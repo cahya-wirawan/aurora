@@ -91,6 +91,7 @@ use accesskit::{Action, ActionData, ActionRequest, Toggled, TreeId};
 use crate::error::WidgetError;
 use crate::input::{FocusManager, FocusOrigin};
 use crate::tree::{ACCESSIBILITY_TREE_ID, WidgetId, WidgetTree};
+use crate::widgets::IconAccess;
 use crate::widgets::{
     self, ColorPickerKey, ColorPickerOutcome, ColorPickerPart, ColorPickerPartRole, CurveEditorKey,
     DropdownOutcome, Hsv, MenuOutcome, TabBarOutcome, WidgetKind,
@@ -404,6 +405,11 @@ enum Target {
 fn target_of(kind: &WidgetKind) -> Target {
     match kind {
         WidgetKind::Button(_) | WidgetKind::ColorSwatch(_) => Target::Owned,
+        // An icon that is a button (0.195.0): the owner decides what its
+        // click means, exactly like a `Button`'s.
+        WidgetKind::Icon(state) if matches!(state.access, IconAccess::Button { .. }) => {
+            Target::Owned
+        }
         WidgetKind::Checkbox(_) => Target::Checkbox,
         WidgetKind::Slider(state) => Target::Slider {
             value: state.value,

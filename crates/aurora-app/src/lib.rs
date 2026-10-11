@@ -1514,6 +1514,9 @@ fn replace_document(
     // it shows the tool, which an open does not change.
     workspace.tree.set_scroll_y(workspace.layers.body, 0.0)?;
     workspace.tree.set_scroll_y(workspace.history.body, 0.0)?;
+    // A different document: no collapsed group of the outgoing one carries
+    // over (layer ids are only meaningful within one document).
+    aurora_ui::reset_layers_panel(&mut workspace.tree, workspace.layers)?;
     let layer_rows =
         aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers)?;
     // The steps the incoming document can undo -- none, for an opened
@@ -4586,6 +4589,9 @@ enum AccessibilityReaction {
     /// A `Click` on a Layers-panel row: select that layer through
     /// [`press_layer_row`], exactly as a pointer press on the row does.
     PressLayer(aurora_doc::LayerId),
+    /// A `Click` on a Layers row's eye (0.195.0): toggle that layer's
+    /// visibility ([`apply_layer_eye`]), whichever layer is active.
+    ToggleVisibility(aurora_doc::LayerId),
     /// A `Click` on a History-panel step or origin row (0.148.0): jump
     /// there through [`perform_history_jump`], the function a pointer
     /// press on the row reaches too (`App::run_history_jump`). As there,
@@ -4695,6 +4701,11 @@ fn route_accessibility_action(
                 AccessibilityReaction::DialogAction(Some(action.to_owned()))
             } else if let Some(&layer_id) = layer_rows.get(&id) {
                 AccessibilityReaction::PressLayer(layer_id)
+            } else if let Some((row, aurora_ui::LayerRowPart::Eye)) =
+                aurora_ui::layer_row_part(&workspace.tree, layer_rows, id)
+                && let Some(&layer_id) = layer_rows.get(&row)
+            {
+                AccessibilityReaction::ToggleVisibility(layer_id)
             } else if let Some(tool) = tool_button_target(workspace, id) {
                 AccessibilityReaction::SelectTool(tool)
             } else if let Some(panel) = workspace.panel_strip.panel_for(id) {
@@ -4739,9 +4750,11 @@ fn route_accessibility_action(
 /// panel is repopulated, the active layer's row re-selected
 /// ([`select_layer`]), and focus moved to the new row of whichever layer
 /// it was on before — the expanded row itself or any other Layers-panel
-/// row, since the rebuild replaces every one of them. **Disclosed cost:** repopulating rebuilds every
-/// row expanded, so another group an assistive technology had collapsed
-/// reopens too; nothing in this app persists per-group collapse state yet.
+/// row, since the rebuild replaces every one of them. **Groups collapsed
+/// elsewhere stay collapsed** (0.195.0): `populate_layers_panel` carries the
+/// collapsed groups of the rows it replaces (by layer id,
+/// `TreeItemState::key`) onto the new ones. Only a group nested under a
+/// collapsed ancestor forgets its own state when that ancestor collapses.
 #[allow(clippy::too_many_arguments)]
 fn reconcile_layer_rows(
     workspace: &mut aurora_ui::Workspace,
@@ -4756,6 +4769,12 @@ fn reconcile_layer_rows(
 ) {
     if !expanded {
         layer_rows.retain(|&id, _| workspace.tree.contains(id));
+        // The row stays: its chevron and folder follow the new state.
+        if let Some(&layer_id) = layer_rows.get(&row)
+            && let Err(err) = aurora_ui::sync_layer_row(&mut workspace.tree, row, layers, layer_id)
+        {
+            tracing::warn!(?err, "failed to refresh a collapsed Layers-panel row");
+        }
         return;
     }
     if !layer_rows.contains_key(&row) {
@@ -5086,6 +5105,23 @@ fn apply_accessibility_action(
                 cx.drag,
                 layer_id,
             );
+        }
+        AccessibilityReaction::ToggleVisibility(layer_id) => {
+            if cx.layer_controls.pending.is_some() {
+                cx.click.release_capture();
+            }
+            let mut edit = LayerControlEdit {
+                workspace: cx.workspace,
+                layers: cx.layers,
+                history: cx.history,
+                pixel_history: cx.pixel_history,
+                undo_order: cx.undo_order,
+                layer_rows: cx.layer_rows,
+                active_layer: *cx.active_layer,
+                state: cx.layer_controls,
+            };
+            let invalidation = apply_layer_eye(&mut edit, layer_id);
+            apply_layer_control_invalidation(cx.composite_cache, &invalidation);
         }
         AccessibilityReaction::JumpHistory(target) => {
             // Only the slider's capture is dropped here, as
@@ -6980,6 +7016,8 @@ fn apply_layer_control_invalidation(
 struct PendingOpacity {
     layer: aurora_doc::LayerId,
     start: f32,
+    /// The drag is the Fill slider's (0.195.0), not Opacity's.
+    fill: bool,
 }
 
 /// What [`install_startup_panels`] hands back to [`App::new`].
@@ -7086,14 +7124,9 @@ fn refresh_layer_row(
     layers: &aurora_doc::LayerTree,
     layer: aurora_doc::LayerId,
 ) {
-    let description = aurora_ui::layer_row_description(layers, layer);
     for (&row, _) in layer_rows.iter().filter(|&(_, &id)| id == layer) {
-        if let Err(err) = aurora_widgets::widgets::set_tree_item_description(
-            &mut workspace.tree,
-            row,
-            Some(&description),
-        ) {
-            tracing::warn!(?err, "failed to refresh a Layers-panel row description");
+        if let Err(err) = aurora_ui::sync_layer_row(&mut workspace.tree, row, layers, layer) {
+            tracing::warn!(?err, "failed to refresh a Layers-panel row");
         }
     }
 }
@@ -7112,20 +7145,10 @@ fn refresh_layer_row_descriptions(
         if !layers.contains(layer) {
             continue;
         }
-        let description = aurora_ui::layer_row_description(layers, layer);
-        let current = workspace
-            .tree
-            .accessibility(row)
-            .and_then(|node| node.description().map(str::to_owned));
-        if current.as_deref() == Some(description.as_str()) {
-            continue;
-        }
-        if let Err(err) = aurora_widgets::widgets::set_tree_item_description(
-            &mut workspace.tree,
-            row,
-            Some(&description),
-        ) {
-            tracing::warn!(?err, "failed to refresh a Layers-panel row description");
+        // Only a row whose text, blend label or eye really changed is
+        // touched (`sync_layer_row` compares before it writes).
+        if let Err(err) = aurora_ui::sync_layer_row(&mut workspace.tree, row, layers, layer) {
+            tracing::warn!(?err, "failed to refresh a Layers-panel row");
         }
     }
 }
@@ -7143,13 +7166,41 @@ fn finish_opacity(cx: &mut LayerControlEdit<'_>) -> bool {
     let Some(pending) = cx.state.pending.take() else {
         return false;
     };
-    if cx.layers.opacity(pending.layer) == Some(pending.start) {
+    let current = if pending.fill {
+        cx.layers.fill_opacity(pending.layer)
+    } else {
+        cx.layers.opacity(pending.layer)
+    };
+    if current == Some(pending.start) {
         return false;
     }
-    match cx
-        .history
-        .record_opacity_change(cx.layers, pending.layer, pending.start)
-    {
+    let recorded = if pending.fill {
+        // `History` has no "record a finished fill drag" entry, and the
+        // document crate is not this round's to change: put the starting
+        // fill back and make the final value one journaled step, whose
+        // undo restores the start.
+        match current {
+            Some(end) => cx
+                .layers
+                .set_fill_opacity(pending.layer, pending.start)
+                .and_then(|()| {
+                    cx.history
+                        .set_fill_opacity(cx.layers, pending.layer, end)
+                        .map(|_| ())
+                        .inspect_err(|_| {
+                            // Refused: leave the layer at the value the
+                            // user dragged to, with no step, not at the
+                            // start.
+                            let _ = cx.layers.set_fill_opacity(pending.layer, end);
+                        })
+                }),
+            None => Ok(()),
+        }
+    } else {
+        cx.history
+            .record_opacity_change(cx.layers, pending.layer, pending.start)
+    };
+    match recorded {
         Ok(()) => {
             cx.undo_order
                 .record(UndoKind::Structural, cx.history, cx.pixel_history);
@@ -7173,7 +7224,7 @@ fn end_layer_control_gestures(cx: &mut LayerControlEdit<'_>, click: &mut ClickTr
     let Some(controls) = cx.state.controls else {
         return false;
     };
-    if cx.state.pending.is_some() || click.captured() == Some(controls.opacity) {
+    if cx.state.pending.is_some() || slider_held(Some(&controls), click.captured()) {
         click.release_capture();
     }
     let committed = finish_opacity(cx);
@@ -7194,14 +7245,21 @@ fn end_layer_control_gestures(cx: &mut LayerControlEdit<'_>, click: &mut ClickTr
 /// resetting a stale capture — cannot strand a drag without its undo
 /// step.
 fn settle_pending_opacity(cx: &mut LayerControlEdit<'_>, captured: Option<WidgetId>) -> bool {
-    let slider = cx.state.controls.map(|controls| controls.opacity);
-    if slider.is_none() || captured != slider {
+    let held = slider_held(cx.state.controls.as_ref(), captured);
+    if !held {
         cx.state.detached = false;
     }
-    if cx.state.pending.is_some() && (slider.is_none() || captured != slider) {
+    if cx.state.pending.is_some() && !held {
         return finish_opacity(cx);
     }
     false
+}
+
+/// Whether `captured` is the Opacity or the Fill slider (0.195.0).
+fn slider_held(controls: Option<&aurora_ui::LayerControls>, captured: Option<WidgetId>) -> bool {
+    captured.is_some_and(|id| {
+        controls.is_some_and(|controls| id == controls.opacity || id == controls.fill)
+    })
 }
 
 /// Turns one Layers-panel control outcome into a document edit and
@@ -7239,18 +7297,22 @@ fn apply_layer_control_outcome(
         return CompositeInvalidation::None;
     };
     let edited: Result<Option<aurora_core::Rect>, aurora_doc::DocError> = match outcome {
-        PointerOutcome::Action(Outcome::ValueChanged { id, value }) if *id == controls.opacity => {
+        PointerOutcome::Action(Outcome::ValueChanged { id, value })
+            if *id == controls.opacity || *id == controls.fill =>
+        {
+            let fill = *id == controls.fill;
             #[allow(clippy::cast_possible_truncation)]
-            let opacity = (value / 100.0).clamp(0.0, 1.0) as f32;
-            if captured == Some(controls.opacity) {
+            let level = (value / 100.0).clamp(0.0, 1.0) as f32;
+            if captured == Some(*id) {
                 // The active layer changed under a live drag (an
-                // assistive technology's row press, a keyboard selection):
-                // the drag ends on the layer it started on, and the rest
-                // of this capture edits nothing (review RT135-3).
+                // assistive technology's row press, a keyboard selection),
+                // or the other slider took over: the drag ends on the
+                // layer it started on, and the rest of this capture edits
+                // nothing (review RT135-3).
                 if cx
                     .state
                     .pending
-                    .is_some_and(|pending| pending.layer != active)
+                    .is_some_and(|pending| pending.layer != active || pending.fill != fill)
                 {
                     let _ = finish_opacity(cx);
                     cx.state.detached = true;
@@ -7259,21 +7321,35 @@ fn apply_layer_control_outcome(
                     return CompositeInvalidation::None;
                 }
                 if cx.state.pending.is_none() {
-                    let start = cx.layers.opacity(active).unwrap_or(1.0);
+                    let start = if fill {
+                        cx.layers.fill_opacity(active)
+                    } else {
+                        cx.layers.opacity(active)
+                    }
+                    .unwrap_or(1.0);
                     cx.state.pending = Some(PendingOpacity {
                         layer: active,
                         start,
+                        fill,
                     });
                 }
-                match cx.layers.set_opacity(active, opacity) {
+                let set = if fill {
+                    cx.layers.set_fill_opacity(active, level)
+                } else {
+                    cx.layers.set_opacity(active, level)
+                };
+                match set {
                     Ok(()) => {
                         refresh_layer_row(cx.workspace, cx.layer_rows, cx.layers, active);
+                        let _ = aurora_ui::sync_layer_readouts(&mut cx.workspace.tree, controls);
                         return CompositeInvalidation::Everything;
                     }
                     Err(err) => Err(err),
                 }
+            } else if fill {
+                cx.history.set_fill_opacity(cx.layers, active, level)
             } else {
-                cx.history.set_opacity(cx.layers, active, opacity)
+                cx.history.set_opacity(cx.layers, active, level)
             }
         }
         PointerOutcome::Action(Outcome::Dropdown {
@@ -7287,9 +7363,6 @@ fn apply_layer_control_outcome(
             Some(mode) => cx.history.set_blend_mode(cx.layers, active, mode),
             None => return CompositeInvalidation::None,
         },
-        PointerOutcome::Action(Outcome::Toggled { id, state }) if *id == controls.visible => cx
-            .history
-            .set_visible(cx.layers, active, *state == accesskit::Toggled::True),
         _ => return CompositeInvalidation::None,
     };
     match edited {
@@ -7302,6 +7375,72 @@ fn apply_layer_control_outcome(
         }
         Err(err) => {
             tracing::warn!(?err, "a Layers-panel control edit was refused");
+            CompositeInvalidation::None
+        }
+    }
+}
+
+/// What a key does on a focused Layers row (0.195.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerRowKeyAction {
+    /// `Shift`+`Space`/`Enter`: toggle the row's eye.
+    ToggleEye,
+    /// `Space`/`Enter`: select the layer.
+    Select,
+    /// `Right`: expand a group.
+    Expand,
+    /// `Left`: collapse a group.
+    Collapse,
+    /// `Up`: focus the previous shown row.
+    Previous,
+    /// `Down`: focus the next shown row.
+    Next,
+}
+
+/// The pure decision behind [`App::layer_row_key`]: nothing while a dialog
+/// or the palette is open (`modal`) or with `Ctrl`/`Alt`/`Meta` held (a
+/// shortcut chord), otherwise the row action `key` names, if any.
+fn layer_row_key_action(key: Key, modifiers: Modifiers, modal: bool) -> Option<LayerRowKeyAction> {
+    if modal || modifiers.control || modifiers.alt || modifiers.meta {
+        return None;
+    }
+    let Key::Named(named) = key else {
+        return None;
+    };
+    match named {
+        NamedKey::Space | NamedKey::Enter if modifiers.shift => Some(LayerRowKeyAction::ToggleEye),
+        NamedKey::Space | NamedKey::Enter => Some(LayerRowKeyAction::Select),
+        NamedKey::ArrowRight => Some(LayerRowKeyAction::Expand),
+        NamedKey::ArrowLeft => Some(LayerRowKeyAction::Collapse),
+        NamedKey::ArrowUp => Some(LayerRowKeyAction::Previous),
+        NamedKey::ArrowDown => Some(LayerRowKeyAction::Next),
+        _ => None,
+    }
+}
+
+/// Toggles `layer`'s visibility from its row's eye (0.195.0): one
+/// `History::set_visible` step — the same edit the old visibility checkbox
+/// made, but for *any* layer, not only the active one — then the History
+/// panel, the row (eye picture, name, description) and the composite
+/// follow. A live Opacity/Fill drag is committed first.
+fn apply_layer_eye(
+    cx: &mut LayerControlEdit<'_>,
+    layer: aurora_doc::LayerId,
+) -> CompositeInvalidation {
+    let _ = finish_opacity(cx);
+    let Some(visible) = cx.layers.visible(layer) else {
+        return CompositeInvalidation::None;
+    };
+    match cx.history.set_visible(cx.layers, layer, !visible) {
+        Ok(dirtied) => {
+            cx.undo_order
+                .record(UndoKind::Structural, cx.history, cx.pixel_history);
+            refresh_history_panel(cx.workspace, cx.undo_order);
+            refresh_layer_row(cx.workspace, cx.layer_rows, cx.layers, layer);
+            structural_invalidation(dirtied)
+        }
+        Err(err) => {
+            tracing::warn!(?err, "a Layers-panel eye toggle was refused");
             CompositeInvalidation::None
         }
     }
@@ -21977,9 +22116,7 @@ fn mark_active_layer_row(
         // has somehow gone missing must not take the rest of the
         // selection with it -- nor become a panic, which this workspace
         // denies outright.
-        if let Err(err) =
-            aurora_widgets::widgets::set_tree_item_selected(tree, row, Some(id) == active)
-        {
+        if let Err(err) = aurora_ui::set_layer_row_selected(tree, row, Some(id) == active) {
             tracing::warn!(?err, "failed to update a layer row's selection state");
         }
     }
@@ -22377,9 +22514,9 @@ fn perform_layer_command(cx: &mut LayerCommandContext<'_>, command: LayerCommand
 /// name a just-removed layer — not a real before/after comparison — so it
 /// was dropped rather than kept as a guard that looked load-bearing.
 ///
-/// **Disclosed cost**, the same as [`reconcile_layer_rows`]'s: every row is
-/// rebuilt expanded, so a group an assistive technology had collapsed
-/// reopens.
+/// Groups the user had collapsed stay collapsed, as in
+/// [`reconcile_layer_rows`] (`populate_layers_panel` carries them over); a
+/// different document starts expanded ([`aurora_ui::reset_layers_panel`]).
 #[allow(clippy::too_many_arguments)]
 fn rebuild_layer_rows(
     workspace: &mut aurora_ui::Workspace,
@@ -24686,6 +24823,9 @@ impl App {
         if self.cancel_panel_drag() && key == Key::Named(NamedKey::Escape) {
             return;
         }
+        if self.layer_row_key(key) {
+            return;
+        }
         let controls = self.layer_controls.controls;
         let tool_controls = self.tool_controls;
         let routed = route_widget_key(
@@ -24846,13 +24986,10 @@ impl App {
         // `perform_undo_redo` commits a live opacity drag first; the
         // slider's capture ends with it, so the rest of that drag is not
         // silently a second gesture and the slider can show the result.
-        if self
-            .layer_controls
-            .controls
-            .map(|controls| controls.opacity)
-            == self.gallery_click.captured()
-            && self.gallery_click.captured().is_some()
-        {
+        if slider_held(
+            self.layer_controls.controls.as_ref(),
+            self.gallery_click.captured(),
+        ) {
             self.gallery_click.release_capture();
         }
         // Taken before the command: an undone New Layer or redone Delete
@@ -24931,13 +25068,10 @@ impl App {
     /// History rows, and maybe the Layers rows, were rebuilt), pushes
     /// accessibility and redraws.
     fn run_history_jump(&mut self, target: usize) {
-        if self
-            .layer_controls
-            .controls
-            .map(|controls| controls.opacity)
-            == self.gallery_click.captured()
-            && self.gallery_click.captured().is_some()
-        {
+        if slider_held(
+            self.layer_controls.controls.as_ref(),
+            self.gallery_click.captured(),
+        ) {
             self.gallery_click.release_capture();
         }
         let jump = perform_history_jump(
@@ -26833,8 +26967,25 @@ impl App {
         // doing, the same way it would in any real image editor.
         if button == PointerButton::Primary
             && let Some(hit) = self.workspace.tree.hit_test(position)
-            && let Some(&layer_id) = self.layer_rows.get(&hit)
+            && let Some((row, part)) =
+                aurora_ui::layer_row_part(&self.workspace.tree, &self.layer_rows, hit)
+            && let Some(&layer_id) = self.layer_rows.get(&row)
         {
+            // The eye and the chevron are controls of the row, not
+            // selections of it (0.195.0): a press on one toggles that
+            // layer's visibility or its group's disclosure and leaves the
+            // active layer alone.
+            match part {
+                aurora_ui::LayerRowPart::Eye => {
+                    self.toggle_layer_eye(layer_id);
+                    return;
+                }
+                aurora_ui::LayerRowPart::Chevron => {
+                    self.toggle_layer_disclosure(row);
+                    return;
+                }
+                aurora_ui::LayerRowPart::Row => {}
+            }
             // Through `press_layer_row`, never `select_layer` alone:
             // the selection moves the pan bound, and no drag may still
             // be live under it. See that function's own doc comment.
@@ -27907,8 +28058,121 @@ impl App {
         }
     }
 
-    /// Applies one routed Layers-panel control outcome
-    /// ([`apply_layer_control_outcome`]) and acts on its invalidation.
+    /// A row's eye was pressed or keyed (0.195.0): one visibility undo
+    /// step on `layer` ([`apply_layer_eye`]).
+    fn toggle_layer_eye(&mut self, layer: aurora_doc::LayerId) {
+        if slider_held(
+            self.layer_controls.controls.as_ref(),
+            self.gallery_click.captured(),
+        ) {
+            self.gallery_click.release_capture();
+        }
+        let invalidation = apply_layer_eye(&mut self.layer_control_edit(), layer);
+        apply_layer_control_invalidation(&mut self.doc.composite_cache, &invalidation);
+        self.relayout_after_gallery();
+        self.push_accessibility();
+        self.needs_redraw = true;
+    }
+
+    /// A group row's chevron was pressed, or Left/Right was keyed on it
+    /// (0.195.0): the same `Expand`/`Collapse` an assistive technology
+    /// sends, through `handle_action`, then the app's own row
+    /// reconciliation.
+    fn toggle_layer_disclosure(&mut self, row: WidgetId) {
+        self.step_layer_disclosure(row, None);
+    }
+
+    fn step_layer_disclosure(&mut self, row: WidgetId, want: Option<bool>) {
+        let expanded = matches!(
+            self.workspace.tree.payload(row),
+            Some(WidgetKind::TreeItem(state)) if state.expanded && state.has_children
+        );
+        let expand = want.unwrap_or(!expanded);
+        let request = accesskit::ActionRequest {
+            action: if expand {
+                accesskit::Action::Expand
+            } else {
+                accesskit::Action::Collapse
+            },
+            target_tree: aurora_widgets::ACCESSIBILITY_TREE_ID,
+            target_node: row,
+            data: None,
+        };
+        // A leaf row declares neither action: `handle_action` refuses it
+        // and nothing changes.
+        if let Ok(aurora_widgets::ActionOutcome::ExpandedChanged { id, expanded }) =
+            aurora_widgets::handle_action(&mut self.workspace.tree, &mut self.focus, &request)
+        {
+            reconcile_layer_rows(
+                &mut self.workspace,
+                &mut self.focus,
+                &self.scales,
+                &self.doc.layers,
+                &mut self.layer_rows,
+                &mut self.doc.active_layer,
+                &mut self.doc.canvas_view,
+                id,
+                expanded,
+            );
+            self.relayout_after_gallery();
+            self.push_accessibility();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Keys on a focused Layers row (0.195.0): `Space`/`Enter` select it,
+    /// `Shift`+`Space`/`Enter` toggle its eye, `Left`/`Right` collapse and
+    /// expand a group, `Up`/`Down` move to the previous/next shown row.
+    /// Returns whether the key was consumed.
+    fn layer_row_key(&mut self, key: Key) -> bool {
+        let Some(row) = self.focus.focused() else {
+            return false;
+        };
+        let Some(&layer_id) = self.layer_rows.get(&row) else {
+            return false;
+        };
+        let modal = self.dialog.is_some() || self.command_palette.is_some();
+        let Some(action) = layer_row_key_action(key, self.modifiers, modal) else {
+            return false;
+        };
+        match action {
+            LayerRowKeyAction::ToggleEye => self.toggle_layer_eye(layer_id),
+            LayerRowKeyAction::Select => {
+                press_layer_row(
+                    &mut self.workspace,
+                    &self.layer_rows,
+                    &mut self.doc.active_layer,
+                    &mut self.doc.canvas_view,
+                    &self.doc.layers,
+                    &mut self.doc.history,
+                    &mut self.doc.pixel_history,
+                    &mut self.doc.undo_order,
+                    &mut self.doc.composite_cache,
+                    &mut self.drag,
+                    layer_id,
+                );
+                self.push_accessibility();
+            }
+            LayerRowKeyAction::Expand => self.step_layer_disclosure(row, Some(true)),
+            LayerRowKeyAction::Collapse => self.step_layer_disclosure(row, Some(false)),
+            LayerRowKeyAction::Previous | LayerRowKeyAction::Next => {
+                if let Some(next) = aurora_ui::layer_row_neighbor(
+                    &self.workspace.tree,
+                    row,
+                    action == LayerRowKeyAction::Next,
+                ) && let Err(err) =
+                    self.focus
+                        .focus_with(&mut self.workspace.tree, next, FocusOrigin::Keyboard)
+                {
+                    tracing::warn!(?err, "failed to move focus between Layers rows");
+                }
+                self.push_accessibility();
+            }
+        }
+        self.needs_redraw = true;
+        true
+    }
+
     fn apply_layer_control(&mut self, outcome: &PointerOutcome) {
         let captured = self.gallery_click.captured();
         let invalidation =
@@ -30026,6 +30290,137 @@ mod tests {
         assert_eq!(selected, Some(true));
     }
 
+    /// Expanding one group through the same route the chevron and
+    /// `Left`/`Right` take leaves another collapsed group collapsed.
+    #[test]
+    fn expanding_one_group_via_the_app_route_keeps_another_collapsed() {
+        let scales = ok_scales();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+        let mut layers = aurora_doc::LayerTree::new();
+        let group_a = ok_id(layers.add_group("A", None));
+        ok_id(layers.add_pixel_layer("a1", layer_bounds(), Some(group_a)));
+        let group_b = ok_id(layers.add_group("B", None));
+        ok_id(layers.add_pixel_layer("b1", layer_bounds(), Some(group_b)));
+        let mut layer_rows = match aurora_ui::populate_layers_panel(
+            &mut workspace.tree,
+            workspace.layers,
+            &scales,
+            &layers,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut focus = FocusManager::default();
+        let mut active = None;
+        let mut view = CanvasView::new();
+        // Collapse A, collapse B, expand B: each through `handle_action`
+        // and then `reconcile_layer_rows`, as `App::step_layer_disclosure`.
+        for (group, action) in [
+            (group_a, accesskit::Action::Collapse),
+            (group_b, accesskit::Action::Collapse),
+            (group_b, accesskit::Action::Expand),
+        ] {
+            let row = row_of(&layer_rows, group);
+            let outcome = aurora_widgets::handle_action(
+                &mut workspace.tree,
+                &mut focus,
+                &a11y_request(row, action),
+            );
+            let Ok(aurora_widgets::ActionOutcome::ExpandedChanged { id, expanded }) = outcome
+            else {
+                unreachable!("expected ExpandedChanged, got {outcome:?}");
+            };
+            reconcile_layer_rows(
+                &mut workspace,
+                &mut focus,
+                &scales,
+                &layers,
+                &mut layer_rows,
+                &mut active,
+                &mut view,
+                id,
+                expanded,
+            );
+        }
+        let shown: std::collections::HashSet<_> = layer_rows.values().copied().collect();
+        assert!(shown.contains(&group_a) && shown.contains(&group_b));
+        assert_eq!(layer_rows.len(), 3, "A, B and b1: a1 stays hidden");
+        let a_row = row_of(&layer_rows, group_a);
+        assert_eq!(
+            workspace
+                .tree
+                .accessibility(a_row)
+                .and_then(accesskit::Node::is_expanded),
+            Some(false),
+            "A is still collapsed after B expanded"
+        );
+    }
+
+    fn ok_scales() -> Scales {
+        match load_scales() {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err}"),
+        }
+    }
+
+    fn ok_id<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// The pure key decision behind `App::layer_row_key`.
+    #[test]
+    fn layer_row_keys_map_to_actions_and_yield_to_modals_and_chords() {
+        use crate::{LayerRowKeyAction as Act, layer_row_key_action};
+        let none = Modifiers::none();
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::none()
+        };
+        let named = |key| Key::Named(key);
+        for (key, mods, want) in [
+            (NamedKey::Space, none, Some(Act::Select)),
+            (NamedKey::Enter, none, Some(Act::Select)),
+            (NamedKey::Space, shift, Some(Act::ToggleEye)),
+            (NamedKey::Enter, shift, Some(Act::ToggleEye)),
+            (NamedKey::ArrowRight, none, Some(Act::Expand)),
+            (NamedKey::ArrowLeft, none, Some(Act::Collapse)),
+            (NamedKey::ArrowUp, none, Some(Act::Previous)),
+            (NamedKey::ArrowDown, none, Some(Act::Next)),
+            (NamedKey::Tab, none, None),
+            (NamedKey::Escape, none, None),
+        ] {
+            assert_eq!(
+                layer_row_key_action(named(key), mods, false),
+                want,
+                "{key:?} with {mods:?}"
+            );
+        }
+        // A modal (dialog or palette) owns every key.
+        assert_eq!(
+            layer_row_key_action(named(NamedKey::Space), none, true),
+            None
+        );
+        // A chord is a shortcut, never a row key.
+        for mods in [
+            Modifiers {
+                control: true,
+                ..none
+            },
+            Modifiers { alt: true, ..none },
+            Modifiers { meta: true, ..none },
+        ] {
+            assert_eq!(
+                layer_row_key_action(named(NamedKey::ArrowDown), mods, false),
+                None
+            );
+        }
+        // A typed character is not a row key.
+        assert_eq!(layer_row_key_action(Key::Character('b'), none, false), None);
+    }
+
     #[test]
     fn an_accessibility_click_on_a_dialog_button_runs_that_action() {
         let (mut workspace, _layers, layer_rows, _a, _b) = two_layers_one_moved();
@@ -30905,6 +31300,7 @@ mod tests {
 
         fn start_live_opacity_drag(rig: &mut JumpRig, ink: LayerId) {
             rig.state.pending = Some(super::super::PendingOpacity {
+                fill: false,
                 layer: ink,
                 start: 1.0,
             });
@@ -35451,9 +35847,10 @@ mod tests {
         );
         assert_eq!(
             total_descendants(&workspace.tree, workspace.layers.body),
-            2,
-            "and nothing at all survives below that: exactly the tree container and one row, \
-             counted at every depth rather than only the tree's own direct children"
+            3,
+            "and nothing at all survives below that: exactly the tree container, one row and \
+             that row's eye (0.195.0), counted at every depth rather than only the tree's own \
+             direct children"
         );
         assert_eq!(
             workspace
@@ -69986,6 +70383,7 @@ mod tests {
             rig.state.pending = Some(PendingOpacity {
                 layer: mid,
                 start: 1.0,
+                fill: false,
             });
             if let Err(err) = rig.layers.set_opacity(mid, 0.4) {
                 unreachable!("{err:?}");
@@ -71088,19 +71486,117 @@ mod tests {
             assert!(rig.row_description(b).starts_with("Normal, "));
         }
 
+        /// The eye of `layer`'s row: the row's `IconAccess::Button` child.
+        fn eye_of(rig: &Rig, layer: LayerId) -> WidgetId {
+            let row = row_of(&rig.layer_rows, layer);
+            let found = rig
+                .workspace
+                .tree
+                .children(row)
+                .unwrap_or_default()
+                .iter()
+                .copied()
+                .find(|&child| {
+                    matches!(
+                        rig.workspace.tree.payload(child),
+                        Some(WidgetKind::Icon(state))
+                            if matches!(state.access, aurora_widgets::widgets::IconAccess::Button { .. })
+                    )
+                });
+            match found {
+                Some(eye) => eye,
+                None => unreachable!("every row has an eye"),
+            }
+        }
+
+        fn eye_kind(rig: &Rig, eye: WidgetId) -> aurora_widgets::icons::IconKind {
+            match rig.workspace.tree.payload(eye) {
+                Some(WidgetKind::Icon(state)) => state.kind,
+                other => unreachable!("expected Icon, got {other:?}"),
+            }
+        }
+
         #[test]
-        fn the_visibility_checkbox_hides_the_layer_and_undo_restores_it() {
-            let (mut rig, _, b) = Rig::two_layers();
-            let invalidation = rig.click(rig.controls().visible);
+        fn the_row_eye_hides_the_layer_and_undo_restores_it() {
+            use aurora_widgets::icons::IconKind;
+            let (mut rig, a, b) = Rig::two_layers();
+            let eye = eye_of(&rig, b);
+            assert_eq!(eye_kind(&rig, eye), IconKind::Eye);
+            // A real pointer hit on the eye resolves to "the eye of b's row".
+            let at = rig.centre(eye);
+            assert_eq!(rig.workspace.tree.hit_test(at), Some(eye));
+            assert_eq!(
+                aurora_ui::layer_row_part(&rig.workspace.tree, &rig.layer_rows, eye),
+                Some((row_of(&rig.layer_rows, b), aurora_ui::LayerRowPart::Eye))
+            );
+            let journal = rig.history.journal_len();
+            let invalidation = crate::apply_layer_eye(&mut rig.edit(), b);
             assert!(matches!(invalidation, CompositeInvalidation::Everything));
             assert_eq!(rig.layers.visible(b), Some(false));
+            assert_eq!(rig.layers.visible(a), Some(true), "only that layer");
+            assert_eq!(rig.history.journal_len(), journal + 1);
             assert!(rig.row_description(b).ends_with(", hidden"));
+            assert_eq!(eye_kind(&rig, eye), IconKind::EyeOff);
             let _ = rig.undo_redo(AppCommand::Undo);
             assert_eq!(rig.layers.visible(b), Some(true));
-            assert!(matches!(
-                rig.workspace.tree.payload(rig.controls().visible),
-                Some(WidgetKind::Checkbox(state)) if state.checked == accesskit::Toggled::True
-            ));
+            assert_eq!(eye_kind(&rig, eye), IconKind::Eye, "undo restores the eye");
+        }
+
+        #[test]
+        fn an_assistive_technology_click_on_the_eye_routes_to_that_layers_visibility() {
+            let (mut rig, a, _b) = Rig::two_layers();
+            let eye = eye_of(&rig, a);
+            let request = accesskit::ActionRequest {
+                action: accesskit::Action::Click,
+                target_tree: aurora_widgets::ACCESSIBILITY_TREE_ID,
+                target_node: eye,
+                data: None,
+            };
+            let controls = rig.state.controls;
+            let reaction = crate::route_accessibility_action(
+                &mut rig.workspace,
+                &mut rig.focus,
+                None,
+                &rig.layer_rows,
+                controls.as_ref(),
+                None,
+                &request,
+            );
+            assert!(
+                matches!(reaction, crate::AccessibilityReaction::ToggleVisibility(layer) if layer == a),
+                "got {reaction:?}"
+            );
+            // And the reaction's edit is the same undoable step.
+            let _ = crate::apply_layer_eye(&mut rig.edit(), a);
+            assert_eq!(rig.layers.visible(a), Some(false));
+            let _ = rig.undo_redo(AppCommand::Undo);
+            assert_eq!(rig.layers.visible(a), Some(true));
+        }
+
+        #[test]
+        fn dragging_fill_is_one_undo_step_and_leaves_opacity_alone() {
+            let (mut rig, _, b) = Rig::two_layers();
+            let journal = rig.history.journal_len();
+            let slider = rig.controls().fill;
+            let down = rig.at(slider, 0.25);
+            let _ = rig.pointer(PointerPhase::Down, down, false);
+            for fraction in [0.4, 0.55, 0.7] {
+                let at = rig.at(slider, fraction);
+                let (_, invalidation) = rig.pointer(PointerPhase::Move, at, false);
+                assert!(matches!(invalidation, CompositeInvalidation::Everything));
+            }
+            let at = rig.at(slider, 0.7);
+            let _ = rig.pointer(PointerPhase::Up, at, false);
+            let fill = rig.layers.fill_opacity(b).unwrap_or(f32::NAN);
+            assert!((0.5..0.9).contains(&fill), "fill follows the drag: {fill}");
+            assert_eq!(rig.opacity(b), 1.0, "opacity is untouched");
+            assert_eq!(rig.history.journal_len(), journal + 1, "one step per drag");
+            let _ = rig.undo_redo(AppCommand::Undo);
+            assert_eq!(
+                rig.layers.fill_opacity(b),
+                Some(1.0),
+                "undo restores the start"
+            );
         }
 
         #[test]
@@ -78315,7 +78811,7 @@ mod text_layout_tests {
     }
 
     #[test]
-    fn the_layers_panel_visible_checkbox_is_laid_out_wide_enough_for_its_label() {
+    fn the_layers_controls_sit_above_the_list_and_their_readouts_have_room() {
         let scales = ok(load_scales());
         let (mut workspace, controls) = workspace();
         let mut engine = ok(TextEngine::new());
@@ -78327,20 +78823,24 @@ mod text_layout_tests {
             1280.0,
             800.0,
         );
-        let Some(bounds) = workspace.tree.bounds(controls.visible) else {
-            unreachable!("the Visible checkbox exists");
+        let strip = workspace.tree.bounds(controls.root);
+        let list = workspace.tree.bounds(workspace.layers.viewport);
+        let (Some(strip), Some(list)) = (strip, list) else {
+            unreachable!("both are laid out");
         };
-        let side = scales.typography.size.md;
-        let gap = scales.spacing.sm;
         assert!(
-            bounds.width > side + gap,
-            "box + gap + label, not a bare box: {bounds:?}"
+            strip.y + i64::from(strip.height) <= list.y,
+            "the controls strip is above the list: {strip:?} / {list:?}"
         );
-        assert_eq!(workspace.tree.is_measured(controls.visible), Some(true));
-        let label = engine.shape("Visible", &aurora_widgets::label_style(&scales), 2.0);
-        #[allow(clippy::cast_precision_loss)]
-        let room = bounds.width as f32 - (side + gap) as f32;
-        assert!(room >= label.width, "{room} < {}", label.width);
+        for readout in [controls.opacity_readout, controls.fill_readout] {
+            let Some(bounds) = workspace.tree.bounds(readout) else {
+                unreachable!("laid out");
+            };
+            let label = engine.shape("100 %", &aurora_widgets::label_style(&scales), 2.0);
+            #[allow(clippy::cast_precision_loss)]
+            let room = bounds.width as f32;
+            assert!(room >= label.width, "{room} < {}", label.width);
+        }
     }
 
     #[test]

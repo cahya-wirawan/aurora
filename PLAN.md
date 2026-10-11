@@ -26,7 +26,118 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.194.0): round L1 of the Photoshop-style Layers panel — the
+**Latest (2026-10-11, 0.195.0): round L2 of the Photoshop-style Layers panel — the
+rows, and the controls on top. Nobody has seen this panel in the live window on the
+Mac (or anywhere but a headless render).**
+- **Rows** (`aurora-ui` `layers_panel.rs`): every layer or group row is a *flat*,
+  full-width tree row (`set_tree_item_flat`: no indentation of its own, so the
+  highlight reaches both edges; the tree's own accessibility node is unchanged —
+  tree item, name, `selected`, `expanded`, `level`, `Focus`/`Click`/`Expand`/
+  `Collapse`). In-row content is absolutely placed icon children: an **eye** in a
+  fixed left column (`Eye`/`EyeOff`, `IconAccess::Button`: a `Role::Button` named
+  "Hide Post 1"/"Show Post 1" with `toggled`, **`Click` only, never `Focus`**),
+  then, indented `spacing.md` per level, a disclosure **chevron**
+  (`ChevronDown`/`ChevronRight`, groups with children; blank spacer otherwise), a
+  **folder** (`FolderOpen`/`FolderClosed`, groups; pixel and adjustment layers keep
+  the blank spacer until L4's thumbnails), the **name** (ellipsised, drawn by the
+  tree row with `TreeItemState::label_inset`) and the **blend-mode name** flush
+  right (`TreeItemState::trailing`, `text.secondary`, `text.on_accent` when
+  selected; `HAlign::End`), shown only when the mode is not `Normal` and, for a
+  group, not `Pass Through`. Icons retone to `OnAccent` on the highlight
+  (`set_layer_row_selected`). `sync_layer_row` keeps description, blend label, eye,
+  chevron and folder current in place (no widget inserted or removed);
+  `layer_row_part` says whether a hit is the row, eye or chevron;
+  `layer_row_neighbor` walks the shown rows.
+- **Controls above the list** (`layer_controls.rs`): the strip is moved
+  (`move_child`) between the title and the list and never shrinks (the Layers
+  panel's floor grows by ~82 px: a rail under ~250 px now squeezes the list first).
+  Rows: blend dropdown; "Opacity" slider + live "100 %" readout; "Fill" slider +
+  readout. **Sliders, not numeric fields**: `aurora-widgets` has no validated
+  numeric field (its `TextField` is free text with no parse-and-commit route in the
+  app), so a numeric field would have been a new widget plus a new app route; a
+  slider keeps the one-undo-step-per-drag path. The visibility checkbox is gone
+  (the eye replaces it); its tests were rewritten for the eye. **Fill** edits
+  `fill_opacity` through the journaled `History::set_fill_opacity` (live drag on
+  the tree, one undo step at drag end — `finish_opacity` puts the start back and
+  journals the end value, since `aurora-doc` has no "record a fill drag" entry and
+  was not this round's to change), History row and composite invalidation as for
+  Opacity; the GPU/CPU paths already applied Fill (0.181.0). Fill is **disabled for
+  a Pass Through group** (reported, not applied), the reason in the Fill row's
+  accessible description.
+- **Eye, chevron and keys in the app** (`aurora-app`): a pointer press on the eye
+  toggles that layer's visibility (any layer, not only the active one; one
+  `History::set_visible` step, `apply_layer_eye`) and does not select; a press on
+  the chevron expands/collapses through the same `Expand`/`Collapse` action an
+  assistive technology sends (+ `reconcile_layer_rows`, which now also re-syncs a
+  collapsed row's icons); an AT `Click` on the eye reaches the same edit
+  (`AccessibilityReaction::ToggleVisibility`). **Keyboard**: before this round a
+  focused row did nothing in the app; now `Space`/`Enter` select it,
+  **`Shift`+`Space`/`Enter` toggle its eye**, `Left`/`Right` collapse/expand,
+  `Up`/`Down` move to the previous/next shown row (`App::layer_row_key`).
+- **Focus decision**: rows stay one `Tab` stop each, as since 0.77.0 (pinned by
+  the existing tab-order test and a new one: 60 layers = 60 stops, the 60 eyes add
+  none); collapsing to one stop for the whole list is a crate-wide focus-model
+  change this round does not make. The eye is not a tab stop.
+- **Clipping decision**: a mesh is now cut to the visible rect
+  (`paint::clip_mesh`, Sutherland-Hodgman per triangle) instead of an icon being
+  dropped when an ancestor clips it at all, so a row at the scroll edge shows the
+  visible part of its icons and no row is left with a name and no icons (the 0.194.0
+  review note 3). Not antialiased: the cut is hard-edged like the rest.
+- **Nyepi populate** (277 rows, 9 nested groups; release,
+  `nyepi_layers_panel_populate`, `#[ignore]`d, skips without the file): **before
+  0.41 ms populate (best of 7), 1.90 ms full relayout, 322 widgets; after 0.90 ms
+  (0.74 ms before the review round's collapse memory and row keys), 2.42 ms, 707
+  widgets** — well under a 16 ms frame; no virtualisation needed.
+- **Tests** (3,648 pass with `AURORA_REQUIRE_GPU=1`; 3,629 before): row
+  structure for a nested tree (eye, chevron, folder, blend label present and
+  absent, empty group), eye node/`toggled`/no `Focus` and its follow-up on
+  visibility, chevron/folder follow expanded, press resolution, Up/Down order,
+  retone on selection, tab stops do not scale with icons, label inset + right-aligned
+  trailing text, mesh clipping and a clipped icon at a viewport edge, button-icon
+  `Click` routing, controls above the list, Fill follows the layer and is disabled
+  with a reason for Pass Through, readouts, AT eye click, Fill drag = one undo step
+  with opacity untouched, eye = one undoable step. **Rewritten, deliberately**: the
+  visibility-checkbox tests (eye replaces it), the two layout-floor tests (the strip
+  is three rows above the list: rail floor 250 px, not 168), the "children of a group
+  row" tests (icons are children now; they count rows), the one-icon-clipped test
+  (partly clipped icons are cut, not dropped), `replace_document_clears…` (one more
+  descendant, the eye). A headless render at scale 2 and 1
+  (`layers_panel_render::write_layers_panel_png`, `#[ignore]`d) writes the review PNG.
+- **Mutations** (each run for real, restored by sha256): eye toggles the active
+  layer instead of the pressed row (1 test fails); blend label shown for Normal
+  (1); Fill edit goes to opacity (1); chevron ignores the expanded state (1).
+- **Review round (judge REVISE, L2-1..L2-5).** (1) **Collapsed groups stay collapsed**:
+  expanding a group (chevron, `Right`, an AT `Expand`) or any other rebuild (undo,
+  a History jump) no longer reopens the others — `populate_layers_panel` reads which
+  group rows of the rows it replaces are collapsed (`TreeItemState::key` = layer id,
+  new) and re-collapses those that still exist; a layer that is gone drops out; a
+  **different document** (open, tab switch) starts expanded (`reset_layers_panel` in
+  `replace_document` and `bind_active_document`, since layer ids repeat across
+  documents); tests: collapse A + expand B keeps A collapsed (widget level and through
+  the app's `handle_action` + `reconcile_layer_rows` route), a reset forgets, a
+  removed group is dropped. (2) The two review-PNG tests now write to
+  `$AURORA_REVIEW_PNG_DIR`, else the system temp directory (printed). (3) A group's
+  accessible description names its blend mode unless it is Pass Through ("Group,
+  Normal", "Group, Multiply, hidden"; new groups are Normal, a PSD's are usually Pass
+  Through) — existing "Group" expectations were updated for Normal groups. (4) A
+  refused Fill history step at drag end leaves the layer at the value dragged to,
+  not the start. (5) `layer_row_key`'s decision is the pure `layer_row_key_action`
+  (modal/chord gating and each key), unit-tested. Not done (optional): a measured
+  blend-label width (L2-7) — the estimate stays, disclosed.
+- **Weaknesses, stated plainly.** No human has seen the panel in the live window,
+  on the Mac or anywhere; I only looked at a Linux/Vulkan render. `App::layer_row_key`
+  and the pointer press on the eye/chevron are wired and compile but have **no
+  end-to-end test** (no headless `App`); their pieces are tested. The name's right
+  limit is a character-count estimate of the blend label's width (no text engine in
+  `text_runs`), so a long name ellipsises a little early. The strip raises the Layers
+  panel's floor. Sliders, not numeric fields (above). The list's clip uses hard
+  edges. An expand still repopulates the whole panel, but collapsed groups now stay collapsed (below); a group nested under a collapsed ancestor forgets its own collapsed state when the ancestor collapses.
+  No design tokens were added; **missing ones**: an eye-column width, row icon
+  size/inset and the control-row caption/readout widths are composed from
+  `spacing.*` (xl, md, xs, xxl) — a design owner may want named tokens; Fill's
+  "100 %" readouts reuse `Label` colours.
+
+**Previously (2026-10-11, 0.194.0): round L1 of the Photoshop-style Layers panel — the
 vector icon foundation. No panel changes yet.**
 - **Decision** (design owner Cahya, 2026-10-11, reference
   `images/flat-design-nyepi-template/layers-panel.png`): the Layers panel is
@@ -33971,7 +34082,7 @@ here so they are not silently lost between phases.
 
 ## Next action
 
-**Layers panel series, round L2 (0.195.0):** rebuild the Layers rows Photoshop-style on the 0.194.0 icons — eye toggle, disclosure chevron, folder icon, name, blend label, nested indent — and the Blend / Opacity / Fill controls on top (see the 0.194.0 entry for L3–L5). The composite-grid anchoring follow-on below is unchanged.
+**Layers panel series, round L2 (0.195.0), done (see Where we are):** rebuilt the Layers rows Photoshop-style on the 0.194.0 icons — eye toggle, disclosure chevron, folder icon, name, blend label, nested indent — and the Blend / Opacity / Fill controls on top (see the 0.194.0 entry for L3–L5). The composite-grid anchoring follow-on below is unchanged.
 
 **Next round (follow-on from 0.193.0): anchor the composite grid to the document.** 0.193.0 clips the live canvas to the document and makes the near pan bound the document corner, with the grid anchor capped at the corner (`min(layer origin, 0)`). Anchoring the grid at the document corner always (then a negative-origin layer is just another layer) would let `composite_reference_origin` be a constant and simplify incremental invalidation, but changes every cached `TileId`; it needs the invalidation paths (`after_undo_redo`, `invalidate_doc_rects`, the background worker's reference-origin stamp) re-proved. Also open: bounding the far pan edge by the document, and centring a document smaller than the view.
 

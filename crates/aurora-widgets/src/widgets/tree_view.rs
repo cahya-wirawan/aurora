@@ -257,6 +257,21 @@ pub struct TreeItemState {
     /// collapsed group has none and must still announce "collapsed"
     /// rather than "leaf".
     pub has_children: bool,
+    /// Logical px between the row's left edge and where its label starts
+    /// (0.195.0): `0` keeps the row's own `spacing.sm` text inset, a larger
+    /// value leaves room for a caller's in-row content (the Layers panel's
+    /// eye, chevron and folder icons, which it places itself as
+    /// absolutely positioned children). Drawn only.
+    pub label_inset: u32,
+    /// A second, secondary-colour label drawn flush with the row's right
+    /// edge (0.195.0; the Layers panel's blend-mode name). Drawn only; the
+    /// accessible description stays the owner's to set.
+    pub trailing: Option<String>,
+    /// The owner's identity for this row (0.195.0; the Layers panel's
+    /// layer id), never drawn or announced. It lets an owner that rebuilds
+    /// every row (`aurora-ui`'s repopulation) carry per-row state, such as
+    /// "this group was collapsed", from the old rows to the new ones.
+    pub key: Option<u64>,
 }
 
 /// This row's accessibility node. `showing_children` is whether the row
@@ -592,6 +607,9 @@ pub fn insert_tree_item(
         selected: false,
         disabled: false,
         has_children,
+        label_inset: 0,
+        trailing: None,
+        key: None,
     };
     let id = tree.insert(
         parent,
@@ -735,6 +753,75 @@ pub fn set_tree_item_description(
         state.description = description.map(ToOwned::to_owned);
         Ok(())
     })
+}
+
+/// Makes `id` a **flat** row (0.195.0): no left indentation of its own
+/// (its box spans the full width of its parent, so a selection highlight
+/// reaches both edges) and its label drawn `label_inset` logical px from
+/// the left edge. The caller draws the nesting itself, inside that inset.
+/// The row's children are still nested rows, which are flat as well once
+/// the caller flattens them. Hit-testing and accessibility are unchanged.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] / [`WidgetError::WrongWidgetKind`].
+pub fn set_tree_item_flat(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    label_inset: u32,
+) -> Result<(), WidgetError> {
+    with_tree_item_mut(tree, id, |state| {
+        state.label_inset = label_inset;
+        Ok(())
+    })?;
+    let mut style = tree
+        .style(id)
+        .cloned()
+        .ok_or(WidgetError::UnknownWidget(id))?;
+    style.padding.left = zero();
+    tree.set_style(id, style)
+}
+
+/// Sets `id`'s owner key ([`TreeItemState::key`]).
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] / [`WidgetError::WrongWidgetKind`].
+pub fn set_tree_item_key(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    key: Option<u64>,
+) -> Result<(), WidgetError> {
+    with_tree_item_mut(tree, id, |state| {
+        state.key = key;
+        Ok(())
+    })
+}
+
+/// Sets the right-aligned secondary label of `id` (`None` clears it).
+/// Returns whether anything changed; an unchanged value touches nothing.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] / [`WidgetError::WrongWidgetKind`].
+pub fn set_tree_item_trailing(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    trailing: Option<&str>,
+) -> Result<bool, WidgetError> {
+    match tree.payload(id) {
+        Some(WidgetKind::TreeItem(state)) if state.trailing.as_deref() == trailing => {
+            return Ok(false);
+        }
+        Some(WidgetKind::TreeItem(_)) => {}
+        Some(_) => return Err(WidgetError::WrongWidgetKind(id)),
+        None => return Err(WidgetError::UnknownWidget(id)),
+    }
+    with_tree_item_mut(tree, id, |state| {
+        state.trailing = trailing.map(ToOwned::to_owned);
+        Ok(())
+    })?;
+    Ok(true)
 }
 
 /// Sets whether `id` (a tree row) is selected. Selection is per-row

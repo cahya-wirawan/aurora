@@ -2274,9 +2274,13 @@ mod icons {
         clippy::cast_sign_loss
     )]
     fn write_icon_review_sheet() {
-        const OUT: &str = "/tmp/claude-1000/-home-cahya-Work-MachineLearning-aurora/d855cbb3-6f26-4834-a925-3bf96e1088a2/scratchpad/icons-sheet.png";
         const CELL: u32 = 40;
         const ZOOM: u32 = 4;
+        // Lands in `$AURORA_REVIEW_PNG_DIR`, else the system temp directory.
+        let png_dir = std::env::var_os("AURORA_REVIEW_PNG_DIR")
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+        let _ = std::fs::create_dir_all(&png_dir);
+        let png_path = png_dir.join("icons-sheet.png");
         let Some(context) = real_context() else {
             return;
         };
@@ -2349,7 +2353,7 @@ mod icons {
                 }
             }
         }
-        let Ok(file) = std::fs::File::create(OUT) else {
+        let Ok(file) = std::fs::File::create(&png_path) else {
             unreachable!("the scratchpad directory exists");
         };
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), out_w, out_h);

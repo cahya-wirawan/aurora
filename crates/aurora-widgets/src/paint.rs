@@ -1213,7 +1213,7 @@ fn paint_icon(
     theme: &Theme,
     scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
-    if bounds != full {
+    if bounds.width == 0 || bounds.height == 0 {
         return Ok(vec![]);
     }
     let side = full.width.min(full.height) as f32;
@@ -1231,18 +1231,106 @@ fn paint_icon(
     let tolerance = tolerance_for_scale_factor(scale_factor);
     let paths = icon_paths(state.kind, origin, side);
     let mut paints = Vec::new();
+    // An icon an ancestor clips only partly (a scrolled Layers row) is cut
+    // to its visible rect, triangle by triangle (0.195.0).
+    let cut = |mesh: Mesh| {
+        if bounds == full {
+            mesh
+        } else {
+            clip_mesh(&mesh, bounds)
+        }
+    };
     if let Some(path) = &paths.fill {
         paints.push((
-            fill(path, tolerance).map_err(WidgetError::Paint)?,
+            cut(fill(path, tolerance).map_err(WidgetError::Paint)?),
             [r, g, b, 1.0],
         ));
     }
     if let Some(path) = &paths.stroke {
         let mesh =
             stroke_rounded(path, paths.stroke_width, tolerance).map_err(WidgetError::Paint)?;
-        paints.push((mesh, [r, g, b, 1.0]));
+        paints.push((cut(mesh), [r, g, b, 1.0]));
     }
     Ok(paints)
+}
+
+/// `mesh` cut to the axis-aligned `rect` (Sutherland-Hodgman, one triangle
+/// at a time, each clipped polygon fanned back into triangles). Geometry
+/// only: nothing is antialiased, like the rest of this module's meshes.
+fn clip_mesh(mesh: &Mesh, rect: Rect) -> Mesh {
+    #[allow(clippy::cast_precision_loss)]
+    let (x0, y0, x1, y1) = (
+        rect.x as f32,
+        rect.y as f32,
+        (rect.x + i64::from(rect.width)) as f32,
+        (rect.y + i64::from(rect.height)) as f32,
+    );
+    // (axis is x?, bound, keep greater side?)
+    let planes = [
+        (true, x0, true),
+        (true, x1, false),
+        (false, y0, true),
+        (false, y1, false),
+    ];
+    let mut out = Mesh::default();
+    for tri in mesh.indices.chunks_exact(3) {
+        let mut poly: Vec<Point> = tri
+            .iter()
+            .filter_map(|&i| mesh.vertices.get(i as usize).copied())
+            .collect();
+        if poly.len() != 3 {
+            continue;
+        }
+        for &(on_x, bound, keep_greater) in &planes {
+            let value = |p: &Point| if on_x { p.x } else { p.y };
+            let inside = |p: &Point| {
+                if keep_greater {
+                    value(p) >= bound
+                } else {
+                    value(p) <= bound
+                }
+            };
+            let input = std::mem::take(&mut poly);
+            let Some(mut previous) = input.last().copied() else {
+                break;
+            };
+            for current in &input {
+                let (cur_in, prev_in) = (inside(current), inside(&previous));
+                if cur_in != prev_in {
+                    let span = value(current) - value(&previous);
+                    let t = if span == 0.0 {
+                        0.0
+                    } else {
+                        (bound - value(&previous)) / span
+                    };
+                    poly.push(Point {
+                        x: previous.x + (current.x - previous.x) * t,
+                        y: previous.y + (current.y - previous.y) * t,
+                    });
+                }
+                if cur_in {
+                    poly.push(*current);
+                }
+                previous = *current;
+            }
+            if poly.is_empty() {
+                break;
+            }
+        }
+        if poly.len() < 3 {
+            continue;
+        }
+        let Ok(base) = u32::try_from(out.vertices.len()) else {
+            break;
+        };
+        out.vertices.extend(poly.iter().copied());
+        for k in 1..poly.len() - 1 {
+            #[allow(clippy::cast_possible_truncation)]
+            let k = k as u32;
+            out.indices.extend([base, base + k, base + k + 1]);
+        }
+    }
+    out
 }
 
 fn paint_button(
@@ -3164,6 +3252,76 @@ mod tests {
             theme.border.control_opacity * theme.state.disabled_opacity,
             "a disabled control's outline dims the same way its fill already does"
         );
+    }
+
+    /// 0.195.0: a mesh cut to a rect stays inside it and keeps the part
+    /// that was inside; a rect that contains it changes nothing.
+    #[test]
+    fn clip_mesh_cuts_triangles_to_the_rect() {
+        use super::clip_mesh;
+        use aurora_vector::{Mesh, Point};
+        let mesh = Mesh {
+            vertices: vec![
+                Point { x: 0.0, y: 0.0 },
+                Point { x: 20.0, y: 0.0 },
+                Point { x: 0.0, y: 20.0 },
+            ],
+            indices: vec![0, 1, 2],
+        };
+        let rect = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let cut = clip_mesh(&mesh, rect);
+        assert!(!cut.indices.is_empty());
+        for v in &cut.vertices {
+            assert!(
+                (0.0..=10.0).contains(&v.x) && (0.0..=10.0).contains(&v.y),
+                "{v:?}"
+            );
+        }
+        // Area: the unit-10 square minus the corner beyond x + y = 20 (none).
+        let area: f32 = cut
+            .indices
+            .chunks_exact(3)
+            .map(|t| {
+                let vertex = |index: u32| {
+                    cut.vertices
+                        .get(index as usize)
+                        .copied()
+                        .unwrap_or(Point { x: 0.0, y: 0.0 })
+                };
+                let [first, second, third] = t else {
+                    return 0.0;
+                };
+                let (a, b, c) = (vertex(*first), vertex(*second), vertex(*third));
+                ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)).abs() / 2.0
+            })
+            .sum();
+        assert!(
+            (area - 100.0).abs() < 1e-3,
+            "the whole 10 x 10 square survives: {area}"
+        );
+        let big = aurora_core::Rect {
+            x: -5,
+            y: -5,
+            width: 100,
+            height: 100,
+        };
+        let same = clip_mesh(&mesh, big);
+        assert_eq!(same.indices.len(), 3);
+        let none = clip_mesh(
+            &mesh,
+            aurora_core::Rect {
+                x: 50,
+                y: 50,
+                width: 5,
+                height: 5,
+            },
+        );
+        assert!(none.indices.is_empty());
     }
 
     #[test]

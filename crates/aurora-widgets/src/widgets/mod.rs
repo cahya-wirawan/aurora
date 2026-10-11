@@ -239,7 +239,8 @@ pub use text_field::{
 pub use tooltip::{Tooltip, TooltipPhase};
 pub use tree_view::{
     MAX_TREE_DEPTH, TreeItemState, insert_tree_item, insert_tree_view, set_tree_item_description,
-    set_tree_item_disabled, set_tree_item_expanded, set_tree_item_label, set_tree_item_selected,
+    set_tree_item_disabled, set_tree_item_expanded, set_tree_item_flat, set_tree_item_key,
+    set_tree_item_label, set_tree_item_selected, set_tree_item_trailing,
 };
 
 use accesskit::{Node, Role};

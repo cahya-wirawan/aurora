@@ -2219,7 +2219,7 @@ mod tests {
     }
 
     /// AC-4: a rail barely taller than every panel's floor (title, one
-    /// body row, one row per controls strip: 63 + 63 + 42 = 168 px) holds
+    /// body row, one row per controls strip: 145 + 63 + 42 = 250 px since 0.195.0, whose Layers controls strip — blend, Opacity and Fill — is three rows above the list) holds
     /// every part of every panel at one row or more, each inside its own
     /// panel — the Curves strip and the Layers controls strip included.
     /// The floor is what M9/M10/M11 of 0.161.0's mutation matrix remove.
@@ -2235,15 +2235,15 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         fill_panels(&mut ws, &scales, (true, false, true), 20);
-        ws.tree.compute_layout(1274.0, 172.0);
-        assert_stacked_inside_the_rail(&ws, "1274 x 172");
+        ws.tree.compute_layout(1274.0, 254.0);
+        assert_stacked_inside_the_rail(&ws, "1274 x 254");
         // 0.164.0: History is the other tab of Properties' slot; it is
         // checked with its own tab shown, below.
         let mut history_shown = build_workspace(&scales);
         fill_panels(&mut history_shown, &scales, (true, false, true), 20);
         super::show_history_tab(&mut history_shown);
-        history_shown.tree.compute_layout(1274.0, 172.0);
-        assert_stacked_inside_the_rail(&history_shown, "1274 x 172, History shown");
+        history_shown.tree.compute_layout(1274.0, 254.0);
+        assert_stacked_inside_the_rail(&history_shown, "1274 x 254, History shown");
         let (Some(rows), Some(panel)) = (
             history_shown.tree.bounds(history_shown.history.viewport),
             history_shown.tree.bounds(history_shown.history.root),

@@ -58,27 +58,28 @@
 //! `""` and `"   "`, and a row labelled with either is silent or
 //! indistinguishable to a screen reader.
 //!
-//! **Almost no pixel rendering.** A *selected* row does now paint a
-//! real, one-row-tall highlight: selection reaches the row's payload, so
-//! `aurora_widgets::paint_widget` draws it (that is the whole point of
-//! moving to the real widget). Everything else is still unpainted — no
-//! thumbnail or colour swatch, no visibility checkbox, no disclosure
-//! triangle for a group, and no drawn text at all, since a row's label
-//! reaches the accessibility node and nothing else
-//! (`aurora-vector`-backed glyph rendering doesn't exist yet).
+//! **Rows (0.195.0, round L2 of the Photoshop-style panel).** Each row is a
+//! *flat*, full-width tree row (`set_tree_item_flat`: no indentation of its
+//! own, so a selection highlight reaches both edges) with its content
+//! placed by this module: an **eye** (`IconAccess::Button`, a `Role::Button`
+//! named "Hide Post 1"/"Show Post 1" with `toggled`, `Click` only so it is
+//! never a tab stop) in a fixed column on the left, then — indented
+//! `spacing.md` per level — a disclosure **chevron** (groups with children;
+//! a blank spacer otherwise), a **folder** icon (groups; pixel and
+//! adjustment layers keep the blank spacer until round L4's thumbnails),
+//! the **name** (ellipsised) and, flush right in the secondary text colour,
+//! the **blend-mode name** when it is not `Normal` (nor `Pass Through` on a
+//! group). The icons are absolutely positioned children of the row, so the
+//! row's own accessibility node (tree item, name, `selected`, `expanded`,
+//! `level`) is exactly what it was; [`sync_layer_row`] keeps the icons and
+//! the blend label in step with the document, and [`layer_row_part`] tells
+//! the app which part of a row a pointer hit.
 //!
-//! **One `Tab` stop per layer row, and that is live in the app now.**
-//! Every enabled row declares `Action::Focus`, which is what
-//! `aurora_widgets::FocusManager` treats as focusable — so `Tab` through
-//! a 200-layer document is 200 stops inside this one panel before
-//! reaching Properties, where the conventional pattern is one stop on
-//! the tree plus arrow keys between rows. That is `tree_view`'s own
-//! disclosed, crate-wide focus-model question (see its module doc
-//! comment), not something this call site can settle; it is named here
-//! because this panel is the first shipping code that makes it a real
-//! user-visible cost, and pinned by this module's own
-//! `tab_order_currently_stops_on_every_layer_row` test so the redesign
-//! has a before-picture.
+//! **Focus model (unchanged, disclosed).** Every enabled row is still one
+//! `Tab` stop, as since 0.77.0 (pinned by
+//! `tab_order_currently_stops_on_every_layer_row`); the eye and chevron add
+//! none. Collapsing to one stop for the list is a crate-wide focus-model
+//! change this round does not make.
 //!
 //! **The panel's height is bounded, and excess rows are clipped rather
 //! than growing it** (0.77.1). `crate::panel`'s own `root_style`/
@@ -121,14 +122,18 @@
 
 use std::collections::HashMap;
 
-use aurora_doc::{LayerId, LayerKind, LayerTree, sanitize_display_name};
+use aurora_doc::{BlendMode, LayerId, LayerKind, LayerTree, sanitize_display_name};
 use aurora_theme::Scales;
+use aurora_widgets::icons::IconKind;
 use aurora_widgets::widgets::{
-    WidgetKind, insert_tree_item, insert_tree_view, set_tree_item_description,
+    IconAccess, IconSize, IconTone, WidgetKind, icon_state, insert_icon, insert_tree_item,
+    insert_tree_view, row_height, set_icon_access, set_icon_kind, set_icon_tone,
+    set_tree_item_description, set_tree_item_expanded, set_tree_item_flat, set_tree_item_key,
+    set_tree_item_selected, set_tree_item_trailing,
 };
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
-use taffy::style_helpers::{auto, percent};
-use taffy::{FlexDirection, Size, Style};
+use taffy::style_helpers::{auto, length, percent};
+use taffy::{FlexDirection, Position, Size, Style};
 
 use crate::panel::{PanelHandle, clear_panel_body};
 
@@ -148,6 +153,17 @@ const _: () = assert!(
      aurora_widgets::widgets::MAX_TREE_DEPTH (0-based) must stay exactly one apart"
 );
 
+/// Which part of a Layers row a widget is (see [`layer_row_part`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerRowPart {
+    /// The row itself, its name, its folder icon or its blank space.
+    Row,
+    /// The visibility eye.
+    Eye,
+    /// The group's disclosure chevron.
+    Chevron,
+}
+
 /// Inserts a real tree (`aurora_widgets::widgets::insert_tree_view`)
 /// under `panel.body`, then one `Role::TreeItem` row
 /// per layer in `layers` inside it — root layers first, top-to-bottom,
@@ -155,51 +171,17 @@ const _: () = assert!(
 /// group structure (a group's own layers become its row's children).
 /// Returns every inserted row's own id mapped to the `LayerId` it
 /// represents, so a caller can turn a real pointer hit or accessibility
-/// action back into "which layer".
+/// action back into "which layer". Each row carries its eye, chevron,
+/// folder icon and blend label as described in the module docs.
 ///
 /// **The tree is its own container under `panel.body` — the rows are
-/// not `panel.body`'s own children.** Originally that container was
-/// load-bearing: `crate::panel`'s own `body_style` left the body at
-/// `Style::default()`'s `FlexDirection::Row`, so tree rows (which are
-/// `width: percent(1.0)`) would have laid out side by side rather than
-/// stacked, and `insert_tree_view` brought its own
-/// `FlexDirection::Column` container to escape that.
-///
-/// **As of `0.77.2` it is no longer load-bearing, and it stays anyway.**
-/// The `Row` default was a real bug for every panel body, not just this
-/// one — it resolved each direct child of a body to a zero-width,
-/// full-height box that nothing could hit — and it was fixed where it
-/// actually lived, in the shared `body_style` itself. That is a fix a
-/// per-panel override could not have made: `crate::panel::
-/// set_panel_collapsed` resets the body to that same shared
-/// `body_style` on every collapse and expand, so an override set here
-/// would be silently discarded on the first round trip, while a change
-/// to the shared default is exactly what the reset restores. This
-/// container is therefore now redundant — kept because removing it
-/// would mean rewriting every test in this module's own tree-root
-/// traversal (`tree_root`) for no behavioural gain, and because
-/// `insert_tree_view` is also what carries the `Role::Tree` node.
-///
-/// **The tree container is deliberately unlabelled.** `panel.root` is
-/// already a `Role::Region` labelled "Layers"; naming the container
-/// inside it "Layers" too made a screen reader announce the name twice
-/// on entry. The History panel next door does the same thing, and
-/// `0.77.2` claimed here that it "avoided the same double-naming by
-/// relabelling the body" — it did not: relabelling the body to the
-/// identical string is the same duplicate one level shallower, and
-/// `0.77.3` dropped that label too. The rule both panels now follow is
-/// that the region names the panel and nothing nested inside it repeats
-/// that name. [`crate::populate_properties_panel`] is the exception that
-/// proves it: its body really is labelled, because "Properties: Brush"
-/// says something the region's bare "Properties" does not.
+/// not `panel.body`'s own children** (kept since 0.77.2 although no
+/// longer load-bearing; the tree container is also what carries the
+/// `Role::Tree` node) and it is deliberately unlabelled: the panel root
+/// is already the `Region` named "Layers".
 ///
 /// **Repopulating is safe**: `panel.body`'s existing children are
-/// removed first ([`crate::panel::clear_panel_body`]), so calling this
-/// twice replaces the rows instead of stacking a second `Role::Tree`
-/// container beside the first with the old, now-meaningless
-/// `WidgetId`s still live and hit-testable. Every caller in the
-/// workspace already cleared first; this makes the one that forgets a
-/// no-op rather than a corrupted panel.
+/// removed first ([`crate::panel::clear_panel_body`]).
 ///
 /// # Errors
 ///
@@ -213,14 +195,64 @@ pub fn populate_layers_panel(
     scales: &Scales,
     layers: &LayerTree,
 ) -> Result<HashMap<WidgetId, LayerId>, WidgetError> {
+    // Which groups the user had collapsed in the rows about to be
+    // replaced (0.195.0): a rebuild — an expand elsewhere, an undo, a
+    // History jump — must not reopen them.
+    let collapsed = collapsed_layer_keys(tree, panel.body);
     clear_panel_body(tree, panel.body)?;
     let view = insert_tree_view(tree, panel.body, None)?;
     tree.set_style(view, tree_container_style())?;
     let mut rows = HashMap::new();
+    let mut groups = Vec::new();
     for &id in layers.roots() {
-        insert_layer_row(tree, view, scales, layers, id, &mut rows)?;
+        insert_layer_row(tree, view, scales, layers, id, &mut rows, &mut groups)?;
     }
+    // Re-collapse those that still exist as groups, top-down: collapsing a
+    // row removes its descendants, so a nested one under it is skipped
+    // (its state is forgotten with it, as a collapse always has).
+    for (row, id) in groups {
+        if collapsed.contains(&id.to_raw()) && tree.contains(row) {
+            set_tree_item_expanded(tree, row, false)?;
+            sync_layer_row(tree, row, layers, id)?;
+        }
+    }
+    rows.retain(|&row, _| tree.contains(row));
     Ok(rows)
+}
+
+/// Forgets the Layers panel's rows, and with them which groups were
+/// collapsed — for a *different document* (an open, a switch of tab),
+/// whose layer ids mean nothing to the outgoing one's.
+///
+/// # Errors
+///
+/// As [`crate::clear_panel_body`].
+pub fn reset_layers_panel(
+    tree: &mut WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+) -> Result<(), WidgetError> {
+    clear_panel_body(tree, panel.body)
+}
+
+/// The keys ([`aurora_widgets::widgets::TreeItemState::key`], the layer
+/// id) of the group rows under `body` that are collapsed right now.
+fn collapsed_layer_keys(
+    tree: &WidgetTree<WidgetKind>,
+    body: WidgetId,
+) -> std::collections::HashSet<u64> {
+    let mut found = std::collections::HashSet::new();
+    let mut pending = vec![body];
+    while let Some(id) = pending.pop() {
+        if let Some(WidgetKind::TreeItem(state)) = tree.payload(id)
+            && state.has_children
+            && !state.expanded
+            && let Some(key) = state.key
+        {
+            found.insert(key);
+        }
+        pending.extend(tree.children(id).unwrap_or_default().iter().copied());
+    }
+    found
 }
 
 /// The Layers tree container's own layout (0.145.0): full body width and
@@ -244,6 +276,84 @@ fn tree_container_style() -> Style {
     }
 }
 
+/// Width of the fixed eye column on the left of every row
+/// (`spacing.xl`).
+fn eye_column(scales: &Scales) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let width = scales.spacing.xl as f32;
+    width
+}
+
+/// Where a row at `depth` puts its disclosure chevron (logical px from the
+/// row's left edge): past the eye column and a `spacing.xs` gap, then
+/// `spacing.md` per level.
+fn chevron_x(scales: &Scales, depth: usize) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let (gap, step) = (scales.spacing.xs as f32, scales.spacing.md as f32);
+    #[allow(clippy::cast_precision_loss)]
+    let levels = depth as f32;
+    eye_column(scales) + gap + levels * step
+}
+
+/// The icon side (`spacing.md`).
+fn icon_side(scales: &Scales) -> f32 {
+    aurora_widgets::widgets::icon_side(scales, IconSize::Small)
+}
+
+/// Where a row at `depth` starts its name: past the chevron and folder
+/// slots (one icon side each) and a `spacing.xs` gap.
+fn label_inset(scales: &Scales, depth: usize) -> u32 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let inset = (chevron_x(scales, depth) + 2.0 * icon_side(scales)).round() as u32;
+    inset + scales.spacing.xs
+}
+
+/// Absolutely positions `icon` inside its row at `(x, y)` (logical px from
+/// the row's top-left; the row's own `padding.top` band is where its line
+/// is, and an absolute child is placed against the row's padding box).
+fn place_icon(
+    tree: &mut WidgetTree<WidgetKind>,
+    icon: WidgetId,
+    x: f32,
+    y: f32,
+) -> Result<(), WidgetError> {
+    let mut style = tree
+        .style(icon)
+        .cloned()
+        .ok_or(WidgetError::UnknownWidget(icon))?;
+    style.position = Position::Absolute;
+    style.inset = taffy::Rect {
+        left: length(x),
+        right: auto(),
+        top: length(y),
+        bottom: auto(),
+    };
+    tree.set_style(icon, style)
+}
+
+fn display_name(layers: &LayerTree, id: LayerId) -> String {
+    // See `sanitize_display_name`'s module doc: names are bounded for
+    // display, and a blank one falls back, after sanitizing.
+    let sanitized = sanitize_display_name(layers.name(id).unwrap_or_default());
+    if sanitized.trim().is_empty() {
+        "Untitled Layer".to_owned()
+    } else {
+        sanitized.into_owned()
+    }
+}
+
+/// The blend-mode name a row shows at its right edge: `None` for `Normal`
+/// and, on a group, for `Pass Through` (its default).
+fn trailing_blend(layers: &LayerTree, id: LayerId) -> Option<&'static str> {
+    let mode = layers.blend_mode(id)?;
+    let is_group = layers.kind(id).is_some_and(LayerKind::is_group);
+    if mode == BlendMode::Normal || (is_group && mode == BlendMode::PassThrough) {
+        None
+    } else {
+        Some(crate::layer_controls::blend_mode_label(mode))
+    }
+}
+
 fn insert_layer_row(
     tree: &mut WidgetTree<WidgetKind>,
     parent: WidgetId,
@@ -251,63 +361,279 @@ fn insert_layer_row(
     layers: &LayerTree,
     id: LayerId,
     rows: &mut HashMap<WidgetId, LayerId>,
+    groups: &mut Vec<(WidgetId, LayerId)>,
 ) -> Result<WidgetId, WidgetError> {
-    // `LayerTree` stores whatever name the file gave it -- there is no
-    // length or content validation on `LayerTree::name`, deliberately,
-    // so the document round-trips unmodified. That makes sanitizing the
-    // *label* this panel's own job: see `sanitize_display_name`'s own
-    // module doc comment, and the History panel next door, which goes
-    // through the same bound via `History::journal_descriptions`.
-    //
-    // The fallback is applied *after* sanitizing, and to whitespace as
-    // well as to emptiness: a missing name is not the only way to get a
-    // blank row. Both `.aur` and PSD accept a layer literally named ""
-    // or "   " -- and so does `sanitize_display_name`'s own output, if
-    // the name was nothing but characters it strips. Any of those left
-    // the row with an empty or all-space accessible label, which a
-    // screen reader announces as nothing at all, and several such rows
-    // are then mutually indistinguishable.
-    let sanitized = sanitize_display_name(layers.name(id).unwrap_or_default());
-    let name: &str = if sanitized.trim().is_empty() {
-        "Untitled Layer"
-    } else {
-        sanitized.as_ref()
-    };
+    let name = display_name(layers, id);
     // "Non-empty group", not "is a group". `LayerTree::children` returns
-    // `None` for a pixel layer and `Some(&[])` for an *empty* group (its
-    // own doc comment says so), and `TreeItem`'s `has_children` is a
-    // declaration that there is something to expand. An empty group
-    // therefore becomes a leaf row -- correctly: it has nothing under
-    // it, and announcing "collapsed" over nothing is exactly the state
-    // `tree_view` refuses to produce. Its description still reads
-    // "Group", so a screen-reader user can still tell what it is.
-    //
-    // What `!children.is_empty()` is *not*: load-bearing for the node
-    // output of today's eager population. Mutation-tested during the
-    // 0.77.0 review round -- hardcoding this argument to `false` passed
-    // the entire `aurora-ui` + `aurora-app` suite, because
-    // `insert_tree_item` sets an ancestor's own `has_children`/`expanded`
-    // the moment a child is inserted under it, and the loop below always
-    // inserts a non-empty group's children immediately. Only the
-    // opposite mutation (`true`, marking a leaf as a group) is a real,
-    // test-caught bug. This expression stays because it is the correct
-    // thing for a caller to *declare* -- it matches `LayerKind::Group`'s
-    // real semantics, and it is what a lazily-populated (or
-    // populated-then-collapsed) group would depend on -- not because it
-    // changes any node this function currently produces.
+    // `None` for a pixel layer and `Some(&[])` for an *empty* group, and
+    // `TreeItem`'s `has_children` is a declaration that there is something
+    // to expand: an empty group is a leaf row (it has nothing to collapse)
+    // whose description still reads "Group".
     let children = layers.children(id).unwrap_or_default();
-    let row = insert_tree_item(tree, parent, scales, name, !children.is_empty())?;
-    // Through the widget's own setter, never onto the node: `tree_view`
-    // rebuilds a row's whole node from its `TreeItemState` on every
-    // mutation, including the one `insert_tree_item` performs on *this*
-    // row the moment the loop below inserts a child under it.
+    let is_group = layers.kind(id).is_some_and(LayerKind::is_group);
+    let row = insert_tree_item(tree, parent, scales, &name, !children.is_empty())?;
+    let depth = match tree.payload(row) {
+        Some(WidgetKind::TreeItem(state)) => state.depth,
+        _ => 0,
+    };
+    set_tree_item_flat(tree, row, label_inset(scales, depth))?;
+    set_tree_item_key(tree, row, Some(id.to_raw()))?;
+    if !children.is_empty() {
+        groups.push((row, id));
+    }
     set_tree_item_description(tree, row, Some(&layer_row_description(layers, id)))?;
+    set_tree_item_trailing(tree, row, trailing_blend(layers, id))?;
+
+    // In-row content: eye, then (groups) chevron and folder. Inserted
+    // before any child row so the row's own children stay rows-last.
+    let side = icon_side(scales);
+    let top = ((row_height(scales) - side) / 2.0).floor().max(0.0);
+    let visible = layers.visible(id).unwrap_or(true);
+    let eye = insert_icon(
+        tree,
+        row,
+        scales,
+        eye_kind(visible),
+        IconSize::Small,
+        IconTone::Default,
+        eye_access(&name, visible),
+    )?;
+    place_icon(tree, eye, (eye_column(scales) - side) / 2.0, top)?;
+    if !children.is_empty() {
+        let chevron = insert_icon(
+            tree,
+            row,
+            scales,
+            IconKind::ChevronDown,
+            IconSize::Small,
+            IconTone::Default,
+            IconAccess::Decorative,
+        )?;
+        place_icon(tree, chevron, chevron_x(scales, depth), top)?;
+    }
+    if is_group {
+        let folder = insert_icon(
+            tree,
+            row,
+            scales,
+            if children.is_empty() {
+                IconKind::FolderClosed
+            } else {
+                IconKind::FolderOpen
+            },
+            IconSize::Small,
+            IconTone::Default,
+            IconAccess::Decorative,
+        )?;
+        place_icon(tree, folder, chevron_x(scales, depth) + side, top)?;
+    }
     rows.insert(row, id);
 
     for &child in children {
-        insert_layer_row(tree, row, scales, layers, child, rows)?;
+        insert_layer_row(tree, row, scales, layers, child, rows, groups)?;
     }
     Ok(row)
+}
+
+const fn eye_kind(visible: bool) -> IconKind {
+    if visible {
+        IconKind::Eye
+    } else {
+        IconKind::EyeOff
+    }
+}
+
+fn eye_access(name: &str, visible: bool) -> IconAccess {
+    IconAccess::Button {
+        label: format!("{} {name}", if visible { "Hide" } else { "Show" }),
+        toggled: Some(visible),
+    }
+}
+
+/// A row's icon children, in insertion order: `(eye, chevron, folder)`.
+fn row_icons(
+    tree: &WidgetTree<WidgetKind>,
+    row: WidgetId,
+) -> (Option<WidgetId>, Option<WidgetId>, Option<WidgetId>) {
+    let (mut eye, mut chevron, mut folder) = (None, None, None);
+    for &child in tree.children(row).unwrap_or_default() {
+        let Some(WidgetKind::Icon(state)) = tree.payload(child) else {
+            continue;
+        };
+        match (&state.access, state.kind) {
+            (IconAccess::Button { .. }, _) => eye = Some(child),
+            (_, IconKind::ChevronRight | IconKind::ChevronDown) => chevron = Some(child),
+            (_, IconKind::FolderClosed | IconKind::FolderOpen) => folder = Some(child),
+            _ => {}
+        }
+    }
+    (eye, chevron, folder)
+}
+
+/// Brings `row` (showing layer `id`) in line with `layers` in place — its
+/// description, its blend-mode label, its eye (picture, name, `toggled`)
+/// and its chevron and folder (from the row's own expanded state) — and
+/// retones every icon for the row's selection (`OnAccent` on the
+/// highlight). Never inserts or removes a widget, so ids and focus
+/// survive. Returns whether anything changed.
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] / [`WidgetError::WrongWidgetKind`] if
+/// `row` is not a Layers row.
+pub fn sync_layer_row(
+    tree: &mut WidgetTree<WidgetKind>,
+    row: WidgetId,
+    layers: &LayerTree,
+    id: LayerId,
+) -> Result<bool, WidgetError> {
+    let (selected, expanded, description) = match tree.payload(row) {
+        Some(WidgetKind::TreeItem(state)) => (
+            state.selected,
+            state.expanded && state.has_children,
+            state.description.clone(),
+        ),
+        Some(_) => return Err(WidgetError::WrongWidgetKind(row)),
+        None => return Err(WidgetError::UnknownWidget(row)),
+    };
+    let mut changed = false;
+    let wanted = layer_row_description(layers, id);
+    if description.as_deref() != Some(wanted.as_str()) {
+        set_tree_item_description(tree, row, Some(&wanted))?;
+        changed = true;
+    }
+    changed |= set_tree_item_trailing(tree, row, trailing_blend(layers, id))?;
+    let visible = layers.visible(id).unwrap_or(true);
+    let (eye, chevron, folder) = row_icons(tree, row);
+    let tone = |secondary: bool| {
+        if selected {
+            IconTone::OnAccent
+        } else if secondary {
+            IconTone::Secondary
+        } else {
+            IconTone::Default
+        }
+    };
+    if let Some(eye) = eye {
+        changed |= set_icon_kind(tree, eye, eye_kind(visible))?;
+        changed |= set_icon_access(tree, eye, eye_access(&display_name(layers, id), visible))?;
+        changed |= set_icon_tone(tree, eye, tone(!visible))?;
+    }
+    if let Some(chevron) = chevron {
+        let kind = if expanded {
+            IconKind::ChevronDown
+        } else {
+            IconKind::ChevronRight
+        };
+        changed |= set_icon_kind(tree, chevron, kind)?;
+        changed |= set_icon_tone(tree, chevron, tone(false))?;
+    }
+    if let Some(folder) = folder {
+        let kind = if expanded {
+            IconKind::FolderOpen
+        } else {
+            IconKind::FolderClosed
+        };
+        changed |= set_icon_kind(tree, folder, kind)?;
+        changed |= set_icon_tone(tree, folder, tone(false))?;
+    }
+    Ok(changed)
+}
+
+/// Selects or deselects `row` and retones its icons for the highlight
+/// (the one call a caller makes instead of `set_tree_item_selected`).
+///
+/// # Errors
+///
+/// As `set_tree_item_selected`.
+pub fn set_layer_row_selected(
+    tree: &mut WidgetTree<WidgetKind>,
+    row: WidgetId,
+    selected: bool,
+) -> Result<(), WidgetError> {
+    set_tree_item_selected(tree, row, selected)?;
+    let (eye, chevron, folder) = row_icons(tree, row);
+    for icon in [eye, chevron, folder].into_iter().flatten() {
+        let secondary = matches!(icon_state(tree, icon)?.kind, IconKind::EyeOff);
+        let tone = if selected {
+            IconTone::OnAccent
+        } else if secondary {
+            IconTone::Secondary
+        } else {
+            IconTone::Default
+        };
+        set_icon_tone(tree, icon, tone)?;
+    }
+    Ok(())
+}
+
+/// Which part of a Layers row `hit` is, and the row: `hit` itself or the
+/// nearest ancestor in `rows`. The eye and chevron are told by what they
+/// are (an `IconAccess::Button`, a chevron icon); anything else inside a
+/// row — its name, its folder icon, blank space — is the row.
+#[must_use]
+pub fn layer_row_part<S: std::hash::BuildHasher>(
+    tree: &WidgetTree<WidgetKind>,
+    rows: &HashMap<WidgetId, LayerId, S>,
+    hit: WidgetId,
+) -> Option<(WidgetId, LayerRowPart)> {
+    let mut part = LayerRowPart::Row;
+    let mut current = Some(hit);
+    while let Some(id) = current {
+        if rows.contains_key(&id) {
+            return Some((id, part));
+        }
+        if let Some(WidgetKind::Icon(state)) = tree.payload(id) {
+            part = match (&state.access, state.kind) {
+                (IconAccess::Button { .. }, _) => LayerRowPart::Eye,
+                (_, IconKind::ChevronRight | IconKind::ChevronDown) => LayerRowPart::Chevron,
+                _ => LayerRowPart::Row,
+            };
+        }
+        current = tree.parent(id);
+    }
+    None
+}
+
+/// The row after (`forward`) or before `row` in on-screen order (a
+/// pre-order walk of the shown rows), for Up/Down navigation.
+#[must_use]
+pub fn layer_row_neighbor(
+    tree: &WidgetTree<WidgetKind>,
+    row: WidgetId,
+    forward: bool,
+) -> Option<WidgetId> {
+    let mut top = row;
+    while let Some(parent) = tree.parent(top) {
+        if matches!(tree.payload(parent), Some(WidgetKind::TreeItem(_))) {
+            top = parent;
+        } else {
+            break;
+        }
+    }
+    let view = tree.parent(top)?;
+    let mut order = Vec::new();
+    let mut pending: Vec<WidgetId> = tree
+        .children(view)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .copied()
+        .collect();
+    while let Some(id) = pending.pop() {
+        if !matches!(tree.payload(id), Some(WidgetKind::TreeItem(_))) {
+            continue;
+        }
+        order.push(id);
+        pending.extend(tree.children(id).unwrap_or_default().iter().rev().copied());
+    }
+    let at = order.iter().position(|&candidate| candidate == row)?;
+    if forward {
+        order.get(at + 1).copied()
+    } else {
+        at.checked_sub(1)
+            .and_then(|before| order.get(before).copied())
+    }
 }
 
 /// `"Group"` / `"Normal, 100%"` / `"Multiply, 80%, hidden"` /
@@ -330,7 +656,15 @@ pub fn layer_row_description(layers: &LayerTree, id: LayerId) -> String {
     let hidden = matches!(layers.visible(id), Some(false));
     let suffix = if hidden { ", hidden" } else { "" };
     match layers.kind(id) {
-        Some(LayerKind::Group { .. }) => format!("Group{suffix}"),
+        // A group names its blend mode too (0.195.0), unless it is Pass
+        // Through, the default: "Group, Multiply, hidden".
+        Some(LayerKind::Group { .. }) => match layers.blend_mode(id) {
+            Some(mode) if mode != BlendMode::PassThrough => format!(
+                "Group, {}{suffix}",
+                crate::layer_controls::blend_mode_label(mode)
+            ),
+            _ => format!("Group{suffix}"),
+        },
         Some(LayerKind::Pixel { .. }) => {
             format!("{}{suffix}", blend_and_opacity(layers, id))
         }
@@ -402,6 +736,16 @@ mod tests {
             [only] => *only,
             other => unreachable!("expected exactly one tree container, got {other:?}"),
         }
+    }
+
+    /// The tree rows directly under `row` (its icons are not rows).
+    fn child_rows(tree: &WidgetTree<WidgetKind>, row: WidgetId) -> Vec<WidgetId> {
+        tree.children(row)
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .filter(|&id| matches!(tree.payload(id), Some(WidgetKind::TreeItem(_))))
+            .collect()
     }
 
     /// Every row under `root`, in insertion order.
@@ -577,7 +921,7 @@ mod tests {
             unreachable!("just inserted");
         };
         assert_eq!(group_accessibility.label(), Some("Effects"));
-        assert_eq!(group_accessibility.description(), Some("Group"));
+        assert_eq!(group_accessibility.description(), Some("Group, Normal"));
         assert_eq!(group_accessibility.level(), Some(0));
         assert_eq!(
             group_accessibility.is_expanded(),
@@ -590,9 +934,7 @@ mod tests {
         );
         assert!(!group_accessibility.supports_action(accesskit::Action::Expand));
 
-        let Some(group_children) = tree.children(group_row) else {
-            unreachable!("just inserted");
-        };
+        let group_children = child_rows(&tree, group_row);
         assert_eq!(group_children.len(), 1);
         let Some(&child_row) = group_children.first() else {
             unreachable!("just asserted len() == 1");
@@ -954,7 +1296,7 @@ mod tests {
         assert_eq!(accessibility.label(), Some("Empty"));
         assert_eq!(
             accessibility.description(),
-            Some("Group"),
+            Some("Group, Normal"),
             "a screen-reader user must still be told this is a group"
         );
         assert_eq!(
@@ -1082,7 +1424,7 @@ mod tests {
         let Some(&group_row) = row_ids.first() else {
             unreachable!("one root row for the group");
         };
-        let Some(&child_row) = tree.children(group_row).unwrap_or_default().first() else {
+        let Some(&child_row) = child_rows(&tree, group_row).first() else {
             unreachable!("the group has one layer in it");
         };
         let (Some(group_bounds), Some(child_bounds)) =
@@ -1465,5 +1807,416 @@ mod tests {
             Err(aurora_widgets::WidgetError::UnknownWidget(id)) => assert_eq!(id, panel.body),
             other => unreachable!("expected UnknownWidget, got {other:?}"),
         }
+    }
+
+    // ---- 0.195.0: row structure ----
+
+    use super::{
+        LayerRowPart, layer_row_neighbor, layer_row_part, set_layer_row_selected, sync_layer_row,
+    };
+    use aurora_doc::BlendMode;
+    use aurora_widgets::icons::IconKind;
+    use aurora_widgets::widgets::{IconAccess, set_tree_item_expanded};
+
+    struct Sample {
+        tree: WidgetTree<WidgetKind>,
+        layers: LayerTree,
+        rows: std::collections::HashMap<WidgetId, aurora_doc::LayerId>,
+        group: aurora_doc::LayerId,
+        inner: aurora_doc::LayerId,
+        leaf: aurora_doc::LayerId,
+    }
+
+    /// `Post` (isolated group, Multiply) holding `Layer` (Normal); plus a
+    /// top-level pass-through group `Pass`.
+    fn sample() -> Sample {
+        let mut layers = LayerTree::new();
+        let group = ok(layers.add_group("Post", None));
+        ok(layers.set_blend_mode(group, BlendMode::Multiply));
+        let leaf = ok(layers.add_pixel_layer("Layer", bounds(), Some(group)));
+        let inner = ok(layers.add_pixel_layer("Inner", bounds(), Some(group)));
+        ok(layers.set_blend_mode(inner, BlendMode::Screen));
+        let _pass = ok(layers.add_group("Pass", None));
+        let scales = test_scales();
+        let (mut tree, root) = widgets::new_tree(Style {
+            size: taffy::Size {
+                width: length(300.0_f32),
+                height: length(600.0_f32),
+            },
+            flex_direction: taffy::FlexDirection::Column,
+            ..Default::default()
+        });
+        let panel = ok(insert_panel(&mut tree, root, "Layers", &scales));
+        let rows = ok(populate_layers_panel(&mut tree, panel, &scales, &layers));
+        tree.compute_layout(300.0, 600.0);
+        Sample {
+            tree,
+            layers,
+            rows,
+            group,
+            inner,
+            leaf,
+        }
+    }
+
+    fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    impl Sample {
+        fn row(&self, layer: aurora_doc::LayerId) -> WidgetId {
+            match self.rows.iter().find(|&(_, &id)| id == layer) {
+                Some((&row, _)) => row,
+                None => unreachable!("a row per layer"),
+            }
+        }
+        /// `(eye, chevron, folder)` icon kinds of a row.
+        fn icons(&self, layer: aurora_doc::LayerId) -> Vec<(IconKind, bool)> {
+            self.tree
+                .children(self.row(layer))
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|&c| match self.tree.payload(c) {
+                    Some(WidgetKind::Icon(state)) => Some((
+                        state.kind,
+                        matches!(state.access, IconAccess::Button { .. }),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        }
+        fn trailing(&self, layer: aurora_doc::LayerId) -> Option<String> {
+            match self.tree.payload(self.row(layer)) {
+                Some(WidgetKind::TreeItem(state)) => state.trailing.clone(),
+                _ => unreachable!("a row"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_nested_tree_gets_an_eye_a_chevron_a_folder_and_a_blend_label_where_they_belong() {
+        let s = sample();
+        // A group with children: eye, chevron (open), folder (open).
+        assert_eq!(
+            s.icons(s.group),
+            vec![
+                (IconKind::Eye, true),
+                (IconKind::ChevronDown, false),
+                (IconKind::FolderOpen, false)
+            ]
+        );
+        // A pixel layer: only the eye (the blank spacer is no widget).
+        assert_eq!(s.icons(s.leaf), vec![(IconKind::Eye, true)]);
+        // The blend label: shown for Multiply and Screen, absent for
+        // Normal and for a Pass Through group.
+        assert_eq!(s.trailing(s.group).as_deref(), Some("Multiply"));
+        assert_eq!(s.trailing(s.inner).as_deref(), Some("Screen"));
+        assert_eq!(s.trailing(s.leaf), None, "Normal shows no label");
+        let pass = s.layers.roots().first().copied();
+        let Some(pass) = pass else {
+            unreachable!("roots")
+        };
+        assert_eq!(s.trailing(pass), None, "Pass Through shows no label");
+        // An empty group is a leaf: an eye and a closed folder, no chevron.
+        assert_eq!(
+            s.icons(pass),
+            vec![(IconKind::Eye, true), (IconKind::FolderClosed, false)]
+        );
+        // Names align: a deeper row's label starts further right.
+        let inset = |layer| match s.tree.payload(s.row(layer)) {
+            Some(WidgetKind::TreeItem(state)) => state.label_inset,
+            _ => unreachable!("a row"),
+        };
+        assert!(inset(s.leaf) > inset(s.group), "one level deeper");
+    }
+
+    #[test]
+    fn the_eye_is_a_named_toggle_button_that_is_not_a_tab_stop_and_follows_visibility() {
+        let mut s = sample();
+        let eye = |s: &Sample| match s
+            .tree
+            .children(s.row(s.leaf))
+            .and_then(|c| c.first().copied())
+        {
+            Some(id) => id,
+            None => unreachable!("an eye"),
+        };
+        let node = |s: &Sample| match s.tree.accessibility(eye(s)) {
+            Some(n) => (
+                n.role(),
+                n.label().map(str::to_owned),
+                n.toggled(),
+                n.supports_action(accesskit::Action::Click),
+                n.supports_action(accesskit::Action::Focus),
+            ),
+            None => unreachable!("a node"),
+        };
+        assert_eq!(
+            node(&s),
+            (
+                accesskit::Role::Button,
+                Some("Hide Layer".to_owned()),
+                Some(accesskit::Toggled::True),
+                true,
+                false
+            )
+        );
+        ok(s.layers.set_visible(s.leaf, false));
+        let (row, leaf) = (s.row(s.leaf), s.leaf);
+        assert!(ok(sync_layer_row(&mut s.tree, row, &s.layers, leaf)));
+        assert_eq!(
+            node(&s),
+            (
+                accesskit::Role::Button,
+                Some("Show Layer".to_owned()),
+                Some(accesskit::Toggled::False),
+                true,
+                false
+            )
+        );
+        assert_eq!(s.icons(s.leaf), vec![(IconKind::EyeOff, true)]);
+        let described = s
+            .tree
+            .accessibility(row)
+            .and_then(|n| n.description().map(str::to_owned));
+        assert_eq!(described.as_deref(), Some("Normal, 100%, hidden"));
+        assert!(
+            !ok(sync_layer_row(&mut s.tree, row, &s.layers, leaf)),
+            "nothing to change twice"
+        );
+    }
+
+    #[test]
+    fn the_chevron_and_folder_follow_the_rows_expanded_state() {
+        let mut s = sample();
+        let (row, group) = (s.row(s.group), s.group);
+        ok(set_tree_item_expanded(&mut s.tree, row, false));
+        assert!(ok(sync_layer_row(&mut s.tree, row, &s.layers, group)));
+        assert_eq!(
+            s.icons(s.group),
+            vec![
+                (IconKind::Eye, true),
+                (IconKind::ChevronRight, false),
+                (IconKind::FolderClosed, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_press_resolves_to_the_row_the_eye_or_the_chevron() {
+        let s = sample();
+        let row = s.row(s.group);
+        let kids = s.tree.children(row).unwrap_or_default().to_vec();
+        let (Some(&eye), Some(&chevron), Some(&folder)) = (kids.first(), kids.get(1), kids.get(2))
+        else {
+            unreachable!("eye, chevron, folder");
+        };
+        assert_eq!(
+            layer_row_part(&s.tree, &s.rows, eye),
+            Some((row, LayerRowPart::Eye))
+        );
+        assert_eq!(
+            layer_row_part(&s.tree, &s.rows, chevron),
+            Some((row, LayerRowPart::Chevron))
+        );
+        assert_eq!(
+            layer_row_part(&s.tree, &s.rows, folder),
+            Some((row, LayerRowPart::Row))
+        );
+        assert_eq!(
+            layer_row_part(&s.tree, &s.rows, row),
+            Some((row, LayerRowPart::Row))
+        );
+        // A real hit on the eye's centre finds the eye, not the row.
+        let Some(b) = s.tree.bounds(eye) else {
+            unreachable!("laid out")
+        };
+        let at = (
+            (b.x + i64::from(b.width) / 2) as f32,
+            (b.y + i64::from(b.height) / 2) as f32,
+        );
+        assert_eq!(s.tree.hit_test(at), Some(eye));
+        // Rows are full width: a deeper row's own eye is in the same column.
+        let leaf_eye = s
+            .tree
+            .children(s.row(s.leaf))
+            .and_then(|c| c.first().copied());
+        let leaf_x = leaf_eye.and_then(|id| s.tree.bounds(id)).map(|b| b.x);
+        assert_eq!(leaf_x, Some(b.x), "the eye column does not indent");
+    }
+
+    #[test]
+    fn up_and_down_walk_the_shown_rows_in_screen_order() {
+        let s = sample();
+        let order: Vec<_> = {
+            let mut order = vec![];
+            let mut at = s
+                .rows
+                .keys()
+                .copied()
+                .find(|&r| layer_row_neighbor(&s.tree, r, false).is_none());
+            while let Some(row) = at {
+                order.push(row);
+                at = layer_row_neighbor(&s.tree, row, true);
+            }
+            order
+        };
+        let names: Vec<&str> = order
+            .iter()
+            .filter_map(|&r| s.rows.get(&r).and_then(|&id| s.layers.name(id)))
+            .collect();
+        assert_eq!(names, ["Pass", "Post", "Inner", "Layer"]);
+    }
+
+    #[test]
+    fn selecting_a_row_retones_its_icons_for_the_highlight() {
+        let mut s = sample();
+        let row = s.row(s.group);
+        ok(set_layer_row_selected(&mut s.tree, row, true));
+        for &c in s.tree.children(row).unwrap_or_default() {
+            if let Some(WidgetKind::Icon(state)) = s.tree.payload(c) {
+                assert_eq!(state.tone, aurora_widgets::widgets::IconTone::OnAccent);
+            }
+        }
+        ok(set_layer_row_selected(&mut s.tree, row, false));
+        let first = s.tree.children(row).and_then(|c| c.first().copied());
+        assert!(matches!(
+            first.and_then(|c| s.tree.payload(c)),
+            Some(WidgetKind::Icon(state)) if state.tone == aurora_widgets::widgets::IconTone::Default
+        ));
+    }
+
+    /// The eyes add no tab stops: the focusable widgets under the tree are
+    /// exactly the rows, however many layers there are.
+    #[test]
+    fn focusable_widgets_scale_with_rows_not_icons() {
+        let mut layers = LayerTree::new();
+        for index in 0..60 {
+            ok(layers.add_pixel_layer(format!("L{index}"), bounds(), None));
+        }
+        let scales = test_scales();
+        let (mut tree, root) = widgets::new_tree(Style::default());
+        let panel = ok(insert_panel(&mut tree, root, "Layers", &scales));
+        let rows = ok(populate_layers_panel(&mut tree, panel, &scales, &layers));
+        let mut stops = 0;
+        let mut pending = vec![panel.body];
+        while let Some(id) = pending.pop() {
+            if tree
+                .accessibility(id)
+                .is_some_and(|n| n.supports_action(accesskit::Action::Focus))
+            {
+                stops += 1;
+            }
+            pending.extend(tree.children(id).unwrap_or_default().iter().copied());
+        }
+        assert_eq!(rows.len(), 60);
+        assert_eq!(stops, 60, "one stop per row; the 60 eyes add none");
+    }
+
+    // ---- 0.195.0 review round: collapse memory, group description ----
+
+    fn two_groups() -> (
+        WidgetTree<WidgetKind>,
+        PanelHandle,
+        LayerTree,
+        aurora_doc::LayerId,
+        aurora_doc::LayerId,
+    ) {
+        let mut layers = LayerTree::new();
+        let a = ok(layers.add_group("A", None));
+        ok(layers.add_pixel_layer("a1", bounds(), Some(a)));
+        let b = ok(layers.add_group("B", None));
+        ok(layers.add_pixel_layer("b1", bounds(), Some(b)));
+        let (mut tree, root) = widgets::new_tree(Style {
+            size: taffy::Size {
+                width: length(300.0_f32),
+                height: length(600.0_f32),
+            },
+            flex_direction: taffy::FlexDirection::Column,
+            ..Default::default()
+        });
+        let panel = ok(insert_panel(&mut tree, root, "Layers", &test_scales()));
+        (tree, panel, layers, a, b)
+    }
+
+    fn row_for(
+        rows: &std::collections::HashMap<WidgetId, aurora_doc::LayerId>,
+        layer: aurora_doc::LayerId,
+    ) -> WidgetId {
+        match rows.iter().find(|&(_, &id)| id == layer) {
+            Some((&row, _)) => row,
+            None => unreachable!("a row per shown layer"),
+        }
+    }
+
+    /// Collapse A, then expand B (collapse B and expand it again, which is
+    /// what the app does before it repopulates): A stays collapsed.
+    #[test]
+    fn expanding_one_group_does_not_reopen_another_collapsed_one() {
+        let scales = test_scales();
+        let (mut tree, panel, layers, a, b) = two_groups();
+        let rows = ok(populate_layers_panel(&mut tree, panel, &scales, &layers));
+        ok(set_tree_item_expanded(&mut tree, row_for(&rows, a), false));
+        ok(set_tree_item_expanded(&mut tree, row_for(&rows, b), false));
+        // The expand request: state flips to expanded, rows are rebuilt.
+        ok(set_tree_item_expanded(&mut tree, row_for(&rows, b), true));
+        let rows = ok(populate_layers_panel(&mut tree, panel, &scales, &layers));
+        assert_eq!(rows.len(), 3, "A, B and b1: a1 stays hidden: {rows:?}");
+        let (row_a, row_b) = (row_for(&rows, a), row_for(&rows, b));
+        assert!(child_rows(&tree, row_a).is_empty(), "A stays collapsed");
+        assert_eq!(child_rows(&tree, row_b).len(), 1, "B is open");
+        let announced = |row| {
+            tree.accessibility(row)
+                .and_then(accesskit::Node::is_expanded)
+        };
+        assert_eq!(announced(row_a), Some(false));
+        assert_eq!(announced(row_b), Some(true));
+        let chevron = tree
+            .children(row_a)
+            .unwrap_or_default()
+            .iter()
+            .find_map(|&c| match tree.payload(c) {
+                Some(WidgetKind::Icon(state)) if state.kind == IconKind::ChevronRight => Some(c),
+                _ => None,
+            });
+        assert!(chevron.is_some(), "and its chevron points right");
+    }
+
+    #[test]
+    fn a_collapsed_group_that_no_longer_exists_is_dropped_and_a_reset_forgets_all() {
+        let scales = test_scales();
+        let (mut tree, panel, mut layers, a, _b) = two_groups();
+        let rows = ok(populate_layers_panel(&mut tree, panel, &scales, &layers));
+        ok(set_tree_item_expanded(&mut tree, row_for(&rows, a), false));
+        // A different document that happens to reuse the id: a reset
+        // forgets, so it starts expanded.
+        ok(super::reset_layers_panel(&mut tree, panel));
+        let rows = ok(populate_layers_panel(&mut tree, panel, &scales, &layers));
+        assert_eq!(rows.len(), 4, "everything expanded after a reset");
+        // And a layer that is gone cannot carry its state to another.
+        ok(set_tree_item_expanded(&mut tree, row_for(&rows, a), false));
+        let removed = layers.remove(a);
+        assert!(removed.is_ok());
+        let rows = ok(populate_layers_panel(&mut tree, panel, &scales, &layers));
+        assert_eq!(rows.len(), 2, "B and b1 only");
+    }
+
+    #[test]
+    fn a_group_names_its_blend_mode_in_its_description_unless_it_is_pass_through() {
+        let (_, _, mut layers, a, _) = two_groups();
+        // New groups are isolated (Normal); Pass Through is the other default.
+        assert_eq!(super::layer_row_description(&layers, a), "Group, Normal");
+        ok(layers.set_blend_mode(a, BlendMode::PassThrough));
+        assert_eq!(super::layer_row_description(&layers, a), "Group");
+        ok(layers.set_blend_mode(a, BlendMode::Multiply));
+        assert_eq!(super::layer_row_description(&layers, a), "Group, Multiply");
+        ok(layers.set_visible(a, false));
+        assert_eq!(
+            super::layer_row_description(&layers, a),
+            "Group, Multiply, hidden"
+        );
     }
 }

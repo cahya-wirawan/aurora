@@ -79,9 +79,14 @@ pub use history_panel::{
 pub use layer_controls::{
     LayerControls, blend_mode_at, blend_mode_index, blend_mode_index_for, blend_mode_label,
     blend_mode_options, blend_mode_options_for, insert_layer_controls, layer_controls_contains,
-    sync_layer_controls,
+    sync_layer_controls, sync_layer_readouts,
 };
-pub use layers_panel::{layer_row_description, populate_layers_panel};
+#[cfg(test)]
+mod layers_panel_render;
+pub use layers_panel::{
+    LayerRowPart, layer_row_description, layer_row_neighbor, layer_row_part, populate_layers_panel,
+    reset_layers_panel, set_layer_row_selected, sync_layer_row,
+};
 pub use panel::{
     FLOATING_DESCRIPTION, PanelHandle, PanelSizing, clear_panel_body, close_panel, insert_panel,
     panel_is_closed, panel_is_collapsed, panel_sizing, set_panel_collapsed, set_panel_sizing,

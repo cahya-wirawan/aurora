@@ -69,6 +69,8 @@ pub enum HAlign {
     /// Centred in the content box (overflowing both sides equally when
     /// wider than it).
     Center,
+    /// Flush with the content box's right edge (0.195.0).
+    End,
 }
 
 /// One line of widget text, ready to be resolved into glyph quads.
@@ -486,12 +488,51 @@ pub fn text_runs(
             } else {
                 theme.text.primary
             };
-            vec![ellipsized(run(
-                &state.label,
-                rgba(color, opacity(state.disabled, theme)),
-                inset_x((full.0, full.1, full.2, height), pad),
-                HAlign::Start,
-            ))]
+            let alpha_color = rgba(color, opacity(state.disabled, theme));
+            if state.label_inset == 0 && state.trailing.is_none() {
+                vec![ellipsized(run(
+                    &state.label,
+                    alpha_color,
+                    inset_x((full.0, full.1, full.2, height), pad),
+                    HAlign::Start,
+                ))]
+            } else {
+                // A flat row with in-row content (0.195.0): the label starts
+                // after the caller's icons; a trailing label (secondary,
+                // `text.on_accent` on a selected row) is flush right. The
+                // label's box stops short of it by a generous estimate of
+                // the trailing text's width (no text engine is available
+                // here), so the two never overlap.
+                let left = full.0 + token_px(state.label_inset);
+                let right = full.0 + full.2 - pad;
+                let reserve = state.trailing.as_ref().map_or(0.0, |text| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let chars = text.chars().count() as f32;
+                    chars * style.size_px * 0.6 + pad
+                });
+                let label_box = (left, full.1, (right - reserve - left).max(0.0), height);
+                let mut runs = vec![ellipsized(run(
+                    &state.label,
+                    alpha_color,
+                    label_box,
+                    HAlign::Start,
+                ))];
+                if let Some(trailing) = &state.trailing {
+                    let secondary = if state.selected {
+                        theme.text.on_accent
+                    } else {
+                        theme.text.secondary
+                    };
+                    let box_w = (right - left).max(0.0);
+                    runs.push(run(
+                        trailing,
+                        rgba(secondary, opacity(state.disabled, theme)),
+                        (left, full.1, box_w, height),
+                        HAlign::End,
+                    ));
+                }
+                runs
+            }
         }
         WidgetKind::Dropdown(state) => state
             .selected_option()
@@ -821,6 +862,7 @@ fn place(engine: &mut TextEngine, run: &TextRun, scale_factor: f32, scroll: f32)
     let start_x = match run.align {
         HAlign::Start => x,
         HAlign::Center => x + (w - line.width) / 2.0,
+        HAlign::End => x + w - line.width,
     } - scroll;
     let baseline_logical = y + h / 2.0 + (line.ascent - line.descent) / 2.0;
     if !(baseline_logical * scale_factor).is_finite() || !(start_x * scale_factor).is_finite() {
@@ -1317,6 +1359,56 @@ mod tests {
         assert!(
             runs.get(1)
                 .is_some_and(|run| (run.rect.0 + run.rect.2 - right).abs() < 0.5)
+        );
+    }
+
+    /// 0.195.0: a flat tree row starts its label after the owner's inset
+    /// and draws its trailing label flush right, in the secondary colour
+    /// (`text.on_accent` when selected).
+    #[test]
+    fn a_flat_tree_row_insets_its_label_and_right_aligns_a_trailing_label() {
+        use crate::widgets::{
+            insert_tree_item, insert_tree_view, new_tree, set_tree_item_flat,
+            set_tree_item_selected, set_tree_item_trailing,
+        };
+        let scales = crate::widgets::test_scales();
+        let theme = dark_theme();
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let view = ok(insert_tree_view(&mut tree, root, None));
+        let row = ok(insert_tree_item(&mut tree, view, &scales, "Vector", false));
+        ok(set_tree_item_flat(&mut tree, row, 80));
+        ok(set_tree_item_trailing(&mut tree, row, Some("Multiply")));
+        place(&mut tree, row, 10, 0, 300, 21);
+        let bounds = Rect {
+            x: 10,
+            y: 0,
+            width: 300,
+            height: 21,
+        };
+        let runs = text_runs(&tree, row, bounds, bounds, None, &theme, &scales);
+        let (Some(name), Some(blend)) = (runs.first(), runs.get(1)) else {
+            unreachable!("name and trailing runs: {runs:?}");
+        };
+        assert!(
+            (name.rect.0 - 90.0).abs() < 0.01,
+            "label at row.x + inset: {:?}",
+            name.rect
+        );
+        assert_eq!(blend.align, HAlign::End);
+        assert_eq!(blend.text, "Multiply");
+        assert!(
+            name.rect.0 + name.rect.2 < blend.rect.0 + blend.rect.2 - 20.0,
+            "the name's box stops short of the right edge"
+        );
+        assert_ne!(name.color, blend.color, "secondary, not primary");
+        ok(set_tree_item_selected(&mut tree, row, true));
+        let runs = text_runs(&tree, row, bounds, bounds, None, &theme, &scales);
+        assert_eq!(runs.first().map(|r| r.color), runs.get(1).map(|r| r.color));
+        // No trailing label: one run only.
+        ok(set_tree_item_trailing(&mut tree, row, None));
+        assert_eq!(
+            text_runs(&tree, row, bounds, bounds, None, &theme, &scales).len(),
+            1
         );
     }
 
