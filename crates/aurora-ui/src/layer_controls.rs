@@ -1,30 +1,33 @@
-//! The Layers panel's **editable** controls (0.135.0): an opacity slider,
-//! a blend-mode dropdown and a visibility checkbox for the *active* layer
-//! — the first panel widgets in the running app that edit a live
+//! The Layers panel's **editable** controls: a blend-mode dropdown, an
+//! Opacity slider (0.135.0) and a Fill slider (0.195.0), each with a live
+//! "100 %" readout, for the *active* layer — widgets that edit a live
 //! document. PLAN.md M1.8, "Layers, history, tool-options panels".
 //!
-//! **Where they live.** [`crate::populate_layers_panel`] clears the whole
-//! of `panel.body` on every call (it is the only way layer rows are
-//! built), so anything inside the body would be destroyed and re-created
-//! with fresh `WidgetId`s on every structural change — including mid-drag.
-//! The strip is therefore a second child of the panel's own *root*, a
-//! sibling after the body: it survives every repopulation, and
-//! [`crate::set_panel_collapsed`] hides it with the body. It sits
-//! **below** the layer list rather than above it, because `WidgetTree`
-//! only appends children and the body already exists by the time the
-//! strip is inserted. Since 0.161.0 it shrinks with the panel once the
-//! rows above it are down to their one-row floor, never below one row
-//! itself (`min_size.height`), and is a scroll container then (no visible
-//! scrollbar yet), so a short rail never pushes it over the Properties
-//! panel.
+//! **Where they live (0.195.0: above the list).** [`crate::populate_layers_panel`]
+//! clears the whole of `panel.body` on every call (it is the only way layer
+//! rows are built), so anything inside the body would be destroyed and
+//! re-created with fresh `WidgetId`s on every structural change —
+//! including mid-drag. The strip is therefore a child of the panel's own
+//! *root*, moved (`WidgetTree::move_child`) to sit right after the title
+//! row and before the list's viewport, as in Photoshop; it survives every
+//! repopulation, and [`crate::set_panel_collapsed`] hides it with the body.
+//! It never shrinks (the list takes the squeeze). The old visibility
+//! checkbox is gone: every row's eye replaces it.
+//!
+//! **Sliders, not numeric fields.** The reference uses `[100 %]` fields.
+//! `aurora-widgets` has no validated numeric field (its `TextField` is a
+//! free-text editor with no per-field parse-and-commit route in the app),
+//! so Opacity and Fill are sliders with a "100 %" readout label; the drag
+//! is one undo step. **Fill is not applied to a Pass Through group** (it
+//! is reported, design decision 3), so its slider is disabled there and
+//! its row says why in its accessible description.
 //!
 //! **This module knows nothing about undo.** It builds the controls,
 //! mirrors a document's state into them ([`sync_layer_controls`]), and
 //! names the blend modes ([`blend_mode_label`]). Turning a widget outcome
-//! into a document edit — live opacity drag, one undo step per gesture —
-//! is `aurora-app`'s job, the same split the gallery panel draws.
+//! into a document edit — live drag, one undo step per gesture — is
+//! `aurora-app`'s job, the same split the gallery panel draws.
 
-use accesskit::Toggled;
 use aurora_doc::{BlendMode, LayerId, LayerTree};
 use aurora_theme::Scales;
 use aurora_widgets::widgets::{self, WidgetKind};
@@ -34,18 +37,25 @@ use taffy::{FlexDirection, Rect as LayoutRect, Size, Style};
 
 use crate::panel::PanelHandle;
 
-/// The three controls, plus the strip that holds them.
+/// The controls, plus the strip that holds them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayerControls {
     /// The strip container — a child of the Layers panel's root.
     pub root: WidgetId,
     /// Opacity, in percent (`0..=100`).
     pub opacity: WidgetId,
+    /// Fill, in percent (`0..=100`); disabled for a Pass Through group.
+    pub fill: WidgetId,
+    /// The Opacity slider's "100 %" readout.
+    pub opacity_readout: WidgetId,
+    /// The Fill slider's "100 %" readout.
+    pub fill_readout: WidgetId,
+    /// The Fill row (its accessible description carries the reason when
+    /// Fill is disabled).
+    pub fill_row: WidgetId,
     /// Blend mode; option `i` is `BlendMode::modes_for(is_group)[i]` for
     /// the active layer (Pass Through first for a group, 0.179.0).
     pub blend: WidgetId,
-    /// Whether the active layer is visible.
-    pub visible: WidgetId,
 }
 
 /// The blend-mode dropdown's options for a pixel or adjustment layer:
@@ -130,24 +140,40 @@ pub const fn blend_mode_label(mode: BlendMode) -> &'static str {
     }
 }
 
+/// The fixed width of a control row's caption ("Opacity"): `spacing.xxl`
+/// plus `spacing.xs`.
+fn caption_width(scales: &Scales) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let width = (scales.spacing.xxl + scales.spacing.xs) as f32;
+    width
+}
+
+/// The fixed width of a readout ("100 %"): `spacing.xxl`.
+fn readout_width(scales: &Scales) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let width = scales.spacing.xxl as f32;
+    width
+}
+
+/// The strip's rows: the blend dropdown, Opacity and Fill.
+const CONTROL_ROWS: f32 = 3.0;
+
 fn strip_style(scales: &Scales) -> Style {
     #[allow(clippy::cast_precision_loss)]
     let pad = length(scales.spacing.sm as f32);
     #[allow(clippy::cast_precision_loss)]
-    let gap = length(scales.spacing.sm as f32);
+    let gap = length(scales.spacing.xs as f32);
+    let row = widgets::row_height(scales);
+    #[allow(clippy::cast_precision_loss)]
+    let chrome = 2.0 * scales.spacing.sm as f32 + 2.0 * scales.spacing.xs as f32;
     Style {
         flex_direction: FlexDirection::Column,
-        // 0.161.0: shrinks and scrolls like the Properties strip, never
-        // below one row (`crate::tool_controls`' `strip_style` explains),
-        // so a short rail cannot push it over the Properties panel.
-        flex_shrink: 1.0,
+        // Above the list (0.195.0): never shrunk; the list's viewport
+        // takes the squeeze and scrolls. Its floor is its own content.
+        flex_shrink: 0.0,
         min_size: Size {
             width: taffy::Dimension::ZERO,
-            height: length(widgets::row_height(scales)),
-        },
-        overflow: taffy::Point {
-            x: taffy::Overflow::Hidden,
-            y: taffy::Overflow::Hidden,
+            height: length(CONTROL_ROWS * row + chrome),
         },
         gap: Size {
             width: gap,
@@ -163,10 +189,25 @@ fn strip_style(scales: &Scales) -> Style {
     }
 }
 
-/// Adds the controls strip to `panel` (the Layers panel) as the last
-/// child of its root — outside `panel.body`, see this module's doc
-/// comment. The controls start disabled, showing `Normal`, `100%` and
-/// visible; call [`sync_layer_controls`] to show a real layer.
+fn control_row_style(scales: &Scales) -> Style {
+    #[allow(clippy::cast_precision_loss)]
+    let gap = length(scales.spacing.xs as f32);
+    Style {
+        flex_direction: FlexDirection::Row,
+        align_items: Some(taffy::AlignItems::CENTER),
+        flex_shrink: 0.0,
+        gap: Size {
+            width: gap,
+            height: gap,
+        },
+        ..Default::default()
+    }
+}
+
+/// Adds the controls strip to `panel` (the Layers panel) as a child of
+/// its root, **between the title row and the list** (see this module's
+/// doc comment). The controls start disabled, showing `Normal`, `100 %`
+/// and `100 %`; call [`sync_layer_controls`] to show a real layer.
 ///
 /// # Errors
 ///
@@ -179,13 +220,40 @@ pub fn insert_layer_controls(
 ) -> Result<LayerControls, WidgetError> {
     let root = widgets::insert_container(tree, panel.root, strip_style(scales))?;
     let built = tree
-        .set_scrollable(root, true)
+        .move_child(root, panel.root, 1)
         .and_then(|()| build(tree, root, scales))
         .and_then(|controls| crate::panel::refresh_panel_floor(tree, panel).map(|()| controls));
     if built.is_err() {
         let _ = tree.remove(root);
     }
     built
+}
+
+/// One captioned slider row: `[caption | slider | readout]`.
+fn slider_row(
+    tree: &mut WidgetTree<WidgetKind>,
+    root: WidgetId,
+    scales: &Scales,
+    caption: &str,
+) -> Result<(WidgetId, WidgetId, WidgetId), WidgetError> {
+    let mut node = accesskit::Node::new(accesskit::Role::Group);
+    node.set_label(caption.to_owned());
+    let row = tree.insert(root, control_row_style(scales), node, WidgetKind::Container)?;
+    let label = widgets::insert_label(tree, row, scales, caption)?;
+    let mut label_style = tree.style(label).cloned().unwrap_or_default();
+    label_style.size.width = length(caption_width(scales));
+    tree.set_style(label, label_style)?;
+    let slider = widgets::insert_slider(tree, row, scales, caption, 100.0, 0.0, 100.0)?;
+    let readout = widgets::insert_label(tree, row, scales, percent_text(100.0))?;
+    let mut readout_style = tree.style(readout).cloned().unwrap_or_default();
+    readout_style.size.width = length(readout_width(scales));
+    tree.set_style(readout, readout_style)?;
+    Ok((row, slider, readout))
+}
+
+/// `"100 %"`.
+fn percent_text(percent: f64) -> String {
+    format!("{percent:.0} %")
 }
 
 fn build(
@@ -201,59 +269,133 @@ fn build(
         blend_mode_options(),
         blend_mode_index(BlendMode::Normal),
     )?;
-    let opacity = widgets::insert_slider(tree, root, scales, "Opacity", 100.0, 0.0, 100.0)?;
-    let visible = widgets::insert_checkbox(tree, root, scales, "Visible")?;
-    widgets::set_checkbox_checked(tree, visible, Toggled::True)?;
+    let (_, opacity, opacity_readout) = slider_row(tree, root, scales, "Opacity")?;
+    let (fill_row, fill, fill_readout) = slider_row(tree, root, scales, "Fill")?;
     let controls = LayerControls {
         root,
         opacity,
+        fill,
+        opacity_readout,
+        fill_readout,
+        fill_row,
         blend,
-        visible,
     };
-    set_disabled(tree, controls, true)?;
+    set_disabled(tree, controls, true, false)?;
     Ok(controls)
 }
+
+/// Why Fill is off for a Pass Through group (its row's description).
+const FILL_PASS_THROUGH_REASON: &str =
+    "Fill is not applied to a Pass Through group; choose another blend mode to use it";
 
 fn set_disabled(
     tree: &mut WidgetTree<WidgetKind>,
     controls: LayerControls,
     disabled: bool,
+    fill_unavailable: bool,
 ) -> Result<bool, WidgetError> {
     let mut changed = false;
-    if let Some(WidgetKind::Slider(state)) = tree.payload(controls.opacity)
-        && state.disabled != disabled
-    {
-        widgets::set_slider_disabled(tree, controls.opacity, disabled)?;
-        changed = true;
+    let fill_disabled = disabled || fill_unavailable;
+    for (slider, off) in [(controls.opacity, disabled), (controls.fill, fill_disabled)] {
+        if let Some(WidgetKind::Slider(state)) = tree.payload(slider)
+            && state.disabled != off
+        {
+            widgets::set_slider_disabled(tree, slider, off)?;
+            changed = true;
+        }
+    }
+    for (readout, off) in [
+        (controls.opacity_readout, disabled),
+        (controls.fill_readout, fill_disabled),
+    ] {
+        changed |= widgets::set_label_disabled(tree, readout, off)?;
     }
     if widgets::dropdown_state(tree, controls.blend)?.is_disabled() != disabled {
         widgets::set_dropdown_disabled(tree, controls.blend, disabled)?;
         changed = true;
     }
-    if let Some(WidgetKind::Checkbox(state)) = tree.payload(controls.visible)
-        && state.disabled != disabled
-    {
-        widgets::set_checkbox_disabled(tree, controls.visible, disabled)?;
+    // The reason travels on the Fill row, so a screen reader that lands on
+    // the dimmed control hears why.
+    let wanted = (fill_unavailable && !disabled).then_some(FILL_PASS_THROUGH_REASON);
+    let current = tree
+        .accessibility(controls.fill_row)
+        .and_then(|node| node.description().map(str::to_owned));
+    if current.as_deref() != wanted {
+        let mut node = accesskit::Node::new(accesskit::Role::Group);
+        node.set_label("Fill".to_owned());
+        if let Some(reason) = wanted {
+            node.set_description(reason.to_owned());
+        }
+        tree.set_accessibility(controls.fill_row, node)?;
         changed = true;
     }
     Ok(changed)
 }
 
-/// Mirrors `active`'s opacity, blend mode and visibility into
-/// `controls`, in place — never inserting or removing a widget, so the
-/// ids a caller holds (and a pointer capture on the slider) stay valid.
-/// Returns whether anything changed; a control already showing the right
-/// state is not touched at all, so this is cheap enough for a caller to
-/// run on every event-loop iteration as a catch-all.
+/// Mirrors one slider and its readout from `target` percent, unless the
+/// slider is `captured` (a drag is the source of truth).
+fn sync_slider(
+    tree: &mut WidgetTree<WidgetKind>,
+    slider: WidgetId,
+    readout: WidgetId,
+    target: f64,
+    captured: Option<WidgetId>,
+) -> Result<bool, WidgetError> {
+    if captured == Some(slider) {
+        return Ok(false);
+    }
+    let mut changed = false;
+    let shown = match tree.payload(slider) {
+        Some(WidgetKind::Slider(state)) => state.value,
+        _ => return Err(WidgetError::WrongWidgetKind(slider)),
+    };
+    if shown.to_bits() != target.to_bits() {
+        widgets::set_slider_value(tree, slider, target)?;
+        changed = true;
+    }
+    changed |= widgets::set_label_text(tree, readout, &percent_text(target))?;
+    Ok(changed)
+}
+
+/// Updates the readouts of a slider being dragged (the document follows
+/// the slider, so only the text needs to follow the slider).
 ///
-/// `None`, or an id `layers` doesn't know, disables all three (their
+/// # Errors
+///
+/// Returns whatever the label setter returns for a wrong widget.
+pub fn sync_layer_readouts(
+    tree: &mut WidgetTree<WidgetKind>,
+    controls: LayerControls,
+) -> Result<bool, WidgetError> {
+    let mut changed = false;
+    for (slider, readout) in [
+        (controls.opacity, controls.opacity_readout),
+        (controls.fill, controls.fill_readout),
+    ] {
+        if let Some(WidgetKind::Slider(state)) = tree.payload(slider) {
+            let text = percent_text(state.value);
+            changed |= widgets::set_label_text(tree, readout, &text)?;
+        }
+    }
+    Ok(changed)
+}
+
+/// Mirrors `active`'s opacity, fill and blend mode into `controls`, in
+/// place — never inserting or removing a widget, so the ids a caller
+/// holds (and a pointer capture on a slider) stay valid. Returns whether
+/// anything changed; a control already showing the right state is not
+/// touched at all, so this is cheap enough for a caller to run on every
+/// event-loop iteration as a catch-all.
+///
+/// `None`, or an id `layers` doesn't know, disables everything (their
 /// shown values are left as they were). `Some` re-enables them *first*,
-/// since `set_slider_value` refuses a disabled slider.
+/// since `set_slider_value` refuses a disabled slider; Fill stays
+/// disabled while `active` is a Pass Through group (not applied there).
 ///
 /// `captured` is the widget currently holding pointer capture: when it
-/// is the opacity slider, the slider's value is **not** overwritten —
-/// mid-drag it is the source of truth and the document follows it, and
-/// writing the document's value back would fight the pointer.
+/// is a slider, that slider's value is **not** overwritten — mid-drag it
+/// is the source of truth and the document follows it, and writing the
+/// document's value back would fight the pointer. Its readout follows it.
 ///
 /// # Errors
 ///
@@ -267,24 +409,32 @@ pub fn sync_layer_controls(
     captured: Option<WidgetId>,
 ) -> Result<bool, WidgetError> {
     let Some(id) = active.filter(|&id| layers.contains(id)) else {
-        return set_disabled(tree, controls, true);
+        return set_disabled(tree, controls, true, false);
     };
-    let mut changed = set_disabled(tree, controls, false)?;
-    if captured != Some(controls.opacity) {
-        let target = f64::from(layers.opacity(id).unwrap_or(1.0)) * 100.0;
-        let shown = match tree.payload(controls.opacity) {
-            Some(WidgetKind::Slider(state)) => state.value,
-            _ => return Err(WidgetError::WrongWidgetKind(controls.opacity)),
-        };
-        if shown.to_bits() != target.to_bits() {
-            widgets::set_slider_value(tree, controls.opacity, target)?;
-            changed = true;
-        }
+    let is_group = layers.kind(id).is_some_and(aurora_doc::LayerKind::is_group);
+    let mode = layers.blend_mode(id).unwrap_or_default();
+    let fill_unavailable = is_group && mode == BlendMode::PassThrough;
+    let mut changed = set_disabled(tree, controls, false, fill_unavailable)?;
+    changed |= sync_slider(
+        tree,
+        controls.opacity,
+        controls.opacity_readout,
+        f64::from(layers.opacity(id).unwrap_or(1.0)) * 100.0,
+        captured,
+    )?;
+    changed |= sync_slider(
+        tree,
+        controls.fill,
+        controls.fill_readout,
+        f64::from(layers.fill_opacity(id).unwrap_or(1.0)) * 100.0,
+        captured,
+    )?;
+    if captured.is_some() {
+        changed |= sync_layer_readouts(tree, controls)?;
     }
     // A group lists Pass Through first and anything else does not list it
     // at all (0.179.0), so the options follow the active layer's kind.
-    let is_group = layers.kind(id).is_some_and(aurora_doc::LayerKind::is_group);
-    let index = blend_mode_index_for(is_group, layers.blend_mode(id).unwrap_or_default());
+    let index = blend_mode_index_for(is_group, mode);
     let options = blend_mode_options_for(is_group);
     let shown = widgets::dropdown_state(tree, controls.blend)?;
     if shown.options() != options.as_slice() {
@@ -292,17 +442,6 @@ pub fn sync_layer_controls(
         changed = true;
     } else if shown.selected() != index {
         widgets::set_dropdown_selected(tree, controls.blend, index)?;
-        changed = true;
-    }
-    let checked = if layers.visible(id).unwrap_or(true) {
-        Toggled::True
-    } else {
-        Toggled::False
-    };
-    if let Some(WidgetKind::Checkbox(state)) = tree.payload(controls.visible)
-        && state.checked != checked
-    {
-        widgets::set_checkbox_checked(tree, controls.visible, checked)?;
         changed = true;
     }
     Ok(changed)
@@ -327,7 +466,6 @@ mod tests {
     };
     use crate::layers_panel::populate_layers_panel;
     use crate::workspace::{build_workspace, set_rail_width};
-    use accesskit::Toggled;
     use aurora_core::Rect;
     use aurora_doc::{BlendMode, LayerId, LayerTree};
     use aurora_theme::Scales;
@@ -387,10 +525,10 @@ mod tests {
         }
     }
 
-    fn checkbox_checked(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> (Toggled, bool) {
+    fn label_text(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> String {
         match tree.payload(id) {
-            Some(WidgetKind::Checkbox(state)) => (state.checked, state.disabled),
-            other => unreachable!("expected Checkbox, got {other:?}"),
+            Some(WidgetKind::Label(state)) => state.text.clone(),
+            other => unreachable!("expected Label, got {other:?}"),
         }
     }
 
@@ -439,7 +577,7 @@ mod tests {
             controls.root,
             controls.opacity,
             controls.blend,
-            controls.visible,
+            controls.fill,
         ] {
             assert!(
                 tree.contains(id),
@@ -454,7 +592,7 @@ mod tests {
     }
 
     fn assert_hittable(tree: &WidgetTree<WidgetKind>, controls: &LayerControls) {
-        for id in [controls.opacity, controls.blend, controls.visible] {
+        for id in [controls.opacity, controls.blend, controls.fill] {
             let Some(bounds) = tree.bounds(id) else {
                 unreachable!("laid out");
             };
@@ -550,14 +688,14 @@ mod tests {
     }
 
     #[test]
-    fn sync_reflects_opacity_blend_mode_and_visibility() {
+    fn sync_reflects_opacity_blend_mode_and_fill() {
         let (mut ws, controls) = built(1600.0, 900.0);
         let tree = &mut ws.tree;
         let (mut layers, id) = doc();
         let results = [
             layers.set_opacity(id, 0.4),
             layers.set_blend_mode(id, BlendMode::Multiply),
-            layers.set_visible(id, false),
+            layers.set_fill_opacity(id, 0.25),
         ];
         assert!(results.iter().all(Result::is_ok));
         if let Err(err) = sync_layer_controls(tree, controls, &layers, Some(id), None) {
@@ -570,10 +708,11 @@ mod tests {
             dropdown_selected(tree, controls.blend),
             (blend_mode_index(BlendMode::Multiply), false)
         );
-        assert_eq!(
-            checkbox_checked(tree, controls.visible),
-            (Toggled::False, false)
-        );
+        let (fill, fill_disabled) = slider_value(tree, controls.fill);
+        assert!((fill - 25.0).abs() < 1e-4, "got {fill}");
+        assert!(!fill_disabled);
+        assert_eq!(label_text(tree, controls.opacity_readout), "40 %");
+        assert_eq!(label_text(tree, controls.fill_readout), "25 %");
         assert!(
             matches!(
                 sync_layer_controls(tree, controls, &layers, Some(id), None),
@@ -596,13 +735,64 @@ mod tests {
         }
         assert!(slider_value(tree, controls.opacity).1);
         assert!(dropdown_selected(tree, controls.blend).1);
-        assert!(checkbox_checked(tree, controls.visible).1);
+        assert!(slider_value(tree, controls.fill).1);
         if let Err(err) = sync_layer_controls(tree, controls, &layers, Some(id), None) {
             unreachable!("{err:?}");
         }
         assert!(!slider_value(tree, controls.opacity).1);
         assert!(!dropdown_selected(tree, controls.blend).1);
-        assert!(!checkbox_checked(tree, controls.visible).1);
+        assert!(!slider_value(tree, controls.fill).1);
+    }
+
+    #[test]
+    fn the_strip_sits_between_the_title_and_the_list_in_the_panel_order() {
+        let (ws, controls) = built(1600.0, 900.0);
+        let children = ws.tree.children(ws.layers.root).unwrap_or_default();
+        assert_eq!(
+            children,
+            &[ws.layers.header, controls.root, ws.layers.viewport],
+            "title, controls, list"
+        );
+        let labels: Vec<Option<String>> = [controls.opacity, controls.fill]
+            .iter()
+            .map(|&id| {
+                ws.tree
+                    .accessibility(id)
+                    .and_then(|n| n.label().map(str::to_owned))
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [Some("Opacity".to_owned()), Some("Fill".to_owned())]
+        );
+    }
+
+    #[test]
+    fn fill_follows_the_layer_and_is_disabled_with_a_reason_for_a_pass_through_group() {
+        let (mut ws, controls) = built(1600.0, 900.0);
+        let tree = &mut ws.tree;
+        let (mut layers, pixel) = doc();
+        let group = match layers.add_group("g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let reason = |tree: &WidgetTree<WidgetKind>| {
+            tree.accessibility(controls.fill_row)
+                .and_then(|n| n.description().map(str::to_owned))
+        };
+        // Pass Through: Fill off, with the reason.
+        assert!(layers.set_blend_mode(group, BlendMode::PassThrough).is_ok());
+        assert!(sync_layer_controls(tree, controls, &layers, Some(group), None).is_ok());
+        assert!(slider_value(tree, controls.fill).1);
+        assert!(reason(tree).is_some_and(|text| text.contains("Pass Through")));
+        // An isolated group: Fill on, no reason.
+        assert!(layers.set_blend_mode(group, BlendMode::Normal).is_ok());
+        assert!(sync_layer_controls(tree, controls, &layers, Some(group), None).is_ok());
+        assert!(!slider_value(tree, controls.fill).1);
+        assert_eq!(reason(tree), None);
+        // A pixel layer: Fill on.
+        assert!(sync_layer_controls(tree, controls, &layers, Some(pixel), None).is_ok());
+        assert!(!slider_value(tree, controls.fill).1);
     }
 
     /// AC-5 (0.179.0): a group's dropdown lists Pass Through first and

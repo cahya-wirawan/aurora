@@ -184,6 +184,13 @@ pub(crate) fn bind_active_document(cx: &mut SwitchContext<'_>) {
     // The session's own active layer is the preferred one; only a layer
     // that no longer exists falls back.
     let preferred = cx.doc.active_layer;
+    // The other document's collapsed groups mean nothing here.
+    if let Err(err) = aurora_ui::reset_layers_panel(&mut cx.workspace.tree, cx.workspace.layers) {
+        tracing::warn!(
+            ?err,
+            "failed to reset the Layers panel for the incoming document"
+        );
+    }
     rebuild_layer_rows(
         cx.workspace,
         cx.focus,

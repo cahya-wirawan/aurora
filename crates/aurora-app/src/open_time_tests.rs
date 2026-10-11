@@ -306,3 +306,46 @@ fn nyepi_tiles_are_the_0_188_0_tiles_with_the_overlap_off() {
     assert_eq!(overlapped_layers, 0);
     assert_eq!(in_place, NYEPI_FINGERPRINT_0_188_0);
 }
+
+/// Populating the Layers panel for the Nyepi template's ~223 layers in 9
+/// nested groups (0.195.0, round L2): the per-row widgets must keep the
+/// population well under one frame. Run with `cargo test -p aurora-app
+/// --release -- --ignored --nocapture nyepi_layers_panel_populate`.
+#[test]
+#[ignore = "measurement on the user's template"]
+fn nyepi_layers_panel_populate() {
+    let Some(path) = nyepi_path() else {
+        println!("SKIPPED: the Nyepi template is not present");
+        return;
+    };
+    let (_dir, store) = new_store();
+    let document = ok(crate::PreparedPsd::stream(
+        &path,
+        Some(&store.staging_root()),
+    ));
+    let layers = &document.layers;
+    let scales = ok(crate::load_scales());
+    let mut workspace = aurora_ui::build_workspace(&scales);
+    let mut best = std::time::Duration::MAX;
+    let mut rows = 0;
+    for _ in 0..7 {
+        let started = Instant::now();
+        let map = ok(aurora_ui::populate_layers_panel(
+            &mut workspace.tree,
+            workspace.layers,
+            &scales,
+            layers,
+        ));
+        let elapsed = started.elapsed();
+        rows = map.len();
+        best = best.min(elapsed);
+    }
+    workspace.tree.compute_layout(1600.0, 900.0);
+    let started = Instant::now();
+    workspace.tree.compute_layout(1600.0, 900.0);
+    let layout = started.elapsed();
+    println!(
+        "NYEPI layers panel: {rows} rows, populate best of 7 {best:?}, full relayout {layout:?}, {} widgets",
+        workspace.tree.len()
+    );
+}

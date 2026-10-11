@@ -33,3 +33,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 accesskit = { workspace = true }
 taffy = { workspace = true }
+
+[dev-dependencies]
+# Only the ignored `layers_panel_render::write_layers_panel_png`, which renders the Layers
+# panel on a real GPU and writes a review PNG.
+aurora-gpu = { workspace = true, features = ["test-support"] }
+png = { workspace = true }
+wgpu = { workspace = true }

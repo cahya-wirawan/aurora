@@ -339,6 +339,7 @@ fn live_gestures_during_a_switch_are_committed_to_the_outgoing_document() {
     rig.layer_controls.pending = Some(PendingOpacity {
         layer: top,
         start: 1.0,
+        fill: false,
     });
     rig.curves_ui.pending = Some(PendingCurves {
         layer: curves,

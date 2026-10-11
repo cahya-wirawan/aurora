@@ -95,6 +95,20 @@ pub enum IconAccess {
     /// The icon carries meaning on its own: a `Role::Image` with this
     /// accessible name.
     Named(String),
+    /// The icon is itself a small button (0.195.0, the Layers panel's eye):
+    /// a `Role::Button` with this accessible name, `toggled` as accesskit's
+    /// toggle state when it has one, and **`Click` only** — never `Focus`,
+    /// so it is not a tab stop (a row of a long list owns the one stop;
+    /// the icon is reached by a pointer, by an assistive technology's
+    /// `Click`, or by the owner's own key). Clicking does **not** flip
+    /// `toggled`: like [`crate::widgets::ButtonState`], the owner decides
+    /// what a click means and sets the state back
+    /// ([`set_icon_access`]). It paints no outline or fill of its own: the
+    /// picture is the whole control.
+    Button {
+        label: String,
+        toggled: Option<bool>,
+    },
 }
 
 /// An icon's size class: a spacing token, a square.
@@ -135,6 +149,18 @@ fn node(state: &IconState) -> Node {
             if state.tone == IconTone::Disabled {
                 node.set_disabled();
             }
+        }
+        IconAccess::Button { label, toggled } => {
+            node = Node::new(Role::Button);
+            node.set_label(label.clone());
+            if let Some(on) = toggled {
+                node.set_toggled(if *on {
+                    accesskit::Toggled::True
+                } else {
+                    accesskit::Toggled::False
+                });
+            }
+            node.add_action(accesskit::Action::Click);
         }
     }
     node
@@ -451,9 +477,61 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         tree.compute_layout(100.0, 100.0);
+        let drawn = paints(&tree, id, 1.0);
+        assert!(!drawn.is_empty(), "the visible 10 px of the icon is drawn");
+        let Some(clip_bounds) = tree.bounds(clip) else {
+            unreachable!("laid out");
+        };
+        let limit = (clip_bounds.y + i64::from(clip_bounds.height)) as f32;
+        let mut full_height = 0.0_f32;
+        for (mesh, _) in &drawn {
+            for vertex in &mesh.vertices {
+                assert!(
+                    vertex.y <= limit + 1e-3,
+                    "no vertex spills below the clip: {} > {limit}",
+                    vertex.y
+                );
+                full_height = full_height.max(vertex.y);
+            }
+        }
         assert!(
-            paints(&tree, id, 1.0).is_empty(),
-            "16 px icon in a 10 px clip"
+            full_height > limit - 1.5,
+            "the cut reaches the clip edge: {full_height} vs {limit}"
+        );
+    }
+
+    /// 0.195.0: a button icon is a `Role::Button` with `Click` only (never
+    /// a tab stop), and `handle_action` reports its click as `Activated`.
+    #[test]
+    fn a_button_icon_is_a_click_only_toggle_button() {
+        let (mut tree, id) = one(IconAccess::Button {
+            label: "Hide Post 1".into(),
+            toggled: Some(true),
+        });
+        let Some(node) = tree.accessibility(id) else {
+            unreachable!("exists");
+        };
+        assert_eq!(node.role(), Role::Button);
+        assert_eq!(node.label(), Some("Hide Post 1"));
+        assert_eq!(node.toggled(), Some(accesskit::Toggled::True));
+        assert!(node.supports_action(Action::Click));
+        assert!(!node.supports_action(Action::Focus), "not a tab stop");
+        let mut focus = crate::FocusManager::new();
+        let outcome = crate::handle_action(
+            &mut tree,
+            &mut focus,
+            &accesskit::ActionRequest {
+                action: Action::Click,
+                target_tree: crate::ACCESSIBILITY_TREE_ID,
+                target_node: id,
+                data: None,
+            },
+        );
+        assert!(matches!(outcome, Ok(crate::ActionOutcome::Activated(clicked)) if clicked == id));
+        // Clicking never flips the state itself.
+        assert_eq!(
+            tree.accessibility(id).and_then(accesskit::Node::toggled),
+            Some(accesskit::Toggled::True)
         );
     }
 

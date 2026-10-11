@@ -1,0 +1,311 @@
+//! A headless render of the Layers panel for a human to look at (0.195.0):
+//! the production workspace layout and paint ops on a real GPU, cropped to
+//! the panel. `#[ignore]`d: it asserts only that something was drawn.
+//! The PNGs (`layers-panel.png` at scale 2, `layers-panel-1x.png`) land in
+//! `$AURORA_REVIEW_PNG_DIR`, else the system temp directory; the test prints
+//! the paths.
+//! Run: `AURORA_REQUIRE_GPU=1 cargo test -p aurora-ui --lib
+//! write_layers_panel_png -- --ignored --nocapture`.
+
+#![cfg(test)]
+
+use aurora_core::Rect;
+use aurora_doc::{BlendMode, LayerTree};
+use aurora_text::TextEngine;
+use aurora_theme::{Palette, Scales, Theme, ThemeSet};
+use aurora_widgets::widgets::{WidgetKind, set_tree_item_expanded};
+use aurora_widgets::{
+    GlyphAtlas, GradientPipeline, PathPipeline, TextPipeline, draw_paint_ops,
+    paint_widget_ops_frame, upload_paint_ops,
+};
+
+/// Where the review PNGs land: `$AURORA_REVIEW_PNG_DIR` if set, else the
+/// system temp directory (created if needed).
+fn review_png(name: &str) -> std::path::PathBuf {
+    let dir = std::env::var_os("AURORA_REVIEW_PNG_DIR")
+        .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(name)
+}
+
+fn scales() -> Scales {
+    match Scales::from_toml_str(include_str!("../../../design/tokens/scales.toml")) {
+        Ok(scales) => scales,
+        Err(err) => unreachable!("{err:?}"),
+    }
+}
+
+fn dark_theme() -> Theme {
+    let Ok(palette) = Palette::from_toml_str(include_str!("../../../design/tokens/palette.toml"))
+    else {
+        unreachable!()
+    };
+    let mut themes = ThemeSet::new();
+    if themes
+        .register(include_str!("../../../design/themes/dark.toml"))
+        .is_err()
+    {
+        unreachable!()
+    }
+    match themes.resolve("Dark", &palette) {
+        Ok(theme) => theme,
+        Err(err) => unreachable!("{err:?}"),
+    }
+}
+
+fn bounds() -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        width: 64,
+        height: 64,
+    }
+}
+
+fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(err) => unreachable!("{err:?}"),
+    }
+}
+
+/// Renders the whole workspace at `scale` and returns the RGBA bytes and
+/// the physical size.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn render_workspace(
+    context: &aurora_gpu::GpuContext,
+    ws: &crate::Workspace,
+    scale: f32,
+    logical: (f32, f32),
+) -> (Vec<u8>, u32, u32) {
+    let (theme, scales) = (dark_theme(), scales());
+    let (width, height) = ((logical.0 * scale) as u32, (logical.1 * scale) as u32);
+    let mut ops = Vec::new();
+    for id in ws.tree.paint_order() {
+        ops.extend(ok(paint_widget_ops_frame(
+            &ws.tree, id, None, None, &theme, &scales, scale,
+        )));
+    }
+    let device = context.device();
+    let queue = context.queue();
+    let mut engine = ok(TextEngine::new());
+    let mut atlas = GlyphAtlas::new(device);
+    let gpu = upload_paint_ops(device, queue, &mut engine, &mut atlas, ops, scale, |c| c);
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("layers-panel-target"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut path = PathPipeline::new(device);
+    let mut gradient = GradientPipeline::new(device);
+    let mut text = TextPipeline::new(device);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("layers-panel"),
+    });
+    {
+        let [r, g, b] = theme.surface.app.to_srgb_f32();
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("layers-panel"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: f64::from(r),
+                        g: f64::from(g),
+                        b: f64::from(b),
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        draw_paint_ops(
+            &mut pass,
+            &mut path,
+            &mut gradient,
+            &mut text,
+            &atlas,
+            device,
+            queue,
+            format,
+            logical,
+            &gpu,
+        );
+    }
+    let bytes_per_row = width * 4;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("layers-panel-readback"),
+        size: u64::from(bytes_per_row) * u64::from(height),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    let Ok(Ok(())) = rx.recv() else {
+        unreachable!("map_async completes once the device is idle");
+    };
+    let Ok(data) = slice.get_mapped_range() else {
+        unreachable!("just mapped");
+    };
+    let bytes = data.to_vec();
+    drop(data);
+    readback.unmap();
+    (bytes, width, height)
+}
+
+#[test]
+#[ignore = "writes a PNG for human review"]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn write_layers_panel_png() {
+    let Some(context) = aurora_gpu::test_support::real_context_or_skip() else {
+        return;
+    };
+    let scales = scales();
+    // The sample document: an expanded group holding an expanded group, a
+    // hidden layer and a Multiply layer; a collapsed group; a Background.
+    let mut layers = LayerTree::new();
+    let _background = ok(layers.add_pixel_layer("Background", bounds(), None));
+    let post2 = ok(layers.add_group("Post 2", None));
+    let logo = ok(layers.add_pixel_layer("Logo", bounds(), Some(post2)));
+    ok(layers.set_visible(logo, false));
+    let vso = ok(layers.add_pixel_layer("Vector Smart Object", bounds(), Some(post2)));
+    ok(layers.set_blend_mode(vso, BlendMode::Multiply));
+    let effect = ok(layers.add_group("Effect", Some(post2)));
+    ok(layers.set_blend_mode(effect, BlendMode::Normal));
+    let _glow = ok(layers.add_pixel_layer("Glow", bounds(), Some(effect)));
+    let post1 = ok(layers.add_group("Post 1", None));
+    let _child = ok(layers.add_pixel_layer("Title", bounds(), Some(post1)));
+    ok(layers.set_blend_mode(post1, BlendMode::SoftLight));
+    ok(layers.add_group("Post 3", None).map(|_| ()));
+
+    let mut ws = crate::build_workspace(&scales);
+    let rows = ok(crate::populate_layers_panel(
+        &mut ws.tree,
+        ws.layers,
+        &scales,
+        &layers,
+    ));
+    let row_of = |layer| {
+        rows.iter()
+            .find(|&(_, &id)| id == layer)
+            .map(|(&row, _)| row)
+    };
+    // Collapse "Post 1" the way the app does (rows removed, icons synced).
+    let Some(post1_row) = row_of(post1) else {
+        unreachable!("a row per layer");
+    };
+    ok(set_tree_item_expanded(&mut ws.tree, post1_row, false));
+    ok(crate::sync_layer_row(
+        &mut ws.tree,
+        post1_row,
+        &layers,
+        post1,
+    ));
+    // The active row, and the controls showing it.
+    let Some(vso_row) = row_of(vso) else {
+        unreachable!("a row per layer");
+    };
+    ok(crate::set_layer_row_selected(&mut ws.tree, vso_row, true));
+    let controls = ok(crate::insert_layer_controls(
+        &mut ws.tree,
+        ws.layers,
+        &scales,
+    ));
+    ok(crate::sync_layer_controls(
+        &mut ws.tree,
+        controls,
+        &layers,
+        Some(vso),
+        None,
+    ));
+    // Scale 2 is the user's Retina case; scale 1 is written beside it.
+    for (scale, name) in [
+        (2.0_f32, review_png("layers-panel.png")),
+        (1.0, review_png("layers-panel-1x.png")),
+    ] {
+        let logical = (1280.0_f32, 800.0_f32);
+        ws.tree.compute_layout(logical.0, logical.1);
+        let (bytes, width, _height) = render_workspace(&context, &ws, scale, logical);
+        let Some(panel) = ws.tree.bounds(ws.layers.root) else {
+            unreachable!("laid out");
+        };
+        let (x0, y0) = (
+            (panel.x as f32 * scale) as u32,
+            (panel.y as f32 * scale) as u32,
+        );
+        let (w, h) = (
+            (panel.width as f32 * scale) as u32,
+            ((panel.height as f32).min(420.0) * scale) as u32,
+        );
+        let mut crop = Vec::with_capacity((w * h * 4) as usize);
+        for y in y0..y0 + h {
+            let from = ((y * width + x0) * 4) as usize;
+            if let Some(row) = bytes.get(from..from + (w * 4) as usize) {
+                crop.extend_from_slice(row);
+            }
+        }
+        assert!(crop.iter().any(|&b| b != 0), "something was drawn");
+        let file = ok(std::fs::File::create(&name));
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = ok(encoder.write_header());
+        ok(writer.write_image_data(&crop));
+        println!("wrote {}", name.display());
+    }
+    let _: Option<&WidgetKind> = None;
+}
