@@ -38183,9 +38183,22 @@ mod tests {
         let Some(session) = tile_store_scratch_dir() else {
             unreachable!("a scratch directory is always creatable in a real test environment");
         };
-        super::remove_scratch_dir(session);
+        // Other tests in this process open tile stores in parallel, and
+        // each one recreates the shared session directory
+        // (`create_private_dir`), so a single sweep can be undone before
+        // the assertion below runs (seen once under load, 0.185.1). Sweep
+        // until it stays gone; the premise is then real, not a race.
+        let mut swept = false;
+        for _ in 0..50 {
+            super::remove_scratch_dir(session);
+            if !session.exists() {
+                swept = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
         assert!(
-            !session.exists(),
+            swept,
             "this test's premise is a session directory that has been swept away"
         );
 
@@ -81443,6 +81456,7 @@ mod occlusion_cull_tests {
             println!("SKIPPED: corpus absent");
             return;
         }
+        let root_display = root.display().to_string();
         let mut pending = vec![root];
         let mut files = Vec::new();
         while let Some(dir) = pending.pop() {
@@ -81459,6 +81473,14 @@ mod occlusion_cull_tests {
             }
         }
         files.sort();
+        // The corpus is fetched by `corpora/psd/reference/fetch-samples.sh`
+        // and is not in git, so CI has the directory (its README and
+        // manifest are tracked) but no PSD files. Skip rather than fail
+        // the "the corpus exercises …" assertions below (0.185.1).
+        if files.is_empty() {
+            println!("SKIPPED: corpus not fetched (no .psd/.psb under {root_display})");
+            return;
+        }
         let (mut compared, mut culled_total, mut culled_files) = (0, 0, 0);
         for path in &files {
             let Ok(bytes) = std::fs::read(path) else {

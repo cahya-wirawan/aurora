@@ -26,7 +26,32 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.185.0): a RAM-sized, shared tile residency
+**Latest (2026-10-11, 0.185.1): CI fixes for tests that depended on local
+state (patch).** GitHub Actions failed on every OS in
+`occlusion_cull_tests::occlusion_cull_matches_uncull_on_the_psd_corpus`,
+with "corpus: 0 of 0 files compared" and then "the corpus exercises the
+transparent skip".
+
+The psd-tools corpus is not in git; `fetch-samples.sh` downloads it. CI
+therefore has `corpora/psd/reference/` (its README and manifest are
+tracked) but no PSD files in it. The test only skipped when the
+directory was missing, so it never skipped in CI.
+
+Fixes:
+- The corpus test now prints `SKIPPED` when no `.psd`/`.psb` file is
+  present.
+- Running the whole workspace in a fresh worktree with no corpus (the
+  same as CI) also hit an old, intermittent race, seen once under load:
+  `open_tile_store_survives_the_session_scratch_directory_being_swept_away`
+  deletes the shared session directory, but parallel tests that open
+  tile stores recreate it before the premise assertion. The test now
+  sweeps until the directory stays gone (at most 50 tries).
+- Both changes are to tests only.
+
+Lesson: run the workspace once in a corpus-free worktree before
+claiming CI parity. The local gate always had the corpus.
+
+**Previously (2026-10-11, 0.185.0): a RAM-sized, shared tile residency
 budget (design-owner decision, Cahya, 2026-10-11; ADR 0011).** The fixed
 `TILE_BUDGET = 256` tiles (128 MiB) is gone from the app. The budget is
 now a share of physical RAM, decided in `aurora-tile`'s new `budget`
