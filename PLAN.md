@@ -26,7 +26,67 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.191.0): layer effects, round E5 — Softer Outer Glow
+**Latest (2026-10-11, 0.191.1): the `masks.psd` Stroke residual is explained
+and fixed — a knockout drop shadow is also hidden under the layer's Outside
+(or Center) stroke ring.**
+- **Diagnosis (measured).** `corpora/psd/reference/psd-tools-fixtures/masks.psd`,
+  "Rectangle 2" (a white shape, vector mask + user mask, 2 px 10 % black
+  Outside stroke, an 18 % Multiply drop shadow, size 100, distance 2). The
+  diff against Photoshop's merged image is one thin line: rows 100-101 of the
+  640-wide canvas (the ring below the shape; 640 px per row, 20 levels off in
+  every one); everything else along the header is the text edges. The page
+  *under* the rectangle is 247, not 255. Photoshop shows 222 at both ring
+  rows, flat across x: 247 × 0.9 = 222.3, **the 10 % stroke over the bare
+  backdrop, with no shadow under it**. Aurora had the shadow (≈9 %) under the
+  stroke: 247 × 0.91 × 0.9 = 202. A/B at (300, 100) (R): Photoshop 222;
+  Aurora stroke + shadow 202, shadow only 224, stroke only 222, neither 247.
+  So the stroke arithmetic was right; the **shadow's knockout** (`layerConceals`,
+  "layer knocks out drop shadow") is by the layer's shape *including its
+  Outside/Center stroke ring*, whatever the stroke's opacity (10 % hides the
+  whole shadow there: a proportional knockout would give 204).
+- **Ruled out.** (a) Wrong silhouette: the vector mask's bbox ends at y = 100,
+  the layer pixels' alpha and the rendered mask are 1 to row 99 and 0 from
+  100, so Aurora's ring is in the same rows as Photoshop's. (b) The stack: only
+  a drop shadow and the stroke (lfx2 `DrSh`, `FrFX`); the legacy `lrFX` block
+  has everything else disabled. (c) "Mask hides effects": the layer's user mask
+  (`-3`, real flags) is *disabled*, the `-2` channel is the rendered vector mask;
+  composites with the masks' coverage forced to 1 are byte-identical to the
+  base, and `layer_comps.psb` (masked layers, mask 0 at the ring, 65 % Outside
+  strokes) shows Photoshop drawing the stroke at mask 0. (d) Off-canvas rows:
+  the ring is fully on canvas.
+- **The fix.** `fold_shadows_beneath` takes the largest coverage of any shown
+  stroke's *outside* plane (`outside_stroke_cover`; already scaled by
+  `1 - alpha`, so it adds to the shape's alpha) and hides the shadow by
+  `min(alpha + ring, 1)`. Inside strokes add nothing; a shadow that does not
+  knock out is unchanged; only drawn (solid-colour) strokes count — a gradient
+  or pattern stroke, undrawn, does not knock the shadow out yet (disclosed).
+  No cache key changes: the shadow's coverage is cached before the knockout.
+- **Reference numbers** (mean per channel; max over all channels), before
+  (0.191.0) → after: `masks.psd` 65 / 0.2257, 0.1822, 0.1710 → 65 / 0.1970,
+  0.1535, 0.1424 (0.189.0, before strokes: 0.2007, 0.1571, 0.1460); `masks.psb`
+  59 / 0.1433, 0.1421, 0.1413 → 59 / 0.1146, 0.1135, 0.1127 (0.189.0: 0.1183,
+  0.1171, 0.1163). Every other effects-corpus file is unchanged (printed and
+  compared against its pin: advanced-blending, shape-fx2, stroke-composite,
+  stroke-effect-transparent-shape, layer_effects, opacity-fill, clip-opacity,
+  fill-opacity, blend-and-clipping, effects-enabled, clipping-mask2,
+  patterns, knockout-isolated-groups; also unchanged against their 0.190.0
+  figures: stroke-effects, double-stroke-effects, layer_comps psd/psb,
+  layer_params psd/psb).
+- **Outer Glow.** `fold_glows_beneath` deliberately does *not* knock a glow out
+  under the shape (0.191.0: it shows through a translucent layer), so the same
+  rule does not follow for a stroke ring; whether Photoshop hides a glow under
+  a stroke is unmeasured (no fixture has both).
+- **Test.** `a_knockout_shadow_is_hidden_under_the_outside_stroke_ring`: bare
+  shadow reaches the ring; a 50 % Outside stroke leaves exactly the stroke
+  (`[0.5, 0, 0, 0.5]`) on all three ring pixels; beyond the ring the shadow is
+  unchanged; a non-knockout shadow still shows there; a Center stroke's outer
+  half hides it; an Inside stroke changes nothing. The two `masks` pins moved.
+- **Known weaknesses.** One fixture, one stroke opacity (10 %): "whatever its
+  opacity" rests on that and on the binary shape of Photoshop's knockout in
+  the 0.190.0 geometry; not checked for gradient/pattern strokes, stroke on a
+  Fill-0 layer, or strokes in a non-Normal mode.
+
+**Previously (2026-10-11, 0.191.0): layer effects, round E5 — Softer Outer Glow
 is drawn (solid colour, on pixel layers, on the CPU).**
 - **What is drawn.** Each shown `OrGl` / `outerGlowMulti` glow with the
   *Softer* technique (`GlwT` `SfBL`) and a solid colour, in list order, on a
@@ -33638,7 +33698,7 @@ here so they are not silently lost between phases.
 
 ## Next action
 
-**First follow-up from 0.190.0 (open, unexplained):** on `corpora/psd/reference/psd-tools-fixtures/masks.psd` layer "Rectangle 2" (a solid-colour shape layer with both a vector mask and a user mask) a 2 px, 10 % black Outside stroke darkens Aurora's merged image by ~22 levels where Photoshop's darkens by ~2. The stroke formula is consistent; suspects are (a) a drop shadow whose silhouette should include the outside stroke, (b) Photoshop not applying the stroke through the mask ("layer mask hides effects" semantics) or stroking the vector shape instead of pixel alpha, (c) the stack above or below. Diagnose by comparing stroke-on/off and shadow-on/off against Photoshop's merged image at one ring pixel before relying on masked strokes.
+**Follow-up from 0.190.0 closed in 0.191.1:** the `masks.psd` Stroke residual was the shadow knockout, not the stroke (see the Latest entry).
 
 
 **Addendum 2026-10-10 (0.179.0) — real Pass Through groups.**
