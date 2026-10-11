@@ -14395,7 +14395,14 @@ fn fold_layer_with_effects(
     let unit = !dissolve && (!shadows.is_empty() || !glows.is_empty());
     let backdrop = (unit && opacity < 1.0).then(|| accumulator.to_vec());
     let shadow_factor = if unit { 1.0 } else { opacity };
-    fold_shadows_beneath(accumulator, &shadows, &shape, shadow_factor, doc_origin);
+    fold_shadows_beneath(
+        accumulator,
+        &shadows,
+        &shape,
+        &outside_stroke_cover(&strokes, shape.len() / aurora_tile::CHANNELS),
+        shadow_factor,
+        doc_origin,
+    );
     // 0.191.0: glows sit above the shadows and beneath the content.
     fold_glows_beneath(accumulator, &glows, shadow_factor, doc_origin);
     let one = half::f16::from_f32(1.0);
@@ -14716,6 +14723,31 @@ fn fold_glows_beneath(
     }
 }
 
+/// Per texel, the largest coverage of any shown stroke's outside ring
+/// (0.191.1): the part of the layer's silhouette beyond its shape that a
+/// shadow's knockout also hides. Empty when no stroke reaches the tile
+/// (callers read a missing entry as zero). `texels` is the tile's texel
+/// count; a plane of another length is ignored.
+fn outside_stroke_cover(
+    strokes: &[(&aurora_core::effects::Stroke, StrokePlanes)],
+    texels: usize,
+) -> Vec<f32> {
+    let mut cover: Vec<f32> = Vec::new();
+    for plane in strokes.iter().filter_map(|(_, p)| p.outside.as_deref()) {
+        if plane.len() != texels {
+            continue;
+        }
+        if cover.is_empty() {
+            cover.clone_from(plane);
+        } else {
+            for (c, p) in cover.iter_mut().zip(plane) {
+                *c = c.max(*p);
+            }
+        }
+    }
+    cover
+}
+
 /// Folds each drop shadow's `coverage` onto `accumulator` beneath the
 /// layer (0.182.0): the shadow colour at coverage × (1 − shape) when it
 /// knocks out, in its own mode at `shadow opacity × layer opacity`.
@@ -14723,22 +14755,30 @@ fn fold_shadows_beneath(
     accumulator: &mut [half::f16],
     shadows: &[(&aurora_core::effects::DropShadow, std::sync::Arc<Vec<f32>>)],
     shape: &[half::f16],
+    stroke_cover: &[f32],
     opacity: f32,
     doc_origin: (i64, i64),
 ) {
     for (shadow, coverage) in shadows {
         let colour = [shadow.color.r, shadow.color.g, shadow.color.b].map(half::f16::from_f32);
         let mut source = Vec::with_capacity(shape.len());
-        for (cover, texel) in coverage
+        for (i, (cover, texel)) in coverage
             .as_slice()
             .iter()
             .zip(shape.chunks_exact(aurora_tile::CHANNELS))
+            .enumerate()
         {
             // Knockout (`layerConceals`): the layer's own *shape* hides its
             // shadow, whatever its Fill — the point of the option is a
-            // Fill-0 layer showing its shadow only outside its shape.
+            // Fill-0 layer showing its shadow only outside its shape. As of
+            // 0.191.1 the shape includes an Outside (or Center) stroke's
+            // ring, whatever the stroke's opacity: Photoshop's merged image
+            // of `masks.psd` shows a 10 % stroke over the bare backdrop, no
+            // shadow beneath it. The ring is already scaled by `1 - alpha`,
+            // so the union is the sum.
             let hidden = if shadow.knocks_out {
-                texel.get(3).map_or(0.0, |a| a.to_f32().clamp(0.0, 1.0))
+                let alpha = texel.get(3).map_or(0.0, |a| a.to_f32().clamp(0.0, 1.0));
+                (alpha + stroke_cover.get(i).copied().unwrap_or(0.0)).min(1.0)
             } else {
                 0.0
             };
@@ -77293,12 +77333,14 @@ mod tests {
             ("layer_effects.psd", 168.0, [8.5358, 6.7384, 8.0221]),
             // 0.181.0: Fill 0 'divider' shape no longer drawn. Before it (0.180.0): 161 / 1.36, 1.32, 1.32 (max / mean per channel).
             // 0.182.0, drop shadows drawn; before (0.181.0): max 65, mean 1.191, 1.148, 1.137.
-            // 0.190.0: A 2 px 10 % outside stroke on Rectangle 2 is drawn darker than Photoshop shows it (unexplained residual); before: 65 / 0.2007, 0.1571, 0.1460.
-            ("masks.psd", 65.0, [0.2257, 0.1822, 0.1710]),
+            // 0.190.0: A 2 px 10 % outside stroke on Rectangle 2 was drawn darker than Photoshop shows it; before: 65 / 0.2007, 0.1571, 0.1460 (0.189.0).
+            // 0.191.1: Explained and fixed: the shadow's knockout includes the stroke's ring, so the ring is the stroke over the bare backdrop (247 x 0.9 = 222, as Photoshop); before: 65 / 0.2257, 0.1822, 0.1710.
+            ("masks.psd", 65.0, [0.1970, 0.1535, 0.1424]),
             // 0.181.0: Fill 0 'divider' shape no longer drawn. Before it (0.180.0): 161 / 1.28, 1.28, 1.29 (max / mean per channel).
             // 0.182.0, drop shadows drawn; before (0.181.0): max 59, mean 1.109, 1.108, 1.107.
-            // 0.190.0: As masks.psd; before: 59 / 0.1183, 0.1171, 0.1163.
-            ("masks.psb", 59.0, [0.1433, 0.1421, 0.1413]),
+            // 0.190.0: As masks.psd; before: 59 / 0.1183, 0.1171, 0.1163 (0.189.0).
+            // 0.191.1: As masks.psd (shadow knockout includes the stroke ring); before: 59 / 0.1433, 0.1421, 0.1413.
+            ("masks.psb", 59.0, [0.1146, 0.1135, 0.1127]),
             // 0.181.0: Fill 171/255: now an exact match. Before it (0.180.0): 56 / 0.00, 56.00, 56.00 (max / mean per channel).
             // 0.182.0: unchanged by drawing drop shadows.
             ("opacity-fill.psd", 0.0, [0.0000, 0.0000, 0.0000]),
@@ -77495,6 +77537,64 @@ mod tests {
                 (142, 120, CLEAR),
             ] {
                 near(texel(&acc, x, y), want);
+            }
+        }
+
+        /// 0.191.1: a drop shadow that knocks out is hidden under an
+        /// Outside (or Center) stroke's ring as well as under the shape,
+        /// whatever the stroke's opacity: Photoshop's merged image of
+        /// `masks.psd` shows its 10 % stroke over the bare backdrop. An
+        /// Inside stroke adds nothing outside the shape. Without the
+        /// stroke the shadow reaches the ring.
+        #[test]
+        fn a_knockout_shadow_is_hidden_under_the_outside_stroke_ring() {
+            let ring_x = [99_usize, 98, 97];
+            let build = |strokes: Vec<aurora_core::effects::Stroke>, knocks_out: bool| {
+                let (_d, mut store) = real_tile_store();
+                let mut layers = aurora_doc::LayerTree::new();
+                let id = painted(&mut layers, &mut store, (0, 0), (100, 100, 40, 40));
+                let mut sh = shadow(90.0, 0.0, 12.0, 0.0);
+                sh.knocks_out = knocks_out;
+                let fx = aurora_core::LayerEffects {
+                    drop_shadows: vec![sh],
+                    strokes,
+                    ..aurora_core::LayerEffects::default()
+                };
+                ok(layers.set_effects(id, Some(fx)));
+                composite_tile_at(&layers, &mut store, 0, 0, (0, 0))
+            };
+            // Shadow only: it reaches the ring and beyond.
+            let bare = build(Vec::new(), true);
+            for x in ring_x {
+                assert!(alpha_at(&bare, x, 120) > 0.2, "bare shadow at {x}");
+            }
+            // A 50 % red Outside stroke, 3 px: the ring is the stroke alone.
+            let mut s = stroke(StrokePosition::Outside, 3.0, [1.0, 0.0, 0.0]);
+            s.opacity = 0.5;
+            let outside = build(vec![s.clone()], true);
+            for x in ring_x {
+                near(texel(&outside, x, 120), [0.5, 0.0, 0.0, 0.5]);
+            }
+            // Past the ring the shadow is untouched by the stroke.
+            assert!(alpha_at(&outside, 95, 120) > 0.05);
+            assert!((alpha_at(&outside, 95, 120) - alpha_at(&bare, 95, 120)).abs() < 1.0 / 255.0);
+            // A shadow that does not knock out keeps showing under the ring.
+            let kept = build(vec![s.clone()], false);
+            assert!(alpha_at(&kept, 99, 120) > 0.6);
+            // Center: its outer half (2 px of a 4 px stroke) hides it too.
+            let mut c = stroke(StrokePosition::Center, 4.0, [1.0, 0.0, 0.0]);
+            c.opacity = 0.5;
+            let centre = build(vec![c], true);
+            for x in [98_usize, 99] {
+                near(texel(&centre, x, 120), [0.5, 0.0, 0.0, 0.5]);
+            }
+            assert!(alpha_at(&centre, 97, 120) > 0.2);
+            // An Inside stroke leaves the shadow outside the shape alone.
+            let mut i = stroke(StrokePosition::Inside, 3.0, [1.0, 0.0, 0.0]);
+            i.opacity = 0.5;
+            let inside = build(vec![i], true);
+            for x in ring_x {
+                assert!((alpha_at(&inside, x, 120) - alpha_at(&bare, x, 120)).abs() < 1.0 / 255.0);
             }
         }
 
