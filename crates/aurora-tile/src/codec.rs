@@ -122,6 +122,54 @@ pub(crate) fn encode_any_length(texels: &[f16]) -> Vec<u8> {
     out
 }
 
+/// Buffers [`encode_with`] reuses between tiles (0.189.0): the raw bytes
+/// and the compressed block. Allocating and first-touching those
+/// half-megabyte buffers for every tile was most of the time of encoding
+/// a tile, and the page faults serialize across threads; a caller that
+/// encodes many tiles keeps one scratch per thread.
+#[derive(Debug, Default)]
+pub struct EncodeScratch {
+    raw: Vec<u8>,
+    block: Vec<u8>,
+}
+
+/// [`encode`], byte for byte, through reusable buffers: the same header,
+/// the same `lz4_flex` block with its size prepended, the same raw
+/// fallback when compression does not shrink the payload. Only the result
+/// itself is allocated, at its exact size.
+#[must_use]
+pub fn encode_with(texels: &[f16], scratch: &mut EncodeScratch) -> Vec<u8> {
+    debug_assert_eq!(texels.len(), crate::SAMPLES);
+    scratch.raw.clear();
+    scratch.raw.reserve(texels.len() * 2);
+    for texel in texels {
+        scratch.raw.extend_from_slice(&texel.to_le_bytes());
+    }
+    let max = lz4_flex::block::get_maximum_output_size(scratch.raw.len());
+    if scratch.block.len() < max {
+        scratch.block.resize(max, 0);
+    }
+    let compressed = lz4_flex::block::compress_into(&scratch.raw, &mut scratch.block).ok();
+    let prefix = u32::try_from(scratch.raw.len()).ok();
+    let (flag, payload_len) = match (compressed, prefix) {
+        (Some(n), Some(_)) if n + 4 < scratch.raw.len() => (1_u8, n + 4),
+        _ => (0_u8, scratch.raw.len()),
+    };
+    let mut out = Vec::with_capacity(HEADER_LEN + payload_len);
+    out.extend_from_slice(&MAGIC);
+    out.push(VERSION);
+    out.push(flag);
+    out.extend_from_slice(&[0, 0]); // reserved
+    match (flag, compressed, prefix) {
+        (1, Some(n), Some(prefix)) => {
+            out.extend_from_slice(&prefix.to_le_bytes());
+            out.extend_from_slice(scratch.block.get(..n).unwrap_or(&[]));
+        }
+        _ => out.extend_from_slice(&scratch.raw),
+    }
+    out
+}
+
 /// Parses the on-disk format back into tile samples.
 ///
 /// # Errors
@@ -248,6 +296,31 @@ fn from_raw_bytes(raw: &[u8]) -> Result<Vec<f16>, TileError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn encode_with_is_byte_identical_to_encode_for_every_kind_of_tile() {
+        let mut scratch = super::EncodeScratch::default();
+        let mut seed = 5_u32;
+        let mut noise = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            half::f16::from_bits((seed >> 8) as u16)
+        };
+        let zero = vec![half::f16::ZERO; crate::SAMPLES];
+        let solid = vec![half::f16::from_f32(0.25); crate::SAMPLES];
+        let noisy: Vec<half::f16> = (0..crate::SAMPLES).map(|_| noise()).collect();
+        let mut half_noisy = zero.clone();
+        for slot in half_noisy.iter_mut().take(crate::SAMPLES / 3) {
+            *slot = noise();
+        }
+        // The scratch is reused across kinds and in both orders, so a
+        // stale tail from a bigger block cannot leak into a smaller one.
+        for texels in [&zero, &noisy, &solid, &half_noisy, &zero, &noisy] {
+            assert_eq!(
+                super::encode_with(texels, &mut scratch),
+                super::encode(texels)
+            );
+        }
+    }
+
     use super::{decode, encode, encode_any_length};
     use half::f16;
 

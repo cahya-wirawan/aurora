@@ -131,6 +131,14 @@ impl EncodedTile {
         Self(Arc::new(codec::encode(tile.texels())))
     }
 
+    /// [`Self::of`] for a tile's raw `texels`, through `scratch`
+    /// ([`codec::encode_with`]): the same bytes, without allocating the
+    /// working buffers again.
+    #[must_use]
+    pub fn of_texels_with(texels: &[half::f16], scratch: &mut codec::EncodeScratch) -> Self {
+        Self(Arc::new(codec::encode_with(texels, scratch)))
+    }
+
     /// The encoded length in bytes.
     #[must_use]
     pub fn len(&self) -> usize {

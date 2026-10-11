@@ -53,8 +53,8 @@ pub use aur::{
 pub use error::{IoError, psd_color_mode_name};
 pub use image::Image;
 pub use import::{
-    EncodedTiles, decode_by_extension, encode_by_extension, encode_image_tiles_at, read_from_store,
-    write_into_store, write_into_store_at,
+    EncodedTiles, ImageView, decode_by_extension, encode_by_extension, encode_image_tile,
+    encode_image_tiles_at, image_tile_ids, read_from_store, write_into_store, write_into_store_at,
 };
 pub use psd::{
     PsdCompositeSource, PsdExpectation, PsdExpectedLayer, PsdExpectedMask, PsdFormat,

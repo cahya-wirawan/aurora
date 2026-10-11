@@ -134,6 +134,24 @@ pub(crate) struct PreparedPsd {
     pub(crate) pixels: Vec<PreparedLayer>,
     pub(crate) masks: Vec<PreparedMask>,
     pub(crate) report: aurora_io::PsdImportReport,
+    /// Where the open's time went (0.189.0).
+    pub(crate) timings: Box<OpenTimings>,
+}
+
+/// Where a streamed open's decode-thread time went (0.189.0): the sink's
+/// own work, against everything else (reading, parsing, decoding and
+/// converting, which `aurora_io::read_psd_streaming` does between sink
+/// calls).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct OpenTimings {
+    /// Tile building and encoding in the sink.
+    pub(crate) encode: std::time::Duration,
+    /// Writing the encoded tiles into the staging area.
+    pub(crate) stage: std::time::Duration,
+    /// The whole [`PreparedPsd::stream`] call.
+    pub(crate) total: std::time::Duration,
+    /// Tiles the sink produced.
+    pub(crate) tiles: usize,
 }
 
 impl PreparedPsd {
@@ -168,6 +186,7 @@ impl PreparedPsd {
             pixels,
             masks: prepare_masks(&masks),
             report,
+            timings: Box::default(),
         }
     }
 }
@@ -214,6 +233,22 @@ impl PreparedPsd {
         path: &Path,
         staging: Option<&StagingRoot>,
     ) -> Result<Self, crate::OpenFailure> {
+        Self::stream_with_threads(
+            path,
+            staging,
+            crate::background_composite::composite_threads(),
+        )
+    }
+
+    /// [`Self::stream`] with each layer's tiles encoded on `encode_threads`
+    /// threads (0.189.0; one or none encodes on the decode thread itself).
+    /// The tiles are the same, in the same order, for any count — the
+    /// tests pin that.
+    pub(crate) fn stream_with_threads(
+        path: &Path,
+        staging: Option<&StagingRoot>,
+        encode_threads: usize,
+    ) -> Result<Self, crate::OpenFailure> {
         let file = std::fs::File::open(path).map_err(|err| {
             tracing::warn!(path = %path.display(), %err, "failed to open the chosen file");
             crate::OpenFailure::Read(err)
@@ -229,15 +264,27 @@ impl PreparedPsd {
                 None
             }
         });
+        let started = std::time::Instant::now();
         let mut sink = StreamSink {
+            pool: build_encode_pool(encode_threads),
+            in_flight: None,
             area,
             pixels: Vec::new(),
             masks: Vec::new(),
+            timings: OpenTimings::default(),
         };
         let reader = std::io::BufReader::with_capacity(STREAM_BUFFER, file);
         let document =
             aurora_io::read_psd_streaming(reader, &mut sink).map_err(crate::OpenFailure::Decode)?;
-        let StreamSink { pixels, masks, .. } = sink;
+        // The last layer may still be encoding.
+        sink.finish_in_flight();
+        let StreamSink {
+            pixels,
+            masks,
+            mut timings,
+            ..
+        } = sink;
+        timings.total = started.elapsed();
         Ok(Self {
             layers: document.layers,
             history: document.history,
@@ -245,6 +292,7 @@ impl PreparedPsd {
             pixels,
             masks,
             report: document.report,
+            timings: Box::new(timings),
         })
     }
 }
@@ -254,14 +302,46 @@ fn session_ending() -> bool {
     crate::SESSION_ENDING.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// The pool the streaming open encodes tiles on (0.189.0): `threads`
+/// threads, which the caller bounds to one fewer than the machine's
+/// parallelism ([`crate::background_composite::composite_threads`]) so the
+/// UI thread keeps a core. `None` for one thread (the decode thread is
+/// itself the one) or when rayon cannot start the pool, which then encodes
+/// sequentially as before.
+pub(crate) fn build_encode_pool(threads: usize) -> Option<std::sync::Arc<rayon::ThreadPool>> {
+    if threads <= 1 {
+        return None;
+    }
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|index| format!("aurora-open-encode-{index}"))
+        .build()
+    {
+        Ok(pool) => Some(std::sync::Arc::new(pool)),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "couldn't start the open's encode pool; encoding on one thread"
+            );
+            None
+        }
+    }
+}
+
 /// The streaming open's read buffer: the metadata is read in small pieces.
 const STREAM_BUFFER: usize = 1 << 16;
 
 /// [`PreparedPsd::stream`]'s sink: encodes and stages one layer at a time.
 struct StreamSink {
+    /// The pool a layer's tiles are encoded on; `None` encodes on the
+    /// decode thread.
+    pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    /// The layer encoding on the pool while the next one decodes.
+    in_flight: Option<InFlight>,
     area: Option<StagingArea>,
     pixels: Vec<PreparedLayer>,
     masks: Vec<PreparedMask>,
+    timings: OpenTimings,
 }
 
 impl StreamSink {
@@ -295,30 +375,125 @@ impl StreamSink {
     }
 }
 
+/// The largest decoded layer image (`f16` RGBA bytes) the sink lets encode
+/// on the pool while the decode thread reads the next layer (0.189.0).
+/// Bigger layers encode in place, so the overlap never holds more than
+/// this beyond what the sequential path held: the peak memory rises by at
+/// most this constant, not with the document.
+const OVERLAP_IMAGE_BYTES: usize = 64 << 20;
+
+/// One layer encoding on the pool: its id, and the channel its tiles (or
+/// the placement error) come back on.
+struct InFlight {
+    layer: LayerId,
+    result: std::sync::mpsc::Receiver<Result<EncodedTiles, IoError>>,
+    started: std::time::Instant,
+}
+
+impl StreamSink {
+    /// Waits for the layer encoding on the pool, if any, then stages its
+    /// tiles and records the layer — keeping the layers in file order, so
+    /// it runs before anything else is recorded.
+    fn finish_in_flight(&mut self) {
+        let Some(flight) = self.in_flight.take() else {
+            return;
+        };
+        let waited = std::time::Instant::now();
+        let encoded = flight.result.recv().unwrap_or_else(|_| {
+            Err(IoError::Io(std::io::Error::other(
+                "the tile encoder stopped before it finished a layer",
+            )))
+        });
+        self.timings.encode += waited.elapsed();
+        let _ = flight.started;
+        self.record_layer(flight.layer, encoded);
+    }
+
+    fn record_layer(&mut self, layer: LayerId, encoded: Result<EncodedTiles, IoError>) {
+        let started = std::time::Instant::now();
+        let tiles = encoded.map(|tiles| self.stage(tiles));
+        self.timings.stage += started.elapsed();
+        self.timings.tiles += tiles.as_ref().map_or(0, Vec::len);
+        self.pixels.push(PreparedLayer { layer, tiles });
+    }
+}
+
 impl aurora_io::PsdPixelSink for StreamSink {
     fn layer(&mut self, placed: aurora_io::PsdPixels) -> Result<(), IoError> {
+        // The previous layer was encoding while this one decoded.
+        self.finish_in_flight();
         let (x, y) = placed.offset;
-        let encoded = aurora_io::encode_image_tiles_at(&placed.image, x, y);
+        let bytes = placed
+            .image
+            .samples()
+            .len()
+            .saturating_mul(std::mem::size_of::<half::f16>());
+        if let (Some(pool), true) = (&self.pool, bytes <= OVERLAP_IMAGE_BYTES) {
+            let (send, result) = std::sync::mpsc::channel();
+            let task_pool = std::sync::Arc::clone(pool);
+            let aurora_io::PsdPixels { layer, image, .. } = placed;
+            pool.spawn(move || {
+                let encoded = encode_layer_tiles(Some(&task_pool), &image, x, y);
+                // The layer's image is not needed past its tiles.
+                drop(image);
+                let _ = send.send(encoded);
+            });
+            self.in_flight = Some(InFlight {
+                layer,
+                result,
+                started: std::time::Instant::now(),
+            });
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let encoded = encode_layer_tiles(self.pool.as_deref(), &placed.image, x, y);
         // The layer's image is not needed past its tiles (the point).
         drop(placed.image);
-        let tiles = encoded.map(|tiles| self.stage(tiles));
-        self.pixels.push(PreparedLayer {
-            layer: placed.layer,
-            tiles,
-        });
+        self.timings.encode += started.elapsed();
+        self.record_layer(placed.layer, encoded);
         Ok(())
     }
 
     fn mask(&mut self, mask: PsdMaskPixels) -> Result<(), IoError> {
+        self.finish_in_flight();
+        let started = std::time::Instant::now();
         let encoded = aurora_io::encode_psd_mask(&mask);
         drop(mask.coverage);
+        self.timings.encode += started.elapsed();
+        let started = std::time::Instant::now();
         let tiles = self.stage(encoded);
+        self.timings.stage += started.elapsed();
+        self.timings.tiles += tiles.len();
         self.masks.push(PreparedMask {
             layer: mask.layer,
             tiles,
         });
         Ok(())
     }
+}
+
+/// [`aurora_io::encode_image_tiles_at`], the tiles spread over `pool` when
+/// there is one (0.189.0). Each tile is built and encoded independently by
+/// the shared per-tile body ([`aurora_io::encode_image_tile`]) and the
+/// indexed parallel collect keeps the ids' row-major order, so the result
+/// equals the sequential one tile for tile.
+pub(crate) fn encode_layer_tiles(
+    pool: Option<&rayon::ThreadPool>,
+    image: &Image,
+    x: u32,
+    y: u32,
+) -> Result<EncodedTiles, IoError> {
+    let Some(pool) = pool else {
+        return aurora_io::encode_image_tiles_at(image, x, y);
+    };
+    let ids = aurora_io::image_tile_ids(image, x, y)?;
+    let view = image.view();
+    Ok(pool.install(|| {
+        use rayon::prelude::*;
+        ids.par_iter()
+            .map(|id| (*id, aurora_io::encode_image_tile(view, x, y, *id)))
+            .collect()
+    }))
 }
 
 /// Inserts one prepared tile; `false` if the store refused it.
