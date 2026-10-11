@@ -243,6 +243,17 @@ pub enum TileShare {
     Encoded(Arc<Vec<u8>>),
 }
 
+/// What [`TileStore::share_tile_without_io`] found.
+#[derive(Debug, Clone)]
+pub enum TileLookup {
+    /// The tile, shared (resident texels or pending encoded bytes).
+    Shared(TileShare),
+    /// The tile exists only as a scratch file; reading it is I/O.
+    OnDisk,
+    /// The store holds no such tile.
+    Absent,
+}
+
 #[derive(Debug)]
 pub struct TileStore {
     resident: LruCache<(SurfaceId, TileId), Tile>,
@@ -833,6 +844,23 @@ impl TileStore {
         self.serial
     }
 
+    /// Moves [`Self::content_epoch`] without changing any tile's version:
+    /// for a change of which tiles exist.
+    fn bump_content_epoch(&mut self) {
+        self.version_counter = self.version_counter.wrapping_add(1);
+    }
+
+    /// A number that changes whenever any tile's content version changes or
+    /// any tile is forgotten (0.197.0): equal values at two moments mean no
+    /// tile of this store was written, inserted or forgotten in between
+    /// (a blank tile a read materialized, which adds no content, is the one
+    /// exception). A cache of something derived from *which tiles exist*
+    /// (the layer thumbnails' sampling plan) re-derives only when it moves.
+    #[must_use]
+    pub fn content_epoch(&self) -> u64 {
+        self.version_counter
+    }
+
     fn bump_content_version(&mut self, surface: SurfaceId, id: TileId) {
         self.version_counter = self.version_counter.wrapping_add(1);
         self.content_versions
@@ -1171,6 +1199,27 @@ impl TileStore {
         })
     }
 
+    /// [`Self::share_tile`] that never touches the disk (0.197.0): a
+    /// resident or pending tile comes back [`TileLookup::Shared`], a tile
+    /// that exists only as a scratch file [`TileLookup::OnDisk`] (read it
+    /// with [`Self::share_tile`], which is the one that does I/O), a tile
+    /// the store does not hold [`TileLookup::Absent`].
+    pub fn share_tile_without_io(&mut self, surface: SurfaceId, id: TileId) -> TileLookup {
+        self.reconcile_pending();
+        let key = (surface, id);
+        if let Some(tile) = self.resident.peek(&key) {
+            return TileLookup::Shared(TileShare::Texels(tile.shared_texels()));
+        }
+        if let Some((_generation, bytes)) = self.pending.get(&key) {
+            return TileLookup::Shared(TileShare::Encoded(Arc::clone(bytes)));
+        }
+        if self.paged_out.contains_key(&key) {
+            TileLookup::OnDisk
+        } else {
+            TileLookup::Absent
+        }
+    }
+
     /// Adopts a tile another store [shared](TileStore::share_tile)
     /// (0.186.0), replacing whatever this store held at that key and
     /// bumping its content version. Shared texels become a resident tile
@@ -1322,6 +1371,7 @@ impl TileStore {
     /// own history for the real, timing-dependent CI failure that
     /// disclosed it.)
     pub fn forget_tile(&mut self, surface: SurfaceId, id: TileId) -> bool {
+        self.bump_content_epoch();
         let key = (surface, id);
         self.content_versions.remove(&key);
         let held = self.contains_tile(surface, id);
@@ -1424,6 +1474,7 @@ impl TileStore {
     /// moment the store is fullest. One pass over the keys, testing
     /// each against the requested set, is O(tiles held) instead.
     pub fn forget_surfaces(&mut self, surfaces: &HashSet<SurfaceId>) -> usize {
+        self.bump_content_epoch();
         self.content_versions
             .retain(|(held, _), _| !surfaces.contains(held));
         let mut keys: HashSet<(SurfaceId, TileId)> = HashSet::new();
@@ -5106,6 +5157,48 @@ mod tests {
     #[test]
     fn each_store_gets_its_own_filename_token() {
         assert_ne!(super::instance_token(), super::instance_token());
+    }
+
+    /// 0.197.0: `content_epoch` moves on a write, an insert and a forget, and
+    /// stays put across reads; `share_tile_without_io` never touches the disk.
+    #[test]
+    fn the_content_epoch_moves_on_writes_and_forgets_and_lookup_never_reads_scratch() {
+        use super::TileLookup;
+        let (_dir, mut store) = store(1);
+        let id = |x| TileId { x, y: 0 };
+        let epoch = store.content_epoch();
+        assert!(matches!(
+            store.share_tile_without_io(surface(), id(0)),
+            TileLookup::Absent
+        ));
+        assert_eq!(store.content_epoch(), epoch, "a lookup is not a change");
+        let _ = store.get_mut(surface(), id(0));
+        let written = store.content_epoch();
+        assert_ne!(written, epoch, "a write moves it");
+        assert!(matches!(
+            store.share_tile_without_io(surface(), id(0)),
+            TileLookup::Shared(_)
+        ));
+        // A second tile evicts the first (budget 1); once flushed it is only
+        // a scratch file, which the lookup reports without reading.
+        let _ = store.get_mut(surface(), id(1));
+        let _ = store.flush();
+        let reads = store.stats().bytes_read;
+        assert!(matches!(
+            store.share_tile_without_io(surface(), id(0)),
+            TileLookup::OnDisk
+        ));
+        assert_eq!(store.stats().bytes_read, reads, "no I/O");
+        let before_forget = store.content_epoch();
+        store.forget_tile(surface(), id(1));
+        assert_ne!(store.content_epoch(), before_forget, "a forget moves it");
+        let before_sweep = store.content_epoch();
+        let _ = store.forget_surface(surface());
+        assert_ne!(
+            store.content_epoch(),
+            before_sweep,
+            "a surface sweep moves it"
+        );
     }
 }
 

@@ -349,3 +349,107 @@ fn nyepi_layers_panel_populate() {
         workspace.tree.len()
     );
 }
+
+/// Layer thumbnails on the Nyepi template (0.197.0, round L4): the first
+/// visible rows of the Layers panel, timed on the UI thread and in total,
+/// with the tiles shared, the store's paging counters and the RSS change.
+/// Run with `cargo test -p aurora-app --release -- --ignored --nocapture
+/// nyepi_layer_thumbnails`.
+#[test]
+#[ignore = "measurement on the user's template"]
+fn nyepi_layer_thumbnails() {
+    use crate::layer_thumbnails::LayerThumbnails;
+    let Some(path) = nyepi_path() else {
+        println!("SKIPPED: the Nyepi template is not present");
+        return;
+    };
+    let (_dir, mut store) = new_store();
+    let document = ok(crate::PreparedPsd::stream(
+        &path,
+        Some(&store.staging_root()),
+    ));
+    let crate::PreparedPsd {
+        layers,
+        pixels,
+        masks,
+        ..
+    } = document;
+    let (_freed, failed) = crate::replace_document_pixels_prepared(
+        &mut store,
+        aurora_doc::LayerTree::new(),
+        aurora_doc::History::new(),
+        &layers,
+        pixels,
+        masks,
+    );
+    assert_eq!(failed, 0);
+    let scales = ok(crate::load_scales());
+    let mut workspace = aurora_ui::build_workspace(&scales);
+    let rows = ok(aurora_ui::populate_layers_panel(
+        &mut workspace.tree,
+        workspace.layers,
+        &scales,
+        &layers,
+    ));
+    workspace.tree.compute_layout(1600.0, 900.0);
+    let visible =
+        aurora_ui::visible_layer_rows(&workspace.tree, workspace.layers, &rows, &scales, 2);
+    let ids: Vec<aurora_doc::LayerId> = visible.iter().map(|&(_, id)| id).collect();
+    let service_doc = (crate::document_session::DocumentId::next(), store.serial());
+    let mut service = LayerThumbnails::new(std::sync::Arc::new(|| {}));
+    let before = (
+        store.resident_len(),
+        store.stats().faults,
+        store.stats().pending_hits,
+        proc_kib("VmRSS:"),
+    );
+    let started = Instant::now();
+    let mut ui_time = std::time::Duration::ZERO;
+    let mut now = Instant::now();
+    loop {
+        let t = Instant::now();
+        let _ = service.update(service_doc, &layers, &mut store, &ids, now);
+        ui_time += t.elapsed();
+        let t = Instant::now();
+        let _ = service.drain();
+        let changed = service.apply(&mut workspace.tree, &visible);
+        ui_time += t.elapsed();
+        let _ = changed;
+        if service.pending_len() == 0
+            && service.stats.jobs_submitted
+                >= ids.len().min(
+                    ids.iter()
+                        .filter(|&&id| {
+                            matches!(layers.kind(id), Some(aurora_doc::LayerKind::Pixel { .. }))
+                        })
+                        .count(),
+                )
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        now += std::time::Duration::from_millis(1);
+    }
+    let total = started.elapsed();
+    let stats = store.stats();
+    let total_layers = layers.len();
+    println!(
+        "NYEPI thumbnails: {} visible rows ({} layers in the document), {} jobs, {} tiles shared \
+         (<= {} per layer); UI-thread time {:?}, wall {:?}; resident tiles {} -> {}; faults +{}, \
+         pending hits +{}; RSS {} -> {} MiB; cache {} pictures",
+        visible.len(),
+        total_layers,
+        service.stats.jobs_submitted,
+        service.stats.tiles_shared,
+        crate::layer_thumbnails::MAX_TILES,
+        ui_time,
+        total,
+        before.0,
+        store.resident_len(),
+        stats.faults - before.1,
+        stats.pending_hits - before.2,
+        before.3 / 1024,
+        proc_kib("VmRSS:") / 1024,
+        service.cache().len(),
+    );
+}

@@ -26,6 +26,16 @@ use crate::residency::TileResidency;
 const CANVAS_SHADER: &str = include_str!("shaders/canvas.wgsl");
 const LABEL: &str = "canvas";
 
+/// The two shades of the checkerboard the canvas shows behind transparent
+/// areas (0.197.0 names them; they were literals in `canvas.wgsl`),
+/// `[dark, light]`, sRGB-encoded greys. Other places that draw "transparent"
+/// (the Layers panel's layer thumbnails) take their checkerboard from here,
+/// so the two never drift. Pinned against the shader's own source by
+/// `checkerboard_shades_match_the_canvas_shader`. Not design tokens: the
+/// shader's values predate the token system, and adding tokens is the design
+/// owner's decision.
+pub const CHECKERBOARD_SHADES: [f32; 2] = [0.18, 0.24];
+
 /// Builds and caches the canvas render pipeline, and builds the
 /// per-frame bind group that samples a given [`TileResidency`].
 pub struct CanvasPipeline {
@@ -181,9 +191,23 @@ impl std::fmt::Debug for CanvasPipeline {
 
 #[cfg(test)]
 mod tests {
-    use super::CanvasPipeline;
+    use super::{CANVAS_SHADER, CHECKERBOARD_SHADES, CanvasPipeline};
     use crate::TileResidency;
     use crate::test_support::real_context;
+
+    /// The constant and the shader's `select(dark, light, ...)` literals are
+    /// one decision in two places; this fails if either moves alone.
+    #[test]
+    fn checkerboard_shades_match_the_canvas_shader() {
+        let wanted = format!(
+            "select({:?}, {:?}, (sq.x + sq.y) % 2.0 == 0.0)",
+            CHECKERBOARD_SHADES[0], CHECKERBOARD_SHADES[1]
+        );
+        assert!(
+            CANVAS_SHADER.contains(&wanted),
+            "canvas.wgsl no longer contains `{wanted}`"
+        );
+    }
 
     #[test]
     fn pipeline_is_cached_by_target_format() {

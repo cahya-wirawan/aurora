@@ -271,6 +271,7 @@ pub fn paint_widget_ops_frame(
     let solids = paint_widget(tree, id, theme, scales, scale_factor)?;
     let gradients = match tree.payload(id) {
         Some(WidgetKind::ColorPickerPart(state)) => color_picker_gradients(tree, id, state, theme),
+        Some(WidgetKind::Thumbnail(state)) => thumbnail_gradients(tree, id, state, scale_factor),
         _ => Vec::new(),
     };
     let mut ops: Vec<PaintOp> = gradients
@@ -475,6 +476,7 @@ fn kind_disabled(kind: &WidgetKind) -> bool {
         WidgetKind::Icon(state) => state.tone == IconTone::Disabled,
         WidgetKind::Container
         | WidgetKind::DropIndicator(_)
+        | WidgetKind::Thumbnail(_)
         | WidgetKind::CommandPalette(_)
         | WidgetKind::ListRow(_)
         | WidgetKind::Panel
@@ -497,6 +499,7 @@ fn gets_focus_ring(kind: &WidgetKind) -> bool {
             | WidgetKind::CommandPalette(_)
             | WidgetKind::DropdownList
             | WidgetKind::ListRow(_)
+            | WidgetKind::Thumbnail(_)
             | WidgetKind::Tooltip
             | WidgetKind::Dialog
             | WidgetKind::MenuSeparator
@@ -589,7 +592,13 @@ fn focus_ring_target(
         WidgetKind::ColorPickerPart(_) => boxed(vis, RING_OFFSET_ADJACENT, 0.0),
         WidgetKind::TreeItem(_) => {
             let (x, y, w, h) = vis;
-            boxed((x, y, w, row_height(scales).min(h)), RING_OFFSET_INSIDE, sm)
+            let line = match tree.payload(focus.anchor) {
+                Some(WidgetKind::TreeItem(state)) => {
+                    crate::widgets::tree_item_row_height(state, scales)
+                }
+                _ => row_height(scales),
+            };
+            boxed((x, y, w, line.min(h)), RING_OFFSET_INSIDE, sm)
         }
         WidgetKind::CurveEditor(state) => {
             let index = (0..state.curve().points().len())
@@ -1117,9 +1126,12 @@ pub fn paint_widget(
         // Whole or not at all: see `paint_icon`.
         WidgetKind::Icon(state) => paint_icon(state, full, bounds, theme, scale_factor),
         // A label paints no solids; `crate::text_runs` draws its text.
+        // A thumbnail's picture is a vertex-coloured mesh
+        // (`thumbnail_gradients`), so it paints no solids.
         WidgetKind::ColorPicker(_)
         | WidgetKind::CurveEditorPoint(_)
         | WidgetKind::Container
+        | WidgetKind::Thumbnail(_)
         | WidgetKind::Label(_) => Ok(vec![]),
     }
 }
@@ -1252,6 +1264,119 @@ fn paint_icon(
         paints.push((cut(mesh), [r, g, b, 1.0]));
     }
     Ok(paints)
+}
+
+/// A thumbnail's picture (0.197.0), as flat-coloured rectangles in one
+/// [`ColorMesh`]: see `widgets::thumbnail`'s module docs. The slot is the
+/// widget's *full* bounds, centred square; the picture is put on the
+/// largest texel grid (48, 24, 12 or 6 across) whose texels are at least a
+/// physical pixel, composited over the canvas's own checkerboard
+/// (`aurora_gpu::CHECKERBOARD_SHADES`, six cells across the slot), and each
+/// row's runs of identical colour become one rectangle. Every rectangle is
+/// cut to the widget's visible rect, so a thumbnail an ancestor clips is
+/// drawn partly, exactly.
+fn thumbnail_gradients(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    state: &crate::widgets::ThumbnailState,
+    scale_factor: f32,
+) -> Vec<ColorMesh> {
+    let Some(image) = &state.image else {
+        return Vec::new();
+    };
+    let Some(full) = tree.bounds(id) else {
+        return Vec::new();
+    };
+    let Some(visible) = clip_to_clipping_ancestors(tree, id, full) else {
+        return Vec::new();
+    };
+    if full.width == 0 || full.height == 0 {
+        return Vec::new();
+    }
+    let side = full.width.min(full.height) as f32;
+    let (slot_x, slot_y) = (
+        full.x as f32 + (full.width as f32 - side) / 2.0,
+        full.y as f32 + (full.height as f32 - side) / 2.0,
+    );
+    let physical = side * scale_factor.max(0.0);
+    let mut grid = crate::widgets::THUMBNAIL_TEXELS;
+    while grid > 6 && grid as f32 > physical {
+        grid /= 2;
+    }
+    let picture = image.on_grid(grid);
+    let pitch = side / grid as f32;
+    let cell = (grid / 6).max(1);
+    let [dark, light] = aurora_gpu::CHECKERBOARD_SHADES;
+    let (vx0, vy0) = (visible.x as f32, visible.y as f32);
+    let (vx1, vy1) = (vx0 + visible.width as f32, vy0 + visible.height as f32);
+    let mut mesh = ColorMesh::default();
+    let mut rect = |x0: f32, y0: f32, x1: f32, y1: f32, color: [f32; 4]| {
+        let (x0, y0, x1, y1) = (x0.max(vx0), y0.max(vy0), x1.min(vx1), y1.min(vy1));
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let Ok(base) = u32::try_from(mesh.vertices.len()) else {
+            return;
+        };
+        for (px, py) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)] {
+            mesh.vertices.push(aurora_vector::ColorVertex {
+                position: Point { x: px, y: py },
+                color,
+            });
+        }
+        mesh.indices
+            .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+    for cy in 0..picture.height() {
+        let ty = picture.y() + cy;
+        let mut run: Option<(u32, [f32; 4])> = None;
+        let flush = |start_and_color: Option<(u32, [f32; 4])>,
+                     end: u32,
+                     rect: &mut dyn FnMut(f32, f32, f32, f32, [f32; 4])| {
+            if let Some((start, color)) = start_and_color {
+                rect(
+                    slot_x + (picture.x() + start) as f32 * pitch,
+                    slot_y + ty as f32 * pitch,
+                    slot_x + (picture.x() + end) as f32 * pitch,
+                    slot_y + (ty + 1) as f32 * pitch,
+                    color,
+                );
+            }
+        };
+        for cx in 0..picture.width() {
+            let tx = picture.x() + cx;
+            let texel = picture.texel(cx, cy).unwrap_or([0.0; 4]);
+            let shade = if ((tx / cell) + (ty / cell)).is_multiple_of(2) {
+                light
+            } else {
+                dark
+            };
+            let behind = 1.0 - texel[3].clamp(0.0, 1.0);
+            let color = [
+                texel[0] + shade * behind,
+                texel[1] + shade * behind,
+                texel[2] + shade * behind,
+                1.0,
+            ];
+            match run {
+                Some((_, previous))
+                    if previous
+                        .iter()
+                        .zip(color)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()) => {}
+                _ => {
+                    flush(run, cx, &mut rect);
+                    run = Some((cx, color));
+                }
+            }
+        }
+        flush(run, picture.width(), &mut rect);
+    }
+    if mesh.indices.is_empty() {
+        Vec::new()
+    } else {
+        vec![mesh]
+    }
 }
 
 /// `mesh` cut to the axis-aligned `rect` (Sutherland-Hodgman, one triangle
@@ -2762,7 +2887,7 @@ fn paint_tree_item(
     if !state.selected {
         return Ok(vec![]);
     }
-    let height = row_height(scales).min(bounds.height as f32);
+    let height = crate::widgets::tree_item_row_height(state, scales).min(bounds.height as f32);
     let path = rounded_rect(
         bounds.x as f32,
         bounds.y as f32,

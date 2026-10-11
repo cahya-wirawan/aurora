@@ -32,5 +32,5 @@ pub use scratch::{
     LOCK_FILE_NAME, ScratchLock, SweepReport, lock_scratch_dir, sweep_orphaned_scratch_dirs,
 };
 pub use staging::{StagedTile, StagingArea, StagingRoot};
-pub use store::{EncodedTile, Stats, TileShare, TileSnapshot, TileStore};
+pub use store::{EncodedTile, Stats, TileLookup, TileShare, TileSnapshot, TileStore};
 pub use tile::{CHANNELS, SAMPLE_FORMAT, SAMPLES, Surface, SurfaceId, TEXELS, TILE, Tile, TileId};

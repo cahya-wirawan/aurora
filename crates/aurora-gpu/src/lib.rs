@@ -35,7 +35,7 @@ mod surface;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub use canvas::CanvasPipeline;
+pub use canvas::{CHECKERBOARD_SHADES, CanvasPipeline};
 pub use context::GpuContext;
 pub use error::GpuError;
 pub use pipeline::{Blend, PipelineCache, PipelineKey};

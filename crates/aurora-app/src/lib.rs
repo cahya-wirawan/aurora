@@ -547,6 +547,7 @@ mod document_session;
 mod document_tabs;
 #[cfg(test)]
 mod document_tabs_tests;
+mod layer_thumbnails;
 mod prepared_pixels;
 mod psd_save;
 #[cfg(test)]
@@ -1080,6 +1081,9 @@ enum AppEvent {
     /// The background compositor (0.186.0) has finished tiles to install;
     /// `about_to_wait` drains them.
     CompositeReady,
+    /// The layer thumbnail worker (0.197.0) finished pictures;
+    /// `about_to_wait` installs them.
+    ThumbnailReady,
 }
 
 impl From<accesskit_winit::Event> for AppEvent {
@@ -20343,7 +20347,10 @@ fn install_provisional_tile(
 /// `user_event`'s own test, so the App-level tests can check it.
 #[must_use]
 fn app_event_requests_redraw(event: &AppEvent) -> bool {
-    matches!(event, AppEvent::OpenFinished | AppEvent::CompositeReady)
+    matches!(
+        event,
+        AppEvent::OpenFinished | AppEvent::CompositeReady | AppEvent::ThumbnailReady
+    )
 }
 
 /// `about_to_wait`'s background-composite step (0.186.0), as a free
@@ -24123,6 +24130,8 @@ struct App {
     /// The background compositor (0.186.0); `None` only if a test double
     /// builds an `App` without one.
     composite_worker: Option<background_composite::CompositeWorker>,
+    /// Layer thumbnails for the Layers panel (0.197.0): a worker, a cache.
+    thumbnails: layer_thumbnails::LayerThumbnails,
     /// Writes the crash-recovery autosave off the UI thread (0.152.0,
     /// [`background_autosave`]).
     autosave_worker: background_autosave::AutosaveWorker,
@@ -24709,6 +24718,7 @@ impl App {
         let _ = sync_status_bar(&mut workspace, &canvas_view, canvas_size, 1.0);
 
         let composite_proxy = proxy.clone();
+        let thumbnail_proxy = proxy.clone();
         let mut app = Self {
             window: None,
             gpu: None,
@@ -24716,6 +24726,9 @@ impl App {
             adapter: None,
             proxy,
             open_worker: OpenWorker::default(),
+            thumbnails: layer_thumbnails::LayerThumbnails::new(std::sync::Arc::new(move || {
+                let _ = thumbnail_proxy.send_event(AppEvent::ThumbnailReady);
+            })),
             composite_worker: Some(background_composite::CompositeWorker::new(
                 std::sync::Arc::new(move || {
                     let _ = composite_proxy.send_event(AppEvent::CompositeReady);
@@ -28538,6 +28551,35 @@ impl App {
         }
     }
 
+    /// The Layers panel's thumbnails (0.197.0), once per loop turn: request
+    /// pictures for the visible pixel rows, install what the worker
+    /// finished, and put the cached pictures into the rows. Returns when a
+    /// throttled refresh is due. Costs the UI thread a row scan, a stamp per
+    /// visible layer and, for a layer with no current picture, a few tile
+    /// shares and at most 8 scratch-disk reads per turn; never a decode or a
+    /// downsample.
+    fn update_layer_thumbnails(&mut self, now: std::time::Instant) -> Option<std::time::Instant> {
+        let rows = aurora_ui::visible_layer_rows(
+            &self.workspace.tree,
+            self.workspace.layers,
+            &self.layer_rows,
+            &self.scales,
+            2,
+        );
+        let store = self.doc.tile_store.as_mut()?;
+        let key = (self.doc.id, store.serial());
+        let ids: Vec<aurora_doc::LayerId> = rows.iter().map(|&(_, layer)| layer).collect();
+        let deadline = self
+            .thumbnails
+            .update(key, &self.doc.layers, store, &ids, now);
+        let installed = self.thumbnails.drain();
+        let changed = self.thumbnails.apply(&mut self.workspace.tree, &rows);
+        if changed || !installed.is_empty() {
+            self.needs_redraw = true;
+        }
+        deadline
+    }
+
     /// The catch-all reactive sync ([`sync_layer_controls`]), run once per
     /// event-loop iteration from [`Self::about_to_wait`], so every path
     /// that changes the active layer or the document — a Layers-row
@@ -29327,7 +29369,9 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, _el: &ActiveEventLoop, event: AppEvent) {
         let event = match event {
             AppEvent::Accessibility(event) => event,
-            wake @ (AppEvent::OpenFinished | AppEvent::CompositeReady) => {
+            wake @ (AppEvent::OpenFinished
+            | AppEvent::CompositeReady
+            | AppEvent::ThumbnailReady) => {
                 // Installed by `about_to_wait`, which runs after this on
                 // the same iteration: the wake's whole job is to end the
                 // loop's `Wait` so that it does.
@@ -29576,6 +29620,7 @@ impl ApplicationHandler<AppEvent> for App {
         self.sync_tool_controls_now();
         self.sync_curves_controls_now();
         self.sync_status_bar_now();
+        let thumbnail_deadline = self.update_layer_thumbnails(now);
         // The caret blink (0.139.0): after everything above that can move
         // focus or edit a field, so the signature it observes is this
         // iteration's. A flip the last frame did not draw asks for one
@@ -29583,6 +29628,10 @@ impl ApplicationHandler<AppEvent> for App {
         // loop with a focused field wakes exactly once per half-period.
         let caret = self.caret_step(now);
         let deadline = fold_caret_step(caret, gallery_deadline, &mut self.needs_redraw);
+        let deadline = match (deadline, thumbnail_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         // `ControlFlow::Wait` would otherwise block indefinitely, and
         // muda's channel has no event-loop wakeup of its own to
         // interrupt that wait -- so macOS also re-polls on a short timer,
@@ -36019,10 +36068,10 @@ mod tests {
         );
         assert_eq!(
             total_descendants(&workspace.tree, workspace.layers.body),
-            3,
-            "and nothing at all survives below that: exactly the tree container, one row and \
-             that row's eye (0.195.0), counted at every depth rather than only the tree's own \
-             direct children"
+            4,
+            "and nothing at all survives below that: exactly the tree container, one row, \
+             that row's eye (0.195.0) and its thumbnail slot (0.197.0), counted at every depth \
+             rather than only the tree's own direct children"
         );
         assert_eq!(
             workspace
@@ -79693,10 +79742,16 @@ mod panel_scroll_tests {
             grab,
         );
         assert_eq!(down.owner, Some(crate::WidgetOwner::PanelScrollbar));
-        assert_eq!(
-            workspace.tree.scroll_y(workspace.layers.body),
-            Some(0.0),
-            "a press on the thumb centre keeps it"
+        assert!(
+            workspace
+                .tree
+                .scroll_y(workspace.layers.body)
+                .is_some_and(|y| y.abs() < 1e-4),
+            // Measured 1.03e-5 px with the 32 px thumbnail rows (the
+            // thumb centre rounds through the scrollbar's f32 range
+            // arithmetic); 1e-4 is ten times that and a hundredth of a
+            // device pixel.
+            "a press on the thumb centre keeps it (to float rounding)"
         );
         let moved = pointer(
             &mut workspace,

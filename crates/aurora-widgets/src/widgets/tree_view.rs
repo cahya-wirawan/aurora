@@ -267,6 +267,12 @@ pub struct TreeItemState {
     /// edge (0.195.0; the Layers panel's blend-mode name). Drawn only; the
     /// accessible description stays the owner's to set.
     pub trailing: Option<String>,
+    /// This row's own line height in logical px (0.197.0; `0` = the
+    /// `row_height` token): the Layers panel's rows are taller than a text
+    /// row to hold a thumbnail. Drives the row's top padding and minimum
+    /// height ([`set_tree_item_row_height`]), the selection highlight, the
+    /// focus ring and the label's box.
+    pub row_height: u32,
     /// The owner's identity for this row (0.195.0; the Layers panel's
     /// layer id), never drawn or announced. It lets an owner that rebuilds
     /// every row (`aurora-ui`'s repopulation) carry per-row state, such as
@@ -609,6 +615,7 @@ pub fn insert_tree_item(
         has_children,
         label_inset: 0,
         trailing: None,
+        row_height: 0,
         key: None,
     };
     let id = tree.insert(
@@ -796,6 +803,53 @@ pub fn set_tree_item_key(
         state.key = key;
         Ok(())
     })
+}
+
+/// Gives `id` its own line height, `height` logical px (0.197.0), in place
+/// of the `row_height` token: its `padding.top` (where its own line is) and
+/// `min_size.height` follow, and so do its highlight, focus ring and label
+/// box. `0` restores the token. The row's children are unaffected (each
+/// carries its own height).
+///
+/// # Errors
+///
+/// [`WidgetError::UnknownWidget`] / [`WidgetError::WrongWidgetKind`].
+pub fn set_tree_item_row_height(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    scales: &Scales,
+    height: u32,
+) -> Result<(), WidgetError> {
+    with_tree_item_mut(tree, id, |state| {
+        state.row_height = height;
+        Ok(())
+    })?;
+    #[allow(clippy::cast_precision_loss)]
+    let line = if height == 0 {
+        row_height(scales)
+    } else {
+        height as f32
+    };
+    let mut style = tree
+        .style(id)
+        .cloned()
+        .ok_or(WidgetError::UnknownWidget(id))?;
+    style.padding.top = length(line);
+    style.min_size.height = length(line);
+    tree.set_style(id, style)
+}
+
+/// `id`'s own line height in logical px: its [`TreeItemState::row_height`],
+/// or the `row_height` token when that is `0`.
+#[must_use]
+pub fn tree_item_row_height(state: &TreeItemState, scales: &Scales) -> f32 {
+    if state.row_height == 0 {
+        row_height(scales)
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        let line = state.row_height as f32;
+        line
+    }
 }
 
 /// Sets the right-aligned secondary label of `id` (`None` clears it).
