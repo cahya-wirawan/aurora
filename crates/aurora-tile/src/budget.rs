@@ -13,17 +13,24 @@
 //!   defensively and clamped to the same range.
 //! - [`physical_ram_bytes`]: the detection, per OS.
 //! - [`ResidencyPool`]: one budget shared by every store that joins it.
-//!   Each member's share is `max(floor, total / members)`, re-read on
-//!   every admission, so a store that leaves grows the others at once.
-//!   A member that admits nothing (a parked document) only shrinks when
-//!   its owner calls [`crate::TileStore::enforce_budget`].
+//!   Each member's share is re-read on every admission, so a store that
+//!   leaves grows the others at once. A member that admits nothing (a
+//!   parked document) only shrinks when its owner calls
+//!   [`crate::TileStore::enforce_budget`].
+//! - [`pool_shares`] (0.187.0): how the pool splits. One *group* of
+//!   members (the active document's store and its background
+//!   compositor's mirror) is active; it gets three quarters of the total
+//!   and the parked members split the last quarter, each floored. With
+//!   no active group, or no parked member, the split is equal
+//!   ([`share_tiles`]).
 //!
 //! The budget is a cap on what may be resident, never a preload
 //! (invariant §7.3.1): nothing here reads a tile.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::SAMPLES;
 
@@ -141,6 +148,79 @@ pub fn share_tiles(total: NonZeroUsize, floor: NonZeroUsize, members: usize) -> 
     NonZeroUsize::new(split.max(floor.get())).unwrap_or(floor)
 }
 
+/// The parked members of a pool that has an active group together get
+/// `total / PARKED_RESERVE_DIVISOR` (a quarter), and the active group
+/// the rest (0.187.0, design-owner decision "the active document gets a
+/// bigger share", Cahya, 2026-10-11; the quarter is engineering's
+/// choice, ADR 0011's 0.187.0 addendum). A quarter of this machine's
+/// 16,384 tiles is 4,096, more than the Nyepi template's ~2,900-tile
+/// working set, so one parked large document stays warm for switching
+/// back; the active document's three quarters never shrink as more
+/// documents are parked, only the floors of very many parked ones can
+/// eat into them.
+pub const PARKED_RESERVE_DIVISOR: usize = 4;
+
+/// Each member's share of a pool, by role ([`pool_shares`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolShares {
+    /// What each member of the active group may hold, in tiles.
+    pub active: NonZeroUsize,
+    /// What each parked member may hold, in tiles.
+    pub parked: NonZeroUsize,
+}
+
+/// How a pool of `total` tiles splits between `active` members (the
+/// active group: the active document's store and its mirror) and
+/// `parked` members (every other store: parked documents, a pending
+/// open), never cutting anyone below `floor` (0.187.0):
+///
+/// - With no active member or no parked member, everyone gets the equal
+///   split [`share_tiles`] of `active + parked` members — exactly the
+///   0.185.0/0.186.0 rule.
+/// - Otherwise the parked members split `total / PARKED_RESERVE_DIVISOR`
+///   (a quarter), each at least `floor`; the active group gets what the
+///   parked shares leave — at least three quarters, less only when the
+///   parked floors do not fit in the quarter — split evenly, each at
+///   least `floor`.
+///
+/// So the sum of every member's share is at most `max(total, members ×
+/// floor)`: within the total whenever the floors fit in it, and only the
+/// floors themselves past it (never more than one floor past it while
+/// `(members − 1) × floor ≤ total`). An active member never gets less
+/// than the equal split would give it, and a parked one never less than
+/// `floor`.
+///
+/// These bounds assume a small active group — at most three members
+/// (a document, its mirror and one mirror the worker has not yet
+/// released), which is all the app creates. A larger active group can
+/// break them: with total 100, floor 10, nine active and one parked the
+/// sum is 115.
+#[must_use]
+pub fn pool_shares(
+    total: NonZeroUsize,
+    floor: NonZeroUsize,
+    active: usize,
+    parked: usize,
+) -> PoolShares {
+    if active == 0 || parked == 0 {
+        let equal = share_tiles(total, floor, active.saturating_add(parked));
+        return PoolShares {
+            active: equal,
+            parked: equal,
+        };
+    }
+    let reserve = total.get() / PARKED_RESERVE_DIVISOR;
+    let parked_each = (reserve / parked).max(floor.get());
+    let active_set = total
+        .get()
+        .saturating_sub(parked_each.saturating_mul(parked));
+    let active_each = (active_set / active).max(floor.get());
+    PoolShares {
+        active: NonZeroUsize::new(active_each).unwrap_or(floor),
+        parked: NonZeroUsize::new(parked_each).unwrap_or(floor),
+    }
+}
+
 /// The total physical memory of this machine in bytes, or `None` when
 /// it cannot be read. Linux reads `/proc/meminfo`'s `MemTotal` (no
 /// `unsafe`), macOS `sysctl hw.memsize`, Windows
@@ -210,20 +290,39 @@ const fn detect_ram() -> Option<u64> {
     None
 }
 
+/// Which members of a [`ResidencyPool`] share one role (0.187.0): a
+/// document's store and its background compositor's mirror are one
+/// group, so making the document active makes both active. Ids are
+/// unique for the whole process, so a group from one pool can never name
+/// another pool's members.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PoolGroup(u64);
+
+impl PoolGroup {
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// One resident-tile budget shared by every store that joins it
 /// ([`crate::TileStore::new_shared`]). The app keeps one per process, so
 /// every open document — active, parked, or still opening — draws on the
 /// same total.
 ///
-/// Each member's budget is [`Self::share`], `max(floor, total /
-/// members)`, read again whenever the member admits a tile, so:
+/// Every member belongs to a [`PoolGroup`]; at most one group is
+/// *active* at a time ([`Self::activate`]), and the shares are
+/// [`pool_shares`] of the active group's member count and everyone
+/// else's. Each member's share is read again whenever it admits a tile,
+/// so:
 ///
-/// - a store joining shrinks every other member's share at once, and the
-///   active store evicts down to it on its next admission; a store that
-///   admits nothing (a parked document) evicts only when its owner calls
+/// - a store joining, or the active group moving, shrinks some members'
+///   shares at once; the active store evicts down to its share on its
+///   next admission, and a store that admits nothing (a parked document)
+///   evicts only when its owner calls
 ///   [`crate::TileStore::enforce_budget`];
 /// - a store dropped (a closed document) leaves, and every remaining
-///   member's share grows at once. Growth needs no eviction.
+///   member's share grows or stays. Growth needs no eviction.
 ///
 /// Eviction always goes through the store's own path: a dirty tile is
 /// encoded and written to scratch, never dropped.
@@ -231,7 +330,24 @@ const fn detect_ram() -> Option<u64> {
 pub struct ResidencyPool {
     total: NonZeroUsize,
     floor: NonZeroUsize,
-    members: AtomicUsize,
+    state: Mutex<PoolState>,
+}
+
+/// Who is in a pool: members per group and the active group. Behind one
+/// lock so a share is never computed from a half-moved active group.
+#[derive(Debug, Default)]
+struct PoolState {
+    groups: HashMap<PoolGroup, usize>,
+    members: usize,
+    active: Option<PoolGroup>,
+}
+
+impl PoolState {
+    fn active_members(&self) -> usize {
+        self.active
+            .and_then(|group| self.groups.get(&group).copied())
+            .unwrap_or(0)
+    }
 }
 
 impl ResidencyPool {
@@ -242,7 +358,7 @@ impl ResidencyPool {
         Arc::new(Self {
             total,
             floor: floor.min(total),
-            members: AtomicUsize::new(0),
+            state: Mutex::new(PoolState::default()),
         })
     }
 
@@ -257,6 +373,13 @@ impl ResidencyPool {
     #[must_use]
     pub fn from_system() -> Arc<Self> {
         Self::from_bytes(system_budget_bytes())
+    }
+
+    /// The membership state. A panic while it was held cannot leave it
+    /// half-updated (every update is a few integer writes that cannot
+    /// panic), so a poisoned lock is simply taken over.
+    fn state(&self) -> MutexGuard<'_, PoolState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The pool's whole budget, in tiles.
@@ -274,47 +397,149 @@ impl ResidencyPool {
     /// How many stores are members now.
     #[must_use]
     pub fn members(&self) -> usize {
-        self.members.load(Ordering::Relaxed)
+        self.state().members
     }
 
-    /// One member's budget now, in tiles ([`share_tiles`]).
+    /// How many members belong to the active group now (0 when no group
+    /// is active).
+    #[must_use]
+    pub fn active_members(&self) -> usize {
+        self.state().active_members()
+    }
+
+    /// The active group, if one is set and still has members.
+    #[must_use]
+    pub fn active_group(&self) -> Option<PoolGroup> {
+        let state = self.state();
+        state
+            .active
+            .filter(|group| state.groups.contains_key(group))
+    }
+
+    /// Makes `group` the active one (0.187.0), parking whichever was
+    /// active before: there is only ever one active group. Shares move
+    /// at once; nothing is evicted here.
+    pub fn activate(&self, group: PoolGroup) {
+        self.state().active = Some(group);
+    }
+
+    /// Parks `group` if it is the active one, leaving no group active
+    /// (every member then gets the equal split). Returns whether it was
+    /// active.
+    pub fn deactivate(&self, group: PoolGroup) -> bool {
+        let mut state = self.state();
+        let was = state.active == Some(group);
+        if was {
+            state.active = None;
+        }
+        was
+    }
+
+    /// Each role's share now ([`pool_shares`]).
+    #[must_use]
+    pub fn shares(&self) -> PoolShares {
+        let state = self.state();
+        let active = state.active_members();
+        pool_shares(
+            self.total,
+            self.floor,
+            active,
+            state.members.saturating_sub(active),
+        )
+    }
+
+    /// A parked member's share now, in tiles — every member's, while no
+    /// group is active (the 0.185.0 meaning: `max(floor, total /
+    /// members)`). [`Self::shares`] has the active group's too.
     #[must_use]
     pub fn share(&self) -> NonZeroUsize {
-        share_tiles(self.total, self.floor, self.members())
+        self.shares().parked
     }
 
+    /// The share a member of `group` may hold now, in tiles.
+    #[must_use]
+    pub fn share_for(&self, group: PoolGroup) -> NonZeroUsize {
+        let state = self.state();
+        let active = state.active_members();
+        let shares = pool_shares(
+            self.total,
+            self.floor,
+            active,
+            state.members.saturating_sub(active),
+        );
+        if active > 0 && state.active == Some(group) {
+            shares.active
+        } else {
+            shares.parked
+        }
+    }
+
+    /// Joins as the only member of a new group.
     pub(crate) fn join(self: &Arc<Self>) -> PoolMembership {
-        self.members.fetch_add(1, Ordering::Relaxed);
-        PoolMembership(Arc::clone(self))
+        self.join_group(PoolGroup::next())
+    }
+
+    /// Joins `group` (0.187.0: the mirror joins its document's group).
+    pub(crate) fn join_group(self: &Arc<Self>, group: PoolGroup) -> PoolMembership {
+        let mut state = self.state();
+        *state.groups.entry(group).or_insert(0) += 1;
+        state.members = state.members.saturating_add(1);
+        drop(state);
+        PoolMembership {
+            pool: Arc::clone(self),
+            group,
+        }
+    }
+
+    fn leave(&self, group: PoolGroup) {
+        let mut state = self.state();
+        // Saturating: a membership only exists after its own increment,
+        // so this never underflows, but a wrap would be worse than a
+        // stuck count.
+        state.members = state.members.saturating_sub(1);
+        let emptied = match state.groups.get_mut(&group) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                *count == 0
+            }
+            None => false,
+        };
+        if emptied {
+            state.groups.remove(&group);
+            // An active group whose last member left (its document
+            // closed) is active no longer.
+            if state.active == Some(group) {
+                state.active = None;
+            }
+        }
     }
 }
 
 /// A store's place in a [`ResidencyPool`]; leaving is its `Drop`, so a
 /// store counts exactly as long as it exists.
 #[derive(Debug)]
-pub(crate) struct PoolMembership(Arc<ResidencyPool>);
+pub(crate) struct PoolMembership {
+    pool: Arc<ResidencyPool>,
+    group: PoolGroup,
+}
 
 impl PoolMembership {
     pub(crate) fn share(&self) -> NonZeroUsize {
-        self.0.share()
+        self.pool.share_for(self.group)
     }
 
     pub(crate) fn pool(&self) -> Arc<ResidencyPool> {
-        Arc::clone(&self.0)
+        Arc::clone(&self.pool)
+    }
+
+    pub(crate) const fn group(&self) -> PoolGroup {
+        self.group
     }
 }
 
 impl Drop for PoolMembership {
     fn drop(&mut self) {
-        // Saturating: a membership only exists after its own increment,
-        // so this never underflows, but a wrap would be worse than a
-        // stuck count.
-        let _ = self
-            .0
-            .members
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(1))
-            });
+        self.pool.leave(self.group);
     }
 }
 
@@ -470,5 +695,152 @@ mod tests {
         assert_eq!(pool.members(), 0);
         // The floor is capped at the total.
         assert_eq!(ResidencyPool::new(nz(10), nz(100)).floor_tiles().get(), 10);
+    }
+
+    /// The sum of every member's share for `active` + `parked` members.
+    fn shares_sum(shares: PoolShares, active: usize, parked: usize) -> usize {
+        shares.active.get() * active + shares.parked.get() * parked
+    }
+
+    /// 0.187.0: the worked cases of the weighting, at this machine's
+    /// 16,384-tile pool with the 256-tile floor.
+    #[test]
+    fn the_active_group_gets_three_quarters_and_the_parked_split_a_quarter() {
+        let (total, floor) = (nz(16_384), nz(256));
+        let at = |active, parked| {
+            let shares = pool_shares(total, floor, active, parked);
+            (shares.active.get(), shares.parked.get())
+        };
+        // One document alone: everything; with its mirror: half each.
+        assert_eq!(at(1, 0), (16_384, 16_384));
+        assert_eq!(at(2, 0), (8_192, 8_192));
+        // One parked document gets a quarter (4,096 tiles, more than
+        // Nyepi's ~2,900-tile working set), the active one the rest.
+        assert_eq!(at(1, 1), (12_288, 4_096));
+        assert_eq!(at(2, 1), (6_144, 4_096));
+        // More parked documents split the quarter; the active group's
+        // three quarters do not move.
+        assert_eq!(at(1, 4), (12_288, 1_024));
+        assert_eq!(at(2, 16), (6_144, 256));
+        // Past 16 parked the floors no longer fit in the quarter and come
+        // out of the active group's share, never below its own floor.
+        assert_eq!(at(1, 20), (16_384 - 20 * 256, 256));
+        assert_eq!(at(2, 63), (256, 256));
+        assert_eq!(at(1, 200), (256, 256));
+        // No active group: the 0.186.0 equal split.
+        assert_eq!(at(0, 3), (5_461, 5_461));
+        assert_eq!(at(0, 0), (16_384, 16_384));
+    }
+
+    /// 0.187.0: over every small pool, floor and member count, with and
+    /// without a mirror in the active group: nobody is below the floor;
+    /// the sum of shares is within `max(total, members × floor)`, so
+    /// within the total plus one floor whenever the other members' floors
+    /// fit in the total; an active member never gets less than the
+    /// 0.186.0 equal split; and an active member gets strictly more than
+    /// a parked one whenever the total leaves room for that.
+    #[test]
+    fn pool_shares_keep_the_floor_and_the_bound_for_every_member_count() {
+        let mut checked = 0_usize;
+        for total in 1..=160 {
+            for floor in 1..=total {
+                for active in 0..=3 {
+                    for parked in 0..=12 {
+                        let shares = pool_shares(nz(total), nz(floor), active, parked);
+                        let members = active + parked;
+                        let case = format!("total {total} floor {floor} a {active} p {parked}");
+                        assert!(shares.active.get() >= floor, "{case}");
+                        assert!(shares.parked.get() >= floor, "{case}");
+                        let sum = shares_sum(shares, active, parked);
+                        assert!(sum <= total.max(members * floor), "{case}: sum {sum}");
+                        if members.saturating_sub(1) * floor <= total {
+                            assert!(sum <= total + floor, "{case}: sum {sum}");
+                        }
+                        if active > 0 {
+                            let equal = share_tiles(nz(total), nz(floor), members).get();
+                            assert!(shares.active.get() >= equal, "{case}: below equal");
+                        }
+                        if active > 0
+                            && active <= 2
+                            && parked > 0
+                            && active * (floor + 1) + parked * floor <= total
+                        {
+                            assert!(
+                                shares.active.get() > shares.parked.get(),
+                                "{case}: {shares:?}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 600_000, "{checked}");
+    }
+
+    #[test]
+    fn activating_a_group_moves_the_bigger_share_and_there_is_only_one() {
+        let pool = ResidencyPool::new(nz(1000), nz(100));
+        let a = pool.join();
+        let b = pool.join();
+        // Nothing active yet: the equal split.
+        assert_eq!((a.share().get(), b.share().get()), (500, 500));
+        assert_eq!((pool.active_group(), pool.active_members()), (None, 0));
+        pool.activate(a.group());
+        assert_eq!((a.share().get(), b.share().get()), (750, 250));
+        assert_eq!(pool.active_members(), 1);
+        // A switch: b active, a parked, at once.
+        pool.activate(b.group());
+        assert_eq!((a.share().get(), b.share().get()), (250, 750));
+        assert_eq!(pool.active_group(), Some(b.group()));
+        // Parking a group that is not the active one changes nothing.
+        assert!(!pool.deactivate(a.group()));
+        assert_eq!(pool.active_group(), Some(b.group()));
+        assert!(pool.deactivate(b.group()));
+        assert_eq!((a.share().get(), b.share().get()), (500, 500));
+    }
+
+    /// 0.187.0: a mirror joins its document's group, so the two split the
+    /// active share; a mirror joined as a group of its own would be
+    /// parked.
+    #[test]
+    fn a_mirror_in_the_documents_group_splits_the_active_share() {
+        let pool = ResidencyPool::new(nz(1000), nz(100));
+        let parked = pool.join();
+        let document = pool.join();
+        pool.activate(document.group());
+        let mirror = pool.join_group(document.group());
+        assert_eq!(pool.active_members(), 2);
+        assert_eq!(
+            (
+                document.share().get(),
+                mirror.share().get(),
+                parked.share().get()
+            ),
+            (375, 375, 250)
+        );
+        let sum = document.share().get() + mirror.share().get() + parked.share().get();
+        assert!(sum <= 1000);
+        // The mirror released: the document has the whole active share.
+        drop(mirror);
+        assert_eq!((document.share().get(), parked.share().get()), (750, 250));
+    }
+
+    /// 0.187.0: the active group's last member leaving (its document
+    /// closed) leaves no group active, so the rest split equally until
+    /// another is activated.
+    #[test]
+    fn closing_the_active_document_leaves_no_group_active() {
+        let pool = ResidencyPool::new(nz(900), nz(100));
+        let a = pool.join();
+        let b = pool.join();
+        let c = pool.join();
+        pool.activate(c.group());
+        drop(c);
+        assert_eq!(pool.active_group(), None);
+        assert_eq!((a.share().get(), b.share().get()), (450, 450));
+        pool.activate(b.group());
+        assert_eq!((a.share().get(), b.share().get()), (225, 675));
+        assert_eq!(pool.members(), 2);
     }
 }

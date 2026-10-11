@@ -22,9 +22,10 @@ mod tile;
 mod writer;
 
 pub use budget::{
-    CEILING_BYTES, EVICTION_BURST, FLOOR_BYTES, OVERRIDE_ENV, RAM_SHARE_DIVISOR, ResidencyPool,
-    TILE_BYTES, budget_bytes_for_ram, clamp_bytes, parse_override_mb, physical_ram_bytes,
-    resolve_budget_bytes, share_tiles, system_budget_bytes, tiles_for_bytes,
+    CEILING_BYTES, EVICTION_BURST, FLOOR_BYTES, OVERRIDE_ENV, PARKED_RESERVE_DIVISOR, PoolGroup,
+    PoolShares, RAM_SHARE_DIVISOR, ResidencyPool, TILE_BYTES, budget_bytes_for_ram, clamp_bytes,
+    parse_override_mb, physical_ram_bytes, pool_shares, resolve_budget_bytes, share_tiles,
+    system_budget_bytes, tiles_for_bytes,
 };
 pub use error::TileError;
 pub use scratch::{

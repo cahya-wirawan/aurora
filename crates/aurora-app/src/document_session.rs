@@ -153,6 +153,7 @@ impl DocumentShelf {
         };
         let incoming = self.parked.remove(index);
         let outgoing = std::mem::replace(active, incoming);
+        hand_tile_pool_over(&outgoing, active);
         // Back to where it was in the full order, which the target's
         // removal shifted by one when the target sat before it.
         let park_at = if target_position < outgoing_position {
@@ -174,6 +175,7 @@ impl DocumentShelf {
         incoming: DocumentSession,
     ) -> usize {
         let outgoing = std::mem::replace(active, incoming);
+        hand_tile_pool_over(&outgoing, active);
         let park_at = self.active_position.min(self.parked.len());
         self.parked.insert(park_at, outgoing);
         self.active_position = self.parked.len();
@@ -194,6 +196,7 @@ impl DocumentShelf {
         }
         let previous = self.parked.remove(parked_at);
         let abandoned = std::mem::replace(active, previous);
+        hand_tile_pool_over(&abandoned, active);
         self.active_position = parked_at;
         Some(abandoned)
     }
@@ -231,13 +234,31 @@ impl DocumentShelf {
             self.active_position = 0;
             replacement?
         };
-        Some(std::mem::replace(active, incoming))
+        let closed = std::mem::replace(active, incoming);
+        hand_tile_pool_over(&closed, active);
+        Some(closed)
     }
 
     /// The parked session with this id, to read (tests, palette names).
     pub(crate) fn get(&self, id: DocumentId) -> Option<&DocumentSession> {
         self.parked.iter().find(|session| session.id == id)
     }
+}
+
+/// Moves the residency pool's active share from `outgoing`'s tile store
+/// to `incoming`'s (0.187.0, ADR 0011 addendum): every change of
+/// [`DocumentShelf`]'s active session goes through here, so exactly one
+/// open document — the active one, with its background compositor's
+/// mirror — holds the bigger share. `outgoing`'s group is parked first,
+/// so an incoming session without a store leaves no group active (the
+/// equal split) rather than the outgoing one's. Shares move at once; the
+/// parked store shrinks through `enforce_tile_budgets`' eviction, the
+/// active one grows with no work.
+pub(crate) fn hand_tile_pool_over(outgoing: &DocumentSession, incoming: &DocumentSession) {
+    if let Some(store) = outgoing.tile_store.as_ref() {
+        let _ = store.deactivate_pool_group();
+    }
+    let _ = incoming.claim_active_tile_share();
 }
 
 /// What a session is built from: the document's own contents and the
@@ -475,6 +496,17 @@ pub(crate) struct DocumentSession {
 }
 
 impl DocumentSession {
+    /// Makes this session's tile store the residency pool's active group
+    /// (0.187.0; [`aurora_tile::TileStore::activate_pool_group`]), so it
+    /// and its background compositor's mirror hold the bigger share and
+    /// whichever document held it is parked. Returns whether the session
+    /// has a pooled store.
+    pub(crate) fn claim_active_tile_share(&self) -> bool {
+        self.tile_store
+            .as_ref()
+            .is_some_and(aurora_tile::TileStore::activate_pool_group)
+    }
+
     /// A session over `contents`, with a fresh id, an empty selection,
     /// empty pixel and interleaved undo stacks (the History panel's
     /// origin row reading "New Document", [`UndoOrder`]'s own
@@ -728,6 +760,38 @@ mod tests {
         assert_eq!(names_in_order(&shelf, &active), ["a", "*b", "c"]);
         assert!(shelf.revert_push(&mut active, 99).is_none());
         let _ = parked_c;
+    }
+
+    /// 0.187.0: the hand-over parks the outgoing group before activating
+    /// the incoming one, so a session without a store (no scratch
+    /// directory) leaves no group active rather than the outgoing one.
+    #[test]
+    fn handing_the_pool_to_a_session_without_a_store_leaves_no_group_active() {
+        let pool = aurora_tile::ResidencyPool::new(
+            std::num::NonZeroUsize::new(16).unwrap_or(std::num::NonZeroUsize::MIN),
+            std::num::NonZeroUsize::MIN,
+        );
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let mut a = named("a");
+        a.tile_store = match aurora_tile::TileStore::new_shared(dir.path().to_path_buf(), &pool) {
+            Ok(store) => Some(store),
+            Err(err) => unreachable!("{err}"),
+        };
+        assert!(a.claim_active_tile_share());
+        assert!(pool.active_group().is_some());
+        let b = named("b");
+        assert!(!b.claim_active_tile_share(), "no store to claim with");
+        super::hand_tile_pool_over(&a, &b);
+        assert_eq!(pool.active_group(), None);
+        super::hand_tile_pool_over(&b, &a);
+        assert!(
+            a.tile_store
+                .as_ref()
+                .is_some_and(aurora_tile::TileStore::is_pool_active)
+        );
     }
 
     #[test]

@@ -595,11 +595,14 @@ fn result_is_installable(job: &ActiveJob, target: &CompositeTarget<'_>, tile: Ti
 fn new_mirror(source: &mut TileStore) -> Option<TileStore> {
     let dir = crate::composite_mirror_scratch_dir(source)?;
     // MEM-1: a pooled source's mirror joins the same pool, so the two
-    // budgets are shares of one total (each `max(floor, total / members)`)
-    // rather than two whole budgets. The source shrinks to its new share
-    // lazily (its own next insertions) plus one eviction burst here.
-    let created = if let Some(pool) = source.pool() {
-        TileStore::new_shared(dir, &pool)
+    // budgets are shares of one total rather than two whole budgets.
+    // 0.187.0: it joins the source's own pool group, so it is active
+    // exactly when its document is and the two split the active share
+    // (`aurora_tile::pool_shares`); the parked documents' shares do not
+    // move. The source shrinks to its new share lazily (its own next
+    // insertions) plus one eviction burst here.
+    let created = if let (Some(pool), Some(group)) = (source.pool(), source.pool_group()) {
+        TileStore::new_shared_in(dir, &pool, group)
     } else {
         let budget = std::num::NonZeroUsize::new(source.budget_tiles().max(1))?;
         TileStore::new(dir, budget)
