@@ -54,5 +54,5 @@ mod test_support;
 mod undo;
 
 pub use dab::{DEFAULT_SPACING, advance_segment, dab_step, dabs_along_path};
-pub use stamp::{DabOutcome, erase_dab, stamp_dab, touched_tiles};
+pub use stamp::{DabOutcome, erase_dab, stamp_dab, stamp_dab_preserving_alpha, touched_tiles};
 pub use undo::{PixelHistory, StrokeSnapshot};

@@ -26,6 +26,18 @@
 //! Nesting is capped at [`super::MAX_GROUP_DEPTH`], the reader's own
 //! limit, and every divider counts towards [`PSD_MAX_RECORDS`].
 //!
+//! # Locks (0.198.0)
+//!
+//! A layer's or group's `aurora_doc::LayerLock` is written the way
+//! Photoshop stores it, as measured with psd-tools on the corpus: the
+//! record flags' bit 0 is set when transparency is locked, and an `lspf`
+//! (Protected Setting) tagged block carries a `u32` — bit 0 transparency,
+//! bit 1 pixels (Photoshop's "composite"), bit 2 position, and exactly
+//! `0x8000_0000` for Lock All (all three set). No lock writes no block.
+//! The artboard "nesting" bit (3) that Photoshop sets on a Background
+//! layer is not kept (Aurora has no artboards) and not reported. Locks are
+//! therefore lossless and never appear in the save report.
+//!
 //! # Masks (0.178.0)
 //!
 //! A layer's or group's `aurora_doc::LayerMask` is written as a PSD
@@ -412,6 +424,8 @@ pub struct PsdExpectedLayer {
     pub opacity: u8,
     pub fill: u8,
     pub visible: bool,
+    /// The record's locks (0.198.0): flags bit 0 and the `lspf` block.
+    pub lock: aurora_doc::LayerLock,
     /// The record's rectangle: top, left, bottom, right.
     pub rect: [i32; 4],
     /// A hash of every written `u16` sample (channel, position, value).
@@ -825,6 +839,7 @@ fn plan_props(
             opacity: opacity_byte(layers.opacity(id).unwrap_or(1.0)),
             fill: opacity_byte(layers.fill_opacity(id).unwrap_or(1.0)),
             visible: layers.visible(id).unwrap_or(true),
+            lock: layers.lock(id).unwrap_or_default(),
             rect,
             sample_hash: 0,
             decoded_hash: 0,
@@ -850,6 +865,7 @@ fn plan_group_end() -> LayerPlan {
             opacity: u8::MAX,
             fill: u8::MAX,
             visible: true,
+            lock: aurora_doc::LayerLock::none(),
             rect: [0; 4],
             sample_hash: 0,
             decoded_hash: 0,
@@ -980,11 +996,22 @@ fn record_extra(plan: &LayerPlan) -> Result<Vec<u8>, IoError> {
         extra.extend_from_slice(&len.to_be_bytes());
         extra.extend_from_slice(&section);
     }
+    if let Some(bits) = super::lspf_for_lock(plan.expected.lock) {
+        extra.extend_from_slice(b"8BIM");
+        extra.extend_from_slice(b"lspf");
+        extra.extend_from_slice(&4u32.to_be_bytes());
+        extra.extend_from_slice(&bits.to_be_bytes());
+    }
     extra.extend_from_slice(b"8BIM");
     extra.extend_from_slice(b"iOpa");
     extra.extend_from_slice(&4u32.to_be_bytes());
     extra.extend_from_slice(&[plan.expected.fill, 0, 0, 0]);
     Ok(extra)
+}
+
+/// A record's flags byte: bit 0 transparency protected, bit 1 hidden.
+fn record_flags(expected: &PsdExpectedLayer) -> u8 {
+    u8::from(expected.lock.transparency) | if expected.visible { 0 } else { 0x02 }
 }
 
 /// A record's `lsct` data: none for a layer; type `3` alone for a
@@ -1380,8 +1407,9 @@ fn write_records<W: Write + Seek>(
         length_slots.push(slots);
         w.write_all(b"8BIM")?;
         w.write_all(&psd_blend_key(plan.expected.blend))?;
-        // Flags bit 1 SET means hidden.
-        let flags: u8 = if plan.expected.visible { 0 } else { 0x02 };
+        // Flags bit 1 SET means hidden; bit 0 means transparency protected
+        // (0.198.0).
+        let flags: u8 = record_flags(&plan.expected);
         w.write_all(&[plan.expected.opacity, 0, flags, 0])?;
         let extra = record_extra(plan)?;
         let extra_len = u32::try_from(extra.len()).map_err(|_| too_large("layer record"))?;
@@ -1716,6 +1744,11 @@ fn raw_record<R: std::io::Read + Seek>(
         flags & 0x02 != 0,
         !want.visible,
     )?;
+    check(
+        &format!("layer {i} transparency-protected flag"),
+        flags & 0x01 != 0,
+        want.lock.transparency,
+    )?;
     let extra = raw.u32()?;
     let extra_end = raw.pos()? + u64::from(extra);
     raw_mask(raw, i, want.mask.as_ref())?;
@@ -1725,6 +1758,7 @@ fn raw_record<R: std::io::Read + Seek>(
     let padded = (usize::from(plen) + 1).next_multiple_of(4) - 1;
     let _pascal = raw.bytes(padded)?;
     let (mut name, mut fill, mut section) = (None, None, None);
+    let mut protected = None;
     while raw.pos()? < extra_end {
         check("tagged block signature", raw.array::<4>()?, *b"8BIM")?;
         let key = raw.array::<4>()?;
@@ -1733,6 +1767,12 @@ fn raw_record<R: std::io::Read + Seek>(
         match &key {
             b"luni" => name = super::decode_luni(&data),
             b"iOpa" => fill = data.first().copied(),
+            b"lspf" => {
+                protected = data
+                    .get(..4)
+                    .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                    .map(u32::from_be_bytes);
+            }
             b"lsct" => section = Some(data),
             _ => {}
         }
@@ -1743,6 +1783,11 @@ fn raw_record<R: std::io::Read + Seek>(
         Some(want.name.as_str()),
     )?;
     check(&format!("layer {i} fill"), fill, Some(want.fill))?;
+    check(
+        &format!("layer {i} protected setting"),
+        protected,
+        super::lspf_for_lock(want.lock),
+    )?;
     check(
         &format!("layer {i} section divider"),
         section,
@@ -1964,6 +2009,7 @@ pub(crate) fn verify_psd_file_with_budget(
             l.visible(id),
             Some(want.visible),
         )?;
+        check(&format!("layer {i} locks"), l.lock(id), Some(want.lock))?;
         reader_mask(i, l.mask(id), want.mask.as_ref(), id, &sink.masks)?;
         if kind != PsdRecordKind::Layer {
             continue;

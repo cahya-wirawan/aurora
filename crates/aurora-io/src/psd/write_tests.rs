@@ -1144,6 +1144,7 @@ fn replace_verified_keeps_an_existing_targets_permissions() {
 /// with psd-tools. Ignored: run it by name.
 #[test]
 #[ignore = "writes fixtures for scripts/verify_psd_write.py"]
+#[allow(clippy::too_many_lines)]
 fn write_psd_fixtures_for_psd_tools() {
     let Ok(out) = std::env::var("AURORA_PSD_FIXTURE_DIR") else {
         unreachable!("set AURORA_PSD_FIXTURE_DIR");
@@ -1235,6 +1236,31 @@ fn write_psd_fixtures_for_psd_tools() {
     );
     ok(std::fs::write(out.join("fixture.json"), json));
     assert_eq!(outcome.expected.layers.len(), 3);
+
+    // 0.198.0: `locks.psd` — one layer per lock combination and a locked
+    // group — for `scripts/verify_psd_write.py`'s psd-tools check.
+    let mut locked = Doc::new((16, 16));
+    let mut spec = Vec::new();
+    for bits in 0..8u8 {
+        let lock = aurora_doc::LayerLock {
+            transparency: bits & 1 != 0,
+            pixels: bits & 2 != 0,
+            position: bits & 4 != 0,
+        };
+        let name = format!("L{bits}");
+        let id = locked.layer(&name, rect(0, 0, 16, 16), None);
+        ok(locked.tree.set_lock(id, lock));
+        spec.push(format!(
+            "{{\"name\":{name:?},\"transparency\":{},\"pixels\":{},\"position\":{}}}",
+            lock.transparency, lock.pixels, lock.position
+        ));
+    }
+    let (locked_bytes, _) = ok(locked.write());
+    ok(std::fs::write(out.join("locks.psd"), locked_bytes));
+    ok(std::fs::write(
+        out.join("locks.json"),
+        format!("[{}]", spec.join(",")),
+    ));
 }
 
 #[allow(dead_code)]
@@ -2395,4 +2421,70 @@ fn unpainted_mask_tiles_write_full_coverage() {
         let dir = ok(tempfile::tempdir());
         ok(save(&mut doc, &dir.path().join("wide.psd"), false));
     }
+}
+
+// ---------------------------------------------------------------------
+// Locks (0.198.0)
+// ---------------------------------------------------------------------
+
+/// Every lock combination, on a layer and on a group: the record flag bit 0
+/// is transparency, an `lspf` block carries the rest (Lock All is exactly
+/// `0x8000_0000`), the file verifies (raw and reader passes), reads back
+/// equal, and the save reports nothing.
+#[test]
+fn every_lock_combination_round_trips_through_write_and_read_and_verifies() {
+    use aurora_doc::LayerLock;
+    for bits in 0..8u8 {
+        let lock = LayerLock {
+            transparency: bits & 1 != 0,
+            pixels: bits & 2 != 0,
+            position: bits & 4 != 0,
+        };
+        let mut doc = flat_doc();
+        let group = ok(doc.tree.add_group("G", None));
+        let child = ok(doc
+            .tree
+            .add_pixel_layer("C", rect(0, 0, 16, 16), Some(group)));
+        let _ = child;
+        let roots = doc.tree.roots().to_vec();
+        for id in roots.iter().copied().chain([group]) {
+            ok(doc.tree.set_lock(id, lock));
+        }
+        let dir = ok(tempfile::tempdir());
+        let target = dir.path().join("locks.psd");
+        let outcome = ok(save(&mut doc, &target, false));
+        assert!(outcome.report.is_empty(), "{:?}", outcome.report);
+        let bytes = ok(std::fs::read(&target));
+        let back = read_back(&bytes);
+        for id in back.layers.roots() {
+            assert_eq!(back.layers.lock(*id), Some(lock), "{lock:?}");
+        }
+        let has_lspf = bytes.windows(4).any(|w| w == b"lspf");
+        assert_eq!(has_lspf, lock.is_any());
+        if lock == LayerLock::all() {
+            assert!(
+                bytes
+                    .windows(8)
+                    .any(|w| w == [b'l', b's', b'p', b'f', 0, 0, 0, 4])
+                    && bytes.windows(4).any(|w| w == 0x8000_0000u32.to_be_bytes()),
+                "Lock All is written as 0x80000000"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_transparency_lock_sets_record_flag_bit_0_and_nothing_else() {
+    let mut doc = Doc::new((4, 4));
+    let id = doc.layer("L", rect(0, 0, 4, 4), None);
+    ok(doc.tree.set_lock(
+        id,
+        aurora_doc::LayerLock {
+            transparency: true,
+            ..aurora_doc::LayerLock::none()
+        },
+    ));
+    let (bytes, _) = ok(doc.write());
+    let record = parse_record(&bytes, first_record(&bytes));
+    assert_eq!(record.flags, 0x01);
 }

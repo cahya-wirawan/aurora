@@ -1475,7 +1475,18 @@ fn paint_icon_button(
     scale_factor: f32,
 ) -> Result<Vec<Paint>, WidgetError> {
     let mut paints = Vec::new();
-    let overlay = if state.disabled {
+    // A toggle that is on (0.198.0) is filled like an on toggle button.
+    let on = state.toggled == Some(true) && !state.disabled;
+    if on {
+        let base = if state.pressed {
+            theme.accent.primary_active
+        } else {
+            theme.accent.primary
+        };
+        let [r, g, b] = base.to_srgb_f32();
+        paints.push((tint_mesh.clone(), [r, g, b, 1.0]));
+    }
+    let overlay = if state.disabled || on {
         None
     } else if state.pressed {
         Some(theme.state.active_overlay)
@@ -1494,6 +1505,8 @@ fn paint_icon_button(
         kind,
         tone: if state.disabled {
             IconTone::Disabled
+        } else if on {
+            IconTone::OnAccent
         } else {
             IconTone::Default
         },
@@ -7442,6 +7455,48 @@ mod tests {
     /// 0.196.0: an icon button is flat at rest (the icon alone), tinted
     /// with `state.hover_overlay` when hovered and `state.active_overlay`
     /// when pressed, and never tinted while disabled.
+    /// 0.198.0: an icon toggle button is flat when off, and when on it is
+    /// filled `accent.primary` with its icon in `icon.on_accent`.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn an_icon_toggle_button_fills_with_the_accent_only_when_on() {
+        let theme = dark_theme();
+        let scales = crate::widgets::test_scales();
+        let (mut tree, root) = crate::widgets::new_tree(taffy::Style::default());
+        let Ok(id) = crate::widgets::insert_icon_toggle_button(
+            &mut tree,
+            root,
+            &scales,
+            "Lock all",
+            crate::icons::IconKind::Lock,
+            crate::widgets::IconSize::Small,
+            false,
+        ) else {
+            unreachable!("root exists");
+        };
+        tree.compute_layout(200.0, 200.0);
+        let paints =
+            |tree: &WidgetTree<WidgetKind>| match paint_widget(tree, id, &theme, &scales, 1.0) {
+                Ok(paints) => paints,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        let off = paints(&tree);
+        if let Err(err) = crate::widgets::set_button_toggled(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        let on = paints(&tree);
+        assert_eq!(on.len(), off.len() + 1, "one accent fill shape");
+        let [r, g, b] = theme.accent.primary.to_srgb_f32();
+        assert!(on.first().is_some_and(|p| p.1 == [r, g, b, 1.0]));
+        let [ir, ig, ib] = theme.icon.on_accent.to_srgb_f32();
+        assert!(
+            on.last().is_some_and(|p| (p.1[0] - ir).abs() < 1e-6
+                && (p.1[1] - ig).abs() < 1e-6
+                && (p.1[2] - ib).abs() < 1e-6),
+            "the icon is on_accent"
+        );
+    }
+
     #[test]
     #[allow(clippy::float_cmp)]
     fn an_icon_button_tints_on_hover_and_press_and_only_when_enabled() {

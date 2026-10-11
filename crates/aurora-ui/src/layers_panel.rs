@@ -129,8 +129,8 @@ use aurora_widgets::widgets::{
     IconAccess, IconSize, IconTone, ThumbnailImage, WidgetKind, icon_state, insert_icon,
     insert_thumbnail, insert_tree_item, insert_tree_view, set_icon_access, set_icon_kind,
     set_icon_tone, set_thumbnail_image, set_tree_item_description, set_tree_item_expanded,
-    set_tree_item_flat, set_tree_item_key, set_tree_item_row_height, set_tree_item_selected,
-    set_tree_item_trailing,
+    set_tree_item_flat, set_tree_item_key, set_tree_item_right_inset, set_tree_item_row_height,
+    set_tree_item_selected, set_tree_item_trailing,
 };
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
 use taffy::style_helpers::{auto, length, percent};
@@ -353,6 +353,66 @@ fn place_icon(
     tree.set_style(icon, style)
 }
 
+/// Absolutely positions `icon` `x` logical px from the row's right edge.
+fn place_icon_right(
+    tree: &mut WidgetTree<WidgetKind>,
+    icon: WidgetId,
+    x: f32,
+    y: f32,
+) -> Result<(), WidgetError> {
+    let mut style = tree
+        .style(icon)
+        .cloned()
+        .ok_or(WidgetError::UnknownWidget(icon))?;
+    style.position = Position::Absolute;
+    style.inset = taffy::Rect {
+        left: auto(),
+        right: length(x),
+        top: length(y),
+        bottom: auto(),
+    };
+    tree.set_style(icon, style)
+}
+
+/// The room a shown lock icon takes at a row's right edge: the icon plus
+/// `spacing.xs` on each side.
+fn lock_room(scales: &Scales) -> u32 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let side = icon_side(scales).ceil() as u32;
+    side + 2 * scales.spacing.xs
+}
+
+/// A row's lock icon (the one `Lock` icon among its children), if any.
+fn row_lock_icon(tree: &WidgetTree<WidgetKind>, row: WidgetId) -> Option<WidgetId> {
+    tree.children(row)?.iter().copied().find(|&child| {
+        matches!(tree.payload(child), Some(WidgetKind::Icon(state)) if state.kind == IconKind::Lock)
+    })
+}
+
+/// Shows or hides `icon` (`Display::None` when hidden: no space, no hit,
+/// not announced).
+fn set_lock_icon_shown(
+    tree: &mut WidgetTree<WidgetKind>,
+    icon: WidgetId,
+    shown: bool,
+) -> Result<bool, WidgetError> {
+    let mut style = tree
+        .style(icon)
+        .cloned()
+        .ok_or(WidgetError::UnknownWidget(icon))?;
+    let display = if shown {
+        taffy::Display::Flex
+    } else {
+        taffy::Display::None
+    };
+    if style.display == display {
+        return Ok(false);
+    }
+    style.display = display;
+    tree.set_style(icon, style)?;
+    Ok(true)
+}
+
 fn display_name(layers: &LayerTree, id: LayerId) -> String {
     // See `sanitize_display_name`'s module doc: names are bounded for
     // display, and a blank one falls back, after sanitizing.
@@ -376,6 +436,7 @@ fn trailing_blend(layers: &LayerTree, id: LayerId) -> Option<&'static str> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn insert_layer_row(
     tree: &mut WidgetTree<WidgetKind>,
     parent: WidgetId,
@@ -484,6 +545,24 @@ fn insert_layer_row(
         };
         tree.set_style(thumb, style)?;
     }
+    // The lock icon (0.198.0): always built, shown only while a lock is
+    // set. Decorative: not a Tab stop; the row's description says "locked".
+    let lock = insert_icon(
+        tree,
+        row,
+        scales,
+        IconKind::Lock,
+        IconSize::Small,
+        IconTone::Secondary,
+        IconAccess::Decorative,
+    )?;
+    #[allow(clippy::cast_precision_loss)]
+    place_icon_right(tree, lock, scales.spacing.xs as f32, top)?;
+    let locked = layers.lock(id).is_some_and(|lock| lock.is_any());
+    set_lock_icon_shown(tree, lock, locked)?;
+    // The lock column is reserved on every row, so the blend labels line
+    // up whether or not a layer is locked.
+    set_tree_item_right_inset(tree, row, lock_room(scales))?;
     rows.insert(row, id);
 
     for &child in children {
@@ -599,6 +678,11 @@ pub fn sync_layer_row(
         }
         changed |= set_icon_tone(tree, folder, tone(false))?;
     }
+    if let Some(lock) = row_lock_icon(tree, row) {
+        let locked = layers.lock(id).is_some_and(|lock| lock.is_any());
+        changed |= set_lock_icon_shown(tree, lock, locked)?;
+        changed |= set_icon_tone(tree, lock, tone(true))?;
+    }
     Ok(changed)
 }
 
@@ -625,6 +709,14 @@ pub fn set_layer_row_selected(
             IconTone::Default
         };
         set_icon_tone(tree, icon, tone)?;
+    }
+    if let Some(lock) = row_lock_icon(tree, row) {
+        let tone = if selected {
+            IconTone::OnAccent
+        } else {
+            IconTone::Secondary
+        };
+        set_icon_tone(tree, lock, tone)?;
     }
     Ok(())
 }
@@ -780,7 +872,13 @@ pub fn layer_row_neighbor(
 #[must_use]
 pub fn layer_row_description(layers: &LayerTree, id: LayerId) -> String {
     let hidden = matches!(layers.visible(id), Some(false));
-    let suffix = if hidden { ", hidden" } else { "" };
+    let locked = layers.lock(id).is_some_and(|lock| lock.is_any());
+    let suffix = match (hidden, locked) {
+        (false, false) => "",
+        (true, false) => ", hidden",
+        (false, true) => ", locked",
+        (true, true) => ", hidden, locked",
+    };
     match layers.kind(id) {
         // A group names its blend mode too (0.195.0), unless it is Pass
         // Through, the default: "Group, Multiply, hidden".
@@ -2013,13 +2111,15 @@ mod tests {
             }
         }
         /// `(eye, chevron, folder)` icon kinds of a row.
+        /// The row's icons except the always-present (shown or hidden) lock
+        /// icon of 0.198.0, which has its own tests.
         fn icons(&self, layer: aurora_doc::LayerId) -> Vec<(IconKind, bool)> {
             self.tree
                 .children(self.row(layer))
                 .unwrap_or_default()
                 .iter()
                 .filter_map(|&c| match self.tree.payload(c) {
-                    Some(WidgetKind::Icon(state)) => Some((
+                    Some(WidgetKind::Icon(state)) if state.kind != IconKind::Lock => Some((
                         state.kind,
                         matches!(state.access, IconAccess::Button { .. }),
                     )),

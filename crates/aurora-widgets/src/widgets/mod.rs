@@ -168,9 +168,9 @@ mod tooltip;
 mod tree_view;
 
 pub use button::{
-    ButtonState, icon_button_side, insert_button, insert_icon_button, insert_toggle_button,
-    set_button_description, set_button_disabled, set_button_hovered, set_button_pressed,
-    set_button_toggled,
+    ButtonState, icon_button_side, insert_button, insert_icon_button, insert_icon_toggle_button,
+    insert_toggle_button, set_button_description, set_button_disabled, set_button_hovered,
+    set_button_pressed, set_button_toggled,
 };
 pub use checkbox::{
     CheckboxState, insert_checkbox, set_checkbox_checked, set_checkbox_disabled, toggle_checkbox,
@@ -246,8 +246,8 @@ pub use tooltip::{Tooltip, TooltipPhase};
 pub use tree_view::{
     MAX_TREE_DEPTH, TreeItemState, insert_tree_item, insert_tree_view, set_tree_item_description,
     set_tree_item_disabled, set_tree_item_expanded, set_tree_item_flat, set_tree_item_key,
-    set_tree_item_label, set_tree_item_row_height, set_tree_item_selected, set_tree_item_trailing,
-    tree_item_row_height,
+    set_tree_item_label, set_tree_item_right_inset, set_tree_item_row_height,
+    set_tree_item_selected, set_tree_item_trailing, tree_item_row_height,
 };
 
 use accesskit::{Node, Role};

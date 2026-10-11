@@ -203,6 +203,32 @@ pub fn insert_icon_button(
     tree.insert(parent, icon_style, node(&state), WidgetKind::Button(state))
 }
 
+/// Adds a **toggle** icon button (0.198.0, the Layers panel's lock row):
+/// an [`insert_icon_button`] that also carries `on`. Off it is flat like
+/// any icon button; on it is filled `accent.primary` with the icon in
+/// `icon.on_accent`, the toggle-button convention. As for every toggle, a
+/// click does not flip it: the owner calls [`set_button_toggled`].
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `parent` doesn't exist.
+pub fn insert_icon_toggle_button(
+    tree: &mut WidgetTree<WidgetKind>,
+    parent: WidgetId,
+    scales: &Scales,
+    label: impl Into<String>,
+    kind: IconKind,
+    size: IconSize,
+    on: bool,
+) -> Result<WidgetId, WidgetError> {
+    let id = insert_icon_button(tree, parent, scales, label, kind, size)?;
+    with_button_mut(tree, id, |state| {
+        state.toggled = Some(on);
+        Ok(())
+    })?;
+    Ok(id)
+}
+
 /// The side of an icon button for `size`: the icon plus `spacing.xxs` of
 /// room on each side for its hover and pressed tint.
 #[must_use]

@@ -241,6 +241,26 @@ fn write_layers_panel_png() {
         .map(|_| ()));
 
     let mut ws = crate::build_workspace(&scales);
+    // Locks (0.198.0): the Background the way Photoshop locks it
+    // (transparency + position), "Logo" locked all, and the active layer
+    // with its position locked so the Lock row shows a mixed state.
+    ok(layers.set_lock(
+        background,
+        aurora_doc::LayerLock {
+            transparency: true,
+            pixels: false,
+            position: true,
+        },
+    ));
+    ok(layers.set_lock(logo, aurora_doc::LayerLock::all()));
+    ok(layers.set_lock(
+        vso,
+        aurora_doc::LayerLock {
+            transparency: false,
+            pixels: false,
+            position: true,
+        },
+    ));
     let rows = ok(crate::populate_layers_panel(
         &mut ws.tree,
         ws.layers,

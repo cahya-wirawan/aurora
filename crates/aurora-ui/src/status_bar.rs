@@ -87,6 +87,10 @@ pub struct StatusInfo {
     pub document_size: (u32, u32),
     /// The document's per-channel sample format.
     pub sample: SampleFormat,
+    /// A calm, non-modal notice (0.198.0; a locked layer refusing an
+    /// edit): while `Some`, the document label shows it instead of the
+    /// document readout. The owner clears it when it no longer applies.
+    pub notice: Option<&'static str>,
 }
 
 /// The physical zoom the status bar shows: the logical `zoom` times the
@@ -282,7 +286,10 @@ pub fn sync_status_bar(
     let document = widgets::set_label_text(
         tree,
         bar.document,
-        &document_text(info.document_size, info.sample),
+        &info.notice.map_or_else(
+            || document_text(info.document_size, info.sample),
+            str::to_owned,
+        ),
     )?;
     Ok(zoom || document)
 }
@@ -373,6 +380,7 @@ mod tests {
             scale_factor: 1.0,
             document_size: (4000, 3000),
             sample: SampleFormat::F16,
+            notice: None,
         };
         let bar = match insert_status_bar(&mut tree, root, &scales, &info) {
             Ok(bar) => bar,

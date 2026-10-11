@@ -458,6 +458,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         scale_factor: 1.0,
         document_size: (0, 0),
         sample: aurora_tile::SAMPLE_FORMAT,
+        notice: None,
     };
     let status_bar = match insert_status_bar(&mut tree, canvas_column, scales, &initial) {
         Ok(bar) => bar,

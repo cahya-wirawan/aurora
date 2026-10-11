@@ -4720,6 +4720,11 @@ fn route_accessibility_action(
             } else if let Some(panel) = workspace.panel_strip.panel_for(id) {
                 open_from_panel_strip(workspace, focus, id);
                 AccessibilityReaction::PanelStrip(panel)
+            } else if layer_controls.is_some_and(|controls| controls.lock_toggle_for(id).is_some())
+            {
+                // A Lock-row button (0.198.0): the same edit a pointer
+                // click makes ([`apply_layer_control_outcome`]).
+                AccessibilityReaction::LayerControl(aurora_widgets::ActionOutcome::Activated(id))
             } else {
                 AccessibilityReaction::Handled(aurora_widgets::ActionOutcome::Activated(id))
             }
@@ -7336,6 +7341,11 @@ fn apply_layer_control_outcome(
     let Some(active) = cx.active_layer.filter(|&id| cx.layers.contains(id)) else {
         return CompositeInvalidation::None;
     };
+    if let PointerOutcome::Action(Outcome::Activated(id)) = outcome
+        && let Some(toggle) = controls.lock_toggle_for(*id)
+    {
+        return apply_lock_toggle(cx, controls, active, toggle);
+    }
     let edited: Result<Option<aurora_core::Rect>, aurora_doc::DocError> = match outcome {
         PointerOutcome::Action(Outcome::ValueChanged { id, value })
             if *id == controls.opacity || *id == controls.fill =>
@@ -7418,6 +7428,47 @@ fn apply_layer_control_outcome(
             CompositeInvalidation::None
         }
     }
+}
+
+/// A Lock-row button press (0.198.0): one journaled `History::set_lock`
+/// step on the active layer, labelled "Lock …"/"Unlock …" in History.
+/// Locks never affect compositing, so nothing is invalidated.
+fn apply_lock_toggle(
+    cx: &mut LayerControlEdit<'_>,
+    controls: aurora_ui::LayerControls,
+    layer: aurora_doc::LayerId,
+    toggle: aurora_ui::LockToggle,
+) -> CompositeInvalidation {
+    let _ = finish_opacity(cx);
+    let Some(before) = cx.layers.lock(layer) else {
+        return CompositeInvalidation::None;
+    };
+    match cx
+        .history
+        .set_lock(cx.layers, layer, toggle.pressed(before))
+    {
+        Ok(_) => {
+            cx.undo_order.record_labelled(
+                UndoKind::Structural,
+                toggle.history_label(before),
+                cx.history,
+                cx.pixel_history,
+            );
+            refresh_history_panel(cx.workspace, cx.undo_order);
+            refresh_layer_row(cx.workspace, cx.layer_rows, cx.layers, layer);
+            if let Err(err) = aurora_ui::sync_layer_controls(
+                &mut cx.workspace.tree,
+                controls,
+                cx.layers,
+                Some(layer),
+                None,
+            ) {
+                tracing::warn!(?err, "failed to sync the Lock row");
+            }
+        }
+        Err(err) => tracing::warn!(?err, "a Lock-row press was refused"),
+    }
+    CompositeInvalidation::None
 }
 
 /// What a key does on a focused Layers row (0.195.0).
@@ -7656,6 +7707,7 @@ fn status_info(
         scale_factor: guarded_scale_factor(scale_factor),
         document_size: canvas_size,
         sample: aurora_tile::SAMPLE_FORMAT,
+        notice: None,
     }
 }
 
@@ -7667,8 +7719,21 @@ fn sync_status_bar(
     canvas_size: (u32, u32),
     scale_factor: f64,
 ) -> bool {
+    sync_status_bar_notice(workspace, view, canvas_size, scale_factor, None)
+}
+
+/// [`sync_status_bar`] showing `notice` in place of the document readout
+/// while it is `Some` (0.198.0).
+fn sync_status_bar_notice(
+    workspace: &mut aurora_ui::Workspace,
+    view: &aurora_ui::CanvasView,
+    canvas_size: (u32, u32),
+    scale_factor: f64,
+    notice: Option<&'static str>,
+) -> bool {
     let bar = workspace.status_bar;
-    let info = status_info(view, canvas_size, scale_factor);
+    let mut info = status_info(view, canvas_size, scale_factor);
+    info.notice = notice;
     match aurora_ui::sync_status_bar(&mut workspace.tree, bar, &info) {
         Ok(changed) => changed,
         Err(err) => {
@@ -22518,6 +22583,10 @@ fn delete_layer(cx: &mut LayerCommandContext<'_>) -> Option<AppliedLayerCommand>
         return None;
     };
     let position = layer_position(cx.layers, target)?;
+    if let Some(why) = delete_refusal(cx.layers.lock(target).unwrap_or_default()) {
+        tracing::info!(?why, "Delete Layer refused: the layer is locked (all)");
+        return None;
+    }
     if !delete_allowed(cx.layers, Some(target)) {
         tracing::info!("Delete Layer refused: it would leave the document with no pixel layer");
         return None;
@@ -23475,6 +23544,98 @@ enum DabTool {
     Eraser,
 }
 
+/// Why a layer's locks (0.198.0) stopped an edit. Locks never touch
+/// compositing or export; they refuse only the edits below, calmly: a
+/// notice in the status bar, no dialog, no history row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockRefusal {
+    /// Lock image pixels (or all): brush and eraser are refused.
+    PixelsLocked,
+    /// Lock transparent pixels: the eraser would change transparency.
+    TransparencyLocksEraser,
+    /// Lock position (or all): the Move tool is refused.
+    PositionLocked,
+    /// Lock all: Delete Layer is refused.
+    DeleteLocked,
+}
+
+impl LockRefusal {
+    /// The status-bar notice.
+    const fn message(self) -> &'static str {
+        match self {
+            LockRefusal::PixelsLocked => {
+                "This layer's pixels are locked. Unlock them in the Layers panel to paint or erase."
+            }
+            LockRefusal::TransparencyLocksEraser => {
+                "This layer's transparent pixels are locked, so the eraser can't change it."
+            }
+            LockRefusal::PositionLocked => {
+                "This layer's position is locked. Unlock it in the Layers panel to move it."
+            }
+            LockRefusal::DeleteLocked => {
+                "This layer is locked (all). Unlock it in the Layers panel to delete it."
+            }
+        }
+    }
+}
+
+/// What a layer's locks allow a brush or eraser dab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaintPermission {
+    Allowed,
+    /// Paint, but never change a texel's alpha (transparency lock, brush).
+    PreserveAlpha,
+    Refused(LockRefusal),
+}
+
+/// The one rule dabs are permitted by: pixels locked refuses both tools;
+/// transparency locked lets the brush recolour existing pixels without
+/// changing alpha and refuses the eraser (whose whole job is alpha).
+fn paint_permission(tool: DabTool, lock: aurora_doc::LayerLock) -> PaintPermission {
+    if lock.pixels {
+        PaintPermission::Refused(LockRefusal::PixelsLocked)
+    } else if lock.transparency {
+        match tool {
+            DabTool::Brush => PaintPermission::PreserveAlpha,
+            DabTool::Eraser => PaintPermission::Refused(LockRefusal::TransparencyLocksEraser),
+        }
+    } else {
+        PaintPermission::Allowed
+    }
+}
+
+/// The refusal a canvas press with `tool` meets on a layer locked as
+/// `lock`, before any drag starts.
+fn press_refusal(tool: aurora_ui::Tool, lock: aurora_doc::LayerLock) -> Option<LockRefusal> {
+    match tool {
+        aurora_ui::Tool::Brush => match paint_permission(DabTool::Brush, lock) {
+            PaintPermission::Refused(why) => Some(why),
+            _ => None,
+        },
+        aurora_ui::Tool::Eraser => match paint_permission(DabTool::Eraser, lock) {
+            PaintPermission::Refused(why) => Some(why),
+            _ => None,
+        },
+        aurora_ui::Tool::Move if lock.position => Some(LockRefusal::PositionLocked),
+        _ => None,
+    }
+}
+
+/// Delete Layer is refused only for Lock All (all three set).
+fn delete_refusal(lock: aurora_doc::LayerLock) -> Option<LockRefusal> {
+    (lock == aurora_doc::LayerLock::all()).then_some(LockRefusal::DeleteLocked)
+}
+
+/// Whether `refusal` still describes what `tool` would meet on `lock`
+/// (so its notice may stay on screen).
+fn lock_refusal_applies(
+    refusal: LockRefusal,
+    tool: aurora_ui::Tool,
+    lock: aurora_doc::LayerLock,
+) -> bool {
+    press_refusal(tool, lock) == Some(refusal) || delete_refusal(lock) == Some(refusal)
+}
+
 impl ToolSettings {
     /// The live radius `tool`'s dabs are laid with — **the only place a
     /// dab site reads a radius** (review M4a/M4b, 0.136.0). Both
@@ -23545,8 +23706,32 @@ fn stamp_tool_dab(
     colour: [f32; 3],
     drag: &mut Option<Drag>,
 ) -> aurora_brush::DabOutcome {
+    stamp_tool_dab_locked(tool, false, store, surface, local, settings, colour, drag)
+}
+
+/// [`stamp_tool_dab`] with the transparency lock (0.198.0): `preserve_alpha`
+/// makes a brush dab recolour without ever changing alpha.
+#[allow(clippy::too_many_arguments)]
+fn stamp_tool_dab_locked(
+    tool: DabTool,
+    preserve_alpha: bool,
+    store: &mut aurora_tile::TileStore,
+    surface: aurora_tile::SurfaceId,
+    local: (f32, f32),
+    settings: &ToolSettings,
+    colour: [f32; 3],
+    drag: &mut Option<Drag>,
+) -> aurora_brush::DabOutcome {
     let radius = settings.dab_radius(tool);
     match tool {
+        DabTool::Brush if preserve_alpha => aurora_brush::stamp_dab_preserving_alpha(
+            store,
+            surface,
+            local,
+            radius,
+            colour,
+            brush_stroke_mut(drag),
+        ),
         DabTool::Brush => aurora_brush::stamp_dab(
             store,
             surface,
@@ -24119,6 +24304,10 @@ fn document_clip_rect(canvas_size: (u32, u32), anchor: (f32, f32)) -> (f32, f32,
 /// is the only sanctioned entry point.
 #[allow(clippy::struct_excessive_bools)] // independent flags (0.174.0 added `exit_requested`)
 struct App {
+    /// The locked-layer refusal currently shown in the status bar, with
+    /// the layer it was about (0.198.0). Cleared by
+    /// [`App::sync_status_bar_now`] once it no longer applies.
+    lock_notice: Option<(LockRefusal, aurora_doc::LayerId)>,
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
     surface: Option<GpuSurface<'static>>,
@@ -24801,6 +24990,7 @@ impl App {
             ime_allowed: false,
             ime_cursor_area: None,
             residency_viewport: None,
+            lock_notice: None,
             drag: None,
             rail_resize: None,
             panel_drag: None,
@@ -25258,6 +25448,12 @@ impl App {
     /// converge here through [`ActivatedCommand`], as Undo/Redo converge
     /// on [`Self::run_undo_redo`].
     fn run_layer_command(&mut self, command: LayerCommand) {
+        if command == LayerCommand::Delete
+            && let Some(layer) = self.doc.active_layer
+            && let Some(why) = delete_refusal(self.doc.layers.lock(layer).unwrap_or_default())
+        {
+            self.lock_notice = Some((why, layer));
+        }
         let _ = perform_layer_command(
             &mut LayerCommandContext {
                 workspace: &mut self.workspace,
@@ -27222,6 +27418,20 @@ impl App {
             &self.doc.canvas_view,
             active_pixel_layer(&self.doc.layers, self.doc.active_layer),
         );
+        // A locked layer refuses the press outright (0.198.0): no drag, so
+        // no stroke snapshot and no history row, and a calm notice.
+        if matches!(
+            self.drag,
+            Some(Drag::Brush { .. } | Drag::Eraser { .. } | Drag::Move { .. })
+        ) && let Some(layer) = self.doc.active_layer
+            && let Some(why) =
+                press_refusal(self.tool, self.doc.layers.lock(layer).unwrap_or_default())
+        {
+            self.drag = None;
+            self.lock_notice = Some((why, layer));
+            self.sync_status_bar_now();
+            return;
+        }
         match self.drag.as_ref() {
             Some(Drag::Brush { last_doc, .. }) => {
                 let last_doc = *last_doc;
@@ -27293,6 +27503,19 @@ impl App {
         let Some(surface) = self.doc.layers.surface_id(layer_id) else {
             return;
         };
+        // The layer's locks (0.198.0), checked at every dab as well as at
+        // the press, so no path can paint through a lock.
+        let preserve_alpha = match paint_permission(
+            DabTool::Brush,
+            self.doc.layers.lock(layer_id).unwrap_or_default(),
+        ) {
+            PaintPermission::Refused(why) => {
+                self.lock_notice = Some((why, layer_id));
+                return;
+            }
+            PaintPermission::PreserveAlpha => true,
+            PaintPermission::Allowed => false,
+        };
         let Some(store) = self.doc.tile_store.as_mut() else {
             return;
         };
@@ -27302,8 +27525,9 @@ impl App {
         // free function over `&mut Option<Drag>` and not a `&mut self`
         // helper method: that would borrow all of `self` and conflict
         // with `self.doc.tile_store` above.
-        let outcome = stamp_tool_dab(
+        let outcome = stamp_tool_dab_locked(
             DabTool::Brush,
+            preserve_alpha,
             store,
             surface,
             local,
@@ -27358,6 +27582,13 @@ impl App {
         let Some(surface) = self.doc.layers.surface_id(layer_id) else {
             return;
         };
+        if let PaintPermission::Refused(why) = paint_permission(
+            DabTool::Eraser,
+            self.doc.layers.lock(layer_id).unwrap_or_default(),
+        ) {
+            self.lock_notice = Some((why, layer_id));
+            return;
+        }
         let Some(store) = self.doc.tile_store.as_mut() else {
             return;
         };
@@ -27430,6 +27661,15 @@ impl App {
     /// crate rather than something the user did, and a modal alert is the
     /// wrong response to it.
     fn apply_move(&mut self, layer_id: aurora_doc::LayerId, bounds: aurora_core::Rect) {
+        if self
+            .doc
+            .layers
+            .lock(layer_id)
+            .is_some_and(|lock| lock.position)
+        {
+            self.lock_notice = Some((LockRefusal::PositionLocked, layer_id));
+            return;
+        }
         if let Err(err) = self.doc.layers.set_bounds(layer_id, bounds) {
             tracing::warn!(?err, "failed to reposition the active layer");
             // Ask, open, and only then latch. The latch must not happen
@@ -28507,11 +28747,25 @@ impl App {
     /// asked for and the accessibility tree is pushed when its text
     /// changed.
     fn sync_status_bar_now(&mut self) {
-        if sync_status_bar(
+        // A lock notice stays only while it still describes what the
+        // active tool would meet on the active layer.
+        if let Some((why, layer)) = self.lock_notice
+            && (self.doc.active_layer != Some(layer)
+                || !lock_refusal_applies(
+                    why,
+                    self.tool,
+                    self.doc.layers.lock(layer).unwrap_or_default(),
+                ))
+        {
+            self.lock_notice = None;
+        }
+        let notice = self.lock_notice.map(|(why, _)| why.message());
+        if sync_status_bar_notice(
             &mut self.workspace,
             &self.doc.canvas_view,
             self.doc.canvas_size,
             self.scale_factor,
+            notice,
         ) {
             self.push_accessibility();
             self.needs_redraw = true;
@@ -36068,9 +36322,10 @@ mod tests {
         );
         assert_eq!(
             total_descendants(&workspace.tree, workspace.layers.body),
-            4,
+            5,
             "and nothing at all survives below that: exactly the tree container, one row, \
-             that row's eye (0.195.0) and its thumbnail slot (0.197.0), counted at every depth \
+             that row's eye (0.195.0), its thumbnail slot (0.197.0) and its lock icon \
+             (0.198.0), counted at every depth \
              rather than only the tree's own direct children"
         );
         assert_eq!(
@@ -70441,6 +70696,48 @@ mod tests {
         }
 
         /// A group holding the document's only pixel layer.
+        #[test]
+        fn delete_layer_is_refused_for_lock_all_only_and_records_nothing() {
+            for (lock, refused) in [
+                (aurora_doc::LayerLock::all(), true),
+                (
+                    aurora_doc::LayerLock {
+                        position: false,
+                        ..aurora_doc::LayerLock::all()
+                    },
+                    false,
+                ),
+                (
+                    aurora_doc::LayerLock {
+                        pixels: true,
+                        ..aurora_doc::LayerLock::none()
+                    },
+                    false,
+                ),
+            ] {
+                let mut layers = LayerTree::new();
+                let mut ids = Vec::new();
+                for name in ["a", "b"] {
+                    match layers.add_pixel_layer(name, crate::tests::layer_bounds(), None) {
+                        Ok(id) => ids.push(id),
+                        Err(err) => unreachable!("{err:?}"),
+                    }
+                }
+                let Some(&top) = ids.get(1) else {
+                    unreachable!("two layers")
+                };
+                assert!(layers.set_lock(top, lock).is_ok());
+                let mut rig = Rig::new(layers, Some(top));
+                let changed = rig.run(LayerCommand::Delete);
+                assert_eq!(changed, !refused, "{lock:?}");
+                assert_eq!(rig.layers.contains(top), refused);
+                if refused {
+                    assert_eq!(rig.history.journal_len(), 0, "no history entry");
+                    assert!(rig.undo_order.undo.is_empty());
+                }
+            }
+        }
+
         fn group_holding_the_only_pixel_layer() -> (LayerTree, LayerId, LayerId) {
             let mut layers = LayerTree::new();
             let group = match layers.add_group("Group", None) {
@@ -71674,6 +71971,213 @@ mod tests {
             rig.click(row)
         }
 
+        // -- Lock row (0.198.0) -------------------------------------------
+
+        fn lock_state(rig: &Rig, id: WidgetId) -> Option<bool> {
+            match rig.workspace.tree.payload(id) {
+                Some(WidgetKind::Button(state)) => state.toggled,
+                _ => None,
+            }
+        }
+
+        fn lock_flags(rig: &Rig) -> Vec<Option<bool>> {
+            let c = rig.controls();
+            [
+                c.lock_transparency,
+                c.lock_pixels,
+                c.lock_position,
+                c.lock_all,
+            ]
+            .into_iter()
+            .map(|id| lock_state(rig, id))
+            .collect()
+        }
+
+        #[test]
+        fn the_lock_row_has_four_named_toggle_buttons_that_are_tab_stops_following_the_active_layer()
+         {
+            let (mut rig, a, b) = Rig::two_layers();
+            let c = rig.controls();
+            let names: Vec<_> = [
+                c.lock_transparency,
+                c.lock_pixels,
+                c.lock_position,
+                c.lock_all,
+            ]
+            .into_iter()
+            .map(|id| {
+                let node = rig.workspace.tree.accessibility(id);
+                assert!(
+                    node.is_some_and(|n| n.supports_action(accesskit::Action::Focus)
+                        && n.supports_action(accesskit::Action::Click)),
+                    "a Tab stop and clickable"
+                );
+                node.and_then(|n| n.label().map(str::to_owned))
+                    .unwrap_or_default()
+            })
+            .collect();
+            assert_eq!(
+                names,
+                [
+                    "Lock transparent pixels",
+                    "Lock image pixels",
+                    "Lock position",
+                    "Lock all"
+                ]
+            );
+            assert_eq!(lock_flags(&rig), vec![Some(false); 4]);
+            // A lock on the *other* layer does not show; switching shows it.
+            let lock = aurora_doc::LayerLock {
+                pixels: true,
+                ..aurora_doc::LayerLock::none()
+            };
+            assert!(rig.layers.set_lock(a, lock).is_ok());
+            let _ = sync_layer_controls(&mut rig.workspace, &rig.state, &rig.layers, Some(b), None);
+            assert_eq!(lock_flags(&rig), vec![Some(false); 4]);
+            let _ = sync_layer_controls(&mut rig.workspace, &rig.state, &rig.layers, Some(a), None);
+            assert_eq!(
+                lock_flags(&rig),
+                [Some(false), Some(true), Some(false), Some(false)]
+            );
+        }
+
+        #[test]
+        fn a_lock_button_edits_the_active_layer_as_one_labelled_undoable_step() {
+            let (mut rig, a, b) = Rig::two_layers();
+            let steps = rig.undo_order.undo.len();
+            let journal = rig.history.journal_len();
+            let button = rig.controls().lock_transparency;
+            let invalidation = rig.click(button);
+            assert!(
+                matches!(invalidation, CompositeInvalidation::None),
+                "a lock never touches compositing"
+            );
+            assert_eq!(
+                rig.layers.lock(b),
+                Some(aurora_doc::LayerLock {
+                    transparency: true,
+                    ..aurora_doc::LayerLock::none()
+                })
+            );
+            assert_eq!(
+                rig.layers.lock(a),
+                Some(aurora_doc::LayerLock::none()),
+                "only the active layer"
+            );
+            assert_eq!(rig.history.journal_len(), journal + 1);
+            assert_eq!(rig.undo_order.undo.len(), steps + 1);
+            assert_eq!(
+                rig.undo_order.undo_labels.last().map(String::as_str),
+                Some("Lock transparent pixels")
+            );
+            assert_eq!(lock_state(&rig, button), Some(true));
+            assert!(
+                rig.row_description(b).ends_with("locked"),
+                "{}",
+                rig.row_description(b)
+            );
+            // Pressing again unlocks, labelled "Unlock ...".
+            let _ = rig.click(button);
+            assert_eq!(rig.layers.lock(b), Some(aurora_doc::LayerLock::none()));
+            assert_eq!(
+                rig.undo_order.undo_labels.last().map(String::as_str),
+                Some("Unlock transparent pixels")
+            );
+            // Undo walks back one step at a time and the buttons follow.
+            let _ = rig.click(button);
+            let _ = rig.undo_redo(AppCommand::Undo);
+            assert_eq!(rig.layers.lock(b), Some(aurora_doc::LayerLock::none()));
+            let _ = sync_layer_controls(&mut rig.workspace, &rig.state, &rig.layers, Some(b), None);
+            assert_eq!(lock_flags(&rig), vec![Some(false); 4]);
+            let _ = rig.undo_redo(AppCommand::Redo);
+            assert_eq!(rig.layers.lock(b).map(|l| l.transparency), Some(true));
+        }
+
+        #[test]
+        fn lock_all_sets_all_three_and_turning_any_one_off_unsets_all() {
+            let (mut rig, _, b) = Rig::two_layers();
+            let c = rig.controls();
+            let _ = rig.click(c.lock_all);
+            assert_eq!(rig.layers.lock(b), Some(aurora_doc::LayerLock::all()));
+            assert_eq!(lock_flags(&rig), vec![Some(true); 4]);
+            let _ = rig.click(c.lock_pixels);
+            assert_eq!(
+                rig.layers.lock(b),
+                Some(aurora_doc::LayerLock {
+                    pixels: false,
+                    ..aurora_doc::LayerLock::all()
+                })
+            );
+            assert_eq!(
+                lock_flags(&rig),
+                [Some(true), Some(false), Some(true), Some(false)]
+            );
+            // All again: not all-three, so it sets everything; then clears.
+            let _ = rig.click(c.lock_all);
+            assert_eq!(rig.layers.lock(b), Some(aurora_doc::LayerLock::all()));
+            let _ = rig.click(c.lock_all);
+            assert_eq!(rig.layers.lock(b), Some(aurora_doc::LayerLock::none()));
+        }
+
+        #[test]
+        fn a_locked_layer_still_takes_opacity_blend_and_visibility_edits() {
+            let (mut rig, _, b) = Rig::two_layers();
+            let all = rig.controls().lock_all;
+            let _ = rig.click(all);
+            let _ = pick_blend(&mut rig, multiply_index());
+            assert_eq!(rig.layers.blend_mode(b), Some(BlendMode::Multiply));
+            rig.drag_opacity(true);
+            assert!(rig.opacity(b) < 1.0, "opacity moved");
+            assert!(rig.layers.set_fill_opacity(b, 0.5).is_ok());
+            assert!(rig.layers.set_visible(b, false).is_ok());
+            assert_eq!(
+                rig.layers.lock(b),
+                Some(aurora_doc::LayerLock::all()),
+                "the lock stays"
+            );
+        }
+
+        #[test]
+        fn a_locked_row_shows_a_decorative_lock_icon_that_is_no_tab_stop() {
+            let (mut rig, a, b) = Rig::two_layers();
+            let lock_icon = |rig: &Rig, layer: LayerId| {
+                let row = row_of(&rig.layer_rows, layer);
+                let child = rig.workspace.tree.children(row).unwrap_or_default().iter().copied().find(|&child| {
+                    matches!(rig.workspace.tree.payload(child),
+                        Some(WidgetKind::Icon(state)) if state.kind == aurora_widgets::icons::IconKind::Lock)
+                });
+                let Some(child) = child else {
+                    unreachable!("every row has a lock icon")
+                };
+                (child, rig.workspace.tree.style(child).map(|s| s.display))
+            };
+            assert_eq!(
+                lock_icon(&rig, b).1,
+                Some(taffy::Display::None),
+                "hidden while unlocked"
+            );
+            let button = rig.controls().lock_position;
+            let _ = rig.click(button);
+            let (icon, display) = lock_icon(&rig, b);
+            assert_eq!(display, Some(taffy::Display::Flex), "shown while locked");
+            assert_eq!(
+                lock_icon(&rig, a).1,
+                Some(taffy::Display::None),
+                "the other row is untouched"
+            );
+            let node = rig.workspace.tree.accessibility(icon);
+            assert!(
+                node.is_none_or(|n| !n.supports_action(accesskit::Action::Focus)),
+                "an icon is never a Tab stop"
+            );
+            let _ = rig.undo_redo(AppCommand::Undo);
+            assert_eq!(
+                lock_icon(&rig, b).1,
+                Some(taffy::Display::None),
+                "undo hides it again"
+            );
+        }
+
         #[test]
         fn a_slider_drag_follows_live_and_records_exactly_one_undo_step() {
             let (mut rig, _, b) = Rig::two_layers();
@@ -72732,6 +73236,127 @@ mod tests {
             let defaults = ToolSettings::default();
             assert_eq!(defaults.dab_radius(DabTool::Brush), 24.0);
             assert_eq!(defaults.dab_radius(DabTool::Eraser), 24.0);
+        }
+
+        /// 0.198.0: the one rule dabs and presses are permitted by.
+        #[test]
+        fn locks_decide_dabs_presses_and_deletes() {
+            use super::super::{
+                DabTool, LockRefusal, PaintPermission, delete_refusal, paint_permission,
+                press_refusal,
+            };
+            use aurora_doc::LayerLock as L;
+            let none = L::none();
+            let t = L {
+                transparency: true,
+                ..none
+            };
+            let p = L {
+                pixels: true,
+                ..none
+            };
+            let m = L {
+                position: true,
+                ..none
+            };
+            assert_eq!(
+                paint_permission(DabTool::Brush, none),
+                PaintPermission::Allowed
+            );
+            assert_eq!(
+                paint_permission(DabTool::Brush, t),
+                PaintPermission::PreserveAlpha
+            );
+            assert_eq!(
+                paint_permission(DabTool::Eraser, t),
+                PaintPermission::Refused(LockRefusal::TransparencyLocksEraser)
+            );
+            for tool in [DabTool::Brush, DabTool::Eraser] {
+                assert_eq!(
+                    paint_permission(tool, p),
+                    PaintPermission::Refused(LockRefusal::PixelsLocked)
+                );
+                assert_eq!(
+                    paint_permission(tool, L::all()),
+                    PaintPermission::Refused(LockRefusal::PixelsLocked)
+                );
+                assert_eq!(paint_permission(tool, m), PaintPermission::Allowed);
+            }
+            assert_eq!(
+                press_refusal(Tool::Move, m),
+                Some(LockRefusal::PositionLocked)
+            );
+            assert_eq!(
+                press_refusal(Tool::Move, L::all()),
+                Some(LockRefusal::PositionLocked)
+            );
+            assert_eq!(press_refusal(Tool::Move, p), None);
+            assert_eq!(
+                press_refusal(Tool::Brush, p),
+                Some(LockRefusal::PixelsLocked)
+            );
+            assert_eq!(
+                press_refusal(Tool::Eraser, t),
+                Some(LockRefusal::TransparencyLocksEraser)
+            );
+            assert_eq!(press_refusal(Tool::Brush, t), None);
+            assert_eq!(press_refusal(Tool::Pan, L::all()), None);
+            assert_eq!(delete_refusal(L::all()), Some(LockRefusal::DeleteLocked));
+            assert_eq!(delete_refusal(p), None);
+            assert_eq!(
+                delete_refusal(L {
+                    position: false,
+                    ..L::all()
+                }),
+                None
+            );
+        }
+
+        /// 0.198.0: the transparency-locked brush recolours painted texels
+        /// and never changes any texel's alpha (exact bits).
+        #[test]
+        fn a_transparency_locked_brush_dab_keeps_every_alpha_bit() {
+            let (_dir, mut store) = commit_test_store();
+            let surface = crate::tests::commit_test_surface();
+            let settings = ToolSettings {
+                brush_radius: 20.0,
+                eraser_radius: 20.0,
+            };
+            let mut drag = None;
+            let _ = stamp_tool_dab(
+                DabTool::Brush,
+                &mut store,
+                surface,
+                (60.0, 60.0),
+                &settings,
+                [1.0, 0.0, 0.0],
+                &mut drag,
+            );
+            let read = |store: &mut aurora_tile::TileStore| -> Vec<u16> {
+                match store.get_mut(surface, aurora_tile::TileId { x: 0, y: 0 }) {
+                    Ok(tile) => tile.texels().iter().map(|v| v.to_bits()).collect(),
+                    Err(err) => unreachable!("{err:?}"),
+                }
+            };
+            let before = read(&mut store);
+            let wide = ToolSettings {
+                brush_radius: 40.0,
+                eraser_radius: 40.0,
+            };
+            let _ = super::super::stamp_tool_dab_locked(
+                DabTool::Brush,
+                true,
+                &mut store,
+                surface,
+                (60.0, 60.0),
+                &wide,
+                [0.0, 1.0, 0.0],
+                &mut drag,
+            );
+            let after = read(&mut store);
+            assert_ne!(before, after, "the colour moved");
+            let alphas = |v: &[u16]| v.chunks(4).map(|t| t.get(3).copied()).collect::<Vec<_>>();
+            assert_eq!(alphas(&before), alphas(&after), "alpha is untouched");
         }
 
         /// Review M4a/M4b: `App::paint_dab`/`App::erase_dab`'s shared

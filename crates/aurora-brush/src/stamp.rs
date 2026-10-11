@@ -365,6 +365,39 @@ pub fn stamp_dab(
     colour: [f32; 3],
     snapshot: Option<&mut StrokeSnapshot>,
 ) -> DabOutcome {
+    stamp_dab_impl(store, surface, center, radius, colour, snapshot, false)
+}
+
+/// [`stamp_dab`] for a layer whose **transparency is locked** (0.198.0):
+/// the dab recolours texels that already have alpha, by its falloff, and
+/// never changes any texel's alpha (bit for bit) nor touches a fully
+/// transparent texel. Repeated dabs over the same texels accumulate toward
+/// `colour` (there is no per-stroke coverage map to cap them at).
+pub fn stamp_dab_preserving_alpha(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    center: (f32, f32),
+    radius: f32,
+    colour: [f32; 3],
+    snapshot: Option<&mut StrokeSnapshot>,
+) -> DabOutcome {
+    stamp_dab_impl(store, surface, center, radius, colour, snapshot, true)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
+fn stamp_dab_impl(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    center: (f32, f32),
+    radius: f32,
+    colour: [f32; 3],
+    snapshot: Option<&mut StrokeSnapshot>,
+    preserve_alpha: bool,
+) -> DabOutcome {
     let mut outcome = DabOutcome::default();
     if !is_paintable(center, radius) {
         return outcome;
@@ -426,23 +459,42 @@ pub fn stamp_dab(
                     let Some(&dst_a) = current.last() else {
                         continue;
                     };
-                    // Max-alpha accumulation, this module's own rule: a
-                    // dab never lowers a texel's alpha.
-                    if a <= dst_a.to_f32() {
-                        continue;
-                    }
-                    // What this texel would actually *store*, computed
-                    // before anything is decided on it -- comparing the
-                    // `f32` `a` against the `f16` already there answers a
-                    // different question than "will this write change
-                    // anything" (`stores_the_same_bits`).
                     let [red, green, blue] = colour;
-                    let fresh: Texel = [
-                        f16::from_f32(red * a),
-                        f16::from_f32(green * a),
-                        f16::from_f32(blue * a),
-                        f16::from_f32(a),
-                    ];
+                    let fresh: Texel = if preserve_alpha {
+                        // Transparency lock (0.198.0): the texel keeps its
+                        // alpha bit for bit; only its colour moves toward
+                        // `colour` by the dab's coverage `a`. Premultiplied:
+                        // old * (1 - a) + colour * alpha * a. A fully
+                        // transparent texel has no colour to paint.
+                        let alpha = dst_a.to_f32();
+                        if alpha <= 0.0 {
+                            continue;
+                        }
+                        let old = |c: usize| current.get(c).map_or(0.0, |v| v.to_f32());
+                        [
+                            f16::from_f32(old(0) * (1.0 - a) + red * alpha * a),
+                            f16::from_f32(old(1) * (1.0 - a) + green * alpha * a),
+                            f16::from_f32(old(2) * (1.0 - a) + blue * alpha * a),
+                            dst_a,
+                        ]
+                    } else {
+                        // Max-alpha accumulation, this module's own rule: a
+                        // dab never lowers a texel's alpha.
+                        if a <= dst_a.to_f32() {
+                            continue;
+                        }
+                        // What this texel would actually *store*, computed
+                        // before anything is decided on it -- comparing the
+                        // `f32` `a` against the `f16` already there answers a
+                        // different question than "will this write change
+                        // anything" (`stores_the_same_bits`).
+                        [
+                            f16::from_f32(red * a),
+                            f16::from_f32(green * a),
+                            f16::from_f32(blue * a),
+                            f16::from_f32(a),
+                        ]
+                    };
                     if stores_the_same_bits(current, fresh) {
                         continue;
                     }
@@ -720,6 +772,64 @@ mod tests {
             Err(err) => unreachable!("scratch dir just created by tempfile must be usable: {err}"),
         };
         (dir, store)
+    }
+
+    fn alphas_and_reds(store: &mut TileStore) -> (Vec<u16>, Vec<u16>) {
+        let tile = match store.get_mut(surface(), TileId { x: 0, y: 0 }) {
+            Ok(tile) => tile,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let texels = tile.texels();
+        let alphas = texels
+            .chunks(4)
+            .map(|t| t.get(3).map_or(0, |v| v.to_bits()))
+            .collect();
+        let reds = texels
+            .chunks(4)
+            .map(|t| t.first().map_or(0, |v| v.to_bits()))
+            .collect();
+        (alphas, reds)
+    }
+
+    /// 0.198.0 transparency lock: every texel's alpha is bit-identical
+    /// after a preserving dab; colour moves only where alpha exists.
+    #[test]
+    fn a_preserving_dab_never_changes_any_alpha_and_recolours_only_painted_texels() {
+        let (_dir, mut store) = store();
+        let red = [1.0, 0.0, 0.0];
+        let _ = stamp_dab(&mut store, surface(), (60.0, 60.0), 20.0, red, None);
+        let (alpha_before, red_before) = alphas_and_reds(&mut store);
+        // A wider green dab over the painted disc and plenty of empty space.
+        let outcome = super::stamp_dab_preserving_alpha(
+            &mut store,
+            surface(),
+            (60.0, 60.0),
+            40.0,
+            [0.0, 1.0, 0.0],
+            None,
+        );
+        assert!(!outcome.painted().is_empty());
+        let (alpha_after, red_after) = alphas_and_reds(&mut store);
+        assert_eq!(alpha_before, alpha_after, "alpha is untouched, bit for bit");
+        assert_ne!(red_before, red_after, "the colour moved");
+        // The empty corner stays exactly empty.
+        assert_eq!(alpha_after.first().copied(), Some(0));
+        assert_eq!(red_after.first().copied(), Some(0));
+    }
+
+    #[test]
+    fn a_preserving_dab_on_empty_pixels_changes_nothing() {
+        let (_dir, mut store) = store();
+        let outcome = super::stamp_dab_preserving_alpha(
+            &mut store,
+            surface(),
+            (60.0, 60.0),
+            20.0,
+            [1.0, 0.0, 0.0],
+            None,
+        );
+        assert!(outcome.painted().is_empty());
+        assert!(outcome.is_complete());
     }
 
     #[test]

@@ -289,6 +289,9 @@ pub struct PsdProps {
     /// `0.0..=1.0` (the `iOpa` block, or `1.0` without one).
     pub fill_opacity: f32,
     pub visible: bool,
+    /// The layer's locks (0.198.0): the record's flags bit 0 and the `lspf`
+    /// block (see `lock_from_psd`).
+    pub lock: aurora_doc::LayerLock,
     /// Clipped to the layer below — not supported, so shown unclipped.
     pub clipped: bool,
     /// The layer's effects (0.180.0), stored on the layer as data and not
@@ -1305,6 +1308,9 @@ struct Record {
     opacity: u8,
     clipping: u8,
     flags: u8,
+    /// The `lspf` (Protected Setting) block's `u32`, when the record has
+    /// one (0.198.0).
+    protected: Option<u32>,
     mask: Option<MaskInfo>,
     /// The record has mask data, but its rectangle does not validate
     /// (past the document range): no mask is applied, and when a `-2`
@@ -1449,6 +1455,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let mut section = None;
     let mut nested_section = None;
     let mut fill_opacity = None;
+    let mut protected = None;
     let mut vector = None;
     let mut curves = None;
     let mut effects_blocks: Vec<(u8, Vec<u8>)> = Vec::new();
@@ -1466,6 +1473,12 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
             b"lsct" => section = read_section(data),
             b"lsdk" => nested_section = read_section(data),
             b"iOpa" => fill_opacity = data.first().copied(),
+            b"lspf" => {
+                protected = data
+                    .get(..4)
+                    .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                    .map(u32::from_be_bytes);
+            }
             b"TySh" | b"tySh" => features.text = true,
             b"SoLd" | b"PlLd" | b"SoLE" => features.smart = true,
             b"lmfx" | b"lfx2" | b"lfxs" => {
@@ -1502,6 +1515,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
         opacity,
         clipping,
         flags,
+        protected,
         mask,
         mask_unreadable,
         name,
@@ -2740,6 +2754,59 @@ fn blend_for_key(key: [u8; 4]) -> PsdBlend {
     PsdBlend::Mode(mode)
 }
 
+/// The `lspf` (Protected Setting) bits (0.198.0), as psd-tools names them
+/// (`ProtectedSetting`) and as measured on the corpus.
+const PROTECT_TRANSPARENCY: u32 = 0x01;
+const PROTECT_COMPOSITE: u32 = 0x02;
+const PROTECT_POSITION: u32 = 0x04;
+// Bit 3 (0x08) is the artboard "nesting" lock; Aurora has no artboards, so
+// it is neither kept nor reported (Photoshop sets it on every Background
+// layer, so a report would be on nearly every file).
+/// Photoshop's "Lock All": the value is exactly `0x8000_0000`.
+const PROTECT_ALL: u32 = 0x8000_0000;
+/// The layer record's flags bit 0: transparency protected.
+const RECORD_TRANSPARENCY_PROTECTED: u8 = 0x01;
+
+/// A record's locks (0.198.0): `lspf` bit 0 / the record flags' bit 0 is
+/// transparency, bit 1 pixels (Photoshop's "composite"), bit 2 position,
+/// and bit 31 (or all three) "Lock All". The record flag and the block are
+/// unioned, so a writer that sets only one still reads as locked.
+fn lock_from_psd(flags: u8, protected: Option<u32>) -> aurora_doc::LayerLock {
+    let bits = protected.unwrap_or(0);
+    if bits & PROTECT_ALL != 0 {
+        return aurora_doc::LayerLock::all();
+    }
+    aurora_doc::LayerLock {
+        transparency: bits & PROTECT_TRANSPARENCY != 0
+            || flags & RECORD_TRANSPARENCY_PROTECTED != 0,
+        pixels: bits & PROTECT_COMPOSITE != 0,
+        position: bits & PROTECT_POSITION != 0,
+    }
+}
+
+/// The `lspf` value Aurora writes for `lock`, or `None` when nothing is
+/// locked (no block). All three set is Photoshop's own "Lock All" value.
+#[must_use]
+pub(crate) fn lspf_for_lock(lock: aurora_doc::LayerLock) -> Option<u32> {
+    if !lock.is_any() {
+        return None;
+    }
+    if lock == aurora_doc::LayerLock::all() {
+        return Some(PROTECT_ALL);
+    }
+    let mut bits = 0;
+    if lock.transparency {
+        bits |= PROTECT_TRANSPARENCY;
+    }
+    if lock.pixels {
+        bits |= PROTECT_COMPOSITE;
+    }
+    if lock.position {
+        bits |= PROTECT_POSITION;
+    }
+    Some(bits)
+}
+
 fn props_for(record: &Record, notes: &mut Notes) -> PsdProps {
     // A group's own blend mode lives in its section divider; it wins over
     // the record's.
@@ -2766,6 +2833,7 @@ fn props_for(record: &Record, notes: &mut Notes) -> PsdProps {
         fill_opacity: record.fill_opacity.map_or(1.0, |v| f32::from(v) / 255.0),
         // Flags bit 1 set means *hidden*.
         visible: record.flags & 0x02 == 0,
+        lock: lock_from_psd(record.flags, record.protected),
         clipped: record.clipping != 0,
         effects: match &record.effects {
             Some(Ok(read)) if !read.effects.is_empty() && read.effects.validate().is_ok() => {
@@ -4187,6 +4255,9 @@ impl Builder<'_, '_, '_> {
         }
         if !props.visible {
             self.history.set_visible(self.layers, id, false)?;
+        }
+        if props.lock.is_any() {
+            self.history.set_lock(self.layers, id, props.lock)?;
         }
         if let Some(effects) = &props.effects {
             self.history
