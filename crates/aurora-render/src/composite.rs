@@ -1419,6 +1419,119 @@ fn fold_texel(
     ]
 }
 
+/// Whether folding `src` over `dst` (one chunk, straight-alpha source,
+/// premultiplied destination) is provably the identity, so
+/// [`composite_layer_into`] may skip it (0.184.0). True when every source
+/// texel has alpha `±0` and colour in `[+0, 1]`, and every destination
+/// texel is sign-clear and finite with each colour channel `<=` its alpha
+/// (a straight backdrop in `[0, 1]`). Compared on `f16` bits: for
+/// sign-clear values, bit order is numeric order.
+///
+/// **Why that is exact, in every mode.** With `sa = ±0`, `fold_texel`'s
+/// `alpha = sa · opacity` is `±0` (opacity is clamped to `[0, 1]` and not
+/// NaN), so `inverse = 1 - alpha = 1` exactly and each colour channel is
+/// `1 · d + (±0) · blended`. `blended` is finite because every mode's
+/// `blend_rgb` is finite on `[0, 1]` operands
+/// (`blend_rgb_is_finite_on_the_unit_cube_in_every_mode`), so the product
+/// is a zero, and `d + ±0 == d` bit for bit for every `d` except `-0.0`,
+/// which the predicate excludes. Alpha is `±0 + da · 1 == da` for the same
+/// reason. The `f32` results are `f16` values, so they convert back
+/// unchanged.
+///
+/// **Why `blend_rgb` is finite there: the analytic argument** (0.184.0
+/// review, SK-1; the grid tests check it, they are not the proof):
+///
+/// - `Cb = d / da <= 1`: the predicate gives `0 <= d <= da`, and with
+///   `da > 0` (`da == 0` takes `fold_texel`'s `[0, 0, 0]` branch) IEEE-754
+///   division is correctly rounded, so a quotient whose exact value is
+///   `<= 1` rounds to `<= 1`. `Cs` is in `[0, 1]` directly.
+/// - Every guarded division's divisor, whenever its guard lets it through,
+///   is bounded below by an `f16` minimum: a nonzero `f16` operand is at
+///   least `2^-24` (the smallest subnormal), and `1 - Cs` for `Cs < 1` is
+///   at least `2^-11` (the gap below one). So `ColorDodge`'s
+///   `Cb / (1 - Cs)`, `ColorBurn`'s `(1 - Cb) / Cs`, `Divide`'s `Cb / Cs`
+///   and the doubled operands `VividLight` and `HardMix` hand to them are
+///   at most about `2^24`, far inside `f32`, before their `min(1, ...)`.
+/// - The non-separable modes' `SetSat`/`ClipColor` ratios
+///   (`(C - min) / (max - min)`, `(C - L) / (L - min)` and the like) are
+///   formed only when their denominator is nonzero, and lie in `[0, 1]`.
+/// - `SoftLight`'s `sqrt` only ever sees `Cb >= 0`, so it is never NaN.
+///
+/// Pinned per mode and opacity by
+/// `a_transparent_source_folds_to_the_backdrop_bit_for_bit_in_every_mode`;
+/// the excluded cases (a `-0.0` backdrop channel, a NaN source colour) are
+/// pinned as really changing the result by
+/// `the_skip_predicate_excludes_cases_where_the_fold_is_not_the_identity`.
+fn chunk_folds_to_backdrop(dst: &[f16], src: &[f16]) -> bool {
+    const ONE: u16 = 0x3C00;
+    const INF: u16 = 0x7C00;
+    dst.chunks_exact(CHANNELS)
+        .zip(src.chunks_exact(CHANNELS))
+        .all(|(d, s)| {
+            let ([dr, dg, db, da], [sr, sg, sb, sa]) = (d, s) else {
+                return false;
+            };
+            let da = da.to_bits();
+            sa.to_bits() << 1 == 0
+                && sr.to_bits() <= ONE
+                && sg.to_bits() <= ONE
+                && sb.to_bits() <= ONE
+                && da < INF
+                && dr.to_bits() <= da
+                && dg.to_bits() <= da
+                && db.to_bits() <= da
+        })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+std::thread_local! {
+    /// `true` turns [`composite_layer_into`]'s transparent-chunk skip off on
+    /// this thread (0.184.0), for skip-on/skip-off differentials.
+    static TRANSPARENT_SKIP_DISABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Chunks [`composite_layer_into`] skipped on this thread (0.184.0):
+    /// the skip being output-identical, nothing else can see it happen.
+    static TRANSPARENT_CHUNKS_SKIPPED: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Turns [`composite_layer_into`]'s transparent-chunk skip on or off on the
+/// calling thread (0.184.0; on by default). Test builds and the
+/// `test-support` feature only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_transparent_skip_enabled(enabled: bool) {
+    TRANSPARENT_SKIP_DISABLED.with(|flag| flag.set(!enabled));
+}
+
+/// How many chunks [`composite_layer_into`] has skipped on the calling
+/// thread (0.184.0). Test builds and the `test-support` feature only.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn transparent_chunks_skipped() -> u64 {
+    TRANSPARENT_CHUNKS_SKIPPED.with(std::cell::Cell::get)
+}
+
+/// Whether the transparent-chunk skip runs on this thread.
+#[cfg(any(test, feature = "test-support"))]
+fn transparent_skip_enabled() -> bool {
+    !TRANSPARENT_SKIP_DISABLED.with(std::cell::Cell::get)
+}
+
+/// Whether the transparent-chunk skip runs: always, in a shipping build
+/// (no thread-local is read).
+#[cfg(not(any(test, feature = "test-support")))]
+const fn transparent_skip_enabled() -> bool {
+    true
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn note_transparent_chunks_skipped(skipped: u64) {
+    TRANSPARENT_CHUNKS_SKIPPED.with(|n| n.set(n.get().saturating_add(skipped)));
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+const fn note_transparent_chunks_skipped(_skipped: u64) {}
+
 /// Folds exactly one layer into `out`, a running accumulator, **in
 /// place** — the per-layer step [`composite_tile_cpu`] runs once per
 /// layer, exposed as its own primitive so that a caller which resolves
@@ -1705,10 +1818,19 @@ pub fn composite_layer_into(out: &mut [f16], texels: &[f16], opacity: f32, mode:
     // samples widened to `f32` for the duration of that chunk's fold.
     let mut dst_wide = [0f32; CHUNK_SAMPLES];
     let mut src_wide = [0f32; CHUNK_SAMPLES];
+    // 0.184.0: a chunk whose source is wholly transparent over an in-range
+    // backdrop folds to the backdrop bit for bit (`chunk_folds_to_backdrop`),
+    // so it is left untouched rather than converted and folded.
+    let skip = !opacity.is_nan() && transparent_skip_enabled();
+    let mut skipped = 0_u64;
     for (dst_chunk, src_chunk) in head_out
         .chunks_exact_mut(CHUNK_SAMPLES)
         .zip(head_src.chunks_exact(CHUNK_SAMPLES))
     {
+        if skip && chunk_folds_to_backdrop(dst_chunk, src_chunk) {
+            skipped += 1;
+            continue;
+        }
         // Two vectorized f16 -> f32 passes: 8 lanes per `vcvtph2ps`, one
         // feature-detection check per slice rather than per sample.
         dst_chunk.convert_to_f32_slice(&mut dst_wide);
@@ -1731,6 +1853,9 @@ pub fn composite_layer_into(out: &mut [f16], texels: &[f16], opacity: f32, mode:
         // serializer there is no channel that must come from the
         // original `f16` chunk instead.
         dst_chunk.convert_from_f32_slice(&dst_wide);
+    }
+    if skipped > 0 {
+        note_transparent_chunks_skipped(skipped);
     }
 
     // The scalar tail. Unreachable for a real whole-tile fold
@@ -5018,6 +5143,209 @@ impl std::fmt::Debug for TileCompositor {
 
 #[cfg(test)]
 mod tests {
+
+    use super::{
+        chunk_folds_to_backdrop, set_transparent_skip_enabled, transparent_chunks_skipped,
+    };
+
+    /// Every mode `composite_layer_into` takes (0.184.0).
+    const TRANSPARENT_SKIP_MODES: [BlendMode; 26] = [
+        BlendMode::Normal,
+        BlendMode::Darken,
+        BlendMode::Multiply,
+        BlendMode::Lighten,
+        BlendMode::Screen,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+        BlendMode::Subtract,
+        BlendMode::Divide,
+        BlendMode::ColorDodge,
+        BlendMode::LinearDodge,
+        BlendMode::ColorBurn,
+        BlendMode::LinearBurn,
+        BlendMode::Overlay,
+        BlendMode::SoftLight,
+        BlendMode::HardLight,
+        BlendMode::VividLight,
+        BlendMode::LinearLight,
+        BlendMode::PinLight,
+        BlendMode::HardMix,
+        BlendMode::Hue,
+        BlendMode::Saturation,
+        BlendMode::Color,
+        BlendMode::Luminosity,
+        BlendMode::DarkerColor,
+        BlendMode::LighterColor,
+    ];
+
+    /// 0.184.0: the transparent-chunk skip's premise, checked per mode: a
+    /// transparent source (`+0` and `-0` alpha) over every in-range
+    /// backdrop on a grid, at opacities 0, 0.5 and 1, folds to the backdrop
+    /// bit for bit.
+    #[test]
+    fn a_transparent_source_folds_to_the_backdrop_bit_for_bit_in_every_mode() {
+        let levels = [0.0_f32, 1.0e-4, 0.1, 0.25, 0.4999, 0.5, 0.75, 0.999, 1.0];
+        let mut checked = 0_u64;
+        for mode in TRANSPARENT_SKIP_MODES {
+            for &da in &levels {
+                for &k in &levels {
+                    let d = [k * da, (1.0 - k) * da, (k * 0.5) * da, da].map(f16::from_f32);
+                    let d = [d[0], d[1], d[2], d[3]];
+                    for &c in &levels {
+                        for sa in [f16::from_bits(0), f16::from_bits(0x8000)] {
+                            let src = [
+                                f16::from_f32(c),
+                                f16::from_f32(1.0 - c),
+                                f16::from_f32(c * c),
+                                sa,
+                            ];
+                            assert!(chunk_folds_to_backdrop(&d, &src));
+                            for opacity in [0.0, 0.5, 1.0] {
+                                let mut out = d.to_vec();
+                                composite_layer_into(&mut out, &src, opacity, mode);
+                                let got: Vec<u16> = out.iter().map(|v| v.to_bits()).collect();
+                                let want: Vec<u16> = d.iter().map(|v| v.to_bits()).collect();
+                                assert_eq!(
+                                    got, want,
+                                    "{mode:?} d {d:?} src {src:?} opacity {opacity}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000);
+    }
+
+    /// Every mode's blend term is finite on the unit cube (the skip's
+    /// finiteness premise), on a 1/32 grid of straight operands.
+    #[test]
+    fn blend_rgb_is_finite_on_the_unit_cube_in_every_mode() {
+        let grid: Vec<f32> = (0..=32).map(|i| i as f32 / 32.0).collect();
+        for mode in TRANSPARENT_SKIP_MODES {
+            for &a in &grid {
+                for &b in &grid {
+                    for &c in &[0.0_f32, 0.5, 1.0] {
+                        let out = blend_rgb(mode, [a, b, c], [b, c, a]);
+                        assert!(
+                            out.iter().all(|v| v.is_finite()),
+                            "{mode:?} {a} {b} {c}: {out:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// SK-1's edge operands, exhaustively: every combination of zero,
+    /// subnormal, tiny, near-one and one `f16` values (and backdrops formed
+    /// as `d / da` from subnormals) per channel gives a finite blend in
+    /// every mode.
+    #[test]
+    fn blend_rgb_is_finite_on_subnormal_and_near_one_operands_in_every_mode() {
+        let edges: Vec<f32> = [
+            0x0000_u16, 0x0001, 0x0002, 0x0400, 0x1000, 0x3800, 0x3BFE, 0x3BFF, 0x3C00,
+        ]
+        .iter()
+        .map(|&bits| f16::from_bits(bits).to_f32())
+        .collect();
+        let ratios: Vec<f32> = [(0x0001_u16, 0x0002_u16), (0x0001, 0x0001), (0x03FF, 0x0400)]
+            .iter()
+            .map(|&(d, a)| f16::from_bits(d).to_f32() / f16::from_bits(a).to_f32())
+            .collect();
+        let operands: Vec<f32> = edges.iter().chain(&ratios).copied().collect();
+        assert!(operands.iter().all(|v| (0.0..=1.0).contains(v)));
+        for mode in TRANSPARENT_SKIP_MODES {
+            for &a in &operands {
+                for &b in &operands {
+                    for &c in &operands {
+                        for &s0 in &edges {
+                            for &s1 in &edges {
+                                let out = blend_rgb(mode, [a, b, c], [s0, s1, a]);
+                                assert!(
+                                    out.iter().all(|v| v.is_finite()),
+                                    "{mode:?} cb {:?} cs {:?}: {out:?}",
+                                    [a, b, c],
+                                    [s0, s1, a]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The cases the skip predicate excludes really do change under the
+    /// fold, so the exclusions are needed, not cautious.
+    #[test]
+    fn the_skip_predicate_excludes_cases_where_the_fold_is_not_the_identity() {
+        let zero = f16::from_bits(0);
+        let negative_zero = [f16::from_bits(0x8000), zero, zero, f16::from_f32(0.5)];
+        let clear = [zero, zero, zero, zero];
+        assert!(!chunk_folds_to_backdrop(&negative_zero, &clear));
+        set_transparent_skip_enabled(false);
+        let mut out = negative_zero.to_vec();
+        composite_layer_into(&mut out, &clear, 1.0, BlendMode::Normal);
+        set_transparent_skip_enabled(true);
+        assert_eq!(out.first().map(|v| v.to_bits()), Some(0), "-0 becomes +0");
+        let nan = [f16::NAN, zero, zero, zero];
+        let backdrop = [f16::from_f32(0.25), zero, zero, f16::from_f32(0.5)];
+        assert!(!chunk_folds_to_backdrop(&backdrop, &nan));
+        let mut out = backdrop.to_vec();
+        composite_layer_into(&mut out, &nan, 1.0, BlendMode::Normal);
+        assert!(
+            out.first().is_some_and(|v| v.is_nan()),
+            "0 * NaN poisons the backdrop"
+        );
+        // A tiny but nonzero source alpha (2^-12) is not transparent: it
+        // visibly lifts a black opaque backdrop, so it must not be skipped.
+        let one = f16::from_f32(1.0);
+        let tiny = [one, one, one, f16::from_bits(0x0C00)];
+        let black = [zero, zero, zero, one];
+        assert!(!chunk_folds_to_backdrop(&black, &tiny));
+        let before = transparent_chunks_skipped();
+        let mut chunk = black.repeat(CHUNK_TEXELS);
+        composite_layer_into(
+            &mut chunk,
+            &tiny.repeat(CHUNK_TEXELS),
+            1.0,
+            BlendMode::Normal,
+        );
+        assert_eq!(transparent_chunks_skipped(), before, "not skipped");
+        assert!(
+            chunk.first().is_some_and(|v| v.to_f32() > 0.0),
+            "and it shows"
+        );
+    }
+
+    /// The skip fires on a transparent chunk and not on a chunk with one
+    /// opaque texel, and skip-on equals skip-off there.
+    #[test]
+    fn composite_layer_into_skips_only_wholly_transparent_chunks() {
+        let backdrop: Vec<f16> = (0..CHUNK_SAMPLES * 4)
+            .map(|i| f16::from_f32(if i % 4 == 3 { 0.75 } else { 0.25 }))
+            .collect();
+        let mut source = vec![f16::from_bits(0); CHUNK_SAMPLES * 4];
+        if let Some(texel) = source.get_mut(CHUNK_SAMPLES + 8..CHUNK_SAMPLES + 12) {
+            texel.copy_from_slice(&[0.5, 0.5, 0.5, 1.0].map(f16::from_f32));
+        }
+        for mode in TRANSPARENT_SKIP_MODES {
+            let before = transparent_chunks_skipped();
+            let mut skipped = backdrop.clone();
+            composite_layer_into(&mut skipped, &source, 1.0, mode);
+            assert_eq!(transparent_chunks_skipped() - before, 3, "{mode:?}");
+            set_transparent_skip_enabled(false);
+            let mut full = backdrop.clone();
+            composite_layer_into(&mut full, &source, 1.0, mode);
+            set_transparent_skip_enabled(true);
+            let a: Vec<u16> = skipped.iter().map(|v| v.to_bits()).collect();
+            let b: Vec<u16> = full.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(a, b, "{mode:?}");
+        }
+    }
     use super::{
         ALL_BLEND_PASSES, BLEND_MATH_PASS_COUNT, BlendMode, CHUNK_SAMPLES, CHUNK_TEXELS,
         COMPOSITE_SHADER, CURVES_GPU_LUT_LEN, TileCompositor, blend_channel, blend_color,

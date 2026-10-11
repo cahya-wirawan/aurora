@@ -108,6 +108,10 @@ aurora-doc = { workspace = true, features = ["test-support"] }
 # decision to `aurora_gpu::test_support::real_context_or_skip` instead
 # of carrying its own copy.
 aurora-gpu = { workspace = true, features = ["test-support"] }
+# And for `aurora-render`'s (0.184.0): the transparent-chunk skip's
+# test-only switch and counter, for this crate's skip-on/skip-off
+# differentials. Never in a shipping build.
+aurora-render = { workspace = true, features = ["test-support"] }
 # Test-only: the autosave file is a real `.aur` ZIP container now
 # (`write_autosave`), so a test can assert its actual archive entries
 # (`mimetype`/`manifest`/`history`) directly rather than only via
