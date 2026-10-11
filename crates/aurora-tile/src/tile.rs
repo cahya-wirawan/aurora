@@ -71,7 +71,13 @@ pub struct TileId {
 /// painting frame's cost).
 #[derive(Debug)]
 pub struct Tile {
-    texels: Vec<f16>,
+    /// Shared, copy-on-write (0.186.0): [`crate::TileStore::share_tile`]
+    /// hands the background compositor an `Arc` clone of a resident
+    /// tile's texels instead of a 512 KiB copy, and
+    /// [`Tile::texels_mut`] copies the buffer only if such a share is
+    /// still alive (`Arc::make_mut`). With no share outstanding the
+    /// write path is unchanged apart from one reference-count check.
+    texels: std::sync::Arc<Vec<f16>>,
     dirty: Option<Rect>,
 }
 
@@ -80,7 +86,7 @@ impl Tile {
     #[must_use]
     pub fn blank() -> Self {
         Self {
-            texels: vec![f16::from_f32(0.0); SAMPLES],
+            texels: std::sync::Arc::new(vec![f16::from_f32(0.0); SAMPLES]),
             dirty: None,
         }
     }
@@ -98,10 +104,24 @@ impl Tile {
     /// "clean in the store" — a paged-in tile can and does arrive dirty.
     #[must_use]
     pub(crate) fn from_texels(texels: Vec<f16>) -> Self {
+        Self::from_shared(std::sync::Arc::new(texels))
+    }
+
+    /// A tile over an already shared texel buffer (0.186.0): what
+    /// [`crate::TileStore::insert_share`] adopts, so a background
+    /// mirror of a resident tile costs a reference count, not a copy.
+    #[must_use]
+    pub(crate) fn from_shared(texels: std::sync::Arc<Vec<f16>>) -> Self {
         Self {
             texels,
             dirty: None,
         }
+    }
+
+    /// The shared texel buffer itself, for [`crate::TileStore::share_tile`].
+    #[must_use]
+    pub(crate) fn shared_texels(&self) -> std::sync::Arc<Vec<f16>> {
+        std::sync::Arc::clone(&self.texels)
     }
 
     #[must_use]
@@ -115,7 +135,7 @@ impl Tile {
     /// through this is responsible for calling [`Tile::mark_dirty`]
     /// itself with the region it actually touched.
     pub fn texels_mut(&mut self) -> &mut [f16] {
-        &mut self.texels
+        std::sync::Arc::make_mut(&mut self.texels).as_mut_slice()
     }
 
     /// Accumulates `rect` (tile-local coordinates) into the dirty region.

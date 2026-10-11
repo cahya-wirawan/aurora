@@ -104,6 +104,19 @@ pub struct IdGenerator<T> {
     marker: PhantomData<fn() -> T>,
 }
 
+/// A copy of the counter (0.186.0), for a read-only copy of whatever owns
+/// it — the background compositor's clone of a `LayerTree`. **Two copies
+/// that both hand out ids would collide**; a clone exists to be read, and
+/// whatever generates ids must keep using the original.
+impl<T> Clone for IdGenerator<T> {
+    fn clone(&self) -> Self {
+        Self {
+            next: self.next,
+            marker: PhantomData,
+        }
+    }
+}
+
 impl<T> Default for IdGenerator<T> {
     fn default() -> Self {
         Self::new()

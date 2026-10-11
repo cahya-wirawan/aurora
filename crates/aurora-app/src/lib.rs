@@ -540,6 +540,7 @@ use winit::window::{Window, WindowId};
 
 mod autosave_files;
 mod background_autosave;
+mod background_composite;
 mod background_open;
 mod document_close;
 mod document_session;
@@ -1075,6 +1076,9 @@ enum AppEvent {
     /// A background open finished; [`App::poll_background_open`]
     /// installs it on the next `about_to_wait`.
     OpenFinished,
+    /// The background compositor (0.186.0) has finished tiles to install;
+    /// `about_to_wait` drains them.
+    CompositeReady,
 }
 
 impl From<accesskit_winit::Event> for AppEvent {
@@ -19486,6 +19490,134 @@ fn tiles_are_bitwise_identical(have: &[half::f16], want: &[half::f16]) -> bool {
     have.reinterpret_cast() == want.reinterpret_cast()
 }
 
+/// Writes one composited tile into the composite surface and marks it
+/// current — the synchronous path's write, shared with the background
+/// compositor's install (0.186.0) so both write exactly the same way.
+/// Shows a superseded background job's tile without marking it current
+/// (0.186.0, BG-3): the canvas shows the most recent finished work during
+/// a continuous structural drag, and the newest job still recomposites
+/// the tile. Never called for a current tile.
+fn install_provisional_tile(
+    store: &mut aurora_tile::TileStore,
+    cache: &mut CompositeCache,
+    tile_id: aurora_tile::TileId,
+    composited: &[half::f16],
+    stamp: u64,
+) {
+    if cache.is_current(tile_id) {
+        return;
+    }
+    install_composited_tile(store, cache, tile_id, composited);
+    cache.mark_provisional(tile_id, stamp);
+}
+
+/// Whether a wake from a background worker asks for a redraw (0.186.0):
+/// `user_event`'s own test, so the App-level tests can check it.
+#[must_use]
+fn app_event_requests_redraw(event: &AppEvent) -> bool {
+    matches!(event, AppEvent::OpenFinished | AppEvent::CompositeReady)
+}
+
+/// `about_to_wait`'s background-composite step (0.186.0), as a free
+/// function over the current document: cancels a job and releases the
+/// mirror that belong to another document, installs every finished tile
+/// that is still valid, and returns whether a redraw is needed (something
+/// installed, or the job finished, so what it left uncovered dispatches).
+fn drain_background_composite_into(
+    worker: &mut background_composite::CompositeWorker,
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    store: Option<&mut aurora_tile::TileStore>,
+    cache: &mut CompositeCache,
+) -> bool {
+    let reference_origin = composite_reference_origin(layers, active_layer);
+    let serial = store.as_ref().map(|store| store.serial());
+    if worker.mirrors_other_than(serial) {
+        worker.cancel();
+        worker.release_mirror();
+    }
+    let installed = match store {
+        None => worker.drain(None),
+        Some(store) => {
+            let mut target = background_composite::CompositeTarget {
+                layers,
+                reference_origin,
+                store,
+                cache,
+            };
+            if worker.is_busy() && !worker.belongs_to(&target) {
+                worker.cancel();
+            }
+            worker.drain(Some(&mut target))
+        }
+    };
+    let finished = worker.take_finished();
+    installed > 0 || finished
+}
+
+/// The set of tile surfaces compositing `layers` can read: every layer's
+/// own pixels and every mask (0.186.0, BG-2). The background compositor
+/// mirrors only these.
+fn tree_surfaces(layers: &aurora_doc::LayerTree) -> HashSet<aurora_tile::SurfaceId> {
+    let mut surfaces = HashSet::new();
+    let mut stack: Vec<aurora_doc::LayerId> = layers.roots().to_vec();
+    let mut budget = layers.len();
+    while let Some(id) = stack.pop() {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        surfaces.extend(layers.surface_id(id));
+        surfaces.extend(layers.mask_surface_id(id));
+        if let Some(children) = layers.children(id) {
+            stack.extend_from_slice(children);
+        }
+    }
+    surfaces
+}
+
+fn install_composited_tile(
+    store: &mut aurora_tile::TileStore,
+    cache: &mut CompositeCache,
+    tile_id: aurora_tile::TileId,
+    composited: &[half::f16],
+) {
+    let full_tile = aurora_core::Rect {
+        x: 0,
+        y: 0,
+        width: aurora_tile::TILE,
+        height: aurora_tile::TILE,
+    };
+    // Asked *before* `get_mut`, which pages the tile in (or
+    // materializes it blank) and would make every tile look resident.
+    let was_resident = store.is_resident(composite_surface_id(), tile_id);
+    let Ok(dest) = store.get_mut(composite_surface_id(), tile_id) else {
+        return;
+    };
+    if dest.texels().len() != composited.len() {
+        tracing::warn!(
+            ?tile_id,
+            composited = composited.len(),
+            expected = dest.texels().len(),
+            "composited tile is not one whole tile; skipping this tile's write"
+        );
+        return;
+    }
+    let unchanged = was_resident && tiles_are_bitwise_identical(dest.texels(), composited);
+    if unchanged {
+        note_composite_write_skipped();
+    } else {
+        dest.texels_mut().copy_from_slice(composited);
+        dest.mark_dirty(full_tile);
+        if was_resident {
+            note_composite_write_changed();
+        } else {
+            note_composite_write_not_resident();
+        }
+    }
+    cache.mark_current(tile_id);
+}
+
 /// Recomposites every tile in `residency`'s own currently-visible grid
 /// from `layers.roots()`'s own bottom-to-top, visible root-level
 /// entries into `store`'s reserved composite surface
@@ -19653,6 +19785,139 @@ fn recomposite_visible_tiles(
     store: &mut aurora_tile::TileStore,
     cache: &mut CompositeCache,
     gpu: Option<&aurora_gpu::GpuContext>,
+    compositor: Option<&mut aurora_render::TileCompositor>,
+) {
+    let tiles: Vec<aurora_tile::TileId> = residency.visible_tiles().collect();
+    recomposite_tiles(&tiles, layers, active_layer, store, cache, gpu, compositor);
+}
+
+/// The doc-space top-left of composite tile `tile_id` on the grid
+/// anchored at `reference_origin` (0.186.0, shared by both paths).
+#[must_use]
+fn composite_tile_doc_origin(
+    reference_origin: (i64, i64),
+    tile_id: aurora_tile::TileId,
+) -> (i64, i64) {
+    let tile_size = i64::from(aurora_tile::TILE);
+    (
+        reference_origin.0 + i64::from(tile_id.x) * tile_size,
+        reference_origin.1 + i64::from(tile_id.y) * tile_size,
+    )
+}
+
+/// Where the background compositor's mirror store keeps its scratch
+/// files: the session's own scratch directory, beside every document
+/// store's, so quit and the orphan sweep clean it up with them.
+fn composite_mirror_scratch_dir(_source: &aurora_tile::TileStore) -> Option<PathBuf> {
+    tile_store_scratch_dir().map(Path::to_path_buf)
+}
+
+/// The redraw handler's recomposite (0.186.0, invariant §7.3.4). A
+/// document on the GPU fast path, or with no background compositor,
+/// recomposites synchronously exactly as before. Otherwise: at most
+/// [`background_composite::SYNC_TILE_LIMIT`] stale tiles nothing in flight
+/// will deliver are composited here (a dab's own tiles — the brush path,
+/// unchanged); more go to the worker as one job, superseding the job in
+/// flight only if that job is for another document or has had a tile
+/// invalidated since it was dispatched. Until a tile's result is
+/// installed the canvas keeps showing its previous composite.
+#[allow(clippy::too_many_arguments)]
+fn recomposite_or_dispatch(
+    residency: &aurora_gpu::TileResidency,
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    store: &mut aurora_tile::TileStore,
+    cache: &mut CompositeCache,
+    gpu: Option<&aurora_gpu::GpuContext>,
+    compositor: Option<&mut aurora_render::TileCompositor>,
+    worker: Option<&mut background_composite::CompositeWorker>,
+) {
+    let gpu_path =
+        document_qualifies_for_gpu_compositing(layers) && gpu.is_some() && compositor.is_some();
+    let Some(worker) = worker.filter(|_| !gpu_path) else {
+        recomposite_visible_tiles(
+            residency,
+            layers,
+            active_layer,
+            store,
+            cache,
+            gpu,
+            compositor,
+        );
+        return;
+    };
+    let tiles: Vec<aurora_tile::TileId> = residency.visible_tiles().collect();
+    dispatch_or_composite_tiles(&tiles, layers, active_layer, store, cache, worker);
+}
+
+/// [`recomposite_or_dispatch`]'s CPU-path decision over an explicit tile
+/// list, so tests can drive it without a GPU residency.
+fn dispatch_or_composite_tiles(
+    tiles: &[aurora_tile::TileId],
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    store: &mut aurora_tile::TileStore,
+    cache: &mut CompositeCache,
+    worker: &mut background_composite::CompositeWorker,
+) {
+    let reference_origin = composite_reference_origin(layers, active_layer);
+    let mut target = background_composite::CompositeTarget {
+        layers,
+        reference_origin,
+        store,
+        cache,
+    };
+    let stale: Vec<aurora_tile::TileId> = tiles
+        .iter()
+        .copied()
+        .filter(|&tile| !target.cache.is_current(tile))
+        .collect();
+    let uncovered: Vec<aurora_tile::TileId> = stale
+        .iter()
+        .copied()
+        .filter(|&tile| !worker.covers(&target, tile))
+        .collect();
+    if uncovered.is_empty() {
+        return;
+    }
+    if uncovered.len() <= background_composite::SYNC_TILE_LIMIT {
+        recomposite_tiles(
+            &uncovered,
+            layers,
+            active_layer,
+            target.store,
+            target.cache,
+            None,
+            None,
+        );
+        return;
+    }
+    if worker.is_busy() && worker.active_is_healthy(&target) {
+        // Left to finish; its `Done` wakes the loop and the next redraw
+        // dispatches what it didn't cover.
+        return;
+    }
+    if !worker.dispatch(&mut target, stale) {
+        recomposite_tiles(
+            &uncovered,
+            layers,
+            active_layer,
+            target.store,
+            target.cache,
+            None,
+            None,
+        );
+    }
+}
+
+/// [`recomposite_visible_tiles`] over an explicit tile list (0.186.0).
+fn recomposite_tiles(
+    tiles: &[aurora_tile::TileId],
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    store: &mut aurora_tile::TileStore,
+    cache: &mut CompositeCache,
+    gpu: Option<&aurora_gpu::GpuContext>,
     mut compositor: Option<&mut aurora_render::TileCompositor>,
 ) {
     // Test-only, no-op in the shipping build (see `RecompositePhases`).
@@ -19679,12 +19944,6 @@ fn recomposite_visible_tiles(
     // that's correct, not just an optimization.
     let gpu_qualifies = document_qualifies_for_gpu_compositing(layers);
 
-    let full_tile = aurora_core::Rect {
-        x: 0,
-        y: 0,
-        width: aurora_tile::TILE,
-        height: aurora_tile::TILE,
-    };
     let tile_size = i64::from(aurora_tile::TILE);
     let doc_origin_for = |tile_id: aurora_tile::TileId| {
         (
@@ -19786,39 +20045,7 @@ fn recomposite_visible_tiles(
     // deliberately not `==`; see that function's own doc comment for why,
     // and for why 0.94.0's faster spelling of it is an implementation
     // change rather than a weaker predicate.
-    let write_composited = |store: &mut aurora_tile::TileStore,
-                            cache: &mut CompositeCache,
-                            tile_id: aurora_tile::TileId,
-                            composited: &[half::f16]| {
-        // Asked *before* `get_mut`, which pages the tile in (or
-        // materializes it blank) and would make every tile look resident.
-        let was_resident = store.is_resident(composite_surface_id(), tile_id);
-        let Ok(dest) = store.get_mut(composite_surface_id(), tile_id) else {
-            return;
-        };
-        if dest.texels().len() != composited.len() {
-            tracing::warn!(
-                ?tile_id,
-                composited = composited.len(),
-                expected = dest.texels().len(),
-                "composited tile is not one whole tile; skipping this tile's write"
-            );
-            return;
-        }
-        let unchanged = was_resident && tiles_are_bitwise_identical(dest.texels(), composited);
-        if unchanged {
-            note_composite_write_skipped();
-        } else {
-            dest.texels_mut().copy_from_slice(composited);
-            dest.mark_dirty(full_tile);
-            if was_resident {
-                note_composite_write_changed();
-            } else {
-                note_composite_write_not_resident();
-            }
-        }
-        cache.mark_current(tile_id);
-    };
+    let write_composited = install_composited_tile;
     // Returns `composite_roots_into_tile`'s own `(texels, roots folded)`
     // pair unchanged; phase 3's caller below discards the count.
     let composite_tile_cpu_path = |layers: &aurora_doc::LayerTree,
@@ -19872,7 +20099,7 @@ fn recomposite_visible_tiles(
     // since "the shipping build is unaffected" is only true of the profile
     // Aurora actually ships.
     let gpu_arm_reachable = gpu_qualifies && gpu.is_some() && compositor.is_some();
-    for tile_id in residency.visible_tiles() {
+    for &tile_id in tiles {
         if cache.is_current(tile_id) {
             continue;
         }
@@ -20063,15 +20290,87 @@ fn recomposite_visible_tiles(
 /// `aurora_tile::TileStore`'s own LRU pages the real tile back out in
 /// the meantime (paging back in on next access restores the same
 /// content `TileStore` already guarantees elsewhere).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CompositeCache {
     current: std::collections::HashSet<aurora_tile::TileId>,
+    /// This cache's own identity (0.186.0): a background composite result
+    /// installs only into the cache it was dispatched for, so a closed or
+    /// switched-away document's result can never land in another.
+    id: u64,
+    /// Advances on every invalidation (0.186.0). A background job records
+    /// it at dispatch; [`CompositeCache::unchanged_since`] compares.
+    stamp: u64,
+    /// The stamp of the last [`CompositeCache::bump`].
+    bumped_at: u64,
+    /// The stamp of each tile's last single-tile invalidation since the
+    /// last bump, kept while a background job may still be in flight.
+    invalidated_at: HashMap<aurora_tile::TileId, u64>,
+    /// Tiles a background job is compositing, so a rect invalidation finds
+    /// them even though they are not current.
+    in_flight: HashSet<aurora_tile::TileId>,
+    /// The stamp of the content each composite tile shows (0.186.0, BG-3):
+    /// a provisional install never replaces newer content with older.
+    displayed: HashMap<aurora_tile::TileId, u64>,
+}
+
+impl Default for CompositeCache {
+    fn default() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            current: HashSet::new(),
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            stamp: 0,
+            bumped_at: 0,
+            invalidated_at: HashMap::new(),
+            in_flight: HashSet::new(),
+            displayed: HashMap::new(),
+        }
+    }
 }
 
 impl CompositeCache {
     /// Invalidates every cached tile.
     fn bump(&mut self) {
         self.current.clear();
+        self.stamp = self.stamp.wrapping_add(1);
+        self.bumped_at = self.stamp;
+        self.invalidated_at.clear();
+    }
+
+    #[must_use]
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[must_use]
+    fn stamp(&self) -> u64 {
+        self.stamp
+    }
+
+    /// Whether nothing has invalidated `id` since `stamp` — the test every
+    /// background result must pass before it is installed (0.186.0).
+    #[must_use]
+    fn unchanged_since(&self, id: aurora_tile::TileId, stamp: u64) -> bool {
+        self.bumped_at <= stamp && self.invalidated_at.get(&id).is_none_or(|&at| at <= stamp)
+    }
+
+    fn track_in_flight(&mut self, tiles: impl IntoIterator<Item = aurora_tile::TileId>) {
+        self.in_flight.clear();
+        self.in_flight.extend(tiles);
+    }
+
+    fn clear_in_flight(&mut self) {
+        self.in_flight.clear();
+        self.invalidated_at.clear();
+    }
+
+    fn note_invalidated(&mut self, id: aurora_tile::TileId) {
+        self.current.remove(&id);
+        // Only a tile a background job may still deliver needs the record;
+        // anything else is simply no longer current.
+        if self.in_flight.contains(&id) {
+            self.invalidated_at.insert(id, self.stamp);
+        }
     }
 
     /// Whether `id` was already computed since the last [`Self::bump`].
@@ -20088,12 +20387,27 @@ impl CompositeCache {
     /// than needing to distrust the whole cache. Safe to call with an `id` that isn't
     /// currently cached at all — `HashSet::remove` is a no-op then.
     fn invalidate(&mut self, id: aurora_tile::TileId) {
-        self.current.remove(&id);
+        self.stamp = self.stamp.wrapping_add(1);
+        self.note_invalidated(id);
     }
 
     /// Records that `id` now holds current composited content.
     fn mark_current(&mut self, id: aurora_tile::TileId) {
         self.current.insert(id);
+        self.displayed.insert(id, self.stamp);
+    }
+
+    /// Whether tile `id` shows content older than `stamp` (or nothing).
+    #[must_use]
+    fn shows_older_than(&self, id: aurora_tile::TileId, stamp: u64) -> bool {
+        self.displayed.get(&id).is_none_or(|&shown| shown < stamp)
+    }
+
+    /// Records a provisional install: the tile shows content as of
+    /// `stamp` and is **not** current, so the newest job recomposites it.
+    fn mark_provisional(&mut self, id: aurora_tile::TileId, stamp: u64) {
+        self.current.remove(&id);
+        self.displayed.insert(id, stamp);
     }
 
     /// Invalidates every cached tile that `rect` — a **document-space**
@@ -20164,11 +20478,21 @@ impl CompositeCache {
         if rects.is_empty() {
             return;
         }
-        self.current.retain(|&id| {
-            !rects
-                .iter()
-                .any(|&rect| tile_overlaps_doc_rect(id, rect, reference_origin))
-        });
+        self.stamp = self.stamp.wrapping_add(1);
+        let hit: Vec<aurora_tile::TileId> = self
+            .current
+            .iter()
+            .chain(self.in_flight.iter())
+            .copied()
+            .filter(|&id| {
+                rects
+                    .iter()
+                    .any(|&rect| tile_overlaps_doc_rect(id, rect, reference_origin))
+            })
+            .collect();
+        for id in hit {
+            self.note_invalidated(id);
+        }
     }
 }
 
@@ -21929,6 +22253,12 @@ fn remove_session_scratch(state: &mut impl ShutdownState) {
 /// misbehaving machine. Writing that back would overwrite a good saved
 /// layout with defaults for no gain.
 fn run_shutdown_cleanup(state: &mut impl ShutdownState) {
+    // 0.186.0: the background compositor is cancelled and joined before
+    // anything else — at most the one tile in progress finishes, and its
+    // result is never installed.
+    if let Some(worker) = state.composite_worker() {
+        worker.shutdown();
+    }
     // First, on both paths (0.152.0): the autosave is abandoned, never
     // finished — a clean quit deletes it just below anyway, and an
     // aborted startup must not replace a previous crash's autosave. Once
@@ -21986,6 +22316,11 @@ trait ShutdownState {
     /// The background autosave writer, stopped before anything is
     /// deleted ([`run_shutdown_cleanup`]); `None` when there is none.
     fn autosave_worker(&mut self) -> Option<&mut background_autosave::AutosaveWorker>;
+    /// The background compositor (0.186.0), stopped first so its mirror
+    /// store is gone before the scratch directory is removed.
+    fn composite_worker(&mut self) -> Option<&mut background_composite::CompositeWorker> {
+        None
+    }
     /// This run's own "I'm still running" marker.
     fn marker_path(&self) -> &Path;
     /// Where the autosave this run has been writing lives.
@@ -22911,6 +23246,9 @@ struct App {
     /// The open still decoding on a background thread, if any, and the
     /// channel its result comes back on (0.151.0).
     open_worker: OpenWorker,
+    /// The background compositor (0.186.0); `None` only if a test double
+    /// builds an `App` without one.
+    composite_worker: Option<background_composite::CompositeWorker>,
     /// Writes the crash-recovery autosave off the UI thread (0.152.0,
     /// [`background_autosave`]).
     autosave_worker: background_autosave::AutosaveWorker,
@@ -23215,6 +23553,10 @@ impl ShutdownState for App {
         Some(&mut self.autosave_worker)
     }
 
+    fn composite_worker(&mut self) -> Option<&mut background_composite::CompositeWorker> {
+        self.composite_worker.as_mut()
+    }
+
     fn marker_path(&self) -> &Path {
         &self.marker_path
     }
@@ -23255,6 +23597,25 @@ impl ShutdownState for App {
         self.layout_path
             .as_deref()
             .map(|path| (path, &self.workspace))
+    }
+}
+
+impl App {
+    /// Installs the background compositor's finished tiles into the
+    /// current document (0.186.0). A job dispatched for another document
+    /// (closed, or switched away from) is cancelled and its mirror
+    /// released here instead.
+    fn drain_background_composite(&mut self) -> bool {
+        let Some(worker) = self.composite_worker.as_mut() else {
+            return false;
+        };
+        drain_background_composite_into(
+            worker,
+            &self.doc.layers,
+            self.doc.active_layer,
+            self.doc.tile_store.as_mut(),
+            &mut self.doc.composite_cache,
+        )
     }
 }
 
@@ -23473,6 +23834,7 @@ impl App {
         // (the `scale_factor` field below); `resumed` re-syncs it.
         let _ = sync_status_bar(&mut workspace, &canvas_view, canvas_size, 1.0);
 
+        let composite_proxy = proxy.clone();
         let mut app = Self {
             window: None,
             gpu: None,
@@ -23480,6 +23842,11 @@ impl App {
             adapter: None,
             proxy,
             open_worker: OpenWorker::default(),
+            composite_worker: Some(background_composite::CompositeWorker::new(
+                std::sync::Arc::new(move || {
+                    let _ = composite_proxy.send_event(AppEvent::CompositeReady);
+                }),
+            )),
             autosave_worker,
             autosave,
             workspace,
@@ -27441,7 +27808,7 @@ impl App {
                         );
                     }
                     if let Some(store) = self.doc.tile_store.as_mut() {
-                        recomposite_visible_tiles(
+                        recomposite_or_dispatch(
                             residency,
                             &self.doc.layers,
                             self.doc.active_layer,
@@ -27449,6 +27816,7 @@ impl App {
                             &mut self.doc.composite_cache,
                             Some(gpu),
                             self.compositor.as_mut(),
+                            self.composite_worker.as_mut(),
                         );
                         let _ = residency.sync(
                             gpu.queue(),
@@ -27883,11 +28251,13 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, _el: &ActiveEventLoop, event: AppEvent) {
         let event = match event {
             AppEvent::Accessibility(event) => event,
-            AppEvent::OpenFinished => {
+            wake @ (AppEvent::OpenFinished | AppEvent::CompositeReady) => {
                 // Installed by `about_to_wait`, which runs after this on
                 // the same iteration: the wake's whole job is to end the
                 // loop's `Wait` so that it does.
-                self.needs_redraw = true;
+                if app_event_requests_redraw(&wake) {
+                    self.needs_redraw = true;
+                }
                 return;
             }
         };
@@ -28027,6 +28397,10 @@ impl ApplicationHandler<AppEvent> for App {
     // `next_control_flow`. Setting it only sometimes would leave a stale
     // `WaitUntil` in the past behind, which is a busy loop.
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // 0.186.0: install whatever the background compositor finished.
+        if self.drain_background_composite() {
+            self.needs_redraw = true;
+        }
         // 0.174.0: the quit review ended with nothing left unsaved.
         if self.exit_requested {
             self.exit_requested = false;
@@ -80427,14 +80801,14 @@ mod occlusion_cull_tests {
     const T: i64 = aurora_tile::TILE as i64;
     const TILE0: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
 
-    fn ok<V, E: std::fmt::Debug>(result: Result<V, E>) -> V {
+    pub(super) fn ok<V, E: std::fmt::Debug>(result: Result<V, E>) -> V {
         match result {
             Ok(value) => value,
             Err(err) => unreachable!("{err:?}"),
         }
     }
 
-    fn store_with_budget(budget: usize) -> (tempfile::TempDir, aurora_tile::TileStore) {
+    pub(super) fn store_with_budget(budget: usize) -> (tempfile::TempDir, aurora_tile::TileStore) {
         let dir = ok(tempfile::tempdir());
         let Some(budget) = std::num::NonZeroUsize::new(budget) else {
             unreachable!("non-zero budget");
@@ -80446,7 +80820,7 @@ mod occlusion_cull_tests {
         (dir, store)
     }
 
-    fn rect(x: i64, y: i64, width: u32, height: u32) -> aurora_core::Rect {
+    pub(super) fn rect(x: i64, y: i64, width: u32, height: u32) -> aurora_core::Rect {
         aurora_core::Rect {
             x,
             y,
@@ -80498,7 +80872,7 @@ mod occlusion_cull_tests {
 
     /// A pixel layer under `parent` (on top of its siblings) with `bounds`
     /// painted by `paint`.
-    fn layer(
+    pub(super) fn layer(
         layers: &mut aurora_doc::LayerTree,
         store: &mut aurora_tile::TileStore,
         parent: Option<aurora_doc::LayerId>,
@@ -80514,7 +80888,7 @@ mod occlusion_cull_tests {
     }
 
     /// An opaque, position-dependent colour.
-    fn opaque(x: i64, y: i64) -> [f32; 4] {
+    pub(super) fn opaque(x: i64, y: i64) -> [f32; 4] {
         [
             ((x * 7 + y * 3).rem_euclid(97)) as f32 / 97.0,
             ((x * 5 + y * 11).rem_euclid(89)) as f32 / 89.0,
@@ -80524,12 +80898,12 @@ mod occlusion_cull_tests {
     }
 
     /// A translucent, position-dependent colour.
-    fn translucent(x: i64, y: i64) -> [f32; 4] {
+    pub(super) fn translucent(x: i64, y: i64) -> [f32; 4] {
         let [r, g, b, _] = opaque(y, x);
         [r, g, b, ((x * 3 + y).rem_euclid(61)) as f32 / 61.0]
     }
 
-    fn full_tile() -> aurora_core::Rect {
+    pub(super) fn full_tile() -> aurora_core::Rect {
         rect(0, 0, aurora_tile::TILE, aurora_tile::TILE)
     }
 
@@ -80580,7 +80954,7 @@ mod occlusion_cull_tests {
         COMPOSITE_CULLED_FOLDS.with(std::cell::Cell::get)
     }
 
-    fn clear_shadow_cache() {
+    pub(super) fn clear_shadow_cache() {
         SHADOW_CACHE.with(|c| {
             if let Ok(mut c) = c.try_borrow_mut() {
                 *c = ShadowCache::default();
@@ -80616,7 +80990,7 @@ mod occlusion_cull_tests {
     }
 
     /// Every mismatching sample, as `(index, culled bits, uncull'd bits)`.
-    fn mismatches(culled: &[half::f16], plain: &[half::f16]) -> Vec<(usize, u16, u16)> {
+    pub(super) fn mismatches(culled: &[half::f16], plain: &[half::f16]) -> Vec<(usize, u16, u16)> {
         let mut out: Vec<(usize, u16, u16)> = culled
             .iter()
             .zip(plain)
@@ -80960,7 +81334,9 @@ mod occlusion_cull_tests {
     /// The Nyepi template's shape: an opaque full-canvas background, shapes
     /// with shadows in an opaque Pass Through group above it, an opaque
     /// photo panel over part of the canvas, and text-like small layers.
-    fn nyepi_shaped(store: &mut aurora_tile::TileStore) -> (aurora_doc::LayerTree, (u32, u32)) {
+    pub(super) fn nyepi_shaped(
+        store: &mut aurora_tile::TileStore,
+    ) -> (aurora_doc::LayerTree, (u32, u32)) {
         let (w, h) = (700_u32, 600_u32);
         let mut layers = aurora_doc::LayerTree::new();
         let _ = layer(&mut layers, store, None, rect(0, 0, w, h), &opaque);
@@ -81595,3 +81971,7 @@ mod occlusion_cull_tests {
         assert!(skipped > 0);
     }
 }
+
+#[cfg(test)]
+#[path = "background_composite_tests.rs"]
+mod background_composite_tests;

@@ -171,7 +171,10 @@ impl RemovedSubtree {
 /// (including `ids`, via `IdGenerator`'s own hand-written impl) needs to
 /// round-trip so a reloaded document keeps allocating fresh, non-
 /// colliding `LayerId`s rather than restarting the counter from `0`.
-#[derive(serde::Serialize, serde::Deserialize)]
+// `Clone` (0.186.0) is for the background compositor's read-only copy;
+// see `aurora_core::IdGenerator`'s own `Clone` for why a clone must never
+// be used to add layers.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "LayerTreeRepr")]
 pub struct LayerTree {
     ids: IdGenerator<Layer>,

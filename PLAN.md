@@ -26,7 +26,118 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.185.1): CI fixes for tests that depended on local
+**Latest (2026-10-11, 0.186.0): background CPU compositing, round R3 of
+the large-template performance plan (ADR 0012; review revision BG-1, BG-2,
+BG-3 and MEM-1 included).** A CPU-path recomposite of the view no longer runs
+in the redraw handler. It runs on one worker thread (`aurora-app`'s
+`background_composite`), and the canvas keeps showing finished work while
+it runs.
+- **Architecture: a mirrored store fed by content-version deltas.** The
+  worker owns its own `TileStore` (the *mirror*) and composites with the
+  unchanged `composite_roots_into_tile`. Each job carries:
+  - a `LayerTree` clone (new `Clone`, with `IdGenerator: Clone` documented as
+    read-only);
+  - only those tiles whose `content_version` changed since the last job
+    (`TileStore::held_tile_versions`), and only for surfaces the tree can
+    composite (`tree_surfaces`: layers and masks, BG-2).
+
+  Resident tiles are shared, not copied: `Tile` texels are
+  `Arc<Vec<f16>>`, copy-on-write (`TileStore::share_tile`/`insert_share`,
+  `TileShare`). Evicted tiles go as their encoded bytes. A structural edit
+  ships no tiles.
+- **Correctness.** `CompositeCache` gained an id, an invalidation stamp,
+  per-tile stamps for in-flight tiles, `unchanged_since`, and a per-tile
+  *displayed* stamp. A result installs as **current** only if all of these
+  hold: its generation is active, the cache id and store serial are the
+  current document's, the reference origin is unchanged, and nothing
+  invalidated that tile since dispatch.
+- **Superseded jobs (BG-3).** A result from a superseded job of the same
+  document (at most 4 are kept) installs as **provisional**: it is uploaded,
+  never marked current, and only if it is newer than what the tile already
+  shows (`install_provisional_tile`, `CompositeCache::shows_older_than`). A
+  continuous structural drag therefore keeps updating the canvas, and the
+  newest job still recomposites every provisional tile. A cancel (document
+  switch or close) drops them.
+- **App wiring (BG-1).** The worker's wake is `AppEvent::CompositeReady`.
+  `user_event` asks `app_event_requests_redraw` whether to redraw, and
+  `about_to_wait` calls the free `drain_background_composite_into`. The write
+  is `install_composited_tile`, shared with the synchronous path.
+- **Memory (MEM-1).** A pooled document's mirror joins the same
+  `ResidencyPool` (`TileStore::pool`). UI + mirror budgets are therefore
+  shares of one total (`max(floor, total / members)`), not two budgets. The
+  UI store shrinks to its new share lazily, plus one `EVICTION_BURST` at
+  mirror creation. Slack: one floor (256 tiles).
+- **Scheduling.**
+  - Up to `SYNC_TILE_LIMIT` = 3 uncovered stale tiles are still composited
+    synchronously (the brush's case, unchanged code). More go to the worker.
+  - A healthy job is left to finish; a job for another document, or with an
+    invalidated tile, is superseded.
+  - A document switch or close cancels the job and releases the mirror.
+  - Quit cancels and joins the worker first in `run_shutdown_cleanup`.
+- **Measured on Nyepi** (release, 40 view tiles, 4,021 source tiles; the
+  machine was shared with another worktree):
+
+  | step | UI-thread time | time to final pixels |
+  |---|---|---|
+  | first job, pool 16,384 (4,021 tiles shipped, encoded: an open leaves them pending) | **3.4 ms** | 8.2 s (sync, cold: 8.2–8.5 s) |
+  | first job, pool **2,048** (BG-2 measurement) | **3.2 ms** | 8.5 s |
+  | structural edit, 0 tiles shipped | **0.9–1.1 ms** | 3.06–3.15 s (0.185.0 warm sync: ~3.3 s) |
+  | dab, 1 stale tile, synchronous by design | 115–119 ms | the same |
+
+  Bit-identical to the synchronous composite on all 40 tiles. The dab row is
+  the same code as 0.185.0, plus at most one copy-on-write copy. It was not
+  A/B-timed against a 0.185.0 build.
+- **Memory measured (MEM-1).**
+  - Pool 16,384: shares 8,192 each. The UI holds only 40 resident tiles,
+    because an open leaves tiles encoded; the mirror holds 2,559 decoded
+    ones (1.3 GiB counted).
+  - Process RSS: 1,624 MiB loaded, 3,216 MiB after the first job, unchanged
+    over three more structural edits. That 1.6 GiB rise is the decoded
+    working set plus the worker's shadow cache. Before R3 the UI store
+    decoded the same working set itself.
+  - Pool 2,048: the mirror is held to its 1,024-tile share and RSS reaches
+    2,446 MiB, with final pixels 0.3 s slower.
+  - Peak UI + mirror resident: 2,599 and 1,064 tiles, both within
+    total + floor.
+- **Tests** (`background_composite_tests.rs`, 14 tests plus 2 ignored Nyepi
+  ones):
+  - equality with the synchronous composite: synthetic, evicted sources, a
+    24-file corpus subset, and Nyepi;
+  - mid-job events: a dab mid-job, a superseded generation (and its stale
+    tile under a newer stamp), an undo mid-job, a document switch and close,
+    and shutdown;
+  - deltas: a structural edit ships 0 tiles, a dab ships 1;
+  - **App wiring**: dispatch → `CompositeReady` → redraw → drain → install →
+    upload dirty mark, and a switch mid-job through the same drain;
+  - **drag**: 4 rapid bumps, each showing a new provisional tile, never
+    current;
+  - **pool bound**: the mirror is a pool member, UI + mirror ≤ total +
+    floor, still bit-identical while both page.
+
+  The waits are bounded so a failed assertion can't deadlock a test.
+- **Still synchronous:**
+  - up to 3 tiles per redraw: dabs and small pans; a dab tile on Nyepi still
+    costs ~115 ms of UI-thread time;
+  - the GPU fast path (unchanged);
+  - export, histogram and PSD-merged composites;
+  - an `.aur` open's install;
+  - reads of paged-out tiles that are no longer pending, at a first dispatch.
+
+  **Invariant §7.3.4 status:** it holds for whole-view CPU recomposites. It
+  does not hold for a dab's own tiles.
+- **Deferred:**
+  - rayon across tiles in the worker (R4);
+  - shipping paged-out tiles as paths the worker reads (BG-2, second half);
+  - keeping a mirror per document across switches (it is released on
+    each switch);
+  - a dirty-since set instead of the O(store) `held_tile_versions` scan
+    (BG-4);
+  - a tree view that cannot mint ids, instead of `IdGenerator: Clone` (BG-5);
+  - routing dabs on very expensive documents to the worker (a design
+    question);
+  - centre-first tile order.
+
+**Previously (2026-10-11, 0.185.1): CI fixes for tests that depended on local
 state (patch).** GitHub Actions failed on every OS in
 `occlusion_cull_tests::occlusion_cull_matches_uncull_on_the_psd_corpus`,
 with "corpus: 0 of 0 files compared" and then "the corpus exercises the
