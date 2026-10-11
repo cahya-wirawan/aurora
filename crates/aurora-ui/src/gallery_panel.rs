@@ -127,6 +127,9 @@ pub struct GalleryPanel {
     /// Toggle buttons (0.160.0, the tools panel's kind): off, on, and
     /// disabled-on. A click flips an enabled one.
     pub toggle_buttons: [WidgetId; 3],
+    /// Icon buttons (0.196.0, the Layers toolbar's kind): enabled,
+    /// hovered, pressed and disabled.
+    pub icon_buttons: [WidgetId; 4],
     /// The icon set (0.194.0), every icon in every tone: one wrapped row
     /// of [`IconKind::ALL`] per tone in [`IconTone::ALL`] order (so
     /// `icons[tone * IconKind::ALL.len() + kind]`), each under its
@@ -285,6 +288,7 @@ pub fn insert_gallery_panel(
     built
 }
 
+#[allow(clippy::too_many_lines)]
 fn build(
     tree: &mut WidgetTree<WidgetKind>,
     panel: PanelHandle,
@@ -369,6 +373,27 @@ fn build(
     let toggle_on = widgets::insert_toggle_button(tree, toggles, scales, "On", true)?;
     let toggle_disabled = widgets::insert_toggle_button(tree, toggles, scales, "Disabled", true)?;
     widgets::set_button_disabled(tree, toggle_disabled, true)?;
+    // Icon buttons (0.196.0): enabled, hovered, pressed, disabled.
+    let icon_button_row = widgets::insert_container(tree, right, toggle_row_style(scales))?;
+    let mut icon_buttons = [icon_button_row; 4];
+    for (slot, (name, kind)) in icon_buttons.iter_mut().zip([
+        ("Enabled", IconKind::NewLayer),
+        ("Hovered", IconKind::Group),
+        ("Pressed", IconKind::Adjustment),
+        ("Disabled", IconKind::Delete),
+    ]) {
+        *slot = widgets::insert_icon_button(
+            tree,
+            icon_button_row,
+            scales,
+            format!("Icon button: {name}"),
+            kind,
+            IconSize::Large,
+        )?;
+    }
+    widgets::set_button_hovered(tree, icon_buttons[1], true)?;
+    widgets::set_button_pressed(tree, icon_buttons[2], true)?;
+    widgets::set_button_disabled(tree, icon_buttons[3], true)?;
     let (icons, icon_captions) = insert_icon_sets(tree, right, scales)?;
     let tooltip = Tooltip::new(tree, button, scales, "A tooltip", GALLERY_TOOLTIP_DELAY)?;
 
@@ -391,6 +416,7 @@ fn build(
         curve,
         curve_caption,
         toggle_buttons: [toggle_off, toggle_on, toggle_disabled],
+        icon_buttons,
         icons,
         icon_captions,
         tooltip,
@@ -1050,7 +1076,9 @@ mod tests {
         // caption (one row) and its column gap, in the right column.
         // 776 since 0.194.0: plus the icon set, three captions each over
         // two wrapped lines of 14 icons (243 px), in the right column.
-        assert!((min - 776.0).abs() < f32::EPSILON, "{min}");
+        // 820 since 0.196.0: plus the icon-button row (a 32 px button
+        // and its 8 px row padding) and its column gap, in the right column.
+        assert!((min - 820.0).abs() < f32::EPSILON, "{min}");
         let last_row_vs_body = |height: f32| {
             let (ws, g, _) = opened(height);
             // The taller column's last widget: since 0.133.1 stopped the
@@ -1126,7 +1154,7 @@ mod tests {
         );
         #[allow(clippy::cast_precision_loss)]
         let min = (body.y + i64::from(content)) as f32;
-        assert!((min - 776.0).abs() < f32::EPSILON, "measured minimum {min}");
+        assert!((min - 820.0).abs() < f32::EPSILON, "measured minimum {min}");
     }
 
     /// Red-team RT-4 / critic C12, disclosed rather than fixed: the

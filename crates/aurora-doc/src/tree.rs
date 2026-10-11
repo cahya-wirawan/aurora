@@ -887,6 +887,29 @@ impl LayerTree {
         )
     }
 
+    /// [`Self::add_group`], but inserted at sibling position `index` of
+    /// `parent` (or of the roots), clamped like
+    /// [`Self::add_pixel_layer_at`] (0.196.0, New Group).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::add_group`].
+    pub fn add_group_at(
+        &mut self,
+        name: impl Into<String>,
+        parent: Option<LayerId>,
+        index: usize,
+    ) -> Result<LayerId, DocError> {
+        self.insert(
+            name.into(),
+            parent,
+            LayerKind::Group {
+                children: Vec::new(),
+            },
+            index,
+        )
+    }
+
     /// Adds an adjustment layer (0.155.0) at position `index` among
     /// `parent`'s children (`0` is the top), clamped exactly as
     /// [`Self::add_pixel_layer_at`] clamps it. An adjustment layer has no

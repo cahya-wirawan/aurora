@@ -1333,6 +1333,72 @@ fn clip_mesh(mesh: &Mesh, rect: Rect) -> Mesh {
     out
 }
 
+/// An icon button (0.196.0, `widgets::button`'s doc comment): no fill or
+/// outline at rest; a pressed button is tinted with `state.active_overlay`,
+/// a hovered one with `state.hover_overlay` (never while disabled); the
+/// icon is centred, `icon.default` or, when disabled, `icon.disabled`.
+/// `tint_mesh` is the button's rounded rectangle.
+#[allow(clippy::too_many_arguments)]
+fn paint_icon_button(
+    state: &ButtonState,
+    kind: crate::icons::IconKind,
+    size: crate::widgets::IconSize,
+    bounds: Rect,
+    tint_mesh: Mesh,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    let mut paints = Vec::new();
+    let overlay = if state.disabled {
+        None
+    } else if state.pressed {
+        Some(theme.state.active_overlay)
+    } else if state.hovered {
+        Some(theme.state.hover_overlay)
+    } else {
+        None
+    };
+    if let Some(overlay) = overlay {
+        let [r, g, b] = overlay.color.to_srgb_f32();
+        paints.push((tint_mesh, [r, g, b, overlay.alpha]));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let side = crate::widgets::icon_side(scales, size).round().max(1.0) as u32;
+    let icon_state = IconState {
+        kind,
+        tone: if state.disabled {
+            IconTone::Disabled
+        } else {
+            IconTone::Default
+        },
+        access: crate::widgets::IconAccess::Decorative,
+    };
+    let x = bounds.x + (i64::from(bounds.width) - i64::from(side)) / 2;
+    let y = bounds.y + (i64::from(bounds.height) - i64::from(side)) / 2;
+    let icon_rect = Rect {
+        x,
+        y,
+        width: side,
+        height: side,
+    };
+    // A clipped button draws no icon rather than a spilled one.
+    if icon_rect.x >= bounds.x
+        && icon_rect.y >= bounds.y
+        && icon_rect.x + i64::from(side) <= bounds.x + i64::from(bounds.width)
+        && icon_rect.y + i64::from(side) <= bounds.y + i64::from(bounds.height)
+    {
+        paints.extend(paint_icon(
+            &icon_state,
+            icon_rect,
+            icon_rect,
+            theme,
+            scale_factor,
+        )?);
+    }
+    Ok(paints)
+}
+
 fn paint_button(
     state: &ButtonState,
     bounds: Rect,
@@ -1349,6 +1415,9 @@ fn paint_button(
     );
     let tolerance = tolerance_for_scale_factor(scale_factor);
     let mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
+    if let Some((kind, size)) = state.icon {
+        return paint_icon_button(state, kind, size, bounds, mesh, theme, scales, scale_factor);
+    }
 
     // No hover flag exists on `ButtonState` yet (`widgets::button`'s own
     // doc comment), so only the two states it actually tracks are
@@ -7243,5 +7312,68 @@ mod tests {
             ok(tree.remove(button));
             assert_eq!(FocusPaint::resolve(&tree, &focus), None, "stale focus");
         }
+    }
+
+    /// 0.196.0: an icon button is flat at rest (the icon alone), tinted
+    /// with `state.hover_overlay` when hovered and `state.active_overlay`
+    /// when pressed, and never tinted while disabled.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn an_icon_button_tints_on_hover_and_press_and_only_when_enabled() {
+        let theme = dark_theme();
+        let scales = crate::widgets::test_scales();
+        let (mut tree, root) = crate::widgets::new_tree(taffy::Style::default());
+        let Ok(id) = crate::widgets::insert_icon_button(
+            &mut tree,
+            root,
+            &scales,
+            "New layer",
+            crate::icons::IconKind::NewLayer,
+            crate::widgets::IconSize::Large,
+        ) else {
+            unreachable!("root exists");
+        };
+        tree.compute_layout(200.0, 200.0);
+        let paints =
+            |tree: &WidgetTree<WidgetKind>| match paint_widget(tree, id, &theme, &scales, 1.0) {
+                Ok(paints) => paints,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        let rest = paints(&tree);
+        assert!(!rest.is_empty(), "the icon is drawn");
+        let tint = |paints: &[Paint]| paints.len() - rest.len();
+        if let Err(err) = crate::widgets::set_button_hovered(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        let hovered = paints(&tree);
+        assert_eq!(tint(&hovered), 1, "one tint shape");
+        assert!(
+            hovered
+                .first()
+                .is_some_and(|p| (p.1[3] - theme.state.hover_overlay.alpha).abs() < 1e-6)
+        );
+        if let Err(err) = crate::widgets::set_button_pressed(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        let pressed = paints(&tree);
+        assert!(
+            pressed
+                .first()
+                .is_some_and(|p| (p.1[3] - theme.state.active_overlay.alpha).abs() < 1e-6)
+        );
+        if let Err(err) = crate::widgets::set_button_disabled(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        let disabled = paints(&tree);
+        assert_eq!(
+            tint(&disabled),
+            0,
+            "no tint while disabled, even if hovered"
+        );
+        let [r, g, b] = theme.icon.disabled.to_srgb_f32();
+        assert!(
+            disabled.first().is_some_and(|p| p.1 == [r, g, b, 1.0]),
+            "the icon is icon.disabled"
+        );
     }
 }

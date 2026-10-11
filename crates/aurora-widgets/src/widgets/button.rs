@@ -12,15 +12,30 @@
 //! toggle is painted like a push button (`accent.primary`, label in
 //! `text.on_accent`); an "off" one has no fill, only the control outline,
 //! with its label in `text.primary` — both pairs already gated by
-//! `design/check_contrast.py`. No hover state exists for any button yet.
+//! `design/check_contrast.py`. No hover state exists for a text button yet.
+//!
+//! **Icon buttons (0.196.0, Layers panel round L3).** A button built with
+//! [`insert_icon_button`] shows one picture from [`crate::icons`] instead
+//! of a label (the label is its accessible name only, never drawn) and is
+//! the Photoshop-style flat tool button: no fill and no outline at rest,
+//! the icon alone in `icon.default` (`icon.disabled` when disabled); a
+//! [hovered](set_button_hovered) one is tinted with `state.hover_overlay`,
+//! a pressed one with `state.active_overlay` (both existing tokens, drawn
+//! over whatever surface it sits on), and focus draws the ordinary
+//! button focus ring. It is otherwise an ordinary [`ButtonState`] — the
+//! same press, activation, disabled and accessibility behaviour — so it
+//! is one `Tab` stop and `Space`/`Enter` and an assistive technology's
+//! `Click` activate it. Hover is app-driven: nothing in the widget layer
+//! tracks the pointer, so the owner calls [`set_button_hovered`].
 
 use accesskit::{Action, Node, Role, Toggled};
 use aurora_theme::Scales;
 use taffy::style_helpers::length;
 use taffy::{Rect as LayoutRect, Style};
 
-use super::{WidgetKind, spacing};
+use super::{IconSize, WidgetKind, icon_side, spacing};
 use crate::error::WidgetError;
+use crate::icons::IconKind;
 use crate::tree::{WidgetId, WidgetTree};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +46,16 @@ pub struct ButtonState {
     /// `None` for a push button; `Some(on)` for a toggle button
     /// ([`insert_toggle_button`]).
     pub toggled: Option<bool>,
+    /// `Some` for an icon button ([`insert_icon_button`], 0.196.0): the
+    /// picture drawn instead of the label.
+    pub icon: Option<(IconKind, IconSize)>,
+    /// Whether the pointer is over the button, as the owner last said
+    /// ([`set_button_hovered`], 0.196.0). Only an icon button paints it.
+    pub hovered: bool,
+    /// An accessible description (0.196.0): what a tooltip would say, and
+    /// what a screen reader reads after the name — an icon button's
+    /// purpose, or why it is disabled ([`set_button_description`]).
+    pub description: Option<String>,
 }
 
 impl ButtonState {
@@ -48,6 +73,9 @@ fn node(state: &ButtonState) -> Node {
     node.set_label(state.label.clone());
     if let Some(on) = state.toggled {
         node.set_toggled(if on { Toggled::True } else { Toggled::False });
+    }
+    if let Some(description) = &state.description {
+        node.set_description(description.clone());
     }
     if state.disabled {
         node.set_disabled();
@@ -86,6 +114,9 @@ pub fn insert_button(
         pressed: false,
         disabled: false,
         toggled: None,
+        icon: None,
+        hovered: false,
+        description: None,
     };
     tree.insert(
         parent,
@@ -113,6 +144,9 @@ pub fn insert_toggle_button(
         pressed: false,
         disabled: false,
         toggled: Some(on),
+        icon: None,
+        hovered: false,
+        description: None,
     };
     // One control row plus its vertical padding, text-blind or measured
     // alike (`measure::measure_widget` gives the same height), so a
@@ -125,6 +159,108 @@ pub fn insert_toggle_button(
         node(&state),
         WidgetKind::Button(state),
     )
+}
+
+/// Adds a new **icon** button as the last child of `parent` — see this
+/// module's own doc comment. `label` is its accessible name (and what a
+/// screen reader announces); it is never drawn. The button is square: the
+/// icon's side ([`icon_side`] for `size`) plus `spacing.xxs` on every side,
+/// fixed, never shrinking.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `parent` doesn't exist.
+pub fn insert_icon_button(
+    tree: &mut WidgetTree<WidgetKind>,
+    parent: WidgetId,
+    scales: &Scales,
+    label: impl Into<String>,
+    kind: IconKind,
+    size: IconSize,
+) -> Result<WidgetId, WidgetError> {
+    let state = ButtonState {
+        label: label.into(),
+        pressed: false,
+        disabled: false,
+        toggled: None,
+        icon: Some((kind, size)),
+        hovered: false,
+        description: None,
+    };
+    let side = icon_button_side(scales, size);
+    let mut icon_style = style(scales);
+    icon_style.padding = LayoutRect {
+        left: taffy::style_helpers::zero(),
+        right: taffy::style_helpers::zero(),
+        top: taffy::style_helpers::zero(),
+        bottom: taffy::style_helpers::zero(),
+    };
+    icon_style.size = taffy::Size {
+        width: length(side),
+        height: length(side),
+    };
+    icon_style.flex_shrink = 0.0;
+    tree.insert(parent, icon_style, node(&state), WidgetKind::Button(state))
+}
+
+/// The side of an icon button for `size`: the icon plus `spacing.xxs` of
+/// room on each side for its hover and pressed tint.
+#[must_use]
+pub fn icon_button_side(scales: &Scales, size: IconSize) -> f32 {
+    icon_side(scales, size) + 2.0 * spacing(scales.spacing.xxs)
+}
+
+/// Sets (or clears) `id`'s accessible description, returning whether
+/// anything changed.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it isn't a button.
+pub fn set_button_description(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    description: Option<&str>,
+) -> Result<bool, WidgetError> {
+    match tree.payload(id) {
+        Some(WidgetKind::Button(state)) if state.description.as_deref() == description => {
+            return Ok(false);
+        }
+        Some(WidgetKind::Button(_)) => {}
+        Some(_) => return Err(WidgetError::WrongWidgetKind(id)),
+        None => return Err(WidgetError::UnknownWidget(id)),
+    }
+    with_button_mut(tree, id, |state| {
+        state.description = description.map(str::to_owned);
+        Ok(())
+    })?;
+    Ok(true)
+}
+
+/// Sets whether the pointer is over `id` (a button), returning whether
+/// anything changed. Painting only — no accessibility node changes, and a
+/// disabled button may be told too (it paints no tint while disabled).
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it isn't a button.
+pub fn set_button_hovered(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    hovered: bool,
+) -> Result<bool, WidgetError> {
+    match tree.payload(id) {
+        Some(WidgetKind::Button(state)) if state.hovered == hovered => return Ok(false),
+        Some(WidgetKind::Button(_)) => {}
+        Some(_) => return Err(WidgetError::WrongWidgetKind(id)),
+        None => return Err(WidgetError::UnknownWidget(id)),
+    }
+    with_button_mut(tree, id, |state| {
+        state.hovered = hovered;
+        Ok(())
+    })?;
+    Ok(true)
 }
 
 /// Sets toggle button `id` on or off, returning whether anything changed.
@@ -252,6 +388,9 @@ mod tests {
                 pressed: false,
                 disabled: false,
                 toggled: None,
+                icon: None,
+                hovered: false,
+                description: None,
             }))
         );
         let Some(accessibility) = tree.accessibility(id) else {
@@ -414,5 +553,64 @@ mod tests {
             set_button_toggled(&mut tree, id, true),
             Err(WidgetError::WrongWidgetKind(wrong)) if wrong == id
         ));
+    }
+
+    /// 0.196.0: an icon button is a named, focusable, clickable button
+    /// that draws no label; hover and description are state, not tree
+    /// shape, and survive every other mutation.
+    #[test]
+    fn an_icon_button_is_a_named_button_with_a_description_that_survives_state_changes() {
+        use super::{
+            icon_button_side, insert_icon_button, set_button_description, set_button_hovered,
+        };
+        use crate::icons::IconKind;
+        use crate::widgets::IconSize;
+        let scales = test_scales();
+        let (mut tree, root) = new_tree(Style::default());
+        let Ok(id) = insert_icon_button(
+            &mut tree,
+            root,
+            &scales,
+            "Delete layer",
+            IconKind::Delete,
+            IconSize::Large,
+        ) else {
+            unreachable!("root exists");
+        };
+        let node = |tree: &WidgetTree<WidgetKind>| tree.accessibility(id).cloned();
+        let Some(node0) = node(&tree) else {
+            unreachable!("inserted");
+        };
+        assert_eq!(node0.role(), accesskit::Role::Button);
+        assert_eq!(node0.label(), Some("Delete layer"));
+        assert!(node0.supports_action(Action::Focus) && node0.supports_action(Action::Click));
+        assert!(matches!(
+            set_button_description(&mut tree, id, Some("why")),
+            Ok(true)
+        ));
+        assert!(matches!(
+            set_button_description(&mut tree, id, Some("why")),
+            Ok(false)
+        ));
+        assert!(matches!(set_button_hovered(&mut tree, id, true), Ok(true)));
+        assert!(matches!(set_button_hovered(&mut tree, id, true), Ok(false)));
+        if let Err(err) = set_button_disabled(&mut tree, id, true) {
+            unreachable!("{err:?}");
+        }
+        let Some(node1) = node(&tree) else {
+            unreachable!("inserted");
+        };
+        assert_eq!(
+            node1.description(),
+            Some("why"),
+            "kept across a state change"
+        );
+        assert!(node1.is_disabled() && !node1.supports_action(Action::Click));
+        tree.compute_layout(200.0, 200.0);
+        let side = icon_button_side(&scales, IconSize::Large);
+        let Some(bounds) = tree.bounds(id) else {
+            unreachable!("laid out");
+        };
+        assert_eq!((bounds.width as f32, bounds.height as f32), (side, side));
     }
 }

@@ -4118,6 +4118,52 @@ mod tests {
         );
     }
 
+    /// 0.196.0: a group born Pass Through (`History::add_group_at`) round
+    /// trips through `.aur`, in the tree and in the replayed journal.
+    #[test]
+    fn round_trips_a_group_created_pass_through_by_add_group_at() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let Ok(base) = history.add_pixel_layer(&mut layers, "Base", bounds(), None) else {
+            unreachable!("root exists");
+        };
+        let group =
+            match history.add_group_at(&mut layers, "Group 1", None, 0, BlendMode::PassThrough) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (20, 15),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir2, mut fresh_store) = real_tile_store();
+        bytes.set_position(0);
+        let super::AurDocument {
+            layers: restored,
+            history: restored_history,
+            ..
+        } = match read(bytes, &mut fresh_store) {
+            Ok(result) => result,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(restored.roots(), &[group, base]);
+        assert_eq!(restored.blend_mode(group), Some(BlendMode::PassThrough));
+        let replayed = match restored_history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(replayed.blend_mode(group), Some(BlendMode::PassThrough));
+    }
+
     // -- 0.149.0: mask density ------------------------------------------
 
     /// A two-mask document (a pixel layer at density 0.5, a group at 0.0)

@@ -26,7 +26,76 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-11, 0.195.1): CI fix for a timing-dependent test (patch).** GitHub Actions (Ubuntu) failed on
+**Latest (2026-10-11, 0.196.0): round L3 of the Photoshop-style Layers panel — the bottom
+toolbar and a New Group command. Nobody has seen this toolbar in the live window on the Mac
+(or anywhere but a headless render at scale 2 and the unit tests).**
+Series status: L1 icons (0.194.0) done, L2 rows and controls (0.195.0) done, **L3 toolbar +
+New Group (this round) done**; next **L4** layer thumbnails (async, from tiles) and **L5**
+Lock (model + UI) and the Kind filter; Channels/Paths tabs later.
+- **The toolbar** (`aurora_ui::layer_toolbar`, `Workspace::layer_toolbar`): a `Role::Toolbar`
+  "Layer actions" row, the last child of the Layers panel's root (below the list, so
+  `populate_layers_panel` never clears it; hidden with the body on collapse), right-aligned,
+  seven icon buttons in the reference's order — Link, Fx, Mask, Adjustment, Group, New Layer,
+  Delete — `IconSize::Large` icons from `IconKind`, tone Default (Disabled when disabled).
+  Each is a real `Button` (own Tab stop, Space/Enter, click, AT `Click`). **Enabled:** New
+  Layer (existing New Layer), Delete (existing Delete Layer; disabled by the same rule the
+  command refuses by — `delete_allowed`: no active node, or no pixel layer would remain),
+  Adjustment (New Curves Layer), Group (New Group). **Disabled placeholders (design owner):**
+  Link, Fx, Mask — no `Click`/`Focus` action, never run anything (`layer_action_command` maps
+  them to `None` as a second guard), each with a description saying why ("Layer masks can't
+  be added from here yet", ...). Disabled buttons are not Tab stops, so the order is list ->
+  Adjustment -> Group -> New Layer (-> Delete when enabled) -> the Properties/History tabs.
+- **Icon button** (`aurora-widgets`): no new widget kind. `ButtonState` gained `icon`,
+  `hovered` and `description`; `insert_icon_button`, `set_button_hovered`,
+  `set_button_description`, `icon_button_side` (icon + `spacing.xxs` each side). Flat at rest;
+  `state.hover_overlay` when hovered, `state.active_overlay` when pressed (existing tokens,
+  first use), none while disabled; `icon.default`/`icon.disabled`; the ordinary button focus
+  ring. Hover is app-driven (`update_toolbar_hover` on pointer moves). Widget Gallery shows four:
+  enabled, hovered, pressed, disabled (its pinned minimum height 776 -> 820).
+- **New Group** (palette "New Group", macOS Layer menu, the toolbar button; no shortcut):
+  an empty "Group N" (`next_numbered_name`, one past the highest "Group n") directly above the
+  active node (above a group, never inside it — `new_layer_placement`), made active, **one undo
+  step**, History row `Added group "Group N"`. **Pass Through from its first moment:** new
+  `LayerTree::add_group_at` and `History::add_group_at(tree, name, parent, index, blend_mode)`
+  record the group with its blend mode in the **same** journal `Restore` (the captured entry
+  carries `blend_mode`), so **no new `LayerOp` variant** and no journal-format change; undo and
+  redo go through the existing `RemoveById`/`Restore` pair, which re-captures the mode; a `.aur`
+  round-trips it (tree and replayed journal; test in `aurora-io`). `add_group` is unchanged
+  (Normal). The journal description says "Added group" when the restored root is a group.
+  A childless Pass Through group shows no blend label (L2 rule); its Fill slider is disabled
+  (existing rule).
+- **Panel floor:** the toolbar row is 40 px (a 32 px button, `spacing.xxs` row padding), never
+  shrinks and joins `refresh_panel_floor`, so the rail floor with the Curves strip and the
+  controls strip went **250 -> 290 px** (the empty Layers panel 42 -> 82 px; its content cap
+  gains 40 px). Seven buttons with no gap fit the default 250 px rail (a gap would not).
+- **Tests:** 3,667 workspace tests pass with `AURORA_REQUIRE_GPU=1` on the RTX 3090 (0 failed, 75 ignored; 3,648 before this round). New: toolbar order/icons/names/descriptions, placeholders
+  disabled with reasons and no actions, Delete sync and its description, survives
+  repopulation and a command with focus kept, floor/layout/right-alignment/collapse, Tab order,
+  hover; icon-button widget and paint tests; New Group (Pass Through, placement, group-active,
+  numbering, undo/redo, History row, controls); every enabled button by a real pointer click
+  -> its action -> one undo step with the right row and active node; placeholders do nothing
+  on click, key or AT click; AT `Click` and `Enter` on an enabled button; Delete disabled for
+  the last pixel layer; `.aur` round-trip. Pinned numbers updated knowingly (gallery 820,
+  floors, History rows 40 -> 38, Layers/History tab-order and focus-order tests).
+- **Mutations (each killed, restored, sha256 checked):** New Group creating a Normal group
+  (`new_group_is_pass_through_...`); the Group button wired to New Layer
+  (`every_enabled_toolbar_button_click_...`); Delete enabled for the last layer
+  (`delete_is_disabled_for_the_last_pixel_layer_...` and the existing refusal test); a
+  placeholder running a command (`disabled_placeholders_do_nothing_...`).
+- **Not done / disclosed:** **No visible hover tooltip.** The toolkit's `Tooltip` hangs below
+  its owner at the owner's width, which cannot hold these sentences at the bottom edge of the
+  rail; the text is each button's accessible description (a screen reader reads it) and
+  `LayerAction::description`. A placement option on `Tooltip` is the follow-up. Hover tint and
+  focus ring were seen only in the headless render (hover on Group) — not on the Mac, not with a
+  screen reader. The per-iteration toolbar sync walks the layer list once (`delete_allowed`,
+  O(layers)); `nyepi_layers_panel_populate` still reads ~1.1 ms (277 rows). No design tokens
+  added; the toolbar reuses `state.hover_overlay`/`active_overlay`, `icon.*`, `spacing.xxs`
+  (whose contrast over the panel is unchecked — `design/check_contrast.py` gates `icon.*` only).
+  Panel PNG: `layers-panel.png` (scale 2) from `write_layers_panel_png`.
+
+Review notes (0.196.0): (1) A New Group is a visible, childless Pass Through group, and a visible group refuses the GPU fast path (0.179.0), so one toolbar click moves the whole document to the CPU path (slower, same pixels, now backgrounded). Whether an *empty* group may be exempt from that refusal was not checked: a follow-up. (2) The hover tint can stay after a dialog or palette opens, or the window loses focus, with the pointer parked on a button, until the next pointer move (cosmetic). (3) The fit of seven buttons in the default 250 px rail holds for the shipped scales only. (4) The hover and pressed overlays on the panel are not covered by `check_contrast.py`. (5) The reviewer could not diff the pinned-test edits and did not check crash-recovery replay at app level.
+
+**Previously (2026-10-11, 0.195.1): CI fix for a timing-dependent test (patch).** GitHub Actions (Ubuntu) failed on
 `document_tabs_tests::a_composite_is_bit_identical_at_a_thrashing_budget_and_a_roomy_pooled_one` with
 "the small store paged". The test asserted `faults > 0` after re-reading evicted tiles, but a re-read is a
 page-in from the scratch disk (`faults`) only once the background writer has landed the tile; before that
