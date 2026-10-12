@@ -479,7 +479,7 @@ type TexelFor<'a> = dyn FnMut(usize, usize, &[f16]) -> Option<Texel> + 'a;
 /// marking the changed rectangle dirty. `pixels` yields tile-local `(x, y)`.
 /// Returns whether anything changed.
 ///
-/// **Plan first, write second (0.209.2).** The changes are worked out
+/// **Plan first, write second (0.209.1).** The changes are worked out
 /// against a read-only view of the tile (a tile the store does not hold is
 /// all zeros and is *not* created to look at it); only when at least one
 /// texel really differs is the tile acquired for writing

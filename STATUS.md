@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-12, version 0.209.0.** This file is updated every round (every
+**As of 2026-10-12, version 0.209.1.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -87,7 +87,7 @@ golden-image tests are `#[ignore]`d.
   management; the colours are not saved across sessions). No tooltip yet. **Never seen by a human, nor on the Mac; the five new icons
   (marquee, zoom in, hand, eyedropper, eraser) are provisional.** The options
   bar shows the active tool's options: the radius for Brush and Eraser;
-  since 0.209.0 Linear/Radial, Reverse and Opacity for the Gradient (`G`) and
+  since 0.209.0 Radial, Reverse and Opacity for the Gradient (`G`) and
   Tolerance and Contiguous for the Paint Bucket (`Shift+G`). Both fill the
   active pixel layer with the foreground/background colours, as one undo step,
   ignoring selections (as the Brush does), the Gradient committing on release

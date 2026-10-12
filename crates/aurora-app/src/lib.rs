@@ -11747,7 +11747,7 @@ fn record_stroke(
 
 /// The `(start, end)` document points of a Gradient drag that is ending, or
 /// `None` for any other drag. [`App::handle_pointer_released`] applies the
-/// gradient from it (0.209.2): **by any button's release and after a tool
+/// gradient from it (0.209.1): **by any button's release and after a tool
 /// switch mid-drag** — a Gradient drag that began stays a Gradient drag
 /// whatever `App::tool` has become, because the gesture is the drag, not the
 /// tool. (A second press, the pointer leaving the window and a lost focus
@@ -25151,7 +25151,7 @@ enum LockRefusal {
     /// (0.209.0; not a lock, it rides the same calm notice).
     FillTooLarge,
     /// A fill with no pixel layer to fill: none is active, or the active
-    /// layer is a group or an adjustment layer (0.209.2).
+    /// layer is a group or an adjustment layer (0.209.1).
     FillNeedsPixelLayer,
 }
 
