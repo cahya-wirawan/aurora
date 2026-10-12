@@ -1094,10 +1094,11 @@ fn colour_overlays_are_reported_only_on_groups() {
     }
 }
 
-/// Review of 0.181.0: a clipped layer's colour overlay is drawn, but the
-/// layer is shown unclipped, so the open report says so specifically.
+/// Review of 0.181.0, revised in 0.201.0: a clipped layer's colour overlay
+/// is drawn and the layer is now clipped to its base, so the open report no
+/// longer says it is shown unclipped.
 #[test]
-fn overlays_on_clipped_layers_are_reported_as_drawn_unclipped() {
+fn overlays_on_clipped_layers_are_no_longer_reported_as_unclipped() {
     let block = effects_block(&[(b"SoFi", V::Obj(vec![]))]);
     let doc = open(
         &TestPsd::new(1, 2, 2, 8)
@@ -1115,13 +1116,13 @@ fn overlays_on_clipped_layers_are_reported_as_drawn_unclipped() {
             .write(),
     );
     let items = doc.report.items.join("\n");
-    assert!(
-        items.contains(
-            "1 colour overlay, drop shadow or stroke on clipped layers is drawn unclipped"
-        ),
-        "only the clipped layer's: {items}"
-    );
+    assert!(!items.contains("unclipped"), "{items}");
     assert!(!items.contains("isn't shown yet"), "{items}");
+    let clipped = find(&doc.layers, "clipped");
+    assert_eq!(
+        clipped.and_then(|id| doc.layers.clip_base(id)),
+        find(&doc.layers, "base")
+    );
     // The effects data itself is untouched (E7 writes it back).
     let fx = find(&doc.layers, "clipped").and_then(|id| doc.layers.effects(id));
     assert_eq!(
@@ -1202,8 +1203,8 @@ fn uglg_uses_resource_1037_not_local_angle() {
 
 /// 0.190.0: a pixel layer's solid-colour stroke is drawn, so it is not
 /// "not shown"; a gradient or pattern stroke never is, and neither is any
-/// stroke on a group (E9). A clipped layer's stroke is reported as drawn
-/// unclipped. The PSD-save report still itemises a layer whose only
+/// stroke on a group (E9). A clipped layer's stroke is drawn within its clip
+/// (0.201.0). The PSD-save report still itemises a layer whose only
 /// effect is an undrawn stroke.
 #[test]
 fn stroke_notes_on_open_and_psd_save() {
@@ -1233,12 +1234,7 @@ fn stroke_notes_on_open_and_psd_save() {
         items.contains("2 gradient, pattern or other non-solid stroke effects aren't shown"),
         "{items}"
     );
-    assert!(
-        items.contains(
-            "1 colour overlay, drop shadow or stroke on clipped layers is drawn unclipped"
-        ),
-        "{items}"
-    );
+    assert!(!items.contains("unclipped"), "{items}");
     // A group's stroke is not shown, whatever its fill.
     let doc = open(
         &TestPsd::new(1, 2, 2, 8)

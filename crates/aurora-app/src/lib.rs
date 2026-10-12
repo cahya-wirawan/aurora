@@ -5353,6 +5353,10 @@ enum AppCommand {
     /// shortcut (see [`default_shortcuts`]); reachable from the command
     /// palette and the macOS `Layer` menu.
     DeleteLayer,
+    /// Toggle the active layer's clipping mask (0.201.0), Photoshop's
+    /// `Alt+Ctrl+G` (`Cmd+Alt+G` on macOS) — handed back as
+    /// [`ActivatedCommand::ToggleClip`].
+    ToggleClippingMask,
     /// Next/Previous Document (0.172.0), `Ctrl+Tab`/`Ctrl+Shift+Tab`.
     NextDocument,
     PreviousDocument,
@@ -5401,6 +5405,8 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         // bare `Delete`/`Backspace` would collide with a focused text
         // field's own editing and with a future "clear selection".
         ("Primary+Shift+N", AppCommand::NewLayer),
+        // 0.201.0: Photoshop's Create/Release Clipping Mask chord.
+        ("Primary+Alt+G", AppCommand::ToggleClippingMask),
         // 0.172.0: the browser and editor convention for cycling open
         // documents. The registry matches whole chords exactly, so these
         // never collide with plain `Tab`/`Shift+Tab` focus traversal.
@@ -5576,6 +5582,12 @@ enum ActivatedCommand {
     /// toolbar only, no shortcut. Run by [`perform_layer_command`] as
     /// [`LayerCommand::NewGroup`].
     NewGroup,
+    /// Create (`true`) or Release (`false`) Clipping Mask (0.201.0):
+    /// palette and the macOS `Layer` menu. Run as [`LayerCommand::SetClip`].
+    SetClip(bool),
+    /// The `Alt+Ctrl+G` toggle (0.201.0): creates the active layer's
+    /// clipping mask, or releases it when it has one.
+    ToggleClip,
     /// A keyboard panel move (0.166.0, [`PANEL_MOVE_COMMANDS`]) —
     /// returned because rebuilding a tab group needs `App`'s `Scales`.
     /// Run by [`run_panel_move`].
@@ -5735,6 +5747,8 @@ const COMMAND_LAYER_NEW: &str = "layer.new";
 const COMMAND_LAYER_DELETE: &str = "layer.delete";
 const COMMAND_LAYER_NEW_CURVES: &str = "layer.new_curves";
 const COMMAND_LAYER_NEW_GROUP: &str = "layer.new_group";
+const COMMAND_LAYER_CLIP_CREATE: &str = "layer.clip_create";
+const COMMAND_LAYER_CLIP_RELEASE: &str = "layer.clip_release";
 
 /// The command palette's own, real content: one command per docked
 /// panel, focusing it; one more per panel, toggling its own
@@ -5800,6 +5814,8 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_LAYER_DELETE, "Delete Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_CURVES, "New Curves Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_GROUP, "New Group"),
+        CommandEntry::new(COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
+        CommandEntry::new(COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),
     ];
     commands.extend(
         PANEL_MOVE_COMMANDS
@@ -5987,6 +6003,12 @@ fn activate_command(
     }
     if id == COMMAND_LAYER_NEW_GROUP {
         return Some(ActivatedCommand::NewGroup);
+    }
+    if id == COMMAND_LAYER_CLIP_CREATE {
+        return Some(ActivatedCommand::SetClip(true));
+    }
+    if id == COMMAND_LAYER_CLIP_RELEASE {
+        return Some(ActivatedCommand::SetClip(false));
     }
     tracing::warn!(command = id, "unknown command activated");
     None
@@ -9087,6 +9109,18 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(COMMAND_LAYER_DELETE, "Delete Layer", true, None),
             &muda::MenuItem::with_id(COMMAND_LAYER_NEW_CURVES, "New Curves Layer", true, None),
             &muda::MenuItem::with_id(COMMAND_LAYER_NEW_GROUP, "New Group", true, None),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_CLIP_CREATE,
+                "Create Clipping Mask",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_CLIP_RELEASE,
+                "Release Clipping Mask",
+                true,
+                None,
+            ),
         ],
     ) {
         Ok(submenu) => submenu,
@@ -9753,7 +9787,9 @@ fn run_command(
         }
         // Never run here (`handle_key` hands both back; `perform_layer_command`
         // runs them). `Everything`, never `None`, per the trap named above.
-        AppCommand::NewLayer | AppCommand::DeleteLayer => CompositeInvalidation::Everything,
+        AppCommand::NewLayer | AppCommand::DeleteLayer | AppCommand::ToggleClippingMask => {
+            CompositeInvalidation::Everything
+        }
         // Handed back as `ActivatedCommand::Document` by `handle_key`, so
         // never run here; nothing in this document changes either way.
         AppCommand::NextDocument | AppCommand::PreviousDocument | AppCommand::CloseDocument => {
@@ -10277,6 +10313,9 @@ fn handle_key(
         }
         if command == AppCommand::DeleteLayer {
             return Some(ActivatedCommand::DeleteLayer);
+        }
+        if command == AppCommand::ToggleClippingMask {
+            return Some(ActivatedCommand::ToggleClip);
         }
         if command == AppCommand::CloseDocument {
             return Some(ActivatedCommand::Document(
@@ -13694,26 +13733,24 @@ fn resolve_tile(
             // pinned by
             // `composite_layer_into_folded_matches_hand_computed_golden_values`.)
             let mut isolated = aurora_render::transparent_tile();
-            for &child_id in children.iter().rev() {
-                if budget.is_exhausted() {
-                    break;
-                }
-                // Through `fold_layer_into` (0.155.0) rather than
-                // `resolve_tile` + `composite_layer_into` directly, so an
-                // adjustment child sees exactly the siblings below it in
-                // this group's own isolated accumulator.
-                let _ = fold_layer_into(
-                    &mut isolated,
-                    child_id,
-                    layers,
-                    store,
-                    tile_id,
-                    doc_origin,
-                    reference_origin,
-                    depth.saturating_add(1),
-                    budget,
-                );
-            }
+            // Through `fold_context_into` (0.201.0) so a clip group inside
+            // the group folds as one; otherwise exactly the loop it
+            // replaces, child by child through `fold_layer_into`, so an
+            // adjustment child sees exactly the siblings below it in this
+            // group's own isolated accumulator.
+            let _ = fold_context_into(
+                &mut isolated,
+                children,
+                layers,
+                store,
+                tile_id,
+                doc_origin,
+                reference_origin,
+                depth.saturating_add(1),
+                budget,
+                None,
+                true,
+            );
             aurora_render::un_premultiply_in_place(&mut isolated);
             // A group's own mask masks its *whole* isolated composite as
             // one unit, ahead of `Dissolve` below -- the same "group's
@@ -15878,6 +15915,11 @@ fn search_cover(
         if layers.visible(id) != Some(true) {
             continue;
         }
+        // A clipped layer (0.201.0) is limited to its base's shape, so it
+        // covers nothing; its base, below it, may still be the cover.
+        if clip_base_of(layers, id).is_some() {
+            continue;
+        }
         match layers.kind(id) {
             Some(aurora_doc::LayerKind::Pixel { .. }) => {
                 if !is_cover_candidate(id, layers, doc_origin, depth) {
@@ -15953,6 +15995,35 @@ fn fold_context_into(
         if stop_when_exhausted && budget.is_exhausted() {
             break;
         }
+        // Clipping masks (0.201.0): a clipped layer folds with its base,
+        // below it, so it is skipped here; a base with clipped layers
+        // above it folds as one clip group.
+        if clip_base_of(layers, id).is_some() {
+            continue;
+        }
+        let clipped = clipped_above(kept, index, layers);
+        if !clipped.is_empty() {
+            let cover = match plan {
+                Some(plan) if start == Some(index) && plan.path.len() <= 1 => Some(plan.cover),
+                _ => None,
+            };
+            if fold_clip_group(
+                accumulator,
+                id,
+                &clipped,
+                cover,
+                layers,
+                store,
+                tile_id,
+                doc_origin,
+                reference_origin,
+                depth,
+                budget,
+            ) {
+                folded = folded.saturating_add(1);
+            }
+            continue;
+        }
         let changed = match plan {
             Some(plan) if start == Some(index) => fold_planned_node(
                 accumulator,
@@ -15986,6 +16057,232 @@ fn fold_context_into(
         }
     }
     folded
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: composites as if no layer were clipped (the "before" of
+    /// the corpus comparison).
+    static CLIPPING_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The layer `id` composites clipped to (0.201.0): its
+/// [`aurora_doc::LayerTree::clip_base`] when that base is a **pixel**
+/// layer. A clipped layer whose base is a group or an adjustment layer
+/// (or that has no base) composites as an ordinary layer: Aurora folds a
+/// clip group over a pixel base only.
+fn clip_base_of(
+    layers: &aurora_doc::LayerTree,
+    id: aurora_doc::LayerId,
+) -> Option<aurora_doc::LayerId> {
+    if !layers.clipped(id) {
+        return None;
+    }
+    #[cfg(test)]
+    if CLIPPING_DISABLED.with(std::cell::Cell::get) {
+        return None;
+    }
+    let base = layers.clip_base(id)?;
+    matches!(layers.kind(base), Some(aurora_doc::LayerKind::Pixel { .. })).then_some(base)
+}
+
+/// The layers clipped to `kept[index]`, bottom to top: the run of clipped
+/// layers directly above it in `kept` (newest first, so at smaller
+/// indices).
+fn clipped_above(
+    kept: &[aurora_doc::LayerId],
+    index: usize,
+    layers: &aurora_doc::LayerTree,
+) -> Vec<aurora_doc::LayerId> {
+    let Some(&base) = kept.get(index) else {
+        return Vec::new();
+    };
+    let mut run = Vec::new();
+    for at in (0..index).rev() {
+        let Some(&above) = kept.get(at) else { break };
+        if clip_base_of(layers, above) != Some(base) {
+            break;
+        }
+        run.push(above);
+    }
+    run
+}
+
+/// Folds `clipped` layer `id` into the premultiplied clip group `group`
+/// *atop* it (0.201.0): the layer composites where `group` has alpha and
+/// leaves `group`'s alpha as it was, so it can never extend the base's
+/// shape. With the layer's own mode `M`, content alpha `s` and the group's
+/// alpha `b` this is Photoshop's `b * ((1 - s) * Cb + s * M(Cb, Cs))`.
+///
+/// Computed with the ordinary fold: the group's colour is straightened and
+/// made opaque, the layer (its mask, opacity, Fill, mode, effects, or an
+/// adjustment's transform) is folded over that, and the result is scaled
+/// back by the group's own alpha. `true` when the layer folded.
+#[allow(clippy::too_many_arguments)]
+fn fold_clipped_atop(
+    group: &mut [half::f16],
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> bool {
+    let mut opaque = group.to_vec();
+    for texel in opaque.chunks_exact_mut(aurora_tile::CHANNELS) {
+        let alpha = texel.get(3).map_or(0.0, |a| a.to_f32());
+        for (channel, value) in texel.iter_mut().enumerate() {
+            *value = if channel == 3 {
+                half::f16::ONE
+            } else if alpha > 0.0 {
+                half::f16::from_f32(value.to_f32() / alpha)
+            } else {
+                half::f16::ZERO
+            };
+        }
+    }
+    if !fold_layer_into(
+        &mut opaque,
+        id,
+        layers,
+        store,
+        tile_id,
+        doc_origin,
+        reference_origin,
+        depth,
+        budget,
+    ) {
+        return false;
+    }
+    for (dst, src) in group
+        .chunks_exact_mut(aurora_tile::CHANNELS)
+        .zip(opaque.chunks_exact(aurora_tile::CHANNELS))
+    {
+        let alpha = dst.get(3).map_or(0.0, |a| a.to_f32());
+        for (channel, (d, s)) in dst.iter_mut().zip(src).enumerate() {
+            if channel < 3 {
+                *d = half::f16::from_f32(s.to_f32() * alpha);
+            }
+        }
+    }
+    true
+}
+
+/// Folds a clip group (0.201.0): `base`, a pixel layer, and the `clipped`
+/// layers above it (bottom to top, [`clipped_above`]), into `accumulator`.
+/// `cover` is the base's already-read exactly-opaque texels when the
+/// occlusion cull chose it ([`FoldPlan`]), else `None`.
+///
+/// Photoshop's default (Blend Clipped Layers as Group on): the base's
+/// masked content and the clipped layers composite as an isolated group
+/// `G` ([`fold_clipped_atop`], each limited to the base's shape), and `G`
+/// folds onto the backdrop with the **base's** blend mode, opacity and
+/// Fill. A base with a drawn layer effect ([`layer_renders_effects`]) is
+/// instead folded as today, effects and all, and each clipped layer's
+/// change to the clip group, scaled by the base's opacity, is added to the
+/// accumulator; that is exact for a `Normal` base and an approximation for
+/// other base modes.
+///
+/// Not modelled: the "Blend Clipped Layers as Group" flag (`clbl`) turned
+/// off, the base's Fill applying to its own pixels only, and a base with a
+/// non-`Normal` mode and drawn effects (see above).
+#[allow(clippy::too_many_arguments)]
+fn fold_clip_group(
+    accumulator: &mut [half::f16],
+    base: aurora_doc::LayerId,
+    clipped: &[aurora_doc::LayerId],
+    cover: Option<&[half::f16]>,
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> bool {
+    let with_effects = cover.is_none() && layer_renders_effects(layers, base);
+    let mut changed = false;
+    if with_effects {
+        // The base as today (visibility, budget and effects inside).
+        changed = fold_layer_into(
+            accumulator,
+            base,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            budget,
+        );
+        if !changed {
+            return false;
+        }
+    } else if cover.is_none() && !admit_composite_node(base, layers, depth, budget) {
+        return false;
+    }
+    let Some(opacity) = content_opacity(layers, base) else {
+        return changed;
+    };
+    let texels = match cover {
+        Some(cover) => Some(cover.to_vec()),
+        None => pixel_layer_texels(
+            base,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            budget,
+        ),
+    };
+    // Nothing of the base on this tile: its clip group is empty.
+    let Some(texels) = texels else {
+        return changed;
+    };
+    let mut group = aurora_render::transparent_tile();
+    aurora_render::composite_layer_into(&mut group, &texels, 1.0, aurora_render::BlendMode::Normal);
+    let before = with_effects.then(|| group.clone());
+    let mut any = false;
+    for &id in clipped {
+        any |= fold_clipped_atop(
+            &mut group,
+            id,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            budget,
+        );
+    }
+    if let Some(before) = before {
+        if any {
+            for (index, ((acc, new), old)) in
+                accumulator.iter_mut().zip(&group).zip(&before).enumerate()
+            {
+                if index % aurora_tile::CHANNELS == 3 {
+                    continue;
+                }
+                let delta = (new.to_f32() - old.to_f32()) * opacity;
+                *acc = half::f16::from_f32(acc.to_f32() + delta);
+            }
+            changed = true;
+        }
+        return changed;
+    }
+    // The group is premultiplied; the fold wants straight alpha.
+    aurora_render::un_premultiply_in_place(&mut group);
+    let mode = layers
+        .blend_mode(base)
+        .unwrap_or(aurora_doc::BlendMode::Normal);
+    profiled(ProfileSlot::LayerFold, || {
+        fold_texels_in_mode(accumulator, &group, opacity, mode, doc_origin);
+    });
+    true
 }
 
 /// Folds the node a [`FoldPlan`] starts at: the cover itself — the plain
@@ -17087,8 +17384,11 @@ fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> boo
         // slower. Fill needs no refusal: `resolve_tile` hands the GPU path
         // `opacity * fill`, which is exact for a layer without drawn
         // effects.
+        // 0.201.0: a visible clipped layer refuses the GPU, which has no
+        // clipping pass (`fold_clip_group`).
         layers.visible(id) != Some(true)
             || (!layer_renders_effects(layers, id)
+                && clip_base_of(layers, id).is_none()
                 && (curves_layer_qualifies_for_gpu(layers, id)
                     || pixel_layer_mode_qualifies_for_gpu(layers, id)))
     })
@@ -22456,6 +22756,10 @@ enum LayerCommand {
     /// active node, placed exactly where [`Self::New`] places a layer,
     /// made active. See [`new_group`].
     NewGroup,
+    /// Create (`true`) or Release (`false`) Clipping Mask on the active
+    /// layer (0.201.0): one journaled `History::set_clipped` step labelled
+    /// "Clip Layer"/"Release Clipping Mask"; the layer stays active.
+    SetClip(bool),
 }
 
 /// Everything [`perform_layer_command`] touches, borrowed from `App` (or
@@ -22587,6 +22891,50 @@ fn next_numbered_name(layers: &aurora_doc::LayerTree, prefix: &str) -> String {
     format!("{prefix}{}", highest.saturating_add(1))
 }
 
+/// Create/Release Clipping Mask on the active layer (0.201.0): one
+/// `History::set_clipped` step. `None` (logged, and a status-bar notice
+/// from `App::run_layer_command`) when there is no active layer, the layer
+/// is already in that state, or the tree refused (a group, or nothing
+/// beneath the layer to clip to).
+fn set_clip(cx: &mut LayerCommandContext<'_>, on: bool) -> Option<AppliedLayerCommand> {
+    let layer = (*cx.active_layer)?;
+    if cx.layers.clipped(layer) == on {
+        return None;
+    }
+    match cx.history.set_clipped(cx.layers, layer, on) {
+        Ok(_) => Some(AppliedLayerCommand {
+            next_active: Some(layer),
+            label: Some(if on {
+                "Clip Layer"
+            } else {
+                "Release Clipping Mask"
+            }),
+        }),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "the clipping mask change was refused by the layer tree"
+            );
+            None
+        }
+    }
+}
+
+/// Why Create Clipping Mask cannot run on `layer`, if it cannot (0.201.0).
+fn clip_refusal(layers: &aurora_doc::LayerTree, layer: aurora_doc::LayerId) -> Option<LockRefusal> {
+    if layers
+        .kind(layer)
+        .is_some_and(aurora_doc::LayerKind::is_group)
+    {
+        return Some(LockRefusal::ClipOnGroup);
+    }
+    let siblings = match layers.parent(layer) {
+        None => layers.roots(),
+        Some(group) => layers.children(group)?,
+    };
+    (siblings.last() == Some(&layer)).then_some(LockRefusal::ClipNeedsBase)
+}
+
 /// New Group (0.196.0): an empty group named "Group N" at
 /// [`new_layer_placement`], **Pass Through from its first moment**
 /// (Photoshop's default; `History::add_group_at` records the mode in the
@@ -22658,6 +23006,8 @@ fn new_layer_placement(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AppliedLayerCommand {
     next_active: Option<aurora_doc::LayerId>,
+    /// The History row's label when it is not the journal's own wording.
+    label: Option<&'static str>,
 }
 
 /// Adds the new layer through `history` ([`aurora_doc::History::add_pixel_layer_at`],
@@ -22740,6 +23090,7 @@ fn delete_layer(cx: &mut LayerCommandContext<'_>) -> Option<AppliedLayerCommand>
     match cx.history.remove(cx.layers, target) {
         Ok(_) => Some(AppliedLayerCommand {
             next_active: layer_at_or_near(cx.layers, position),
+            label: None,
         }),
         Err(err) => {
             tracing::warn!(?err, "Delete Layer was refused by the layer tree");
@@ -22799,20 +23150,33 @@ fn perform_layer_command(cx: &mut LayerCommandContext<'_>, command: LayerCommand
     let next_active = match command {
         LayerCommand::New => new_layer(cx).map(|id| AppliedLayerCommand {
             next_active: Some(id),
+            label: None,
         }),
         LayerCommand::Delete => delete_layer(cx),
         LayerCommand::NewCurves => new_curves_layer(cx).map(|id| AppliedLayerCommand {
             next_active: Some(id),
+            label: None,
         }),
         LayerCommand::NewGroup => new_group(cx).map(|id| AppliedLayerCommand {
             next_active: Some(id),
+            label: None,
         }),
+        LayerCommand::SetClip(on) => set_clip(cx, on),
     };
-    let Some(AppliedLayerCommand { next_active }) = next_active else {
+    let Some(AppliedLayerCommand { next_active, label }) = next_active else {
         return false;
     };
-    cx.undo_order
-        .record(UndoKind::Structural, cx.history, cx.pixel_history);
+    match label {
+        Some(label) => cx.undo_order.record_labelled(
+            UndoKind::Structural,
+            label.to_owned(),
+            cx.history,
+            cx.pixel_history,
+        ),
+        None => cx
+            .undo_order
+            .record(UndoKind::Structural, cx.history, cx.pixel_history),
+    }
     rebuild_layer_rows(
         cx.workspace,
         cx.focus,
@@ -22912,6 +23276,9 @@ fn rebuild_layer_rows(
 struct LayerSetSnapshot {
     ids: HashSet<aurora_doc::LayerId>,
     active_position: Option<LayerPosition>,
+    /// Layers clipped to a base (0.201.0): an undone Create Clipping Mask
+    /// changes row indentation without changing the layer set.
+    clipped: HashSet<aurora_doc::LayerId>,
 }
 
 impl LayerSetSnapshot {
@@ -22919,8 +23286,17 @@ impl LayerSetSnapshot {
         Self {
             ids: layer_ids_in_order(layers).into_iter().collect(),
             active_position: active.and_then(|id| layer_position(layers, id)),
+            clipped: clipped_set(layers),
         }
     }
+}
+
+/// Every layer with a clip base, for [`LayerSetSnapshot`].
+fn clipped_set(layers: &aurora_doc::LayerTree) -> HashSet<aurora_doc::LayerId> {
+    layer_ids_in_order(layers)
+        .into_iter()
+        .filter(|&id| layers.clip_base(id).is_some())
+        .collect()
 }
 
 /// After a structural `Undo`/`Redo`: if the *set* of layers changed (an
@@ -22950,7 +23326,10 @@ fn sync_layer_rows_after_undo_redo(
     before: &LayerSetSnapshot,
 ) -> bool {
     let after = layer_ids_in_order(layers);
-    if after.len() == before.ids.len() && after.iter().all(|id| before.ids.contains(id)) {
+    if after.len() == before.ids.len()
+        && after.iter().all(|id| before.ids.contains(id))
+        && clipped_set(layers) == before.clipped
+    {
         return false;
     }
     let preferred = after
@@ -23709,6 +24088,11 @@ enum LockRefusal {
     PositionLocked,
     /// Lock all: Delete Layer is refused.
     DeleteLocked,
+    /// Create Clipping Mask on the bottom-most layer of its group (0.201.0;
+    /// not a lock, it rides the same calm status-bar notice).
+    ClipNeedsBase,
+    /// Create Clipping Mask on a group (0.201.0).
+    ClipOnGroup,
 }
 
 impl LockRefusal {
@@ -23727,6 +24111,10 @@ impl LockRefusal {
             LockRefusal::DeleteLocked => {
                 "This layer is locked (all). Unlock it in the Layers panel to delete it."
             }
+            LockRefusal::ClipNeedsBase => {
+                "There is no layer beneath this one to clip to. Clipping masks need a layer below."
+            }
+            LockRefusal::ClipOnGroup => "Groups can't be clipped. Clip a layer inside the group.",
         }
     }
 }
@@ -25418,6 +25806,16 @@ impl App {
                 self.run_layer_command(LayerCommand::NewCurves);
             }
             Some(ActivatedCommand::NewGroup) => self.run_layer_command(LayerCommand::NewGroup),
+            Some(ActivatedCommand::SetClip(on)) => {
+                self.run_layer_command(LayerCommand::SetClip(on));
+            }
+            Some(ActivatedCommand::ToggleClip) => {
+                let on = !self
+                    .doc
+                    .active_layer
+                    .is_some_and(|layer| self.doc.layers.clipped(layer));
+                self.run_layer_command(LayerCommand::SetClip(on));
+            }
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -25606,6 +26004,12 @@ impl App {
         if command == LayerCommand::Delete
             && let Some(layer) = self.doc.active_layer
             && let Some(why) = delete_refusal(self.doc.layers.lock(layer).unwrap_or_default())
+        {
+            self.lock_notice = Some((why, layer));
+        }
+        if command == LayerCommand::SetClip(true)
+            && let Some(layer) = self.doc.active_layer
+            && let Some(why) = clip_refusal(&self.doc.layers, layer)
         {
             self.lock_notice = Some((why, layer));
         }
@@ -28128,6 +28532,16 @@ impl App {
                 self.run_layer_command(LayerCommand::NewCurves);
             }
             Some(ActivatedCommand::NewGroup) => self.run_layer_command(LayerCommand::NewGroup),
+            Some(ActivatedCommand::SetClip(on)) => {
+                self.run_layer_command(LayerCommand::SetClip(on));
+            }
+            Some(ActivatedCommand::ToggleClip) => {
+                let on = !self
+                    .doc
+                    .active_layer
+                    .is_some_and(|layer| self.doc.layers.clipped(layer));
+                self.run_layer_command(LayerCommand::SetClip(on));
+            }
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -35153,7 +35567,8 @@ mod tests {
         ("layers/curves-with-vectormask.psd", 0.0, None),
         // 15 other adjustment kinds left out.
         ("fill_adjustments.psd", 240.0, Some("15 adjustment layers")),
-        // A clipped Curves layer shown unclipped.
+        // A clipped layer whose base is not a pixel layer shown unclipped
+        // (0.201.0: the other clipped layers are clipped for real).
         (
             "adjustments/adjustment_backdrop_test.psd",
             2.0,
@@ -35161,8 +35576,8 @@ mod tests {
         ),
         (
             "adjustments/adjustment_clipping.psd",
-            68.0,
-            Some("4 clipped layers"),
+            1.0,
+            Some("1 clipped layer is shown unclipped"),
         ),
         // Curves inside Pass Through groups — composited as Pass Through
         // since 0.179.0, so no longer reported; what remains is named in
@@ -71413,6 +71828,44 @@ mod tests {
             }
 
             #[test]
+            fn create_and_release_clipping_mask_are_one_labelled_step_each_and_refuse_the_bottom() {
+                let (mut rig, [top, _mid, bottom]) = Rig::three();
+                // The active layer is `top`; clip it to the layer below.
+                rig.active = Some(top);
+                assert!(rig.run(LayerCommand::SetClip(true)));
+                assert!(rig.layers.clipped(top));
+                assert_eq!(
+                    step_labels(&rig).last().map(String::as_str),
+                    Some("Clip Layer")
+                );
+                assert_eq!(rig.active, Some(top));
+                rig.assert_coherent();
+                // The row's description says so; undo takes it back.
+                assert!(aurora_ui::layer_row_description(&rig.layers, top).ends_with(", clipped"));
+                assert!(rig.undo_redo(AppCommand::Undo));
+                assert!(!rig.layers.clipped(top));
+                assert!(rig.undo_redo(AppCommand::Redo));
+                assert!(rig.layers.clipped(top));
+                // Release is its own labelled step; releasing again is a no-op.
+                assert!(rig.run(LayerCommand::SetClip(false)));
+                assert_eq!(
+                    step_labels(&rig).last().map(String::as_str),
+                    Some("Release Clipping Mask")
+                );
+                assert!(!rig.run(LayerCommand::SetClip(false)));
+                // The bottom-most layer has nothing to clip to: refused, no step.
+                rig.active = Some(bottom);
+                let steps = step_labels(&rig).len();
+                assert!(!rig.run(LayerCommand::SetClip(true)));
+                assert_eq!(step_labels(&rig).len(), steps);
+                assert!(!rig.layers.clipped(bottom));
+                assert_eq!(
+                    crate::clip_refusal(&rig.layers, bottom),
+                    Some(crate::LockRefusal::ClipNeedsBase)
+                );
+            }
+
+            #[test]
             fn new_group_is_pass_through_above_the_active_layer_one_step_and_active() {
                 let (mut rig, [top, mid, bottom]) = Rig::three();
                 let before = rig.layers.roots().to_vec();
@@ -80233,6 +80686,7 @@ mod tests {
         }
 
         include!("outer_glow_tests.rs");
+        include!("clip_corpus_tests.rs");
         include!("small_machine_effect_tests.rs");
     }
 }
@@ -85353,3 +85807,6 @@ mod background_composite_tests;
 #[cfg(test)]
 #[path = "open_time_tests.rs"]
 mod open_time_tests;
+
+#[cfg(test)]
+mod clip_tests;

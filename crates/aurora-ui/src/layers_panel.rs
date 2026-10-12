@@ -567,6 +567,10 @@ fn insert_layer_row(
         Some(WidgetKind::TreeItem(state)) => state.depth,
         _ => 0,
     };
+    // A layer clipped to a base beneath it (0.201.0) sits one level in, like
+    // Photoshop's indented clipped rows. (No dedicated clip glyph exists in
+    // the icon set yet; the row's description says "clipped".)
+    let depth = depth + usize::from(layers.clip_base(id).is_some());
     set_tree_item_flat(tree, row, label_inset(scales, depth))?;
     set_tree_item_key(tree, row, Some(id.to_raw()))?;
     if !children.is_empty() {
@@ -981,12 +985,16 @@ pub fn layer_row_neighbor(
 pub fn layer_row_description(layers: &LayerTree, id: LayerId) -> String {
     let hidden = matches!(layers.visible(id), Some(false));
     let locked = layers.lock(id).is_some_and(|lock| lock.is_any());
-    let suffix = match (hidden, locked) {
+    let mut suffix = String::from(match (hidden, locked) {
         (false, false) => "",
         (true, false) => ", hidden",
         (false, true) => ", locked",
         (true, true) => ", hidden, locked",
-    };
+    });
+    if layers.clip_base(id).is_some() {
+        suffix.push_str(", clipped");
+    }
+    let suffix = suffix.as_str();
     match layers.kind(id) {
         // A group names its blend mode too (0.195.0), unless it is Pass
         // Through, the default: "Group, Multiply, hidden".
