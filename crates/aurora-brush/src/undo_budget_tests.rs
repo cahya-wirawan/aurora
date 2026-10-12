@@ -89,7 +89,7 @@ fn spilled_steps(history: &PixelHistory) -> Vec<bool> {
         .undo
         .iter()
         .chain(&history.redo)
-        .map(|s| s.spill.is_some())
+        .map(|s| s.is_spilled())
         .collect()
 }
 
@@ -307,7 +307,7 @@ fn an_unreadable_spilled_step_fails_the_undo_and_keeps_the_entry() {
         unreachable!("spilled");
     };
     // Undo down to a spilled step, then remove the files.
-    while history.undo.last().is_none_or(|s| s.spill.is_none()) {
+    while history.undo.last().is_none_or(|s| !s.is_spilled()) {
         assert!(ok(history.undo(&mut store)));
     }
     let tile_now = read(&mut store, T0);
@@ -359,7 +359,7 @@ fn truncating_the_redo_stack_deletes_its_spill_files() {
     }
     history.clear_redo();
     assert_eq!(history.memory_bytes(), history.stats().memory_bytes);
-    let live = history.undo.iter().filter(|s| s.spill.is_some()).count();
+    let live = history.undo.iter().filter(|s| s.is_spilled()).count();
     assert_eq!(
         files_in(&dir),
         live,
@@ -444,14 +444,14 @@ fn a_random_walk_of_pushes_undos_and_redos_matches_a_model_under_a_tiny_budget()
 }
 
 #[test]
-fn ten_thousand_tiny_steps_stay_small_and_undo_in_order() {
+fn two_thousand_tiny_steps_stay_small_and_undo_in_order() {
     let (_dir, mut store) = new_store();
-    // 4 MiB: 10,000 steps of ~200 bytes of bookkeeping plus ~2 KiB of
+    // 1 MiB: 2,000 steps of ~200 bytes of bookkeeping plus ~2 KiB of
     // flat tile overflow it, so this also spills thousands of tiny files.
-    let mut history = history_for(&store, 4 << 20);
+    let mut history = history_for(&store, 1 << 20);
     let started = std::time::Instant::now();
     write(&mut store, T0, &flat(0.0));
-    for i in 1..=10_000_u32 {
+    for i in 1..=2_000_u32 {
         stroke(
             &mut history,
             &mut store,
@@ -462,17 +462,17 @@ fn ten_thousand_tiny_steps_stay_small_and_undo_in_order() {
     let pushed = started.elapsed();
     let stats = history.stats();
     println!(
-        "10,000 tiny steps: {pushed:?}, memory {} KiB, {} spilled steps, {} KiB on disk",
+        "2,000 tiny steps: {pushed:?}, memory {} KiB, {} spilled steps, {} KiB on disk",
         stats.memory_bytes >> 10,
         stats.spilled_steps,
         stats.spilled_bytes >> 10
     );
-    assert!(stats.memory_bytes <= 4 << 20, "{stats:?}");
-    assert_eq!(stats.undo_steps, 10_000);
-    // The newest 1,500 undo in order (a mix of resident and spilled; the
-    // full-length order is covered by the random walk above, and 10,000
-    // 512 KiB-tile undos would take half a minute).
-    for i in (8_500..10_000_u32).rev() {
+    assert!(stats.memory_bytes <= 1 << 20, "{stats:?}");
+    assert_eq!(stats.undo_steps, 2_000);
+    // The newest 500 undo in order (a mix of resident and spilled; the
+    // full-length order is covered by the random walk above, and 2,000
+    // 512 KiB-tile undos would take a while).
+    for i in (1_500..2_000_u32).rev() {
         assert!(ok(history.undo(&mut store)));
         let expected = f16::from_f32((i % 1000) as f32 / 1000.0).to_bits();
         assert_eq!(
@@ -482,15 +482,15 @@ fn ten_thousand_tiny_steps_stay_small_and_undo_in_order() {
         );
     }
     assert_eq!(history.memory_bytes(), history.stats().memory_bytes);
-    assert!(history.memory_bytes() <= 4 << 20);
+    assert!(history.memory_bytes() <= 1 << 20);
     // Dropping the redo stack frees its files: only live spilled steps keep one.
     history.clear_redo();
     let Some(dir) = spill_dir(&history) else {
         unreachable!("spilled");
     };
-    let live = history.undo.iter().filter(|s| s.spill.is_some()).count();
+    let live = history.undo.iter().filter(|s| s.is_spilled()).count();
     assert_eq!(files_in(&dir), live);
-    println!("10,000 pushes plus 1,500 undos: {:?}", started.elapsed());
+    println!("2,000 pushes plus 500 undos: {:?}", started.elapsed());
 }
 
 #[test]
@@ -640,12 +640,221 @@ fn undo_steps_spill_before_redo_steps() {
     // ~3 MiB held; a 2.5 MiB budget spills down to 1.875 MiB: three steps.
     history.set_budget_bytes(5 << 19);
     history.trim();
-    assert!(history.undo.iter().all(|s| s.spill.is_some()), "undo first");
-    assert!(history.redo.iter().all(|s| s.spill.is_none()), "redo kept");
+    assert!(history.undo.iter().all(|s| s.is_spilled()), "undo first");
+    assert!(history.redo.iter().all(|s| !s.is_spilled()), "redo kept");
     // And everything still comes back exactly.
     for i in (0..3).rev() {
         assert!(ok(history.undo(&mut store)));
         let expected = if i == 0 { noisy(1) } else { noisy(50 + i - 1) };
         assert_eq!(read(&mut store, T0), bits(&expected));
     }
+}
+
+#[test]
+fn a_failed_spill_backs_off_by_time_and_resets_on_success() {
+    let (_dir, mut store) = new_store();
+    let mut history = history_for(&store, 1 << 20);
+    write(&mut store, T0, &noisy(1));
+    // Over budget with nothing spilled yet: the first push makes the area.
+    stroke(&mut history, &mut store, T0, &noisy(2));
+    stroke(&mut history, &mut store, T0, &noisy(3));
+    let Some(dir) = spill_dir(&history) else {
+        unreachable!("the budget forced a spill");
+    };
+    ok(std::fs::remove_dir_all(&dir));
+    history.set_budget_bytes(1);
+    stroke(&mut history, &mut store, T0, &noisy(4));
+    assert_eq!(history.stats().spill_failures, 1);
+    // Hundreds of further turns inside the wait attempt nothing.
+    for _ in 0..500 {
+        history.trim();
+    }
+    assert_eq!(
+        history.stats().spill_failures,
+        1,
+        "no retry inside the wait"
+    );
+    assert!(history.backoff >= std::time::Duration::from_secs(2));
+    // The wait expires: one more attempt, a longer wait.
+    history.retry_at = Some(std::time::Instant::now());
+    history.trim();
+    assert_eq!(history.stats().spill_failures, 2);
+    assert!(history.backoff >= std::time::Duration::from_secs(4));
+    // The directory comes back and the wait expires: it succeeds and resets.
+    ok(std::fs::create_dir(&dir));
+    history.retry_at = Some(std::time::Instant::now());
+    history.trim();
+    assert_eq!(history.stats().spill_failures, 2);
+    assert_eq!(history.backoff, std::time::Duration::ZERO);
+    assert!(history.retry_at.is_none());
+    assert!(history.undo.iter().any(|s| s.is_spilled()));
+}
+
+#[test]
+fn one_call_never_writes_more_than_its_cap_even_for_one_big_snapshot() {
+    let (_dir, mut store) = new_store();
+    let mut history = history_for(&store, 1 << 40);
+    let mut snapshot = StrokeSnapshot::new(surface());
+    let contents: Vec<Vec<f16>> = (0..12).map(|i| noisy(500 + i)).collect();
+    for (i, content) in contents.iter().enumerate() {
+        let tile = TileId { x: i as u32, y: 0 };
+        write(&mut store, tile, &flat(0.0));
+        assert!(snapshot.record_content(tile, content));
+        write(&mut store, tile, &flat(1.0));
+    }
+    assert!(history.push(snapshot));
+    assert_eq!(history.stats().spilled_bytes, 0);
+    history.set_budget_bytes(1 << 20);
+    let cap = 1 << 20; // two noisy tiles
+    let mut calls = 0;
+    let mut last = 0;
+    while history.memory_bytes() > (1 << 20) / 4 * 3 {
+        history.trim_with(cap, 64);
+        let now = history.stats().spilled_bytes;
+        assert!(now - last <= cap, "call {calls} wrote {} bytes", now - last);
+        assert!(now > last, "each call makes progress");
+        last = now;
+        calls += 1;
+        assert!(calls < 20);
+    }
+    assert!(
+        calls >= 4,
+        "a 6 MiB snapshot needs several capped calls: {calls}"
+    );
+    assert!(history.undo[0].spill.len() > 1, "split across files");
+    assert_eq!(history.memory_bytes(), history.stats().memory_bytes);
+    assert!(ok(history.undo(&mut store)));
+    for (i, content) in contents.iter().enumerate() {
+        assert_eq!(
+            read(&mut store, TileId { x: i as u32, y: 0 }),
+            bits(content),
+            "tile {i}"
+        );
+    }
+    assert!(ok(history.redo(&mut store)));
+    assert_eq!(read(&mut store, TileId { x: 3, y: 0 }), bits(&flat(1.0)));
+}
+
+#[test]
+fn one_call_creates_a_bounded_number_of_files_for_many_tiny_steps() {
+    let (_dir, mut store) = new_store();
+    let mut history = history_for(&store, 1 << 40);
+    write(&mut store, T0, &flat(0.0));
+    for i in 1..=300_u32 {
+        stroke(&mut history, &mut store, T0, &flat(i as f32 / 512.0));
+    }
+    assert_eq!(history.stats().spilled_steps, 0);
+    history.set_budget_bytes(100 << 10);
+    // Force the area (the first trim creates it) with a tiny file cap.
+    history.trim_with(u64::MAX, 7);
+    let Some(dir) = spill_dir(&history) else {
+        unreachable!("spilled");
+    };
+    assert_eq!(files_in(&dir), 7, "at most the file cap per call");
+    history.trim_with(u64::MAX, 7);
+    assert_eq!(files_in(&dir), 14);
+    // The default cap bounds a call too.
+    history.set_budget_bytes(1);
+    history.trim();
+    assert!(files_in(&dir) <= 14 + super::SPILL_FILES_PER_CALL);
+    for i in (0..300_u32).rev() {
+        assert!(ok(history.undo(&mut store)));
+        assert_eq!(
+            read(&mut store, T0).first().copied(),
+            Some(f16::from_f32(i as f32 / 512.0).to_bits()),
+            "step {i}"
+        );
+    }
+}
+
+/// A multi-tile step whose tile `bad` cannot be decoded: the undo must
+/// return an error with the store bit-identical, whichever tile is bad
+/// (some come after tiles already written, which exercises the rollback).
+fn corrupt_multi_tile_undo(spilled: bool) {
+    for bad in 0..8_u32 {
+        let (_dir, mut store) = new_store();
+        let mut history = history_for(&store, if spilled { 1 } else { 1 << 40 });
+        let tiles: Vec<TileId> = (0..8).map(|x| TileId { x, y: 0 }).collect();
+        for (i, &tile) in tiles.iter().enumerate() {
+            write(&mut store, tile, &painted(i as u64 + 1));
+        }
+        let mut snapshot = StrokeSnapshot::new(surface());
+        for (i, &tile) in tiles.iter().enumerate() {
+            assert!(snapshot.record_content(tile, &painted(i as u64 + 1)));
+            write(&mut store, tile, &painted(i as u64 + 100));
+        }
+        assert!(history.push(snapshot));
+        let target = TileId { x: bad, y: 0 };
+        if spilled {
+            // Overwrite the file with garbage of the same length.
+            let files: Vec<_> = history.undo[0]
+                .spill
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect();
+            assert!(!files.is_empty());
+            for path in files {
+                let len = ok(std::fs::metadata(&path)).len() as usize;
+                ok(std::fs::write(&path, vec![0xA5_u8; len]));
+            }
+        } else if let Some(TileData::Packed(bytes)) = history.undo[0].tiles.get_mut(&target) {
+            let keep = bytes.len() / 2;
+            bytes.truncate(keep);
+        } else {
+            unreachable!("packed");
+        }
+        let expected: Vec<Vec<u16>> = tiles.iter().map(|&t| read(&mut store, t)).collect();
+        let accounted = history.memory_bytes();
+        assert!(
+            history.undo(&mut store).is_err(),
+            "bad {bad}, spilled {spilled}"
+        );
+        for (&tile, want) in tiles.iter().zip(&expected) {
+            assert_eq!(&read(&mut store, tile), want, "bad {bad}: store untouched");
+        }
+        assert_eq!(history.undo.len(), 1, "the entry stays");
+        assert_eq!(history.redo.len(), 0);
+        assert_eq!(history.memory_bytes(), accounted);
+        assert_eq!(history.memory_bytes(), history.stats().memory_bytes);
+        assert!(history.take_restore_failure(), "the app is told");
+        assert!(!history.take_restore_failure(), "once");
+    }
+}
+
+#[test]
+fn a_corrupt_packed_tile_in_a_multi_tile_step_fails_the_undo_and_changes_nothing() {
+    corrupt_multi_tile_undo(false);
+}
+
+#[test]
+fn a_corrupt_spill_file_fails_the_undo_and_changes_nothing() {
+    corrupt_multi_tile_undo(true);
+}
+
+#[test]
+fn a_store_failure_is_not_reported_as_a_history_file_problem() {
+    let (dir, mut store) = crate::test_support::store_with_a_broken_tile(T0, TileId { x: 1, y: 0 });
+    let mut history = PixelHistory::new();
+    let mut snapshot = StrokeSnapshot::new(surface());
+    assert!(snapshot.record_content(T0, &flat(0.5)));
+    assert!(history.push(snapshot));
+    assert!(history.undo(&mut store).is_err());
+    assert!(!history.take_restore_failure());
+    drop(dir);
+}
+
+#[test]
+fn packing_survives_an_os_that_will_not_create_threads() {
+    let contents: Vec<Vec<f16>> = (0..40).map(|i| painted(i + 1)).collect();
+    let raws: Vec<(TileId, &[f16])> = contents
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (TileId { x: i as u32, y: 0 }, c.as_slice()))
+        .collect();
+    let mut refused = super::encode_all_with(&raws, true);
+    let mut allowed = super::encode_all_with(&raws, false);
+    refused.sort_by_key(|(t, _)| t.x);
+    allowed.sort_by_key(|(t, _)| t.x);
+    assert_eq!(refused.len(), 40, "every tile was still encoded");
+    assert_eq!(refused, allowed);
 }

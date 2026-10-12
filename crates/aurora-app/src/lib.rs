@@ -25153,6 +25153,10 @@ enum LockRefusal {
     /// A fill with no pixel layer to fill: none is active, or the active
     /// layer is a group or an adjustment layer (0.209.1).
     FillNeedsPixelLayer,
+    /// An undo or redo could not read the step's saved data back (0.210.0:
+    /// a pixel-history spill file a temp-file cleaner removed, or a corrupt
+    /// one). Not a lock; the step stays in the History panel.
+    HistoryUnavailable,
 }
 
 impl LockRefusal {
@@ -25177,6 +25181,9 @@ impl LockRefusal {
             LockRefusal::ClipOnGroup => "Groups can't be clipped. Clip a layer inside the group.",
             LockRefusal::FillNeedsPixelLayer => {
                 "Select a pixel layer to fill. A group, an adjustment layer or no layer can't be filled."
+            }
+            LockRefusal::HistoryUnavailable => {
+                "Couldn't undo or redo: history file unavailable. A temp-file cleaner may have removed it; the step stays in the list."
             }
             LockRefusal::FillTooLarge => {
                 "That area is too large to fill in one step (over 64 megapixels). Use a smaller selection of the layer."
@@ -25247,6 +25254,7 @@ fn lock_refusal_applies(
 ) -> bool {
     press_refusal(tool, lock) == Some(refusal)
         || delete_refusal(lock) == Some(refusal)
+        || refusal == LockRefusal::HistoryUnavailable
         || (matches!(
             refusal,
             LockRefusal::FillTooLarge | LockRefusal::FillNeedsPixelLayer
@@ -25254,6 +25262,19 @@ fn lock_refusal_applies(
             tool,
             aurora_ui::Tool::Gradient | aurora_ui::Tool::PaintBucket
         ))
+}
+
+/// Turns a failed pixel undo/redo (0.210.0: the step's saved history data
+/// could not be read back) into the calm status-bar notice, once. A dialog
+/// would be too loud for a step that simply stays in the list.
+fn adopt_history_failure(
+    pixel_history: &mut aurora_brush::PixelHistory,
+    active_layer: Option<aurora_doc::LayerId>,
+    notice: &mut Option<(LockRefusal, Option<aurora_doc::LayerId>)>,
+) {
+    if pixel_history.take_restore_failure() {
+        *notice = Some((LockRefusal::HistoryUnavailable, active_layer));
+    }
 }
 
 impl ToolSettings {
@@ -30696,6 +30717,11 @@ impl App {
     /// asked for and the accessibility tree is pushed when its text
     /// changed.
     fn sync_status_bar_now(&mut self) {
+        adopt_history_failure(
+            &mut self.doc.pixel_history,
+            self.doc.active_layer,
+            &mut self.lock_notice,
+        );
         // A lock notice stays only while it still describes what the
         // active tool would meet on the active layer.
         if let Some((why, layer)) = self.lock_notice

@@ -888,4 +888,68 @@ mod tests {
         assert_eq!(left, 0, "dropping the history removes its directory");
         let _ = super::new_pixel_history(None);
     }
+
+    /// 0.210.0: a spill file a temp-file cleaner removed makes the undo
+    /// fail (the step stays) and becomes a calm status-bar notice once,
+    /// not a dialog; a store failure does not.
+    #[test]
+    fn a_removed_history_file_becomes_a_calm_notice_and_the_step_stays() {
+        use crate::{LockRefusal, adopt_history_failure, lock_refusal_applies};
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(8) else {
+            unreachable!("non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().join("scratch"), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("{err}"),
+        };
+        let mut history = aurora_brush::PixelHistory::with_spill(store.staging_root(), 1);
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        let mut snapshot = aurora_brush::StrokeSnapshot::new(surface);
+        let content = vec![half::f16::from_f32(0.5); aurora_tile::SAMPLES];
+        assert!(snapshot.record_content(tile, &content));
+        if let Ok(t) = store.get_mut(surface, tile) {
+            t.texels_mut().copy_from_slice(&content);
+        }
+        assert!(history.push(snapshot));
+        assert_eq!(history.stats().spilled_steps, 1, "spilled at once");
+        // The cleaner removes the history directory.
+        let history_dir = std::fs::read_dir(dir.path().join("scratch"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().starts_with("history-"))
+            .map(|e| e.path());
+        let Some(history_dir) = history_dir else {
+            unreachable!("the spill directory exists");
+        };
+        assert!(std::fs::remove_dir_all(history_dir).is_ok());
+
+        let mut notice = None;
+        adopt_history_failure(&mut history, None, &mut notice);
+        assert_eq!(notice, None, "nothing failed yet");
+        assert!(history.undo(&mut store).is_err());
+        assert!(history.can_undo(), "the step stays");
+        adopt_history_failure(&mut history, None, &mut notice);
+        let Some((why, _)) = notice else {
+            unreachable!("the failure is reported");
+        };
+        assert_eq!(why, LockRefusal::HistoryUnavailable);
+        assert!(
+            why.message()
+                .starts_with("Couldn't undo or redo: history file unavailable")
+        );
+        assert!(lock_refusal_applies(
+            why,
+            aurora_ui::Tool::Brush,
+            aurora_doc::LayerLock::default()
+        ));
+        notice = None;
+        adopt_history_failure(&mut history, None, &mut notice);
+        assert_eq!(notice, None, "reported once");
+    }
 }
