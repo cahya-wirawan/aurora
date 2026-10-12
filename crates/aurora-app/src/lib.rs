@@ -546,6 +546,7 @@ mod colour_state;
 mod document_close;
 mod document_session;
 mod document_tabs;
+mod fill_tools;
 #[cfg(test)]
 mod document_tabs_tests;
 mod layer_thumbnails;
@@ -5471,6 +5472,9 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         ("i", AppCommand::SelectTool(aurora_ui::Tool::Eyedropper)),
         ("b", AppCommand::SelectTool(aurora_ui::Tool::Brush)),
         ("e", AppCommand::SelectTool(aurora_ui::Tool::Eraser)),
+        // 0.209.0: Photoshop's grouped G key.
+        ("g", AppCommand::SelectTool(aurora_ui::Tool::Gradient)),
+        ("Shift+G", AppCommand::SelectTool(aurora_ui::Tool::PaintBucket)),
         // 0.208.0: Photoshop's colour keys, bare like the tool letters.
         ("x", AppCommand::SwapColours),
         ("d", AppCommand::ResetColours),
@@ -5649,6 +5653,8 @@ enum ActivatedCommand {
     /// Reset the colours to black over white (0.208.0): `D`, the palette
     /// and the Tools panel's defaults button.
     ResetColours,
+    /// Select a tool from the palette (0.209.0).
+    SelectTool(aurora_ui::Tool),
     /// A keyboard panel move (0.166.0, [`PANEL_MOVE_COMMANDS`]) —
     /// returned because rebuilding a tab group needs `App`'s `Scales`.
     /// Run by [`run_panel_move`].
@@ -5815,6 +5821,21 @@ const COMMAND_LAYER_CLIP_RELEASE: &str = "layer.clip_release";
 const COMMAND_COLOURS_SWAP: &str = "colour.swap";
 const COMMAND_COLOURS_RESET: &str = "colour.reset";
 
+/// The palette command id that selects `tool` (0.209.0).
+const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
+    match tool {
+        aurora_ui::Tool::Move => "tool.move",
+        aurora_ui::Tool::MarqueeSelect => "tool.marquee_select",
+        aurora_ui::Tool::Zoom => "tool.zoom",
+        aurora_ui::Tool::Pan => "tool.pan",
+        aurora_ui::Tool::Eyedropper => "tool.eyedropper",
+        aurora_ui::Tool::Brush => "tool.brush",
+        aurora_ui::Tool::Eraser => "tool.eraser",
+        aurora_ui::Tool::Gradient => "tool.gradient",
+        aurora_ui::Tool::PaintBucket => "tool.paint_bucket",
+    }
+}
+
 /// The command palette's own, real content: one command per docked
 /// panel, focusing it; one more per panel, toggling its own
 /// collapsed/expanded state (`aurora_ui::set_panel_collapsed`); one
@@ -5892,6 +5913,10 @@ fn palette_commands() -> Vec<CommandEntry> {
             "Default Foreground and Background Colours",
         ),
     ];
+    // 0.209.0: "Select ... Tool" for every tool (the palette had none).
+    commands.extend(aurora_ui::Tool::ALL.iter().map(|tool| {
+        CommandEntry::new(tool_command_id(*tool), format!("Select {} Tool", tool.label()))
+    }));
     commands.extend(
         PANEL_MOVE_COMMANDS
             .iter()
@@ -6091,6 +6116,13 @@ fn activate_command(
     }
     if id == COMMAND_LAYER_CLIP_RELEASE {
         return Some(ActivatedCommand::SetClip(false));
+    }
+    if let Some(tool) = aurora_ui::Tool::ALL
+        .iter()
+        .copied()
+        .find(|tool| tool_command_id(*tool) == id)
+    {
+        return Some(ActivatedCommand::SelectTool(tool));
     }
     if id == COMMAND_COLOURS_SWAP {
         return Some(ActivatedCommand::SwapColours);
@@ -11305,6 +11337,13 @@ enum Drag {
         refused: bool,
     },
     Eyedropper,
+    /// The Gradient tool's drag (0.209.0): nothing is drawn until the
+    /// release, which applies the gradient from `start_doc` to
+    /// `current_doc` (document space) as one undo step. No live preview.
+    Gradient {
+        start_doc: (f32, f32),
+        current_doc: (f32, f32),
+    },
 }
 
 /// The active `Drag::Brush`'s own accumulated stroke snapshot, if there
@@ -11697,6 +11736,13 @@ fn begin_drag(
             })
         }
         (aurora_ui::Tool::Eyedropper, PointerButton::Primary) => Some(Drag::Eyedropper),
+        (aurora_ui::Tool::Gradient, PointerButton::Primary) => {
+            let start_doc = view.to_document(canvas_point);
+            Some(Drag::Gradient {
+                start_doc,
+                current_doc: start_doc,
+            })
+        }
         _ => None,
     }
 }
@@ -11821,6 +11867,10 @@ fn continue_drag(
         // comment) -- the caller (`App::handle_pointer_moved`) samples
         // directly at `canvas_point` itself once this returns.
         Drag::Eyedropper => Vec::new(),
+        Drag::Gradient { current_doc, .. } => {
+            *current_doc = view.to_document(canvas_point);
+            Vec::new()
+        }
     }
 }
 
@@ -12160,6 +12210,15 @@ fn shift_drag_reference(drag: &mut Drag, delta: (f32, f32)) {
             last_doc.0 += delta.0;
             last_doc.1 += delta.1;
         }
+        Drag::Gradient {
+            start_doc,
+            current_doc,
+        } => {
+            start_doc.0 += delta.0;
+            start_doc.1 += delta.1;
+            current_doc.0 += delta.0;
+            current_doc.1 += delta.1;
+        }
         Drag::Pan { .. } | Drag::Eyedropper => {}
     }
 }
@@ -12178,7 +12237,9 @@ fn shift_drag_reference(drag: &mut Drag, delta: (f32, f32)) {
 #[must_use]
 fn drag_reference(drag: &Drag) -> Option<(f32, f32)> {
     match drag {
-        Drag::Marquee { start_doc } | Drag::Move { start_doc, .. } => Some(*start_doc),
+        Drag::Marquee { start_doc }
+        | Drag::Move { start_doc, .. }
+        | Drag::Gradient { start_doc, .. } => Some(*start_doc),
         Drag::Brush { last_doc, .. } | Drag::Eraser { last_doc, .. } => Some(*last_doc),
         Drag::Pan { .. } | Drag::Eyedropper => None,
     }
@@ -24871,14 +24932,61 @@ const ERASER_RADIUS: f32 = 24.0;
 struct ToolSettings {
     brush_radius: f32,
     eraser_radius: f32,
+    /// The Paint Bucket's tolerance, 0..=255 in 8-bit-equivalent units
+    /// (0.209.0; Photoshop's default is 32).
+    tolerance: u8,
+    /// The Paint Bucket's "Contiguous" option (default on).
+    contiguous: bool,
+    /// The Gradient's type: `false` Linear, `true` Radial.
+    gradient_radial: bool,
+    /// The Gradient's "Reverse" option: background to foreground.
+    gradient_reverse: bool,
+    /// The Gradient's opacity, 0..=100 percent.
+    gradient_opacity: u8,
 }
+
+/// The Paint Bucket's default tolerance (Photoshop's).
+const DEFAULT_TOLERANCE: u8 = 32;
 
 impl Default for ToolSettings {
     fn default() -> Self {
         Self {
             brush_radius: BRUSH_RADIUS,
             eraser_radius: ERASER_RADIUS,
+            tolerance: DEFAULT_TOLERANCE,
+            contiguous: true,
+            gradient_radial: false,
+            gradient_reverse: false,
+            gradient_opacity: 100,
         }
+    }
+}
+
+impl ToolSettings {
+    /// Sets the Paint Bucket tolerance from a slider value (rounded,
+    /// clamped to 0..=255; non-finite refused). Returns whether it changed.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn set_tolerance(&mut self, value: f64) -> bool {
+        if !value.is_finite() {
+            return false;
+        }
+        let tolerance = value.round().clamp(0.0, 255.0) as u8;
+        let changed = tolerance != self.tolerance;
+        self.tolerance = tolerance;
+        changed
+    }
+
+    /// Sets the Gradient opacity from a slider value (rounded, clamped to
+    /// 0..=100; non-finite refused). Returns whether it changed.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn set_gradient_opacity(&mut self, value: f64) -> bool {
+        if !value.is_finite() {
+            return false;
+        }
+        let opacity = value.round().clamp(0.0, 100.0) as u8;
+        let changed = opacity != self.gradient_opacity;
+        self.gradient_opacity = opacity;
+        changed
     }
 }
 
@@ -24910,6 +25018,9 @@ enum LockRefusal {
     ClipNeedsBase,
     /// Create Clipping Mask on a group (0.201.0).
     ClipOnGroup,
+    /// A Paint Bucket region or a Gradient area is over the tile cap
+    /// (0.209.0; not a lock, it rides the same calm notice).
+    FillTooLarge,
 }
 
 impl LockRefusal {
@@ -24932,6 +25043,9 @@ impl LockRefusal {
                 "There is no layer beneath this one to clip to. Clipping masks need a layer below."
             }
             LockRefusal::ClipOnGroup => "Groups can't be clipped. Clip a layer inside the group.",
+            LockRefusal::FillTooLarge => {
+                "That area is too large to fill in one step (over 64 megapixels). Use a smaller selection of the layer."
+            }
         }
     }
 }
@@ -24973,6 +25087,12 @@ fn press_refusal(tool: aurora_ui::Tool, lock: aurora_doc::LayerLock) -> Option<L
             PaintPermission::Refused(why) => Some(why),
             _ => None,
         },
+        aurora_ui::Tool::Gradient | aurora_ui::Tool::PaintBucket => {
+            match paint_permission(DabTool::Brush, lock) {
+                PaintPermission::Refused(why) => Some(why),
+                _ => None,
+            }
+        }
         aurora_ui::Tool::Move if lock.position => Some(LockRefusal::PositionLocked),
         _ => None,
     }
@@ -24990,7 +25110,13 @@ fn lock_refusal_applies(
     tool: aurora_ui::Tool,
     lock: aurora_doc::LayerLock,
 ) -> bool {
-    press_refusal(tool, lock) == Some(refusal) || delete_refusal(lock) == Some(refusal)
+    press_refusal(tool, lock) == Some(refusal)
+        || delete_refusal(lock) == Some(refusal)
+        || (refusal == LockRefusal::FillTooLarge
+            && matches!(
+                tool,
+                aurora_ui::Tool::Gradient | aurora_ui::Tool::PaintBucket
+            ))
 }
 
 impl ToolSettings {
@@ -25015,7 +25141,9 @@ impl ToolSettings {
             | aurora_ui::Tool::MarqueeSelect
             | aurora_ui::Tool::Zoom
             | aurora_ui::Tool::Pan
-            | aurora_ui::Tool::Eyedropper => None,
+            | aurora_ui::Tool::Eyedropper
+            | aurora_ui::Tool::Gradient
+            | aurora_ui::Tool::PaintBucket => None,
         }
     }
 
@@ -26658,6 +26786,7 @@ impl App {
             }
             Some(ActivatedCommand::SwapColours) => self.swap_colours(),
             Some(ActivatedCommand::ResetColours) => self.reset_colours(),
+            Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -28812,6 +28941,12 @@ impl App {
             );
             return;
         }
+        // The Paint Bucket fills on the press itself (0.209.0): no drag.
+        if self.tool == aurora_ui::Tool::PaintBucket && button == PointerButton::Primary {
+            let doc_point = self.doc.canvas_view.to_document(canvas_point);
+            self.fill_bucket(doc_point);
+            return;
+        }
         self.drag = begin_drag(
             self.tool,
             button,
@@ -28823,7 +28958,12 @@ impl App {
         // no stroke snapshot and no history row, and a calm notice.
         if matches!(
             self.drag,
-            Some(Drag::Brush { .. } | Drag::Eraser { .. } | Drag::Move { .. })
+            Some(
+                Drag::Brush { .. }
+                    | Drag::Eraser { .. }
+                    | Drag::Move { .. }
+                    | Drag::Gradient { .. }
+            )
         ) && let Some(layer) = self.doc.active_layer
             && let Some(why) =
                 press_refusal(self.tool, self.doc.layers.lock(layer).unwrap_or_default())
@@ -29145,6 +29285,90 @@ impl App {
         );
     }
 
+    /// One Paint Bucket click at `doc_point` on the active layer
+    /// ([`fill_tools::bucket_fill`]): one undo step, "Paint Bucket Fill".
+    fn fill_bucket(&mut self, doc_point: (f32, f32)) {
+        let Some(layer) = self.doc.active_layer else {
+            return;
+        };
+        let Some(store) = self.doc.tile_store.as_mut() else {
+            return;
+        };
+        let result = fill_tools::bucket_fill(
+            store,
+            &self.doc.layers,
+            layer,
+            doc_point,
+            &self.tool_settings,
+            self.colour.state.foreground(),
+        );
+        self.finish_fill(layer, result, fill_tools::PAINT_BUCKET_LABEL);
+    }
+
+    /// The released Gradient drag ([`fill_tools::gradient_drag`]): one undo
+    /// step, "Gradient".
+    fn apply_gradient(&mut self, start_doc: (f32, f32), end_doc: (f32, f32)) {
+        let Some(layer) = self.doc.active_layer else {
+            return;
+        };
+        let Some(store) = self.doc.tile_store.as_mut() else {
+            return;
+        };
+        let result = fill_tools::gradient_drag(
+            store,
+            &self.doc.layers,
+            layer,
+            self.doc.canvas_size,
+            start_doc,
+            end_doc,
+            &self.tool_settings,
+            self.colour.state.foreground(),
+            self.colour.state.background(),
+        );
+        self.finish_fill(layer, result, fill_tools::GRADIENT_LABEL);
+    }
+
+    /// Records a finished fill: invalidates the composite narrowly like a
+    /// dab, pushes the snapshot as one history step (none when nothing
+    /// changed) and refreshes the History panel; a refusal becomes the
+    /// calm status-bar notice.
+    fn finish_fill(
+        &mut self,
+        layer: aurora_doc::LayerId,
+        result: Result<fill_tools::Filled, fill_tools::FillRefused>,
+        label: &str,
+    ) {
+        match result {
+            Err(fill_tools::FillRefused::Notice(why)) => {
+                self.lock_notice = Some((why, layer));
+                self.sync_status_bar_now();
+            }
+            Err(fill_tools::FillRefused::Nothing) => {}
+            Ok(filled) => {
+                let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer));
+                invalidate_painted_tiles(
+                    &mut self.doc.composite_cache,
+                    &self.doc.layers,
+                    layer,
+                    &filled.painted,
+                    reference_origin,
+                );
+                let before = self.doc.undo_order.undo.len();
+                record_stroke(
+                    filled.snapshot,
+                    label,
+                    &mut self.doc.history,
+                    &mut self.doc.pixel_history,
+                    &mut self.doc.undo_order,
+                );
+                if self.doc.undo_order.undo.len() != before {
+                    refresh_history_panel(&mut self.workspace, &self.doc.undo_order);
+                }
+                self.needs_redraw = true;
+            }
+        }
+    }
+
     /// Samples the live, **composited** document at `doc_point` (document
     /// space) — every visible layer, in its own real blend order and
     /// opacity, exactly what's on screen — and, if the sampled texel is
@@ -29248,6 +29472,13 @@ impl App {
             self.relayout_after_gallery();
         }
         let ending = self.drag.take();
+        if let Some(Drag::Gradient {
+            start_doc,
+            current_doc,
+        }) = &ending
+        {
+            self.apply_gradient(*start_doc, *current_doc);
+        }
         self.commit_drag(ending);
         // Whatever owned the pointer let go: the tooltip may arm again
         // where the pointer now rests (review L4).
@@ -29396,6 +29627,7 @@ impl App {
             }
             Some(ActivatedCommand::SwapColours) => self.swap_colours(),
             Some(ActivatedCommand::ResetColours) => self.reset_colours(),
+            Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
