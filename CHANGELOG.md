@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.208.0] - 2026-10-12
+
+### Changed
+
+- Foreground/background colour: model, Tools panel swatches, picker popover, commands
+
 ## [0.207.1] - 2026-10-12
 
 ### Fixed
