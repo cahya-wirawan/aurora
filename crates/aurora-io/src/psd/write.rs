@@ -2161,6 +2161,7 @@ fn raw_mask<R: std::io::Read + Seek>(
 }
 
 /// One record's fields, checked against `want`.
+#[allow(clippy::too_many_lines)] // one linear list of checks, one per field
 fn raw_record<R: std::io::Read + Seek>(
     raw: &mut Raw<R>,
     i: usize,
@@ -2230,7 +2231,7 @@ fn raw_record<R: std::io::Read + Seek>(
                     .map(u32::from_be_bytes);
             }
             b"lsct" => section = Some(data),
-            k if super::write_adjust::is_adjustment_key(k) => adjustment_blocks.push((key, data)),
+            k if super::write_adjust::is_adjustment_key(*k) => adjustment_blocks.push((key, data)),
             k if aurora_doc::smart_object::SMART_OBJECT_BLOCK_KEYS.contains(k) => {
                 smart_blocks.push(aurora_doc::SmartObjectBlock { key, data });
             }

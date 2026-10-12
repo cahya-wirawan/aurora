@@ -36611,6 +36611,7 @@ mod tests {
     /// `resave_<name>` for `scripts/verify_psd_write.py` (psd-tools).
     /// Skips ("not run") when the corpus is absent.
     #[test]
+    #[allow(clippy::too_many_lines)] // one linear script per corpus file
     fn corpus_adjustment_psds_survive_a_psd_save_and_reopen() {
         let files = [
             "adjustments/curves_rgb.psd",
@@ -36635,7 +36636,7 @@ mod tests {
             let Ok(merged) = aurora_io::decode_psd_merged_image(&bytes) else {
                 unreachable!("{relative}: merged image")
             };
-            let (_scratch, mut store) = real_tile_store();
+            let (scratch, mut store) = real_tile_store();
             let (doc1, img1) = open_and_composite_psd(
                 &bytes,
                 &mut store,
@@ -36644,7 +36645,7 @@ mod tests {
             let target = {
                 let name = relative.rsplit('/').next().unwrap_or(relative);
                 keep.as_ref().map_or_else(
-                    || _scratch.path().join(format!("resave_{name}")),
+                    || scratch.path().join(format!("resave_{name}")),
                     |dir| dir.join(format!("resave_{name}")),
                 )
             };
@@ -36709,10 +36710,14 @@ mod tests {
             );
             // The save changes the reopened composite by at most one level
             // (the 16-bit file's own quantisation).
-            for c in 0..3 {
-                assert!(roundtrip_max[c] <= 1.0, "{relative}: {roundtrip_max:?}");
-                assert!(roundtrip_mean[c] <= 0.05, "{relative}: {roundtrip_mean:?}");
-            }
+            assert!(
+                roundtrip_max.iter().all(|&m| m <= 1.0),
+                "{relative}: {roundtrip_max:?}"
+            );
+            assert!(
+                roundtrip_mean.iter().all(|&m| m <= 0.05),
+                "{relative}: {roundtrip_mean:?}"
+            );
             if relative.contains("curves") || relative.contains("levels") {
                 assert_eq!(before, after, "{relative}: parameters survive exactly");
             }

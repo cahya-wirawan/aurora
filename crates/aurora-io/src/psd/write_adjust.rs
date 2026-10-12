@@ -83,8 +83,8 @@ pub(super) struct EncodedAdjustment {
 }
 
 /// Whether `key` is one of the three blocks this module writes.
-pub(super) fn is_adjustment_key(key: &[u8; 4]) -> bool {
-    matches!(key, b"curv" | b"levl" | b"hue2")
+pub(super) fn is_adjustment_key(key: [u8; 4]) -> bool {
+    matches!(&key, b"curv" | b"levl" | b"hue2")
 }
 
 fn pad4(data: &mut Vec<u8>) {
@@ -333,7 +333,10 @@ fn encode_hue2(
                 .get(index)
                 .copied()
                 .unwrap_or_default();
-            if range.edges() != standard {
+            // Both are small whole numbers held in `f32`: exact.
+            #[allow(clippy::float_cmp)]
+            let custom = range.edges() != standard;
+            if custom {
                 rounding.ranges_reset = true;
             }
             for edge in standard {
