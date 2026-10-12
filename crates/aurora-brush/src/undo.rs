@@ -706,7 +706,7 @@ pub const SPILL_FILES_PER_CALL: usize = 64;
 /// success resets it. Wall-clock time, not pushes or turns: `trim` runs
 /// every event-loop turn.
 const SPILL_BACKOFF_FIRST: std::time::Duration = std::time::Duration::from_secs(2);
-const SPILL_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+const SPILL_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// What the history holds, counted honestly (0.210.0) -- see
 /// [`PixelHistory::stats`].

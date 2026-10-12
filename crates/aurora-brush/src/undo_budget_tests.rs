@@ -3,7 +3,7 @@
 //! `undo` so it can look at the stacks themselves.
 
 // Test code: slicing a fixture vector it just built is not a production panic.
-#![allow(clippy::indexing_slicing)]
+#![allow(clippy::indexing_slicing, clippy::redundant_closure_for_method_calls)]
 
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -89,7 +89,7 @@ fn spilled_steps(history: &PixelHistory) -> Vec<bool> {
         .undo
         .iter()
         .chain(&history.redo)
-        .map(|s| s.is_spilled())
+        .map(StrokeSnapshot::is_spilled)
         .collect()
 }
 
@@ -640,7 +640,10 @@ fn undo_steps_spill_before_redo_steps() {
     // ~3 MiB held; a 2.5 MiB budget spills down to 1.875 MiB: three steps.
     history.set_budget_bytes(5 << 19);
     history.trim();
-    assert!(history.undo.iter().all(|s| s.is_spilled()), "undo first");
+    assert!(
+        history.undo.iter().all(StrokeSnapshot::is_spilled),
+        "undo first"
+    );
     assert!(history.redo.iter().all(|s| !s.is_spilled()), "redo kept");
     // And everything still comes back exactly.
     for i in (0..3).rev() {
@@ -687,7 +690,7 @@ fn a_failed_spill_backs_off_by_time_and_resets_on_success() {
     assert_eq!(history.stats().spill_failures, 2);
     assert_eq!(history.backoff, std::time::Duration::ZERO);
     assert!(history.retry_at.is_none());
-    assert!(history.undo.iter().any(|s| s.is_spilled()));
+    assert!(history.undo.iter().any(StrokeSnapshot::is_spilled));
 }
 
 #[test]

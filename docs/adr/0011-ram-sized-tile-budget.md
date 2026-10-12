@@ -81,7 +81,7 @@ The background compositor's mirror store is a pool member too. It joins the docu
 
 **Why a quarter.** The history holds compressed bytes, so a quarter of the tile budget retains many more edits than the resident tiles beside it, while the three quarters left cover the tile store itself, the shadow cache and the OS. The quarter, the floor and the 3/4 spill target are engineering choices, not measurements.
 
-**Not shared with the pool.** The budget is per document session, not part of the `ResidencyPool`: N open documents can hold N budgets of history (parked documents' histories are not shrunk). Spill I/O is synchronous on the UI thread (64 MiB per call), and packing a stroke runs on the UI thread at its end; both are disclosed in PLAN.md 0.210.0.
+**Not shared with the pool.** The budget is per document session, not part of the `ResidencyPool`: N open documents can hold N budgets of history (parked documents' histories are not shrunk). Spill I/O is synchronous on the UI thread (64 MiB and 64 files per call; a failed spill backs off 2 s doubling to 60 s by wall-clock time; one file per spilled piece, so many small steps mean many small files), and a temp-file cleaner can delete spill files while the app runs (the step then fails to undo, with a calm notice), and packing a stroke runs on the UI thread at its end; both are disclosed in PLAN.md 0.210.0.
 
 **Reconsider if** several large documents are routinely open at once and history memory adds up, or if the stroke-end packing hitch is noticeable on real hardware (move it to a worker, as the autosave and tile encoding already are).
 

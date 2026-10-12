@@ -67,8 +67,9 @@ golden-image tests are `#[ignore]`d.
   1024-tile flat fill costs about 2 MiB instead of 512 MiB. Costs, plainly: a
   stroke's end packs its tiles on the UI thread (17-20 ms for 4 painted tiles,
   up to about 80 ms for 64-256 in the dev test profile; release not measured),
-  spilling writes synchronously (at most 64 MiB per call, so the budget is
-  soft), a fill holds its raw tiles until it ends, and the budget is per
+  spilling writes synchronously (at most 64 MiB and 64 files per call, so the
+  budget is soft), a temp-file cleaner can remove spill files (that step then
+  cannot be undone and a status-bar notice says so), a fill holds its raw tiles until it ends, and the budget is per
   document. Not seen in the live app.
 - **History panel** lists the user's own steps ("Brush Stroke", layer edits,
   and so on) under an "Open" or "New Document" row; the current step is
