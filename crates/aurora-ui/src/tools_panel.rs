@@ -24,8 +24,9 @@
 //! buttons sit in [`TOOL_GROUPS`], one row per group of at most two, and a
 //! group rule ([`widgets::insert_separator`], the menu separator's 1 px
 //! `border.default` line) separates the groups: move and select, view,
-//! sample, paint — Photoshop's own grouping, trimmed to the tools Aurora
-//! has. A group of one (the Eyedropper) fills the left cell.
+//! sample, paint, fill — Photoshop's own grouping, trimmed to the tools
+//! Aurora has (the fill group, Gradient and Paint Bucket, is 0.209.0's: a
+//! row of its own under the paint group). A group of one (the Eyedropper) fills the left cell.
 //!
 //! **The colour swatches (0.208.0).** Below the last tool group, behind
 //! one more group rule, sit Photoshop's foreground/background swatches,
@@ -89,11 +90,12 @@ pub const TOOL_COLUMNS: usize = 2;
 /// The groups of the strip, top to bottom, each one row of at most
 /// [`TOOL_COLUMNS`] buttons, a rule between consecutive groups. Together
 /// they hold every tool of [`Tool::ALL`], in that order.
-pub const TOOL_GROUPS: [&[Tool]; 4] = [
+pub const TOOL_GROUPS: [&[Tool]; 5] = [
     &[Tool::Move, Tool::MarqueeSelect],
     &[Tool::Zoom, Tool::Pan],
     &[Tool::Eyedropper],
     &[Tool::Brush, Tool::Eraser],
+    &[Tool::Gradient, Tool::PaintBucket],
 ];
 
 /// The icon on `tool`'s button. (`Move` and `Brush` are the icons the
@@ -109,13 +111,15 @@ pub const fn tool_icon(tool: Tool) -> IconKind {
         Tool::Eyedropper => IconKind::Eyedropper,
         Tool::Brush => IconKind::Brush,
         Tool::Eraser => IconKind::Eraser,
+        Tool::Gradient => IconKind::Gradient,
+        Tool::PaintBucket => IconKind::PaintBucket,
     }
 }
 
 /// `tool`'s button description: its name and its shortcut key.
 #[must_use]
 pub fn tool_description(tool: Tool) -> String {
-    format!("{} tool, shortcut {}", tool.label(), tool.shortcut_key())
+    format!("{} tool, shortcut {}", tool.label(), tool.shortcut_text())
 }
 
 /// The strip and its buttons, one per [`Tool::ALL`] entry, in that order.

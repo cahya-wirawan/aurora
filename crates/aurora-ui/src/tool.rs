@@ -62,13 +62,21 @@ pub enum Tool {
     /// `Brush` uses, subtractive instead of blended. Same reason the
     /// actual erasing logic lives in `aurora-app`, not here.
     Eraser,
+    /// Drags out a gradient from the foreground to the background colour
+    /// over the active pixel layer (0.209.0): real, via
+    /// `aurora_brush::gradient_fill` in `aurora-app`.
+    Gradient,
+    /// Fills a region of similar colour on the active pixel layer with
+    /// the foreground colour (0.209.0): real, via
+    /// `aurora_brush::flood_fill` in `aurora-app`.
+    PaintBucket,
 }
 
 impl Tool {
     /// Every tool this enum has today, in the fixed order they're
     /// offered to the user (matches PLAN.md's own bullets: Move, Marquee
-    /// Select, Zoom, Pan, Eyedropper, then Brush, Eraser).
-    pub const ALL: [Self; 7] = [
+    /// Select, Zoom, Pan, Eyedropper, then Brush, Eraser, and the 0.209.0 fills Gradient and Paint Bucket).
+    pub const ALL: [Self; 9] = [
         Self::Move,
         Self::MarqueeSelect,
         Self::Zoom,
@@ -76,6 +84,8 @@ impl Tool {
         Self::Eyedropper,
         Self::Brush,
         Self::Eraser,
+        Self::Gradient,
+        Self::PaintBucket,
     ];
 
     /// A short, human-readable label — for a future tool palette/status
@@ -90,6 +100,8 @@ impl Tool {
             Self::Eyedropper => "Eyedropper",
             Self::Brush => "Brush",
             Self::Eraser => "Eraser",
+            Self::Gradient => "Gradient",
+            Self::PaintBucket => "Paint Bucket",
         }
     }
 
@@ -107,6 +119,25 @@ impl Tool {
             Self::Eyedropper => 'I',
             Self::Brush => 'B',
             Self::Eraser => 'E',
+            Self::Gradient | Self::PaintBucket => 'G',
+        }
+    }
+
+    /// Whether the tool's shortcut needs `Shift` as well as
+    /// [`Self::shortcut_key`] (Photoshop's grouped `G` key, 0.209.0:
+    /// `G` selects the Gradient, `Shift+G` the Paint Bucket).
+    #[must_use]
+    pub const fn shortcut_needs_shift(self) -> bool {
+        matches!(self, Self::PaintBucket)
+    }
+
+    /// The shortcut as the user reads it: `"B"`, `"Shift+G"`.
+    #[must_use]
+    pub fn shortcut_text(self) -> String {
+        if self.shortcut_needs_shift() {
+            format!("Shift+{}", self.shortcut_key())
+        } else {
+            self.shortcut_key().to_string()
         }
     }
 }
@@ -147,20 +178,32 @@ mod tests {
 
     #[test]
     fn all_lists_every_variant_once() {
-        assert_eq!(Tool::ALL.len(), 7);
+        assert_eq!(Tool::ALL.len(), 9);
         let mut seen = Tool::ALL.to_vec();
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
-        assert_eq!(seen.len(), 7, "ALL must not repeat a variant");
+        assert_eq!(seen.len(), 9, "ALL must not repeat a variant");
     }
 
     #[test]
-    fn shortcut_keys_are_distinct_upper_case_letters() {
-        let mut keys: Vec<char> = Tool::ALL.iter().map(|tool| tool.shortcut_key()).collect();
+    fn shortcut_keys_are_upper_case_letters_and_the_chords_are_distinct() {
+        let keys: Vec<char> = Tool::ALL.iter().map(|tool| tool.shortcut_key()).collect();
         assert!(keys.iter().all(char::is_ascii_uppercase), "{keys:?}");
-        keys.sort_unstable();
-        keys.dedup();
-        assert_eq!(keys.len(), Tool::ALL.len());
+        let mut chords: Vec<(char, bool)> = Tool::ALL
+            .iter()
+            .map(|tool| (tool.shortcut_key(), tool.shortcut_needs_shift()))
+            .collect();
+        chords.sort_unstable();
+        chords.dedup();
+        assert_eq!(chords.len(), Tool::ALL.len());
+        // Only the grouped G key shares a letter, and only by Shift.
+        let mut letters = keys;
+        letters.sort_unstable();
+        letters.dedup();
+        assert_eq!(letters.len(), Tool::ALL.len() - 1);
+        assert_eq!(Tool::Gradient.shortcut_text(), "G");
+        assert_eq!(Tool::PaintBucket.shortcut_text(), "Shift+G");
+        assert_eq!(Tool::Brush.shortcut_text(), "B");
     }
 
     #[test]

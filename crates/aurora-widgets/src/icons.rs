@@ -110,11 +110,17 @@ pub enum IconKind {
     /// A filled square in front of an outlined one: reset the
     /// foreground and background colours to black and white (0.208.0).
     DefaultColours,
+    /// A framed ramp: vertical bars that thicken left to right, the
+    /// Gradient tool (0.209.0).
+    Gradient,
+    /// A tilted bucket with a drop beside it: the Paint Bucket tool
+    /// (0.209.0).
+    PaintBucket,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 27] = [
+    pub const ALL: [IconKind; 29] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -142,6 +148,8 @@ impl IconKind {
         IconKind::Eraser,
         IconKind::SwapArrows,
         IconKind::DefaultColours,
+        IconKind::Gradient,
+        IconKind::PaintBucket,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -176,6 +184,8 @@ impl IconKind {
             IconKind::Eraser => "Eraser",
             IconKind::SwapArrows => "Swap Arrows",
             IconKind::DefaultColours => "Default Colours",
+            IconKind::Gradient => "Gradient",
+            IconKind::PaintBucket => "Paint Bucket",
         }
     }
 }
@@ -594,6 +604,30 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
                 .l(5.0, 13.0)
                 .l(5.0, 9.0),
         ],
+        IconKind::Gradient => vec![
+            // The frame, and three bars that grow from left to right.
+            rounded_box(2.0, 3.0, 12.0, 10.0, 1.0),
+            stroke_part().m(5.0, 7.0).l(5.0, 9.0),
+            stroke_part().m(8.0, 6.0).l(8.0, 10.0),
+            stroke_part().m(11.0, 5.0).l(11.0, 11.0),
+        ],
+        IconKind::PaintBucket => vec![
+            // A tilted bucket (a diamond), the paint line across it, and
+            // the drop pouring from its corner.
+            stroke_part()
+                .m(2.0, 8.0)
+                .l(7.0, 3.0)
+                .l(12.0, 8.0)
+                .l(7.0, 13.0)
+                .closed(),
+            stroke_part().m(4.0, 6.0).l(10.0, 12.0),
+            fill_part()
+                .m(14.0, 10.0)
+                .l(15.0, 12.0)
+                .l(14.0, 14.0)
+                .l(13.0, 12.0)
+                .closed(),
+        ],
     }
 }
 
@@ -706,7 +740,7 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 27);
+        assert_eq!(IconKind::ALL.len(), 29);
         for kind in [IconKind::SwapArrows, IconKind::DefaultColours] {
             assert!(IconKind::ALL.contains(&kind));
             assert!(!icon_parts(kind).is_empty(), "{kind:?}");
