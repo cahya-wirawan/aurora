@@ -87,6 +87,13 @@ impl DocumentShelf {
     ) -> (usize, bool) {
         let mut evicted = 0;
         let mut over = false;
+        // 0.210.0: finish a pixel-history spill a push left over (the
+        // history's budget is soft by one bounded write per call). Not
+        // counted in `over`: a failing disk must not keep the loop awake.
+        active.pixel_history.trim();
+        for parked in &mut self.parked {
+            parked.pixel_history.trim();
+        }
         for store in std::iter::once(&mut active.tile_store)
             .chain(
                 self.parked
@@ -501,6 +508,23 @@ pub(crate) struct DocumentSession {
     pub(crate) tile_store: Option<aurora_tile::TileStore>,
 }
 
+/// A document's pixel history (0.210.0): snapshots compressed, the oldest
+/// spilled to a directory inside `store`'s scratch directory once the
+/// history passes its memory budget (`aurora_tile::system_history_budget_bytes`:
+/// a quarter of the tile budget, 32 MiB to 2 GiB, `AURORA_HISTORY_BUDGET_MB`
+/// overrides). With no live store (a startup that could not make one)
+/// there is nowhere to spill and the history stays in memory.
+pub(crate) fn new_pixel_history(
+    store: Option<&aurora_tile::TileStore>,
+) -> aurora_brush::PixelHistory {
+    store.map_or_else(aurora_brush::PixelHistory::new, |store| {
+        aurora_brush::PixelHistory::with_spill(
+            store.staging_root(),
+            aurora_tile::system_history_budget_bytes(),
+        )
+    })
+}
+
 impl DocumentSession {
     /// Makes this session's tile store the residency pool's active group
     /// (0.187.0; [`aurora_tile::TileStore::activate_pool_group`]), so it
@@ -568,7 +592,7 @@ impl DocumentSession {
             canvas_size,
             skipped_tiles,
             history,
-            pixel_history: aurora_brush::PixelHistory::new(),
+            pixel_history: new_pixel_history(tile_store.as_ref()),
             undo_order,
             composite_cache: CompositeCache::default(),
             active_layer,
@@ -807,5 +831,125 @@ mod tests {
         let second = startup_session();
         assert_ne!(first.id, second.id);
         assert!(first.id < second.id);
+    }
+
+    /// 0.210.0: a session's pixel history spills into its own store's
+    /// scratch directory and takes its files with it when it is dropped;
+    /// a session with no store still has a (memory-only) history.
+    #[test]
+    fn a_sessions_pixel_history_spills_inside_its_stores_scratch_and_cleans_up() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let scratch = dir.path().join("scratch");
+        let Some(budget) = std::num::NonZeroUsize::new(8) else {
+            unreachable!("non-zero");
+        };
+        let store = match aurora_tile::TileStore::new(scratch.clone(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("{err}"),
+        };
+        let mut history = super::new_pixel_history(Some(&store));
+        assert_eq!(
+            history.budget_bytes(),
+            aurora_tile::system_history_budget_bytes(),
+            "the budget is the system's"
+        );
+        history.set_budget_bytes(1 << 20);
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        for i in 0..6_u32 {
+            let mut snapshot = aurora_brush::StrokeSnapshot::new(surface);
+            let noise: Vec<half::f16> = (0..aurora_tile::SAMPLES)
+                .map(|n| {
+                    half::f16::from_bits(
+                        (n as u32).wrapping_mul(2_654_435_761_u32.wrapping_add(i)) as u16
+                    )
+                })
+                .collect();
+            assert!(snapshot.record_content(aurora_tile::TileId { x: i, y: 0 }, &noise));
+            assert!(history.push(snapshot));
+        }
+        let stats = history.stats();
+        assert!(stats.spilled_steps >= 4, "{stats:?}");
+        let spilled_somewhere_under_scratch = std::fs::read_dir(&scratch)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("history-"));
+        assert!(spilled_somewhere_under_scratch);
+        drop(history);
+        let left = std::fs::read_dir(&scratch)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("history-"))
+            .count();
+        assert_eq!(left, 0, "dropping the history removes its directory");
+        let _ = super::new_pixel_history(None);
+    }
+
+    /// 0.210.0: a spill file a temp-file cleaner removed makes the undo
+    /// fail (the step stays) and becomes a calm status-bar notice once,
+    /// not a dialog; a store failure does not.
+    #[test]
+    fn a_removed_history_file_becomes_a_calm_notice_and_the_step_stays() {
+        use crate::{LockRefusal, adopt_history_failure, lock_refusal_applies};
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(8) else {
+            unreachable!("non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().join("scratch"), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("{err}"),
+        };
+        let mut history = aurora_brush::PixelHistory::with_spill(store.staging_root(), 1);
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        let mut snapshot = aurora_brush::StrokeSnapshot::new(surface);
+        let content = vec![half::f16::from_f32(0.5); aurora_tile::SAMPLES];
+        assert!(snapshot.record_content(tile, &content));
+        if let Ok(t) = store.get_mut(surface, tile) {
+            t.texels_mut().copy_from_slice(&content);
+        }
+        assert!(history.push(snapshot));
+        assert_eq!(history.stats().spilled_steps, 1, "spilled at once");
+        // The cleaner removes the history directory.
+        let history_dir = std::fs::read_dir(dir.path().join("scratch"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().starts_with("history-"))
+            .map(|e| e.path());
+        let Some(history_dir) = history_dir else {
+            unreachable!("the spill directory exists");
+        };
+        assert!(std::fs::remove_dir_all(history_dir).is_ok());
+
+        let mut notice = None;
+        adopt_history_failure(&mut history, None, &mut notice);
+        assert_eq!(notice, None, "nothing failed yet");
+        assert!(history.undo(&mut store).is_err());
+        assert!(history.can_undo(), "the step stays");
+        adopt_history_failure(&mut history, None, &mut notice);
+        let Some((why, _)) = notice else {
+            unreachable!("the failure is reported");
+        };
+        assert_eq!(why, LockRefusal::HistoryUnavailable);
+        assert!(
+            why.message()
+                .starts_with("Couldn't undo or redo: history file unavailable")
+        );
+        assert!(lock_refusal_applies(
+            why,
+            aurora_ui::Tool::Brush,
+            aurora_doc::LayerLock::default()
+        ));
+        notice = None;
+        adopt_history_failure(&mut history, None, &mut notice);
+        assert_eq!(notice, None, "reported once");
     }
 }

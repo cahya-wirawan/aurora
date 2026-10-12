@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-12, version 0.209.1.** This file is updated every round (every
+**As of 2026-10-12, version 0.210.0.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -60,7 +60,17 @@ golden-image tests are `#[ignore]`d.
 - **Paint and erase** with a Brush and Eraser (radius 1-256 px in the options
   bar; a tool setting, not undoable, reset on launch). Unified undo/redo
   across structural edits and pixel strokes; whole-stroke coalescing; unlimited
-  history stored as reversible operations plus dirtied tiles.
+  history stored as reversible operations plus dirtied tiles. Since 0.210.0 the
+  pixel part is compressed (lossless) and bounded by a memory budget (a quarter
+  of the tile budget, 32 MiB to 2 GiB; `AURORA_HISTORY_BUDGET_MB`): the oldest
+  steps spill to the scratch disk and page back on undo, none is dropped. A
+  1024-tile flat fill costs about 2 MiB instead of 512 MiB. Costs, plainly: a
+  stroke's end packs its tiles on the UI thread (17-20 ms for 4 painted tiles,
+  up to about 80 ms for 64-256 in the dev test profile; release not measured),
+  spilling writes synchronously (at most 64 MiB and 64 files per call, so the
+  budget is soft), a temp-file cleaner can remove spill files (that step then
+  cannot be undone and a status-bar notice says so), a fill holds its raw tiles until it ends, and the budget is per
+  document. Not seen in the live app.
 - **History panel** lists the user's own steps ("Brush Stroke", layer edits,
   and so on) under an "Open" or "New Document" row; the current step is
   highlighted, undone steps are dimmed, and clicking a row jumps there

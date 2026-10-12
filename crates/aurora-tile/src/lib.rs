@@ -16,21 +16,26 @@ mod budget;
 pub mod codec;
 mod error;
 mod scratch;
+mod spill;
 mod staging;
 mod store;
 mod tile;
 mod writer;
 
 pub use budget::{
-    CEILING_BYTES, EVICTION_BURST, FLOOR_BYTES, OVERRIDE_ENV, PARKED_RESERVE_DIVISOR, PoolGroup,
-    PoolShares, RAM_SHARE_DIVISOR, ResidencyPool, TILE_BYTES, budget_bytes_for_ram, clamp_bytes,
-    parse_override_mb, physical_ram_bytes, pool_shares, resolve_budget_bytes, share_tiles,
-    system_budget_bytes, tiles_for_bytes,
+    CEILING_BYTES, EVICTION_BURST, FLOOR_BYTES, HISTORY_CEILING_BYTES, HISTORY_FLOOR_BYTES,
+    HISTORY_OVERRIDE_ENV, HISTORY_OVERRIDE_MIN_BYTES, HISTORY_SHARE_DIVISOR, OVERRIDE_ENV,
+    PARKED_RESERVE_DIVISOR, PoolGroup, PoolShares, RAM_SHARE_DIVISOR, ResidencyPool, TILE_BYTES,
+    budget_bytes_for_ram, clamp_bytes, history_budget_for_tile_budget, parse_history_override_mb,
+    parse_override_mb, physical_ram_bytes, pool_shares, resolve_budget_bytes,
+    resolve_history_budget_bytes, share_tiles, system_budget_bytes, system_history_budget_bytes,
+    tiles_for_bytes,
 };
 pub use error::TileError;
 pub use scratch::{
     LOCK_FILE_NAME, ScratchLock, SweepReport, lock_scratch_dir, sweep_orphaned_scratch_dirs,
 };
+pub use spill::{SpillArea, SpillFile};
 pub use staging::{StagedTile, StagingArea, StagingRoot};
 pub use store::{EncodedTile, Stats, TileLookup, TileShare, TileSnapshot, TileStore};
 pub use tile::{CHANNELS, SAMPLE_FORMAT, SAMPLES, Surface, SurfaceId, TEXELS, TILE, Tile, TileId};

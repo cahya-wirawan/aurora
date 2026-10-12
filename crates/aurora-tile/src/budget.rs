@@ -221,6 +221,81 @@ pub fn pool_shares(
     }
 }
 
+/// The share of the tile budget the pixel-history memory budget takes:
+/// one quarter (`tile_budget / HISTORY_SHARE_DIVISOR`, 0.210.0, ADR 0011's
+/// 0.210.0 addendum). The history holds *compressed* tile copies, so a
+/// quarter of the tile budget keeps many more edits than the resident
+/// tiles it sits beside; whatever does not fit is spilled to the
+/// document's scratch directory, never dropped.
+pub const HISTORY_SHARE_DIVISOR: u64 = 4;
+
+/// The smallest pixel-history memory budget: 32 MiB (a quarter of
+/// [`FLOOR_BYTES`]).
+pub const HISTORY_FLOOR_BYTES: u64 = FLOOR_BYTES / HISTORY_SHARE_DIVISOR;
+
+/// The largest pixel-history memory budget: 2 GiB (a quarter of
+/// [`CEILING_BYTES`]).
+pub const HISTORY_CEILING_BYTES: u64 = CEILING_BYTES / HISTORY_SHARE_DIVISOR;
+
+/// The smallest value the history override accepts: 1 MiB, so a tester
+/// can force spilling with a small document. (The tile override's floor
+/// is much higher because a tile store needs a working set; the history
+/// only needs to stay correct when everything spills.)
+pub const HISTORY_OVERRIDE_MIN_BYTES: u64 = 1 << 20;
+
+/// The environment variable that overrides the derived pixel-history
+/// memory budget, in MiB (base 2), read by [`system_history_budget_bytes`].
+pub const HISTORY_OVERRIDE_ENV: &str = "AURORA_HISTORY_BUDGET_MB";
+
+/// The pixel-history memory budget for a tile budget of `tile_budget`
+/// bytes: a quarter of it, clamped to [[`HISTORY_FLOOR_BYTES`],
+/// [`HISTORY_CEILING_BYTES`]].
+#[must_use]
+pub const fn history_budget_for_tile_budget(tile_budget: u64) -> u64 {
+    let share = tile_budget / HISTORY_SHARE_DIVISOR;
+    if share < HISTORY_FLOOR_BYTES {
+        HISTORY_FLOOR_BYTES
+    } else if share > HISTORY_CEILING_BYTES {
+        HISTORY_CEILING_BYTES
+    } else {
+        share
+    }
+}
+
+/// Parses a [`HISTORY_OVERRIDE_ENV`] value: whole MiB, whitespace
+/// ignored, clamped to [[`HISTORY_OVERRIDE_MIN_BYTES`],
+/// [`CEILING_BYTES`]]; anything else is `None` (the derived budget
+/// stands).
+#[must_use]
+pub fn parse_history_override_mb(value: &str) -> Option<u64> {
+    let digits = value.trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mib = digits.parse::<u64>().unwrap_or(u64::MAX);
+    Some(
+        mib.saturating_mul(1 << 20)
+            .clamp(HISTORY_OVERRIDE_MIN_BYTES, CEILING_BYTES),
+    )
+}
+
+/// The history budget from a tile budget and an optional override value:
+/// the override when it parses, else [`history_budget_for_tile_budget`].
+#[must_use]
+pub fn resolve_history_budget_bytes(tile_budget: u64, override_value: Option<&str>) -> u64 {
+    override_value
+        .and_then(parse_history_override_mb)
+        .unwrap_or_else(|| history_budget_for_tile_budget(tile_budget))
+}
+
+/// [`resolve_history_budget_bytes`] for this machine and process: the
+/// [`system_budget_bytes`] tile budget and [`HISTORY_OVERRIDE_ENV`].
+#[must_use]
+pub fn system_history_budget_bytes() -> u64 {
+    let value = std::env::var(HISTORY_OVERRIDE_ENV).ok();
+    resolve_history_budget_bytes(system_budget_bytes(), value.as_deref())
+}
+
 /// The total physical memory of this machine in bytes, or `None` when
 /// it cannot be read. Linux reads `/proc/meminfo`'s `MemTotal` (no
 /// `unsafe`), macOS `sysctl hw.memsize`, Windows
@@ -552,6 +627,33 @@ mod tests {
 
     fn nz(n: usize) -> NonZeroUsize {
         NonZeroUsize::new(n).unwrap_or(NonZeroUsize::MIN)
+    }
+
+    #[test]
+    fn the_history_budget_is_a_quarter_of_the_tile_budget_with_floor_and_ceiling() {
+        assert_eq!(HISTORY_FLOOR_BYTES, 32 << 20);
+        assert_eq!(HISTORY_CEILING_BYTES, 2 << 30);
+        assert_eq!(history_budget_for_tile_budget(FLOOR_BYTES), 32 << 20);
+        assert_eq!(history_budget_for_tile_budget(0), 32 << 20);
+        assert_eq!(history_budget_for_tile_budget(1 << 30), 256 << 20);
+        assert_eq!(history_budget_for_tile_budget(CEILING_BYTES), 2 << 30);
+        assert_eq!(history_budget_for_tile_budget(u64::MAX), 2 << 30);
+        // The override: whole MiB, 1 MiB to the tile ceiling.
+        assert_eq!(parse_history_override_mb(" 5 "), Some(5 << 20));
+        assert_eq!(parse_history_override_mb("0"), Some(1 << 20));
+        assert_eq!(
+            parse_history_override_mb("99999999999"),
+            Some(CEILING_BYTES)
+        );
+        for bad in ["", "-1", "1.5", "4MB", "x", "+3"] {
+            assert_eq!(parse_history_override_mb(bad), None, "{bad:?}");
+        }
+        assert_eq!(resolve_history_budget_bytes(1 << 30, Some("64")), 64 << 20);
+        assert_eq!(
+            resolve_history_budget_bytes(1 << 30, Some("junk")),
+            256 << 20
+        );
+        assert_eq!(resolve_history_budget_bytes(1 << 30, None), 256 << 20);
     }
 
     #[test]
