@@ -856,10 +856,13 @@ fn the_app_dab_sites_take_their_colour_from_dab_colour_only() {
         );
     }
     // The Escape hook passes the real popover, dialog and palette state.
+    // Compared with all whitespace removed: a Windows checkout has CRLF line
+    // endings, and rustfmt's layout may change.
+    let squeeze = |text: &str| text.split_whitespace().collect::<String>();
     assert!(
-        production.contains(
-            "colour_state::escape_closes_popover(\n            key,\n            self.colour.popover.is_some(),\n            self.dialog.is_some(),\n            self.command_palette.is_some(),\n        )"
-        ),
+        squeeze(production).contains(&squeeze(
+            "colour_state::escape_closes_popover(key, self.colour.popover.is_some(), self.dialog.is_some(), self.command_palette.is_some(),)"
+        )),
         "the Escape hook"
     );
 }

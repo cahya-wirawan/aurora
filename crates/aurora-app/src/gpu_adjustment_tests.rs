@@ -49,8 +49,14 @@ fn tolerance() -> f32 {
 /// 0.206.1: 10 steps, not 8. Windows' WARP software adapter reached
 /// exactly 8 steps on Hue/Saturation hue shifts (no margin) and 3.4e-3..
 /// 3.9e-3 elsewhere.
+///
+/// 0.208.2: 16 steps. The error scales with `1 / alpha` of the backdrop
+/// (`straight_backdrop` divides by it; the random tiles reach alpha 0.1, a
+/// factor of 10), and GitHub's macOS adapter (Apple Paravirtual) measured
+/// 11 steps on Hue/Saturation lightness -50 where the RTX 3090 stays
+/// within 6.
 fn translucent_tolerance() -> f32 {
-    10.0 / 2048.0
+    16.0 / 2048.0
 }
 
 fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
