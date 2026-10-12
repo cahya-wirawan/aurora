@@ -1169,6 +1169,25 @@ mod tests {
     }
 
     #[test]
+    fn a_transparency_locked_fill_leaves_stale_colour_under_zero_alpha_alone() {
+        let (_dir, mut s) = store();
+        // Fully transparent but with leftover RGB: a locked layer must
+        // not be touched there (the unlocked fill would replace it).
+        put(&mut s, 0, 0, [f16::ONE, f16::ONE, f16::ONE, f16::ZERO]);
+        let Ok((painted, snapshot)) = bucket(
+            &mut s,
+            (1, 1),
+            &spec((0, 0), 255, true),
+            FillMode::PreserveAlpha,
+        ) else {
+            unreachable!()
+        };
+        assert_eq!(painted, 0);
+        assert!(snapshot.is_empty());
+        assert_eq!(get(&mut s, 0, 0), [1.0, 1.0, 1.0, 0.0]);
+    }
+
+    #[test]
     fn a_fill_is_undone_exactly_by_its_snapshot() {
         let (_dir, mut s) = store();
         fill_rect(&mut s, 250, 250, 262, 262, grey(0.5));

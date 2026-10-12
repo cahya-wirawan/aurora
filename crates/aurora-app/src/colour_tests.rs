@@ -874,3 +874,38 @@ fn the_app_dab_sites_take_their_colour_from_dab_colour_only() {
         "the Escape hook"
     );
 }
+
+/// 0.209.0: the Paint Bucket fills with the foreground and the Gradient
+/// runs foreground to background (Reverse swaps them), and `App` reads
+/// those colours only through `fill_foreground`/`fill_background`. Compared
+/// with all whitespace removed (CRLF checkouts, rustfmt layout).
+#[test]
+fn the_app_fill_sites_take_their_colours_from_the_fill_accessors_only() {
+    use crate::colour_state::{ColourState, fill_background, fill_foreground};
+    let mut state = ColourState::default();
+    assert!(state.set(ColourTarget::Foreground, [0.1, 0.2, 0.3]));
+    assert!(state.set(ColourTarget::Background, [0.7, 0.8, 0.9]));
+    assert_eq!(fill_foreground(&state), [0.1, 0.2, 0.3]);
+    assert_eq!(fill_background(&state), [0.7, 0.8, 0.9]);
+
+    let source = include_str!("lib.rs");
+    let production = source.split("\nmod tests {").next().unwrap_or(source);
+    let squeeze = |text: &str| text.split_whitespace().collect::<String>();
+    let squeezed = squeeze(production);
+    // The bucket: the foreground alone.
+    assert!(squeezed.contains(&squeeze(
+        "&self.tool_settings, colour_state::fill_foreground(&self.colour.state), );"
+    )));
+    // The gradient: foreground then background.
+    assert!(squeezed.contains(&squeeze(
+        "colour_state::fill_foreground(&self.colour.state), colour_state::fill_background(&self.colour.state), );"
+    )));
+    assert_eq!(
+        squeezed.matches("colour_state::fill_foreground(").count(),
+        2
+    );
+    assert_eq!(
+        squeezed.matches("colour_state::fill_background(").count(),
+        1
+    );
+}
