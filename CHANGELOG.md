@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.214.0] - 2026-10-13
+
+### Added
+
+- Add Lasso, Polygonal Lasso and Magic Wand selection tools
+
 ## [0.213.0] - 2026-10-12
 
 ### Changed
