@@ -357,6 +357,14 @@ const GPU_MODES: [BlendMode; 19] = [
 
 const STEEP_LEVELS_CASES: [&str; 2] = ["gamma min 0.10", "narrow input span"];
 
+/// Hue/Saturation cases whose slope is also unbounded on a translucent
+/// backdrop: saturation +99/+100 divides by `1 - k` (a factor of 100 at
+/// +99), so a one-step `Cb` difference from the GPU's `straight_backdrop`
+/// division flips a pixel between grey and coloured. Held to the opaque
+/// tolerance only. The macOS and Windows CI adapters (Apple Paravirtual,
+/// WARP) rounded differently from the RTX 3090 and exposed this in 0.206.0.
+const STEEP_HUE_SAT_CASES: [&str; 3] = ["saturation +99", "saturation +100", "extremes"];
+
 /// Blend terms that divide or threshold (`ColorBurn`, `ColorDodge`,
 /// `VividLight`, `Divide`, `HardMix`) amplify a one-`f16`-step difference
 /// in `Cs` (the same class as the Curves tests' derived per-mode bound of
@@ -485,7 +493,9 @@ fn run_cases(
         // Slopes of 10 (gamma 0.10) and 255 (a one-level input span) scale a
         // translucent backdrop's one-step `Cb` difference past any fixed
         // bound; they are held to the opaque tolerance above instead.
-        if bound > tolerance() && STEEP_LEVELS_CASES.contains(&name) {
+        if bound > tolerance()
+            && (STEEP_LEVELS_CASES.contains(&name) || STEEP_HUE_SAT_CASES.contains(&name))
+        {
             continue;
         }
         let (_dir, mut store) = store();
