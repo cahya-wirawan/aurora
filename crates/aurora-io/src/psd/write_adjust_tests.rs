@@ -13,6 +13,7 @@ use aurora_doc::{Adjustment, BlendMode, LayerId, LayerKind, LayerTree};
 use super::write::{PsdSaveOptions, PsdSaveRefusal, psd_save_preflight};
 use super::write_adjust::encode_adjustment;
 use super::write_tests::{Doc, ok, read_back, records, rect, save, shape};
+use crate::error::IoError;
 
 // Photoshop's own blocks, from psd-tools' fixtures (`curves_rgb.psd`
 // "Curves 2", `levels_rgb.psd` "Levels 4", `huesaturation_colorize_rgb.psd`
@@ -622,4 +623,53 @@ fn adjustments_fixture_for_psd_tools() {
         ranges.join(", ")
     );
     ok(std::fs::write(out.join("adjustments.json"), json));
+}
+
+/// The writer's verifier compares an adjustment's block bytes (first pass)
+/// and what the reader makes of them (second pass).
+#[test]
+fn the_verifier_catches_a_wrong_adjustment_block_or_readback() {
+    let mut doc = adjustments_doc();
+    let dir = ok(tempfile::tempdir());
+    let path = dir.path().join("adjustments.psd");
+    let (bytes, outcome) = ok(doc.write());
+    ok(std::fs::write(&path, &bytes));
+    ok(super::write::verify_psd_file(&path, &outcome.expected));
+
+    let curves_at = |e: &super::write::PsdExpectation| {
+        e.layers
+            .iter()
+            .position(|l| l.adjustment.as_ref().is_some_and(|a| a.key == *b"curv"))
+    };
+    let mut wrong_bytes = outcome.expected.clone();
+    let Some(i) = curves_at(&wrong_bytes) else {
+        unreachable!("curves record")
+    };
+    if let Some(a) = wrong_bytes
+        .layers
+        .get_mut(i)
+        .and_then(|l| l.adjustment.as_mut())
+        && let Some(byte) = a.data.get_mut(8)
+    {
+        *byte ^= 1;
+    }
+    let err = super::write::verify_psd_file(&path, &wrong_bytes);
+    assert!(
+        matches!(&err, Err(IoError::PsdVerifyFailed { what }) if what.contains("adjustment blocks")),
+        "{err:?}"
+    );
+
+    let mut wrong_readback = outcome.expected.clone();
+    if let Some(a) = wrong_readback
+        .layers
+        .get_mut(i)
+        .and_then(|l| l.adjustment.as_mut())
+    {
+        a.readback = Adjustment::Curves(CurvesParams::identity());
+    }
+    let err = super::write::verify_psd_file(&path, &wrong_readback);
+    assert!(
+        matches!(&err, Err(IoError::PsdVerifyFailed { what }) if what.contains("adjustment")),
+        "{err:?}"
+    );
 }
