@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-12, version 0.207.0.** This file is updated every round (every
+**As of 2026-10-12, version 0.208.0.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -78,9 +78,12 @@ golden-image tests are `#[ignore]`d.
   and Marquee Select; Zoom and Pan; Eyedropper; Brush and Eraser). The selected
   tool is a filled accent square, hover and press tint it, each button keeps
   the tool's full name for assistive technology and a description with its
-  shortcut letter, and each is its own Tab stop. There are no foreground and
-  background colour swatches (the app has no such colour model) and no
-  tooltip yet. **Never seen by a human, nor on the Mac; the five new icons
+  shortcut letter, and each is its own Tab stop. Below the tools sit
+  Photoshop's foreground/background swatches (0.208.0), a swap arrow and a
+  default-colours icon: the Brush paints with the foreground, the Eyedropper
+  sets it (Alt/Option: the background), `X` swaps, `D` resets, and a swatch
+  opens an HSV colour picker popover (no hex entry, alpha or colour
+  management; the colours are not saved across sessions). No tooltip yet. **Never seen by a human, nor on the Mac; the five new icons
   (marquee, zoom in, hand, eyedropper, eraser) are provisional.** The options
   bar shows the active tool's options. Selection tools
   beyond a raw data model do not exist yet.
