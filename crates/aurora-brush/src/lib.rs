@@ -48,6 +48,8 @@
 //! still open.
 
 mod coverage;
+#[cfg(test)]
+mod coverage_tests;
 mod dab;
 mod fill;
 mod stamp;
