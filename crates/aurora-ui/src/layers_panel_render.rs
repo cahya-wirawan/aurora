@@ -527,3 +527,66 @@ fn write_tools_panel_png() {
         window,
     );
 }
+
+/// The two fill tools (0.209.0) for a human to look at: the Tools panel
+/// with the tool selected (scale 2) and the options bar's group for it
+/// (scale 2), one pair of pictures per tool.
+/// Run: `AURORA_REQUIRE_GPU=1 AURORA_REVIEW_PNG_DIR=<dir> cargo test -p
+/// aurora-ui --lib write_fill_tools_png -- --ignored --nocapture`.
+#[test]
+#[ignore = "writes a PNG for human review"]
+fn write_fill_tools_png() {
+    let Some(context) = aurora_gpu::test_support::real_context_or_skip() else {
+        return;
+    };
+    let scales = scales();
+    let mut ws = crate::build_workspace(&scales);
+    let controls = ok(crate::insert_tool_controls(
+        &mut ws.tree,
+        ws.options_bar,
+        ws.properties,
+        &scales,
+    ));
+    let view = crate::FillView {
+        radial: true,
+        reverse: false,
+        opacity: 80,
+        tolerance: 32,
+        contiguous: true,
+    };
+    for (tool, name) in [
+        (crate::Tool::Gradient, "gradient"),
+        (crate::Tool::PaintBucket, "paint-bucket"),
+    ] {
+        ok(crate::sync_tools_panel(&mut ws.tree, &ws.tools, tool));
+        ok(crate::sync_tool_controls(
+            &mut ws.tree,
+            controls,
+            tool,
+            None,
+            None,
+        ));
+        ok(crate::sync_fill_controls(
+            &mut ws.tree,
+            &controls,
+            tool,
+            view,
+            None,
+        ));
+        let (tools_root, bar) = (ws.tools.root, ws.options_bar);
+        write_crop_png(
+            &context,
+            &mut ws,
+            2.0,
+            &review_png(&format!("fill-tools-panel-{name}.png")),
+            tools_root,
+        );
+        write_crop_png(
+            &context,
+            &mut ws,
+            2.0,
+            &review_png(&format!("fill-tools-options-{name}.png")),
+            bar,
+        );
+    }
+}

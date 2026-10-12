@@ -17,7 +17,7 @@
 //! both recolour without ever changing alpha.
 //!
 //! **Bounds.** More than [`aurora_brush::MAX_FILL_TILES`] tiles is refused
-//! with [`FillRefused::TooLarge`] and the layer is untouched.
+//! with [`aurora_brush::FillError::TooLarge`] and the layer is untouched.
 
 use aurora_brush::{
     FillError, FillMode, FloodSpec, GradientKind, GradientSpec, MAX_FILL_TILES, StrokeSnapshot,

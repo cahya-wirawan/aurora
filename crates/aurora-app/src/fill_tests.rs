@@ -843,3 +843,59 @@ fn brush_and_eraser_keep_their_radius_row_and_fill_tools_replace_it() {
         );
     }
 }
+
+#[test]
+fn with_measured_text_every_option_fits_the_options_bar_and_the_labels_have_room() {
+    let scales = crate::test_workspace_scales();
+    let mut bar = Bar::new();
+    let Ok(mut engine) = aurora_text::TextEngine::new() else {
+        unreachable!("the bundled font loads");
+    };
+    for tool in [Tool::Gradient, Tool::PaintBucket] {
+        crate::sync_tool_controls(
+            &mut bar.workspace,
+            Some(bar.controls),
+            tool,
+            &bar.settings,
+            None,
+        );
+        aurora_widgets::compute_text_layout(
+            &mut bar.workspace.tree,
+            W,
+            H,
+            Some(aurora_widgets::TextMeasure {
+                engine: &mut engine,
+                scales: &scales,
+                scale_factor: 1.0,
+            }),
+        );
+        let Some(strip) = bar.workspace.tree.bounds(bar.workspace.options_bar) else {
+            unreachable!("laid out");
+        };
+        let fill = bar.controls.fill;
+        let ids = match tool {
+            Tool::Gradient => vec![fill.linear, fill.radial, fill.reverse, fill.opacity],
+            _ => vec![fill.tolerance, fill.contiguous],
+        };
+        let mut previous_right = strip.x;
+        for id in ids {
+            let Some(b) = bar.workspace.tree.bounds(id) else {
+                unreachable!("laid out");
+            };
+            assert!(b.width >= 20, "{tool:?} {id:?} is measured: {b:?}");
+            assert!(
+                b.x >= previous_right,
+                "{tool:?} {id:?} overlaps its left neighbour"
+            );
+            assert!(b.right() <= strip.right(), "{tool:?} {id:?} fits the bar");
+            previous_right = b.right();
+        }
+        // The two type buttons are wider than the 3-glyph text-blind box.
+        if tool == Tool::Gradient {
+            for id in [fill.linear, fill.radial] {
+                let w = bar.workspace.tree.bounds(id).map_or(0, |b| b.width);
+                assert!(w >= 48, "a measured text button: {w}");
+            }
+        }
+    }
+}
