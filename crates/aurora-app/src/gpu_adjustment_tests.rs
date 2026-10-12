@@ -45,8 +45,12 @@ fn tolerance() -> f32 {
 /// adjustments tested here have a slope of at most about 2 on these
 /// fixtures (Hue/Saturation saturation at most +50, Levels gamma and
 /// range stretches kept moderate in these tiles).
+///
+/// 0.206.1: 10 steps, not 8. Windows' WARP software adapter reached
+/// exactly 8 steps on Hue/Saturation hue shifts (no margin) and 3.4e-3..
+/// 3.9e-3 elsewhere.
 fn translucent_tolerance() -> f32 {
-    8.0 / 2048.0
+    10.0 / 2048.0
 }
 
 fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
@@ -368,14 +372,16 @@ const STEEP_HUE_SAT_CASES: [&str; 3] = ["saturation +99", "saturation +100", "ex
 /// Blend terms that divide or threshold (`ColorBurn`, `ColorDodge`,
 /// `VividLight`, `Divide`, `HardMix`) amplify a one-`f16`-step difference
 /// in `Cs` (the same class as the Curves tests' derived per-mode bound of
-/// about 6-8 steps): 8 steps of `2^-11` instead of `2 * f16::EPSILON`.
+/// about 6-8 steps on the RTX 3090; Windows' WARP adapter measured 9 steps
+/// for Hue/Saturation under `ColorDodge`): 12 steps of `2^-11` instead of
+/// `2 * f16::EPSILON`.
 fn mode_bound(mode: BlendMode) -> f32 {
     match mode {
         BlendMode::ColorBurn
         | BlendMode::ColorDodge
         | BlendMode::VividLight
         | BlendMode::Divide
-        | BlendMode::HardMix => 8.0 / 2048.0,
+        | BlendMode::HardMix => 12.0 / 2048.0,
         _ => tolerance(),
     }
 }

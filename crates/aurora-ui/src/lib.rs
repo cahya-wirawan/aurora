@@ -146,8 +146,9 @@ pub use tool_controls::{
     radius_slider_shown, sync_tool_controls, tool_controls_contains,
 };
 pub use tools_panel::{
-    TOOLS_PANEL_LABEL, ToolsPanel, insert_tools_panel, selected_tool, sync_tools_panel,
-    tools_panel_contains,
+    TOOL_COLUMNS, TOOL_GROUPS, TOOL_ICON_SIZE, TOOLS_PANEL_LABEL, ToolsPanel, insert_tools_panel,
+    is_tools_panel_button, selected_tool, set_tools_panel_hover, sync_tools_panel,
+    tool_description, tool_icon, tools_panel_contains, tools_panel_width,
 };
 pub use workspace::{
     FloatFrame, OPTIONS_BAR_LABEL, PANEL_GROUP_LABEL, PANEL_GROUP_TAB_DEFAULT, RAIL_WIDTH_DEFAULT,

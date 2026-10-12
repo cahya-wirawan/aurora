@@ -428,6 +428,32 @@ fn separator_node() -> Node {
     Node::new(Role::Splitter)
 }
 
+/// Adds a free-standing separator as the last child of `parent` (0.207.0,
+/// the tools panel's group rule): the menu separator's leaf — a
+/// `Role::Splitter` with no label and no actions, never a `Tab` stop —
+/// painted as the same 1 px `border.default` rule, centred in a row
+/// `spacing.xs` high and as wide as `parent` lets a stretched child be.
+/// It needs no menu; the menu code only looks at a menu's own children.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `parent` doesn't exist.
+pub fn insert_separator(
+    tree: &mut WidgetTree<WidgetKind>,
+    parent: WidgetId,
+    scales: &Scales,
+) -> Result<WidgetId, WidgetError> {
+    let style = Style {
+        size: Size {
+            width: auto(),
+            height: length(spacing(scales.spacing.xs)),
+        },
+        flex_shrink: 0.0,
+        ..Default::default()
+    };
+    tree.insert(parent, style, separator_node(), WidgetKind::MenuSeparator)
+}
+
 /// The payload an item's child should have, given whether it is
 /// highlighted. Cheap — no allocation — so a whole-menu check can afford
 /// it for every item.

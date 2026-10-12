@@ -94,11 +94,21 @@ pub enum IconKind {
     /// A corner arrow pointing down: a layer clipped to the one below
     /// (0.201.1).
     Clip,
+    /// A dashed rectangle: the Marquee Select tool (0.207.0).
+    Marquee,
+    /// A magnifying glass with a plus: the Zoom tool (0.207.0).
+    ZoomIn,
+    /// An open hand: the Pan tool (0.207.0).
+    Hand,
+    /// A dropper: the Eyedropper tool (0.207.0).
+    Eyedropper,
+    /// A tilted eraser block: the Eraser tool (0.207.0).
+    Eraser,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 20] = [
+    pub const ALL: [IconKind; 25] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -119,6 +129,11 @@ impl IconKind {
         IconKind::Search,
         IconKind::Image,
         IconKind::Clip,
+        IconKind::Marquee,
+        IconKind::ZoomIn,
+        IconKind::Hand,
+        IconKind::Eyedropper,
+        IconKind::Eraser,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -146,6 +161,11 @@ impl IconKind {
             IconKind::Search => "Search",
             IconKind::Image => "Image",
             IconKind::Clip => "Clip",
+            IconKind::Marquee => "Marquee",
+            IconKind::ZoomIn => "Zoom In",
+            IconKind::Hand => "Hand",
+            IconKind::Eyedropper => "Eyedropper",
+            IconKind::Eraser => "Eraser",
         }
     }
 }
@@ -494,7 +514,69 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
             stroke_part().m(2.0, 3.0).l(11.0, 3.0).l(11.0, 13.0),
             stroke_part().m(8.0, 10.0).l(11.0, 13.0).l(14.0, 10.0),
         ],
+        IconKind::Marquee => marquee_dashes(),
+        IconKind::ZoomIn => {
+            let [vertical, horizontal] = plus(6.0, 6.0, 2.0);
+            vec![
+                circle(PartStyle::Stroke, 6.0, 6.0, 4.0),
+                stroke_part().m(9.0, 9.0).l(13.0, 13.0),
+                vertical,
+                horizontal,
+            ]
+        }
+        IconKind::Hand => vec![
+            // Four fingers (the middle two taller), the palm under them
+            // and the thumb off its left side.
+            stroke_part().m(5.0, 4.0).l(5.0, 8.0),
+            stroke_part().m(7.0, 2.0).l(7.0, 8.0),
+            stroke_part().m(9.0, 2.0).l(9.0, 8.0),
+            stroke_part().m(11.0, 4.0).l(11.0, 8.0),
+            stroke_part()
+                .m(5.0, 8.0)
+                .l(5.0, 11.0)
+                .l(7.0, 14.0)
+                .l(9.0, 14.0)
+                .l(11.0, 11.0)
+                .l(11.0, 8.0),
+            stroke_part().m(5.0, 11.0).l(3.0, 9.0),
+        ],
+        IconKind::Eyedropper => vec![
+            // The glass, a collar, the rubber bulb and the tip.
+            stroke_part()
+                .m(4.0, 11.0)
+                .l(9.0, 6.0)
+                .l(11.0, 8.0)
+                .l(6.0, 13.0)
+                .closed(),
+            stroke_part().m(8.0, 4.0).l(12.0, 8.0),
+            stroke_part().m(10.0, 2.0).l(14.0, 6.0),
+            stroke_part().m(2.0, 14.0).l(4.0, 12.0),
+        ],
+        IconKind::Eraser => vec![
+            // A tilted block and the line between its worn and clean ends.
+            stroke_part()
+                .m(2.0, 9.0)
+                .l(8.0, 3.0)
+                .l(13.0, 8.0)
+                .l(7.0, 14.0)
+                .closed(),
+            stroke_part().m(5.0, 6.0).l(10.0, 11.0),
+        ],
     }
+}
+
+/// The marquee's dashed rectangle: on every side, three dashes with a
+/// single-pixel gap between them (12 short strokes).
+fn marquee_dashes() -> Vec<IconPart> {
+    const DASHES: [(f32, f32); 3] = [(2.0, 5.0), (7.0, 9.0), (11.0, 14.0)];
+    let mut parts = Vec::with_capacity(12);
+    for (from, to) in DASHES {
+        parts.push(stroke_part().m(from, 2.0).l(to, 2.0));
+        parts.push(stroke_part().m(from, 14.0).l(to, 14.0));
+        parts.push(stroke_part().m(2.0, from).l(2.0, to));
+        parts.push(stroke_part().m(14.0, from).l(14.0, to));
+    }
+    parts
 }
 
 /// An icon's parts as tessellation-ready paths, scaled and placed.
@@ -592,7 +674,7 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 20);
+        assert_eq!(IconKind::ALL.len(), 25);
         for (i, a) in IconKind::ALL.iter().enumerate() {
             assert!(!a.name().is_empty());
             for b in IconKind::ALL.iter().skip(i + 1) {

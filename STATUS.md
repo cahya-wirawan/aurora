@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-12, version 0.206.0.** This file is updated every round (every
+**As of 2026-10-12, version 0.207.0.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -72,9 +72,17 @@ golden-image tests are `#[ignore]`d.
   infinite pasteboard on purpose). Since 0.193.0 only the document is drawn
   (layer content outside the canvas is clipped), since 0.192.1 the canvas no
   longer shows documents washed out on an sRGB surface.
-- **Tools panel and options bar**: a left panel with one text button per tool
-  (Move, Marquee Select, Zoom, Pan, Eyedropper, Brush, Eraser; icons later)
-  and an options bar showing the active tool's options. Selection tools
+- **Tools panel and options bar**: a left panel (0.207.0: rebuilt Photoshop
+  style) of flat icon-only toggle buttons, two to a row in a 72 px strip (the
+  text-labelled one was 145 px), in four groups with a rule between them (Move
+  and Marquee Select; Zoom and Pan; Eyedropper; Brush and Eraser). The selected
+  tool is a filled accent square, hover and press tint it, each button keeps
+  the tool's full name for assistive technology and a description with its
+  shortcut letter, and each is its own Tab stop. There are no foreground and
+  background colour swatches (the app has no such colour model) and no
+  tooltip yet. **Never seen by a human, nor on the Mac; the five new icons
+  (marquee, zoom in, hand, eyedropper, eraser) are provisional.** The options
+  bar shows the active tool's options. Selection tools
   beyond a raw data model do not exist yet.
 - **Text fields and dialogs**: caret, selection, IME composition, standard
   editing chords through the real OS clipboard (`Cmd` on macOS, `Ctrl`
