@@ -87,6 +87,13 @@ impl DocumentShelf {
     ) -> (usize, bool) {
         let mut evicted = 0;
         let mut over = false;
+        // 0.210.0: finish a pixel-history spill a push left over (the
+        // history's budget is soft by one bounded write per call). Not
+        // counted in `over`: a failing disk must not keep the loop awake.
+        active.pixel_history.trim();
+        for parked in &mut self.parked {
+            parked.pixel_history.trim();
+        }
         for store in std::iter::once(&mut active.tile_store)
             .chain(
                 self.parked
@@ -501,6 +508,23 @@ pub(crate) struct DocumentSession {
     pub(crate) tile_store: Option<aurora_tile::TileStore>,
 }
 
+/// A document's pixel history (0.210.0): snapshots compressed, the oldest
+/// spilled to a directory inside `store`'s scratch directory once the
+/// history passes its memory budget (`aurora_tile::system_history_budget_bytes`:
+/// a quarter of the tile budget, 32 MiB to 2 GiB, `AURORA_HISTORY_BUDGET_MB`
+/// overrides). With no live store (a startup that could not make one)
+/// there is nowhere to spill and the history stays in memory.
+pub(crate) fn new_pixel_history(
+    store: Option<&aurora_tile::TileStore>,
+) -> aurora_brush::PixelHistory {
+    store.map_or_else(aurora_brush::PixelHistory::new, |store| {
+        aurora_brush::PixelHistory::with_spill(
+            store.staging_root(),
+            aurora_tile::system_history_budget_bytes(),
+        )
+    })
+}
+
 impl DocumentSession {
     /// Makes this session's tile store the residency pool's active group
     /// (0.187.0; [`aurora_tile::TileStore::activate_pool_group`]), so it
@@ -568,7 +592,7 @@ impl DocumentSession {
             canvas_size,
             skipped_tiles,
             history,
-            pixel_history: aurora_brush::PixelHistory::new(),
+            pixel_history: new_pixel_history(tile_store.as_ref()),
             undo_order,
             composite_cache: CompositeCache::default(),
             active_layer,

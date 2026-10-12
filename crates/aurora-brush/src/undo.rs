@@ -542,7 +542,7 @@ impl StrokeSnapshot {
 }
 
 /// Tiles per worker below which encoding stays on the calling thread.
-const SERIAL_PACK_TILES: usize = 8;
+const SERIAL_PACK_TILES: usize = 2;
 /// The most worker threads one pack uses.
 const MAX_PACK_THREADS: usize = 8;
 
@@ -948,6 +948,10 @@ impl PixelHistory {
         Ok(true)
     }
 }
+
+#[cfg(test)]
+#[path = "undo_budget_tests.rs"]
+mod budget_tests;
 
 #[cfg(test)]
 mod tests {

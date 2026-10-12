@@ -27994,7 +27994,7 @@ impl App {
         // on the way in (`History::clear_undo`, 0.144.0 review), so a
         // fresh `undo_order` agrees with it: the opened file is the
         // baseline, and Ctrl+Z cannot take the import apart.
-        self.doc.pixel_history = aurora_brush::PixelHistory::new();
+        self.doc.pixel_history = document_session::new_pixel_history(self.doc.tile_store.as_ref());
         self.doc.undo_order = UndoOrder::default();
         self.doc.composite_cache.bump();
         self.doc.active_layer = active_layer;
@@ -28153,7 +28153,7 @@ impl App {
         self.doc.canvas_size = canvas_size;
         self.doc.history = history;
         // See the same reset in `Self::open_file`'s own flat-image path.
-        self.doc.pixel_history = aurora_brush::PixelHistory::new();
+        self.doc.pixel_history = document_session::new_pixel_history(self.doc.tile_store.as_ref());
         self.doc.undo_order = UndoOrder::default();
         self.doc.composite_cache.bump();
         self.doc.active_layer = active_layer;
