@@ -34,9 +34,11 @@
 //! - **An identity record is skipped**, so it is an exact passthrough,
 //!   even for an out-of-gamut value; a non-identity record clamps its
 //!   input to `[0, 1]` (`NaN` reads as `0`), as the exact map does.
-//! - **No GPU port.** `aurora-app` composites Levels layers on the CPU
-//!   only (a visible Levels layer refuses the GPU path, as every
-//!   adjustment but Curves does).
+//! - **GPU (0.206.0).** `aurora-render`'s Levels pass
+//!   (`shaders/levels.wgsl`) evaluates the same records per pixel with the
+//!   GPU's own `pow` instead of this table ([`LevelsLut::packed_for_gpu`]
+//!   hands it the records); it matches this table to within the GPU/CPU
+//!   tolerance class, and `aurora-app`'s differential tests measure it.
 
 use aurora_core::{LevelsChannel, LevelsParams};
 
@@ -108,6 +110,10 @@ impl Channel {
     }
 }
 
+/// How many `f32`s [`LevelsLut::packed_for_gpu`] returns: four records
+/// (red, green, blue, master) of eight (0.206.0).
+pub const LEVELS_PACKED_LEN: usize = 32;
+
 /// A Levels adjustment ready to apply: one optional record per stage.
 /// See the module docs.
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +135,44 @@ impl LevelsLut {
                 Channel::new(params.blue),
             ],
         }
+    }
+
+    /// The records flattened for the GPU Levels pass (0.206.0,
+    /// `aurora_render::TileCompositor::composite_levels_with_opacity`,
+    /// whose `LEVELS_GPU_PARAMS_LEN` and `shaders/levels.wgsl` document
+    /// the same layout from their side; `aurora-app` asserts the length
+    /// agrees). Four records in the order red, green, blue, master, eight
+    /// `f32`s each: `[present, input_black, input_white, 1 / gamma,
+    /// output_black, output_white, has_gamma, 0]`. `present` is `0` for an
+    /// identity record (the shader then passes the value through exactly,
+    /// as this table does); `has_gamma` is `0` when gamma is exactly `1`.
+    /// An absent record is all zeros. Values are the record's own `f32`s,
+    /// bit for bit, and `1 / gamma` is computed as [`Channel::new`] does.
+    #[must_use]
+    pub fn packed_for_gpu(&self) -> [f32; LEVELS_PACKED_LEN] {
+        let records = [
+            self.channels.first().and_then(Option::as_ref),
+            self.channels.get(1).and_then(Option::as_ref),
+            self.channels.get(2).and_then(Option::as_ref),
+            self.master.as_ref(),
+        ];
+        let mut out = [0.0_f32; LEVELS_PACKED_LEN];
+        for (slot, channel) in out.chunks_exact_mut(8).zip(records) {
+            let Some(channel) = channel else { continue };
+            let record = &channel.record;
+            let packed = [
+                1.0,
+                record.input_black(),
+                record.input_white(),
+                1.0 / record.gamma(),
+                record.output_black(),
+                record.output_white(),
+                f32::from(u8::from(channel.gamma_table.is_some())),
+                0.0,
+            ];
+            slot.copy_from_slice(&packed);
+        }
+        out
     }
 
     /// Whether applying this changes nothing (every record was identity).

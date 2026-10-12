@@ -21,8 +21,12 @@
 //! - **A grey pixel (`max == min`) has no hue and no saturation**: the
 //!   master sliders touch only its lightness; Colorize gives it the
 //!   Colorize hue and saturation.
-//! - **No GPU port.** `aurora-app` composites Hue/Saturation layers on
-//!   the CPU only (a visible one refuses the GPU path).
+//! - **GPU (0.206.0)** for the master / Colorize path only:
+//!   `aurora-render`'s Hue/Saturation pass (`shaders/hue_saturation.wgsl`)
+//!   ports [`HueSaturationOp::apply`] line for line
+//!   ([`HueSaturationOp::packed_for_gpu`] hands it the settings). An
+//!   operation with active colour ranges returns `None` there and stays
+//!   on the CPU.
 
 use aurora_core::{
     HUE_RANGE_COUNT, HueRange, HueSaturationParams, HueSaturationRangesParams, forward_gap,
@@ -139,6 +143,9 @@ fn saturation_factor(amount: f32) -> f32 {
     }
 }
 
+/// How many `f32`s [`HueSaturationOp::packed_for_gpu`] returns (0.206.0).
+pub const HUE_SATURATION_PACKED_LEN: usize = 8;
+
 /// A Hue/Saturation adjustment ready to apply to pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HueSaturationOp {
@@ -169,6 +176,34 @@ impl HueSaturationOp {
             params: *params.base(),
             ranges: ranged.then(|| *params.ranges()),
         }
+    }
+
+    /// The settings flattened for the GPU Hue/Saturation pass (0.206.0,
+    /// `aurora_render::TileCompositor::composite_hue_saturation_with_opacity`,
+    /// `shaders/hue_saturation.wgsl`): `[identity, colorize, hue,
+    /// saturation, lightness, colorize_hue, colorize_saturation,
+    /// colorize_lightness]`, flags as `0`/`1`, hues in degrees, the
+    /// saturation and lightness sliders divided by `100` in `f32` exactly
+    /// as [`Self::apply`] divides them.
+    ///
+    /// `None` when this operation has active colour ranges: the GPU pass
+    /// has no per-range model, so the layer stays on the CPU.
+    #[must_use]
+    pub fn packed_for_gpu(&self) -> Option<[f32; HUE_SATURATION_PACKED_LEN]> {
+        if self.ranges.is_some() {
+            return None;
+        }
+        let p = &self.params;
+        Some([
+            f32::from(u8::from(self.is_identity())),
+            f32::from(u8::from(p.colorize())),
+            p.hue(),
+            p.saturation() / 100.0,
+            p.lightness() / 100.0,
+            p.colorize_hue(),
+            p.colorize_saturation() / 100.0,
+            p.colorize_lightness() / 100.0,
+        ])
     }
 
     /// Whether [`Self::apply`] returns its input unchanged.
