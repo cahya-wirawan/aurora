@@ -79,7 +79,8 @@ pub enum Adjustment {
     /// `aurora_filters::HueSaturationOp`. **Appended after `Levels`**
     /// (ordinal 2): every file written before 0.203.0 holds only ordinals
     /// 0 and 1, and an older build refuses a file using this variant
-    /// (ADR 0009). The per-colour-range adjustments are not modelled.
+    /// (ADR 0009). The per-colour-range adjustments are carried by
+    /// [`Adjustment::HueSaturationRanges`] below.
     HueSaturation(aurora_core::HueSaturationParams),
     /// Hue/Saturation with the six per-colour-range adjustments
     /// (0.204.0, [`aurora_core::HueSaturationRangesParams`]). **Appended
