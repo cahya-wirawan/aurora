@@ -4,15 +4,18 @@
 //! `docs/adr/` for the decisions that shape it.
 //!
 //! As of 0.155.0 this crate holds one real adjustment, Curves
-//! ([`curves`]); Levels ([`levels`]) joined in 0.202.0; every other filter
+//! ([`curves`]); Levels ([`levels`]) joined in 0.202.0 and Hue/Saturation
+//! ([`hue_saturation`]) in 0.203.0; every other filter
 //! and adjustment is still to come.
 
 pub mod curves;
+pub mod hue_saturation;
 pub mod levels;
 pub mod shadow;
 pub mod stroke;
 
 pub use curves::{CURVES_LUT_INTERVALS, CURVES_PACKED_HEADER, CURVES_PACKED_LEN, CurvesLut};
+pub use hue_saturation::HueSaturationOp;
 pub use levels::{EXACT_INTERVALS, LEVELS_LUT_INTERVALS, LevelsLut};
 pub use shadow::shadow_coverage;
 pub use stroke::{StrokeSide, stroke_coverage, stroke_reach};

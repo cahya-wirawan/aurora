@@ -655,6 +655,7 @@ fn writer_matches_test_writer_bytes_for_a_two_layer_file() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn preflight_refuses_curves_and_oversize_but_not_groups_or_masks() {
     let opts = PsdSaveOptions::default();
     let base = || {
@@ -711,6 +712,19 @@ fn preflight_refuses_curves_and_oversize_but_not_groups_or_masks() {
     assert_eq!(
         psd_save_preflight(&levels, (4, 4), opts),
         Err(PsdSaveRefusal::LevelsNotYetSupported { count: 1 })
+    );
+
+    // 0.203.0: Hue/Saturation layers are refused the same way, counted apart.
+    let mut hue = base();
+    ok(hue.add_adjustment_layer_at(
+        "H",
+        Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
+        None,
+        0,
+    ));
+    assert_eq!(
+        psd_save_preflight(&hue, (4, 4), opts),
+        Err(PsdSaveRefusal::HueSaturationNotYetSupported { count: 1 })
     );
 
     for canvas in [(30_001, 10), (10, 30_001)] {

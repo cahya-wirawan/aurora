@@ -287,8 +287,8 @@ pub struct PsdLayer {
     pending: Option<PendingPixels>,
 }
 
-/// One imported adjustment layer: Curves (`curv`, 0.158.0) or Levels
-/// (`levl`, 0.202.0).
+/// One imported adjustment layer: Curves (`curv`, 0.158.0), Levels
+/// (`levl`, 0.202.0) or Hue/Saturation (`hue2`, 0.203.0).
 #[derive(Debug)]
 pub struct PsdAdjustment {
     pub props: PsdProps,
@@ -429,6 +429,9 @@ enum Note {
     CurvesGrayscale,
     LevelsUnreadable,
     LevelsGrayscale,
+    HueSaturationUnreadable,
+    HueSaturationGrayscale,
+    HueSaturationRanges,
     FillSkipped,
     TextRasterised,
     SmartObjectRasterised,
@@ -511,8 +514,9 @@ fn note_text(note: Note, n: u64) -> String {
     let is = if one { "is" } else { "are" };
     match note {
         Note::AdjustmentSkipped => format!(
-            "{n} adjustment layer{s} (Hue/Saturation and similar) {was} left out — \
-             Aurora shows only Curves and Levels adjustment layers so far."
+            "{n} adjustment layer{s} (Brightness/Contrast, Color Balance and similar) {was} \
+             left out — Aurora shows only Curves, Levels and Hue/Saturation adjustment layers \
+             so far."
         ),
         Note::CurvesUnreadable => format!(
             "{n} Curves layer{s} {was} left out — {} settings could not be read.",
@@ -536,6 +540,22 @@ fn note_text(note: Note, n: u64) -> String {
         Note::LevelsGrayscale => format!(
             "{n} Levels layer{s} in this Grayscale file {was} left out — Aurora hasn't yet \
              verified how Photoshop applies Levels to a Grayscale image."
+        ),
+        Note::HueSaturationUnreadable => format!(
+            "{n} Hue/Saturation layer{s} {was} left out — {} settings could not be read or \
+             fall outside the ranges Photoshop's Hue/Saturation allows.",
+            if one { "its" } else { "their" },
+        ),
+        Note::HueSaturationGrayscale => format!(
+            "{n} Hue/Saturation layer{s} in this Grayscale file {was} left out — Aurora \
+             hasn't yet verified how Photoshop applies Hue/Saturation to a Grayscale image."
+        ),
+        Note::HueSaturationRanges => format!(
+            "{n} Hue/Saturation layer{s} {was} left out — {} adjust{} individual colour \
+             ranges (reds, yellows, greens, cyans, blues or magentas), which Aurora doesn't \
+             apply yet; only the Master sliders and Colorize are supported.",
+            if one { "it" } else { "they" },
+            if one { "s" } else { "" },
         ),
         Note::FillSkipped => format!(
             "{n} shape or fill layer{s} (solid colour, gradient or pattern) with no stored \
@@ -1355,6 +1375,8 @@ struct Record {
     curves: Option<Result<CurvBlock, CurvRefusal>>,
     /// The last `levl` block, parsed (0.202.0).
     levels: Option<Result<LevlBlock, ()>>,
+    /// The last `hue2` block, parsed (0.203.0).
+    hue_saturation: Option<Result<HueBlock, ()>>,
     /// The effects blocks to read (0.180.0), as `(priority, bytes)`:
     /// `lmfx` (0), `lfx2` (1), `lfxs` (2). Tried in that order; the first
     /// that reads wins, so a damaged `lmfx` falls back to `lfx2`.
@@ -1496,6 +1518,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let mut vector = None;
     let mut curves = None;
     let mut levels = None;
+    let mut hue_saturation = None;
     let mut effects_blocks: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut smart_blocks: Vec<aurora_doc::SmartObjectBlock> = Vec::new();
     let mut smart_filters = false;
@@ -1555,6 +1578,8 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
             b"curv" => curves = Some(parse_curv(data)),
             // Likewise Levels (0.202.0).
             b"levl" => levels = Some(parse_levl(data)),
+            // Likewise Hue/Saturation (0.203.0).
+            b"hue2" => hue_saturation = Some(parse_hue2(data)),
             k if ADJUSTMENT_KEYS.contains(&k) => features.adjustment = true,
             _ => {}
         }
@@ -1578,6 +1603,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
         vector,
         curves,
         levels,
+        hue_saturation,
         effects_blocks,
         effects: None,
         smart_blocks,
@@ -1855,6 +1881,100 @@ fn levels_params(block: &LevlBlock, gray: bool) -> Result<aurora_core::LevelsPar
         green: channel(green)?,
         blue: channel(blue)?,
     })
+}
+
+// ---------------------------------------------------------------------
+// Hue/Saturation (`hue2`, 0.203.0)
+// ---------------------------------------------------------------------
+
+/// The bytes psd-tools 1.17.4 reads of a `hue2` block
+/// (`HueSaturation.read`): `u16` version `2`, a `u8` Colorize flag and a
+/// pad byte, the colorization `(hue, saturation, lightness)` as three
+/// `i16`, the master `(hue, saturation, lightness)` as three `i16`, then
+/// six range records of seven `i16` (four range boundaries and the
+/// range's `(hue, saturation, lightness)`), in the order reds, yellows,
+/// greens, cyans, blues, magentas.
+const HUE2_LEN: usize = 2 + 2 + 6 + 6 + 6 * 14;
+
+/// A parsed `hue2` block, the parts Aurora models.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HueBlock {
+    colorize: bool,
+    /// `(hue, saturation, lightness)` of the Colorize record.
+    colorization: (i16, i16, i16),
+    /// `(hue, saturation, lightness)` of the master record.
+    master: (i16, i16, i16),
+    /// Whether any of the six range records adjusts anything (a non-zero
+    /// hue, saturation or lightness setting; the boundaries do not matter
+    /// when all three are zero).
+    ranges_adjust: bool,
+}
+
+/// Parses a `hue2` block. Short data or another version is unreadable;
+/// bytes after the 100th are ignored. Never panics, allocates nothing.
+fn parse_hue2(data: &[u8]) -> Result<HueBlock, ()> {
+    let mut r = Reader::new(data);
+    if r.remaining() < HUE2_LEN || r.u16("hue/saturation version").map_err(|_| ())? != 2 {
+        return Err(());
+    }
+    let colorize = r.u8("hue/saturation colorize").map_err(|_| ())? != 0;
+    r.u8("hue/saturation padding").map_err(|_| ())?;
+    let mut triple = || -> Result<(i16, i16, i16), ()> {
+        let mut field = || r.i16("hue/saturation value").map_err(|_| ());
+        Ok((field()?, field()?, field()?))
+    };
+    let colorization = triple()?;
+    let master = triple()?;
+    let mut ranges_adjust = false;
+    for _ in 0..6 {
+        let mut field = || r.i16("hue/saturation range").map_err(|_| ());
+        for _ in 0..4 {
+            field()?;
+        }
+        let settings = (field()?, field()?, field()?);
+        ranges_adjust |= settings != (0, 0, 0);
+    }
+    Ok(HueBlock {
+        colorize,
+        colorization,
+        master,
+        ranges_adjust,
+    })
+}
+
+/// A parsed block as Aurora's [`aurora_core::HueSaturationParams`]. With
+/// Colorize on, only the colorization record counts (Photoshop's Colorize
+/// has no ranges or master sliders; a stored hue below zero is the same
+/// angle plus 360). With it off, a non-neutral range record means the layer
+/// adjusts individual colour ranges, which Aurora does not apply: the layer
+/// is left out and reported rather than imported with the ranges dropped.
+/// A value outside the validated ranges is unreadable. A Grayscale file's
+/// layers are not imported, as for Levels ([`levels_params`]).
+fn hue_saturation_params(
+    block: &HueBlock,
+    gray: bool,
+) -> Result<aurora_core::HueSaturationParams, Note> {
+    if gray {
+        return Err(Note::HueSaturationGrayscale);
+    }
+    if !block.colorize && block.ranges_adjust {
+        return Err(Note::HueSaturationRanges);
+    }
+    let (ch, cs, cl) = block.colorization;
+    let (mh, ms, ml) = block.master;
+    let colorize_hue = i32::from(ch).rem_euclid(360);
+    #[allow(clippy::cast_precision_loss)] // 0..360 is exact in f32
+    let colorize_hue = colorize_hue as f32;
+    aurora_core::HueSaturationParams::new(
+        f32::from(mh),
+        f32::from(ms),
+        f32::from(ml),
+        block.colorize,
+        colorize_hue,
+        f32::from(cs),
+        f32::from(cl),
+    )
+    .map_err(|_| Note::HueSaturationUnreadable)
 }
 
 /// Whether a record's blending ranges ("Blend If") differ from the
@@ -3226,6 +3346,39 @@ fn collect_smart_ids(nodes: &[PsdNode], out: &mut std::collections::BTreeSet<Str
     }
 }
 
+/// A `hue2` record as an adjustment node, or `None` (with a report line)
+/// when its block is unreadable, adjusts colour ranges or is in a Grayscale
+/// file ([`hue_saturation_params`]).
+fn hue_saturation_node(
+    src: &mut dyn ByteSource,
+    record: &Record,
+    header: Header,
+    hue: &Result<HueBlock, ()>,
+    notes: &mut Notes,
+    vector_budget: &mut vector::Budget,
+) -> Option<PsdNode> {
+    let params = match hue {
+        Ok(block) => hue_saturation_params(block, header.gray()),
+        Err(()) => Err(Note::HueSaturationUnreadable),
+    };
+    let params = match params {
+        Ok(params) => params,
+        Err(note) => {
+            notes.add(note);
+            return None;
+        }
+    };
+    let mut props = props_for(record, notes);
+    props.effects = None;
+    let outcome = masks_for(src, record, header, canvas_of(header), notes, vector_budget);
+    note_unsupported_kept(record, &outcome, notes, false, false);
+    Some(PsdNode::Adjustment(PsdAdjustment {
+        props,
+        adjustment: aurora_doc::Adjustment::HueSaturation(params),
+        mask: outcome.mask,
+    }))
+}
+
 /// One non-divider record as a layer node, or `None` when it is left out
 /// (an adjustment layer, or a fill layer with no pixels).
 fn layer_node(
@@ -3283,7 +3436,14 @@ fn layer_node(
             mask: outcome.mask,
         }));
     }
-    if record.features.adjustment || record.curves.is_some() || record.levels.is_some() {
+    if let (Some(hue), false) = (&record.hue_saturation, record.features.adjustment) {
+        return hue_saturation_node(src, record, header, hue, notes, vector_budget);
+    }
+    if record.features.adjustment
+        || record.curves.is_some()
+        || record.levels.is_some()
+        || record.hue_saturation.is_some()
+    {
         notes.add(Note::AdjustmentSkipped);
         return None;
     }

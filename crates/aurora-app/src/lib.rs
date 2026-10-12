@@ -5581,6 +5581,9 @@ enum ActivatedCommand {
     /// New Levels Layer (0.202.0): palette and the macOS `Layer` menu
     /// only, no shortcut. Run as [`LayerCommand::NewLevels`].
     NewLevelsLayer,
+    /// New Hue/Saturation Layer (0.203.0): palette and the macOS `Layer`
+    /// menu only, no shortcut. Run as [`LayerCommand::NewHueSaturation`].
+    NewHueSaturationLayer,
     /// New Group (0.196.0): palette, the macOS `Layer` menu and the Layers
     /// toolbar only, no shortcut. Run by [`perform_layer_command`] as
     /// [`LayerCommand::NewGroup`].
@@ -5750,6 +5753,7 @@ const COMMAND_LAYER_NEW: &str = "layer.new";
 const COMMAND_LAYER_DELETE: &str = "layer.delete";
 const COMMAND_LAYER_NEW_CURVES: &str = "layer.new_curves";
 const COMMAND_LAYER_NEW_LEVELS: &str = "layer.new_levels";
+const COMMAND_LAYER_NEW_HUE_SATURATION: &str = "layer.new_hue_saturation";
 const COMMAND_LAYER_NEW_GROUP: &str = "layer.new_group";
 const COMMAND_LAYER_CLIP_CREATE: &str = "layer.clip_create";
 const COMMAND_LAYER_CLIP_RELEASE: &str = "layer.clip_release";
@@ -5818,6 +5822,7 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_LAYER_DELETE, "Delete Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_CURVES, "New Curves Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_LEVELS, "New Levels Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_HUE_SATURATION, "New Hue/Saturation Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_GROUP, "New Group"),
         CommandEntry::new(COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
         CommandEntry::new(COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),
@@ -6009,6 +6014,9 @@ fn activate_command(
     }
     if id == COMMAND_LAYER_NEW_LEVELS {
         return Some(ActivatedCommand::NewLevelsLayer);
+    }
+    if id == COMMAND_LAYER_NEW_HUE_SATURATION {
+        return Some(ActivatedCommand::NewHueSaturationLayer);
     }
     if id == COMMAND_LAYER_NEW_GROUP {
         return Some(ActivatedCommand::NewGroup);
@@ -7820,6 +7828,7 @@ fn tool_button_click(
 /// Properties panel's until then), leaving a captured slider's value
 /// alone, and the tools panel's highlight ([`sync_tools_panel`]). Returns
 /// whether anything changed.
+#[allow(clippy::large_types_passed_by_value)] // `ToolControls` is `Copy` and 280 bytes since 0.203.0
 fn sync_tool_controls(
     workspace: &mut aurora_ui::Workspace,
     controls: Option<aurora_ui::ToolControls>,
@@ -7913,6 +7922,7 @@ fn sync_status_bar_notice(
 /// then refreshes the Properties body and the readout. **No history
 /// step**: tool settings are not document state. Returns whether a
 /// radius changed.
+#[allow(clippy::large_types_passed_by_value)] // `ToolControls` is `Copy` and 280 bytes since 0.203.0
 fn apply_tool_control_outcome(
     workspace: &mut aurora_ui::Workspace,
     controls: Option<aurora_ui::ToolControls>,
@@ -8008,6 +8018,18 @@ struct CurvesUiState {
     levels_pending: Option<PendingLevels>,
     /// [`Self::detached`]'s twin for the Levels sliders.
     levels_detached: bool,
+    /// A live Hue/Saturation slider drag (0.203.0), [`Self::levels_pending`]'s twin.
+    hue_saturation_pending: Option<PendingHueSaturation>,
+    /// [`Self::detached`]'s twin for the Hue/Saturation sliders.
+    hue_saturation_detached: bool,
+}
+
+/// A live Hue/Saturation-slider drag: [`PendingLevels`]' twin, so the whole
+/// gesture is **one** undo step ([`finish_hue_saturation`]).
+#[derive(Debug, Clone, PartialEq)]
+struct PendingHueSaturation {
+    layer: aurora_doc::LayerId,
+    start: aurora_core::HueSaturationParams,
 }
 
 /// A live Levels-slider drag: the layer it started on and that layer's
@@ -8103,7 +8125,8 @@ fn finish_curves(cx: &mut CurvesEdit<'_>) -> bool {
 fn settle_pending_curves(cx: &mut CurvesEdit<'_>, captured: Option<WidgetId>) -> bool {
     // The Levels sliders' drag settles by the same rule (0.202.0).
     let levels = settle_pending_levels(cx, captured);
-    settle_pending_curves_only(cx, captured) || levels
+    let hue_saturation = settle_pending_hue_saturation(cx, captured);
+    settle_pending_curves_only(cx, captured) || levels || hue_saturation
 }
 
 /// [`settle_pending_curves`] for the curve editor alone.
@@ -8123,7 +8146,7 @@ fn settle_pending_curves_only(cx: &mut CurvesEdit<'_>, captured: Option<WidgetId
 /// [`apply_curves_outcome`] instead of the radius handler.
 fn is_curves_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutcome) -> bool {
     use aurora_widgets::ActionOutcome as Outcome;
-    if is_levels_outcome(controls, outcome) {
+    if is_levels_outcome(controls, outcome) || is_hue_saturation_outcome(controls, outcome) {
         return true;
     }
     match outcome {
@@ -8135,6 +8158,161 @@ fn is_curves_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutco
 
 /// Whether `outcome` belongs to the Levels editor beside the Curves one
 /// (0.202.0): its channel tab bar or one of its five sliders.
+/// Whether `outcome` is the Hue/Saturation editor's: a slider value or the
+/// Colorize checkbox ([`is_levels_outcome`]'s twin, 0.203.0).
+fn is_hue_saturation_outcome(
+    controls: aurora_ui::CurvesControls,
+    outcome: &PointerOutcome,
+) -> bool {
+    use aurora_widgets::ActionOutcome as Outcome;
+    let Some(hs) = controls.hue_saturation else {
+        return false;
+    };
+    match outcome {
+        PointerOutcome::Action(Outcome::ValueChanged { id, .. }) => hs.slider_of(*id).is_some(),
+        PointerOutcome::Action(Outcome::Toggled { id, .. }) => *id == hs.colorize,
+        _ => false,
+    }
+}
+
+fn hue_saturation_slider_captured(
+    controls: Option<aurora_ui::CurvesControls>,
+    captured: Option<WidgetId>,
+) -> bool {
+    controls
+        .and_then(|controls| controls.hue_saturation)
+        .zip(captured)
+        .is_some_and(|(hs, id)| hs.slider_of(id).is_some())
+}
+
+/// Records one Hue/Saturation edit as a structural step ([`record_levels_step`]'s twin).
+fn record_hue_saturation_step(
+    cx: &mut CurvesEdit<'_>,
+    id: aurora_doc::LayerId,
+    params: aurora_core::HueSaturationParams,
+) -> bool {
+    if let Err(err) =
+        cx.history
+            .set_adjustment(cx.layers, id, aurora_doc::Adjustment::HueSaturation(params))
+    {
+        tracing::warn!(?err, "a Hue/Saturation edit was refused by the layer tree");
+        return false;
+    }
+    cx.undo_order
+        .record(UndoKind::Structural, cx.history, cx.pixel_history);
+    refresh_history_panel(cx.workspace, cx.undo_order);
+    refresh_layer_row(cx.workspace, cx.layer_rows, cx.layers, id);
+    true
+}
+
+/// Ends a live Hue/Saturation drag as one undo step ([`finish_levels`]'s twin).
+fn finish_hue_saturation(cx: &mut CurvesEdit<'_>) -> bool {
+    let Some(pending) = cx.state.hue_saturation_pending.take() else {
+        return false;
+    };
+    let Some(now) = aurora_ui::hue_saturation_params(cx.layers, pending.layer).copied() else {
+        return false;
+    };
+    if now == pending.start {
+        return false;
+    }
+    // Rewind the live edits, then record the whole drag as one step.
+    if let Err(err) = cx.layers.set_adjustment(
+        pending.layer,
+        aurora_doc::Adjustment::HueSaturation(pending.start),
+    ) {
+        tracing::warn!(
+            ?err,
+            "failed to rewind a Hue/Saturation drag before recording it"
+        );
+        return false;
+    }
+    record_hue_saturation_step(cx, pending.layer, now)
+}
+
+fn settle_pending_hue_saturation(cx: &mut CurvesEdit<'_>, captured: Option<WidgetId>) -> bool {
+    if hue_saturation_slider_captured(cx.controls, captured) {
+        return false;
+    }
+    cx.state.hue_saturation_detached = false;
+    cx.state.hue_saturation_pending.is_some() && finish_hue_saturation(cx)
+}
+
+/// Turns one Hue/Saturation-editor outcome into a document edit
+/// ([`apply_levels_outcome`]'s twin): a slider with the pointer captured
+/// is a live drag (one step when it ends); a slider without capture (an
+/// arrow key, an assistive technology) and a Colorize toggle are one step
+/// each. Every real change is `Everything`.
+fn apply_hue_saturation_outcome(
+    cx: &mut CurvesEdit<'_>,
+    outcome: &PointerOutcome,
+    captured: Option<WidgetId>,
+) -> CompositeInvalidation {
+    let Some(hs) = cx.controls.and_then(|controls| controls.hue_saturation) else {
+        return CompositeInvalidation::None;
+    };
+    let _ = settle_pending_hue_saturation(cx, captured);
+    let PointerOutcome::Action(action) = outcome else {
+        return CompositeInvalidation::None;
+    };
+    let Some(active) = cx.active_layer.filter(|&id| cx.layers.contains(id)) else {
+        return CompositeInvalidation::None;
+    };
+    let Some(current) = aurora_ui::hue_saturation_params(cx.layers, active).copied() else {
+        return CompositeInvalidation::None;
+    };
+    let (next, dragged) = match action {
+        aurora_widgets::ActionOutcome::Toggled { id, state } if *id == hs.colorize => (
+            current.with_colorize(*state == accesskit::Toggled::True),
+            None,
+        ),
+        aurora_widgets::ActionOutcome::ValueChanged { id, value } => {
+            let Some(slider) = hs.slider_of(*id) else {
+                return CompositeInvalidation::None;
+            };
+            let Some(next) = slider.with_value(&current, *value) else {
+                return CompositeInvalidation::None;
+            };
+            (next, Some(*id))
+        }
+        _ => return CompositeInvalidation::None,
+    };
+    if dragged.is_some() && captured == dragged {
+        if cx
+            .state
+            .hue_saturation_pending
+            .as_ref()
+            .is_some_and(|pending| pending.layer != active)
+        {
+            let _ = finish_hue_saturation(cx);
+            cx.state.hue_saturation_detached = true;
+        }
+        if cx.state.hue_saturation_detached || next == current {
+            return CompositeInvalidation::None;
+        }
+        if cx.state.hue_saturation_pending.is_none() {
+            cx.state.hue_saturation_pending = Some(PendingHueSaturation {
+                layer: active,
+                start: current,
+            });
+        }
+        return match cx
+            .layers
+            .set_adjustment(active, aurora_doc::Adjustment::HueSaturation(next))
+        {
+            Ok(()) => CompositeInvalidation::Everything,
+            Err(err) => {
+                tracing::warn!(?err, "a live Hue/Saturation drag move was refused");
+                CompositeInvalidation::None
+            }
+        };
+    }
+    if next == current || !record_hue_saturation_step(cx, active, next) {
+        return CompositeInvalidation::None;
+    }
+    CompositeInvalidation::Everything
+}
+
 fn is_levels_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutcome) -> bool {
     use aurora_widgets::ActionOutcome as Outcome;
     let Some(levels) = controls.levels else {
@@ -8310,6 +8488,9 @@ fn apply_curves_outcome(
     if is_levels_outcome(controls, outcome) {
         return apply_levels_outcome(cx, outcome, captured);
     }
+    if is_hue_saturation_outcome(controls, outcome) {
+        return apply_hue_saturation_outcome(cx, outcome, captured);
+    }
     let _ = settle_pending_curves(cx, captured);
     let PointerOutcome::Action(aurora_widgets::ActionOutcome::CurveChanged { editor }) = outcome
     else {
@@ -8386,7 +8567,13 @@ fn end_curves_drag(cx: &mut CurvesEdit<'_>, click: &mut ClickTracker) -> bool {
         click.release_capture();
     }
     cx.state.levels_detached = false;
-    finish_levels(cx) || curves
+    let levels = finish_levels(cx);
+    // So do the Hue/Saturation sliders (0.203.0).
+    if hue_saturation_slider_captured(cx.controls, click.captured()) {
+        click.release_capture();
+    }
+    cx.state.hue_saturation_detached = false;
+    finish_hue_saturation(cx) || levels || curves
 }
 
 /// What a key that reaches the shortcuts does to the Curves editor first
@@ -8403,7 +8590,9 @@ fn end_curves_gesture_before_key(cx: &mut CurvesEdit<'_>, click: &mut ClickTrack
         cx.state.pending.is_some() || (editor.is_some() && click.captured() == editor);
     let levels_live =
         cx.state.levels_pending.is_some() || levels_slider_captured(cx.controls, click.captured());
-    if !curves_live && !levels_live {
+    let hue_saturation_live = cx.state.hue_saturation_pending.is_some()
+        || hue_saturation_slider_captured(cx.controls, click.captured());
+    if !curves_live && !levels_live && !hue_saturation_live {
         return false;
     }
     end_curves_drag(cx, click)
@@ -8435,7 +8624,12 @@ fn end_curves_gestures(cx: &mut CurvesEdit<'_>, click: &mut ClickTracker) -> boo
     {
         tracing::warn!(?err, "failed to reset the Levels channel");
     }
-    let committed = finish_curves(cx) || committed_levels;
+    if hue_saturation_slider_captured(cx.controls, click.captured()) {
+        click.release_capture();
+    }
+    let committed_hue_saturation = finish_hue_saturation(cx);
+    cx.state.hue_saturation_detached = false;
+    let committed = finish_curves(cx) || committed_levels || committed_hue_saturation;
     cx.state.detached = false;
     cx.state.histogram = None;
     cx.state.job = None;
@@ -8765,7 +8959,9 @@ fn sync_curves_ui(
     // A Levels layer expands a collapsed Properties panel the same way
     // (0.202.0); only the histogram stays Curves-only.
     let editor_layer = cx.active_layer.filter(|&id| {
-        curves_layer == Some(id) || aurora_ui::levels_params(cx.layers, id).is_some()
+        curves_layer == Some(id)
+            || aurora_ui::levels_params(cx.layers, id).is_some()
+            || aurora_ui::hue_saturation_params(cx.layers, id).is_some()
     });
     let expanded =
         expand_properties_for_curves(cx.workspace, &mut cx.state.shown_for, editor_layer);
@@ -8802,6 +8998,26 @@ fn sync_curves_ui(
         },
         None => false,
     };
+    let hue_saturation_changed = match controls.hue_saturation {
+        Some(hs) => match aurora_ui::sync_hue_saturation_controls(
+            &mut cx.workspace.tree,
+            hs,
+            cx.layers,
+            cx.active_layer,
+            captured,
+        ) {
+            Ok(changed) => changed,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "failed to sync the Properties-panel Hue/Saturation editor"
+                );
+                false
+            }
+        },
+        None => false,
+    };
+    let other_changed = levels_changed || hue_saturation_changed;
     match aurora_ui::sync_curves_controls(
         &mut cx.workspace.tree,
         controls,
@@ -8810,10 +9026,10 @@ fn sync_curves_ui(
         captured,
         bins,
     ) {
-        Ok(changed) => changed || settled || levels_changed,
+        Ok(changed) => changed || settled || other_changed,
         Err(err) => {
             tracing::warn!(?err, "failed to sync the Properties-panel Curves editor");
-            settled || levels_changed
+            settled || other_changed
         }
     }
 }
@@ -8896,6 +9112,7 @@ fn expand_properties_for_curves(
 /// it holds it (review RT136-4). A radius drag has no pending state of
 /// its own to settle — every `Move` already set the radius — so ending it
 /// is only this. Returns whether a capture was dropped.
+#[allow(clippy::large_types_passed_by_value)] // `ToolControls` is `Copy` and 280 bytes since 0.203.0
 fn release_radius_capture(
     click: &mut ClickTracker,
     controls: Option<aurora_ui::ToolControls>,
@@ -8919,6 +9136,7 @@ fn release_radius_capture(
 /// ([`App::handle_key_event`]'s [`handle_key`], which carries the letter
 /// shortcuts and the command palette). Returns whether a capture was
 /// dropped.
+#[allow(clippy::large_types_passed_by_value)] // `ToolControls` is `Copy` and 280 bytes since 0.203.0
 fn end_radius_drag_on_tool_change(
     click: &mut ClickTracker,
     controls: Option<aurora_ui::ToolControls>,
@@ -9341,6 +9559,12 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(COMMAND_LAYER_DELETE, "Delete Layer", true, None),
             &muda::MenuItem::with_id(COMMAND_LAYER_NEW_CURVES, "New Curves Layer", true, None),
             &muda::MenuItem::with_id(COMMAND_LAYER_NEW_LEVELS, "New Levels Layer", true, None),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_HUE_SATURATION,
+                "New Hue/Saturation Layer",
+                true,
+                None,
+            ),
             &muda::MenuItem::with_id(COMMAND_LAYER_NEW_GROUP, "New Group", true, None),
             &muda::MenuItem::with_id(
                 COMMAND_LAYER_CLIP_CREATE,
@@ -15874,6 +16098,8 @@ fn levels_lut(params: &aurora_core::LevelsParams) -> std::rc::Rc<aurora_filters:
 enum AdjustmentLut {
     Curves(std::rc::Rc<aurora_filters::CurvesLut>),
     Levels(std::rc::Rc<aurora_filters::LevelsLut>),
+    /// Hue/Saturation (0.203.0): a per-pixel function, nothing to cache.
+    HueSaturation(aurora_filters::HueSaturationOp),
 }
 
 impl AdjustmentLut {
@@ -15882,6 +16108,9 @@ impl AdjustmentLut {
         match adjustment {
             aurora_doc::Adjustment::Curves(params) => Self::Curves(curves_lut(params)),
             aurora_doc::Adjustment::Levels(params) => Self::Levels(levels_lut(params)),
+            aurora_doc::Adjustment::HueSaturation(params) => {
+                Self::HueSaturation(aurora_filters::HueSaturationOp::new(params))
+            }
         }
     }
 
@@ -15890,6 +16119,7 @@ impl AdjustmentLut {
         match self {
             Self::Curves(lut) => lut.is_identity(),
             Self::Levels(lut) => lut.is_identity(),
+            Self::HueSaturation(op) => op.is_identity(),
         }
     }
 
@@ -15898,6 +16128,7 @@ impl AdjustmentLut {
         match self {
             Self::Curves(lut) => lut.apply(rgb),
             Self::Levels(lut) => lut.apply(rgb),
+            Self::HueSaturation(op) => op.apply(rgb),
         }
     }
 }
@@ -23057,6 +23288,8 @@ enum LayerCommand {
     /// New Levels Layer (0.202.0): an identity Levels adjustment layer,
     /// placed exactly as [`Self::NewCurves`].
     NewLevels,
+    /// New Hue/Saturation Layer (0.203.0): [`Self::NewLevels`]'s twin.
+    NewHueSaturation,
     /// New Group (0.196.0): an empty Pass Through group directly above the
     /// active node, placed exactly where [`Self::New`] places a layer,
     /// made active. See [`new_group`].
@@ -23415,6 +23648,47 @@ fn new_levels_layer(cx: &mut LayerCommandContext<'_>) -> Option<aurora_doc::Laye
     }
 }
 
+/// The name for the next Hue/Saturation layer: "Hue/Saturation N", N one
+/// above the highest in use ([`next_levels_name`]'s twin).
+fn next_hue_saturation_name(layers: &aurora_doc::LayerTree) -> String {
+    let highest = layer_ids_in_order(layers)
+        .into_iter()
+        .filter_map(|id| {
+            layers
+                .name(id)?
+                .strip_prefix("Hue/Saturation ")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0);
+    format!("Hue/Saturation {}", highest.saturating_add(1))
+}
+
+/// New Hue/Saturation Layer (0.203.0): an identity Hue/Saturation
+/// adjustment directly above the active node, placed exactly where
+/// [`new_levels_layer`] places a Levels layer; one undo step.
+fn new_hue_saturation_layer(cx: &mut LayerCommandContext<'_>) -> Option<aurora_doc::LayerId> {
+    let placement = new_layer_placement(cx.layers, *cx.active_layer);
+    let name = next_hue_saturation_name(cx.layers);
+    match cx.history.add_adjustment_layer_at(
+        cx.layers,
+        name,
+        aurora_doc::Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
+        placement.parent,
+        placement.index,
+    ) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "New Hue/Saturation Layer was refused by the layer tree"
+            );
+            None
+        }
+    }
+}
+
 fn delete_layer(cx: &mut LayerCommandContext<'_>) -> Option<AppliedLayerCommand> {
     let Some(target) = cx.active_layer.filter(|&id| cx.layers.contains(id)) else {
         tracing::info!("Delete Layer with no active layer; nothing to delete");
@@ -23503,6 +23777,12 @@ fn perform_layer_command(cx: &mut LayerCommandContext<'_>, command: LayerCommand
             next_active: Some(id),
             label: None,
         }),
+        LayerCommand::NewHueSaturation => {
+            new_hue_saturation_layer(cx).map(|id| AppliedLayerCommand {
+                next_active: Some(id),
+                label: None,
+            })
+        }
         LayerCommand::NewGroup => new_group(cx).map(|id| AppliedLayerCommand {
             next_active: Some(id),
             label: None,
@@ -26153,6 +26433,9 @@ impl App {
             }
             Some(ActivatedCommand::NewLevelsLayer) => {
                 self.run_layer_command(LayerCommand::NewLevels);
+            }
+            Some(ActivatedCommand::NewHueSaturationLayer) => {
+                self.run_layer_command(LayerCommand::NewHueSaturation);
             }
             Some(ActivatedCommand::NewGroup) => self.run_layer_command(LayerCommand::NewGroup),
             Some(ActivatedCommand::SetClip(on)) => {
@@ -28882,6 +29165,9 @@ impl App {
             }
             Some(ActivatedCommand::NewLevelsLayer) => {
                 self.run_layer_command(LayerCommand::NewLevels);
+            }
+            Some(ActivatedCommand::NewHueSaturationLayer) => {
+                self.run_layer_command(LayerCommand::NewHueSaturation);
             }
             Some(ActivatedCommand::NewGroup) => self.run_layer_command(LayerCommand::NewGroup),
             Some(ActivatedCommand::SetClip(on)) => {
@@ -35917,9 +36203,11 @@ mod tests {
         // Identity curves: an exact match.
         ("layers/curves.psd", 0.0, None),
         ("layers/curves-with-vectormask.psd", 0.0, None),
-        // 14 other adjustment kinds left out (15 before 0.202.0 imported
-        // its Levels layer).
-        ("fill_adjustments.psd", 240.0, Some("14 adjustment layers")),
+        // 13 other adjustment kinds left out (15 before 0.202.0 imported its
+        // Levels layer, 14 before 0.203.0 imported its master-only
+        // Hue/Saturation layer: max 240 -> 230, mean 133.1 / 58.7 / 39.1 ->
+        // 125.9 / 51.5 / 32.0).
+        ("fill_adjustments.psd", 230.0, Some("13 adjustment layers")),
         // A clipped layer whose base is not a pixel layer shown unclipped
         // (0.201.0: the other clipped layers are clipped for real).
         (
@@ -36274,6 +36562,81 @@ mod tests {
             assert!(*mean <= mean_want + 1e-3, "channel {c}: {diff:?}");
         }
         assert!(diff.over_one <= 1818 && diff.over_two <= 826, "{diff:?}");
+    }
+
+    /// 0.203.0: the psd-tools Hue/Saturation fixtures against Photoshop's
+    /// own merged image. Colorize-only layers (neutral range records) and
+    /// master-only layers are imported; a layer whose per-range records are
+    /// not neutral is left out with a report line (the "before" numbers).
+    /// Prints the numbers; skips when the corpus is absent.
+    #[test]
+    fn hue_saturation_psds_composite_like_photoshops_merged_image() {
+        // (file, imported layers, max-error bound per channel, mean bound
+        // per channel, report fragment that must appear (None: no report)).
+        type Row<'a> = (&'a str, usize, [f64; 3], [f64; 3], Option<&'a str>);
+        let rows: [Row<'_>; 5] = [
+            (
+                "adjustments/huesaturation_colorize_rgb.psd",
+                4,
+                [3.0, 3.0, 3.0],
+                [0.46, 0.55, 0.44],
+                None,
+            ),
+            ("layers/hue-saturation.psd", 1, [0.0; 3], [0.001; 3], None),
+            ("clip-adjustment.psd", 1, [0.0; 3], [0.001; 3], None),
+            // One master-only layer imported, three ranged ones left out
+            // (before 0.203.0 all four were: mean 41.0 / 33.3 / 34.4 by an
+            // independent reconstruction of the backdrop).
+            (
+                "adjustments/huesaturation_rgb.psd",
+                1,
+                [249.0, 249.0, 249.0],
+                [23.0, 18.4, 16.1],
+                Some("Hue/Saturation"),
+            ),
+            // All four ranged: left out, the error is the whole adjustment's.
+            (
+                "adjustments/huesaturation_lightness_rgb.psd",
+                0,
+                [193.0, 245.0, 248.0],
+                [71.5, 72.5, 75.6],
+                Some("Hue/Saturation"),
+            ),
+        ];
+        for (file, imported, max_bound, mean_bound, report) in rows {
+            let Some(diff) = curves_corpus_diff(file) else {
+                return;
+            };
+            println!("{file}: {diff:?}");
+            assert_eq!(diff.curves, imported, "{file}: {diff:?}");
+            match report {
+                Some(fragment) => assert!(
+                    diff.report.iter().any(|item| item.contains(fragment)),
+                    "{file}: {:?}",
+                    diff.report
+                ),
+                None => assert!(
+                    !diff
+                        .report
+                        .iter()
+                        .any(|item| item.contains("adjustment layer") || item.contains("Hue")),
+                    "{file}: {:?}",
+                    diff.report
+                ),
+            }
+            for c in 0..3 {
+                let (Some(max), Some(mean), Some(max_want), Some(mean_want)) = (
+                    diff.max.get(c),
+                    diff.mean.get(c),
+                    max_bound.get(c),
+                    mean_bound.get(c),
+                ) else {
+                    unreachable!("three channels");
+                };
+                assert!(max <= max_want, "{file} channel {c}: {diff:?}");
+                assert!(mean <= mean_want, "{file} channel {c}: {diff:?}");
+            }
+        }
     }
 
     /// AC-4: the other corpus files carrying `curv`, each against its own
@@ -39138,7 +39501,7 @@ mod tests {
         // and (0.167.0) "Float Layers Panel" and "Dock Layers Panel" --
         // the first inserted (`palette_commands`'s own order) is what ends
         // up selected. (0.202.0) "New Levels Layer" matches too.
-        assert_eq!(state.results().len(), 13);
+        assert_eq!(state.results().len(), 14);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -72732,6 +73095,50 @@ mod tests {
                 assert_eq!(rig.layers.roots(), [top, mid, bottom].as_slice());
                 rig.assert_coherent();
             }
+
+            #[test]
+            fn new_hue_saturation_layer_is_in_the_palette_activates_and_is_one_undo_step() {
+                assert!(
+                    palette_commands()
+                        .iter()
+                        .any(|entry| entry.id == crate::COMMAND_LAYER_NEW_HUE_SATURATION
+                            && entry.title == "New Hue/Saturation Layer")
+                );
+                let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+                let mut focus = FocusManager::default();
+                let mut dialog = FakeFileDialog::default();
+                assert_eq!(
+                    activate_command(
+                        &mut workspace,
+                        &mut focus,
+                        crate::COMMAND_LAYER_NEW_HUE_SATURATION,
+                        &mut dialog
+                    ),
+                    Some(ActivatedCommand::NewHueSaturationLayer)
+                );
+                let (mut rig, [top, mid, bottom]) = Rig::three();
+                let before = rig.layers.roots().to_vec();
+                assert!(rig.run(LayerCommand::NewHueSaturation));
+                let added = only_new_root(&rig, &before);
+                assert_eq!(
+                    rig.layers.kind(added),
+                    Some(&LayerKind::Adjustment(Adjustment::HueSaturation(
+                        aurora_core::HueSaturationParams::identity()
+                    )))
+                );
+                assert_eq!(rig.layers.name(added), Some("Hue/Saturation 1"));
+                assert_eq!(rig.active, Some(added));
+                assert!(rig.run(LayerCommand::NewHueSaturation));
+                assert_eq!(
+                    rig.active.and_then(|id| rig.layers.name(id)),
+                    Some("Hue/Saturation 2")
+                );
+                assert!(rig.undo_redo(AppCommand::Undo));
+                assert!(rig.undo_redo(AppCommand::Undo));
+                assert_eq!(rig.layers.roots(), before.as_slice());
+                assert_eq!(rig.layers.roots(), [top, mid, bottom].as_slice());
+                rig.assert_coherent();
+            }
         }
     }
 
@@ -77068,6 +77475,198 @@ mod tests {
             assert!((got[0] - BACKDROP[0]).abs() <= TOLERANCE, "{got:?}");
         }
 
+        impl Rig {
+            /// A Hue/Saturation layer on top of the backdrop, made active.
+            fn hue_saturation() -> (Self, LayerId) {
+                let (mut rig, _curves) = Self::backdrop();
+                let id = match rig.layers.add_adjustment_layer_at(
+                    "Hue/Saturation 1",
+                    aurora_doc::Adjustment::HueSaturation(
+                        aurora_core::HueSaturationParams::identity(),
+                    ),
+                    None,
+                    0,
+                ) {
+                    Ok(id) => id,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                rig.active = Some(id);
+                rig.sync();
+                (rig, id)
+            }
+
+            fn hs_controls(&self) -> aurora_ui::HueSaturationControls {
+                match self.controls.curves.hue_saturation {
+                    Some(hs) => hs,
+                    None => unreachable!("the strip builds the Hue/Saturation editor"),
+                }
+            }
+
+            fn hs_params(&self, id: LayerId) -> aurora_core::HueSaturationParams {
+                match aurora_ui::hue_saturation_params(&self.layers, id) {
+                    Some(params) => *params,
+                    None => unreachable!("{id:?} is a Hue/Saturation layer"),
+                }
+            }
+
+            fn hs_along(
+                &self,
+                slider: aurora_ui::HueSaturationSlider,
+                fraction: f32,
+            ) -> (f32, f32) {
+                let Some(&id) = self.hs_controls().sliders.get(slider.index()) else {
+                    unreachable!("six sliders");
+                };
+                let Some(b) = self.workspace.tree.bounds(id) else {
+                    unreachable!("the slider is laid out");
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let point = (
+                    b.x as f32 + fraction * b.width as f32,
+                    b.y as f32 + b.height as f32 / 2.0,
+                );
+                point
+            }
+
+            fn hs_set(&mut self, slider: aurora_ui::HueSaturationSlider, value: f64) {
+                let Some(&id) = self.hs_controls().sliders.get(slider.index()) else {
+                    unreachable!("six sliders");
+                };
+                self.apply(&PointerOutcome::Action(
+                    aurora_widgets::ActionOutcome::ValueChanged { id, value },
+                ));
+                self.sync();
+            }
+
+            fn hs_slider(&self, slider: aurora_ui::HueSaturationSlider) -> (f64, bool) {
+                match self.workspace.tree.payload(
+                    self.hs_controls()
+                        .sliders
+                        .get(slider.index())
+                        .copied()
+                        .unwrap_or_else(|| unreachable!("six sliders")),
+                ) {
+                    Some(aurora_widgets::widgets::WidgetKind::Slider(state)) => {
+                        (state.value, state.disabled)
+                    }
+                    other => unreachable!("{other:?}"),
+                }
+            }
+        }
+
+        /// 0.203.0: the Hue/Saturation editor shows only for such a layer,
+        /// a slider drag is **one** undo step, undo moves the slider back
+        /// and the composite follows.
+        #[test]
+        #[allow(clippy::indexing_slicing)]
+        fn a_hue_saturation_slider_drag_is_one_undo_step_and_undo_moves_the_slider() {
+            use aurora_ui::HueSaturationSlider as S;
+            let (mut rig, id) = Rig::hue_saturation();
+            assert!(aurora_ui::hue_saturation_controls_shown(
+                &rig.workspace.tree,
+                rig.hs_controls()
+            ));
+            assert!(!rig.shown(), "the Curves editor is hidden");
+            assert!(!aurora_ui::levels_controls_shown(
+                &rig.workspace.tree,
+                rig.controls
+                    .curves
+                    .levels
+                    .unwrap_or_else(|| unreachable!("levels"))
+            ));
+            assert!(!rig.hs_slider(S::Hue).1 && rig.hs_slider(S::ColorizeHue).1);
+            let before = rig.undo_order.undo.len();
+            let down = rig.hs_along(S::Hue, 0.5);
+            rig.pointer(PointerPhase::Down, down);
+            for f in [0.55, 0.6, 0.65] {
+                let at = rig.hs_along(S::Hue, f);
+                rig.pointer(PointerPhase::Move, at);
+            }
+            let up = rig.hs_along(S::Hue, 0.65);
+            rig.pointer(PointerPhase::Up, up);
+            let hue = rig.hs_params(id).hue();
+            assert!(hue > 10.0 && hue < 90.0, "dragged to {hue}");
+            assert_eq!(rig.undo_order.undo.len(), before + 1, "one undo step");
+            assert!(
+                (rig.first()[0] - BACKDROP[0]).abs() > 0.01
+                    || (rig.first()[1] - BACKDROP[1]).abs() > 0.01,
+                "the composite follows: {:?}",
+                rig.first()
+            );
+            rig.undo();
+            assert_eq!(
+                rig.hs_params(id),
+                aurora_core::HueSaturationParams::identity()
+            );
+            assert_eq!(rig.hs_slider(S::Hue).0, 0.0);
+            rig.redo();
+            assert_eq!(rig.hs_params(id).hue(), hue);
+            // A keyboard/AT value is one step; a no-op and a NaN record nothing.
+            let steps = rig.undo_order.undo.len();
+            rig.hs_set(S::Saturation, -40.0);
+            assert_eq!(rig.hs_params(id).saturation(), -40.0);
+            rig.hs_set(S::Saturation, -40.0);
+            rig.hs_set(S::Saturation, f64::NAN);
+            assert_eq!(rig.undo_order.undo.len(), steps + 1);
+            // A hostile out-of-range value clamps to the slider's end.
+            rig.hs_set(S::Lightness, 9_999.0);
+            assert_eq!(rig.hs_params(id).lightness(), 100.0);
+        }
+
+        #[test]
+        fn the_colorize_checkbox_is_one_undo_step_and_swaps_the_live_sliders() {
+            use aurora_ui::HueSaturationSlider as S;
+            let (mut rig, id) = Rig::hue_saturation();
+            let checkbox = rig.hs_controls().colorize;
+            let before = rig.undo_order.undo.len();
+            let at = rig.centre(checkbox);
+            rig.pointer(PointerPhase::Down, at);
+            rig.pointer(PointerPhase::Up, at);
+            assert!(rig.hs_params(id).colorize(), "the click toggled it on");
+            assert_eq!(rig.undo_order.undo.len(), before + 1);
+            assert!(aurora_ui::hue_saturation_colorize_checked(
+                &rig.workspace.tree,
+                rig.hs_controls()
+            ));
+            assert!(rig.hs_slider(S::Hue).1 && !rig.hs_slider(S::ColorizeHue).1);
+            // Colorize paints the backdrop with the layer's own hue.
+            let coloured = rig.first();
+            assert!((coloured[0] - coloured[1]).abs() > 0.01, "{coloured:?}");
+            rig.undo();
+            assert!(!rig.hs_params(id).colorize());
+            assert!(!aurora_ui::hue_saturation_colorize_checked(
+                &rig.workspace.tree,
+                rig.hs_controls()
+            ));
+            assert!(!rig.hs_slider(S::Hue).1 && rig.hs_slider(S::ColorizeHue).1);
+            rig.redo();
+            assert!(rig.hs_params(id).colorize());
+            assert_eq!(rig.undo_order.undo.len(), before + 1);
+        }
+
+        #[test]
+        fn the_hue_saturation_editor_hides_for_other_layers() {
+            let (mut rig, _id) = Rig::hue_saturation();
+            let pixel = rig.layers.roots().last().copied();
+            rig.active = pixel;
+            rig.sync();
+            assert!(!aurora_ui::hue_saturation_controls_shown(
+                &rig.workspace.tree,
+                rig.hs_controls()
+            ));
+            rig.active = None;
+            rig.sync();
+            assert!(!aurora_ui::hue_saturation_controls_shown(
+                &rig.workspace.tree,
+                rig.hs_controls()
+            ));
+            let (rig, _levels) = Rig::levels();
+            assert!(!aurora_ui::hue_saturation_controls_shown(
+                &rig.workspace.tree,
+                rig.hs_controls()
+            ));
+        }
+
         fn close(got: f32, want: f32, what: &str) {
             assert!(
                 (got - want).abs() <= TOLERANCE,
@@ -77827,6 +78426,241 @@ mod tests {
             let mut layers = stack(&mut store);
             assert!(crate::document_qualifies_for_gpu_compositing(&layers));
             let id = add_levels(&mut layers, stretch());
+            assert!(!crate::document_qualifies_for_gpu_compositing(&layers));
+            if let Err(err) = layers.set_visible(id, false) {
+                unreachable!("{err:?}");
+            }
+            assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+        }
+    }
+
+    // -- Hue/Saturation adjustment layers in the compositor (0.203.0) -----
+    /// 0.203.0: the Hue/Saturation adjustment through the CPU fold, against
+    /// hand-computed references (the formulas are in
+    /// `aurora_core::hue_saturation`). The backdrop (0.2, 0.4, 0.6) is HSL
+    /// hue 210, saturation 0.5, lightness 0.4.
+    #[allow(clippy::float_cmp)]
+    mod hue_saturation_adjustment {
+        use super::*;
+        use aurora_doc::BlendMode;
+
+        const TILE: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
+        const TOLERANCE: f32 = 3e-3;
+        const BACKDROP: [f32; 4] = [0.2, 0.4, 0.6, 1.0];
+
+        fn params(h: f32, s: f32, l: f32) -> aurora_core::HueSaturationParams {
+            match aurora_core::HueSaturationParams::new(h, s, l, false, 0.0, 25.0, 0.0) {
+                Ok(p) => p,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn add(
+            layers: &mut aurora_doc::LayerTree,
+            params: aurora_core::HueSaturationParams,
+            parent: Option<aurora_doc::LayerId>,
+        ) -> aurora_doc::LayerId {
+            match layers.add_adjustment_layer_at(
+                "Hue/Saturation 1",
+                aurora_doc::Adjustment::HueSaturation(params),
+                parent,
+                0,
+            ) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn composite(
+            layers: &aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+        ) -> Vec<[f32; 4]> {
+            let mut budget = crate::CompositeBudget::for_pass(layers);
+            let (texels, _) =
+                crate::composite_roots_into_tile(layers, store, TILE, (0, 0), (0, 0), &mut budget);
+            texels
+                .chunks_exact(4)
+                .filter_map(|texel| match *texel {
+                    [r, g, b, a] => Some([r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()]),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn first(layers: &aurora_doc::LayerTree, store: &mut aurora_tile::TileStore) -> [f32; 4] {
+            composite(layers, store)
+                .first()
+                .copied()
+                .unwrap_or([f32::NAN; 4])
+        }
+
+        fn assert_close(got: [f32; 4], want: [f32; 4], what: &str) {
+            for (g, w) in got.iter().zip(want) {
+                assert!(
+                    (g - w).abs() <= TOLERANCE,
+                    "{what}: got {got:?}, want {want:?}"
+                );
+            }
+        }
+
+        fn stack(store: &mut aurora_tile::TileStore) -> aurora_doc::LayerTree {
+            solid_root_stack(store, &[("bottom", BlendMode::Normal, 1.0, BACKDROP)])
+        }
+
+        #[test]
+        fn an_identity_layer_is_an_exact_passthrough() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[
+                    ("bottom", BlendMode::Normal, 1.0, BACKDROP),
+                    ("top", BlendMode::Multiply, 0.5, [0.9, 0.3, 0.7, 0.6]),
+                ],
+            );
+            let without = composite(&layers, &mut store);
+            // Colorize values are stored but unused while it is off.
+            let off = match aurora_core::HueSaturationParams::new(
+                0.0, 0.0, 0.0, false, 200.0, 90.0, 40.0,
+            ) {
+                Ok(p) => p,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let _ = add(&mut layers, off, None);
+            let with = composite(&layers, &mut store);
+            let bits = |v: &[[f32; 4]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&with), bits(&without));
+        }
+
+        #[test]
+        fn hue_saturation_and_lightness_recolour_the_composite_below_and_keep_alpha() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = stack(&mut store);
+            let id = add(&mut layers, params(30.0, 0.0, 0.0), None);
+            // Hue 210 + 30 = 240 at the same saturation and lightness.
+            let got = first(&layers, &mut store);
+            assert_close(got, [0.2, 0.2, 0.6, 1.0], "hue +30");
+            assert_eq!(got[3], 1.0);
+            let set = |layers: &mut aurora_doc::LayerTree, p| {
+                if let Err(err) =
+                    layers.set_adjustment(id, aurora_doc::Adjustment::HueSaturation(p))
+                {
+                    unreachable!("{err:?}");
+                }
+            };
+            set(&mut layers, params(0.0, -100.0, 0.0));
+            assert_close(first(&layers, &mut store), [0.4, 0.4, 0.4, 1.0], "grey");
+            set(&mut layers, params(0.0, 0.0, 50.0));
+            assert_close(
+                first(&layers, &mut store),
+                [0.55, 0.7, 0.85, 1.0],
+                "lightness +50",
+            );
+            set(&mut layers, params(0.0, 0.0, -100.0));
+            assert_close(first(&layers, &mut store), [0.0, 0.0, 0.0, 1.0], "black");
+            // Colorize: hue 120, saturation 100 %, the pixel's lightness 0.4.
+            let colorize =
+                match aurora_core::HueSaturationParams::new(0.0, 0.0, 0.0, true, 120.0, 100.0, 0.0)
+                {
+                    Ok(p) => p,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+            set(&mut layers, colorize);
+            assert_close(first(&layers, &mut store), [0.0, 0.8, 0.0, 1.0], "colorize");
+        }
+
+        #[test]
+        fn opacity_blend_mode_and_mask_apply_like_curves() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = stack(&mut store);
+            let id = add(&mut layers, params(30.0, 0.0, 0.0), None);
+            if let Err(err) = layers.set_opacity(id, 0.25) {
+                unreachable!("{err:?}");
+            }
+            // lerp(Cb, f(Cb), 0.25) with f(Cb) = (0.2, 0.2, 0.6)
+            assert_close(first(&layers, &mut store), [0.2, 0.35, 0.6, 1.0], "25%");
+            if let Err(err) = layers.set_opacity(id, 1.0) {
+                unreachable!("{err:?}");
+            }
+            if let Err(err) = layers.set_blend_mode(id, BlendMode::Multiply) {
+                unreachable!("{err:?}");
+            }
+            // Cb * f(Cb)
+            assert_close(
+                first(&layers, &mut store),
+                [0.04, 0.08, 0.36, 1.0],
+                "Multiply",
+            );
+            if let Err(err) = layers.set_blend_mode(id, BlendMode::Normal) {
+                unreachable!("{err:?}");
+            }
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            };
+            if let Err(err) = layers.add_mask(id, bounds) {
+                unreachable!("{err:?}");
+            }
+            let Some(mask_surface) = layers.mask_surface_id(id) else {
+                unreachable!("an adjustment layer can carry a mask");
+            };
+            for (column, coverage) in [(0, 1.0), (1, 0.0), (2, 0.5)] {
+                if let Err(err) = aurora_doc::write_mask_coverage(
+                    &mut store,
+                    mask_surface,
+                    TILE,
+                    column,
+                    0,
+                    coverage,
+                ) {
+                    unreachable!("{err:?}");
+                }
+            }
+            let texels = composite(&layers, &mut store);
+            let at = |i: usize| texels.get(i).copied().unwrap_or([f32::NAN; 4]);
+            assert_close(at(0), [0.2, 0.2, 0.6, 1.0], "full coverage");
+            assert_close(at(1), BACKDROP, "zero coverage");
+            assert_close(at(2), [0.2, 0.3, 0.6, 1.0], "half coverage");
+        }
+
+        #[test]
+        fn inside_a_group_it_adjusts_only_that_groups_own_layers() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("outside", BlendMode::Normal, 1.0, [1.0, 0.0, 0.0, 1.0])],
+            );
+            let group = match layers.add_group("group", None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            };
+            let inner = match layers.add_pixel_layer("inner", bounds, Some(group)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(inner) else {
+                unreachable!("a pixel layer");
+            };
+            fill_solid(&mut store, surface, TILE, [0.2, 0.4, 0.6, 0.5]);
+            let _ = add(&mut layers, params(0.0, -100.0, 0.0), Some(group));
+            // The group's isolated result is grey 0.4 at alpha 0.5, over
+            // the untouched red outside layer: 0.5 * 0.4 + 0.5 * (1, 0, 0).
+            assert_close(first(&layers, &mut store), [0.7, 0.2, 0.2, 1.0], "group");
+        }
+
+        #[test]
+        fn a_visible_layer_refuses_the_gpu_path_and_a_hidden_one_does_not() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = stack(&mut store);
+            assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+            let id = add(&mut layers, params(30.0, 0.0, 0.0), None);
             assert!(!crate::document_qualifies_for_gpu_compositing(&layers));
             if let Err(err) = layers.set_visible(id, false) {
                 unreachable!("{err:?}");
@@ -80862,7 +81696,8 @@ mod tests {
                 [37.9004, 24.9445, 27.3005],
             ),
             // 0.182.0: unchanged by drawing drop shadows.
-            ("fill_adjustments.psd", 240.0, [133.1256, 58.7064, 39.0855]),
+            // 0.203.0: its master-only Hue/Saturation layer imported; before: 240 / 133.1256, 58.7064, 39.0855.
+            ("fill_adjustments.psd", 230.0, [125.8756, 51.4564, 32.0369]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 162, mean 6.738, 12.118, 17.999.
             // 0.190.0: Strokes drawn; before: 162 / 4.4585, 9.8399, 15.7286.
             ("layer_comps.psd", 136.0, [3.8984, 9.3481, 15.6275]),

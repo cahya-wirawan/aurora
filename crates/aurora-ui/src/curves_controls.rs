@@ -136,6 +136,9 @@ pub struct CurvesControls {
     /// It rides on this handle so every place that already routes the
     /// Curves editor's events reaches the Levels editor's too.
     pub levels: Option<crate::levels_controls::LevelsControls>,
+    /// The Hue/Saturation editor built beside this column (0.203.0), set
+    /// by [`crate::insert_tool_controls`], riding here like [`Self::levels`].
+    pub hue_saturation: Option<crate::hue_saturation_controls::HueSaturationControls>,
 }
 
 fn column_style(scales: &Scales) -> Style {
@@ -192,6 +195,7 @@ pub fn insert_curves_controls(
             channel,
             editor,
             levels: None,
+            hue_saturation: None,
         };
         set_enabled(tree, controls, false)?;
         Ok(controls)

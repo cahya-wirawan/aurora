@@ -14,7 +14,8 @@ use half::f16;
 
 use super::test_writer::{TestLayer, TestPsd, pack_bits};
 use super::{
-    CurvBlock, CurvRefusal, LevlRecord, Note, curves_params, levels_params, parse_curv, parse_levl,
+    CurvBlock, CurvRefusal, HueBlock, LevlRecord, Note, curves_params, hue_saturation_params,
+    levels_params, parse_curv, parse_hue2, parse_levl,
 };
 use super::{
     MAX_GROUP_DEPTH, PIXEL_BUDGET, PsdBlend, PsdDocument, PsdFile, PsdNode, blend_for_key, decode,
@@ -4798,7 +4799,7 @@ fn curves_reporting_covers_pass_through_other_kinds_grayscale_and_refusals() {
             curves_file(&curv_rgb_block(), |l| {
                 l.blocks = vec![(*b"brit", vec![0; 4])];
             }),
-            "1 adjustment layer (Hue/Saturation and similar) was left out",
+            "1 adjustment layer (Brightness/Contrast, Color Balance and similar) was left out",
         ),
         (
             "curv and brit",
@@ -5349,6 +5350,291 @@ fn levels_reporting_covers_unreadable_and_out_of_range() {
             document.layers.children(group).map(<[_]>::len),
             Some(1),
             "{what}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Hue/Saturation (`hue2`, 0.203.0)
+// ---------------------------------------------------------------------
+
+/// One `hue2` range record: four boundaries and `(hue, saturation,
+/// lightness)`.
+type HueRange = ([i16; 4], [i16; 3]);
+
+const HUE_NEUTRAL_RANGE: HueRange = ([0, 0, 0, 0], [0, 0, 0]);
+
+/// A `hue2` block in psd-tools' layout (`HueSaturation.read`): version 2,
+/// the Colorize byte and a pad, the colorization and master triples, six
+/// range records.
+fn hue2_block(
+    colorize: u8,
+    colorization: [i16; 3],
+    master: [i16; 3],
+    ranges: [HueRange; 6],
+) -> Vec<u8> {
+    let mut out = 2_u16.to_be_bytes().to_vec();
+    out.extend_from_slice(&[colorize, 0]);
+    for v in colorization.into_iter().chain(master) {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    for (bounds, settings) in ranges {
+        for v in bounds.into_iter().chain(settings) {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+    out
+}
+
+fn hue2_plain(master: [i16; 3]) -> Vec<u8> {
+    hue2_block(0, [0, 25, 0], master, [HUE_NEUTRAL_RANGE; 6])
+}
+
+fn hue_file(block: &[u8], tweak: impl FnOnce(&mut TestLayer)) -> TestPsd {
+    let block = block.to_vec();
+    let layer = TestLayer::empty("Hue/Saturation 1").with(|l| {
+        l.blocks.push((*b"hue2", block));
+        l.mask = Some((0, 0, 2, 1, 255, 0));
+        l.channels.push((-2, vec![0, 255]));
+        tweak(l);
+    });
+    TestPsd::new(1, 2, 2, 8).with(|p| {
+        p.layers = vec![
+            TestLayer::divider(),
+            TestLayer::pixels("p", 0, 0, 2, 2, 8, &two_by_two(8)),
+            layer,
+            TestLayer::group("G", *b"pass"),
+        ];
+    })
+}
+
+fn hue_block(bytes: &[u8]) -> HueBlock {
+    match parse_hue2(bytes) {
+        Ok(block) => block,
+        Err(()) => unreachable!("a readable block"),
+    }
+}
+
+#[test]
+fn hue2_block_layout_matches_the_documented_structure() {
+    let block = hue2_plain([-27, 12, 10]);
+    assert_eq!(block.len(), 100);
+    let parsed = hue_block(&block);
+    assert!(!parsed.colorize && !parsed.ranges_adjust);
+    assert_eq!(parsed.master, (-27, 12, 10));
+    assert_eq!(parsed.colorization, (0, 25, 0));
+    let params = match hue_saturation_params(&parsed, false) {
+        Ok(p) => p,
+        Err(note) => unreachable!("{note:?}"),
+    };
+    assert_eq!(
+        (
+            params.hue(),
+            params.saturation(),
+            params.lightness(),
+            params.colorize()
+        ),
+        (-27.0, 12.0, 10.0, false)
+    );
+    // Bytes after the 100th are ignored.
+    let mut longer = block.clone();
+    longer.extend_from_slice(&[0xAA; 8]);
+    assert_eq!(parse_hue2(&longer), Ok(parsed));
+    // The real corpus' Colorize record: a stored hue of -118 is 242.
+    let colorize = hue2_block(1, [-118, 45, 14], [0, 0, 0], [HUE_NEUTRAL_RANGE; 6]);
+    let parsed = hue_block(&colorize);
+    let params = match hue_saturation_params(&parsed, false) {
+        Ok(p) => p,
+        Err(note) => unreachable!("{note:?}"),
+    };
+    assert!(params.colorize());
+    assert_eq!(
+        (
+            params.colorize_hue(),
+            params.colorize_saturation(),
+            params.colorize_lightness()
+        ),
+        (242.0, 45.0, 14.0)
+    );
+    // Hue 360 and 0 are the same angle.
+    for (stored, want) in [
+        (0_i16, 0.0_f32),
+        (360, 0.0),
+        (-360, 0.0),
+        (-1, 359.0),
+        (180, 180.0),
+    ] {
+        let block = hue_block(&hue2_block(
+            1,
+            [stored, 10, 0],
+            [0; 3],
+            [HUE_NEUTRAL_RANGE; 6],
+        ));
+        let params = match hue_saturation_params(&block, false) {
+            Ok(p) => p,
+            Err(note) => unreachable!("{note:?}"),
+        };
+        assert_eq!(params.colorize_hue(), want, "stored {stored}");
+    }
+}
+
+#[test]
+fn hue2_ranges_with_adjustments_are_left_out_unless_colorize_ignores_them() {
+    let mut ranges = [HUE_NEUTRAL_RANGE; 6];
+    // Boundaries alone (no settings) do not count as an adjustment.
+    if let Some(slot) = ranges.get_mut(2) {
+        *slot = ([315, 345, 15, 90], [0, 0, 0]);
+    }
+    let neutral = hue_block(&hue2_block(0, [0, 25, 0], [5, 0, 0], ranges));
+    assert!(!neutral.ranges_adjust);
+    assert!(hue_saturation_params(&neutral, false).is_ok());
+    // Each of the three settings of any one of the six records counts.
+    for record in 0..6 {
+        for setting in 0..3 {
+            let mut r = [HUE_NEUTRAL_RANGE; 6];
+            if let Some(slot) = r.get_mut(record).and_then(|rec| rec.1.get_mut(setting)) {
+                *slot = -1;
+            }
+            let block = hue_block(&hue2_block(0, [0, 25, 0], [0; 3], r));
+            assert!(block.ranges_adjust, "{record} {setting}");
+            assert_eq!(
+                hue_saturation_params(&block, false),
+                Err(Note::HueSaturationRanges)
+            );
+            // Colorize has no ranges: they are ignored there.
+            let block = hue_block(&hue2_block(1, [10, 50, 0], [0; 3], r));
+            assert!(hue_saturation_params(&block, false).is_ok());
+        }
+    }
+}
+
+#[test]
+fn hue2_grayscale_and_out_of_range_values_are_left_out() {
+    let good = hue_block(&hue2_plain([10, 20, 30]));
+    assert_eq!(
+        hue_saturation_params(&good, true),
+        Err(Note::HueSaturationGrayscale)
+    );
+    for master in [[181, 0, 0], [-181, 0, 0], [0, 101, 0], [0, 0, -101]] {
+        let block = hue_block(&hue2_plain(master));
+        assert_eq!(
+            hue_saturation_params(&block, false),
+            Err(Note::HueSaturationUnreadable),
+            "{master:?}"
+        );
+    }
+    for colorization in [[0, 101, 0], [0, -1, 0], [0, 50, 101]] {
+        let block = hue_block(&hue2_block(1, colorization, [0; 3], [HUE_NEUTRAL_RANGE; 6]));
+        assert_eq!(
+            hue_saturation_params(&block, false),
+            Err(Note::HueSaturationUnreadable),
+            "{colorization:?}"
+        );
+    }
+}
+
+#[test]
+fn hue2_hostile_and_short_data_is_unreadable_never_a_panic() {
+    let good = hue2_plain([1, 2, 3]);
+    for len in 0..good.len() {
+        let cut = good.get(..len).unwrap_or(&[]);
+        assert_eq!(parse_hue2(cut), Err(()), "len {len}");
+    }
+    for version in [0_u16, 1, 3, 4, 0xFFFF] {
+        let mut bad = good.clone();
+        for (slot, byte) in bad.iter_mut().zip(version.to_be_bytes()) {
+            *slot = byte;
+        }
+        assert_eq!(parse_hue2(&bad), Err(()), "version {version}");
+    }
+    // Any other Colorize byte value is "on".
+    let mut odd = good.clone();
+    if let Some(byte) = odd.get_mut(2) {
+        *byte = 0x80;
+    }
+    assert!(hue_block(&odd).colorize);
+    // Junk of every length never panics.
+    let mut junk = Vec::new();
+    for i in 0..300_u32 {
+        junk.push(i.wrapping_mul(2_654_435_761).to_be_bytes()[0]);
+        let _ = parse_hue2(&junk);
+        let mut v2 = vec![0, 2];
+        v2.extend_from_slice(&junk);
+        let _ = parse_hue2(&v2);
+    }
+}
+
+/// Through the real reader, a master-only layer becomes
+/// `Adjustment::HueSaturation` with its opacity, blend mode, visibility and
+/// mask, and is not reported as left out.
+#[test]
+fn a_hue_saturation_layer_opens_as_an_adjustment_and_is_not_reported() {
+    let bytes = hue_file(&hue2_plain([-27, 12, 10]), |l| {
+        l.opacity = 128;
+        l.blend = *b"mul ";
+        l.flags = 0x02;
+    })
+    .write();
+    let document = doc(&bytes);
+    let Some(&group) = document.layers.roots().first() else {
+        unreachable!("a group");
+    };
+    let children = document.layers.children(group).unwrap_or(&[]).to_vec();
+    let Some(&top) = children.first() else {
+        unreachable!("children");
+    };
+    let Some(aurora_doc::Adjustment::HueSaturation(params)) = document.layers.adjustment(top)
+    else {
+        unreachable!("the top child is the Hue/Saturation layer");
+    };
+    assert_eq!(
+        (params.hue(), params.saturation(), params.lightness()),
+        (-27.0, 12.0, 10.0)
+    );
+    assert_eq!(document.layers.opacity(top), Some(128.0 / 255.0));
+    assert_eq!(document.layers.blend_mode(top), Some(BlendMode::Multiply));
+    assert_eq!(document.layers.visible(top), Some(false));
+    assert!(document.layers.mask(top).is_some());
+    let items = document.report.items.join("\n");
+    assert!(!items.contains("adjustment layer"), "{items}");
+    assert!(!items.contains("Hue/Saturation"), "{items}");
+}
+
+/// Layers the reader cannot honour are left out and named in the report,
+/// each with its own line.
+#[test]
+fn hue_saturation_reporting_covers_ranges_unreadable_and_grayscale() {
+    let mut ranged = [HUE_NEUTRAL_RANGE; 6];
+    if let Some(slot) = ranged.get_mut(0) {
+        *slot = ([315, 345, 15, 90], [19, 14, 26]);
+    }
+    for (what, block, needle) in [
+        (
+            "short",
+            vec![0_u8, 2, 0, 0],
+            "Hue/Saturation layer was left out",
+        ),
+        (
+            "out of range",
+            hue2_plain([200, 0, 0]),
+            "outside the ranges",
+        ),
+        (
+            "ranges",
+            hue2_block(0, [0, 25, 0], [0; 3], ranged),
+            "individual colour ranges",
+        ),
+    ] {
+        let document = doc(&hue_file(&block, |_| {}).write());
+        let items = document.report.items.join("\n");
+        assert!(items.contains(needle), "{what}: {items}");
+        let Some(&group) = document.layers.roots().first() else {
+            unreachable!("a group");
+        };
+        assert_eq!(
+            document.layers.children(group).map(<[_]>::len),
+            Some(1),
+            "{what}: only the pixel layer remains"
         );
     }
 }

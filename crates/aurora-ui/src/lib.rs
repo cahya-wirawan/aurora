@@ -41,6 +41,7 @@ pub mod dock;
 pub mod document_tabs;
 pub mod gallery_panel;
 pub mod history_panel;
+pub mod hue_saturation_controls;
 pub mod layer_controls;
 pub mod layer_filter;
 pub mod layer_toolbar;
@@ -78,6 +79,11 @@ pub use gallery_panel::{
 };
 pub use history_panel::{
     HistoryRows, HistoryStep, UNDONE_STATE, populate_history_panel, populate_history_panel_rows,
+};
+pub use hue_saturation_controls::{
+    HueSaturationControls, HueSaturationSlider, hue_saturation_colorize_checked,
+    hue_saturation_controls_contains, hue_saturation_controls_shown, hue_saturation_params,
+    insert_hue_saturation_controls, sync_hue_saturation_controls,
 };
 pub use layer_controls::{
     LayerControls, LockToggle, blend_mode_at, blend_mode_index, blend_mode_index_for,
