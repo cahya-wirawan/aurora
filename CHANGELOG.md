@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.204.0] - 2026-10-12
+
+### Changed
+
+- Hue/Saturation per-colour-range adjustments
+
 ## [0.203.0] - 2026-10-12
 
 ### Added

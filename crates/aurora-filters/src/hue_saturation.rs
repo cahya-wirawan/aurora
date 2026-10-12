@@ -24,7 +24,9 @@
 //! - **No GPU port.** `aurora-app` composites Hue/Saturation layers on
 //!   the CPU only (a visible one refuses the GPU path).
 
-use aurora_core::HueSaturationParams;
+use aurora_core::{
+    HUE_RANGE_COUNT, HueRange, HueSaturationParams, HueSaturationRangesParams, forward_gap,
+};
 
 /// HSL of a clamped pixel: hue in degrees `[0, 360)`, saturation and
 /// lightness in `[0, 1]`.
@@ -100,10 +102,50 @@ fn adjust_saturation(saturation: f32, amount: f32) -> f32 {
     }
 }
 
+/// The weight in `[0, 1]` of hue `hue` (degrees) in a colour range with
+/// `edges`: a linear ramp up from edge 1 to edge 2, 1 up to edge 3, a
+/// linear ramp down to edge 4, 0 elsewhere, all measured forward from
+/// edge 1 around the circle. A zero-width ramp is a hard edge.
+///
+/// This is a **fitted model**, not Photoshop's published algorithm: it
+/// reproduces the ramps in psd-tools' `huesaturation_saturation_rgb.psd`
+/// against Photoshop's merged image (see PLAN.md, 0.204.0).
+#[must_use]
+pub fn range_weight(edges: [f32; 4], hue: f32) -> f32 {
+    let [e1, e2, e3, e4] = edges;
+    let t = (hue - e1).rem_euclid(360.0);
+    let up = forward_gap(e1, e2);
+    let full = forward_gap(e2, e3);
+    let down = forward_gap(e3, e4);
+    if t < up {
+        t / up
+    } else if t < up + full {
+        1.0
+    } else if t < up + full + down {
+        1.0 - (t - up - full) / down
+    } else {
+        0.0
+    }
+}
+
+/// A saturation slider position `amount` in `[-1, 1]` as a factor on the
+/// saturation (`1 + k` below zero, `1 / (1 - k)` above; the pole at `+1`
+/// is capped, since a weighted share of an infinite factor has no meaning).
+fn saturation_factor(amount: f32) -> f32 {
+    if amount <= 0.0 {
+        1.0 + amount
+    } else {
+        1.0 / (1.0 - amount).max(1e-6)
+    }
+}
+
 /// A Hue/Saturation adjustment ready to apply to pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HueSaturationOp {
     params: HueSaturationParams,
+    /// The colour ranges, only when Colorize is off and one of them
+    /// adjusts something; otherwise the 0.203.0 path runs unchanged.
+    ranges: Option<[HueRange; HUE_RANGE_COUNT]>,
 }
 
 impl HueSaturationOp {
@@ -111,19 +153,34 @@ impl HueSaturationOp {
     /// type so the caller's lookup-table enum treats every adjustment alike).
     #[must_use]
     pub const fn new(params: &HueSaturationParams) -> Self {
-        Self { params: *params }
+        Self {
+            params: *params,
+            ranges: None,
+        }
+    }
+
+    /// Prepares master/Colorize settings plus colour ranges. With Colorize
+    /// on, or every range adjusting nothing, this is [`Self::new`] of the
+    /// base settings exactly (bit for bit).
+    #[must_use]
+    pub fn with_ranges(params: &HueSaturationRangesParams) -> Self {
+        let ranged = !params.base().colorize() && !params.ranges_adjust_nothing();
+        Self {
+            params: *params.base(),
+            ranges: ranged.then(|| *params.ranges()),
+        }
     }
 
     /// Whether [`Self::apply`] returns its input unchanged.
     #[must_use]
     pub fn is_identity(&self) -> bool {
-        self.params.is_identity()
+        self.params.is_identity() && self.ranges.is_none()
     }
 
     /// The adjusted colour of one straight, encoded RGB pixel.
     #[must_use]
     pub fn apply(&self, rgb: [f32; 3]) -> [f32; 3] {
-        if self.params.is_identity() {
+        if self.is_identity() {
             return rgb;
         }
         let clamped = rgb.map(|v| if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) });
@@ -136,16 +193,58 @@ impl HueSaturationOp {
                 adjust_lightness(lightness, p.colorize_lightness() / 100.0),
             );
         }
-        from_hsl(
-            hue + p.hue(),
-            adjust_saturation(saturation, p.saturation() / 100.0),
+        let Some(ranges) = &self.ranges else {
+            return from_hsl(
+                hue + p.hue(),
+                adjust_saturation(saturation, p.saturation() / 100.0),
+                adjust_lightness(lightness, p.lightness() / 100.0),
+            );
+        };
+        // Ranged: the master first (exactly as above), then the weighted
+        // sum of the ranges, weights read from the pixel's ORIGINAL hue.
+        let (mut hue_shift, mut saturation_gain, mut lightness_sum) = (0.0_f32, 0.0_f32, 0.0_f32);
+        for range in ranges.iter().filter(|r| !r.adjusts_nothing()) {
+            let w = range_weight(range.edges(), hue);
+            if w <= 0.0 {
+                continue;
+            }
+            hue_shift += w * range.hue();
+            saturation_gain += w * (saturation_factor(range.saturation() / 100.0) - 1.0);
+            lightness_sum += w * range.lightness() / 100.0;
+        }
+        let master_saturation = adjust_saturation(saturation, p.saturation() / 100.0);
+        let rgb = from_hsl(
+            hue + p.hue() + hue_shift,
+            (master_saturation * (1.0 + saturation_gain)).clamp(0.0, 1.0),
             adjust_lightness(lightness, p.lightness() / 100.0),
-        )
+        );
+        pull_lightness(rgb, lightness_sum.clamp(-1.0, 1.0))
     }
 }
 
+/// The ranges' net lightness `t` in `[-1, 1]`: positive pulls every
+/// channel towards the pixel's largest channel by that fraction (towards
+/// grey at the peak's level), negative pulls them towards the smallest.
+/// Fitted: Photoshop's per-range lightness barely moves HSL lightness, it
+/// desaturates (PLAN.md, 0.204.0).
+fn pull_lightness(rgb: [f32; 3], t: f32) -> [f32; 3] {
+    if t == 0.0 {
+        return rgb;
+    }
+    let max = rgb[0].max(rgb[1]).max(rgb[2]);
+    let min = rgb[0].min(rgb[1]).min(rgb[2]);
+    rgb.map(|c| {
+        if t > 0.0 {
+            t.mul_add(max - c, c)
+        } else {
+            (-t).mul_add(-(c - min), c)
+        }
+        .clamp(0.0, 1.0)
+    })
+}
+
 #[cfg(test)]
-#[allow(clippy::float_cmp)]
+#[allow(clippy::float_cmp, clippy::many_single_char_names)]
 mod tests {
     use super::{HueSaturationOp, from_hsl, to_hsl};
     use aurora_core::HueSaturationParams as P;
@@ -367,6 +466,238 @@ mod tests {
         let batch: Vec<[f32; 3]> = px.iter().map(|&c| op.apply(c)).collect();
         for (c, want) in px.iter().zip(&batch) {
             assert_eq!(&op.apply(*c), want);
+        }
+    }
+
+    // ---- 0.204.0: colour ranges ----------------------------------------
+
+    use super::range_weight;
+    use aurora_core::{HueRange, HueSaturationRangesParams as RP};
+
+    fn base(h: f32, s: f32, l: f32) -> P {
+        params(h, s, l)
+    }
+
+    fn with_range(b: P, index: usize, edges: [f32; 4], h: f32, s: f32, l: f32) -> RP {
+        let range = match HueRange::new(edges, h, s, l) {
+            Ok(r) => r,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match RP::plain(b).with_range(index, range) {
+            Some(p) => p,
+            None => unreachable!("index"),
+        }
+    }
+
+    fn grid() -> Vec<[f32; 3]> {
+        let mut v = Vec::new();
+        for r in 0..=6 {
+            for g in 0..=6 {
+                for b in 0..=6 {
+                    v.push([r as f32 / 6.0, g as f32 / 6.0, b as f32 / 6.0]);
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn weights_ramp_hold_ramp_down_and_wrap() {
+        let e = [315.0, 345.0, 15.0, 45.0]; // reds: wraps through 0
+        let w = |h: f32| range_weight(e, h);
+        assert_eq!(w(315.0), 0.0);
+        assert!((w(330.0) - 0.5).abs() < 1e-6);
+        assert_eq!(w(345.0), 1.0);
+        assert_eq!(w(0.0), 1.0);
+        assert_eq!(w(359.999), 1.0);
+        assert_eq!(w(15.0 - 1e-3), 1.0);
+        assert!((w(30.0) - 0.5).abs() < 1e-6);
+        assert_eq!(w(45.0), 0.0);
+        assert_eq!(w(180.0), 0.0);
+        assert_eq!(w(314.9), 0.0);
+        // Hue 360 is hue 0; hue -30 is 330.
+        assert_eq!(w(360.0), w(0.0));
+        assert!((w(-30.0) - w(330.0)).abs() < 1e-6);
+        // Hard edges: (100,100,200,200) is a box.
+        let b = [100.0, 100.0, 200.0, 200.0];
+        assert_eq!(range_weight(b, 99.9), 0.0);
+        assert_eq!(range_weight(b, 100.0), 1.0);
+        assert_eq!(range_weight(b, 199.9), 1.0);
+        assert_eq!(range_weight(b, 200.0), 0.0);
+        // A corpus range that wraps in its ramp-up (303 -> 4).
+        let c = [303.0, 4.0, 82.0, 175.0];
+        assert_eq!(range_weight(c, 303.0), 0.0);
+        assert!((range_weight(c, 333.5) - 0.5).abs() < 0.01);
+        assert_eq!(range_weight(c, 40.0), 1.0);
+        assert!((range_weight(c, 128.5) - 0.5).abs() < 0.01);
+        assert_eq!(range_weight(c, 175.0), 0.0);
+        assert_eq!(range_weight(c, 250.0), 0.0);
+    }
+
+    #[test]
+    fn neutral_ranges_are_bit_identical_to_the_plain_adjustment() {
+        let plain = base(-27.0, 12.0, -20.0);
+        let a = HueSaturationOp::new(&plain);
+        // Default ranges, and ranges whose edges were edited but adjust nothing.
+        let edited = with_range(plain, 2, [80.0, 100.0, 140.0, 160.0], 0.0, 0.0, 0.0);
+        for ranged in [RP::plain(plain), edited] {
+            let b = HueSaturationOp::with_ranges(&ranged);
+            for px in grid() {
+                let (x, y) = (a.apply(px), b.apply(px));
+                for (u, v) in x.iter().zip(y) {
+                    assert_eq!(u.to_bits(), v.to_bits(), "{px:?}");
+                }
+            }
+        }
+        assert!(HueSaturationOp::with_ranges(&RP::plain(P::identity())).is_identity());
+        // Colorize ignores the ranges.
+        let col = P::new(0.0, 0.0, 0.0, true, 120.0, 100.0, 0.0);
+        let col = match col {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let ranged = with_range(col, 0, [315.0, 345.0, 15.0, 45.0], 50.0, 50.0, 50.0);
+        let (x, y) = (
+            HueSaturationOp::new(&col),
+            HueSaturationOp::with_ranges(&ranged),
+        );
+        for px in grid() {
+            assert_eq!(x.apply(px), y.apply(px));
+        }
+    }
+
+    #[test]
+    fn a_ranges_hue_shift_applies_by_weight_and_leaves_other_hues_alone() {
+        let red_range = [315.0, 345.0, 15.0, 45.0];
+        let p = with_range(P::identity(), 0, red_range, 120.0, 0.0, 0.0);
+        let op = HueSaturationOp::with_ranges(&p);
+        // Pure red (hue 0, weight 1) rotates by 120: green.
+        assert!(near(op.apply([1.0, 0.0, 0.0]), [0.0, 1.0, 0.0], 1e-5));
+        // Pure blue (hue 240, weight 0) is untouched.
+        assert_eq!(op.apply([0.0, 0.0, 1.0]), [0.0, 0.0, 1.0]);
+        // Halfway down the ramp (hue 30, weight .5) rotates by 60.
+        let c = from_hsl(30.0, 1.0, 0.5);
+        let (h, _, _) = to_hsl(op.apply(c));
+        assert!((h - 90.0).abs() < 1e-3, "{h}");
+        // Grey is untouched by a hue shift.
+        assert_eq!(op.apply([0.4, 0.4, 0.4]), [0.4, 0.4, 0.4]);
+    }
+
+    #[test]
+    fn a_ranges_saturation_blends_the_factor_by_weight() {
+        let red_range = [315.0, 345.0, 15.0, 45.0];
+        // +50 is a factor of 2; at weight 0.5 the blended factor is 1.5.
+        let p = with_range(P::identity(), 0, red_range, 0.0, 50.0, 0.0);
+        let op = HueSaturationOp::with_ranges(&p);
+        let full = from_hsl(0.0, 0.2, 0.5);
+        let (_, s, _) = to_hsl(op.apply(full));
+        assert!((s - 0.4).abs() < 1e-5, "{s}");
+        let half = from_hsl(30.0, 0.2, 0.5);
+        let (_, s, _) = to_hsl(op.apply(half));
+        assert!((s - 0.3).abs() < 1e-5, "{s}");
+        // -100 greys the range completely, at its plateau only.
+        let g = with_range(P::identity(), 0, red_range, 0.0, -100.0, 0.0);
+        let (_, s, _) = to_hsl(HueSaturationOp::with_ranges(&g).apply(full));
+        assert!(s < 1e-5);
+        // Two overlapping ranges add their (factor - 1) shares.
+        let Ok(second) = HueRange::new(red_range, 0.0, 50.0, 0.0) else {
+            unreachable!("valid range");
+        };
+        let Some(two) = p.with_range(1, second) else {
+            unreachable!("index");
+        };
+        let (_, s, _) = to_hsl(HueSaturationOp::with_ranges(&two).apply(full));
+        assert!((s - 0.6).abs() < 1e-5, "factor 1 + 1 + 1 = 3: {s}");
+    }
+
+    #[test]
+    fn master_applies_first_and_the_ranges_weight_the_original_hue() {
+        // Master hue +120 moves red to green; the red range (weights from
+        // the ORIGINAL hue) then still applies to it.
+        let red_range = [315.0, 345.0, 15.0, 45.0];
+        let p = with_range(base(120.0, 0.0, 0.0), 0, red_range, 60.0, 0.0, 0.0);
+        let out = HueSaturationOp::with_ranges(&p).apply([1.0, 0.0, 0.0]);
+        let (h, _, _) = to_hsl(out);
+        assert!((h - 180.0).abs() < 1e-3, "120 + 60: {h}");
+        // A pixel that master moves INTO the range is not affected by it.
+        let blue = [0.0, 0.0, 1.0]; // hue 240; +120 -> hue 0 (red-ish)
+        let (h, _, _) = to_hsl(HueSaturationOp::with_ranges(&p).apply(blue));
+        assert!((h - 0.0).abs() < 1e-3 || (h - 360.0).abs() < 1e-3, "{h}");
+    }
+
+    #[test]
+    fn a_ranges_lightness_pulls_channels_towards_the_peak_or_the_floor() {
+        let red_range = [315.0, 345.0, 15.0, 45.0];
+        let up = with_range(P::identity(), 0, red_range, 0.0, 0.0, 50.0);
+        let down = with_range(P::identity(), 0, red_range, 0.0, 0.0, -50.0);
+        let c = [0.8, 0.3, 0.2];
+        let (u, d) = (
+            HueSaturationOp::with_ranges(&up).apply(c),
+            HueSaturationOp::with_ranges(&down).apply(c),
+        );
+        // c has hue 10, inside the plateau (weight 1): +50 halves the gap to 0.8.
+        assert!(near(u, [0.8, 0.55, 0.5], 1e-5), "{u:?}");
+        // -50 halves the gap to the floor 0.2.
+        assert!(near(d, [0.5, 0.25, 0.2], 1e-5), "{d:?}");
+        // +100 is grey at the peak, -100 grey at the floor.
+        let full = with_range(P::identity(), 0, red_range, 0.0, 0.0, 100.0);
+        assert!(near(
+            HueSaturationOp::with_ranges(&full).apply(c),
+            [0.8; 3],
+            1e-5
+        ));
+        let low = with_range(P::identity(), 0, red_range, 0.0, 0.0, -100.0);
+        assert!(near(
+            HueSaturationOp::with_ranges(&low).apply(c),
+            [0.2; 3],
+            1e-5
+        ));
+        // Hue 340 sits at weight 5/6 on the ramp: the pull is scaled by it.
+        let ramp = HueSaturationOp::with_ranges(&up).apply([0.8, 0.2, 0.4]);
+        assert!(
+            (ramp[1] - (0.2 + 0.6 * 0.5 * 5.0 / 6.0)).abs() < 1e-4,
+            "{ramp:?}"
+        );
+        // Outside the range nothing happens.
+        let blue = [0.1, 0.2, 0.9];
+        assert!(near(
+            HueSaturationOp::with_ranges(&up).apply(blue),
+            blue,
+            1e-6
+        ));
+    }
+
+    #[test]
+    fn ranged_output_stays_in_gamut_and_is_a_pure_per_pixel_function() {
+        let mut p = with_range(
+            base(40.0, 30.0, 10.0),
+            0,
+            [315.0, 345.0, 15.0, 45.0],
+            90.0,
+            100.0,
+            100.0,
+        );
+        p = match p.with_range(
+            3,
+            match HueRange::new([135.0, 165.0, 195.0, 225.0], -90.0, -100.0, -100.0) {
+                Ok(r) => r,
+                Err(err) => unreachable!("{err:?}"),
+            },
+        ) {
+            Some(p) => p,
+            None => unreachable!("index"),
+        };
+        let op = HueSaturationOp::with_ranges(&p);
+        for px in grid() {
+            let out = op.apply(px);
+            assert!(
+                out.iter().all(|v| (0.0..=1.0).contains(v)),
+                "{px:?} {out:?}"
+            );
+            assert_eq!(op.apply(px), out);
+        }
+        for px in [[f32::NAN, 2.0, -1.0], [f32::INFINITY, 0.0, 0.3]] {
+            assert!(op.apply(px).iter().all(|v| (0.0..=1.0).contains(v)));
         }
     }
 }

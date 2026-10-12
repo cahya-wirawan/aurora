@@ -83,7 +83,7 @@ pub use history_panel::{
 pub use hue_saturation_controls::{
     HueSaturationControls, HueSaturationSlider, hue_saturation_colorize_checked,
     hue_saturation_controls_contains, hue_saturation_controls_shown, hue_saturation_params,
-    insert_hue_saturation_controls, sync_hue_saturation_controls,
+    hue_saturation_selected_range, insert_hue_saturation_controls, sync_hue_saturation_controls,
 };
 pub use layer_controls::{
     LayerControls, LockToggle, blend_mode_at, blend_mode_index, blend_mode_index_for,

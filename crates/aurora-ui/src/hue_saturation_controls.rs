@@ -23,10 +23,20 @@
 //! (Photoshop reuses one set of sliders for both modes; two sets keeps
 //! each mode's values apart, as the document stores them.)
 //!
+//! **Range selector (0.204.0).** A tab bar above the first three
+//! sliders picks what they edit: Master (tab 0) or one of the six colour
+//! ranges (tabs 1..=6, reds first). The selection is widget state only —
+//! never document state, no undo step. The range edges are not editable
+//! here; they import from a PSD and default to Photoshop's standard ones.
+//! The Colorize sliders ignore the selection; with Colorize on the tab bar
+//! is disabled (Colorize has no ranges).
+//!
 //! **Units.** Whole numbers throughout (Photoshop's fields): hue in
 //! degrees, saturation and lightness in percent.
 
-use aurora_core::HueSaturationParams;
+use aurora_core::{
+    HUE_RANGE_COUNT, HUE_RANGE_NAMES, HueRange, HueSaturationParams, HueSaturationRangesParams,
+};
 use aurora_doc::{Adjustment, LayerId, LayerTree};
 use aurora_theme::Scales;
 use aurora_widgets::widgets::{self, WidgetKind};
@@ -108,16 +118,23 @@ impl HueSaturationSlider {
         }
     }
 
-    /// The slider position for `params`.
+    /// The slider position for `params`; the first three sliders read
+    /// `range` (0 the master, `1..=6` a colour range, a larger index the
+    /// master).
     #[must_use]
-    pub fn value_of(self, params: &HueSaturationParams) -> f64 {
-        f64::from(match self {
-            Self::Hue => params.hue(),
-            Self::Saturation => params.saturation(),
-            Self::Lightness => params.lightness(),
-            Self::ColorizeHue => params.colorize_hue(),
-            Self::ColorizeSaturation => params.colorize_saturation(),
-            Self::ColorizeLightness => params.colorize_lightness(),
+    pub fn value_of(self, params: &HueSaturationRangesParams, range: usize) -> f64 {
+        let base = params.base();
+        let ranged = range.checked_sub(1).and_then(|i| params.range(i));
+        f64::from(match (self, ranged) {
+            (Self::Hue, Some(r)) => r.hue(),
+            (Self::Saturation, Some(r)) => r.saturation(),
+            (Self::Lightness, Some(r)) => r.lightness(),
+            (Self::Hue, None) => base.hue(),
+            (Self::Saturation, None) => base.saturation(),
+            (Self::Lightness, None) => base.lightness(),
+            (Self::ColorizeHue, _) => base.colorize_hue(),
+            (Self::ColorizeSaturation, _) => base.colorize_saturation(),
+            (Self::ColorizeLightness, _) => base.colorize_lightness(),
         })
     }
 
@@ -128,40 +145,63 @@ impl HueSaturationSlider {
     }
 
     /// `params` with this slider moved to `value` (rounded to a whole
-    /// number and clamped to the slider's range). `None` for a non-finite
-    /// `value`.
+    /// number and clamped to the slider's range), on `range` for the
+    /// first three sliders. `None` for a non-finite `value`.
     #[must_use]
     pub fn with_value(
         self,
-        params: &HueSaturationParams,
+        params: &HueSaturationRangesParams,
+        range: usize,
         value: f64,
-    ) -> Option<HueSaturationParams> {
+    ) -> Option<HueSaturationRangesParams> {
         if !value.is_finite() {
             return None;
         }
         let (min, max) = self.range();
         #[allow(clippy::cast_possible_truncation)]
         let v = value.round().clamp(min, max) as f32;
-        match self {
-            Self::Hue => params.with_hue(v),
-            Self::Saturation => params.with_saturation(v),
-            Self::Lightness => params.with_lightness(v),
-            Self::ColorizeHue => params.with_colorize_hue(v),
-            Self::ColorizeSaturation => params.with_colorize_saturation(v),
-            Self::ColorizeLightness => params.with_colorize_lightness(v),
+        let base = params.base();
+        if let (Some(index), false) = (range.checked_sub(1), self.is_colorize()) {
+            let current: &HueRange = params.range(index)?;
+            let next = match self {
+                Self::Hue => current.with_hue(v),
+                Self::Saturation => current.with_saturation(v),
+                _ => current.with_lightness(v),
+            }
+            .ok()?;
+            return params.with_range(index, next);
         }
-        .ok()
+        let next = match self {
+            Self::Hue => base.with_hue(v),
+            Self::Saturation => base.with_saturation(v),
+            Self::Lightness => base.with_lightness(v),
+            Self::ColorizeHue => base.with_colorize_hue(v),
+            Self::ColorizeSaturation => base.with_colorize_saturation(v),
+            Self::ColorizeLightness => base.with_colorize_lightness(v),
+        }
+        .ok()?;
+        Some(params.with_base(next))
     }
 }
 
-/// `id`'s Hue/Saturation parameters, `None` for anything that is not a
-/// Hue/Saturation adjustment layer.
+/// `id`'s Hue/Saturation settings (master/Colorize and the six colour
+/// ranges, whichever variant stores them), `None` for anything that is not
+/// a Hue/Saturation adjustment layer.
 #[must_use]
-pub fn hue_saturation_params(layers: &LayerTree, id: LayerId) -> Option<&HueSaturationParams> {
-    match layers.adjustment(id) {
-        Some(Adjustment::HueSaturation(params)) => Some(params),
-        _ => None,
-    }
+pub fn hue_saturation_params(layers: &LayerTree, id: LayerId) -> Option<HueSaturationRangesParams> {
+    layers.adjustment(id).and_then(Adjustment::hue_saturation)
+}
+
+/// The tab labels of the range selector: Master, then the six ranges.
+const RANGE_TAB_LABELS: [&str; HUE_RANGE_COUNT + 1] =
+    ["Master", "Red", "Yel", "Grn", "Cyn", "Blu", "Mag"];
+
+/// The accessible names of the range tabs.
+fn range_tab_names() -> Vec<String> {
+    std::iter::once("Master")
+        .chain(HUE_RANGE_NAMES)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The six sliders, their readouts, the Colorize checkbox and the column.
@@ -169,6 +209,8 @@ pub fn hue_saturation_params(layers: &LayerTree, id: LayerId) -> Option<&HueSatu
 pub struct HueSaturationControls {
     /// The column container.
     pub root: WidgetId,
+    /// The range selector tab bar: tab 0 Master, tabs 1..=6 the ranges.
+    pub range: WidgetId,
     /// The "Colorize" checkbox.
     pub colorize: WidgetId,
     /// The sliders, indexed by [`HueSaturationSlider::index`].
@@ -217,7 +259,16 @@ pub fn insert_hue_saturation_controls(
 ) -> Result<HueSaturationControls, WidgetError> {
     let root = widgets::insert_container(tree, parent, column_style(scales))?;
     let built = (|| {
-        let identity = HueSaturationParams::identity();
+        let identity = HueSaturationRangesParams::plain(HueSaturationParams::identity());
+        let range = widgets::insert_tab_bar(
+            tree,
+            root,
+            scales,
+            "Hue/Saturation range",
+            RANGE_TAB_LABELS.iter().map(|&l| l.to_owned()).collect(),
+            0,
+        )?;
+        widgets::set_tab_accessible_names(tree, range, range_tab_names())?;
         let mut sliders = Vec::new();
         let mut readouts = Vec::new();
         let mut colorize = None;
@@ -225,7 +276,7 @@ pub fn insert_hue_saturation_controls(
             if slider == HueSaturationSlider::ColorizeHue {
                 colorize = Some(widgets::insert_checkbox(tree, root, scales, "Colorize")?);
             }
-            let value = slider.value_of(&identity);
+            let value = slider.value_of(&identity, 0);
             let (min, max) = slider.range();
             readouts.push(widgets::insert_label(
                 tree,
@@ -252,6 +303,7 @@ pub fn insert_hue_saturation_controls(
         };
         let controls = HueSaturationControls {
             root,
+            range,
             colorize,
             sliders,
             readouts,
@@ -275,6 +327,11 @@ fn set_enabled(
     colorize: bool,
 ) -> Result<bool, WidgetError> {
     let mut changed = false;
+    let tabs_disabled = widgets::tab_bar_state(tree, controls.range)?.is_disabled();
+    if tabs_disabled == (shown && !colorize) {
+        widgets::set_tab_bar_disabled(tree, controls.range, !shown || colorize)?;
+        changed = true;
+    }
     let checkbox_disabled = match tree.payload(controls.colorize) {
         Some(WidgetKind::Checkbox(state)) => state.disabled,
         Some(_) => return Err(WidgetError::WrongWidgetKind(controls.colorize)),
@@ -338,6 +395,17 @@ pub fn hue_saturation_controls_shown(
         .is_some_and(|style| style.display != Display::None)
 }
 
+/// The range the first three sliders edit: 0 the master, `1..=6` a
+/// colour range (the selector's selected tab; 0 if it cannot be read).
+#[must_use]
+pub fn hue_saturation_selected_range(
+    tree: &WidgetTree<WidgetKind>,
+    controls: HueSaturationControls,
+) -> usize {
+    widgets::tab_bar_state(tree, controls.range)
+        .map_or(0, aurora_widgets::widgets::TabBarState::selected)
+}
+
 /// Whether the Colorize checkbox is checked.
 #[must_use]
 pub fn hue_saturation_colorize_checked(
@@ -374,13 +442,16 @@ pub fn sync_hue_saturation_controls(
     let Some(params) = active.and_then(|id| hue_saturation_params(layers, id)) else {
         return set_shown(tree, controls, false, false);
     };
-    let mut changed = set_shown(tree, controls, true, params.colorize())?;
-    let checked = if params.colorize() {
+    let range = hue_saturation_selected_range(tree, controls);
+    let params = &params;
+    let colorize_on = params.base().colorize();
+    let mut changed = set_shown(tree, controls, true, colorize_on)?;
+    let checked = if colorize_on {
         accesskit::Toggled::True
     } else {
         accesskit::Toggled::False
     };
-    if hue_saturation_colorize_checked(tree, controls) != params.colorize() {
+    if hue_saturation_colorize_checked(tree, controls) != colorize_on {
         widgets::set_checkbox_checked(tree, controls.colorize, checked)?;
         changed = true;
     }
@@ -391,7 +462,7 @@ pub fn sync_hue_saturation_controls(
         ) else {
             continue;
         };
-        let value = slider.value_of(params);
+        let value = slider.value_of(params, range);
         if captured != Some(id) {
             let shown = match tree.payload(id) {
                 Some(WidgetKind::Slider(state)) => state.value,
@@ -428,7 +499,7 @@ mod tests {
         HueSaturationSlider as S, hue_saturation_colorize_checked, hue_saturation_controls_shown,
         insert_hue_saturation_controls, sync_hue_saturation_controls,
     };
-    use aurora_core::HueSaturationParams;
+    use aurora_core::{HueSaturationParams, HueSaturationRangesParams};
     use aurora_doc::{Adjustment, LayerTree};
     use aurora_widgets::widgets::{self, WidgetKind};
 
@@ -508,6 +579,11 @@ mod tests {
         let _ = sync_hue_saturation_controls(&mut ws.tree, controls, &layers, Some(id), None);
         assert!(hue_saturation_colorize_checked(&ws.tree, controls));
         assert!(
+            widgets::tab_bar_state(&ws.tree, controls.range)
+                .is_ok_and(aurora_widgets::widgets::TabBarState::is_disabled),
+            "Colorize has no ranges: the selector is disabled"
+        );
+        assert!(
             st(&ws, controls, S::Hue.index()).1 && !st(&ws, controls, S::ColorizeHue.index()).1
         );
         // A captured slider keeps its mid-drag value.
@@ -531,20 +607,98 @@ mod tests {
 
     #[test]
     fn slider_values_round_to_whole_numbers_and_clamp() {
-        let id = HueSaturationParams::identity();
-        for s in S::ALL {
-            let (min, max) = s.range();
-            let lo = s.with_value(&id, min - 50.0).map(|p| s.value_of(&p));
-            let hi = s.with_value(&id, max + 50.0).map(|p| s.value_of(&p));
-            assert_eq!(lo, Some(min), "{s:?}");
-            assert_eq!(hi, Some(max), "{s:?}");
-            assert!(s.with_value(&id, f64::NAN).is_none());
+        let id = HueSaturationRangesParams::plain(HueSaturationParams::identity());
+        for range in 0..=6 {
+            for s in S::ALL {
+                let (min, max) = s.range();
+                let lo = s
+                    .with_value(&id, range, min - 50.0)
+                    .map(|p| s.value_of(&p, range));
+                let hi = s
+                    .with_value(&id, range, max + 50.0)
+                    .map(|p| s.value_of(&p, range));
+                assert_eq!(lo, Some(min), "{s:?} {range}");
+                assert_eq!(hi, Some(max), "{s:?} {range}");
+                assert!(s.with_value(&id, range, f64::NAN).is_none());
+            }
         }
-        let moved = S::Saturation.with_value(&id, 40.6);
-        assert_eq!(moved.map(|p| p.saturation()), Some(41.0));
+        let moved = S::Saturation.with_value(&id, 0, 40.6);
+        assert_eq!(moved.map(|p| p.base().saturation()), Some(41.0));
         let m = moved.unwrap_or(id);
-        assert_eq!((m.hue(), m.lightness(), m.colorize()), (0.0, 0.0, false));
-        assert_eq!(S::ColorizeSaturation.value_of(&id), 25.0);
+        let b = m.base();
+        assert_eq!((b.hue(), b.lightness(), b.colorize()), (0.0, 0.0, false));
+        assert_eq!(S::ColorizeSaturation.value_of(&id, 0), 25.0);
+        // A range edit leaves the master and the other ranges alone.
+        let r = S::Lightness.with_value(&id, 3, -40.0).unwrap_or(id);
+        assert_eq!(S::Lightness.value_of(&r, 3), -40.0);
+        assert_eq!(S::Lightness.value_of(&r, 0), 0.0);
+        assert_eq!(S::Lightness.value_of(&r, 2), 0.0);
+        assert_eq!(
+            r.range(2).map(aurora_core::HueRange::lightness),
+            Some(-40.0)
+        );
+        assert_eq!(
+            r.range(2).map(aurora_core::HueRange::edges),
+            Some([75.0, 105.0, 135.0, 165.0])
+        );
+        // The Colorize sliders ignore the selection.
+        let c = S::ColorizeHue.with_value(&id, 4, 99.0).unwrap_or(id);
+        assert_eq!(c.base().colorize_hue(), 99.0);
+        assert!(c.ranges_adjust_nothing());
         assert!(S::ColorizeHue.is_colorize() && !S::Hue.is_colorize());
+    }
+
+    /// 0.204.0: the selector re-binds the first three sliders to a range
+    /// of a ranged layer and back to the master, with no document change.
+    #[test]
+    fn the_range_selector_rebinds_the_first_three_sliders() {
+        let scales = scales();
+        let mut ws = crate::build_workspace(&scales);
+        let controls =
+            match insert_hue_saturation_controls(&mut ws.tree, ws.properties.root, &scales) {
+                Ok(c) => c,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        let ranged = HueSaturationRangesParams::plain(params(5.0, 6.0, 7.0))
+            .with_range(
+                2,
+                match aurora_core::HueRange::new([75.0, 105.0, 135.0, 165.0], 11.0, -22.0, 33.0) {
+                    Ok(r) => r,
+                    Err(err) => unreachable!("{err:?}"),
+                },
+            )
+            .unwrap_or_else(|| unreachable!("range"));
+        let mut layers = LayerTree::new();
+        let Ok(id) = layers.add_adjustment_layer_at(
+            "Hue/Saturation 1",
+            Adjustment::from_hue_saturation(ranged),
+            None,
+            0,
+        ) else {
+            unreachable!("adjustment layer");
+        };
+        let _ = sync_hue_saturation_controls(&mut ws.tree, controls, &layers, Some(id), None);
+        assert_eq!(super::hue_saturation_selected_range(&ws.tree, controls), 0);
+        assert_eq!(st(&ws, controls, 0), (5.0, false));
+        assert!(widgets::tab_bar_state(&ws.tree, controls.range).is_ok_and(|t| !t.is_disabled()));
+        // Select Greens (tab 3).
+        let _ = widgets::select_tab(&mut ws.tree, controls.range, 3);
+        let _ = sync_hue_saturation_controls(&mut ws.tree, controls, &layers, Some(id), None);
+        assert_eq!(super::hue_saturation_selected_range(&ws.tree, controls), 3);
+        assert_eq!(st(&ws, controls, 0), (11.0, false));
+        assert_eq!(st(&ws, controls, 1), (-22.0, false));
+        assert_eq!(st(&ws, controls, 2), (33.0, false));
+        match ws.tree.payload(controls.readouts[1]) {
+            Some(WidgetKind::Label(label)) => assert_eq!(label.text, "Saturation: -22"),
+            other => unreachable!("{other:?}"),
+        }
+        // Back to Master.
+        let _ = widgets::select_tab(&mut ws.tree, controls.range, 0);
+        let _ = sync_hue_saturation_controls(&mut ws.tree, controls, &layers, Some(id), None);
+        assert_eq!(st(&ws, controls, 0), (5.0, false));
+        assert_eq!(
+            layers.adjustment(id),
+            Some(&Adjustment::from_hue_saturation(ranged))
+        );
     }
 }

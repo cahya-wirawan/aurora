@@ -8029,7 +8029,7 @@ struct CurvesUiState {
 #[derive(Debug, Clone, PartialEq)]
 struct PendingHueSaturation {
     layer: aurora_doc::LayerId,
-    start: aurora_core::HueSaturationParams,
+    start: aurora_core::HueSaturationRangesParams,
 }
 
 /// A live Levels-slider drag: the layer it started on and that layer's
@@ -8171,6 +8171,9 @@ fn is_hue_saturation_outcome(
     match outcome {
         PointerOutcome::Action(Outcome::ValueChanged { id, .. }) => hs.slider_of(*id).is_some(),
         PointerOutcome::Action(Outcome::Toggled { id, .. }) => *id == hs.colorize,
+        // The range selector (0.204.0): widget state only, no document edit,
+        // but a pending drag settles when it is used.
+        PointerOutcome::Action(Outcome::TabSelected { bar, .. }) => *bar == hs.range,
         _ => false,
     }
 }
@@ -8189,12 +8192,13 @@ fn hue_saturation_slider_captured(
 fn record_hue_saturation_step(
     cx: &mut CurvesEdit<'_>,
     id: aurora_doc::LayerId,
-    params: aurora_core::HueSaturationParams,
+    params: aurora_core::HueSaturationRangesParams,
 ) -> bool {
-    if let Err(err) =
-        cx.history
-            .set_adjustment(cx.layers, id, aurora_doc::Adjustment::HueSaturation(params))
-    {
+    if let Err(err) = cx.history.set_adjustment(
+        cx.layers,
+        id,
+        aurora_doc::Adjustment::from_hue_saturation(params),
+    ) {
         tracing::warn!(?err, "a Hue/Saturation edit was refused by the layer tree");
         return false;
     }
@@ -8210,7 +8214,7 @@ fn finish_hue_saturation(cx: &mut CurvesEdit<'_>) -> bool {
     let Some(pending) = cx.state.hue_saturation_pending.take() else {
         return false;
     };
-    let Some(now) = aurora_ui::hue_saturation_params(cx.layers, pending.layer).copied() else {
+    let Some(now) = aurora_ui::hue_saturation_params(cx.layers, pending.layer) else {
         return false;
     };
     if now == pending.start {
@@ -8219,7 +8223,7 @@ fn finish_hue_saturation(cx: &mut CurvesEdit<'_>) -> bool {
     // Rewind the live edits, then record the whole drag as one step.
     if let Err(err) = cx.layers.set_adjustment(
         pending.layer,
-        aurora_doc::Adjustment::HueSaturation(pending.start),
+        aurora_doc::Adjustment::from_hue_saturation(pending.start),
     ) {
         tracing::warn!(
             ?err,
@@ -8258,19 +8262,24 @@ fn apply_hue_saturation_outcome(
     let Some(active) = cx.active_layer.filter(|&id| cx.layers.contains(id)) else {
         return CompositeInvalidation::None;
     };
-    let Some(current) = aurora_ui::hue_saturation_params(cx.layers, active).copied() else {
+    let Some(current) = aurora_ui::hue_saturation_params(cx.layers, active) else {
         return CompositeInvalidation::None;
     };
     let (next, dragged) = match action {
         aurora_widgets::ActionOutcome::Toggled { id, state } if *id == hs.colorize => (
-            current.with_colorize(*state == accesskit::Toggled::True),
+            current.with_base(
+                current
+                    .base()
+                    .with_colorize(*state == accesskit::Toggled::True),
+            ),
             None,
         ),
         aurora_widgets::ActionOutcome::ValueChanged { id, value } => {
             let Some(slider) = hs.slider_of(*id) else {
                 return CompositeInvalidation::None;
             };
-            let Some(next) = slider.with_value(&current, *value) else {
+            let range = aurora_ui::hue_saturation_selected_range(&cx.workspace.tree, hs);
+            let Some(next) = slider.with_value(&current, range, *value) else {
                 return CompositeInvalidation::None;
             };
             (next, Some(*id))
@@ -8298,7 +8307,7 @@ fn apply_hue_saturation_outcome(
         }
         return match cx
             .layers
-            .set_adjustment(active, aurora_doc::Adjustment::HueSaturation(next))
+            .set_adjustment(active, aurora_doc::Adjustment::from_hue_saturation(next))
         {
             Ok(()) => CompositeInvalidation::Everything,
             Err(err) => {
@@ -16110,6 +16119,9 @@ impl AdjustmentLut {
             aurora_doc::Adjustment::Levels(params) => Self::Levels(levels_lut(params)),
             aurora_doc::Adjustment::HueSaturation(params) => {
                 Self::HueSaturation(aurora_filters::HueSaturationOp::new(params))
+            }
+            aurora_doc::Adjustment::HueSaturationRanges(params) => {
+                Self::HueSaturation(aurora_filters::HueSaturationOp::with_ranges(params))
             }
         }
     }
@@ -36564,66 +36576,63 @@ mod tests {
         assert!(diff.over_one <= 1818 && diff.over_two <= 826, "{diff:?}");
     }
 
-    /// 0.203.0: the psd-tools Hue/Saturation fixtures against Photoshop's
-    /// own merged image. Colorize-only layers (neutral range records) and
-    /// master-only layers are imported; a layer whose per-range records are
-    /// not neutral is left out with a report line (the "before" numbers).
-    /// Prints the numbers; skips when the corpus is absent.
+    /// 0.203.0/0.204.0: the psd-tools Hue/Saturation fixtures against
+    /// Photoshop's own merged image. Colorize-only layers, master-only
+    /// layers and (0.204.0) layers with per-colour-range adjustments are
+    /// imported and composited; nothing is left out. Prints the numbers;
+    /// skips (printing "not run") when the corpus is absent.
     #[test]
     fn hue_saturation_psds_composite_like_photoshops_merged_image() {
         // (file, imported layers, max-error bound per channel, mean bound
-        // per channel, report fragment that must appear (None: no report)).
-        type Row<'a> = (&'a str, usize, [f64; 3], [f64; 3], Option<&'a str>);
-        let rows: [Row<'_>; 5] = [
+        // per channel). 8-bit levels over the whole 200x200 or 32x32 image.
+        type Row<'a> = (&'a str, usize, [f64; 3], [f64; 3]);
+        let rows: [Row<'_>; 6] = [
             (
                 "adjustments/huesaturation_colorize_rgb.psd",
                 4,
                 [3.0, 3.0, 3.0],
                 [0.46, 0.55, 0.44],
-                None,
             ),
-            ("layers/hue-saturation.psd", 1, [0.0; 3], [0.001; 3], None),
-            ("clip-adjustment.psd", 1, [0.0; 3], [0.001; 3], None),
-            // One master-only layer imported, three ranged ones left out
-            // (before 0.203.0 all four were: mean 41.0 / 33.3 / 34.4 by an
-            // independent reconstruction of the backdrop).
+            ("layers/hue-saturation.psd", 1, [0.0; 3], [0.001; 3]),
+            ("clip-adjustment.psd", 1, [0.0; 3], [0.001; 3]),
+            // Measured on 0.204.0 (master-only layers use 0.203.0's HSL
+            // lightness, which is the dominant remaining error: PLAN.md).
+            // Before: mean 23.0 / 18.4 / 16.1 with three of four layers
+            // left out. The bounds sit just above the measurement.
             (
                 "adjustments/huesaturation_rgb.psd",
-                1,
-                [249.0, 249.0, 249.0],
-                [23.0, 18.4, 16.1],
-                Some("Hue/Saturation"),
+                4,
+                [118.0, 118.0, 112.0],
+                [3.8, 4.0, 4.85],
             ),
-            // All four ranged: left out, the error is the whole adjustment's.
             (
                 "adjustments/huesaturation_lightness_rgb.psd",
-                0,
-                [193.0, 245.0, 248.0],
-                [71.5, 72.5, 75.6],
-                Some("Hue/Saturation"),
+                4,
+                [88.0, 83.0, 88.0],
+                [4.7, 3.85, 4.8],
+            ),
+            (
+                "adjustments/huesaturation_saturation_rgb.psd",
+                4,
+                [35.0, 35.0, 25.0],
+                [0.45, 0.38, 0.41],
             ),
         ];
-        for (file, imported, max_bound, mean_bound, report) in rows {
+        for (file, imported, max_bound, mean_bound) in rows {
             let Some(diff) = curves_corpus_diff(file) else {
-                return;
+                eprintln!("not run: {file} (corpus file missing)");
+                continue;
             };
             println!("{file}: {diff:?}");
             assert_eq!(diff.curves, imported, "{file}: {diff:?}");
-            match report {
-                Some(fragment) => assert!(
-                    diff.report.iter().any(|item| item.contains(fragment)),
-                    "{file}: {:?}",
-                    diff.report
-                ),
-                None => assert!(
-                    !diff
-                        .report
-                        .iter()
-                        .any(|item| item.contains("adjustment layer") || item.contains("Hue")),
-                    "{file}: {:?}",
-                    diff.report
-                ),
-            }
+            assert!(
+                !diff
+                    .report
+                    .iter()
+                    .any(|item| item.contains("adjustment layer") || item.contains("Hue")),
+                "{file}: {:?}",
+                diff.report
+            );
             for c in 0..3 {
                 let (Some(max), Some(mean), Some(max_want), Some(mean_want)) = (
                     diff.max.get(c),
@@ -77504,9 +77513,26 @@ mod tests {
 
             fn hs_params(&self, id: LayerId) -> aurora_core::HueSaturationParams {
                 match aurora_ui::hue_saturation_params(&self.layers, id) {
-                    Some(params) => *params,
+                    Some(params) => *params.base(),
                     None => unreachable!("{id:?} is a Hue/Saturation layer"),
                 }
+            }
+
+            fn hs_ranged(&self, id: LayerId) -> aurora_core::HueSaturationRangesParams {
+                match aurora_ui::hue_saturation_params(&self.layers, id) {
+                    Some(params) => params,
+                    None => unreachable!("{id:?} is a Hue/Saturation layer"),
+                }
+            }
+
+            /// Picks tab `index` of the range selector as a click would.
+            fn hs_select_range(&mut self, index: usize) {
+                let bar = self.hs_controls().range;
+                let _ = aurora_widgets::widgets::select_tab(&mut self.workspace.tree, bar, index);
+                self.apply(&PointerOutcome::Action(
+                    aurora_widgets::ActionOutcome::TabSelected { bar, index },
+                ));
+                self.sync();
             }
 
             fn hs_along(
@@ -77611,6 +77637,79 @@ mod tests {
             // A hostile out-of-range value clamps to the slider's end.
             rig.hs_set(S::Lightness, 9_999.0);
             assert_eq!(rig.hs_params(id).lightness(), 100.0);
+        }
+
+        /// 0.204.0: with a colour range selected the sliders edit that range;
+        /// a drag is **one** undo step, the layer becomes the ranged variant
+        /// (and goes back to the plain one when undone), selecting a tab
+        /// records nothing, and the composite follows.
+        #[test]
+        fn a_range_slider_drag_is_one_undo_step_and_switches_the_stored_variant() {
+            use aurora_ui::HueSaturationSlider as S;
+            let (mut rig, id) = Rig::hue_saturation();
+            let before = rig.undo_order.undo.len();
+            // Tab selection is widget state: no step, no document change.
+            rig.hs_select_range(1);
+            assert_eq!(rig.undo_order.undo.len(), before);
+            assert!(matches!(
+                rig.layers.adjustment(id),
+                Some(aurora_doc::Adjustment::HueSaturation(_))
+            ));
+            // Reds hue, dragged: BACKDROP's hue is in the reds range or not; the
+            // drag must still record exactly one step and store ordinal 3.
+            let down = rig.hs_along(S::Hue, 0.5);
+            rig.pointer(PointerPhase::Down, down);
+            for f in [0.6, 0.7, 0.8] {
+                let at = rig.hs_along(S::Hue, f);
+                rig.pointer(PointerPhase::Move, at);
+            }
+            let up = rig.hs_along(S::Hue, 0.8);
+            rig.pointer(PointerPhase::Up, up);
+            let ranged = rig.hs_ranged(id);
+            let reds = ranged.range(0).copied();
+            assert!(reds.is_some_and(|r| r.hue() > 10.0), "{reds:?}");
+            assert_eq!(ranged.base().hue(), 0.0, "the master is untouched");
+            assert!(
+                ranged
+                    .range(1)
+                    .is_some_and(aurora_core::HueRange::adjusts_nothing)
+            );
+            assert!(matches!(
+                rig.layers.adjustment(id),
+                Some(aurora_doc::Adjustment::HueSaturationRanges(_))
+            ));
+            assert_eq!(rig.undo_order.undo.len(), before + 1, "one undo step");
+            // The selector survives the edit and keeps showing the range.
+            assert_eq!(
+                aurora_ui::hue_saturation_selected_range(&rig.workspace.tree, rig.hs_controls()),
+                1
+            );
+            assert_eq!(
+                rig.hs_slider(S::Hue).0,
+                f64::from(reds.map_or(0.0, |r| r.hue()))
+            );
+            // Master is still 0 when its tab is selected.
+            rig.hs_select_range(0);
+            assert_eq!(rig.hs_slider(S::Hue).0, 0.0);
+            // Undo restores the plain variant exactly.
+            rig.undo();
+            assert!(matches!(
+                rig.layers.adjustment(id),
+                Some(aurora_doc::Adjustment::HueSaturation(_))
+            ));
+            rig.redo();
+            assert_eq!(rig.hs_ranged(id), ranged);
+            // A keyboard/AT value on another range is one more step.
+            rig.hs_select_range(4);
+            let steps = rig.undo_order.undo.len();
+            rig.hs_set(S::Saturation, -60.0);
+            assert_eq!(
+                rig.hs_ranged(id)
+                    .range(3)
+                    .map(aurora_core::HueRange::saturation),
+                Some(-60.0)
+            );
+            assert_eq!(rig.undo_order.undo.len(), steps + 1);
         }
 
         #[test]

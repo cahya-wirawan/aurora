@@ -398,6 +398,12 @@ mod tests {
         assert_eq!(with(4, -1.0), Err(E::ColorizeSaturation));
         assert_eq!(with(4, 100.5), Err(E::ColorizeSaturation));
         assert_eq!(with(5, 101.0), Err(E::ColorizeLightness));
+        // 0.204.0 judge nits: the half-step boundaries and exactly +-100.
+        assert_eq!(with(5, 100.5), Err(E::ColorizeLightness));
+        assert_eq!(with(5, -100.5), Err(E::ColorizeLightness));
+        assert!(P::new(0.0, 100.0, 100.0, false, 0.0, 25.0, 0.0).is_ok());
+        assert!(P::new(0.0, -100.0, -100.0, false, 0.0, 25.0, 0.0).is_ok());
+        assert!(P::new(0.0, 0.0, 0.0, true, 0.0, 25.0, 100.0).is_ok());
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             for i in 0..6 {
                 assert_eq!(with(i, bad), Err(E::NotFinite), "{i} {bad}");

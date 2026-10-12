@@ -11,6 +11,7 @@ pub mod curves;
 pub mod effects;
 pub mod error;
 pub mod geometry;
+pub mod hue_ranges;
 pub mod hue_saturation;
 pub mod id;
 pub mod levels;
@@ -21,6 +22,10 @@ pub use curves::CurvesParams;
 pub use effects::LayerEffects;
 pub use error::CoreError;
 pub use geometry::{MAX_DOCUMENT_EXTENT, MAX_DOCUMENT_ORIGIN, Rect, Size};
+pub use hue_ranges::{
+    DEFAULT_HUE_RANGE_EDGES, HUE_RANGE_COUNT, HUE_RANGE_NAMES, HueRange, HueRangeError,
+    HueSaturationRangesParams, forward_gap,
+};
 pub use hue_saturation::{HueSaturationError, HueSaturationParams};
 pub use id::{Id, IdGenerator};
 pub use levels::{GAMMA_MAX, GAMMA_MIN, LevelsChannel, LevelsError, LevelsParams, MIN_INPUT_SPAN};

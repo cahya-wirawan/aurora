@@ -4897,6 +4897,75 @@ mod tests {
         }
     }
 
+    /// 0.204.0: a ranged Hue/Saturation adjustment layer, its edit and its history
+    /// survive a save and reopen (manifest and journal replay), with no
+    /// manifest version bump: the variant is appended after `Levels`.
+    #[test]
+    fn round_trips_a_ranged_hue_saturation_adjustment_layer_and_its_history() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        if let Err(err) = history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let params = match aurora_core::HueSaturationParams::new(
+            -27.0, 12.0, -64.0, true, 242.0, 45.0, 14.0,
+        ) {
+            Ok(params) => params,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let layer = match history.add_adjustment_layer_at(
+            &mut layers,
+            "Hue/Saturation 1",
+            aurora_doc::Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
+            None,
+            0,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let range = match aurora_core::HueRange::new([303.0, 4.0, 82.0, 175.0], -38.0, 93.0, -27.0)
+        {
+            Ok(range) => range,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(ranged) =
+            aurora_core::HueSaturationRangesParams::plain(params).with_range(3, range)
+        else {
+            unreachable!("range 3 exists");
+        };
+        let wanted = aurora_doc::Adjustment::from_hue_saturation(ranged);
+        assert!(matches!(
+            wanted,
+            aurora_doc::Adjustment::HueSaturationRanges(_)
+        ));
+        if let Err(err) = history.set_adjustment(&mut layers, layer, wanted.clone()) {
+            unreachable!("{err:?}");
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.into_inner()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(document.layers.adjustment(layer), Some(&wanted));
+        match document.history.replay() {
+            Ok(replayed) => assert_eq!(replayed.adjustment(layer), Some(&wanted)),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
     /// 0.198.0: a layer's and a group's locks survive a save and reopen —
     /// the manifest carries them and the journal replays to them — and an
     /// unlocked layer stays unlocked (an old file's layers read as none).

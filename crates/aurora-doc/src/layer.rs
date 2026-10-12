@@ -81,6 +81,13 @@ pub enum Adjustment {
     /// 0 and 1, and an older build refuses a file using this variant
     /// (ADR 0009). The per-colour-range adjustments are not modelled.
     HueSaturation(aurora_core::HueSaturationParams),
+    /// Hue/Saturation with the six per-colour-range adjustments
+    /// (0.204.0, [`aurora_core::HueSaturationRangesParams`]). **Appended
+    /// after `HueSaturation`** (ordinal 3): an older build refuses a file
+    /// using it (ADR 0009 addendum). A layer whose ranges are all at
+    /// their defaults is stored as `HueSaturation` instead
+    /// ([`Adjustment::from_hue_saturation`]), so 0.203.0 bytes are unchanged.
+    HueSaturationRanges(aurora_core::HueSaturationRangesParams),
 }
 
 impl Adjustment {
@@ -90,7 +97,29 @@ impl Adjustment {
         match self {
             Self::Curves(_) => "Curves",
             Self::Levels(_) => "Levels",
-            Self::HueSaturation(_) => "Hue/Saturation",
+            Self::HueSaturation(_) | Self::HueSaturationRanges(_) => "Hue/Saturation",
+        }
+    }
+
+    /// The Hue/Saturation settings of either Hue/Saturation variant (the
+    /// older one has default, neutral ranges), `None` for other adjustments.
+    #[must_use]
+    pub fn hue_saturation(&self) -> Option<aurora_core::HueSaturationRangesParams> {
+        match self {
+            Self::HueSaturation(p) => Some(aurora_core::HueSaturationRangesParams::plain(*p)),
+            Self::HueSaturationRanges(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    /// A Hue/Saturation adjustment for `params`: the 0.203.0 variant when
+    /// the ranges are all default and neutral, else `HueSaturationRanges`.
+    #[must_use]
+    pub fn from_hue_saturation(params: aurora_core::HueSaturationRangesParams) -> Self {
+        if params.is_plain() {
+            Self::HueSaturation(*params.base())
+        } else {
+            Self::HueSaturationRanges(params)
         }
     }
 }
@@ -869,6 +898,71 @@ mod hue_saturation_wire_tests {
         assert!(
             postcard::from_bytes::<OldLayerKind>(&bytes).is_err(),
             "an older build refuses the unknown Adjustment ordinal"
+        );
+    }
+
+    /// 0.204.0: the ranged variant is ordinal 3, a plain one normalises to
+    /// ordinal 2 with the 0.203.0 bytes, and a 0.203.0 build refuses ordinal 3.
+    #[test]
+    fn ranged_hue_saturation_is_ordinal_three_and_plain_stays_ordinal_two() {
+        use aurora_core::{HueRange, HueSaturationParams, HueSaturationRangesParams};
+
+        /// `Adjustment` as a 0.203.0 build declares it.
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        enum Adjustment203 {
+            Curves(aurora_core::CurvesParams),
+            Levels(aurora_core::LevelsParams),
+            HueSaturation(HueSaturationParams),
+        }
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        enum Kind203 {
+            Pixel { bounds: aurora_core::Rect },
+            Group { children: Vec<super::LayerId> },
+            Adjustment(Adjustment203),
+        }
+        let base = HueSaturationParams::identity();
+        let plain = Adjustment::from_hue_saturation(HueSaturationRangesParams::plain(base));
+        assert_eq!(plain, Adjustment::HueSaturation(base));
+        let old = Kind203::Adjustment(Adjustment203::HueSaturation(base));
+        assert_eq!(
+            encode(&LayerKind::Adjustment(plain.clone())),
+            encode(&old),
+            "plain ranges keep the 0.203.0 bytes"
+        );
+        let moved = match HueRange::standard(0).with_hue(30.0) {
+            Ok(r) => r,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let ranged = HueSaturationRangesParams::plain(base).with_range(0, moved);
+        let Some(ranged) = ranged else {
+            unreachable!("range 0 exists");
+        };
+        let adj = Adjustment::from_hue_saturation(ranged);
+        assert_eq!(adj, Adjustment::HueSaturationRanges(ranged));
+        assert_eq!(adj.hue_saturation(), Some(ranged));
+        let kind = LayerKind::Adjustment(adj);
+        let bytes = encode(&kind);
+        assert_eq!(
+            bytes.get(..2),
+            Some([2_u8, 3].as_slice()),
+            "ordinals 2 then 3"
+        );
+        match postcard::from_bytes::<LayerKind>(&bytes) {
+            Ok(decoded) => assert_eq!(decoded, kind),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        assert!(
+            postcard::from_bytes::<Kind203>(&bytes).is_err(),
+            "a 0.203.0 build refuses ordinal 3"
+        );
+        assert_eq!(
+            plain.hue_saturation(),
+            Some(HueSaturationRangesParams::plain(base))
+        );
+        assert!(
+            Adjustment::Curves(aurora_core::CurvesParams::identity())
+                .hue_saturation()
+                .is_none()
         );
     }
 }

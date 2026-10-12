@@ -431,7 +431,6 @@ enum Note {
     LevelsGrayscale,
     HueSaturationUnreadable,
     HueSaturationGrayscale,
-    HueSaturationRanges,
     FillSkipped,
     TextRasterised,
     SmartObjectRasterised,
@@ -549,13 +548,6 @@ fn note_text(note: Note, n: u64) -> String {
         Note::HueSaturationGrayscale => format!(
             "{n} Hue/Saturation layer{s} in this Grayscale file {was} left out — Aurora \
              hasn't yet verified how Photoshop applies Hue/Saturation to a Grayscale image."
-        ),
-        Note::HueSaturationRanges => format!(
-            "{n} Hue/Saturation layer{s} {was} left out — {} adjust{} individual colour \
-             ranges (reds, yellows, greens, cyans, blues or magentas), which Aurora doesn't \
-             apply yet; only the Master sliders and Colorize are supported.",
-            if one { "it" } else { "they" },
-            if one { "s" } else { "" },
         ),
         Note::FillSkipped => format!(
             "{n} shape or fill layer{s} (solid colour, gradient or pattern) with no stored \
@@ -1904,10 +1896,9 @@ struct HueBlock {
     colorization: (i16, i16, i16),
     /// `(hue, saturation, lightness)` of the master record.
     master: (i16, i16, i16),
-    /// Whether any of the six range records adjusts anything (a non-zero
-    /// hue, saturation or lightness setting; the boundaries do not matter
-    /// when all three are zero).
-    ranges_adjust: bool,
+    /// The six range records: four edges and `(hue, saturation,
+    /// lightness)` each, reds first.
+    ranges: [([i16; 4], (i16, i16, i16)); 6],
 }
 
 /// Parses a `hue2` block. Short data or another version is unreadable;
@@ -1925,47 +1916,39 @@ fn parse_hue2(data: &[u8]) -> Result<HueBlock, ()> {
     };
     let colorization = triple()?;
     let master = triple()?;
-    let mut ranges_adjust = false;
-    for _ in 0..6 {
+    let mut ranges = [([0_i16; 4], (0_i16, 0_i16, 0_i16)); 6];
+    for slot in &mut ranges {
         let mut field = || r.i16("hue/saturation range").map_err(|_| ());
-        for _ in 0..4 {
-            field()?;
-        }
-        let settings = (field()?, field()?, field()?);
-        ranges_adjust |= settings != (0, 0, 0);
+        let edges = [field()?, field()?, field()?, field()?];
+        *slot = (edges, (field()?, field()?, field()?));
     }
     Ok(HueBlock {
         colorize,
         colorization,
         master,
-        ranges_adjust,
+        ranges,
     })
 }
 
-/// A parsed block as Aurora's [`aurora_core::HueSaturationParams`]. With
-/// Colorize on, only the colorization record counts (Photoshop's Colorize
-/// has no ranges or master sliders; a stored hue below zero is the same
-/// angle plus 360). With it off, a non-neutral range record means the layer
-/// adjusts individual colour ranges, which Aurora does not apply: the layer
-/// is left out and reported rather than imported with the ranges dropped.
-/// A value outside the validated ranges is unreadable. A Grayscale file's
-/// layers are not imported, as for Levels ([`levels_params`]).
-fn hue_saturation_params(
-    block: &HueBlock,
-    gray: bool,
-) -> Result<aurora_core::HueSaturationParams, Note> {
+/// A parsed block as an Aurora Hue/Saturation adjustment. With Colorize on,
+/// only the colorization record counts (Photoshop's Colorize has no ranges
+/// or master sliders; a stored hue below zero is the same angle plus 360).
+/// With it off, the master record and the six range records are imported
+/// (0.204.0): a range that adjusts nothing keeps Photoshop's standard
+/// edges, so a layer with no adjusting range is the plain 0.203.0 variant.
+/// A value outside the validated ranges (or edges that wrap more than once)
+/// is unreadable. A Grayscale file's layers are not imported, as for Levels
+/// ([`levels_params`]).
+fn hue_saturation_adjustment(block: &HueBlock, gray: bool) -> Result<aurora_doc::Adjustment, Note> {
     if gray {
         return Err(Note::HueSaturationGrayscale);
-    }
-    if !block.colorize && block.ranges_adjust {
-        return Err(Note::HueSaturationRanges);
     }
     let (ch, cs, cl) = block.colorization;
     let (mh, ms, ml) = block.master;
     let colorize_hue = i32::from(ch).rem_euclid(360);
     #[allow(clippy::cast_precision_loss)] // 0..360 is exact in f32
     let colorize_hue = colorize_hue as f32;
-    aurora_core::HueSaturationParams::new(
+    let base = aurora_core::HueSaturationParams::new(
         f32::from(mh),
         f32::from(ms),
         f32::from(ml),
@@ -1974,7 +1957,27 @@ fn hue_saturation_params(
         f32::from(cs),
         f32::from(cl),
     )
-    .map_err(|_| Note::HueSaturationUnreadable)
+    .map_err(|_| Note::HueSaturationUnreadable)?;
+    if block.colorize {
+        return Ok(aurora_doc::Adjustment::HueSaturation(base));
+    }
+    let mut ranges = [aurora_core::HueRange::standard(0); aurora_core::HUE_RANGE_COUNT];
+    for (index, (slot, (edges, (h, sa, li)))) in ranges.iter_mut().zip(block.ranges).enumerate() {
+        if (h, sa, li) == (0, 0, 0) {
+            *slot = aurora_core::HueRange::standard(index);
+            continue;
+        }
+        *slot = aurora_core::HueRange::new(
+            edges.map(f32::from),
+            f32::from(h),
+            f32::from(sa),
+            f32::from(li),
+        )
+        .map_err(|_| Note::HueSaturationUnreadable)?;
+    }
+    Ok(aurora_doc::Adjustment::from_hue_saturation(
+        aurora_core::HueSaturationRangesParams::new(base, ranges),
+    ))
 }
 
 /// Whether a record's blending ranges ("Blend If") differ from the
@@ -3347,8 +3350,8 @@ fn collect_smart_ids(nodes: &[PsdNode], out: &mut std::collections::BTreeSet<Str
 }
 
 /// A `hue2` record as an adjustment node, or `None` (with a report line)
-/// when its block is unreadable, adjusts colour ranges or is in a Grayscale
-/// file ([`hue_saturation_params`]).
+/// when its block is unreadable or is in a Grayscale file
+/// ([`hue_saturation_adjustment`]).
 fn hue_saturation_node(
     src: &mut dyn ByteSource,
     record: &Record,
@@ -3358,7 +3361,7 @@ fn hue_saturation_node(
     vector_budget: &mut vector::Budget,
 ) -> Option<PsdNode> {
     let params = match hue {
-        Ok(block) => hue_saturation_params(block, header.gray()),
+        Ok(block) => hue_saturation_adjustment(block, header.gray()),
         Err(()) => Err(Note::HueSaturationUnreadable),
     };
     let params = match params {
@@ -3374,7 +3377,7 @@ fn hue_saturation_node(
     note_unsupported_kept(record, &outcome, notes, false, false);
     Some(PsdNode::Adjustment(PsdAdjustment {
         props,
-        adjustment: aurora_doc::Adjustment::HueSaturation(params),
+        adjustment: params,
         mask: outcome.mask,
     }))
 }
