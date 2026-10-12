@@ -894,11 +894,11 @@ fn the_app_fill_sites_take_their_colours_from_the_fill_accessors_only() {
     let squeezed = squeeze(production);
     // The bucket: the foreground alone.
     assert!(squeezed.contains(&squeeze(
-        "&self.tool_settings, colour_state::fill_foreground(&self.colour.state), );"
+        "&self.tool_settings, colour_state::fill_foreground(&self.colour.state), self.doc.selection.active(), );"
     )));
     // The gradient: foreground then background.
     assert!(squeezed.contains(&squeeze(
-        "colour_state::fill_foreground(&self.colour.state), colour_state::fill_background(&self.colour.state), );"
+        "colour_state::fill_foreground(&self.colour.state), colour_state::fill_background(&self.colour.state), self.doc.selection.active(), );"
     )));
     assert_eq!(
         squeezed.matches("colour_state::fill_foreground(").count(),
