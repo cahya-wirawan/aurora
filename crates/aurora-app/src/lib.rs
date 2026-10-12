@@ -36576,6 +36576,152 @@ mod tests {
         assert!(diff.over_one <= 1818 && diff.over_two <= 826, "{diff:?}");
     }
 
+    /// Per-channel max and mean absolute difference, in 8-bit levels,
+    /// of two composites of the same size.
+    // Test-only pixel arithmetic.
+    #[allow(clippy::cast_precision_loss)]
+    fn composite_difference(a: &aurora_io::Image, b: &aurora_io::Image) -> ([f64; 3], [f64; 3]) {
+        let (mut max, mut sum) = ([0.0_f64; 3], [0.0_f64; 3]);
+        for y in 0..a.height() {
+            for x in 0..a.width() {
+                let (pa, pb) = (image_pixel(a, x, y), image_pixel(b, x, y));
+                for c in 0..3 {
+                    let over = |p: [f32; 4]| {
+                        let alpha = f64::from(p[3]);
+                        f64::from(p.get(c).copied().unwrap_or(0.0)) * alpha + (1.0 - alpha)
+                    };
+                    let error = ((over(pa) * 255.0).round() - (over(pb) * 255.0).round()).abs();
+                    if let (Some(m), Some(s)) = (max.get_mut(c), sum.get_mut(c)) {
+                        *m = m.max(error);
+                        *s += error;
+                    }
+                }
+            }
+        }
+        let n = f64::from(a.width()) * f64::from(a.height());
+        (max, sum.map(|s| s / n))
+    }
+
+    /// 0.205.0: the corpus files with adjustment layers, opened in Aurora,
+    /// saved as PSD by the writer (verified by its two passes), and
+    /// reopened by Aurora's reader. Compares, in 8-bit levels, the
+    /// composite before and after the save, and each against the original
+    /// file's own (Photoshop's) merged image; prints the numbers. When
+    /// `AURORA_PSD_FIXTURE_DIR` is set the saved files are kept there as
+    /// `resave_<name>` for `scripts/verify_psd_write.py` (psd-tools).
+    /// Skips ("not run") when the corpus is absent.
+    #[test]
+    fn corpus_adjustment_psds_survive_a_psd_save_and_reopen() {
+        let files = [
+            "adjustments/curves_rgb.psd",
+            "adjustments/levels_rgb.psd",
+            "adjustments/huesaturation_rgb.psd",
+            "adjustments/huesaturation_colorize_rgb.psd",
+            "adjustments/huesaturation_lightness_rgb.psd",
+            "adjustments/huesaturation_saturation_rgb.psd",
+            "clip-adjustment.psd",
+        ];
+        let keep = std::env::var_os("AURORA_PSD_FIXTURE_DIR").map(std::path::PathBuf::from);
+        let mut ran = 0;
+        for relative in files {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../corpora/psd/reference/psd-tools-fixtures")
+                .join(relative);
+            let Ok(bytes) = std::fs::read(&path) else {
+                eprintln!("not run: corpus absent ({relative})");
+                continue;
+            };
+            ran += 1;
+            let Ok(merged) = aurora_io::decode_psd_merged_image(&bytes) else {
+                unreachable!("{relative}: merged image")
+            };
+            let (_scratch, mut store) = real_tile_store();
+            let (doc1, img1) = open_and_composite_psd(
+                &bytes,
+                &mut store,
+                (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+            );
+            let target = {
+                let name = relative.rsplit('/').next().unwrap_or(relative);
+                keep.as_ref().map_or_else(
+                    || _scratch.path().join(format!("resave_{name}")),
+                    |dir| dir.join(format!("resave_{name}")),
+                )
+            };
+            let outcome = aurora_io::replace_verified(
+                &target,
+                |file| {
+                    let mut source: &aurora_io::Image = &img1;
+                    aurora_io::write_psd(
+                        &mut *file,
+                        &doc1.layers,
+                        doc1.canvas_size,
+                        &mut source,
+                        &mut store,
+                        aurora_io::PsdSaveOptions::default(),
+                    )
+                },
+                |written, outcome| aurora_io::verify_psd_file(written, &outcome.expected),
+            );
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(err) => unreachable!("{relative}: {err:?}"),
+            };
+            let Ok(written) = std::fs::read(&target) else {
+                unreachable!("{relative}: written file")
+            };
+            let (_scratch2, mut store2) = real_tile_store();
+            let (doc2, img2) = open_and_composite_psd(
+                &written,
+                &mut store2,
+                (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+            );
+            let adjustments = |doc: &aurora_io::PsdDocument| {
+                let mut found = Vec::new();
+                let mut pending = doc.layers.roots().to_vec();
+                while let Some(id) = pending.pop() {
+                    pending.extend(doc.layers.children(id).unwrap_or(&[]));
+                    if let Some(a) = doc.layers.adjustment(id) {
+                        found.push((
+                            doc.layers.name(id).unwrap_or_default().to_owned(),
+                            a.clone(),
+                        ));
+                    }
+                }
+                found.sort_by(|a, b| a.0.cmp(&b.0));
+                found
+            };
+            let (before, after) = (adjustments(&doc1), adjustments(&doc2));
+            let (roundtrip_max, roundtrip_mean) = composite_difference(&img2, &img1);
+            let (orig_max, orig_mean) = composite_difference(&img1, &merged);
+            let (saved_max, saved_mean) = composite_difference(&img2, &merged);
+            println!(
+                "{relative}: {} adjustment layers, report {:?}\n  reopened vs before save: max {roundtrip_max:?} mean {roundtrip_mean:.4?}\n  Aurora vs Photoshop merged (before): max {orig_max:?} mean {orig_mean:.3?}\n  Aurora vs Photoshop merged (after save+reopen): max {saved_max:?} mean {saved_mean:.3?}",
+                before.len(),
+                outcome.report.items
+            );
+            assert_eq!(before.len(), after.len(), "{relative}: adjustment count");
+            assert!(!before.is_empty(), "{relative}");
+            assert_eq!(
+                before.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                after.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                "{relative}"
+            );
+            // The save changes the reopened composite by at most one level
+            // (the 16-bit file's own quantisation).
+            for c in 0..3 {
+                assert!(roundtrip_max[c] <= 1.0, "{relative}: {roundtrip_max:?}");
+                assert!(roundtrip_mean[c] <= 0.05, "{relative}: {roundtrip_mean:?}");
+            }
+            if relative.contains("curves") || relative.contains("levels") {
+                assert_eq!(before, after, "{relative}: parameters survive exactly");
+            }
+        }
+        if ran == 0 {
+            eprintln!("not run: corpus absent");
+        }
+    }
+
     /// 0.203.0/0.204.0: the psd-tools Hue/Saturation fixtures against
     /// Photoshop's own merged image. Colorize-only layers, master-only
     /// layers and (0.204.0) layers with per-colour-range adjustments are

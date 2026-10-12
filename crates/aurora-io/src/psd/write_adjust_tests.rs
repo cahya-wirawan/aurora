@@ -548,3 +548,78 @@ fn a_curve_that_collapses_to_one_level_is_refused_with_its_reason() {
         "{text}"
     );
 }
+
+/// `adjustments.psd` / `adjustments.json` for `scripts/verify_psd_write.py
+/// check_adjustments` (psd-tools): the document of
+/// [`adjustments_doc`] and the integers each block should hold.
+///
+/// ```text
+/// AURORA_PSD_FIXTURE_DIR=/tmp/psdw cargo test -p aurora-io --lib \
+///     adjustments_fixture_for_psd_tools -- --ignored
+/// ```
+#[test]
+#[ignore = "writes the fixture scripts/verify_psd_write.py reads"]
+fn adjustments_fixture_for_psd_tools() {
+    let Ok(out) = std::env::var("AURORA_PSD_FIXTURE_DIR") else {
+        unreachable!("set AURORA_PSD_FIXTURE_DIR");
+    };
+    let out = std::path::Path::new(&out);
+    let mut doc = adjustments_doc();
+    let (bytes, _) = ok(doc.write());
+    ok(std::fs::write(out.join("adjustments.psd"), &bytes));
+    let level = |v: f32| (v * 255.0).round() as i64;
+    let curve_json = |c: &ToneCurve| -> String {
+        let pts: Vec<String> = c
+            .points()
+            .iter()
+            .map(|p| format!("[{}, {}]", level(p.x), level(p.y)))
+            .collect();
+        format!("[{}]", pts.join(", "))
+    };
+    let curves = sample_curves();
+    let blue = curves.blue.as_ref().map_or_else(String::new, curve_json);
+    let levels = sample_levels();
+    let records: Vec<String> = [levels.master, levels.red, levels.green, levels.blue]
+        .iter()
+        .map(|c| {
+            format!(
+                "[{}, {}, {}, {}, {}]",
+                level(c.input_black()),
+                level(c.input_white()),
+                level(c.output_black()),
+                level(c.output_white()),
+                (c.gamma() * 100.0).round() as i64
+            )
+        })
+        .collect();
+    let hue = hue_ranges();
+    let ranges: Vec<String> = hue
+        .ranges()
+        .iter()
+        .map(|r| {
+            let e = r.edges();
+            format!(
+                "[[{}, {}, {}, {}], [{}, {}, {}]]",
+                e[0] as i64,
+                e[1] as i64,
+                e[2] as i64,
+                e[3] as i64,
+                r.hue() as i64,
+                r.saturation() as i64,
+                r.lightness() as i64
+            )
+        })
+        .collect();
+    let json = format!(
+        "{{\"curves\": {{\"composite\": {}, \"blue\": {}}}, \"levels\": [{}], \
+         \"hue\": {{\"master\": [{}, {}, {}], \"ranges\": [{}]}}}}\n",
+        curve_json(&curves.composite),
+        blue,
+        records.join(", "),
+        hue.base().hue() as i64,
+        hue.base().saturation() as i64,
+        hue.base().lightness() as i64,
+        ranges.join(", ")
+    );
+    ok(std::fs::write(out.join("adjustments.json"), json));
+}
