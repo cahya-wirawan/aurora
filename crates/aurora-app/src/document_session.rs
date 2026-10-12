@@ -861,7 +861,11 @@ mod tests {
         for i in 0..6_u32 {
             let mut snapshot = aurora_brush::StrokeSnapshot::new(surface);
             let noise: Vec<half::f16> = (0..aurora_tile::SAMPLES)
-                .map(|n| half::f16::from_bits((n as u32).wrapping_mul(2_654_435_761 ^ i) as u16))
+                .map(|n| {
+                    half::f16::from_bits(
+                        (n as u32).wrapping_mul(2_654_435_761_u32.wrapping_add(i)) as u16
+                    )
+                })
                 .collect();
             assert!(snapshot.record_content(aurora_tile::TileId { x: i, y: 0 }, &noise));
             assert!(history.push(snapshot));

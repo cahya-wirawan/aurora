@@ -498,7 +498,13 @@ fn pack_gives_the_same_bytes_on_one_thread_and_many() {
     // 200 tiles take the threaded path; each must equal its own serial encode.
     let mut snapshot = StrokeSnapshot::new(surface());
     let contents: Vec<Vec<f16>> = (0..200)
-        .map(|i| if i % 2 == 0 { noisy(i) } else { painted(i) })
+        .map(|i: u64| {
+            if i.is_multiple_of(2) {
+                noisy(i)
+            } else {
+                painted(i)
+            }
+        })
         .collect();
     for (i, content) in contents.iter().enumerate() {
         assert!(snapshot.record_content(TileId { x: i as u32, y: 0 }, content));
@@ -587,7 +593,7 @@ fn multi_tile_spilled_steps_restore_every_tile_to_its_own_content() {
         TileId { x: 9, y: 9 },
     ];
     let content = |round: u64, i: usize| -> Vec<f16> {
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             noisy(round * 10 + i as u64 + 1)
         } else {
             painted(round * 10 + i as u64 + 1)

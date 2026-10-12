@@ -72,3 +72,16 @@ The background compositor's mirror store is a pool member too. It joins the docu
 **Moving it.** Every change of the app's active session goes through `DocumentShelf` (`swap_in`, `push_active`, `revert_push`, `close_active`), and each calls `document_session::hand_tile_pool_over`. It parks the outgoing document's group, then activates the incoming one's. So a switch, an open's install, a reverted open and a close all move the share, and a closed active document leaves no group active until the next document claims it. The startup document claims it in `App::new`. `about_to_wait` re-claims it for `App::doc` every event-loop turn as a backstop, one lock per turn. A pending open's store is a parked member until its install. A document whose share shrank is parked, so it shrinks through `enforce_tile_budgets`' ordinary eviction at most `EVICTION_BURST` tiles per turn, as before. A grown share needs no work.
 
 **Not measured.** Whether a quarter is the right number for switching back on a real machine. Nobody has timed a switch back to a parked large document under this rule against the equal split. The one Nyepi measurement taken is in PLAN.md's 0.187.0 entry.
+
+## Addendum (0.210.0): the pixel-history memory budget
+
+**Problem.** `aurora_brush::PixelHistory` kept every stroke's pre-edit tiles raw (512 KiB each) with no cap; a maximum fill added about 512 MiB to the undo stack. The PRD wants history unlimited, stored incrementally and compressed, so steps are never dropped.
+
+**Rule.** The history's snapshots are compressed with the lossless tile codec when a stroke is pushed. The memory they may hold is a **quarter of the tile budget** (`HISTORY_SHARE_DIVISOR` 4), clamped to 32 MiB (`HISTORY_FLOOR_BYTES`) .. 2 GiB (`HISTORY_CEILING_BYTES`). `AURORA_HISTORY_BUDGET_MB` overrides it (whole MiB, 1 MiB to 8 GiB; anything else is ignored), mirroring `AURORA_TILE_BUDGET_MB`. Past the budget the oldest packed snapshots spill to the document store's scratch directory down to three quarters of it, and page back on undo; a spill failure keeps the data in memory.
+
+**Why a quarter.** The history holds compressed bytes, so a quarter of the tile budget retains many more edits than the resident tiles beside it, while the three quarters left cover the tile store itself, the shadow cache and the OS. The quarter, the floor and the 3/4 spill target are engineering choices, not measurements.
+
+**Not shared with the pool.** The budget is per document session, not part of the `ResidencyPool`: N open documents can hold N budgets of history (parked documents' histories are not shrunk). Spill I/O is synchronous on the UI thread (64 MiB per call), and packing a stroke runs on the UI thread at its end; both are disclosed in PLAN.md 0.210.0.
+
+**Reconsider if** several large documents are routinely open at once and history memory adds up, or if the stroke-end packing hitch is noticeable on real hardware (move it to a worker, as the autosave and tile encoding already are).
+

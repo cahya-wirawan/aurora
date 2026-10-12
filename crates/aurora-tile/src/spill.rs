@@ -166,7 +166,7 @@ impl SpillFile {
             path: self.path.clone(),
             source,
         };
-        let end = offset
+        offset
             .checked_add(len as u64)
             .filter(|end| *end <= self.len)
             .ok_or_else(|| {
@@ -175,7 +175,6 @@ impl SpillFile {
                     "range outside the spilled file",
                 ))
             })?;
-        let _ = end;
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
