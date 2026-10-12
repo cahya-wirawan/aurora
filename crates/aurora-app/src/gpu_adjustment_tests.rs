@@ -140,11 +140,18 @@ fn ramp(x: u32, y: u32) -> [f32; 4] {
 
 /// Random colours at a random alpha in `[0.1, 1)`, a fully transparent band
 /// at the top.
+/// The lowest backdrop alpha of the translucent tiles. `straight_backdrop`
+/// divides by it, so an adapter's one-`f16`-step rounding difference is
+/// amplified by up to `1 / ALPHA_FLOOR`. 0.25 (was 0.1 until 0.209.1) keeps
+/// that factor at 4: GitHub's Windows (WARP) and macOS (Apple Paravirtual)
+/// adapters kept finding new 10x cases at 0.1, each needing a wider bound.
+const ALPHA_FLOOR: f32 = 0.25;
+
 fn random_translucent(x: u32, y: u32) -> [f32; 4] {
     let a = if y < 16 {
         0.0
     } else {
-        0.1 + 0.9 * hash(x, y, 4)
+        ALPHA_FLOOR + (1.0 - ALPHA_FLOOR) * hash(x, y, 4)
     };
     [hash(x, y, 1), hash(x, y, 2), hash(x, y, 3), a]
 }
@@ -155,7 +162,7 @@ fn ramp_translucent(x: u32, y: u32) -> [f32; 4] {
     let a = if y < 16 {
         0.0
     } else {
-        0.1 + 0.9 * x as f32 / 255.0
+        ALPHA_FLOOR + (1.0 - ALPHA_FLOOR) * x as f32 / 255.0
     };
     [r, g, b, a]
 }
@@ -379,7 +386,7 @@ const STEEP_HUE_SAT_CASES: [&str; 3] = ["saturation +99", "saturation +100", "ex
 /// `VividLight`, `Divide`, `HardMix`) amplify a one-`f16`-step difference
 /// in `Cs` (the same class as the Curves tests' derived per-mode bound of
 /// about 6-8 steps on the RTX 3090; Windows' WARP adapter measured 9 steps
-/// for Hue/Saturation under `ColorDodge`): 12 steps of `2^-11` instead of
+/// for Hue/Saturation under `ColorDodge`, 13 under `VividLight`): 20 steps of `2^-11` instead of
 /// `2 * f16::EPSILON`.
 fn mode_bound(mode: BlendMode) -> f32 {
     match mode {
@@ -387,7 +394,7 @@ fn mode_bound(mode: BlendMode) -> f32 {
         | BlendMode::ColorDodge
         | BlendMode::VividLight
         | BlendMode::Divide
-        | BlendMode::HardMix => 12.0 / 2048.0,
+        | BlendMode::HardMix => 20.0 / 2048.0,
         _ => tolerance(),
     }
 }
