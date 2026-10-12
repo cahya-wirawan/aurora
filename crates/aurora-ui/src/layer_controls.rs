@@ -68,6 +68,10 @@ pub struct LayerControls {
     pub lock_position: WidgetId,
     /// Lock all (all three set).
     pub lock_all: WidgetId,
+    /// The filter row (0.199.0): a name search and three kind toggles,
+    /// the strip's first row. It filters the list, so it works with no
+    /// active layer and is never disabled by [`sync_layer_controls`].
+    pub filter: crate::layer_filter::LayerFilterRow,
 }
 
 /// One of the Lock row's four toggles (0.198.0).
@@ -318,7 +322,7 @@ fn strip_style(scales: &Scales) -> Style {
     let gap = length(scales.spacing.xs as f32);
     let row = widgets::row_height(scales);
     #[allow(clippy::cast_precision_loss)]
-    let chrome = 2.0 * scales.spacing.sm as f32 + 3.0 * scales.spacing.xs as f32;
+    let chrome = 2.0 * scales.spacing.sm as f32 + 4.0 * scales.spacing.xs as f32;
     Style {
         flex_direction: FlexDirection::Column,
         // Above the list (0.195.0): never shrunk; the list's viewport
@@ -326,7 +330,12 @@ fn strip_style(scales: &Scales) -> Style {
         flex_shrink: 0.0,
         min_size: Size {
             width: taffy::Dimension::ZERO,
-            height: length(CONTROL_ROWS * row + lock_row_height(scales) + chrome),
+            height: length(
+                CONTROL_ROWS * row
+                    + lock_row_height(scales)
+                    + crate::layer_filter::filter_row_height(scales)
+                    + chrome,
+            ),
         },
         gap: Size {
             width: gap,
@@ -414,6 +423,8 @@ fn build(
     root: WidgetId,
     scales: &Scales,
 ) -> Result<LayerControls, WidgetError> {
+    let filter =
+        crate::layer_filter::insert_filter_row(tree, root, scales, control_row_style(scales))?;
     let blend = widgets::insert_dropdown(
         tree,
         root,
@@ -464,6 +475,7 @@ fn build(
         lock_pixels,
         lock_position,
         lock_all,
+        filter,
     };
     set_disabled(tree, controls, true, false)?;
     Ok(controls)

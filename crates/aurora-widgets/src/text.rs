@@ -36,8 +36,8 @@
 //! `Tooltip::set_text` keeps current), and a dialog's message (one
 //! line). Since 0.140.0 a measured `Checkbox`'s label, since 0.141.0 a
 //! dialog's title, and since 0.142.0 a docked panel's title (its root's
-//! label, drawn in the root's first child — [`panel_title`]). **Not
-//! yet**: a text field's placeholder (`TextFieldState` has none).
+//! label, drawn in the root's first child — [`panel_title`]). A text
+//! field's placeholder (0.199.0) is drawn in `text.secondary` while it is empty.
 //!
 //! **Overflow (0.142.0).** There is no wrapping. A run is clipped to its
 //! box by default ([`TextOverflow::Clip`]); a static `Label`, a
@@ -565,8 +565,17 @@ pub fn text_runs(
             .into_iter()
             .collect(),
         WidgetKind::TextField(state) => {
-            let (text, decor) = field_text(state, focused == Some(id), theme);
-            let color = rgba(theme.text.primary, opacity(state.disabled, theme));
+            let (mut text, decor) = field_text(state, focused == Some(id), theme);
+            let mut color = rgba(theme.text.primary, opacity(state.disabled, theme));
+            // The hint (0.199.0): only while there is nothing else to show,
+            // in the supporting-text colour; the caret stays at its start.
+            if state.content.is_empty()
+                && state.composition.is_none()
+                && let Some(hint) = &state.placeholder
+            {
+                text = sanitize_field(hint);
+                color = rgba(theme.text.secondary, opacity(state.disabled, theme));
+            }
             // The outline is `CONTROL_BORDER_WIDTH` logical px, centred
             // on the edge; a whole logical px covers its inner half at
             // every scale factor.
@@ -2475,6 +2484,44 @@ mod field_tests {
             Some(decor) => decor,
             None => unreachable!("a text field's run carries decor"),
         }
+    }
+
+    #[test]
+    fn an_empty_field_draws_its_placeholder_in_secondary_text_until_it_has_content() {
+        let (mut tree, id, _) = field("");
+        assert!(
+            field_run(&tree, id, None).is_none(),
+            "no hint set: nothing drawn"
+        );
+        ok(crate::widgets::set_text_field_hints(
+            &mut tree,
+            id,
+            Some("Search layers"),
+            Some("3 of 9 layers shown"),
+        ));
+        let Some(run) = field_run(&tree, id, None) else {
+            unreachable!("a run")
+        };
+        assert_eq!(run.text, "Search layers");
+        assert_eq!(run.color, rgba(dark_theme().text.secondary, 1.0));
+        let node = tree.accessibility(id);
+        assert_eq!(node.and_then(|n| n.placeholder()), Some("Search layers"));
+        assert_eq!(
+            node.and_then(|n| n.description()),
+            Some("3 of 9 layers shown")
+        );
+        // Typing replaces the hint; the node keeps both.
+        ok(crate::widgets::insert_text_field_text(&mut tree, id, "ab"));
+        let Some(run) = field_run(&tree, id, None) else {
+            unreachable!("a run")
+        };
+        assert_eq!(run.text, "ab");
+        assert_eq!(run.color, rgba(dark_theme().text.primary, 1.0));
+        assert_eq!(
+            tree.accessibility(id).and_then(|n| n.description()),
+            Some("3 of 9 layers shown"),
+            "an edit rebuilds the node but keeps the description"
+        );
     }
 
     #[test]

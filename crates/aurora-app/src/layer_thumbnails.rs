@@ -1967,6 +1967,47 @@ mod tests {
         fx.service.shutdown();
     }
 
+    /// 0.199.0: under a filter only the shown rows exist, so only they are
+    /// ever visible to the service and get a request.
+    #[test]
+    fn a_filtered_panel_requests_thumbnails_for_its_shown_rows_only() {
+        let scales = ok(crate::load_scales());
+        let (mut fx, ids) = Fixture::new(100);
+        let mut ws = aurora_ui::build_workspace(&scales);
+        ws.layer_view.filter = aurora_ui::LayerFilter {
+            text: "l4".to_owned(),
+            ..aurora_ui::LayerFilter::default()
+        };
+        let rows = ok(aurora_ui::populate_layers_panel_view(
+            &mut ws.tree,
+            ws.layers,
+            &scales,
+            &fx.layers,
+            &mut ws.layer_view,
+        ));
+        assert_eq!(rows.len(), 11, "L4 and L40..L49");
+        ws.tree.compute_layout(1274.0, 900.0);
+        let visible: Vec<LayerId> =
+            aurora_ui::visible_layer_rows(&ws.tree, ws.layers, &rows, &scales, 2)
+                .into_iter()
+                .map(|(_, layer)| layer)
+                .collect();
+        assert!(
+            !visible.is_empty() && visible.len() <= 11,
+            "{}",
+            visible.len()
+        );
+        for layer in &visible {
+            let name = fx.layers.name(*layer).unwrap_or_default();
+            assert!(name.starts_with("L4"), "{name}");
+        }
+        fx.settle(&visible, Instant::now());
+        assert_eq!(fx.service.stats.jobs_submitted, visible.len());
+        for hidden in &ids[5..40] {
+            assert!(fx.service.cache().stamp(*hidden).is_none());
+        }
+    }
+
     #[test]
     fn rows_show_visible_pictures_and_blank_when_they_scroll_away() {
         let scales = ok(crate::load_scales());

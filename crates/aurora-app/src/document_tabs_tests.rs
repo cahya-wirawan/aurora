@@ -2970,3 +2970,280 @@ fn a_composite_is_bit_identical_at_a_thrashing_budget_and_a_roomy_pooled_one() {
     let differ = thrashed.iter().zip(&held).filter(|(a, b)| a != b).count();
     assert_eq!(differ, 0, "residency changed {differ} samples");
 }
+
+// -- The Layers panel's filter (0.199.0, round L5b) --
+
+/// Types `text` into the filter field and applies it, as the key path does.
+fn type_into_filter(rig: &mut Rig, text: &str) -> bool {
+    let Some(controls) = rig.layer_controls.controls else {
+        unreachable!("the strip exists");
+    };
+    if let Err(err) = aurora_widgets::widgets::insert_text_field_text(
+        &mut rig.workspace.tree,
+        controls.filter.field,
+        text,
+    ) {
+        unreachable!("{err:?}");
+    }
+    apply_filter(rig, None)
+}
+
+fn apply_filter(rig: &mut Rig, activated: Option<WidgetId>) -> bool {
+    let Some(controls) = rig.layer_controls.controls else {
+        unreachable!("the strip exists");
+    };
+    crate::apply_layer_filter_edit(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &rig.scales,
+        &rig.doc.layers,
+        &mut rig.layer_rows,
+        &mut rig.doc.active_layer,
+        &mut rig.doc.canvas_view,
+        &controls,
+        activated,
+    )
+}
+
+fn filter_text(rig: &Rig) -> String {
+    let Some(controls) = rig.layer_controls.controls else {
+        unreachable!("the strip exists");
+    };
+    aurora_ui::read_layer_filter(&rig.workspace.tree, &controls.filter).text
+}
+
+#[test]
+fn each_document_keeps_its_own_filter_and_a_new_document_starts_clean() {
+    let (dir_a, dir_b) = (tempdir(), tempdir());
+    let (a, _) = session("alpha", 3, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("beta", 2, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let (a_id, b_id) = (a.id, b.id);
+    let mut rig = Rig::new(a);
+    assert!(type_into_filter(&mut rig, "alpha 2"));
+    assert_eq!(rig.layer_rows.len(), 1);
+    rig.open(b);
+    assert_eq!(rig.layer_rows.len(), 2, "a new document shows every layer");
+    assert_eq!(filter_text(&rig), "");
+    assert!(!rig.workspace.layer_view.filter.is_active());
+    assert!(type_into_filter(&mut rig, "beta 1"));
+    assert_eq!(rig.layer_rows.len(), 1);
+    assert_eq!(rig.switch(a_id), SwitchOutcome::Switched);
+    assert_eq!(filter_text(&rig), "alpha 2", "saved with the session");
+    assert_eq!(rig.layer_rows.len(), 1);
+    assert_eq!(rig.switch(b_id), SwitchOutcome::Switched);
+    assert_eq!(filter_text(&rig), "beta 1");
+    assert_eq!(rig.layer_rows.len(), 1);
+    assert_eq!(rig.parked(a_id).layer_filter.text, "alpha 2");
+}
+
+#[test]
+fn a_filter_edit_is_not_document_state() {
+    let dir = tempdir();
+    let (a, _) = session("alpha", 3, [1.0, 0.0, 0.0, 1.0], &dir);
+    let mut rig = Rig::new(a);
+    // One real undoable step, so the History panel has a row to lose.
+    let Some(layer) = rig.doc.active_layer else {
+        unreachable!("active")
+    };
+    if let Err(err) = rig.doc.history.set_opacity(&mut rig.doc.layers, layer, 0.5) {
+        unreachable!("{err:?}");
+    }
+    rig.doc.undo_order.record(
+        crate::UndoKind::Structural,
+        &mut rig.doc.history,
+        &mut rig.doc.pixel_history,
+    );
+    crate::refresh_history_panel(&mut rig.workspace, &rig.doc.undo_order);
+    let descendants = |rig: &Rig| {
+        let mut count = 0;
+        let mut pending = vec![rig.workspace.history.body];
+        while let Some(id) = pending.pop() {
+            count += 1;
+            pending.extend(
+                rig.workspace
+                    .tree
+                    .children(id)
+                    .unwrap_or_default()
+                    .iter()
+                    .copied(),
+            );
+        }
+        count
+    };
+    let history_rows = descendants(&rig);
+    let dirty_before = rig.doc.is_dirty();
+    let undo_before = rig.doc.undo_order.undo.len();
+    let journal_before = rig.doc.history.journal_len();
+    assert!(type_into_filter(&mut rig, "alpha"));
+    assert_eq!(descendants(&rig), history_rows, "History is never filtered");
+    assert!(type_into_filter(&mut rig, " 3"));
+    assert_eq!(rig.doc.undo_order.undo.len(), undo_before, "no undo step");
+    assert_eq!(
+        rig.doc.history.journal_len(),
+        journal_before,
+        "no journal op"
+    );
+    assert_eq!(
+        rig.doc.is_dirty(),
+        dirty_before,
+        "never changes the unsaved flag"
+    );
+    assert!(!type_into_filter(&mut rig, ""), "no change, no rebuild");
+}
+
+#[test]
+fn the_active_layer_hidden_by_the_filter_is_still_edited_by_the_controls() {
+    let dir = tempdir();
+    let (a, ids) = session("alpha", 3, [1.0, 0.0, 0.0, 1.0], &dir);
+    let mut rig = Rig::new(a);
+    let Some(active) = rig.doc.active_layer else {
+        unreachable!("active")
+    };
+    let Some(&other) = ids.iter().find(|&&id| id != active) else {
+        unreachable!("another layer")
+    };
+    let name = rig.doc.layers.name(other).unwrap_or_default().to_owned();
+    assert!(type_into_filter(&mut rig, &name));
+    assert_eq!(
+        rig.doc.active_layer,
+        Some(active),
+        "the filter never changes it"
+    );
+    assert!(
+        !rig.layer_rows.values().any(|&id| id == active),
+        "its row is hidden"
+    );
+    let _ = crate::sync_layer_controls(
+        &mut rig.workspace,
+        &rig.layer_controls,
+        &rig.doc.layers,
+        rig.doc.active_layer,
+        None,
+    );
+    let Some(controls) = rig.layer_controls.controls else {
+        unreachable!("strip")
+    };
+    assert!(matches!(
+        rig.workspace.tree.payload(controls.opacity),
+        Some(aurora_widgets::widgets::WidgetKind::Slider(s)) if !s.disabled
+    ));
+}
+
+#[test]
+fn a_layer_added_under_a_filter_that_does_not_match_stays_hidden_without_a_scroll_jump() {
+    let dir = tempdir();
+    let (a, _) = session("alpha", 3, [1.0, 0.0, 0.0, 1.0], &dir);
+    let mut rig = Rig::new(a);
+    assert!(type_into_filter(&mut rig, "alpha"));
+    let before = rig.workspace.tree.scroll_y(rig.workspace.layers.body);
+    let bounds = aurora_core::Rect {
+        x: 0,
+        y: 0,
+        width: 256,
+        height: 256,
+    };
+    let added = match rig.doc.layers.add_pixel_layer("zzz", bounds, None) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    crate::rebuild_layer_rows(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &rig.scales,
+        &rig.doc.layers,
+        &mut rig.layer_rows,
+        &mut rig.doc.active_layer,
+        &mut rig.doc.canvas_view,
+        Some(added),
+    );
+    assert_eq!(
+        rig.layer_rows.len(),
+        3,
+        "the three alphas, not the new layer"
+    );
+    assert!(!rig.layer_rows.values().any(|&id| id == added));
+    assert_eq!(rig.doc.active_layer, Some(added));
+    assert_eq!(
+        rig.workspace.tree.scroll_y(rig.workspace.layers.body),
+        before
+    );
+}
+
+#[test]
+fn typing_in_the_filter_field_never_reaches_a_global_shortcut() {
+    let dir = tempdir();
+    let (a, _) = session("alpha", 3, [1.0, 0.0, 0.0, 1.0], &dir);
+    let mut rig = Rig::new(a);
+    let Some(controls) = rig.layer_controls.controls else {
+        unreachable!("strip")
+    };
+    if let Err(err) = rig
+        .focus
+        .focus(&mut rig.workspace.tree, controls.filter.field)
+    {
+        unreachable!("{err:?}");
+    }
+    let mut clipboard = FakeClipboard::default();
+    // `b` is the brush shortcut and `v` the move tool's: both are typed.
+    for letter in ['b', 'v'] {
+        let routed = crate::route_widget_key(
+            &mut rig.workspace,
+            &mut rig.focus,
+            &mut None,
+            Some(&controls),
+            None,
+            &rig.scales,
+            false,
+            false,
+            Modifiers::none(),
+            Key::Character(letter),
+            Some(&letter.to_string()),
+            &mut clipboard,
+        );
+        assert!(
+            matches!(routed, Some((crate::WidgetOwner::LayerControls, _))),
+            "{letter}: consumed by the field"
+        );
+    }
+    assert_eq!(filter_text(&rig), "bv");
+    assert!(apply_filter(&mut rig, None));
+    assert_eq!(rig.layer_rows.len(), 0, "no layer is named like that");
+}
+
+#[test]
+fn a_kind_toggle_press_flips_and_filters() {
+    let dir = tempdir();
+    let (a, _) = session("alpha", 3, [1.0, 0.0, 0.0, 1.0], &dir);
+    let mut rig = Rig::new(a);
+    let Some(controls) = rig.layer_controls.controls else {
+        unreachable!("strip")
+    };
+    assert!(apply_filter(&mut rig, Some(controls.filter.group)));
+    assert!(rig.workspace.layer_view.filter.group);
+    assert_eq!(rig.layer_rows.len(), 0, "no groups in this document");
+    assert!(apply_filter(&mut rig, Some(controls.filter.group)));
+    assert!(!rig.workspace.layer_view.filter.is_active());
+    assert_eq!(rig.layer_rows.len(), 3);
+}
+
+#[test]
+fn trailing_spaces_do_not_rebuild_the_list_and_are_kept_in_the_field() {
+    let dir = tempdir();
+    let (a, _) = session("alpha", 3, [1.0, 0.0, 0.0, 1.0], &dir);
+    let mut rig = Rig::new(a);
+    assert!(type_into_filter(&mut rig, "alpha 2"));
+    let rows = rig.layer_rows.clone();
+    assert!(!type_into_filter(&mut rig, " "), "same rows: no rebuild");
+    assert_eq!(rig.layer_rows, rows, "the very same row widgets");
+    assert_eq!(filter_text(&rig), "alpha 2 ", "the field keeps the space");
+    assert_eq!(rig.workspace.layer_view.filter.text, "alpha 2 ");
+    // The per-loop sync must not erase it either.
+    let _ = crate::sync_layer_controls(
+        &mut rig.workspace,
+        &rig.layer_controls,
+        &rig.doc.layers,
+        rig.doc.active_layer,
+        None,
+    );
+    assert_eq!(filter_text(&rig), "alpha 2 ");
+}

@@ -314,6 +314,12 @@ pub(crate) struct DocumentSession {
     /// open and a recovered document. A Photoshop save lists them, so a
     /// file re-saved over itself never loses that content silently.
     pub(crate) import_losses: Option<Vec<String>>,
+    /// This document's Layers-panel filter (0.199.0): view state, not
+    /// document state (no undo, not saved, never dirty). Copied from
+    /// `Workspace::layer_view` when the session stops being active
+    /// (`commit_live_gestures`) and back when it becomes active
+    /// (`bind_active_document`).
+    pub(crate) layer_filter: aurora_ui::LayerFilter,
     /// The canvas pan/zoom transform ([`aurora_ui::CanvasView`]). Per
     /// document, the way Photoshop remembers each open document's own
     /// zoom and scroll independent of its pixel content.
@@ -554,6 +560,7 @@ impl DocumentSession {
             path: None,
             saved_revision: Some(undo_order.revision),
             import_losses: None,
+            layer_filter: aurora_ui::LayerFilter::default(),
             park_autosave: None,
             canvas_view,
             selection: aurora_doc::SelectionSet::new(),

@@ -152,6 +152,18 @@ pub struct TextFieldState {
     /// In-progress IME composition, anchored at `cursor`. `None` when
     /// there's no composition underway.
     pub composition: Option<Composition>,
+    /// Hint text drawn in `text.secondary` while the field is empty and no
+    /// IME composition is under way (0.199.0; the Layers panel's "Search
+    /// layers"). Drawn only: it is never content, never selected, and the
+    /// accessibility node carries it as its `placeholder`.
+    pub placeholder: Option<String>,
+    /// A second line of accessible detail (0.199.0), announced beside the
+    /// label (the Layers search field's "12 of 277 layers shown"). It
+    /// lives in state for the reason [`super::TreeItemState::description`]
+    /// does: every mutation rebuilds the whole node from this struct. An
+    /// IME composition's "composing: …" takes its place while one is under
+    /// way.
+    pub description: Option<String>,
     undo_stack: Vec<Snapshot>,
     redo_stack: Vec<Snapshot>,
     /// The line's horizontal scroll (0.138.0 review) — view state kept
@@ -183,6 +195,8 @@ impl TextFieldState {
             selection_anchor: None,
             disabled: false,
             composition: None,
+            placeholder: None,
+            description: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             scroll: ViewScroll::default(),
@@ -529,11 +543,16 @@ fn node(state: &TextFieldState) -> Node {
     let mut node = Node::new(Role::TextInput);
     node.set_label(state.label.clone());
     node.set_value(state.content.clone());
+    if let Some(placeholder) = &state.placeholder {
+        node.set_placeholder(placeholder.clone());
+    }
     if let Some(composition) = &state.composition {
         // Composition in progress: announce it, or a screen-reader user
         // hears nothing while typing CJK -- the exact mechanism
         // `spike/a11y-ime/src/tree.rs` already proved reaches VoiceOver.
         node.set_description(format!("composing: {}", composition.text));
+    } else if let Some(description) = &state.description {
+        node.set_description(description.clone());
     }
     if state.disabled {
         node.set_disabled();
@@ -644,6 +663,41 @@ pub fn with_text_field_mut<R>(
     };
     tree.set_accessibility(id, node(state))?;
     Ok(result)
+}
+
+/// Sets (or clears) text field `id`'s placeholder and accessible
+/// description (0.199.0), returning whether anything changed. Neither is
+/// content, so neither is an undo step; both work on a disabled field.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it exists but isn't a text field.
+pub fn set_text_field_hints(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    placeholder: Option<&str>,
+    description: Option<&str>,
+) -> Result<bool, WidgetError> {
+    match tree.payload_mut(id) {
+        Some(WidgetKind::TextField(state)) => {
+            if state.placeholder.as_deref() == placeholder
+                && state.description.as_deref() == description
+            {
+                return Ok(false);
+            }
+            state.placeholder = placeholder.map(str::to_owned);
+            state.description = description.map(str::to_owned);
+        }
+        Some(_) => return Err(WidgetError::WrongWidgetKind(id)),
+        None => return Err(WidgetError::UnknownWidget(id)),
+    }
+    let Some(WidgetKind::TextField(state)) = tree.payload(id) else {
+        return Err(WidgetError::UnknownWidget(id));
+    };
+    tree.set_accessibility(id, node(state))?;
+    tree.mark_dirty(id)?;
+    Ok(true)
 }
 
 /// Sets whether `id` (a text field) is disabled. Unlike
