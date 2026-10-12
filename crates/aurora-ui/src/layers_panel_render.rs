@@ -226,8 +226,38 @@ fn write_crop_png(
     name: &std::path::Path,
     target: aurora_widgets::WidgetId,
 ) {
+    write_crop_png_with(context, ws, scale, name, target, false);
+}
+
+/// [`write_crop_png`] with the text-aware layout the app uses
+/// (`compute_text_layout`: buttons and checkboxes sized to their labels),
+/// when `measured`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn write_crop_png_with(
+    context: &aurora_gpu::GpuContext,
+    ws: &mut crate::Workspace,
+    scale: f32,
+    name: &std::path::Path,
+    target: aurora_widgets::WidgetId,
+    measured: bool,
+) {
     let logical = (1280.0_f32, 800.0_f32);
-    ws.tree.compute_layout(logical.0, logical.1);
+    if measured {
+        let scales = scales();
+        let mut engine = ok(TextEngine::new());
+        aurora_widgets::compute_text_layout(
+            &mut ws.tree,
+            logical.0,
+            logical.1,
+            Some(aurora_widgets::TextMeasure {
+                engine: &mut engine,
+                scales: &scales,
+                scale_factor: scale,
+            }),
+        );
+    } else {
+        ws.tree.compute_layout(logical.0, logical.1);
+    }
     let (bytes, width, _height) = render_workspace(context, ws, scale, logical);
     let Some(panel) = ws.tree.bounds(target) else {
         unreachable!("laid out");
@@ -581,12 +611,13 @@ fn write_fill_tools_png() {
             &review_png(&format!("fill-tools-panel-{name}.png")),
             tools_root,
         );
-        write_crop_png(
+        write_crop_png_with(
             &context,
             &mut ws,
             2.0,
             &review_png(&format!("fill-tools-options-{name}.png")),
             bar,
+            true,
         );
     }
 }

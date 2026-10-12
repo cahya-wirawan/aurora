@@ -30,6 +30,14 @@ pub(crate) const PAINT_BUCKET_LABEL: &str = "Paint Bucket Fill";
 /// The History row of one Gradient.
 pub(crate) const GRADIENT_LABEL: &str = "Gradient";
 
+/// The layer a fill acts on: the active one, else the calm
+/// [`LockRefusal::FillNeedsPixelLayer`] notice.
+pub(crate) fn fill_target(
+    active: Option<aurora_doc::LayerId>,
+) -> Result<aurora_doc::LayerId, LockRefusal> {
+    active.ok_or(LockRefusal::FillNeedsPixelLayer)
+}
+
 /// What a fill wrote: the undo snapshot (empty when nothing changed) and
 /// the layer tiles to invalidate in the composite.
 #[derive(Debug)]
@@ -81,10 +89,10 @@ pub(crate) fn bucket_fill(
     foreground: [f32; 3],
 ) -> Result<Filled, FillRefused> {
     let Some(aurora_doc::LayerKind::Pixel { bounds }) = layers.kind(layer).cloned() else {
-        return Err(FillRefused::Nothing);
+        return Err(FillRefused::Notice(LockRefusal::FillNeedsPixelLayer));
     };
     let Some(surface) = layers.surface_id(layer) else {
-        return Err(FillRefused::Nothing);
+        return Err(FillRefused::Notice(LockRefusal::FillNeedsPixelLayer));
     };
     let mode = mode_for(layers.lock(layer).unwrap_or_default())?;
     let local = crate::layer_local_point(bounds, doc_point);
@@ -98,6 +106,7 @@ pub(crate) fn bucket_fill(
         tolerance: settings.tolerance,
         contiguous: settings.contiguous,
         max_tiles: MAX_FILL_TILES,
+        max_examined: aurora_brush::MAX_EXAMINED_TILES,
     };
     let mut snapshot = StrokeSnapshot::new(surface);
     let outcome = aurora_brush::flood_fill(
@@ -152,10 +161,10 @@ pub(crate) fn gradient_drag(
     background: [f32; 3],
 ) -> Result<Filled, FillRefused> {
     let Some(aurora_doc::LayerKind::Pixel { bounds }) = layers.kind(layer).cloned() else {
-        return Err(FillRefused::Nothing);
+        return Err(FillRefused::Notice(LockRefusal::FillNeedsPixelLayer));
     };
     let Some(surface) = layers.surface_id(layer) else {
-        return Err(FillRefused::Nothing);
+        return Err(FillRefused::Notice(LockRefusal::FillNeedsPixelLayer));
     };
     let mode = mode_for(layers.lock(layer).unwrap_or_default())?;
     let (from, to) = if settings.gradient_reverse {

@@ -46,6 +46,13 @@ use crate::StrokeSnapshot;
 /// [`FillError::TooLarge`].
 pub const MAX_FILL_TILES: usize = 1024;
 
+/// The most **existing** tiles a non-contiguous flood fill may read while
+/// looking for similar pixels (4096 tiles, 268 Mpx of scanning): a layer
+/// holding more is refused with [`FillError::TooLarge`] before any write.
+/// An engineering default like [`MAX_FILL_TILES`], and higher because a
+/// scanned tile that does not match costs time, not undo memory.
+pub const MAX_EXAMINED_TILES: usize = 4096;
+
 /// Tiles of source pixels a flood fill keeps decoded at once.
 const READ_CACHE_TILES: usize = 32;
 
@@ -260,7 +267,7 @@ impl Region {
         while x <= x1 {
             let (id, lx, ly) = split(x, y);
             let slot = self.slot_or_insert(id)?;
-            let run_end = x1.min(id.x * TILE + (TILE - 1));
+            let run_end = x1.min(id.x.saturating_mul(TILE).saturating_add(TILE - 1));
             let last_lx = lx + (run_end - x) as usize;
             if let Some((_, words)) = self.tiles.get_mut(slot) {
                 for l in lx..=last_lx {
@@ -270,10 +277,10 @@ impl Region {
                     }
                 }
             }
-            x = run_end + 1;
-            if run_end == u32::MAX {
+            let Some(next) = run_end.checked_add(1) else {
                 break;
-            }
+            };
+            x = next;
         }
         Ok(())
     }
@@ -291,6 +298,9 @@ pub struct FloodSpec {
     pub contiguous: bool,
     /// The tile cap ([`MAX_FILL_TILES`] in the app; tests lower it).
     pub max_tiles: usize,
+    /// The cap on existing tiles a non-contiguous fill reads
+    /// ([`MAX_EXAMINED_TILES`] in the app; tests lower it).
+    pub max_examined: usize,
 }
 
 /// Finds the matched region. `None` when the seed is outside `area`.
@@ -335,9 +345,10 @@ fn flood_contiguous(
             x0 -= 1;
         }
         let mut x1 = x;
-        while x1 + 1 < width && within_tolerance(seed, plane.quantised(x1 + 1, y)?, spec.tolerance)
+        while let Some(next) = x1.checked_add(1).filter(|n| *n < width)
+            && within_tolerance(seed, plane.quantised(next, y)?, spec.tolerance)
         {
-            x1 += 1;
+            x1 = next;
         }
         region.set_span(y, x0, x1)?;
         for ny in [y.checked_sub(1), y.checked_add(1).filter(|v| *v < height)]
@@ -351,15 +362,15 @@ fn flood_contiguous(
                 if open {
                     stack.push((cx, ny));
                     // Skip the rest of this run: one seed per run.
-                    cx += 1;
+                    cx = cx.saturating_add(1);
                     while cx <= x1
                         && !region.contains(cx, ny)
                         && within_tolerance(seed, plane.quantised(cx, ny)?, spec.tolerance)
                     {
-                        cx += 1;
+                        cx = cx.saturating_add(1);
                     }
                 } else {
-                    cx += 1;
+                    cx = cx.saturating_add(1);
                 }
             }
         }
@@ -378,36 +389,47 @@ fn flood_everywhere(
     let blank_matches = within_tolerance(seed, [0; CHANNELS], spec.tolerance);
     let tiles_x = width.div_ceil(TILE);
     let tiles_y = height.div_ceil(TILE);
+    let mut examined = 0_usize;
     for ty in 0..tiles_y {
+        let y_start = ty.saturating_mul(TILE);
+        let y_end = ty.saturating_add(1).saturating_mul(TILE).min(height);
         for tx in 0..tiles_x {
             let id = TileId { x: tx, y: ty };
-            let x_end = ((tx + 1) * TILE).min(width);
-            let y_end = (ty + 1).saturating_mul(TILE).min(height);
-            let held = plane.store.contains_tile(plane.surface, id);
-            if !held {
+            let x_start = tx.saturating_mul(TILE);
+            let x_end = tx.saturating_add(1).saturating_mul(TILE).min(width);
+            let last_x = x_end.saturating_sub(1);
+            if !plane.store.contains_tile(plane.surface, id) {
                 // A tile nobody wrote is fully transparent all over.
                 if blank_matches {
-                    for y in ty * TILE..y_end {
-                        region.set_span(y, tx * TILE, x_end - 1)?;
+                    for y in y_start..y_end {
+                        region.set_span(y, x_start, last_x)?;
                     }
                 }
                 continue;
             }
-            for y in ty * TILE..y_end {
+            // Reading a held tile costs time even when nothing in it
+            // matches, so those are bounded too, before the read.
+            examined += 1;
+            if examined > spec.max_examined {
+                return Err(FillError::TooLarge {
+                    max: spec.max_examined,
+                });
+            }
+            for y in y_start..y_end {
                 let mut run: Option<u32> = None;
-                for x in tx * TILE..x_end {
+                for x in x_start..x_end {
                     let hit = within_tolerance(seed, plane.quantised(x, y)?, spec.tolerance);
                     match (hit, run) {
                         (true, None) => run = Some(x),
                         (false, Some(start)) => {
-                            region.set_span(y, start, x - 1)?;
+                            region.set_span(y, start, x.saturating_sub(1))?;
                             run = None;
                         }
                         _ => {}
                     }
                 }
                 if let Some(start) = run {
-                    region.set_span(y, start, x_end - 1)?;
+                    region.set_span(y, start, last_x)?;
                 }
             }
         }
@@ -456,6 +478,16 @@ type TexelFor<'a> = dyn FnMut(usize, usize, &[f16]) -> Option<Texel> + 'a;
 /// tile's old content first (once, before its first changed texel) and
 /// marking the changed rectangle dirty. `pixels` yields tile-local `(x, y)`.
 /// Returns whether anything changed.
+///
+/// **Plan first, write second (0.209.2).** The changes are worked out
+/// against a read-only view of the tile (a tile the store does not hold is
+/// all zeros and is *not* created to look at it); only when at least one
+/// texel really differs is the tile acquired for writing
+/// (`TileStore::get_mut`, which creates a missing tile and bumps its
+/// content version). A fill that ends up changing nothing in a tile (a
+/// transparency-locked fill over transparent pixels, opacity 0, an
+/// already-filled region) therefore creates no tile, bumps no version and
+/// captures nothing.
 #[allow(clippy::cast_possible_wrap)]
 fn write_tile(
     store: &mut TileStore,
@@ -465,54 +497,66 @@ fn write_tile(
     texel_for: &mut TexelFor<'_>,
     snapshot: &mut Option<&mut StrokeSnapshot>,
 ) -> Result<bool, TileError> {
+    let mut changes: Vec<(usize, usize, Texel)> = Vec::new();
+    {
+        let blank;
+        let current: &[f16] = if store.contains_tile(surface, id) {
+            store.get(surface, id)?.texels()
+        } else {
+            blank = vec![f16::ZERO; SAMPLES];
+            &blank
+        };
+        for (lx, ly) in pixels {
+            let index = (ly * TILE_SIDE + lx) * CHANNELS;
+            let Some(old) = current.get(index..index + CHANNELS) else {
+                continue;
+            };
+            let Some(fresh) = texel_for(lx, ly, old) else {
+                continue;
+            };
+            if !same_bits(old, fresh) {
+                changes.push((lx, ly, fresh));
+            }
+        }
+    }
+    let Some(&(fx, fy, _)) = changes.first() else {
+        return Ok(false);
+    };
     let tile = store.get_mut(surface, id)?;
     let texels = tile.texels_mut();
-    let mut captured = false;
-    let mut bounds: Option<(usize, usize, usize, usize)> = None;
-    for (lx, ly) in pixels {
+    if let Some(stroke) = snapshot.as_deref_mut()
+        && !stroke.record_content(id, texels)
+    {
+        return Err(TileError::MalformedTile {
+            surface,
+            id,
+            samples: texels.len(),
+            expected: SAMPLES,
+        });
+    }
+    let mut bounds = (fx, fy, fx, fy);
+    for (lx, ly, fresh) in changes {
         let index = (ly * TILE_SIDE + lx) * CHANNELS;
-        let Some(current) = texels.get(index..index + CHANNELS) else {
-            continue;
-        };
-        let Some(fresh) = texel_for(lx, ly, current) else {
-            continue;
-        };
-        if same_bits(current, fresh) {
-            continue;
-        }
-        if !captured {
-            if let Some(stroke) = snapshot.as_deref_mut()
-                && !stroke.record_content(id, texels)
-            {
-                return Err(TileError::MalformedTile {
-                    surface,
-                    id,
-                    samples: texels.len(),
-                    expected: SAMPLES,
-                });
-            }
-            captured = true;
-        }
         for (offset, value) in fresh.iter().enumerate() {
             if let Some(sample) = texels.get_mut(index + offset) {
                 *sample = *value;
             }
         }
-        bounds = Some(match bounds {
-            None => (lx, ly, lx, ly),
-            Some((x0, y0, x1, y1)) => (x0.min(lx), y0.min(ly), x1.max(lx), y1.max(ly)),
-        });
+        bounds = (
+            bounds.0.min(lx),
+            bounds.1.min(ly),
+            bounds.2.max(lx),
+            bounds.3.max(ly),
+        );
     }
-    if let Some((x0, y0, x1, y1)) = bounds {
-        tile.mark_dirty(Rect {
-            x: x0 as i64,
-            y: y0 as i64,
-            width: (x1 - x0 + 1) as u32,
-            height: (y1 - y0 + 1) as u32,
-        });
-        return Ok(true);
-    }
-    Ok(false)
+    let (x0, y0, x1, y1) = bounds;
+    tile.mark_dirty(Rect {
+        x: x0 as i64,
+        y: y0 as i64,
+        width: (x1 - x0 + 1) as u32,
+        height: (y1 - y0 + 1) as u32,
+    });
+    Ok(true)
 }
 
 /// Fills the region `spec` selects with `colour` (the Paint Bucket).
@@ -706,7 +750,13 @@ pub fn gradient_fill(
 ) -> Result<FillOutcome, FillError> {
     let mut outcome = FillOutcome::default();
     let (x0, y0, x1, y1) = area;
-    if x0 >= x1 || y0 >= y1 || spec.is_degenerate() || !spec.opacity.is_finite() {
+    if x0 >= x1
+        || y0 >= y1
+        || spec.is_degenerate()
+        || !spec.opacity.is_finite()
+        // Opacity zero changes nothing: no tile is read or created.
+        || spec.opacity <= 0.0
+    {
         return Ok(outcome);
     }
     let (tx0, tx1) = (x0 / TILE, (x1 - 1) / TILE);
@@ -720,19 +770,19 @@ pub fn gradient_fill(
     for ty in ty0..=ty1 {
         for tx in tx0..=tx1 {
             let id = TileId { x: tx, y: ty };
-            let (origin_x, origin_y) = (tx * TILE, ty * TILE);
+            let (origin_x, origin_y) = (tx.saturating_mul(TILE), ty.saturating_mul(TILE));
             let lx0 = x0.max(origin_x) - origin_x;
-            let lx1 = x1.min(origin_x + TILE) - origin_x;
+            let lx1 = x1.min(origin_x.saturating_add(TILE)) - origin_x;
             let ly0 = y0.max(origin_y) - origin_y;
-            let ly1 = y1.min(origin_y + TILE) - origin_y;
+            let ly1 = y1.min(origin_y.saturating_add(TILE)) - origin_y;
             let mut pixels =
                 (ly0..ly1).flat_map(move |ly| (lx0..lx1).map(move |lx| (lx as usize, ly as usize)));
             let mut texel_for = |lx: usize, ly: usize, current: &[f16]| {
                 gradient_texel(
                     spec,
                     mode,
-                    origin_x + u32::try_from(lx).unwrap_or(0),
-                    origin_y + u32::try_from(ly).unwrap_or(0),
+                    origin_x.saturating_add(u32::try_from(lx).unwrap_or(0)),
+                    origin_y.saturating_add(u32::try_from(ly).unwrap_or(0)),
                     current,
                 )
             };
@@ -826,6 +876,7 @@ mod tests {
             tolerance,
             contiguous,
             max_tiles: MAX_FILL_TILES,
+            max_examined: MAX_EXAMINED_TILES,
         }
     }
 
@@ -1051,6 +1102,7 @@ mod tests {
                 tolerance: 0,
                 contiguous: true,
                 max_tiles: 8,
+                max_examined: MAX_EXAMINED_TILES,
             },
             RED,
             FillMode::Normal,
@@ -1069,6 +1121,7 @@ mod tests {
                 tolerance: 0,
                 contiguous: false,
                 max_tiles: 8,
+                max_examined: MAX_EXAMINED_TILES,
             },
             RED,
             FillMode::Normal,
@@ -1089,6 +1142,7 @@ mod tests {
                 tolerance: 0,
                 contiguous: true,
                 max_tiles: 2,
+                max_examined: MAX_EXAMINED_TILES,
             },
             RED,
             FillMode::Normal,
@@ -1105,6 +1159,7 @@ mod tests {
                 tolerance: 0,
                 contiguous: true,
                 max_tiles: 2,
+                max_examined: MAX_EXAMINED_TILES,
             },
             RED,
             FillMode::Normal,
@@ -1185,6 +1240,142 @@ mod tests {
         assert_eq!(painted, 0);
         assert!(snapshot.is_empty());
         assert_eq!(get(&mut s, 0, 0), [1.0, 1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn fills_that_change_nothing_create_no_tile_and_bump_no_version() {
+        let (_dir, mut s) = store();
+        // Transparency lock over an empty layer: nothing to recolour.
+        let r = bucket(
+            &mut s,
+            (600, 300),
+            &spec((5, 5), 255, true),
+            FillMode::PreserveAlpha,
+        );
+        assert!(matches!(r, Ok((0, ref snap)) if snap.is_empty()));
+        let spec_all = linear([0.0; 3], [1.0; 3]);
+        let r = gradient(&mut s, (0, 0, 600, 300), &spec_all, FillMode::PreserveAlpha);
+        assert!(matches!(r, Ok((0, ref snap)) if snap.is_empty()));
+        // Opacity zero, on an empty layer and on a held tile.
+        let mut zero = linear([0.0; 3], [1.0; 3]);
+        zero.opacity = 0.0;
+        let r = gradient(&mut s, (0, 0, 600, 300), &zero, FillMode::Normal);
+        assert!(matches!(r, Ok((0, ref snap)) if snap.is_empty()));
+        assert_eq!(s.resident_len(), 0, "no tile was created");
+        for x in 0..3 {
+            for y in 0..3 {
+                assert!(!s.contains_tile(surface(), TileId { x, y }));
+            }
+        }
+        // A held tile that ends unchanged keeps its content version.
+        put(&mut s, 0, 0, grey(1.0));
+        let id = TileId { x: 0, y: 0 };
+        let version = s.content_version(surface(), id);
+        let r = gradient(&mut s, (0, 0, 8, 8), &zero, FillMode::Normal);
+        assert!(matches!(r, Ok((0, _))));
+        assert_eq!(
+            s.content_version(surface(), id),
+            version,
+            "opacity 0 touched nothing"
+        );
+        // A locked bucket over transparent pixels of a held tile: unchanged.
+        let r = bucket(
+            &mut s,
+            (8, 8),
+            &spec((200, 200), 0, true),
+            FillMode::PreserveAlpha,
+        );
+        assert!(matches!(r, Ok((0, _))));
+        assert_eq!(s.content_version(surface(), id), version);
+        let before = s.content_version(surface(), id);
+        let r = gradient(&mut s, (0, 0, 8, 8), &zero, FillMode::Normal);
+        assert!(matches!(r, Ok((0, _))));
+        assert_eq!(s.content_version(surface(), id), before);
+    }
+
+    #[test]
+    fn a_non_contiguous_fill_over_many_non_matching_tiles_is_refused() {
+        let (_dir, mut s) = store();
+        // Ten held tiles, none matching the (transparent) seed.
+        for tx in 0..10_u32 {
+            put(&mut s, tx * TILE, 0, grey(1.0));
+            fill_rect(&mut s, tx * TILE, 0, tx * TILE + 256, 1, grey(1.0));
+        }
+        let mut snapshot = StrokeSnapshot::new(surface());
+        let result = flood_fill(
+            &mut s,
+            surface(),
+            (10 * TILE, 256),
+            &FloodSpec {
+                seed: (5, 200),
+                tolerance: 0,
+                contiguous: false,
+                max_tiles: MAX_FILL_TILES,
+                max_examined: 4,
+            },
+            RED,
+            FillMode::Normal,
+            Some(&mut snapshot),
+        );
+        assert!(
+            matches!(result, Err(FillError::TooLarge { max: 4 })),
+            "{result:?}"
+        );
+        assert!(snapshot.is_empty(), "nothing was written");
+        // The same layer with the cap raised is fine.
+        let ok = flood_fill(
+            &mut s,
+            surface(),
+            (10 * TILE, 256),
+            &FloodSpec {
+                seed: (5, 200),
+                tolerance: 0,
+                contiguous: false,
+                max_tiles: MAX_FILL_TILES,
+                max_examined: 10,
+            },
+            RED,
+            FillMode::Normal,
+            None,
+        );
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn coordinates_at_the_u32_limit_do_not_overflow() {
+        let (_dir, mut s) = store();
+        let far = 299_997;
+        let spec_far = FloodSpec {
+            seed: (far, far),
+            tolerance: 0,
+            contiguous: true,
+            max_tiles: 4,
+            max_examined: 4,
+        };
+        let r = flood_fill(
+            &mut s,
+            surface(),
+            (300_000, 300_000),
+            &spec_far,
+            RED,
+            FillMode::Normal,
+            None,
+        );
+        assert!(matches!(r, Err(FillError::TooLarge { .. })), "{r:?}");
+        let mut grad = linear([0.0; 3], [1.0; 3]);
+        grad.max_tiles = 4;
+        let r = gradient_fill(
+            &mut s,
+            surface(),
+            (u32::MAX - 5, 0, u32::MAX, 3),
+            &grad,
+            FillMode::Normal,
+            None,
+        );
+        assert!(r.is_ok(), "{r:?}");
+        let mut seen = Region::new(4);
+        assert!(seen.set_span(0, u32::MAX - 3, u32::MAX).is_ok());
+        assert!(seen.contains(u32::MAX, 0));
     }
 
     #[test]

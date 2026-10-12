@@ -16,9 +16,9 @@
 //! **This module knows no tool parameters**, like [`crate::tool_controls`]:
 //! `aurora-app` passes its settings as a [`FillView`] and applies the
 //! outcomes of these widgets to its `ToolSettings`. Nothing here is
-//! document state: no undo step, not persisted. The type pair is two text
-//! toggle buttons that behave as a radio group (the app keeps exactly one
-//! on). No new design tokens: sizes are the options bar's
+//! document state: no undo step, not persisted. The type is one checkbox,
+//! "Radial" (a toggle pair is taller than the bar's row and would make the
+//! canvas jump on a tool switch). No new design tokens: sizes are the options bar's
 //! (`size.options_control_width` for the sliders, `spacing.sm` gaps).
 
 use accesskit::Toggled;
@@ -47,9 +47,7 @@ pub const OPACITY_MAX: f64 = 100.0;
 pub struct FillControls {
     /// The Gradient group's row.
     pub gradient: WidgetId,
-    /// The "Linear" type button.
-    pub linear: WidgetId,
-    /// The "Radial" type button.
+    /// The "Radial" checkbox: unchecked is Linear, checked Radial.
     pub radial: WidgetId,
     /// The "Reverse" checkbox.
     pub reverse: WidgetId,
@@ -131,8 +129,12 @@ pub fn insert_fill_controls(
     scales: &Scales,
 ) -> Result<FillControls, WidgetError> {
     let gradient = widgets::insert_container(tree, options, group_style(scales))?;
-    let linear = widgets::insert_toggle_button(tree, gradient, scales, "Linear", true)?;
-    let radial = widgets::insert_toggle_button(tree, gradient, scales, "Radial", false)?;
+    // The type is one checkbox (a row tall, like every other options-bar
+    // control): a text or icon toggle pair is taller than the bar's row
+    // (a measured text toggle is 45 px, a 32 px icon button 48 px with the
+    // bar's padding against 37), which would make the canvas jump on a
+    // tool switch.
+    let radial = widgets::insert_checkbox(tree, gradient, scales, "Radial")?;
     let reverse = widgets::insert_checkbox(tree, gradient, scales, "Reverse")?;
     let opacity_readout = widgets::insert_label(tree, gradient, scales, opacity_readout_text(100))?;
     let opacity = widgets::insert_slider(
@@ -168,7 +170,6 @@ pub fn insert_fill_controls(
     set_node_hidden(tree, bucket, true)?;
     Ok(FillControls {
         gradient,
-        linear,
         radial,
         reverse,
         opacity_readout,
@@ -249,8 +250,7 @@ pub fn sync_fill_controls(
     changed |= set_item_shown(tree, controls.readout, !fill_tool)?;
     changed |= set_node_hidden(tree, controls.readout, fill_tool)?;
 
-    changed |= widgets::set_button_toggled(tree, fill.linear, !view.radial)?;
-    changed |= widgets::set_button_toggled(tree, fill.radial, view.radial)?;
+    changed |= sync_checkbox(tree, fill.radial, view.radial)?;
     changed |= sync_checkbox(tree, fill.reverse, view.reverse)?;
     changed |= widgets::set_label_text(
         tree,
@@ -383,7 +383,7 @@ mod tests {
         for (tool, ids) in [
             (
                 Tool::Gradient,
-                vec![fill.linear, fill.radial, fill.reverse, fill.opacity],
+                vec![fill.radial, fill.reverse, fill.opacity],
             ),
             (Tool::PaintBucket, vec![fill.tolerance, fill.contiguous]),
         ] {
@@ -414,8 +414,8 @@ mod tests {
         assert!(sync(&mut ws, &controls, Tool::Gradient, view, None));
         assert!(!sync(&mut ws, &controls, Tool::Gradient, view, None));
         let fill = controls.fill;
-        let on = |id| matches!(ws.tree.payload(id), Some(WidgetKind::Button(s)) if s.toggled == Some(true));
-        assert!(!on(fill.linear) && on(fill.radial), "a radio pair");
+        let on = |id| matches!(ws.tree.payload(id), Some(WidgetKind::Checkbox(s)) if s.checked == accesskit::Toggled::True);
+        assert!(on(fill.radial), "Radial is checked");
         let slider = |id| match ws.tree.payload(id) {
             Some(WidgetKind::Slider(s)) => s.value,
             other => unreachable!("{other:?}"),

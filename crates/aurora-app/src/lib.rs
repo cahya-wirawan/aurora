@@ -4650,7 +4650,6 @@ enum AccessibilityReaction {
 /// Layers-panel row. Free and platform-free, like [`handle_dialog_key`],
 /// so it is testable with no window or adapter; the caller performs the
 /// side effects the returned [`AccessibilityReaction`] names.
-#[allow(clippy::too_many_lines)]
 fn route_accessibility_action(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
@@ -4743,11 +4742,6 @@ fn route_accessibility_action(
                 // A Lock-row button (0.198.0): the same edit a pointer
                 // click makes ([`apply_layer_control_outcome`]).
                 AccessibilityReaction::LayerControl(aurora_widgets::ActionOutcome::Activated(id))
-            } else if tool_controls.is_some_and(|controls| {
-                aurora_ui::tool_controls_contains(&workspace.tree, controls, id)
-            }) {
-                // A Linear/Radial button of the Gradient options (0.209.0).
-                AccessibilityReaction::ToolControl(aurora_widgets::ActionOutcome::Activated(id))
             } else {
                 AccessibilityReaction::Handled(aurora_widgets::ActionOutcome::Activated(id))
             }
@@ -8071,10 +8065,10 @@ fn apply_fill_control_outcome(
     use aurora_widgets::ActionOutcome;
     let fill = &controls.fill;
     let changed = match action {
-        ActionOutcome::Activated(id) if *id == fill.linear || *id == fill.radial => {
-            let radial = *id == fill.radial;
-            let changed = settings.gradient_radial != radial;
-            settings.gradient_radial = radial;
+        ActionOutcome::Toggled { id, state } if *id == fill.radial => {
+            let on = *state == accesskit::Toggled::True;
+            let changed = settings.gradient_radial != on;
+            settings.gradient_radial = on;
             changed
         }
         ActionOutcome::Toggled { id, state } if *id == fill.reverse => {
@@ -11748,6 +11742,23 @@ fn record_stroke(
     // snapshot itself.
     if pixel_history.push(stroke) {
         undo_order.record_labelled(UndoKind::Pixel, label.to_owned(), history, pixel_history);
+    }
+}
+
+/// The `(start, end)` document points of a Gradient drag that is ending, or
+/// `None` for any other drag. [`App::handle_pointer_released`] applies the
+/// gradient from it (0.209.2): **by any button's release and after a tool
+/// switch mid-drag** — a Gradient drag that began stays a Gradient drag
+/// whatever `App::tool` has become, because the gesture is the drag, not the
+/// tool. (A second press, the pointer leaving the window and a lost focus
+/// end a drag through [`commit_ending_drag`] and so cancel it.)
+fn released_gradient(ending: Option<&Drag>) -> Option<((f32, f32), (f32, f32))> {
+    match ending {
+        Some(Drag::Gradient {
+            start_doc,
+            current_doc,
+        }) => Some((*start_doc, *current_doc)),
+        _ => None,
     }
 }
 
@@ -25139,6 +25150,9 @@ enum LockRefusal {
     /// A Paint Bucket region or a Gradient area is over the tile cap
     /// (0.209.0; not a lock, it rides the same calm notice).
     FillTooLarge,
+    /// A fill with no pixel layer to fill: none is active, or the active
+    /// layer is a group or an adjustment layer (0.209.2).
+    FillNeedsPixelLayer,
 }
 
 impl LockRefusal {
@@ -25161,6 +25175,9 @@ impl LockRefusal {
                 "There is no layer beneath this one to clip to. Clipping masks need a layer below."
             }
             LockRefusal::ClipOnGroup => "Groups can't be clipped. Clip a layer inside the group.",
+            LockRefusal::FillNeedsPixelLayer => {
+                "Select a pixel layer to fill. A group, an adjustment layer or no layer can't be filled."
+            }
             LockRefusal::FillTooLarge => {
                 "That area is too large to fill in one step (over 64 megapixels). Use a smaller selection of the layer."
             }
@@ -25230,11 +25247,13 @@ fn lock_refusal_applies(
 ) -> bool {
     press_refusal(tool, lock) == Some(refusal)
         || delete_refusal(lock) == Some(refusal)
-        || (refusal == LockRefusal::FillTooLarge
-            && matches!(
-                tool,
-                aurora_ui::Tool::Gradient | aurora_ui::Tool::PaintBucket
-            ))
+        || (matches!(
+            refusal,
+            LockRefusal::FillTooLarge | LockRefusal::FillNeedsPixelLayer
+        ) && matches!(
+            tool,
+            aurora_ui::Tool::Gradient | aurora_ui::Tool::PaintBucket
+        ))
 }
 
 impl ToolSettings {
@@ -25910,7 +25929,7 @@ struct App {
     /// The locked-layer refusal currently shown in the status bar, with
     /// the layer it was about (0.198.0). Cleared by
     /// [`App::sync_status_bar_now`] once it no longer applies.
-    lock_notice: Option<(LockRefusal, aurora_doc::LayerId)>,
+    lock_notice: Option<(LockRefusal, Option<aurora_doc::LayerId>)>,
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
     surface: Option<GpuSurface<'static>>,
@@ -27094,13 +27113,13 @@ impl App {
             && let Some(layer) = self.doc.active_layer
             && let Some(why) = delete_refusal(self.doc.layers.lock(layer).unwrap_or_default())
         {
-            self.lock_notice = Some((why, layer));
+            self.lock_notice = Some((why, Some(layer)));
         }
         if command == LayerCommand::SetClip(true)
             && let Some(layer) = self.doc.active_layer
             && let Some(why) = clip_refusal(&self.doc.layers, layer)
         {
-            self.lock_notice = Some((why, layer));
+            self.lock_notice = Some((why, Some(layer)));
         }
         let _ = perform_layer_command(
             &mut LayerCommandContext {
@@ -29087,7 +29106,7 @@ impl App {
                 press_refusal(self.tool, self.doc.layers.lock(layer).unwrap_or_default())
         {
             self.drag = None;
-            self.lock_notice = Some((why, layer));
+            self.lock_notice = Some((why, Some(layer)));
             self.sync_status_bar_now();
             return;
         }
@@ -29169,7 +29188,7 @@ impl App {
             self.doc.layers.lock(layer_id).unwrap_or_default(),
         ) {
             PaintPermission::Refused(why) => {
-                self.lock_notice = Some((why, layer_id));
+                self.lock_notice = Some((why, Some(layer_id)));
                 return;
             }
             PaintPermission::PreserveAlpha => true,
@@ -29245,7 +29264,7 @@ impl App {
             DabTool::Eraser,
             self.doc.layers.lock(layer_id).unwrap_or_default(),
         ) {
-            self.lock_notice = Some((why, layer_id));
+            self.lock_notice = Some((why, Some(layer_id)));
             return;
         }
         let Some(store) = self.doc.tile_store.as_mut() else {
@@ -29326,7 +29345,7 @@ impl App {
             .lock(layer_id)
             .is_some_and(|lock| lock.position)
         {
-            self.lock_notice = Some((LockRefusal::PositionLocked, layer_id));
+            self.lock_notice = Some((LockRefusal::PositionLocked, Some(layer_id)));
             return;
         }
         if let Err(err) = self.doc.layers.set_bounds(layer_id, bounds) {
@@ -29403,10 +29422,25 @@ impl App {
         );
     }
 
+    /// The active layer a fill acts on, or `None` after showing the calm
+    /// notice (no layer is active: [`LockRefusal::FillNeedsPixelLayer`]).
+    /// A group or adjustment layer is refused later with the same notice
+    /// ([`fill_tools`]).
+    fn fill_target(&mut self) -> Option<aurora_doc::LayerId> {
+        match fill_tools::fill_target(self.doc.active_layer) {
+            Ok(layer) => Some(layer),
+            Err(why) => {
+                self.lock_notice = Some((why, None));
+                self.sync_status_bar_now();
+                None
+            }
+        }
+    }
+
     /// One Paint Bucket click at `doc_point` on the active layer
     /// ([`fill_tools::bucket_fill`]): one undo step, "Paint Bucket Fill".
     fn fill_bucket(&mut self, doc_point: (f32, f32)) {
-        let Some(layer) = self.doc.active_layer else {
+        let Some(layer) = self.fill_target() else {
             return;
         };
         let Some(store) = self.doc.tile_store.as_mut() else {
@@ -29426,7 +29460,7 @@ impl App {
     /// The released Gradient drag ([`fill_tools::gradient_drag`]): one undo
     /// step, "Gradient".
     fn apply_gradient(&mut self, start_doc: (f32, f32), end_doc: (f32, f32)) {
-        let Some(layer) = self.doc.active_layer else {
+        let Some(layer) = self.fill_target() else {
             return;
         };
         let Some(store) = self.doc.tile_store.as_mut() else {
@@ -29458,7 +29492,7 @@ impl App {
     ) {
         match result {
             Err(fill_tools::FillRefused::Notice(why)) => {
-                self.lock_notice = Some((why, layer));
+                self.lock_notice = Some((why, Some(layer)));
                 self.sync_status_bar_now();
             }
             Err(fill_tools::FillRefused::Nothing) => {}
@@ -29582,12 +29616,8 @@ impl App {
             self.relayout_after_gallery();
         }
         let ending = self.drag.take();
-        if let Some(Drag::Gradient {
-            start_doc,
-            current_doc,
-        }) = &ending
-        {
-            self.apply_gradient(*start_doc, *current_doc);
+        if let Some((start_doc, end_doc)) = released_gradient(ending.as_ref()) {
+            self.apply_gradient(start_doc, end_doc);
         }
         self.commit_drag(ending);
         // Whatever owned the pointer let go: the tooltip may arm again
@@ -30669,11 +30699,13 @@ impl App {
         // A lock notice stays only while it still describes what the
         // active tool would meet on the active layer.
         if let Some((why, layer)) = self.lock_notice
-            && (self.doc.active_layer != Some(layer)
+            && (self.doc.active_layer != layer
                 || !lock_refusal_applies(
                     why,
                     self.tool,
-                    self.doc.layers.lock(layer).unwrap_or_default(),
+                    layer
+                        .and_then(|layer| self.doc.layers.lock(layer))
+                        .unwrap_or_default(),
                 ))
         {
             self.lock_notice = None;

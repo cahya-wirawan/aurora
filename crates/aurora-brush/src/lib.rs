@@ -56,8 +56,8 @@ mod undo;
 
 pub use dab::{DEFAULT_SPACING, advance_segment, dab_step, dabs_along_path};
 pub use fill::{
-    FillError, FillMode, FillOutcome, FloodSpec, GradientKind, GradientSpec, MAX_FILL_TILES,
-    flood_fill, gradient_fill,
+    FillError, FillMode, FillOutcome, FloodSpec, GradientKind, GradientSpec, MAX_EXAMINED_TILES,
+    MAX_FILL_TILES, flood_fill, gradient_fill,
 };
 pub use stamp::{DabOutcome, erase_dab, stamp_dab, stamp_dab_preserving_alpha, touched_tiles};
 pub use undo::{PixelHistory, StrokeSnapshot};

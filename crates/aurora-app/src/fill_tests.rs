@@ -485,7 +485,7 @@ fn a_too_large_fill_is_refused_calmly_with_nothing_written() {
 }
 
 #[test]
-fn a_group_or_missing_layer_is_nothing_to_fill() {
+fn a_group_or_missing_layer_is_refused_with_a_calm_notice() {
     let mut doc = Doc::new(Doc::rect(0, 0, 64, 64));
     let group = ok(doc.history.add_group_at(
         &mut doc.layers,
@@ -494,7 +494,7 @@ fn a_group_or_missing_layer_is_nothing_to_fill() {
         0,
         aurora_doc::BlendMode::PassThrough,
     ));
-    let r = fill_tools::bucket_fill(
+    let bucket = fill_tools::bucket_fill(
         &mut doc.store,
         &doc.layers,
         group,
@@ -502,7 +502,105 @@ fn a_group_or_missing_layer_is_nothing_to_fill() {
         &doc.settings,
         GREEN,
     );
-    assert!(matches!(r, Err(FillRefused::Nothing)));
+    assert!(matches!(
+        bucket,
+        Err(FillRefused::Notice(LockRefusal::FillNeedsPixelLayer))
+    ));
+    let gradient = fill_tools::gradient_drag(
+        &mut doc.store,
+        &doc.layers,
+        group,
+        CANVAS,
+        (0.0, 0.0),
+        (9.0, 0.0),
+        &doc.settings,
+        GREEN,
+        BLUE,
+    );
+    assert!(matches!(
+        gradient,
+        Err(FillRefused::Notice(LockRefusal::FillNeedsPixelLayer))
+    ));
+    assert!(doc.undo_order.undo.is_empty(), "no history row");
+    // No active layer at all.
+    assert_eq!(
+        fill_tools::fill_target(None),
+        Err(LockRefusal::FillNeedsPixelLayer)
+    );
+    assert_eq!(fill_tools::fill_target(Some(doc.layer)), Ok(doc.layer));
+    // The notice names what to do, and stays only for the fill tools.
+    assert!(
+        LockRefusal::FillNeedsPixelLayer
+            .message()
+            .contains("pixel layer")
+    );
+    for (tool, stays) in [
+        (Tool::Gradient, true),
+        (Tool::PaintBucket, true),
+        (Tool::Brush, false),
+        (Tool::Move, false),
+    ] {
+        assert_eq!(
+            crate::lock_refusal_applies(
+                LockRefusal::FillNeedsPixelLayer,
+                tool,
+                aurora_doc::LayerLock::none()
+            ),
+            stays,
+            "{tool:?}"
+        );
+    }
+}
+
+#[test]
+fn fills_over_transparent_pixels_under_the_lock_or_at_zero_opacity_create_no_tile() {
+    let mut doc = Doc::new(Doc::rect(0, 0, 600, 300));
+    doc.lock(aurora_doc::LayerLock {
+        transparency: true,
+        ..aurora_doc::LayerLock::none()
+    });
+    doc.settings.tolerance = 255;
+    let f = ok(doc.bucket((10.0, 10.0)));
+    assert!(!doc.commit(f, "x"));
+    let f = ok(doc.gradient((0.0, 0.0), (100.0, 0.0)));
+    assert!(!doc.commit(f, "x"));
+    doc.lock(aurora_doc::LayerLock::none());
+    doc.settings.gradient_opacity = 0;
+    let f = ok(doc.gradient((0.0, 0.0), (100.0, 0.0)));
+    assert!(!doc.commit(f, "x"));
+    assert_eq!(doc.store.resident_len(), 0, "no phantom tile");
+    assert!(doc.undo_order.undo.is_empty());
+}
+
+#[test]
+fn a_gradient_drag_applies_on_release_whatever_the_tool_or_button() {
+    let drag = Drag::Gradient {
+        start_doc: (1.0, 2.0),
+        current_doc: (30.0, 40.0),
+    };
+    assert_eq!(
+        crate::released_gradient(Some(&drag)),
+        Some(((1.0, 2.0), (30.0, 40.0)))
+    );
+    assert_eq!(crate::released_gradient(None), None);
+    assert_eq!(
+        crate::released_gradient(Some(&Drag::Marquee {
+            start_doc: (0.0, 0.0)
+        })),
+        None
+    );
+    assert_eq!(crate::released_gradient(Some(&Drag::Eyedropper)), None);
+    // `App::handle_pointer_released` (not runnable without a window) takes
+    // the gradient from `released_gradient` before committing the drag, and
+    // never looks at `self.tool` or the button: a source guard, compared
+    // with whitespace removed.
+    let source = include_str!("lib.rs");
+    let production = source.split("\nmod tests {").next().unwrap_or(source);
+    let squeeze = |text: &str| text.split_whitespace().collect::<String>();
+    let squeezed = squeeze(production);
+    assert!(squeezed.contains(&squeeze(
+        "let ending = self.drag.take(); if let Some((start_doc, end_doc)) = released_gradient(ending.as_ref()) { self.apply_gradient(start_doc, end_doc); } self.commit_drag(ending);"
+    )));
 }
 
 // -- tools, shortcuts, palette, drag ------------------------------------
@@ -771,13 +869,31 @@ fn the_options_bar_edits_the_fill_settings_and_mirrors_them() {
     ));
     assert!(!bar.settings.contiguous);
 
-    assert!(bar.outcome(Tool::Gradient, A::Activated(fill.radial)));
+    assert!(bar.outcome(
+        Tool::Gradient,
+        A::Toggled {
+            id: fill.radial,
+            state: accesskit::Toggled::True
+        }
+    ));
     assert!(bar.settings.gradient_radial);
     assert!(
-        !bar.outcome(Tool::Gradient, A::Activated(fill.radial)),
+        !bar.outcome(
+            Tool::Gradient,
+            A::Toggled {
+                id: fill.radial,
+                state: accesskit::Toggled::True
+            }
+        ),
         "idempotent"
     );
-    assert!(bar.outcome(Tool::Gradient, A::Activated(fill.linear)));
+    assert!(bar.outcome(
+        Tool::Gradient,
+        A::Toggled {
+            id: fill.radial,
+            state: accesskit::Toggled::False
+        }
+    ));
     assert!(!bar.settings.gradient_radial);
     assert!(bar.outcome(
         Tool::Gradient,
@@ -851,6 +967,28 @@ fn with_measured_text_every_option_fits_the_options_bar_and_the_labels_have_room
     let Ok(mut engine) = aurora_text::TextEngine::new() else {
         unreachable!("the bundled font loads");
     };
+    crate::sync_tool_controls(
+        &mut bar.workspace,
+        Some(bar.controls),
+        Tool::Brush,
+        &bar.settings,
+        None,
+    );
+    aurora_widgets::compute_text_layout(
+        &mut bar.workspace.tree,
+        W,
+        H,
+        Some(aurora_widgets::TextMeasure {
+            engine: &mut engine,
+            scales: &scales,
+            scale_factor: 1.0,
+        }),
+    );
+    let brush_height = bar
+        .workspace
+        .tree
+        .bounds(bar.workspace.options_bar)
+        .map_or(0, |b| b.height);
     for tool in [Tool::Gradient, Tool::PaintBucket] {
         crate::sync_tool_controls(
             &mut bar.workspace,
@@ -872,9 +1010,12 @@ fn with_measured_text_every_option_fits_the_options_bar_and_the_labels_have_room
         let Some(strip) = bar.workspace.tree.bounds(bar.workspace.options_bar) else {
             unreachable!("laid out");
         };
+        // The bar is as tall for a fill tool as for the Brush: the canvas
+        // below it never jumps on a tool switch.
+        assert_eq!(strip.height, brush_height, "{tool:?}");
         let fill = bar.controls.fill;
         let ids = match tool {
-            Tool::Gradient => vec![fill.linear, fill.radial, fill.reverse, fill.opacity],
+            Tool::Gradient => vec![fill.radial, fill.reverse, fill.opacity],
             _ => vec![fill.tolerance, fill.contiguous],
         };
         let mut previous_right = strip.x;
@@ -889,13 +1030,6 @@ fn with_measured_text_every_option_fits_the_options_bar_and_the_labels_have_room
             );
             assert!(b.right() <= strip.right(), "{tool:?} {id:?} fits the bar");
             previous_right = b.right();
-        }
-        // The two type buttons are wider than the 3-glyph text-blind box.
-        if tool == Tool::Gradient {
-            for id in [fill.linear, fill.radial] {
-                let w = bar.workspace.tree.bounds(id).map_or(0, |b| b.width);
-                assert!(w >= 48, "a measured text button: {w}");
-            }
         }
     }
 }

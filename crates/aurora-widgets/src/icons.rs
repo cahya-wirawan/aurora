@@ -604,13 +604,17 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
                 .l(5.0, 13.0)
                 .l(5.0, 9.0),
         ],
-        IconKind::Gradient => vec![
-            // The frame, and three bars that grow from left to right.
-            rounded_box(2.0, 3.0, 12.0, 10.0, 1.0),
-            stroke_part().m(5.0, 7.0).l(5.0, 9.0),
-            stroke_part().m(8.0, 6.0).l(8.0, 10.0),
-            stroke_part().m(11.0, 5.0).l(11.0, 11.0),
-        ],
+        IconKind::Gradient => {
+            // The frame and full-height lines that crowd together left to
+            // right until they merge into a solid: a ramp, not a bar chart.
+            let mut parts = vec![rounded_box(2.0, 3.0, 12.0, 10.0, 1.0)];
+            parts.extend(
+                [4.0, 6.0, 8.0, 10.0, 11.0, 12.0]
+                    .iter()
+                    .map(|&x| stroke_part().m(x, 5.0).l(x, 11.0)),
+            );
+            parts
+        }
         IconKind::PaintBucket => vec![
             // A tilted bucket (a diamond), the paint line across it, and
             // the drop pouring from its corner.
