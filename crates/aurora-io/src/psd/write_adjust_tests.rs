@@ -673,3 +673,91 @@ fn the_verifier_catches_a_wrong_adjustment_block_or_readback() {
         "{err:?}"
     );
 }
+
+/// The Colorize hue is stored signed, as Photoshop does: 180 stays, 181 is
+/// written as -179, and both read back as the angle they were.
+#[test]
+fn the_colorize_hue_is_signed_across_the_180_boundary() {
+    for (hue, stored) in [(0.0_f32, 0_i16), (180.0, 180), (181.0, -179), (359.0, -1)] {
+        let params = ok(HueSaturationParams::new(
+            0.0, 0.0, 0.0, true, hue, 50.0, 0.0,
+        ));
+        let encoded = encode_adjustment(&Adjustment::HueSaturation(params));
+        let Ok(encoded) = encoded else {
+            unreachable!("{hue}: {encoded:?}")
+        };
+        // Header (version, colorize byte, pad), then the Colorize hue.
+        let at = encoded
+            .data
+            .get(4..6)
+            .and_then(|b| <[u8; 2]>::try_from(b).ok());
+        assert_eq!(at.map(i16::from_be_bytes), Some(stored), "hue {hue}");
+        assert!(!encoded.rounding.rounded, "hue {hue}");
+        assert_eq!(
+            encoded.readback,
+            Adjustment::HueSaturation(params),
+            "hue {hue}"
+        );
+    }
+}
+
+/// Colorize on with colour-range adjustments: the ranges are written (the
+/// file keeps them) but Aurora's reader drops them, so the save report says
+/// so; a Colorize layer with neutral ranges, and a ranged layer without
+/// Colorize, say nothing.
+#[test]
+fn colorize_with_range_adjustments_is_reported_as_not_kept_on_reopen() {
+    let ranged = |colorize: bool| {
+        let base = ok(HueSaturationParams::new(
+            0.0, 0.0, 0.0, colorize, 200.0, 40.0, 0.0,
+        ));
+        let mut ranges = [HueRange::standard(0); 6];
+        for (i, slot) in ranges.iter_mut().enumerate() {
+            *slot = HueRange::standard(i);
+        }
+        ranges[1] = ok(HueRange::new(
+            aurora_core::DEFAULT_HUE_RANGE_EDGES[1],
+            20.0,
+            -10.0,
+            0.0,
+        ));
+        HueSaturationRangesParams::new(base, ranges)
+    };
+    let report_of = |adjustment: Adjustment| {
+        let mut tree = LayerTree::new();
+        ok(tree.add_pixel_layer("A", rect(0, 0, 4, 4), None));
+        ok(tree.add_adjustment_layer_at("H", adjustment, None, 0));
+        ok(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default())).items
+    };
+    let items = report_of(Adjustment::from_hue_saturation(ranged(true)));
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(
+        items
+            .iter()
+            .any(|i| i.contains("Aurora ignores them while Colorize is on")),
+        "{items:?}"
+    );
+    assert_eq!(
+        report_of(Adjustment::from_hue_saturation(ranged(false))),
+        Vec::<String>::new()
+    );
+    let neutral = HueSaturationRangesParams::plain(ok(HueSaturationParams::new(
+        0.0, 0.0, 0.0, true, 200.0, 40.0, 0.0,
+    )));
+    assert_eq!(
+        report_of(Adjustment::from_hue_saturation(neutral)),
+        Vec::<String>::new()
+    );
+
+    // The file does hold the range, and Aurora reads the layer back without it.
+    let encoded = encode_adjustment(&Adjustment::from_hue_saturation(ranged(true)));
+    let Ok(encoded) = encoded else { unreachable!() };
+    assert!(encoded.rounding.colorize_ranges);
+    let Adjustment::HueSaturation(plain) = encoded.readback else {
+        unreachable!("Colorize reads back without ranges")
+    };
+    assert!(plain.colorize());
+    // Yellows' record: edges 15 45 75 105 then hue 20, saturation -10.
+    let tail = [0, 15, 0, 45, 0, 75, 0, 105, 0, 20, 255, 246];
+    assert!(encoded.data.windows(tail.len()).any(|w| w == tail));
+}

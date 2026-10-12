@@ -95,8 +95,9 @@
 //!   since the path is not kept. Feather (user or vector) is reported,
 //!   not applied; layer effects, blending ranges ("Blend If")
 //!   and knockout are not applied either.
-//!   Curves adjustment layers (`curv`, 0.158.0) are imported as real
-//!   `aurora_doc::Adjustment::Curves` layers ([`PsdNode::Adjustment`]);
+//!   Curves (`curv`, 0.158.0), Levels (`levl`, 0.202.0) and Hue/Saturation
+//!   (`hue2`, 0.203.0/0.204.0) adjustment layers are imported as real
+//!   `aurora_doc::Adjustment` layers ([`PsdNode::Adjustment`]);
 //!   every other adjustment kind, a Grayscale file's Curves, and fill
 //!   layers with no pixels are left out; text,
 //!   smart-object and shape layers open as their stored pixels. Every
@@ -111,8 +112,9 @@
 //!   would pass the pool's bounds is not kept, and is reported as before.
 //! - Writing (0.176.0) is a separate module, [`write`](mod@write): 16-bit
 //!   RGB PSD, reachable from the app's Save As (0.177.0); pixel layers,
-//!   groups and user masks on layers and groups (0.178.0). Curves and
-//!   PSB are refused.
+//!   groups and user masks on layers and groups (0.178.0), locks,
+//!   clipping, preserved smart objects and Curves, Levels and
+//!   Hue/Saturation adjustment layers (0.205.0). PSB is refused.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;

@@ -269,8 +269,13 @@ golden-image tests are `#[ignore]`d.
   written already inverted), locks, clipping bytes and preserved smart objects.
   It writes beside the target, verifies by reopening, then renames; a
   "Save With Changes?" list is shown before anything lossy, and a lossy save
-  is a copy (the document stays unsaved). **Refused for now**: Curves,
-  Levels and Hue/Saturation layers, PSB, and canvases over 30,000 px.
+  is a copy (the document stays unsaved). **Refused**: PSB and canvases
+  over 30,000 px (an adjustment layer only if its rounded values would not read
+  back). Curves, Levels and Hue/Saturation layers are written as adjustment layers
+  (0.205.0); values finer than the file (curve points off the 8-bit grid, a Levels
+  gamma beyond hundredths, fractional Hue/Saturation values, custom edges on a
+  neutral colour range) are rounded and itemised in the list, and so are colour-range
+  adjustments under Colorize, which Aurora itself does not keep on reopen.
 - **Smart objects** (0.200.0): a smart object layer opens as ordinary pixels
   (Aurora neither renders nor edits the embedded file), but its embedded file
   and placement blocks are held byte for byte and written back on a `.psd`

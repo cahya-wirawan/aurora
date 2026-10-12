@@ -60,6 +60,7 @@ const LVLS_TOTAL: u16 = 62;
 
 /// What had to change for the file to hold an adjustment.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // four independent facts about one layer
 pub(super) struct Rounding {
     /// A value was rounded to the file's resolution.
     pub rounded: bool,
@@ -68,6 +69,9 @@ pub(super) struct Rounding {
     /// A colour range with custom edges that adjusts nothing was written
     /// with Photoshop's standard edges.
     pub ranges_reset: bool,
+    /// Colorize is on and a colour range adjusts something: the ranges are
+    /// written, but Aurora's reader drops them again (Colorize has none).
+    pub colorize_ranges: bool,
 }
 
 /// One adjustment's tagged block, ready to write.
@@ -132,6 +136,7 @@ pub(super) fn encode_adjustment(
             let Some(params) = adjustment.hue_saturation() else {
                 return Err("its Hue/Saturation settings are unreadable");
             };
+            rounding.colorize_ranges = params.base().colorize() && !params.ranges_adjust_nothing();
             (
                 *b"hue2",
                 encode_hue2(params.base(), params.ranges(), &mut rounding),

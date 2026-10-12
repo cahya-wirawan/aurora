@@ -36701,6 +36701,12 @@ mod tests {
                 before.len(),
                 outcome.report.items
             );
+            // Nothing in these files needs rounding, so the save is lossless.
+            assert!(
+                outcome.report.items.is_empty(),
+                "{relative}: {:?}",
+                outcome.report.items
+            );
             assert_eq!(before.len(), after.len(), "{relative}: adjustment count");
             assert!(!before.is_empty(), "{relative}");
             assert_eq!(
@@ -36718,9 +36724,10 @@ mod tests {
                 roundtrip_mean.iter().all(|&m| m <= 0.05),
                 "{relative}: {roundtrip_mean:?}"
             );
-            if relative.contains("curves") || relative.contains("levels") {
-                assert_eq!(before, after, "{relative}: parameters survive exactly");
-            }
+            // Every kind survives exactly: the open already gives a colour
+            // range that adjusts nothing the standard edges, the only thing
+            // the writer normalises.
+            assert_eq!(before, after, "{relative}: parameters survive exactly");
         }
         if ran == 0 {
             eprintln!("not run: corpus absent");

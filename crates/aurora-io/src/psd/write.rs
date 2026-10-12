@@ -292,6 +292,9 @@ struct Losses {
     curve_merged: usize,
     /// Hue/Saturation layers with custom edges on a neutral range.
     hue_ranges_reset: usize,
+    /// Hue/Saturation layers with Colorize on and colour-range adjustments
+    /// (Aurora's reader does not keep the ranges of a Colorize layer).
+    hue_colorize_ranges: usize,
     clipped: u64,
     nan: u64,
     /// The written layers add up to more than the reader's
@@ -319,6 +322,7 @@ impl Losses {
         }
         self.curve_merged += usize::from(rounding.merged_points);
         self.hue_ranges_reset += usize::from(rounding.ranges_reset);
+        self.hue_colorize_ranges += usize::from(rounding.colorize_ranges);
     }
 }
 
@@ -389,6 +393,7 @@ impl Losses {
         items
     }
 
+    #[allow(clippy::too_many_lines)] // one linear list of report lines
     fn report(self) -> PsdWriteReport {
         let mut items = Vec::new();
         if self.long_names > 0 {
@@ -452,6 +457,17 @@ impl Losses {
                  Photoshop's standard edges.",
                 plural(
                     self.hue_ranges_reset as u64,
+                    "Hue/Saturation layer's",
+                    "Hue/Saturation layers'"
+                )
+            ));
+        }
+        if self.hue_colorize_ranges > 0 {
+            items.push(format!(
+                "{} colour-range adjustments are saved in the file, but Aurora ignores them \
+                 while Colorize is on and will not keep them when it reopens the file.",
+                plural(
+                    self.hue_colorize_ranges as u64,
                     "Hue/Saturation layer's",
                     "Hue/Saturation layers'"
                 )
@@ -723,8 +739,10 @@ fn refused(refusal: PsdSaveRefusal) -> IoError {
 ///
 /// The first refusal that applies, in this order: PSB, an empty or
 /// oversize canvas (over 30,000 px on either side: "use .psb"), no
-/// layers, groups nested deeper than [`super::MAX_GROUP_DEPTH`], Curves
-/// layers, more than 32,767 records (a group takes two).
+/// layers, groups nested deeper than [`super::MAX_GROUP_DEPTH`], an
+/// adjustment layer whose rounded values would not read back
+/// ([`PsdSaveRefusal::AdjustmentNotRepresentable`]), more than 32,767
+/// records (a group takes two).
 pub fn psd_save_preflight(
     layers: &LayerTree,
     canvas: (u32, u32),
@@ -784,8 +802,10 @@ fn preflight_losses(
 
 /// Counts `ids` (siblings, enclosed by `depth` groups) and everything
 /// below them: records (a group is two, its divider and its folder),
-/// Curves layers, nesting past [`MAX_GROUP_DEPTH`] — not descended into
-/// — and the structural losses. Recursion is bounded by
+/// the first adjustment layer the file cannot hold
+/// ([`PsdSaveRefusal::AdjustmentNotRepresentable`]), nesting past
+/// [`MAX_GROUP_DEPTH`] — not descended into — and the structural losses
+/// (including each adjustment's rounding). Recursion is bounded by
 /// [`MAX_GROUP_DEPTH`] + 1.
 fn census_of(
     layers: &LayerTree,
