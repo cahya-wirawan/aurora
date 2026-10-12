@@ -14,7 +14,7 @@ use half::f16;
 
 use super::test_writer::{TestLayer, TestPsd, pack_bits};
 use super::{
-    CurvBlock, CurvRefusal, HueBlock, LevlRecord, Note, curves_params, hue_saturation_params,
+    CurvBlock, CurvRefusal, HueBlock, LevlRecord, Note, curves_params, hue_saturation_adjustment,
     levels_params, parse_curv, parse_hue2, parse_levl,
 };
 use super::{
@@ -5408,6 +5408,17 @@ fn hue_file(block: &[u8], tweak: impl FnOnce(&mut TestLayer)) -> TestPsd {
     })
 }
 
+/// The master/Colorize settings of an imported block (either variant).
+fn hue_saturation_params(
+    block: &HueBlock,
+    gray: bool,
+) -> Result<aurora_core::HueSaturationParams, Note> {
+    hue_saturation_adjustment(block, gray).and_then(|a| match a.hue_saturation() {
+        Some(p) => Ok(*p.base()),
+        None => Err(Note::HueSaturationUnreadable),
+    })
+}
+
 fn hue_block(bytes: &[u8]) -> HueBlock {
     match parse_hue2(bytes) {
         Ok(block) => block,
@@ -5420,7 +5431,7 @@ fn hue2_block_layout_matches_the_documented_structure() {
     let block = hue2_plain([-27, 12, 10]);
     assert_eq!(block.len(), 100);
     let parsed = hue_block(&block);
-    assert!(!parsed.colorize && !parsed.ranges_adjust);
+    assert!(!parsed.colorize && parsed.ranges.iter().all(|r| r.1 == (0, 0, 0)));
     assert_eq!(parsed.master, (-27, 12, 10));
     assert_eq!(parsed.colorization, (0, 25, 0));
     let params = match hue_saturation_params(&parsed, false) {
@@ -5479,33 +5490,79 @@ fn hue2_block_layout_matches_the_documented_structure() {
 }
 
 #[test]
-fn hue2_ranges_with_adjustments_are_left_out_unless_colorize_ignores_them() {
+fn hue2_ranges_import_with_their_edges_and_neutral_ones_stay_plain() {
     let mut ranges = [HUE_NEUTRAL_RANGE; 6];
-    // Boundaries alone (no settings) do not count as an adjustment.
+    // Boundaries alone (no settings) do not count as an adjustment: the
+    // plain 0.203.0 variant, standard edges.
     if let Some(slot) = ranges.get_mut(2) {
         *slot = ([315, 345, 15, 90], [0, 0, 0]);
     }
     let neutral = hue_block(&hue2_block(0, [0, 25, 0], [5, 0, 0], ranges));
-    assert!(!neutral.ranges_adjust);
-    assert!(hue_saturation_params(&neutral, false).is_ok());
-    // Each of the three settings of any one of the six records counts.
+    assert!(matches!(
+        hue_saturation_adjustment(&neutral, false),
+        Ok(aurora_doc::Adjustment::HueSaturation(_))
+    ));
+    // Each of the three settings of any one of the six records imports
+    // as the ranged variant, with that record's edges and value.
     for record in 0..6 {
         for setting in 0..3 {
             let mut r = [HUE_NEUTRAL_RANGE; 6];
-            if let Some(slot) = r.get_mut(record).and_then(|rec| rec.1.get_mut(setting)) {
-                *slot = -1;
+            if let Some(rec) = r.get_mut(record) {
+                rec.0 = [303, 4, 82, 175];
+                if let Some(slot) = rec.1.get_mut(setting) {
+                    *slot = -17;
+                }
             }
-            let block = hue_block(&hue2_block(0, [0, 25, 0], [0; 3], r));
-            assert!(block.ranges_adjust, "{record} {setting}");
-            assert_eq!(
-                hue_saturation_params(&block, false),
-                Err(Note::HueSaturationRanges)
-            );
+            let block = hue_block(&hue2_block(0, [0, 25, 0], [7, 0, 0], r));
+            let Ok(aurora_doc::Adjustment::HueSaturationRanges(p)) =
+                hue_saturation_adjustment(&block, false)
+            else {
+                unreachable!("{record} {setting}: ranged");
+            };
+            assert_eq!(p.base().hue(), 7.0);
+            for (i, range) in p.ranges().iter().enumerate() {
+                if i == record {
+                    assert_eq!(range.edges(), [303.0, 4.0, 82.0, 175.0]);
+                    let got = [range.hue(), range.saturation(), range.lightness()];
+                    let mut want = [0.0; 3];
+                    if let Some(slot) = want.get_mut(setting) {
+                        *slot = -17.0;
+                    }
+                    assert_eq!(got, want, "{record} {setting}");
+                } else {
+                    assert_eq!(*range, aurora_core::HueRange::standard(i));
+                }
+            }
             // Colorize has no ranges: they are ignored there.
             let block = hue_block(&hue2_block(1, [10, 50, 0], [0; 3], r));
-            assert!(hue_saturation_params(&block, false).is_ok());
+            assert!(matches!(
+                hue_saturation_adjustment(&block, false),
+                Ok(aurora_doc::Adjustment::HueSaturation(_))
+            ));
         }
     }
+}
+
+#[test]
+fn hue2_range_values_and_edges_outside_the_rules_are_unreadable() {
+    let bad = |edges: [i16; 4], settings: [i16; 3]| {
+        let mut r = [HUE_NEUTRAL_RANGE; 6];
+        if let Some(slot) = r.get_mut(1) {
+            *slot = (edges, settings);
+        }
+        let block = hue_block(&hue2_block(0, [0, 25, 0], [0; 3], r));
+        hue_saturation_adjustment(&block, false)
+    };
+    assert!(bad([15, 45, 75, 105], [181, 0, 0]).is_err());
+    assert!(bad([15, 45, 75, 105], [0, -101, 0]).is_err());
+    assert!(bad([15, 45, 75, 105], [0, 0, 101]).is_err());
+    assert!(bad([15, 45, 75, 361], [0, 0, 1]).is_err());
+    assert!(bad([-1, 45, 75, 105], [0, 0, 1]).is_err());
+    // Wraps around more than once.
+    assert!(bad([0, 200, 100, 300], [0, 0, 1]).is_err());
+    // A neutral record's junk edges are ignored.
+    assert!(bad([0, 200, 100, 300], [0, 0, 0]).is_ok());
+    assert!(bad([15, 45, 75, 105], [180, -100, 100]).is_ok());
 }
 
 #[test]
@@ -5603,11 +5660,7 @@ fn a_hue_saturation_layer_opens_as_an_adjustment_and_is_not_reported() {
 /// Layers the reader cannot honour are left out and named in the report,
 /// each with its own line.
 #[test]
-fn hue_saturation_reporting_covers_ranges_unreadable_and_grayscale() {
-    let mut ranged = [HUE_NEUTRAL_RANGE; 6];
-    if let Some(slot) = ranged.get_mut(0) {
-        *slot = ([315, 345, 15, 90], [19, 14, 26]);
-    }
+fn hue_saturation_reporting_covers_unreadable_and_grayscale() {
     for (what, block, needle) in [
         (
             "short",
@@ -5618,11 +5671,6 @@ fn hue_saturation_reporting_covers_ranges_unreadable_and_grayscale() {
             "out of range",
             hue2_plain([200, 0, 0]),
             "outside the ranges",
-        ),
-        (
-            "ranges",
-            hue2_block(0, [0, 25, 0], [0; 3], ranged),
-            "individual colour ranges",
         ),
     ] {
         let document = doc(&hue_file(&block, |_| {}).write());
@@ -5637,4 +5685,42 @@ fn hue_saturation_reporting_covers_ranges_unreadable_and_grayscale() {
             "{what}: only the pixel layer remains"
         );
     }
+}
+
+/// 0.204.0: through the real reader, a layer with an adjusting range
+/// opens as `Adjustment::HueSaturationRanges` and is no longer reported
+/// as left out.
+#[test]
+fn a_ranged_hue_saturation_layer_opens_as_an_adjustment_and_is_not_reported() {
+    let mut r = [HUE_NEUTRAL_RANGE; 6];
+    if let Some(slot) = r.get_mut(0) {
+        *slot = ([303, 4, 82, 175], [19, 14, 26]);
+    }
+    let bytes = hue_file(&hue2_block(0, [0, 25, 0], [-27, 0, 10], r), |_| {}).write();
+    let document = doc(&bytes);
+    let Some(&group) = document.layers.roots().first() else {
+        unreachable!("a group");
+    };
+    let top = document
+        .layers
+        .children(group)
+        .unwrap_or(&[])
+        .first()
+        .copied();
+    let Some(top) = top else {
+        unreachable!("children");
+    };
+    let Some(aurora_doc::Adjustment::HueSaturationRanges(p)) = document.layers.adjustment(top)
+    else {
+        unreachable!("ranged");
+    };
+    assert_eq!(p.base().hue(), -27.0);
+    let first = p.range(0).copied();
+    assert_eq!(first.map(|r| r.edges()), Some([303.0, 4.0, 82.0, 175.0]));
+    assert_eq!(
+        first.map(|r| (r.hue(), r.saturation(), r.lightness())),
+        Some((19.0, 14.0, 26.0))
+    );
+    let items = document.report.items.join("\n");
+    assert!(!items.contains("Hue/Saturation"), "{items}");
 }

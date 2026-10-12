@@ -1,8 +1,8 @@
 //! The parameters of a Hue/Saturation adjustment (0.203.0): Photoshop's
 //! master Hue, Saturation and Lightness sliders and its Colorize mode.
-//! The per-range adjustments (reds, yellows, greens, cyans, blues,
-//! magentas) are **not** modelled: a file that uses them is left out on
-//! import rather than flattened (see `aurora-io`).
+//! This type holds only the master and Colorize settings; the
+//! per-range adjustments (reds, yellows, greens, cyans, blues, magentas)
+//! live in [`crate::HueSaturationRangesParams`] (`hue_ranges.rs`).
 //!
 //! It lives in `aurora-core`, beside [`crate::LevelsParams`], so
 //! `aurora-doc` can store it in a layer while `aurora-filters` applies it.
@@ -398,6 +398,12 @@ mod tests {
         assert_eq!(with(4, -1.0), Err(E::ColorizeSaturation));
         assert_eq!(with(4, 100.5), Err(E::ColorizeSaturation));
         assert_eq!(with(5, 101.0), Err(E::ColorizeLightness));
+        // 0.204.0 judge nits: the half-step boundaries and exactly +-100.
+        assert_eq!(with(5, 100.5), Err(E::ColorizeLightness));
+        assert_eq!(with(5, -100.5), Err(E::ColorizeLightness));
+        assert!(P::new(0.0, 100.0, 100.0, false, 0.0, 25.0, 0.0).is_ok());
+        assert!(P::new(0.0, -100.0, -100.0, false, 0.0, 25.0, 0.0).is_ok());
+        assert!(P::new(0.0, 0.0, 0.0, true, 0.0, 25.0, 100.0).is_ok());
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             for i in 0..6 {
                 assert_eq!(with(i, bad), Err(E::NotFinite), "{i} {bad}");

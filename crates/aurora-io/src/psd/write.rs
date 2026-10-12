@@ -754,7 +754,10 @@ fn census_of(
             }
             Some(LayerKind::Adjustment(aurora_doc::Adjustment::Curves(_))) => census.curves += 1,
             Some(LayerKind::Adjustment(aurora_doc::Adjustment::Levels(_))) => census.levels += 1,
-            Some(LayerKind::Adjustment(aurora_doc::Adjustment::HueSaturation(_))) => {
+            Some(LayerKind::Adjustment(
+                aurora_doc::Adjustment::HueSaturation(_)
+                | aurora_doc::Adjustment::HueSaturationRanges(_),
+            )) => {
                 census.hue_saturation += 1;
             }
             Some(LayerKind::Pixel { .. }) | None => {}
@@ -1171,9 +1174,10 @@ fn plan_layer(
             Some(LayerKind::Adjustment(aurora_doc::Adjustment::Levels(_))) => {
                 PsdSaveRefusal::LevelsNotYetSupported { count: 1 }
             }
-            Some(LayerKind::Adjustment(aurora_doc::Adjustment::HueSaturation(_))) => {
-                PsdSaveRefusal::HueSaturationNotYetSupported { count: 1 }
-            }
+            Some(LayerKind::Adjustment(
+                aurora_doc::Adjustment::HueSaturation(_)
+                | aurora_doc::Adjustment::HueSaturationRanges(_),
+            )) => PsdSaveRefusal::HueSaturationNotYetSupported { count: 1 },
             _ => PsdSaveRefusal::CurvesNotYetSupported { count: 1 },
         }));
     };

@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-12, version 0.203.0.** This file is updated every round (every
+**As of 2026-10-12, version 0.204.0.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -217,9 +217,10 @@ golden-image tests are `#[ignore]`d.
   (Hue, Saturation, Lightness sliders, a Colorize checkbox with its own three
   sliders; whole numbers only), per-pixel HSL math on encoded RGB (a non-identity
   setting clamps the backdrop to [0, 1], so float values above 1 are clipped), `hue2`
-  layers imported (Master and Colorize only). **Per-colour-range adjustments
-  (reds, yellows, ...) are not implemented**: a PSD layer that uses them is left
-  out with a report line. **CPU compositing only** (a visible Hue/Saturation
+  layers imported. **Per-colour-range adjustments (0.204.0)**: a range selector
+  (Master, Reds ... Magentas) re-binds the three sliders; ranges render by a
+  fitted model (see PLAN.md) and PSD layers using them import, with the edges
+  the file stores (edges are not editable in the UI). **CPU compositing only** (a visible Hue/Saturation
   layer refuses the GPU path); **PSD save of Hue/Saturation layers is
   refused**. Against Photoshop's merged image: Colorize layers match to a mean
   of about 0.4-0.5 levels (max 3); a master-only layer is about 1-1.4 levels on
@@ -412,7 +413,7 @@ small machines has not been measured on a real small machine.
   0.75 s alone to 1.1-1.25 s beside the pool (contention, not investigated).
 
 **Adjustments, filters, tools**
-- Adjustments: Curves, Levels and Hue/Saturation (Master and Colorize only). No filters,
+- Adjustments: Curves, Levels and Hue/Saturation (Master, Colorize and the six colour ranges as a fitted CPU model; range edges are not editable in the UI). No filters,
   selection tools beyond a raw data model, smart-object editing, RAW import,
   plugins, scripting or AI (`aurora-ai`, `aurora-plugin`, `aurora-cli` are
   skeletons).
@@ -444,8 +445,9 @@ small machines has not been measured on a real small machine.
 ## Known gaps and next steps
 
 - **Adjustment queue approved by the design owner is done** (Levels 0.202.0,
-  Hue/Saturation 0.203.0). Open follow-ups: Hue/Saturation per-colour-range
-  adjustments, PSD save of Curves/Levels/Hue/Saturation layers, a GPU path for
+  Hue/Saturation 0.203.0, its per-colour-range adjustments 0.204.0). Open
+  follow-ups: the master Lightness slider should blend towards white in RGB
+  (PLAN.md, 0.204.0), range edge editing, PSD save of Curves/Levels/Hue/Saturation layers, a GPU path for
   Levels and Hue/Saturation, and a histogram behind the Levels sliders.
 - **Next in the performance line**: anchor the composite grid to the document.
 - **Phase 1 gate (M1.10)** remains open on hardware (accessibility and IME
