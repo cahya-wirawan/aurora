@@ -700,6 +700,19 @@ fn preflight_refuses_curves_and_oversize_but_not_groups_or_masks() {
         Err(PsdSaveRefusal::CurvesNotYetSupported { count: 1 })
     );
 
+    // 0.202.0: Levels layers are refused the same way, counted apart.
+    let mut levels = base();
+    ok(levels.add_adjustment_layer_at(
+        "L",
+        Adjustment::Levels(aurora_core::LevelsParams::identity()),
+        None,
+        0,
+    ));
+    assert_eq!(
+        psd_save_preflight(&levels, (4, 4), opts),
+        Err(PsdSaveRefusal::LevelsNotYetSupported { count: 1 })
+    );
+
     for canvas in [(30_001, 10), (10, 30_001)] {
         let refusal = psd_save_preflight(&tree, canvas, opts);
         let Err(refusal) = refusal else {

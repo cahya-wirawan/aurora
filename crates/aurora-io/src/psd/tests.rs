@@ -13,7 +13,9 @@ use aurora_doc::{BlendMode, LayerId, LayerKind, LayerTree};
 use half::f16;
 
 use super::test_writer::{TestLayer, TestPsd, pack_bits};
-use super::{CurvBlock, CurvRefusal, Note, curves_params, parse_curv};
+use super::{
+    CurvBlock, CurvRefusal, LevlRecord, Note, curves_params, levels_params, parse_curv, parse_levl,
+};
 use super::{
     MAX_GROUP_DEPTH, PIXEL_BUDGET, PsdBlend, PsdDocument, PsdFile, PsdNode, blend_for_key, decode,
     read, unpack_bits,
@@ -652,7 +654,7 @@ fn extra_channels_and_adjustment_layers_are_reported() {
                     l.clipping = 1;
                     l.blocks.push((*b"lfx2", vec![0; 8]));
                 }),
-                TestLayer::empty("Levels 1").with(|l| l.blocks.push((*b"levl", vec![0; 4]))),
+                TestLayer::empty("Levels 1").with(|l| l.blocks.push((*b"brit", vec![0; 4]))),
                 TestLayer::empty("Color Fill").with(|l| l.blocks.push((*b"SoCo", vec![0; 4]))),
             ];
         })
@@ -968,6 +970,22 @@ fn sweep_fixtures() -> Vec<Vec<u8>> {
     // 0.158.0: a Curves layer (legacy curves and `Crv ` extra data, a
     // moved endpoint, a mask) inside a Pass Through group, over pixels.
     files.push(curves_file(&curv_rgb_block(), |_| {}).write());
+    // 0.202.0: a Levels layer with the `Lvls` extension and a mask.
+    files.push(
+        levels_file(
+            &levl_block(
+                [
+                    (10, 240, 5, 250, 120),
+                    LEVL_IDENTITY,
+                    LEVL_IDENTITY,
+                    LEVL_IDENTITY,
+                ],
+                true,
+            ),
+            |_| {},
+        )
+        .write(),
+    );
     files
 }
 
@@ -1518,7 +1536,7 @@ fn the_merged_fallback_uses_merged_alpha_and_removes_the_white_matte() {
             // Every record left out, so the merged image is used.
             p.layers.push(
                 TestLayer::pixels("levels", 0, 0, 1, 1, 8, &[[0, 0, 0, 255]])
-                    .with(|l| l.blocks.push((*b"levl", vec![0; 4]))),
+                    .with(|l| l.blocks.push((*b"brit", vec![0; 4]))),
             );
             // c' = c*a + (1 - a), a = 128/255: c = 0, 1, ~0.5.
             p.merged = Some(vec![vec![127], vec![255], vec![191], vec![128]]);
@@ -2527,7 +2545,7 @@ fn a_grayscale_merged_fallback_reads_its_alpha_plane_as_alpha() {
             p.channels = 2;
             p.negative_count = true;
             p.layers
-                .push(TestLayer::empty("adj").with(|l| l.blocks.push((*b"levl", vec![0; 4]))));
+                .push(TestLayer::empty("adj").with(|l| l.blocks.push((*b"brit", vec![0; 4]))));
             p.merged = Some(vec![vec![60, 255], vec![255, 0]]);
         })
         .write();
@@ -4778,13 +4796,13 @@ fn curves_reporting_covers_pass_through_other_kinds_grayscale_and_refusals() {
         (
             "levels",
             curves_file(&curv_rgb_block(), |l| {
-                l.blocks = vec![(*b"levl", vec![0; 4])];
+                l.blocks = vec![(*b"brit", vec![0; 4])];
             }),
-            "1 adjustment layer (Levels, Hue/Saturation and similar) was left out",
+            "1 adjustment layer (Hue/Saturation and similar) was left out",
         ),
         (
-            "curv and levl",
-            curves_file(&curv_rgb_block(), |l| l.blocks.push((*b"levl", vec![0; 4]))),
+            "curv and brit",
+            curves_file(&curv_rgb_block(), |l| l.blocks.push((*b"brit", vec![0; 4]))),
             "1 adjustment layer",
         ),
         (
@@ -5095,6 +5113,242 @@ mod locks {
         assert!(
             locked,
             "the Background layer is locked as Photoshop locks it"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Levels (`levl`, 0.202.0)
+// ---------------------------------------------------------------------
+
+/// A `levl` block in the documented layout: version 2 then 29 records of
+/// five big-endian `u16` — input floor, input ceiling, output floor,
+/// output ceiling, gamma * 100. The first four are given (master, red,
+/// green, blue); the other 25 are Photoshop's defaults. `extra` appends
+/// the `Lvls` extension (signature, version 3, count, records).
+fn levl_block(first: [LevlRecord; 4], extra: bool) -> Vec<u8> {
+    let mut out = 2_u16.to_be_bytes().to_vec();
+    let default: LevlRecord = (0, 255, 0, 255, 100);
+    for i in 0..29 {
+        let record = first.get(i).copied().unwrap_or(default);
+        for v in [record.0, record.1, record.2, record.3, record.4] {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+    if extra {
+        out.extend_from_slice(b"Lvls");
+        out.extend_from_slice(&3_u16.to_be_bytes());
+        out.extend_from_slice(&33_u16.to_be_bytes());
+        for _ in 29..33 {
+            for v in [0_u16, 255, 0, 255, 100] {
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+    }
+    while !out.len().is_multiple_of(4) {
+        out.push(0);
+    }
+    out
+}
+
+const LEVL_IDENTITY: LevlRecord = (0, 255, 0, 255, 100);
+
+fn levels_file(block: &[u8], tweak: impl FnOnce(&mut TestLayer)) -> TestPsd {
+    let block = block.to_vec();
+    let levels = TestLayer::empty("Levels 1").with(|l| {
+        l.blocks.push((*b"levl", block));
+        l.mask = Some((0, 0, 2, 1, 255, 0));
+        l.channels.push((-2, vec![0, 255]));
+        tweak(l);
+    });
+    TestPsd::new(1, 2, 2, 8).with(|p| {
+        p.layers = vec![
+            TestLayer::divider(),
+            TestLayer::pixels("p", 0, 0, 2, 2, 8, &two_by_two(8)),
+            levels,
+            TestLayer::group("G", *b"pass"),
+        ];
+    })
+}
+
+/// The documented byte layout: 2 + 29 * 10 = 292 bytes, records in the
+/// order floor, ceiling, output floor, output ceiling, gamma.
+#[test]
+fn levl_block_layout_matches_the_documented_structure() {
+    let block = levl_block(
+        [
+            (5, 250, 10, 240, 150),
+            LEVL_IDENTITY,
+            LEVL_IDENTITY,
+            LEVL_IDENTITY,
+        ],
+        false,
+    );
+    assert_eq!(block.len(), 292);
+    assert_eq!(block.get(..2), Some([0_u8, 2].as_slice()), "version 2");
+    assert_eq!(
+        block.get(2..12),
+        Some([0_u8, 5, 0, 250, 0, 10, 0, 240, 0, 150].as_slice())
+    );
+    let Ok(parsed) = parse_levl(&block) else {
+        unreachable!("must parse");
+    };
+    assert_eq!(parsed.records.first(), Some(&(5, 250, 10, 240, 150)));
+    assert_eq!(parsed.records.get(3), Some(&LEVL_IDENTITY));
+    let params = match levels_params(&parsed, false) {
+        Ok(params) => params,
+        Err(note) => unreachable!("{note:?}"),
+    };
+    assert_eq!(params.master.input_black(), 5.0 / 255.0);
+    assert_eq!(params.master.input_white(), 250.0 / 255.0);
+    assert_eq!(params.master.output_black(), 10.0 / 255.0);
+    assert_eq!(params.master.output_white(), 240.0 / 255.0);
+    assert_eq!(params.master.gamma(), 1.5);
+    assert!(params.red.is_identity() && params.green.is_identity() && params.blue.is_identity());
+    // A Grayscale file's Levels are left out (as Curves are).
+    assert_eq!(levels_params(&parsed, true), Err(Note::LevelsGrayscale));
+    // The extension is ignored, with or without it the same.
+    assert_eq!(
+        parse_levl(&levl_block(
+            [
+                (5, 250, 10, 240, 150),
+                LEVL_IDENTITY,
+                LEVL_IDENTITY,
+                LEVL_IDENTITY
+            ],
+            true
+        )),
+        Ok(parsed)
+    );
+}
+
+#[test]
+fn levl_hostile_and_short_data_is_unreadable_never_a_panic() {
+    let good = levl_block([LEVL_IDENTITY; 4], true);
+    // Every truncation: a document-length prefix parses (the extension is
+    // optional), anything shorter than version + 29 records does not.
+    for len in 0..good.len() {
+        let cut = good.get(..len).unwrap_or(&[]);
+        let parsed = parse_levl(cut);
+        if len < 292 {
+            assert_eq!(parsed, Err(()), "{len} bytes");
+        }
+    }
+    // Wrong versions.
+    for version in [0_u16, 1, 3, 0xFFFF] {
+        let mut bad = good.clone();
+        bad.splice(..2, version.to_be_bytes());
+        assert_eq!(parse_levl(&bad), Err(()), "version {version}");
+    }
+    // A record outside what Levels allows: the layer is reported, not
+    // imported repaired.
+    for first in [
+        (100, 100, 0, 255, 100), // equal input range
+        (200, 100, 0, 255, 100), // reversed
+        (0, 255, 0, 255, 5),     // gamma 0.05
+        (0, 255, 0, 255, 1000),  // gamma 10.0
+        (0, 300, 0, 255, 100),   // level above 255
+        (0, 255, 0, 255, 0),     // zero gamma
+    ] {
+        let parsed = parse_levl(&levl_block(
+            [first, LEVL_IDENTITY, LEVL_IDENTITY, LEVL_IDENTITY],
+            false,
+        ));
+        let Ok(parsed) = parsed else {
+            unreachable!("parses");
+        };
+        assert_eq!(
+            levels_params(&parsed, false),
+            Err(Note::LevelsUnreadable),
+            "{first:?}"
+        );
+    }
+    // Garbage bytes never panic.
+    let mut seed = 0x1234_5678_u32;
+    for _ in 0..200 {
+        let junk: Vec<u8> = (0..300)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                seed.to_be_bytes()[0]
+            })
+            .collect();
+        if let Ok(parsed) = parse_levl(&junk) {
+            let _ = levels_params(&parsed, false);
+        }
+    }
+}
+
+/// Through the real reader, a Levels layer becomes `Adjustment::Levels`
+/// with its opacity, blend mode, visibility and mask, and is no longer
+/// reported as left out.
+#[test]
+fn a_levels_layer_opens_as_a_levels_adjustment_and_is_not_reported() {
+    let block = levl_block(
+        [
+            (10, 240, 5, 250, 120),
+            LEVL_IDENTITY,
+            (0, 128, 0, 255, 100),
+            LEVL_IDENTITY,
+        ],
+        true,
+    );
+    let bytes = levels_file(&block, |l| {
+        l.opacity = 128;
+        l.blend = *b"mul ";
+        l.flags = 0x02;
+    })
+    .write();
+    let document = doc(&bytes);
+    let Some(&group) = document.layers.roots().first() else {
+        unreachable!("a group");
+    };
+    let children = document.layers.children(group).unwrap_or(&[]).to_vec();
+    let Some(&top) = children.first() else {
+        unreachable!("children");
+    };
+    let Some(aurora_doc::Adjustment::Levels(params)) = document.layers.adjustment(top) else {
+        unreachable!("the top child is the Levels layer");
+    };
+    assert_eq!(params.master.gamma(), 1.2);
+    assert_eq!(params.green.input_white(), 128.0 / 255.0);
+    assert_eq!(document.layers.opacity(top), Some(128.0 / 255.0));
+    assert_eq!(document.layers.blend_mode(top), Some(BlendMode::Multiply));
+    assert_eq!(document.layers.visible(top), Some(false));
+    assert!(document.layers.mask(top).is_some());
+    let items = document.report.items.join("\n");
+    assert!(!items.contains("adjustment layer"), "{items}");
+    assert!(!items.contains("Levels"), "{items}");
+}
+
+/// Unreadable or out-of-range Levels are left out and named in the report.
+#[test]
+fn levels_reporting_covers_unreadable_and_out_of_range() {
+    for (what, block, needle) in [
+        ("short", vec![0_u8, 2, 0, 0], "Levels layer was left out"),
+        (
+            "gamma",
+            levl_block(
+                [
+                    (0, 255, 0, 255, 5),
+                    LEVL_IDENTITY,
+                    LEVL_IDENTITY,
+                    LEVL_IDENTITY,
+                ],
+                false,
+            ),
+            "outside the ranges",
+        ),
+    ] {
+        let document = doc(&levels_file(&block, |_| {}).write());
+        let items = document.report.items.join("\n");
+        assert!(items.contains(needle), "{what}: {items}");
+        let Some(&group) = document.layers.roots().first() else {
+            unreachable!("a group");
+        };
+        assert_eq!(
+            document.layers.children(group).map(<[_]>::len),
+            Some(1),
+            "{what}"
         );
     }
 }

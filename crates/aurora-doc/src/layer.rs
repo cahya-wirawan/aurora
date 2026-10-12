@@ -68,6 +68,12 @@ pub enum Adjustment {
     /// per-channel curves ([`aurora_core::CurvesParams`]), applied by
     /// `aurora_filters::CurvesLut`.
     Curves(aurora_core::CurvesParams),
+    /// Photoshop-model Levels (0.202.0): a master record plus one per
+    /// colour channel ([`aurora_core::LevelsParams`]), applied by
+    /// `aurora_filters::LevelsLut`. **Appended after `Curves`** (ordinal
+    /// 1): every file written before 0.202.0 holds only ordinal 0, and an
+    /// older build refuses a file using this variant (ADR 0009).
+    Levels(aurora_core::LevelsParams),
 }
 
 impl Adjustment {
@@ -76,6 +82,7 @@ impl Adjustment {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Curves(_) => "Curves",
+            Self::Levels(_) => "Levels",
         }
     }
 }
@@ -727,6 +734,63 @@ mod adjustment_wire_tests {
             Ok(decoded) => assert_eq!(decoded, curves),
             Err(err) => unreachable!("{err:?}"),
         }
+    }
+}
+
+/// `Adjustment::Levels` is appended after `Curves`, so every pre-0.202.0
+/// encoding still decodes and an older reader refuses a Levels layer
+/// rather than opening it without the adjustment (0.202.0, ADR 0009).
+#[cfg(test)]
+mod levels_wire_tests {
+    use super::{Adjustment, LayerKind};
+
+    /// `Adjustment` exactly as it was before 0.202.0 (one variant).
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum OldAdjustment {
+        Curves(aurora_core::CurvesParams),
+    }
+
+    /// `LayerKind` as an older build declares it.
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum OldLayerKind {
+        Pixel { bounds: aurora_core::Rect },
+        Group { children: Vec<super::LayerId> },
+        Adjustment(OldAdjustment),
+    }
+
+    #[test]
+    fn curves_bytes_are_unchanged_and_an_old_reader_refuses_levels() {
+        let curves =
+            LayerKind::Adjustment(Adjustment::Curves(aurora_core::CurvesParams::identity()));
+        let old =
+            OldLayerKind::Adjustment(OldAdjustment::Curves(aurora_core::CurvesParams::identity()));
+        let (Ok(new_bytes), Ok(old_bytes)) =
+            (postcard::to_allocvec(&curves), postcard::to_allocvec(&old))
+        else {
+            unreachable!("encodes");
+        };
+        assert_eq!(new_bytes, old_bytes, "a Curves layer encodes unchanged");
+        assert!(postcard::from_bytes::<OldLayerKind>(&new_bytes).is_ok());
+
+        let levels =
+            LayerKind::Adjustment(Adjustment::Levels(aurora_core::LevelsParams::identity()));
+        let bytes = match postcard::to_allocvec(&levels) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            bytes.get(..2),
+            Some([2_u8, 1].as_slice()),
+            "ordinals 2 then 1"
+        );
+        match postcard::from_bytes::<LayerKind>(&bytes) {
+            Ok(decoded) => assert_eq!(decoded, levels),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        assert!(
+            postcard::from_bytes::<OldLayerKind>(&bytes).is_err(),
+            "an older build refuses the unknown Adjustment ordinal"
+        );
     }
 }
 

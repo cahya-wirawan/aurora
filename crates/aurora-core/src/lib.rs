@@ -12,6 +12,7 @@ pub mod effects;
 pub mod error;
 pub mod geometry;
 pub mod id;
+pub mod levels;
 pub mod tone_curve;
 
 pub use color::{Channels, ColorSpace, PixelFormat, SampleFormat};
@@ -20,6 +21,7 @@ pub use effects::LayerEffects;
 pub use error::CoreError;
 pub use geometry::{MAX_DOCUMENT_EXTENT, MAX_DOCUMENT_ORIGIN, Rect, Size};
 pub use id::{Id, IdGenerator};
+pub use levels::{GAMMA_MAX, GAMMA_MIN, LevelsChannel, LevelsError, LevelsParams, MIN_INPUT_SPAN};
 pub use tone_curve::{
     CurvePoint, MAX_LUT_LEN, MAX_POINTS, MIN_POINT_SEPARATION, MIN_POINTS, ToneCurve,
     ToneCurveError,

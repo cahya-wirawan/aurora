@@ -4785,6 +4785,63 @@ mod tests {
         }
     }
 
+    /// 0.202.0: a Levels adjustment layer, its edit and its history survive
+    /// a save and reopen (manifest and journal replay), with no manifest
+    /// version bump: the variant is appended after `Curves`.
+    #[test]
+    fn round_trips_a_levels_adjustment_layer_and_its_history() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        if let Err(err) = history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let record = match aurora_core::LevelsChannel::new(0.1, 0.9, 1.5, 0.05, 0.95) {
+            Ok(record) => record,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let params = aurora_core::LevelsParams {
+            red: record,
+            ..aurora_core::LevelsParams::identity()
+        };
+        let levels = match history.add_adjustment_layer_at(
+            &mut layers,
+            "Levels 1",
+            aurora_doc::Adjustment::Levels(aurora_core::LevelsParams::identity()),
+            None,
+            0,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let wanted = aurora_doc::Adjustment::Levels(params);
+        if let Err(err) = history.set_adjustment(&mut layers, levels, wanted.clone()) {
+            unreachable!("{err:?}");
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.into_inner()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(document.layers.adjustment(levels), Some(&wanted));
+        match document.history.replay() {
+            Ok(replayed) => assert_eq!(replayed.adjustment(levels), Some(&wanted)),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
     /// 0.198.0: a layer's and a group's locks survive a save and reopen —
     /// the manifest carries them and the journal replays to them — and an
     /// unlocked layer stays unlocked (an old file's layers read as none).
