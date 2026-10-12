@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-12, version 0.204.0.** This file is updated every round (every
+**As of 2026-10-12, version 0.205.0.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -211,8 +211,8 @@ golden-image tests are `#[ignore]`d.
   compositing only** (a visible Levels layer refuses the GPU path). On
   `adjustments/levels_rgb.psd` against Photoshop's merged image: max error
   (2, 2, 6) levels for R, G, B, mean (0.266, 0.247, 0.429); the maximum of 6 in
-  blue is not investigated. **PSD save of Levels layers is refused** (like
-  Curves). Not seen in the live window or on the Mac.
+  blue is not investigated. **PSD save of Levels layers works
+  (0.205.0)**. Not seen in the live window or on the Mac.
 - **Hue/Saturation** (0.203.0): New Hue/Saturation Layer, a Properties editor
   (Hue, Saturation, Lightness sliders, a Colorize checkbox with its own three
   sliders; whole numbers only), per-pixel HSL math on encoded RGB (a non-identity
@@ -221,8 +221,8 @@ golden-image tests are `#[ignore]`d.
   (Master, Reds ... Magentas) re-binds the three sliders; ranges render by a
   fitted model (see PLAN.md) and PSD layers using them import, with the edges
   the file stores (edges are not editable in the UI). **CPU compositing only** (a visible Hue/Saturation
-  layer refuses the GPU path); **PSD save of Hue/Saturation layers is
-  refused**. Against Photoshop's merged image: Colorize layers match to a mean
+  layer refuses the GPU path); **PSD save of Hue/Saturation layers works
+  (0.205.0)**: written as `hue2` adjustment layers, values rounded to whole numbers and itemised. Against Photoshop's merged image: Colorize layers match to a mean
   of about 0.4-0.5 levels (max 3); a master-only layer is about 1-1.4 levels on
   saturated pixels but tens of levels off on near-grey pixels at Saturation
   +100 (possibly the reconstructed backdrop, not the model); positive
@@ -269,8 +269,13 @@ golden-image tests are `#[ignore]`d.
   written already inverted), locks, clipping bytes and preserved smart objects.
   It writes beside the target, verifies by reopening, then renames; a
   "Save With Changes?" list is shown before anything lossy, and a lossy save
-  is a copy (the document stays unsaved). **Refused for now**: Curves,
-  Levels and Hue/Saturation layers, PSB, and canvases over 30,000 px.
+  is a copy (the document stays unsaved). **Refused**: PSB and canvases
+  over 30,000 px (an adjustment layer only if its rounded values would not read
+  back). Curves, Levels and Hue/Saturation layers are written as adjustment layers
+  (0.205.0); values finer than the file (curve points off the 8-bit grid, a Levels
+  gamma beyond hundredths, fractional Hue/Saturation values, custom edges on a
+  neutral colour range) are rounded and itemised in the list, and so are colour-range
+  adjustments under Colorize, which Aurora itself does not keep on reopen.
 - **Smart objects** (0.200.0): a smart object layer opens as ordinary pixels
   (Aurora neither renders nor edits the embedded file), but its embedded file
   and placement blocks are held byte for byte and written back on a `.psd`
@@ -447,7 +452,7 @@ small machines has not been measured on a real small machine.
 - **Adjustment queue approved by the design owner is done** (Levels 0.202.0,
   Hue/Saturation 0.203.0, its per-colour-range adjustments 0.204.0). Open
   follow-ups: the master Lightness slider should blend towards white in RGB
-  (PLAN.md, 0.204.0), range edge editing, PSD save of Curves/Levels/Hue/Saturation layers, a GPU path for
+  (PLAN.md, 0.204.0), range edge editing, a GPU path for
   Levels and Hue/Saturation, and a histogram behind the Levels sliders.
 - **Next in the performance line**: anchor the composite grid to the document.
 - **Phase 1 gate (M1.10)** remains open on hardware (accessibility and IME

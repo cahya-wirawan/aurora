@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks a PSD written by Aurora's PSD writer with psd-tools, an
 independent reader (0.176.0, PSD write round R1; groups and masks
-0.178.0, R3).
+0.178.0, R3; adjustment layers 0.205.0).
 
 Not part of the CI gate: it needs `psd-tools` and `numpy`
 (`pip install psd-tools`). Write the fixture first, then check it:
@@ -26,6 +26,7 @@ channel's own decompressed data — exactly, not within a tolerance.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -273,6 +274,143 @@ def check_clips(folder):
     print(f"OK: psd-tools read the clipping of {len(spec)} layers")
 
 
+def find_layer(psd, name):
+    for layer in psd.descendants():
+        if layer.name == name:
+            return layer
+    fail(f"adjustments: no layer {name}")
+
+
+def adjustment_summary(layer):
+    """The integers psd-tools reads from a layer's adjustment block."""
+    blocks = layer.tagged_blocks
+    if blocks is None:
+        return None
+    curves = blocks.get_data(Tag.CURVES)
+    if curves is not None:
+        return ("curves", sorted((i.channel_id, [tuple(p) for p in i.points]) for i in curves.extra))
+    levels = blocks.get_data(Tag.LEVELS)
+    if levels is not None:
+        return (
+            "levels",
+            [
+                (r.input_floor, r.input_ceiling, r.output_floor, r.output_ceiling, r.gamma)
+                for r in list(levels)[:4]
+            ],
+        )
+    hue = blocks.get_data(Tag.HUE_SATURATION)
+    if hue is not None:
+        return (
+            "hue",
+            (hue.enable, tuple(hue.colorization), tuple(hue.master),
+             [(tuple(a), tuple(b)) for a, b in hue.items]),
+        )
+    return None
+
+
+def check_adjustments(folder):
+    """0.205.0: Curves, Levels and Hue/Saturation layers read back.
+
+    `adjustments.psd` (written by the Rust fixture test
+    `adjustments_fixture_for_psd_tools`) must show the layer kinds psd-tools
+    names, the integers of `adjustments.json` in each block, and the
+    properties of the records around them (opacity, blend, visibility,
+    clipping, mask rectangle). `resave_*.psd` files kept by the app's
+    corpus test are compared with their originals when the corpus exists.
+    """
+    spec_path = folder / "adjustments.json"
+    if not spec_path.exists():
+        print("no adjustments.json: the adjustment pass was skipped")
+        return
+    want = json.loads(spec_path.read_text(encoding="utf-8"))
+    psd = PSDImage.open(folder / "adjustments.psd")
+    curves = find_layer(psd, "Curves A")
+    check("Curves A kind", curves.kind, "curves")
+    kind, items = adjustment_summary(curves)
+    check("Curves A block", kind, "curves")
+    got = {cid: [(i, o) for o, i in pts] for cid, pts in items}
+    check("Curves A composite", got.get(0), [tuple(p) for p in want["curves"]["composite"]])
+    check("Curves A blue", got.get(3), [tuple(p) for p in want["curves"]["blue"]])
+    check("Curves A curve channels", sorted(got), [0, 3])
+    check("Curves A opacity", curves.opacity, 128)
+    check("Curves A blend", curves.blend_mode.name, "MULTIPLY")
+    check("Curves A mask bbox", tuple(curves.mask.bbox), (2, 2, 12, 12))
+    levels = find_layer(psd, "Levels in group")
+    check("Levels kind", levels.kind, "levels")
+    check("Levels records", adjustment_summary(levels)[1], [tuple(r) for r in want["levels"]])
+    clipped = find_layer(psd, "Hue clipped")
+    check("Hue clipped kind", clipped.kind, "huesaturation")
+    check("Hue clipped clipping", bool(clipped.clipping), True)
+    check("Hue clipped master", adjustment_summary(clipped)[1][2], (10, -20, 5))
+    ranged = find_layer(psd, "Hue ranges")
+    check("Hue ranges kind", ranged.kind, "huesaturation")
+    check("Hue ranges visible", ranged.visible, False)
+    enable, colorization, master, ranges = adjustment_summary(ranged)[1]
+    check("Hue ranges colorize", enable, 0)
+    check("Hue ranges colorization", colorization, (0, 25, 0))
+    check("Hue ranges master", list(master), want["hue"]["master"])
+    check(
+        "Hue ranges records",
+        [[list(a), list(b)] for a, b in ranges],
+        want["hue"]["ranges"],
+    )
+    check("group member", find_layer(psd, "Levels in group").parent.name, "Group")
+    print("OK: psd-tools read the Curves, Levels and Hue/Saturation blocks and records")
+    check_resaves(folder)
+
+
+def check_resaves(folder):
+    """Each kept `resave_<name>.psd` against the original corpus file."""
+    corpus = Path(__file__).resolve().parent.parent / "corpora/psd/reference/psd-tools-fixtures"
+    if not corpus.exists():
+        print("not run: corpus absent (resaves)")
+        return
+    found = 0
+    for saved in sorted(folder.glob("resave_*.psd")):
+        name = saved.name[len("resave_"):]
+        matches = list(corpus.rglob(name))
+        if not matches:
+            continue
+        found += 1
+        original = PSDImage.open(matches[0])
+        resaved = PSDImage.open(saved)
+        a = [(l.name, l.kind, adjustment_summary(l)) for l in original.descendants()
+             if l.kind in ("curves", "levels", "huesaturation")]
+        b = [(l.name, l.kind, adjustment_summary(l)) for l in resaved.descendants()
+             if l.kind in ("curves", "levels", "huesaturation")]
+        check(f"{name} adjustment layers", sorted(x[:2] for x in a), sorted(x[:2] for x in b))
+        same = sum(1 for x in a if x in b)
+        # Merged images: psd-tools' own composite of each file's layers and
+        # the stored merged image of each file.
+        stored = np.asarray(resaved.topil().convert("RGB"), dtype=np.float64)
+        orig_stored = np.asarray(original.topil().convert("RGB"), dtype=np.float64)
+        try:
+            orig_img = np.asarray(original.composite(force=True).convert("RGB"), dtype=np.float64)
+            new_img = np.asarray(resaved.composite(force=True).convert("RGB"), dtype=np.float64)
+        except ImportError as error:
+            # psd-tools' own compositor needs scipy for some fills; not installed here.
+            orig_img = new_img = None
+            composite_note = f"psd-tools composite not run ({str(error).splitlines()[0]})"
+        def stats(x, y):
+            d = np.abs(x - y)
+            return f"max {d.max():.0f} mean {d.mean():.3f}"
+        line = (
+            f"  {name}: {len(a)} adjustment layers, {same} with identical integers;"
+            f" stored merged image resaved vs original: {stats(stored, orig_stored)}"
+        )
+        if new_img is not None:
+            line += (
+                f"; psd-tools composite resaved vs original: {stats(new_img, orig_img)};"
+                f" psd-tools composite vs stored merged (resaved): {stats(new_img, stored)}"
+            )
+        else:
+            line += f"; {composite_note}"
+        print(line)
+        if same != len(a):
+            print(f"  note: {len(a) - same} layer(s) differ in integers (neutral colour ranges are written with standard edges)")
+    print(f"OK: {found} re-saved corpus file(s) checked with psd-tools" if found else "not run: no resave_*.psd kept")
+
+
 def smart_objects(psd):
     """Every smart object layer of `psd`, as (name, unique id, data) in file order."""
     out = []
@@ -330,3 +468,4 @@ if __name__ == "__main__":
     check_locks(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_clips(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_smart(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
+    check_adjustments(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
