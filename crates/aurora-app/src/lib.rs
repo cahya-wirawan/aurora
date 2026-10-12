@@ -548,6 +548,7 @@ mod document_session;
 mod document_tabs;
 #[cfg(test)]
 mod document_tabs_tests;
+mod fill_tools;
 mod layer_thumbnails;
 mod prepared_pixels;
 mod psd_save;
@@ -5471,6 +5472,12 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         ("i", AppCommand::SelectTool(aurora_ui::Tool::Eyedropper)),
         ("b", AppCommand::SelectTool(aurora_ui::Tool::Brush)),
         ("e", AppCommand::SelectTool(aurora_ui::Tool::Eraser)),
+        // 0.209.0: Photoshop's grouped G key.
+        ("g", AppCommand::SelectTool(aurora_ui::Tool::Gradient)),
+        (
+            "Shift+G",
+            AppCommand::SelectTool(aurora_ui::Tool::PaintBucket),
+        ),
         // 0.208.0: Photoshop's colour keys, bare like the tool letters.
         ("x", AppCommand::SwapColours),
         ("d", AppCommand::ResetColours),
@@ -5649,6 +5656,8 @@ enum ActivatedCommand {
     /// Reset the colours to black over white (0.208.0): `D`, the palette
     /// and the Tools panel's defaults button.
     ResetColours,
+    /// Select a tool from the palette (0.209.0).
+    SelectTool(aurora_ui::Tool),
     /// A keyboard panel move (0.166.0, [`PANEL_MOVE_COMMANDS`]) —
     /// returned because rebuilding a tab group needs `App`'s `Scales`.
     /// Run by [`run_panel_move`].
@@ -5815,6 +5824,21 @@ const COMMAND_LAYER_CLIP_RELEASE: &str = "layer.clip_release";
 const COMMAND_COLOURS_SWAP: &str = "colour.swap";
 const COMMAND_COLOURS_RESET: &str = "colour.reset";
 
+/// The palette command id that selects `tool` (0.209.0).
+const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
+    match tool {
+        aurora_ui::Tool::Move => "tool.move",
+        aurora_ui::Tool::MarqueeSelect => "tool.marquee_select",
+        aurora_ui::Tool::Zoom => "tool.zoom",
+        aurora_ui::Tool::Pan => "tool.pan",
+        aurora_ui::Tool::Eyedropper => "tool.eyedropper",
+        aurora_ui::Tool::Brush => "tool.brush",
+        aurora_ui::Tool::Eraser => "tool.eraser",
+        aurora_ui::Tool::Gradient => "tool.gradient",
+        aurora_ui::Tool::PaintBucket => "tool.paint_bucket",
+    }
+}
+
 /// The command palette's own, real content: one command per docked
 /// panel, focusing it; one more per panel, toggling its own
 /// collapsed/expanded state (`aurora_ui::set_panel_collapsed`); one
@@ -5892,6 +5916,13 @@ fn palette_commands() -> Vec<CommandEntry> {
             "Default Foreground and Background Colours",
         ),
     ];
+    // 0.209.0: "Select ... Tool" for every tool (the palette had none).
+    commands.extend(aurora_ui::Tool::ALL.iter().map(|tool| {
+        CommandEntry::new(
+            tool_command_id(*tool),
+            format!("Select {} Tool", tool.label()),
+        )
+    }));
     commands.extend(
         PANEL_MOVE_COMMANDS
             .iter()
@@ -6091,6 +6122,13 @@ fn activate_command(
     }
     if id == COMMAND_LAYER_CLIP_RELEASE {
         return Some(ActivatedCommand::SetClip(false));
+    }
+    if let Some(tool) = aurora_ui::Tool::ALL
+        .iter()
+        .copied()
+        .find(|tool| tool_command_id(*tool) == id)
+    {
+        return Some(ActivatedCommand::SelectTool(tool));
     }
     if id == COMMAND_COLOURS_SWAP {
         return Some(ActivatedCommand::SwapColours);
@@ -7923,6 +7961,20 @@ fn sync_tool_controls(
     let Some(controls) = controls else {
         return highlighted;
     };
+    let fill = aurora_ui::sync_fill_controls(
+        &mut workspace.tree,
+        &controls,
+        tool,
+        settings.fill_view(),
+        captured,
+    );
+    let fill_changed = match fill {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to sync the options-bar fill controls");
+            false
+        }
+    };
     match aurora_ui::sync_tool_controls(
         &mut workspace.tree,
         controls,
@@ -7930,7 +7982,7 @@ fn sync_tool_controls(
         settings.radius(tool).map(f64::from),
         captured,
     ) {
-        Ok(changed) => changed || highlighted,
+        Ok(changed) => changed || highlighted || fill_changed,
         Err(err) => {
             tracing::warn!(?err, "failed to sync the options-bar tool controls");
             false
@@ -7996,6 +8048,53 @@ fn sync_status_bar_notice(
     }
 }
 
+/// Applies one routed outcome of the fill tools' option widgets
+/// (0.209.0) to `settings`: the Linear/Radial buttons, the Reverse and
+/// Contiguous checkboxes, the Opacity and Tolerance sliders. Whatever the
+/// widget did, the controls are re-mirrored from `settings`, so the pair
+/// of type buttons stays a radio group. No history step. Returns whether
+/// a setting changed.
+fn apply_fill_control_outcome(
+    workspace: &mut aurora_ui::Workspace,
+    controls: &aurora_ui::ToolControls,
+    tool: aurora_ui::Tool,
+    settings: &mut ToolSettings,
+    action: &aurora_widgets::ActionOutcome,
+    captured: Option<WidgetId>,
+) -> bool {
+    use aurora_widgets::ActionOutcome;
+    let fill = &controls.fill;
+    let changed = match action {
+        ActionOutcome::Toggled { id, state } if *id == fill.radial => {
+            let on = *state == accesskit::Toggled::True;
+            let changed = settings.gradient_radial != on;
+            settings.gradient_radial = on;
+            changed
+        }
+        ActionOutcome::Toggled { id, state } if *id == fill.reverse => {
+            let on = *state == accesskit::Toggled::True;
+            let changed = settings.gradient_reverse != on;
+            settings.gradient_reverse = on;
+            changed
+        }
+        ActionOutcome::Toggled { id, state } if *id == fill.contiguous => {
+            let on = *state == accesskit::Toggled::True;
+            let changed = settings.contiguous != on;
+            settings.contiguous = on;
+            changed
+        }
+        ActionOutcome::ValueChanged { id, value } if *id == fill.opacity => {
+            settings.set_gradient_opacity(*value)
+        }
+        ActionOutcome::ValueChanged { id, value } if *id == fill.tolerance => {
+            settings.set_tolerance(*value)
+        }
+        _ => return false,
+    };
+    let _ = sync_tool_controls(workspace, Some(*controls), tool, settings, captured);
+    changed
+}
+
 /// Applies one routed Properties-panel tool-control outcome (0.136.0):
 /// a radius slider `ValueChanged` — pointer drag, keyboard or assistive
 /// technology alike — sets the active tool's radius
@@ -8015,8 +8114,13 @@ fn apply_tool_control_outcome(
     let Some(controls) = controls else {
         return false;
     };
-    let PointerOutcome::Action(aurora_widgets::ActionOutcome::ValueChanged { id, value }) = outcome
-    else {
+    let PointerOutcome::Action(action) = outcome else {
+        return false;
+    };
+    if apply_fill_control_outcome(workspace, &controls, tool, settings, action, captured) {
+        return true;
+    }
+    let aurora_widgets::ActionOutcome::ValueChanged { id, value } = action else {
         return false;
     };
     if *id != controls.radius || !settings.set_radius(tool, *value) {
@@ -11305,6 +11409,13 @@ enum Drag {
         refused: bool,
     },
     Eyedropper,
+    /// The Gradient tool's drag (0.209.0): nothing is drawn until the
+    /// release, which applies the gradient from `start_doc` to
+    /// `current_doc` (document space) as one undo step. No live preview.
+    Gradient {
+        start_doc: (f32, f32),
+        current_doc: (f32, f32),
+    },
 }
 
 /// The active `Drag::Brush`'s own accumulated stroke snapshot, if there
@@ -11634,6 +11745,52 @@ fn record_stroke(
     }
 }
 
+/// The `(start, end)` document points of a Gradient drag that is ending, or
+/// `None` for any other drag. [`App::handle_pointer_released`] applies the
+/// gradient from it (0.209.1): **by any button's release and after a tool
+/// switch mid-drag** — a Gradient drag that began stays a Gradient drag
+/// whatever `App::tool` has become, because the gesture is the drag, not the
+/// tool. (A second press, the pointer leaving the window and a lost focus
+/// end a drag through [`commit_ending_drag`] and so cancel it.)
+fn released_gradient(ending: Option<&Drag>) -> Option<((f32, f32), (f32, f32))> {
+    match ending {
+        Some(Drag::Gradient {
+            start_doc,
+            current_doc,
+        }) => Some((*start_doc, *current_doc)),
+        _ => None,
+    }
+}
+
+/// Records one finished Paint Bucket fill or Gradient (0.209.0): the
+/// composite is invalidated narrowly like a dab (the filled layer tiles and
+/// the reach of the layer's effects), the snapshot becomes **one** undo
+/// step labelled `label` in the user's undo order, and the History panel
+/// is refreshed. A fill that changed nothing (an empty snapshot) records
+/// nothing. Returns whether a step was recorded.
+#[allow(clippy::too_many_arguments)]
+fn commit_fill(
+    workspace: &mut aurora_ui::Workspace,
+    layers: &aurora_doc::LayerTree,
+    layer: aurora_doc::LayerId,
+    filled: fill_tools::Filled,
+    label: &str,
+    cache: &mut CompositeCache,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    undo_order: &mut UndoOrder,
+) -> bool {
+    let reference_origin = composite_reference_origin(layers, Some(layer));
+    invalidate_painted_tiles(cache, layers, layer, &filled.painted, reference_origin);
+    let before = undo_order.undo.len();
+    record_stroke(filled.snapshot, label, history, pixel_history, undo_order);
+    let recorded = undo_order.undo.len() != before;
+    if recorded {
+        refresh_history_panel(workspace, undo_order);
+    }
+    recorded
+}
+
 /// Starts a drag for `tool`/`button` at `canvas_point` (already
 /// canvas-area-relative — see [`pointer_in_canvas`]), or `None` if this
 /// tool/button combination doesn't start one. The middle button always
@@ -11697,6 +11854,13 @@ fn begin_drag(
             })
         }
         (aurora_ui::Tool::Eyedropper, PointerButton::Primary) => Some(Drag::Eyedropper),
+        (aurora_ui::Tool::Gradient, PointerButton::Primary) => {
+            let start_doc = view.to_document(canvas_point);
+            Some(Drag::Gradient {
+                start_doc,
+                current_doc: start_doc,
+            })
+        }
         _ => None,
     }
 }
@@ -11821,6 +11985,10 @@ fn continue_drag(
         // comment) -- the caller (`App::handle_pointer_moved`) samples
         // directly at `canvas_point` itself once this returns.
         Drag::Eyedropper => Vec::new(),
+        Drag::Gradient { current_doc, .. } => {
+            *current_doc = view.to_document(canvas_point);
+            Vec::new()
+        }
     }
 }
 
@@ -12160,6 +12328,15 @@ fn shift_drag_reference(drag: &mut Drag, delta: (f32, f32)) {
             last_doc.0 += delta.0;
             last_doc.1 += delta.1;
         }
+        Drag::Gradient {
+            start_doc,
+            current_doc,
+        } => {
+            start_doc.0 += delta.0;
+            start_doc.1 += delta.1;
+            current_doc.0 += delta.0;
+            current_doc.1 += delta.1;
+        }
         Drag::Pan { .. } | Drag::Eyedropper => {}
     }
 }
@@ -12178,7 +12355,9 @@ fn shift_drag_reference(drag: &mut Drag, delta: (f32, f32)) {
 #[must_use]
 fn drag_reference(drag: &Drag) -> Option<(f32, f32)> {
     match drag {
-        Drag::Marquee { start_doc } | Drag::Move { start_doc, .. } => Some(*start_doc),
+        Drag::Marquee { start_doc }
+        | Drag::Move { start_doc, .. }
+        | Drag::Gradient { start_doc, .. } => Some(*start_doc),
         Drag::Brush { last_doc, .. } | Drag::Eraser { last_doc, .. } => Some(*last_doc),
         Drag::Pan { .. } | Drag::Eyedropper => None,
     }
@@ -24871,14 +25050,72 @@ const ERASER_RADIUS: f32 = 24.0;
 struct ToolSettings {
     brush_radius: f32,
     eraser_radius: f32,
+    /// The Paint Bucket's tolerance, 0..=255 in 8-bit-equivalent units
+    /// (0.209.0; Photoshop's default is 32).
+    tolerance: u8,
+    /// The Paint Bucket's "Contiguous" option (default on).
+    contiguous: bool,
+    /// The Gradient's type: `false` Linear, `true` Radial.
+    gradient_radial: bool,
+    /// The Gradient's "Reverse" option: background to foreground.
+    gradient_reverse: bool,
+    /// The Gradient's opacity, 0..=100 percent.
+    gradient_opacity: u8,
 }
+
+/// The Paint Bucket's default tolerance (Photoshop's).
+const DEFAULT_TOLERANCE: u8 = 32;
 
 impl Default for ToolSettings {
     fn default() -> Self {
         Self {
             brush_radius: BRUSH_RADIUS,
             eraser_radius: ERASER_RADIUS,
+            tolerance: DEFAULT_TOLERANCE,
+            contiguous: true,
+            gradient_radial: false,
+            gradient_reverse: false,
+            gradient_opacity: 100,
         }
+    }
+}
+
+impl ToolSettings {
+    /// The fill options the options bar mirrors.
+    fn fill_view(&self) -> aurora_ui::FillView {
+        aurora_ui::FillView {
+            radial: self.gradient_radial,
+            reverse: self.gradient_reverse,
+            opacity: self.gradient_opacity,
+            tolerance: self.tolerance,
+            contiguous: self.contiguous,
+        }
+    }
+
+    /// Sets the Paint Bucket tolerance from a slider value (rounded,
+    /// clamped to 0..=255; non-finite refused). Returns whether it changed.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn set_tolerance(&mut self, value: f64) -> bool {
+        if !value.is_finite() {
+            return false;
+        }
+        let tolerance = value.round().clamp(0.0, 255.0) as u8;
+        let changed = tolerance != self.tolerance;
+        self.tolerance = tolerance;
+        changed
+    }
+
+    /// Sets the Gradient opacity from a slider value (rounded, clamped to
+    /// 0..=100; non-finite refused). Returns whether it changed.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn set_gradient_opacity(&mut self, value: f64) -> bool {
+        if !value.is_finite() {
+            return false;
+        }
+        let opacity = value.round().clamp(0.0, 100.0) as u8;
+        let changed = opacity != self.gradient_opacity;
+        self.gradient_opacity = opacity;
+        changed
     }
 }
 
@@ -24910,6 +25147,12 @@ enum LockRefusal {
     ClipNeedsBase,
     /// Create Clipping Mask on a group (0.201.0).
     ClipOnGroup,
+    /// A Paint Bucket region or a Gradient area is over the tile cap
+    /// (0.209.0; not a lock, it rides the same calm notice).
+    FillTooLarge,
+    /// A fill with no pixel layer to fill: none is active, or the active
+    /// layer is a group or an adjustment layer (0.209.1).
+    FillNeedsPixelLayer,
 }
 
 impl LockRefusal {
@@ -24932,6 +25175,12 @@ impl LockRefusal {
                 "There is no layer beneath this one to clip to. Clipping masks need a layer below."
             }
             LockRefusal::ClipOnGroup => "Groups can't be clipped. Clip a layer inside the group.",
+            LockRefusal::FillNeedsPixelLayer => {
+                "Select a pixel layer to fill. A group, an adjustment layer or no layer can't be filled."
+            }
+            LockRefusal::FillTooLarge => {
+                "That area is too large to fill in one step (over 64 megapixels). Use a smaller selection of the layer."
+            }
         }
     }
 }
@@ -24973,6 +25222,12 @@ fn press_refusal(tool: aurora_ui::Tool, lock: aurora_doc::LayerLock) -> Option<L
             PaintPermission::Refused(why) => Some(why),
             _ => None,
         },
+        aurora_ui::Tool::Gradient | aurora_ui::Tool::PaintBucket => {
+            match paint_permission(DabTool::Brush, lock) {
+                PaintPermission::Refused(why) => Some(why),
+                _ => None,
+            }
+        }
         aurora_ui::Tool::Move if lock.position => Some(LockRefusal::PositionLocked),
         _ => None,
     }
@@ -24990,7 +25245,15 @@ fn lock_refusal_applies(
     tool: aurora_ui::Tool,
     lock: aurora_doc::LayerLock,
 ) -> bool {
-    press_refusal(tool, lock) == Some(refusal) || delete_refusal(lock) == Some(refusal)
+    press_refusal(tool, lock) == Some(refusal)
+        || delete_refusal(lock) == Some(refusal)
+        || (matches!(
+            refusal,
+            LockRefusal::FillTooLarge | LockRefusal::FillNeedsPixelLayer
+        ) && matches!(
+            tool,
+            aurora_ui::Tool::Gradient | aurora_ui::Tool::PaintBucket
+        ))
 }
 
 impl ToolSettings {
@@ -25015,7 +25278,9 @@ impl ToolSettings {
             | aurora_ui::Tool::MarqueeSelect
             | aurora_ui::Tool::Zoom
             | aurora_ui::Tool::Pan
-            | aurora_ui::Tool::Eyedropper => None,
+            | aurora_ui::Tool::Eyedropper
+            | aurora_ui::Tool::Gradient
+            | aurora_ui::Tool::PaintBucket => None,
         }
     }
 
@@ -25664,7 +25929,7 @@ struct App {
     /// The locked-layer refusal currently shown in the status bar, with
     /// the layer it was about (0.198.0). Cleared by
     /// [`App::sync_status_bar_now`] once it no longer applies.
-    lock_notice: Option<(LockRefusal, aurora_doc::LayerId)>,
+    lock_notice: Option<(LockRefusal, Option<aurora_doc::LayerId>)>,
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
     surface: Option<GpuSurface<'static>>,
@@ -26658,6 +26923,7 @@ impl App {
             }
             Some(ActivatedCommand::SwapColours) => self.swap_colours(),
             Some(ActivatedCommand::ResetColours) => self.reset_colours(),
+            Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -26847,13 +27113,13 @@ impl App {
             && let Some(layer) = self.doc.active_layer
             && let Some(why) = delete_refusal(self.doc.layers.lock(layer).unwrap_or_default())
         {
-            self.lock_notice = Some((why, layer));
+            self.lock_notice = Some((why, Some(layer)));
         }
         if command == LayerCommand::SetClip(true)
             && let Some(layer) = self.doc.active_layer
             && let Some(why) = clip_refusal(&self.doc.layers, layer)
         {
-            self.lock_notice = Some((why, layer));
+            self.lock_notice = Some((why, Some(layer)));
         }
         let _ = perform_layer_command(
             &mut LayerCommandContext {
@@ -28812,6 +29078,12 @@ impl App {
             );
             return;
         }
+        // The Paint Bucket fills on the press itself (0.209.0): no drag.
+        if self.tool == aurora_ui::Tool::PaintBucket && button == PointerButton::Primary {
+            let doc_point = self.doc.canvas_view.to_document(canvas_point);
+            self.fill_bucket(doc_point);
+            return;
+        }
         self.drag = begin_drag(
             self.tool,
             button,
@@ -28823,13 +29095,18 @@ impl App {
         // no stroke snapshot and no history row, and a calm notice.
         if matches!(
             self.drag,
-            Some(Drag::Brush { .. } | Drag::Eraser { .. } | Drag::Move { .. })
+            Some(
+                Drag::Brush { .. }
+                    | Drag::Eraser { .. }
+                    | Drag::Move { .. }
+                    | Drag::Gradient { .. }
+            )
         ) && let Some(layer) = self.doc.active_layer
             && let Some(why) =
                 press_refusal(self.tool, self.doc.layers.lock(layer).unwrap_or_default())
         {
             self.drag = None;
-            self.lock_notice = Some((why, layer));
+            self.lock_notice = Some((why, Some(layer)));
             self.sync_status_bar_now();
             return;
         }
@@ -28911,7 +29188,7 @@ impl App {
             self.doc.layers.lock(layer_id).unwrap_or_default(),
         ) {
             PaintPermission::Refused(why) => {
-                self.lock_notice = Some((why, layer_id));
+                self.lock_notice = Some((why, Some(layer_id)));
                 return;
             }
             PaintPermission::PreserveAlpha => true,
@@ -28987,7 +29264,7 @@ impl App {
             DabTool::Eraser,
             self.doc.layers.lock(layer_id).unwrap_or_default(),
         ) {
-            self.lock_notice = Some((why, layer_id));
+            self.lock_notice = Some((why, Some(layer_id)));
             return;
         }
         let Some(store) = self.doc.tile_store.as_mut() else {
@@ -29068,7 +29345,7 @@ impl App {
             .lock(layer_id)
             .is_some_and(|lock| lock.position)
         {
-            self.lock_notice = Some((LockRefusal::PositionLocked, layer_id));
+            self.lock_notice = Some((LockRefusal::PositionLocked, Some(layer_id)));
             return;
         }
         if let Err(err) = self.doc.layers.set_bounds(layer_id, bounds) {
@@ -29143,6 +29420,97 @@ impl App {
             self.doc.active_layer,
             canvas_size,
         );
+    }
+
+    /// The active layer a fill acts on, or `None` after showing the calm
+    /// notice (no layer is active: [`LockRefusal::FillNeedsPixelLayer`]).
+    /// A group or adjustment layer is refused later with the same notice
+    /// ([`fill_tools`]).
+    fn fill_target(&mut self) -> Option<aurora_doc::LayerId> {
+        match fill_tools::fill_target(self.doc.active_layer) {
+            Ok(layer) => Some(layer),
+            Err(why) => {
+                self.lock_notice = Some((why, None));
+                self.sync_status_bar_now();
+                None
+            }
+        }
+    }
+
+    /// One Paint Bucket click at `doc_point` on the active layer
+    /// ([`fill_tools::bucket_fill`]): one undo step, "Paint Bucket Fill".
+    fn fill_bucket(&mut self, doc_point: (f32, f32)) {
+        let Some(layer) = self.fill_target() else {
+            return;
+        };
+        let Some(store) = self.doc.tile_store.as_mut() else {
+            return;
+        };
+        let result = fill_tools::bucket_fill(
+            store,
+            &self.doc.layers,
+            layer,
+            doc_point,
+            &self.tool_settings,
+            colour_state::fill_foreground(&self.colour.state),
+        );
+        self.finish_fill(layer, result, fill_tools::PAINT_BUCKET_LABEL);
+    }
+
+    /// The released Gradient drag ([`fill_tools::gradient_drag`]): one undo
+    /// step, "Gradient".
+    fn apply_gradient(&mut self, start_doc: (f32, f32), end_doc: (f32, f32)) {
+        let Some(layer) = self.fill_target() else {
+            return;
+        };
+        let Some(store) = self.doc.tile_store.as_mut() else {
+            return;
+        };
+        let result = fill_tools::gradient_drag(
+            store,
+            &self.doc.layers,
+            layer,
+            self.doc.canvas_size,
+            start_doc,
+            end_doc,
+            &self.tool_settings,
+            colour_state::fill_foreground(&self.colour.state),
+            colour_state::fill_background(&self.colour.state),
+        );
+        self.finish_fill(layer, result, fill_tools::GRADIENT_LABEL);
+    }
+
+    /// Records a finished fill: invalidates the composite narrowly like a
+    /// dab, pushes the snapshot as one history step (none when nothing
+    /// changed) and refreshes the History panel; a refusal becomes the
+    /// calm status-bar notice.
+    fn finish_fill(
+        &mut self,
+        layer: aurora_doc::LayerId,
+        result: Result<fill_tools::Filled, fill_tools::FillRefused>,
+        label: &str,
+    ) {
+        match result {
+            Err(fill_tools::FillRefused::Notice(why)) => {
+                self.lock_notice = Some((why, Some(layer)));
+                self.sync_status_bar_now();
+            }
+            Err(fill_tools::FillRefused::Nothing) => {}
+            Ok(filled) => {
+                commit_fill(
+                    &mut self.workspace,
+                    &self.doc.layers,
+                    layer,
+                    filled,
+                    label,
+                    &mut self.doc.composite_cache,
+                    &mut self.doc.history,
+                    &mut self.doc.pixel_history,
+                    &mut self.doc.undo_order,
+                );
+                self.needs_redraw = true;
+            }
+        }
     }
 
     /// Samples the live, **composited** document at `doc_point` (document
@@ -29248,6 +29616,9 @@ impl App {
             self.relayout_after_gallery();
         }
         let ending = self.drag.take();
+        if let Some((start_doc, end_doc)) = released_gradient(ending.as_ref()) {
+            self.apply_gradient(start_doc, end_doc);
+        }
         self.commit_drag(ending);
         // Whatever owned the pointer let go: the tooltip may arm again
         // where the pointer now rests (review L4).
@@ -29396,6 +29767,7 @@ impl App {
             }
             Some(ActivatedCommand::SwapColours) => self.swap_colours(),
             Some(ActivatedCommand::ResetColours) => self.reset_colours(),
+            Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -30327,11 +30699,13 @@ impl App {
         // A lock notice stays only while it still describes what the
         // active tool would meet on the active layer.
         if let Some((why, layer)) = self.lock_notice
-            && (self.doc.active_layer != Some(layer)
+            && (self.doc.active_layer != layer
                 || !lock_refusal_applies(
                     why,
                     self.tool,
-                    self.doc.layers.lock(layer).unwrap_or_default(),
+                    layer
+                        .and_then(|layer| self.doc.layers.lock(layer))
+                        .unwrap_or_default(),
                 ))
         {
             self.lock_notice = None;
@@ -34221,7 +34595,7 @@ mod tests {
             mut state: AtState,
             request: &accesskit::ActionRequest,
         ) -> bool {
-            let radius = state.tool_settings.radius(state.tool);
+            let settings = state.tool_settings.clone();
             let Some(curves) = state.active_layer else {
                 unreachable!("the sweep's Curves layer is active");
             };
@@ -34231,9 +34605,17 @@ mod tests {
             state.sync_curves();
             let now = aurora_ui::curves_params(&state.layers, curves).cloned();
             if now == params {
+                // The radius, or (0.209.0) a fill option's setting. The
+                // Gradient opacity slider starts at its maximum, where
+                // `Increment` legitimately changes nothing.
+                if request.action == accesskit::Action::Increment
+                    && settings.gradient_opacity == 100
+                    && state.tool_settings == settings
+                {
+                    return false;
+                }
                 assert_ne!(
-                    state.tool_settings.radius(state.tool),
-                    radius,
+                    state.tool_settings, settings,
                     "{request:?} reached a tool control and changed nothing"
                 );
                 return false;
@@ -66240,7 +66622,7 @@ mod tests {
         let shortcuts = default_shortcuts();
         let workspace = laid_out_workspace();
         for (tool, button) in workspace.tools.buttons {
-            let lower = tool.shortcut_key().to_ascii_lowercase().to_string();
+            let lower = tool.shortcut_text().to_ascii_lowercase();
             let chord = match KeyChord::parse(&lower) {
                 Ok(chord) => chord,
                 Err(err) => unreachable!("{lower:?}: {err:?}"),
@@ -66256,7 +66638,7 @@ mod tests {
                 .and_then(|node| node.description().map(str::to_owned))
                 .unwrap_or_default();
             assert!(
-                described.ends_with(&format!("shortcut {}", tool.shortcut_key())),
+                described.ends_with(&format!("shortcut {}", tool.shortcut_text())),
                 "{described}"
             );
         }
@@ -75253,6 +75635,7 @@ mod tests {
             let settings = ToolSettings {
                 brush_radius: 7.0,
                 eraser_radius: 40.0,
+                ..ToolSettings::default()
             };
             assert_eq!(settings.dab_radius(DabTool::Brush), 7.0);
             assert_eq!(settings.dab_radius(DabTool::Eraser), 40.0);
@@ -75344,6 +75727,7 @@ mod tests {
             let settings = ToolSettings {
                 brush_radius: 20.0,
                 eraser_radius: 20.0,
+                ..ToolSettings::default()
             };
             let mut drag = None;
             let _ = stamp_tool_dab(
@@ -75365,6 +75749,7 @@ mod tests {
             let wide = ToolSettings {
                 brush_radius: 40.0,
                 eraser_radius: 40.0,
+                ..ToolSettings::default()
             };
             let _ = super::super::stamp_tool_dab_locked(
                 DabTool::Brush,
@@ -75407,6 +75792,7 @@ mod tests {
             let small = ToolSettings {
                 brush_radius: 4.0,
                 eraser_radius: 4.0,
+                ..ToolSettings::default()
             };
             let outcome = stamp_tool_dab(
                 DabTool::Brush,
@@ -75428,6 +75814,7 @@ mod tests {
             let big = ToolSettings {
                 brush_radius: 40.0,
                 eraser_radius: 4.0,
+                ..ToolSettings::default()
             };
             let _ = stamp_tool_dab(
                 DabTool::Brush,
@@ -75464,6 +75851,7 @@ mod tests {
             let one = ToolSettings {
                 brush_radius: 1.0,
                 eraser_radius: 1.0,
+                ..ToolSettings::default()
             };
             assert_eq!(brush_dabs(&one), 128);
             assert_eq!(eraser_dabs(&one), 128);
@@ -75471,6 +75859,7 @@ mod tests {
             let max = ToolSettings {
                 brush_radius: 256.0,
                 eraser_radius: 256.0,
+                ..ToolSettings::default()
             };
             assert_eq!(brush_dabs(&max), 1);
         }
@@ -86381,7 +86770,7 @@ mod panel_scroll_tests {
                 toggle(&mut ws, &mut focus);
                 let hist = button(&ws, ws.history);
                 let mut reached = false;
-                for _ in 0..16 {
+                for _ in 0..32 {
                     if focus.focus_next(&mut ws.tree) == Some(hist) {
                         reached = true;
                         break;
@@ -88060,3 +88449,6 @@ mod clip_tests;
 
 #[cfg(test)]
 mod gpu_adjustment_tests;
+
+#[cfg(test)]
+mod fill_tests;

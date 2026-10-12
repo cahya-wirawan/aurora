@@ -1640,7 +1640,7 @@ mod tests {
         );
         rig.run(WorkspaceCommand::Delete("Paint".to_owned()));
         let titles = rig.palette_titles();
-        assert!(!titles.iter().any(|t| t.contains("Paint")), "{titles:?}");
+        assert!(!titles.iter().any(|t| t.ends_with("Paint")), "{titles:?}");
         assert!(titles.iter().any(|t| t == "Workspace: Ink"));
         // Only a palette the key just opened is extended, never the prompt.
         let mut palette = None;

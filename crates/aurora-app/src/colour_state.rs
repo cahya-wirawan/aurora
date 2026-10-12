@@ -121,6 +121,18 @@ pub(crate) fn dab_colour(_tool: crate::DabTool, state: &ColourState) -> [f32; 3]
     state.paint_colour()
 }
 
+/// The colour the Paint Bucket fills with and the Gradient starts from
+/// (0.209.0): the foreground, always (the one place a fill site reads it,
+/// like [`dab_colour`]).
+pub(crate) fn fill_foreground(state: &ColourState) -> [f32; 3] {
+    state.foreground()
+}
+
+/// The colour the Gradient ends at (0.209.0): the background.
+pub(crate) fn fill_background(state: &ColourState) -> [f32; 3] {
+    state.background()
+}
+
 /// Whether `key` closes the colour popover: `Escape` while it is open and
 /// no dialog or the command palette (which own the key) is.
 pub(crate) fn escape_closes_popover(

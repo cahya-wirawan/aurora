@@ -24,8 +24,9 @@
 //! buttons sit in [`TOOL_GROUPS`], one row per group of at most two, and a
 //! group rule ([`widgets::insert_separator`], the menu separator's 1 px
 //! `border.default` line) separates the groups: move and select, view,
-//! sample, paint — Photoshop's own grouping, trimmed to the tools Aurora
-//! has. A group of one (the Eyedropper) fills the left cell.
+//! sample, paint, fill — Photoshop's own grouping, trimmed to the tools
+//! Aurora has (the fill group, Gradient and Paint Bucket, is 0.209.0's: a
+//! row of its own under the paint group). A group of one (the Eyedropper) fills the left cell.
 //!
 //! **The colour swatches (0.208.0).** Below the last tool group, behind
 //! one more group rule, sit Photoshop's foreground/background swatches,
@@ -89,11 +90,12 @@ pub const TOOL_COLUMNS: usize = 2;
 /// The groups of the strip, top to bottom, each one row of at most
 /// [`TOOL_COLUMNS`] buttons, a rule between consecutive groups. Together
 /// they hold every tool of [`Tool::ALL`], in that order.
-pub const TOOL_GROUPS: [&[Tool]; 4] = [
+pub const TOOL_GROUPS: [&[Tool]; 5] = [
     &[Tool::Move, Tool::MarqueeSelect],
     &[Tool::Zoom, Tool::Pan],
     &[Tool::Eyedropper],
     &[Tool::Brush, Tool::Eraser],
+    &[Tool::Gradient, Tool::PaintBucket],
 ];
 
 /// The icon on `tool`'s button. (`Move` and `Brush` are the icons the
@@ -109,13 +111,15 @@ pub const fn tool_icon(tool: Tool) -> IconKind {
         Tool::Eyedropper => IconKind::Eyedropper,
         Tool::Brush => IconKind::Brush,
         Tool::Eraser => IconKind::Eraser,
+        Tool::Gradient => IconKind::Gradient,
+        Tool::PaintBucket => IconKind::PaintBucket,
     }
 }
 
 /// `tool`'s button description: its name and its shortcut key.
 #[must_use]
 pub fn tool_description(tool: Tool) -> String {
-    format!("{} tool, shortcut {}", tool.label(), tool.shortcut_key())
+    format!("{} tool, shortcut {}", tool.label(), tool.shortcut_text())
 }
 
 /// The strip and its buttons, one per [`Tool::ALL`] entry, in that order.
@@ -377,7 +381,7 @@ mod tests {
 
     /// The icon each tool must wear, written out independently of
     /// [`tool_icon`] so a mapped-to-the-wrong-tool slip fails.
-    const EXPECTED_ICONS: [(Tool, IconKind); 7] = [
+    const EXPECTED_ICONS: [(Tool, IconKind); 9] = [
         (Tool::Move, IconKind::Move),
         (Tool::MarqueeSelect, IconKind::Marquee),
         (Tool::Zoom, IconKind::ZoomIn),
@@ -385,6 +389,8 @@ mod tests {
         (Tool::Eyedropper, IconKind::Eyedropper),
         (Tool::Brush, IconKind::Brush),
         (Tool::Eraser, IconKind::Eraser),
+        (Tool::Gradient, IconKind::Gradient),
+        (Tool::PaintBucket, IconKind::PaintBucket),
     ];
 
     #[test]
@@ -459,11 +465,19 @@ mod tests {
             assert_eq!(description, tool_description(tool));
             assert!(description.contains(tool.label()), "{description}");
             assert!(
-                description.contains(&format!("shortcut {}", tool.shortcut_key())),
+                description.ends_with(&format!("shortcut {}", tool.shortcut_text())),
                 "{description}"
             );
         }
         assert_eq!(tool_description(Tool::Brush), "Brush tool, shortcut B");
+        assert_eq!(
+            tool_description(Tool::Gradient),
+            "Gradient tool, shortcut G"
+        );
+        assert_eq!(
+            tool_description(Tool::PaintBucket),
+            "Paint Bucket tool, shortcut Shift+G"
+        );
         assert_eq!(
             tool_description(Tool::MarqueeSelect),
             "Marquee Select tool, shortcut M"
@@ -532,7 +546,7 @@ mod tests {
         }
         assert!(
             matches!(
-                sync_tools_panel(&mut ws.tree, &ws.tools, Tool::Eraser),
+                sync_tools_panel(&mut ws.tree, &ws.tools, Tool::PaintBucket),
                 Ok(false)
             ),
             "syncing the same tool again changes nothing"
@@ -635,6 +649,22 @@ mod tests {
             assert_eq!(at(Tool::Eyedropper).x, at(Tool::Move).x);
             assert!(at(Tool::Zoom).y > at(Tool::Move).y);
             assert!(at(Tool::Brush).y > at(Tool::Eyedropper).y);
+            // 0.209.0: the fill row sits under the paint row, two to a
+            // row, in the same two columns, inside the same 72 px.
+            assert!(at(Tool::Gradient).y > at(Tool::Brush).y);
+            assert_eq!(at(Tool::Gradient).y, at(Tool::PaintBucket).y);
+            assert_eq!(at(Tool::Gradient).x, at(Tool::Brush).x);
+            assert_eq!(at(Tool::PaintBucket).x, at(Tool::Eraser).x);
+            let bucket = at(Tool::PaintBucket);
+            assert_eq!(
+                bucket.bottom() - strip.y,
+                4 + 5 * 32 + 4 * 8,
+                "scale {scale_factor}"
+            );
+            assert!(
+                bucket.right() - strip.x <= 72 - 4,
+                "inside the strip's padding"
+            );
         }
         // The old strip, rebuilt: text toggle buttons in the label strip's
         // column style, measured.

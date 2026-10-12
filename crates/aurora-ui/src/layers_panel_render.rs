@@ -226,8 +226,38 @@ fn write_crop_png(
     name: &std::path::Path,
     target: aurora_widgets::WidgetId,
 ) {
+    write_crop_png_with(context, ws, scale, name, target, false);
+}
+
+/// [`write_crop_png`] with the text-aware layout the app uses
+/// (`compute_text_layout`: buttons and checkboxes sized to their labels),
+/// when `measured`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn write_crop_png_with(
+    context: &aurora_gpu::GpuContext,
+    ws: &mut crate::Workspace,
+    scale: f32,
+    name: &std::path::Path,
+    target: aurora_widgets::WidgetId,
+    measured: bool,
+) {
     let logical = (1280.0_f32, 800.0_f32);
-    ws.tree.compute_layout(logical.0, logical.1);
+    if measured {
+        let scales = scales();
+        let mut engine = ok(TextEngine::new());
+        aurora_widgets::compute_text_layout(
+            &mut ws.tree,
+            logical.0,
+            logical.1,
+            Some(aurora_widgets::TextMeasure {
+                engine: &mut engine,
+                scales: &scales,
+                scale_factor: scale,
+            }),
+        );
+    } else {
+        ws.tree.compute_layout(logical.0, logical.1);
+    }
     let (bytes, width, _height) = render_workspace(context, ws, scale, logical);
     let Some(panel) = ws.tree.bounds(target) else {
         unreachable!("laid out");
@@ -526,4 +556,68 @@ fn write_tools_panel_png() {
         &review_png("tools-panel-colour-picker.png"),
         window,
     );
+}
+
+/// The two fill tools (0.209.0) for a human to look at: the Tools panel
+/// with the tool selected (scale 2) and the options bar's group for it
+/// (scale 2), one pair of pictures per tool.
+/// Run: `AURORA_REQUIRE_GPU=1 AURORA_REVIEW_PNG_DIR=<dir> cargo test -p
+/// aurora-ui --lib write_fill_tools_png -- --ignored --nocapture`.
+#[test]
+#[ignore = "writes a PNG for human review"]
+fn write_fill_tools_png() {
+    let Some(context) = aurora_gpu::test_support::real_context_or_skip() else {
+        return;
+    };
+    let scales = scales();
+    let mut ws = crate::build_workspace(&scales);
+    let controls = ok(crate::insert_tool_controls(
+        &mut ws.tree,
+        ws.options_bar,
+        ws.properties,
+        &scales,
+    ));
+    let view = crate::FillView {
+        radial: true,
+        reverse: false,
+        opacity: 80,
+        tolerance: 32,
+        contiguous: true,
+    };
+    for (tool, name) in [
+        (crate::Tool::Gradient, "gradient"),
+        (crate::Tool::PaintBucket, "paint-bucket"),
+    ] {
+        ok(crate::sync_tools_panel(&mut ws.tree, &ws.tools, tool));
+        ok(crate::sync_tool_controls(
+            &mut ws.tree,
+            controls,
+            tool,
+            None,
+            None,
+        ));
+        ok(crate::sync_fill_controls(
+            &mut ws.tree,
+            &controls,
+            tool,
+            view,
+            None,
+        ));
+        let (tools_root, bar) = (ws.tools.root, ws.options_bar);
+        write_crop_png(
+            &context,
+            &mut ws,
+            2.0,
+            &review_png(&format!("fill-tools-panel-{name}.png")),
+            tools_root,
+        );
+        write_crop_png_with(
+            &context,
+            &mut ws,
+            2.0,
+            &review_png(&format!("fill-tools-options-{name}.png")),
+            bar,
+            true,
+        );
+    }
 }

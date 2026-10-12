@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-12, version 0.208.1.** This file is updated every round (every
+**As of 2026-10-12, version 0.209.1.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -74,8 +74,9 @@ golden-image tests are `#[ignore]`d.
   longer shows documents washed out on an sRGB surface.
 - **Tools panel and options bar**: a left panel (0.207.0: rebuilt Photoshop
   style) of flat icon-only toggle buttons, two to a row in a 72 px strip (the
-  text-labelled one was 145 px), in four groups with a rule between them (Move
-  and Marquee Select; Zoom and Pan; Eyedropper; Brush and Eraser). The selected
+  text-labelled one was 145 px), in five groups with a rule between them (Move
+  and Marquee Select; Zoom and Pan; Eyedropper; Brush and Eraser; and, since
+  0.209.0, Gradient and Paint Bucket). The selected
   tool is a filled accent square, hover and press tint it, each button keeps
   the tool's full name for assistive technology and a description with its
   shortcut letter, and each is its own Tab stop. Below the tools sit
@@ -85,7 +86,13 @@ golden-image tests are `#[ignore]`d.
   opens an HSV colour picker popover (no hex entry, alpha or colour
   management; the colours are not saved across sessions). No tooltip yet. **Never seen by a human, nor on the Mac; the five new icons
   (marquee, zoom in, hand, eyedropper, eraser) are provisional.** The options
-  bar shows the active tool's options. Selection tools
+  bar shows the active tool's options: the radius for Brush and Eraser;
+  since 0.209.0 Radial, Reverse and Opacity for the Gradient (`G`) and
+  Tolerance and Contiguous for the Paint Bucket (`Shift+G`). Both fill the
+  active pixel layer with the foreground/background colours, as one undo step,
+  ignoring selections (as the Brush does), the Gradient committing on release
+  with no live preview, a fill over 64 Mpx refused with a calm notice; never
+  seen by a human, nor on the Mac; the two new icons are provisional. Selection tools
   beyond a raw data model do not exist yet.
 - **Text fields and dialogs**: caret, selection, IME composition, standard
   editing chords through the real OS clipboard (`Cmd` on macOS, `Ctrl`
