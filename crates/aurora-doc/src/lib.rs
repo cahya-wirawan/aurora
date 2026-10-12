@@ -35,6 +35,9 @@ mod layer;
 // module's are.
 pub mod mask;
 mod selection;
+mod selection_mask;
+#[cfg(test)]
+mod selection_tests;
 pub mod smart_object;
 mod text_safety;
 mod tree;
@@ -48,7 +51,10 @@ pub use mask::{
     MASK_SURFACE_BIT, encode_mask_coverage_region, forget_mask_coverage, read_mask_coverage,
     write_mask_coverage, write_mask_coverage_region,
 };
-pub use selection::{Selection, SelectionSet};
+pub use selection::{Selection, SelectionSet, SelectionShape};
+pub use selection_mask::{
+    BoundaryTrace, MAX_SELECTION_MASK_PIXELS, MAX_TRACE_RUNS, SelectionMask, TraceRun,
+};
 pub use smart_object::{LinkedFile, SmartObject, SmartObjectBlock, SmartObjectError};
 pub use text_safety::sanitize_display_name;
 pub use tree::{LayerTree, MAX_LAYER_TREE_DEPTH};

@@ -72,7 +72,7 @@ pub struct StatusBar {
 /// What the status bar shows. Built by the app from its live state — the
 /// canvas view's zoom, the document's canvas size, and the tile store's
 /// sample format — never from literals.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StatusInfo {
     /// The canvas view's own, *logical* zoom factor (`1.0`,
     /// [`crate::canvas_view::DEFAULT_ZOOM`], is one document pixel per
@@ -158,11 +158,18 @@ pub fn document_text(size: (u32, u32), sample: SampleFormat) -> String {
 /// The selection readout (0.212.0): `Selection: 10, 20, 300 × 200 px` (left,
 /// top, width, height in document pixels), `Selection: empty` for a
 /// rectangle with no area, `Selection: inverse of 10, 20, 300 × 200 px`
-/// when inverted (everything outside the rectangle).
+/// when inverted (everything outside the rectangle). A non-rectangular
+/// selection (0.213.0) reads its bounds followed by ` (ellipse)` or
+/// ` (mask)`.
 #[must_use]
 pub fn selection_text(selection: &aurora_doc::Selection) -> String {
     let b = selection.bounds;
-    let rect = format!("{}, {}, {} × {} px", b.x, b.y, b.width, b.height);
+    let suffix = match selection.shape {
+        aurora_doc::SelectionShape::Rect => "",
+        aurora_doc::SelectionShape::Ellipse => " (ellipse)",
+        aurora_doc::SelectionShape::Mask(_) => " (mask)",
+    };
+    let rect = format!("{}, {}, {} × {} px{suffix}", b.x, b.y, b.width, b.height);
     match (selection.inverted, b.is_empty()) {
         (false, true) => "Selection: empty".to_owned(),
         (false, false) => format!("Selection: {rect}"),
@@ -456,7 +463,7 @@ mod tests {
         // it reads 200% again.
         let retina = StatusInfo {
             scale_factor: 2.0,
-            ..zoomed
+            ..zoomed.clone()
         };
         assert!(matches!(sync_status_bar(&mut tree, bar, &retina), Ok(true)));
         let Some(node) = tree.accessibility(bar.zoom) else {
@@ -500,17 +507,36 @@ mod tests {
         let plain = Selection::new(rect(10, 20, 300, 200));
         assert_eq!(selection_text(&plain), "Selection: 10, 20, 300 × 200 px");
         assert_eq!(
-            document_label_text(&some(plain)),
+            document_label_text(&some(plain.clone())),
             format!("{base} · Selection: 10, 20, 300 × 200 px")
         );
         let inverted = Selection {
             inverted: true,
-            ..plain
+            ..plain.clone()
         };
         assert_eq!(
             selection_text(&inverted),
             "Selection: inverse of 10, 20, 300 × 200 px"
         );
+        // 0.213.0: the shape is named after the bounds.
+        let ellipse = Selection::ellipse(rect(10, 20, 300, 200));
+        assert_eq!(
+            selection_text(&ellipse),
+            "Selection: 10, 20, 300 × 200 px (ellipse)"
+        );
+        assert_eq!(
+            selection_text(&Selection {
+                inverted: true,
+                ..ellipse
+            }),
+            "Selection: inverse of 10, 20, 300 × 200 px (ellipse)"
+        );
+        if let Ok(mask) = aurora_doc::SelectionMask::new(rect(1, 2, 2, 1), vec![255, 0]) {
+            assert_eq!(
+                selection_text(&Selection::from_mask(std::sync::Arc::new(mask))),
+                "Selection: 1, 2, 2 × 1 px (mask)"
+            );
+        }
         assert_eq!(
             selection_text(&Selection::new(rect(5, 5, 0, 9))),
             "Selection: empty"
@@ -523,7 +549,7 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(
-            sync_status_bar(&mut tree, bar, &some(plain)).ok(),
+            sync_status_bar(&mut tree, bar, &some(plain.clone())).ok(),
             Some(true)
         );
         assert!(status_bar_text(&tree, bar).is_some_and(|(_, d)| d.ends_with("300 × 200 px")));

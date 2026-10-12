@@ -7,10 +7,11 @@
 //! `aurora_doc::Selection`, which is in **document** space, to it:
 //! [`LayerSelection`] shifts every coordinate by the layer's bounds origin.
 //!
-//! Today a selection is a rectangle (plus an inverted flag), so coverage
-//! is exactly `0` or `1`. A raster selection (Lasso, Magic Wand,
-//! feathered) will only need to answer `Selection::coverage_at` and
-//! friends; nothing here or in the tools changes.
+//! A selection is a rectangle (coverage exactly `0` or `1`), the ellipse
+//! inscribed in one (antialiased, `k/16` along its edge) or a raster mask
+//! (0.213.0), each with an inverted flag; the tools consume only
+//! `Selection::coverage_at` and friends, so a Lasso or Magic Wand mask
+//! changes nothing here or in the tools.
 //!
 //! With no active selection [`layer_selection`] returns `None` and the
 //! tools run their unchanged, selection-free code.
@@ -22,7 +23,7 @@ use aurora_doc::Selection;
 use crate::{DabTool, Drag, ToolSettings};
 
 /// A document-space [`Selection`] seen from one layer's own texels.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct LayerSelection {
     selection: Selection,
     /// The layer's position in document space (its bounds' `x`, `y`): the

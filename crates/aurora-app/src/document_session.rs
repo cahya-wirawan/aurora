@@ -556,13 +556,13 @@ impl DocumentSession {
     /// Live gestures not yet committed are not counted; every close and
     /// quit path commits them first.
     pub(crate) fn is_dirty(&self) -> bool {
-        self.saved_revision != Some(self.undo_order.revision)
+        self.saved_revision != Some(self.undo_order.content_revision)
     }
 
     /// Records that the document now matches a file (an open's install,
     /// a successful `.aur` save).
     pub(crate) fn mark_clean(&mut self) {
-        self.saved_revision = Some(self.undo_order.revision);
+        self.saved_revision = Some(self.undo_order.content_revision);
     }
 
     /// [`Self::new`] with an id taken earlier — `App::new` needs it to
@@ -582,7 +582,7 @@ impl DocumentSession {
             id,
             name: UNTITLED.to_owned(),
             path: None,
-            saved_revision: Some(undo_order.revision),
+            saved_revision: Some(undo_order.content_revision),
             import_losses: None,
             layer_filter: aurora_ui::LayerFilter::default(),
             park_autosave: None,
@@ -664,6 +664,67 @@ mod tests {
             canvas_view,
             tile_store,
         })
+    }
+
+    /// 0.213.0: selection steps never make a document unsaved, nor clean
+    /// one that is; content steps do, as before.
+    #[test]
+    fn selection_steps_are_dirty_neutral_and_content_steps_are_not() {
+        let mut session = startup_session();
+        let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+        assert!(!session.is_dirty());
+        let rect = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let select = |session: &mut DocumentSession, workspace: &mut aurora_ui::Workspace| {
+            session
+                .selection
+                .select(aurora_doc::Selection::ellipse(rect));
+            crate::record_selection_step(
+                workspace,
+                &mut session.undo_order,
+                &mut session.history,
+                &mut session.pixel_history,
+                "Elliptical Marquee",
+                None,
+                session.selection.active(),
+            )
+        };
+        assert!(select(&mut session, &mut workspace));
+        assert!(!session.is_dirty(), "a selection does not dirty");
+        assert!(
+            session
+                .undo_order
+                .apply_selection_step(crate::UndoDirection::Undo)
+        );
+        assert!(!session.is_dirty(), "nor does undoing one");
+        assert!(
+            session
+                .undo_order
+                .apply_selection_step(crate::UndoDirection::Redo)
+        );
+        assert!(!session.is_dirty());
+        // A content step dirties; selection steps on top change nothing.
+        session.undo_order.record_labelled(
+            crate::UndoKind::Pixel,
+            "Brush Stroke".to_owned(),
+            &mut session.history,
+            &mut session.pixel_history,
+        );
+        assert!(session.is_dirty());
+        assert!(select(&mut session, &mut workspace));
+        assert!(session.is_dirty());
+        session.mark_clean();
+        assert!(!session.is_dirty());
+        assert!(
+            session
+                .undo_order
+                .apply_selection_step(crate::UndoDirection::Undo)
+        );
+        assert!(!session.is_dirty(), "undoing a selection keeps it clean");
     }
 
     #[test]

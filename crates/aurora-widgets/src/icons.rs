@@ -116,11 +116,13 @@ pub enum IconKind {
     /// A tilted bucket with a drop beside it: the Paint Bucket tool
     /// (0.209.0).
     PaintBucket,
+    /// A dashed ellipse: the Elliptical Marquee tool (0.213.0).
+    EllipseMarquee,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 29] = [
+    pub const ALL: [IconKind; 30] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -150,6 +152,7 @@ impl IconKind {
         IconKind::DefaultColours,
         IconKind::Gradient,
         IconKind::PaintBucket,
+        IconKind::EllipseMarquee,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -186,6 +189,7 @@ impl IconKind {
             IconKind::DefaultColours => "Default Colours",
             IconKind::Gradient => "Gradient",
             IconKind::PaintBucket => "Paint Bucket",
+            IconKind::EllipseMarquee => "Ellipse Marquee",
         }
     }
 }
@@ -535,6 +539,7 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
             stroke_part().m(8.0, 10.0).l(11.0, 13.0).l(14.0, 10.0),
         ],
         IconKind::Marquee => marquee_dashes(),
+        IconKind::EllipseMarquee => ellipse_marquee_dashes(),
         IconKind::ZoomIn => {
             let [vertical, horizontal] = plus(6.0, 6.0, 2.0);
             vec![
@@ -649,6 +654,24 @@ fn marquee_dashes() -> Vec<IconPart> {
     parts
 }
 
+/// The elliptical marquee's dashed ellipse: eight short arcs of 30 degrees
+/// every 45 degrees, each a three-point polyline on the ellipse centred on
+/// grid point (8, 8) with radii 6 and 5.
+fn ellipse_marquee_dashes() -> Vec<IconPart> {
+    let mut parts = Vec::with_capacity(8);
+    for k in 0..8_u8 {
+        let start = f32::from(k) * 45.0 + 7.5;
+        let mut part = stroke_part();
+        for (i, step) in [0.0_f32, 15.0, 30.0].into_iter().enumerate() {
+            let angle = (start + step).to_radians();
+            let (x, y) = (8.0 + 6.0 * angle.cos(), 8.0 + 5.0 * angle.sin());
+            part = if i == 0 { part.m(x, y) } else { part.l(x, y) };
+        }
+        parts.push(part);
+    }
+    parts
+}
+
 /// An icon's parts as tessellation-ready paths, scaled and placed.
 #[derive(Debug, Clone)]
 pub struct IconPaths {
@@ -744,7 +767,7 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 29);
+        assert_eq!(IconKind::ALL.len(), 30);
         for kind in [IconKind::SwapArrows, IconKind::DefaultColours] {
             assert!(IconKind::ALL.contains(&kind));
             assert!(!icon_parts(kind).is_empty(), "{kind:?}");
