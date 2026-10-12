@@ -94,6 +94,65 @@ pub fn insert_color_swatch(
     )
 }
 
+/// Adds a new, enabled colour swatch with a caller-supplied layout
+/// `style` (a size, an absolute position) instead of the default
+/// body-text-sized square — for a swatch a panel places itself (the
+/// Tools panel's foreground/background pair, 0.208.0).
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `parent` doesn't exist.
+pub fn insert_color_swatch_styled(
+    tree: &mut WidgetTree<WidgetKind>,
+    parent: WidgetId,
+    style: Style,
+    color: Color,
+) -> Result<WidgetId, WidgetError> {
+    let state = ColorSwatchState {
+        color,
+        disabled: false,
+    };
+    tree.insert(parent, style, node(state), WidgetKind::ColorSwatch(state))
+}
+
+/// Gives `id` (a colour swatch) an accessible name and, optionally, a
+/// description. The name and description survive later
+/// [`set_color_swatch_color`]/[`set_color_swatch_disabled`] calls, which
+/// rebuild the node around them. Returns whether anything changed.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it isn't a colour swatch.
+pub fn set_color_swatch_accessible(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    label: &str,
+    description: Option<&str>,
+) -> Result<bool, WidgetError> {
+    match tree.payload(id) {
+        Some(WidgetKind::ColorSwatch(_)) => {}
+        Some(_) => return Err(WidgetError::WrongWidgetKind(id)),
+        None => return Err(WidgetError::UnknownWidget(id)),
+    }
+    let unchanged = tree
+        .accessibility(id)
+        .is_some_and(|node| node.label() == Some(label) && node.description() == description);
+    if unchanged {
+        return Ok(false);
+    }
+    let Some(WidgetKind::ColorSwatch(state)) = tree.payload(id) else {
+        return Err(WidgetError::WrongWidgetKind(id));
+    };
+    let mut rebuilt = node(*state);
+    rebuilt.set_label(label);
+    if let Some(description) = description {
+        rebuilt.set_description(description);
+    }
+    tree.set_accessibility(id, rebuilt)?;
+    Ok(true)
+}
+
 /// Sets the colour `id` (a colour swatch) displays.
 ///
 /// # Errors
@@ -145,7 +204,18 @@ fn with_color_swatch_mut(
     let Some(WidgetKind::ColorSwatch(state)) = tree.payload(id) else {
         unreachable!("id was just confirmed to be a ColorSwatch above");
     };
-    tree.set_accessibility(id, node(*state))?;
+    let mut rebuilt = node(*state);
+    // A name and description given by `set_color_swatch_accessible`
+    // outlive a colour or disabled change.
+    if let Some(previous) = tree.accessibility(id) {
+        if let Some(label) = previous.label() {
+            rebuilt.set_label(label);
+        }
+        if let Some(description) = previous.description() {
+            rebuilt.set_description(description);
+        }
+    }
+    tree.set_accessibility(id, rebuilt)?;
     Ok(())
 }
 

@@ -36,6 +36,7 @@
 //! in particular).
 
 pub mod canvas_view;
+pub mod colour_controls;
 pub mod curves_controls;
 pub mod dock;
 pub mod document_tabs;
@@ -109,6 +110,14 @@ pub use levels_controls::{
 mod layer_filter_tests;
 #[cfg(test)]
 mod layers_panel_render;
+pub use colour_controls::{
+    COLOUR_BUTTON_ICON_SIZE, COLOUR_CONTROLS_LABEL, COLOUR_PICKER_ROWS, ColourAction,
+    ColourControls, ColourPopover, ColourTarget, DEFAULT_COLOURS_DESCRIPTION,
+    DEFAULT_COLOURS_LABEL, SWAP_COLOURS_DESCRIPTION, SWAP_COLOURS_LABEL, close_colour_popover,
+    colour_group_height, colour_swatch_offset, colour_swatch_side, insert_colour_controls,
+    is_colour_control, open_colour_popover, swatch_colour, swatch_description, swatch_name,
+    sync_colour_controls,
+};
 pub use layers_panel::{
     LayerRowPart, LayersView, layer_row_description, layer_row_height, layer_row_neighbor,
     layer_row_part, layer_row_thumbnail, layer_thumbnail_side, populate_layers_panel,
@@ -146,9 +155,10 @@ pub use tool_controls::{
     radius_slider_shown, sync_tool_controls, tool_controls_contains,
 };
 pub use tools_panel::{
-    TOOL_COLUMNS, TOOL_GROUPS, TOOL_ICON_SIZE, TOOLS_PANEL_LABEL, ToolsPanel, insert_tools_panel,
-    is_tools_panel_button, selected_tool, set_tools_panel_hover, sync_tools_panel,
-    tool_description, tool_icon, tools_panel_contains, tools_panel_width,
+    DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, TOOL_COLUMNS, TOOL_GROUPS, TOOL_ICON_SIZE,
+    TOOLS_PANEL_LABEL, ToolsPanel, insert_tools_panel, is_tools_panel_button, selected_tool,
+    set_tools_panel_hover, sync_tools_panel, tool_description, tool_icon, tools_panel_contains,
+    tools_panel_width,
 };
 pub use workspace::{
     FloatFrame, OPTIONS_BAR_LABEL, PANEL_GROUP_LABEL, PANEL_GROUP_TAB_DEFAULT, RAIL_WIDTH_DEFAULT,
