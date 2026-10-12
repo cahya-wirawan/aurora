@@ -19,6 +19,8 @@ use aurora_brush::{Coverage, CoverageRegion};
 use aurora_core::Rect;
 use aurora_doc::Selection;
 
+use crate::{DabTool, Drag, ToolSettings};
+
 /// A document-space [`Selection`] seen from one layer's own texels.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LayerSelection {
@@ -45,6 +47,39 @@ pub(crate) fn layer_selection(
 #[must_use]
 pub(crate) fn as_coverage(layer: Option<&LayerSelection>) -> Option<&dyn Coverage> {
     layer.map(|c| c as &dyn Coverage)
+}
+
+/// One Brush or Eraser dab at document point `doc_point` on the layer with
+/// `bounds`, through `selection` (the document's active one, `None` for no
+/// selection): the one call `App::paint_dab` and `App::erase_dab` stamp
+/// with, so a test can drive exactly what the app does. The active drag's
+/// own stroke snapshot captures the tiles the dab really changes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dab_through_selection(
+    tool: DabTool,
+    preserve_alpha: bool,
+    store: &mut aurora_tile::TileStore,
+    surface: aurora_tile::SurfaceId,
+    bounds: Rect,
+    doc_point: (f32, f32),
+    selection: Option<Selection>,
+    settings: &ToolSettings,
+    colour: [f32; 3],
+    drag: &mut Option<Drag>,
+) -> aurora_brush::DabOutcome {
+    let local = crate::layer_local_point(bounds, doc_point);
+    let cover = layer_selection(selection, bounds);
+    crate::stamp_tool_dab_covered(
+        tool,
+        preserve_alpha,
+        store,
+        surface,
+        local,
+        settings,
+        colour,
+        drag,
+        as_coverage(cover.as_ref()),
+    )
 }
 
 impl LayerSelection {

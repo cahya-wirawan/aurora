@@ -555,6 +555,8 @@ mod psd_save;
 #[cfg(test)]
 mod psd_save_tests;
 mod selection_paint;
+#[cfg(test)]
+mod selection_paint_tests;
 mod small_machine;
 mod workspace_presets;
 use background_open::{
@@ -29255,26 +29257,26 @@ impl App {
             PaintPermission::Allowed => false,
         };
         // The active selection (0.211.0): the dab paints only through it.
-        let selection = selection_paint::layer_selection(self.doc.selection.active(), bounds);
+        let selection = self.doc.selection.active();
         let Some(store) = self.doc.tile_store.as_mut() else {
             return;
         };
-        let local = layer_local_point(bounds, doc_point);
         // All borrows are of distinct fields of `self`, so they coexist.
         // This is why the stamp (and the stroke accessor inside it) is a
         // free function over `&mut Option<Drag>` and not a `&mut self`
         // helper method: that would borrow all of `self` and conflict
         // with `self.doc.tile_store` above.
-        let outcome = stamp_tool_dab_covered(
+        let outcome = selection_paint::dab_through_selection(
             DabTool::Brush,
             preserve_alpha,
             store,
             surface,
-            local,
+            bounds,
+            doc_point,
+            selection,
             &self.tool_settings,
             colour_state::dab_colour(DabTool::Brush, &self.colour.state),
             &mut self.drag,
-            selection_paint::as_coverage(selection.as_ref()),
         );
         let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
         invalidate_painted_tiles(
@@ -29331,23 +29333,23 @@ impl App {
             return;
         }
         // The active selection (0.211.0): the dab erases only through it.
-        let selection = selection_paint::layer_selection(self.doc.selection.active(), bounds);
+        let selection = self.doc.selection.active();
         let Some(store) = self.doc.tile_store.as_mut() else {
             return;
         };
-        let local = layer_local_point(bounds, doc_point);
         // Same distinct-field borrows `Self::paint_dab` relies on; the
         // colour is unused by an erase.
-        let outcome = stamp_tool_dab_covered(
+        let outcome = selection_paint::dab_through_selection(
             DabTool::Eraser,
             false,
             store,
             surface,
-            local,
+            bounds,
+            doc_point,
+            selection,
             &self.tool_settings,
             colour_state::dab_colour(DabTool::Eraser, &self.colour.state),
             &mut self.drag,
-            selection_paint::as_coverage(selection.as_ref()),
         );
         let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
         invalidate_painted_tiles(

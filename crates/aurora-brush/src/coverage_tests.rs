@@ -1345,3 +1345,54 @@ fn a_selected_fill_undoes_and_redoes_exactly() {
     assert!(matches!(history.redo(&mut s), Ok(true)));
     assert_eq!(dump(&mut s), after);
 }
+
+/// Prints the cost of one default-radius dab with no selection, a
+/// rectangle that cuts the dab (tile-level `Partial`), an inverted one
+/// (no bounds, per-texel lookups) and a fractional coverage (a blend per
+/// texel). Run with `--nocapture`. Asserts nothing about time (CI
+/// machines vary); it asserts only that every variant painted.
+#[test]
+fn dab_cost_with_and_without_a_selection_is_printed() {
+    use std::time::Instant;
+    let rect = RectCov {
+        rect: r(300, 300, 400, 400),
+        inverted: false,
+    };
+    let inverted = RectCov {
+        rect: r(0, 0, 100, 100),
+        inverted: true,
+    };
+    let half = Constant(0.5);
+    let variants: [(&str, Option<&dyn Coverage>); 4] = [
+        ("no selection", None),
+        ("rectangle", Some(&rect)),
+        ("inverted rectangle", Some(&inverted)),
+        ("fractional 0.5", Some(&half)),
+    ];
+    for radius in [24.0_f32, 100.0] {
+        for (name, cov) in variants {
+            let (_d, mut s) = store();
+            let mut snap = StrokeSnapshot::new(surface());
+            let rounds = 400_u32;
+            let start = Instant::now();
+            let mut painted = 0_usize;
+            for i in 0..rounds {
+                let x = 320.0 + (i % 40) as f32 * 8.0;
+                let y = 320.0 + (i / 40) as f32 * 8.0;
+                let outcome = stamp_dab_covered(
+                    &mut s,
+                    surface(),
+                    (x, y),
+                    radius,
+                    [1.0, 0.0, 0.0],
+                    Some(&mut snap),
+                    cov,
+                );
+                painted += outcome.painted().len();
+            }
+            let per = start.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
+            println!("dab radius {radius:>5}: {name:<20} {per:>8.1} us/dab");
+            assert!(painted > 0, "{name}");
+        }
+    }
+}
