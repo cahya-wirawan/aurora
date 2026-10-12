@@ -519,10 +519,19 @@ fn a_deferred_save_with_changes_asks_once_the_dialog_closes() {
 #[test]
 fn preflight_refusal_shows_couldnt_save_with_reason() {
     let mut doc = Doc::new();
-    // 0.178.0: groups and masks are written; Curves still are not (R4).
+    // 0.205.0: adjustment layers are written; one whose rounded values the
+    // file cannot hold (two curve points on one 8-bit level) is still refused.
+    let x = 102.5_f32 / 255.0;
+    let squeezed = ok(aurora_core::ToneCurve::new(&[
+        aurora_core::CurvePoint::new(x, 0.2),
+        aurora_core::CurvePoint::new(x + 1.0 / 256.0, 0.8),
+    ]));
     ok(doc.tree.add_adjustment_layer_at(
         "Curves",
-        aurora_doc::Adjustment::Curves(aurora_core::CurvesParams::default()),
+        aurora_doc::Adjustment::Curves(aurora_core::CurvesParams {
+            composite: squeezed,
+            ..aurora_core::CurvesParams::identity()
+        }),
         None,
         0,
     ));
@@ -532,7 +541,8 @@ fn preflight_refusal_shows_couldnt_save_with_reason() {
     };
     let message = psd_save_failure_message("copy.psd", &failure);
     assert!(
-        message.contains("saving Curves layers to PSD is not"),
+        message.contains("the Curves layer \u{201c}Curves\u{201d} can't be saved to .psd")
+            && message.contains("fewer than two different 8-bit levels"),
         "{message}"
     );
     assert!(message.ends_with(crate::SAVE_FAILED_UNCHANGED), "{message}");
@@ -1073,4 +1083,81 @@ fn moving_a_smart_object_layer_drops_it_with_an_itemised_report() {
     };
     let text = pending.report.items.join("\n");
     assert!(text.contains("they were moved"), "{text}");
+}
+
+/// 0.205.0: a document with Curves, Levels and Hue/Saturation layers saves
+/// to PSD through the whole app flow. Exact values are lossless (no
+/// dialog, the target replaced); rounded ones ask first, naming the kind.
+#[test]
+fn adjustment_layers_save_losslessly_and_rounded_ones_ask_first() {
+    let mut doc = Doc::new();
+    let curve = ok(aurora_core::ToneCurve::new(&[
+        aurora_core::CurvePoint::new(0.0, 0.0),
+        aurora_core::CurvePoint::new(64.0 / 255.0, 90.0 / 255.0),
+        aurora_core::CurvePoint::new(1.0, 1.0),
+    ]));
+    ok(doc.tree.add_adjustment_layer_at(
+        "Curves",
+        aurora_doc::Adjustment::Curves(aurora_core::CurvesParams {
+            composite: curve,
+            ..aurora_core::CurvesParams::identity()
+        }),
+        None,
+        0,
+    ));
+    ok(doc.tree.add_adjustment_layer_at(
+        "Levels",
+        aurora_doc::Adjustment::Levels(aurora_core::LevelsParams::identity()),
+        None,
+        0,
+    ));
+    ok(doc.tree.add_adjustment_layer_at(
+        "Hue",
+        aurora_doc::Adjustment::HueSaturation(ok(aurora_core::HueSaturationParams::new(
+            15.0, -30.0, 10.0, false, 0.0, 25.0, 0.0,
+        ))),
+        None,
+        0,
+    ));
+    let path = doc.path("adjusted.psd");
+    let step = ok(doc.save(&path));
+    assert!(matches!(step, PsdSaveStep::Saved), "{step:?}");
+    let reopened = ok(aurora_io::read_psd(&ok(std::fs::read(&path))));
+    assert_eq!(
+        names_bottom_up(&reopened.layers),
+        ["Background", "Top", "Curves", "Levels", "Hue"]
+    );
+    assert_eq!(listing_without_scratch(&doc), ["adjusted.psd"]);
+
+    // A fractional Hue/Saturation value is rounded: Save Anyway first.
+    let hue = find(&doc.tree, "Hue");
+    ok(doc.tree.set_adjustment(
+        hue,
+        aurora_doc::Adjustment::HueSaturation(ok(aurora_core::HueSaturationParams::new(
+            15.4, -30.0, 10.0, false, 0.0, 25.0, 0.0,
+        ))),
+    ));
+    let target = doc.path("rounded.psd");
+    let step = ok(doc.save(&target));
+    let PsdSaveStep::NeedsConfirmation(pending) = step else {
+        unreachable!("asks first")
+    };
+    assert!(!target.exists());
+    assert!(
+        pending
+            .report
+            .items
+            .iter()
+            .any(|i| i.contains("Hue/Saturation layer's fractional values")),
+        "{:?}",
+        pending.report.items
+    );
+    let message = psd_save_message("rounded.psd", &pending.report);
+    assert!(message.contains("rounded to whole numbers"), "{message}");
+    ok(finish_psd_save(pending, doc.id, doc.revision));
+    assert!(target.exists());
+}
+
+fn listing_without_scratch(doc: &Doc) -> Vec<String> {
+    doc.listing()
 }

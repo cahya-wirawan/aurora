@@ -139,14 +139,18 @@ mod test_writer;
 mod tests;
 mod vector;
 pub mod write;
+mod write_adjust;
+#[cfg(test)]
+mod write_adjust_tests;
 #[cfg(test)]
 mod write_tests;
 
 pub use smart::PsdSmartObject;
 pub use write::{
     PSD_GROUP_END_NAME, PSD_MAX_NAME_UNITS, PSD_MAX_RECORDS, PsdCompositeSource, PsdExpectation,
-    PsdExpectedLayer, PsdExpectedMask, PsdFormat, PsdRecordKind, PsdSaveOptions, PsdSaveRefusal,
-    PsdWriteOutcome, PsdWriteReport, psd_blend_key, psd_save_preflight, verify_psd_file, write_psd,
+    PsdExpectedAdjustment, PsdExpectedLayer, PsdExpectedMask, PsdFormat, PsdRecordKind,
+    PsdSaveOptions, PsdSaveRefusal, PsdWriteOutcome, PsdWriteReport, psd_blend_key,
+    psd_save_preflight, verify_psd_file, write_psd,
 };
 
 /// The largest canvas side a version-1 PSD file may declare.

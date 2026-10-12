@@ -5,8 +5,21 @@
 //! (layer-info length 0, the way Photoshop itself stores 16-bit files)
 //! and a planar, white-matted four-channel merged image behind a
 //! negative layer count. The app's Save As reaches it (0.177.0).
-//! Curves layers and PSB are refused by [`psd_save_preflight`] as not
-//! supported yet.
+//! PSB is refused by [`psd_save_preflight`] as not supported yet.
+//!
+//! # Adjustment layers (0.205.0)
+//!
+//! Curves, Levels and Hue/Saturation layers (including the per-colour-range
+//! variant) are written as adjustment records — see `write_adjust` for the
+//! block layouts. The record has an empty rectangle and four empty colour
+//! channels like a group's records, a user mask and the usual properties
+//! (name, opacity, fill, blend mode, visibility, locks, clipping), and the
+//! adjustment's `curv`/`levl`/`hue2` block first among its tagged blocks.
+//! Values finer than the file (curve points off the 8-bit grid, a Levels
+//! gamma beyond hundredths, fractional Hue/Saturation values) are rounded
+//! and itemised; a layer is refused only when the rounded values would not
+//! read back ([`PsdSaveRefusal::AdjustmentNotRepresentable`]). Checked with
+//! Aurora's own reader and psd-tools; never opened in Photoshop.
 //!
 //! # Groups (0.178.0)
 //!
@@ -183,12 +196,15 @@ pub enum PsdSaveRefusal {
     PsbNotYetSupported,
     /// Groups nest deeper than a PSD Aurora can reopen allows.
     GroupsTooDeep { depth: usize, max: usize },
-    /// Curves (adjustment) layers are not written yet.
-    CurvesNotYetSupported { count: usize },
-    /// Levels (adjustment) layers are not written yet (0.202.0).
-    LevelsNotYetSupported { count: usize },
-    /// Hue/Saturation (adjustment) layers are not written yet (0.203.0).
-    HueSaturationNotYetSupported { count: usize },
+    /// An adjustment layer whose values the file cannot hold even after
+    /// rounding (0.205.0): `reason` says why.
+    AdjustmentNotRepresentable {
+        /// The layer's name.
+        name: String,
+        /// The adjustment's label ("Curves").
+        kind: &'static str,
+        reason: &'static str,
+    },
     /// More layer records than a PSD's layer count can hold.
     TooManyLayers { count: usize },
     /// The merged image is not the canvas's size.
@@ -213,20 +229,9 @@ impl std::fmt::Display for PsdSaveRefusal {
                 f,
                 "the document's groups are nested {depth} deep; a PSD file holds at most {max}"
             ),
-            Self::CurvesNotYetSupported { count } => write!(
+            Self::AdjustmentNotRepresentable { name, kind, reason } => write!(
                 f,
-                "the document has {count} Curves layer(s); saving Curves layers to PSD is not \
-                 yet supported"
-            ),
-            Self::LevelsNotYetSupported { count } => write!(
-                f,
-                "the document has {count} Levels layer(s); saving Levels layers to PSD is not \
-                 yet supported"
-            ),
-            Self::HueSaturationNotYetSupported { count } => write!(
-                f,
-                "the document has {count} Hue/Saturation layer(s); saving Hue/Saturation \
-                 layers to PSD is not yet supported"
+                "the {kind} layer \u{201c}{name}\u{201d} can't be saved to .psd: {reason}"
             ),
             Self::TooManyLayers { count } => write!(
                 f,
@@ -280,11 +285,41 @@ struct Losses {
     dissolve: usize,
     /// Layers carrying effects (0.180.0): no `lfx2` is written yet.
     effects: usize,
+    /// Adjustment layers with values rounded to the file's resolution
+    /// (0.205.0): Curves, Levels, Hue/Saturation.
+    adjustment_rounded: [usize; 3],
+    /// Curves layers with points merged on the same 8-bit level.
+    curve_merged: usize,
+    /// Hue/Saturation layers with custom edges on a neutral range.
+    hue_ranges_reset: usize,
     clipped: u64,
     nan: u64,
     /// The written layers add up to more than the reader's
     /// `PIXEL_BUDGET`, so Aurora cannot reopen the file (0.177.0, N-1).
     unreopenable: bool,
+}
+
+impl Losses {
+    /// Counts an adjustment layer's rounding in the report.
+    fn note_adjustment(
+        &mut self,
+        adjustment: &aurora_doc::Adjustment,
+        rounding: super::write_adjust::Rounding,
+    ) {
+        let slot = match adjustment {
+            aurora_doc::Adjustment::Curves(_) => 0,
+            aurora_doc::Adjustment::Levels(_) => 1,
+            aurora_doc::Adjustment::HueSaturation(_)
+            | aurora_doc::Adjustment::HueSaturationRanges(_) => 2,
+        };
+        if rounding.rounded
+            && let Some(count) = self.adjustment_rounded.get_mut(slot)
+        {
+            *count += 1;
+        }
+        self.curve_merged += usize::from(rounding.merged_points);
+        self.hue_ranges_reset += usize::from(rounding.ranges_reset);
+    }
 }
 
 fn plural(n: u64, one: &str, many: &str) -> String {
@@ -379,6 +414,46 @@ impl Losses {
                     self.rounded_density as u64,
                     "layer mask density",
                     "layer mask densities"
+                )
+            ));
+        }
+        let [curves, levels, hue] = self.adjustment_rounded;
+        if curves > 0 {
+            items.push(format!(
+                "{} point positions will be rounded to Photoshop's 255 levels.",
+                plural(curves as u64, "Curves layer's", "Curves layers'")
+            ));
+        }
+        if self.curve_merged > 0 {
+            items.push(format!(
+                "{} points less than one level apart will be merged.",
+                plural(self.curve_merged as u64, "Curves layer's", "Curves layers'")
+            ));
+        }
+        if levels > 0 {
+            items.push(format!(
+                "{} values will be rounded to Photoshop's 255 levels and a gamma to hundredths.",
+                plural(levels as u64, "Levels layer's", "Levels layers'")
+            ));
+        }
+        if hue > 0 {
+            items.push(format!(
+                "{} fractional values will be rounded to whole numbers.",
+                plural(
+                    hue as u64,
+                    "Hue/Saturation layer's",
+                    "Hue/Saturation layers'"
+                )
+            ));
+        }
+        if self.hue_ranges_reset > 0 {
+            items.push(format!(
+                "{} custom colour-range edges on ranges that adjust nothing will be saved as \
+                 Photoshop's standard edges.",
+                plural(
+                    self.hue_ranges_reset as u64,
+                    "Hue/Saturation layer's",
+                    "Hue/Saturation layers'"
                 )
             ));
         }
@@ -567,9 +642,23 @@ impl ByteHash {
     }
 }
 
+/// An adjustment layer's block as [`verify_psd_file`] expects to read it
+/// back (0.205.0).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PsdExpectedAdjustment {
+    /// `curv`, `levl` or `hue2`.
+    pub key: [u8; 4],
+    /// The block's data as written, zero-padded to a multiple of four.
+    pub data: Vec<u8>,
+    /// What Aurora's reader makes of it.
+    pub readback: aurora_doc::Adjustment,
+}
+
 /// One layer record as [`verify_psd_file`] expects to read it back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PsdExpectedLayer {
+    /// The record's adjustment block, for an adjustment layer (0.205.0).
+    pub adjustment: Option<PsdExpectedAdjustment>,
     /// The record's smart-object data, when it is written back as one
     /// (0.200.0).
     pub smart: Option<PsdExpectedSmart>,
@@ -648,9 +737,8 @@ pub fn psd_save_preflight(
 #[derive(Debug, Default)]
 struct Census {
     records: usize,
-    curves: usize,
-    levels: usize,
-    hue_saturation: usize,
+    /// The first adjustment layer the file cannot hold (0.205.0).
+    refusal: Option<PsdSaveRefusal>,
     /// The deepest group nesting past [`MAX_GROUP_DEPTH`], if any.
     too_deep: Option<usize>,
 }
@@ -683,20 +771,8 @@ fn preflight_losses(
             max: MAX_GROUP_DEPTH,
         });
     }
-    if census.curves > 0 {
-        return Err(PsdSaveRefusal::CurvesNotYetSupported {
-            count: census.curves,
-        });
-    }
-    if census.levels > 0 {
-        return Err(PsdSaveRefusal::LevelsNotYetSupported {
-            count: census.levels,
-        });
-    }
-    if census.hue_saturation > 0 {
-        return Err(PsdSaveRefusal::HueSaturationNotYetSupported {
-            count: census.hue_saturation,
-        });
+    if let Some(refusal) = census.refusal {
+        return Err(refusal);
     }
     if census.records > PSD_MAX_RECORDS {
         return Err(PsdSaveRefusal::TooManyLayers {
@@ -752,13 +828,19 @@ fn census_of(
                     census_of(layers, children, level, census, losses);
                 }
             }
-            Some(LayerKind::Adjustment(aurora_doc::Adjustment::Curves(_))) => census.curves += 1,
-            Some(LayerKind::Adjustment(aurora_doc::Adjustment::Levels(_))) => census.levels += 1,
-            Some(LayerKind::Adjustment(
-                aurora_doc::Adjustment::HueSaturation(_)
-                | aurora_doc::Adjustment::HueSaturationRanges(_),
-            )) => {
-                census.hue_saturation += 1;
+            Some(LayerKind::Adjustment(adjustment)) => {
+                match super::write_adjust::encode_adjustment(adjustment) {
+                    Ok(encoded) => losses.note_adjustment(adjustment, encoded.rounding),
+                    Err(reason) => {
+                        census
+                            .refusal
+                            .get_or_insert(PsdSaveRefusal::AdjustmentNotRepresentable {
+                                name: layers.name(id).unwrap_or_default().to_owned(),
+                                kind: adjustment.label(),
+                                reason,
+                            });
+                    }
+                }
             }
             Some(LayerKind::Pixel { .. }) | None => {}
         }
@@ -1018,6 +1100,7 @@ fn plan_props(
         mask,
         pascal: pascal_name(&written),
         expected: PsdExpectedLayer {
+            adjustment: None,
             smart: None,
             kind,
             name: written,
@@ -1046,6 +1129,7 @@ fn plan_group_end() -> LayerPlan {
         mask: None,
         pascal: pascal_name(PSD_GROUP_END_NAME),
         expected: PsdExpectedLayer {
+            adjustment: None,
             smart: None,
             kind: PsdRecordKind::GroupEnd,
             name: PSD_GROUP_END_NAME.to_owned(),
@@ -1163,23 +1247,43 @@ fn smart_for(
     }))
 }
 
+/// An adjustment layer's record: no pixels, its block, the usual
+/// properties and mask.
+fn plan_adjustment(
+    layers: &LayerTree,
+    id: LayerId,
+    adjustment: &aurora_doc::Adjustment,
+) -> Result<LayerPlan, IoError> {
+    let encoded = super::write_adjust::encode_adjustment(adjustment).map_err(|reason| {
+        refused(PsdSaveRefusal::AdjustmentNotRepresentable {
+            name: layers.name(id).unwrap_or_default().to_owned(),
+            kind: adjustment.label(),
+            reason,
+        })
+    })?;
+    let mut plan = plan_props(layers, id, PsdRecordKind::Layer, [0; 4])?;
+    plan.expected.adjustment = Some(PsdExpectedAdjustment {
+        key: encoded.key,
+        data: encoded.data,
+        readback: encoded.readback,
+    });
+    Ok(plan)
+}
+
 fn plan_layer(
     layers: &LayerTree,
     store: &mut TileStore,
     id: LayerId,
     losses: &mut Losses,
 ) -> Result<LayerPlan, IoError> {
-    let Some(LayerKind::Pixel { bounds }) = layers.kind(id) else {
-        return Err(refused(match layers.kind(id) {
-            Some(LayerKind::Adjustment(aurora_doc::Adjustment::Levels(_))) => {
-                PsdSaveRefusal::LevelsNotYetSupported { count: 1 }
-            }
-            Some(LayerKind::Adjustment(
-                aurora_doc::Adjustment::HueSaturation(_)
-                | aurora_doc::Adjustment::HueSaturationRanges(_),
-            )) => PsdSaveRefusal::HueSaturationNotYetSupported { count: 1 },
-            _ => PsdSaveRefusal::CurvesNotYetSupported { count: 1 },
-        }));
+    let bounds = match layers.kind(id) {
+        Some(LayerKind::Pixel { bounds }) => bounds,
+        Some(LayerKind::Adjustment(adjustment)) => return plan_adjustment(layers, id, adjustment),
+        _ => {
+            return Err(IoError::PsdMalformed {
+                what: "a record that is neither a pixel nor an adjustment layer",
+            });
+        }
     };
     let surface = layers.surface_id(id).ok_or(IoError::PsdMalformed {
         what: "a pixel layer without a surface",
@@ -1235,6 +1339,14 @@ fn record_extra(plan: &LayerPlan) -> Result<Vec<u8>, IoError> {
     extra.extend_from_slice(&plan.pascal);
     let units = u32::try_from(plan.luni.len()).map_err(|_| too_large("layer name"))?;
     let luni_len = 4 + 2 * units;
+    if let Some(adjustment) = &plan.expected.adjustment {
+        // First among the tagged blocks, as Photoshop writes it.
+        extra.extend_from_slice(b"8BIM");
+        extra.extend_from_slice(&adjustment.key);
+        let len = u32::try_from(adjustment.data.len()).map_err(|_| too_large("adjustment"))?;
+        extra.extend_from_slice(&len.to_be_bytes());
+        extra.extend_from_slice(&adjustment.data);
+    }
     extra.extend_from_slice(b"8BIM");
     extra.extend_from_slice(b"luni");
     extra.extend_from_slice(&luni_len.to_be_bytes());
@@ -2102,6 +2214,7 @@ fn raw_record<R: std::io::Read + Seek>(
     let (mut name, mut fill, mut section) = (None, None, None);
     let mut protected = None;
     let mut smart_blocks: Vec<aurora_doc::SmartObjectBlock> = Vec::new();
+    let mut adjustment_blocks: Vec<([u8; 4], Vec<u8>)> = Vec::new();
     while raw.pos()? < extra_end {
         check("tagged block signature", raw.array::<4>()?, *b"8BIM")?;
         let key = raw.array::<4>()?;
@@ -2117,12 +2230,21 @@ fn raw_record<R: std::io::Read + Seek>(
                     .map(u32::from_be_bytes);
             }
             b"lsct" => section = Some(data),
+            k if super::write_adjust::is_adjustment_key(k) => adjustment_blocks.push((key, data)),
             k if aurora_doc::smart_object::SMART_OBJECT_BLOCK_KEYS.contains(k) => {
                 smart_blocks.push(aurora_doc::SmartObjectBlock { key, data });
             }
             _ => {}
         }
     }
+    check(
+        &format!("layer {i} adjustment blocks"),
+        adjustment_blocks,
+        want.adjustment
+            .iter()
+            .map(|a| (a.key, a.data.clone()))
+            .collect::<Vec<_>>(),
+    )?;
     check(
         &format!("layer {i} smart object blocks"),
         smart_blocks,
@@ -2442,6 +2564,14 @@ pub(crate) fn verify_psd_file_with_budget(
                 .map(|s| (s.unique_id.as_str(), s.blocks.as_slice())),
         )?;
         reader_mask(i, l.mask(id), want.mask.as_ref(), id, &sink.masks)?;
+        check(
+            &format!("layer {i} adjustment"),
+            match l.kind(id) {
+                Some(LayerKind::Adjustment(a)) => Some(a),
+                _ => None,
+            },
+            want.adjustment.as_ref().map(|a| &a.readback),
+        )?;
         if kind != PsdRecordKind::Layer {
             continue;
         }

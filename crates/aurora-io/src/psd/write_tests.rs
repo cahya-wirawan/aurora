@@ -21,7 +21,7 @@ use crate::error::IoError;
 use crate::image::Image;
 use crate::replace_verified;
 
-fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
+pub(super) fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     match r {
         Ok(v) => v,
         Err(err) => unreachable!("{err:?}"),
@@ -37,7 +37,7 @@ fn store() -> (tempfile::TempDir, TileStore) {
     (dir, store)
 }
 
-fn rect(x: i64, y: i64, width: u32, height: u32) -> Rect {
+pub(super) fn rect(x: i64, y: i64, width: u32, height: u32) -> Rect {
     Rect {
         x,
         y,
@@ -46,7 +46,7 @@ fn rect(x: i64, y: i64, width: u32, height: u32) -> Rect {
     }
 }
 
-fn image(width: u32, height: u32, f: impl Fn(u32, u32) -> [f32; 4]) -> Image {
+pub(super) fn image(width: u32, height: u32, f: impl Fn(u32, u32) -> [f32; 4]) -> Image {
     let mut samples = Vec::new();
     for y in 0..height {
         for x in 0..width {
@@ -57,16 +57,16 @@ fn image(width: u32, height: u32, f: impl Fn(u32, u32) -> [f32; 4]) -> Image {
 }
 
 /// A test document: layers added bottom first.
-struct Doc {
-    tree: LayerTree,
+pub(super) struct Doc {
+    pub(super) tree: LayerTree,
     _dir: tempfile::TempDir,
-    store: TileStore,
-    canvas: (u32, u32),
-    composite: Image,
+    pub(super) store: TileStore,
+    pub(super) canvas: (u32, u32),
+    pub(super) composite: Image,
 }
 
 impl Doc {
-    fn new(canvas: (u32, u32)) -> Self {
+    pub(super) fn new(canvas: (u32, u32)) -> Self {
         let (dir, store) = store();
         Self {
             tree: LayerTree::new(),
@@ -81,7 +81,12 @@ impl Doc {
 
     /// Adds a layer on top with `bounds`, its pixels at surface offset
     /// `(dx, dy)`.
-    fn layer(&mut self, name: &str, bounds: Rect, pixels: Option<(&Image, u32, u32)>) -> LayerId {
+    pub(super) fn layer(
+        &mut self,
+        name: &str,
+        bounds: Rect,
+        pixels: Option<(&Image, u32, u32)>,
+    ) -> LayerId {
         let id = ok(self.tree.add_pixel_layer(name, bounds, None));
         if let Some((img, dx, dy)) = pixels {
             let Some(surface) = self.tree.surface_id(id) else {
@@ -98,7 +103,7 @@ impl Doc {
         id
     }
 
-    fn write(&mut self) -> Result<(Vec<u8>, PsdWriteOutcome), IoError> {
+    pub(super) fn write(&mut self) -> Result<(Vec<u8>, PsdWriteOutcome), IoError> {
         let mut out = Cursor::new(Vec::new());
         let mut source = &self.composite;
         let outcome = write_psd(
@@ -188,7 +193,7 @@ fn parse_record(bytes: &[u8], at: usize) -> ParsedRecord {
     }
 }
 
-fn read_back(bytes: &[u8]) -> super::PsdDocument {
+pub(super) fn read_back(bytes: &[u8]) -> super::PsdDocument {
     ok(super::read(bytes))
 }
 
@@ -656,7 +661,7 @@ fn writer_matches_test_writer_bytes_for_a_two_layer_file() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn preflight_refuses_curves_and_oversize_but_not_groups_or_masks() {
+fn preflight_refuses_oversize_but_not_groups_masks_or_adjustments() {
     let opts = PsdSaveOptions::default();
     let base = || {
         let mut tree = LayerTree::new();
@@ -689,43 +694,30 @@ fn preflight_refuses_curves_and_oversize_but_not_groups_or_masks() {
         Ok(vec![])
     );
 
-    let mut curves = base();
-    ok(curves.add_adjustment_layer_at(
-        "C",
-        Adjustment::Curves(aurora_core::CurvesParams::default()),
-        None,
-        0,
-    ));
-    assert_eq!(
-        psd_save_preflight(&curves, (4, 4), opts),
-        Err(PsdSaveRefusal::CurvesNotYetSupported { count: 1 })
-    );
-
-    // 0.202.0: Levels layers are refused the same way, counted apart.
-    let mut levels = base();
-    ok(levels.add_adjustment_layer_at(
-        "L",
-        Adjustment::Levels(aurora_core::LevelsParams::identity()),
-        None,
-        0,
-    ));
-    assert_eq!(
-        psd_save_preflight(&levels, (4, 4), opts),
-        Err(PsdSaveRefusal::LevelsNotYetSupported { count: 1 })
-    );
-
-    // 0.203.0: Hue/Saturation layers are refused the same way, counted apart.
-    let mut hue = base();
-    ok(hue.add_adjustment_layer_at(
-        "H",
-        Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
-        None,
-        0,
-    ));
-    assert_eq!(
-        psd_save_preflight(&hue, (4, 4), opts),
-        Err(PsdSaveRefusal::HueSaturationNotYetSupported { count: 1 })
-    );
+    // 0.205.0: Curves, Levels and Hue/Saturation layers are written, so
+    // the preflight no longer refuses them (a lossless one reports nothing).
+    for (name, adjustment) in [
+        (
+            "C",
+            Adjustment::Curves(aurora_core::CurvesParams::default()),
+        ),
+        (
+            "L",
+            Adjustment::Levels(aurora_core::LevelsParams::identity()),
+        ),
+        (
+            "H",
+            Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
+        ),
+    ] {
+        let mut with = base();
+        ok(with.add_adjustment_layer_at(name, adjustment, None, 0));
+        assert_eq!(
+            psd_save_preflight(&with, (4, 4), opts).map(|r| r.items),
+            Ok(vec![]),
+            "{name}"
+        );
+    }
 
     for canvas in [(30_001, 10), (10, 30_001)] {
         let refusal = psd_save_preflight(&tree, canvas, opts);
@@ -752,12 +744,6 @@ fn preflight_refuses_curves_and_oversize_but_not_groups_or_masks() {
 
     // `write_psd` refuses through the same checks before writing a byte.
     let mut doc = Doc::new((4, 4));
-    ok(doc.tree.add_adjustment_layer_at(
-        "C",
-        Adjustment::Curves(aurora_core::CurvesParams::default()),
-        None,
-        0,
-    ));
     let mut out = Cursor::new(Vec::new());
     let mut source = &doc.composite;
     let result = write_psd(
@@ -770,9 +756,7 @@ fn preflight_refuses_curves_and_oversize_but_not_groups_or_masks() {
     );
     assert!(matches!(
         result,
-        Err(IoError::PsdSaveRefused(
-            PsdSaveRefusal::CurvesNotYetSupported { .. }
-        ))
+        Err(IoError::PsdSaveRefused(PsdSaveRefusal::NoLayers))
     ));
     assert!(out.into_inner().is_empty());
 }
@@ -998,7 +982,7 @@ fn flat_doc() -> Doc {
     doc
 }
 
-fn save(doc: &mut Doc, target: &Path, short: bool) -> Result<PsdWriteOutcome, IoError> {
+pub(super) fn save(doc: &mut Doc, target: &Path, short: bool) -> Result<PsdWriteOutcome, IoError> {
     let Doc {
         tree,
         store,
@@ -1710,7 +1694,7 @@ fn write_verified_temp_touches_nothing_until_persist() {
 
 impl Doc {
     /// Adds a layer on top of `parent`'s children (or the roots).
-    fn layer_in(
+    pub(super) fn layer_in(
         &mut self,
         name: &str,
         bounds: Rect,
@@ -1733,13 +1717,13 @@ impl Doc {
         id
     }
 
-    fn group(&mut self, name: &str, parent: Option<LayerId>) -> LayerId {
+    pub(super) fn group(&mut self, name: &str, parent: Option<LayerId>) -> LayerId {
         ok(self.tree.add_group(name, parent))
     }
 
     /// Adds a mask at `bounds`, its coverage `f(x, y)` (mask-local)
     /// painted over the `paint` part of it (mask-local x, y, w, h).
-    fn mask(
+    pub(super) fn mask(
         &mut self,
         id: LayerId,
         bounds: Rect,
@@ -1763,7 +1747,7 @@ impl Doc {
 }
 
 /// The tree's shape, top-to-bottom: `name` or `name(children)`.
-fn shape(tree: &LayerTree, ids: &[LayerId]) -> String {
+pub(super) fn shape(tree: &LayerTree, ids: &[LayerId]) -> String {
     ids.iter()
         .map(|&id| {
             let name = tree.name(id).unwrap_or_default().to_owned();
@@ -1779,13 +1763,13 @@ fn shape(tree: &LayerTree, ids: &[LayerId]) -> String {
 }
 
 /// A re-read document with its masks written into a store of its own.
-struct Reopened {
-    doc: super::PsdDocument,
+pub(super) struct Reopened {
+    pub(super) doc: super::PsdDocument,
     _dir: tempfile::TempDir,
-    store: TileStore,
+    pub(super) store: TileStore,
 }
 
-fn reopen(bytes: &[u8]) -> Reopened {
+pub(super) fn reopen(bytes: &[u8]) -> Reopened {
     let doc = read_back(bytes);
     let (dir, mut store) = store();
     for mask in &doc.masks {
@@ -1801,7 +1785,13 @@ fn reopen(bytes: &[u8]) -> Reopened {
 /// Aurora's effective mask coverage at a document pixel — the app's
 /// `apply_mask`: inside the bounds the painted coverage (unpainted is
 /// `1.0`), outside them `0.0`; then `inverted`; then the density.
-fn coverage_at(tree: &LayerTree, store: &mut TileStore, id: LayerId, x: i64, y: i64) -> f32 {
+pub(super) fn coverage_at(
+    tree: &LayerTree,
+    store: &mut TileStore,
+    id: LayerId,
+    x: i64,
+    y: i64,
+) -> f32 {
     let density = tree.mask(id).map_or(1.0, |m| m.density);
     density * shown_at(tree, store, id, x, y) + (1.0 - density)
 }
@@ -1846,7 +1836,7 @@ fn rec(recs: &[Rec], i: usize) -> &Rec {
     recs.get(i).unwrap_or_else(|| unreachable!("record {i}"))
 }
 
-fn records(bytes: &[u8]) -> Vec<Rec> {
+pub(super) fn records(bytes: &[u8]) -> Vec<Rec> {
     let count = usize::from(
         be16(bytes, first_record(bytes) - 2)
             .cast_signed()
@@ -1892,7 +1882,7 @@ fn blend_key_of(bytes: &[u8], index: usize) -> [u8; 4] {
     key
 }
 
-fn px(w: u32, h: u32, seed: u32) -> Image {
+pub(super) fn px(w: u32, h: u32, seed: u32) -> Image {
     image(w, h, |x, y| {
         [level(x + seed), level(y), level(x + y + seed), 1.0]
     })
