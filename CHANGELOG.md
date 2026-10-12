@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.206.1] - 2026-10-12
+
+### Fixed
+
+- Hold steep Hue/Saturation GPU cases to the opaque tolerance on translucent backdrops
+
 ## [0.206.0] - 2026-10-12
 
 ### Changed
