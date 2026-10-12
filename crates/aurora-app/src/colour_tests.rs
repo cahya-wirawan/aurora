@@ -8,6 +8,8 @@
 //! [`ColourController`]); `App`'s own thin wiring (which field it reads,
 //! the Escape hook) is therefore **not** run here.
 
+#![allow(clippy::float_cmp)] // exact constants and exact copies, not computed values
+
 use crate::colour_state::{ColourController, ColourState, Effect, eyedropper_target};
 use crate::{
     ActivatedCommand, AppCommand, ClipboardAccess, FileDialogAccess, KeyOutcome, PointerPhase,
@@ -461,9 +463,9 @@ fn a_picker_edit_changes_only_the_colour_it_was_opened_for() {
     let _ = rig.pointer(PointerPhase::Down, at);
     let _ = rig.pointer(PointerPhase::Up, at);
     assert_ne!(rig.colour.state.background(), [1.0, 1.0, 1.0]);
-    assert!(
-        aurora_ui::swatch_colour(rig.colour.state.background())
-            != aurora_ui::swatch_colour([1.0; 3])
+    assert_ne!(
+        aurora_ui::swatch_colour(rig.colour.state.background()),
+        aurora_ui::swatch_colour([1.0; 3])
     );
     assert_eq!(rig.colour.state.foreground(), [0.0, 0.0, 0.0]);
     // The swatch follows the edit, live.
@@ -704,5 +706,74 @@ fn every_action_a_control_runs_is_distinct() {
             Some(ColourAction::Swap),
             Some(ColourAction::Reset),
         ]
+    );
+}
+
+#[test]
+fn an_assistive_technology_click_reaches_the_colour_controls() {
+    let mut rig = Rig::new();
+    let c = rig.workspace.tools.colours;
+    let layer_rows = std::collections::HashMap::new();
+    for id in [c.foreground, c.background, c.swap, c.defaults] {
+        let request = accesskit::ActionRequest {
+            action: accesskit::Action::Click,
+            target_tree: aurora_widgets::ACCESSIBILITY_TREE_ID,
+            target_node: id,
+            data: None,
+        };
+        let reaction = crate::route_accessibility_action(
+            &mut rig.workspace,
+            &mut rig.focus,
+            None,
+            &layer_rows,
+            None,
+            None,
+            &request,
+        );
+        assert!(
+            matches!(
+                reaction,
+                crate::AccessibilityReaction::ColourControl(ActionOutcome::Activated(got)) if got == id
+            ),
+            "{id:?}: {reaction:?}"
+        );
+        // What the app does with it.
+        let effect = rig.colour.apply_edit(
+            &mut rig.workspace,
+            &mut rig.focus,
+            &rig.scales,
+            crate::ColourEdit::Activated(id),
+        );
+        rig.apply(effect);
+    }
+    // swatch fg (opens), bg (retargets), swap (swapped), defaults (reset).
+    assert_eq!(rig.colour.state, ColourState::default());
+    assert_eq!(
+        rig.colour.popover.map(|open| open.target),
+        Some(ColourTarget::Background)
+    );
+    // A picker report reaches only the picker's own colour.
+    let Some(open) = rig.colour.popover else {
+        unreachable!("open");
+    };
+    let effect = rig.colour.apply_edit(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &rig.scales,
+        crate::ColourEdit::Picked(open.picker, [0.5_f32, 0.25, 0.75].map(f32::to_bits)),
+    );
+    assert!(effect.changed);
+    assert_eq!(rig.colour.state.background(), [0.5, 0.25, 0.75]);
+    assert_eq!(rig.colour.state.foreground(), [0.0; 3]);
+    let _ = rig.colour.apply_edit(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &rig.scales,
+        crate::ColourEdit::Picked(c.group, [0.9_f32; 3].map(f32::to_bits)),
+    );
+    assert_eq!(
+        rig.colour.state.foreground(),
+        [0.0; 3],
+        "a stranger picker is ignored"
     );
 }

@@ -707,6 +707,21 @@ mod tests {
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
         assert_eq!(IconKind::ALL.len(), 27);
+        for kind in [IconKind::SwapArrows, IconKind::DefaultColours] {
+            assert!(IconKind::ALL.contains(&kind));
+            assert!(!icon_parts(kind).is_empty(), "{kind:?}");
+        }
+        // The defaults icon is the one with a solid square (black over white).
+        assert!(
+            icon_parts(IconKind::DefaultColours)
+                .iter()
+                .any(|p| p.style == PartStyle::Fill)
+        );
+        assert!(
+            icon_parts(IconKind::SwapArrows)
+                .iter()
+                .all(|p| p.style == PartStyle::Stroke)
+        );
         for (i, a) in IconKind::ALL.iter().enumerate() {
             assert!(!a.name().is_empty());
             for b in IconKind::ALL.iter().skip(i + 1) {

@@ -236,7 +236,7 @@
 //! already does for painting. **Eyedropper finished the same week**:
 //! `sample_pixel` reads one texel straight out of the active layer's
 //! own tile store surface (`TileStore::get`, no interpolation), and
-//! `App::sample_eyedropper` sets it as `current_colour` — what `Brush`
+//! `App::sample_eyedropper` sets it as the foreground colour (`App::colour`, 0.208.0) — what `Brush`
 //! now actually paints with, replacing what used to be a fixed
 //! constant — as long as the sampled texel is actually painted (alpha
 //! `> 0.0`; a fully transparent one, painted-then-erased or never
@@ -4626,6 +4626,10 @@ enum AccessibilityReaction {
     /// A `Click` on a Layer actions toolbar button (0.196.0): the app
     /// runs that action ([`AccessibilityEffects::layer_action`]).
     LayerAction(aurora_ui::LayerAction),
+    /// An action on a Tools-panel colour control or its picker popover
+    /// (0.208.0): the app applies it to the colours
+    /// ([`AccessibilityEffects::colour`]).
+    ColourControl(aurora_widgets::ActionOutcome),
     /// A Layers-panel row group expanded or collapsed: the caller must
     /// reconcile its own row map ([`App::handle_accessibility_action`]).
     LayerRowExpanded { row: WidgetId, expanded: bool },
@@ -4726,6 +4730,8 @@ fn route_accessibility_action(
                 AccessibilityReaction::SelectTool(tool)
             } else if let Some(action) = workspace.layer_toolbar.action_for(id) {
                 AccessibilityReaction::LayerAction(action)
+            } else if aurora_ui::is_colour_control(&workspace.tree, id) {
+                AccessibilityReaction::ColourControl(aurora_widgets::ActionOutcome::Activated(id))
             } else if let Some(panel) = workspace.panel_strip.panel_for(id) {
                 open_from_panel_strip(workspace, focus, id);
                 AccessibilityReaction::PanelStrip(panel)
@@ -4743,6 +4749,9 @@ fn route_accessibility_action(
             if layer_rows.contains_key(&id) =>
         {
             AccessibilityReaction::LayerRowExpanded { row: id, expanded }
+        }
+        Ok(outcome) if aurora_ui::is_colour_control(&workspace.tree, request.target_node) => {
+            AccessibilityReaction::ColourControl(outcome)
         }
         Ok(outcome)
             if layer_controls.is_some_and(|controls| {
@@ -4917,6 +4926,19 @@ struct AccessibilityEffects {
     /// A Layer actions toolbar button an assistive technology clicked
     /// (0.196.0); the App runs it (`App::run_layer_action`).
     layer_action: Option<aurora_ui::LayerAction>,
+    /// A colour control an assistive technology used (0.208.0); the App
+    /// applies it to the colours (`App::apply_colour_edit`).
+    colour: Option<ColourEdit>,
+}
+
+/// A colour control's accessibility action, reduced to comparable data
+/// (an `f32` colour travels as bits so the effects stay `Eq`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColourEdit {
+    /// A swatch, swap or defaults button was clicked.
+    Activated(WidgetId),
+    /// The picker `.0` reported the straight sRGB colour `.1` (bits).
+    Picked(WidgetId, [u32; 3]),
 }
 
 /// Whether an outcome the app maps to no reaction of its own is
@@ -5231,6 +5253,22 @@ fn apply_accessibility_action(
                 dialog: None,
                 close_tab: None,
                 layer_action: Some(action),
+                colour: None,
+            };
+        }
+        AccessibilityReaction::ColourControl(outcome) => {
+            let colour = match outcome {
+                aurora_widgets::ActionOutcome::Activated(id) => Some(ColourEdit::Activated(id)),
+                aurora_widgets::ActionOutcome::ColorChanged { picker, hsv, .. } => Some(
+                    ColourEdit::Picked(picker, hsv.to_srgb_f32().map(f32::to_bits)),
+                ),
+                _ => None,
+            };
+            return AccessibilityEffects {
+                relayout: true,
+                redraw: true,
+                colour,
+                ..AccessibilityEffects::default()
             };
         }
         AccessibilityReaction::SelectTool(tool) => {
@@ -5241,6 +5279,7 @@ fn apply_accessibility_action(
                 dialog: None,
                 close_tab: None,
                 layer_action: None,
+                colour: None,
             };
         }
         AccessibilityReaction::Handled(outcome) if in_gallery => {
@@ -5271,6 +5310,7 @@ fn apply_accessibility_action(
                 dialog: None,
                 close_tab: Some(index),
                 layer_action: None,
+                colour: None,
             };
         }
         AccessibilityReaction::PanelStrip(panel) => {
@@ -5309,6 +5349,7 @@ fn apply_accessibility_action(
         dialog: dialog_result,
         close_tab: None,
         layer_action: None,
+        colour: None,
     }
 }
 
@@ -26403,6 +26444,12 @@ impl App {
         if let Some(action) = effects.layer_action {
             self.run_layer_action(action);
         }
+        if let Some(edit) = effects.colour {
+            let effect =
+                self.colour
+                    .apply_edit(&mut self.workspace, &mut self.focus, &self.scales, edit);
+            self.apply_colour_effect(effect);
+        }
         if let Some(tool) = effects.select_tool {
             self.select_tool_command(tool);
         }
@@ -28484,7 +28531,7 @@ impl App {
     /// half of the split that function's own doc comment describes. For
     /// `Drag::Eyedropper`, samples directly at the current point
     /// ([`Self::sample_eyedropper`]) every event, so dragging with the
-    /// Eyedropper tool held down updates `current_colour` live, the
+    /// Eyedropper tool held down updates the foreground colour live, the
     /// same as a real image editor's own eyedropper.
     fn handle_pointer_moved(&mut self, physical_position: (f64, f64)) {
         let position = logical_point(physical_position, self.scale_factor);
@@ -29101,7 +29148,7 @@ impl App {
     /// space) — every visible layer, in its own real blend order and
     /// opacity, exactly what's on screen — and, if the sampled texel is
     /// actually painted (alpha `> 0.0`), sets it as the new
-    /// [`Self::current_colour`] — what the Eyedropper tool does on a
+    /// foreground colour (`Alt` held: the background, 0.208.0) — what the Eyedropper tool does on a
     /// click or while dragging. Reads [`composite_surface_id`] rather
     /// than the active layer's own surface: `App::redraw`'s own
     /// [`recomposite_visible_tiles`] call keeps that reserved surface's
@@ -33702,6 +33749,7 @@ mod tests {
                         dialog: None,
                         close_tab: None,
                         layer_action: None,
+                        colour: None,
                     },
                     "{tool:?}"
                 );
@@ -33897,6 +33945,7 @@ mod tests {
             dialog: None,
             close_tab: None,
             layer_action: None,
+            colour: None,
         };
 
         /// A group `g` holding `c`, plus a top-level `top`.
@@ -38831,7 +38880,21 @@ mod tests {
 
         // 0.160.0: the tools panel's buttons come first in tab order, one
         // stop each; the docked panels follow them.
-        for (_, button) in workspace.tools.buttons {
+        // 0.208.0: then the colour controls, in tree order.
+        let colours = workspace.tools.colours;
+        let stops: Vec<_> = workspace
+            .tools
+            .buttons
+            .iter()
+            .map(|(_, id)| *id)
+            .chain([
+                colours.background,
+                colours.foreground,
+                colours.swap,
+                colours.defaults,
+            ])
+            .collect();
+        for button in stops {
             let _ = run_command(
                 &mut workspace,
                 &mut focus,

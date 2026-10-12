@@ -49,7 +49,7 @@ use aurora_theme::{Color, Scales};
 use aurora_widgets::icons::IconKind;
 use aurora_widgets::widgets::{self, IconSize, WidgetKind};
 use aurora_widgets::{PaintLayer, WidgetError, WidgetId, WidgetTree};
-use taffy::style_helpers::{auto, length, percent};
+use taffy::style_helpers::{auto, length, percent, zero};
 use taffy::{FlexDirection, Position, Rect as LayoutRect, Size, Style};
 
 /// The group's accessible label.
@@ -337,6 +337,7 @@ fn build(
     Ok(controls)
 }
 
+#[derive(Clone, Copy)]
 enum Place {
     TopRight,
     BottomLeft,
@@ -351,15 +352,15 @@ fn place(tree: &mut WidgetTree<WidgetKind>, id: WidgetId, at: Place) -> Result<(
     style.inset = match at {
         Place::TopRight => LayoutRect {
             left: auto(),
-            right: length(0.0_f32),
-            top: length(0.0_f32),
+            right: zero(),
+            top: zero(),
             bottom: auto(),
         },
         Place::BottomLeft => LayoutRect {
-            left: length(0.0_f32),
+            left: zero(),
             right: auto(),
             top: auto(),
-            bottom: length(0.0_f32),
+            bottom: zero(),
         },
     };
     tree.set_style(id, style)
@@ -470,7 +471,7 @@ pub fn open_colour_popover(
             left: percent(1.0_f32),
             right: auto(),
             top: auto(),
-            bottom: length(0.0_f32),
+            bottom: zero(),
         },
         ..Default::default()
     };
@@ -516,6 +517,7 @@ pub fn close_colour_popover(
 mod tests {
     use super::*;
     use crate::workspace::build_workspace;
+    use aurora_widgets::icons::IconKind;
 
     fn scales() -> Scales {
         const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
@@ -568,5 +570,139 @@ mod tests {
         assert_eq!(c.action_for(c.defaults), Some(ColourAction::Reset));
         assert_eq!(c.action_for(c.group), None);
         assert_eq!(ColourTarget::Foreground.other(), ColourTarget::Background);
+    }
+    #[test]
+    fn the_group_is_the_last_child_of_the_strip_behind_a_rule() {
+        let ws = build_workspace(&scales());
+        let children = ws.tree.children(ws.tools.root).unwrap_or_default();
+        assert_eq!(children.last(), Some(&ws.tools.colours.group));
+        let Some(rule) = children.get(children.len().saturating_sub(2)) else {
+            unreachable!("a rule precedes the group");
+        };
+        assert_eq!(
+            ws.tree.accessibility(*rule).map(accesskit::Node::role),
+            Some(Role::Splitter)
+        );
+        let Some(node) = ws.tree.accessibility(ws.tools.colours.group) else {
+            unreachable!("built");
+        };
+        assert_eq!(node.role(), Role::Group);
+        assert_eq!(node.label(), Some(COLOUR_CONTROLS_LABEL));
+        let c = ws.tools.colours;
+        // Background first so the foreground paints in front.
+        assert_eq!(
+            ws.tree.children(c.group),
+            Some(&[c.background, c.foreground, c.swap, c.defaults][..])
+        );
+        for id in [c.group, c.background, c.foreground, c.swap, c.defaults] {
+            assert!(is_colour_control(&ws.tree, id));
+        }
+        assert!(!is_colour_control(&ws.tree, ws.tools.root));
+        assert!(!is_colour_control(&ws.tree, ws.tools.buttons[0].1));
+        assert!(!is_colour_control(&ws.tree, ws.canvas_area));
+    }
+
+    #[test]
+    fn the_buttons_wear_the_new_icons() {
+        let ws = build_workspace(&scales());
+        let c = ws.tools.colours;
+        for (id, icon) in [
+            (c.swap, IconKind::SwapArrows),
+            (c.defaults, IconKind::DefaultColours),
+        ] {
+            let Some(WidgetKind::Button(state)) = ws.tree.payload(id) else {
+                unreachable!("a button");
+            };
+            assert_eq!(state.icon, Some((icon, COLOUR_BUTTON_ICON_SIZE)));
+        }
+    }
+
+    #[test]
+    fn the_popover_opens_beside_the_group_floats_above_and_closes_clean() {
+        let scales = scales();
+        let mut ws = build_workspace(&scales);
+        ws.tree.compute_layout(1000.0, 800.0);
+        let before = ws.tree.len();
+        let c = ws.tools.colours;
+        let Ok(open) = open_colour_popover(
+            &mut ws.tree,
+            &c,
+            &scales,
+            ColourTarget::Foreground,
+            [0.0; 3],
+        ) else {
+            unreachable!("opens");
+        };
+        ws.tree.compute_layout(1000.0, 800.0);
+        assert_eq!(ws.tree.layer(open.frame), Some(PaintLayer::Popover));
+        assert!(open.contains(&ws.tree, open.picker));
+        let (Some(frame), Some(strip), Some(group)) = (
+            ws.tree.bounds(open.frame),
+            ws.tree.bounds(ws.tools.root),
+            ws.tree.bounds(c.group),
+        ) else {
+            unreachable!("laid out");
+        };
+        assert!(
+            frame.x >= group.x + i64::from(group.width),
+            "right of the group"
+        );
+        assert!(
+            frame.x + i64::from(frame.width) <= 1000,
+            "inside the window"
+        );
+        assert_eq!(
+            frame.y + i64::from(frame.height),
+            group.y + i64::from(group.height),
+            "anchored to the group's bottom"
+        );
+        let _ = strip;
+        // Its picker accepts a hit.
+        let Some(picker) = ws.tree.bounds(open.picker) else {
+            unreachable!("laid out");
+        };
+        let centre = (
+            picker.x as f32 + picker.width as f32 / 2.0,
+            picker.y as f32 + picker.height as f32 / 2.0,
+        );
+        assert!(
+            ws.tree
+                .hit_test(centre)
+                .is_some_and(|hit| open.contains(&ws.tree, hit))
+        );
+        assert!(close_colour_popover(&mut ws.tree, &open).is_ok());
+        assert_eq!(ws.tree.len(), before, "nothing is left behind");
+        assert!(close_colour_popover(&mut ws.tree, &open).is_err());
+    }
+
+    #[test]
+    fn the_gallery_shows_the_new_icons_in_every_tone() {
+        let scales = scales();
+        let mut ws = build_workspace(&scales);
+        let root = ws.root;
+        let Ok(_gallery) = crate::insert_gallery_panel(&mut ws.tree, root, &scales) else {
+            unreachable!("the gallery builds");
+        };
+        let shown = |kind: IconKind| {
+            ws.tree
+                .paint_order()
+                .into_iter()
+                .filter(|id| {
+                    matches!(ws.tree.payload(*id), Some(WidgetKind::Icon(state)) if state.kind == kind)
+                })
+                .count()
+        };
+        for kind in [IconKind::SwapArrows, IconKind::DefaultColours] {
+            assert!(shown(kind) >= 3, "{kind:?} in three tones: {}", shown(kind));
+        }
+    }
+
+    #[test]
+    fn a_failed_build_leaves_no_partial_group() {
+        let mut ws = build_workspace(&scales());
+        let bogus = accesskit::NodeId(u64::MAX);
+        assert!(
+            insert_colour_controls(&mut ws.tree, bogus, &scales(), [0.0; 3], [1.0; 3]).is_err()
+        );
     }
 }

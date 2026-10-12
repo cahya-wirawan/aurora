@@ -252,13 +252,46 @@ impl ColourController {
                 Some(ColourAction::Reset) => self.reset(workspace),
                 None => Effect::NONE,
             },
-            ActionOutcome::ColorChanged { picker, hsv, .. } => match self.popover {
-                Some(open) if open.picker == *picker => {
-                    self.set(workspace, open.target, hsv.to_srgb_f32())
-                }
-                _ => Effect::NONE,
-            },
+            ActionOutcome::ColorChanged { picker, hsv, .. } => {
+                self.picked(workspace, *picker, hsv.to_srgb_f32())
+            }
             _ => Effect::NONE,
+        }
+    }
+
+    /// The open picker `picker` reported `rgb`: edit the colour it was
+    /// opened for. A report from any other picker is ignored.
+    pub(crate) fn picked(
+        &mut self,
+        workspace: &mut aurora_ui::Workspace,
+        picker: aurora_widgets::WidgetId,
+        rgb: [f32; 3],
+    ) -> Effect {
+        match self.popover {
+            Some(open) if open.picker == picker => self.set(workspace, open.target, rgb),
+            _ => Effect::NONE,
+        }
+    }
+
+    /// An assistive technology's action on a colour control, as the app
+    /// receives it ([`crate::ColourEdit`]).
+    pub(crate) fn apply_edit(
+        &mut self,
+        workspace: &mut aurora_ui::Workspace,
+        focus: &mut FocusManager,
+        scales: &Scales,
+        edit: crate::ColourEdit,
+    ) -> Effect {
+        match edit {
+            crate::ColourEdit::Activated(id) => self.apply_outcome(
+                workspace,
+                focus,
+                scales,
+                &PointerOutcome::Action(ActionOutcome::Activated(id)),
+            ),
+            crate::ColourEdit::Picked(picker, bits) => {
+                self.picked(workspace, picker, bits.map(f32::from_bits))
+            }
         }
     }
 
@@ -348,6 +381,7 @@ impl ColourController {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // exact constants and exact copies, not computed values
 mod tests {
     use super::*;
 
