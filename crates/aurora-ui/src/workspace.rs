@@ -1331,7 +1331,11 @@ mod tests {
     #[test]
     fn the_tools_panel_and_options_bar_take_token_sized_space_and_never_overlap() {
         let scales = test_scales();
-        let (xs, md) = (scales.spacing.xs, scales.spacing.md);
+        let xs = scales.spacing.xs;
+        // 0.207.0: two 32 px icon buttons (a 24 px icon plus `spacing.xxs`
+        // each side) and `spacing.xxs` of padding each side.
+        let tools_w = 2 * (scales.spacing.lg + 2 * scales.spacing.xxs) + 2 * scales.spacing.xxs;
+        assert_eq!(tools_w, 72, "the default tools strip is 72 px wide");
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let row = aurora_widgets::widgets::row_height(&scales) as u32;
         for (window, rail) in [
@@ -1353,7 +1357,7 @@ mod tests {
             let rail_bounds = bounds_of(&ws, ws.rail);
             let case = format!("window {window:?}, rail {rail}");
 
-            assert_eq!(tools.width, 2 * xs + 2 * md, "{case}: {tools:?}");
+            assert_eq!(tools.width, tools_w, "{case}: {tools:?}");
             assert_eq!((tools.x, tools.y), (0, 0), "{case}");
             assert_eq!(bar.height, row + 2 * xs, "{case}: {bar:?}");
             assert_eq!(column.x, i64::from(tools.width), "{case}");
@@ -1391,7 +1395,8 @@ mod tests {
             ] {
                 assert!(!overlaps(a, b), "{case}: {name} overlap: {a:?} {b:?}");
             }
-            // Every tool button is laid out inside the strip, stacked.
+            // Every tool button is laid out inside the strip, in reading
+            // order (0.207.0: two to a row), never overlapping another.
             let mut previous: Option<aurora_core::Rect> = None;
             for (_, id) in ws.tools.buttons {
                 let button = bounds_of(&ws, id);
@@ -1401,7 +1406,11 @@ mod tests {
                     "{case}: {button:?} outside {tools:?}"
                 );
                 if let Some(before) = previous {
-                    assert!(button.y >= before.y + i64::from(before.height), "{case}");
+                    assert!(
+                        (button.y, button.x) > (before.y, before.x),
+                        "{case}: reading order {before:?} then {button:?}"
+                    );
+                    assert!(!overlaps(before, button), "{case}");
                 }
                 previous = Some(button);
             }
@@ -1813,9 +1822,11 @@ mod tests {
             let mut ws = build_workspace(&test_scales());
             fill_panels(&mut ws, &scales, which, 5);
             // 0.160.0: the tools panel never shrinks, so "a 1 px
-            // window" is now 1 px beyond the tools panel's own width.
+            // window" is now 1 px beyond the tools panel's own width
+            // (0.207.0: 72 px, two icon buttons and `spacing.xxs` padding).
             #[allow(clippy::cast_precision_loss)]
-            let tools = (2 * scales.spacing.xs + 2 * scales.spacing.md) as f32;
+            let tools =
+                (2 * (scales.spacing.lg + 2 * scales.spacing.xxs) + 2 * scales.spacing.xxs) as f32;
             ws.tree.compute_layout(tools + 1.0, 200.0);
 
             let Some(rail) = ws.tree.bounds(ws.rail) else {

@@ -1,14 +1,37 @@
-//! The left tools panel (0.160.0): a narrow, vertical, non-scrolling strip
-//! on the canvas area's left edge holding one text-labelled toggle button
-//! per [`Tool`] — the first of the workspace rounds, following
-//! Photoshop's layout convention (tools on the left, the active tool's
-//! options across the top) in Aurora's own tokens.
+//! The left tools panel: a narrow, non-scrolling strip on the canvas
+//! area's left edge holding one flat **icon** toggle button per [`Tool`],
+//! laid out the way Photoshop's Tools panel is (reference
+//! `images/photoshop-workspace-01.jpg`, section C) in Aurora's own
+//! tokens.
 //!
-//! **Text labels, not icons** — the design owner's call (Cahya,
-//! 2026-10-09): real icons wait for an icon set. Every size here comes
-//! from spacing tokens and, in the running app, from text measurement
-//! (`aurora_widgets::compute_text_layout` measures a toggle button's
-//! label); nothing is a literal.
+//! **0.207.0 rebuild.** The panel began (0.160.0) as a column of
+//! text-labelled toggle buttons, the design owner's call until an icon
+//! set existed (Cahya, 2026-10-09). The set exists since 0.194.0, so the
+//! labels are gone: each button is an
+//! [`insert_icon_toggle_button`](aurora_widgets::widgets::insert_icon_toggle_button)
+//! ([`TOOL_ICON_SIZE`], a 32 px square: the 24 px icon plus `spacing.xxs`
+//! each side), flat at rest, tinted `state.hover_overlay` when the owner
+//! says it is hovered ([`set_tools_panel_hover`]) and `state.active_overlay`
+//! while pressed, and **on** for the selected tool: filled `accent.primary`
+//! with the icon in `icon.on_accent` (so the selected tool differs by a
+//! filled square, not by hue alone, and by the accesskit `toggled` state).
+//!
+//! **Two columns.** Photoshop packs its tools two to a row, and the panel
+//! can do so with existing tokens only: the strip is `2 x 32 px` plus
+//! `spacing.xxs` of padding each side, 72 px at the default density
+//! (the text-labelled strip was about 140 px: `spacing.xs` each side, the
+//! widest label "Marquee Select" and `spacing.md` of button padding). The
+//! buttons sit in [`TOOL_GROUPS`], one row per group of at most two, and a
+//! group rule ([`widgets::insert_separator`], the menu separator's 1 px
+//! `border.default` line) separates the groups: move and select, view,
+//! sample, paint — Photoshop's own grouping, trimmed to the tools Aurora
+//! has. A group of one (the Eyedropper) fills the left cell.
+//!
+//! **Not here yet: the colour swatches.** Photoshop shows the foreground
+//! and background colours at the strip's foot. Aurora has no
+//! foreground/background colour model (the Brush paints with whatever
+//! the Eyedropper last sampled), and the swatches would need one, so
+//! none is drawn; it is future work for the round that adds it.
 //!
 //! **This module owns no tool state.** Which tool is active is
 //! `aurora-app`'s (`App::tool`); a click or an assistive-technology
@@ -16,16 +39,31 @@
 //! `SelectTool` command a shortcut uses, and the app then mirrors the
 //! result back with [`sync_tools_panel`]. The buttons behave as a radio
 //! group: exactly one is "on" (accesskit `toggled`), clicking the
-//! selected one leaves it selected.
+//! selected one leaves it selected. **Accessibility:** every button keeps
+//! the tool's full name as its accessible name (never drawn) and a
+//! description — "Name tool, shortcut V" — the text a tooltip would show
+//! and a screen reader reads after the name.
 //!
 //! **Keyboard: each button is its own `Tab` stop**, in [`Tool::ALL`]
-//! order — the cheap option, chosen over the arrow-key toolbar pattern
-//! (one stop, roving focus) because the toolkit has no roving-focus
-//! mechanism yet; `Space`/`Enter` on a focused button clicks it.
+//! order (the reading order of the grid) — the cheap option, chosen over
+//! the arrow-key toolbar pattern (one stop, roving focus) because the
+//! toolkit has no roving-focus mechanism yet; `Space`/`Enter` on a
+//! focused button clicks it. The separators are not stops.
+//!
+//! **Hover** is app-driven like the Layers toolbar's: the widget layer
+//! tracks no pointer, so `aurora-app` calls [`set_tools_panel_hover`].
+//!
+//! Every size is a token or derived from one; nothing is a literal. The
+//! icons are the provisional set of [`aurora_widgets::icons`] and have
+//! not been seen by a human, nor on the Mac. There is no per-tool-button
+//! size token: the strip reuses the Layers toolbar's button size
+//! ([`aurora_widgets::widgets::icon_button_side`] at [`IconSize::Large`]),
+//! which is a gap for the design owner to settle.
 
 use accesskit::{Node, Orientation, Role};
 use aurora_theme::Scales;
-use aurora_widgets::widgets::{self, WidgetKind};
+use aurora_widgets::icons::IconKind;
+use aurora_widgets::widgets::{self, IconSize, WidgetKind};
 use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
 use taffy::style_helpers::length;
 use taffy::{FlexDirection, Rect as LayoutRect, Size, Style};
@@ -34,6 +72,44 @@ use crate::tool::Tool;
 
 /// The tools panel's accessible label.
 pub const TOOLS_PANEL_LABEL: &str = "Tools";
+
+/// The icon size of a tool button: the Layers toolbar's.
+pub const TOOL_ICON_SIZE: IconSize = IconSize::Large;
+
+/// How many buttons share a row of the grid.
+pub const TOOL_COLUMNS: usize = 2;
+
+/// The groups of the strip, top to bottom, each one row of at most
+/// [`TOOL_COLUMNS`] buttons, a rule between consecutive groups. Together
+/// they hold every tool of [`Tool::ALL`], in that order.
+pub const TOOL_GROUPS: [&[Tool]; 4] = [
+    &[Tool::Move, Tool::MarqueeSelect],
+    &[Tool::Zoom, Tool::Pan],
+    &[Tool::Eyedropper],
+    &[Tool::Brush, Tool::Eraser],
+];
+
+/// The icon on `tool`'s button. (`Move` and `Brush` are the icons the
+/// Layers lock row already uses for "position" and "image pixels", as in
+/// Photoshop.)
+#[must_use]
+pub const fn tool_icon(tool: Tool) -> IconKind {
+    match tool {
+        Tool::Move => IconKind::Move,
+        Tool::MarqueeSelect => IconKind::Marquee,
+        Tool::Zoom => IconKind::ZoomIn,
+        Tool::Pan => IconKind::Hand,
+        Tool::Eyedropper => IconKind::Eyedropper,
+        Tool::Brush => IconKind::Brush,
+        Tool::Eraser => IconKind::Eraser,
+    }
+}
+
+/// `tool`'s button description: its name and its shortcut key.
+#[must_use]
+pub fn tool_description(tool: Tool) -> String {
+    format!("{} tool, shortcut {}", tool.label(), tool.shortcut_key())
+}
 
 /// The strip and its buttons, one per [`Tool::ALL`] entry, in that order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,9 +140,54 @@ impl ToolsPanel {
     }
 }
 
-/// The strip's style: a column, never shrinking below its content (so a
-/// narrow window squeezes the canvas, never the tool labels), padded and
-/// gapped by `spacing.xs`. Its width is its widest button's.
+#[allow(clippy::cast_precision_loss)]
+fn px(token: u32) -> f32 {
+    token as f32
+}
+
+/// The strip's width: two buttons side by side plus `spacing.xxs` of
+/// padding each side.
+#[must_use]
+pub fn tools_panel_width(scales: &Scales) -> f32 {
+    TOOL_COLUMNS as f32 * widgets::icon_button_side(scales, TOOL_ICON_SIZE)
+        + 2.0 * px(scales.spacing.xxs)
+}
+
+/// The strip's own style: a column, never shrinking below its content (so
+/// a narrow window squeezes the canvas, never the tools), padded by
+/// `spacing.xxs`, no gaps — each button carries its own `spacing.xxs` of
+/// room round its icon.
+fn strip_style(scales: &Scales) -> Style {
+    let pad = length(px(scales.spacing.xxs));
+    Style {
+        flex_direction: FlexDirection::Column,
+        flex_shrink: 0.0,
+        padding: LayoutRect {
+            left: pad,
+            right: pad,
+            top: pad,
+            bottom: pad,
+        },
+        ..Default::default()
+    }
+}
+
+/// One group's row: its buttons side by side from the left.
+fn group_style() -> Style {
+    Style {
+        flex_direction: FlexDirection::Row,
+        flex_shrink: 0.0,
+        size: Size {
+            width: taffy::style_helpers::auto(),
+            height: taffy::style_helpers::auto(),
+        },
+        ..Default::default()
+    }
+}
+
+/// The style the label strip (`panel_strip`) uses: a column of text
+/// buttons, padded and gapped by `spacing.xs`. (It began as the old
+/// tools panel's style and kept it when the tools went to icons.)
 pub(crate) fn tools_style(scales: &Scales) -> Style {
     #[allow(clippy::cast_precision_loss)]
     let pad = length(scales.spacing.xs as f32);
@@ -103,7 +224,7 @@ pub fn insert_tools_panel(
     let mut node = Node::new(Role::Toolbar);
     node.set_label(TOOLS_PANEL_LABEL);
     node.set_orientation(Orientation::Vertical);
-    let root = tree.insert(parent, tools_style(scales), node, WidgetKind::Container)?;
+    let root = tree.insert(parent, strip_style(scales), node, WidgetKind::Container)?;
     let built = build(tree, root, scales, selected);
     if built.is_err() {
         let _ = tree.remove(root);
@@ -118,9 +239,27 @@ fn build(
     selected: Tool,
 ) -> Result<ToolsPanel, WidgetError> {
     let mut buttons = [(Tool::default(), root); Tool::ALL.len()];
-    for (slot, tool) in buttons.iter_mut().zip(Tool::ALL) {
-        let id = widgets::insert_toggle_button(tree, root, scales, tool.label(), tool == selected)?;
-        *slot = (tool, id);
+    let mut slots = buttons.iter_mut();
+    for (index, group) in TOOL_GROUPS.iter().enumerate() {
+        if index > 0 {
+            widgets::insert_separator(tree, root, scales)?;
+        }
+        let row = widgets::insert_container(tree, root, group_style())?;
+        for &tool in *group {
+            let id = widgets::insert_icon_toggle_button(
+                tree,
+                row,
+                scales,
+                tool.label(),
+                tool_icon(tool),
+                TOOL_ICON_SIZE,
+                tool == selected,
+            )?;
+            widgets::set_button_description(tree, id, Some(&tool_description(tool)))?;
+            if let Some(slot) = slots.next() {
+                *slot = (tool, id);
+            }
+        }
     }
     Ok(ToolsPanel { root, buttons })
 }
@@ -167,11 +306,43 @@ pub fn tools_panel_contains(
     tree.is_within(panel.root, id)
 }
 
+/// Whether `id` is one of the panel's tool buttons.
+#[must_use]
+pub fn is_tools_panel_button(panel: &ToolsPanel, id: WidgetId) -> bool {
+    panel.tool_for(id).is_some()
+}
+
+/// Points the hover tint at `hovered` (a button of this panel) and clears
+/// it from every other one; `None` clears all. Returns whether anything
+/// changed.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`]/[`WidgetError::WrongWidgetKind`]
+/// if a button is missing or is not a button.
+pub fn set_tools_panel_hover(
+    tree: &mut WidgetTree<WidgetKind>,
+    panel: &ToolsPanel,
+    hovered: Option<WidgetId>,
+) -> Result<bool, WidgetError> {
+    let mut changed = false;
+    for (_, id) in panel.buttons {
+        changed |= widgets::set_button_hovered(tree, id, hovered == Some(id))?;
+    }
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TOOLS_PANEL_LABEL, selected_tool, sync_tools_panel, tools_panel_contains};
+    use super::{
+        TOOL_COLUMNS, TOOL_GROUPS, TOOLS_PANEL_LABEL, is_tools_panel_button, selected_tool,
+        set_tools_panel_hover, sync_tools_panel, tool_description, tool_icon, tools_panel_contains,
+        tools_panel_width,
+    };
     use crate::tool::Tool;
-    use crate::workspace::build_workspace;
+    use crate::workspace::{Workspace, build_workspace};
+    use aurora_widgets::icons::IconKind;
+    use aurora_widgets::widgets::{IconSize, WidgetKind};
 
     fn scales() -> aurora_theme::Scales {
         const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
@@ -181,8 +352,27 @@ mod tests {
         }
     }
 
+    fn bounds(ws: &Workspace, id: aurora_widgets::WidgetId) -> aurora_core::Rect {
+        match ws.tree.bounds(id) {
+            Some(bounds) => bounds,
+            None => unreachable!("{id:?} is laid out"),
+        }
+    }
+
+    /// The icon each tool must wear, written out independently of
+    /// [`tool_icon`] so a mapped-to-the-wrong-tool slip fails.
+    const EXPECTED_ICONS: [(Tool, IconKind); 7] = [
+        (Tool::Move, IconKind::Move),
+        (Tool::MarqueeSelect, IconKind::Marquee),
+        (Tool::Zoom, IconKind::ZoomIn),
+        (Tool::Pan, IconKind::Hand),
+        (Tool::Eyedropper, IconKind::Eyedropper),
+        (Tool::Brush, IconKind::Brush),
+        (Tool::Eraser, IconKind::Eraser),
+    ];
+
     #[test]
-    fn the_panel_is_a_labelled_vertical_toolbar_with_one_toggle_per_tool() {
+    fn the_panel_is_a_labelled_vertical_toolbar_with_one_icon_toggle_per_tool() {
         let ws = build_workspace(&scales());
         let Some(node) = ws.tree.accessibility(ws.tools.root) else {
             unreachable!("built");
@@ -190,29 +380,115 @@ mod tests {
         assert_eq!(node.role(), accesskit::Role::Toolbar);
         assert_eq!(node.label(), Some(TOOLS_PANEL_LABEL));
         assert_eq!(node.orientation(), Some(accesskit::Orientation::Vertical));
-        let children = ws.tree.children(ws.tools.root).unwrap_or_default();
-        assert_eq!(children.len(), Tool::ALL.len());
-        for ((tool, id), child) in ws.tools.buttons.iter().zip(children) {
-            assert_eq!(id, child, "buttons are in Tool::ALL order");
-            let Some(node) = ws.tree.accessibility(*id) else {
+        for (tool, id) in ws.tools.buttons {
+            let Some(node) = ws.tree.accessibility(id) else {
                 unreachable!("built");
             };
             assert_eq!(node.role(), accesskit::Role::Button);
+            // The full name is the accessible name, never drawn.
             assert_eq!(node.label(), Some(tool.label()));
             assert!(node.supports_action(accesskit::Action::Click));
             assert!(node.supports_action(accesskit::Action::Focus));
-            let expected = if *tool == Tool::default() {
+            let expected = if tool == Tool::default() {
                 accesskit::Toggled::True
             } else {
                 accesskit::Toggled::False
             };
             assert_eq!(node.toggled(), Some(expected), "{tool:?}");
-            assert_eq!(ws.tools.tool_for(*id), Some(*tool));
-            assert_eq!(ws.tools.button_for(*tool), Some(*id));
-            assert!(tools_panel_contains(&ws.tree, &ws.tools, *id));
+            assert_eq!(ws.tools.tool_for(id), Some(tool));
+            assert_eq!(ws.tools.button_for(tool), Some(id));
+            assert!(tools_panel_contains(&ws.tree, &ws.tools, id));
+            assert!(is_tools_panel_button(&ws.tools, id));
+            // An icon button: the picture, no text.
+            let Some(WidgetKind::Button(state)) = ws.tree.payload(id) else {
+                unreachable!("a button");
+            };
+            assert_eq!(state.icon.map(|(_, size)| size), Some(IconSize::Large));
         }
         assert_eq!(ws.tools.tool_for(ws.canvas_area), None);
+        assert!(!is_tools_panel_button(&ws.tools, ws.tools.root));
         assert_eq!(selected_tool(&ws.tree, &ws.tools), Some(Tool::default()));
+    }
+
+    /// Every tool wears its own icon, distinct from every other tool's.
+    #[test]
+    fn every_tool_button_wears_its_own_icon() {
+        let ws = build_workspace(&scales());
+        assert_eq!(EXPECTED_ICONS.len(), Tool::ALL.len());
+        for (tool, icon) in EXPECTED_ICONS {
+            assert_eq!(tool_icon(tool), icon, "{tool:?}");
+            let Some(id) = ws.tools.button_for(tool) else {
+                unreachable!("every tool has a button");
+            };
+            let Some(WidgetKind::Button(state)) = ws.tree.payload(id) else {
+                unreachable!("a button");
+            };
+            assert_eq!(state.icon.map(|(kind, _)| kind), Some(icon), "{tool:?}");
+        }
+        let mut icons: Vec<_> = Tool::ALL.iter().map(|t| tool_icon(*t).name()).collect();
+        icons.sort_unstable();
+        icons.dedup();
+        assert_eq!(icons.len(), Tool::ALL.len(), "no two tools share an icon");
+    }
+
+    /// A button's description is the tool's name and its shortcut letter.
+    #[test]
+    fn every_button_describes_its_tool_and_its_shortcut() {
+        let ws = build_workspace(&scales());
+        for (tool, id) in ws.tools.buttons {
+            let Some(node) = ws.tree.accessibility(id) else {
+                unreachable!("built");
+            };
+            let description = node.description().unwrap_or_default();
+            assert_eq!(description, tool_description(tool));
+            assert!(description.contains(tool.label()), "{description}");
+            assert!(
+                description.contains(&format!("shortcut {}", tool.shortcut_key())),
+                "{description}"
+            );
+        }
+        assert_eq!(tool_description(Tool::Brush), "Brush tool, shortcut B");
+        assert_eq!(
+            tool_description(Tool::MarqueeSelect),
+            "Marquee Select tool, shortcut M"
+        );
+    }
+
+    #[test]
+    fn the_groups_partition_the_tools_in_order_with_a_rule_between_groups() {
+        let flat: Vec<Tool> = TOOL_GROUPS.iter().flat_map(|g| g.iter().copied()).collect();
+        assert_eq!(
+            flat,
+            Tool::ALL.to_vec(),
+            "TOOL_GROUPS is Tool::ALL in order"
+        );
+        assert!(
+            TOOL_GROUPS
+                .iter()
+                .all(|g| (1..=TOOL_COLUMNS).contains(&g.len()))
+        );
+        let ws = build_workspace(&scales());
+        let children = ws.tree.children(ws.tools.root).unwrap_or_default();
+        // group, rule, group, rule, group, rule, group
+        assert_eq!(children.len(), 2 * TOOL_GROUPS.len() - 1);
+        for (index, child) in children.iter().enumerate() {
+            if index % 2 == 1 {
+                let Some(node) = ws.tree.accessibility(*child) else {
+                    unreachable!("built");
+                };
+                assert_eq!(node.role(), accesskit::Role::Splitter, "child {index}");
+                assert!(!node.supports_action(accesskit::Action::Focus));
+                assert!(matches!(
+                    ws.tree.payload(*child),
+                    Some(WidgetKind::MenuSeparator)
+                ));
+            } else {
+                let group = TOOL_GROUPS.get(index / 2).copied().unwrap_or(&[]);
+                let row = ws.tree.children(*child).unwrap_or_default();
+                let tools: Vec<Tool> = row.iter().filter_map(|id| ws.tools.tool_for(*id)).collect();
+                assert_eq!(tools, group.to_vec(), "group {}", index / 2);
+            }
+        }
     }
 
     #[test]
@@ -245,5 +521,143 @@ mod tests {
             ),
             "syncing the same tool again changes nothing"
         );
+    }
+
+    /// Hover follows the pointer to exactly one button and clears.
+    #[test]
+    fn hover_tints_one_button_at_a_time() {
+        let mut ws = build_workspace(&scales());
+        let hovered = |ws: &Workspace| -> Vec<Tool> {
+            ws.tools
+                .buttons
+                .iter()
+                .filter(|(_, id)| {
+                    matches!(ws.tree.payload(*id), Some(WidgetKind::Button(s)) if s.hovered)
+                })
+                .map(|(tool, _)| *tool)
+                .collect()
+        };
+        let Some(zoom) = ws.tools.button_for(Tool::Zoom) else {
+            unreachable!("built");
+        };
+        assert!(matches!(
+            set_tools_panel_hover(&mut ws.tree, &ws.tools, Some(zoom)),
+            Ok(true)
+        ));
+        assert_eq!(hovered(&ws), vec![Tool::Zoom]);
+        assert!(matches!(
+            set_tools_panel_hover(&mut ws.tree, &ws.tools, Some(zoom)),
+            Ok(false)
+        ));
+        assert!(matches!(
+            set_tools_panel_hover(&mut ws.tree, &ws.tools, None),
+            Ok(true)
+        ));
+        assert!(hovered(&ws).is_empty());
+    }
+
+    /// `Tab` visits the seven buttons in `Tool::ALL` order, one stop
+    /// each; the separators are never stops.
+    #[test]
+    fn tab_visits_each_button_once_in_tool_order_and_skips_the_rules() {
+        let mut ws = build_workspace(&scales());
+        let mut focus = aurora_widgets::FocusManager::new();
+        let mut visited = Vec::new();
+        for _ in 0..Tool::ALL.len() {
+            let Some(id) = focus.focus_next(&mut ws.tree) else {
+                unreachable!("a stop exists");
+            };
+            visited.push(id);
+        }
+        let expected: Vec<_> = ws.tools.buttons.iter().map(|(_, id)| *id).collect();
+        assert_eq!(visited, expected);
+    }
+
+    /// 0.207.0: the strip is two 32 px buttons and `spacing.xxs` padding
+    /// wide (72 px at the default), at scale 1 and under a 2x text engine
+    /// alike, and narrower than the text-labelled column it replaces
+    /// (rebuilt here from the same API the old panel used and measured with
+    /// the real text engine).
+    #[test]
+    fn the_strip_is_72_px_and_much_narrower_than_the_text_labelled_one() {
+        let scales = scales();
+        assert!((tools_panel_width(&scales) - 72.0).abs() < f32::EPSILON);
+        for scale_factor in [1.0_f32, 2.0] {
+            let mut ws = build_workspace(&scales);
+            let Ok(mut engine) = aurora_text::TextEngine::new() else {
+                unreachable!("the bundled font loads")
+            };
+            aurora_widgets::compute_text_layout(
+                &mut ws.tree,
+                1000.0,
+                800.0,
+                Some(aurora_widgets::TextMeasure {
+                    engine: &mut engine,
+                    scales: &scales,
+                    scale_factor,
+                }),
+            );
+            let strip = bounds(&ws, ws.tools.root);
+            assert_eq!(strip.width, 72, "scale {scale_factor}");
+            // The strip stretches to the window; its content is four
+            // groups of 32 px and three 8 px rules under 4 px of padding:
+            // the last button ends 4 + 4*32 + 3*8 = 156 px down.
+            let last = bounds(
+                &ws,
+                ws.tools.button_for(Tool::Eraser).unwrap_or(ws.tools.root),
+            );
+            assert_eq!(last.bottom() - strip.y, 156, "scale {scale_factor}");
+            for (_, id) in ws.tools.buttons {
+                let b = bounds(&ws, id);
+                assert_eq!((b.width, b.height), (32, 32), "scale {scale_factor}");
+            }
+            // Two to a row, left cell first; the lone Eyedropper in the
+            // left cell.
+            let at = |tool| bounds(&ws, ws.tools.button_for(tool).unwrap_or(ws.tools.root));
+            assert_eq!(at(Tool::Move).y, at(Tool::MarqueeSelect).y);
+            assert_eq!(at(Tool::Move).x + 32, at(Tool::MarqueeSelect).x);
+            assert_eq!(at(Tool::Eyedropper).x, at(Tool::Move).x);
+            assert!(at(Tool::Zoom).y > at(Tool::Move).y);
+            assert!(at(Tool::Brush).y > at(Tool::Eyedropper).y);
+        }
+        // The old strip, rebuilt: text toggle buttons in the label strip's
+        // column style, measured.
+        let (mut old, root) = aurora_widgets::widgets::new_tree(taffy::Style::default());
+        let column = match aurora_widgets::widgets::insert_container(
+            &mut old,
+            root,
+            super::tools_style(&scales),
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for tool in Tool::ALL {
+            if let Err(err) = aurora_widgets::widgets::insert_toggle_button(
+                &mut old,
+                column,
+                &scales,
+                tool.label(),
+                false,
+            ) {
+                unreachable!("{err:?}");
+            }
+        }
+        let Ok(mut engine) = aurora_text::TextEngine::new() else {
+            unreachable!("the bundled font loads")
+        };
+        aurora_widgets::compute_text_layout(
+            &mut old,
+            1000.0,
+            800.0,
+            Some(aurora_widgets::TextMeasure {
+                engine: &mut engine,
+                scales: &scales,
+                scale_factor: 1.0,
+            }),
+        );
+        let old_width = old.bounds(column).map_or(0, |b| b.width);
+        eprintln!("the text-labelled strip measured {old_width} px wide");
+        assert!(old_width > 100, "labels are measured: {old_width}");
+        assert!(old_width > 72 + 40, "much wider than 72: {old_width}");
     }
 }

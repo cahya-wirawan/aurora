@@ -92,6 +92,23 @@ impl Tool {
             Self::Eraser => "Eraser",
         }
     }
+
+    /// The single key that selects the tool, as it is shown to the user
+    /// (upper case, Photoshop's own letters). `aurora-app`'s shortcut
+    /// table binds the lower-case letter to `SelectTool`; a test there
+    /// checks that the two agree for every tool.
+    #[must_use]
+    pub const fn shortcut_key(self) -> char {
+        match self {
+            Self::Move => 'V',
+            Self::MarqueeSelect => 'M',
+            Self::Zoom => 'Z',
+            Self::Pan => 'H',
+            Self::Eyedropper => 'I',
+            Self::Brush => 'B',
+            Self::Eraser => 'E',
+        }
+    }
 }
 
 /// The axis-aligned [`Rect`] a marquee-select drag from `start` to
@@ -135,6 +152,15 @@ mod tests {
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
         assert_eq!(seen.len(), 7, "ALL must not repeat a variant");
+    }
+
+    #[test]
+    fn shortcut_keys_are_distinct_upper_case_letters() {
+        let mut keys: Vec<char> = Tool::ALL.iter().map(|tool| tool.shortcut_key()).collect();
+        assert!(keys.iter().all(char::is_ascii_uppercase), "{keys:?}");
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), Tool::ALL.len());
     }
 
     #[test]

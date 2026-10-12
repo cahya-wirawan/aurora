@@ -212,10 +212,24 @@ fn write_panel_png(
     scale: f32,
     name: &std::path::Path,
 ) {
+    let target = ws.layers.root;
+    write_crop_png(context, ws, scale, name, target);
+}
+
+/// Lays out `ws`, renders it at `scale` and writes `target`'s crop to
+/// `name`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn write_crop_png(
+    context: &aurora_gpu::GpuContext,
+    ws: &mut crate::Workspace,
+    scale: f32,
+    name: &std::path::Path,
+    target: aurora_widgets::WidgetId,
+) {
     let logical = (1280.0_f32, 800.0_f32);
     ws.tree.compute_layout(logical.0, logical.1);
     let (bytes, width, _height) = render_workspace(context, ws, scale, logical);
-    let Some(panel) = ws.tree.bounds(ws.layers.root) else {
+    let Some(panel) = ws.tree.bounds(target) else {
         unreachable!("laid out");
     };
     let (x0, y0) = (
@@ -452,4 +466,33 @@ fn write_layers_panel_png() {
         &review_png("layers-panel-filtered.png"),
     );
     let _: Option<&WidgetKind> = None;
+}
+
+/// The tools panel (0.207.0) for a human to look at: Brush selected, the
+/// Zoom button hovered, at scale 2 and scale 1, then the scale-2 picture
+/// again enlarged 3x with nearest-neighbour so the pixels show.
+/// Run: `AURORA_REQUIRE_GPU=1 cargo test -p aurora-ui --lib
+/// write_tools_panel_png -- --ignored --nocapture`.
+#[test]
+#[ignore = "writes a PNG for human review"]
+fn write_tools_panel_png() {
+    let Some(context) = aurora_gpu::test_support::real_context_or_skip() else {
+        return;
+    };
+    let scales = scales();
+    let mut ws = crate::build_workspace(&scales);
+    ok(crate::sync_tools_panel(
+        &mut ws.tree,
+        &ws.tools,
+        crate::Tool::Brush,
+    ));
+    let zoom = ws.tools.button_for(crate::Tool::Zoom);
+    ok(crate::set_tools_panel_hover(&mut ws.tree, &ws.tools, zoom));
+    let root = ws.tools.root;
+    for (scale, name) in [
+        (2.0_f32, review_png("tools-panel.png")),
+        (1.0, review_png("tools-panel-1x.png")),
+    ] {
+        write_crop_png(&context, &mut ws, scale, &name, root);
+    }
 }
