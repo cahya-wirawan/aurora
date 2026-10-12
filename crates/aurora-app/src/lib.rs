@@ -6563,18 +6563,21 @@ fn widget_owner(
     None
 }
 
-/// Whether `id` is a tools-panel button: a toggle button whose parent is a
-/// `Role::Toolbar` labelled [`aurora_ui::TOOLS_PANEL_LABEL`]. Read off the
-/// tree because [`widget_owner`] is handed the tree alone.
+/// Whether `id` is a tools-panel button: a toggle button inside a group
+/// row (0.207.0; before, directly) of a `Role::Toolbar` labelled
+/// [`aurora_ui::TOOLS_PANEL_LABEL`]. Read off the tree because
+/// [`widget_owner`] is handed the tree alone.
 fn is_tool_button(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> bool {
-    matches!(tree.payload(id), Some(WidgetKind::Button(state)) if state.toggled.is_some())
-        && tree
-            .parent(id)
-            .and_then(|parent| tree.accessibility(parent))
+    let in_tools_toolbar = |ancestor: Option<WidgetId>| {
+        ancestor
+            .and_then(|ancestor| tree.accessibility(ancestor))
             .is_some_and(|node| {
                 node.role() == accesskit::Role::Toolbar
                     && node.label() == Some(aurora_ui::TOOLS_PANEL_LABEL)
             })
+    };
+    matches!(tree.payload(id), Some(WidgetKind::Button(state)) if state.toggled.is_some())
+        && in_tools_toolbar(tree.parent(id).and_then(|row| tree.parent(row)))
 }
 
 /// Closes the Layers panel's blend-mode list when a `Down` lands outside
@@ -29534,18 +29537,20 @@ impl App {
         true
     }
 
-    /// Tints the Layer actions toolbar button under the pointer
-    /// (0.196.0; `None`: the pointer left the window or something else
-    /// owns it — a modal, a canvas drag, a rail resize).
+    /// Tints the Layer actions toolbar button (0.196.0) and the tools
+    /// panel button (0.207.0) under the pointer (`None`: the pointer left
+    /// the window or something else owns it — a modal, a canvas drag, a
+    /// rail resize).
     fn update_toolbar_hover(&mut self, position: Option<(f32, f32)>) {
         let busy = self.dialog.is_some()
             || self.command_palette.is_some()
             || self.drag.is_some()
             || self.rail_resize.is_some();
-        let hovered = position
+        let under = position
             .filter(|_| !busy)
-            .and_then(|point| self.workspace.tree.hit_test(point))
-            .filter(|&id| aurora_ui::is_layer_toolbar_button(&self.workspace.tree, id));
+            .and_then(|point| self.workspace.tree.hit_test(point));
+        let hovered =
+            under.filter(|&id| aurora_ui::is_layer_toolbar_button(&self.workspace.tree, id));
         match aurora_ui::set_layer_toolbar_hover(
             &mut self.workspace.tree,
             &self.workspace.layer_toolbar,
@@ -29554,6 +29559,18 @@ impl App {
             Ok(true) => self.needs_redraw = true,
             Ok(false) => {}
             Err(err) => tracing::warn!(?err, "toolbar hover failed"),
+        }
+        // 0.207.0: the tools panel's icon buttons are tinted the same way.
+        let tool_hovered =
+            under.filter(|&id| aurora_ui::is_tools_panel_button(&self.workspace.tools, id));
+        match aurora_ui::set_tools_panel_hover(
+            &mut self.workspace.tree,
+            &self.workspace.tools,
+            tool_hovered,
+        ) {
+            Ok(true) => self.needs_redraw = true,
+            Ok(false) => {}
+            Err(err) => tracing::warn!(?err, "tools panel hover failed"),
         }
     }
 
@@ -66014,6 +66031,35 @@ mod tests {
                 aurora_ui::selected_tool(&workspace.tree, &workspace.tools),
                 Some(expected),
                 "{letter}"
+            );
+        }
+    }
+
+    /// 0.207.0: the shortcut letter a tool button's description names is
+    /// the one the shortcut table binds to that tool, for every tool.
+    #[test]
+    fn every_tool_buttons_described_shortcut_is_the_one_bound_to_that_tool() {
+        let shortcuts = default_shortcuts();
+        let workspace = laid_out_workspace();
+        for (tool, button) in workspace.tools.buttons {
+            let lower = tool.shortcut_key().to_ascii_lowercase().to_string();
+            let chord = match KeyChord::parse(&lower) {
+                Ok(chord) => chord,
+                Err(err) => unreachable!("{lower:?}: {err:?}"),
+            };
+            assert_eq!(
+                shortcuts.resolve(chord),
+                Some(&AppCommand::SelectTool(tool)),
+                "{tool:?}"
+            );
+            let described = workspace
+                .tree
+                .accessibility(button)
+                .and_then(|node| node.description().map(str::to_owned))
+                .unwrap_or_default();
+            assert!(
+                described.ends_with(&format!("shortcut {}", tool.shortcut_key())),
+                "{described}"
             );
         }
     }

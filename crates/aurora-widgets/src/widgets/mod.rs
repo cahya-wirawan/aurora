@@ -217,7 +217,7 @@ pub use label::{LabelState, insert_label, label_state, set_label_disabled, set_l
 pub use list_row::ListRowState;
 pub use menu::{
     MenuItem, MenuItemKind, MenuKey, MenuOutcome, MenuState, activate_menu_item, close_menu,
-    handle_menu_key, menu_state, open_menu,
+    handle_menu_key, insert_separator, menu_state, open_menu,
 };
 pub use scrollbar::{
     ScrollbarRange, ScrollbarState, insert_scrollbar, link_scrollbar, scrollbar_target,
