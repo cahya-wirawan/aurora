@@ -100,7 +100,15 @@
 //!   every other adjustment kind, a Grayscale file's Curves, and fill
 //!   layers with no pixels are left out; text,
 //!   smart-object and shape layers open as their stored pixels. Every
-//!   one of those that a file actually uses is named in the report.
+//!   one of those that a file actually uses is named in the report —
+//!   except a smart object whose data is **kept** (0.200.0): its
+//!   `SoLd`/`PlLd`/`SoLE`/`fxrp` blocks and the embedded file its unique
+//!   ID names (document-level `lnk2`/`lnkD`/`lnk3`/`lnkE`, read entry by
+//!   entry within `aurora_doc::smart_object`'s bounds) are held verbatim
+//!   in the tree ([`PsdLayer::smart`], [`PsdFile::linked_files`]) for the
+//!   writer to put back; see the `smart` module. A smart object whose ID
+//!   matches no entry, that carries smart filters (`FXid`/`FEid`) or that
+//!   would pass the pool's bounds is not kept, and is reported as before.
 //! - Writing (0.176.0) is a separate module, [`write`](mod@write): 16-bit
 //!   RGB PSD, reachable from the app's Save As (0.177.0); pixel layers,
 //!   groups and user masks on layers and groups (0.178.0). Curves and
@@ -122,6 +130,9 @@ mod descriptor;
 mod effects;
 #[cfg(test)]
 mod effects_tests;
+mod smart;
+#[cfg(test)]
+mod smart_tests;
 #[cfg(test)]
 mod test_writer;
 #[cfg(test)]
@@ -131,6 +142,7 @@ pub mod write;
 #[cfg(test)]
 mod write_tests;
 
+pub use smart::PsdSmartObject;
 pub use write::{
     PSD_GROUP_END_NAME, PSD_MAX_NAME_UNITS, PSD_MAX_RECORDS, PsdCompositeSource, PsdExpectation,
     PsdExpectedLayer, PsdExpectedMask, PsdFormat, PsdRecordKind, PsdSaveOptions, PsdSaveRefusal,
@@ -221,6 +233,9 @@ pub struct PsdFile {
     /// tree is empty (a "flat" PSD, or one whose every record was left
     /// out), `None` otherwise.
     pub composite: Option<Image>,
+    /// The embedded smart-object files some layer's
+    /// [`PsdLayer::smart`] names (0.200.0), in first-use order.
+    pub linked_files: Vec<aurora_doc::LinkedFile>,
     notes: Notes,
 }
 
@@ -262,6 +277,10 @@ pub struct PsdLayer {
     /// The layer's user mask (channel `-2`), applied by
     /// [`build_document`] (0.147.0).
     pub mask: Option<PsdMask>,
+    /// The layer's smart-object data (0.200.0), kept verbatim and not
+    /// interpreted: [`build_document`] attaches it to the tree with the
+    /// pixels' fingerprint, so a PSD save can write it back.
+    pub smart: Option<PsdSmartObject>,
     /// Where the layer's channels are in the file, while its pixels are
     /// not decoded yet (0.154.0): [`decode`] decodes every one before it
     /// returns, [`read_streaming`] one at a time as each is handed on.
@@ -1332,6 +1351,13 @@ struct Record {
     /// That block, read by `decode_source` once the global light angle
     /// is known and charged to the file's descriptor budget.
     effects: Option<Result<effects::ReadEffects, effects::Unreadable>>,
+    /// The layer's `SoLd`/`PlLd`/`SoLE`/`fxrp` blocks, copied (0.200.0).
+    smart_blocks: Vec<aurora_doc::SmartObjectBlock>,
+    /// The layer carries smart filters (`FXid`/`FEid`); its smart object
+    /// is not preserved.
+    smart_filters: bool,
+    /// The smart object [`smart::resolve`] matched to an embedded file.
+    smart: Option<PsdSmartObject>,
 }
 
 impl Record {
@@ -1459,6 +1485,8 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let mut vector = None;
     let mut curves = None;
     let mut effects_blocks: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut smart_blocks: Vec<aurora_doc::SmartObjectBlock> = Vec::new();
+    let mut smart_filters = false;
     let mut features = Features {
         blend_if: blend_if_in_use(ranges),
         ..Features::default()
@@ -1480,7 +1508,18 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
                     .map(u32::from_be_bytes);
             }
             b"TySh" | b"tySh" => features.text = true,
-            b"SoLd" | b"PlLd" | b"SoLE" => features.smart = true,
+            b"SoLd" | b"PlLd" | b"SoLE" => {
+                features.smart = true;
+                smart_blocks.push(aurora_doc::SmartObjectBlock {
+                    key,
+                    data: data.to_vec(),
+                });
+            }
+            b"fxrp" => smart_blocks.push(aurora_doc::SmartObjectBlock {
+                key,
+                data: data.to_vec(),
+            }),
+            b"FXid" | b"FEid" => smart_filters = true,
             b"lmfx" | b"lfx2" | b"lfxs" => {
                 features.effects = true;
                 let priority = match &key {
@@ -1526,6 +1565,9 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
         curves,
         effects_blocks,
         effects: None,
+        smart_blocks,
+        smart_filters,
+        smart: None,
     })
 }
 
@@ -3090,6 +3132,23 @@ fn build_tree(
     Ok(stack.pop().unwrap_or_default())
 }
 
+/// The unique IDs of every kept smart object in `nodes`. Iterative, so a
+/// deep tree cannot overflow the stack.
+fn collect_smart_ids(nodes: &[PsdNode], out: &mut std::collections::BTreeSet<String>) {
+    let mut stack: Vec<&PsdNode> = nodes.iter().collect();
+    while let Some(node) = stack.pop() {
+        match node {
+            PsdNode::Layer(layer) => {
+                if let Some(smart) = &layer.smart {
+                    out.insert(smart.unique_id.clone());
+                }
+            }
+            PsdNode::Group { children, .. } => stack.extend(children.iter()),
+            PsdNode::Adjustment(_) => {}
+        }
+    }
+}
+
 /// One non-divider record as a layer node, or `None` when it is left out
 /// (an adjustment layer, or a fill layer with no pixels).
 fn layer_node(
@@ -3133,10 +3192,22 @@ fn layer_node(
         notes.add(Note::FillSkipped);
         return None;
     }
+    // Located, not decoded (0.154.0): `decode` or `read_streaming`
+    // decodes it later, one layer at a time.
+    let pending = plan_layer_image(record, header, notes);
+    // A smart object is kept (0.200.0) only if it will actually attach: the
+    // layer must have pixels to be the rendering of the embedded file. A
+    // matched one with an empty rectangle or no readable channels is
+    // reported like any other, and its file never enters the pool.
+    let smart = record.smart.clone().filter(|_| pending.is_some());
     if record.features.text {
         notes.add(Note::TextRasterised);
     } else if record.features.smart {
-        notes.add(Note::SmartObjectRasterised);
+        // A kept smart object is not a loss; the layer's pixels are its
+        // rendering and are saved as before.
+        if smart.is_none() {
+            notes.add(Note::SmartObjectRasterised);
+        }
     } else if record.features.fill && record.features.vector_mask {
         // A fill clipped by a vector path is what Photoshop calls a
         // shape layer; a fill without one is a plain fill layer.
@@ -3145,9 +3216,6 @@ fn layer_node(
         notes.add(Note::FillRasterised);
     }
     let props = props_for(record, notes);
-    // Located, not decoded (0.154.0): `decode` or `read_streaming`
-    // decodes it later, one layer at a time.
-    let pending = plan_layer_image(record, header, notes);
     // The region `Builder::add_nodes` gives the layer: its own rectangle
     // and the canvas when it has pixels, else the canvas.
     let canvas = canvas_of(header);
@@ -3164,6 +3232,7 @@ fn layer_node(
         bounds: record.bounds,
         image: None,
         mask,
+        smart,
         pending,
     }))
 }
@@ -3720,6 +3789,8 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         records: Vec::new(),
         merged_alpha: false,
     };
+    // The document-level linked-layer lists (0.200.0), located only.
+    let mut linked_windows: Vec<([u8; 4], Window)> = Vec::new();
     if section.remaining() > 0 {
         let info_len = section.length(src, psb, "layer info length")?;
         let mut body = section.sub(info_len, "layer info")?;
@@ -3730,6 +3801,7 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         }
         for (key, mut data) in read_block_windows(src, &mut section, psb, 4)? {
             match &key {
+                b"lnk2" | b"lnkD" | b"lnk3" | b"lnkE" => linked_windows.push((key, data)),
                 b"Lr16" | b"Layr" if info.records.is_empty() => {
                     let tagged_alpha = info.merged_alpha;
                     info = read_layer_info(src, &mut data, header)?;
@@ -3781,7 +3853,18 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
             }
         }
     }
+    // Smart objects (0.200.0): matched to their embedded files before the
+    // tree is built, so the build knows which ones are kept.
+    let resolved = smart::resolve(src, &mut info.records, &linked_windows, &mut effects_budget)?;
     let layers = build_tree(src, &info.records, header, &mut notes, &mut vector_budget)?;
+    // Only the files a layer that was actually built still names: a smart
+    // object dropped on the way (no pixels) must not pool its file.
+    let mut named = std::collections::BTreeSet::new();
+    collect_smart_ids(&layers, &mut named);
+    let linked_files: Vec<aurora_doc::LinkedFile> = resolved
+        .into_iter()
+        .filter(|f| named.contains(&f.unique_id))
+        .collect();
     // A read that failed inside a mask was reported as a damaged mask by
     // the tree build; the file itself is what failed, so the open does.
     // The only place a swallowed read failure is turned back into one
@@ -3832,6 +3915,7 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         depth: header.depth,
         layers,
         composite,
+        linked_files,
         notes,
     })
 }
@@ -3979,6 +4063,7 @@ fn build_streamed(
         height,
         layers: nodes,
         composite,
+        linked_files,
         notes,
         ..
     } = file;
@@ -3989,6 +4074,9 @@ fn build_streamed(
         height,
     };
     let mut layers = LayerTree::new();
+    for file in linked_files {
+        layers.add_linked_file(file)?;
+    }
     let mut history = History::new();
     let profile = SharedProfile::new();
     let mut builder = Builder {
@@ -4103,6 +4191,24 @@ impl Builder<'_, '_, '_> {
                         }
                         (None, None) => None,
                     };
+                    if let (Some(image), Some(smart)) = (&image, layer.smart) {
+                        // The fingerprint of the pixels as they will sit in
+                        // the layer's surface, so a later save can tell
+                        // whether they are still the smart object's
+                        // rendering (0.200.0).
+                        let pixel_fingerprint =
+                            crate::import::placed_image_fingerprint(image, offset.0, offset.1)?;
+                        self.history.set_smart_object(
+                            self.layers,
+                            id,
+                            Some(aurora_doc::SmartObject {
+                                unique_id: smart.unique_id,
+                                blocks: smart.blocks,
+                                bounds,
+                                pixel_fingerprint,
+                            }),
+                        )?;
+                    }
                     if let Some(image) = image {
                         self.sink.layer(PsdPixels {
                             layer: id,

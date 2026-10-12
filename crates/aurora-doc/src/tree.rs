@@ -182,6 +182,11 @@ pub struct LayerTree {
     /// Root-level layers. See this type's own doc comment for the
     /// ordering convention.
     roots: Vec<LayerId>,
+    /// The document's pool of embedded smart-object files (0.200.0), keyed
+    /// by unique ID. Not part of the positional manifest (`#[serde(skip)]`):
+    /// `.aur`'s `smart-objects` entry carries it. Cheap to clone (`Arc`s).
+    #[serde(skip)]
+    linked_files: std::collections::BTreeMap<String, crate::smart_object::LinkedFile>,
 }
 
 /// [`LayerTree`]'s own on-the-wire shape — field-for-field identical to
@@ -276,7 +281,12 @@ impl TryFrom<LayerTreeRepr> for LayerTree {
         validate_layer_id_range(&ids, &layers)?;
         validate_opacities(&layers)?;
         validate_blend_modes(&layers)?;
-        Ok(Self { ids, layers, roots })
+        Ok(Self {
+            ids,
+            layers,
+            roots,
+            linked_files: std::collections::BTreeMap::new(),
+        })
     }
 }
 
@@ -792,6 +802,7 @@ impl LayerTree {
             ids: IdGenerator::new(),
             layers: HashMap::new(),
             roots: Vec::new(),
+            linked_files: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2270,6 +2281,80 @@ impl LayerTree {
         Ok(())
     }
 
+    /// The layer's preserved smart-object data (0.200.0), or `None` when
+    /// it has none or `id` does not exist.
+    #[must_use]
+    pub fn smart_object(&self, id: LayerId) -> Option<&crate::smart_object::SmartObject> {
+        self.layers.get(&id)?.smart_object.as_deref()
+    }
+
+    /// Replaces the layer's preserved smart-object data (0.200.0); `None`
+    /// removes it. Data only: nothing is rendered from it.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::UnknownLayer`] if `id` doesn't exist;
+    /// [`DocError::NotAPixelLayer`] if it is not a pixel layer;
+    /// [`DocError::InvalidSmartObject`] if `value` fails
+    /// [`crate::SmartObject::validate`]. Nothing is changed when any
+    /// happens.
+    pub fn set_smart_object(
+        &mut self,
+        id: LayerId,
+        value: Option<crate::smart_object::SmartObject>,
+    ) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        if !matches!(entry.kind, LayerKind::Pixel { .. }) {
+            return Err(DocError::NotAPixelLayer(id));
+        }
+        if let Some(value) = &value {
+            value.validate().map_err(DocError::InvalidSmartObject)?;
+        }
+        entry.smart_object = value.map(Box::new);
+        Ok(())
+    }
+
+    /// The document's embedded smart-object files, by unique ID (0.200.0).
+    #[must_use]
+    pub fn linked_files(
+        &self,
+    ) -> &std::collections::BTreeMap<String, crate::smart_object::LinkedFile> {
+        &self.linked_files
+    }
+
+    /// Adds (or replaces, by unique ID) an embedded file in the pool.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::InvalidSmartObject`] if the file fails
+    /// [`crate::LinkedFile::validate`], or the pool would pass
+    /// [`crate::smart_object::MAX_LINKED_FILES`] files or
+    /// [`crate::smart_object::MAX_LINKED_FILE_POOL_BYTES`] bytes.
+    pub fn add_linked_file(
+        &mut self,
+        file: crate::smart_object::LinkedFile,
+    ) -> Result<(), DocError> {
+        use crate::smart_object as so;
+        file.validate().map_err(DocError::InvalidSmartObject)?;
+        let others: u64 = self
+            .linked_files
+            .iter()
+            .filter(|(id, _)| **id != file.unique_id)
+            .map(|(_, f)| f.entry.len() as u64)
+            .fold(0u64, u64::saturating_add);
+        let count =
+            self.linked_files.len() + usize::from(!self.linked_files.contains_key(&file.unique_id));
+        if count > so::MAX_LINKED_FILES
+            || others.saturating_add(file.entry.len() as u64) > so::MAX_LINKED_FILE_POOL_BYTES
+        {
+            return Err(DocError::InvalidSmartObject(
+                crate::SmartObjectError::PoolTooLarge,
+            ));
+        }
+        self.linked_files.insert(file.unique_id.clone(), file);
+        Ok(())
+    }
+
     /// Sets the mask's [`LayerMask::density`] (0.149.0).
     ///
     /// # Errors
@@ -2728,6 +2813,7 @@ mod tests {
                 ids: ids_for(&layers),
                 layers,
                 roots: vec![colliding],
+                linked_files: std::collections::BTreeMap::new(),
             };
             assert!(forced.contains(colliding), "the guard, not `contains`");
             assert_eq!(
@@ -2747,6 +2833,7 @@ mod tests {
             ids: ids_for(&layers),
             layers,
             roots: vec![below],
+            linked_files: std::collections::BTreeMap::new(),
         };
         assert_eq!(
             forced.mask_surface_id(below),
@@ -3478,6 +3565,7 @@ mod tests {
             ids: aurora_core::IdGenerator::new(),
             layers,
             roots: vec![holder, into],
+            ..LayerTree::new()
         };
 
         // `into` sits at depth 1, so this move lands `holder` at 2 --
@@ -3512,6 +3600,7 @@ mod tests {
             ids: aurora_core::IdGenerator::new(),
             layers,
             roots: vec![a, into],
+            ..LayerTree::new()
         };
 
         let started = std::time::Instant::now();
@@ -3554,6 +3643,7 @@ mod tests {
             ids: aurora_core::IdGenerator::new(),
             layers,
             roots: vec![container, target],
+            ..LayerTree::new()
         };
         let holder_depth_before = tree.depth_of(holder);
         assert_eq!(
@@ -4734,6 +4824,7 @@ mod tests {
             ids: aurora_core::IdGenerator::new(),
             layers,
             roots: vec![root],
+            ..LayerTree::new()
         };
         let started = std::time::Instant::now();
         let order = tree.paint_order();
@@ -4762,6 +4853,7 @@ mod tests {
             ids: aurora_core::IdGenerator::new(),
             layers,
             roots: Vec::new(),
+            ..LayerTree::new()
         };
         let started = std::time::Instant::now();
         let result = tree.reparent(a, Some(b), 0);
@@ -4948,6 +5040,7 @@ mod tests {
             ids: aurora_core::IdGenerator::new(),
             layers,
             roots: vec![not_a_group],
+            ..LayerTree::new()
         };
         match tree.remove(victim) {
             Err(DocError::NotAGroup(id)) => assert_eq!(id, not_a_group),
@@ -4971,6 +5064,7 @@ mod tests {
             ids: aurora_core::IdGenerator::new(),
             layers,
             roots: vec![group],
+            ..LayerTree::new()
         };
         match tree.remove(victim) {
             Err(DocError::InconsistentLayerParent(id)) => assert_eq!(id, victim),
@@ -4995,6 +5089,7 @@ mod tests {
             ids: aurora_core::IdGenerator::new(),
             layers,
             roots: vec![not_a_group, destination],
+            ..LayerTree::new()
         };
         match tree.reparent(victim, Some(destination), 0) {
             Err(DocError::NotAGroup(id)) => assert_eq!(id, not_a_group),
@@ -5240,6 +5335,7 @@ mod tests {
             ids: ids_for(&layers),
             layers,
             roots: vec![victim, attacker],
+            ..LayerTree::new()
         };
 
         assert!(forced.contains(attacker));
@@ -5290,6 +5386,7 @@ mod tests {
             ids: stale,
             layers,
             roots: vec![target],
+            ..LayerTree::new()
         };
 
         match tree.add_group("new", None) {
@@ -5413,6 +5510,7 @@ mod tests {
             ids: ids_for(&layers),
             layers,
             roots: vec![group],
+            ..LayerTree::new()
         };
 
         let fresh = match tree.add_group("new", None) {
@@ -5582,6 +5680,7 @@ mod tests {
             ids: ids_for(&layers),
             layers,
             roots: vec![host],
+            ..LayerTree::new()
         };
 
         let removed = super::RemovedSubtree {
@@ -5747,6 +5846,7 @@ mod tests {
             ids: ids_for(&layers),
             layers,
             roots: vec![id],
+            ..LayerTree::new()
         }
     }
 
@@ -5989,6 +6089,7 @@ mod tests {
             ids: ids_for(&layers),
             layers,
             roots: vec![group, destination],
+            ..LayerTree::new()
         };
         match tree.reparent(victim, Some(destination), 0) {
             Err(DocError::InconsistentLayerParent(id)) => assert_eq!(id, victim),

@@ -205,6 +205,36 @@ pub fn encode_image_tile(image: ImageView<'_>, dx: u32, dy: u32, id: TileId) -> 
     EncodedTile::of(&tile)
 }
 
+/// The `aurora_doc::smart_object::surface_fingerprint` a layer's surface
+/// will have once `image` is written into it at `(dx, dy)` — computed from
+/// the image, without a store (0.200.0), so the decode thread can take it
+/// before the tiles exist. The same tiles ([`image_tile_ids`]) built by
+/// the same row copy (`fill_placed_tile`) as the encoder, hashed by the
+/// same functions; a tile that is entirely `+0.0` contributes nothing, as
+/// an absent tile does.
+///
+/// # Errors
+///
+/// [`IoError::ImagePlacementOutOfRange`] exactly when
+/// [`write_into_store_at`] returns it.
+pub fn placed_image_fingerprint(image: &Image, dx: u32, dy: u32) -> Result<u64, IoError> {
+    let ids = image_tile_ids(image, dx, dy)?;
+    let view = image.view();
+    let mut texels = vec![half::f16::ZERO; aurora_tile::SAMPLES];
+    let mut sum = 0u64;
+    for id in ids {
+        if placed_region_is_zero(view, dx, dy, id) {
+            continue;
+        }
+        texels.fill(half::f16::ZERO);
+        let _dirty = fill_placed_tile(view, dx, dy, id.x, id.y, &mut texels);
+        if let Some(hash) = aurora_doc::smart_object::texel_fingerprint(&texels) {
+            sum = sum.wrapping_add(aurora_doc::smart_object::tile_fingerprint_term(id, hash));
+        }
+    }
+    Ok(sum)
+}
+
 /// A decoded image's pixels without its colour profile (0.189.0): plain
 /// borrowed data, so several threads can read it at once —
 /// [`Image`] itself holds an `lcms2` profile handle and is not `Sync`.

@@ -941,3 +941,136 @@ fn save_as_psd_round_trips_nested_groups_and_a_masked_layer() {
         .collect();
     assert_eq!(coverage.coverage, want);
 }
+
+// -- 0.200.0: smart-object preservation (round S1) ---------------------
+
+const SMART_ID: &str = "0001bdab-4207-8a45-9be1-e66466dde9b7";
+
+/// A framed linked-layer entry holding `payload`: the length, `liFD`,
+/// version, the Pascal ID, and filler, padded to four.
+fn linked_entry(payload: &[u8]) -> Vec<u8> {
+    let mut body = b"liFD".to_vec();
+    body.extend_from_slice(&7u32.to_be_bytes());
+    body.push(SMART_ID.len() as u8);
+    body.extend_from_slice(SMART_ID.as_bytes());
+    body.extend_from_slice(payload);
+    let mut framed = (body.len() as u64).to_be_bytes().to_vec();
+    framed.extend_from_slice(&body);
+    while !framed.len().is_multiple_of(4) {
+        framed.push(0);
+    }
+    framed
+}
+
+impl Doc {
+    /// Makes "Top" a smart object whose data is still true.
+    fn make_smart(&mut self) -> aurora_doc::LayerId {
+        let Some(top) = self.tree.roots().first().copied() else {
+            unreachable!("layers")
+        };
+        let bounds = rect(0, 0, 8, 8);
+        let Some(surface) = self.tree.surface_id(top) else {
+            unreachable!("pixel layer")
+        };
+        let fingerprint = ok(aurora_doc::smart_object::surface_fingerprint(
+            &mut self.store,
+            surface,
+            bounds,
+        ));
+        ok(self.tree.add_linked_file(aurora_doc::LinkedFile {
+            list: *b"lnk2",
+            unique_id: SMART_ID.to_owned(),
+            entry: std::sync::Arc::new(linked_entry(&[9; 33])),
+        }));
+        ok(self.tree.set_smart_object(
+            top,
+            Some(aurora_doc::SmartObject {
+                unique_id: SMART_ID.to_owned(),
+                blocks: vec![aurora_doc::SmartObjectBlock {
+                    key: *b"PlLd",
+                    data: {
+                        let mut d = b"plcL\0\0\0\x03".to_vec();
+                        d.push(SMART_ID.len() as u8);
+                        d.extend_from_slice(SMART_ID.as_bytes());
+                        d.extend_from_slice(&[0, 0, 0]);
+                        d
+                    },
+                }],
+                bounds,
+                pixel_fingerprint: fingerprint,
+            }),
+        ));
+        top
+    }
+}
+
+#[test]
+fn an_untouched_smart_object_saves_losslessly_and_reopens_as_one() {
+    let mut doc = Doc::new();
+    doc.make_smart();
+    let path = doc.path("smart.psd");
+    assert!(matches!(ok(doc.save(&path)), PsdSaveStep::Saved));
+    let back = ok(aurora_io::read_psd(&ok(std::fs::read(&path))));
+    let kept = back
+        .layers
+        .roots()
+        .iter()
+        .filter(|&&id| back.layers.smart_object(id).is_some())
+        .count();
+    assert_eq!(kept, 1);
+    assert_eq!(
+        back.layers
+            .linked_files()
+            .get(SMART_ID)
+            .map(|f| f.entry.to_vec()),
+        Some(linked_entry(&[9; 33]))
+    );
+}
+
+#[test]
+fn a_brush_dab_on_a_smart_object_layer_drops_it_with_an_itemised_report() {
+    let mut doc = Doc::new();
+    let top = doc.make_smart();
+    let Some(surface) = doc.tree.surface_id(top) else {
+        unreachable!("pixel layer")
+    };
+    // The real brush, as a stroke on the layer would.
+    let outcome = aurora_brush::stamp_dab(
+        &mut doc.store,
+        surface,
+        (4.0, 4.0),
+        6.0,
+        [1.0, 0.0, 0.0],
+        None,
+    );
+    assert!(!outcome.painted().is_empty(), "the dab painted");
+    let path = doc.path("smart.psd");
+    let PsdSaveStep::NeedsConfirmation(pending) = ok(doc.save(&path)) else {
+        unreachable!("a smart object lost: the user must agree")
+    };
+    let text = pending.report.items.join("\n");
+    assert!(text.contains("painted or erased"), "{text}");
+    assert!(text.contains("\u{201c}Top\u{201d}"), "{text}");
+    ok(finish_psd_save(pending, doc.id, doc.revision));
+    let back = ok(aurora_io::read_psd(&ok(std::fs::read(&path))));
+    assert!(back.layers.linked_files().is_empty());
+    assert!(
+        back.layers
+            .roots()
+            .iter()
+            .all(|&id| back.layers.smart_object(id).is_none())
+    );
+}
+
+#[test]
+fn moving_a_smart_object_layer_drops_it_with_an_itemised_report() {
+    let mut doc = Doc::new();
+    let top = doc.make_smart();
+    ok(doc.tree.set_bounds(top, rect(2, 1, 8, 8)));
+    let path = doc.path("smart.psd");
+    let PsdSaveStep::NeedsConfirmation(pending) = ok(doc.save(&path)) else {
+        unreachable!("a smart object lost: the user must agree")
+    };
+    let text = pending.report.items.join("\n");
+    assert!(text.contains("they were moved"), "{text}");
+}

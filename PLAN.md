@@ -26,7 +26,83 @@ than the tidiness.
 
 ## Where we are
 
-**Latest (2026-10-12, 0.199.0): round L5b of the Photoshop-style Layers panel — the name search and kind filter row.
+**Latest (2026-10-12, 0.200.0): round S1 — PSD smart objects are preserved on open -> save, not edited.
+A smart object layer still opens as ordinary raster pixels (Aurora does not render or edit the embedded file), but its
+embedded file and placement blocks are held byte for byte and written back on a PSD save, so the layer reopens as a
+smart object. Verified with Aurora's own parsers and with psd-tools 1.17.4 only; no PSD written here has been opened in
+Photoshop, and nothing was seen in the live window or on the Mac.**
+Series status: Layers panel series done (0.199.0); **S1 smart-object preservation (this round)**; next clipping masks
+(C1), Levels / Hue-Saturation (A1).
+- **What is kept.** Per layer (`aurora_doc::SmartObject`, `crates/aurora-doc/src/smart_object.rs`): the layer's `SoLd`,
+  `PlLd`, `SoLE` and `fxrp` tagged blocks verbatim, the embedded file's unique ID (`SoLd`'s `Idnt` descriptor item, else
+  `SoLE`'s, else `PlLd`'s Pascal string), the layer's bounds and a **pixel fingerprint** at open. Per document
+  (`LayerTree::linked_files`, an `Arc`-shared pool): the matching entries of the file's document-level linked-layer
+  lists (`lnk2`/`lnkD`/`lnk3`/`lnkE`), each as the whole framed entry (u64 length, body, padding to 4), nothing in it
+  interpreted. Layers sharing one file (the Nyepi template's copies) share one entry.
+- **Reader** (`psd/smart.rs`, `psd.rs`): the lists are *located* while the file's global blocks are read; after the records
+  are parsed, each smart layer's candidate IDs are looked up by walking the lists entry by entry (8-byte length plus the
+  few bytes holding the ID), and an entry is read whole only when a layer names it. Bounds: 8 blocks of at most 4 MiB
+  and 16 MiB of blocks per file (the blocks are stored twice in an `.aur`, journal and `smart-objects`, and the journal is read under a 64 MiB cap; delete/undo cycles still add carriers and can pass it), 4096 files and a **512 MiB pool** per document (`MAX_LINKED_FILE_POOL_BYTES`),
+  descriptors charged to the file's existing item budget, a length past its list ends the walk, no `unwrap`/index/panic.
+  Not kept (and still reported as "N smart objects opened as pixels; the original contents aren't kept."): an ID no
+  entry carries, smart filters (`FXid`/`FEid`), an entry that would pass the pool, a matched layer with an empty rectangle or no readable channels (reported, and its file is not pooled: the pool keeps only files a built layer names).
+  A kept one is **not** an "Opened With Changes" item any more. "Verbatim" excludes padding: up to three zero bytes per block are appended inside its length when needed, and the record rectangle written is the tile-occupied extent (unverified in Photoshop).
+- **Fingerprint** (`surface_fingerprint`, `placed_image_fingerprint`): the wrapping sum, over every tile of the layer that
+  holds anything but `+0.0`, of a position-mixed hash of the tile's f16 bits — independent of the store's bookkeeping, so
+  it survives a `.aur` save/reopen, an undone edit (pixels back = fingerprint back) and a delete that is undone. Taken at
+  open from the decoded image on the decode thread (the same tile fill the encoder runs), compared at save against the
+  store (pages in only the layer's tiles).
+- **Policy (the "save-time truth" rule).** A PSD save writes the smart object back only while the layer's bounds are the
+  recorded ones and its fingerprint matches. Painting/erasing (or anything else that changes the pixels) or a **Move**
+  (the placement in `SoLd` is in document coordinates and Aurora does not update it) drops it: the layer is written as an
+  ordinary pixel layer and the save report adds one line per reason, naming up to five layers ("N smart object layer(s)
+  will be saved as ordinary pixel layers because their pixels were painted or erased after the file was opened ...",
+  "... because they were moved ...", "... their embedded file is no longer available ..."), so the "Save With Changes?"
+  dialog asks first. Opacity, Fill, blend mode, visibility, locks, masks and effects do not matter. No app hook is
+  needed: the decision is made from the document at save time, so any future pixel-changing tool is covered.
+- **Writer** (`psd/write.rs`): the preserved blocks (zero-padded to a multiple of four inside their length when needed) are
+  appended to the record's extra data; after `Lr16` one global block per list that has a used file (`lnk2`, `lnkD`,
+  `lnk3`, `lnkE` order), holding only the files a written smart layer names, in first-use order. `minimum_file_size`
+  counts them. `PsdExpectation` gained the written blocks and files; **both verifier passes check them**: the raw pass
+  (blocks per record; each linked entry framed, length and FNV-1a hash) and the reader pass (the tree's smart object per
+  layer and the pool, entry hashes). `psd_save_preflight` does not report smart objects (it has no store); the report
+  comes from the write.
+- **`.aur`** (ADR 0009 addendum): optional versioned `smart-objects` entry (`SmartObjectsWire` v1) plus stored
+  `smart-object-file-<n>` entries; a newer version, a missing/short/malformed file entry or an over-bound pool refuses
+  the open; no smart objects writes nothing (byte-identical to before). Journal: `LayerOp::SetSmartObject` appended last
+  (ordinal 17), `History::set_smart_object`, and `save_journal` carries a `Restore`d subtree's data like effects.
+- **Template and psd-tools.** `images/flat-design-nyepi-template/6739968.psd` (read only): 35 smart objects kept,
+  27 embedded files in the file, the used ones about 100 MB held in memory; open -> save -> `verify_psd_file` ok ->
+  reopen gives 35 again with byte-identical entries (`the_nyepi_template_round_trips_its_35_smart_objects`, prints
+  SKIPPED without the file). `scripts/verify_psd_write.py` (new `check_smart`, fixtures from the ignored
+  `write_smart_fixtures_for_psd_tools`): psd-tools reads the synthetic file's 3 smart objects as `kind == 'smartobject'`
+  with identical unique IDs and embedded bytes, and the template's re-saved file (a 770 MB 16-bit file) with the same 35
+  names/IDs/embedded bytes and an identical layer-name list. Run: OK. The merged image written by the test is a flat
+  placeholder, so "same composite" is covered by the writer's existing sample-hash verification of every layer's pixels,
+  not by comparing a composite.
+- **Mutations** (really run, each reverted and sha256-checked): fingerprint term without position, blank tile counted,
+  writer ignoring a move, writer ignoring the fingerprint, writer writing the whole pool, reader ignoring `PlLd`, smart
+  filters not disqualifying, the entry padding dropped, `.aur` frame validation removed (survived at first, killed by a
+  same-length wrong-frame test), `.aur` newer version accepted, journal carrier removed, blocks omitted from the record,
+  the open note kept for a preserved layer, the placed fingerprint's zero-tile test inverted, the app-level report line
+  removed: 15 of 16 killed. **One survives: the reader pass's embedded-file hash comparison in `verify_psd_file`** is
+  redundant with the raw pass that checks the same bytes (a damaged byte is caught by the raw pass, tested).
+- **Gate:** fmt, layering, no-hardcoded-style, `cargo check --locked`, clippy `-D warnings`, doc `-D warnings`, `cargo deny`,
+  contrast and cross-clippy (windows-gnu, x86_64-apple-darwin; `aurora-doc`, `aurora-io`, `aurora-app`) clean;
+  **3,805 workspace tests pass with `AURORA_REQUIRE_GPU=1` on the RTX 3090 (0 failed, 78 ignored; 3,767 before this round)** (the one `aurora-render` golden that failed in the single full run was a stale test binary from the removed corpus-free worktree, whose manifest path no longer existed; after `touch crates/aurora-render/src/lib.rs` the crate passes, 259/259); a corpus-free run in a detached worktree with my changes applied and no `images/` passed (3,802, 0 failed, 78 ignored, before the review fixes).
+Review notes (0.200.0): (1) Never opened in Photoshop: the writer keeps `SoLd`/`PlLd`/`fxrp` and rebuilds the `lnk*` lists
+but not Photoshop's other per-layer blocks (`lyid`, `clbl`, `infx`, `knko`, `shmd`, `lclr`, `lfx2`/`lrFX`: layer effects are
+still not written), so whether Photoshop opens every such layer as an editable smart object is unconfirmed beyond
+psd-tools. (2) The embedded files live in memory (up to 512 MiB) and are written into **every** `.aur` save and autosave
+(stored, not compressed): the Nyepi template adds about 100 MB to each; the autosave size bound that chooses snapshot vs
+streaming counts them (so a large pool takes the streaming path). (3) Smart-filter layers and smart objects whose file is a *linked* (external) one with no
+embedded data are only as good as the entry: an `lnkE` entry is kept byte for byte but untested against a real file.
+(4) The fingerprint is a 64-bit non-cryptographic hash; a collision would keep a stale smart object. (5) The autosave snapshot bound now counts the pool (shared, not copied, but pinned), and entries are read once into an `Arc<Vec<u8>>` with no second copy. (5b) Hidden or
+deleted layers' files stay in the pool until a save (an undo can bring the layer back); a PSD save writes only the used
+ones. (6) The Layers panel shows no smart-object indicator. (7) A PSB save is still refused, so a smart object in a PSB
+cannot be written yet.
+
+**Previously (2026-10-12, 0.199.0): round L5b of the Photoshop-style Layers panel — the name search and kind filter row.
 Nobody has seen the filter row, the search field, the kind toggles or a filtered list in the live window on the Mac (or anywhere but a headless render at scale 2 and the unit tests); typing, IME, the Escape chord and the canvas-click blur are tested only through the pure routing functions, never with a real window.**
 Series status: L1 icons (0.194.0), L2 rows and controls (0.195.0), L3 toolbar + New Group (0.196.0), L4 thumbnails (0.197.0), L5a locks (0.198.0) and **L5b filter (this round)** done — **the Layers panel series is complete** except the Channels and Paths tabs and the name-width fix (the name column's width when a blend label or lock icon is present); next: smart-object preservation on PSD save (S1), clipping masks (C1), Levels / Hue-Saturation (A1).
 - **The row.** The first row of the Layers controls strip, above blend/Opacity/Fill/Lock (as in the reference): a decorative magnifier (`IconKind::Search`), the existing `TextField` ("Search layers": its accessible name, now also a drawn placeholder in `text.secondary` and the node's `placeholder`) and three icon toggle buttons ("Show pixel layers" `Image`, "Show adjustment layers" `Adjustment`, "Show groups" `FolderClosed`; accesskit `toggled`, descriptions). New icons `Search` and `Image` (`IconKind::ALL` is 19; contact sheet re-rendered and viewed; the gallery follows). `aurora_widgets::widgets::set_text_field_hints` sets a field's placeholder and its accessible description (both live in `TextFieldState`, so an edit's node rebuild keeps them). No new tokens.
@@ -49,7 +125,7 @@ anywhere but a headless render at scale 2 and the unit tests); the press and dab
 enforcement need a window and are covered only through the pure permission rules.**
 Series status: L1 icons (0.194.0), L2 rows and controls (0.195.0), L3 toolbar + New Group (0.196.0), L4
 thumbnails (0.197.0) and **L5a layer locks** done; L5b filter followed in 0.199.0;
-then smart-object preservation on PSD save (S1), clipping masks (C1), Levels / Hue-Saturation (A1).
+then smart-object preservation on PSD save (S1, done in 0.200.0), clipping masks (C1), Levels / Hue-Saturation (A1).
 - **What the model and formats already did.** `aurora_doc::LayerLock { transparency, pixels, position }` was
   already stored per layer and group, journaled and undoable (`LayerOp::SetLock`, `History::set_lock`,
   replayed from a saved journal) and serialised positionally in the `.aur` manifest, so `.aur` files

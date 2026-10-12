@@ -428,6 +428,13 @@ pub(crate) struct LayerEntry {
     /// of a subtree that carries some.
     #[serde(skip)]
     pub(crate) effects: Option<Box<aurora_core::LayerEffects>>,
+    /// The layer's preserved Photoshop smart-object data (0.200.0), on a
+    /// pixel layer only. `#[serde(skip)]` for the same reason as
+    /// [`Self::effects`]: it travels as `.aur`'s optional `smart-objects`
+    /// entry and as the `LayerOp::SetSmartObject` that
+    /// [`crate::History::save_journal`] emits after a journaled `Restore`.
+    #[serde(skip)]
+    pub(crate) smart_object: Option<Box<crate::smart_object::SmartObject>>,
 }
 
 impl LayerEntry {
@@ -443,6 +450,7 @@ impl LayerEntry {
             lock: LayerLock::default(),
             mask: None,
             effects: None,
+            smart_object: None,
         }
     }
 }

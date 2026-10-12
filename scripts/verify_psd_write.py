@@ -256,7 +256,59 @@ def check_locks(folder):
     print(f"OK: psd-tools read the locks of {len(spec)} layers")
 
 
+def smart_objects(psd):
+    """Every smart object layer of `psd`, as (name, unique id, data) in file order."""
+    out = []
+    for layer in psd.descendants():
+        if layer.kind == "smartobject":
+            so = layer.smart_object
+            out.append((layer.name, so.unique_id, so.data))
+    return out
+
+
+def check_smart(folder):
+    """0.200.0: preserved smart objects read back as smart objects.
+
+    `smart.psd` (synthetic, written by the Rust fixture test) must hold the
+    three smart-object layers of `smart.json`, each with its embedded
+    bytes. When the user's template was available, `nyepi-roundtrip.psd`
+    must hold exactly the smart objects of the original (same count, same
+    unique IDs, byte-identical embedded files), and its layer tree must
+    have the same names.
+    """
+    spec_path = folder / "smart.json"
+    if not spec_path.exists():
+        print("no smart.json: the smart object pass was skipped")
+        return
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))["smart"]
+    got = smart_objects(PSDImage.open(folder / "smart.psd"))
+    check("smart object count", len(got), len(spec))
+    for (name, unique_id, data), want in zip(got, spec):
+        check("smart object name", name, want["name"])
+        check(f"{name} unique id", unique_id, want["unique_id"])
+        check(f"{name} embedded file", bytes(data).hex(), want["data"])
+    print(f"OK: psd-tools read {len(got)} smart objects with their embedded files")
+
+    nyepi_path = folder / "nyepi.json"
+    if not nyepi_path.exists():
+        print("no nyepi.json: the template pass was skipped")
+        return
+    original = PSDImage.open(json.loads(nyepi_path.read_text())["original"])
+    again = PSDImage.open(folder / "nyepi-roundtrip.psd")
+    before, after = smart_objects(original), smart_objects(again)
+    check("template smart object count", len(after), len(before))
+    check("template smart object count is 35", len(after), 35)
+    check("template layer names", [l.name for l in again.descendants()],
+          [l.name for l in original.descendants()])
+    for (name, uid, data), (name2, uid2, data2) in zip(before, after):
+        check(f"{name} name", name2, name)
+        check(f"{name} unique id", uid2, uid)
+        check(f"{name} embedded file", bytes(data2) == bytes(data), True)
+    print(f"OK: the template's {len(after)} smart objects survived open -> save byte for byte")
+
+
 if __name__ == "__main__":
     main()
     check_groups(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_locks(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
+    check_smart(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
