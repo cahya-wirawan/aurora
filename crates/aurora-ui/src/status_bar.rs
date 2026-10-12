@@ -91,6 +91,9 @@ pub struct StatusInfo {
     /// edit): while `Some`, the document label shows it instead of the
     /// document readout. The owner clears it when it no longer applies.
     pub notice: Option<&'static str>,
+    /// The active selection (0.212.0), if any: its readout is appended to
+    /// the document label ([`selection_text`]) so it is announced with it.
+    pub selection: Option<aurora_doc::Selection>,
 }
 
 /// The physical zoom the status bar shows: the logical `zoom` times the
@@ -150,6 +153,33 @@ pub fn document_text(size: (u32, u32), sample: SampleFormat) -> String {
         size.1,
         sample_format_text(sample)
     )
+}
+
+/// The selection readout (0.212.0): `Selection: 10, 20, 300 × 200 px` (left,
+/// top, width, height in document pixels), `Selection: empty` for a
+/// rectangle with no area, `Selection: inverse of 10, 20, 300 × 200 px`
+/// when inverted (everything outside the rectangle).
+#[must_use]
+pub fn selection_text(selection: &aurora_doc::Selection) -> String {
+    let b = selection.bounds;
+    let rect = format!("{}, {}, {} × {} px", b.x, b.y, b.width, b.height);
+    match (selection.inverted, b.is_empty()) {
+        (false, true) => "Selection: empty".to_owned(),
+        (false, false) => format!("Selection: {rect}"),
+        (true, true) => "Selection: inverse of empty".to_owned(),
+        (true, false) => format!("Selection: inverse of {rect}"),
+    }
+}
+
+/// The document label's full text: the document readout, then the
+/// selection readout after ` · ` while one is active.
+#[must_use]
+pub fn document_label_text(info: &StatusInfo) -> String {
+    let document = document_text(info.document_size, info.sample);
+    match info.selection.as_ref() {
+        Some(selection) => format!("{document} · {}", selection_text(selection)),
+        None => document,
+    }
 }
 
 /// The status bar's style: a row exactly one `row_height` tall that never
@@ -249,12 +279,7 @@ pub fn insert_status_bar(
     let built = (|| {
         let zoom =
             widgets::insert_label(tree, root, scales, zoom_text(info.zoom, info.scale_factor))?;
-        let document = widgets::insert_label(
-            tree,
-            root,
-            scales,
-            document_text(info.document_size, info.sample),
-        )?;
+        let document = widgets::insert_label(tree, root, scales, document_label_text(info))?;
         style_item(tree, scales, zoom, false)?;
         style_item(tree, scales, document, true)?;
         Ok(StatusBar {
@@ -286,10 +311,9 @@ pub fn sync_status_bar(
     let document = widgets::set_label_text(
         tree,
         bar.document,
-        &info.notice.map_or_else(
-            || document_text(info.document_size, info.sample),
-            str::to_owned,
-        ),
+        &info
+            .notice
+            .map_or_else(|| document_label_text(info), str::to_owned),
     )?;
     Ok(zoom || document)
 }
@@ -381,6 +405,7 @@ mod tests {
             document_size: (4000, 3000),
             sample: SampleFormat::F16,
             notice: None,
+            selection: None,
         };
         let bar = match insert_status_bar(&mut tree, root, &scales, &info) {
             Ok(bar) => bar,
@@ -442,6 +467,70 @@ mod tests {
         assert_eq!(
             status_bar_text(&tree, bar).map(|text| text.0),
             Some("200%".to_owned())
+        );
+    }
+
+    /// 0.212.0: the selection readout for none, a rectangle, an empty
+    /// rectangle and an inverted selection, and that it reaches the bar.
+    #[test]
+    fn the_selection_readout_covers_none_rect_empty_and_inverted() {
+        use super::{document_label_text, selection_text};
+        use aurora_core::Rect;
+        use aurora_doc::Selection;
+        let rect = |x, y, width, height| Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let info = StatusInfo {
+            zoom: 1.0,
+            scale_factor: 1.0,
+            document_size: (640, 480),
+            sample: SampleFormat::F16,
+            notice: None,
+            selection: None,
+        };
+        let base = "Document: 640 × 480 px · 16-bit float";
+        assert_eq!(document_label_text(&info), base);
+        let some = |selection| StatusInfo {
+            selection: Some(selection),
+            ..info
+        };
+        let plain = Selection::new(rect(10, 20, 300, 200));
+        assert_eq!(selection_text(&plain), "Selection: 10, 20, 300 × 200 px");
+        assert_eq!(
+            document_label_text(&some(plain)),
+            format!("{base} · Selection: 10, 20, 300 × 200 px")
+        );
+        let inverted = Selection {
+            inverted: true,
+            ..plain
+        };
+        assert_eq!(
+            selection_text(&inverted),
+            "Selection: inverse of 10, 20, 300 × 200 px"
+        );
+        assert_eq!(
+            selection_text(&Selection::new(rect(5, 5, 0, 9))),
+            "Selection: empty"
+        );
+        // Through the bar: the label follows the selection and back.
+        let scales = test_scales();
+        let (mut tree, root) = aurora_widgets::widgets::new_tree(taffy::Style::default());
+        let bar = match insert_status_bar(&mut tree, root, &scales, &info) {
+            Ok(bar) => bar,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            sync_status_bar(&mut tree, bar, &some(plain)).ok(),
+            Some(true)
+        );
+        assert!(status_bar_text(&tree, bar).is_some_and(|(_, d)| d.ends_with("300 × 200 px")));
+        assert_eq!(sync_status_bar(&mut tree, bar, &info).ok(), Some(true));
+        assert_eq!(
+            status_bar_text(&tree, bar).map(|(_, d)| d),
+            Some(base.to_owned())
         );
     }
 }

@@ -159,6 +159,7 @@ mod label;
 mod list_row;
 mod menu;
 mod scrollbar;
+mod selection_outline;
 mod slider;
 mod tab_bar;
 mod text_field;
@@ -224,6 +225,10 @@ pub use scrollbar::{
     ScrollbarRange, ScrollbarState, insert_scrollbar, link_scrollbar, scrollbar_target,
     set_scrollbar_disabled, set_scrollbar_value, settle_linked_scrollbars, sync_linked_scrollbars,
     sync_scrollbar,
+};
+pub use selection_outline::{
+    OutlineRun, OutlineTone, SelectionOutlineState, insert_selection_outline,
+    selection_outline_state, set_selection_outline,
 };
 pub use slider::{SliderState, insert_slider, set_slider_disabled, set_slider_value};
 pub use tab_bar::{
@@ -444,6 +449,11 @@ pub enum WidgetKind {
     /// created by `thumbnail.rs`'s [`insert_thumbnail`]. AT-`hidden`,
     /// never focusable, no actions.
     Thumbnail(ThumbnailState),
+    /// The selection's marching ants (0.212.0) — created by
+    /// `selection_outline.rs`'s [`insert_selection_outline`], zero-sized,
+    /// painted by `paint::paint_selection_outline`; AT-`hidden`, never
+    /// focusable, no actions.
+    SelectionOutline(SelectionOutlineState),
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

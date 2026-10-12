@@ -557,6 +557,7 @@ mod psd_save_tests;
 mod selection_paint;
 #[cfg(test)]
 mod selection_paint_tests;
+mod selection_view;
 mod small_machine;
 mod workspace_presets;
 use background_open::{
@@ -5413,6 +5414,12 @@ enum AppCommand {
     SwapColours,
     /// Reset the colours to black over white (0.208.0), `D`.
     ResetColours,
+    /// Select All (0.212.0), `Primary+A`: the whole document.
+    SelectAll,
+    /// Deselect (0.212.0), `Primary+D`.
+    Deselect,
+    /// Inverse (0.212.0), `Primary+Shift+I`.
+    InverseSelection,
 }
 
 /// This build's fixed, checked-in global shortcut bindings. Not (yet)
@@ -5484,6 +5491,11 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         // 0.208.0: Photoshop's colour keys, bare like the tool letters.
         ("x", AppCommand::SwapColours),
         ("d", AppCommand::ResetColours),
+        // 0.212.0: Photoshop's Select menu chords. A focused text field
+        // takes `Primary+A` first (`route_widget_key`), never reaching here.
+        ("Primary+A", AppCommand::SelectAll),
+        ("Primary+D", AppCommand::Deselect),
+        ("Primary+Shift+I", AppCommand::InverseSelection),
     ];
     let mut registry = ShortcutRegistry::new();
     for (source, command) in bindings {
@@ -5659,6 +5671,9 @@ enum ActivatedCommand {
     /// Reset the colours to black over white (0.208.0): `D`, the palette
     /// and the Tools panel's defaults button.
     ResetColours,
+    /// Select All / Deselect / Inverse (0.212.0): `App` state, so handed
+    /// back like the colour commands.
+    Selection(selection_view::SelectionCommand),
     /// Select a tool from the palette (0.209.0).
     SelectTool(aurora_ui::Tool),
     /// A keyboard panel move (0.166.0, [`PANEL_MOVE_COMMANDS`]) —
@@ -5826,6 +5841,9 @@ const COMMAND_LAYER_CLIP_CREATE: &str = "layer.clip_create";
 const COMMAND_LAYER_CLIP_RELEASE: &str = "layer.clip_release";
 const COMMAND_COLOURS_SWAP: &str = "colour.swap";
 const COMMAND_COLOURS_RESET: &str = "colour.reset";
+const COMMAND_SELECT_ALL: &str = "select.all";
+const COMMAND_SELECT_DESELECT: &str = "select.deselect";
+const COMMAND_SELECT_INVERSE: &str = "select.inverse";
 
 /// The palette command id that selects `tool` (0.209.0).
 const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
@@ -5918,6 +5936,9 @@ fn palette_commands() -> Vec<CommandEntry> {
             COMMAND_COLOURS_RESET,
             "Default Foreground and Background Colours",
         ),
+        CommandEntry::new(COMMAND_SELECT_ALL, "Select All"),
+        CommandEntry::new(COMMAND_SELECT_DESELECT, "Deselect"),
+        CommandEntry::new(COMMAND_SELECT_INVERSE, "Inverse Selection"),
     ];
     // 0.209.0: "Select ... Tool" for every tool (the palette had none).
     commands.extend(aurora_ui::Tool::ALL.iter().map(|tool| {
@@ -6138,6 +6159,21 @@ fn activate_command(
     }
     if id == COMMAND_COLOURS_RESET {
         return Some(ActivatedCommand::ResetColours);
+    }
+    if id == COMMAND_SELECT_ALL {
+        return Some(ActivatedCommand::Selection(
+            selection_view::SelectionCommand::SelectAll,
+        ));
+    }
+    if id == COMMAND_SELECT_DESELECT {
+        return Some(ActivatedCommand::Selection(
+            selection_view::SelectionCommand::Deselect,
+        ));
+    }
+    if id == COMMAND_SELECT_INVERSE {
+        return Some(ActivatedCommand::Selection(
+            selection_view::SelectionCommand::Inverse,
+        ));
     }
     tracing::warn!(command = id, "unknown command activated");
     None
@@ -8016,6 +8052,7 @@ fn status_info(
         document_size: canvas_size,
         sample: aurora_tile::SAMPLE_FORMAT,
         notice: None,
+        selection: None,
     }
 }
 
@@ -8027,7 +8064,7 @@ fn sync_status_bar(
     canvas_size: (u32, u32),
     scale_factor: f64,
 ) -> bool {
-    sync_status_bar_notice(workspace, view, canvas_size, scale_factor, None)
+    sync_status_bar_notice(workspace, view, canvas_size, scale_factor, None, None)
 }
 
 /// [`sync_status_bar`] showing `notice` in place of the document readout
@@ -8038,10 +8075,12 @@ fn sync_status_bar_notice(
     canvas_size: (u32, u32),
     scale_factor: f64,
     notice: Option<&'static str>,
+    selection: Option<aurora_doc::Selection>,
 ) -> bool {
     let bar = workspace.status_bar;
     let mut info = status_info(view, canvas_size, scale_factor);
     info.notice = notice;
+    info.selection = selection;
     match aurora_ui::sync_status_bar(&mut workspace.tree, bar, &info) {
         Ok(changed) => changed,
         Err(err) => {
@@ -9739,6 +9778,10 @@ fn build_menu() -> muda::Menu {
         &[
             &muda::MenuItem::with_id(COMMAND_UNDO, "Undo", true, None),
             &muda::MenuItem::with_id(COMMAND_REDO, "Redo", true, None),
+            &muda::PredefinedMenuItem::separator(),
+            &muda::MenuItem::with_id(COMMAND_SELECT_ALL, "Select All", true, None),
+            &muda::MenuItem::with_id(COMMAND_SELECT_DESELECT, "Deselect", true, None),
+            &muda::MenuItem::with_id(COMMAND_SELECT_INVERSE, "Inverse Selection", true, None),
         ],
     ) {
         Ok(submenu) => submenu,
@@ -10446,7 +10489,10 @@ fn run_command(
         }
         // Handed back as `ActivatedCommand::Document` by `handle_key`, so
         // never run here; nothing in this document changes either way.
-        AppCommand::NextDocument | AppCommand::PreviousDocument | AppCommand::CloseDocument => {
+        AppCommand::NextDocument | AppCommand::PreviousDocument | AppCommand::CloseDocument |
+        // Handed back as `ActivatedCommand::Selection` by `handle_key`
+        // (the selection is `App` state); not pixels either way.
+        AppCommand::SelectAll | AppCommand::Deselect | AppCommand::InverseSelection => {
             CompositeInvalidation::None
         }
         // Handed back as `ActivatedCommand::{SwapColours, ResetColours}`
@@ -10980,6 +11026,9 @@ fn handle_key(
         }
         if command == AppCommand::ResetColours {
             return Some(ActivatedCommand::ResetColours);
+        }
+        if let Some(selection_command) = selection_view::SelectionCommand::from_app(command) {
+            return Some(ActivatedCommand::Selection(selection_command));
         }
         if command == AppCommand::CloseDocument {
             return Some(ActivatedCommand::Document(
@@ -26281,6 +26330,11 @@ struct App {
     needs_redraw: bool,
     /// The text caret's blink (0.139.0) — see [`caret_step`].
     caret: CaretState,
+    /// The selection's marching ants clock (0.212.0).
+    ants: selection_view::AntsState,
+    /// The selection as it was when the live Marquee drag began, restored
+    /// by Escape (0.212.0).
+    marquee_before: Option<aurora_doc::Selection>,
 }
 
 /// [`App`]'s caret-blink state (0.139.0), the inputs [`caret_step`]
@@ -26692,6 +26746,8 @@ impl App {
                 window_focused: true,
                 reduced_motion,
             },
+            ants: selection_view::AntsState::new(std::time::Instant::now()),
+            marquee_before: None,
         };
         // 0.173.0: the tab strip shows every startup document (several
         // after a crash recovery) with the active one selected.
@@ -26854,6 +26910,9 @@ impl App {
         if self.escape_clears_layer_filter(key) {
             return;
         }
+        if self.escape_cancels_marquee(key) {
+            return;
+        }
         let controls = self.layer_controls.controls;
         let tool_controls = self.tool_controls;
         let routed = route_widget_key(
@@ -26985,6 +27044,7 @@ impl App {
             }
             Some(ActivatedCommand::SwapColours) => self.swap_colours(),
             Some(ActivatedCommand::ResetColours) => self.reset_colours(),
+            Some(ActivatedCommand::Selection(command)) => self.run_selection_command(command),
             Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
@@ -29153,6 +29213,9 @@ impl App {
             &self.doc.canvas_view,
             active_pixel_layer(&self.doc.layers, self.doc.active_layer),
         );
+        if matches!(self.drag, Some(Drag::Marquee { .. })) {
+            self.marquee_before = self.doc.selection.active();
+        }
         // A locked layer refuses the press outright (0.198.0): no drag, so
         // no stroke snapshot and no history row, and a calm notice.
         if matches!(
@@ -29838,6 +29901,7 @@ impl App {
             }
             Some(ActivatedCommand::SwapColours) => self.swap_colours(),
             Some(ActivatedCommand::ResetColours) => self.reset_colours(),
+            Some(ActivatedCommand::Selection(command)) => self.run_selection_command(command),
             Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
@@ -30793,6 +30857,7 @@ impl App {
             self.doc.canvas_size,
             self.scale_factor,
             notice,
+            self.doc.selection.active(),
         ) {
             self.push_accessibility();
             self.needs_redraw = true;
@@ -31029,6 +31094,77 @@ impl App {
         }
     }
 
+    /// Runs a Select All / Deselect / Inverse command on the active
+    /// document's selection (0.212.0). A live Marquee drag ends first. No
+    /// history step (selection is not undoable yet, a disclosed gap) and
+    /// the document is not made dirty.
+    fn run_selection_command(&mut self, command: selection_view::SelectionCommand) {
+        if matches!(self.drag, Some(Drag::Marquee { .. })) {
+            self.drag = None;
+        }
+        if selection_view::apply_selection_command(
+            &mut self.doc.selection,
+            command,
+            self.doc.canvas_size,
+        ) {
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Escape during a live Marquee drag: the drag ends and the selection
+    /// returns to what it was when the drag began. Returns whether it did.
+    fn escape_cancels_marquee(&mut self, key: Key) -> bool {
+        if key != Key::Named(NamedKey::Escape) || !matches!(self.drag, Some(Drag::Marquee { .. })) {
+            return false;
+        }
+        self.drag = None;
+        match self.marquee_before.take() {
+            Some(before) => self.doc.selection.select(before),
+            None => self.doc.selection.deselect(),
+        }
+        self.needs_redraw = true;
+        true
+    }
+
+    /// [`selection_view::ants_step`] on this app's own state at `now`.
+    fn ants_step(&self, now: std::time::Instant) -> selection_view::AntsStep {
+        selection_view::ants_step(
+            self.doc.selection.active().is_some(),
+            self.caret.window_focused,
+            self.caret.reduced_motion,
+            now,
+            self.ants.epoch,
+            self.ants.drawn_phase,
+        )
+    }
+
+    /// Draws the active selection's marching ants on the workspace's
+    /// outline widget for this frame (0.212.0) and records the phase
+    /// drawn. Pure widget state: no layout, no document access beyond the
+    /// selection, view and size.
+    fn sync_selection_outline_now(&mut self, now: std::time::Instant) {
+        let step = self.ants_step(now);
+        self.ants.drawn_phase = step.phase;
+        let runs = match canvas_area_logical_size(&self.workspace) {
+            Some(size) => aurora_ui::selection_outline_runs(
+                self.doc.selection.active(),
+                self.doc.canvas_size,
+                &self.doc.canvas_view,
+                size,
+                guarded_scale_factor(self.scale_factor),
+                step.phase,
+            ),
+            None => Vec::new(),
+        };
+        if let Err(err) = aurora_ui::sync_selection_outline(
+            &mut self.workspace.tree,
+            self.workspace.selection_outline,
+            runs,
+        ) {
+            tracing::warn!(?err, "failed to update the selection outline");
+        }
+    }
+
     /// [`caret_step`] on this app's own state at `now`.
     fn caret_step(&mut self, now: std::time::Instant) -> CaretStep {
         caret_step(
@@ -31078,7 +31214,8 @@ impl App {
         // The caret owner this frame paints with (0.139.0 blink),
         // recorded before any early return below — see
         // `CaretState::drawn_owner`.
-        let caret_owner = self.caret_step(std::time::Instant::now()).owner;
+        let frame_time = std::time::Instant::now();
+        let caret_owner = self.caret_step(frame_time).owner;
         self.caret.drawn_owner = caret_owner;
         // Before anything reads `canvas_view`: hold its zoom to the
         // floor the atlas can actually render at this canvas size
@@ -31114,14 +31251,19 @@ impl App {
         // 0.162.0: after the zoom floor above (which can move the zoom),
         // so the status bar this frame paints shows the zoom it draws at.
         // Its text is fixed-width items, so no relayout is needed.
-        if sync_status_bar(
+        if sync_status_bar_notice(
             &mut self.workspace,
             &self.doc.canvas_view,
             self.doc.canvas_size,
             self.scale_factor,
+            self.lock_notice.map(|(why, _)| why.message()),
+            self.doc.selection.active(),
         ) {
             self.push_accessibility();
         }
+        // 0.212.0: the selection's ants for this frame, after the view
+        // settled above.
+        self.sync_selection_outline_now(frame_time);
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
         };
@@ -31913,6 +32055,13 @@ impl ApplicationHandler<AppEvent> for App {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
+        // 0.212.0: the selection's ants, only while one is shown, the
+        // window is focused and motion is allowed (`ants_step`).
+        let ants = self.ants_step(now);
+        if ants.redraw {
+            self.needs_redraw = true;
+        }
+        let deadline = earliest_deadline(deadline, ants.next_tick);
         // `ControlFlow::Wait` would otherwise block indefinitely, and
         // muda's channel has no event-loop wakeup of its own to
         // interrupt that wait -- so macOS also re-polls on a short timer,
@@ -85764,7 +85913,9 @@ mod panel_scroll_tests {
                     assert_eq!(homes, 1, "{panel:?} appears exactly once");
                     assert!(ws.tree.contains(root));
                 }
-                let frames: Vec<WidgetId> = ws.floating.iter().map(|f| f.frame).collect();
+                let frames: Vec<WidgetId> = std::iter::once(ws.selection_outline)
+                    .chain(ws.floating.iter().map(|f| f.frame))
+                    .collect();
                 assert_eq!(
                     ws.tree
                         .children(ws.canvas_area)

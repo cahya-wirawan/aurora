@@ -54,6 +54,7 @@ pub mod panel_group;
 pub mod panel_strip;
 pub mod properties_panel;
 pub mod redock;
+pub mod selection_outline;
 pub mod status_bar;
 pub mod tool;
 pub mod tool_controls;
@@ -151,9 +152,12 @@ pub use redock::{
     dock_workspace_panel, drop_indicator_rect, drop_target_at, float_workspace_panel,
     move_workspace_panel, move_workspace_panel_by, move_workspace_slot, panel_drag_source,
 };
+pub use selection_outline::{
+    DASH_LENGTH, MARCH_PERIOD, selection_outline_runs, sync_selection_outline,
+};
 pub use status_bar::{
-    STATUS_BAR_LABEL, StatusBar, StatusInfo, document_text, insert_status_bar, physical_zoom,
-    sample_format_text, status_bar_text, sync_status_bar, zoom_text,
+    STATUS_BAR_LABEL, StatusBar, StatusInfo, document_label_text, document_text, insert_status_bar,
+    physical_zoom, sample_format_text, selection_text, status_bar_text, sync_status_bar, zoom_text,
 };
 pub use tool::Tool;
 pub use tool_controls::{

@@ -496,6 +496,7 @@ fn allowed_owner(kind: &WidgetKind) -> bool {
         | WidgetKind::Label(_)
         | WidgetKind::Icon(_)
         | WidgetKind::Thumbnail(_)
+        | WidgetKind::SelectionOutline(_)
         | WidgetKind::DropIndicator(_) => false,
     }
 }
@@ -1256,6 +1257,7 @@ mod tests {
             WidgetKind::RaisedPanel => 25,
             WidgetKind::Icon(_) => 26,
             WidgetKind::Thumbnail(_) => 27,
+            WidgetKind::SelectionOutline(_) => 28,
         }
     }
 

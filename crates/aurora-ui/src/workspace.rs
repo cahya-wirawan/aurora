@@ -122,6 +122,11 @@ pub struct Workspace {
     /// rotation, pan, ...` is a separate, still-open M1.8 bullet; this
     /// is an empty container reserving its place in the layout.
     pub canvas_area: WidgetId,
+    /// The selection's marching ants (0.212.0): a zero-sized widget, the
+    /// first child of [`Self::canvas_area`] (so floating panels paint over
+    /// it), whose dash runs `aurora-app` sets every frame
+    /// ([`crate::selection_outline`]).
+    pub selection_outline: WidgetId,
     /// The status bar (0.162.0): the canvas column's last child, under
     /// [`Self::canvas_area`] — zoom and document info, a `Role::Status`
     /// region. It starts showing 100% and a 0 × 0 document; `aurora-app`
@@ -455,7 +460,12 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
 
     let (canvas_column, options_bar, document_tabs, canvas_area) =
         insert_canvas_column(&mut tree, root, scales);
+    let selection_outline = match widgets::insert_selection_outline(&mut tree, canvas_area) {
+        Ok(id) => id,
+        Err(err) => unreachable!("canvas_area was just inserted: {err:?}"),
+    };
     let initial = StatusInfo {
+        selection: None,
         zoom: crate::canvas_view::DEFAULT_ZOOM,
         scale_factor: 1.0,
         document_size: (0, 0),
@@ -559,6 +569,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         options_bar,
         document_tabs,
         canvas_area,
+        selection_outline,
         status_bar,
         divider,
         rail,
