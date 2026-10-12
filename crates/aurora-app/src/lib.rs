@@ -7955,6 +7955,20 @@ fn sync_tool_controls(
     let Some(controls) = controls else {
         return highlighted;
     };
+    let fill = aurora_ui::sync_fill_controls(
+        &mut workspace.tree,
+        &controls,
+        tool,
+        settings.fill_view(),
+        captured,
+    );
+    let fill_changed = match fill {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to sync the options-bar fill controls");
+            false
+        }
+    };
     match aurora_ui::sync_tool_controls(
         &mut workspace.tree,
         controls,
@@ -7962,7 +7976,7 @@ fn sync_tool_controls(
         settings.radius(tool).map(f64::from),
         captured,
     ) {
-        Ok(changed) => changed || highlighted,
+        Ok(changed) => changed || highlighted || fill_changed,
         Err(err) => {
             tracing::warn!(?err, "failed to sync the options-bar tool controls");
             false
@@ -8028,6 +8042,53 @@ fn sync_status_bar_notice(
     }
 }
 
+/// Applies one routed outcome of the fill tools' option widgets
+/// (0.209.0) to `settings`: the Linear/Radial buttons, the Reverse and
+/// Contiguous checkboxes, the Opacity and Tolerance sliders. Whatever the
+/// widget did, the controls are re-mirrored from `settings`, so the pair
+/// of type buttons stays a radio group. No history step. Returns whether
+/// a setting changed.
+fn apply_fill_control_outcome(
+    workspace: &mut aurora_ui::Workspace,
+    controls: &aurora_ui::ToolControls,
+    tool: aurora_ui::Tool,
+    settings: &mut ToolSettings,
+    action: &aurora_widgets::ActionOutcome,
+    captured: Option<WidgetId>,
+) -> bool {
+    use aurora_widgets::ActionOutcome;
+    let fill = &controls.fill;
+    let changed = match action {
+        ActionOutcome::Activated(id) if *id == fill.linear || *id == fill.radial => {
+            let radial = *id == fill.radial;
+            let changed = settings.gradient_radial != radial;
+            settings.gradient_radial = radial;
+            changed
+        }
+        ActionOutcome::Toggled { id, state } if *id == fill.reverse => {
+            let on = *state == accesskit::Toggled::True;
+            let changed = settings.gradient_reverse != on;
+            settings.gradient_reverse = on;
+            changed
+        }
+        ActionOutcome::Toggled { id, state } if *id == fill.contiguous => {
+            let on = *state == accesskit::Toggled::True;
+            let changed = settings.contiguous != on;
+            settings.contiguous = on;
+            changed
+        }
+        ActionOutcome::ValueChanged { id, value } if *id == fill.opacity => {
+            settings.set_gradient_opacity(*value)
+        }
+        ActionOutcome::ValueChanged { id, value } if *id == fill.tolerance => {
+            settings.set_tolerance(*value)
+        }
+        _ => return false,
+    };
+    let _ = sync_tool_controls(workspace, Some(*controls), tool, settings, captured);
+    changed
+}
+
 /// Applies one routed Properties-panel tool-control outcome (0.136.0):
 /// a radius slider `ValueChanged` — pointer drag, keyboard or assistive
 /// technology alike — sets the active tool's radius
@@ -8047,8 +8108,13 @@ fn apply_tool_control_outcome(
     let Some(controls) = controls else {
         return false;
     };
-    let PointerOutcome::Action(aurora_widgets::ActionOutcome::ValueChanged { id, value }) = outcome
-    else {
+    let PointerOutcome::Action(action) = outcome else {
+        return false;
+    };
+    if apply_fill_control_outcome(workspace, &controls, tool, settings, action, captured) {
+        return true;
+    }
+    let aurora_widgets::ActionOutcome::ValueChanged { id, value } = action else {
         return false;
     };
     if *id != controls.radius || !settings.set_radius(tool, *value) {
@@ -24963,6 +25029,17 @@ impl Default for ToolSettings {
 }
 
 impl ToolSettings {
+    /// The fill options the options bar mirrors.
+    fn fill_view(&self) -> aurora_ui::FillView {
+        aurora_ui::FillView {
+            radial: self.gradient_radial,
+            reverse: self.gradient_reverse,
+            opacity: self.gradient_opacity,
+            tolerance: self.tolerance,
+            contiguous: self.contiguous,
+        }
+    }
+
     /// Sets the Paint Bucket tolerance from a slider value (rounded,
     /// clamped to 0..=255; non-finite refused). Returns whether it changed.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -75485,6 +75562,7 @@ mod tests {
             let settings = ToolSettings {
                 brush_radius: 7.0,
                 eraser_radius: 40.0,
+                ..ToolSettings::default()
             };
             assert_eq!(settings.dab_radius(DabTool::Brush), 7.0);
             assert_eq!(settings.dab_radius(DabTool::Eraser), 40.0);
@@ -75576,6 +75654,7 @@ mod tests {
             let settings = ToolSettings {
                 brush_radius: 20.0,
                 eraser_radius: 20.0,
+                ..ToolSettings::default()
             };
             let mut drag = None;
             let _ = stamp_tool_dab(
@@ -75597,6 +75676,7 @@ mod tests {
             let wide = ToolSettings {
                 brush_radius: 40.0,
                 eraser_radius: 40.0,
+                ..ToolSettings::default()
             };
             let _ = super::super::stamp_tool_dab_locked(
                 DabTool::Brush,
@@ -75639,6 +75719,7 @@ mod tests {
             let small = ToolSettings {
                 brush_radius: 4.0,
                 eraser_radius: 4.0,
+                ..ToolSettings::default()
             };
             let outcome = stamp_tool_dab(
                 DabTool::Brush,
@@ -75660,6 +75741,7 @@ mod tests {
             let big = ToolSettings {
                 brush_radius: 40.0,
                 eraser_radius: 4.0,
+                ..ToolSettings::default()
             };
             let _ = stamp_tool_dab(
                 DabTool::Brush,
@@ -75696,6 +75778,7 @@ mod tests {
             let one = ToolSettings {
                 brush_radius: 1.0,
                 eraser_radius: 1.0,
+                ..ToolSettings::default()
             };
             assert_eq!(brush_dabs(&one), 128);
             assert_eq!(eraser_dabs(&one), 128);
@@ -75703,6 +75786,7 @@ mod tests {
             let max = ToolSettings {
                 brush_radius: 256.0,
                 eraser_radius: 256.0,
+                ..ToolSettings::default()
             };
             assert_eq!(brush_dabs(&max), 1);
         }

@@ -65,6 +65,9 @@ pub struct ToolControls {
     /// ([`crate::sync_curves_controls`]). Inside the strip so
     /// [`tool_controls_contains`] routes its events here too.
     pub curves: CurvesControls,
+    /// The Gradient and Paint Bucket option groups (0.209.0), inside
+    /// [`Self::options`].
+    pub fill: crate::fill_controls::FillControls,
 }
 
 /// The readout's text for `tool` with `radius` (`None`: the tool has no
@@ -152,14 +155,14 @@ fn options_style(scales: &Scales) -> Style {
 /// design owner's decision, replacing a 1:2 flex split), shrinking only
 /// if the bar is narrower than that.
 #[derive(Debug, Clone, Copy)]
-enum OptionsItem {
+pub(crate) enum OptionsItem {
     Readout,
     Slider,
 }
 
 /// Re-styles `id` (already built) for the options row as `item`, shown or
 /// hidden. Returns whether its style changed.
-fn set_options_item(
+pub(crate) fn set_options_item(
     tree: &mut WidgetTree<WidgetKind>,
     scales: &Scales,
     id: WidgetId,
@@ -197,7 +200,7 @@ fn set_options_item(
 
 /// Shows or hides an options-row item (`Display`), leaving its sizing as
 /// [`set_options_item`] set it. Returns whether its style changed.
-fn set_item_shown(
+pub(crate) fn set_item_shown(
     tree: &mut WidgetTree<WidgetKind>,
     id: WidgetId,
     shown: bool,
@@ -219,7 +222,7 @@ fn set_item_shown(
 /// layout is not announced (0.160.0 review J1, the precedent of a linked
 /// scrollbar that fits). Applied last, after any mutator that rebuilds
 /// the node from widget state. Returns whether anything changed.
-fn set_node_hidden(
+pub(crate) fn set_node_hidden(
     tree: &mut WidgetTree<WidgetKind>,
     id: WidgetId,
     hidden: bool,
@@ -297,6 +300,7 @@ fn build(
     )?;
     set_options_item(tree, scales, readout, OptionsItem::Readout, true)?;
     set_options_item(tree, scales, radius, OptionsItem::Slider, false)?;
+    let fill = crate::fill_controls::insert_fill_controls(tree, options, scales)?;
     let mut curves = insert_curves_controls(tree, root, scales)?;
     // The Levels editor (0.202.0) sits beside it; one handle reaches both.
     curves.levels = Some(insert_levels_controls(tree, root, scales)?);
@@ -308,6 +312,7 @@ fn build(
         readout,
         radius,
         curves,
+        fill,
     };
     set_disabled(tree, controls, true)?;
     set_node_hidden(tree, radius, true)?;

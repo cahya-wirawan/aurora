@@ -55,6 +55,7 @@ pub mod properties_panel;
 pub mod redock;
 pub mod status_bar;
 pub mod tool;
+pub mod fill_controls;
 pub mod tool_controls;
 pub mod tools_panel;
 pub mod workspace;
@@ -148,6 +149,10 @@ pub use redock::{
 pub use status_bar::{
     STATUS_BAR_LABEL, StatusBar, StatusInfo, document_text, insert_status_bar, physical_zoom,
     sample_format_text, status_bar_text, sync_status_bar, zoom_text,
+};
+pub use fill_controls::{
+    FillControls, FillView, OPACITY_MAX, OPACITY_MIN, TOLERANCE_MAX, TOLERANCE_MIN, insert_fill_controls,
+    is_fill_tool, opacity_readout_text, shown_fill_group, sync_fill_controls, tolerance_readout_text,
 };
 pub use tool::Tool;
 pub use tool_controls::{
