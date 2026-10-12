@@ -1519,7 +1519,12 @@ mod tests {
                     .service
                     .update(self.doc, &self.layers, &mut self.store, visible, now);
                 let _ = self.service.drain();
-                if self.service.pending_len() == 0 {
+                // A layer whose tiles are still being read from the scratch
+                // disk (the per-turn read cap deferred it) is not pending
+                // yet: wait for those too, or a store that paged tiles out
+                // (a small residency share, as on a busy macOS runner)
+                // returns before every visible layer has its job.
+                if self.service.pending_len() == 0 && self.service.gathering.is_empty() {
                     return now;
                 }
                 assert!(Instant::now() < end, "the worker never finished");
