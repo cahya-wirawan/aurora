@@ -184,7 +184,8 @@ pub use color_picker::{
     set_saturation_value_from_point,
 };
 pub use color_swatch::{
-    ColorSwatchState, insert_color_swatch, set_color_swatch_color, set_color_swatch_disabled,
+    ColorSwatchState, insert_color_swatch, insert_color_swatch_styled, set_color_swatch_accessible,
+    set_color_swatch_color, set_color_swatch_disabled,
 };
 pub use command_palette::{
     CommandEntry, CommandPaletteState, command_palette_state, insert_command_palette,

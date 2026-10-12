@@ -236,7 +236,7 @@
 //! already does for painting. **Eyedropper finished the same week**:
 //! `sample_pixel` reads one texel straight out of the active layer's
 //! own tile store surface (`TileStore::get`, no interpolation), and
-//! `App::sample_eyedropper` sets it as `current_colour` — what `Brush`
+//! `App::sample_eyedropper` sets it as the foreground colour (`App::colour`, 0.208.0) — what `Brush`
 //! now actually paints with, replacing what used to be a fixed
 //! constant — as long as the sampled texel is actually painted (alpha
 //! `> 0.0`; a fully transparent one, painted-then-erased or never
@@ -542,6 +542,7 @@ mod autosave_files;
 mod background_autosave;
 mod background_composite;
 mod background_open;
+mod colour_state;
 mod document_close;
 mod document_session;
 mod document_tabs;
@@ -4625,6 +4626,10 @@ enum AccessibilityReaction {
     /// A `Click` on a Layer actions toolbar button (0.196.0): the app
     /// runs that action ([`AccessibilityEffects::layer_action`]).
     LayerAction(aurora_ui::LayerAction),
+    /// An action on a Tools-panel colour control or its picker popover
+    /// (0.208.0): the app applies it to the colours
+    /// ([`AccessibilityEffects::colour`]).
+    ColourControl(aurora_widgets::ActionOutcome),
     /// A Layers-panel row group expanded or collapsed: the caller must
     /// reconcile its own row map ([`App::handle_accessibility_action`]).
     LayerRowExpanded { row: WidgetId, expanded: bool },
@@ -4725,6 +4730,8 @@ fn route_accessibility_action(
                 AccessibilityReaction::SelectTool(tool)
             } else if let Some(action) = workspace.layer_toolbar.action_for(id) {
                 AccessibilityReaction::LayerAction(action)
+            } else if aurora_ui::is_colour_control(&workspace.tree, id) {
+                AccessibilityReaction::ColourControl(aurora_widgets::ActionOutcome::Activated(id))
             } else if let Some(panel) = workspace.panel_strip.panel_for(id) {
                 open_from_panel_strip(workspace, focus, id);
                 AccessibilityReaction::PanelStrip(panel)
@@ -4742,6 +4749,9 @@ fn route_accessibility_action(
             if layer_rows.contains_key(&id) =>
         {
             AccessibilityReaction::LayerRowExpanded { row: id, expanded }
+        }
+        Ok(outcome) if aurora_ui::is_colour_control(&workspace.tree, request.target_node) => {
+            AccessibilityReaction::ColourControl(outcome)
         }
         Ok(outcome)
             if layer_controls.is_some_and(|controls| {
@@ -4916,6 +4926,19 @@ struct AccessibilityEffects {
     /// A Layer actions toolbar button an assistive technology clicked
     /// (0.196.0); the App runs it (`App::run_layer_action`).
     layer_action: Option<aurora_ui::LayerAction>,
+    /// A colour control an assistive technology used (0.208.0); the App
+    /// applies it to the colours (`App::apply_colour_edit`).
+    colour: Option<ColourEdit>,
+}
+
+/// A colour control's accessibility action, reduced to comparable data
+/// (an `f32` colour travels as bits so the effects stay `Eq`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColourEdit {
+    /// A swatch, swap or defaults button was clicked.
+    Activated(WidgetId),
+    /// The picker `.0` reported the straight sRGB colour `.1` (bits).
+    Picked(WidgetId, [u32; 3]),
 }
 
 /// Whether an outcome the app maps to no reaction of its own is
@@ -5230,6 +5253,22 @@ fn apply_accessibility_action(
                 dialog: None,
                 close_tab: None,
                 layer_action: Some(action),
+                colour: None,
+            };
+        }
+        AccessibilityReaction::ColourControl(outcome) => {
+            let colour = match outcome {
+                aurora_widgets::ActionOutcome::Activated(id) => Some(ColourEdit::Activated(id)),
+                aurora_widgets::ActionOutcome::ColorChanged { picker, hsv, .. } => Some(
+                    ColourEdit::Picked(picker, hsv.to_srgb_f32().map(f32::to_bits)),
+                ),
+                _ => None,
+            };
+            return AccessibilityEffects {
+                relayout: true,
+                redraw: true,
+                colour,
+                ..AccessibilityEffects::default()
             };
         }
         AccessibilityReaction::SelectTool(tool) => {
@@ -5240,6 +5279,7 @@ fn apply_accessibility_action(
                 dialog: None,
                 close_tab: None,
                 layer_action: None,
+                colour: None,
             };
         }
         AccessibilityReaction::Handled(outcome) if in_gallery => {
@@ -5270,6 +5310,7 @@ fn apply_accessibility_action(
                 dialog: None,
                 close_tab: Some(index),
                 layer_action: None,
+                colour: None,
             };
         }
         AccessibilityReaction::PanelStrip(panel) => {
@@ -5308,6 +5349,7 @@ fn apply_accessibility_action(
         dialog: dialog_result,
         close_tab: None,
         layer_action: None,
+        colour: None,
     }
 }
 
@@ -5363,6 +5405,10 @@ enum AppCommand {
     /// Close Document (0.174.0), `Ctrl+W` — literally `Ctrl`, even on
     /// macOS, for the same reason as Undo (no per-platform rebinding).
     CloseDocument,
+    /// Swap the foreground and background colours (0.208.0), `X`.
+    SwapColours,
+    /// Reset the colours to black over white (0.208.0), `D`.
+    ResetColours,
 }
 
 /// This build's fixed, checked-in global shortcut bindings. Not (yet)
@@ -5425,6 +5471,9 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         ("i", AppCommand::SelectTool(aurora_ui::Tool::Eyedropper)),
         ("b", AppCommand::SelectTool(aurora_ui::Tool::Brush)),
         ("e", AppCommand::SelectTool(aurora_ui::Tool::Eraser)),
+        // 0.208.0: Photoshop's colour keys, bare like the tool letters.
+        ("x", AppCommand::SwapColours),
+        ("d", AppCommand::ResetColours),
     ];
     let mut registry = ShortcutRegistry::new();
     for (source, command) in bindings {
@@ -5594,6 +5643,12 @@ enum ActivatedCommand {
     /// The `Alt+Ctrl+G` toggle (0.201.0): creates the active layer's
     /// clipping mask, or releases it when it has one.
     ToggleClip,
+    /// Swap the foreground and background colours (0.208.0): `X`, the
+    /// palette and the Tools panel's swap button.
+    SwapColours,
+    /// Reset the colours to black over white (0.208.0): `D`, the palette
+    /// and the Tools panel's defaults button.
+    ResetColours,
     /// A keyboard panel move (0.166.0, [`PANEL_MOVE_COMMANDS`]) —
     /// returned because rebuilding a tab group needs `App`'s `Scales`.
     /// Run by [`run_panel_move`].
@@ -5757,6 +5812,8 @@ const COMMAND_LAYER_NEW_HUE_SATURATION: &str = "layer.new_hue_saturation";
 const COMMAND_LAYER_NEW_GROUP: &str = "layer.new_group";
 const COMMAND_LAYER_CLIP_CREATE: &str = "layer.clip_create";
 const COMMAND_LAYER_CLIP_RELEASE: &str = "layer.clip_release";
+const COMMAND_COLOURS_SWAP: &str = "colour.swap";
+const COMMAND_COLOURS_RESET: &str = "colour.reset";
 
 /// The command palette's own, real content: one command per docked
 /// panel, focusing it; one more per panel, toggling its own
@@ -5826,6 +5883,14 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_LAYER_NEW_GROUP, "New Group"),
         CommandEntry::new(COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
         CommandEntry::new(COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),
+        CommandEntry::new(
+            COMMAND_COLOURS_SWAP,
+            "Swap Foreground and Background Colours",
+        ),
+        CommandEntry::new(
+            COMMAND_COLOURS_RESET,
+            "Default Foreground and Background Colours",
+        ),
     ];
     commands.extend(
         PANEL_MOVE_COMMANDS
@@ -6027,6 +6092,12 @@ fn activate_command(
     if id == COMMAND_LAYER_CLIP_RELEASE {
         return Some(ActivatedCommand::SetClip(false));
     }
+    if id == COMMAND_COLOURS_SWAP {
+        return Some(ActivatedCommand::SwapColours);
+    }
+    if id == COMMAND_COLOURS_RESET {
+        return Some(ActivatedCommand::ResetColours);
+    }
     tracing::warn!(command = id, "unknown command activated");
     None
 }
@@ -6123,6 +6194,10 @@ enum WidgetOwner {
     /// The document tab strip (0.173.0): the bar changes its own
     /// selection; `App::follow_document_tabs_now` then switches.
     DocumentTabs,
+    /// The Tools panel's foreground/background swatches, swap and
+    /// defaults buttons, and the colour picker popover a swatch opens
+    /// (0.208.0): an outcome edits `App::colours`, never the document.
+    ColourControls,
 }
 
 /// A label-strip button's action (0.165.0): expands the rail with the
@@ -6544,6 +6619,9 @@ fn widget_owner(
     }
     if tool_controls.is_some_and(|controls| aurora_ui::tool_controls_contains(tree, controls, id)) {
         return Some(WidgetOwner::ToolControls);
+    }
+    if aurora_ui::is_colour_control(tree, id) {
+        return Some(WidgetOwner::ColourControls);
     }
     if is_tool_button(tree, id) {
         return Some(WidgetOwner::ToolsPanel);
@@ -10264,6 +10342,10 @@ fn run_command(
         AppCommand::NextDocument | AppCommand::PreviousDocument | AppCommand::CloseDocument => {
             CompositeInvalidation::None
         }
+        // Handed back as `ActivatedCommand::{SwapColours, ResetColours}`
+        // by `handle_key` (the colours are `App` state, not this
+        // function's); not document state either way.
+        AppCommand::SwapColours | AppCommand::ResetColours => CompositeInvalidation::None,
     }
 }
 
@@ -10785,6 +10867,12 @@ fn handle_key(
         }
         if command == AppCommand::ToggleClippingMask {
             return Some(ActivatedCommand::ToggleClip);
+        }
+        if command == AppCommand::SwapColours {
+            return Some(ActivatedCommand::SwapColours);
+        }
+        if command == AppCommand::ResetColours {
+            return Some(ActivatedCommand::ResetColours);
         }
         if command == AppCommand::CloseDocument {
             return Some(ActivatedCommand::Document(
@@ -24768,14 +24856,6 @@ fn eyedropper_sample(
 /// radius slider.
 const BRUSH_RADIUS: f32 = 24.0;
 
-/// [`App::current_colour`]'s own starting value — black, since there is
-/// no colour-picker UI yet to set it any other way at startup. Real
-/// after that: the Eyedropper tool changes it to whatever's actually
-/// sampled, and every `Brush` dab paints with whatever it currently is,
-/// not this constant directly (like [`BRUSH_RADIUS`]/[`ERASER_RADIUS`],
-/// which since 0.136.0 are only [`ToolSettings`]' starting values).
-const DEFAULT_COLOUR: [f32; 3] = [0.0, 0.0, 0.0];
-
 /// The Eraser tool's *starting* radius — same reasoning and same value
 /// as [`BRUSH_RADIUS`], kept as its own named constant so the two tools'
 /// sizes are independent ([`ToolSettings`] edits them separately).
@@ -25710,11 +25790,12 @@ struct App {
     /// A window close arrived while another dialog was open (review Q-3):
     /// the quit review starts once it closes.
     quit_pending: bool,
-    /// The colour `Brush` paints with — [`DEFAULT_COLOUR`] until the
-    /// Eyedropper tool samples a real pixel and changes it
-    /// ([`Self::sample_eyedropper`]). No colour-picker UI exists yet to
-    /// set it any other way.
-    current_colour: [f32; 3],
+    /// The foreground and background colours (0.208.0,
+    /// [`colour_state::ColourState`]): `Brush` paints with the
+    /// foreground; the Eyedropper sets it (`Alt` held: the background);
+    /// the Tools panel's swatches, the swap/reset commands and a colour
+    /// picker popover edit it. Not document state, not persisted.
+    colour: colour_state::ColourController,
     /// Every Layers-panel row's own `WidgetId`, mapped to the `LayerId`
     /// it represents (`aurora_ui::populate_layers_panel`'s own return
     /// value) — what [`Self::handle_pointer_pressed`] looks a
@@ -26246,7 +26327,7 @@ impl App {
             exit_requested: false,
             quit_confirmed: false,
             quit_pending: false,
-            current_colour: DEFAULT_COLOUR,
+            colour: colour_state::ColourController::default(),
             layer_rows,
             scroll_follow: ScrollFollow::default(),
             residency: None,
@@ -26363,6 +26444,12 @@ impl App {
         if let Some(action) = effects.layer_action {
             self.run_layer_action(action);
         }
+        if let Some(edit) = effects.colour {
+            let effect =
+                self.colour
+                    .apply_edit(&mut self.workspace, &mut self.focus, &self.scales, edit);
+            self.apply_colour_effect(effect);
+        }
         if let Some(tool) = effects.select_tool {
             self.select_tool_command(tool);
         }
@@ -26425,6 +26512,15 @@ impl App {
         if self.cancel_panel_drag() && key == Key::Named(NamedKey::Escape) {
             return;
         }
+        if colour_state::escape_closes_popover(
+            key,
+            self.colour.popover.is_some(),
+            self.dialog.is_some(),
+            self.command_palette.is_some(),
+        ) {
+            self.close_colour_popover_now(true);
+            return;
+        }
         if self.layer_row_key(key) {
             return;
         }
@@ -26457,6 +26553,7 @@ impl App {
                         self.select_tool_command(tool);
                     }
                 }
+                WidgetOwner::ColourControls => self.apply_colour_outcome(&outcome),
                 WidgetOwner::LayerToolbar => {
                     if let Some(action) = layer_toolbar_click(&self.workspace, &outcome) {
                         self.run_layer_action(action);
@@ -26559,6 +26656,8 @@ impl App {
                     .is_some_and(|layer| self.doc.layers.clipped(layer));
                 self.run_layer_command(LayerCommand::SetClip(on));
             }
+            Some(ActivatedCommand::SwapColours) => self.swap_colours(),
+            Some(ActivatedCommand::ResetColours) => self.reset_colours(),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -28433,7 +28532,7 @@ impl App {
     /// half of the split that function's own doc comment describes. For
     /// `Drag::Eyedropper`, samples directly at the current point
     /// ([`Self::sample_eyedropper`]) every event, so dragging with the
-    /// Eyedropper tool held down updates `current_colour` live, the
+    /// Eyedropper tool held down updates the foreground colour live, the
     /// same as a real image editor's own eyedropper.
     fn handle_pointer_moved(&mut self, physical_position: (f64, f64)) {
         let position = logical_point(physical_position, self.scale_factor);
@@ -28834,7 +28933,7 @@ impl App {
             surface,
             local,
             &self.tool_settings,
-            self.current_colour,
+            colour_state::dab_colour(DabTool::Brush, &self.colour.state),
             &mut self.drag,
         );
         let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
@@ -28903,7 +29002,7 @@ impl App {
             surface,
             local,
             &self.tool_settings,
-            self.current_colour,
+            colour_state::dab_colour(DabTool::Eraser, &self.colour.state),
             &mut self.drag,
         );
         let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
@@ -29050,7 +29149,7 @@ impl App {
     /// space) — every visible layer, in its own real blend order and
     /// opacity, exactly what's on screen — and, if the sampled texel is
     /// actually painted (alpha `> 0.0`), sets it as the new
-    /// [`Self::current_colour`] — what the Eyedropper tool does on a
+    /// foreground colour (`Alt` held: the background, 0.208.0) — what the Eyedropper tool does on a
     /// click or while dragging. Reads [`composite_surface_id`] rather
     /// than the active layer's own surface: `App::redraw`'s own
     /// [`recomposite_visible_tiles`] call keeps that reserved surface's
@@ -29098,7 +29197,11 @@ impl App {
         };
         let origin = active_layer_origin(&self.doc.layers, self.doc.active_layer);
         if let Some(colour) = eyedropper_sample(store, origin, doc_point) {
-            self.current_colour = colour;
+            // Photoshop's convention: `Alt`/`Option` picks the background.
+            let effect = self
+                .colour
+                .eyedropper_pick(&mut self.workspace, self.modifiers, colour);
+            self.apply_colour_effect(effect);
         }
     }
 
@@ -29291,6 +29394,8 @@ impl App {
                     .is_some_and(|layer| self.doc.layers.clipped(layer));
                 self.run_layer_command(LayerCommand::SetClip(on));
             }
+            Some(ActivatedCommand::SwapColours) => self.swap_colours(),
+            Some(ActivatedCommand::ResetColours) => self.reset_colours(),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -29447,6 +29552,9 @@ impl App {
     /// second gesture, the same rule [`Self::handle_pointer_pressed`]
     /// applies to its layer-row and canvas branches.
     fn route_gallery(&mut self, phase: PointerPhase, position: (f32, f32)) -> bool {
+        if phase == PointerPhase::Down && self.dialog.is_none() && self.command_palette.is_none() {
+            self.light_dismiss_colour_popover(position);
+        }
         let controls = self.layer_controls.controls;
         let tool_controls = self.tool_controls;
         #[allow(clippy::cast_possible_truncation)]
@@ -29493,6 +29601,11 @@ impl App {
             {
                 self.apply_tool_control(outcome);
             }
+            if routed.owner == Some(WidgetOwner::ColourControls)
+                && let Some(outcome) = routed.outcome.as_ref()
+            {
+                self.apply_colour_outcome(outcome);
+            }
             if routed.owner == Some(WidgetOwner::ToolsPanel)
                 && let Some(tool) = routed
                     .outcome
@@ -29537,6 +29650,61 @@ impl App {
         true
     }
 
+    /// Applies what a [`colour_state::ColourController`] call reports.
+    fn apply_colour_effect(&mut self, effect: colour_state::Effect) {
+        if effect.relayout {
+            self.relayout_after_gallery();
+        } else if effect.changed {
+            self.push_accessibility();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Mirrors the colours into the Tools panel's swatches and an open
+    /// picker; run once per event-loop iteration and after every change.
+    fn sync_colours_now(&mut self) {
+        let effect = self.colour.sync(&mut self.workspace);
+        self.apply_colour_effect(effect);
+    }
+
+    /// Swap Foreground and Background (0.208.0): `X`, the palette, the
+    /// swap button.
+    fn swap_colours(&mut self) {
+        let effect = self.colour.swap(&mut self.workspace);
+        self.apply_colour_effect(effect);
+    }
+
+    /// Default Colours (0.208.0): black over white. `D`, the palette, the
+    /// defaults button.
+    fn reset_colours(&mut self) {
+        let effect = self.colour.reset(&mut self.workspace);
+        self.apply_colour_effect(effect);
+    }
+
+    /// What an outcome on a colour control means (0.208.0).
+    fn apply_colour_outcome(&mut self, outcome: &PointerOutcome) {
+        let effect =
+            self.colour
+                .apply_outcome(&mut self.workspace, &mut self.focus, &self.scales, outcome);
+        self.apply_colour_effect(effect);
+    }
+
+    /// Closes the colour popover (a no-op if none is open).
+    fn close_colour_popover_now(&mut self, restore_focus: bool) {
+        let effect = self
+            .colour
+            .close_popover(&mut self.workspace, &mut self.focus, restore_focus);
+        self.apply_colour_effect(effect);
+    }
+
+    /// A press outside the colour popover closes it.
+    fn light_dismiss_colour_popover(&mut self, position: (f32, f32)) {
+        let effect = self
+            .colour
+            .light_dismiss(&mut self.workspace, &mut self.focus, position);
+        self.apply_colour_effect(effect);
+    }
+
     /// Tints the Layer actions toolbar button (0.196.0) and the tools
     /// panel button (0.207.0) under the pointer (`None`: the pointer left
     /// the window or something else owns it — a modal, a canvas drag, a
@@ -29559,6 +29727,19 @@ impl App {
             Ok(true) => self.needs_redraw = true,
             Ok(false) => {}
             Err(err) => tracing::warn!(?err, "toolbar hover failed"),
+        }
+        // 0.208.0: so are the swap and default-colours buttons.
+        let colours = self.workspace.tools.colours;
+        for button in [colours.swap, colours.defaults] {
+            match aurora_widgets::widgets::set_button_hovered(
+                &mut self.workspace.tree,
+                button,
+                under == Some(button),
+            ) {
+                Ok(true) => self.needs_redraw = true,
+                Ok(false) => {}
+                Err(err) => tracing::warn!(?err, "colour button hover failed"),
+            }
         }
         // 0.207.0: the tools panel's icon buttons are tinted the same way.
         let tool_hovered =
@@ -30061,6 +30242,7 @@ impl App {
     /// one having to remember. The Properties *body* is refreshed by those
     /// paths themselves ([`refresh_properties_panel`]).
     fn sync_tool_controls_now(&mut self) {
+        self.sync_colours_now();
         let captured = self.gallery_click.captured();
         if sync_tool_controls(
             &mut self.workspace,
@@ -33568,6 +33750,7 @@ mod tests {
                         dialog: None,
                         close_tab: None,
                         layer_action: None,
+                        colour: None,
                     },
                     "{tool:?}"
                 );
@@ -33763,6 +33946,7 @@ mod tests {
             dialog: None,
             close_tab: None,
             layer_action: None,
+            colour: None,
         };
 
         /// A group `g` holding `c`, plus a top-level `top`.
@@ -38697,7 +38881,21 @@ mod tests {
 
         // 0.160.0: the tools panel's buttons come first in tab order, one
         // stop each; the docked panels follow them.
-        for (_, button) in workspace.tools.buttons {
+        // 0.208.0: then the colour controls, in tree order.
+        let colours = workspace.tools.colours;
+        let stops: Vec<_> = workspace
+            .tools
+            .buttons
+            .iter()
+            .map(|(_, id)| *id)
+            .chain([
+                colours.background,
+                colours.foreground,
+                colours.swap,
+                colours.defaults,
+            ])
+            .collect();
+        for button in stops {
             let _ = run_command(
                 &mut workspace,
                 &mut focus,
@@ -87850,6 +88048,8 @@ mod occlusion_cull_tests {
 #[cfg(test)]
 #[path = "background_composite_tests.rs"]
 mod background_composite_tests;
+#[cfg(test)]
+mod colour_tests;
 
 #[cfg(test)]
 #[path = "open_time_tests.rs"]

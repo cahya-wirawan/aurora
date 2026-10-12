@@ -27,11 +27,11 @@
 //! sample, paint — Photoshop's own grouping, trimmed to the tools Aurora
 //! has. A group of one (the Eyedropper) fills the left cell.
 //!
-//! **Not here yet: the colour swatches.** Photoshop shows the foreground
-//! and background colours at the strip's foot. Aurora has no
-//! foreground/background colour model (the Brush paints with whatever
-//! the Eyedropper last sampled), and the swatches would need one, so
-//! none is drawn; it is future work for the round that adds it.
+//! **The colour swatches (0.208.0).** Below the last tool group, behind
+//! one more group rule, sit Photoshop's foreground/background swatches,
+//! the swap arrow and the default-colours icon
+//! ([`crate::colour_controls`]). The colours themselves are
+//! `aurora-app`'s state, not this panel's.
 //!
 //! **This module owns no tool state.** Which tool is active is
 //! `aurora-app`'s (`App::tool`); a click or an assistive-technology
@@ -68,7 +68,14 @@ use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
 use taffy::style_helpers::length;
 use taffy::{FlexDirection, Rect as LayoutRect, Size, Style};
 
+use crate::colour_controls::{ColourControls, insert_colour_controls};
 use crate::tool::Tool;
+
+/// The colours a fresh panel shows before the app mirrors its own: black
+/// over white, Photoshop's defaults.
+pub const DEFAULT_FOREGROUND: [f32; 3] = [0.0, 0.0, 0.0];
+/// See [`DEFAULT_FOREGROUND`].
+pub const DEFAULT_BACKGROUND: [f32; 3] = [1.0, 1.0, 1.0];
 
 /// The tools panel's accessible label.
 pub const TOOLS_PANEL_LABEL: &str = "Tools";
@@ -118,6 +125,8 @@ pub struct ToolsPanel {
     pub root: WidgetId,
     /// `(tool, its toggle button)`, in [`Tool::ALL`] order.
     pub buttons: [(Tool, WidgetId); Tool::ALL.len()],
+    /// The foreground/background swatches and their two buttons (0.208.0).
+    pub colours: ColourControls,
 }
 
 impl ToolsPanel {
@@ -261,7 +270,14 @@ fn build(
             }
         }
     }
-    Ok(ToolsPanel { root, buttons })
+    widgets::insert_separator(tree, root, scales)?;
+    let colours =
+        insert_colour_controls(tree, root, scales, DEFAULT_FOREGROUND, DEFAULT_BACKGROUND)?;
+    Ok(ToolsPanel {
+        root,
+        buttons,
+        colours,
+    })
 }
 
 /// Turns `selected`'s button on and every other one off, returning
@@ -470,7 +486,7 @@ mod tests {
         let ws = build_workspace(&scales());
         let children = ws.tree.children(ws.tools.root).unwrap_or_default();
         // group, rule, group, rule, group, rule, group
-        assert_eq!(children.len(), 2 * TOOL_GROUPS.len() - 1);
+        assert_eq!(children.len(), 2 * TOOL_GROUPS.len() + 1);
         for (index, child) in children.iter().enumerate() {
             if index % 2 == 1 {
                 let Some(node) = ws.tree.accessibility(*child) else {
