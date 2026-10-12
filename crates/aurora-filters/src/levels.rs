@@ -147,7 +147,7 @@ impl LevelsLut {
     /// identity record (the shader then passes the value through exactly,
     /// as this table does); `has_gamma` is `0` when gamma is exactly `1`.
     /// An absent record is all zeros. Values are the record's own `f32`s,
-    /// bit for bit, and `1 / gamma` is computed as [`Channel::new`] does.
+    /// bit for bit, and `1 / gamma` is computed as `LevelsLut::new` does.
     #[must_use]
     pub fn packed_for_gpu(&self) -> [f32; LEVELS_PACKED_LEN] {
         let records = [

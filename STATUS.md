@@ -150,9 +150,11 @@ golden-image tests are `#[ignore]`d.
   20 blend modes (Normal, Multiply, Darken, Lighten, Screen, Difference,
   LinearDodge, LinearBurn, ColorBurn, ColorDodge, Overlay, HardLight,
   LinearLight, VividLight, HardMix, PinLight, SoftLight, Subtract, Divide,
-  Dissolve) and an unmasked root-level Curves layer; everything else (groups,
-  Exclusion, the six non-separable modes, masked Curves, layers with drawn
-  effects, clipped layers, Levels, Hue/Saturation) falls back to the CPU path transparently
+  Dissolve) and an unmasked root-level Curves, Levels or Hue/Saturation layer (0.206.0 for
+  the last two; Hue/Saturation with active colour ranges excepted); everything
+  else (groups, Exclusion, the six non-separable modes, masked adjustment
+  layers, ranged Hue/Saturation, layers with drawn effects, clipped layers) falls
+  back to the CPU path transparently
   with the same result. GPU compositing is verified on Vulkan/NVIDIA only;
   Metal and DX12 are unverified for these mechanisms.
 - The CPU whole-view recomposite runs on a **background worker** (so hiding a
@@ -414,7 +416,9 @@ small machines has not been measured on a real small machine.
 **Compositing and performance**
 - The 60 FPS gate is missed; `recomposite` is about 73 % of the GPU-path frame.
 - GPU fast path does not cover groups, `Exclusion`, the six non-separable
-  modes, masked Curves, drawn effects, clipped layers, Levels or Hue/Saturation.
+  modes, masked adjustment layers, ranged Hue/Saturation, drawn effects or
+  clipped layers (Curves, Levels and master/Colorize Hue/Saturation are covered
+  since 0.206.0).
 - Re-anchoring the composite grid to the document (so structural undo can
   invalidate narrowly and `composite_reference_origin` becomes constant) is the
   named follow-on to 0.193.0; the far pan edge is not bounded and a document
@@ -435,7 +439,7 @@ small machines has not been measured on a real small machine.
   in History.
 
 **PSD**
-- Not written: Curves, Levels and Hue/Saturation layers, PSB, text layers, editable vector
+- Not written: PSB, text layers, editable vector
   paths, CMYK/Lab/32-bit. Not read: CMYK/Lab/Bitmap/Indexed/Duotone/32-bit.
 - Smart objects are not rendered or edited and survive a save only while
   untouched.
@@ -457,8 +461,8 @@ small machines has not been measured on a real small machine.
 - **Adjustment queue approved by the design owner is done** (Levels 0.202.0,
   Hue/Saturation 0.203.0, its per-colour-range adjustments 0.204.0). Open
   follow-ups: the master Lightness slider should blend towards white in RGB
-  (PLAN.md, 0.204.0), range edge editing, a GPU path for
-  Levels and Hue/Saturation, and a histogram behind the Levels sliders.
+  (PLAN.md, 0.204.0), range edge editing, and a histogram behind the Levels sliders (the GPU
+  path for Levels and Hue/Saturation is done, 0.206.0).
 - **Next in the performance line**: anchor the composite grid to the document.
 - **Phase 1 gate (M1.10)** remains open on hardware (accessibility and IME
   audits on all three platforms), on the missed 60 FPS budget, and on a
