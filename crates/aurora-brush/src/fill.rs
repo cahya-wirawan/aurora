@@ -40,6 +40,7 @@ use aurora_tile::{CHANNELS, SAMPLES, SurfaceId, TILE, TileError, TileId, TileSto
 use half::f16;
 
 use crate::StrokeSnapshot;
+use crate::coverage::{Coverage, CoverageRegion, apply_coverage, covered};
 
 /// The most tiles one fill may touch: 1024 tiles (64 Mpx). A larger flood
 /// region or gradient area is refused, untouched, with
@@ -437,6 +438,49 @@ fn flood_everywhere(
     Ok(())
 }
 
+/// The coverage to consult texel by texel in the `width x height` box at
+/// tile-local `(x, y)` of the tile whose layer-local origin is
+/// `origin`; `None` when the box is wholly uncovered (skip the tile), and
+/// `Some(None)` when it is wholly covered or there is no selection.
+fn tile_coverage_of(
+    coverage: Option<&dyn Coverage>,
+    origin: (u32, u32),
+    tile_box: (u32, u32, u32, u32),
+) -> Option<Option<&dyn Coverage>> {
+    let Some(cov) = coverage else {
+        return Some(None);
+    };
+    let (x, y, width, height) = tile_box;
+    let rect = Rect {
+        x: i64::from(origin.0) + i64::from(x),
+        y: i64::from(origin.1) + i64::from(y),
+        width,
+        height,
+    };
+    match cov.region(rect) {
+        CoverageRegion::Empty => None,
+        CoverageRegion::Full => Some(None),
+        CoverageRegion::Partial => Some(Some(cov)),
+    }
+}
+
+/// `fresh` blended over `current` by the coverage at the layer-local
+/// texel (`origin` plus tile-local `at`), or `fresh` as is without one.
+fn blended_by(
+    tile_cov: Option<&dyn Coverage>,
+    origin: (u32, u32),
+    at: (usize, usize),
+    current: &[f16],
+    fresh: Texel,
+) -> Option<Texel> {
+    let Some(cov) = tile_cov else {
+        return Some(fresh);
+    };
+    let x = i64::from(origin.0) + i64::try_from(at.0).unwrap_or(i64::MAX);
+    let y = i64::from(origin.1) + i64::try_from(at.1).unwrap_or(i64::MAX);
+    apply_coverage(current, fresh, covered(cov, x, y))
+}
+
 /// The texel a bucket fill writes over `current`, or `None` to leave it.
 fn bucket_texel(mode: FillMode, colour: [f32; 3], current: &[f16]) -> Option<Texel> {
     let [red, green, blue] = colour;
@@ -579,9 +623,42 @@ pub fn flood_fill(
     spec: &FloodSpec,
     colour: [f32; 3],
     mode: FillMode,
+    snapshot: Option<&mut StrokeSnapshot>,
+) -> Result<FillOutcome, FillError> {
+    flood_fill_covered(store, surface, area, spec, colour, mode, snapshot, None)
+}
+
+/// [`flood_fill`] restricted to a selection (0.211.0): the region is found
+/// exactly as before (a contiguous region may run through unselected
+/// pixels), then each of its texels is blended in by `coverage`
+/// (`old + (fill - old) * coverage`, see [`Coverage`]) and a tile with no
+/// covered texel is neither read for writing nor created. A seed whose own
+/// coverage is `0` does nothing at all and reads nothing. The tile caps
+/// count the matched region, not the covered part of it. `None` is exactly
+/// [`flood_fill`]; coverage `1` writes the same bits.
+///
+/// # Errors
+///
+/// As [`flood_fill`].
+#[allow(clippy::too_many_arguments)]
+pub fn flood_fill_covered(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    area: (u32, u32),
+    spec: &FloodSpec,
+    colour: [f32; 3],
+    mode: FillMode,
     mut snapshot: Option<&mut StrokeSnapshot>,
+    coverage: Option<&dyn Coverage>,
 ) -> Result<FillOutcome, FillError> {
     let mut outcome = FillOutcome::default();
+    if let Some(cov) = coverage
+        && covered(cov, i64::from(spec.seed.0), i64::from(spec.seed.1)) <= 0.0
+    {
+        // The clicked pixel is outside the selection: Photoshop does
+        // nothing, and so nothing is read.
+        return Ok(outcome);
+    }
     let region = {
         let mut plane = Plane::new(store, surface);
         flood_region(&mut plane, area, spec)?
@@ -590,6 +667,10 @@ pub fn flood_fill(
         return Ok(outcome);
     };
     for (id, words) in &region.tiles {
+        let origin = (id.x.saturating_mul(TILE), id.y.saturating_mul(TILE));
+        let Some(tile_cov) = tile_coverage_of(coverage, origin, (0, 0, TILE, TILE)) else {
+            continue;
+        };
         let mut bits = words
             .iter()
             .enumerate()
@@ -600,8 +681,10 @@ pub fn flood_fill(
                     .map(move |b| w * 64 + b)
             })
             .map(|bit| (bit % TILE_SIDE, bit / TILE_SIDE));
-        let mut texel_for =
-            |_: usize, _: usize, current: &[f16]| bucket_texel(mode, colour, current);
+        let mut texel_for = |lx: usize, ly: usize, current: &[f16]| {
+            let fresh = bucket_texel(mode, colour, current)?;
+            blended_by(tile_cov, origin, (lx, ly), current, fresh)
+        };
         match write_tile(
             store,
             surface,
@@ -746,10 +829,39 @@ pub fn gradient_fill(
     area: (u32, u32, u32, u32),
     spec: &GradientSpec,
     mode: FillMode,
+    snapshot: Option<&mut StrokeSnapshot>,
+) -> Result<FillOutcome, FillError> {
+    gradient_fill_covered(store, surface, area, spec, mode, snapshot, None)
+}
+
+/// [`gradient_fill`] restricted to a selection (0.211.0): the gradient is
+/// evaluated as before (its start and end do not move) and each texel is
+/// blended in by `coverage`. The area is first clipped to
+/// [`Coverage::bounds`], so only the tiles the selection can reach count
+/// toward `spec.max_tiles` and are visited; a tile with no covered texel
+/// is neither read nor created. `None` is exactly [`gradient_fill`].
+///
+/// # Errors
+///
+/// As [`gradient_fill`].
+pub fn gradient_fill_covered(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    area: (u32, u32, u32, u32),
+    spec: &GradientSpec,
+    mode: FillMode,
     mut snapshot: Option<&mut StrokeSnapshot>,
+    coverage: Option<&dyn Coverage>,
 ) -> Result<FillOutcome, FillError> {
     let mut outcome = FillOutcome::default();
-    let (x0, y0, x1, y1) = area;
+    let (mut x0, mut y0, mut x1, mut y1) = area;
+    if let Some(bounds) = coverage.and_then(Coverage::bounds) {
+        let clip = |v: i64| u32::try_from(v.clamp(0, i64::from(u32::MAX))).unwrap_or(u32::MAX);
+        x0 = x0.max(clip(bounds.x));
+        y0 = y0.max(clip(bounds.y));
+        x1 = x1.min(clip(bounds.right()));
+        y1 = y1.min(clip(bounds.bottom()));
+    }
     if x0 >= x1
         || y0 >= y1
         || spec.is_degenerate()
@@ -775,16 +887,24 @@ pub fn gradient_fill(
             let lx1 = x1.min(origin_x.saturating_add(TILE)) - origin_x;
             let ly0 = y0.max(origin_y) - origin_y;
             let ly1 = y1.min(origin_y.saturating_add(TILE)) - origin_y;
+            let Some(tile_cov) = tile_coverage_of(
+                coverage,
+                (origin_x, origin_y),
+                (lx0, ly0, lx1 - lx0, ly1 - ly0),
+            ) else {
+                continue;
+            };
             let mut pixels =
                 (ly0..ly1).flat_map(move |ly| (lx0..lx1).map(move |lx| (lx as usize, ly as usize)));
             let mut texel_for = |lx: usize, ly: usize, current: &[f16]| {
-                gradient_texel(
+                let fresh = gradient_texel(
                     spec,
                     mode,
                     origin_x.saturating_add(u32::try_from(lx).unwrap_or(0)),
                     origin_y.saturating_add(u32::try_from(ly).unwrap_or(0)),
                     current,
-                )
+                )?;
+                blended_by(tile_cov, (origin_x, origin_y), (lx, ly), current, fresh)
             };
             match write_tile(
                 store,

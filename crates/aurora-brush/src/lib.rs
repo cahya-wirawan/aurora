@@ -47,6 +47,7 @@
 //! See each module's own doc comment for exactly what's real and what's
 //! still open.
 
+mod coverage;
 mod dab;
 mod fill;
 mod stamp;
@@ -54,12 +55,16 @@ mod stamp;
 mod test_support;
 mod undo;
 
+pub use coverage::{Coverage, CoverageRegion};
 pub use dab::{DEFAULT_SPACING, advance_segment, dab_step, dabs_along_path};
 pub use fill::{
     FillError, FillMode, FillOutcome, FloodSpec, GradientKind, GradientSpec, MAX_EXAMINED_TILES,
-    MAX_FILL_TILES, flood_fill, gradient_fill,
+    MAX_FILL_TILES, flood_fill, flood_fill_covered, gradient_fill, gradient_fill_covered,
 };
-pub use stamp::{DabOutcome, erase_dab, stamp_dab, stamp_dab_preserving_alpha, touched_tiles};
+pub use stamp::{
+    DabOutcome, erase_dab, erase_dab_covered, stamp_dab, stamp_dab_covered,
+    stamp_dab_preserving_alpha, stamp_dab_preserving_alpha_covered, touched_tiles,
+};
 pub use undo::{
     HistoryStats, PixelHistory, SPILL_BYTES_PER_CALL, SPILL_FILES_PER_CALL, StrokeSnapshot,
 };

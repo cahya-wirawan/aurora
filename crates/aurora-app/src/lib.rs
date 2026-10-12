@@ -554,6 +554,7 @@ mod prepared_pixels;
 mod psd_save;
 #[cfg(test)]
 mod psd_save_tests;
+mod selection_paint;
 mod small_machine;
 mod workspace_presets;
 use background_open::{
@@ -25340,6 +25341,7 @@ impl ToolSettings {
 /// behind [`App::paint_dab`] and [`App::erase_dab`], pulled out of them
 /// (review M4a/M4b, 0.136.0) so the radius they stamp with is
 /// testable without an `App`, which needs a window.
+#[cfg_attr(not(test), allow(dead_code))] // the selection-free form: tests and docs
 fn stamp_tool_dab(
     tool: DabTool,
     store: &mut aurora_tile::TileStore,
@@ -25355,6 +25357,7 @@ fn stamp_tool_dab(
 /// [`stamp_tool_dab`] with the transparency lock (0.198.0): `preserve_alpha`
 /// makes a brush dab recolour without ever changing alpha.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))] // the selection-free form: tests and docs
 fn stamp_tool_dab_locked(
     tool: DabTool,
     preserve_alpha: bool,
@@ -25365,27 +25368,63 @@ fn stamp_tool_dab_locked(
     colour: [f32; 3],
     drag: &mut Option<Drag>,
 ) -> aurora_brush::DabOutcome {
+    stamp_tool_dab_covered(
+        tool,
+        preserve_alpha,
+        store,
+        surface,
+        local,
+        settings,
+        colour,
+        drag,
+        None,
+    )
+}
+
+/// [`stamp_tool_dab_locked`] through the active selection (0.211.0):
+/// `coverage` is the document's selection seen from the painted layer
+/// ([`selection_paint::layer_selection`]), `None` for no selection, which
+/// is exactly the selection-free dab.
+#[allow(clippy::too_many_arguments)]
+fn stamp_tool_dab_covered(
+    tool: DabTool,
+    preserve_alpha: bool,
+    store: &mut aurora_tile::TileStore,
+    surface: aurora_tile::SurfaceId,
+    local: (f32, f32),
+    settings: &ToolSettings,
+    colour: [f32; 3],
+    drag: &mut Option<Drag>,
+    coverage: Option<&dyn aurora_brush::Coverage>,
+) -> aurora_brush::DabOutcome {
     let radius = settings.dab_radius(tool);
     match tool {
-        DabTool::Brush if preserve_alpha => aurora_brush::stamp_dab_preserving_alpha(
+        DabTool::Brush if preserve_alpha => aurora_brush::stamp_dab_preserving_alpha_covered(
             store,
             surface,
             local,
             radius,
             colour,
             brush_stroke_mut(drag),
+            coverage,
         ),
-        DabTool::Brush => aurora_brush::stamp_dab(
+        DabTool::Brush => aurora_brush::stamp_dab_covered(
             store,
             surface,
             local,
             radius,
             colour,
             brush_stroke_mut(drag),
+            coverage,
         ),
-        DabTool::Eraser => {
-            aurora_brush::erase_dab(store, surface, local, radius, eraser_stroke_mut(drag))
-        }
+        DabTool::Eraser => aurora_brush::erase_dab_covered(
+            store,
+            surface,
+            local,
+            radius,
+            eraser_stroke_mut(drag),
+            coverage,
+        ),
     }
 }
 
@@ -29215,6 +29254,8 @@ impl App {
             PaintPermission::PreserveAlpha => true,
             PaintPermission::Allowed => false,
         };
+        // The active selection (0.211.0): the dab paints only through it.
+        let selection = selection_paint::layer_selection(self.doc.selection.active(), bounds);
         let Some(store) = self.doc.tile_store.as_mut() else {
             return;
         };
@@ -29224,7 +29265,7 @@ impl App {
         // free function over `&mut Option<Drag>` and not a `&mut self`
         // helper method: that would borrow all of `self` and conflict
         // with `self.doc.tile_store` above.
-        let outcome = stamp_tool_dab_locked(
+        let outcome = stamp_tool_dab_covered(
             DabTool::Brush,
             preserve_alpha,
             store,
@@ -29233,6 +29274,7 @@ impl App {
             &self.tool_settings,
             colour_state::dab_colour(DabTool::Brush, &self.colour.state),
             &mut self.drag,
+            selection_paint::as_coverage(selection.as_ref()),
         );
         let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
         invalidate_painted_tiles(
@@ -29288,20 +29330,24 @@ impl App {
             self.lock_notice = Some((why, Some(layer_id)));
             return;
         }
+        // The active selection (0.211.0): the dab erases only through it.
+        let selection = selection_paint::layer_selection(self.doc.selection.active(), bounds);
         let Some(store) = self.doc.tile_store.as_mut() else {
             return;
         };
         let local = layer_local_point(bounds, doc_point);
         // Same distinct-field borrows `Self::paint_dab` relies on; the
         // colour is unused by an erase.
-        let outcome = stamp_tool_dab(
+        let outcome = stamp_tool_dab_covered(
             DabTool::Eraser,
+            false,
             store,
             surface,
             local,
             &self.tool_settings,
             colour_state::dab_colour(DabTool::Eraser, &self.colour.state),
             &mut self.drag,
+            selection_paint::as_coverage(selection.as_ref()),
         );
         let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
         invalidate_painted_tiles(
@@ -29474,6 +29520,7 @@ impl App {
             doc_point,
             &self.tool_settings,
             colour_state::fill_foreground(&self.colour.state),
+            self.doc.selection.active(),
         );
         self.finish_fill(layer, result, fill_tools::PAINT_BUCKET_LABEL);
     }
@@ -29497,6 +29544,7 @@ impl App {
             &self.tool_settings,
             colour_state::fill_foreground(&self.colour.state),
             colour_state::fill_background(&self.colour.state),
+            self.doc.selection.active(),
         );
         self.finish_fill(layer, result, fill_tools::GRADIENT_LABEL);
     }

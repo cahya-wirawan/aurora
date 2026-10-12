@@ -34,6 +34,64 @@ impl Selection {
             inverted: false,
         }
     }
+
+    /// How much of document pixel `(x, y)` the selection covers, for
+    /// painting through it (0.211.0): exactly `1.0` or `0.0` for a
+    /// rectangle (`Rect`'s half-open convention: the left/top edge is in,
+    /// the right/bottom edge is out), flipped by `inverted`. An empty
+    /// rectangle contains no pixel, so inverted it covers everything. A
+    /// future raster selection answers with anything in between; callers
+    /// must not assume it is only ever `0` or `1`.
+    #[must_use]
+    pub fn coverage_at(&self, x: i64, y: i64) -> f32 {
+        if self.bounds.contains_point(x, y) != self.inverted {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// A rectangle outside which [`Self::coverage_at`] is `0`: the bounds
+    /// of a plain selection, `None` for an inverted one (everything
+    /// outside the rectangle is covered, so no useful bound exists).
+    #[must_use]
+    pub fn coverage_bounds(&self) -> Option<Rect> {
+        (!self.inverted).then_some(self.bounds)
+    }
+
+    /// Whether every pixel of `rect` is covered. An empty `rect` has no
+    /// pixel and is vacuously covered.
+    #[must_use]
+    pub fn fully_covers(&self, rect: &Rect) -> bool {
+        if rect.is_empty() {
+            return true;
+        }
+        if self.inverted {
+            !self.bounds.intersects(rect)
+        } else {
+            self.bounds.x <= rect.x
+                && self.bounds.y <= rect.y
+                && self.bounds.right() >= rect.right()
+                && self.bounds.bottom() >= rect.bottom()
+        }
+    }
+
+    /// Whether no pixel of `rect` is covered. An empty `rect` has no
+    /// pixel and is vacuously uncovered.
+    #[must_use]
+    pub fn fully_excludes(&self, rect: &Rect) -> bool {
+        if rect.is_empty() {
+            return true;
+        }
+        if self.inverted {
+            self.bounds.x <= rect.x
+                && self.bounds.y <= rect.y
+                && self.bounds.right() >= rect.right()
+                && self.bounds.bottom() >= rect.bottom()
+        } else {
+            !self.bounds.intersects(rect)
+        }
+    }
 }
 
 /// A document's full selection state: the current active selection (if
@@ -168,6 +226,80 @@ mod tests {
             y: 5,
             width: 20,
             height: 20,
+        }
+    }
+
+    fn r(x: i64, y: i64, width: u32, height: u32) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn coverage_at_is_one_inside_and_zero_outside_with_half_open_edges() {
+        let s = Selection::new(r(2, 3, 4, 5));
+        assert_eq!(s.coverage_at(2, 3), 1.0, "left/top edge is in");
+        assert_eq!(s.coverage_at(5, 7), 1.0, "last column/row is in");
+        assert_eq!(s.coverage_at(6, 7), 0.0, "right edge is out");
+        assert_eq!(s.coverage_at(5, 8), 0.0, "bottom edge is out");
+        assert_eq!(s.coverage_at(1, 3), 0.0);
+        assert_eq!(s.coverage_at(2, 2), 0.0);
+        assert_eq!(s.coverage_at(-100, -100), 0.0);
+    }
+
+    #[test]
+    fn inverting_flips_every_texel_and_drops_the_bound() {
+        let mut s = Selection::new(r(2, 3, 4, 5));
+        assert_eq!(s.coverage_bounds(), Some(r(2, 3, 4, 5)));
+        s.inverted = true;
+        assert_eq!(s.coverage_bounds(), None);
+        assert_eq!(s.coverage_at(2, 3), 0.0);
+        assert_eq!(s.coverage_at(6, 7), 1.0);
+        assert_eq!(s.coverage_at(-5, 900), 1.0);
+    }
+
+    #[test]
+    fn an_empty_selection_covers_nothing_and_inverted_everything() {
+        let mut s = Selection::new(r(4, 4, 0, 10));
+        assert_eq!(s.coverage_at(4, 4), 0.0);
+        s.inverted = true;
+        assert_eq!(s.coverage_at(4, 4), 1.0);
+        assert!(s.fully_covers(&r(0, 0, 100, 100)));
+    }
+
+    #[test]
+    fn region_queries_agree_with_per_pixel_coverage() {
+        let sel = Selection::new(r(10, 10, 20, 20));
+        let inv = Selection {
+            inverted: true,
+            ..sel
+        };
+        for rect in [
+            r(10, 10, 20, 20),
+            r(12, 12, 5, 5),
+            r(0, 0, 10, 10),
+            r(0, 0, 11, 11),
+            r(25, 25, 10, 10),
+            r(30, 30, 3, 3),
+            r(9, 12, 22, 3),
+        ] {
+            for s in [sel, inv] {
+                let (mut covered, mut missed) = (0_u32, 0_u32);
+                for y in rect.y..rect.bottom() {
+                    for x in rect.x..rect.right() {
+                        if s.coverage_at(x, y) > 0.0 {
+                            covered += 1;
+                        } else {
+                            missed += 1;
+                        }
+                    }
+                }
+                assert_eq!(s.fully_covers(&rect), missed == 0, "{s:?} {rect:?}");
+                assert_eq!(s.fully_excludes(&rect), covered == 0, "{s:?} {rect:?}");
+            }
         }
     }
 
