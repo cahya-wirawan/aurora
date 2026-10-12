@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.213.0] - 2026-10-12
+
+### Changed
+
+- Raster selection model, Elliptical Marquee and undoable selection steps
+
 ## [0.212.0] - 2026-10-12
 
 ### Added
