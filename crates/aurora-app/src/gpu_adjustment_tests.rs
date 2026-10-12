@@ -55,6 +55,10 @@ fn tolerance() -> f32 {
 /// factor of 10), and GitHub's macOS adapter (Apple Paravirtual) measured
 /// 11 steps on Hue/Saturation lightness -50 where the RTX 3090 stays
 /// within 6.
+///
+/// 0.211.1: still 16 steps, now with [`Conditioning`]: the 11- and
+/// 17-step failures were not a gap in this bound but texels whose CPU
+/// result moves by up to ~0.03 for a one-step backdrop difference.
 fn translucent_tolerance() -> f32 {
     16.0 / 2048.0
 }
@@ -319,6 +323,142 @@ fn gpu_matches_cpu(
     bound: f32,
     what: &str,
 ) -> (Vec<f32>, f32) {
+    gpu_matches_cpu_excluding(
+        context, compositor, layers, store, pass, passes, bound, what, None,
+    )
+}
+
+/// How many `f16` steps of the premultiplied backdrop [`Conditioning`]
+/// perturbs each channel by: one, the most an adapter's blend unit or
+/// `straight_backdrop` division was ever measured to move it.
+const CONDITIONING_STEPS: i32 = 1;
+
+/// Per-texel conditioning of a translucent case (0.211.1): how much the
+/// CPU result moves when the premultiplied backdrop moves by one `f16`
+/// step per channel. GitHub's macOS (Apple Paravirtual, Metal) and Windows
+/// (WARP, Dx12) adapters round the backdrop one step differently from the
+/// RTX 3090, and Hue/Saturation's HSL turns that step into up to ~0.03 at
+/// a light, barely coloured pixel: with `l` near 1 the saturation
+/// `delta / (2 - hi - lo)` divides by ~0.08, and a lightness cut then
+/// scales the chroma back up (texel (198, 20) of `random_translucent` at
+/// lightness -50 moves 0.0087 on macOS and 0.0174 on Windows, and the same
+/// one-step change in the CPU result reproduces the macOS value to the
+/// bit). No bound on the GPU/CPU difference holds there, so such texels
+/// are reported and held to a looser, sensitivity-relative bound instead.
+struct Conditioning {
+    /// Texels whose sensitivity exceeds the limit, per texel.
+    ill: Vec<bool>,
+    /// The sensitivity per texel.
+    sensitivity: Vec<f32>,
+    /// The unperturbed result, which must equal the CPU tile exactly:
+    /// proof that the sensitivity is measured on the very reference the
+    /// GPU is compared against.
+    base: Vec<f32>,
+}
+
+/// The sensitivity above which a texel is excluded from the tight bound:
+/// `bound` minus the final readback's own one-step rounding direction
+/// (`pack2x16float` may round either way; `1 / ALPHA_FLOOR` of `2^-11`
+/// after the un-premultiply).
+fn conditioning_limit(bound: f32) -> f32 {
+    bound - ALPHA_FLOOR.recip() / 2048.0
+}
+
+/// `v` moved by `k` `f16` steps (a premultiplied backdrop channel is never
+/// negative; a negative `v` is returned unchanged). Below zero it goes to
+/// the negative subnormals, which is what one step down from `0.0` is.
+fn f16_step(v: half::f16, k: i32) -> half::f16 {
+    let bits = v.to_bits();
+    if bits & 0x8000 != 0 {
+        return v;
+    }
+    let moved = (i32::from(bits) + k).min(0x7BFF);
+    if moved >= 0 {
+        half::f16::from_bits(moved as u16)
+    } else {
+        half::f16::from_bits(0x8000 | (-moved) as u16)
+    }
+}
+
+/// Measures [`Conditioning`] of the adjustment layer `id` over the tile
+/// whose composite without it is `without` (straight, as [`cpu_tile`]
+/// returns it), by running the CPU's own `apply_adjustment_layer` on the
+/// premultiplied backdrop and on every combination of its colour channels
+/// moved by up to [`CONDITIONING_STEPS`] `f16` steps.
+fn conditioning_of(
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    id: aurora_doc::LayerId,
+    without: &[f32],
+    bound: f32,
+) -> Conditioning {
+    use half::f16;
+    let mut backdrop = Vec::with_capacity(without.len());
+    for px in without.chunks_exact(4) {
+        if let [r, g, b, a] = *px {
+            let a = f16::from_f32(a);
+            for c in [r, g, b] {
+                backdrop.push(f16::from_f32(f16::from_f32(c).to_f32() * a.to_f32()));
+            }
+            backdrop.push(a);
+        }
+    }
+    let mut run = |acc: Vec<f16>| -> Vec<f32> {
+        let mut acc = acc;
+        let mut budget = crate::CompositeBudget::for_pass(layers);
+        let _ = crate::apply_adjustment_layer(&mut acc, id, layers, store, (0, 0), 0, &mut budget);
+        aurora_render::un_premultiply_in_place(&mut acc);
+        acc.iter().map(|v| v.to_f32()).collect()
+    };
+    let base = run(backdrop.clone());
+    let mut sensitivity = vec![0.0_f32; without.len() / 4];
+    let n = CONDITIONING_STEPS;
+    for dr in -n..=n {
+        for dg in -n..=n {
+            for db in -n..=n {
+                let moved: Vec<f16> = backdrop
+                    .chunks_exact(4)
+                    .flat_map(|t| {
+                        [
+                            f16_step(t[0], dr),
+                            f16_step(t[1], dg),
+                            f16_step(t[2], db),
+                            t[3],
+                        ]
+                    })
+                    .collect();
+                let out = run(moved);
+                for (i, s) in sensitivity.iter_mut().enumerate() {
+                    for c in 0..3 {
+                        *s = s.max((out[i * 4 + c] - base[i * 4 + c]).abs());
+                    }
+                }
+            }
+        }
+    }
+    let limit = conditioning_limit(bound);
+    let ill = sensitivity.iter().map(|s| *s > limit).collect();
+    Conditioning {
+        ill,
+        sensitivity,
+        base,
+    }
+}
+
+/// [`gpu_matches_cpu`] with the texels `exclude` marks ill-conditioned
+/// held to `bound + 2 * sensitivity` instead of `bound` (and the count of
+/// them printed and bounded to 1 % of the tile).
+fn gpu_matches_cpu_excluding(
+    context: &aurora_gpu::GpuContext,
+    compositor: &mut aurora_render::TileCompositor,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    pass: Pass,
+    passes: u64,
+    bound: f32,
+    what: &str,
+    exclude: Option<&Conditioning>,
+) -> (Vec<f32>, f32) {
     assert!(
         crate::document_qualifies_for_gpu_compositing(layers),
         "{what}: setup, must take the GPU path"
@@ -335,16 +475,45 @@ fn gpu_matches_cpu(
     let cpu = cpu_tile(layers, store);
     assert_eq!(gpu.len(), cpu.len(), "{what}");
     let mut worst = 0.0_f32;
+    let mut worst_excluded = 0.0_f32;
     for (i, (g, c)) in gpu.iter().zip(&cpu).enumerate() {
         let d = (g - c).abs();
+        let texel = i / 4;
+        let (limit, excluded) = match exclude {
+            Some(e) if e.ill.get(texel).copied().unwrap_or(false) => (
+                bound + 2.0 * e.sensitivity.get(texel).copied().unwrap_or(0.0),
+                true,
+            ),
+            _ => (bound, false),
+        };
         assert!(
-            d <= bound,
-            "{what}: texel ({}, {}) channel {}: GPU {g} vs CPU {c} (bound {bound})",
-            (i / 4) % aurora_tile::TILE as usize,
-            (i / 4) / aurora_tile::TILE as usize,
+            d <= limit,
+            "{what}: texel ({}, {}) channel {}: GPU {g} vs CPU {c} (bound {limit}, excluded {excluded})",
+            texel % aurora_tile::TILE as usize,
+            texel / aurora_tile::TILE as usize,
             i % 4
         );
-        worst = worst.max(d);
+        if excluded {
+            worst_excluded = worst_excluded.max(d);
+        } else {
+            worst = worst.max(d);
+        }
+    }
+    if let Some(e) = exclude {
+        assert!(
+            e.base == cpu,
+            "{what}: the conditioning probe must reproduce the CPU tile exactly"
+        );
+        let count = e.ill.iter().filter(|b| **b).count();
+        println!(
+            "{what}: {count} of {} texels ill-conditioned (sensitivity > {:e}), their worst {worst_excluded:e}",
+            e.ill.len(),
+            conditioning_limit(bound)
+        );
+        assert!(
+            count * 100 < e.ill.len(),
+            "{what}: {count} ill-conditioned texels is not a small set"
+        );
     }
     println!("{what}: worst |GPU - CPU| = {worst:e} (bound {bound:e})");
     (cpu, worst)
@@ -526,7 +695,12 @@ fn run_cases(
         ok(layers.set_blend_mode(id, mode));
         let mut compositor = aurora_render::TileCompositor::new(context.device());
         let what = format!("{label} / {name}");
-        let (cpu, w) = gpu_matches_cpu(
+        // A translucent run (bound above the opaque one): measure which
+        // texels the CPU result is too sensitive to a one-step backdrop
+        // difference for any adapter-independent bound to hold.
+        let conditioning = (bound > tolerance())
+            .then(|| conditioning_of(&layers, &mut store, id, &without, bound));
+        let (cpu, w) = gpu_matches_cpu_excluding(
             &context,
             &mut compositor,
             &layers,
@@ -535,6 +709,7 @@ fn run_cases(
             1,
             bound,
             &what,
+            conditioning.as_ref(),
         );
         assert!(
             max_diff(&cpu, &without) > 0.002,
@@ -1165,4 +1340,44 @@ fn hue_saturation_packed_for_gpu_is_the_settings_in_shader_order() {
     let identity =
         aurora_filters::HueSaturationOp::new(&aurora_core::HueSaturationParams::identity());
     assert_eq!(identity.packed_for_gpu().map(|v| v[0]), Some(1.0));
+}
+
+/// The 0.211.1 finding, headless (no adapter needed): texel (198, 20) of
+/// `random_translucent` is a light, barely coloured pixel
+/// (`l` ~ 0.96, `2 - hi - lo` ~ 0.08), and under Hue/Saturation lightness
+/// -50 one `f16` step of its premultiplied backdrop moves the CPU's own
+/// result by up to ~0.03. The macOS CI adapter's 0.23547363 at channel 1
+/// (CPU 0.22680664) is exactly the CPU result for the blue channel one
+/// step lower, i.e. a one-step backdrop difference, not a shader fault.
+#[test]
+fn a_light_pixel_amplifies_a_one_step_backdrop_difference_under_lightness() {
+    use half::f16;
+    let op = aurora_filters::HueSaturationOp::new(&ok(aurora_core::HueSaturationParams::new(
+        0.0, 0.0, -50.0, false, 0.0, 25.0, 0.0,
+    )));
+    let pixel = random_translucent(198, 20);
+    let alpha = f16::from_f32(pixel[3]);
+    let premultiplied =
+        [0, 1, 2].map(|c| f16::from_f32(f16::from_f32(pixel[c]).to_f32() * alpha.to_f32()));
+    let green = |steps: [i32; 3]| -> f32 {
+        let straight = [0, 1, 2].map(|c| {
+            let v = f16_step(premultiplied[c], steps[c]);
+            f16::from_f32(v.to_f32() / alpha.to_f32()).to_f32()
+        });
+        let out = op.apply(straight)[1];
+        let stored = f16::from_f32(f16::from_f32(out).to_f32() * alpha.to_f32());
+        f16::from_f32(stored.to_f32() / alpha.to_f32()).to_f32()
+    };
+    assert_eq!(green([0, 0, 0]), 0.226_806_64, "the CPU reference");
+    assert_eq!(green([0, 0, -1]), 0.235_473_63, "macOS CI's GPU value");
+    let mut spread = 0.0_f32;
+    for dr in -1..=1 {
+        for dg in -1..=1 {
+            for db in -1..=1 {
+                spread = spread.max((green([dr, dg, db]) - 0.226_806_64).abs());
+            }
+        }
+    }
+    assert!(spread > 0.02, "one step moves the result by {spread}");
+    assert!(spread > 3.0 * translucent_tolerance());
 }

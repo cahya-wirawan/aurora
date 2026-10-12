@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.211.1] - 2026-10-12
+
+### Fixed
+
+- Measure per-texel conditioning in the translucent GPU adjustment tests
+
 ## [0.211.0] - 2026-10-12
 
 ### Changed
