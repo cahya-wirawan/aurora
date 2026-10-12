@@ -282,6 +282,10 @@ fn a_spill_write_that_fails_midway_changes_nothing() {
     stroke(&mut history, &mut store, T0, &noisy(5));
     let after = history.stats();
     assert!(after.spill_failures > before.spill_failures, "{after:?}");
+    assert_eq!(
+        after.tiles, after.undo_steps as u64,
+        "a failed spill loses no captured tile: {after:?}"
+    );
     assert_eq!(history.memory_bytes(), after.memory_bytes);
     // The two newest steps are intact (the older spilled ones lost their
     // files with the directory, which is an error on undo, not a panic).
@@ -570,4 +574,72 @@ fn a_history_without_a_spill_directory_never_spills() {
     let stats = history.stats();
     assert_eq!(stats.spilled_steps, 0);
     assert_eq!(stats.spill_failures, 0);
+}
+
+#[test]
+fn multi_tile_spilled_steps_restore_every_tile_to_its_own_content() {
+    let (_dir, mut store) = new_store();
+    let mut history = history_for(&store, 1 << 20);
+    let tiles = [
+        TileId { x: 0, y: 0 },
+        TileId { x: 5, y: 0 },
+        TileId { x: 0, y: 7 },
+        TileId { x: 9, y: 9 },
+    ];
+    let content = |round: u64, i: usize| -> Vec<f16> {
+        if i % 2 == 0 {
+            noisy(round * 10 + i as u64 + 1)
+        } else {
+            painted(round * 10 + i as u64 + 1)
+        }
+    };
+    for (i, &tile) in tiles.iter().enumerate() {
+        write(&mut store, tile, &content(0, i));
+    }
+    for round in 1..=4_u64 {
+        let mut snapshot = StrokeSnapshot::new(surface());
+        for (i, &tile) in tiles.iter().enumerate() {
+            let before = ok(store.get(surface(), tile)).texels().to_vec();
+            assert!(snapshot.record_content(tile, &before));
+            write(&mut store, tile, &content(round, i));
+        }
+        assert!(history.push(snapshot));
+    }
+    assert!(history.stats().spilled_steps >= 3, "{:?}", history.stats());
+    for round in (0..4_u64).rev() {
+        assert!(ok(history.undo(&mut store)));
+        for (i, &tile) in tiles.iter().enumerate() {
+            assert_eq!(
+                read(&mut store, tile),
+                bits(&content(round, i)),
+                "round {round} tile {i}"
+            );
+        }
+    }
+}
+
+#[test]
+fn undo_steps_spill_before_redo_steps() {
+    let (_dir, mut store) = new_store();
+    let mut history = history_for(&store, 64 << 20);
+    write(&mut store, T0, &noisy(1));
+    for i in 0..6 {
+        stroke(&mut history, &mut store, T0, &noisy(50 + i));
+    }
+    for _ in 0..3 {
+        assert!(ok(history.undo(&mut store)));
+    }
+    assert_eq!((history.undo.len(), history.redo.len()), (3, 3));
+    assert_eq!(history.stats().spilled_steps, 0, "nothing over budget yet");
+    // ~3 MiB held; a 2.5 MiB budget spills down to 1.875 MiB: three steps.
+    history.set_budget_bytes(5 << 19);
+    history.trim();
+    assert!(history.undo.iter().all(|s| s.spill.is_some()), "undo first");
+    assert!(history.redo.iter().all(|s| s.spill.is_none()), "redo kept");
+    // And everything still comes back exactly.
+    for i in (0..3).rev() {
+        assert!(ok(history.undo(&mut store)));
+        let expected = if i == 0 { noisy(1) } else { noisy(50 + i - 1) };
+        assert_eq!(read(&mut store, T0), bits(&expected));
+    }
 }
