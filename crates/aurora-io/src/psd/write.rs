@@ -187,6 +187,8 @@ pub enum PsdSaveRefusal {
     CurvesNotYetSupported { count: usize },
     /// Levels (adjustment) layers are not written yet (0.202.0).
     LevelsNotYetSupported { count: usize },
+    /// Hue/Saturation (adjustment) layers are not written yet (0.203.0).
+    HueSaturationNotYetSupported { count: usize },
     /// More layer records than a PSD's layer count can hold.
     TooManyLayers { count: usize },
     /// The merged image is not the canvas's size.
@@ -220,6 +222,11 @@ impl std::fmt::Display for PsdSaveRefusal {
                 f,
                 "the document has {count} Levels layer(s); saving Levels layers to PSD is not \
                  yet supported"
+            ),
+            Self::HueSaturationNotYetSupported { count } => write!(
+                f,
+                "the document has {count} Hue/Saturation layer(s); saving Hue/Saturation \
+                 layers to PSD is not yet supported"
             ),
             Self::TooManyLayers { count } => write!(
                 f,
@@ -643,6 +650,7 @@ struct Census {
     records: usize,
     curves: usize,
     levels: usize,
+    hue_saturation: usize,
     /// The deepest group nesting past [`MAX_GROUP_DEPTH`], if any.
     too_deep: Option<usize>,
 }
@@ -683,6 +691,11 @@ fn preflight_losses(
     if census.levels > 0 {
         return Err(PsdSaveRefusal::LevelsNotYetSupported {
             count: census.levels,
+        });
+    }
+    if census.hue_saturation > 0 {
+        return Err(PsdSaveRefusal::HueSaturationNotYetSupported {
+            count: census.hue_saturation,
         });
     }
     if census.records > PSD_MAX_RECORDS {
@@ -741,6 +754,9 @@ fn census_of(
             }
             Some(LayerKind::Adjustment(aurora_doc::Adjustment::Curves(_))) => census.curves += 1,
             Some(LayerKind::Adjustment(aurora_doc::Adjustment::Levels(_))) => census.levels += 1,
+            Some(LayerKind::Adjustment(aurora_doc::Adjustment::HueSaturation(_))) => {
+                census.hue_saturation += 1;
+            }
             Some(LayerKind::Pixel { .. }) | None => {}
         }
     }
@@ -1154,6 +1170,9 @@ fn plan_layer(
         return Err(refused(match layers.kind(id) {
             Some(LayerKind::Adjustment(aurora_doc::Adjustment::Levels(_))) => {
                 PsdSaveRefusal::LevelsNotYetSupported { count: 1 }
+            }
+            Some(LayerKind::Adjustment(aurora_doc::Adjustment::HueSaturation(_))) => {
+                PsdSaveRefusal::HueSaturationNotYetSupported { count: 1 }
             }
             _ => PsdSaveRefusal::CurvesNotYetSupported { count: 1 },
         }));

@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-12, version 0.202.1.** This file is updated every round (every
+**As of 2026-10-12, version 0.203.0.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -14,7 +14,7 @@ Aurora is an early but real editor: **Phase 1 (document, canvas, layers,
 rendering, shell) is in progress**, and the Phase 1 gate (M1.10) is open. You
 can open images and layered Photoshop files, paint and erase on real pixels
 with undo/redo, work with layers, groups, masks, clipping masks, 27 blend modes
-and two adjustment layers (Curves, Levels), see Photoshop-style layer effects
+and three adjustment layers (Curves, Levels, Hue/Saturation), see Photoshop-style layer effects
 drawn, keep several documents open in tabs, and save back out, including to
 `.psd`. It is roughly 200,000 lines of Rust across 20 crates; 17 of them hold
 real code and three (`aurora-ai`, `aurora-plugin`, `aurora-cli`) are still
@@ -35,8 +35,8 @@ Three things to keep in mind when reading anything below:
 - **No PSD written by Aurora has been opened in Photoshop.** Writes are
   checked against Aurora's own reader and psd-tools only.
 
-Test and CI state: 3,825 tests were counted at 0.201.0 (0 failed) and Levels
-(0.202.0) added more; the full CI gate runs on Linux, macOS and Windows.
+Test and CI state: 3,890 tests passed at 0.203.0 (0 failed, 78 ignored, run with
+`AURORA_REQUIRE_GPU=1` on an RTX 3090); the full CI gate runs on Linux, macOS and Windows.
 Several rounds (0.161.1, 0.165.1, 0.165.2, 0.185.1, 0.186.1, 0.195.1, 0.202.1)
 fixed timing-dependent or environment-dependent tests that failed on shared CI
 runners; 0.202.1 is the latest (a thumbnail test that failed once on the macOS
@@ -125,7 +125,7 @@ golden-image tests are `#[ignore]`d.
   groups, as Photoshop does. A name search and three kind toggles (pixel layers,
   adjustment layers, groups) filter the list.
 - New Layer, Delete Layer (never the last pixel layer), New Group, New Curves
-  Layer, New Levels Layer and Create/Release Clipping Mask are one undo step
+  Layer, New Levels Layer, New Hue/Saturation Layer and Create/Release Clipping Mask are one undo step
   each.
 - Not seen in the live window or on the Mac: the rebuilt rows (0.195.0), the
   toolbar (0.196.0), thumbnails (0.197.0), locks (0.198.0), the filter
@@ -152,7 +152,7 @@ golden-image tests are `#[ignore]`d.
   LinearLight, VividLight, HardMix, PinLight, SoftLight, Subtract, Divide,
   Dissolve) and an unmasked root-level Curves layer; everything else (groups,
   Exclusion, the six non-separable modes, masked Curves, layers with drawn
-  effects, clipped layers, Levels) falls back to the CPU path transparently
+  effects, clipped layers, Levels, Hue/Saturation) falls back to the CPU path transparently
   with the same result. GPU compositing is verified on Vulkan/NVIDIA only;
   Metal and DX12 are unverified for these mechanisms.
 - The CPU whole-view recomposite runs on a **background worker** (so hiding a
@@ -213,9 +213,22 @@ golden-image tests are `#[ignore]`d.
   (2, 2, 6) levels for R, G, B, mean (0.266, 0.247, 0.429); the maximum of 6 in
   blue is not investigated. **PSD save of Levels layers is refused** (like
   Curves). Not seen in the live window or on the Mac.
+- **Hue/Saturation** (0.203.0): New Hue/Saturation Layer, a Properties editor
+  (Hue, Saturation, Lightness sliders, a Colorize checkbox with its own three
+  sliders; whole numbers only), per-pixel HSL math on encoded RGB (a non-identity
+  setting clamps the backdrop to [0, 1], so float values above 1 are clipped), `hue2`
+  layers imported (Master and Colorize only). **Per-colour-range adjustments
+  (reds, yellows, ...) are not implemented**: a PSD layer that uses them is left
+  out with a report line. **CPU compositing only** (a visible Hue/Saturation
+  layer refuses the GPU path); **PSD save of Hue/Saturation layers is
+  refused**. Against Photoshop's merged image: Colorize layers match to a mean
+  of about 0.4-0.5 levels (max 3); a master-only layer is about 1-1.4 levels on
+  saturated pixels but tens of levels off on near-grey pixels at Saturation
+  +100 (possibly the reconstructed backdrop, not the model); positive
+  saturation between 0 and 100 uses `s/(1-k)`, a choice not told apart from
+  the alternative `s + (1-s)k`. Not seen in the live window or on the Mac.
 - Other adjustment kinds and Curves in Grayscale files are listed as "not
-  shown" when a PSD is opened. A Hue/Saturation adjustment is next (in
-  progress on a separate branch, not merged).
+  shown" when a PSD is opened.
 
 ### Layer effects (pixel layers; solid colour)
 
@@ -255,8 +268,8 @@ golden-image tests are `#[ignore]`d.
   written already inverted), locks, clipping bytes and preserved smart objects.
   It writes beside the target, verifies by reopening, then renames; a
   "Save With Changes?" list is shown before anything lossy, and a lossy save
-  is a copy (the document stays unsaved). **Refused for now**: Curves and
-  Levels layers, PSB, and canvases over 30,000 px.
+  is a copy (the document stays unsaved). **Refused for now**: Curves,
+  Levels and Hue/Saturation layers, PSB, and canvases over 30,000 px.
 - **Smart objects** (0.200.0): a smart object layer opens as ordinary pixels
   (Aurora neither renders nor edits the embedded file), but its embedded file
   and placement blocks are held byte for byte and written back on a `.psd`
@@ -390,7 +403,7 @@ small machines has not been measured on a real small machine.
 **Compositing and performance**
 - The 60 FPS gate is missed; `recomposite` is about 73 % of the GPU-path frame.
 - GPU fast path does not cover groups, `Exclusion`, the six non-separable
-  modes, masked Curves, drawn effects, clipped layers or Levels.
+  modes, masked Curves, drawn effects, clipped layers, Levels or Hue/Saturation.
 - Re-anchoring the composite grid to the document (so structural undo can
   invalidate narrowly and `composite_reference_origin` becomes constant) is the
   named follow-on to 0.193.0; the far pan edge is not bounded and a document
@@ -399,7 +412,7 @@ small machines has not been measured on a real small machine.
   0.75 s alone to 1.1-1.25 s beside the pool (contention, not investigated).
 
 **Adjustments, filters, tools**
-- Adjustments: Curves and Levels only (Hue/Saturation next). No filters,
+- Adjustments: Curves, Levels and Hue/Saturation (Master and Colorize only). No filters,
   selection tools beyond a raw data model, smart-object editing, RAW import,
   plugins, scripting or AI (`aurora-ai`, `aurora-plugin`, `aurora-cli` are
   skeletons).
@@ -411,7 +424,7 @@ small machines has not been measured on a real small machine.
   in History.
 
 **PSD**
-- Not written: Curves and Levels layers, PSB, text layers, editable vector
+- Not written: Curves, Levels and Hue/Saturation layers, PSB, text layers, editable vector
   paths, CMYK/Lab/32-bit. Not read: CMYK/Lab/Bitmap/Indexed/Duotone/32-bit.
 - Smart objects are not rendered or edited and survive a save only while
   untouched.
@@ -430,9 +443,10 @@ small machines has not been measured on a real small machine.
 
 ## Known gaps and next steps
 
-- **Next round**: the Hue/Saturation adjustment layer (queue approved by the
-  design owner: Levels, then Hue/Saturation). It is being built on its own
-  branch and is not part of 0.202.1.
+- **Adjustment queue approved by the design owner is done** (Levels 0.202.0,
+  Hue/Saturation 0.203.0). Open follow-ups: Hue/Saturation per-colour-range
+  adjustments, PSD save of Curves/Levels/Hue/Saturation layers, a GPU path for
+  Levels and Hue/Saturation, and a histogram behind the Levels sliders.
 - **Next in the performance line**: anchor the composite grid to the document.
 - **Phase 1 gate (M1.10)** remains open on hardware (accessibility and IME
   audits on all three platforms), on the missed 60 FPS budget, and on a

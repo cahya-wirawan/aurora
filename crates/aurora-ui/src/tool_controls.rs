@@ -36,6 +36,7 @@ use taffy::style_helpers::{TaffyZero as _, length};
 use taffy::{Display, FlexDirection, Rect as LayoutRect, Size, Style};
 
 use crate::curves_controls::{CurvesControls, insert_curves_controls};
+use crate::hue_saturation_controls::insert_hue_saturation_controls;
 use crate::levels_controls::insert_levels_controls;
 use crate::panel::{PanelHandle, panel_is_collapsed};
 use crate::tool::Tool;
@@ -299,6 +300,8 @@ fn build(
     let mut curves = insert_curves_controls(tree, root, scales)?;
     // The Levels editor (0.202.0) sits beside it; one handle reaches both.
     curves.levels = Some(insert_levels_controls(tree, root, scales)?);
+    // The Hue/Saturation editor (0.203.0) likewise.
+    curves.hue_saturation = Some(insert_hue_saturation_controls(tree, root, scales)?);
     let controls = ToolControls {
         root,
         options,
@@ -319,6 +322,9 @@ pub fn radius_slider_shown(tree: &WidgetTree<WidgetKind>, controls: &ToolControl
         .is_some_and(|style| style.display != Display::None)
 }
 
+// `ToolControls` grew past clippy's 256-byte limit with the Hue/Saturation
+// editor's ids (0.203.0); it is `Copy` and these helpers take it by value.
+#[allow(clippy::large_types_passed_by_value)]
 fn set_disabled(
     tree: &mut WidgetTree<WidgetKind>,
     controls: ToolControls,
@@ -454,6 +460,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::large_types_passed_by_value)]
     fn sync(
         tree: &mut WidgetTree<WidgetKind>,
         controls: ToolControls,

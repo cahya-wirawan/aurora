@@ -74,6 +74,13 @@ pub enum Adjustment {
     /// 1): every file written before 0.202.0 holds only ordinal 0, and an
     /// older build refuses a file using this variant (ADR 0009).
     Levels(aurora_core::LevelsParams),
+    /// Photoshop-model Hue/Saturation, master sliders and Colorize
+    /// (0.203.0, [`aurora_core::HueSaturationParams`]), applied by
+    /// `aurora_filters::HueSaturationOp`. **Appended after `Levels`**
+    /// (ordinal 2): every file written before 0.203.0 holds only ordinals
+    /// 0 and 1, and an older build refuses a file using this variant
+    /// (ADR 0009). The per-colour-range adjustments are not modelled.
+    HueSaturation(aurora_core::HueSaturationParams),
 }
 
 impl Adjustment {
@@ -83,6 +90,7 @@ impl Adjustment {
         match self {
             Self::Curves(_) => "Curves",
             Self::Levels(_) => "Levels",
+            Self::HueSaturation(_) => "Hue/Saturation",
         }
     }
 }
@@ -785,6 +793,77 @@ mod levels_wire_tests {
         );
         match postcard::from_bytes::<LayerKind>(&bytes) {
             Ok(decoded) => assert_eq!(decoded, levels),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        assert!(
+            postcard::from_bytes::<OldLayerKind>(&bytes).is_err(),
+            "an older build refuses the unknown Adjustment ordinal"
+        );
+    }
+}
+
+/// `Adjustment::HueSaturation` is appended after `Levels`, so every
+/// pre-0.203.0 encoding still decodes and an older reader refuses a
+/// Hue/Saturation layer rather than opening it without the adjustment
+/// (0.203.0, ADR 0009).
+#[cfg(test)]
+mod hue_saturation_wire_tests {
+    use super::{Adjustment, LayerKind};
+
+    /// `Adjustment` exactly as it was in 0.202.0 (two variants).
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum OldAdjustment {
+        Curves(aurora_core::CurvesParams),
+        Levels(aurora_core::LevelsParams),
+    }
+
+    /// `LayerKind` as a 0.202.0 build declares it.
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum OldLayerKind {
+        Pixel { bounds: aurora_core::Rect },
+        Group { children: Vec<super::LayerId> },
+        Adjustment(OldAdjustment),
+    }
+
+    fn encode<T: serde::Serialize>(value: &T) -> Vec<u8> {
+        match postcard::to_allocvec(value) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn curves_and_levels_bytes_are_unchanged_and_an_old_reader_refuses_hue_saturation() {
+        let pairs = [
+            (
+                LayerKind::Adjustment(Adjustment::Curves(aurora_core::CurvesParams::identity())),
+                OldLayerKind::Adjustment(OldAdjustment::Curves(
+                    aurora_core::CurvesParams::identity(),
+                )),
+            ),
+            (
+                LayerKind::Adjustment(Adjustment::Levels(aurora_core::LevelsParams::identity())),
+                OldLayerKind::Adjustment(OldAdjustment::Levels(
+                    aurora_core::LevelsParams::identity(),
+                )),
+            ),
+        ];
+        for (new, old) in &pairs {
+            let (new_bytes, old_bytes) = (encode(new), encode(old));
+            assert_eq!(new_bytes, old_bytes, "{new:?} encodes unchanged");
+            assert!(postcard::from_bytes::<OldLayerKind>(&new_bytes).is_ok());
+        }
+        let hue = LayerKind::Adjustment(Adjustment::HueSaturation(
+            aurora_core::HueSaturationParams::identity(),
+        ));
+        let bytes = encode(&hue);
+        assert_eq!(
+            bytes.get(..2),
+            Some([2_u8, 2].as_slice()),
+            "ordinals 2 then 2"
+        );
+        match postcard::from_bytes::<LayerKind>(&bytes) {
+            Ok(decoded) => assert_eq!(decoded, hue),
             Err(err) => unreachable!("{err:?}"),
         }
         assert!(
