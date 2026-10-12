@@ -488,6 +488,20 @@ fn write_tools_panel_png() {
     ));
     let zoom = ws.tools.button_for(crate::Tool::Zoom);
     ok(crate::set_tools_panel_hover(&mut ws.tree, &ws.tools, zoom));
+    // 0.208.0: a foreground and a background colour, the swap button
+    // hovered.
+    ok(crate::sync_colour_controls(
+        &mut ws.tree,
+        &ws.tools.colours,
+        [0.85, 0.25, 0.1],
+        [0.1, 0.4, 0.75],
+    ));
+    let swap = ws.tools.colours.swap;
+    ok(aurora_widgets::widgets::set_button_hovered(
+        &mut ws.tree,
+        swap,
+        true,
+    ));
     let root = ws.tools.root;
     for (scale, name) in [
         (2.0_f32, review_png("tools-panel.png")),
@@ -495,4 +509,21 @@ fn write_tools_panel_png() {
     ] {
         write_crop_png(&context, &mut ws, scale, &name, root);
     }
+    // ...and with the foreground's picker open, the whole window at 1x.
+    let colours = ws.tools.colours;
+    ok(crate::open_colour_popover(
+        &mut ws.tree,
+        &colours,
+        &scales,
+        crate::ColourTarget::Foreground,
+        [0.85, 0.25, 0.1],
+    ));
+    let window = ws.root;
+    write_crop_png(
+        &context,
+        &mut ws,
+        1.0,
+        &review_png("tools-panel-colour-picker.png"),
+        window,
+    );
 }
