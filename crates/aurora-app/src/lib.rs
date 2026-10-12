@@ -11028,7 +11028,13 @@ fn handle_key(
             return Some(ActivatedCommand::ResetColours);
         }
         if let Some(selection_command) = selection_view::SelectionCommand::from_app(command) {
-            return Some(ActivatedCommand::Selection(selection_command));
+            // A focused text field keeps the keyboard: these chords never
+            // edit the document's selection from inside one (`Primary+A`
+            // is the field's own select-all and never reaches here).
+            let in_text_field = focus.focused().is_some_and(|id| {
+                matches!(workspace.tree.payload(id), Some(WidgetKind::TextField(_)))
+            });
+            return (!in_text_field).then_some(ActivatedCommand::Selection(selection_command));
         }
         if command == AppCommand::CloseDocument {
             return Some(ActivatedCommand::Document(
@@ -29214,7 +29220,10 @@ impl App {
             active_pixel_layer(&self.doc.layers, self.doc.active_layer),
         );
         if matches!(self.drag, Some(Drag::Marquee { .. })) {
-            self.marquee_before = self.doc.selection.active();
+            // A press with the Marquee deselects at once (Photoshop: a
+            // click deselects, including a click on a selection); the drag
+            // then draws a new one, and Escape restores this one.
+            self.marquee_before = selection_view::press_marquee(&mut self.doc.selection);
         }
         // A locked layer refuses the press outright (0.198.0): no drag, so
         // no stroke snapshot and no history row, and a calm notice.
@@ -31114,14 +31123,16 @@ impl App {
     /// Escape during a live Marquee drag: the drag ends and the selection
     /// returns to what it was when the drag began. Returns whether it did.
     fn escape_cancels_marquee(&mut self, key: Key) -> bool {
-        if key != Key::Named(NamedKey::Escape) || !matches!(self.drag, Some(Drag::Marquee { .. })) {
+        if !selection_view::escape_cancels_marquee_applies(
+            key == Key::Named(NamedKey::Escape),
+            matches!(self.drag, Some(Drag::Marquee { .. })),
+            self.dialog.is_some(),
+            self.command_palette.is_some(),
+        ) {
             return false;
         }
         self.drag = None;
-        match self.marquee_before.take() {
-            Some(before) => self.doc.selection.select(before),
-            None => self.doc.selection.deselect(),
-        }
+        selection_view::cancel_marquee(&mut self.doc.selection, self.marquee_before.take());
         self.needs_redraw = true;
         true
     }
@@ -31129,12 +31140,27 @@ impl App {
     /// [`selection_view::ants_step`] on this app's own state at `now`.
     fn ants_step(&self, now: std::time::Instant) -> selection_view::AntsStep {
         selection_view::ants_step(
-            self.doc.selection.active().is_some(),
+            self.selection_outline_visible(),
             self.caret.window_focused,
             self.caret.reduced_motion,
             now,
             self.ants.epoch,
             self.ants.drawn_phase,
+        )
+    }
+
+    /// Whether the active selection has any outline on the canvas now:
+    /// only then do the ants march and wake the loop.
+    fn selection_outline_visible(&self) -> bool {
+        let Some(size) = canvas_area_logical_size(&self.workspace) else {
+            return false;
+        };
+        selection_view::outline_visible(
+            self.doc.selection.active(),
+            self.doc.canvas_size,
+            &self.doc.canvas_view,
+            size,
+            guarded_scale_factor(self.scale_factor),
         )
     }
 
@@ -68725,6 +68751,133 @@ mod tests {
         assert_eq!(dabs, Vec::new(), "Pan must never produce dabs to paint");
     }
 
+    /// A whole Marquee gesture as `App` runs it: the press (which
+    /// deselects), then every move; returns the selection after the last.
+    fn marquee_gesture(
+        selection: &mut SelectionSet,
+        start: (f32, f32),
+        moves: &[(f32, f32)],
+    ) -> Option<aurora_doc::Selection> {
+        let mut view = CanvasView::new();
+        let _ = crate::selection_view::press_marquee(selection);
+        let mut drag = Drag::Marquee { start_doc: start };
+        for &to in moves {
+            let _ = continue_drag(
+                &mut drag,
+                to,
+                &mut view,
+                selection,
+                &crate::ToolSettings::default(),
+                bounds_at((0.0, 0.0), None),
+            );
+        }
+        selection.active()
+    }
+
+    /// 0.212.0 review: a zero-area Marquee result must deselect, never
+    /// store an empty rectangle that would make every paint tool paint
+    /// nothing with no outline to show why.
+    #[test]
+    fn a_zero_area_marquee_deselects_and_never_stores_an_empty_rectangle() {
+        let existing = aurora_doc::Selection::new(aurora_core::Rect {
+            x: 5,
+            y: 5,
+            width: 50,
+            height: 50,
+        });
+        for (name, start, moves) in [
+            ("a click with no move", (20.0, 20.0), vec![]),
+            (
+                "a click with jitter",
+                (20.0, 20.0),
+                vec![(20.3, 19.8), (20.4, 20.2)],
+            ),
+            ("a horizontal-only drag", (20.0, 20.0), vec![(60.0, 20.0)]),
+            ("a vertical-only drag", (20.0, 20.0), vec![(20.0, 70.0)]),
+            ("a sub-half-pixel drag", (20.0, 20.0), vec![(20.4, 20.4)]),
+        ] {
+            // Over nothing, and as a click on an existing selection.
+            for before in [None, Some(existing)] {
+                let mut selection = SelectionSet::new();
+                if let Some(before) = before {
+                    selection.select(before);
+                }
+                assert_eq!(
+                    marquee_gesture(&mut selection, start, &moves),
+                    None,
+                    "{name} (before: {before:?})"
+                );
+            }
+        }
+        // A real drag still selects, a later degenerate move deselects.
+        let mut selection = SelectionSet::new();
+        assert!(marquee_gesture(&mut selection, (20.0, 20.0), &[(60.0, 50.0)]).is_some());
+        assert_eq!(
+            marquee_gesture(&mut selection, (20.0, 20.0), &[(60.0, 50.0), (20.0, 50.0)]),
+            None
+        );
+        // The set itself refuses an empty plain rectangle but keeps an
+        // inverted one (everything).
+        let empty = aurora_core::Rect {
+            x: 1,
+            y: 1,
+            width: 0,
+            height: 4,
+        };
+        selection.select(aurora_doc::Selection::new(empty));
+        assert_eq!(selection.active(), None);
+        selection.select(aurora_doc::Selection {
+            bounds: empty,
+            inverted: true,
+        });
+        assert!(selection.active().is_some());
+    }
+
+    /// Escape on a drag that began over an existing selection puts it back
+    /// (and one that began over nothing leaves nothing).
+    #[test]
+    fn escape_during_a_marquee_drag_restores_the_selection_it_began_over() {
+        let existing = aurora_doc::Selection::new(aurora_core::Rect {
+            x: 5,
+            y: 5,
+            width: 50,
+            height: 50,
+        });
+        let mut selection = SelectionSet::new();
+        selection.select(existing);
+        let before = crate::selection_view::press_marquee(&mut selection);
+        assert_eq!(before, Some(existing));
+        assert_eq!(selection.active(), None, "the press deselected");
+        let mut view = CanvasView::new();
+        let mut drag = Drag::Marquee {
+            start_doc: (70.0, 70.0),
+        };
+        let _ = continue_drag(
+            &mut drag,
+            (90.0, 95.0),
+            &mut view,
+            &mut selection,
+            &crate::ToolSettings::default(),
+            bounds_at((0.0, 0.0), None),
+        );
+        assert_ne!(selection.active(), Some(existing), "the rubber band");
+        crate::selection_view::cancel_marquee(&mut selection, before);
+        assert_eq!(selection.active(), Some(existing));
+        // From nothing: Escape leaves nothing.
+        let mut empty = SelectionSet::new();
+        let before = crate::selection_view::press_marquee(&mut empty);
+        let _ = continue_drag(
+            &mut drag,
+            (90.0, 95.0),
+            &mut view,
+            &mut empty,
+            &crate::ToolSettings::default(),
+            bounds_at((0.0, 0.0), None),
+        );
+        crate::selection_view::cancel_marquee(&mut empty, before);
+        assert_eq!(empty.active(), None);
+    }
+
     #[test]
     fn continue_drag_marquee_updates_the_active_selection_live() {
         let mut view = CanvasView::new();
@@ -72602,6 +72755,65 @@ mod tests {
             rig.key_event(Key::Character('p'), None, with_shift(primary()));
         assert_eq!(routed, Some(KeyOutcome::Ignored));
         assert!(palette_open, "the registry's primary Shift+P still runs");
+    }
+
+    /// 0.212.0 review: with a text field focused, `Primary+A` is the
+    /// field's own select-all (consumed at the routing level, never a
+    /// document Select All), and `Primary+D` / `Primary+Shift+I` do not
+    /// reach the document's selection either.
+    #[test]
+    fn a_focused_text_field_keeps_select_all_deselect_and_inverse() {
+        let mut rig = GalleryRig::open();
+        let field = rig.focus_text_field();
+        for c in "abc".chars() {
+            rig.typed(Key::Character(c), Some(&c.to_string()), Modifiers::none());
+        }
+        let (routed, picked, _) = rig.key_event(Key::Character('a'), None, primary());
+        assert_eq!(
+            routed,
+            Some(KeyOutcome::Handled(PointerOutcome::Changed(field))),
+            "the field consumes Primary+A"
+        );
+        assert_eq!(picked, None, "so no document Select All");
+        let selected = match rig.workspace.tree.payload(field) {
+            Some(aurora_widgets::widgets::WidgetKind::TextField(state)) => {
+                state.selection_anchor.is_some()
+            }
+            other => unreachable!("{other:?}"),
+        };
+        assert!(selected, "the field's text is selected");
+        for (c, modifiers) in [('d', primary()), ('i', with_shift(primary()))] {
+            let (_, picked, _) = rig.key_event(Key::Character(c), None, modifiers);
+            assert_eq!(picked, None, "{c}: a text field keeps the keyboard");
+        }
+    }
+
+    #[test]
+    fn the_selection_shortcuts_run_when_no_text_field_is_focused() {
+        let mut rig = GalleryRig::open();
+        for (c, modifiers, expected) in [
+            (
+                'a',
+                primary(),
+                crate::selection_view::SelectionCommand::SelectAll,
+            ),
+            (
+                'd',
+                primary(),
+                crate::selection_view::SelectionCommand::Deselect,
+            ),
+            (
+                'i',
+                with_shift(primary()),
+                crate::selection_view::SelectionCommand::Inverse,
+            ),
+        ] {
+            let (_, picked, _) = rig.key_event(Key::Character(c), None, modifiers);
+            assert!(
+                matches!(picked, Some(ActivatedCommand::Selection(got)) if got == expected),
+                "{c}: {picked:?}"
+            );
+        }
     }
 
     #[test]

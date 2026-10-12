@@ -80,6 +80,50 @@ pub(crate) fn ants_step(
     }
 }
 
+/// Whether the selection has any outline inside the canvas area right now
+/// (a non-empty rectangle or an inverted selection, on screen): an empty
+/// or fully off-canvas selection draws nothing and must not wake the loop.
+pub(crate) fn outline_visible(
+    selection: Option<Selection>,
+    document_size: (u32, u32),
+    view: &aurora_ui::CanvasView,
+    canvas_size: (f32, f32),
+    scale_factor: f32,
+) -> bool {
+    !aurora_ui::selection_outline_runs(selection, document_size, view, canvas_size, scale_factor, 0)
+        .is_empty()
+}
+
+/// Whether Escape cancels a live Marquee drag: only when it is Escape, a
+/// Marquee drag is live and no dialog or palette is open (they own Escape).
+// Four independent facts, each its own flag at the call site.
+#[allow(clippy::fn_params_excessive_bools)]
+pub(crate) fn escape_cancels_marquee_applies(
+    is_escape: bool,
+    marquee_live: bool,
+    dialog_open: bool,
+    palette_open: bool,
+) -> bool {
+    is_escape && marquee_live && !dialog_open && !palette_open
+}
+
+/// A Marquee press: deselects at once (a click deselects, including a
+/// click on an existing selection) and returns what was selected, for
+/// Escape to restore.
+pub(crate) fn press_marquee(selection: &mut aurora_doc::SelectionSet) -> Option<Selection> {
+    let before = selection.active();
+    selection.deselect();
+    before
+}
+
+/// Escape on a live Marquee drag: puts `before` back.
+pub(crate) fn cancel_marquee(selection: &mut aurora_doc::SelectionSet, before: Option<Selection>) {
+    match before {
+        Some(before) => selection.select(before),
+        None => selection.deselect(),
+    }
+}
+
 /// Select All: the whole document, `(0, 0, w, h)`; `None` for an empty
 /// document (nothing to select).
 pub(crate) fn select_all(canvas_size: (u32, u32)) -> Option<Selection> {
@@ -231,6 +275,43 @@ mod tests {
             crate::next_control_flow(later, marching.next_tick, None),
             winit::event_loop::ControlFlow::WaitUntil(_)
         ));
+    }
+
+    #[test]
+    fn only_a_selection_with_a_visible_outline_marches_or_wakes_the_loop() {
+        let view = aurora_ui::CanvasView::new();
+        let size = (200.0, 100.0);
+        let rect = |x, y, width, height| aurora_core::Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let visible = |s| super::outline_visible(s, (300, 300), &view, size, 1.0);
+        assert!(!visible(None));
+        assert!(visible(Some(Selection::new(rect(10, 10, 20, 20)))));
+        // Fully off the canvas area: nothing drawn, so no wake-up.
+        assert!(!visible(Some(Selection::new(rect(1000, 1000, 20, 20)))));
+        // An empty plain rectangle (only constructible directly) draws nothing.
+        assert!(!visible(Some(Selection::new(rect(10, 10, 0, 20)))));
+        // Inverted draws the document border.
+        assert!(visible(Some(Selection {
+            bounds: rect(10, 10, 0, 20),
+            inverted: true
+        })));
+        // The ants gate on it: no visible outline -> `ants_step(false, ..)`.
+        let now = Instant::now();
+        assert_eq!(ants_step(false, true, false, now, now, 0).next_tick, None);
+    }
+
+    #[test]
+    fn escape_cancels_a_marquee_only_when_nothing_modal_owns_it() {
+        use super::escape_cancels_marquee_applies as applies;
+        assert!(applies(true, true, false, false));
+        assert!(!applies(false, true, false, false), "not Escape");
+        assert!(!applies(true, false, false, false), "no live Marquee drag");
+        assert!(!applies(true, true, true, false), "a dialog owns Escape");
+        assert!(!applies(true, true, false, true), "the palette owns Escape");
     }
 
     #[test]

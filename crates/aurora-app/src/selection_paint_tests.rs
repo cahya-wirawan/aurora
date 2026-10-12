@@ -400,6 +400,25 @@ fn a_brush_stroke_paints_only_inside_the_marquee_selection() {
     assert_eq!(rig.snapshot(600, 400), after);
 }
 
+/// 0.212.0 review: a Marquee click (press, then a jittering or
+/// one-dimensional move) over an existing selection deselects, and the
+/// brush then paints the whole layer again.
+#[test]
+fn a_marquee_click_on_a_selection_deselects_and_painting_works_again() {
+    for to in [(200.4, 170.3), (260.0, 170.0), (200.0, 230.0)] {
+        let mut rig = Rig::new(rect(0, 0, 600, 400));
+        rig.marquee((100.0, 80.0), (300.0, 260.0));
+        assert!(rig.selection.active().is_some());
+        let _ = crate::selection_view::press_marquee(&mut rig.selection);
+        rig.marquee((200.0, 170.0), to);
+        assert_eq!(rig.selection.active(), None, "{to:?}");
+        rig.settings.set_radius(Tool::Brush, 20.0);
+        // A stroke well outside the old selection paints now.
+        assert!(rig.stroke(Tool::Brush, &[(400.0, 340.0), (520.0, 340.0)], false));
+        assert!(rig.at(450, 340)[3] > 0.0, "{to:?}: painted");
+    }
+}
+
 #[test]
 fn a_layer_with_an_origin_is_painted_in_document_space() {
     // The layer sits at document (50, 30); the selection is document

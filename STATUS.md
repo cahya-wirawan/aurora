@@ -107,8 +107,10 @@ golden-image tests are `#[ignore]`d.
   selections also outline the document; steady under reduced motion, paused in a
   background window), Select All / Deselect / Inverse exist (`Ctrl/Cmd+A`, `+D`,
   `+Shift+I`, palette, macOS Edit menu), Escape cancels a Marquee drag and the status
-  bar reads the selection out; **selection changes are not undoable** and mark nothing
-  dirty; nothing of this has been seen live or on the Mac. Selection tools beyond the
+  bar reads the selection out; a Marquee click deselects; **Select All, Deselect,
+  Inverse and the Marquee are not undoable**, mark nothing dirty, are not saved
+  (`.aur`/PSD), are lost when the document closes, and the outline is not clipped to
+  the document; nothing of this has been seen live or on the Mac. Selection tools beyond the
   rectangle do not exist yet.
 - **Text fields and dialogs**: caret, selection, IME composition, standard
   editing chords through the real OS clipboard (`Cmd` on macOS, `Ctrl`
