@@ -60,4 +60,4 @@ pub use fill::{
     MAX_FILL_TILES, flood_fill, gradient_fill,
 };
 pub use stamp::{DabOutcome, erase_dab, stamp_dab, stamp_dab_preserving_alpha, touched_tiles};
-pub use undo::{PixelHistory, StrokeSnapshot};
+pub use undo::{HistoryStats, PixelHistory, SPILL_BYTES_PER_CALL, StrokeSnapshot};

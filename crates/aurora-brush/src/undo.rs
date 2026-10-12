@@ -40,9 +40,14 @@
 //! [`StrokeSnapshot::captured`] for the direct assertion.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use aurora_core::Rect;
-use aurora_tile::{SAMPLES, SurfaceId, TILE, TileError, TileId, TileStore};
+use aurora_tile::codec::{self, EncodeScratch};
+use aurora_tile::{
+    SAMPLES, SpillArea, SpillFile, StagingRoot, SurfaceId, TILE, TILE_BYTES, TileError, TileId,
+    TileStore,
+};
 use half::f16;
 
 /// The whole-tile dirty rectangle every [`StrokeSnapshot::apply`] write
@@ -68,7 +73,51 @@ const fn full_tile_rect() -> Rect {
 #[derive(Debug, Clone)]
 pub struct StrokeSnapshot {
     surface: SurfaceId,
-    tiles: HashMap<TileId, Vec<f16>>,
+    tiles: HashMap<TileId, TileData>,
+    /// The file the [`TileData::Spilled`] tiles live in, once this
+    /// snapshot has been spilled (0.210.0). Shared (`Arc`) so a clone
+    /// keeps the file alive; the file deletes itself when the last
+    /// holder drops, which is how a truncated redo stack or a closed
+    /// document frees its spilled steps.
+    spill: Option<Arc<SpillFile>>,
+    /// What this snapshot costs in memory ([`Self::memory_bytes`]),
+    /// refreshed whenever a tile's representation changes.
+    memory_bytes: u64,
+}
+
+/// One captured tile's content, in one of three representations
+/// (0.210.0). A stroke records [`Self::Raw`] copies while it paints; the
+/// history packs them when the stroke is pushed and may spill the packed
+/// bytes to disk later. The three are the same texels: packing is the
+/// lossless tile codec ([`aurora_tile::codec`], bit-exact for every
+/// `f16` bit pattern), spilling is a byte copy.
+#[derive(Debug, Clone)]
+enum TileData {
+    /// One whole tile of samples, as captured.
+    Raw(Vec<f16>),
+    /// [`codec::encode`]'s bytes for the tile.
+    Packed(Vec<u8>),
+    /// [`codec::encode`]'s bytes, in the snapshot's spill file.
+    Spilled { offset: u64, len: u32 },
+}
+
+/// What the bookkeeping charges for each tile entry beyond its payload
+/// (hash-map slot, enum, vector header): an estimate, here so thousands
+/// of tiny steps are not counted as free.
+const ENTRY_OVERHEAD_BYTES: u64 = 64;
+/// What it charges for each snapshot beyond its entries.
+const SNAPSHOT_OVERHEAD_BYTES: u64 = 128;
+
+impl TileData {
+    /// Bytes held in memory for this tile, payload plus entry overhead.
+    fn memory_bytes(&self) -> u64 {
+        let payload = match self {
+            Self::Raw(texels) => (texels.len() * std::mem::size_of::<f16>()) as u64,
+            Self::Packed(bytes) => bytes.len() as u64,
+            Self::Spilled { .. } => 0,
+        };
+        payload.saturating_add(ENTRY_OVERHEAD_BYTES)
+    }
 }
 
 impl StrokeSnapshot {
@@ -78,6 +127,8 @@ impl StrokeSnapshot {
         Self {
             surface,
             tiles: HashMap::new(),
+            spill: None,
+            memory_bytes: SNAPSHOT_OVERHEAD_BYTES,
         }
     }
 
@@ -122,8 +173,16 @@ impl StrokeSnapshot {
             return Ok(());
         }
         let content = store.get(self.surface, tile)?.texels().to_vec();
-        self.tiles.insert(tile, content);
+        self.insert_raw(tile, content);
         Ok(())
+    }
+
+    fn insert_raw(&mut self, tile: TileId, content: Vec<f16>) {
+        let data = TileData::Raw(content);
+        self.memory_bytes = self.memory_bytes.saturating_add(data.memory_bytes());
+        if let Some(old) = self.tiles.insert(tile, data) {
+            self.memory_bytes = self.memory_bytes.saturating_sub(old.memory_bytes());
+        }
     }
 
     /// Captures `texels` as `tile`'s own pre-stroke content, if that
@@ -182,7 +241,9 @@ impl StrokeSnapshot {
             );
             return false;
         }
-        self.tiles.entry(tile).or_insert_with(|| texels.to_vec());
+        if !self.tiles.contains_key(&tile) {
+            self.insert_raw(tile, texels.to_vec());
+        }
         true
     }
 
@@ -248,23 +309,32 @@ impl StrokeSnapshot {
     /// fails (the same scratch-disk-I/O class of failure every other
     /// `TileStore`-touching call in this crate can raise).
     pub fn apply(&self, store: &mut TileStore) -> Result<Self, TileError> {
+        // Phase zero: a spilled snapshot's bytes come back in one read
+        // (compressed, so far smaller than the tiles they decode to).
+        // Nothing has been touched yet, so a failed read is a clean
+        // error and the entry stays where it is.
+        let spilled = self.read_spill_file()?;
+
         // Phase one: read every tile, write nothing. `?` here is safe to
         // return on precisely because nothing has been modified yet.
         let mut inverse = Self::new(self.surface);
         for &tile in self.tiles.keys() {
             let content = store.get(self.surface, tile)?.texels().to_vec();
-            inverse.tiles.insert(tile, content);
+            inverse.insert_raw(tile, content);
         }
 
         // Phase two: write. Every tile was resident a moment ago, so the
         // only way this fails is an eviction between the phases whose
-        // page-in then fails -- narrow, but not impossible, so it rolls
-        // back rather than leaving a half-applied restore behind.
+        // page-in then fails -- narrow, but not impossible -- or, since
+        // 0.210.0, a packed tile that does not decode. Either rolls back
+        // rather than leaving a half-applied restore behind.
         let mut written: Vec<TileId> = Vec::with_capacity(self.tiles.len());
-        for (&tile, content) in &self.tiles {
-            if let Err(err) = Self::restore_tile(store, self.surface, tile, content) {
+        for (&tile, data) in &self.tiles {
+            let restored = Self::texels_of(data, spilled.as_deref(), self.surface, tile)
+                .and_then(|texels| Self::restore_tile(store, self.surface, tile, &texels));
+            if let Err(err) = restored {
                 for done in &written {
-                    let Some(previous) = inverse.tiles.get(done) else {
+                    let Some(TileData::Raw(previous)) = inverse.tiles.get(done) else {
                         continue;
                     };
                     if let Err(rollback) = Self::restore_tile(store, self.surface, *done, previous)
@@ -283,6 +353,152 @@ impl StrokeSnapshot {
             written.push(tile);
         }
         Ok(inverse)
+    }
+
+    /// The whole spill file, when this snapshot has spilled tiles.
+    fn read_spill_file(&self) -> Result<Option<Vec<u8>>, TileError> {
+        let has_spilled = self
+            .tiles
+            .values()
+            .any(|data| matches!(data, TileData::Spilled { .. }));
+        if !has_spilled {
+            return Ok(None);
+        }
+        let Some(file) = &self.spill else {
+            return Err(TileError::CorruptFile(
+                "a spilled history tile has no spill file".to_owned(),
+            ));
+        };
+        let len = usize::try_from(file.len())
+            .map_err(|_| TileError::CorruptFile("spill file too large".to_owned()))?;
+        file.read_range(0, len).map(Some)
+    }
+
+    /// One tile's samples, whatever its representation.
+    fn texels_of<'a>(
+        data: &'a TileData,
+        spilled: Option<&[u8]>,
+        surface: SurfaceId,
+        tile: TileId,
+    ) -> Result<std::borrow::Cow<'a, [f16]>, TileError> {
+        match data {
+            TileData::Raw(texels) => Ok(std::borrow::Cow::Borrowed(texels.as_slice())),
+            TileData::Packed(bytes) => codec::decode(bytes).map(std::borrow::Cow::Owned),
+            TileData::Spilled { offset, len } => {
+                let bytes = usize::try_from(*offset)
+                    .ok()
+                    .and_then(|start| {
+                        let end = start.checked_add(usize::try_from(*len).ok()?)?;
+                        spilled?.get(start..end)
+                    })
+                    .ok_or_else(|| {
+                        TileError::CorruptFile(format!(
+                            "spilled history tile {tile:?} on {surface:?} lies outside its file"
+                        ))
+                    })?;
+                codec::decode(bytes).map(std::borrow::Cow::Owned)
+            }
+        }
+    }
+
+    /// Bytes this snapshot holds in memory: every tile's payload that is
+    /// not on disk, plus a fixed charge per tile and per snapshot for the
+    /// bookkeeping around it. A spilled snapshot costs only that
+    /// bookkeeping.
+    #[must_use]
+    pub const fn memory_bytes(&self) -> u64 {
+        self.memory_bytes
+    }
+
+    /// Bytes this snapshot occupies in its spill file (0 if not spilled).
+    #[must_use]
+    pub fn spilled_bytes(&self) -> u64 {
+        self.spill.as_ref().map_or(0, |file| file.len())
+    }
+
+    /// What the captured tiles would cost uncompressed and resident
+    /// ([`TILE_BYTES`] each) -- the figure the history used to hold.
+    #[must_use]
+    pub fn uncompressed_bytes(&self) -> u64 {
+        (self.tiles.len() as u64).saturating_mul(TILE_BYTES)
+    }
+
+    /// `true` when the snapshot has packed tiles in memory a spill could
+    /// move to disk.
+    fn has_spillable(&self) -> bool {
+        self.tiles
+            .values()
+            .any(|data| matches!(data, TileData::Packed(_)))
+    }
+
+    fn refresh_memory_bytes(&mut self) {
+        self.memory_bytes = self
+            .tiles
+            .values()
+            .fold(SNAPSHOT_OVERHEAD_BYTES, |sum, data| {
+                sum.saturating_add(data.memory_bytes())
+            });
+    }
+
+    /// Compresses every raw tile with the lossless tile codec (0.210.0).
+    /// Done once, when the stroke is pushed -- never per dab. Tiles
+    /// encode on a few scoped threads when there are many (a fill can
+    /// capture hundreds); a tile whose worker did not finish stays raw,
+    /// which is larger but still exact.
+    fn pack(&mut self) {
+        let raws: Vec<(TileId, &[f16])> = self
+            .tiles
+            .iter()
+            .filter_map(|(&tile, data)| match data {
+                TileData::Raw(texels) if texels.len() == SAMPLES => Some((tile, texels.as_slice())),
+                _ => None,
+            })
+            .collect();
+        if raws.is_empty() {
+            return;
+        }
+        let packed = encode_all(&raws);
+        drop(raws);
+        for (tile, bytes) in packed {
+            self.tiles.insert(tile, TileData::Packed(bytes));
+        }
+        self.refresh_memory_bytes();
+    }
+
+    /// Moves every packed tile's bytes into one file in `area`; on
+    /// success the memory is released and the bytes written returned. On
+    /// failure nothing has changed.
+    fn spill_to(&mut self, area: &SpillArea) -> Result<u64, TileError> {
+        let mut order: Vec<(TileId, &Vec<u8>)> = self
+            .tiles
+            .iter()
+            .filter_map(|(&tile, data)| match data {
+                TileData::Packed(bytes) => Some((tile, bytes)),
+                _ => None,
+            })
+            .collect();
+        if order.is_empty() {
+            return Ok(0);
+        }
+        order.sort_by_key(|(tile, _)| (tile.y, tile.x));
+        let parts: Vec<&[u8]> = order.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+        let file = area.write(&parts)?;
+        let mut placed: Vec<(TileId, u64, u32)> = Vec::with_capacity(order.len());
+        let mut offset: u64 = 0;
+        for (tile, bytes) in &order {
+            // A tile's encoding is at most `MAX_ENCODED_LEN` bytes.
+            let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+            placed.push((*tile, offset, len));
+            offset = offset.saturating_add(bytes.len() as u64);
+        }
+        drop(order);
+        let written = file.len();
+        for (tile, offset, len) in placed {
+            self.tiles.insert(tile, TileData::Spilled { offset, len });
+        }
+        self.spill = Some(Arc::new(file));
+        self.refresh_memory_bytes();
+        Ok(written)
     }
 
     /// Overwrites one tile with `content` and marks it fully dirty — the
@@ -325,19 +541,262 @@ impl StrokeSnapshot {
     }
 }
 
+/// Tiles per worker below which encoding stays on the calling thread.
+const SERIAL_PACK_TILES: usize = 8;
+/// The most worker threads one pack uses.
+const MAX_PACK_THREADS: usize = 8;
+
+/// Encodes `raws` with [`codec::encode_with`]; the result holds only the
+/// tiles that were encoded (all of them unless a worker thread died).
+fn encode_all(raws: &[(TileId, &[f16])]) -> Vec<(TileId, Vec<u8>)> {
+    let encode_chunk = |chunk: &[(TileId, &[f16])]| -> Vec<(TileId, Vec<u8>)> {
+        let mut scratch = EncodeScratch::default();
+        chunk
+            .iter()
+            .map(|(tile, texels)| (*tile, codec::encode_with(texels, &mut scratch)))
+            .collect()
+    };
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let threads = cores
+        .min(MAX_PACK_THREADS)
+        .min(raws.len().div_ceil(SERIAL_PACK_TILES));
+    if threads <= 1 {
+        return encode_chunk(raws);
+    }
+    let per_thread = raws.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = raws
+            .chunks(per_thread)
+            .map(|chunk| scope.spawn(move || encode_chunk(chunk)))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    })
+}
+
 /// Unlimited undo/redo over completed brush/eraser strokes — this
 /// module's own doc comment explains why it's a separate stack from
 /// `aurora_doc::History`'s structural one, not a unified journal.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PixelHistory {
     undo: Vec<StrokeSnapshot>,
     redo: Vec<StrokeSnapshot>,
+    /// Where spill files go (0.210.0), `None` for a history that never
+    /// spills (every snapshot stays in memory, compressed).
+    spill_root: Option<StagingRoot>,
+    /// The memory budget [`Self::trim`] spills down to.
+    budget_bytes: u64,
+    /// The sum of every snapshot's [`StrokeSnapshot::memory_bytes`],
+    /// kept incrementally ([`Self::stats`] recomputes it honestly).
+    memory_bytes: u64,
+    /// Every undo entry below this index is already spilled (or has
+    /// nothing to spill), so the oldest one still resident is at or
+    /// above it. Clamped whenever the stack shrinks.
+    undo_cursor: usize,
+    /// The same for the redo stack (its oldest entry is index 0).
+    redo_cursor: usize,
+    /// Pushes to skip before a failed spill is tried again.
+    cooldown: u32,
+    spill_failures: u64,
+    /// Declared last so it drops after the snapshots, whose files it
+    /// then finds already gone.
+    area: Option<SpillArea>,
+}
+
+impl Default for PixelHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What [`PixelHistory::trim`] spills down to, as a share of the budget:
+/// 3/4, so one push over the budget does not cost one file write per push
+/// afterwards.
+const TRIM_TARGET_NUM: u64 = 3;
+const TRIM_TARGET_DEN: u64 = 4;
+/// The most bytes one [`PixelHistory::trim`] call writes: the budget is
+/// soft by this much per call, so a single push never stalls the UI
+/// thread on a gigabyte write; later pushes and [`PixelHistory::trim`]
+/// calls finish the job.
+pub const SPILL_BYTES_PER_CALL: u64 = 64 << 20;
+/// Pushes to wait after a failed spill write before trying again.
+const SPILL_RETRY_PUSHES: u32 = 32;
+
+/// What the history holds, counted honestly (0.210.0) -- see
+/// [`PixelHistory::stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistoryStats {
+    /// Steps on the undo stack.
+    pub undo_steps: usize,
+    /// Steps on the redo stack.
+    pub redo_steps: usize,
+    /// Tiles captured across both stacks.
+    pub tiles: u64,
+    /// What those tiles would hold uncompressed and resident.
+    pub uncompressed_bytes: u64,
+    /// Memory the history holds, recomputed from the snapshots.
+    pub memory_bytes: u64,
+    /// Bytes in spill files.
+    pub spilled_bytes: u64,
+    /// Snapshots with a spill file.
+    pub spilled_steps: usize,
+    /// Spill attempts that failed (the data stayed in memory).
+    pub spill_failures: u64,
 }
 
 impl PixelHistory {
+    /// A history with no spill directory: snapshots are compressed but
+    /// always stay in memory.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            undo: Vec::new(),
+            redo: Vec::new(),
+            spill_root: None,
+            budget_bytes: u64::MAX,
+            memory_bytes: 0,
+            undo_cursor: 0,
+            redo_cursor: 0,
+            cooldown: 0,
+            spill_failures: 0,
+            area: None,
+        }
+    }
+
+    /// A history that keeps at most about `budget_bytes` of snapshots in
+    /// memory and spills the oldest compressed ones into a directory made
+    /// through `root` (a document store's
+    /// [`aurora_tile::TileStore::staging_root`]) -- created on the first
+    /// spill, removed when the history drops.
+    #[must_use]
+    pub fn with_spill(root: StagingRoot, budget_bytes: u64) -> Self {
+        Self {
+            spill_root: Some(root),
+            budget_bytes,
+            ..Self::new()
+        }
+    }
+
+    /// The memory budget.
+    #[must_use]
+    pub const fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
+
+    /// Changes the memory budget; the next push or [`Self::trim`] acts
+    /// on it.
+    pub fn set_budget_bytes(&mut self, budget_bytes: u64) {
+        self.budget_bytes = budget_bytes;
+    }
+
+    /// Memory the history holds, from the incremental count.
+    #[must_use]
+    pub const fn memory_bytes(&self) -> u64 {
+        self.memory_bytes
+    }
+
+    /// Everything the history holds, recomputed from the snapshots (O(n))
+    /// so a test can check the incremental [`Self::memory_bytes`].
+    #[must_use]
+    pub fn stats(&self) -> HistoryStats {
+        let mut stats = HistoryStats {
+            undo_steps: self.undo.len(),
+            redo_steps: self.redo.len(),
+            spill_failures: self.spill_failures,
+            ..HistoryStats::default()
+        };
+        for snapshot in self.undo.iter().chain(&self.redo) {
+            stats.tiles = stats.tiles.saturating_add(snapshot.tiles.len() as u64);
+            stats.uncompressed_bytes = stats
+                .uncompressed_bytes
+                .saturating_add(snapshot.uncompressed_bytes());
+            stats.memory_bytes = stats.memory_bytes.saturating_add(snapshot.memory_bytes);
+            let spilled = snapshot.spilled_bytes();
+            stats.spilled_bytes = stats.spilled_bytes.saturating_add(spilled);
+            if snapshot.spill.is_some() {
+                stats.spilled_steps += 1;
+            }
+        }
+        stats
+    }
+
+    /// Spills the oldest compressed snapshots to disk while the memory
+    /// held is over the budget, down to three quarters of it, writing at
+    /// most [`SPILL_BYTES_PER_CALL`]. Called by every push, undo and
+    /// redo; an app may also call it between frames to finish a job one
+    /// call left over. A failed write leaves the data in memory, logs it
+    /// and backs off for a few pushes -- never data loss.
+    pub fn trim(&mut self) {
+        if self.memory_bytes <= self.budget_bytes || self.spill_root.is_none() {
+            return;
+        }
+        if self.cooldown > 0 {
+            self.cooldown -= 1;
+            return;
+        }
+        let target = self.budget_bytes / TRIM_TARGET_DEN * TRIM_TARGET_NUM;
+        let mut written: u64 = 0;
+        while self.memory_bytes > target && written < SPILL_BYTES_PER_CALL {
+            match self.spill_oldest() {
+                Ok(Some(bytes)) => written = written.saturating_add(bytes),
+                Ok(None) => break,
+                Err(err) => {
+                    self.spill_failures = self.spill_failures.saturating_add(1);
+                    self.cooldown = SPILL_RETRY_PUSHES;
+                    tracing::warn!(
+                        ?err,
+                        memory_bytes = self.memory_bytes,
+                        budget_bytes = self.budget_bytes,
+                        "could not spill pixel history to the scratch disk; keeping it in memory"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Spills the oldest snapshot that still has packed tiles in memory
+    /// (undo stack from the bottom, then the redo stack from its bottom).
+    /// `Ok(None)` when nothing is left to spill.
+    fn spill_oldest(&mut self) -> Result<Option<u64>, TileError> {
+        if self.area.is_none() {
+            let Some(root) = &self.spill_root else {
+                return Ok(None);
+            };
+            self.area = Some(root.spill_area()?);
+        }
+        let Some(area) = self.area.as_ref() else {
+            return Ok(None);
+        };
+        for (stack, cursor) in [
+            (&mut self.undo, &mut self.undo_cursor),
+            (&mut self.redo, &mut self.redo_cursor),
+        ] {
+            while let Some(snapshot) = stack.get_mut(*cursor) {
+                if !snapshot.has_spillable() {
+                    *cursor += 1;
+                    continue;
+                }
+                let before = snapshot.memory_bytes;
+                let written = snapshot.spill_to(area)?;
+                self.memory_bytes = self
+                    .memory_bytes
+                    .saturating_sub(before.saturating_sub(snapshot.memory_bytes));
+                *cursor += 1;
+                return Ok(Some(written));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Drops the redo stack (freeing its spill files) and its accounting.
+    fn discard_redo(&mut self) {
+        let freed: u64 = self.redo.iter().map(|s| s.memory_bytes).sum();
+        self.memory_bytes = self.memory_bytes.saturating_sub(freed);
+        self.redo.clear();
+        self.redo_cursor = 0;
     }
 
     #[must_use]
@@ -366,8 +825,13 @@ impl PixelHistory {
         if stroke.is_empty() {
             return false;
         }
+        // Pack at the end of the stroke, not per dab (0.210.0).
+        let mut stroke = stroke;
+        stroke.pack();
+        self.discard_redo();
+        self.memory_bytes = self.memory_bytes.saturating_add(stroke.memory_bytes);
         self.undo.push(stroke);
-        self.redo.clear();
+        self.trim();
         true
     }
 
@@ -379,7 +843,7 @@ impl PixelHistory {
     /// `aurora_doc::History`, from the same unified-ordering need
     /// `aurora_doc::History::clear_redo` itself already documents).
     pub fn clear_redo(&mut self) {
-        self.redo.clear();
+        self.discard_redo();
     }
 
     /// The stroke [`Self::undo`] would restore next, without restoring
@@ -448,9 +912,15 @@ impl PixelHistory {
         // Borrowed, not removed: `apply` is fallible, and `?` below
         // returns before the `pop` that commits to this undo actually
         // having happened.
-        let inverse = stroke.apply(store)?;
-        let _ = self.undo.pop();
+        let mut inverse = stroke.apply(store)?;
+        inverse.pack();
+        if let Some(old) = self.undo.pop() {
+            self.memory_bytes = self.memory_bytes.saturating_sub(old.memory_bytes);
+        }
+        self.undo_cursor = self.undo_cursor.min(self.undo.len());
+        self.memory_bytes = self.memory_bytes.saturating_add(inverse.memory_bytes);
         self.redo.push(inverse);
+        self.trim();
         Ok(true)
     }
 
@@ -466,9 +936,15 @@ impl PixelHistory {
         let Some(stroke) = self.redo.last() else {
             return Ok(false);
         };
-        let inverse = stroke.apply(store)?;
-        let _ = self.redo.pop();
+        let mut inverse = stroke.apply(store)?;
+        inverse.pack();
+        if let Some(old) = self.redo.pop() {
+            self.memory_bytes = self.memory_bytes.saturating_sub(old.memory_bytes);
+        }
+        self.redo_cursor = self.redo_cursor.min(self.redo.len());
+        self.memory_bytes = self.memory_bytes.saturating_add(inverse.memory_bytes);
         self.undo.push(inverse);
+        self.trim();
         Ok(true)
     }
 }

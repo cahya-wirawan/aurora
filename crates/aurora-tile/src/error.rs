@@ -39,6 +39,14 @@ pub enum TileError {
         #[source]
         source: std::io::Error,
     },
+    /// A pixel-history spill file ([`crate::SpillArea`], 0.210.0) could not
+    /// be created, written or read back.
+    #[error("history spill file {path:?} failed: {source}")]
+    Spill {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     /// [`crate::TileStore::insert_staged`] was handed a tile staged for a
     /// different store (0.154.0); it was not adopted.
     #[error("a staged tile belongs to a different tile store")]
