@@ -9,9 +9,9 @@
 
 use crate::fill_tools::{self, FillRefused, Filled};
 use crate::{
-    AppCommand, CompositeCache, DabTool, Drag, LockRefusal, ToolSettings, UndoDirection,
-    UndoOrder, activate_command, begin_drag, commit_fill, continue_drag, default_shortcuts,
-    handle_key, palette_commands, press_refusal, step_undo_order,
+    AppCommand, CompositeCache, DabTool, Drag, LockRefusal, ToolSettings, UndoDirection, UndoOrder,
+    activate_command, begin_drag, commit_fill, continue_drag, default_shortcuts, handle_key,
+    palette_commands, press_refusal, step_undo_order,
 };
 use aurora_ui::Tool;
 use aurora_widgets::shortcut::{Key, KeyChord, Modifiers};
@@ -51,7 +51,10 @@ impl Doc {
         let Some(budget) = std::num::NonZeroUsize::new(64) else {
             unreachable!("non-zero");
         };
-        let store = ok(aurora_tile::TileStore::new(dir.path().to_path_buf(), budget));
+        let store = ok(aurora_tile::TileStore::new(
+            dir.path().to_path_buf(),
+            budget,
+        ));
         let mut layers = aurora_doc::LayerTree::new();
         let layer = ok(layers.add_pixel_layer("Layer", bounds, None));
         let Some(surface) = layers.surface_id(layer) else {
@@ -114,7 +117,11 @@ impl Doc {
         }
         let tile = ok(self.store.get(self.surface, id));
         let index = (((y % 256) * 256 + (x % 256)) as usize) * 4;
-        let at = |o: usize| tile.texels().get(index + o).map_or(f32::NAN, |v| v.to_f32());
+        let at = |o: usize| {
+            tile.texels()
+                .get(index + o)
+                .map_or(f32::NAN, |v| v.to_f32())
+        };
         [at(0), at(1), at(2), at(3)]
     }
 
@@ -186,8 +193,16 @@ fn a_bucket_click_is_one_labelled_undo_step_that_restores_and_redoes_exact_pixel
     let before = doc.at(50, 50);
     let filled = ok(doc.bucket((50.0, 50.0)));
     assert!(doc.commit(filled, fill_tools::PAINT_BUCKET_LABEL));
-    assert_eq!(doc.at(50, 50), [0.0, 1.0, 0.0, 1.0], "the foreground, opaque");
-    assert_eq!(doc.at(150, 50), [1.0, 0.0, 0.0, 1.0], "the red block is a wall");
+    assert_eq!(
+        doc.at(50, 50),
+        [0.0, 1.0, 0.0, 1.0],
+        "the foreground, opaque"
+    );
+    assert_eq!(
+        doc.at(150, 50),
+        [1.0, 0.0, 0.0, 1.0],
+        "the red block is a wall"
+    );
     assert_eq!(history_labels(&doc), ["Paint Bucket Fill"]);
     assert_eq!(doc.undo_order.undo.len(), 1, "exactly one step");
 
@@ -224,7 +239,8 @@ fn the_bucket_uses_the_layer_origin_and_ignores_points_outside_the_layer() {
     for point in [(99.0, 60.0), (110.0, 49.0), (164.0, 60.0), (110.0, 114.0)] {
         let result = doc.bucket(point);
         assert!(
-            matches!(&result, Err(FillRefused::Nothing)) || matches!(&result, Ok(f) if f.snapshot.is_empty()),
+            matches!(&result, Err(FillRefused::Nothing))
+                || matches!(&result, Ok(f) if f.snapshot.is_empty()),
             "{point:?}: {result:?}"
         );
     }
@@ -239,7 +255,11 @@ fn the_bucket_options_reach_the_algorithm() {
     doc.settings.tolerance = 32;
     let f = ok(doc.bucket((1.0, 1.0)));
     assert!(doc.commit(f, "x"));
-    assert_ne!(doc.at(5, 1)[1], 1.0, "40 apart is outside the default tolerance 32");
+    assert_ne!(
+        doc.at(5, 1)[1],
+        1.0,
+        "40 apart is outside the default tolerance 32"
+    );
     assert!(doc.undo(UndoDirection::Undo));
     doc.settings.tolerance = 40;
     let f = ok(doc.bucket((1.0, 1.0)));
@@ -274,8 +294,14 @@ fn a_fill_invalidates_only_the_tiles_it_wrote() {
     assert!(filled.painted.contains(&near));
     assert!(!filled.painted.contains(&far), "the wall confines the fill");
     assert!(doc.commit(filled, "x"));
-    assert!(!doc.cache.current.contains(&near), "the filled tile is stale");
-    assert!(doc.cache.current.contains(&far), "an untouched tile stays current");
+    assert!(
+        !doc.cache.current.contains(&near),
+        "the filled tile is stale"
+    );
+    assert!(
+        doc.cache.current.contains(&far),
+        "an untouched tile stays current"
+    );
     assert!(doc.cache.stamp > stamp);
 }
 
@@ -303,7 +329,11 @@ fn reverse_radial_and_opacity_reach_the_gradient() {
     doc.settings.gradient_reverse = true;
     let f = ok(doc.gradient((0.0, 0.0), (100.0, 0.0)));
     assert!(doc.commit(f, "x"));
-    assert_eq!(doc.at(300, 5), [0.0, 1.0, 0.0, 1.0], "reversed: the foreground is at the end");
+    assert_eq!(
+        doc.at(300, 5),
+        [0.0, 1.0, 0.0, 1.0],
+        "reversed: the foreground is at the end"
+    );
     assert!(doc.undo(UndoDirection::Undo));
 
     doc.settings.gradient_reverse = false;
@@ -312,7 +342,7 @@ fn reverse_radial_and_opacity_reach_the_gradient() {
     assert!(doc.commit(f, "x"));
     // Equal distance right and down: equal colours; a linear one is not.
     assert_eq!(doc.at(125, 100), doc.at(100, 125));
-    assert_eq!(doc.at(100, 100)[1] > 0.9, true);
+    assert!(doc.at(100, 100)[1] > 0.9);
     assert!(doc.undo(UndoDirection::Undo));
 
     doc.settings.gradient_radial = false;
@@ -321,7 +351,10 @@ fn reverse_radial_and_opacity_reach_the_gradient() {
     let f = ok(doc.gradient((0.0, 0.0), (100.0, 0.0)));
     assert!(doc.commit(f, "x"));
     let p = doc.at(300, 5);
-    assert!((p[0] - 0.5).abs() < 0.01 && (p[2] - 0.5).abs() < 0.01, "{p:?}");
+    assert!(
+        (p[0] - 0.5).abs() < 0.01 && (p[2] - 0.5).abs() < 0.01,
+        "{p:?}"
+    );
 }
 
 #[test]
@@ -358,9 +391,15 @@ fn locks_refuse_or_preserve_alpha_for_both_tools() {
             ..aurora_doc::LayerLock::none()
         });
         let r = doc.bucket((5.0, 5.0));
-        assert!(matches!(r, Err(FillRefused::Notice(LockRefusal::PixelsLocked))), "{r:?}");
+        assert!(
+            matches!(r, Err(FillRefused::Notice(LockRefusal::PixelsLocked))),
+            "{r:?}"
+        );
         let r = doc.gradient((0.0, 0.0), (50.0, 0.0));
-        assert!(matches!(r, Err(FillRefused::Notice(LockRefusal::PixelsLocked))), "{r:?}");
+        assert!(
+            matches!(r, Err(FillRefused::Notice(LockRefusal::PixelsLocked))),
+            "{r:?}"
+        );
         assert_eq!(doc.at(5, 5), [1.0; 4], "nothing was written");
         assert!(doc.undo_order.undo.is_empty(), "no history row");
         for tool in [Tool::Gradient, Tool::PaintBucket] {
@@ -373,7 +412,10 @@ fn locks_refuse_or_preserve_alpha_for_both_tools() {
     // Lock All too.
     let mut doc = Doc::new(Doc::rect(0, 0, 64, 64));
     doc.lock(aurora_doc::LayerLock::all());
-    assert!(matches!(doc.bucket((1.0, 1.0)), Err(FillRefused::Notice(_))));
+    assert!(matches!(
+        doc.bucket((1.0, 1.0)),
+        Err(FillRefused::Notice(_))
+    ));
 
     // Transparency lock: alpha untouched, transparent pixels stay empty.
     let mut doc = Doc::new(Doc::rect(0, 0, 64, 64));
@@ -385,7 +427,11 @@ fn locks_refuse_or_preserve_alpha_for_both_tools() {
     doc.settings.tolerance = 255;
     let f = ok(doc.bucket((1.0, 1.0)));
     assert!(doc.commit(f, "x"));
-    assert_eq!(doc.at(1, 1), [0.0, 0.5, 0.0, 0.5], "green x alpha, alpha kept");
+    assert_eq!(
+        doc.at(1, 1),
+        [0.0, 0.5, 0.0, 0.5],
+        "green x alpha, alpha kept"
+    );
     assert_eq!(doc.at(20, 20), [0.0; 4]);
     let f = ok(doc.gradient((0.0, 0.0), (40.0, 0.0)));
     assert!(doc.commit(f, "y"));
@@ -403,7 +449,10 @@ fn a_too_large_fill_is_refused_calmly_with_nothing_written() {
         "{r:?}"
     );
     assert!(doc.undo_order.undo.is_empty());
-    assert!(!doc.store.contains_tile(doc.surface, aurora_tile::TileId { x: 0, y: 0 }));
+    assert!(
+        !doc.store
+            .contains_tile(doc.surface, aurora_tile::TileId { x: 0, y: 0 })
+    );
     // The same message class stays on screen only for the fill tools.
     assert!(crate::lock_refusal_applies(
         LockRefusal::FillTooLarge,
@@ -429,7 +478,10 @@ fn a_too_large_fill_is_refused_calmly_with_nothing_written() {
         GREEN,
         BLUE,
     );
-    assert!(matches!(r, Err(FillRefused::Notice(LockRefusal::FillTooLarge))), "{r:?}");
+    assert!(
+        matches!(r, Err(FillRefused::Notice(LockRefusal::FillTooLarge))),
+        "{r:?}"
+    );
 }
 
 #[test]
@@ -550,9 +602,8 @@ fn clicking_a_new_tool_button_selects_it_and_the_buttons_are_named_and_described
         let Some(id) = workspace.tools.button_for(tool) else {
             unreachable!("a button");
         };
-        let outcome = aurora_widgets::PointerOutcome::Action(
-            aurora_widgets::ActionOutcome::Activated(id),
-        );
+        let outcome =
+            aurora_widgets::PointerOutcome::Action(aurora_widgets::ActionOutcome::Activated(id));
         assert_eq!(crate::tool_button_click(&workspace, &outcome), Some(tool));
         let Some(node) = workspace.tree.accessibility(id) else {
             unreachable!("node");
@@ -610,9 +661,24 @@ fn a_gradient_press_starts_a_drag_that_follows_the_pointer_and_a_bucket_press_st
     assert_eq!(*start_doc, start, "the start is fixed");
     assert!((current_doc.0 - start.0 - 100.0).abs() < 1.0);
     // The bucket acts on the press itself; the middle button still pans.
-    assert!(begin_drag(Tool::PaintBucket, crate::PointerButton::Primary, (1.0, 1.0), &view, None).is_none());
+    assert!(
+        begin_drag(
+            Tool::PaintBucket,
+            crate::PointerButton::Primary,
+            (1.0, 1.0),
+            &view,
+            None
+        )
+        .is_none()
+    );
     assert!(matches!(
-        begin_drag(Tool::Gradient, crate::PointerButton::Middle, (1.0, 1.0), &view, None),
+        begin_drag(
+            Tool::Gradient,
+            crate::PointerButton::Middle,
+            (1.0, 1.0),
+            &view,
+            None
+        ),
         Some(Drag::Pan { .. })
     ));
     // Neither fill tool is a dab tool.
@@ -673,30 +739,69 @@ fn the_options_bar_edits_the_fill_settings_and_mirrors_them() {
         &bar.settings,
         None,
     );
-    assert!(bar.outcome(Tool::PaintBucket, A::ValueChanged { id: fill.tolerance, value: 90.4 }));
-    assert_eq!(bar.settings.tolerance, 90);
-    assert!(bar.outcome(Tool::PaintBucket, A::ValueChanged { id: fill.tolerance, value: 9000.0 }));
-    assert_eq!(bar.settings.tolerance, 255);
-    assert!(!bar.outcome(Tool::PaintBucket, A::ValueChanged { id: fill.tolerance, value: f64::NAN }));
     assert!(bar.outcome(
         Tool::PaintBucket,
-        A::Toggled { id: fill.contiguous, state: accesskit::Toggled::False }
+        A::ValueChanged {
+            id: fill.tolerance,
+            value: 90.4
+        }
+    ));
+    assert_eq!(bar.settings.tolerance, 90);
+    assert!(bar.outcome(
+        Tool::PaintBucket,
+        A::ValueChanged {
+            id: fill.tolerance,
+            value: 9000.0
+        }
+    ));
+    assert_eq!(bar.settings.tolerance, 255);
+    assert!(!bar.outcome(
+        Tool::PaintBucket,
+        A::ValueChanged {
+            id: fill.tolerance,
+            value: f64::NAN
+        }
+    ));
+    assert!(bar.outcome(
+        Tool::PaintBucket,
+        A::Toggled {
+            id: fill.contiguous,
+            state: accesskit::Toggled::False
+        }
     ));
     assert!(!bar.settings.contiguous);
 
     assert!(bar.outcome(Tool::Gradient, A::Activated(fill.radial)));
     assert!(bar.settings.gradient_radial);
-    assert!(!bar.outcome(Tool::Gradient, A::Activated(fill.radial)), "idempotent");
+    assert!(
+        !bar.outcome(Tool::Gradient, A::Activated(fill.radial)),
+        "idempotent"
+    );
     assert!(bar.outcome(Tool::Gradient, A::Activated(fill.linear)));
     assert!(!bar.settings.gradient_radial);
     assert!(bar.outcome(
         Tool::Gradient,
-        A::Toggled { id: fill.reverse, state: accesskit::Toggled::True }
+        A::Toggled {
+            id: fill.reverse,
+            state: accesskit::Toggled::True
+        }
     ));
     assert!(bar.settings.gradient_reverse);
-    assert!(bar.outcome(Tool::Gradient, A::ValueChanged { id: fill.opacity, value: 35.0 }));
+    assert!(bar.outcome(
+        Tool::Gradient,
+        A::ValueChanged {
+            id: fill.opacity,
+            value: 35.0
+        }
+    ));
     assert_eq!(bar.settings.gradient_opacity, 35);
-    assert!(bar.outcome(Tool::Gradient, A::ValueChanged { id: fill.opacity, value: -4.0 }));
+    assert!(bar.outcome(
+        Tool::Gradient,
+        A::ValueChanged {
+            id: fill.opacity,
+            value: -4.0
+        }
+    ));
     assert_eq!(bar.settings.gradient_opacity, 0);
     // Not a fill widget, not a fill outcome.
     assert!(!bar.outcome(Tool::Gradient, A::Activated(bar.controls.radius)));
@@ -712,7 +817,8 @@ fn the_options_bar_edits_the_fill_settings_and_mirrors_them() {
 #[test]
 fn brush_and_eraser_keep_their_radius_row_and_fill_tools_replace_it() {
     let mut bar = Bar::new();
-    let radius_shown = |bar: &Bar| aurora_ui::radius_slider_shown(&bar.workspace.tree, &bar.controls);
+    let radius_shown =
+        |bar: &Bar| aurora_ui::radius_slider_shown(&bar.workspace.tree, &bar.controls);
     for (tool, radius, group) in [
         (Tool::Brush, true, None),
         (Tool::Eraser, true, None),
@@ -721,9 +827,19 @@ fn brush_and_eraser_keep_their_radius_row_and_fill_tools_replace_it() {
         (Tool::Move, false, None),
         (Tool::Brush, true, None),
     ] {
-        crate::sync_tool_controls(&mut bar.workspace, Some(bar.controls), tool, &bar.settings, None);
+        crate::sync_tool_controls(
+            &mut bar.workspace,
+            Some(bar.controls),
+            tool,
+            &bar.settings,
+            None,
+        );
         bar.workspace.tree.compute_layout(W, H);
         assert_eq!(radius_shown(&bar), radius, "{tool:?}");
-        assert_eq!(aurora_ui::shown_fill_group(&bar.workspace.tree, &bar.controls), group, "{tool:?}");
+        assert_eq!(
+            aurora_ui::shown_fill_group(&bar.workspace.tree, &bar.controls),
+            group,
+            "{tool:?}"
+        );
     }
 }

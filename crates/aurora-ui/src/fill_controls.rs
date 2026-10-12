@@ -134,8 +134,7 @@ pub fn insert_fill_controls(
     let linear = widgets::insert_toggle_button(tree, gradient, scales, "Linear", true)?;
     let radial = widgets::insert_toggle_button(tree, gradient, scales, "Radial", false)?;
     let reverse = widgets::insert_checkbox(tree, gradient, scales, "Reverse")?;
-    let opacity_readout =
-        widgets::insert_label(tree, gradient, scales, opacity_readout_text(100))?;
+    let opacity_readout = widgets::insert_label(tree, gradient, scales, opacity_readout_text(100))?;
     let opacity = widgets::insert_slider(
         tree,
         gradient,
@@ -316,15 +315,11 @@ mod tests {
     fn built() -> (crate::Workspace, ToolControls) {
         let scales = scales();
         let mut ws = build_workspace(&scales);
-        let controls = match insert_tool_controls(
-            &mut ws.tree,
-            ws.options_bar,
-            ws.properties,
-            &scales,
-        ) {
-            Ok(controls) => controls,
-            Err(err) => unreachable!("{err:?}"),
-        };
+        let controls =
+            match insert_tool_controls(&mut ws.tree, ws.options_bar, ws.properties, &scales) {
+                Ok(controls) => controls,
+                Err(err) => unreachable!("{err:?}"),
+            };
         ws.tree.compute_layout(1600.0, 900.0);
         (ws, controls)
     }
@@ -347,7 +342,8 @@ mod tests {
     }
 
     fn hidden_to_at(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> bool {
-        tree.accessibility(id).is_some_and(accesskit::Node::is_hidden)
+        tree.accessibility(id)
+            .is_some_and(accesskit::Node::is_hidden)
     }
 
     #[test]
@@ -370,7 +366,11 @@ mod tests {
             assert_eq!(hidden_to_at(&ws.tree, fill.gradient), !gradient, "{tool:?}");
             assert_eq!(hidden_to_at(&ws.tree, fill.bucket), !bucket, "{tool:?}");
             // The radius readout belongs to every tool but the fill tools.
-            assert_eq!(shown(&ws.tree, controls.readout), !is_fill_tool(tool), "{tool:?}");
+            assert_eq!(
+                shown(&ws.tree, controls.readout),
+                !is_fill_tool(tool),
+                "{tool:?}"
+            );
         }
         sync(&mut ws, &controls, Tool::Gradient, VIEW, None);
         assert_eq!(shown_fill_group(&ws.tree, &controls), Some(Tool::Gradient));
@@ -448,7 +448,13 @@ mod tests {
             tolerance: 90,
             ..VIEW
         };
-        sync(&mut ws, &controls, Tool::PaintBucket, moved, Some(fill.tolerance));
+        sync(
+            &mut ws,
+            &controls,
+            Tool::PaintBucket,
+            moved,
+            Some(fill.tolerance),
+        );
         let value = match ws.tree.payload(fill.tolerance) {
             Some(WidgetKind::Slider(s)) => s.value,
             other => unreachable!("{other:?}"),

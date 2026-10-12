@@ -546,9 +546,9 @@ mod colour_state;
 mod document_close;
 mod document_session;
 mod document_tabs;
-mod fill_tools;
 #[cfg(test)]
 mod document_tabs_tests;
+mod fill_tools;
 mod layer_thumbnails;
 mod prepared_pixels;
 mod psd_save;
@@ -4742,6 +4742,11 @@ fn route_accessibility_action(
                 // A Lock-row button (0.198.0): the same edit a pointer
                 // click makes ([`apply_layer_control_outcome`]).
                 AccessibilityReaction::LayerControl(aurora_widgets::ActionOutcome::Activated(id))
+            } else if tool_controls.is_some_and(|controls| {
+                aurora_ui::tool_controls_contains(&workspace.tree, controls, id)
+            }) {
+                // A Linear/Radial button of the Gradient options (0.209.0).
+                AccessibilityReaction::ToolControl(aurora_widgets::ActionOutcome::Activated(id))
             } else {
                 AccessibilityReaction::Handled(aurora_widgets::ActionOutcome::Activated(id))
             }
@@ -5474,7 +5479,10 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         ("e", AppCommand::SelectTool(aurora_ui::Tool::Eraser)),
         // 0.209.0: Photoshop's grouped G key.
         ("g", AppCommand::SelectTool(aurora_ui::Tool::Gradient)),
-        ("Shift+G", AppCommand::SelectTool(aurora_ui::Tool::PaintBucket)),
+        (
+            "Shift+G",
+            AppCommand::SelectTool(aurora_ui::Tool::PaintBucket),
+        ),
         // 0.208.0: Photoshop's colour keys, bare like the tool letters.
         ("x", AppCommand::SwapColours),
         ("d", AppCommand::ResetColours),
@@ -5915,7 +5923,10 @@ fn palette_commands() -> Vec<CommandEntry> {
     ];
     // 0.209.0: "Select ... Tool" for every tool (the palette had none).
     commands.extend(aurora_ui::Tool::ALL.iter().map(|tool| {
-        CommandEntry::new(tool_command_id(*tool), format!("Select {} Tool", tool.label()))
+        CommandEntry::new(
+            tool_command_id(*tool),
+            format!("Select {} Tool", tool.label()),
+        )
     }));
     commands.extend(
         PANEL_MOVE_COMMANDS
@@ -29406,7 +29417,7 @@ impl App {
             layer,
             doc_point,
             &self.tool_settings,
-            self.colour.state.foreground(),
+            colour_state::fill_foreground(&self.colour.state),
         );
         self.finish_fill(layer, result, fill_tools::PAINT_BUCKET_LABEL);
     }
@@ -29428,8 +29439,8 @@ impl App {
             start_doc,
             end_doc,
             &self.tool_settings,
-            self.colour.state.foreground(),
-            self.colour.state.background(),
+            colour_state::fill_foreground(&self.colour.state),
+            colour_state::fill_background(&self.colour.state),
         );
         self.finish_fill(layer, result, fill_tools::GRADIENT_LABEL);
     }
@@ -34551,7 +34562,7 @@ mod tests {
             mut state: AtState,
             request: &accesskit::ActionRequest,
         ) -> bool {
-            let radius = state.tool_settings.radius(state.tool);
+            let settings = state.tool_settings.clone();
             let Some(curves) = state.active_layer else {
                 unreachable!("the sweep's Curves layer is active");
             };
@@ -34561,9 +34572,17 @@ mod tests {
             state.sync_curves();
             let now = aurora_ui::curves_params(&state.layers, curves).cloned();
             if now == params {
+                // The radius, or (0.209.0) a fill option's setting. The
+                // Gradient opacity slider starts at its maximum, where
+                // `Increment` legitimately changes nothing.
+                if request.action == accesskit::Action::Increment
+                    && settings.gradient_opacity == 100
+                    && state.tool_settings == settings
+                {
+                    return false;
+                }
                 assert_ne!(
-                    state.tool_settings.radius(state.tool),
-                    radius,
+                    state.tool_settings, settings,
                     "{request:?} reached a tool control and changed nothing"
                 );
                 return false;
@@ -66570,7 +66589,7 @@ mod tests {
         let shortcuts = default_shortcuts();
         let workspace = laid_out_workspace();
         for (tool, button) in workspace.tools.buttons {
-            let lower = tool.shortcut_key().to_ascii_lowercase().to_string();
+            let lower = tool.shortcut_text().to_ascii_lowercase();
             let chord = match KeyChord::parse(&lower) {
                 Ok(chord) => chord,
                 Err(err) => unreachable!("{lower:?}: {err:?}"),
@@ -66586,7 +66605,7 @@ mod tests {
                 .and_then(|node| node.description().map(str::to_owned))
                 .unwrap_or_default();
             assert!(
-                described.ends_with(&format!("shortcut {}", tool.shortcut_key())),
+                described.ends_with(&format!("shortcut {}", tool.shortcut_text())),
                 "{described}"
             );
         }
@@ -86718,7 +86737,7 @@ mod panel_scroll_tests {
                 toggle(&mut ws, &mut focus);
                 let hist = button(&ws, ws.history);
                 let mut reached = false;
-                for _ in 0..16 {
+                for _ in 0..32 {
                     if focus.focus_next(&mut ws.tree) == Some(hist) {
                         reached = true;
                         break;

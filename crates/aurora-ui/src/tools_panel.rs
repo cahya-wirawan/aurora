@@ -470,7 +470,10 @@ mod tests {
             );
         }
         assert_eq!(tool_description(Tool::Brush), "Brush tool, shortcut B");
-        assert_eq!(tool_description(Tool::Gradient), "Gradient tool, shortcut G");
+        assert_eq!(
+            tool_description(Tool::Gradient),
+            "Gradient tool, shortcut G"
+        );
         assert_eq!(
             tool_description(Tool::PaintBucket),
             "Paint Bucket tool, shortcut Shift+G"
@@ -653,8 +656,15 @@ mod tests {
             assert_eq!(at(Tool::Gradient).x, at(Tool::Brush).x);
             assert_eq!(at(Tool::PaintBucket).x, at(Tool::Eraser).x);
             let bucket = at(Tool::PaintBucket);
-            assert_eq!(bucket.bottom() - strip.y, 4 + 5 * 32 + 4 * 8, "scale {scale_factor}");
-            assert!(bucket.right() - strip.x <= 72 - 4, "inside the strip's padding");
+            assert_eq!(
+                bucket.bottom() - strip.y,
+                4 + 5 * 32 + 4 * 8,
+                "scale {scale_factor}"
+            );
+            assert!(
+                bucket.right() - strip.x <= 72 - 4,
+                "inside the strip's padding"
+            );
         }
         // The old strip, rebuilt: text toggle buttons in the label strip's
         // column style, measured.

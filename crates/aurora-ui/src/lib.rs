@@ -40,6 +40,7 @@ pub mod colour_controls;
 pub mod curves_controls;
 pub mod dock;
 pub mod document_tabs;
+pub mod fill_controls;
 pub mod gallery_panel;
 pub mod history_panel;
 pub mod hue_saturation_controls;
@@ -55,7 +56,6 @@ pub mod properties_panel;
 pub mod redock;
 pub mod status_bar;
 pub mod tool;
-pub mod fill_controls;
 pub mod tool_controls;
 pub mod tools_panel;
 pub mod workspace;
@@ -119,6 +119,11 @@ pub use colour_controls::{
     is_colour_control, open_colour_popover, swatch_colour, swatch_description, swatch_name,
     sync_colour_controls,
 };
+pub use fill_controls::{
+    FillControls, FillView, OPACITY_MAX, OPACITY_MIN, TOLERANCE_MAX, TOLERANCE_MIN,
+    insert_fill_controls, is_fill_tool, opacity_readout_text, shown_fill_group, sync_fill_controls,
+    tolerance_readout_text,
+};
 pub use layers_panel::{
     LayerRowPart, LayersView, layer_row_description, layer_row_height, layer_row_neighbor,
     layer_row_part, layer_row_thumbnail, layer_thumbnail_side, populate_layers_panel,
@@ -149,10 +154,6 @@ pub use redock::{
 pub use status_bar::{
     STATUS_BAR_LABEL, StatusBar, StatusInfo, document_text, insert_status_bar, physical_zoom,
     sample_format_text, status_bar_text, sync_status_bar, zoom_text,
-};
-pub use fill_controls::{
-    FillControls, FillView, OPACITY_MAX, OPACITY_MIN, TOLERANCE_MAX, TOLERANCE_MIN, insert_fill_controls,
-    is_fill_tool, opacity_readout_text, shown_fill_group, sync_fill_controls, tolerance_readout_text,
 };
 pub use tool::Tool;
 pub use tool_controls::{

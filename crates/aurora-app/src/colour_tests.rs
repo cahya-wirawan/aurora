@@ -197,6 +197,14 @@ fn x_and_d_are_bound_and_collide_with_no_tool_letter() {
         let key = tool.shortcut_key().to_ascii_lowercase();
         assert_ne!(key, 'x');
         assert_ne!(key, 'd');
+        if tool.shortcut_needs_shift() {
+            // Paint Bucket is Shift+G (0.209.0), never the bare letter.
+            assert_eq!(
+                shortcut_command(key),
+                Some(AppCommand::SelectTool(Tool::Gradient))
+            );
+            continue;
+        }
         assert_eq!(shortcut_command(key), Some(AppCommand::SelectTool(tool)));
     }
     // On macOS the table is the same for these bare keys.
