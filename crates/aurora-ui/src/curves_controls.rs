@@ -131,6 +131,11 @@ pub struct CurvesControls {
     pub channel: WidgetId,
     /// The curve editor, bound to the selected channel's curve.
     pub editor: WidgetId,
+    /// The Levels editor built beside this column (0.202.0), set by
+    /// [`crate::insert_tool_controls`]; `None` for a column built alone.
+    /// It rides on this handle so every place that already routes the
+    /// Curves editor's events reaches the Levels editor's too.
+    pub levels: Option<crate::levels_controls::LevelsControls>,
 }
 
 fn column_style(scales: &Scales) -> Style {
@@ -186,6 +191,7 @@ pub fn insert_curves_controls(
             root,
             channel,
             editor,
+            levels: None,
         };
         set_enabled(tree, controls, false)?;
         Ok(controls)

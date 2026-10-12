@@ -5578,6 +5578,9 @@ enum ActivatedCommand {
     /// only, no shortcut. Run by [`perform_layer_command`] as
     /// [`LayerCommand::NewCurves`].
     NewCurvesLayer,
+    /// New Levels Layer (0.202.0): palette and the macOS `Layer` menu
+    /// only, no shortcut. Run as [`LayerCommand::NewLevels`].
+    NewLevelsLayer,
     /// New Group (0.196.0): palette, the macOS `Layer` menu and the Layers
     /// toolbar only, no shortcut. Run by [`perform_layer_command`] as
     /// [`LayerCommand::NewGroup`].
@@ -5746,6 +5749,7 @@ const COMMAND_TOGGLE_WIDGET_GALLERY: &str = "view.toggle_widget_gallery";
 const COMMAND_LAYER_NEW: &str = "layer.new";
 const COMMAND_LAYER_DELETE: &str = "layer.delete";
 const COMMAND_LAYER_NEW_CURVES: &str = "layer.new_curves";
+const COMMAND_LAYER_NEW_LEVELS: &str = "layer.new_levels";
 const COMMAND_LAYER_NEW_GROUP: &str = "layer.new_group";
 const COMMAND_LAYER_CLIP_CREATE: &str = "layer.clip_create";
 const COMMAND_LAYER_CLIP_RELEASE: &str = "layer.clip_release";
@@ -5813,6 +5817,7 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_LAYER_NEW, "New Layer"),
         CommandEntry::new(COMMAND_LAYER_DELETE, "Delete Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_CURVES, "New Curves Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_LEVELS, "New Levels Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_GROUP, "New Group"),
         CommandEntry::new(COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
         CommandEntry::new(COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),
@@ -5893,6 +5898,7 @@ fn command_close_target(
 /// which already own that state) runs the real undo/redo via
 /// [`run_command`], the same path `Ctrl+Z`/`Ctrl+Shift+Z` themselves
 /// use. Logs and returns `None` for any other id.
+#[allow(clippy::too_many_lines)]
 fn activate_command(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
@@ -6000,6 +6006,9 @@ fn activate_command(
     }
     if id == COMMAND_LAYER_NEW_CURVES {
         return Some(ActivatedCommand::NewCurvesLayer);
+    }
+    if id == COMMAND_LAYER_NEW_LEVELS {
+        return Some(ActivatedCommand::NewLevelsLayer);
     }
     if id == COMMAND_LAYER_NEW_GROUP {
         return Some(ActivatedCommand::NewGroup);
@@ -7994,6 +8003,20 @@ struct CurvesUiState {
     /// memory [`expand_properties_for_curves`] needs to act on a
     /// transition only.
     shown_for: Option<aurora_doc::LayerId>,
+    /// A live Levels slider drag (0.202.0): the Levels editor shares this
+    /// state and every routing site of the Curves editor.
+    levels_pending: Option<PendingLevels>,
+    /// [`Self::detached`]'s twin for the Levels sliders.
+    levels_detached: bool,
+}
+
+/// A live Levels-slider drag: the layer it started on and that layer's
+/// parameters before it, so the whole gesture is **one** undo step
+/// ([`finish_levels`]) — [`PendingCurves`]' twin.
+#[derive(Debug, Clone, PartialEq)]
+struct PendingLevels {
+    layer: aurora_doc::LayerId,
+    start: aurora_core::LevelsParams,
 }
 
 /// Everything a Curves edit touches — [`LayerControlEdit`]'s shape.
@@ -8078,6 +8101,13 @@ fn finish_curves(cx: &mut CurvesEdit<'_>) -> bool {
 /// pointer capture — [`settle_pending_opacity`]'s twin, run after every
 /// routed pointer event and once per event-loop iteration.
 fn settle_pending_curves(cx: &mut CurvesEdit<'_>, captured: Option<WidgetId>) -> bool {
+    // The Levels sliders' drag settles by the same rule (0.202.0).
+    let levels = settle_pending_levels(cx, captured);
+    settle_pending_curves_only(cx, captured) || levels
+}
+
+/// [`settle_pending_curves`] for the curve editor alone.
+fn settle_pending_curves_only(cx: &mut CurvesEdit<'_>, captured: Option<WidgetId>) -> bool {
     let editor = cx.controls.map(|controls| controls.editor);
     if editor.is_none() || captured != editor {
         cx.state.detached = false;
@@ -8093,11 +8123,165 @@ fn settle_pending_curves(cx: &mut CurvesEdit<'_>, captured: Option<WidgetId>) ->
 /// [`apply_curves_outcome`] instead of the radius handler.
 fn is_curves_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutcome) -> bool {
     use aurora_widgets::ActionOutcome as Outcome;
+    if is_levels_outcome(controls, outcome) {
+        return true;
+    }
     match outcome {
         PointerOutcome::Action(Outcome::TabSelected { bar, .. }) => *bar == controls.channel,
         PointerOutcome::Action(Outcome::CurveChanged { editor }) => *editor == controls.editor,
         _ => false,
     }
+}
+
+/// Whether `outcome` belongs to the Levels editor beside the Curves one
+/// (0.202.0): its channel tab bar or one of its five sliders.
+fn is_levels_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutcome) -> bool {
+    use aurora_widgets::ActionOutcome as Outcome;
+    let Some(levels) = controls.levels else {
+        return false;
+    };
+    match outcome {
+        PointerOutcome::Action(Outcome::TabSelected { bar, .. }) => *bar == levels.channel,
+        PointerOutcome::Action(Outcome::ValueChanged { id, .. }) => levels.slider_of(*id).is_some(),
+        _ => false,
+    }
+}
+
+/// Whether a Levels slider holds the pointer capture.
+fn levels_slider_captured(
+    controls: Option<aurora_ui::CurvesControls>,
+    captured: Option<WidgetId>,
+) -> bool {
+    controls
+        .and_then(|controls| controls.levels)
+        .zip(captured)
+        .is_some_and(|(levels, id)| levels.slider_of(id).is_some())
+}
+
+/// Sets Levels layer `id`'s parameters as **one** undoable structural
+/// step — [`record_curves_step`]'s twin (no histogram to carry forward).
+fn record_levels_step(
+    cx: &mut CurvesEdit<'_>,
+    id: aurora_doc::LayerId,
+    params: aurora_core::LevelsParams,
+) -> bool {
+    if let Err(err) =
+        cx.history
+            .set_adjustment(cx.layers, id, aurora_doc::Adjustment::Levels(params))
+    {
+        tracing::warn!(?err, "a Levels edit was refused by the layer tree");
+        return false;
+    }
+    cx.undo_order
+        .record(UndoKind::Structural, cx.history, cx.pixel_history);
+    refresh_history_panel(cx.workspace, cx.undo_order);
+    refresh_layer_row(cx.workspace, cx.layer_rows, cx.layers, id);
+    true
+}
+
+/// Ends a live Levels drag: one undo step for the whole gesture
+/// ([`finish_curves`]'s method: put the start back, record start -> final).
+fn finish_levels(cx: &mut CurvesEdit<'_>) -> bool {
+    let Some(pending) = cx.state.levels_pending.take() else {
+        return false;
+    };
+    let Some(now) = aurora_ui::levels_params(cx.layers, pending.layer).copied() else {
+        return false;
+    };
+    if now == pending.start {
+        return false;
+    }
+    if let Err(err) = cx
+        .layers
+        .set_adjustment(pending.layer, aurora_doc::Adjustment::Levels(pending.start))
+    {
+        tracing::warn!(?err, "failed to rewind a Levels drag before recording it");
+        return false;
+    }
+    record_levels_step(cx, pending.layer, now)
+}
+
+/// Commits a pending Levels drag once no Levels slider holds the capture
+/// ([`settle_pending_curves`]'s twin).
+fn settle_pending_levels(cx: &mut CurvesEdit<'_>, captured: Option<WidgetId>) -> bool {
+    if levels_slider_captured(cx.controls, captured) {
+        return false;
+    }
+    cx.state.levels_detached = false;
+    cx.state.levels_pending.is_some() && finish_levels(cx)
+}
+
+/// Turns one Levels-editor outcome into a document edit
+/// ([`apply_curves_outcome`]'s twin). A channel tab changes no document
+/// state. A slider `ValueChanged` while the slider holds the capture is
+/// applied to the tree live with the start kept in [`PendingLevels`];
+/// without capture (an arrow key, an assistive technology) it is one
+/// step. The record is rebuilt through [`aurora_ui::LevelsSlider::with_value`],
+/// which rounds to whole levels and keeps black below white, so no edit
+/// can produce an invalid record.
+fn apply_levels_outcome(
+    cx: &mut CurvesEdit<'_>,
+    outcome: &PointerOutcome,
+    captured: Option<WidgetId>,
+) -> CompositeInvalidation {
+    let Some(levels) = cx.controls.and_then(|controls| controls.levels) else {
+        return CompositeInvalidation::None;
+    };
+    let _ = settle_pending_levels(cx, captured);
+    let PointerOutcome::Action(aurora_widgets::ActionOutcome::ValueChanged { id, value }) = outcome
+    else {
+        return CompositeInvalidation::None;
+    };
+    let Some(slider) = levels.slider_of(*id) else {
+        return CompositeInvalidation::None;
+    };
+    let Some(active) = cx.active_layer.filter(|&id| cx.layers.contains(id)) else {
+        return CompositeInvalidation::None;
+    };
+    let Some(current) = aurora_ui::levels_params(cx.layers, active).copied() else {
+        return CompositeInvalidation::None;
+    };
+    let channel =
+        aurora_ui::levels_selected_channel(&cx.workspace.tree, levels).unwrap_or_default();
+    let record = aurora_ui::channel_levels(&current, channel);
+    let Some(record) = slider.with_value(&record, *value) else {
+        return CompositeInvalidation::None;
+    };
+    let next = aurora_ui::with_channel_levels(&current, channel, record);
+    if captured == Some(*id) {
+        if cx
+            .state
+            .levels_pending
+            .as_ref()
+            .is_some_and(|pending| pending.layer != active)
+        {
+            let _ = finish_levels(cx);
+            cx.state.levels_detached = true;
+        }
+        if cx.state.levels_detached || next == current {
+            return CompositeInvalidation::None;
+        }
+        if cx.state.levels_pending.is_none() {
+            cx.state.levels_pending = Some(PendingLevels {
+                layer: active,
+                start: current,
+            });
+        }
+        return match cx
+            .layers
+            .set_adjustment(active, aurora_doc::Adjustment::Levels(next))
+        {
+            Ok(()) => CompositeInvalidation::Everything,
+            Err(err) => {
+                tracing::warn!(?err, "a live Levels drag move was refused");
+                CompositeInvalidation::None
+            }
+        };
+    }
+    if next == current || !record_levels_step(cx, active, next) {
+        return CompositeInvalidation::None;
+    }
+    CompositeInvalidation::Everything
 }
 
 /// Turns one Curves-editor outcome into a document edit and reports what
@@ -8123,6 +8307,9 @@ fn apply_curves_outcome(
     let Some(controls) = cx.controls else {
         return CompositeInvalidation::None;
     };
+    if is_levels_outcome(controls, outcome) {
+        return apply_levels_outcome(cx, outcome, captured);
+    }
     let _ = settle_pending_curves(cx, captured);
     let PointerOutcome::Action(aurora_widgets::ActionOutcome::CurveChanged { editor }) = outcome
     else {
@@ -8193,7 +8380,13 @@ fn end_curves_drag(cx: &mut CurvesEdit<'_>, click: &mut ClickTracker) -> bool {
         click.release_capture();
     }
     cx.state.detached = false;
-    finish_curves(cx)
+    let curves = finish_curves(cx);
+    // The Levels sliders' drag ends the same way (0.202.0).
+    if levels_slider_captured(cx.controls, click.captured()) {
+        click.release_capture();
+    }
+    cx.state.levels_detached = false;
+    finish_levels(cx) || curves
 }
 
 /// What a key that reaches the shortcuts does to the Curves editor first
@@ -8206,7 +8399,11 @@ fn end_curves_drag(cx: &mut CurvesEdit<'_>, click: &mut ClickTracker) -> bool {
 /// was recorded.
 fn end_curves_gesture_before_key(cx: &mut CurvesEdit<'_>, click: &mut ClickTracker) -> bool {
     let editor = cx.controls.map(|controls| controls.editor);
-    if cx.state.pending.is_none() && (editor.is_none() || click.captured() != editor) {
+    let curves_live =
+        cx.state.pending.is_some() || (editor.is_some() && click.captured() == editor);
+    let levels_live =
+        cx.state.levels_pending.is_some() || levels_slider_captured(cx.controls, click.captured());
+    if !curves_live && !levels_live {
         return false;
     }
     end_curves_drag(cx, click)
@@ -8224,7 +8421,21 @@ fn end_curves_gestures(cx: &mut CurvesEdit<'_>, click: &mut ClickTracker) -> boo
     if cx.state.pending.is_some() || click.captured() == Some(controls.editor) {
         click.release_capture();
     }
-    let committed = finish_curves(cx);
+    if levels_slider_captured(cx.controls, click.captured()) {
+        click.release_capture();
+    }
+    let committed_levels = finish_levels(cx);
+    cx.state.levels_detached = false;
+    if let Some(levels) = controls.levels
+        && let Err(err) = aurora_ui::select_levels_channel(
+            &mut cx.workspace.tree,
+            levels,
+            aurora_ui::CurvesChannel::Rgb,
+        )
+    {
+        tracing::warn!(?err, "failed to reset the Levels channel");
+    }
+    let committed = finish_curves(cx) || committed_levels;
     cx.state.detached = false;
     cx.state.histogram = None;
     cx.state.job = None;
@@ -8551,8 +8762,13 @@ fn sync_curves_ui(
     let curves_layer = cx
         .active_layer
         .filter(|&id| aurora_ui::curves_params(cx.layers, id).is_some());
+    // A Levels layer expands a collapsed Properties panel the same way
+    // (0.202.0); only the histogram stays Curves-only.
+    let editor_layer = cx.active_layer.filter(|&id| {
+        curves_layer == Some(id) || aurora_ui::levels_params(cx.layers, id).is_some()
+    });
     let expanded =
-        expand_properties_for_curves(cx.workspace, &mut cx.state.shown_for, curves_layer);
+        expand_properties_for_curves(cx.workspace, &mut cx.state.shown_for, editor_layer);
     let settled = settled || expanded;
     let revision = cx.undo_order.revision;
     let _ = refresh_curves_histogram(
@@ -8570,6 +8786,22 @@ fn sync_curves_ui(
         .as_ref()
         .filter(|histogram| Some(histogram.layer) == curves_layer && histogram.channel == channel)
         .and_then(|histogram| histogram.bins.as_deref());
+    let levels_changed = match controls.levels {
+        Some(levels) => match aurora_ui::sync_levels_controls(
+            &mut cx.workspace.tree,
+            levels,
+            cx.layers,
+            cx.active_layer,
+            captured,
+        ) {
+            Ok(changed) => changed,
+            Err(err) => {
+                tracing::warn!(?err, "failed to sync the Properties-panel Levels editor");
+                false
+            }
+        },
+        None => false,
+    };
     match aurora_ui::sync_curves_controls(
         &mut cx.workspace.tree,
         controls,
@@ -8578,10 +8810,10 @@ fn sync_curves_ui(
         captured,
         bins,
     ) {
-        Ok(changed) => changed || settled,
+        Ok(changed) => changed || settled || levels_changed,
         Err(err) => {
             tracing::warn!(?err, "failed to sync the Properties-panel Curves editor");
-            settled
+            settled || levels_changed
         }
     }
 }
@@ -9108,6 +9340,7 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(COMMAND_LAYER_NEW, "New Layer", true, None),
             &muda::MenuItem::with_id(COMMAND_LAYER_DELETE, "Delete Layer", true, None),
             &muda::MenuItem::with_id(COMMAND_LAYER_NEW_CURVES, "New Curves Layer", true, None),
+            &muda::MenuItem::with_id(COMMAND_LAYER_NEW_LEVELS, "New Levels Layer", true, None),
             &muda::MenuItem::with_id(COMMAND_LAYER_NEW_GROUP, "New Group", true, None),
             &muda::MenuItem::with_id(
                 COMMAND_LAYER_CLIP_CREATE,
@@ -15600,7 +15833,76 @@ fn curves_lut(params: &aurora_core::CurvesParams) -> std::rc::Rc<aurora_filters:
     })
 }
 
-/// Applies an adjustment layer (0.155.0) to `accumulator`, the
+/// How many distinct Levels parameter sets [`levels_lut`] keeps built per
+/// thread (0.202.0), the Curves cache's rule.
+const LEVELS_LUT_CACHE_LEN: usize = 8;
+
+/// A thread's built Levels lookup tables, keyed by their exact parameters.
+type LevelsLutCache = Vec<(
+    aurora_core::LevelsParams,
+    std::rc::Rc<aurora_filters::LevelsLut>,
+)>;
+
+thread_local! {
+    /// Built Levels gamma tables, so a composite pass builds each set once
+    /// rather than once per tile (up to four 16,385-sample tables).
+    static LEVELS_LUTS: std::cell::RefCell<LevelsLutCache> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `params`' lookup tables, from this thread's cache when built before.
+fn levels_lut(params: &aurora_core::LevelsParams) -> std::rc::Rc<aurora_filters::LevelsLut> {
+    LEVELS_LUTS.with(|cache| {
+        let Ok(mut cache) = cache.try_borrow_mut() else {
+            return std::rc::Rc::new(aurora_filters::LevelsLut::new(params));
+        };
+        if let Some((_, lut)) = cache.iter().find(|(cached, _)| cached == params) {
+            return std::rc::Rc::clone(lut);
+        }
+        let lut = std::rc::Rc::new(aurora_filters::LevelsLut::new(params));
+        if cache.len() >= LEVELS_LUT_CACHE_LEN {
+            cache.remove(0);
+        }
+        cache.push((*params, std::rc::Rc::clone(&lut)));
+        lut
+    })
+}
+
+/// An adjustment layer's built tables (0.202.0): what
+/// [`apply_adjustment_layer`] maps the backdrop's straight RGB through,
+/// whichever adjustment the layer holds.
+enum AdjustmentLut {
+    Curves(std::rc::Rc<aurora_filters::CurvesLut>),
+    Levels(std::rc::Rc<aurora_filters::LevelsLut>),
+}
+
+impl AdjustmentLut {
+    /// The tables of `adjustment`, from the per-thread caches.
+    fn of(adjustment: &aurora_doc::Adjustment) -> Self {
+        match adjustment {
+            aurora_doc::Adjustment::Curves(params) => Self::Curves(curves_lut(params)),
+            aurora_doc::Adjustment::Levels(params) => Self::Levels(levels_lut(params)),
+        }
+    }
+
+    /// Whether the adjustment changes nothing.
+    fn is_identity(&self) -> bool {
+        match self {
+            Self::Curves(lut) => lut.is_identity(),
+            Self::Levels(lut) => lut.is_identity(),
+        }
+    }
+
+    /// Maps one straight RGB colour.
+    fn apply(&self, rgb: [f32; 3]) -> [f32; 3] {
+        match self {
+            Self::Curves(lut) => lut.apply(rgb),
+            Self::Levels(lut) => lut.apply(rgb),
+        }
+    }
+}
+
+/// Applies an adjustment layer (Curves 0.155.0, Levels 0.202.0) to `accumulator`, the
 /// premultiplied composite of everything below it in its own group (or
 /// the document), in place. Photoshop's adjustment-layer model:
 ///
@@ -15642,7 +15944,7 @@ fn apply_adjustment_layer(
     if !admit_composite_node(id, layers, depth, budget) {
         return false;
     }
-    let Some(aurora_doc::Adjustment::Curves(params)) = layers.adjustment(id) else {
+    let Some(adjustment) = layers.adjustment(id) else {
         return false;
     };
     let Some(opacity) = content_opacity(layers, id) else {
@@ -15651,7 +15953,7 @@ fn apply_adjustment_layer(
     let raw_blend_mode = layers
         .blend_mode(id)
         .unwrap_or(aurora_doc::BlendMode::Normal);
-    let lut = curves_lut(params);
+    let lut = AdjustmentLut::of(adjustment);
     if lut.is_identity()
         && matches!(
             raw_blend_mode,
@@ -22752,6 +23054,9 @@ enum LayerCommand {
     /// directly above the active node, placed exactly where
     /// [`Self::New`] places a pixel layer, made active.
     NewCurves,
+    /// New Levels Layer (0.202.0): an identity Levels adjustment layer,
+    /// placed exactly as [`Self::NewCurves`].
+    NewLevels,
     /// New Group (0.196.0): an empty Pass Through group directly above the
     /// active node, placed exactly where [`Self::New`] places a layer,
     /// made active. See [`new_group`].
@@ -23073,6 +23378,43 @@ fn new_curves_layer(cx: &mut LayerCommandContext<'_>) -> Option<aurora_doc::Laye
     }
 }
 
+/// `"Levels N"`, one past the highest `N` any existing "Levels N" layer
+/// uses ([`next_curves_name`]'s rule).
+fn next_levels_name(layers: &aurora_doc::LayerTree) -> String {
+    let highest = layer_ids_in_order(layers)
+        .into_iter()
+        .filter_map(|id| {
+            layers
+                .name(id)?
+                .strip_prefix("Levels ")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0);
+    format!("Levels {}", highest.saturating_add(1))
+}
+
+/// New Levels Layer (0.202.0): an identity Levels adjustment, one undo
+/// step, at [`new_layer_placement`].
+fn new_levels_layer(cx: &mut LayerCommandContext<'_>) -> Option<aurora_doc::LayerId> {
+    let placement = new_layer_placement(cx.layers, *cx.active_layer);
+    let name = next_levels_name(cx.layers);
+    match cx.history.add_adjustment_layer_at(
+        cx.layers,
+        name,
+        aurora_doc::Adjustment::Levels(aurora_core::LevelsParams::identity()),
+        placement.parent,
+        placement.index,
+    ) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(?err, "New Levels Layer was refused by the layer tree");
+            None
+        }
+    }
+}
+
 fn delete_layer(cx: &mut LayerCommandContext<'_>) -> Option<AppliedLayerCommand> {
     let Some(target) = cx.active_layer.filter(|&id| cx.layers.contains(id)) else {
         tracing::info!("Delete Layer with no active layer; nothing to delete");
@@ -23154,6 +23496,10 @@ fn perform_layer_command(cx: &mut LayerCommandContext<'_>, command: LayerCommand
         }),
         LayerCommand::Delete => delete_layer(cx),
         LayerCommand::NewCurves => new_curves_layer(cx).map(|id| AppliedLayerCommand {
+            next_active: Some(id),
+            label: None,
+        }),
+        LayerCommand::NewLevels => new_levels_layer(cx).map(|id| AppliedLayerCommand {
             next_active: Some(id),
             label: None,
         }),
@@ -25804,6 +26150,9 @@ impl App {
             Some(ActivatedCommand::DeleteLayer) => self.run_layer_command(LayerCommand::Delete),
             Some(ActivatedCommand::NewCurvesLayer) => {
                 self.run_layer_command(LayerCommand::NewCurves);
+            }
+            Some(ActivatedCommand::NewLevelsLayer) => {
+                self.run_layer_command(LayerCommand::NewLevels);
             }
             Some(ActivatedCommand::NewGroup) => self.run_layer_command(LayerCommand::NewGroup),
             Some(ActivatedCommand::SetClip(on)) => {
@@ -28530,6 +28879,9 @@ impl App {
             Some(ActivatedCommand::DeleteLayer) => self.run_layer_command(LayerCommand::Delete),
             Some(ActivatedCommand::NewCurvesLayer) => {
                 self.run_layer_command(LayerCommand::NewCurves);
+            }
+            Some(ActivatedCommand::NewLevelsLayer) => {
+                self.run_layer_command(LayerCommand::NewLevels);
             }
             Some(ActivatedCommand::NewGroup) => self.run_layer_command(LayerCommand::NewGroup),
             Some(ActivatedCommand::SetClip(on)) => {
@@ -35565,8 +35917,9 @@ mod tests {
         // Identity curves: an exact match.
         ("layers/curves.psd", 0.0, None),
         ("layers/curves-with-vectormask.psd", 0.0, None),
-        // 15 other adjustment kinds left out.
-        ("fill_adjustments.psd", 240.0, Some("15 adjustment layers")),
+        // 14 other adjustment kinds left out (15 before 0.202.0 imported
+        // its Levels layer).
+        ("fill_adjustments.psd", 240.0, Some("14 adjustment layers")),
         // A clipped layer whose base is not a pixel layer shown unclipped
         // (0.201.0: the other clipped layers are clipped for real).
         (
@@ -35594,7 +35947,8 @@ mod tests {
             113.0,
             None,
         ),
-        // A Levels layer left out.
+        // A Hue/Saturation layer left out (its Levels layer is imported since
+        // 0.202.0; the maximum is Hue/Saturation's, unchanged at 84).
         (
             "adjustments/adjustment_nested_composition_5.psd",
             84.0,
@@ -35880,6 +36234,46 @@ mod tests {
             assert!(max <= max_want, "channel {c}: {diff:?}");
             assert!(*mean <= mean_want + 1e-3, "channel {c}: {diff:?}");
         }
+    }
+
+    /// 0.202.0: `adjustments/levels_rgb.psd` — four masked Levels layers
+    /// (master and per-channel records) in a Pass Through group, over
+    /// pixels — against Photoshop's own merged image.
+    #[test]
+    fn levels_rgb_psd_composites_like_photoshops_merged_image() {
+        let Some(diff) = curves_corpus_diff("adjustments/levels_rgb.psd") else {
+            return;
+        };
+        println!("levels_rgb.psd: {diff:?}");
+        assert_eq!(diff.curves, 4, "every Levels layer is imported: {diff:?}");
+        assert!(
+            !diff
+                .report
+                .iter()
+                .any(|item| item.contains("adjustment layer") || item.contains("Levels")),
+            "{:?}",
+            diff.report
+        );
+        // Measured on 0.202.0 (the CPU compositor is deterministic), 8-bit
+        // levels over all 40,000 pixels: per-channel max and mean, and the
+        // solid-mask channel samples (of 120,000) more than one / two
+        // levels off. Pinned as a regression guard with a little slack on
+        // the means; the maximum of 6 (blue) is not explained further.
+        let want_max = [2.0, 2.0, 6.0];
+        let want_mean = [0.2661, 0.24745, 0.42935];
+        for c in 0..3 {
+            let (Some(max), Some(mean), Some(max_want), Some(mean_want)) = (
+                diff.max.get(c),
+                diff.mean.get(c),
+                want_max.get(c),
+                want_mean.get(c),
+            ) else {
+                unreachable!("three channels");
+            };
+            assert!(max <= max_want, "channel {c}: {diff:?}");
+            assert!(*mean <= mean_want + 1e-3, "channel {c}: {diff:?}");
+        }
+        assert!(diff.over_one <= 1818 && diff.over_two <= 826, "{diff:?}");
     }
 
     /// AC-4: the other corpus files carrying `curv`, each against its own
@@ -38743,8 +39137,8 @@ mod tests {
         // Panel Layout" and the three "Move Layers Panel ..." commands,
         // and (0.167.0) "Float Layers Panel" and "Dock Layers Panel" --
         // the first inserted (`palette_commands`'s own order) is what ends
-        // up selected.
-        assert_eq!(state.results().len(), 12);
+        // up selected. (0.202.0) "New Levels Layer" matches too.
+        assert_eq!(state.results().len(), 13);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -72294,6 +72688,50 @@ mod tests {
                     Some(ActivatedCommand::NewCurvesLayer)
                 );
             }
+
+            #[test]
+            fn new_levels_layer_is_in_the_palette_activates_and_is_one_undo_step() {
+                assert!(
+                    palette_commands()
+                        .iter()
+                        .any(|entry| entry.id == crate::COMMAND_LAYER_NEW_LEVELS
+                            && entry.title == "New Levels Layer")
+                );
+                let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+                let mut focus = FocusManager::default();
+                let mut dialog = FakeFileDialog::default();
+                assert_eq!(
+                    activate_command(
+                        &mut workspace,
+                        &mut focus,
+                        crate::COMMAND_LAYER_NEW_LEVELS,
+                        &mut dialog
+                    ),
+                    Some(ActivatedCommand::NewLevelsLayer)
+                );
+                let (mut rig, [top, mid, bottom]) = Rig::three();
+                let before = rig.layers.roots().to_vec();
+                assert!(rig.run(LayerCommand::NewLevels));
+                let added = only_new_root(&rig, &before);
+                assert_eq!(
+                    rig.layers.kind(added),
+                    Some(&LayerKind::Adjustment(Adjustment::Levels(
+                        aurora_core::LevelsParams::identity()
+                    )))
+                );
+                assert_eq!(rig.layers.name(added), Some("Levels 1"));
+                assert_eq!(rig.active, Some(added));
+                assert!(rig.run(LayerCommand::NewLevels));
+                assert_eq!(
+                    rig.active.and_then(|id| rig.layers.name(id)),
+                    Some("Levels 2")
+                );
+                assert!(rig.undo_redo(AppCommand::Undo));
+                assert!(rig.undo_redo(AppCommand::Undo));
+                assert_eq!(rig.layers.roots(), before.as_slice());
+                assert_eq!(rig.layers.roots(), [top, mid, bottom].as_slice());
+                rig.assert_coherent();
+            }
         }
     }
 
@@ -76488,6 +76926,148 @@ mod tests {
             }
         }
 
+        impl Rig {
+            /// A Levels layer on top of the backdrop, made active.
+            fn levels() -> (Self, LayerId) {
+                let (mut rig, curves) = Self::backdrop();
+                let levels = match rig.layers.add_adjustment_layer_at(
+                    "Levels 1",
+                    aurora_doc::Adjustment::Levels(aurora_core::LevelsParams::identity()),
+                    None,
+                    0,
+                ) {
+                    Ok(id) => id,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                assert!(rig.layers.contains(curves));
+                rig.active = Some(levels);
+                rig.sync();
+                (rig, levels)
+            }
+
+            fn levels_controls(&self) -> aurora_ui::LevelsControls {
+                match self.controls.curves.levels {
+                    Some(levels) => levels,
+                    None => unreachable!("the strip builds the Levels editor"),
+                }
+            }
+
+            fn levels_params(&self, id: LayerId) -> aurora_core::LevelsParams {
+                match aurora_ui::levels_params(&self.layers, id) {
+                    Some(params) => *params,
+                    None => unreachable!("{id:?} is a Levels layer"),
+                }
+            }
+
+            /// A window point `fraction` of the way along `slider`'s track.
+            fn along(&self, slider: aurora_ui::LevelsSlider, fraction: f32) -> (f32, f32) {
+                let Some(&id) = self.levels_controls().sliders.get(slider.index()) else {
+                    unreachable!("five sliders");
+                };
+                let Some(b) = self.workspace.tree.bounds(id) else {
+                    unreachable!("the slider is laid out");
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let point = (
+                    b.x as f32 + fraction * b.width as f32,
+                    b.y as f32 + b.height as f32 / 2.0,
+                );
+                point
+            }
+
+            /// `App::apply_curves_control` for a slider key/AT value.
+            fn set_slider(&mut self, slider: aurora_ui::LevelsSlider, value: f64) {
+                let Some(&id) = self.levels_controls().sliders.get(slider.index()) else {
+                    unreachable!("five sliders");
+                };
+                self.apply(&PointerOutcome::Action(
+                    aurora_widgets::ActionOutcome::ValueChanged { id, value },
+                ));
+                self.sync();
+            }
+        }
+
+        /// 0.202.0: the Levels editor shows only for a Levels layer (the
+        /// Curves editor hides), a slider drag is **one** undo step, undo
+        /// and redo move the sliders, and a channel tab edits only its
+        /// own record.
+        #[test]
+        #[allow(clippy::indexing_slicing)]
+        fn a_levels_slider_drag_is_one_undo_step_and_undo_moves_the_slider() {
+            use aurora_ui::LevelsSlider;
+            let (mut rig, id) = Rig::levels();
+            assert!(aurora_ui::levels_controls_shown(
+                &rig.workspace.tree,
+                rig.levels_controls()
+            ));
+            assert!(!rig.shown(), "the Curves editor is hidden");
+            let before = rig.undo_order.undo.len();
+            let down = rig.along(LevelsSlider::InputBlack, 0.1);
+            rig.pointer(PointerPhase::Down, down);
+            for f in [0.15, 0.2, 0.25] {
+                let at = rig.along(LevelsSlider::InputBlack, f);
+                rig.pointer(PointerPhase::Move, at);
+            }
+            let up = rig.along(LevelsSlider::InputBlack, 0.25);
+            rig.pointer(PointerPhase::Up, up);
+            let black = rig.levels_params(id).master.input_black();
+            assert!(black > 0.05 && black < 0.45, "dragged to {black}");
+            assert_eq!(
+                rig.undo_order.undo.len(),
+                before + 1,
+                "the whole drag is one undo step"
+            );
+            // The composite follows (the master clips the dark end).
+            assert!(rig.first()[0] < BACKDROP[0] + TOLERANCE);
+            rig.undo();
+            assert_eq!(rig.levels_params(id), aurora_core::LevelsParams::identity());
+            let slider = rig.levels_controls().sliders[LevelsSlider::InputBlack.index()];
+            assert!(matches!(
+                rig.workspace.tree.payload(slider),
+                Some(aurora_widgets::widgets::WidgetKind::Slider(state)) if state.value == 0.0
+            ));
+            rig.redo();
+            assert_eq!(rig.levels_params(id).master.input_black(), black);
+        }
+
+        #[test]
+        fn a_channel_tab_edits_only_its_own_levels_record_one_step_per_key() {
+            use aurora_ui::LevelsSlider;
+            let (mut rig, id) = Rig::levels();
+            let levels = rig.levels_controls();
+            let Some(tab) = rig
+                .workspace
+                .tree
+                .children(levels.channel)
+                .and_then(|tabs| tabs.get(CurvesChannel::Green.index()).copied())
+            else {
+                unreachable!("four tabs");
+            };
+            let at = rig.centre(tab);
+            rig.pointer(PointerPhase::Down, at);
+            rig.pointer(PointerPhase::Up, at);
+            let before = rig.undo_order.undo.len();
+            rig.set_slider(LevelsSlider::Gamma, 2.0);
+            rig.set_slider(LevelsSlider::OutputWhite, 128.0);
+            let params = rig.levels_params(id);
+            assert_eq!(params.green.gamma(), 2.0);
+            assert_eq!(params.green.output_white(), 128.0 / 255.0);
+            assert!(params.master.is_identity() && params.red.is_identity());
+            assert!(params.blue.is_identity());
+            assert_eq!(rig.undo_order.undo.len(), before + 2);
+            // A no-op value records nothing; a hostile one is refused.
+            rig.set_slider(LevelsSlider::Gamma, 2.0);
+            rig.set_slider(LevelsSlider::Gamma, f64::NAN);
+            assert_eq!(rig.undo_order.undo.len(), before + 2);
+            // Black cannot cross white: the record stays valid.
+            rig.set_slider(LevelsSlider::InputBlack, 255.0);
+            let green = rig.levels_params(id).green;
+            assert!(green.input_black() < green.input_white());
+            // Only green's gamma brightened the composite's green.
+            let got = rig.first();
+            assert!((got[0] - BACKDROP[0]).abs() <= TOLERANCE, "{got:?}");
+        }
+
         fn close(got: f32, want: f32, what: &str) {
             assert!(
                 (got - want).abs() <= TOLERANCE,
@@ -77049,6 +77629,212 @@ mod tests {
         }
     }
     // -- Curves adjustment layers in the compositor (0.155.0) -------------
+    /// 0.202.0: the Levels adjustment through the CPU fold, against
+    /// hand-computed references (the formulas are in
+    /// `aurora_core::levels`).
+    #[allow(clippy::float_cmp)]
+    mod levels_adjustment {
+        use super::*;
+        use aurora_doc::BlendMode;
+
+        const TILE: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
+        const TOLERANCE: f32 = 3e-3;
+        const BACKDROP: [f32; 4] = [0.2, 0.4, 0.6, 1.0];
+
+        fn record(ib: u8, iw: u8, gamma: f32, ob: u8, ow: u8) -> aurora_core::LevelsChannel {
+            match aurora_core::LevelsChannel::new(
+                f32::from(ib) / 255.0,
+                f32::from(iw) / 255.0,
+                gamma,
+                f32::from(ob) / 255.0,
+                f32::from(ow) / 255.0,
+            ) {
+                Ok(record) => record,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        /// Master: input 0.2..0.8, so 0.2 -> 0, 0.4 -> 1/3, 0.6 -> 2/3.
+        fn stretch() -> aurora_core::LevelsParams {
+            aurora_core::LevelsParams {
+                master: record(51, 204, 1.0, 0, 255),
+                ..aurora_core::LevelsParams::identity()
+            }
+        }
+
+        fn add_levels(
+            layers: &mut aurora_doc::LayerTree,
+            params: aurora_core::LevelsParams,
+        ) -> aurora_doc::LayerId {
+            match layers.add_adjustment_layer_at(
+                "Levels 1",
+                aurora_doc::Adjustment::Levels(params),
+                None,
+                0,
+            ) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn composite(
+            layers: &aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+        ) -> Vec<[f32; 4]> {
+            let mut budget = crate::CompositeBudget::for_pass(layers);
+            let (texels, _) =
+                crate::composite_roots_into_tile(layers, store, TILE, (0, 0), (0, 0), &mut budget);
+            texels
+                .chunks_exact(4)
+                .filter_map(|texel| match *texel {
+                    [r, g, b, a] => Some([r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()]),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn first(layers: &aurora_doc::LayerTree, store: &mut aurora_tile::TileStore) -> [f32; 4] {
+            composite(layers, store)
+                .first()
+                .copied()
+                .unwrap_or([f32::NAN; 4])
+        }
+
+        fn assert_close(got: [f32; 4], want: [f32; 4], what: &str) {
+            for (g, w) in got.iter().zip(want) {
+                assert!(
+                    (g - w).abs() <= TOLERANCE,
+                    "{what}: got {got:?}, want {want:?}"
+                );
+            }
+        }
+
+        fn stack(store: &mut aurora_tile::TileStore) -> aurora_doc::LayerTree {
+            solid_root_stack(store, &[("bottom", BlendMode::Normal, 1.0, BACKDROP)])
+        }
+
+        #[test]
+        fn an_identity_levels_layer_is_an_exact_passthrough() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[
+                    ("bottom", BlendMode::Normal, 1.0, BACKDROP),
+                    ("top", BlendMode::Multiply, 0.5, [0.9, 0.3, 0.7, 0.6]),
+                ],
+            );
+            let without = composite(&layers, &mut store);
+            let _ = add_levels(&mut layers, aurora_core::LevelsParams::identity());
+            let with = composite(&layers, &mut store);
+            let bits = |v: &[[f32; 4]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&with), bits(&without));
+        }
+
+        #[test]
+        fn a_levels_layer_stretches_the_composite_below_and_keeps_alpha() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = stack(&mut store);
+            let _ = add_levels(&mut layers, stretch());
+            let got = first(&layers, &mut store);
+            assert_close(got, [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0], "stretch");
+            assert_eq!(got[3], 1.0);
+        }
+
+        #[test]
+        fn levels_opacity_blend_mode_and_mask_apply_like_curves() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = stack(&mut store);
+            let id = add_levels(&mut layers, stretch());
+            if let Err(err) = layers.set_opacity(id, 0.25) {
+                unreachable!("{err:?}");
+            }
+            // lerp(Cb, f(Cb), 0.25)
+            assert_close(
+                first(&layers, &mut store),
+                [0.15, 0.383_333, 0.616_667, 1.0],
+                "25%",
+            );
+            if let Err(err) = layers.set_opacity(id, 1.0) {
+                unreachable!("{err:?}");
+            }
+            if let Err(err) = layers.set_blend_mode(id, BlendMode::Multiply) {
+                unreachable!("{err:?}");
+            }
+            // Cb * f(Cb)
+            assert_close(
+                first(&layers, &mut store),
+                [0.0, 0.4 / 3.0, 0.4, 1.0],
+                "Multiply",
+            );
+            if let Err(err) = layers.set_blend_mode(id, BlendMode::Normal) {
+                unreachable!("{err:?}");
+            }
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            };
+            if let Err(err) = layers.add_mask(id, bounds) {
+                unreachable!("{err:?}");
+            }
+            let Some(mask_surface) = layers.mask_surface_id(id) else {
+                unreachable!("an adjustment layer can carry a mask");
+            };
+            for (column, coverage) in [(0, 1.0), (1, 0.0), (2, 0.5)] {
+                if let Err(err) = aurora_doc::write_mask_coverage(
+                    &mut store,
+                    mask_surface,
+                    TILE,
+                    column,
+                    0,
+                    coverage,
+                ) {
+                    unreachable!("{err:?}");
+                }
+            }
+            let texels = composite(&layers, &mut store);
+            let at = |i: usize| texels.get(i).copied().unwrap_or([f32::NAN; 4]);
+            assert_close(at(0), [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0], "full coverage");
+            assert_close(at(1), BACKDROP, "zero coverage");
+            assert_close(at(2), [0.1, 0.366_667, 0.633_333, 1.0], "half coverage");
+        }
+
+        /// Per-channel record first, then the master: the red record
+        /// (input white 0.4) takes 0.2 to 0.5, then the master's gamma 2
+        /// takes 0.5 to 0.5^(1/2). The other order would clip red to 1.
+        #[test]
+        fn the_channel_record_applies_before_the_master() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = stack(&mut store);
+            let params = aurora_core::LevelsParams {
+                master: record(0, 255, 2.0, 0, 255),
+                red: record(0, 102, 1.0, 0, 255),
+                ..aurora_core::LevelsParams::identity()
+            };
+            let _ = add_levels(&mut layers, params);
+            let got = first(&layers, &mut store);
+            assert_close(
+                got,
+                [0.5_f32.sqrt(), 0.4_f32.sqrt(), 0.6_f32.sqrt(), 1.0],
+                "red then master",
+            );
+        }
+
+        #[test]
+        fn a_visible_levels_layer_refuses_the_gpu_path_and_a_hidden_one_does_not() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = stack(&mut store);
+            assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+            let id = add_levels(&mut layers, stretch());
+            assert!(!crate::document_qualifies_for_gpu_compositing(&layers));
+            if let Err(err) = layers.set_visible(id, false) {
+                unreachable!("{err:?}");
+            }
+            assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+        }
+    }
+
     #[allow(clippy::float_cmp)]
     mod curves_adjustment {
         use super::*;

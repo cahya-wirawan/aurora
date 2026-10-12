@@ -45,6 +45,7 @@ pub mod layer_controls;
 pub mod layer_filter;
 pub mod layer_toolbar;
 pub mod layers_panel;
+pub mod levels_controls;
 pub mod panel;
 pub mod panel_group;
 pub mod panel_strip;
@@ -92,6 +93,11 @@ pub use layer_toolbar::{
     DELETE_UNAVAILABLE, LAYER_TOOLBAR_ICON_SIZE, LAYER_TOOLBAR_LABEL, LayerAction, LayerToolbar,
     insert_layer_toolbar, is_layer_toolbar_button, layer_toolbar_contains, layer_toolbar_height,
     set_layer_toolbar_hover, sync_layer_toolbar,
+};
+pub use levels_controls::{
+    LevelsControls, LevelsSlider, channel_levels, insert_levels_controls, levels_controls_contains,
+    levels_controls_shown, levels_params, levels_selected_channel, select_levels_channel,
+    sync_levels_controls, with_channel_levels,
 };
 #[cfg(test)]
 mod layer_filter_tests;

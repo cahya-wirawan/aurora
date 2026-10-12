@@ -287,13 +287,15 @@ pub struct PsdLayer {
     pending: Option<PendingPixels>,
 }
 
-/// One imported Curves adjustment layer (`curv`, 0.158.0).
+/// One imported adjustment layer: Curves (`curv`, 0.158.0) or Levels
+/// (`levl`, 0.202.0).
 #[derive(Debug)]
 pub struct PsdAdjustment {
     pub props: PsdProps,
-    /// The file's curves: channel `0` is the composite, `1..=3` red,
-    /// green and blue; levels divided by 255.
-    pub curves: aurora_core::CurvesParams,
+    /// The file's settings. For Curves, channel `0` is the composite,
+    /// `1..=3` red, green and blue, levels divided by 255; for Levels,
+    /// record `0` is the master and `1..=3` red, green and blue.
+    pub adjustment: aurora_doc::Adjustment,
     /// The layer's user mask, applied as for any layer.
     pub mask: Option<PsdMask>,
 }
@@ -425,6 +427,8 @@ enum Note {
     CurvesUnreadable,
     CurvesTooManyPoints,
     CurvesGrayscale,
+    LevelsUnreadable,
+    LevelsGrayscale,
     FillSkipped,
     TextRasterised,
     SmartObjectRasterised,
@@ -507,8 +511,8 @@ fn note_text(note: Note, n: u64) -> String {
     let is = if one { "is" } else { "are" };
     match note {
         Note::AdjustmentSkipped => format!(
-            "{n} adjustment layer{s} (Levels, Hue/Saturation and similar) {was} left out — \
-             Aurora shows only Curves adjustment layers so far."
+            "{n} adjustment layer{s} (Hue/Saturation and similar) {was} left out — \
+             Aurora shows only Curves and Levels adjustment layers so far."
         ),
         Note::CurvesUnreadable => format!(
             "{n} Curves layer{s} {was} left out — {} settings could not be read.",
@@ -523,6 +527,15 @@ fn note_text(note: Note, n: u64) -> String {
         Note::CurvesGrayscale => format!(
             "{n} Curves layer{s} in this Grayscale file {was} left out — Aurora hasn't yet \
              verified how Photoshop applies Curves to a Grayscale image."
+        ),
+        Note::LevelsUnreadable => format!(
+            "{n} Levels layer{s} {was} left out — {} settings could not be read or fall \
+             outside the ranges Photoshop's Levels allows.",
+            if one { "its" } else { "their" },
+        ),
+        Note::LevelsGrayscale => format!(
+            "{n} Levels layer{s} in this Grayscale file {was} left out — Aurora hasn't yet \
+             verified how Photoshop applies Levels to a Grayscale image."
         ),
         Note::FillSkipped => format!(
             "{n} shape or fill layer{s} (solid colour, gradient or pattern) with no stored \
@@ -1340,6 +1353,8 @@ struct Record {
     vector: Option<Vec<u8>>,
     /// The last `curv` block, parsed (0.158.0).
     curves: Option<Result<CurvBlock, CurvRefusal>>,
+    /// The last `levl` block, parsed (0.202.0).
+    levels: Option<Result<LevlBlock, ()>>,
     /// The effects blocks to read (0.180.0), as `(priority, bytes)`:
     /// `lmfx` (0), `lfx2` (1), `lfxs` (2). Tried in that order; the first
     /// that reads wins, so a damaged `lmfx` falls back to `lfx2`.
@@ -1480,6 +1495,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let mut protected = None;
     let mut vector = None;
     let mut curves = None;
+    let mut levels = None;
     let mut effects_blocks: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut smart_blocks: Vec<aurora_doc::SmartObjectBlock> = Vec::new();
     let mut smart_filters = false;
@@ -1537,6 +1553,8 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
             // Before the generic arm: Curves is imported (0.158.0), so it
             // does not mark the record as an other-kind adjustment.
             b"curv" => curves = Some(parse_curv(data)),
+            // Likewise Levels (0.202.0).
+            b"levl" => levels = Some(parse_levl(data)),
             k if ADJUSTMENT_KEYS.contains(&k) => features.adjustment = true,
             _ => {}
         }
@@ -1559,6 +1577,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
         features,
         vector,
         curves,
+        levels,
         effects_blocks,
         effects: None,
         smart_blocks,
@@ -1760,6 +1779,82 @@ fn curves_params(block: &CurvBlock, gray: bool) -> Result<aurora_core::CurvesPar
         }
     }
     Ok(params)
+}
+
+// ---------------------------------------------------------------------
+// Levels (`levl`, 0.202.0)
+// ---------------------------------------------------------------------
+
+/// How many level records a `levl` block holds before its optional
+/// `Lvls` extension: the master and the colour channels, then padding
+/// records (Photoshop's fixed 29).
+const LEVL_RECORDS: usize = 29;
+
+/// One stored level record, as the file holds it: `(input floor, input
+/// ceiling, output floor, output ceiling, gamma * 100)`, all `u16`.
+type LevlRecord = (u16, u16, u16, u16, u16);
+
+/// A parsed `levl` block: the first four records (master, red, green,
+/// blue). The 25 further records and the `Lvls` extension (more records,
+/// for other channel layouts) are not read: they apply to no RGB channel
+/// (psd-tools' `_apply_luts` ignores them in RGB).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LevlBlock {
+    records: [LevlRecord; 4],
+}
+
+/// Parses a `levl` block the way psd-tools 1.17.4 does (`Levels.read`): a
+/// `u16` version that must be `2`, then 29 records of five `u16`. Short
+/// data or another version is unreadable; the extension after the 29th
+/// record is ignored (a damaged one never refuses the layer, since it
+/// holds no RGB channel). Never panics, allocates nothing.
+fn parse_levl(data: &[u8]) -> Result<LevlBlock, ()> {
+    let mut r = Reader::new(data);
+    if r.u16("levels version").map_err(|_| ())? != 2 {
+        return Err(());
+    }
+    if r.remaining() < LEVL_RECORDS * 10 {
+        return Err(());
+    }
+    let mut records = [(0, 0, 0, 0, 0); 4];
+    for slot in &mut records {
+        let mut field = || r.u16("levels record").map_err(|_| ());
+        *slot = (field()?, field()?, field()?, field()?, field()?);
+    }
+    Ok(LevlBlock { records })
+}
+
+/// A parsed block as Aurora's [`aurora_core::LevelsParams`]: record `0`
+/// the master, `1..=3` red, green, blue; `u16` levels divided by `255`,
+/// gamma by `100`. Any record outside [`aurora_core::LevelsChannel::new`]'s
+/// rules (an equal or reversed input range, a gamma outside 0.10..9.99, a
+/// level above 255) is unreadable: the layer is left out and reported
+/// rather than imported with a repaired value. A Grayscale file's Levels
+/// are not imported, as for Curves ([`curves_params`]).
+fn levels_params(block: &LevlBlock, gray: bool) -> Result<aurora_core::LevelsParams, Note> {
+    if gray {
+        return Err(Note::LevelsGrayscale);
+    }
+    let channel = |&(ib, iw, ob, ow, gamma): &LevlRecord| {
+        if ib > 255 || iw > 255 || ob > 255 || ow > 255 {
+            return Err(Note::LevelsUnreadable);
+        }
+        aurora_core::LevelsChannel::new(
+            f32::from(ib) / 255.0,
+            f32::from(iw) / 255.0,
+            f32::from(gamma) / 100.0,
+            f32::from(ob) / 255.0,
+            f32::from(ow) / 255.0,
+        )
+        .map_err(|_| Note::LevelsUnreadable)
+    };
+    let [master, red, green, blue] = &block.records;
+    Ok(aurora_core::LevelsParams {
+        master: channel(master)?,
+        red: channel(red)?,
+        green: channel(green)?,
+        blue: channel(blue)?,
+    })
 }
 
 /// Whether a record's blending ranges ("Blend If") differ from the
@@ -3162,11 +3257,33 @@ fn layer_node(
         note_unsupported_kept(record, &outcome, notes, false, false);
         return Some(PsdNode::Adjustment(PsdAdjustment {
             props,
-            curves,
+            adjustment: aurora_doc::Adjustment::Curves(curves),
             mask: outcome.mask,
         }));
     }
-    if record.features.adjustment || record.curves.is_some() {
+    if let (Some(levels), false) = (&record.levels, record.features.adjustment) {
+        let params = match levels {
+            Ok(block) => levels_params(block, header.gray()),
+            Err(()) => Err(Note::LevelsUnreadable),
+        };
+        let levels = match params {
+            Ok(levels) => levels,
+            Err(note) => {
+                notes.add(note);
+                return None;
+            }
+        };
+        let mut props = props_for(record, notes);
+        props.effects = None;
+        let outcome = masks_for(src, record, header, canvas_of(header), notes, vector_budget);
+        note_unsupported_kept(record, &outcome, notes, false, false);
+        return Some(PsdNode::Adjustment(PsdAdjustment {
+            props,
+            adjustment: aurora_doc::Adjustment::Levels(levels),
+            mask: outcome.mask,
+        }));
+    }
+    if record.features.adjustment || record.curves.is_some() || record.levels.is_some() {
         notes.add(Note::AdjustmentSkipped);
         return None;
     }
@@ -4210,7 +4327,7 @@ impl Builder<'_, '_, '_> {
                     let id = self.history.add_adjustment_layer_at(
                         self.layers,
                         adjustment.props.name.clone(),
-                        aurora_doc::Adjustment::Curves(adjustment.curves),
+                        adjustment.adjustment,
                         parent,
                         0,
                     )?;

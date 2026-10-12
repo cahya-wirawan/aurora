@@ -36,6 +36,7 @@ use taffy::style_helpers::{TaffyZero as _, length};
 use taffy::{Display, FlexDirection, Rect as LayoutRect, Size, Style};
 
 use crate::curves_controls::{CurvesControls, insert_curves_controls};
+use crate::levels_controls::insert_levels_controls;
 use crate::panel::{PanelHandle, panel_is_collapsed};
 use crate::tool::Tool;
 
@@ -295,7 +296,9 @@ fn build(
     )?;
     set_options_item(tree, scales, readout, OptionsItem::Readout, true)?;
     set_options_item(tree, scales, radius, OptionsItem::Slider, false)?;
-    let curves = insert_curves_controls(tree, root, scales)?;
+    let mut curves = insert_curves_controls(tree, root, scales)?;
+    // The Levels editor (0.202.0) sits beside it; one handle reaches both.
+    curves.levels = Some(insert_levels_controls(tree, root, scales)?);
     let controls = ToolControls {
         root,
         options,
