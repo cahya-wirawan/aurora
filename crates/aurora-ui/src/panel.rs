@@ -288,6 +288,11 @@ pub fn set_panel_sizing(
                 .map(|style| style.max_size.height)
         })
         .flatten();
+    // A body floor ([`set_panel_body_floor`]) survives every re-sizing,
+    // docked or floating.
+    let kept_floor = tree
+        .style(panel.viewport)
+        .map(|style| style.min_size.height);
     let mut style = Style {
         display,
         ..viewport_style(sizing, scales)
@@ -295,8 +300,42 @@ pub fn set_panel_sizing(
     if let Some(cap) = kept_cap {
         style.max_size.height = cap;
     }
+    if let Some(floor) = kept_floor
+        && !floor.is_auto()
+        && floor.value() > style.min_size.height.value()
+    {
+        style.min_size.height = floor;
+    }
     tree.set_style(panel.viewport, style)?;
     Ok(())
+}
+
+/// Gives `panel`'s body a floor of `rows` rows of `row_height` (0.199.0):
+/// its viewport's minimum height, which the panel's own floor
+/// (the panel's own floor) and, in a tab group, the group's floor then sum. A shrinking rail
+/// takes the height from the *other* panels first (the Layers list) until
+/// this floor is reached. At least one row, so every expanded panel keeps
+/// its body row. A re-sizing keeps it ([`set_panel_sizing`]).
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `panel.viewport` doesn't
+/// exist.
+pub fn set_panel_body_floor(
+    tree: &mut WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+    rows: u32,
+    scales: &Scales,
+) -> Result<(), WidgetError> {
+    let mut style = tree
+        .style(panel.viewport)
+        .cloned()
+        .ok_or(WidgetError::UnknownWidget(panel.viewport))?;
+    #[allow(clippy::cast_precision_loss)]
+    let floor = rows.max(1) as f32 * row_height(scales);
+    style.min_size.height = length(floor);
+    tree.set_style(panel.viewport, style)?;
+    refresh_panel_floor(tree, panel)
 }
 
 /// Sets the height a [`PanelSizing::Content`] panel's viewport stops growing

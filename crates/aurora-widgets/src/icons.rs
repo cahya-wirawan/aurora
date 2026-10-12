@@ -87,11 +87,15 @@ pub enum IconKind {
     Brush,
     /// Four arrows: lock position (0.198.0).
     Move,
+    /// A magnifying glass: search (0.199.0).
+    Search,
+    /// A picture frame with a hill and a sun: a pixel layer (0.199.0).
+    Image,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 17] = [
+    pub const ALL: [IconKind; 19] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -109,6 +113,8 @@ impl IconKind {
         IconKind::TransparentPixels,
         IconKind::Brush,
         IconKind::Move,
+        IconKind::Search,
+        IconKind::Image,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -133,6 +139,8 @@ impl IconKind {
             IconKind::TransparentPixels => "Transparent Pixels",
             IconKind::Brush => "Brush",
             IconKind::Move => "Move",
+            IconKind::Search => "Search",
+            IconKind::Image => "Image",
         }
     }
 }
@@ -459,6 +467,22 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
             stroke_part().m(4.0, 6.0).l(2.0, 8.0).l(4.0, 10.0),
             stroke_part().m(12.0, 6.0).l(14.0, 8.0).l(12.0, 10.0),
         ],
+        IconKind::Search => vec![
+            // The lens, then the handle running to the lower right.
+            circle(PartStyle::Stroke, 6.0, 6.0, 4.0),
+            stroke_part().m(9.0, 9.0).l(13.0, 13.0),
+        ],
+        IconKind::Image => vec![
+            // The frame, a sun filled in its upper right and a hill line.
+            rounded_box(2.0, 3.0, 12.0, 10.0, 1.0),
+            circle(PartStyle::Fill, 10.0, 6.0, 1.0),
+            stroke_part()
+                .m(2.0, 11.0)
+                .l(6.0, 7.0)
+                .l(9.0, 10.0)
+                .l(11.0, 8.0)
+                .l(14.0, 11.0),
+        ],
     }
 }
 
@@ -557,7 +581,7 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 17);
+        assert_eq!(IconKind::ALL.len(), 19);
         for (i, a) in IconKind::ALL.iter().enumerate() {
             assert!(!a.name().is_empty());
             for b in IconKind::ALL.iter().skip(i + 1) {

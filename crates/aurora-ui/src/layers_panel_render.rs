@@ -203,6 +203,46 @@ fn render_workspace(
     (bytes, width, height)
 }
 
+/// Lays out `ws`, renders it at `scale` and writes the Layers panel's crop
+/// to `name`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn write_panel_png(
+    context: &aurora_gpu::GpuContext,
+    ws: &mut crate::Workspace,
+    scale: f32,
+    name: &std::path::Path,
+) {
+    let logical = (1280.0_f32, 800.0_f32);
+    ws.tree.compute_layout(logical.0, logical.1);
+    let (bytes, width, _height) = render_workspace(context, ws, scale, logical);
+    let Some(panel) = ws.tree.bounds(ws.layers.root) else {
+        unreachable!("laid out");
+    };
+    let (x0, y0) = (
+        (panel.x as f32 * scale) as u32,
+        (panel.y as f32 * scale) as u32,
+    );
+    let (w, h) = (
+        (panel.width as f32 * scale) as u32,
+        (panel.height as f32 * scale) as u32,
+    );
+    let mut crop = Vec::with_capacity((w * h * 4) as usize);
+    for y in y0..y0 + h {
+        let from = ((y * width + x0) * 4) as usize;
+        if let Some(row) = bytes.get(from..from + (w * 4) as usize) {
+            crop.extend_from_slice(row);
+        }
+    }
+    assert!(crop.iter().any(|&b| b != 0), "something was drawn");
+    let file = ok(std::fs::File::create(name));
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = ok(encoder.write_header());
+    ok(writer.write_image_data(&crop));
+    println!("wrote {}", name.display());
+}
+
 #[test]
 #[ignore = "writes a PNG for human review"]
 #[allow(
@@ -371,35 +411,41 @@ fn write_layers_panel_png() {
         (2.0_f32, review_png("layers-panel.png")),
         (1.0, review_png("layers-panel-1x.png")),
     ] {
-        let logical = (1280.0_f32, 800.0_f32);
-        ws.tree.compute_layout(logical.0, logical.1);
-        let (bytes, width, _height) = render_workspace(&context, &ws, scale, logical);
-        let Some(panel) = ws.tree.bounds(ws.layers.root) else {
-            unreachable!("laid out");
-        };
-        let (x0, y0) = (
-            (panel.x as f32 * scale) as u32,
-            (panel.y as f32 * scale) as u32,
-        );
-        let (w, h) = (
-            (panel.width as f32 * scale) as u32,
-            (panel.height as f32 * scale) as u32,
-        );
-        let mut crop = Vec::with_capacity((w * h * 4) as usize);
-        for y in y0..y0 + h {
-            let from = ((y * width + x0) * 4) as usize;
-            if let Some(row) = bytes.get(from..from + (w * 4) as usize) {
-                crop.extend_from_slice(row);
-            }
-        }
-        assert!(crop.iter().any(|&b| b != 0), "something was drawn");
-        let file = ok(std::fs::File::create(&name));
-        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = ok(encoder.write_header());
-        ok(writer.write_image_data(&crop));
-        println!("wrote {}", name.display());
+        write_panel_png(&context, &mut ws, scale, &name);
     }
+    // The filter (0.199.0): "lo" with the pixel-layer kind not toggled; the
+    // active layer ("Vector Smart Object") is hidden by it, so no row is
+    // highlighted while the controls still show it.
+    ws.layer_view.filter = crate::LayerFilter {
+        text: "lo".to_owned(),
+        ..crate::LayerFilter::default()
+    };
+    let shown_rows = ok(crate::populate_layers_panel_view(
+        &mut ws.tree,
+        ws.layers,
+        &scales,
+        &layers,
+        &mut ws.layer_view,
+    ));
+    ok(crate::write_layer_filter(
+        &mut ws.tree,
+        &controls.filter,
+        &ws.layer_view.filter,
+    ));
+    let (shown, total) = ws.layer_view.counts();
+    ok(crate::set_layer_filter_summary(
+        &mut ws.tree,
+        &controls.filter,
+        shown,
+        total,
+        true,
+    ));
+    assert_eq!(shown_rows.len(), shown);
+    write_panel_png(
+        &context,
+        &mut ws,
+        2.0,
+        &review_png("layers-panel-filtered.png"),
+    );
     let _: Option<&WidgetKind> = None;
 }

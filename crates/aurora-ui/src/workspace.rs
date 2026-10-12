@@ -102,6 +102,8 @@ pub struct Workspace {
     /// The Layers panel's bottom toolbar (0.196.0) — the last child of
     /// the Layers panel's root, below the list.
     pub layer_toolbar: LayerToolbar,
+    /// The Layers panel's filter and collapse memory (0.199.0).
+    pub layer_view: crate::layers_panel::LayersView,
     /// The column holding [`Self::options_bar`] above
     /// [`Self::canvas_area`] (0.160.0); it is what grows and shrinks with
     /// the window.
@@ -527,6 +529,14 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
     // `Fill` rule and absorbs what they leave. Equal thirds squeezed the
     // Properties panel's Curves editor to nothing (`PanelSizing`).
     size_docked_panels(&mut tree, layers, properties, scales);
+    // 0.199.0: the Layers panel grew (its filter row), so History's list
+    // gets a floor of `history_floor_rows` rows: a short rail now shrinks
+    // the Layers list first instead of squeezing History to a few rows.
+    if let Err(err) =
+        crate::panel::set_panel_body_floor(&mut tree, history, history_floor_rows(scales), scales)
+    {
+        unreachable!("the panel was just inserted into this same tree: {err:?}");
+    }
     if let Err(err) = sync_panel_group(&mut tree, &panel_group) {
         unreachable!("the group was just inserted into this same tree: {err:?}");
     }
@@ -544,6 +554,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         root,
         tools,
         layer_toolbar,
+        layer_view: crate::layers_panel::LayersView::default(),
         canvas_column,
         options_bar,
         document_tabs,
@@ -579,6 +590,15 @@ fn size_docked_panels(
             unreachable!("the panel was just inserted into this same tree: {err:?}");
         }
     }
+}
+
+/// The History list's body floor, in rows (0.199.0): the
+/// `size.content_panel_max_rows` token (10), the same count of rows the
+/// Layers list is capped at, so History never shows fewer rows than the
+/// Layers list can. 210 px at the default `row_height`. No new token.
+#[must_use]
+pub fn history_floor_rows(scales: &Scales) -> u32 {
+    scales.size.content_panel_max_rows
 }
 
 /// How a panel shares the rail's height while docked (0.161.0's rule, one
@@ -1963,6 +1983,8 @@ mod tests {
         controls
     }
 
+    const LAYERS_HEIGHT_AT_900: u32 = 548;
+
     fn bottom(rect: aurora_core::Rect) -> i64 {
         rect.y + i64::from(rect.height)
     }
@@ -2270,8 +2292,117 @@ mod tests {
         assert_stacked_inside_the_rail(&ws, "640 x 480");
     }
 
+    /// 0.199.0: with the filter row the Layers panel is taller (its strip's
+    /// floor 135 -> 167 px), so in a 900 px window with a long document it
+    /// takes title + strip + a list capped at 10 rows + the 40 px toolbar,
+    /// and Properties/History share what is left. Measured, then pinned.
+    #[test]
+    fn at_900_px_a_long_document_still_leaves_properties_and_history_room() {
+        let scales = test_scales();
+        let mut ws = build_workspace(&scales);
+        if let Err(err) = crate::insert_layer_controls(&mut ws.tree, ws.layers, &scales) {
+            unreachable!("{err:?}");
+        }
+        fill_panels(&mut ws, &scales, (true, true, true), 40);
+        ws.tree.compute_layout(1274.0, 900.0);
+        let (Some(layers), Some(group)) = (
+            ws.tree.bounds(ws.layers.root),
+            ws.tree.bounds(crate::workspace::test_group(&ws).bar),
+        ) else {
+            unreachable!("laid out");
+        };
+        let shown = match crate::panel_group_shown(&ws.tree, &crate::workspace::test_group(&ws)) {
+            Some(0) => ws.properties.root,
+            _ => ws.history.root,
+        };
+        let Some(shown) = ws.tree.bounds(shown) else {
+            unreachable!("laid out");
+        };
+        println!("900px: layers {layers:?} tabs {group:?} shown {shown:?}");
+        assert!(shown.height >= 150, "{shown:?}");
+        assert_eq!(layers.height, LAYERS_HEIGHT_AT_900, "{layers:?}");
+    }
+
+    /// The Properties/History group at the default window width and a
+    /// long document (0.199.0): `(shown panel root height, its body
+    /// viewport height, the Curves strip's height or 0)` for a window
+    /// `height` px tall, with the Curves editor open or not.
+    fn group_heights_at(height: f32, curves: bool, history: bool) -> (u32, u32, u32) {
+        let scales = test_scales();
+        let mut ws = build_workspace(&scales);
+        let strip = curves.then(|| with_curves_shown(&mut ws, &scales));
+        if let Err(err) = crate::insert_layer_controls(&mut ws.tree, ws.layers, &scales) {
+            unreachable!("{err:?}");
+        }
+        fill_panels(&mut ws, &scales, (true, false, true), 40);
+        // Properties as the app fills it: a few tool-option rows.
+        let options = [
+            ("Radius", "12px".to_owned()),
+            ("Hardness", "80%".to_owned()),
+        ];
+        if let Err(err) = crate::populate_properties_panel(
+            &mut ws.tree,
+            ws.properties,
+            &scales,
+            crate::Tool::Brush,
+            &options,
+        ) {
+            unreachable!("{err:?}");
+        }
+        if history {
+            super::show_history_tab(&mut ws);
+        }
+        ws.tree.compute_layout(1280.0, height);
+        let h = |id| ws.tree.bounds(id).map_or(0, |b| b.height);
+        let shown = if history { ws.history } else { ws.properties };
+        (
+            h(shown.root),
+            h(shown.viewport),
+            strip.map_or(0, |c| h(c.curves.root)),
+        )
+    }
+
+    /// 0.199.0 (judge I1): the filter row made the Layers panel 32 px
+    /// taller, which a short window paid for out of History. History's
+    /// body now has a floor of `size.content_panel_max_rows` rows (210 px),
+    /// so the Layers list shrinks first. Measured before the fix
+    /// (0.198.0 / 0.199.0 without the floor), History's body at 900 / 800 /
+    /// 768 / 700 px with a 40-layer document: 363 / 263 / 231 / 163 px
+    /// before the filter row, 331 / 231 / 199 / 131 after it and before the
+    /// floor; with the floor 331 / 231 / 210 / 210. The Properties panel
+    /// with the Curves editor open keeps its 197 px strip and a 42 / 40 / 38
+    /// px list at 900 / 800 / 768 px (0.198.0: 42 / 42 / 40), the rest of
+    /// the rail going to the Layers list.
+    #[test]
+    fn history_keeps_ten_rows_and_the_curves_editor_its_strip_in_short_windows() {
+        let history = |h: f32| group_heights_at(h, false, true).1;
+        assert_eq!(history(900.0), 331);
+        assert_eq!(history(800.0), 231, "already above the floor: unchanged");
+        assert_eq!(history(768.0), 210, "was 199 before the floor");
+        assert_eq!(history(700.0), 210, "was 131 before the floor");
+        let floor = 210;
+        assert!(history(600.0) >= floor && history(480.0) >= floor);
+        for (height, list) in [(900.0, 42), (800.0, 40), (768.0, 38)] {
+            let (_, viewport, strip) = group_heights_at(height, true, false);
+            assert_eq!(strip, 197, "the Curves strip keeps its height at {height}");
+            assert_eq!(viewport, list, "Properties' list at {height}");
+        }
+        // The Layers list gave the height: at 768 it is 11 px shorter than
+        // its 548 px natural panel.
+        let scales = test_scales();
+        let mut ws = build_workspace(&scales);
+        if let Err(err) = crate::insert_layer_controls(&mut ws.tree, ws.layers, &scales) {
+            unreachable!("{err:?}");
+        }
+        fill_panels(&mut ws, &scales, (true, false, true), 40);
+        super::show_history_tab(&mut ws);
+        ws.tree.compute_layout(1280.0, 768.0);
+        let layers = ws.tree.bounds(ws.layers.root).map_or(0, |b| b.height);
+        assert_eq!(layers, 548 - 11);
+    }
+
     /// AC-4: a rail barely taller than every panel's floor (title, one
-    /// body row, one row per controls strip: 145 + 63 + 42 = 250 px since 0.195.0, 290 px since 0.196.0 (the 40 px Layers toolbar row), whose Layers controls strip — blend, Opacity and Fill — is three rows above the list) holds
+    /// body row, one row per controls strip: 145 + 63 + 42 = 250 px since 0.195.0, 290 px since 0.196.0 (the 40 px Layers toolbar row), whose Layers controls strip — filter, blend, Opacity, Fill and Lock rows — sits above the list; the filter row of 0.199.0 moved the whole floor from 294 to 312 px) holds
     /// every part of every panel at one row or more, each inside its own
     /// panel — the Curves strip and the Layers controls strip included.
     /// The floor is what M9/M10/M11 of 0.161.0's mutation matrix remove.
@@ -2287,15 +2418,17 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         fill_panels(&mut ws, &scales, (true, false, true), 20);
-        ws.tree.compute_layout(1274.0, 294.0);
-        assert_stacked_inside_the_rail(&ws, "1274 x 294");
+        ws.tree.compute_layout(1274.0, 312.0);
+        assert_stacked_inside_the_rail(&ws, "1274 x 312");
         // 0.164.0: History is the other tab of Properties' slot; it is
         // checked with its own tab shown, below.
         let mut history_shown = build_workspace(&scales);
         fill_panels(&mut history_shown, &scales, (true, false, true), 20);
         super::show_history_tab(&mut history_shown);
-        history_shown.tree.compute_layout(1274.0, 294.0);
-        assert_stacked_inside_the_rail(&history_shown, "1274 x 294, History shown");
+        // History's body floor is ten rows since 0.199.0 (210 px): 313 px
+        // is the shortest rail holding it under a strip-less Layers panel.
+        history_shown.tree.compute_layout(1274.0, 313.0);
+        assert_stacked_inside_the_rail(&history_shown, "1274 x 313, History shown");
         let (Some(rows), Some(panel)) = (
             history_shown.tree.bounds(history_shown.history.viewport),
             history_shown.tree.bounds(history_shown.history.root),

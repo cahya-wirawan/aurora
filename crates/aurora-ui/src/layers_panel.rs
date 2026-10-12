@@ -120,7 +120,7 @@
 //! [`layer_row_description`] + `set_tree_item_description`, without a
 //! repopulation, so row ids, focus and a slider drag's capture survive.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aurora_doc::{BlendMode, LayerId, LayerKind, LayerTree, sanitize_display_name};
 use aurora_theme::Scales;
@@ -136,6 +136,7 @@ use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
 use taffy::style_helpers::{auto, length, percent};
 use taffy::{FlexDirection, Position, Size, Style};
 
+use crate::layer_filter::{LayerFilter, NO_MATCH_TEXT, shown_layers};
 use crate::panel::{PanelHandle, clear_panel_body};
 
 /// The exact-fit between the two depth caps this module sits between,
@@ -196,32 +197,126 @@ pub fn populate_layers_panel(
     scales: &Scales,
     layers: &LayerTree,
 ) -> Result<HashMap<WidgetId, LayerId>, WidgetError> {
+    populate_layers_panel_view(tree, panel, scales, layers, &mut LayersView::default())
+}
+
+/// The Layers panel's view state beyond the rows themselves (0.199.0): the
+/// filter, and which groups the user collapsed. One per open document's
+/// panel (`aurora_ui::Workspace::layer_view`); the filter itself is saved
+/// per document session by the app.
+///
+/// **Collapse memory.** While no filter is active the collapsed groups are
+/// read off the rows about to be replaced (as since 0.195.0). While a
+/// filter is active, ancestors of matches are forced open and some groups
+/// are hidden or shown as leaves, so the rows cannot tell: the memory is
+/// then **frozen** (a collapse or expand made *during* a filter is
+/// transient and lasts until the next rebuild) and comes back untouched
+/// when the filter clears.
+#[derive(Debug, Clone, Default)]
+pub struct LayersView {
+    /// The active filter ([`LayerFilter::default`] shows everything).
+    pub filter: LayerFilter,
+    collapsed: HashSet<u64>,
+    last_filtered: bool,
+    shown_rows: usize,
+    total_layers: usize,
+}
+
+impl LayersView {
+    /// Forgets the collapsed groups, for a different document (layer ids
+    /// mean nothing across documents). The filter is the caller's.
+    pub fn reset_document(&mut self) {
+        self.collapsed.clear();
+        self.last_filtered = false;
+    }
+
+    /// How many rows the last population built, and how many layers the
+    /// document had.
+    #[must_use]
+    pub fn counts(&self) -> (usize, usize) {
+        (self.shown_rows, self.total_layers)
+    }
+
+    /// Whether `layer` is remembered as collapsed (tests).
+    #[must_use]
+    pub fn remembers_collapsed(&self, layer: LayerId) -> bool {
+        self.collapsed.contains(&layer.to_raw())
+    }
+}
+
+/// [`populate_layers_panel`] with a filter and collapse memory (0.199.0):
+/// builds only the rows `view.filter` shows (matches and their ancestors,
+/// ancestors forced open), and shows "No matching layers" when none do.
+///
+/// # Errors
+///
+/// As [`populate_layers_panel`].
+pub fn populate_layers_panel_view(
+    tree: &mut WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+    scales: &Scales,
+    layers: &LayerTree,
+    view: &mut LayersView,
+) -> Result<HashMap<WidgetId, LayerId>, WidgetError> {
     // Which groups the user had collapsed in the rows about to be
     // replaced (0.195.0): a rebuild — an expand elsewhere, an undo, a
-    // History jump — must not reopen them.
-    let collapsed = collapsed_layer_keys(tree, panel.body);
+    // History jump — must not reopen them. Frozen while filtered (above).
+    if !view.last_filtered {
+        view.collapsed = collapsed_layer_keys(tree, panel.body);
+    }
+    let shown = shown_layers(layers, &view.filter);
+    view.last_filtered = shown.is_some();
     clear_panel_body(tree, panel.body)?;
     // `size.content_panel_max_rows` rows of *this* panel's rows (0.197.0).
     #[allow(clippy::cast_precision_loss)]
     let cap = crate::panel::content_panel_max_rows(scales) * layer_row_height(scales) as f32;
     crate::panel::set_panel_content_cap(tree, panel, cap)?;
-    let view = insert_tree_view(tree, panel.body, None)?;
-    tree.set_style(view, tree_container_style())?;
+    let container = insert_tree_view(tree, panel.body, None)?;
+    tree.set_style(container, tree_container_style())?;
     let mut rows = HashMap::new();
     let mut groups = Vec::new();
     for &id in layers.roots() {
-        insert_layer_row(tree, view, scales, layers, id, &mut rows, &mut groups)?;
+        if shown.as_ref().is_none_or(|set| set.contains(&id)) {
+            insert_layer_row(
+                tree,
+                container,
+                scales,
+                layers,
+                id,
+                shown.as_ref(),
+                &mut rows,
+                &mut groups,
+            )?;
+        }
     }
     // Re-collapse those that still exist as groups, top-down: collapsing a
     // row removes its descendants, so a nested one under it is skipped
-    // (its state is forgotten with it, as a collapse always has).
-    for (row, id) in groups {
-        if collapsed.contains(&id.to_raw()) && tree.contains(row) {
-            set_tree_item_expanded(tree, row, false)?;
-            sync_layer_row(tree, row, layers, id)?;
+    // (its state is forgotten with it, as a collapse always has). Never
+    // while filtering: the ancestors of matches stay open.
+    if shown.is_none() {
+        for (row, id) in groups {
+            if view.collapsed.contains(&id.to_raw()) && tree.contains(row) {
+                set_tree_item_expanded(tree, row, false)?;
+                sync_layer_row(tree, row, layers, id)?;
+            }
         }
     }
     rows.retain(|&row, _| tree.contains(row));
+    view.shown_rows = rows.len();
+    view.total_layers = layers.len();
+    if shown.is_some() && rows.is_empty() {
+        let label = aurora_widgets::widgets::insert_label(tree, panel.body, scales, NO_MATCH_TEXT)?;
+        let mut style = tree.style(label).cloned().unwrap_or_default();
+        #[allow(clippy::cast_precision_loss)]
+        let pad = length(scales.spacing.sm as f32);
+        style.padding = taffy::Rect {
+            left: pad,
+            right: pad,
+            top: pad,
+            bottom: pad,
+        };
+        tree.set_style(label, style)?;
+    }
     Ok(rows)
 }
 
@@ -413,6 +508,10 @@ fn set_lock_icon_shown(
     Ok(true)
 }
 
+pub(crate) fn display_name_of(layers: &LayerTree, id: LayerId) -> String {
+    display_name(layers, id)
+}
+
 fn display_name(layers: &LayerTree, id: LayerId) -> String {
     // See `sanitize_display_name`'s module doc: names are bounded for
     // display, and a blank one falls back, after sanitizing.
@@ -436,13 +535,14 @@ fn trailing_blend(layers: &LayerTree, id: LayerId) -> Option<&'static str> {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn insert_layer_row(
     tree: &mut WidgetTree<WidgetKind>,
     parent: WidgetId,
     scales: &Scales,
     layers: &LayerTree,
     id: LayerId,
+    shown: Option<&HashSet<LayerId>>,
     rows: &mut HashMap<WidgetId, LayerId>,
     groups: &mut Vec<(WidgetId, LayerId)>,
 ) -> Result<WidgetId, WidgetError> {
@@ -452,7 +552,15 @@ fn insert_layer_row(
     // `TreeItem`'s `has_children` is a declaration that there is something
     // to expand: an empty group is a leaf row (it has nothing to collapse)
     // whose description still reads "Group".
-    let children = layers.children(id).unwrap_or_default();
+    // Under a filter only the shown children get rows: a matching group
+    // with none shows as a leaf (0.199.0).
+    let children: Vec<LayerId> = layers
+        .children(id)
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .filter(|child| shown.is_none_or(|set| set.contains(child)))
+        .collect();
     let is_group = layers.kind(id).is_some_and(LayerKind::is_group);
     let row = insert_tree_item(tree, parent, scales, &name, !children.is_empty())?;
     let depth = match tree.payload(row) {
@@ -565,8 +673,8 @@ fn insert_layer_row(
     set_tree_item_right_inset(tree, row, lock_room(scales))?;
     rows.insert(row, id);
 
-    for &child in children {
-        insert_layer_row(tree, row, scales, layers, child, rows, groups)?;
+    for child in children {
+        insert_layer_row(tree, row, scales, layers, child, shown, rows, groups)?;
     }
     Ok(row)
 }

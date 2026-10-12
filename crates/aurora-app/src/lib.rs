@@ -1521,8 +1521,16 @@ fn replace_document(
     // A different document: no collapsed group of the outgoing one carries
     // over (layer ids are only meaningful within one document).
     aurora_ui::reset_layers_panel(&mut workspace.tree, workspace.layers)?;
-    let layer_rows =
-        aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers)?;
+    // An open or New starts with no filter (0.199.0; the per-loop sync
+    // shows that in the filter row).
+    workspace.layer_view = aurora_ui::LayersView::default();
+    let layer_rows = aurora_ui::populate_layers_panel_view(
+        &mut workspace.tree,
+        workspace.layers,
+        scales,
+        layers,
+        &mut workspace.layer_view,
+    )?;
     // The steps the incoming document can undo -- none, for an opened
     // file (its import is the baseline, `History::clear_undo`), so the
     // panel shows just its origin row (0.147.1; it listed the import's
@@ -4720,8 +4728,9 @@ fn route_accessibility_action(
             } else if let Some(panel) = workspace.panel_strip.panel_for(id) {
                 open_from_panel_strip(workspace, focus, id);
                 AccessibilityReaction::PanelStrip(panel)
-            } else if layer_controls.is_some_and(|controls| controls.lock_toggle_for(id).is_some())
-            {
+            } else if layer_controls.is_some_and(|controls| {
+                controls.lock_toggle_for(id).is_some() || controls.filter.toggle_for(id).is_some()
+            }) {
                 // A Lock-row button (0.198.0): the same edit a pointer
                 // click makes ([`apply_layer_control_outcome`]).
                 AccessibilityReaction::LayerControl(aurora_widgets::ActionOutcome::Activated(id))
@@ -4800,7 +4809,13 @@ fn reconcile_layer_rows(
         .focused()
         .and_then(|focused| layer_rows.get(&focused))
         .copied();
-    match aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers) {
+    match aurora_ui::populate_layers_panel_view(
+        &mut workspace.tree,
+        workspace.layers,
+        scales,
+        layers,
+        &mut workspace.layer_view,
+    ) {
         Ok(rows) => *layer_rows = rows,
         Err(err) => {
             tracing::warn!(?err, "failed to rebuild the Layers panel after an expand");
@@ -4940,6 +4955,23 @@ fn apply_layer_control_accessibility(
     outcome: aurora_widgets::ActionOutcome,
 ) {
     tracing::debug!(?outcome, "accessibility action on a Layers-panel control");
+    if let Some(controls) = cx.layer_controls.controls {
+        let activated = match outcome {
+            aurora_widgets::ActionOutcome::Activated(id) => Some(id),
+            _ => None,
+        };
+        apply_layer_filter_edit(
+            cx.workspace,
+            cx.focus,
+            cx.scales,
+            cx.layers,
+            cx.layer_rows,
+            cx.active_layer,
+            cx.view,
+            &controls,
+            activated,
+        );
+    }
     end_pointer_opacity_drag(cx);
     let mut edit = LayerControlEdit {
         workspace: cx.workspace,
@@ -6739,9 +6771,11 @@ fn route_widget_pointer(
                 // character key through already, and a light-dismissed
                 // menu's focus deliberately returns to its opener
                 // (critic C11).
+                // The Layers search field (0.199.0) likewise.
                 let blurred = gallery
                     .as_ref()
-                    .is_some_and(|open| focus.focused() == Some(open.text_field));
+                    .is_some_and(|open| focus.focused() == Some(open.text_field))
+                    || layer_controls.is_some_and(|c| focus.focused() == Some(c.filter.field));
                 if blurred {
                     focus.blur(&mut workspace.tree);
                 }
@@ -7561,6 +7595,8 @@ fn sync_layer_controls(
     let Some(controls) = state.controls else {
         return toolbar_changed;
     };
+    let filter_changed = sync_layer_filter_row(workspace, &controls);
+    let toolbar_changed = toolbar_changed || filter_changed;
     match aurora_ui::sync_layer_controls(
         &mut workspace.tree,
         controls,
@@ -7574,6 +7610,102 @@ fn sync_layer_controls(
             toolbar_changed
         }
     }
+}
+
+/// Shows `workspace.layer_view` in the filter row (0.199.0): the text and
+/// toggles it holds, and "N of M layers shown" as the field's accessible
+/// description. The view is the truth; a widget edit reaches it through
+/// [`apply_layer_filter_edit`] first. Returns whether anything changed.
+fn sync_layer_filter_row(
+    workspace: &mut aurora_ui::Workspace,
+    controls: &aurora_ui::LayerControls,
+) -> bool {
+    let (shown, total) = workspace.layer_view.counts();
+    let active = workspace.layer_view.filter.is_active();
+    let wrote = aurora_ui::write_layer_filter(
+        &mut workspace.tree,
+        &controls.filter,
+        &workspace.layer_view.filter,
+    );
+    let described = aurora_ui::set_layer_filter_summary(
+        &mut workspace.tree,
+        &controls.filter,
+        shown,
+        total,
+        active,
+    );
+    match (wrote, described) {
+        (Ok(a), Ok(b)) => a || b,
+        (a, b) => {
+            tracing::warn!(?a, ?b, "failed to sync the Layers filter row");
+            false
+        }
+    }
+}
+
+/// Reads the filter row's widgets into the view and, when they differ,
+/// rebuilds the Layers rows under the new filter (0.199.0). A toggle
+/// press flips its button first (`Activated` does not flip a toggle). The
+/// body scrolls back to the top, the focus stays where it is (normally
+/// the field), the active layer stays active even when its row is gone,
+/// and nothing touches the document or its history. Returns whether the
+/// filter changed.
+#[allow(clippy::too_many_arguments)]
+fn apply_layer_filter_edit(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    scales: &Scales,
+    layers: &aurora_doc::LayerTree,
+    layer_rows: &mut HashMap<WidgetId, aurora_doc::LayerId>,
+    active_layer: &mut Option<aurora_doc::LayerId>,
+    view: &mut aurora_ui::CanvasView,
+    controls: &aurora_ui::LayerControls,
+    activated: Option<WidgetId>,
+) -> bool {
+    if let Some(toggle) = activated.and_then(|id| controls.filter.toggle_for(id)) {
+        let on = !workspace.layer_view.filter.kind_on(toggle);
+        if let Err(err) = aurora_widgets::widgets::set_button_toggled(
+            &mut workspace.tree,
+            controls.filter.button(toggle),
+            on,
+        ) {
+            tracing::warn!(?err, "failed to flip a kind toggle");
+        }
+    }
+    let wanted = aurora_ui::read_layer_filter(&workspace.tree, &controls.filter);
+    if wanted == workspace.layer_view.filter {
+        return false;
+    }
+    // Whitespace around the search text matches nothing (0.199.0, judge
+    // I3): "a " and "a" show the same rows, so only the view's text follows
+    // (the widget keeps what was typed) and the list is not rebuilt. No
+    // debounce: a rebuild costs 0.04-1.5 ms on Nyepi, far under a frame.
+    let same_rows = wanted.text.trim() == workspace.layer_view.filter.text.trim()
+        && (wanted.pixel, wanted.adjustment, wanted.group)
+            == (
+                workspace.layer_view.filter.pixel,
+                workspace.layer_view.filter.adjustment,
+                workspace.layer_view.filter.group,
+            );
+    workspace.layer_view.filter = wanted;
+    if same_rows {
+        return false;
+    }
+    if let Err(err) = workspace.tree.set_scroll_y(workspace.layers.body, 0.0) {
+        tracing::warn!(?err, "failed to scroll the Layers panel to its top");
+    }
+    rebuild_layer_rows(
+        workspace,
+        focus,
+        scales,
+        layers,
+        layer_rows,
+        active_layer,
+        view,
+        None,
+    );
+    sync_layer_filter_row(workspace, controls);
+    true
 }
 
 /// The Layer actions button a widget outcome activated, if it is an
@@ -8720,11 +8852,19 @@ fn apply_gallery_ime(
     gallery: Option<&aurora_ui::GalleryPanel>,
     ime: &winit::event::Ime,
 ) -> bool {
+    apply_field_ime(workspace, focus, gallery.map(|open| open.text_field), ime)
+}
+
+/// [`apply_gallery_ime`] for any one app-owned text field (0.199.0: the
+/// gallery's, and the Layers panel's search field).
+fn apply_field_ime(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &FocusManager,
+    field: Option<WidgetId>,
+    ime: &winit::event::Ime,
+) -> bool {
     let disabled = matches!(ime, winit::event::Ime::Disabled);
-    let Some(field) = gallery
-        .map(|open| open.text_field)
-        .filter(|&field| disabled || focus.focused() == Some(field))
-    else {
+    let Some(field) = field.filter(|&field| disabled || focus.focused() == Some(field)) else {
         return false;
     };
     let result = aurora_widgets::widgets::with_text_field_mut(
@@ -8769,10 +8909,16 @@ fn drop_stale_gallery_composition(
     focus: &FocusManager,
     gallery: Option<&aurora_ui::GalleryPanel>,
 ) -> bool {
-    let Some(field) = gallery
-        .map(|open| open.text_field)
-        .filter(|&field| focus.focused() != Some(field))
-    else {
+    drop_stale_field_composition(workspace, focus, gallery.map(|open| open.text_field))
+}
+
+/// [`drop_stale_gallery_composition`] for any one app-owned text field.
+fn drop_stale_field_composition(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &FocusManager,
+    field: Option<WidgetId>,
+) -> bool {
+    let Some(field) = field.filter(|&field| focus.focused() != Some(field)) else {
         return false;
     };
     let composing = matches!(
@@ -22726,7 +22872,13 @@ fn rebuild_layer_rows(
     let focus_was_on_a_row = focus
         .focused()
         .is_some_and(|focused| layer_rows.contains_key(&focused));
-    match aurora_ui::populate_layers_panel(&mut workspace.tree, workspace.layers, scales, layers) {
+    match aurora_ui::populate_layers_panel_view(
+        &mut workspace.tree,
+        workspace.layers,
+        scales,
+        layers,
+        &mut workspace.layer_view,
+    ) {
         Ok(rows) => *layer_rows = rows,
         Err(err) => {
             tracing::warn!(?err, "failed to rebuild the Layers panel");
@@ -25149,6 +25301,9 @@ impl App {
             return;
         }
         if self.layer_row_key(key) {
+            return;
+        }
+        if self.escape_clears_layer_filter(key) {
             return;
         }
         let controls = self.layer_controls.controls;
@@ -28270,7 +28425,11 @@ impl App {
 
     /// A real `WindowEvent::Ime` ([`apply_gallery_ime`]).
     fn handle_ime(&mut self, ime: &winit::event::Ime) {
-        if apply_gallery_ime(&mut self.workspace, &self.focus, self.gallery.as_ref(), ime) {
+        let filter_field = self.layer_controls.controls.map(|c| c.filter.field);
+        if apply_gallery_ime(&mut self.workspace, &self.focus, self.gallery.as_ref(), ime)
+            || apply_field_ime(&mut self.workspace, &self.focus, filter_field, ime)
+        {
+            self.apply_layer_filter_now(None);
             self.relayout_after_gallery();
         }
     }
@@ -28288,14 +28447,19 @@ impl App {
     /// drops a composition the field no longer owns
     /// ([`drop_stale_gallery_composition`], review RT-1).
     fn sync_ime(&mut self) {
-        if drop_stale_gallery_composition(&mut self.workspace, &self.focus, self.gallery.as_ref()) {
+        let filter_field = self.layer_controls.controls.map(|c| c.filter.field);
+        if drop_stale_gallery_composition(&mut self.workspace, &self.focus, self.gallery.as_ref())
+            | drop_stale_field_composition(&mut self.workspace, &self.focus, filter_field)
+        {
             self.needs_redraw = true;
         }
         let field = self
             .gallery
             .as_ref()
             .map(|open| open.text_field)
-            .filter(|&field| self.focus.focused() == Some(field));
+            .into_iter()
+            .chain(filter_field)
+            .find(|&field| self.focus.focused() == Some(field));
         let Some(window) = self.window.as_ref() else {
             return;
         };
@@ -28595,7 +28759,61 @@ impl App {
         true
     }
 
+    /// Applies a change of the filter row's widgets (a typed character, a
+    /// paste, an IME commit, a toggle press `activated`) to the Layers
+    /// panel ([`apply_layer_filter_edit`]). Returns whether it changed.
+    fn apply_layer_filter_now(&mut self, activated: Option<WidgetId>) -> bool {
+        let Some(controls) = self.layer_controls.controls else {
+            return false;
+        };
+        let changed = apply_layer_filter_edit(
+            &mut self.workspace,
+            &mut self.focus,
+            &self.scales,
+            &self.doc.layers,
+            &mut self.layer_rows,
+            &mut self.doc.active_layer,
+            &mut self.doc.canvas_view,
+            &controls,
+            activated,
+        );
+        if changed {
+            self.push_accessibility();
+            self.needs_redraw = true;
+        }
+        changed
+    }
+
+    /// `Escape` in the focused search field clears its text first (0.199.0);
+    /// with the field already empty the key goes on as it always did.
+    /// Returns whether it was consumed.
+    fn escape_clears_layer_filter(&mut self, key: Key) -> bool {
+        let Some(controls) = self.layer_controls.controls else {
+            return false;
+        };
+        if key != Key::Named(NamedKey::Escape)
+            || self.dialog.is_some()
+            || self.command_palette.is_some()
+            || self.focus.focused() != Some(controls.filter.field)
+        {
+            return false;
+        }
+        match aurora_ui::clear_layer_filter_text(&mut self.workspace.tree, &controls.filter) {
+            Ok(true) => {
+                self.apply_layer_filter_now(None);
+                self.relayout_after_gallery();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn apply_layer_control(&mut self, outcome: &PointerOutcome) {
+        let activated = match outcome {
+            PointerOutcome::Action(aurora_widgets::ActionOutcome::Activated(id)) => Some(*id),
+            _ => None,
+        };
+        self.apply_layer_filter_now(activated);
         let captured = self.gallery_click.captured();
         let invalidation =
             apply_layer_control_outcome(&mut self.layer_control_edit(), outcome, captured);

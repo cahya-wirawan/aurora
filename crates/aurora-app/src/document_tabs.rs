@@ -129,6 +129,11 @@ pub(crate) enum SwitchOutcome {
 /// Commits every live gesture into the active (outgoing) document's own
 /// history (step 1 above). Returns whether anything was recorded.
 pub(crate) fn commit_live_gestures(cx: &mut SwitchContext<'_>) -> bool {
+    // Every path that stops a session being active starts here, so this
+    // is where its Layers filter is saved (0.199.0).
+    cx.doc
+        .layer_filter
+        .clone_from(&cx.workspace.layer_view.filter);
     let mut recorded = end_layer_control_gestures(
         &mut LayerControlEdit {
             workspace: cx.workspace,
@@ -184,7 +189,22 @@ pub(crate) fn bind_active_document(cx: &mut SwitchContext<'_>) {
     // The session's own active layer is the preferred one; only a layer
     // that no longer exists falls back.
     let preferred = cx.doc.active_layer;
-    // The other document's collapsed groups mean nothing here.
+    // The other document's collapsed groups mean nothing here; its filter
+    // is this session's own (0.199.0).
+    cx.workspace.layer_view.reset_document();
+    cx.workspace
+        .layer_view
+        .filter
+        .clone_from(&cx.doc.layer_filter);
+    if let Some(controls) = cx.layer_controls.controls
+        && let Err(err) = aurora_ui::write_layer_filter(
+            &mut cx.workspace.tree,
+            &controls.filter,
+            &cx.doc.layer_filter,
+        )
+    {
+        tracing::warn!(?err, "failed to show the incoming document's Layers filter");
+    }
     if let Err(err) = aurora_ui::reset_layers_panel(&mut cx.workspace.tree, cx.workspace.layers) {
         tracing::warn!(
             ?err,

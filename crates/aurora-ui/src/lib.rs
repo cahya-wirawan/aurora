@@ -42,6 +42,7 @@ pub mod document_tabs;
 pub mod gallery_panel;
 pub mod history_panel;
 pub mod layer_controls;
+pub mod layer_filter;
 pub mod layer_toolbar;
 pub mod layers_panel;
 pub mod panel;
@@ -82,17 +83,25 @@ pub use layer_controls::{
     blend_mode_label, blend_mode_options, blend_mode_options_for, insert_layer_controls,
     layer_controls_contains, sync_layer_controls, sync_layer_readouts,
 };
+pub use layer_filter::{
+    KindToggle, LayerFilter, LayerFilterRow, NO_MATCH_TEXT, SEARCH_LABEL, SEARCH_PLACEHOLDER,
+    clear_layer_filter_text, is_layer_filter_field, read_layer_filter, set_layer_filter_summary,
+    shown_layers, write_layer_filter,
+};
 pub use layer_toolbar::{
     DELETE_UNAVAILABLE, LAYER_TOOLBAR_ICON_SIZE, LAYER_TOOLBAR_LABEL, LayerAction, LayerToolbar,
     insert_layer_toolbar, is_layer_toolbar_button, layer_toolbar_contains, layer_toolbar_height,
     set_layer_toolbar_hover, sync_layer_toolbar,
 };
 #[cfg(test)]
+mod layer_filter_tests;
+#[cfg(test)]
 mod layers_panel_render;
 pub use layers_panel::{
-    LayerRowPart, layer_row_description, layer_row_height, layer_row_neighbor, layer_row_part,
-    layer_row_thumbnail, layer_thumbnail_side, populate_layers_panel, reset_layers_panel,
-    set_layer_row_selected, set_layer_row_thumbnail, sync_layer_row, visible_layer_rows,
+    LayerRowPart, LayersView, layer_row_description, layer_row_height, layer_row_neighbor,
+    layer_row_part, layer_row_thumbnail, layer_thumbnail_side, populate_layers_panel,
+    populate_layers_panel_view, reset_layers_panel, set_layer_row_selected,
+    set_layer_row_thumbnail, sync_layer_row, visible_layer_rows,
 };
 pub use panel::{
     FLOATING_DESCRIPTION, PanelHandle, PanelSizing, clear_panel_body, close_panel, insert_panel,

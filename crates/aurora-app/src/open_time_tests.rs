@@ -350,6 +350,49 @@ fn nyepi_layers_panel_populate() {
     );
 }
 
+/// Re-filtering the Layers panel on the Nyepi template (0.199.0, round
+/// L5b): the cost of one keystroke (a full filtered population) for a
+/// typical search, a search matching nothing and the empty search. Run
+/// with `cargo test -p aurora-app --release -- --ignored --nocapture
+/// nyepi_layers_filter`.
+#[test]
+#[ignore = "measurement on the user's template"]
+fn nyepi_layers_filter() {
+    let Some(path) = nyepi_path() else {
+        println!("SKIPPED: the Nyepi template is not present");
+        return;
+    };
+    let (_dir, store) = new_store();
+    let document = ok(crate::PreparedPsd::stream(
+        &path,
+        Some(&store.staging_root()),
+    ));
+    let layers = &document.layers;
+    let scales = ok(crate::load_scales());
+    let mut workspace = aurora_ui::build_workspace(&scales);
+    for text in ["post", "zzzz", "", "p"] {
+        workspace.layer_view.filter = aurora_ui::LayerFilter {
+            text: text.to_owned(),
+            ..aurora_ui::LayerFilter::default()
+        };
+        let mut best = std::time::Duration::MAX;
+        let mut rows = 0;
+        for _ in 0..7 {
+            let started = Instant::now();
+            let map = ok(aurora_ui::populate_layers_panel_view(
+                &mut workspace.tree,
+                workspace.layers,
+                &scales,
+                layers,
+                &mut workspace.layer_view,
+            ));
+            best = best.min(started.elapsed());
+            rows = map.len();
+        }
+        println!("NYEPI filter {text:?}: {rows} rows, populate best of 7 {best:?}");
+    }
+}
+
 /// Layer thumbnails on the Nyepi template (0.197.0, round L4): the first
 /// visible rows of the Layers panel, timed on the UI thread and in total,
 /// with the tiles shared, the store's paging counters and the RSS change.
