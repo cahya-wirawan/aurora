@@ -1,0 +1,1139 @@
+//! Levels and Hue/Saturation on the GPU path (0.206.0): the GPU passes
+//! against the CPU compositor (`apply_adjustment_layer`, the reference) on
+//! whole composite tiles, plus the dispatch counters that prove the GPU
+//! path really ran and the predicate's refusals.
+//!
+//! Verified on an RTX 3090 (Vulkan) only; every GPU test self-skips
+//! without an adapter (`AURORA_REQUIRE_GPU=1` makes that a failure).
+
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::too_many_arguments,
+    clippy::float_cmp
+)]
+
+use crate::tests::real_gpu_context;
+use aurora_doc::BlendMode;
+
+const TILE0: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
+const QUAD: aurora_core::Rect = aurora_core::Rect {
+    x: 0,
+    y: 0,
+    width: 512,
+    height: 512,
+};
+
+/// The GPU/CPU tolerance on an opaque backdrop: the existing blend-mode
+/// differential's `2 * f16::EPSILON` (about half an 8-bit level). The pass
+/// rounds `Cb`, `f(Cb)` and the mix to `f16` where the CPU stores them, so
+/// what is left is `pack2x16float`'s implementation-defined rounding
+/// direction (one `f16` step) and the GPU's own transcendental / division
+/// rounding (`pow`, `/`) flipping an `f16` rounding.
+fn tolerance() -> f32 {
+    2.0 * f32::from(half::f16::EPSILON)
+}
+
+/// The bound on a translucent backdrop: `straight_backdrop`'s division
+/// (WGSL: 2.5 ULP) can move `Cb` by one `f16` step, which the adjustment's
+/// slope scales and the blend term carries, then the final premultiply
+/// rounds again. The same derived-per-mode class as the Curves tests
+/// (about 6-8 `f16` steps at the top of the range, `2^-11` each); the
+/// adjustments tested here have a slope of at most about 2 on these
+/// fixtures (Hue/Saturation saturation at most +50, Levels gamma and
+/// range stretches kept moderate in these tiles).
+fn translucent_tolerance() -> f32 {
+    8.0 / 2048.0
+}
+
+fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
+    match r {
+        Ok(v) => v,
+        Err(err) => unreachable!("{err:?}"),
+    }
+}
+
+fn store() -> (tempfile::TempDir, aurora_tile::TileStore) {
+    let dir = ok(tempfile::tempdir());
+    let Some(budget) = std::num::NonZeroUsize::new(16) else {
+        unreachable!("non-zero");
+    };
+    let store = ok(aurora_tile::TileStore::new(
+        dir.path().to_path_buf(),
+        budget,
+    ));
+    (dir, store)
+}
+
+/// A deterministic value in `[0, 1)` for texel `(x, y)` and a `salt`.
+fn hash(x: u32, y: u32, salt: u32) -> f32 {
+    let mut h = x
+        .wrapping_mul(0x9E37_79B1)
+        .wrapping_add(y.wrapping_mul(0x85EB_CA77))
+        .wrapping_add(salt.wrapping_mul(0xC2B2_AE3D));
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    h ^= h >> 12;
+    h = h.wrapping_mul(0x297A_2D39);
+    h ^= h >> 15;
+    (h >> 8) as f32 / 16_777_216.0
+}
+
+/// Opaque uniform-random colours.
+fn random_opaque(x: u32, y: u32) -> [f32; 4] {
+    [hash(x, y, 1), hash(x, y, 2), hash(x, y, 3), 1.0]
+}
+
+/// Named corner cases (black, white, greys, primaries, secondaries, tints,
+/// near-black and near-white near-greys) in the top rows, random colours
+/// below; opaque.
+fn edge_opaque(x: u32, y: u32) -> [f32; 4] {
+    const PALETTE: [[f32; 3]; 16] = [
+        [0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0],
+        [0.5, 0.5, 0.5],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 1.0],
+        [1.0, 0.0, 1.0],
+        [0.2, 0.4, 0.6],
+        [0.9, 0.5, 0.5],
+        [0.01, 0.02, 0.015],
+        [0.99, 0.98, 0.985],
+        [0.25, 0.25, 0.25],
+        [0.75, 0.5, 0.25],
+        [0.3, 0.9, 0.4],
+    ];
+    if y < 64 {
+        let [r, g, b] = PALETTE[(x as usize / 4) % PALETTE.len()];
+        let s = 1.0 - (y % 8) as f32 / 10.0;
+        [r * s, g * s, b * s, 1.0]
+    } else {
+        random_opaque(x, y)
+    }
+}
+
+/// A smooth colour ramp, opaque.
+fn ramp(x: u32, y: u32) -> [f32; 4] {
+    [
+        x as f32 / 255.0,
+        y as f32 / 255.0,
+        ((x * 3 + y * 5) % 256) as f32 / 255.0,
+        1.0,
+    ]
+}
+
+/// Random colours at a random alpha in `[0.1, 1)`, a fully transparent band
+/// at the top.
+fn random_translucent(x: u32, y: u32) -> [f32; 4] {
+    let a = if y < 16 {
+        0.0
+    } else {
+        0.1 + 0.9 * hash(x, y, 4)
+    };
+    [hash(x, y, 1), hash(x, y, 2), hash(x, y, 3), a]
+}
+
+/// [`ramp`] at an alpha that varies across the tile.
+fn ramp_translucent(x: u32, y: u32) -> [f32; 4] {
+    let [r, g, b, _] = ramp(x, y);
+    let a = if y < 16 {
+        0.0
+    } else {
+        0.1 + 0.9 * x as f32 / 255.0
+    };
+    [r, g, b, a]
+}
+
+/// Out-of-gamut straight colours (negative, above one) at alpha 1, which
+/// `straight_backdrop` leaves unclamped.
+fn out_of_gamut(x: u32, y: u32) -> [f32; 4] {
+    [
+        hash(x, y, 1) * 3.0 - 1.0,
+        hash(x, y, 2) * 2.0 - 0.5,
+        hash(x, y, 3) * 4.0 - 2.0,
+        1.0,
+    ]
+}
+
+fn pattern_layer(
+    layers: &mut aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    pattern: impl Fn(u32, u32) -> [f32; 4],
+) -> aurora_doc::LayerId {
+    let id = ok(layers.add_pixel_layer("pattern", QUAD, None));
+    let Some(surface) = layers.surface_id(id) else {
+        unreachable!("a pixel layer");
+    };
+    let tile = ok(store.get_mut(surface, TILE0));
+    for (i, sample) in tile.texels_mut().iter_mut().enumerate() {
+        let texel = (i / 4) as u32;
+        let rgba = pattern(texel % aurora_tile::TILE, texel / aurora_tile::TILE);
+        *sample = half::f16::from_f32(rgba[i % 4]);
+    }
+    tile.mark_dirty(aurora_core::Rect {
+        x: 0,
+        y: 0,
+        width: aurora_tile::TILE,
+        height: aurora_tile::TILE,
+    });
+    id
+}
+
+fn add_adjustment(
+    layers: &mut aurora_doc::LayerTree,
+    adjustment: aurora_doc::Adjustment,
+) -> aurora_doc::LayerId {
+    ok(layers.add_adjustment_layer_at("adjustment", adjustment, None, 0))
+}
+
+fn record(ib: f32, iw: f32, g: f32, ob: f32, ow: f32) -> aurora_core::LevelsChannel {
+    ok(aurora_core::LevelsChannel::new(ib, iw, g, ob, ow))
+}
+
+fn levels(
+    master: aurora_core::LevelsChannel,
+    rgb: [aurora_core::LevelsChannel; 3],
+) -> aurora_doc::Adjustment {
+    let [red, green, blue] = rgb;
+    aurora_doc::Adjustment::Levels(aurora_core::LevelsParams {
+        master,
+        red,
+        green,
+        blue,
+    })
+}
+
+fn levels_master(master: aurora_core::LevelsChannel) -> aurora_doc::Adjustment {
+    let id = aurora_core::LevelsChannel::identity();
+    levels(master, [id; 3])
+}
+
+fn hue_sat(h: f32, s: f32, l: f32) -> aurora_doc::Adjustment {
+    aurora_doc::Adjustment::HueSaturation(ok(aurora_core::HueSaturationParams::new(
+        h, s, l, false, 0.0, 25.0, 0.0,
+    )))
+}
+
+fn colorize(h: f32, s: f32, l: f32) -> aurora_doc::Adjustment {
+    aurora_doc::Adjustment::HueSaturation(ok(aurora_core::HueSaturationParams::new(
+        0.0, 0.0, 0.0, true, h, s, l,
+    )))
+}
+
+fn cpu_tile(layers: &aurora_doc::LayerTree, store: &mut aurora_tile::TileStore) -> Vec<f32> {
+    let mut budget = crate::CompositeBudget::for_pass(layers);
+    let (texels, _) =
+        crate::composite_roots_into_tile(layers, store, TILE0, (0, 0), (0, 0), &mut budget);
+    texels.iter().map(|v| v.to_f32()).collect()
+}
+
+fn gpu_tile(
+    context: &aurora_gpu::GpuContext,
+    compositor: &mut aurora_render::TileCompositor,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+) -> Option<Vec<f32>> {
+    let mut budget = crate::CompositeBudget::for_pass(layers);
+    let pending = crate::begin_gpu_composite_tile(
+        context,
+        compositor,
+        layers,
+        store,
+        TILE0,
+        (0, 0),
+        (0, 0),
+        &mut budget,
+    )?;
+    let _ = context.device().poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    crate::finish_tile_readback(pending).map(|t| t.iter().map(|v| v.to_f32()).collect())
+}
+
+fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
+}
+
+/// The passes recorded since the last call, `(curves, levels, hue_sat)`.
+fn take_counts() -> (u64, u64, u64) {
+    (
+        crate::take_gpu_curves_dispatch_count(),
+        crate::take_gpu_levels_dispatch_count(),
+        crate::take_gpu_hue_saturation_dispatch_count(),
+    )
+}
+
+/// Which adjustment pass a test expects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pass {
+    Levels,
+    HueSaturation,
+}
+
+impl Pass {
+    fn expected(self, passes: u64) -> (u64, u64, u64) {
+        match self {
+            Self::Levels => (0, passes, 0),
+            Self::HueSaturation => (0, 0, passes),
+        }
+    }
+}
+
+/// One GPU tile that must have run exactly `passes` passes of `pass` (and
+/// none of the others), compared against the CPU reference within `bound`.
+/// Returns `(cpu, worst |GPU - CPU|)`.
+fn gpu_matches_cpu(
+    context: &aurora_gpu::GpuContext,
+    compositor: &mut aurora_render::TileCompositor,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    pass: Pass,
+    passes: u64,
+    bound: f32,
+    what: &str,
+) -> (Vec<f32>, f32) {
+    assert!(
+        crate::document_qualifies_for_gpu_compositing(layers),
+        "{what}: setup, must take the GPU path"
+    );
+    let _ = take_counts();
+    let Some(gpu) = gpu_tile(context, compositor, layers, store) else {
+        unreachable!("{what}: the GPU tile fell back");
+    };
+    assert_eq!(
+        take_counts(),
+        pass.expected(passes),
+        "{what}: GPU passes recorded -- fewer means a silent CPU fallback"
+    );
+    let cpu = cpu_tile(layers, store);
+    assert_eq!(gpu.len(), cpu.len(), "{what}");
+    let mut worst = 0.0_f32;
+    for (i, (g, c)) in gpu.iter().zip(&cpu).enumerate() {
+        let d = (g - c).abs();
+        assert!(
+            d <= bound,
+            "{what}: texel ({}, {}) channel {}: GPU {g} vs CPU {c} (bound {bound})",
+            (i / 4) % aurora_tile::TILE as usize,
+            (i / 4) / aurora_tile::TILE as usize,
+            i % 4
+        );
+        worst = worst.max(d);
+    }
+    println!("{what}: worst |GPU - CPU| = {worst:e} (bound {bound:e})");
+    (cpu, worst)
+}
+
+const GPU_MODES: [BlendMode; 19] = [
+    BlendMode::Normal,
+    BlendMode::Multiply,
+    BlendMode::Darken,
+    BlendMode::Lighten,
+    BlendMode::Screen,
+    BlendMode::Difference,
+    BlendMode::LinearDodge,
+    BlendMode::LinearBurn,
+    BlendMode::ColorBurn,
+    BlendMode::ColorDodge,
+    BlendMode::Overlay,
+    BlendMode::HardLight,
+    BlendMode::LinearLight,
+    BlendMode::VividLight,
+    BlendMode::HardMix,
+    BlendMode::PinLight,
+    BlendMode::SoftLight,
+    BlendMode::Subtract,
+    BlendMode::Divide,
+];
+
+const STEEP_LEVELS_CASES: [&str; 2] = ["gamma min 0.10", "narrow input span"];
+
+/// Blend terms that divide or threshold (`ColorBurn`, `ColorDodge`,
+/// `VividLight`, `Divide`, `HardMix`) amplify a one-`f16`-step difference
+/// in `Cs` (the same class as the Curves tests' derived per-mode bound of
+/// about 6-8 steps): 8 steps of `2^-11` instead of `2 * f16::EPSILON`.
+fn mode_bound(mode: BlendMode) -> f32 {
+    match mode {
+        BlendMode::ColorBurn
+        | BlendMode::ColorDodge
+        | BlendMode::VividLight
+        | BlendMode::Divide
+        | BlendMode::HardMix => 8.0 / 2048.0,
+        _ => tolerance(),
+    }
+}
+
+// -- Levels parameter sets ------------------------------------------------
+
+fn levels_cases() -> Vec<(&'static str, aurora_doc::Adjustment)> {
+    let id = aurora_core::LevelsChannel::identity();
+    vec![
+        ("stretch", levels_master(record(0.1, 0.9, 1.0, 0.0, 1.0))),
+        ("gamma 2.2", levels_master(record(0.0, 1.0, 2.2, 0.0, 1.0))),
+        (
+            "gamma min 0.10",
+            levels_master(record(0.0, 1.0, 0.10, 0.0, 1.0)),
+        ),
+        (
+            "gamma max 9.99",
+            levels_master(record(0.0, 1.0, 9.99, 0.0, 1.0)),
+        ),
+        ("gamma 0.5", levels_master(record(0.0, 1.0, 0.5, 0.0, 1.0))),
+        (
+            "output range",
+            levels_master(record(0.0, 1.0, 1.0, 0.2, 0.8)),
+        ),
+        (
+            "inverted output",
+            levels_master(record(0.0, 1.0, 1.0, 1.0, 0.0)),
+        ),
+        (
+            "everything",
+            levels_master(record(0.05, 0.95, 1.7, 0.1, 0.9)),
+        ),
+        (
+            "narrow input span",
+            levels_master(record(0.4, 0.4 + 1.0 / 255.0, 1.0, 0.0, 1.0)),
+        ),
+        (
+            "per channel + master",
+            levels(
+                record(0.0, 1.0, 1.4, 0.0, 1.0),
+                [
+                    record(0.1, 0.8, 1.0, 0.0, 1.0),
+                    record(0.0, 1.0, 0.6, 0.0, 1.0),
+                    record(0.0, 1.0, 1.0, 0.3, 1.0),
+                ],
+            ),
+        ),
+        (
+            "red only",
+            levels(id, [record(0.2, 0.7, 1.3, 0.0, 1.0), id, id]),
+        ),
+    ]
+}
+
+fn hue_sat_cases() -> Vec<(&'static str, aurora_doc::Adjustment)> {
+    vec![
+        ("hue +60", hue_sat(60.0, 0.0, 0.0)),
+        ("hue -120", hue_sat(-120.0, 0.0, 0.0)),
+        ("hue +180", hue_sat(180.0, 0.0, 0.0)),
+        ("hue -180", hue_sat(-180.0, 0.0, 0.0)),
+        ("hue +1", hue_sat(1.0, 0.0, 0.0)),
+        ("saturation -100", hue_sat(0.0, -100.0, 0.0)),
+        ("saturation -40", hue_sat(0.0, -40.0, 0.0)),
+        ("saturation +30", hue_sat(0.0, 30.0, 0.0)),
+        ("saturation +50", hue_sat(0.0, 50.0, 0.0)),
+        ("saturation +99", hue_sat(0.0, 99.0, 0.0)),
+        ("saturation +100", hue_sat(0.0, 100.0, 0.0)),
+        ("lightness -100", hue_sat(0.0, 0.0, -100.0)),
+        ("lightness -50", hue_sat(0.0, 0.0, -50.0)),
+        ("lightness +50", hue_sat(0.0, 0.0, 50.0)),
+        ("lightness +100", hue_sat(0.0, 0.0, 100.0)),
+        ("all three", hue_sat(75.0, 35.0, -20.0)),
+        ("extremes", hue_sat(-180.0, 100.0, 100.0)),
+        ("extremes low", hue_sat(180.0, -100.0, -100.0)),
+        ("colorize", colorize(30.0, 80.0, 0.0)),
+        ("colorize hue 0", colorize(0.0, 100.0, 0.0)),
+        ("colorize hue 360", colorize(360.0, 50.0, 0.0)),
+        ("colorize saturation 0", colorize(200.0, 0.0, 0.0)),
+        ("colorize lightness -100", colorize(120.0, 100.0, -100.0)),
+        ("colorize lightness +100", colorize(120.0, 100.0, 100.0)),
+        ("colorize lightness +30", colorize(280.0, 60.0, 30.0)),
+        (
+            "colorize ignores master",
+            aurora_doc::Adjustment::HueSaturation(ok(aurora_core::HueSaturationParams::new(
+                90.0, 100.0, 100.0, true, 30.0, 80.0, 0.0,
+            ))),
+        ),
+    ]
+}
+
+/// The pass (Levels or Hue/Saturation) of the case list `which`.
+fn cases_of(pass: Pass) -> Vec<(&'static str, aurora_doc::Adjustment)> {
+    match pass {
+        Pass::Levels => levels_cases(),
+        Pass::HueSaturation => hue_sat_cases(),
+    }
+}
+
+/// Runs every case of `pass` over `pattern` at `opacity` and `mode`,
+/// returning the worst difference. The adjustment must change the
+/// composite (or be an identity-like case).
+fn run_cases(
+    pass: Pass,
+    pattern: impl Fn(u32, u32) -> [f32; 4] + Copy,
+    opacity: f32,
+    mode: BlendMode,
+    bound: f32,
+    label: &str,
+) -> f32 {
+    let Some(context) = real_gpu_context() else {
+        return 0.0;
+    };
+    let mut worst = 0.0_f32;
+    for (name, adjustment) in cases_of(pass) {
+        // Slopes of 10 (gamma 0.10) and 255 (a one-level input span) scale a
+        // translucent backdrop's one-step `Cb` difference past any fixed
+        // bound; they are held to the opaque tolerance above instead.
+        if bound > tolerance() && STEEP_LEVELS_CASES.contains(&name) {
+            continue;
+        }
+        let (_dir, mut store) = store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = pattern_layer(&mut layers, &mut store, pattern);
+        let without = cpu_tile(&layers, &mut store);
+        let id = add_adjustment(&mut layers, adjustment);
+        ok(layers.set_opacity(id, opacity));
+        ok(layers.set_blend_mode(id, mode));
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let what = format!("{label} / {name}");
+        let (cpu, w) = gpu_matches_cpu(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            pass,
+            1,
+            bound,
+            &what,
+        );
+        assert!(
+            max_diff(&cpu, &without) > 0.002,
+            "{what}: the adjustment must really change the composite"
+        );
+        worst = worst.max(w);
+    }
+    worst
+}
+
+#[test]
+fn gpu_levels_matches_the_cpu_on_random_and_edge_tiles() {
+    for (label, pattern) in [
+        ("random", random_opaque as fn(u32, u32) -> [f32; 4]),
+        ("edge", edge_opaque),
+        ("ramp", ramp),
+    ] {
+        let worst = run_cases(
+            Pass::Levels,
+            pattern,
+            1.0,
+            BlendMode::Normal,
+            tolerance(),
+            label,
+        );
+        println!("levels opaque {label}: worst {worst:e}");
+    }
+    // Partial opacity, so the lerp with the backdrop is observable.
+    let worst = run_cases(
+        Pass::Levels,
+        random_opaque,
+        0.35,
+        BlendMode::Normal,
+        tolerance(),
+        "random @35%",
+    );
+    println!("levels opaque random @35%: worst {worst:e}");
+}
+
+#[test]
+fn gpu_hue_saturation_matches_the_cpu_on_random_and_edge_tiles() {
+    for (label, pattern) in [
+        ("random", random_opaque as fn(u32, u32) -> [f32; 4]),
+        ("edge", edge_opaque),
+        ("ramp", ramp),
+    ] {
+        let worst = run_cases(
+            Pass::HueSaturation,
+            pattern,
+            1.0,
+            BlendMode::Normal,
+            tolerance(),
+            label,
+        );
+        println!("hue/sat opaque {label}: worst {worst:e}");
+    }
+    let worst = run_cases(
+        Pass::HueSaturation,
+        random_opaque,
+        0.35,
+        BlendMode::Normal,
+        tolerance(),
+        "random @35%",
+    );
+    println!("hue/sat opaque random @35%: worst {worst:e}");
+}
+
+/// Translucent backdrops: moderate-slope cases only (see
+/// [`translucent_tolerance`]); the +99/+100 saturation, +/-100 lightness
+/// extremes and Colorize are covered on opaque backdrops above and on a
+/// translucent one in the full-alpha-band test below.
+#[test]
+fn gpu_levels_matches_the_cpu_on_translucent_backdrops() {
+    let worst = run_cases(
+        Pass::Levels,
+        random_translucent,
+        1.0,
+        BlendMode::Normal,
+        translucent_tolerance(),
+        "random translucent",
+    );
+    println!("levels translucent random: worst {worst:e}");
+    let worst = run_cases(
+        Pass::Levels,
+        ramp_translucent,
+        0.6,
+        BlendMode::Normal,
+        translucent_tolerance(),
+        "ramp translucent @60%",
+    );
+    println!("levels translucent ramp @60%: worst {worst:e}");
+}
+
+#[test]
+fn gpu_hue_saturation_matches_the_cpu_on_translucent_backdrops() {
+    let worst = run_cases(
+        Pass::HueSaturation,
+        random_translucent,
+        1.0,
+        BlendMode::Normal,
+        translucent_tolerance(),
+        "random translucent",
+    );
+    println!("hue/sat translucent random: worst {worst:e}");
+    let worst = run_cases(
+        Pass::HueSaturation,
+        ramp_translucent,
+        0.6,
+        BlendMode::Normal,
+        translucent_tolerance(),
+        "ramp translucent @60%",
+    );
+    println!("hue/sat translucent ramp @60%: worst {worst:e}");
+}
+
+/// Every admitted blend mode, one adjustment each, on the smooth ramp (as
+/// the Curves test): the GPU must differ from Normal for every other mode,
+/// or a dropped mode would pass.
+fn every_mode(pass: Pass, adjustment: aurora_doc::Adjustment, pattern: fn(u32, u32) -> [f32; 4]) {
+    let Some(context) = real_gpu_context() else {
+        return;
+    };
+    let (_dir, mut store) = store();
+    let mut layers = aurora_doc::LayerTree::new();
+    let _ = pattern_layer(&mut layers, &mut store, pattern);
+    let id = add_adjustment(&mut layers, adjustment);
+    ok(layers.set_opacity(id, 0.75));
+    let mut compositor = aurora_render::TileCompositor::new(context.device());
+    let mut normal = Vec::new();
+    let mut worst = 0.0_f32;
+    for mode in GPU_MODES {
+        ok(layers.set_blend_mode(id, mode));
+        let what = format!("{pass:?} {mode:?}");
+        if mode == BlendMode::HardMix {
+            // HardMix thresholds `VividLight` at 0.5: a one-`f16`-step
+            // difference in `Cs` near the threshold flips a channel between
+            // 0 and 1 (disclosed since 0.115.1), so no value bound exists.
+            // Hold it to a bound on how many channels may flip instead.
+            let _ = take_counts();
+            let Some(gpu) = gpu_tile(&context, &mut compositor, &layers, &mut store) else {
+                unreachable!("{what}: fell back");
+            };
+            assert_eq!(take_counts(), pass.expected(1), "{what}: pass recorded");
+            let cpu = cpu_tile(&layers, &mut store);
+            let flipped = gpu
+                .iter()
+                .zip(&cpu)
+                .filter(|(g, c)| (*g - *c).abs() > mode_bound(mode))
+                .count();
+            println!("{what}: {flipped} of {} channels flipped", gpu.len());
+            assert!(
+                flipped * 1000 <= gpu.len(),
+                "{what}: {flipped} channels flipped"
+            );
+            continue;
+        }
+        let (cpu, w) = gpu_matches_cpu(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            pass,
+            1,
+            mode_bound(mode),
+            &what,
+        );
+        worst = worst.max(w);
+        if mode == BlendMode::Normal {
+            normal = cpu;
+        } else {
+            assert!(
+                max_diff(&cpu, &normal) > 0.01,
+                "{what}: must differ from Normal, or a dropped mode would pass"
+            );
+        }
+    }
+    println!("{pass:?} every mode: worst {worst:e}");
+}
+
+#[test]
+fn gpu_levels_matches_the_cpu_at_every_gpu_blend_mode() {
+    every_mode(
+        Pass::Levels,
+        levels(
+            record(0.0, 1.0, 1.4, 0.0, 1.0),
+            [
+                record(0.1, 0.9, 1.0, 0.0, 1.0),
+                aurora_core::LevelsChannel::identity(),
+                record(0.0, 1.0, 1.0, 0.2, 1.0),
+            ],
+        ),
+        ramp,
+    );
+}
+
+#[test]
+fn gpu_hue_saturation_matches_the_cpu_at_every_gpu_blend_mode() {
+    every_mode(Pass::HueSaturation, hue_sat(100.0, 30.0, -15.0), ramp);
+    every_mode(Pass::HueSaturation, colorize(210.0, 70.0, 10.0), ramp);
+}
+
+/// The same modes on random tiles, where the blend terms meet saturated
+/// and degenerate operands: `Divide`, `ColorBurn`, `ColorDodge` and
+/// `VividLight` amplify a one-step input difference, so only the stable
+/// modes are held to the opaque tolerance here.
+#[test]
+fn gpu_adjustments_match_the_cpu_at_the_stable_modes_on_random_tiles() {
+    let Some(context) = real_gpu_context() else {
+        return;
+    };
+    let stable = [
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::SoftLight,
+        BlendMode::Difference,
+        BlendMode::LinearDodge,
+        BlendMode::Darken,
+    ];
+    for (pass, adjustment) in [
+        (
+            Pass::Levels,
+            levels_master(record(0.05, 0.95, 1.7, 0.1, 0.9)),
+        ),
+        (Pass::HueSaturation, hue_sat(75.0, 35.0, -20.0)),
+    ] {
+        let (_dir, mut store) = store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = pattern_layer(&mut layers, &mut store, random_opaque);
+        let id = add_adjustment(&mut layers, adjustment);
+        ok(layers.set_opacity(id, 0.8));
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        for mode in stable {
+            ok(layers.set_blend_mode(id, mode));
+            let what = format!("random {pass:?} {mode:?}");
+            let _ = gpu_matches_cpu(
+                &context,
+                &mut compositor,
+                &layers,
+                &mut store,
+                pass,
+                1,
+                tolerance(),
+                &what,
+            );
+        }
+    }
+}
+
+#[test]
+fn gpu_adjustments_apply_opacity_times_fill() {
+    let Some(context) = real_gpu_context() else {
+        return;
+    };
+    for (pass, adjustment) in [
+        (Pass::Levels, levels_master(record(0.1, 0.9, 1.6, 0.0, 1.0))),
+        (Pass::HueSaturation, hue_sat(90.0, 40.0, 0.0)),
+    ] {
+        let (_dir, mut store) = store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = pattern_layer(&mut layers, &mut store, random_opaque);
+        let id = add_adjustment(&mut layers, adjustment);
+        ok(layers.set_opacity(id, 0.8));
+        ok(layers.set_fill_opacity(id, 0.5));
+        assert_eq!(crate::content_opacity(&layers, id), Some(0.4));
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let _ = gpu_matches_cpu(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            pass,
+            1,
+            tolerance(),
+            &format!("{pass:?} opacity x fill"),
+        );
+    }
+}
+
+/// Out-of-gamut and negative backdrops (`straight_backdrop` is unclamped).
+/// A non-identity adjustment clamps its input to [0, 1] on both paths; an
+/// identity one under a blend mode passes the value through unchanged.
+#[test]
+fn gpu_adjustments_handle_out_of_gamut_backdrops_like_the_cpu() {
+    let Some(context) = real_gpu_context() else {
+        return;
+    };
+    let identity_levels = aurora_doc::Adjustment::Levels(aurora_core::LevelsParams::identity());
+    let identity_hs =
+        aurora_doc::Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity());
+    let cases = [
+        (
+            Pass::Levels,
+            levels_master(record(0.1, 0.9, 1.6, 0.0, 1.0)),
+            BlendMode::Normal,
+        ),
+        (Pass::Levels, identity_levels, BlendMode::Multiply),
+        (
+            Pass::HueSaturation,
+            hue_sat(90.0, 40.0, 10.0),
+            BlendMode::Normal,
+        ),
+        (
+            Pass::HueSaturation,
+            colorize(40.0, 60.0, 0.0),
+            BlendMode::Normal,
+        ),
+        (Pass::HueSaturation, identity_hs, BlendMode::Multiply),
+    ];
+    for (i, (pass, adjustment, mode)) in cases.into_iter().enumerate() {
+        let (_dir, mut store) = store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = pattern_layer(&mut layers, &mut store, out_of_gamut);
+        let id = add_adjustment(&mut layers, adjustment);
+        ok(layers.set_blend_mode(id, mode));
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        // Out-of-gamut operands push blend terms far out of range; compare
+        // relative to the CPU value (f16 has 11 significant bits), with the
+        // absolute tolerance as a floor.
+        assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+        let _ = take_counts();
+        let Some(gpu) = gpu_tile(&context, &mut compositor, &layers, &mut store) else {
+            unreachable!("case {i}: fell back");
+        };
+        assert_eq!(take_counts(), pass.expected(1), "case {i}: pass recorded");
+        let cpu = cpu_tile(&layers, &mut store);
+        let mut worst = 0.0_f32;
+        for (g, c) in gpu.iter().zip(&cpu) {
+            let allowed = tolerance().max(c.abs() * 4.0 / 2048.0);
+            assert!(
+                (g - c).abs() <= allowed,
+                "case {i} ({pass:?} {mode:?}): GPU {g} vs CPU {c}"
+            );
+            worst = worst.max((g - c).abs() / allowed);
+        }
+        println!("out of gamut case {i} ({pass:?} {mode:?}): worst fraction of allowance {worst}");
+    }
+}
+
+/// Identity adjustments: under `Normal` the CPU skips the layer and the GPU
+/// records no pass (bit-identical to the layer-less composite); under any
+/// other mode the pass runs and passes the value through exactly.
+#[test]
+fn gpu_identity_adjustments_record_no_pass_under_normal_and_one_otherwise() {
+    let Some(context) = real_gpu_context() else {
+        return;
+    };
+    for (pass, adjustment) in [
+        (
+            Pass::Levels,
+            aurora_doc::Adjustment::Levels(aurora_core::LevelsParams::identity()),
+        ),
+        (
+            Pass::HueSaturation,
+            aurora_doc::Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
+        ),
+    ] {
+        let (_dir, mut store) = store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = pattern_layer(&mut layers, &mut store, random_translucent);
+        let without = cpu_tile(&layers, &mut store);
+        let id = add_adjustment(&mut layers, adjustment);
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let (cpu, _) = gpu_matches_cpu(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            pass,
+            0,
+            tolerance(),
+            &format!("{pass:?} identity @Normal"),
+        );
+        assert_eq!(cpu, without, "the CPU skips an identity layer under Normal");
+        ok(layers.set_blend_mode(id, BlendMode::Multiply));
+        let _ = gpu_matches_cpu(
+            &context,
+            &mut compositor,
+            &layers,
+            &mut store,
+            pass,
+            1,
+            translucent_tolerance(),
+            &format!("{pass:?} identity @Multiply"),
+        );
+    }
+}
+
+/// A document with a pixel layer, an adjustment of each kind (and Curves),
+/// a blended pixel layer between them and one on top composites on the GPU
+/// and equals the CPU composite.
+#[test]
+fn a_document_with_levels_and_hue_saturation_layers_composites_on_the_gpu() {
+    let Some(context) = real_gpu_context() else {
+        return;
+    };
+    let (_dir, mut store) = store();
+    let mut layers = aurora_doc::LayerTree::new();
+    let _ = pattern_layer(&mut layers, &mut store, random_opaque);
+    let lv = add_adjustment(
+        &mut layers,
+        levels_master(record(0.05, 0.95, 1.5, 0.0, 1.0)),
+    );
+    ok(layers.set_opacity(lv, 0.9));
+    let mid = pattern_layer(&mut layers, &mut store, ramp_translucent);
+    ok(layers.set_blend_mode(mid, BlendMode::Multiply));
+    ok(layers.set_opacity(mid, 0.7));
+    let hs = add_adjustment(&mut layers, hue_sat(40.0, 20.0, -10.0));
+    ok(layers.set_blend_mode(hs, BlendMode::Overlay));
+    ok(layers.set_opacity(hs, 0.8));
+    let lv2 = add_adjustment(&mut layers, colorize(200.0, 50.0, 0.0));
+    ok(layers.set_opacity(lv2, 0.3));
+    let top = pattern_layer(&mut layers, &mut store, edge_opaque);
+    ok(layers.set_opacity(top, 0.25));
+    let mut compositor = aurora_render::TileCompositor::new(context.device());
+    assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+    let _ = take_counts();
+    let Some(gpu) = gpu_tile(&context, &mut compositor, &layers, &mut store) else {
+        unreachable!("the tile fell back");
+    };
+    assert_eq!(
+        take_counts(),
+        (0, 1, 2),
+        "Levels once, Hue/Saturation twice"
+    );
+    let cpu = cpu_tile(&layers, &mut store);
+    let worst = max_diff(&gpu, &cpu);
+    println!("mixed document: worst |GPU - CPU| = {worst:e}");
+    assert!(worst <= translucent_tolerance(), "worst {worst}");
+}
+
+/// Hue/Saturation with colour ranges stays on the CPU; a ranges layer whose
+/// ranges are neutral (or that is Colorize) is the master path and runs on
+/// the GPU.
+#[test]
+fn hue_saturation_with_active_ranges_stays_on_the_cpu_and_neutral_ranges_do_not() {
+    let base = ok(aurora_core::HueSaturationParams::new(
+        20.0, 10.0, 0.0, false, 0.0, 25.0, 0.0,
+    ));
+    let plain = aurora_core::HueSaturationRangesParams::plain(base);
+    // A range that adjusts something.
+    let reds = ok(aurora_core::HueRange::new(
+        aurora_core::HueRange::standard(0).edges(),
+        30.0,
+        20.0,
+        0.0,
+    ));
+    let Some(ranged) = plain.with_range(0, reds) else {
+        unreachable!("index 0 exists");
+    };
+    // The same, with Colorize on: ranges are ignored.
+    let colorized_base = ok(aurora_core::HueSaturationParams::new(
+        0.0, 0.0, 0.0, true, 120.0, 60.0, 0.0,
+    ));
+    let colorized = ranged.with_base(colorized_base);
+    // Custom edges that adjust nothing.
+    let quiet = ok(aurora_core::HueRange::new(
+        [10.0, 20.0, 30.0, 40.0],
+        0.0,
+        0.0,
+        0.0,
+    ));
+    let Some(neutral_edges) = plain.with_range(1, quiet) else {
+        unreachable!("index 1 exists");
+    };
+
+    let Some(context) = real_gpu_context() else {
+        return;
+    };
+    let cases = [
+        ("ranged", ranged, false),
+        ("colorize with ranges", colorized, true),
+        ("neutral custom edges", neutral_edges, true),
+        ("plain", plain, true),
+    ];
+    for (name, params, gpu_ok) in cases {
+        let (_dir, mut store) = store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = pattern_layer(&mut layers, &mut store, random_opaque);
+        let _ = add_adjustment(
+            &mut layers,
+            aurora_doc::Adjustment::HueSaturationRanges(params),
+        );
+        assert_eq!(
+            crate::document_qualifies_for_gpu_compositing(&layers),
+            gpu_ok,
+            "{name}: predicate"
+        );
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        let _ = take_counts();
+        let gpu = gpu_tile(&context, &mut compositor, &layers, &mut store);
+        if gpu_ok {
+            let Some(gpu) = gpu else {
+                unreachable!("{name}: should run on the GPU");
+            };
+            assert_eq!(take_counts(), (0, 0, 1), "{name}");
+            let cpu = cpu_tile(&layers, &mut store);
+            assert!(max_diff(&gpu, &cpu) <= tolerance(), "{name}");
+        } else {
+            assert!(
+                gpu.is_none(),
+                "{name}: the tile must fall back, not drop it"
+            );
+            assert_eq!(take_counts(), (0, 0, 0), "{name}: no pass recorded");
+        }
+    }
+}
+
+/// Masks, `Dissolve`, `Exclusion` and the non-separable modes keep both
+/// new passes on the CPU, and a group refuses the whole document.
+#[test]
+fn unsupported_levels_and_hue_saturation_layers_fall_back_to_the_cpu() {
+    let Some(context) = real_gpu_context() else {
+        return;
+    };
+    for adjustment in [
+        levels_master(record(0.1, 0.9, 1.5, 0.0, 1.0)),
+        hue_sat(30.0, 0.0, 0.0),
+    ] {
+        for refusal in ["mask", "Dissolve", "Exclusion", "Luminosity"] {
+            let (_dir, mut store) = store();
+            let mut layers = aurora_doc::LayerTree::new();
+            let _ = pattern_layer(&mut layers, &mut store, random_opaque);
+            let id = add_adjustment(&mut layers, adjustment.clone());
+            match refusal {
+                "mask" => ok(layers.add_mask(id, QUAD)),
+                "Dissolve" => ok(layers.set_blend_mode(id, BlendMode::Dissolve)),
+                "Exclusion" => ok(layers.set_blend_mode(id, BlendMode::Exclusion)),
+                _ => ok(layers.set_blend_mode(id, BlendMode::Luminosity)),
+            }
+            assert!(
+                !crate::document_qualifies_for_gpu_compositing(&layers),
+                "{refusal}: the document stays on the CPU"
+            );
+            let mut compositor = aurora_render::TileCompositor::new(context.device());
+            let _ = take_counts();
+            assert!(
+                gpu_tile(&context, &mut compositor, &layers, &mut store).is_none(),
+                "{refusal}: the tile must fall back, not drop the layer"
+            );
+            assert_eq!(take_counts(), (0, 0, 0), "{refusal}");
+        }
+        // A disabled mask is ignored on both paths.
+        let (_dir, mut store) = store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = pattern_layer(&mut layers, &mut store, random_opaque);
+        let id = add_adjustment(&mut layers, adjustment.clone());
+        ok(layers.add_mask(id, QUAD));
+        ok(layers.set_mask_enabled(id, false));
+        assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+        // A group refuses, an adjustment inside it or not.
+        let (_dir, mut store) = self::store();
+        let mut grouped = aurora_doc::LayerTree::new();
+        let _ = pattern_layer(&mut grouped, &mut store, random_opaque);
+        let group = ok(grouped.add_group("Group 1", None));
+        let _ = ok(grouped.add_adjustment_layer_at("inner", adjustment, Some(group), 0));
+        assert!(!crate::document_qualifies_for_gpu_compositing(&grouped));
+    }
+}
+
+/// A hidden Levels / Hue/Saturation layer never disqualifies, and a visible
+/// one now qualifies at the root.
+#[test]
+fn visible_levels_and_hue_saturation_layers_qualify_and_hidden_ones_are_ignored() {
+    let (_dir, mut store) = store();
+    for adjustment in [
+        levels_master(record(0.1, 0.9, 1.5, 0.0, 1.0)),
+        hue_sat(30.0, 0.0, 0.0),
+    ] {
+        let mut layers = aurora_doc::LayerTree::new();
+        let _ = pattern_layer(&mut layers, &mut store, random_opaque);
+        let id = add_adjustment(&mut layers, adjustment);
+        assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+        ok(layers.set_visible(id, false));
+        assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+    }
+}
+
+/// The CPU-side and render-side layouts agree.
+#[test]
+fn the_packed_parameter_layouts_agree_between_filters_and_render() {
+    assert_eq!(
+        aurora_filters::LEVELS_PACKED_LEN,
+        aurora_render::LEVELS_GPU_PARAMS_LEN
+    );
+    assert_eq!(
+        aurora_filters::HUE_SATURATION_PACKED_LEN,
+        aurora_render::HUE_SATURATION_GPU_PARAMS_LEN
+    );
+}
+
+/// `packed_for_gpu` carries exactly the record fields, in the shader's
+/// order: red, green, blue, master.
+#[test]
+fn levels_packed_for_gpu_is_the_records_in_shader_order() {
+    let params = aurora_core::LevelsParams {
+        master: record(0.1, 0.9, 2.0, 0.2, 0.8),
+        red: record(0.3, 0.7, 1.0, 0.0, 1.0),
+        green: aurora_core::LevelsChannel::identity(),
+        blue: record(0.0, 1.0, 0.5, 0.0, 1.0),
+    };
+    let packed = aurora_filters::LevelsLut::new(&params).packed_for_gpu();
+    assert_eq!(
+        &packed[0..8],
+        &[1.0, 0.3, 0.7, 1.0, 0.0, 1.0, 0.0, 0.0],
+        "red"
+    );
+    assert_eq!(&packed[8..16], &[0.0; 8], "green is an identity record");
+    assert_eq!(
+        &packed[16..24],
+        &[1.0, 0.0, 1.0, 2.0, 0.0, 1.0, 1.0, 0.0],
+        "blue"
+    );
+    assert_eq!(
+        &packed[24..32],
+        &[1.0, 0.1, 0.9, 0.5, 0.2, 0.8, 1.0, 0.0],
+        "master"
+    );
+}
+
+#[test]
+fn hue_saturation_packed_for_gpu_is_the_settings_in_shader_order() {
+    let p = ok(aurora_core::HueSaturationParams::new(
+        -45.0, 30.0, -60.0, false, 200.0, 80.0, 20.0,
+    ));
+    let packed = aurora_filters::HueSaturationOp::new(&p).packed_for_gpu();
+    assert_eq!(packed, Some([0.0, 0.0, -45.0, 0.3, -0.6, 200.0, 0.8, 0.2]),);
+    let identity =
+        aurora_filters::HueSaturationOp::new(&aurora_core::HueSaturationParams::identity());
+    assert_eq!(identity.packed_for_gpu().map(|v| v[0]), Some(1.0));
+}

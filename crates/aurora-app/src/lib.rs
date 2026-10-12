@@ -14168,8 +14168,11 @@ fn resolve_tile(
         // transforms the accumulator *below* it, so it is folded by
         // `fold_layer_into`/`apply_adjustment_layer`, which see that
         // accumulator, and never resolved here. A caller that reaches this
-        // arm (the GPU path, whose predicate refuses adjustments first)
-        // gets "nothing to fold", never a wrong composite of the layer.
+        // arm (the GPU path, whose predicate admits only the adjustments
+        // that have a GPU pass -- `adjustment_layer_qualifies_for_gpu` --
+        // and routes those to `begin_gpu_adjustment_pass` before this
+        // function) gets "nothing to fold", never a wrong composite of
+        // the layer.
         aurora_doc::LayerKind::Adjustment(_) => None,
         aurora_doc::LayerKind::Group { children } => {
             // Folded in place, one child at a time, rather than collected
@@ -17934,7 +17937,7 @@ fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> boo
         layers.visible(id) != Some(true)
             || (!layer_renders_effects(layers, id)
                 && clip_base_of(layers, id).is_none()
-                && (curves_layer_qualifies_for_gpu(layers, id)
+                && (adjustment_layer_qualifies_for_gpu(layers, id)
                     || pixel_layer_mode_qualifies_for_gpu(layers, id)))
     })
 }
@@ -17989,32 +17992,53 @@ fn pixel_layer_mode_qualifies_for_gpu(
     )
 }
 
-/// Whether root `id` is a Curves adjustment layer the GPU Curves pass
-/// (0.159.0, `aurora_render::TileCompositor::composite_curves_with_opacity`)
-/// composites exactly as [`apply_adjustment_layer`] does on the CPU:
+/// Whether root `id` is an adjustment layer a GPU adjustment pass
+/// (Curves 0.159.0, `aurora_render::TileCompositor::composite_curves_with_opacity`;
+/// Levels and Hue/Saturation 0.206.0, `composite_levels_with_opacity` and
+/// `composite_hue_saturation_with_opacity`) composites exactly as
+/// [`apply_adjustment_layer`] does on the CPU:
 ///
 /// - **blend mode**: `Normal` or one of the eighteen with their own GPU
 ///   blend math (`aurora_render::curves_mode_code` is the single list —
 ///   every separable mode except `Exclusion`). `Exclusion`, the six
 ///   non-separable modes and `Dissolve` stay on the CPU. `Dissolve` is
 ///   refused because its gate is computed per texel on the CPU for a
-///   pixel layer's *uploaded* texels, and a Curves layer uploads none;
+///   pixel layer's *uploaded* texels, and an adjustment layer uploads none;
 /// - **no enabled mask**: a pixel layer's mask is applied on the CPU to
-///   the texels it uploads ([`resolve_tile`]), and a Curves layer has no
-///   texels to carry it, so a masked Curves layer stays on the CPU. A
-///   disabled mask is ignored on both paths, so it does not refuse.
+///   the texels it uploads ([`resolve_tile`]), and an adjustment layer has
+///   no texels to carry it, so a masked one stays on the CPU. A
+///   disabled mask is ignored on both paths, so it does not refuse;
+/// - **Hue/Saturation with colour ranges** (`Adjustment::HueSaturationRanges`
+///   whose ranges adjust something and Colorize is off) stays on the CPU:
+///   the GPU pass has no per-range model. A ranges layer whose ranges are
+///   neutral, or that is Colorize, is the 0.203.0 path
+///   (`HueSaturationOp::packed_for_gpu` is `Some`) and qualifies.
 ///
 /// Only root level is asked: a group still refuses the whole document in
 /// [`document_qualifies_for_gpu_compositing`], with its children inside.
 #[must_use]
-fn curves_layer_qualifies_for_gpu(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> bool {
+fn adjustment_layer_qualifies_for_gpu(
+    layers: &aurora_doc::LayerTree,
+    id: aurora_doc::LayerId,
+) -> bool {
     let mode = layers
         .blend_mode(id)
         .unwrap_or(aurora_doc::BlendMode::Normal);
-    matches!(
-        layers.adjustment(id),
-        Some(aurora_doc::Adjustment::Curves(_))
-    ) && !layers.mask(id).is_some_and(|mask| mask.enabled)
+    let expressible = match layers.adjustment(id) {
+        Some(
+            aurora_doc::Adjustment::Curves(_)
+            | aurora_doc::Adjustment::Levels(_)
+            | aurora_doc::Adjustment::HueSaturation(_),
+        ) => true,
+        Some(aurora_doc::Adjustment::HueSaturationRanges(params)) => {
+            aurora_filters::HueSaturationOp::with_ranges(params)
+                .packed_for_gpu()
+                .is_some()
+        }
+        None => false,
+    };
+    expressible
+        && !layers.mask(id).is_some_and(|mask| mask.enabled)
         && mode != aurora_doc::BlendMode::Dissolve
         && aurora_render::curves_mode_code(translate_blend_mode(mode)).is_some()
 }
@@ -18362,9 +18386,10 @@ fn create_composite_accumulator(
 /// it just stored, so there is no second, fallible lookup to guard:
 /// the unreachable state is unrepresentable rather than defended
 /// against. 0.86.1.
-/// Records one root Curves layer's GPU pass into `encoder` (0.159.0),
-/// in [`apply_adjustment_layer`]'s order: the same budget charge, the
-/// same skip for an identity curve under `Normal` (an exact passthrough,
+/// Records one root adjustment layer's GPU pass into `encoder` (Curves
+/// 0.159.0; Levels and Hue/Saturation 0.206.0), in
+/// [`apply_adjustment_layer`]'s order: the same budget charge, the same
+/// skip for an identity adjustment under `Normal` (an exact passthrough,
 /// so no pass at all), and nothing to adjust while no layer below has
 /// folded yet (an all-transparent accumulator stays all-transparent on
 /// the CPU too, since the result is written back at the backdrop's own
@@ -18372,10 +18397,11 @@ fn create_composite_accumulator(
 /// two swap, as a blend-math pass does.
 ///
 /// `false` only when the compositor refused the pass (a mode without
-/// Curves math, or a malformed table set), so the caller falls back to
-/// the CPU for this tile rather than dropping the layer.
+/// adjustment math, a malformed table set, Hue/Saturation with active
+/// colour ranges), so the caller falls back to the CPU for this tile
+/// rather than dropping the layer.
 #[allow(clippy::too_many_arguments)]
-fn begin_gpu_curves_pass(
+fn begin_gpu_adjustment_pass(
     gpu: &aurora_gpu::GpuContext,
     compositor: &mut aurora_render::TileCompositor,
     layers: &aurora_doc::LayerTree,
@@ -18389,15 +18415,14 @@ fn begin_gpu_curves_pass(
     if !admit_composite_node(id, layers, 1, budget) {
         return true;
     }
-    let (Some(aurora_doc::Adjustment::Curves(params)), Some(opacity)) =
-        (layers.adjustment(id), content_opacity(layers, id))
+    let (Some(adjustment), Some(opacity)) = (layers.adjustment(id), content_opacity(layers, id))
     else {
         return true;
     };
     let raw_blend_mode = layers
         .blend_mode(id)
         .unwrap_or(aurora_doc::BlendMode::Normal);
-    let lut = curves_lut(params);
+    let lut = AdjustmentLut::of(adjustment);
     if lut.is_identity() && raw_blend_mode == aurora_doc::BlendMode::Normal {
         return true;
     }
@@ -18406,31 +18431,72 @@ fn begin_gpu_curves_pass(
     };
     let spare_accumulator =
         accumulator_or_create(spare, gpu.device(), encoder, tile_extent, "gpu-composite-b");
-    if !compositor.composite_curves_with_opacity(
-        gpu,
-        encoder,
-        params,
-        || lut.packed_for_gpu(),
-        &current_accumulator.1,
-        &spare_accumulator.1,
-        opacity,
-        translate_blend_mode(raw_blend_mode),
-    ) {
-        return false;
+    let mode = translate_blend_mode(raw_blend_mode);
+    let (from, to) = (&current_accumulator.1, &spare_accumulator.1);
+    match (adjustment, &lut) {
+        (aurora_doc::Adjustment::Curves(params), AdjustmentLut::Curves(lut)) => {
+            if !compositor.composite_curves_with_opacity(
+                gpu,
+                encoder,
+                params,
+                || lut.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_curves_dispatch();
+        }
+        (_, AdjustmentLut::Levels(lut)) => {
+            if !compositor.composite_levels_with_opacity(
+                gpu,
+                encoder,
+                &lut.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_levels_dispatch();
+        }
+        (_, AdjustmentLut::HueSaturation(op)) => {
+            let Some(packed) = op.packed_for_gpu() else {
+                return false;
+            };
+            if !compositor.composite_hue_saturation_with_opacity(
+                gpu, encoder, &packed, from, to, opacity, mode,
+            ) {
+                return false;
+            }
+            note_gpu_hue_saturation_dispatch();
+        }
+        (_, AdjustmentLut::Curves(_)) => return false,
     }
-    note_gpu_curves_dispatch();
     std::mem::swap(current_accumulator, spare_accumulator);
     true
 }
 
 /// Test-only count of GPU Curves passes recorded (0.159.0), the
-/// [`GpuBlendDispatches`] convention for the one pass that is not a blend
+/// [`GpuBlendDispatches`] convention for the passes that are not a blend
 /// mode: the only observable that tells "the Curves layer composited on
 /// the GPU" apart from "the tile silently fell back to the CPU, which
 /// computes the same pixels". Process-global; every reader holds the GPU
-/// test lock, as the blend counters' readers do.
+/// test lock, as the blend counters' readers do. Levels and
+/// Hue/Saturation have their own (0.206.0), so one pass type's dispatch
+/// can never be mistaken for another's.
 #[cfg(test)]
 static GPU_CURVES_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Levels passes recorded (0.206.0).
+#[cfg(test)]
+static GPU_LEVELS_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Hue/Saturation passes recorded (0.206.0).
+#[cfg(test)]
+static GPU_HUE_SATURATION_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 fn note_gpu_curves_dispatch() {
@@ -18440,11 +18506,39 @@ fn note_gpu_curves_dispatch() {
 #[cfg(not(test))]
 fn note_gpu_curves_dispatch() {}
 
+#[cfg(test)]
+fn note_gpu_levels_dispatch() {
+    GPU_LEVELS_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_levels_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_hue_saturation_dispatch() {
+    GPU_HUE_SATURATION_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_hue_saturation_dispatch() {}
+
 /// Reads [`GPU_CURVES_DISPATCHES`] and resets it, like
 /// [`take_gpu_blend_dispatch_count`].
 #[cfg(test)]
 fn take_gpu_curves_dispatch_count() -> u64 {
     GPU_CURVES_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_LEVELS_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_levels_dispatch_count() -> u64 {
+    GPU_LEVELS_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_HUE_SATURATION_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_hue_saturation_dispatch_count() -> u64 {
+    GPU_HUE_SATURATION_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn accumulator_or_create<'slot>(
@@ -20152,18 +20246,20 @@ fn begin_gpu_composite_tile(
         // 0.155.0 refused every adjustment layer here: `resolve_tile`
         // hands one back as "nothing to fold", so a GPU pass reaching it
         // would silently drop it. As of 0.159.0 a qualifying Curves layer
-        // (`curves_layer_qualifies_for_gpu`) is its own GPU pass; any
-        // other visible adjustment (a mask, `Dissolve`, a mode without
-        // GPU math) is still this second, local refusal behind the
+        // (`adjustment_layer_qualifies_for_gpu`) is its own GPU pass, and as
+        // of 0.206.0 so is a Levels or Hue/Saturation one; any other
+        // visible adjustment (a mask, `Dissolve`, a mode without GPU
+        // math, Hue/Saturation with colour ranges) is still this second,
+        // local refusal behind the
         // predicate's document-wide one, so the tile falls back to the
         // CPU rather than compositing without the adjustment.
         if layers.visible(id) == Some(true)
             && matches!(layers.kind(id), Some(aurora_doc::LayerKind::Adjustment(_)))
         {
-            if !curves_layer_qualifies_for_gpu(layers, id) {
+            if !adjustment_layer_qualifies_for_gpu(layers, id) {
                 return None;
             }
-            if !begin_gpu_curves_pass(
+            if !begin_gpu_adjustment_pass(
                 gpu,
                 compositor,
                 layers,
@@ -78678,11 +78774,25 @@ mod tests {
         }
 
         #[test]
-        fn a_visible_levels_layer_refuses_the_gpu_path_and_a_hidden_one_does_not() {
+        fn a_visible_masked_levels_layer_refuses_the_gpu_path_and_an_unmasked_one_does_not() {
+            // 0.206.0: an unmasked root Levels layer has a GPU pass; the
+            // mask (applied on the CPU to uploaded texels) still refuses.
             let (_dir, mut store) = real_tile_store();
             let mut layers = stack(&mut store);
             assert!(crate::document_qualifies_for_gpu_compositing(&layers));
             let id = add_levels(&mut layers, stretch());
+            assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+            if let Err(err) = layers.add_mask(
+                id,
+                aurora_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 10,
+                },
+            ) {
+                unreachable!("{err:?}");
+            }
             assert!(!crate::document_qualifies_for_gpu_compositing(&layers));
             if let Err(err) = layers.set_visible(id, false) {
                 unreachable!("{err:?}");
@@ -78913,11 +79023,24 @@ mod tests {
         }
 
         #[test]
-        fn a_visible_layer_refuses_the_gpu_path_and_a_hidden_one_does_not() {
+        fn a_visible_masked_layer_refuses_the_gpu_path_and_a_hidden_one_does_not() {
+            // 0.206.0: an unmasked root layer has a GPU pass; a mask refuses.
             let (_dir, mut store) = real_tile_store();
             let mut layers = stack(&mut store);
             assert!(crate::document_qualifies_for_gpu_compositing(&layers));
             let id = add(&mut layers, params(30.0, 0.0, 0.0), None);
+            assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+            if let Err(err) = layers.add_mask(
+                id,
+                aurora_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 10,
+                },
+            ) {
+                unreachable!("{err:?}");
+            }
             assert!(!crate::document_qualifies_for_gpu_compositing(&layers));
             if let Err(err) = layers.set_visible(id, false) {
                 unreachable!("{err:?}");
@@ -80143,7 +80266,7 @@ mod tests {
                         layers.visible(id),
                         layers.blend_mode(id),
                         layers.mask(id).map(|m| m.enabled),
-                        crate::curves_layer_qualifies_for_gpu(layers, id),
+                        crate::adjustment_layer_qualifies_for_gpu(layers, id),
                     )
                 })
                 .collect();
@@ -87688,3 +87811,6 @@ mod open_time_tests;
 
 #[cfg(test)]
 mod clip_tests;
+
+#[cfg(test)]
+mod gpu_adjustment_tests;

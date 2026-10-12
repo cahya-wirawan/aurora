@@ -394,7 +394,7 @@ fn fs_composite_multiply(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_multiply`'s blend term, `blend_rgb(multiply, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_multiply(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     let b = cb * cs;                       // blend_rgb(Multiply, cb, cs)
@@ -430,7 +430,7 @@ fn fs_composite_darken(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_darken`'s blend term, `blend_rgb(darken, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_darken(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     let b = min(cb, cs);                   // blend_rgb(Darken, cb, cs)
@@ -466,7 +466,7 @@ fn fs_composite_lighten(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_lighten`'s blend term, `blend_rgb(lighten, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_lighten(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     let b = max(cb, cs);                   // blend_rgb(Lighten, cb, cs)
@@ -513,7 +513,7 @@ fn fs_composite_screen(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_screen`'s blend term, `blend_rgb(screen, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_screen(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     let b = cb + cs - cb * cs;          // blend_rgb(Screen, cb, cs)
@@ -571,7 +571,7 @@ fn fs_composite_difference(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_difference`'s blend term, `blend_rgb(difference, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_difference(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     let b = abs(cb - cs);                  // blend_rgb(Difference, cb, cs)
@@ -660,7 +660,7 @@ fn fs_composite_linear_dodge(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_linear_dodge`'s blend term, `blend_rgb(linear_dodge, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_linear_dodge(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     let b = min(cb + cs, vec3<f32>(1.0)); // blend_rgb(LinearDodge, cb, cs)
@@ -772,7 +772,7 @@ fn fs_composite_linear_burn(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_linear_burn`'s blend term, `blend_rgb(linear_burn, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_linear_burn(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     let b = max(cb + cs - 1.0, vec3<f32>(0.0)); // blend_rgb(LinearBurn, cb, cs)
@@ -877,7 +877,7 @@ fn fs_composite_color_burn(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_color_burn`'s blend term, `blend_rgb(color_burn, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_color_burn(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     let b = vec3<f32>(
@@ -994,7 +994,7 @@ fn fs_composite_color_dodge(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_color_dodge`'s blend term, `blend_rgb(color_dodge, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_color_dodge(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     let b = vec3<f32>(
@@ -1135,7 +1135,7 @@ fn fs_composite_overlay(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_overlay`'s blend term, `blend_rgb(overlay, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_overlay(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_rgb(Overlay, cb, cs) == blend_channel(HardLight, cs, cb):
@@ -1297,7 +1297,7 @@ fn fs_composite_hard_light(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_hard_light`'s blend term, `blend_rgb(hard_light, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_hard_light(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_channel(HardLight, cb, cs): Multiply(cb, 2*cs) where cs <= 0.5,
@@ -1412,7 +1412,7 @@ fn fs_composite_linear_light(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_linear_light`'s blend term, `blend_rgb(linear_light, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_linear_light(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_channel(LinearLight, cb, cs): clamp(cb + 2*cs - 1, 0, 1), one
@@ -1664,7 +1664,7 @@ fn fs_composite_vivid_light(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_vivid_light`'s blend term, `blend_rgb(vivid_light, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_vivid_light(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_channel(VividLight, cb, cs): ColorBurn(cb, 2*cs) where cs <= 0.5,
@@ -1909,7 +1909,7 @@ fn fs_composite_hard_mix(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_hard_mix`'s blend term, `blend_rgb(hard_mix, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_hard_mix(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_channel(HardMix, cb, cs): 0.0 where VividLight(cb, cs) < 0.5, else
@@ -2076,7 +2076,7 @@ fn fs_composite_pin_light(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_pin_light`'s blend term, `blend_rgb(pin_light, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_pin_light(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_channel(PinLight, cb, cs): Darken(cb, 2*cs) where cs <= 0.5, else
@@ -2397,7 +2397,7 @@ fn fs_composite_soft_light(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_soft_light`'s blend term, `blend_rgb(soft_light, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_soft_light(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_channel(SoftLight, cb, cs): cb - (1 - 2*cs)*cb*(1 - cb) where
@@ -2584,7 +2584,7 @@ fn fs_composite_subtract(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_subtract`'s blend term, `blend_rgb(subtract, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_subtract(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     let b = max(cb - cs, vec3<f32>(0.0)); // blend_rgb(Subtract, cb, cs)
@@ -2782,7 +2782,7 @@ fn fs_composite_divide(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 // `fs_composite_divide`'s blend term, `blend_rgb(divide, cb, cs)` (0.159.0:
-// shared with `shaders/curves.wgsl`'s `curves_blend`, so the two can
+// shared with `shaders/adjust_common.wgsl`'s `adjustment_blend`, so the two can
 // never drift apart).
 fn blend_divide(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
     // blend_rgb(Divide, cb, cs), one guarded division per channel.

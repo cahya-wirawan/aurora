@@ -2233,6 +2233,12 @@ pub struct TileCompositor {
     /// compositor that never meets a Curves layer never compiles its
     /// shader module. See [`Self::composite_curves_with_opacity`].
     curves: Option<CurvesGpu>,
+    /// The Levels adjustment pass (0.206.0), built on first use like
+    /// [`Self::curves`]. See [`Self::composite_levels_with_opacity`].
+    levels: Option<UniformAdjustmentGpu>,
+    /// The Hue/Saturation adjustment pass (0.206.0), built on first use.
+    /// See [`Self::composite_hue_saturation_with_opacity`].
+    hue_saturation: Option<UniformAdjustmentGpu>,
 }
 
 /// Builds [`TileCompositor::bind_group_layout_blend`]: the opacity
@@ -2488,6 +2494,8 @@ impl TileCompositor {
             shader,
             pipelines: PipelineCache::new(),
             curves: None,
+            levels: None,
+            hue_saturation: None,
         }
     }
 
@@ -4810,11 +4818,14 @@ impl TileCompositor {
 }
 
 /// The Curves pass's WGSL (0.159.0): `shaders/curves.wgsl` appended to
-/// `shaders/composite.wgsl`, whose blend-math helpers and
-/// `straight_backdrop` it calls. Its own module, so [`COMPOSITE_SHADER`]'s
-/// entry-point roster is unchanged.
+/// `shaders/composite.wgsl` and `shaders/adjust_common.wgsl` (0.206.0:
+/// the f16 rounding and blend switch every adjustment pass shares), whose
+/// helpers and `straight_backdrop` it calls. Its own module, so
+/// [`COMPOSITE_SHADER`]'s entry-point roster is unchanged.
 const CURVES_SHADER: &str = concat!(
     include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
     "\n",
     include_str!("shaders/curves.wgsl")
 );
@@ -4846,8 +4857,9 @@ pub const CURVES_GPU_LUT_LEN: usize = 16 + 4 * (CURVES_GPU_LUT_INTERVALS + 1);
 /// sets is about 2 MiB of GPU memory, a fixed bound.
 pub const CURVES_GPU_LUT_CACHE_LEN: usize = 8;
 
-/// `shaders/curves.wgsl`'s `curves_blend` code for `mode`, or `None` for
-/// a mode the Curves pass cannot express (0.159.0). The set is `Normal`
+/// `shaders/adjust_common.wgsl`'s `adjustment_blend` code for `mode`, or
+/// `None` for a mode an adjustment pass cannot express (0.159.0; shared
+/// by the Levels and Hue/Saturation passes since 0.206.0). The set is `Normal`
 /// plus the eighteen modes with their own blend-math entry point in
 /// `shaders/composite.wgsl` (`ALL_BLEND_PASSES`): every separable mode
 /// except `Exclusion`. `Exclusion`, the six non-separable modes and
@@ -5133,6 +5145,277 @@ impl TileCompositor {
     }
 }
 
+/// The Levels pass's WGSL (0.206.0): `shaders/levels.wgsl` appended to
+/// `shaders/composite.wgsl` and `shaders/adjust_common.wgsl`. Its own
+/// module, like [`CURVES_SHADER`].
+const LEVELS_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
+    "\n",
+    include_str!("shaders/levels.wgsl")
+);
+/// The Hue/Saturation pass's WGSL (0.206.0).
+const HUE_SATURATION_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
+    "\n",
+    include_str!("shaders/hue_saturation.wgsl")
+);
+const LABEL_LEVELS: &str = "composite.levels";
+const LABEL_HUE_SATURATION: &str = "composite.hue_saturation";
+
+/// The `f32` length of a Levels pass's parameters (0.206.0), as
+/// `aurora_filters::LevelsLut::packed_for_gpu` builds them and
+/// `shaders/levels.wgsl` reads them: four records (red, green, blue,
+/// master) of eight. `aurora-app` asserts the two lengths agree.
+pub const LEVELS_GPU_PARAMS_LEN: usize = 32;
+
+/// The `f32` length of a Hue/Saturation pass's parameters (0.206.0), as
+/// `aurora_filters::HueSaturationOp::packed_for_gpu` builds them.
+pub const HUE_SATURATION_GPU_PARAMS_LEN: usize = 8;
+
+/// A lazily built adjustment pass whose whole parameter set rides in one
+/// small uniform (0.206.0): bindings 1 (sampler), 3 (backdrop) and 4 (the
+/// uniform, `opacity`, the blend code, two pad words, then the pass's own
+/// `f32`s). No storage buffer and no cache: the parameters are re-sent
+/// per dispatch, a few dozen bytes.
+struct UniformAdjustmentGpu {
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+    /// Debug label of every object this pass creates.
+    label: &'static str,
+}
+
+impl UniformAdjustmentGpu {
+    fn new(
+        device: &wgpu::Device,
+        label: &'static str,
+        source: &str,
+        fragment_entry: &'static str,
+    ) -> Self {
+        let uniform_entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty,
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(label),
+            entries: &[
+                uniform_entry(
+                    1,
+                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                ),
+                uniform_entry(
+                    3,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                ),
+                uniform_entry(
+                    4,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let key = PipelineKey {
+            shader: label,
+            vertex_entry: "vs_composite",
+            fragment_entry,
+            target_format: wgpu::TextureFormat::Rgba16Float,
+            // The shader computes the whole result, as every blend-math
+            // pass does.
+            blend: Blend::None,
+        };
+        let pipeline = composite_pipeline(device, &shader, &key, &layout, label);
+        Self {
+            layout,
+            pipeline,
+            label,
+        }
+    }
+
+    /// Records one full-tile pass reading `backdrop`, writing `dst`, with
+    /// `[opacity, code, 0, 0, params...]` as its uniform.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        sampler: &wgpu::Sampler,
+        params: &[f32],
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        code: u32,
+    ) {
+        let device = context.device();
+        let mut bytes = Vec::with_capacity(16 + params.len() * 4);
+        // `composite_layer_into` clamps the opacity, so the reference does.
+        bytes.extend_from_slice(&opacity.clamp(0.0, 1.0).to_le_bytes());
+        bytes.extend_from_slice(&code.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        for value in params {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(self.label),
+            size: bytes.len() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        context.queue().write_buffer(&uniform, 0, &bytes);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(self.label),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(backdrop),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(self.label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: dst,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    // Every texel is replaced, as in the blend passes.
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+impl TileCompositor {
+    /// Records the Levels adjustment pass (0.206.0): reads `backdrop` (the
+    /// premultiplied accumulator), un-premultiplies it, maps it through the
+    /// Levels records in `params`, blends the result with `mode` at
+    /// `opacity` over the backdrop made opaque, and writes it to `dst`
+    /// premultiplied at the backdrop's own alpha -- `aurora-app`'s CPU
+    /// `apply_adjustment_layer` with `aurora_filters::LevelsLut`, which is
+    /// the reference. See `shaders/levels.wgsl`.
+    ///
+    /// `params` is `aurora_filters::LevelsLut::packed_for_gpu`'s output
+    /// ([`LEVELS_GPU_PARAMS_LEN`] values). Returns `false`, recording
+    /// nothing, when `mode` has no adjustment blend math
+    /// ([`curves_mode_code`]) or a value is not finite; the caller then
+    /// composites on the CPU. The mask and `Dissolve` are not handled
+    /// here: `aurora-app` keeps such a layer on the CPU.
+    ///
+    /// Records into `encoder`; does not submit. `backdrop` and `dst` must
+    /// be different `Rgba16Float` textures of the same size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_levels_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &[f32; LEVELS_GPU_PARAMS_LEN],
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        if !params.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let device = context.device();
+        let pass = self.levels.get_or_insert_with(|| {
+            UniformAdjustmentGpu::new(device, LABEL_LEVELS, LEVELS_SHADER, "fs_composite_levels")
+        });
+        pass.record(
+            context,
+            encoder,
+            &self.sampler,
+            params,
+            backdrop,
+            dst,
+            opacity,
+            code,
+        );
+        true
+    }
+
+    /// Records the Hue/Saturation adjustment pass (0.206.0), the same
+    /// shape as [`Self::composite_levels_with_opacity`]: the CPU reference
+    /// is `aurora_filters::HueSaturationOp::apply` (master and Colorize
+    /// only), `params` is `HueSaturationOp::packed_for_gpu`'s output
+    /// ([`HUE_SATURATION_GPU_PARAMS_LEN`] values). See
+    /// `shaders/hue_saturation.wgsl`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_hue_saturation_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &[f32; HUE_SATURATION_GPU_PARAMS_LEN],
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        if !params.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let device = context.device();
+        let pass = self.hue_saturation.get_or_insert_with(|| {
+            UniformAdjustmentGpu::new(
+                device,
+                LABEL_HUE_SATURATION,
+                HUE_SATURATION_SHADER,
+                "fs_composite_hue_saturation",
+            )
+        });
+        pass.record(
+            context,
+            encoder,
+            &self.sampler,
+            params,
+            backdrop,
+            dst,
+            opacity,
+            code,
+        );
+        true
+    }
+}
+
 impl std::fmt::Debug for TileCompositor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TileCompositor")
@@ -5357,7 +5640,7 @@ mod tests {
     use aurora_tile::{CHANNELS, SAMPLES, TILE};
     use half::f16;
 
-    /// 0.159.0 review (I2): the Curves pass's `curves_blend` switch, the
+    /// 0.159.0 review (I2): the adjustment passes' `adjustment_blend` switch, the
     /// `curves_mode_code` codes and `ALL_BLEND_PASSES` cannot drift apart.
     /// Every mode is either refused by `curves_mode_code` or, for every
     /// mode but `Normal`, has a blend-math pass `fs_composite_<mode>` whose
@@ -5367,7 +5650,7 @@ mod tests {
     /// re-inlining its formula instead of calling the helper fails here.
     #[test]
     fn curves_switch_matches_curves_mode_code_and_all_blend_passes() {
-        let curves_source = include_str!("shaders/curves.wgsl");
+        let curves_source = include_str!("shaders/adjust_common.wgsl");
         let modes = [
             (BlendMode::Normal, "normal"),
             (BlendMode::Darken, "darken"),
@@ -5428,7 +5711,7 @@ mod tests {
             let arm = format!("        case {code}u: {{ return blend_{snake}(cb, cs); }}");
             assert!(
                 curves_source.contains(&arm),
-                "{mode:?}: the Curves switch must call blend_{snake} under code {code}"
+                "{mode:?}: the adjustment switch must call blend_{snake} under code {code}"
             );
         }
         assert_eq!(admitted, BLEND_MATH_PASS_COUNT + 1);

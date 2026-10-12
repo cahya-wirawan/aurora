@@ -61,8 +61,9 @@ mod test_support;
 
 pub use composite::{
     BLEND_MATH_PASS_COUNT, BlendMode, CURVES_GPU_LUT_CACHE_LEN, CURVES_GPU_LUT_INTERVALS,
-    CURVES_GPU_LUT_LEN, TileCompositor, composite_layer_into, composite_tile_cpu, curves_mode_code,
-    transparent_tile, un_premultiply_in_place,
+    CURVES_GPU_LUT_LEN, HUE_SATURATION_GPU_PARAMS_LEN, LEVELS_GPU_PARAMS_LEN, TileCompositor,
+    composite_layer_into, composite_tile_cpu, curves_mode_code, transparent_tile,
+    un_premultiply_in_place,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use composite::{set_transparent_skip_enabled, transparent_chunks_skipped};

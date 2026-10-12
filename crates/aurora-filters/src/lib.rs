@@ -15,8 +15,8 @@ pub mod shadow;
 pub mod stroke;
 
 pub use curves::{CURVES_LUT_INTERVALS, CURVES_PACKED_HEADER, CURVES_PACKED_LEN, CurvesLut};
-pub use hue_saturation::{HueSaturationOp, range_weight};
-pub use levels::{EXACT_INTERVALS, LEVELS_LUT_INTERVALS, LevelsLut};
+pub use hue_saturation::{HUE_SATURATION_PACKED_LEN, HueSaturationOp, range_weight};
+pub use levels::{EXACT_INTERVALS, LEVELS_LUT_INTERVALS, LEVELS_PACKED_LEN, LevelsLut};
 pub use shadow::shadow_coverage;
 pub use stroke::{StrokeSide, stroke_coverage, stroke_reach};
 
