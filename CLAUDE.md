@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Three crates are still skeletons holding only a placeholder `crate_name()` and one test: `aurora-ai`, `aurora-plugin`, and the `aurora-cli` binary. `aurora-filters` stopped being one in 0.155.0 (Curves, its only real code so far). Everything else is real code.
 
-**[PLAN.md](PLAN.md) is the progress tracker** — task-level status per milestone, every `[x]` backed by linked evidence. Check it before starting work, and update the relevant checkbox in the same commit as the work. Its "Where we are" and "Next action" sections are the maintained, current summary; this file's summary is deliberately shorter and goes stale faster, so **PLAN.md wins on any disagreement**. README.md's status paragraph is also kept current, aimed at outside readers.
+**[PLAN.md](PLAN.md) is the progress tracker** — task-level status per milestone, every `[x]` backed by linked evidence. Check it before starting work, and update the relevant checkbox in the same commit as the work. Its "Where we are" and "Next action" sections are the maintained, current summary; this file's summary is deliberately shorter and goes stale faster, so **PLAN.md wins on any disagreement**. [STATUS.md](STATUS.md) is the maintained status document and [CHANGELOG.md](CHANGELOG.md) the per-version list; README stays a stable front page.
 
 ### What is not done
 
@@ -146,6 +146,7 @@ SemVer, started at `0.0.1`, currently `0.202.1`. The single source of truth is `
 - **Minor** (`0.X.0`): every PLAN.md step — a task-level unit of work landing in its own commit (the same granularity PLAN.md's own checkboxes track).
 - **Patch** (`0.0.X`): a bug fix — correcting something that was already landed and wrong, not new work.
 - Bump the version in the same commit as the work it covers, the same discipline PLAN.md's own checkbox updates already follow.
+- Every version bump adds a line to CHANGELOG.md (`scripts/gen_changelog.py` regenerates it) and updates STATUS.md if the status changed.
 
 A release is a `vX.Y.Z` tag (e.g. `v0.1.0`) pushed once the matching version bump is committed — pushing that tag is what actually publishes a GitHub Release, so treat it as a deliberate, user-approved action, not a routine one. `.github/workflows/release.yml` re-runs the full gate (`verify.yml`, the same jobs `ci.yml` runs on every push/PR) against the tagged commit, confirms the tag matches `Cargo.toml`'s own version, then creates the Release. Ordinary commits and PRs are still checked immediately via `ci.yml` regardless of tags — CLAUDE.md's own "cross-platform breakage is cheap to fix now" principle applies to every commit, not just tagged ones.
 
