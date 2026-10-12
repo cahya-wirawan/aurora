@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-12, version 0.205.0.** This file is updated every round (every
+**As of 2026-10-12, version 0.206.0.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -207,8 +207,11 @@ golden-image tests are `#[ignore]`d.
   Curves.
 - **Levels** (0.202.0): New Levels Layer, a Properties editor with channel
   tabs and five sliders (input black, gamma, input white, output black, output
-  white), per-channel then master order, `levl` layers imported. **CPU
-  compositing only** (a visible Levels layer refuses the GPU path). On
+  white), per-channel then master order, `levl` layers imported. **GPU
+  compositing for an unmasked root layer at Normal or one of 18 blend modes
+  (0.206.0, verified on an RTX 3090/Vulkan only, within 4.9e-4 of the CPU on
+  opaque backdrops; Metal/DX12 unverified); masked layers and the other modes
+  stay on the CPU.** On
   `adjustments/levels_rgb.psd` against Photoshop's merged image: max error
   (2, 2, 6) levels for R, G, B, mean (0.266, 0.247, 0.429); the maximum of 6 in
   blue is not investigated. **PSD save of Levels layers works
@@ -220,8 +223,10 @@ golden-image tests are `#[ignore]`d.
   layers imported. **Per-colour-range adjustments (0.204.0)**: a range selector
   (Master, Reds ... Magentas) re-binds the three sliders; ranges render by a
   fitted model (see PLAN.md) and PSD layers using them import, with the edges
-  the file stores (edges are not editable in the UI). **CPU compositing only** (a visible Hue/Saturation
-  layer refuses the GPU path); **PSD save of Hue/Saturation layers works
+  the file stores (edges are not editable in the UI). **GPU compositing for the master and Colorize
+  settings of an unmasked root layer (0.206.0, RTX 3090/Vulkan only, within
+  4.9e-4 of the CPU on opaque backdrops; Metal/DX12 unverified); a layer with
+  active colour ranges, a mask or an unadmitted blend mode stays on the CPU**; **PSD save of Hue/Saturation layers works
   (0.205.0)**: written as `hue2` adjustment layers, values rounded to whole numbers and itemised. Against Photoshop's merged image: Colorize layers match to a mean
   of about 0.4-0.5 levels (max 3); a master-only layer is about 1-1.4 levels on
   saturated pixels but tens of levels off on near-grey pixels at Saturation
