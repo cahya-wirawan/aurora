@@ -256,6 +256,23 @@ def check_locks(folder):
     print(f"OK: psd-tools read the locks of {len(spec)} layers")
 
 
+def check_clips(folder):
+    """0.201.0: the record clipping byte reads back as psd-tools' clipping."""
+    spec_path = folder / "clips.json"
+    if not spec_path.exists():
+        print("no clips.json: the clipping pass was skipped")
+        return
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    psd = PSDImage.open(folder / "clips.psd")
+    by_name = {layer.name: layer for layer in psd}
+    for want in spec:
+        layer = by_name.get(want["name"])
+        if layer is None:
+            fail(f"clips: no layer {want['name']}")
+        check(f"{want['name']} clipping", bool(layer.clipping), want["clipping"])
+    print(f"OK: psd-tools read the clipping of {len(spec)} layers")
+
+
 def smart_objects(psd):
     """Every smart object layer of `psd`, as (name, unique id, data) in file order."""
     out = []
@@ -311,4 +328,5 @@ if __name__ == "__main__":
     main()
     check_groups(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_locks(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
+    check_clips(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_smart(Path(sys.argv[1] if len(sys.argv) > 1 else "."))

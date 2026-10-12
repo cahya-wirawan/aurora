@@ -36,6 +36,15 @@ pub enum DocError {
     /// Smart-object data failed its bounds (0.200.0).
     #[error("invalid smart object data: {0}")]
     InvalidSmartObject(crate::smart_object::SmartObjectError),
+    /// [`crate::LayerTree::set_clipped`] was asked to clip a layer that has
+    /// no layer beneath it in its group (0.201.0): there is nothing to
+    /// clip to.
+    #[error("layer {0:?} has no layer beneath it in its group to be clipped to")]
+    NoClipBase(LayerId),
+    /// [`crate::LayerTree::set_clipped`] was asked to clip a group (0.201.0):
+    /// only pixel and adjustment layers can be clipped.
+    #[error("layer {0:?} is a group and cannot be clipped")]
+    GroupCannotBeClipped(LayerId),
     /// A group-only blend mode ([`crate::BlendMode::PassThrough`],
     /// 0.179.0) was set on, or decoded for, a layer that is not a group.
     #[error("layer {0:?} is not a group, so it cannot use Pass Through blending")]

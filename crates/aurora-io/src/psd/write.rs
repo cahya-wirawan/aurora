@@ -568,6 +568,9 @@ pub struct PsdExpectedLayer {
     pub visible: bool,
     /// The record's locks (0.198.0): flags bit 0 and the `lspf` block.
     pub lock: aurora_doc::LayerLock,
+    /// The record's clipping byte (0.201.0): `1` when the layer is clipped
+    /// to a base beneath it.
+    pub clipped: bool,
     /// The record's rectangle: top, left, bottom, right.
     pub rect: [i32; 4],
     /// A hash of every written `u16` sample (channel, position, value).
@@ -990,6 +993,7 @@ fn plan_props(
             fill: opacity_byte(layers.fill_opacity(id).unwrap_or(1.0)),
             visible: layers.visible(id).unwrap_or(true),
             lock: layers.lock(id).unwrap_or_default(),
+            clipped: layers.clip_base(id).is_some(),
             rect,
             sample_hash: 0,
             decoded_hash: 0,
@@ -1017,6 +1021,7 @@ fn plan_group_end() -> LayerPlan {
             fill: u8::MAX,
             visible: true,
             lock: aurora_doc::LayerLock::none(),
+            clipped: false,
             rect: [0; 4],
             sample_hash: 0,
             decoded_hash: 0,
@@ -1695,7 +1700,12 @@ fn write_records<W: Write + Seek>(
         // Flags bit 1 SET means hidden; bit 0 means transparency protected
         // (0.198.0).
         let flags: u8 = record_flags(&plan.expected);
-        w.write_all(&[plan.expected.opacity, 0, flags, 0])?;
+        w.write_all(&[
+            plan.expected.opacity,
+            u8::from(plan.expected.clipped),
+            flags,
+            0,
+        ])?;
         let extra = record_extra(plan)?;
         let extra_len = u32::try_from(extra.len()).map_err(|_| too_large("layer record"))?;
         w.write_all(&extra_len.to_be_bytes())?;
@@ -2022,8 +2032,13 @@ fn raw_record<R: std::io::Read + Seek>(
         raw.array::<4>()?,
         psd_blend_key(want.blend),
     )?;
-    let [opacity, _clip, flags, _filler] = raw.array::<4>()?;
+    let [opacity, clip, flags, _filler] = raw.array::<4>()?;
     check(&format!("layer {i} opacity"), opacity, want.opacity)?;
+    check(
+        &format!("layer {i} clipping byte"),
+        clip,
+        u8::from(want.clipped),
+    )?;
     check(
         &format!("layer {i} hidden flag"),
         flags & 0x02 != 0,
@@ -2371,6 +2386,11 @@ pub(crate) fn verify_psd_file_with_budget(
             Some(want.visible),
         )?;
         check(&format!("layer {i} locks"), l.lock(id), Some(want.lock))?;
+        check(
+            &format!("layer {i} clipping"),
+            l.clip_base(id).is_some(),
+            want.clipped,
+        )?;
         check(
             &format!("layer {i} smart object"),
             l.smart_object(id)

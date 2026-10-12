@@ -93,7 +93,7 @@
 //!   as pixel coverage — alone, or multiplied with the real user mask —
 //!   with the vector-mask density; the conversion itself is reported,
 //!   since the path is not kept. Feather (user or vector) is reported,
-//!   not applied; clipping, layer effects, blending ranges ("Blend If")
+//!   not applied; layer effects, blending ranges ("Blend If")
 //!   and knockout are not applied either.
 //!   Curves adjustment layers (`curv`, 0.158.0) are imported as real
 //!   `aurora_doc::Adjustment::Curves` layers ([`PsdNode::Adjustment`]);
@@ -311,7 +311,8 @@ pub struct PsdProps {
     /// The layer's locks (0.198.0): the record's flags bit 0 and the `lspf`
     /// block (see `lock_from_psd`).
     pub lock: aurora_doc::LayerLock,
-    /// Clipped to the layer below — not supported, so shown unclipped.
+    /// Clipped to the layer below (record byte `clipping` != 0), applied
+    /// by `Builder::apply` through `History::set_clipped` (0.201.0).
     pub clipped: bool,
     /// The layer's effects (0.180.0), stored on the layer as data and not
     /// rendered yet.
@@ -441,7 +442,6 @@ enum Note {
     VectorMaskRasterised,
     VectorMaskDisabledDropped,
     ClippingDropped,
-    ClippedOverlaysUnclipped,
     ShadowNoiseNotApplied,
     ShadowContourNotApplied,
     EffectScaleNotApplied,
@@ -600,11 +600,6 @@ fn note_text(note: Note, n: u64) -> String {
              can't be turned back on.",
             if one { "it" } else { "they" },
         ),
-        Note::ClippedOverlaysUnclipped => format!(
-            "{n} colour overlay{s}, drop shadow{s} or stroke{s} on clipped layers {is} drawn \
-             unclipped, \
-             over the layer's whole shape, because Aurora doesn't have clipping masks yet."
-        ),
         Note::EffectScaleNotApplied => format!(
             "{n} layer style{s} with an effect scale other than 100 % {is} drawn at the \
              effects' stored sizes (the scale isn't applied)."
@@ -637,8 +632,9 @@ fn note_text(note: Note, n: u64) -> String {
             aurora_core::effects::MAX_SHADOW_APRON
         ),
         Note::ClippingDropped => format!(
-            "{n} clipped layer{s} {is} shown unclipped — Aurora doesn't have clipping masks \
-             yet."
+            "{n} clipped layer{s} {is} shown unclipped — {} base is a group or an adjustment \
+             layer, or there is no layer beneath to clip to.",
+            if one { "its" } else { "their" }
         ),
         Note::DropShadowsNotShown => format!(
             "{n} drop shadow{s} {is}n't shown yet; {} kept with the layer.",
@@ -2918,17 +2914,6 @@ fn note_unsupported_kept(
         Some(Ok(read)) => {
             let fx = &read.effects;
             if overlays_drawn {
-                if record.clipping != 0 {
-                    // Review of 0.181.0: the effect is drawn, but the layer
-                    // is shown unclipped, so it covers more than Photoshop's.
-                    notes.add_n(
-                        Note::ClippedOverlaysUnclipped,
-                        (fx.shown_color_overlays()
-                            + fx.shown_drop_shadows()
-                            + fx.shown_color_strokes()
-                            + fx.shown_soft_glows()) as u64,
-                    );
-                }
                 // 0.182.0 review (DS-4): the style's scale is not applied;
                 // say so where it would matter.
                 if fx.shows_any() && (fx.scale - 100.0).abs() > 1e-3 {
@@ -3004,9 +2989,6 @@ fn note_unsupported_kept(
         // An `lrFX`-only record: the legacy block is not parsed.
         None if record.features.effects => notes.add(Note::EffectsNotShown),
         None => {}
-    }
-    if record.clipping != 0 {
-        notes.add(Note::ClippingDropped);
     }
     if record.mask_unreadable && record.has_channel(-2) {
         notes.add(Note::MaskUnreadable);
@@ -4064,7 +4046,7 @@ fn build_streamed(
         layers: nodes,
         composite,
         linked_files,
-        notes,
+        mut notes,
         ..
     } = file;
     let canvas = Rect {
@@ -4086,6 +4068,7 @@ fn build_streamed(
         src,
         profile: &profile,
         canvas,
+        clip_refused: 0,
     };
     if nodes.is_empty() {
         if let Some(image) = composite {
@@ -4106,6 +4089,7 @@ fn build_streamed(
     } else {
         builder.add_nodes(nodes, None, 0)?;
     }
+    notes.add_n(Note::ClippingDropped, builder.clip_refused);
     // No second `take_failure` check here (0.154.0 review I1): every read
     // this build makes (`decode_pending`) propagates its own error with
     // `?`; only the tree build's mask decode swallows one, and
@@ -4128,6 +4112,9 @@ struct Builder<'b, 'k, 's> {
     src: Option<&'b mut (dyn ByteSource + 's)>,
     profile: &'b SharedProfile,
     canvas: Rect,
+    /// Layers whose clipping flag Aurora cannot honour (0.201.0): shown
+    /// unclipped, reported as [`Note::ClippingDropped`].
+    clip_refused: u64,
 }
 
 impl Builder<'_, '_, '_> {
@@ -4364,6 +4351,29 @@ impl Builder<'_, '_, '_> {
         }
         if props.lock.is_any() {
             self.history.set_lock(self.layers, id, props.lock)?;
+        }
+        if props.clipped {
+            match self.history.set_clipped(self.layers, id, true) {
+                Ok(_) => {
+                    // Aurora composites a clip group over a pixel base only.
+                    let base_is_pixel = self.layers.clip_base(id).is_some_and(|base| {
+                        matches!(
+                            self.layers.kind(base),
+                            Some(aurora_doc::LayerKind::Pixel { .. })
+                        )
+                    });
+                    if !base_is_pixel {
+                        self.clip_refused = self.clip_refused.saturating_add(1);
+                    }
+                }
+                // The bottom-most layer of its group, or a group: shown
+                // unclipped, as Photoshop shows a clipped bottom layer.
+                Err(
+                    aurora_doc::DocError::NoClipBase(_)
+                    | aurora_doc::DocError::GroupCannotBeClipped(_),
+                ) => self.clip_refused = self.clip_refused.saturating_add(1),
+                Err(err) => return Err(err.into()),
+            }
         }
         if let Some(effects) = &props.effects {
             self.history

@@ -2281,6 +2281,82 @@ impl LayerTree {
         Ok(())
     }
 
+    /// Whether the layer carries the clipping flag (0.201.0); `false` for
+    /// an unknown layer. The flag alone is not "clipped": a flagged layer
+    /// with nothing beneath it in its group (it was moved or its base was
+    /// removed) composites unclipped; see [`Self::clip_base`].
+    #[must_use]
+    pub fn clipped(&self, id: LayerId) -> bool {
+        self.layers.get(&id).is_some_and(|entry| entry.clipped)
+    }
+
+    /// The layer a clipped layer is clipped to (0.201.0): the nearest layer
+    /// beneath it in its own group (or the root list) that is **not**
+    /// itself clipped. `None` when `id` is not flagged clipped, or nothing
+    /// unclipped lies beneath it.
+    #[must_use]
+    pub fn clip_base(&self, id: LayerId) -> Option<LayerId> {
+        if !self.clipped(id) {
+            return None;
+        }
+        let siblings = self.sibling_slice(self.parent(id))?;
+        // Newest first: layers beneath `id` come after it.
+        let at = siblings.iter().position(|&s| s == id)?;
+        siblings
+            .get(at.checked_add(1)?..)?
+            .iter()
+            .copied()
+            .find(|&below| !self.clipped(below))
+    }
+
+    fn sibling_slice(&self, parent: Option<LayerId>) -> Option<&[LayerId]> {
+        match parent {
+            None => Some(&self.roots),
+            Some(parent) => match &self.layers.get(&parent)?.kind {
+                LayerKind::Group { children } => Some(children),
+                LayerKind::Pixel { .. } | LayerKind::Adjustment(_) => None,
+            },
+        }
+    }
+
+    /// Sets or clears the clipping flag (0.201.0): Photoshop's "Create
+    /// Clipping Mask" / "Release Clipping Mask". Clearing always works.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::UnknownLayer`] if `id` doesn't exist;
+    /// [`DocError::GroupCannotBeClipped`] for a group;
+    /// [`DocError::NoClipBase`] when clipping a layer with no layer beneath
+    /// it in its group (the bottom-most layer of a group has no base).
+    /// Nothing is changed when any happens.
+    pub fn set_clipped(&mut self, id: LayerId, value: bool) -> Result<(), DocError> {
+        let entry = self.layers.get(&id).ok_or(DocError::UnknownLayer(id))?;
+        if value {
+            if matches!(entry.kind, LayerKind::Group { .. }) {
+                return Err(DocError::GroupCannotBeClipped(id));
+            }
+            let siblings = self.sibling_slice(entry.parent).unwrap_or(&[]);
+            let has_below = siblings
+                .iter()
+                .position(|&s| s == id)
+                .and_then(|at| siblings.get(at.checked_add(1)?..))
+                .is_some_and(|below| !below.is_empty());
+            if !has_below {
+                return Err(DocError::NoClipBase(id));
+            }
+        }
+        self.set_clipped_flag(id, value)
+    }
+
+    /// [`Self::set_clipped`] without the base check: what journal replay
+    /// and undo use, where the operation was validated when it was first
+    /// made and the tree may since have been rearranged.
+    pub(crate) fn set_clipped_flag(&mut self, id: LayerId, value: bool) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        entry.clipped = value;
+        Ok(())
+    }
+
     /// The layer's preserved smart-object data (0.200.0), or `None` when
     /// it has none or `id` does not exist.
     #[must_use]

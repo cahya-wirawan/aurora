@@ -1261,6 +1261,81 @@ fn write_psd_fixtures_for_psd_tools() {
         out.join("locks.json"),
         format!("[{}]", spec.join(",")),
     ));
+
+    // 0.201.0: `clips.psd` — a base, two clipped layers, a free layer and a
+    // clipped layer on it — for psd-tools' `clipping_layer` check.
+    let (clips_bytes, names) = clipping_document_bytes();
+    ok(std::fs::write(out.join("clips.psd"), clips_bytes));
+    ok(std::fs::write(
+        out.join("clips.json"),
+        format!(
+            "[{}]",
+            names
+                .iter()
+                .map(|(name, clipped)| format!("{{\"name\":{name:?},\"clipping\":{clipped}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    ));
+}
+
+/// Bottom to top: base, c1 (clipped), c2 (clipped), free, c3 (clipped).
+fn clipping_document_bytes() -> (Vec<u8>, Vec<(String, bool)>) {
+    let mut doc = Doc::new((16, 16));
+    let mut names = Vec::new();
+    for (name, clipped) in [
+        ("base", false),
+        ("c1", true),
+        ("c2", true),
+        ("free", false),
+        ("c3", true),
+    ] {
+        let id = doc.layer(name, rect(0, 0, 16, 16), None);
+        if clipped {
+            ok(doc.tree.set_clipped(id, true));
+        }
+        names.push((name.to_owned(), clipped));
+    }
+    let (bytes, _) = ok(doc.write());
+    (bytes, names)
+}
+
+/// 0.201.0: clipping round-trips through the writer, the writer's own
+/// verifier and the reader, and a record's clipping byte is exactly the
+/// layer's.
+#[test]
+fn clipping_round_trips_through_write_verify_and_read() {
+    let (bytes, names) = clipping_document_bytes();
+    let back = read_back(&bytes);
+    for (name, clipped) in names {
+        let found = back
+            .layers
+            .roots()
+            .iter()
+            .copied()
+            .find(|&id| back.layers.name(id) == Some(name.as_str()));
+        let Some(id) = found else {
+            unreachable!("layer {name}");
+        };
+        assert_eq!(back.layers.clip_base(id).is_some(), clipped, "{name}");
+    }
+    // c2's base is the layer two below it, c3's is "free".
+    let by = |n: &str| {
+        back.layers
+            .roots()
+            .iter()
+            .copied()
+            .find(|&id| back.layers.name(id) == Some(n))
+    };
+    assert_eq!(by("c2").and_then(|c| back.layers.clip_base(c)), by("base"));
+    assert_eq!(by("c3").and_then(|c| back.layers.clip_base(c)), by("free"));
+    assert!(
+        !back
+            .report
+            .items
+            .iter()
+            .any(|i| i.contains("clipped layer"))
+    );
 }
 
 #[allow(dead_code)]

@@ -167,6 +167,17 @@ enum LayerOp {
         id: LayerId,
         value: Option<Box<crate::smart_object::SmartObject>>,
     },
+    /// Set or clear a layer's clipping flag (0.201.0): Photoshop's "Create
+    /// Clipping Mask" / "Release Clipping Mask". Appended last for the
+    /// postcard-ordinal reason above. Also the carrier for the flag a
+    /// journaled `Restore` holds in memory but cannot put on the wire
+    /// (`LayerEntry::clipped` is `#[serde(skip)]`), like
+    /// [`Self::SetEffects`]. A build older than 0.201.0 refuses a journal
+    /// holding it.
+    SetClipped {
+        id: LayerId,
+        value: bool,
+    },
 }
 
 /// Every `(layer, smart object)` pair a journaled `Restore` carries in a
@@ -182,10 +193,24 @@ fn restored_smart_objects(op: &LayerOp) -> Vec<(LayerId, Box<crate::smart_object
     }
 }
 
-/// Every `(layer, effects)` pair a journaled `Restore` carries in a
-/// subtree entry whose effects would be lost on the wire.
+/// Every layer id a journaled `Restore` carries with its clipping flag set
+/// (the flag would be lost on the wire).
 /// [`History::save_journal`]'s helper, the twin of
 /// [`reduced_mask_densities`].
+fn restored_clipped(op: &LayerOp) -> Vec<LayerId> {
+    match op {
+        LayerOp::Restore(subtree) => subtree
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.clipped)
+            .map(|(id, _)| *id)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every `(layer, effects)` pair a journaled `Restore` carries whose
+/// effects would be lost on the wire.
 fn restored_effects(op: &LayerOp) -> Vec<(LayerId, Box<aurora_core::LayerEffects>)> {
     match op {
         LayerOp::Restore(subtree) => subtree
@@ -395,6 +420,12 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
             // offset and blur), so the whole composite is invalidated.
             Ok((LayerOp::SetEffects { id, value: old }, None))
         }
+        LayerOp::SetClipped { id, value } => {
+            let old = tree.clipped(id);
+            tree.set_clipped_flag(id, value)?;
+            // `None`: clipping changes where a layer's effects reach too.
+            Ok((LayerOp::SetClipped { id, value: old }, None))
+        }
         LayerOp::SetSmartObject { id, value } => {
             let old = tree.smart_object(id).cloned().map(Box::new);
             tree.set_smart_object(id, value.map(|so| *so))?;
@@ -553,6 +584,14 @@ fn describe(op: &LayerOp) -> String {
             Some(_) => format!("Changed layer effects on layer #{}", id.to_raw()),
             None => format!("Removed layer effects from layer #{}", id.to_raw()),
         },
+        LayerOp::SetClipped { id, value } => {
+            let verb = if *value {
+                "Clipped"
+            } else {
+                "Released the clipping of"
+            };
+            format!("{verb} layer #{}", id.to_raw())
+        }
         LayerOp::SetSmartObject { id, value } => match value {
             Some(_) => format!("Kept the smart object data of layer #{}", id.to_raw()),
             None => format!("Removed the smart object data of layer #{}", id.to_raw()),
@@ -841,6 +880,13 @@ impl History {
                 wire.push(std::borrow::Cow::Owned(LayerOp::SetEffects {
                     id,
                     value: Some(value),
+                }));
+            }
+            // The clipping flag (0.201.0) the same way.
+            for id in restored_clipped(op) {
+                wire.push(std::borrow::Cow::Owned(LayerOp::SetClipped {
+                    id,
+                    value: true,
                 }));
             }
             // Smart-object data (0.200.0) the same way.
@@ -1304,6 +1350,27 @@ impl History {
         self.journal.push(LayerOp::SetLock { id, value });
         self.push(LayerOp::SetLock { id, value: old });
         Ok(layer_dirty_rect(tree, id))
+    }
+
+    /// Same as [`LayerTree::set_clipped`], recorded for undo as one step
+    /// (0.201.0). Nothing is recorded when it fails (a layer with nothing
+    /// beneath it, a group, an unknown id). Returns `None` for the dirty
+    /// rectangle: clipping changes the whole composite the layer reaches.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LayerTree::set_clipped`].
+    pub fn set_clipped(
+        &mut self,
+        tree: &mut LayerTree,
+        id: LayerId,
+        value: bool,
+    ) -> Result<Option<Rect>, DocError> {
+        let old = tree.clipped(id);
+        tree.set_clipped(id, value)?;
+        self.journal.push(LayerOp::SetClipped { id, value });
+        self.push(LayerOp::SetClipped { id, value: old });
+        Ok(None)
     }
 
     /// Same as [`LayerTree::add_mask`], recorded for undo — **and, unlike
@@ -5598,5 +5665,72 @@ mod adjustment_tests {
         let id = crate::LayerId::from_raw(1);
         let bytes = postcard::to_allocvec(&LayerOp::SetSmartObject { id, value: None });
         assert_eq!(bytes.ok().and_then(|b| b.first().copied()), Some(17));
+    }
+
+    #[test]
+    fn set_clipped_refuses_without_a_base_undoes_replays_and_survives_a_restore() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let base = history
+            .add_pixel_layer(&mut tree, "base", bounds, None)
+            .ok();
+        let top = history.add_pixel_layer(&mut tree, "top", bounds, None).ok();
+        let (Some(base), Some(top)) = (base, top) else {
+            unreachable!("layers add");
+        };
+        // The bottom-most layer has no base; nothing is recorded.
+        let steps = history.journal_len();
+        assert!(matches!(
+            history.set_clipped(&mut tree, base, true),
+            Err(DocError::NoClipBase(_))
+        ));
+        assert_eq!(history.journal_len(), steps);
+        assert!(history.set_clipped(&mut tree, top, true).is_ok());
+        assert_eq!(tree.clip_base(top), Some(base));
+        // Straight after the edit, the journal alone replays to the flag.
+        let early = History::load_journal(&history.save_journal().unwrap_or_default());
+        assert!(
+            early
+                .ok()
+                .and_then(|h| h.replay().ok())
+                .is_some_and(|t| t.clipped(top))
+        );
+        // Undo, redo.
+        assert!(history.undo(&mut tree).is_ok());
+        assert!(!tree.clipped(top));
+        assert!(history.redo(&mut tree).is_ok());
+        assert!(tree.clipped(top));
+        // The journal alone replays to the flag, through the wire.
+        let loaded = History::load_journal(&history.save_journal().unwrap_or_default());
+        let replayed = loaded.ok().and_then(|h| h.replay().ok());
+        assert!(replayed.is_some_and(|t| t.clipped(top)));
+        // Removing and restoring the clipped layer keeps it (the carrier op).
+        assert!(history.remove(&mut tree, top).is_ok());
+        assert!(history.undo(&mut tree).is_ok());
+        assert!(tree.clipped(top));
+        let loaded = History::load_journal(&history.save_journal().unwrap_or_default());
+        let replayed = loaded.ok().and_then(|h| h.replay().ok());
+        assert!(replayed.is_some_and(|t| t.clipped(top)));
+        // A released layer is no longer clipped; a group cannot be clipped.
+        assert!(history.set_clipped(&mut tree, top, false).is_ok());
+        assert_eq!(tree.clip_base(top), None);
+        let group = history.add_group(&mut tree, "g", None).ok();
+        assert!(group.is_some_and(|g| matches!(
+            tree.set_clipped(g, true),
+            Err(DocError::GroupCannotBeClipped(_))
+        )));
+    }
+
+    #[test]
+    fn set_clipped_is_appended_after_set_smart_object() {
+        let id = crate::LayerId::from_raw(1);
+        let bytes = postcard::to_allocvec(&LayerOp::SetClipped { id, value: true });
+        assert_eq!(bytes.ok().and_then(|b| b.first().copied()), Some(18));
     }
 }

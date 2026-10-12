@@ -435,6 +435,13 @@ pub(crate) struct LayerEntry {
     /// [`crate::History::save_journal`] emits after a journaled `Restore`.
     #[serde(skip)]
     pub(crate) smart_object: Option<Box<crate::smart_object::SmartObject>>,
+    /// Whether the layer is clipped to the layer beneath it (0.201.0,
+    /// Photoshop's "Create Clipping Mask"). `#[serde(skip)]` for the same
+    /// reason as [`Self::effects`]: it travels as `.aur`'s optional
+    /// `layer-clipping` entry and as the `LayerOp::SetClipped` that
+    /// [`crate::History::save_journal`] emits after a journaled `Restore`.
+    #[serde(skip)]
+    pub(crate) clipped: bool,
 }
 
 impl LayerEntry {
@@ -451,6 +458,7 @@ impl LayerEntry {
             mask: None,
             effects: None,
             smart_object: None,
+            clipped: false,
         }
     }
 }

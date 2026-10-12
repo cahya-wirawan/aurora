@@ -404,6 +404,82 @@ fn read_layer_effects<R: Read + Seek>(
     Ok(())
 }
 
+/// The optional entry carrying which layers are clipped to the layer
+/// beneath them (0.201.0): `LayerEntry::clipped` is `#[serde(skip)]` in the
+/// positional manifest, like the effects. Written only when some layer is
+/// clipped to a base (a flagged layer with nothing beneath it composites
+/// unclipped and is not written), so every other save stays
+/// byte-identical; a file without it opens with nothing clipped, which is
+/// what every older file means. **Versioned, and a newer version refuses
+/// the file** loudly like [`LAYER_EFFECTS_ENTRY`]. An Aurora older than
+/// 0.201.0 ignores the entry, but refuses the file anyway whenever its
+/// journal holds a `SetClipped` op (an unknown ordinal).
+const LAYER_CLIPPING_ENTRY: &str = "layer-clipping";
+
+/// [`LAYER_CLIPPING_ENTRY`]'s own schema version.
+const LAYER_CLIPPING_VERSION: u32 = 1;
+
+/// The largest [`LAYER_CLIPPING_ENTRY`] read: ids, ten bytes each at most.
+const MAX_LAYER_CLIPPING_BYTES: u64 = 16 * 1024 * 1024;
+
+/// [`LAYER_CLIPPING_ENTRY`]'s payload: version first (frozen), then the raw
+/// ids of the clipped layers.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LayerClippingWire {
+    version: u32,
+    clipped: Vec<u64>,
+}
+
+/// The raw ids of every layer clipped to a base, in [`layer_ids`] order.
+fn layer_clipping_ids(layers: &LayerTree) -> Vec<u64> {
+    layer_ids(layers)
+        .into_iter()
+        .filter(|&id| layers.clip_base(id).is_some())
+        .map(aurora_doc::LayerId::to_raw)
+        .collect()
+}
+
+/// Reads [`LAYER_CLIPPING_ENTRY`] if present and applies it to `layers`.
+///
+/// # Errors
+///
+/// [`IoError::ManifestDeserialization`] for an unknown version, bytes that
+/// do not decode, or an id naming a missing layer, a group or a layer with
+/// nothing beneath it (`LayerTree::set_clipped`'s checks).
+fn read_layer_clipping<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    layers: &mut LayerTree,
+) -> Result<(), IoError> {
+    let bytes = match zip.by_name(LAYER_CLIPPING_ENTRY) {
+        Ok(file) => read_capped(file, LAYER_CLIPPING_ENTRY, MAX_LAYER_CLIPPING_BYTES)?,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let (prefix, _rest) = postcard::take_from_bytes::<MaskDensityPrefix>(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    if prefix.version != LAYER_CLIPPING_VERSION {
+        let cause = if prefix.version > LAYER_CLIPPING_VERSION {
+            "the file was saved by a newer Aurora"
+        } else {
+            "the entry is damaged or of an unknown kind"
+        };
+        return Err(IoError::ManifestDeserialization(format!(
+            "unsupported layer-clipping version {} (this build understands version \
+             {LAYER_CLIPPING_VERSION}); {cause}",
+            prefix.version
+        )));
+    }
+    let wire: LayerClippingWire = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    // Bottom-most first, so each layer's base exists and is already settled.
+    for raw in wire.clipped {
+        layers
+            .set_clipped(aurora_doc::LayerId::from_raw(raw), true)
+            .map_err(|err| IoError::ManifestDeserialization(format!("layer clipping: {err}")))?;
+    }
+    Ok(())
+}
+
 /// The optional entry carrying the document's preserved Photoshop smart
 /// objects (0.200.0): each smart-object layer's `aurora_doc::SmartObject`
 /// (`LayerEntry::smart_object` is `#[serde(skip)]`) and the list of
@@ -1706,6 +1782,8 @@ struct DocumentEntries {
     mask_densities: Option<Vec<u8>>,
     /// [`LAYER_EFFECTS_ENTRY`], when some layer has effects (0.180.0).
     layer_effects: Option<Vec<u8>>,
+    /// [`LAYER_CLIPPING_ENTRY`], when some layer is clipped (0.201.0).
+    layer_clipping: Option<Vec<u8>>,
     /// [`IMPORT_LOSSES_ENTRY`], when the document has any (0.177.0).
     import_losses: Option<Vec<u8>>,
     /// [`SMART_OBJECTS_ENTRY`] and the embedded files, when the document
@@ -1760,11 +1838,25 @@ impl DocumentEntries {
                     .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
             )
         };
+        let clipped = layer_clipping_ids(layers);
+        let layer_clipping = if clipped.is_empty() {
+            None
+        } else {
+            let wire = LayerClippingWire {
+                version: LAYER_CLIPPING_VERSION,
+                clipped,
+            };
+            Some(
+                postcard::to_allocvec(&wire)
+                    .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
+            )
+        };
         Ok(Self {
             manifest,
             history,
             mask_densities,
             layer_effects,
+            layer_clipping,
             import_losses: None,
             smart_objects: smart_entries(layers)?,
         })
@@ -1789,6 +1881,10 @@ impl DocumentEntries {
         }
         if let Some(bytes) = &self.layer_effects {
             zip.start_file(LAYER_EFFECTS_ENTRY, deflated)?;
+            zip.write_all(bytes)?;
+        }
+        if let Some(bytes) = &self.layer_clipping {
+            zip.start_file(LAYER_CLIPPING_ENTRY, deflated)?;
             zip.write_all(bytes)?;
         }
         if let Some(smart) = &self.smart_objects {
@@ -2184,6 +2280,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     let mut layers = manifest.layers;
     read_mask_densities(&mut zip, &mut layers)?;
     read_layer_effects(&mut zip, &mut layers)?;
+    read_layer_clipping(&mut zip, &mut layers)?;
     read_smart_objects(&mut zip, &mut layers)?;
 
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
@@ -4746,6 +4843,85 @@ mod tests {
             }
             Err(err) => unreachable!("{err:?}"),
         }
+    }
+
+    /// 0.201.0: clipping survives a save and reopen — the optional
+    /// `layer-clipping` entry restores the flags, the journal replays to
+    /// them, an unclipped document writes no entry, and an unknown entry
+    /// version refuses the file.
+    #[test]
+    fn round_trips_clipping_and_refuses_a_newer_entry_version() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let add = |name: &str, layers: &mut LayerTree, history: &mut History| match history
+            .add_pixel_layer(layers, name, bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let base = add("base", &mut layers, &mut history);
+        let top = add("top", &mut layers, &mut history);
+        let free = add("free", &mut layers, &mut history);
+        let write_bytes = |layers: &LayerTree, history: &History, store: &mut TileStore| {
+            let mut bytes = Cursor::new(Vec::new());
+            if let Err(err) = write(
+                &mut bytes,
+                layers,
+                history,
+                (100, 100),
+                None,
+                &SkippedTiles::new(),
+                store,
+            ) {
+                unreachable!("{err:?}");
+            }
+            bytes.into_inner()
+        };
+        let plain = write_bytes(&layers, &history, &mut store);
+        assert!(
+            effects_entry_names(&plain)
+                .iter()
+                .all(|n| n != super::LAYER_CLIPPING_ENTRY),
+            "an unclipped document writes no entry"
+        );
+        if let Err(err) = history.set_clipped(&mut layers, top, true) {
+            unreachable!("{err:?}");
+        }
+        let bytes = write_bytes(&layers, &history, &mut store);
+        assert!(
+            effects_entry_names(&bytes)
+                .iter()
+                .any(|n| n == super::LAYER_CLIPPING_ENTRY)
+        );
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.clone()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(document.layers.clip_base(top), Some(base));
+        assert!(!document.layers.clipped(free));
+        match document.history.replay() {
+            Ok(replayed) => assert!(replayed.clipped(top) && !replayed.clipped(free)),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        let payload = postcard::to_allocvec(&super::LayerClippingWire {
+            version: super::LAYER_CLIPPING_VERSION + 1,
+            clipped: vec![top.to_raw()],
+        })
+        .unwrap_or_default();
+        let tampered = with_named_entry(&bytes, super::LAYER_CLIPPING_ENTRY, Some(&payload));
+        let (_dir3, mut fresh) = real_tile_store();
+        assert!(read(Cursor::new(tampered), &mut fresh).is_err());
+        // An entry naming the bottom layer is refused, never half-applied.
+        let payload = postcard::to_allocvec(&super::LayerClippingWire {
+            version: super::LAYER_CLIPPING_VERSION,
+            clipped: vec![base.to_raw()],
+        })
+        .unwrap_or_default();
+        let tampered = with_named_entry(&bytes, super::LAYER_CLIPPING_ENTRY, Some(&payload));
+        let (_dir4, mut fresh) = real_tile_store();
+        assert!(read(Cursor::new(tampered), &mut fresh).is_err());
     }
 
     /// 0.158.0: a Curves layer whose curves have **moved endpoints** (a
