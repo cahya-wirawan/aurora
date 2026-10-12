@@ -479,9 +479,23 @@ fn lock_room(scales: &Scales) -> u32 {
 
 /// A row's lock icon (the one `Lock` icon among its children), if any.
 fn row_lock_icon(tree: &WidgetTree<WidgetKind>, row: WidgetId) -> Option<WidgetId> {
-    tree.children(row)?.iter().copied().find(|&child| {
-        matches!(tree.payload(child), Some(WidgetKind::Icon(state)) if state.kind == IconKind::Lock)
-    })
+    row_icon_of_kind(tree, row, IconKind::Lock)
+}
+
+/// A row's clip icon (0.201.1; the one `Clip` icon among its children of a
+/// clipped row), if any.
+fn row_clip_icon(tree: &WidgetTree<WidgetKind>, row: WidgetId) -> Option<WidgetId> {
+    row_icon_of_kind(tree, row, IconKind::Clip)
+}
+
+fn row_icon_of_kind(
+    tree: &WidgetTree<WidgetKind>,
+    row: WidgetId,
+    kind: IconKind,
+) -> Option<WidgetId> {
+    tree.children(row)?.iter().copied().find(
+        |&child| matches!(tree.payload(child), Some(WidgetKind::Icon(state)) if state.kind == kind),
+    )
 }
 
 /// Shows or hides `icon` (`Display::None` when hidden: no space, no hit,
@@ -568,9 +582,10 @@ fn insert_layer_row(
         _ => 0,
     };
     // A layer clipped to a base beneath it (0.201.0) sits one level in, like
-    // Photoshop's indented clipped rows. (No dedicated clip glyph exists in
-    // the icon set yet; the row's description says "clipped".)
-    let depth = depth + usize::from(layers.clip_base(id).is_some());
+    // Photoshop's indented clipped rows, and (0.201.1) shows the Clip glyph
+    // in that indent step. The row's description still says "clipped".
+    let clipped = layers.clip_base(id).is_some();
+    let depth = depth + usize::from(clipped);
     set_tree_item_flat(tree, row, label_inset(scales, depth))?;
     set_tree_item_key(tree, row, Some(id.to_raw()))?;
     if !children.is_empty() {
@@ -604,6 +619,23 @@ fn insert_layer_row(
         eye_access(&name, visible),
     )?;
     place_icon(tree, eye, (eye_column(scales) - side) / 2.0, top)?;
+    if clipped {
+        // The clipped row's extra indent step is one icon side wide
+        // (`spacing.md` both), so the glyph fills exactly the room the
+        // indent already reserved: no row gets wider or taller, and the
+        // chevron, thumbnail, name, lock and blend label keep the places
+        // `label_inset` gave them.
+        let clip = insert_icon(
+            tree,
+            row,
+            scales,
+            IconKind::Clip,
+            IconSize::Small,
+            IconTone::Secondary,
+            IconAccess::Decorative,
+        )?;
+        place_icon(tree, clip, chevron_x(scales, depth.saturating_sub(1)), top)?;
+    }
     if !children.is_empty() {
         let chevron = insert_icon(
             tree,
@@ -795,6 +827,9 @@ pub fn sync_layer_row(
         changed |= set_lock_icon_shown(tree, lock, locked)?;
         changed |= set_icon_tone(tree, lock, tone(true))?;
     }
+    if let Some(clip) = row_clip_icon(tree, row) {
+        changed |= set_icon_tone(tree, clip, tone(true))?;
+    }
     Ok(changed)
 }
 
@@ -829,6 +864,14 @@ pub fn set_layer_row_selected(
             IconTone::Secondary
         };
         set_icon_tone(tree, lock, tone)?;
+    }
+    if let Some(clip) = row_clip_icon(tree, row) {
+        let tone = if selected {
+            IconTone::OnAccent
+        } else {
+            IconTone::Secondary
+        };
+        set_icon_tone(tree, clip, tone)?;
     }
     Ok(())
 }
@@ -2694,6 +2737,145 @@ mod thumbnail_slot_tests {
             row_of(&rows, group),
             None
         )));
+    }
+
+    fn clip_children(
+        tree: &WidgetTree<WidgetKind>,
+        rows: &HashMap<WidgetId, LayerId>,
+        layer: LayerId,
+    ) -> Vec<WidgetId> {
+        tree.children(row_of(rows, layer))
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .filter(|&c| matches!(tree.payload(c), Some(WidgetKind::Icon(s)) if s.kind == IconKind::Clip))
+            .collect()
+    }
+
+    /// 0.201.1: a clipped row shows exactly one decorative `Clip` icon in
+    /// its extra indent step; an unclipped row, a group and a base show
+    /// none, and nothing else on the row moves or overlaps.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_clipped_row_has_exactly_one_clip_icon_in_its_indent_and_the_rest_still_fits() {
+        let scales = scales();
+        let mut layers = LayerTree::new();
+        let base = ok(layers.add_pixel_layer("Base", rect(), None));
+        let over = ok(layers.add_pixel_layer("Over", rect(), None));
+        ok(layers.set_clipped(over, true));
+        ok(layers.set_blend_mode(over, BlendMode::Multiply));
+        ok(layers.set_lock(over, aurora_doc::LayerLock::all()));
+        let group = ok(layers.add_group("Group", None));
+        let inner_base = ok(layers.add_pixel_layer("Inner base", rect(), Some(group)));
+        let inner = ok(layers.add_pixel_layer("Inner", rect(), Some(group)));
+        ok(layers.set_clipped(inner, true));
+        let mut ws = crate::build_workspace(&scales);
+        let rows = ok(populate_layers_panel(
+            &mut ws.tree,
+            ws.layers,
+            &scales,
+            &layers,
+        ));
+        ws.tree.compute_layout(1600.0, 900.0);
+        for layer in [base, group, inner_base] {
+            assert!(
+                clip_children(&ws.tree, &rows, layer).is_empty(),
+                "{layer:?}"
+            );
+        }
+        for layer in [over, inner] {
+            let clips = clip_children(&ws.tree, &rows, layer);
+            assert_eq!(clips.len(), 1, "exactly one Clip icon");
+            let Some(&clip) = clips.first() else {
+                unreachable!("one clip icon");
+            };
+            let state = ok(icon_state(&ws.tree, clip));
+            assert_eq!(state.tone, IconTone::Secondary);
+            assert_eq!(state.access, IconAccess::Decorative);
+            assert!(
+                ws.tree
+                    .accessibility(clip)
+                    .is_some_and(accesskit::Node::is_hidden),
+                "decorative: not announced"
+            );
+            // The row's own accessible description is unchanged.
+            assert!(layer_row_description(&layers, layer).contains(", clipped"));
+            // Geometry: the clip icon sits in the indent step between the
+            // eye column and the chevron slot, inside the row, left of the
+            // thumbnail, and overlaps no sibling icon, the thumbnail or the
+            // blend label's side of the row.
+            let row = row_of(&rows, layer);
+            let (Some(r), Some(c)) = (ws.tree.bounds(row), ws.tree.bounds(clip)) else {
+                unreachable!("laid out");
+            };
+            let Some(WidgetKind::TreeItem(item)) = ws.tree.payload(row) else {
+                unreachable!("a row");
+            };
+            assert_eq!((c.width, c.height), (16, 16));
+            assert!(c.x >= r.x && c.y >= r.y && c.y + 16 <= r.y + i64::from(r.height));
+            let slot_x = r.x + i64::from(item.label_inset) - 8 - 24;
+            assert!(c.x + 16 <= slot_x, "left of the thumbnail slot: {c:?}");
+            let parent_depth = i64::from(layer == inner);
+            assert_eq!(
+                c.x - r.x,
+                32 + 8 + 16 * parent_depth,
+                "the indent step the clipped depth added"
+            );
+            for &other in ws.tree.children(row).unwrap_or_default() {
+                if other == clip {
+                    continue;
+                }
+                let Some(o) = ws.tree.bounds(other) else {
+                    continue;
+                };
+                if o.width == 0 || o.height == 0 {
+                    continue;
+                }
+                let apart = o.x >= c.x + i64::from(c.width)
+                    || o.x + i64::from(o.width) <= c.x
+                    || o.y >= c.y + i64::from(c.height)
+                    || o.y + i64::from(o.height) <= c.y;
+                // The inner row is a child row of nothing here; its own
+                // child widgets are icons and a thumbnail only.
+                assert!(apart, "clip {c:?} overlaps {o:?}");
+            }
+        }
+        // The Multiply label and the lock column are where an unclipped
+        // row's would be (right-aligned, reserved on every row): the
+        // clipped row's label inset is one indent step more, nothing else.
+        let inset = |layer| match ws.tree.payload(row_of(&rows, layer)) {
+            Some(WidgetKind::TreeItem(item)) => (item.label_inset, item.right_inset),
+            _ => unreachable!("a row"),
+        };
+        let (base_left, base_right) = inset(base);
+        let (over_left, over_right) = inset(over);
+        assert_eq!(over_left, base_left + 16);
+        assert_eq!(over_right, base_right);
+        let lock = ws
+            .tree
+            .children(row_of(&rows, over))
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .find(|&c| matches!(ws.tree.payload(c), Some(WidgetKind::Icon(s)) if s.kind == IconKind::Lock));
+        let (Some(lock), Some(row_b)) = (lock, ws.tree.bounds(row_of(&rows, over))) else {
+            unreachable!("lock and row");
+        };
+        let Some(lock_b) = ws.tree.bounds(lock) else {
+            unreachable!("laid out");
+        };
+        assert!(lock_b.x + i64::from(lock_b.width) <= row_b.x + i64::from(row_b.width));
+        // Selecting retones it for the highlight and deselecting restores.
+        let row = row_of(&rows, over);
+        ok(set_layer_row_selected(&mut ws.tree, row, true));
+        let Some(&clip) = clip_children(&ws.tree, &rows, over).first() else {
+            unreachable!("one clip icon");
+        };
+        assert_eq!(ok(icon_state(&ws.tree, clip)).tone, IconTone::OnAccent);
+        ok(set_layer_row_selected(&mut ws.tree, row, false));
+        assert_eq!(ok(icon_state(&ws.tree, clip)).tone, IconTone::Secondary);
+        ok(sync_layer_row(&mut ws.tree, row, &layers, over));
+        assert_eq!(ok(icon_state(&ws.tree, clip)).tone, IconTone::Secondary);
     }
 
     #[test]
