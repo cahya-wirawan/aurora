@@ -11739,6 +11739,35 @@ fn record_stroke(
     }
 }
 
+/// Records one finished Paint Bucket fill or Gradient (0.209.0): the
+/// composite is invalidated narrowly like a dab (the filled layer tiles and
+/// the reach of the layer's effects), the snapshot becomes **one** undo
+/// step labelled `label` in the user's undo order, and the History panel
+/// is refreshed. A fill that changed nothing (an empty snapshot) records
+/// nothing. Returns whether a step was recorded.
+#[allow(clippy::too_many_arguments)]
+fn commit_fill(
+    workspace: &mut aurora_ui::Workspace,
+    layers: &aurora_doc::LayerTree,
+    layer: aurora_doc::LayerId,
+    filled: fill_tools::Filled,
+    label: &str,
+    cache: &mut CompositeCache,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    undo_order: &mut UndoOrder,
+) -> bool {
+    let reference_origin = composite_reference_origin(layers, Some(layer));
+    invalidate_painted_tiles(cache, layers, layer, &filled.painted, reference_origin);
+    let before = undo_order.undo.len();
+    record_stroke(filled.snapshot, label, history, pixel_history, undo_order);
+    let recorded = undo_order.undo.len() != before;
+    if recorded {
+        refresh_history_panel(workspace, undo_order);
+    }
+    recorded
+}
+
 /// Starts a drag for `tool`/`button` at `canvas_point` (already
 /// canvas-area-relative — see [`pointer_in_canvas`]), or `None` if this
 /// tool/button combination doesn't start one. The middle button always
@@ -29422,25 +29451,17 @@ impl App {
             }
             Err(fill_tools::FillRefused::Nothing) => {}
             Ok(filled) => {
-                let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer));
-                invalidate_painted_tiles(
-                    &mut self.doc.composite_cache,
+                commit_fill(
+                    &mut self.workspace,
                     &self.doc.layers,
                     layer,
-                    &filled.painted,
-                    reference_origin,
-                );
-                let before = self.doc.undo_order.undo.len();
-                record_stroke(
-                    filled.snapshot,
+                    filled,
                     label,
+                    &mut self.doc.composite_cache,
                     &mut self.doc.history,
                     &mut self.doc.pixel_history,
                     &mut self.doc.undo_order,
                 );
-                if self.doc.undo_order.undo.len() != before {
-                    refresh_history_panel(&mut self.workspace, &self.doc.undo_order);
-                }
                 self.needs_redraw = true;
             }
         }

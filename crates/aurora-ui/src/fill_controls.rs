@@ -282,3 +282,182 @@ pub fn shown_fill_group(tree: &WidgetTree<WidgetKind>, controls: &ToolControls) 
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FillView, TOLERANCE_MAX, is_fill_tool, opacity_readout_text, shown_fill_group,
+        sync_fill_controls, tolerance_readout_text,
+    };
+    use crate::tool::Tool;
+    use crate::tool_controls::{ToolControls, insert_tool_controls, tool_controls_contains};
+    use crate::workspace::build_workspace;
+    use aurora_theme::Scales;
+    use aurora_widgets::widgets::WidgetKind;
+    use aurora_widgets::{WidgetId, WidgetTree};
+    use taffy::Display;
+
+    fn scales() -> Scales {
+        const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
+        match Scales::from_toml_str(SCALES_TOML) {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    const VIEW: FillView = FillView {
+        radial: false,
+        reverse: false,
+        opacity: 100,
+        tolerance: 32,
+        contiguous: true,
+    };
+
+    fn built() -> (crate::Workspace, ToolControls) {
+        let scales = scales();
+        let mut ws = build_workspace(&scales);
+        let controls = match insert_tool_controls(
+            &mut ws.tree,
+            ws.options_bar,
+            ws.properties,
+            &scales,
+        ) {
+            Ok(controls) => controls,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        ws.tree.compute_layout(1600.0, 900.0);
+        (ws, controls)
+    }
+
+    fn sync(
+        ws: &mut crate::Workspace,
+        controls: &ToolControls,
+        tool: Tool,
+        view: FillView,
+        captured: Option<WidgetId>,
+    ) -> bool {
+        match sync_fill_controls(&mut ws.tree, controls, tool, view, captured) {
+            Ok(changed) => changed,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn shown(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> bool {
+        tree.style(id).is_some_and(|s| s.display != Display::None)
+    }
+
+    fn hidden_to_at(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> bool {
+        tree.accessibility(id).is_some_and(accesskit::Node::is_hidden)
+    }
+
+    #[test]
+    fn each_fill_tool_shows_only_its_own_group_and_other_tools_show_neither() {
+        let (mut ws, controls) = built();
+        // Fresh: nothing shown.
+        assert_eq!(shown_fill_group(&ws.tree, &controls), None);
+        for (tool, gradient, bucket) in [
+            (Tool::Gradient, true, false),
+            (Tool::PaintBucket, false, true),
+            (Tool::Brush, false, false),
+            (Tool::Eraser, false, false),
+            (Tool::Move, false, false),
+        ] {
+            sync(&mut ws, &controls, tool, VIEW, None);
+            ws.tree.compute_layout(1600.0, 900.0);
+            let fill = controls.fill;
+            assert_eq!(shown(&ws.tree, fill.gradient), gradient, "{tool:?}");
+            assert_eq!(shown(&ws.tree, fill.bucket), bucket, "{tool:?}");
+            assert_eq!(hidden_to_at(&ws.tree, fill.gradient), !gradient, "{tool:?}");
+            assert_eq!(hidden_to_at(&ws.tree, fill.bucket), !bucket, "{tool:?}");
+            // The radius readout belongs to every tool but the fill tools.
+            assert_eq!(shown(&ws.tree, controls.readout), !is_fill_tool(tool), "{tool:?}");
+        }
+        sync(&mut ws, &controls, Tool::Gradient, VIEW, None);
+        assert_eq!(shown_fill_group(&ws.tree, &controls), Some(Tool::Gradient));
+    }
+
+    #[test]
+    fn a_shown_group_has_real_size_and_every_widget_is_inside_the_tool_controls() {
+        let (mut ws, controls) = built();
+        let fill = controls.fill;
+        for (tool, ids) in [
+            (
+                Tool::Gradient,
+                vec![fill.linear, fill.radial, fill.reverse, fill.opacity],
+            ),
+            (Tool::PaintBucket, vec![fill.tolerance, fill.contiguous]),
+        ] {
+            sync(&mut ws, &controls, tool, VIEW, None);
+            ws.tree.compute_layout(1600.0, 900.0);
+            for id in ids {
+                assert!(tool_controls_contains(&ws.tree, &controls, id));
+                let Some(b) = ws.tree.bounds(id) else {
+                    unreachable!("laid out");
+                };
+                assert!(b.width > 0 && b.height > 0, "{tool:?} {id:?} {b:?}");
+                let bar = ws.tree.bounds(ws.options_bar).map_or(0, |b| b.right());
+                assert!(b.right() <= bar, "{tool:?} {id:?} fits the options bar");
+            }
+        }
+    }
+
+    #[test]
+    fn the_widgets_mirror_the_settings_and_a_second_identical_sync_changes_nothing() {
+        let (mut ws, controls) = built();
+        let view = FillView {
+            radial: true,
+            reverse: true,
+            opacity: 40,
+            tolerance: 200,
+            contiguous: false,
+        };
+        assert!(sync(&mut ws, &controls, Tool::Gradient, view, None));
+        assert!(!sync(&mut ws, &controls, Tool::Gradient, view, None));
+        let fill = controls.fill;
+        let on = |id| matches!(ws.tree.payload(id), Some(WidgetKind::Button(s)) if s.toggled == Some(true));
+        assert!(!on(fill.linear) && on(fill.radial), "a radio pair");
+        let slider = |id| match ws.tree.payload(id) {
+            Some(WidgetKind::Slider(s)) => s.value,
+            other => unreachable!("{other:?}"),
+        };
+        assert!((slider(fill.opacity) - 40.0).abs() < f64::EPSILON);
+        assert!((slider(fill.tolerance) - 200.0).abs() < f64::EPSILON);
+        let label = |id| match ws.tree.payload(id) {
+            Some(WidgetKind::Label(s)) => s.text.clone(),
+            other => unreachable!("{other:?}"),
+        };
+        assert_eq!(label(fill.opacity_readout), "Opacity 40 %");
+        assert_eq!(label(fill.tolerance_readout), "Tolerance 200");
+        let checked = |id| match ws.tree.payload(id) {
+            Some(WidgetKind::Checkbox(s)) => s.checked,
+            other => unreachable!("{other:?}"),
+        };
+        assert_eq!(checked(fill.reverse), accesskit::Toggled::True);
+        assert_eq!(checked(fill.contiguous), accesskit::Toggled::False);
+        assert_eq!(opacity_readout_text(100), "Opacity 100 %");
+        assert_eq!(tolerance_readout_text(0), "Tolerance 0");
+        assert!((TOLERANCE_MAX - 255.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_slider_mid_drag_keeps_its_value_but_the_readout_follows() {
+        let (mut ws, controls) = built();
+        let fill = controls.fill;
+        sync(&mut ws, &controls, Tool::PaintBucket, VIEW, None);
+        let moved = FillView {
+            tolerance: 90,
+            ..VIEW
+        };
+        sync(&mut ws, &controls, Tool::PaintBucket, moved, Some(fill.tolerance));
+        let value = match ws.tree.payload(fill.tolerance) {
+            Some(WidgetKind::Slider(s)) => s.value,
+            other => unreachable!("{other:?}"),
+        };
+        assert!((value - 32.0).abs() < f64::EPSILON, "{value}");
+        let text = match ws.tree.payload(fill.tolerance_readout) {
+            Some(WidgetKind::Label(s)) => s.text.clone(),
+            other => unreachable!("{other:?}"),
+        };
+        assert_eq!(text, "Tolerance 90");
+    }
+}
