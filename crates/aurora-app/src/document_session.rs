@@ -832,4 +832,56 @@ mod tests {
         assert_ne!(first.id, second.id);
         assert!(first.id < second.id);
     }
+
+    /// 0.210.0: a session's pixel history spills into its own store's
+    /// scratch directory and takes its files with it when it is dropped;
+    /// a session with no store still has a (memory-only) history.
+    #[test]
+    fn a_sessions_pixel_history_spills_inside_its_stores_scratch_and_cleans_up() {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err}"),
+        };
+        let scratch = dir.path().join("scratch");
+        let Some(budget) = std::num::NonZeroUsize::new(8) else {
+            unreachable!("non-zero");
+        };
+        let store = match aurora_tile::TileStore::new(scratch.clone(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("{err}"),
+        };
+        let mut history = super::new_pixel_history(Some(&store));
+        assert_eq!(
+            history.budget_bytes(),
+            aurora_tile::system_history_budget_bytes(),
+            "the budget is the system's"
+        );
+        history.set_budget_bytes(1 << 20);
+        let surface = aurora_tile::SurfaceId::from_raw(0);
+        for i in 0..6_u32 {
+            let mut snapshot = aurora_brush::StrokeSnapshot::new(surface);
+            let noise: Vec<half::f16> = (0..aurora_tile::SAMPLES)
+                .map(|n| half::f16::from_bits((n as u32).wrapping_mul(2_654_435_761 ^ i) as u16))
+                .collect();
+            assert!(snapshot.record_content(aurora_tile::TileId { x: i, y: 0 }, &noise));
+            assert!(history.push(snapshot));
+        }
+        let stats = history.stats();
+        assert!(stats.spilled_steps >= 4, "{stats:?}");
+        let spilled_somewhere_under_scratch = std::fs::read_dir(&scratch)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("history-"));
+        assert!(spilled_somewhere_under_scratch);
+        drop(history);
+        let left = std::fs::read_dir(&scratch)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("history-"))
+            .count();
+        assert_eq!(left, 0, "dropping the history removes its directory");
+        let _ = super::new_pixel_history(None);
+    }
 }

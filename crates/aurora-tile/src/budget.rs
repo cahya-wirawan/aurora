@@ -630,6 +630,33 @@ mod tests {
     }
 
     #[test]
+    fn the_history_budget_is_a_quarter_of_the_tile_budget_with_floor_and_ceiling() {
+        assert_eq!(HISTORY_FLOOR_BYTES, 32 << 20);
+        assert_eq!(HISTORY_CEILING_BYTES, 2 << 30);
+        assert_eq!(history_budget_for_tile_budget(FLOOR_BYTES), 32 << 20);
+        assert_eq!(history_budget_for_tile_budget(0), 32 << 20);
+        assert_eq!(history_budget_for_tile_budget(1 << 30), 256 << 20);
+        assert_eq!(history_budget_for_tile_budget(CEILING_BYTES), 2 << 30);
+        assert_eq!(history_budget_for_tile_budget(u64::MAX), 2 << 30);
+        // The override: whole MiB, 1 MiB to the tile ceiling.
+        assert_eq!(parse_history_override_mb(" 5 "), Some(5 << 20));
+        assert_eq!(parse_history_override_mb("0"), Some(1 << 20));
+        assert_eq!(
+            parse_history_override_mb("99999999999"),
+            Some(CEILING_BYTES)
+        );
+        for bad in ["", "-1", "1.5", "4MB", "x", "+3"] {
+            assert_eq!(parse_history_override_mb(bad), None, "{bad:?}");
+        }
+        assert_eq!(resolve_history_budget_bytes(1 << 30, Some("64")), 64 << 20);
+        assert_eq!(
+            resolve_history_budget_bytes(1 << 30, Some("junk")),
+            256 << 20
+        );
+        assert_eq!(resolve_history_budget_bytes(1 << 30, None), 256 << 20);
+    }
+
+    #[test]
     fn a_tile_is_512_kib_and_the_floor_is_the_old_256_tile_budget() {
         assert_eq!(TILE_BYTES, 512 * 1024);
         assert_eq!(tiles_for_bytes(FLOOR_BYTES).get(), 256);

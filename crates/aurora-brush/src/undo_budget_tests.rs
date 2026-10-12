@@ -2,6 +2,9 @@
 //! spilling, paging back, budget, order and cleanup. A child module of
 //! `undo` so it can look at the stacks themselves.
 
+// Test code: slicing a fixture vector it just built is not a production panic.
+#![allow(clippy::indexing_slicing)]
+
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -148,7 +151,7 @@ fn a_flat_fill_of_1024_tiles_costs_a_few_mebibytes_not_half_a_gibibyte() {
     println!(
         "1024 flat tiles: raw snapshot {} MiB, in history {:.2} MiB (uncompressed equivalent {} MiB)",
         raw >> 20,
-        stats.memory_bytes as f64 / 1048576.0,
+        stats.memory_bytes as f64 / 1_048_576.0,
         stats.uncompressed_bytes >> 20
     );
     assert_eq!(stats.tiles, 1024);
@@ -300,7 +303,7 @@ fn an_unreadable_spilled_step_fails_the_undo_and_keeps_the_entry() {
         unreachable!("spilled");
     };
     // Undo down to a spilled step, then remove the files.
-    while !history.undo.last().is_some_and(|s| s.spill.is_some()) {
+    while history.undo.last().is_none_or(|s| s.spill.is_none()) {
         assert!(ok(history.undo(&mut store)));
     }
     let tile_now = read(&mut store, T0);
@@ -529,7 +532,7 @@ fn the_spill_per_call_cap_leaves_the_rest_for_trim() {
     let steps = (SPILL_BYTES_PER_CALL / (512 * 1024)) as u32 + 40;
     for i in 0..steps {
         let mut snapshot = StrokeSnapshot::new(surface());
-        assert!(snapshot.record_content(TileId { x: i, y: 0 }, &noisy(i as u64 + 1)));
+        assert!(snapshot.record_content(TileId { x: i, y: 0 }, &noisy(u64::from(i) + 1)));
         history.undo.push({
             let mut s = snapshot;
             s.pack();
