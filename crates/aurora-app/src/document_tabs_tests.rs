@@ -3247,3 +3247,49 @@ fn trailing_spaces_do_not_rebuild_the_list_and_are_kept_in_the_field() {
     );
     assert_eq!(filter_text(&rig), "alpha 2 ");
 }
+
+/// 0.213.0 review: a tab switch, close or quit commits a live Marquee drag
+/// into the outgoing document as its selection step, so undoing there
+/// undoes that selection.
+#[test]
+fn a_live_marquee_drag_is_recorded_when_the_document_is_left() {
+    let dir = tempdir();
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir);
+    let mut rig = Rig::new(a);
+    let rect = aurora_core::Rect {
+        x: 2,
+        y: 3,
+        width: 20,
+        height: 10,
+    };
+    rig.doc
+        .selection
+        .select(aurora_doc::Selection::ellipse(rect));
+    rig.drag = Some(Drag::Marquee {
+        start_doc: (2.0, 3.0),
+        elliptical: true,
+        before: None,
+        current: rig.doc.selection.active(),
+    });
+    assert!(document_tabs::commit_live_gestures(&mut rig.cx(None)));
+    assert!(rig.drag.is_none());
+    assert_eq!(
+        rig.doc.undo_order.undo.last(),
+        Some(&crate::UndoKind::Selection)
+    );
+    assert!(!rig.doc.is_dirty(), "a selection never dirties");
+    let doc = &mut rig.doc;
+    assert!(
+        crate::step_undo_order(
+            &mut doc.layers,
+            &mut doc.history,
+            &mut doc.pixel_history,
+            doc.tile_store.as_mut(),
+            &mut doc.undo_order,
+            crate::UndoDirection::Undo,
+        )
+        .is_some()
+    );
+    crate::selection_view::apply_pending_selection(&mut doc.undo_order, &mut doc.selection);
+    assert!(doc.selection.active().is_none());
+}

@@ -86,6 +86,14 @@ pub enum DocError {
     /// but none exists.
     #[error("no active selection")]
     NoActiveSelection,
+    /// A selection mask (0.213.0) was asked to cover more texels than
+    /// [`crate::MAX_SELECTION_MASK_PIXELS`] (64 megapixels).
+    #[error("a selection of {0} pixels is too large (the limit is 64 megapixels)")]
+    SelectionMaskTooLarge(u64),
+    /// A selection mask (0.213.0) was built over an empty rectangle or
+    /// with a coverage buffer that is not one byte per texel.
+    #[error("a selection mask needs a non-empty area and one coverage byte per pixel")]
+    SelectionMaskInvalid,
     /// [`crate::SelectionSet::load`] or
     /// [`crate::SelectionSet::delete_saved`] named a selection that was
     /// never saved (or was already deleted).

@@ -2,94 +2,285 @@
 //! ones saved for later. PLAN.md M1.4's fourth piece.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use aurora_core::Rect;
 
 use crate::error::DocError;
+use crate::selection_mask::SelectionMask;
+
+/// The shape of a [`Selection`]'s region (0.213.0), before inversion.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum SelectionShape {
+    /// The whole of [`Selection::bounds`], coverage exactly `0` or `1`.
+    #[default]
+    Rect,
+    /// The ellipse inscribed in [`Selection::bounds`], antialiased: a
+    /// texel's coverage is the share of 16 evenly spread sample points
+    /// inside it (`0`, `1/16` .. `1`).
+    Ellipse,
+    /// A raster coverage grid ([`SelectionMask`]); its own bounds are the
+    /// selection's.
+    Mask(Arc<SelectionMask>),
+}
 
 /// A selection: the region of the document an edit operation is
-/// restricted to. Deliberately just a bounding [`Rect`] plus an inverted
-/// flag, not a real raster mask — no selection tool (rectangle, ellipse,
-/// lasso, magic wand, all FR-004, all Phase 2 scope) exists yet to
-/// produce anything but a bounding box, and there is no real pixel
-/// storage to hold antialiased/feathered coverage even if one did (the
-/// same open question `LayerKind::Pixel`'s own `bounds` field and
-/// [`crate::LayerMask`] already flagged). `inverted` answers FR-004's
-/// "Inverse" command the same way [`crate::LayerMask::inverted`] answers
-/// a mask's own invert toggle — well-defined even for a plain rectangle
-/// (its complement is "everything outside it"), so it doesn't need real
-/// pixel data either.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// restricted to. A bounding [`Rect`], a [`SelectionShape`] inside it
+/// (a rectangle, its inscribed ellipse, or a raster [`SelectionMask`])
+/// and an inverted flag. `inverted` answers FR-004's "Inverse" command
+/// the same way [`crate::LayerMask::inverted`] answers a mask's own
+/// invert toggle: the complement of the shape is "everything else".
+///
+/// Cloning is cheap (a mask is shared through an `Arc`). The rectangle
+/// shape answers every question exactly as the pre-0.213.0 rectangle-only
+/// selection did (differential-tested); the other shapes answer
+/// fractional coverage, which the painting tools already consume.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Selection {
+    /// The rectangle outside which a non-inverted selection covers
+    /// nothing (for a mask: the mask's own bounds).
     pub bounds: Rect,
     pub inverted: bool,
+    pub shape: SelectionShape,
+}
+
+/// Samples per axis of the ellipse's edge supersampling (4 x 4 = 16).
+const ELLIPSE_SAMPLES: u32 = 4;
+
+/// Whether the point `(px, py)` lies in the closed ellipse inscribed in
+/// `b`. Done in `f64` on values that are exact multiples of `1/8`, so
+/// mirrored points get bit-identical answers.
+fn in_ellipse(b: &Rect, px: f64, py: f64) -> bool {
+    let a = f64::from(b.width) / 2.0;
+    let c = f64::from(b.height) / 2.0;
+    if a <= 0.0 || c <= 0.0 {
+        return false;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let (cx, cy) = (b.x as f64 + a, b.y as f64 + c);
+    let (dx, dy) = ((px - cx) / a, (py - cy) / c);
+    dx * dx + dy * dy <= 1.0
+}
+
+/// The nearest point of the continuous rectangle `rect` to the ellipse's
+/// centre.
+fn nearest_to_centre(b: &Rect, rect: &Rect) -> (f64, f64) {
+    #[allow(clippy::cast_precision_loss)]
+    let (cx, cy) = (
+        b.x as f64 + f64::from(b.width) / 2.0,
+        b.y as f64 + f64::from(b.height) / 2.0,
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let (x0, x1, y0, y1) = (
+        rect.x as f64,
+        rect.right() as f64,
+        rect.y as f64,
+        rect.bottom() as f64,
+    );
+    (cx.clamp(x0, x1), cy.clamp(y0, y1))
+}
+
+/// Coverage of texel `(x, y)` by the ellipse inscribed in `b`.
+fn ellipse_coverage(b: &Rect, x: i64, y: i64) -> f32 {
+    if !b.contains_point(x, y) {
+        return 0.0;
+    }
+    let texel = Rect {
+        x,
+        y,
+        width: 1,
+        height: 1,
+    };
+    if ellipse_covers(b, &texel) {
+        return 1.0;
+    }
+    let (nx, ny) = nearest_to_centre(b, &texel);
+    if !in_ellipse(b, nx, ny) {
+        return 0.0;
+    }
+    let step = 1.0 / f64::from(ELLIPSE_SAMPLES);
+    let mut inside = 0_u32;
+    for j in 0..ELLIPSE_SAMPLES {
+        for i in 0..ELLIPSE_SAMPLES {
+            #[allow(clippy::cast_precision_loss)]
+            let (sx, sy) = (
+                x as f64 + (f64::from(i) + 0.5) * step,
+                y as f64 + (f64::from(j) + 0.5) * step,
+            );
+            if in_ellipse(b, sx, sy) {
+                inside += 1;
+            }
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let total = (ELLIPSE_SAMPLES * ELLIPSE_SAMPLES) as f32;
+    inside as f32 / total
+}
+
+/// Whether every texel of non-empty `rect` is fully inside the ellipse
+/// (all four corners of the continuous rectangle are: the ellipse is
+/// convex, and a texel whose corners are inside has all its samples in).
+fn ellipse_covers(b: &Rect, rect: &Rect) -> bool {
+    #[allow(clippy::cast_precision_loss)]
+    let (x0, x1, y0, y1) = (
+        rect.x as f64,
+        rect.right() as f64,
+        rect.y as f64,
+        rect.bottom() as f64,
+    );
+    [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
+        .into_iter()
+        .all(|(px, py)| in_ellipse(b, px, py))
+}
+
+/// Whether no texel of `rect` has any ellipse coverage: it misses the
+/// bounds, or the point of its clipped area nearest the centre is outside.
+fn ellipse_excludes(b: &Rect, rect: &Rect) -> bool {
+    if !b.intersects(rect) {
+        return true;
+    }
+    let clipped_x = rect.x.max(b.x);
+    let clipped_y = rect.y.max(b.y);
+    let clipped = Rect {
+        x: clipped_x,
+        y: clipped_y,
+        width: u32::try_from(rect.right().min(b.right()) - clipped_x).unwrap_or(0),
+        height: u32::try_from(rect.bottom().min(b.bottom()) - clipped_y).unwrap_or(0),
+    };
+    let (nx, ny) = nearest_to_centre(b, &clipped);
+    !in_ellipse(b, nx, ny)
 }
 
 impl Selection {
-    /// A non-inverted selection covering `bounds`.
+    /// A non-inverted rectangular selection covering `bounds`.
     #[must_use]
     pub const fn new(bounds: Rect) -> Self {
         Self {
             bounds,
             inverted: false,
+            shape: SelectionShape::Rect,
         }
+    }
+
+    /// A non-inverted selection of the ellipse inscribed in `bounds`.
+    #[must_use]
+    pub const fn ellipse(bounds: Rect) -> Self {
+        Self {
+            bounds,
+            inverted: false,
+            shape: SelectionShape::Ellipse,
+        }
+    }
+
+    /// A non-inverted selection of a raster `mask`; its bounds are the
+    /// mask's.
+    #[must_use]
+    pub fn from_mask(mask: Arc<SelectionMask>) -> Self {
+        Self {
+            bounds: mask.bounds(),
+            inverted: false,
+            shape: SelectionShape::Mask(mask),
+        }
+    }
+
+    /// Whether this is a plain rectangle (the exact, 0-or-1 fast path).
+    #[must_use]
+    pub const fn is_rect(&self) -> bool {
+        matches!(self.shape, SelectionShape::Rect)
     }
 
     /// How much of document pixel `(x, y)` the selection covers, for
     /// painting through it (0.211.0): exactly `1.0` or `0.0` for a
     /// rectangle (`Rect`'s half-open convention: the left/top edge is in,
     /// the right/bottom edge is out), flipped by `inverted`. An empty
-    /// rectangle contains no pixel, so inverted it covers everything. A
-    /// future raster selection answers with anything in between; callers
+    /// rectangle contains no pixel, so inverted it covers everything. An
+    /// ellipse answers `k/16` along its edge and a mask `byte/255`
+    /// (0.213.0); an inverted one answers the exact complement. Callers
     /// must not assume it is only ever `0` or `1`.
     #[must_use]
     pub fn coverage_at(&self, x: i64, y: i64) -> f32 {
-        if self.bounds.contains_point(x, y) ^ self.inverted {
-            1.0
-        } else {
-            0.0
+        match &self.shape {
+            SelectionShape::Rect => {
+                if self.bounds.contains_point(x, y) ^ self.inverted {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            SelectionShape::Ellipse => {
+                let c = ellipse_coverage(&self.bounds, x, y);
+                if self.inverted { 1.0 - c } else { c }
+            }
+            SelectionShape::Mask(mask) => {
+                let byte = mask.byte_at(x, y);
+                let byte = if self.inverted { u8::MAX - byte } else { byte };
+                f32::from(byte) / 255.0
+            }
         }
     }
 
     /// A rectangle outside which [`Self::coverage_at`] is `0`: the bounds
     /// of a plain selection, `None` for an inverted one (everything
-    /// outside the rectangle is covered, so no useful bound exists).
+    /// outside the shape is covered, so no useful bound exists).
     #[must_use]
     pub fn coverage_bounds(&self) -> Option<Rect> {
         (!self.inverted).then_some(self.bounds)
     }
 
-    /// Whether every pixel of `rect` is covered. An empty `rect` has no
-    /// pixel and is vacuously covered.
+    /// Whether the (un-inverted) shape covers every texel of non-empty
+    /// `rect` fully. Conservative: `false` when unsure.
+    fn shape_covers(&self, rect: &Rect) -> bool {
+        match &self.shape {
+            SelectionShape::Rect => {
+                self.bounds.x <= rect.x
+                    && self.bounds.y <= rect.y
+                    && self.bounds.right() >= rect.right()
+                    && self.bounds.bottom() >= rect.bottom()
+            }
+            SelectionShape::Ellipse => ellipse_covers(&self.bounds, rect),
+            SelectionShape::Mask(mask) => mask.fully_covers(rect),
+        }
+    }
+
+    /// Whether the (un-inverted) shape covers no texel of non-empty
+    /// `rect` at all. Conservative: `false` when unsure.
+    fn shape_excludes(&self, rect: &Rect) -> bool {
+        match &self.shape {
+            SelectionShape::Rect => !self.bounds.intersects(rect),
+            SelectionShape::Ellipse => ellipse_excludes(&self.bounds, rect),
+            SelectionShape::Mask(mask) => mask.fully_excludes(rect),
+        }
+    }
+
+    /// Whether every pixel of `rect` is covered (coverage exactly `1`). An
+    /// empty `rect` has no pixel and is vacuously covered. Conservative
+    /// for the non-rectangular shapes: it may say `false` for a `rect`
+    /// that happens to be covered, never `true` for one that is not.
     #[must_use]
     pub fn fully_covers(&self, rect: &Rect) -> bool {
         if rect.is_empty() {
             return true;
         }
         if self.inverted {
-            !self.bounds.intersects(rect)
+            self.shape_excludes(rect)
         } else {
-            self.bounds.x <= rect.x
-                && self.bounds.y <= rect.y
-                && self.bounds.right() >= rect.right()
-                && self.bounds.bottom() >= rect.bottom()
+            self.shape_covers(rect)
         }
     }
 
     /// Whether no pixel of `rect` is covered. An empty `rect` has no
-    /// pixel and is vacuously uncovered.
+    /// pixel and is vacuously uncovered. Conservative like
+    /// [`Self::fully_covers`]: never `true` for a `rect` with a covered
+    /// pixel.
     #[must_use]
     pub fn fully_excludes(&self, rect: &Rect) -> bool {
         if rect.is_empty() {
             return true;
         }
         if self.inverted {
-            self.bounds.x <= rect.x
-                && self.bounds.y <= rect.y
-                && self.bounds.right() >= rect.right()
-                && self.bounds.bottom() >= rect.bottom()
+            self.shape_covers(rect)
         } else {
-            !self.bounds.intersects(rect)
+            self.shape_excludes(rect)
         }
     }
 }
@@ -127,7 +318,7 @@ impl SelectionSet {
     /// (equivalent to the whole document/layer being eligible).
     #[must_use]
     pub fn active(&self) -> Option<Selection> {
-        self.active
+        self.active.clone()
     }
 
     /// Replaces the active selection with `selection`. A non-inverted
@@ -168,7 +359,7 @@ impl SelectionSet {
     ///
     /// Returns [`DocError::NoActiveSelection`] if nothing is selected.
     pub fn save_active(&mut self, name: impl Into<String>) -> Result<(), DocError> {
-        let selection = self.active.ok_or(DocError::NoActiveSelection)?;
+        let selection = self.active.clone().ok_or(DocError::NoActiveSelection)?;
         self.saved.insert(name.into(), selection);
         Ok(())
     }
@@ -181,9 +372,10 @@ impl SelectionSet {
     /// Returns [`DocError::UnknownSavedSelection`] if no selection was
     /// ever saved under `name`.
     pub fn load(&mut self, name: &str) -> Result<(), DocError> {
-        let selection = *self
+        let selection = self
             .saved
             .get(name)
+            .cloned()
             .ok_or_else(|| DocError::UnknownSavedSelection(name.to_owned()))?;
         self.active = Some(selection);
         Ok(())
@@ -272,8 +464,9 @@ mod tests {
         let everything = Selection {
             bounds: r(3, 3, 0, 7),
             inverted: true,
+            shape: super::SelectionShape::Rect,
         };
-        set.select(everything);
+        set.select(everything.clone());
         assert_eq!(set.active(), Some(everything));
     }
 
@@ -302,7 +495,7 @@ mod tests {
         let sel = Selection::new(r(10, 10, 20, 20));
         let inv = Selection {
             inverted: true,
-            ..sel
+            ..sel.clone()
         };
         for rect in [
             r(10, 10, 20, 20),
@@ -313,7 +506,7 @@ mod tests {
             r(30, 30, 3, 3),
             r(9, 12, 22, 3),
         ] {
-            for s in [sel, inv] {
+            for s in [sel.clone(), inv.clone()] {
                 let (mut covered, mut missed) = (0_u32, 0_u32);
                 for y in rect.y..rect.bottom() {
                     for x in rect.x..rect.right() {
@@ -354,7 +547,7 @@ mod tests {
     fn select_and_deselect_round_trip() {
         let mut set = SelectionSet::new();
         let selection = Selection::new(bounds());
-        set.select(selection);
+        set.select(selection.clone());
         assert_eq!(set.active(), Some(selection));
 
         set.deselect();
@@ -403,7 +596,7 @@ mod tests {
     fn save_load_and_delete_round_trip() {
         let mut set = SelectionSet::new();
         let selection = Selection::new(bounds());
-        set.select(selection);
+        set.select(selection.clone());
         if let Err(err) = set.save_active("mine") {
             unreachable!("{err:?}");
         }

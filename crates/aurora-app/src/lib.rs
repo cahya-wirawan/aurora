@@ -5477,6 +5477,11 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         // something real once selected now.
         ("v", AppCommand::SelectTool(aurora_ui::Tool::Move)),
         ("m", AppCommand::SelectTool(aurora_ui::Tool::MarqueeSelect)),
+        // 0.213.0: Photoshop's grouped M key.
+        (
+            "Shift+M",
+            AppCommand::SelectTool(aurora_ui::Tool::EllipticalMarquee),
+        ),
         ("z", AppCommand::SelectTool(aurora_ui::Tool::Zoom)),
         ("h", AppCommand::SelectTool(aurora_ui::Tool::Pan)),
         ("i", AppCommand::SelectTool(aurora_ui::Tool::Eyedropper)),
@@ -5850,6 +5855,7 @@ const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
     match tool {
         aurora_ui::Tool::Move => "tool.move",
         aurora_ui::Tool::MarqueeSelect => "tool.marquee_select",
+        aurora_ui::Tool::EllipticalMarquee => "tool.elliptical_marquee",
         aurora_ui::Tool::Zoom => "tool.zoom",
         aurora_ui::Tool::Pan => "tool.pan",
         aurora_ui::Tool::Eyedropper => "tool.eyedropper",
@@ -10024,6 +10030,18 @@ fn toggle_command_palette(
 enum UndoKind {
     Structural,
     Pixel,
+    /// A change of the active selection (0.213.0): its before and after
+    /// live in [`UndoOrder`] itself ([`SelectionStep`]), and it never
+    /// touches the document's content or its unsaved-changes state.
+    Selection,
+}
+
+/// One selection change: the active selection before and after it
+/// (`None` = nothing selected). Cheap to hold: a mask is shared.
+#[derive(Debug, Clone, PartialEq)]
+struct SelectionStep {
+    before: Option<aurora_doc::Selection>,
+    after: Option<aurora_doc::Selection>,
 }
 
 /// The one true chronological order `Ctrl+Z`/`Ctrl+Shift+Z` walk across
@@ -10062,6 +10080,21 @@ struct UndoOrder {
     /// is fresh for every new order — the Curves histogram's staleness
     /// key ([`refresh_curves_histogram`]).
     revision: UndoRevision,
+    /// Like [`Self::revision`] but moved only by steps that change the
+    /// document's content (structural and pixel steps), never by a
+    /// selection step: the unsaved-changes key (0.213.0), so selecting,
+    /// deselecting and undoing either leave the document clean.
+    content_revision: UndoRevision,
+    /// The selection steps behind the `Selection` tags of `undo` and
+    /// `redo`, in the same order (the newest on top).
+    selection_undo: Vec<SelectionStep>,
+    selection_redo: Vec<SelectionStep>,
+    /// The selection an undo or redo of a selection step has just put in
+    /// force, for the owner of the live selection to take and apply
+    /// ([`Self::take_pending_selection`]): `Some(None)` means "deselect".
+    // `Some(None)` (deselect) differs from `None` (nothing pending).
+    #[allow(clippy::option_option)]
+    pending_selection: Option<Option<aurora_doc::Selection>>,
 }
 
 /// A process-unique stamp for an [`UndoOrder`]'s state (0.156.0): drawn
@@ -10101,6 +10134,7 @@ fn default_step_label(kind: UndoKind) -> &'static str {
     match kind {
         UndoKind::Structural => "Layer Change",
         UndoKind::Pixel => "Pixel Edit",
+        UndoKind::Selection => "Selection Change",
     }
 }
 
@@ -10121,6 +10155,10 @@ impl Default for UndoOrder {
             redo_labels: Vec::new(),
             origin: OPEN_HISTORY_ORIGIN,
             revision: UndoRevision::next(),
+            content_revision: UndoRevision::next(),
+            selection_undo: Vec::new(),
+            selection_redo: Vec::new(),
+            pending_selection: None,
         }
     }
 }
@@ -10152,6 +10190,9 @@ impl UndoOrder {
             self.redo.push(kind);
             self.redo_labels.push(label);
             self.revision = UndoRevision::next();
+            if kind != UndoKind::Selection {
+                self.content_revision = UndoRevision::next();
+            }
         }
     }
 
@@ -10167,7 +10208,77 @@ impl UndoOrder {
             self.undo.push(kind);
             self.undo_labels.push(label);
             self.revision = UndoRevision::next();
+            if kind != UndoKind::Selection {
+                self.content_revision = UndoRevision::next();
+            }
         }
+    }
+
+    /// Records a committed selection change as a step labelled `label`
+    /// (0.213.0), clearing every pending redo like any other step. Does
+    /// nothing, and returns `false`, when `before == after`.
+    fn record_selection(
+        &mut self,
+        label: &str,
+        before: Option<aurora_doc::Selection>,
+        after: Option<aurora_doc::Selection>,
+        history: &mut aurora_doc::History,
+        pixel_history: &mut aurora_brush::PixelHistory,
+    ) -> bool {
+        if before == after {
+            return false;
+        }
+        self.record_labelled(
+            UndoKind::Selection,
+            label.to_owned(),
+            history,
+            pixel_history,
+        );
+        // After `record_labelled`, which clears the redo side.
+        self.selection_undo.push(SelectionStep { before, after });
+        true
+    }
+
+    /// Undoes or redoes the top selection step: moves it across, leaves
+    /// the selection to put in force in [`Self::take_pending_selection`]
+    /// and moves the History marker. `false` (nothing changed) when the
+    /// top tag is not a selection step or its data is missing.
+    fn apply_selection_step(&mut self, direction: UndoDirection) -> bool {
+        match direction {
+            UndoDirection::Undo => {
+                if self.undo.last() != Some(&UndoKind::Selection) {
+                    return false;
+                }
+                let Some(step) = self.selection_undo.pop() else {
+                    return false;
+                };
+                self.pending_selection = Some(step.before.clone());
+                self.selection_redo.push(step);
+                self.step_back();
+                true
+            }
+            UndoDirection::Redo => {
+                if self.redo.last() != Some(&UndoKind::Selection) {
+                    return false;
+                }
+                let Some(step) = self.selection_redo.pop() else {
+                    return false;
+                };
+                self.pending_selection = Some(step.after.clone());
+                self.selection_undo.push(step);
+                self.step_forward();
+                true
+            }
+        }
+    }
+
+    /// The selection the last undo or redo of a selection step put in
+    /// force, once (`Some(None)` = deselect); the caller applies it to
+    /// the document's live selection.
+    // `Some(None)` (deselect) differs from `None` (nothing pending).
+    #[allow(clippy::option_option)]
+    fn take_pending_selection(&mut self) -> Option<Option<aurora_doc::Selection>> {
+        self.pending_selection.take()
     }
 
     /// The History panel's view of this order: every applied step
@@ -10213,7 +10324,7 @@ impl UndoOrder {
             UndoKind::Structural => history
                 .last_journal_description()
                 .unwrap_or_else(|| default_step_label(kind).to_owned()),
-            UndoKind::Pixel => default_step_label(kind).to_owned(),
+            UndoKind::Pixel | UndoKind::Selection => default_step_label(kind).to_owned(),
         };
         self.record_labelled(kind, label, history, pixel_history);
     }
@@ -10241,9 +10352,13 @@ impl UndoOrder {
         self.undo_labels.push(label);
         self.redo.clear();
         self.redo_labels.clear();
+        self.selection_redo.clear();
         history.clear_redo();
         pixel_history.clear_redo();
         self.revision = UndoRevision::next();
+        if kind != UndoKind::Selection {
+            self.content_revision = UndoRevision::next();
+        }
     }
 }
 
@@ -10571,6 +10686,9 @@ fn step_undo_order(
                     None
                 }
             }
+            Some(UndoKind::Selection) => undo_order
+                .apply_selection_step(UndoDirection::Undo)
+                .then_some(CompositeInvalidation::None),
             None => None,
         },
         UndoDirection::Redo => match undo_order.redo.last().copied() {
@@ -10606,6 +10724,9 @@ fn step_undo_order(
                     None
                 }
             }
+            Some(UndoKind::Selection) => undo_order
+                .apply_selection_step(UndoDirection::Redo)
+                .then_some(CompositeInvalidation::None),
             None => None,
         },
     }
@@ -11417,6 +11538,20 @@ enum Drag {
     },
     Marquee {
         start_doc: (f32, f32),
+        /// Whether this drag makes an elliptical selection (the
+        /// Elliptical Marquee tool, 0.213.0) rather than a rectangular one.
+        elliptical: bool,
+        /// What was selected when the drag began (the press deselected
+        /// it): the "before" of the drag's one selection step, and what
+        /// Escape or a selection command puts back.
+        before: Option<aurora_doc::Selection>,
+        /// The selection the drag has drawn so far (`None` until the
+        /// first move): the "after" of the step. Whatever path ends the
+        /// drag — release, a second press, a lost focus, an undo, a
+        /// History jump, a tab switch — records this as the step
+        /// ([`commit_ending_drag`]); only Escape and a selection command
+        /// cancel instead, restoring `before`.
+        current: Option<aurora_doc::Selection>,
     },
     Brush {
         last_doc: (f32, f32),
@@ -11720,6 +11855,18 @@ fn commit_ending_drag(
             pixel_history,
             undo_order,
         ),
+        // A Marquee drag ending by any path is one selection step (0.213.0):
+        // from what was selected when it began to what it had drawn. The
+        // live selection already is `current`.
+        Some(Drag::Marquee {
+            elliptical,
+            before,
+            current,
+            ..
+        }) => {
+            let label = selection_view::marquee_step_label(elliptical, current.is_some());
+            undo_order.record_selection(label, before, current, history, pixel_history);
+        }
         Some(Drag::Move {
             layer_id,
             start_bounds,
@@ -11803,6 +11950,53 @@ fn record_stroke(
     }
 }
 
+/// Records one finished selection change as an undo step (0.213.0) and
+/// refreshes the History panel; `false` (and nothing recorded) when the
+/// selection did not actually change. Selection steps never make the
+/// document unsaved ([`UndoOrder::content_revision`]).
+fn record_selection_step(
+    workspace: &mut aurora_ui::Workspace,
+    undo_order: &mut UndoOrder,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    label: &str,
+    before: Option<aurora_doc::Selection>,
+    after: Option<aurora_doc::Selection>,
+) -> bool {
+    let recorded = undo_order.record_selection(label, before, after, history, pixel_history);
+    if recorded {
+        refresh_history_panel(workspace, undo_order);
+    }
+    recorded
+}
+
+/// Runs a Select All / Deselect / Inverse command on `selection` and
+/// records it as a selection step (0.213.0); returns whether it changed.
+fn run_selection_step(
+    workspace: &mut aurora_ui::Workspace,
+    undo_order: &mut UndoOrder,
+    history: &mut aurora_doc::History,
+    pixel_history: &mut aurora_brush::PixelHistory,
+    selection: &mut aurora_doc::SelectionSet,
+    command: selection_view::SelectionCommand,
+    canvas_size: (u32, u32),
+) -> bool {
+    let before = selection.active();
+    if !selection_view::apply_selection_command(selection, command, canvas_size) {
+        return false;
+    }
+    record_selection_step(
+        workspace,
+        undo_order,
+        history,
+        pixel_history,
+        command.label(),
+        before,
+        selection.active(),
+    );
+    true
+}
+
 /// The `(start, end)` document points of a Gradient drag that is ending, or
 /// `None` for any other drag. [`App::handle_pointer_released`] applies the
 /// gradient from it (0.209.1): **by any button's release and after a tool
@@ -11884,8 +12078,14 @@ fn begin_drag(
                 last_screen: canvas_point,
             })
         }
-        (aurora_ui::Tool::MarqueeSelect, PointerButton::Primary) => Some(Drag::Marquee {
+        (
+            aurora_ui::Tool::MarqueeSelect | aurora_ui::Tool::EllipticalMarquee,
+            PointerButton::Primary,
+        ) => Some(Drag::Marquee {
             start_doc: view.to_document(canvas_point),
+            elliptical: tool == aurora_ui::Tool::EllipticalMarquee,
+            before: None,
+            current: None,
         }),
         (aurora_ui::Tool::Brush, PointerButton::Primary) => Some(Drag::Brush {
             last_doc: view.to_document(canvas_point),
@@ -11994,10 +12194,20 @@ fn continue_drag(
             *last_screen = canvas_point;
             Vec::new()
         }
-        Drag::Marquee { start_doc } => {
+        Drag::Marquee {
+            start_doc,
+            elliptical,
+            current,
+            ..
+        } => {
             let current_doc = view.to_document(canvas_point);
             let rect = aurora_ui::tool::marquee_rect(*start_doc, current_doc);
-            selection.select(aurora_doc::Selection::new(rect));
+            selection.select(if *elliptical {
+                aurora_doc::Selection::ellipse(rect)
+            } else {
+                aurora_doc::Selection::new(rect)
+            });
+            *current = selection.active();
             Vec::new()
         }
         Drag::Brush {
@@ -12378,7 +12588,7 @@ fn apply_scroll_zoom(
 /// samples wherever the pointer currently is.
 fn shift_drag_reference(drag: &mut Drag, delta: (f32, f32)) {
     match drag {
-        Drag::Marquee { start_doc } | Drag::Move { start_doc, .. } => {
+        Drag::Marquee { start_doc, .. } | Drag::Move { start_doc, .. } => {
             start_doc.0 += delta.0;
             start_doc.1 += delta.1;
         }
@@ -12413,7 +12623,7 @@ fn shift_drag_reference(drag: &mut Drag, delta: (f32, f32)) {
 #[must_use]
 fn drag_reference(drag: &Drag) -> Option<(f32, f32)> {
     match drag {
-        Drag::Marquee { start_doc }
+        Drag::Marquee { start_doc, .. }
         | Drag::Move { start_doc, .. }
         | Drag::Gradient { start_doc, .. } => Some(*start_doc),
         Drag::Brush { last_doc, .. } | Drag::Eraser { last_doc, .. } => Some(*last_doc),
@@ -17135,7 +17345,7 @@ fn fold_clip_group(
             budget,
         );
     }
-    if let Some(before) = before {
+    if let Some(before) = before.clone() {
         if any {
             for (index, ((acc, new), old)) in
                 accumulator.iter_mut().zip(&group).zip(&before).enumerate()
@@ -25355,6 +25565,7 @@ impl ToolSettings {
             aurora_ui::Tool::Eraser => Some(self.eraser_radius),
             aurora_ui::Tool::Move
             | aurora_ui::Tool::MarqueeSelect
+            | aurora_ui::Tool::EllipticalMarquee
             | aurora_ui::Tool::Zoom
             | aurora_ui::Tool::Pan
             | aurora_ui::Tool::Eyedropper
@@ -26338,9 +26549,6 @@ struct App {
     caret: CaretState,
     /// The selection's marching ants clock (0.212.0).
     ants: selection_view::AntsState,
-    /// The selection as it was when the live Marquee drag began, restored
-    /// by Escape (0.212.0).
-    marquee_before: Option<aurora_doc::Selection>,
 }
 
 /// [`App`]'s caret-blink state (0.139.0), the inputs [`caret_step`]
@@ -26753,7 +26961,6 @@ impl App {
                 reduced_motion,
             },
             ants: selection_view::AntsState::new(std::time::Instant::now()),
-            marquee_before: None,
         };
         // 0.173.0: the tab strip shows every startup document (several
         // after a crash recovery) with the active one selected.
@@ -26830,6 +27037,7 @@ impl App {
             },
             request,
         );
+        self.apply_pending_selection();
         if let Some(action) = effects.layer_action {
             self.run_layer_action(action);
         }
@@ -27137,6 +27345,7 @@ impl App {
             &mut self.layer_controls,
             command,
         );
+        self.apply_pending_selection();
         let rebuilt = sync_layer_rows_after_undo_redo(
             &mut self.workspace,
             &mut self.focus,
@@ -27213,6 +27422,7 @@ impl App {
             },
             target,
         );
+        self.apply_pending_selection();
         tracing::debug!(?jump, target, "History jump");
         let window_size = self.window.as_ref().map(|window| window.inner_size());
         if let Some(size) = window_size {
@@ -28659,7 +28869,7 @@ impl App {
             canvas: self.doc.canvas_size,
             store,
             doc_id: self.doc.id,
-            revision: self.doc.undo_order.revision,
+            revision: self.doc.undo_order.content_revision,
             carried: psd_save::carried_losses(
                 self.doc.import_losses.as_deref(),
                 &self.doc.skipped_tiles,
@@ -28725,7 +28935,8 @@ impl App {
         let target = pending.temp.target().to_path_buf();
         // Decision 4: a save with changes is a copy, Save Anyway included —
         // the document is left as it is.
-        match psd_save::finish_psd_save(pending, self.doc.id, self.doc.undo_order.revision) {
+        match psd_save::finish_psd_save(pending, self.doc.id, self.doc.undo_order.content_revision)
+        {
             Ok(()) => {
                 tracing::info!(path = %target.display(), "saved a Photoshop copy with changes");
             }
@@ -29223,7 +29434,10 @@ impl App {
             // A press with the Marquee deselects at once (Photoshop: a
             // click deselects, including a click on a selection); the drag
             // then draws a new one, and Escape restores this one.
-            self.marquee_before = selection_view::press_marquee(&mut self.doc.selection);
+            let began_with = selection_view::press_marquee(&mut self.doc.selection);
+            if let Some(Drag::Marquee { before, .. }) = self.drag.as_mut() {
+                *before = began_with;
+            }
         }
         // A locked layer refuses the press outright (0.198.0): no drag, so
         // no stroke snapshot and no history row, and a calm notice.
@@ -29549,6 +29763,9 @@ impl App {
     /// the free function, which needs no `App` (and therefore no GPU
     /// adapter) to test.
     fn commit_drag(&mut self, drag: Option<Drag>) {
+        // A finished Marquee drag is recorded as one selection step by
+        // `commit_ending_drag` (0.213.0).
+        self.needs_redraw |= matches!(drag, Some(Drag::Marquee { .. }));
         let canvas_size = canvas_area_logical_size(&self.workspace);
         commit_drag_into_history(
             &mut self.workspace,
@@ -31104,17 +31321,37 @@ impl App {
     }
 
     /// Runs a Select All / Deselect / Inverse command on the active
-    /// document's selection (0.212.0). A live Marquee drag ends first. No
-    /// history step (selection is not undoable yet, a disclosed gap) and
-    /// the document is not made dirty.
+    /// document's selection (0.212.0). A live Marquee drag ends first (the
+    /// selection goes back to what it was). The change is one undo step
+    /// (0.213.0, [`run_selection_step`]) and the document is not made dirty.
     fn run_selection_command(&mut self, command: selection_view::SelectionCommand) {
         if matches!(self.drag, Some(Drag::Marquee { .. })) {
-            self.drag = None;
+            // The drag ends unrecorded and the selection goes back to what
+            // it was before it, so the command's step starts from there.
+            if let Some(Drag::Marquee { before, .. }) = self.drag.take() {
+                selection_view::cancel_marquee(&mut self.doc.selection, before);
+            }
         }
-        if selection_view::apply_selection_command(
+        if run_selection_step(
+            &mut self.workspace,
+            &mut self.doc.undo_order,
+            &mut self.doc.history,
+            &mut self.doc.pixel_history,
             &mut self.doc.selection,
             command,
             self.doc.canvas_size,
+        ) {
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Applies the selection an undo, redo or History jump has just put in
+    /// force ([`selection_view::apply_pending_selection`]); every path that
+    /// can step the unified undo order calls it.
+    fn apply_pending_selection(&mut self) {
+        if selection_view::apply_pending_selection(
+            &mut self.doc.undo_order,
+            &mut self.doc.selection,
         ) {
             self.needs_redraw = true;
         }
@@ -31131,8 +31368,9 @@ impl App {
         ) {
             return false;
         }
-        self.drag = None;
-        selection_view::cancel_marquee(&mut self.doc.selection, self.marquee_before.take());
+        if let Some(Drag::Marquee { before, .. }) = self.drag.take() {
+            selection_view::cancel_marquee(&mut self.doc.selection, before);
+        }
         self.needs_redraw = true;
         true
     }
@@ -31967,6 +32205,9 @@ impl ApplicationHandler<AppEvent> for App {
     // `next_control_flow`. Setting it only sometimes would leave a stale
     // `WaitUntil` in the past behind, which is a busy loop.
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // 0.213.0: a selection step undone or redone by a path that does
+        // not own the selection (defensive; the known ones apply it).
+        self.apply_pending_selection();
         // 0.186.0: install whatever the background compositor finished.
         if self.drain_background_composite() {
             self.needs_redraw = true;
@@ -67338,7 +67579,7 @@ mod tests {
             &view,
             None,
         ) {
-            Some(Drag::Marquee { start_doc }) => assert_eq!(start_doc, (10.0, 20.0)),
+            Some(Drag::Marquee { start_doc, .. }) => assert_eq!(start_doc, (10.0, 20.0)),
             other => unreachable!("{other:?}"),
         }
     }
@@ -68760,7 +69001,12 @@ mod tests {
     ) -> Option<aurora_doc::Selection> {
         let mut view = CanvasView::new();
         let _ = crate::selection_view::press_marquee(selection);
-        let mut drag = Drag::Marquee { start_doc: start };
+        let mut drag = Drag::Marquee {
+            start_doc: start,
+            elliptical: false,
+            before: None,
+            current: None,
+        };
         for &to in moves {
             let _ = continue_drag(
                 &mut drag,
@@ -68797,9 +69043,9 @@ mod tests {
             ("a sub-half-pixel drag", (20.0, 20.0), vec![(20.4, 20.4)]),
         ] {
             // Over nothing, and as a click on an existing selection.
-            for before in [None, Some(existing)] {
+            for before in [None, Some(existing.clone())] {
                 let mut selection = SelectionSet::new();
-                if let Some(before) = before {
+                if let Some(before) = before.clone() {
                     selection.select(before);
                 }
                 assert_eq!(
@@ -68829,6 +69075,7 @@ mod tests {
         selection.select(aurora_doc::Selection {
             bounds: empty,
             inverted: true,
+            ..aurora_doc::Selection::new(empty)
         });
         assert!(selection.active().is_some());
     }
@@ -68844,13 +69091,16 @@ mod tests {
             height: 50,
         });
         let mut selection = SelectionSet::new();
-        selection.select(existing);
+        selection.select(existing.clone());
         let before = crate::selection_view::press_marquee(&mut selection);
-        assert_eq!(before, Some(existing));
+        assert_eq!(before, Some(existing.clone()));
         assert_eq!(selection.active(), None, "the press deselected");
         let mut view = CanvasView::new();
         let mut drag = Drag::Marquee {
             start_doc: (70.0, 70.0),
+            elliptical: false,
+            before: None,
+            current: None,
         };
         let _ = continue_drag(
             &mut drag,
@@ -68860,7 +69110,11 @@ mod tests {
             &crate::ToolSettings::default(),
             bounds_at((0.0, 0.0), None),
         );
-        assert_ne!(selection.active(), Some(existing), "the rubber band");
+        assert_ne!(
+            selection.active(),
+            Some(existing.clone()),
+            "the rubber band"
+        );
         crate::selection_view::cancel_marquee(&mut selection, before);
         assert_eq!(selection.active(), Some(existing));
         // From nothing: Escape leaves nothing.
@@ -68884,6 +69138,9 @@ mod tests {
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Marquee {
             start_doc: (10.0, 10.0),
+            elliptical: false,
+            before: None,
+            current: None,
         };
         let dabs = continue_drag(
             &mut drag,

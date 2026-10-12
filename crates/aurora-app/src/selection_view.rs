@@ -145,7 +145,49 @@ pub(crate) enum SelectionCommand {
     Inverse,
 }
 
+/// The History row of a Rectangular Marquee drag.
+pub(crate) const RECTANGULAR_MARQUEE_LABEL: &str = "Rectangular Marquee";
+/// The History row of an Elliptical Marquee drag.
+pub(crate) const ELLIPTICAL_MARQUEE_LABEL: &str = "Elliptical Marquee";
+
+/// The History row of a finished Marquee drag (0.213.0): a drag that
+/// ended with nothing selected (a click, a zero-area drag) deselected, and
+/// is named so.
+pub(crate) fn marquee_step_label(elliptical: bool, selected: bool) -> &'static str {
+    match (selected, elliptical) {
+        (false, _) => "Deselect",
+        (true, false) => RECTANGULAR_MARQUEE_LABEL,
+        (true, true) => ELLIPTICAL_MARQUEE_LABEL,
+    }
+}
+
+/// Puts the selection an undo or redo has just put in force
+/// ([`crate::UndoOrder::take_pending_selection`]) into the live
+/// `selection`; returns whether there was one.
+pub(crate) fn apply_pending_selection(
+    undo_order: &mut crate::UndoOrder,
+    selection: &mut aurora_doc::SelectionSet,
+) -> bool {
+    let Some(target) = undo_order.take_pending_selection() else {
+        return false;
+    };
+    match target {
+        Some(target) => selection.select(target),
+        None => selection.deselect(),
+    }
+    true
+}
+
 impl SelectionCommand {
+    /// The command's History row.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::SelectAll => "Select All",
+            Self::Deselect => "Deselect",
+            Self::Inverse => "Inverse Selection",
+        }
+    }
+
     pub(crate) fn from_app(command: crate::AppCommand) -> Option<Self> {
         match command {
             crate::AppCommand::SelectAll => Some(Self::SelectAll),
@@ -297,7 +339,8 @@ mod tests {
         // Inverted draws the document border.
         assert!(visible(Some(Selection {
             bounds: rect(10, 10, 0, 20),
-            inverted: true
+            inverted: true,
+            shape: aurora_doc::SelectionShape::Rect,
         })));
         // The ants gate on it: no visible outline -> `ants_step(false, ..)`.
         let now = Instant::now();

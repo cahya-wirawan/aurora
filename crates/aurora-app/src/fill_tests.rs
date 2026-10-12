@@ -590,7 +590,10 @@ fn a_gradient_drag_applies_on_release_whatever_the_tool_or_button() {
     assert_eq!(crate::released_gradient(None), None);
     assert_eq!(
         crate::released_gradient(Some(&Drag::Marquee {
-            start_doc: (0.0, 0.0)
+            start_doc: (0.0, 0.0),
+            elliptical: false,
+            before: None,
+            current: None
         })),
         None
     );

@@ -84,7 +84,7 @@ pub(crate) fn autosave_outgoing(cx: &mut SwitchContext<'_>) -> bool {
     // R-1 (0.173.0, review-revised): unchanged since its last park
     // autosave — every recorded, undone or redone step moves the revision
     // — *and* that autosave landed complete, so nothing new to write.
-    let revision = cx.doc.undo_order.revision;
+    let revision = cx.doc.undo_order.content_revision;
     let id = cx.doc.id.get();
     // L-2 (0.175.0): nor while that write is still queued or in flight.
     if let Some((saved, generation)) = cx.doc.park_autosave

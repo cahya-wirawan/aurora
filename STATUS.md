@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-12, version 0.212.0.** This file is updated every round (every
+**As of 2026-10-12, version 0.213.0.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -107,11 +107,15 @@ golden-image tests are `#[ignore]`d.
   selections also outline the document; steady under reduced motion, paused in a
   background window), Select All / Deselect / Inverse exist (`Ctrl/Cmd+A`, `+D`,
   `+Shift+I`, palette, macOS Edit menu), Escape cancels a Marquee drag and the status
-  bar reads the selection out; a Marquee click deselects; **Select All, Deselect,
-  Inverse and the Marquee are not undoable**, mark nothing dirty, are not saved
-  (`.aur`/PSD), are lost when the document closes, and the outline is not clipped to
-  the document; nothing of this has been seen live or on the Mac. Selection tools beyond the
-  rectangle do not exist yet.
+  bar reads the selection out; a Marquee click deselects. Since 0.213.0 the selection
+  can be a rectangle, an ellipse (the **Elliptical Marquee**, `Shift+M`, antialiased
+  edge, ants along its curve) or a raster mask (the data model and outline exist, no
+  tool makes one yet), and **every selection change is an undo step** in the History
+  panel ("Rectangular Marquee", "Elliptical Marquee", "Select All", "Deselect",
+  "Inverse Selection") that never marks the document unsaved. Selections are
+  still not saved (`.aur`/PSD), are lost when the document closes, and the outline is
+  not clipped to the document; nothing of this has been seen live or on the Mac.
+  Lasso, Polygonal Lasso and Magic Wand do not exist yet.
 - **Text fields and dialogs**: caret, selection, IME composition, standard
   editing chords through the real OS clipboard (`Cmd` on macOS, `Ctrl`
   elsewhere), click/drag selection (double-click word selection was not done as of 0.138.0).

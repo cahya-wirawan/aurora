@@ -218,7 +218,7 @@ impl Rig {
                 rig.surface,
                 rig.bounds,
                 p,
-                selection,
+                selection.clone(),
                 &rig.settings,
                 colour,
                 drag,
@@ -661,4 +661,561 @@ fn transparency_lock_and_the_selection_compose() {
         }
     }
     assert!(recoloured > 1000, "{recoloured}");
+}
+
+// ---- 0.213.0: elliptical selections and undoable selection steps -------
+
+use crate::AppCommand;
+use crate::selection_view::{self, SelectionCommand};
+use aurora_doc::{Selection, SelectionShape};
+use aurora_widgets::shortcut::{Key, KeyChord, Modifiers};
+
+impl Rig {
+    /// A Marquee press as the app runs it: the press deselects and the new
+    /// drag remembers what was selected.
+    fn press_marquee(&mut self, tool: Tool, from: (f32, f32)) -> Option<Drag> {
+        let began_with = selection_view::press_marquee(&mut self.selection);
+        let mut drag = begin_drag(tool, PointerButton::Primary, from, &self.view, None);
+        if let Some(Drag::Marquee { before, .. }) = drag.as_mut() {
+            *before = began_with;
+        }
+        drag
+    }
+
+    fn drag_to(&mut self, drag: &mut Option<Drag>, to: (f32, f32)) {
+        let bounds = pan_bounds(&self.layers, Some(self.layer), Some((1000.0, 800.0)));
+        if let Some(d) = drag.as_mut() {
+            let _ = continue_drag(
+                d,
+                to,
+                &mut self.view,
+                &mut self.selection,
+                &self.settings,
+                bounds,
+            );
+        }
+    }
+
+    /// The release (or any other end) of a drag, as `App::commit_drag`.
+    fn end_drag(&mut self, drag: Option<Drag>) -> bool {
+        crate::commit_drag_into_history(
+            &mut self.workspace,
+            drag,
+            &self.layers,
+            &mut self.history,
+            &mut self.pixel_history,
+            &mut self.undo_order,
+            &mut self.view,
+            Some(self.layer),
+            Some((1000.0, 800.0)),
+        )
+    }
+
+    /// A whole Marquee gesture. Returns whether a step was recorded.
+    fn marquee_step(&mut self, tool: Tool, from: (f32, f32), to: (f32, f32)) -> bool {
+        let mut drag = self.press_marquee(tool, from);
+        self.drag_to(&mut drag, to);
+        self.end_drag(drag)
+    }
+
+    fn command_step(&mut self, command: SelectionCommand) -> bool {
+        crate::run_selection_step(
+            &mut self.workspace,
+            &mut self.undo_order,
+            &mut self.history,
+            &mut self.pixel_history,
+            &mut self.selection,
+            command,
+            (400, 300),
+        )
+    }
+
+    /// One Ctrl+Z or Ctrl+Shift+Z as `App::run_undo_redo` runs it.
+    fn step(&mut self, direction: UndoDirection) -> bool {
+        let stepped = self.undo(direction);
+        selection_view::apply_pending_selection(&mut self.undo_order, &mut self.selection);
+        stepped
+    }
+
+    fn labels(&self) -> Vec<String> {
+        self.undo_order
+            .history_steps()
+            .iter()
+            .map(|s| format!("{}{}", s.label, if s.undone { " (undone)" } else { "" }))
+            .collect()
+    }
+
+    fn alpha(&mut self, x: u32, y: u32) -> f32 {
+        self.at(x, y)[3]
+    }
+}
+
+#[test]
+fn the_elliptical_marquee_tool_draws_an_ellipse_selection() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    assert!(rig.marquee_step(Tool::EllipticalMarquee, (50.0, 40.0), (150.0, 100.0)));
+    let Some(s) = rig.selection.active() else {
+        unreachable!("selected");
+    };
+    assert!(matches!(s.shape, SelectionShape::Ellipse));
+    assert_eq!(s.bounds, rect(50, 40, 100, 60));
+    // The rectangular tool still makes rectangles.
+    assert!(rig.marquee_step(Tool::MarqueeSelect, (50.0, 40.0), (150.0, 100.0)));
+    assert!(matches!(
+        rig.selection.active().map(|s| s.shape),
+        Some(SelectionShape::Rect)
+    ));
+    assert_eq!(rig.labels(), ["Elliptical Marquee", "Rectangular Marquee"]);
+}
+
+#[test]
+fn an_ellipse_selection_paints_partial_values_on_its_edge_and_nothing_outside() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    assert!(rig.marquee_step(Tool::EllipticalMarquee, (50.0, 40.0), (150.0, 100.0)));
+    assert!(rig.bucket((100.0, 70.0)), "the fill is one undo step");
+    let selection = ok_selection(&rig);
+    let (mut partial, mut full) = (0, 0);
+    for y in 0..300_u32 {
+        for x in 0..400_u32 {
+            let expected = selection.coverage_at(i64::from(x), i64::from(y));
+            let got = rig.alpha(x, y);
+            // The fill is opaque green, so alpha is exactly the coverage
+            // (multiples of 1/16 are exact in f16).
+            assert_eq!(got, expected, "({x}, {y})");
+            if got > 0.0 && got < 1.0 {
+                partial += 1;
+            } else if got == 1.0 {
+                full += 1;
+            }
+        }
+    }
+    assert!(partial > 40, "an antialiased edge: {partial}");
+    assert!(full > 3000, "an interior: {full}");
+    // Nothing in the bounds' corners nor outside.
+    assert_eq!(rig.alpha(50, 40), 0.0);
+    assert_eq!(rig.alpha(10, 70), 0.0);
+    assert_eq!(rig.alpha(100, 70), 1.0);
+}
+
+fn ok_selection(rig: &Rig) -> Selection {
+    match rig.selection.active() {
+        Some(s) => s,
+        None => unreachable!("a selection is active"),
+    }
+}
+
+#[test]
+fn a_brush_stroke_through_an_ellipse_changes_nothing_outside_it() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::EllipticalMarquee, (100.0, 100.0), (200.0, 160.0));
+    let selection = ok_selection(&rig);
+    rig.settings.set_radius(Tool::Brush, 30.0);
+    assert!(rig.stroke(Tool::Brush, &[(60.0, 130.0), (240.0, 130.0)], false));
+    let mut partial = 0;
+    for y in 0..300_u32 {
+        for x in 0..400_u32 {
+            let c = selection.coverage_at(i64::from(x), i64::from(y));
+            let a = rig.alpha(x, y);
+            if c == 0.0 {
+                assert_eq!(a, 0.0, "outside the ellipse ({x}, {y})");
+            } else {
+                // Repeated dabs converge towards the full value (the
+                // brush's max-alpha rule, disclosed since 0.211.0), so
+                // only the bounds are exact.
+                assert!((0.0..=1.0).contains(&a), "({x}, {y}): {a}");
+                if a > 0.0 && a < 1.0 {
+                    partial += 1;
+                }
+            }
+        }
+    }
+    assert!(partial > 0, "the ellipse's edge took fractional paint");
+}
+
+#[test]
+fn selection_changes_are_undoable_steps_with_their_labels() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut states = vec![rig.selection.active()];
+    assert!(rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0)));
+    states.push(rig.selection.active());
+    assert!(rig.marquee_step(Tool::EllipticalMarquee, (20.0, 20.0), (120.0, 90.0)));
+    states.push(rig.selection.active());
+    assert!(rig.command_step(SelectionCommand::Inverse));
+    states.push(rig.selection.active());
+    assert!(rig.command_step(SelectionCommand::SelectAll));
+    states.push(rig.selection.active());
+    assert!(rig.command_step(SelectionCommand::Deselect));
+    states.push(rig.selection.active());
+    assert_eq!(
+        rig.labels(),
+        [
+            "Rectangular Marquee",
+            "Elliptical Marquee",
+            "Inverse Selection",
+            "Select All",
+            "Deselect"
+        ]
+    );
+    // Undo walks back through every state, exactly.
+    for expected in states.iter().rev().skip(1) {
+        assert!(rig.step(UndoDirection::Undo));
+        assert_eq!(&rig.selection.active(), expected);
+    }
+    assert!(!rig.step(UndoDirection::Undo), "nothing left");
+    // And redo forwards again.
+    for expected in states.iter().skip(1) {
+        assert!(rig.step(UndoDirection::Redo));
+        assert_eq!(&rig.selection.active(), expected);
+    }
+    assert!(!rig.step(UndoDirection::Redo));
+    // A new step after an undo discards the redo side, selection steps
+    // included.
+    assert!(rig.step(UndoDirection::Undo));
+    assert!(rig.command_step(SelectionCommand::Inverse));
+    assert!(!rig.step(UndoDirection::Redo));
+    assert!(rig.undo_order.selection_redo.is_empty());
+}
+
+#[test]
+fn a_click_that_deselects_is_a_step_and_a_no_op_is_not() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    assert!(
+        !rig.marquee_step(Tool::MarqueeSelect, (30.0, 30.0), (30.0, 30.0)),
+        "a click over nothing changes nothing"
+    );
+    assert!(!rig.command_step(SelectionCommand::Deselect));
+    assert!(
+        !rig.command_step(SelectionCommand::Inverse),
+        "nothing to invert"
+    );
+    rig.marquee_step(Tool::MarqueeSelect, (30.0, 30.0), (90.0, 90.0));
+    assert!(rig.marquee_step(Tool::MarqueeSelect, (200.0, 200.0), (200.0, 200.0)));
+    assert!(rig.selection.active().is_none());
+    assert_eq!(
+        rig.labels(),
+        ["Rectangular Marquee", "Deselect"],
+        "a click that cleared the selection reads Deselect"
+    );
+    assert!(rig.step(UndoDirection::Undo));
+    assert!(rig.selection.active().is_some());
+}
+
+#[test]
+fn selection_steps_interleave_with_pixel_steps_and_never_touch_the_content() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::EllipticalMarquee, (50.0, 50.0), (150.0, 120.0));
+    assert!(rig.bucket((100.0, 85.0)));
+    let painted = rig.snapshot(200, 150);
+    rig.command_step(SelectionCommand::Deselect);
+    // Undo the Deselect: the selection returns, the pixels are untouched.
+    assert!(rig.step(UndoDirection::Undo));
+    assert!(rig.selection.active().is_some());
+    assert_eq!(rig.snapshot(200, 150), painted);
+    // Undo the fill: pixels go, the selection stays.
+    assert!(rig.step(UndoDirection::Undo));
+    assert!(rig.selection.active().is_some());
+    assert_eq!(rig.alpha(100, 85), 0.0);
+    // Undo the marquee itself.
+    assert!(rig.step(UndoDirection::Undo));
+    assert!(rig.selection.active().is_none());
+    // Redo all the way: the fill comes back through the ellipse.
+    for _ in 0..3 {
+        assert!(rig.step(UndoDirection::Redo));
+    }
+    assert_eq!(rig.snapshot(200, 150), painted);
+    assert!(rig.selection.active().is_none());
+}
+
+#[test]
+fn selection_steps_leave_the_content_revision_alone_and_content_steps_move_it() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let saved = rig.undo_order.content_revision;
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    rig.command_step(SelectionCommand::SelectAll);
+    assert_eq!(rig.undo_order.content_revision, saved);
+    assert!(rig.step(UndoDirection::Undo));
+    assert!(rig.step(UndoDirection::Redo));
+    assert_eq!(rig.undo_order.content_revision, saved, "undo/redo too");
+    assert!(rig.bucket((20.0, 20.0)));
+    assert_ne!(rig.undo_order.content_revision, saved);
+    let dirty = rig.undo_order.content_revision;
+    // Undoing the selection step above the fill's neither cleans nor
+    // dirties anything further.
+    rig.command_step(SelectionCommand::Deselect);
+    assert_eq!(rig.undo_order.content_revision, dirty);
+    assert!(rig.step(UndoDirection::Undo));
+    assert_eq!(rig.undo_order.content_revision, dirty);
+}
+
+#[test]
+fn a_history_panel_jump_applies_the_selection_of_the_row() {
+    use std::collections::HashMap;
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    let first = rig.selection.active();
+    rig.marquee_step(Tool::EllipticalMarquee, (20.0, 20.0), (120.0, 90.0));
+    let second = rig.selection.active();
+    rig.command_step(SelectionCommand::Inverse);
+    let third = rig.selection.active();
+    let scales = match crate::load_scales() {
+        Ok(s) => s,
+        Err(err) => unreachable!("{err}"),
+    };
+    let mut cache = CompositeCache::default();
+    let mut layer_rows = HashMap::new();
+    let mut active = Some(rig.layer);
+    let mut state = crate::LayerControlsState::default();
+    let mut drag = None;
+    let mut focus = aurora_widgets::FocusManager::default();
+    for (target, expected) in [(1, &first), (0, &None), (3, &third), (2, &second)] {
+        let _ = crate::perform_history_jump(
+            &mut crate::HistoryJumpContext {
+                workspace: &mut rig.workspace,
+                focus: &mut focus,
+                scales: &scales,
+                layers: &mut rig.layers,
+                history: &mut rig.history,
+                pixel_history: &mut rig.pixel_history,
+                store: Some(&mut rig.store),
+                undo_order: &mut rig.undo_order,
+                composite_cache: &mut cache,
+                view: &mut rig.view,
+                layer_rows: &mut layer_rows,
+                active_layer: &mut active,
+                drag: &mut drag,
+                layer_controls: &mut state,
+            },
+            target,
+        );
+        selection_view::apply_pending_selection(&mut rig.undo_order, &mut rig.selection);
+        assert_eq!(&rig.selection.active(), expected, "jump to row {target}");
+        assert_eq!(rig.undo_order.undo.len(), target);
+    }
+}
+
+#[test]
+fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
+    assert_eq!(Tool::ALL.len(), 10);
+    let table = crate::default_shortcuts_for(false);
+    let chord = |shift| {
+        KeyChord::new(
+            Modifiers {
+                shift,
+                ..Modifiers::none()
+            },
+            Key::Character('m'),
+        )
+    };
+    assert_eq!(
+        table.resolve(chord(true)),
+        Some(&AppCommand::SelectTool(Tool::EllipticalMarquee))
+    );
+    assert_eq!(
+        table.resolve(chord(false)),
+        Some(&AppCommand::SelectTool(Tool::MarqueeSelect))
+    );
+    // Every tool's documented shortcut resolves to that tool.
+    for tool in Tool::ALL {
+        let c = KeyChord::new(
+            Modifiers {
+                shift: tool.shortcut_needs_shift(),
+                ..Modifiers::none()
+            },
+            Key::Character(tool.shortcut_key().to_ascii_lowercase()),
+        );
+        assert_eq!(
+            table.resolve(c),
+            Some(&AppCommand::SelectTool(tool)),
+            "{tool:?}"
+        );
+    }
+    let commands = crate::palette_commands();
+    let Some(entry) = commands
+        .iter()
+        .find(|c| c.title == "Select Elliptical Marquee Tool")
+    else {
+        unreachable!("the palette lists the tool");
+    };
+    let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+    let mut focus = aurora_widgets::FocusManager::default();
+    let activated = crate::activate_command(
+        &mut workspace,
+        &mut focus,
+        &entry.id,
+        &mut crate::tests::FakeFileDialog::default(),
+    );
+    assert!(
+        matches!(
+            activated,
+            Some(crate::ActivatedCommand::SelectTool(Tool::EllipticalMarquee))
+        ),
+        "{activated:?}"
+    );
+    // The tools panel has one button per tool, the new one wearing its
+    // own icon.
+    assert_eq!(workspace.tools.buttons.len(), 10);
+    assert_eq!(
+        aurora_ui::tool_icon(Tool::EllipticalMarquee),
+        aurora_widgets::icons::IconKind::EllipseMarquee
+    );
+}
+
+#[test]
+fn escape_during_an_elliptical_drag_restores_the_selection_without_a_step() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    let existing = rig.selection.active();
+    let steps = rig.undo_order.undo.len();
+    let before = selection_view::press_marquee(&mut rig.selection);
+    let mut drag = begin_drag(
+        Tool::EllipticalMarquee,
+        PointerButton::Primary,
+        (100.0, 100.0),
+        &rig.view,
+        None,
+    );
+    let bounds = pan_bounds(&rig.layers, Some(rig.layer), Some((1000.0, 800.0)));
+    if let Some(d) = drag.as_mut() {
+        let _ = continue_drag(
+            d,
+            (180.0, 160.0),
+            &mut rig.view,
+            &mut rig.selection,
+            &rig.settings,
+            bounds,
+        );
+    }
+    assert!(matches!(
+        rig.selection.active().map(|s| s.shape),
+        Some(SelectionShape::Ellipse)
+    ));
+    selection_view::cancel_marquee(&mut rig.selection, before);
+    assert_eq!(rig.selection.active(), existing);
+    assert_eq!(rig.undo_order.undo.len(), steps, "no step was recorded");
+}
+
+/// 0.213.0 review: a Marquee drag that is still live when something else
+/// ends it is recorded as its selection step by every path (the rule is
+/// "record", not "cancel"; only Escape and a selection command cancel), so
+/// the undo that follows undoes the drag's selection, never an older one.
+#[test]
+fn ctrl_z_during_a_live_marquee_drag_undoes_that_drags_selection() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    let first = rig.selection.active();
+    // A new drag is live (pressed, moved) when Ctrl+Z arrives.
+    let mut drag = rig.press_marquee(Tool::EllipticalMarquee, (100.0, 100.0));
+    rig.drag_to(&mut drag, (180.0, 160.0));
+    let drawn = rig.selection.active();
+    assert!(matches!(
+        drawn.as_ref().map(|s| &s.shape),
+        Some(SelectionShape::Ellipse)
+    ));
+    let mut tool = Tool::EllipticalMarquee;
+    let mut focus = aurora_widgets::FocusManager::default();
+    let mut palette = None;
+    let mut cache = CompositeCache::default();
+    let mut controls = crate::LayerControlsState::default();
+    let _ = crate::perform_undo_redo(
+        &mut rig.workspace,
+        &mut focus,
+        &mut palette,
+        &mut tool,
+        &rig.settings,
+        &mut rig.layers,
+        &mut rig.history,
+        &mut rig.pixel_history,
+        Some(&mut rig.store),
+        &mut rig.undo_order,
+        &mut cache,
+        &mut rig.view,
+        Some(rig.layer),
+        &mut drag,
+        &mut controls,
+        AppCommand::Undo,
+    );
+    assert!(drag.is_none(), "the drag was ended");
+    selection_view::apply_pending_selection(&mut rig.undo_order, &mut rig.selection);
+    // The drag's own step was recorded and then undone: back to the first
+    // selection, and redo brings the drawn ellipse back.
+    assert_eq!(rig.selection.active(), first);
+    assert_eq!(
+        rig.labels(),
+        ["Rectangular Marquee", "Elliptical Marquee (undone)"]
+    );
+    assert!(rig.step(UndoDirection::Redo));
+    assert_eq!(rig.selection.active(), drawn);
+}
+
+#[test]
+fn a_history_jump_during_a_live_marquee_drag_records_it_first() {
+    use std::collections::HashMap;
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    rig.command_step(SelectionCommand::Inverse);
+    let first = {
+        // The state after the first row.
+        let mut s = Selection::new(rect(10, 10, 50, 40));
+        s.inverted = false;
+        Some(s)
+    };
+    let mut drag = rig.press_marquee(Tool::EllipticalMarquee, (100.0, 100.0));
+    rig.drag_to(&mut drag, (180.0, 160.0));
+    let scales = match crate::load_scales() {
+        Ok(s) => s,
+        Err(err) => unreachable!("{err}"),
+    };
+    let mut cache = CompositeCache::default();
+    let mut layer_rows = HashMap::new();
+    let mut active = Some(rig.layer);
+    let mut state = crate::LayerControlsState::default();
+    let mut focus = aurora_widgets::FocusManager::default();
+    let _ = crate::perform_history_jump(
+        &mut crate::HistoryJumpContext {
+            workspace: &mut rig.workspace,
+            focus: &mut focus,
+            scales: &scales,
+            layers: &mut rig.layers,
+            history: &mut rig.history,
+            pixel_history: &mut rig.pixel_history,
+            store: Some(&mut rig.store),
+            undo_order: &mut rig.undo_order,
+            composite_cache: &mut cache,
+            view: &mut rig.view,
+            layer_rows: &mut layer_rows,
+            active_layer: &mut active,
+            drag: &mut drag,
+            layer_controls: &mut state,
+        },
+        1,
+    );
+    selection_view::apply_pending_selection(&mut rig.undo_order, &mut rig.selection);
+    assert!(drag.is_none());
+    assert_eq!(rig.selection.active(), first);
+    // The live drag became a third step before the jump, and the jump kept
+    // everything else redoable.
+    assert_eq!(
+        rig.labels(),
+        [
+            "Rectangular Marquee",
+            "Inverse Selection (undone)",
+            "Elliptical Marquee (undone)"
+        ]
+    );
+}
+
+#[test]
+fn a_selection_command_cancels_a_live_marquee_drag_back_to_what_it_replaced() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    let existing = rig.selection.active();
+    let mut drag = rig.press_marquee(Tool::EllipticalMarquee, (100.0, 100.0));
+    rig.drag_to(&mut drag, (180.0, 160.0));
+    // What `App::run_selection_command` does with a live Marquee drag.
+    if let Some(Drag::Marquee { before, .. }) = drag.take() {
+        selection_view::cancel_marquee(&mut rig.selection, before);
+    }
+    assert_eq!(rig.selection.active(), existing);
+    assert!(rig.command_step(SelectionCommand::Inverse));
+    assert_eq!(rig.labels(), ["Rectangular Marquee", "Inverse Selection"]);
 }
