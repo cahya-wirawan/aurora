@@ -26512,11 +26512,12 @@ impl App {
         if self.cancel_panel_drag() && key == Key::Named(NamedKey::Escape) {
             return;
         }
-        if key == Key::Named(NamedKey::Escape)
-            && self.colour.popover.is_some()
-            && self.dialog.is_none()
-            && self.command_palette.is_none()
-        {
+        if colour_state::escape_closes_popover(
+            key,
+            self.colour.popover.is_some(),
+            self.dialog.is_some(),
+            self.command_palette.is_some(),
+        ) {
             self.close_colour_popover_now(true);
             return;
         }
@@ -28932,7 +28933,7 @@ impl App {
             surface,
             local,
             &self.tool_settings,
-            self.colour.state.paint_colour(),
+            colour_state::dab_colour(DabTool::Brush, &self.colour.state),
             &mut self.drag,
         );
         let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
@@ -29001,7 +29002,7 @@ impl App {
             surface,
             local,
             &self.tool_settings,
-            self.colour.state.paint_colour(),
+            colour_state::dab_colour(DabTool::Eraser, &self.colour.state),
             &mut self.drag,
         );
         let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));

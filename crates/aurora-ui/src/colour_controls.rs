@@ -17,8 +17,8 @@
 //! they overlap by `spacing.lg - spacing.md`), the swap button flush
 //! right at the top and the defaults button flush left at the bottom
 //! (both small icon buttons, `spacing.md` icon plus `spacing.xxs` each
-//! side). The group is `2 * spacing.lg + spacing.md` tall... no: see
-//! [`colour_group_height`]. At the default density that is 64 px, inside
+//! side). The group's height is [`colour_group_height`]: the pair
+//! (`spacing.lg + spacing.md`) plus one small button row. At the default density that is 64 px, inside
 //! the strip's 64 px of content width ([`crate::tools_panel_width`] less
 //! its padding), so the panel stays 72 px wide. **No new token** was
 //! invented: the swatch side, overlap offset and group height are
@@ -392,16 +392,23 @@ pub fn sync_colour_controls(
             Some(_) => return Err(WidgetError::WrongWidgetKind(id)),
             None => return Err(WidgetError::UnknownWidget(id)),
         };
+        let named = tree
+            .accessibility(id)
+            .is_some_and(|node| node.label().is_some());
         if shown != colour {
             widgets::set_color_swatch_color(tree, id, colour)?;
             changed = true;
         }
-        changed |= widgets::set_color_swatch_accessible(
-            tree,
-            id,
-            &swatch_name(target, rgb),
-            Some(&swatch_description(target)),
-        )?;
+        // The name and description change only with the colour (and are
+        // set once at first sync), so build their strings only then.
+        if shown != colour || !named {
+            changed |= widgets::set_color_swatch_accessible(
+                tree,
+                id,
+                &swatch_name(target, rgb),
+                Some(&swatch_description(target)),
+            )?;
+        }
     }
     Ok(changed)
 }

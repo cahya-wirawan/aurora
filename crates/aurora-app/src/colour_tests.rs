@@ -777,3 +777,89 @@ fn an_assistive_technology_click_reaches_the_colour_controls() {
         "a stranger picker is ignored"
     );
 }
+
+#[test]
+fn an_eyedropper_pick_clamps_out_of_gamut_values_and_refuses_only_non_finite_ones() {
+    let mut rig = Rig::new();
+    // f16 overshoot and a tiny negative: clamped, not silently ignored.
+    let effect = rig.colour.eyedropper_pick(
+        &mut rig.workspace,
+        Modifiers::none(),
+        [1.0004, -0.0002, 0.5],
+    );
+    assert!(effect.changed);
+    assert_eq!(rig.colour.state.foreground(), [1.0, 0.0, 0.5]);
+    assert_eq!(rig.swatch_colour(ColourTarget::Foreground), [255, 0, 128]);
+    // Non-finite: refused, nothing changes.
+    for bad in [[f32::NAN, 0.0, 0.0], [0.0, f32::INFINITY, 0.0]] {
+        let effect = rig
+            .colour
+            .eyedropper_pick(&mut rig.workspace, Modifiers::none(), bad);
+        assert_eq!(effect, Effect::default());
+    }
+    assert_eq!(rig.colour.state.foreground(), [1.0, 0.0, 0.5]);
+}
+
+#[test]
+fn dab_colour_is_the_foreground_for_both_dab_tools() {
+    let mut state = ColourState::default();
+    assert!(state.set(ColourTarget::Foreground, [0.25, 0.5, 0.75]));
+    for tool in [crate::DabTool::Brush, crate::DabTool::Eraser] {
+        assert_eq!(
+            crate::colour_state::dab_colour(tool, &state),
+            [0.25, 0.5, 0.75]
+        );
+    }
+}
+
+#[test]
+fn escape_closes_the_popover_only_when_nothing_modal_owns_the_key() {
+    use crate::colour_state::escape_closes_popover as f;
+    let esc = Key::Named(NamedKey::Escape);
+    assert!(f(esc, true, false, false));
+    assert!(!f(esc, false, false, false), "no popover");
+    assert!(!f(esc, true, true, false), "a dialog owns Escape");
+    assert!(!f(esc, true, false, true), "the palette owns Escape");
+    assert!(!f(Key::Named(NamedKey::Enter), true, false, false));
+    assert!(!f(Key::Character('x'), true, false, false));
+}
+
+/// A source-level guard on `App`'s dab sites (which need a window to run):
+/// both read their colour through `dab_colour`, and no non-test source of
+/// `lib.rs` reads the colour state's foreground or background directly.
+#[test]
+fn the_app_dab_sites_take_their_colour_from_dab_colour_only() {
+    let source = include_str!("lib.rs");
+    let production = source.split("\nmod tests {").next().unwrap_or(source);
+    assert_eq!(
+        production
+            .matches("colour_state::dab_colour(DabTool::Brush, &self.colour.state)")
+            .count(),
+        1,
+        "the Brush dab site"
+    );
+    assert_eq!(
+        production
+            .matches("colour_state::dab_colour(DabTool::Eraser, &self.colour.state)")
+            .count(),
+        1,
+        "the Eraser dab site"
+    );
+    for forbidden in [
+        "state.background()",
+        "state.foreground()",
+        "state.paint_colour()",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "App reads {forbidden} directly instead of through dab_colour"
+        );
+    }
+    // The Escape hook passes the real popover, dialog and palette state.
+    assert!(
+        production.contains(
+            "colour_state::escape_closes_popover(\n            key,\n            self.colour.popover.is_some(),\n            self.dialog.is_some(),\n            self.command_palette.is_some(),\n        )"
+        ),
+        "the Escape hook"
+    );
+}

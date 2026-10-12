@@ -114,6 +114,27 @@ pub(crate) fn eyedropper_target(modifiers: aurora_widgets::shortcut::Modifiers) 
     }
 }
 
+/// The colour a `tool` dab is stamped with: the foreground for the Brush
+/// (the one place a dab site reads a colour, so none can pick the
+/// background); the Eraser takes the same value and ignores it.
+pub(crate) fn dab_colour(_tool: crate::DabTool, state: &ColourState) -> [f32; 3] {
+    state.paint_colour()
+}
+
+/// Whether `key` closes the colour popover: `Escape` while it is open and
+/// no dialog or the command palette (which own the key) is.
+pub(crate) fn escape_closes_popover(
+    key: aurora_widgets::shortcut::Key,
+    popover_open: bool,
+    dialog_open: bool,
+    palette_open: bool,
+) -> bool {
+    key == aurora_widgets::shortcut::Key::Named(aurora_widgets::shortcut::NamedKey::Escape)
+        && popover_open
+        && !dialog_open
+        && !palette_open
+}
+
 /// What a [`ColourController`] call changed in the tree.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Effect {
@@ -210,6 +231,13 @@ impl ColourController {
         modifiers: aurora_widgets::shortcut::Modifiers,
         rgb: [f32; 3],
     ) -> Effect {
+        // The composite can hold out-of-range values (f16 overshoot, a
+        // tiny negative): clamp finite channels into 0..1 so a pick is
+        // never silently refused; only a non-finite channel is.
+        if !rgb.iter().all(|c| c.is_finite()) {
+            return Effect::NONE;
+        }
+        let rgb = rgb.map(|c| c.clamp(0.0, 1.0));
         self.set(workspace, eyedropper_target(modifiers), rgb)
     }
 
