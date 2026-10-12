@@ -153,6 +153,33 @@ enum LayerOp {
         id: LayerId,
         value: Option<Box<aurora_core::LayerEffects>>,
     },
+    /// Replace a pixel layer's preserved smart-object data (0.200.0);
+    /// `None` removes it. Appended last for the postcard-ordinal reason
+    /// above. Also the carrier for the data a journaled `Restore` holds in
+    /// memory but cannot put on the wire (`LayerEntry::smart_object` is
+    /// `#[serde(skip)]`), exactly like [`Self::SetEffects`]. The payload
+    /// is positional `postcard` too: a change to
+    /// [`crate::SmartObject`]'s shape needs a new variant, never an edit
+    /// of this one. A build older than 0.200.0 refuses a journal holding
+    /// it. The embedded files themselves are not in the journal: they live
+    /// in the tree's pool, carried by `.aur`'s `smart-objects` entry.
+    SetSmartObject {
+        id: LayerId,
+        value: Option<Box<crate::smart_object::SmartObject>>,
+    },
+}
+
+/// Every `(layer, smart object)` pair a journaled `Restore` carries in a
+/// subtree entry whose smart-object data would be lost on the wire.
+fn restored_smart_objects(op: &LayerOp) -> Vec<(LayerId, Box<crate::smart_object::SmartObject>)> {
+    match op {
+        LayerOp::Restore(subtree) => subtree
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| entry.smart_object.clone().map(|so| (*id, so)))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Every `(layer, effects)` pair a journaled `Restore` carries in a
@@ -368,6 +395,18 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
             // offset and blur), so the whole composite is invalidated.
             Ok((LayerOp::SetEffects { id, value: old }, None))
         }
+        LayerOp::SetSmartObject { id, value } => {
+            let old = tree.smart_object(id).cloned().map(Box::new);
+            tree.set_smart_object(id, value.map(|so| *so))?;
+            // `None` means "region unknown", which callers answer by
+            // invalidating the whole composite. This op changes no pixel
+            // and no placement, so that is more than needed -- and there is
+            // no "nothing to redraw" value in this API -- but it is only
+            // ever undone or redone from a `History` that holds it, and the
+            // PSD open that creates these ops clears the undo stack, so no
+            // user action reaches it.
+            Ok((LayerOp::SetSmartObject { id, value: old }, None))
+        }
         LayerOp::SetBounds { id, value } => {
             let old = tree.bounds(id).ok_or(DocError::UnknownLayer(id))?;
             tree.set_bounds(id, value)?;
@@ -513,6 +552,10 @@ fn describe(op: &LayerOp) -> String {
             }
             Some(_) => format!("Changed layer effects on layer #{}", id.to_raw()),
             None => format!("Removed layer effects from layer #{}", id.to_raw()),
+        },
+        LayerOp::SetSmartObject { id, value } => match value {
+            Some(_) => format!("Kept the smart object data of layer #{}", id.to_raw()),
+            None => format!("Removed the smart object data of layer #{}", id.to_raw()),
         },
         LayerOp::SetBounds { id, value } => {
             format!(
@@ -796,6 +839,13 @@ impl History {
             // a subtree that has some, one `SetEffects` per layer.
             for (id, value) in restored_effects(op) {
                 wire.push(std::borrow::Cow::Owned(LayerOp::SetEffects {
+                    id,
+                    value: Some(value),
+                }));
+            }
+            // Smart-object data (0.200.0) the same way.
+            for (id, value) in restored_smart_objects(op) {
+                wire.push(std::borrow::Cow::Owned(LayerOp::SetSmartObject {
                     id,
                     value: Some(value),
                 }));
@@ -1509,6 +1559,32 @@ impl History {
             value: value.map(Box::new),
         });
         self.push(LayerOp::SetEffects { id, value: old });
+        Ok(None)
+    }
+
+    /// Same as [`LayerTree::set_smart_object`], recorded for undo as one
+    /// `LayerOp::SetSmartObject` step (0.200.0). Returns `None` (region
+    /// unknown, so a caller invalidates the whole composite) although no
+    /// pixel changes: this API has no "nothing dirty" result, and the one
+    /// production caller (the PSD open) clears the undo stack afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LayerTree::set_smart_object`]. Nothing is recorded when
+    /// it fails.
+    pub fn set_smart_object(
+        &mut self,
+        tree: &mut LayerTree,
+        id: LayerId,
+        value: Option<crate::smart_object::SmartObject>,
+    ) -> Result<Option<Rect>, DocError> {
+        let old = tree.smart_object(id).cloned().map(Box::new);
+        tree.set_smart_object(id, value.clone())?;
+        self.journal.push(LayerOp::SetSmartObject {
+            id,
+            value: value.map(Box::new),
+        });
+        self.push(LayerOp::SetSmartObject { id, value: old });
         Ok(None)
     }
 
@@ -5422,5 +5498,105 @@ mod adjustment_tests {
         let id = crate::LayerId::from_raw(1);
         let bytes = postcard::to_allocvec(&LayerOp::SetEffects { id, value: None });
         assert_eq!(bytes.ok().and_then(|b| b.first().copied()), Some(16));
+    }
+
+    fn smart_object(seed: u8) -> crate::SmartObject {
+        crate::SmartObject {
+            unique_id: format!("id-{seed}"),
+            blocks: vec![crate::SmartObjectBlock {
+                key: *b"SoLd",
+                data: vec![seed; 12],
+            }],
+            bounds: bounds(),
+            pixel_fingerprint: u64::from(seed),
+        }
+    }
+
+    #[test]
+    fn set_smart_object_undo_redo_and_validation() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let layer = match history.add_pixel_layer(&mut tree, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match history.add_group(&mut tree, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(tree.smart_object(layer).is_none());
+        if let Err(err) = history.set_smart_object(&mut tree, layer, Some(smart_object(1))) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.smart_object(layer), Some(&smart_object(1)));
+        assert_eq!(
+            replayed_through_postcard(&history).smart_object(layer),
+            Some(&smart_object(1)),
+            "journal replay"
+        );
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert!(tree.smart_object(layer).is_none());
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.smart_object(layer), Some(&smart_object(1)));
+        // Refusals change nothing and record nothing.
+        assert!(matches!(
+            history.set_smart_object(&mut tree, group, Some(smart_object(2))),
+            Err(DocError::NotAPixelLayer(_))
+        ));
+        let mut bad = smart_object(3);
+        bad.unique_id.clear();
+        assert!(matches!(
+            history.set_smart_object(&mut tree, layer, Some(bad)),
+            Err(DocError::InvalidSmartObject(_))
+        ));
+        assert_eq!(tree.smart_object(layer), Some(&smart_object(1)));
+    }
+
+    #[test]
+    fn restored_subtree_keeps_smart_objects_through_journal() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let group = match history.add_group(&mut tree, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match history.add_pixel_layer(&mut tree, "c", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_smart_object(&mut tree, child, Some(smart_object(9))) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.remove(&mut tree, group) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            replayed_through_postcard(&history).smart_object(child),
+            None
+        );
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(
+            tree.smart_object(child),
+            Some(&smart_object(9)),
+            "in memory"
+        );
+        assert_eq!(
+            replayed_through_postcard(&history).smart_object(child),
+            Some(&smart_object(9)),
+            "through the wire"
+        );
+    }
+
+    #[test]
+    fn set_smart_object_is_appended_after_set_effects() {
+        let id = crate::LayerId::from_raw(1);
+        let bytes = postcard::to_allocvec(&LayerOp::SetSmartObject { id, value: None });
+        assert_eq!(bytes.ok().and_then(|b| b.first().copied()), Some(17));
     }
 }

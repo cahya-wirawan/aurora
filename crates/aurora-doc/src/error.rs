@@ -33,6 +33,9 @@ pub enum DocError {
     /// [`aurora_core::LayerEffects::validate`] (0.180.0).
     #[error("invalid layer effects: {0}")]
     InvalidEffects(aurora_core::effects::EffectsError),
+    /// Smart-object data failed its bounds (0.200.0).
+    #[error("invalid smart object data: {0}")]
+    InvalidSmartObject(crate::smart_object::SmartObjectError),
     /// A group-only blend mode ([`crate::BlendMode::PassThrough`],
     /// 0.179.0) was set on, or decoded for, a layer that is not a group.
     #[error("layer {0:?} is not a group, so it cannot use Pass Through blending")]

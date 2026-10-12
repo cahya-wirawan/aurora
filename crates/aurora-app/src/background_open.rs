@@ -83,6 +83,10 @@ pub(crate) const MAX_SUPERSEDED: usize = 1;
 /// A decoded file, ready for the UI thread to install. Plain `Send`
 /// data: no tile-store handle, nothing that needs the UI thread.
 #[derive(Debug)]
+// One value per open, moved once to the UI thread; boxing the PSD would
+// only touch every call site (`LayerTree` grew by the smart-object pool,
+// 0.200.0).
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum DecodedFile {
     /// A flat PNG/JPEG/TIFF image, its tiles already encoded on the
     /// decode thread (0.153.0).

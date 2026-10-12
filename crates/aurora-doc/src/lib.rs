@@ -35,6 +35,7 @@ mod layer;
 // module's are.
 pub mod mask;
 mod selection;
+pub mod smart_object;
 mod text_safety;
 mod tree;
 
@@ -48,5 +49,6 @@ pub use mask::{
     write_mask_coverage, write_mask_coverage_region,
 };
 pub use selection::{Selection, SelectionSet};
+pub use smart_object::{LinkedFile, SmartObject, SmartObjectBlock, SmartObjectError};
 pub use text_safety::sanitize_display_name;
 pub use tree::{LayerTree, MAX_LAYER_TREE_DEPTH};

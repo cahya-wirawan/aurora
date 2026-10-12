@@ -404,6 +404,188 @@ fn read_layer_effects<R: Read + Seek>(
     Ok(())
 }
 
+/// The optional entry carrying the document's preserved Photoshop smart
+/// objects (0.200.0): each smart-object layer's `aurora_doc::SmartObject`
+/// (`LayerEntry::smart_object` is `#[serde(skip)]`) and the list of
+/// embedded files in `aurora_doc::LayerTree::linked_files`, whose bytes are
+/// their own stored entries, [`SMART_OBJECT_FILE_PREFIX`] plus the file's
+/// index in that list.
+///
+/// Written only when the document has smart-object data or embedded files,
+/// so every other save stays byte-identical; a file without it opens with
+/// none, which is what every older file means. **Versioned, and a newer
+/// version refuses the file** loudly, like [`LAYER_EFFECTS_ENTRY`] (the
+/// payload is positional `postcard` of `aurora_doc::SmartObject`). An
+/// Aurora older than 0.200.0 ignores the entry, but refuses the file
+/// anyway whenever its journal holds a `SetSmartObject` op (an unknown
+/// ordinal), which every document whose smart objects came from an open
+/// does.
+///
+/// **The embedded files are the cost.** They are stored uncompressed (they
+/// are usually compressed already) in every save and autosave of a document
+/// that holds them: a document opened from a PSD with 100 MB of embedded
+/// files writes 100 MB more each time. Bounded by
+/// `aurora_doc::smart_object::MAX_LINKED_FILE_POOL_BYTES`, enforced on read.
+const SMART_OBJECTS_ENTRY: &str = "smart-objects";
+
+/// The name prefix of an embedded file's entry (`smart-object-file-0`, …).
+const SMART_OBJECT_FILE_PREFIX: &str = "smart-object-file-";
+
+/// [`SMART_OBJECTS_ENTRY`]'s own schema version.
+const SMART_OBJECTS_VERSION: u32 = 1;
+
+/// The largest [`SMART_OBJECTS_ENTRY`] read: its blocks are bounded by
+/// `MAX_SMART_OBJECT_TOTAL_BLOCK_BYTES`, plus the layer and file lists.
+const MAX_SMART_OBJECTS_BYTES: u64 = 80 * 1024 * 1024;
+
+/// [`SMART_OBJECTS_ENTRY`]'s payload: version first (frozen), the
+/// `(raw layer id, smart object)` pairs, then one record per embedded file.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SmartObjectsWire {
+    version: u32,
+    objects: Vec<(u64, aurora_doc::SmartObject)>,
+    files: Vec<SmartFileWire>,
+}
+
+/// One embedded file's record; its bytes are the entry
+/// `smart-object-file-<index>`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SmartFileWire {
+    list: [u8; 4],
+    unique_id: String,
+    len: u64,
+}
+
+/// What [`DocumentEntries`] carries for the smart-object entries: the
+/// metadata entry and the embedded files (shared, not copied).
+#[derive(Debug, Clone)]
+struct SmartEntries {
+    meta: Vec<u8>,
+    files: Vec<std::sync::Arc<Vec<u8>>>,
+}
+
+/// The smart-object entries for `layers`, or `None` when it has no
+/// smart-object data and no embedded files.
+fn smart_entries(layers: &LayerTree) -> Result<Option<SmartEntries>, IoError> {
+    let objects: Vec<(u64, aurora_doc::SmartObject)> = layer_ids(layers)
+        .into_iter()
+        .filter_map(|id| Some((id.to_raw(), layers.smart_object(id)?.clone())))
+        .collect();
+    let pool = layers.linked_files();
+    if objects.is_empty() && pool.is_empty() {
+        return Ok(None);
+    }
+    let wire = SmartObjectsWire {
+        version: SMART_OBJECTS_VERSION,
+        objects,
+        files: pool
+            .values()
+            .map(|f| SmartFileWire {
+                list: f.list,
+                unique_id: f.unique_id.clone(),
+                len: f.entry.len() as u64,
+            })
+            .collect(),
+    };
+    let meta = postcard::to_allocvec(&wire)
+        .map_err(|source| IoError::ManifestSerialization(source.to_string()))?;
+    Ok(Some(SmartEntries {
+        meta,
+        files: pool.values().map(|f| f.entry.clone()).collect(),
+    }))
+}
+
+/// A framed linked-layer entry is a `u64` length, that many bytes, and zero
+/// padding to a multiple of four: nothing else is accepted back.
+fn framed_entry_is_valid(entry: &[u8]) -> bool {
+    let Some(head) = entry.get(..8).and_then(|b| <[u8; 8]>::try_from(b).ok()) else {
+        return false;
+    };
+    let body = u64::from_be_bytes(head);
+    let Some(expected) = body.checked_add(8 + (4 - body % 4) % 4) else {
+        return false;
+    };
+    // At least the kind, version and ID length byte.
+    body >= 9 && expected == entry.len() as u64
+}
+
+/// Reads [`SMART_OBJECTS_ENTRY`] if present and applies it to `layers`.
+///
+/// # Errors
+///
+/// [`IoError::ManifestDeserialization`] for an unknown version, bytes that
+/// do not decode, an object on a missing or non-pixel layer or that fails
+/// validation, or an embedded file that is missing, malformed, over the
+/// pool's bounds or whose length disagrees with its record;
+/// [`IoError::EntryTooLarge`] for an entry over its cap. Refused, never
+/// half-applied silently.
+fn read_smart_objects<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    layers: &mut LayerTree,
+) -> Result<(), IoError> {
+    let bytes = match zip.by_name(SMART_OBJECTS_ENTRY) {
+        Ok(file) => read_capped(file, SMART_OBJECTS_ENTRY, MAX_SMART_OBJECTS_BYTES)?,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let (prefix, _rest) = postcard::take_from_bytes::<MaskDensityPrefix>(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    if prefix.version != SMART_OBJECTS_VERSION {
+        let cause = if prefix.version > SMART_OBJECTS_VERSION {
+            "the file was saved by a newer Aurora"
+        } else {
+            "the entry is damaged or of an unknown kind"
+        };
+        return Err(IoError::ManifestDeserialization(format!(
+            "unsupported smart-objects version {} (this build understands version \
+             {SMART_OBJECTS_VERSION}); {cause}",
+            prefix.version
+        )));
+    }
+    let wire: SmartObjectsWire = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    let bad = |what: String| IoError::ManifestDeserialization(format!("smart objects: {what}"));
+    if wire.files.len() > aurora_doc::smart_object::MAX_LINKED_FILES {
+        return Err(bad("too many embedded files".to_owned()));
+    }
+    let mut block_bytes = 0usize;
+    for (raw, object) in wire.objects {
+        block_bytes = block_bytes.saturating_add(object.block_bytes());
+        if block_bytes > aurora_doc::smart_object::MAX_SMART_OBJECT_TOTAL_BLOCK_BYTES {
+            return Err(bad("the smart object data is too large".to_owned()));
+        }
+        layers
+            .set_smart_object(aurora_doc::LayerId::from_raw(raw), Some(object))
+            .map_err(|err| bad(err.to_string()))?;
+    }
+    let mut pool: u64 = 0;
+    for (index, record) in wire.files.into_iter().enumerate() {
+        pool = pool.saturating_add(record.len);
+        if pool > aurora_doc::smart_object::MAX_LINKED_FILE_POOL_BYTES {
+            return Err(bad("the embedded files are too large".to_owned()));
+        }
+        let name = format!("{SMART_OBJECT_FILE_PREFIX}{index}");
+        let entry = match zip.by_name(&name) {
+            Ok(file) => read_capped(file, &name, record.len)?,
+            Err(zip::result::ZipError::FileNotFound) => {
+                return Err(bad(format!("the embedded file {index} is missing")));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if entry.len() as u64 != record.len || !framed_entry_is_valid(&entry) {
+            return Err(bad(format!("the embedded file {index} is damaged")));
+        }
+        layers
+            .add_linked_file(aurora_doc::LinkedFile {
+                list: record.list,
+                unique_id: record.unique_id,
+                entry: std::sync::Arc::new(entry),
+            })
+            .map_err(|err| bad(err.to_string()))?;
+    }
+    Ok(())
+}
+
 /// The entry holding what the document's own open changed or left out
 /// (0.177.0 review B-1): the lines of a PSD's "Opened With Changes"
 /// report, so a later Photoshop save of the document lists them even
@@ -1526,6 +1708,9 @@ struct DocumentEntries {
     layer_effects: Option<Vec<u8>>,
     /// [`IMPORT_LOSSES_ENTRY`], when the document has any (0.177.0).
     import_losses: Option<Vec<u8>>,
+    /// [`SMART_OBJECTS_ENTRY`] and the embedded files, when the document
+    /// has any (0.200.0).
+    smart_objects: Option<SmartEntries>,
 }
 
 impl DocumentEntries {
@@ -1581,6 +1766,7 @@ impl DocumentEntries {
             mask_densities,
             layer_effects,
             import_losses: None,
+            smart_objects: smart_entries(layers)?,
         })
     }
 
@@ -1604,6 +1790,14 @@ impl DocumentEntries {
         if let Some(bytes) = &self.layer_effects {
             zip.start_file(LAYER_EFFECTS_ENTRY, deflated)?;
             zip.write_all(bytes)?;
+        }
+        if let Some(smart) = &self.smart_objects {
+            zip.start_file(SMART_OBJECTS_ENTRY, deflated)?;
+            zip.write_all(&smart.meta)?;
+            for (index, file) in smart.files.iter().enumerate() {
+                zip.start_file(format!("{SMART_OBJECT_FILE_PREFIX}{index}"), stored)?;
+                zip.write_all(file)?;
+            }
         }
         if let Some(bytes) = &self.import_losses {
             zip.start_file(IMPORT_LOSSES_ENTRY, deflated)?;
@@ -1732,6 +1926,17 @@ pub fn snapshot_best_effort(
             }
         }
     }
+    // The embedded smart-object files (0.200.0) are shared (`Arc`), not
+    // copied, by a snapshot; they are counted anyway, so a document whose
+    // tiles plus embedded files pass the caller's budget takes the
+    // streaming write, which holds only one tile at a time, and the budget
+    // stays a bound on what an autosave pins in memory.
+    let pool: usize = layers
+        .linked_files()
+        .values()
+        .map(|f| f.entry.len())
+        .fold(0usize, usize::saturating_add);
+    bound = bound.saturating_add(pool);
     if bound > max_texel_bytes {
         return Ok(None);
     }
@@ -1979,6 +2184,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     let mut layers = manifest.layers;
     read_mask_densities(&mut zip, &mut layers)?;
     read_layer_effects(&mut zip, &mut layers)?;
+    read_smart_objects(&mut zip, &mut layers)?;
 
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
     let history = History::load_journal(&history_bytes)?;

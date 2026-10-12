@@ -38,6 +38,36 @@
 //! layer is not kept (Aurora has no artboards) and not reported. Locks are
 //! therefore lossless and never appear in the save report.
 //!
+//! # Smart objects (0.200.0)
+//!
+//! A pixel layer that still carries `aurora_doc::SmartObject` data (a PSD
+//! smart object kept at open, see `aurora_doc::smart_object`) is written
+//! back as one: its preserved tagged blocks (`SoLd`, `PlLd`, `SoLE`,
+//! `fxrp`) verbatim in the record's extra data, and the embedded files its
+//! unique IDs name, as the document's own framed `lnk2`/`lnkD`/`lnk3`/
+//! `lnkE` entries, rebuilt into one global block per list after `Lr16`
+//! (only the files a written layer names). The layer's pixels are written
+//! exactly as for any layer: they are the smart object's rendering and
+//! Aurora never re-renders them.
+//!
+//! The data is kept only while it is still true: the layer's bounds must be
+//! the ones recorded when it was attached (a Move changes the placement,
+//! which Aurora does not update) and the fingerprint of its tiles must
+//! match the recorded one (any painted or erased pixel changes it); an
+//! undone edit puts it back. Otherwise the layer is written as an ordinary
+//! pixel layer and the report lists it by name and reason. Opacity, fill,
+//! blend mode, visibility, locks, masks and effects do not matter. "Verbatim"
+//! excludes padding: a block whose length is not a multiple of four is
+//! written with up to three zero bytes appended, inside its length (so a
+//! reader of Aurora's own file sees those extra bytes), and a linked entry
+//! missing its final padding gets it. The layer's record rectangle is the
+//! tile-occupied extent of its pixels like any other layer's, not the
+//! original rectangle; the placement in `SoLd` does not depend on it, but
+//! that has not been confirmed in Photoshop.
+//!
+//! Checked with Aurora's own parsers and with psd-tools
+//! (`scripts/verify_psd_write.py`); never opened in Photoshop.
+//!
 //! # Masks (0.178.0)
 //!
 //! A layer's or group's `aurora_doc::LayerMask` is written as a PSD
@@ -213,10 +243,23 @@ impl PsdWriteReport {
     }
 }
 
+/// Why a smart object's data was not written back (0.200.0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SmartDrop {
+    /// The layer's pixels differ from the smart object's rendering.
+    Pixels,
+    /// The layer was moved; its placement data would be wrong.
+    Moved,
+    /// Its embedded file is not in the document's pool.
+    FileMissing,
+}
+
 /// The counts behind a [`PsdWriteReport`]: structural ones known before
 /// writing, measured ones while writing.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Losses {
+    /// Smart-object layers saved as ordinary layers, by name (0.200.0).
+    smart_dropped: Vec<(String, SmartDrop)>,
     long_names: usize,
     rounded_opacity: usize,
     rounded_density: usize,
@@ -238,7 +281,65 @@ fn plural(n: u64, one: &str, many: &str) -> String {
     }
 }
 
+/// "A, B, C and 2 more" for a report line.
+fn name_list(names: &[&str]) -> String {
+    const SHOWN: usize = 5;
+    let shown: Vec<String> = names
+        .iter()
+        .take(SHOWN)
+        .map(|n| format!("\u{201c}{n}\u{201d}"))
+        .collect();
+    let mut text = shown.join(", ");
+    if names.len() > SHOWN {
+        text.push_str(" and ");
+        text.push_str(&(names.len() - SHOWN).to_string());
+        text.push_str(" more");
+    }
+    text
+}
+
 impl Losses {
+    /// One line per reason a smart object's data was not written back.
+    fn smart_object_items(&self) -> Vec<String> {
+        let mut items = Vec::new();
+        for (drop, reason) in [
+            (
+                SmartDrop::Pixels,
+                "their pixels were painted or erased after the file was opened, so they no \
+                 longer match the embedded file",
+            ),
+            (
+                SmartDrop::Moved,
+                "they were moved, and Aurora does not update a smart object's placement",
+            ),
+            (
+                SmartDrop::FileMissing,
+                "their embedded file is no longer available",
+            ),
+        ] {
+            let names: Vec<&str> = self
+                .smart_dropped
+                .iter()
+                .filter(|(_, d)| *d == drop)
+                .map(|(n, _)| n.as_str())
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            items.push(format!(
+                "{} will be saved as ordinary pixel layers because {reason}; Photoshop will not \
+                 be able to open their original contents. Affected: {}.",
+                plural(
+                    names.len() as u64,
+                    "smart object layer",
+                    "smart object layers"
+                ),
+                name_list(&names)
+            ));
+        }
+        items
+    }
+
     fn report(self) -> PsdWriteReport {
         let mut items = Vec::new();
         if self.long_names > 0 {
@@ -273,6 +374,7 @@ impl Losses {
                 plural(self.effects as u64, "layer's", "layers'")
             ));
         }
+        items.extend(self.smart_object_items());
         if self.dissolve > 0 {
             items.push(
                 "Dissolve layers will look different in apps other than Photoshop.".to_owned(),
@@ -414,9 +516,49 @@ pub struct PsdExpectedMask {
     pub decoded_hash: u64,
 }
 
+/// A smart object's data as [`verify_psd_file`] expects to read it back
+/// (0.200.0): the unique ID and the blocks as written (zero-padded to a
+/// multiple of four bytes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PsdExpectedSmart {
+    pub unique_id: String,
+    pub blocks: Vec<aurora_doc::SmartObjectBlock>,
+}
+
+/// One embedded file as [`verify_psd_file`] expects to read it back
+/// (0.200.0): the list it sits in, its unique ID and the length and hash
+/// of its whole framed entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PsdExpectedLinked {
+    pub list: [u8; 4],
+    pub unique_id: String,
+    pub len: u64,
+    pub hash: u64,
+}
+
+/// A streaming 64-bit FNV-1a hash of bytes (0.200.0): the embedded files
+/// are megabytes, hashed as they are written and again as they are read
+/// back, never held twice.
+struct ByteHash(u64);
+
+impl ByteHash {
+    fn new() -> Self {
+        Self(0xCBF2_9CE4_8422_2325)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    }
+}
+
 /// One layer record as [`verify_psd_file`] expects to read it back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PsdExpectedLayer {
+    /// The record's smart-object data, when it is written back as one
+    /// (0.200.0).
+    pub smart: Option<PsdExpectedSmart>,
     pub kind: PsdRecordKind,
     /// The name as written (after any shortening).
     pub name: String,
@@ -446,6 +588,9 @@ pub struct PsdExpectation {
     pub layers: Vec<PsdExpectedLayer>,
     /// A hash of every written merged-image `u16` sample.
     pub merged_hash: u64,
+    /// The embedded files written after `Lr16` (0.200.0), list by list in
+    /// `lnk2`, `lnkD`, `lnk3`, `lnkE` order, each list's in file order.
+    pub linked: Vec<PsdExpectedLinked>,
 }
 
 /// [`write_psd`]'s result.
@@ -728,7 +873,7 @@ pub(crate) fn icc_resource() -> Result<Vec<u8>, IoError> {
 /// channel row and merged row as `PackBits`' best case, one two-byte
 /// packet per 128 bytes, plus its row count and compression field. Known
 /// before a byte is written, from the planned extents.
-fn minimum_file_size(plans: &[LayerPlan], (width, height): (u32, u32)) -> u64 {
+fn minimum_file_size(plans: &[LayerPlan], (width, height): (u32, u32), linked: u64) -> u64 {
     let rows = |w: u32, h: u32, channels: u64| -> u64 {
         let row_min = 2 * (u64::from(w) * 2).div_ceil(128);
         channels.saturating_mul(2 + u64::from(h).saturating_mul(2 + row_min))
@@ -743,7 +888,7 @@ fn minimum_file_size(plans: &[LayerPlan], (width, height): (u32, u32)) -> u64 {
     // The merged image has one compression field for all four planes.
     let merged_row_min = 2 * (u64::from(width) * 2).div_ceil(128);
     let merged = 2 + 4 * u64::from(height).saturating_mul(2 + merged_row_min);
-    layers.saturating_add(merged)
+    layers.saturating_add(merged).saturating_add(linked)
 }
 
 /// One record, planned before anything is written.
@@ -804,11 +949,15 @@ fn i32_of(v: i64) -> Result<i32, IoError> {
     i32::try_from(v).map_err(|_| too_large("layer position"))
 }
 
-fn plan_layers(layers: &LayerTree, store: &TileStore) -> Result<Vec<LayerPlan>, IoError> {
+fn plan_layers(
+    layers: &LayerTree,
+    store: &mut TileStore,
+    losses: &mut Losses,
+) -> Result<Vec<LayerPlan>, IoError> {
     let mut plans = Vec::new();
     for (id, kind) in file_order(layers)? {
         plans.push(match kind {
-            PsdRecordKind::Layer => plan_layer(layers, store, id)?,
+            PsdRecordKind::Layer => plan_layer(layers, store, id, losses)?,
             PsdRecordKind::GroupEnd => plan_group_end(),
             PsdRecordKind::Group => plan_group(layers, id)?,
         });
@@ -833,6 +982,7 @@ fn plan_props(
         mask,
         pascal: pascal_name(&written),
         expected: PsdExpectedLayer {
+            smart: None,
             kind,
             name: written,
             blend: layers.blend_mode(id).unwrap_or_default(),
@@ -859,6 +1009,7 @@ fn plan_group_end() -> LayerPlan {
         mask: None,
         pascal: pascal_name(PSD_GROUP_END_NAME),
         expected: PsdExpectedLayer {
+            smart: None,
             kind: PsdRecordKind::GroupEnd,
             name: PSD_GROUP_END_NAME.to_owned(),
             blend: BlendMode::Normal,
@@ -925,7 +1076,61 @@ fn plan_mask(
     ))
 }
 
-fn plan_layer(layers: &LayerTree, store: &TileStore, id: LayerId) -> Result<LayerPlan, IoError> {
+/// Whether `id`'s smart-object data is still true and so written back
+/// (0.200.0), and the data as it is written; otherwise why not, recorded in
+/// `losses`. See the module documentation for the policy.
+fn smart_for(
+    layers: &LayerTree,
+    store: &mut TileStore,
+    id: LayerId,
+    (surface, bounds, extent): (SurfaceId, &Rect, (u32, u32, u32, u32)),
+    losses: &mut Losses,
+) -> Result<Option<PsdExpectedSmart>, IoError> {
+    let Some(smart) = layers.smart_object(id) else {
+        return Ok(None);
+    };
+    let mut drop_for = |why: SmartDrop| {
+        losses
+            .smart_dropped
+            .push((layers.name(id).unwrap_or_default().to_owned(), why));
+        Ok(None)
+    };
+    if smart.bounds != *bounds {
+        return drop_for(SmartDrop::Moved);
+    }
+    if !layers.linked_files().contains_key(&smart.unique_id) {
+        return drop_for(SmartDrop::FileMissing);
+    }
+    let unchanged = extent.2 > 0
+        && extent.3 > 0
+        && aurora_doc::smart_object::surface_fingerprint(store, surface, *bounds)?
+            == smart.pixel_fingerprint;
+    if !unchanged {
+        return drop_for(SmartDrop::Pixels);
+    }
+    let blocks = smart
+        .blocks
+        .iter()
+        .map(|b| {
+            let mut data = b.data.clone();
+            while !data.len().is_multiple_of(4) {
+                data.push(0);
+            }
+            aurora_doc::SmartObjectBlock { key: b.key, data }
+        })
+        .collect();
+    Ok(Some(PsdExpectedSmart {
+        unique_id: smart.unique_id.clone(),
+        blocks,
+    }))
+}
+
+fn plan_layer(
+    layers: &LayerTree,
+    store: &mut TileStore,
+    id: LayerId,
+    losses: &mut Losses,
+) -> Result<LayerPlan, IoError> {
     let Some(LayerKind::Pixel { bounds }) = layers.kind(id) else {
         return Err(refused(PsdSaveRefusal::CurvesNotYetSupported { count: 1 }));
     };
@@ -955,6 +1160,7 @@ fn plan_layer(layers: &LayerTree, store: &TileStore, id: LayerId) -> Result<Laye
     let mut plan = plan_props(layers, id, PsdRecordKind::Layer, [top, left, bottom, right])?;
     plan.surface = Some(surface);
     plan.extent = extent;
+    plan.expected.smart = smart_for(layers, store, id, (surface, bounds, extent), losses)?;
     Ok(plan)
 }
 
@@ -1006,6 +1212,15 @@ fn record_extra(plan: &LayerPlan) -> Result<Vec<u8>, IoError> {
     extra.extend_from_slice(b"iOpa");
     extra.extend_from_slice(&4u32.to_be_bytes());
     extra.extend_from_slice(&[plan.expected.fill, 0, 0, 0]);
+    if let Some(smart) = &plan.expected.smart {
+        for block in &smart.blocks {
+            extra.extend_from_slice(b"8BIM");
+            extra.extend_from_slice(&block.key);
+            let len = u32::try_from(block.data.len()).map_err(|_| too_large("smart object"))?;
+            extra.extend_from_slice(&len.to_be_bytes());
+            extra.extend_from_slice(&block.data);
+        }
+    }
     Ok(extra)
 }
 
@@ -1028,6 +1243,69 @@ fn section_data(expected: &PsdExpectedLayer) -> Option<Vec<u8>> {
             Some(data)
         }
     }
+}
+
+/// The embedded files the written smart objects name, list by list in
+/// [`aurora_doc::smart_object::LINKED_LIST_KEYS`] order and in the order the
+/// layers first name them (file order, bottom-to-top).
+fn linked_to_write<'a>(
+    layers: &'a LayerTree,
+    plans: &[LayerPlan],
+) -> Vec<&'a aurora_doc::LinkedFile> {
+    let mut used: Vec<&aurora_doc::LinkedFile> = Vec::new();
+    for plan in plans {
+        let Some(smart) = &plan.expected.smart else {
+            continue;
+        };
+        if let Some(file) = layers.linked_files().get(&smart.unique_id)
+            && !used.iter().any(|f| f.unique_id == file.unique_id)
+        {
+            used.push(file);
+        }
+    }
+    let mut ordered = Vec::with_capacity(used.len());
+    for key in aurora_doc::smart_object::LINKED_LIST_KEYS {
+        ordered.extend(used.iter().copied().filter(|f| f.list == key));
+    }
+    ordered
+}
+
+/// Writes the document-level linked-layer blocks: one `8BIM` block per list
+/// that has a file, holding the framed entries back to back. Returns what
+/// was written, for the verifier.
+fn write_linked_blocks<W: Write + Seek>(
+    w: &mut W,
+    files: &[&aurora_doc::LinkedFile],
+    limit: u64,
+) -> Result<Vec<PsdExpectedLinked>, IoError> {
+    let mut expected = Vec::with_capacity(files.len());
+    for key in aurora_doc::smart_object::LINKED_LIST_KEYS {
+        let list: Vec<&&aurora_doc::LinkedFile> = files.iter().filter(|f| f.list == key).collect();
+        if list.is_empty() {
+            continue;
+        }
+        let total = list
+            .iter()
+            .map(|f| f.entry.len() as u64)
+            .fold(0u64, u64::saturating_add);
+        let total32 = u32::try_from(total).map_err(|_| too_large("linked files"))?;
+        w.write_all(b"8BIM")?;
+        w.write_all(&key)?;
+        w.write_all(&total32.to_be_bytes())?;
+        for file in list {
+            let mut hash = ByteHash::new();
+            hash.update(&file.entry);
+            w.write_all(&file.entry)?;
+            check_size(w, limit)?;
+            expected.push(PsdExpectedLinked {
+                list: key,
+                unique_id: file.unique_id.clone(),
+                len: file.entry.len() as u64,
+                hash: hash.0,
+            });
+        }
+    }
+    Ok(expected)
 }
 
 /// The order colour channels are stored in, and each one's RGBA slot.
@@ -1313,8 +1591,13 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
             composite: composite.size(),
         }));
     }
-    let mut plans = plan_layers(layers, store)?;
-    if minimum_file_size(&plans, canvas) > max_bytes {
+    let mut plans = plan_layers(layers, store, &mut losses)?;
+    let linked = linked_to_write(layers, &plans);
+    let linked_bytes: u64 = linked
+        .iter()
+        .map(|f| f.entry.len() as u64 + 12)
+        .fold(0u64, u64::saturating_add);
+    if minimum_file_size(&plans, canvas, linked_bytes) > max_bytes {
         return Err(too_large(
             "a .psd file must be smaller than 2 GiB; use .psb instead",
         ));
@@ -1363,6 +1646,7 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
     if pad != 0 {
         w.write_all(&vec![0u8; usize::try_from(4 - pad).unwrap_or(0)])?;
     }
+    let linked_expected = write_linked_blocks(w, &linked, limit)?;
     let section_end = pos(w)?;
     patch(
         w,
@@ -1380,6 +1664,7 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
             height,
             layers: plans.into_iter().map(|p| p.expected).collect(),
             merged_hash,
+            linked: linked_expected,
         },
     })
 }
@@ -1759,6 +2044,7 @@ fn raw_record<R: std::io::Read + Seek>(
     let _pascal = raw.bytes(padded)?;
     let (mut name, mut fill, mut section) = (None, None, None);
     let mut protected = None;
+    let mut smart_blocks: Vec<aurora_doc::SmartObjectBlock> = Vec::new();
     while raw.pos()? < extra_end {
         check("tagged block signature", raw.array::<4>()?, *b"8BIM")?;
         let key = raw.array::<4>()?;
@@ -1774,9 +2060,20 @@ fn raw_record<R: std::io::Read + Seek>(
                     .map(u32::from_be_bytes);
             }
             b"lsct" => section = Some(data),
+            k if aurora_doc::smart_object::SMART_OBJECT_BLOCK_KEYS.contains(k) => {
+                smart_blocks.push(aurora_doc::SmartObjectBlock { key, data });
+            }
             _ => {}
         }
     }
+    check(
+        &format!("layer {i} smart object blocks"),
+        smart_blocks,
+        want.smart
+            .as_ref()
+            .map(|s| s.blocks.clone())
+            .unwrap_or_default(),
+    )?;
     check(
         &format!("layer {i} name"),
         name.as_deref(),
@@ -1808,7 +2105,8 @@ fn verify_raw<R: std::io::Read + Seek>(inner: R, expected: &PsdExpectation) -> R
     raw.skip(u64::from(global))?;
     check("block signature", raw.array::<4>()?, *b"8BIM")?;
     check("block key", raw.array::<4>()?, *b"Lr16")?;
-    let _lr16_len = raw.u32()?;
+    let lr16_len = raw.u32()?;
+    let lr16_start = raw.pos()?;
     let count = i16::from_be_bytes(raw.array()?);
     let n = i16::try_from(expected.layers.len()).map_err(|_| mismatch("layer count"))?;
     check("layer count", count, -n)?;
@@ -1839,8 +2137,70 @@ fn verify_raw<R: std::io::Read + Seek>(inner: R, expected: &PsdExpectation) -> R
             check(&format!("layer {i} mask pixels"), got, mask.sample_hash)?;
         }
     }
+    let lr16_end = lr16_start + u64::from(lr16_len);
+    check("Lr16 length", raw.pos()?, lr16_end)?;
+    raw.skip((4 - u64::from(lr16_len) % 4) % 4)?;
+    raw_linked(&mut raw, section_start + section, &expected.linked)?;
     raw.inner.seek(SeekFrom::Start(section_start + section))?;
     raw_merged(&mut raw, expected)
+}
+
+/// The global blocks after `Lr16` (0.200.0): the linked-layer lists, each
+/// read entry by entry (length, body, padding) in chunks, never whole, and
+/// compared with what was written.
+fn raw_linked<R: std::io::Read + Seek>(
+    raw: &mut Raw<R>,
+    section_end: u64,
+    want: &[PsdExpectedLinked],
+) -> Result<(), IoError> {
+    const CHUNK: u64 = 1 << 20;
+    let mut got = Vec::new();
+    while raw.pos()? + 12 <= section_end {
+        check("global block signature", raw.array::<4>()?, *b"8BIM")?;
+        let key = raw.array::<4>()?;
+        let len = u64::from(raw.u32()?);
+        if !aurora_doc::smart_object::LINKED_LIST_KEYS.contains(&key) {
+            return Err(mismatch("an unexpected global block after Lr16"));
+        }
+        let block_end = raw.pos()? + len;
+        if block_end > section_end {
+            return Err(mismatch("a linked-layer block runs past its section"));
+        }
+        while raw.pos()? < block_end {
+            let mut hash = ByteHash::new();
+            let length_bytes = raw.array::<8>()?;
+            hash.update(&length_bytes);
+            let body = u64::from_be_bytes(length_bytes);
+            let framed = body + (4 - body % 4) % 4;
+            if raw.pos()? + framed > block_end {
+                return Err(mismatch("a linked-layer entry runs past its block"));
+            }
+            let mut unique_id = String::new();
+            let mut left = framed;
+            let mut first = true;
+            while left > 0 {
+                let n = left.min(CHUNK);
+                let bytes = raw.bytes(usize::try_from(n).map_err(|_| mismatch("a length"))?)?;
+                if first {
+                    first = false;
+                    if let Some(&id_len) = bytes.get(8)
+                        && let Some(text) = bytes.get(9..9 + usize::from(id_len))
+                    {
+                        unique_id = String::from_utf8_lossy(text).into_owned();
+                    }
+                }
+                hash.update(&bytes);
+                left -= n;
+            }
+            got.push(PsdExpectedLinked {
+                list: key,
+                unique_id,
+                len: 8 + framed,
+                hash: hash.0,
+            });
+        }
+    }
+    check("linked-layer entries", got, want.to_vec())
 }
 
 /// The merged image: every row of all four planes, hashed.
@@ -1948,6 +2308,7 @@ pub fn verify_psd_file(path: &Path, expected: &PsdExpectation) -> Result<(), IoE
 
 /// [`verify_psd_file`] with the reader pass's pixel budget as a
 /// parameter (0.177.0, N-3), so a test reaches the skip branch.
+#[allow(clippy::too_many_lines)] // one linear list of checks, one per field
 pub(crate) fn verify_psd_file_with_budget(
     path: &Path,
     expected: &PsdExpectation,
@@ -2010,6 +2371,14 @@ pub(crate) fn verify_psd_file_with_budget(
             Some(want.visible),
         )?;
         check(&format!("layer {i} locks"), l.lock(id), Some(want.lock))?;
+        check(
+            &format!("layer {i} smart object"),
+            l.smart_object(id)
+                .map(|s| (s.unique_id.as_str(), s.blocks.as_slice())),
+            want.smart
+                .as_ref()
+                .map(|s| (s.unique_id.as_str(), s.blocks.as_slice())),
+        )?;
         reader_mask(i, l.mask(id), want.mask.as_ref(), id, &sink.masks)?;
         if kind != PsdRecordKind::Layer {
             continue;
@@ -2037,6 +2406,26 @@ pub(crate) fn verify_psd_file_with_budget(
     }
     if decoded.next().is_some() {
         return Err(mismatch("more layers with pixels than were written"));
+    }
+    check(
+        "embedded smart object files",
+        doc.layers.linked_files().len(),
+        expected.linked.len(),
+    )?;
+    for want in &expected.linked {
+        let Some(file) = doc.layers.linked_files().get(&want.unique_id) else {
+            return Err(mismatch(format!(
+                "embedded file {} was not read back",
+                want.unique_id
+            )));
+        };
+        let mut hash = ByteHash::new();
+        hash.update(&file.entry);
+        check(
+            &format!("embedded file {}", want.unique_id),
+            (file.list, file.entry.len() as u64, hash.0),
+            (want.list, want.len, want.hash),
+        )?;
     }
     Ok(())
 }

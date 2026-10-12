@@ -169,6 +169,9 @@ pub(crate) struct TestPsd {
     /// `None`.
     pub merged: Option<Vec<Vec<u8>>>,
     pub merged_compression: u16,
+    /// Document-level tagged blocks after the layer info (0.200.0), written
+    /// as given and padded to four bytes.
+    pub globals: Vec<([u8; 4], Vec<u8>)>,
 }
 
 impl TestPsd {
@@ -186,6 +189,7 @@ impl TestPsd {
             resources: Vec::new(),
             merged: None,
             merged_compression: 0,
+            globals: Vec::new(),
         }
     }
 
@@ -228,6 +232,7 @@ impl TestPsd {
             while !section.len().is_multiple_of(4) {
                 section.push(0);
             }
+            self.put_globals(&mut section);
         } else {
             let mut body = body;
             if !body.len().is_multiple_of(2) {
@@ -236,12 +241,23 @@ impl TestPsd {
             put_len(&mut section, body.len(), self.psb());
             section.extend_from_slice(&body);
             put_u32(&mut section, 0);
+            self.put_globals(&mut section);
         }
         put_len(&mut o, section.len(), self.psb());
         o.extend_from_slice(&section);
 
         o.extend_from_slice(&self.merged_bytes());
         o
+    }
+
+    fn put_globals(&self, section: &mut Vec<u8>) {
+        for (key, data) in &self.globals {
+            put_block(section, *key, data, self.psb());
+            // Padded by the data's own length, as the reader skips it.
+            for _ in 0..(4 - data.len() % 4) % 4 {
+                section.push(0);
+            }
+        }
     }
 
     fn layer_info_body(&self) -> Vec<u8> {
