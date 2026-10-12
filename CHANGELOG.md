@@ -20,6 +20,18 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.207.1] - 2026-10-12
+
+### Fixed
+
+- Widen GPU adjustment test bounds for WARP/Metal adapters; merge main
+
+## [0.207.0] - 2026-10-12
+
+### Changed
+
+- Rebuild the Tools panel Photoshop-style: icon-only, two columns, grouped
+
 ## [0.206.1] - 2026-10-12
 
 ### Fixed
