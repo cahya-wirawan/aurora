@@ -413,7 +413,7 @@ small machines has not been measured on a real small machine.
   0.75 s alone to 1.1-1.25 s beside the pool (contention, not investigated).
 
 **Adjustments, filters, tools**
-- Adjustments: Curves, Levels and Hue/Saturation (Master and Colorize only). No filters,
+- Adjustments: Curves, Levels and Hue/Saturation (Master, Colorize and the six colour ranges as a fitted CPU model; range edges are not editable in the UI). No filters,
   selection tools beyond a raw data model, smart-object editing, RAW import,
   plugins, scripting or AI (`aurora-ai`, `aurora-plugin`, `aurora-cli` are
   skeletons).

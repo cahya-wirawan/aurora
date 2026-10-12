@@ -1,8 +1,8 @@
 //! The parameters of a Hue/Saturation adjustment (0.203.0): Photoshop's
 //! master Hue, Saturation and Lightness sliders and its Colorize mode.
-//! The per-range adjustments (reds, yellows, greens, cyans, blues,
-//! magentas) are **not** modelled: a file that uses them is left out on
-//! import rather than flattened (see `aurora-io`).
+//! This type holds only the master and Colorize settings; the
+//! per-range adjustments (reds, yellows, greens, cyans, blues, magentas)
+//! live in [`crate::HueSaturationRangesParams`] (`hue_ranges.rs`).
 //!
 //! It lives in `aurora-core`, beside [`crate::LevelsParams`], so
 //! `aurora-doc` can store it in a layer while `aurora-filters` applies it.
