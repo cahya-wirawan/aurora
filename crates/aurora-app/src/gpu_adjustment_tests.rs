@@ -45,8 +45,12 @@ fn tolerance() -> f32 {
 /// adjustments tested here have a slope of at most about 2 on these
 /// fixtures (Hue/Saturation saturation at most +50, Levels gamma and
 /// range stretches kept moderate in these tiles).
+///
+/// 0.206.1: 10 steps, not 8. Windows' WARP software adapter reached
+/// exactly 8 steps on Hue/Saturation hue shifts (no margin) and 3.4e-3..
+/// 3.9e-3 elsewhere.
 fn translucent_tolerance() -> f32 {
-    8.0 / 2048.0
+    10.0 / 2048.0
 }
 
 fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
@@ -357,17 +361,27 @@ const GPU_MODES: [BlendMode; 19] = [
 
 const STEEP_LEVELS_CASES: [&str; 2] = ["gamma min 0.10", "narrow input span"];
 
+/// Hue/Saturation cases whose slope is also unbounded on a translucent
+/// backdrop: saturation +99/+100 divides by `1 - k` (a factor of 100 at
+/// +99), so a one-step `Cb` difference from the GPU's `straight_backdrop`
+/// division flips a pixel between grey and coloured. Held to the opaque
+/// tolerance only. The macOS and Windows CI adapters (Apple Paravirtual,
+/// WARP) rounded differently from the RTX 3090 and exposed this in 0.206.0.
+const STEEP_HUE_SAT_CASES: [&str; 3] = ["saturation +99", "saturation +100", "extremes"];
+
 /// Blend terms that divide or threshold (`ColorBurn`, `ColorDodge`,
 /// `VividLight`, `Divide`, `HardMix`) amplify a one-`f16`-step difference
 /// in `Cs` (the same class as the Curves tests' derived per-mode bound of
-/// about 6-8 steps): 8 steps of `2^-11` instead of `2 * f16::EPSILON`.
+/// about 6-8 steps on the RTX 3090; Windows' WARP adapter measured 9 steps
+/// for Hue/Saturation under `ColorDodge`): 12 steps of `2^-11` instead of
+/// `2 * f16::EPSILON`.
 fn mode_bound(mode: BlendMode) -> f32 {
     match mode {
         BlendMode::ColorBurn
         | BlendMode::ColorDodge
         | BlendMode::VividLight
         | BlendMode::Divide
-        | BlendMode::HardMix => 8.0 / 2048.0,
+        | BlendMode::HardMix => 12.0 / 2048.0,
         _ => tolerance(),
     }
 }
@@ -485,7 +499,9 @@ fn run_cases(
         // Slopes of 10 (gamma 0.10) and 255 (a one-level input span) scale a
         // translucent backdrop's one-step `Cb` difference past any fixed
         // bound; they are held to the opaque tolerance above instead.
-        if bound > tolerance() && STEEP_LEVELS_CASES.contains(&name) {
+        if bound > tolerance()
+            && (STEEP_LEVELS_CASES.contains(&name) || STEEP_HUE_SAT_CASES.contains(&name))
+        {
             continue;
         }
         let (_dir, mut store) = store();
