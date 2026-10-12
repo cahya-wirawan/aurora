@@ -215,7 +215,8 @@ golden-image tests are `#[ignore]`d.
   Curves). Not seen in the live window or on the Mac.
 - **Hue/Saturation** (0.203.0): New Hue/Saturation Layer, a Properties editor
   (Hue, Saturation, Lightness sliders, a Colorize checkbox with its own three
-  sliders; whole numbers only), per-pixel HSL math on encoded RGB, `hue2`
+  sliders; whole numbers only), per-pixel HSL math on encoded RGB (a non-identity
+  setting clamps the backdrop to [0, 1], so float values above 1 are clipped), `hue2`
   layers imported (Master and Colorize only). **Per-colour-range adjustments
   (reds, yellows, ...) are not implemented**: a PSD layer that uses them is left
   out with a report line. **CPU compositing only** (a visible Hue/Saturation
@@ -442,9 +443,10 @@ small machines has not been measured on a real small machine.
 
 ## Known gaps and next steps
 
-- **Next round**: the Hue/Saturation adjustment layer (queue approved by the
-  design owner: Levels, then Hue/Saturation). It is being built on its own
-  branch and is not part of 0.202.1.
+- **Adjustment queue approved by the design owner is done** (Levels 0.202.0,
+  Hue/Saturation 0.203.0). Open follow-ups: Hue/Saturation per-colour-range
+  adjustments, PSD save of Curves/Levels/Hue/Saturation layers, a GPU path for
+  Levels and Hue/Saturation, and a histogram behind the Levels sliders.
 - **Next in the performance line**: anchor the composite grid to the document.
 - **Phase 1 gate (M1.10)** remains open on hardware (accessibility and IME
   audits on all three platforms), on the missed 60 FPS budget, and on a
