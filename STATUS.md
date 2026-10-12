@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-12, version 0.211.0.** This file is updated every round (every
+**As of 2026-10-12, version 0.212.0.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -102,8 +102,16 @@ golden-image tests are `#[ignore]`d.
   active pixel layer with the foreground/background colours, as one undo step,
   through the active selection since 0.211.0 (it was ignored before), the Gradient committing on release
   with no live preview, a fill over 64 Mpx refused with a calm notice; never
-  seen by a human, nor on the Mac; the two new icons are provisional. Selection tools
-  beyond a raw data model do not exist yet.
+  seen by a human, nor on the Mac; the two new icons are provisional. Since 0.212.0 the
+  Marquee's selection is drawn as marching ants (two-tone, 1 physical px, inverted
+  selections also outline the document; steady under reduced motion, paused in a
+  background window), Select All / Deselect / Inverse exist (`Ctrl/Cmd+A`, `+D`,
+  `+Shift+I`, palette, macOS Edit menu), Escape cancels a Marquee drag and the status
+  bar reads the selection out; a Marquee click deselects; **Select All, Deselect,
+  Inverse and the Marquee are not undoable**, mark nothing dirty, are not saved
+  (`.aur`/PSD), are lost when the document closes, and the outline is not clipped to
+  the document; nothing of this has been seen live or on the Mac. Selection tools beyond the
+  rectangle do not exist yet.
 - **Text fields and dialogs**: caret, selection, IME composition, standard
   editing chords through the real OS clipboard (`Cmd` on macOS, `Ctrl`
   elsewhere), click/drag selection (double-click word selection was not done as of 0.138.0).

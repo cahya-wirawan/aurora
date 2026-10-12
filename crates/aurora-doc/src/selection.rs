@@ -130,9 +130,18 @@ impl SelectionSet {
         self.active
     }
 
-    /// Replaces the active selection with `selection`.
+    /// Replaces the active selection with `selection`. A non-inverted
+    /// selection with no area covers nothing (painting through it would
+    /// paint nothing and no outline could show it), so it is never stored:
+    /// it deselects instead, which is what a Marquee click or a
+    /// one-dimensional drag means. An inverted empty rectangle is
+    /// everything and is kept.
     pub fn select(&mut self, selection: Selection) {
-        self.active = Some(selection);
+        if selection.bounds.is_empty() && !selection.inverted {
+            self.active = None;
+        } else {
+            self.active = Some(selection);
+        }
     }
 
     /// Clears the active selection (Photoshop's "Deselect").
@@ -250,6 +259,22 @@ mod tests {
         assert_eq!(s.coverage_at(1, 3), 0.0);
         assert_eq!(s.coverage_at(2, 2), 0.0);
         assert_eq!(s.coverage_at(-100, -100), 0.0);
+    }
+
+    #[test]
+    fn selecting_an_empty_plain_rectangle_deselects_but_an_inverted_one_is_kept() {
+        let mut set = SelectionSet::new();
+        set.select(Selection::new(r(0, 0, 10, 10)));
+        set.select(Selection::new(r(3, 3, 0, 7)));
+        assert_eq!(set.active(), None, "no area covers nothing: deselected");
+        set.select(Selection::new(r(3, 3, 5, 0)));
+        assert_eq!(set.active(), None);
+        let everything = Selection {
+            bounds: r(3, 3, 0, 7),
+            inverted: true,
+        };
+        set.select(everything);
+        assert_eq!(set.active(), Some(everything));
     }
 
     #[test]

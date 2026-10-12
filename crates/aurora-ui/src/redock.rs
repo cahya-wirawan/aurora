@@ -1681,7 +1681,9 @@ mod tests {
     /// group root inside one of those; the canvas area holds exactly the
     /// frames; no group or frame is empty.
     fn every_panel_once(ws: &Workspace) {
-        let frames: Vec<WidgetId> = ws.floating.iter().map(|float| float.frame).collect();
+        let frames: Vec<WidgetId> = std::iter::once(ws.selection_outline)
+            .chain(ws.floating.iter().map(|float| float.frame))
+            .collect();
         assert_eq!(
             ws.tree
                 .children(ws.canvas_area)
@@ -2037,7 +2039,7 @@ mod tests {
         lay(&mut ws, WINDOW);
         assert_eq!(
             ws.tree.children(ws.canvas_area).map(<[_]>::to_vec),
-            Some(vec![upper, lower])
+            Some(vec![ws.selection_outline, upper, lower])
         );
         assert_eq!(crate::floating_index_at(&ws, shared), Some(1));
         assert!(
@@ -2070,7 +2072,10 @@ mod tests {
                 .find(|(node, _)| *node == id)
                 .map(|(_, node)| node.children().to_vec())
         };
-        assert_eq!(children_of(ws.canvas_area), Some(vec![upper, lower]));
+        assert_eq!(
+            children_of(ws.canvas_area),
+            Some(vec![ws.selection_outline, upper, lower])
+        );
         for panel in DockPanel::ALL {
             let root = ws.panel(panel).root;
             let parents = update
@@ -2188,7 +2193,11 @@ mod tests {
             .map(|(_, node)| node.children().to_vec());
         assert_eq!(
             canvas_children,
-            Some(ws.floating.iter().map(|f| f.frame).collect::<Vec<_>>())
+            Some(
+                std::iter::once(ws.selection_outline)
+                    .chain(ws.floating.iter().map(|f| f.frame))
+                    .collect::<Vec<_>>()
+            )
         );
         assert_eq!(
             super::float_workspace_panel(&mut ws, &mut focus, DockPanel::History, &scales).ok(),

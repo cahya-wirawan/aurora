@@ -477,6 +477,7 @@ fn kind_disabled(kind: &WidgetKind) -> bool {
         WidgetKind::Container
         | WidgetKind::DropIndicator(_)
         | WidgetKind::Thumbnail(_)
+        | WidgetKind::SelectionOutline(_)
         | WidgetKind::CommandPalette(_)
         | WidgetKind::ListRow(_)
         | WidgetKind::Panel
@@ -500,6 +501,7 @@ fn gets_focus_ring(kind: &WidgetKind) -> bool {
             | WidgetKind::DropdownList
             | WidgetKind::ListRow(_)
             | WidgetKind::Thumbnail(_)
+            | WidgetKind::SelectionOutline(_)
             | WidgetKind::Tooltip
             | WidgetKind::Dialog
             | WidgetKind::MenuSeparator
@@ -1122,6 +1124,9 @@ pub fn paint_widget(
         }
         WidgetKind::DropIndicator(state) => {
             paint_drop_indicator(*state, bounds, theme, scales, scale_factor)
+        }
+        WidgetKind::SelectionOutline(state) => {
+            Ok(paint_selection_outline(state, bounds, theme, scale_factor))
         }
         // Whole or not at all: see `paint_icon`.
         WidgetKind::Icon(state) => paint_icon(state, full, bounds, theme, scale_factor),
@@ -3030,6 +3035,66 @@ fn paint_raised_panel(
     )
 }
 
+/// A selection outline's paint (0.212.0, `widgets::selection_outline`):
+/// every [`crate::widgets::OutlineRun`] of one tone merged into one flat
+/// mesh, the light tone in `text.primary` and the dark one in
+/// `surface.canvas`. The runs are physical pixels from the widget's
+/// origin; the mesh is in logical units, so each run lands on whole
+/// physical pixels at the frame's scale factor. Nothing for no runs.
+fn paint_selection_outline(
+    state: &crate::widgets::SelectionOutlineState,
+    bounds: Rect,
+    theme: &Theme,
+    scale_factor: f32,
+) -> Vec<Paint> {
+    use crate::widgets::OutlineTone;
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let (origin_x, origin_y) = (bounds.x as f32, bounds.y as f32);
+    let mut paints = Vec::new();
+    for (tone, colour) in [
+        (OutlineTone::Light, theme.text.primary.to_srgb_f32()),
+        (OutlineTone::Dark, theme.surface.canvas.to_srgb_f32()),
+    ] {
+        let mut mesh = Mesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        };
+        for run in state.runs().iter().filter(|run| run.tone == tone) {
+            #[allow(clippy::cast_precision_loss)]
+            let (x0, y0) = (
+                origin_x + run.x as f32 / scale,
+                origin_y + run.y as f32 / scale,
+            );
+            #[allow(clippy::cast_precision_loss)]
+            let (x1, y1) = (
+                x0 + run.width as f32 / scale,
+                y0 + run.height as f32 / scale,
+            );
+            let Ok(base) = u32::try_from(mesh.vertices.len()) else {
+                break;
+            };
+            mesh.vertices.extend([
+                Point { x: x0, y: y0 },
+                Point { x: x1, y: y0 },
+                Point { x: x1, y: y1 },
+                Point { x: x0, y: y1 },
+            ]);
+            mesh.indices
+                .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        if !mesh.indices.is_empty() {
+            let [red, green, blue] = colour;
+            paints.push((mesh, [red, green, blue, 1.0]));
+        }
+    }
+    paints
+}
+
 /// A drop indicator's paint (0.166.0, `widgets::drop_indicator`):
 /// nothing while hidden; an [`crate::widgets::DropIndicatorKind::Insertion`] fills its
 /// whole box with `accent.primary`; a [`crate::widgets::DropIndicatorKind::Target`]
@@ -3136,6 +3201,69 @@ mod tests {
             Ok(scales) => scales,
             Err(err) => unreachable!("the committed scales must parse: {err:?}"),
         }
+    }
+
+    /// 0.212.0: a selection outline paints one mesh per tone in the two
+    /// token colours, each run at `run / scale` logical units from the
+    /// widget's origin, and nothing when it has no runs.
+    #[test]
+    #[allow(clippy::indexing_slicing, clippy::float_cmp)]
+    fn a_selection_outline_paints_two_tone_meshes_from_its_runs() {
+        use crate::widgets::{
+            OutlineRun, OutlineTone, insert_selection_outline, set_selection_outline,
+        };
+        let theme = dark_theme();
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let id = match insert_selection_outline(&mut tree, root) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(200.0, 100.0);
+        let paints = |tree: &WidgetTree<WidgetKind>, scale| match paint_widget(
+            tree,
+            id,
+            &theme,
+            &scales(),
+            scale,
+        ) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(paints(&tree, 1.0).is_empty());
+        let runs = vec![
+            OutlineRun {
+                x: 2,
+                y: 0,
+                width: 4,
+                height: 1,
+                tone: OutlineTone::Light,
+            },
+            OutlineRun {
+                x: 6,
+                y: 0,
+                width: 4,
+                height: 1,
+                tone: OutlineTone::Dark,
+            },
+        ];
+        assert_eq!(
+            set_selection_outline(&mut tree, id, runs.clone()).ok(),
+            Some(true)
+        );
+        assert_eq!(set_selection_outline(&mut tree, id, runs).ok(), Some(false));
+        let drawn = paints(&tree, 2.0);
+        assert_eq!(drawn.len(), 2);
+        let [lr, lg, lb] = theme.text.primary.to_srgb_f32();
+        let [dr, dg, db] = theme.surface.canvas.to_srgb_f32();
+        assert_eq!(drawn[0].1, [lr, lg, lb, 1.0]);
+        assert_eq!(drawn[1].1, [dr, dg, db, 1.0]);
+        // Scale 2: a 4 physical px run is 2 logical wide, 1 px is 0.5.
+        let xs: Vec<f32> = drawn[0].0.vertices.iter().map(|p| p.x).collect();
+        let ys: Vec<f32> = drawn[0].0.vertices.iter().map(|p| p.y).collect();
+        assert_eq!(xs.iter().copied().fold(f32::MAX, f32::min), 1.0);
+        assert_eq!(xs.iter().copied().fold(f32::MIN, f32::max), 3.0);
+        assert_eq!(ys.iter().copied().fold(f32::MIN, f32::max), 0.5);
+        assert_ne!(drawn[0].1, drawn[1].1, "the two tones differ");
     }
 
     /// A synthetic child of the real, committed Dark theme with

@@ -374,6 +374,7 @@ pub(crate) fn payload_disabled(kind: &WidgetKind) -> bool {
         | WidgetKind::DropIndicator(_)
         | WidgetKind::Icon(_)
         | WidgetKind::Thumbnail(_)
+        | WidgetKind::SelectionOutline(_)
         | WidgetKind::CommandPalette(_)
         | WidgetKind::Panel
         | WidgetKind::RaisedPanel
@@ -1832,6 +1833,7 @@ mod tests {
             WidgetKind::RaisedPanel => 25,
             WidgetKind::Icon(_) => 26,
             WidgetKind::Thumbnail(_) => 27,
+            WidgetKind::SelectionOutline(_) => 28,
         }
     }
     const KIND_COUNT: usize = 28;

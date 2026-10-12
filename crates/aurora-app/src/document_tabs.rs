@@ -35,7 +35,7 @@ use crate::document_session::{DocumentId, DocumentSession, DocumentShelf};
 use crate::{
     ClickTracker, CurvesEdit, CurvesUiState, Drag, LayerControlEdit, LayerControlsState,
     ScrollFollow, commit_drag_into_history, end_curves_gestures, end_layer_control_gestures,
-    populate_history_rows, rebuild_layer_rows, sync_layer_controls, sync_status_bar,
+    populate_history_rows, rebuild_layer_rows, sync_layer_controls,
 };
 
 /// Everything a switch reads or rewrites, borrowed from `App`.
@@ -250,11 +250,13 @@ pub(crate) fn bind_active_document(cx: &mut SwitchContext<'_>) {
     }
     let _ = sync_document_tab_bar(cx.workspace, cx.focus, cx.shelf, cx.doc);
     cx.focus.validate(&cx.workspace.tree);
-    let _ = sync_status_bar(
+    let _ = crate::sync_status_bar_notice(
         cx.workspace,
         &cx.doc.canvas_view,
         cx.doc.canvas_size,
         cx.scale_factor,
+        None,
+        cx.doc.selection.active(),
     );
 }
 
