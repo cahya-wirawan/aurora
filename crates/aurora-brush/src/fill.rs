@@ -40,7 +40,7 @@ use aurora_tile::{CHANNELS, SAMPLES, SurfaceId, TILE, TileError, TileId, TileSto
 use half::f16;
 
 use crate::StrokeSnapshot;
-use crate::coverage::{Coverage, CoverageRegion, apply_coverage, covered};
+use crate::coverage::{Coverage, TileCover, apply_coverage, covered, tile_cover};
 
 /// The most tiles one fill may touch: 1024 tiles (64 Mpx). A larger flood
 /// region or gradient area is refused, untouched, with
@@ -442,14 +442,12 @@ fn flood_everywhere(
 /// tile-local `(x, y)` of the tile whose layer-local origin is
 /// `origin`; `None` when the box is wholly uncovered (skip the tile), and
 /// `Some(None)` when it is wholly covered or there is no selection.
+#[allow(clippy::option_option)]
 fn tile_coverage_of(
     coverage: Option<&dyn Coverage>,
     origin: (u32, u32),
     tile_box: (u32, u32, u32, u32),
 ) -> Option<Option<&dyn Coverage>> {
-    let Some(cov) = coverage else {
-        return Some(None);
-    };
     let (x, y, width, height) = tile_box;
     let rect = Rect {
         x: i64::from(origin.0) + i64::from(x),
@@ -457,10 +455,10 @@ fn tile_coverage_of(
         width,
         height,
     };
-    match cov.region(rect) {
-        CoverageRegion::Empty => None,
-        CoverageRegion::Full => Some(None),
-        CoverageRegion::Partial => Some(Some(cov)),
+    match tile_cover(coverage, rect) {
+        TileCover::Skip => None,
+        TileCover::All => Some(None),
+        TileCover::Each(cov) => Some(Some(cov)),
     }
 }
 

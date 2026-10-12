@@ -49,7 +49,7 @@ use aurora_tile::{CHANNELS, SAMPLES, SurfaceId, TILE, TileError, TileId, TileSto
 use half::f16;
 
 use crate::StrokeSnapshot;
-use crate::coverage::{Coverage, CoverageRegion, blend_texel, covered};
+use crate::coverage::{Coverage, TileCover, blend_texel, covered, tile_cover};
 
 /// Index of tile-local pixel `(x, y)`'s first (red) channel within a
 /// tile's own flat `texels()` slice.
@@ -462,16 +462,14 @@ fn dab_reaches_blank_tile(
 }
 
 /// The coverage to consult texel by texel inside the tile box, or `None`
-/// to skip the tile (`Empty`). `Ok(None)` means every texel is covered
-/// (no selection, or the tile is wholly inside it).
-fn tile_coverage<'a>(
-    coverage: Option<&'a dyn Coverage>,
+/// to skip the tile entirely. `Some(None)` means every texel is covered
+/// (no selection, or the box is wholly inside it).
+#[allow(clippy::option_option)]
+fn tile_coverage(
+    coverage: Option<&dyn Coverage>,
     origin: (u32, u32),
     tile_box: TileBox,
-) -> Option<Option<&'a dyn Coverage>> {
-    let Some(cov) = coverage else {
-        return Some(None);
-    };
+) -> Option<Option<&dyn Coverage>> {
     let (lx0, ly0, lx1, ly1) = tile_box;
     let rect = Rect {
         x: i64::from(origin.0 + lx0),
@@ -479,10 +477,10 @@ fn tile_coverage<'a>(
         width: lx1 - lx0 + 1,
         height: ly1 - ly0 + 1,
     };
-    match cov.region(rect) {
-        CoverageRegion::Empty => None,
-        CoverageRegion::Full => Some(None),
-        CoverageRegion::Partial => Some(Some(cov)),
+    match tile_cover(coverage, rect) {
+        TileCover::Skip => None,
+        TileCover::All => Some(None),
+        TileCover::Each(cov) => Some(Some(cov)),
     }
 }
 
@@ -790,7 +788,11 @@ pub fn erase_dab(
 /// erases half as much), which is the lerp of the old and the erased alpha.
 /// `None` is exactly [`erase_dab`]; coverage `1` erases exactly what it
 /// does; a tile with no covered texel is neither read nor created.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
 pub fn erase_dab_covered(
     store: &mut TileStore,
     surface: SurfaceId,

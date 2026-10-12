@@ -6,6 +6,15 @@
 //! coverage (rectangles, inverted, constant fractions and a function that
 //! is not a rectangle at all).
 
+#![allow(
+    clippy::float_cmp,
+    clippy::indexing_slicing,
+    clippy::type_complexity,
+    clippy::cast_precision_loss,
+    clippy::needless_range_loop,
+    clippy::too_many_lines
+)]
+
 use std::num::NonZeroUsize;
 
 use aurora_core::Rect;
@@ -151,7 +160,7 @@ impl Coverage for RectCov {
         (!self.inverted).then_some(self.rect)
     }
     fn at(&self, x: i64, y: i64) -> f32 {
-        if self.rect.contains_point(x, y) != self.inverted {
+        if self.rect.contains_point(x, y) ^ self.inverted {
             1.0
         } else {
             0.0

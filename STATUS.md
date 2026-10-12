@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-12, version 0.210.0.** This file is updated every round (every
+**As of 2026-10-12, version 0.211.0.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -100,7 +100,7 @@ golden-image tests are `#[ignore]`d.
   since 0.209.0 Radial, Reverse and Opacity for the Gradient (`G`) and
   Tolerance and Contiguous for the Paint Bucket (`Shift+G`). Both fill the
   active pixel layer with the foreground/background colours, as one undo step,
-  ignoring selections (as the Brush does), the Gradient committing on release
+  through the active selection since 0.211.0 (it was ignored before), the Gradient committing on release
   with no live preview, a fill over 64 Mpx refused with a calm notice; never
   seen by a human, nor on the Mac; the two new icons are provisional. Selection tools
   beyond a raw data model do not exist yet.

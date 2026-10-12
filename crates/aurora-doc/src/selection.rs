@@ -44,7 +44,7 @@ impl Selection {
     /// must not assume it is only ever `0` or `1`.
     #[must_use]
     pub fn coverage_at(&self, x: i64, y: i64) -> f32 {
-        if self.bounds.contains_point(x, y) != self.inverted {
+        if self.bounds.contains_point(x, y) ^ self.inverted {
             1.0
         } else {
             0.0
@@ -207,6 +207,8 @@ impl Default for SelectionSet {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
+
     use super::{Selection, SelectionSet};
     use crate::DocError;
     use aurora_core::Rect;

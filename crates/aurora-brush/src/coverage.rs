@@ -63,6 +63,28 @@ pub trait Coverage {
     }
 }
 
+/// What a tool does with one rectangle of a tile under a coverage.
+pub(crate) enum TileCover<'a> {
+    /// Nothing in it is covered: skip the tile (do not even acquire it).
+    Skip,
+    /// Everything in it is covered, or there is no selection: no lookups.
+    All,
+    /// Ask the coverage texel by texel.
+    Each(&'a dyn Coverage),
+}
+
+/// Classifies `rect` for a tool: no selection is [`TileCover::All`].
+pub(crate) fn tile_cover(coverage: Option<&dyn Coverage>, rect: Rect) -> TileCover<'_> {
+    let Some(cov) = coverage else {
+        return TileCover::All;
+    };
+    match cov.region(rect) {
+        CoverageRegion::Empty => TileCover::Skip,
+        CoverageRegion::Full => TileCover::All,
+        CoverageRegion::Partial => TileCover::Each(cov),
+    }
+}
+
 /// The coverage at `(x, y)`, clamped to `0..=1` (NaN is `0`).
 #[must_use]
 pub(crate) fn covered(coverage: &dyn Coverage, x: i64, y: i64) -> f32 {
@@ -105,6 +127,8 @@ pub(crate) fn apply_coverage(old: &[f16], new: [f16; CHANNELS], c: f32) -> Optio
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
+
     use super::*;
 
     #[test]

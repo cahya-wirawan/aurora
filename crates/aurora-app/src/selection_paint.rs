@@ -83,7 +83,7 @@ pub(crate) fn dab_through_selection(
 }
 
 impl LayerSelection {
-    fn to_document(&self, rect: Rect) -> Rect {
+    fn document_rect(&self, rect: Rect) -> Rect {
         Rect {
             x: rect.x.saturating_add(self.origin.0),
             y: rect.y.saturating_add(self.origin.1),
@@ -109,7 +109,7 @@ impl Coverage for LayerSelection {
     }
 
     fn region(&self, rect: Rect) -> CoverageRegion {
-        let doc = self.to_document(rect);
+        let doc = self.document_rect(rect);
         if self.selection.fully_excludes(&doc) {
             CoverageRegion::Empty
         } else if self.selection.fully_covers(&doc) {
@@ -122,6 +122,8 @@ impl Coverage for LayerSelection {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
+
     use super::*;
 
     fn r(x: i64, y: i64, width: u32, height: u32) -> Rect {

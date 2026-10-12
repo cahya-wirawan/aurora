@@ -7,7 +7,12 @@
 //! `step_undo_order`). `App` itself needs a window, so its thin wrappers
 //! (which `self` fields they pass) are not run here.
 
-#![allow(clippy::float_cmp, clippy::cast_precision_loss)]
+#![allow(
+    clippy::float_cmp,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap,
+    clippy::indexing_slicing
+)]
 
 use crate::PointerButton;
 use crate::fill_tools::{self, FillRefused};
