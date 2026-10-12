@@ -118,11 +118,17 @@ pub enum IconKind {
     PaintBucket,
     /// A dashed ellipse: the Elliptical Marquee tool (0.213.0).
     EllipseMarquee,
+    /// A freehand loop with a tail: the Lasso tool (0.214.0).
+    Lasso,
+    /// An open polygon: the Polygonal Lasso tool (0.214.0).
+    PolygonalLasso,
+    /// A wand with a sparkle at its tip: the Magic Wand tool (0.214.0).
+    MagicWand,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 30] = [
+    pub const ALL: [IconKind; 33] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -153,6 +159,9 @@ impl IconKind {
         IconKind::Gradient,
         IconKind::PaintBucket,
         IconKind::EllipseMarquee,
+        IconKind::Lasso,
+        IconKind::PolygonalLasso,
+        IconKind::MagicWand,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -190,6 +199,9 @@ impl IconKind {
             IconKind::Gradient => "Gradient",
             IconKind::PaintBucket => "Paint Bucket",
             IconKind::EllipseMarquee => "Ellipse Marquee",
+            IconKind::Lasso => "Lasso",
+            IconKind::PolygonalLasso => "Polygonal Lasso",
+            IconKind::MagicWand => "Magic Wand",
         }
     }
 }
@@ -540,6 +552,37 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
         ],
         IconKind::Marquee => marquee_dashes(),
         IconKind::EllipseMarquee => ellipse_marquee_dashes(),
+        IconKind::Lasso => vec![
+            // The loop (open at the lower left), then the tail hanging
+            // from it.
+            stroke_part()
+                .m(5.0, 11.0)
+                .c([2.0, 9.0], [2.0, 4.0], [8.0, 3.0])
+                .c([13.0, 2.0], [15.0, 7.0], [11.0, 10.0])
+                .c([9.0, 12.0], [7.0, 12.0], [5.0, 11.0]),
+            stroke_part()
+                .m(5.0, 11.0)
+                .c([5.0, 13.0], [4.0, 14.0], [3.0, 14.0]),
+        ],
+        IconKind::PolygonalLasso => vec![
+            // Straight edges between corners, left open at the last one.
+            stroke_part()
+                .m(2.0, 12.0)
+                .l(4.0, 4.0)
+                .l(9.0, 2.0)
+                .l(14.0, 6.0)
+                .l(11.0, 13.0)
+                .l(7.0, 9.0),
+        ],
+        IconKind::MagicWand => {
+            let [vertical, horizontal] = plus(11.0, 5.0, 3.0);
+            vec![
+                // The wand, running to the sparkle at the upper right.
+                stroke_part().m(2.0, 14.0).l(8.0, 8.0),
+                vertical,
+                horizontal,
+            ]
+        }
         IconKind::ZoomIn => {
             let [vertical, horizontal] = plus(6.0, 6.0, 2.0);
             vec![
@@ -767,7 +810,7 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 30);
+        assert_eq!(IconKind::ALL.len(), 33);
         for kind in [IconKind::SwapArrows, IconKind::DefaultColours] {
             assert!(IconKind::ALL.contains(&kind));
             assert!(!icon_parts(kind).is_empty(), "{kind:?}");

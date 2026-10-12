@@ -549,6 +549,7 @@ mod document_tabs;
 #[cfg(test)]
 mod document_tabs_tests;
 mod fill_tools;
+mod lasso_tools;
 mod layer_thumbnails;
 mod prepared_pixels;
 mod psd_save;
@@ -5482,6 +5483,13 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
             "Shift+M",
             AppCommand::SelectTool(aurora_ui::Tool::EllipticalMarquee),
         ),
+        // 0.214.0: Photoshop's grouped L key, and the Magic Wand.
+        ("l", AppCommand::SelectTool(aurora_ui::Tool::Lasso)),
+        (
+            "Shift+L",
+            AppCommand::SelectTool(aurora_ui::Tool::PolygonalLasso),
+        ),
+        ("w", AppCommand::SelectTool(aurora_ui::Tool::MagicWand)),
         ("z", AppCommand::SelectTool(aurora_ui::Tool::Zoom)),
         ("h", AppCommand::SelectTool(aurora_ui::Tool::Pan)),
         ("i", AppCommand::SelectTool(aurora_ui::Tool::Eyedropper)),
@@ -5856,6 +5864,9 @@ const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
         aurora_ui::Tool::Move => "tool.move",
         aurora_ui::Tool::MarqueeSelect => "tool.marquee_select",
         aurora_ui::Tool::EllipticalMarquee => "tool.elliptical_marquee",
+        aurora_ui::Tool::Lasso => "tool.lasso",
+        aurora_ui::Tool::PolygonalLasso => "tool.polygonal_lasso",
+        aurora_ui::Tool::MagicWand => "tool.magic_wand",
         aurora_ui::Tool::Zoom => "tool.zoom",
         aurora_ui::Tool::Pan => "tool.pan",
         aurora_ui::Tool::Eyedropper => "tool.eyedropper",
@@ -11553,6 +11564,24 @@ enum Drag {
         /// cancel instead, restoring `before`.
         current: Option<aurora_doc::Selection>,
     },
+    /// A Lasso drag, or a Polygonal Lasso in progress (0.214.0; see
+    /// [`lasso_tools`]). Like `Marquee` it keeps `before` and `current`
+    /// and ends by recording one selection step; unlike it, `current` is
+    /// a raster mask, and a Polygonal Lasso survives the pointer's release.
+    Lasso {
+        /// `true` for the Polygonal Lasso: `points` are clicked vertices.
+        polygonal: bool,
+        /// The path, in document space.
+        points: Vec<(f32, f32)>,
+        /// The document rectangle the mask is clipped to (set at the
+        /// press; empty until then).
+        clip: aurora_core::Rect,
+        /// What was selected when the gesture began (the press deselected
+        /// it): the step's "before", and what Escape puts back.
+        before: Option<aurora_doc::Selection>,
+        /// The selection the path has built so far: the step's "after".
+        current: Option<aurora_doc::Selection>,
+    },
     Brush {
         last_doc: (f32, f32),
         carry: f32,
@@ -11867,6 +11896,18 @@ fn commit_ending_drag(
             let label = selection_view::marquee_step_label(elliptical, current.is_some());
             undo_order.record_selection(label, before, current, history, pixel_history);
         }
+        // A Lasso gesture ending by any path is one selection step too
+        // (0.214.0): from what was selected when it began to what it had
+        // built. The live selection already is `current`.
+        Some(Drag::Lasso {
+            polygonal,
+            before,
+            current,
+            ..
+        }) => {
+            let label = lasso_tools::lasso_step_label(polygonal, current.is_some());
+            undo_order.record_selection(label, before, current, history, pixel_history);
+        }
         Some(Drag::Move {
             layer_id,
             start_bounds,
@@ -12087,6 +12128,20 @@ fn begin_drag(
             before: None,
             current: None,
         }),
+        (aurora_ui::Tool::Lasso | aurora_ui::Tool::PolygonalLasso, PointerButton::Primary) => {
+            Some(Drag::Lasso {
+                polygonal: tool == aurora_ui::Tool::PolygonalLasso,
+                points: vec![view.to_document(canvas_point)],
+                clip: aurora_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+                before: None,
+                current: None,
+            })
+        }
         (aurora_ui::Tool::Brush, PointerButton::Primary) => Some(Drag::Brush {
             last_doc: view.to_document(canvas_point),
             carry: 0.0,
@@ -12208,6 +12263,23 @@ fn continue_drag(
                 aurora_doc::Selection::new(rect)
             });
             *current = selection.active();
+            Vec::new()
+        }
+        Drag::Lasso {
+            polygonal,
+            points,
+            clip,
+            current,
+            ..
+        } => {
+            // A Polygonal Lasso only changes on a click, not a move.
+            if !*polygonal {
+                let point = view.to_document(canvas_point);
+                if lasso_tools::push_lasso_point(points, point) && lasso_tools::rebuild_due(points)
+                {
+                    lasso_tools::rebuild_live(points, clip, selection, current);
+                }
+            }
             Vec::new()
         }
         Drag::Brush {
@@ -12605,6 +12677,12 @@ fn shift_drag_reference(drag: &mut Drag, delta: (f32, f32)) {
             current_doc.0 += delta.0;
             current_doc.1 += delta.1;
         }
+        Drag::Lasso { points, .. } => {
+            for point in points {
+                point.0 += delta.0;
+                point.1 += delta.1;
+            }
+        }
         Drag::Pan { .. } | Drag::Eyedropper => {}
     }
 }
@@ -12627,6 +12705,7 @@ fn drag_reference(drag: &Drag) -> Option<(f32, f32)> {
         | Drag::Move { start_doc, .. }
         | Drag::Gradient { start_doc, .. } => Some(*start_doc),
         Drag::Brush { last_doc, .. } | Drag::Eraser { last_doc, .. } => Some(*last_doc),
+        Drag::Lasso { points, .. } => points.first().copied(),
         Drag::Pan { .. } | Drag::Eyedropper => None,
     }
 }
@@ -25421,6 +25500,11 @@ enum LockRefusal {
     /// A fill with no pixel layer to fill: none is active, or the active
     /// layer is a group or an adjustment layer (0.209.1).
     FillNeedsPixelLayer,
+    /// The Magic Wand with no pixel layer to read: none is active, or the
+    /// active layer is a group or an adjustment layer (0.214.0).
+    WandNeedsPixelLayer,
+    /// A Magic Wand region is over the tile or area cap (0.214.0).
+    SelectionTooLarge,
     /// An undo or redo could not read the step's saved data back (0.210.0:
     /// a pixel-history spill file a temp-file cleaner removed, or a corrupt
     /// one). Not a lock; the step stays in the History panel.
@@ -25449,6 +25533,12 @@ impl LockRefusal {
             LockRefusal::ClipOnGroup => "Groups can't be clipped. Clip a layer inside the group.",
             LockRefusal::FillNeedsPixelLayer => {
                 "Select a pixel layer to fill. A group, an adjustment layer or no layer can't be filled."
+            }
+            LockRefusal::WandNeedsPixelLayer => {
+                "Select a pixel layer to use the Magic Wand. A group, an adjustment layer or no layer can't be sampled."
+            }
+            LockRefusal::SelectionTooLarge => {
+                "That region is too large to select in one step (over 64 megapixels). Raise the tolerance less, or turn Contiguous on."
             }
             LockRefusal::HistoryUnavailable => {
                 "Couldn't undo or redo: history file unavailable. A temp-file cleaner may have removed it; the step stays in the list."
@@ -25530,6 +25620,10 @@ fn lock_refusal_applies(
             tool,
             aurora_ui::Tool::Gradient | aurora_ui::Tool::PaintBucket
         ))
+        || (matches!(
+            refusal,
+            LockRefusal::WandNeedsPixelLayer | LockRefusal::SelectionTooLarge
+        ) && tool == aurora_ui::Tool::MagicWand)
 }
 
 /// Turns a failed pixel undo/redo (0.210.0: the step's saved history data
@@ -25566,6 +25660,9 @@ impl ToolSettings {
             aurora_ui::Tool::Move
             | aurora_ui::Tool::MarqueeSelect
             | aurora_ui::Tool::EllipticalMarquee
+            | aurora_ui::Tool::Lasso
+            | aurora_ui::Tool::PolygonalLasso
+            | aurora_ui::Tool::MagicWand
             | aurora_ui::Tool::Zoom
             | aurora_ui::Tool::Pan
             | aurora_ui::Tool::Eyedropper
@@ -27125,6 +27222,9 @@ impl App {
             return;
         }
         if self.escape_cancels_marquee(key) {
+            return;
+        }
+        if self.polygon_key(key) {
             return;
         }
         let controls = self.layer_controls.controls;
@@ -29401,6 +29501,21 @@ impl App {
         // fix, one branch further down this same function, and a live
         // `Drag::Brush` really can reach here: `z` switches to the Zoom
         // tool mid-stroke without ending the stroke.
+        // A Polygonal Lasso in progress takes this click as a vertex (or
+        // closes) instead of ending (0.214.0).
+        if self.tool == aurora_ui::Tool::PolygonalLasso
+            && button == PointerButton::Primary
+            && matches!(
+                self.drag,
+                Some(Drag::Lasso {
+                    polygonal: true,
+                    ..
+                })
+            )
+        {
+            self.polygon_click(canvas_point);
+            return;
+        }
         let interrupted = self.drag.take();
         self.commit_drag(interrupted);
 
@@ -29423,6 +29538,12 @@ impl App {
             self.fill_bucket(doc_point);
             return;
         }
+        // The Magic Wand selects on the press itself (0.214.0): no drag.
+        if self.tool == aurora_ui::Tool::MagicWand && button == PointerButton::Primary {
+            let doc_point = self.doc.canvas_view.to_document(canvas_point);
+            self.select_wand(doc_point);
+            return;
+        }
         self.drag = begin_drag(
             self.tool,
             button,
@@ -29430,6 +29551,16 @@ impl App {
             &self.doc.canvas_view,
             active_pixel_layer(&self.doc.layers, self.doc.active_layer),
         );
+        if matches!(self.drag, Some(Drag::Lasso { .. })) {
+            // Like the Marquee, a press deselects at once; the path then
+            // builds the new selection and Escape restores this one.
+            lasso_tools::press_lasso(
+                &mut self.drag,
+                &mut self.doc.selection,
+                self.doc.canvas_size,
+            );
+            self.needs_redraw = true;
+        }
         if matches!(self.drag, Some(Drag::Marquee { .. })) {
             // A press with the Marquee deselects at once (Photoshop: a
             // click deselects, including a click on a selection); the drag
@@ -29765,7 +29896,7 @@ impl App {
     fn commit_drag(&mut self, drag: Option<Drag>) {
         // A finished Marquee drag is recorded as one selection step by
         // `commit_ending_drag` (0.213.0).
-        self.needs_redraw |= matches!(drag, Some(Drag::Marquee { .. }));
+        self.needs_redraw |= matches!(drag, Some(Drag::Marquee { .. } | Drag::Lasso { .. }));
         let canvas_size = canvas_area_logical_size(&self.workspace);
         commit_drag_into_history(
             &mut self.workspace,
@@ -29975,7 +30106,10 @@ impl App {
         ) {
             self.relayout_after_gallery();
         }
+        // A Polygonal Lasso outlives the click that added a vertex; a
+        // freehand path's final mask is always exact.
         let ending = self.drag.take();
+        let ending = lasso_tools::release_lasso(&mut self.drag, ending, &mut self.doc.selection);
         if let Some((start_doc, end_doc)) = released_gradient(ending.as_ref()) {
             self.apply_gradient(start_doc, end_doc);
         }
@@ -31325,12 +31459,10 @@ impl App {
     /// selection goes back to what it was). The change is one undo step
     /// (0.213.0, [`run_selection_step`]) and the document is not made dirty.
     fn run_selection_command(&mut self, command: selection_view::SelectionCommand) {
-        if matches!(self.drag, Some(Drag::Marquee { .. })) {
-            // The drag ends unrecorded and the selection goes back to what
-            // it was before it, so the command's step starts from there.
-            if let Some(Drag::Marquee { before, .. }) = self.drag.take() {
-                selection_view::cancel_marquee(&mut self.doc.selection, before);
-            }
+        // The drag ends unrecorded and the selection goes back to what it
+        // was before it, so the command's step starts from there.
+        if let Some(before) = self.take_selection_drag() {
+            selection_view::cancel_marquee(&mut self.doc.selection, before);
         }
         if run_selection_step(
             &mut self.workspace,
@@ -31362,17 +31494,124 @@ impl App {
     fn escape_cancels_marquee(&mut self, key: Key) -> bool {
         if !selection_view::escape_cancels_marquee_applies(
             key == Key::Named(NamedKey::Escape),
-            matches!(self.drag, Some(Drag::Marquee { .. })),
+            matches!(self.drag, Some(Drag::Marquee { .. } | Drag::Lasso { .. })),
             self.dialog.is_some(),
             self.command_palette.is_some(),
         ) {
             return false;
         }
-        if let Some(Drag::Marquee { before, .. }) = self.drag.take() {
+        if let Some(before) = self.take_selection_drag() {
             selection_view::cancel_marquee(&mut self.doc.selection, before);
         }
         self.needs_redraw = true;
         true
+    }
+
+    /// Ends a live Marquee or Lasso gesture without recording it and
+    /// returns what was selected when it began (`Some(None)` = nothing);
+    /// `None` when no such gesture is live.
+    // `Some(None)` (began with nothing selected) differs from `None`.
+    #[allow(clippy::option_option)]
+    fn take_selection_drag(&mut self) -> Option<Option<aurora_doc::Selection>> {
+        if !matches!(self.drag, Some(Drag::Marquee { .. } | Drag::Lasso { .. })) {
+            return None;
+        }
+        match self.drag.take() {
+            Some(Drag::Marquee { before, .. } | Drag::Lasso { before, .. }) => Some(before),
+            _ => None,
+        }
+    }
+
+    /// A click of the Polygonal Lasso while a polygon is being built: it
+    /// closes the polygon (near the first or last vertex) or adds a vertex
+    /// ([`lasso_tools`]).
+    fn polygon_click(&mut self, canvas_point: (f32, f32)) {
+        if let Some(drag) = self.drag.as_mut()
+            && lasso_tools::polygon_click(
+                drag,
+                canvas_point,
+                &self.doc.canvas_view,
+                &mut self.doc.selection,
+            ) == lasso_tools::PolygonClick::Closes
+        {
+            self.close_polygon();
+            return;
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Closes the Polygonal Lasso in progress: one selection step.
+    fn close_polygon(&mut self) {
+        let ending = self.drag.take();
+        self.commit_drag(ending);
+        self.needs_redraw = true;
+    }
+
+    /// Enter closes and Backspace removes the last vertex of a Polygonal
+    /// Lasso in progress (removing the only vertex cancels it). Returns
+    /// whether the key was used.
+    fn polygon_key(&mut self, key: Key) -> bool {
+        if self.dialog.is_some()
+            || self.command_palette.is_some()
+            || !matches!(
+                self.drag,
+                Some(Drag::Lasso {
+                    polygonal: true,
+                    ..
+                })
+            )
+        {
+            return false;
+        }
+        match key {
+            Key::Named(NamedKey::Enter) => {
+                self.close_polygon();
+                true
+            }
+            Key::Named(NamedKey::Backspace) => {
+                let emptied = self.drag.as_mut().is_some_and(|drag| {
+                    lasso_tools::polygon_backspace(drag, &mut self.doc.selection)
+                });
+                if emptied && let Some(before) = self.take_selection_drag() {
+                    selection_view::cancel_marquee(&mut self.doc.selection, before);
+                }
+                self.needs_redraw = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// One Magic Wand click at `doc_point` on the active layer
+    /// ([`lasso_tools::wand_select`]): one selection step, "Magic Wand".
+    fn select_wand(&mut self, doc_point: (f32, f32)) {
+        let Some(layer) = self.doc.active_layer else {
+            self.lock_notice = Some((LockRefusal::WandNeedsPixelLayer, None));
+            self.sync_status_bar_now();
+            return;
+        };
+        let Some(store) = self.doc.tile_store.as_mut() else {
+            return;
+        };
+        match lasso_tools::wand_step(
+            &mut self.workspace,
+            &mut self.doc.undo_order,
+            &mut self.doc.history,
+            &mut self.doc.pixel_history,
+            &mut self.doc.selection,
+            store,
+            &self.doc.layers,
+            layer,
+            doc_point,
+            &self.tool_settings,
+        ) {
+            Ok(_) => self.needs_redraw = true,
+            Err(lasso_tools::WandRefused::Notice(why)) => {
+                self.lock_notice = Some((why, Some(layer)));
+                self.sync_status_bar_now();
+            }
+            Err(lasso_tools::WandRefused::Nothing) => {}
+        }
     }
 
     /// [`selection_view::ants_step`] on this app's own state at `now`.

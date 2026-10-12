@@ -41,6 +41,17 @@ pub enum Tool {
     /// dragged rectangle (0.213.0): the first tool to make a
     /// non-rectangular [`aurora_doc::Selection`].
     EllipticalMarquee,
+    /// Draws a freehand selection by dragging (0.214.0): the path the
+    /// pointer travels, closed on release, becomes a raster selection.
+    Lasso,
+    /// Builds a selection from clicked corners (0.214.0): a click adds a
+    /// vertex, a click near the first one, `Enter` or a double click
+    /// closes the polygon.
+    PolygonalLasso,
+    /// Selects the pixels of the active pixel layer similar to the
+    /// clicked one (0.214.0), with the Paint Bucket's tolerance and
+    /// Contiguous settings.
+    MagicWand,
     /// Zooms [`crate::CanvasView`] — real, via
     /// [`crate::CanvasView::zoom_at`]; this variant exists so a caller
     /// can offer it as an explicit tool choice (a click-to-zoom marquee,
@@ -80,10 +91,13 @@ impl Tool {
     /// Every tool this enum has today, in the fixed order they're
     /// offered to the user (matches PLAN.md's own bullets: Move, Marquee
     /// Select, Zoom, Pan, Eyedropper, then Brush, Eraser, and the 0.209.0 fills Gradient and Paint Bucket).
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 13] = [
         Self::Move,
         Self::MarqueeSelect,
         Self::EllipticalMarquee,
+        Self::Lasso,
+        Self::PolygonalLasso,
+        Self::MagicWand,
         Self::Zoom,
         Self::Pan,
         Self::Eyedropper,
@@ -101,6 +115,9 @@ impl Tool {
             Self::Move => "Move",
             Self::MarqueeSelect => "Marquee Select",
             Self::EllipticalMarquee => "Elliptical Marquee",
+            Self::Lasso => "Lasso",
+            Self::PolygonalLasso => "Polygonal Lasso",
+            Self::MagicWand => "Magic Wand",
             Self::Zoom => "Zoom",
             Self::Pan => "Pan",
             Self::Eyedropper => "Eyedropper",
@@ -120,6 +137,8 @@ impl Tool {
         match self {
             Self::Move => 'V',
             Self::MarqueeSelect | Self::EllipticalMarquee => 'M',
+            Self::Lasso | Self::PolygonalLasso => 'L',
+            Self::MagicWand => 'W',
             Self::Zoom => 'Z',
             Self::Pan => 'H',
             Self::Eyedropper => 'I',
@@ -132,10 +151,14 @@ impl Tool {
     /// Whether the tool's shortcut needs `Shift` as well as
     /// [`Self::shortcut_key`] (Photoshop's grouped keys: `G` selects the
     /// Gradient and `Shift+G` the Paint Bucket, 0.209.0; `M` the
-    /// rectangular and `Shift+M` the Elliptical Marquee, 0.213.0).
+    /// rectangular and `Shift+M` the Elliptical Marquee, 0.213.0; `L` the
+    /// Lasso and `Shift+L` the Polygonal Lasso, 0.214.0).
     #[must_use]
     pub const fn shortcut_needs_shift(self) -> bool {
-        matches!(self, Self::PaintBucket | Self::EllipticalMarquee)
+        matches!(
+            self,
+            Self::PaintBucket | Self::EllipticalMarquee | Self::PolygonalLasso
+        )
     }
 
     /// The shortcut as the user reads it: `"B"`, `"Shift+G"`.
@@ -185,11 +208,11 @@ mod tests {
 
     #[test]
     fn all_lists_every_variant_once() {
-        assert_eq!(Tool::ALL.len(), 10);
+        assert_eq!(Tool::ALL.len(), 13);
         let mut seen = Tool::ALL.to_vec();
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
-        assert_eq!(seen.len(), 10, "ALL must not repeat a variant");
+        assert_eq!(seen.len(), 13, "ALL must not repeat a variant");
     }
 
     #[test]
@@ -203,11 +226,14 @@ mod tests {
         chords.sort_unstable();
         chords.dedup();
         assert_eq!(chords.len(), Tool::ALL.len());
-        // Only the grouped G and M keys share a letter, and only by Shift.
+        // Only the grouped G, M and L keys share a letter, and only by Shift.
         let mut letters = keys;
         letters.sort_unstable();
         letters.dedup();
-        assert_eq!(letters.len(), Tool::ALL.len() - 2);
+        assert_eq!(letters.len(), Tool::ALL.len() - 3);
+        assert_eq!(Tool::Lasso.shortcut_text(), "L");
+        assert_eq!(Tool::PolygonalLasso.shortcut_text(), "Shift+L");
+        assert_eq!(Tool::MagicWand.shortcut_text(), "W");
         assert_eq!(Tool::EllipticalMarquee.shortcut_text(), "Shift+M");
         assert_eq!(Tool::MarqueeSelect.shortcut_text(), "M");
         assert_eq!(Tool::Gradient.shortcut_text(), "G");

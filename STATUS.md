@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-12, version 0.213.0.** This file is updated every round (every
+**As of 2026-10-12, version 0.214.0.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -115,7 +115,12 @@ golden-image tests are `#[ignore]`d.
   "Inverse Selection") that never marks the document unsaved. Selections are
   still not saved (`.aur`/PSD), are lost when the document closes, and the outline is
   not clipped to the document; nothing of this has been seen live or on the Mac.
-  Lasso, Polygonal Lasso and Magic Wand do not exist yet.
+  Since 0.214.0 the **Lasso** (`L`, drag), the **Polygonal Lasso** (`Shift+L`, click
+  vertices, close near the first one or with `Enter`, `Backspace` removes a vertex) and
+  the **Magic Wand** (`W`, tolerance/contiguous shared with the Paint Bucket, active
+  layer only) make raster selections, each one undo step; the lassos are clipped to the
+  document, show no polyline preview (the live shape is the filled mask) and the first
+  outline of a big mask costs a boundary trace on the UI thread; nothing seen live. Workspace tests at 0.214.0: 4,213 passed, 0 failed, 82 ignored.
 - **Text fields and dialogs**: caret, selection, IME composition, standard
   editing chords through the real OS clipboard (`Cmd` on macOS, `Ctrl`
   elsewhere), click/drag selection (double-click word selection was not done as of 0.138.0).

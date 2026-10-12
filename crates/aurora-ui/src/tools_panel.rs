@@ -90,9 +90,11 @@ pub const TOOL_COLUMNS: usize = 2;
 /// The groups of the strip, top to bottom, each one row of at most
 /// [`TOOL_COLUMNS`] buttons, a rule between consecutive groups. Together
 /// they hold every tool of [`Tool::ALL`], in that order.
-pub const TOOL_GROUPS: [&[Tool]; 6] = [
+pub const TOOL_GROUPS: [&[Tool]; 8] = [
     &[Tool::Move],
     &[Tool::MarqueeSelect, Tool::EllipticalMarquee],
+    &[Tool::Lasso, Tool::PolygonalLasso],
+    &[Tool::MagicWand],
     &[Tool::Zoom, Tool::Pan],
     &[Tool::Eyedropper],
     &[Tool::Brush, Tool::Eraser],
@@ -108,6 +110,9 @@ pub const fn tool_icon(tool: Tool) -> IconKind {
         Tool::Move => IconKind::Move,
         Tool::MarqueeSelect => IconKind::Marquee,
         Tool::EllipticalMarquee => IconKind::EllipseMarquee,
+        Tool::Lasso => IconKind::Lasso,
+        Tool::PolygonalLasso => IconKind::PolygonalLasso,
+        Tool::MagicWand => IconKind::MagicWand,
         Tool::Zoom => IconKind::ZoomIn,
         Tool::Pan => IconKind::Hand,
         Tool::Eyedropper => IconKind::Eyedropper,
@@ -383,10 +388,13 @@ mod tests {
 
     /// The icon each tool must wear, written out independently of
     /// [`tool_icon`] so a mapped-to-the-wrong-tool slip fails.
-    const EXPECTED_ICONS: [(Tool, IconKind); 10] = [
+    const EXPECTED_ICONS: [(Tool, IconKind); 13] = [
         (Tool::Move, IconKind::Move),
         (Tool::MarqueeSelect, IconKind::Marquee),
         (Tool::EllipticalMarquee, IconKind::EllipseMarquee),
+        (Tool::Lasso, IconKind::Lasso),
+        (Tool::PolygonalLasso, IconKind::PolygonalLasso),
+        (Tool::MagicWand, IconKind::MagicWand),
         (Tool::Zoom, IconKind::ZoomIn),
         (Tool::Pan, IconKind::Hand),
         (Tool::Eyedropper, IconKind::Eyedropper),
@@ -488,6 +496,15 @@ mod tests {
         assert_eq!(
             tool_description(Tool::EllipticalMarquee),
             "Elliptical Marquee tool, shortcut Shift+M"
+        );
+        assert_eq!(tool_description(Tool::Lasso), "Lasso tool, shortcut L");
+        assert_eq!(
+            tool_description(Tool::PolygonalLasso),
+            "Polygonal Lasso tool, shortcut Shift+L"
+        );
+        assert_eq!(
+            tool_description(Tool::MagicWand),
+            "Magic Wand tool, shortcut W"
         );
     }
 
@@ -638,12 +655,13 @@ mod tests {
             assert_eq!(strip.width, 72, "scale {scale_factor}");
             // The strip stretches to the window; its content is five
             // groups of 32 px and four 8 px rules under 4 px of padding:
-            // the last button ends 4 + 5*32 + 4*8 = 196 px down.
+            // the last button ends 4 + 7*32 + 6*8 = 276 px down (0.214.0
+            // added the Lasso row and the Magic Wand row).
             let last = bounds(
                 &ws,
                 ws.tools.button_for(Tool::Eraser).unwrap_or(ws.tools.root),
             );
-            assert_eq!(last.bottom() - strip.y, 196, "scale {scale_factor}");
+            assert_eq!(last.bottom() - strip.y, 276, "scale {scale_factor}");
             for (_, id) in ws.tools.buttons {
                 let b = bounds(&ws, id);
                 assert_eq!((b.width, b.height), (32, 32), "scale {scale_factor}");
@@ -659,6 +677,12 @@ mod tests {
                 at(Tool::MarqueeSelect).x + 32,
                 at(Tool::EllipticalMarquee).x
             );
+            // 0.214.0: the two lassos share a row; the Magic Wand has one.
+            assert_eq!(at(Tool::Lasso).y, at(Tool::PolygonalLasso).y);
+            assert_eq!(at(Tool::Lasso).x + 32, at(Tool::PolygonalLasso).x);
+            assert!(at(Tool::Lasso).y > at(Tool::EllipticalMarquee).y);
+            assert!(at(Tool::MagicWand).y > at(Tool::Lasso).y);
+            assert!(at(Tool::Zoom).y > at(Tool::MagicWand).y);
             assert_eq!(at(Tool::Eyedropper).x, at(Tool::Move).x);
             assert!(at(Tool::Zoom).y > at(Tool::Move).y);
             assert!(at(Tool::Brush).y > at(Tool::Eyedropper).y);
@@ -671,7 +695,7 @@ mod tests {
             let bucket = at(Tool::PaintBucket);
             assert_eq!(
                 bucket.bottom() - strip.y,
-                4 + 6 * 32 + 5 * 8,
+                4 + 8 * 32 + 7 * 8,
                 "scale {scale_factor}"
             );
             assert!(

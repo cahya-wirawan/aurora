@@ -601,6 +601,110 @@ fn write_tile(
     Ok(true)
 }
 
+/// The region the Magic Wand matched (0.214.0): a binary grid over the
+/// matched pixels' bounding box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WandRegion {
+    /// The tight bounding box of the matched pixels, layer-local.
+    pub bounds: Rect,
+    /// One byte per texel of `bounds`, row-major: `255` matched, `0` not.
+    pub data: Vec<u8>,
+}
+
+/// Finds the pixels of the layer `area` (its `(width, height)`) similar to
+/// the seed of `spec`, exactly as the Paint Bucket would fill them, and
+/// returns them as a [`WandRegion`] without writing anything: the Magic
+/// Wand (0.214.0). `None` when the seed is outside `area`. The same
+/// similarity rule, tolerance semantics and caps as [`flood_fill`]
+/// (`spec.max_tiles` matched tiles, `spec.max_examined` examined ones); in
+/// addition the matched pixels' bounding box must not exceed
+/// `spec.max_tiles` tiles of area (a sparse non-contiguous match can
+/// otherwise span a huge box).
+///
+/// # Errors
+///
+/// [`FillError::TooLarge`] over a cap; [`FillError::Tile`] if a source
+/// tile cannot be read.
+pub fn wand_region(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    area: (u32, u32),
+    spec: &FloodSpec,
+) -> Result<Option<WandRegion>, FillError> {
+    let mut plane = Plane::new(store, surface);
+    let Some(region) = flood_region(&mut plane, area, spec)? else {
+        return Ok(None);
+    };
+    // The tight box of the set bits, tile by tile.
+    let mut lo = (u32::MAX, u32::MAX);
+    let mut hi = (0_u32, 0_u32);
+    let mut any = false;
+    for (id, words) in &region.tiles {
+        let (ox, oy) = (id.x.saturating_mul(TILE), id.y.saturating_mul(TILE));
+        for (w, word) in words.iter().enumerate() {
+            if *word == 0 {
+                continue;
+            }
+            // Bit `b` of the tile is texel (b % SIDE, b / SIDE).
+            let first = w * 64 + word.trailing_zeros() as usize;
+            let last = w * 64 + 63 - word.leading_zeros() as usize;
+            for bit in [first, last] {
+                let x = ox.saturating_add(u32::try_from(bit % TILE_SIDE).unwrap_or(0));
+                let y = oy.saturating_add(u32::try_from(bit / TILE_SIDE).unwrap_or(0));
+                lo = (lo.0.min(x), lo.1.min(y));
+                hi = (hi.0.max(x), hi.1.max(y));
+            }
+            // The row bounds above come from the lowest and highest set
+            // bit; the column bounds need every set bit of the word.
+            let mut rest = *word;
+            while rest != 0 {
+                let bit = w * 64 + rest.trailing_zeros() as usize;
+                let x = ox.saturating_add(u32::try_from(bit % TILE_SIDE).unwrap_or(0));
+                lo.0 = lo.0.min(x);
+                hi.0 = hi.0.max(x);
+                rest &= rest - 1;
+            }
+            any = true;
+        }
+    }
+    if !any {
+        return Ok(None);
+    }
+    let (bw, bh) = (hi.0 - lo.0 + 1, hi.1 - lo.1 + 1);
+    let max_area = (spec.max_tiles as u64).saturating_mul(u64::from(TILE) * u64::from(TILE));
+    if u64::from(bw) * u64::from(bh) > max_area {
+        return Err(FillError::TooLarge {
+            max: spec.max_tiles,
+        });
+    }
+    let mut data = vec![0_u8; (bw as usize).saturating_mul(bh as usize)];
+    for (id, words) in &region.tiles {
+        let (ox, oy) = (id.x.saturating_mul(TILE), id.y.saturating_mul(TILE));
+        for (w, word) in words.iter().enumerate() {
+            let mut rest = *word;
+            while rest != 0 {
+                let bit = w * 64 + rest.trailing_zeros() as usize;
+                rest &= rest - 1;
+                let x = ox.saturating_add(u32::try_from(bit % TILE_SIDE).unwrap_or(0));
+                let y = oy.saturating_add(u32::try_from(bit / TILE_SIDE).unwrap_or(0));
+                let at = (y - lo.1) as usize * bw as usize + (x - lo.0) as usize;
+                if let Some(slot) = data.get_mut(at) {
+                    *slot = 255;
+                }
+            }
+        }
+    }
+    Ok(Some(WandRegion {
+        bounds: Rect {
+            x: i64::from(lo.0),
+            y: i64::from(lo.1),
+            width: bw,
+            height: bh,
+        },
+        data,
+    }))
+}
+
 /// Fills the region `spec` selects with `colour` (the Paint Bucket).
 ///
 /// `area` is the layer's `(width, height)`; the seed must lie inside it.
