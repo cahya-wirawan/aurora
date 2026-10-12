@@ -7,10 +7,12 @@
 //!
 //! **What they act on.** The active pixel layer only (Photoshop's "Sample:
 //! Current Layer"; the composite is never read). **Selections are
-//! ignored**, exactly as the Brush and Eraser ignore them today: nothing
-//! in this crate paints through a selection yet. The Paint Bucket is
-//! confined to the layer's bounds; the Gradient to the layer's bounds
-//! intersected with the canvas.
+//! respected** (0.211.0, [`crate::selection_paint`]): the Paint Bucket
+//! finds its region as always and fills only the part of it the selection
+//! covers (a click outside the selection does nothing and records nothing),
+//! and the Gradient is evaluated as always and painted only through it.
+//! The Paint Bucket is confined to the layer's bounds; the Gradient to the
+//! layer's bounds intersected with the canvas.
 //!
 //! **Locks.** Lock image pixels (or all) refuses both with the calm
 //! status-bar notice, before anything is read. A transparency lock lets
@@ -23,7 +25,9 @@ use aurora_brush::{
     FillError, FillMode, FloodSpec, GradientKind, GradientSpec, MAX_FILL_TILES, StrokeSnapshot,
 };
 
-use crate::{DabTool, LockRefusal, PaintPermission, ToolSettings, paint_permission};
+use crate::{
+    DabTool, LockRefusal, PaintPermission, ToolSettings, paint_permission, selection_paint,
+};
 
 /// The History row of one Paint Bucket fill.
 pub(crate) const PAINT_BUCKET_LABEL: &str = "Paint Bucket Fill";
@@ -87,6 +91,7 @@ pub(crate) fn bucket_fill(
     doc_point: (f32, f32),
     settings: &ToolSettings,
     foreground: [f32; 3],
+    selection: Option<aurora_doc::Selection>,
 ) -> Result<Filled, FillRefused> {
     let Some(aurora_doc::LayerKind::Pixel { bounds }) = layers.kind(layer).cloned() else {
         return Err(FillRefused::Notice(LockRefusal::FillNeedsPixelLayer));
@@ -109,7 +114,8 @@ pub(crate) fn bucket_fill(
         max_examined: aurora_brush::MAX_EXAMINED_TILES,
     };
     let mut snapshot = StrokeSnapshot::new(surface);
-    let outcome = aurora_brush::flood_fill(
+    let cover = selection_paint::layer_selection(selection, bounds);
+    let outcome = aurora_brush::flood_fill_covered(
         store,
         surface,
         (bounds.width, bounds.height),
@@ -117,6 +123,7 @@ pub(crate) fn bucket_fill(
         foreground,
         mode,
         Some(&mut snapshot),
+        selection_paint::as_coverage(cover.as_ref()),
     )
     .map_err(|err| refusal(&err))?;
     for (tile, err) in outcome.failed() {
@@ -159,6 +166,7 @@ pub(crate) fn gradient_drag(
     settings: &ToolSettings,
     foreground: [f32; 3],
     background: [f32; 3],
+    selection: Option<aurora_doc::Selection>,
 ) -> Result<Filled, FillRefused> {
     let Some(aurora_doc::LayerKind::Pixel { bounds }) = layers.kind(layer).cloned() else {
         return Err(FillRefused::Notice(LockRefusal::FillNeedsPixelLayer));
@@ -186,13 +194,15 @@ pub(crate) fn gradient_drag(
         max_tiles: MAX_FILL_TILES,
     };
     let mut snapshot = StrokeSnapshot::new(surface);
-    let outcome = aurora_brush::gradient_fill(
+    let cover = selection_paint::layer_selection(selection, bounds);
+    let outcome = aurora_brush::gradient_fill_covered(
         store,
         surface,
         gradient_area(bounds, canvas_size),
         &spec,
         mode,
         Some(&mut snapshot),
+        selection_paint::as_coverage(cover.as_ref()),
     )
     .map_err(|err| refusal(&err))?;
     for (tile, err) in outcome.failed() {

@@ -49,6 +49,7 @@ use aurora_tile::{CHANNELS, SAMPLES, SurfaceId, TILE, TileError, TileId, TileSto
 use half::f16;
 
 use crate::StrokeSnapshot;
+use crate::coverage::{Coverage, TileCover, blend_texel, covered, tile_cover};
 
 /// Index of tile-local pixel `(x, y)`'s first (red) channel within a
 /// tile's own flat `texels()` slice.
@@ -365,7 +366,29 @@ pub fn stamp_dab(
     colour: [f32; 3],
     snapshot: Option<&mut StrokeSnapshot>,
 ) -> DabOutcome {
-    stamp_dab_impl(store, surface, center, radius, colour, snapshot, false)
+    stamp_dab_impl(
+        store, surface, center, radius, colour, snapshot, false, None,
+    )
+}
+
+/// [`stamp_dab`] restricted to a selection (0.211.0): the dab's texel is
+/// computed as always and blended in by `coverage` at that texel
+/// (`old + (new - old) * coverage`; see [`Coverage`]). `None` is exactly
+/// [`stamp_dab`]; coverage `1` writes exactly what [`stamp_dab`] writes;
+/// a tile with no covered texel is neither read nor created, so it is
+/// neither captured nor reported painted.
+pub fn stamp_dab_covered(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    center: (f32, f32),
+    radius: f32,
+    colour: [f32; 3],
+    snapshot: Option<&mut StrokeSnapshot>,
+    coverage: Option<&dyn Coverage>,
+) -> DabOutcome {
+    stamp_dab_impl(
+        store, surface, center, radius, colour, snapshot, false, coverage,
+    )
 }
 
 /// [`stamp_dab`] for a layer whose **transparency is locked** (0.198.0):
@@ -381,13 +404,91 @@ pub fn stamp_dab_preserving_alpha(
     colour: [f32; 3],
     snapshot: Option<&mut StrokeSnapshot>,
 ) -> DabOutcome {
-    stamp_dab_impl(store, surface, center, radius, colour, snapshot, true)
+    stamp_dab_impl(store, surface, center, radius, colour, snapshot, true, None)
+}
+
+/// [`stamp_dab_preserving_alpha`] restricted to a selection, on the terms
+/// of [`stamp_dab_covered`].
+pub fn stamp_dab_preserving_alpha_covered(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    center: (f32, f32),
+    radius: f32,
+    colour: [f32; 3],
+    snapshot: Option<&mut StrokeSnapshot>,
+    coverage: Option<&dyn Coverage>,
+) -> DabOutcome {
+    stamp_dab_impl(
+        store, surface, center, radius, colour, snapshot, true, coverage,
+    )
+}
+
+/// The tile-local inclusive texel box `(lx0, ly0, lx1, ly1)` a dab's
+/// bounding box covers within the tile whose origin is `origin`.
+type TileBox = (u32, u32, u32, u32);
+
+/// Whether a brush dab would write any texel of `tile_box` in a tile the
+/// store does not hold (blank: every alpha is `0`, so the max-alpha rule
+/// never declines): some texel within the radius, with falloff above zero
+/// and coverage above zero. Used only when a selection is active, so a
+/// tile the selection excludes is never created just to be looked at.
+#[allow(clippy::cast_precision_loss)]
+fn dab_reaches_blank_tile(
+    center: (f32, f32),
+    radius: f32,
+    origin: (u32, u32),
+    tile_box: TileBox,
+    coverage: Option<&dyn Coverage>,
+) -> bool {
+    let (cx, cy) = center;
+    let (lx0, ly0, lx1, ly1) = tile_box;
+    for ly in ly0..=ly1 {
+        for lx in lx0..=lx1 {
+            let px = (origin.0 + lx) as f32 + 0.5;
+            let py = (origin.1 + ly) as f32 + 0.5;
+            let d = (px - cx).hypot(py - cy);
+            if d > radius || (1.0 - (d / radius)).clamp(0.0, 1.0).powf(1.5) <= 0.0 {
+                continue;
+            }
+            let covered_here = coverage.is_none_or(|cov| {
+                covered(cov, i64::from(origin.0 + lx), i64::from(origin.1 + ly)) > 0.0
+            });
+            if covered_here {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The coverage to consult texel by texel inside the tile box, or `None`
+/// to skip the tile entirely. `Some(None)` means every texel is covered
+/// (no selection, or the box is wholly inside it).
+#[allow(clippy::option_option)]
+fn tile_coverage(
+    coverage: Option<&dyn Coverage>,
+    origin: (u32, u32),
+    tile_box: TileBox,
+) -> Option<Option<&dyn Coverage>> {
+    let (lx0, ly0, lx1, ly1) = tile_box;
+    let rect = Rect {
+        x: i64::from(origin.0 + lx0),
+        y: i64::from(origin.1 + ly0),
+        width: lx1 - lx0 + 1,
+        height: ly1 - ly0 + 1,
+    };
+    match tile_cover(coverage, rect) {
+        TileCover::Skip => None,
+        TileCover::All => Some(None),
+        TileCover::Each(cov) => Some(Some(cov)),
+    }
 }
 
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::too_many_arguments
 )]
 fn stamp_dab_impl(
     store: &mut TileStore,
@@ -397,6 +498,7 @@ fn stamp_dab_impl(
     colour: [f32; 3],
     snapshot: Option<&mut StrokeSnapshot>,
     preserve_alpha: bool,
+    coverage: Option<&dyn Coverage>,
 ) -> DabOutcome {
     let mut outcome = DabOutcome::default();
     if !is_paintable(center, radius) {
@@ -416,6 +518,31 @@ fn stamp_dab_impl(
             let id = TileId { x: tx, y: ty };
             let origin_x = tx * TILE;
             let origin_y = ty * TILE;
+            let lx0 = min_x.saturating_sub(origin_x).min(TILE - 1);
+            let ly0 = min_y.saturating_sub(origin_y).min(TILE - 1);
+            let lx1 = max_x.saturating_sub(origin_x).min(TILE - 1);
+            let ly1 = max_y.saturating_sub(origin_y).min(TILE - 1);
+            // Selection (0.211.0): a tile the selection excludes is not
+            // even acquired; a tile the store does not hold is created
+            // only if the dab will really write into it.
+            let Some(tile_cov) =
+                tile_coverage(coverage, (origin_x, origin_y), (lx0, ly0, lx1, ly1))
+            else {
+                continue;
+            };
+            if coverage.is_some()
+                && !store.contains_tile(surface, id)
+                && (preserve_alpha
+                    || !dab_reaches_blank_tile(
+                        center,
+                        radius,
+                        (origin_x, origin_y),
+                        (lx0, ly0, lx1, ly1),
+                        tile_cov,
+                    ))
+            {
+                continue;
+            }
             // Continue, don't return: a tile that cannot be paged in
             // costs its own 256x256 px and nothing else. Returning here
             // skipped every *later* tile too, leaving a dab straddling a
@@ -428,10 +555,6 @@ fn stamp_dab_impl(
                     continue;
                 }
             };
-            let lx0 = min_x.saturating_sub(origin_x).min(TILE - 1);
-            let ly0 = min_y.saturating_sub(origin_y).min(TILE - 1);
-            let lx1 = max_x.saturating_sub(origin_x).min(TILE - 1);
-            let ly1 = max_y.saturating_sub(origin_y).min(TILE - 1);
             let mut touched_this_tile = false;
             let mut capture_failed = false;
             let texels = tile.texels_mut();
@@ -452,6 +575,17 @@ fn stamp_dab_impl(
                     if a <= 0.0 {
                         continue;
                     }
+                    let cover = match tile_cov {
+                        Some(cov) => {
+                            let c =
+                                covered(cov, i64::from(origin_x + lx), i64::from(origin_y + ly));
+                            if c <= 0.0 {
+                                continue;
+                            }
+                            c
+                        }
+                        None => 1.0,
+                    };
                     let index = texel_index(lx, ly);
                     let Some(current) = texels.get(index..index + CHANNELS) else {
                         continue;
@@ -494,6 +628,14 @@ fn stamp_dab_impl(
                             f16::from_f32(blue * a),
                             f16::from_f32(a),
                         ]
+                    };
+                    // Selection (0.211.0): blend by coverage; full coverage
+                    // keeps `fresh` untouched, so the no-selection output is
+                    // the same bits it always was.
+                    let fresh = if cover < 1.0 {
+                        blend_texel(current, fresh, cover)
+                    } else {
+                        fresh
                     };
                     if stores_the_same_bits(current, fresh) {
                         continue;
@@ -638,6 +780,27 @@ pub fn erase_dab(
     radius: f32,
     snapshot: Option<&mut StrokeSnapshot>,
 ) -> DabOutcome {
+    erase_dab_covered(store, surface, center, radius, snapshot, None)
+}
+
+/// [`erase_dab`] restricted to a selection (0.211.0): the erase amount at
+/// each texel is the dab's falloff times `coverage` (so coverage `0.5`
+/// erases half as much), which is the lerp of the old and the erased alpha.
+/// `None` is exactly [`erase_dab`]; coverage `1` erases exactly what it
+/// does; a tile with no covered texel is neither read nor created.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
+pub fn erase_dab_covered(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    center: (f32, f32),
+    radius: f32,
+    snapshot: Option<&mut StrokeSnapshot>,
+    coverage: Option<&dyn Coverage>,
+) -> DabOutcome {
     let mut outcome = DabOutcome::default();
     if !is_paintable(center, radius) {
         return outcome;
@@ -657,6 +820,21 @@ pub fn erase_dab(
             let id = TileId { x: tx, y: ty };
             let origin_x = tx * TILE;
             let origin_y = ty * TILE;
+            let lx0 = min_x.saturating_sub(origin_x).min(TILE - 1);
+            let ly0 = min_y.saturating_sub(origin_y).min(TILE - 1);
+            let lx1 = max_x.saturating_sub(origin_x).min(TILE - 1);
+            let ly1 = max_y.saturating_sub(origin_y).min(TILE - 1);
+            // Selection (0.211.0): see `stamp_dab_impl`. A tile the store
+            // does not hold has nothing to erase, so with a selection
+            // active it is not created just to find that out.
+            let Some(tile_cov) =
+                tile_coverage(coverage, (origin_x, origin_y), (lx0, ly0, lx1, ly1))
+            else {
+                continue;
+            };
+            if coverage.is_some() && !store.contains_tile(surface, id) {
+                continue;
+            }
             // `continue`, not `return` -- `stamp_dab`'s own rule, and
             // the same reasoning, mirrored.
             let tile = match store.get_mut(surface, id) {
@@ -666,10 +844,6 @@ pub fn erase_dab(
                     continue;
                 }
             };
-            let lx0 = min_x.saturating_sub(origin_x).min(TILE - 1);
-            let ly0 = min_y.saturating_sub(origin_y).min(TILE - 1);
-            let lx1 = max_x.saturating_sub(origin_x).min(TILE - 1);
-            let ly1 = max_y.saturating_sub(origin_y).min(TILE - 1);
             let mut touched_this_tile = false;
             let mut capture_failed = false;
             let texels = tile.texels_mut();
@@ -688,6 +862,19 @@ pub fn erase_dab(
                     if a <= 0.0 {
                         continue;
                     }
+                    // Selection (0.211.0): the erase amount scales by the
+                    // coverage; full coverage leaves `a` as it was.
+                    let a = match tile_cov {
+                        Some(cov) => {
+                            let c =
+                                covered(cov, i64::from(origin_x + lx), i64::from(origin_y + ly));
+                            if c <= 0.0 {
+                                continue;
+                            }
+                            if c < 1.0 { a * c } else { a }
+                        }
+                        None => a,
+                    };
                     let index = texel_index(lx, ly);
                     let Some(&stored_a) = texels.get(index + ALPHA) else {
                         continue;

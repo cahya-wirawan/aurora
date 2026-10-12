@@ -133,6 +133,7 @@ impl Doc {
             doc_point,
             &self.settings,
             GREEN,
+            None,
         )
     }
 
@@ -147,6 +148,7 @@ impl Doc {
             &self.settings,
             GREEN,
             BLUE,
+            None,
         )
     }
 
@@ -477,6 +479,7 @@ fn a_too_large_fill_is_refused_calmly_with_nothing_written() {
         &big.settings,
         GREEN,
         BLUE,
+        None,
     );
     assert!(
         matches!(r, Err(FillRefused::Notice(LockRefusal::FillTooLarge))),
@@ -501,6 +504,7 @@ fn a_group_or_missing_layer_is_refused_with_a_calm_notice() {
         (1.0, 1.0),
         &doc.settings,
         GREEN,
+        None,
     );
     assert!(matches!(
         bucket,
@@ -516,6 +520,7 @@ fn a_group_or_missing_layer_is_refused_with_a_calm_notice() {
         &doc.settings,
         GREEN,
         BLUE,
+        None,
     );
     assert!(matches!(
         gradient,
