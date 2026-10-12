@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.208.1] - 2026-10-12
+
+### Fixed
+
+- Colour controls: clamp Eyedropper picks, pure App call-site helpers, doc and sync cleanup
+
 ## [0.208.0] - 2026-10-12
 
 ### Changed
