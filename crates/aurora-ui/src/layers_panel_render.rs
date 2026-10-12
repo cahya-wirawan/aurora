@@ -259,6 +259,10 @@ fn write_layers_panel_png() {
     // hidden layer and a Multiply layer; a collapsed group; a Background.
     let mut layers = LayerTree::new();
     let background = ok(layers.add_pixel_layer("Background", bounds(), None));
+    // A layer clipped to the Background (0.201.1): the Clip glyph in its
+    // indent step.
+    let highlights = ok(layers.add_pixel_layer("Highlights", bounds(), None));
+    ok(layers.set_clipped(highlights, true));
     let post2 = ok(layers.add_group("Post 2", None));
     let logo = ok(layers.add_pixel_layer("Logo", bounds(), Some(post2)));
     ok(layers.set_visible(logo, false));

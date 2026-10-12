@@ -91,11 +91,14 @@ pub enum IconKind {
     Search,
     /// A picture frame with a hill and a sun: a pixel layer (0.199.0).
     Image,
+    /// A corner arrow pointing down: a layer clipped to the one below
+    /// (0.201.1).
+    Clip,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 19] = [
+    pub const ALL: [IconKind; 20] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -115,6 +118,7 @@ impl IconKind {
         IconKind::Move,
         IconKind::Search,
         IconKind::Image,
+        IconKind::Clip,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -141,6 +145,7 @@ impl IconKind {
             IconKind::Move => "Move",
             IconKind::Search => "Search",
             IconKind::Image => "Image",
+            IconKind::Clip => "Clip",
         }
     }
 }
@@ -483,6 +488,12 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
                 .l(11.0, 8.0)
                 .l(14.0, 11.0),
         ],
+        IconKind::Clip => vec![
+            // The corner: across, then down; and the head pointing down at
+            // the layer below.
+            stroke_part().m(2.0, 3.0).l(11.0, 3.0).l(11.0, 13.0),
+            stroke_part().m(8.0, 10.0).l(11.0, 13.0).l(14.0, 10.0),
+        ],
     }
 }
 
@@ -581,7 +592,7 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 19);
+        assert_eq!(IconKind::ALL.len(), 20);
         for (i, a) in IconKind::ALL.iter().enumerate() {
             assert!(!a.name().is_empty());
             for b in IconKind::ALL.iter().skip(i + 1) {
@@ -590,6 +601,53 @@ mod tests {
                 assert_ne!(icon_parts(*a), icon_parts(*b), "{a:?} and {b:?} look alike");
             }
         }
+    }
+
+    /// The clip glyph (0.201.1): an open corner arrow, strokes only, that
+    /// points down: its lowest point is the end of the stem and its
+    /// arrowhead is wider than the stem is long from the left edge.
+    #[test]
+    fn the_clip_icon_is_an_open_corner_arrow_pointing_down() {
+        let parts = icon_parts(IconKind::Clip);
+        assert_eq!(parts.len(), 2, "the corner and the head");
+        assert!(
+            parts
+                .iter()
+                .all(|p| !p.closed && p.style == PartStyle::Stroke)
+        );
+        assert_eq!(IconKind::Clip.name(), "Clip");
+        let paths = icon_paths(IconKind::Clip, (0.0, 0.0), ICON_BOX);
+        let Some(path) = &paths.stroke else {
+            unreachable!("the clip icon strokes");
+        };
+        let Ok(mesh) = stroke_rounded(path, paths.stroke_width, DEFAULT_TOLERANCE) else {
+            unreachable!("tessellates");
+        };
+        let xs: Vec<f32> = mesh.vertices.iter().map(|v| v.x).collect();
+        let ys: Vec<f32> = mesh.vertices.iter().map(|v| v.y).collect();
+        let (min_x, max_x) = (
+            xs.iter().copied().fold(f32::MAX, f32::min),
+            xs.iter().copied().fold(f32::MIN, f32::max),
+        );
+        let (min_y, max_y) = (
+            ys.iter().copied().fold(f32::MAX, f32::min),
+            ys.iter().copied().fold(f32::MIN, f32::max),
+        );
+        assert!(max_x - min_x > 14.0, "wide: {min_x}..{max_x}");
+        assert!(max_y - min_y > 12.0, "tall: {min_y}..{max_y}");
+        // The arrowhead's apex (the lowest point) is right of the middle:
+        // the stem is the right-hand part, the horizontal runs in from the
+        // left at the top.
+        let lowest_x = mesh
+            .vertices
+            .iter()
+            .fold(None::<&aurora_vector::Point>, |best, v| match best {
+                Some(b) if b.y >= v.y => Some(b),
+                _ => Some(v),
+            })
+            .map(|v| v.x);
+        assert!(lowest_x.is_some_and(|x| x > 12.0), "{lowest_x:?}");
+        assert!(min_y < 6.0 && max_y > 18.0, "{min_y} {max_y}");
     }
 
     #[test]
