@@ -185,11 +185,6 @@ impl Rig {
     /// pressed at the first and released after the last. Returns whether a
     /// history step was recorded.
     fn stroke(&mut self, tool: Tool, points: &[(f32, f32)], preserve_alpha: bool) -> bool {
-        let dab_tool = if tool == Tool::Eraser {
-            DabTool::Eraser
-        } else {
-            DabTool::Brush
-        };
         let Some(&first) = points.first() else {
             unreachable!("a stroke has points");
         };
@@ -200,11 +195,17 @@ impl Rig {
             &self.view,
             crate::active_pixel_layer(&self.layers, Some(self.layer)),
         );
-        let selection = self.selection.active();
-        let colour = if dab_tool == DabTool::Brush {
-            RED
+        // The very function `App::paint_dab` reads the Pencil from.
+        let dab_tool = if tool == Tool::Eraser {
+            DabTool::Eraser
         } else {
+            crate::dab_tool_of_drag(drag.as_ref())
+        };
+        let selection = self.selection.active();
+        let colour = if dab_tool == DabTool::Eraser {
             [0.0; 3]
+        } else {
+            RED
         };
         let press = match drag.as_ref() {
             Some(Drag::Brush { last_doc, .. } | Drag::Eraser { last_doc, .. }) => *last_doc,
@@ -1003,7 +1004,7 @@ fn a_history_panel_jump_applies_the_selection_of_the_row() {
 
 #[test]
 fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
-    assert_eq!(Tool::ALL.len(), 13);
+    assert_eq!(Tool::ALL.len(), 14);
     let table = crate::default_shortcuts_for(false);
     let chord = |shift| {
         KeyChord::new(
@@ -1061,7 +1062,7 @@ fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
     );
     // The tools panel has one button per tool, the new one wearing its
     // own icon.
-    assert_eq!(workspace.tools.buttons.len(), 13);
+    assert_eq!(workspace.tools.buttons.len(), 14);
     assert_eq!(
         aurora_ui::tool_icon(Tool::EllipticalMarquee),
         aurora_widgets::icons::IconKind::EllipseMarquee
@@ -3012,11 +3013,6 @@ impl Rig {
         points: &[(f32, f32)],
         colours: &ColourState,
     ) -> bool {
-        let dab_tool = if tool == Tool::Eraser {
-            DabTool::Eraser
-        } else {
-            DabTool::Brush
-        };
         let Some(&first) = points.first() else {
             unreachable!("a stroke has points");
         };
@@ -3031,6 +3027,11 @@ impl Rig {
                 crate::active_pixel_layer(&self.layers, Some(self.layer)),
             ),
         );
+        let dab_tool = if tool == Tool::Eraser {
+            DabTool::Eraser
+        } else {
+            crate::dab_tool_of_drag(drag.as_ref())
+        };
         let press = match drag.as_ref() {
             Some(
                 Drag::Brush {
@@ -3490,6 +3491,7 @@ fn dab_cost_on_the_grid_is_small() {
 fn entering_quick_mask_mid_stroke_commits_the_layer_stroke_first() {
     let rig = Rig::new(rect(0, 0, 400, 300));
     let layer_stroke = Some(Drag::Brush {
+        hard: false,
         last_doc: (0.0, 0.0),
         carry: 0.0,
         stroke: Some(aurora_brush::StrokeSnapshot::new(rig.surface)),
@@ -3518,4 +3520,282 @@ fn entering_quick_mask_mid_stroke_commits_the_layer_stroke_first() {
     let mut drag = layer_stroke;
     quick_mask::drop_mask_stroke(&mut drag);
     assert!(drag.is_some());
+}
+
+// -- The Pencil (0.220.0) ------------------------------------------------
+
+/// Every texel of the layer with any non-zero alpha, as `(x, y)`.
+fn alpha_set(rig: &mut Rig, w: u32, h: u32) -> std::collections::BTreeSet<(u32, u32)> {
+    let mut out = std::collections::BTreeSet::new();
+    for y in 0..h {
+        for x in 0..w {
+            if rig.at(x, y)[3] > 0.0 {
+                out.insert((x, y));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_pencil_press_starts_a_hard_brush_drag_and_the_brush_a_soft_one() {
+    let view = CanvasView::new();
+    let pencil = begin_drag(
+        Tool::Pencil,
+        PointerButton::Primary,
+        (5.0, 5.0),
+        &view,
+        None,
+    );
+    assert!(matches!(pencil, Some(Drag::Brush { hard: true, .. })));
+    assert_eq!(crate::dab_tool_of_drag(pencil.as_ref()), DabTool::Pencil);
+    let brush = begin_drag(Tool::Brush, PointerButton::Primary, (5.0, 5.0), &view, None);
+    assert!(matches!(brush, Some(Drag::Brush { hard: false, .. })));
+    assert_eq!(crate::dab_tool_of_drag(brush.as_ref()), DabTool::Brush);
+    assert_eq!(crate::dab_tool_of_drag(None), DabTool::Brush);
+    // Only the primary button draws.
+    assert!(
+        begin_drag(
+            Tool::Pencil,
+            PointerButton::Secondary,
+            (5.0, 5.0),
+            &view,
+            None
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn a_pencil_stroke_is_hard_in_foreground_colour_and_one_labelled_undo_step() {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.settings.set_radius(Tool::Pencil, 3.0);
+    assert_eq!(rig.settings.radius(Tool::Brush), Some(3.0), "shared radius");
+    assert!(rig.stroke(Tool::Pencil, &[(100.4, 100.6)], false));
+    assert_eq!(rig.undo_order.undo_labels, ["Pencil Stroke"]);
+    let set = alpha_set(&mut rig, 600, 400);
+    assert_eq!(set.len(), 25, "radius 3 is a 5 x 5 block");
+    for &(x, y) in &set {
+        assert_eq!(
+            rig.at(x, y),
+            [1.0, 0.0, 0.0, 1.0],
+            "full red, no partial alpha"
+        );
+    }
+    assert!(set.contains(&(100, 100)));
+    // The history row is the Pencil's, undo restores, redo repaints.
+    let after = rig.snapshot(600, 400);
+    assert!(rig.undo(UndoDirection::Undo));
+    assert!(alpha_set(&mut rig, 600, 400).is_empty());
+    assert!(rig.undo(UndoDirection::Redo));
+    assert_eq!(rig.snapshot(600, 400), after);
+}
+
+#[test]
+fn a_pencil_stroke_has_no_gaps_and_the_brush_still_says_brush_stroke() {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.settings.set_radius(Tool::Pencil, 1.0);
+    assert!(rig.stroke(Tool::Pencil, &[(10.0, 10.0), (200.0, 90.0)], false));
+    let set = alpha_set(&mut rig, 600, 400);
+    // 8-connected from the press to the end: every column in range has one.
+    for x in 10..=199_u32 {
+        assert!(set.iter().any(|&(px, _)| px == x), "column {x} has a texel");
+    }
+    for &(x, y) in &set {
+        let neighbours = set
+            .iter()
+            .filter(|&&(a, b)| a.abs_diff(x) <= 1 && b.abs_diff(y) <= 1 && (a, b) != (x, y))
+            .count();
+        assert!(neighbours >= 1, "({x}, {y}) is isolated");
+        assert_eq!(rig.at(x, y)[3], 1.0);
+    }
+    let mut other = Rig::new(rect(0, 0, 600, 400));
+    assert!(other.stroke(Tool::Brush, &[(100.0, 100.0)], false));
+    assert_eq!(other.undo_order.undo_labels, ["Brush Stroke"]);
+}
+
+#[test]
+fn a_pencil_stroke_paints_through_a_selection_only() {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.marquee((100.0, 80.0), (300.0, 260.0));
+    let sel = rect(100, 80, 200, 180);
+    rig.settings.set_radius(Tool::Pencil, 8.0);
+    assert!(rig.stroke(Tool::Pencil, &[(40.0, 170.0), (350.0, 170.0)], false));
+    let set = alpha_set(&mut rig, 600, 400);
+    assert!(set.len() > 1000);
+    assert!(
+        set.iter()
+            .all(|&(x, y)| inside(sel, i64::from(x), i64::from(y)))
+    );
+    assert!(set.iter().any(|&(x, _)| x == 100) && set.iter().any(|&(x, _)| x == 299));
+}
+
+#[test]
+fn a_pencil_dab_through_a_fractional_selection_blends_by_the_coverage() {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.marquee_step(Tool::EllipticalMarquee, (100.0, 100.0), (300.0, 300.0));
+    rig.settings.set_radius(Tool::Pencil, 6.0);
+    // Along the ellipse's edge some covered texels have coverage < 1.
+    assert!(rig.stroke(Tool::Pencil, &[(120.0, 120.0), (140.0, 140.0)], false));
+    let set = alpha_set(&mut rig, 600, 400);
+    let partial = set
+        .iter()
+        .filter(|&&(x, y)| {
+            let a = rig.at(x, y)[3];
+            a > 0.0 && a < 1.0
+        })
+        .count();
+    let full = set.iter().filter(|&&(x, y)| rig.at(x, y)[3] == 1.0).count();
+    assert!(partial > 0, "the antialiased selection edge blends");
+    assert!(full > 0);
+}
+
+#[test]
+fn a_transparency_locked_pencil_recolours_without_changing_alpha() {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.rect_fill(90, 90, 110, 110, [0.0, 0.5, 0.0, 0.5]);
+    let before: Vec<f32> = (90..110).map(|x| rig.at(x, 100)[3]).collect();
+    rig.settings.set_radius(Tool::Pencil, 30.0);
+    assert!(rig.stroke(Tool::Pencil, &[(100.5, 100.5)], true));
+    let after: Vec<f32> = (90..110).map(|x| rig.at(x, 100)[3]).collect();
+    assert_eq!(before, after, "alpha untouched");
+    assert_eq!(rig.at(100, 100), [0.5, 0.0, 0.0, 0.5], "red at its alpha");
+    assert_eq!(rig.at(120, 100), [0.0; 4], "transparent texels stay empty");
+    assert_eq!(rig.alpha(89, 100), 0.0);
+}
+
+#[test]
+fn pencil_locks_and_permissions_follow_the_brush() {
+    use aurora_doc::LayerLock as L;
+    let none = L::none();
+    let t = L {
+        transparency: true,
+        ..none
+    };
+    let p = L {
+        pixels: true,
+        ..none
+    };
+    assert_eq!(
+        crate::paint_permission(DabTool::Pencil, none),
+        crate::PaintPermission::Allowed
+    );
+    assert_eq!(
+        crate::paint_permission(DabTool::Pencil, t),
+        crate::PaintPermission::PreserveAlpha
+    );
+    assert_eq!(
+        crate::paint_permission(DabTool::Pencil, p),
+        crate::PaintPermission::Refused(crate::LockRefusal::PixelsLocked)
+    );
+    assert_eq!(
+        crate::press_refusal(Tool::Pencil, p),
+        Some(crate::LockRefusal::PixelsLocked)
+    );
+    assert_eq!(crate::press_refusal(Tool::Pencil, t), None);
+    assert_eq!(crate::press_refusal(Tool::Pencil, none), None);
+    // The Pencil and Brush share one radius; the Eraser has its own.
+    let mut settings = ToolSettings::default();
+    assert!(settings.set_radius(Tool::Pencil, 9.0));
+    assert_eq!(settings.dab_radius(DabTool::Pencil), 9.0);
+    assert_eq!(settings.dab_radius(DabTool::Brush), 9.0);
+    assert_eq!(settings.dab_radius(DabTool::Eraser), 24.0);
+}
+
+#[test]
+fn a_pencil_with_no_pixel_layer_starts_a_drag_with_no_stroke_and_records_nothing() {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    let drag = begin_drag(
+        Tool::Pencil,
+        PointerButton::Primary,
+        (50.0, 50.0),
+        &rig.view,
+        None,
+    );
+    assert!(matches!(
+        drag,
+        Some(Drag::Brush {
+            stroke: None,
+            hard: true,
+            ..
+        })
+    ));
+    let recorded = commit_ending_drag(
+        drag,
+        &rig.layers,
+        &mut rig.history,
+        &mut rig.pixel_history,
+        &mut rig.undo_order,
+        &mut rig.view,
+        Some(rig.layer),
+        Some((1000.0, 800.0)),
+    );
+    assert!(!recorded);
+    assert!(rig.undo_order.undo_labels.is_empty());
+}
+
+#[test]
+fn the_pencil_edits_the_quick_mask_hard_toward_the_foreground_luma() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.settings.set_radius(Tool::Pencil, 3.0);
+    let mut mode = rig.qm_enter();
+    let tiles = rig.tiles();
+    assert_eq!(
+        quick_mask::target_byte(DabTool::Pencil, &black_on_white()),
+        0
+    );
+    assert_eq!(
+        quick_mask::target_byte(DabTool::Pencil, &white_on_black()),
+        255
+    );
+    let recorded = rig.qm_stroke(
+        &mut mode,
+        Tool::Pencil,
+        &[(150.3, 120.7)],
+        &black_on_white(),
+    );
+    assert!(!recorded, "mask strokes record no step");
+    assert_eq!(rig.tiles(), tiles, "no layer pixel touched");
+    let mut zeros = 0;
+    for y in 100..140_i64 {
+        for x in 130..170_i64 {
+            let b = mode.mask.byte_at(x, y);
+            assert!(
+                b == 0 || b == 255,
+                "hard: no in-between byte at ({x}, {y}): {b}"
+            );
+            if b == 0 {
+                zeros += 1;
+            }
+        }
+    }
+    assert_eq!(zeros, 25, "radius 3 is a 5 x 5 block");
+    assert_eq!(mode.mask.byte_at(150, 120), 0);
+    assert!(quick_mask::skips_lock_gate(true, Tool::Pencil));
+    assert_eq!(quick_mask::drag_layer(true, Tool::Pencil, Some(1)), None);
+    assert_eq!(
+        quick_mask::drag_layer(false, Tool::Pencil, Some(1)),
+        Some(1)
+    );
+    assert!(quick_mask::tool_refusal(Tool::Pencil).is_none());
+}
+
+#[test]
+fn the_pencil_is_selected_by_shift_b_and_the_palette_and_the_brush_by_b() {
+    use aurora_widgets::shortcut::KeyChord;
+    let registry = crate::default_shortcuts_for(false);
+    let find = |source: &str| match KeyChord::parse(source) {
+        Ok(chord) => registry.resolve(chord),
+        Err(err) => unreachable!("{err:?}"),
+    };
+    assert!(matches!(
+        find("Shift+B"),
+        Some(crate::AppCommand::SelectTool(Tool::Pencil))
+    ));
+    assert!(matches!(
+        find("b"),
+        Some(crate::AppCommand::SelectTool(Tool::Brush))
+    ));
+    assert_eq!(crate::tool_command_id(Tool::Pencil), "tool.pencil");
+    assert_eq!(Tool::Pencil.shortcut_text(), "Shift+B");
 }

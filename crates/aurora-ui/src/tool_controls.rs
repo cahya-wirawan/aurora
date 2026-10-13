@@ -524,7 +524,7 @@ mod tests {
             "starts hidden"
         );
         for tool in Tool::ALL {
-            let radius = matches!(tool, Tool::Brush | Tool::Eraser).then_some(24.0);
+            let radius = matches!(tool, Tool::Brush | Tool::Pencil | Tool::Eraser).then_some(24.0);
             let _ = sync(&mut ws.tree, controls, tool, radius, None);
             ws.tree.compute_layout(1600.0, 900.0);
             assert_eq!(

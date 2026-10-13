@@ -205,6 +205,7 @@ impl Rig {
             unreachable!("{err:?}");
         }
         self.drag = Some(Drag::Brush {
+            hard: false,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: Some(stroke),
@@ -3472,6 +3473,7 @@ fn opening_a_document_ends_quick_mask_on_the_outgoing_one() {
     // A mask stroke in progress (no pixel snapshot) must not outlive the
     // mode.
     rig.drag = Some(Drag::Brush {
+        hard: false,
         last_doc: (0.0, 0.0),
         carry: 0.0,
         stroke: None,

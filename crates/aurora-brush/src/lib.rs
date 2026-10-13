@@ -52,6 +52,8 @@ mod coverage;
 mod coverage_tests;
 mod dab;
 mod fill;
+#[cfg(test)]
+mod hard_dab_tests;
 mod mask_dab;
 mod stamp;
 #[cfg(test)]
@@ -67,10 +69,12 @@ pub use fill::{
     MAX_FILL_TILES, WandRegion, flood_fill, flood_fill_covered, gradient_fill,
     gradient_fill_covered, wand_region,
 };
-pub use mask_dab::{dab_falloff, stamp_toward};
+pub use mask_dab::{dab_falloff, hard_dab_covers, hard_dab_snap, stamp_toward, stamp_toward_hard};
 pub use stamp::{
-    DabOutcome, erase_dab, erase_dab_covered, stamp_dab, stamp_dab_covered,
-    stamp_dab_preserving_alpha, stamp_dab_preserving_alpha_covered, touched_tiles,
+    DabOutcome, erase_dab, erase_dab_covered, stamp_dab, stamp_dab_covered, stamp_dab_hard,
+    stamp_dab_hard_covered, stamp_dab_hard_preserving_alpha,
+    stamp_dab_hard_preserving_alpha_covered, stamp_dab_preserving_alpha,
+    stamp_dab_preserving_alpha_covered, touched_tiles,
 };
 pub use undo::{
     HistoryStats, PixelHistory, SPILL_BYTES_PER_CALL, SPILL_FILES_PER_CALL, StrokeSnapshot,

@@ -24,7 +24,7 @@
 //! buttons sit in [`TOOL_GROUPS`], one row per group of at most two, and a
 //! group rule ([`widgets::insert_separator`], the menu separator's 1 px
 //! `border.default` line) separates the groups: move and select, view,
-//! sample, paint, fill — Photoshop's own grouping, trimmed to the tools
+//! sample, paint (Brush and Pencil), erase, fill — Photoshop's own grouping, trimmed to the tools
 //! Aurora has (the fill group, Gradient and Paint Bucket, is 0.209.0's: a
 //! row of its own under the paint group). A group of one (the Eyedropper) fills the left cell.
 //!
@@ -90,14 +90,15 @@ pub const TOOL_COLUMNS: usize = 2;
 /// The groups of the strip, top to bottom, each one row of at most
 /// [`TOOL_COLUMNS`] buttons, a rule between consecutive groups. Together
 /// they hold every tool of [`Tool::ALL`], in that order.
-pub const TOOL_GROUPS: [&[Tool]; 8] = [
+pub const TOOL_GROUPS: [&[Tool]; 9] = [
     &[Tool::Move],
     &[Tool::MarqueeSelect, Tool::EllipticalMarquee],
     &[Tool::Lasso, Tool::PolygonalLasso],
     &[Tool::MagicWand],
     &[Tool::Zoom, Tool::Pan],
     &[Tool::Eyedropper],
-    &[Tool::Brush, Tool::Eraser],
+    &[Tool::Brush, Tool::Pencil],
+    &[Tool::Eraser],
     &[Tool::Gradient, Tool::PaintBucket],
 ];
 
@@ -118,6 +119,7 @@ pub const fn tool_icon(tool: Tool) -> IconKind {
         Tool::Eyedropper => IconKind::Eyedropper,
         Tool::Brush => IconKind::Brush,
         Tool::Eraser => IconKind::Eraser,
+        Tool::Pencil => IconKind::Pencil,
         Tool::Gradient => IconKind::Gradient,
         Tool::PaintBucket => IconKind::PaintBucket,
     }
@@ -388,7 +390,7 @@ mod tests {
 
     /// The icon each tool must wear, written out independently of
     /// [`tool_icon`] so a mapped-to-the-wrong-tool slip fails.
-    const EXPECTED_ICONS: [(Tool, IconKind); 13] = [
+    const EXPECTED_ICONS: [(Tool, IconKind); 14] = [
         (Tool::Move, IconKind::Move),
         (Tool::MarqueeSelect, IconKind::Marquee),
         (Tool::EllipticalMarquee, IconKind::EllipseMarquee),
@@ -399,6 +401,7 @@ mod tests {
         (Tool::Pan, IconKind::Hand),
         (Tool::Eyedropper, IconKind::Eyedropper),
         (Tool::Brush, IconKind::Brush),
+        (Tool::Pencil, IconKind::Pencil),
         (Tool::Eraser, IconKind::Eraser),
         (Tool::Gradient, IconKind::Gradient),
         (Tool::PaintBucket, IconKind::PaintBucket),
@@ -481,6 +484,10 @@ mod tests {
             );
         }
         assert_eq!(tool_description(Tool::Brush), "Brush tool, shortcut B");
+        assert_eq!(
+            tool_description(Tool::Pencil),
+            "Pencil tool, shortcut Shift+B"
+        );
         assert_eq!(
             tool_description(Tool::Gradient),
             "Gradient tool, shortcut G"
@@ -664,15 +671,16 @@ mod tests {
             );
             let strip = bounds(&ws, ws.tools.root);
             assert_eq!(strip.width, 72, "scale {scale_factor}");
-            // The strip stretches to the window; its content is five
-            // groups of 32 px and four 8 px rules under 4 px of padding:
-            // the last button ends 4 + 7*32 + 6*8 = 276 px down (0.214.0
-            // added the Lasso row and the Magic Wand row).
+            // The strip stretches to the window; its content is groups of
+            // 32 px and 8 px rules under 4 px of padding: the Eraser ends
+            // 4 + 8*32 + 7*8 = 316 px down (0.214.0 added the Lasso row and
+            // the Magic Wand row, 0.220.0 the Pencil's: Brush and Pencil
+            // share a row, the Eraser has the next one).
             let last = bounds(
                 &ws,
                 ws.tools.button_for(Tool::Eraser).unwrap_or(ws.tools.root),
             );
-            assert_eq!(last.bottom() - strip.y, 276, "scale {scale_factor}");
+            assert_eq!(last.bottom() - strip.y, 316, "scale {scale_factor}");
             for (_, id) in ws.tools.buttons {
                 let b = bounds(&ws, id);
                 assert_eq!((b.width, b.height), (32, 32), "scale {scale_factor}");
@@ -697,16 +705,23 @@ mod tests {
             assert_eq!(at(Tool::Eyedropper).x, at(Tool::Move).x);
             assert!(at(Tool::Zoom).y > at(Tool::Move).y);
             assert!(at(Tool::Brush).y > at(Tool::Eyedropper).y);
+            // 0.220.0: the Pencil sits beside the Brush; the Eraser has
+            // the row under them, in the left column.
+            assert_eq!(at(Tool::Brush).y, at(Tool::Pencil).y);
+            assert_eq!(at(Tool::Brush).x + 32, at(Tool::Pencil).x);
+            assert!(at(Tool::Eraser).y > at(Tool::Brush).y);
+            assert_eq!(at(Tool::Eraser).x, at(Tool::Brush).x);
+            assert!(at(Tool::Gradient).y > at(Tool::Eraser).y);
             // 0.209.0: the fill row sits under the paint row, two to a
             // row, in the same two columns, inside the same 72 px.
             assert!(at(Tool::Gradient).y > at(Tool::Brush).y);
             assert_eq!(at(Tool::Gradient).y, at(Tool::PaintBucket).y);
             assert_eq!(at(Tool::Gradient).x, at(Tool::Brush).x);
-            assert_eq!(at(Tool::PaintBucket).x, at(Tool::Eraser).x);
+            assert_eq!(at(Tool::PaintBucket).x, at(Tool::Pencil).x);
             let bucket = at(Tool::PaintBucket);
             assert_eq!(
                 bucket.bottom() - strip.y,
-                4 + 8 * 32 + 7 * 8,
+                4 + 9 * 32 + 8 * 8,
                 "scale {scale_factor}"
             );
             assert!(
