@@ -542,6 +542,9 @@ mod autosave_files;
 mod background_autosave;
 mod background_composite;
 mod background_open;
+mod brush_spacing;
+#[cfg(test)]
+mod brush_spacing_tests;
 mod clone_stamp;
 #[cfg(test)]
 mod clone_stamp_tests;
@@ -12900,6 +12903,7 @@ fn continue_drag(
     tool_settings: &ToolSettings,
     bounds: PanBounds,
 ) -> Vec<(f32, f32)> {
+    let spacing = brush_spacing::spacing_of(drag);
     match drag {
         Drag::Pan { last_screen } => {
             let delta = (
@@ -12956,9 +12960,15 @@ fn continue_drag(
             last_doc, carry, ..
         } => {
             let current_doc = view.to_document(canvas_point);
-            let step = aurora_brush::dab_step(
+            // 0.226.1: the soft Brush alone lays dense, per-event-capped
+            // dabs ([`brush_spacing`]); every other Brush-shaped drag keeps
+            // the old step.
+            let step = brush_spacing::event_step(
+                spacing,
                 tool_settings.dab_radius(DabTool::Brush),
-                aurora_brush::DEFAULT_SPACING,
+                *last_doc,
+                current_doc,
+                *carry,
             );
             let (dabs, new_carry) =
                 aurora_brush::advance_segment(*last_doc, current_doc, *carry, step);
@@ -71200,9 +71210,12 @@ mod tests {
             warned: std::collections::HashSet::new(),
         };
         // radius 24, DEFAULT_SPACING 0.25 -> step 6; a 12-unit segment
-        // lands dabs at 6 and 12 (the segment's own start, 0, is not
+        // lands dabs at 6 and 12. (0.226.1: this hand-built drag has no
+        // stroke snapshot, i.e. it is the Quick Mask shape, which keeps the
+        // old spacing; the layer Brush's dense step is pinned in
+        // `brush_spacing_tests`.) The segment's own start, 0, is not
         // re-emitted -- it was already painted by whatever started the
-        // drag or the previous event).
+        // drag or the previous event.
         let dabs = continue_drag(
             &mut drag,
             (12.0, 0.0),
@@ -71286,9 +71299,10 @@ mod tests {
             stroke: None,
             warned: std::collections::HashSet::new(),
         };
-        // Same radius/spacing as Brush (ERASER_RADIUS == BRUSH_RADIUS ==
-        // 24, DEFAULT_SPACING 0.25 -> step 6), so the same dab positions
-        // land for the same segment.
+        // The Eraser's radius and spacing (ERASER_RADIUS == 24,
+        // DEFAULT_SPACING 0.25 -> step 6, unchanged by 0.226.1), so the
+        // same dab positions land for the same segment as the stroke-less
+        // Brush drag above.
         let dabs = continue_drag(
             &mut drag,
             (12.0, 0.0),

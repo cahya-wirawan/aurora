@@ -47,6 +47,8 @@
 //! See each module's own doc comment for exactly what's real and what's
 //! still open.
 
+#[cfg(test)]
+mod brush_spacing_tests;
 mod clone;
 #[cfg(test)]
 mod clone_tests;
@@ -76,7 +78,11 @@ mod wand_tests;
 
 pub use clone::{MAX_CLONE_OFFSET, MAX_CLONE_PATCH_TEXELS, clone_dab_covered};
 pub use coverage::{Coverage, CoverageRegion};
-pub use dab::{DEFAULT_SPACING, advance_segment, dab_step, dabs_along_path};
+pub use dab::{
+    BRUSH_EVENT_TEXEL_BUDGET, BRUSH_SPACING, DEFAULT_SPACING, MAX_BRUSH_DABS_PER_EVENT,
+    MIN_BRUSH_DABS_PER_EVENT, advance_segment, brush_dab_cap, brush_segment_step, dab_step,
+    dabs_along_path, spacing_dip,
+};
 pub use fill::{
     FillError, FillMode, FillOutcome, FloodSpec, GradientKind, GradientSpec, MAX_EXAMINED_TILES,
     MAX_FILL_TILES, WandRegion, flood_fill, flood_fill_covered, gradient_fill,
