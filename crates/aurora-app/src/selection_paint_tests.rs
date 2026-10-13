@@ -1004,7 +1004,7 @@ fn a_history_panel_jump_applies_the_selection_of_the_row() {
 
 #[test]
 fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
-    assert_eq!(Tool::ALL.len(), 18);
+    assert_eq!(Tool::ALL.len(), 21);
     let table = crate::default_shortcuts_for(false);
     let chord = |shift| {
         KeyChord::new(
@@ -1062,7 +1062,7 @@ fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
     );
     // The tools panel has one button per tool, the new one wearing its
     // own icon.
-    assert_eq!(workspace.tools.buttons.len(), 18);
+    assert_eq!(workspace.tools.buttons.len(), 21);
     assert_eq!(
         aurora_ui::tool_icon(Tool::EllipticalMarquee),
         aurora_widgets::icons::IconKind::EllipseMarquee
@@ -3344,6 +3344,9 @@ fn the_fills_and_selection_tools_are_refused_and_the_rest_work() {
                 | Tool::Smudge
                 | Tool::Blur
                 | Tool::Sharpen
+                | Tool::Dodge
+                | Tool::Burn
+                | Tool::Sponge
         );
         assert_eq!(
             quick_mask::tool_refusal(tool),
@@ -3499,6 +3502,7 @@ fn entering_quick_mask_mid_stroke_commits_the_layer_stroke_first() {
         clone: None,
         smudge: None,
         filter: None,
+        tone: None,
         last_doc: (0.0, 0.0),
         carry: 0.0,
         stroke: Some(aurora_brush::StrokeSnapshot::new(rig.surface)),
@@ -4549,4 +4553,345 @@ fn a_pixel_lock_refuses_the_filter_press_and_a_missing_layer_has_its_own_notice(
         Some(crate::LockRefusal::PixelsLocked)
     );
     assert_eq!(crate::filter_stamp::press(Sharpen, true, None), None);
+}
+
+// -- The Dodge, Burn and Sponge (0.224.0) ---------------------------------------
+
+impl Rig {
+    /// A Dodge, Burn or Sponge stroke (`tool`) along `points` driven the way
+    /// `App` does: the press decision (`tone_stamp::press`), then the drag,
+    /// each dab stamped by `tone_stamp::tone_dab_through_selection`, then the
+    /// commit. Returns the press refusal (if any) and whether a history
+    /// step was recorded.
+    fn tone_stroke(
+        &mut self,
+        tool: Tool,
+        points: &[(f32, f32)],
+    ) -> (Option<crate::LockRefusal>, bool) {
+        let Some(&first) = points.first() else {
+            unreachable!("a stroke has points");
+        };
+        let Some(kind) = crate::tone_stamp::kind_of(tool) else {
+            unreachable!("{tool:?} is a toning tool");
+        };
+        let lock = self.layers.lock(self.layer).unwrap_or_default();
+        if let Some(why) = crate::tone_stamp::press(
+            kind,
+            crate::active_pixel_layer(&self.layers, Some(self.layer)).is_some(),
+            crate::press_refusal(tool, lock),
+        ) {
+            return (Some(why), false);
+        }
+        let mut drag = begin_drag(
+            tool,
+            PointerButton::Primary,
+            first,
+            &self.view,
+            crate::active_pixel_layer(&self.layers, Some(self.layer)),
+        );
+        assert_eq!(crate::tone_stamp::drag_tone(drag.as_ref()), Some(kind));
+        let selection = self.selection.active();
+        let dab_at = |rig: &mut Self, drag: &mut Option<Drag>, p: (f32, f32)| {
+            let _ = crate::tone_stamp::tone_dab_through_selection(
+                &mut rig.store,
+                rig.surface,
+                rig.bounds,
+                p,
+                selection.clone(),
+                &rig.settings,
+                drag,
+            );
+        };
+        dab_at(self, &mut drag, first);
+        for &p in points.iter().skip(1) {
+            let bounds = pan_bounds(&self.layers, Some(self.layer), Some((1000.0, 800.0)));
+            let dabs = match drag.as_mut() {
+                Some(d) => continue_drag(
+                    d,
+                    p,
+                    &mut self.view,
+                    &mut self.selection,
+                    &self.settings,
+                    bounds,
+                ),
+                None => Vec::new(),
+            };
+            for dab in dabs {
+                dab_at(self, &mut drag, dab);
+            }
+        }
+        let recorded = commit_ending_drag(
+            drag,
+            &self.layers,
+            &mut self.history,
+            &mut self.pixel_history,
+            &mut self.undo_order,
+            &mut self.view,
+            Some(self.layer),
+            Some((1000.0, 800.0)),
+        );
+        (None, recorded)
+    }
+}
+
+/// A rig with a coloured block (x 20..60, y 80..120) on an empty layer.
+fn tone_rig(colour: [f32; 4]) -> Rig {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.settings.set_radius(Tool::Dodge, 8.0);
+    rig.rect_fill(20, 80, 60, 120, colour);
+    rig
+}
+
+const TONE_POINTS: [(f32, f32); 3] = [(30.5, 100.5), (40.5, 100.5), (50.5, 100.5)];
+
+#[test]
+fn the_toning_settings_default_clamp_and_are_separate_slots() {
+    let mut s = crate::ToolSettings::default();
+    assert_eq!(
+        (s.dodge_exposure, s.burn_exposure, s.sponge_flow),
+        (50, 50, 50)
+    );
+    assert_eq!(s.tone_range, aurora_brush::ToneRange::Midtones);
+    assert_eq!(s.sponge_mode, aurora_brush::SpongeMode::Desaturate);
+    for (tool, kind) in [
+        (Tool::Dodge, crate::tone_stamp::ToneKind::Dodge),
+        (Tool::Burn, crate::tone_stamp::ToneKind::Burn),
+        (Tool::Sponge, crate::tone_stamp::ToneKind::Sponge),
+    ] {
+        assert!((crate::tone_stamp::amount_fraction(&s, kind) - 0.5).abs() < f32::EPSILON);
+        assert!(s.set_strength(tool, 100.4));
+        assert!((crate::tone_stamp::amount_fraction(&s, kind) - 1.0).abs() < f32::EPSILON);
+        assert!(s.set_strength(tool, -5.0));
+        assert!((crate::tone_stamp::amount_fraction(&s, kind) - 0.01).abs() < 1e-6);
+        assert!(!s.set_strength(tool, f64::NAN));
+        // Every toning tool shares the Brush's radius.
+        let radius = 31.0 + f64::from(tool as u8);
+        assert!(s.set_radius(tool, radius));
+        assert_eq!(s.radius(Tool::Brush).map(f64::from), Some(radius));
+        assert_eq!(s.radius(tool).map(f64::from), Some(radius));
+    }
+    let mut t = crate::ToolSettings::default();
+    assert!(t.set_strength(Tool::Dodge, 20.0));
+    assert!(t.set_strength(Tool::Burn, 60.0));
+    assert!(t.set_strength(Tool::Sponge, 90.0));
+    assert_eq!(
+        (
+            t.smudge_strength,
+            t.blur_strength,
+            t.dodge_exposure,
+            t.burn_exposure,
+            t.sponge_flow
+        ),
+        (50, 50, 20, 60, 90)
+    );
+}
+
+#[test]
+fn the_tool_settings_choose_the_engine_operation() {
+    use aurora_brush::{SpongeMode, ToneOp, ToneRange};
+    let mut s = crate::ToolSettings::default();
+    for range in ToneRange::ALL {
+        s.tone_range = range;
+        assert_eq!(
+            crate::tone_stamp::op_of(&s, crate::tone_stamp::ToneKind::Dodge),
+            ToneOp::Dodge(range)
+        );
+        assert_eq!(
+            crate::tone_stamp::op_of(&s, crate::tone_stamp::ToneKind::Burn),
+            ToneOp::Burn(range)
+        );
+    }
+    s.sponge_mode = SpongeMode::Saturate;
+    assert_eq!(
+        crate::tone_stamp::op_of(&s, crate::tone_stamp::ToneKind::Sponge),
+        ToneOp::Saturate
+    );
+    s.sponge_mode = SpongeMode::Desaturate;
+    assert_eq!(
+        crate::tone_stamp::op_of(&s, crate::tone_stamp::ToneKind::Sponge),
+        ToneOp::Desaturate
+    );
+}
+
+#[test]
+fn a_dodge_stroke_lightens_a_grey_block_as_one_labelled_step_and_undoes() {
+    let mut rig = tone_rig([0.25, 0.25, 0.25, 1.0]);
+    rig.settings.set_strength(Tool::Dodge, 100.0);
+    let before = rig.snapshot(600, 400);
+    let (refused, recorded) = rig.tone_stroke(Tool::Dodge, &TONE_POINTS);
+    assert_eq!(refused, None);
+    assert!(recorded);
+    assert_eq!(rig.undo_order.undo_labels, ["Dodge Stroke"]);
+    let t = rig.at(40, 100);
+    assert!(t[0] > 0.5 && t[0] <= 1.0, "{t:?}");
+    assert_eq!(t[3], 1.0);
+    // Far from the stroke and in empty space nothing moved.
+    assert_eq!(rig.at(22, 82), [0.25, 0.25, 0.25, 1.0]);
+    assert_eq!(rig.at(150, 100), [0.0; 4]);
+    assert!(rig.undo(UndoDirection::Undo));
+    assert_eq!(rig.snapshot(600, 400), before);
+    assert!(rig.undo(UndoDirection::Redo));
+    assert!(rig.at(40, 100)[0] > 0.5);
+}
+
+#[test]
+fn a_burn_stroke_darkens_and_a_sponge_stroke_desaturates_or_saturates() {
+    let mut rig = tone_rig([0.5, 0.5, 0.5, 1.0]);
+    rig.settings.set_strength(Tool::Burn, 100.0);
+    let (_, recorded) = rig.tone_stroke(Tool::Burn, &TONE_POINTS);
+    assert!(recorded);
+    assert_eq!(rig.undo_order.undo_labels, ["Burn Stroke"]);
+    assert!(rig.at(40, 100)[0] < 0.4, "{:?}", rig.at(40, 100));
+    assert_eq!(rig.at(150, 100), [0.0; 4]);
+
+    // The Sponge, both modes, on a muted red.
+    for (mode, grows) in [
+        (aurora_brush::SpongeMode::Desaturate, false),
+        (aurora_brush::SpongeMode::Saturate, true),
+    ] {
+        let mut rig = tone_rig([0.6, 0.4, 0.4, 1.0]);
+        rig.settings.sponge_mode = mode;
+        rig.settings.set_strength(Tool::Sponge, 100.0);
+        let (_, recorded) = rig.tone_stroke(Tool::Sponge, &TONE_POINTS);
+        assert!(recorded, "{mode:?}");
+        assert_eq!(rig.undo_order.undo_labels, ["Sponge Stroke"]);
+        let t = rig.at(40, 100);
+        let chroma = t[0] - t[1];
+        assert_eq!(chroma > 0.2, grows, "{mode:?} {t:?}");
+        assert_eq!(t[3], 1.0);
+    }
+}
+
+#[test]
+fn the_range_decides_which_tones_a_dodge_stroke_reaches() {
+    use aurora_brush::ToneRange;
+    // A dark block is moved most by Shadows, least by Highlights.
+    let mut moved = Vec::new();
+    for range in [ToneRange::Shadows, ToneRange::Highlights] {
+        let mut rig = tone_rig([0.1, 0.1, 0.1, 1.0]);
+        rig.settings.tone_range = range;
+        rig.settings.set_strength(Tool::Dodge, 100.0);
+        let _ = rig.tone_stroke(Tool::Dodge, &TONE_POINTS);
+        moved.push(rig.at(40, 100)[0] - 0.1);
+    }
+    assert!(moved[0] > moved[1] + 0.2, "{moved:?}");
+}
+
+#[test]
+fn a_toning_stroke_over_empty_space_or_nothing_to_do_records_nothing_and_makes_no_tile() {
+    for tool in [Tool::Dodge, Tool::Burn, Tool::Sponge] {
+        let mut rig = Rig::new(rect(0, 0, 600, 400));
+        let before = rig.snapshot(600, 400);
+        let (refused, recorded) = rig.tone_stroke(tool, &[(100.5, 100.5), (140.5, 110.5)]);
+        assert_eq!(refused, None);
+        assert!(!recorded, "{tool:?}");
+        assert!(rig.undo_order.undo_labels.is_empty());
+        assert_eq!(rig.snapshot(600, 400), before);
+        assert!(
+            !rig.store
+                .contains_tile(rig.surface, aurora_tile::TileId { x: 0, y: 0 })
+        );
+    }
+    // A white block cannot be dodged, a black one cannot be burned and a
+    // grey one cannot be sponged.
+    for (tool, colour) in [
+        (Tool::Dodge, [1.0, 1.0, 1.0, 1.0]),
+        (Tool::Burn, [0.0, 0.0, 0.0, 1.0]),
+        (Tool::Sponge, [0.5, 0.5, 0.5, 1.0]),
+    ] {
+        let mut rig = tone_rig(colour);
+        rig.settings.set_strength(tool, 100.0);
+        let (_, recorded) = rig.tone_stroke(tool, &TONE_POINTS);
+        assert!(!recorded, "{tool:?}");
+        assert!(rig.undo_order.undo_labels.is_empty());
+    }
+}
+
+#[test]
+fn a_toning_stroke_paints_only_through_the_selection() {
+    for tool in [Tool::Dodge, Tool::Burn, Tool::Sponge] {
+        let mut rig = tone_rig([0.6, 0.4, 0.4, 1.0]);
+        rig.settings.set_strength(tool, 100.0);
+        let before = rig.snapshot(600, 400);
+        rig.marquee((34.0, 0.0), (46.0, 400.0));
+        let (_, recorded) = rig.tone_stroke(tool, &TONE_POINTS);
+        let after = rig.snapshot(600, 400);
+        let mut xs = std::collections::BTreeSet::new();
+        for y in 0..400usize {
+            for x in 0..600usize {
+                if after[y * 600 + x] != before[y * 600 + x] {
+                    xs.insert(x);
+                }
+            }
+        }
+        assert!(recorded, "{tool:?}");
+        assert!(!xs.is_empty(), "{tool:?}");
+        assert!(xs.iter().all(|x| (34..46).contains(x)), "{tool:?} {xs:?}");
+    }
+}
+
+#[test]
+fn a_transparency_locked_toning_stroke_still_works_and_never_changes_alpha() {
+    let transparency = aurora_doc::LayerLock {
+        transparency: true,
+        ..aurora_doc::LayerLock::default()
+    };
+    for tool in [Tool::Dodge, Tool::Burn, Tool::Sponge] {
+        assert_eq!(crate::press_refusal(tool, transparency), None);
+        let mut rig = tone_rig([0.3, 0.2, 0.1, 0.5]);
+        assert!(rig.layers.set_lock(rig.layer, transparency).is_ok());
+        rig.settings.set_strength(tool, 100.0);
+        let (refused, recorded) = rig.tone_stroke(tool, &TONE_POINTS);
+        assert_eq!(refused, None);
+        assert!(recorded, "{tool:?}");
+        for y in 80..120 {
+            for x in 20..60 {
+                assert_eq!(rig.at(x, y)[3], 0.5, "alpha kept at ({x}, {y})");
+            }
+        }
+        assert_eq!(rig.at(150, 100), [0.0; 4]);
+    }
+}
+
+#[test]
+fn a_pixel_lock_refuses_the_toning_press_and_a_missing_layer_has_its_own_notice() {
+    use crate::tone_stamp::{ToneKind, press};
+    for tool in [Tool::Dodge, Tool::Burn, Tool::Sponge] {
+        let mut rig = tone_rig([0.5, 0.5, 0.5, 1.0]);
+        let lock = aurora_doc::LayerLock {
+            pixels: true,
+            ..aurora_doc::LayerLock::default()
+        };
+        assert!(rig.layers.set_lock(rig.layer, lock).is_ok());
+        let before = rig.snapshot(600, 400);
+        let (refused, recorded) = rig.tone_stroke(tool, &TONE_POINTS);
+        assert_eq!(refused, Some(crate::LockRefusal::PixelsLocked), "{tool:?}");
+        assert!(!recorded);
+        assert_eq!(rig.snapshot(600, 400), before);
+    }
+    assert_eq!(
+        press(ToneKind::Dodge, false, None),
+        Some(crate::LockRefusal::DodgeNeedsPixelLayer)
+    );
+    assert_eq!(
+        press(
+            ToneKind::Burn,
+            false,
+            Some(crate::LockRefusal::PixelsLocked)
+        ),
+        Some(crate::LockRefusal::BurnNeedsPixelLayer)
+    );
+    assert_eq!(
+        press(ToneKind::Sponge, false, None),
+        Some(crate::LockRefusal::SpongeNeedsPixelLayer)
+    );
+    assert_eq!(
+        press(
+            ToneKind::Dodge,
+            true,
+            Some(crate::LockRefusal::PixelsLocked)
+        ),
+        Some(crate::LockRefusal::PixelsLocked)
+    );
+    assert_eq!(press(ToneKind::Sponge, true, None), None);
 }

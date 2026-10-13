@@ -139,6 +139,31 @@ pub fn set_slider_disabled(
     })
 }
 
+/// Sets the accessible name of `id` (a slider). Returns whether it
+/// changed (an unchanged name touches nothing).
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it exists but isn't a slider.
+pub fn set_slider_label(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    label: &str,
+) -> Result<bool, WidgetError> {
+    match tree.payload(id) {
+        Some(WidgetKind::Slider(state)) if state.label == label => return Ok(false),
+        Some(WidgetKind::Slider(_)) => {}
+        Some(_) => return Err(WidgetError::WrongWidgetKind(id)),
+        None => return Err(WidgetError::UnknownWidget(id)),
+    }
+    with_slider_mut(tree, id, |state| {
+        label.clone_into(&mut state.label);
+        Ok(())
+    })?;
+    Ok(true)
+}
+
 fn with_slider_mut(
     tree: &mut WidgetTree<WidgetKind>,
     id: WidgetId,
@@ -160,7 +185,7 @@ fn with_slider_mut(
 
 #[cfg(test)]
 mod tests {
-    use super::{insert_slider, set_slider_disabled, set_slider_value};
+    use super::{insert_slider, set_slider_disabled, set_slider_label, set_slider_value};
     use crate::WidgetError;
     use crate::widgets::{WidgetKind, new_tree, test_scales};
     use accesskit::Action;
@@ -253,5 +278,27 @@ mod tests {
             Err(WidgetError::WrongWidgetKind(id)) => assert_eq!(id, root),
             other => unreachable!("expected WrongWidgetKind, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_slider_label_renames_the_accessible_name_and_reports_a_change_once() {
+        let (mut tree, root) = new_tree(Style::default());
+        let id = match insert_slider(&mut tree, root, &test_scales(), "Strength", 5.0, 0.0, 10.0) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(matches!(set_slider_label(&mut tree, id, "Flow"), Ok(true)));
+        assert!(matches!(set_slider_label(&mut tree, id, "Flow"), Ok(false)));
+        assert_eq!(tree.accessibility(id).and_then(|n| n.label()), Some("Flow"));
+        // The value and range survive the rebuild of the node.
+        assert_eq!(
+            tree.accessibility(id)
+                .and_then(accesskit::Node::numeric_value),
+            Some(5.0)
+        );
+        assert!(matches!(
+            set_slider_label(&mut tree, root, "x"),
+            Err(WidgetError::WrongWidgetKind(_))
+        ));
     }
 }

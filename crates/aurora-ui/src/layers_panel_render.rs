@@ -586,6 +586,9 @@ fn write_fill_tools_png() {
         strength: 50,
         blur_strength: 50,
         sharpen_strength: 50,
+        dodge_exposure: 50,
+        burn_exposure: 50,
+        sponge_flow: 50,
     };
     for (tool, name) in [
         (crate::Tool::Gradient, "gradient"),

@@ -71,6 +71,9 @@ pub struct ToolControls {
     /// The New / Add / Subtract / Intersect group (0.215.0), inside
     /// [`Self::options`].
     pub modes: crate::selection_mode_controls::SelectionModeControls,
+    /// The Dodge/Burn Range and the Sponge Mode groups (0.224.0), inside
+    /// [`Self::options`].
+    pub tone: crate::tone_controls::ToneControls,
 }
 
 /// The readout's text for `tool` with `radius` (`None`: the tool has no
@@ -306,6 +309,7 @@ fn build(
     let fill = crate::fill_controls::insert_fill_controls(tree, options, scales)?;
     let modes =
         crate::selection_mode_controls::insert_selection_mode_controls(tree, options, scales)?;
+    let tone = crate::tone_controls::insert_tone_controls(tree, options, scales)?;
     let mut curves = insert_curves_controls(tree, root, scales)?;
     // The Levels editor (0.202.0) sits beside it; one handle reaches both.
     curves.levels = Some(insert_levels_controls(tree, root, scales)?);
@@ -319,6 +323,7 @@ fn build(
         curves,
         fill,
         modes,
+        tone,
     };
     set_disabled(tree, controls, true)?;
     set_node_hidden(tree, radius, true)?;
@@ -533,6 +538,9 @@ mod tests {
                     | Tool::Smudge
                     | Tool::Blur
                     | Tool::Sharpen
+                    | Tool::Dodge
+                    | Tool::Burn
+                    | Tool::Sponge
             )
             .then_some(24.0);
             let _ = sync(&mut ws.tree, controls, tool, radius, None);

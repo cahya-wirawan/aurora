@@ -230,7 +230,9 @@ pub use selection_outline::{
     OutlineRun, OutlineTone, SelectionOutlineState, TINT_LEVELS, TintRect,
     insert_selection_outline, selection_outline_state, set_selection_outline, set_selection_tint,
 };
-pub use slider::{SliderState, insert_slider, set_slider_disabled, set_slider_value};
+pub use slider::{
+    SliderState, insert_slider, set_slider_disabled, set_slider_label, set_slider_value,
+};
 pub use tab_bar::{
     TAB_CLOSE_GLYPH, TabBarKey, TabBarOutcome, TabBarState, TabState, handle_tab_bar_key,
     insert_tab_bar, select_tab, set_tab_accessible_names, set_tab_bar_closable,

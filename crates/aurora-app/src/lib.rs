@@ -576,6 +576,9 @@ mod small_machine;
 mod smudge_stamp;
 #[cfg(test)]
 mod smudge_stamp_tests;
+mod tone_stamp;
+#[cfg(test)]
+mod tone_stamp_tests;
 mod workspace_presets;
 use background_open::{
     BackgroundFailure, DecodedFile, FinishedOpen, OpenInstaller, OpenStep, OpenWorker,
@@ -5582,6 +5585,12 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         // the bare S Clone Stamp leaves free).
         ("Shift+R", AppCommand::SelectTool(aurora_ui::Tool::Blur)),
         ("Shift+S", AppCommand::SelectTool(aurora_ui::Tool::Sharpen)),
+        // 0.224.0: the Dodge, Burn and Sponge. Photoshop shares O among the
+        // three; Aurora keeps bare O for the Dodge, Shift+O for the Burn and
+        // gives the Sponge Shift+P (bare P stays free for a future Pen).
+        ("o", AppCommand::SelectTool(aurora_ui::Tool::Dodge)),
+        ("Shift+O", AppCommand::SelectTool(aurora_ui::Tool::Burn)),
+        ("Shift+P", AppCommand::SelectTool(aurora_ui::Tool::Sponge)),
         // 0.209.0: Photoshop's grouped G key.
         ("g", AppCommand::SelectTool(aurora_ui::Tool::Gradient)),
         (
@@ -5989,6 +5998,9 @@ const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
         aurora_ui::Tool::Smudge => "tool.smudge",
         aurora_ui::Tool::Blur => "tool.blur",
         aurora_ui::Tool::Sharpen => "tool.sharpen",
+        aurora_ui::Tool::Dodge => "tool.dodge",
+        aurora_ui::Tool::Burn => "tool.burn",
+        aurora_ui::Tool::Sponge => "tool.sponge",
     }
 }
 
@@ -8189,6 +8201,19 @@ fn sync_tool_controls(
             false
         }
     };
+    let tone_changed = match aurora_ui::sync_tone_controls(
+        &mut workspace.tree,
+        &controls,
+        tool,
+        settings.tone_range,
+        settings.sponge_mode,
+    ) {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to sync the options-bar toning controls");
+            false
+        }
+    };
     match aurora_ui::sync_tool_controls(
         &mut workspace.tree,
         controls,
@@ -8196,7 +8221,7 @@ fn sync_tool_controls(
         settings.radius(tool).map(f64::from),
         captured,
     ) {
-        Ok(changed) => changed || highlighted || fill_changed || modes_changed,
+        Ok(changed) => changed || highlighted || fill_changed || modes_changed || tone_changed,
         Err(err) => {
             tracing::warn!(?err, "failed to sync the options-bar tool controls");
             false
@@ -8305,6 +8330,20 @@ fn apply_fill_control_outcome(
             settings.selection_mode = chosen;
             changed
         }
+        // The Dodge/Burn Range and the Sponge Mode (0.224.0): a box in any
+        // state chooses its value (the sync re-checks the one in force).
+        ActionOutcome::Toggled { id, .. } if controls.tone.range_of(*id).is_some() => {
+            let chosen = controls.tone.range_of(*id).unwrap_or(settings.tone_range);
+            let changed = settings.tone_range != chosen;
+            settings.tone_range = chosen;
+            changed
+        }
+        ActionOutcome::Toggled { id, .. } if controls.tone.mode_of(*id).is_some() => {
+            let chosen = controls.tone.mode_of(*id).unwrap_or(settings.sponge_mode);
+            let changed = settings.sponge_mode != chosen;
+            settings.sponge_mode = chosen;
+            changed
+        }
         ActionOutcome::Toggled { id, state } if *id == fill.radial => {
             let on = *state == accesskit::Toggled::True;
             let changed = settings.gradient_radial != on;
@@ -8330,9 +8369,17 @@ fn apply_fill_control_outcome(
             settings.set_tolerance(*value)
         }
         ActionOutcome::ValueChanged { id, value } if *id == fill.strength => {
-            // The Blur and the Sharpen edit their own; the slider is the
-            // Smudge's in every other state (0.222.0's behaviour).
-            let owner = if matches!(tool, aurora_ui::Tool::Blur | aurora_ui::Tool::Sharpen) {
+            // The Blur, Sharpen, Dodge, Burn and Sponge edit their own; the
+            // slider is the Smudge's in every other state (0.222.0's
+            // behaviour).
+            let owner = if matches!(
+                tool,
+                aurora_ui::Tool::Blur
+                    | aurora_ui::Tool::Sharpen
+                    | aurora_ui::Tool::Dodge
+                    | aurora_ui::Tool::Burn
+                    | aurora_ui::Tool::Sponge
+            ) {
                 tool
             } else {
                 aurora_ui::Tool::Smudge
@@ -10376,6 +10423,15 @@ const BLUR_STROKE_LABEL: &str = "Blur Stroke";
 /// The row label of a committed Sharpen stroke (0.223.0).
 const SHARPEN_STROKE_LABEL: &str = "Sharpen Stroke";
 
+/// The row label of a committed Dodge stroke (0.224.0).
+const DODGE_STROKE_LABEL: &str = "Dodge Stroke";
+
+/// The row label of a committed Burn stroke (0.224.0).
+const BURN_STROKE_LABEL: &str = "Burn Stroke";
+
+/// The row label of a committed Sponge stroke (0.224.0).
+const SPONGE_STROKE_LABEL: &str = "Sponge Stroke";
+
 /// The History row a committed stroke of the Brush drag gets: the Pencil's
 /// (`hard`) or the Brush's.
 const fn brush_drag_label(hard: bool) -> &'static str {
@@ -11924,6 +11980,11 @@ enum Drag {
         /// reads "Blur Stroke"/"Sharpen Stroke" and its dabs are
         /// [`filter_stamp::filter_dab_through_selection`]'s.
         filter: Option<aurora_brush::FilterKind>,
+        /// The Dodge, Burn or Sponge (0.224.0): the toning tool this drag
+        /// is ([`tone_stamp`]); the drag is otherwise the Brush's, its step
+        /// reads "Dodge Stroke"/"Burn Stroke"/"Sponge Stroke" and its dabs
+        /// are [`tone_stamp::tone_dab_through_selection`]'s.
+        tone: Option<tone_stamp::ToneKind>,
         last_doc: (f32, f32),
         carry: f32,
         /// This stroke's own accumulated undo snapshot — `None` when the
@@ -12211,6 +12272,7 @@ fn commit_ending_drag(
             clone,
             smudge,
             filter,
+            tone,
             ..
         }) => record_stroke(
             stroke,
@@ -12220,6 +12282,8 @@ fn commit_ending_drag(
                 SMUDGE_STROKE_LABEL
             } else if let Some(kind) = filter {
                 filter_stamp::stroke_label(kind)
+            } else if let Some(kind) = tone {
+                tone_stamp::stroke_label(kind)
             } else {
                 brush_drag_label(hard)
             },
@@ -12512,7 +12576,10 @@ fn begin_drag(
             | aurora_ui::Tool::CloneStamp
             | aurora_ui::Tool::Smudge
             | aurora_ui::Tool::Blur
-            | aurora_ui::Tool::Sharpen,
+            | aurora_ui::Tool::Sharpen
+            | aurora_ui::Tool::Dodge
+            | aurora_ui::Tool::Burn
+            | aurora_ui::Tool::Sponge,
             PointerButton::Primary,
         ) => {
             Some(Drag::Brush {
@@ -12524,6 +12591,7 @@ fn begin_drag(
                 // A press starts with nothing carried (0.222.0).
                 smudge: (tool == aurora_ui::Tool::Smudge).then(Box::default),
                 filter: filter_stamp::kind_of(tool),
+                tone: tone_stamp::kind_of(tool),
                 last_doc: view.to_document(canvas_point),
                 carry: 0.0,
                 stroke: active_pixel_layer
@@ -25810,6 +25878,16 @@ struct ToolSettings {
     blur_strength: u8,
     /// The Sharpen's strength, 1..=100 percent (0.223.0; default 50).
     sharpen_strength: u8,
+    /// The Dodge's exposure, 1..=100 percent (0.224.0; default 50).
+    dodge_exposure: u8,
+    /// The Burn's exposure, 1..=100 percent (0.224.0; default 50).
+    burn_exposure: u8,
+    /// The Sponge's flow, 1..=100 percent (0.224.0; default 50).
+    sponge_flow: u8,
+    /// The tones the Dodge and Burn reach (0.224.0; default Midtones).
+    tone_range: aurora_brush::ToneRange,
+    /// The Sponge's mode (0.224.0; default Desaturate).
+    sponge_mode: aurora_brush::SpongeMode,
 }
 
 /// The Smudge's default strength, percent (0.222.0).
@@ -25833,6 +25911,11 @@ impl Default for ToolSettings {
             smudge_strength: DEFAULT_SMUDGE_STRENGTH,
             blur_strength: DEFAULT_SMUDGE_STRENGTH,
             sharpen_strength: DEFAULT_SMUDGE_STRENGTH,
+            dodge_exposure: DEFAULT_SMUDGE_STRENGTH,
+            burn_exposure: DEFAULT_SMUDGE_STRENGTH,
+            sponge_flow: DEFAULT_SMUDGE_STRENGTH,
+            tone_range: aurora_brush::ToneRange::Midtones,
+            sponge_mode: aurora_brush::SpongeMode::Desaturate,
         }
     }
 }
@@ -25849,11 +25932,14 @@ impl ToolSettings {
             strength: self.smudge_strength,
             blur_strength: self.blur_strength,
             sharpen_strength: self.sharpen_strength,
+            dodge_exposure: self.dodge_exposure,
+            burn_exposure: self.burn_exposure,
+            sponge_flow: self.sponge_flow,
         }
     }
 
-    /// Sets the strength of `tool` (the Smudge, Blur or Sharpen; any other
-    /// tool has none) from a slider value (rounded, clamped to 1..=100;
+    /// Sets the strength of `tool` (the Smudge, Blur, Sharpen, or the Dodge's
+    /// and Burn's exposure and the Sponge's flow; any other tool has none) from a slider value (rounded, clamped to 1..=100;
     /// non-finite refused). Returns whether it changed.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn set_strength(&mut self, tool: aurora_ui::Tool, value: f64) -> bool {
@@ -25865,6 +25951,9 @@ impl ToolSettings {
             aurora_ui::Tool::Smudge => &mut self.smudge_strength,
             aurora_ui::Tool::Blur => &mut self.blur_strength,
             aurora_ui::Tool::Sharpen => &mut self.sharpen_strength,
+            aurora_ui::Tool::Dodge => &mut self.dodge_exposure,
+            aurora_ui::Tool::Burn => &mut self.burn_exposure,
+            aurora_ui::Tool::Sponge => &mut self.sponge_flow,
             _ => return false,
         };
         let changed = strength != *slot;
@@ -25988,6 +26077,12 @@ enum LockRefusal {
     BlurNeedsPixelLayer,
     /// The Sharpen with no pixel layer to work on (0.223.0).
     SharpenNeedsPixelLayer,
+    /// The Dodge with no pixel layer to work on (0.224.0).
+    DodgeNeedsPixelLayer,
+    /// The Burn with no pixel layer to work on (0.224.0).
+    BurnNeedsPixelLayer,
+    /// The Sponge with no pixel layer to work on (0.224.0).
+    SpongeNeedsPixelLayer,
     /// An undo or redo could not read the step's saved data back (0.210.0:
     /// a pixel-history spill file a temp-file cleaner removed, or a corrupt
     /// one). Not a lock; the step stays in the History panel.
@@ -26066,6 +26161,15 @@ impl LockRefusal {
             LockRefusal::SharpenNeedsPixelLayer => {
                 "Select a pixel layer to sharpen. A group, an adjustment layer or no layer can't be sharpened."
             }
+            LockRefusal::DodgeNeedsPixelLayer => {
+                "Select a pixel layer to dodge. A group, an adjustment layer or no layer can't be dodged."
+            }
+            LockRefusal::BurnNeedsPixelLayer => {
+                "Select a pixel layer to burn. A group, an adjustment layer or no layer can't be burned."
+            }
+            LockRefusal::SpongeNeedsPixelLayer => {
+                "Select a pixel layer to sponge. A group, an adjustment layer or no layer can't be sponged."
+            }
             LockRefusal::HistoryUnavailable => {
                 "Couldn't undo or redo: history file unavailable. A temp-file cleaner may have removed it; the step stays in the list."
             }
@@ -26120,6 +26224,9 @@ fn press_refusal(tool: aurora_ui::Tool, lock: aurora_doc::LayerLock) -> Option<L
         | aurora_ui::Tool::Smudge
         | aurora_ui::Tool::Blur
         | aurora_ui::Tool::Sharpen
+        | aurora_ui::Tool::Dodge
+        | aurora_ui::Tool::Burn
+        | aurora_ui::Tool::Sponge
         | aurora_ui::Tool::Gradient
         | aurora_ui::Tool::PaintBucket => match paint_permission(DabTool::Brush, lock) {
             PaintPermission::Refused(why) => Some(why),
@@ -26166,6 +26273,9 @@ fn lock_refusal_applies(
         || (refusal == LockRefusal::SmudgeNeedsPixelLayer && tool == aurora_ui::Tool::Smudge)
         || (refusal == LockRefusal::BlurNeedsPixelLayer && tool == aurora_ui::Tool::Blur)
         || (refusal == LockRefusal::SharpenNeedsPixelLayer && tool == aurora_ui::Tool::Sharpen)
+        || (refusal == LockRefusal::DodgeNeedsPixelLayer && tool == aurora_ui::Tool::Dodge)
+        || (refusal == LockRefusal::BurnNeedsPixelLayer && tool == aurora_ui::Tool::Burn)
+        || (refusal == LockRefusal::SpongeNeedsPixelLayer && tool == aurora_ui::Tool::Sponge)
         || (refusal == LockRefusal::WandNeedsPixelLayer && tool == aurora_ui::Tool::MagicWand)
         || (refusal == LockRefusal::SelectionTooLarge
             && matches!(
@@ -26225,7 +26335,10 @@ impl ToolSettings {
             | aurora_ui::Tool::CloneStamp
             | aurora_ui::Tool::Smudge
             | aurora_ui::Tool::Blur
-            | aurora_ui::Tool::Sharpen => Some(self.brush_radius),
+            | aurora_ui::Tool::Sharpen
+            | aurora_ui::Tool::Dodge
+            | aurora_ui::Tool::Burn
+            | aurora_ui::Tool::Sponge => Some(self.brush_radius),
             aurora_ui::Tool::Eraser => Some(self.eraser_radius),
             aurora_ui::Tool::Move
             | aurora_ui::Tool::MarqueeSelect
@@ -26261,7 +26374,10 @@ impl ToolSettings {
             | aurora_ui::Tool::CloneStamp
             | aurora_ui::Tool::Smudge
             | aurora_ui::Tool::Blur
-            | aurora_ui::Tool::Sharpen => &mut self.brush_radius,
+            | aurora_ui::Tool::Sharpen
+            | aurora_ui::Tool::Dodge
+            | aurora_ui::Tool::Burn
+            | aurora_ui::Tool::Sponge => &mut self.brush_radius,
             aurora_ui::Tool::Eraser => &mut self.eraser_radius,
             _ => return false,
         };
@@ -30247,6 +30363,22 @@ impl App {
             self.sync_status_bar_now();
             return;
         }
+        // The Dodge, Burn and Sponge (0.224.0): a press needs a pixel layer
+        // the lock allows.
+        if let Some(kind) = tone_stamp::kind_of(self.tool)
+            && button == PointerButton::Primary
+            && let Some(why) = tone_stamp::press(
+                kind,
+                active_pixel_layer(&self.doc.layers, self.doc.active_layer).is_some(),
+                self.doc.active_layer.and_then(|id| {
+                    press_refusal(self.tool, self.doc.layers.lock(id).unwrap_or_default())
+                }),
+            )
+        {
+            self.lock_notice = Some((why, self.doc.active_layer));
+            self.sync_status_bar_now();
+            return;
+        }
         // The Paint Bucket fills on the press itself (0.209.0): no drag.
         if self.tool == aurora_ui::Tool::PaintBucket && button == PointerButton::Primary {
             let doc_point = self.doc.canvas_view.to_document(canvas_point);
@@ -30390,6 +30522,11 @@ impl App {
         // filtered dab.
         if filter_stamp::drag_filter(self.drag.as_ref()).is_some() {
             self.filter_dab(doc_point);
+            return;
+        }
+        // The Dodge, Burn and Sponge (0.224.0) likewise.
+        if tone_stamp::drag_tone(self.drag.as_ref()).is_some() {
+            self.tone_dab(doc_point);
             return;
         }
         // The Pencil (0.220.0) is the Brush's drag with a hard dab.
@@ -30666,6 +30803,67 @@ impl App {
                 failed = outcome.failed().len(),
                 painted = outcome.painted().len(),
                 "failed to blur or sharpen part of a dab"
+            );
+        }
+    }
+
+    /// One Dodge, Burn or Sponge dab at `doc_point` (0.224.0):
+    /// [`Self::filter_dab`]'s preconditions, locks, selection, invalidation
+    /// and per-stroke warning dedupe, with
+    /// [`tone_stamp::tone_dab_through_selection`] as the stamp. Never runs in
+    /// Quick Mask (the press is refused there). A transparency lock changes
+    /// nothing: these tools never change alpha.
+    fn tone_dab(&mut self, doc_point: (f32, f32)) {
+        if self.quick_mask.is_some() {
+            return;
+        }
+        let Some(layer_id) = self.doc.active_layer else {
+            return;
+        };
+        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.doc.layers.kind(layer_id).cloned()
+        else {
+            return;
+        };
+        let Some(surface) = self.doc.layers.surface_id(layer_id) else {
+            return;
+        };
+        if let PaintPermission::Refused(why) = paint_permission(
+            DabTool::Brush,
+            self.doc.layers.lock(layer_id).unwrap_or_default(),
+        ) {
+            self.lock_notice = Some((why, Some(layer_id)));
+            return;
+        }
+        let selection = self.doc.selection.active();
+        let Some(store) = self.doc.tile_store.as_mut() else {
+            return;
+        };
+        let outcome = tone_stamp::tone_dab_through_selection(
+            store,
+            surface,
+            bounds,
+            doc_point,
+            selection,
+            &self.tool_settings,
+            &mut self.drag,
+        );
+        let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
+        invalidate_painted_tiles(
+            &mut self.doc.composite_cache,
+            &self.doc.layers,
+            layer_id,
+            outcome.painted(),
+            reference_origin,
+        );
+        let fresh = unwarned_failures(&mut self.drag, &outcome);
+        for (tile, err) in &fresh {
+            tracing::warn!(
+                ?err,
+                ?tile,
+                first_failures = fresh.len(),
+                failed = outcome.failed().len(),
+                painted = outcome.painted().len(),
+                "failed to dodge, burn or sponge part of a dab"
             );
         }
     }
@@ -68605,6 +68803,9 @@ mod tests {
                         | Tool::Smudge
                         | Tool::Blur
                         | Tool::Sharpen
+                        | Tool::Dodge
+                        | Tool::Burn
+                        | Tool::Sponge
                 ),
                 "{tool:?}"
             );
@@ -69130,6 +69331,7 @@ mod tests {
                 clone: _,
                 smudge: _,
                 filter: _,
+                tone: _,
                 last_doc,
                 carry,
                 stroke,
@@ -69192,6 +69394,7 @@ mod tests {
             clone: None,
             smudge: None,
             filter: None,
+            tone: None,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: Some(aurora_brush::StrokeSnapshot::new(
@@ -69225,6 +69428,7 @@ mod tests {
                 clone: None,
                 smudge: None,
                 filter: None,
+                tone: None,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,
@@ -70338,6 +70542,7 @@ mod tests {
                 clone: None,
                 smudge: None,
                 filter: None,
+                tone: None,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,
@@ -70720,6 +70925,7 @@ mod tests {
             clone: None,
             smudge: None,
             filter: None,
+            tone: None,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
@@ -70761,6 +70967,7 @@ mod tests {
             clone: None,
             smudge: None,
             filter: None,
+            tone: None,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
@@ -71428,6 +71635,7 @@ mod tests {
             clone: None,
             smudge: None,
             filter: None,
+            tone: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71558,6 +71766,7 @@ mod tests {
             clone: None,
             smudge: None,
             filter: None,
+            tone: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71668,6 +71877,7 @@ mod tests {
             clone: None,
             smudge: None,
             filter: None,
+            tone: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71729,6 +71939,7 @@ mod tests {
             clone: None,
             smudge: None,
             filter: None,
+            tone: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71780,6 +71991,7 @@ mod tests {
             clone: None,
             smudge: None,
             filter: None,
+            tone: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71921,6 +72133,7 @@ mod tests {
             clone: None,
             smudge: None,
             filter: None,
+            tone: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -72068,6 +72281,7 @@ mod tests {
             clone: None,
             smudge: None,
             filter: None,
+            tone: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -77814,6 +78028,7 @@ mod tests {
                 clone: None,
                 smudge: None,
                 filter: None,
+                tone: None,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,

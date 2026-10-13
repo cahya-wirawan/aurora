@@ -103,13 +103,23 @@ pub enum Tool {
     /// Sharpens (unsharp mask) the active pixel layer's pixels under the
     /// brush (0.223.0): the same engine as the Blur.
     Sharpen,
+    /// Lightens the shadows, midtones or highlights of the active pixel
+    /// layer under the brush (0.224.0): real, via
+    /// `aurora_brush::tone_dab_covered` in `aurora-app`.
+    Dodge,
+    /// Darkens the shadows, midtones or highlights of the active pixel
+    /// layer under the brush (0.224.0): the Dodge's engine, reversed.
+    Burn,
+    /// Saturates or desaturates the active pixel layer under the brush
+    /// (0.224.0): the Dodge's engine, on colourfulness.
+    Sponge,
 }
 
 impl Tool {
     /// Every tool this enum has today, in the fixed order they're
     /// offered to the user (matches PLAN.md's own bullets: Move, Marquee
     /// Select, Zoom, Pan, Eyedropper, then Brush, Eraser, and the 0.209.0 fills Gradient and Paint Bucket).
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 21] = [
         Self::Move,
         Self::MarqueeSelect,
         Self::EllipticalMarquee,
@@ -126,6 +136,9 @@ impl Tool {
         Self::Smudge,
         Self::Blur,
         Self::Sharpen,
+        Self::Dodge,
+        Self::Burn,
+        Self::Sponge,
         Self::Gradient,
         Self::PaintBucket,
     ];
@@ -167,6 +180,9 @@ impl Tool {
             Self::Smudge => "Smudge",
             Self::Blur => "Blur",
             Self::Sharpen => "Sharpen",
+            Self::Dodge => "Dodge",
+            Self::Burn => "Burn",
+            Self::Sponge => "Sponge",
         }
     }
 
@@ -189,6 +205,8 @@ impl Tool {
             Self::CloneStamp | Self::Sharpen => 'S',
             Self::Smudge | Self::Blur => 'R',
             Self::Gradient | Self::PaintBucket => 'G',
+            Self::Dodge | Self::Burn => 'O',
+            Self::Sponge => 'P',
         }
     }
 
@@ -199,7 +217,9 @@ impl Tool {
     /// Lasso and `Shift+L` the Polygonal Lasso, 0.214.0; `B` the Brush and
     /// `Shift+B` the Pencil, 0.220.0; `R` the Smudge and `Shift+R` the Blur,
     /// and `Shift+S` the Sharpen, 0.223.0: Photoshop shares R among the three,
-    /// Aurora gives each its own chord).
+    /// Aurora gives each its own chord; `O` the Dodge and `Shift+O` the Burn,
+    /// and `Shift+P` the Sponge, 0.224.0: Photoshop shares O among the three,
+    /// and `Shift+P` is the free chord Aurora gives the Sponge).
     #[must_use]
     pub const fn shortcut_needs_shift(self) -> bool {
         matches!(
@@ -210,6 +230,8 @@ impl Tool {
                 | Self::Pencil
                 | Self::Blur
                 | Self::Sharpen
+                | Self::Burn
+                | Self::Sponge
         )
     }
 
@@ -260,11 +282,11 @@ mod tests {
 
     #[test]
     fn all_lists_every_variant_once() {
-        assert_eq!(Tool::ALL.len(), 18);
+        assert_eq!(Tool::ALL.len(), 21);
         let mut seen = Tool::ALL.to_vec();
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
-        assert_eq!(seen.len(), 18, "ALL must not repeat a variant");
+        assert_eq!(seen.len(), 21, "ALL must not repeat a variant");
     }
 
     #[test]
@@ -278,11 +300,11 @@ mod tests {
         chords.sort_unstable();
         chords.dedup();
         assert_eq!(chords.len(), Tool::ALL.len());
-        // Only the grouped G, M, L, B, R and S keys share a letter, and only by Shift.
+        // Only the grouped G, M, L, B, R, S and O keys share a letter, and only by Shift.
         let mut letters = keys;
         letters.sort_unstable();
         letters.dedup();
-        assert_eq!(letters.len(), Tool::ALL.len() - 6);
+        assert_eq!(letters.len(), Tool::ALL.len() - 7);
         assert_eq!(Tool::Lasso.shortcut_text(), "L");
         assert_eq!(Tool::PolygonalLasso.shortcut_text(), "Shift+L");
         assert_eq!(Tool::MagicWand.shortcut_text(), "W");
@@ -296,6 +318,9 @@ mod tests {
         assert_eq!(Tool::Smudge.shortcut_text(), "R");
         assert_eq!(Tool::Blur.shortcut_text(), "Shift+R");
         assert_eq!(Tool::Sharpen.shortcut_text(), "Shift+S");
+        assert_eq!(Tool::Dodge.shortcut_text(), "O");
+        assert_eq!(Tool::Burn.shortcut_text(), "Shift+O");
+        assert_eq!(Tool::Sponge.shortcut_text(), "Shift+P");
     }
 
     #[test]
