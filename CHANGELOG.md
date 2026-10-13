@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.223.0] - 2026-10-13
+
+### Added
+
+- Add the Blur and Sharpen tools: one filter engine, 3x3 [1 2 1] average
+
 ## [0.222.0] - 2026-10-13
 
 ### Added
