@@ -108,6 +108,10 @@ pub struct Workspace {
     /// [`Self::canvas_area`] (0.160.0); it is what grows and shrinks with
     /// the window.
     pub canvas_column: WidgetId,
+    /// The in-window menu bar (0.225.0, [`crate::menu_bar`]): the canvas
+    /// column's first child, above [`Self::options_bar`]; built hidden
+    /// (`aurora-app` shows it on Linux and Windows).
+    pub menu_bar: crate::menu_bar::MenuBar,
     /// The options bar (0.160.0): a horizontal `Role::Toolbar` across the
     /// top of the canvas column, holding the active tool's options
     /// (`aurora-app` puts [`crate::ToolControls`]' radius readout and
@@ -458,7 +462,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         Err(err) => unreachable!("root was just created by new_tree above: {err:?}"),
     };
 
-    let (canvas_column, options_bar, document_tabs, canvas_area) =
+    let (canvas_column, menu_bar, options_bar, document_tabs, canvas_area) =
         insert_canvas_column(&mut tree, root, scales);
     let selection_outline = match widgets::insert_selection_outline(&mut tree, canvas_area) {
         Ok(id) => id,
@@ -567,6 +571,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         layer_toolbar,
         layer_view: crate::layers_panel::LayersView::default(),
         canvas_column,
+        menu_bar,
         options_bar,
         document_tabs,
         canvas_area,
@@ -852,7 +857,13 @@ fn insert_canvas_column(
     tree: &mut WidgetTree<WidgetKind>,
     root: WidgetId,
     scales: &Scales,
-) -> (WidgetId, WidgetId, WidgetId, WidgetId) {
+) -> (
+    WidgetId,
+    crate::menu_bar::MenuBar,
+    WidgetId,
+    WidgetId,
+    WidgetId,
+) {
     // The only element that grows: once the tools panel claims its
     // content width, the rail its fixed width and the divider none, the
     // canvas column absorbs whatever space is left. `min_size: 0` lets a
@@ -877,6 +888,11 @@ fn insert_canvas_column(
     ) {
         Ok(id) => id,
         Err(err) => unreachable!("root was just created by new_tree above: {err:?}"),
+    };
+    // 0.225.0: the menu bar, hidden until the app shows it.
+    let menu_bar = match crate::menu_bar::insert_menu_bar(tree, canvas_column, scales) {
+        Ok(bar) => bar,
+        Err(err) => unreachable!("canvas_column was just inserted: {err:?}"),
     };
     let mut options_node = Node::new(Role::Toolbar);
     options_node.set_label(OPTIONS_BAR_LABEL);
@@ -914,7 +930,13 @@ fn insert_canvas_column(
     if let Err(err) = crate::document_tabs::link_document_panel(tree, document_tabs, canvas_area) {
         unreachable!("both were just inserted: {err:?}");
     }
-    (canvas_column, options_bar, document_tabs, canvas_area)
+    (
+        canvas_column,
+        menu_bar,
+        options_bar,
+        document_tabs,
+        canvas_area,
+    )
 }
 
 /// The options bar's style: a row, never shrinking on its column's main
@@ -2814,9 +2836,11 @@ mod tests {
             .unwrap_or_default()
             .to_vec();
         let position = |id| children.iter().position(|&child| child == id);
-        assert_eq!(position(ws.options_bar), Some(0));
-        assert_eq!(position(ws.document_tabs), Some(1));
-        assert_eq!(position(ws.canvas_area), Some(2));
+        // 0.225.0: the (hidden) menu bar is the column's first child.
+        assert_eq!(position(ws.menu_bar.root), Some(0));
+        assert_eq!(position(ws.options_bar), Some(1));
+        assert_eq!(position(ws.document_tabs), Some(2));
+        assert_eq!(position(ws.canvas_area), Some(3));
         let bar = ws.tree.accessibility(ws.document_tabs).cloned();
         assert_eq!(
             bar.as_ref().map(accesskit::Node::role),
@@ -2886,5 +2910,40 @@ mod tests {
             ws.document_tabs,
             ws.canvas_area
         ));
+    }
+
+    /// 0.225.0: showing the menu bar takes exactly its height from the
+    /// canvas area and nothing from the rail or the tools panel; hiding it
+    /// restores the old geometry bit for bit.
+    #[test]
+    fn showing_the_menu_bar_costs_the_canvas_one_row_and_nothing_else() {
+        let measure = |shown: bool| {
+            let mut ws = super::build_workspace(&test_scales());
+            let bar = ws.menu_bar;
+            if let Err(err) = crate::set_menu_bar_shown(&mut ws.tree, &bar, shown) {
+                unreachable!("{err:?}");
+            }
+            ws.tree.compute_layout(1280.0, 800.0);
+            let rect = |id| bounds_of(&ws, id);
+            (
+                rect(ws.canvas_area),
+                rect(ws.rail),
+                rect(ws.tools.root),
+                rect(ws.menu_bar.root),
+                rect(ws.layers.root),
+                rect(ws.history.root),
+            )
+        };
+        let (canvas_off, rail_off, tools_off, bar_off, layers_off, history_off) = measure(false);
+        let (canvas_on, rail_on, tools_on, bar_on, layers_on, history_on) = measure(true);
+        assert_eq!(bar_off.height, 0, "hidden: no height");
+        assert!(bar_on.height > 0);
+        assert_eq!(canvas_on.width, canvas_off.width);
+        assert_eq!(canvas_on.y, canvas_off.y + i64::from(bar_on.height));
+        assert_eq!(canvas_on.height + bar_on.height, canvas_off.height);
+        assert_eq!(rail_on, rail_off, "the rail is untouched");
+        assert_eq!(tools_on, tools_off, "the tools panel is untouched");
+        assert_eq!(layers_on, layers_off, "panel floors are unchanged");
+        assert_eq!(history_on, history_off);
     }
 }

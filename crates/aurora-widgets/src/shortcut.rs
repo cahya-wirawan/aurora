@@ -303,6 +303,23 @@ impl<T> ShortcutRegistry<T> {
         self.bindings.get(&chord)
     }
 
+    /// Every chord bound to `command`, ordered by their display text so the
+    /// result is deterministic (0.225.0: the menus' shortcut hints).
+    #[must_use]
+    pub fn chords_for(&self, command: &T) -> Vec<KeyChord>
+    where
+        T: PartialEq,
+    {
+        let mut chords: Vec<KeyChord> = self
+            .bindings
+            .iter()
+            .filter(|(_, bound)| *bound == command)
+            .map(|(chord, _)| *chord)
+            .collect();
+        chords.sort_by_key(ToString::to_string);
+        chords
+    }
+
     /// Removes `chord`'s binding, if any, returning the command it used
     /// to map to.
     pub fn unbind(&mut self, chord: KeyChord) -> Option<T> {
@@ -549,5 +566,28 @@ mod tests {
         assert_eq!(registry.unbind(chord), Some(Command::Quit));
         assert_eq!(registry.resolve(chord), None);
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn chords_for_lists_every_chord_of_a_command_in_a_stable_order() {
+        let mut registry = ShortcutRegistry::new();
+        let bind =
+            |registry: &mut ShortcutRegistry<u8>, text: &str, command: u8| match KeyChord::parse(
+                text,
+            ) {
+                Ok(chord) => assert!(registry.bind(chord, command).is_ok()),
+                Err(err) => unreachable!("{err:?}"),
+            };
+        bind(&mut registry, "Ctrl+Z", 1);
+        bind(&mut registry, "Alt+Z", 1);
+        bind(&mut registry, "Ctrl+Y", 2);
+        let shown: Vec<String> = registry
+            .chords_for(&1)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(shown, ["Alt+Z", "Ctrl+Z"]);
+        assert_eq!(registry.chords_for(&2).len(), 1);
+        assert!(registry.chords_for(&3).is_empty());
     }
 }

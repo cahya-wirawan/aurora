@@ -557,6 +557,9 @@ mod filter_stamp;
 mod filter_stamp_tests;
 mod lasso_tools;
 mod layer_thumbnails;
+mod menu_bar_app;
+mod menu_bar_state;
+mod menu_model;
 mod prepared_pixels;
 mod psd_save;
 #[cfg(test)]
@@ -4710,6 +4713,11 @@ enum AccessibilityReaction {
     /// (0.208.0): the app applies it to the colours
     /// ([`AccessibilityEffects::colour`]).
     ColourControl(aurora_widgets::ActionOutcome),
+    /// An action on the in-window menu bar (0.225.0): a title's `Click`
+    /// or a popup item's `Click` (the toolkit has already removed the
+    /// popup); the app opens, closes or runs the command
+    /// ([`AccessibilityEffects::menu_bar`]).
+    MenuBar(aurora_widgets::ActionOutcome),
     /// A Layers-panel row group expanded or collapsed: the caller must
     /// reconcile its own row map ([`App::handle_accessibility_action`]).
     LayerRowExpanded { row: WidgetId, expanded: bool },
@@ -4729,6 +4737,7 @@ enum AccessibilityReaction {
 /// Layers-panel row. Free and platform-free, like [`handle_dialog_key`],
 /// so it is testable with no window or adapter; the caller performs the
 /// side effects the returned [`AccessibilityReaction`] names.
+#[allow(clippy::too_many_lines)] // one more reaction arm (0.225.0: menu bar) tipped it over
 fn route_accessibility_action(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
@@ -4782,6 +4791,9 @@ fn route_accessibility_action(
             workspace.document_tabs,
             request.target_node,
         );
+    // Read before the action: activating a popup item removes the popup.
+    let on_menu_bar = request.target_tree == aurora_widgets::ACCESSIBILITY_TREE_ID
+        && aurora_ui::is_menu_bar_part(&workspace.tree, request.target_node);
     let handled = aurora_widgets::handle_action(&mut workspace.tree, focus, request);
     if on_panel_tabs && handled.is_ok() {
         follow_panel_tabs(
@@ -4812,6 +4824,8 @@ fn route_accessibility_action(
                 AccessibilityReaction::LayerAction(action)
             } else if aurora_ui::is_colour_control(&workspace.tree, id) {
                 AccessibilityReaction::ColourControl(aurora_widgets::ActionOutcome::Activated(id))
+            } else if aurora_ui::is_menu_bar_part(&workspace.tree, id) {
+                AccessibilityReaction::MenuBar(aurora_widgets::ActionOutcome::Activated(id))
             } else if let Some(panel) = workspace.panel_strip.panel_for(id) {
                 open_from_panel_strip(workspace, focus, id);
                 AccessibilityReaction::PanelStrip(panel)
@@ -4832,6 +4846,9 @@ fn route_accessibility_action(
         }
         Ok(outcome) if aurora_ui::is_colour_control(&workspace.tree, request.target_node) => {
             AccessibilityReaction::ColourControl(outcome)
+        }
+        Ok(outcome @ aurora_widgets::ActionOutcome::MenuActivated { .. }) if on_menu_bar => {
+            AccessibilityReaction::MenuBar(outcome)
         }
         Ok(outcome)
             if layer_controls.is_some_and(|controls| {
@@ -5009,6 +5026,18 @@ struct AccessibilityEffects {
     /// A colour control an assistive technology used (0.208.0); the App
     /// applies it to the colours (`App::apply_colour_edit`).
     colour: Option<ColourEdit>,
+    /// A menu bar action an assistive technology took (0.225.0); the App
+    /// applies it (`App::apply_menu_bar_outcome`).
+    menu_bar: Option<MenuBarEdit>,
+}
+
+/// A menu bar action, reduced to comparable data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuBarEdit {
+    /// A title was clicked.
+    Activated(WidgetId),
+    /// A popup item was activated: the popup `menu`, the item `index`.
+    MenuActivated { menu: WidgetId, index: usize },
 }
 
 /// A colour control's accessibility action, reduced to comparable data
@@ -5334,6 +5363,22 @@ fn apply_accessibility_action(
                 close_tab: None,
                 layer_action: Some(action),
                 colour: None,
+                menu_bar: None,
+            };
+        }
+        AccessibilityReaction::MenuBar(outcome) => {
+            let menu_bar = match outcome {
+                aurora_widgets::ActionOutcome::Activated(id) => Some(MenuBarEdit::Activated(id)),
+                aurora_widgets::ActionOutcome::MenuActivated { menu, index } => {
+                    Some(MenuBarEdit::MenuActivated { menu, index })
+                }
+                _ => None,
+            };
+            return AccessibilityEffects {
+                relayout: true,
+                redraw: true,
+                menu_bar,
+                ..AccessibilityEffects::default()
             };
         }
         AccessibilityReaction::ColourControl(outcome) => {
@@ -5360,6 +5405,7 @@ fn apply_accessibility_action(
                 close_tab: None,
                 layer_action: None,
                 colour: None,
+                menu_bar: None,
             };
         }
         AccessibilityReaction::Handled(outcome) if in_gallery => {
@@ -5391,6 +5437,7 @@ fn apply_accessibility_action(
                 close_tab: Some(index),
                 layer_action: None,
                 colour: None,
+                menu_bar: None,
             };
         }
         AccessibilityReaction::PanelStrip(panel) => {
@@ -5430,6 +5477,7 @@ fn apply_accessibility_action(
         close_tab: None,
         layer_action: None,
         colour: None,
+        menu_bar: None,
     }
 }
 
@@ -5943,10 +5991,6 @@ const COMMAND_APP_QUIT: &str = "app.quit";
 /// Whether a native menu command may run while a modal dialog is open
 /// (0.175.0): only Quit, which itself waits for the dialog to close
 /// (`App::request_quit`'s pending quit) rather than being dropped.
-#[cfg_attr(
-    not(any(target_os = "macos", test)),
-    expect(dead_code, reason = "the native menu exists on macOS only")
-)]
 fn menu_command_allowed_with_dialog(id: &str) -> bool {
     id == COMMAND_APP_QUIT
 }
@@ -6450,6 +6494,10 @@ enum WidgetOwner {
     /// defaults buttons, and the colour picker popover a swatch opens
     /// (0.208.0): an outcome edits `App::colours`, never the document.
     ColourControls,
+    /// The in-window menu bar's titles and its open popup (0.225.0): an
+    /// outcome opens, switches or closes a menu, or runs a command through
+    /// [`activate_command`].
+    MenuBar,
 }
 
 /// A label-strip button's action (0.165.0): expands the rail with the
@@ -6874,6 +6922,9 @@ fn widget_owner(
     }
     if aurora_ui::is_colour_control(tree, id) {
         return Some(WidgetOwner::ColourControls);
+    }
+    if aurora_ui::is_menu_bar_part(tree, id) {
+        return Some(WidgetOwner::MenuBar);
     }
     if is_tool_button(tree, id) {
         return Some(WidgetOwner::ToolsPanel);
@@ -27195,6 +27246,9 @@ struct App {
     /// the Tools panel's swatches, the swap/reset commands and a colour
     /// picker popover edit it. Not document state, not persisted.
     colour: colour_state::ColourController,
+    /// The in-window menu bar's open menu (0.225.0,
+    /// [`menu_bar_state::MenuBarState`]); never document state.
+    menu_bar: menu_bar_state::MenuBarState,
     /// Every Layers-panel row's own `WidgetId`, mapped to the `LayerId`
     /// it represents (`aurora_ui::populate_layers_panel`'s own return
     /// value) — what [`Self::handle_pointer_pressed`] looks a
@@ -27503,6 +27557,16 @@ impl App {
         if let Some(layout_path) = layout_path.as_deref() {
             load_workspace_layout(layout_path, &mut workspace, &scales);
         }
+        // 0.225.0: the in-window menu bar, on Linux and Windows (macOS has
+        // its native menu); `AURORA_MENU_BAR=1`/`0` forces it either way.
+        let bar_shown = menu_model::menu_bar_enabled(
+            cfg!(target_os = "macos"),
+            std::env::var("AURORA_MENU_BAR").ok().as_deref(),
+        );
+        let menu_bar = workspace.menu_bar;
+        if let Err(err) = aurora_ui::set_menu_bar_shown(&mut workspace.tree, &menu_bar, bar_shown) {
+            tracing::warn!(?err, "failed to show the menu bar");
+        }
         let presets_path = layout_path
             .as_deref()
             .map(workspace_presets::presets_path_for);
@@ -27735,6 +27799,7 @@ impl App {
             quit_confirmed: false,
             quit_pending: false,
             colour: colour_state::ColourController::default(),
+            menu_bar: menu_bar_state::MenuBarState::default(),
             layer_rows,
             scroll_follow: ScrollFollow::default(),
             residency: None,
@@ -27858,6 +27923,20 @@ impl App {
         if let Some(action) = effects.layer_action {
             self.run_layer_action(action);
         }
+        if let Some(edit) = effects.menu_bar {
+            let outcome = match edit {
+                MenuBarEdit::Activated(id) => {
+                    PointerOutcome::Action(aurora_widgets::ActionOutcome::Activated(id))
+                }
+                MenuBarEdit::MenuActivated { menu, index } => {
+                    PointerOutcome::Action(aurora_widgets::ActionOutcome::MenuActivated {
+                        menu,
+                        index,
+                    })
+                }
+            };
+            self.apply_menu_bar_outcome(&outcome);
+        }
         if let Some(edit) = effects.colour {
             let effect =
                 self.colour
@@ -27935,6 +28014,9 @@ impl App {
             self.close_colour_popover_now(true);
             return;
         }
+        if self.menu_bar_key(key) {
+            return;
+        }
         if self.layer_row_key(key) {
             return;
         }
@@ -27971,6 +28053,7 @@ impl App {
                     }
                 }
                 WidgetOwner::ColourControls => self.apply_colour_outcome(&outcome),
+                WidgetOwner::MenuBar => self.apply_menu_bar_outcome(&outcome),
                 WidgetOwner::LayerToolbar => {
                     if let Some(action) = layer_toolbar_click(&self.workspace, &outcome) {
                         self.run_layer_action(action);
@@ -28052,6 +28135,20 @@ impl App {
             self.tool,
         );
         self.end_selection_drag_on_tool_switch(tool_before);
+        self.run_activated(picked);
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        // `Tab` may have moved focus onto or off the gallery's text field.
+        self.sync_ime();
+    }
+
+    /// Runs what a command activation (a shortcut, a palette entry, the
+    /// native menu, or — 0.225.0 — the in-window menu bar) resolved to: the
+    /// one dispatch every surface shares.
+    fn run_activated(&mut self, picked: Option<ActivatedCommand>) {
         match picked {
             Some(ActivatedCommand::OpenFile(path)) => self.open_file(&path),
             Some(ActivatedCommand::SaveFile(path)) => {
@@ -28104,13 +28201,6 @@ impl App {
             Some(ActivatedCommand::Dialog(result)) => self.run_dialog_result(&result),
             None => {}
         }
-        let window_size = self.window.as_ref().map(|window| window.inner_size());
-        if let Some(size) = window_size {
-            self.apply_resize((size.width, size.height));
-        }
-        self.push_accessibility();
-        // `Tab` may have moved focus onto or off the gallery's text field.
-        self.sync_ime();
     }
 
     /// Runs `command` (`AppCommand::Undo` or `::Redo`) against this
@@ -30024,6 +30114,7 @@ impl App {
         }
         self.update_gallery_hover(Some(position));
         self.update_toolbar_hover(Some(position));
+        self.update_menu_bar_hover(Some(position));
 
         if let Some(resize) = self.rail_resize {
             let new_width = resized_rail_width(resize, position.0);
@@ -31386,58 +31477,7 @@ impl App {
             event.id().as_ref(),
             &mut self.file_dialog,
         );
-        match picked {
-            Some(ActivatedCommand::OpenFile(path)) => self.open_file(&path),
-            Some(ActivatedCommand::SaveFile(path)) => {
-                let _saved = self.save_file(&path);
-            }
-            Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
-            Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
-            Some(ActivatedCommand::ToggleWidgetGallery) => self.toggle_widget_gallery(),
-            Some(ActivatedCommand::Quit) => {
-                let _ = self.request_quit();
-            }
-            Some(ActivatedCommand::NewLayer) => self.run_layer_command(LayerCommand::New),
-            Some(ActivatedCommand::DeleteLayer) => self.run_layer_command(LayerCommand::Delete),
-            Some(ActivatedCommand::NewCurvesLayer) => {
-                self.run_layer_command(LayerCommand::NewCurves);
-            }
-            Some(ActivatedCommand::NewLevelsLayer) => {
-                self.run_layer_command(LayerCommand::NewLevels);
-            }
-            Some(ActivatedCommand::NewHueSaturationLayer) => {
-                self.run_layer_command(LayerCommand::NewHueSaturation);
-            }
-            Some(ActivatedCommand::NewGroup) => self.run_layer_command(LayerCommand::NewGroup),
-            Some(ActivatedCommand::SetClip(on)) => {
-                self.run_layer_command(LayerCommand::SetClip(on));
-            }
-            Some(ActivatedCommand::ToggleClip) => {
-                let on = !self
-                    .doc
-                    .active_layer
-                    .is_some_and(|layer| self.doc.layers.clipped(layer));
-                self.run_layer_command(LayerCommand::SetClip(on));
-            }
-            Some(ActivatedCommand::SwapColours) => self.swap_colours(),
-            Some(ActivatedCommand::ResetColours) => self.reset_colours(),
-            Some(ActivatedCommand::Selection(command)) => self.run_selection_command(command),
-            Some(ActivatedCommand::ToggleQuickMask) => self.toggle_quick_mask(),
-            Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
-            Some(ActivatedCommand::SetSelectionMode(mode)) => self.set_selection_mode(mode),
-            Some(ActivatedCommand::RefinePrompt(kind)) => self.open_refine_prompt(kind),
-            Some(ActivatedCommand::RefineApply(kind, amount)) => self.run_refine(kind, amount),
-            Some(ActivatedCommand::SavedSelection(command)) => self.run_saved_selection(command),
-            Some(ActivatedCommand::MovePanel(panel, direction)) => {
-                self.move_panel(panel, direction);
-            }
-            Some(ActivatedCommand::ResetPanels) => self.reset_panels(),
-            Some(ActivatedCommand::SetPanelFloating(p, f)) => self.float_panel(p, f),
-            Some(ActivatedCommand::Workspace(command)) => self.run_workspace_command(command),
-            Some(ActivatedCommand::Document(command)) => self.run_document_command(command),
-            Some(ActivatedCommand::Dialog(result)) => self.run_dialog_result(&result),
-            None => {}
-        }
+        self.run_activated(picked);
         self.push_accessibility();
     }
 
@@ -31586,6 +31626,7 @@ impl App {
     fn route_gallery(&mut self, phase: PointerPhase, position: (f32, f32)) -> bool {
         if phase == PointerPhase::Down && self.dialog.is_none() && self.command_palette.is_none() {
             self.light_dismiss_colour_popover(position);
+            self.light_dismiss_menu_bar(position);
         }
         let controls = self.layer_controls.controls;
         let tool_controls = self.tool_controls;
@@ -31637,6 +31678,11 @@ impl App {
                 && let Some(outcome) = routed.outcome.as_ref()
             {
                 self.apply_colour_outcome(outcome);
+            }
+            if routed.owner == Some(WidgetOwner::MenuBar)
+                && let Some(outcome) = routed.outcome.as_ref()
+            {
+                self.apply_menu_bar_outcome(outcome);
             }
             if routed.owner == Some(WidgetOwner::ToolsPanel)
                 && let Some(tool) = routed
@@ -32498,6 +32544,7 @@ impl App {
     /// paths themselves ([`refresh_properties_panel`]).
     fn sync_tool_controls_now(&mut self) {
         self.sync_colours_now();
+        self.sync_menu_bar_now();
         let captured = self.gallery_click.captured();
         if sync_tool_controls(
             &mut self.workspace,
@@ -33788,6 +33835,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.settle_layer_controls_drag();
                 self.update_gallery_hover(None);
                 self.update_toolbar_hover(None);
+                self.update_menu_bar_hover(None);
             }
             _ => {}
         }
@@ -36214,6 +36262,7 @@ mod tests {
                         close_tab: None,
                         layer_action: None,
                         colour: None,
+                        menu_bar: None,
                     },
                     "{tool:?}"
                 );
@@ -36410,6 +36459,7 @@ mod tests {
             close_tab: None,
             layer_action: None,
             colour: None,
+            menu_bar: None,
         };
 
         /// A group `g` holding `c`, plus a top-level `top`.
@@ -90947,3 +90997,6 @@ mod gpu_adjustment_tests;
 
 #[cfg(test)]
 mod fill_tests;
+
+#[cfg(test)]
+mod menu_bar_tests;

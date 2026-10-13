@@ -49,6 +49,7 @@ pub mod layer_filter;
 pub mod layer_toolbar;
 pub mod layers_panel;
 pub mod levels_controls;
+pub mod menu_bar;
 pub mod panel;
 pub mod panel_group;
 pub mod panel_strip;
@@ -134,6 +135,10 @@ pub use layers_panel::{
     layer_row_part, layer_row_thumbnail, layer_thumbnail_side, populate_layers_panel,
     populate_layers_panel_view, reset_layers_panel, set_layer_row_selected,
     set_layer_row_thumbnail, sync_layer_row, visible_layer_rows,
+};
+pub use menu_bar::{
+    MENU_BAR_LABEL, MENU_BAR_TITLES, MenuBar, is_menu_bar_part, menu_bar_shown, menu_popup_width,
+    open_menu_under, set_menu_bar_hover, set_menu_bar_shown, sync_menu_bar_open,
 };
 pub use panel::{
     FLOATING_DESCRIPTION, PanelHandle, PanelSizing, clear_panel_body, close_panel, insert_panel,
