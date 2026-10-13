@@ -3485,3 +3485,37 @@ fn dab_cost_on_the_grid_is_small() {
         assert!(per < 20_000, "{per} us");
     }
 }
+
+#[test]
+fn entering_quick_mask_mid_stroke_commits_the_layer_stroke_first() {
+    let rig = Rig::new(rect(0, 0, 400, 300));
+    let layer_stroke = Some(Drag::Brush {
+        last_doc: (0.0, 0.0),
+        carry: 0.0,
+        stroke: Some(aurora_brush::StrokeSnapshot::new(rig.surface)),
+        warned: std::collections::HashSet::new(),
+    });
+    let mask_stroke = Some(Drag::Eraser {
+        last_doc: (0.0, 0.0),
+        carry: 0.0,
+        stroke: None,
+        warned: std::collections::HashSet::new(),
+    });
+    assert!(quick_mask::drag_needs_commit_before_enter(
+        layer_stroke.as_ref()
+    ));
+    assert!(!quick_mask::drag_needs_commit_before_enter(
+        mask_stroke.as_ref()
+    ));
+    assert!(!quick_mask::drag_needs_commit_before_enter(None));
+    assert!(!quick_mask::drag_needs_commit_before_enter(Some(
+        &Drag::Eyedropper
+    )));
+    // A mask stroke is dropped on leaving; a layer stroke is not.
+    let mut drag = mask_stroke;
+    quick_mask::drop_mask_stroke(&mut drag);
+    assert!(drag.is_none());
+    let mut drag = layer_stroke;
+    quick_mask::drop_mask_stroke(&mut drag);
+    assert!(drag.is_some());
+}

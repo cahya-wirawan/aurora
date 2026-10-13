@@ -123,7 +123,7 @@ golden-image tests are `#[ignore]`d.
   unavailable meanwhile; leaving is one undo step "Quick Mask" (all selected = no
   selection, nothing selected = no selection with a notice). Mask strokes are not
   individually undoable, the mode is not saved, and nothing of this has been seen
-  live or on the Mac.
+  live or on the Mac. (A first version turned the mode off every event-loop turn; fixed.)
   Since 0.216.0 the selection can be reshaped: **Feather, Expand, Contract, Smooth
   and Border Selection** (palette and the macOS Edit menu), each asking for a number
   of pixels in the palette's prompt (the last value is remembered for the session),

@@ -48,6 +48,9 @@ pub(crate) struct SwitchContext<'a> {
     pub(crate) layer_rows: &'a mut HashMap<WidgetId, aurora_doc::LayerId>,
     pub(crate) scroll_follow: &'a mut ScrollFollow,
     pub(crate) drag: &'a mut Option<Drag>,
+    /// Quick Mask (0.217.0): left, applying the grid to the outgoing
+    /// document, by [`commit_live_gestures`].
+    pub(crate) quick_mask: &'a mut Option<crate::quick_mask::QuickMaskMode>,
     pub(crate) layer_controls: &'a mut LayerControlsState,
     pub(crate) curves_ui: &'a mut CurvesUiState,
     pub(crate) tool_controls: Option<aurora_ui::ToolControls>,
@@ -129,12 +132,17 @@ pub(crate) enum SwitchOutcome {
 /// Commits every live gesture into the active (outgoing) document's own
 /// history (step 1 above). Returns whether anything was recorded.
 pub(crate) fn commit_live_gestures(cx: &mut SwitchContext<'_>) -> bool {
+    // Quick Mask ends with the document that holds it: its grid becomes
+    // that document's selection before anything else is committed.
+    let left = crate::quick_mask::leave_for_switch(cx.quick_mask, cx.workspace, cx.doc)
+        .is_some_and(|outcome| outcome != crate::quick_mask::LeaveOutcome::Unchanged);
     // Every path that stops a session being active starts here, so this
     // is where its Layers filter is saved (0.199.0).
     cx.doc
         .layer_filter
         .clone_from(&cx.workspace.layer_view.filter);
-    let mut recorded = end_layer_control_gestures(
+    let mut recorded = left;
+    recorded |= end_layer_control_gestures(
         &mut LayerControlEdit {
             workspace: cx.workspace,
             layers: &mut cx.doc.layers,

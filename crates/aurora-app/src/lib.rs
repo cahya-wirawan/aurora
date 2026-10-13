@@ -27838,6 +27838,7 @@ impl App {
             layer_rows: &mut self.layer_rows,
             scroll_follow: &mut self.scroll_follow,
             drag: &mut self.drag,
+            quick_mask: &mut self.quick_mask,
             layer_controls: &mut self.layer_controls,
             curves_ui: &mut self.curves_ui,
             tool_controls: self.tool_controls,
@@ -27875,7 +27876,6 @@ impl App {
     /// Makes the open document with this raw id active (0.172.0) — the
     /// palette's "Document: `name`" and Next/Previous Document.
     fn activate_document(&mut self, raw: u64) {
-        self.leave_quick_mask(true);
         let target = self
             .shelf
             .tab_order(&self.doc)
@@ -27901,7 +27901,6 @@ impl App {
     /// through the same `switch_document` `Ctrl+Tab` runs (or puts the
     /// strip back when the switch is refused).
     fn follow_document_tabs_now(&mut self) {
-        self.leave_quick_mask(true);
         let outcome = {
             let mut cx = self.switch_context();
             document_tabs::follow_document_tabs(&mut cx)
@@ -27924,7 +27923,6 @@ impl App {
         if self.dialog.is_some() {
             return;
         }
-        self.leave_quick_mask(true);
         let canvas_size = self.doc.canvas_size;
         let (layers, mut history, _layer) = document_from_size("Layer 1", canvas_size);
         history.clear_undo();
@@ -28341,7 +28339,6 @@ impl App {
     /// finished open with no pending store (which cannot adopt tiles
     /// staged under another store's root) is reported as a failed open.
     fn install_finished_open(&mut self, finished: FinishedOpen) {
-        self.leave_quick_mask(true);
         let FinishedOpen {
             generation,
             path,
@@ -28565,7 +28562,6 @@ impl App {
         masks: Vec<PreparedMask>,
         canvas_size: (u32, u32),
     ) -> Option<usize> {
-        self.leave_quick_mask(true);
         // The opened file is the undo baseline -- see the `undo_order`
         // reset below for why this must agree with it.
         history.clear_undo();
@@ -28750,7 +28746,6 @@ impl App {
     /// still runs here, on the UI thread, because the live store is the
     /// UI thread's.
     fn open_aur_file(&mut self, path: &Path, bytes: &[u8]) -> bool {
-        self.leave_quick_mask(true);
         // Before the read, not after it as until 0.143.1: once the live
         // read has succeeded the current document's aliased tiles are
         // already overwritten, so every refusal that can still happen
@@ -30862,6 +30857,12 @@ impl App {
     /// says so and stays out. A live selection gesture ends first.
     fn enter_quick_mask(&mut self) {
         lasso_tools::cancel_selection_gesture(&mut self.drag, &mut self.doc.selection);
+        // A layer stroke in progress ends (and is recorded) first, so no
+        // stale pixel snapshot carries into the mode.
+        if quick_mask::drag_needs_commit_before_enter(self.drag.as_ref()) {
+            let ending = self.drag.take();
+            self.commit_drag(ending);
+        }
         match quick_mask::enter(self.doc.selection.active().as_ref(), self.doc.canvas_size) {
             Ok(mode) => {
                 self.quick_mask = Some(mode);
@@ -30879,14 +30880,7 @@ impl App {
         let Some(mode) = self.quick_mask.take() else {
             return;
         };
-        // A mask stroke in progress has no pixel snapshot: it must not go
-        // on painting the layer once the mode is gone.
-        if matches!(
-            self.drag,
-            Some(Drag::Brush { stroke: None, .. } | Drag::Eraser { stroke: None, .. })
-        ) {
-            self.drag = None;
-        }
+        quick_mask::drop_mask_stroke(&mut self.drag);
         let emptied = apply
             && quick_mask::leave(
                 &mode,
@@ -30896,13 +30890,7 @@ impl App {
                 &mut self.doc.pixel_history,
                 &mut self.doc.selection,
             ) == quick_mask::LeaveOutcome::Emptied;
-        if let Err(err) = aurora_ui::sync_quick_mask_tint(
-            &mut self.workspace.tree,
-            self.workspace.selection_outline,
-            Vec::new(),
-        ) {
-            tracing::warn!(?err, "failed to clear the Quick Mask tint");
-        }
+        quick_mask::clear_tint(&mut self.workspace);
         self.lock_notice =
             emptied.then_some((LockRefusal::QuickMaskNothing, self.doc.active_layer));
         self.sync_status_bar_now();

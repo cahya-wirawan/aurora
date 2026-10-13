@@ -243,3 +243,75 @@ pub(crate) fn drag_layer<T>(on: bool, tool: aurora_ui::Tool, layer: Option<T>) -
 pub(crate) fn skips_lock_gate(on: bool, tool: aurora_ui::Tool) -> bool {
     on && matches!(tool, aurora_ui::Tool::Brush | aurora_ui::Tool::Eraser)
 }
+
+/// Ends a Brush or Eraser drag that has no stroke snapshot: such a drag
+/// belongs to Quick Mask (it paints the grid), and once the mode is gone it
+/// must not go on painting the layer with no undo.
+pub(crate) fn drop_mask_stroke(drag: &mut Option<crate::Drag>) {
+    use crate::Drag;
+    if matches!(
+        drag,
+        Some(Drag::Brush { stroke: None, .. } | Drag::Eraser { stroke: None, .. })
+    ) {
+        *drag = None;
+    }
+}
+
+/// Whether a drag in progress when the mode is entered must be committed
+/// first: a layer stroke (it holds a pixel snapshot) would otherwise carry
+/// on into the mode with a stale snapshot.
+#[must_use]
+pub(crate) fn drag_needs_commit_before_enter(drag: Option<&crate::Drag>) -> bool {
+    use crate::Drag;
+    matches!(
+        drag,
+        Some(
+            Drag::Brush {
+                stroke: Some(_),
+                ..
+            } | Drag::Eraser {
+                stroke: Some(_),
+                ..
+            }
+        )
+    )
+}
+
+/// Clears the overlay (the mode is over).
+pub(crate) fn clear_tint(workspace: &mut aurora_ui::Workspace) {
+    if let Err(err) = aurora_ui::sync_quick_mask_tint(
+        &mut workspace.tree,
+        workspace.selection_outline,
+        Vec::new(),
+    ) {
+        tracing::warn!(?err, "failed to clear the Quick Mask tint");
+    }
+}
+
+/// Leaves the mode because the document is stopping being the active one
+/// (a tab switch, New, Open, Close, quit): the grid becomes **that
+/// document's** selection as one "Quick Mask" step, before the document is
+/// parked. Called from `document_tabs::commit_live_gestures`, which every
+/// such path runs once, only when the change will really happen; it does
+/// nothing when the mode is off (so it is safe to call every time). The
+/// "selected nothing" notice is not shown (there is no longer a document it
+/// would describe).
+pub(crate) fn leave_for_switch(
+    mode: &mut Option<QuickMaskMode>,
+    workspace: &mut aurora_ui::Workspace,
+    doc: &mut crate::document_session::DocumentSession,
+) -> Option<LeaveOutcome> {
+    let mode = mode.take()?;
+    // A mask stroke still in `drag` has no snapshot and is ended with the
+    // other live gestures right after (`commit_drag_into_history`).
+    let outcome = leave(
+        &mode,
+        workspace,
+        &mut doc.undo_order,
+        &mut doc.history,
+        &mut doc.pixel_history,
+        &mut doc.selection,
+    );
+    clear_tint(workspace);
+    Some(outcome)
+}
