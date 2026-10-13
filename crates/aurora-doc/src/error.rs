@@ -113,6 +113,25 @@ pub enum DocError {
     /// never saved (or was already deleted).
     #[error("no selection saved under {0:?}")]
     UnknownSavedSelection(String),
+    /// [`crate::SelectionSet::save_active`] would pass
+    /// [`crate::MAX_SAVED_SELECTIONS`] saved selections (0.218.0).
+    #[error("at most 64 selections can be saved in one document")]
+    SavedSelectionsFull,
+    /// [`crate::SelectionSet::save_active`] would pass
+    /// [`crate::MAX_SAVED_SELECTION_BYTES`] of saved raster coverage
+    /// (0.218.0).
+    #[error("the saved selections would take more than 128 MiB; delete one first")]
+    SavedSelectionsTooLarge,
+    /// [`crate::SelectionSet::from_parts`] was given a saved selection with
+    /// no area that is not inverted: it would select nothing, which the
+    /// selection invariant never stores (0.218.1).
+    #[error("a saved selection with no area selects nothing")]
+    EmptySavedSelection,
+    /// A saved selection's name failed [`crate::validate_selection_name`],
+    /// or [`crate::SelectionSet::from_parts`] was given a repeated one
+    /// (0.218.0).
+    #[error("that is not a usable name for a saved selection")]
+    InvalidSelectionName,
     /// [`crate::History::save_journal`] failed. `postcard`'s own error
     /// type carries no useful structure for a caller to match on, so
     /// this holds its rendered message (via `to_string`) rather than

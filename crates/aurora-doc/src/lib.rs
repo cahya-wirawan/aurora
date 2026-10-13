@@ -64,13 +64,17 @@ pub use mask::{
     write_mask_coverage, write_mask_coverage_region,
 };
 pub use quick_mask::{QuickMask, QuickMaskOutcome};
-pub use selection::{Selection, SelectionSet, SelectionShape};
+pub use selection::{
+    MAX_SAVED_SELECTION_BYTES, MAX_SAVED_SELECTIONS, SELECTION_NAME_MAX_CHARS, Selection,
+    SelectionNameError, SelectionSet, SelectionShape, validate_selection_name,
+};
 pub use selection_build::{
     COORDINATE_LIMIT, MAX_POLYGON_VERTICES, SUBSCANLINES, antialiased_mask, polygon_mask,
 };
 pub use selection_combine::{SelectionMode, combine_selections};
 pub use selection_mask::{
-    BoundaryTrace, MAX_SELECTION_MASK_PIXELS, MAX_TRACE_RUNS, SelectionMask, TraceRun,
+    BoundaryTrace, MAX_SELECTION_MASK_PIXELS, MAX_TRACE_RUNS, PackedSelectionMask, SelectionMask,
+    TraceRun,
 };
 pub use selection_refine::{
     MAX_FEATHER_PX, MAX_REFINE_PX, MAX_REFINE_WORK, MAX_SMOOTH_PX, border, contract, expand,

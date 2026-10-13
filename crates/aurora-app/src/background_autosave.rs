@@ -858,6 +858,7 @@ mod tests {
                 crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
                 &mut self.store,
                 None,
+                None,
             ) {
                 crate::SnapshotOutcome::Taken(job) => job,
                 other => unreachable!("{other:?}"),
@@ -1326,6 +1327,7 @@ mod tests {
             crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
             &mut store,
             None,
+            None,
         ) {
             crate::SnapshotOutcome::Taken(job) => job,
             other => unreachable!("{other:?}"),
@@ -1345,6 +1347,7 @@ mod tests {
             (1024, 10),
             &mut aurora_io::SkippedTiles::new(),
             &mut store,
+            None,
             None,
         );
         let read = |path: &Path| -> Vec<(String, Vec<u8>)> {
@@ -1507,6 +1510,7 @@ mod tests {
             (10, 10),
             &mut aurora_io::SkippedTiles::new(),
             &mut doc.store,
+            None,
             None,
         );
         assert!(started.recv_timeout(WAIT).is_ok(), "the worker is writing");
@@ -1680,6 +1684,7 @@ mod tests {
             1,
             &mut doc.store,
             None,
+            None,
         );
         assert!(matches!(outcome, crate::SnapshotOutcome::OverBudget));
     }
@@ -1709,6 +1714,7 @@ mod tests {
             (10, 10),
             &mut aurora_io::SkippedTiles::new(),
             &mut second.store,
+            None,
             None,
         );
         assert_eq!(recovered(&path), Some(vec![("second".to_owned(), 0.75)]));
@@ -1767,6 +1773,7 @@ mod tests {
             aurora_tile::SAMPLES * 2,
             &mut store,
             None,
+            None,
         );
         assert!(matches!(outcome, crate::SnapshotOutcome::OverBudget));
         assert_eq!(
@@ -1783,6 +1790,7 @@ mod tests {
             &mut aurora_io::SkippedTiles::new(),
             aurora_tile::SAMPLES * 2 + aurora_tile::codec::MAX_ENCODED_LEN,
             &mut store,
+            None,
             None,
         );
         assert!(matches!(outcome, crate::SnapshotOutcome::Taken(_)));
@@ -1844,6 +1852,7 @@ mod tests {
                 crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
                 &mut store,
                 None,
+                None,
             ) {
                 crate::SnapshotOutcome::Taken(job) => job,
                 other => unreachable!("{other:?}"),
@@ -1864,6 +1873,7 @@ mod tests {
                 (SIDE, SIDE),
                 &mut aurora_io::SkippedTiles::new(),
                 &mut store,
+                None,
                 None,
             );
             let sync = started.elapsed();

@@ -97,7 +97,56 @@ fn us(v: u32) -> usize {
     usize::try_from(v).unwrap_or(usize::MAX)
 }
 
+/// A [`SelectionMask`]'s coverage, losslessly packed (0.218.0) so a
+/// selection undo step far back in history costs a fraction of the mask:
+/// `lz4` of the row-major bytes, exact on the way back
+/// ([`Self::unpack`]), which rebuilds the summary blocks (the cached
+/// boundary trace is recomputed on demand).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackedSelectionMask {
+    bounds: Rect,
+    bytes: Vec<u8>,
+}
+
+impl PackedSelectionMask {
+    /// The rectangle the mask covers.
+    #[must_use]
+    pub const fn bounds(&self) -> Rect {
+        self.bounds
+    }
+
+    /// The bytes this packed mask holds.
+    #[must_use]
+    pub fn packed_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// The mask this was packed from, bit for bit.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::SelectionMaskInvalid`] if the packed bytes do not
+    /// decode to exactly one byte per texel (they always do for a value
+    /// made by [`SelectionMask::pack`]).
+    pub fn unpack(&self) -> Result<SelectionMask, DocError> {
+        let size =
+            usize::try_from(self.bounds.area_px()).map_err(|_| DocError::SelectionMaskInvalid)?;
+        let data = lz4_flex::block::decompress(&self.bytes, size)
+            .map_err(|_| DocError::SelectionMaskInvalid)?;
+        SelectionMask::new(self.bounds, data)
+    }
+}
+
 impl SelectionMask {
+    /// The mask's coverage packed losslessly ([`PackedSelectionMask`]).
+    #[must_use]
+    pub fn pack(&self) -> PackedSelectionMask {
+        PackedSelectionMask {
+            bounds: self.bounds,
+            bytes: lz4_flex::block::compress(&self.data),
+        }
+    }
+
     /// A mask over `bounds` with one coverage byte per texel, row-major.
     ///
     /// # Errors
@@ -170,6 +219,13 @@ impl SelectionMask {
     #[must_use]
     pub const fn bounds(&self) -> Rect {
         self.bounds
+    }
+
+    /// The coverage bytes, row-major over [`Self::bounds`] (what a file
+    /// stores, 0.218.0).
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.data
     }
 
     /// The coverage byte of document texel `(x, y)`; `0` outside the grid.

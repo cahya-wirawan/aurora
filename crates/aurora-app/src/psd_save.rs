@@ -151,6 +151,18 @@ pub(crate) fn carried_losses(
     lines
 }
 
+/// The one report line for a document that has **saved named selections**
+/// (0.218.1): they are the user's data and a Photoshop file cannot carry
+/// them yet (PSD alpha channels wait for the Channels panel), so the save
+/// would leave them out. `None` when there are none. The *active*
+/// selection alone adds nothing: it is transient state, and listing it
+/// would make every PSD save of a document with a marquee "lossy" and ask
+/// first. (It is still not written to the PSD: a documented gap.)
+pub(crate) fn selection_loss_line(selection: &aurora_doc::SelectionSet) -> Option<String> {
+    (selection.saved_count() > 0)
+        .then(|| "Saved selections are not saved in a Photoshop file.".to_owned())
+}
+
 /// Records a PSD save on the document: a lossless one is a real save
 /// (clean, `.psd` path and name, through `document_close::after_save`);
 /// one with changes — Save Anyway included — leaves it untouched.

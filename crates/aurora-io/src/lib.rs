@@ -32,6 +32,7 @@
 //! `LayerTree`/`History` shape `.aur` does; writing PSD/PSB remains open.
 
 pub mod aur;
+mod aur_selection;
 mod channels;
 mod error;
 mod image;
