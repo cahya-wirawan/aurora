@@ -98,6 +98,12 @@ pub struct FillView {
     pub blur_strength: u8,
     /// Sharpen strength, 1 to 100 (0.223.0).
     pub sharpen_strength: u8,
+    /// Dodge exposure, 1 to 100 (0.224.0).
+    pub dodge_exposure: u8,
+    /// Burn exposure, 1 to 100 (0.224.0).
+    pub burn_exposure: u8,
+    /// Sponge flow, 1 to 100 (0.224.0).
+    pub sponge_flow: u8,
 }
 
 /// "Opacity 100 %".
@@ -110,6 +116,24 @@ pub fn opacity_readout_text(percent: u8) -> String {
 #[must_use]
 pub fn strength_readout_text(percent: u8) -> String {
     format!("Strength {percent} %")
+}
+
+/// What the shared slider is called for `tool` (0.224.0): "Exposure" for
+/// the Dodge and Burn, "Flow" for the Sponge, "Strength" for the rest. It
+/// is both the readout's word and the slider's accessible name.
+#[must_use]
+pub const fn strength_name(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Dodge | Tool::Burn => "Exposure",
+        Tool::Sponge => "Flow",
+        _ => "Strength",
+    }
+}
+
+/// "Exposure 50 %", "Flow 50 %" or "Strength 50 %": the readout for `tool`.
+#[must_use]
+pub fn strength_readout_for(tool: Tool, percent: u8) -> String {
+    format!("{} {percent} %", strength_name(tool))
 }
 
 /// "Tolerance 32".
@@ -294,11 +318,15 @@ pub fn sync_fill_controls(
             matches!(tool, Tool::PaintBucket | Tool::MagicWand),
         ),
         // The Smudge's Strength (0.222.0), shared by the Blur and the
-        // Sharpen (0.223.0), each with its own value; they keep the radius
+        // Sharpen (0.223.0) and, as Exposure or Flow, by the Dodge, Burn and
+        // Sponge (0.224.0), each with its own value; they keep the radius
         // controls.
         (
             fill.smudge,
-            matches!(tool, Tool::Smudge | Tool::Blur | Tool::Sharpen),
+            matches!(
+                tool,
+                Tool::Smudge | Tool::Blur | Tool::Sharpen | Tool::Dodge | Tool::Burn | Tool::Sponge
+            ),
         ),
     ] {
         changed |= set_item_shown(tree, group, shown)?;
@@ -328,13 +356,17 @@ pub fn sync_fill_controls(
     let strength = match tool {
         Tool::Blur => view.blur_strength,
         Tool::Sharpen => view.sharpen_strength,
+        Tool::Dodge => view.dodge_exposure,
+        Tool::Burn => view.burn_exposure,
+        Tool::Sponge => view.sponge_flow,
         _ => view.strength,
     };
     changed |= widgets::set_label_text(
         tree,
         fill.strength_readout,
-        &strength_readout_text(strength),
+        &strength_readout_for(tool, strength),
     )?;
+    changed |= widgets::set_slider_label(tree, fill.strength, strength_name(tool))?;
     changed |= sync_slider(tree, fill.strength, f64::from(strength), captured)?;
     Ok(changed)
 }
@@ -387,6 +419,9 @@ mod tests {
         strength: 50,
         blur_strength: 50,
         sharpen_strength: 50,
+        dodge_exposure: 50,
+        burn_exposure: 50,
+        sponge_flow: 50,
     };
 
     fn built() -> (crate::Workspace, ToolControls) {
@@ -492,6 +527,9 @@ mod tests {
             strength: 73,
             blur_strength: 50,
             sharpen_strength: 50,
+            dodge_exposure: 50,
+            burn_exposure: 50,
+            sponge_flow: 50,
         };
         assert!(sync(&mut ws, &controls, Tool::Gradient, view, None));
         assert!(!sync(&mut ws, &controls, Tool::Gradient, view, None));
@@ -633,5 +671,55 @@ mod tests {
         }
         sync(&mut ws, &controls, Tool::Eraser, view, None);
         assert!(!shown(&ws.tree, fill.smudge));
+    }
+
+    #[test]
+    fn the_toning_tools_share_the_group_under_their_own_name_and_value() {
+        use super::{strength_name, strength_readout_for};
+        let (mut ws, controls) = built();
+        let fill = controls.fill;
+        let view = FillView {
+            dodge_exposure: 21,
+            burn_exposure: 64,
+            sponge_flow: 77,
+            ..VIEW
+        };
+        assert_eq!(strength_name(Tool::Dodge), "Exposure");
+        assert_eq!(strength_name(Tool::Burn), "Exposure");
+        assert_eq!(strength_name(Tool::Sponge), "Flow");
+        assert_eq!(strength_name(Tool::Smudge), "Strength");
+        assert_eq!(strength_name(Tool::Blur), "Strength");
+        assert_eq!(strength_readout_for(Tool::Sponge, 5), "Flow 5 %");
+        for (tool, name, value) in [
+            (Tool::Dodge, "Exposure", 21.0),
+            (Tool::Burn, "Exposure", 64.0),
+            (Tool::Sponge, "Flow", 77.0),
+            (Tool::Smudge, "Strength", 50.0),
+        ] {
+            sync(&mut ws, &controls, tool, view, None);
+            ws.tree.compute_layout(1600.0, 900.0);
+            assert!(shown(&ws.tree, fill.smudge), "{tool:?}");
+            assert!(
+                shown(&ws.tree, controls.readout),
+                "{tool:?} keeps the radius"
+            );
+            let (slider_value, label) = match ws.tree.payload(fill.strength) {
+                Some(WidgetKind::Slider(s)) => (s.value, s.label.clone()),
+                other => unreachable!("{other:?}"),
+            };
+            assert!((slider_value - value).abs() < f64::EPSILON, "{tool:?}");
+            assert_eq!(label, name, "{tool:?}");
+            let node = ws
+                .tree
+                .accessibility(fill.strength)
+                .and_then(|n| n.label().map(str::to_owned));
+            assert_eq!(node.as_deref(), Some(name), "{tool:?} accessible name");
+            match ws.tree.payload(fill.strength_readout) {
+                Some(WidgetKind::Label(s)) => {
+                    assert_eq!(s.text, format!("{name} {value} %"), "{tool:?}");
+                }
+                other => unreachable!("{other:?}"),
+            }
+        }
     }
 }

@@ -230,7 +230,10 @@ pub(crate) fn tool_refusal(tool: aurora_ui::Tool) -> Option<LockRefusal> {
         | Tool::CloneStamp
         | Tool::Smudge
         | Tool::Blur
-        | Tool::Sharpen => Some(LockRefusal::QuickMaskToolUnavailable),
+        | Tool::Sharpen
+        | Tool::Dodge
+        | Tool::Burn
+        | Tool::Sponge => Some(LockRefusal::QuickMaskToolUnavailable),
         Tool::Move
         | Tool::Zoom
         | Tool::Pan

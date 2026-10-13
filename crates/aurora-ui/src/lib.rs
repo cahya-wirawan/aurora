@@ -58,6 +58,7 @@ pub mod redock;
 pub mod selection_mode_controls;
 pub mod selection_outline;
 pub mod status_bar;
+pub mod tone_controls;
 pub mod tool;
 pub mod tool_controls;
 pub mod tools_panel;
@@ -125,7 +126,8 @@ pub use colour_controls::{
 pub use fill_controls::{
     FillControls, FillView, OPACITY_MAX, OPACITY_MIN, STRENGTH_MAX, STRENGTH_MIN, TOLERANCE_MAX,
     TOLERANCE_MIN, insert_fill_controls, is_fill_tool, opacity_readout_text, shown_fill_group,
-    strength_readout_text, sync_fill_controls, tolerance_readout_text,
+    strength_name, strength_readout_for, strength_readout_text, sync_fill_controls,
+    tolerance_readout_text,
 };
 pub use layers_panel::{
     LayerRowPart, LayersView, layer_row_description, layer_row_height, layer_row_neighbor,
@@ -166,6 +168,10 @@ pub use status_bar::{
     QUICK_MASK_TEXT, STATUS_BAR_LABEL, StatusBar, StatusInfo, document_label_text, document_text,
     insert_status_bar, physical_zoom, sample_format_text, selection_text, status_bar_text,
     sync_status_bar, zoom_text,
+};
+pub use tone_controls::{
+    SPONGE_MODE_LABEL, TONE_RANGE_LABEL, ToneControls, has_tone_range, insert_tone_controls,
+    sponge_mode_label, sync_tone_controls, tone_range_label,
 };
 pub use tool::Tool;
 pub use tool_controls::{

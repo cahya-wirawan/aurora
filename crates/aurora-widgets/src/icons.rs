@@ -137,11 +137,17 @@ pub enum IconKind {
     /// A sharp triangle pointing up with a line down its middle: the
     /// Sharpen tool (0.223.0).
     Sharpen,
+    /// A circle on a stick, a lollipop: the Dodge tool (0.224.0).
+    Dodge,
+    /// A small flame: the Burn tool (0.224.0).
+    Burn,
+    /// A droplet inside a ring: the Sponge tool (0.224.0).
+    Sponge,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 38] = [
+    pub const ALL: [IconKind; 41] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -180,6 +186,9 @@ impl IconKind {
         IconKind::Smudge,
         IconKind::Blur,
         IconKind::Sharpen,
+        IconKind::Dodge,
+        IconKind::Burn,
+        IconKind::Sponge,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -225,6 +234,9 @@ impl IconKind {
             IconKind::Smudge => "Smudge",
             IconKind::Blur => "Blur",
             IconKind::Sharpen => "Sharpen",
+            IconKind::Dodge => "Dodge",
+            IconKind::Burn => "Burn",
+            IconKind::Sponge => "Sponge",
         }
     }
 }
@@ -759,6 +771,37 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
                 .closed(),
             stroke_part().m(8.0, 6.5).l(8.0, 10.5),
         ],
+        IconKind::Dodge => vec![
+            // A lollipop: the round head and its stick.
+            circle(PartStyle::Stroke, 8.0, 5.0, 3.5),
+            stroke_part().m(8.0, 8.5).l(8.0, 14.0),
+        ],
+        IconKind::Burn => vec![
+            // A flame (a point on top, a round belly) and a small tongue
+            // inside it.
+            stroke_part()
+                .m(8.0, 1.5)
+                .c([8.0, 1.5], [12.5, 6.0], [12.5, 10.0])
+                .c([12.5, 12.5], [10.5, 14.5], [8.0, 14.5])
+                .c([5.5, 14.5], [3.5, 12.5], [3.5, 10.0])
+                .c([3.5, 8.0], [5.0, 7.0], [5.5, 5.5])
+                .c([6.5, 6.5], [7.0, 6.0], [8.0, 1.5])
+                .closed(),
+            stroke_part()
+                .m(8.0, 9.5)
+                .c([6.8, 10.5], [6.5, 11.5], [8.0, 12.5]),
+        ],
+        IconKind::Sponge => vec![
+            // A ring and a small droplet inside it.
+            circle(PartStyle::Stroke, 8.0, 8.0, 6.0),
+            stroke_part()
+                .m(8.0, 4.5)
+                .c([8.0, 4.5], [5.5, 7.5], [5.5, 9.0])
+                .c([5.5, 10.4], [6.6, 11.5], [8.0, 11.5])
+                .c([9.4, 11.5], [10.5, 10.4], [10.5, 9.0])
+                .c([10.5, 7.5], [8.0, 4.5], [8.0, 4.5])
+                .closed(),
+        ],
         IconKind::PaintBucket => vec![
             // A tilted bucket (a diamond), the paint line across it, and
             // the drop pouring from its corner.
@@ -906,7 +949,7 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 38);
+        assert_eq!(IconKind::ALL.len(), 41);
         for kind in [IconKind::SwapArrows, IconKind::DefaultColours] {
             assert!(IconKind::ALL.contains(&kind));
             assert!(!icon_parts(kind).is_empty(), "{kind:?}");

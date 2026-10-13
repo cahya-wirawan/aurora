@@ -67,6 +67,9 @@ mod smudge_tests;
 mod stamp;
 #[cfg(test)]
 mod test_support;
+mod tone_brush;
+#[cfg(test)]
+mod tone_brush_tests;
 mod undo;
 #[cfg(test)]
 mod wand_tests;
@@ -87,6 +90,9 @@ pub use stamp::{
     stamp_dab_hard_covered, stamp_dab_hard_preserving_alpha,
     stamp_dab_hard_preserving_alpha_covered, stamp_dab_preserving_alpha,
     stamp_dab_preserving_alpha_covered, touched_tiles,
+};
+pub use tone_brush::{
+    MAX_TONE_DAB_TEXELS, SpongeMode, ToneOp, ToneRange, luminance, range_weight, tone_dab_covered,
 };
 pub use undo::{
     HistoryStats, PixelHistory, SPILL_BYTES_PER_CALL, SPILL_FILES_PER_CALL, StrokeSnapshot,

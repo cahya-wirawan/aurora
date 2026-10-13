@@ -1180,3 +1180,181 @@ fn the_options_bar_edits_the_blur_and_sharpen_strengths_each_on_its_own() {
     assert_eq!(bar.settings.sharpen_strength, 63);
     assert_eq!(bar.settings.smudge_strength, 50);
 }
+
+#[test]
+fn the_options_bar_edits_exposure_and_flow_each_on_its_own_under_their_own_name() {
+    use aurora_widgets::ActionOutcome as A;
+    let mut bar = Bar::new();
+    let fill = bar.controls.fill;
+    let label = |bar: &Bar, id| match bar.workspace.tree.payload(id) {
+        Some(WidgetKind::Label(s)) => s.text.clone(),
+        other => unreachable!("{other:?}"),
+    };
+    let slider_name = |bar: &Bar| match bar.workspace.tree.payload(fill.strength) {
+        Some(WidgetKind::Slider(s)) => s.label.clone(),
+        other => unreachable!("{other:?}"),
+    };
+    let node_name = |bar: &Bar| {
+        bar.workspace
+            .tree
+            .accessibility(fill.strength)
+            .and_then(|n| n.label().map(str::to_owned))
+    };
+    for (tool, word, value) in [
+        (Tool::Dodge, "Exposure", 21.0),
+        (Tool::Burn, "Exposure", 64.0),
+        (Tool::Sponge, "Flow", 77.0),
+        (Tool::Smudge, "Strength", 50.0),
+    ] {
+        crate::sync_tool_controls(
+            &mut bar.workspace,
+            Some(bar.controls),
+            tool,
+            &bar.settings,
+            None,
+        );
+        assert_eq!(slider_name(&bar), word, "{tool:?}");
+        assert_eq!(node_name(&bar).as_deref(), Some(word), "{tool:?}");
+        assert_eq!(
+            aurora_ui::shown_fill_group(&bar.workspace.tree, &bar.controls),
+            Some(Tool::Smudge)
+        );
+        if tool != Tool::Smudge {
+            assert!(bar.outcome(
+                tool,
+                A::ValueChanged {
+                    id: fill.strength,
+                    value
+                }
+            ));
+            assert!(!bar.outcome(
+                tool,
+                A::ValueChanged {
+                    id: fill.strength,
+                    value: f64::NAN
+                }
+            ));
+        }
+        assert_eq!(
+            label(&bar, fill.strength_readout),
+            format!("{word} {value} %"),
+            "{tool:?}"
+        );
+    }
+    assert_eq!(bar.settings.dodge_exposure, 21);
+    assert_eq!(bar.settings.burn_exposure, 64);
+    assert_eq!(bar.settings.sponge_flow, 77);
+    assert_eq!(bar.settings.smudge_strength, 50);
+    assert_eq!(bar.settings.blur_strength, 50);
+    // Switching back shows each tool's own value again.
+    crate::sync_tool_controls(
+        &mut bar.workspace,
+        Some(bar.controls),
+        Tool::Dodge,
+        &bar.settings,
+        None,
+    );
+    assert_eq!(label(&bar, fill.strength_readout), "Exposure 21 %");
+    // A tool with no Strength group does not show it.
+    crate::sync_tool_controls(
+        &mut bar.workspace,
+        Some(bar.controls),
+        Tool::Brush,
+        &bar.settings,
+        None,
+    );
+    assert_eq!(
+        aurora_ui::shown_fill_group(&bar.workspace.tree, &bar.controls),
+        None
+    );
+}
+
+#[test]
+fn the_range_and_mode_checkboxes_set_the_tone_settings_and_stay_radio_groups() {
+    use aurora_brush::{SpongeMode, ToneRange};
+    use aurora_widgets::ActionOutcome as A;
+    let mut bar = Bar::new();
+    let tone = bar.controls.tone;
+    assert_eq!(bar.settings.tone_range, ToneRange::Midtones);
+    assert_eq!(bar.settings.sponge_mode, SpongeMode::Desaturate);
+    let checked = |bar: &Bar, id| {
+        matches!(
+            bar.workspace.tree.payload(id),
+            Some(WidgetKind::Checkbox(s)) if s.checked == accesskit::Toggled::True
+        )
+    };
+    let shown = |bar: &Bar, id| {
+        bar.workspace
+            .tree
+            .style(id)
+            .is_some_and(|s| s.display != taffy::Display::None)
+    };
+    crate::sync_tool_controls(
+        &mut bar.workspace,
+        Some(bar.controls),
+        Tool::Burn,
+        &bar.settings,
+        None,
+    );
+    assert!(shown(&bar, tone.range_group));
+    assert!(!shown(&bar, tone.mode_group));
+    for range in ToneRange::ALL {
+        let _ = bar.outcome(
+            Tool::Burn,
+            A::Toggled {
+                id: tone.range_checkbox(range),
+                state: accesskit::Toggled::True,
+            },
+        );
+        assert_eq!(bar.settings.tone_range, range);
+        for other in ToneRange::ALL {
+            assert_eq!(
+                checked(&bar, tone.range_checkbox(other)),
+                other == range,
+                "{range:?} / {other:?}"
+            );
+        }
+    }
+    // Unchecking the one in force changes nothing and re-checks it.
+    let _ = bar.outcome(
+        Tool::Burn,
+        A::Toggled {
+            id: tone.range_checkbox(ToneRange::Highlights),
+            state: accesskit::Toggled::False,
+        },
+    );
+    assert!(checked(&bar, tone.highlights));
+    assert_eq!(bar.settings.tone_range, ToneRange::Highlights);
+
+    crate::sync_tool_controls(
+        &mut bar.workspace,
+        Some(bar.controls),
+        Tool::Sponge,
+        &bar.settings,
+        None,
+    );
+    assert!(!shown(&bar, tone.range_group));
+    assert!(shown(&bar, tone.mode_group));
+    let _ = bar.outcome(
+        Tool::Sponge,
+        A::Toggled {
+            id: tone.saturate,
+            state: accesskit::Toggled::True,
+        },
+    );
+    assert_eq!(bar.settings.sponge_mode, SpongeMode::Saturate);
+    assert!(checked(&bar, tone.saturate));
+    assert!(!checked(&bar, tone.desaturate));
+    // The range is the Dodge/Burn's alone: the Sponge's choice left it.
+    assert_eq!(bar.settings.tone_range, ToneRange::Highlights);
+    // Any other tool shows neither group.
+    crate::sync_tool_controls(
+        &mut bar.workspace,
+        Some(bar.controls),
+        Tool::Brush,
+        &bar.settings,
+        None,
+    );
+    assert!(!shown(&bar, tone.range_group));
+    assert!(!shown(&bar, tone.mode_group));
+}
