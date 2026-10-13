@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.224.0] - 2026-10-13
+
+### Added
+
+- Add the Dodge, Burn and Sponge tools: one toning engine on straight sRGB
+
 ## [0.223.0] - 2026-10-13
 
 ### Added
