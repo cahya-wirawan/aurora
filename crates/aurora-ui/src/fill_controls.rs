@@ -94,6 +94,10 @@ pub struct FillView {
     pub contiguous: bool,
     /// Smudge strength, 1 to 100 (0.222.0).
     pub strength: u8,
+    /// Blur strength, 1 to 100 (0.223.0).
+    pub blur_strength: u8,
+    /// Sharpen strength, 1 to 100 (0.223.0).
+    pub sharpen_strength: u8,
 }
 
 /// "Opacity 100 %".
@@ -196,7 +200,7 @@ pub fn insert_fill_controls(
         tree,
         smudge,
         scales,
-        "Smudge strength",
+        "Strength",
         50.0,
         STRENGTH_MIN,
         STRENGTH_MAX,
@@ -289,8 +293,13 @@ pub fn sync_fill_controls(
             fill.bucket,
             matches!(tool, Tool::PaintBucket | Tool::MagicWand),
         ),
-        // The Smudge's Strength (0.222.0); it keeps the radius controls.
-        (fill.smudge, tool == Tool::Smudge),
+        // The Smudge's Strength (0.222.0), shared by the Blur and the
+        // Sharpen (0.223.0), each with its own value; they keep the radius
+        // controls.
+        (
+            fill.smudge,
+            matches!(tool, Tool::Smudge | Tool::Blur | Tool::Sharpen),
+        ),
     ] {
         changed |= set_item_shown(tree, group, shown)?;
         changed |= set_node_hidden(tree, group, !shown)?;
@@ -316,17 +325,23 @@ pub fn sync_fill_controls(
     )?;
     changed |= sync_slider(tree, fill.tolerance, f64::from(view.tolerance), captured)?;
     changed |= sync_checkbox(tree, fill.contiguous, view.contiguous)?;
+    let strength = match tool {
+        Tool::Blur => view.blur_strength,
+        Tool::Sharpen => view.sharpen_strength,
+        _ => view.strength,
+    };
     changed |= widgets::set_label_text(
         tree,
         fill.strength_readout,
-        &strength_readout_text(view.strength),
+        &strength_readout_text(strength),
     )?;
-    changed |= sync_slider(tree, fill.strength, f64::from(view.strength), captured)?;
+    changed |= sync_slider(tree, fill.strength, f64::from(strength), captured)?;
     Ok(changed)
 }
 
 /// Whether the active tool's group is shown: `Some(tool)` for the group
-/// currently displayed.
+/// currently displayed (`Some(Tool::Smudge)` for the Strength group, which
+/// the Blur and the Sharpen share, 0.223.0).
 #[must_use]
 pub fn shown_fill_group(tree: &WidgetTree<WidgetKind>, controls: &ToolControls) -> Option<Tool> {
     let shown = |id| tree.style(id).is_some_and(|s| s.display != Display::None);
@@ -370,6 +385,8 @@ mod tests {
         tolerance: 32,
         contiguous: true,
         strength: 50,
+        blur_strength: 50,
+        sharpen_strength: 50,
     };
 
     fn built() -> (crate::Workspace, ToolControls) {
@@ -473,6 +490,8 @@ mod tests {
             tolerance: 200,
             contiguous: false,
             strength: 73,
+            blur_strength: 50,
+            sharpen_strength: 50,
         };
         assert!(sync(&mut ws, &controls, Tool::Gradient, view, None));
         assert!(!sync(&mut ws, &controls, Tool::Gradient, view, None));
@@ -572,5 +591,47 @@ mod tests {
         assert!(!shown(&ws.tree, fill.smudge));
         assert!(hidden_to_at(&ws.tree, fill.smudge));
         assert_eq!(shown_fill_group(&ws.tree, &controls), None);
+    }
+
+    #[test]
+    fn the_blur_and_sharpen_share_the_strength_group_each_with_its_own_value() {
+        let (mut ws, controls) = built();
+        let fill = controls.fill;
+        let view = FillView {
+            strength: 80,
+            blur_strength: 30,
+            sharpen_strength: 65,
+            ..VIEW
+        };
+        let read = |ws: &crate::Workspace| {
+            let value = match ws.tree.payload(fill.strength) {
+                Some(WidgetKind::Slider(s)) => s.value,
+                other => unreachable!("{other:?}"),
+            };
+            let text = match ws.tree.payload(fill.strength_readout) {
+                Some(WidgetKind::Label(s)) => s.text.clone(),
+                other => unreachable!("{other:?}"),
+            };
+            (value, text)
+        };
+        for (tool, value, text) in [
+            (Tool::Smudge, 80.0, "Strength 80 %"),
+            (Tool::Blur, 30.0, "Strength 30 %"),
+            (Tool::Sharpen, 65.0, "Strength 65 %"),
+        ] {
+            sync(&mut ws, &controls, tool, view, None);
+            ws.tree.compute_layout(1600.0, 900.0);
+            assert!(shown(&ws.tree, fill.smudge), "{tool:?}");
+            assert!(
+                shown(&ws.tree, controls.readout),
+                "{tool:?} keeps the radius"
+            );
+            assert!(!hidden_to_at(&ws.tree, fill.smudge), "{tool:?}");
+            let (v, t) = read(&ws);
+            assert!((v - value).abs() < f64::EPSILON, "{tool:?} {v}");
+            assert_eq!(t, text, "{tool:?}");
+        }
+        sync(&mut ws, &controls, Tool::Eraser, view, None);
+        assert!(!shown(&ws.tree, fill.smudge));
     }
 }

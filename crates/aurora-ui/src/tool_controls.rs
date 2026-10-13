@@ -526,7 +526,13 @@ mod tests {
         for tool in Tool::ALL {
             let radius = matches!(
                 tool,
-                Tool::Brush | Tool::Pencil | Tool::Eraser | Tool::CloneStamp | Tool::Smudge
+                Tool::Brush
+                    | Tool::Pencil
+                    | Tool::Eraser
+                    | Tool::CloneStamp
+                    | Tool::Smudge
+                    | Tool::Blur
+                    | Tool::Sharpen
             )
             .then_some(24.0);
             let _ = sync(&mut ws.tree, controls, tool, radius, None);

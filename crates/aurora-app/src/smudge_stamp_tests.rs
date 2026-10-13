@@ -143,7 +143,7 @@ fn the_strength_setting_mirrors_into_the_options_bar_view_and_the_dab() {
     let settings = crate::ToolSettings::default();
     assert_eq!(settings.fill_view().strength, 50);
     let mut s = crate::ToolSettings::default();
-    assert!(s.set_smudge_strength(25.0));
+    assert!(s.set_strength(aurora_ui::Tool::Smudge, 25.0));
     assert_eq!(s.fill_view().strength, 25);
     // The dab reads the setting.
     assert!((smudge_stamp::strength_fraction(&s) - 0.25).abs() < f32::EPSILON);

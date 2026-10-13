@@ -132,11 +132,16 @@ pub enum IconKind {
     /// A fingertip pressed down with a smeared trail under it: the Smudge
     /// tool (0.222.0).
     Smudge,
+    /// A soft droplet with a highlight arc: the Blur tool (0.223.0).
+    Blur,
+    /// A sharp triangle pointing up with a line down its middle: the
+    /// Sharpen tool (0.223.0).
+    Sharpen,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 36] = [
+    pub const ALL: [IconKind; 38] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -173,6 +178,8 @@ impl IconKind {
         IconKind::Pencil,
         IconKind::CloneStamp,
         IconKind::Smudge,
+        IconKind::Blur,
+        IconKind::Sharpen,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -216,6 +223,8 @@ impl IconKind {
             IconKind::Pencil => "Pencil",
             IconKind::CloneStamp => "Clone Stamp",
             IconKind::Smudge => "Smudge",
+            IconKind::Blur => "Blur",
+            IconKind::Sharpen => "Sharpen",
         }
     }
 }
@@ -726,6 +735,30 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
                 .m(2.0, 14.0)
                 .c([5.0, 11.0], [8.0, 15.0], [14.0, 12.0]),
         ],
+        IconKind::Blur => vec![
+            // A droplet (a point on top, a round belly) and a short arc
+            // inside its lower left: soft, rounded edges.
+            stroke_part()
+                .m(8.0, 2.0)
+                .c([8.0, 2.0], [3.0, 8.0], [3.0, 10.0])
+                .c([3.0, 12.8], [5.2, 14.5], [8.0, 14.5])
+                .c([10.8, 14.5], [13.0, 12.8], [13.0, 10.0])
+                .c([13.0, 8.0], [8.0, 2.0], [8.0, 2.0])
+                .closed(),
+            stroke_part()
+                .m(5.8, 10.0)
+                .c([5.8, 11.4], [6.6, 12.2], [8.0, 12.4]),
+        ],
+        IconKind::Sharpen => vec![
+            // A sharp triangle pointing up with a line down its middle:
+            // hard corners.
+            stroke_part()
+                .m(8.0, 2.0)
+                .l(14.0, 13.5)
+                .l(2.0, 13.5)
+                .closed(),
+            stroke_part().m(8.0, 6.5).l(8.0, 10.5),
+        ],
         IconKind::PaintBucket => vec![
             // A tilted bucket (a diamond), the paint line across it, and
             // the drop pouring from its corner.
@@ -873,7 +906,7 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 36);
+        assert_eq!(IconKind::ALL.len(), 38);
         for kind in [IconKind::SwapArrows, IconKind::DefaultColours] {
             assert!(IconKind::ALL.contains(&kind));
             assert!(!icon_parts(kind).is_empty(), "{kind:?}");

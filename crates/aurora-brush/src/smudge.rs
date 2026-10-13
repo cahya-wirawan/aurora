@@ -127,7 +127,7 @@ fn half_extent(radius: f32) -> i64 {
 
 /// Reads the layer under the patch square around `anchor` as premultiplied
 /// `f32` (see the module docs). `Err` is the tile that could not be read.
-fn gather_under(
+pub(crate) fn gather_under(
     store: &mut TileStore,
     surface: SurfaceId,
     anchor: (i64, i64),
