@@ -98,6 +98,16 @@ pub enum DocError {
     /// [`crate::MAX_POLYGON_VERTICES`] vertices.
     #[error("a selection outline of {0} points is too complex (the limit is 100,000)")]
     SelectionPolygonTooComplex(usize),
+    /// A selection refinement (0.216.0: Feather, Expand, Contract, Smooth,
+    /// Border) was given a parameter that is non-finite, negative or over
+    /// its cap.
+    #[error("that value is outside what the selection command accepts")]
+    SelectionRefineInvalid,
+    /// A selection refinement (0.216.0) would take more than
+    /// [`crate::MAX_REFINE_WORK`] (the estimate is held): refused before
+    /// any work, so the interface never freezes.
+    #[error("that selection is too large for this command (estimated work {0})")]
+    SelectionRefineTooExpensive(u64),
     /// [`crate::SelectionSet::load`] or
     /// [`crate::SelectionSet::delete_saved`] named a selection that was
     /// never saved (or was already deleted).

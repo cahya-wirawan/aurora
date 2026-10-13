@@ -42,6 +42,9 @@ mod selection_combine;
 #[cfg(test)]
 mod selection_combine_tests;
 mod selection_mask;
+mod selection_refine;
+#[cfg(test)]
+mod selection_refine_tests;
 #[cfg(test)]
 mod selection_tests;
 pub mod smart_object;
@@ -64,6 +67,10 @@ pub use selection_build::{
 pub use selection_combine::{SelectionMode, combine_selections};
 pub use selection_mask::{
     BoundaryTrace, MAX_SELECTION_MASK_PIXELS, MAX_TRACE_RUNS, SelectionMask, TraceRun,
+};
+pub use selection_refine::{
+    MAX_FEATHER_PX, MAX_REFINE_PX, MAX_REFINE_WORK, MAX_SMOOTH_PX, border, contract, expand,
+    feather, smooth,
 };
 pub use smart_object::{LinkedFile, SmartObject, SmartObjectBlock, SmartObjectError};
 pub use text_safety::sanitize_display_name;
