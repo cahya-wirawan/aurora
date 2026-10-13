@@ -13,6 +13,21 @@
 //! shown, composited or exported, as all layer content outside the canvas
 //! already is. Undo shifts everything back exactly.
 //!
+//! **Smart objects.** A smart-object layer's recorded placement
+//! (`SmartObject::bounds`, and the `SoLd` blocks behind it) is in document
+//! coordinates and is deliberately NOT shifted by a crop: the PSD writer
+//! keeps a smart object only while the layer's bounds still equal the
+//! recorded ones. So a crop at origin `(0, 0)` keeps every smart object,
+//! while ANY crop with `x > 0` or `y > 0` turns each smart-object layer into
+//! ordinary pixels at the next PSD save, named in the "Save With Changes?"
+//! report ("they were moved"); undoing the crop makes them smart objects
+//! again (pinned in `psd_save_tests::crop_and_smart_objects`).
+//!
+//! **Cost.** Shifting a selection ([`aurora_doc::SelectionMask::translated`])
+//! deep-copies a mask's coverage bytes (up to 64 Mpx), on the UI thread, for
+//! every crop and every undo/redo of one; the copy drops the cached boundary
+//! trace and breaks `Arc` sharing.
+//!
 //! This module is the pure part: the on-canvas rectangle ([`CropState`]:
 //! create, move, resize by eight handles, clamp to the canvas, double-click),
 //! the validation ([`validate`]) and the document operation
@@ -518,9 +533,14 @@ pub(crate) fn apply_pending_crop(
         return false;
     };
     if selection.translate(pending.dx, pending.dy).is_err() {
-        // Unreachable for shifts that were applied once; dropping the
-        // selection is the safe answer.
-        selection.deselect();
+        // `SelectionSet::translate` is all-or-nothing, so the set is
+        // unchanged here and every selection in it (the active one AND the
+        // saved ones) would sit at the wrong place after the canvas change.
+        // Only a shift that overflows `i64` gets here, which no shift that
+        // was applied once and is now undone, and no tool-made selection,
+        // can produce; the consistent answer is to drop them all rather
+        // than keep some at stale coordinates.
+        *selection = aurora_doc::SelectionSet::new();
     }
     *canvas_size = pending.canvas;
     true

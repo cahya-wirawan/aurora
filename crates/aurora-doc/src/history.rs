@@ -2124,6 +2124,64 @@ mod tests {
         assert!(mask.inverted);
     }
 
+    /// 0.226.0: a journal holding `Translate` (the Crop) replays to the live
+    /// tree, before and after an undo, a redo and a second shift, directly
+    /// and through the `postcard` journal bytes an `.aur` carries.
+    #[test]
+    fn replay_reconstructs_translated_layers_and_masks() {
+        let (_dir, mut store) = real_tile_store();
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let ok = |r: Result<crate::LayerId, DocError>| match r {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let base = ok(history.add_pixel_layer(&mut tree, "base", bounds(), None));
+        let group = ok(history.add_group(&mut tree, "g", None));
+        let kid = ok(history.add_pixel_layer(&mut tree, "kid", other_bounds(), Some(group)));
+        for id in [base, group, kid] {
+            if let Err(err) = history.add_mask(&mut tree, &mut store, id, other_bounds()) {
+                unreachable!("{err:?}");
+            }
+        }
+        let same = |history: &History, tree: &LayerTree| {
+            for replayed in [history.replay(), Ok(replayed_through_postcard(history))] {
+                let replayed = match replayed {
+                    Ok(tree) => tree,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                for id in [base, group, kid] {
+                    assert_eq!(replayed.bounds(id), tree.bounds(id), "bounds of {id:?}");
+                    assert_eq!(
+                        replayed.mask(id).map(|m| m.bounds),
+                        tree.mask(id).map(|m| m.bounds),
+                        "mask of {id:?}"
+                    );
+                }
+            }
+        };
+        let before = tree.bounds(base);
+        same(&history, &tree);
+        if let Err(err) = history.translate_all(&mut tree, -3, -2) {
+            unreachable!("{err:?}");
+        }
+        assert_ne!(tree.bounds(base), before, "the shift happened");
+        same(&history, &tree);
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.bounds(base), before);
+        same(&history, &tree);
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        same(&history, &tree);
+        if let Err(err) = history.translate_all(&mut tree, 7, 11) {
+            unreachable!("{err:?}");
+        }
+        same(&history, &tree);
+    }
+
     #[test]
     fn journal_len_grows_with_every_action_undo_and_redo() {
         let mut tree = LayerTree::new();

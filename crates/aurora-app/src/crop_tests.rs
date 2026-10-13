@@ -1071,3 +1071,31 @@ impl crate::FileDialogAccess for NoDialog {
         None
     }
 }
+
+#[test]
+fn a_pending_shift_that_cannot_apply_drops_every_selection_not_just_the_active_one() {
+    let mut order = UndoOrder {
+        pending_crop: Some(crop::PendingCrop {
+            dx: 5,
+            dy: 0,
+            canvas: (12, 9),
+        }),
+        ..UndoOrder::default()
+    };
+    let mut selection = SelectionSet::new();
+    selection.select(Selection::new(rect(1, 1, 2, 2)));
+    ok(selection.save_active("old"));
+    selection.select(Selection::new(rect(i64::MAX - 1, 0, 1, 1)));
+    let mut canvas = (1, 1);
+    assert!(apply_pending_crop(&mut order, &mut canvas, &mut selection));
+    assert_eq!(canvas, (12, 9), "the canvas size is applied regardless");
+    assert_eq!(selection.active(), None);
+    assert!(
+        selection.saved("old").is_none(),
+        "no saved selection left at stale coordinates"
+    );
+    assert!(
+        !apply_pending_crop(&mut order, &mut canvas, &mut selection),
+        "taken once"
+    );
+}

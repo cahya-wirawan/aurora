@@ -151,6 +151,11 @@ impl SelectionMask {
     /// mask whose bounds are shifted and whose bytes are the same; the
     /// cached boundary trace is rebuilt on first use.
     ///
+    /// **Cost:** a deep copy of the coverage bytes (up to
+    /// [`MAX_SELECTION_MASK_PIXELS`]) and of the block table, never an
+    /// `Arc` share: the copy has no cached trace and is a distinct
+    /// allocation for any byte accounting that de-duplicates by `Arc`.
+    ///
     /// # Errors
     ///
     /// [`DocError::SelectionMaskInvalid`] when the shifted origin leaves
