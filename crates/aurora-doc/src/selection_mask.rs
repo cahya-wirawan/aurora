@@ -188,6 +188,24 @@ impl SelectionMask {
             .unwrap_or(0)
     }
 
+    /// The coverage bytes of row `y` from column `x0` (inclusive) to `x1`
+    /// (exclusive), when that stretch lies inside the grid; `None`
+    /// otherwise.
+    #[must_use]
+    pub fn row_bytes(&self, y: i64, x0: i64, x1: i64) -> Option<&[u8]> {
+        if x1 < x0 || x0 < self.bounds.x || x1 > self.bounds.right() {
+            return None;
+        }
+        if y < self.bounds.y || y >= self.bounds.bottom() {
+            return None;
+        }
+        let ly = usize::try_from(y - self.bounds.y).ok()?;
+        let lx0 = usize::try_from(x0 - self.bounds.x).ok()?;
+        let lx1 = usize::try_from(x1 - self.bounds.x).ok()?;
+        let start = ly.checked_mul(us(self.bounds.width))?;
+        self.data.get(start + lx0..start + lx1)
+    }
+
     /// The coverage of texel `(x, y)` in `0..=1`.
     #[must_use]
     pub fn coverage_at(&self, x: i64, y: i64) -> f32 {

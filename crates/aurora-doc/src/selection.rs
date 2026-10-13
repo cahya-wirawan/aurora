@@ -219,6 +219,30 @@ impl Selection {
         }
     }
 
+    /// The coverage byte (`0..=255`) of the un-inverted shape at texel
+    /// `(x, y)`: `255`/`0` for a rectangle, `round(k/16 * 255)` for an
+    /// ellipse, the mask's own byte for a mask. The combination of
+    /// selections (0.215.0) works on these bytes.
+    #[must_use]
+    pub(crate) fn shape_byte_at(&self, x: i64, y: i64) -> u8 {
+        match &self.shape {
+            SelectionShape::Rect => {
+                if self.bounds.contains_point(x, y) {
+                    u8::MAX
+                } else {
+                    0
+                }
+            }
+            SelectionShape::Ellipse => {
+                // In 0..=255 after rounding a value in 0..=1.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let byte = (ellipse_coverage(&self.bounds, x, y) * 255.0).round() as u8;
+                byte
+            }
+            SelectionShape::Mask(mask) => mask.byte_at(x, y),
+        }
+    }
+
     /// A rectangle outside which [`Self::coverage_at`] is `0`: the bounds
     /// of a plain selection, `None` for an inverted one (everything
     /// outside the shape is covered, so no useful bound exists).

@@ -33,6 +33,7 @@ use aurora_tile::TileStore;
 
 use aurora_widgets::shortcut::{Key, NamedKey};
 
+use crate::selection_modes::ModeGesture;
 use crate::{Drag, LockRefusal, PointerButton, ToolSettings};
 
 /// The History row of a Lasso drag.
@@ -144,6 +145,7 @@ pub(crate) fn backoff_until(
 pub(crate) fn live_rebuild_step(
     points: &[(f32, f32)],
     clip: &Rect,
+    modal: &ModeGesture,
     selection: &mut aurora_doc::SelectionSet,
     current: &mut Option<Selection>,
     not_before: &mut Option<std::time::Instant>,
@@ -155,7 +157,7 @@ pub(crate) fn live_rebuild_step(
     if not_before.is_some_and(|t| started < t) {
         return;
     }
-    rebuild_live(points, clip, selection, current);
+    rebuild_live(points, clip, modal, selection, current);
     *not_before = backoff_until(started, started.elapsed());
 }
 
@@ -188,16 +190,17 @@ pub(crate) fn path_selection(
 }
 
 /// Rebuilds the live selection from `points` into `selection` and
-/// `current`. A path the caps refuse leaves both unchanged.
+/// `current`, combined by the gesture's mode (0.215.0). A path the caps
+/// refuse, or a combination the mask cap refuses, leaves both unchanged.
 pub(crate) fn rebuild_live(
     points: &[(f32, f32)],
     clip: &Rect,
+    modal: &ModeGesture,
     selection: &mut aurora_doc::SelectionSet,
     current: &mut Option<Selection>,
 ) {
-    match path_selection(points, clip) {
-        Ok(Some(next)) => selection.select(next),
-        Ok(None) => selection.deselect(),
+    let shape = match path_selection(points, clip) {
+        Ok(shape) => shape,
         Err(err) => {
             tracing::debug!(
                 ?err,
@@ -205,8 +208,10 @@ pub(crate) fn rebuild_live(
             );
             return;
         }
+    };
+    if modal.place(selection, shape.as_ref()) {
+        *current = selection.active();
     }
-    *current = selection.active();
 }
 
 /// Whether a click at screen point `click` closes a polygon with
@@ -307,18 +312,29 @@ pub(crate) fn wand_select(
     }
 }
 
-/// A Lasso press as the app runs it: the press deselects at once (the old
-/// selection is kept as the gesture's "before") and the mask will be
+/// A Lasso press as the app runs it: in New mode the press deselects at
+/// once, in a combining mode the selection stays (either way the old
+/// selection is kept as the gesture's "before"), and the mask will be
 /// clipped to the document.
 pub(crate) fn press_lasso(
     drag: &mut Option<crate::Drag>,
     selection: &mut aurora_doc::SelectionSet,
     document_size: (u32, u32),
+    mode: aurora_doc::SelectionMode,
 ) {
-    let began_with = crate::selection_view::press_marquee(selection);
-    if let Some(crate::Drag::Lasso { before, clip, .. }) = drag.as_mut() {
+    let (gesture, began_with) = crate::selection_modes::press_selection(selection, mode);
+    if let Some(crate::Drag::Lasso {
+        before,
+        clip,
+        current,
+        modal,
+        ..
+    }) = drag.as_mut()
+    {
         *before = began_with;
         *clip = document_clip(document_size);
+        *current = crate::selection_modes::initial_current(&gesture);
+        **modal = gesture;
     }
 }
 
@@ -340,8 +356,9 @@ pub(crate) fn release_lasso(
             points,
             clip,
             current,
+            modal,
             ..
-        }) => rebuild_live(points, clip, selection, current),
+        }) => rebuild_live(points, clip, modal, selection, current),
         _ => {}
     }
     ending
@@ -368,6 +385,7 @@ pub(crate) fn polygon_click(
         points,
         clip,
         current,
+        modal,
         ..
     } = drag
     else {
@@ -377,7 +395,7 @@ pub(crate) fn polygon_click(
         return PolygonClick::Closes;
     }
     if push_lasso_point(points, view.to_document(canvas_point)) {
-        rebuild_live(points, clip, selection, current);
+        rebuild_live(points, clip, modal, selection, current);
     }
     PolygonClick::Added
 }
@@ -392,6 +410,7 @@ pub(crate) fn polygon_backspace(
         points,
         clip,
         current,
+        modal,
         ..
     } = drag
     else {
@@ -401,7 +420,7 @@ pub(crate) fn polygon_backspace(
     if points.is_empty() {
         return true;
     }
-    rebuild_live(points, clip, selection, current);
+    rebuild_live(points, clip, modal, selection, current);
     false
 }
 
@@ -427,16 +446,24 @@ pub(crate) fn wand_step(
     doc_point: (f32, f32),
     settings: &ToolSettings,
     document_size: (u32, u32),
+    mode: aurora_doc::SelectionMode,
 ) -> Result<bool, WandRefused> {
     let picked = wand_select(store, layers, layer, doc_point, settings, document_size)?;
     let before = selection.active();
-    selection.select(picked);
+    // The click's pixels combine with the selection by the mode in force
+    // at the press (0.215.0); New replaces.
+    let combined = aurora_doc::combine_selections(before.as_ref(), &picked, mode)
+        .map_err(|_| WandRefused::Notice(LockRefusal::SelectionTooLarge))?;
+    match combined {
+        Some(next) => selection.select(next),
+        None => selection.deselect(),
+    }
     Ok(crate::record_selection_step(
         workspace,
         undo_order,
         history,
         pixel_history,
-        MAGIC_WAND_LABEL,
+        crate::selection_modes::step_label(mode, MAGIC_WAND_LABEL),
         before,
         selection.active(),
     ))

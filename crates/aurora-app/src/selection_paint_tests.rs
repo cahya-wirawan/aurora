@@ -674,11 +674,19 @@ impl Rig {
     /// A Marquee press as the app runs it: the press deselects and the new
     /// drag remembers what was selected.
     fn press_marquee(&mut self, tool: Tool, from: (f32, f32)) -> Option<Drag> {
-        let began_with = selection_view::press_marquee(&mut self.selection);
+        self.press_marquee_mode(tool, from, aurora_doc::SelectionMode::Replace)
+    }
+
+    /// The same in a selection mode (0.215.0), through the production
+    /// helper `App::handle_pointer_pressed` calls.
+    fn press_marquee_mode(
+        &mut self,
+        tool: Tool,
+        from: (f32, f32),
+        mode: aurora_doc::SelectionMode,
+    ) -> Option<Drag> {
         let mut drag = begin_drag(tool, PointerButton::Primary, from, &self.view, None);
-        if let Some(Drag::Marquee { before, .. }) = drag.as_mut() {
-            *before = began_with;
-        }
+        crate::selection_modes::press_marquee_drag(&mut drag, &mut self.selection, mode);
         drag
     }
 
@@ -1229,8 +1237,17 @@ const SQUARE: [(f32, f32); 4] = [(100.0, 80.0), (200.0, 80.0), (200.0, 180.0), (
 impl Rig {
     /// A Lasso press as the app runs it.
     fn press_lasso(&mut self, tool: Tool, from: (f32, f32)) -> Option<Drag> {
+        self.press_lasso_mode(tool, from, aurora_doc::SelectionMode::Replace)
+    }
+
+    fn press_lasso_mode(
+        &mut self,
+        tool: Tool,
+        from: (f32, f32),
+        mode: aurora_doc::SelectionMode,
+    ) -> Option<Drag> {
         let mut drag = begin_drag(tool, PointerButton::Primary, from, &self.view, None);
-        lasso_tools::press_lasso(&mut drag, &mut self.selection, (400, 300));
+        lasso_tools::press_lasso(&mut drag, &mut self.selection, (400, 300), mode);
         drag
     }
 
@@ -1271,6 +1288,14 @@ impl Rig {
     }
 
     fn wand(&mut self, point: (f32, f32)) -> Result<bool, WandRefused> {
+        self.wand_mode(point, aurora_doc::SelectionMode::Replace)
+    }
+
+    fn wand_mode(
+        &mut self,
+        point: (f32, f32),
+        mode: aurora_doc::SelectionMode,
+    ) -> Result<bool, WandRefused> {
         lasso_tools::wand_step(
             &mut self.workspace,
             &mut self.undo_order,
@@ -1283,6 +1308,7 @@ impl Rig {
             point,
             &self.settings,
             (400, 300),
+            mode,
         )
     }
 
@@ -1593,6 +1619,7 @@ fn a_path_over_the_mask_cap_leaves_the_selection_as_it_was() {
     lasso_tools::rebuild_live(
         &[(0.0, 0.0), (9999.0, 0.0), (9999.0, 9999.0), (0.0, 9999.0)],
         &clip,
+        &crate::selection_modes::ModeGesture::replace(),
         &mut selection,
         &mut current,
     );
@@ -1781,7 +1808,12 @@ fn a_big_lasso_rebuilds_on_a_cadence_but_the_release_is_always_exact() {
         &rig.view,
         None,
     );
-    lasso_tools::press_lasso(&mut drag, &mut rig.selection, (4000, 4000));
+    lasso_tools::press_lasso(
+        &mut drag,
+        &mut rig.selection,
+        (4000, 4000),
+        aurora_doc::SelectionMode::Replace,
+    );
     for p in [
         (1000.0, 0.0),
         (1000.0, 1000.0),
@@ -2042,13 +2074,470 @@ fn a_slow_live_rebuild_backs_off_and_a_quick_one_does_not() {
     let mut selection = aurora_doc::SelectionSet::new();
     let mut current = None;
     let mut wait = Some(std::time::Instant::now() + std::time::Duration::from_hours(1));
-    lasso_tools::live_rebuild_step(&path, &clip, &mut selection, &mut current, &mut wait);
+    lasso_tools::live_rebuild_step(
+        &path,
+        &clip,
+        &crate::selection_modes::ModeGesture::replace(),
+        &mut selection,
+        &mut current,
+        &mut wait,
+    );
     assert_eq!(selection.active(), None, "skipped while backing off");
     let mut wait = Some(std::time::Instant::now());
-    lasso_tools::live_rebuild_step(&path, &clip, &mut selection, &mut current, &mut wait);
+    lasso_tools::live_rebuild_step(
+        &path,
+        &clip,
+        &crate::selection_modes::ModeGesture::replace(),
+        &mut selection,
+        &mut current,
+        &mut wait,
+    );
     assert!(
         selection.active().is_some(),
         "rebuilt once the wait is over"
     );
     assert_eq!(wait, None, "a quick rebuild clears the wait");
+}
+
+// ---- 0.215.0: selection modes -------------------------------------------
+
+use crate::selection_modes::{self, mode_from_modifiers, resolve_mode};
+use aurora_doc::SelectionMode;
+
+fn mods(shift: bool, alt: bool) -> Modifiers {
+    Modifiers {
+        shift,
+        alt,
+        control: false,
+        meta: false,
+    }
+}
+
+impl Rig {
+    /// A whole Marquee gesture in `mode`; whether a step was recorded.
+    fn marquee_mode(
+        &mut self,
+        tool: Tool,
+        mode: SelectionMode,
+        from: (f32, f32),
+        to: (f32, f32),
+    ) -> bool {
+        let mut drag = self.press_marquee_mode(tool, from, mode);
+        self.drag_to(&mut drag, to);
+        self.end_drag(drag)
+    }
+
+    /// A whole freehand Lasso gesture in `mode`.
+    fn lasso_mode(&mut self, mode: SelectionMode, points: &[(f32, f32)]) -> bool {
+        let Some((&first, rest)) = points.split_first() else {
+            unreachable!("a lasso has points");
+        };
+        let mut drag = self.press_lasso_mode(Tool::Lasso, first, mode);
+        for &p in rest {
+            self.drag_to(&mut drag, p);
+        }
+        let mut slot = None;
+        let ending = lasso_tools::release_lasso(&mut slot, drag, &mut self.selection);
+        self.end_drag(ending)
+    }
+
+    fn covered(&self, x: i64, y: i64) -> f32 {
+        self.selection.active().map_or(0.0, |s| s.coverage_at(x, y))
+    }
+}
+
+#[test]
+fn modifiers_at_the_press_pick_the_mode_and_the_mode_button_overrides_them() {
+    assert_eq!(
+        mode_from_modifiers(mods(false, false)),
+        SelectionMode::Replace
+    );
+    assert_eq!(mode_from_modifiers(mods(true, false)), SelectionMode::Add);
+    assert_eq!(
+        mode_from_modifiers(mods(false, true)),
+        SelectionMode::Subtract
+    );
+    assert_eq!(
+        mode_from_modifiers(mods(true, true)),
+        SelectionMode::Intersect
+    );
+    // The button at New defers to the modifiers; any other button wins.
+    for (shift, alt) in [(false, false), (true, false), (false, true), (true, true)] {
+        let m = mods(shift, alt);
+        assert_eq!(
+            resolve_mode(SelectionMode::Replace, m),
+            mode_from_modifiers(m)
+        );
+        for button in [
+            SelectionMode::Add,
+            SelectionMode::Subtract,
+            SelectionMode::Intersect,
+        ] {
+            assert_eq!(resolve_mode(button, m), button, "{shift} {alt}");
+        }
+    }
+    assert_eq!(
+        crate::ToolSettings::default().selection_mode,
+        SelectionMode::Replace
+    );
+}
+
+#[test]
+fn add_unites_two_marquees_in_one_labelled_step_and_undo_restores_the_first() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    assert!(rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0)));
+    let first = rig.selection.active();
+    assert!(rig.marquee_mode(
+        Tool::MarqueeSelect,
+        SelectionMode::Add,
+        (40.0, 30.0),
+        (100.0, 90.0)
+    ));
+    let union = rig.selection.active();
+    assert_eq!(rig.labels(), ["Rectangular Marquee", "Add to Selection"]);
+    assert_eq!(rig.covered(20, 20), 1.0, "only in the first");
+    assert_eq!(rig.covered(90, 80), 1.0, "only in the second");
+    assert_eq!(rig.covered(70, 20), 0.0, "in neither");
+    assert_eq!(rig.selected_bounds(), Some(rect(10, 10, 90, 80)));
+    assert!(rig.step(UndoDirection::Undo));
+    assert_eq!(rig.selection.active(), first, "exactly the previous one");
+    assert!(rig.step(UndoDirection::Redo));
+    assert_eq!(rig.selection.active(), union);
+}
+
+#[test]
+fn subtract_and_intersect_cut_the_existing_selection() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (110.0, 110.0));
+    assert!(rig.marquee_mode(
+        Tool::EllipticalMarquee,
+        SelectionMode::Subtract,
+        (40.0, 40.0),
+        (80.0, 80.0)
+    ));
+    assert_eq!(rig.covered(60, 60), 0.0, "the hole");
+    assert_eq!(rig.covered(15, 15), 1.0, "the rest");
+    assert_eq!(
+        rig.labels().last().map(String::as_str),
+        Some("Subtract from Selection")
+    );
+    let holed = rig.selection.active();
+    assert!(rig.marquee_mode(
+        Tool::MarqueeSelect,
+        SelectionMode::Intersect,
+        (0.0, 0.0),
+        (50.0, 50.0)
+    ));
+    assert_eq!(
+        rig.labels().last().map(String::as_str),
+        Some("Intersect Selection")
+    );
+    assert_eq!(rig.covered(15, 15), 1.0);
+    assert_eq!(rig.covered(100, 100), 0.0, "outside the intersecting box");
+    assert_eq!(rig.covered(55, 55), 0.0, "inside the hole");
+    assert!(rig.step(UndoDirection::Undo));
+    assert_eq!(rig.selection.active(), holed);
+}
+
+#[test]
+fn a_combining_press_keeps_the_selection_and_a_release_without_a_move_records_nothing() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    let existing = rig.selection.active();
+    let steps = rig.undo_order.undo.len();
+    for mode in [
+        SelectionMode::Add,
+        SelectionMode::Subtract,
+        SelectionMode::Intersect,
+    ] {
+        let drag = rig.press_marquee_mode(Tool::MarqueeSelect, (200.0, 200.0), mode);
+        assert_eq!(rig.selection.active(), existing, "{mode:?}: still visible");
+        assert!(!rig.end_drag(drag), "{mode:?}: a click changes nothing");
+        assert_eq!(rig.selection.active(), existing);
+    }
+    assert_eq!(rig.undo_order.undo.len(), steps);
+    // New mode still deselects on a click.
+    let drag = rig.press_marquee_mode(Tool::MarqueeSelect, (200.0, 200.0), SelectionMode::Replace);
+    assert_eq!(rig.selection.active(), None);
+    assert!(rig.end_drag(drag));
+}
+
+#[test]
+fn the_live_selection_while_dragging_in_add_mode_is_the_combined_result() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    let mut drag = rig.press_marquee_mode(Tool::MarqueeSelect, (100.0, 100.0), SelectionMode::Add);
+    rig.drag_to(&mut drag, (140.0, 130.0));
+    assert_eq!(rig.covered(20.0 as i64, 20), 1.0, "the old part stays");
+    assert_eq!(rig.covered(120, 110), 1.0, "the new part joins");
+    rig.drag_to(&mut drag, (110.0, 105.0));
+    assert_eq!(
+        rig.covered(120, 110),
+        0.0,
+        "shrinking the drag shrinks the addition"
+    );
+    assert_eq!(rig.covered(20, 20), 1.0);
+    assert!(rig.end_drag(drag));
+}
+
+#[test]
+fn escape_during_a_combining_drag_restores_the_selection_without_a_step() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    let existing = rig.selection.active();
+    let steps = rig.undo_order.undo.len();
+    let mut drag =
+        rig.press_marquee_mode(Tool::MarqueeSelect, (100.0, 100.0), SelectionMode::Subtract);
+    rig.drag_to(&mut drag, (30.0, 30.0));
+    assert_ne!(rig.selection.active(), existing);
+    assert!(lasso_tools::cancel_selection_gesture(
+        &mut drag,
+        &mut rig.selection
+    ));
+    assert_eq!(rig.selection.active(), existing);
+    assert_eq!(rig.undo_order.undo.len(), steps);
+}
+
+#[test]
+fn a_tool_switch_mid_combining_drag_records_the_combined_step() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    let first = rig.selection.active();
+    let mut drag = rig.press_marquee_mode(Tool::MarqueeSelect, (100.0, 100.0), SelectionMode::Add);
+    rig.drag_to(&mut drag, (140.0, 130.0));
+    let ending = lasso_tools::take_on_tool_switch(&mut drag, Tool::MarqueeSelect, Tool::Brush);
+    assert!(rig.end_drag(ending));
+    assert_eq!(
+        rig.labels().last().map(String::as_str),
+        Some("Add to Selection")
+    );
+    assert!(rig.step(UndoDirection::Undo));
+    assert_eq!(rig.selection.active(), first);
+}
+
+#[test]
+fn a_combination_over_the_mask_cap_leaves_the_selection_unchanged_and_records_nothing() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (20.0, 20.0));
+    let existing = rig.selection.active();
+    let steps = rig.undo_order.undo.len();
+    // The union box would be about 30000 x 30000.
+    assert!(!rig.marquee_mode(
+        Tool::MarqueeSelect,
+        SelectionMode::Add,
+        (30000.0, 30000.0),
+        (30010.0, 30010.0)
+    ));
+    assert_eq!(rig.selection.active(), existing);
+    assert_eq!(rig.undo_order.undo.len(), steps);
+}
+
+#[test]
+fn history_jumps_over_combined_steps_apply_exactly_each_rows_selection() {
+    use std::collections::HashMap;
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    let first = rig.selection.active();
+    rig.marquee_mode(
+        Tool::MarqueeSelect,
+        SelectionMode::Add,
+        (40.0, 30.0),
+        (100.0, 90.0),
+    );
+    let second = rig.selection.active();
+    rig.marquee_mode(
+        Tool::EllipticalMarquee,
+        SelectionMode::Subtract,
+        (20.0, 20.0),
+        (50.0, 40.0),
+    );
+    let third = rig.selection.active();
+    assert!(first != second && second != third);
+    let scales = match crate::load_scales() {
+        Ok(s) => s,
+        Err(err) => unreachable!("{err}"),
+    };
+    let mut cache = CompositeCache::default();
+    let mut layer_rows = HashMap::new();
+    let mut active = Some(rig.layer);
+    let mut state = crate::LayerControlsState::default();
+    let mut drag = None;
+    let mut focus = aurora_widgets::FocusManager::default();
+    for (target, expected) in [(1, &first), (0, &None), (3, &third), (2, &second)] {
+        let _ = crate::perform_history_jump(
+            &mut crate::HistoryJumpContext {
+                workspace: &mut rig.workspace,
+                focus: &mut focus,
+                scales: &scales,
+                layers: &mut rig.layers,
+                history: &mut rig.history,
+                pixel_history: &mut rig.pixel_history,
+                store: Some(&mut rig.store),
+                undo_order: &mut rig.undo_order,
+                composite_cache: &mut cache,
+                view: &mut rig.view,
+                layer_rows: &mut layer_rows,
+                active_layer: &mut active,
+                drag: &mut drag,
+                layer_controls: &mut state,
+            },
+            target,
+        );
+        selection_view::apply_pending_selection(&mut rig.undo_order, &mut rig.selection);
+        assert_eq!(&rig.selection.active(), expected, "jump to row {target}");
+    }
+}
+
+#[test]
+fn painting_goes_through_the_combined_selection() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 60.0));
+    rig.marquee_mode(
+        Tool::MarqueeSelect,
+        SelectionMode::Add,
+        (100.0, 10.0),
+        (150.0, 60.0),
+    );
+    rig.settings.set_radius(Tool::Brush, 10.0);
+    // A horizontal stroke across both boxes and the gap between them.
+    assert!(rig.stroke(Tool::Brush, &[(5.0, 35.0), (160.0, 35.0)], false));
+    assert!(rig.alpha(30, 35) > 0.0, "inside the first box");
+    assert!(rig.alpha(120, 35) > 0.0, "inside the added box");
+    assert_eq!(rig.alpha(80, 35), 0.0, "the gap between them stays clean");
+    assert_eq!(rig.alpha(5, 35), 0.0, "left of both");
+}
+
+#[test]
+fn lasso_modes_combine_with_the_existing_selection() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (110.0, 110.0));
+    let first = rig.selection.active();
+    assert!(rig.lasso_mode(SelectionMode::Subtract, &SQUARE));
+    // SQUARE is (100,80)-(200,180): only the corner overlapping the box
+    // is removed.
+    assert_eq!(rig.covered(105, 95), 0.0, "removed");
+    assert_eq!(rig.covered(50, 50), 1.0, "kept");
+    assert_eq!(
+        rig.labels().last().map(String::as_str),
+        Some("Subtract from Selection")
+    );
+    assert!(rig.step(UndoDirection::Undo));
+    assert_eq!(rig.selection.active(), first);
+    assert!(rig.lasso_mode(SelectionMode::Add, &SQUARE));
+    assert_eq!(rig.covered(150, 150), 1.0, "added");
+    assert_eq!(rig.covered(50, 50), 1.0, "kept");
+    assert!(rig.step(UndoDirection::Undo));
+    assert!(rig.lasso_mode(SelectionMode::Intersect, &SQUARE));
+    assert_eq!(rig.covered(105, 95), 1.0, "the overlap");
+    assert_eq!(rig.covered(50, 50), 0.0, "outside the lasso");
+    assert_eq!(rig.covered(150, 150), 0.0, "outside the old box");
+}
+
+#[test]
+fn a_polygonal_lasso_in_add_mode_keeps_the_selection_while_building_and_adds_on_close() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    let existing = rig.selection.active();
+    let mut drag = rig.press_lasso_mode(Tool::PolygonalLasso, SQUARE[0], SelectionMode::Add);
+    assert_eq!(rig.selection.active(), existing, "kept at the press");
+    let ending = drag.take();
+    let ending = lasso_tools::release_lasso(&mut drag, ending, &mut rig.selection);
+    assert!(ending.is_none());
+    for p in &SQUARE[1..] {
+        let Some(d) = drag.as_mut() else {
+            unreachable!("alive");
+        };
+        lasso_tools::polygon_click(d, *p, &rig.view, &mut rig.selection);
+    }
+    assert_eq!(rig.covered(30, 30), 1.0, "old part kept while building");
+    assert_eq!(rig.covered(150, 120), 1.0, "polygon so far added");
+    let Some(d) = drag.as_mut() else {
+        unreachable!("alive");
+    };
+    assert_eq!(
+        lasso_tools::polygon_click(d, SQUARE[0], &rig.view, &mut rig.selection),
+        PolygonClick::Closes
+    );
+    let ending = drag.take();
+    assert!(rig.end_drag(ending));
+    assert_eq!(
+        rig.labels().last().map(String::as_str),
+        Some("Add to Selection")
+    );
+}
+
+#[test]
+fn the_wand_combines_by_its_mode() {
+    let mut rig = wand_rig();
+    assert_eq!(rig.wand((250.0, 140.0)), Ok(true));
+    let red = rig.selection.active();
+    // Add the far square.
+    assert_eq!(rig.wand_mode((50.0, 50.0), SelectionMode::Add), Ok(true));
+    assert_eq!(rig.covered(250, 140), 1.0);
+    assert_eq!(rig.covered(50, 50), 1.0);
+    assert_eq!(
+        rig.labels().last().map(String::as_str),
+        Some("Add to Selection")
+    );
+    // Subtract the big rectangle again.
+    assert_eq!(
+        rig.wand_mode((250.0, 140.0), SelectionMode::Subtract),
+        Ok(true)
+    );
+    assert_eq!(rig.covered(250, 140), 0.0);
+    assert_eq!(rig.covered(50, 50), 1.0);
+    // Intersect with the big rectangle: nothing left, so it deselects.
+    assert_eq!(
+        rig.wand_mode((250.0, 140.0), SelectionMode::Intersect),
+        Ok(true)
+    );
+    assert_eq!(rig.selection.active(), None);
+    assert_eq!(
+        rig.labels().last().map(String::as_str),
+        Some("Intersect Selection")
+    );
+    assert!(rig.step(UndoDirection::Undo));
+    assert_eq!(rig.covered(50, 50), 1.0);
+    assert!(rig.step(UndoDirection::Undo));
+    assert!(rig.step(UndoDirection::Undo));
+    assert_eq!(rig.selection.active(), red);
+}
+
+#[test]
+fn the_wand_in_a_combining_mode_with_nothing_selected_follows_photoshop() {
+    let mut rig = wand_rig();
+    // Add with nothing selected selects; Subtract and Intersect select
+    // nothing and record nothing.
+    assert_eq!(
+        rig.wand_mode((250.0, 140.0), SelectionMode::Subtract),
+        Ok(false)
+    );
+    assert_eq!(
+        rig.wand_mode((250.0, 140.0), SelectionMode::Intersect),
+        Ok(false)
+    );
+    assert!(rig.labels().is_empty());
+    assert_eq!(rig.wand_mode((250.0, 140.0), SelectionMode::Add), Ok(true));
+    assert_eq!(rig.covered(250, 140), 1.0);
+}
+
+#[test]
+fn the_mode_labels_and_palette_names_are_distinct_and_new_keeps_the_tool_label() {
+    assert_eq!(
+        selection_modes::step_label(SelectionMode::Replace, "Lasso"),
+        "Lasso"
+    );
+    let labels: Vec<_> = SelectionMode::ALL
+        .iter()
+        .map(|m| selection_modes::palette_label(*m))
+        .collect();
+    for (i, a) in labels.iter().enumerate() {
+        for b in &labels[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+    assert_eq!(
+        selection_modes::mode_step_label(SelectionMode::Replace),
+        None
+    );
 }

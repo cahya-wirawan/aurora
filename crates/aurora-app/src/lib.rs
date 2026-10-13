@@ -555,6 +555,7 @@ mod prepared_pixels;
 mod psd_save;
 #[cfg(test)]
 mod psd_save_tests;
+mod selection_modes;
 mod selection_paint;
 #[cfg(test)]
 mod selection_paint_tests;
@@ -5687,6 +5688,8 @@ enum ActivatedCommand {
     /// Select All / Deselect / Inverse (0.212.0): `App` state, so handed
     /// back like the colour commands.
     Selection(selection_view::SelectionCommand),
+    /// Choose the selection tools' mode button (0.215.0): palette only.
+    SetSelectionMode(aurora_doc::SelectionMode),
     /// Select a tool from the palette (0.209.0).
     SelectTool(aurora_ui::Tool),
     /// A keyboard panel move (0.166.0, [`PANEL_MOVE_COMMANDS`]) —
@@ -5858,6 +5861,16 @@ const COMMAND_SELECT_ALL: &str = "select.all";
 const COMMAND_SELECT_DESELECT: &str = "select.deselect";
 const COMMAND_SELECT_INVERSE: &str = "select.inverse";
 
+/// The palette command id that chooses selection `mode` (0.215.0).
+const fn selection_mode_command_id(mode: aurora_doc::SelectionMode) -> &'static str {
+    match mode {
+        aurora_doc::SelectionMode::Replace => "selection.mode.new",
+        aurora_doc::SelectionMode::Add => "selection.mode.add",
+        aurora_doc::SelectionMode::Subtract => "selection.mode.subtract",
+        aurora_doc::SelectionMode::Intersect => "selection.mode.intersect",
+    }
+}
+
 /// The palette command id that selects `tool` (0.209.0).
 const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
     match tool {
@@ -5957,6 +5970,13 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_SELECT_DESELECT, "Deselect"),
         CommandEntry::new(COMMAND_SELECT_INVERSE, "Inverse Selection"),
     ];
+    // 0.215.0: the selection tools' mode button.
+    commands.extend(aurora_doc::SelectionMode::ALL.iter().map(|mode| {
+        CommandEntry::new(
+            selection_mode_command_id(*mode),
+            selection_modes::palette_label(*mode),
+        )
+    }));
     // 0.209.0: "Select ... Tool" for every tool (the palette had none).
     commands.extend(aurora_ui::Tool::ALL.iter().map(|tool| {
         CommandEntry::new(
@@ -6170,6 +6190,13 @@ fn activate_command(
         .find(|tool| tool_command_id(*tool) == id)
     {
         return Some(ActivatedCommand::SelectTool(tool));
+    }
+    if let Some(mode) = aurora_doc::SelectionMode::ALL
+        .iter()
+        .copied()
+        .find(|mode| selection_mode_command_id(*mode) == id)
+    {
+        return Some(ActivatedCommand::SetSelectionMode(mode));
     }
     if id == COMMAND_COLOURS_SWAP {
         return Some(ActivatedCommand::SwapColours);
@@ -8031,6 +8058,18 @@ fn sync_tool_controls(
             false
         }
     };
+    let modes_changed = match aurora_ui::sync_selection_mode_controls(
+        &mut workspace.tree,
+        &controls,
+        tool,
+        settings.selection_mode,
+    ) {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to sync the options-bar selection modes");
+            false
+        }
+    };
     match aurora_ui::sync_tool_controls(
         &mut workspace.tree,
         controls,
@@ -8038,7 +8077,7 @@ fn sync_tool_controls(
         settings.radius(tool).map(f64::from),
         captured,
     ) {
-        Ok(changed) => changed || highlighted || fill_changed,
+        Ok(changed) => changed || highlighted || fill_changed || modes_changed,
         Err(err) => {
             tracing::warn!(?err, "failed to sync the options-bar tool controls");
             false
@@ -8124,6 +8163,18 @@ fn apply_fill_control_outcome(
     use aurora_widgets::ActionOutcome;
     let fill = &controls.fill;
     let changed = match action {
+        // A selection-mode checkbox in any state chooses its mode (the
+        // sync re-checks the one in force, so unchecking the current one
+        // changes nothing).
+        ActionOutcome::Toggled { id, .. } if controls.modes.mode_of(*id).is_some() => {
+            let chosen = controls
+                .modes
+                .mode_of(*id)
+                .unwrap_or(settings.selection_mode);
+            let changed = settings.selection_mode != chosen;
+            settings.selection_mode = chosen;
+            changed
+        }
         ActionOutcome::Toggled { id, state } if *id == fill.radial => {
             let on = *state == accesskit::Toggled::True;
             let changed = settings.gradient_radial != on;
@@ -11563,6 +11614,10 @@ enum Drag {
         /// ([`commit_ending_drag`]); only Escape and a selection command
         /// cancel instead, restoring `before`.
         current: Option<aurora_doc::Selection>,
+        /// The gesture's selection mode and starting selection (0.215.0;
+        /// [`selection_modes`]): in a combining mode `current` is the
+        /// drawn shape combined into the selection held at the press.
+        modal: Box<selection_modes::ModeGesture>,
     },
     /// A Lasso drag, or a Polygonal Lasso in progress (0.214.0; see
     /// [`lasso_tools`]). Like `Marquee` it keeps `before` and `current`
@@ -11584,6 +11639,8 @@ enum Drag {
         /// After a slow live rebuild, the time before which the next one
         /// is skipped ([`lasso_tools::live_rebuild_step`]).
         not_before: Option<std::time::Instant>,
+        /// The gesture's selection mode and starting selection (0.215.0).
+        modal: Box<selection_modes::ModeGesture>,
     },
     Brush {
         last_doc: (f32, f32),
@@ -11894,9 +11951,13 @@ fn commit_ending_drag(
             elliptical,
             before,
             current,
+            modal,
             ..
         }) => {
-            let label = selection_view::marquee_step_label(elliptical, current.is_some());
+            let label = selection_modes::step_label(
+                modal.mode,
+                selection_view::marquee_step_label(elliptical, current.is_some()),
+            );
             undo_order.record_selection(label, before, current, history, pixel_history);
         }
         // A Lasso gesture ending by any path is one selection step too
@@ -11906,9 +11967,13 @@ fn commit_ending_drag(
             polygonal,
             before,
             current,
+            modal,
             ..
         }) => {
-            let label = lasso_tools::lasso_step_label(polygonal, current.is_some());
+            let label = selection_modes::step_label(
+                modal.mode,
+                lasso_tools::lasso_step_label(polygonal, current.is_some()),
+            );
             undo_order.record_selection(label, before, current, history, pixel_history);
         }
         Some(Drag::Move {
@@ -12130,6 +12195,7 @@ fn begin_drag(
             elliptical: tool == aurora_ui::Tool::EllipticalMarquee,
             before: None,
             current: None,
+            modal: selection_modes::ModeGesture::boxed_replace(),
         }),
         (aurora_ui::Tool::Lasso | aurora_ui::Tool::PolygonalLasso, PointerButton::Primary) => {
             Some(Drag::Lasso {
@@ -12144,6 +12210,7 @@ fn begin_drag(
                 before: None,
                 current: None,
                 not_before: None,
+                modal: selection_modes::ModeGesture::boxed_replace(),
             })
         }
         (aurora_ui::Tool::Brush, PointerButton::Primary) => Some(Drag::Brush {
@@ -12257,15 +12324,19 @@ fn continue_drag(
             start_doc,
             elliptical,
             current,
+            modal,
             ..
         } => {
             let current_doc = view.to_document(canvas_point);
             let rect = aurora_ui::tool::marquee_rect(*start_doc, current_doc);
-            selection.select(if *elliptical {
-                aurora_doc::Selection::ellipse(rect)
-            } else {
-                aurora_doc::Selection::new(rect)
-            });
+            modal.place(
+                selection,
+                Some(&if *elliptical {
+                    aurora_doc::Selection::ellipse(rect)
+                } else {
+                    aurora_doc::Selection::new(rect)
+                }),
+            );
             *current = selection.active();
             Vec::new()
         }
@@ -12275,13 +12346,16 @@ fn continue_drag(
             clip,
             current,
             not_before,
+            modal,
             ..
         } => {
             // A Polygonal Lasso only changes on a click, not a move.
             if !*polygonal {
                 let point = view.to_document(canvas_point);
                 if lasso_tools::push_lasso_point(points, point) {
-                    lasso_tools::live_rebuild_step(points, clip, selection, current, not_before);
+                    lasso_tools::live_rebuild_step(
+                        points, clip, modal, selection, current, not_before,
+                    );
                 }
             }
             Vec::new()
@@ -25412,6 +25486,10 @@ struct ToolSettings {
     gradient_reverse: bool,
     /// The Gradient's opacity, 0..=100 percent.
     gradient_opacity: u8,
+    /// The selection tools' mode button (0.215.0): New unless the user
+    /// chose Add, Subtract or Intersect; modifiers held at a press apply
+    /// only while it is New.
+    selection_mode: aurora_doc::SelectionMode,
 }
 
 /// The Paint Bucket's default tolerance (Photoshop's).
@@ -25427,6 +25505,7 @@ impl Default for ToolSettings {
             gradient_radial: false,
             gradient_reverse: false,
             gradient_opacity: 100,
+            selection_mode: aurora_doc::SelectionMode::Replace,
         }
     }
 }
@@ -27367,6 +27446,7 @@ impl App {
             Some(ActivatedCommand::ResetColours) => self.reset_colours(),
             Some(ActivatedCommand::Selection(command)) => self.run_selection_command(command),
             Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
+            Some(ActivatedCommand::SetSelectionMode(mode)) => self.set_selection_mode(mode),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -29571,6 +29651,7 @@ impl App {
                 &mut self.drag,
                 &mut self.doc.selection,
                 self.doc.canvas_size,
+                selection_modes::gesture_mode(&self.tool_settings, self.modifiers),
             );
             self.needs_redraw = true;
         }
@@ -29578,10 +29659,8 @@ impl App {
             // A press with the Marquee deselects at once (Photoshop: a
             // click deselects, including a click on a selection); the drag
             // then draws a new one, and Escape restores this one.
-            let began_with = selection_view::press_marquee(&mut self.doc.selection);
-            if let Some(Drag::Marquee { before, .. }) = self.drag.as_mut() {
-                *before = began_with;
-            }
+            let mode = selection_modes::gesture_mode(&self.tool_settings, self.modifiers);
+            selection_modes::press_marquee_drag(&mut self.drag, &mut self.doc.selection, mode);
         }
         // A locked layer refuses the press outright (0.198.0): no drag, so
         // no stroke snapshot and no history row, and a calm notice.
@@ -30276,6 +30355,7 @@ impl App {
             Some(ActivatedCommand::ResetColours) => self.reset_colours(),
             Some(ActivatedCommand::Selection(command)) => self.run_selection_command(command),
             Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
+            Some(ActivatedCommand::SetSelectionMode(mode)) => self.set_selection_mode(mode),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -31089,6 +31169,15 @@ impl App {
     /// and an assistive technology's `Click` all take (0.160.0), so the
     /// tool, the Properties body and the tools panel's highlight can never
     /// disagree with a shortcut's result.
+    /// Chooses the selection tools' mode button (0.215.0); applies to the
+    /// next press (a gesture in progress keeps the mode it began with).
+    fn set_selection_mode(&mut self, mode: aurora_doc::SelectionMode) {
+        self.tool_settings.selection_mode = mode;
+        self.sync_tool_controls_now();
+        self.push_accessibility();
+        self.needs_redraw = true;
+    }
+
     fn select_tool_command(&mut self, tool: aurora_ui::Tool) {
         let tool_before = self.tool;
         let _: CompositeInvalidation = run_command(
@@ -31570,6 +31659,7 @@ impl App {
             doc_point,
             &self.tool_settings,
             self.doc.canvas_size,
+            selection_modes::gesture_mode(&self.tool_settings, self.modifiers),
         ) {
             Ok(_) => self.needs_redraw = true,
             Err(lasso_tools::WandRefused::Notice(why)) => {
@@ -67421,6 +67511,99 @@ mod tests {
         ));
     }
 
+    /// 0.215.0: the options bar's four mode checkboxes choose the selection
+    /// mode through the same outcome path as the other tool controls, stay
+    /// a radio group (unchecking the current one re-checks it), and the
+    /// palette offers a command per mode.
+    #[test]
+    fn the_selection_mode_checkboxes_choose_the_mode_and_stay_a_radio_group() {
+        use aurora_doc::SelectionMode;
+        let scales = crate::test_workspace_scales();
+        let mut workspace = laid_out_workspace();
+        let layers = aurora_doc::LayerTree::new();
+        let mut settings = crate::ToolSettings::default();
+        let panels = install_startup_panels(
+            &mut workspace,
+            &scales,
+            &layers,
+            &UndoOrder::default(),
+            Tool::Lasso,
+            &settings,
+        );
+        let Some(controls) = panels.tool_controls else {
+            unreachable!("built");
+        };
+        let checked = |ws: &aurora_ui::Workspace, mode| {
+            matches!(
+                ws.tree.payload(controls.modes.checkbox(mode)),
+                Some(aurora_widgets::widgets::WidgetKind::Checkbox(s)) if s.checked == accesskit::Toggled::True
+            )
+        };
+        for mode in [
+            SelectionMode::Add,
+            SelectionMode::Subtract,
+            SelectionMode::Intersect,
+            SelectionMode::Replace,
+        ] {
+            let outcome = PointerOutcome::Action(aurora_widgets::ActionOutcome::Toggled {
+                id: controls.modes.checkbox(mode),
+                state: accesskit::Toggled::True,
+            });
+            let _ = crate::apply_tool_control_outcome(
+                &mut workspace,
+                Some(controls),
+                Tool::Lasso,
+                &mut settings,
+                &outcome,
+                None,
+            );
+            assert_eq!(settings.selection_mode, mode);
+            for other in SelectionMode::ALL {
+                assert_eq!(checked(&workspace, other), other == mode, "{mode:?}");
+            }
+        }
+        // Unchecking the mode in force keeps it (and re-checks the box).
+        settings.selection_mode = SelectionMode::Add;
+        let outcome = PointerOutcome::Action(aurora_widgets::ActionOutcome::Toggled {
+            id: controls.modes.add,
+            state: accesskit::Toggled::False,
+        });
+        assert!(!crate::apply_tool_control_outcome(
+            &mut workspace,
+            Some(controls),
+            Tool::Lasso,
+            &mut settings,
+            &outcome,
+            None,
+        ));
+        assert_eq!(settings.selection_mode, SelectionMode::Add);
+        assert!(checked(&workspace, SelectionMode::Add));
+        // A non-selection tool hides the group.
+        let _ =
+            crate::sync_tool_controls(&mut workspace, Some(controls), Tool::Brush, &settings, None);
+        assert!(
+            workspace
+                .tree
+                .accessibility(controls.modes.group)
+                .is_some_and(accesskit::Node::is_hidden)
+        );
+        // The palette lists and resolves every mode.
+        let mut focus = FocusManager::default();
+        let mut file_dialog = FakeFileDialog::default();
+        let commands = palette_commands();
+        for mode in SelectionMode::ALL {
+            let id = crate::selection_mode_command_id(mode);
+            assert!(
+                commands.iter().any(|c| c.id == id),
+                "{mode:?} in the palette"
+            );
+            assert_eq!(
+                activate_command(&mut workspace, &mut focus, id, &mut file_dialog),
+                Some(ActivatedCommand::SetSelectionMode(mode))
+            );
+        }
+    }
+
     /// 0.160.0 AC-1/AC-5, the Retina lesson: with the canvas now offset by
     /// the tools panel and the options bar, a real dab stamped from a
     /// *physical* pointer position lands under the pointer at scale
@@ -69212,6 +69395,7 @@ mod tests {
             elliptical: false,
             before: None,
             current: None,
+            modal: crate::selection_modes::ModeGesture::boxed_replace(),
         };
         for &to in moves {
             let _ = continue_drag(
@@ -69307,6 +69491,7 @@ mod tests {
             elliptical: false,
             before: None,
             current: None,
+            modal: crate::selection_modes::ModeGesture::boxed_replace(),
         };
         let _ = continue_drag(
             &mut drag,
@@ -69347,6 +69532,7 @@ mod tests {
             elliptical: false,
             before: None,
             current: None,
+            modal: crate::selection_modes::ModeGesture::boxed_replace(),
         };
         let dabs = continue_drag(
             &mut drag,

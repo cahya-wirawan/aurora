@@ -54,6 +54,7 @@ pub mod panel_group;
 pub mod panel_strip;
 pub mod properties_panel;
 pub mod redock;
+pub mod selection_mode_controls;
 pub mod selection_outline;
 pub mod status_bar;
 pub mod tool;
@@ -151,6 +152,10 @@ pub use redock::{
     PANEL_DRAG_THRESHOLD, PanelDrag, apply_dock_arrangement, apply_dock_arrangement_keeping_focus,
     dock_workspace_panel, drop_indicator_rect, drop_target_at, float_workspace_panel,
     move_workspace_panel, move_workspace_panel_by, move_workspace_slot, panel_drag_source,
+};
+pub use selection_mode_controls::{
+    SELECTION_MODE_LABEL, SelectionModeControls, insert_selection_mode_controls,
+    selection_mode_label, sync_selection_mode_controls,
 };
 pub use selection_outline::{
     DASH_LENGTH, MARCH_PERIOD, selection_outline_runs, sync_selection_outline,
