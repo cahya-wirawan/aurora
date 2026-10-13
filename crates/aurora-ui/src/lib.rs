@@ -123,9 +123,9 @@ pub use colour_controls::{
     sync_colour_controls,
 };
 pub use fill_controls::{
-    FillControls, FillView, OPACITY_MAX, OPACITY_MIN, TOLERANCE_MAX, TOLERANCE_MIN,
-    insert_fill_controls, is_fill_tool, opacity_readout_text, shown_fill_group, sync_fill_controls,
-    tolerance_readout_text,
+    FillControls, FillView, OPACITY_MAX, OPACITY_MIN, STRENGTH_MAX, STRENGTH_MIN, TOLERANCE_MAX,
+    TOLERANCE_MIN, insert_fill_controls, is_fill_tool, opacity_readout_text, shown_fill_group,
+    strength_readout_text, sync_fill_controls, tolerance_readout_text,
 };
 pub use layers_panel::{
     LayerRowPart, LayersView, layer_row_description, layer_row_height, layer_row_neighbor,

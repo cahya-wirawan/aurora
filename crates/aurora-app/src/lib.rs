@@ -570,6 +570,9 @@ mod selection_refine;
 mod selection_store;
 mod selection_view;
 mod small_machine;
+mod smudge_stamp;
+#[cfg(test)]
+mod smudge_stamp_tests;
 mod workspace_presets;
 use background_open::{
     BackgroundFailure, DecodedFile, FinishedOpen, OpenInstaller, OpenStep, OpenWorker,
@@ -5567,6 +5570,9 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         ("e", AppCommand::SelectTool(aurora_ui::Tool::Eraser)),
         // 0.221.0: Photoshop's Clone Stamp key.
         ("s", AppCommand::SelectTool(aurora_ui::Tool::CloneStamp)),
+        // 0.222.0: Photoshop's Smudge key (it shares R with Blur and
+        // Sharpen there; Aurora has neither).
+        ("r", AppCommand::SelectTool(aurora_ui::Tool::Smudge)),
         // 0.209.0: Photoshop's grouped G key.
         ("g", AppCommand::SelectTool(aurora_ui::Tool::Gradient)),
         (
@@ -5971,6 +5977,7 @@ const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
         aurora_ui::Tool::PaintBucket => "tool.paint_bucket",
         aurora_ui::Tool::Pencil => "tool.pencil",
         aurora_ui::Tool::CloneStamp => "tool.clone_stamp",
+        aurora_ui::Tool::Smudge => "tool.smudge",
     }
 }
 
@@ -8311,6 +8318,9 @@ fn apply_fill_control_outcome(
         ActionOutcome::ValueChanged { id, value } if *id == fill.tolerance => {
             settings.set_tolerance(*value)
         }
+        ActionOutcome::ValueChanged { id, value } if *id == fill.strength => {
+            settings.set_smudge_strength(*value)
+        }
         _ => return false,
     };
     let _ = sync_tool_controls(workspace, Some(*controls), tool, settings, captured);
@@ -10339,6 +10349,9 @@ const PENCIL_STROKE_LABEL: &str = "Pencil Stroke";
 /// The row label of a committed Clone Stamp stroke (0.221.0).
 const CLONE_STAMP_STROKE_LABEL: &str = "Clone Stamp Stroke";
 
+/// The row label of a committed Smudge stroke (0.222.0).
+const SMUDGE_STROKE_LABEL: &str = "Smudge Stroke";
+
 /// The History row a committed stroke of the Brush drag gets: the Pencil's
 /// (`hard`) or the Brush's.
 const fn brush_drag_label(hard: bool) -> &'static str {
@@ -11876,6 +11889,12 @@ enum Drag {
         /// Brush's, its step reads "Clone Stamp Stroke" and its dabs are
         /// [`clone_stamp::clone_dab_through_selection`]'s.
         clone: Option<(i64, i64)>,
+        /// The Smudge (0.222.0): `Some(carry)` is the paint the finger
+        /// carries ([`smudge_stamp`]), empty until the stroke's first dab;
+        /// the drag is otherwise the Brush's, its step reads "Smudge
+        /// Stroke" and its dabs are
+        /// [`smudge_stamp::smudge_dab_through_selection`]'s.
+        smudge: Option<Box<aurora_brush::SmudgeCarry>>,
         last_doc: (f32, f32),
         carry: f32,
         /// This stroke's own accumulated undo snapshot — `None` when the
@@ -12161,11 +12180,14 @@ fn commit_ending_drag(
             stroke: Some(stroke),
             hard,
             clone,
+            smudge,
             ..
         }) => record_stroke(
             stroke,
             if clone.is_some() {
                 CLONE_STAMP_STROKE_LABEL
+            } else if smudge.is_some() {
+                SMUDGE_STROKE_LABEL
             } else {
                 brush_drag_label(hard)
             },
@@ -12453,7 +12475,10 @@ fn begin_drag(
             })
         }
         (
-            aurora_ui::Tool::Brush | aurora_ui::Tool::Pencil | aurora_ui::Tool::CloneStamp,
+            aurora_ui::Tool::Brush
+            | aurora_ui::Tool::Pencil
+            | aurora_ui::Tool::CloneStamp
+            | aurora_ui::Tool::Smudge,
             PointerButton::Primary,
         ) => {
             Some(Drag::Brush {
@@ -12462,6 +12487,8 @@ fn begin_drag(
                 // ([`clone_stamp::set_drag_offset`]); a Clone Stamp drag
                 // always carries one.
                 clone: (tool == aurora_ui::Tool::CloneStamp).then_some((0, 0)),
+                // A press starts with nothing carried (0.222.0).
+                smudge: (tool == aurora_ui::Tool::Smudge).then(Box::default),
                 last_doc: view.to_document(canvas_point),
                 carry: 0.0,
                 stroke: active_pixel_layer
@@ -25742,7 +25769,12 @@ struct ToolSettings {
     selection_mode: aurora_doc::SelectionMode,
     /// The last value used for each Select > Modify command (0.216.0).
     refine_amounts: selection_refine::RefineAmounts,
+    /// The Smudge's strength, 1..=100 percent (0.222.0; default 50).
+    smudge_strength: u8,
 }
+
+/// The Smudge's default strength, percent (0.222.0).
+const DEFAULT_SMUDGE_STRENGTH: u8 = 50;
 
 /// The Paint Bucket's default tolerance (Photoshop's).
 const DEFAULT_TOLERANCE: u8 = 32;
@@ -25759,6 +25791,7 @@ impl Default for ToolSettings {
             gradient_opacity: 100,
             selection_mode: aurora_doc::SelectionMode::Replace,
             refine_amounts: selection_refine::RefineAmounts::default(),
+            smudge_strength: DEFAULT_SMUDGE_STRENGTH,
         }
     }
 }
@@ -25772,7 +25805,21 @@ impl ToolSettings {
             opacity: self.gradient_opacity,
             tolerance: self.tolerance,
             contiguous: self.contiguous,
+            strength: self.smudge_strength,
         }
+    }
+
+    /// Sets the Smudge strength from a slider value (rounded, clamped to
+    /// 1..=100; non-finite refused). Returns whether it changed.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn set_smudge_strength(&mut self, value: f64) -> bool {
+        if !value.is_finite() {
+            return false;
+        }
+        let strength = value.round().clamp(1.0, 100.0) as u8;
+        let changed = strength != self.smudge_strength;
+        self.smudge_strength = strength;
+        changed
     }
 
     /// Sets the Paint Bucket tolerance from a slider value (rounded,
@@ -25884,6 +25931,9 @@ enum LockRefusal {
     /// active, or the active layer is a group or an adjustment layer
     /// (0.221.0).
     CloneNeedsPixelLayer,
+    /// The Smudge with no pixel layer to drag: none is active, or the
+    /// active layer is a group or an adjustment layer (0.222.0).
+    SmudgeNeedsPixelLayer,
     /// An undo or redo could not read the step's saved data back (0.210.0:
     /// a pixel-history spill file a temp-file cleaner removed, or a corrupt
     /// one). Not a lock; the step stays in the History panel.
@@ -25953,6 +26003,9 @@ impl LockRefusal {
             LockRefusal::CloneNeedsPixelLayer => {
                 "Select a pixel layer to clone. A group, an adjustment layer or no layer can't be sampled."
             }
+            LockRefusal::SmudgeNeedsPixelLayer => {
+                "Select a pixel layer to smudge. A group, an adjustment layer or no layer can't be smudged."
+            }
             LockRefusal::HistoryUnavailable => {
                 "Couldn't undo or redo: history file unavailable. A temp-file cleaner may have removed it; the step stays in the list."
             }
@@ -26000,10 +26053,11 @@ fn press_refusal(tool: aurora_ui::Tool, lock: aurora_doc::LayerLock) -> Option<L
             PaintPermission::Refused(why) => Some(why),
             _ => None,
         },
-        // The Brush, the fills and the Clone Stamp (0.221.0) share the
-        // Brush's rule: refused on a pixels lock.
+        // The Brush, the fills, the Clone Stamp (0.221.0) and the Smudge
+        // (0.222.0) share the Brush's rule: refused on a pixels lock.
         aurora_ui::Tool::Brush
         | aurora_ui::Tool::CloneStamp
+        | aurora_ui::Tool::Smudge
         | aurora_ui::Tool::Gradient
         | aurora_ui::Tool::PaintBucket => match paint_permission(DabTool::Brush, lock) {
             PaintPermission::Refused(why) => Some(why),
@@ -26047,6 +26101,7 @@ fn lock_refusal_applies(
             refusal,
             LockRefusal::CloneNeedsSource | LockRefusal::CloneNeedsPixelLayer
         ) && tool == aurora_ui::Tool::CloneStamp)
+        || (refusal == LockRefusal::SmudgeNeedsPixelLayer && tool == aurora_ui::Tool::Smudge)
         || (refusal == LockRefusal::WandNeedsPixelLayer && tool == aurora_ui::Tool::MagicWand)
         || (refusal == LockRefusal::SelectionTooLarge
             && matches!(
@@ -26101,9 +26156,10 @@ impl ToolSettings {
     /// `tool`'s radius, or `None` for a tool that has none.
     fn radius(&self, tool: aurora_ui::Tool) -> Option<f32> {
         match tool {
-            aurora_ui::Tool::Brush | aurora_ui::Tool::Pencil | aurora_ui::Tool::CloneStamp => {
-                Some(self.brush_radius)
-            }
+            aurora_ui::Tool::Brush
+            | aurora_ui::Tool::Pencil
+            | aurora_ui::Tool::CloneStamp
+            | aurora_ui::Tool::Smudge => Some(self.brush_radius),
             aurora_ui::Tool::Eraser => Some(self.eraser_radius),
             aurora_ui::Tool::Move
             | aurora_ui::Tool::MarqueeSelect
@@ -26134,9 +26190,10 @@ impl ToolSettings {
             .clamp(aurora_ui::TOOL_RADIUS_MIN, aurora_ui::TOOL_RADIUS_MAX)
             as f32;
         let slot = match tool {
-            aurora_ui::Tool::Brush | aurora_ui::Tool::Pencil | aurora_ui::Tool::CloneStamp => {
-                &mut self.brush_radius
-            }
+            aurora_ui::Tool::Brush
+            | aurora_ui::Tool::Pencil
+            | aurora_ui::Tool::CloneStamp
+            | aurora_ui::Tool::Smudge => &mut self.brush_radius,
             aurora_ui::Tool::Eraser => &mut self.eraser_radius,
             _ => return false,
         };
@@ -30092,6 +30149,20 @@ impl App {
                 clone_stamp::Press::Stroke(offset) => clone_offset = Some(offset),
             }
         }
+        // The Smudge (0.222.0): a press needs a pixel layer the lock allows.
+        if self.tool == aurora_ui::Tool::Smudge
+            && button == PointerButton::Primary
+            && let Some(why) = smudge_stamp::press(
+                active_pixel_layer(&self.doc.layers, self.doc.active_layer).is_some(),
+                self.doc.active_layer.and_then(|id| {
+                    press_refusal(self.tool, self.doc.layers.lock(id).unwrap_or_default())
+                }),
+            )
+        {
+            self.lock_notice = Some((why, self.doc.active_layer));
+            self.sync_status_bar_now();
+            return;
+        }
         // The Paint Bucket fills on the press itself (0.209.0): no drag.
         if self.tool == aurora_ui::Tool::PaintBucket && button == PointerButton::Primary {
             let doc_point = self.doc.canvas_view.to_document(canvas_point);
@@ -30224,6 +30295,11 @@ impl App {
         // The Clone Stamp (0.221.0) is the Brush's drag with a cloned dab.
         if let Some(offset) = clone_stamp::drag_offset(self.drag.as_ref()) {
             self.clone_dab(doc_point, offset);
+            return;
+        }
+        // The Smudge (0.222.0) is the Brush's drag with a smudged dab.
+        if smudge_stamp::is_smudge(self.drag.as_ref()) {
+            self.smudge_dab(doc_point);
             return;
         }
         // The Pencil (0.220.0) is the Brush's drag with a hard dab.
@@ -30372,6 +30448,70 @@ impl App {
                 failed = outcome.failed().len(),
                 painted = outcome.painted().len(),
                 "failed to clone part of a dab"
+            );
+        }
+    }
+
+    /// One Smudge dab at `doc_point` (0.222.0): [`Self::clone_dab`]'s
+    /// preconditions, locks, selection, invalidation and per-stroke warning
+    /// dedupe, with [`smudge_stamp::smudge_dab_through_selection`] as the
+    /// stamp. Never runs in Quick Mask (the press is refused there).
+    fn smudge_dab(&mut self, doc_point: (f32, f32)) {
+        if self.quick_mask.is_some() {
+            return;
+        }
+        let Some(layer_id) = self.doc.active_layer else {
+            return;
+        };
+        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.doc.layers.kind(layer_id).cloned()
+        else {
+            return;
+        };
+        let Some(surface) = self.doc.layers.surface_id(layer_id) else {
+            return;
+        };
+        let preserve_alpha = match paint_permission(
+            DabTool::Brush,
+            self.doc.layers.lock(layer_id).unwrap_or_default(),
+        ) {
+            PaintPermission::Refused(why) => {
+                self.lock_notice = Some((why, Some(layer_id)));
+                return;
+            }
+            PaintPermission::PreserveAlpha => true,
+            PaintPermission::Allowed => false,
+        };
+        let selection = self.doc.selection.active();
+        let Some(store) = self.doc.tile_store.as_mut() else {
+            return;
+        };
+        let outcome = smudge_stamp::smudge_dab_through_selection(
+            preserve_alpha,
+            store,
+            surface,
+            bounds,
+            doc_point,
+            selection,
+            &self.tool_settings,
+            &mut self.drag,
+        );
+        let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
+        invalidate_painted_tiles(
+            &mut self.doc.composite_cache,
+            &self.doc.layers,
+            layer_id,
+            outcome.painted(),
+            reference_origin,
+        );
+        let fresh = unwarned_failures(&mut self.drag, &outcome);
+        for (tile, err) in &fresh {
+            tracing::warn!(
+                ?err,
+                ?tile,
+                first_failures = fresh.len(),
+                failed = outcome.failed().len(),
+                painted = outcome.painted().len(),
+                "failed to smudge part of a dab"
             );
         }
     }
@@ -68304,7 +68444,7 @@ mod tests {
                 aurora_ui::radius_slider_shown(&workspace.tree, &controls),
                 matches!(
                     tool,
-                    Tool::Brush | Tool::Pencil | Tool::Eraser | Tool::CloneStamp
+                    Tool::Brush | Tool::Pencil | Tool::Eraser | Tool::CloneStamp | Tool::Smudge
                 ),
                 "{tool:?}"
             );
@@ -68828,6 +68968,7 @@ mod tests {
             Some(Drag::Brush {
                 hard: _,
                 clone: _,
+                smudge: _,
                 last_doc,
                 carry,
                 stroke,
@@ -68888,6 +69029,7 @@ mod tests {
         Drag::Brush {
             hard: false,
             clone: None,
+            smudge: None,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: Some(aurora_brush::StrokeSnapshot::new(
@@ -68919,6 +69061,7 @@ mod tests {
             brush_stroke_mut(&mut Some(Drag::Brush {
                 hard: false,
                 clone: None,
+                smudge: None,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,
@@ -70030,6 +70173,7 @@ mod tests {
             Some(Drag::Brush {
                 hard: false,
                 clone: None,
+                smudge: None,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,
@@ -70410,6 +70554,7 @@ mod tests {
         let mut drag = Drag::Brush {
             hard: false,
             clone: None,
+            smudge: None,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
@@ -70449,6 +70594,7 @@ mod tests {
         let mut drag = Drag::Brush {
             hard: false,
             clone: None,
+            smudge: None,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
@@ -71114,6 +71260,7 @@ mod tests {
         let mut drag = Drag::Brush {
             hard: false,
             clone: None,
+            smudge: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71242,6 +71389,7 @@ mod tests {
         let mut drag = Drag::Brush {
             hard: false,
             clone: None,
+            smudge: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71350,6 +71498,7 @@ mod tests {
         let mut drag = Drag::Brush {
             hard: false,
             clone: None,
+            smudge: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71409,6 +71558,7 @@ mod tests {
         let mut drag = Drag::Brush {
             hard: false,
             clone: None,
+            smudge: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71458,6 +71608,7 @@ mod tests {
         let mut drag = Drag::Brush {
             hard: false,
             clone: None,
+            smudge: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71597,6 +71748,7 @@ mod tests {
         let mut drag = Drag::Brush {
             hard: false,
             clone: None,
+            smudge: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71742,6 +71894,7 @@ mod tests {
         let a_stroke = |view: &CanvasView| Drag::Brush {
             hard: false,
             clone: None,
+            smudge: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -77486,6 +77639,7 @@ mod tests {
             let mut drag = Drag::Brush {
                 hard: false,
                 clone: None,
+                smudge: None,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,

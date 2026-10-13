@@ -94,13 +94,16 @@ pub enum Tool {
     /// `aurora_brush::clone_dab_covered` in `aurora-app`. `Alt`+click sets
     /// the source.
     CloneStamp,
+    /// Drags the active pixel layer's pixels along the stroke (0.222.0):
+    /// real, via `aurora_brush::smudge_dab_covered` in `aurora-app`.
+    Smudge,
 }
 
 impl Tool {
     /// Every tool this enum has today, in the fixed order they're
     /// offered to the user (matches PLAN.md's own bullets: Move, Marquee
     /// Select, Zoom, Pan, Eyedropper, then Brush, Eraser, and the 0.209.0 fills Gradient and Paint Bucket).
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Move,
         Self::MarqueeSelect,
         Self::EllipticalMarquee,
@@ -114,6 +117,7 @@ impl Tool {
         Self::Pencil,
         Self::Eraser,
         Self::CloneStamp,
+        Self::Smudge,
         Self::Gradient,
         Self::PaintBucket,
     ];
@@ -152,6 +156,7 @@ impl Tool {
             Self::PaintBucket => "Paint Bucket",
             Self::Pencil => "Pencil",
             Self::CloneStamp => "Clone Stamp",
+            Self::Smudge => "Smudge",
         }
     }
 
@@ -172,6 +177,7 @@ impl Tool {
             Self::Brush | Self::Pencil => 'B',
             Self::Eraser => 'E',
             Self::CloneStamp => 'S',
+            Self::Smudge => 'R',
             Self::Gradient | Self::PaintBucket => 'G',
         }
     }
@@ -237,11 +243,11 @@ mod tests {
 
     #[test]
     fn all_lists_every_variant_once() {
-        assert_eq!(Tool::ALL.len(), 15);
+        assert_eq!(Tool::ALL.len(), 16);
         let mut seen = Tool::ALL.to_vec();
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
-        assert_eq!(seen.len(), 15, "ALL must not repeat a variant");
+        assert_eq!(seen.len(), 16, "ALL must not repeat a variant");
     }
 
     #[test]
@@ -270,6 +276,7 @@ mod tests {
         assert_eq!(Tool::Brush.shortcut_text(), "B");
         assert_eq!(Tool::Pencil.shortcut_text(), "Shift+B");
         assert_eq!(Tool::CloneStamp.shortcut_text(), "S");
+        assert_eq!(Tool::Smudge.shortcut_text(), "R");
     }
 
     #[test]

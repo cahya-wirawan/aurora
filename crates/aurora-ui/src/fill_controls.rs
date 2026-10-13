@@ -1,7 +1,10 @@
 //! The options bar's controls for the two fill tools (0.209.0): the
 //! **Gradient** (a Linear/Radial type pair, a Reverse checkbox, an
 //! Opacity readout and slider) and the **Paint Bucket** (a Tolerance
-//! readout and slider, a Contiguous checkbox).
+//! readout and slider, a Contiguous checkbox), and (0.222.0) the **Smudge**'s
+//! Strength readout and slider, built the way the Gradient's opacity is.
+//! The Smudge keeps the radius readout and slider (it has a radius); only
+//! the fill tools hide them.
 //!
 //! They live inside the existing options strip ([`ToolControls::options`]),
 //! after the radius readout and slider, as two group rows shown one at a
@@ -42,7 +45,12 @@ pub const OPACITY_MIN: f64 = 0.0;
 /// See [`OPACITY_MIN`].
 pub const OPACITY_MAX: f64 = 100.0;
 
-/// The widgets of both groups.
+/// The Smudge strength slider's range, in percent (0.222.0).
+pub const STRENGTH_MIN: f64 = 1.0;
+/// See [`STRENGTH_MIN`].
+pub const STRENGTH_MAX: f64 = 100.0;
+
+/// The widgets of all three groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FillControls {
     /// The Gradient group's row.
@@ -63,6 +71,12 @@ pub struct FillControls {
     pub tolerance: WidgetId,
     /// The "Contiguous" checkbox.
     pub contiguous: WidgetId,
+    /// The Smudge group's row (0.222.0).
+    pub smudge: WidgetId,
+    /// "Strength N %".
+    pub strength_readout: WidgetId,
+    /// The strength slider, 1 to 100.
+    pub strength: WidgetId,
 }
 
 /// The fill settings the controls mirror.
@@ -78,12 +92,20 @@ pub struct FillView {
     pub tolerance: u8,
     /// Paint Bucket contiguous.
     pub contiguous: bool,
+    /// Smudge strength, 1 to 100 (0.222.0).
+    pub strength: u8,
 }
 
 /// "Opacity 100 %".
 #[must_use]
 pub fn opacity_readout_text(percent: u8) -> String {
     format!("Opacity {percent} %")
+}
+
+/// "Strength 50 %" (0.222.0).
+#[must_use]
+pub fn strength_readout_text(percent: u8) -> String {
+    format!("Strength {percent} %")
 }
 
 /// "Tolerance 32".
@@ -168,8 +190,23 @@ pub fn insert_fill_controls(
     set_options_item(tree, scales, tolerance_readout, OptionsItem::Readout, true)?;
     set_options_item(tree, scales, tolerance, OptionsItem::Slider, true)?;
 
+    let smudge = widgets::insert_container(tree, options, group_style(scales))?;
+    let strength_readout = widgets::insert_label(tree, smudge, scales, strength_readout_text(50))?;
+    let strength = widgets::insert_slider(
+        tree,
+        smudge,
+        scales,
+        "Smudge strength",
+        50.0,
+        STRENGTH_MIN,
+        STRENGTH_MAX,
+    )?;
+    set_options_item(tree, scales, strength_readout, OptionsItem::Readout, true)?;
+    set_options_item(tree, scales, strength, OptionsItem::Slider, true)?;
+
     set_node_hidden(tree, gradient, true)?;
     set_node_hidden(tree, bucket, true)?;
+    set_node_hidden(tree, smudge, true)?;
     Ok(FillControls {
         gradient,
         radial,
@@ -180,6 +217,9 @@ pub fn insert_fill_controls(
         tolerance_readout,
         tolerance,
         contiguous,
+        smudge,
+        strength_readout,
+        strength,
     })
 }
 
@@ -249,6 +289,8 @@ pub fn sync_fill_controls(
             fill.bucket,
             matches!(tool, Tool::PaintBucket | Tool::MagicWand),
         ),
+        // The Smudge's Strength (0.222.0); it keeps the radius controls.
+        (fill.smudge, tool == Tool::Smudge),
     ] {
         changed |= set_item_shown(tree, group, shown)?;
         changed |= set_node_hidden(tree, group, !shown)?;
@@ -274,6 +316,12 @@ pub fn sync_fill_controls(
     )?;
     changed |= sync_slider(tree, fill.tolerance, f64::from(view.tolerance), captured)?;
     changed |= sync_checkbox(tree, fill.contiguous, view.contiguous)?;
+    changed |= widgets::set_label_text(
+        tree,
+        fill.strength_readout,
+        &strength_readout_text(view.strength),
+    )?;
+    changed |= sync_slider(tree, fill.strength, f64::from(view.strength), captured)?;
     Ok(changed)
 }
 
@@ -286,6 +334,8 @@ pub fn shown_fill_group(tree: &WidgetTree<WidgetKind>, controls: &ToolControls) 
         Some(Tool::Gradient)
     } else if shown(controls.fill.bucket) {
         Some(Tool::PaintBucket)
+    } else if shown(controls.fill.smudge) {
+        Some(Tool::Smudge)
     } else {
         None
     }
@@ -294,8 +344,8 @@ pub fn shown_fill_group(tree: &WidgetTree<WidgetKind>, controls: &ToolControls) 
 #[cfg(test)]
 mod tests {
     use super::{
-        FillView, TOLERANCE_MAX, is_fill_tool, opacity_readout_text, shown_fill_group,
-        sync_fill_controls, tolerance_readout_text,
+        FillView, STRENGTH_MAX, STRENGTH_MIN, TOLERANCE_MAX, is_fill_tool, opacity_readout_text,
+        shown_fill_group, strength_readout_text, sync_fill_controls, tolerance_readout_text,
     };
     use crate::tool::Tool;
     use crate::tool_controls::{ToolControls, insert_tool_controls, tool_controls_contains};
@@ -319,6 +369,7 @@ mod tests {
         opacity: 100,
         tolerance: 32,
         contiguous: true,
+        strength: 50,
     };
 
     fn built() -> (crate::Workspace, ToolControls) {
@@ -421,6 +472,7 @@ mod tests {
             opacity: 40,
             tolerance: 200,
             contiguous: false,
+            strength: 73,
         };
         assert!(sync(&mut ws, &controls, Tool::Gradient, view, None));
         assert!(!sync(&mut ws, &controls, Tool::Gradient, view, None));
@@ -476,5 +528,49 @@ mod tests {
             other => unreachable!("{other:?}"),
         };
         assert_eq!(text, "Tolerance 90");
+    }
+
+    #[test]
+    fn the_smudge_shows_its_strength_beside_the_radius_and_mirrors_it() {
+        let (mut ws, controls) = built();
+        let fill = controls.fill;
+        let view = FillView {
+            strength: 80,
+            ..VIEW
+        };
+        assert!(sync(&mut ws, &controls, Tool::Smudge, view, None));
+        ws.tree.compute_layout(1600.0, 900.0);
+        assert_eq!(shown_fill_group(&ws.tree, &controls), Some(Tool::Smudge));
+        assert!(shown(&ws.tree, fill.smudge));
+        assert!(!shown(&ws.tree, fill.gradient));
+        assert!(!shown(&ws.tree, fill.bucket));
+        assert!(!hidden_to_at(&ws.tree, fill.smudge));
+        // The Smudge has a radius: its readout stays.
+        assert!(shown(&ws.tree, controls.readout));
+        for id in [fill.strength_readout, fill.strength] {
+            assert!(tool_controls_contains(&ws.tree, &controls, id));
+            let Some(b) = ws.tree.bounds(id) else {
+                unreachable!("laid out");
+            };
+            assert!(b.width > 0 && b.height > 0, "{id:?} {b:?}");
+        }
+        let value = match ws.tree.payload(fill.strength) {
+            Some(WidgetKind::Slider(s)) => s.value,
+            other => unreachable!("{other:?}"),
+        };
+        assert!((value - 80.0).abs() < f64::EPSILON);
+        let text = match ws.tree.payload(fill.strength_readout) {
+            Some(WidgetKind::Label(s)) => s.text.clone(),
+            other => unreachable!("{other:?}"),
+        };
+        assert_eq!(text, "Strength 80 %");
+        assert_eq!(strength_readout_text(1), "Strength 1 %");
+        assert!((STRENGTH_MIN - 1.0).abs() < f64::EPSILON);
+        assert!((STRENGTH_MAX - 100.0).abs() < f64::EPSILON);
+        // Another tool hides it again (layout and assistive technology).
+        sync(&mut ws, &controls, Tool::Brush, view, None);
+        assert!(!shown(&ws.tree, fill.smudge));
+        assert!(hidden_to_at(&ws.tree, fill.smudge));
+        assert_eq!(shown_fill_group(&ws.tree, &controls), None);
     }
 }
