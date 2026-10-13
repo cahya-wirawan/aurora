@@ -377,9 +377,10 @@ pub(crate) fn menu_bar_enabled(is_macos: bool, env: Option<&str>) -> bool {
 }
 
 /// The ids the macOS native menu is built from (`build_menu`), kept here
-/// so a pure test can hold them against the model on every platform. The
-/// macOS-only test `native_menu_ids_match_the_const` walks the real built
-/// menu against this list.
+/// so a pure test can hold them against the model on every platform. It is
+/// a hand-kept list: nothing walks the real built menu against it
+/// (`muda::Menu::new()` needs the main thread), so a change to
+/// `build_menu` must update it by hand.
 #[cfg(test)]
 pub(crate) const NATIVE_MENU_COMMANDS: &[&str] = &[
     crate::COMMAND_FILE_OPEN,

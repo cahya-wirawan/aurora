@@ -4737,6 +4737,7 @@ enum AccessibilityReaction {
 /// Layers-panel row. Free and platform-free, like [`handle_dialog_key`],
 /// so it is testable with no window or adapter; the caller performs the
 /// side effects the returned [`AccessibilityReaction`] names.
+#[allow(clippy::too_many_lines)] // one more reaction arm (0.225.0: menu bar) tipped it over
 fn route_accessibility_action(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
