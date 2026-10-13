@@ -359,7 +359,8 @@ pub(crate) fn release_lasso(
             modal,
             ..
         }) => rebuild_live(points, clip, modal, selection, current),
-        _ => {}
+        // 0.216.0: a Marquee's newest throttled shape is placed exactly.
+        _ => crate::selection_modes::release_marquee(&mut ending, selection),
     }
     ending
 }

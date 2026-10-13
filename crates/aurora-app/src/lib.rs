@@ -559,6 +559,7 @@ mod selection_modes;
 mod selection_paint;
 #[cfg(test)]
 mod selection_paint_tests;
+mod selection_refine;
 mod selection_view;
 mod small_machine;
 mod workspace_presets;
@@ -5641,7 +5642,7 @@ impl FileDialogAccess for SystemFileDialog {
 /// `App::handle_menu_event` run them via the same [`run_command`]
 /// path `Ctrl+Z`/`Ctrl+Shift+Z` already use, so there is exactly one
 /// place either command's own logic lives, not a second copy here).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum ActivatedCommand {
     OpenFile(PathBuf),
     SaveFile(PathBuf),
@@ -5690,6 +5691,11 @@ enum ActivatedCommand {
     Selection(selection_view::SelectionCommand),
     /// Choose the selection tools' mode button (0.215.0): palette only.
     SetSelectionMode(aurora_doc::SelectionMode),
+    /// Select > Modify (0.216.0): open the number prompt of a command.
+    RefinePrompt(selection_refine::RefineKind),
+    /// Select > Modify (0.216.0): apply a command with the number the
+    /// prompt accepted.
+    RefineApply(selection_refine::RefineKind, f32),
     /// Select a tool from the palette (0.209.0).
     SelectTool(aurora_ui::Tool),
     /// A keyboard panel move (0.166.0, [`PANEL_MOVE_COMMANDS`]) —
@@ -5970,6 +5976,12 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_SELECT_DESELECT, "Deselect"),
         CommandEntry::new(COMMAND_SELECT_INVERSE, "Inverse Selection"),
     ];
+    // 0.216.0: Select > Modify.
+    commands.extend(
+        selection_refine::RefineKind::ALL
+            .iter()
+            .map(|kind| CommandEntry::new(kind.command_id(), kind.menu_label())),
+    );
     // 0.215.0: the selection tools' mode button.
     commands.extend(aurora_doc::SelectionMode::ALL.iter().map(|mode| {
         CommandEntry::new(
@@ -6203,6 +6215,9 @@ fn activate_command(
     }
     if id == COMMAND_COLOURS_RESET {
         return Some(ActivatedCommand::ResetColours);
+    }
+    if let Some(kind) = selection_refine::RefineKind::for_command(id) {
+        return Some(ActivatedCommand::RefinePrompt(kind));
     }
     if id == COMMAND_SELECT_ALL {
         return Some(ActivatedCommand::Selection(
@@ -9850,6 +9865,37 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(COMMAND_SELECT_ALL, "Select All", true, None),
             &muda::MenuItem::with_id(COMMAND_SELECT_DESELECT, "Deselect", true, None),
             &muda::MenuItem::with_id(COMMAND_SELECT_INVERSE, "Inverse Selection", true, None),
+            &muda::PredefinedMenuItem::separator(),
+            &muda::MenuItem::with_id(
+                selection_refine::RefineKind::Feather.command_id(),
+                selection_refine::RefineKind::Feather.menu_label(),
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                selection_refine::RefineKind::Expand.command_id(),
+                selection_refine::RefineKind::Expand.menu_label(),
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                selection_refine::RefineKind::Contract.command_id(),
+                selection_refine::RefineKind::Contract.menu_label(),
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                selection_refine::RefineKind::Smooth.command_id(),
+                selection_refine::RefineKind::Smooth.menu_label(),
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                selection_refine::RefineKind::Border.command_id(),
+                selection_refine::RefineKind::Border.menu_label(),
+                true,
+                None,
+            ),
         ],
     ) {
         Ok(submenu) => submenu,
@@ -11023,6 +11069,15 @@ fn handle_palette_key(
             }
         }
         Key::Named(NamedKey::Enter) => {
+            // 0.216.0: a Select > Modify prompt checks its number the same way.
+            match selection_refine::prompt_enter(&mut workspace.tree, root) {
+                Some(Ok((kind, amount))) => {
+                    close_command_palette(workspace, focus, palette);
+                    return Some(ActivatedCommand::RefineApply(kind, amount));
+                }
+                Some(Err(())) => return None,
+                None => {}
+            }
             // 0.168.0: the workspace name prompt checks the typed name; a
             // refused one keeps the prompt open with the reason shown.
             match workspace_presets::name_prompt_enter(&mut workspace.tree, root) {
@@ -12329,15 +12384,16 @@ fn continue_drag(
         } => {
             let current_doc = view.to_document(canvas_point);
             let rect = aurora_ui::tool::marquee_rect(*start_doc, current_doc);
-            modal.place(
-                selection,
-                Some(&if *elliptical {
-                    aurora_doc::Selection::ellipse(rect)
-                } else {
-                    aurora_doc::Selection::new(rect)
-                }),
-            );
-            *current = selection.active();
+            let shape = if *elliptical {
+                aurora_doc::Selection::ellipse(rect)
+            } else {
+                aurora_doc::Selection::new(rect)
+            };
+            // 0.216.0: a combining update that is slow backs off; the
+            // release places the newest shape exactly.
+            if modal.place_throttled(selection, shape, std::time::Instant::now()) {
+                *current = selection.active();
+            }
             Vec::new()
         }
         Drag::Lasso {
@@ -25490,6 +25546,8 @@ struct ToolSettings {
     /// chose Add, Subtract or Intersect; modifiers held at a press apply
     /// only while it is New.
     selection_mode: aurora_doc::SelectionMode,
+    /// The last value used for each Select > Modify command (0.216.0).
+    refine_amounts: selection_refine::RefineAmounts,
 }
 
 /// The Paint Bucket's default tolerance (Photoshop's).
@@ -25506,6 +25564,7 @@ impl Default for ToolSettings {
             gradient_reverse: false,
             gradient_opacity: 100,
             selection_mode: aurora_doc::SelectionMode::Replace,
+            refine_amounts: selection_refine::RefineAmounts::default(),
         }
     }
 }
@@ -25588,6 +25647,11 @@ enum LockRefusal {
     WandNeedsPixelLayer,
     /// A Magic Wand region is over the tile or area cap (0.214.0).
     SelectionTooLarge,
+    /// Select > Modify with nothing selected (0.216.0).
+    RefineNeedsSelection,
+    /// A Select > Modify result is over the mask cap or the work budget
+    /// (0.216.0).
+    RefineTooLarge,
     /// An undo or redo could not read the step's saved data back (0.210.0:
     /// a pixel-history spill file a temp-file cleaner removed, or a corrupt
     /// one). Not a lock; the step stays in the History panel.
@@ -25621,7 +25685,13 @@ impl LockRefusal {
                 "Select a pixel layer to use the Magic Wand. A group, an adjustment layer or no layer can't be sampled."
             }
             LockRefusal::SelectionTooLarge => {
-                "That region is too large to select in one step (over 64 megapixels). Raise the tolerance less, or turn Contiguous on."
+                "That selection is too large to build in one step (over 64 megapixels). Use a smaller region; for the Magic Wand, raise the tolerance less or turn Contiguous on."
+            }
+            LockRefusal::RefineNeedsSelection => {
+                "Make a selection first. Select > Modify changes the selection you have."
+            }
+            LockRefusal::RefineTooLarge => {
+                "That selection is too large to modify in one step (over about 24 megapixels, or 64 megapixels once grown). Use a smaller selection or a smaller amount."
             }
             LockRefusal::HistoryUnavailable => {
                 "Couldn't undo or redo: history file unavailable. A temp-file cleaner may have removed it; the step stays in the list."
@@ -25703,10 +25773,20 @@ fn lock_refusal_applies(
             tool,
             aurora_ui::Tool::Gradient | aurora_ui::Tool::PaintBucket
         ))
-        || (matches!(
+        || (refusal == LockRefusal::WandNeedsPixelLayer && tool == aurora_ui::Tool::MagicWand)
+        || (refusal == LockRefusal::SelectionTooLarge
+            && matches!(
+                tool,
+                aurora_ui::Tool::MagicWand
+                    | aurora_ui::Tool::MarqueeSelect
+                    | aurora_ui::Tool::EllipticalMarquee
+                    | aurora_ui::Tool::Lasso
+                    | aurora_ui::Tool::PolygonalLasso
+            ))
+        || matches!(
             refusal,
-            LockRefusal::WandNeedsPixelLayer | LockRefusal::SelectionTooLarge
-        ) && tool == aurora_ui::Tool::MagicWand)
+            LockRefusal::RefineNeedsSelection | LockRefusal::RefineTooLarge
+        )
 }
 
 /// Turns a failed pixel undo/redo (0.210.0: the step's saved history data
@@ -27447,6 +27527,8 @@ impl App {
             Some(ActivatedCommand::Selection(command)) => self.run_selection_command(command),
             Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
             Some(ActivatedCommand::SetSelectionMode(mode)) => self.set_selection_mode(mode),
+            Some(ActivatedCommand::RefinePrompt(kind)) => self.open_refine_prompt(kind),
+            Some(ActivatedCommand::RefineApply(kind, amount)) => self.run_refine(kind, amount),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -29396,6 +29478,10 @@ impl App {
                 }
             }
         }
+        // 0.216.0: a live combination the mask cap refused says so once.
+        if selection_modes::drag_refusal(self.drag.as_ref()) {
+            self.note_selection_too_large();
+        }
         match self.drag.as_ref() {
             Some(Drag::Move {
                 layer_id,
@@ -29986,6 +30072,11 @@ impl App {
     /// the free function, which needs no `App` (and therefore no GPU
     /// adapter) to test.
     fn commit_drag(&mut self, drag: Option<Drag>) {
+        // 0.216.0: a live combination the mask cap refused during the
+        // gesture says so once, whichever path ends it.
+        if selection_modes::drag_refusal(drag.as_ref()) {
+            self.note_selection_too_large();
+        }
         // A finished Marquee drag is recorded as one selection step by
         // `commit_ending_drag` (0.213.0).
         self.needs_redraw |= matches!(drag, Some(Drag::Marquee { .. } | Drag::Lasso { .. }));
@@ -30356,6 +30447,8 @@ impl App {
             Some(ActivatedCommand::Selection(command)) => self.run_selection_command(command),
             Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
             Some(ActivatedCommand::SetSelectionMode(mode)) => self.set_selection_mode(mode),
+            Some(ActivatedCommand::RefinePrompt(kind)) => self.open_refine_prompt(kind),
+            Some(ActivatedCommand::RefineApply(kind, amount)) => self.run_refine(kind, amount),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -31171,6 +31264,58 @@ impl App {
     /// disagree with a shortcut's result.
     /// Chooses the selection tools' mode button (0.215.0); applies to the
     /// next press (a gesture in progress keeps the mode it began with).
+    /// The calm notice for a live selection combination over the mask cap
+    /// (0.216.0); the caller gives it once per gesture.
+    fn note_selection_too_large(&mut self) {
+        self.lock_notice = Some((LockRefusal::SelectionTooLarge, self.doc.active_layer));
+        self.sync_status_bar_now();
+    }
+
+    /// Select > Modify (0.216.0): opens the number prompt of `kind`, or
+    /// says there is nothing to modify. A live selection gesture ends
+    /// first (the selection returns to what it replaced).
+    fn open_refine_prompt(&mut self, kind: selection_refine::RefineKind) {
+        lasso_tools::cancel_selection_gesture(&mut self.drag, &mut self.doc.selection);
+        if self.doc.selection.active().is_none() {
+            self.lock_notice = Some((LockRefusal::RefineNeedsSelection, self.doc.active_layer));
+            self.sync_status_bar_now();
+            return;
+        }
+        if selection_refine::open_prompt(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.command_palette,
+            kind,
+            self.tool_settings.refine_amounts.get(kind),
+        ) {
+            self.push_accessibility();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Select > Modify (0.216.0): applies `kind` by `amount` as one undo
+    /// step ([`selection_refine::refine_step`]) and remembers the amount.
+    fn run_refine(&mut self, kind: selection_refine::RefineKind, amount: f32) {
+        lasso_tools::cancel_selection_gesture(&mut self.drag, &mut self.doc.selection);
+        self.tool_settings.refine_amounts.set(kind, amount);
+        match selection_refine::refine_step(
+            &mut self.workspace,
+            &mut self.doc.undo_order,
+            &mut self.doc.history,
+            &mut self.doc.pixel_history,
+            &mut self.doc.selection,
+            kind,
+            amount,
+        ) {
+            selection_refine::RefineOutcome::Applied => self.needs_redraw = true,
+            selection_refine::RefineOutcome::Unchanged => {}
+            selection_refine::RefineOutcome::Refused(why) => {
+                self.lock_notice = Some((why, self.doc.active_layer));
+                self.sync_status_bar_now();
+            }
+        }
+    }
+
     fn set_selection_mode(&mut self, mode: aurora_doc::SelectionMode) {
         self.tool_settings.selection_mode = mode;
         self.sync_tool_controls_now();
@@ -31310,6 +31455,14 @@ impl App {
                         .and_then(|layer| self.doc.layers.lock(layer))
                         .unwrap_or_default(),
                 ))
+        {
+            self.lock_notice = None;
+        }
+        // "Make a selection first" goes once there is one.
+        if matches!(
+            self.lock_notice,
+            Some((LockRefusal::RefineNeedsSelection, _))
+        ) && self.doc.selection.active().is_some()
         {
             self.lock_notice = None;
         }

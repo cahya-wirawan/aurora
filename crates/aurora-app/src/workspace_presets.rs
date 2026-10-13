@@ -483,6 +483,10 @@ pub(crate) fn follow_name_prompt_query(
     tree: &mut aurora_widgets::WidgetTree<super::WidgetKind>,
     root: WidgetId,
 ) {
+    // 0.216.0: a Select > Modify prompt follows its own number.
+    if super::selection_refine::follow_prompt_query(tree, root) {
+        return;
+    }
     let Ok(state) = command_palette_state(tree, root) else {
         return;
     };

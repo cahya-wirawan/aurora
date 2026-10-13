@@ -60,6 +60,17 @@ pub(crate) struct ModeGesture {
     /// The selection in force at the press (`None`: nothing). Only
     /// consulted when `mode` is not New.
     pub base: Option<Selection>,
+    /// A combination the mask cap refused during this gesture (0.216.0);
+    /// latched. [`Self::take_refusal`] turns it into one notice.
+    pub refused: std::cell::Cell<bool>,
+    /// Whether the notice for [`Self::refused`] was already given.
+    pub notified: std::cell::Cell<bool>,
+    /// After a slow live combination, the time before which the next one
+    /// is skipped (0.216.0; the Lasso's back-off, [`crate::lasso_tools`]).
+    pub not_before: Option<std::time::Instant>,
+    /// The newest shape a skipped update left unplaced; the release
+    /// places it exactly ([`release_marquee`]).
+    pub pending: Option<Selection>,
 }
 
 impl ModeGesture {
@@ -68,6 +79,10 @@ impl ModeGesture {
         Self {
             mode: SelectionMode::Replace,
             base: None,
+            refused: std::cell::Cell::new(false),
+            notified: std::cell::Cell::new(false),
+            not_before: None,
+            pending: None,
         }
     }
 
@@ -107,10 +122,72 @@ impl ModeGesture {
                     ?err,
                     "a combined selection is over the cap; the selection is unchanged"
                 );
+                self.refused.set(true);
                 return false;
             }
         }
         true
+    }
+}
+
+impl ModeGesture {
+    /// One live update of a Marquee or Ellipse gesture (0.216.0): in a
+    /// combining mode the combination is recomputed per pointer move, so
+    /// after one slower than [`crate::lasso_tools::SLOW_REBUILD`] the next
+    /// updates wait (the Lasso's back-off) and the newest shape is kept in
+    /// [`Self::pending`] for the release. `now` is when the update began.
+    /// Returns whether the selection was updated.
+    pub(crate) fn place_throttled(
+        &mut self,
+        selection: &mut SelectionSet,
+        shape: Selection,
+        now: std::time::Instant,
+    ) -> bool {
+        if self.mode == SelectionMode::Replace {
+            self.pending = None;
+            return self.place(selection, Some(&shape));
+        }
+        if self.not_before.is_some_and(|t| now < t) {
+            self.pending = Some(shape);
+            return false;
+        }
+        let placed = self.place(selection, Some(&shape));
+        self.pending = None;
+        self.not_before = crate::lasso_tools::backoff_until(now, now.elapsed());
+        placed
+    }
+
+    /// Whether a refused combination still needs its notice, once per
+    /// gesture.
+    pub(crate) fn take_refusal(&self) -> bool {
+        if self.refused.get() && !self.notified.get() {
+            self.notified.set(true);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// [`ModeGesture::take_refusal`] of the gesture a live drag carries.
+pub(crate) fn drag_refusal(drag: Option<&crate::Drag>) -> bool {
+    match drag {
+        Some(crate::Drag::Marquee { modal, .. } | crate::Drag::Lasso { modal, .. }) => {
+            modal.take_refusal()
+        }
+        _ => false,
+    }
+}
+
+/// A Marquee release: the newest shape a throttled update skipped is
+/// placed now, so the finished selection is exact whatever the back-off
+/// did mid-drag.
+pub(crate) fn release_marquee(ending: &mut Option<crate::Drag>, selection: &mut SelectionSet) {
+    if let Some(crate::Drag::Marquee { current, modal, .. }) = ending.as_mut()
+        && let Some(shape) = modal.pending.take()
+        && modal.place(selection, Some(&shape))
+    {
+        *current = selection.active();
     }
 }
 
@@ -131,6 +208,7 @@ pub(crate) fn press_selection(
             ModeGesture {
                 mode,
                 base: before.clone(),
+                ..ModeGesture::replace()
             },
             before,
         )

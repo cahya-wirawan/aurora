@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-13, version 0.215.0.** This file is updated every round (every
+**As of 2026-10-13, version 0.216.0.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -115,6 +115,14 @@ golden-image tests are `#[ignore]`d.
   "Inverse Selection") that never marks the document unsaved. Selections are
   still not saved (`.aur`/PSD), are lost when the document closes, and the outline is
   not clipped to the document; nothing of this has been seen live or on the Mac.
+  Since 0.216.0 the selection can be reshaped: **Feather, Expand, Contract, Smooth
+  and Border Selection** (palette and the macOS Edit menu), each asking for a number
+  of pixels in the palette's prompt (the last value is remembered for the session),
+  each one undo step; Expand/Contract are exact Euclidean distances, Feather is a
+  Gaussian (sigma = radius / 2), inverted selections are handled exactly; results over
+  64 Mpx or too slow (about 24 Mpx) are refused with a notice. Combining Marquee drags
+  back off when slow and say so when the 64 Mpx cap refuses a combination. Not seen
+  live nor on the Mac.
   Since 0.215.0 every selection tool has **selection modes**: New (default), Add
   (`Shift` held at the press), Subtract (`Alt`), Intersect (`Shift+Alt`), or a mode
   chosen with the options bar's New/Add/Subtract/Intersect checkboxes (which override

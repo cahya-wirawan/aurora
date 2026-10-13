@@ -2541,3 +2541,438 @@ fn the_mode_labels_and_palette_names_are_distinct_and_new_keeps_the_tool_label()
         None
     );
 }
+
+// ---- Select > Modify (0.216.0) ----
+
+use crate::selection_refine::{self, RefineKind, RefineOutcome};
+
+impl Rig {
+    /// One Select > Modify command as `App::run_refine` runs it.
+    fn refine(&mut self, kind: RefineKind, amount: f32) -> RefineOutcome {
+        selection_refine::refine_step(
+            &mut self.workspace,
+            &mut self.undo_order,
+            &mut self.history,
+            &mut self.pixel_history,
+            &mut self.selection,
+            kind,
+            amount,
+        )
+    }
+}
+
+#[test]
+fn every_refinement_is_one_labelled_dirty_neutral_step_that_undoes_and_redoes_exactly() {
+    for (kind, amount, label) in [
+        (RefineKind::Feather, 6.0, "Feather Selection"),
+        (RefineKind::Expand, 4.0, "Expand Selection"),
+        (RefineKind::Contract, 4.0, "Contract Selection"),
+        (RefineKind::Smooth, 3.0, "Smooth Selection"),
+        (RefineKind::Border, 4.0, "Border Selection"),
+    ] {
+        let mut rig = Rig::new(rect(0, 0, 400, 300));
+        rig.marquee_step(Tool::EllipticalMarquee, (50.0, 40.0), (150.0, 120.0));
+        let before = rig.selection.active();
+        let content = rig.undo_order.content_revision;
+        assert_eq!(rig.refine(kind, amount), RefineOutcome::Applied, "{label}");
+        let after = rig.selection.active();
+        assert_ne!(after, before, "{label}");
+        assert_eq!(rig.labels().last().map(String::as_str), Some(label));
+        assert_eq!(
+            rig.undo_order.content_revision, content,
+            "{label} is dirty-neutral"
+        );
+        // Undo puts back exactly what was there; redo exactly the result.
+        assert!(rig.step(UndoDirection::Undo));
+        assert_eq!(rig.selection.active(), before, "{label} undo");
+        assert!(rig.step(UndoDirection::Redo));
+        assert_eq!(rig.selection.active(), after, "{label} redo");
+    }
+}
+
+#[test]
+fn a_history_jump_over_a_refine_step_restores_the_exact_selection() {
+    use std::collections::HashMap;
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (50.0, 40.0), (150.0, 120.0));
+    let first = rig.selection.active();
+    assert_eq!(rig.refine(RefineKind::Expand, 5.0), RefineOutcome::Applied);
+    let second = rig.selection.active();
+    assert_eq!(rig.refine(RefineKind::Feather, 5.0), RefineOutcome::Applied);
+    let third = rig.selection.active();
+    let scales = match crate::load_scales() {
+        Ok(s) => s,
+        Err(err) => unreachable!("{err}"),
+    };
+    let mut cache = CompositeCache::default();
+    let mut layer_rows = HashMap::new();
+    let mut active = Some(rig.layer);
+    let mut state = crate::LayerControlsState::default();
+    let mut drag = None;
+    let mut focus = aurora_widgets::FocusManager::default();
+    for (target, expected) in [(1, &first), (3, &third), (2, &second)] {
+        let _ = crate::perform_history_jump(
+            &mut crate::HistoryJumpContext {
+                workspace: &mut rig.workspace,
+                focus: &mut focus,
+                scales: &scales,
+                layers: &mut rig.layers,
+                history: &mut rig.history,
+                pixel_history: &mut rig.pixel_history,
+                store: Some(&mut rig.store),
+                undo_order: &mut rig.undo_order,
+                composite_cache: &mut cache,
+                view: &mut rig.view,
+                layer_rows: &mut layer_rows,
+                active_layer: &mut active,
+                drag: &mut drag,
+                layer_controls: &mut state,
+            },
+            target,
+        );
+        selection_view::apply_pending_selection(&mut rig.undo_order, &mut rig.selection);
+        assert_eq!(&rig.selection.active(), expected, "jump to row {target}");
+    }
+}
+
+#[test]
+fn modifying_with_no_selection_says_so_and_records_nothing() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    for kind in RefineKind::ALL {
+        assert_eq!(
+            rig.refine(kind, 3.0),
+            RefineOutcome::Refused(crate::LockRefusal::RefineNeedsSelection)
+        );
+    }
+    assert!(rig.labels().is_empty());
+    assert!(rig.selection.active().is_none());
+    let notice = crate::LockRefusal::RefineNeedsSelection.message();
+    assert!(notice.contains("selection"));
+}
+
+#[test]
+fn a_selection_too_large_to_modify_is_refused_calmly_and_unchanged() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let big = Selection::new(rect(0, 0, 7000, 7000));
+    rig.selection.select(big.clone());
+    for kind in RefineKind::ALL {
+        assert_eq!(
+            rig.refine(kind, 3.0),
+            RefineOutcome::Refused(crate::LockRefusal::RefineTooLarge),
+            "{kind:?}"
+        );
+    }
+    assert_eq!(rig.selection.active(), Some(big));
+    assert!(rig.labels().is_empty());
+}
+
+#[test]
+fn a_contract_that_leaves_nothing_deselects_as_one_step() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (50.0, 40.0), (56.0, 120.0));
+    let before = rig.selection.active();
+    assert_eq!(
+        rig.refine(RefineKind::Contract, 5.0),
+        RefineOutcome::Applied
+    );
+    assert!(rig.selection.active().is_none());
+    assert!(rig.step(UndoDirection::Undo));
+    assert_eq!(rig.selection.active(), before);
+}
+
+#[test]
+fn a_feather_below_one_pixel_changes_nothing_and_records_nothing() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (50.0, 40.0), (150.0, 120.0));
+    let steps = rig.labels().len();
+    assert_eq!(
+        rig.refine(RefineKind::Feather, 0.5),
+        RefineOutcome::Unchanged
+    );
+    assert_eq!(rig.labels().len(), steps);
+}
+
+#[test]
+fn painting_through_a_feathered_selection_takes_fractional_coverage() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (100.0, 100.0), (220.0, 180.0));
+    assert_eq!(
+        rig.refine(RefineKind::Feather, 12.0),
+        RefineOutcome::Applied
+    );
+    let selection = ok_selection(&rig);
+    assert!(matches!(selection.shape, SelectionShape::Mask(_)));
+    rig.settings.set_radius(Tool::Brush, 40.0);
+    assert!(rig.stroke(Tool::Brush, &[(40.0, 140.0), (300.0, 140.0)], false));
+    let mut partial = 0;
+    for y in 0..300_u32 {
+        for x in 0..400_u32 {
+            let c = selection.coverage_at(i64::from(x), i64::from(y));
+            let a = rig.alpha(x, y);
+            if c == 0.0 {
+                assert_eq!(a, 0.0, "outside the feather ({x}, {y})");
+            } else if a > 0.0 && a < 1.0 {
+                partial += 1;
+            }
+        }
+    }
+    assert!(
+        partial > 20,
+        "the feathered edge took fractional paint ({partial})"
+    );
+}
+
+#[test]
+fn the_prompt_accepts_numbers_by_the_kinds_own_rules() {
+    use selection_refine::parse_amount;
+    assert_eq!(parse_amount(RefineKind::Expand, "5"), Ok(5.0));
+    assert_eq!(parse_amount(RefineKind::Expand, " 12 px "), Ok(12.0));
+    assert_eq!(parse_amount(RefineKind::Feather, "2.5"), Ok(2.5));
+    assert_eq!(parse_amount(RefineKind::Contract, "500"), Ok(500.0));
+    assert!(parse_amount(RefineKind::Contract, "501").is_err());
+    assert!(parse_amount(RefineKind::Smooth, "100").is_ok());
+    assert!(parse_amount(RefineKind::Smooth, "101").is_err());
+    assert!(parse_amount(RefineKind::Feather, "250").is_ok());
+    assert!(parse_amount(RefineKind::Feather, "250.5").is_err());
+    for bad in [
+        "", "  ", "0", "-3", "abc", "1e2", "NaN", "inf", "5.5", "3 4", ".", "0.5",
+    ] {
+        assert!(
+            parse_amount(RefineKind::Border, bad).is_err(),
+            "Border accepted {bad:?}"
+        );
+    }
+    assert!(parse_amount(RefineKind::Feather, "0.5").is_err());
+    assert!(parse_amount(RefineKind::Feather, "5.5.5").is_err());
+}
+
+#[test]
+fn the_prompt_opens_with_the_last_value_validates_on_enter_and_cancels() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut focus = aurora_widgets::FocusManager::default();
+    let mut palette = None;
+    assert!(selection_refine::open_prompt(
+        &mut rig.workspace,
+        &mut focus,
+        &mut palette,
+        RefineKind::Expand,
+        7.0
+    ));
+    let Some(root) = palette else {
+        unreachable!("open");
+    };
+    // A second prompt while one is open is refused.
+    assert!(!selection_refine::open_prompt(
+        &mut rig.workspace,
+        &mut focus,
+        &mut palette,
+        RefineKind::Feather,
+        7.0
+    ));
+    let state = aurora_widgets::widgets::command_palette_state(&rig.workspace.tree, root);
+    let Ok(state) = state else {
+        unreachable!("state")
+    };
+    assert_eq!(state.query(), "7");
+    assert!(
+        state
+            .selected()
+            .is_some_and(|e| e.title.contains("Expand Selection by 7 px"))
+    );
+    // Enter on the opening value is valid.
+    assert_eq!(
+        selection_refine::prompt_enter(&mut rig.workspace.tree, root),
+        Some(Ok((RefineKind::Expand, 7.0)))
+    );
+    // A bad value keeps the prompt and shows the reason; typing withdraws it.
+    let _ = aurora_widgets::widgets::set_command_palette_query(&mut rig.workspace.tree, root, "9x");
+    assert!(selection_refine::follow_prompt_query(
+        &mut rig.workspace.tree,
+        root
+    ));
+    assert_eq!(
+        selection_refine::prompt_enter(&mut rig.workspace.tree, root),
+        Some(Err(()))
+    );
+    let Ok(state) = aurora_widgets::widgets::command_palette_state(&rig.workspace.tree, root)
+    else {
+        unreachable!("state")
+    };
+    assert!(state.selected().is_some_and(|e| e.title.contains("digits")));
+    let _ =
+        aurora_widgets::widgets::set_command_palette_query(&mut rig.workspace.tree, root, "900");
+    assert!(selection_refine::follow_prompt_query(
+        &mut rig.workspace.tree,
+        root
+    ));
+    assert_eq!(
+        selection_refine::prompt_enter(&mut rig.workspace.tree, root),
+        Some(Err(()))
+    );
+    // Escape closes it as it closes any palette.
+    crate::close_command_palette(&mut rig.workspace, &mut focus, &mut palette);
+    assert!(palette.is_none());
+    // The remembered amount is per command.
+    let mut amounts = selection_refine::RefineAmounts::default();
+    amounts.set(RefineKind::Smooth, 9.0);
+    assert_eq!(amounts.get(RefineKind::Smooth), 9.0);
+    assert_eq!(amounts.get(RefineKind::Expand), 5.0);
+}
+
+#[test]
+fn the_commands_are_in_the_palette_and_route_to_their_prompts() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut focus = aurora_widgets::FocusManager::default();
+    let entries = crate::palette_commands();
+    for kind in RefineKind::ALL {
+        assert_eq!(RefineKind::for_command(kind.command_id()), Some(kind));
+        assert_eq!(RefineKind::for_row(kind.row_id()), Some(kind));
+        assert!(kind.menu_label().ends_with('\u{2026}'));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.id == kind.command_id() && e.title == kind.menu_label()),
+            "{kind:?} is in the palette"
+        );
+        let mut dialog = crate::tests::FakeFileDialog::default();
+        assert!(matches!(
+            crate::activate_command(&mut rig.workspace, &mut focus, kind.command_id(), &mut dialog),
+            Some(crate::ActivatedCommand::RefinePrompt(k)) if k == kind
+        ));
+    }
+}
+
+#[test]
+fn a_slow_live_combination_backs_off_and_the_release_places_the_newest_shape_exactly() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 60.0));
+    let mut drag = rig.press_marquee_mode(
+        Tool::EllipticalMarquee,
+        (100.0, 100.0),
+        aurora_doc::SelectionMode::Add,
+    );
+    rig.drag_to(&mut drag, (140.0, 130.0));
+    let shown = rig.selection.active();
+    // A slow update was just seen: the next ones wait.
+    let far = std::time::Instant::now() + std::time::Duration::from_hours(1);
+    if let Some(Drag::Marquee { modal, .. }) = drag.as_mut() {
+        modal.not_before = Some(far);
+    }
+    rig.drag_to(&mut drag, (200.0, 190.0));
+    assert_eq!(
+        rig.selection.active(),
+        shown,
+        "the skipped update changed nothing"
+    );
+    // The release is exact whatever the back-off did.
+    let mut slot = None;
+    let ending = lasso_tools::release_lasso(&mut slot, drag, &mut rig.selection);
+    let exact = rig.selection.active();
+    assert_ne!(exact, shown);
+    let Some(exact_sel) = exact.clone() else {
+        unreachable!("selected")
+    };
+    assert!(exact_sel.coverage_at(150, 145) > 0.0);
+    assert!(rig.end_drag(ending));
+    // The same gesture without any back-off gives the same selection.
+    let mut other = Rig::new(rect(0, 0, 400, 300));
+    other.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 60.0));
+    assert!(other.marquee_mode(
+        Tool::EllipticalMarquee,
+        aurora_doc::SelectionMode::Add,
+        (100.0, 100.0),
+        (200.0, 190.0)
+    ));
+    assert_eq!(other.selection.active(), exact);
+}
+
+#[test]
+fn a_combination_slower_than_the_limit_sets_the_back_off() {
+    let mut selection = aurora_doc::SelectionSet::new();
+    selection.select(Selection::ellipse(rect(0, 0, 3000, 3000)));
+    let mut gesture = selection_modes::ModeGesture {
+        mode: aurora_doc::SelectionMode::Add,
+        base: selection.active(),
+        ..selection_modes::ModeGesture::replace()
+    };
+    let shape = Selection::ellipse(rect(500, 500, 3000, 3000));
+    let started = std::time::Instant::now();
+    assert!(gesture.place_throttled(&mut selection, shape.clone(), started));
+    assert!(
+        gesture.not_before.is_some(),
+        "a union of two 3000 px ellipses is slower than {:?}",
+        lasso_tools::SLOW_REBUILD
+    );
+    // Within the back-off the update is only remembered.
+    assert!(!gesture.place_throttled(&mut selection, shape.clone(), std::time::Instant::now()));
+    assert_eq!(gesture.pending, Some(shape));
+    // New mode never backs off.
+    let mut replace = selection_modes::ModeGesture::replace();
+    replace.not_before = Some(std::time::Instant::now() + std::time::Duration::from_mins(1));
+    assert!(replace.place_throttled(
+        &mut selection,
+        Selection::new(rect(0, 0, 5, 5)),
+        std::time::Instant::now()
+    ));
+}
+
+#[test]
+fn a_live_combination_over_the_cap_says_so_once_per_gesture() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    // A selection of 81 Mpx: adding anything non-trivial exceeds the mask cap.
+    rig.selection.select(Selection::new(rect(0, 0, 9000, 9000)));
+    let mut drag = rig.press_marquee_mode(
+        Tool::EllipticalMarquee,
+        (100.0, 100.0),
+        aurora_doc::SelectionMode::Add,
+    );
+    let before = rig.selection.active();
+    assert!(
+        !selection_modes::drag_refusal(drag.as_ref()),
+        "nothing refused yet"
+    );
+    rig.drag_to(&mut drag, (160.0, 150.0));
+    assert_eq!(
+        rig.selection.active(),
+        before,
+        "a refused combination changes nothing"
+    );
+    assert!(
+        selection_modes::drag_refusal(drag.as_ref()),
+        "the first refusal gives the notice"
+    );
+    rig.drag_to(&mut drag, (180.0, 170.0));
+    assert!(
+        !selection_modes::drag_refusal(drag.as_ref()),
+        "once per gesture"
+    );
+    // The notice is the Magic Wand's calm one, kept for the selection tools.
+    for tool in [
+        Tool::MarqueeSelect,
+        Tool::EllipticalMarquee,
+        Tool::Lasso,
+        Tool::PolygonalLasso,
+        Tool::MagicWand,
+    ] {
+        assert!(crate::lock_refusal_applies(
+            crate::LockRefusal::SelectionTooLarge,
+            tool,
+            aurora_doc::LayerLock::default()
+        ));
+    }
+    assert!(!crate::lock_refusal_applies(
+        crate::LockRefusal::SelectionTooLarge,
+        Tool::Brush,
+        aurora_doc::LayerLock::default()
+    ));
+    // A new gesture gets its own notice.
+    let ending = drag;
+    assert!(!rig.end_drag(ending));
+    let mut again = rig.press_marquee_mode(
+        Tool::EllipticalMarquee,
+        (100.0, 100.0),
+        aurora_doc::SelectionMode::Add,
+    );
+    rig.drag_to(&mut again, (160.0, 150.0));
+    assert!(selection_modes::drag_refusal(again.as_ref()));
+}
