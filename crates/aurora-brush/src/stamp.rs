@@ -53,15 +53,15 @@ use crate::coverage::{Coverage, TileCover, blend_texel, covered, tile_cover};
 
 /// Index of tile-local pixel `(x, y)`'s first (red) channel within a
 /// tile's own flat `texels()` slice.
-const fn texel_index(x: u32, y: u32) -> usize {
+pub(crate) const fn texel_index(x: u32, y: u32) -> usize {
     (y * TILE + x) as usize * CHANNELS
 }
 
 /// One whole texel, in the channel order a tile stores: R, G, B, A.
-type Texel = [f16; CHANNELS];
+pub(crate) type Texel = [f16; CHANNELS];
 
 /// The alpha channel's own offset within a texel — the last one.
-const ALPHA: usize = CHANNELS - 1;
+pub(crate) const ALPHA: usize = CHANNELS - 1;
 
 /// Compile-time proof that a [`Texel`] literal written as `[r, g, b, a]`
 /// really is one whole texel. An `assert!` would be a `panic!` in
@@ -88,7 +88,7 @@ const _: [(); 4] = [(); CHANNELS];
 /// `to_bits`, not `==`, so a NaN channel (a caller handing in a NaN
 /// `colour`) compares equal to itself and settles rather than
 /// re-reporting the same texel as changed on every dab forever.
-fn stores_the_same_bits(current: &[f16], new: Texel) -> bool {
+pub(crate) fn stores_the_same_bits(current: &[f16], new: Texel) -> bool {
     current.len() == new.len()
         && current
             .iter()
@@ -113,7 +113,7 @@ fn stores_the_same_bits(current: &[f16], new: Texel) -> bool {
 #[derive(Debug, Default)]
 #[must_use]
 pub struct DabOutcome {
-    painted: Vec<TileId>,
+    pub(crate) painted: Vec<TileId>,
     failed: Vec<(TileId, TileError)>,
 }
 
@@ -162,7 +162,7 @@ impl DabOutcome {
 
     /// The one place a failure is recorded, shared by [`stamp_dab`] and
     /// [`erase_dab`] so their two parallel loops cannot drift apart.
-    fn fail(&mut self, tile: TileId, err: TileError) {
+    pub(crate) fn fail(&mut self, tile: TileId, err: TileError) {
         self.failed.push((tile, err));
     }
 }
@@ -189,7 +189,7 @@ impl DabOutcome {
 /// for the bound and why it is where it is. `error!`, like
 /// [`usable_snapshot`]'s own mismatch: a radius no brush could produce
 /// is a caller bug, not a runtime condition.
-fn is_paintable(center: (f32, f32), radius: f32) -> bool {
+pub(crate) fn is_paintable(center: (f32, f32), radius: f32) -> bool {
     if !(center.0.is_finite() && center.1.is_finite() && radius.is_finite() && radius > 0.0) {
         return false;
     }
@@ -257,7 +257,7 @@ fn tile_span(t0: TileId, t1: TileId) -> u64 {
 /// changes nothing for it. The `min` is what keeps this function's own
 /// contract true when it is called directly with a range nothing
 /// validated (its own test does exactly that).
-fn reserved_tiles(t0: TileId, t1: TileId) -> usize {
+pub(crate) fn reserved_tiles(t0: TileId, t1: TileId) -> usize {
     let planned = tile_span(t0, t1).min(MAX_DAB_TILES);
     // Capped at 4096 a line above, so this conversion always succeeds;
     // `unwrap_or` rather than an assertion because a wrong capacity hint
@@ -272,7 +272,7 @@ fn reserved_tiles(t0: TileId, t1: TileId) -> usize {
 /// without real geometry (`min > max` would otherwise fall out, and
 /// every caller here already guards it before reaching this function).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn tile_range(center: (f32, f32), radius: f32) -> (TileId, TileId) {
+pub(crate) fn tile_range(center: (f32, f32), radius: f32) -> (TileId, TileId) {
     let (cx, cy) = center;
     let min_x = (cx - radius).floor().max(0.0) as u32;
     let min_y = (cy - radius).floor().max(0.0) as u32;
@@ -497,7 +497,7 @@ pub fn stamp_dab_hard_preserving_alpha_covered(
 
 /// The tile-local inclusive texel box `(lx0, ly0, lx1, ly1)` a dab's
 /// bounding box covers within the tile whose origin is `origin`.
-type TileBox = (u32, u32, u32, u32);
+pub(crate) type TileBox = (u32, u32, u32, u32);
 
 /// Whether a brush dab would write any texel of `tile_box` in a tile the
 /// store does not hold (blank: every alpha is `0`, so the max-alpha rule
@@ -536,7 +536,7 @@ fn dab_reaches_blank_tile(
 /// the footprint. The Brush's is the falloff within `radius`; the Pencil's
 /// (`hard`) is exactly `1` for a texel centre strictly inside the circle
 /// and `0` otherwise.
-fn texel_alpha(px: f32, py: f32, center: (f32, f32), radius: f32, hard: bool) -> f32 {
+pub(crate) fn texel_alpha(px: f32, py: f32, center: (f32, f32), radius: f32, hard: bool) -> f32 {
     if hard {
         return if crate::mask_dab::hard_dab_covers(px, py, center, radius) {
             1.0
@@ -555,7 +555,7 @@ fn texel_alpha(px: f32, py: f32, center: (f32, f32), radius: f32, hard: bool) ->
 /// to skip the tile entirely. `Some(None)` means every texel is covered
 /// (no selection, or the box is wholly inside it).
 #[allow(clippy::option_option)]
-fn tile_coverage(
+pub(crate) fn tile_coverage(
     coverage: Option<&dyn Coverage>,
     origin: (u32, u32),
     tile_box: TileBox,
@@ -800,7 +800,7 @@ fn stamp_dab_impl(
 /// resident, was paged in cleanly, and is simply the wrong length in
 /// memory — and reporting a scratch-disk corruption that did not happen
 /// would send whoever reads the log looking in the wrong place.
-fn malformed_tile(surface: SurfaceId, id: TileId, samples: usize) -> TileError {
+pub(crate) fn malformed_tile(surface: SurfaceId, id: TileId, samples: usize) -> TileError {
     TileError::MalformedTile {
         surface,
         id,
@@ -820,7 +820,7 @@ fn malformed_tile(surface: SurfaceId, id: TileId, samples: usize) -> TileError {
 /// quietly unundoable with no signal anywhere. `error!`, not `warn!`:
 /// this is a programming error in the caller, not a runtime condition
 /// like a scratch disk going away.
-fn usable_snapshot(
+pub(crate) fn usable_snapshot(
     snapshot: Option<&mut StrokeSnapshot>,
     surface: SurfaceId,
 ) -> Option<&mut StrokeSnapshot> {

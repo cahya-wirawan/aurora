@@ -98,7 +98,7 @@ pub const TOOL_GROUPS: [&[Tool]; 9] = [
     &[Tool::Zoom, Tool::Pan],
     &[Tool::Eyedropper],
     &[Tool::Brush, Tool::Pencil],
-    &[Tool::Eraser],
+    &[Tool::Eraser, Tool::CloneStamp],
     &[Tool::Gradient, Tool::PaintBucket],
 ];
 
@@ -120,6 +120,7 @@ pub const fn tool_icon(tool: Tool) -> IconKind {
         Tool::Brush => IconKind::Brush,
         Tool::Eraser => IconKind::Eraser,
         Tool::Pencil => IconKind::Pencil,
+        Tool::CloneStamp => IconKind::CloneStamp,
         Tool::Gradient => IconKind::Gradient,
         Tool::PaintBucket => IconKind::PaintBucket,
     }
@@ -390,7 +391,7 @@ mod tests {
 
     /// The icon each tool must wear, written out independently of
     /// [`tool_icon`] so a mapped-to-the-wrong-tool slip fails.
-    const EXPECTED_ICONS: [(Tool, IconKind); 14] = [
+    const EXPECTED_ICONS: [(Tool, IconKind); 15] = [
         (Tool::Move, IconKind::Move),
         (Tool::MarqueeSelect, IconKind::Marquee),
         (Tool::EllipticalMarquee, IconKind::EllipseMarquee),
@@ -403,6 +404,7 @@ mod tests {
         (Tool::Brush, IconKind::Brush),
         (Tool::Pencil, IconKind::Pencil),
         (Tool::Eraser, IconKind::Eraser),
+        (Tool::CloneStamp, IconKind::CloneStamp),
         (Tool::Gradient, IconKind::Gradient),
         (Tool::PaintBucket, IconKind::PaintBucket),
     ];
@@ -487,6 +489,10 @@ mod tests {
         assert_eq!(
             tool_description(Tool::Pencil),
             "Pencil tool, shortcut Shift+B"
+        );
+        assert_eq!(
+            tool_description(Tool::CloneStamp),
+            "Clone Stamp tool, shortcut S"
         );
         assert_eq!(
             tool_description(Tool::Gradient),
@@ -651,6 +657,7 @@ mod tests {
     /// (rebuilt here from the same API the old panel used and measured with
     /// the real text engine).
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn the_strip_is_72_px_and_much_narrower_than_the_text_labelled_one() {
         let scales = scales();
         assert!((tools_panel_width(&scales) - 72.0).abs() < f32::EPSILON);
@@ -712,6 +719,9 @@ mod tests {
             assert!(at(Tool::Eraser).y > at(Tool::Brush).y);
             assert_eq!(at(Tool::Eraser).x, at(Tool::Brush).x);
             assert!(at(Tool::Gradient).y > at(Tool::Eraser).y);
+            // 0.221.0: the Clone Stamp shares the Eraser's row.
+            assert_eq!(at(Tool::CloneStamp).y, at(Tool::Eraser).y);
+            assert_eq!(at(Tool::Eraser).x + 32, at(Tool::CloneStamp).x);
             // 0.209.0: the fill row sits under the paint row, two to a
             // row, in the same two columns, inside the same 72 px.
             assert!(at(Tool::Gradient).y > at(Tool::Brush).y);

@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.221.0] - 2026-10-13
+
+### Added
+
+- Add the Clone Stamp tool: aligned mode, stroke-start source
+
 ## [0.220.0] - 2026-10-13
 
 ### Added
