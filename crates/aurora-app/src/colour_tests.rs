@@ -205,6 +205,9 @@ fn x_and_d_are_bound_and_collide_with_no_tool_letter() {
                 Tool::EllipticalMarquee => Tool::MarqueeSelect,
                 Tool::PolygonalLasso => Tool::Lasso,
                 Tool::Pencil => Tool::Brush,
+                // 0.223.0: bare R is the Smudge and bare S the Clone Stamp.
+                Tool::Blur => Tool::Smudge,
+                Tool::Sharpen => Tool::CloneStamp,
                 _ => Tool::Gradient,
             };
             assert_eq!(shortcut_command(key), Some(AppCommand::SelectTool(first)));

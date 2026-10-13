@@ -55,6 +55,9 @@ mod coverage;
 mod coverage_tests;
 mod dab;
 mod fill;
+mod filter_brush;
+#[cfg(test)]
+mod filter_brush_tests;
 #[cfg(test)]
 mod hard_dab_tests;
 mod mask_dab;
@@ -76,6 +79,7 @@ pub use fill::{
     MAX_FILL_TILES, WandRegion, flood_fill, flood_fill_covered, gradient_fill,
     gradient_fill_covered, wand_region,
 };
+pub use filter_brush::{FilterKind, MAX_FILTER_PATCH_TEXELS, SHARPEN_GAIN, filter_dab_covered};
 pub use mask_dab::{dab_falloff, hard_dab_covers, hard_dab_snap, stamp_toward, stamp_toward_hard};
 pub use smudge::{MAX_SMUDGE_PATCH_TEXELS, SmudgeCarry, smudge_dab_covered};
 pub use stamp::{

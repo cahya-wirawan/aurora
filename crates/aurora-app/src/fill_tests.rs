@@ -1109,3 +1109,74 @@ fn the_options_bar_edits_the_smudge_strength_and_mirrors_it() {
         None
     );
 }
+
+#[test]
+fn the_options_bar_edits_the_blur_and_sharpen_strengths_each_on_its_own() {
+    use aurora_widgets::ActionOutcome as A;
+    let mut bar = Bar::new();
+    let fill = bar.controls.fill;
+    let label = |bar: &Bar, id| match bar.workspace.tree.payload(id) {
+        Some(WidgetKind::Label(s)) => s.text.clone(),
+        other => unreachable!("{other:?}"),
+    };
+    for (tool, other, final_value) in [
+        (Tool::Blur, Tool::Sharpen, 41.0),
+        (Tool::Sharpen, Tool::Blur, 63.0),
+    ] {
+        crate::sync_tool_controls(
+            &mut bar.workspace,
+            Some(bar.controls),
+            tool,
+            &bar.settings,
+            None,
+        );
+        assert_eq!(label(&bar, fill.strength_readout), "Strength 50 %");
+        assert!(bar.outcome(
+            tool,
+            A::ValueChanged {
+                id: fill.strength,
+                value: 33.3
+            }
+        ));
+        assert!(bar.outcome(
+            tool,
+            A::ValueChanged {
+                id: fill.strength,
+                value: 900.0
+            }
+        ));
+        assert!(bar.outcome(
+            tool,
+            A::ValueChanged {
+                id: fill.strength,
+                value: final_value
+            }
+        ));
+        assert!(!bar.outcome(
+            tool,
+            A::ValueChanged {
+                id: fill.strength,
+                value: f64::NAN
+            }
+        ));
+        assert_eq!(
+            label(&bar, fill.strength_readout),
+            format!("Strength {final_value} %")
+        );
+        crate::sync_tool_controls(
+            &mut bar.workspace,
+            Some(bar.controls),
+            other,
+            &bar.settings,
+            None,
+        );
+        // The other filter and the Smudge are untouched.
+        assert_ne!(
+            label(&bar, fill.strength_readout),
+            format!("Strength {final_value} %")
+        );
+    }
+    assert_eq!(bar.settings.blur_strength, 41);
+    assert_eq!(bar.settings.sharpen_strength, 63);
+    assert_eq!(bar.settings.smudge_strength, 50);
+}

@@ -1004,7 +1004,7 @@ fn a_history_panel_jump_applies_the_selection_of_the_row() {
 
 #[test]
 fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
-    assert_eq!(Tool::ALL.len(), 16);
+    assert_eq!(Tool::ALL.len(), 18);
     let table = crate::default_shortcuts_for(false);
     let chord = |shift| {
         KeyChord::new(
@@ -1062,7 +1062,7 @@ fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
     );
     // The tools panel has one button per tool, the new one wearing its
     // own icon.
-    assert_eq!(workspace.tools.buttons.len(), 16);
+    assert_eq!(workspace.tools.buttons.len(), 18);
     assert_eq!(
         aurora_ui::tool_icon(Tool::EllipticalMarquee),
         aurora_widgets::icons::IconKind::EllipseMarquee
@@ -3342,6 +3342,8 @@ fn the_fills_and_selection_tools_are_refused_and_the_rest_work() {
                 | Tool::MagicWand
                 | Tool::CloneStamp
                 | Tool::Smudge
+                | Tool::Blur
+                | Tool::Sharpen
         );
         assert_eq!(
             quick_mask::tool_refusal(tool),
@@ -3496,6 +3498,7 @@ fn entering_quick_mask_mid_stroke_commits_the_layer_stroke_first() {
         hard: false,
         clone: None,
         smudge: None,
+        filter: None,
         last_doc: (0.0, 0.0),
         carry: 0.0,
         stroke: Some(aurora_brush::StrokeSnapshot::new(rig.surface)),
@@ -4123,12 +4126,12 @@ fn the_smudge_defaults_to_half_strength_and_shares_the_brush_radius() {
     let mut settings = crate::ToolSettings::default();
     assert_eq!(settings.smudge_strength, 50);
     assert!((crate::smudge_stamp::strength_fraction(&settings) - 0.5).abs() < f32::EPSILON);
-    assert!(settings.set_smudge_strength(100.4));
+    assert!(settings.set_strength(aurora_ui::Tool::Smudge, 100.4));
     assert_eq!(settings.smudge_strength, 100);
     assert!((crate::smudge_stamp::strength_fraction(&settings) - 1.0).abs() < f32::EPSILON);
-    assert!(settings.set_smudge_strength(-5.0));
+    assert!(settings.set_strength(aurora_ui::Tool::Smudge, -5.0));
     assert_eq!(settings.smudge_strength, 1, "never below 1");
-    assert!(!settings.set_smudge_strength(f64::NAN));
+    assert!(!settings.set_strength(aurora_ui::Tool::Smudge, f64::NAN));
     assert_eq!(settings.smudge_strength, 1);
     assert!(settings.set_radius(Tool::Smudge, 17.0));
     assert_eq!(settings.radius(Tool::Brush), Some(17.0));
@@ -4137,7 +4140,7 @@ fn the_smudge_defaults_to_half_strength_and_shares_the_brush_radius() {
 #[test]
 fn a_smudge_stroke_drags_paint_out_of_a_block_as_one_labelled_step() {
     let mut rig = smudge_rig();
-    rig.settings.set_smudge_strength(100.0);
+    rig.settings.set_strength(aurora_ui::Tool::Smudge, 100.0);
     let before = rig.snapshot(600, 400);
     // From inside the block, out to the right across its edge.
     let (refused, recorded) = rig.smudge_stroke(
@@ -4163,7 +4166,7 @@ fn a_smudge_stroke_drags_paint_out_of_a_block_as_one_labelled_step() {
 #[test]
 fn the_carried_paint_resets_at_every_press() {
     let mut rig = smudge_rig();
-    rig.settings.set_smudge_strength(100.0);
+    rig.settings.set_strength(aurora_ui::Tool::Smudge, 100.0);
     // First stroke picks up red and drags it out; it ends over empty space.
     let _ = rig.smudge_stroke(&[(50.5, 100.5), (70.5, 100.5), (90.5, 100.5)], false);
     let after_first = rig.snapshot(600, 400);
@@ -4194,7 +4197,7 @@ fn a_smudge_stroke_over_an_empty_layer_creates_no_tile_and_no_step() {
 #[test]
 fn a_smudge_paints_only_through_the_selection() {
     let mut rig = smudge_rig();
-    rig.settings.set_smudge_strength(100.0);
+    rig.settings.set_strength(aurora_ui::Tool::Smudge, 100.0);
     rig.marquee((64.0, 0.0), (68.0, 400.0));
     let (_, recorded) = rig.smudge_stroke(&[(50.5, 100.5), (62.5, 100.5), (74.5, 100.5)], false);
     assert!(recorded);
@@ -4216,7 +4219,7 @@ fn a_smudge_paints_only_through_the_selection() {
 #[test]
 fn a_transparency_locked_smudge_keeps_alpha() {
     let mut rig = smudge_rig();
-    rig.settings.set_smudge_strength(100.0);
+    rig.settings.set_strength(aurora_ui::Tool::Smudge, 100.0);
     rig.rect_fill(60, 80, 100, 120, [0.0, 0.0, 1.0, 0.5]);
     let (_, recorded) = rig.smudge_stroke(&[(50.5, 100.5), (65.5, 100.5), (80.5, 100.5)], true);
     assert!(recorded);
@@ -4257,4 +4260,293 @@ fn a_pixel_lock_refuses_the_press_and_a_missing_layer_has_its_own_notice() {
         Some(crate::LockRefusal::PixelsLocked)
     );
     assert_eq!(crate::smudge_stamp::press(true, None), None);
+}
+
+// -- The Blur and Sharpen (0.223.0) --------------------------------------------
+
+impl Rig {
+    /// A Blur or Sharpen stroke (`tool`) along `points` driven the way `App`
+    /// does: the press decision (`filter_stamp::press`), then the drag, each
+    /// dab stamped by `filter_stamp::filter_dab_through_selection`, then the
+    /// commit. Returns the press refusal (if any) and whether a history
+    /// step was recorded.
+    fn filter_stroke(
+        &mut self,
+        tool: Tool,
+        points: &[(f32, f32)],
+        preserve_alpha: bool,
+    ) -> (Option<crate::LockRefusal>, bool) {
+        let Some(&first) = points.first() else {
+            unreachable!("a stroke has points");
+        };
+        let Some(kind) = crate::filter_stamp::kind_of(tool) else {
+            unreachable!("{tool:?} is a filter tool");
+        };
+        let lock = self.layers.lock(self.layer).unwrap_or_default();
+        if let Some(why) = crate::filter_stamp::press(
+            kind,
+            crate::active_pixel_layer(&self.layers, Some(self.layer)).is_some(),
+            crate::press_refusal(tool, lock),
+        ) {
+            return (Some(why), false);
+        }
+        let mut drag = begin_drag(
+            tool,
+            PointerButton::Primary,
+            first,
+            &self.view,
+            crate::active_pixel_layer(&self.layers, Some(self.layer)),
+        );
+        assert_eq!(crate::filter_stamp::drag_filter(drag.as_ref()), Some(kind));
+        let selection = self.selection.active();
+        let dab_at = |rig: &mut Self, drag: &mut Option<Drag>, p: (f32, f32)| {
+            let _ = crate::filter_stamp::filter_dab_through_selection(
+                preserve_alpha,
+                &mut rig.store,
+                rig.surface,
+                rig.bounds,
+                p,
+                selection.clone(),
+                &rig.settings,
+                drag,
+            );
+        };
+        dab_at(self, &mut drag, first);
+        for &p in points.iter().skip(1) {
+            let bounds = pan_bounds(&self.layers, Some(self.layer), Some((1000.0, 800.0)));
+            let dabs = match drag.as_mut() {
+                Some(d) => continue_drag(
+                    d,
+                    p,
+                    &mut self.view,
+                    &mut self.selection,
+                    &self.settings,
+                    bounds,
+                ),
+                None => Vec::new(),
+            };
+            for dab in dabs {
+                dab_at(self, &mut drag, dab);
+            }
+        }
+        let recorded = commit_ending_drag(
+            drag,
+            &self.layers,
+            &mut self.history,
+            &mut self.pixel_history,
+            &mut self.undo_order,
+            &mut self.view,
+            Some(self.layer),
+            Some((1000.0, 800.0)),
+        );
+        (None, recorded)
+    }
+}
+
+/// A rig with a white block (x 20..60, y 80..120) on an empty layer.
+fn filter_rig() -> Rig {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.settings.set_radius(Tool::Blur, 6.0);
+    for y in 80..120u32 {
+        for x in 20..60u32 {
+            rig.put(x, y, [1.0, 1.0, 1.0, 1.0]);
+        }
+    }
+    rig
+}
+
+#[test]
+fn the_filters_default_to_half_strength_clamp_and_share_the_brush_radius() {
+    let mut settings = crate::ToolSettings::default();
+    for (tool, kind) in [
+        (Tool::Blur, aurora_brush::FilterKind::Blur),
+        (Tool::Sharpen, aurora_brush::FilterKind::Sharpen),
+    ] {
+        assert!(
+            (crate::filter_stamp::strength_fraction(&settings, kind) - 0.5).abs() < f32::EPSILON
+        );
+        assert!(settings.set_strength(tool, 100.4));
+        assert!(
+            (crate::filter_stamp::strength_fraction(&settings, kind) - 1.0).abs() < f32::EPSILON
+        );
+        assert!(settings.set_strength(tool, -5.0));
+        assert!((crate::filter_stamp::strength_fraction(&settings, kind) - 0.01).abs() < 1e-6);
+        assert!(!settings.set_strength(tool, f64::NAN));
+        let radius: f32 = if tool == Tool::Blur { 17.0 } else { 19.0 };
+        assert!(settings.set_radius(tool, f64::from(radius)));
+        assert_eq!(settings.radius(Tool::Brush), Some(radius));
+    }
+    // The three strengths are separate settings; other tools have none.
+    let mut s = crate::ToolSettings::default();
+    assert!(s.set_strength(Tool::Blur, 20.0));
+    assert!(s.set_strength(Tool::Sharpen, 80.0));
+    assert_eq!(
+        (s.smudge_strength, s.blur_strength, s.sharpen_strength),
+        (50, 20, 80)
+    );
+    assert!(!s.set_strength(Tool::Brush, 10.0));
+}
+
+#[test]
+fn a_blur_stroke_softens_a_block_edge_as_one_labelled_step_and_undoes() {
+    let mut rig = filter_rig();
+    rig.settings.set_strength(Tool::Blur, 100.0);
+    let before = rig.snapshot(600, 400);
+    let (refused, recorded) = rig.filter_stroke(
+        Tool::Blur,
+        &[(56.5, 100.5), (60.5, 100.5), (64.5, 100.5)],
+        false,
+    );
+    assert_eq!(refused, None);
+    assert!(recorded);
+    assert_eq!(rig.undo_order.undo_labels, ["Blur Stroke"]);
+    // The edge texel just outside the block gained alpha, the one just
+    // inside lost some; far from the stroke nothing moved.
+    let outside = rig.at(60, 100)[3];
+    let inside = rig.at(59, 100)[3];
+    assert!(outside > 0.0 && outside < 1.0, "{outside}");
+    assert!(inside < 1.0 && inside > 0.0, "{inside}");
+    assert_eq!(rig.at(30, 100), [1.0; 4]);
+    assert_eq!(rig.at(150, 100), [0.0; 4]);
+    assert!(rig.undo(UndoDirection::Undo));
+    assert_eq!(rig.snapshot(600, 400), before);
+    assert!(rig.undo(UndoDirection::Redo));
+    assert!(rig.at(60, 100)[3] > 0.0);
+}
+
+#[test]
+fn a_sharpen_stroke_is_labelled_and_leaves_flat_areas_and_empty_space_alone() {
+    let mut rig = filter_rig();
+    // Soften the block edge first, then sharpen it.
+    rig.settings.set_strength(Tool::Blur, 100.0);
+    let _ = rig.filter_stroke(Tool::Blur, &[(58.5, 100.5), (62.5, 100.5)], false);
+    rig.settings.set_strength(Tool::Sharpen, 100.0);
+    let blurred = rig.snapshot(600, 400);
+    let (_, recorded) = rig.filter_stroke(Tool::Sharpen, &[(58.5, 100.5), (62.5, 100.5)], false);
+    assert!(recorded);
+    assert_eq!(
+        rig.undo_order.undo_labels,
+        ["Blur Stroke", "Sharpen Stroke"]
+    );
+    assert_ne!(rig.snapshot(600, 400), blurred);
+    // Valid premultiplied texels everywhere it worked.
+    for y in 90..110 {
+        for x in 50..72 {
+            let t = rig.at(x, y);
+            assert!((0.0..=1.0).contains(&t[3]), "{t:?}");
+            assert!(t[..3].iter().all(|c| (0.0..=t[3]).contains(c)), "{t:?}");
+        }
+    }
+    assert_eq!(rig.at(30, 100), [1.0; 4], "flat area");
+    assert_eq!(rig.at(150, 100), [0.0; 4], "empty space");
+}
+
+#[test]
+fn a_filter_stroke_over_empty_space_or_a_flat_area_records_nothing_and_makes_no_tile() {
+    for tool in [Tool::Blur, Tool::Sharpen] {
+        let mut rig = Rig::new(rect(0, 0, 600, 400));
+        let before = rig.snapshot(600, 400);
+        let (refused, recorded) = rig.filter_stroke(tool, &[(100.5, 100.5), (140.5, 110.5)], false);
+        assert_eq!(refused, None);
+        assert!(!recorded);
+        assert!(rig.undo_order.undo_labels.is_empty());
+        assert_eq!(rig.snapshot(600, 400), before);
+        assert!(
+            !rig.store
+                .contains_tile(rig.surface, aurora_tile::TileId { x: 0, y: 0 })
+        );
+        // The interior of the white block is flat: nothing to do either.
+        let mut rig = filter_rig();
+        let (_, recorded) = rig.filter_stroke(tool, &[(35.5, 100.5), (45.5, 100.5)], false);
+        assert!(!recorded, "{tool:?}");
+        assert!(rig.undo_order.undo_labels.is_empty());
+    }
+}
+
+#[test]
+fn a_filter_paints_only_through_the_selection() {
+    for tool in [Tool::Blur, Tool::Sharpen] {
+        let mut rig = filter_rig();
+        // A softened edge to sharpen, and a hard one to blur.
+        if tool == Tool::Sharpen {
+            rig.settings.set_strength(Tool::Blur, 100.0);
+            let _ = rig.filter_stroke(Tool::Blur, &[(58.5, 100.5), (62.5, 100.5)], false);
+        }
+        rig.settings.set_strength(tool, 100.0);
+        let before = rig.snapshot(600, 400);
+        rig.marquee((58.0, 0.0), (62.0, 400.0));
+        let (_, recorded) =
+            rig.filter_stroke(tool, &[(52.5, 100.5), (62.5, 100.5), (72.5, 100.5)], false);
+        let after = rig.snapshot(600, 400);
+        let mut xs = std::collections::BTreeSet::new();
+        for y in 0..400usize {
+            for x in 0..600usize {
+                if after[y * 600 + x] != before[y * 600 + x] {
+                    xs.insert(x);
+                }
+            }
+        }
+        assert!(
+            recorded,
+            "{tool:?} must change the edge inside the selection"
+        );
+        assert!(!xs.is_empty(), "{tool:?}");
+        assert!(xs.iter().all(|x| (58..62).contains(x)), "{tool:?} {xs:?}");
+    }
+}
+
+#[test]
+fn a_transparency_locked_filter_keeps_alpha() {
+    for tool in [Tool::Blur, Tool::Sharpen] {
+        let mut rig = filter_rig();
+        rig.settings.set_strength(tool, 100.0);
+        rig.rect_fill(60, 80, 100, 120, [0.0, 0.0, 1.0, 0.5]);
+        let alphas: Vec<f32> = (80..120).map(|y| rig.at(61, y)[3]).collect();
+        let (_, recorded) =
+            rig.filter_stroke(tool, &[(50.5, 100.5), (65.5, 100.5), (80.5, 100.5)], true);
+        assert!(recorded, "{tool:?}");
+        for (y, want) in (80..120).zip(alphas) {
+            assert_eq!(rig.at(61, y)[3], want);
+        }
+        for y in 80..120 {
+            for x in 60..100 {
+                assert_eq!(rig.at(x, y)[3], 0.5, "alpha kept at ({x}, {y})");
+            }
+        }
+        for x in 20..60 {
+            assert_eq!(rig.at(x, 100)[3], 1.0, "{tool:?} {x}");
+        }
+        assert_eq!(rig.at(150, 100), [0.0; 4]);
+    }
+}
+
+#[test]
+fn a_pixel_lock_refuses_the_filter_press_and_a_missing_layer_has_its_own_notice() {
+    use aurora_brush::FilterKind::{Blur, Sharpen};
+    for tool in [Tool::Blur, Tool::Sharpen] {
+        let mut rig = filter_rig();
+        let lock = aurora_doc::LayerLock {
+            pixels: true,
+            ..aurora_doc::LayerLock::default()
+        };
+        assert!(rig.layers.set_lock(rig.layer, lock).is_ok());
+        let before = rig.snapshot(600, 400);
+        let (refused, recorded) = rig.filter_stroke(tool, &[(50.5, 100.5), (80.5, 100.5)], false);
+        assert_eq!(refused, Some(crate::LockRefusal::PixelsLocked), "{tool:?}");
+        assert!(!recorded);
+        assert_eq!(rig.snapshot(600, 400), before);
+    }
+    assert_eq!(
+        crate::filter_stamp::press(Blur, false, None),
+        Some(crate::LockRefusal::BlurNeedsPixelLayer)
+    );
+    assert_eq!(
+        crate::filter_stamp::press(Sharpen, false, Some(crate::LockRefusal::PixelsLocked)),
+        Some(crate::LockRefusal::SharpenNeedsPixelLayer)
+    );
+    assert_eq!(
+        crate::filter_stamp::press(Blur, true, Some(crate::LockRefusal::PixelsLocked)),
+        Some(crate::LockRefusal::PixelsLocked)
+    );
+    assert_eq!(crate::filter_stamp::press(Sharpen, true, None), None);
 }
