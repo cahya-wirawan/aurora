@@ -583,6 +583,7 @@ fn write_fill_tools_png() {
         opacity: 80,
         tolerance: 32,
         contiguous: true,
+        strength: 50,
     };
     for (tool, name) in [
         (crate::Tool::Gradient, "gradient"),

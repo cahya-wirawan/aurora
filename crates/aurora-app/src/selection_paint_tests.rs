@@ -1004,7 +1004,7 @@ fn a_history_panel_jump_applies_the_selection_of_the_row() {
 
 #[test]
 fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
-    assert_eq!(Tool::ALL.len(), 15);
+    assert_eq!(Tool::ALL.len(), 16);
     let table = crate::default_shortcuts_for(false);
     let chord = |shift| {
         KeyChord::new(
@@ -1062,7 +1062,7 @@ fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
     );
     // The tools panel has one button per tool, the new one wearing its
     // own icon.
-    assert_eq!(workspace.tools.buttons.len(), 15);
+    assert_eq!(workspace.tools.buttons.len(), 16);
     assert_eq!(
         aurora_ui::tool_icon(Tool::EllipticalMarquee),
         aurora_widgets::icons::IconKind::EllipseMarquee
@@ -3341,6 +3341,7 @@ fn the_fills_and_selection_tools_are_refused_and_the_rest_work() {
                 | Tool::PolygonalLasso
                 | Tool::MagicWand
                 | Tool::CloneStamp
+                | Tool::Smudge
         );
         assert_eq!(
             quick_mask::tool_refusal(tool),
@@ -3494,6 +3495,7 @@ fn entering_quick_mask_mid_stroke_commits_the_layer_stroke_first() {
     let layer_stroke = Some(Drag::Brush {
         hard: false,
         clone: None,
+        smudge: None,
         last_doc: (0.0, 0.0),
         carry: 0.0,
         stroke: Some(aurora_brush::StrokeSnapshot::new(rig.surface)),
@@ -4022,4 +4024,237 @@ fn a_press_with_no_source_changes_nothing() {
     assert!(!recorded);
     assert!(rig.undo_order.undo_labels.is_empty());
     assert_eq!(rig.snapshot(600, 400), before);
+}
+
+// -- The Smudge (0.222.0) ---------------------------------------------------
+
+impl Rig {
+    /// A Smudge stroke along `points` driven the way `App` does: the press
+    /// decision (`smudge_stamp::press`), then the drag, each dab stamped by
+    /// `smudge_stamp::smudge_dab_through_selection`, then the commit.
+    /// Returns the press refusal (if any) and whether a history step was
+    /// recorded.
+    fn smudge_stroke(
+        &mut self,
+        points: &[(f32, f32)],
+        preserve_alpha: bool,
+    ) -> (Option<crate::LockRefusal>, bool) {
+        let Some(&first) = points.first() else {
+            unreachable!("a stroke has points");
+        };
+        let lock = self.layers.lock(self.layer).unwrap_or_default();
+        if let Some(why) = crate::smudge_stamp::press(
+            crate::active_pixel_layer(&self.layers, Some(self.layer)).is_some(),
+            crate::press_refusal(Tool::Smudge, lock),
+        ) {
+            return (Some(why), false);
+        }
+        let mut drag = begin_drag(
+            Tool::Smudge,
+            PointerButton::Primary,
+            first,
+            &self.view,
+            crate::active_pixel_layer(&self.layers, Some(self.layer)),
+        );
+        assert!(
+            crate::smudge_stamp::drag_carry(drag.as_ref())
+                .is_some_and(aurora_brush::SmudgeCarry::is_empty),
+            "a press starts with nothing carried"
+        );
+        let selection = self.selection.active();
+        let dab_at = |rig: &mut Self, drag: &mut Option<Drag>, p: (f32, f32)| {
+            let _ = crate::smudge_stamp::smudge_dab_through_selection(
+                preserve_alpha,
+                &mut rig.store,
+                rig.surface,
+                rig.bounds,
+                p,
+                selection.clone(),
+                &rig.settings,
+                drag,
+            );
+        };
+        dab_at(self, &mut drag, first);
+        for &p in points.iter().skip(1) {
+            let bounds = pan_bounds(&self.layers, Some(self.layer), Some((1000.0, 800.0)));
+            let dabs = match drag.as_mut() {
+                Some(d) => continue_drag(
+                    d,
+                    p,
+                    &mut self.view,
+                    &mut self.selection,
+                    &self.settings,
+                    bounds,
+                ),
+                None => Vec::new(),
+            };
+            for dab in dabs {
+                dab_at(self, &mut drag, dab);
+            }
+        }
+        let recorded = commit_ending_drag(
+            drag,
+            &self.layers,
+            &mut self.history,
+            &mut self.pixel_history,
+            &mut self.undo_order,
+            &mut self.view,
+            Some(self.layer),
+            Some((1000.0, 800.0)),
+        );
+        (None, recorded)
+    }
+}
+
+/// A rig with a red block on the left (x 20..60) and nothing to its right.
+fn smudge_rig() -> Rig {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.settings.set_radius(Tool::Smudge, 6.0);
+    for y in 80..120u32 {
+        for x in 20..60u32 {
+            rig.put(x, y, [1.0, 0.0, 0.0, 1.0]);
+        }
+    }
+    rig
+}
+
+#[test]
+fn the_smudge_defaults_to_half_strength_and_shares_the_brush_radius() {
+    let mut settings = crate::ToolSettings::default();
+    assert_eq!(settings.smudge_strength, 50);
+    assert!((crate::smudge_stamp::strength_fraction(&settings) - 0.5).abs() < f32::EPSILON);
+    assert!(settings.set_smudge_strength(100.4));
+    assert_eq!(settings.smudge_strength, 100);
+    assert!((crate::smudge_stamp::strength_fraction(&settings) - 1.0).abs() < f32::EPSILON);
+    assert!(settings.set_smudge_strength(-5.0));
+    assert_eq!(settings.smudge_strength, 1, "never below 1");
+    assert!(!settings.set_smudge_strength(f64::NAN));
+    assert_eq!(settings.smudge_strength, 1);
+    assert!(settings.set_radius(Tool::Smudge, 17.0));
+    assert_eq!(settings.radius(Tool::Brush), Some(17.0));
+}
+
+#[test]
+fn a_smudge_stroke_drags_paint_out_of_a_block_as_one_labelled_step() {
+    let mut rig = smudge_rig();
+    rig.settings.set_smudge_strength(100.0);
+    let before = rig.snapshot(600, 400);
+    // From inside the block, out to the right across its edge.
+    let (refused, recorded) = rig.smudge_stroke(
+        &[(50.5, 100.5), (60.5, 100.5), (70.5, 100.5), (80.5, 100.5)],
+        false,
+    );
+    assert_eq!(refused, None);
+    assert!(recorded);
+    assert_eq!(rig.undo_order.undo_labels, ["Smudge Stroke"]);
+    // Red now lies right of the block's old edge, along the stroke...
+    assert!(rig.at(66, 100)[3] > 0.0, "{:?}", rig.at(66, 100));
+    assert!(rig.at(75, 100)[0] > 0.0);
+    // ... and nowhere far from it.
+    assert_eq!(rig.at(150, 100), [0.0; 4]);
+    assert_eq!(rig.at(66, 140), [0.0; 4]);
+    // Undo restores everything, redo puts it back.
+    assert!(rig.undo(UndoDirection::Undo));
+    assert_eq!(rig.snapshot(600, 400), before);
+    assert!(rig.undo(UndoDirection::Redo));
+    assert!(rig.at(66, 100)[3] > 0.0);
+}
+
+#[test]
+fn the_carried_paint_resets_at_every_press() {
+    let mut rig = smudge_rig();
+    rig.settings.set_smudge_strength(100.0);
+    // First stroke picks up red and drags it out; it ends over empty space.
+    let _ = rig.smudge_stroke(&[(50.5, 100.5), (70.5, 100.5), (90.5, 100.5)], false);
+    let after_first = rig.snapshot(600, 400);
+    // A second stroke begins over empty space far from the block. Nothing
+    // carries over from the first stroke, so it picks up nothing and
+    // paints nothing, however far it goes.
+    let (_, recorded) = rig.smudge_stroke(&[(300.5, 300.5), (320.5, 300.5), (340.5, 300.5)], false);
+    assert!(!recorded, "a stroke that changes nothing records no step");
+    assert_eq!(rig.snapshot(600, 400), after_first);
+    assert_eq!(rig.undo_order.undo_labels, ["Smudge Stroke"]);
+}
+
+#[test]
+fn a_smudge_stroke_over_an_empty_layer_creates_no_tile_and_no_step() {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    let before = rig.snapshot(600, 400);
+    let (refused, recorded) = rig.smudge_stroke(&[(100.5, 100.5), (140.5, 110.5)], false);
+    assert_eq!(refused, None);
+    assert!(!recorded);
+    assert!(rig.undo_order.undo_labels.is_empty());
+    assert_eq!(rig.snapshot(600, 400), before);
+    assert!(
+        !rig.store
+            .contains_tile(rig.surface, aurora_tile::TileId { x: 0, y: 0 })
+    );
+}
+
+#[test]
+fn a_smudge_paints_only_through_the_selection() {
+    let mut rig = smudge_rig();
+    rig.settings.set_smudge_strength(100.0);
+    rig.marquee((64.0, 0.0), (68.0, 400.0));
+    let (_, recorded) = rig.smudge_stroke(&[(50.5, 100.5), (62.5, 100.5), (74.5, 100.5)], false);
+    assert!(recorded);
+    let mut xs = std::collections::BTreeSet::new();
+    for y in 60..140 {
+        for x in 60..120 {
+            if rig.at(x, y)[3] > 0.0 {
+                xs.insert(x);
+            }
+        }
+    }
+    // The block's own right edge is at x 59; everything right of it that
+    // lit up is inside the selected strip.
+    xs.retain(|&x| x >= 60);
+    assert!(!xs.is_empty());
+    assert!(xs.iter().all(|x| (64..68).contains(x)), "{xs:?}");
+}
+
+#[test]
+fn a_transparency_locked_smudge_keeps_alpha() {
+    let mut rig = smudge_rig();
+    rig.settings.set_smudge_strength(100.0);
+    rig.rect_fill(60, 80, 100, 120, [0.0, 0.0, 1.0, 0.5]);
+    let (_, recorded) = rig.smudge_stroke(&[(50.5, 100.5), (65.5, 100.5), (80.5, 100.5)], true);
+    assert!(recorded);
+    for y in 80..120 {
+        for x in 60..100 {
+            assert_eq!(rig.at(x, y)[3], 0.5, "alpha kept at ({x}, {y})");
+        }
+    }
+    assert!(rig.at(75, 100)[0] > 0.0, "red was dragged in");
+    // Transparent space beyond stays empty.
+    assert_eq!(rig.at(150, 100), [0.0; 4]);
+}
+
+#[test]
+fn a_pixel_lock_refuses_the_press_and_a_missing_layer_has_its_own_notice() {
+    let mut rig = smudge_rig();
+    let lock = aurora_doc::LayerLock {
+        pixels: true,
+        ..aurora_doc::LayerLock::default()
+    };
+    assert!(rig.layers.set_lock(rig.layer, lock).is_ok());
+    let before = rig.snapshot(600, 400);
+    let (refused, recorded) = rig.smudge_stroke(&[(50.5, 100.5), (80.5, 100.5)], false);
+    assert_eq!(refused, Some(crate::LockRefusal::PixelsLocked));
+    assert!(!recorded);
+    assert_eq!(rig.snapshot(600, 400), before);
+    // The decision itself: no pixel layer, then a lock, then go.
+    assert_eq!(
+        crate::smudge_stamp::press(false, None),
+        Some(crate::LockRefusal::SmudgeNeedsPixelLayer)
+    );
+    assert_eq!(
+        crate::smudge_stamp::press(false, Some(crate::LockRefusal::PixelsLocked)),
+        Some(crate::LockRefusal::SmudgeNeedsPixelLayer)
+    );
+    assert_eq!(
+        crate::smudge_stamp::press(true, Some(crate::LockRefusal::PixelsLocked)),
+        Some(crate::LockRefusal::PixelsLocked)
+    );
+    assert_eq!(crate::smudge_stamp::press(true, None), None);
 }

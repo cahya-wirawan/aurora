@@ -58,6 +58,9 @@ mod fill;
 #[cfg(test)]
 mod hard_dab_tests;
 mod mask_dab;
+mod smudge;
+#[cfg(test)]
+mod smudge_tests;
 mod stamp;
 #[cfg(test)]
 mod test_support;
@@ -74,6 +77,7 @@ pub use fill::{
     gradient_fill_covered, wand_region,
 };
 pub use mask_dab::{dab_falloff, hard_dab_covers, hard_dab_snap, stamp_toward, stamp_toward_hard};
+pub use smudge::{MAX_SMUDGE_PATCH_TEXELS, SmudgeCarry, smudge_dab_covered};
 pub use stamp::{
     DabOutcome, erase_dab, erase_dab_covered, stamp_dab, stamp_dab_covered, stamp_dab_hard,
     stamp_dab_hard_covered, stamp_dab_hard_preserving_alpha,

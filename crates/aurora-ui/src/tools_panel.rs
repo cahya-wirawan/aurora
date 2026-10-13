@@ -24,7 +24,7 @@
 //! buttons sit in [`TOOL_GROUPS`], one row per group of at most two, and a
 //! group rule ([`widgets::insert_separator`], the menu separator's 1 px
 //! `border.default` line) separates the groups: move and select, view,
-//! sample, paint (Brush and Pencil), erase, fill — Photoshop's own grouping, trimmed to the tools
+//! sample, paint (Brush and Pencil), erase (Eraser and Clone Stamp), smudge, fill — Photoshop's own grouping, trimmed to the tools
 //! Aurora has (the fill group, Gradient and Paint Bucket, is 0.209.0's: a
 //! row of its own under the paint group). A group of one (the Eyedropper) fills the left cell.
 //!
@@ -90,7 +90,7 @@ pub const TOOL_COLUMNS: usize = 2;
 /// The groups of the strip, top to bottom, each one row of at most
 /// [`TOOL_COLUMNS`] buttons, a rule between consecutive groups. Together
 /// they hold every tool of [`Tool::ALL`], in that order.
-pub const TOOL_GROUPS: [&[Tool]; 9] = [
+pub const TOOL_GROUPS: [&[Tool]; 10] = [
     &[Tool::Move],
     &[Tool::MarqueeSelect, Tool::EllipticalMarquee],
     &[Tool::Lasso, Tool::PolygonalLasso],
@@ -99,6 +99,7 @@ pub const TOOL_GROUPS: [&[Tool]; 9] = [
     &[Tool::Eyedropper],
     &[Tool::Brush, Tool::Pencil],
     &[Tool::Eraser, Tool::CloneStamp],
+    &[Tool::Smudge],
     &[Tool::Gradient, Tool::PaintBucket],
 ];
 
@@ -121,6 +122,7 @@ pub const fn tool_icon(tool: Tool) -> IconKind {
         Tool::Eraser => IconKind::Eraser,
         Tool::Pencil => IconKind::Pencil,
         Tool::CloneStamp => IconKind::CloneStamp,
+        Tool::Smudge => IconKind::Smudge,
         Tool::Gradient => IconKind::Gradient,
         Tool::PaintBucket => IconKind::PaintBucket,
     }
@@ -391,7 +393,7 @@ mod tests {
 
     /// The icon each tool must wear, written out independently of
     /// [`tool_icon`] so a mapped-to-the-wrong-tool slip fails.
-    const EXPECTED_ICONS: [(Tool, IconKind); 15] = [
+    const EXPECTED_ICONS: [(Tool, IconKind); 16] = [
         (Tool::Move, IconKind::Move),
         (Tool::MarqueeSelect, IconKind::Marquee),
         (Tool::EllipticalMarquee, IconKind::EllipseMarquee),
@@ -405,6 +407,7 @@ mod tests {
         (Tool::Pencil, IconKind::Pencil),
         (Tool::Eraser, IconKind::Eraser),
         (Tool::CloneStamp, IconKind::CloneStamp),
+        (Tool::Smudge, IconKind::Smudge),
         (Tool::Gradient, IconKind::Gradient),
         (Tool::PaintBucket, IconKind::PaintBucket),
     ];
@@ -494,6 +497,7 @@ mod tests {
             tool_description(Tool::CloneStamp),
             "Clone Stamp tool, shortcut S"
         );
+        assert_eq!(tool_description(Tool::Smudge), "Smudge tool, shortcut R");
         assert_eq!(
             tool_description(Tool::Gradient),
             "Gradient tool, shortcut G"
@@ -722,6 +726,11 @@ mod tests {
             // 0.221.0: the Clone Stamp shares the Eraser's row.
             assert_eq!(at(Tool::CloneStamp).y, at(Tool::Eraser).y);
             assert_eq!(at(Tool::Eraser).x + 32, at(Tool::CloneStamp).x);
+            // 0.222.0: the Smudge has a row of its own under them, in the
+            // left column, above the fill row.
+            assert!(at(Tool::Smudge).y > at(Tool::Eraser).y);
+            assert_eq!(at(Tool::Smudge).x, at(Tool::Eraser).x);
+            assert!(at(Tool::Gradient).y > at(Tool::Smudge).y);
             // 0.209.0: the fill row sits under the paint row, two to a
             // row, in the same two columns, inside the same 72 px.
             assert!(at(Tool::Gradient).y > at(Tool::Brush).y);
@@ -731,7 +740,7 @@ mod tests {
             let bucket = at(Tool::PaintBucket);
             assert_eq!(
                 bucket.bottom() - strip.y,
-                4 + 9 * 32 + 8 * 8,
+                4 + 10 * 32 + 9 * 8,
                 "scale {scale_factor}"
             );
             assert!(

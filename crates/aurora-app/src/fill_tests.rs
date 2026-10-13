@@ -1042,3 +1042,70 @@ fn with_measured_text_every_option_fits_the_options_bar_and_the_labels_have_room
         }
     }
 }
+
+#[test]
+fn the_options_bar_edits_the_smudge_strength_and_mirrors_it() {
+    use aurora_widgets::ActionOutcome as A;
+    let mut bar = Bar::new();
+    let fill = bar.controls.fill;
+    assert_eq!(ToolSettings::default().smudge_strength, 50);
+    crate::sync_tool_controls(
+        &mut bar.workspace,
+        Some(bar.controls),
+        Tool::Smudge,
+        &bar.settings,
+        None,
+    );
+    assert!(bar.outcome(
+        Tool::Smudge,
+        A::ValueChanged {
+            id: fill.strength,
+            value: 72.4
+        }
+    ));
+    assert_eq!(bar.settings.smudge_strength, 72);
+    assert!(bar.outcome(
+        Tool::Smudge,
+        A::ValueChanged {
+            id: fill.strength,
+            value: 900.0
+        }
+    ));
+    assert_eq!(bar.settings.smudge_strength, 100);
+    assert!(bar.outcome(
+        Tool::Smudge,
+        A::ValueChanged {
+            id: fill.strength,
+            value: -3.0
+        }
+    ));
+    assert_eq!(bar.settings.smudge_strength, 1);
+    assert!(!bar.outcome(
+        Tool::Smudge,
+        A::ValueChanged {
+            id: fill.strength,
+            value: f64::NAN
+        }
+    ));
+    // The widgets show the setting, and only the Smudge shows the group.
+    let label = |bar: &Bar, id| match bar.workspace.tree.payload(id) {
+        Some(WidgetKind::Label(s)) => s.text.clone(),
+        other => unreachable!("{other:?}"),
+    };
+    assert_eq!(label(&bar, fill.strength_readout), "Strength 1 %");
+    assert_eq!(
+        aurora_ui::shown_fill_group(&bar.workspace.tree, &bar.controls),
+        Some(Tool::Smudge)
+    );
+    crate::sync_tool_controls(
+        &mut bar.workspace,
+        Some(bar.controls),
+        Tool::Brush,
+        &bar.settings,
+        None,
+    );
+    assert_eq!(
+        aurora_ui::shown_fill_group(&bar.workspace.tree, &bar.controls),
+        None
+    );
+}

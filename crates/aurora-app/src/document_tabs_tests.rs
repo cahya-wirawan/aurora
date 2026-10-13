@@ -207,6 +207,7 @@ impl Rig {
         self.drag = Some(Drag::Brush {
             hard: false,
             clone: None,
+            smudge: None,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: Some(stroke),
@@ -3476,6 +3477,7 @@ fn opening_a_document_ends_quick_mask_on_the_outgoing_one() {
     rig.drag = Some(Drag::Brush {
         hard: false,
         clone: None,
+        smudge: None,
         last_doc: (0.0, 0.0),
         carry: 0.0,
         stroke: None,
