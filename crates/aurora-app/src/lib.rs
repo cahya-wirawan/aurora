@@ -542,6 +542,9 @@ mod autosave_files;
 mod background_autosave;
 mod background_composite;
 mod background_open;
+mod clone_stamp;
+#[cfg(test)]
+mod clone_stamp_tests;
 mod colour_state;
 mod document_close;
 mod document_session;
@@ -5562,6 +5565,8 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         // 0.220.0: Photoshop's grouped B key.
         ("Shift+B", AppCommand::SelectTool(aurora_ui::Tool::Pencil)),
         ("e", AppCommand::SelectTool(aurora_ui::Tool::Eraser)),
+        // 0.221.0: Photoshop's Clone Stamp key.
+        ("s", AppCommand::SelectTool(aurora_ui::Tool::CloneStamp)),
         // 0.209.0: Photoshop's grouped G key.
         ("g", AppCommand::SelectTool(aurora_ui::Tool::Gradient)),
         (
@@ -5965,6 +5970,7 @@ const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
         aurora_ui::Tool::Gradient => "tool.gradient",
         aurora_ui::Tool::PaintBucket => "tool.paint_bucket",
         aurora_ui::Tool::Pencil => "tool.pencil",
+        aurora_ui::Tool::CloneStamp => "tool.clone_stamp",
     }
 }
 
@@ -10330,6 +10336,9 @@ const ERASER_STROKE_LABEL: &str = "Eraser Stroke";
 /// The row label of a committed Pencil stroke (0.220.0).
 const PENCIL_STROKE_LABEL: &str = "Pencil Stroke";
 
+/// The row label of a committed Clone Stamp stroke (0.221.0).
+const CLONE_STAMP_STROKE_LABEL: &str = "Clone Stamp Stroke";
+
 /// The History row a committed stroke of the Brush drag gets: the Pencil's
 /// (`hard`) or the Brush's.
 const fn brush_drag_label(hard: bool) -> &'static str {
@@ -11861,6 +11870,12 @@ enum Drag {
         /// snapshot and undo as the Brush, but its dabs are hard-edged
         /// ([`dab_tool_of_drag`]) and its step reads "Pencil Stroke".
         hard: bool,
+        /// The Clone Stamp (0.221.0): `Some(offset)` is the integer
+        /// document-space offset from a painted texel to the texel it copies
+        /// (aligned mode, [`clone_stamp`]); the drag is otherwise the
+        /// Brush's, its step reads "Clone Stamp Stroke" and its dabs are
+        /// [`clone_stamp::clone_dab_through_selection`]'s.
+        clone: Option<(i64, i64)>,
         last_doc: (f32, f32),
         carry: f32,
         /// This stroke's own accumulated undo snapshot — `None` when the
@@ -12145,10 +12160,15 @@ fn commit_ending_drag(
         Some(Drag::Brush {
             stroke: Some(stroke),
             hard,
+            clone,
             ..
         }) => record_stroke(
             stroke,
-            brush_drag_label(hard),
+            if clone.is_some() {
+                CLONE_STAMP_STROKE_LABEL
+            } else {
+                brush_drag_label(hard)
+            },
             history,
             pixel_history,
             undo_order,
@@ -12432,9 +12452,16 @@ fn begin_drag(
                 modal: selection_modes::ModeGesture::boxed_replace(),
             })
         }
-        (aurora_ui::Tool::Brush | aurora_ui::Tool::Pencil, PointerButton::Primary) => {
+        (
+            aurora_ui::Tool::Brush | aurora_ui::Tool::Pencil | aurora_ui::Tool::CloneStamp,
+            PointerButton::Primary,
+        ) => {
             Some(Drag::Brush {
                 hard: tool == aurora_ui::Tool::Pencil,
+                // The press fills in the real offset
+                // ([`clone_stamp::set_drag_offset`]); a Clone Stamp drag
+                // always carries one.
+                clone: (tool == aurora_ui::Tool::CloneStamp).then_some((0, 0)),
                 last_doc: view.to_document(canvas_point),
                 carry: 0.0,
                 stroke: active_pixel_layer
@@ -25851,6 +25878,12 @@ enum LockRefusal {
     /// A `.aur` file's selection entry was unusable and was left out
     /// (0.218.0); the document opened without it.
     SelectionDroppedOnOpen,
+    /// The Clone Stamp pressed with no source set (0.221.0).
+    CloneNeedsSource,
+    /// The Clone Stamp with no pixel layer to sample or paint: none is
+    /// active, or the active layer is a group or an adjustment layer
+    /// (0.221.0).
+    CloneNeedsPixelLayer,
     /// An undo or redo could not read the step's saved data back (0.210.0:
     /// a pixel-history spill file a temp-file cleaner removed, or a corrupt
     /// one). Not a lock; the step stays in the History panel.
@@ -25916,6 +25949,10 @@ impl LockRefusal {
             LockRefusal::SelectionDroppedOnOpen => {
                 "This file's saved selection couldn't be restored and was left out. The rest of the document opened."
             }
+            LockRefusal::CloneNeedsSource => "Alt-click to set a clone source.",
+            LockRefusal::CloneNeedsPixelLayer => {
+                "Select a pixel layer to clone. A group, an adjustment layer or no layer can't be sampled."
+            }
             LockRefusal::HistoryUnavailable => {
                 "Couldn't undo or redo: history file unavailable. A temp-file cleaner may have removed it; the step stays in the list."
             }
@@ -25955,10 +25992,6 @@ fn paint_permission(tool: DabTool, lock: aurora_doc::LayerLock) -> PaintPermissi
 /// `lock`, before any drag starts.
 fn press_refusal(tool: aurora_ui::Tool, lock: aurora_doc::LayerLock) -> Option<LockRefusal> {
     match tool {
-        aurora_ui::Tool::Brush => match paint_permission(DabTool::Brush, lock) {
-            PaintPermission::Refused(why) => Some(why),
-            _ => None,
-        },
         aurora_ui::Tool::Pencil => match paint_permission(DabTool::Pencil, lock) {
             PaintPermission::Refused(why) => Some(why),
             _ => None,
@@ -25967,12 +26000,15 @@ fn press_refusal(tool: aurora_ui::Tool, lock: aurora_doc::LayerLock) -> Option<L
             PaintPermission::Refused(why) => Some(why),
             _ => None,
         },
-        aurora_ui::Tool::Gradient | aurora_ui::Tool::PaintBucket => {
-            match paint_permission(DabTool::Brush, lock) {
-                PaintPermission::Refused(why) => Some(why),
-                _ => None,
-            }
-        }
+        // The Brush, the fills and the Clone Stamp (0.221.0) share the
+        // Brush's rule: refused on a pixels lock.
+        aurora_ui::Tool::Brush
+        | aurora_ui::Tool::CloneStamp
+        | aurora_ui::Tool::Gradient
+        | aurora_ui::Tool::PaintBucket => match paint_permission(DabTool::Brush, lock) {
+            PaintPermission::Refused(why) => Some(why),
+            _ => None,
+        },
         aurora_ui::Tool::Move if lock.position => Some(LockRefusal::PositionLocked),
         _ => None,
     }
@@ -26007,6 +26043,10 @@ fn lock_refusal_applies(
             tool,
             aurora_ui::Tool::Gradient | aurora_ui::Tool::PaintBucket
         ))
+        || (matches!(
+            refusal,
+            LockRefusal::CloneNeedsSource | LockRefusal::CloneNeedsPixelLayer
+        ) && tool == aurora_ui::Tool::CloneStamp)
         || (refusal == LockRefusal::WandNeedsPixelLayer && tool == aurora_ui::Tool::MagicWand)
         || (refusal == LockRefusal::SelectionTooLarge
             && matches!(
@@ -26061,7 +26101,9 @@ impl ToolSettings {
     /// `tool`'s radius, or `None` for a tool that has none.
     fn radius(&self, tool: aurora_ui::Tool) -> Option<f32> {
         match tool {
-            aurora_ui::Tool::Brush | aurora_ui::Tool::Pencil => Some(self.brush_radius),
+            aurora_ui::Tool::Brush | aurora_ui::Tool::Pencil | aurora_ui::Tool::CloneStamp => {
+                Some(self.brush_radius)
+            }
             aurora_ui::Tool::Eraser => Some(self.eraser_radius),
             aurora_ui::Tool::Move
             | aurora_ui::Tool::MarqueeSelect
@@ -26092,7 +26134,9 @@ impl ToolSettings {
             .clamp(aurora_ui::TOOL_RADIUS_MIN, aurora_ui::TOOL_RADIUS_MAX)
             as f32;
         let slot = match tool {
-            aurora_ui::Tool::Brush | aurora_ui::Tool::Pencil => &mut self.brush_radius,
+            aurora_ui::Tool::Brush | aurora_ui::Tool::Pencil | aurora_ui::Tool::CloneStamp => {
+                &mut self.brush_radius
+            }
             aurora_ui::Tool::Eraser => &mut self.eraser_radius,
             _ => return false,
         };
@@ -30020,6 +30064,31 @@ impl App {
             );
             return;
         }
+        // The Clone Stamp (0.221.0): Alt+click sets the source and starts
+        // no stroke; a plain press needs a source and a pixel layer.
+        let mut clone_offset = None;
+        if self.tool == aurora_ui::Tool::CloneStamp && button == PointerButton::Primary {
+            let doc_point = self.doc.canvas_view.to_document(canvas_point);
+            let layer =
+                active_pixel_layer(&self.doc.layers, self.doc.active_layer).map(|(id, _)| id);
+            match clone_stamp::press(
+                &mut self.doc.clone_stamp,
+                self.modifiers.alt,
+                layer,
+                doc_point,
+            ) {
+                clone_stamp::Press::SourceSet => {
+                    self.needs_redraw = true;
+                    return;
+                }
+                clone_stamp::Press::Refused(why) => {
+                    self.lock_notice = Some((why, self.doc.active_layer));
+                    self.sync_status_bar_now();
+                    return;
+                }
+                clone_stamp::Press::Stroke(offset) => clone_offset = Some(offset),
+            }
+        }
         // The Paint Bucket fills on the press itself (0.209.0): no drag.
         if self.tool == aurora_ui::Tool::PaintBucket && button == PointerButton::Primary {
             let doc_point = self.doc.canvas_view.to_document(canvas_point);
@@ -30045,6 +30114,9 @@ impl App {
                 active_pixel_layer(&self.doc.layers, self.doc.active_layer),
             ),
         );
+        if let Some(offset) = clone_offset {
+            clone_stamp::set_drag_offset(&mut self.drag, offset);
+        }
         if matches!(self.drag, Some(Drag::Lasso { .. })) {
             // Like the Marquee, a press deselects at once; the path then
             // builds the new selection and Escape restores this one.
@@ -30146,6 +30218,11 @@ impl App {
     /// collapse still left a long drag across one emitting ~100
     /// identical lines.
     fn paint_dab(&mut self, doc_point: (f32, f32)) {
+        // The Clone Stamp (0.221.0) is the Brush's drag with a cloned dab.
+        if let Some(offset) = clone_stamp::drag_offset(self.drag.as_ref()) {
+            self.clone_dab(doc_point, offset);
+            return;
+        }
         // The Pencil (0.220.0) is the Brush's drag with a hard dab.
         let dab_tool = dab_tool_of_drag(self.drag.as_ref());
         // Quick Mask (0.217.0): the dab edits the mask grid, never a layer.
@@ -30227,6 +30304,71 @@ impl App {
                 failed = outcome.failed().len(),
                 painted = outcome.painted().len(),
                 "failed to stamp part of a brush dab"
+            );
+        }
+    }
+
+    /// One Clone Stamp dab at `doc_point` (0.221.0): [`Self::paint_dab`]'s
+    /// preconditions, locks, selection, invalidation and per-stroke warning
+    /// dedupe, with [`clone_stamp::clone_dab_through_selection`] as the
+    /// stamp. Never runs in Quick Mask (the press is refused there).
+    fn clone_dab(&mut self, doc_point: (f32, f32), offset: (i64, i64)) {
+        if self.quick_mask.is_some() {
+            return;
+        }
+        let Some(layer_id) = self.doc.active_layer else {
+            return;
+        };
+        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.doc.layers.kind(layer_id).cloned()
+        else {
+            return;
+        };
+        let Some(surface) = self.doc.layers.surface_id(layer_id) else {
+            return;
+        };
+        let preserve_alpha = match paint_permission(
+            DabTool::Brush,
+            self.doc.layers.lock(layer_id).unwrap_or_default(),
+        ) {
+            PaintPermission::Refused(why) => {
+                self.lock_notice = Some((why, Some(layer_id)));
+                return;
+            }
+            PaintPermission::PreserveAlpha => true,
+            PaintPermission::Allowed => false,
+        };
+        let selection = self.doc.selection.active();
+        let Some(store) = self.doc.tile_store.as_mut() else {
+            return;
+        };
+        let outcome = clone_stamp::clone_dab_through_selection(
+            preserve_alpha,
+            store,
+            surface,
+            bounds,
+            doc_point,
+            offset,
+            selection,
+            &self.tool_settings,
+            &mut self.drag,
+        );
+        let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
+        invalidate_painted_tiles(
+            &mut self.doc.composite_cache,
+            &self.doc.layers,
+            layer_id,
+            outcome.painted(),
+            reference_origin,
+        );
+        let fresh = unwarned_failures(&mut self.drag, &outcome);
+        for (tile, err) in &fresh {
+            tracing::warn!(
+                ?err,
+                ?tile,
+                first_failures = fresh.len(),
+                failed = outcome.failed().len(),
+                painted = outcome.painted().len(),
+                "failed to clone part of a dab"
             );
         }
     }
@@ -33166,6 +33308,8 @@ impl ApplicationHandler<AppEvent> for App {
         // 0.213.0: a selection step undone or redone by a path that does
         // not own the selection (defensive; the known ones apply it).
         self.apply_pending_selection();
+        // 0.221.0: a Clone Stamp source belongs to the layer it was set on.
+        self.doc.clone_stamp.observe_layer(self.doc.active_layer);
         // 0.186.0: install whatever the background compositor finished.
         if self.drain_background_composite() {
             self.needs_redraw = true;
@@ -68155,7 +68299,10 @@ mod tests {
                 crate::sync_tool_controls(&mut workspace, Some(controls), tool, &settings, None);
             assert_eq!(
                 aurora_ui::radius_slider_shown(&workspace.tree, &controls),
-                matches!(tool, Tool::Brush | Tool::Pencil | Tool::Eraser),
+                matches!(
+                    tool,
+                    Tool::Brush | Tool::Pencil | Tool::Eraser | Tool::CloneStamp
+                ),
                 "{tool:?}"
             );
             assert_eq!(
@@ -68677,6 +68824,7 @@ mod tests {
         ) {
             Some(Drag::Brush {
                 hard: _,
+                clone: _,
                 last_doc,
                 carry,
                 stroke,
@@ -68736,6 +68884,7 @@ mod tests {
     fn brush_drag_with_a_stroke() -> Drag {
         Drag::Brush {
             hard: false,
+            clone: None,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: Some(aurora_brush::StrokeSnapshot::new(
@@ -68766,6 +68915,7 @@ mod tests {
         assert!(
             brush_stroke_mut(&mut Some(Drag::Brush {
                 hard: false,
+                clone: None,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,
@@ -69876,6 +70026,7 @@ mod tests {
         for nothing in [
             Some(Drag::Brush {
                 hard: false,
+                clone: None,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,
@@ -70255,6 +70406,7 @@ mod tests {
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Brush {
             hard: false,
+            clone: None,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
@@ -70293,6 +70445,7 @@ mod tests {
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Brush {
             hard: false,
+            clone: None,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
@@ -70957,6 +71110,7 @@ mod tests {
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Brush {
             hard: false,
+            clone: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71084,6 +71238,7 @@ mod tests {
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Brush {
             hard: false,
+            clone: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71191,6 +71346,7 @@ mod tests {
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Brush {
             hard: false,
+            clone: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71249,6 +71405,7 @@ mod tests {
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Brush {
             hard: false,
+            clone: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71297,6 +71454,7 @@ mod tests {
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Brush {
             hard: false,
+            clone: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71435,6 +71593,7 @@ mod tests {
         let pointer = (40.0, 40.0);
         let mut drag = Drag::Brush {
             hard: false,
+            clone: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71579,6 +71738,7 @@ mod tests {
         };
         let a_stroke = |view: &CanvasView| Drag::Brush {
             hard: false,
+            clone: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -77322,6 +77482,7 @@ mod tests {
         fn brush_dabs(settings: &ToolSettings) -> usize {
             let mut drag = Drag::Brush {
                 hard: false,
+                clone: None,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,

@@ -327,6 +327,12 @@ pub(crate) struct DocumentSession {
     /// (`commit_live_gestures`) and back when it becomes active
     /// (`bind_active_document`).
     pub(crate) layer_filter: aurora_ui::LayerFilter,
+    /// The Clone Stamp's source and aligned offset (0.221.0): tool state
+    /// tied to this document's active layer, not document state (no undo,
+    /// not saved, never dirty). Cleared when the session stops being the
+    /// active one (`commit_live_gestures`), when the active layer changes
+    /// and by a new `Alt`+click.
+    pub(crate) clone_stamp: crate::clone_stamp::CloneStamp,
     /// The canvas pan/zoom transform ([`aurora_ui::CanvasView`]). Per
     /// document, the way Photoshop remembers each open document's own
     /// zoom and scroll independent of its pixel content.
@@ -585,6 +591,7 @@ impl DocumentSession {
             saved_revision: Some(undo_order.content_revision),
             import_losses: None,
             layer_filter: aurora_ui::LayerFilter::default(),
+            clone_stamp: crate::clone_stamp::CloneStamp::default(),
             park_autosave: None,
             canvas_view,
             selection: aurora_doc::SelectionSet::new(),

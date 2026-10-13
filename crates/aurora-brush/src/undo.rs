@@ -248,6 +248,22 @@ impl StrokeSnapshot {
         true
     }
 
+    /// The stroke-start content of `tile` while the stroke is still being
+    /// painted (0.221.0): the raw copy a dab captured just before it first
+    /// wrote the tile, one whole tile of samples. `None` for a tile this
+    /// stroke has not changed (its live content *is* its stroke-start
+    /// content) and for a tile already packed or spilled (only
+    /// [`crate::PixelHistory::push`] does that, after the stroke). The
+    /// Clone Stamp reads its source through this so a stroke never clones
+    /// its own output.
+    #[must_use]
+    pub fn raw_content(&self, tile: TileId) -> Option<&[f16]> {
+        match self.tiles.get(&tile) {
+            Some(TileData::Raw(texels)) => Some(texels.as_slice()),
+            _ => None,
+        }
+    }
+
     /// Every tile this snapshot has captured, in no particular order —
     /// exactly the tiles [`Self::apply`] would restore, and (for a
     /// snapshot the brush/eraser dab path built) exactly the union of

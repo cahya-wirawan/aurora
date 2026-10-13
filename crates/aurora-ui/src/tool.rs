@@ -89,13 +89,18 @@ pub enum Tool {
     /// real, via `aurora_brush::stamp_dab_hard` in `aurora-app`, with the
     /// Brush's radius and spacing and no opacity.
     Pencil,
+    /// Copies pixels of the active pixel layer from a source point to
+    /// where it is dragged, aligned (0.221.0): real, via
+    /// `aurora_brush::clone_dab_covered` in `aurora-app`. `Alt`+click sets
+    /// the source.
+    CloneStamp,
 }
 
 impl Tool {
     /// Every tool this enum has today, in the fixed order they're
     /// offered to the user (matches PLAN.md's own bullets: Move, Marquee
     /// Select, Zoom, Pan, Eyedropper, then Brush, Eraser, and the 0.209.0 fills Gradient and Paint Bucket).
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Move,
         Self::MarqueeSelect,
         Self::EllipticalMarquee,
@@ -108,6 +113,7 @@ impl Tool {
         Self::Brush,
         Self::Pencil,
         Self::Eraser,
+        Self::CloneStamp,
         Self::Gradient,
         Self::PaintBucket,
     ];
@@ -145,6 +151,7 @@ impl Tool {
             Self::Gradient => "Gradient",
             Self::PaintBucket => "Paint Bucket",
             Self::Pencil => "Pencil",
+            Self::CloneStamp => "Clone Stamp",
         }
     }
 
@@ -164,6 +171,7 @@ impl Tool {
             Self::Eyedropper => 'I',
             Self::Brush | Self::Pencil => 'B',
             Self::Eraser => 'E',
+            Self::CloneStamp => 'S',
             Self::Gradient | Self::PaintBucket => 'G',
         }
     }
@@ -229,11 +237,11 @@ mod tests {
 
     #[test]
     fn all_lists_every_variant_once() {
-        assert_eq!(Tool::ALL.len(), 14);
+        assert_eq!(Tool::ALL.len(), 15);
         let mut seen = Tool::ALL.to_vec();
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
-        assert_eq!(seen.len(), 14, "ALL must not repeat a variant");
+        assert_eq!(seen.len(), 15, "ALL must not repeat a variant");
     }
 
     #[test]
@@ -261,6 +269,7 @@ mod tests {
         assert_eq!(Tool::PaintBucket.shortcut_text(), "Shift+G");
         assert_eq!(Tool::Brush.shortcut_text(), "B");
         assert_eq!(Tool::Pencil.shortcut_text(), "Shift+B");
+        assert_eq!(Tool::CloneStamp.shortcut_text(), "S");
     }
 
     #[test]

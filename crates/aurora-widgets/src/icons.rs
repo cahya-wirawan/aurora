@@ -126,11 +126,14 @@ pub enum IconKind {
     MagicWand,
     /// A sharpened pencil, tip down-left: the Pencil tool (0.220.0).
     Pencil,
+    /// A rubber stamp, handle over a wide shoulder over its base: the Clone
+    /// Stamp tool (0.221.0).
+    CloneStamp,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 34] = [
+    pub const ALL: [IconKind; 35] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -165,6 +168,7 @@ impl IconKind {
         IconKind::PolygonalLasso,
         IconKind::MagicWand,
         IconKind::Pencil,
+        IconKind::CloneStamp,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -206,6 +210,7 @@ impl IconKind {
             IconKind::PolygonalLasso => "Polygonal Lasso",
             IconKind::MagicWand => "Magic Wand",
             IconKind::Pencil => "Pencil",
+            IconKind::CloneStamp => "Clone Stamp",
         }
     }
 }
@@ -682,6 +687,28 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
             stroke_part().m(3.0, 10.0).l(6.0, 13.0),
             stroke_part().m(9.0, 4.0).l(12.0, 7.0),
         ],
+        IconKind::CloneStamp => vec![
+            // A rubber stamp: the handle, the shoulder it sits on and the
+            // wide base plate.
+            stroke_part()
+                .m(6.0, 2.0)
+                .l(9.0, 2.0)
+                .l(9.0, 6.0)
+                .l(6.0, 6.0)
+                .closed(),
+            stroke_part()
+                .m(3.0, 6.0)
+                .l(12.0, 6.0)
+                .l(12.0, 9.0)
+                .l(3.0, 9.0)
+                .closed(),
+            stroke_part()
+                .m(2.0, 11.0)
+                .l(13.0, 11.0)
+                .l(13.0, 13.0)
+                .l(2.0, 13.0)
+                .closed(),
+        ],
         IconKind::PaintBucket => vec![
             // A tilted bucket (a diamond), the paint line across it, and
             // the drop pouring from its corner.
@@ -829,7 +856,7 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 34);
+        assert_eq!(IconKind::ALL.len(), 35);
         for kind in [IconKind::SwapArrows, IconKind::DefaultColours] {
             assert!(IconKind::ALL.contains(&kind));
             assert!(!icon_parts(kind).is_empty(), "{kind:?}");

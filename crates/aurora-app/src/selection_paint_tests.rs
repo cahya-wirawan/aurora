@@ -1004,7 +1004,7 @@ fn a_history_panel_jump_applies_the_selection_of_the_row() {
 
 #[test]
 fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
-    assert_eq!(Tool::ALL.len(), 14);
+    assert_eq!(Tool::ALL.len(), 15);
     let table = crate::default_shortcuts_for(false);
     let chord = |shift| {
         KeyChord::new(
@@ -1062,7 +1062,7 @@ fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
     );
     // The tools panel has one button per tool, the new one wearing its
     // own icon.
-    assert_eq!(workspace.tools.buttons.len(), 14);
+    assert_eq!(workspace.tools.buttons.len(), 15);
     assert_eq!(
         aurora_ui::tool_icon(Tool::EllipticalMarquee),
         aurora_widgets::icons::IconKind::EllipseMarquee
@@ -3340,6 +3340,7 @@ fn the_fills_and_selection_tools_are_refused_and_the_rest_work() {
                 | Tool::Lasso
                 | Tool::PolygonalLasso
                 | Tool::MagicWand
+                | Tool::CloneStamp
         );
         assert_eq!(
             quick_mask::tool_refusal(tool),
@@ -3492,6 +3493,7 @@ fn entering_quick_mask_mid_stroke_commits_the_layer_stroke_first() {
     let rig = Rig::new(rect(0, 0, 400, 300));
     let layer_stroke = Some(Drag::Brush {
         hard: false,
+        clone: None,
         last_doc: (0.0, 0.0),
         carry: 0.0,
         stroke: Some(aurora_brush::StrokeSnapshot::new(rig.surface)),
@@ -3798,4 +3800,226 @@ fn the_pencil_is_selected_by_shift_b_and_the_palette_and_the_brush_by_b() {
     ));
     assert_eq!(crate::tool_command_id(Tool::Pencil), "tool.pencil");
     assert_eq!(Tool::Pencil.shortcut_text(), "Shift+B");
+}
+
+// -- The Clone Stamp (0.221.0) ---------------------------------------------
+
+impl Rig {
+    /// A Clone Stamp stroke along `points` driven the way `App` does: the
+    /// press decision (`clone_stamp::press`), then the drag, each dab
+    /// stamped by `clone_stamp::clone_dab_through_selection`, then the
+    /// commit. Returns the press and whether a history step was recorded.
+    fn clone_stroke(
+        &mut self,
+        state: &mut crate::clone_stamp::CloneStamp,
+        alt: bool,
+        points: &[(f32, f32)],
+        preserve_alpha: bool,
+    ) -> (crate::clone_stamp::Press, bool) {
+        let Some(&first) = points.first() else {
+            unreachable!("a stroke has points");
+        };
+        let press = crate::clone_stamp::press(state, alt, Some(self.layer), first);
+        let crate::clone_stamp::Press::Stroke(offset) = press else {
+            return (press, false);
+        };
+        let mut drag = begin_drag(
+            Tool::CloneStamp,
+            PointerButton::Primary,
+            first,
+            &self.view,
+            crate::active_pixel_layer(&self.layers, Some(self.layer)),
+        );
+        crate::clone_stamp::set_drag_offset(&mut drag, offset);
+        let selection = self.selection.active();
+        let dab_at = |rig: &mut Self, drag: &mut Option<Drag>, p: (f32, f32)| {
+            let _ = crate::clone_stamp::clone_dab_through_selection(
+                preserve_alpha,
+                &mut rig.store,
+                rig.surface,
+                rig.bounds,
+                p,
+                offset,
+                selection.clone(),
+                &rig.settings,
+                drag,
+            );
+        };
+        dab_at(self, &mut drag, first);
+        for &p in points.iter().skip(1) {
+            let bounds = pan_bounds(&self.layers, Some(self.layer), Some((1000.0, 800.0)));
+            let dabs = match drag.as_mut() {
+                Some(d) => continue_drag(
+                    d,
+                    p,
+                    &mut self.view,
+                    &mut self.selection,
+                    &self.settings,
+                    bounds,
+                ),
+                None => Vec::new(),
+            };
+            for dab in dabs {
+                dab_at(self, &mut drag, dab);
+            }
+        }
+        let recorded = commit_ending_drag(
+            drag,
+            &self.layers,
+            &mut self.history,
+            &mut self.pixel_history,
+            &mut self.undo_order,
+            &mut self.view,
+            Some(self.layer),
+            Some((1000.0, 800.0)),
+        );
+        (press, recorded)
+    }
+}
+
+/// A rig with a distinctive opaque pattern at x 200..232, y 100..132.
+fn clone_rig() -> Rig {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.settings.set_radius(Tool::CloneStamp, 3.0);
+    for y in 100..132u32 {
+        for x in 200..232u32 {
+            rig.put(
+                x,
+                y,
+                [(x - 200) as f32 / 32.0, (y - 100) as f32 / 32.0, 0.5, 1.0],
+            );
+        }
+    }
+    rig
+}
+
+#[test]
+fn a_clone_stroke_copies_the_source_at_the_aligned_offset_as_one_labelled_step() {
+    let mut rig = clone_rig();
+    let mut state = crate::clone_stamp::CloneStamp::default();
+    let (set, recorded) = rig.clone_stroke(&mut state, true, &[(210.5, 110.5)], false);
+    assert_eq!(set, crate::clone_stamp::Press::SourceSet);
+    assert!(!recorded, "Alt+click is not a stroke");
+    assert!(rig.undo_order.undo_labels.is_empty());
+    let before = rig.snapshot(600, 400);
+    // Press at (50.5, 60.5): offset = (210.5 - 50.5, 110.5 - 60.5) = (160, 50).
+    let (press, recorded) = rig.clone_stroke(&mut state, false, &[(50.5, 60.5)], false);
+    assert_eq!(press, crate::clone_stamp::Press::Stroke((160, 50)));
+    assert!(recorded);
+    assert_eq!(rig.undo_order.undo_labels, ["Clone Stamp Stroke"]);
+    // The centre texel is an exact copy of the source texel it points at.
+    let (src, dst) = (rig.at(210, 110), rig.at(50, 60));
+    assert_eq!(dst, src);
+    assert!(dst[3] > 0.0);
+    // One texel to the right copies the texel to the right of the source.
+    let falloff = aurora_brush::dab_falloff(1.0, 3.0);
+    let right = rig.at(51, 60);
+    let want = rig.at(211, 110);
+    for c in 0..3 {
+        let diff = (right[c] - want[c] * falloff).abs();
+        assert!(diff < 2e-3, "channel {c}: {right:?} vs {want:?}");
+    }
+    // The source itself is untouched and undo restores everything.
+    assert_eq!(rig.at(210, 110), src);
+    assert!(rig.undo(UndoDirection::Undo));
+    assert_eq!(rig.snapshot(600, 400), before);
+    assert!(rig.undo(UndoDirection::Redo));
+    assert_eq!(rig.at(50, 60), src);
+}
+
+#[test]
+fn a_second_stroke_keeps_the_first_strokes_offset() {
+    let mut rig = clone_rig();
+    let mut state = crate::clone_stamp::CloneStamp::default();
+    let _ = rig.clone_stroke(&mut state, true, &[(210.5, 110.5)], false);
+    let _ = rig.clone_stroke(&mut state, false, &[(50.5, 60.5)], false);
+    // Elsewhere: still offset (160, 50), so (80, 70) copies (240, 120)...
+    // which is outside the pattern (x 200..232): transparent. Use (60, 75).
+    let (press, _) = rig.clone_stroke(&mut state, false, &[(60.5, 75.5)], false);
+    assert_eq!(press, crate::clone_stamp::Press::Stroke((160, 50)));
+    assert_eq!(rig.at(60, 75), rig.at(220, 125));
+    assert_eq!(rig.undo_order.undo_labels.len(), 2);
+}
+
+#[test]
+fn a_stroke_never_clones_its_own_output() {
+    // One opaque red texel is the only source content. Offset (-8, 0):
+    // destination x reads source x - 8. Dragging right from x 50 to 60, a
+    // live read would pass the red along (dest 58 reads dest 50, already
+    // red); the stroke-start read leaves only dest 50 red.
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.settings.set_radius(Tool::CloneStamp, 3.0);
+    rig.put(42, 50, [1.0, 0.0, 0.0, 1.0]);
+    let mut state = crate::clone_stamp::CloneStamp::default();
+    let _ = rig.clone_stroke(&mut state, true, &[(42.5, 50.5)], false);
+    let (press, recorded) = rig.clone_stroke(
+        &mut state,
+        false,
+        &[(50.5, 50.5), (55.5, 50.5), (60.5, 50.5)],
+        false,
+    );
+    assert_eq!(press, crate::clone_stamp::Press::Stroke((-8, 0)));
+    assert!(recorded);
+    let mut lit = Vec::new();
+    for y in 40..60 {
+        for x in 40..70 {
+            if (x, y) != (42, 50) && rig.at(x, y)[3] > 0.0 {
+                lit.push((x, y));
+            }
+        }
+    }
+    assert_eq!(lit, vec![(50, 50)], "only the one copied texel");
+}
+
+#[test]
+fn a_clone_paints_only_through_the_selection() {
+    let mut rig = clone_rig();
+    rig.marquee((48.0, 0.0), (52.0, 400.0));
+    let mut state = crate::clone_stamp::CloneStamp::default();
+    let _ = rig.clone_stroke(&mut state, true, &[(210.5, 110.5)], false);
+    let (_, recorded) = rig.clone_stroke(&mut state, false, &[(50.5, 60.5)], false);
+    assert!(recorded);
+    let mut xs = std::collections::BTreeSet::new();
+    for y in 0..400 {
+        for x in 0..300 {
+            if rig.at(x, y)[3] > 0.0 && !(200..232).contains(&x) {
+                xs.insert(x);
+            }
+        }
+    }
+    assert!(!xs.is_empty());
+    assert!(xs.iter().all(|x| (48..52).contains(x)), "{xs:?}");
+}
+
+#[test]
+fn a_transparency_locked_clone_keeps_alpha() {
+    let mut rig = clone_rig();
+    rig.rect_fill(40, 50, 60, 70, [0.2, 0.2, 0.2, 0.5]);
+    let mut state = crate::clone_stamp::CloneStamp::default();
+    let _ = rig.clone_stroke(&mut state, true, &[(210.5, 110.5)], false);
+    let (_, recorded) = rig.clone_stroke(&mut state, false, &[(50.5, 60.5)], true);
+    assert!(recorded);
+    for y in 50..70 {
+        for x in 40..60 {
+            assert_eq!(rig.at(x, y)[3], 0.5, "alpha kept at ({x}, {y})");
+        }
+    }
+    assert_ne!(rig.at(50, 60)[0], 0.2, "the colour moved");
+    // Transparent texels stay empty and no tile is created for them.
+    assert_eq!(rig.at(300, 300), [0.0; 4]);
+}
+
+#[test]
+fn a_press_with_no_source_changes_nothing() {
+    let mut rig = clone_rig();
+    let before = rig.snapshot(600, 400);
+    let mut state = crate::clone_stamp::CloneStamp::default();
+    let (press, recorded) = rig.clone_stroke(&mut state, false, &[(50.5, 60.5)], false);
+    assert_eq!(
+        press,
+        crate::clone_stamp::Press::Refused(crate::LockRefusal::CloneNeedsSource)
+    );
+    assert!(!recorded);
+    assert!(rig.undo_order.undo_labels.is_empty());
+    assert_eq!(rig.snapshot(600, 400), before);
 }

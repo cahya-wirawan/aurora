@@ -144,6 +144,9 @@ pub(crate) fn commit_live_gestures(cx: &mut SwitchContext<'_>) -> bool {
     cx.doc
         .layer_filter
         .clone_from(&cx.workspace.layer_view.filter);
+    // The Clone Stamp's source belongs to the document and layer it was set
+    // on (0.221.0): a switch, New, Open or close ends it.
+    cx.doc.clone_stamp.clear();
     let mut recorded = left;
     recorded |= end_layer_control_gestures(
         &mut LayerControlEdit {

@@ -47,6 +47,9 @@
 //! See each module's own doc comment for exactly what's real and what's
 //! still open.
 
+mod clone;
+#[cfg(test)]
+mod clone_tests;
 mod coverage;
 #[cfg(test)]
 mod coverage_tests;
@@ -62,6 +65,7 @@ mod undo;
 #[cfg(test)]
 mod wand_tests;
 
+pub use clone::{MAX_CLONE_PATCH_TEXELS, clone_dab_covered};
 pub use coverage::{Coverage, CoverageRegion};
 pub use dab::{DEFAULT_SPACING, advance_segment, dab_step, dabs_along_path};
 pub use fill::{
