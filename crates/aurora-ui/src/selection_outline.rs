@@ -63,9 +63,9 @@ pub const MARCH_PERIOD: u32 = 2 * DASH_LENGTH;
 const COORD_LIMIT: f64 = 1.0e9;
 
 /// A whole-pixel rectangle `[x0, x1) x [y0, y1)` in physical pixels.
-type PixelRect = (i64, i64, i64, i64);
+pub(crate) type PixelRect = (i64, i64, i64, i64);
 
-fn to_pixel(v: f64) -> i64 {
+pub(crate) fn to_pixel(v: f64) -> i64 {
     // Within `COORD_LIMIT`, so the cast is exact in range; NaN maps to 0.
     #[allow(clippy::cast_possible_truncation)]
     let rounded = if v.is_nan() {
@@ -78,7 +78,7 @@ fn to_pixel(v: f64) -> i64 {
 
 /// A document-space rectangle as a physical-pixel one, at least one pixel
 /// wide and tall.
-fn pixel_rect(rect: &aurora_core::Rect, view: &CanvasView, scale: f64) -> PixelRect {
+pub(crate) fn pixel_rect(rect: &aurora_core::Rect, view: &CanvasView, scale: f64) -> PixelRect {
     #[allow(clippy::cast_precision_loss)]
     let (left, top, right, bottom) = (
         rect.x as f32,

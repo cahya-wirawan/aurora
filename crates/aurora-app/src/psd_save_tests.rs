@@ -1088,6 +1088,151 @@ fn moving_a_smart_object_layer_drops_it_with_an_itemised_report() {
     assert!(text.contains("they were moved"), "{text}");
 }
 
+/// 0.226.0: the Crop moves every layer's bounds by the negated crop origin
+/// and does NOT move a smart object's recorded placement (the `SoLd` data is
+/// in document coordinates and would be stale), so a smart object survives a
+/// crop whose origin is (0, 0) and is written as ordinary pixels, with a
+/// report naming the layer, after any crop that moves the origin; undoing
+/// the crop makes it a smart object again. All through the real PSD save.
+mod crop_and_smart_objects {
+    use super::*;
+    use crate::crop::crop_document;
+    use crate::{UndoDirection, UndoOrder, step_undo_order};
+
+    /// The document's crop machinery beside the `Doc`.
+    struct Cropper {
+        history: aurora_doc::History,
+        pixel_history: aurora_brush::PixelHistory,
+        undo_order: UndoOrder,
+        selection: aurora_doc::SelectionSet,
+        canvas: (u32, u32),
+    }
+
+    impl Cropper {
+        fn new() -> Self {
+            Self {
+                history: aurora_doc::History::new(),
+                pixel_history: aurora_brush::PixelHistory::new(),
+                undo_order: UndoOrder::default(),
+                selection: aurora_doc::SelectionSet::new(),
+                canvas: (8, 8),
+            }
+        }
+
+        fn crop(&mut self, doc: &mut Doc, r: Rect) {
+            ok(crop_document(
+                &mut doc.tree,
+                &mut self.history,
+                &mut self.pixel_history,
+                &mut self.undo_order,
+                &mut self.selection,
+                &mut self.canvas,
+                false,
+                r,
+            )
+            .map_err(|why| format!("{why:?}")));
+        }
+
+        fn undo(&mut self, doc: &mut Doc) {
+            assert!(
+                step_undo_order(
+                    &mut doc.tree,
+                    &mut self.history,
+                    &mut self.pixel_history,
+                    Some(&mut doc.store),
+                    &mut self.undo_order,
+                    UndoDirection::Undo,
+                )
+                .is_some()
+            );
+            crate::crop::apply_pending_crop(
+                &mut self.undo_order,
+                &mut self.canvas,
+                &mut self.selection,
+            );
+        }
+
+        fn save(&self, doc: &mut Doc, path: &Path) -> PsdSaveStep {
+            ok(begin_psd_save(
+                PsdSaveSource {
+                    layers: &doc.tree,
+                    canvas: self.canvas,
+                    store: &mut doc.store,
+                    doc_id: doc.id,
+                    revision: doc.revision,
+                    carried: Vec::new(),
+                },
+                path,
+            ))
+        }
+    }
+
+    fn smart_layers(path: &Path) -> usize {
+        let back = ok(aurora_io::read_psd(&ok(std::fs::read(path))));
+        back.layers
+            .roots()
+            .iter()
+            .filter(|&&id| back.layers.smart_object(id).is_some())
+            .count()
+    }
+
+    #[test]
+    fn a_crop_at_the_origin_keeps_the_smart_object() {
+        let mut doc = Doc::new();
+        let top = doc.make_smart();
+        let mut c = Cropper::new();
+        c.crop(&mut doc, rect(0, 0, 6, 5));
+        assert_eq!(c.canvas, (6, 5));
+        assert_eq!(
+            doc.tree.bounds(top),
+            Some(rect(0, 0, 8, 8)),
+            "origin unchanged"
+        );
+        let path = doc.path("origin.psd");
+        assert!(matches!(c.save(&mut doc, &path), PsdSaveStep::Saved));
+        assert_eq!(smart_layers(&path), 1);
+    }
+
+    #[test]
+    fn a_crop_that_moves_the_origin_writes_it_as_pixels_and_names_the_layer() {
+        for r in [rect(2, 0, 6, 8), rect(0, 3, 8, 5), rect(1, 1, 5, 5)] {
+            let mut doc = Doc::new();
+            let top = doc.make_smart();
+            let mut c = Cropper::new();
+            c.crop(&mut doc, r);
+            assert_eq!(doc.tree.bounds(top), Some(rect(-r.x, -r.y, 8, 8)));
+            let path = doc.path("moved.psd");
+            let PsdSaveStep::NeedsConfirmation(pending) = c.save(&mut doc, &path) else {
+                unreachable!("a smart object lost: the user must agree ({r:?})")
+            };
+            let text = pending.report.items.join("\n");
+            assert!(text.contains("they were moved"), "{text}");
+            assert!(text.contains("\u{201c}Top\u{201d}"), "{text}");
+            ok(finish_psd_save(pending, doc.id, doc.revision));
+            assert_eq!(smart_layers(&path), 0, "written as ordinary pixels ({r:?})");
+        }
+    }
+
+    #[test]
+    fn undoing_the_crop_makes_it_a_smart_object_again() {
+        let mut doc = Doc::new();
+        let top = doc.make_smart();
+        let mut c = Cropper::new();
+        c.crop(&mut doc, rect(2, 1, 6, 7));
+        let moved = doc.path("moved.psd");
+        assert!(matches!(
+            c.save(&mut doc, &moved),
+            PsdSaveStep::NeedsConfirmation(_)
+        ));
+        c.undo(&mut doc);
+        assert_eq!(c.canvas, (8, 8));
+        assert_eq!(doc.tree.bounds(top), Some(rect(0, 0, 8, 8)));
+        let back = doc.path("back.psd");
+        assert!(matches!(c.save(&mut doc, &back), PsdSaveStep::Saved));
+        assert_eq!(smart_layers(&back), 1);
+    }
+}
+
 /// 0.205.0: a document with Curves, Levels and Hue/Saturation layers saves
 /// to PSD through the whole app flow. Exact values are lossless (no
 /// dialog, the target replaced); rounded ones ask first, naming the kind.

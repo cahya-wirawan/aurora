@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.226.0] - 2026-10-13
+
+### Added
+
+- Add the Crop tool and Crop to Selection: a non-destructive, undoable crop
+
 ## [0.225.0] - 2026-10-13
 
 ### Added

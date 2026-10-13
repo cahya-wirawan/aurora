@@ -242,6 +242,41 @@ impl Selection {
         }
     }
 
+    /// This selection moved by `(dx, dy)` (0.226.0, the Crop): the same
+    /// shape and coverage, bounds shifted, not clipped to anything, so
+    /// shifting by the negation restores it exactly.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::SelectionMaskInvalid`] when the shifted origin leaves
+    /// `i64`'s range.
+    pub fn translated(&self, dx: i64, dy: i64) -> Result<Self, DocError> {
+        let x = self
+            .bounds
+            .x
+            .checked_add(dx)
+            .ok_or(DocError::SelectionMaskInvalid)?;
+        let y = self
+            .bounds
+            .y
+            .checked_add(dy)
+            .ok_or(DocError::SelectionMaskInvalid)?;
+        let shape = match &self.shape {
+            SelectionShape::Rect => SelectionShape::Rect,
+            SelectionShape::Ellipse => SelectionShape::Ellipse,
+            SelectionShape::Mask(mask) => SelectionShape::Mask(Arc::new(mask.translated(dx, dy)?)),
+        };
+        Ok(Self {
+            bounds: Rect {
+                x,
+                y,
+                ..self.bounds
+            },
+            inverted: self.inverted,
+            shape,
+        })
+    }
+
     /// Whether this is a plain rectangle (the exact, 0-or-1 fast path).
     #[must_use]
     pub const fn is_rect(&self) -> bool {
@@ -501,6 +536,28 @@ impl SelectionSet {
             Some(selection) => self.select(selection),
             None => self.deselect(),
         }
+    }
+
+    /// Moves the active selection and every saved one by `(dx, dy)`
+    /// (0.226.0, the Crop and its undo). All or nothing: on an error the
+    /// set is unchanged. Not clipped, so the negation restores exactly.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::SelectionMaskInvalid`] when a shifted origin overflows.
+    pub fn translate(&mut self, dx: i64, dy: i64) -> Result<(), DocError> {
+        let active = self
+            .active
+            .as_ref()
+            .map(|selection| selection.translated(dx, dy))
+            .transpose()?;
+        let mut saved = HashMap::with_capacity(self.saved.len());
+        for (name, selection) in &self.saved {
+            saved.insert(name.clone(), selection.translated(dx, dy)?);
+        }
+        self.active = active;
+        self.saved = saved;
+        Ok(())
     }
 
     /// The selection saved under `name`, if any.

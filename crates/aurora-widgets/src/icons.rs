@@ -143,11 +143,13 @@ pub enum IconKind {
     Burn,
     /// A droplet inside a ring: the Sponge tool (0.224.0).
     Sponge,
+    /// Two overlapping corner brackets: the Crop tool (0.226.0).
+    Crop,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 41] = [
+    pub const ALL: [IconKind; 42] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -189,6 +191,7 @@ impl IconKind {
         IconKind::Dodge,
         IconKind::Burn,
         IconKind::Sponge,
+        IconKind::Crop,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -237,6 +240,7 @@ impl IconKind {
             IconKind::Dodge => "Dodge",
             IconKind::Burn => "Burn",
             IconKind::Sponge => "Sponge",
+            IconKind::Crop => "Crop",
         }
     }
 }
@@ -802,6 +806,12 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
                 .c([10.5, 7.5], [8.0, 4.5], [8.0, 4.5])
                 .closed(),
         ],
+        IconKind::Crop => vec![
+            // The crop mark: an L bracket from the top-left and another
+            // from the bottom-right, crossing as Photoshop's does.
+            stroke_part().m(4.5, 1.5).l(4.5, 11.5).l(14.5, 11.5),
+            stroke_part().m(11.5, 14.5).l(11.5, 4.5).l(1.5, 4.5),
+        ],
         IconKind::PaintBucket => vec![
             // A tilted bucket (a diamond), the paint line across it, and
             // the drop pouring from its corner.
@@ -949,7 +959,7 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 41);
+        assert_eq!(IconKind::ALL.len(), 42);
         for kind in [IconKind::SwapArrows, IconKind::DefaultColours] {
             assert!(IconKind::ALL.contains(&kind));
             assert!(!icon_parts(kind).is_empty(), "{kind:?}");

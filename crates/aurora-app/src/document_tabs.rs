@@ -272,6 +272,7 @@ pub(crate) fn bind_active_document(cx: &mut SwitchContext<'_>) {
         None,
         cx.doc.selection.active(),
         false,
+        None,
     );
 }
 

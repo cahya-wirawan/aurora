@@ -113,19 +113,23 @@ pub enum Tool {
     /// Saturates or desaturates the active pixel layer under the brush
     /// (0.224.0): the Dodge's engine, on colourfulness.
     Sponge,
+    /// Crops the document to a rectangle (0.226.0): non-destructive, the
+    /// layers keep their pixels outside the new canvas.
+    Crop,
 }
 
 impl Tool {
     /// Every tool this enum has today, in the fixed order they're
     /// offered to the user (matches PLAN.md's own bullets: Move, Marquee
     /// Select, Zoom, Pan, Eyedropper, then Brush, Eraser, and the 0.209.0 fills Gradient and Paint Bucket).
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::Move,
         Self::MarqueeSelect,
         Self::EllipticalMarquee,
         Self::Lasso,
         Self::PolygonalLasso,
         Self::MagicWand,
+        Self::Crop,
         Self::Zoom,
         Self::Pan,
         Self::Eyedropper,
@@ -183,6 +187,7 @@ impl Tool {
             Self::Dodge => "Dodge",
             Self::Burn => "Burn",
             Self::Sponge => "Sponge",
+            Self::Crop => "Crop",
         }
     }
 
@@ -207,6 +212,7 @@ impl Tool {
             Self::Gradient | Self::PaintBucket => 'G',
             Self::Dodge | Self::Burn => 'O',
             Self::Sponge => 'P',
+            Self::Crop => 'C',
         }
     }
 
@@ -282,11 +288,11 @@ mod tests {
 
     #[test]
     fn all_lists_every_variant_once() {
-        assert_eq!(Tool::ALL.len(), 21);
+        assert_eq!(Tool::ALL.len(), 22);
         let mut seen = Tool::ALL.to_vec();
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
-        assert_eq!(seen.len(), 21, "ALL must not repeat a variant");
+        assert_eq!(seen.len(), 22, "ALL must not repeat a variant");
     }
 
     #[test]
@@ -305,6 +311,7 @@ mod tests {
         letters.sort_unstable();
         letters.dedup();
         assert_eq!(letters.len(), Tool::ALL.len() - 7);
+        assert_eq!(Tool::Crop.shortcut_text(), "C");
         assert_eq!(Tool::Lasso.shortcut_text(), "L");
         assert_eq!(Tool::PolygonalLasso.shortcut_text(), "Shift+L");
         assert_eq!(Tool::MagicWand.shortcut_text(), "W");

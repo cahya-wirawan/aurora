@@ -2079,6 +2079,45 @@ impl LayerTree {
         Ok(())
     }
 
+    /// Shifts every pixel layer's `bounds` and every layer's, group's and
+    /// adjustment's mask `bounds` by `(dx, dy)` (0.226.0, the Crop's
+    /// document half). All or nothing: every new origin is checked
+    /// against the document range first. Tile contents are layer- and
+    /// mask-local, so nothing else moves.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::LayerOriginOutOfRange`] when a shifted origin leaves
+    /// the range (or overflows); the tree is unchanged then.
+    pub fn translate_all(&mut self, dx: i64, dy: i64) -> Result<(), DocError> {
+        let shifted = |rect: Rect| -> Result<Rect, DocError> {
+            let moved = Rect {
+                x: rect.x.checked_add(dx).unwrap_or(i64::MAX),
+                y: rect.y.checked_add(dy).unwrap_or(i64::MAX),
+                ..rect
+            };
+            validate_origin(moved)?;
+            Ok(moved)
+        };
+        for entry in self.layers.values() {
+            if let LayerKind::Pixel { bounds } = &entry.kind {
+                shifted(*bounds)?;
+            }
+            if let Some(mask) = &entry.mask {
+                shifted(mask.bounds)?;
+            }
+        }
+        for entry in self.layers.values_mut() {
+            if let LayerKind::Pixel { bounds } = &mut entry.kind {
+                *bounds = shifted(*bounds)?;
+            }
+            if let Some(mask) = &mut entry.mask {
+                mask.bounds = shifted(mask.bounds)?;
+            }
+        }
+        Ok(())
+    }
+
     /// This layer's *own* visibility flag — not whether it actually shows
     /// up in the final composite, which also depends on every ancestor
     /// group's own visibility. Computing that combined answer needs a

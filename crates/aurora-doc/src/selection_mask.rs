@@ -147,6 +147,43 @@ impl SelectionMask {
         }
     }
 
+    /// The same coverage moved by `(dx, dy)` (0.226.0, the Crop): a new
+    /// mask whose bounds are shifted and whose bytes are the same; the
+    /// cached boundary trace is rebuilt on first use.
+    ///
+    /// **Cost:** a deep copy of the coverage bytes (up to
+    /// [`MAX_SELECTION_MASK_PIXELS`]) and of the block table, never an
+    /// `Arc` share: the copy has no cached trace and is a distinct
+    /// allocation for any byte accounting that de-duplicates by `Arc`.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::SelectionMaskInvalid`] when the shifted origin leaves
+    /// `i64`'s range.
+    pub fn translated(&self, dx: i64, dy: i64) -> Result<Self, DocError> {
+        let x = self
+            .bounds
+            .x
+            .checked_add(dx)
+            .ok_or(DocError::SelectionMaskInvalid)?;
+        let y = self
+            .bounds
+            .y
+            .checked_add(dy)
+            .ok_or(DocError::SelectionMaskInvalid)?;
+        Ok(Self {
+            bounds: Rect {
+                x,
+                y,
+                ..self.bounds
+            },
+            data: self.data.clone(),
+            blocks: self.blocks.clone(),
+            blocks_across: self.blocks_across,
+            trace: OnceLock::new(),
+        })
+    }
+
     /// A mask over `bounds` with one coverage byte per texel, row-major.
     ///
     /// # Errors

@@ -178,6 +178,14 @@ enum LayerOp {
         id: LayerId,
         value: bool,
     },
+    /// Moves every pixel layer's and every mask's `bounds` by `(dx, dy)`
+    /// (0.226.0, the Crop: the new canvas origin is the crop's top-left,
+    /// so everything shifts by its negation). Appended last: an Aurora
+    /// older than 0.226.0 refuses a journal holding it (ADR 0009).
+    Translate {
+        dx: i64,
+        dy: i64,
+    },
 }
 
 /// Every `(layer, smart object)` pair a journaled `Restore` carries in a
@@ -438,6 +446,11 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
             // user action reaches it.
             Ok((LayerOp::SetSmartObject { id, value: old }, None))
         }
+        LayerOp::Translate { dx, dy } => {
+            tree.translate_all(dx, dy)?;
+            // `None`: every layer moved, so the whole composite is stale.
+            Ok((LayerOp::Translate { dx: -dx, dy: -dy }, None))
+        }
         LayerOp::SetBounds { id, value } => {
             let old = tree.bounds(id).ok_or(DocError::UnknownLayer(id))?;
             tree.set_bounds(id, value)?;
@@ -503,6 +516,7 @@ const MAX_ROOT_SEARCH_ENTRIES: usize = 64;
 /// zero-structural-validation doctrine is untouched, and
 /// [`History::replay`] still holds the full subtree to the real
 /// validator.
+#[allow(clippy::too_many_lines)]
 fn describe(op: &LayerOp) -> String {
     match op {
         LayerOp::RemoveById(id) => format!("Removed layer #{}", id.to_raw()),
@@ -596,6 +610,9 @@ fn describe(op: &LayerOp) -> String {
             Some(_) => format!("Kept the smart object data of layer #{}", id.to_raw()),
             None => format!("Removed the smart object data of layer #{}", id.to_raw()),
         },
+        LayerOp::Translate { dx, dy } => {
+            format!("Shifted every layer and mask by ({dx}, {dy}) (crop)")
+        }
         LayerOp::SetBounds { id, value } => {
             format!(
                 "Repositioned layer #{} to ({}, {})",
@@ -1227,6 +1244,29 @@ impl History {
         self.journal.push(LayerOp::SetBounds { id, value });
         self.push(LayerOp::SetBounds { id, value: old });
         Ok(Some(old.union(&value)))
+    }
+
+    /// Shifts every pixel layer's and every mask's `bounds` by `(dx, dy)`
+    /// ([`LayerTree::translate_all`]) as one recorded step (0.226.0): the
+    /// document half of a crop, whose new canvas origin is the crop's
+    /// top-left (`dx = -x`, `dy = -y`). Undo shifts back exactly. Pixels,
+    /// masks' coverage, effects, clipping and smart-object records are not
+    /// touched.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::LayerOriginOutOfRange`] when any shifted origin would
+    /// leave the document range; nothing is recorded or changed then.
+    pub fn translate_all(
+        &mut self,
+        tree: &mut LayerTree,
+        dx: i64,
+        dy: i64,
+    ) -> Result<(), DocError> {
+        tree.translate_all(dx, dy)?;
+        self.journal.push(LayerOp::Translate { dx, dy });
+        self.push(LayerOp::Translate { dx: -dx, dy: -dy });
+        Ok(())
     }
 
     /// Records a bounds change for `id` from `old` to whatever `tree`
@@ -2082,6 +2122,64 @@ mod tests {
         assert_eq!(mask.bounds, other_bounds());
         assert!(mask.enabled);
         assert!(mask.inverted);
+    }
+
+    /// 0.226.0: a journal holding `Translate` (the Crop) replays to the live
+    /// tree, before and after an undo, a redo and a second shift, directly
+    /// and through the `postcard` journal bytes an `.aur` carries.
+    #[test]
+    fn replay_reconstructs_translated_layers_and_masks() {
+        let (_dir, mut store) = real_tile_store();
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let ok = |r: Result<crate::LayerId, DocError>| match r {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let base = ok(history.add_pixel_layer(&mut tree, "base", bounds(), None));
+        let group = ok(history.add_group(&mut tree, "g", None));
+        let kid = ok(history.add_pixel_layer(&mut tree, "kid", other_bounds(), Some(group)));
+        for id in [base, group, kid] {
+            if let Err(err) = history.add_mask(&mut tree, &mut store, id, other_bounds()) {
+                unreachable!("{err:?}");
+            }
+        }
+        let same = |history: &History, tree: &LayerTree| {
+            for replayed in [history.replay(), Ok(replayed_through_postcard(history))] {
+                let replayed = match replayed {
+                    Ok(tree) => tree,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                for id in [base, group, kid] {
+                    assert_eq!(replayed.bounds(id), tree.bounds(id), "bounds of {id:?}");
+                    assert_eq!(
+                        replayed.mask(id).map(|m| m.bounds),
+                        tree.mask(id).map(|m| m.bounds),
+                        "mask of {id:?}"
+                    );
+                }
+            }
+        };
+        let before = tree.bounds(base);
+        same(&history, &tree);
+        if let Err(err) = history.translate_all(&mut tree, -3, -2) {
+            unreachable!("{err:?}");
+        }
+        assert_ne!(tree.bounds(base), before, "the shift happened");
+        same(&history, &tree);
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.bounds(base), before);
+        same(&history, &tree);
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        same(&history, &tree);
+        if let Err(err) = history.translate_all(&mut tree, 7, 11) {
+            unreachable!("{err:?}");
+        }
+        same(&history, &tree);
     }
 
     #[test]
