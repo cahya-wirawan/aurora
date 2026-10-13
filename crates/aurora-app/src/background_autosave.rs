@@ -1189,10 +1189,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(lock.exists(), "the timer re-created the lock file");
-        assert!(
-            crate::autosave_files::try_lock(&lock, false).is_none(),
-            "and holds it"
-        );
+        // The file appears a moment before the worker locks it, so wait for
+        // the lock to be held rather than testing it once (a loaded CI
+        // runner caught the gap).
+        let mut held = false;
+        while !held && std::time::Instant::now() < deadline {
+            held = crate::autosave_files::try_lock(&lock, false).is_none();
+            if !held {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(held, "and holds it");
         let _ = worker.shutdown(super::SHUTDOWN_WAIT_BOUND);
     }
 
