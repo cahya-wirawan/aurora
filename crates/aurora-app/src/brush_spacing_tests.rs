@@ -202,7 +202,11 @@ fn the_layer_brush_lays_dense_dabs_and_caps_one_event() {
 
     // A long flick: at most the cap, evenly spread to the pointer.
     let mut drag = press(Tool::Brush, true);
-    let flick = dense * cap as f32 * 20.0;
+    let flick = dense * cap as f32 * 5.0;
+    assert!(
+        flick / (cap as f32) < dab_step(radius, 0.25),
+        "inside the range where the cap, not the old step, binds"
+    );
     let dabs = move_to(&mut drag, (flick, 0.0), &settings);
     assert!(dabs.len() <= cap, "{} > {cap}", dabs.len());
     assert!(dabs.len() + 1 >= cap);
@@ -262,8 +266,13 @@ fn event_step_uses_the_dense_step_only_for_the_brush_spacing() {
         brush_spacing::event_step(DabSpacing::BrushDense, 24.0, from, to, 0.0),
         dab_step(24.0, BRUSH_SPACING)
     );
-    let long = brush_spacing::event_step(DabSpacing::BrushDense, 24.0, from, (1.0e4, 0.0), 0.0);
-    assert!((long - 1.0e4 / brush_dab_cap(24.0) as f32).abs() < 1e-2);
+    let long = brush_spacing::event_step(DabSpacing::BrushDense, 24.0, from, (500.0, 0.0), 0.0);
+    assert!((long - 500.0 / brush_dab_cap(24.0) as f32).abs() < 1e-2);
+    // A huge event is never coarser than the old quarter-radius step.
+    let huge = brush_spacing::event_step(DabSpacing::BrushDense, 24.0, from, (1.0e6, 0.0), 0.0);
+    assert_eq!(huge, 6.0, "capped at the old spacing, not widened past it");
+    let small = brush_spacing::event_step(DabSpacing::BrushDense, 4.0, from, (1000.0, 0.0), 0.0);
+    assert_eq!(small, 1.0, "r=4 never coarser than the old 1 px step");
 }
 
 #[test]

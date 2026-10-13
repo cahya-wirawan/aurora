@@ -121,7 +121,11 @@ pub fn brush_dab_cap(radius: f32) -> usize {
 /// [`brush_dab_cap`] dabs. The carry stays in distance units, so the next
 /// event (with its own step) continues from where this one stopped; a
 /// stroke fed in events short enough never to reach the cap gets exactly
-/// the dabs one long segment would.
+/// the dabs one long segment would. The widened step never exceeds the old
+/// [`DEFAULT_SPACING`] step, so a very long event at a small radius is no
+/// coarser than before 0.226.1 (it may then place more than the cap: the
+/// cap bounds cost only where that does not make the stroke worse than it
+/// was).
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub fn brush_segment_step(radius: f32, carry: f32, segment_len: f32) -> f32 {
@@ -129,7 +133,9 @@ pub fn brush_segment_step(radius: f32, carry: f32, segment_len: f32) -> f32 {
     let travel = carry.max(0.0) + segment_len.max(0.0);
     let capped = travel / brush_dab_cap(radius) as f32;
     if capped.is_finite() {
-        dense.max(capped)
+        dense
+            .max(capped)
+            .min(dab_step(radius, DEFAULT_SPACING).max(dense))
     } else {
         dense
     }

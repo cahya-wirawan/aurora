@@ -300,7 +300,16 @@ fn a_short_event_keeps_the_dense_step_and_a_long_one_is_capped() {
         // Long segments, with and without a carry: at most `cap` dabs, and
         // the cap is used (not one fewer than allowed, give or take a
         // rounding step).
-        for (carry, len) in [(0.0_f32, 5_000.0_f32), (0.4, 800.0), (dense * 0.9, 333.3)] {
+        // The cap binds only while the widened step stays within the old
+        // quarter-radius step (`old * cap` px of travel); past that the step
+        // is held at the old one (see `a_huge_event_is_never_coarser...`).
+        let old = dab_step(radius, DEFAULT_SPACING);
+        let reach = old * cap as f32 * 0.8;
+        for (carry, len) in [
+            (0.0_f32, reach),
+            (0.4, reach * 0.9),
+            (dense * 0.9, reach * 0.5),
+        ] {
             let step = brush_segment_step(radius, carry, len);
             assert!(step > dense, "radius {radius}: widened");
             let (dabs, new_carry) = advance_segment((0.0, 0.0), (len, 0.0), carry, step);
@@ -369,6 +378,25 @@ fn a_stroke_fed_in_many_small_events_equals_the_same_stroke_in_one_segment() {
 }
 
 #[test]
+fn a_huge_event_is_never_coarser_than_the_old_quarter_radius_step() {
+    // 0.226.1 review: the cap used to widen the step without limit, so a
+    // long single event at a small radius left gaps the old spacing never
+    // had (r=4, 1000 px: a 3.9 px step for a 4 px brush). The widened step
+    // is now held at the old `DEFAULT_SPACING` step.
+    for radius in [2.0_f32, 4.0, 10.0, 24.0, 100.0, 256.0] {
+        let old = dab_step(radius, DEFAULT_SPACING);
+        for len in [1.0e3_f32, 1.0e4, 1.0e6] {
+            let step = brush_segment_step(radius, 0.0, len);
+            assert!(
+                step <= old + 1e-4,
+                "radius {radius}, len {len}: {step} > {old}"
+            );
+            assert!(step >= dab_step(radius, BRUSH_SPACING));
+        }
+    }
+}
+
+#[test]
 fn a_capped_event_hands_the_right_carry_to_the_next_one() {
     // A long flick (capped), then a run of short events: whatever carry the
     // flick left, the next dab is due at most one capped step after the
@@ -378,7 +406,7 @@ fn a_capped_event_hands_the_right_carry_to_the_next_one() {
     let dense = dab_step(radius, BRUSH_SPACING);
     let mut carry = 0.0_f32;
     let mut prev = (0.0_f32, 0.0_f32);
-    let flick = (400.0_f32, 0.0_f32);
+    let flick = (150.0_f32, 0.0_f32);
     let flick_step = brush_segment_step(radius, carry, flick.0);
     let (dabs, c) = advance_segment(prev, flick, carry, flick_step);
     assert!(dabs.len() <= brush_dab_cap(radius));
