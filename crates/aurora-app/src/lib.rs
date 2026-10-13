@@ -11581,6 +11581,9 @@ enum Drag {
         before: Option<aurora_doc::Selection>,
         /// The selection the path has built so far: the step's "after".
         current: Option<aurora_doc::Selection>,
+        /// After a slow live rebuild, the time before which the next one
+        /// is skipped ([`lasso_tools::live_rebuild_step`]).
+        not_before: Option<std::time::Instant>,
     },
     Brush {
         last_doc: (f32, f32),
@@ -12140,6 +12143,7 @@ fn begin_drag(
                 },
                 before: None,
                 current: None,
+                not_before: None,
             })
         }
         (aurora_ui::Tool::Brush, PointerButton::Primary) => Some(Drag::Brush {
@@ -12270,14 +12274,14 @@ fn continue_drag(
             points,
             clip,
             current,
+            not_before,
             ..
         } => {
             // A Polygonal Lasso only changes on a click, not a move.
             if !*polygonal {
                 let point = view.to_document(canvas_point);
-                if lasso_tools::push_lasso_point(points, point) && lasso_tools::rebuild_due(points)
-                {
-                    lasso_tools::rebuild_live(points, clip, selection, current);
+                if lasso_tools::push_lasso_point(points, point) {
+                    lasso_tools::live_rebuild_step(points, clip, selection, current, not_before);
                 }
             }
             Vec::new()
@@ -27224,9 +27228,6 @@ impl App {
         if self.escape_cancels_marquee(key) {
             return;
         }
-        if self.polygon_key(key) {
-            return;
-        }
         let controls = self.layer_controls.controls;
         let tool_controls = self.tool_controls;
         let routed = route_widget_key(
@@ -27276,6 +27277,11 @@ impl App {
             self.relayout_after_gallery();
             return;
         }
+        // A key no focused widget used: Enter, Backspace and Escape belong
+        // to a Polygonal Lasso in progress.
+        if self.polygon_key_now(key) {
+            return;
+        }
         // A key that reaches the shortcuts (an Undo, typically) ends a
         // live Curves drag first, so it undoes the drag rather than what
         // preceded it; its capture is dropped, so the rest of that drag
@@ -27323,6 +27329,7 @@ impl App {
             tool_before,
             self.tool,
         );
+        self.end_selection_drag_on_tool_switch(tool_before);
         match picked {
             Some(ActivatedCommand::OpenFile(path)) => self.open_file(&path),
             Some(ActivatedCommand::SaveFile(path)) => {
@@ -29503,18 +29510,24 @@ impl App {
         // tool mid-stroke without ending the stroke.
         // A Polygonal Lasso in progress takes this click as a vertex (or
         // closes) instead of ending (0.214.0).
-        if self.tool == aurora_ui::Tool::PolygonalLasso
-            && button == PointerButton::Primary
-            && matches!(
-                self.drag,
-                Some(Drag::Lasso {
-                    polygonal: true,
-                    ..
-                })
-            )
-        {
-            self.polygon_click(canvas_point);
-            return;
+        match lasso_tools::polygon_press(
+            &mut self.drag,
+            self.tool,
+            button,
+            canvas_point,
+            &self.doc.canvas_view,
+            &mut self.doc.selection,
+        ) {
+            lasso_tools::PolygonPress::NotApplicable => {}
+            lasso_tools::PolygonPress::Added => {
+                self.needs_redraw = true;
+                return;
+            }
+            lasso_tools::PolygonPress::Closes(ending) => {
+                self.commit_drag(ending);
+                self.needs_redraw = true;
+                return;
+            }
         }
         let interrupted = self.drag.take();
         self.commit_drag(interrupted);
@@ -31097,6 +31110,7 @@ impl App {
             tool_before,
             self.tool,
         );
+        self.end_selection_drag_on_tool_switch(tool_before);
         self.sync_tool_controls_now();
         self.push_accessibility();
         self.needs_redraw = true;
@@ -31461,9 +31475,7 @@ impl App {
     fn run_selection_command(&mut self, command: selection_view::SelectionCommand) {
         // The drag ends unrecorded and the selection goes back to what it
         // was before it, so the command's step starts from there.
-        if let Some(before) = self.take_selection_drag() {
-            selection_view::cancel_marquee(&mut self.doc.selection, before);
-        }
+        lasso_tools::cancel_selection_gesture(&mut self.drag, &mut self.doc.selection);
         if run_selection_step(
             &mut self.workspace,
             &mut self.doc.undo_order,
@@ -31492,94 +31504,47 @@ impl App {
     /// Escape during a live Marquee drag: the drag ends and the selection
     /// returns to what it was when the drag began. Returns whether it did.
     fn escape_cancels_marquee(&mut self, key: Key) -> bool {
+        // A Polygonal Lasso's Escape waits for the focused widgets
+        // ([`Self::polygon_key_now`]).
         if !selection_view::escape_cancels_marquee_applies(
             key == Key::Named(NamedKey::Escape),
-            matches!(self.drag, Some(Drag::Marquee { .. } | Drag::Lasso { .. })),
+            matches!(self.drag, Some(Drag::Marquee { .. } | Drag::Lasso { .. }))
+                && !lasso_tools::is_polygon(self.drag.as_ref()),
             self.dialog.is_some(),
             self.command_palette.is_some(),
         ) {
             return false;
         }
-        if let Some(before) = self.take_selection_drag() {
-            selection_view::cancel_marquee(&mut self.doc.selection, before);
-        }
+        lasso_tools::cancel_selection_gesture(&mut self.drag, &mut self.doc.selection);
         self.needs_redraw = true;
         true
     }
 
-    /// Ends a live Marquee or Lasso gesture without recording it and
-    /// returns what was selected when it began (`Some(None)` = nothing);
-    /// `None` when no such gesture is live.
-    // `Some(None)` (began with nothing selected) differs from `None`.
-    #[allow(clippy::option_option)]
-    fn take_selection_drag(&mut self) -> Option<Option<aurora_doc::Selection>> {
-        if !matches!(self.drag, Some(Drag::Marquee { .. } | Drag::Lasso { .. })) {
-            return None;
-        }
-        match self.drag.take() {
-            Some(Drag::Marquee { before, .. } | Drag::Lasso { before, .. }) => Some(before),
-            _ => None,
-        }
-    }
-
-    /// A click of the Polygonal Lasso while a polygon is being built: it
-    /// closes the polygon (near the first or last vertex) or adds a vertex
-    /// ([`lasso_tools`]).
-    fn polygon_click(&mut self, canvas_point: (f32, f32)) {
-        if let Some(drag) = self.drag.as_mut()
-            && lasso_tools::polygon_click(
-                drag,
-                canvas_point,
-                &self.doc.canvas_view,
-                &mut self.doc.selection,
-            ) == lasso_tools::PolygonClick::Closes
-        {
-            self.close_polygon();
-            return;
-        }
-        self.needs_redraw = true;
-    }
-
-    /// Closes the Polygonal Lasso in progress: one selection step.
-    fn close_polygon(&mut self) {
-        let ending = self.drag.take();
-        self.commit_drag(ending);
-        self.needs_redraw = true;
-    }
-
-    /// Enter closes and Backspace removes the last vertex of a Polygonal
-    /// Lasso in progress (removing the only vertex cancels it). Returns
-    /// whether the key was used.
-    fn polygon_key(&mut self, key: Key) -> bool {
-        if self.dialog.is_some()
-            || self.command_palette.is_some()
-            || !matches!(
-                self.drag,
-                Some(Drag::Lasso {
-                    polygonal: true,
-                    ..
-                })
-            )
-        {
+    /// Enter, Backspace and Escape for a Polygonal Lasso in progress
+    /// ([`lasso_tools::polygon_key`]), offered after the focused widgets.
+    fn polygon_key_now(&mut self, key: Key) -> bool {
+        if self.dialog.is_some() || self.command_palette.is_some() {
             return false;
         }
-        match key {
-            Key::Named(NamedKey::Enter) => {
-                self.close_polygon();
-                true
-            }
-            Key::Named(NamedKey::Backspace) => {
-                let emptied = self.drag.as_mut().is_some_and(|drag| {
-                    lasso_tools::polygon_backspace(drag, &mut self.doc.selection)
-                });
-                if emptied && let Some(before) = self.take_selection_drag() {
-                    selection_view::cancel_marquee(&mut self.doc.selection, before);
-                }
+        match lasso_tools::polygon_key(&mut self.drag, self.tool, key, &mut self.doc.selection) {
+            lasso_tools::PolygonKey::Ignored => false,
+            lasso_tools::PolygonKey::Handled => {
                 self.needs_redraw = true;
                 true
             }
-            _ => false,
+            lasso_tools::PolygonKey::Close(ending) => {
+                self.commit_drag(ending);
+                self.needs_redraw = true;
+                true
+            }
         }
+    }
+
+    /// Records a live Marquee or Lasso gesture when the tool changed from
+    /// `tool_before` ([`lasso_tools::take_on_tool_switch`]).
+    fn end_selection_drag_on_tool_switch(&mut self, tool_before: aurora_ui::Tool) {
+        let ending = lasso_tools::take_on_tool_switch(&mut self.drag, tool_before, self.tool);
+        self.commit_drag(ending);
     }
 
     /// One Magic Wand click at `doc_point` on the active layer
@@ -31604,6 +31569,7 @@ impl App {
             layer,
             doc_point,
             &self.tool_settings,
+            self.doc.canvas_size,
         ) {
             Ok(_) => self.needs_redraw = true,
             Err(lasso_tools::WandRefused::Notice(why)) => {
@@ -32424,7 +32390,8 @@ impl ApplicationHandler<AppEvent> for App {
                 // to end it by simply dropping it -- losing a live
                 // stroke's whole undo entry along with it. Commit it the
                 // same way a release would (`commit_ending_drag`).
-                let interrupted = self.drag.take();
+                // A Polygonal Lasso (clicked vertices, no button held) stays.
+                let interrupted = lasso_tools::take_on_cursor_left(&mut self.drag);
                 self.commit_drag(interrupted);
                 // A gallery drag ends too: its release may never arrive.
                 // The value keeps whatever the last move set.

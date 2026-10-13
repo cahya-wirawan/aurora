@@ -31,7 +31,9 @@ use aurora_core::Rect;
 use aurora_doc::{LayerKind, LayerTree, Selection};
 use aurora_tile::TileStore;
 
-use crate::{LockRefusal, ToolSettings};
+use aurora_widgets::shortcut::{Key, NamedKey};
+
+use crate::{Drag, LockRefusal, PointerButton, ToolSettings};
 
 /// The History row of a Lasso drag.
 pub(crate) const LASSO_LABEL: &str = "Lasso";
@@ -55,6 +57,12 @@ pub(crate) const POLYGON_CLOSE_TOLERANCE_PX: f32 = 6.0;
 /// The path box area (document pixels) per extra pointer move between
 /// rebuilds of the live mask.
 const REBUILD_AREA_STEP: f64 = 262_144.0;
+
+/// Points per extra pointer move between rebuilds: a rebuild costs
+/// `O(points log points)` (the edges are sorted and every sub-scanline
+/// sorts its crossings), so a long scribble inside a small box would
+/// otherwise cost `O(points^2 log points)` over the drag.
+const REBUILD_POINTS_STEP: usize = 512;
 
 /// The History row of a finished lasso: `"Deselect"` when it selected
 /// nothing (a click, a degenerate path).
@@ -93,7 +101,8 @@ pub(crate) fn push_lasso_point(points: &mut Vec<(f32, f32)>, point: (f32, f32)) 
 }
 
 /// After how many points the live mask is rebuilt: every point for a small
-/// path, every `1 + area / 262,144`th as the path's box grows.
+/// path, every `1 + area / 262,144 + points / 512`th as the path's box
+/// and point count grow.
 pub(crate) fn rebuild_period(points: &[(f32, f32)]) -> usize {
     let (mut lo, mut hi) = ((f32::MAX, f32::MAX), (f32::MIN, f32::MIN));
     for &(x, y) in points {
@@ -107,7 +116,47 @@ pub(crate) fn rebuild_period(points: &[(f32, f32)]) -> usize {
     // A non-negative, finite quotient.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let extra = (area / REBUILD_AREA_STEP) as usize;
-    1 + extra
+    1 + extra + points.len() / REBUILD_POINTS_STEP
+}
+
+/// A live rebuild that took longer than this makes the next ones wait.
+pub(crate) const SLOW_REBUILD: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// After a slow rebuild, how many times its duration to wait before the
+/// next (so rebuilding takes at most a quarter of the drag's time).
+const SLOW_REBUILD_BACKOFF: u32 = 3;
+
+/// When the next live rebuild may run after one that began at `now` and
+/// took `took`: `None` (right away) for a quick one.
+pub(crate) fn backoff_until(
+    now: std::time::Instant,
+    took: std::time::Duration,
+) -> Option<std::time::Instant> {
+    (took > SLOW_REBUILD)
+        .then(|| now.checked_add(took.saturating_mul(SLOW_REBUILD_BACKOFF)))
+        .flatten()
+}
+
+/// One pointer move's chance to rebuild the live mask of a freehand path:
+/// when it is due by count ([`rebuild_due`]) and any back-off after a slow
+/// rebuild has passed. The release never goes through this: it always
+/// rebuilds.
+pub(crate) fn live_rebuild_step(
+    points: &[(f32, f32)],
+    clip: &Rect,
+    selection: &mut aurora_doc::SelectionSet,
+    current: &mut Option<Selection>,
+    not_before: &mut Option<std::time::Instant>,
+) {
+    if !rebuild_due(points) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    if not_before.is_some_and(|t| started < t) {
+        return;
+    }
+    rebuild_live(points, clip, selection, current);
+    *not_before = backoff_until(started, started.elapsed());
 }
 
 /// Whether the live mask is due for a rebuild after the path grew to
@@ -201,6 +250,7 @@ pub(crate) fn wand_select(
     layer: aurora_doc::LayerId,
     doc_point: (f32, f32),
     settings: &ToolSettings,
+    document_size: (u32, u32),
 ) -> Result<Selection, WandRefused> {
     let Some(LayerKind::Pixel { bounds }) = layers.kind(layer).cloned() else {
         return Err(WandRefused::Notice(LockRefusal::WandNeedsPixelLayer));
@@ -241,7 +291,14 @@ pub(crate) fn wand_select(
         width: region.bounds.width,
         height: region.bounds.height,
     };
-    match aurora_doc::antialiased_mask(doc_bounds, &region.data) {
+    // Clipped to the document, like the lassos (a layer may reach past the
+    // canvas; nothing there can be painted or seen).
+    let Some((doc_bounds, data)) =
+        crop_binary(doc_bounds, &region.data, &document_clip(document_size))
+    else {
+        return Err(WandRefused::Nothing);
+    };
+    match aurora_doc::antialiased_mask(doc_bounds, &data) {
         Ok(Some(mask)) => Ok(Selection::from_mask(std::sync::Arc::new(mask))),
         Err(aurora_doc::DocError::SelectionMaskTooLarge(_)) => {
             Err(WandRefused::Notice(LockRefusal::SelectionTooLarge))
@@ -369,8 +426,9 @@ pub(crate) fn wand_step(
     layer: aurora_doc::LayerId,
     doc_point: (f32, f32),
     settings: &ToolSettings,
+    document_size: (u32, u32),
 ) -> Result<bool, WandRefused> {
-    let picked = wand_select(store, layers, layer, doc_point, settings)?;
+    let picked = wand_select(store, layers, layer, doc_point, settings, document_size)?;
     let before = selection.active();
     selection.select(picked);
     Ok(crate::record_selection_step(
@@ -382,4 +440,188 @@ pub(crate) fn wand_step(
         before,
         selection.active(),
     ))
+}
+
+/// The part of the binary grid `data` (one byte per texel of `bounds`)
+/// inside `clip`, with its bounds; `None` when they do not meet.
+pub(crate) fn crop_binary(bounds: Rect, data: &[u8], clip: &Rect) -> Option<(Rect, Vec<u8>)> {
+    let x0 = bounds.x.max(clip.x);
+    let y0 = bounds.y.max(clip.y);
+    let x1 = bounds.right().min(clip.right());
+    let y1 = bounds.bottom().min(clip.bottom());
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let width = usize::try_from(bounds.width).ok()?;
+    let (cw, ch) = (
+        usize::try_from(x1 - x0).ok()?,
+        usize::try_from(y1 - y0).ok()?,
+    );
+    let (ox, oy) = (
+        usize::try_from(x0 - bounds.x).ok()?,
+        usize::try_from(y0 - bounds.y).ok()?,
+    );
+    let mut out = Vec::with_capacity(cw.saturating_mul(ch));
+    for row in oy..oy + ch {
+        out.extend_from_slice(data.get(row * width + ox..row * width + ox + cw)?);
+    }
+    Some((
+        Rect {
+            x: x0,
+            y: y0,
+            width: u32::try_from(cw).ok()?,
+            height: u32::try_from(ch).ok()?,
+        },
+        out,
+    ))
+}
+
+/// Takes the live selection gesture (a Marquee or a Lasso) out of `drag`
+/// without recording it and returns what was selected when it began
+/// (`Some(None)` = nothing); `None` when no such gesture is live.
+// `Some(None)` (began with nothing selected) differs from `None`.
+#[allow(clippy::option_option)]
+pub(crate) fn take_selection_drag(
+    drag: &mut Option<Drag>,
+) -> Option<Option<aurora_doc::Selection>> {
+    if !matches!(drag, Some(Drag::Marquee { .. } | Drag::Lasso { .. })) {
+        return None;
+    }
+    match drag.take() {
+        Some(Drag::Marquee { before, .. } | Drag::Lasso { before, .. }) => Some(before),
+        _ => None,
+    }
+}
+
+/// Cancels a live selection gesture: the selection goes back to what it
+/// was when the gesture began and nothing is recorded. Whether there was
+/// one.
+pub(crate) fn cancel_selection_gesture(
+    drag: &mut Option<Drag>,
+    selection: &mut aurora_doc::SelectionSet,
+) -> bool {
+    match take_selection_drag(drag) {
+        Some(before) => {
+            crate::selection_view::cancel_marquee(selection, before);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Whether `drag` is a Polygonal Lasso in progress.
+pub(crate) fn is_polygon(drag: Option<&Drag>) -> bool {
+    matches!(
+        drag,
+        Some(Drag::Lasso {
+            polygonal: true,
+            ..
+        })
+    )
+}
+
+/// What a key did to a Polygonal Lasso in progress.
+#[derive(Debug)]
+pub(crate) enum PolygonKey {
+    /// Not a polygon key (or no polygon, or another tool): the key goes on.
+    Ignored,
+    /// Used (Backspace, or Escape cancelling): nothing to commit.
+    Handled,
+    /// Enter: the polygon closes; the caller commits this drag.
+    Close(Option<Drag>),
+}
+
+/// Enter closes, Backspace removes the last vertex (the only vertex
+/// cancels) and Escape cancels a Polygonal Lasso in progress while the
+/// Polygonal Lasso is the active tool. The caller offers keys to focused
+/// widgets first, so a text field or a button keeps its own Enter and
+/// Backspace.
+pub(crate) fn polygon_key(
+    drag: &mut Option<Drag>,
+    tool: aurora_ui::Tool,
+    key: Key,
+    selection: &mut aurora_doc::SelectionSet,
+) -> PolygonKey {
+    if tool != aurora_ui::Tool::PolygonalLasso || !is_polygon(drag.as_ref()) {
+        return PolygonKey::Ignored;
+    }
+    match key {
+        Key::Named(NamedKey::Enter) => PolygonKey::Close(drag.take()),
+        Key::Named(NamedKey::Escape) => {
+            cancel_selection_gesture(drag, selection);
+            PolygonKey::Handled
+        }
+        Key::Named(NamedKey::Backspace) => {
+            let emptied = drag
+                .as_mut()
+                .is_some_and(|d| polygon_backspace(d, selection));
+            if emptied {
+                cancel_selection_gesture(drag, selection);
+            }
+            PolygonKey::Handled
+        }
+        _ => PolygonKey::Ignored,
+    }
+}
+
+/// What a press did with a Polygonal Lasso in progress.
+#[derive(Debug)]
+pub(crate) enum PolygonPress {
+    /// Not a click on a polygon in progress: the press goes on.
+    NotApplicable,
+    /// A vertex was added.
+    Added,
+    /// The click closed the polygon; the caller commits this drag.
+    Closes(Option<Drag>),
+}
+
+/// A press while a Polygonal Lasso is in progress and its tool is active
+/// adds a vertex or closes (primary button only).
+pub(crate) fn polygon_press(
+    drag: &mut Option<Drag>,
+    tool: aurora_ui::Tool,
+    button: PointerButton,
+    canvas_point: (f32, f32),
+    view: &aurora_ui::CanvasView,
+    selection: &mut aurora_doc::SelectionSet,
+) -> PolygonPress {
+    if tool != aurora_ui::Tool::PolygonalLasso
+        || button != PointerButton::Primary
+        || !is_polygon(drag.as_ref())
+    {
+        return PolygonPress::NotApplicable;
+    }
+    let closes = drag
+        .as_mut()
+        .is_some_and(|d| polygon_click(d, canvas_point, view, selection) == PolygonClick::Closes);
+    if closes {
+        PolygonPress::Closes(drag.take())
+    } else {
+        PolygonPress::Added
+    }
+}
+
+/// A tool switch ends a live Marquee or Lasso gesture by recording it
+/// (the Marquee-drag rule): the drag to commit, when the tool really
+/// changed.
+pub(crate) fn take_on_tool_switch(
+    drag: &mut Option<Drag>,
+    from: aurora_ui::Tool,
+    to: aurora_ui::Tool,
+) -> Option<Drag> {
+    if from != to && matches!(drag, Some(Drag::Marquee { .. } | Drag::Lasso { .. })) {
+        drag.take()
+    } else {
+        None
+    }
+}
+
+/// The pointer leaving the window ends a drag, except a Polygonal Lasso
+/// (clicked vertices, no button held): that one stays in progress.
+pub(crate) fn take_on_cursor_left(drag: &mut Option<Drag>) -> Option<Drag> {
+    if is_polygon(drag.as_ref()) {
+        None
+    } else {
+        drag.take()
+    }
 }

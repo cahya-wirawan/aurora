@@ -120,7 +120,7 @@ golden-image tests are `#[ignore]`d.
   the **Magic Wand** (`W`, tolerance/contiguous shared with the Paint Bucket, active
   layer only) make raster selections, each one undo step; the lassos are clipped to the
   document, show no polyline preview (the live shape is the filled mask) and the first
-  outline of a big mask costs a boundary trace on the UI thread; nothing seen live. Workspace tests at 0.214.0: 4,213 passed, 0 failed, 82 ignored.
+  outline of a big mask costs a boundary trace on the UI thread; nothing seen live. The Wand's mask is clipped to the document; a tool switch records a live polygon. **Costs (dev profile, UI thread):** a 64 Mpx wand region 2.1 s plus a 351 ms first trace; one live rebuild of a 50k-point scribble in a small box about 0.9 s (live rebuilds thin out and back off after slow ones; the release's exact rebuild still pays it). **Silent behaviours:** a freehand path whose mask would exceed 64 Mpx keeps its last smaller shape without a notice; lasso/wand steps keep their masks in History with no byte budget. Workspace tests at 0.214.0: 4,221 passed, 0 failed, 82 ignored.
 - **Text fields and dialogs**: caret, selection, IME composition, standard
   editing chords through the real OS clipboard (`Cmd` on macOS, `Ctrl`
   elsewhere), click/drag selection (double-click word selection was not done as of 0.138.0).

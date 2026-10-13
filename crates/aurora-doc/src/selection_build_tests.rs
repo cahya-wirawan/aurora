@@ -321,6 +321,8 @@ fn the_antialiased_mask_softens_only_the_outside_of_a_block() {
     assert_eq!(mask.byte_at(12, 22), 255, "interior is full");
     assert_eq!(mask.byte_at(10, 22), 255, "selected texels stay full");
     assert_eq!(mask.byte_at(9, 22), 64, "outside edge: one quarter");
+    assert_eq!(mask.byte_at(12, 19), 64, "above the block");
+    assert_eq!(mask.byte_at(12, 25), 64, "below the block");
     // Corners: the selected corner texel stays full, the outside diagonal
     // gets a sixteenth.
     assert_eq!(mask.byte_at(10, 20), 255);
@@ -347,6 +349,8 @@ fn a_single_texel_becomes_a_three_by_three_blur_and_nothing_is_none() {
         "a one-pixel region stays fully selected"
     );
     assert_eq!(mask.byte_at(4, 5), 32);
+    assert_eq!(mask.byte_at(5, 4), 32, "above the texel");
+    assert_eq!(mask.byte_at(5, 6), 32, "below the texel");
     assert_eq!(mask.byte_at(4, 4), 16);
     assert!(matches!(
         antialiased_mask(rect(0, 0, 2, 2), &[0; 4]),

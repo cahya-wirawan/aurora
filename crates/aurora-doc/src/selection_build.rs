@@ -313,8 +313,8 @@ pub fn antialiased_mask(bounds: Rect, data: &[u8]) -> Result<Option<SelectionMas
         return Err(DocError::SelectionMaskInvalid);
     }
     let area = Rect {
-        x: bounds.x - 1,
-        y: bounds.y - 1,
+        x: bounds.x.saturating_sub(1),
+        y: bounds.y.saturating_sub(1),
         width: bounds.width.saturating_add(2),
         height: bounds.height.saturating_add(2),
     };
