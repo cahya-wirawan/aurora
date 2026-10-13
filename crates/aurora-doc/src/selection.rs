@@ -9,6 +9,53 @@ use aurora_core::Rect;
 use crate::error::DocError;
 use crate::selection_mask::SelectionMask;
 
+/// The most selections a document keeps saved by name (0.218.0).
+pub const MAX_SAVED_SELECTIONS: usize = 64;
+
+/// The most raster coverage (bytes of [`SelectionMask`]) the saved
+/// selections of one document may hold together (0.218.0): 128 MiB, two
+/// full 64 Mpx masks. An engineering default, not a design decision.
+pub const MAX_SAVED_SELECTION_BYTES: u64 = 128 * 1024 * 1024;
+
+/// The most characters in a saved selection's name (0.218.0), like a
+/// workspace name.
+pub const SELECTION_NAME_MAX_CHARS: usize = 64;
+
+/// Why a saved selection's name was refused (0.218.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionNameError {
+    Empty,
+    /// A control, separator or text-direction character.
+    InvalidCharacter,
+    TooLong,
+}
+
+/// A typed name, trimmed and checked: non-empty, free of the characters
+/// `sanitize_display_name` strips (controls, line/paragraph separators,
+/// bidi overrides and isolates), at most [`SELECTION_NAME_MAX_CHARS`].
+/// A name read from a `.aur` goes through the same check.
+///
+/// # Errors
+///
+/// [`SelectionNameError`] naming the first problem found.
+pub fn validate_selection_name(raw: &str) -> Result<String, SelectionNameError> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(SelectionNameError::Empty);
+    }
+    let stripped = |c: char| {
+        let one = c.to_string();
+        crate::sanitize_display_name(&one).as_ref() != one.as_str()
+    };
+    if name.chars().any(stripped) {
+        return Err(SelectionNameError::InvalidCharacter);
+    }
+    if name.chars().count() > SELECTION_NAME_MAX_CHARS {
+        return Err(SelectionNameError::TooLong);
+    }
+    Ok(name.to_owned())
+}
+
 /// The shape of a [`Selection`]'s region (0.213.0), before inversion.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum SelectionShape {
@@ -180,6 +227,18 @@ impl Selection {
             bounds: mask.bounds(),
             inverted: false,
             shape: SelectionShape::Mask(mask),
+        }
+    }
+
+    /// The bytes of raster coverage this selection holds: the mask's
+    /// texel count for a [`SelectionShape::Mask`], `0` for a rectangle or
+    /// an ellipse (they are computed). What the saved-selection cap and
+    /// the selection-history budget count.
+    #[must_use]
+    pub fn mask_bytes(&self) -> u64 {
+        match &self.shape {
+            SelectionShape::Mask(mask) => mask.bounds().area_px(),
+            SelectionShape::Rect | SelectionShape::Ellipse => 0,
         }
     }
 
@@ -384,8 +443,96 @@ impl SelectionSet {
     /// Returns [`DocError::NoActiveSelection`] if nothing is selected.
     pub fn save_active(&mut self, name: impl Into<String>) -> Result<(), DocError> {
         let selection = self.active.clone().ok_or(DocError::NoActiveSelection)?;
-        self.saved.insert(name.into(), selection);
+        let name = name.into();
+        // 0.218.0: bounded. A replaced name does not count twice.
+        let replaced = self.saved.get(&name);
+        if replaced.is_none() && self.saved.len() >= MAX_SAVED_SELECTIONS {
+            return Err(DocError::SavedSelectionsFull);
+        }
+        let total = self.saved_mask_bytes() - replaced.map_or(0, Selection::mask_bytes)
+            + selection.mask_bytes();
+        if total > MAX_SAVED_SELECTION_BYTES {
+            return Err(DocError::SavedSelectionsTooLarge);
+        }
+        self.saved.insert(name, selection);
         Ok(())
+    }
+
+    /// A set holding `active` and the `saved` selections (0.218.0), as a
+    /// file restores them. Checked like [`Self::save_active`] checks one
+    /// at a time.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::InvalidSelectionName`] for a name that fails
+    /// [`validate_selection_name`] (as typed: not trimmed) or repeats,
+    /// [`DocError::SavedSelectionsFull`] / [`DocError::SavedSelectionsTooLarge`]
+    /// past the caps.
+    pub fn from_parts(
+        active: Option<Selection>,
+        saved: Vec<(String, Selection)>,
+    ) -> Result<Self, DocError> {
+        if saved.len() > MAX_SAVED_SELECTIONS {
+            return Err(DocError::SavedSelectionsFull);
+        }
+        let mut set = Self::new();
+        set.select_stored(active);
+        let mut bytes = 0_u64;
+        for (name, selection) in saved {
+            if validate_selection_name(&name).as_deref() != Ok(name.as_str()) {
+                return Err(DocError::InvalidSelectionName);
+            }
+            bytes = bytes.saturating_add(selection.mask_bytes());
+            if bytes > MAX_SAVED_SELECTION_BYTES {
+                return Err(DocError::SavedSelectionsTooLarge);
+            }
+            if set.saved.insert(name, selection).is_some() {
+                return Err(DocError::InvalidSelectionName);
+            }
+        }
+        Ok(set)
+    }
+
+    fn select_stored(&mut self, active: Option<Selection>) {
+        match active {
+            Some(selection) => self.select(selection),
+            None => self.deselect(),
+        }
+    }
+
+    /// The selection saved under `name`, if any.
+    #[must_use]
+    pub fn saved(&self, name: &str) -> Option<&Selection> {
+        self.saved.get(name)
+    }
+
+    /// How many selections are saved.
+    #[must_use]
+    pub fn saved_count(&self) -> usize {
+        self.saved.len()
+    }
+
+    /// The raster coverage bytes the saved selections hold together.
+    #[must_use]
+    pub fn saved_mask_bytes(&self) -> u64 {
+        self.saved.values().map(Selection::mask_bytes).sum()
+    }
+
+    /// Every saved selection, sorted by name (a stable order for files
+    /// and menus).
+    #[must_use]
+    pub fn saved_sorted(&self) -> Vec<(&str, &Selection)> {
+        let mut all: Vec<(&str, &Selection)> =
+            self.saved.iter().map(|(n, s)| (n.as_str(), s)).collect();
+        all.sort_by(|a, b| a.0.cmp(b.0));
+        all
+    }
+
+    /// Whether the set holds nothing at all (no active selection, none
+    /// saved).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.active.is_none() && self.saved.is_empty()
     }
 
     /// Loads the selection saved under `name` back as the active

@@ -994,6 +994,7 @@ mod tests {
             crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
             store,
             None,
+            None,
         ) {
             crate::SnapshotOutcome::Taken(job) => job,
             other => unreachable!("{other:?}"),

@@ -556,11 +556,15 @@ mod psd_save;
 #[cfg(test)]
 mod psd_save_tests;
 mod quick_mask;
+mod selection_history;
 mod selection_modes;
 mod selection_paint;
 #[cfg(test)]
 mod selection_paint_tests;
+#[cfg(test)]
+mod selection_persist_tests;
 mod selection_refine;
+mod selection_store;
 mod selection_view;
 mod small_machine;
 mod workspace_presets;
@@ -1967,6 +1971,7 @@ fn autosave_path() -> PathBuf {
 /// well. Nothing else can: a tile an earlier writer dropped is not in
 /// `store` at all, so this pass would otherwise walk past it as "never
 /// painted".
+#[allow(clippy::too_many_arguments)]
 fn write_autosave(
     path: &Path,
     layers: &aurora_doc::LayerTree,
@@ -1975,6 +1980,7 @@ fn write_autosave(
     skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
     import_losses: Option<&[String]>,
+    selection: Option<&aurora_doc::SelectionSet>,
 ) {
     let temp_path = autosave_temp_path(path);
     let Some(mut file) = create_autosave_temp(&temp_path) else {
@@ -1998,6 +2004,7 @@ fn write_autosave(
         None,
         skipped,
         import_losses,
+        selection,
         store,
     ) {
         // The complete-vs-`.partial` choice keys on what *this* write
@@ -2097,6 +2104,7 @@ fn request_autosave(
     skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
     import_losses: Option<&[String]>,
+    selection: Option<&aurora_doc::SelectionSet>,
 ) -> Option<background_autosave::Generation> {
     request_autosave_within(
         worker,
@@ -2109,6 +2117,7 @@ fn request_autosave(
         skipped,
         store,
         import_losses,
+        selection,
     )
 }
 
@@ -2131,6 +2140,7 @@ fn request_autosave_within(
     skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
     import_losses: Option<&[String]>,
+    selection: Option<&aurora_doc::SelectionSet>,
 ) -> Option<background_autosave::Generation> {
     // 0.173.0 review (R-1): the generation of a *complete* autosave this
     // call submitted (or wrote), `None` when there is none — a failed or
@@ -2145,6 +2155,7 @@ fn request_autosave_within(
         budget,
         store,
         import_losses,
+        selection,
     ) {
         SnapshotOutcome::Taken(mut job) => {
             job.document = document;
@@ -2165,6 +2176,7 @@ fn request_autosave_within(
                 skipped,
                 store,
                 import_losses,
+                selection,
             );
             // Complete only if the canonical file was (re)written: a
             // failed write leaves it as it was, and a partial one goes to
@@ -2219,14 +2231,32 @@ fn snapshot_autosave(
     max_texel_bytes: usize,
     store: &mut aurora_tile::TileStore,
     import_losses: Option<&[String]>,
+    selection: Option<&aurora_doc::SelectionSet>,
 ) -> SnapshotOutcome {
+    // 0.218.0: the selection's raster coverage is shared, not copied, but
+    // it is alive until the write ends, so it counts against the bound.
+    let selection_bytes = selection.map_or(0, |set| {
+        usize::try_from(
+            set.active()
+                .iter()
+                .map(aurora_doc::Selection::mask_bytes)
+                .sum::<u64>()
+                + set.saved_mask_bytes(),
+        )
+        .unwrap_or(usize::MAX)
+    });
+    // A selection past the bound alone is over it (a saturating
+    // subtraction below would otherwise let it through).
+    if selection_bytes > max_texel_bytes {
+        return SnapshotOutcome::OverBudget;
+    }
     let mut snapshot = match aurora_io::snapshot_aur_best_effort(
         layers,
         history,
         canvas_size,
         None,
         skipped,
-        max_texel_bytes,
+        max_texel_bytes - selection_bytes,
         store,
     ) {
         Ok(Some(snapshot)) => snapshot,
@@ -2236,6 +2266,8 @@ fn snapshot_autosave(
             return SnapshotOutcome::Failed;
         }
     };
+    // 0.218.0: the selections survive a crash (the writer thread encodes).
+    snapshot.set_selection(selection);
     // Review B-1: what the document's open dropped survives a recovery.
     if let Err(err) = snapshot.set_import_losses(import_losses) {
         tracing::warn!(?err, path = %path.display(), "failed to encode the autosave's import losses");
@@ -2607,6 +2639,7 @@ fn read_autosave_container(
             canvas_size: document.canvas_size,
             skipped_tiles: document.skipped_tiles,
             import_losses: document.import_losses,
+            selection: document.selection,
         }),
         Err(err) => {
             tracing::warn!(?err, path = %path.display(), "failed to read the autosave container");
@@ -2634,6 +2667,8 @@ struct RecoveredDocument {
     /// [`DocumentSession::import_losses`] so a recovered document's
     /// Photoshop save still lists it.
     import_losses: Option<Vec<String>>,
+    /// The selections the autosave carried (0.218.0).
+    selection: aurora_doc::SelectionSet,
 }
 
 /// What [`App::new`] starts this session with — see
@@ -2653,6 +2688,8 @@ struct StartupDocument {
     skipped_tiles: aurora_io::SkippedTiles,
     /// A recovered document's carried open report (0.177.0 review B-1).
     import_losses: Option<Vec<String>>,
+    /// A recovered document's selections (0.218.0); empty otherwise.
+    selection: aurora_doc::SelectionSet,
     /// Whether this really came from an autosave — what the
     /// crash-recovery dialog's own message reports
     /// ([`crash_recovery_dialog_message`]).
@@ -2800,6 +2837,7 @@ fn recovered_shelf(sessions: Vec<RecoveredSession>) -> DocumentShelf {
             canvas_size,
             skipped_tiles,
             import_losses,
+            selection,
         } = document;
         let active_layer = topmost_pixel_layer(&layers);
         let canvas_view = load_document_view(
@@ -2824,6 +2862,7 @@ fn recovered_shelf(sessions: Vec<RecoveredSession>) -> DocumentShelf {
         );
         session.name = format!("Recovered {}", number + 2);
         session.import_losses = import_losses;
+        session.selection = selection;
         // 0.174.0: recovered work is in no file the user chose.
         session.saved_revision = None;
         shelf.parked.push(session);
@@ -2853,6 +2892,7 @@ fn startup_document_from(
             canvas_size,
             skipped_tiles: aurora_io::SkippedTiles::new(),
             import_losses: None,
+            selection: aurora_doc::SelectionSet::new(),
             was_recovered: false,
             autosave: None,
             recovered_from: None,
@@ -2887,6 +2927,7 @@ fn startup_document_from(
                 canvas_size,
                 skipped_tiles,
                 import_losses,
+                selection,
             }) = recovered
             {
                 // Nothing written back out: the file on disk *is* this
@@ -2904,6 +2945,7 @@ fn startup_document_from(
                     canvas_size,
                     skipped_tiles,
                     import_losses,
+                    selection,
                     was_recovered: true,
                     autosave: None,
                     recovered_from: Some(position),
@@ -2950,6 +2992,7 @@ fn startup_document_from(
             AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
             store,
             None,
+            None,
         ) {
             SnapshotOutcome::Taken(job) => autosave = Some(job),
             SnapshotOutcome::OverBudget => write_autosave(
@@ -2959,6 +3002,7 @@ fn startup_document_from(
                 canvas_size,
                 &mut skipped_tiles,
                 store,
+                None,
                 None,
             ),
             SnapshotOutcome::Failed => {}
@@ -2972,6 +3016,7 @@ fn startup_document_from(
         canvas_size,
         skipped_tiles,
         import_losses: None,
+        selection: aurora_doc::SelectionSet::new(),
         was_recovered: false,
         autosave,
         recovered_from: None,
@@ -5704,6 +5749,8 @@ enum ActivatedCommand {
     /// Select > Modify (0.216.0): apply a command with the number the
     /// prompt accepted.
     RefineApply(selection_refine::RefineKind, f32),
+    /// Save, Load or Delete a saved selection (0.218.0).
+    SavedSelection(selection_store::SavedSelectionCommand),
     /// Select a tool from the palette (0.209.0).
     SelectTool(aurora_ui::Tool),
     /// A keyboard panel move (0.166.0, [`PANEL_MOVE_COMMANDS`]) —
@@ -5984,6 +6031,7 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_SELECT_DESELECT, "Deselect"),
         CommandEntry::new(COMMAND_SELECT_INVERSE, "Inverse Selection"),
         CommandEntry::new(quick_mask::COMMAND_ID, quick_mask::COMMAND_TITLE),
+        CommandEntry::new(selection_store::COMMAND_SAVE, selection_store::SAVE_TITLE),
     ];
     // 0.216.0: Select > Modify.
     commands.extend(
@@ -6230,6 +6278,9 @@ fn activate_command(
     }
     if id == quick_mask::COMMAND_ID {
         return Some(ActivatedCommand::ToggleQuickMask);
+    }
+    if let Some(command) = selection_store::command_for(id) {
+        return Some(ActivatedCommand::SavedSelection(command));
     }
     if id == COMMAND_SELECT_ALL {
         return Some(ActivatedCommand::Selection(
@@ -10173,13 +10224,7 @@ enum UndoKind {
     Selection,
 }
 
-/// One selection change: the active selection before and after it
-/// (`None` = nothing selected). Cheap to hold: a mask is shared.
-#[derive(Debug, Clone, PartialEq)]
-struct SelectionStep {
-    before: Option<aurora_doc::Selection>,
-    after: Option<aurora_doc::Selection>,
-}
+use selection_history::SelectionStep;
 
 /// The one true chronological order `Ctrl+Z`/`Ctrl+Shift+Z` walk across
 /// `aurora_doc::History`'s own structural entries (so far, just Move)
@@ -10226,6 +10271,9 @@ struct UndoOrder {
     /// `redo`, in the same order (the newest on top).
     selection_undo: Vec<SelectionStep>,
     selection_redo: Vec<SelectionStep>,
+    /// The bytes of selection masks the two stacks may hold before the
+    /// oldest are packed (0.218.0, [`selection_history`]).
+    selection_budget: u64,
     /// The selection an undo or redo of a selection step has just put in
     /// force, for the owner of the live selection to take and apply
     /// ([`Self::take_pending_selection`]): `Some(None)` means "deselect".
@@ -10295,6 +10343,7 @@ impl Default for UndoOrder {
             content_revision: UndoRevision::next(),
             selection_undo: Vec::new(),
             selection_redo: Vec::new(),
+            selection_budget: selection_history::system_budget_bytes(),
             pending_selection: None,
         }
     }
@@ -10351,6 +10400,13 @@ impl UndoOrder {
         }
     }
 
+    /// A saved-selection edit (0.218.0) is document metadata: no step and
+    /// no dirty flag, but the all-steps revision moves so the park
+    /// autosave writes it.
+    fn note_selection_metadata_change(&mut self) {
+        self.revision = UndoRevision::next();
+    }
+
     /// Records a committed selection change as a step labelled `label`
     /// (0.213.0), clearing every pending redo like any other step. Does
     /// nothing, and returns `false`, when `before == after`.
@@ -10372,8 +10428,28 @@ impl UndoOrder {
             pixel_history,
         );
         // After `record_labelled`, which clears the redo side.
-        self.selection_undo.push(SelectionStep { before, after });
+        self.selection_undo.push(SelectionStep::new(before, after));
+        self.trim_selection_history();
         true
+    }
+
+    /// Packs the oldest selection steps' masks when the stacks are over
+    /// [`Self::selection_budget`]; no step is ever dropped.
+    fn trim_selection_history(&mut self) -> selection_history::SelectionHistoryStats {
+        selection_history::trim(
+            &mut self.selection_undo,
+            &mut self.selection_redo,
+            self.selection_budget,
+        )
+    }
+
+    /// What the selection stacks hold (0.218.0).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn selection_history_stats(&self) -> selection_history::SelectionHistoryStats {
+        let mut stats =
+            selection_history::distinct_mask_bytes(&self.selection_undo, &self.selection_redo);
+        stats.over_budget = stats.total_bytes() > self.selection_budget && stats.live_bytes == 0;
+        stats
     }
 
     /// Undoes or redoes the top selection step: moves it across, leaves
@@ -10386,10 +10462,16 @@ impl UndoOrder {
                 if self.undo.last() != Some(&UndoKind::Selection) {
                     return false;
                 }
+                // Resolved before anything moves: a step whose packed
+                // data cannot be read stays where it is.
+                let Some(Ok(target)) = self.selection_undo.last().map(|s| s.before.resolve())
+                else {
+                    return false;
+                };
                 let Some(step) = self.selection_undo.pop() else {
                     return false;
                 };
-                self.pending_selection = Some(step.before.clone());
+                self.pending_selection = Some(target);
                 self.selection_redo.push(step);
                 self.step_back();
                 true
@@ -10398,10 +10480,13 @@ impl UndoOrder {
                 if self.redo.last() != Some(&UndoKind::Selection) {
                     return false;
                 }
+                let Some(Ok(target)) = self.selection_redo.last().map(|s| s.after.resolve()) else {
+                    return false;
+                };
                 let Some(step) = self.selection_redo.pop() else {
                     return false;
                 };
-                self.pending_selection = Some(step.after.clone());
+                self.pending_selection = Some(target);
                 self.selection_undo.push(step);
                 self.step_forward();
                 true
@@ -11106,6 +11191,17 @@ fn handle_palette_key(
                 Some(Err(())) => return None,
                 None => {}
             }
+            // 0.218.0: the Save Selection name prompt.
+            match selection_store::prompt_enter(&mut workspace.tree, root) {
+                Some(Ok(name)) => {
+                    close_command_palette(workspace, focus, palette);
+                    return Some(ActivatedCommand::SavedSelection(
+                        selection_store::SavedSelectionCommand::Save(name),
+                    ));
+                }
+                Some(Err(())) => return None,
+                None => {}
+            }
             // 0.168.0: the workspace name prompt checks the typed name; a
             // refused one keeps the prompt open with the reason shown.
             match workspace_presets::name_prompt_enter(&mut workspace.tree, root) {
@@ -11132,6 +11228,7 @@ fn handle_palette_key(
                     tracing::warn!(?err, "failed to update command palette query");
                 }
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
+                selection_store::follow_prompt_query(&mut workspace.tree, root);
             }
         }
         // Copy/paste against the real system clipboard, on the platform's
@@ -11160,6 +11257,7 @@ fn handle_palette_key(
                     tracing::warn!(?err, "failed to update command palette query");
                 }
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
+                selection_store::follow_prompt_query(&mut workspace.tree, root);
             }
         }
         // A plain, unmodified character types into the query. A
@@ -11184,6 +11282,7 @@ fn handle_palette_key(
                     tracing::warn!(?err, "failed to update command palette query");
                 }
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
+                selection_store::follow_prompt_query(&mut workspace.tree, root);
             }
         }
         _ => {}
@@ -25693,6 +25792,15 @@ enum LockRefusal {
     /// Quick Mask (0.217.0): leaving selected nothing, so there is no
     /// selection.
     QuickMaskNothing,
+    /// Save Selection with nothing selected (0.218.0).
+    SavedSelectionNeedsSelection,
+    /// Save Selection past the saved-selection count cap (0.218.0).
+    SavedSelectionsFull,
+    /// Save Selection past the saved-selection coverage cap (0.218.0).
+    SavedSelectionsTooLarge,
+    /// A `.aur` file's selection entry was unusable and was left out
+    /// (0.218.0); the document opened without it.
+    SelectionDroppedOnOpen,
     /// An undo or redo could not read the step's saved data back (0.210.0:
     /// a pixel-history spill file a temp-file cleaner removed, or a corrupt
     /// one). Not a lock; the step stays in the History panel.
@@ -25745,6 +25853,18 @@ impl LockRefusal {
             }
             LockRefusal::QuickMaskNothing => {
                 "Quick Mask selected nothing, so there is no selection."
+            }
+            LockRefusal::SavedSelectionNeedsSelection => {
+                "Make a selection first. Save Selection keeps the selection you have."
+            }
+            LockRefusal::SavedSelectionsFull => {
+                "This document already keeps 64 saved selections. Delete one first."
+            }
+            LockRefusal::SavedSelectionsTooLarge => {
+                "The saved selections would take more than 128 MiB. Delete one first."
+            }
+            LockRefusal::SelectionDroppedOnOpen => {
+                "This file's saved selection couldn't be restored and was left out. The rest of the document opened."
             }
             LockRefusal::HistoryUnavailable => {
                 "Couldn't undo or redo: history file unavailable. A temp-file cleaner may have removed it; the step stays in the list."
@@ -25819,6 +25939,13 @@ fn lock_refusal_applies(
     press_refusal(tool, lock) == Some(refusal)
         || delete_refusal(lock) == Some(refusal)
         || refusal == LockRefusal::HistoryUnavailable
+        || matches!(
+            refusal,
+            LockRefusal::SavedSelectionNeedsSelection
+                | LockRefusal::SavedSelectionsFull
+                | LockRefusal::SavedSelectionsTooLarge
+                | LockRefusal::SelectionDroppedOnOpen
+        )
         || (matches!(
             refusal,
             LockRefusal::FillTooLarge | LockRefusal::FillNeedsPixelLayer
@@ -27045,6 +27172,7 @@ impl App {
             canvas_size,
             skipped_tiles,
             import_losses: startup_import_losses,
+            selection: startup_selection,
             was_recovered,
             autosave: startup_autosave,
             recovered_from,
@@ -27236,6 +27364,7 @@ impl App {
                     doc.saved_revision = None;
                 }
                 doc.import_losses = startup_import_losses;
+                doc.selection = startup_selection;
                 doc
             },
             shelf: recovered_shelf(extra_sessions),
@@ -27545,6 +27674,12 @@ impl App {
             self.command_palette,
             document_tabs::document_palette_entries(&self.shelf, &self.doc),
         );
+        selection_store::add_entries_if_opened(
+            &mut self.workspace,
+            palette_was_open,
+            self.command_palette,
+            &self.doc.selection,
+        );
         // Review RT136-2: a radius drag cannot carry over onto the tool
         // this key just switched to.
         let _ = end_radius_drag_on_tool_change(
@@ -27595,6 +27730,7 @@ impl App {
             Some(ActivatedCommand::SetSelectionMode(mode)) => self.set_selection_mode(mode),
             Some(ActivatedCommand::RefinePrompt(kind)) => self.open_refine_prompt(kind),
             Some(ActivatedCommand::RefineApply(kind, amount)) => self.run_refine(kind, amount),
+            Some(ActivatedCommand::SavedSelection(command)) => self.run_saved_selection(command),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -27961,6 +28097,7 @@ impl App {
                 &mut self.doc.skipped_tiles,
                 store,
                 self.doc.import_losses.as_deref(),
+                None,
             );
         } else {
             tracing::warn!("no live tile store; the new document is not autosaved");
@@ -28642,6 +28779,7 @@ impl App {
                 &mut self.doc.skipped_tiles,
                 store,
                 self.doc.import_losses.as_deref(),
+                None,
             );
         } else {
             // Nothing to free beyond the in-memory structure itself:
@@ -28774,6 +28912,8 @@ impl App {
             profile: _profile,
             skipped_tiles,
             import_losses,
+            selection,
+            selection_dropped,
         } = document;
         // Review B-1: what this document's own first open dropped, kept
         // across the `.aur` (set before the install's autosave).
@@ -28820,6 +28960,7 @@ impl App {
                 &mut self.doc.skipped_tiles,
                 store,
                 self.doc.import_losses.as_deref(),
+                Some(&selection),
             );
         }
 
@@ -28854,7 +28995,14 @@ impl App {
             canvas_area_logical_size(&self.workspace),
             self.scale_factor,
         );
-        self.doc.selection = aurora_doc::SelectionSet::new();
+        // 0.218.0: the file's own selections (an empty set for a file
+        // without any, or whose entry was unusable).
+        self.doc.selection = selection;
+        if let Some(why) = &selection_dropped {
+            tracing::warn!(%why, path = %path.display(), "a .aur file's selection was left out");
+            self.lock_notice = Some((LockRefusal::SelectionDroppedOnOpen, self.doc.active_layer));
+            self.sync_status_bar_now();
+        }
         // Dropped, deliberately not committed through `commit_drag`:
         // `pixel_history` was replaced wholesale a few lines up, so an
         // entry pushed here would be discarded immediately -- and it
@@ -29210,10 +29358,14 @@ impl App {
             store,
             doc_id: self.doc.id,
             revision: self.doc.undo_order.content_revision,
-            carried: psd_save::carried_losses(
-                self.doc.import_losses.as_deref(),
-                &self.doc.skipped_tiles,
-            ),
+            carried: {
+                let mut carried = psd_save::carried_losses(
+                    self.doc.import_losses.as_deref(),
+                    &self.doc.skipped_tiles,
+                );
+                carried.extend(psd_save::selection_loss_line(&self.doc.selection));
+                carried
+            },
         };
         match psd_save::begin_psd_save(source, path) {
             Ok(psd_save::PsdSaveStep::Saved) => {
@@ -29429,6 +29581,9 @@ impl App {
                 // so it can never turn into a fresh skip here.
                 &self.doc.skipped_tiles,
                 self.doc.import_losses.as_deref(),
+                // 0.218.0: the selection in force (while Quick Mask is on
+                // that is the selection it started from, not the grid).
+                Some(&self.doc.selection),
                 store,
             )
         })();
@@ -30557,6 +30712,7 @@ impl App {
             Some(ActivatedCommand::SetSelectionMode(mode)) => self.set_selection_mode(mode),
             Some(ActivatedCommand::RefinePrompt(kind)) => self.open_refine_prompt(kind),
             Some(ActivatedCommand::RefineApply(kind, amount)) => self.run_refine(kind, amount),
+            Some(ActivatedCommand::SavedSelection(command)) => self.run_saved_selection(command),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -31503,6 +31659,59 @@ impl App {
         ) {
             self.push_accessibility();
             self.needs_redraw = true;
+        }
+    }
+
+    /// Save, Load and Delete Saved Selection (0.218.0). Load is one undo
+    /// step and refused while Quick Mask is on (it would change the
+    /// selection under the grid); Save and Delete are metadata.
+    fn run_saved_selection(&mut self, command: selection_store::SavedSelectionCommand) {
+        use selection_store::{SavedSelectionCommand as Cmd, StoreOutcome};
+        let outcome = match command {
+            Cmd::Prompt => {
+                if self.doc.selection.active().is_none() {
+                    StoreOutcome::Refused(LockRefusal::SavedSelectionNeedsSelection)
+                } else {
+                    if selection_store::open_prompt(
+                        &mut self.workspace,
+                        &mut self.focus,
+                        &mut self.command_palette,
+                    ) {
+                        self.push_accessibility();
+                        self.needs_redraw = true;
+                    }
+                    return;
+                }
+            }
+            Cmd::Save(name) => {
+                lasso_tools::cancel_selection_gesture(&mut self.drag, &mut self.doc.selection);
+                selection_store::save(&mut self.doc.undo_order, &mut self.doc.selection, &name)
+            }
+            Cmd::Delete(name) => {
+                selection_store::delete(&mut self.doc.undo_order, &mut self.doc.selection, &name)
+            }
+            Cmd::Load(name) => {
+                if self.quick_mask_refuses_command() {
+                    return;
+                }
+                lasso_tools::cancel_selection_gesture(&mut self.drag, &mut self.doc.selection);
+                selection_store::load(
+                    &mut self.workspace,
+                    &mut self.doc.undo_order,
+                    &mut self.doc.history,
+                    &mut self.doc.pixel_history,
+                    &mut self.doc.selection,
+                    &name,
+                )
+            }
+        };
+        match outcome {
+            StoreOutcome::Loaded => self.needs_redraw = true,
+            StoreOutcome::MetadataChanged | StoreOutcome::Unchanged => {}
+            StoreOutcome::Refused(why) => {
+                self.lock_notice = Some((why, self.doc.active_layer));
+                self.sync_status_bar_now();
+            }
         }
     }
 
@@ -36573,6 +36782,7 @@ mod tests {
             (320, 160),
             &mut aurora_io::SkippedTiles::new(),
             &mut store,
+            None,
             None,
         );
 
@@ -43648,6 +43858,7 @@ mod tests {
             &mut aurora_io::SkippedTiles::new(),
             crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
             &mut store,
+            None,
             None,
         ) else {
             unreachable!("a tiny document is snapshotted");
@@ -63711,6 +63922,7 @@ mod tests {
             &mut nothing_lost_yet,
             &mut store,
             None,
+            None,
         );
 
         let full_len = match std::fs::metadata(&path) {
@@ -63790,6 +64002,7 @@ mod tests {
             &mut nothing_lost_yet,
             &mut store,
             None,
+            None,
         );
         let Ok(complete) = std::fs::read(&path) else {
             unreachable!("the complete autosave must have been written");
@@ -63841,6 +64054,7 @@ mod tests {
             (10, 10),
             &mut nothing_lost_yet,
             &mut store,
+            None,
             None,
         );
 
@@ -63954,6 +64168,7 @@ mod tests {
             &mut nothing_lost_yet,
             &mut store,
             None,
+            None,
         );
 
         // Nothing complete was ever written here, so the salvaged
@@ -64028,6 +64243,7 @@ mod tests {
             (10, 10),
             &mut nothing_lost_yet,
             &mut store,
+            None,
             None,
         );
 
@@ -64117,6 +64333,7 @@ mod tests {
                 &mut aurora_io::SkippedTiles::new(),
                 &mut store,
                 None,
+                None,
             );
             painted
         };
@@ -64186,6 +64403,7 @@ mod tests {
             &mut nothing_lost_yet,
             &mut store,
             None,
+            None,
         );
         let mut nothing_lost_yet = aurora_io::SkippedTiles::new();
         write_autosave(
@@ -64195,6 +64413,7 @@ mod tests {
             (10, 10),
             &mut nothing_lost_yet,
             &mut store,
+            None,
             None,
         );
 
@@ -64243,6 +64462,7 @@ mod tests {
             &mut nothing_lost_yet,
             &mut store,
             None,
+            None,
         );
         let mode = match std::fs::metadata(&path) {
             Ok(meta) => meta.permissions().mode() & 0o777,
@@ -64275,6 +64495,7 @@ mod tests {
                 (37, 21),
                 &mut aurora_io::SkippedTiles::new(),
                 &mut store,
+                None,
                 None,
             );
         }
@@ -64347,6 +64568,7 @@ mod tests {
                 size,
                 &mut aurora_io::SkippedTiles::new(),
                 &mut store,
+                None,
                 None,
             );
             assert!(path.exists(), "the fixture container was written");
@@ -64739,6 +64961,7 @@ mod tests {
                 &mut aurora_io::SkippedTiles::new(),
                 &mut store,
                 None,
+                None,
             );
             assert!(own.exists());
             assert_eq!(
@@ -65053,6 +65276,7 @@ mod tests {
                 (10, 10),
                 &mut aurora_io::SkippedTiles::new(),
                 &mut store,
+                None,
                 None,
             );
         }
@@ -66425,6 +66649,7 @@ mod tests {
             document.canvas_size,
             &mut carried,
             &mut fresh_store,
+            None,
             None,
         );
         assert!(
@@ -77813,6 +78038,7 @@ mod tests {
                 crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
                 &mut staged_store,
                 None,
+                None,
             ),
             crate::SnapshotOutcome::Taken(_)
         ));
@@ -78289,6 +78515,7 @@ mod tests {
             crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
             &mut store,
             None,
+            None,
         ) else {
             unreachable!("a 4096x4096 four-layer document fits the snapshot budget");
         };
@@ -78311,6 +78538,7 @@ mod tests {
             document_canvas_size,
             &mut aurora_io::SkippedTiles::new(),
             &mut store,
+            None,
             None,
         );
         let sync_time = started.elapsed();

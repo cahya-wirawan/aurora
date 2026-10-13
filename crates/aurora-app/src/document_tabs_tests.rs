@@ -630,6 +630,7 @@ fn every_session_autosaves_to_its_own_file_and_the_index_lists_them_in_tab_order
             &mut doc.skipped_tiles,
             store,
             None,
+            None,
         );
     }
     let b_id = rig.doc.id;
@@ -649,6 +650,7 @@ fn every_session_autosaves_to_its_own_file_and_the_index_lists_them_in_tab_order
             doc.canvas_size,
             &mut doc.skipped_tiles,
             store,
+            None,
             None,
         );
     }
@@ -699,6 +701,7 @@ fn a_crashed_two_document_run_is_recovered_as_two_sessions() {
             doc.canvas_size,
             &mut doc.skipped_tiles,
             store,
+            None,
             None,
         );
         assert!(path.exists());
@@ -992,6 +995,7 @@ fn a_parked_document_is_autosaved_with_its_edits() {
             doc.canvas_size,
             &mut doc.skipped_tiles,
             store,
+            None,
             None,
         );
     }
@@ -1558,6 +1562,79 @@ fn an_unchanged_parked_document_is_not_autosaved_again() {
     let _ = rig.open(b);
 }
 
+/// 0.218.0: a selection-only change (a recorded selection step, or a
+/// saved-selection edit) never dirties the document but IS autosaved on the
+/// next park, and the file carries the selection.
+#[test]
+fn a_selection_only_change_is_autosaved_on_park_and_the_file_holds_it() {
+    let (dir_a, autosaves) = (tempdir(), tempdir());
+    let namespace =
+        autosave_files::AutosaveNamespace::acquire(autosaves.path().to_path_buf(), 4248);
+    let mut worker = background_autosave::AutosaveWorker::default();
+    let (a, _) = session("a", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let mut rig = Rig::new(a);
+    let a_path = namespace.session_path(rig.doc.id.get());
+    assert!(park_now(&mut rig, &mut worker, &namespace));
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    if let Err(err) = std::fs::remove_file(&a_path) {
+        unreachable!("{err:?}");
+    }
+    assert!(!park_now(&mut rig, &mut worker, &namespace), "unchanged");
+    let clean = rig.doc.is_dirty();
+    // A selection step.
+    let selected = aurora_doc::Selection::new(aurora_core::Rect {
+        x: 1,
+        y: 2,
+        width: 5,
+        height: 6,
+    });
+    rig.doc.selection.select(selected.clone());
+    let doc = &mut rig.doc;
+    assert!(doc.undo_order.record_selection(
+        "Rectangular Marquee",
+        None,
+        Some(selected.clone()),
+        &mut doc.history,
+        &mut doc.pixel_history,
+    ));
+    assert_eq!(rig.doc.is_dirty(), clean, "a selection never dirties");
+    assert!(
+        park_now(&mut rig, &mut worker, &namespace),
+        "but is written"
+    );
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    let dir = tempdir();
+    let Some(budget) = std::num::NonZeroUsize::new(16) else {
+        unreachable!("non-zero")
+    };
+    let mut fresh = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+        Ok(store) => store,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let file = std::fs::File::open(&a_path).map_err(|e| format!("{e:?}"));
+    let Ok(file) = file else {
+        unreachable!("the park wrote the autosave")
+    };
+    let document = match aurora_io::read_aur(std::io::BufReader::new(file), &mut fresh) {
+        Ok(document) => document,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    assert_eq!(document.selection.active(), Some(selected));
+    // A saved-selection edit (metadata, no step) is written on the next park.
+    if let Err(err) = std::fs::remove_file(&a_path) {
+        unreachable!("{err:?}");
+    }
+    assert!(
+        !park_now(&mut rig, &mut worker, &namespace),
+        "unchanged again"
+    );
+    assert!(rig.doc.selection.save_active("Kept").is_ok());
+    rig.doc.undo_order.note_selection_metadata_change();
+    assert!(park_now(&mut rig, &mut worker, &namespace));
+    assert!(worker.wait_idle(std::time::Duration::from_secs(20)));
+    assert!(a_path.exists());
+}
+
 /// AC-2/AC-5 (R4, F8/F11): with focus resting on the strip, a switch made
 /// elsewhere (`Ctrl+Tab`, the palette) moves focus to the strip's newly
 /// selected tab — never left on the now-unselected (unfocusable) one.
@@ -1993,6 +2070,7 @@ fn a_close_activates_the_neighbour_and_removes_the_store_and_autosave() {
             doc.canvas_size,
             &mut doc.skipped_tiles,
             store,
+            None,
             None,
         );
     }

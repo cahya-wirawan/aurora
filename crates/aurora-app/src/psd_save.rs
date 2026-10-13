@@ -151,6 +151,21 @@ pub(crate) fn carried_losses(
     lines
 }
 
+/// The one report line for a document that has selections (0.218.0): a
+/// Photoshop file carries no selection (PSD alpha channels wait for the
+/// Channels panel), so the save would leave them out. `None` when the
+/// document has none, so a selection-less save reports nothing new.
+pub(crate) fn selection_loss_line(selection: &aurora_doc::SelectionSet) -> Option<String> {
+    match (selection.active().is_some(), selection.saved_count() > 0) {
+        (false, false) => None,
+        (true, false) => Some("The selection is not saved in a Photoshop file.".to_owned()),
+        (false, true) => Some("Saved selections are not saved in a Photoshop file.".to_owned()),
+        (true, true) => Some(
+            "The selection and the saved selections are not saved in a Photoshop file.".to_owned(),
+        ),
+    }
+}
+
 /// Records a PSD save on the document: a lossless one is a real save
 /// (clean, `.psd` path and name, through `document_close::after_save`);
 /// one with changes — Save Anyway included — leaves it untouched.

@@ -229,6 +229,7 @@ pub(crate) fn final_autosave_unsaved(
             &mut session.skipped_tiles,
             store,
             session.import_losses.as_deref(),
+            Some(&session.selection),
         );
         let after = modified(&path);
         session.park_autosave = None;

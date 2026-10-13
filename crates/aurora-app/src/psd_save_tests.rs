@@ -714,6 +714,7 @@ fn a_lossy_psd_saved_as_aur_and_reopened_still_asks_before_a_psd_save() {
         None,
         &aurora_io::SkippedTiles::new(),
         Some(&losses),
+        None,
         &mut doc.store,
     ));
     let (_dir, mut fresh) = fresh_store();
@@ -755,6 +756,7 @@ fn a_lossy_psd_recovered_after_a_crash_still_asks_before_a_psd_save() {
         crate::AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
         &mut doc.store,
         Some(&losses),
+        None,
     ) {
         crate::SnapshotOutcome::Taken(job) => job,
         other => unreachable!("{other:?}"),
@@ -773,6 +775,7 @@ fn a_lossy_psd_recovered_after_a_crash_still_asks_before_a_psd_save() {
         &mut aurora_io::SkippedTiles::new(),
         &mut doc.store,
         Some(&losses),
+        None,
     );
     for path in [&snap_path, &sync_path] {
         let (_dir, mut fresh) = fresh_store();

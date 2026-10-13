@@ -975,7 +975,11 @@ const MAX_TOTAL_TILES_PER_DOCUMENT: u64 = {
 /// pair: `ZipFile::size()` is the container's own *claim* about the
 /// uncompressed size and a crafted archive is free to lie about it, so
 /// the actual read is bounded by `Read::take` as well.
-fn read_capped(mut file: zip::read::ZipFile<'_>, name: &str, cap: u64) -> Result<Vec<u8>, IoError> {
+pub(crate) fn read_capped(
+    mut file: zip::read::ZipFile<'_>,
+    name: &str,
+    cap: u64,
+) -> Result<Vec<u8>, IoError> {
     let declared = file.size();
     if declared > cap {
         return Err(IoError::EntryTooLarge {
@@ -1193,6 +1197,7 @@ pub fn write<W: Write + Seek>(
             known_missing,
             unreadable: UnreadableTile::Refuse,
             import_losses: None,
+            selection: None,
         },
         store,
     )?;
@@ -1528,6 +1533,7 @@ pub fn write_best_effort<W: Write + Seek>(
             known_missing,
             unreadable: UnreadableTile::Skip,
             import_losses: None,
+            selection: None,
         },
         store,
     )
@@ -1549,6 +1555,7 @@ pub fn write_with_import_losses<W: Write + Seek>(
     profile: Option<&aurora_color::IccProfile>,
     known_missing: &SkippedTiles,
     import_losses: Option<&[String]>,
+    selection: Option<&aurora_doc::SelectionSet>,
     store: &mut TileStore,
 ) -> Result<(), IoError> {
     let _empty = write_with_policy(
@@ -1561,6 +1568,7 @@ pub fn write_with_import_losses<W: Write + Seek>(
             known_missing,
             unreadable: UnreadableTile::Refuse,
             import_losses,
+            selection,
         },
         store,
     )?;
@@ -1582,6 +1590,7 @@ pub fn write_best_effort_with_import_losses<W: Write + Seek>(
     profile: Option<&aurora_color::IccProfile>,
     known_missing: &SkippedTiles,
     import_losses: Option<&[String]>,
+    selection: Option<&aurora_doc::SelectionSet>,
     store: &mut TileStore,
 ) -> Result<Vec<SkippedTile>, IoError> {
     write_with_policy(
@@ -1594,6 +1603,7 @@ pub fn write_best_effort_with_import_losses<W: Write + Seek>(
             known_missing,
             unreadable: UnreadableTile::Skip,
             import_losses,
+            selection,
         },
         store,
     )
@@ -1626,6 +1636,8 @@ struct WritePolicy<'a> {
     unreadable: UnreadableTile,
     /// What the document's open changed (0.177.0 review B-1).
     import_losses: Option<&'a [String]>,
+    /// The selections to persist (0.218.0).
+    selection: Option<&'a aurora_doc::SelectionSet>,
 }
 
 fn write_with_policy<W: Write + Seek>(
@@ -1641,6 +1653,7 @@ fn write_with_policy<W: Write + Seek>(
         known_missing,
         unreadable,
         import_losses,
+        selection,
     } = policy;
     // Before a single byte is written: every rectangle the tile loop
     // below will derive a grid from, range-checked, and their grids
@@ -1660,6 +1673,7 @@ fn write_with_policy<W: Write + Seek>(
 
     let mut header = DocumentEntries::build(layers, history, canvas_size, profile)?;
     header.import_losses = encode_import_losses(import_losses)?;
+    header.selection = selection.cloned();
     header.write_to(&mut zip, stored, deflated)?;
 
     for (surface, bounds) in persisted_surfaces(layers) {
@@ -1786,6 +1800,10 @@ struct DocumentEntries {
     layer_clipping: Option<Vec<u8>>,
     /// [`IMPORT_LOSSES_ENTRY`], when the document has any (0.177.0).
     import_losses: Option<Vec<u8>>,
+    /// The selections to write as the `selection` entry (0.218.0); the
+    /// entry is encoded when written, so a background autosave does its
+    /// compression off the UI thread (masks are shared, not copied).
+    selection: Option<aurora_doc::SelectionSet>,
     /// [`SMART_OBJECTS_ENTRY`] and the embedded files, when the document
     /// has any (0.200.0).
     smart_objects: Option<SmartEntries>,
@@ -1858,6 +1876,7 @@ impl DocumentEntries {
             layer_effects,
             layer_clipping,
             import_losses: None,
+            selection: None,
             smart_objects: smart_entries(layers)?,
         })
     }
@@ -1898,6 +1917,12 @@ impl DocumentEntries {
         if let Some(bytes) = &self.import_losses {
             zip.start_file(IMPORT_LOSSES_ENTRY, deflated)?;
             zip.write_all(bytes)?;
+        }
+        if let Some(set) = &self.selection
+            && let Some(bytes) = crate::aur_selection::encode_selection(set)?
+        {
+            zip.start_file(crate::aur_selection::SELECTION_ENTRY, deflated)?;
+            zip.write_all(&bytes)?;
         }
         Ok(())
     }
@@ -1956,6 +1981,27 @@ impl AurSnapshot {
     pub fn set_import_losses(&mut self, lines: Option<&[String]>) -> Result<(), IoError> {
         self.entries.import_losses = encode_import_losses(lines)?;
         Ok(())
+    }
+
+    /// Records the selections to write as the optional `selection` entry
+    /// (0.218.0). The snapshot holds the set (its masks are shared, not
+    /// copied) and the writer thread encodes it. `None` or an empty set
+    /// writes no entry.
+    pub fn set_selection(&mut self, selection: Option<&aurora_doc::SelectionSet>) {
+        self.entries.selection = selection.cloned();
+    }
+
+    /// The raster-coverage bytes of the selections this snapshot will
+    /// write (shared with the document, alive until the write ends).
+    #[must_use]
+    pub fn selection_bytes(&self) -> u64 {
+        self.entries.selection.as_ref().map_or(0, |set| {
+            set.active()
+                .iter()
+                .map(aurora_doc::Selection::mask_bytes)
+                .sum::<u64>()
+                + set.saved_mask_bytes()
+        })
     }
 
     /// The tiles [`snapshot_best_effort`] had to leave out because the
@@ -2179,6 +2225,14 @@ pub struct AurDocument {
     /// for a file without one, sanitised lines when it reads, a single
     /// generic line ([`IMPORT_LOSSES_FALLBACK`]) when it is damaged.
     pub import_losses: Option<Vec<String>>,
+    /// The persisted selections (the optional `selection` entry, 0.218.0):
+    /// empty for a file without one or with one that was dropped.
+    pub selection: aurora_doc::SelectionSet,
+    /// Why a present `selection` entry was dropped (damaged, oversized,
+    /// over a cap, of an older unknown kind), as a sentence for the user;
+    /// `None` when it restored or was absent. A newer version refuses the
+    /// whole open instead.
+    pub selection_dropped: Option<String>,
 }
 
 /// Reads a complete `.aur` document from `reader`, writing every
@@ -2288,6 +2342,15 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
 
     let skipped_tiles = read_skipped_tiles(&mut zip)?;
     let import_losses = read_import_losses(&mut zip);
+    // After the manifest and journal are known good, before any tile is
+    // written: a newer-version refusal then commits nothing.
+    let (selection, selection_dropped) = match crate::aur_selection::read_selection(&mut zip)? {
+        crate::aur_selection::SelectionRead::Absent => (aurora_doc::SelectionSet::new(), None),
+        crate::aur_selection::SelectionRead::Restored(set) => (set, None),
+        crate::aur_selection::SelectionRead::Dropped(why) => {
+            (aurora_doc::SelectionSet::new(), Some(why))
+        }
+    };
 
     // Every tile this scan commits is recorded, and undone if the scan
     // does not finish -- see `read_persisted_tiles` for why a partial
@@ -2312,6 +2375,8 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
         profile,
         skipped_tiles,
         import_losses,
+        selection,
+        selection_dropped,
     })
 }
 
@@ -6929,6 +6994,7 @@ mod import_losses_tests {
             None,
             &SkippedTiles::new(),
             lines,
+            None,
             &mut store,
         ));
         out.into_inner()

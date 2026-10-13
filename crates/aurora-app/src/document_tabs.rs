@@ -87,7 +87,9 @@ pub(crate) fn autosave_outgoing(cx: &mut SwitchContext<'_>) -> bool {
     // R-1 (0.173.0, review-revised): unchanged since its last park
     // autosave — every recorded, undone or redone step moves the revision
     // — *and* that autosave landed complete, so nothing new to write.
-    let revision = cx.doc.undo_order.content_revision;
+    // 0.218.0: the all-steps revision, not `content_revision`, so a
+    // selection-only change (or a saved-selection edit) is autosaved too.
+    let revision = cx.doc.undo_order.revision;
     let id = cx.doc.id.get();
     // L-2 (0.175.0): nor while that write is still queued or in flight.
     if let Some((saved, generation)) = cx.doc.park_autosave
@@ -115,6 +117,7 @@ pub(crate) fn autosave_outgoing(cx: &mut SwitchContext<'_>) -> bool {
         &mut cx.doc.skipped_tiles,
         store,
         cx.doc.import_losses.as_deref(),
+        Some(&cx.doc.selection),
     );
     cx.doc.park_autosave = submitted.map(|generation| (revision, generation));
     true

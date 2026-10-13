@@ -41,6 +41,7 @@ test-support = []
 aurora-core = { workspace = true }
 aurora-tile = { workspace = true }
 aurora-graph = { workspace = true }
+lz4_flex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

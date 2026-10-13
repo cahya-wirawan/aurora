@@ -492,3 +492,122 @@ fn mask_selections_compare_by_content_and_share_cheaply() {
         "different shapes differ"
     );
 }
+
+// -- 0.218.0: saved-selection caps, names, packing ---------------------------
+
+mod persist {
+    use std::sync::Arc;
+
+    use aurora_core::Rect;
+
+    use crate::{
+        DocError, MAX_SAVED_SELECTION_BYTES, MAX_SAVED_SELECTIONS, Selection, SelectionMask,
+        SelectionNameError, SelectionSet, SelectionShape, validate_selection_name,
+    };
+
+    fn r(x: i64, y: i64, width: u32, height: u32) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn mask_selection(width: u32, height: u32) -> Selection {
+        let bounds = r(1, 2, width, height);
+        let data: Vec<u8> = (0..bounds.area_px())
+            .map(|i| u8::try_from((i * 31) % 251).unwrap_or(0))
+            .collect();
+        match SelectionMask::new(bounds, data) {
+            Ok(mask) => Selection::from_mask(Arc::new(mask)),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn packing_a_mask_is_lossless_and_shrinks_runs() {
+        let flat = match SelectionMask::new(r(-3, 4, 200, 100), vec![255; 20_000]) {
+            Ok(m) => m,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let packed = flat.pack();
+        assert!(packed.packed_len() < 1_000, "{}", packed.packed_len());
+        assert_eq!(packed.bounds(), flat.bounds());
+        assert!(matches!(packed.unpack(), Ok(ref m) if *m == flat));
+        let noisy = mask_selection(37, 29);
+        let SelectionShape::Mask(mask) = &noisy.shape else {
+            unreachable!("a mask");
+        };
+        assert!(matches!(mask.pack().unpack(), Ok(ref m) if m == mask.as_ref()));
+    }
+
+    #[test]
+    fn saved_selections_are_capped_by_count_and_by_coverage_bytes() {
+        let mut set = SelectionSet::new();
+        set.select(Selection::new(r(0, 0, 2, 2)));
+        for i in 0..MAX_SAVED_SELECTIONS {
+            assert!(set.save_active(format!("s{i}")).is_ok());
+        }
+        assert!(matches!(
+            set.save_active("extra"),
+            Err(DocError::SavedSelectionsFull)
+        ));
+        assert!(
+            set.save_active("s3").is_ok(),
+            "a replaced name is not a new one"
+        );
+        assert_eq!(set.saved_count(), MAX_SAVED_SELECTIONS);
+
+        let mut set = SelectionSet::new();
+        // 2 x 64 Mpx = the whole 128 MiB; a third does not fit.
+        let big = mask_selection(8192, 8192);
+        set.select(big);
+        assert_eq!(MAX_SAVED_SELECTION_BYTES, 2 * 8192 * 8192);
+        assert!(set.save_active("a").is_ok());
+        assert!(set.save_active("b").is_ok());
+        assert!(matches!(
+            set.save_active("c"),
+            Err(DocError::SavedSelectionsTooLarge)
+        ));
+        assert!(
+            set.save_active("a").is_ok(),
+            "replacing does not double count"
+        );
+        assert_eq!(set.saved_mask_bytes(), MAX_SAVED_SELECTION_BYTES);
+    }
+
+    #[test]
+    fn from_parts_refuses_bad_and_repeated_names() {
+        let sel = Selection::new(r(0, 0, 2, 2));
+        let ok = SelectionSet::from_parts(None, vec![("a".to_owned(), sel.clone())]);
+        assert!(ok.is_ok_and(|s| s.saved_count() == 1));
+        for bad in ["", " a", "a ", "x\ty"] {
+            let r = SelectionSet::from_parts(None, vec![(bad.to_owned(), sel.clone())]);
+            assert!(matches!(r, Err(DocError::InvalidSelectionName)), "{bad:?}");
+        }
+        let dup = SelectionSet::from_parts(
+            None,
+            vec![("a".to_owned(), sel.clone()), ("a".to_owned(), sel)],
+        );
+        assert!(matches!(dup, Err(DocError::InvalidSelectionName)));
+    }
+
+    #[test]
+    fn names_are_trimmed_and_bounded() {
+        assert_eq!(validate_selection_name("  Sky  "), Ok("Sky".to_owned()));
+        assert_eq!(
+            validate_selection_name("  "),
+            Err(SelectionNameError::Empty)
+        );
+        assert_eq!(
+            validate_selection_name("a\u{202e}b"),
+            Err(SelectionNameError::InvalidCharacter)
+        );
+        assert!(validate_selection_name(&"é".repeat(64)).is_ok());
+        assert_eq!(
+            validate_selection_name(&"é".repeat(65)),
+            Err(SelectionNameError::TooLong)
+        );
+    }
+}
