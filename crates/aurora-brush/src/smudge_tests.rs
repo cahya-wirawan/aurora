@@ -823,3 +823,98 @@ fn an_unreadable_tile_refuses_the_dab_before_anything_is_written() {
     assert_eq!(out.failed().len(), 1);
     assert!(carry.is_empty(), "the carry is untouched by a refused dab");
 }
+
+/// Runs `dabs` as one stroke on a store holding a pattern block and
+/// compares every texel of `w` x `h` with the independent model.
+fn assert_stroke_matches_model(
+    blocks: &[(u32, u32, u32, u32)],
+    dims: (u32, u32),
+    dabs: &[(f32, f32)],
+    radius: f32,
+    strength: f32,
+) {
+    let (_dir, mut s) = store();
+    for block in blocks {
+        paint_pattern(&mut s, block.0, block.1, block.2, block.3);
+    }
+    let (w, h) = dims;
+    let mut grid: Vec<[f32; 4]> = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            grid.push(texel(&mut s, x, y).map(f16::to_f32));
+        }
+    }
+    let mut carry = SmudgeCarry::default();
+    for &c in dabs {
+        let _ = smudge(&mut s, &mut carry, c, radius, strength, None, None);
+    }
+    model_stroke(&mut grid, w as usize, dabs, radius, strength);
+    for y in 0..h {
+        for x in 0..w {
+            let want = grid[(y * w + x) as usize].map(|v| f16::from_f32(v).to_bits());
+            assert_eq!(
+                bits(texel(&mut s, x, y)),
+                want,
+                "strength {strength} texel ({x}, {y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_stroke_straddling_a_tile_edge_matches_the_model_with_both_tiles_present() {
+    // The block spans x 230..290 so tiles (0, 0) and (1, 0) both exist,
+    // and the dabs cross the x = 256 edge (their patches straddle it).
+    assert_eq!(TILE, 256, "the test is written for 256-texel tiles");
+    let dabs = [
+        (244.3_f32, 24.7_f32),
+        (249.9, 26.1),
+        (254.6, 27.8),
+        (258.2, 29.9),
+        (262.6, 31.0),
+        (267.5, 28.2),
+        (272.2, 24.4),
+    ];
+    for strength in [0.5_f32, 1.0] {
+        assert_stroke_matches_model(&[(230, 8, 60, 40)], (300, 56), &dabs, 9.0, strength);
+    }
+    // The neighbouring tile absent: the block stops at the edge, so nothing
+    // may leak into the empty column beyond it (tile (1, 0) never exists);
+    // a second block fills this tile's first columns, which an overrun
+    // read of the row would pick up instead.
+    assert_stroke_matches_model(
+        &[(230, 8, 26, 40), (0, 8, 6, 60)],
+        (300, 56),
+        &dabs,
+        9.0,
+        0.5,
+    );
+    // And across the horizontal edge (y = 256) with a vertical stroke.
+    let tall = [
+        (30.4_f32, 244.3_f32),
+        (31.9, 249.9),
+        (33.6, 254.6),
+        (34.2, 258.2),
+        (35.6, 262.6),
+        (36.5, 267.5),
+    ];
+    assert_stroke_matches_model(&[(10, 230, 40, 60)], (60, 300), &tall, 9.0, 0.5);
+}
+
+#[test]
+fn a_stroke_near_the_layer_origin_matches_the_model_including_negative_patch_texels() {
+    // Radius 9 at x/y < 8: the patch square reaches negative coordinates,
+    // which read as transparent and are never written.
+    let dabs = [
+        (3.2_f32, 2.7_f32),
+        (5.9, 4.1),
+        (7.4, 6.8),
+        (10.6, 8.0),
+        (14.5, 9.2),
+        (2.5, 12.4),
+        (0.5, 0.5),
+    ];
+    for strength in [0.25_f32, 0.5, 1.0] {
+        assert_stroke_matches_model(&[(0, 0, 40, 30)], (48, 40), &dabs, 9.0, strength);
+    }
+}
