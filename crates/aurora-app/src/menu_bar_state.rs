@@ -8,9 +8,9 @@
 //! menu is open switches to that one; `Left`/`Right` do the same from the
 //! keyboard (wrapping); `Escape` (the toolkit's `MenuCancelled`) closes it
 //! and focus returns to its title; a press anywhere else closes it
-//! ([`light_dismiss`]). A press on the canvas still reaches the canvas, as
+//! (`light_dismiss`). A press on the canvas still reaches the canvas, as
 //! for the other popovers. A modal (a dialog or the command palette)
-//! closes an open menu ([`close_for_modal`]) and no menu opens under one.
+//! closes an open menu (`close_for_modal`) and no menu opens under one.
 //!
 //! Alt+letter mnemonics are not implemented.
 
