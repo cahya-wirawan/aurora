@@ -546,6 +546,10 @@ mod clone_stamp;
 #[cfg(test)]
 mod clone_stamp_tests;
 mod colour_state;
+mod crop;
+mod crop_app;
+#[cfg(test)]
+mod crop_tests;
 mod document_close;
 mod document_session;
 mod document_tabs;
@@ -5639,6 +5643,8 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         ("o", AppCommand::SelectTool(aurora_ui::Tool::Dodge)),
         ("Shift+O", AppCommand::SelectTool(aurora_ui::Tool::Burn)),
         ("Shift+P", AppCommand::SelectTool(aurora_ui::Tool::Sponge)),
+        // 0.226.0: Photoshop's Crop key (bare, like the other tool letters).
+        ("c", AppCommand::SelectTool(aurora_ui::Tool::Crop)),
         // 0.209.0: Photoshop's grouped G key.
         ("g", AppCommand::SelectTool(aurora_ui::Tool::Gradient)),
         (
@@ -5837,6 +5843,9 @@ enum ActivatedCommand {
     Selection(selection_view::SelectionCommand),
     /// Choose the selection tools' mode button (0.215.0): palette only.
     SetSelectionMode(aurora_doc::SelectionMode),
+    /// Crop to Selection (0.226.0): palette, the Select menu (and the
+    /// macOS Edit menu).
+    CropToSelection,
     /// Select > Modify (0.216.0): open the number prompt of a command.
     RefinePrompt(selection_refine::RefineKind),
     /// Select > Modify (0.216.0): apply a command with the number the
@@ -6045,6 +6054,7 @@ const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
         aurora_ui::Tool::Dodge => "tool.dodge",
         aurora_ui::Tool::Burn => "tool.burn",
         aurora_ui::Tool::Sponge => "tool.sponge",
+        aurora_ui::Tool::Crop => "tool.crop",
     }
 }
 
@@ -6128,6 +6138,7 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_SELECT_DESELECT, "Deselect"),
         CommandEntry::new(COMMAND_SELECT_INVERSE, "Inverse Selection"),
         CommandEntry::new(quick_mask::COMMAND_ID, quick_mask::COMMAND_TITLE),
+        CommandEntry::new(crop::COMMAND_CROP_TO_SELECTION, crop::COMMAND_TITLE),
         CommandEntry::new(selection_store::COMMAND_SAVE, selection_store::SAVE_TITLE),
     ];
     // 0.216.0: Select > Modify.
@@ -6375,6 +6386,9 @@ fn activate_command(
     }
     if id == quick_mask::COMMAND_ID {
         return Some(ActivatedCommand::ToggleQuickMask);
+    }
+    if id == crop::COMMAND_CROP_TO_SELECTION {
+        return Some(ActivatedCommand::CropToSelection);
     }
     if let Some(command) = selection_store::command_for(id) {
         return Some(ActivatedCommand::SavedSelection(command));
@@ -8305,6 +8319,7 @@ fn status_info(
         notice: None,
         selection: None,
         quick_mask: false,
+        crop: None,
     }
 }
 
@@ -8324,11 +8339,13 @@ fn sync_status_bar(
         None,
         None,
         false,
+        None,
     )
 }
 
 /// [`sync_status_bar`] showing `notice` in place of the document readout
 /// while it is `Some` (0.198.0).
+#[allow(clippy::too_many_arguments)]
 fn sync_status_bar_notice(
     workspace: &mut aurora_ui::Workspace,
     view: &aurora_ui::CanvasView,
@@ -8337,12 +8354,14 @@ fn sync_status_bar_notice(
     notice: Option<&'static str>,
     selection: Option<aurora_doc::Selection>,
     quick_mask: bool,
+    crop: Option<aurora_core::Rect>,
 ) -> bool {
     let bar = workspace.status_bar;
     let mut info = status_info(view, canvas_size, scale_factor);
     info.notice = notice;
     info.selection = selection;
     info.quick_mask = quick_mask;
+    info.crop = crop;
     match aurora_ui::sync_status_bar(&mut workspace.tree, bar, &info) {
         Ok(changed) => changed,
         Err(err) => {
@@ -10094,6 +10113,12 @@ fn build_menu() -> muda::Menu {
                 true,
                 None,
             ),
+            &muda::MenuItem::with_id(
+                crop::COMMAND_CROP_TO_SELECTION,
+                crop::COMMAND_TITLE,
+                true,
+                None,
+            ),
             &muda::PredefinedMenuItem::separator(),
             &muda::MenuItem::with_id(
                 selection_refine::RefineKind::Feather.command_id(),
@@ -10371,6 +10396,10 @@ enum UndoKind {
     /// live in [`UndoOrder`] itself ([`SelectionStep`]), and it never
     /// touches the document's content or its unsaved-changes state.
     Selection,
+    /// A crop (0.226.0): its shift and canvas sizes live in [`UndoOrder`]
+    /// ([`crop::CropStep`]); its document half is one `Translate` step in
+    /// `aurora_doc::History`. It is a content change (dirty).
+    Crop,
 }
 
 use selection_history::SelectionStep;
@@ -10429,6 +10458,14 @@ struct UndoOrder {
     // `Some(None)` (deselect) differs from `None` (nothing pending).
     #[allow(clippy::option_option)]
     pending_selection: Option<Option<aurora_doc::Selection>>,
+    /// The crops behind the `Crop` tags of `undo` and `redo` (0.226.0), in
+    /// the same order (the newest on top).
+    crop_undo: Vec<crop::CropStep>,
+    crop_redo: Vec<crop::CropStep>,
+    /// What an undo or redo of crops has just put in force, for the owner
+    /// of the live document to take ([`crop::apply_pending_crop`]); shifts
+    /// of several steps in one History jump add up.
+    pending_crop: Option<crop::PendingCrop>,
 }
 
 /// A process-unique stamp for an [`UndoOrder`]'s state (0.156.0): drawn
@@ -10502,6 +10539,7 @@ fn default_step_label(kind: UndoKind) -> &'static str {
         UndoKind::Structural => "Layer Change",
         UndoKind::Pixel => "Pixel Edit",
         UndoKind::Selection => "Selection Change",
+        UndoKind::Crop => crop::CROP_LABEL,
     }
 }
 
@@ -10527,6 +10565,9 @@ impl Default for UndoOrder {
             selection_redo: Vec::new(),
             selection_budget: selection_history::system_budget_bytes(),
             pending_selection: None,
+            crop_undo: Vec::new(),
+            crop_redo: Vec::new(),
+            pending_crop: None,
         }
     }
 }
@@ -10676,6 +10717,90 @@ impl UndoOrder {
         }
     }
 
+    /// Records a committed crop as a step labelled "Crop" (0.226.0), after
+    /// its `Translate` step is in `history`.
+    fn record_crop(
+        &mut self,
+        step: crop::CropStep,
+        history: &mut aurora_doc::History,
+        pixel_history: &mut aurora_brush::PixelHistory,
+    ) {
+        self.record_labelled(
+            UndoKind::Crop,
+            crop::CROP_LABEL.to_owned(),
+            history,
+            pixel_history,
+        );
+        // After `record_labelled`, which clears the redo side.
+        self.crop_undo.push(step);
+    }
+
+    /// Whether the top of the `direction` side is a crop whose data is
+    /// there (checked before the document half is touched).
+    fn crop_step_ready(&self, direction: UndoDirection) -> bool {
+        match direction {
+            UndoDirection::Undo => {
+                self.undo.last() == Some(&UndoKind::Crop) && !self.crop_undo.is_empty()
+            }
+            UndoDirection::Redo => {
+                self.redo.last() == Some(&UndoKind::Crop) && !self.crop_redo.is_empty()
+            }
+        }
+    }
+
+    /// Moves the top crop step across (the bookkeeping half of an undo or
+    /// redo whose document half has just succeeded) and leaves its shift
+    /// and canvas size in [`Self::take_pending_crop`]. A selection target
+    /// still pending from an earlier step of the same jump is in the
+    /// coordinates before this crop's shift, so it is shifted too.
+    fn apply_crop_step(&mut self, direction: UndoDirection) -> bool {
+        if !self.crop_step_ready(direction) {
+            return false;
+        }
+        let (step, dx, dy, canvas) = match direction {
+            UndoDirection::Undo => {
+                let Some(step) = self.crop_undo.pop() else {
+                    return false;
+                };
+                (step, -step.dx, -step.dy, step.before)
+            }
+            UndoDirection::Redo => {
+                let Some(step) = self.crop_redo.pop() else {
+                    return false;
+                };
+                (step, step.dx, step.dy, step.after)
+            }
+        };
+        match direction {
+            UndoDirection::Undo => {
+                self.crop_redo.push(step);
+                self.step_back();
+            }
+            UndoDirection::Redo => {
+                self.crop_undo.push(step);
+                self.step_forward();
+            }
+        }
+        if let Some(Some(target)) = self.pending_selection.take() {
+            self.pending_selection = Some(target.translated(dx, dy).ok());
+        }
+        let (total_dx, total_dy) = self
+            .pending_crop
+            .map_or((0, 0), |pending| (pending.dx, pending.dy));
+        self.pending_crop = Some(crop::PendingCrop {
+            dx: total_dx.saturating_add(dx),
+            dy: total_dy.saturating_add(dy),
+            canvas,
+        });
+        true
+    }
+
+    /// What the last undo, redo or History jump of crops put in force,
+    /// once.
+    fn take_pending_crop(&mut self) -> Option<crop::PendingCrop> {
+        self.pending_crop.take()
+    }
+
     /// The selection the last undo or redo of a selection step put in
     /// force, once (`Some(None)` = deselect); the caller applies it to
     /// the document's live selection.
@@ -10728,7 +10853,9 @@ impl UndoOrder {
             UndoKind::Structural => history
                 .last_journal_description()
                 .unwrap_or_else(|| default_step_label(kind).to_owned()),
-            UndoKind::Pixel | UndoKind::Selection => default_step_label(kind).to_owned(),
+            UndoKind::Pixel | UndoKind::Selection | UndoKind::Crop => {
+                default_step_label(kind).to_owned()
+            }
         };
         self.record_labelled(kind, label, history, pixel_history);
     }
@@ -10757,6 +10884,7 @@ impl UndoOrder {
         self.redo.clear();
         self.redo_labels.clear();
         self.selection_redo.clear();
+        self.crop_redo.clear();
         history.clear_redo();
         pixel_history.clear_redo();
         self.revision = UndoRevision::next();
@@ -11032,6 +11160,7 @@ fn run_command(
 /// logged), in which case `undo_order` is untouched. **It refreshes no
 /// panel**: each caller refreshes once, so a jump across many steps
 /// rebuilds the History panel once rather than once per step.
+#[allow(clippy::too_many_lines)]
 fn step_undo_order(
     layers: &mut aurora_doc::LayerTree,
     history: &mut aurora_doc::History,
@@ -11092,6 +11221,22 @@ fn step_undo_order(
             Some(UndoKind::Selection) => undo_order
                 .apply_selection_step(UndoDirection::Undo)
                 .then_some(CompositeInvalidation::None),
+            Some(UndoKind::Crop) => {
+                if history.can_undo() && undo_order.crop_step_ready(UndoDirection::Undo) {
+                    match history.undo(layers) {
+                        Ok(_) => undo_order
+                            .apply_crop_step(UndoDirection::Undo)
+                            .then_some(CompositeInvalidation::Everything),
+                        Err(err) => {
+                            tracing::warn!(?err, "undoing a crop failed");
+                            None
+                        }
+                    }
+                } else {
+                    tracing::warn!("the undo order names a crop the document history lacks");
+                    None
+                }
+            }
             None => None,
         },
         UndoDirection::Redo => match undo_order.redo.last().copied() {
@@ -11130,6 +11275,22 @@ fn step_undo_order(
             Some(UndoKind::Selection) => undo_order
                 .apply_selection_step(UndoDirection::Redo)
                 .then_some(CompositeInvalidation::None),
+            Some(UndoKind::Crop) => {
+                if history.can_redo() && undo_order.crop_step_ready(UndoDirection::Redo) {
+                    match history.redo(layers) {
+                        Ok(_) => undo_order
+                            .apply_crop_step(UndoDirection::Redo)
+                            .then_some(CompositeInvalidation::Everything),
+                        Err(err) => {
+                            tracing::warn!(?err, "redoing a crop failed");
+                            None
+                        }
+                    }
+                } else {
+                    tracing::warn!("the undo order names a crop the document history lacks");
+                    None
+                }
+            }
             None => None,
         },
     }
@@ -26096,6 +26257,16 @@ enum LockRefusal {
     /// A Select > Modify result is over the mask cap or the work budget
     /// (0.216.0).
     RefineTooLarge,
+    /// Crop to Selection with nothing (or only an inverted selection)
+    /// selected (0.226.0).
+    CropNeedsSelection,
+    /// The crop rectangle is the whole canvas (0.226.0).
+    CropNoChange,
+    /// The crop rectangle is empty or off the canvas (0.226.0).
+    CropDegenerate,
+    /// A crop would move a layer or mask out of the document's range
+    /// (0.226.0).
+    CropOutOfRange,
     /// Quick Mask (0.217.0): the document is over the 64 Mpx mask cap, so
     /// the mode is not entered.
     QuickMaskTooLarge,
@@ -26174,6 +26345,18 @@ impl LockRefusal {
             }
             LockRefusal::RefineTooLarge => {
                 "That selection is too large to modify in one step (over about 24 megapixels, or 64 megapixels once grown). Use a smaller selection or a smaller amount."
+            }
+            LockRefusal::CropNeedsSelection => {
+                "Make a rectangular selection first. Crop to Selection crops to the bounds of the selection you have."
+            }
+            LockRefusal::CropNoChange => {
+                "That crop is the whole canvas, so there is nothing to crop."
+            }
+            LockRefusal::CropDegenerate => {
+                "That crop has no area on the canvas. Drag a rectangle inside the canvas."
+            }
+            LockRefusal::CropOutOfRange => {
+                "This crop would move a layer further from the document origin than Aurora allows. Crop closer to the top-left, or move the layer first."
             }
             LockRefusal::QuickMaskTooLarge => {
                 "This document is too large for Quick Mask (over 64 megapixels)."
@@ -26341,6 +26524,13 @@ fn lock_refusal_applies(
             refusal,
             LockRefusal::RefineNeedsSelection | LockRefusal::RefineTooLarge
         )
+        || matches!(
+            refusal,
+            LockRefusal::CropNeedsSelection
+                | LockRefusal::CropNoChange
+                | LockRefusal::CropDegenerate
+                | LockRefusal::CropOutOfRange
+        )
         || (refusal == LockRefusal::QuickMaskToolUnavailable
             && quick_mask::tool_refusal(tool).is_some())
         || matches!(
@@ -26401,7 +26591,8 @@ impl ToolSettings {
             | aurora_ui::Tool::Pan
             | aurora_ui::Tool::Eyedropper
             | aurora_ui::Tool::Gradient
-            | aurora_ui::Tool::PaintBucket => None,
+            | aurora_ui::Tool::PaintBucket
+            | aurora_ui::Tool::Crop => None,
         }
     }
 
@@ -27412,6 +27603,8 @@ struct App {
     /// Quick Mask mode (0.217.0), `None` when off: the editable grid of
     /// the active document's selection ([`quick_mask`]).
     quick_mask: Option<quick_mask::QuickMaskMode>,
+    /// The Crop tool's rectangle and drag (0.226.0, [`crop`]).
+    crop: crop::CropState,
 }
 
 /// [`App`]'s caret-blink state (0.139.0), the inputs [`caret_step`]
@@ -27843,6 +28036,7 @@ impl App {
             },
             ants: selection_view::AntsState::new(std::time::Instant::now()),
             quick_mask: None,
+            crop: crop::CropState::default(),
         };
         // 0.173.0: the tab strip shows every startup document (several
         // after a crash recovery) with the active one selected.
@@ -28081,6 +28275,9 @@ impl App {
         if self.polygon_key_now(key) {
             return;
         }
+        if self.crop_key_now(key) {
+            return;
+        }
         // A key that reaches the shortcuts (an Undo, typically) ends a
         // live Curves drag first, so it undoes the drag rather than what
         // preceded it; its capture is dropped, so the rest of that drag
@@ -28188,6 +28385,7 @@ impl App {
             Some(ActivatedCommand::ToggleQuickMask) => self.toggle_quick_mask(),
             Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
             Some(ActivatedCommand::SetSelectionMode(mode)) => self.set_selection_mode(mode),
+            Some(ActivatedCommand::CropToSelection) => self.crop_to_selection(),
             Some(ActivatedCommand::RefinePrompt(kind)) => self.open_refine_prompt(kind),
             Some(ActivatedCommand::RefineApply(kind, amount)) => self.run_refine(kind, amount),
             Some(ActivatedCommand::SavedSelection(command)) => self.run_saved_selection(command),
@@ -30136,6 +30334,9 @@ impl App {
         let Some(canvas_point) = pointer_in_canvas(&self.workspace, position) else {
             return;
         };
+        if self.crop_pointer_moved(canvas_point) {
+            return;
+        }
         if let Some(drag) = self.drag.as_mut() {
             let erasing = matches!(drag, Drag::Eraser { .. });
             let dabs = continue_drag(
@@ -30381,6 +30582,12 @@ impl App {
         // Quick Mask (0.217.0): the fills and the selection tools do not
         // work on the mask; say so and do nothing.
         if button == PointerButton::Primary && self.quick_mask_refuses_tool(self.tool) {
+            return;
+        }
+        // The Crop tool (0.226.0): a drag makes, moves or resizes the
+        // rectangle; nothing is cropped until it is committed.
+        if self.tool == aurora_ui::Tool::Crop && button == PointerButton::Primary {
+            self.crop_press(canvas_point);
             return;
         }
         if self.tool == aurora_ui::Tool::Zoom && button == PointerButton::Primary {
@@ -31359,6 +31566,9 @@ impl App {
         }
         // A Polygonal Lasso outlives the click that added a vertex; a
         // freehand path's final mask is always exact.
+        if translate_pointer_button(button) == Some(PointerButton::Primary) {
+            self.crop_pointer_released();
+        }
         let ending = self.drag.take();
         let ending = lasso_tools::release_lasso(&mut self.drag, ending, &mut self.doc.selection);
         if let Some((start_doc, end_doc)) = released_gradient(ending.as_ref()) {
@@ -32543,6 +32753,7 @@ impl App {
     /// one having to remember. The Properties *body* is refreshed by those
     /// paths themselves ([`refresh_properties_panel`]).
     fn sync_tool_controls_now(&mut self) {
+        self.crop_drop_if_stale();
         self.sync_colours_now();
         self.sync_menu_bar_now();
         let captured = self.gallery_click.captured();
@@ -32662,6 +32873,7 @@ impl App {
             notice,
             self.doc.selection.active(),
             self.quick_mask.is_some(),
+            crop::status_rect(self.tool, &self.crop),
         ) {
             self.push_accessibility();
             self.needs_redraw = true;
@@ -32926,6 +33138,9 @@ impl App {
     /// force ([`selection_view::apply_pending_selection`]); every path that
     /// can step the unified undo order calls it.
     fn apply_pending_selection(&mut self) {
+        // A crop's shift first: a selection step undone in the same jump
+        // holds coordinates of its own era and replaces the shifted one.
+        self.apply_pending_crop_now();
         if selection_view::apply_pending_selection(
             &mut self.doc.undo_order,
             &mut self.doc.selection,
@@ -33033,7 +33248,7 @@ impl App {
             return false;
         };
         selection_view::outline_visible(
-            self.doc.selection.active(),
+            self.outline_selection(),
             self.doc.canvas_size,
             &self.doc.canvas_view,
             size,
@@ -33048,9 +33263,9 @@ impl App {
     fn sync_selection_outline_now(&mut self, now: std::time::Instant) {
         let step = self.ants_step(now);
         self.ants.drawn_phase = step.phase;
-        let runs = match canvas_area_logical_size(&self.workspace) {
+        let mut runs = match canvas_area_logical_size(&self.workspace) {
             Some(size) => aurora_ui::selection_outline_runs(
-                self.doc.selection.active(),
+                self.outline_selection(),
                 self.doc.canvas_size,
                 &self.doc.canvas_view,
                 size,
@@ -33059,6 +33274,8 @@ impl App {
             ),
             None => Vec::new(),
         };
+        // The Crop tool's handles sit on top of its outline (0.226.0).
+        runs.extend(self.crop_handle_runs_now());
         if let Err(err) = aurora_ui::sync_selection_outline(
             &mut self.workspace.tree,
             self.workspace.selection_outline,
@@ -33162,6 +33379,7 @@ impl App {
             self.lock_notice.map(|(why, _)| why.message()),
             self.doc.selection.active(),
             self.quick_mask.is_some(),
+            crop::status_rect(self.tool, &self.crop),
         ) {
             self.push_accessibility();
         }

@@ -94,7 +94,7 @@ pub const TOOL_GROUPS: [&[Tool]; 13] = [
     &[Tool::Move],
     &[Tool::MarqueeSelect, Tool::EllipticalMarquee],
     &[Tool::Lasso, Tool::PolygonalLasso],
-    &[Tool::MagicWand],
+    &[Tool::MagicWand, Tool::Crop],
     &[Tool::Zoom, Tool::Pan],
     &[Tool::Eyedropper],
     &[Tool::Brush, Tool::Pencil],
@@ -131,6 +131,7 @@ pub const fn tool_icon(tool: Tool) -> IconKind {
         Tool::Dodge => IconKind::Dodge,
         Tool::Burn => IconKind::Burn,
         Tool::Sponge => IconKind::Sponge,
+        Tool::Crop => IconKind::Crop,
         Tool::Gradient => IconKind::Gradient,
         Tool::PaintBucket => IconKind::PaintBucket,
     }
@@ -401,7 +402,7 @@ mod tests {
 
     /// The icon each tool must wear, written out independently of
     /// [`tool_icon`] so a mapped-to-the-wrong-tool slip fails.
-    const EXPECTED_ICONS: [(Tool, IconKind); 21] = [
+    const EXPECTED_ICONS: [(Tool, IconKind); 22] = [
         (Tool::Move, IconKind::Move),
         (Tool::MarqueeSelect, IconKind::Marquee),
         (Tool::EllipticalMarquee, IconKind::EllipseMarquee),
@@ -421,6 +422,7 @@ mod tests {
         (Tool::Dodge, IconKind::Dodge),
         (Tool::Burn, IconKind::Burn),
         (Tool::Sponge, IconKind::Sponge),
+        (Tool::Crop, IconKind::Crop),
         (Tool::Gradient, IconKind::Gradient),
         (Tool::PaintBucket, IconKind::PaintBucket),
     ];
@@ -522,6 +524,7 @@ mod tests {
             tool_description(Tool::Sponge),
             "Sponge tool, shortcut Shift+P"
         );
+        assert_eq!(tool_description(Tool::Crop), "Crop tool, shortcut C");
         assert_eq!(
             tool_description(Tool::Gradient),
             "Gradient tool, shortcut G"
@@ -736,7 +739,10 @@ mod tests {
             assert_eq!(at(Tool::Lasso).x + 32, at(Tool::PolygonalLasso).x);
             assert!(at(Tool::Lasso).y > at(Tool::EllipticalMarquee).y);
             assert!(at(Tool::MagicWand).y > at(Tool::Lasso).y);
-            assert!(at(Tool::Zoom).y > at(Tool::MagicWand).y);
+            // 0.226.0: the Crop shares the Magic Wand's row, right of it.
+            assert_eq!(at(Tool::Crop).y, at(Tool::MagicWand).y);
+            assert_eq!(at(Tool::MagicWand).x + 32, at(Tool::Crop).x);
+            assert!(at(Tool::Zoom).y > at(Tool::Crop).y);
             assert_eq!(at(Tool::Eyedropper).x, at(Tool::Move).x);
             assert!(at(Tool::Zoom).y > at(Tool::Move).y);
             assert!(at(Tool::Brush).y > at(Tool::Eyedropper).y);

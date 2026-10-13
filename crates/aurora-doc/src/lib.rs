@@ -25,6 +25,8 @@
 //! panels that turn a file-supplied layer name into an `accesskit` label
 //! go through; see its module's own doc comment.
 
+#[cfg(test)]
+mod crop_tests;
 mod error;
 mod history;
 mod layer;

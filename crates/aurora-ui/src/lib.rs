@@ -37,6 +37,7 @@
 
 pub mod canvas_view;
 pub mod colour_controls;
+pub mod crop_overlay;
 pub mod curves_controls;
 pub mod dock;
 pub mod document_tabs;
@@ -124,6 +125,7 @@ pub use colour_controls::{
     is_colour_control, open_colour_popover, swatch_colour, swatch_description, swatch_name,
     sync_colour_controls,
 };
+pub use crop_overlay::{CROP_HANDLE_COUNT, crop_handle_runs};
 pub use fill_controls::{
     FillControls, FillView, OPACITY_MAX, OPACITY_MIN, STRENGTH_MAX, STRENGTH_MIN, TOLERANCE_MAX,
     TOLERANCE_MIN, insert_fill_controls, is_fill_tool, opacity_readout_text, shown_fill_group,
@@ -170,9 +172,9 @@ pub use selection_outline::{
     DASH_LENGTH, MARCH_PERIOD, selection_outline_runs, sync_selection_outline,
 };
 pub use status_bar::{
-    QUICK_MASK_TEXT, STATUS_BAR_LABEL, StatusBar, StatusInfo, document_label_text, document_text,
-    insert_status_bar, physical_zoom, sample_format_text, selection_text, status_bar_text,
-    sync_status_bar, zoom_text,
+    QUICK_MASK_TEXT, STATUS_BAR_LABEL, StatusBar, StatusInfo, crop_text, document_label_text,
+    document_text, insert_status_bar, physical_zoom, sample_format_text, selection_text,
+    status_bar_text, sync_status_bar, zoom_text,
 };
 pub use tone_controls::{
     SPONGE_MODE_LABEL, TONE_RANGE_LABEL, ToneControls, has_tone_range, insert_tone_controls,

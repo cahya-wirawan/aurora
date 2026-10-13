@@ -97,6 +97,9 @@ pub struct StatusInfo {
     /// Quick Mask mode is on (0.217.0): the document label starts with
     /// [`QUICK_MASK_TEXT`].
     pub quick_mask: bool,
+    /// The Crop tool's rectangle while it has one (0.226.0): its readout
+    /// ([`crop_text`]) is appended to the document label.
+    pub crop: Option<aurora_core::Rect>,
 }
 
 /// The status bar's Quick Mask indicator (0.217.0).
@@ -184,6 +187,16 @@ pub fn selection_text(selection: &aurora_doc::Selection) -> String {
     }
 }
 
+/// The Crop tool's readout (0.226.0): `Crop: 10, 20, 300 × 200 px` (left,
+/// top, width, height in document pixels).
+#[must_use]
+pub fn crop_text(rect: &aurora_core::Rect) -> String {
+    format!(
+        "Crop: {}, {}, {} × {} px",
+        rect.x, rect.y, rect.width, rect.height
+    )
+}
+
 /// The document label's full text: the document readout, then the
 /// selection readout after ` · ` while one is active.
 #[must_use]
@@ -192,6 +205,10 @@ pub fn document_label_text(info: &StatusInfo) -> String {
     let text = match info.selection.as_ref() {
         Some(selection) => format!("{document} · {}", selection_text(selection)),
         None => document,
+    };
+    let text = match info.crop.as_ref() {
+        Some(rect) => format!("{text} · {}", crop_text(rect)),
+        None => text,
     };
     if info.quick_mask {
         format!("{QUICK_MASK_TEXT} · {text}")
@@ -425,6 +442,7 @@ mod tests {
             notice: None,
             selection: None,
             quick_mask: false,
+            crop: None,
         };
         let bar = match insert_status_bar(&mut tree, root, &scales, &info) {
             Ok(bar) => bar,
@@ -502,9 +520,11 @@ mod tests {
             notice: None,
             selection: None,
             quick_mask: false,
+            crop: None,
         };
         let on = StatusInfo {
             quick_mask: true,
+            crop: None,
             ..off.clone()
         };
         assert_eq!(QUICK_MASK_TEXT, "Quick Mask");
@@ -546,12 +566,14 @@ mod tests {
             notice: None,
             selection: None,
             quick_mask: false,
+            crop: None,
         };
         let base = "Document: 640 × 480 px · 16-bit float";
         assert_eq!(document_label_text(&info), base);
         let some = |selection| StatusInfo {
             selection: Some(selection),
             quick_mask: false,
+            crop: None,
             ..info
         };
         let plain = Selection::new(rect(10, 20, 300, 200));
@@ -608,5 +630,30 @@ mod tests {
             status_bar_text(&tree, bar).map(|(_, d)| d),
             Some(base.to_owned())
         );
+    }
+
+    #[test]
+    fn the_crop_readout_follows_the_document_and_selection_text() {
+        let rect = aurora_core::Rect {
+            x: 7,
+            y: 3,
+            width: 40,
+            height: 30,
+        };
+        assert_eq!(super::crop_text(&rect), "Crop: 7, 3, 40 × 30 px");
+        let info = StatusInfo {
+            zoom: 1.0,
+            scale_factor: 1.0,
+            document_size: (100, 80),
+            sample: aurora_tile::SAMPLE_FORMAT,
+            notice: None,
+            selection: None,
+            quick_mask: false,
+            crop: Some(rect),
+        };
+        let text = super::document_label_text(&info);
+        assert!(text.ends_with(" · Crop: 7, 3, 40 × 30 px"), "{text}");
+        let none = StatusInfo { crop: None, ..info };
+        assert!(!super::document_label_text(&none).contains("Crop"));
     }
 }
