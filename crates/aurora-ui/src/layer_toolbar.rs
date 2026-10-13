@@ -378,6 +378,16 @@ mod tests {
         }
     }
 
+    /// 0.219.0: the toolbar row is the `size.icon_button` token plus
+    /// `spacing.xxs` above and below (40 px by default, as before).
+    #[test]
+    fn the_toolbar_height_follows_the_icon_button_token() {
+        let mut scales = scales();
+        assert!((layer_toolbar_height(&scales) - 40.0).abs() < f32::EPSILON);
+        scales.size.icon_button = 36;
+        assert!((layer_toolbar_height(&scales) - 44.0).abs() < f32::EPSILON);
+    }
+
     fn state_of(
         ws: &crate::Workspace,
         action: LayerAction,

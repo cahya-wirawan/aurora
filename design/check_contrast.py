@@ -75,6 +75,10 @@ PAIRS = [
     ("icon.secondary on surface.raised", "icon.secondary", "surface.raised", 3.0, "UI graphic (icon)"),
     ("icon.secondary on surface.sunken", "icon.secondary", "surface.sunken", 3.0, "UI graphic (icon)"),
     ("icon.on_accent on accent.primary", "icon.on_accent", "accent.primary", 3.0, "UI graphic (icon)"),
+    # 0.219.0: the marching ants are two tones that must read against each
+    # other, so that at least one of them shows on any backdrop (WCAG 1.4.11
+    # graphical objects: 3:1). Pure white vs pure black is 21:1.
+    ("selection.ants_light on selection.ants_dark", "selection.ants_light", "selection.ants_dark", 3.0, "UI graphic (selection outline)"),
 ]
 
 # Not gated (informational only). (label, fg, bg, reason)

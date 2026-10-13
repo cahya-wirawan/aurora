@@ -10,20 +10,19 @@
 //! a click on a swatch, the swap button or the defaults button into the
 //! same commands the `X` and `D` shortcuts run.
 //!
-//! **Layout, all from existing tokens.** The pair sits in a fixed-height
+//! **Layout, from tokens.** The pair sits in a fixed-height
 //! group (`ColourControls::group`) whose four children are placed
 //! absolutely: the background swatch at `(spacing.md, spacing.md)`, the
-//! foreground swatch in front at `(0, 0)` (both `spacing.lg` square, so
-//! they overlap by `spacing.lg - spacing.md`), the swap button flush
+//! foreground swatch in front at `(0, 0)` (both `size.colour_swatch` square, 24 px, so
+//! they overlap by `size.colour_swatch - spacing.md`), the swap button flush
 //! right at the top and the defaults button flush left at the bottom
 //! (both small icon buttons, `spacing.md` icon plus `spacing.xxs` each
 //! side). The group's height is [`colour_group_height`]: the pair
-//! (`spacing.lg + spacing.md`) plus one small button row. At the default density that is 64 px, inside
+//! (`size.colour_swatch + spacing.md`) plus one small button row. At the default density that is 64 px, inside
 //! the strip's 64 px of content width ([`crate::tools_panel_width`] less
-//! its padding), so the panel stays 72 px wide. **No new token** was
-//! invented: the swatch side, overlap offset and group height are
-//! derived from `spacing.*` and `icon_button_side`; a dedicated pair of
-//! size tokens is a gap for the design owner to settle.
+//! its padding), so the panel stays 72 px wide. The swatch side is the
+//! `size.colour_swatch` token (0.219.0); the overlap offset and the group
+//! height are derived from `spacing.*` and `icon_button_side`.
 //!
 //! **Accessibility.** Every control has a node. A swatch is a
 //! `Role::ColorWell` named with its colour as text ("Foreground colour,
@@ -170,10 +169,11 @@ fn px(token: u32) -> f32 {
     token as f32
 }
 
-/// A swatch's side: `spacing.lg`.
+/// A swatch's side: the `size.colour_swatch` token (0.219.0, 24 px, what
+/// `spacing.lg` gave before).
 #[must_use]
 pub fn colour_swatch_side(scales: &Scales) -> f32 {
-    px(scales.spacing.lg)
+    px(scales.size.colour_swatch)
 }
 
 /// How far the background swatch is offset from the foreground one, on
@@ -557,9 +557,18 @@ mod tests {
     #[test]
     fn group_height_is_derived_from_tokens() {
         let s = scales();
-        let expected =
-            px(s.spacing.lg) + px(s.spacing.md) + widgets::icon_button_side(&s, IconSize::Small);
+        let expected = px(s.size.colour_swatch)
+            + px(s.spacing.md)
+            + widgets::icon_button_side(&s, IconSize::Small);
         assert!((colour_group_height(&s) - expected).abs() < f32::EPSILON);
+        // 0.219.0: the tokens reproduce the geometry drawn before them.
+        assert!((colour_swatch_side(&s) - 24.0).abs() < f32::EPSILON);
+        assert!((colour_group_height(&s) - 64.0).abs() < f32::EPSILON);
+        // And they follow the token, not `spacing.lg`.
+        let mut bigger = s.clone();
+        bigger.size.colour_swatch = 30;
+        assert!((colour_swatch_side(&bigger) - 30.0).abs() < f32::EPSILON);
+        assert!((colour_group_height(&bigger) - 70.0).abs() < f32::EPSILON);
     }
 
     #[test]

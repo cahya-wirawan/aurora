@@ -87,6 +87,18 @@ widgets are added, not grow one-off per component.
 | `state.warning` | Non-blocking warnings (e.g. lossy-save notice, PRD's itemized-warning requirement). |
 | `state.success` | Rare confirmation (e.g. save/export completed). |
 
+## Selection and Quick Mask
+
+Added in 0.219.0 (design owner Cahya's decision; the values were chosen by
+Claude on Cahya's delegation, not seen by eye). Identical in every built-in
+theme: the ants must read on any image, so they do not follow the surfaces.
+
+| Token | Meaning |
+|---|---|
+| `selection.ants_light` | The light dash of the marching-ants selection outline. Pure white (`hc.white`: the palette's only pure white; the `neutral` ramp ends at `#f5f5f6`). |
+| `selection.ants_dark` | The dark dash of the outline. Pure black (`hc.black`). The pair is gated at 3:1 against each other (21:1 as chosen); each is never gated against a surface, because the two tones together are what stay visible on any backdrop. |
+| `quick_mask.overlay` | The Quick Mask tint over the unselected area: a `{ color, alpha }` table like `state.hover_overlay`. `semantic.red.500` at `0.5`, Photoshop's red 50 %. The alpha is the tint's *maximum* (a fully excluded area); partial coverage draws proportionally less. Not contrast-gated (a tint, not content). |
+
 ## Explicitly not yet decided
 
 - A second accent hue / accent-family axis.

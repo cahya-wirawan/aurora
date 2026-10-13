@@ -3037,8 +3037,9 @@ fn paint_raised_panel(
 
 /// A selection outline's paint (0.212.0, `widgets::selection_outline`):
 /// every [`crate::widgets::OutlineRun`] of one tone merged into one flat
-/// mesh, the light tone in `text.primary` and the dark one in
-/// `surface.canvas`. The runs are physical pixels from the widget's
+/// mesh, the light tone in `selection.ants_light` and the dark one in
+/// `selection.ants_dark` (0.219.0; `text.primary` and `surface.canvas`
+/// before). The runs are physical pixels from the widget's
 /// origin; the mesh is in logical units, so each run lands on whole
 /// physical pixels at the frame's scale factor. Nothing for no runs.
 fn paint_selection_outline(
@@ -3057,8 +3058,8 @@ fn paint_selection_outline(
     let (origin_x, origin_y) = (bounds.x as f32, bounds.y as f32);
     let mut paints = tint_paints(state, origin_x, origin_y, theme, scale);
     for (tone, colour) in [
-        (OutlineTone::Light, theme.text.primary.to_srgb_f32()),
-        (OutlineTone::Dark, theme.surface.canvas.to_srgb_f32()),
+        (OutlineTone::Light, theme.selection.ants_light.to_srgb_f32()),
+        (OutlineTone::Dark, theme.selection.ants_dark.to_srgb_f32()),
     ] {
         let mut mesh = Mesh {
             vertices: Vec::new(),
@@ -3096,8 +3097,9 @@ fn paint_selection_outline(
 }
 
 /// The Quick Mask tint under a selection outline (0.217.0): one flat mesh
-/// per intensity level present, in `state.error` at
-/// `level / TINT_LEVELS * TINT_MAX_OPACITY`.
+/// per intensity level present, in the `quick_mask.overlay` colour at
+/// `level / TINT_LEVELS` of that token's alpha (0.219.0; `state.error` at
+/// a fixed 0.5 before).
 fn tint_paints(
     state: &crate::widgets::SelectionOutlineState,
     origin_x: f32,
@@ -3105,8 +3107,9 @@ fn tint_paints(
     theme: &Theme,
     scale: f32,
 ) -> Vec<Paint> {
-    use crate::widgets::{TINT_LEVELS, TINT_MAX_OPACITY};
-    let [red, green, blue] = theme.state.error.to_srgb_f32();
+    use crate::widgets::TINT_LEVELS;
+    let overlay = theme.quick_mask.overlay;
+    let [red, green, blue] = overlay.color.to_srgb_f32();
     let mut paints = Vec::new();
     for level in 1..=TINT_LEVELS {
         let mut mesh = Mesh {
@@ -3141,7 +3144,7 @@ fn tint_paints(
                 .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
         }
         if !mesh.indices.is_empty() {
-            let alpha = f32::from(level) / f32::from(TINT_LEVELS) * TINT_MAX_OPACITY;
+            let alpha = f32::from(level) / f32::from(TINT_LEVELS) * overlay.alpha;
             paints.push((mesh, [red, green, blue, alpha]));
         }
     }
@@ -3306,8 +3309,10 @@ mod tests {
         assert_eq!(set_selection_outline(&mut tree, id, runs).ok(), Some(false));
         let drawn = paints(&tree, 2.0);
         assert_eq!(drawn.len(), 2);
-        let [lr, lg, lb] = theme.text.primary.to_srgb_f32();
-        let [dr, dg, db] = theme.surface.canvas.to_srgb_f32();
+        let [lr, lg, lb] = theme.selection.ants_light.to_srgb_f32();
+        let [dr, dg, db] = theme.selection.ants_dark.to_srgb_f32();
+        assert_eq!([lr, lg, lb], [1.0, 1.0, 1.0], "pure white");
+        assert_eq!([dr, dg, db], [0.0, 0.0, 0.0], "pure black");
         assert_eq!(drawn[0].1, [lr, lg, lb, 1.0]);
         assert_eq!(drawn[1].1, [dr, dg, db, 1.0]);
         // Scale 2: a 4 physical px run is 2 logical wide, 1 px is 0.5.
@@ -3319,8 +3324,9 @@ mod tests {
         assert_ne!(drawn[0].1, drawn[1].1, "the two tones differ");
     }
 
-    /// 0.217.0: the Quick Mask tint paints one mesh per level in the
-    /// `state.error` token, alpha `level / 16 * 0.5`, beneath the ants.
+    /// 0.217.0: the Quick Mask tint paints one mesh per level, beneath the
+    /// ants. 0.219.0: in the `quick_mask.overlay` colour, alpha
+    /// `level / 16` of the token's alpha.
     #[test]
     #[allow(clippy::indexing_slicing, clippy::float_cmp)]
     fn a_selection_outline_tint_paints_one_mesh_per_level_under_the_ants() {
@@ -3360,9 +3366,11 @@ mod tests {
         assert_eq!(set_selection_tint(&mut tree, id, rects).ok(), Some(false));
         let drawn = paints(&tree, 2.0);
         assert_eq!(drawn.len(), 2, "level 0 paints nothing; two levels present");
-        let [r, g, b] = theme.state.error.to_srgb_f32();
-        assert_eq!(drawn[0].1, [r, g, b, 4.0 / f32::from(TINT_LEVELS) * 0.5]);
-        assert_eq!(drawn[1].1, [r, g, b, 0.5]);
+        let [r, g, b] = theme.quick_mask.overlay.color.to_srgb_f32();
+        let max = theme.quick_mask.overlay.alpha;
+        assert_eq!(max, 0.5);
+        assert_eq!(drawn[0].1, [r, g, b, 4.0 / f32::from(TINT_LEVELS) * max]);
+        assert_eq!(drawn[1].1, [r, g, b, max]);
         assert_eq!(
             drawn[1].0.vertices.len(),
             8,
@@ -3371,6 +3379,22 @@ mod tests {
         let xs: Vec<f32> = drawn[0].0.vertices.iter().map(|p| p.x).collect();
         assert_eq!(xs.iter().copied().fold(f32::MAX, f32::min), 10.0);
         assert_eq!(xs.iter().copied().fold(f32::MIN, f32::max), 13.0);
+        // The tint reads the token's colour and alpha, whatever they are
+        // (not `state.error`, not a fixed 0.5).
+        let mut other = theme;
+        other.quick_mask.overlay.color = Color {
+            r: 10,
+            g: 200,
+            b: 30,
+        };
+        other.quick_mask.overlay.alpha = 0.25;
+        let retinted = match paint_widget(&tree, id, &other, &scales(), 2.0) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let [r2, g2, b2] = other.quick_mask.overlay.color.to_srgb_f32();
+        assert_eq!(retinted[1].1, [r2, g2, b2, 0.25]);
+        assert_eq!(retinted[0].1, [r2, g2, b2, 4.0 / 16.0 * 0.25]);
         // The ants come after the tint.
         let run = OutlineRun {
             x: 0,
@@ -3384,7 +3408,7 @@ mod tests {
             Some(true)
         );
         let drawn = paints(&tree, 1.0);
-        let [lr, lg, lb] = theme.text.primary.to_srgb_f32();
+        let [lr, lg, lb] = theme.selection.ants_light.to_srgb_f32();
         assert_eq!(drawn.len(), 3);
         assert_eq!(drawn[2].1, [lr, lg, lb, 1.0]);
     }

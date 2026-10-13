@@ -11,21 +11,20 @@
 //! in one of two tones. An empty list paints nothing.
 //!
 //! **Paint** (`paint::paint_selection_outline`): every run of one tone is
-//! merged into one flat mesh, in `text.primary` and `surface.canvas`
-//! respectively, the two existing tokens that are the document's own
-//! maximum-contrast pair in every built-in theme (text on the canvas
-//! surface), so a dash of either shows on any backdrop. No token was added;
-//! see PLAN.md for the gap this leaves (a dedicated `selection.ants.*`
-//! pair is the design owner's call).
+//! merged into one flat mesh, in `selection.ants_light` and
+//! `selection.ants_dark` respectively (0.219.0, the design owner's tokens:
+//! pure white and pure black in every built-in theme, gated at 3:1 against
+//! each other), so a dash of either shows on any backdrop. Before 0.219.0
+//! the pair was `text.primary` and `surface.canvas`.
 //!
 //! **Tint (0.217.0, Quick Mask).** The same widget also carries a list of
 //! [`TintRect`]s: axis-aligned rectangles in the same physical-pixel space,
 //! each with an intensity `level` of `1..=`[`TINT_LEVELS`]. They paint
-//! beneath the ants as flat meshes in the `state.error` token at an opacity
-//! of `level / TINT_LEVELS` of [`TINT_MAX_OPACITY`] (one mesh per level
-//! present). An empty list paints nothing. No token was added: Photoshop's
-//! Quick Mask overlay is red at 50 %, and the design owner's call is a
-//! dedicated `quick_mask.overlay` colour (see PLAN.md).
+//! beneath the ants as flat meshes in the `quick_mask.overlay` token's
+//! colour (0.219.0: `semantic.red.500`; it was `state.error` before) at an
+//! opacity of `level / TINT_LEVELS` of that token's alpha (0.5, Photoshop's
+//! Quick Mask red at 50 %; one mesh per level present). An empty list
+//! paints nothing.
 //!
 //! **Accessibility**: AT-`hidden`, never focusable, no actions. The
 //! selection itself is announced through the status bar's text.
@@ -40,9 +39,9 @@ use crate::{WidgetError, WidgetId, WidgetTree};
 /// Which of the two ant colours a run is drawn in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutlineTone {
-    /// `text.primary`.
+    /// `selection.ants_light`.
     Light,
-    /// `surface.canvas`.
+    /// `selection.ants_dark`.
     Dark,
 }
 
@@ -59,9 +58,6 @@ pub struct OutlineRun {
 
 /// The number of tint intensity levels.
 pub const TINT_LEVELS: u8 = 16;
-
-/// The opacity of a tint at its full level: one half.
-pub const TINT_MAX_OPACITY: f32 = 0.5;
 
 /// One tinted rectangle in physical pixels relative to the widget's
 /// origin; `level` is `1..=`[`TINT_LEVELS`] (a larger one is clamped when
