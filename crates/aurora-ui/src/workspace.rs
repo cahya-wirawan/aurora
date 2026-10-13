@@ -466,6 +466,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
     };
     let initial = StatusInfo {
         selection: None,
+        quick_mask: false,
         zoom: crate::canvas_view::DEFAULT_ZOOM,
         scale_factor: 1.0,
         document_size: (0, 0),

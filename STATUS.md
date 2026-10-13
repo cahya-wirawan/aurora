@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-13, version 0.216.0.** This file is updated every round (every
+**As of 2026-10-13, version 0.217.0.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -115,6 +115,15 @@ golden-image tests are `#[ignore]`d.
   "Inverse Selection") that never marks the document unsaved. Selections are
   still not saved (`.aur`/PSD), are lost when the document closes, and the outline is
   not clipped to the document; nothing of this has been seen live or on the Mac.
+  Since 0.217.0 the selection can be painted: **Quick Mask** (`Q`, the palette or
+  the macOS Edit menu) turns it into an editable coverage grid over the document, the
+  unselected area tinted (`state.error`, up to 50 %); the Brush paints toward the
+  foreground's luminance and the Eraser toward the background's, never touching
+  layers; Gradient, Paint Bucket, the selection tools and the Select commands are
+  unavailable meanwhile; leaving is one undo step "Quick Mask" (all selected = no
+  selection, nothing selected = no selection with a notice). Mask strokes are not
+  individually undoable, the mode is not saved, and nothing of this has been seen
+  live or on the Mac.
   Since 0.216.0 the selection can be reshaped: **Feather, Expand, Contract, Smooth
   and Border Selection** (palette and the macOS Edit menu), each asking for a number
   of pixels in the palette's prompt (the last value is remembered for the session),

@@ -34,6 +34,9 @@ mod layer;
 // are re-exported at the crate root too, the same way every other
 // module's are.
 pub mod mask;
+mod quick_mask;
+#[cfg(test)]
+mod quick_mask_tests;
 mod selection;
 mod selection_build;
 #[cfg(test)]
@@ -60,6 +63,7 @@ pub use mask::{
     MASK_SURFACE_BIT, encode_mask_coverage_region, forget_mask_coverage, read_mask_coverage,
     write_mask_coverage, write_mask_coverage_region,
 };
+pub use quick_mask::{QuickMask, QuickMaskOutcome};
 pub use selection::{Selection, SelectionSet, SelectionShape};
 pub use selection_build::{
     COORDINATE_LIMIT, MAX_POLYGON_VERTICES, SUBSCANLINES, antialiased_mask, polygon_mask,

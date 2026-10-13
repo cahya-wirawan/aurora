@@ -94,7 +94,13 @@ pub struct StatusInfo {
     /// The active selection (0.212.0), if any: its readout is appended to
     /// the document label ([`selection_text`]) so it is announced with it.
     pub selection: Option<aurora_doc::Selection>,
+    /// Quick Mask mode is on (0.217.0): the document label starts with
+    /// [`QUICK_MASK_TEXT`].
+    pub quick_mask: bool,
 }
+
+/// The status bar's Quick Mask indicator (0.217.0).
+pub const QUICK_MASK_TEXT: &str = "Quick Mask";
 
 /// The physical zoom the status bar shows: the logical `zoom` times the
 /// window's `scale_factor`, so `1.0` is one document pixel per
@@ -183,9 +189,14 @@ pub fn selection_text(selection: &aurora_doc::Selection) -> String {
 #[must_use]
 pub fn document_label_text(info: &StatusInfo) -> String {
     let document = document_text(info.document_size, info.sample);
-    match info.selection.as_ref() {
+    let text = match info.selection.as_ref() {
         Some(selection) => format!("{document} · {}", selection_text(selection)),
         None => document,
+    };
+    if info.quick_mask {
+        format!("{QUICK_MASK_TEXT} · {text}")
+    } else {
+        text
     }
 }
 
@@ -413,6 +424,7 @@ mod tests {
             sample: SampleFormat::F16,
             notice: None,
             selection: None,
+            quick_mask: false,
         };
         let bar = match insert_status_bar(&mut tree, root, &scales, &info) {
             Ok(bar) => bar,
@@ -477,6 +489,42 @@ mod tests {
         );
     }
 
+    /// 0.217.0: Quick Mask mode prefixes the document label with
+    /// "Quick Mask" and reaches the bar, and leaving removes it.
+    #[test]
+    fn quick_mask_mode_is_announced_in_the_document_label() {
+        use super::{QUICK_MASK_TEXT, document_label_text};
+        let off = StatusInfo {
+            zoom: 1.0,
+            scale_factor: 1.0,
+            document_size: (10, 10),
+            sample: aurora_tile::SAMPLE_FORMAT,
+            notice: None,
+            selection: None,
+            quick_mask: false,
+        };
+        let on = StatusInfo {
+            quick_mask: true,
+            ..off.clone()
+        };
+        assert_eq!(QUICK_MASK_TEXT, "Quick Mask");
+        assert!(!document_label_text(&off).contains("Quick Mask"));
+        assert_eq!(
+            document_label_text(&on),
+            format!("Quick Mask · {}", document_label_text(&off))
+        );
+        let scales = test_scales();
+        let (mut tree, root) = aurora_widgets::widgets::new_tree(taffy::Style::default());
+        let bar = match insert_status_bar(&mut tree, root, &scales, &off) {
+            Ok(bar) => bar,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(sync_status_bar(&mut tree, bar, &on).ok(), Some(true));
+        assert!(status_bar_text(&tree, bar).is_some_and(|(_, d)| d.starts_with("Quick Mask")));
+        assert_eq!(sync_status_bar(&mut tree, bar, &off).ok(), Some(true));
+        assert!(status_bar_text(&tree, bar).is_some_and(|(_, d)| !d.contains("Quick Mask")));
+    }
+
     /// 0.212.0: the selection readout for none, a rectangle, an empty
     /// rectangle and an inverted selection, and that it reaches the bar.
     #[test]
@@ -497,11 +545,13 @@ mod tests {
             sample: SampleFormat::F16,
             notice: None,
             selection: None,
+            quick_mask: false,
         };
         let base = "Document: 640 × 480 px · 16-bit float";
         assert_eq!(document_label_text(&info), base);
         let some = |selection| StatusInfo {
             selection: Some(selection),
+            quick_mask: false,
             ..info
         };
         let plain = Selection::new(rect(10, 20, 300, 200));

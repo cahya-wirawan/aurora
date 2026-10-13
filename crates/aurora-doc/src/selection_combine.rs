@@ -245,7 +245,7 @@ fn cheap_result(
 
 /// Fills `buf` with `selection`'s effective coverage on row `y` from
 /// column `x0`.
-fn fill_effective_row(selection: &Selection, y: i64, x0: i64, buf: &mut [u8]) {
+pub(crate) fn fill_effective_row(selection: &Selection, y: i64, x0: i64, buf: &mut [u8]) {
     buf.fill(0);
     let b = &selection.bounds;
     if !b.is_empty() && y >= b.y && y < b.bottom() {

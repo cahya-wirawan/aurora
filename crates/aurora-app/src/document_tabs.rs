@@ -257,6 +257,7 @@ pub(crate) fn bind_active_document(cx: &mut SwitchContext<'_>) {
         cx.scale_factor,
         None,
         cx.doc.selection.active(),
+        false,
     );
 }
 

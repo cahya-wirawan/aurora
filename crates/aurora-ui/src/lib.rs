@@ -53,6 +53,7 @@ pub mod panel;
 pub mod panel_group;
 pub mod panel_strip;
 pub mod properties_panel;
+pub mod quick_mask_overlay;
 pub mod redock;
 pub mod selection_mode_controls;
 pub mod selection_outline;
@@ -148,6 +149,7 @@ pub use panel_strip::{
     panel_strip_shown,
 };
 pub use properties_panel::populate_properties_panel;
+pub use quick_mask_overlay::{MAX_TINT_RECTS, quick_mask_tint, sync_quick_mask_tint, tint_level};
 pub use redock::{
     PANEL_DRAG_THRESHOLD, PanelDrag, apply_dock_arrangement, apply_dock_arrangement_keeping_focus,
     dock_workspace_panel, drop_indicator_rect, drop_target_at, float_workspace_panel,
@@ -161,8 +163,9 @@ pub use selection_outline::{
     DASH_LENGTH, MARCH_PERIOD, selection_outline_runs, sync_selection_outline,
 };
 pub use status_bar::{
-    STATUS_BAR_LABEL, StatusBar, StatusInfo, document_label_text, document_text, insert_status_bar,
-    physical_zoom, sample_format_text, selection_text, status_bar_text, sync_status_bar, zoom_text,
+    QUICK_MASK_TEXT, STATUS_BAR_LABEL, StatusBar, StatusInfo, document_label_text, document_text,
+    insert_status_bar, physical_zoom, sample_format_text, selection_text, status_bar_text,
+    sync_status_bar, zoom_text,
 };
 pub use tool::Tool;
 pub use tool_controls::{
