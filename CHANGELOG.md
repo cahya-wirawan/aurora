@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.216.0] - 2026-10-13
+
+### Added
+
+- Add Feather, Expand, Contract, Smooth and Border selection commands
+
 ## [0.215.0] - 2026-10-13
 
 ### Added
