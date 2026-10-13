@@ -2976,3 +2976,546 @@ fn a_live_combination_over_the_cap_says_so_once_per_gesture() {
     rig.drag_to(&mut again, (160.0, 150.0));
     assert!(selection_modes::drag_refusal(again.as_ref()));
 }
+
+// ---- Quick Mask (0.217.0) ----
+
+use crate::colour_state::ColourState;
+use crate::quick_mask::{self, LeaveOutcome};
+use aurora_doc::QuickMaskOutcome;
+
+fn black_on_white() -> ColourState {
+    ColourState::default()
+}
+
+/// White over black: the Brush selects, the Eraser deselects.
+fn white_on_black() -> ColourState {
+    let mut c = ColourState::default();
+    assert!(c.swap());
+    c
+}
+
+impl Rig {
+    fn qm_enter(&self) -> quick_mask::QuickMaskMode {
+        match quick_mask::enter(self.selection.active().as_ref(), (400, 300)) {
+            Ok(mode) => mode,
+            Err(why) => unreachable!("{why:?}"),
+        }
+    }
+
+    /// A Brush or Eraser stroke in Quick Mask the way `App` runs one:
+    /// `begin_drag` with no layer, `paint_dab` per dab, `commit_ending_drag`.
+    /// Returns whether a history step was recorded (it must not be).
+    fn qm_stroke(
+        &mut self,
+        mode: &mut quick_mask::QuickMaskMode,
+        tool: Tool,
+        points: &[(f32, f32)],
+        colours: &ColourState,
+    ) -> bool {
+        let dab_tool = if tool == Tool::Eraser {
+            DabTool::Eraser
+        } else {
+            DabTool::Brush
+        };
+        let Some(&first) = points.first() else {
+            unreachable!("a stroke has points");
+        };
+        let mut drag = begin_drag(
+            tool,
+            PointerButton::Primary,
+            first,
+            &self.view,
+            quick_mask::drag_layer(
+                true,
+                tool,
+                crate::active_pixel_layer(&self.layers, Some(self.layer)),
+            ),
+        );
+        let press = match drag.as_ref() {
+            Some(
+                Drag::Brush {
+                    last_doc, stroke, ..
+                }
+                | Drag::Eraser {
+                    last_doc, stroke, ..
+                },
+            ) => {
+                assert!(stroke.is_none(), "no stroke snapshot in Quick Mask");
+                *last_doc
+            }
+            _ => unreachable!("a paint tool starts a stroke"),
+        };
+        let _ = quick_mask::paint_dab(mode, dab_tool, press, &self.settings, colours);
+        for &p in points.iter().skip(1) {
+            let bounds = pan_bounds(&self.layers, Some(self.layer), Some((1000.0, 800.0)));
+            let dabs = match drag.as_mut() {
+                Some(d) => continue_drag(
+                    d,
+                    p,
+                    &mut self.view,
+                    &mut self.selection,
+                    &self.settings,
+                    bounds,
+                ),
+                None => Vec::new(),
+            };
+            for dab in dabs {
+                let _ = quick_mask::paint_dab(mode, dab_tool, dab, &self.settings, colours);
+            }
+        }
+        commit_ending_drag(
+            drag,
+            &self.layers,
+            &mut self.history,
+            &mut self.pixel_history,
+            &mut self.undo_order,
+            &mut self.view,
+            Some(self.layer),
+            Some((1000.0, 800.0)),
+        )
+    }
+
+    fn qm_leave(&mut self, mode: &quick_mask::QuickMaskMode) -> LeaveOutcome {
+        quick_mask::leave(
+            mode,
+            &mut self.workspace,
+            &mut self.undo_order,
+            &mut self.history,
+            &mut self.pixel_history,
+            &mut self.selection,
+        )
+    }
+}
+
+fn fill_mask(mode: &mut quick_mask::QuickMaskMode, value: u8) {
+    mode.mask.edit(|data, _, _| {
+        data.fill(value);
+        Some(rect(0, 0, 1, 1))
+    });
+}
+
+#[test]
+fn luma_is_rec709_on_straight_srgb_with_clamping() {
+    assert_eq!(quick_mask::luma([0.0, 0.0, 0.0]), 0);
+    assert_eq!(quick_mask::luma([1.0, 1.0, 1.0]), 255);
+    assert_eq!(quick_mask::luma([0.5, 0.5, 0.5]), 128);
+    assert_eq!(quick_mask::luma([1.0, 0.0, 0.0]), 54);
+    assert_eq!(quick_mask::luma([0.0, 1.0, 0.0]), 182);
+    assert_eq!(quick_mask::luma([0.0, 0.0, 1.0]), 18);
+    assert_eq!(quick_mask::luma([2.0, 2.0, 2.0]), 255);
+    assert_eq!(quick_mask::luma([-1.0, -1.0, -1.0]), 0);
+    assert_eq!(quick_mask::luma([f32::NAN, 1.0, 1.0]), 201);
+}
+
+#[test]
+fn the_brush_pulls_toward_the_foreground_and_the_eraser_toward_the_background() {
+    let c = black_on_white();
+    assert_eq!(quick_mask::target_byte(DabTool::Brush, &c), 0);
+    assert_eq!(quick_mask::target_byte(DabTool::Eraser, &c), 255);
+    let c = white_on_black();
+    assert_eq!(quick_mask::target_byte(DabTool::Brush, &c), 255);
+    assert_eq!(quick_mask::target_byte(DabTool::Eraser, &c), 0);
+}
+
+#[test]
+fn entering_records_nothing_and_a_mask_stroke_never_touches_the_layer_or_history() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (50.0, 50.0), (250.0, 200.0));
+    let steps = rig.labels();
+    let tiles = rig.tiles();
+    let selection = rig.selection.active();
+    let mut mode = rig.qm_enter();
+    assert_eq!(rig.labels(), steps, "entering records nothing");
+    assert_eq!(
+        rig.selection.active(),
+        selection,
+        "nor changes the selection"
+    );
+    // Black foreground: the Brush deselects under the dab.
+    let recorded = rig.qm_stroke(
+        &mut mode,
+        Tool::Brush,
+        &[(100.5, 100.5), (160.5, 100.5)],
+        &black_on_white(),
+    );
+    assert!(!recorded, "no pixel-history step");
+    assert_eq!(rig.labels(), steps);
+    assert_eq!(rig.tiles(), tiles, "the layer gained no tile");
+    assert_eq!(rig.alpha(100, 100), 0.0);
+    assert_eq!(mode.mask.byte_at(100, 100), 0);
+    assert!(mode.mask.byte_at(140, 100) <= 2, "along the stroke");
+    assert_eq!(mode.mask.byte_at(100, 150), 255, "untouched stays selected");
+    assert_eq!(rig.selection.active(), selection, "the selection waits");
+}
+
+#[test]
+fn the_eraser_in_quick_mask_pulls_toward_the_background_not_the_layer() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    // Layer has real pixels the Eraser would remove.
+    rig.rect_fill(0, 0, 400, 300, [1.0, 0.0, 0.0, 1.0]);
+    let before = rig.alpha(100, 100);
+    let mut mode = rig.qm_enter();
+    fill_mask(&mut mode, 0);
+    // Default colours: background white -> the Eraser selects.
+    let recorded = rig.qm_stroke(
+        &mut mode,
+        Tool::Eraser,
+        &[(100.5, 100.5)],
+        &black_on_white(),
+    );
+    assert!(!recorded);
+    assert_eq!(mode.mask.byte_at(100, 100), 255);
+    assert_eq!(rig.alpha(100, 100), before, "layer pixels unchanged");
+}
+
+#[test]
+fn a_dab_footprint_matches_the_layer_brushs_within_one_byte() {
+    // The same dab on a blank layer (alpha = falloff, white) and on a zero
+    // grid pulled toward 255: every texel agrees within one byte.
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut mode = rig.qm_enter();
+    fill_mask(&mut mode, 0);
+    let _ = rig.qm_stroke(&mut mode, Tool::Brush, &[(150.3, 120.7)], &white_on_black());
+    let _ = rig.stroke(Tool::Brush, &[(150.3, 120.7)], false);
+    let mut painted = 0;
+    for y in 90..150_u32 {
+        for x in 120..180_u32 {
+            let layer = (rig.alpha(x, y) * 255.0).round() as i32;
+            let mask = i32::from(mode.mask.byte_at(i64::from(x), i64::from(y)));
+            assert!(
+                (layer - mask).abs() <= 1,
+                "({x},{y}) layer {layer} mask {mask}"
+            );
+            if mask > 0 {
+                painted += 1;
+            }
+        }
+    }
+    assert!(
+        painted > 1000,
+        "a radius-24 dab covers about 1800 texels: {painted}"
+    );
+}
+
+#[test]
+fn leaving_makes_one_undoable_step_that_restores_the_exact_previous_selection() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::EllipticalMarquee, (50.0, 50.0), (250.0, 200.0));
+    let first = rig.selection.active();
+    let mut mode = rig.qm_enter();
+    let _ = rig.qm_stroke(&mut mode, Tool::Brush, &[(150.5, 120.5)], &black_on_white());
+    assert_eq!(rig.qm_leave(&mode), LeaveOutcome::Applied);
+    let after = rig.selection.active();
+    assert_ne!(after, first);
+    assert_eq!(rig.labels().last().map(String::as_str), Some("Quick Mask"));
+    // The dab hole is deselected.
+    assert_eq!(
+        after.as_ref().map(|s| s.coverage_at(150, 120)),
+        Some(0.0),
+        "the painted hole"
+    );
+    assert!(rig.step(UndoDirection::Undo));
+    assert_eq!(rig.selection.active(), first, "undo restores it exactly");
+    assert!(rig.step(UndoDirection::Redo));
+    assert_eq!(rig.selection.active(), after, "redo returns the result");
+}
+
+#[test]
+fn an_unedited_grid_leaves_the_selection_and_history_alone() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    // A selection reaching past the document survives an unedited pass.
+    rig.selection
+        .select(Selection::new(rect(-50, -50, 700, 500)));
+    let before = rig.selection.active();
+    let steps = rig.labels();
+    let mode = rig.qm_enter();
+    assert_eq!(rig.qm_leave(&mode), LeaveOutcome::Unchanged);
+    assert_eq!(rig.selection.active(), before);
+    assert_eq!(rig.labels(), steps);
+}
+
+#[test]
+fn everything_selected_becomes_no_selection_and_nothing_selected_says_so() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (50.0, 50.0), (250.0, 200.0));
+    let first = rig.selection.active();
+    let mut mode = rig.qm_enter();
+    fill_mask(&mut mode, 255);
+    assert_eq!(rig.qm_leave(&mode), LeaveOutcome::Applied);
+    assert_eq!(rig.selection.active(), None, "all 255 is no selection");
+    assert!(rig.step(UndoDirection::Undo));
+    assert_eq!(rig.selection.active(), first);
+    let mut mode = rig.qm_enter();
+    fill_mask(&mut mode, 0);
+    assert_eq!(rig.qm_leave(&mode), LeaveOutcome::Emptied);
+    assert_eq!(
+        rig.selection.active(),
+        None,
+        "an empty selection is never stored"
+    );
+    assert!(
+        crate::LockRefusal::QuickMaskNothing
+            .message()
+            .contains("nothing")
+    );
+    assert!(rig.step(UndoDirection::Undo));
+    assert_eq!(rig.selection.active(), first);
+}
+
+#[test]
+fn a_quick_mask_step_never_dirties_the_document_and_jumps_apply_it() {
+    use std::collections::HashMap;
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (50.0, 50.0), (250.0, 200.0));
+    let first = rig.selection.active();
+    let content = rig.undo_order.content_revision;
+    let mut mode = rig.qm_enter();
+    let _ = rig.qm_stroke(&mut mode, Tool::Brush, &[(100.0, 100.0)], &black_on_white());
+    assert_eq!(rig.qm_leave(&mode), LeaveOutcome::Applied);
+    let second = rig.selection.active();
+    assert_eq!(rig.undo_order.content_revision, content);
+    let scales = match crate::load_scales() {
+        Ok(s) => s,
+        Err(err) => unreachable!("{err}"),
+    };
+    let mut cache = CompositeCache::default();
+    let mut layer_rows = HashMap::new();
+    let mut active = Some(rig.layer);
+    let mut state = crate::LayerControlsState::default();
+    let mut drag = None;
+    let mut focus = aurora_widgets::FocusManager::default();
+    for (target, expected) in [(1, &first), (2, &second)] {
+        let _ = crate::perform_history_jump(
+            &mut crate::HistoryJumpContext {
+                workspace: &mut rig.workspace,
+                focus: &mut focus,
+                scales: &scales,
+                layers: &mut rig.layers,
+                history: &mut rig.history,
+                pixel_history: &mut rig.pixel_history,
+                store: Some(&mut rig.store),
+                undo_order: &mut rig.undo_order,
+                composite_cache: &mut cache,
+                view: &mut rig.view,
+                layer_rows: &mut layer_rows,
+                active_layer: &mut active,
+                drag: &mut drag,
+                layer_controls: &mut state,
+            },
+            target,
+        );
+        selection_view::apply_pending_selection(&mut rig.undo_order, &mut rig.selection);
+        assert_eq!(&rig.selection.active(), expected, "jump to row {target}");
+    }
+}
+
+#[test]
+fn a_document_over_the_cap_is_refused_and_the_cap_itself_is_allowed() {
+    assert!(matches!(
+        quick_mask::enter(None, (8193, 8192)),
+        Err(crate::LockRefusal::QuickMaskTooLarge)
+    ));
+    assert!(matches!(
+        quick_mask::enter(None, (0, 10)),
+        Err(crate::LockRefusal::QuickMaskTooLarge)
+    ));
+    assert!(quick_mask::enter(None, (8192, 8192)).is_ok());
+    assert!(
+        crate::LockRefusal::QuickMaskTooLarge
+            .message()
+            .contains("64")
+    );
+}
+
+#[test]
+fn the_fills_and_selection_tools_are_refused_and_the_rest_work() {
+    for tool in Tool::ALL {
+        let refused = matches!(
+            tool,
+            Tool::Gradient
+                | Tool::PaintBucket
+                | Tool::MarqueeSelect
+                | Tool::EllipticalMarquee
+                | Tool::Lasso
+                | Tool::PolygonalLasso
+                | Tool::MagicWand
+        );
+        assert_eq!(
+            quick_mask::tool_refusal(tool),
+            refused.then_some(crate::LockRefusal::QuickMaskToolUnavailable),
+            "{tool:?}"
+        );
+    }
+    assert!(
+        crate::LockRefusal::QuickMaskToolUnavailable
+            .message()
+            .contains("Quick Mask")
+    );
+    // Lock gate and layer hand-over: only the mask tools are special.
+    assert!(quick_mask::skips_lock_gate(true, Tool::Brush));
+    assert!(quick_mask::skips_lock_gate(true, Tool::Eraser));
+    assert!(!quick_mask::skips_lock_gate(true, Tool::Move));
+    assert!(!quick_mask::skips_lock_gate(false, Tool::Brush));
+    assert_eq!(quick_mask::drag_layer(true, Tool::Brush, Some(1)), None);
+    assert_eq!(quick_mask::drag_layer(true, Tool::Move, Some(1)), Some(1));
+    assert_eq!(quick_mask::drag_layer(false, Tool::Brush, Some(1)), Some(1));
+}
+
+#[test]
+fn q_the_palette_and_the_menu_id_toggle_quick_mask() {
+    for meta in [false, true] {
+        let table = crate::default_shortcuts_for(meta);
+        assert_eq!(
+            table.resolve(KeyChord::new(Modifiers::none(), Key::Character('q'))),
+            Some(&AppCommand::ToggleQuickMask)
+        );
+    }
+    let commands = crate::palette_commands();
+    let Some(entry) = commands
+        .iter()
+        .find(|c| c.title == "Toggle Quick Mask Mode")
+    else {
+        unreachable!("the palette lists the command");
+    };
+    assert_eq!(entry.id, quick_mask::COMMAND_ID);
+    let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+    let mut focus = aurora_widgets::FocusManager::default();
+    let activated = crate::activate_command(
+        &mut workspace,
+        &mut focus,
+        &entry.id,
+        &mut crate::tests::FakeFileDialog::default(),
+    );
+    assert!(
+        matches!(activated, Some(crate::ActivatedCommand::ToggleQuickMask)),
+        "{activated:?}"
+    );
+}
+
+#[test]
+fn the_overlay_is_rebuilt_only_when_the_grid_the_view_or_the_sizes_change() {
+    let rig = Rig::new(rect(0, 0, 400, 300));
+    let mut mode = rig.qm_enter();
+    let view = CanvasView::new();
+    assert!(mode.tint_changed(&view, (800.0, 600.0), 1.0), "first build");
+    assert!(!mode.tint_changed(&view, (800.0, 600.0), 1.0));
+    assert!(mode.tint_changed(&view, (800.0, 601.0), 1.0), "canvas size");
+    assert!(mode.tint_changed(&view, (800.0, 601.0), 2.0), "scale");
+    let mut zoomed = CanvasView::new();
+    zoomed.zoom_at((0.0, 0.0), 2.0);
+    assert!(mode.tint_changed(&zoomed, (800.0, 601.0), 2.0), "view");
+    assert!(!mode.tint_changed(&zoomed, (800.0, 601.0), 2.0));
+    mode.mask.edit(|data, _, _| {
+        data.fill(0);
+        Some(rect(0, 0, 1, 1))
+    });
+    assert!(mode.tint_changed(&zoomed, (800.0, 601.0), 2.0), "grid edit");
+}
+
+#[test]
+fn the_selection_shapes_round_trip_through_enter_and_leave_with_an_edit() {
+    for shape in [
+        Selection::new(rect(20, 30, 150, 90)),
+        Selection::ellipse(rect(20, 30, 150, 90)),
+        Selection {
+            inverted: true,
+            ..Selection::new(rect(20, 30, 150, 90))
+        },
+    ] {
+        let mut rig = Rig::new(rect(0, 0, 400, 300));
+        rig.selection.select(shape.clone());
+        let mut mode = rig.qm_enter();
+        // An edit that changes nothing visible: a dab pulling a texel
+        // already at its target (selected) toward white... then force the
+        // version by a no-op rewrite of one byte.
+        mode.mask.edit(|data, _, _| {
+            data[0] = data[0].saturating_add(0);
+            Some(rect(0, 0, 1, 1))
+        });
+        let outcome = rig.qm_leave(&mode);
+        assert_eq!(outcome, LeaveOutcome::Applied);
+        let after = rig.selection.active().map(|s| {
+            (0..300_i64)
+                .flat_map(|y| (0..400_i64).map(move |x| (x, y)))
+                .map(|(x, y)| (s.coverage_at(x, y) * 255.0).round() as i32)
+                .collect::<Vec<_>>()
+        });
+        let want: Vec<i32> = (0..300_i64)
+            .flat_map(|y| (0..400_i64).map(move |x| (x, y)))
+            .map(|(x, y)| (shape.coverage_at(x, y) * 255.0).round() as i32)
+            .collect();
+        let after = after.unwrap_or_default();
+        assert_eq!(after.len(), want.len(), "{:?}", shape.shape);
+        assert!(
+            after.iter().zip(&want).all(|(a, b)| (a - b).abs() <= 1),
+            "{:?} inverted {}",
+            shape.shape,
+            shape.inverted
+        );
+    }
+    let _ = QuickMaskOutcome::Everything;
+}
+
+#[test]
+fn dab_cost_on_the_grid_is_small() {
+    // Dev-profile numbers are in PLAN.md; this only bounds them loosely.
+    // Dabs alternate between two spots so each does real work, with no
+    // grid fill inside the timed loop.
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut mode = rig.qm_enter();
+    fill_mask(&mut mode, 0);
+    let c = white_on_black();
+    let black = black_on_white();
+    for radius in [24.0_f32, 100.0] {
+        rig.settings.brush_radius = radius;
+        let start = std::time::Instant::now();
+        let n = 400_u32;
+        for i in 0..n {
+            let colours = if i % 2 == 0 { &c } else { &black };
+            let _ = quick_mask::paint_dab(
+                &mut mode,
+                DabTool::Brush,
+                (150.0 + (i % 7) as f32, 150.0),
+                &rig.settings,
+                colours,
+            );
+        }
+        let per = start.elapsed().as_micros() / u128::from(n);
+        eprintln!("quick mask dab radius {radius}: {per} us per dab");
+        assert!(per < 20_000, "{per} us");
+    }
+}
+
+#[test]
+fn entering_quick_mask_mid_stroke_commits_the_layer_stroke_first() {
+    let rig = Rig::new(rect(0, 0, 400, 300));
+    let layer_stroke = Some(Drag::Brush {
+        last_doc: (0.0, 0.0),
+        carry: 0.0,
+        stroke: Some(aurora_brush::StrokeSnapshot::new(rig.surface)),
+        warned: std::collections::HashSet::new(),
+    });
+    let mask_stroke = Some(Drag::Eraser {
+        last_doc: (0.0, 0.0),
+        carry: 0.0,
+        stroke: None,
+        warned: std::collections::HashSet::new(),
+    });
+    assert!(quick_mask::drag_needs_commit_before_enter(
+        layer_stroke.as_ref()
+    ));
+    assert!(!quick_mask::drag_needs_commit_before_enter(
+        mask_stroke.as_ref()
+    ));
+    assert!(!quick_mask::drag_needs_commit_before_enter(None));
+    assert!(!quick_mask::drag_needs_commit_before_enter(Some(
+        &Drag::Eyedropper
+    )));
+    // A mask stroke is dropped on leaving; a layer stroke is not.
+    let mut drag = mask_stroke;
+    quick_mask::drop_mask_stroke(&mut drag);
+    assert!(drag.is_none());
+    let mut drag = layer_stroke;
+    quick_mask::drop_mask_stroke(&mut drag);
+    assert!(drag.is_some());
+}

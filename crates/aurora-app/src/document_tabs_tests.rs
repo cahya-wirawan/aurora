@@ -95,6 +95,7 @@ struct Rig {
     layer_rows: HashMap<WidgetId, aurora_doc::LayerId>,
     scroll_follow: ScrollFollow,
     drag: Option<Drag>,
+    quick_mask: Option<crate::quick_mask::QuickMaskMode>,
     layer_controls: LayerControlsState,
     curves_ui: CurvesUiState,
     tool_controls: Option<aurora_ui::ToolControls>,
@@ -131,6 +132,7 @@ impl Rig {
             layer_rows,
             scroll_follow: ScrollFollow::default(),
             drag: None,
+            quick_mask: None,
             layer_controls,
             curves_ui: CurvesUiState::default(),
             tool_controls,
@@ -163,6 +165,7 @@ impl Rig {
             layer_rows: &mut self.layer_rows,
             scroll_follow: &mut self.scroll_follow,
             drag: &mut self.drag,
+            quick_mask: &mut self.quick_mask,
             layer_controls: &mut self.layer_controls,
             curves_ui: &mut self.curves_ui,
             tool_controls: self.tool_controls,
@@ -3293,4 +3296,146 @@ fn a_live_marquee_drag_is_recorded_when_the_document_is_left() {
     );
     crate::selection_view::apply_pending_selection(&mut doc.undo_order, &mut doc.selection);
     assert!(doc.selection.active().is_none());
+}
+
+// -- 0.217.0 fix: Quick Mask must survive the per-turn tab follower --
+
+/// An id no open document has.
+fn unknown_document_id() -> DocumentId {
+    let dir = tempdir();
+    let (other, _) = session("x", 1, [0.0; 4], &dir);
+    other.id
+}
+
+fn quick_mask_with_a_hole(doc: &DocumentSession) -> crate::quick_mask::QuickMaskMode {
+    let mut mode = match crate::quick_mask::enter(doc.selection.active().as_ref(), doc.canvas_size)
+    {
+        Ok(mode) => mode,
+        Err(why) => unreachable!("{why:?}"),
+    };
+    // Deselect a block: an edit, so leaving changes the selection.
+    mode.mask.edit(|data, w, _| {
+        for y in 10..20_usize {
+            for x in 10..20_usize {
+                if let Some(v) = data.get_mut(y * w as usize + x) {
+                    *v = 0;
+                }
+            }
+        }
+        Some(aurora_core::Rect {
+            x: 10,
+            y: 10,
+            width: 10,
+            height: 10,
+        })
+    });
+    mode
+}
+
+/// The per-loop-turn work `about_to_wait` does for tabs
+/// (`follow_document_tabs`, run every turn) must leave Quick Mask alone
+/// when no tab changed; a real switch leaves it and applies the grid to the
+/// OUTGOING document.
+#[test]
+fn quick_mask_survives_the_per_turn_follower_and_a_real_switch_applies_it_to_the_outgoing_document()
+{
+    let (dir_a, dir_b) = (tempdir(), tempdir());
+    let (a, _) = session("a.png", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b.psd", 1, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let mut rig = Rig::new(a);
+    let a_id = rig.doc.id;
+    let _ = rig.open(b);
+    let b_id = rig.doc.id;
+    rig.quick_mask = Some(quick_mask_with_a_hole(&rig.doc));
+    for _ in 0..50 {
+        assert_eq!(document_tabs::follow_document_tabs(&mut rig.cx(None)), None);
+        assert!(rig.quick_mask.is_some(), "the idle follower left the mode");
+    }
+    assert_eq!(rig.doc.id, b_id);
+    // A refused or no-op switch leaves it on too.
+    assert_eq!(rig.switch(b_id), SwitchOutcome::AlreadyActive);
+    assert_eq!(rig.switch(unknown_document_id()), SwitchOutcome::Unknown);
+    rig.blocked = true;
+    assert_eq!(rig.switch(a_id), SwitchOutcome::Blocked);
+    rig.blocked = false;
+    assert!(rig.quick_mask.is_some(), "a refused switch keeps the mode");
+    assert!(rig.doc.selection.active().is_none());
+    // The real switch: the mode ends and b (the outgoing one) gets the step.
+    assert_eq!(rig.switch(a_id), SwitchOutcome::Switched);
+    assert!(rig.quick_mask.is_none());
+    assert!(
+        rig.doc.selection.active().is_none(),
+        "the incoming document's selection is untouched"
+    );
+    let outgoing = rig.parked(b_id);
+    let applied = outgoing.selection.active();
+    assert_eq!(
+        applied.as_ref().map(|s| s.coverage_at(15, 15)),
+        Some(0.0),
+        "the grid became the outgoing document's selection"
+    );
+    assert_eq!(
+        outgoing.undo_order.history_steps().last().map(|s| s.label),
+        Some("Quick Mask")
+    );
+}
+
+/// New and Open (`activate_new_document`) and the quit path
+/// (`commit_live_gestures`) end the mode the same way, on the outgoing
+/// document.
+#[test]
+fn opening_a_document_ends_quick_mask_on_the_outgoing_one() {
+    let (dir_a, dir_b) = (tempdir(), tempdir());
+    let (a, _) = session("a.png", 1, [1.0, 0.0, 0.0, 1.0], &dir_a);
+    let (b, _) = session("b.psd", 1, [0.0, 0.0, 1.0, 1.0], &dir_b);
+    let mut rig = Rig::new(a);
+    let a_id = rig.doc.id;
+    rig.quick_mask = Some(quick_mask_with_a_hole(&rig.doc));
+    // A mask stroke in progress (no pixel snapshot) must not outlive the
+    // mode.
+    rig.drag = Some(Drag::Brush {
+        last_doc: (0.0, 0.0),
+        carry: 0.0,
+        stroke: None,
+        warned: HashSet::new(),
+    });
+    let _ = rig.open(b);
+    assert!(rig.drag.is_none(), "the mask stroke was dropped");
+    assert!(rig.quick_mask.is_none());
+    assert!(rig.doc.selection.active().is_none());
+    assert!(rig.parked(a_id).selection.active().is_some());
+}
+
+/// The decision lives in `commit_live_gestures`; `App`'s per-turn
+/// `follow_document_tabs_now`, `activate_document` and `about_to_wait`
+/// must not leave the mode themselves (the first version of 0.217.0 did, and
+/// so could never stay on).
+#[test]
+fn no_per_turn_app_hook_leaves_quick_mask_unconditionally() {
+    let source: String = include_str!("lib.rs")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for name in [
+        "fn follow_document_tabs_now(&mut self) {",
+        "fn activate_document(&mut self, raw: u64) {",
+        "fn about_to_wait(&mut self",
+        "fn redraw(&mut self) {",
+        "fn sync_status_bar_now(&mut self) {",
+    ] {
+        let start = source
+            .find(name)
+            .unwrap_or_else(|| unreachable!("{name} exists"));
+        let body = &source[start + name.len()..];
+        // Up to the next method of the impl.
+        let end = body.find(" fn ").unwrap_or(body.len());
+        assert!(
+            !body[..end].contains("leave_quick_mask"),
+            "{name} leaves Quick Mask"
+        );
+    }
+    // The only callers of the App-level leave are the toggle and a
+    // closing active document.
+    let calls = source.matches("self.leave_quick_mask(").count();
+    assert_eq!(calls, 2, "toggle_quick_mask and finish_close only");
 }

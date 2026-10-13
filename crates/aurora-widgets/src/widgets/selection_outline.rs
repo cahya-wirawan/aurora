@@ -18,6 +18,15 @@
 //! see PLAN.md for the gap this leaves (a dedicated `selection.ants.*`
 //! pair is the design owner's call).
 //!
+//! **Tint (0.217.0, Quick Mask).** The same widget also carries a list of
+//! [`TintRect`]s: axis-aligned rectangles in the same physical-pixel space,
+//! each with an intensity `level` of `1..=`[`TINT_LEVELS`]. They paint
+//! beneath the ants as flat meshes in the `state.error` token at an opacity
+//! of `level / TINT_LEVELS` of [`TINT_MAX_OPACITY`] (one mesh per level
+//! present). An empty list paints nothing. No token was added: Photoshop's
+//! Quick Mask overlay is red at 50 %, and the design owner's call is a
+//! dedicated `quick_mask.overlay` colour (see PLAN.md).
+//!
 //! **Accessibility**: AT-`hidden`, never focusable, no actions. The
 //! selection itself is announced through the status bar's text.
 
@@ -48,10 +57,29 @@ pub struct OutlineRun {
     pub tone: OutlineTone,
 }
 
-/// A selection outline's state: the dashes to draw.
+/// The number of tint intensity levels.
+pub const TINT_LEVELS: u8 = 16;
+
+/// The opacity of a tint at its full level: one half.
+pub const TINT_MAX_OPACITY: f32 = 0.5;
+
+/// One tinted rectangle in physical pixels relative to the widget's
+/// origin; `level` is `1..=`[`TINT_LEVELS`] (a larger one is clamped when
+/// painted, `0` paints nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TintRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub level: u8,
+}
+
+/// A selection outline's state: the dashes to draw, and the tint beneath.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SelectionOutlineState {
     runs: Vec<OutlineRun>,
+    tint: Vec<TintRect>,
 }
 
 impl SelectionOutlineState {
@@ -59,6 +87,12 @@ impl SelectionOutlineState {
     #[must_use]
     pub fn runs(&self) -> &[OutlineRun] {
         &self.runs
+    }
+
+    /// The tinted rectangles (Quick Mask), in no particular order.
+    #[must_use]
+    pub fn tint(&self) -> &[TintRect] {
+        &self.tint
     }
 }
 
@@ -132,6 +166,30 @@ pub fn set_selection_outline(
     match tree.payload_mut(id) {
         Some(WidgetKind::SelectionOutline(state)) => {
             state.runs = runs;
+            Ok(true)
+        }
+        Some(_) => Err(WidgetError::WrongWidgetKind(id)),
+        None => Err(WidgetError::UnknownWidget(id)),
+    }
+}
+
+/// Replaces the tint rectangles. Returns whether anything changed. No
+/// relayout is needed.
+///
+/// # Errors
+///
+/// As [`selection_outline_state`].
+pub fn set_selection_tint(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    rects: Vec<TintRect>,
+) -> Result<bool, WidgetError> {
+    if selection_outline_state(tree, id)?.tint == rects {
+        return Ok(false);
+    }
+    match tree.payload_mut(id) {
+        Some(WidgetKind::SelectionOutline(state)) => {
+            state.tint = rects;
             Ok(true)
         }
         Some(_) => Err(WidgetError::WrongWidgetKind(id)),

@@ -52,6 +52,7 @@ mod coverage;
 mod coverage_tests;
 mod dab;
 mod fill;
+mod mask_dab;
 mod stamp;
 #[cfg(test)]
 mod test_support;
@@ -66,6 +67,7 @@ pub use fill::{
     MAX_FILL_TILES, WandRegion, flood_fill, flood_fill_covered, gradient_fill,
     gradient_fill_covered, wand_region,
 };
+pub use mask_dab::{dab_falloff, stamp_toward};
 pub use stamp::{
     DabOutcome, erase_dab, erase_dab_covered, stamp_dab, stamp_dab_covered,
     stamp_dab_preserving_alpha, stamp_dab_preserving_alpha_covered, touched_tiles,

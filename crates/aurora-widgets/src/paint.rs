@@ -3055,7 +3055,7 @@ fn paint_selection_outline(
     };
     #[allow(clippy::cast_precision_loss)]
     let (origin_x, origin_y) = (bounds.x as f32, bounds.y as f32);
-    let mut paints = Vec::new();
+    let mut paints = tint_paints(state, origin_x, origin_y, theme, scale);
     for (tone, colour) in [
         (OutlineTone::Light, theme.text.primary.to_srgb_f32()),
         (OutlineTone::Dark, theme.surface.canvas.to_srgb_f32()),
@@ -3090,6 +3090,59 @@ fn paint_selection_outline(
         if !mesh.indices.is_empty() {
             let [red, green, blue] = colour;
             paints.push((mesh, [red, green, blue, 1.0]));
+        }
+    }
+    paints
+}
+
+/// The Quick Mask tint under a selection outline (0.217.0): one flat mesh
+/// per intensity level present, in `state.error` at
+/// `level / TINT_LEVELS * TINT_MAX_OPACITY`.
+fn tint_paints(
+    state: &crate::widgets::SelectionOutlineState,
+    origin_x: f32,
+    origin_y: f32,
+    theme: &Theme,
+    scale: f32,
+) -> Vec<Paint> {
+    use crate::widgets::{TINT_LEVELS, TINT_MAX_OPACITY};
+    let [red, green, blue] = theme.state.error.to_srgb_f32();
+    let mut paints = Vec::new();
+    for level in 1..=TINT_LEVELS {
+        let mut mesh = Mesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        };
+        for rect in state
+            .tint()
+            .iter()
+            .filter(|r| r.level.min(TINT_LEVELS) == level)
+        {
+            #[allow(clippy::cast_precision_loss)]
+            let (x0, y0) = (
+                origin_x + rect.x as f32 / scale,
+                origin_y + rect.y as f32 / scale,
+            );
+            #[allow(clippy::cast_precision_loss)]
+            let (x1, y1) = (
+                x0 + rect.width as f32 / scale,
+                y0 + rect.height as f32 / scale,
+            );
+            let Ok(base) = u32::try_from(mesh.vertices.len()) else {
+                break;
+            };
+            mesh.vertices.extend([
+                Point { x: x0, y: y0 },
+                Point { x: x1, y: y0 },
+                Point { x: x1, y: y1 },
+                Point { x: x0, y: y1 },
+            ]);
+            mesh.indices
+                .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        if !mesh.indices.is_empty() {
+            let alpha = f32::from(level) / f32::from(TINT_LEVELS) * TINT_MAX_OPACITY;
+            paints.push((mesh, [red, green, blue, alpha]));
         }
     }
     paints
@@ -3264,6 +3317,76 @@ mod tests {
         assert_eq!(xs.iter().copied().fold(f32::MIN, f32::max), 3.0);
         assert_eq!(ys.iter().copied().fold(f32::MIN, f32::max), 0.5);
         assert_ne!(drawn[0].1, drawn[1].1, "the two tones differ");
+    }
+
+    /// 0.217.0: the Quick Mask tint paints one mesh per level in the
+    /// `state.error` token, alpha `level / 16 * 0.5`, beneath the ants.
+    #[test]
+    #[allow(clippy::indexing_slicing, clippy::float_cmp)]
+    fn a_selection_outline_tint_paints_one_mesh_per_level_under_the_ants() {
+        use crate::widgets::{
+            OutlineRun, OutlineTone, TINT_LEVELS, TintRect, insert_selection_outline,
+            set_selection_outline, set_selection_tint,
+        };
+        let theme = dark_theme();
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let id = match insert_selection_outline(&mut tree, root) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(200.0, 100.0);
+        let paints = |tree: &WidgetTree<WidgetKind>, scale| match paint_widget(
+            tree,
+            id,
+            &theme,
+            &scales(),
+            scale,
+        ) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let rect = |x, level| TintRect {
+            x,
+            y: 4,
+            width: 6,
+            height: 2,
+            level,
+        };
+        let rects = vec![rect(0, 16), rect(10, 16), rect(20, 4), rect(30, 0)];
+        assert_eq!(
+            set_selection_tint(&mut tree, id, rects.clone()).ok(),
+            Some(true)
+        );
+        assert_eq!(set_selection_tint(&mut tree, id, rects).ok(), Some(false));
+        let drawn = paints(&tree, 2.0);
+        assert_eq!(drawn.len(), 2, "level 0 paints nothing; two levels present");
+        let [r, g, b] = theme.state.error.to_srgb_f32();
+        assert_eq!(drawn[0].1, [r, g, b, 4.0 / f32::from(TINT_LEVELS) * 0.5]);
+        assert_eq!(drawn[1].1, [r, g, b, 0.5]);
+        assert_eq!(
+            drawn[1].0.vertices.len(),
+            8,
+            "two rectangles at the top level"
+        );
+        let xs: Vec<f32> = drawn[0].0.vertices.iter().map(|p| p.x).collect();
+        assert_eq!(xs.iter().copied().fold(f32::MAX, f32::min), 10.0);
+        assert_eq!(xs.iter().copied().fold(f32::MIN, f32::max), 13.0);
+        // The ants come after the tint.
+        let run = OutlineRun {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 1,
+            tone: OutlineTone::Light,
+        };
+        assert_eq!(
+            set_selection_outline(&mut tree, id, vec![run]).ok(),
+            Some(true)
+        );
+        let drawn = paints(&tree, 1.0);
+        let [lr, lg, lb] = theme.text.primary.to_srgb_f32();
+        assert_eq!(drawn.len(), 3);
+        assert_eq!(drawn[2].1, [lr, lg, lb, 1.0]);
     }
 
     /// A synthetic child of the real, committed Dark theme with

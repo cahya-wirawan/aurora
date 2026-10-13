@@ -555,6 +555,7 @@ mod prepared_pixels;
 mod psd_save;
 #[cfg(test)]
 mod psd_save_tests;
+mod quick_mask;
 mod selection_modes;
 mod selection_paint;
 #[cfg(test)]
@@ -5417,6 +5418,9 @@ enum AppCommand {
     SwapColours,
     /// Reset the colours to black over white (0.208.0), `D`.
     ResetColours,
+    /// Toggle Quick Mask mode (0.217.0), `Q`: handed back as
+    /// [`ActivatedCommand::ToggleQuickMask`] (the mode is `App` state).
+    ToggleQuickMask,
     /// Select All (0.212.0), `Primary+A`: the whole document.
     SelectAll,
     /// Deselect (0.212.0), `Primary+D`.
@@ -5506,6 +5510,8 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         // 0.208.0: Photoshop's colour keys, bare like the tool letters.
         ("x", AppCommand::SwapColours),
         ("d", AppCommand::ResetColours),
+        // 0.217.0: Photoshop's Quick Mask key, bare like the tool letters.
+        ("q", AppCommand::ToggleQuickMask),
         // 0.212.0: Photoshop's Select menu chords. A focused text field
         // takes `Primary+A` first (`route_widget_key`), never reaching here.
         ("Primary+A", AppCommand::SelectAll),
@@ -5686,6 +5692,8 @@ enum ActivatedCommand {
     /// Reset the colours to black over white (0.208.0): `D`, the palette
     /// and the Tools panel's defaults button.
     ResetColours,
+    /// Toggle Quick Mask mode (0.217.0): `Q`, the palette, the Select menu.
+    ToggleQuickMask,
     /// Select All / Deselect / Inverse (0.212.0): `App` state, so handed
     /// back like the colour commands.
     Selection(selection_view::SelectionCommand),
@@ -5975,6 +5983,7 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_SELECT_ALL, "Select All"),
         CommandEntry::new(COMMAND_SELECT_DESELECT, "Deselect"),
         CommandEntry::new(COMMAND_SELECT_INVERSE, "Inverse Selection"),
+        CommandEntry::new(quick_mask::COMMAND_ID, quick_mask::COMMAND_TITLE),
     ];
     // 0.216.0: Select > Modify.
     commands.extend(
@@ -6218,6 +6227,9 @@ fn activate_command(
     }
     if let Some(kind) = selection_refine::RefineKind::for_command(id) {
         return Some(ActivatedCommand::RefinePrompt(kind));
+    }
+    if id == quick_mask::COMMAND_ID {
+        return Some(ActivatedCommand::ToggleQuickMask);
     }
     if id == COMMAND_SELECT_ALL {
         return Some(ActivatedCommand::Selection(
@@ -8124,6 +8136,7 @@ fn status_info(
         sample: aurora_tile::SAMPLE_FORMAT,
         notice: None,
         selection: None,
+        quick_mask: false,
     }
 }
 
@@ -8135,7 +8148,15 @@ fn sync_status_bar(
     canvas_size: (u32, u32),
     scale_factor: f64,
 ) -> bool {
-    sync_status_bar_notice(workspace, view, canvas_size, scale_factor, None, None)
+    sync_status_bar_notice(
+        workspace,
+        view,
+        canvas_size,
+        scale_factor,
+        None,
+        None,
+        false,
+    )
 }
 
 /// [`sync_status_bar`] showing `notice` in place of the document readout
@@ -8147,11 +8168,13 @@ fn sync_status_bar_notice(
     scale_factor: f64,
     notice: Option<&'static str>,
     selection: Option<aurora_doc::Selection>,
+    quick_mask: bool,
 ) -> bool {
     let bar = workspace.status_bar;
     let mut info = status_info(view, canvas_size, scale_factor);
     info.notice = notice;
     info.selection = selection;
+    info.quick_mask = quick_mask;
     match aurora_ui::sync_status_bar(&mut workspace.tree, bar, &info) {
         Ok(changed) => changed,
         Err(err) => {
@@ -9865,6 +9888,12 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(COMMAND_SELECT_ALL, "Select All", true, None),
             &muda::MenuItem::with_id(COMMAND_SELECT_DESELECT, "Deselect", true, None),
             &muda::MenuItem::with_id(COMMAND_SELECT_INVERSE, "Inverse Selection", true, None),
+            &muda::MenuItem::with_id(
+                quick_mask::COMMAND_ID,
+                quick_mask::COMMAND_TITLE,
+                true,
+                None,
+            ),
             &muda::PredefinedMenuItem::separator(),
             &muda::MenuItem::with_id(
                 selection_refine::RefineKind::Feather.command_id(),
@@ -10715,13 +10744,12 @@ fn run_command(
         AppCommand::NextDocument | AppCommand::PreviousDocument | AppCommand::CloseDocument |
         // Handed back as `ActivatedCommand::Selection` by `handle_key`
         // (the selection is `App` state); not pixels either way.
-        AppCommand::SelectAll | AppCommand::Deselect | AppCommand::InverseSelection => {
+        AppCommand::SelectAll | AppCommand::Deselect | AppCommand::InverseSelection |
+        // The colours and Quick Mask are `App` state too (handed back as
+        // `ActivatedCommand::{SwapColours, ResetColours, ToggleQuickMask}`).
+        AppCommand::SwapColours | AppCommand::ResetColours | AppCommand::ToggleQuickMask => {
             CompositeInvalidation::None
         }
-        // Handed back as `ActivatedCommand::{SwapColours, ResetColours}`
-        // by `handle_key` (the colours are `App` state, not this
-        // function's); not document state either way.
-        AppCommand::SwapColours | AppCommand::ResetColours => CompositeInvalidation::None,
     }
 }
 
@@ -11264,6 +11292,9 @@ fn handle_key(
         }
         if command == AppCommand::ResetColours {
             return Some(ActivatedCommand::ResetColours);
+        }
+        if command == AppCommand::ToggleQuickMask {
+            return Some(ActivatedCommand::ToggleQuickMask);
         }
         if let Some(selection_command) = selection_view::SelectionCommand::from_app(command) {
             // A focused text field keeps the keyboard: these chords never
@@ -25652,6 +25683,16 @@ enum LockRefusal {
     /// A Select > Modify result is over the mask cap or the work budget
     /// (0.216.0).
     RefineTooLarge,
+    /// Quick Mask (0.217.0): the document is over the 64 Mpx mask cap, so
+    /// the mode is not entered.
+    QuickMaskTooLarge,
+    /// Quick Mask (0.217.0): a tool that does not work on the mask.
+    QuickMaskToolUnavailable,
+    /// Quick Mask (0.217.0): a Select command while the mode is on.
+    QuickMaskLeaveFirst,
+    /// Quick Mask (0.217.0): leaving selected nothing, so there is no
+    /// selection.
+    QuickMaskNothing,
     /// An undo or redo could not read the step's saved data back (0.210.0:
     /// a pixel-history spill file a temp-file cleaner removed, or a corrupt
     /// one). Not a lock; the step stays in the History panel.
@@ -25692,6 +25733,18 @@ impl LockRefusal {
             }
             LockRefusal::RefineTooLarge => {
                 "That selection is too large to modify in one step (over about 24 megapixels, or 64 megapixels once grown). Use a smaller selection or a smaller amount."
+            }
+            LockRefusal::QuickMaskTooLarge => {
+                "This document is too large for Quick Mask (over 64 megapixels)."
+            }
+            LockRefusal::QuickMaskToolUnavailable => {
+                "Not available in Quick Mask. Paint the mask with the Brush or Eraser, or press Q to leave."
+            }
+            LockRefusal::QuickMaskLeaveFirst => {
+                "Not available in Quick Mask. Press Q to leave Quick Mask first."
+            }
+            LockRefusal::QuickMaskNothing => {
+                "Quick Mask selected nothing, so there is no selection."
             }
             LockRefusal::HistoryUnavailable => {
                 "Couldn't undo or redo: history file unavailable. A temp-file cleaner may have removed it; the step stays in the list."
@@ -25786,6 +25839,14 @@ fn lock_refusal_applies(
         || matches!(
             refusal,
             LockRefusal::RefineNeedsSelection | LockRefusal::RefineTooLarge
+        )
+        || (refusal == LockRefusal::QuickMaskToolUnavailable
+            && quick_mask::tool_refusal(tool).is_some())
+        || matches!(
+            refusal,
+            LockRefusal::QuickMaskTooLarge
+                | LockRefusal::QuickMaskLeaveFirst
+                | LockRefusal::QuickMaskNothing
         )
 }
 
@@ -26809,6 +26870,9 @@ struct App {
     caret: CaretState,
     /// The selection's marching ants clock (0.212.0).
     ants: selection_view::AntsState,
+    /// Quick Mask mode (0.217.0), `None` when off: the editable grid of
+    /// the active document's selection ([`quick_mask`]).
+    quick_mask: Option<quick_mask::QuickMaskMode>,
 }
 
 /// [`App`]'s caret-blink state (0.139.0), the inputs [`caret_step`]
@@ -27221,6 +27285,7 @@ impl App {
                 reduced_motion,
             },
             ants: selection_view::AntsState::new(std::time::Instant::now()),
+            quick_mask: None,
         };
         // 0.173.0: the tab strip shows every startup document (several
         // after a crash recovery) with the active one selected.
@@ -27525,6 +27590,7 @@ impl App {
             Some(ActivatedCommand::SwapColours) => self.swap_colours(),
             Some(ActivatedCommand::ResetColours) => self.reset_colours(),
             Some(ActivatedCommand::Selection(command)) => self.run_selection_command(command),
+            Some(ActivatedCommand::ToggleQuickMask) => self.toggle_quick_mask(),
             Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
             Some(ActivatedCommand::SetSelectionMode(mode)) => self.set_selection_mode(mode),
             Some(ActivatedCommand::RefinePrompt(kind)) => self.open_refine_prompt(kind),
@@ -27772,6 +27838,7 @@ impl App {
             layer_rows: &mut self.layer_rows,
             scroll_follow: &mut self.scroll_follow,
             drag: &mut self.drag,
+            quick_mask: &mut self.quick_mask,
             layer_controls: &mut self.layer_controls,
             curves_ui: &mut self.curves_ui,
             tool_controls: self.tool_controls,
@@ -27985,6 +28052,10 @@ impl App {
     /// "Untitled") becomes active, then the closed session is retired and
     /// the autosave index rewritten without it, which deletes its file.
     fn finish_close(&mut self, id: document_session::DocumentId) {
+        // Closing the active document drops Quick Mask without applying it.
+        if id == self.doc.id {
+            self.leave_quick_mask(false);
+        }
         let last = self.shelf.parked.is_empty() && id == self.doc.id;
         let replacement = last.then(|| self.fresh_untitled_session());
         let closed = {
@@ -29698,6 +29769,11 @@ impl App {
         let interrupted = self.drag.take();
         self.commit_drag(interrupted);
 
+        // Quick Mask (0.217.0): the fills and the selection tools do not
+        // work on the mask; say so and do nothing.
+        if button == PointerButton::Primary && self.quick_mask_refuses_tool(self.tool) {
+            return;
+        }
         if self.tool == aurora_ui::Tool::Zoom && button == PointerButton::Primary {
             handle_zoom_tool_click(
                 &mut self.doc.canvas_view,
@@ -29728,7 +29804,13 @@ impl App {
             button,
             canvas_point,
             &self.doc.canvas_view,
-            active_pixel_layer(&self.doc.layers, self.doc.active_layer),
+            // In Quick Mask a Brush or Eraser stroke edits the mask: it has
+            // no layer, so no stroke snapshot and no history step.
+            quick_mask::drag_layer(
+                self.quick_mask.is_some(),
+                self.tool,
+                active_pixel_layer(&self.doc.layers, self.doc.active_layer),
+            ),
         );
         if matches!(self.drag, Some(Drag::Lasso { .. })) {
             // Like the Marquee, a press deselects at once; the path then
@@ -29749,16 +29831,19 @@ impl App {
             selection_modes::press_marquee_drag(&mut self.drag, &mut self.doc.selection, mode);
         }
         // A locked layer refuses the press outright (0.198.0): no drag, so
-        // no stroke snapshot and no history row, and a calm notice.
-        if matches!(
-            self.drag,
-            Some(
-                Drag::Brush { .. }
-                    | Drag::Eraser { .. }
-                    | Drag::Move { .. }
-                    | Drag::Gradient { .. }
+        // no stroke snapshot and no history row, and a calm notice. Not in
+        // Quick Mask, whose strokes never touch the layer.
+        if !quick_mask::skips_lock_gate(self.quick_mask.is_some(), self.tool)
+            && matches!(
+                self.drag,
+                Some(
+                    Drag::Brush { .. }
+                        | Drag::Eraser { .. }
+                        | Drag::Move { .. }
+                        | Drag::Gradient { .. }
+                )
             )
-        ) && let Some(layer) = self.doc.active_layer
+            && let Some(layer) = self.doc.active_layer
             && let Some(why) =
                 press_refusal(self.tool, self.doc.layers.lock(layer).unwrap_or_default())
         {
@@ -29828,6 +29913,17 @@ impl App {
     /// collapse still left a long drag across one emitting ~100
     /// identical lines.
     fn paint_dab(&mut self, doc_point: (f32, f32)) {
+        // Quick Mask (0.217.0): the dab edits the mask grid, never a layer.
+        if let Some(mode) = self.quick_mask.as_mut() {
+            let _ = quick_mask::paint_dab(
+                mode,
+                DabTool::Brush,
+                doc_point,
+                &self.tool_settings,
+                &self.colour.state,
+            );
+            return;
+        }
         let Some(layer_id) = self.doc.active_layer else {
             return;
         };
@@ -29910,6 +30006,17 @@ impl App {
     /// capture (against `Drag::Eraser`'s own `stroke` field instead,
     /// via [`eraser_stroke_mut`]).
     fn erase_dab(&mut self, doc_point: (f32, f32)) {
+        // Quick Mask (0.217.0): the Eraser pulls toward the background.
+        if let Some(mode) = self.quick_mask.as_mut() {
+            let _ = quick_mask::paint_dab(
+                mode,
+                DabTool::Eraser,
+                doc_point,
+                &self.tool_settings,
+                &self.colour.state,
+            );
+            return;
+        }
         let Some(layer_id) = self.doc.active_layer else {
             return;
         };
@@ -30445,6 +30552,7 @@ impl App {
             Some(ActivatedCommand::SwapColours) => self.swap_colours(),
             Some(ActivatedCommand::ResetColours) => self.reset_colours(),
             Some(ActivatedCommand::Selection(command)) => self.run_selection_command(command),
+            Some(ActivatedCommand::ToggleQuickMask) => self.toggle_quick_mask(),
             Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
             Some(ActivatedCommand::SetSelectionMode(mode)) => self.set_selection_mode(mode),
             Some(ActivatedCommand::RefinePrompt(kind)) => self.open_refine_prompt(kind),
@@ -30732,6 +30840,108 @@ impl App {
     fn reset_colours(&mut self) {
         let effect = self.colour.reset(&mut self.workspace);
         self.apply_colour_effect(effect);
+    }
+
+    /// Quick Mask (0.217.0): `Q`, the palette, the Select menu. Enters the
+    /// mode, or leaves it applying the grid as one "Quick Mask" step.
+    fn toggle_quick_mask(&mut self) {
+        if self.quick_mask.is_some() {
+            self.leave_quick_mask(true);
+        } else {
+            self.enter_quick_mask();
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Enters Quick Mask ([`quick_mask::enter`]); a document over the cap
+    /// says so and stays out. A live selection gesture ends first.
+    fn enter_quick_mask(&mut self) {
+        lasso_tools::cancel_selection_gesture(&mut self.drag, &mut self.doc.selection);
+        // A layer stroke in progress ends (and is recorded) first, so no
+        // stale pixel snapshot carries into the mode.
+        if quick_mask::drag_needs_commit_before_enter(self.drag.as_ref()) {
+            let ending = self.drag.take();
+            self.commit_drag(ending);
+        }
+        match quick_mask::enter(self.doc.selection.active().as_ref(), self.doc.canvas_size) {
+            Ok(mode) => {
+                self.quick_mask = Some(mode);
+                self.lock_notice = None;
+            }
+            Err(why) => self.lock_notice = Some((why, self.doc.active_layer)),
+        }
+        self.sync_status_bar_now();
+    }
+
+    /// Leaves Quick Mask, if on: with `apply` the grid becomes the
+    /// selection ([`quick_mask::leave`], one undo step), without it the
+    /// grid is dropped (the document is going away). Does nothing when off.
+    fn leave_quick_mask(&mut self, apply: bool) {
+        let Some(mode) = self.quick_mask.take() else {
+            return;
+        };
+        quick_mask::drop_mask_stroke(&mut self.drag);
+        let emptied = apply
+            && quick_mask::leave(
+                &mode,
+                &mut self.workspace,
+                &mut self.doc.undo_order,
+                &mut self.doc.history,
+                &mut self.doc.pixel_history,
+                &mut self.doc.selection,
+            ) == quick_mask::LeaveOutcome::Emptied;
+        quick_mask::clear_tint(&mut self.workspace);
+        self.lock_notice =
+            emptied.then_some((LockRefusal::QuickMaskNothing, self.doc.active_layer));
+        self.sync_status_bar_now();
+        self.needs_redraw = true;
+    }
+
+    /// Whether Quick Mask refuses `tool`'s press: says so and returns true.
+    fn quick_mask_refuses_tool(&mut self, tool: aurora_ui::Tool) -> bool {
+        if self.quick_mask.is_none() {
+            return false;
+        }
+        let Some(why) = quick_mask::tool_refusal(tool) else {
+            return false;
+        };
+        self.lock_notice = Some((why, self.doc.active_layer));
+        self.sync_status_bar_now();
+        true
+    }
+
+    /// Whether Quick Mask refuses a Select command: says so and returns true.
+    fn quick_mask_refuses_command(&mut self) -> bool {
+        if self.quick_mask.is_none() {
+            return false;
+        }
+        self.lock_notice = Some((quick_mask::COMMAND_REFUSAL, self.doc.active_layer));
+        self.sync_status_bar_now();
+        true
+    }
+
+    /// Draws this frame's Quick Mask tint (0.217.0), rebuilt only when the
+    /// grid, the view or the sizes changed.
+    fn sync_quick_mask_tint_now(&mut self) {
+        let Some(mode) = self.quick_mask.as_mut() else {
+            return;
+        };
+        let Some(size) = canvas_area_logical_size(&self.workspace) else {
+            return;
+        };
+        let scale = guarded_scale_factor(self.scale_factor);
+        if !mode.tint_changed(&self.doc.canvas_view, size, scale) {
+            return;
+        }
+        let rects = aurora_ui::quick_mask_tint(&mode.mask, &self.doc.canvas_view, size, scale);
+        match aurora_ui::sync_quick_mask_tint(
+            &mut self.workspace.tree,
+            self.workspace.selection_outline,
+            rects,
+        ) {
+            Ok(_) => {}
+            Err(err) => tracing::warn!(?err, "failed to update the Quick Mask tint"),
+        }
     }
 
     /// What an outcome on a colour control means (0.208.0).
@@ -31275,6 +31485,9 @@ impl App {
     /// says there is nothing to modify. A live selection gesture ends
     /// first (the selection returns to what it replaced).
     fn open_refine_prompt(&mut self, kind: selection_refine::RefineKind) {
+        if self.quick_mask_refuses_command() {
+            return;
+        }
         lasso_tools::cancel_selection_gesture(&mut self.drag, &mut self.doc.selection);
         if self.doc.selection.active().is_none() {
             self.lock_notice = Some((LockRefusal::RefineNeedsSelection, self.doc.active_layer));
@@ -31296,6 +31509,9 @@ impl App {
     /// Select > Modify (0.216.0): applies `kind` by `amount` as one undo
     /// step ([`selection_refine::refine_step`]) and remembers the amount.
     fn run_refine(&mut self, kind: selection_refine::RefineKind, amount: f32) {
+        if self.quick_mask_refuses_command() {
+            return;
+        }
         lasso_tools::cancel_selection_gesture(&mut self.drag, &mut self.doc.selection);
         self.tool_settings.refine_amounts.set(kind, amount);
         match selection_refine::refine_step(
@@ -31474,6 +31690,7 @@ impl App {
             self.scale_factor,
             notice,
             self.doc.selection.active(),
+            self.quick_mask.is_some(),
         ) {
             self.push_accessibility();
             self.needs_redraw = true;
@@ -31715,6 +31932,9 @@ impl App {
     /// selection goes back to what it was). The change is one undo step
     /// (0.213.0, [`run_selection_step`]) and the document is not made dirty.
     fn run_selection_command(&mut self, command: selection_view::SelectionCommand) {
+        if self.quick_mask_refuses_command() {
+            return;
+        }
         // The drag ends unrecorded and the selection goes back to what it
         // was before it, so the command's step starts from there.
         lasso_tools::cancel_selection_gesture(&mut self.drag, &mut self.doc.selection);
@@ -31970,12 +32190,14 @@ impl App {
             self.scale_factor,
             self.lock_notice.map(|(why, _)| why.message()),
             self.doc.selection.active(),
+            self.quick_mask.is_some(),
         ) {
             self.push_accessibility();
         }
         // 0.212.0: the selection's ants for this frame, after the view
         // settled above.
         self.sync_selection_outline_now(frame_time);
+        self.sync_quick_mask_tint_now();
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
         };

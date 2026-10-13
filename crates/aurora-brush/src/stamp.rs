@@ -447,7 +447,7 @@ fn dab_reaches_blank_tile(
             let px = (origin.0 + lx) as f32 + 0.5;
             let py = (origin.1 + ly) as f32 + 0.5;
             let d = (px - cx).hypot(py - cy);
-            if d > radius || (1.0 - (d / radius)).clamp(0.0, 1.0).powf(1.5) <= 0.0 {
+            if d > radius || crate::mask_dab::dab_falloff(d, radius) <= 0.0 {
                 continue;
             }
             let covered_here = coverage.is_none_or(|cov| {
@@ -571,7 +571,7 @@ fn stamp_dab_impl(
                     }
                     // Smooth falloff; hardness is not a variable here,
                     // matching the spike this is ported from.
-                    let a = (1.0 - (d / radius)).clamp(0.0, 1.0).powf(1.5);
+                    let a = crate::mask_dab::dab_falloff(d, radius);
                     if a <= 0.0 {
                         continue;
                     }
@@ -858,7 +858,7 @@ pub fn erase_dab_covered(
                     if d > radius {
                         continue;
                     }
-                    let a = (1.0 - (d / radius)).clamp(0.0, 1.0).powf(1.5);
+                    let a = crate::mask_dab::dab_falloff(d, radius);
                     if a <= 0.0 {
                         continue;
                     }
