@@ -995,7 +995,7 @@ fn a_history_panel_jump_applies_the_selection_of_the_row() {
 
 #[test]
 fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
-    assert_eq!(Tool::ALL.len(), 10);
+    assert_eq!(Tool::ALL.len(), 13);
     let table = crate::default_shortcuts_for(false);
     let chord = |shift| {
         KeyChord::new(
@@ -1053,7 +1053,7 @@ fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
     );
     // The tools panel has one button per tool, the new one wearing its
     // own icon.
-    assert_eq!(workspace.tools.buttons.len(), 10);
+    assert_eq!(workspace.tools.buttons.len(), 13);
     assert_eq!(
         aurora_ui::tool_icon(Tool::EllipticalMarquee),
         aurora_widgets::icons::IconKind::EllipseMarquee
@@ -1218,4 +1218,837 @@ fn a_selection_command_cancels_a_live_marquee_drag_back_to_what_it_replaced() {
     assert_eq!(rig.selection.active(), existing);
     assert!(rig.command_step(SelectionCommand::Inverse));
     assert_eq!(rig.labels(), ["Rectangular Marquee", "Inverse Selection"]);
+}
+
+// ---- 0.214.0: Lasso, Polygonal Lasso and Magic Wand --------------------
+
+use crate::lasso_tools::{self, PolygonClick, WandRefused};
+
+const SQUARE: [(f32, f32); 4] = [(100.0, 80.0), (200.0, 80.0), (200.0, 180.0), (100.0, 180.0)];
+
+impl Rig {
+    /// A Lasso press as the app runs it.
+    fn press_lasso(&mut self, tool: Tool, from: (f32, f32)) -> Option<Drag> {
+        let mut drag = begin_drag(tool, PointerButton::Primary, from, &self.view, None);
+        lasso_tools::press_lasso(&mut drag, &mut self.selection, (400, 300));
+        drag
+    }
+
+    /// A whole freehand Lasso gesture: press, moves, release. Whether a
+    /// step was recorded.
+    fn lasso(&mut self, points: &[(f32, f32)]) -> bool {
+        let Some((&first, rest)) = points.split_first() else {
+            unreachable!("a lasso has points");
+        };
+        let mut drag = self.press_lasso(Tool::Lasso, first);
+        for &p in rest {
+            self.drag_to(&mut drag, p);
+        }
+        let mut slot = None;
+        let ending = lasso_tools::release_lasso(&mut slot, drag, &mut self.selection);
+        assert!(slot.is_none(), "a freehand lasso ends on release");
+        self.end_drag(ending)
+    }
+
+    /// One click of the Polygonal Lasso: the first starts the gesture, the
+    /// rest add vertices or close it. Whether it closed (and so recorded).
+    fn poly_click(&mut self, drag: &mut Option<Drag>, at: (f32, f32)) -> bool {
+        if let Some(d) = drag.as_mut() {
+            if lasso_tools::polygon_click(d, at, &self.view, &mut self.selection)
+                == PolygonClick::Closes
+            {
+                let ending = drag.take();
+                return self.end_drag(ending);
+            }
+            return false;
+        }
+        *drag = self.press_lasso(Tool::PolygonalLasso, at);
+        // The click's release leaves the polygon alive.
+        let ending = drag.take();
+        let ending = lasso_tools::release_lasso(drag, ending, &mut self.selection);
+        assert!(ending.is_none());
+        false
+    }
+
+    fn wand(&mut self, point: (f32, f32)) -> Result<bool, WandRefused> {
+        lasso_tools::wand_step(
+            &mut self.workspace,
+            &mut self.undo_order,
+            &mut self.history,
+            &mut self.pixel_history,
+            &mut self.selection,
+            &mut self.store,
+            &self.layers,
+            self.layer,
+            point,
+            &self.settings,
+            (400, 300),
+        )
+    }
+
+    fn selected_bounds(&self) -> Option<Rect> {
+        self.selection.active().map(|s| s.bounds)
+    }
+}
+
+fn mask_of_selection(rig: &Rig) -> Selection {
+    let selection = ok_selection(rig);
+    assert!(matches!(selection.shape, SelectionShape::Mask(_)));
+    selection
+}
+
+#[test]
+fn a_lasso_drag_is_one_labelled_mask_step_that_undoes_and_redoes() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    assert!(rig.lasso(&[(100.0, 80.0), (200.0, 90.0), (180.0, 180.0), (90.0, 150.0)]));
+    let drawn = rig.selection.active();
+    let selection = mask_of_selection(&rig);
+    // Tight: the box of the drawn quadrilateral.
+    assert_eq!(selection.bounds, rect(90, 80, 110, 100));
+    assert_eq!(rig.labels(), ["Lasso"]);
+    assert!(rig.step(UndoDirection::Undo));
+    assert_eq!(rig.selection.active(), None);
+    assert!(rig.step(UndoDirection::Redo));
+    assert_eq!(rig.selection.active(), drawn);
+    assert_eq!(rig.labels(), ["Lasso"]);
+}
+
+#[test]
+fn a_lasso_click_or_a_degenerate_path_deselects_and_a_no_op_records_nothing() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    // Nothing selected, a click: nothing changed, nothing recorded.
+    assert!(!rig.lasso(&[(50.0, 50.0)]));
+    assert!(rig.lasso(&SQUARE));
+    // A straight line selects nothing: it deselects, as a step.
+    assert!(rig.lasso(&[(10.0, 10.0), (60.0, 60.0), (110.0, 110.0)]));
+    assert_eq!(rig.selection.active(), None);
+    assert_eq!(rig.labels(), ["Lasso", "Deselect"]);
+}
+
+#[test]
+fn the_lasso_mask_is_clipped_to_the_document() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    assert!(rig.lasso(&[
+        (-50.0, -50.0),
+        (100.0, -50.0),
+        (100.0, 100.0),
+        (-50.0, 100.0)
+    ]));
+    assert_eq!(rig.selected_bounds(), Some(rect(0, 0, 100, 100)));
+}
+
+#[test]
+fn a_brush_through_a_lasso_paints_fractional_edges_and_nothing_outside() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    // A right triangle: its hypotenuse crosses row 150 at x = 200.
+    assert!(rig.lasso(&[(100.0, 100.0), (300.0, 100.0), (100.0, 200.0)]));
+    rig.settings.set_radius(Tool::Brush, 40.0);
+    assert!(rig.stroke(Tool::Brush, &[(40.0, 150.0), (320.0, 150.0)], false));
+    let full = rig.at(130, 150)[3];
+    assert!(full > 0.5, "inside is painted: {full}");
+    assert_eq!(rig.at(60, 150)[3], 0.0, "left of the selection");
+    let (mut partial, mut beyond) = (0, 0);
+    for x in 150..320_u32 {
+        let a = rig.at(x, 150)[3];
+        if a > 0.0 && a < full - 0.05 {
+            partial += 1;
+        }
+        if x > 203 && a > 0.0 {
+            beyond += 1;
+        }
+    }
+    assert!(partial >= 1, "an antialiased edge paints fractions");
+    assert_eq!(beyond, 0, "nothing past the hypotenuse");
+    assert_eq!(rig.at(150, 90)[3], 0.0, "above the top edge");
+}
+
+#[test]
+fn a_figure_eight_lasso_selects_both_lobes() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    assert!(rig.lasso(&[
+        (100.0, 100.0),
+        (200.0, 200.0),
+        (200.0, 100.0),
+        (100.0, 200.0)
+    ]));
+    let s = mask_of_selection(&rig);
+    assert_eq!(s.coverage_at(110, 150), 1.0, "left lobe");
+    assert_eq!(s.coverage_at(190, 150), 1.0, "right lobe");
+    assert_eq!(s.coverage_at(150, 110), 0.0, "between the lobes, above");
+}
+
+#[test]
+fn a_polygon_closes_on_the_first_vertex_and_is_one_step() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut drag = None;
+    for p in SQUARE {
+        assert!(!rig.poly_click(&mut drag, p));
+    }
+    // Live while building: the closed polygon so far.
+    assert_eq!(rig.selected_bounds(), Some(rect(100, 80, 100, 100)));
+    assert!(matches!(
+        drag,
+        Some(Drag::Lasso {
+            polygonal: true,
+            ..
+        })
+    ));
+    // A click on the first vertex closes it.
+    assert!(rig.poly_click(&mut drag, (100.0, 80.0)));
+    assert!(drag.is_none());
+    assert_eq!(rig.labels(), ["Polygonal Lasso"]);
+    assert_eq!(rig.selected_bounds(), Some(rect(100, 80, 100, 100)));
+    assert!(rig.step(UndoDirection::Undo));
+    assert_eq!(rig.selection.active(), None);
+}
+
+#[test]
+fn the_close_tolerance_is_six_screen_pixels_and_a_double_click_closes() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut drag = None;
+    for p in SQUARE {
+        rig.poly_click(&mut drag, p);
+    }
+    // 7 px from the first vertex: another vertex, not a close.
+    assert!(!rig.poly_click(&mut drag, (107.0, 80.0)));
+    assert!(drag.is_some());
+    // 5 px from the first vertex closes.
+    assert!(rig.poly_click(&mut drag, (105.0, 80.0)));
+
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut drag = None;
+    for p in [SQUARE[0], SQUARE[1], SQUARE[2]] {
+        rig.poly_click(&mut drag, p);
+    }
+    // The second click of a double click lands on the last vertex.
+    assert!(rig.poly_click(&mut drag, (201.0, 181.0)));
+    assert_eq!(rig.labels(), ["Polygonal Lasso"]);
+    // Two vertices: a click on the first one does not close (a polygon
+    // needs three).
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut drag = None;
+    rig.poly_click(&mut drag, SQUARE[0]);
+    rig.poly_click(&mut drag, SQUARE[1]);
+    assert!(!rig.poly_click(&mut drag, SQUARE[0]));
+    assert!(drag.is_some());
+}
+
+#[test]
+fn backspace_removes_the_last_vertex_and_the_only_vertex_cancels() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let existing = {
+        rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+        rig.selection.active()
+    };
+    let mut drag = None;
+    for p in SQUARE {
+        rig.poly_click(&mut drag, p);
+    }
+    let four = rig.selection.active();
+    let Some(d) = drag.as_mut() else {
+        unreachable!("building");
+    };
+    assert!(!lasso_tools::polygon_backspace(d, &mut rig.selection));
+    // The triangle of the first three vertices: not the square, and the
+    // first vertex (100, 80) is still in it.
+    let three = rig.selection.active();
+    assert_ne!(three, four);
+    let Some(three) = three else {
+        unreachable!("three vertices select");
+    };
+    assert_eq!(three.bounds, rect(100, 80, 100, 100));
+    assert_eq!(three.coverage_at(190, 100), 1.0, "inside the triangle");
+    assert_eq!(three.coverage_at(110, 170), 0.0, "the dropped corner");
+    assert!(!lasso_tools::polygon_backspace(d, &mut rig.selection));
+    // Two vertices left: nothing selected yet.
+    assert_eq!(rig.selection.active(), None);
+    // The last vertex goes: the gesture is over and cancels.
+    assert!(!lasso_tools::polygon_backspace(d, &mut rig.selection));
+    assert!(lasso_tools::polygon_backspace(d, &mut rig.selection));
+    if let Some(Drag::Lasso { before, .. }) = drag.take() {
+        selection_view::cancel_marquee(&mut rig.selection, before);
+    }
+    assert_eq!(rig.selection.active(), existing);
+    assert_eq!(rig.labels(), ["Rectangular Marquee"], "no step recorded");
+}
+
+#[test]
+fn escape_during_a_polygon_restores_the_old_selection_without_a_step() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    let existing = rig.selection.active();
+    let mut drag = None;
+    for p in SQUARE {
+        rig.poly_click(&mut drag, p);
+    }
+    assert_ne!(rig.selection.active(), existing);
+    if let Some(Drag::Lasso { before, .. }) = drag.take() {
+        selection_view::cancel_marquee(&mut rig.selection, before);
+    }
+    assert_eq!(rig.selection.active(), existing);
+    assert_eq!(rig.labels(), ["Rectangular Marquee"]);
+}
+
+#[test]
+fn ctrl_z_during_a_live_polygon_records_it_then_undoes_it() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    let first = rig.selection.active();
+    let mut drag = None;
+    for p in SQUARE {
+        rig.poly_click(&mut drag, p);
+    }
+    let drawn = rig.selection.active();
+    let mut tool = Tool::PolygonalLasso;
+    let mut focus = aurora_widgets::FocusManager::default();
+    let mut palette = None;
+    let mut cache = CompositeCache::default();
+    let mut controls = crate::LayerControlsState::default();
+    let _ = crate::perform_undo_redo(
+        &mut rig.workspace,
+        &mut focus,
+        &mut palette,
+        &mut tool,
+        &rig.settings,
+        &mut rig.layers,
+        &mut rig.history,
+        &mut rig.pixel_history,
+        Some(&mut rig.store),
+        &mut rig.undo_order,
+        &mut cache,
+        &mut rig.view,
+        Some(rig.layer),
+        &mut drag,
+        &mut controls,
+        AppCommand::Undo,
+    );
+    assert!(drag.is_none());
+    selection_view::apply_pending_selection(&mut rig.undo_order, &mut rig.selection);
+    assert_eq!(rig.selection.active(), first);
+    assert_eq!(
+        rig.labels(),
+        ["Rectangular Marquee", "Polygonal Lasso (undone)"]
+    );
+    assert!(rig.step(UndoDirection::Redo));
+    assert_eq!(rig.selection.active(), drawn);
+}
+
+#[test]
+fn an_interrupted_freehand_lasso_keeps_what_was_built_as_its_step() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut drag = rig.press_lasso(Tool::Lasso, (100.0, 80.0));
+    for p in [(200.0, 80.0), (200.0, 180.0), (100.0, 180.0)] {
+        rig.drag_to(&mut drag, p);
+    }
+    let built = rig.selection.active();
+    assert!(built.is_some());
+    // A second press (or anything) takes the drag: no release rebuild.
+    assert!(rig.end_drag(drag));
+    assert_eq!(rig.selection.active(), built);
+    assert_eq!(rig.labels(), ["Lasso"]);
+}
+
+#[test]
+fn lasso_paths_are_thinned_and_capped() {
+    let mut points = vec![(0.0_f32, 0.0_f32)];
+    assert!(
+        !lasso_tools::push_lasso_point(&mut points, (0.5, 0.5)),
+        "too close"
+    );
+    assert!(lasso_tools::push_lasso_point(&mut points, (3.0, 0.0)));
+    assert!(!lasso_tools::push_lasso_point(&mut points, (f32::NAN, 0.0)));
+    let mut full: Vec<(f32, f32)> = (0..lasso_tools::MAX_LASSO_POINTS)
+        .map(|i| (i as f32 * 2.0, 0.0))
+        .collect();
+    assert!(
+        !lasso_tools::push_lasso_point(&mut full, (1.0e7, 5.0)),
+        "full"
+    );
+    // A small path rebuilds on every point; a big one on every nth.
+    assert_eq!(
+        lasso_tools::rebuild_period(&[(0.0, 0.0), (100.0, 100.0)]),
+        1
+    );
+    assert_eq!(
+        lasso_tools::rebuild_period(&[(0.0, 0.0), (1000.0, 1000.0)]),
+        1 + 3
+    );
+    assert!(lasso_tools::rebuild_period(&[(0.0, 0.0), (8000.0, 8000.0)]) > 200);
+    // A long scribble in a small box thins out by its point count too.
+    assert_eq!(lasso_tools::rebuild_period(&full), 1 + 50_000 / 512);
+}
+
+#[test]
+fn a_path_over_the_mask_cap_leaves_the_selection_as_it_was() {
+    let clip = Rect {
+        x: 0,
+        y: 0,
+        width: 10_000,
+        height: 10_000,
+    };
+    let mut selection = aurora_doc::SelectionSet::new();
+    selection.select(Selection::new(rect(5, 5, 10, 10)));
+    let mut current = selection.active();
+    let before = selection.active();
+    lasso_tools::rebuild_live(
+        &[(0.0, 0.0), (9999.0, 0.0), (9999.0, 9999.0), (0.0, 9999.0)],
+        &clip,
+        &mut selection,
+        &mut current,
+    );
+    assert_eq!(selection.active(), before);
+}
+
+// ---- the Magic Wand ----
+
+fn wand_rig() -> Rig {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.rect_fill(200, 100, 300, 180, [1.0, 0.0, 0.0, 1.0]);
+    rig.rect_fill(40, 40, 60, 60, [1.0, 0.0, 0.0, 1.0]);
+    rig
+}
+
+#[test]
+fn the_wand_selects_the_similar_region_as_a_softened_mask_in_one_step() {
+    let mut rig = wand_rig();
+    assert_eq!(rig.wand((250.0, 140.0)), Ok(true));
+    let s = mask_of_selection(&rig);
+    // The red rectangle grown by the one-texel softening; the far red
+    // square is not contiguous.
+    assert_eq!(s.bounds, rect(199, 99, 102, 82));
+    assert_eq!(s.coverage_at(250, 140), 1.0);
+    assert!((s.coverage_at(199, 140) - 0.25).abs() < 0.01);
+    assert_eq!(s.coverage_at(150, 140), 0.0);
+    assert_eq!(s.coverage_at(50, 50), 0.0);
+    assert_eq!(rig.labels(), ["Magic Wand"]);
+    assert!(rig.step(UndoDirection::Undo));
+    assert_eq!(rig.selection.active(), None);
+    assert!(rig.step(UndoDirection::Redo));
+    assert_eq!(rig.selected_bounds(), Some(rect(199, 99, 102, 82)));
+}
+
+#[test]
+fn non_contiguous_takes_every_similar_region_and_tolerance_widens_the_match() {
+    let mut rig = wand_rig();
+    rig.settings.contiguous = false;
+    assert_eq!(rig.wand((250.0, 140.0)), Ok(true));
+    assert_eq!(rig.selected_bounds(), Some(rect(39, 39, 262, 142)));
+    let s = ok_selection(&rig);
+    assert_eq!(s.coverage_at(50, 50), 1.0);
+    // A slightly different red joins the click's region only within the
+    // tolerance.
+    let mut rig = wand_rig();
+    rig.rect_fill(300, 100, 320, 180, [0.9, 0.0, 0.0, 1.0]);
+    rig.settings.set_tolerance(0.0);
+    assert_eq!(rig.wand((250.0, 140.0)), Ok(true));
+    assert_eq!(rig.selected_bounds(), Some(rect(199, 99, 102, 82)));
+    rig.settings.set_tolerance(40.0);
+    assert_eq!(rig.wand((250.0, 140.0)), Ok(true));
+    assert_eq!(rig.selected_bounds(), Some(rect(199, 99, 122, 82)));
+}
+
+#[test]
+fn the_wand_works_in_document_space_for_a_layer_with_an_origin() {
+    let mut rig = Rig::new(rect(50, 40, 200, 150));
+    rig.rect_fill(10, 10, 30, 30, [0.0, 1.0, 0.0, 1.0]);
+    assert_eq!(rig.wand((70.0, 60.0)), Ok(true));
+    assert_eq!(rig.selected_bounds(), Some(rect(59, 49, 22, 22)));
+}
+
+#[test]
+fn a_wand_click_outside_the_layer_or_on_a_group_selects_nothing() {
+    let mut rig = Rig::new(rect(50, 40, 200, 150));
+    // Left of and above the layer, and past its far edge.
+    assert_eq!(rig.wand((10.0, 10.0)), Err(WandRefused::Nothing));
+    assert_eq!(rig.wand((400.0, 100.0)), Err(WandRefused::Nothing));
+    assert_eq!(rig.selection.active(), None);
+    assert!(rig.labels().is_empty());
+    let group = ok(rig.layers.add_group("Group", None));
+    rig.layer = group;
+    assert_eq!(
+        rig.wand((60.0, 60.0)),
+        Err(WandRefused::Notice(crate::LockRefusal::WandNeedsPixelLayer))
+    );
+    assert!(rig.labels().is_empty());
+}
+
+#[test]
+fn a_wand_region_over_the_cap_is_refused_with_a_notice_and_changes_nothing() {
+    // A blank layer is one region: 2 x 2 tiles of 256 is within the caps,
+    // so use a layer that is wider than 64 Mpx / 1024 tiles allow.
+    let mut rig = Rig::new(rect(0, 0, 16_384, 8_192));
+    assert_eq!(
+        rig.wand((10.0, 10.0)),
+        Err(WandRefused::Notice(crate::LockRefusal::SelectionTooLarge))
+    );
+    assert_eq!(rig.selection.active(), None);
+    assert!(rig.labels().is_empty());
+}
+
+#[test]
+fn a_brush_through_a_wand_mask_paints_the_softened_edge_fractionally() {
+    let mut rig = wand_rig();
+    assert_eq!(rig.wand((250.0, 140.0)), Ok(true));
+    rig.settings.set_radius(Tool::Brush, 30.0);
+    assert!(rig.stroke(Tool::Brush, &[(150.0, 140.0), (350.0, 140.0)], false));
+    let inside = rig.at(250, 140)[3];
+    assert!(inside > 0.5);
+    assert_eq!(rig.at(150, 140)[3], 0.0, "outside the mask");
+    // The outer softened texel (coverage 1/4) is painted, but less than the
+    // inside (repeated dabs converge towards the full value, so the exact
+    // fraction is not asserted).
+    let outer = rig.at(199, 140)[3];
+    assert!(outer > 0.0 && outer < inside, "{outer} {inside}");
+}
+
+#[test]
+fn the_new_tools_are_wired_to_their_shortcuts_the_palette_and_the_panel() {
+    let table = crate::default_shortcuts_for(false);
+    let key = |c, shift| {
+        table.resolve(KeyChord::new(
+            Modifiers {
+                shift,
+                ..Modifiers::none()
+            },
+            Key::Character(c),
+        ))
+    };
+    assert_eq!(key('l', false), Some(&AppCommand::SelectTool(Tool::Lasso)));
+    assert_eq!(
+        key('l', true),
+        Some(&AppCommand::SelectTool(Tool::PolygonalLasso))
+    );
+    assert_eq!(
+        key('w', false),
+        Some(&AppCommand::SelectTool(Tool::MagicWand))
+    );
+    let commands = crate::palette_commands();
+    for title in [
+        "Select Lasso Tool",
+        "Select Polygonal Lasso Tool",
+        "Select Magic Wand Tool",
+    ] {
+        assert!(commands.iter().any(|c| c.title == title), "{title}");
+    }
+    // Each tool starts the right drag (the wand and the polygon start
+    // theirs on a press).
+    let view = CanvasView::new();
+    for (tool, polygonal) in [(Tool::Lasso, false), (Tool::PolygonalLasso, true)] {
+        let drag = begin_drag(tool, PointerButton::Primary, (5.0, 6.0), &view, None);
+        assert!(matches!(
+            drag,
+            Some(Drag::Lasso { polygonal: p, ref points, .. }) if p == polygonal && points == &[(5.0, 6.0)]
+        ));
+    }
+    assert!(
+        begin_drag(
+            Tool::MagicWand,
+            PointerButton::Primary,
+            (5.0, 6.0),
+            &view,
+            None
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn lasso_labels_name_the_steps_and_a_scroll_clamp_moves_every_point() {
+    assert_eq!(lasso_tools::lasso_step_label(false, true), "Lasso");
+    assert_eq!(lasso_tools::lasso_step_label(true, true), "Polygonal Lasso");
+    assert_eq!(lasso_tools::lasso_step_label(true, false), "Deselect");
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut drag = rig.press_lasso(Tool::Lasso, (10.0, 10.0));
+    rig.drag_to(&mut drag, (50.0, 10.0));
+    let Some(d) = drag.as_mut() else {
+        unreachable!("live");
+    };
+    crate::shift_drag_reference(d, (5.0, -2.0));
+    assert!(matches!(
+        d,
+        Drag::Lasso { points, .. } if points == &[(15.0, 8.0), (55.0, 8.0)]
+    ));
+    assert_eq!(crate::drag_reference(d), Some((15.0, 8.0)));
+}
+
+#[test]
+fn a_big_lasso_rebuilds_on_a_cadence_but_the_release_is_always_exact() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut drag = begin_drag(
+        Tool::Lasso,
+        PointerButton::Primary,
+        (0.0, 0.0),
+        &rig.view,
+        None,
+    );
+    lasso_tools::press_lasso(&mut drag, &mut rig.selection, (4000, 4000));
+    for p in [
+        (1000.0, 0.0),
+        (1000.0, 1000.0),
+        (0.0, 1000.0),
+        (500.0, 1500.0),
+    ] {
+        rig.drag_to(&mut drag, p);
+    }
+    // A 1000 x 1000 box rebuilds every fourth point: the square is live,
+    // the fifth point is not in the mask yet.
+    assert_eq!(rig.selected_bounds(), Some(rect(0, 0, 1000, 1000)));
+    let mut slot = None;
+    let ending = lasso_tools::release_lasso(&mut slot, drag, &mut rig.selection);
+    assert_eq!(rig.selected_bounds(), Some(rect(0, 0, 1000, 1500)));
+    assert!(rig.end_drag(ending));
+    assert_eq!(rig.labels(), ["Lasso"]);
+}
+
+#[test]
+fn a_one_pixel_wand_region_stays_fully_selected() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.put(120, 90, [1.0, 0.0, 0.0, 1.0]);
+    rig.settings.set_tolerance(0.0);
+    assert_eq!(rig.wand((120.5, 90.5)), Ok(true));
+    let s = mask_of_selection(&rig);
+    assert_eq!(s.bounds, rect(119, 89, 3, 3));
+    assert_eq!(s.coverage_at(120, 90), 1.0, "the region itself is full");
+    assert!(s.coverage_at(119, 90) < 0.5, "the softened rim is partial");
+    assert!(s.coverage_at(119, 90) > 0.0);
+}
+
+fn building_polygon(rig: &mut Rig) -> Option<Drag> {
+    let mut drag = None;
+    for p in SQUARE {
+        rig.poly_click(&mut drag, p);
+    }
+    drag
+}
+
+#[test]
+fn enter_closes_a_polygon_through_the_production_helper() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut drag = building_polygon(&mut rig);
+    let lasso_tools::PolygonKey::Close(ending) = lasso_tools::polygon_key(
+        &mut drag,
+        Tool::PolygonalLasso,
+        Key::Named(aurora_widgets::shortcut::NamedKey::Enter),
+        &mut rig.selection,
+    ) else {
+        unreachable!("Enter closes");
+    };
+    assert!(drag.is_none());
+    assert!(rig.end_drag(ending));
+    assert_eq!(rig.labels(), ["Polygonal Lasso"]);
+    assert_eq!(rig.selected_bounds(), Some(rect(100, 80, 100, 100)));
+}
+
+#[test]
+fn backspace_and_escape_go_through_the_production_helper() {
+    use aurora_widgets::shortcut::NamedKey;
+    let key = |k| Key::Named(k);
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    rig.marquee_step(Tool::MarqueeSelect, (10.0, 10.0), (60.0, 50.0));
+    let existing = rig.selection.active();
+    let mut drag = building_polygon(&mut rig);
+    let three = |rig: &mut Rig, drag: &mut Option<Drag>| {
+        matches!(
+            lasso_tools::polygon_key(
+                drag,
+                Tool::PolygonalLasso,
+                key(NamedKey::Backspace),
+                &mut rig.selection
+            ),
+            lasso_tools::PolygonKey::Handled
+        )
+    };
+    assert!(three(&mut rig, &mut drag));
+    assert_eq!(rig.selected_bounds(), Some(rect(100, 80, 100, 100)));
+    assert!(matches!(&drag, Some(Drag::Lasso { points, .. }) if points.len() == 3));
+    // Down to nothing: the last Backspace cancels the gesture.
+    for _ in 0..3 {
+        assert!(three(&mut rig, &mut drag));
+    }
+    assert!(drag.is_none());
+    assert_eq!(rig.selection.active(), existing);
+    // Escape cancels a fresh polygon back to the same selection.
+    let mut drag = building_polygon(&mut rig);
+    assert!(matches!(
+        lasso_tools::polygon_key(
+            &mut drag,
+            Tool::PolygonalLasso,
+            key(NamedKey::Escape),
+            &mut rig.selection
+        ),
+        lasso_tools::PolygonKey::Handled
+    ));
+    assert!(drag.is_none());
+    assert_eq!(rig.selection.active(), existing);
+    assert_eq!(
+        rig.labels(),
+        ["Rectangular Marquee"],
+        "no step was recorded"
+    );
+    // Other keys, other tools and other drags are not the polygon's.
+    let mut drag = building_polygon(&mut rig);
+    for (tool, k) in [
+        (Tool::Brush, NamedKey::Enter),
+        (Tool::Lasso, NamedKey::Backspace),
+        (Tool::PolygonalLasso, NamedKey::Tab),
+    ] {
+        assert!(matches!(
+            lasso_tools::polygon_key(&mut drag, tool, key(k), &mut rig.selection),
+            lasso_tools::PolygonKey::Ignored
+        ));
+    }
+    assert!(drag.is_some());
+    let mut freehand = rig.press_lasso(Tool::Lasso, (5.0, 5.0));
+    assert!(matches!(
+        lasso_tools::polygon_key(
+            &mut freehand,
+            Tool::PolygonalLasso,
+            key(NamedKey::Enter),
+            &mut rig.selection
+        ),
+        lasso_tools::PolygonKey::Ignored
+    ));
+}
+
+#[test]
+fn switching_tool_records_a_live_polygon_or_marquee_and_only_then() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut drag = building_polygon(&mut rig);
+    let drawn = rig.selection.active();
+    // The same tool: nothing happens.
+    assert!(
+        lasso_tools::take_on_tool_switch(&mut drag, Tool::PolygonalLasso, Tool::PolygonalLasso)
+            .is_none()
+    );
+    assert!(drag.is_some());
+    let ending = lasso_tools::take_on_tool_switch(&mut drag, Tool::PolygonalLasso, Tool::Brush);
+    assert!(drag.is_none(), "the polygon is not left stale");
+    assert!(rig.end_drag(ending));
+    assert_eq!(rig.labels(), ["Polygonal Lasso"]);
+    assert_eq!(rig.selection.active(), drawn);
+    // A Marquee gesture too; a Brush stroke is not touched.
+    let mut marquee = rig.press_marquee(Tool::MarqueeSelect, (10.0, 10.0));
+    assert!(
+        lasso_tools::take_on_tool_switch(&mut marquee, Tool::MarqueeSelect, Tool::Zoom).is_some()
+    );
+    let mut eyedropper = Some(Drag::Eyedropper);
+    assert!(
+        lasso_tools::take_on_tool_switch(&mut eyedropper, Tool::Eyedropper, Tool::Zoom).is_none()
+    );
+    assert!(eyedropper.is_some());
+}
+
+#[test]
+fn the_pointer_leaving_the_window_keeps_a_polygon_but_ends_a_freehand_lasso() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut drag = building_polygon(&mut rig);
+    assert!(lasso_tools::take_on_cursor_left(&mut drag).is_none());
+    assert!(lasso_tools::is_polygon(drag.as_ref()));
+    let mut freehand = rig.press_lasso(Tool::Lasso, (10.0, 10.0));
+    assert!(lasso_tools::take_on_cursor_left(&mut freehand).is_some());
+    assert!(freehand.is_none());
+    let mut brush = Some(Drag::Eyedropper);
+    assert!(lasso_tools::take_on_cursor_left(&mut brush).is_some());
+}
+
+#[test]
+fn a_press_belongs_to_the_polygon_only_for_its_tool_and_the_primary_button() {
+    let mut rig = Rig::new(rect(0, 0, 400, 300));
+    let mut drag = building_polygon(&mut rig);
+    let view = rig.view;
+    let press = |rig: &mut Rig, drag: &mut Option<Drag>, tool, button, at| {
+        lasso_tools::polygon_press(drag, tool, button, at, &view, &mut rig.selection)
+    };
+    assert!(matches!(
+        press(
+            &mut rig,
+            &mut drag,
+            Tool::Brush,
+            PointerButton::Primary,
+            (300.0, 250.0)
+        ),
+        lasso_tools::PolygonPress::NotApplicable
+    ));
+    assert!(matches!(
+        press(
+            &mut rig,
+            &mut drag,
+            Tool::PolygonalLasso,
+            PointerButton::Middle,
+            (300.0, 250.0)
+        ),
+        lasso_tools::PolygonPress::NotApplicable
+    ));
+    assert!(matches!(
+        press(
+            &mut rig,
+            &mut drag,
+            Tool::PolygonalLasso,
+            PointerButton::Primary,
+            (300.0, 250.0)
+        ),
+        lasso_tools::PolygonPress::Added
+    ));
+    let lasso_tools::PolygonPress::Closes(ending) = press(
+        &mut rig,
+        &mut drag,
+        Tool::PolygonalLasso,
+        PointerButton::Primary,
+        (101.0, 81.0),
+    ) else {
+        unreachable!("the first vertex closes");
+    };
+    assert!(rig.end_drag(ending));
+    assert_eq!(rig.labels(), ["Polygonal Lasso"]);
+}
+
+#[test]
+fn the_wand_mask_is_clipped_to_the_document() {
+    // A layer wider and taller than the 400 x 300 document.
+    let mut rig = Rig::new(rect(0, 0, 600, 500));
+    assert_eq!(rig.wand((10.0, 10.0)), Ok(true));
+    // The whole layer matches; the document-sized part is kept, plus the
+    // one-texel softening rim.
+    assert_eq!(rig.selected_bounds(), Some(rect(-1, -1, 402, 302)));
+    let s = ok_selection(&rig);
+    assert_eq!(s.coverage_at(399, 299), 1.0);
+    assert!(s.coverage_at(400, 299) < 0.5, "past the document edge");
+    // A layer origin left of the document is clipped on that side too.
+    let mut rig = Rig::new(rect(-100, -50, 300, 200));
+    assert_eq!(rig.wand((10.0, 10.0)), Ok(true));
+    assert_eq!(rig.selected_bounds(), Some(rect(-1, -1, 202, 152)));
+}
+
+#[test]
+fn crop_binary_keeps_the_overlap_rows_and_refuses_no_overlap() {
+    let data: Vec<u8> = (0..12).collect();
+    let cropped = lasso_tools::crop_binary(rect(10, 10, 4, 3), &data, &rect(11, 11, 2, 5));
+    assert_eq!(cropped, Some((rect(11, 11, 2, 2), vec![5, 6, 9, 10])));
+    assert_eq!(
+        lasso_tools::crop_binary(rect(10, 10, 4, 3), &data, &rect(20, 20, 5, 5)),
+        None
+    );
+}
+
+#[test]
+fn a_slow_live_rebuild_backs_off_and_a_quick_one_does_not() {
+    let now = std::time::Instant::now();
+    let ms = std::time::Duration::from_millis;
+    assert_eq!(lasso_tools::backoff_until(now, ms(8)), None);
+    assert_eq!(lasso_tools::backoff_until(now, ms(9)), Some(now + ms(27)));
+    // Inside the back-off the live mask is not rebuilt; after it, it is.
+    let clip = lasso_tools::document_clip((400, 300));
+    let path = [(100.0, 80.0), (200.0, 80.0), (200.0, 180.0)];
+    let mut selection = aurora_doc::SelectionSet::new();
+    let mut current = None;
+    let mut wait = Some(std::time::Instant::now() + std::time::Duration::from_hours(1));
+    lasso_tools::live_rebuild_step(&path, &clip, &mut selection, &mut current, &mut wait);
+    assert_eq!(selection.active(), None, "skipped while backing off");
+    let mut wait = Some(std::time::Instant::now());
+    lasso_tools::live_rebuild_step(&path, &clip, &mut selection, &mut current, &mut wait);
+    assert!(
+        selection.active().is_some(),
+        "rebuilt once the wait is over"
+    );
+    assert_eq!(wait, None, "a quick rebuild clears the wait");
 }

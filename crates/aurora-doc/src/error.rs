@@ -94,6 +94,10 @@ pub enum DocError {
     /// with a coverage buffer that is not one byte per texel.
     #[error("a selection mask needs a non-empty area and one coverage byte per pixel")]
     SelectionMaskInvalid,
+    /// A Lasso polygon (0.214.0) had more than
+    /// [`crate::MAX_POLYGON_VERTICES`] vertices.
+    #[error("a selection outline of {0} points is too complex (the limit is 100,000)")]
+    SelectionPolygonTooComplex(usize),
     /// [`crate::SelectionSet::load`] or
     /// [`crate::SelectionSet::delete_saved`] named a selection that was
     /// never saved (or was already deleted).

@@ -199,12 +199,12 @@ fn x_and_d_are_bound_and_collide_with_no_tool_letter() {
         assert_ne!(key, 'd');
         if tool.shortcut_needs_shift() {
             // Paint Bucket is Shift+G (0.209.0) and the Elliptical Marquee
-            // Shift+M (0.213.0), never the bare letter, which selects the
+            // Shift+M (0.213.0) and the Polygonal Lasso Shift+L (0.214.0), never the bare letter, which selects the
             // first tool of the group.
-            let first = if tool == Tool::EllipticalMarquee {
-                Tool::MarqueeSelect
-            } else {
-                Tool::Gradient
+            let first = match tool {
+                Tool::EllipticalMarquee => Tool::MarqueeSelect,
+                Tool::PolygonalLasso => Tool::Lasso,
+                _ => Tool::Gradient,
             };
             assert_eq!(shortcut_command(key), Some(AppCommand::SelectTool(first)));
             continue;

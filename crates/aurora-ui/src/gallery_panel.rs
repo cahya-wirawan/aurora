@@ -1082,7 +1082,9 @@ mod tests {
         // so its three captions wrap over more lines.
         // 940 since 0.207.0: five tool icons more (25), one more wrapped
         // line (20 px) under each of the three captions.
-        assert!((min - 940.0).abs() < f32::EPSILON, "{min}");
+        // 1000 since 0.214.0: three selection-tool icons more (33), one
+        // more wrapped line (20 px) under each of the three captions.
+        assert!((min - 1000.0).abs() < f32::EPSILON, "{min}");
         let last_row_vs_body = |height: f32| {
             let (ws, g, _) = opened(height);
             // The taller column's last widget: since 0.133.1 stopped the
@@ -1158,7 +1160,10 @@ mod tests {
         );
         #[allow(clippy::cast_precision_loss)]
         let min = (body.y + i64::from(content)) as f32;
-        assert!((min - 940.0).abs() < f32::EPSILON, "measured minimum {min}");
+        assert!(
+            (min - 1000.0).abs() < f32::EPSILON,
+            "measured minimum {min}"
+        );
     }
 
     /// Red-team RT-4 / critic C12, disclosed rather than fixed: the

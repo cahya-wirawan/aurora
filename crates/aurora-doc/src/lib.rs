@@ -35,6 +35,9 @@ mod layer;
 // module's are.
 pub mod mask;
 mod selection;
+mod selection_build;
+#[cfg(test)]
+mod selection_build_tests;
 mod selection_mask;
 #[cfg(test)]
 mod selection_tests;
@@ -52,6 +55,9 @@ pub use mask::{
     write_mask_coverage, write_mask_coverage_region,
 };
 pub use selection::{Selection, SelectionSet, SelectionShape};
+pub use selection_build::{
+    COORDINATE_LIMIT, MAX_POLYGON_VERTICES, SUBSCANLINES, antialiased_mask, polygon_mask,
+};
 pub use selection_mask::{
     BoundaryTrace, MAX_SELECTION_MASK_PIXELS, MAX_TRACE_RUNS, SelectionMask, TraceRun,
 };

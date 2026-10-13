@@ -92,10 +92,12 @@ pub fn tolerance_readout_text(tolerance: u8) -> String {
     format!("Tolerance {tolerance}")
 }
 
-/// Whether `tool` is one of the two fill tools.
+/// Whether `tool` shows a fill options group instead of the radius
+/// readout: the two fill tools and the Magic Wand (0.214.0), which
+/// shares the Paint Bucket's group.
 #[must_use]
 pub const fn is_fill_tool(tool: Tool) -> bool {
-    matches!(tool, Tool::Gradient | Tool::PaintBucket)
+    matches!(tool, Tool::Gradient | Tool::PaintBucket | Tool::MagicWand)
 }
 
 fn group_style(scales: &Scales) -> Style {
@@ -241,7 +243,12 @@ pub fn sync_fill_controls(
     let mut changed = false;
     for (group, shown) in [
         (fill.gradient, tool == Tool::Gradient),
-        (fill.bucket, tool == Tool::PaintBucket),
+        // The Magic Wand shares the Paint Bucket's Tolerance and
+        // Contiguous controls (0.214.0).
+        (
+            fill.bucket,
+            matches!(tool, Tool::PaintBucket | Tool::MagicWand),
+        ),
     ] {
         changed |= set_item_shown(tree, group, shown)?;
         changed |= set_node_hidden(tree, group, !shown)?;
@@ -354,6 +361,7 @@ mod tests {
         for (tool, gradient, bucket) in [
             (Tool::Gradient, true, false),
             (Tool::PaintBucket, false, true),
+            (Tool::MagicWand, false, true),
             (Tool::Brush, false, false),
             (Tool::Eraser, false, false),
             (Tool::Move, false, false),
@@ -386,6 +394,7 @@ mod tests {
                 vec![fill.radial, fill.reverse, fill.opacity],
             ),
             (Tool::PaintBucket, vec![fill.tolerance, fill.contiguous]),
+            (Tool::MagicWand, vec![fill.tolerance, fill.contiguous]),
         ] {
             sync(&mut ws, &controls, tool, VIEW, None);
             ws.tree.compute_layout(1600.0, 900.0);

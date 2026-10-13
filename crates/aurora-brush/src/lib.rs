@@ -56,12 +56,15 @@ mod stamp;
 #[cfg(test)]
 mod test_support;
 mod undo;
+#[cfg(test)]
+mod wand_tests;
 
 pub use coverage::{Coverage, CoverageRegion};
 pub use dab::{DEFAULT_SPACING, advance_segment, dab_step, dabs_along_path};
 pub use fill::{
     FillError, FillMode, FillOutcome, FloodSpec, GradientKind, GradientSpec, MAX_EXAMINED_TILES,
-    MAX_FILL_TILES, flood_fill, flood_fill_covered, gradient_fill, gradient_fill_covered,
+    MAX_FILL_TILES, WandRegion, flood_fill, flood_fill_covered, gradient_fill,
+    gradient_fill_covered, wand_region,
 };
 pub use stamp::{
     DabOutcome, erase_dab, erase_dab_covered, stamp_dab, stamp_dab_covered,
