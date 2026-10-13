@@ -107,6 +107,20 @@ impl Tool {
         Self::PaintBucket,
     ];
 
+    /// Whether this tool makes a selection and so has the New / Add /
+    /// Subtract / Intersect modes (0.215.0).
+    #[must_use]
+    pub const fn is_selection_tool(self) -> bool {
+        matches!(
+            self,
+            Self::MarqueeSelect
+                | Self::EllipticalMarquee
+                | Self::Lasso
+                | Self::PolygonalLasso
+                | Self::MagicWand
+        )
+    }
+
     /// A short, human-readable label — for a future tool palette/status
     /// bar, and for this crate's own tests.
     #[must_use]

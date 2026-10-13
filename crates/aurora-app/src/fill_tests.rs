@@ -593,7 +593,8 @@ fn a_gradient_drag_applies_on_release_whatever_the_tool_or_button() {
             start_doc: (0.0, 0.0),
             elliptical: false,
             before: None,
-            current: None
+            current: None,
+            modal: crate::selection_modes::ModeGesture::boxed_replace(),
         })),
         None
     );

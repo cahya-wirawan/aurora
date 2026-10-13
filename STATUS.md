@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-12, version 0.214.0.** This file is updated every round (every
+**As of 2026-10-13, version 0.215.0.** This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
@@ -115,6 +115,16 @@ golden-image tests are `#[ignore]`d.
   "Inverse Selection") that never marks the document unsaved. Selections are
   still not saved (`.aur`/PSD), are lost when the document closes, and the outline is
   not clipped to the document; nothing of this has been seen live or on the Mac.
+  Since 0.215.0 every selection tool has **selection modes**: New (default), Add
+  (`Shift` held at the press), Subtract (`Alt`), Intersect (`Shift+Alt`), or a mode
+  chosen with the options bar's New/Add/Subtract/Intersect checkboxes (which override
+  the modifiers) or the palette ("Selection Mode: ..."). The result is the union
+  (`max`), intersection (`min`) or difference (saturating subtract) of the two
+  coverages, exact for inverted selections (stored inverted, not clipped to the
+  document); the selection stays visible during a combining gesture and the History row
+  reads "Add to Selection" / "Subtract from Selection" / "Intersect Selection". A result
+  over 64 Mpx is refused (the selection is kept; the Wand shows its notice). No cursor
+  badge, no mode shortcut and no menu item; nothing seen live or on the Mac.
   Since 0.214.0 the **Lasso** (`L`, drag), the **Polygonal Lasso** (`Shift+L`, click
   vertices, close near the first one or with `Enter`, `Backspace` removes a vertex) and
   the **Magic Wand** (`W`, tolerance/contiguous shared with the Paint Bucket, active

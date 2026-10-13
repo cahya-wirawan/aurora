@@ -253,9 +253,11 @@ pub fn sync_fill_controls(
         changed |= set_item_shown(tree, group, shown)?;
         changed |= set_node_hidden(tree, group, !shown)?;
     }
-    let fill_tool = is_fill_tool(tool);
-    changed |= set_item_shown(tree, controls.readout, !fill_tool)?;
-    changed |= set_node_hidden(tree, controls.readout, fill_tool)?;
+    // The radius readout has nothing to say for a fill tool, nor (0.215.0)
+    // for a selection tool, whose options are the mode group.
+    let no_radius = is_fill_tool(tool) || tool.is_selection_tool();
+    changed |= set_item_shown(tree, controls.readout, !no_radius)?;
+    changed |= set_node_hidden(tree, controls.readout, no_radius)?;
 
     changed |= sync_checkbox(tree, fill.radial, view.radial)?;
     changed |= sync_checkbox(tree, fill.reverse, view.reverse)?;
@@ -376,7 +378,7 @@ mod tests {
             // The radius readout belongs to every tool but the fill tools.
             assert_eq!(
                 shown(&ws.tree, controls.readout),
-                !is_fill_tool(tool),
+                !(is_fill_tool(tool) || tool.is_selection_tool()),
                 "{tool:?}"
             );
         }

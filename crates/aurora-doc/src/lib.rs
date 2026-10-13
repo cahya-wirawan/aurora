@@ -38,6 +38,9 @@ mod selection;
 mod selection_build;
 #[cfg(test)]
 mod selection_build_tests;
+mod selection_combine;
+#[cfg(test)]
+mod selection_combine_tests;
 mod selection_mask;
 #[cfg(test)]
 mod selection_tests;
@@ -58,6 +61,7 @@ pub use selection::{Selection, SelectionSet, SelectionShape};
 pub use selection_build::{
     COORDINATE_LIMIT, MAX_POLYGON_VERTICES, SUBSCANLINES, antialiased_mask, polygon_mask,
 };
+pub use selection_combine::{SelectionMode, combine_selections};
 pub use selection_mask::{
     BoundaryTrace, MAX_SELECTION_MASK_PIXELS, MAX_TRACE_RUNS, SelectionMask, TraceRun,
 };

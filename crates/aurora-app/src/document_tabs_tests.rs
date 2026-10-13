@@ -3270,6 +3270,7 @@ fn a_live_marquee_drag_is_recorded_when_the_document_is_left() {
         elliptical: true,
         before: None,
         current: rig.doc.selection.active(),
+        modal: crate::selection_modes::ModeGesture::boxed_replace(),
     });
     assert!(document_tabs::commit_live_gestures(&mut rig.cx(None)));
     assert!(rig.drag.is_none());
