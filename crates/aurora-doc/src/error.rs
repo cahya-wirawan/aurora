@@ -122,6 +122,11 @@ pub enum DocError {
     /// (0.218.0).
     #[error("the saved selections would take more than 128 MiB; delete one first")]
     SavedSelectionsTooLarge,
+    /// [`crate::SelectionSet::from_parts`] was given a saved selection with
+    /// no area that is not inverted: it would select nothing, which the
+    /// selection invariant never stores (0.218.1).
+    #[error("a saved selection with no area selects nothing")]
+    EmptySavedSelection,
     /// A saved selection's name failed [`crate::validate_selection_name`],
     /// or [`crate::SelectionSet::from_parts`] was given a repeated one
     /// (0.218.0).

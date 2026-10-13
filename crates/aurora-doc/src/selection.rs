@@ -479,6 +479,9 @@ impl SelectionSet {
         set.select_stored(active);
         let mut bytes = 0_u64;
         for (name, selection) in saved {
+            if selection.bounds.is_empty() && !selection.inverted {
+                return Err(DocError::EmptySavedSelection);
+            }
             if validate_selection_name(&name).as_deref() != Ok(name.as_str()) {
                 return Err(DocError::InvalidSelectionName);
             }
@@ -548,7 +551,10 @@ impl SelectionSet {
             .get(name)
             .cloned()
             .ok_or_else(|| DocError::UnknownSavedSelection(name.to_owned()))?;
-        self.active = Some(selection);
+        // Through the same invariant as every other way in: an empty,
+        // non-inverted entry (a damaged file could hold one; `from_parts`
+        // refuses it, but a set built by hand might) deselects.
+        self.select(selection);
         Ok(())
     }
 
@@ -827,5 +833,20 @@ mod tests {
             Err(DocError::UnknownSavedSelection(name)) => assert_eq!(name, "nope"),
             other => unreachable!("expected UnknownSavedSelection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_of_an_empty_plain_entry_deselects_and_never_stores_it() {
+        let mut set = SelectionSet::new();
+        set.select(Selection::new(bounds()));
+        // The invariant keeps such an entry out through the public API
+        // ([`SelectionSet::from_parts`] refuses it); plant one to prove
+        // `load` applies the rule anyway.
+        set.saved
+            .insert("empty".to_owned(), Selection::new(r(3, 3, 0, 7)));
+        if let Err(err) = set.load("empty") {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(set.active(), None, "an empty plain selection is not stored");
     }
 }

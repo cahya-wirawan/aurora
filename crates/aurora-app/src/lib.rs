@@ -2640,6 +2640,7 @@ fn read_autosave_container(
             skipped_tiles: document.skipped_tiles,
             import_losses: document.import_losses,
             selection: document.selection,
+            selection_dropped: document.selection_dropped,
         }),
         Err(err) => {
             tracing::warn!(?err, path = %path.display(), "failed to read the autosave container");
@@ -2669,6 +2670,8 @@ struct RecoveredDocument {
     import_losses: Option<Vec<String>>,
     /// The selections the autosave carried (0.218.0).
     selection: aurora_doc::SelectionSet,
+    /// Why its selection entry was dropped, if it was (0.218.1).
+    selection_dropped: Option<String>,
 }
 
 /// What [`App::new`] starts this session with — see
@@ -2690,6 +2693,9 @@ struct StartupDocument {
     import_losses: Option<Vec<String>>,
     /// A recovered document's selections (0.218.0); empty otherwise.
     selection: aurora_doc::SelectionSet,
+    /// Why a recovered document's selection entry was dropped (0.218.1),
+    /// for the status-bar notice `App::new` raises.
+    selection_dropped: Option<String>,
     /// Whether this really came from an autosave — what the
     /// crash-recovery dialog's own message reports
     /// ([`crash_recovery_dialog_message`]).
@@ -2838,6 +2844,10 @@ fn recovered_shelf(sessions: Vec<RecoveredSession>) -> DocumentShelf {
             skipped_tiles,
             import_losses,
             selection,
+            // A parked recovered document is not on screen, so there is no
+            // status bar to tell: a known gap (0.218.1), the entry is
+            // simply left out.
+            selection_dropped: _,
         } = document;
         let active_layer = topmost_pixel_layer(&layers);
         let canvas_view = load_document_view(
@@ -2893,6 +2903,7 @@ fn startup_document_from(
             skipped_tiles: aurora_io::SkippedTiles::new(),
             import_losses: None,
             selection: aurora_doc::SelectionSet::new(),
+            selection_dropped: None,
             was_recovered: false,
             autosave: None,
             recovered_from: None,
@@ -2928,6 +2939,7 @@ fn startup_document_from(
                 skipped_tiles,
                 import_losses,
                 selection,
+                selection_dropped,
             }) = recovered
             {
                 // Nothing written back out: the file on disk *is* this
@@ -2946,6 +2958,7 @@ fn startup_document_from(
                     skipped_tiles,
                     import_losses,
                     selection,
+                    selection_dropped,
                     was_recovered: true,
                     autosave: None,
                     recovered_from: Some(position),
@@ -3017,6 +3030,7 @@ fn startup_document_from(
         skipped_tiles,
         import_losses: None,
         selection: aurora_doc::SelectionSet::new(),
+        selection_dropped: None,
         was_recovered: false,
         autosave,
         recovered_from: None,
@@ -27173,6 +27187,7 @@ impl App {
             skipped_tiles,
             import_losses: startup_import_losses,
             selection: startup_selection,
+            selection_dropped: startup_selection_dropped,
             was_recovered,
             autosave: startup_autosave,
             recovered_from,
@@ -27396,7 +27411,11 @@ impl App {
             ime_allowed: false,
             ime_cursor_area: None,
             residency_viewport: None,
-            lock_notice: None,
+            // 0.218.1: a recovered autosave whose selection entry was
+            // unusable says so, like an ordinary open does.
+            lock_notice: startup_selection_dropped
+                .as_ref()
+                .map(|_| (LockRefusal::SelectionDroppedOnOpen, active_layer)),
             drag: None,
             rail_resize: None,
             panel_drag: None,

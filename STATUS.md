@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-13, version 0.218.0.** (0.218.0: selections are saved in `.aur` and autosaves, Save/Load/Delete Saved Selection exist, and selection undo steps have a 256 MiB packed-history budget; not seen live nor on the Mac.) This file is updated every round (every
+**As of 2026-10-13, version 0.218.0.** (0.218.0: selections are saved in `.aur` and autosaves, Save/Load/Delete Saved Selection exist, and selection undo steps have a 256 MiB packed-history budget (the budget ignores masks shared with live selections, and packing runs on the UI thread); a PSD save names only saved selections, the active one is not written to PSD; not seen live nor on the Mac.) This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),

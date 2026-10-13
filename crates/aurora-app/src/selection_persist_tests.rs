@@ -421,16 +421,22 @@ fn the_name_prompt_validates_and_the_palette_lists_loads_and_deletes() {
 }
 
 #[test]
-fn the_psd_report_names_the_selection_only_when_there_is_one() {
+fn the_psd_report_names_only_saved_selections_never_a_transient_active_one() {
     let mut set = SelectionSet::new();
     assert_eq!(crate::psd_save::selection_loss_line(&set), None);
     set.select(Selection::new(rect(0, 0, 3, 3)));
-    let line = crate::psd_save::selection_loss_line(&set).unwrap_or_default();
-    assert!(line.contains("not saved"), "{line}");
+    assert_eq!(
+        crate::psd_save::selection_loss_line(&set),
+        None,
+        "an active selection alone does not make a PSD save lossy"
+    );
     ok(set.save_active("x"));
+    let line = crate::psd_save::selection_loss_line(&set).unwrap_or_default();
+    assert!(line.contains("Saved selections"), "{line}");
     set.deselect();
-    let saved_only = crate::psd_save::selection_loss_line(&set).unwrap_or_default();
-    assert!(saved_only.contains("Saved selections"), "{saved_only}");
+    assert!(crate::psd_save::selection_loss_line(&set).is_some());
+    ok(set.delete_saved("x"));
+    assert_eq!(crate::psd_save::selection_loss_line(&set), None);
 }
 
 // -- Autosave and recovery -------------------------------------------------
@@ -572,4 +578,40 @@ fn quick_mask_does_not_change_what_is_persisted() {
     drop(mode);
     assert_eq!(set.saved_sorted().len(), before);
     assert_eq!(set.active(), active);
+}
+
+#[test]
+fn a_recovered_autosave_with_a_damaged_selection_reports_why_and_opens_without_it() {
+    let dir = ok(tempfile::tempdir());
+    let path = dir.path().join("aurora-autosave-damaged.aur");
+    let (_s, mut store) = new_store();
+    crate::write_autosave(
+        &path,
+        &tree(),
+        &aurora_doc::History::new(),
+        (8, 8),
+        &mut aurora_io::SkippedTiles::new(),
+        &mut store,
+        None,
+        Some(&rich()),
+    );
+    // Replace the selection entry with garbage.
+    let bytes = ok(std::fs::read(&path));
+    let mut archive = ok(zip::ZipArchive::new(std::io::Cursor::new(bytes)));
+    let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for index in 0..archive.len() {
+        let file = ok(archive.by_index_raw(index));
+        if file.name() != "selection" {
+            ok(out.raw_copy_file(file));
+        }
+    }
+    ok(out.start_file("selection", zip::write::SimpleFileOptions::default()));
+    ok(std::io::Write::write_all(&mut out, &[0xFF; 12]));
+    ok(std::fs::write(&path, ok(out.finish()).into_inner()));
+    let (_s2, mut fresh) = new_store();
+    let Some(recovered) = crate::recover_document(&path, &mut fresh) else {
+        unreachable!("the document still recovers");
+    };
+    assert!(recovered.selection.is_empty());
+    assert!(recovered.selection_dropped.is_some());
 }

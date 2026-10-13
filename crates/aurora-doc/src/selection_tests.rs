@@ -610,4 +610,17 @@ mod persist {
             Err(SelectionNameError::TooLong)
         );
     }
+
+    #[test]
+    fn from_parts_refuses_an_empty_plain_saved_selection_but_keeps_an_inverted_one() {
+        let empty = Selection::new(r(3, 3, 0, 7));
+        let r1 = SelectionSet::from_parts(None, vec![("e".to_owned(), empty.clone())]);
+        assert!(matches!(r1, Err(DocError::EmptySavedSelection)));
+        let everything = Selection {
+            inverted: true,
+            ..empty
+        };
+        let r2 = SelectionSet::from_parts(None, vec![("all".to_owned(), everything)]);
+        assert!(r2.is_ok_and(|s| s.saved_count() == 1));
+    }
 }
