@@ -1,6 +1,6 @@
 # Aurora status
 
-**As of 2026-10-13, version 0.217.0.** This file is updated every round (every
+**As of 2026-10-13, version 0.217.1.** (0.217.1 hardened two timing tests after CI and a Mac Metal run; no product change.) This file is updated every round (every
 version bump that changes what Aurora does or what has been verified). It is
 the detailed, honest picture of where the project is. The front page is
 [README.md](README.md), the per-version list is [CHANGELOG.md](CHANGELOG.md),
