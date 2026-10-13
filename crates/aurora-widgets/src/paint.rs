@@ -1561,6 +1561,27 @@ fn paint_button(
     if let Some((kind, size)) = state.icon {
         return paint_icon_button(state, kind, size, bounds, mesh, theme, scales, scale_factor);
     }
+    if state.flat {
+        // A flat text button (0.225.0): no fill or outline at rest; open or
+        // pressed takes the active tint, hovered the hover tint.
+        let open = state.toggled == Some(true);
+        let overlay = if state.disabled {
+            None
+        } else if state.pressed || open {
+            Some(theme.state.active_overlay)
+        } else if state.hovered {
+            Some(theme.state.hover_overlay)
+        } else {
+            None
+        };
+        return Ok(overlay
+            .map(|overlay| {
+                let [r, g, b] = overlay.color.to_srgb_f32();
+                (mesh, [r, g, b, overlay.alpha])
+            })
+            .into_iter()
+            .collect());
+    }
 
     // No hover flag exists on `ButtonState` yet (`widgets::button`'s own
     // doc comment), so only the two states it actually tracks are
@@ -7830,5 +7851,44 @@ mod tests {
             disabled.first().is_some_and(|p| p.1 == [r, g, b, 1.0]),
             "the icon is icon.disabled"
         );
+    }
+
+    #[test]
+    fn a_flat_text_button_is_bare_at_rest_and_tints_on_hover_open_and_press() {
+        let theme = dark_theme();
+        let scales = crate::widgets::test_scales();
+        let (mut tree, root) = crate::widgets::new_tree(taffy::Style::default());
+        let Ok(id) = crate::widgets::insert_flat_button(&mut tree, root, &scales, "File") else {
+            unreachable!("root exists");
+        };
+        tree.compute_layout(200.0, 200.0);
+        let paints =
+            |tree: &WidgetTree<WidgetKind>| match paint_widget(tree, id, &theme, &scales, 1.0) {
+                Ok(paints) => paints,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        assert!(paints(&tree).is_empty(), "no fill and no outline at rest");
+        assert!(crate::widgets::set_button_hovered(&mut tree, id, true).is_ok());
+        let hovered = paints(&tree);
+        assert_eq!(hovered.len(), 1);
+        assert!(
+            hovered
+                .first()
+                .is_some_and(|p| (p.1[3] - theme.state.hover_overlay.alpha).abs() < 1e-6)
+        );
+        // Open (toggled) takes the active tint even without a pointer.
+        assert!(crate::widgets::set_button_hovered(&mut tree, id, false).is_ok());
+        assert!(crate::widgets::set_button_toggled(&mut tree, id, true).is_ok());
+        let open = paints(&tree);
+        assert_eq!(open.len(), 1);
+        assert!(
+            open.first()
+                .is_some_and(|p| (p.1[3] - theme.state.active_overlay.alpha).abs() < 1e-6)
+        );
+        assert!(crate::widgets::set_button_toggled(&mut tree, id, false).is_ok());
+        assert!(crate::widgets::set_button_pressed(&mut tree, id, true).is_ok());
+        assert_eq!(paints(&tree).len(), 1, "pressed tints");
+        assert!(crate::widgets::set_button_disabled(&mut tree, id, true).is_ok());
+        assert!(paints(&tree).is_empty(), "disabled: no tint");
     }
 }

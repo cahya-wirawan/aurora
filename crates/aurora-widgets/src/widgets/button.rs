@@ -38,6 +38,8 @@ use crate::error::WidgetError;
 use crate::icons::IconKind;
 use crate::tree::{WidgetId, WidgetTree};
 
+// `flat` is a paint kind (the menu bar's), not a state to fold into an enum.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ButtonState {
     pub label: String,
@@ -56,6 +58,13 @@ pub struct ButtonState {
     /// what a screen reader reads after the name — an icon button's
     /// purpose, or why it is disabled ([`set_button_description`]).
     pub description: Option<String>,
+    /// A flat text button (0.225.0, the menu bar's kind): a toggle whose
+    /// state means "its popup is open". No fill and no outline at rest, a
+    /// `state.hover_overlay` tint while [hovered](set_button_hovered), a
+    /// `state.active_overlay` tint while pressed or open, the label in
+    /// `text.primary`. Its node reports `expanded` (and a menu popup)
+    /// instead of `toggled`.
+    pub flat: bool,
 }
 
 impl ButtonState {
@@ -64,7 +73,7 @@ impl ButtonState {
     /// when on or while held down.
     #[must_use]
     pub const fn fills_accent(&self) -> bool {
-        self.pressed || !matches!(self.toggled, Some(false))
+        !self.flat && (self.pressed || !matches!(self.toggled, Some(false)))
     }
 }
 
@@ -72,7 +81,12 @@ fn node(state: &ButtonState) -> Node {
     let mut node = Node::new(Role::Button);
     node.set_label(state.label.clone());
     if let Some(on) = state.toggled {
-        node.set_toggled(if on { Toggled::True } else { Toggled::False });
+        if state.flat {
+            node.set_expanded(on);
+            node.set_has_popup(accesskit::HasPopup::Menu);
+        } else {
+            node.set_toggled(if on { Toggled::True } else { Toggled::False });
+        }
     }
     if let Some(description) = &state.description {
         node.set_description(description.clone());
@@ -117,6 +131,7 @@ pub fn insert_button(
         icon: None,
         hovered: false,
         description: None,
+        flat: false,
     };
     tree.insert(
         parent,
@@ -147,6 +162,7 @@ pub fn insert_toggle_button(
         icon: None,
         hovered: false,
         description: None,
+        flat: false,
     };
     // One control row plus its vertical padding, text-blind or measured
     // alike (`measure::measure_widget` gives the same height), so a
@@ -159,6 +175,28 @@ pub fn insert_toggle_button(
         node(&state),
         WidgetKind::Button(state),
     )
+}
+
+/// Adds a **flat text** button (0.225.0, the menu bar's titles) as the
+/// last child of `parent`: a toggle button (`open` is its state) with the
+/// flat look described on [`ButtonState::flat`]. It is measured and sized
+/// like any toggle button.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `parent` doesn't exist.
+pub fn insert_flat_button(
+    tree: &mut WidgetTree<WidgetKind>,
+    parent: WidgetId,
+    scales: &Scales,
+    label: impl Into<String>,
+) -> Result<WidgetId, WidgetError> {
+    let id = insert_toggle_button(tree, parent, scales, label, false)?;
+    with_button_mut(tree, id, |state| {
+        state.flat = true;
+        Ok(())
+    })?;
+    Ok(id)
 }
 
 /// Adds a new **icon** button as the last child of `parent` — see this
@@ -186,6 +224,7 @@ pub fn insert_icon_button(
         icon: Some((kind, size)),
         hovered: false,
         description: None,
+        flat: false,
     };
     let side = icon_button_side(scales, size);
     let mut icon_style = style(scales);
@@ -424,6 +463,7 @@ mod tests {
                 icon: None,
                 hovered: false,
                 description: None,
+                flat: false,
             }))
         );
         let Some(accessibility) = tree.accessibility(id) else {
@@ -660,5 +700,47 @@ mod tests {
         scales.size.icon_button = 40;
         assert!((icon_button_side(&scales, IconSize::Large) - 40.0).abs() < 1e-6);
         assert!((icon_button_side(&scales, IconSize::Small) - 24.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_flat_button_reports_expanded_not_toggled_and_never_fills_accent() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let id = match super::insert_flat_button(&mut tree, root, &scales, "File") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let node = |tree: &WidgetTree<WidgetKind>| tree.accessibility(id).cloned();
+        let closed = node(&tree);
+        assert_eq!(
+            closed.as_ref().and_then(accesskit::Node::is_expanded),
+            Some(false)
+        );
+        assert_eq!(closed.as_ref().and_then(accesskit::Node::toggled), None);
+        assert_eq!(
+            closed.as_ref().and_then(accesskit::Node::has_popup),
+            Some(accesskit::HasPopup::Menu)
+        );
+        assert!(closed.is_some_and(|n| n.supports_action(Action::Click)));
+        assert!(set_button_toggled(&mut tree, id, true).is_ok());
+        let open = node(&tree);
+        assert_eq!(open.and_then(|n| n.is_expanded()), Some(true));
+        match tree.payload(id) {
+            Some(WidgetKind::Button(state)) => {
+                assert!(state.flat);
+                assert!(
+                    !state.fills_accent(),
+                    "an open flat button is not accent-filled"
+                );
+            }
+            other => unreachable!("{other:?}"),
+        }
+        // A pressed flat button is still flat; its expanded state survives.
+        assert!(set_button_pressed(&mut tree, id, true).is_ok());
+        assert_eq!(node(&tree).and_then(|n| n.is_expanded()), Some(true));
+        match tree.payload(id) {
+            Some(WidgetKind::Button(state)) => assert!(!state.fills_accent()),
+            other => unreachable!("{other:?}"),
+        }
     }
 }
