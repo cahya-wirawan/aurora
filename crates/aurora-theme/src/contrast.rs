@@ -229,6 +229,14 @@ const GATED_PAIRS: &[GatedPair] = &[
         foreground: |t| t.icon.on_accent,
         background: |t| t.accent.primary,
     },
+    // 0.219.0: the marching ants are two tones that must read against each
+    // other so one of them shows on any backdrop (WCAG 1.4.11, 3:1).
+    GatedPair {
+        label: "selection.ants_light on selection.ants_dark",
+        floor: 3.0,
+        foreground: |t| t.selection.ants_light,
+        background: |t| t.selection.ants_dark,
+    },
 ];
 
 /// One gated pair's result: whether `theme` clears the WCAG floor for it.
@@ -330,8 +338,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            29,
-            "expected all 29 gated pairs to be checked"
+            30,
+            "expected all 30 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -342,6 +350,33 @@ mod tests {
                 result.floor
             );
         }
+    }
+
+    /// 0.219.0: the ants pair is a gated pair with a 3:1 floor, and as
+    /// chosen (pure white on pure black) it measures 21:1.
+    #[test]
+    fn the_ants_pair_is_gated_at_three_to_one_and_measures_twenty_one() {
+        let palette = match Palette::from_toml_str(PALETTE_TOML) {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut set = ThemeSet::new();
+        if let Err(err) = set.register(DARK_TOML) {
+            unreachable!("{err:?}");
+        }
+        let theme = match set.resolve("Dark", &palette) {
+            Ok(t) => t,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let results = check_gated_pairs(&theme);
+        let Some(pair) = results
+            .iter()
+            .find(|r| r.label == "selection.ants_light on selection.ants_dark")
+        else {
+            unreachable!("the ants pair is gated");
+        };
+        assert!((pair.floor - 3.0).abs() < 1e-6);
+        assert!((pair.ratio - 21.0).abs() < 1e-3, "{}", pair.ratio);
     }
 
     #[test]
@@ -366,8 +401,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            29,
-            "expected all 29 gated pairs to be checked"
+            30,
+            "expected all 30 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -402,8 +437,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            29,
-            "expected all 29 gated pairs to be checked"
+            30,
+            "expected all 30 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -438,8 +473,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            29,
-            "expected all 29 gated pairs to be checked"
+            30,
+            "expected all 30 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -474,8 +509,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            29,
-            "expected all 29 gated pairs to be checked"
+            30,
+            "expected all 30 gated pairs to be checked"
         );
         for result in &results {
             assert!(

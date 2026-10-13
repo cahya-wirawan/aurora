@@ -75,6 +75,13 @@ def main():
             value = resolve_color(val, palette) if isinstance(val, str) else val
             lines.append(f"  {css_var_name(f'state-{name}')}: {value};")
 
+    # 0.219.0: the marching-ants pair and the Quick Mask overlay.
+    for name, ref in theme["selection"].items():
+        lines.append(f"  {css_var_name(f'selection-{name}')}: {resolve_color(ref, palette)};")
+    overlay = theme["quick_mask"]["overlay"]
+    lines.append(f"  --quick-mask-overlay-color: {resolve_color(overlay['color'], palette)};")
+    lines.append(f"  --quick-mask-overlay-alpha: {overlay['alpha']};")
+
     lines.append("")
 
     # --- shared scales (theme-independent) ---

@@ -70,6 +70,21 @@ pub struct StateTokens {
     pub active_overlay: Overlay,
 }
 
+/// The marching-ants selection outline's two tones (`selection.*`,
+/// 0.219.0): identical in every built-in theme, pure white and pure black.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SelectionTokens {
+    pub ants_light: Color,
+    pub ants_dark: Color,
+}
+
+/// The Quick Mask tint (`quick_mask.*`, 0.219.0): `overlay.alpha` is the
+/// tint's maximum opacity (a fully excluded area).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuickMaskTokens {
+    pub overlay: Overlay,
+}
+
 /// A fully resolved theme: every token in `design/tokens/vocabulary.md`,
 /// with its `extends` chain (if any) already merged and every palette
 /// reference already resolved to a concrete [`Color`]. Nothing downstream
@@ -84,6 +99,8 @@ pub struct Theme {
     pub border: BorderTokens,
     pub accent: AccentTokens,
     pub state: StateTokens,
+    pub selection: SelectionTokens,
+    pub quick_mask: QuickMaskTokens,
 }
 
 /// One registered theme's raw, unresolved data: its own declared parent
@@ -138,7 +155,16 @@ impl ThemeSet {
             .unwrap_or(false);
 
         let mut fields = HashMap::new();
-        for key in ["surface", "text", "icon", "border", "accent", "state"] {
+        for key in [
+            "surface",
+            "text",
+            "icon",
+            "border",
+            "accent",
+            "state",
+            "selection",
+            "quick_mask",
+        ] {
             if let Some(section) = root.get(key) {
                 flatten(key, section, &mut fields);
             }
@@ -229,6 +255,16 @@ impl ThemeSet {
                 active_overlay: Overlay {
                     color: resolve_color(&merged, "state.active_overlay.color", palette)?,
                     alpha: require_f32(&merged, "state.active_overlay.alpha")?,
+                },
+            },
+            selection: SelectionTokens {
+                ants_light: resolve_color(&merged, "selection.ants_light", palette)?,
+                ants_dark: resolve_color(&merged, "selection.ants_dark", palette)?,
+            },
+            quick_mask: QuickMaskTokens {
+                overlay: Overlay {
+                    color: resolve_color(&merged, "quick_mask.overlay.color", palette)?,
+                    alpha: require_f32(&merged, "quick_mask.overlay.alpha")?,
                 },
             },
         })
@@ -351,6 +387,69 @@ mod tests {
         assert_eq!(theme.surface.canvas.r, 0x14);
         assert!((theme.state.disabled_opacity - 0.4).abs() < 1e-6);
         assert!((theme.state.hover_overlay.alpha - 0.06).abs() < 1e-6);
+    }
+
+    /// 0.219.0: every built-in theme resolves the selection and Quick Mask
+    /// tokens, and they are identical in all five — the ants pure white and
+    /// pure black, the overlay `semantic.red.500` at 0.5.
+    #[test]
+    fn every_built_in_theme_resolves_the_selection_and_quick_mask_tokens() {
+        let sources = [
+            ("Dark", DARK_TOML),
+            ("Light", include_str!("../../../design/themes/light.toml")),
+            (
+                "High Contrast Dark",
+                include_str!("../../../design/themes/high-contrast-dark.toml"),
+            ),
+            (
+                "High Contrast Light",
+                include_str!("../../../design/themes/high-contrast-light.toml"),
+            ),
+            (
+                "Color-Critical",
+                include_str!("../../../design/themes/color-critical.toml"),
+            ),
+        ];
+        let mut set = ThemeSet::new();
+        for (_, source) in sources {
+            if let Err(err) = set.register(source) {
+                unreachable!("{err:?}");
+            }
+        }
+        let palette = palette();
+        let red = match palette.resolve("semantic.red.500") {
+            Ok(c) => c,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for (name, _) in sources {
+            let theme = match set.resolve(name, &palette) {
+                Ok(t) => t,
+                Err(err) => unreachable!("{name}: {err:?}"),
+            };
+            assert_eq!(
+                (
+                    theme.selection.ants_light.r,
+                    theme.selection.ants_light.g,
+                    theme.selection.ants_light.b
+                ),
+                (255, 255, 255),
+                "{name}: ants_light is pure white"
+            );
+            assert_eq!(
+                (
+                    theme.selection.ants_dark.r,
+                    theme.selection.ants_dark.g,
+                    theme.selection.ants_dark.b
+                ),
+                (0, 0, 0),
+                "{name}: ants_dark is pure black"
+            );
+            assert_eq!(theme.quick_mask.overlay.color, red, "{name}");
+            assert!(
+                (theme.quick_mask.overlay.alpha - 0.5).abs() < 1e-6,
+                "{name}"
+            );
+        }
     }
 
     #[test]

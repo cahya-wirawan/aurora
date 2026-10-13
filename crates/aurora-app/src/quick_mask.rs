@@ -26,7 +26,7 @@
 //!   a press or command says so in the status bar and does nothing. Pan,
 //!   Zoom, the Eyedropper and Move work normally.
 //! * **The overlay** is the unselected area tinted
-//!   (`aurora_ui::quick_mask_tint`: the `state.error` token at up to 50 %),
+//!   (`aurora_ui::quick_mask_tint`: the `quick_mask.overlay` token, up to its 50 % alpha),
 //!   rebuilt only when the grid, the view or the sizes change
 //!   ([`QuickMaskMode::tint_changed`]); the status bar reads
 //!   "Quick Mask · Document: ...".

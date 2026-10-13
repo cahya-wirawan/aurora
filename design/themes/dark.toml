@@ -54,3 +54,16 @@ alpha = 0.06
 [state.active_overlay]
 color = "neutral.900"
 alpha = 0.10
+
+# 0.219.0 (design owner Cahya's decision, delegated for the values): the
+# marching-ants pair and the Quick Mask overlay. Identical in all five
+# themes on purpose -- the ants must read on any image, so they are pure
+# white and pure black ([hc] is the palette's only pure pair; the [neutral]
+# ramp's ends are #141414 and #f5f5f6), not surface-relative.
+[selection]
+ants_light = "hc.white"
+ants_dark  = "hc.black"
+
+[quick_mask.overlay]
+color = "semantic.red.500"
+alpha = 0.5

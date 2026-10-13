@@ -56,10 +56,10 @@
 //!
 //! Every size is a token or derived from one; nothing is a literal. The
 //! icons are the provisional set of [`aurora_widgets::icons`] and have
-//! not been seen by a human, nor on the Mac. There is no per-tool-button
-//! size token: the strip reuses the Layers toolbar's button size
-//! ([`aurora_widgets::widgets::icon_button_side`] at [`IconSize::Large`]),
-//! which is a gap for the design owner to settle.
+//! not been seen by a human, nor on the Mac. A button's side is the
+//! `size.icon_button` token (0.219.0, 32 px;
+//! [`aurora_widgets::widgets::icon_button_side`] at [`IconSize::Large`]),
+//! shared with the Layers toolbar.
 
 use accesskit::{Node, Orientation, Role};
 use aurora_theme::Scales;
@@ -625,6 +625,17 @@ mod tests {
         }
         let expected: Vec<_> = ws.tools.buttons.iter().map(|(_, id)| *id).collect();
         assert_eq!(visited, expected);
+    }
+
+    /// 0.219.0: the strip's width follows the `size.icon_button` token
+    /// (two buttons plus `spacing.xxs` each side), and the default is
+    /// unchanged at 72.
+    #[test]
+    fn the_strip_width_follows_the_icon_button_token() {
+        let mut scales = scales();
+        assert!((tools_panel_width(&scales) - 72.0).abs() < f32::EPSILON);
+        scales.size.icon_button = 36;
+        assert!((tools_panel_width(&scales) - 80.0).abs() < f32::EPSILON);
     }
 
     /// 0.207.0: the strip is two 32 px buttons and `spacing.xxs` padding

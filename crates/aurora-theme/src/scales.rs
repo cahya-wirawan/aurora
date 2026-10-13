@@ -84,6 +84,15 @@ pub struct SizeScale {
     /// (0.166.0: a provisional 2, for the design owner to tune). Logical
     /// px, not scaled by density.
     pub indicator_width: u32,
+    /// The side of an icon-only button — the Tools panel's tool buttons
+    /// and the Layers toolbar's (0.219.0: 32, the 24 px icon plus
+    /// `spacing.xxs` each side they used before). Logical px, not scaled
+    /// by density.
+    pub icon_button: u32,
+    /// The side of a foreground/background colour swatch in the Tools
+    /// panel (0.219.0: 24, `spacing.lg`, what they were drawn at before).
+    /// Logical px, not scaled by density.
+    pub colour_swatch: u32,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -355,6 +364,23 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(scales.size.indicator_width, 2);
+    }
+
+    /// 0.219.0: the icon-button and colour-swatch size tokens parse, at
+    /// the values the buttons and swatches were already drawn at.
+    #[test]
+    fn the_icon_button_and_colour_swatch_tokens_parse() {
+        let scales = match Scales::from_toml_str(SCALES_TOML) {
+            Ok(scales) => scales,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(scales.size.icon_button, 32);
+        assert_eq!(
+            scales.size.icon_button,
+            scales.spacing.lg + 2 * scales.spacing.xxs
+        );
+        assert_eq!(scales.size.colour_swatch, 24);
+        assert_eq!(scales.size.colour_swatch, scales.spacing.lg);
     }
 
     #[test]

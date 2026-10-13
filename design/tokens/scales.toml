@@ -75,6 +75,15 @@ content_panel_max_rows = 10
 # for the design owner to tune: 2, the weight both used as literals
 # before. Logical px; not scaled by density (only the spacing scale is).
 indicator_width = 2
+# The side of an icon-only button -- the Tools panel's tool buttons and the
+# Layers toolbar's buttons (0.219.0, design owner's decision 2026-10-13, who
+# delegated the value). 32 = the 24 px icon plus `spacing.xxs` each side
+# that both used before, so nothing moved. Logical px; not scaled by density.
+icon_button = 32
+# The side of a foreground/background colour swatch in the Tools panel
+# (0.219.0, same decision). 24 = `spacing.lg`, what the swatches were drawn
+# at before, so nothing moved. Logical px; not scaled by density.
+colour_swatch = 24
 
 [radius]
 none = 0

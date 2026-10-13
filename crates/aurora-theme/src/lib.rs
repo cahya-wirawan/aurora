@@ -63,6 +63,6 @@ pub use scales::{
     TypeLineHeightScale, TypeScale, TypeSizeScale, TypeWeightScale,
 };
 pub use theme::{
-    AccentTokens, BorderTokens, IconTokens, Overlay, StateTokens, SurfaceTokens, TextTokens, Theme,
-    ThemeSet,
+    AccentTokens, BorderTokens, IconTokens, Overlay, QuickMaskTokens, SelectionTokens, StateTokens,
+    SurfaceTokens, TextTokens, Theme, ThemeSet,
 };

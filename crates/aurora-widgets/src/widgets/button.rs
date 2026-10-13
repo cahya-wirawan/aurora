@@ -229,11 +229,18 @@ pub fn insert_icon_toggle_button(
     Ok(id)
 }
 
-/// The side of an icon button for `size`: the icon plus `spacing.xxs` of
-/// room on each side for its hover and pressed tint.
+/// The side of an icon button for `size`. [`IconSize::Large`] is the
+/// `size.icon_button` token (0.219.0, the design owner's: 32 px, logical,
+/// not density scaled), which is what the Tools panel's and the Layers
+/// toolbar's buttons use; the icon sits centred in it. [`IconSize::Small`]
+/// is still derived: the icon plus `spacing.xxs` of room on each side for
+/// its hover and pressed tint (no token for it).
 #[must_use]
 pub fn icon_button_side(scales: &Scales, size: IconSize) -> f32 {
-    icon_side(scales, size) + 2.0 * spacing(scales.spacing.xxs)
+    match size {
+        IconSize::Large => spacing(scales.size.icon_button),
+        IconSize::Small => icon_side(scales, size) + 2.0 * spacing(scales.spacing.xxs),
+    }
 }
 
 /// Sets (or clears) `id`'s accessible description, returning whether
@@ -638,5 +645,20 @@ mod tests {
             unreachable!("laid out");
         };
         assert_eq!((bounds.width as f32, bounds.height as f32), (side, side));
+    }
+
+    /// 0.219.0: a Large icon button is the `size.icon_button` token (32,
+    /// what icon + 2 x `spacing.xxs` gave before, so nothing moved); a
+    /// Small one is still derived and ignores the token.
+    #[test]
+    fn a_large_icon_button_is_the_icon_button_token() {
+        use super::icon_button_side;
+        use crate::widgets::IconSize;
+        let mut scales = test_scales();
+        assert!((icon_button_side(&scales, IconSize::Large) - 32.0).abs() < 1e-6);
+        assert!((icon_button_side(&scales, IconSize::Small) - 24.0).abs() < 1e-6);
+        scales.size.icon_button = 40;
+        assert!((icon_button_side(&scales, IconSize::Large) - 40.0).abs() < 1e-6);
+        assert!((icon_button_side(&scales, IconSize::Small) - 24.0).abs() < 1e-6);
     }
 }

@@ -57,8 +57,8 @@ schema_version = 1
 # Literal, maximum-contrast primitives for the two High Contrast themes only.
 # Deliberately separate from [neutral]/[accent.blue], which are tuned to stay
 # "quiet" and never reach true black/white/max-saturation on purpose.
-black       = "#000000"
-white       = "#ffffff"
+black       = "#000000"   # also `selection.ants_dark` in every theme (0.219.0): the only pure black
+white       = "#ffffff"   # also `selection.ants_light` in every theme (0.219.0): the only pure white
 mid_gray    = "#808080"   # disabled content only -- WCAG-exempt, but still legible
 yellow      = "#ffff00"   # primary accent -- near-maximum luminance among fully-saturated hues
 yellow_dark = "#c8a000"   # pressed/active accent -- clearly distinct from primary, still bold
