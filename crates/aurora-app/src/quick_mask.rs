@@ -118,7 +118,7 @@ pub(crate) fn luma(rgb: [f32; 3]) -> u8 {
 #[must_use]
 pub(crate) fn target_byte(tool: DabTool, colours: &ColourState) -> u8 {
     match tool {
-        DabTool::Brush => luma(colours.foreground()),
+        DabTool::Brush | DabTool::Pencil => luma(colours.foreground()),
         DabTool::Eraser => luma(colours.background()),
     }
 }
@@ -136,7 +136,14 @@ pub(crate) fn paint_dab(
     let radius = settings.dab_radius(tool);
     let target = target_byte(tool, colours);
     mode.mask
-        .edit(|data, w, h| aurora_brush::stamp_toward(data, w, h, doc_point, radius, target))
+        .edit(|data, w, h| {
+            // The Pencil's hard footprint (0.220.0), the others' soft one.
+            if tool == DabTool::Pencil {
+                aurora_brush::stamp_toward_hard(data, w, h, doc_point, radius, target)
+            } else {
+                aurora_brush::stamp_toward(data, w, h, doc_point, radius, target)
+            }
+        })
         .is_some()
 }
 
@@ -220,7 +227,13 @@ pub(crate) fn tool_refusal(tool: aurora_ui::Tool) -> Option<LockRefusal> {
         | Tool::Lasso
         | Tool::PolygonalLasso
         | Tool::MagicWand => Some(LockRefusal::QuickMaskToolUnavailable),
-        Tool::Move | Tool::Zoom | Tool::Pan | Tool::Eyedropper | Tool::Brush | Tool::Eraser => None,
+        Tool::Move
+        | Tool::Zoom
+        | Tool::Pan
+        | Tool::Eyedropper
+        | Tool::Brush
+        | Tool::Pencil
+        | Tool::Eraser => None,
     }
 }
 
@@ -229,11 +242,7 @@ pub(crate) fn tool_refusal(tool: aurora_ui::Tool) -> Option<LockRefusal> {
 /// pixel-history step can be recorded); everything else is unchanged.
 #[must_use]
 pub(crate) fn drag_layer<T>(on: bool, tool: aurora_ui::Tool, layer: Option<T>) -> Option<T> {
-    if on && matches!(tool, aurora_ui::Tool::Brush | aurora_ui::Tool::Eraser) {
-        None
-    } else {
-        layer
-    }
+    if on && paints_mask(tool) { None } else { layer }
 }
 
 /// Whether a press skips the layer-lock refusal: only the mask-painting
@@ -241,7 +250,15 @@ pub(crate) fn drag_layer<T>(on: bool, tool: aurora_ui::Tool, layer: Option<T>) -
 /// position lock.
 #[must_use]
 pub(crate) fn skips_lock_gate(on: bool, tool: aurora_ui::Tool) -> bool {
-    on && matches!(tool, aurora_ui::Tool::Brush | aurora_ui::Tool::Eraser)
+    on && paints_mask(tool)
+}
+
+/// Whether `tool` edits the grid in the mode (the three dab tools).
+const fn paints_mask(tool: aurora_ui::Tool) -> bool {
+    matches!(
+        tool,
+        aurora_ui::Tool::Brush | aurora_ui::Tool::Pencil | aurora_ui::Tool::Eraser
+    )
 }
 
 /// Ends a Brush or Eraser drag that has no stroke snapshot: such a drag

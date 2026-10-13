@@ -5559,6 +5559,8 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         ("h", AppCommand::SelectTool(aurora_ui::Tool::Pan)),
         ("i", AppCommand::SelectTool(aurora_ui::Tool::Eyedropper)),
         ("b", AppCommand::SelectTool(aurora_ui::Tool::Brush)),
+        // 0.220.0: Photoshop's grouped B key.
+        ("Shift+B", AppCommand::SelectTool(aurora_ui::Tool::Pencil)),
         ("e", AppCommand::SelectTool(aurora_ui::Tool::Eraser)),
         // 0.209.0: Photoshop's grouped G key.
         ("g", AppCommand::SelectTool(aurora_ui::Tool::Gradient)),
@@ -5962,6 +5964,7 @@ const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
         aurora_ui::Tool::Eraser => "tool.eraser",
         aurora_ui::Tool::Gradient => "tool.gradient",
         aurora_ui::Tool::PaintBucket => "tool.paint_bucket",
+        aurora_ui::Tool::Pencil => "tool.pencil",
     }
 }
 
@@ -10324,6 +10327,18 @@ const NEW_DOCUMENT_HISTORY_ORIGIN: &str = "New Document";
 const BRUSH_STROKE_LABEL: &str = "Brush Stroke";
 /// The row label of a committed Eraser stroke.
 const ERASER_STROKE_LABEL: &str = "Eraser Stroke";
+/// The row label of a committed Pencil stroke (0.220.0).
+const PENCIL_STROKE_LABEL: &str = "Pencil Stroke";
+
+/// The History row a committed stroke of the Brush drag gets: the Pencil's
+/// (`hard`) or the Brush's.
+const fn brush_drag_label(hard: bool) -> &'static str {
+    if hard {
+        PENCIL_STROKE_LABEL
+    } else {
+        BRUSH_STROKE_LABEL
+    }
+}
 
 /// The generic label of a step recorded without one: a pixel step whose
 /// tool nobody named (only tests do that; the app names Brush and
@@ -11842,6 +11857,10 @@ enum Drag {
         modal: Box<selection_modes::ModeGesture>,
     },
     Brush {
+        /// Whether this is the Pencil (0.220.0): the same drag, spacing,
+        /// snapshot and undo as the Brush, but its dabs are hard-edged
+        /// ([`dab_tool_of_drag`]) and its step reads "Pencil Stroke".
+        hard: bool,
         last_doc: (f32, f32),
         carry: f32,
         /// This stroke's own accumulated undo snapshot — `None` when the
@@ -12125,10 +12144,11 @@ fn commit_ending_drag(
     match drag {
         Some(Drag::Brush {
             stroke: Some(stroke),
+            hard,
             ..
         }) => record_stroke(
             stroke,
-            BRUSH_STROKE_LABEL,
+            brush_drag_label(hard),
             history,
             pixel_history,
             undo_order,
@@ -12412,13 +12432,16 @@ fn begin_drag(
                 modal: selection_modes::ModeGesture::boxed_replace(),
             })
         }
-        (aurora_ui::Tool::Brush, PointerButton::Primary) => Some(Drag::Brush {
-            last_doc: view.to_document(canvas_point),
-            carry: 0.0,
-            stroke: active_pixel_layer
-                .map(|(id, _)| aurora_brush::StrokeSnapshot::new(surface_id_for(id))),
-            warned: std::collections::HashSet::new(),
-        }),
+        (aurora_ui::Tool::Brush | aurora_ui::Tool::Pencil, PointerButton::Primary) => {
+            Some(Drag::Brush {
+                hard: tool == aurora_ui::Tool::Pencil,
+                last_doc: view.to_document(canvas_point),
+                carry: 0.0,
+                stroke: active_pixel_layer
+                    .map(|(id, _)| aurora_brush::StrokeSnapshot::new(surface_id_for(id))),
+                warned: std::collections::HashSet::new(),
+            })
+        }
         (aurora_ui::Tool::Eraser, PointerButton::Primary) => Some(Drag::Eraser {
             last_doc: view.to_document(canvas_point),
             carry: 0.0,
@@ -25760,6 +25783,19 @@ impl ToolSettings {
 enum DabTool {
     Brush,
     Eraser,
+    /// The Pencil (0.220.0): the Brush's colour, radius, locks and
+    /// selection rules with a hard-edged, aliased dab.
+    Pencil,
+}
+
+/// The dab tool a drag lays: the Pencil for a `Drag::Brush` begun with the
+/// Pencil, the Brush for any other (the stamp site `App::paint_dab`
+/// reads it from, so no path can lay a soft dab in a Pencil stroke).
+fn dab_tool_of_drag(drag: Option<&Drag>) -> DabTool {
+    match drag {
+        Some(Drag::Brush { hard: true, .. }) => DabTool::Pencil,
+        _ => DabTool::Brush,
+    }
 }
 
 /// Why a layer's locks (0.198.0) stopped an edit. Locks never touch
@@ -25907,7 +25943,7 @@ fn paint_permission(tool: DabTool, lock: aurora_doc::LayerLock) -> PaintPermissi
         PaintPermission::Refused(LockRefusal::PixelsLocked)
     } else if lock.transparency {
         match tool {
-            DabTool::Brush => PaintPermission::PreserveAlpha,
+            DabTool::Brush | DabTool::Pencil => PaintPermission::PreserveAlpha,
             DabTool::Eraser => PaintPermission::Refused(LockRefusal::TransparencyLocksEraser),
         }
     } else {
@@ -25920,6 +25956,10 @@ fn paint_permission(tool: DabTool, lock: aurora_doc::LayerLock) -> PaintPermissi
 fn press_refusal(tool: aurora_ui::Tool, lock: aurora_doc::LayerLock) -> Option<LockRefusal> {
     match tool {
         aurora_ui::Tool::Brush => match paint_permission(DabTool::Brush, lock) {
+            PaintPermission::Refused(why) => Some(why),
+            _ => None,
+        },
+        aurora_ui::Tool::Pencil => match paint_permission(DabTool::Pencil, lock) {
             PaintPermission::Refused(why) => Some(why),
             _ => None,
         },
@@ -26012,7 +26052,8 @@ impl ToolSettings {
     /// [`BRUSH_RADIUS`]/[`ERASER_RADIUS`] on its own.
     fn dab_radius(&self, tool: DabTool) -> f32 {
         match tool {
-            DabTool::Brush => self.brush_radius,
+            // The Pencil shares the Brush's radius (0.220.0).
+            DabTool::Brush | DabTool::Pencil => self.brush_radius,
             DabTool::Eraser => self.eraser_radius,
         }
     }
@@ -26020,7 +26061,7 @@ impl ToolSettings {
     /// `tool`'s radius, or `None` for a tool that has none.
     fn radius(&self, tool: aurora_ui::Tool) -> Option<f32> {
         match tool {
-            aurora_ui::Tool::Brush => Some(self.brush_radius),
+            aurora_ui::Tool::Brush | aurora_ui::Tool::Pencil => Some(self.brush_radius),
             aurora_ui::Tool::Eraser => Some(self.eraser_radius),
             aurora_ui::Tool::Move
             | aurora_ui::Tool::MarqueeSelect
@@ -26051,7 +26092,7 @@ impl ToolSettings {
             .clamp(aurora_ui::TOOL_RADIUS_MIN, aurora_ui::TOOL_RADIUS_MAX)
             as f32;
         let slot = match tool {
-            aurora_ui::Tool::Brush => &mut self.brush_radius,
+            aurora_ui::Tool::Brush | aurora_ui::Tool::Pencil => &mut self.brush_radius,
             aurora_ui::Tool::Eraser => &mut self.eraser_radius,
             _ => return false,
         };
@@ -26139,6 +26180,24 @@ fn stamp_tool_dab_covered(
             coverage,
         ),
         DabTool::Brush => aurora_brush::stamp_dab_covered(
+            store,
+            surface,
+            local,
+            radius,
+            colour,
+            brush_stroke_mut(drag),
+            coverage,
+        ),
+        DabTool::Pencil if preserve_alpha => aurora_brush::stamp_dab_hard_preserving_alpha_covered(
+            store,
+            surface,
+            local,
+            radius,
+            colour,
+            brush_stroke_mut(drag),
+            coverage,
+        ),
+        DabTool::Pencil => aurora_brush::stamp_dab_hard_covered(
             store,
             surface,
             local,
@@ -30087,11 +30146,13 @@ impl App {
     /// collapse still left a long drag across one emitting ~100
     /// identical lines.
     fn paint_dab(&mut self, doc_point: (f32, f32)) {
+        // The Pencil (0.220.0) is the Brush's drag with a hard dab.
+        let dab_tool = dab_tool_of_drag(self.drag.as_ref());
         // Quick Mask (0.217.0): the dab edits the mask grid, never a layer.
         if let Some(mode) = self.quick_mask.as_mut() {
             let _ = quick_mask::paint_dab(
                 mode,
-                DabTool::Brush,
+                dab_tool,
                 doc_point,
                 &self.tool_settings,
                 &self.colour.state,
@@ -30110,17 +30171,15 @@ impl App {
         };
         // The layer's locks (0.198.0), checked at every dab as well as at
         // the press, so no path can paint through a lock.
-        let preserve_alpha = match paint_permission(
-            DabTool::Brush,
-            self.doc.layers.lock(layer_id).unwrap_or_default(),
-        ) {
-            PaintPermission::Refused(why) => {
-                self.lock_notice = Some((why, Some(layer_id)));
-                return;
-            }
-            PaintPermission::PreserveAlpha => true,
-            PaintPermission::Allowed => false,
-        };
+        let preserve_alpha =
+            match paint_permission(dab_tool, self.doc.layers.lock(layer_id).unwrap_or_default()) {
+                PaintPermission::Refused(why) => {
+                    self.lock_notice = Some((why, Some(layer_id)));
+                    return;
+                }
+                PaintPermission::PreserveAlpha => true,
+                PaintPermission::Allowed => false,
+            };
         // The active selection (0.211.0): the dab paints only through it.
         let selection = self.doc.selection.active();
         let Some(store) = self.doc.tile_store.as_mut() else {
@@ -30132,7 +30191,7 @@ impl App {
         // helper method: that would borrow all of `self` and conflict
         // with `self.doc.tile_store` above.
         let outcome = selection_paint::dab_through_selection(
-            DabTool::Brush,
+            dab_tool,
             preserve_alpha,
             store,
             surface,
@@ -30140,7 +30199,7 @@ impl App {
             doc_point,
             selection,
             &self.tool_settings,
-            colour_state::dab_colour(DabTool::Brush, &self.colour.state),
+            colour_state::dab_colour(dab_tool, &self.colour.state),
             &mut self.drag,
         );
         let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
@@ -68096,7 +68155,7 @@ mod tests {
                 crate::sync_tool_controls(&mut workspace, Some(controls), tool, &settings, None);
             assert_eq!(
                 aurora_ui::radius_slider_shown(&workspace.tree, &controls),
-                matches!(tool, Tool::Brush | Tool::Eraser),
+                matches!(tool, Tool::Brush | Tool::Pencil | Tool::Eraser),
                 "{tool:?}"
             );
             assert_eq!(
@@ -68617,6 +68676,7 @@ mod tests {
             None,
         ) {
             Some(Drag::Brush {
+                hard: _,
                 last_doc,
                 carry,
                 stroke,
@@ -68675,6 +68735,7 @@ mod tests {
     /// therefore no GPU adapter) to exercise.
     fn brush_drag_with_a_stroke() -> Drag {
         Drag::Brush {
+            hard: false,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: Some(aurora_brush::StrokeSnapshot::new(
@@ -68704,6 +68765,7 @@ mod tests {
         assert_eq!(stroke.surface(), aurora_tile::SurfaceId::from_raw(7));
         assert!(
             brush_stroke_mut(&mut Some(Drag::Brush {
+                hard: false,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,
@@ -69813,6 +69875,7 @@ mod tests {
         // no drag at all.
         for nothing in [
             Some(Drag::Brush {
+                hard: false,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,
@@ -70191,6 +70254,7 @@ mod tests {
         let mut view = CanvasView::new();
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Brush {
+            hard: false,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
@@ -70228,6 +70292,7 @@ mod tests {
         let mut view = CanvasView::new();
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Brush {
+            hard: false,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
@@ -70891,6 +70956,7 @@ mod tests {
         let pointer = (40.0, 40.0);
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Brush {
+            hard: false,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71017,6 +71083,7 @@ mod tests {
         let pointer = (40.0, 40.0);
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Brush {
+            hard: false,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71123,6 +71190,7 @@ mod tests {
         let pointer = (40.0, 40.0);
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Brush {
+            hard: false,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71180,6 +71248,7 @@ mod tests {
         let mut view = CanvasView::new();
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Brush {
+            hard: false,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71227,6 +71296,7 @@ mod tests {
         view.zoom_at((0.0, 0.0), 0.25);
         let mut selection = SelectionSet::new();
         let mut drag = Drag::Brush {
+            hard: false,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71364,6 +71434,7 @@ mod tests {
         let mut selection = SelectionSet::new();
         let pointer = (40.0, 40.0);
         let mut drag = Drag::Brush {
+            hard: false,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -71507,6 +71578,7 @@ mod tests {
             view
         };
         let a_stroke = |view: &CanvasView| Drag::Brush {
+            hard: false,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -77249,6 +77321,7 @@ mod tests {
         /// The dabs a 64-px Brush segment lays down with `settings`.
         fn brush_dabs(settings: &ToolSettings) -> usize {
             let mut drag = Drag::Brush {
+                hard: false,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,

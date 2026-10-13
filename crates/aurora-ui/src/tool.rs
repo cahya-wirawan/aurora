@@ -85,13 +85,17 @@ pub enum Tool {
     /// the foreground colour (0.209.0): real, via
     /// `aurora_brush::flood_fill` in `aurora-app`.
     PaintBucket,
+    /// Paints the foreground colour with a hard, aliased dab (0.220.0):
+    /// real, via `aurora_brush::stamp_dab_hard` in `aurora-app`, with the
+    /// Brush's radius and spacing and no opacity.
+    Pencil,
 }
 
 impl Tool {
     /// Every tool this enum has today, in the fixed order they're
     /// offered to the user (matches PLAN.md's own bullets: Move, Marquee
     /// Select, Zoom, Pan, Eyedropper, then Brush, Eraser, and the 0.209.0 fills Gradient and Paint Bucket).
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Move,
         Self::MarqueeSelect,
         Self::EllipticalMarquee,
@@ -102,6 +106,7 @@ impl Tool {
         Self::Pan,
         Self::Eyedropper,
         Self::Brush,
+        Self::Pencil,
         Self::Eraser,
         Self::Gradient,
         Self::PaintBucket,
@@ -139,6 +144,7 @@ impl Tool {
             Self::Eraser => "Eraser",
             Self::Gradient => "Gradient",
             Self::PaintBucket => "Paint Bucket",
+            Self::Pencil => "Pencil",
         }
     }
 
@@ -156,7 +162,7 @@ impl Tool {
             Self::Zoom => 'Z',
             Self::Pan => 'H',
             Self::Eyedropper => 'I',
-            Self::Brush => 'B',
+            Self::Brush | Self::Pencil => 'B',
             Self::Eraser => 'E',
             Self::Gradient | Self::PaintBucket => 'G',
         }
@@ -166,12 +172,13 @@ impl Tool {
     /// [`Self::shortcut_key`] (Photoshop's grouped keys: `G` selects the
     /// Gradient and `Shift+G` the Paint Bucket, 0.209.0; `M` the
     /// rectangular and `Shift+M` the Elliptical Marquee, 0.213.0; `L` the
-    /// Lasso and `Shift+L` the Polygonal Lasso, 0.214.0).
+    /// Lasso and `Shift+L` the Polygonal Lasso, 0.214.0; `B` the Brush and
+    /// `Shift+B` the Pencil, 0.220.0).
     #[must_use]
     pub const fn shortcut_needs_shift(self) -> bool {
         matches!(
             self,
-            Self::PaintBucket | Self::EllipticalMarquee | Self::PolygonalLasso
+            Self::PaintBucket | Self::EllipticalMarquee | Self::PolygonalLasso | Self::Pencil
         )
     }
 
@@ -222,11 +229,11 @@ mod tests {
 
     #[test]
     fn all_lists_every_variant_once() {
-        assert_eq!(Tool::ALL.len(), 13);
+        assert_eq!(Tool::ALL.len(), 14);
         let mut seen = Tool::ALL.to_vec();
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
-        assert_eq!(seen.len(), 13, "ALL must not repeat a variant");
+        assert_eq!(seen.len(), 14, "ALL must not repeat a variant");
     }
 
     #[test]
@@ -240,11 +247,11 @@ mod tests {
         chords.sort_unstable();
         chords.dedup();
         assert_eq!(chords.len(), Tool::ALL.len());
-        // Only the grouped G, M and L keys share a letter, and only by Shift.
+        // Only the grouped G, M, L and B keys share a letter, and only by Shift.
         let mut letters = keys;
         letters.sort_unstable();
         letters.dedup();
-        assert_eq!(letters.len(), Tool::ALL.len() - 3);
+        assert_eq!(letters.len(), Tool::ALL.len() - 4);
         assert_eq!(Tool::Lasso.shortcut_text(), "L");
         assert_eq!(Tool::PolygonalLasso.shortcut_text(), "Shift+L");
         assert_eq!(Tool::MagicWand.shortcut_text(), "W");
@@ -253,6 +260,7 @@ mod tests {
         assert_eq!(Tool::Gradient.shortcut_text(), "G");
         assert_eq!(Tool::PaintBucket.shortcut_text(), "Shift+G");
         assert_eq!(Tool::Brush.shortcut_text(), "B");
+        assert_eq!(Tool::Pencil.shortcut_text(), "Shift+B");
     }
 
     #[test]

@@ -24,6 +24,27 @@ pub fn dab_falloff(d: f32, radius: f32) -> f32 {
     (1.0 - (d / radius)).clamp(0.0, 1.0).powf(1.5)
 }
 
+/// The centre of the texel containing `center` (`floor + 0.5` per axis): the
+/// Pencil's dabs align to the texel grid, as Photoshop's do, so a given
+/// radius always gives the same footprint wherever inside a texel the
+/// pointer is. A non-finite coordinate stays non-finite.
+#[must_use]
+pub fn hard_dab_snap(center: (f32, f32)) -> (f32, f32) {
+    (center.0.floor() + 0.5, center.1.floor() + 0.5)
+}
+
+/// Whether the texel whose centre is `(px, py)` is in the Pencil's hard
+/// footprint around `center` (already snapped, see [`hard_dab_snap`]): its
+/// centre lies **strictly** inside the circle of `radius`. Radius `1` is
+/// therefore one texel, `2` a 3 x 3 block (the corners are `sqrt 2 < 2`
+/// away), `3` a 5 x 5 block. This is a choice, not Photoshop's measured
+/// rule.
+#[must_use]
+pub fn hard_dab_covers(px: f32, py: f32, center: (f32, f32), radius: f32) -> bool {
+    let (dx, dy) = (px - center.0, py - center.1);
+    dx * dx + dy * dy < radius * radius
+}
+
 /// Moves every texel in the dab's footprint toward `target` by the dab's
 /// falloff `a`: `new = round(old + (target - old) * a)`. A texel already at
 /// `target` is unchanged (so a second identical dab changes nothing), and
@@ -43,6 +64,35 @@ pub fn stamp_toward(
     radius: f32,
     target: u8,
 ) -> Option<Rect> {
+    stamp_toward_impl(data, width, height, center, radius, target, false)
+}
+
+/// [`stamp_toward`] with the Pencil's hard footprint (0.220.0): the centre
+/// snaps to its texel ([`hard_dab_snap`]), every texel whose centre is
+/// strictly inside the circle ([`hard_dab_covers`]) is set to `target`
+/// outright (alpha `1`, no falloff). Returns the changed rectangle on the
+/// same terms.
+pub fn stamp_toward_hard(
+    data: &mut [u8],
+    width: u32,
+    height: u32,
+    center: (f32, f32),
+    radius: f32,
+    target: u8,
+) -> Option<Rect> {
+    stamp_toward_impl(data, width, height, center, radius, target, true)
+}
+
+fn stamp_toward_impl(
+    data: &mut [u8],
+    width: u32,
+    height: u32,
+    center: (f32, f32),
+    radius: f32,
+    target: u8,
+    hard: bool,
+) -> Option<Rect> {
+    let center = if hard { hard_dab_snap(center) } else { center };
     if !(center.0.is_finite() && center.1.is_finite() && radius.is_finite() && radius > 0.0) {
         return None;
     }
@@ -70,11 +120,19 @@ pub fn stamp_toward(
         for x in x0..=x1 {
             #[allow(clippy::cast_precision_loss)]
             let px = x as f32 + 0.5;
-            let d = (px - center.0).hypot(py - center.1);
-            if d > radius {
-                continue;
-            }
-            let a = dab_falloff(d, radius);
+            let a = if hard {
+                if hard_dab_covers(px, py, center, radius) {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                let d = (px - center.0).hypot(py - center.1);
+                if d > radius {
+                    continue;
+                }
+                dab_falloff(d, radius)
+            };
             if a <= 0.0 {
                 continue;
             }

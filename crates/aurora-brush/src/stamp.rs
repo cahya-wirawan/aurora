@@ -367,7 +367,7 @@ pub fn stamp_dab(
     snapshot: Option<&mut StrokeSnapshot>,
 ) -> DabOutcome {
     stamp_dab_impl(
-        store, surface, center, radius, colour, snapshot, false, None,
+        store, surface, center, radius, colour, snapshot, false, false, None,
     )
 }
 
@@ -387,7 +387,7 @@ pub fn stamp_dab_covered(
     coverage: Option<&dyn Coverage>,
 ) -> DabOutcome {
     stamp_dab_impl(
-        store, surface, center, radius, colour, snapshot, false, coverage,
+        store, surface, center, radius, colour, snapshot, false, false, coverage,
     )
 }
 
@@ -404,7 +404,9 @@ pub fn stamp_dab_preserving_alpha(
     colour: [f32; 3],
     snapshot: Option<&mut StrokeSnapshot>,
 ) -> DabOutcome {
-    stamp_dab_impl(store, surface, center, radius, colour, snapshot, true, None)
+    stamp_dab_impl(
+        store, surface, center, radius, colour, snapshot, true, false, None,
+    )
 }
 
 /// [`stamp_dab_preserving_alpha`] restricted to a selection, on the terms
@@ -419,7 +421,77 @@ pub fn stamp_dab_preserving_alpha_covered(
     coverage: Option<&dyn Coverage>,
 ) -> DabOutcome {
     stamp_dab_impl(
-        store, surface, center, radius, colour, snapshot, true, coverage,
+        store, surface, center, radius, colour, snapshot, true, false, coverage,
+    )
+}
+
+/// The Pencil's dab (0.220.0): a **hard-edged, aliased** disc of `colour`.
+/// The centre snaps to the texel containing it, a texel is in the dab
+/// exactly when its centre lies strictly inside the circle of `radius`
+/// ([`crate::hard_dab_covers`]), so radius `1` is one texel, `2` a 3 x 3
+/// block, `3` a 5 x 5 block, and a texel is either fully covered or not
+/// touched: there is no falloff and no partial alpha. A covered texel is
+/// **replaced** by `colour` at alpha `1` (the Brush's max-alpha rule does
+/// not apply: a Pencil recolours opaque pixels). Opacity is always 100 %.
+pub fn stamp_dab_hard(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    center: (f32, f32),
+    radius: f32,
+    colour: [f32; 3],
+    snapshot: Option<&mut StrokeSnapshot>,
+) -> DabOutcome {
+    stamp_dab_impl(
+        store, surface, center, radius, colour, snapshot, false, true, None,
+    )
+}
+
+/// [`stamp_dab_hard`] restricted to a selection, on the terms of
+/// [`stamp_dab_covered`]: the hard dab is blended in by the coverage at
+/// each texel, so a fractional selection edge gives a fractional result
+/// there and a covered texel (coverage `1`) is exactly [`stamp_dab_hard`]'s.
+pub fn stamp_dab_hard_covered(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    center: (f32, f32),
+    radius: f32,
+    colour: [f32; 3],
+    snapshot: Option<&mut StrokeSnapshot>,
+    coverage: Option<&dyn Coverage>,
+) -> DabOutcome {
+    stamp_dab_impl(
+        store, surface, center, radius, colour, snapshot, false, true, coverage,
+    )
+}
+
+/// [`stamp_dab_hard`] for a layer whose **transparency is locked**: every
+/// covered texel that has alpha takes `colour` at full strength with its
+/// alpha kept bit for bit; a fully transparent texel is left alone.
+pub fn stamp_dab_hard_preserving_alpha(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    center: (f32, f32),
+    radius: f32,
+    colour: [f32; 3],
+    snapshot: Option<&mut StrokeSnapshot>,
+) -> DabOutcome {
+    stamp_dab_impl(
+        store, surface, center, radius, colour, snapshot, true, true, None,
+    )
+}
+
+/// [`stamp_dab_hard_preserving_alpha`] restricted to a selection.
+pub fn stamp_dab_hard_preserving_alpha_covered(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    center: (f32, f32),
+    radius: f32,
+    colour: [f32; 3],
+    snapshot: Option<&mut StrokeSnapshot>,
+    coverage: Option<&dyn Coverage>,
+) -> DabOutcome {
+    stamp_dab_impl(
+        store, surface, center, radius, colour, snapshot, true, true, coverage,
     )
 }
 
@@ -436,18 +508,17 @@ type TileBox = (u32, u32, u32, u32);
 fn dab_reaches_blank_tile(
     center: (f32, f32),
     radius: f32,
+    hard: bool,
     origin: (u32, u32),
     tile_box: TileBox,
     coverage: Option<&dyn Coverage>,
 ) -> bool {
-    let (cx, cy) = center;
     let (lx0, ly0, lx1, ly1) = tile_box;
     for ly in ly0..=ly1 {
         for lx in lx0..=lx1 {
             let px = (origin.0 + lx) as f32 + 0.5;
             let py = (origin.1 + ly) as f32 + 0.5;
-            let d = (px - cx).hypot(py - cy);
-            if d > radius || crate::mask_dab::dab_falloff(d, radius) <= 0.0 {
+            if texel_alpha(px, py, center, radius, hard) <= 0.0 {
                 continue;
             }
             let covered_here = coverage.is_none_or(|cov| {
@@ -459,6 +530,25 @@ fn dab_reaches_blank_tile(
         }
     }
     false
+}
+
+/// The alpha a dab gives the texel whose centre is `(px, py)`: `0` outside
+/// the footprint. The Brush's is the falloff within `radius`; the Pencil's
+/// (`hard`) is exactly `1` for a texel centre strictly inside the circle
+/// and `0` otherwise.
+fn texel_alpha(px: f32, py: f32, center: (f32, f32), radius: f32, hard: bool) -> f32 {
+    if hard {
+        return if crate::mask_dab::hard_dab_covers(px, py, center, radius) {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    let d = (px - center.0).hypot(py - center.1);
+    if d > radius {
+        return 0.0;
+    }
+    crate::mask_dab::dab_falloff(d, radius)
 }
 
 /// The coverage to consult texel by texel inside the tile box, or `None`
@@ -498,9 +588,16 @@ fn stamp_dab_impl(
     colour: [f32; 3],
     snapshot: Option<&mut StrokeSnapshot>,
     preserve_alpha: bool,
+    hard: bool,
     coverage: Option<&dyn Coverage>,
 ) -> DabOutcome {
     let mut outcome = DabOutcome::default();
+    // The Pencil aligns to the texel grid (0.220.0).
+    let center = if hard {
+        crate::mask_dab::hard_dab_snap(center)
+    } else {
+        center
+    };
     if !is_paintable(center, radius) {
         return outcome;
     }
@@ -536,6 +633,7 @@ fn stamp_dab_impl(
                     || !dab_reaches_blank_tile(
                         center,
                         radius,
+                        hard,
                         (origin_x, origin_y),
                         (lx0, ly0, lx1, ly1),
                         tile_cov,
@@ -565,13 +663,10 @@ fn stamp_dab_impl(
                     let px = (origin_x + lx) as f32 + 0.5;
                     #[allow(clippy::cast_precision_loss)]
                     let py = (origin_y + ly) as f32 + 0.5;
-                    let d = (px - cx).hypot(py - cy);
-                    if d > radius {
-                        continue;
-                    }
                     // Smooth falloff; hardness is not a variable here,
-                    // matching the spike this is ported from.
-                    let a = crate::mask_dab::dab_falloff(d, radius);
+                    // matching the spike this is ported from. The Pencil's
+                    // `a` is exactly 1 inside its footprint and 0 outside.
+                    let a = texel_alpha(px, py, center, radius, hard);
                     if a <= 0.0 {
                         continue;
                     }
@@ -613,8 +708,9 @@ fn stamp_dab_impl(
                         ]
                     } else {
                         // Max-alpha accumulation, this module's own rule: a
-                        // dab never lowers a texel's alpha.
-                        if a <= dst_a.to_f32() {
+                        // dab never lowers a texel's alpha. A hard dab
+                        // replaces instead (`a` is 1).
+                        if !hard && a <= dst_a.to_f32() {
                             continue;
                         }
                         // What this texel would actually *store*, computed

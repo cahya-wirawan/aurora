@@ -199,11 +199,12 @@ fn x_and_d_are_bound_and_collide_with_no_tool_letter() {
         assert_ne!(key, 'd');
         if tool.shortcut_needs_shift() {
             // Paint Bucket is Shift+G (0.209.0) and the Elliptical Marquee
-            // Shift+M (0.213.0) and the Polygonal Lasso Shift+L (0.214.0), never the bare letter, which selects the
+            // Shift+M (0.213.0) and the Polygonal Lasso Shift+L (0.214.0) and the Pencil Shift+B (0.220.0), never the bare letter, which selects the
             // first tool of the group.
             let first = match tool {
                 Tool::EllipticalMarquee => Tool::MarqueeSelect,
                 Tool::PolygonalLasso => Tool::Lasso,
+                Tool::Pencil => Tool::Brush,
                 _ => Tool::Gradient,
             };
             assert_eq!(shortcut_command(key), Some(AppCommand::SelectTool(first)));
@@ -845,10 +846,17 @@ fn the_app_dab_sites_take_their_colour_from_dab_colour_only() {
     let production = source.split("\nmod tests {").next().unwrap_or(source);
     assert_eq!(
         production
-            .matches("colour_state::dab_colour(DabTool::Brush, &self.colour.state)")
+            .matches("colour_state::dab_colour(dab_tool, &self.colour.state)")
             .count(),
         1,
-        "the Brush dab site"
+        "the Brush/Pencil dab site (0.220.0: the tool comes from the drag)"
+    );
+    assert_eq!(
+        production
+            .matches("let dab_tool = dab_tool_of_drag(self.drag.as_ref());")
+            .count(),
+        1,
+        "the dab site reads its tool from the drag"
     );
     assert_eq!(
         production
