@@ -30075,6 +30075,9 @@ impl App {
                 &mut self.doc.clone_stamp,
                 self.modifiers.alt,
                 layer,
+                self.doc.active_layer.and_then(|id| {
+                    press_refusal(self.tool, self.doc.layers.lock(id).unwrap_or_default())
+                }),
                 doc_point,
             ) {
                 clone_stamp::Press::SourceSet => {

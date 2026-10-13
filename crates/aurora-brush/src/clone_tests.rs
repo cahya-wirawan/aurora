@@ -610,3 +610,37 @@ fn an_unreadable_source_tile_refuses_the_dab_instead_of_erasing() {
     assert!(out.painted().is_empty());
     assert_eq!(out.failed().len(), 1);
 }
+
+#[test]
+fn absurd_offsets_never_overflow_and_beyond_the_limit_are_refused() {
+    use crate::MAX_CLONE_OFFSET;
+    let (_dir, mut s) = store();
+    put(&mut s, 20, 20, px(1.0, 0.0, 0.0, 1.0));
+    let before = dump(&mut s, 32, 32);
+    for offset in [
+        (i64::MAX, 0),
+        (0, i64::MAX),
+        (i64::MIN, 0),
+        (i64::MIN, i64::MIN),
+        (MAX_CLONE_OFFSET + 1, 0),
+        (0, -MAX_CLONE_OFFSET - 1),
+    ] {
+        let out = clone(&mut s, (20.5, 20.5), 3.0, offset, None, None);
+        assert!(out.painted().is_empty(), "{offset:?}");
+        assert!(out.failed().is_empty(), "{offset:?}");
+    }
+    assert_eq!(
+        dump(&mut s, 32, 32),
+        before,
+        "a refused dab changes nothing"
+    );
+    // Exactly at the limit the source lies far outside the surface: a
+    // transparent source, so the dab fades the texels instead of panicking.
+    for offset in [
+        (MAX_CLONE_OFFSET, MAX_CLONE_OFFSET),
+        (-MAX_CLONE_OFFSET, -MAX_CLONE_OFFSET),
+    ] {
+        let _ = clone(&mut s, (20.5, 20.5), 3.0, offset, None, None);
+    }
+    assert_eq!(bits(texel(&mut s, 20, 20)), bits([f16::ZERO; 4]));
+}

@@ -58,6 +58,12 @@ use crate::stamp::{
 /// 8 MiB of `f16`. A larger dab is refused whole and logged.
 pub const MAX_CLONE_PATCH_TEXELS: u64 = 1 << 20;
 
+/// The largest offset magnitude, per axis, a clone dab accepts: `2^40`
+/// texels, far beyond any surface (tile coordinates are `u32`, so nothing
+/// past `2^32` texels exists). A dab with a larger offset is refused whole
+/// and paints nothing, so the offset arithmetic below can never overflow.
+pub const MAX_CLONE_OFFSET: i64 = 1 << 40;
+
 /// The source patch of one dab: `width * height` premultiplied texels (four
 /// `f16` each, row-major) whose top-left destination texel is `(x0, y0)`.
 struct Patch {
@@ -104,10 +110,10 @@ fn gather_patch(
     let height = y1 - y0 + 1;
     let mut texels = vec![f16::from_f32(0.0); width as usize * height as usize * CHANNELS];
     // The source box in surface space; the surface has no negative texels.
-    let sx0 = (i64::from(x0) + offset.0).max(0);
-    let sy0 = (i64::from(y0) + offset.1).max(0);
-    let sx1 = i64::from(x1) + offset.0;
-    let sy1 = i64::from(y1) + offset.1;
+    let sx0 = i64::from(x0).saturating_add(offset.0).max(0);
+    let sy0 = i64::from(y0).saturating_add(offset.1).max(0);
+    let sx1 = i64::from(x1).saturating_add(offset.0);
+    let sy1 = i64::from(y1).saturating_add(offset.1);
     if sx1 < 0 || sy1 < 0 || sx0 > sx1 || sy0 > sy1 {
         return Ok(Patch {
             x0,
@@ -149,8 +155,8 @@ fn gather_patch(
             for sy in oy0..=oy1 {
                 for sx in ox0..=ox1 {
                     // Destination texel and patch slot, then the tile slot.
-                    let dx = sx - offset.0 - i64::from(x0);
-                    let dy = sy - offset.1 - i64::from(y0);
+                    let dx = sx.saturating_sub(offset.0).saturating_sub(i64::from(x0));
+                    let dy = sy.saturating_sub(offset.1).saturating_sub(i64::from(y0));
                     let (Ok(dx), Ok(dy)) = (usize::try_from(dx), usize::try_from(dy)) else {
                         continue;
                     };
@@ -263,6 +269,12 @@ pub fn clone_dab_covered(
 ) -> DabOutcome {
     let mut outcome = DabOutcome::default();
     if !is_paintable(center, radius) {
+        return outcome;
+    }
+    if offset.0.unsigned_abs() > MAX_CLONE_OFFSET.unsigned_abs()
+        || offset.1.unsigned_abs() > MAX_CLONE_OFFSET.unsigned_abs()
+    {
+        tracing::warn!(?offset, "refusing a clone dab with an absurd offset");
         return outcome;
     }
     let mut snapshot = usable_snapshot(snapshot, surface);

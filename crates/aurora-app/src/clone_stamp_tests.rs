@@ -51,7 +51,7 @@ fn a_press_without_alt_needs_a_source_and_a_pixel_layer() {
     let (a, _) = two_layers();
     let mut state = CloneStamp::default();
     assert_eq!(
-        clone_stamp::press(&mut state, false, Some(a), (5.0, 5.0)),
+        clone_stamp::press(&mut state, false, Some(a), None, (5.0, 5.0)),
         Press::Refused(LockRefusal::CloneNeedsSource)
     );
     assert_eq!(
@@ -59,12 +59,12 @@ fn a_press_without_alt_needs_a_source_and_a_pixel_layer() {
         "Alt-click to set a clone source."
     );
     assert_eq!(
-        clone_stamp::press(&mut state, false, None, (5.0, 5.0)),
+        clone_stamp::press(&mut state, false, None, None, (5.0, 5.0)),
         Press::Refused(LockRefusal::CloneNeedsPixelLayer)
     );
     // Alt on a non-pixel layer cannot set a source either.
     assert_eq!(
-        clone_stamp::press(&mut state, true, None, (5.0, 5.0)),
+        clone_stamp::press(&mut state, true, None, None, (5.0, 5.0)),
         Press::Refused(LockRefusal::CloneNeedsPixelLayer)
     );
     assert!(state.source().is_none());
@@ -75,13 +75,13 @@ fn alt_click_sets_the_source_and_starts_no_stroke() {
     let (a, _) = two_layers();
     let mut state = CloneStamp::default();
     assert_eq!(
-        clone_stamp::press(&mut state, true, Some(a), (30.0, 40.0)),
+        clone_stamp::press(&mut state, true, Some(a), None, (30.0, 40.0)),
         Press::SourceSet
     );
     assert_eq!(state.source(), Some((a, (30.0, 40.0))));
     // The next plain press fixes the offset: source minus press.
     assert_eq!(
-        clone_stamp::press(&mut state, false, Some(a), (10.0, 10.0)),
+        clone_stamp::press(&mut state, false, Some(a), None, (10.0, 10.0)),
         Press::Stroke((20, 30))
     );
 }
@@ -90,20 +90,20 @@ fn alt_click_sets_the_source_and_starts_no_stroke() {
 fn the_aligned_offset_persists_across_strokes_until_a_new_source() {
     let (a, _) = two_layers();
     let mut state = CloneStamp::default();
-    let _ = clone_stamp::press(&mut state, true, Some(a), (30.0, 40.0));
+    let _ = clone_stamp::press(&mut state, true, Some(a), None, (30.0, 40.0));
     assert_eq!(
-        clone_stamp::press(&mut state, false, Some(a), (10.0, 10.0)),
+        clone_stamp::press(&mut state, false, Some(a), None, (10.0, 10.0)),
         Press::Stroke((20, 30))
     );
     // A second stroke somewhere else keeps the first stroke's offset.
     assert_eq!(
-        clone_stamp::press(&mut state, false, Some(a), (50.0, 3.0)),
+        clone_stamp::press(&mut state, false, Some(a), None, (50.0, 3.0)),
         Press::Stroke((20, 30))
     );
     // A new Alt+click replaces the source and forgets the offset.
-    let _ = clone_stamp::press(&mut state, true, Some(a), (0.0, 0.0));
+    let _ = clone_stamp::press(&mut state, true, Some(a), None, (0.0, 0.0));
     assert_eq!(
-        clone_stamp::press(&mut state, false, Some(a), (50.0, 3.0)),
+        clone_stamp::press(&mut state, false, Some(a), None, (50.0, 3.0)),
         Press::Stroke((-50, -3))
     );
 }
@@ -112,7 +112,7 @@ fn the_aligned_offset_persists_across_strokes_until_a_new_source() {
 fn the_source_is_cleared_by_a_layer_change_and_by_a_document_switch() {
     let (a, b) = two_layers();
     let mut state = CloneStamp::default();
-    let _ = clone_stamp::press(&mut state, true, Some(a), (30.0, 40.0));
+    let _ = clone_stamp::press(&mut state, true, Some(a), None, (30.0, 40.0));
     // The same layer keeps it.
     state.observe_layer(Some(a));
     assert!(state.source().is_some());
@@ -123,21 +123,21 @@ fn the_source_is_cleared_by_a_layer_change_and_by_a_document_switch() {
     state.observe_layer(Some(a));
     assert!(state.source().is_none());
     assert_eq!(
-        clone_stamp::press(&mut state, false, Some(a), (1.0, 1.0)),
+        clone_stamp::press(&mut state, false, Some(a), None, (1.0, 1.0)),
         Press::Refused(LockRefusal::CloneNeedsSource)
     );
     // None (no active layer) clears too.
-    let _ = clone_stamp::press(&mut state, true, Some(a), (3.0, 4.0));
+    let _ = clone_stamp::press(&mut state, true, Some(a), None, (3.0, 4.0));
     state.observe_layer(None);
     assert!(state.source().is_none());
     // A source set on one layer is not used on another even unobserved.
-    let _ = clone_stamp::press(&mut state, true, Some(a), (3.0, 4.0));
+    let _ = clone_stamp::press(&mut state, true, Some(a), None, (3.0, 4.0));
     assert_eq!(
-        clone_stamp::press(&mut state, false, Some(b), (1.0, 1.0)),
+        clone_stamp::press(&mut state, false, Some(b), None, (1.0, 1.0)),
         Press::Refused(LockRefusal::CloneNeedsSource)
     );
     // `clear` is what a document switch, New, Open or close runs.
-    let _ = clone_stamp::press(&mut state, true, Some(a), (3.0, 4.0));
+    let _ = clone_stamp::press(&mut state, true, Some(a), None, (3.0, 4.0));
     state.clear();
     assert!(state.source().is_none());
 }
@@ -263,4 +263,61 @@ fn the_app_wires_the_press_the_dab_and_the_stamp_to_the_clone_stamp() {
     assert!(production.contains("clone_stamp::drag_offset(self.drag.as_ref())"));
     assert!(production.contains("clone_stamp::clone_dab_through_selection("));
     assert!(production.contains("clone_stamp::set_drag_offset(&mut self.drag, offset)"));
+}
+
+#[test]
+fn a_press_the_lock_refuses_does_not_fix_the_aligned_offset() {
+    let (a, _) = two_layers();
+    let mut state = CloneStamp::default();
+    let _ = clone_stamp::press(&mut state, true, Some(a), None, (30.0, 40.0));
+    // A pixels-locked layer refuses the stroke: no offset is fixed.
+    assert_eq!(
+        clone_stamp::press(
+            &mut state,
+            false,
+            Some(a),
+            Some(LockRefusal::PixelsLocked),
+            (10.0, 10.0)
+        ),
+        Press::Refused(LockRefusal::PixelsLocked)
+    );
+    // After unlocking, the next accepted press fixes it from its own point,
+    // not from the refused one.
+    assert_eq!(
+        clone_stamp::press(&mut state, false, Some(a), None, (20.0, 15.0)),
+        Press::Stroke((10, 25))
+    );
+    // Alt+click only reads the layer: a lock never refuses it.
+    assert_eq!(
+        clone_stamp::press(
+            &mut state,
+            true,
+            Some(a),
+            Some(LockRefusal::PixelsLocked),
+            (1.0, 2.0)
+        ),
+        Press::SourceSet
+    );
+    // The app asks the lock before fixing the offset.
+    let source = include_str!("lib.rs");
+    let production = source.split("\nmod tests {").next().unwrap_or(source);
+    assert!(production.contains("press_refusal(self.tool, self.doc.layers.lock(id)"));
+}
+
+#[test]
+fn absurd_offsets_are_clamped_or_refused_without_overflow() {
+    let limit = aurora_brush::MAX_CLONE_OFFSET;
+    assert_eq!(
+        clone_stamp::offset_between((1e30, -1e30), (0.0, 0.0)),
+        (limit, -limit)
+    );
+    assert_eq!(
+        clone_stamp::offset_between((f32::MAX, f32::MIN), (0.0, 0.0)),
+        (limit, -limit)
+    );
+    // A difference that overflows `f32` to infinity is non-finite: no offset.
+    assert_eq!(
+        clone_stamp::offset_between((f32::MAX, 0.0), (f32::MIN, 0.0)),
+        (0, 0)
+    );
 }

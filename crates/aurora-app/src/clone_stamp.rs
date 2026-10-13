@@ -78,13 +78,21 @@ impl CloneStamp {
     }
 }
 
-/// `round(source - press)` per axis; a non-finite coordinate gives `0`.
+/// `round(source - press)` per axis, clamped to `+-MAX_CLONE_OFFSET`; a
+/// non-finite coordinate gives `0`.
 #[must_use]
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 pub(crate) fn offset_between(source: (f32, f32), press: (f32, f32)) -> (i64, i64) {
+    let limit = aurora_brush::MAX_CLONE_OFFSET;
     let axis = |s: f32, p: f32| {
         let d = (s - p).round();
-        if d.is_finite() { d as i64 } else { 0 }
+        // Clamped to the offset the stamp accepts, so no later arithmetic
+        // sees an absurd value.
+        if d.is_finite() {
+            d.clamp(-(limit as f32), limit as f32) as i64
+        } else {
+            0
+        }
     };
     (axis(source.0, press.0), axis(source.1, press.1))
 }
@@ -102,11 +110,16 @@ pub(crate) enum Press {
 
 /// The one decision a Clone Stamp primary press makes (the app calls this
 /// and nothing else): `alt` is `Alt` held at the press, `layer` the active
-/// pixel layer (`None` for a group, an adjustment layer or none).
+/// pixel layer (`None` for a group, an adjustment layer or none), `locked`
+/// the layer lock's refusal for a stroke (`press_refusal`). A refused press
+/// must not fix the aligned offset, so the lock is consulted before
+/// [`CloneStamp::begin_stroke`]; `Alt`+click only reads the layer and is
+/// never refused by a lock.
 pub(crate) fn press(
     state: &mut CloneStamp,
     alt: bool,
     layer: Option<LayerId>,
+    locked: Option<LockRefusal>,
     doc_point: (f32, f32),
 ) -> Press {
     let Some(layer) = layer else {
@@ -115,6 +128,9 @@ pub(crate) fn press(
     if alt {
         state.set_source(layer, doc_point);
         return Press::SourceSet;
+    }
+    if let Some(why) = locked {
+        return Press::Refused(why);
     }
     match state.begin_stroke(layer, doc_point) {
         Some(offset) => Press::Stroke(offset),

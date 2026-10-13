@@ -3819,7 +3819,7 @@ impl Rig {
         let Some(&first) = points.first() else {
             unreachable!("a stroke has points");
         };
-        let press = crate::clone_stamp::press(state, alt, Some(self.layer), first);
+        let press = crate::clone_stamp::press(state, alt, Some(self.layer), None, first);
         let crate::clone_stamp::Press::Stroke(offset) = press else {
             return (press, false);
         };

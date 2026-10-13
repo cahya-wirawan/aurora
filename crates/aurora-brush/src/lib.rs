@@ -65,7 +65,7 @@ mod undo;
 #[cfg(test)]
 mod wand_tests;
 
-pub use clone::{MAX_CLONE_PATCH_TEXELS, clone_dab_covered};
+pub use clone::{MAX_CLONE_OFFSET, MAX_CLONE_PATCH_TEXELS, clone_dab_covered};
 pub use coverage::{Coverage, CoverageRegion};
 pub use dab::{DEFAULT_SPACING, advance_segment, dab_step, dabs_along_path};
 pub use fill::{
