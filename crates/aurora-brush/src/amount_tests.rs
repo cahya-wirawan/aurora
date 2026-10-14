@@ -577,6 +577,7 @@ fn region_hash(store: &mut TileStore) -> u64 {
 /// The legacy entry points on a fixed random sequence; this exact sequence
 /// was hashed with the 0.227.0 code (before this round) to get the constants
 /// below, so Opacity 100 % / Flow 100 % is pinned to what shipped.
+#[cfg(target_os = "linux")]
 fn legacy_hash() -> (u64, u64) {
     let mut rng = Rng(0x1234_5678_9ABC_DEF1);
     let (_dir, mut s) = store();
@@ -643,10 +644,16 @@ fn legacy_hash() -> (u64, u64) {
     (brush, region_hash(&mut s))
 }
 
-/// The hashes the 0.227.0 code produced for [`legacy_hash`].
+/// The hashes the 0.227.0 code produced for [`legacy_hash`] on Linux. The
+/// falloff uses `powf`, whose last bit differs between platform math
+/// libraries (macOS failed this pin), so the pin is Linux-only; the
+/// platform-independent guard is the differential test below.
+#[cfg(target_os = "linux")]
 const LEGACY_BRUSH_HASH: u64 = 0x236b_8639_623e_9433;
+#[cfg(target_os = "linux")]
 const LEGACY_CLONE_HASH: u64 = 0xb72b_4bd9_a93c_3dd6;
 
+#[cfg(target_os = "linux")]
 #[test]
 fn the_legacy_entry_points_are_bit_identical_to_0_227_0() {
     let (brush, clone) = legacy_hash();
