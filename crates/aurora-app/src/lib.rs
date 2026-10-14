@@ -554,6 +554,8 @@ mod colour_state;
 mod crop;
 mod crop_app;
 #[cfg(test)]
+mod crop_ratio_tests;
+#[cfg(test)]
 mod crop_tests;
 mod document_close;
 mod document_session;
@@ -6002,6 +6004,10 @@ enum ActivatedCommand {
     /// Crop to Selection (0.226.0): palette, the Select menu (and the
     /// macOS Edit menu).
     CropToSelection,
+    /// Choose the Crop tool's aspect ratio (0.236.0): palette only.
+    SetCropRatio(aurora_ui::CropRatio),
+    /// Swap the Crop tool's orientation (0.236.0): palette only.
+    SwapCropOrientation,
     /// A clipboard command (0.235.0).
     Clipboard(clipboard_app::ClipCommand),
     /// Select > Modify (0.216.0): open the number prompt of a command.
@@ -6349,6 +6355,7 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_SELECT_INVERSE, "Inverse Selection"),
         CommandEntry::new(quick_mask::COMMAND_ID, quick_mask::COMMAND_TITLE),
         CommandEntry::new(crop::COMMAND_CROP_TO_SELECTION, crop::COMMAND_TITLE),
+        CommandEntry::new(crop::COMMAND_SWAP_ORIENTATION, crop::SWAP_ORIENTATION_TITLE),
         CommandEntry::new(selection_store::COMMAND_SAVE, selection_store::SAVE_TITLE),
     ];
     commands.extend(
@@ -6367,6 +6374,13 @@ fn palette_commands() -> Vec<CommandEntry> {
             .iter()
             .map(|kind| CommandEntry::new(kind.command_id(), kind.menu_label())),
     );
+    // 0.236.0: the Crop tool's aspect ratios.
+    commands.extend(aurora_ui::CropRatio::ALL.iter().map(|choice| {
+        CommandEntry::new(
+            crop::ratio_command_id(*choice),
+            crop::ratio_command_title(*choice),
+        )
+    }));
     // 0.215.0: the selection tools' mode button.
     commands.extend(aurora_doc::SelectionMode::ALL.iter().map(|mode| {
         CommandEntry::new(
@@ -6620,6 +6634,16 @@ fn activate_command(
     }
     if id == crop::COMMAND_CROP_TO_SELECTION {
         return Some(ActivatedCommand::CropToSelection);
+    }
+    if id == crop::COMMAND_SWAP_ORIENTATION {
+        return Some(ActivatedCommand::SwapCropOrientation);
+    }
+    if let Some(choice) = aurora_ui::CropRatio::ALL
+        .iter()
+        .copied()
+        .find(|choice| crop::ratio_command_id(*choice) == id)
+    {
+        return Some(ActivatedCommand::SetCropRatio(choice));
     }
     if let Some(command) = clipboard_app::command_for(id) {
         return Some(ActivatedCommand::Clipboard(command));
@@ -7300,6 +7324,32 @@ fn layer_controls_light_dismiss(
     }
 }
 
+/// Closes the Crop tool's ratio list when a `Down` lands outside it
+/// (0.236.0) — the options bar's half of [`layer_controls_light_dismiss`].
+/// Returns whether it closed anything.
+fn crop_controls_light_dismiss(
+    tree: &mut WidgetTree<WidgetKind>,
+    controls: &aurora_ui::ToolControls,
+    point: (f32, f32),
+) -> bool {
+    let ratio = controls.crop.ratio;
+    let open = aurora_widgets::widgets::dropdown_state(tree, ratio)
+        .is_ok_and(aurora_widgets::widgets::DropdownState::is_open);
+    let inside = tree
+        .hit_test(point)
+        .is_some_and(|hit| tree.is_within(ratio, hit));
+    if !open || inside {
+        return false;
+    }
+    match aurora_widgets::widgets::set_dropdown_open(tree, ratio, false) {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::warn!(?err, "failed to close the crop ratio list");
+            false
+        }
+    }
+}
+
 /// Routes one primary-button pointer event to the gallery, if it is the
 /// gallery's: `outcome` is `None` (the caller goes on routing it) unless
 /// the gallery is open **and** — for a `Down` — the press lands inside it,
@@ -7475,6 +7525,12 @@ fn route_widget_pointer(
             }
             if let Some(controls) = layer_controls
                 && layer_controls_light_dismiss(&mut workspace.tree, controls, position)
+            {
+                dismissed = true;
+                focus.validate(&workspace.tree);
+            }
+            if let Some(controls) = tool_controls
+                && crop_controls_light_dismiss(&mut workspace.tree, controls, position)
             {
                 dismissed = true;
                 focus.validate(&workspace.tree);
@@ -8593,6 +8649,19 @@ fn sync_tool_controls(
             false
         }
     };
+    let crop_changed = match aurora_ui::sync_crop_controls(
+        &mut workspace.tree,
+        &controls,
+        tool,
+        settings.crop_ratio,
+        settings.crop_portrait,
+    ) {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::warn!(?err, "failed to sync the options-bar crop controls");
+            false
+        }
+    };
     match aurora_ui::sync_tool_controls(
         &mut workspace.tree,
         controls,
@@ -8600,7 +8669,9 @@ fn sync_tool_controls(
         settings.radius(tool).map(f64::from),
         captured,
     ) {
-        Ok(changed) => changed || highlighted || fill_changed || modes_changed || tone_changed,
+        Ok(changed) => {
+            changed || highlighted || fill_changed || modes_changed || tone_changed || crop_changed
+        }
         Err(err) => {
             tracing::warn!(?err, "failed to sync the options-bar tool controls");
             false
@@ -8712,6 +8783,22 @@ fn apply_fill_control_outcome(
                 .unwrap_or(settings.selection_mode);
             let changed = settings.selection_mode != chosen;
             settings.selection_mode = chosen;
+            changed
+        }
+        // The Crop tool's ratio dropdown and Portrait checkbox (0.236.0).
+        ActionOutcome::Dropdown {
+            id,
+            outcome: aurora_widgets::widgets::DropdownOutcome::Committed { index, .. },
+        } if *id == controls.crop.ratio => {
+            let chosen = aurora_ui::CropRatio::at(*index).unwrap_or(settings.crop_ratio);
+            let changed = settings.crop_ratio != chosen;
+            settings.crop_ratio = chosen;
+            changed
+        }
+        ActionOutcome::Toggled { id, state } if *id == controls.crop.portrait => {
+            let on = *state == accesskit::Toggled::True;
+            let changed = settings.crop_portrait != on;
+            settings.crop_portrait = on;
             changed
         }
         // The Dodge/Burn Range and the Sponge Mode (0.224.0): a box in any
@@ -26682,6 +26769,8 @@ const ERASER_RADIUS: f32 = 24.0;
 /// site. **Not document state**: changing a radius records no undo step
 /// and is not saved in a `.aur` file or the workspace layout — it resets
 /// to [`BRUSH_RADIUS`]/[`ERASER_RADIUS`] on every launch.
+// Independent on/off options of different tools, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 struct ToolSettings {
     brush_radius: f32,
@@ -26738,6 +26827,10 @@ struct ToolSettings {
     eraser_opacity: u8,
     /// The Eraser's Flow, 1..=100 percent (0.229.0; default 100).
     eraser_flow: u8,
+    /// The Crop tool's aspect-ratio choice (0.236.0; default Free).
+    crop_ratio: aurora_ui::CropRatio,
+    /// The Crop tool's Portrait toggle (0.236.0; swaps the ratio's sides).
+    crop_portrait: bool,
 }
 
 /// The default Opacity and Flow of the paint tools, percent (0.228.0).
@@ -26776,6 +26869,8 @@ impl Default for ToolSettings {
             clone_flow: DEFAULT_PAINT_PERCENT,
             eraser_opacity: DEFAULT_PAINT_PERCENT,
             eraser_flow: DEFAULT_PAINT_PERCENT,
+            crop_ratio: aurora_ui::CropRatio::Free,
+            crop_portrait: false,
         }
     }
 }
@@ -29123,6 +29218,8 @@ impl App {
             Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
             Some(ActivatedCommand::SetSelectionMode(mode)) => self.set_selection_mode(mode),
             Some(ActivatedCommand::CropToSelection) => self.crop_to_selection(),
+            Some(ActivatedCommand::SetCropRatio(choice)) => self.set_crop_ratio(choice),
+            Some(ActivatedCommand::SwapCropOrientation) => self.swap_crop_orientation(),
             Some(ActivatedCommand::Clipboard(command)) => self.run_clipboard_command(command),
             Some(ActivatedCommand::RefinePrompt(kind)) => self.open_refine_prompt(kind),
             Some(ActivatedCommand::RefineApply(kind, amount)) => self.run_refine(kind, amount),
@@ -33643,6 +33740,26 @@ impl App {
                 self.sync_status_bar_now();
             }
         }
+    }
+
+    /// Chooses the Crop tool's aspect ratio (0.236.0); the rectangle is
+    /// re-fitted by the next loop turn's sync (and by the next press).
+    fn set_crop_ratio(&mut self, choice: aurora_ui::CropRatio) {
+        self.tool_settings.crop_ratio = choice;
+        self.crop_settings_changed();
+    }
+
+    /// Swaps the Crop tool's orientation (0.236.0).
+    fn swap_crop_orientation(&mut self) {
+        self.tool_settings.crop_portrait = !self.tool_settings.crop_portrait;
+        self.crop_settings_changed();
+    }
+
+    fn crop_settings_changed(&mut self) {
+        self.sync_crop_ratio_now();
+        self.sync_tool_controls_now();
+        self.push_accessibility();
+        self.needs_redraw = true;
     }
 
     fn set_selection_mode(&mut self, mode: aurora_doc::SelectionMode) {

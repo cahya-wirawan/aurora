@@ -33,8 +33,23 @@ impl App {
         }
     }
 
+    /// Holds the crop state to the ratio the options bar says (0.236.0),
+    /// re-fitting a rectangle when it changed (run before a press and once
+    /// per loop turn, so a setting changed by any path takes effect).
+    pub(crate) fn sync_crop_ratio_now(&mut self) {
+        if hold_ratio(
+            &mut self.crop,
+            self.tool_settings.crop_ratio,
+            self.tool_settings.crop_portrait,
+            self.doc.canvas_size,
+        ) {
+            self.crop_changed_visibly();
+        }
+    }
+
     /// A primary press on the canvas with the Crop tool.
     pub(crate) fn crop_press(&mut self, canvas_point: (f32, f32)) {
+        self.sync_crop_ratio_now();
         let doc_point = self.doc.canvas_view.to_document(canvas_point);
         let radius = self.crop_hit_radius();
         match self.crop.press(
@@ -136,6 +151,7 @@ impl App {
     /// Cancels a crop rectangle that no longer belongs to the active tool,
     /// document or canvas size (run once per loop turn).
     pub(crate) fn crop_drop_if_stale(&mut self) {
+        self.sync_crop_ratio_now();
         if self.crop.rect().is_none() && !self.crop.dragging() {
             return;
         }
@@ -291,6 +307,18 @@ impl App {
             tracing::warn!(?err, "failed to update the crop shield");
         }
     }
+}
+
+/// [`App::sync_crop_ratio_now`]'s decision as a free function: holds `state`
+/// to the ratio `choice` and `portrait` mean for `canvas`; returns whether
+/// the state changed.
+pub(crate) fn hold_ratio(
+    state: &mut crop::CropState,
+    choice: aurora_ui::CropRatio,
+    portrait: bool,
+    canvas: (u32, u32),
+) -> bool {
+    state.set_ratio(crop::ratio_for(choice, portrait, canvas), canvas)
 }
 
 /// [`App::crop_shield_rects_now`]'s decision as a free function: shield
