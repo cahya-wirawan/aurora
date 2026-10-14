@@ -33397,6 +33397,8 @@ impl App {
         // settled above.
         self.sync_selection_outline_now(frame_time);
         self.sync_quick_mask_tint_now();
+        // 0.227.0: the Crop tool's shield beneath the outline.
+        self.sync_crop_shield_now();
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
         };

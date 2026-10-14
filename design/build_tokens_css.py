@@ -81,6 +81,10 @@ def main():
     overlay = theme["quick_mask"]["overlay"]
     lines.append(f"  --quick-mask-overlay-color: {resolve_color(overlay['color'], palette)};")
     lines.append(f"  --quick-mask-overlay-alpha: {overlay['alpha']};")
+    # 0.227.0: the Crop tool's shield.
+    shield = theme["crop"]["shield"]
+    lines.append(f"  --crop-shield-color: {resolve_color(shield['color'], palette)};")
+    lines.append(f"  --crop-shield-alpha: {shield['alpha']};")
 
     lines.append("")
 

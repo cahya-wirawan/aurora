@@ -85,6 +85,13 @@ pub struct QuickMaskTokens {
     pub overlay: Overlay,
 }
 
+/// The Crop tool's shield (`crop.*`, 0.227.0): `shield.alpha` is its
+/// opacity over the canvas outside the crop rectangle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CropTokens {
+    pub shield: Overlay,
+}
+
 /// A fully resolved theme: every token in `design/tokens/vocabulary.md`,
 /// with its `extends` chain (if any) already merged and every palette
 /// reference already resolved to a concrete [`Color`]. Nothing downstream
@@ -101,6 +108,7 @@ pub struct Theme {
     pub state: StateTokens,
     pub selection: SelectionTokens,
     pub quick_mask: QuickMaskTokens,
+    pub crop: CropTokens,
 }
 
 /// One registered theme's raw, unresolved data: its own declared parent
@@ -164,6 +172,7 @@ impl ThemeSet {
             "state",
             "selection",
             "quick_mask",
+            "crop",
         ] {
             if let Some(section) = root.get(key) {
                 flatten(key, section, &mut fields);
@@ -265,6 +274,12 @@ impl ThemeSet {
                 overlay: Overlay {
                     color: resolve_color(&merged, "quick_mask.overlay.color", palette)?,
                     alpha: require_f32(&merged, "quick_mask.overlay.alpha")?,
+                },
+            },
+            crop: CropTokens {
+                shield: Overlay {
+                    color: resolve_color(&merged, "crop.shield.color", palette)?,
+                    alpha: require_f32(&merged, "crop.shield.alpha")?,
                 },
             },
         })
@@ -391,7 +406,8 @@ mod tests {
 
     /// 0.219.0: every built-in theme resolves the selection and Quick Mask
     /// tokens, and they are identical in all five — the ants pure white and
-    /// pure black, the overlay `semantic.red.500` at 0.5.
+    /// pure black, the overlay `semantic.red.500` at 0.5 (0.227.0: and the
+    /// crop shield black at 0.5).
     #[test]
     fn every_built_in_theme_resolves_the_selection_and_quick_mask_tokens() {
         let sources = [
@@ -449,6 +465,16 @@ mod tests {
                 (theme.quick_mask.overlay.alpha - 0.5).abs() < 1e-6,
                 "{name}"
             );
+            assert_eq!(
+                (
+                    theme.crop.shield.color.r,
+                    theme.crop.shield.color.g,
+                    theme.crop.shield.color.b
+                ),
+                (0, 0, 0),
+                "{name}: the crop shield is black"
+            );
+            assert!((theme.crop.shield.alpha - 0.5).abs() < 1e-6, "{name}");
         }
     }
 

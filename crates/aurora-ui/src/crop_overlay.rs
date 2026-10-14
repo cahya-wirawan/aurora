@@ -11,7 +11,7 @@
 //! the canvas area's top-left corner, clipped to it.
 
 use aurora_core::Rect;
-use aurora_widgets::widgets::{OutlineRun, OutlineTone};
+use aurora_widgets::widgets::{OutlineRun, OutlineTone, ShieldRect};
 
 use crate::CanvasView;
 use crate::selection_outline::{PixelRect, pixel_rect, to_pixel};
@@ -74,6 +74,91 @@ pub fn crop_handle_runs(
     runs
 }
 
+/// The Crop tool's shield (0.227.0): the part of the canvas area outside
+/// the crop rectangle, as at most four non-overlapping rectangles (the
+/// band above, the band below, and the pieces left and right of the
+/// rectangle between them), in physical pixels from the canvas area's
+/// top-left corner and clipped to it. They are drawn in the `crop.shield`
+/// token beneath the outline and the handles.
+///
+/// The rectangle's edges are the very pixels the outline is drawn on
+/// ([`pixel_rect`]), so the shield meets the frame exactly. A rectangle
+/// wholly outside the canvas area shields the whole area; an empty
+/// rectangle, or a canvas area with no size, shields nothing (there is no
+/// crop to dim round).
+#[must_use]
+pub fn crop_shield_rects(
+    rect: &Rect,
+    view: &CanvasView,
+    canvas_size: (f32, f32),
+    scale_factor: f32,
+) -> Vec<ShieldRect> {
+    if rect.is_empty() {
+        return Vec::new();
+    }
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        f64::from(scale_factor)
+    } else {
+        1.0
+    };
+    let (width, height) = (
+        to_pixel(f64::from(canvas_size.0.max(0.0)) * scale),
+        to_pixel(f64::from(canvas_size.1.max(0.0)) * scale),
+    );
+    if width <= 0 || height <= 0 {
+        return Vec::new();
+    }
+    let (x0, y0, x1, y1): PixelRect = pixel_rect(rect, view, scale);
+    // The crop rectangle cut to the canvas area.
+    let (left, top) = (x0.clamp(0, width), y0.clamp(0, height));
+    let (right, bottom) = (x1.clamp(left, width), y1.clamp(top, height));
+    let mut out = Vec::new();
+    if right <= left || bottom <= top {
+        push_shield(&mut out, (0, 0, width, height));
+        return out;
+    }
+    push_shield(&mut out, (0, 0, width, top));
+    push_shield(&mut out, (0, bottom, width, height - bottom));
+    push_shield(&mut out, (0, top, left, bottom - top));
+    push_shield(&mut out, (right, top, width - right, bottom - top));
+    out
+}
+
+/// Hands `rects` to the workspace's outline widget as the Crop shield.
+/// Returns whether the shield changed (then a frame is due).
+///
+/// # Errors
+///
+/// A [`aurora_widgets::WidgetError`] if the widget is missing.
+pub fn sync_crop_shield(
+    tree: &mut aurora_widgets::WidgetTree<aurora_widgets::widgets::WidgetKind>,
+    outline: aurora_widgets::WidgetId,
+    rects: Vec<ShieldRect>,
+) -> Result<bool, aurora_widgets::WidgetError> {
+    aurora_widgets::widgets::set_selection_shield(tree, outline, rects)
+}
+
+/// Appends `(x, y, width, height)` when it has area.
+fn push_shield(out: &mut Vec<ShieldRect>, (x, y, width, height): (i64, i64, i64, i64)) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let (Ok(x), Ok(y), Ok(width), Ok(height)) = (
+        i32::try_from(x),
+        i32::try_from(y),
+        u32::try_from(width),
+        u32::try_from(height),
+    ) else {
+        return;
+    };
+    out.push(ShieldRect {
+        x,
+        y,
+        width,
+        height,
+    });
+}
+
 /// Appends `(x, y, width, height)` cut to `0..clip`, if anything is left.
 fn push_clipped(
     runs: &mut Vec<OutlineRun>,
@@ -107,7 +192,13 @@ fn push_clipped(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::indexing_slicing, clippy::cast_possible_truncation)]
+    #![allow(
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_wrap
+    )]
 
     use super::*;
 
@@ -198,5 +289,231 @@ mod tests {
         let a = crop_handle_runs(&rect(10, 10, 40, 40), &view(), (100.0, 100.0), f32::NAN, 6);
         let b = crop_handle_runs(&rect(10, 10, 40, 40), &view(), (100.0, 100.0), 1.0, 6);
         assert_eq!(a, b);
+    }
+
+    // ---- the shield (0.227.0) ----
+
+    /// A grid of the canvas area's physical pixels: how many rectangles
+    /// cover each (the shield must cover every pixel outside the clipped
+    /// crop exactly once and none inside it).
+    fn shield_cover(rects: &[ShieldRect], width: usize, height: usize) -> Vec<u32> {
+        let mut grid = vec![0u32; width * height];
+        for r in rects {
+            assert!(r.x >= 0 && r.y >= 0, "inside the area: {r:?}");
+            let (x, y) = (r.x as usize, r.y as usize);
+            assert!(r.width > 0 && r.height > 0, "no empty rectangle: {r:?}");
+            assert!(x + r.width as usize <= width, "{r:?}");
+            assert!(y + r.height as usize <= height, "{r:?}");
+            for yy in y..y + r.height as usize {
+                for xx in x..x + r.width as usize {
+                    grid[yy * width + xx] += 1;
+                }
+            }
+        }
+        grid
+    }
+
+    /// Asserts the shield is exactly the canvas area minus the crop's
+    /// pixel rectangle `inner = (x0, y0, x1, y1)` (cut to the area).
+    fn assert_shield_is_the_complement(
+        rects: &[ShieldRect],
+        width: usize,
+        height: usize,
+        inner: (i64, i64, i64, i64),
+    ) {
+        let grid = shield_cover(rects, width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let (xi, yi) = (x as i64, y as i64);
+                let inside = xi >= inner.0 && xi < inner.2 && yi >= inner.1 && yi < inner.3;
+                assert_eq!(
+                    grid[y * width + x],
+                    u32::from(!inside),
+                    "pixel ({x}, {y}) in {rects:?}"
+                );
+            }
+        }
+    }
+
+    fn pixel_box(r: &Rect, view: &CanvasView, scale: f32) -> (i64, i64, i64, i64) {
+        let (a, b) = (
+            view.to_screen((r.x as f32, r.y as f32)),
+            view.to_screen((r.right() as f32, r.bottom() as f32)),
+        );
+        let s = f64::from(scale);
+        (
+            (f64::from(a.0) * s).round() as i64,
+            (f64::from(a.1) * s).round() as i64,
+            (f64::from(b.0) * s).round() as i64,
+            (f64::from(b.1) * s).round() as i64,
+        )
+    }
+
+    #[test]
+    fn a_rectangle_inside_the_area_leaves_four_pieces_round_it() {
+        let r = rect(40, 30, 100, 60);
+        let rects = crop_shield_rects(&r, &view(), (400.0, 300.0), 1.0);
+        assert_eq!(rects.len(), 4);
+        assert_shield_is_the_complement(&rects, 400, 300, pixel_box(&r, &view(), 1.0));
+        // The pieces: top, bottom, left, right, in that order.
+        let (x0, y0, x1, y1) = pixel_box(&r, &view(), 1.0);
+        assert_eq!(
+            rects,
+            vec![
+                ShieldRect {
+                    x: 0,
+                    y: 0,
+                    width: 400,
+                    height: y0 as u32
+                },
+                ShieldRect {
+                    x: 0,
+                    y: y1 as i32,
+                    width: 400,
+                    height: 300 - y1 as u32
+                },
+                ShieldRect {
+                    x: 0,
+                    y: y0 as i32,
+                    width: x0 as u32,
+                    height: (y1 - y0) as u32
+                },
+                ShieldRect {
+                    x: x1 as i32,
+                    y: y0 as i32,
+                    width: 400 - x1 as u32,
+                    height: (y1 - y0) as u32
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rectangle_touching_edges_leaves_no_empty_piece() {
+        let v = view();
+        let (x0, y0, _, _) = pixel_box(&rect(0, 0, 1, 1), &v, 1.0);
+        // Touching the left and top edges of the area.
+        let r = rect(0, 0, 50, 40);
+        let rects = crop_shield_rects(&r, &v, (200.0, 100.0), 1.0);
+        assert_eq!(
+            rects.len(),
+            2,
+            "only the bottom and right pieces: {rects:?}"
+        );
+        assert_shield_is_the_complement(&rects, 200, 100, pixel_box(&r, &v, 1.0));
+        assert_eq!((x0, y0), (0, 0), "the default view sits at the origin");
+        // Filling the area exactly: nothing is left to shield.
+        let all = rect(0, 0, 200, 100);
+        assert!(crop_shield_rects(&all, &v, (200.0, 100.0), 1.0).is_empty());
+        // Touching the right and bottom edges.
+        let r = rect(150, 60, 50, 40);
+        let rects = crop_shield_rects(&r, &v, (200.0, 100.0), 1.0);
+        assert_eq!(rects.len(), 2);
+        assert_shield_is_the_complement(&rects, 200, 100, pixel_box(&r, &v, 1.0));
+    }
+
+    #[test]
+    fn a_rectangle_partly_off_screen_is_cut_to_the_area() {
+        let v = view();
+        // Hangs off the right and bottom.
+        let r = rect(150, 60, 500, 500);
+        let rects = crop_shield_rects(&r, &v, (200.0, 100.0), 1.0);
+        assert_shield_is_the_complement(&rects, 200, 100, (150, 60, 200, 100));
+        // Hangs off the left and top (a panned view).
+        let mut panned = view();
+        panned.pan_by((-30.0, -20.0));
+        let r = rect(0, 0, 100, 50);
+        let rects = crop_shield_rects(&r, &panned, (200.0, 100.0), 1.0);
+        assert_shield_is_the_complement(&rects, 200, 100, (0, 0, 70, 30));
+        // Wholly outside: the whole area is shielded in one piece.
+        let far = rect(10_000, 10_000, 5, 5);
+        let rects = crop_shield_rects(&far, &v, (200.0, 100.0), 1.0);
+        assert_eq!(
+            rects,
+            vec![ShieldRect {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 100
+            }]
+        );
+        let behind = rect(0, 0, 5, 5);
+        let mut gone = view();
+        gone.pan_by((500.0, 500.0));
+        let rects = crop_shield_rects(&behind, &gone, (200.0, 100.0), 1.0);
+        assert_eq!(rects.len(), 1);
+        assert_shield_is_the_complement(&rects, 200, 100, (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn zoom_and_pan_move_the_shield_with_the_rectangle() {
+        let mut v = view();
+        v.zoom_at((0.0, 0.0), 2.0);
+        v.pan_by((25.0, 10.0));
+        let r = rect(20, 10, 30, 20);
+        let rects = crop_shield_rects(&r, &v, (300.0, 200.0), 1.0);
+        let inner = pixel_box(&r, &v, 1.0);
+        assert_eq!(inner, (65, 30, 125, 70), "2 x zoom plus the pan");
+        assert_shield_is_the_complement(&rects, 300, 200, inner);
+        // Zoomed out too.
+        let mut out = view();
+        out.zoom_at((0.0, 0.0), 0.5);
+        let r = rect(100, 100, 200, 100);
+        let rects = crop_shield_rects(&r, &out, (300.0, 200.0), 1.0);
+        assert_shield_is_the_complement(&rects, 300, 200, pixel_box(&r, &out, 1.0));
+    }
+
+    #[test]
+    fn a_scale_factor_of_two_works_in_physical_pixels() {
+        let v = view();
+        let r = rect(40, 30, 100, 60);
+        let rects = crop_shield_rects(&r, &v, (200.0, 150.0), 2.0);
+        // The area is 400 x 300 physical pixels; the rectangle starts at
+        // 80, 60 and is 200 x 120 physical.
+        assert_shield_is_the_complement(&rects, 400, 300, (80, 60, 280, 180));
+        assert_eq!(rects.len(), 4);
+        // The same rectangle at scale 1 is a quarter of the pixels.
+        let one = crop_shield_rects(&r, &v, (200.0, 150.0), 1.0);
+        assert_shield_is_the_complement(&one, 200, 150, (40, 30, 140, 90));
+    }
+
+    #[test]
+    fn degenerate_inputs_shield_nothing() {
+        let v = view();
+        assert!(crop_shield_rects(&rect(0, 0, 0, 5), &v, (100.0, 100.0), 1.0).is_empty());
+        assert!(crop_shield_rects(&rect(0, 0, 5, 0), &v, (100.0, 100.0), 1.0).is_empty());
+        assert!(crop_shield_rects(&rect(5, 5, 5, 5), &v, (0.0, 100.0), 1.0).is_empty());
+        assert!(crop_shield_rects(&rect(5, 5, 5, 5), &v, (100.0, -3.0), 1.0).is_empty());
+        // A non-finite scale counts as one.
+        let a = crop_shield_rects(&rect(10, 10, 40, 40), &v, (100.0, 100.0), f32::NAN);
+        let b = crop_shield_rects(&rect(10, 10, 40, 40), &v, (100.0, 100.0), 1.0);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 4);
+    }
+
+    #[test]
+    fn a_one_pixel_rectangle_still_has_a_hole() {
+        // `pixel_rect` makes the frame at least one pixel, so the shield
+        // leaves that pixel clear.
+        let v = view();
+        let r = rect(10, 10, 1, 1);
+        let rects = crop_shield_rects(&r, &v, (50.0, 50.0), 1.0);
+        assert_shield_is_the_complement(&rects, 50, 50, (10, 10, 11, 11));
+    }
+
+    #[test]
+    fn the_shield_and_the_outline_frame_share_their_edges() {
+        // The frame the ants draw sits on `pixel_rect`'s edges; no shield
+        // piece may overlap the rectangle's own pixels.
+        let v = view();
+        let r = rect(33, 21, 77, 45);
+        let rects = crop_shield_rects(&r, &v, (300.0, 200.0), 1.0);
+        let (x0, y0, x1, y1) = pixel_box(&r, &v, 1.0);
+        for piece in &rects {
+            let (px0, py0) = (i64::from(piece.x), i64::from(piece.y));
+            let (px1, py1) = (px0 + i64::from(piece.width), py0 + i64::from(piece.height));
+            let overlaps = px0 < x1 && px1 > x0 && py0 < y1 && py1 > y0;
+            assert!(!overlaps, "{piece:?} overlaps the crop pixels");
+        }
     }
 }

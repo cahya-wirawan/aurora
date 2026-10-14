@@ -219,4 +219,44 @@ impl App {
             self.crop_handle_px(),
         )
     }
+
+    /// The Crop shield for this frame: the canvas area outside the crop
+    /// rectangle while the Crop tool has one (empty otherwise).
+    pub(crate) fn crop_shield_rects_now(&self) -> Vec<aurora_widgets::widgets::ShieldRect> {
+        shield_for_frame(
+            self.tool,
+            self.crop.rect(),
+            crate::canvas_area_logical_size(&self.workspace),
+            &self.doc.canvas_view,
+            guarded_scale_factor(self.scale_factor),
+        )
+    }
+
+    /// Draws this frame's Crop shield on the workspace's outline widget.
+    pub(crate) fn sync_crop_shield_now(&mut self) {
+        let rects = self.crop_shield_rects_now();
+        if let Err(err) = aurora_ui::sync_crop_shield(
+            &mut self.workspace.tree,
+            self.workspace.selection_outline,
+            rects,
+        ) {
+            tracing::warn!(?err, "failed to update the crop shield");
+        }
+    }
+}
+
+/// [`App::crop_shield_rects_now`]'s decision as a free function: shield
+/// only while the Crop tool is active, has a rectangle and the canvas area
+/// has a size.
+pub(crate) fn shield_for_frame(
+    tool: aurora_ui::Tool,
+    rect: Option<aurora_core::Rect>,
+    canvas_size: Option<(f32, f32)>,
+    view: &aurora_ui::CanvasView,
+    scale_factor: f32,
+) -> Vec<aurora_widgets::widgets::ShieldRect> {
+    let (aurora_ui::Tool::Crop, Some(rect), Some(size)) = (tool, rect, canvas_size) else {
+        return Vec::new();
+    };
+    aurora_ui::crop_shield_rects(&rect, view, size, scale_factor)
 }
