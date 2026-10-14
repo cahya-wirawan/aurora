@@ -148,11 +148,9 @@ impl PixelClip {
     }
 
     /// The same pixels at another document position.
-    pub(crate) fn moved_to(&self, origin: (i64, i64)) -> Self {
-        Self {
-            origin,
-            ..self.clone()
-        }
+    pub(crate) fn moved_to(mut self, origin: (i64, i64)) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// The clip as 8-bit straight-alpha RGBA, dithered: the system
@@ -610,7 +608,7 @@ pub(crate) fn paste_bounds(canvas: (u32, u32), clip: Rect) -> Rect {
 /// Where a paste puts the clip's top-left. `visible` is the document
 /// rectangle the view shows. `in_place` always keeps the original origin.
 /// Otherwise the original origin is kept when the clip's rectangle lies
-/// fully inside `visible`; else the clip is centred in `visible` narrowed to
+/// fully inside `visible` *and* the canvas; else the clip is centred in `visible` narrowed to
 /// the canvas (the canvas itself when nothing of it is visible) and clamped
 /// so it lies inside the canvas whenever it fits.
 pub(crate) fn paste_origin(
@@ -622,17 +620,20 @@ pub(crate) fn paste_origin(
     if in_place {
         return (clip.x, clip.y);
     }
-    if let Some(view) = visible
-        && intersect(view, clip) == Some(clip)
-    {
-        return (clip.x, clip.y);
-    }
     let canvas_rect = Rect {
         x: 0,
         y: 0,
         width: canvas.0,
         height: canvas.1,
     };
+    // Both the view and the canvas must hold it: a clip copied from a
+    // larger document (or a moved layer) can lie off a smaller canvas.
+    if let Some(view) = visible
+        && intersect(view, clip) == Some(clip)
+        && intersect(canvas_rect, clip) == Some(clip)
+    {
+        return (clip.x, clip.y);
+    }
     let area = visible
         .and_then(|view| intersect(view, canvas_rect))
         .unwrap_or(canvas_rect);
@@ -655,7 +656,7 @@ pub(crate) fn write_clip(
     store: &mut TileStore,
     surface: SurfaceId,
     layer: Rect,
-    clip: &PixelClip,
+    clip: PixelClip,
 ) -> Result<(), aurora_io::IoError> {
     let dx = u32::try_from(clip.origin.0 - layer.x).ok();
     let dy = u32::try_from(clip.origin.1 - layer.y).ok();
@@ -667,12 +668,9 @@ pub(crate) fn write_clip(
             height: clip.height,
         });
     };
-    let image = aurora_io::Image::new(
-        clip.width,
-        clip.height,
-        aurora_color::IccProfile::srgb(),
-        clip.pixels.clone(),
-    )?;
+    let (width, height) = (clip.width, clip.height);
+    let image =
+        aurora_io::Image::new(width, height, aurora_color::IccProfile::srgb(), clip.pixels)?;
     aurora_io::write_into_store_at(&image, store, surface, dx, dy)
 }
 

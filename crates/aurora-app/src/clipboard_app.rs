@@ -241,14 +241,15 @@ pub(crate) fn visible_rect(view: &aurora_ui::CanvasView, size: (f32, f32)) -> Op
 pub(crate) fn place_clip_core(
     cx: &mut LayerCommandContext<'_>,
     store: &mut aurora_tile::TileStore,
-    clip: &PixelClip,
+    clip: PixelClip,
     visible: Option<Rect>,
     in_place: bool,
     label: &'static str,
     cut: Option<Filled>,
 ) -> Result<(), &'static str> {
     let canvas = cx.canvas_size;
-    let clip = clip.moved_to(paste_origin(clip.rect(), visible, canvas, in_place));
+    let origin = paste_origin(clip.rect(), visible, canvas, in_place);
+    let clip = clip.moved_to(origin);
     let too_big = clip.width() > aurora_core::MAX_DOCUMENT_EXTENT
         || clip.height() > aurora_core::MAX_DOCUMENT_EXTENT;
     let bounds = paste_bounds(canvas, clip.rect());
@@ -264,7 +265,7 @@ pub(crate) fn place_clip_core(
     }
     let surface = (*cx.active_layer).and_then(|layer| cx.layers.surface_id(layer));
     let written = surface.is_some_and(|surface| {
-        pixels::write_clip(store, surface, bounds, &clip)
+        pixels::write_clip(store, surface, bounds, clip)
             .inspect_err(|err| tracing::warn!(?err, "a pasted layer could not be filled"))
             .is_ok()
     });
@@ -322,7 +323,7 @@ impl App {
                 match clip {
                     Ok(clip) => {
                         let label = PASTE_LABEL;
-                        self.place_clip(&clip, command == ClipCommand::PasteInPlace, label, None);
+                        self.place_clip(clip, command == ClipCommand::PasteInPlace, label, None);
                     }
                     Err(text) => self.clip_notice(text),
                 }
@@ -339,7 +340,7 @@ impl App {
                     selection.as_ref(),
                 ) {
                     Ok(clip) => {
-                        self.place_clip(&clip, true, LAYER_VIA_COPY_LABEL, None);
+                        self.place_clip(clip, true, LAYER_VIA_COPY_LABEL, None);
                     }
                     Err(text) => self.clip_notice(text),
                 }
@@ -400,7 +401,7 @@ impl App {
             }
             Ok((clip, filled)) => {
                 if via_layer {
-                    self.place_clip(&clip, true, LAYER_VIA_CUT_LABEL, Some(filled));
+                    self.place_clip(clip, true, LAYER_VIA_CUT_LABEL, Some(filled));
                 } else {
                     publish(&mut self.pixel_clip, clip, &mut self.clipboard);
                     if let Some(layer) = layer {
@@ -415,7 +416,7 @@ impl App {
     /// [`place_clip_core`]); a failure becomes the calm notice.
     fn place_clip(
         &mut self,
-        clip: &PixelClip,
+        clip: PixelClip,
         in_place: bool,
         label: &'static str,
         cut: Option<Filled>,

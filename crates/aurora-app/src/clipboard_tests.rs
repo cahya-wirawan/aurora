@@ -110,7 +110,7 @@ impl ClipboardAccess for FakeOs {
 
 /// `App`'s document state for one layer-command flow, without a window.
 struct Rig {
-    _dir: tempfile::TempDir,
+    scratch_dir: tempfile::TempDir,
     store: TileStore,
     workspace: aurora_ui::Workspace,
     focus: FocusManager,
@@ -161,7 +161,7 @@ impl Rig {
         let _ = crate::sync_layer_controls(&mut workspace, &state, &layers, Some(layer), None);
         workspace.tree.compute_layout(W, H);
         Self {
-            _dir: dir,
+            scratch_dir: dir,
             store,
             workspace,
             focus: FocusManager::default(),
@@ -279,7 +279,7 @@ impl Rig {
         place_clip_core(
             &mut cx,
             &mut self.store,
-            &clip,
+            clip,
             visible,
             in_place,
             label,
@@ -322,6 +322,65 @@ impl Rig {
             &mut self.pixel_history,
             &mut self.undo_order,
         )
+    }
+
+    /// The same document with a pixel history that spills every step to
+    /// the scratch directory at once.
+    fn spilling() -> Self {
+        let mut rig = Self::doc();
+        rig.pixel_history = aurora_brush::PixelHistory::with_spill(rig.store.staging_root(), 1);
+        rig
+    }
+
+    /// What a temp-file cleaner does: removes the spilled history steps.
+    fn remove_spill_files(&self) -> usize {
+        let mut removed = 0;
+        let mut stack = vec![self.scratch_dir.path().to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if entry.file_name().to_string_lossy().starts_with("history-") {
+                    if std::fs::remove_dir_all(&path).is_ok() {
+                        removed += 1;
+                    }
+                } else if path.is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+        removed
+    }
+
+    fn jump(&mut self, target: usize) -> crate::HistoryJump {
+        crate::perform_history_jump(
+            &mut crate::HistoryJumpContext {
+                workspace: &mut self.workspace,
+                focus: &mut self.focus,
+                scales: &self.scales,
+                layers: &mut self.layers,
+                history: &mut self.history,
+                pixel_history: &mut self.pixel_history,
+                store: Some(&mut self.store),
+                undo_order: &mut self.undo_order,
+                composite_cache: &mut self.cache,
+                view: &mut self.view,
+                layer_rows: &mut self.layer_rows,
+                active_layer: &mut self.active,
+                drag: &mut self.drag,
+                layer_controls: &mut self.state,
+            },
+            target,
+        )
+    }
+
+    /// A Layer via Cut of the red block, recorded as one step.
+    fn layer_via_cut(&mut self) {
+        let selection = rect_selection(rect(30, 30, 60, 60));
+        let (clip, filled) = match self.cut(Some(&selection)) {
+            Ok(v) => v,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        ok(self.paste(clip, None, true, "Layer via Cut", Some(filled)));
     }
 
     fn labels(&self) -> Vec<String> {
@@ -1291,4 +1350,126 @@ fn the_native_macos_menu_list_names_every_command() {
             "{id} is in the native menu cross-check"
         );
     }
+}
+
+// -- atomic undo of Layer via Cut, History jumps, stale-clip placement ----------
+
+#[test]
+fn a_failing_pixel_half_leaves_layer_via_cut_undo_and_redo_atomic() {
+    let mut rig = Rig::spilling();
+    rig.fill(40, 40, 70, 60, RED);
+    rig.layer_via_cut();
+    assert_eq!(rig.undo_order.undo, vec![UndoKind::LayerViaCut]);
+    let layers = crate::layer_ids_in_order(&rig.layers);
+    let source = rig.dump(rig.surface);
+    assert!(rig.remove_spill_files() > 0, "the step was spilled");
+    // The undo cannot read its spilled pixels: nothing may change.
+    assert!(!rig.step(UndoDirection::Undo), "the undo fails");
+    assert_eq!(
+        crate::layer_ids_in_order(&rig.layers),
+        layers,
+        "the layer is still there"
+    );
+    assert!(rig.history.can_undo(), "the journal step was not consumed");
+    assert!(!rig.history.can_redo());
+    assert_eq!(rig.undo_order.undo, vec![UndoKind::LayerViaCut]);
+    assert!(rig.undo_order.redo.is_empty());
+    assert_eq!(rig.dump(rig.surface), source, "the pixels were not touched");
+
+    // The same for a redo whose pixels cannot be read.
+    let mut rig = Rig::spilling();
+    rig.fill(40, 40, 70, 60, RED);
+    rig.layer_via_cut();
+    assert!(
+        rig.step(UndoDirection::Undo),
+        "undo works while the files exist"
+    );
+    let layers = crate::layer_ids_in_order(&rig.layers);
+    let source = rig.dump(rig.surface);
+    assert!(rig.remove_spill_files() > 0);
+    assert!(!rig.step(UndoDirection::Redo), "the redo fails");
+    assert_eq!(crate::layer_ids_in_order(&rig.layers), layers);
+    assert!(rig.history.can_redo(), "the journal step was not consumed");
+    assert_eq!(rig.undo_order.redo, vec![UndoKind::LayerViaCut]);
+    assert!(rig.undo_order.undo.is_empty());
+    assert_eq!(rig.dump(rig.surface), source);
+}
+
+#[test]
+fn a_history_jump_over_layer_via_cut_steps_both_halves_and_back() {
+    let mut rig = Rig::doc();
+    rig.fill(40, 40, 70, 60, RED);
+    let layers_before = crate::layer_ids_in_order(&rig.layers);
+    let source_before = rig.dump(rig.surface);
+    ok(rig.paste(sample_clip((5, 5)), None, true, "Paste", None));
+    rig.active = Some(rig.layer);
+    rig.layer_via_cut();
+    assert_eq!(
+        rig.undo_order.undo,
+        vec![UndoKind::Structural, UndoKind::LayerViaCut]
+    );
+    let layers_after = crate::layer_ids_in_order(&rig.layers);
+    let source_after = rig.dump(rig.surface);
+    let jump = rig.jump(0);
+    assert_eq!((jump.steps, jump.stopped_early), (2, false));
+    assert_eq!(crate::layer_ids_in_order(&rig.layers), layers_before);
+    assert_eq!(rig.dump(rig.surface), source_before);
+    assert_eq!(rig.undo_order.redo.len(), 2);
+    let jump = rig.jump(2);
+    assert_eq!((jump.steps, jump.stopped_early), (2, false));
+    assert_eq!(crate::layer_ids_in_order(&rig.layers), layers_after);
+    assert_eq!(rig.dump(rig.surface), source_after);
+    assert_eq!(rig.undo_order.undo.len(), 2);
+}
+
+#[test]
+fn a_history_jump_that_meets_an_unreadable_layer_via_cut_stops_with_nothing_half_done() {
+    let mut rig = Rig::spilling();
+    rig.fill(40, 40, 70, 60, RED);
+    rig.layer_via_cut();
+    let layers = crate::layer_ids_in_order(&rig.layers);
+    let source = rig.dump(rig.surface);
+    let _ = rig.remove_spill_files();
+    let jump = rig.jump(0);
+    assert_eq!((jump.steps, jump.stopped_early), (0, true));
+    assert_eq!(crate::layer_ids_in_order(&rig.layers), layers);
+    assert_eq!(rig.dump(rig.surface), source);
+    assert_eq!(rig.undo_order.undo, vec![UndoKind::LayerViaCut]);
+    assert!(rig.history.can_undo());
+}
+
+#[test]
+fn a_stale_clip_from_a_larger_document_is_centred_not_kept_off_the_canvas() {
+    // Pure: the clip lies in the view but off a smaller canvas.
+    let stale = rect(300, 300, 10, 10);
+    let view = Some(rect(0, 0, 1000, 1000));
+    assert_eq!(paste_origin(stale, view, (100, 100), false), (45, 45));
+    // Paste in Place still keeps it, by definition.
+    assert_eq!(paste_origin(stale, view, (100, 100), true), (300, 300));
+    // Partly off the canvas counts as off it.
+    assert_eq!(
+        paste_origin(rect(95, 10, 10, 10), view, (100, 100), false),
+        (45, 45)
+    );
+    // Through the paste flow: a clip remembered from a larger document.
+    let mut rig = Rig::doc();
+    ok(rig.paste(
+        sample_clip((700, 50)),
+        Some(rect(0, 0, 2000, 2000)),
+        false,
+        "Paste",
+        None,
+    ));
+    let Some(new) = rig.active else {
+        unreachable!()
+    };
+    let Some(surface) = rig.layers.surface_id(new) else {
+        unreachable!()
+    };
+    assert_eq!(rig.layers.bounds(new), Some(rect(0, 0, CANVAS.0, CANVAS.1)));
+    assert_ne!(
+        rig.at_on(surface, 298, 148)[3],
+        f16::ZERO,
+        "centred on the canvas"
+    );
 }

@@ -11711,22 +11711,34 @@ fn step_undo_order(
                     None
                 }
             }
+            // Atomic (0.235.0 review): the pixel half goes first, because only it
+            // can fail (a tile or spilled snapshot that cannot be read);
+            // the layer half then only edits the in-memory tree, and if
+            // that is refused the pixel half is taken back, so the
+            // journal, the pixels and `undo_order` never disagree.
             Some(UndoKind::LayerViaCut) => {
                 if let Some(store) = store
                     && history.can_undo()
                     && pixel_history.can_undo()
                 {
-                    match history.undo(layers) {
-                        Ok(_) => {
-                            apply_pixel_step(layers, pixel_history, store, UndoDirection::Undo)
-                                .inspect(|_| undo_order.step_back())
-                                .map(|_| CompositeInvalidation::Everything)
-                        }
-                        Err(err) => {
-                            tracing::warn!(?err, "undoing a Layer via Cut failed");
-                            None
-                        }
-                    }
+                    apply_pixel_step(layers, pixel_history, store, UndoDirection::Undo).and_then(
+                        |_| match history.undo(layers) {
+                            Ok(_) => {
+                                undo_order.step_back();
+                                Some(CompositeInvalidation::Everything)
+                            }
+                            Err(err) => {
+                                tracing::warn!(?err, "undoing a Layer via Cut failed");
+                                let _ = apply_pixel_step(
+                                    layers,
+                                    pixel_history,
+                                    store,
+                                    UndoDirection::Redo,
+                                );
+                                None
+                            }
+                        },
+                    )
                 } else {
                     tracing::warn!("the undo order names a Layer via Cut the history lacks");
                     None
@@ -11794,17 +11806,24 @@ fn step_undo_order(
                     && history.can_redo()
                     && pixel_history.can_redo()
                 {
-                    match history.redo(layers) {
-                        Ok(_) => {
-                            apply_pixel_step(layers, pixel_history, store, UndoDirection::Redo)
-                                .inspect(|_| undo_order.step_forward())
-                                .map(|_| CompositeInvalidation::Everything)
-                        }
-                        Err(err) => {
-                            tracing::warn!(?err, "redoing a Layer via Cut failed");
-                            None
-                        }
-                    }
+                    apply_pixel_step(layers, pixel_history, store, UndoDirection::Redo).and_then(
+                        |_| match history.redo(layers) {
+                            Ok(_) => {
+                                undo_order.step_forward();
+                                Some(CompositeInvalidation::Everything)
+                            }
+                            Err(err) => {
+                                tracing::warn!(?err, "redoing a Layer via Cut failed");
+                                let _ = apply_pixel_step(
+                                    layers,
+                                    pixel_history,
+                                    store,
+                                    UndoDirection::Undo,
+                                );
+                                None
+                            }
+                        },
+                    )
                 } else {
                     tracing::warn!("the undo order names a Layer via Cut the history lacks");
                     None
