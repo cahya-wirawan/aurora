@@ -549,10 +549,6 @@ mod clone_stamp_tests;
 mod colour_state;
 mod crop;
 mod crop_app;
-mod paths_app;
-mod pen;
-#[cfg(test)]
-mod paths_undo_tests;
 #[cfg(test)]
 mod crop_tests;
 mod document_close;
@@ -569,6 +565,10 @@ mod layer_thumbnails;
 mod menu_bar_app;
 mod menu_bar_state;
 mod menu_model;
+mod paths_app;
+#[cfg(test)]
+mod paths_undo_tests;
+mod pen;
 mod prepared_pixels;
 mod psd_save;
 #[cfg(test)]
@@ -3682,6 +3682,8 @@ fn apply_saved_collapse(workspace: &mut aurora_ui::Workspace, layout: &Workspace
         // 0.232.0: the Channels panel's collapse is not saved (the layout
         // wire format has no field for it; adding one is a new version).
         aurora_ui::DockPanel::Channels => false,
+        // 0.233.0: nor the Paths panel's.
+        aurora_ui::DockPanel::Paths => false,
     };
     // Floating slots too (0.167.0): a floating panel's collapse is saved
     // and restored like a docked one's.
@@ -4725,6 +4727,8 @@ enum AccessibilityReaction {
     /// button (0.232.0): the app applies it
     /// ([`AccessibilityEffects::channels`]).
     Channels(ChannelsRequest),
+    /// A `Click` on a Paths row or toolbar button (0.233.0).
+    Paths(PathsRequest),
     /// An action on a Tools-panel colour control or its picker popover
     /// (0.208.0): the app applies it to the colours
     /// ([`AccessibilityEffects::colour`]).
@@ -4843,6 +4847,10 @@ fn route_accessibility_action(
                 AccessibilityReaction::Channels(ChannelsRequest::Row { row, part })
             } else if let Some(action) = workspace.channels_state.toolbar.action_for(id) {
                 AccessibilityReaction::Channels(ChannelsRequest::Action(action))
+            } else if let Some(action) = workspace.paths_state.toolbar.action_for(id) {
+                AccessibilityReaction::Paths(PathsRequest::Action(action))
+            } else if workspace.paths_state.name_of(id).is_some() {
+                AccessibilityReaction::Paths(PathsRequest::Row(id))
             } else if aurora_ui::is_colour_control(&workspace.tree, id) {
                 AccessibilityReaction::ColourControl(aurora_widgets::ActionOutcome::Activated(id))
             } else if aurora_ui::is_menu_bar_part(&workspace.tree, id) {
@@ -5053,6 +5061,16 @@ struct AccessibilityEffects {
     /// A Channels panel row or toolbar button an assistive technology
     /// clicked (0.232.0); the App applies it (`App::apply_channels_request`).
     channels: Option<ChannelsRequest>,
+    /// A Paths panel row or toolbar button an assistive technology clicked
+    /// (0.233.0); the App applies it (`App::apply_paths_request`).
+    paths: Option<PathsRequest>,
+}
+
+/// A Paths panel activation reduced to comparable data (0.233.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathsRequest {
+    Row(WidgetId),
+    Action(aurora_ui::PathsAction),
 }
 
 /// A Channels panel activation reduced to comparable data (0.232.0).
@@ -5398,6 +5416,14 @@ fn apply_accessibility_action(
                 ..AccessibilityEffects::default()
             };
         }
+        AccessibilityReaction::Paths(request) => {
+            return AccessibilityEffects {
+                relayout: true,
+                redraw: true,
+                paths: Some(request),
+                ..AccessibilityEffects::default()
+            };
+        }
         AccessibilityReaction::LayerAction(action) => {
             return AccessibilityEffects {
                 relayout: true,
@@ -5407,6 +5433,7 @@ fn apply_accessibility_action(
                 close_tab: None,
                 layer_action: Some(action),
                 channels: None,
+                paths: None,
                 colour: None,
                 menu_bar: None,
             };
@@ -5450,6 +5477,7 @@ fn apply_accessibility_action(
                 close_tab: None,
                 layer_action: None,
                 channels: None,
+                paths: None,
                 colour: None,
                 menu_bar: None,
             };
@@ -5483,6 +5511,7 @@ fn apply_accessibility_action(
                 close_tab: Some(index),
                 layer_action: None,
                 channels: None,
+                paths: None,
                 colour: None,
                 menu_bar: None,
             };
@@ -5524,6 +5553,7 @@ fn apply_accessibility_action(
         close_tab: None,
         layer_action: None,
         channels: None,
+        paths: None,
         colour: None,
         menu_bar: None,
     }
@@ -5594,6 +5624,8 @@ enum AppCommand {
     Deselect,
     /// Inverse (0.212.0), `Primary+Shift+I`.
     InverseSelection,
+    /// Make Selection from Path (0.233.0), `Primary+Enter`.
+    MakeSelectionFromPath,
 }
 
 /// This build's fixed, checked-in global shortcut bindings. Not (yet)
@@ -5687,6 +5719,8 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         ("o", AppCommand::SelectTool(aurora_ui::Tool::Dodge)),
         ("Shift+O", AppCommand::SelectTool(aurora_ui::Tool::Burn)),
         ("Shift+P", AppCommand::SelectTool(aurora_ui::Tool::Sponge)),
+        // 0.233.0: Photoshop's Pen key (bare P; the Sponge keeps Shift+P).
+        ("p", AppCommand::SelectTool(aurora_ui::Tool::Pen)),
         // 0.226.0: Photoshop's Crop key (bare, like the other tool letters).
         ("c", AppCommand::SelectTool(aurora_ui::Tool::Crop)),
         // 0.209.0: Photoshop's grouped G key.
@@ -5703,6 +5737,7 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         // 0.212.0: Photoshop's Select menu chords. A focused text field
         // takes `Primary+A` first (`route_widget_key`), never reaching here.
         ("Primary+A", AppCommand::SelectAll),
+        ("Primary+Enter", AppCommand::MakeSelectionFromPath),
         ("Primary+D", AppCommand::Deselect),
         ("Primary+Shift+I", AppCommand::InverseSelection),
     ];
@@ -5897,6 +5932,8 @@ enum ActivatedCommand {
     RefineApply(selection_refine::RefineKind, f32),
     /// Save, Load or Delete a saved selection (0.218.0).
     SavedSelection(selection_store::SavedSelectionCommand),
+    /// A Paths command (0.233.0).
+    Paths(paths_app::PathsCommand),
     /// Select a tool from the palette (0.209.0).
     SelectTool(aurora_ui::Tool),
     /// A keyboard panel move (0.166.0, [`PANEL_MOVE_COMMANDS`]) —
@@ -5939,6 +5976,10 @@ const COMMAND_CLOSE_HISTORY: &str = "view.close_history";
 const COMMAND_FOCUS_CHANNELS: &str = "view.focus_channels";
 const COMMAND_TOGGLE_CHANNELS: &str = "view.toggle_channels";
 const COMMAND_CLOSE_CHANNELS: &str = "view.close_channels";
+/// The Paths panel's focus, toggle and close commands (0.233.0).
+const COMMAND_FOCUS_PATHS: &str = "view.focus_paths";
+const COMMAND_TOGGLE_PATHS: &str = "view.toggle_paths";
+const COMMAND_CLOSE_PATHS: &str = "view.close_paths";
 /// Collapses the whole right rail to its label strip, or expands it back
 /// (0.165.0, `aurora_ui::toggle_rail_collapsed`). One toggle id with one
 /// static label, like every other toggle here: neither the palette's
@@ -5953,8 +5994,8 @@ const COMMAND_TOGGLE_PANELS_LABEL: &str = "Collapse or Expand Panels";
 /// [`aurora_ui::PanelMove`]. One command per panel and move, the same
 /// per-panel shape as the focus/toggle/close commands, so a command
 /// never depends on where focus was before the palette took it.
-const PANEL_MOVE_COMMANDS: [(&str, aurora_ui::DockPanel, aurora_ui::PanelMove, &str); 12] = {
-    use aurora_ui::DockPanel::{Channels, History, Layers, Properties};
+const PANEL_MOVE_COMMANDS: [(&str, aurora_ui::DockPanel, aurora_ui::PanelMove, &str); 15] = {
+    use aurora_ui::DockPanel::{Channels, History, Layers, Paths, Properties};
     use aurora_ui::PanelMove::{Down, NextGroup, Up};
     [
         ("view.move_layers_up", Layers, Up, "Move Layers Panel Up"),
@@ -6019,6 +6060,14 @@ const PANEL_MOVE_COMMANDS: [(&str, aurora_ui::DockPanel, aurora_ui::PanelMove, &
             NextGroup,
             "Move Channels Panel to Next Group",
         ),
+        ("view.move_paths_up", Paths, Up, "Move Paths Panel Up"),
+        ("view.move_paths_down", Paths, Down, "Move Paths Panel Down"),
+        (
+            "view.move_paths_next_group",
+            Paths,
+            NextGroup,
+            "Move Paths Panel to Next Group",
+        ),
     ]
 };
 /// Restores the default panel arrangement (0.166.0) — since 0.167.0 that
@@ -6035,8 +6084,8 @@ const COMMAND_RESET_PANELS: &str = "window.reset_panels";
 /// expanding a collapsed rail, and lands focus on it
 /// (`aurora_ui::float_workspace_panel`/`dock_workspace_panel`). There is
 /// no keyboard way to *move* a floating panel yet (disclosed).
-const PANEL_FLOAT_COMMANDS: [(&str, aurora_ui::DockPanel, bool, &str); 8] = {
-    use aurora_ui::DockPanel::{Channels, History, Layers, Properties};
+const PANEL_FLOAT_COMMANDS: [(&str, aurora_ui::DockPanel, bool, &str); 10] = {
+    use aurora_ui::DockPanel::{Channels, History, Layers, Paths, Properties};
     [
         ("view.float_layers", Layers, true, "Float Layers Panel"),
         ("view.dock_layers", Layers, false, "Dock Layers Panel"),
@@ -6061,6 +6110,8 @@ const PANEL_FLOAT_COMMANDS: [(&str, aurora_ui::DockPanel, bool, &str); 8] = {
             "Float Channels Panel",
         ),
         ("view.dock_channels", Channels, false, "Dock Channels Panel"),
+        ("view.float_paths", Paths, true, "Float Paths Panel"),
+        ("view.dock_paths", Paths, false, "Dock Paths Panel"),
     ]
 };
 const COMMAND_FILE_OPEN: &str = "file.open";
@@ -6128,6 +6179,7 @@ const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
         aurora_ui::Tool::Burn => "tool.burn",
         aurora_ui::Tool::Sponge => "tool.sponge",
         aurora_ui::Tool::Crop => "tool.crop",
+        aurora_ui::Tool::Pen => "tool.pen",
     }
 }
 
@@ -6172,14 +6224,17 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_FOCUS_PROPERTIES, "Focus Properties Panel"),
         CommandEntry::new(COMMAND_FOCUS_HISTORY, "Focus History Panel"),
         CommandEntry::new(COMMAND_FOCUS_CHANNELS, "Focus Channels Panel"),
+        CommandEntry::new(COMMAND_FOCUS_PATHS, "Focus Paths Panel"),
         CommandEntry::new(COMMAND_TOGGLE_LAYERS, "Toggle Layers Panel"),
         CommandEntry::new(COMMAND_TOGGLE_PROPERTIES, "Toggle Properties Panel"),
         CommandEntry::new(COMMAND_TOGGLE_HISTORY, "Toggle History Panel"),
         CommandEntry::new(COMMAND_TOGGLE_CHANNELS, "Toggle Channels Panel"),
+        CommandEntry::new(COMMAND_TOGGLE_PATHS, "Toggle Paths Panel"),
         CommandEntry::new(COMMAND_CLOSE_LAYERS, "Close Layers Panel"),
         CommandEntry::new(COMMAND_CLOSE_PROPERTIES, "Close Properties Panel"),
         CommandEntry::new(COMMAND_CLOSE_HISTORY, "Close History Panel"),
         CommandEntry::new(COMMAND_CLOSE_CHANNELS, "Close Channels Panel"),
+        CommandEntry::new(COMMAND_CLOSE_PATHS, "Close Paths Panel"),
         CommandEntry::new(COMMAND_TOGGLE_PANELS, COMMAND_TOGGLE_PANELS_LABEL),
         CommandEntry::new(COMMAND_RESET_PANELS, "Reset Panel Layout"),
         CommandEntry::new(document_tabs::COMMAND_FILE_NEW, "New Document"),
@@ -6217,6 +6272,11 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(crop::COMMAND_CROP_TO_SELECTION, crop::COMMAND_TITLE),
         CommandEntry::new(selection_store::COMMAND_SAVE, selection_store::SAVE_TITLE),
     ];
+    commands.extend(
+        paths_app::COMMANDS
+            .iter()
+            .map(|(id, title)| CommandEntry::new(*id, *title)),
+    );
     // 0.216.0: Select > Modify.
     commands.extend(
         selection_refine::RefineKind::ALL
@@ -6261,6 +6321,7 @@ fn command_target(workspace: &aurora_ui::Workspace, id: &str) -> Option<WidgetId
         COMMAND_FOCUS_PROPERTIES => Some(workspace.properties.root),
         COMMAND_FOCUS_HISTORY => Some(workspace.history.root),
         COMMAND_FOCUS_CHANNELS => Some(workspace.channels.root),
+        COMMAND_FOCUS_PATHS => Some(workspace.paths.root),
         _ => None,
     }
 }
@@ -6277,6 +6338,7 @@ fn command_collapse_target(
         COMMAND_TOGGLE_PROPERTIES => Some(workspace.properties),
         COMMAND_TOGGLE_HISTORY => Some(workspace.history),
         COMMAND_TOGGLE_CHANNELS => Some(workspace.channels),
+        COMMAND_TOGGLE_PATHS => Some(workspace.paths),
         _ => None,
     }
 }
@@ -6293,6 +6355,7 @@ fn command_close_target(
         COMMAND_CLOSE_PROPERTIES => Some(workspace.properties),
         COMMAND_CLOSE_HISTORY => Some(workspace.history),
         COMMAND_CLOSE_CHANNELS => Some(workspace.channels),
+        COMMAND_CLOSE_PATHS => Some(workspace.paths),
         _ => None,
     }
 }
@@ -6326,7 +6389,12 @@ fn activate_command(
     if let Some(target) = command_target(workspace, id) {
         // 0.164.0: a grouped panel's tab is selected first — a hidden tab
         // panel is not focusable.
-        for panel in [workspace.properties, workspace.history, workspace.channels] {
+        for panel in [
+            workspace.properties,
+            workspace.history,
+            workspace.channels,
+            workspace.paths,
+        ] {
             if panel.root == target
                 && let Err(err) = aurora_ui::select_panel_tab(workspace, panel)
             {
@@ -6472,6 +6540,9 @@ fn activate_command(
     if let Some(command) = selection_store::command_for(id) {
         return Some(ActivatedCommand::SavedSelection(command));
     }
+    if let Some(command) = paths_app::command_for(id) {
+        return Some(ActivatedCommand::Paths(command));
+    }
     if id == COMMAND_SELECT_ALL {
         return Some(ActivatedCommand::Selection(
             selection_view::SelectionCommand::SelectAll,
@@ -6575,6 +6646,9 @@ enum WidgetOwner {
     /// A button of the Channels panel's foot toolbar (0.232.0): an
     /// activation runs [`App::run_channels_action`].
     ChannelsToolbar,
+    /// A button of the Paths panel's foot toolbar (0.233.0): an
+    /// activation runs [`App::run_paths_action`].
+    PathsToolbar,
     /// A panel tab group's tab bar (0.164.0, `aurora_ui::PanelGroup`): a
     /// click, an arrow key or `Home`/`End` selects a tab in the widget
     /// layer, then [`follow_panel_tabs`] shows that tab's panel.
@@ -6735,6 +6809,36 @@ fn refill_reopened_panels(
                     tracing::warn!(?err, "failed to refill the Channels panel");
                 }
                 workspace.channels_state = state;
+            }
+            // The Paths panel is rebuilt from its own last names; the
+            // per-turn sync corrects it if the document differs.
+            aurora_ui::DockPanel::Paths => {
+                let names = workspace.paths_state.names.clone();
+                let selected = workspace.paths_state.selected.clone();
+                let selected_empty = workspace.paths_state.selected_empty;
+                let paths = workspace.paths;
+                let mut state = workspace.paths_state.clone();
+                if let Err(err) = aurora_ui::populate_paths_panel(
+                    &mut workspace.tree,
+                    paths,
+                    scales,
+                    &mut state,
+                    &names,
+                ) {
+                    tracing::warn!(?err, "failed to refill the Paths panel");
+                }
+                if let Err(err) = aurora_ui::sync_paths_panel(
+                    &mut workspace.tree,
+                    paths,
+                    scales,
+                    &mut state,
+                    &names,
+                    selected.as_deref(),
+                    selected_empty,
+                ) {
+                    tracing::warn!(?err, "failed to re-select in the Paths panel");
+                }
+                workspace.paths_state = state;
             }
         }
     }
@@ -7051,6 +7155,9 @@ fn widget_owner(
     }
     if aurora_ui::is_channels_toolbar_button(tree, id) {
         return Some(WidgetOwner::ChannelsToolbar);
+    }
+    if aurora_ui::is_paths_toolbar_button(tree, id) {
+        return Some(WidgetOwner::PathsToolbar);
     }
     if aurora_ui::is_panel_group_tab(tree, id) {
         return Some(WidgetOwner::PanelTabs);
@@ -10260,6 +10367,12 @@ fn build_menu() -> muda::Menu {
                 true,
                 None,
             ),
+            &muda::MenuItem::with_id(
+                paths_app::COMMAND_MAKE_SELECTION,
+                paths_app::MAKE_SELECTION_TITLE,
+                true,
+                None,
+            ),
             &muda::PredefinedMenuItem::separator(),
             &muda::MenuItem::with_id(
                 selection_refine::RefineKind::Feather.command_id(),
@@ -10346,6 +10459,7 @@ fn build_menu() -> muda::Menu {
             ),
             &muda::MenuItem::with_id(COMMAND_FOCUS_HISTORY, "Focus History Panel", true, None),
             &muda::MenuItem::with_id(COMMAND_FOCUS_CHANNELS, "Focus Channels Panel", true, None),
+            &muda::MenuItem::with_id(COMMAND_FOCUS_PATHS, "Focus Paths Panel", true, None),
             &muda::PredefinedMenuItem::separator(),
             &muda::MenuItem::with_id(COMMAND_TOGGLE_LAYERS, "Toggle Layers Panel", true, None),
             &muda::MenuItem::with_id(
@@ -10356,6 +10470,7 @@ fn build_menu() -> muda::Menu {
             ),
             &muda::MenuItem::with_id(COMMAND_TOGGLE_HISTORY, "Toggle History Panel", true, None),
             &muda::MenuItem::with_id(COMMAND_TOGGLE_CHANNELS, "Toggle Channels Panel", true, None),
+            &muda::MenuItem::with_id(COMMAND_TOGGLE_PATHS, "Toggle Paths Panel", true, None),
             &muda::PredefinedMenuItem::separator(),
             &muda::MenuItem::with_id(COMMAND_CLOSE_LAYERS, "Close Layers Panel", true, None),
             &muda::MenuItem::with_id(
@@ -10366,6 +10481,7 @@ fn build_menu() -> muda::Menu {
             ),
             &muda::MenuItem::with_id(COMMAND_CLOSE_HISTORY, "Close History Panel", true, None),
             &muda::MenuItem::with_id(COMMAND_CLOSE_CHANNELS, "Close Channels Panel", true, None),
+            &muda::MenuItem::with_id(COMMAND_CLOSE_PATHS, "Close Paths Panel", true, None),
             &muda::PredefinedMenuItem::separator(),
             &muda::MenuItem::with_id(
                 COMMAND_TOGGLE_WIDGET_GALLERY,
@@ -11369,7 +11485,10 @@ fn run_command(
         AppCommand::SelectAll | AppCommand::Deselect | AppCommand::InverseSelection |
         // The colours and Quick Mask are `App` state too (handed back as
         // `ActivatedCommand::{SwapColours, ResetColours, ToggleQuickMask}`).
-        AppCommand::SwapColours | AppCommand::ResetColours | AppCommand::ToggleQuickMask => {
+        AppCommand::SwapColours
+        | AppCommand::ResetColours
+        | AppCommand::ToggleQuickMask
+        | AppCommand::MakeSelectionFromPath => {
             CompositeInvalidation::None
         }
     }
@@ -11778,6 +11897,15 @@ fn handle_palette_key(
                 Some(Err(())) => return None,
                 None => {}
             }
+            // 0.233.0: the path name prompt (Save Work Path, Rename Path).
+            match paths_app::prompt_enter(&mut workspace.tree, root) {
+                Some(Ok(name)) => {
+                    close_command_palette(workspace, focus, palette);
+                    return Some(ActivatedCommand::Paths(paths_app::PathsCommand::Name(name)));
+                }
+                Some(Err(())) => return None,
+                None => {}
+            }
             // 0.168.0: the workspace name prompt checks the typed name; a
             // refused one keeps the prompt open with the reason shown.
             match workspace_presets::name_prompt_enter(&mut workspace.tree, root) {
@@ -11805,6 +11933,7 @@ fn handle_palette_key(
                 }
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
                 selection_store::follow_prompt_query(&mut workspace.tree, root);
+                paths_app::follow_prompt_query(&mut workspace.tree, root);
             }
         }
         // Copy/paste against the real system clipboard, on the platform's
@@ -11834,6 +11963,7 @@ fn handle_palette_key(
                 }
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
                 selection_store::follow_prompt_query(&mut workspace.tree, root);
+                paths_app::follow_prompt_query(&mut workspace.tree, root);
             }
         }
         // A plain, unmodified character types into the query. A
@@ -11859,6 +11989,7 @@ fn handle_palette_key(
                 }
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
                 selection_store::follow_prompt_query(&mut workspace.tree, root);
+                paths_app::follow_prompt_query(&mut workspace.tree, root);
             }
         }
         _ => {}
@@ -11970,6 +12101,11 @@ fn handle_key(
         }
         if command == AppCommand::ToggleQuickMask {
             return Some(ActivatedCommand::ToggleQuickMask);
+        }
+        if command == AppCommand::MakeSelectionFromPath {
+            return Some(ActivatedCommand::Paths(
+                paths_app::PathsCommand::MakeSelection,
+            ));
         }
         if let Some(selection_command) = selection_view::SelectionCommand::from_app(command) {
             // A focused text field keeps the keyboard: these chords never
@@ -26597,6 +26733,8 @@ enum LockRefusal {
     /// Quick Mask (0.217.0): leaving selected nothing, so there is no
     /// selection.
     QuickMaskNothing,
+    /// A Pen or Paths notice (0.233.0): the sentence is the variant's own.
+    Path(&'static str),
     /// Save Selection with nothing selected (0.218.0).
     SavedSelectionNeedsSelection,
     /// Save Selection past the saved-selection count cap (0.218.0).
@@ -26690,6 +26828,7 @@ impl LockRefusal {
             LockRefusal::QuickMaskNothing => {
                 "Quick Mask selected nothing, so there is no selection."
             }
+            LockRefusal::Path(text) => text,
             LockRefusal::SavedSelectionNeedsSelection => {
                 "Make a selection first. Save Selection keeps the selection you have."
             }
@@ -26806,6 +26945,7 @@ fn lock_refusal_applies(
     press_refusal(tool, lock) == Some(refusal)
         || delete_refusal(lock) == Some(refusal)
         || refusal == LockRefusal::HistoryUnavailable
+        || matches!(refusal, LockRefusal::Path(_))
         || matches!(
             refusal,
             LockRefusal::SavedSelectionNeedsSelection
@@ -26912,7 +27052,8 @@ impl ToolSettings {
             | aurora_ui::Tool::Eyedropper
             | aurora_ui::Tool::Gradient
             | aurora_ui::Tool::PaintBucket
-            | aurora_ui::Tool::Crop => None,
+            | aurora_ui::Tool::Crop
+            | aurora_ui::Tool::Pen => None,
         }
     }
 
@@ -27636,6 +27777,12 @@ struct App {
     /// The last press on a Channels saved-selection row, for the double
     /// click that loads it (0.232.0, [`channels_app::is_double_click`]).
     channel_click: Option<(WidgetId, std::time::Instant)>,
+    /// The Pen tool's state (0.233.0, [`pen::PenState`]).
+    pen: pen::PenState,
+    /// The last press on a Paths row, for the double-click rename.
+    path_click: Option<(WidgetId, std::time::Instant)>,
+    /// The path the open name prompt will rename (0.233.0).
+    path_name_target: Option<String>,
     /// This build's fixed global keyboard shortcuts ([`default_shortcuts`]).
     shortcuts: ShortcutRegistry<AppCommand>,
     /// The modifier keys currently held down, tracked from
@@ -28314,6 +28461,9 @@ impl App {
             gallery: None,
             gallery_click: ClickTracker::default(),
             channel_click: None,
+            pen: pen::PenState::default(),
+            path_click: None,
+            path_name_target: None,
             layer_controls,
             tool_settings,
             tool_controls,
@@ -28425,6 +28575,12 @@ impl App {
         self.apply_pending_selection();
         if let Some(action) = effects.layer_action {
             self.run_layer_action(action);
+        }
+        if let Some(request) = effects.paths {
+            match request {
+                PathsRequest::Row(row) => self.click_paths_row(row),
+                PathsRequest::Action(action) => self.run_paths_action(action),
+            }
         }
         if let Some(request) = effects.channels {
             self.apply_channels_request(request);
@@ -28573,6 +28729,14 @@ impl App {
                         self.run_channels_action(action);
                     }
                 }
+                WidgetOwner::PathsToolbar => {
+                    if let PointerOutcome::Action(aurora_widgets::ActionOutcome::Activated(id)) =
+                        &outcome
+                        && let Some(action) = self.workspace.paths_state.toolbar.action_for(*id)
+                    {
+                        self.run_paths_action(action);
+                    }
+                }
                 // A linked panel bar is never focused, so no key reaches it.
                 // A tab key has already shown its panel
                 // (`route_widget_key` -> `follow_panel_tabs`).
@@ -28595,7 +28759,7 @@ impl App {
         if self.polygon_key_now(key) {
             return;
         }
-        if self.crop_key_now(key) {
+        if self.crop_key_now(key) || self.pen_key_now(key) {
             return;
         }
         // A key that reaches the shortcuts (an Undo, typically) ends a
@@ -28709,6 +28873,7 @@ impl App {
             Some(ActivatedCommand::RefinePrompt(kind)) => self.open_refine_prompt(kind),
             Some(ActivatedCommand::RefineApply(kind, amount)) => self.run_refine(kind, amount),
             Some(ActivatedCommand::SavedSelection(command)) => self.run_saved_selection(command),
+            Some(ActivatedCommand::Paths(command)) => self.run_paths_command(command),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
                 self.move_panel(panel, direction);
             }
@@ -30465,6 +30630,7 @@ impl App {
                     &self.doc.skipped_tiles,
                 );
                 carried.extend(psd_save::selection_loss_line(&self.doc.selection));
+                carried.extend(psd_save::paths_loss_line(&self.doc.selection));
                 carried
             },
         };
@@ -30784,7 +30950,7 @@ impl App {
         let Some(canvas_point) = pointer_in_canvas(&self.workspace, position) else {
             return;
         };
-        if self.crop_pointer_moved(canvas_point) {
+        if self.crop_pointer_moved(canvas_point) || self.pen_pointer_moved(canvas_point) {
             return;
         }
         if let Some(drag) = self.drag.as_mut() {
@@ -30963,6 +31129,9 @@ impl App {
         }
 
         // A Channels panel row or eye (0.232.0), whatever the tool.
+        if button == PointerButton::Primary && self.press_paths_row(position) {
+            return;
+        }
         if button == PointerButton::Primary && self.press_channels_row(position) {
             return;
         }
@@ -31043,6 +31212,11 @@ impl App {
         // rectangle; nothing is cropped until it is committed.
         if self.tool == aurora_ui::Tool::Crop && button == PointerButton::Primary {
             self.crop_press(canvas_point);
+            return;
+        }
+        // The Pen tool (0.233.0): clicks and drags edit the active path.
+        if self.tool == aurora_ui::Tool::Pen && button == PointerButton::Primary {
+            self.pen_press(canvas_point);
             return;
         }
         if self.tool == aurora_ui::Tool::Zoom && button == PointerButton::Primary {
@@ -32023,6 +32197,7 @@ impl App {
         // freehand path's final mask is always exact.
         if translate_pointer_button(button) == Some(PointerButton::Primary) {
             self.crop_pointer_released();
+            self.pen_pointer_released();
         }
         let ending = self.drag.take();
         let ending = lasso_tools::release_lasso(&mut self.drag, ending, &mut self.doc.selection);
@@ -32358,6 +32533,16 @@ impl App {
             {
                 self.select_tool_command(tool);
             }
+            if routed.owner == Some(WidgetOwner::PathsToolbar)
+                && let Some(action) = routed.outcome.as_ref().and_then(|outcome| match outcome {
+                    PointerOutcome::Action(aurora_widgets::ActionOutcome::Activated(id)) => {
+                        self.workspace.paths_state.toolbar.action_for(*id)
+                    }
+                    _ => None,
+                })
+            {
+                self.run_paths_action(action);
+            }
             if routed.owner == Some(WidgetOwner::ChannelsToolbar)
                 && let Some(action) = routed
                     .outcome
@@ -32593,6 +32778,18 @@ impl App {
             Ok(true) => self.needs_redraw = true,
             Ok(false) => {}
             Err(err) => tracing::warn!(?err, "channels toolbar hover failed"),
+        }
+        // 0.233.0: and the Path actions toolbar's.
+        let paths_hovered =
+            under.filter(|&id| aurora_ui::is_paths_toolbar_button(&self.workspace.tree, id));
+        match aurora_ui::set_paths_toolbar_hover(
+            &mut self.workspace.tree,
+            &self.workspace.paths_state.toolbar,
+            paths_hovered,
+        ) {
+            Ok(true) => self.needs_redraw = true,
+            Ok(false) => {}
+            Err(err) => tracing::warn!(?err, "paths toolbar hover failed"),
         }
         // 0.208.0: so are the swap and default-colours buttons.
         let colours = self.workspace.tools.colours;
@@ -33230,6 +33427,7 @@ impl App {
     /// paths themselves ([`refresh_properties_panel`]).
     fn sync_tool_controls_now(&mut self) {
         self.crop_drop_if_stale();
+        self.pen_drop_if_stale();
         self.sync_crop_cursor_now();
         self.sync_colours_now();
         self.sync_menu_bar_now();
@@ -33624,6 +33822,7 @@ impl App {
         ) {
             self.needs_redraw = true;
         }
+        self.apply_pending_paths_now();
     }
 
     /// Escape during a live Marquee drag: the drag ends and the selection
@@ -33755,6 +33954,8 @@ impl App {
         // (0.226.0) sit on top of its outline, the handles over the guides.
         runs.extend(self.crop_guide_runs_now());
         runs.extend(self.crop_handle_runs_now());
+        // The Pen's path (0.233.0): never beside the Crop's handles.
+        runs.extend(self.pen_overlay_runs_now());
         if let Err(err) = aurora_ui::sync_selection_outline(
             &mut self.workspace.tree,
             self.workspace.selection_outline,
@@ -34654,6 +34855,7 @@ impl ApplicationHandler<AppEvent> for App {
         self.sync_layer_controls_now();
         self.sync_tool_controls_now();
         self.sync_channels_now();
+        self.sync_paths_now();
         self.sync_curves_controls_now();
         self.sync_status_bar_now();
         let thumbnail_deadline = self.update_layer_thumbnails(now);
@@ -36963,6 +37165,7 @@ mod tests {
                         close_tab: None,
                         layer_action: None,
                         channels: None,
+                        paths: None,
                         colour: None,
                         menu_bar: None,
                     },
@@ -37161,6 +37364,7 @@ mod tests {
             close_tab: None,
             layer_action: None,
             channels: None,
+            paths: None,
             colour: None,
             menu_bar: None,
         };

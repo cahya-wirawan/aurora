@@ -17,9 +17,7 @@
 //! none. During a drag the path set is edited live and the step is made at
 //! the release.
 
-use aurora_doc::{
-    Anchor, MAX_ANCHORS_PER_SUBPATH, MAX_SUBPATHS, PathSet, Subpath, WORK_PATH_NAME,
-};
+use aurora_doc::{Anchor, MAX_ANCHORS_PER_SUBPATH, MAX_SUBPATHS, PathSet, Subpath, WORK_PATH_NAME};
 use aurora_ui::{AnchorRef, PathPart};
 
 use crate::document_session::DocumentId;
@@ -130,8 +128,7 @@ impl PenState {
         self.gesture.is_some()
     }
 
-    /// Whether an open subpath is still being drawn.
-    #[cfg(test)]
+    /// The index of the open subpath still being drawn.
     pub(crate) fn drawing(&self) -> Option<usize> {
         self.drawing
     }
@@ -172,7 +169,11 @@ impl PenState {
     /// active path stays if it still exists, else nothing is active.
     pub(crate) fn paths_replaced(&mut self, paths: &PathSet) {
         self.reset_editing();
-        if self.active.as_deref().is_some_and(|n| paths.get(n).is_none()) {
+        if self
+            .active
+            .as_deref()
+            .is_some_and(|n| paths.get(n).is_none())
+        {
             self.active = None;
         }
     }
@@ -247,18 +248,26 @@ impl PenState {
             });
             return out;
         }
-        if let Some(name) = self.active.clone()
-            && let Some(index) = self.drawing
-            && let Some(subs) = sub_mut(paths, &name)
-            && let Some(open) = subs.get(index)
-            && open.anchors.len() >= 2
-            && open
-                .anchors
-                .first()
-                .is_some_and(|a| dist(a.point, point) <= close_radius)
-        {
+        let closing = self
+            .active
+            .as_deref()
+            .zip(self.drawing)
+            .filter(|&(name, index)| {
+                paths
+                    .get(name)
+                    .and_then(|path| path.subpaths.get(index))
+                    .is_some_and(|open| {
+                        open.anchors.len() >= 2
+                            && open
+                                .anchors
+                                .first()
+                                .is_some_and(|a| dist(a.point, point) <= close_radius)
+                    })
+            })
+            .map(|(name, index)| (name.to_owned(), index));
+        if let Some((name, index)) = closing {
             self.begin(paths, CLOSE_PATH_LABEL);
-            if let Some(open) = subs.get_mut(index) {
+            if let Some(open) = sub_mut(paths, &name).and_then(|subs| subs.get_mut(index)) {
                 open.closed = true;
             }
             self.drawing = None;

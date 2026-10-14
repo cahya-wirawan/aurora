@@ -29,10 +29,7 @@ fn click(pen: &mut PenState, paths: &mut PathSet, p: (f32, f32)) -> PenOutcome {
 }
 
 fn work(paths: &PathSet) -> Vec<Subpath> {
-    paths
-        .work()
-        .map(|p| p.subpaths.clone())
-        .unwrap_or_default()
+    paths.work().map(|p| p.subpaths.clone()).unwrap_or_default()
 }
 
 fn points(sub: &Subpath) -> Vec<(f32, f32)> {
@@ -69,7 +66,11 @@ fn the_first_click_creates_the_work_path_and_each_click_is_one_step() {
 fn a_drag_makes_a_smooth_anchor_with_mirrored_handles() {
     let mut pen = PenState::default();
     let mut paths = PathSet::new();
-    assert!(pen.press(&mut paths, (20.0, 20.0), None, R, false).step.is_none());
+    assert!(
+        pen.press(&mut paths, (20.0, 20.0), None, R, false)
+            .step
+            .is_none()
+    );
     assert!(pen.dragging());
     assert!(pen.drag(&mut paths, (30.0, 15.0)));
     let live = work(&paths);
@@ -194,7 +195,13 @@ fn dragging_an_anchor_moves_it_with_its_handles_and_is_one_step() {
         subs[0].anchors[1] = Anchor::smooth((40.0, 0.0), (6.0, 2.0));
     }
     let before = paths.clone();
-    let down = pen.press(&mut paths, (41.0, 1.0), Some(PathPart::Anchor(r(0, 1))), R, false);
+    let down = pen.press(
+        &mut paths,
+        (41.0, 1.0),
+        Some(PathPart::Anchor(r(0, 1))),
+        R,
+        false,
+    );
     assert!(down.step.is_none());
     assert_eq!(pen.selected(), Some(r(0, 1)));
     assert!(pen.drag(&mut paths, (51.0, 11.0)));
@@ -214,7 +221,13 @@ fn dragging_an_anchor_moves_it_with_its_handles_and_is_one_step() {
 fn a_press_on_an_anchor_without_a_move_records_nothing() {
     let (mut pen, mut paths) = with_square();
     let before = paths.clone();
-    pen.press(&mut paths, (0.0, 0.0), Some(PathPart::Anchor(r(0, 0))), 0.0, false);
+    pen.press(
+        &mut paths,
+        (0.0, 0.0),
+        Some(PathPart::Anchor(r(0, 0))),
+        0.0,
+        false,
+    );
     let up = pen.release(&mut paths);
     assert!(up.step.is_none());
     assert_eq!(paths, before);
@@ -228,7 +241,13 @@ fn a_handle_of_a_smooth_anchor_mirrors_and_alt_breaks_it() {
         if let Some(subs) = paths.subpaths_mut(WORK_PATH_NAME) {
             subs[0].anchors[1] = Anchor::smooth((40.0, 0.0), (6.0, 2.0));
         }
-        pen.press(&mut paths, (46.0, 2.0), Some(PathPart::HandleOut(r(0, 1))), R, alt);
+        pen.press(
+            &mut paths,
+            (46.0, 2.0),
+            Some(PathPart::HandleOut(r(0, 1))),
+            R,
+            alt,
+        );
         assert!(pen.drag(&mut paths, (50.0, 10.0)));
         let a = work(&paths)[0].anchors[1];
         assert_eq!(a.handle_out, (10.0, 10.0));
@@ -252,11 +271,21 @@ fn the_incoming_handle_drags_too_and_a_corner_with_one_handle_does_not_mirror() 
             handle_out: (0.0, 0.0),
         };
     }
-    pen.press(&mut paths, (35.0, 0.0), Some(PathPart::HandleIn(r(0, 1))), R, false);
+    pen.press(
+        &mut paths,
+        (35.0, 0.0),
+        Some(PathPart::HandleIn(r(0, 1))),
+        R,
+        false,
+    );
     pen.drag(&mut paths, (30.0, 4.0));
     let a = work(&paths)[0].anchors[1];
     assert_eq!(a.handle_in, (-10.0, 4.0));
-    assert_eq!(a.handle_out, (0.0, 0.0), "no mirror for a one-handle corner");
+    assert_eq!(
+        a.handle_out,
+        (0.0, 0.0),
+        "no mirror for a one-handle corner"
+    );
     pen.release(&mut paths);
 }
 
@@ -264,13 +293,25 @@ fn the_incoming_handle_drags_too_and_a_corner_with_one_handle_does_not_mirror() 
 fn delete_removes_the_selected_anchor_and_unselects() {
     let (mut pen, mut paths) = with_square();
     assert!(pen.delete_selected(&mut PathSet::new()).step.is_none());
-    pen.press(&mut paths, (40.0, 0.0), Some(PathPart::Anchor(r(0, 1))), R, false);
+    pen.press(
+        &mut paths,
+        (40.0, 0.0),
+        Some(PathPart::Anchor(r(0, 1))),
+        R,
+        false,
+    );
     pen.release(&mut paths);
     let out = pen.delete_selected(&mut paths);
-    assert_eq!(out.step.as_ref().map(|s| s.label), Some(DELETE_ANCHOR_LABEL));
+    assert_eq!(
+        out.step.as_ref().map(|s| s.label),
+        Some(DELETE_ANCHOR_LABEL)
+    );
     assert_eq!(points(&work(&paths)[0]), vec![(0.0, 0.0), (40.0, 40.0)]);
     assert_eq!(pen.selected(), None);
-    assert!(pen.delete_selected(&mut paths).step.is_none(), "nothing selected");
+    assert!(
+        pen.delete_selected(&mut paths).step.is_none(),
+        "nothing selected"
+    );
 }
 
 #[test]
@@ -279,13 +320,25 @@ fn deleting_down_to_one_anchor_opens_a_closed_subpath_and_to_none_removes_it() {
     // `with_square` closed it; delete two anchors.
     assert!(work(&paths)[0].closed);
     for _ in 0..2 {
-        pen.press(&mut paths, (0.0, 0.0), Some(PathPart::Anchor(r(0, 0))), R, false);
+        pen.press(
+            &mut paths,
+            (0.0, 0.0),
+            Some(PathPart::Anchor(r(0, 0))),
+            R,
+            false,
+        );
         pen.release(&mut paths);
         pen.delete_selected(&mut paths);
     }
     assert_eq!(work(&paths)[0].anchors.len(), 1);
     assert!(!work(&paths)[0].closed, "a lone anchor cannot be closed");
-    pen.press(&mut paths, (0.0, 0.0), Some(PathPart::Anchor(r(0, 0))), R, false);
+    pen.press(
+        &mut paths,
+        (0.0, 0.0),
+        Some(PathPart::Anchor(r(0, 0))),
+        R,
+        false,
+    );
     pen.release(&mut paths);
     pen.delete_selected(&mut paths);
     assert!(work(&paths).is_empty());

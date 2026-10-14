@@ -124,7 +124,11 @@ fn a_crop_in_the_same_jump_shifts_the_pending_paths() {
         .and_then(|p| p.get("A"))
         .and_then(|p| p.subpaths.first())
         .and_then(|s| s.anchors.first().copied());
-    assert_eq!(first.map(|a| a.point), Some((6.0, -4.0)), "shifted by -dx, -dy");
+    assert_eq!(
+        first.map(|a| a.point),
+        Some((6.0, -4.0)),
+        "shifted by -dx, -dy"
+    );
 }
 
 #[test]

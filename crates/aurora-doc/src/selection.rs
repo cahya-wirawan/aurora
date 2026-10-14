@@ -444,6 +444,12 @@ impl SelectionSet {
         &self.paths
     }
 
+    /// The document's paths, for a gesture that edits them live (the Pen's
+    /// drag). The caller keeps them valid ([`crate::PathSet::validate`]).
+    pub fn paths_mut(&mut self) -> &mut crate::PathSet {
+        &mut self.paths
+    }
+
     /// Replaces the document's paths.
     pub fn set_paths(&mut self, paths: crate::PathSet) {
         self.paths = paths;

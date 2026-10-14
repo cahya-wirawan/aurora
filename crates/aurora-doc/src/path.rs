@@ -139,32 +139,38 @@ fn cubic_between(a: &Anchor, b: &Anchor) -> Cubic {
     [a.point, a.out_position(), b.in_position(), b.point]
 }
 
-/// Appends the flattening of `c` (excluding its first point) to `out`.
-fn flatten_cubic(c: &Cubic, tolerance: f32, out: &mut Vec<(f32, f32)>) {
-    let [p0, p1, p2, p3] = *c;
-    let d1 = (p0.0 - 2.0 * p1.0 + p2.0, p0.1 - 2.0 * p1.1 + p2.1);
-    let d2 = (p1.0 - 2.0 * p2.0 + p3.0, p1.1 - 2.0 * p2.1 + p3.1);
-    let m = d1.0.hypot(d1.1).max(d2.0.hypot(d2.1));
+/// Appends the flattening of `curve` (excluding its first point) to `out`.
+fn flatten_cubic(curve: &Cubic, tolerance: f32, out: &mut Vec<(f32, f32)>) {
+    let [start, ctrl1, ctrl2, end] = *curve;
+    let second1 = (
+        start.0 - 2.0 * ctrl1.0 + ctrl2.0,
+        start.1 - 2.0 * ctrl1.1 + ctrl2.1,
+    );
+    let second2 = (
+        ctrl1.0 - 2.0 * ctrl2.0 + end.0,
+        ctrl1.1 - 2.0 * ctrl2.1 + end.1,
+    );
+    let bend = second1.0.hypot(second1.1).max(second2.0.hypot(second2.1));
     // Uniform subdivision error is at most (1/8) * max|B''| / n^2 with
-    // max|B''| <= 6 * m.
-    // A segment with no handle at either end is a straight line.
-    let n = if m <= 0.0 || (p1 == p0 && p2 == p3) {
+    // max|B''| <= 6 * bend. A segment with no handle at either end is a
+    // straight line.
+    let segments = if bend <= 0.0 || (ctrl1 == start && ctrl2 == end) {
         1
     } else {
-        let raw = (0.75 * m / tolerance).sqrt().ceil();
+        let raw = (0.75 * bend / tolerance).sqrt().ceil();
         // Truncation is intended: `raw` is a small positive whole number.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let n = raw.min(MAX_SEGMENTS_PER_CURVE as f32) as u32;
-        n.max(1)
+        let count = raw.min(MAX_SEGMENTS_PER_CURVE as f32) as u32;
+        count.max(1)
     };
-    for i in 1..=n {
+    for step in 1..=segments {
         #[allow(clippy::cast_precision_loss)]
-        let t = i as f32 / n as f32;
+        let t = step as f32 / segments as f32;
         let u = 1.0 - t;
         let (b0, b1, b2, b3) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
-        let x = b0 * p0.0 + b1 * p1.0 + b2 * p2.0 + b3 * p3.0;
-        let y = b0 * p0.1 + b1 * p1.1 + b2 * p2.1 + b3 * p3.1;
-        out.push(if i == n { p3 } else { (x, y) });
+        let x = b0 * start.0 + b1 * ctrl1.0 + b2 * ctrl2.0 + b3 * end.0;
+        let y = b0 * start.1 + b1 * ctrl1.1 + b2 * ctrl2.1 + b3 * end.1;
+        out.push(if step == segments { end } else { (x, y) });
     }
 }
 
@@ -394,7 +400,7 @@ impl PathSet {
     /// The first name `Path N` not in use.
     #[must_use]
     pub fn next_free_name(&self) -> String {
-        (1..)
+        (1..=MAX_PATHS + 1)
             .map(|n| format!("Path {n}"))
             .find(|name| self.get(name).is_none())
             .unwrap_or_default()
