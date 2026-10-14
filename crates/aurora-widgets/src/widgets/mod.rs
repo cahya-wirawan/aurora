@@ -227,8 +227,9 @@ pub use scrollbar::{
     sync_scrollbar,
 };
 pub use selection_outline::{
-    OutlineRun, OutlineTone, SelectionOutlineState, TINT_LEVELS, TintRect,
-    insert_selection_outline, selection_outline_state, set_selection_outline, set_selection_tint,
+    OutlineRun, OutlineTone, SelectionOutlineState, ShieldRect, TINT_LEVELS, TintRect,
+    insert_selection_outline, selection_outline_state, set_selection_outline, set_selection_shield,
+    set_selection_tint,
 };
 pub use slider::{
     SliderState, insert_slider, set_slider_disabled, set_slider_label, set_slider_value,

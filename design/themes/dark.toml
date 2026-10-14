@@ -67,3 +67,10 @@ ants_dark  = "hc.black"
 [quick_mask.overlay]
 color = "semantic.red.500"
 alpha = 0.5
+
+# 0.227.0: the Crop tool's shield over the canvas outside the crop
+# rectangle. Black at 0.5, identical in all five themes (Photoshop's
+# default shield opacity); not contrast-gated (a dimming, not content).
+[crop.shield]
+color = "hc.black"
+alpha = 0.5

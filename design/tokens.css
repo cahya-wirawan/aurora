@@ -37,6 +37,8 @@
   --selection-ants-dark: #000000;
   --quick-mask-overlay-color: #ff6b6f;
   --quick-mask-overlay-alpha: 0.5;
+  --crop-shield-color: #000000;
+  --crop-shield-alpha: 0.5;
 
   --type-size-xs: 11px;
   --type-size-sm: 12px;

@@ -1099,3 +1099,73 @@ fn a_pending_shift_that_cannot_apply_drops_every_selection_not_just_the_active_o
         "taken once"
     );
 }
+
+// ---- the shield (0.227.0) ----
+
+#[test]
+fn the_shield_shows_only_for_the_crop_tool_with_a_rectangle_and_an_area() {
+    use crate::crop_app::shield_for_frame;
+    let view = aurora_ui::CanvasView::default();
+    let r = Some(rect(10, 10, 40, 30));
+    let size = Some((200.0, 100.0));
+    let shown = shield_for_frame(aurora_ui::Tool::Crop, r, size, &view, 1.0);
+    assert_eq!(shown.len(), 4);
+    assert!(shield_for_frame(aurora_ui::Tool::Brush, r, size, &view, 1.0).is_empty());
+    assert!(shield_for_frame(aurora_ui::Tool::MarqueeSelect, r, size, &view, 1.0).is_empty());
+    assert!(shield_for_frame(aurora_ui::Tool::Crop, None, size, &view, 1.0).is_empty());
+    assert!(shield_for_frame(aurora_ui::Tool::Crop, r, None, &view, 1.0).is_empty());
+}
+
+#[test]
+fn a_crop_drag_dims_everything_outside_its_rectangle() {
+    use crate::crop_app::shield_for_frame;
+    let view = aurora_ui::CanvasView::default();
+    let mut state = CropState::default();
+    let start = Instant::now();
+    state.press((20.0, 10.0), 4.0, start, DocumentId::next(), (200, 100));
+    state.drag((120.0, 60.0), (200, 100));
+    state.release();
+    let Some(r) = state.rect() else {
+        unreachable!("a drag makes a rectangle")
+    };
+    let shield = shield_for_frame(
+        aurora_ui::Tool::Crop,
+        Some(r),
+        Some((200.0, 100.0)),
+        &view,
+        1.0,
+    );
+    let area: u64 = shield
+        .iter()
+        .map(|s| u64::from(s.width) * u64::from(s.height))
+        .sum();
+    assert_eq!(
+        area,
+        200 * 100 - u64::from(r.width) * u64::from(r.height),
+        "the shield is the area minus the rectangle"
+    );
+    // After a cancel nothing is left to dim.
+    state.cancel();
+    assert!(
+        shield_for_frame(
+            aurora_ui::Tool::Crop,
+            state.rect(),
+            Some((200.0, 100.0)),
+            &view,
+            1.0
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn the_frame_syncs_the_shield_once_beneath_the_outline() {
+    // `App::redraw` needs a window: a single-line source check that it
+    // calls the sync, and that the sync is not mistyped away.
+    let source = include_str!("lib.rs");
+    let calls = source
+        .lines()
+        .filter(|line| line.trim() == "self.sync_crop_shield_now();")
+        .count();
+    assert_eq!(calls, 1, "redraw syncs the crop shield");
+}

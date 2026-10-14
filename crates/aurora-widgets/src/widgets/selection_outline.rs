@@ -26,6 +26,11 @@
 //! Quick Mask red at 50 %; one mesh per level present). An empty list
 //! paints nothing.
 //!
+//! **Shield (0.227.0, Crop).** A third list of [`ShieldRect`]s, in the same
+//! physical-pixel space, paints flat in the `crop.shield` token (black at
+//! alpha 0.5 in every built-in theme) beneath the tint and the ants: the
+//! Crop tool dims the canvas outside its rectangle with them.
+//!
 //! **Accessibility**: AT-`hidden`, never focusable, no actions. The
 //! selection itself is announced through the status bar's text.
 
@@ -71,11 +76,23 @@ pub struct TintRect {
     pub level: u8,
 }
 
-/// A selection outline's state: the dashes to draw, and the tint beneath.
+/// One shielded rectangle (the Crop tool's dimming) in physical pixels
+/// relative to the widget's origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShieldRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A selection outline's state: the dashes to draw, the tint beneath and
+/// the shield beneath that.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SelectionOutlineState {
     runs: Vec<OutlineRun>,
     tint: Vec<TintRect>,
+    shield: Vec<ShieldRect>,
 }
 
 impl SelectionOutlineState {
@@ -89,6 +106,12 @@ impl SelectionOutlineState {
     #[must_use]
     pub fn tint(&self) -> &[TintRect] {
         &self.tint
+    }
+
+    /// The shielded rectangles (Crop), in no particular order.
+    #[must_use]
+    pub fn shield(&self) -> &[ShieldRect] {
+        &self.shield
     }
 }
 
@@ -186,6 +209,30 @@ pub fn set_selection_tint(
     match tree.payload_mut(id) {
         Some(WidgetKind::SelectionOutline(state)) => {
             state.tint = rects;
+            Ok(true)
+        }
+        Some(_) => Err(WidgetError::WrongWidgetKind(id)),
+        None => Err(WidgetError::UnknownWidget(id)),
+    }
+}
+
+/// Replaces the shield rectangles. Returns whether anything changed. No
+/// relayout is needed.
+///
+/// # Errors
+///
+/// As [`selection_outline_state`].
+pub fn set_selection_shield(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    rects: Vec<ShieldRect>,
+) -> Result<bool, WidgetError> {
+    if selection_outline_state(tree, id)?.shield == rects {
+        return Ok(false);
+    }
+    match tree.payload_mut(id) {
+        Some(WidgetKind::SelectionOutline(state)) => {
+            state.shield = rects;
             Ok(true)
         }
         Some(_) => Err(WidgetError::WrongWidgetKind(id)),

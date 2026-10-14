@@ -3077,7 +3077,8 @@ fn paint_selection_outline(
     };
     #[allow(clippy::cast_precision_loss)]
     let (origin_x, origin_y) = (bounds.x as f32, bounds.y as f32);
-    let mut paints = tint_paints(state, origin_x, origin_y, theme, scale);
+    let mut paints = shield_paints(state, origin_x, origin_y, theme, scale);
+    paints.extend(tint_paints(state, origin_x, origin_y, theme, scale));
     for (tone, colour) in [
         (OutlineTone::Light, theme.selection.ants_light.to_srgb_f32()),
         (OutlineTone::Dark, theme.selection.ants_dark.to_srgb_f32()),
@@ -3115,6 +3116,52 @@ fn paint_selection_outline(
         }
     }
     paints
+}
+
+/// The Crop tool's shield under everything else a selection outline draws
+/// (0.227.0): one flat mesh of every shield rectangle in the `crop.shield`
+/// colour at its alpha. Nothing for no rectangles.
+fn shield_paints(
+    state: &crate::widgets::SelectionOutlineState,
+    origin_x: f32,
+    origin_y: f32,
+    theme: &Theme,
+    scale: f32,
+) -> Vec<Paint> {
+    let shield = theme.crop.shield;
+    let [red, green, blue] = shield.color.to_srgb_f32();
+    let mut mesh = Mesh {
+        vertices: Vec::new(),
+        indices: Vec::new(),
+    };
+    for rect in state.shield() {
+        #[allow(clippy::cast_precision_loss)]
+        let (x0, y0) = (
+            origin_x + rect.x as f32 / scale,
+            origin_y + rect.y as f32 / scale,
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let (x1, y1) = (
+            x0 + rect.width as f32 / scale,
+            y0 + rect.height as f32 / scale,
+        );
+        let Ok(base) = u32::try_from(mesh.vertices.len()) else {
+            break;
+        };
+        mesh.vertices.extend([
+            Point { x: x0, y: y0 },
+            Point { x: x1, y: y0 },
+            Point { x: x1, y: y1 },
+            Point { x: x0, y: y1 },
+        ]);
+        mesh.indices
+            .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    if mesh.indices.is_empty() {
+        Vec::new()
+    } else {
+        vec![(mesh, [red, green, blue, shield.alpha])]
+    }
 }
 
 /// The Quick Mask tint under a selection outline (0.217.0): one flat mesh
@@ -3431,6 +3478,102 @@ mod tests {
         let drawn = paints(&tree, 1.0);
         let [lr, lg, lb] = theme.selection.ants_light.to_srgb_f32();
         assert_eq!(drawn.len(), 3);
+        assert_eq!(drawn[2].1, [lr, lg, lb, 1.0]);
+    }
+
+    /// 0.227.0: the Crop shield paints one flat mesh in the `crop.shield`
+    /// token's colour and alpha, beneath the tint and the ants.
+    #[test]
+    #[allow(clippy::indexing_slicing, clippy::float_cmp)]
+    fn a_selection_outline_shield_paints_first_in_the_crop_shield_token() {
+        use crate::widgets::{
+            OutlineRun, OutlineTone, ShieldRect, TintRect, insert_selection_outline,
+            set_selection_outline, set_selection_shield, set_selection_tint,
+        };
+        let theme = dark_theme();
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let id = match insert_selection_outline(&mut tree, root) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        tree.compute_layout(200.0, 100.0);
+        let paints = |tree: &WidgetTree<WidgetKind>, theme: &Theme, scale| match paint_widget(
+            tree,
+            id,
+            theme,
+            &scales(),
+            scale,
+        ) {
+            Ok(paints) => paints,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(paints(&tree, &theme, 1.0).is_empty(), "no shield, no paint");
+        let rects = vec![
+            ShieldRect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 4,
+            },
+            ShieldRect {
+                x: 8,
+                y: 10,
+                width: 4,
+                height: 6,
+            },
+        ];
+        assert_eq!(
+            set_selection_shield(&mut tree, id, rects.clone()).ok(),
+            Some(true)
+        );
+        assert_eq!(set_selection_shield(&mut tree, id, rects).ok(), Some(false));
+        let drawn = paints(&tree, &theme, 2.0);
+        assert_eq!(drawn.len(), 1);
+        let [r, g, b] = theme.crop.shield.color.to_srgb_f32();
+        assert_eq!([r, g, b], [0.0, 0.0, 0.0], "black");
+        assert_eq!(drawn[0].1, [r, g, b, 0.5]);
+        assert_eq!(drawn[0].0.vertices.len(), 8, "two rectangles, one mesh");
+        let xs: Vec<f32> = drawn[0].0.vertices.iter().map(|p| p.x).collect();
+        assert_eq!(xs.iter().copied().fold(f32::MIN, f32::max), 10.0);
+        // The colour and alpha come from the token, whatever they are.
+        let mut other = theme;
+        other.crop.shield.color = Color {
+            r: 10,
+            g: 200,
+            b: 30,
+        };
+        other.crop.shield.alpha = 0.25;
+        let [r2, g2, b2] = other.crop.shield.color.to_srgb_f32();
+        assert_eq!(paints(&tree, &other, 2.0)[0].1, [r2, g2, b2, 0.25]);
+        // Tint and ants come after the shield.
+        let tint = TintRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            level: 16,
+        };
+        let run = OutlineRun {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 1,
+            tone: OutlineTone::Light,
+        };
+        assert_eq!(
+            set_selection_tint(&mut tree, id, vec![tint]).ok(),
+            Some(true)
+        );
+        assert_eq!(
+            set_selection_outline(&mut tree, id, vec![run]).ok(),
+            Some(true)
+        );
+        let drawn = paints(&tree, &theme, 1.0);
+        assert_eq!(drawn.len(), 3);
+        assert_eq!(drawn[0].1, [r, g, b, 0.5], "the shield is first");
+        let [qr, qg, qb] = theme.quick_mask.overlay.color.to_srgb_f32();
+        assert_eq!(drawn[1].1, [qr, qg, qb, theme.quick_mask.overlay.alpha]);
+        let [lr, lg, lb] = theme.selection.ants_light.to_srgb_f32();
         assert_eq!(drawn[2].1, [lr, lg, lb, 1.0]);
     }
 
