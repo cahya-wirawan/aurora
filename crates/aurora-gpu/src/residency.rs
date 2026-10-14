@@ -1197,7 +1197,7 @@ impl TileResidency {
     /// exported changes. A non-finite or out-of-range entry is made safe:
     /// NaN reads as shown, the rest is clamped to `0..=1`. Takes effect on
     /// the next [`Self::set_origin`], which rewrites the uniform (the app
-    /// calls it every frame). The default, and [`FULL_GAIN`], draws
+    /// calls it every frame). The default, and `FULL_GAIN`, draws
     /// bit-identically to a canvas with no gain.
     pub fn set_channel_gain(&mut self, gain: [f32; 3]) {
         self.channel_gain = gain.map(|g| if g.is_nan() { 1.0 } else { g.clamp(0.0, 1.0) });
