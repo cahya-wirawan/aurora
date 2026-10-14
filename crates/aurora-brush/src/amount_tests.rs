@@ -31,9 +31,12 @@ use half::f16;
 
 use crate::{
     Coverage, MIN_AMOUNT, PaintAmount, PixelHistory, StrokeSnapshot, clone_dab_amount,
-    clone_dab_covered, hard_dab_snap, stamp_dab, stamp_dab_amount, stamp_dab_covered,
-    stamp_dab_hard, stamp_dab_hard_preserving_alpha_covered, stamp_dab_preserving_alpha,
+    clone_dab_covered, hard_dab_snap, stamp_dab_amount, stamp_dab_covered,
+    stamp_dab_hard_preserving_alpha_covered,
 };
+// Only the Linux-only legacy pin below uses these entry points.
+#[cfg(target_os = "linux")]
+use crate::{stamp_dab, stamp_dab_hard, stamp_dab_preserving_alpha};
 
 type Tx = [f16; CHANNELS];
 
