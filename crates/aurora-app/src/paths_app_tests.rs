@@ -406,3 +406,142 @@ fn a_notice_shows_its_own_sentence_and_a_psd_save_names_paths() {
     set.set_paths(paths);
     assert!(crate::psd_save::paths_loss_line(&set).is_some_and(|line| line.contains("Paths")));
 }
+
+// ---- 0.234.0: the new commands --------------------------------------------
+
+#[test]
+fn fill_stroke_and_make_path_are_commands_in_the_palette_and_the_menus() {
+    use crate::path_paint::{
+        COMMAND_FILL, COMMAND_MAKE_FROM_SELECTION, COMMAND_STROKE, FILL_TITLE,
+        MAKE_FROM_SELECTION_TITLE, STROKE_TITLE,
+    };
+    let expected = [
+        (COMMAND_FILL, FILL_TITLE, PathsCommand::Fill),
+        (COMMAND_STROKE, STROKE_TITLE, PathsCommand::Stroke),
+        (
+            COMMAND_MAKE_FROM_SELECTION,
+            MAKE_FROM_SELECTION_TITLE,
+            PathsCommand::MakeFromSelection,
+        ),
+    ];
+    let mut ws = build_workspace(&scales());
+    let mut focus = crate::FocusManager::default();
+    let palette = crate::palette_commands();
+    let menus = crate::menu_model::build_menus(
+        &crate::menu_model::MenuContext {
+            can_undo: false,
+            can_redo: false,
+            delete_allowed: true,
+            quick_mask: false,
+            clipped: false,
+            clip_refused: false,
+            workspaces: Vec::new(),
+            documents: Vec::new(),
+            saved_selections: Vec::new(),
+        },
+        &crate::default_shortcuts_for(false),
+    );
+    for (id, title, command) in expected {
+        assert_eq!(command_for(id), Some(command.clone()));
+        assert!(
+            palette.iter().any(|c| c.id == id && c.title == title),
+            "{id} palette"
+        );
+        assert!(
+            menus
+                .iter()
+                .flat_map(|m| m.entries.iter())
+                .any(|e| matches!(
+                    e,
+                    crate::menu_model::Entry::Item { command, .. } if command == id
+                )),
+            "{id} menu"
+        );
+        assert_eq!(
+            crate::activate_command(
+                &mut ws,
+                &mut focus,
+                id,
+                &mut crate::tests::FakeFileDialog::default()
+            ),
+            Some(crate::ActivatedCommand::Paths(command))
+        );
+        let off = crate::menu_model::MenuContext {
+            quick_mask: true,
+            ..crate::menu_model::MenuContext {
+                can_undo: false,
+                can_redo: false,
+                delete_allowed: true,
+                quick_mask: false,
+                clipped: false,
+                clip_refused: false,
+                workspaces: Vec::new(),
+                documents: Vec::new(),
+                saved_selections: Vec::new(),
+            }
+        };
+        assert!(
+            !crate::menu_model::enabled(id, &off),
+            "{id} refused in Quick Mask"
+        );
+    }
+}
+
+#[test]
+fn the_panel_buttons_run_the_matching_commands_and_follow_the_document() {
+    let mut s = session();
+    let mut ws = build_workspace(&scales());
+    // Facts: no path, no selection.
+    let facts = |ws: &aurora_ui::Workspace| ws.paths_state.facts;
+    sync_paths(&mut ws, &scales(), &s, None);
+    assert_eq!(facts(&ws), aurora_ui::PathsFacts::default());
+    // A work path of three points can fill and stroke; a selection enables
+    // Make Work Path.
+    let mut set = PathSet::new();
+    assert!(set.ensure_work().is_ok());
+    assert!(
+        set.set_subpaths(
+            WORK_PATH_NAME,
+            vec![Subpath {
+                anchors: vec![
+                    Anchor::corner(0.0, 0.0),
+                    Anchor::corner(9.0, 0.0),
+                    Anchor::corner(9.0, 9.0)
+                ],
+                closed: true,
+            }]
+        )
+        .is_ok()
+    );
+    s.selection.set_paths(set);
+    s.selection.select(aurora_doc::Selection {
+        bounds: aurora_core::Rect {
+            x: 1,
+            y: 1,
+            width: 4,
+            height: 4,
+        },
+        inverted: false,
+        shape: aurora_doc::SelectionShape::Rect,
+    });
+    sync_paths(&mut ws, &scales(), &s, Some(WORK_PATH_NAME));
+    let f = facts(&ws);
+    assert!(
+        f.can_fill && f.can_stroke && f.has_selection && !f.selected_empty,
+        "{f:?}"
+    );
+    let toolbar = ws.paths_state.toolbar;
+    for action in [
+        aurora_ui::PathsAction::FillPath,
+        aurora_ui::PathsAction::StrokePath,
+        aurora_ui::PathsAction::MakeWorkPath,
+    ] {
+        let Some(id) = toolbar.button_for(action) else {
+            unreachable!("button");
+        };
+        assert!(
+            !matches!(ws.tree.payload(id), Some(aurora_widgets::widgets::WidgetKind::Button(b)) if b.disabled),
+            "{action:?} enabled"
+        );
+    }
+}

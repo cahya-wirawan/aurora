@@ -368,3 +368,26 @@ fn one_snapshot_restores_the_layer() {
     assert!(snap.apply(&mut s).is_ok());
     assert_eq!(all_bits(&mut s, 70, 70), before);
 }
+
+#[test]
+fn a_small_shape_in_a_huge_area_only_counts_the_tiles_it_reaches() {
+    let (_d, mut s) = store();
+    let small = Block(rect(10, 10, 20, 20), 1.0);
+    let tight = ShapeFillSpec {
+        colour: RED,
+        opacity: 1.0,
+        max_tiles: 1,
+    };
+    let out = fill_with_coverage(
+        &mut s,
+        surface(),
+        (0, 0, 100_000, 100_000),
+        &small,
+        &tight,
+        FillMode::Normal,
+        None,
+        None,
+    );
+    assert!(out.is_ok_and(|o| o.painted().len() == 1));
+    assert_eq!(get(&mut s, 15, 15)[3], f16::ONE);
+}
