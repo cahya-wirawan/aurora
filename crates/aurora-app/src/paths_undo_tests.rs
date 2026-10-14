@@ -1,6 +1,8 @@
 //! Path steps in the unified undo order (0.233.0): undo and redo exactness,
 //! dirty neutrality, redo clearing, History labels and the Crop's shift.
 
+#![allow(clippy::indexing_slicing)]
+
 use aurora_doc::{Anchor, PathSet, Subpath};
 
 use crate::pen::PathStep;

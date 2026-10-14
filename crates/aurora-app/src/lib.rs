@@ -3681,9 +3681,8 @@ fn apply_saved_collapse(workspace: &mut aurora_ui::Workspace, layout: &Workspace
         aurora_ui::DockPanel::History => layout.history_collapsed,
         // 0.232.0: the Channels panel's collapse is not saved (the layout
         // wire format has no field for it; adding one is a new version).
-        aurora_ui::DockPanel::Channels => false,
         // 0.233.0: nor the Paths panel's.
-        aurora_ui::DockPanel::Paths => false,
+        aurora_ui::DockPanel::Channels | aurora_ui::DockPanel::Paths => false,
     };
     // Floating slots too (0.167.0): a floating panel's collapse is saved
     // and restored like a docked one's.
@@ -11854,6 +11853,7 @@ fn palette_query_with_paste(query: &str, pasted: &str) -> String {
 /// for a file, the read/decode step) `activate_command` deliberately
 /// doesn't. Every other case returns `None`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn handle_palette_key(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
@@ -34748,6 +34748,7 @@ impl ApplicationHandler<AppEvent> for App {
     // (macOS only) the muda poll — see
     // `next_control_flow`. Setting it only sometimes would leave a stale
     // `WaitUntil` in the past behind, which is a busy loop.
+    #[allow(clippy::too_many_lines)]
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         // 0.213.0: a selection step undone or redone by a path that does
         // not own the selection (defensive; the known ones apply it).

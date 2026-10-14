@@ -1,7 +1,11 @@
 //! Tests of the Pen tool's state machine (0.233.0): clicks, drags, closing,
 //! ending, cancelling, anchor and handle moves, deletion, caps and steps.
 
-#![allow(clippy::cast_precision_loss, clippy::indexing_slicing)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::indexing_slicing,
+    clippy::redundant_closure_for_method_calls
+)]
 
 use aurora_doc::{Anchor, MAX_ANCHORS_PER_SUBPATH, MAX_SUBPATHS, PathSet, Subpath, WORK_PATH_NAME};
 use aurora_ui::{AnchorRef, PathPart};

@@ -104,7 +104,7 @@ fn sub_mut<'a>(paths: &'a mut PathSet, name: &str) -> Option<&'a mut Vec<Subpath
     paths.subpaths_mut(name)
 }
 
-fn anchor_mut<'a>(subs: &'a mut [Subpath], r: AnchorRef) -> Option<&'a mut Anchor> {
+fn anchor_mut(subs: &mut [Subpath], r: AnchorRef) -> Option<&mut Anchor> {
     subs.get_mut(r.subpath)?.anchors.get_mut(r.anchor)
 }
 
@@ -215,6 +215,7 @@ impl PenState {
     /// `aurora_ui::path_hit` found under the pointer on the active path,
     /// `close_radius` the close tolerance in document px, `alt` whether Alt
     /// is held.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn press(
         &mut self,
         paths: &mut PathSet,
@@ -306,17 +307,16 @@ impl PenState {
         let Some(subs) = sub_mut(paths, &name) else {
             return out;
         };
-        let index = match drawing.filter(|&i| subs.get(i).is_some_and(|s| !s.closed)) {
-            Some(i) => i,
-            None => {
-                if subs.len() >= MAX_SUBPATHS {
-                    self.before = None;
-                    out.refused = Some("This path already has the most subpaths it can hold.");
-                    return out;
-                }
-                subs.push(Subpath::default());
-                subs.len() - 1
+        let index = if let Some(i) = drawing.filter(|&i| subs.get(i).is_some_and(|s| !s.closed)) {
+            i
+        } else {
+            if subs.len() >= MAX_SUBPATHS {
+                self.before = None;
+                out.refused = Some("This path already has the most subpaths it can hold.");
+                return out;
             }
+            subs.push(Subpath::default());
+            subs.len() - 1
         };
         let Some(open) = subs.get_mut(index) else {
             return out;

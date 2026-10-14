@@ -6,7 +6,11 @@
     clippy::indexing_slicing,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::float_cmp
+    clippy::cast_sign_loss,
+    clippy::excessive_precision,
+    clippy::float_cmp,
+    clippy::manual_midpoint,
+    clippy::many_single_char_names
 )]
 
 use aurora_core::Rect;

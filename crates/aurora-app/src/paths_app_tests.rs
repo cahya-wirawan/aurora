@@ -2,6 +2,8 @@
 //! selection step, the path commands as undo steps, the Pen's keys, the
 //! panel's rows, the commands and the layout, the Quick Mask refusals.
 
+#![allow(clippy::redundant_closure_for_method_calls)]
+
 use aurora_doc::{Anchor, PathSet, Subpath, WORK_PATH_NAME};
 use aurora_ui::{Tool, build_workspace};
 

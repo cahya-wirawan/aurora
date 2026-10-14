@@ -169,20 +169,18 @@ pub(crate) fn prompt_enter(
         return None;
     }
     let query = command_palette_state(tree, root).ok()?.query().to_owned();
-    match aurora_doc::validate_path_name(&query) {
-        Ok(name) => Some(Ok(name)),
-        Err(_) => {
-            let message = refusal_message().to_owned();
-            let row = vec![CommandEntry::new(ROW_NAME, message.clone())];
-            if let Err(err) = set_command_palette_commands(tree, root, row) {
-                tracing::warn!(?err, "failed to show a refused path name");
-            }
-            if let Err(err) = set_command_palette_message(tree, root, Some(message)) {
-                tracing::warn!(?err, "failed to describe a refused path name");
-            }
-            Some(Err(()))
+    let Ok(name) = aurora_doc::validate_path_name(&query) else {
+        let message = refusal_message().to_owned();
+        let row = vec![CommandEntry::new(ROW_NAME, message.clone())];
+        if let Err(err) = set_command_palette_commands(tree, root, row) {
+            tracing::warn!(?err, "failed to show a refused path name");
         }
-    }
+        if let Err(err) = set_command_palette_message(tree, root, Some(message)) {
+            tracing::warn!(?err, "failed to describe a refused path name");
+        }
+        return Some(Err(()));
+    };
+    Some(Ok(name))
 }
 
 // ------------------------------------------------------- pure decisions
