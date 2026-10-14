@@ -595,6 +595,9 @@ mod small_machine;
 mod smudge_stamp;
 #[cfg(test)]
 mod smudge_stamp_tests;
+mod spot_heal_stamp;
+#[cfg(test)]
+mod spot_heal_stamp_tests;
 mod tone_stamp;
 #[cfg(test)]
 mod tone_stamp_tests;
@@ -5723,6 +5726,9 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         // the bare S Clone Stamp leaves free).
         ("Shift+R", AppCommand::SelectTool(aurora_ui::Tool::Blur)),
         ("Shift+S", AppCommand::SelectTool(aurora_ui::Tool::Sharpen)),
+        // 0.237.0: Photoshop's Spot Healing Brush key (bare, like the other
+        // tool letters; Primary+J is Layer via Copy, a different chord).
+        ("j", AppCommand::SelectTool(aurora_ui::Tool::SpotHealing)),
         // 0.224.0: the Dodge, Burn and Sponge. Photoshop shares O among the
         // three; Aurora keeps bare O for the Dodge, Shift+O for the Burn and
         // gives the Sponge Shift+P (bare P stays free for a future Pen).
@@ -6265,6 +6271,7 @@ const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
         aurora_ui::Tool::Sponge => "tool.sponge",
         aurora_ui::Tool::Crop => "tool.crop",
         aurora_ui::Tool::Pen => "tool.pen",
+        aurora_ui::Tool::SpotHealing => "tool.spot_healing",
     }
 }
 
@@ -12871,6 +12878,10 @@ enum Drag {
         /// reads "Dodge Stroke"/"Burn Stroke"/"Sponge Stroke" and its dabs
         /// are [`tone_stamp::tone_dab_through_selection`]'s.
         tone: Option<tone_stamp::ToneKind>,
+        /// The Spot Healing (0.237.0): `Some(stroke)` is the area painted so
+        /// far ([`spot_heal_stamp`]); nothing is written while the drag
+        /// runs, the release heals it as one step "Spot Healing".
+        heal: Option<Box<spot_heal_stamp::HealStroke>>,
         last_doc: (f32, f32),
         carry: f32,
         /// This stroke's own accumulated undo snapshot — `None` when the
@@ -13159,11 +13170,14 @@ fn commit_ending_drag(
             smudge,
             filter,
             tone,
+            heal,
             ..
         }) => record_stroke(
             stroke,
             if clone.is_some() {
                 CLONE_STAMP_STROKE_LABEL
+            } else if heal.is_some() {
+                spot_heal_stamp::SPOT_HEALING_LABEL
             } else if smudge.is_some() {
                 SMUDGE_STROKE_LABEL
             } else if let Some(kind) = filter {
@@ -13461,6 +13475,7 @@ fn begin_drag(
             | aurora_ui::Tool::Pencil
             | aurora_ui::Tool::CloneStamp
             | aurora_ui::Tool::Smudge
+            | aurora_ui::Tool::SpotHealing
             | aurora_ui::Tool::Blur
             | aurora_ui::Tool::Sharpen
             | aurora_ui::Tool::Dodge
@@ -13478,6 +13493,7 @@ fn begin_drag(
                 smudge: (tool == aurora_ui::Tool::Smudge).then(Box::default),
                 filter: filter_stamp::kind_of(tool),
                 tone: tone_stamp::kind_of(tool),
+                heal: (tool == aurora_ui::Tool::SpotHealing).then(Box::default),
                 last_doc: view.to_document(canvas_point),
                 carry: 0.0,
                 stroke: active_pixel_layer
@@ -27108,6 +27124,13 @@ enum LockRefusal {
     BurnNeedsPixelLayer,
     /// The Sponge with no pixel layer to work on (0.224.0).
     SpongeNeedsPixelLayer,
+    /// The Spot Healing with no pixel layer to work on (0.237.0).
+    SpotHealNeedsPixelLayer,
+    /// A Spot Healing stroke with too little around it to learn from
+    /// (0.237.0).
+    HealNotEnoughSurroundings,
+    /// A Spot Healing stroke over the size bound (0.237.0).
+    HealTooLarge,
     /// An undo or redo could not read the step's saved data back (0.210.0:
     /// a pixel-history spill file a temp-file cleaner removed, or a corrupt
     /// one). Not a lock; the step stays in the History panel.
@@ -27116,6 +27139,7 @@ enum LockRefusal {
 
 impl LockRefusal {
     /// The status-bar notice.
+    #[allow(clippy::too_many_lines)]
     const fn message(self) -> &'static str {
         match self {
             LockRefusal::PixelsLocked => {
@@ -27193,6 +27217,13 @@ impl LockRefusal {
             LockRefusal::SmudgeNeedsPixelLayer => {
                 "Select a pixel layer to smudge. A group, an adjustment layer or no layer can't be smudged."
             }
+            LockRefusal::SpotHealNeedsPixelLayer => {
+                "Select a pixel layer to heal. A group, an adjustment layer or no layer can't be healed."
+            }
+            LockRefusal::HealNotEnoughSurroundings => {
+                "Not enough surrounding texture to heal here."
+            }
+            LockRefusal::HealTooLarge => "That area is too large to heal.",
             LockRefusal::BlurNeedsPixelLayer => {
                 "Select a pixel layer to blur. A group, an adjustment layer or no layer can't be blurred."
             }
@@ -27260,6 +27291,7 @@ fn press_refusal(tool: aurora_ui::Tool, lock: aurora_doc::LayerLock) -> Option<L
         aurora_ui::Tool::Brush
         | aurora_ui::Tool::CloneStamp
         | aurora_ui::Tool::Smudge
+        | aurora_ui::Tool::SpotHealing
         | aurora_ui::Tool::Blur
         | aurora_ui::Tool::Sharpen
         | aurora_ui::Tool::Dodge
@@ -27310,6 +27342,12 @@ fn lock_refusal_applies(
             LockRefusal::CloneNeedsSource | LockRefusal::CloneNeedsPixelLayer
         ) && tool == aurora_ui::Tool::CloneStamp)
         || (refusal == LockRefusal::SmudgeNeedsPixelLayer && tool == aurora_ui::Tool::Smudge)
+        || (matches!(
+            refusal,
+            LockRefusal::SpotHealNeedsPixelLayer
+                | LockRefusal::HealNotEnoughSurroundings
+                | LockRefusal::HealTooLarge
+        ) && tool == aurora_ui::Tool::SpotHealing)
         || (refusal == LockRefusal::BlurNeedsPixelLayer && tool == aurora_ui::Tool::Blur)
         || (refusal == LockRefusal::SharpenNeedsPixelLayer && tool == aurora_ui::Tool::Sharpen)
         || (refusal == LockRefusal::DodgeNeedsPixelLayer && tool == aurora_ui::Tool::Dodge)
@@ -27380,6 +27418,7 @@ impl ToolSettings {
             | aurora_ui::Tool::Pencil
             | aurora_ui::Tool::CloneStamp
             | aurora_ui::Tool::Smudge
+            | aurora_ui::Tool::SpotHealing
             | aurora_ui::Tool::Blur
             | aurora_ui::Tool::Sharpen
             | aurora_ui::Tool::Dodge
@@ -27421,6 +27460,7 @@ impl ToolSettings {
             | aurora_ui::Tool::Pencil
             | aurora_ui::Tool::CloneStamp
             | aurora_ui::Tool::Smudge
+            | aurora_ui::Tool::SpotHealing
             | aurora_ui::Tool::Blur
             | aurora_ui::Tool::Sharpen
             | aurora_ui::Tool::Dodge
@@ -29034,6 +29074,9 @@ impl App {
             return;
         }
         if self.escape_clears_layer_filter(key) {
+            return;
+        }
+        if self.escape_cancels_spot_heal(key) {
             return;
         }
         if self.escape_cancels_marquee(key) {
@@ -31663,6 +31706,21 @@ impl App {
             self.sync_status_bar_now();
             return;
         }
+        // The Spot Healing (0.237.0): a press needs a pixel layer the lock
+        // allows.
+        if self.tool == aurora_ui::Tool::SpotHealing
+            && button == PointerButton::Primary
+            && let Some(why) = spot_heal_stamp::press(
+                active_pixel_layer(&self.doc.layers, self.doc.active_layer).is_some(),
+                self.doc.active_layer.and_then(|id| {
+                    press_refusal(self.tool, self.doc.layers.lock(id).unwrap_or_default())
+                }),
+            )
+        {
+            self.lock_notice = Some((why, self.doc.active_layer));
+            self.sync_status_bar_now();
+            return;
+        }
         // The Paint Bucket fills on the press itself (0.209.0): no drag.
         if self.tool == aurora_ui::Tool::PaintBucket && button == PointerButton::Primary {
             let doc_point = self.doc.canvas_view.to_document(canvas_point);
@@ -31806,6 +31864,12 @@ impl App {
         // filtered dab.
         if filter_stamp::drag_filter(self.drag.as_ref()).is_some() {
             self.filter_dab(doc_point);
+            return;
+        }
+        // The Spot Healing (0.237.0) only collects the area; the release
+        // heals it.
+        if spot_heal_stamp::is_heal(self.drag.as_ref()) {
+            self.heal_dab(doc_point);
             return;
         }
         // The Dodge, Burn and Sponge (0.224.0) likewise.
@@ -31961,6 +32025,23 @@ impl App {
                 "failed to clone part of a dab"
             );
         }
+    }
+
+    /// One Spot Healing dab at `doc_point` (0.237.0): adds its disc to the
+    /// drag's painted area and writes nothing. Never runs in Quick Mask (the
+    /// press is refused there).
+    fn heal_dab(&mut self, doc_point: (f32, f32)) {
+        if self.quick_mask.is_some() {
+            return;
+        }
+        let Some(layer_id) = self.doc.active_layer else {
+            return;
+        };
+        let Some(aurora_doc::LayerKind::Pixel { bounds }) = self.doc.layers.kind(layer_id).cloned()
+        else {
+            return;
+        };
+        spot_heal_stamp::add_dab(bounds, doc_point, &self.tool_settings, &mut self.drag);
     }
 
     /// One Smudge dab at `doc_point` (0.222.0): [`Self::clone_dab`]'s
@@ -32333,6 +32414,16 @@ impl App {
     /// the free function, which needs no `App` (and therefore no GPU
     /// adapter) to test.
     fn commit_drag(&mut self, drag: Option<Drag>) {
+        // The Spot Healing (0.237.0) heals its painted area as the stroke
+        // ends, into the stroke's own snapshot, before it is recorded.
+        let mut drag = drag;
+        if spot_heal_stamp::is_heal(drag.as_ref()) {
+            if let Some(why) = spot_heal_stamp::finish(&mut drag, &mut self.doc) {
+                self.lock_notice = Some((why, self.doc.active_layer));
+                self.sync_status_bar_now();
+            }
+            self.needs_redraw = true;
+        }
         // 0.216.0: a live combination the mask cap refused during the
         // gesture says so once, whichever path ends it.
         if selection_modes::drag_refusal(drag.as_ref()) {
@@ -34200,6 +34291,21 @@ impl App {
             self.needs_redraw = true;
         }
         self.apply_pending_paths_now();
+    }
+
+    /// Escape during a live Spot Healing stroke: the stroke ends without
+    /// healing anything (0.237.0). Returns whether it did.
+    fn escape_cancels_spot_heal(&mut self, key: Key) -> bool {
+        if key != Key::Named(NamedKey::Escape)
+            || !spot_heal_stamp::is_heal(self.drag.as_ref())
+            || self.dialog.is_some()
+            || self.command_palette.is_some()
+        {
+            return false;
+        }
+        self.drag = None;
+        self.needs_redraw = true;
+        true
     }
 
     /// Escape during a live Marquee drag: the drag ends and the selection
@@ -70137,6 +70243,7 @@ mod tests {
                         | Tool::Eraser
                         | Tool::CloneStamp
                         | Tool::Smudge
+                        | Tool::SpotHealing
                         | Tool::Blur
                         | Tool::Sharpen
                         | Tool::Dodge
@@ -70668,6 +70775,7 @@ mod tests {
                 smudge: _,
                 filter: _,
                 tone: _,
+                heal: _,
                 last_doc,
                 carry,
                 stroke,
@@ -70731,6 +70839,7 @@ mod tests {
             smudge: None,
             filter: None,
             tone: None,
+            heal: None,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: Some(aurora_brush::StrokeSnapshot::new(
@@ -70765,6 +70874,7 @@ mod tests {
                 smudge: None,
                 filter: None,
                 tone: None,
+                heal: None,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,
@@ -71879,6 +71989,7 @@ mod tests {
                 smudge: None,
                 filter: None,
                 tone: None,
+                heal: None,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,
@@ -72262,6 +72373,7 @@ mod tests {
             smudge: None,
             filter: None,
             tone: None,
+            heal: None,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
@@ -72305,6 +72417,7 @@ mod tests {
             smudge: None,
             filter: None,
             tone: None,
+            heal: None,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: None,
@@ -72974,6 +73087,7 @@ mod tests {
             smudge: None,
             filter: None,
             tone: None,
+            heal: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -73105,6 +73219,7 @@ mod tests {
             smudge: None,
             filter: None,
             tone: None,
+            heal: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -73216,6 +73331,7 @@ mod tests {
             smudge: None,
             filter: None,
             tone: None,
+            heal: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -73278,6 +73394,7 @@ mod tests {
             smudge: None,
             filter: None,
             tone: None,
+            heal: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -73330,6 +73447,7 @@ mod tests {
             smudge: None,
             filter: None,
             tone: None,
+            heal: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -73472,6 +73590,7 @@ mod tests {
             smudge: None,
             filter: None,
             tone: None,
+            heal: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -73620,6 +73739,7 @@ mod tests {
             smudge: None,
             filter: None,
             tone: None,
+            heal: None,
             last_doc: view.to_document(pointer),
             carry: 0.0,
             stroke: None,
@@ -79367,6 +79487,7 @@ mod tests {
                 smudge: None,
                 filter: None,
                 tone: None,
+                heal: None,
                 last_doc: (0.0, 0.0),
                 carry: 0.0,
                 stroke: None,

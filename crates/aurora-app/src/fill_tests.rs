@@ -2121,6 +2121,7 @@ mod path_paint_flows {
             smudge: None,
             filter: None,
             tone: None,
+            heal: None,
             last_doc: (0.0, 0.0),
             carry: 0.0,
             stroke: Some(aurora_brush::StrokeSnapshot::new(live.surface)),

@@ -71,6 +71,9 @@ mod shape_fill_tests;
 mod smudge;
 #[cfg(test)]
 mod smudge_tests;
+mod spot_heal;
+#[cfg(test)]
+mod spot_heal_tests;
 mod stamp;
 #[cfg(test)]
 mod stroke_composite_tests;
@@ -96,6 +99,10 @@ pub use fill::{
 pub use filter_brush::{FilterKind, MAX_FILTER_PATCH_TEXELS, SHARPEN_GAIN, filter_dab_covered};
 pub use mask_dab::{dab_falloff, hard_dab_covers, hard_dab_snap, stamp_toward, stamp_toward_hard};
 pub use smudge::{MAX_SMUDGE_PATCH_TEXELS, SmudgeCarry, smudge_dab_covered};
+pub use spot_heal::{
+    HEAL_FEATHER, HealMask, HealRefusal, MAX_HEAL_ITERATIONS, MAX_HEAL_SIDE, MAX_HEAL_TEXELS,
+    MIN_RING_TEXELS, spot_heal_covered,
+};
 pub use stamp::{
     DabOutcome, erase_dab, erase_dab_amount, erase_dab_covered, stamp_dab, stamp_dab_amount,
     stamp_dab_covered, stamp_dab_hard, stamp_dab_hard_covered, stamp_dab_hard_preserving_alpha,
