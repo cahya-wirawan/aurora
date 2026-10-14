@@ -49,10 +49,11 @@ pub const PANEL_STRIP_LABEL: &str = "Panels";
 /// the one place the abbreviations are defined. The Widget Gallery is not
 /// here: it is a root-level column beside the rail, not one of the
 /// rail's docked panels, and collapsing the rail leaves it as it is.
-pub const PANEL_SHORT_LABELS: [(&str, &str); 3] = [
+pub const PANEL_SHORT_LABELS: [(&str, &str); 4] = [
     ("Layers", "Lay"),
     ("Properties", "Prop"),
     ("History", "Hist"),
+    ("Channels", "Chan"),
 ];
 
 /// The short strip label for a panel's full name, if it has one.
@@ -70,7 +71,7 @@ pub fn panel_short_label(full: &str) -> Option<&'static str> {
 pub struct PanelStrip {
     pub root: WidgetId,
     /// `(panel, button)` per rail panel, in rail order.
-    pub buttons: [(PanelHandle, WidgetId); 3],
+    pub buttons: [(PanelHandle, WidgetId); 4],
 }
 
 impl PanelStrip {
@@ -99,7 +100,7 @@ pub(crate) fn insert_panel_strip(
     tree: &mut WidgetTree<WidgetKind>,
     parent: WidgetId,
     scales: &Scales,
-    panels: [(PanelHandle, &str); 3],
+    panels: [(PanelHandle, &str); 4],
 ) -> Result<PanelStrip, WidgetError> {
     let mut node = Node::new(Role::Toolbar);
     node.set_label(PANEL_STRIP_LABEL);
@@ -136,7 +137,7 @@ pub(crate) fn insert_panel_strip(
 fn sync_strip_buttons(
     tree: &mut WidgetTree<WidgetKind>,
     strip: &PanelStrip,
-    names: [&str; 3],
+    names: [&str; 4],
 ) -> Result<(), WidgetError> {
     for ((_, id), full) in strip.buttons.iter().zip(names) {
         widgets::set_button_toggled(tree, *id, false)?;
@@ -233,6 +234,7 @@ mod tests {
             (ws.layers, "Layers", "Lay"),
             (ws.properties, "Properties", "Prop"),
             (ws.history, "History", "Hist"),
+            (ws.channels, "Channels", "Chan"),
         ];
         assert_eq!(
             ws.tree.children(strip.root).map(<[_]>::len),

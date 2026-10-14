@@ -1212,7 +1212,14 @@ mod tests {
         assert_eq!(
             shape(&ws),
             vec![
-                (vec![DockPanel::Properties, DockPanel::History], 0),
+                (
+                    vec![
+                        DockPanel::Properties,
+                        DockPanel::History,
+                        DockPanel::Channels
+                    ],
+                    0
+                ),
                 (vec![DockPanel::Layers], 0)
             ]
         );
@@ -1248,6 +1255,7 @@ mod tests {
     /// top gap becomes its own slot; the last member dragged out of a
     /// two-tab group dissolves it, leaving no empty group anywhere.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn a_tab_strip_drop_joins_a_drag_out_splits_and_empty_groups_go() {
         let (mut ws, _) = workspace();
         let mut focus = FocusManager::new();
@@ -1260,12 +1268,17 @@ mod tests {
         assert_eq!(
             shape(&ws),
             vec![(
-                vec![DockPanel::Properties, DockPanel::History, DockPanel::Layers],
-                2
+                vec![
+                    DockPanel::Properties,
+                    DockPanel::History,
+                    DockPanel::Channels,
+                    DockPanel::Layers
+                ],
+                3
             )]
         );
         let group = crate::workspace::test_group(&ws);
-        assert_eq!(crate::panel_group_shown(&ws.tree, &group), Some(2));
+        assert_eq!(crate::panel_group_shown(&ws.tree, &group), Some(3));
         assert!(ws.tree.contains(layers_row), "the panel moved whole");
         assert_eq!(
             ws.tree
@@ -1287,7 +1300,14 @@ mod tests {
             shape(&ws),
             vec![
                 (vec![DockPanel::History], 0),
-                (vec![DockPanel::Properties, DockPanel::Layers], 1)
+                (
+                    vec![
+                        DockPanel::Properties,
+                        DockPanel::Channels,
+                        DockPanel::Layers
+                    ],
+                    2
+                )
             ]
         );
         assert_eq!(
@@ -1298,8 +1318,8 @@ mod tests {
             "a lone panel is a region again"
         );
 
-        // Layers' tab out to the bottom gap: the two-tab group loses its
-        // last but one member and is removed.
+        // Layers' tab out to the bottom gap, then Channels': the group
+        // loses its members one by one and is removed with the last but one.
         let old_group = crate::workspace::test_group(&ws);
         let layers_tab = centre(bounds(&ws, tab_of(&ws, DockPanel::Layers)));
         let bottom = near_bottom(bounds(&ws, ws.rail));
@@ -1314,8 +1334,26 @@ mod tests {
             shape(&ws),
             vec![
                 (vec![DockPanel::History], 0),
-                (vec![DockPanel::Properties], 0),
+                (vec![DockPanel::Properties, DockPanel::Channels], 1),
                 (vec![DockPanel::Layers], 0)
+            ]
+        );
+        let channels_tab = centre(bounds(&ws, tab_of(&ws, DockPanel::Channels)));
+        let bottom = near_bottom(bounds(&ws, ws.rail));
+        let out = drag(
+            &mut ws,
+            channels_tab,
+            &[(channels_tab.0, channels_tab.1 + 30.0), bottom],
+        );
+        assert_eq!(out.target(), Some(DropTarget::Gap(3)));
+        assert!(finish(&mut ws, &mut focus, out));
+        assert_eq!(
+            shape(&ws),
+            vec![
+                (vec![DockPanel::History], 0),
+                (vec![DockPanel::Properties], 0),
+                (vec![DockPanel::Layers], 0),
+                (vec![DockPanel::Channels], 0)
             ]
         );
         assert_eq!(ws.groups().count(), 0, "no group is left");
@@ -1326,7 +1364,12 @@ mod tests {
         assert!(!ws.tree.contains(old_group.bar));
         assert_eq!(
             rail_children(&ws),
-            vec![ws.history.root, ws.properties.root, ws.layers.root]
+            vec![
+                ws.history.root,
+                ws.properties.root,
+                ws.layers.root,
+                ws.channels.root
+            ]
         );
     }
 
@@ -1500,7 +1543,7 @@ mod tests {
             vec![
                 (vec![DockPanel::Layers], 0),
                 (vec![DockPanel::Properties], 0),
-                (vec![DockPanel::History], 0)
+                (vec![DockPanel::History, DockPanel::Channels], 0)
             ]
         );
         assert_eq!(focus.focused(), Some(ws.properties.root));
@@ -1515,7 +1558,7 @@ mod tests {
             shape(&ws),
             vec![
                 (vec![DockPanel::Properties, DockPanel::Layers], 1),
-                (vec![DockPanel::History], 0)
+                (vec![DockPanel::History, DockPanel::Channels], 0)
             ]
         );
         let layers_tab = tab_of(&ws, DockPanel::Layers);
@@ -1614,10 +1657,15 @@ mod tests {
         ) {
             unreachable!("{err:?}");
         }
-        let order: Vec<WidgetId> = [DockPanel::Properties, DockPanel::History, DockPanel::Layers]
-            .into_iter()
-            .filter_map(|panel| ws.panel_strip.button_for(ws.panel(panel)))
-            .collect();
+        let order: Vec<WidgetId> = [
+            DockPanel::Properties,
+            DockPanel::History,
+            DockPanel::Channels,
+            DockPanel::Layers,
+        ]
+        .into_iter()
+        .filter_map(|panel| ws.panel_strip.button_for(ws.panel(panel)))
+        .collect();
         assert_eq!(
             ws.tree.children(ws.panel_strip.root).map(<[_]>::to_vec),
             Some(order)
@@ -1780,7 +1828,14 @@ mod tests {
         assert_eq!(floating_shape(&ws), vec![(vec![DockPanel::Layers], 0)]);
         assert_eq!(
             shape(&ws),
-            vec![(vec![DockPanel::Properties, DockPanel::History], 0)]
+            vec![(
+                vec![
+                    DockPanel::Properties,
+                    DockPanel::History,
+                    DockPanel::Channels
+                ],
+                0
+            )]
         );
         let Some(float) = ws.floating.first().cloned() else {
             unreachable!("one float");
@@ -1868,7 +1923,14 @@ mod tests {
         assert_eq!(
             shape(&ws),
             vec![
-                (vec![DockPanel::Properties, DockPanel::History], 0),
+                (
+                    vec![
+                        DockPanel::Properties,
+                        DockPanel::History,
+                        DockPanel::Channels
+                    ],
+                    0
+                ),
                 (vec![DockPanel::Layers], 0)
             ]
         );
@@ -1887,6 +1949,7 @@ mod tests {
     /// that panel, and its last tab torn off over the canvas floats on its
     /// own: every panel exactly once and no empty group, every step.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn floating_and_docked_groups_join_and_split() {
         let (mut ws, _) = workspace();
         let mut focus = FocusManager::new();
@@ -1900,11 +1963,11 @@ mod tests {
             &[offset(canvas, 100.0, 100.0)]
         ));
         assert_eq!(floating_shape(&ws), vec![(vec![DockPanel::History], 0)]);
-        assert_eq!(ws.groups().count(), 0, "the docked group dissolved");
+        assert_eq!(ws.groups().count(), 1, "the docked group keeps two tabs");
         every_panel_once(&ws);
 
-        // Properties' title onto the floating History's title: a floating group.
-        let props = offset(bounds(&ws, ws.properties.header), 10.0, 5.0);
+        // Properties' tab onto the floating History's title: a floating group.
+        let props = centre(bounds(&ws, tab_of(&ws, DockPanel::Properties)));
         let onto = centre(bounds(&ws, ws.history.header));
         assert!(drop_at(
             &mut ws,
@@ -1937,7 +2000,11 @@ mod tests {
                 2
             )]
         );
-        assert!(shape(&ws).is_empty(), "the rail is empty");
+        assert_eq!(
+            shape(&ws),
+            vec![(vec![DockPanel::Channels], 0)],
+            "only Channels is left in the rail"
+        );
         every_panel_once(&ws);
 
         // The group's grip above its tabs moves the whole group.
@@ -1964,16 +2031,22 @@ mod tests {
         );
         assert_eq!(floating_shape(&ws).first().map(|s| s.0.len()), Some(3));
 
-        // A floating tab into the (empty) rail docks that panel.
+        // A floating tab into the rail's bottom gap docks that panel.
         let props_tab = centre(bounds(&ws, tab_of(&ws, DockPanel::Properties)));
-        let rail = centre(bounds(&ws, ws.rail));
+        let rail = near_bottom(bounds(&ws, ws.rail));
         assert!(drop_at(
             &mut ws,
             &mut focus,
             props_tab,
             &[(props_tab.0, props_tab.1 + 20.0), rail]
         ));
-        assert_eq!(shape(&ws), vec![(vec![DockPanel::Properties], 0)]);
+        assert_eq!(
+            shape(&ws),
+            vec![
+                (vec![DockPanel::Channels], 0),
+                (vec![DockPanel::Properties], 0)
+            ]
+        );
         assert_eq!(
             floating_shape(&ws),
             vec![(vec![DockPanel::History, DockPanel::Layers], 1)]
@@ -2382,7 +2455,7 @@ mod tests {
             history,
             &[offset(canvas, 40.0, 40.0)]
         ));
-        let props = offset(bounds(&ws, ws.properties.header), 10.0, 5.0);
+        let props = centre(bounds(&ws, tab_of(&ws, DockPanel::Properties)));
         let onto = centre(bounds(&ws, ws.history.header));
         assert!(drop_at(
             &mut ws,

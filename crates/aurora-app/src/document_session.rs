@@ -333,6 +333,11 @@ pub(crate) struct DocumentSession {
     /// active one (`commit_live_gestures`), when the active layer changes
     /// and by a new `Alt`+click.
     pub(crate) clone_stamp: crate::clone_stamp::CloneStamp,
+    /// Which colour channels the canvas displays (0.232.0, the Channels
+    /// panel's eyes): a per-document *view* setting, not document state
+    /// (no undo, never dirty, not saved), applied only to the displayed
+    /// picture by the canvas shader. A new session shows all three.
+    pub(crate) channel_view: aurora_ui::ChannelVisibility,
     /// The canvas pan/zoom transform ([`aurora_ui::CanvasView`]). Per
     /// document, the way Photoshop remembers each open document's own
     /// zoom and scroll independent of its pixel content.
@@ -592,6 +597,7 @@ impl DocumentSession {
             import_losses: None,
             layer_filter: aurora_ui::LayerFilter::default(),
             clone_stamp: crate::clone_stamp::CloneStamp::default(),
+            channel_view: aurora_ui::ChannelVisibility::default(),
             park_autosave: None,
             canvas_view,
             selection: aurora_doc::SelectionSet::new(),

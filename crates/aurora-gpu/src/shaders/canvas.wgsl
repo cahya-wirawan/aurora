@@ -17,6 +17,12 @@ struct Canvas {
     // never shown and neither is the checkerboard there. With no
     // document (tests, the demo) the rectangle is huge and clips nothing.
     doc_clip: vec4<f32>,
+    // 0.232.0: the Channels panel's eyes. `rgb` multiplies the colour the
+    // fragment finally shows (1.0 for a channel shown, 0.0 for one hidden);
+    // `w` is unused. A view setting only: it changes what is drawn, never
+    // what is stored, composited, exported or measured. All ones is
+    // bit-identical to no gain (x * 1.0 == x).
+    channel_gain: vec4<f32>,
 };
 
 @group(0) @binding(0) var canvas_tex: texture_2d<f32>;
@@ -132,6 +138,9 @@ fn fs_canvas(in: VsOut) -> @location(0) vec4<f32> {
     // `canvas_pipeline_does_not_bleed_transparent_black_across_a_hard_alpha_edge`
     // is the negative control for the *domain* -- it fails against the
     // straight-domain formula, measured, not assumed.
-    let encoded = c.rgb + bg * (1.0 - c.a);
+    // The Channels panel's gain is applied last, to the displayed colour
+    // (the checkerboard included), before the sRGB store: a hidden channel
+    // is zero in the picture and only there.
+    let encoded = (c.rgb + bg * (1.0 - c.a)) * canvas.channel_gain.rgb;
     return vec4<f32>(select(encoded, srgb_to_linear(encoded), SRGB_TARGET), 1.0);
 }

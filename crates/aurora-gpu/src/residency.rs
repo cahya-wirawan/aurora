@@ -15,8 +15,13 @@ use rayon::prelude::*;
 use crate::error::GpuError;
 
 /// The `Canvas` uniform `canvas.wgsl` expects: `uv_offset`/`uv_scale`
-/// (two `vec2<f32>`s) and `doc_clip` (a `vec4<f32>`), 32 bytes total.
-const UNIFORM_SIZE: u64 = 32;
+/// (two `vec2<f32>`s), `doc_clip` (a `vec4<f32>`) and `channel_gain` (a
+/// `vec4<f32>`, 0.232.0), 48 bytes total.
+const UNIFORM_SIZE: u64 = 48;
+
+/// `channel_gain` when every channel is shown: multiplying by `1.0` is
+/// exact, so the picture is bit-identical to one drawn without a gain.
+const FULL_GAIN: [f32; 3] = [1.0, 1.0, 1.0];
 
 /// `doc_clip` when no document rectangle is set: covers every position
 /// the viewport's `0..1` space can take, so nothing is clipped.
@@ -905,6 +910,11 @@ pub struct TileResidency {
     /// document-local pixels (the space [`Self::set_origin`] takes), or
     /// `None` for no clip. See [`Self::set_document_clip`].
     doc_clip: Option<(f32, f32, f32, f32)>,
+    /// The per-channel multiplier the canvas applies to the colour it
+    /// displays (0.232.0, the Channels panel's eyes): `1.0` shown, `0.0`
+    /// hidden. A view setting only -- nothing stored is touched. See
+    /// [`Self::set_channel_gain`].
+    channel_gain: [f32; 3],
 }
 
 impl TileResidency {
@@ -1032,6 +1042,7 @@ impl TileResidency {
             origin: TileId { x: 0, y: 0 },
             sub_tile: (0.0, 0.0),
             doc_clip: None,
+            channel_gain: FULL_GAIN,
         };
         residency.write_uniform(queue, viewport_px, 1.0);
         residency
@@ -1179,6 +1190,25 @@ impl TileResidency {
         self.doc_clip = rect;
     }
 
+    /// Sets the per-channel multiplier `canvas.wgsl` applies to the colour
+    /// it shows (0.232.0): `[r, g, b]`, each `1.0` for a channel shown and
+    /// `0.0` for one hidden (the Channels panel's eyes). Applied last, to
+    /// the displayed picture only, so nothing stored, composited or
+    /// exported changes. A non-finite or out-of-range entry is made safe:
+    /// NaN reads as shown, the rest is clamped to `0..=1`. Takes effect on
+    /// the next [`Self::set_origin`], which rewrites the uniform (the app
+    /// calls it every frame). The default, and [`FULL_GAIN`], draws
+    /// bit-identically to a canvas with no gain.
+    pub fn set_channel_gain(&mut self, gain: [f32; 3]) {
+        self.channel_gain = gain.map(|g| if g.is_nan() { 1.0 } else { g.clamp(0.0, 1.0) });
+    }
+
+    /// The gain [`Self::set_channel_gain`] last set.
+    #[must_use]
+    pub fn channel_gain(&self) -> [f32; 3] {
+        self.channel_gain
+    }
+
     /// Rebuilds the atlas at a new `viewport_px` — the real fix for the
     /// limitation this struct's own doc comment used to name. There is
     /// no in-place way to resize a `wgpu::Texture`, so this reconstructs
@@ -1221,10 +1251,12 @@ impl TileResidency {
         let origin = self.origin;
         let sub_tile = self.sub_tile;
         let doc_clip = self.doc_clip;
+        let channel_gain = self.channel_gain;
         *self = Self::new(device, queue, viewport_px);
         self.origin = origin;
         self.sub_tile = sub_tile;
         self.doc_clip = doc_clip;
+        self.channel_gain = channel_gain;
         self.write_uniform(queue, viewport_px, 1.0);
     }
 
@@ -1558,8 +1590,13 @@ impl TileResidency {
             zoom,
             self.doc_clip,
         );
+        let [gain_r, gain_g, gain_b] = self.channel_gain;
         let mut bytes = Vec::with_capacity(UNIFORM_SIZE as usize);
-        for value in values.into_iter().chain(clip) {
+        for value in values
+            .into_iter()
+            .chain(clip)
+            .chain([gain_r, gain_g, gain_b, 1.0])
+        {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         queue.write_buffer(&self.uniform_buffer, 0, &bytes);
