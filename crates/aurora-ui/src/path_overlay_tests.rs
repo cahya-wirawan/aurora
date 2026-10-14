@@ -374,3 +374,42 @@ fn hit_testing_follows_the_view() {
     assert_eq!(path_hit(&p, None, &v, (sx + 5.0, sy), 4.0), None);
     assert_eq!(path_anchor_screen(&p, at(3, 0), &v), None);
 }
+
+#[test]
+fn the_flattening_a_frame_does_is_bounded_and_later_subpaths_wait_their_turn() {
+    // A subpath of long curves (each would be 512 segments) uses up the
+    // frame's flattening budget; a visible line after it is not drawn, and
+    // the same line after a small subpath is.
+    let huge = Subpath {
+        anchors: (0..2_000)
+            .map(|i| {
+                let mut a =
+                    Anchor::corner(if i % 2 == 0 { -1.0e5 } else { 1.0e5 }, 1.0e6 + i as f32);
+                a.handle_out = (5.0e5, 0.0);
+                a.handle_in = (-5.0e5, 0.0);
+                a
+            })
+            .collect(),
+        closed: false,
+    };
+    let line = corners(&[(20.0, 20.0), (100.0, 20.0)], false);
+    let after_huge = pixels(&path_overlay_runs(
+        &path(vec![huge, line.clone()]),
+        None,
+        &view(),
+        SIZE,
+        1.0,
+        0,
+    ));
+    assert_eq!(tone_at(&after_huge, 60, 20), None, "budget spent");
+    let small = corners(&[(5.0, 5.0), (6.0, 5.0)], false);
+    let after_small = pixels(&path_overlay_runs(
+        &path(vec![small, line]),
+        None,
+        &view(),
+        SIZE,
+        1.0,
+        0,
+    ));
+    assert_eq!(tone_at(&after_small, 60, 20), Some(OutlineTone::Light));
+}

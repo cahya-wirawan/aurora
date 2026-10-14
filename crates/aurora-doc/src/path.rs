@@ -180,24 +180,36 @@ impl Subpath {
     #[must_use]
     pub fn flatten(&self, tolerance: f32) -> Vec<(f32, f32)> {
         let mut out = Vec::new();
+        self.flatten_into(tolerance, &mut out, usize::MAX);
+        out
+    }
+
+    /// [`Self::flatten`] appending to `out`, stopping as soon as `out` holds
+    /// more than `limit` points (after the curve that crossed it, so at most
+    /// [`MAX_SEGMENTS_PER_CURVE`] points past it). Returns whether the whole
+    /// subpath was flattened.
+    pub fn flatten_into(&self, tolerance: f32, out: &mut Vec<(f32, f32)>, limit: usize) -> bool {
         let Some(first) = self.anchors.first() else {
-            return out;
+            return true;
         };
         out.push(first.point);
         for pair in self.anchors.windows(2) {
             if let [a, b] = pair {
-                flatten_cubic(&cubic_between(a, b), tolerance, &mut out);
+                flatten_cubic(&cubic_between(a, b), tolerance, out);
+                if out.len() > limit {
+                    return false;
+                }
             }
         }
         if self.closed
             && self.anchors.len() > 1
             && let Some(last) = self.anchors.last()
         {
-            flatten_cubic(&cubic_between(last, first), tolerance, &mut out);
+            flatten_cubic(&cubic_between(last, first), tolerance, out);
             // The closing curve ends on the first point again.
             out.pop();
         }
-        out
+        out.len() <= limit
     }
 }
 
@@ -245,7 +257,9 @@ impl Path {
     }
 
     /// The polylines of every subpath within `tolerance` (see
-    /// [`Subpath::flatten`]); empty subpaths give nothing.
+    /// [`Subpath::flatten`]); empty subpaths give nothing. A curve is cut into
+    /// at most [`MAX_SEGMENTS_PER_CURVE`] lines, so the tolerance does not hold
+    /// for a bend over about 35,000 px (far past any document).
     #[must_use]
     pub fn flatten(&self, tolerance: f32) -> Vec<Vec<(f32, f32)>> {
         self.subpaths
@@ -543,7 +557,16 @@ pub fn selection_from_path(path: &Path, size: (u32, u32)) -> Result<Option<Selec
     path.validate()?;
     let mut hub: Option<(f64, f64)> = None;
     let mut points: Vec<(f64, f64)> = Vec::new();
-    for poly in path.flatten(FLATTEN_TOLERANCE) {
+    for sub in &path.subpaths {
+        // One subpath at a time, and never past the filler's vertex cap:
+        // a path of long curves is refused before it is flattened whole.
+        let mut poly = Vec::new();
+        let room = MAX_POLYGON_VERTICES.saturating_sub(points.len());
+        if !sub.flatten_into(FLATTEN_TOLERANCE, &mut poly, room) {
+            return Err(DocError::SelectionPolygonTooComplex(
+                points.len() + poly.len(),
+            ));
+        }
         if poly.len() < 3 {
             continue;
         }

@@ -454,3 +454,137 @@ fn three_subpaths_leave_nothing_between_them() {
         assert_eq!(cov8(&mask, x, y), 0, "({x}, {y})");
     }
 }
+
+fn long_curves(count: usize) -> Path {
+    // Every curve bends by a million pixels: 512 segments each.
+    Path {
+        name: "long".into(),
+        subpaths: vec![Subpath {
+            anchors: (0..count)
+                .map(|i| {
+                    let x = (i % 2) as f32 * 1.0e5;
+                    Anchor::smooth((x, i as f32), (0.0, 5.0e5))
+                })
+                .collect(),
+            closed: true,
+        }],
+    }
+}
+
+#[test]
+fn a_path_of_many_long_curves_is_refused_before_it_is_flattened_whole() {
+    // 10,000 anchors are within the model's caps; flattened whole that would
+    // be about 5 million points.
+    let path = long_curves(MAX_ANCHORS_PER_SUBPATH);
+    assert!(path.validate().is_ok());
+    assert!(matches!(
+        selection_from_path(&path, (100, 100)),
+        Err(DocError::SelectionPolygonTooComplex(n))
+            if n > crate::MAX_POLYGON_VERTICES
+                && n <= crate::MAX_POLYGON_VERTICES + crate::MAX_SEGMENTS_PER_CURVE as usize + 1
+    ));
+    // The limit stops the flattening within one curve of the cap.
+    let mut out = Vec::new();
+    let limit = 1_000;
+    assert!(!path.subpaths[0].flatten_into(FLATTEN_TOLERANCE, &mut out, limit));
+    assert!(out.len() > limit && out.len() <= limit + crate::MAX_SEGMENTS_PER_CURVE as usize + 1);
+    // Across subpaths the running count is what is checked.
+    let mut many = long_curves(300);
+    for _ in 0..4 {
+        many.subpaths.extend(long_curves(300).subpaths);
+    }
+    assert!(matches!(
+        selection_from_path(&many, (100, 100)),
+        Err(DocError::SelectionPolygonTooComplex(_))
+    ));
+}
+
+#[test]
+fn flatten_into_with_room_equals_flatten_and_small_paths_are_unchanged() {
+    let mut p = square("a", 3.0, 3.0, 20.0, true);
+    for a in &mut p.subpaths[0].anchors {
+        a.handle_out = (4.0, 1.0);
+        a.handle_in = (-4.0, -1.0);
+    }
+    p.subpaths
+        .extend(square("a", 30.0, 30.0, 9.0, false).subpaths);
+    for sub in &p.subpaths {
+        let mut out = Vec::new();
+        assert!(sub.flatten_into(FLATTEN_TOLERANCE, &mut out, usize::MAX));
+        assert_eq!(out, sub.flatten(FLATTEN_TOLERANCE));
+    }
+    // Differential against the whole-path chaining the first version used.
+    let mut points: Vec<(f64, f64)> = Vec::new();
+    let mut hub = None;
+    for poly in p.flatten(FLATTEN_TOLERANCE) {
+        let to64 = |&(x, y): &(f32, f32)| (f64::from(x), f64::from(y));
+        let f = to64(&poly[0]);
+        match hub {
+            None => {
+                hub = Some(f);
+                points.extend(poly.iter().map(to64));
+                points.push(f);
+            }
+            Some(h) => {
+                points.push(f);
+                points.extend(poly.iter().map(to64));
+                points.push(f);
+                points.push(h);
+            }
+        }
+    }
+    let want = polygon_mask(
+        &points,
+        &Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 60,
+        },
+    )
+    .ok()
+    .flatten();
+    let got = mask_of(&p, (60, 60));
+    assert!(want.is_some() && got.is_some());
+    assert_eq!(
+        want.map(|m| m.data().to_vec()),
+        got.map(|m| m.data().to_vec())
+    );
+}
+
+#[test]
+fn a_fractional_point_survives_a_crop_and_its_undo_within_a_hundredth_of_a_pixel() {
+    // Whole-number coordinates shift exactly; fractional ones can differ by
+    // f32 rounding (about 1e-3 px far from the origin).
+    let mut set = SelectionSet::new();
+    let mut paths = PathSet::new();
+    assert!(paths.add("a").is_ok());
+    let far = (123_456.789_f32, 98_765.432_f32);
+    assert!(
+        paths
+            .set_subpaths(
+                "a",
+                vec![Subpath {
+                    anchors: vec![Anchor::smooth(far, (0.37, 0.61))],
+                    closed: false
+                }]
+            )
+            .is_ok()
+    );
+    set.set_paths(paths);
+    assert!(set.translate(-3_001, -7_003).is_ok());
+    assert!(set.translate(3_001, 7_003).is_ok());
+    let back = set
+        .paths()
+        .get("a")
+        .and_then(|p| p.subpaths[0].anchors.first().copied());
+    let Some(back) = back else {
+        unreachable!("kept");
+    };
+    assert!((back.point.0 - far.0).abs() < 1.0e-2 && (back.point.1 - far.1).abs() < 1.0e-2);
+    assert_eq!(
+        back.handle_out,
+        (0.37, 0.61),
+        "handles are offsets: untouched"
+    );
+}

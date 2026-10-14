@@ -433,3 +433,61 @@ fn another_document_clears_the_state() {
     assert_eq!(pen.active(), None);
     assert!(!pen.adopt_document(a), "the same one is left alone");
 }
+
+#[test]
+fn the_document_wide_point_limit_is_enforced_at_the_press() {
+    let mut pen = PenState::default();
+    let mut paths = PathSet::new();
+    assert!(paths.add("big").is_ok());
+    let per = MAX_ANCHORS_PER_SUBPATH;
+    let full = aurora_doc::MAX_PATH_ANCHORS_TOTAL / per;
+    let subs: Vec<Subpath> = (0..full)
+        .map(|_| Subpath {
+            anchors: vec![Anchor::corner(1.0, 1.0); per],
+            closed: false,
+        })
+        .collect();
+    assert!(paths.set_subpaths("big", subs).is_ok());
+    assert!(paths.add("other").is_ok());
+    pen.set_active(Some("other".to_owned()));
+    let before = paths.clone();
+    let out = pen.press(&mut paths, (5.0, 5.0), None, 0.0, false);
+    assert_eq!(out.refused, Some(super::POINT_LIMIT_NOTICE));
+    assert_eq!(paths, before);
+    assert!(!pen.dragging());
+    assert!(pen.release(&mut paths).step.is_none());
+}
+
+#[test]
+fn a_release_names_a_range_violation_and_a_cap_violation_differently() {
+    use aurora_doc::DocError;
+    assert_eq!(
+        super::release_notice(&DocError::InvalidPath("a coordinate is not usable")),
+        super::RANGE_NOTICE
+    );
+    assert_eq!(
+        super::release_notice(&DocError::InvalidPath("too many anchors in the document")),
+        super::POINT_LIMIT_NOTICE
+    );
+    // Through a real release: range.
+    let mut pen = PenState::default();
+    let mut paths = PathSet::new();
+    click(&mut pen, &mut paths, (1.0, 1.0));
+    pen.press(&mut paths, (2.0, 2.0), None, 0.0, false);
+    pen.drag(&mut paths, (2.0e7, 0.0));
+    assert_eq!(pen.release(&mut paths).refused, Some(super::RANGE_NOTICE));
+    // And a cap: the set grows past the limit during the gesture.
+    let mut pen = PenState::default();
+    let mut paths = PathSet::new();
+    pen.press(&mut paths, (2.0, 2.0), None, 0.0, false);
+    if let Some(subs) = paths.subpaths_mut(WORK_PATH_NAME) {
+        for _ in 0..=(aurora_doc::MAX_PATH_ANCHORS_TOTAL / MAX_ANCHORS_PER_SUBPATH) {
+            subs.push(Subpath {
+                anchors: vec![Anchor::corner(1.0, 1.0); MAX_ANCHORS_PER_SUBPATH],
+                closed: false,
+            });
+        }
+    }
+    let up = pen.release(&mut paths);
+    assert_eq!(up.refused, Some(super::POINT_LIMIT_NOTICE));
+}

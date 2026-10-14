@@ -144,3 +144,31 @@ fn the_history_panel_names_a_path_step() {
     assert!(!steps[0].undone);
     assert_eq!(crate::default_step_label(UndoKind::Path), "Path Change");
 }
+
+#[test]
+fn a_shift_no_path_survives_drops_the_pending_paths_and_says_so() {
+    let mut order = UndoOrder::default();
+    order.undo.push(UndoKind::Crop);
+    order.crop_undo.push(crate::crop::CropStep {
+        dx: 100_000_000,
+        dy: 0,
+        before: (10, 10),
+        after: (5, 5),
+    });
+    order.pending_paths = Some(set_with(10.0));
+    assert!(order.apply_crop_step(UndoDirection::Undo));
+    assert_eq!(order.take_pending_paths(), Some(PathSet::new()));
+    assert!(order.take_paths_lost());
+    assert!(!order.take_paths_lost(), "once");
+    // A shift that fits drops nothing.
+    order.undo.push(UndoKind::Crop);
+    order.crop_undo.push(crate::crop::CropStep {
+        dx: 4,
+        dy: 6,
+        before: (10, 10),
+        after: (5, 5),
+    });
+    order.pending_paths = Some(set_with(10.0));
+    assert!(order.apply_crop_step(UndoDirection::Undo));
+    assert!(!order.take_paths_lost());
+}

@@ -17,7 +17,10 @@
 //! none. During a drag the path set is edited live and the step is made at
 //! the release.
 
-use aurora_doc::{Anchor, MAX_ANCHORS_PER_SUBPATH, MAX_SUBPATHS, PathSet, Subpath, WORK_PATH_NAME};
+use aurora_doc::{
+    Anchor, DocError, MAX_ANCHORS_PER_SUBPATH, MAX_PATH_ANCHORS_TOTAL, MAX_SUBPATHS, PathSet,
+    Subpath, WORK_PATH_NAME,
+};
 use aurora_ui::{AnchorRef, PathPart};
 
 use crate::document_session::DocumentId;
@@ -98,6 +101,30 @@ pub(crate) struct PenState {
     before: Option<(PathSet, &'static str)>,
     /// The document the state belongs to.
     doc: Option<DocumentId>,
+}
+
+/// The notice for a path set that reached the point limit.
+pub(crate) const POINT_LIMIT_NOTICE: &str = "That path set has reached its point limit.";
+/// The notice for a coordinate out of range.
+pub(crate) const RANGE_NOTICE: &str = "That point is too far outside the document.";
+
+/// Every anchor of every path of the set.
+fn total_anchors(paths: &PathSet) -> usize {
+    paths
+        .saved()
+        .iter()
+        .chain(paths.work())
+        .map(aurora_doc::Path::anchor_count)
+        .sum()
+}
+
+/// The sentence for a failed release-time validation: a coordinate out of
+/// range, or a cap.
+pub(crate) fn release_notice(error: &DocError) -> &'static str {
+    match error {
+        DocError::InvalidPath(why) if why.contains("coordinate") => RANGE_NOTICE,
+        _ => POINT_LIMIT_NOTICE,
+    }
 }
 
 fn sub_mut<'a>(paths: &'a mut PathSet, name: &str) -> Option<&'a mut Vec<Subpath>> {
@@ -295,6 +322,10 @@ impl PenState {
             }
         }
         // 4. Add an anchor.
+        if total_anchors(paths) >= MAX_PATH_ANCHORS_TOTAL {
+            out.refused = Some(POINT_LIMIT_NOTICE);
+            return out;
+        }
         if let Err(why) = self.ensure_active_for_add(paths) {
             out.refused = Some(why);
             return out;
@@ -410,12 +441,12 @@ impl PenState {
         if self.gesture.take().is_none() {
             return out;
         }
-        if paths.validate().is_err() {
+        if let Err(error) = paths.validate() {
             if let Some((before, _)) = self.before.take() {
                 *paths = before;
             }
             self.reset_editing();
-            out.refused = Some("That point is too far outside the document.");
+            out.refused = Some(release_notice(&error));
             return out;
         }
         out.step = self.finish(paths);

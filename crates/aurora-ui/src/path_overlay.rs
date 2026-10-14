@@ -37,6 +37,11 @@ pub const MAX_DRAWN_ANCHORS: usize = 4096;
 /// The most curve and handle-line pixels drawn per frame.
 pub const MAX_LINE_PIXELS: usize = 200_000;
 
+/// The most flattened curve points one frame computes; past it the rest of
+/// the path is not drawn (the pixel cap above only bounds what is rasterised,
+/// this bounds the flattening itself).
+pub const MAX_FLATTENED_POINTS: usize = 100_000;
+
 /// An anchor of a path by position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AnchorRef {
@@ -291,14 +296,15 @@ pub fn path_overlay_runs(
     let tolerance = ((0.25 / (zoom * scale)) as f32).clamp(0.001, FLATTEN_TOLERANCE);
 
     let mut line: BTreeSet<Pixel> = BTreeSet::new();
-    for (poly, sub) in path
-        .subpaths
-        .iter()
-        .map(|s| (s.flatten(tolerance), s))
-        .filter(|(p, _)| !p.is_empty())
-    {
-        let mut points = poly;
-        if sub.closed && points.len() > 1 {
+    let mut budget = MAX_FLATTENED_POINTS;
+    for sub in &path.subpaths {
+        let mut points = Vec::new();
+        let complete = sub.flatten_into(tolerance, &mut points, budget);
+        budget = budget.saturating_sub(points.len());
+        if points.is_empty() {
+            continue;
+        }
+        if complete && sub.closed && points.len() > 1 {
             // `flatten` leaves the closing curve's last point (the first
             // anchor) off; the line has to end on it.
             if let Some(&first) = points.first() {
@@ -314,6 +320,9 @@ pub fn path_overlay_runs(
                 rasterise(&mut line, here, here, clip);
             }
             previous = Some(here);
+        }
+        if !complete {
+            break;
         }
     }
 

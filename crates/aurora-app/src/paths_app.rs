@@ -48,6 +48,8 @@ pub(crate) const DELETE_PATH_LABEL: &str = "Delete Path";
 pub(crate) const RENAME_PATH_LABEL: &str = "Rename Path";
 pub(crate) const SAVE_WORK_LABEL: &str = "Save Work Path";
 
+pub(crate) const PATHS_LOST_NOTICE: &str =
+    "The crop moved this document's paths out of range, so they were dropped.";
 pub(crate) const NO_PATH_NOTICE: &str = "Select a path in the Paths panel first.";
 pub(crate) const EMPTY_PATH_NOTICE: &str = "This path has no area to select.";
 pub(crate) const NO_WORK_PATH_NOTICE: &str = "There is no work path to save.";
@@ -472,6 +474,9 @@ impl App {
     /// Puts the path set an undo, redo or History jump has just put in force
     /// into the live document; returns whether there was one.
     pub(crate) fn apply_pending_paths_now(&mut self) -> bool {
+        if self.doc.undo_order.take_paths_lost() {
+            self.pen_notice(PATHS_LOST_NOTICE);
+        }
         let Some(paths) = self.doc.undo_order.take_pending_paths() else {
             return false;
         };

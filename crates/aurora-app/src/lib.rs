@@ -10737,6 +10737,9 @@ struct UndoOrder {
     /// The path set an undo or redo of a path step has just put in force,
     /// for the owner of the live paths to take ([`Self::take_pending_paths`]).
     pending_paths: Option<aurora_doc::PathSet>,
+    /// A pending path set was dropped because a Crop's shift could not be
+    /// applied to it (0.233.0 review); taken once to raise a notice.
+    paths_lost: bool,
 }
 
 /// A process-unique stamp for an [`UndoOrder`]'s state (0.156.0): drawn
@@ -10843,6 +10846,7 @@ impl Default for UndoOrder {
             path_undo: Vec::new(),
             path_redo: Vec::new(),
             pending_paths: None,
+            paths_lost: false,
         }
     }
 }
@@ -11050,6 +11054,11 @@ impl UndoOrder {
         self.pending_paths.take()
     }
 
+    /// Whether a pending path set was dropped by a Crop's shift, once.
+    fn take_paths_lost(&mut self) -> bool {
+        std::mem::take(&mut self.paths_lost)
+    }
+
     /// Records a committed crop as a step labelled "Crop" (0.226.0), after
     /// its `Translate` step is in `history`.
     fn record_crop(
@@ -11120,7 +11129,10 @@ impl UndoOrder {
         // Likewise a path set still pending from an earlier step of the jump.
         if let Some(mut paths) = self.pending_paths.take() {
             if paths.translate(dx, dy).is_err() {
+                // A shift no coordinate survives: the paths are dropped,
+                // and the owner tells the user ([`Self::take_paths_lost`]).
                 paths = aurora_doc::PathSet::new();
+                self.paths_lost = true;
             }
             self.pending_paths = Some(paths);
         }
