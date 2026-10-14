@@ -378,6 +378,31 @@ mod tests {
         assert!(!sync(&mut ws, &c, Tool::Crop, CropRatio::Free, false));
     }
 
+    /// The 0.228.3 sizing rules: neither item shrinks in a narrow window,
+    /// the dropdown is the slider floor wide (a token-derived width) at any
+    /// bar width, and both keep a hittable extent.
+    #[test]
+    fn the_dropdown_keeps_its_floor_width_and_the_checkbox_its_text_in_a_narrow_bar() {
+        const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
+        let floor = match Scales::from_toml_str(SCALES_TOML) {
+            Ok(scales) => scales.size.options_control_width / 2,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (mut ws, c) = built();
+        sync(&mut ws, &c, Tool::Crop, CropRatio::Free, false);
+        let widths = |ws: &crate::Workspace| {
+            [c.crop.ratio, c.crop.portrait]
+                .map(|id| ws.tree.bounds(id).map_or(0, |bounds| bounds.width))
+        };
+        let wide = widths(&ws);
+        assert_eq!(wide[0], floor, "the dropdown is the slider floor wide");
+        assert!(wide[1] > 0);
+        for window in [1000.0_f32, 700.0] {
+            ws.tree.compute_layout(window, 900.0);
+            assert_eq!(widths(&ws), wide, "{window}: nothing shrinks");
+        }
+    }
+
     #[test]
     fn leaving_the_tool_closes_an_open_list() {
         let (mut ws, c) = built();
