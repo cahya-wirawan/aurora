@@ -38,6 +38,7 @@
 pub mod canvas_view;
 pub mod channels_panel;
 pub mod colour_controls;
+pub mod crop_controls;
 pub mod crop_overlay;
 pub mod curves_controls;
 pub mod dock;
@@ -143,6 +144,10 @@ pub use colour_controls::{
     colour_group_height, colour_swatch_offset, colour_swatch_side, insert_colour_controls,
     is_colour_control, open_colour_popover, swatch_colour, swatch_description, swatch_name,
     sync_colour_controls,
+};
+pub use crop_controls::{
+    CROP_GROUP_LABEL, CROP_PORTRAIT_LABEL, CROP_RATIO_LABEL, CropControls, CropRatio,
+    has_crop_controls, insert_crop_controls, sync_crop_controls,
 };
 pub use crop_overlay::{
     CROP_GUIDE_MIN_GAP, CROP_HANDLE_COUNT, crop_guide_runs, crop_handle_runs, crop_shield_rects,

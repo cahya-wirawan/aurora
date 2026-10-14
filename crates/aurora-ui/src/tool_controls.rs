@@ -74,6 +74,9 @@ pub struct ToolControls {
     /// The Dodge/Burn Range and the Sponge Mode groups (0.224.0), inside
     /// [`Self::options`].
     pub tone: crate::tone_controls::ToneControls,
+    /// The Crop tool's ratio dropdown and Portrait checkbox (0.236.0),
+    /// inside [`Self::options`].
+    pub crop: crate::crop_controls::CropControls,
 }
 
 /// The readout's text for `tool` with `radius` (`None`: the tool has no
@@ -364,6 +367,7 @@ fn build(
     let modes =
         crate::selection_mode_controls::insert_selection_mode_controls(tree, options, scales)?;
     let tone = crate::tone_controls::insert_tone_controls(tree, options, scales)?;
+    let crop = crate::crop_controls::insert_crop_controls(tree, options, scales)?;
     let mut curves = insert_curves_controls(tree, root, scales)?;
     // The Levels editor (0.202.0) sits beside it; one handle reaches both.
     curves.levels = Some(insert_levels_controls(tree, root, scales)?);
@@ -378,6 +382,7 @@ fn build(
         fill,
         modes,
         tone,
+        crop,
     };
     set_disabled(tree, controls, true)?;
     set_node_hidden(tree, radius, true)?;
