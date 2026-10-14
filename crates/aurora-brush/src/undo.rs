@@ -90,7 +90,8 @@ pub struct StrokeSnapshot {
     /// `stroke_cover`): lives and dies with the stroke, dropped when the
     /// snapshot is packed for history, never counted in
     /// [`Self::memory_bytes`] because it never reaches the undo stack.
-    cover: StrokeCover,
+    // Boxed so a `Drag` holding a snapshot stays small (clippy::large_enum_variant).
+    cover: Box<StrokeCover>,
 }
 
 /// One captured tile's content, in one of three representations
@@ -137,7 +138,7 @@ impl StrokeSnapshot {
             tiles: HashMap::new(),
             spill: Vec::new(),
             memory_bytes: SNAPSHOT_OVERHEAD_BYTES,
-            cover: StrokeCover::default(),
+            cover: Box::default(),
         }
     }
 
