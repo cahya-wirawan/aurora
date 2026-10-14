@@ -43649,8 +43649,9 @@ mod tests {
         // Panel Layout" and the three "Move Layers Panel ..." commands,
         // and (0.167.0) "Float Layers Panel" and "Dock Layers Panel" --
         // the first inserted (`palette_commands`'s own order) is what ends
-        // up selected. (0.202.0) "New Levels Layer" matches too.
-        assert_eq!(state.results().len(), 14);
+        // up selected. (0.202.0) "New Levels Layer" matches too, and
+        // (0.235.0) "Layer via Copy" and "Layer via Cut".
+        assert_eq!(state.results().len(), 16);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)

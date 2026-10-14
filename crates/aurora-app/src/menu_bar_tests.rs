@@ -664,9 +664,9 @@ fn a_disabled_row_cannot_be_activated_and_leaves_the_menu_open() {
     assert!(rig.state.open.is_some());
     assert_eq!(rig.popup_count(), 1);
     // The initial highlight skips the disabled Undo and Redo: it is on the
-    // first enabled row, and Enter runs that one.
+    // first enabled row (Copy since 0.235.0), and Enter runs that one.
     let (_, action) = rig.key(NamedKey::Enter);
-    assert_eq!(action, BarAction::Run("colour.swap".to_owned()));
+    assert_eq!(action, BarAction::Run("edit.copy".to_owned()));
 }
 
 #[test]
