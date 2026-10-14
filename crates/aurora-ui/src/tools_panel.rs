@@ -102,7 +102,7 @@ pub const TOOL_GROUPS: [&[Tool]; 13] = [
     &[Tool::Smudge],
     &[Tool::Blur, Tool::Sharpen],
     &[Tool::Dodge, Tool::Burn],
-    &[Tool::Sponge],
+    &[Tool::Sponge, Tool::Pen],
     &[Tool::Gradient, Tool::PaintBucket],
 ];
 
@@ -132,6 +132,7 @@ pub const fn tool_icon(tool: Tool) -> IconKind {
         Tool::Burn => IconKind::Burn,
         Tool::Sponge => IconKind::Sponge,
         Tool::Crop => IconKind::Crop,
+        Tool::Pen => IconKind::Pen,
         Tool::Gradient => IconKind::Gradient,
         Tool::PaintBucket => IconKind::PaintBucket,
     }
@@ -402,7 +403,7 @@ mod tests {
 
     /// The icon each tool must wear, written out independently of
     /// [`tool_icon`] so a mapped-to-the-wrong-tool slip fails.
-    const EXPECTED_ICONS: [(Tool, IconKind); 22] = [
+    const EXPECTED_ICONS: [(Tool, IconKind); 23] = [
         (Tool::Move, IconKind::Move),
         (Tool::MarqueeSelect, IconKind::Marquee),
         (Tool::EllipticalMarquee, IconKind::EllipseMarquee),
@@ -422,6 +423,7 @@ mod tests {
         (Tool::Dodge, IconKind::Dodge),
         (Tool::Burn, IconKind::Burn),
         (Tool::Sponge, IconKind::Sponge),
+        (Tool::Pen, IconKind::Pen),
         (Tool::Crop, IconKind::Crop),
         (Tool::Gradient, IconKind::Gradient),
         (Tool::PaintBucket, IconKind::PaintBucket),
@@ -771,6 +773,9 @@ mod tests {
             assert_eq!(at(Tool::Dodge).x + 32, at(Tool::Burn).x);
             assert!(at(Tool::Sponge).y > at(Tool::Dodge).y);
             assert_eq!(at(Tool::Sponge).x, at(Tool::Dodge).x);
+            // 0.233.0: the Pen shares the Sponge's row, right of it.
+            assert_eq!(at(Tool::Pen).y, at(Tool::Sponge).y);
+            assert_eq!(at(Tool::Sponge).x + 32, at(Tool::Pen).x);
             assert!(at(Tool::Gradient).y > at(Tool::Sponge).y);
             // 0.209.0: the fill row sits under the paint row, two to a
             // row, in the same two columns, inside the same 72 px.

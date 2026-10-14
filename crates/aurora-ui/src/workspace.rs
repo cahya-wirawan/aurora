@@ -65,7 +65,7 @@ pub const OPTIONS_BAR_LABEL: &str = "Tool options";
 
 /// The Properties + History + Channels tab group's tab-list label (0.164.0;
 /// Channels joined in 0.232.0).
-pub const PANEL_GROUP_LABEL: &str = "Properties, History and Channels";
+pub const PANEL_GROUP_LABEL: &str = "Properties, History, Channels and Paths";
 
 /// The tab [`build_workspace`] selects in the default Properties + History group, and
 /// the one a saved layout without a tab falls back to: `0`, Properties
@@ -161,6 +161,10 @@ pub struct Workspace {
     /// The Channels panel's rows, selection and toolbar
     /// ([`crate::channels_panel`]); `aurora-app` keeps its rows current.
     pub channels_state: crate::channels_panel::ChannelsPanel,
+    /// The Paths panel (0.233.0) — by default the fourth tab of that group.
+    pub paths: PanelHandle,
+    /// The Paths panel's rows, selection and toolbar ([`crate::paths_panel`]).
+    pub paths_state: crate::paths_panel::PathsPanel,
     /// The rail's dock slots, top to bottom (0.166.0, drag-to-redock;
     /// [`crate::dock`]): each a lone panel or a tab group
     /// ([`crate::panel_group`]). The default is Layers on its own, then
@@ -256,6 +260,7 @@ impl Workspace {
             DockPanel::Properties => self.properties,
             DockPanel::History => self.history,
             DockPanel::Channels => self.channels,
+            DockPanel::Paths => self.paths,
         }
     }
 
@@ -537,16 +542,16 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         &mut tree,
         rail,
         PANEL_GROUP_LABEL,
-        &["Properties", "History", "Channels"],
+        &["Properties", "History", "Channels", "Paths"],
         PANEL_GROUP_TAB_DEFAULT,
         scales,
     ) {
         Ok(group) => group,
         Err(err) => unreachable!("rail was just inserted into this same tree: {err:?}"),
     };
-    let (properties, history, channels) = match panel_group.members.as_slice() {
-        [properties, history, channels] => (*properties, *history, *channels),
-        _ => unreachable!("the group was built with exactly three titles"),
+    let (properties, history, channels, paths) = match panel_group.members.as_slice() {
+        [properties, history, channels, paths] => (*properties, *history, *channels, *paths),
+        _ => unreachable!("the group was built with exactly four titles"),
     };
     // 0.232.0: the Channels panel's foot toolbar and first rows.
     let channels_toolbar =
@@ -564,6 +569,17 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         &[],
     ) {
         unreachable!("the Channels panel was just inserted: {err:?}");
+    }
+    // 0.233.0: the Paths panel's foot toolbar and its empty-state row.
+    let paths_toolbar = match crate::paths_panel::insert_paths_toolbar(&mut tree, paths, scales) {
+        Ok(toolbar) => toolbar,
+        Err(err) => unreachable!("the Paths panel was just inserted: {err:?}"),
+    };
+    let mut paths_state = crate::paths_panel::new_paths_panel(paths_toolbar);
+    if let Err(err) =
+        crate::paths_panel::populate_paths_panel(&mut tree, paths, scales, &mut paths_state, &[])
+    {
+        unreachable!("the Paths panel was just inserted: {err:?}");
     }
     // 0.161.0: Layers and Properties take their content's height (their
     // rows up to the `size.content_panel_max_rows` token, then they scroll); History keeps the zero-basis
@@ -587,7 +603,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         &mut tree,
         root,
         scales,
-        [layers, properties, history, channels],
+        [layers, properties, history, channels, paths],
     );
     // 0.166.0: the drag-to-redock drop indicator, hidden until a drag.
     let drop_indicator = match widgets::insert_drop_indicator(&mut tree, root) {
@@ -615,6 +631,8 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         history,
         channels,
         channels_state,
+        paths,
+        paths_state,
         slots: vec![RailSlot::Panel(layers), RailSlot::Group(panel_group)],
         drop_indicator,
         floating: Vec::new(),
@@ -661,7 +679,7 @@ pub fn history_floor_rows(scales: &Scales) -> u32 {
 pub fn docked_sizing(panel: DockPanel) -> PanelSizing {
     match panel {
         DockPanel::Layers | DockPanel::Properties => PanelSizing::Content,
-        DockPanel::History | DockPanel::Channels => PanelSizing::Fill,
+        DockPanel::History | DockPanel::Channels | DockPanel::Paths => PanelSizing::Fill,
     }
 }
 
@@ -870,7 +888,7 @@ fn insert_rail_strip(
     tree: &mut WidgetTree<WidgetKind>,
     root: WidgetId,
     scales: &Scales,
-    [layers, properties, history, channels]: [PanelHandle; 4],
+    [layers, properties, history, channels, paths]: [PanelHandle; 5],
 ) -> PanelStrip {
     match insert_panel_strip(
         tree,
@@ -881,6 +899,7 @@ fn insert_rail_strip(
             (properties, "Properties"),
             (history, "History"),
             (channels, "Channels"),
+            (paths, "Paths"),
         ],
     ) {
         Ok(strip) => strip,

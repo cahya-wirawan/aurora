@@ -37,15 +37,18 @@ pub enum DockPanel {
     /// The Channels panel (0.232.0): by default the third tab of the
     /// Properties + History group.
     Channels,
+    /// The Paths panel (0.233.0): by default the fourth tab of that group.
+    Paths,
 }
 
 impl DockPanel {
     /// Every rail panel, in the default top-to-bottom order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Layers,
         Self::Properties,
         Self::History,
         Self::Channels,
+        Self::Paths,
     ];
 
     /// The panel's title (its tab label and accessible name).
@@ -56,6 +59,7 @@ impl DockPanel {
             Self::Properties => "Properties",
             Self::History => "History",
             Self::Channels => "Channels",
+            Self::Paths => "Paths",
         }
     }
 
@@ -68,6 +72,7 @@ impl DockPanel {
             Self::Properties => "properties",
             Self::History => "history",
             Self::Channels => "channels",
+            Self::Paths => "paths",
         }
     }
 
@@ -184,6 +189,7 @@ impl Default for DockArrangement {
                         DockPanel::Properties,
                         DockPanel::History,
                         DockPanel::Channels,
+                        DockPanel::Paths,
                     ],
                     selected: crate::workspace::PANEL_GROUP_TAB_DEFAULT,
                 },
@@ -344,7 +350,8 @@ impl DockArrangement {
                 // existed gets it as one more tab of the rail group that
                 // holds History (Photoshop's History-and-friends group),
                 // else as a slot of its own like any other missing panel.
-                if panel == DockPanel::Channels
+                // 0.233.0: the Paths panel joins it the same way.
+                if matches!(panel, DockPanel::Channels | DockPanel::Paths)
                     && let Some(slot) = slots
                         .iter_mut()
                         .find(|slot| slot.panels.contains(&DockPanel::History))

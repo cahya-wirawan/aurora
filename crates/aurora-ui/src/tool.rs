@@ -116,13 +116,15 @@ pub enum Tool {
     /// Crops the document to a rectangle (0.226.0): non-destructive, the
     /// layers keep their pixels outside the new canvas.
     Crop,
+    /// Draws Bezier paths (0.233.0): real, in `aurora-app`'s `path_pen`.
+    Pen,
 }
 
 impl Tool {
     /// Every tool this enum has today, in the fixed order they're
     /// offered to the user (matches PLAN.md's own bullets: Move, Marquee
     /// Select, Zoom, Pan, Eyedropper, then Brush, Eraser, and the 0.209.0 fills Gradient and Paint Bucket).
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Move,
         Self::MarqueeSelect,
         Self::EllipticalMarquee,
@@ -143,6 +145,7 @@ impl Tool {
         Self::Dodge,
         Self::Burn,
         Self::Sponge,
+        Self::Pen,
         Self::Gradient,
         Self::PaintBucket,
     ];
@@ -188,6 +191,7 @@ impl Tool {
             Self::Burn => "Burn",
             Self::Sponge => "Sponge",
             Self::Crop => "Crop",
+            Self::Pen => "Pen",
         }
     }
 
@@ -213,6 +217,7 @@ impl Tool {
             Self::Dodge | Self::Burn => 'O',
             Self::Sponge => 'P',
             Self::Crop => 'C',
+            Self::Pen => 'P',
         }
     }
 
@@ -288,11 +293,11 @@ mod tests {
 
     #[test]
     fn all_lists_every_variant_once() {
-        assert_eq!(Tool::ALL.len(), 22);
+        assert_eq!(Tool::ALL.len(), 23);
         let mut seen = Tool::ALL.to_vec();
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
-        assert_eq!(seen.len(), 22, "ALL must not repeat a variant");
+        assert_eq!(seen.len(), 23, "ALL must not repeat a variant");
     }
 
     #[test]
@@ -328,6 +333,7 @@ mod tests {
         assert_eq!(Tool::Dodge.shortcut_text(), "O");
         assert_eq!(Tool::Burn.shortcut_text(), "Shift+O");
         assert_eq!(Tool::Sponge.shortcut_text(), "Shift+P");
+        assert_eq!(Tool::Pen.shortcut_text(), "P");
     }
 
     #[test]

@@ -404,3 +404,26 @@ fn the_selection_set_carries_paths_and_the_crop_shifts_them() {
         .and_then(|p| p.subpaths[0].anchors.first().copied());
     assert_eq!(first.map(|a| a.point), Some((10.0, 20.0)));
 }
+
+#[test]
+fn live_edits_through_subpaths_mut_are_caught_by_validate() {
+    let mut set = PathSet::new();
+    assert!(set.add("a").is_ok());
+    assert!(set.ensure_work().is_ok());
+    for name in ["a", WORK_PATH_NAME] {
+        assert!(set.validate().is_ok());
+        let Some(subs) = set.subpaths_mut(name) else {
+            unreachable!("exists")
+        };
+        subs.push(Subpath {
+            anchors: vec![Anchor::corner(f32::NAN, 0.0)],
+            closed: false,
+        });
+        assert!(set.validate().is_err(), "{name}");
+        let Some(subs) = set.subpaths_mut(name) else {
+            unreachable!("exists")
+        };
+        subs.clear();
+    }
+    assert!(set.subpaths_mut("missing").is_none());
+}

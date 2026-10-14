@@ -3082,6 +3082,7 @@ fn paint_selection_outline(
     for (tone, colour) in [
         (OutlineTone::Light, theme.selection.ants_light.to_srgb_f32()),
         (OutlineTone::Dark, theme.selection.ants_dark.to_srgb_f32()),
+        (OutlineTone::Accent, theme.accent.primary.to_srgb_f32()),
     ] {
         let mut mesh = Mesh {
             vertices: Vec::new(),

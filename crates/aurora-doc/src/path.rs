@@ -298,6 +298,28 @@ impl PathSet {
         Ok(set)
     }
 
+    /// Mutable access to the subpaths of the path `name`, for a gesture that
+    /// edits it live. The caller must call [`Self::validate`] before the
+    /// result is kept; nothing is checked here.
+    pub fn subpaths_mut(&mut self, name: &str) -> Option<&mut Vec<Subpath>> {
+        if name == WORK_PATH_NAME {
+            return self.work.as_mut().map(|p| &mut p.subpaths);
+        }
+        self.paths
+            .iter_mut()
+            .find(|p| p.name == name)
+            .map(|p| &mut p.subpaths)
+    }
+
+    /// Checks every bound of the module doc over the whole set.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::InvalidPath`] naming the first problem found.
+    pub fn validate(&self) -> Result<(), DocError> {
+        self.check()
+    }
+
     fn check(&self) -> Result<(), DocError> {
         let count = self.paths.len() + usize::from(self.work.is_some());
         if count > MAX_PATHS {

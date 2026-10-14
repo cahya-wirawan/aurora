@@ -549,6 +549,10 @@ mod clone_stamp_tests;
 mod colour_state;
 mod crop;
 mod crop_app;
+mod paths_app;
+mod pen;
+#[cfg(test)]
+mod paths_undo_tests;
 #[cfg(test)]
 mod crop_tests;
 mod document_close;
@@ -10540,6 +10544,12 @@ enum UndoKind {
     /// ([`crop::CropStep`]); its document half is one `Translate` step in
     /// `aurora_doc::History`. It is a content change (dirty).
     Crop,
+    /// An edit of the document's paths (0.233.0): its before and after live
+    /// in [`UndoOrder`] ([`pen::PathStep`]). Like a selection step it is
+    /// dirty-neutral (a disclosed choice: paths ride in the selection
+    /// state, so they are saved with the file but do not make a document
+    /// unsaved).
+    Path,
 }
 
 use selection_history::SelectionStep;
@@ -10606,6 +10616,13 @@ struct UndoOrder {
     /// of the live document to take ([`crop::apply_pending_crop`]); shifts
     /// of several steps in one History jump add up.
     pending_crop: Option<crop::PendingCrop>,
+    /// The path edits behind the `Path` tags of `undo` and `redo` (0.233.0),
+    /// in the same order (the newest on top).
+    path_undo: Vec<pen::PathStep>,
+    path_redo: Vec<pen::PathStep>,
+    /// The path set an undo or redo of a path step has just put in force,
+    /// for the owner of the live paths to take ([`Self::take_pending_paths`]).
+    pending_paths: Option<aurora_doc::PathSet>,
 }
 
 /// A process-unique stamp for an [`UndoOrder`]'s state (0.156.0): drawn
@@ -10680,6 +10697,7 @@ fn default_step_label(kind: UndoKind) -> &'static str {
         UndoKind::Pixel => "Pixel Edit",
         UndoKind::Selection => "Selection Change",
         UndoKind::Crop => crop::CROP_LABEL,
+        UndoKind::Path => "Path Change",
     }
 }
 
@@ -10708,6 +10726,9 @@ impl Default for UndoOrder {
             crop_undo: Vec::new(),
             crop_redo: Vec::new(),
             pending_crop: None,
+            path_undo: Vec::new(),
+            path_redo: Vec::new(),
+            pending_paths: None,
         }
     }
 }
@@ -10739,7 +10760,7 @@ impl UndoOrder {
             self.redo.push(kind);
             self.redo_labels.push(label);
             self.revision = UndoRevision::next();
-            if kind != UndoKind::Selection {
+            if !matches!(kind, UndoKind::Selection | UndoKind::Path) {
                 self.content_revision = UndoRevision::next();
             }
         }
@@ -10757,7 +10778,7 @@ impl UndoOrder {
             self.undo.push(kind);
             self.undo_labels.push(label);
             self.revision = UndoRevision::next();
-            if kind != UndoKind::Selection {
+            if !matches!(kind, UndoKind::Selection | UndoKind::Path) {
                 self.content_revision = UndoRevision::next();
             }
         }
@@ -10857,6 +10878,64 @@ impl UndoOrder {
         }
     }
 
+    /// Records a committed path edit as a step (0.233.0), clearing every
+    /// pending redo like any other step. Does nothing, and returns `false`,
+    /// when the step changed nothing.
+    fn record_path_step(
+        &mut self,
+        step: pen::PathStep,
+        label: &str,
+        history: &mut aurora_doc::History,
+        pixel_history: &mut aurora_brush::PixelHistory,
+    ) -> bool {
+        if step.before == step.after {
+            return false;
+        }
+        self.record_labelled(UndoKind::Path, label.to_owned(), history, pixel_history);
+        // After `record_labelled`, which clears the redo side.
+        self.path_undo.push(step);
+        true
+    }
+
+    /// Undoes or redoes the top path step: moves it across, leaves the path
+    /// set to put in force in [`Self::take_pending_paths`] and moves the
+    /// History marker. `false` (nothing changed) when the top tag is not a
+    /// path step or its data is missing.
+    fn apply_path_step(&mut self, direction: UndoDirection) -> bool {
+        match direction {
+            UndoDirection::Undo => {
+                if self.undo.last() != Some(&UndoKind::Path) {
+                    return false;
+                }
+                let Some(step) = self.path_undo.pop() else {
+                    return false;
+                };
+                self.pending_paths = Some(step.before.clone());
+                self.path_redo.push(step);
+                self.step_back();
+                true
+            }
+            UndoDirection::Redo => {
+                if self.redo.last() != Some(&UndoKind::Path) {
+                    return false;
+                }
+                let Some(step) = self.path_redo.pop() else {
+                    return false;
+                };
+                self.pending_paths = Some(step.after.clone());
+                self.path_undo.push(step);
+                self.step_forward();
+                true
+            }
+        }
+    }
+
+    /// The path set the last undo, redo or History jump of a path step put
+    /// in force, once.
+    fn take_pending_paths(&mut self) -> Option<aurora_doc::PathSet> {
+        self.pending_paths.take()
+    }
+
     /// Records a committed crop as a step labelled "Crop" (0.226.0), after
     /// its `Translate` step is in `history`.
     fn record_crop(
@@ -10923,6 +11002,13 @@ impl UndoOrder {
         }
         if let Some(Some(target)) = self.pending_selection.take() {
             self.pending_selection = Some(target.translated(dx, dy).ok());
+        }
+        // Likewise a path set still pending from an earlier step of the jump.
+        if let Some(mut paths) = self.pending_paths.take() {
+            if paths.translate(dx, dy).is_err() {
+                paths = aurora_doc::PathSet::new();
+            }
+            self.pending_paths = Some(paths);
         }
         let (total_dx, total_dy) = self
             .pending_crop
@@ -10993,7 +11079,7 @@ impl UndoOrder {
             UndoKind::Structural => history
                 .last_journal_description()
                 .unwrap_or_else(|| default_step_label(kind).to_owned()),
-            UndoKind::Pixel | UndoKind::Selection | UndoKind::Crop => {
+            UndoKind::Pixel | UndoKind::Selection | UndoKind::Crop | UndoKind::Path => {
                 default_step_label(kind).to_owned()
             }
         };
@@ -11025,10 +11111,11 @@ impl UndoOrder {
         self.redo_labels.clear();
         self.selection_redo.clear();
         self.crop_redo.clear();
+        self.path_redo.clear();
         history.clear_redo();
         pixel_history.clear_redo();
         self.revision = UndoRevision::next();
-        if kind != UndoKind::Selection {
+        if !matches!(kind, UndoKind::Selection | UndoKind::Path) {
             self.content_revision = UndoRevision::next();
         }
     }
@@ -11361,6 +11448,9 @@ fn step_undo_order(
             Some(UndoKind::Selection) => undo_order
                 .apply_selection_step(UndoDirection::Undo)
                 .then_some(CompositeInvalidation::None),
+            Some(UndoKind::Path) => undo_order
+                .apply_path_step(UndoDirection::Undo)
+                .then_some(CompositeInvalidation::None),
             Some(UndoKind::Crop) => {
                 if history.can_undo() && undo_order.crop_step_ready(UndoDirection::Undo) {
                     match history.undo(layers) {
@@ -11414,6 +11504,9 @@ fn step_undo_order(
             }
             Some(UndoKind::Selection) => undo_order
                 .apply_selection_step(UndoDirection::Redo)
+                .then_some(CompositeInvalidation::None),
+            Some(UndoKind::Path) => undo_order
+                .apply_path_step(UndoDirection::Redo)
                 .then_some(CompositeInvalidation::None),
             Some(UndoKind::Crop) => {
                 if history.can_redo() && undo_order.crop_step_ready(UndoDirection::Redo) {

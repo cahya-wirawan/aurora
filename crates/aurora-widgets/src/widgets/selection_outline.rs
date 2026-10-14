@@ -48,6 +48,9 @@ pub enum OutlineTone {
     Light,
     /// `selection.ants_dark`.
     Dark,
+    /// `accent.primary` (0.233.0): the Pen tool's selected anchor, drawn
+    /// after the other two.
+    Accent,
 }
 
 /// One dash: an axis-aligned rectangle in physical pixels, relative to
