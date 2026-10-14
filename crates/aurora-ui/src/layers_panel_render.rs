@@ -594,6 +594,8 @@ fn write_fill_tools_png() {
         pencil_opacity: 100,
         clone_opacity: 100,
         clone_flow: 100,
+        eraser_opacity: 100,
+        eraser_flow: 100,
     };
     for (tool, name) in [
         (crate::Tool::Gradient, "gradient"),

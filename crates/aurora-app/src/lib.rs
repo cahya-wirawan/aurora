@@ -8441,8 +8441,8 @@ fn apply_fill_control_outcome(
         ActionOutcome::ValueChanged { id, value } if *id == fill.tolerance => {
             settings.set_tolerance(*value)
         }
-        // The Brush's, Pencil's and Clone Stamp's Opacity and Flow (0.228.0):
-        // the tool in force owns the slider (the Brush's in every other
+        // The Brush's, Pencil's, Clone Stamp's and Eraser's Opacity and Flow
+        // (0.228.0, 0.229.0): the tool in force owns the slider (the Brush's in every other
         // state, where it is not shown).
         ActionOutcome::ValueChanged { id, value } if *id == fill.paint_opacity => {
             let owner = paint_slider_owner(tool);
@@ -8477,11 +8477,11 @@ fn apply_fill_control_outcome(
 }
 
 /// The tool whose Opacity or Flow the shared paint sliders edit (0.228.0):
-/// the Pencil and the Clone Stamp each own their own, the Brush every other
-/// state's.
+/// the Pencil, the Clone Stamp and (0.229.0) the Eraser each own their own,
+/// the Brush every other state's.
 fn paint_slider_owner(tool: aurora_ui::Tool) -> aurora_ui::Tool {
     match tool {
-        aurora_ui::Tool::Pencil | aurora_ui::Tool::CloneStamp => tool,
+        aurora_ui::Tool::Pencil | aurora_ui::Tool::CloneStamp | aurora_ui::Tool::Eraser => tool,
         _ => aurora_ui::Tool::Brush,
     }
 }
@@ -26143,6 +26143,13 @@ struct ToolSettings {
     clone_opacity: u8,
     /// The Clone Stamp's Flow, 1..=100 percent (0.228.0; default 100).
     clone_flow: u8,
+    /// The Eraser's Opacity, 1..=100 percent (0.229.0; default 100): a
+    /// per-stroke ceiling on how much the stroke erases, see
+    /// `aurora_brush::erase_dab_amount`. The Quick Mask Eraser (which edits
+    /// the mask, not a layer) ignores it.
+    eraser_opacity: u8,
+    /// The Eraser's Flow, 1..=100 percent (0.229.0; default 100).
+    eraser_flow: u8,
 }
 
 /// The default Opacity and Flow of the paint tools, percent (0.228.0).
@@ -26179,6 +26186,8 @@ impl Default for ToolSettings {
             pencil_opacity: DEFAULT_PAINT_PERCENT,
             clone_opacity: DEFAULT_PAINT_PERCENT,
             clone_flow: DEFAULT_PAINT_PERCENT,
+            eraser_opacity: DEFAULT_PAINT_PERCENT,
+            eraser_flow: DEFAULT_PAINT_PERCENT,
         }
     }
 }
@@ -26203,12 +26212,14 @@ impl ToolSettings {
             pencil_opacity: self.pencil_opacity,
             clone_opacity: self.clone_opacity,
             clone_flow: self.clone_flow,
+            eraser_opacity: self.eraser_opacity,
+            eraser_flow: self.eraser_flow,
         }
     }
 
     /// The Opacity and Flow `tool`'s dabs stamp with (0.228.0): the Brush's
     /// and the Pencil's own Opacity (the Pencil has no Flow, so it reads as
-    /// 100 %); the Eraser has neither and is unchanged.
+    /// 100 %), and (0.229.0) the Eraser's own pair.
     fn paint_amount(&self, tool: DabTool) -> aurora_brush::PaintAmount {
         let fraction = |percent: u8| f32::from(percent) / 100.0;
         match tool {
@@ -26217,7 +26228,10 @@ impl ToolSettings {
                 fraction(self.brush_flow),
             ),
             DabTool::Pencil => aurora_brush::PaintAmount::new(fraction(self.pencil_opacity), 1.0),
-            DabTool::Eraser => aurora_brush::PaintAmount::FULL,
+            DabTool::Eraser => aurora_brush::PaintAmount::new(
+                fraction(self.eraser_opacity),
+                fraction(self.eraser_flow),
+            ),
         }
     }
 
@@ -26231,7 +26245,7 @@ impl ToolSettings {
 
     /// Sets the Opacity (`flow` false) or Flow (`flow` true) of `tool` from a
     /// slider value (rounded, clamped to 1..=100; non-finite refused). Only
-    /// the Brush, Pencil (Opacity) and Clone Stamp have them; any other tool
+    /// the Brush, Pencil (Opacity), Clone Stamp and Eraser have them; any other tool
     /// changes nothing. Returns whether it changed.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn set_paint_percent(&mut self, tool: aurora_ui::Tool, flow: bool, value: f64) -> bool {
@@ -26245,6 +26259,8 @@ impl ToolSettings {
             (aurora_ui::Tool::Pencil, false) => &mut self.pencil_opacity,
             (aurora_ui::Tool::CloneStamp, false) => &mut self.clone_opacity,
             (aurora_ui::Tool::CloneStamp, true) => &mut self.clone_flow,
+            (aurora_ui::Tool::Eraser, false) => &mut self.eraser_opacity,
+            (aurora_ui::Tool::Eraser, true) => &mut self.eraser_flow,
             _ => return false,
         };
         let changed = percent != *slot;
@@ -26813,13 +26829,16 @@ fn stamp_tool_dab_covered(
             tool == DabTool::Pencil,
             settings.paint_amount(tool),
         ),
-        DabTool::Eraser => aurora_brush::erase_dab_covered(
+        // The Eraser erases with its Opacity and Flow (0.229.0); at 100 %
+        // each is exactly `erase_dab_covered`.
+        DabTool::Eraser => aurora_brush::erase_dab_amount(
             store,
             surface,
             local,
             radius,
             eraser_stroke_mut(drag),
             coverage,
+            settings.paint_amount(tool),
         ),
     }
 }

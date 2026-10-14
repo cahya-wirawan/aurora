@@ -946,7 +946,8 @@ fn brush_and_eraser_keep_their_radius_row_and_fill_tools_replace_it() {
         |bar: &Bar| aurora_ui::radius_slider_shown(&bar.workspace.tree, &bar.controls);
     for (tool, radius, group) in [
         (Tool::Brush, true, Some(Tool::Brush)),
-        (Tool::Eraser, true, None),
+        // The Eraser shares the Opacity and Flow group since 0.229.0.
+        (Tool::Eraser, true, Some(Tool::Brush)),
         (Tool::Gradient, false, Some(Tool::Gradient)),
         (Tool::PaintBucket, false, Some(Tool::PaintBucket)),
         (Tool::Move, false, None),
@@ -1100,7 +1101,7 @@ fn the_options_bar_edits_the_smudge_strength_and_mirrors_it() {
     crate::sync_tool_controls(
         &mut bar.workspace,
         Some(bar.controls),
-        Tool::Eraser,
+        Tool::Move,
         &bar.settings,
         None,
     );
@@ -1259,7 +1260,7 @@ fn the_options_bar_edits_exposure_and_flow_each_on_its_own_under_their_own_name(
     crate::sync_tool_controls(
         &mut bar.workspace,
         Some(bar.controls),
-        Tool::Eraser,
+        Tool::Move,
         &bar.settings,
         None,
     );
@@ -1383,8 +1384,20 @@ fn the_paint_settings_default_to_a_hundred_percent_and_map_to_the_engine_per_too
         settings.paint_amount(DabTool::Pencil),
         PaintAmount::new(0.55, 1.0)
     );
-    // The Eraser is unchanged by every one of them.
+    // The Eraser is unchanged by every one of them, and has its own pair
+    // (0.229.0).
     assert_eq!(settings.paint_amount(DabTool::Eraser), PaintAmount::FULL);
+    settings.eraser_opacity = 30;
+    settings.eraser_flow = 45;
+    assert_eq!(
+        settings.paint_amount(DabTool::Eraser),
+        PaintAmount::new(0.30, 0.45)
+    );
+    assert_eq!(
+        settings.paint_amount(DabTool::Brush),
+        PaintAmount::new(0.40, 0.70),
+        "the Eraser's pair is not the Brush's"
+    );
     assert_eq!(settings.clone_amount(), PaintAmount::new(0.25, 0.90));
 }
 
@@ -1409,16 +1422,23 @@ fn the_setters_round_clamp_and_refuse_a_non_finite_value_and_a_tool_without_the_
     assert!(s.set_paint_percent(Tool::CloneStamp, false, 20.0));
     assert!(s.set_paint_percent(Tool::CloneStamp, true, 30.0));
     assert_eq!((s.clone_opacity, s.clone_flow), (20, 30));
-    // The Eraser and the rest have none; nothing else moved.
-    for tool in [Tool::Eraser, Tool::Smudge, Tool::Move, Tool::Gradient] {
+    // The Eraser has its own pair (0.229.0).
+    assert!(s.set_paint_percent(Tool::Eraser, false, 44.0));
+    assert!(s.set_paint_percent(Tool::Eraser, true, 66.0));
+    assert!(!s.set_paint_percent(Tool::Eraser, true, f64::NAN));
+    assert_eq!((s.eraser_opacity, s.eraser_flow), (44, 66));
+    // The rest have none; nothing else moved.
+    for tool in [Tool::Smudge, Tool::Move, Tool::Gradient] {
         assert!(!s.set_paint_percent(tool, false, 50.0), "{tool:?}");
         assert!(!s.set_paint_percent(tool, true, 50.0), "{tool:?}");
     }
     assert_eq!((s.brush_opacity, s.brush_flow), (1, 12));
     assert_eq!(s.pencil_opacity, 60);
+    assert_eq!((s.eraser_opacity, s.eraser_flow), (44, 66));
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn the_options_bar_edits_the_brush_pencil_and_clone_opacity_and_flow_each_on_its_own() {
     use aurora_widgets::ActionOutcome as A;
     let mut bar = Bar::new();
@@ -1511,6 +1531,40 @@ fn the_options_bar_edits_the_brush_pencil_and_clone_opacity_and_flow_each_on_its
         (20, 80)
     );
     assert_eq!(bar.settings.pencil_opacity, 45);
+    // The Eraser has both, its own (0.229.0), starting from 100 %.
+    sync(&mut bar, Tool::Eraser);
+    assert_eq!(label(&bar, fill.paint_opacity_readout), "Opacity 100 %");
+    assert_eq!(label(&bar, fill.paint_flow_readout), "Flow 100 %");
+    assert!(bar.outcome(
+        Tool::Eraser,
+        A::ValueChanged {
+            id: fill.paint_opacity,
+            value: 55.0
+        }
+    ));
+    assert!(bar.outcome(
+        Tool::Eraser,
+        A::ValueChanged {
+            id: fill.paint_flow,
+            value: 25.0
+        }
+    ));
+    assert_eq!(
+        (bar.settings.eraser_opacity, bar.settings.eraser_flow),
+        (55, 25)
+    );
+    assert_eq!(label(&bar, fill.paint_opacity_readout), "Opacity 55 %");
+    assert_eq!(label(&bar, fill.paint_flow_readout), "Flow 25 %");
+    assert_eq!(
+        (bar.settings.clone_opacity, bar.settings.clone_flow),
+        (20, 80),
+        "the Clone Stamp's were not touched"
+    );
+    assert_eq!(
+        (bar.settings.brush_opacity, bar.settings.brush_flow),
+        (62, 35),
+        "nor the Brush's"
+    );
     // Back to the Brush: its values are mirrored again.
     sync(&mut bar, Tool::Brush);
     assert_eq!(label(&bar, fill.paint_opacity_readout), "Opacity 62 %");
@@ -1556,7 +1610,7 @@ fn with_measured_text_the_paint_options_fit_the_bar_without_changing_its_height(
             .map_or(0, |b| b.height)
     };
     let reference = height_of(&mut bar, Tool::Move);
-    for tool in [Tool::Brush, Tool::Pencil, Tool::CloneStamp] {
+    for tool in [Tool::Brush, Tool::Pencil, Tool::CloneStamp, Tool::Eraser] {
         assert_eq!(height_of(&mut bar, tool), reference, "{tool:?}");
         let Some(strip) = bar.workspace.tree.bounds(bar.workspace.options_bar) else {
             unreachable!("laid out");
@@ -1735,6 +1789,7 @@ fn in_a_narrow_bar_the_sliders_give_up_width_before_any_readout() {
         Tool::Brush,
         Tool::Pencil,
         Tool::CloneStamp,
+        Tool::Eraser,
         Tool::Smudge,
         Tool::Dodge,
         Tool::Sponge,
@@ -1791,6 +1846,24 @@ fn in_a_narrow_bar_the_sliders_give_up_width_before_any_readout() {
             assert_eq!(item_width(n), item_width(m), "a readout kept its width");
         }
     }
+    // The Eraser's group (0.229.0) follows the same rules: radius, Opacity
+    // and Flow sliders, each given up to the floor before any readout.
+    let (eraser_narrow, _) = options_items(&mut bar, Tool::Eraser, 700.0);
+    let eraser_sliders: Vec<i64> = eraser_narrow
+        .iter()
+        .filter(|i| i.leaf == Leaf::Slider)
+        .map(item_width)
+        .collect();
+    assert_eq!(eraser_sliders.len(), 3, "radius, opacity, flow");
+    assert!(
+        eraser_sliders.iter().all(|w| *w == floor),
+        "{eraser_sliders:?}"
+    );
+    let readouts = eraser_narrow
+        .iter()
+        .filter(|i| i.leaf == Leaf::Readout)
+        .count();
+    assert_eq!(readouts, 3, "radius, Opacity and Flow readouts");
 }
 
 #[test]

@@ -1056,11 +1056,6 @@ pub fn erase_dab(
 /// erases half as much), which is the lerp of the old and the erased alpha.
 /// `None` is exactly [`erase_dab`]; coverage `1` erases exactly what it
 /// does; a tile with no covered texel is neither read nor created.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::too_many_lines
-)]
 pub fn erase_dab_covered(
     store: &mut TileStore,
     surface: SurfaceId,
@@ -1069,10 +1064,58 @@ pub fn erase_dab_covered(
     snapshot: Option<&mut StrokeSnapshot>,
     coverage: Option<&dyn Coverage>,
 ) -> DabOutcome {
+    erase_dab_amount(
+        store,
+        surface,
+        center,
+        radius,
+        snapshot,
+        coverage,
+        PaintAmount::FULL,
+    )
+}
+
+/// The general erase entry (0.229.0): [`erase_dab_covered`] with the
+/// stroke's Flow and Opacity ([`PaintAmount`]; [`PaintAmount::FULL`] is
+/// exactly [`erase_dab_covered`], bit for bit).
+///
+/// **The model (a choice, not compared with Photoshop).** A dab erases a
+/// texel by `a = falloff * flow * coverage`: the alpha moves toward zero,
+/// `alpha' = alpha * (1 - a)` (the erase accumulates over a stroke, as it
+/// always has). **Opacity** is a per-stroke ceiling on how much a stroke can
+/// erase in total: with `start` the texel's alpha as the stroke began (the
+/// snapshot's raw copy; a tile the stroke has not written yet is still its
+/// own start) the stored alpha is `start + (erased - start) * opacity`,
+/// where `erased` is what the stroke would have left at opacity 100 %.
+/// Nothing reconstructs `erased` from the stored texel: moving the stored
+/// alpha toward the opacity-limited target `start * (1 - opacity)` by `a`
+/// is the same interpolation (the two commute), so
+/// `alpha' = floor + (alpha - floor) * (1 - a)` with
+/// `floor = start * (1 - opacity)` holds after every dab, and a texel at or
+/// below its floor is left alone. Colour channels are never touched (as
+/// before). With no snapshot every dab is its own stroke.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
+pub fn erase_dab_amount(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    center: (f32, f32),
+    radius: f32,
+    snapshot: Option<&mut StrokeSnapshot>,
+    coverage: Option<&dyn Coverage>,
+    amount: PaintAmount,
+) -> DabOutcome {
     let mut outcome = DabOutcome::default();
     if !is_paintable(center, radius) {
         return outcome;
     }
+    // Flow scales the erase amount; `a * 1.0` is `a` bit for bit.
+    let flow = amount.flow();
+    // `None` is the unchanged 0.228.3 code.
+    let opacity = amount.cap();
     // Same surface guard `stamp_dab` applies, for the same reason.
     let mut snapshot = usable_snapshot(snapshot, surface);
     let (cx, cy) = center;
@@ -1112,81 +1155,110 @@ pub fn erase_dab_covered(
                     continue;
                 }
             };
-            let mut touched_this_tile = false;
-            let mut capture_failed = false;
             let texels = tile.texels_mut();
-
-            'texels: for ly in ly0..=ly1 {
-                for lx in lx0..=lx1 {
-                    #[allow(clippy::cast_precision_loss)]
-                    let px = (origin_x + lx) as f32 + 0.5;
-                    #[allow(clippy::cast_precision_loss)]
-                    let py = (origin_y + ly) as f32 + 0.5;
-                    let d = (px - cx).hypot(py - cy);
-                    if d > radius {
-                        continue;
-                    }
-                    let a = crate::mask_dab::dab_falloff(d, radius);
-                    if a <= 0.0 {
-                        continue;
-                    }
-                    // Selection (0.211.0): the erase amount scales by the
-                    // coverage; full coverage leaves `a` as it was.
-                    let a = match tile_cov {
-                        Some(cov) => {
-                            let c =
-                                covered(cov, i64::from(origin_x + lx), i64::from(origin_y + ly));
-                            if c <= 0.0 {
+            // The stroke-start content of this tile when the stroke has
+            // already written it (see `stamp_dab_impl`); only the opacity
+            // ceiling reads it.
+            let mut erase_tile = |start: Option<&[f16]>, mut snap: Option<&mut StrokeSnapshot>| {
+                let mut touched_this_tile = false;
+                let mut capture_failed = false;
+                'texels: for ly in ly0..=ly1 {
+                    for lx in lx0..=lx1 {
+                        #[allow(clippy::cast_precision_loss)]
+                        let px = (origin_x + lx) as f32 + 0.5;
+                        #[allow(clippy::cast_precision_loss)]
+                        let py = (origin_y + ly) as f32 + 0.5;
+                        let d = (px - cx).hypot(py - cy);
+                        if d > radius {
+                            continue;
+                        }
+                        let a = crate::mask_dab::dab_falloff(d, radius);
+                        if a <= 0.0 {
+                            continue;
+                        }
+                        let a = a * flow;
+                        // Selection (0.211.0): the erase amount scales by the
+                        // coverage; full coverage leaves `a` as it was.
+                        let a = match tile_cov {
+                            Some(cov) => {
+                                let c = covered(
+                                    cov,
+                                    i64::from(origin_x + lx),
+                                    i64::from(origin_y + ly),
+                                );
+                                if c <= 0.0 {
+                                    continue;
+                                }
+                                if c < 1.0 { a * c } else { a }
+                            }
+                            None => a,
+                        };
+                        let index = texel_index(lx, ly);
+                        let Some(&stored_a) = texels.get(index + ALPHA) else {
+                            continue;
+                        };
+                        let dst_a = stored_a.to_f32();
+                        if dst_a <= 0.0 {
+                            continue;
+                        }
+                        // The value that would really be stored, against the
+                        // value really there -- `stamp_dab`'s own
+                        // `stores_the_same_bits` rule, in the one-channel
+                        // form an erase needs. Out near the falloff's own
+                        // edge `1.0 - a` is within half an `f16` ulp of
+                        // `1.0`, so the multiply lands back on the very bits
+                        // already stored: a texel the old `dst_a <= 0.0`
+                        // guard called changed, marked the tile dirty and
+                        // captured an undo entry for, having changed nothing.
+                        let fresh_a = if let Some(o) = opacity {
+                            // Opacity ceiling (0.229.0): move toward the
+                            // floor `start * (1 - o)` by `a`; a texel already
+                            // at or below it has nothing left to erase.
+                            let began = start
+                                .and_then(|s| s.get(index + ALPHA))
+                                .map_or(dst_a, |v| v.to_f32());
+                            let floor = began * (1.0 - o);
+                            if dst_a <= floor {
                                 continue;
                             }
-                            if c < 1.0 { a * c } else { a }
+                            f16::from_f32(floor + (dst_a - floor) * (1.0 - a))
+                        } else {
+                            f16::from_f32(dst_a * (1.0 - a))
+                        };
+                        if fresh_a.to_bits() == stored_a.to_bits() {
+                            continue;
                         }
-                        None => a,
-                    };
-                    let index = texel_index(lx, ly);
-                    let Some(&stored_a) = texels.get(index + ALPHA) else {
-                        continue;
-                    };
-                    let dst_a = stored_a.to_f32();
-                    if dst_a <= 0.0 {
-                        continue;
-                    }
-                    // The value that would really be stored, against the
-                    // value really there -- `stamp_dab`'s own
-                    // `stores_the_same_bits` rule, in the one-channel
-                    // form an erase needs. Out near the falloff's own
-                    // edge `1.0 - a` is within half an `f16` ulp of
-                    // `1.0`, so the multiply lands back on the very bits
-                    // already stored: a texel the old `dst_a <= 0.0`
-                    // guard called changed, marked the tile dirty and
-                    // captured an undo entry for, having changed nothing.
-                    let fresh_a = f16::from_f32(dst_a * (1.0 - a));
-                    if fresh_a.to_bits() == stored_a.to_bits() {
-                        continue;
-                    }
-                    // Captured here, not before the loop --
-                    // `stamp_dab`'s own "capture at the first real
-                    // write, never for a tile nothing changed in" rule,
-                    // mirrored. An erase over already-transparent
-                    // pixels reaches neither this line nor the write
-                    // below.
-                    if !touched_this_tile {
-                        // `stamp_dab`'s own refused-capture rule,
-                        // mirrored: no write, no `painted` entry, a
-                        // reported failure instead.
-                        if let Some(stroke) = snapshot.as_mut()
-                            && !stroke.record_content(id, texels)
-                        {
-                            capture_failed = true;
-                            break 'texels;
+                        // Captured here, not before the loop --
+                        // `stamp_dab`'s own "capture at the first real
+                        // write, never for a tile nothing changed in" rule,
+                        // mirrored. An erase over already-transparent
+                        // pixels reaches neither this line nor the write
+                        // below.
+                        if !touched_this_tile {
+                            // `stamp_dab`'s own refused-capture rule,
+                            // mirrored: no write, no `painted` entry, a
+                            // reported failure instead.
+                            if let Some(stroke) = snap.as_mut()
+                                && !stroke.record_content(id, texels)
+                            {
+                                capture_failed = true;
+                                break 'texels;
+                            }
+                            touched_this_tile = true;
                         }
-                        touched_this_tile = true;
-                    }
-                    if let Some(sample) = texels.get_mut(index + ALPHA) {
-                        *sample = fresh_a;
+                        if let Some(sample) = texels.get_mut(index + ALPHA) {
+                            *sample = fresh_a;
+                        }
                     }
                 }
-            }
+                (touched_this_tile, capture_failed)
+            };
+            let (touched_this_tile, capture_failed) =
+                match snapshot.as_deref().and_then(|s| s.raw_content(id)) {
+                    // Already captured by an earlier dab of this stroke.
+                    Some(raw) => erase_tile(Some(raw), None),
+                    None => erase_tile(None, snapshot.as_deref_mut()),
+                };
             if capture_failed {
                 outcome.fail(id, malformed_tile(surface, id, texels.len()));
                 continue;
