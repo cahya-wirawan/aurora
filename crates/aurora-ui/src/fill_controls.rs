@@ -77,6 +77,17 @@ pub struct FillControls {
     pub strength_readout: WidgetId,
     /// The strength slider, 1 to 100.
     pub strength: WidgetId,
+    /// The paint group's row (0.228.0): Opacity and Flow for the Brush,
+    /// Pencil (Opacity only) and Clone Stamp.
+    pub paint: WidgetId,
+    /// "Opacity N %" of the paint group.
+    pub paint_opacity_readout: WidgetId,
+    /// The paint Opacity slider, 1 to 100.
+    pub paint_opacity: WidgetId,
+    /// "Flow N %" of the paint group (hidden for the Pencil).
+    pub paint_flow_readout: WidgetId,
+    /// The paint Flow slider, 1 to 100.
+    pub paint_flow: WidgetId,
 }
 
 /// The fill settings the controls mirror.
@@ -104,12 +115,42 @@ pub struct FillView {
     pub burn_exposure: u8,
     /// Sponge flow, 1 to 100 (0.224.0).
     pub sponge_flow: u8,
+    /// Brush opacity, 1 to 100 (0.228.0).
+    pub brush_opacity: u8,
+    /// Brush flow, 1 to 100 (0.228.0).
+    pub brush_flow: u8,
+    /// Pencil opacity, 1 to 100 (0.228.0).
+    pub pencil_opacity: u8,
+    /// Clone Stamp opacity, 1 to 100 (0.228.0).
+    pub clone_opacity: u8,
+    /// Clone Stamp flow, 1 to 100 (0.228.0).
+    pub clone_flow: u8,
 }
 
 /// "Opacity 100 %".
 #[must_use]
 pub fn opacity_readout_text(percent: u8) -> String {
     format!("Opacity {percent} %")
+}
+
+/// "Flow 100 %" (0.228.0).
+#[must_use]
+pub fn flow_readout_text(percent: u8) -> String {
+    format!("Flow {percent} %")
+}
+
+/// Whether `tool` shows the paint group's Opacity (0.228.0): the Brush,
+/// the Pencil and the Clone Stamp.
+#[must_use]
+pub const fn has_paint_opacity(tool: Tool) -> bool {
+    matches!(tool, Tool::Brush | Tool::Pencil | Tool::CloneStamp)
+}
+
+/// Whether `tool` also shows the paint group's Flow (0.228.0): the Brush
+/// and the Clone Stamp, not the Pencil.
+#[must_use]
+pub const fn has_paint_flow(tool: Tool) -> bool {
+    matches!(tool, Tool::Brush | Tool::CloneStamp)
 }
 
 /// "Strength 50 %" (0.222.0).
@@ -232,9 +273,43 @@ pub fn insert_fill_controls(
     set_options_item(tree, scales, strength_readout, OptionsItem::Readout, true)?;
     set_options_item(tree, scales, strength, OptionsItem::Slider, true)?;
 
+    // The Brush, Pencil and Clone Stamp (0.228.0): Opacity, and Flow for the
+    // two that have one.
+    let paint = widgets::insert_container(tree, options, group_style(scales))?;
+    let paint_opacity_readout =
+        widgets::insert_label(tree, paint, scales, opacity_readout_text(100))?;
+    let paint_opacity = widgets::insert_slider(
+        tree,
+        paint,
+        scales,
+        "Opacity",
+        100.0,
+        STRENGTH_MIN,
+        STRENGTH_MAX,
+    )?;
+    let paint_flow_readout = widgets::insert_label(tree, paint, scales, flow_readout_text(100))?;
+    let paint_flow = widgets::insert_slider(
+        tree,
+        paint,
+        scales,
+        "Flow",
+        100.0,
+        STRENGTH_MIN,
+        STRENGTH_MAX,
+    )?;
+    for (id, item) in [
+        (paint_opacity_readout, OptionsItem::Readout),
+        (paint_opacity, OptionsItem::Slider),
+        (paint_flow_readout, OptionsItem::Readout),
+        (paint_flow, OptionsItem::Slider),
+    ] {
+        set_options_item(tree, scales, id, item, true)?;
+    }
+
     set_node_hidden(tree, gradient, true)?;
     set_node_hidden(tree, bucket, true)?;
     set_node_hidden(tree, smudge, true)?;
+    set_node_hidden(tree, paint, true)?;
     Ok(FillControls {
         gradient,
         radial,
@@ -248,6 +323,11 @@ pub fn insert_fill_controls(
         smudge,
         strength_readout,
         strength,
+        paint,
+        paint_opacity_readout,
+        paint_opacity,
+        paint_flow_readout,
+        paint_flow,
     })
 }
 
@@ -328,6 +408,9 @@ pub fn sync_fill_controls(
                 Tool::Smudge | Tool::Blur | Tool::Sharpen | Tool::Dodge | Tool::Burn | Tool::Sponge
             ),
         ),
+        // The Brush's, Pencil's and Clone Stamp's Opacity and Flow (0.228.0);
+        // they keep the radius controls.
+        (fill.paint, has_paint_opacity(tool)),
     ] {
         changed |= set_item_shown(tree, group, shown)?;
         changed |= set_node_hidden(tree, group, !shown)?;
@@ -368,12 +451,35 @@ pub fn sync_fill_controls(
     )?;
     changed |= widgets::set_slider_label(tree, fill.strength, strength_name(tool))?;
     changed |= sync_slider(tree, fill.strength, f64::from(strength), captured)?;
+
+    // The paint group (0.228.0): each tool shows its own values; the Pencil
+    // has no Flow, so its Flow readout and slider are hidden (layout and
+    // assistive technology).
+    let (opacity, flow) = match tool {
+        Tool::Pencil => (view.pencil_opacity, view.brush_flow),
+        Tool::CloneStamp => (view.clone_opacity, view.clone_flow),
+        _ => (view.brush_opacity, view.brush_flow),
+    };
+    changed |= widgets::set_label_text(
+        tree,
+        fill.paint_opacity_readout,
+        &opacity_readout_text(opacity),
+    )?;
+    changed |= sync_slider(tree, fill.paint_opacity, f64::from(opacity), captured)?;
+    changed |= widgets::set_label_text(tree, fill.paint_flow_readout, &flow_readout_text(flow))?;
+    changed |= sync_slider(tree, fill.paint_flow, f64::from(flow), captured)?;
+    let flow_shown = has_paint_flow(tool);
+    for id in [fill.paint_flow_readout, fill.paint_flow] {
+        changed |= set_item_shown(tree, id, flow_shown)?;
+        changed |= set_node_hidden(tree, id, !flow_shown)?;
+    }
     Ok(changed)
 }
 
 /// Whether the active tool's group is shown: `Some(tool)` for the group
 /// currently displayed (`Some(Tool::Smudge)` for the Strength group, which
-/// the Blur and the Sharpen share, 0.223.0).
+/// the Blur and the Sharpen share, 0.223.0; `Some(Tool::Brush)` for the
+/// Opacity and Flow group the Pencil and Clone Stamp share, 0.228.0).
 #[must_use]
 pub fn shown_fill_group(tree: &WidgetTree<WidgetKind>, controls: &ToolControls) -> Option<Tool> {
     let shown = |id| tree.style(id).is_some_and(|s| s.display != Display::None);
@@ -383,6 +489,8 @@ pub fn shown_fill_group(tree: &WidgetTree<WidgetKind>, controls: &ToolControls) 
         Some(Tool::PaintBucket)
     } else if shown(controls.fill.smudge) {
         Some(Tool::Smudge)
+    } else if shown(controls.fill.paint) {
+        Some(Tool::Brush)
     } else {
         None
     }
@@ -422,6 +530,11 @@ mod tests {
         dodge_exposure: 50,
         burn_exposure: 50,
         sponge_flow: 50,
+        brush_opacity: 100,
+        brush_flow: 100,
+        pencil_opacity: 100,
+        clone_opacity: 100,
+        clone_flow: 100,
     };
 
     fn built() -> (crate::Workspace, ToolControls) {
@@ -530,6 +643,11 @@ mod tests {
             dodge_exposure: 50,
             burn_exposure: 50,
             sponge_flow: 50,
+            brush_opacity: 100,
+            brush_flow: 100,
+            pencil_opacity: 100,
+            clone_opacity: 100,
+            clone_flow: 100,
         };
         assert!(sync(&mut ws, &controls, Tool::Gradient, view, None));
         assert!(!sync(&mut ws, &controls, Tool::Gradient, view, None));
@@ -625,7 +743,7 @@ mod tests {
         assert!((STRENGTH_MIN - 1.0).abs() < f64::EPSILON);
         assert!((STRENGTH_MAX - 100.0).abs() < f64::EPSILON);
         // Another tool hides it again (layout and assistive technology).
-        sync(&mut ws, &controls, Tool::Brush, view, None);
+        sync(&mut ws, &controls, Tool::Eraser, view, None);
         assert!(!shown(&ws.tree, fill.smudge));
         assert!(hidden_to_at(&ws.tree, fill.smudge));
         assert_eq!(shown_fill_group(&ws.tree, &controls), None);
@@ -721,5 +839,150 @@ mod tests {
                 other => unreachable!("{other:?}"),
             }
         }
+    }
+
+    fn paint_view() -> FillView {
+        FillView {
+            brush_opacity: 40,
+            brush_flow: 70,
+            pencil_opacity: 55,
+            clone_opacity: 25,
+            clone_flow: 90,
+            ..VIEW
+        }
+    }
+
+    fn slider_value(ws: &crate::Workspace, id: WidgetId) -> f64 {
+        match ws.tree.payload(id) {
+            Some(WidgetKind::Slider(s)) => s.value,
+            other => unreachable!("{other:?}"),
+        }
+    }
+
+    fn label_text(ws: &crate::Workspace, id: WidgetId) -> String {
+        match ws.tree.payload(id) {
+            Some(WidgetKind::Label(s)) => s.text.clone(),
+            other => unreachable!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_brush_pencil_and_clone_stamp_show_opacity_and_the_others_do_not() {
+        let (mut ws, controls) = built();
+        let fill = controls.fill;
+        for tool in Tool::ALL {
+            sync(&mut ws, &controls, tool, paint_view(), None);
+            ws.tree.compute_layout(1600.0, 900.0);
+            let wants = matches!(tool, Tool::Brush | Tool::Pencil | Tool::CloneStamp);
+            assert_eq!(shown(&ws.tree, fill.paint), wants, "{tool:?}");
+            assert_eq!(hidden_to_at(&ws.tree, fill.paint), !wants, "{tool:?}");
+            assert_eq!(super::has_paint_opacity(tool), wants, "{tool:?}");
+            let flow = matches!(tool, Tool::Brush | Tool::CloneStamp);
+            assert_eq!(super::has_paint_flow(tool), flow, "{tool:?}");
+            if wants {
+                for id in [fill.paint_flow_readout, fill.paint_flow] {
+                    assert_eq!(shown(&ws.tree, id), flow, "{tool:?} flow {id:?}");
+                    assert_eq!(hidden_to_at(&ws.tree, id), !flow, "{tool:?} flow {id:?}");
+                }
+                for id in [fill.paint_opacity_readout, fill.paint_opacity] {
+                    assert!(
+                        shown(&ws.tree, id) && !hidden_to_at(&ws.tree, id),
+                        "{tool:?}"
+                    );
+                    assert!(tool_controls_contains(&ws.tree, &controls, id));
+                    let Some(b) = ws.tree.bounds(id) else {
+                        unreachable!("laid out");
+                    };
+                    assert!(b.width > 0 && b.height > 0, "{tool:?} {id:?} {b:?}");
+                }
+                // They keep the radius.
+                assert!(shown(&ws.tree, controls.readout), "{tool:?}");
+            }
+        }
+        sync(&mut ws, &controls, Tool::Brush, paint_view(), None);
+        assert_eq!(shown_fill_group(&ws.tree, &controls), Some(Tool::Brush));
+        sync(&mut ws, &controls, Tool::Move, paint_view(), None);
+        assert_eq!(shown_fill_group(&ws.tree, &controls), None);
+    }
+
+    #[test]
+    fn each_paint_tool_mirrors_its_own_opacity_and_flow() {
+        let (mut ws, controls) = built();
+        let fill = controls.fill;
+        for (tool, opacity, flow) in [
+            (Tool::Brush, 40.0, 70.0),
+            (Tool::Pencil, 55.0, 70.0),
+            (Tool::CloneStamp, 25.0, 90.0),
+        ] {
+            sync(&mut ws, &controls, tool, paint_view(), None);
+            assert!(
+                (slider_value(&ws, fill.paint_opacity) - opacity).abs() < f64::EPSILON,
+                "{tool:?}"
+            );
+            assert_eq!(
+                label_text(&ws, fill.paint_opacity_readout),
+                format!("Opacity {opacity} %")
+            );
+            if super::has_paint_flow(tool) {
+                assert!(
+                    (slider_value(&ws, fill.paint_flow) - flow).abs() < f64::EPSILON,
+                    "{tool:?}"
+                );
+                assert_eq!(
+                    label_text(&ws, fill.paint_flow_readout),
+                    format!("Flow {flow} %")
+                );
+            }
+        }
+        assert_eq!(super::flow_readout_text(100), "Flow 100 %");
+        // A second identical sync changes nothing.
+        assert!(!sync(
+            &mut ws,
+            &controls,
+            Tool::CloneStamp,
+            paint_view(),
+            None
+        ));
+    }
+
+    #[test]
+    fn the_paint_sliders_are_named_and_ranged_for_assistive_technology() {
+        let (ws, controls) = built();
+        let fill = controls.fill;
+        for (id, name) in [(fill.paint_opacity, "Opacity"), (fill.paint_flow, "Flow")] {
+            let node = ws
+                .tree
+                .accessibility(id)
+                .and_then(|n| n.label().map(str::to_owned));
+            assert_eq!(node.as_deref(), Some(name));
+            match ws.tree.payload(id) {
+                Some(WidgetKind::Slider(s)) => {
+                    assert!((s.min - STRENGTH_MIN).abs() < f64::EPSILON);
+                    assert!((s.max - STRENGTH_MAX).abs() < f64::EPSILON);
+                    assert!((s.value - 100.0).abs() < f64::EPSILON, "default 100 %");
+                }
+                other => unreachable!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_paint_slider_mid_drag_keeps_its_value_but_the_readout_follows() {
+        let (mut ws, controls) = built();
+        let fill = controls.fill;
+        sync(&mut ws, &controls, Tool::Brush, VIEW, None);
+        let moved = FillView {
+            brush_opacity: 30,
+            ..VIEW
+        };
+        sync(
+            &mut ws,
+            &controls,
+            Tool::Brush,
+            moved,
+            Some(fill.paint_opacity),
+        );
+        assert!((slider_value(&ws, fill.paint_opacity) - 100.0).abs() < f64::EPSILON);
+        assert_eq!(label_text(&ws, fill.paint_opacity_readout), "Opacity 30 %");
     }
 }

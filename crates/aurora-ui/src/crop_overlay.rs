@@ -82,7 +82,7 @@ pub fn crop_handle_runs(
 /// token beneath the outline and the handles.
 ///
 /// The rectangle's edges are the very pixels the outline is drawn on
-/// ([`pixel_rect`]), so the shield meets the frame exactly. A rectangle
+/// (`pixel_rect`), so the shield meets the frame exactly. A rectangle
 /// wholly outside the canvas area shields the whole area; an empty
 /// rectangle, or a canvas area with no size, shields nothing (there is no
 /// crop to dim round).

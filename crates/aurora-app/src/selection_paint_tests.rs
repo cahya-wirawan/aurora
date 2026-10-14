@@ -4896,3 +4896,225 @@ fn a_pixel_lock_refuses_the_toning_press_and_a_missing_layer_has_its_own_notice(
     );
     assert_eq!(press(ToneKind::Sponge, true, None), None);
 }
+
+// -- Opacity and Flow of the paint tools (0.228.0) --------------------------
+
+/// The largest alpha anywhere in the layer's top-left `w x h`.
+fn max_alpha(rig: &mut Rig, w: u32, h: u32) -> f32 {
+    let mut best = 0.0_f32;
+    for y in 0..h {
+        for x in 0..w {
+            best = best.max(rig.at(x, y)[3]);
+        }
+    }
+    best
+}
+
+#[test]
+fn a_brush_stroke_crossing_itself_stays_under_its_opacity_and_is_one_undo_step() {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.settings.set_radius(Tool::Brush, 20.0);
+    rig.settings.brush_opacity = 50;
+    // Right, back left, right again: the same ground three times.
+    let path = [
+        (60.0, 100.0),
+        (300.0, 100.0),
+        (60.0, 104.0),
+        (300.0, 104.0),
+        (60.0, 98.0),
+    ];
+    assert!(rig.stroke(Tool::Brush, &path, false));
+    let capped = max_alpha(&mut rig, 600, 400);
+    assert!(
+        (capped - 0.5).abs() < 1.0e-3,
+        "alpha reaches the cap and not past it: {capped}"
+    );
+    assert_eq!(rig.undo_order.undo_labels, ["Brush Stroke"], "one step");
+    // The same strokes at 100 % are opaque there.
+    let mut full = Rig::new(rect(0, 0, 600, 400));
+    full.settings.set_radius(Tool::Brush, 20.0);
+    assert!(full.stroke(Tool::Brush, &path, false));
+    assert!(max_alpha(&mut full, 600, 400) > 0.99);
+    // Undo restores the blank layer exactly and redo the capped result.
+    let after = rig.snapshot(600, 400);
+    assert!(rig.undo(UndoDirection::Undo));
+    assert!(rig.snapshot(600, 400).iter().all(|t| *t == [0; 4]));
+    assert!(rig.undo(UndoDirection::Redo));
+    assert_eq!(rig.snapshot(600, 400), after);
+}
+
+#[test]
+fn a_second_stroke_starts_from_the_first_strokes_result() {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.settings.set_radius(Tool::Brush, 20.0);
+    rig.settings.brush_opacity = 50;
+    assert!(rig.stroke(Tool::Brush, &[(100.5, 100.5), (101.5, 100.5)], false));
+    let first = rig.at(100, 100)[3];
+    assert!((first - 0.5).abs() < 1.0e-3);
+    assert!(rig.stroke(Tool::Brush, &[(100.5, 100.5), (101.5, 100.5)], false));
+    let second = rig.at(100, 100)[3];
+    assert!((second - 0.75).abs() < 2.0e-3, "0.5 + 0.5 * 0.5: {second}");
+    assert_eq!(rig.undo_order.undo_labels.len(), 2);
+}
+
+#[test]
+fn the_brushs_flow_scales_each_dab_and_the_pencil_has_none() {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.settings.set_radius(Tool::Brush, 20.0);
+    rig.settings.brush_flow = 40;
+    // The Brush's Flow is not the Pencil's: set it low and the Pencil is
+    // still a full-strength replacement.
+    assert!(rig.stroke(Tool::Brush, &[(100.5, 100.5), (101.5, 100.5)], false));
+    assert!((max_alpha(&mut rig, 600, 400) - 0.4).abs() < 1.0e-3);
+    let mut pencil = Rig::new(rect(0, 0, 600, 400));
+    pencil.settings.set_radius(Tool::Pencil, 3.0);
+    pencil.settings.brush_flow = 10;
+    pencil.settings.brush_opacity = 10;
+    assert!(pencil.stroke(Tool::Pencil, &[(50.5, 50.5), (51.5, 50.5)], false));
+    assert_eq!(
+        pencil.at(50, 50),
+        [1.0, 0.0, 0.0, 1.0],
+        "neither setting touches it"
+    );
+}
+
+#[test]
+fn the_pencils_opacity_blends_toward_its_colour_once_however_often_it_crosses() {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.settings.set_radius(Tool::Pencil, 3.0);
+    rig.settings.pencil_opacity = 40;
+    rig.rect_fill(40, 40, 70, 60, [0.0, 0.0, 0.5, 1.0]);
+    let path = [(50.5, 50.5), (60.5, 50.5), (50.5, 50.5), (60.5, 50.5)];
+    assert!(rig.stroke(Tool::Pencil, &path, false));
+    let t = rig.at(55, 50);
+    // RED over (0, 0, 0.5, 1): start + (colour - start) * 0.4.
+    let want = [0.4, 0.0, 0.5 - 0.5 * 0.4, 1.0];
+    for c in 0..4 {
+        assert!(
+            (t[c] - want[c]).abs() < 1.5e-3,
+            "channel {c}: {t:?} vs {want:?}"
+        );
+    }
+    assert_eq!(rig.undo_order.undo_labels, ["Pencil Stroke"]);
+}
+
+#[test]
+fn opacity_composes_with_the_selection_and_the_transparency_lock() {
+    // Through a selection: nothing outside, never past the cap inside.
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.marquee((100.0, 80.0), (300.0, 260.0));
+    let sel = rect(100, 80, 200, 180);
+    rig.settings.set_radius(Tool::Brush, 25.0);
+    rig.settings.brush_opacity = 30;
+    assert!(rig.stroke(
+        Tool::Brush,
+        &[(60.0, 170.0), (340.0, 170.0), (60.0, 172.0)],
+        false
+    ));
+    let mut inside_max = 0.0_f32;
+    for y in 0..400_u32 {
+        for x in 0..600_u32 {
+            let a = rig.at(x, y)[3];
+            if inside(sel, i64::from(x), i64::from(y)) {
+                inside_max = inside_max.max(a);
+            } else {
+                assert_eq!(a, 0.0, "nothing outside at ({x}, {y})");
+            }
+        }
+    }
+    assert!((inside_max - 0.3).abs() < 1.0e-3, "{inside_max}");
+    // The transparency lock keeps alpha bit for bit and respects the cap:
+    // the colour ends at start + (colour * alpha - start) * opacity.
+    let mut locked = Rig::new(rect(0, 0, 600, 400));
+    locked.settings.set_radius(Tool::Brush, 10.0);
+    locked.settings.brush_opacity = 50;
+    locked.rect_fill(80, 80, 140, 120, [0.0, 0.0, 0.25, 0.5]);
+    let before_alpha = locked.at(100, 100)[3];
+    let path = [(90.0, 100.0), (130.0, 100.0), (90.0, 100.0), (130.0, 100.0)];
+    assert!(locked.stroke(Tool::Brush, &path, true));
+    let t = locked.at(110, 100);
+    assert_eq!(t[3].to_bits(), before_alpha.to_bits(), "alpha kept");
+    // RED at alpha 0.5 is (0.5, 0, 0); half of the way from (0, 0, 0.25).
+    let want = [0.25, 0.0, 0.125];
+    for c in 0..3 {
+        assert!((t[c] - want[c]).abs() < 1.5e-3, "channel {c}: {t:?}");
+    }
+}
+
+#[test]
+fn the_eraser_ignores_the_brushs_opacity_and_flow() {
+    let run = |opacity: u8, flow: u8| {
+        let mut rig = Rig::new(rect(0, 0, 600, 400));
+        rig.rect_fill(40, 40, 140, 100, [0.5, 0.5, 0.5, 1.0]);
+        rig.settings.set_radius(Tool::Eraser, 15.0);
+        rig.settings.brush_opacity = opacity;
+        rig.settings.brush_flow = flow;
+        rig.settings.pencil_opacity = opacity;
+        rig.settings.clone_opacity = opacity;
+        rig.settings.clone_flow = flow;
+        assert!(rig.stroke(Tool::Eraser, &[(60.0, 70.0), (120.0, 70.0)], false));
+        rig.snapshot(200, 150)
+    };
+    assert_eq!(run(100, 100), run(5, 5));
+}
+
+#[test]
+fn quick_mask_brush_ignores_opacity_and_flow() {
+    let run = |opacity: u8, flow: u8| {
+        let mut rig = Rig::new(rect(0, 0, 400, 300));
+        rig.settings.brush_opacity = opacity;
+        rig.settings.brush_flow = flow;
+        rig.settings.pencil_opacity = opacity;
+        let mut mode = rig.qm_enter();
+        fill_mask(&mut mode, 0);
+        let colours = white_on_black();
+        for tool in [DabTool::Brush, DabTool::Pencil] {
+            let _ = quick_mask::paint_dab(&mut mode, tool, (150.0, 150.0), &rig.settings, &colours);
+            let _ = quick_mask::paint_dab(&mut mode, tool, (170.0, 152.0), &rig.settings, &colours);
+        }
+        (0..300_i64)
+            .flat_map(|y| (0..400_i64).map(move |x| (x, y)))
+            .map(|(x, y)| mode.mask.byte_at(x, y))
+            .collect::<Vec<u8>>()
+    };
+    let full = run(100, 100);
+    assert!(full.contains(&255), "the dabs did paint");
+    assert_eq!(full, run(10, 10));
+}
+
+#[test]
+fn a_clone_stroke_honours_its_own_opacity_and_flow_and_not_the_brushs() {
+    let colour_after = |brush_opacity: u8, clone_opacity: u8, clone_flow: u8| {
+        let mut rig = clone_rig();
+        rig.settings.brush_opacity = brush_opacity;
+        rig.settings.brush_flow = brush_opacity;
+        rig.settings.clone_opacity = clone_opacity;
+        rig.settings.clone_flow = clone_flow;
+        // The destination holds a flat grey the clone is blended into.
+        rig.rect_fill(40, 50, 70, 80, [0.25, 0.25, 0.25, 1.0]);
+        let mut state = crate::clone_stamp::CloneStamp::default();
+        let _ = rig.clone_stroke(&mut state, true, &[(210.5, 110.5)], false);
+        let (_, recorded) = rig.clone_stroke(
+            &mut state,
+            false,
+            &[(50.5, 60.5), (51.5, 60.5), (50.5, 60.5)],
+            false,
+        );
+        assert!(recorded);
+        assert_eq!(rig.undo_order.undo_labels, ["Clone Stamp Stroke"]);
+        (rig.at(50, 60), rig.at(210, 110))
+    };
+    let (exact, source) = colour_after(100, 100, 100);
+    assert_eq!(exact, source, "defaults copy exactly");
+    // The Brush's settings do not reach the Clone Stamp.
+    assert_eq!(colour_after(10, 100, 100).0, exact);
+    // Opacity 50: halfway from the grey to the source, repeated dabs or not.
+    let (half, _) = colour_after(100, 50, 100);
+    for c in 0..3 {
+        let want = 0.25 + (source[c] - 0.25) * 0.5;
+        assert!((half[c] - want).abs() < 1.5e-3, "channel {c}: {half:?}");
+    }
+    // Flow below 100 % never reaches an exact copy at the centre.
+    let (soft, _) = colour_after(100, 100, 50);
+    assert_ne!(soft, exact);
+}

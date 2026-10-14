@@ -175,7 +175,7 @@ pub(crate) fn clone_dab_through_selection(
 ) -> aurora_brush::DabOutcome {
     let local = crate::layer_local_point(bounds, doc_point);
     let cover = crate::selection_paint::layer_selection(selection, bounds);
-    aurora_brush::clone_dab_covered(
+    aurora_brush::clone_dab_amount(
         store,
         surface,
         local,
@@ -184,5 +184,6 @@ pub(crate) fn clone_dab_through_selection(
         preserve_alpha,
         crate::brush_stroke_mut(drag),
         crate::selection_paint::as_coverage(cover.as_ref()),
+        settings.clone_amount(),
     )
 }

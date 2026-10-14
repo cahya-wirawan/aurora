@@ -945,12 +945,12 @@ fn brush_and_eraser_keep_their_radius_row_and_fill_tools_replace_it() {
     let radius_shown =
         |bar: &Bar| aurora_ui::radius_slider_shown(&bar.workspace.tree, &bar.controls);
     for (tool, radius, group) in [
-        (Tool::Brush, true, None),
+        (Tool::Brush, true, Some(Tool::Brush)),
         (Tool::Eraser, true, None),
         (Tool::Gradient, false, Some(Tool::Gradient)),
         (Tool::PaintBucket, false, Some(Tool::PaintBucket)),
         (Tool::Move, false, None),
-        (Tool::Brush, true, None),
+        (Tool::Brush, true, Some(Tool::Brush)),
     ] {
         crate::sync_tool_controls(
             &mut bar.workspace,
@@ -1100,7 +1100,7 @@ fn the_options_bar_edits_the_smudge_strength_and_mirrors_it() {
     crate::sync_tool_controls(
         &mut bar.workspace,
         Some(bar.controls),
-        Tool::Brush,
+        Tool::Eraser,
         &bar.settings,
         None,
     );
@@ -1259,7 +1259,7 @@ fn the_options_bar_edits_exposure_and_flow_each_on_its_own_under_their_own_name(
     crate::sync_tool_controls(
         &mut bar.workspace,
         Some(bar.controls),
-        Tool::Brush,
+        Tool::Eraser,
         &bar.settings,
         None,
     );
@@ -1357,4 +1357,227 @@ fn the_range_and_mode_checkboxes_set_the_tone_settings_and_stay_radio_groups() {
     );
     assert!(!shown(&bar, tone.range_group));
     assert!(!shown(&bar, tone.mode_group));
+}
+
+// -- Opacity and Flow of the paint tools (0.228.0) --------------------------
+
+#[test]
+fn the_paint_settings_default_to_a_hundred_percent_and_map_to_the_engine_per_tool() {
+    use aurora_brush::PaintAmount;
+    let mut settings = ToolSettings::default();
+    for tool in [DabTool::Brush, DabTool::Pencil, DabTool::Eraser] {
+        assert_eq!(settings.paint_amount(tool), PaintAmount::FULL, "{tool:?}");
+    }
+    assert_eq!(settings.clone_amount(), PaintAmount::FULL);
+    settings.brush_opacity = 40;
+    settings.brush_flow = 70;
+    settings.pencil_opacity = 55;
+    settings.clone_opacity = 25;
+    settings.clone_flow = 90;
+    assert_eq!(
+        settings.paint_amount(DabTool::Brush),
+        PaintAmount::new(0.40, 0.70)
+    );
+    // The Pencil has an Opacity of its own and no Flow, whatever the Brush's.
+    assert_eq!(
+        settings.paint_amount(DabTool::Pencil),
+        PaintAmount::new(0.55, 1.0)
+    );
+    // The Eraser is unchanged by every one of them.
+    assert_eq!(settings.paint_amount(DabTool::Eraser), PaintAmount::FULL);
+    assert_eq!(settings.clone_amount(), PaintAmount::new(0.25, 0.90));
+}
+
+#[test]
+fn the_setters_round_clamp_and_refuse_a_non_finite_value_and_a_tool_without_the_setting() {
+    let mut s = ToolSettings::default();
+    assert!(s.set_paint_percent(Tool::Brush, false, 33.4));
+    assert_eq!(s.brush_opacity, 33);
+    assert!(!s.set_paint_percent(Tool::Brush, false, 33.0), "unchanged");
+    assert!(s.set_paint_percent(Tool::Brush, false, 900.0));
+    assert_eq!(s.brush_opacity, 100);
+    assert!(s.set_paint_percent(Tool::Brush, false, -4.0));
+    assert_eq!(s.brush_opacity, 1);
+    assert!(!s.set_paint_percent(Tool::Brush, false, f64::NAN));
+    assert!(!s.set_paint_percent(Tool::Brush, true, f64::INFINITY));
+    assert!(s.set_paint_percent(Tool::Brush, true, 12.0));
+    assert_eq!(s.brush_flow, 12);
+    // The Pencil: Opacity only.
+    assert!(s.set_paint_percent(Tool::Pencil, false, 60.0));
+    assert_eq!(s.pencil_opacity, 60);
+    assert!(!s.set_paint_percent(Tool::Pencil, true, 60.0));
+    assert!(s.set_paint_percent(Tool::CloneStamp, false, 20.0));
+    assert!(s.set_paint_percent(Tool::CloneStamp, true, 30.0));
+    assert_eq!((s.clone_opacity, s.clone_flow), (20, 30));
+    // The Eraser and the rest have none; nothing else moved.
+    for tool in [Tool::Eraser, Tool::Smudge, Tool::Move, Tool::Gradient] {
+        assert!(!s.set_paint_percent(tool, false, 50.0), "{tool:?}");
+        assert!(!s.set_paint_percent(tool, true, 50.0), "{tool:?}");
+    }
+    assert_eq!((s.brush_opacity, s.brush_flow), (1, 12));
+    assert_eq!(s.pencil_opacity, 60);
+}
+
+#[test]
+fn the_options_bar_edits_the_brush_pencil_and_clone_opacity_and_flow_each_on_its_own() {
+    use aurora_widgets::ActionOutcome as A;
+    let mut bar = Bar::new();
+    let fill = bar.controls.fill;
+    let label = |bar: &Bar, id| match bar.workspace.tree.payload(id) {
+        Some(WidgetKind::Label(s)) => s.text.clone(),
+        other => unreachable!("{other:?}"),
+    };
+    let sync = |bar: &mut Bar, tool| {
+        crate::sync_tool_controls(
+            &mut bar.workspace,
+            Some(bar.controls),
+            tool,
+            &bar.settings,
+            None,
+        );
+    };
+    sync(&mut bar, Tool::Brush);
+    assert_eq!(label(&bar, fill.paint_opacity_readout), "Opacity 100 %");
+    assert_eq!(label(&bar, fill.paint_flow_readout), "Flow 100 %");
+    assert!(bar.outcome(
+        Tool::Brush,
+        A::ValueChanged {
+            id: fill.paint_opacity,
+            value: 62.4
+        }
+    ));
+    assert!(bar.outcome(
+        Tool::Brush,
+        A::ValueChanged {
+            id: fill.paint_flow,
+            value: 35.0
+        }
+    ));
+    assert!(!bar.outcome(
+        Tool::Brush,
+        A::ValueChanged {
+            id: fill.paint_opacity,
+            value: f64::NAN
+        }
+    ));
+    assert_eq!(
+        (bar.settings.brush_opacity, bar.settings.brush_flow),
+        (62, 35)
+    );
+    assert_eq!(label(&bar, fill.paint_opacity_readout), "Opacity 62 %");
+    assert_eq!(label(&bar, fill.paint_flow_readout), "Flow 35 %");
+    // The Pencil starts from its own 100 % and leaves the Brush's alone.
+    sync(&mut bar, Tool::Pencil);
+    assert_eq!(label(&bar, fill.paint_opacity_readout), "Opacity 100 %");
+    assert!(bar.outcome(
+        Tool::Pencil,
+        A::ValueChanged {
+            id: fill.paint_opacity,
+            value: 45.0
+        }
+    ));
+    // The Pencil's hidden Flow slider cannot edit anything.
+    assert!(!bar.outcome(
+        Tool::Pencil,
+        A::ValueChanged {
+            id: fill.paint_flow,
+            value: 5.0
+        }
+    ));
+    assert_eq!(bar.settings.pencil_opacity, 45);
+    assert_eq!(
+        (bar.settings.brush_opacity, bar.settings.brush_flow),
+        (62, 35)
+    );
+    // The Clone Stamp has both, its own.
+    sync(&mut bar, Tool::CloneStamp);
+    assert_eq!(label(&bar, fill.paint_flow_readout), "Flow 100 %");
+    assert!(bar.outcome(
+        Tool::CloneStamp,
+        A::ValueChanged {
+            id: fill.paint_opacity,
+            value: 20.0
+        }
+    ));
+    assert!(bar.outcome(
+        Tool::CloneStamp,
+        A::ValueChanged {
+            id: fill.paint_flow,
+            value: 80.0
+        }
+    ));
+    assert_eq!(
+        (bar.settings.clone_opacity, bar.settings.clone_flow),
+        (20, 80)
+    );
+    assert_eq!(bar.settings.pencil_opacity, 45);
+    // Back to the Brush: its values are mirrored again.
+    sync(&mut bar, Tool::Brush);
+    assert_eq!(label(&bar, fill.paint_opacity_readout), "Opacity 62 %");
+    assert_eq!(label(&bar, fill.paint_flow_readout), "Flow 35 %");
+    assert_eq!(
+        aurora_ui::shown_fill_group(&bar.workspace.tree, &bar.controls),
+        Some(Tool::Brush)
+    );
+}
+
+#[test]
+fn with_measured_text_the_paint_options_fit_the_bar_without_changing_its_height() {
+    // A 1600 px window (a ~1200 px options bar). Narrower than about 900 px
+    // the readouts, which take only spare width, collapse before the sliders
+    // shrink (the Gradient group does the same); disclosed in PLAN.md.
+    const WIDE: f32 = 1600.0;
+    let scales = crate::test_workspace_scales();
+    let mut bar = Bar::new();
+    let Ok(mut engine) = aurora_text::TextEngine::new() else {
+        unreachable!("the bundled font loads");
+    };
+    let mut height_of = |bar: &mut Bar, tool: Tool| {
+        crate::sync_tool_controls(
+            &mut bar.workspace,
+            Some(bar.controls),
+            tool,
+            &bar.settings,
+            None,
+        );
+        aurora_widgets::compute_text_layout(
+            &mut bar.workspace.tree,
+            WIDE,
+            H,
+            Some(aurora_widgets::TextMeasure {
+                engine: &mut engine,
+                scales: &scales,
+                scale_factor: 1.0,
+            }),
+        );
+        bar.workspace
+            .tree
+            .bounds(bar.workspace.options_bar)
+            .map_or(0, |b| b.height)
+    };
+    let reference = height_of(&mut bar, Tool::Move);
+    for tool in [Tool::Brush, Tool::Pencil, Tool::CloneStamp] {
+        assert_eq!(height_of(&mut bar, tool), reference, "{tool:?}");
+        let Some(strip) = bar.workspace.tree.bounds(bar.workspace.options_bar) else {
+            unreachable!("laid out");
+        };
+        let fill = bar.controls.fill;
+        let mut ids = vec![fill.paint_opacity_readout, fill.paint_opacity];
+        if aurora_ui::has_paint_flow(tool) {
+            ids.extend([fill.paint_flow_readout, fill.paint_flow]);
+        }
+        let mut previous_right = strip.x;
+        for id in ids {
+            let Some(b) = bar.workspace.tree.bounds(id) else {
+                unreachable!("laid out");
+            };
+            assert!(b.width >= 20, "{tool:?} {id:?} is measured: {b:?}");
+            assert!(
+                b.x >= previous_right,
+                "{tool:?} {id:?} overlaps a neighbour"
+            );
+            assert!(b.right() <= strip.right(), "{tool:?} {id:?} fits the bar");
+            previous_right = b.right();
+        }
+    }
 }

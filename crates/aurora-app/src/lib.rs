@@ -8441,6 +8441,17 @@ fn apply_fill_control_outcome(
         ActionOutcome::ValueChanged { id, value } if *id == fill.tolerance => {
             settings.set_tolerance(*value)
         }
+        // The Brush's, Pencil's and Clone Stamp's Opacity and Flow (0.228.0):
+        // the tool in force owns the slider (the Brush's in every other
+        // state, where it is not shown).
+        ActionOutcome::ValueChanged { id, value } if *id == fill.paint_opacity => {
+            let owner = paint_slider_owner(tool);
+            settings.set_paint_percent(owner, false, *value)
+        }
+        ActionOutcome::ValueChanged { id, value } if *id == fill.paint_flow => {
+            let owner = paint_slider_owner(tool);
+            settings.set_paint_percent(owner, true, *value)
+        }
         ActionOutcome::ValueChanged { id, value } if *id == fill.strength => {
             // The Blur, Sharpen, Dodge, Burn and Sponge edit their own; the
             // slider is the Smudge's in every other state (0.222.0's
@@ -8463,6 +8474,16 @@ fn apply_fill_control_outcome(
     };
     let _ = sync_tool_controls(workspace, Some(*controls), tool, settings, captured);
     changed
+}
+
+/// The tool whose Opacity or Flow the shared paint sliders edit (0.228.0):
+/// the Pencil and the Clone Stamp each own their own, the Brush every other
+/// state's.
+fn paint_slider_owner(tool: aurora_ui::Tool) -> aurora_ui::Tool {
+    match tool {
+        aurora_ui::Tool::Pencil | aurora_ui::Tool::CloneStamp => tool,
+        _ => aurora_ui::Tool::Brush,
+    }
 }
 
 /// Applies one routed Properties-panel tool-control outcome (0.136.0):
@@ -26110,7 +26131,22 @@ struct ToolSettings {
     tone_range: aurora_brush::ToneRange,
     /// The Sponge's mode (0.224.0; default Desaturate).
     sponge_mode: aurora_brush::SpongeMode,
+    /// The Brush's Opacity, 1..=100 percent (0.228.0; default 100): a
+    /// per-stroke ceiling, see `aurora_brush::PaintAmount`.
+    brush_opacity: u8,
+    /// The Brush's Flow, 1..=100 percent (0.228.0; default 100).
+    brush_flow: u8,
+    /// The Pencil's Opacity, 1..=100 percent (0.228.0; default 100). The
+    /// Pencil has no Flow.
+    pencil_opacity: u8,
+    /// The Clone Stamp's Opacity, 1..=100 percent (0.228.0; default 100).
+    clone_opacity: u8,
+    /// The Clone Stamp's Flow, 1..=100 percent (0.228.0; default 100).
+    clone_flow: u8,
 }
+
+/// The default Opacity and Flow of the paint tools, percent (0.228.0).
+const DEFAULT_PAINT_PERCENT: u8 = 100;
 
 /// The Smudge's default strength, percent (0.222.0).
 const DEFAULT_SMUDGE_STRENGTH: u8 = 50;
@@ -26138,6 +26174,11 @@ impl Default for ToolSettings {
             sponge_flow: DEFAULT_SMUDGE_STRENGTH,
             tone_range: aurora_brush::ToneRange::Midtones,
             sponge_mode: aurora_brush::SpongeMode::Desaturate,
+            brush_opacity: DEFAULT_PAINT_PERCENT,
+            brush_flow: DEFAULT_PAINT_PERCENT,
+            pencil_opacity: DEFAULT_PAINT_PERCENT,
+            clone_opacity: DEFAULT_PAINT_PERCENT,
+            clone_flow: DEFAULT_PAINT_PERCENT,
         }
     }
 }
@@ -26157,7 +26198,58 @@ impl ToolSettings {
             dodge_exposure: self.dodge_exposure,
             burn_exposure: self.burn_exposure,
             sponge_flow: self.sponge_flow,
+            brush_opacity: self.brush_opacity,
+            brush_flow: self.brush_flow,
+            pencil_opacity: self.pencil_opacity,
+            clone_opacity: self.clone_opacity,
+            clone_flow: self.clone_flow,
         }
+    }
+
+    /// The Opacity and Flow `tool`'s dabs stamp with (0.228.0): the Brush's
+    /// and the Pencil's own Opacity (the Pencil has no Flow, so it reads as
+    /// 100 %); the Eraser has neither and is unchanged.
+    fn paint_amount(&self, tool: DabTool) -> aurora_brush::PaintAmount {
+        let fraction = |percent: u8| f32::from(percent) / 100.0;
+        match tool {
+            DabTool::Brush => aurora_brush::PaintAmount::new(
+                fraction(self.brush_opacity),
+                fraction(self.brush_flow),
+            ),
+            DabTool::Pencil => aurora_brush::PaintAmount::new(fraction(self.pencil_opacity), 1.0),
+            DabTool::Eraser => aurora_brush::PaintAmount::FULL,
+        }
+    }
+
+    /// The Clone Stamp's Opacity and Flow (0.228.0).
+    fn clone_amount(&self) -> aurora_brush::PaintAmount {
+        aurora_brush::PaintAmount::new(
+            f32::from(self.clone_opacity) / 100.0,
+            f32::from(self.clone_flow) / 100.0,
+        )
+    }
+
+    /// Sets the Opacity (`flow` false) or Flow (`flow` true) of `tool` from a
+    /// slider value (rounded, clamped to 1..=100; non-finite refused). Only
+    /// the Brush, Pencil (Opacity) and Clone Stamp have them; any other tool
+    /// changes nothing. Returns whether it changed.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn set_paint_percent(&mut self, tool: aurora_ui::Tool, flow: bool, value: f64) -> bool {
+        if !value.is_finite() {
+            return false;
+        }
+        let percent = value.round().clamp(1.0, 100.0) as u8;
+        let slot = match (tool, flow) {
+            (aurora_ui::Tool::Brush, false) => &mut self.brush_opacity,
+            (aurora_ui::Tool::Brush, true) => &mut self.brush_flow,
+            (aurora_ui::Tool::Pencil, false) => &mut self.pencil_opacity,
+            (aurora_ui::Tool::CloneStamp, false) => &mut self.clone_opacity,
+            (aurora_ui::Tool::CloneStamp, true) => &mut self.clone_flow,
+            _ => return false,
+        };
+        let changed = percent != *slot;
+        *slot = percent;
+        changed
     }
 
     /// Sets the strength of `tool` (the Smudge, Blur, Sharpen, or the Dodge's
@@ -26707,7 +26799,9 @@ fn stamp_tool_dab_covered(
 ) -> aurora_brush::DabOutcome {
     let radius = settings.dab_radius(tool);
     match tool {
-        DabTool::Brush if preserve_alpha => aurora_brush::stamp_dab_preserving_alpha_covered(
+        // The Brush and the Pencil stamp with their Opacity and Flow
+        // (0.228.0); at 100 % each is exactly the earlier entry point.
+        DabTool::Brush | DabTool::Pencil => aurora_brush::stamp_dab_amount(
             store,
             surface,
             local,
@@ -26715,33 +26809,9 @@ fn stamp_tool_dab_covered(
             colour,
             brush_stroke_mut(drag),
             coverage,
-        ),
-        DabTool::Brush => aurora_brush::stamp_dab_covered(
-            store,
-            surface,
-            local,
-            radius,
-            colour,
-            brush_stroke_mut(drag),
-            coverage,
-        ),
-        DabTool::Pencil if preserve_alpha => aurora_brush::stamp_dab_hard_preserving_alpha_covered(
-            store,
-            surface,
-            local,
-            radius,
-            colour,
-            brush_stroke_mut(drag),
-            coverage,
-        ),
-        DabTool::Pencil => aurora_brush::stamp_dab_hard_covered(
-            store,
-            surface,
-            local,
-            radius,
-            colour,
-            brush_stroke_mut(drag),
-            coverage,
+            preserve_alpha,
+            tool == DabTool::Pencil,
+            settings.paint_amount(tool),
         ),
         DabTool::Eraser => aurora_brush::erase_dab_covered(
             store,
