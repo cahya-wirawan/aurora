@@ -141,7 +141,7 @@ rfd = "0.17"
 # support this workspace has no use for yet (nothing copies/pastes
 # pixels) -- text only, the same "declare only what's used" discipline
 # `aurora-widgets`' own headless-mode work already established.
-arboard = { version = "3", default-features = false }
+arboard = { version = "3", default-features = false, features = ["image-data"] }
 # The real per-platform app-support directory for durable user
 # preferences (starting with the docked-workspace layout: rail width,
 # panel collapsed state) -- unlike `aurora-app`'s own `marker_path`/
