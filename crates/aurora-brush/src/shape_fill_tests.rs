@@ -391,3 +391,27 @@ fn a_small_shape_in_a_huge_area_only_counts_the_tiles_it_reaches() {
     assert!(out.is_ok_and(|o| o.painted().len() == 1));
     assert_eq!(get(&mut s, 15, 15)[3], f16::ONE);
 }
+
+#[test]
+fn the_transparency_lock_recolours_by_the_amount_toward_colour_times_alpha() {
+    let (_d, mut s) = store();
+    put(&mut s, 3, 3, [h(0.0), h(0.0), h(0.5), h(0.5)]);
+    let shape = Block(rect(0, 0, 8, 8), 1.0);
+    let out = fill_with_coverage(
+        &mut s,
+        surface(),
+        (0, 0, 8, 8),
+        &shape,
+        &spec(0.25),
+        FillMode::PreserveAlpha,
+        None,
+        None,
+    );
+    assert!(out.is_ok());
+    let px = get(&mut s, 3, 3).map(f16::to_f32);
+    // red: 0 * 0.75 + 1.0 * 0.5 * 0.25; blue: 0.5 * 0.75 + 0 * 0.5 * 0.25
+    assert!((px[0] - 0.125).abs() < 1e-3, "{px:?}");
+    assert!((px[1] - 0.25 * 0.25 * 0.5).abs() < 1e-3, "{px:?}");
+    assert!((px[2] - 0.375).abs() < 1e-3, "{px:?}");
+    assert_eq!(px[3], 0.5);
+}

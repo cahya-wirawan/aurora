@@ -229,3 +229,33 @@ fn make_work_path_names_an_empty_selection() {
     );
     assert!(paths.is_empty(), "nothing was created");
 }
+
+#[test]
+fn make_work_path_keeps_every_subpath_of_a_selection_with_a_hole() {
+    let mut paths = PathSet::new();
+    let ring = aurora_doc::SelectionMask::rasterize(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 60,
+        },
+        |x, y| {
+            let d = ((x - 30) as f64).hypot((y - 30) as f64);
+            if (8.0..25.0).contains(&d) { 1.0 } else { 0.0 }
+        },
+    );
+    let Ok(ring) = ring else {
+        unreachable!("mask");
+    };
+    let sel = Selection::from_mask(Arc::new(ring));
+    let step = make_work_path(&mut paths, &sel, (100, 100));
+    assert!(matches!(step, Ok(Some(_))));
+    let work = paths.work().unwrap_or_else(|| unreachable!("work path"));
+    assert_eq!(work.subpaths.len(), 2, "the outer boundary and the hole");
+    assert!(
+        work.subpaths
+            .iter()
+            .all(|s| s.closed && s.anchors.len() >= 4)
+    );
+}
