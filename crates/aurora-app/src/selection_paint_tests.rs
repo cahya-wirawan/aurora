@@ -3506,6 +3506,7 @@ fn entering_quick_mask_mid_stroke_commits_the_layer_stroke_first() {
         smudge: None,
         filter: None,
         tone: None,
+        heal: None,
         last_doc: (0.0, 0.0),
         carry: 0.0,
         stroke: Some(aurora_brush::StrokeSnapshot::new(rig.surface)),

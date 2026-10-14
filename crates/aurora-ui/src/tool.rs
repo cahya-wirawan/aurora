@@ -118,13 +118,17 @@ pub enum Tool {
     Crop,
     /// Draws Bezier paths (0.233.0): real, in `aurora-app`'s `path_pen`.
     Pen,
+    /// Paints a blemish away (0.237.0): the stroke only collects the area
+    /// and the release heals it, real via `aurora_brush::spot_heal_covered`
+    /// in `aurora-app`.
+    SpotHealing,
 }
 
 impl Tool {
     /// Every tool this enum has today, in the fixed order they're
     /// offered to the user (matches PLAN.md's own bullets: Move, Marquee
     /// Select, Zoom, Pan, Eyedropper, then Brush, Eraser, and the 0.209.0 fills Gradient and Paint Bucket).
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::Move,
         Self::MarqueeSelect,
         Self::EllipticalMarquee,
@@ -140,6 +144,7 @@ impl Tool {
         Self::Eraser,
         Self::CloneStamp,
         Self::Smudge,
+        Self::SpotHealing,
         Self::Blur,
         Self::Sharpen,
         Self::Dodge,
@@ -192,6 +197,7 @@ impl Tool {
             Self::Sponge => "Sponge",
             Self::Crop => "Crop",
             Self::Pen => "Pen",
+            Self::SpotHealing => "Spot Healing",
         }
     }
 
@@ -217,6 +223,7 @@ impl Tool {
             Self::Dodge | Self::Burn => 'O',
             Self::Sponge | Self::Pen => 'P',
             Self::Crop => 'C',
+            Self::SpotHealing => 'J',
         }
     }
 
@@ -292,11 +299,11 @@ mod tests {
 
     #[test]
     fn all_lists_every_variant_once() {
-        assert_eq!(Tool::ALL.len(), 23);
+        assert_eq!(Tool::ALL.len(), 24);
         let mut seen = Tool::ALL.to_vec();
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
-        assert_eq!(seen.len(), 23, "ALL must not repeat a variant");
+        assert_eq!(seen.len(), 24, "ALL must not repeat a variant");
     }
 
     #[test]
@@ -327,6 +334,7 @@ mod tests {
         assert_eq!(Tool::Pencil.shortcut_text(), "Shift+B");
         assert_eq!(Tool::CloneStamp.shortcut_text(), "S");
         assert_eq!(Tool::Smudge.shortcut_text(), "R");
+        assert_eq!(Tool::SpotHealing.shortcut_text(), "J");
         assert_eq!(Tool::Blur.shortcut_text(), "Shift+R");
         assert_eq!(Tool::Sharpen.shortcut_text(), "Shift+S");
         assert_eq!(Tool::Dodge.shortcut_text(), "O");

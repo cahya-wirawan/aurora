@@ -147,11 +147,13 @@ pub enum IconKind {
     Crop,
     /// A pen nib: the Pen tool (0.233.0).
     Pen,
+    /// A diagonal sticking plaster: the Spot Healing tool (0.237.0).
+    SpotHealing,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 43] = [
+    pub const ALL: [IconKind; 44] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -195,6 +197,7 @@ impl IconKind {
         IconKind::Sponge,
         IconKind::Crop,
         IconKind::Pen,
+        IconKind::SpotHealing,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -245,6 +248,7 @@ impl IconKind {
             IconKind::Sponge => "Sponge",
             IconKind::Crop => "Crop",
             IconKind::Pen => "Pen",
+            IconKind::SpotHealing => "Spot Healing",
         }
     }
 }
@@ -834,6 +838,22 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
                 .l(7.0, 6.5)
                 .closed(),
         ],
+        IconKind::SpotHealing => vec![
+            // A diagonal sticking plaster: the strip, and the pad at its
+            // middle.
+            stroke_part()
+                .m(14.4, 5.2)
+                .l(10.8, 1.6)
+                .l(1.6, 10.8)
+                .l(5.2, 14.4)
+                .closed(),
+            stroke_part()
+                .m(8.0, 6.2)
+                .l(9.8, 8.0)
+                .l(8.0, 9.8)
+                .l(6.2, 8.0)
+                .closed(),
+        ],
         IconKind::PaintBucket => vec![
             // A tilted bucket (a diamond), the paint line across it, and
             // the drop pouring from its corner.
@@ -981,7 +1001,7 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 43);
+        assert_eq!(IconKind::ALL.len(), 44);
         for kind in [IconKind::SwapArrows, IconKind::DefaultColours] {
             assert!(IconKind::ALL.contains(&kind));
             assert!(!icon_parts(kind).is_empty(), "{kind:?}");

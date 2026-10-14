@@ -175,9 +175,13 @@ pub(crate) fn commit_live_gestures(cx: &mut SwitchContext<'_>) -> bool {
         },
         cx.click,
     );
+    // A live Spot Healing stroke is healed into the outgoing document first
+    // (0.237.0); a refusal has no status bar to show on.
+    let mut ending = cx.drag.take();
+    let _ = crate::spot_heal_stamp::finish(&mut ending, cx.doc);
     recorded |= commit_drag_into_history(
         cx.workspace,
-        cx.drag.take(),
+        ending,
         &cx.doc.layers,
         &mut cx.doc.history,
         &mut cx.doc.pixel_history,

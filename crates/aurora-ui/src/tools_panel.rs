@@ -99,7 +99,7 @@ pub const TOOL_GROUPS: [&[Tool]; 13] = [
     &[Tool::Eyedropper],
     &[Tool::Brush, Tool::Pencil],
     &[Tool::Eraser, Tool::CloneStamp],
-    &[Tool::Smudge],
+    &[Tool::Smudge, Tool::SpotHealing],
     &[Tool::Blur, Tool::Sharpen],
     &[Tool::Dodge, Tool::Burn],
     &[Tool::Sponge, Tool::Pen],
@@ -133,6 +133,7 @@ pub const fn tool_icon(tool: Tool) -> IconKind {
         Tool::Sponge => IconKind::Sponge,
         Tool::Crop => IconKind::Crop,
         Tool::Pen => IconKind::Pen,
+        Tool::SpotHealing => IconKind::SpotHealing,
         Tool::Gradient => IconKind::Gradient,
         Tool::PaintBucket => IconKind::PaintBucket,
     }
@@ -403,7 +404,7 @@ mod tests {
 
     /// The icon each tool must wear, written out independently of
     /// [`tool_icon`] so a mapped-to-the-wrong-tool slip fails.
-    const EXPECTED_ICONS: [(Tool, IconKind); 23] = [
+    const EXPECTED_ICONS: [(Tool, IconKind); 24] = [
         (Tool::Move, IconKind::Move),
         (Tool::MarqueeSelect, IconKind::Marquee),
         (Tool::EllipticalMarquee, IconKind::EllipseMarquee),
@@ -418,6 +419,7 @@ mod tests {
         (Tool::Eraser, IconKind::Eraser),
         (Tool::CloneStamp, IconKind::CloneStamp),
         (Tool::Smudge, IconKind::Smudge),
+        (Tool::SpotHealing, IconKind::SpotHealing),
         (Tool::Blur, IconKind::Blur),
         (Tool::Sharpen, IconKind::Sharpen),
         (Tool::Dodge, IconKind::Dodge),
@@ -515,6 +517,10 @@ mod tests {
             "Clone Stamp tool, shortcut S"
         );
         assert_eq!(tool_description(Tool::Smudge), "Smudge tool, shortcut R");
+        assert_eq!(
+            tool_description(Tool::SpotHealing),
+            "Spot Healing tool, shortcut J"
+        );
         assert_eq!(tool_description(Tool::Blur), "Blur tool, shortcut Shift+R");
         assert_eq!(
             tool_description(Tool::Sharpen),
@@ -762,6 +768,9 @@ mod tests {
             // left column, above the fill row.
             assert!(at(Tool::Smudge).y > at(Tool::Eraser).y);
             assert_eq!(at(Tool::Smudge).x, at(Tool::Eraser).x);
+            // 0.237.0: the Spot Healing shares the Smudge's row, right of it.
+            assert_eq!(at(Tool::SpotHealing).y, at(Tool::Smudge).y);
+            assert_eq!(at(Tool::Smudge).x + 32, at(Tool::SpotHealing).x);
             // 0.223.0: the Blur and Sharpen share a row under it.
             assert!(at(Tool::Blur).y > at(Tool::Smudge).y);
             assert_eq!(at(Tool::Sharpen).y, at(Tool::Blur).y);
