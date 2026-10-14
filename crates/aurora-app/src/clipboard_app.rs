@@ -138,7 +138,7 @@ pub(crate) enum CutError {
     Refused(&'static str),
     /// Some tiles were erased before a failure: record `filled` so the part
     /// that happened can be undone.
-    Failed(&'static str, Filled),
+    Failed(&'static str, Box<Filled>),
 }
 
 /// Cut: Copy, then erase the copied texels through a stroke snapshot.
@@ -170,10 +170,10 @@ pub(crate) fn cut_active(
             tracing::warn!(?err, "Cut could not erase part of the layer");
             Err(CutError::Failed(
                 pixels::CUT_FAILED_NOTICE,
-                Filled {
+                Box::new(Filled {
                     snapshot,
                     painted: Vec::new(),
-                },
+                }),
             ))
         }
     }
@@ -181,11 +181,7 @@ pub(crate) fn cut_active(
 
 /// Fills the internal clipboard with `clip` and puts its 8-bit export on
 /// the system clipboard (silently nothing if there is none).
-pub(crate) fn publish(
-    state: &mut PixelClipboard,
-    clip: PixelClip,
-    os: &mut dyn ClipboardAccess,
-) {
+pub(crate) fn publish(state: &mut PixelClipboard, clip: PixelClip, os: &mut dyn ClipboardAccess) {
     let rgba = clip.to_rgba8();
     state.exported = Some(pixels::fingerprint(clip.width(), clip.height(), &rgba));
     os.set_image(&ClipImage {
@@ -205,10 +201,7 @@ pub(crate) fn resolve_paste(
     match pixels::os_image_paste(os.get_image(), state.exported) {
         OsPaste::Image(clip) => Ok(clip),
         OsPaste::TooLarge => Err(pixels::TOO_LARGE_TO_PASTE_NOTICE),
-        OsPaste::Internal => state
-            .clip
-            .clone()
-            .ok_or(pixels::NOTHING_TO_PASTE_NOTICE),
+        OsPaste::Internal => state.clip.clone().ok_or(pixels::NOTHING_TO_PASTE_NOTICE),
     }
 }
 
@@ -248,7 +241,7 @@ pub(crate) fn visible_rect(view: &aurora_ui::CanvasView, size: (f32, f32)) -> Op
 pub(crate) fn place_clip_core(
     cx: &mut LayerCommandContext<'_>,
     store: &mut aurora_tile::TileStore,
-    clip: PixelClip,
+    clip: &PixelClip,
     visible: Option<Rect>,
     in_place: bool,
     label: &'static str,
@@ -329,7 +322,7 @@ impl App {
                 match clip {
                     Ok(clip) => {
                         let label = PASTE_LABEL;
-                        self.place_clip(clip, command == ClipCommand::PasteInPlace, label, None);
+                        self.place_clip(&clip, command == ClipCommand::PasteInPlace, label, None);
                     }
                     Err(text) => self.clip_notice(text),
                 }
@@ -346,7 +339,7 @@ impl App {
                     selection.as_ref(),
                 ) {
                     Ok(clip) => {
-                        self.place_clip(clip, true, LAYER_VIA_COPY_LABEL, None);
+                        self.place_clip(&clip, true, LAYER_VIA_COPY_LABEL, None);
                     }
                     Err(text) => self.clip_notice(text),
                 }
@@ -401,13 +394,13 @@ impl App {
             Err(CutError::Refused(text)) => self.clip_notice(text),
             Err(CutError::Failed(text, filled)) => {
                 if let Some(layer) = layer {
-                    self.finish_fill(layer, Ok(filled), CUT_LABEL);
+                    self.finish_fill(layer, Ok(*filled), CUT_LABEL);
                 }
                 self.clip_notice(text);
             }
             Ok((clip, filled)) => {
                 if via_layer {
-                    self.place_clip(clip, true, LAYER_VIA_CUT_LABEL, Some(filled));
+                    self.place_clip(&clip, true, LAYER_VIA_CUT_LABEL, Some(filled));
                 } else {
                     publish(&mut self.pixel_clip, clip, &mut self.clipboard);
                     if let Some(layer) = layer {
@@ -422,7 +415,7 @@ impl App {
     /// [`place_clip_core`]); a failure becomes the calm notice.
     fn place_clip(
         &mut self,
-        clip: PixelClip,
+        clip: &PixelClip,
         in_place: bool,
         label: &'static str,
         cut: Option<Filled>,

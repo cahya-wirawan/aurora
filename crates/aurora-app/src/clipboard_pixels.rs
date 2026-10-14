@@ -42,6 +42,8 @@
 //! rectangle is fully inside the visible document area, else centred in the
 //! visible canvas, clamped so the clip lies inside the canvas when it fits.
 
+#![allow(clippy::many_single_char_names)]
+
 use std::hash::{Hash, Hasher};
 
 use aurora_core::Rect;
@@ -98,7 +100,12 @@ pub(crate) struct PixelClip {
 impl PixelClip {
     /// A clip over `pixels`, or `None` for an empty one, a wrong sample
     /// count or one over the cap.
-    pub(crate) fn new(width: u32, height: u32, origin: (i64, i64), pixels: Vec<f16>) -> Option<Self> {
+    pub(crate) fn new(
+        width: u32,
+        height: u32,
+        origin: (i64, i64),
+        pixels: Vec<f16>,
+    ) -> Option<Self> {
         let texels = u64::from(width).checked_mul(u64::from(height))?;
         if texels == 0 || texels > MAX_CLIP_TEXELS {
             return None;
@@ -157,11 +164,7 @@ impl PixelClip {
             let [r, g, b, a] = texel else { continue };
             let alpha = a.to_f32();
             let straight = |v: &f16| {
-                if alpha > 0.0 {
-                    v.to_f32() / alpha
-                } else {
-                    0.0
-                }
+                if alpha > 0.0 { v.to_f32() / alpha } else { 0.0 }
             };
             #[allow(clippy::cast_possible_truncation)]
             let pixel = index as u32;
@@ -235,7 +238,12 @@ pub(crate) fn split(texel: &[f16], c: f32) -> Option<([f16; 4], [f16; 4])> {
     let keep = 1.0 - c;
     Some((
         copied,
-        [scale(r, keep), scale(g, keep), scale(b, keep), scale(a, keep)],
+        [
+            scale(r, keep),
+            scale(g, keep),
+            scale(b, keep),
+            scale(a, keep),
+        ],
     ))
 }
 
@@ -359,7 +367,8 @@ pub(crate) fn extract_layer(
     if texels > MAX_CLIP_TEXELS {
         return Err(ClipError::TooLarge);
     }
-    let mut pixels = vec![f16::ZERO; usize::try_from(texels).map_err(|_| ClipError::TooLarge)? * CHANNELS];
+    let mut pixels =
+        vec![f16::ZERO; usize::try_from(texels).map_err(|_| ClipError::TooLarge)? * CHANNELS];
     walk_copied(store, surface, layer, region, selection, &mut |v| {
         let index = usize::try_from(v.y - min.1).unwrap_or(0) * width as usize
             + usize::try_from(v.x - min.0).unwrap_or(0);
@@ -530,7 +539,9 @@ pub(crate) fn extract_merged(
                     };
                     let index = usize::try_from(y - region.y).unwrap_or(0) * rw
                         + usize::try_from(x - region.x).unwrap_or(0);
-                    if let Some(slot) = buffer.get_mut(index * CHANNELS..index * CHANNELS + CHANNELS) {
+                    if let Some(slot) =
+                        buffer.get_mut(index * CHANNELS..index * CHANNELS + CHANNELS)
+                    {
                         slot.copy_from_slice(&copied);
                     }
                 }
@@ -568,7 +579,9 @@ fn trim(buffer: &[f16], width: usize, height: usize, origin: (i64, i64)) -> Opti
     let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
     let mut pixels = Vec::with_capacity(w * h * CHANNELS);
     for y in y0..=y1 {
-        pixels.extend_from_slice(buffer.get((y * width + x0) * CHANNELS..(y * width + x1 + 1) * CHANNELS)?);
+        pixels.extend_from_slice(
+            buffer.get((y * width + x0) * CHANNELS..(y * width + x1 + 1) * CHANNELS)?,
+        );
     }
     PixelClip::new(
         u32::try_from(w).ok()?,
@@ -623,7 +636,8 @@ pub(crate) fn paste_origin(
     let area = visible
         .and_then(|view| intersect(view, canvas_rect))
         .unwrap_or(canvas_rect);
-    let centre = |start: i64, extent: u32, size: u32| start + (i64::from(extent) - i64::from(size)) / 2;
+    let centre =
+        |start: i64, extent: u32, size: u32| start + (i64::from(extent) - i64::from(size)) / 2;
     let x = centre(area.x, area.width, clip.width);
     let y = centre(area.y, area.height, clip.height);
     let max_x = (i64::from(canvas.0) - i64::from(clip.width)).max(0);

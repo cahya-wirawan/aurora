@@ -110,7 +110,10 @@ fn static_rows(title: &str) -> Vec<Row> {
             Cmd(crate::clipboard_app::COMMAND_CUT, "Cut"),
             Cmd(crate::clipboard_app::COMMAND_COPY_MERGED, "Copy Merged"),
             Cmd(crate::clipboard_app::COMMAND_PASTE, "Paste"),
-            Cmd(crate::clipboard_app::COMMAND_PASTE_IN_PLACE, "Paste in Place"),
+            Cmd(
+                crate::clipboard_app::COMMAND_PASTE_IN_PLACE,
+                "Paste in Place",
+            ),
             Cmd(
                 crate::clipboard_app::COMMAND_LAYER_VIA_COPY,
                 crate::clipboard_app::LAYER_VIA_COPY_LABEL,

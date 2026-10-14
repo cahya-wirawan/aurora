@@ -544,9 +544,9 @@ mod background_composite;
 mod background_open;
 mod channels_app;
 mod clipboard_app;
+mod clipboard_pixels;
 #[cfg(test)]
 mod clipboard_tests;
-mod clipboard_pixels;
 mod clone_stamp;
 #[cfg(test)]
 mod clone_stamp_tests;
@@ -5751,13 +5751,22 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         // 0.235.0: Photoshop's clipboard chords. A focused text field takes
         // Primary+C/X/V first (`route_widget_key`); the Shift chords are not
         // run from inside one (`handle_key`).
-        ("Primary+C", AppCommand::Clipboard(clipboard_app::ClipCommand::Copy)),
-        ("Primary+X", AppCommand::Clipboard(clipboard_app::ClipCommand::Cut)),
+        (
+            "Primary+C",
+            AppCommand::Clipboard(clipboard_app::ClipCommand::Copy),
+        ),
+        (
+            "Primary+X",
+            AppCommand::Clipboard(clipboard_app::ClipCommand::Cut),
+        ),
         (
             "Primary+Shift+C",
             AppCommand::Clipboard(clipboard_app::ClipCommand::CopyMerged),
         ),
-        ("Primary+V", AppCommand::Clipboard(clipboard_app::ClipCommand::Paste)),
+        (
+            "Primary+V",
+            AppCommand::Clipboard(clipboard_app::ClipCommand::Paste),
+        ),
         (
             "Primary+Shift+V",
             AppCommand::Clipboard(clipboard_app::ClipCommand::PasteInPlace),
@@ -11334,9 +11343,7 @@ impl UndoOrder {
             | UndoKind::Selection
             | UndoKind::Crop
             | UndoKind::Path
-            | UndoKind::LayerViaCut => {
-                default_step_label(kind).to_owned()
-            }
+            | UndoKind::LayerViaCut => default_step_label(kind).to_owned(),
         };
         self.record_labelled(kind, label, history, pixel_history);
     }
@@ -11710,9 +11717,11 @@ fn step_undo_order(
                     && pixel_history.can_undo()
                 {
                     match history.undo(layers) {
-                        Ok(_) => apply_pixel_step(layers, pixel_history, store, UndoDirection::Undo)
-                            .inspect(|_| undo_order.step_back())
-                            .map(|_| CompositeInvalidation::Everything),
+                        Ok(_) => {
+                            apply_pixel_step(layers, pixel_history, store, UndoDirection::Undo)
+                                .inspect(|_| undo_order.step_back())
+                                .map(|_| CompositeInvalidation::Everything)
+                        }
                         Err(err) => {
                             tracing::warn!(?err, "undoing a Layer via Cut failed");
                             None
@@ -11786,9 +11795,11 @@ fn step_undo_order(
                     && pixel_history.can_redo()
                 {
                     match history.redo(layers) {
-                        Ok(_) => apply_pixel_step(layers, pixel_history, store, UndoDirection::Redo)
-                            .inspect(|_| undo_order.step_forward())
-                            .map(|_| CompositeInvalidation::Everything),
+                        Ok(_) => {
+                            apply_pixel_step(layers, pixel_history, store, UndoDirection::Redo)
+                                .inspect(|_| undo_order.step_forward())
+                                .map(|_| CompositeInvalidation::Everything)
+                        }
                         Err(err) => {
                             tracing::warn!(?err, "redoing a Layer via Cut failed");
                             None
