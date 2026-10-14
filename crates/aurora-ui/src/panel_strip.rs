@@ -97,6 +97,7 @@ impl PanelStrip {
 
 /// Builds the strip under `parent`, hidden (the rail starts expanded).
 /// `panels` is each rail panel with its full name.
+#[allow(clippy::large_types_passed_by_value)]
 pub(crate) fn insert_panel_strip(
     tree: &mut WidgetTree<WidgetKind>,
     parent: WidgetId,

@@ -53,10 +53,10 @@ pub mod layers_panel;
 pub mod levels_controls;
 pub mod menu_bar;
 pub mod panel;
-pub mod path_overlay;
-pub mod paths_panel;
 pub mod panel_group;
 pub mod panel_strip;
+pub mod path_overlay;
+pub mod paths_panel;
 pub mod properties_panel;
 pub mod quick_mask_overlay;
 pub mod redock;
@@ -70,14 +70,6 @@ pub mod tools_panel;
 pub mod workspace;
 
 pub use canvas_view::CanvasView;
-pub use path_overlay::{AnchorRef, PathPart, path_anchor_screen, path_hit, path_overlay_runs};
-pub use paths_panel::{
-    MAKE_SELECTION_EMPTY, MAKE_SELECTION_UNAVAILABLE, NO_PATHS_TEXT, PATH_DELETE_UNAVAILABLE,
-    PATHS_TOOLBAR_ICON_SIZE, PATHS_TOOLBAR_LABEL, PathsAction, PathsPanel, PathsToolbar,
-    insert_paths_toolbar, is_paths_toolbar_button, new_paths_panel, paths_toolbar_height,
-    populate_paths_panel, select_path_row, set_paths_toolbar_hover, sync_paths_panel,
-    sync_paths_toolbar,
-};
 pub use channels_panel::{
     CHANNELS_TOOLBAR_ICON_SIZE, CHANNELS_TOOLBAR_LABEL, ChannelRow, ChannelRowPart,
     ChannelVisibility, ChannelsAction, ChannelsPanel, ChannelsToolbar, CompositeChannel,
@@ -131,6 +123,14 @@ pub use levels_controls::{
     LevelsControls, LevelsSlider, channel_levels, insert_levels_controls, levels_controls_contains,
     levels_controls_shown, levels_params, levels_selected_channel, select_levels_channel,
     sync_levels_controls, with_channel_levels,
+};
+pub use path_overlay::{AnchorRef, PathPart, path_anchor_screen, path_hit, path_overlay_runs};
+pub use paths_panel::{
+    MAKE_SELECTION_EMPTY, MAKE_SELECTION_UNAVAILABLE, NO_PATHS_TEXT, PATH_DELETE_UNAVAILABLE,
+    PATHS_TOOLBAR_ICON_SIZE, PATHS_TOOLBAR_LABEL, PathsAction, PathsPanel, PathsToolbar,
+    insert_paths_toolbar, is_paths_toolbar_button, new_paths_panel, paths_toolbar_height,
+    populate_paths_panel, select_path_row, set_paths_toolbar_hover, sync_paths_panel,
+    sync_paths_toolbar,
 };
 #[cfg(test)]
 mod layer_filter_tests;

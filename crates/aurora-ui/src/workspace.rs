@@ -1549,7 +1549,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn build_workspace_has_a_canvas_area_and_four_docked_panels() {
+    fn build_workspace_has_a_canvas_area_and_five_docked_panels() {
         let mut ws = build_workspace(&test_scales());
         assert_eq!(ws.tree.parent(ws.canvas_area), Some(ws.canvas_column));
         assert_eq!(ws.tree.parent(ws.canvas_column), Some(ws.root));
@@ -1568,11 +1568,12 @@ mod tests {
                     crate::workspace::test_group(&ws).bar,
                     ws.properties.root,
                     ws.history.root,
-                    ws.channels.root
+                    ws.channels.root,
+                    ws.paths.root
                 ]
                 .as_slice()
             ),
-            "the group holds its tab row, then Properties, History and Channels"
+            "the group holds its tab row, then Properties, History, Channels and Paths"
         );
 
         for (panel, title, role) in [
@@ -1580,6 +1581,7 @@ mod tests {
             (ws.properties, "Properties", accesskit::Role::TabPanel),
             (ws.history, "History", accesskit::Role::TabPanel),
             (ws.channels, "Channels", accesskit::Role::TabPanel),
+            (ws.paths, "Paths", accesskit::Role::TabPanel),
         ] {
             let Some(accessibility) = ws.tree.accessibility(panel.root) else {
                 unreachable!("just inserted");

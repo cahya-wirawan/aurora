@@ -215,9 +215,8 @@ impl Tool {
             Self::Smudge | Self::Blur => 'R',
             Self::Gradient | Self::PaintBucket => 'G',
             Self::Dodge | Self::Burn => 'O',
-            Self::Sponge => 'P',
+            Self::Sponge | Self::Pen => 'P',
             Self::Crop => 'C',
-            Self::Pen => 'P',
         }
     }
 
@@ -311,11 +310,11 @@ mod tests {
         chords.sort_unstable();
         chords.dedup();
         assert_eq!(chords.len(), Tool::ALL.len());
-        // Only the grouped G, M, L, B, R, S and O keys share a letter, and only by Shift.
+        // Only the grouped G, M, L, B, R, S, O and P keys share a letter, and only by Shift.
         let mut letters = keys;
         letters.sort_unstable();
         letters.dedup();
-        assert_eq!(letters.len(), Tool::ALL.len() - 7);
+        assert_eq!(letters.len(), Tool::ALL.len() - 8);
         assert_eq!(Tool::Crop.shortcut_text(), "C");
         assert_eq!(Tool::Lasso.shortcut_text(), "L");
         assert_eq!(Tool::PolygonalLasso.shortcut_text(), "Shift+L");

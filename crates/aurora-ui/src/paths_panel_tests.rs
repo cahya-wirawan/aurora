@@ -111,7 +111,10 @@ fn a_row_per_name_in_order_and_each_is_a_focusable_laid_out_node() {
     let rows = ws.paths_state.rows.clone();
     let labels: Vec<String> = rows.iter().map(|(id, _)| label_of(&ws, *id)).collect();
     assert_eq!(labels, ["Outline", "Work Path", "Eye"]);
-    assert!(body_labels(&ws).is_empty(), "no empty-state label with rows");
+    assert!(
+        body_labels(&ws).is_empty(),
+        "no empty-state label with rows"
+    );
     for (id, name) in &rows {
         let Some(rect) = ws.tree.bounds(*id) else {
             unreachable!("laid out");
@@ -190,7 +193,7 @@ fn selecting_a_row_highlights_it_and_enables_the_toolbar_with_reasons() {
 fn sync_rebuilds_on_a_name_change_and_only_rehighlights_on_a_selection_change() {
     let mut ws = build_workspace(&scales());
     let scales = scales();
-    let mut run = |ws: &mut Workspace, list: &[&str], sel: Option<&str>, empty: bool| {
+    let run = |ws: &mut Workspace, list: &[&str], sel: Option<&str>, empty: bool| {
         let mut state = ws.paths_state.clone();
         let out = sync_paths_panel(
             &mut ws.tree,
@@ -300,7 +303,10 @@ fn the_toolbar_sits_under_the_rows_inside_the_panel_when_laid_out() {
     ) else {
         unreachable!("laid out");
     };
-    assert!(bar.y >= body.y + i64::from(body.height) - 1, "under the list");
+    assert!(
+        bar.y >= body.y + i64::from(body.height) - 1,
+        "under the list"
+    );
     assert!(
         bar.y + i64::from(bar.height) <= panel.y + i64::from(panel.height),
         "inside the panel"
@@ -351,6 +357,11 @@ fn closing_and_reopening_the_panel_rebuilds_its_emptied_body() {
     );
     ws.paths_state = state;
     assert_eq!(out.ok(), Some(true));
-    assert!(ws.paths_state.rows.iter().all(|(id, _)| ws.tree.contains(*id)));
+    assert!(
+        ws.paths_state
+            .rows
+            .iter()
+            .all(|(id, _)| ws.tree.contains(*id))
+    );
     assert_eq!(ws.paths_state.rows.len(), 1);
 }

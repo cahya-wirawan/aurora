@@ -569,7 +569,7 @@ mod tests {
     use super::{
         DockArrangement, DockPanel, DockPlacement, DockSlot, DropTarget, PanelMove, SlotRef,
     };
-    use DockPanel::{Channels, History, Layers, Properties};
+    use DockPanel::{Channels, History, Layers, Paths, Properties};
 
     fn arrangement(slots: &[(&[DockPanel], usize)]) -> DockArrangement {
         let raw = slots
@@ -608,7 +608,10 @@ mod tests {
         let default = DockArrangement::default();
         assert_eq!(
             shape(&default),
-            vec![(vec![Layers], 0), (vec![Properties, History, Channels], 0)]
+            vec![
+                (vec![Layers], 0),
+                (vec![Properties, History, Channels, Paths], 0)
+            ]
         );
         assert!(every_panel_once(&default));
         for panel in DockPanel::ALL {
@@ -628,7 +631,7 @@ mod tests {
         assert_eq!(
             reordered.as_ref().map(shape),
             Some(vec![
-                (vec![Properties, History, Channels], 0),
+                (vec![Properties, History, Channels, Paths], 0),
                 (vec![Layers], 0)
             ])
         );
@@ -636,7 +639,10 @@ mod tests {
         let joined = default.moved(Layers, DropTarget::Join(1));
         assert_eq!(
             joined.as_ref().map(shape),
-            Some(vec![(vec![Properties, History, Channels, Layers], 3)])
+            Some(vec![(
+                vec![Properties, History, Channels, Paths, Layers],
+                4
+            )])
         );
         // Split: History out of the group into the top gap.
         let split = default.moved(History, DropTarget::Gap(0));
@@ -645,7 +651,7 @@ mod tests {
             Some(vec![
                 (vec![History], 0),
                 (vec![Layers], 0),
-                (vec![Properties, Channels], 0)
+                (vec![Properties, Channels, Paths], 0)
             ])
         );
         // The selected tab leaving: the tab now in its place is selected.
@@ -659,7 +665,7 @@ mod tests {
             Some(vec![
                 (vec![History], 0),
                 (vec![Layers], 0),
-                (vec![Properties, Channels], 1)
+                (vec![Properties, Channels, Paths], 1)
             ])
         );
         // No-ops: a lone panel just above or below itself, a join of its
@@ -682,7 +688,7 @@ mod tests {
     /// removes its slot — no empty slot survives any move.
     #[test]
     fn no_move_ever_leaves_an_empty_slot() {
-        let grouped = arrangement(&[(&[Layers, Properties, History, Channels], 1)]);
+        let grouped = arrangement(&[(&[Layers, Properties, History, Channels, Paths], 1)]);
         let mut frontier = vec![grouped];
         let mut seen = Vec::new();
         while let Some(next) = frontier.pop() {
@@ -719,7 +725,7 @@ mod tests {
         assert_eq!(
             shape(&repaired),
             vec![
-                (vec![History, Channels], 0),
+                (vec![History, Channels, Paths], 0),
                 (vec![Layers], 0),
                 (vec![Properties], 0)
             ]
@@ -746,7 +752,10 @@ mod tests {
         ]);
         assert_eq!(
             shape(&kept),
-            vec![(vec![Layers], 0), (vec![Properties, History, Channels], 1)]
+            vec![
+                (vec![Layers], 0),
+                (vec![Properties, History, Channels, Paths], 1)
+            ]
         );
         // 0.232.0: a layout saved before the Channels panel existed gets it
         // as one more tab of the group holding History, selection kept.
@@ -757,7 +766,10 @@ mod tests {
         assert!(changed);
         assert_eq!(
             shape(&old),
-            vec![(vec![Layers], 0), (vec![Properties, History, Channels], 1)]
+            vec![
+                (vec![Layers], 0),
+                (vec![Properties, History, Channels, Paths], 1)
+            ]
         );
         // With History alone it joins that slot; with no rail History it
         // is a slot of its own at the end.
@@ -767,7 +779,10 @@ mod tests {
         ]);
         assert_eq!(
             shape(&lone),
-            vec![(vec![Layers, Properties], 0), (vec![History, Channels], 0)]
+            vec![
+                (vec![Layers, Properties], 0),
+                (vec![History, Channels, Paths], 0)
+            ]
         );
         let (floating_history, _) = DockArrangement::repaired_placed(vec![
             (DockPlacement::Rail, vec![Some(Layers), Some(Properties)], 0),
@@ -779,7 +794,11 @@ mod tests {
         ]);
         assert_eq!(
             shape(&floating_history),
-            vec![(vec![Layers, Properties], 0), (vec![Channels], 0)]
+            vec![
+                (vec![Layers, Properties], 0),
+                (vec![Channels], 0),
+                (vec![Paths], 0)
+            ]
         );
     }
 
@@ -804,9 +823,9 @@ mod tests {
             default.move_target(History, PanelMove::NextGroup),
             Some(DropTarget::Join(0))
         );
-        let one_slot = arrangement(&[(&[Layers, Properties, History, Channels], 0)]);
+        let one_slot = arrangement(&[(&[Layers, Properties, History, Channels, Paths], 0)]);
         assert_eq!(one_slot.move_target(Layers, PanelMove::NextGroup), None);
-        let bottom = arrangement(&[(&[Properties, History, Channels], 0), (&[Layers], 0)]);
+        let bottom = arrangement(&[(&[Properties, History, Channels, Paths], 0), (&[Layers], 0)]);
         assert_eq!(bottom.move_target(Layers, PanelMove::Down), None);
         let _ = DockSlot::single(Layers);
     }
@@ -858,7 +877,7 @@ mod tests {
         };
         assert_eq!(
             shape(&one),
-            vec![(vec![Layers], 0), (vec![Properties, Channels], 0)]
+            vec![(vec![Layers], 0), (vec![Properties, Channels, Paths], 0)]
         );
         assert_eq!(floats(&one), vec![(vec![History], 0, 10.0, 20.0)]);
         assert_eq!(one.locate(History), Some((SlotRef::Floating(0), 0)));
@@ -874,7 +893,11 @@ mod tests {
         let Some(joined) = two.moved(Properties, DropTarget::JoinFloating(0)) else {
             unreachable!("joins");
         };
-        assert_eq!(shape(&joined), vec![(vec![Channels], 0)], "Channels stays");
+        assert_eq!(
+            shape(&joined),
+            vec![(vec![Channels, Paths], 0)],
+            "Channels and Paths stay"
+        );
         assert_eq!(
             floats(&joined).first().map(|f| (f.0.clone(), f.1)),
             Some((vec![History, Properties], 1))
@@ -893,7 +916,7 @@ mod tests {
         };
         assert_eq!(
             shape(&docked),
-            vec![(vec![History, Properties], 1), (vec![Channels], 0)]
+            vec![(vec![History, Properties], 1), (vec![Channels, Paths], 0)]
         );
         assert_eq!(floats(&docked), vec![(vec![Layers], 0, 50.0, 60.0)]);
         // Raising.
@@ -1001,7 +1024,8 @@ mod tests {
             vec![
                 (vec![Properties], 0),
                 (vec![Layers], 0),
-                (vec![Channels], 0)
+                (vec![Channels], 0),
+                (vec![Paths], 0)
             ]
         );
         assert_eq!(floats(&repaired), vec![(vec![History], 0, 0.0, 7.0)]);

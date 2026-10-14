@@ -463,9 +463,7 @@ pub fn select_path_row(
     state: &mut PathsPanel,
     name: Option<&str>,
 ) -> Result<(), WidgetError> {
-    let wanted = name
-        .filter(|n| state.id_of(n).is_some())
-        .map(str::to_owned);
+    let wanted = name.filter(|n| state.id_of(n).is_some()).map(str::to_owned);
     for (id, row_name) in state.rows.clone() {
         set_tree_item_selected(tree, id, wanted.as_deref() == Some(row_name.as_str()))?;
     }
@@ -500,10 +498,11 @@ pub fn sync_paths_panel(
 ) -> Result<bool, WidgetError> {
     // A closed panel's body is emptied (`close_panel`): the remembered rows
     // (or the empty-state label) are gone and are rebuilt like a name change.
-    let dead = tree
-        .children(panel.body)
-        .is_none_or(<[WidgetId]>::is_empty)
-        || state.rows.first().is_some_and(|(id, _)| !tree.contains(*id));
+    let dead = tree.children(panel.body).is_none_or(<[WidgetId]>::is_empty)
+        || state
+            .rows
+            .first()
+            .is_some_and(|(id, _)| !tree.contains(*id));
     let empty_changed = state.selected_empty != selected_empty;
     state.selected_empty = selected_empty;
     if dead || state.names != names {
@@ -516,7 +515,12 @@ pub fn sync_paths_panel(
         return Ok(true);
     }
     if empty_changed {
-        return sync_paths_toolbar(tree, &state.toolbar, state.selected.is_some(), selected_empty);
+        return sync_paths_toolbar(
+            tree,
+            &state.toolbar,
+            state.selected.is_some(),
+            selected_empty,
+        );
     }
     Ok(false)
 }
