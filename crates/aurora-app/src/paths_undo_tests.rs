@@ -63,19 +63,20 @@ fn a_step_that_changed_nothing_is_not_recorded() {
 }
 
 #[test]
-fn path_steps_never_dirty_the_document_but_move_the_revision() {
+fn path_steps_dirty_the_document_and_move_the_revision() {
     let mut order = UndoOrder::default();
     let content = order.content_revision;
-    let revision = order.revision;
     record(&mut order, "Pen: Add Point", PathSet::new(), set_with(1.0));
-    assert_eq!(order.content_revision, content, "dirty-neutral");
-    assert_ne!(order.revision, revision, "but autosaved");
-    let revision = order.revision;
+    assert_ne!(
+        order.content_revision, content,
+        "a path edit is unsaved work"
+    );
+    let content = order.content_revision;
     assert!(order.apply_path_step(UndoDirection::Undo));
-    assert_eq!(order.content_revision, content);
-    assert_ne!(order.revision, revision);
+    assert_ne!(order.content_revision, content);
+    let content = order.content_revision;
     assert!(order.apply_path_step(UndoDirection::Redo));
-    assert_eq!(order.content_revision, content);
+    assert_ne!(order.content_revision, content);
 }
 
 #[test]

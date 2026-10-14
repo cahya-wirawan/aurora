@@ -211,7 +211,7 @@ fn path_commands_are_undo_steps_that_change_only_the_path_set() {
     );
     assert_eq!(doc.undo_order.undo, vec![UndoKind::Path]);
     assert_eq!(doc.undo_order.undo_labels, vec!["New Path"]);
-    assert!(!doc.is_dirty());
+    assert!(doc.is_dirty(), "a path edit is unsaved work");
     assert_eq!(doc.selection.paths().next_free_name(), "Path 2");
     // A rename onto a taken name is refused and changes nothing.
     ok(doc.selection.paths_mut().add("Other"));

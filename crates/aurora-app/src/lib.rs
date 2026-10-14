@@ -10660,10 +10660,9 @@ enum UndoKind {
     /// `aurora_doc::History`. It is a content change (dirty).
     Crop,
     /// An edit of the document's paths (0.233.0): its before and after live
-    /// in [`UndoOrder`] ([`pen::PathStep`]). Like a selection step it is
-    /// dirty-neutral (a disclosed choice: paths ride in the selection
-    /// state, so they are saved with the file but do not make a document
-    /// unsaved).
+    /// in [`UndoOrder`] ([`pen::PathStep`]). Unlike a selection step it
+    /// is a content change (dirty): paths are authored work saved with the
+    /// file, so an edit makes the document unsaved.
     Path,
 }
 
@@ -10875,7 +10874,7 @@ impl UndoOrder {
             self.redo.push(kind);
             self.redo_labels.push(label);
             self.revision = UndoRevision::next();
-            if !matches!(kind, UndoKind::Selection | UndoKind::Path) {
+            if !matches!(kind, UndoKind::Selection) {
                 self.content_revision = UndoRevision::next();
             }
         }
@@ -10893,7 +10892,7 @@ impl UndoOrder {
             self.undo.push(kind);
             self.undo_labels.push(label);
             self.revision = UndoRevision::next();
-            if !matches!(kind, UndoKind::Selection | UndoKind::Path) {
+            if !matches!(kind, UndoKind::Selection) {
                 self.content_revision = UndoRevision::next();
             }
         }
@@ -11230,7 +11229,7 @@ impl UndoOrder {
         history.clear_redo();
         pixel_history.clear_redo();
         self.revision = UndoRevision::next();
-        if !matches!(kind, UndoKind::Selection | UndoKind::Path) {
+        if !matches!(kind, UndoKind::Selection) {
             self.content_revision = UndoRevision::next();
         }
     }
