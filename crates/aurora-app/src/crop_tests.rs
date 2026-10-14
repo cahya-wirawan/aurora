@@ -1169,3 +1169,524 @@ fn the_frame_syncs_the_shield_once_beneath_the_outline() {
         .count();
     assert_eq!(calls, 1, "redraw syncs the crop shield");
 }
+
+// ---- the cursor, keyboard nudging and the guides (0.231.0) ----
+
+mod polish {
+    use super::*;
+    use crate::Key;
+    use crate::crop::{
+        Arrow, CropCursor, NUDGE_STEP, NUDGE_STEP_LARGE, Nudge, cursor_for, nudge_for_key, nudged,
+    };
+    use crate::crop_app::{CropKeyAction, crop_key_action, guides_for_frame};
+    use aurora_widgets::shortcut::{Modifiers, NamedKey};
+
+    const CANVAS: (u32, u32) = (200, 100);
+    const RADIUS: f32 = 4.0;
+
+    fn cursor(tool: aurora_ui::Tool, r: Option<&Rect>, p: Option<(f32, f32)>) -> CropCursor {
+        cursor_for(tool, r, p, RADIUS)
+    }
+
+    #[test]
+    fn other_tools_and_an_absent_pointer_keep_the_default_cursor() {
+        let r = rect(50, 20, 100, 60);
+        for tool in aurora_ui::Tool::ALL {
+            if tool != aurora_ui::Tool::Crop {
+                assert_eq!(
+                    cursor(tool, Some(&r), Some((100.0, 50.0))),
+                    CropCursor::Default,
+                    "{tool:?}"
+                );
+            }
+        }
+        assert_eq!(
+            cursor(aurora_ui::Tool::Crop, Some(&r), None),
+            CropCursor::Default
+        );
+        assert_eq!(
+            cursor(aurora_ui::Tool::Crop, None, None),
+            CropCursor::Default
+        );
+    }
+
+    #[test]
+    fn a_crosshair_with_no_rectangle_or_outside_it() {
+        let r = rect(50, 20, 100, 60);
+        assert_eq!(
+            cursor(aurora_ui::Tool::Crop, None, Some((10.0, 10.0))),
+            CropCursor::Crosshair
+        );
+        for p in [(10.0, 10.0), (190.0, 90.0), (100.0, 5.0), (30.0, 50.0)] {
+            assert_eq!(
+                cursor(aurora_ui::Tool::Crop, Some(&r), Some(p)),
+                CropCursor::Crosshair,
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_move_cursor_inside_the_rectangle() {
+        let r = rect(50, 20, 100, 60);
+        for p in [(100.0, 50.0), (60.0, 30.0), (140.0, 70.0)] {
+            assert_eq!(
+                cursor(aurora_ui::Tool::Crop, Some(&r), Some(p)),
+                CropCursor::Move,
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_of_the_eight_handles_has_its_own_resize_cursor() {
+        let r = rect(50, 20, 100, 60);
+        // Edges at x 50..150, y 20..80; centre (100, 50).
+        let cases = [
+            ((50.0, 20.0), CropCursor::ResizeNwSe),
+            ((100.0, 20.0), CropCursor::ResizeNs),
+            ((150.0, 20.0), CropCursor::ResizeNeSw),
+            ((150.0, 50.0), CropCursor::ResizeEw),
+            ((150.0, 80.0), CropCursor::ResizeNwSe),
+            ((100.0, 80.0), CropCursor::ResizeNs),
+            ((50.0, 80.0), CropCursor::ResizeNeSw),
+            ((50.0, 50.0), CropCursor::ResizeEw),
+        ];
+        for (p, want) in cases {
+            assert_eq!(
+                cursor(aurora_ui::Tool::Crop, Some(&r), Some(p)),
+                want,
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cursor_uses_the_presses_handle_radius() {
+        let r = rect(50, 20, 100, 60);
+        // Just inside the radius of the top-left corner, just outside it.
+        assert_eq!(
+            cursor_for(aurora_ui::Tool::Crop, Some(&r), Some((47.0, 17.0)), 4.0),
+            CropCursor::ResizeNwSe
+        );
+        assert_eq!(
+            cursor_for(aurora_ui::Tool::Crop, Some(&r), Some((45.0, 15.0)), 4.0),
+            CropCursor::Crosshair
+        );
+        // A handle's reach extends into the rectangle too (the press hits it).
+        assert_eq!(
+            cursor_for(aurora_ui::Tool::Crop, Some(&r), Some((53.0, 23.0)), 4.0),
+            CropCursor::ResizeNwSe
+        );
+        // The cursor and the press agree everywhere on a grid of points.
+        for y in (0..100).step_by(3) {
+            for x in (0..200).step_by(3) {
+                let p = (x as f32, y as f32);
+                let want = match hit_test(&r, p, RADIUS) {
+                    CropHit::Outside => CropCursor::Crosshair,
+                    CropHit::Inside => CropCursor::Move,
+                    CropHit::Handle(_) => {
+                        let got = cursor(aurora_ui::Tool::Crop, Some(&r), Some(p));
+                        assert!(!matches!(
+                            got,
+                            CropCursor::Crosshair | CropCursor::Move | CropCursor::Default
+                        ));
+                        continue;
+                    }
+                };
+                assert_eq!(cursor(aurora_ui::Tool::Crop, Some(&r), Some(p)), want);
+            }
+        }
+    }
+
+    #[test]
+    fn the_kinds_map_to_distinct_winit_cursors() {
+        use winit::window::CursorIcon;
+        assert_eq!(CropCursor::Default.icon(), CursorIcon::Default);
+        assert_eq!(CropCursor::Crosshair.icon(), CursorIcon::Crosshair);
+        assert_eq!(CropCursor::Move.icon(), CursorIcon::Move);
+        assert_eq!(CropCursor::ResizeNs.icon(), CursorIcon::NsResize);
+        assert_eq!(CropCursor::ResizeEw.icon(), CursorIcon::EwResize);
+        assert_eq!(CropCursor::ResizeNeSw.icon(), CursorIcon::NeswResize);
+        assert_eq!(CropCursor::ResizeNwSe.icon(), CursorIcon::NwseResize);
+    }
+
+    #[test]
+    fn the_loop_syncs_the_cursor_and_only_sets_it_on_a_change() {
+        // `App` needs a window: single-line source checks.
+        let lib = include_str!("lib.rs");
+        let calls = lib
+            .lines()
+            .filter(|line| line.trim() == "self.sync_crop_cursor_now();")
+            .count();
+        assert_eq!(calls, 1, "the per-turn sync calls the cursor sync");
+        let app = include_str!("crop_app.rs");
+        assert!(
+            app.lines()
+                .any(|line| line.trim() == "if wanted == self.crop_cursor {"),
+            "set_cursor is skipped while the kind is unchanged"
+        );
+        assert!(
+            app.lines().any(|line| line.trim()
+                == "|| text_field_focused(&self.workspace.tree, self.focus.focused()),"),
+            "a focused text field keeps the crop's keys"
+        );
+    }
+
+    // ---- nudging ----
+
+    fn mods(shift: bool, alt: bool) -> Modifiers {
+        Modifiers {
+            shift,
+            alt,
+            ..Modifiers::default()
+        }
+    }
+
+    fn arrow_key(arrow: Arrow) -> Key {
+        Key::Named(match arrow {
+            Arrow::Left => NamedKey::ArrowLeft,
+            Arrow::Right => NamedKey::ArrowRight,
+            Arrow::Up => NamedKey::ArrowUp,
+            Arrow::Down => NamedKey::ArrowDown,
+        })
+    }
+
+    fn mv(arrow: Arrow, step: u32) -> Nudge {
+        Nudge {
+            arrow,
+            step,
+            resize: false,
+        }
+    }
+
+    fn grow(arrow: Arrow, step: u32) -> Nudge {
+        Nudge {
+            arrow,
+            step,
+            resize: true,
+        }
+    }
+
+    #[test]
+    fn arrow_keys_map_to_a_step_of_one_or_ten_and_alt_resizes() {
+        for arrow in [Arrow::Left, Arrow::Right, Arrow::Up, Arrow::Down] {
+            let key = arrow_key(arrow);
+            assert_eq!(nudge_for_key(key, mods(false, false)), Some(mv(arrow, 1)));
+            assert_eq!(nudge_for_key(key, mods(true, false)), Some(mv(arrow, 10)));
+            assert_eq!(nudge_for_key(key, mods(false, true)), Some(grow(arrow, 1)));
+            assert_eq!(nudge_for_key(key, mods(true, true)), Some(grow(arrow, 10)));
+            // Control and Meta chords belong to the shortcuts.
+            let ctrl = Modifiers {
+                control: true,
+                ..Modifiers::default()
+            };
+            let meta = Modifiers {
+                meta: true,
+                ..Modifiers::default()
+            };
+            assert_eq!(nudge_for_key(key, ctrl), None);
+            assert_eq!(nudge_for_key(key, meta), None);
+        }
+        assert_eq!((NUDGE_STEP, NUDGE_STEP_LARGE), (1, 10));
+        assert_eq!(
+            nudge_for_key(Key::Named(NamedKey::Enter), mods(false, false)),
+            None
+        );
+        assert_eq!(nudge_for_key(Key::Character('a'), mods(false, false)), None);
+    }
+
+    #[test]
+    fn a_move_nudge_moves_one_pixel_in_the_arrows_direction() {
+        let r = rect(50, 20, 40, 30);
+        assert_eq!(nudged(r, mv(Arrow::Left, 1), CANVAS), rect(49, 20, 40, 30));
+        assert_eq!(nudged(r, mv(Arrow::Right, 1), CANVAS), rect(51, 20, 40, 30));
+        assert_eq!(nudged(r, mv(Arrow::Up, 1), CANVAS), rect(50, 19, 40, 30));
+        assert_eq!(nudged(r, mv(Arrow::Down, 1), CANVAS), rect(50, 21, 40, 30));
+    }
+
+    #[test]
+    fn shift_moves_ten_pixels() {
+        let r = rect(50, 20, 40, 30);
+        assert_eq!(
+            nudged(r, mv(Arrow::Right, 10), CANVAS),
+            rect(60, 20, 40, 30)
+        );
+        assert_eq!(nudged(r, mv(Arrow::Down, 10), CANVAS), rect(50, 30, 40, 30));
+        assert_eq!(nudged(r, mv(Arrow::Left, 10), CANVAS), rect(40, 20, 40, 30));
+        assert_eq!(nudged(r, mv(Arrow::Up, 10), CANVAS), rect(50, 10, 40, 30));
+    }
+
+    #[test]
+    fn a_move_stops_at_every_canvas_edge_and_keeps_its_size() {
+        // Left edge.
+        assert_eq!(
+            nudged(rect(0, 20, 40, 30), mv(Arrow::Left, 1), CANVAS),
+            rect(0, 20, 40, 30)
+        );
+        assert_eq!(
+            nudged(rect(5, 20, 40, 30), mv(Arrow::Left, 10), CANVAS),
+            rect(0, 20, 40, 30)
+        );
+        // Top edge.
+        assert_eq!(
+            nudged(rect(50, 0, 40, 30), mv(Arrow::Up, 1), CANVAS),
+            rect(50, 0, 40, 30)
+        );
+        assert_eq!(
+            nudged(rect(50, 3, 40, 30), mv(Arrow::Up, 10), CANVAS),
+            rect(50, 0, 40, 30)
+        );
+        // Right edge (x + w == 200).
+        assert_eq!(
+            nudged(rect(160, 20, 40, 30), mv(Arrow::Right, 1), CANVAS),
+            rect(160, 20, 40, 30)
+        );
+        assert_eq!(
+            nudged(rect(155, 20, 40, 30), mv(Arrow::Right, 10), CANVAS),
+            rect(160, 20, 40, 30)
+        );
+        // Bottom edge (y + h == 100).
+        assert_eq!(
+            nudged(rect(50, 70, 40, 30), mv(Arrow::Down, 1), CANVAS),
+            rect(50, 70, 40, 30)
+        );
+        assert_eq!(
+            nudged(rect(50, 62, 40, 30), mv(Arrow::Down, 10), CANVAS),
+            rect(50, 70, 40, 30)
+        );
+    }
+
+    #[test]
+    fn a_rectangle_as_wide_as_the_canvas_cannot_move_sideways() {
+        let r = rect(0, 10, 200, 20);
+        assert_eq!(nudged(r, mv(Arrow::Left, 10), CANVAS), r);
+        assert_eq!(nudged(r, mv(Arrow::Right, 10), CANVAS), r);
+        assert_eq!(nudged(r, mv(Arrow::Down, 1), CANVAS), rect(0, 11, 200, 20));
+    }
+
+    #[test]
+    fn alt_arrows_resize_the_bottom_right_corner_and_keep_the_origin() {
+        let r = rect(50, 20, 40, 30);
+        assert_eq!(
+            nudged(r, grow(Arrow::Right, 1), CANVAS),
+            rect(50, 20, 41, 30)
+        );
+        assert_eq!(
+            nudged(r, grow(Arrow::Left, 1), CANVAS),
+            rect(50, 20, 39, 30)
+        );
+        assert_eq!(
+            nudged(r, grow(Arrow::Down, 1), CANVAS),
+            rect(50, 20, 40, 31)
+        );
+        assert_eq!(nudged(r, grow(Arrow::Up, 1), CANVAS), rect(50, 20, 40, 29));
+        assert_eq!(
+            nudged(r, grow(Arrow::Right, 10), CANVAS),
+            rect(50, 20, 50, 30)
+        );
+        assert_eq!(
+            nudged(r, grow(Arrow::Down, 10), CANVAS),
+            rect(50, 20, 40, 40)
+        );
+        assert_eq!(
+            nudged(r, grow(Arrow::Left, 10), CANVAS),
+            rect(50, 20, 30, 30)
+        );
+        assert_eq!(nudged(r, grow(Arrow::Up, 10), CANVAS), rect(50, 20, 40, 20));
+    }
+
+    #[test]
+    fn a_resize_never_goes_below_one_pixel() {
+        assert_eq!(
+            nudged(rect(50, 20, 1, 30), grow(Arrow::Left, 1), CANVAS),
+            rect(50, 20, 1, 30)
+        );
+        assert_eq!(
+            nudged(rect(50, 20, 5, 30), grow(Arrow::Left, 10), CANVAS),
+            rect(50, 20, 1, 30)
+        );
+        assert_eq!(
+            nudged(rect(50, 20, 40, 1), grow(Arrow::Up, 1), CANVAS),
+            rect(50, 20, 40, 1)
+        );
+        assert_eq!(
+            nudged(rect(50, 20, 40, 7), grow(Arrow::Up, 10), CANVAS),
+            rect(50, 20, 40, 1)
+        );
+    }
+
+    #[test]
+    fn a_resize_stops_at_the_canvas_edges() {
+        // x + w == 200, y + h == 100 already.
+        assert_eq!(
+            nudged(rect(160, 70, 40, 30), grow(Arrow::Right, 1), CANVAS),
+            rect(160, 70, 40, 30)
+        );
+        assert_eq!(
+            nudged(rect(160, 70, 40, 30), grow(Arrow::Down, 1), CANVAS),
+            rect(160, 70, 40, 30)
+        );
+        // Ten would overshoot: it stops at the edge.
+        assert_eq!(
+            nudged(rect(150, 60, 40, 30), grow(Arrow::Right, 10), CANVAS),
+            rect(150, 60, 50, 30)
+        );
+        assert_eq!(
+            nudged(rect(150, 60, 40, 35), grow(Arrow::Down, 10), CANVAS),
+            rect(150, 60, 40, 40)
+        );
+    }
+
+    #[test]
+    fn the_state_takes_a_nudge_only_with_a_rectangle_and_no_live_drag() {
+        let id = DocumentId::next();
+        let mut state = CropState::default();
+        assert!(!state.nudge(mv(Arrow::Right, 1), CANVAS), "no rectangle");
+        assert_eq!(state.rect(), None);
+
+        let t = Instant::now();
+        state.press((20.0, 10.0), RADIUS, t, id, CANVAS);
+        state.drag((80.0, 60.0), CANVAS);
+        assert!(!state.nudge(mv(Arrow::Right, 1), CANVAS), "a drag is live");
+        assert_eq!(state.rect(), Some(rect(20, 10, 60, 50)));
+        state.release();
+        assert!(state.nudge(mv(Arrow::Right, 10), CANVAS));
+        assert_eq!(state.rect(), Some(rect(30, 10, 60, 50)));
+        assert!(state.nudge(grow(Arrow::Down, 1), CANVAS));
+        assert_eq!(state.rect(), Some(rect(30, 10, 60, 51)));
+    }
+
+    #[test]
+    fn a_nudged_rectangle_always_validates_for_a_crop() {
+        // Whatever the nudge, the result is a legal crop rectangle.
+        let id = DocumentId::next();
+        let mut state = CropState::default();
+        state.press((10.0, 10.0), RADIUS, Instant::now(), id, CANVAS);
+        state.drag((60.0, 40.0), CANVAS);
+        state.release();
+        let arrows = [Arrow::Left, Arrow::Right, Arrow::Up, Arrow::Down];
+        for i in 0..400usize {
+            let n = Nudge {
+                arrow: arrows[i % 4],
+                step: if i % 3 == 0 { 10 } else { 1 },
+                resize: (i / 4) % 5 == 0,
+            };
+            state.nudge(n, CANVAS);
+            let r = state.rect().unwrap_or_else(|| unreachable!("still there"));
+            assert!(r.width >= 1 && r.height >= 1, "{r:?}");
+            assert!(r.x >= 0 && r.y >= 0, "{r:?}");
+            assert!(r.right() <= i64::from(CANVAS.0), "{r:?}");
+            assert!(r.bottom() <= i64::from(CANVAS.1), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn a_focused_text_field_keeps_its_alt_arrow_chords() {
+        let Ok(scales) = crate::load_scales() else {
+            unreachable!("the committed tokens load");
+        };
+        let (mut tree, root) = aurora_widgets::widgets::new_tree(taffy::Style::default());
+        let Ok(field) =
+            aurora_widgets::widgets::insert_text_field(&mut tree, root, &scales, "Name", "x")
+        else {
+            unreachable!()
+        };
+        let Ok(boxed) = aurora_widgets::widgets::insert_checkbox(&mut tree, root, &scales, "c")
+        else {
+            unreachable!()
+        };
+        assert!(crate::crop_app::text_field_focused(&tree, Some(field)));
+        assert!(!crate::crop_app::text_field_focused(&tree, Some(boxed)));
+        assert!(!crate::crop_app::text_field_focused(&tree, None));
+        // With the field focused the decision is the modal one: ignored.
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            crop_key_action(
+                aurora_ui::Tool::Crop,
+                true,
+                true,
+                Key::Named(NamedKey::ArrowLeft),
+                alt
+            ),
+            CropKeyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn keys_belong_to_the_crop_only_with_a_rectangle_and_no_modal() {
+        let right = Key::Named(NamedKey::ArrowRight);
+        let none = Modifiers::default();
+        let crop = aurora_ui::Tool::Crop;
+        assert!(matches!(
+            crop_key_action(crop, true, false, right, none),
+            CropKeyAction::Nudge(_)
+        ));
+        // No rectangle: the key is not consumed.
+        for key in [
+            right,
+            Key::Named(NamedKey::Enter),
+            Key::Named(NamedKey::Escape),
+        ] {
+            assert_eq!(
+                crop_key_action(crop, false, false, key, none),
+                CropKeyAction::Ignore
+            );
+            // Another tool, or a dialog/palette open, either.
+            assert_eq!(
+                crop_key_action(aurora_ui::Tool::Brush, true, false, key, none),
+                CropKeyAction::Ignore
+            );
+            assert_eq!(
+                crop_key_action(crop, true, true, key, none),
+                CropKeyAction::Ignore
+            );
+        }
+        assert_eq!(
+            crop_key_action(crop, true, false, Key::Named(NamedKey::Enter), none),
+            CropKeyAction::Commit
+        );
+        assert_eq!(
+            crop_key_action(crop, true, false, Key::Named(NamedKey::Escape), none),
+            CropKeyAction::Cancel
+        );
+        // A key that is neither: not consumed.
+        assert_eq!(
+            crop_key_action(crop, true, false, Key::Character('a'), none),
+            CropKeyAction::Ignore
+        );
+    }
+
+    // ---- the guides ----
+
+    #[test]
+    fn guides_draw_only_for_the_crop_tool_with_a_rectangle_and_an_area() {
+        let view = aurora_ui::CanvasView::default();
+        let r = Some(rect(10, 10, 120, 90));
+        let size = Some((400.0, 300.0));
+        let shown = guides_for_frame(aurora_ui::Tool::Crop, r, size, &view, 1.0);
+        assert_eq!(shown.len(), 8);
+        assert!(guides_for_frame(aurora_ui::Tool::Brush, r, size, &view, 1.0).is_empty());
+        assert!(guides_for_frame(aurora_ui::Tool::Crop, None, size, &view, 1.0).is_empty());
+        assert!(guides_for_frame(aurora_ui::Tool::Crop, r, None, &view, 1.0).is_empty());
+    }
+
+    #[test]
+    fn the_frame_draws_the_guides_beneath_the_handles() {
+        let source = include_str!("lib.rs");
+        let lines: Vec<&str> = source.lines().map(str::trim).collect();
+        let guides = lines
+            .iter()
+            .position(|l| *l == "runs.extend(self.crop_guide_runs_now());");
+        let handles = lines
+            .iter()
+            .position(|l| *l == "runs.extend(self.crop_handle_runs_now());");
+        match (guides, handles) {
+            (Some(g), Some(h)) => assert!(g < h, "handles are pushed after the guides"),
+            other => unreachable!("both extends exist: {other:?}"),
+        }
+    }
+}

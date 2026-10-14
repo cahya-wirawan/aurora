@@ -27694,6 +27694,9 @@ struct App {
     quick_mask: Option<quick_mask::QuickMaskMode>,
     /// The Crop tool's rectangle and drag (0.226.0, [`crop`]).
     crop: crop::CropState,
+    /// The pointer cursor last handed to the window (0.231.0), so
+    /// `set_cursor` runs only when the Crop tool's choice changes.
+    crop_cursor: crop::CropCursor,
 }
 
 /// [`App`]'s caret-blink state (0.139.0), the inputs [`caret_step`]
@@ -28126,6 +28129,7 @@ impl App {
             ants: selection_view::AntsState::new(std::time::Instant::now()),
             quick_mask: None,
             crop: crop::CropState::default(),
+            crop_cursor: crop::CropCursor::Default,
         };
         // 0.173.0: the tab strip shows every startup document (several
         // after a crash recovery) with the active one selected.
@@ -32843,6 +32847,7 @@ impl App {
     /// paths themselves ([`refresh_properties_panel`]).
     fn sync_tool_controls_now(&mut self) {
         self.crop_drop_if_stale();
+        self.sync_crop_cursor_now();
         self.sync_colours_now();
         self.sync_menu_bar_now();
         let captured = self.gallery_click.captured();
@@ -33363,7 +33368,9 @@ impl App {
             ),
             None => Vec::new(),
         };
-        // The Crop tool's handles sit on top of its outline (0.226.0).
+        // The Crop tool's rule-of-thirds guides (0.231.0) and handles
+        // (0.226.0) sit on top of its outline, the handles over the guides.
+        runs.extend(self.crop_guide_runs_now());
         runs.extend(self.crop_handle_runs_now());
         if let Err(err) = aurora_ui::sync_selection_outline(
             &mut self.workspace.tree,

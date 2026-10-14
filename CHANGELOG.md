@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.231.0] - 2026-10-14
+
+### Changed
+
+- Crop polish: cursor, arrow-key nudging and rule-of-thirds guides
+
 ## [0.230.0] - 2026-10-14
 
 ### Changed

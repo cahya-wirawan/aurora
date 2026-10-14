@@ -74,6 +74,94 @@ pub fn crop_handle_runs(
     runs
 }
 
+/// The least distance, in physical pixels, a rule-of-thirds guide keeps
+/// from the frame and from its neighbour on the same axis (the dark rim
+/// round the light line is one pixel each side, so a gap of four leaves a
+/// clear pixel between any two drawn things). An axis too short for it
+/// draws no guides.
+pub const CROP_GUIDE_MIN_GAP: i64 = 4;
+
+/// The rule-of-thirds guides (0.231.0): two vertical and two horizontal
+/// lines at one third and two thirds of the crop rectangle, inside its
+/// frame, each a light line one physical pixel wide on a dark rim one
+/// pixel wide either side (the handles' pair: `selection.ants_light` /
+/// `selection.ants_dark`, no new token). Runs are in physical pixels from
+/// the canvas area's top-left corner, clipped to it, on the very pixel
+/// grid of the frame (`pixel_rect`), dark then light for each line.
+///
+/// An axis whose guides would sit within [`CROP_GUIDE_MIN_GAP`] pixels of
+/// the frame or of each other draws neither of its two lines (so a tiny
+/// rectangle shows no guides); an empty rectangle or a canvas area with
+/// no size gives nothing.
+#[must_use]
+pub fn crop_guide_runs(
+    rect: &Rect,
+    view: &CanvasView,
+    canvas_size: (f32, f32),
+    scale_factor: f32,
+) -> Vec<OutlineRun> {
+    if rect.is_empty() {
+        return Vec::new();
+    }
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        f64::from(scale_factor)
+    } else {
+        1.0
+    };
+    let clip = (
+        to_pixel(f64::from(canvas_size.0.max(0.0)) * scale),
+        to_pixel(f64::from(canvas_size.1.max(0.0)) * scale),
+    );
+    if clip.0 <= 0 || clip.1 <= 0 {
+        return Vec::new();
+    }
+    let (x0, y0, x1, y1): PixelRect = pixel_rect(rect, view, scale);
+    let mut runs = Vec::new();
+    if let Some(positions) = guide_positions(x0, x1) {
+        for p in positions {
+            // Inside the frame's own rows, so the frame is never overdrawn.
+            let (top, height) = (y0 + 1, y1 - y0 - 2);
+            push_clipped(
+                &mut runs,
+                (p - RIM, top, 1 + 2 * RIM, height),
+                clip,
+                OutlineTone::Dark,
+            );
+            push_clipped(&mut runs, (p, top, 1, height), clip, OutlineTone::Light);
+        }
+    }
+    if let Some(positions) = guide_positions(y0, y1) {
+        for p in positions {
+            let (left, width) = (x0 + 1, x1 - x0 - 2);
+            push_clipped(
+                &mut runs,
+                (left, p - RIM, width, 1 + 2 * RIM),
+                clip,
+                OutlineTone::Dark,
+            );
+            push_clipped(&mut runs, (left, p, width, 1), clip, OutlineTone::Light);
+        }
+    }
+    runs
+}
+
+/// The pixel numbers of the guides at one third and two thirds between
+/// `start` and `end` (each rounded to the nearest pixel), or `None` when
+/// either would be closer than [`CROP_GUIDE_MIN_GAP`] to an edge or to the
+/// other.
+fn guide_positions(start: i64, end: i64) -> Option<[i64; 2]> {
+    let length = end.checked_sub(start)?;
+    if length <= 0 {
+        return None;
+    }
+    let first = start + (length + 1) / 3;
+    let second = start + (2 * length + 1) / 3;
+    (first - start >= CROP_GUIDE_MIN_GAP
+        && second - first >= CROP_GUIDE_MIN_GAP
+        && end - second >= CROP_GUIDE_MIN_GAP)
+        .then_some([first, second])
+}
+
 /// The Crop tool's shield (0.227.0): the part of the canvas area outside
 /// the crop rectangle, as at most four non-overlapping rectangles (the
 /// band above, the band below, and the pieces left and right of the
@@ -515,5 +603,171 @@ mod tests {
             let overlaps = px0 < x1 && px1 > x0 && py0 < y1 && py1 > y0;
             assert!(!overlaps, "{piece:?} overlaps the crop pixels");
         }
+    }
+
+    // ---- the rule-of-thirds guides (0.231.0) ----
+
+    /// Splits guide runs into (dark, light) lists.
+    fn by_tone(runs: &[OutlineRun]) -> (Vec<OutlineRun>, Vec<OutlineRun>) {
+        let dark = runs
+            .iter()
+            .copied()
+            .filter(|r| r.tone == OutlineTone::Dark)
+            .collect();
+        let light = runs
+            .iter()
+            .copied()
+            .filter(|r| r.tone == OutlineTone::Light)
+            .collect();
+        (dark, light)
+    }
+
+    #[test]
+    fn four_guides_sit_at_a_third_and_two_thirds_inside_the_frame() {
+        let v = view();
+        // 300 x 150 document pixels at zoom 1 and scale 1: thirds are exact.
+        let r = rect(20, 30, 300, 150);
+        let runs = crop_guide_runs(&r, &v, (1000.0, 800.0), 1.0);
+        let (x0, y0, x1, y1) = pixel_box(&r, &v, 1.0);
+        assert_eq!(
+            runs.len(),
+            8,
+            "four lines, each a dark rim and a light line"
+        );
+        let (dark, light) = by_tone(&runs);
+        assert_eq!((dark.len(), light.len()), (4, 4));
+        // The vertical light lines: one pixel wide, full height inside the frame.
+        let verticals: Vec<&OutlineRun> = light.iter().filter(|l| l.width == 1).collect();
+        let xs: Vec<i64> = verticals.iter().map(|l| i64::from(l.x)).collect();
+        assert_eq!(xs, vec![x0 + 100, x0 + 200]);
+        for l in &verticals {
+            assert_eq!(i64::from(l.y), y0 + 1);
+            assert_eq!(i64::from(l.height), y1 - y0 - 2);
+        }
+        let horizontals: Vec<&OutlineRun> = light.iter().filter(|l| l.height == 1).collect();
+        let ys: Vec<i64> = horizontals.iter().map(|l| i64::from(l.y)).collect();
+        assert_eq!(ys, vec![y0 + 50, y0 + 100]);
+        for l in &horizontals {
+            assert_eq!(i64::from(l.x), x0 + 1);
+            assert_eq!(i64::from(l.width), x1 - x0 - 2);
+        }
+    }
+
+    #[test]
+    fn each_light_line_has_a_dark_rim_one_pixel_either_side_drawn_first() {
+        let v = view();
+        let runs = crop_guide_runs(&rect(20, 30, 300, 150), &v, (1000.0, 800.0), 1.0);
+        for pair in runs.chunks(2) {
+            let (rim, line) = (pair[0], pair[1]);
+            assert_eq!(rim.tone, OutlineTone::Dark);
+            assert_eq!(line.tone, OutlineTone::Light);
+            if line.width == 1 {
+                assert_eq!(
+                    (rim.x + 1, rim.y, rim.width, rim.height),
+                    (line.x, line.y, 3, line.height)
+                );
+            } else {
+                assert_eq!(line.height, 1);
+                assert_eq!(
+                    (rim.x, rim.y + 1, rim.width, rim.height),
+                    (line.x, line.y, line.width, 3)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_guide_pixel_is_strictly_inside_the_frame() {
+        let v = view();
+        for (w, h) in [(300u32, 150u32), (13, 40), (64, 64), (101, 97)] {
+            let r = rect(7, 9, w, h);
+            let (x0, y0, x1, y1) = pixel_box(&r, &v, 1.0);
+            for run in crop_guide_runs(&r, &v, (1000.0, 800.0), 1.0) {
+                let (rx0, ry0) = (i64::from(run.x), i64::from(run.y));
+                let (rx1, ry1) = (rx0 + i64::from(run.width), ry0 + i64::from(run.height));
+                assert!(
+                    rx0 > x0 && ry0 > y0 && rx1 < x1 && ry1 < y1,
+                    "{run:?} in {w}x{h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_guides_follow_the_scale_and_the_zoom_on_the_frames_pixel_grid() {
+        let mut v = view();
+        v.zoom_at((0.0, 0.0), 2.0);
+        let r = rect(10, 10, 90, 60);
+        let runs = crop_guide_runs(&r, &v, (2000.0, 2000.0), 2.0);
+        let (x0, y0, x1, y1) = pixel_box(&r, &v, 2.0);
+        let (_, light) = by_tone(&runs);
+        assert_eq!(light.len(), 4);
+        let width = x1 - x0;
+        let height = y1 - y0;
+        let first_x = light.iter().find(|l| l.width == 1).map(|l| i64::from(l.x));
+        assert_eq!(first_x, Some(x0 + (width + 1) / 3));
+        let first_y = light.iter().find(|l| l.height == 1).map(|l| i64::from(l.y));
+        assert_eq!(first_y, Some(y0 + (height + 1) / 3));
+    }
+
+    #[test]
+    fn a_short_axis_draws_neither_of_its_lines_and_a_tiny_rectangle_none() {
+        let v = view();
+        // 30 px wide (10 px thirds: fine) but 9 px tall (3 px thirds: too close).
+        let runs = crop_guide_runs(&rect(10, 10, 30, 9), &v, (500.0, 500.0), 1.0);
+        let (_, light) = by_tone(&runs);
+        assert_eq!(light.len(), 2, "only the two vertical lines");
+        assert!(light.iter().all(|l| l.width == 1));
+        // The mirror image.
+        let runs = crop_guide_runs(&rect(10, 10, 9, 30), &v, (500.0, 500.0), 1.0);
+        let (_, light) = by_tone(&runs);
+        assert_eq!(light.len(), 2);
+        assert!(light.iter().all(|l| l.height == 1));
+        // Tiny.
+        assert!(crop_guide_runs(&rect(10, 10, 3, 3), &v, (500.0, 500.0), 1.0).is_empty());
+        assert!(crop_guide_runs(&rect(10, 10, 1, 1), &v, (500.0, 500.0), 1.0).is_empty());
+    }
+
+    #[test]
+    fn the_guide_threshold_is_exactly_the_minimum_gap() {
+        // Thirds of 12 are 4 apart (drawn); thirds of 11 are 4, 3 (not).
+        let v = view();
+        let drawn = crop_guide_runs(&rect(0, 0, 12, 100), &v, (500.0, 500.0), 1.0);
+        assert!(
+            drawn
+                .iter()
+                .any(|r| r.tone == OutlineTone::Light && r.width == 1)
+        );
+        let skipped = crop_guide_runs(&rect(0, 0, 11, 100), &v, (500.0, 500.0), 1.0);
+        assert!(
+            !skipped
+                .iter()
+                .any(|r| r.tone == OutlineTone::Light && r.width == 1)
+        );
+        assert_eq!(CROP_GUIDE_MIN_GAP, 4);
+    }
+
+    #[test]
+    fn guides_are_cut_to_the_canvas_area_and_dropped_when_wholly_outside() {
+        let v = view();
+        // The rectangle runs far past a 100 x 100 area: lines stay inside it.
+        let r = rect(0, 0, 600, 600);
+        for run in crop_guide_runs(&r, &v, (100.0, 100.0), 1.0) {
+            assert!(run.x >= 0 && run.y >= 0);
+            assert!(i64::from(run.x) + i64::from(run.width) <= 100);
+            assert!(i64::from(run.y) + i64::from(run.height) <= 100);
+        }
+        // A rectangle wholly off to the right draws nothing.
+        assert!(crop_guide_runs(&rect(10_000, 0, 300, 300), &v, (100.0, 100.0), 1.0).is_empty());
+    }
+
+    #[test]
+    fn empty_rectangles_and_empty_areas_have_no_guides() {
+        let v = view();
+        assert!(crop_guide_runs(&rect(0, 0, 0, 90), &v, (500.0, 500.0), 1.0).is_empty());
+        assert!(crop_guide_runs(&rect(0, 0, 90, 90), &v, (0.0, 500.0), 1.0).is_empty());
+        let a = crop_guide_runs(&rect(0, 0, 90, 90), &v, (500.0, 500.0), f32::NAN);
+        let b = crop_guide_runs(&rect(0, 0, 90, 90), &v, (500.0, 500.0), 1.0);
+        assert_eq!(a, b);
     }
 }
