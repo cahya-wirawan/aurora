@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.228.0] - 2026-10-14
+
+### Added
+
+- Add Opacity and Flow to the Brush, Pencil and Clone Stamp
+
 ## [0.227.0] - 2026-10-14
 
 ### Added

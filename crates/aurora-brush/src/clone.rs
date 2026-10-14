@@ -47,6 +47,7 @@ use aurora_tile::{CHANNELS, SurfaceId, TILE, TileId, TileStore};
 use half::f16;
 
 use crate::StrokeSnapshot;
+use crate::amount::PaintAmount;
 use crate::coverage::{Coverage, blend_texel, covered};
 use crate::stamp::{
     ALPHA, DabOutcome, Texel, is_paintable, malformed_tile, reserved_tiles, stores_the_same_bits,
@@ -184,8 +185,25 @@ fn gather_patch(
 
 /// The texel a clone dab writes over `current`, or `None` to leave it:
 /// `source` weighted by the footprint's falloff `a` (see the module docs).
-fn clone_texel(current: &[f16], source: Texel, a: f32, preserve_alpha: bool) -> Option<Texel> {
+/// `began` is the texel as the stroke began it and `cap` the Opacity ceiling
+/// (`None` below: 100 %, the pre-0.228.0 arithmetic): the target moves to
+/// `began + (target - began) * cap` and the destination toward that by `a`
+/// (`crate::amount`).
+fn clone_texel(
+    current: &[f16],
+    began: &[f16],
+    source: Texel,
+    a: f32,
+    preserve_alpha: bool,
+    cap: Option<f32>,
+) -> Option<Texel> {
     let old = |c: usize| current.get(c).map_or(0.0, |v| v.to_f32());
+    let start = |c: usize| began.get(c).map_or(0.0, |v| v.to_f32());
+    // The target of channel `c`, limited by the opacity ceiling.
+    let limit = |c: usize, target: f32| match cap {
+        Some(o) => start(c) + (target - start(c)) * o,
+        None => target,
+    };
     if preserve_alpha {
         let dst_alpha = old(ALPHA);
         let src_alpha = source.get(ALPHA).map_or(0.0, |v| v.to_f32());
@@ -194,18 +212,21 @@ fn clone_texel(current: &[f16], source: Texel, a: f32, preserve_alpha: bool) -> 
         }
         let toward = |c: usize| {
             let straight = source.get(c).map_or(0.0, |v| v.to_f32()) / src_alpha;
-            let target = straight * dst_alpha;
+            let target = limit(c, straight * dst_alpha);
             f16::from_f32(old(c) + (target - old(c)) * a)
         };
         // Alpha kept bit for bit.
         let kept = current.get(ALPHA).copied()?;
         return Some([toward(0), toward(1), toward(2), kept]);
     }
-    if a >= 1.0 {
+    if a >= 1.0 && cap.is_none() {
         return Some(source);
     }
     let mix = |c: usize| {
-        let s = source.get(c).map_or(0.0, |v| v.to_f32());
+        let s = limit(c, source.get(c).map_or(0.0, |v| v.to_f32()));
+        if a >= 1.0 {
+            return f16::from_f32(s);
+        }
         f16::from_f32(old(c) + (s - old(c)) * a)
     };
     Some([mix(0), mix(1), mix(2), mix(3)])
@@ -267,6 +288,43 @@ pub fn clone_dab_covered(
     snapshot: Option<&mut StrokeSnapshot>,
     coverage: Option<&dyn Coverage>,
 ) -> DabOutcome {
+    clone_dab_amount(
+        store,
+        surface,
+        center,
+        radius,
+        offset,
+        preserve_alpha,
+        snapshot,
+        coverage,
+        PaintAmount::FULL,
+    )
+}
+
+/// [`clone_dab_covered`] with the stroke's Flow and Opacity (0.228.0, the
+/// model in [`PaintAmount`]): Flow scales the falloff weight (`a * flow`;
+/// below 100 % even the centre never copies exactly), Opacity limits the
+/// stroke to that fraction of the way from the content it started with.
+/// [`PaintAmount::FULL`] is exactly [`clone_dab_covered`].
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+pub fn clone_dab_amount(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    center: (f32, f32),
+    radius: f32,
+    offset: (i64, i64),
+    preserve_alpha: bool,
+    snapshot: Option<&mut StrokeSnapshot>,
+    coverage: Option<&dyn Coverage>,
+    amount: PaintAmount,
+) -> DabOutcome {
+    let flow = amount.flow();
+    let cap = amount.cap();
     let mut outcome = DabOutcome::default();
     if !is_paintable(center, radius) {
         return outcome;
@@ -349,63 +407,79 @@ pub fn clone_dab_covered(
                     continue;
                 }
             };
-            let mut touched_this_tile = false;
-            let mut capture_failed = false;
             let tile_texels = tile.texels_mut();
-
-            'texels: for ly in ly0..=ly1 {
-                for lx in lx0..=lx1 {
-                    let (x, y) = (origin_x + lx, origin_y + ly);
-                    #[allow(clippy::cast_precision_loss)]
-                    let px = x as f32 + 0.5;
-                    #[allow(clippy::cast_precision_loss)]
-                    let py = y as f32 + 0.5;
-                    let a = texel_alpha(px, py, center, radius, false);
-                    if a <= 0.0 {
-                        continue;
-                    }
-                    let cover = match tile_cov {
-                        Some(cov) => {
-                            let c = covered(cov, i64::from(x), i64::from(y));
-                            if c <= 0.0 {
-                                continue;
+            // As `crate::stamp_dab_amount`: the stroke-start content of the
+            // tile when an earlier dab already wrote it, else the tile is
+            // still as the stroke found it.
+            let mut clone_tile = |start: Option<&[f16]>, mut snap: Option<&mut StrokeSnapshot>| {
+                let mut touched_this_tile = false;
+                let mut capture_failed = false;
+                'texels: for ly in ly0..=ly1 {
+                    for lx in lx0..=lx1 {
+                        let (x, y) = (origin_x + lx, origin_y + ly);
+                        #[allow(clippy::cast_precision_loss)]
+                        let px = x as f32 + 0.5;
+                        #[allow(clippy::cast_precision_loss)]
+                        let py = y as f32 + 0.5;
+                        let a = texel_alpha(px, py, center, radius, false);
+                        if a <= 0.0 {
+                            continue;
+                        }
+                        // Flow (0.228.0); `a * 1.0` is `a` bit for bit.
+                        let a = a * flow;
+                        let cover = match tile_cov {
+                            Some(cov) => {
+                                let c = covered(cov, i64::from(x), i64::from(y));
+                                if c <= 0.0 {
+                                    continue;
+                                }
+                                c
                             }
-                            c
+                            None => 1.0,
+                        };
+                        let index = texel_index(lx, ly);
+                        let Some(current) = tile_texels.get(index..index + CHANNELS) else {
+                            continue;
+                        };
+                        let began = start
+                            .and_then(|s| s.get(index..index + CHANNELS))
+                            .unwrap_or(current);
+                        let Some(fresh) =
+                            clone_texel(current, began, patch.texel(x, y), a, preserve_alpha, cap)
+                        else {
+                            continue;
+                        };
+                        let fresh = if cover < 1.0 {
+                            blend_texel(current, fresh, cover)
+                        } else {
+                            fresh
+                        };
+                        if stores_the_same_bits(current, fresh) {
+                            continue;
                         }
-                        None => 1.0,
-                    };
-                    let index = texel_index(lx, ly);
-                    let Some(current) = tile_texels.get(index..index + CHANNELS) else {
-                        continue;
-                    };
-                    let Some(fresh) = clone_texel(current, patch.texel(x, y), a, preserve_alpha)
-                    else {
-                        continue;
-                    };
-                    let fresh = if cover < 1.0 {
-                        blend_texel(current, fresh, cover)
-                    } else {
-                        fresh
-                    };
-                    if stores_the_same_bits(current, fresh) {
-                        continue;
-                    }
-                    if !touched_this_tile {
-                        if let Some(stroke) = snapshot.as_mut()
-                            && !stroke.record_content(id, tile_texels)
-                        {
-                            capture_failed = true;
-                            break 'texels;
+                        if !touched_this_tile {
+                            if let Some(stroke) = snap.as_mut()
+                                && !stroke.record_content(id, tile_texels)
+                            {
+                                capture_failed = true;
+                                break 'texels;
+                            }
+                            touched_this_tile = true;
                         }
-                        touched_this_tile = true;
-                    }
-                    for (channel, &value) in fresh.iter().enumerate() {
-                        if let Some(sample) = tile_texels.get_mut(index + channel) {
-                            *sample = value;
+                        for (channel, &value) in fresh.iter().enumerate() {
+                            if let Some(sample) = tile_texels.get_mut(index + channel) {
+                                *sample = value;
+                            }
                         }
                     }
                 }
-            }
+                (touched_this_tile, capture_failed)
+            };
+            let (touched_this_tile, capture_failed) =
+                match snapshot.as_deref().and_then(|s| s.raw_content(id)) {
+                    Some(raw) => clone_tile(Some(raw), None),
+                    None => clone_tile(None, snapshot.as_deref_mut()),
+                };
             if capture_failed {
                 outcome.fail(id, malformed_tile(surface, id, tile_texels.len()));
                 continue;

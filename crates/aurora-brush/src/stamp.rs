@@ -49,6 +49,7 @@ use aurora_tile::{CHANNELS, SAMPLES, SurfaceId, TILE, TileError, TileId, TileSto
 use half::f16;
 
 use crate::StrokeSnapshot;
+use crate::amount::PaintAmount;
 use crate::coverage::{Coverage, TileCover, blend_texel, covered, tile_cover};
 
 /// Index of tile-local pixel `(x, y)`'s first (red) channel within a
@@ -367,7 +368,16 @@ pub fn stamp_dab(
     snapshot: Option<&mut StrokeSnapshot>,
 ) -> DabOutcome {
     stamp_dab_impl(
-        store, surface, center, radius, colour, snapshot, false, false, None,
+        store,
+        surface,
+        center,
+        radius,
+        colour,
+        snapshot,
+        false,
+        false,
+        None,
+        PaintAmount::FULL,
     )
 }
 
@@ -387,7 +397,16 @@ pub fn stamp_dab_covered(
     coverage: Option<&dyn Coverage>,
 ) -> DabOutcome {
     stamp_dab_impl(
-        store, surface, center, radius, colour, snapshot, false, false, coverage,
+        store,
+        surface,
+        center,
+        radius,
+        colour,
+        snapshot,
+        false,
+        false,
+        coverage,
+        PaintAmount::FULL,
     )
 }
 
@@ -405,7 +424,16 @@ pub fn stamp_dab_preserving_alpha(
     snapshot: Option<&mut StrokeSnapshot>,
 ) -> DabOutcome {
     stamp_dab_impl(
-        store, surface, center, radius, colour, snapshot, true, false, None,
+        store,
+        surface,
+        center,
+        radius,
+        colour,
+        snapshot,
+        true,
+        false,
+        None,
+        PaintAmount::FULL,
     )
 }
 
@@ -421,7 +449,16 @@ pub fn stamp_dab_preserving_alpha_covered(
     coverage: Option<&dyn Coverage>,
 ) -> DabOutcome {
     stamp_dab_impl(
-        store, surface, center, radius, colour, snapshot, true, false, coverage,
+        store,
+        surface,
+        center,
+        radius,
+        colour,
+        snapshot,
+        true,
+        false,
+        coverage,
+        PaintAmount::FULL,
     )
 }
 
@@ -442,7 +479,16 @@ pub fn stamp_dab_hard(
     snapshot: Option<&mut StrokeSnapshot>,
 ) -> DabOutcome {
     stamp_dab_impl(
-        store, surface, center, radius, colour, snapshot, false, true, None,
+        store,
+        surface,
+        center,
+        radius,
+        colour,
+        snapshot,
+        false,
+        true,
+        None,
+        PaintAmount::FULL,
     )
 }
 
@@ -460,7 +506,16 @@ pub fn stamp_dab_hard_covered(
     coverage: Option<&dyn Coverage>,
 ) -> DabOutcome {
     stamp_dab_impl(
-        store, surface, center, radius, colour, snapshot, false, true, coverage,
+        store,
+        surface,
+        center,
+        radius,
+        colour,
+        snapshot,
+        false,
+        true,
+        coverage,
+        PaintAmount::FULL,
     )
 }
 
@@ -476,7 +531,16 @@ pub fn stamp_dab_hard_preserving_alpha(
     snapshot: Option<&mut StrokeSnapshot>,
 ) -> DabOutcome {
     stamp_dab_impl(
-        store, surface, center, radius, colour, snapshot, true, true, None,
+        store,
+        surface,
+        center,
+        radius,
+        colour,
+        snapshot,
+        true,
+        true,
+        None,
+        PaintAmount::FULL,
     )
 }
 
@@ -491,7 +555,49 @@ pub fn stamp_dab_hard_preserving_alpha_covered(
     coverage: Option<&dyn Coverage>,
 ) -> DabOutcome {
     stamp_dab_impl(
-        store, surface, center, radius, colour, snapshot, true, true, coverage,
+        store,
+        surface,
+        center,
+        radius,
+        colour,
+        snapshot,
+        true,
+        true,
+        coverage,
+        PaintAmount::FULL,
+    )
+}
+
+/// The general dab entry (0.228.0): every variant above is this with
+/// [`PaintAmount::FULL`]. `preserve_alpha` is the transparency lock, `hard`
+/// the Pencil's dab, `amount` the stroke's Flow and Opacity
+/// ([`PaintAmount`], whose docs define the model; the Pencil ignores Flow).
+/// `snapshot` must be the stroke's own: it holds the stroke-start content
+/// Opacity limits against. With no snapshot every dab is its own stroke.
+#[allow(clippy::too_many_arguments)]
+pub fn stamp_dab_amount(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    center: (f32, f32),
+    radius: f32,
+    colour: [f32; 3],
+    snapshot: Option<&mut StrokeSnapshot>,
+    coverage: Option<&dyn Coverage>,
+    preserve_alpha: bool,
+    hard: bool,
+    amount: PaintAmount,
+) -> DabOutcome {
+    stamp_dab_impl(
+        store,
+        surface,
+        center,
+        radius,
+        colour,
+        snapshot,
+        preserve_alpha,
+        hard,
+        coverage,
+        amount,
     )
 }
 
@@ -590,8 +696,14 @@ fn stamp_dab_impl(
     preserve_alpha: bool,
     hard: bool,
     coverage: Option<&dyn Coverage>,
+    amount: PaintAmount,
 ) -> DabOutcome {
     let mut outcome = DabOutcome::default();
+    // Flow scales the soft dab's alpha; the Pencil has none (0.228.0).
+    let flow = if hard { 1.0 } else { amount.flow() };
+    // Opacity is a per-stroke ceiling (0.228.0, `crate::amount`); `None` is
+    // the unchanged 0.227.0 code.
+    let opacity = amount.cap();
     // The Pencil aligns to the texel grid (0.220.0).
     let center = if hard {
         crate::mask_dab::hard_dab_snap(center)
@@ -653,120 +765,180 @@ fn stamp_dab_impl(
                     continue;
                 }
             };
-            let mut touched_this_tile = false;
-            let mut capture_failed = false;
             let texels = tile.texels_mut();
-
-            'texels: for ly in ly0..=ly1 {
-                for lx in lx0..=lx1 {
-                    #[allow(clippy::cast_precision_loss)]
-                    let px = (origin_x + lx) as f32 + 0.5;
-                    #[allow(clippy::cast_precision_loss)]
-                    let py = (origin_y + ly) as f32 + 0.5;
-                    // Smooth falloff; hardness is not a variable here,
-                    // matching the spike this is ported from. The Pencil's
-                    // `a` is exactly 1 inside its footprint and 0 outside.
-                    let a = texel_alpha(px, py, center, radius, hard);
-                    if a <= 0.0 {
-                        continue;
-                    }
-                    let cover = match tile_cov {
-                        Some(cov) => {
-                            let c =
-                                covered(cov, i64::from(origin_x + lx), i64::from(origin_y + ly));
-                            if c <= 0.0 {
+            // The stroke-start content of this tile, when the stroke has
+            // already written it (its pre-stroke copy is in the snapshot);
+            // otherwise the tile is still as the stroke found it. Only the
+            // opacity cap reads it. The two arms are split so the snapshot
+            // is borrowed shared for the read and mutably for the capture,
+            // never both.
+            let mut paint_tile = |start: Option<&[f16]>, mut snap: Option<&mut StrokeSnapshot>| {
+                let mut touched_this_tile = false;
+                let mut capture_failed = false;
+                'texels: for ly in ly0..=ly1 {
+                    for lx in lx0..=lx1 {
+                        #[allow(clippy::cast_precision_loss)]
+                        let px = (origin_x + lx) as f32 + 0.5;
+                        #[allow(clippy::cast_precision_loss)]
+                        let py = (origin_y + ly) as f32 + 0.5;
+                        // Smooth falloff; hardness is not a variable here,
+                        // matching the spike this is ported from. The
+                        // Pencil's `a` is exactly 1 inside its footprint and
+                        // 0 outside. Flow (0.228.0) scales it: `a * 1.0` is
+                        // `a` bit for bit.
+                        let a = texel_alpha(px, py, center, radius, hard);
+                        if a <= 0.0 {
+                            continue;
+                        }
+                        let a = a * flow;
+                        let cover = match tile_cov {
+                            Some(cov) => {
+                                let c = covered(
+                                    cov,
+                                    i64::from(origin_x + lx),
+                                    i64::from(origin_y + ly),
+                                );
+                                if c <= 0.0 {
+                                    continue;
+                                }
+                                c
+                            }
+                            None => 1.0,
+                        };
+                        let index = texel_index(lx, ly);
+                        let Some(current) = texels.get(index..index + CHANNELS) else {
+                            continue;
+                        };
+                        let Some(&dst_a) = current.last() else {
+                            continue;
+                        };
+                        let [red, green, blue] = colour;
+                        // The texel as the stroke began it (opacity cap only).
+                        let began = start
+                            .and_then(|s| s.get(index..index + CHANNELS))
+                            .unwrap_or(current);
+                        let at_start = |c: usize| began.get(c).map_or(0.0, |v| v.to_f32());
+                        let fresh: Texel = if preserve_alpha {
+                            // Transparency lock (0.198.0): the texel keeps its
+                            // alpha bit for bit; only its colour moves toward
+                            // `colour` by the dab's coverage `a`. Premultiplied:
+                            // old * (1 - a) + colour * alpha * a. A fully
+                            // transparent texel has no colour to paint.
+                            let alpha = dst_a.to_f32();
+                            if alpha <= 0.0 {
                                 continue;
                             }
-                            c
-                        }
-                        None => 1.0,
-                    };
-                    let index = texel_index(lx, ly);
-                    let Some(current) = texels.get(index..index + CHANNELS) else {
-                        continue;
-                    };
-                    let Some(&dst_a) = current.last() else {
-                        continue;
-                    };
-                    let [red, green, blue] = colour;
-                    let fresh: Texel = if preserve_alpha {
-                        // Transparency lock (0.198.0): the texel keeps its
-                        // alpha bit for bit; only its colour moves toward
-                        // `colour` by the dab's coverage `a`. Premultiplied:
-                        // old * (1 - a) + colour * alpha * a. A fully
-                        // transparent texel has no colour to paint.
-                        let alpha = dst_a.to_f32();
-                        if alpha <= 0.0 {
+                            let old = |c: usize| current.get(c).map_or(0.0, |v| v.to_f32());
+                            if let Some(o) = opacity {
+                                // Opacity ceiling: move toward the
+                                // opacity-limited target `start + (colour *
+                                // alpha - start) * o` by `a` (the stored
+                                // value is `start + (painted - start) * o`).
+                                let toward = |c: usize, paint: f32| {
+                                    let s = at_start(c);
+                                    let limit = s + (paint * alpha - s) * o;
+                                    f16::from_f32(old(c) * (1.0 - a) + limit * a)
+                                };
+                                [toward(0, red), toward(1, green), toward(2, blue), dst_a]
+                            } else {
+                                [
+                                    f16::from_f32(old(0) * (1.0 - a) + red * alpha * a),
+                                    f16::from_f32(old(1) * (1.0 - a) + green * alpha * a),
+                                    f16::from_f32(old(2) * (1.0 - a) + blue * alpha * a),
+                                    dst_a,
+                                ]
+                            }
+                        } else if let Some(o) = opacity {
+                            // Opacity ceiling (0.228.0): the texel the stroke
+                            // would have painted, limited to `o` of the way
+                            // from the stroke-start texel. The max-alpha rule
+                            // is judged on the limited alpha against what is
+                            // stored (the same decision as on the unlimited
+                            // alpha, since the limit is increasing in it), so
+                            // a stroke crossing itself never goes past `o`.
+                            let limited = |c: usize, painted: f32| {
+                                let s = at_start(c);
+                                f16::from_f32(s + (painted - s) * o)
+                            };
+                            let fresh = [
+                                limited(0, red * a),
+                                limited(1, green * a),
+                                limited(2, blue * a),
+                                limited(3, a),
+                            ];
+                            if !hard && fresh[ALPHA].to_f32() <= dst_a.to_f32() {
+                                continue;
+                            }
+                            fresh
+                        } else {
+                            // Max-alpha accumulation, this module's own rule:
+                            // a dab never lowers a texel's alpha. A hard dab
+                            // replaces instead (`a` is 1).
+                            if !hard && a <= dst_a.to_f32() {
+                                continue;
+                            }
+                            // What this texel would actually *store*, computed
+                            // before anything is decided on it -- comparing the
+                            // `f32` `a` against the `f16` already there answers
+                            // a different question than "will this write change
+                            // anything" (`stores_the_same_bits`).
+                            [
+                                f16::from_f32(red * a),
+                                f16::from_f32(green * a),
+                                f16::from_f32(blue * a),
+                                f16::from_f32(a),
+                            ]
+                        };
+                        // Selection (0.211.0): blend by coverage; full coverage
+                        // keeps `fresh` untouched, so the no-selection output
+                        // is the same bits it always was.
+                        let fresh = if cover < 1.0 {
+                            blend_texel(current, fresh, cover)
+                        } else {
+                            fresh
+                        };
+                        if stores_the_same_bits(current, fresh) {
                             continue;
                         }
-                        let old = |c: usize| current.get(c).map_or(0.0, |v| v.to_f32());
-                        [
-                            f16::from_f32(old(0) * (1.0 - a) + red * alpha * a),
-                            f16::from_f32(old(1) * (1.0 - a) + green * alpha * a),
-                            f16::from_f32(old(2) * (1.0 - a) + blue * alpha * a),
-                            dst_a,
-                        ]
-                    } else {
-                        // Max-alpha accumulation, this module's own rule: a
-                        // dab never lowers a texel's alpha. A hard dab
-                        // replaces instead (`a` is 1).
-                        if !hard && a <= dst_a.to_f32() {
-                            continue;
+                        // Every `continue` above is a texel this dab
+                        // declined to write, and a tile can be made
+                        // entirely of them. This line is the first moment
+                        // this tile is certainly about to change, so it is
+                        // where the pre-dab content is captured: after that
+                        // certainty, before the write two lines down, and
+                        // never for a tile that turns out to change nothing.
+                        if !touched_this_tile {
+                            // A refused capture must not become a painted
+                            // tile with no undo entry: abandon this tile
+                            // entirely instead, before its first write, and
+                            // report it as failed. Unreachable from any
+                            // caller in this workspace (both hand a whole
+                            // `Tile::texels()` slice), which is exactly why
+                            // it must not be able to quietly cost a user
+                            // their undo if a future one gets it wrong.
+                            if let Some(stroke) = snap.as_mut()
+                                && !stroke.record_content(id, texels)
+                            {
+                                capture_failed = true;
+                                break 'texels;
+                            }
+                            touched_this_tile = true;
                         }
-                        // What this texel would actually *store*, computed
-                        // before anything is decided on it -- comparing the
-                        // `f32` `a` against the `f16` already there answers a
-                        // different question than "will this write change
-                        // anything" (`stores_the_same_bits`).
-                        [
-                            f16::from_f32(red * a),
-                            f16::from_f32(green * a),
-                            f16::from_f32(blue * a),
-                            f16::from_f32(a),
-                        ]
-                    };
-                    // Selection (0.211.0): blend by coverage; full coverage
-                    // keeps `fresh` untouched, so the no-selection output is
-                    // the same bits it always was.
-                    let fresh = if cover < 1.0 {
-                        blend_texel(current, fresh, cover)
-                    } else {
-                        fresh
-                    };
-                    if stores_the_same_bits(current, fresh) {
-                        continue;
-                    }
-                    // Every `continue` above is a texel this dab
-                    // declined to write, and a tile can be made
-                    // entirely of them. This line is the first moment
-                    // this tile is certainly about to change, so it is
-                    // where the pre-dab content is captured: after that
-                    // certainty, before the write two lines down, and
-                    // never for a tile that turns out to change nothing.
-                    if !touched_this_tile {
-                        // A refused capture must not become a painted
-                        // tile with no undo entry: abandon this tile
-                        // entirely instead, before its first write, and
-                        // report it as failed. Unreachable from any
-                        // caller in this workspace (both hand a whole
-                        // `Tile::texels()` slice), which is exactly why
-                        // it must not be able to quietly cost a user
-                        // their undo if a future one gets it wrong.
-                        if let Some(stroke) = snapshot.as_mut()
-                            && !stroke.record_content(id, texels)
-                        {
-                            capture_failed = true;
-                            break 'texels;
-                        }
-                        touched_this_tile = true;
-                    }
-                    for (channel, &value) in fresh.iter().enumerate() {
-                        if let Some(sample) = texels.get_mut(index + channel) {
-                            *sample = value;
+                        for (channel, &value) in fresh.iter().enumerate() {
+                            if let Some(sample) = texels.get_mut(index + channel) {
+                                *sample = value;
+                            }
                         }
                     }
                 }
-            }
+                (touched_this_tile, capture_failed)
+            };
+            let (touched_this_tile, capture_failed) =
+                match snapshot.as_deref().and_then(|s| s.raw_content(id)) {
+                    // Already captured by an earlier dab of this stroke.
+                    Some(raw) => paint_tile(Some(raw), None),
+                    None => paint_tile(None, snapshot.as_deref_mut()),
+                };
             if capture_failed {
                 outcome.fail(id, malformed_tile(surface, id, texels.len()));
                 continue;
