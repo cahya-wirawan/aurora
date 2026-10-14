@@ -27139,6 +27139,7 @@ enum LockRefusal {
 
 impl LockRefusal {
     /// The status-bar notice.
+    #[allow(clippy::too_many_lines)]
     const fn message(self) -> &'static str {
         match self {
             LockRefusal::PixelsLocked => {

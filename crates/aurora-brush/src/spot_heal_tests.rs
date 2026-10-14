@@ -548,7 +548,7 @@ fn too_little_around_the_mask_is_refused_and_writes_nothing() {
     paint(&mut s, 5, 5, |_, _| texel(0.5, 0.5, 0.5, 1.0));
     let before = dump(&mut s, 12, 12);
     let mask = disc(2.5, 2.5, 2.4);
-    const { assert!(MIN_RING_TEXELS > 4) };
+    assert_eq!(MIN_RING_TEXELS, 16);
     assert_eq!(
         heal(&mut s, &mask, false, None, None).err(),
         Some(HealRefusal::NotEnoughSurroundings)
@@ -568,7 +568,8 @@ fn a_ring_of_exactly_the_minimum_heals_and_one_short_is_refused() {
     // A one-texel mask at (50, 50): the domain is x, y in 48..=52. The ring
     // is every opaque texel outside it; paint exactly `n` in a row from
     // (53, 50), the first of which is also the mask's boundary neighbour.
-    for (n, ok) in [(MIN_RING_TEXELS - 1, false), (MIN_RING_TEXELS, true)] {
+    assert_eq!(MIN_RING_TEXELS, 16);
+    for (n, ok) in [(15_usize, false), (16, true)] {
         let (_dir, mut s) = store();
         for k in 0..n {
             put(
@@ -809,6 +810,45 @@ fn an_unreadable_tile_fails_the_heal_before_any_write() {
     };
     assert!(!out.is_complete());
     assert!(out.painted().is_empty());
+}
+
+#[test]
+fn the_healed_alpha_and_colour_stay_valid_when_the_source_overshoots() {
+    // The ring is opaque; the only usable sources are faint (alpha 0.2)
+    // blocks with one opaque texel inside the footprint. Where the opaque
+    // texel lands the gradient-domain sum is 1.0 + 0.8 = 1.8 before the
+    // clamp.
+    let (_dir, mut s) = store();
+    let grey = |a: f32| texel(0.5, 0.5, 0.5, a);
+    let mask = disc(30.5, 30.5, 5.0);
+    let in_domain =
+        |x: i64, y: i64| (-2..=2).any(|dy| (-2..=2).any(|dx| mask.contains(x + dx, y + dy)));
+    for y in 14..=47_u32 {
+        for x in 14..=47_u32 {
+            if !in_domain(i64::from(x), i64::from(y)) {
+                put(&mut s, x, y, grey(1.0));
+            }
+        }
+    }
+    for y in 14..=47_u32 {
+        for x in 62..=95_u32 {
+            put(&mut s, x, y, grey(0.2));
+        }
+    }
+    put(&mut s, 78, 30, grey(1.0));
+    assert!(heal(&mut s, &mask, false, None, None).is_ok());
+    let mut brightest = 0.0_f32;
+    for y in 26..=34 {
+        for x in 26..=34 {
+            let t = getf(&mut s, x, y);
+            assert!(t[3] <= 1.0, "alpha {t:?}");
+            assert!(t.iter().take(3).all(|c| *c <= t[3] + 1.0e-3), "{t:?}");
+            brightest = brightest.max(t[3]);
+        }
+    }
+    // The clamp was reached: some texel is fully opaque, the rest follow
+    // the faint source plus the ring's difference.
+    assert!(brightest > 0.99, "{brightest}");
 }
 
 /// Prints the cost of a heal of a square mask (dev profile numbers for the

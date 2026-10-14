@@ -1063,7 +1063,7 @@ fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
     );
     // The tools panel has one button per tool, the new one wearing its
     // own icon.
-    assert_eq!(workspace.tools.buttons.len(), 23);
+    assert_eq!(workspace.tools.buttons.len(), 24);
     assert_eq!(
         aurora_ui::tool_icon(Tool::EllipticalMarquee),
         aurora_widgets::icons::IconKind::EllipseMarquee

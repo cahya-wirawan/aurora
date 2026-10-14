@@ -299,9 +299,10 @@ fn the_release_heals_the_area_as_one_undo_step_that_undoes_bit_for_bit() {
     // The blemish is gone: the centre is a stripe colour again.
     let truth = stripes(60, 60);
     let index = ((60 * aurora_tile::TILE + 60) as usize) * 4;
-    let got = half::f16::from_bits(healed[index]).to_f32();
+    let got = half::f16::from_bits(healed.get(index).copied().unwrap_or(0)).to_f32();
     assert!((got - truth[0]).abs() < 0.03, "{got} vs {truth:?}");
-    // Finishing again heals nothing more.
+    // The painted area was consumed: finishing again heals nothing more.
+    assert!(spot_heal_stamp::drag_stroke(drag.as_ref()).is_some_and(|s| s.mask().is_empty()));
     assert_eq!(spot_heal_stamp::finish(&mut drag, &mut doc), None);
     assert_eq!(dump(&mut doc, id), healed);
     let (recorded, order) = end(drag, &mut doc);
