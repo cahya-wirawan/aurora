@@ -74,27 +74,61 @@ impl App {
         self.sync_status_bar_now();
     }
 
-    /// Enter commits and Escape cancels a crop rectangle, offered after the
+    /// Enter commits and Escape cancels a crop rectangle, and (0.231.0) the
+    /// arrow keys nudge it (see [`crop::nudge_for_key`]), offered after the
     /// focused widgets. Returns whether the key was used.
     pub(crate) fn crop_key_now(&mut self, key: Key) -> bool {
-        if self.tool != aurora_ui::Tool::Crop
-            || self.crop.rect().is_none()
-            || self.dialog.is_some()
-            || self.command_palette.is_some()
-        {
-            return false;
-        }
-        match key {
-            Key::Named(NamedKey::Enter) => {
+        let action = crop_key_action(
+            self.tool,
+            self.crop.rect().is_some(),
+            self.dialog.is_some() || self.command_palette.is_some(),
+            key,
+            self.modifiers,
+        );
+        match action {
+            CropKeyAction::Ignore => return false,
+            CropKeyAction::Commit => {
                 if let Some(rect) = self.crop.rect() {
                     self.crop_commit_rect(rect);
                 }
             }
-            Key::Named(NamedKey::Escape) => self.crop.cancel(),
-            _ => return false,
+            CropKeyAction::Cancel => self.crop.cancel(),
+            // Used even while a drag is live (then it changes nothing), so
+            // an arrow never also reaches a shortcut.
+            CropKeyAction::Nudge(nudge) => {
+                self.crop.nudge(nudge, self.doc.canvas_size);
+            }
         }
         self.crop_changed_visibly();
         true
+    }
+
+    /// The cursor the Crop tool wants right now: its pointer is over the
+    /// canvas, no dialog or palette is open.
+    fn wanted_crop_cursor(&self) -> crop::CropCursor {
+        let over_canvas = if self.dialog.is_some() || self.command_palette.is_some() {
+            None
+        } else {
+            self.pointer_position
+                .and_then(|position| crate::pointer_in_canvas(&self.workspace, position))
+        };
+        let pointer = over_canvas.map(|point| self.doc.canvas_view.to_document(point));
+        let rect = self.crop.rect();
+        crop::cursor_for(self.tool, rect.as_ref(), pointer, self.crop_hit_radius())
+    }
+
+    /// Hands the window the Crop tool's cursor when it differs from the one
+    /// last set (run once per loop turn). Every other tool keeps the
+    /// window's ordinary pointer; the app sets no other cursor.
+    pub(crate) fn sync_crop_cursor_now(&mut self) {
+        let wanted = self.wanted_crop_cursor();
+        if wanted == self.crop_cursor {
+            return;
+        }
+        self.crop_cursor = wanted;
+        if let Some(window) = self.window.as_ref() {
+            window.set_cursor(wanted.icon());
+        }
     }
 
     /// Cancels a crop rectangle that no longer belongs to the active tool,
@@ -220,6 +254,18 @@ impl App {
         )
     }
 
+    /// The rule-of-thirds guides of the crop rectangle for this frame
+    /// (empty without one).
+    pub(crate) fn crop_guide_runs_now(&self) -> Vec<aurora_widgets::widgets::OutlineRun> {
+        guides_for_frame(
+            self.tool,
+            self.crop.rect(),
+            crate::canvas_area_logical_size(&self.workspace),
+            &self.doc.canvas_view,
+            guarded_scale_factor(self.scale_factor),
+        )
+    }
+
     /// The Crop shield for this frame: the canvas area outside the crop
     /// rectangle while the Crop tool has one (empty otherwise).
     pub(crate) fn crop_shield_rects_now(&self) -> Vec<aurora_widgets::widgets::ShieldRect> {
@@ -259,4 +305,53 @@ pub(crate) fn shield_for_frame(
         return Vec::new();
     };
     aurora_ui::crop_shield_rects(&rect, view, size, scale_factor)
+}
+
+/// [`App::crop_guide_runs_now`]'s decision as a free function: guides only
+/// while the Crop tool is active, has a rectangle and the canvas area has a
+/// size.
+pub(crate) fn guides_for_frame(
+    tool: aurora_ui::Tool,
+    rect: Option<aurora_core::Rect>,
+    canvas_size: Option<(f32, f32)>,
+    view: &aurora_ui::CanvasView,
+    scale_factor: f32,
+) -> Vec<aurora_widgets::widgets::OutlineRun> {
+    let (aurora_ui::Tool::Crop, Some(rect), Some(size)) = (tool, rect, canvas_size) else {
+        return Vec::new();
+    };
+    aurora_ui::crop_guide_runs(&rect, view, size, scale_factor)
+}
+
+/// What a key means to the Crop tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CropKeyAction {
+    /// Not the Crop tool's key (or no rectangle, or a modal is open): the
+    /// key goes on to the shortcuts.
+    Ignore,
+    Commit,
+    Cancel,
+    Nudge(crop::Nudge),
+}
+
+/// [`App::crop_key_now`]'s decision as a free function: the keys are only
+/// the Crop tool's while it is active and holds a rectangle and no dialog
+/// or palette is open.
+pub(crate) fn crop_key_action(
+    tool: aurora_ui::Tool,
+    has_rect: bool,
+    modal_open: bool,
+    key: Key,
+    modifiers: aurora_widgets::shortcut::Modifiers,
+) -> CropKeyAction {
+    if tool != aurora_ui::Tool::Crop || !has_rect || modal_open {
+        return CropKeyAction::Ignore;
+    }
+    match key {
+        Key::Named(NamedKey::Enter) => CropKeyAction::Commit,
+        Key::Named(NamedKey::Escape) => CropKeyAction::Cancel,
+        _ => {
+            crop::nudge_for_key(key, modifiers).map_or(CropKeyAction::Ignore, CropKeyAction::Nudge)
+        }
+    }
 }

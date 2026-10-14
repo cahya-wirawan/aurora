@@ -125,7 +125,10 @@ pub use colour_controls::{
     is_colour_control, open_colour_popover, swatch_colour, swatch_description, swatch_name,
     sync_colour_controls,
 };
-pub use crop_overlay::{CROP_HANDLE_COUNT, crop_handle_runs, crop_shield_rects, sync_crop_shield};
+pub use crop_overlay::{
+    CROP_GUIDE_MIN_GAP, CROP_HANDLE_COUNT, crop_guide_runs, crop_handle_runs, crop_shield_rects,
+    sync_crop_shield,
+};
 pub use fill_controls::{
     FillControls, FillView, OPACITY_MAX, OPACITY_MIN, STRENGTH_MAX, STRENGTH_MIN, TOLERANCE_MAX,
     TOLERANCE_MIN, flow_readout_text, has_paint_flow, has_paint_opacity, insert_fill_controls,

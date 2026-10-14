@@ -39,8 +39,9 @@
 use std::time::{Duration, Instant};
 
 use aurora_core::Rect;
+use aurora_widgets::shortcut::{Modifiers, NamedKey};
 
-use crate::{LockRefusal, UndoOrder};
+use crate::{Key, LockRefusal, UndoOrder};
 
 /// The palette / menu id of "Crop to Selection".
 pub(crate) const COMMAND_CROP_TO_SELECTION: &str = "select.crop_to_selection";
@@ -299,6 +300,155 @@ pub(crate) fn hit_test(rect: &Rect, p: (f32, f32), radius: f32) -> CropHit {
     }
 }
 
+/// The pointer cursor the Crop tool wants over the canvas (0.231.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum CropCursor {
+    /// The window's ordinary pointer: another tool, off the canvas, or a
+    /// modal in the way.
+    #[default]
+    Default,
+    /// No rectangle yet, or the pointer is outside it: a drag makes one.
+    Crosshair,
+    /// Inside the rectangle: a drag moves it.
+    Move,
+    /// Over the top or bottom handle.
+    ResizeNs,
+    /// Over the left or right handle.
+    ResizeEw,
+    /// Over the top-right or bottom-left handle.
+    ResizeNeSw,
+    /// Over the top-left or bottom-right handle.
+    ResizeNwSe,
+}
+
+impl CropCursor {
+    /// The winit icon for the kind: the one place the kinds meet winit.
+    pub(crate) const fn icon(self) -> winit::window::CursorIcon {
+        use winit::window::CursorIcon;
+        match self {
+            Self::Default => CursorIcon::Default,
+            Self::Crosshair => CursorIcon::Crosshair,
+            Self::Move => CursorIcon::Move,
+            Self::ResizeNs => CursorIcon::NsResize,
+            Self::ResizeEw => CursorIcon::EwResize,
+            Self::ResizeNeSw => CursorIcon::NeswResize,
+            Self::ResizeNwSe => CursorIcon::NwseResize,
+        }
+    }
+}
+
+/// The cursor for `tool` with the pointer at document point `pointer`
+/// (`None` when it is not over the canvas, or something modal is open):
+/// the ordinary one unless the Crop tool is active, then a crosshair with
+/// no rectangle or outside it, a move cursor inside it and the matching
+/// resize cursor over a handle (the same [`hit_test`] a press uses, with
+/// the same `radius` in document pixels).
+pub(crate) fn cursor_for(
+    tool: aurora_ui::Tool,
+    rect: Option<&Rect>,
+    pointer: Option<(f32, f32)>,
+    radius: f32,
+) -> CropCursor {
+    let (aurora_ui::Tool::Crop, Some(pointer)) = (tool, pointer) else {
+        return CropCursor::Default;
+    };
+    let Some(rect) = rect else {
+        return CropCursor::Crosshair;
+    };
+    match hit_test(rect, pointer, radius) {
+        CropHit::Outside => CropCursor::Crosshair,
+        CropHit::Inside => CropCursor::Move,
+        CropHit::Handle(CropHandle::Top | CropHandle::Bottom) => CropCursor::ResizeNs,
+        CropHit::Handle(CropHandle::Left | CropHandle::Right) => CropCursor::ResizeEw,
+        CropHit::Handle(CropHandle::TopRight | CropHandle::BottomLeft) => CropCursor::ResizeNeSw,
+        CropHit::Handle(CropHandle::TopLeft | CropHandle::BottomRight) => CropCursor::ResizeNwSe,
+    }
+}
+
+/// An arrow key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arrow {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// How far a plain arrow key nudges, in document pixels.
+pub(crate) const NUDGE_STEP: u32 = 1;
+
+/// How far `Shift` + an arrow key nudges.
+pub(crate) const NUDGE_STEP_LARGE: u32 = 10;
+
+/// One keyboard nudge of the crop rectangle (0.231.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Nudge {
+    pub(crate) arrow: Arrow,
+    /// Document pixels (1 or 10).
+    pub(crate) step: u32,
+    /// `Alt` held: resize the bottom-right corner instead of moving.
+    pub(crate) resize: bool,
+}
+
+/// The nudge an arrow key with `modifiers` means: arrow = 1 px move,
+/// `Shift` = 10, `Alt` = resize the bottom-right edges instead. Any key
+/// that is not an arrow, and any arrow with `Control` or `Meta` held (those
+/// belong to the shortcuts), is `None`.
+pub(crate) fn nudge_for_key(key: Key, modifiers: Modifiers) -> Option<Nudge> {
+    if modifiers.control || modifiers.meta {
+        return None;
+    }
+    let arrow = match key {
+        Key::Named(NamedKey::ArrowLeft) => Arrow::Left,
+        Key::Named(NamedKey::ArrowRight) => Arrow::Right,
+        Key::Named(NamedKey::ArrowUp) => Arrow::Up,
+        Key::Named(NamedKey::ArrowDown) => Arrow::Down,
+        _ => return None,
+    };
+    Some(Nudge {
+        arrow,
+        step: if modifiers.shift {
+            NUDGE_STEP_LARGE
+        } else {
+            NUDGE_STEP
+        },
+        resize: modifiers.alt,
+    })
+}
+
+/// `rect` after `nudge`, inside the canvas. A move keeps the size and
+/// stops at the canvas edges; a resize moves the right edge (Left/Right)
+/// or the bottom edge (Up/Down) by the step, never below one pixel and
+/// never past the canvas, leaving the origin where it is.
+pub(crate) fn nudged(rect: Rect, nudge: Nudge, canvas: (u32, u32)) -> Rect {
+    let step = i64::from(nudge.step);
+    let (dx, dy) = match nudge.arrow {
+        Arrow::Left => (-step, 0),
+        Arrow::Right => (step, 0),
+        Arrow::Up => (0, -step),
+        Arrow::Down => (0, step),
+    };
+    if nudge.resize {
+        let room_w = (i64::from(canvas.0) - rect.x).max(1);
+        let room_h = (i64::from(canvas.1) - rect.y).max(1);
+        let width = (i64::from(rect.width) + dx).clamp(1, room_w);
+        let height = (i64::from(rect.height) + dy).clamp(1, room_h);
+        Rect {
+            width: u32::try_from(width).unwrap_or(rect.width),
+            height: u32::try_from(height).unwrap_or(rect.height),
+            ..rect
+        }
+    } else {
+        let room_x = (i64::from(canvas.0) - i64::from(rect.width)).max(0);
+        let room_y = (i64::from(canvas.1) - i64::from(rect.height)).max(0);
+        Rect {
+            x: rect.x.saturating_add(dx).clamp(0, room_x),
+            y: rect.y.saturating_add(dy).clamp(0, room_y),
+            ..rect
+        }
+    }
+}
+
 /// The gesture a press began.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Gesture {
@@ -415,6 +565,18 @@ impl CropState {
                 self.rect = Some(resized(origin, handle, p, canvas));
             }
             None => {}
+        }
+    }
+
+    /// Applies a keyboard [`Nudge`] to the rectangle; returns whether the
+    /// state could take it (there is a rectangle and no drag is live).
+    pub(crate) fn nudge(&mut self, nudge: Nudge, canvas: (u32, u32)) -> bool {
+        match (self.rect, self.gesture) {
+            (Some(rect), None) => {
+                self.rect = Some(nudged(rect, nudge, canvas));
+                true
+            }
+            _ => false,
         }
     }
 
