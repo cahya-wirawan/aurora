@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.228.1] - 2026-10-14
+
+### Fixed
+
+- Pin the legacy paint hashes on Linux only; macOS powf differs in the last bit
+
 ## [0.228.0] - 2026-10-14
 
 ### Added
