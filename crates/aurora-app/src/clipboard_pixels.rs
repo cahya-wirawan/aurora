@@ -120,10 +120,12 @@ impl PixelClip {
         self.height
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const fn origin(&self) -> (i64, i64) {
         self.origin
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn pixels(&self) -> &[f16] {
         &self.pixels
     }
