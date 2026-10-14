@@ -50,8 +50,6 @@
 mod amount;
 #[cfg(test)]
 mod amount_tests;
-#[cfg(test)]
-mod brush_spacing_tests;
 mod clone;
 #[cfg(test)]
 mod clone_tests;
@@ -73,6 +71,9 @@ mod smudge;
 mod smudge_tests;
 mod stamp;
 #[cfg(test)]
+mod stroke_composite_tests;
+mod stroke_cover;
+#[cfg(test)]
 mod test_support;
 mod tone_brush;
 #[cfg(test)]
@@ -84,11 +85,7 @@ mod wand_tests;
 pub use amount::{MIN_AMOUNT, PaintAmount};
 pub use clone::{MAX_CLONE_OFFSET, MAX_CLONE_PATCH_TEXELS, clone_dab_amount, clone_dab_covered};
 pub use coverage::{Coverage, CoverageRegion};
-pub use dab::{
-    BRUSH_EVENT_TEXEL_BUDGET, BRUSH_SPACING, DEFAULT_SPACING, MAX_BRUSH_DABS_PER_EVENT,
-    MIN_BRUSH_DABS_PER_EVENT, advance_segment, brush_dab_cap, brush_segment_step, dab_step,
-    dabs_along_path, spacing_dip,
-};
+pub use dab::{DEFAULT_SPACING, advance_segment, dab_step, dabs_along_path};
 pub use fill::{
     FillError, FillMode, FillOutcome, FloodSpec, GradientKind, GradientSpec, MAX_EXAMINED_TILES,
     MAX_FILL_TILES, WandRegion, flood_fill, flood_fill_covered, gradient_fill,

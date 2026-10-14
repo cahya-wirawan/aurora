@@ -22,124 +22,19 @@
 //! only produces the positions `stamp::stamp_dab` consumes.
 
 /// Dab spacing as a fraction of brush radius — `spike/vertical-slice`'s
-/// own proven default (a dab every quarter-radius travelled).
+/// own proven default (a dab every quarter-radius travelled), used by every
+/// dab tool including the soft Brush.
+///
+/// **Why the soft Brush is back on it (0.230.0).** 0.226.1 gave the Brush a
+/// denser `0.03` spacing to hide the beading of the max-alpha rule (an 18 %
+/// dip between dabs at `0.25`). Stroke compositing (`stroke_cover`) builds
+/// the dabs up instead, so at `0.25` the centre-line and lateral ripple is
+/// under 1 % of full coverage (measured, `stroke_composite_tests`), and
+/// denser dabs would only *harden* the brush: the accumulated edge profile
+/// `1 - prod(1 - a_i)` has its 50 % point at `0.67 r` from the centre line
+/// at `0.25` but `0.89 r` at `0.03` (the 90 % point at `0.39 r` against
+/// `0.80 r`), and cost 8x the dabs.
 pub const DEFAULT_SPACING: f32 = 0.25;
-
-/// The soft **Brush**'s dab spacing as a fraction of its radius (0.226.1):
-/// a dab every `0.03 r` (floored at 0.5 px by [`dab_step`]), against the
-/// [`DEFAULT_SPACING`] `0.25 r` every other dab tool keeps.
-///
-/// **Why the Brush has its own.** A Brush dab's alpha is `(1 - d / r)^1.5`
-/// and a texel is rewritten only when a dab's alpha is *higher* than what
-/// it already holds (the max-alpha rule, `stamp.rs`), so along a stroke the
-/// alpha on the centre line is the upper envelope of the dabs. Halfway
-/// between two dabs `s` apart the nearest dabs are `s / 2` away, so the
-/// centre line dips from `1` to `(1 - s / (2 r))^1.5` there, a dip of
-/// [`spacing_dip`]`(s / r) ~= 0.75 s / r`. At `0.25` that is **18 %** (the
-/// beading the design owner reported: dark dots at each dab centre and
-/// lighter bands between). At `0.03` it is **2.2 %**.
-///
-/// | radius | step at `0.03` | dip |
-/// |---|---|---|
-/// | 4 px | 0.5 px (the floor) | 9.1 % |
-/// | 10 px | 0.5 px (the floor) | 3.7 % |
-/// | 24 px | 0.72 px | 2.2 % |
-/// | 100 px | 3.0 px | 2.2 % |
-/// | 256 px | 7.68 px | 2.2 % |
-///
-/// Below about `r = 17` the 0.5 px floor, not this fraction, sets the step,
-/// so the smallest brushes keep a larger dip (still half the old one).
-///
-/// **Cost.** Dense dabs cost proportionally more: measured in the dev
-/// profile a dab is about 80 us at `r = 24` and 1.2 ms at `r = 100`, so a
-/// 200 px stroke is 278 dabs (22 ms) at `r = 24` and 67 dabs (78 ms) at
-/// `r = 100`, against 34 (3 ms) and 9 (14 ms) at `0.25`. A single pointer
-/// event is bounded by [`brush_dab_cap`] instead of being allowed to take
-/// that long.
-///
-/// Only the Brush uses this: every other tool's per-dab effect accumulates
-/// (the Eraser multiplies, the smudge, blur, sharpen and toning tools mix
-/// per dab, the Quick Mask moves toward its target per dab), so denser
-/// dabs would change their strength, not just smooth them.
-pub const BRUSH_SPACING: f32 = 0.03;
-
-/// The most texel visits a Brush stroke is allowed per pointer event,
-/// `250,000`: about 10 ms at the measured ~40 ns per texel (dev profile),
-/// the stroke budget. [`brush_dab_cap`] turns it into a dab count for a
-/// radius.
-pub const BRUSH_EVENT_TEXEL_BUDGET: f32 = 250_000.0;
-
-/// The fewest dabs per pointer event [`brush_dab_cap`] allows, however big
-/// the radius (a 256 px dab is 205,000 texels, so the budget alone would
-/// allow one).
-pub const MIN_BRUSH_DABS_PER_EVENT: usize = 4;
-
-/// The most dabs per pointer event [`brush_dab_cap`] allows, however small
-/// the radius.
-pub const MAX_BRUSH_DABS_PER_EVENT: usize = 256;
-
-/// The depth of the dip a stroke at `spacing` (a fraction of the radius)
-/// leaves in the Brush's centre-line alpha, as a fraction of full alpha:
-/// `1 - (1 - spacing / 2)^1.5`, from the falloff `(1 - d / r)^1.5` read at
-/// the midpoint between two dabs. `0` for a non-positive or non-finite
-/// spacing; a spacing of `2` or more leaves the dabs disjoint, a full dip
-/// of `1`.
-#[must_use]
-pub fn spacing_dip(spacing: f32) -> f32 {
-    if !(spacing.is_finite() && spacing > 0.0) {
-        return 0.0;
-    }
-    1.0 - (1.0 - spacing / 2.0).clamp(0.0, 1.0).powf(1.5)
-}
-
-/// How many dabs one Brush pointer event may place at `radius`:
-/// [`BRUSH_EVENT_TEXEL_BUDGET`] divided by the dab's area `pi r^2`, rounded
-/// down and kept within [`MIN_BRUSH_DABS_PER_EVENT`] and
-/// [`MAX_BRUSH_DABS_PER_EVENT`] (138 at `r = 24`, 7 at `r = 100`, 4 at
-/// `r = 256`). A non-finite or non-positive radius gets the maximum (it
-/// paints nothing).
-#[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn brush_dab_cap(radius: f32) -> usize {
-    let area = std::f32::consts::PI * radius * radius;
-    if !(area.is_finite() && area > 0.0) {
-        return MAX_BRUSH_DABS_PER_EVENT;
-    }
-    let cap = (BRUSH_EVENT_TEXEL_BUDGET / area).floor();
-    // Within the usize range after the clamp.
-    cap.clamp(
-        MIN_BRUSH_DABS_PER_EVENT as f32,
-        MAX_BRUSH_DABS_PER_EVENT as f32,
-    ) as usize
-}
-
-/// The step the Brush uses for one pointer event of `segment_len` px, given
-/// the `carry` the stroke had already travelled past its last dab:
-/// [`dab_step`]`(radius, `[`BRUSH_SPACING`]`)`, widened to
-/// `(carry + segment_len) / `[`brush_dab_cap`] when the dense step would put
-/// more than the cap on this one event, so the event places **at most**
-/// [`brush_dab_cap`] dabs. The carry stays in distance units, so the next
-/// event (with its own step) continues from where this one stopped; a
-/// stroke fed in events short enough never to reach the cap gets exactly
-/// the dabs one long segment would. The widened step never exceeds the old
-/// [`DEFAULT_SPACING`] step, so a very long event at a small radius is no
-/// coarser than before 0.226.1 (it may then place more than the cap: the
-/// cap bounds cost only where that does not make the stroke worse than it
-/// was).
-#[must_use]
-#[allow(clippy::cast_precision_loss)]
-pub fn brush_segment_step(radius: f32, carry: f32, segment_len: f32) -> f32 {
-    let dense = dab_step(radius, BRUSH_SPACING);
-    let travel = carry.max(0.0) + segment_len.max(0.0);
-    let capped = travel / brush_dab_cap(radius) as f32;
-    if capped.is_finite() {
-        dense
-            .max(capped)
-            .min(dab_step(radius, DEFAULT_SPACING).max(dense))
-    } else {
-        dense
-    }
-}
 
 /// The distance between dabs — `radius * spacing`, floored at `0.5` so a
 /// degenerate `spacing` of `0.0` can't demand a dab at every
@@ -170,11 +65,10 @@ pub fn dab_step(radius: f32, spacing: f32) -> f32 {
 /// with no actual movement) places nothing and returns `carry`
 /// unchanged.
 ///
-/// `step` may differ from one event to the next (0.226.1: the Brush widens
-/// it for an event that would otherwise place too many dabs,
-/// [`brush_segment_step`]); `carry` is a distance, so it stays meaningful.
-/// A `carry` already at or past the new `step` puts a dab at the start of
-/// the segment.
+/// `step` may differ from one event to the next (a tool changing its
+/// radius mid-stroke); `carry` is a distance, so it stays meaningful. A
+/// `carry` already at or past the new `step` puts a dab at the start of the
+/// segment (0.226.1).
 #[must_use]
 pub fn advance_segment(
     prev: (f32, f32),
@@ -193,9 +87,8 @@ pub fn advance_segment(
     let mut carry = carry;
     while carry + (segment_len - travelled) >= step {
         // `carry` is below `step` unless the step shrank since the last
-        // event (the Brush's capped flick followed by dense events,
-        // `brush_segment_step`): then a dab is already due and lands at the
-        // segment's start, never behind it.
+        // event (a smaller radius mid-stroke): then a dab is already due
+        // and lands at the segment's start, never behind it.
         let needed = (step - carry).max(0.0);
         travelled += needed;
         dabs.push((prev.0 + ux * travelled, prev.1 + uy * travelled));
