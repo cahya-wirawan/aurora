@@ -539,7 +539,7 @@ pub(crate) fn ratio_for(
     })
 }
 
-/// The palette id of "Crop Ratio: <choice>".
+/// The palette id of `Crop Ratio: <choice>`.
 pub(crate) const fn ratio_command_id(choice: aurora_ui::CropRatio) -> &'static str {
     match choice {
         aurora_ui::CropRatio::Free => "crop.ratio.free",
@@ -553,7 +553,7 @@ pub(crate) const fn ratio_command_id(choice: aurora_ui::CropRatio) -> &'static s
     }
 }
 
-/// The palette title of "Crop Ratio: <choice>".
+/// The palette title of `Crop Ratio: <choice>`.
 pub(crate) fn ratio_command_title(choice: aurora_ui::CropRatio) -> String {
     format!("Crop Ratio: {}", choice.label())
 }
