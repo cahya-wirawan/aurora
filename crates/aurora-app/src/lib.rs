@@ -88200,6 +88200,8 @@ mod panel_scroll_tests {
             run(&mut ws, &mut focus, COMMAND_CLOSE_PROPERTIES);
             assert_eq!(shown(&ws), Some(2), "Channels is still open");
             run(&mut ws, &mut focus, COMMAND_CLOSE_CHANNELS);
+            assert_eq!(shown(&ws), Some(3), "Paths is still open");
+            run(&mut ws, &mut focus, crate::COMMAND_CLOSE_PATHS);
             assert_eq!(shown(&ws), None);
             ws.tree.compute_layout(WINDOW.0, WINDOW.1);
             assert_eq!(
@@ -88603,9 +88605,10 @@ mod panel_scroll_tests {
                             DockPanel::Properties,
                             DockPanel::History,
                             DockPanel::Channels,
+                            DockPanel::Paths,
                             DockPanel::Layers
                         ],
-                        3
+                        4
                     )]
                 );
                 assert_eq!(
@@ -88629,7 +88632,10 @@ mod panel_scroll_tests {
                     shape(&ws),
                     vec![
                         (vec![DockPanel::Properties], 0),
-                        (vec![DockPanel::Channels, DockPanel::Layers], 1),
+                        (
+                            vec![DockPanel::Channels, DockPanel::Paths, DockPanel::Layers],
+                            2
+                        ),
                         (vec![DockPanel::History], 0)
                     ]
                 );
@@ -88699,7 +88705,7 @@ mod panel_scroll_tests {
                     vec![
                         (vec![DockPanel::Layers, DockPanel::Properties], 1),
                         (vec![DockPanel::History], 0),
-                        (vec![DockPanel::Channels], 0)
+                        (vec![DockPanel::Channels, DockPanel::Paths], 0)
                     ]
                 );
                 crate::save_workspace_layout(&path, &original);
@@ -88788,7 +88794,10 @@ mod panel_scroll_tests {
                 assert_eq!(
                     shape(&loaded),
                     vec![
-                        (vec![DockPanel::History, DockPanel::Channels], 0),
+                        (
+                            vec![DockPanel::History, DockPanel::Channels, DockPanel::Paths],
+                            0
+                        ),
                         (vec![DockPanel::Layers], 0),
                         (vec![DockPanel::Properties], 0)
                     ],
@@ -88952,7 +88961,10 @@ mod panel_scroll_tests {
                     shape(&ws),
                     vec![
                         (vec![DockPanel::Layers], 0),
-                        (vec![DockPanel::Properties, DockPanel::Channels], 1),
+                        (
+                            vec![DockPanel::Properties, DockPanel::Channels, DockPanel::Paths],
+                            1
+                        ),
                         (vec![DockPanel::History], 0)
                     ],
                     "the drop was applied"
@@ -88975,7 +88987,10 @@ mod panel_scroll_tests {
                 assert_eq!(
                     shape(&ws),
                     vec![
-                        (vec![DockPanel::Properties, DockPanel::Channels], 1),
+                        (
+                            vec![DockPanel::Properties, DockPanel::Channels, DockPanel::Paths],
+                            1
+                        ),
                         (vec![DockPanel::History, DockPanel::Layers], 1)
                     ],
                     "joined as the selected tab"
@@ -89778,7 +89793,10 @@ mod panel_scroll_tests {
                         .map(|s| (s.panels.clone(), s.selected))
                         .collect::<Vec<_>>(),
                     vec![
-                        (vec![DockPanel::History, DockPanel::Channels], 0),
+                        (
+                            vec![DockPanel::History, DockPanel::Channels, DockPanel::Paths],
+                            0
+                        ),
                         (vec![DockPanel::Properties, DockPanel::Layers], 1)
                     ],
                     "the 0.166.0 arrangement"
