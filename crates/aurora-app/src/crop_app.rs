@@ -81,7 +81,9 @@ impl App {
         let action = crop_key_action(
             self.tool,
             self.crop.rect().is_some(),
-            self.dialog.is_some() || self.command_palette.is_some(),
+            self.dialog.is_some()
+                || self.command_palette.is_some()
+                || text_field_focused(&self.workspace.tree, self.focus.focused()),
             key,
             self.modifiers,
         );
@@ -323,6 +325,20 @@ pub(crate) fn guides_for_frame(
     aurora_ui::crop_guide_runs(&rect, view, size, scale_factor)
 }
 
+/// Whether the focused widget is a text field. A field leaves an Alt chord
+/// unhandled, and the crop must not take it from someone typing.
+pub(crate) fn text_field_focused(
+    tree: &aurora_widgets::WidgetTree<aurora_widgets::widgets::WidgetKind>,
+    focused: Option<aurora_widgets::WidgetId>,
+) -> bool {
+    focused.is_some_and(|id| {
+        matches!(
+            tree.payload(id),
+            Some(aurora_widgets::widgets::WidgetKind::TextField(_))
+        )
+    })
+}
+
 /// What a key means to the Crop tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CropKeyAction {
@@ -336,7 +352,7 @@ pub(crate) enum CropKeyAction {
 
 /// [`App::crop_key_now`]'s decision as a free function: the keys are only
 /// the Crop tool's while it is active and holds a rectangle and no dialog
-/// or palette is open.
+/// or palette is open and no text field has focus (`modal_open` covers all).
 pub(crate) fn crop_key_action(
     tool: aurora_ui::Tool,
     has_rect: bool,

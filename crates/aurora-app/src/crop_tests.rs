@@ -1326,6 +1326,11 @@ mod polish {
                 .any(|line| line.trim() == "if wanted == self.crop_cursor {"),
             "set_cursor is skipped while the kind is unchanged"
         );
+        assert!(
+            app.lines().any(|line| line.trim()
+                == "|| text_field_focused(&self.workspace.tree, self.focus.focused()),"),
+            "a focused text field keeps the crop's keys"
+        );
     }
 
     // ---- nudging ----
@@ -1574,6 +1579,41 @@ mod polish {
             assert!(r.right() <= i64::from(CANVAS.0), "{r:?}");
             assert!(r.bottom() <= i64::from(CANVAS.1), "{r:?}");
         }
+    }
+
+    #[test]
+    fn a_focused_text_field_keeps_its_alt_arrow_chords() {
+        let Ok(scales) = crate::load_scales() else {
+            unreachable!("the committed tokens load");
+        };
+        let (mut tree, root) = aurora_widgets::widgets::new_tree(taffy::Style::default());
+        let Ok(field) =
+            aurora_widgets::widgets::insert_text_field(&mut tree, root, &scales, "Name", "x")
+        else {
+            unreachable!()
+        };
+        let Ok(boxed) = aurora_widgets::widgets::insert_checkbox(&mut tree, root, &scales, "c")
+        else {
+            unreachable!()
+        };
+        assert!(crate::crop_app::text_field_focused(&tree, Some(field)));
+        assert!(!crate::crop_app::text_field_focused(&tree, Some(boxed)));
+        assert!(!crate::crop_app::text_field_focused(&tree, None));
+        // With the field focused the decision is the modal one: ignored.
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            crop_key_action(
+                aurora_ui::Tool::Crop,
+                true,
+                true,
+                Key::Named(NamedKey::ArrowLeft),
+                alt
+            ),
+            CropKeyAction::Ignore
+        );
     }
 
     #[test]
