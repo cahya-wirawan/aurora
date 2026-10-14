@@ -360,7 +360,7 @@ fn gather_rect(
 }
 
 /// `src` dilated by Chebyshev radius `r` inside a `w x h` grid.
-fn dilate(src: &[bool], w: usize, h: usize, r: usize) -> Vec<bool> {
+pub(crate) fn dilate(src: &[bool], w: usize, h: usize, r: usize) -> Vec<bool> {
     let mut rows = vec![false; w * h];
     for (line, out) in src.chunks(w.max(1)).zip(rows.chunks_mut(w.max(1))) {
         let mut prefix = Vec::with_capacity(w + 1);
@@ -407,14 +407,14 @@ const DIRS: [(i64, i64); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
 
 /// Offsets within the search window, for a domain whose longest side is
 /// `side`.
-fn search_radius(side: usize) -> i64 {
+pub(crate) fn search_radius(side: usize) -> i64 {
     #[allow(clippy::cast_possible_wrap)]
     let s = (side as i64).saturating_mul(4);
     s.clamp(16, 128)
 }
 
 /// The ring margin for a brush `radius`.
-fn margin_for(radius: f32) -> i64 {
+pub(crate) fn margin_for(radius: f32) -> i64 {
     if !radius.is_finite() {
         return 8;
     }
