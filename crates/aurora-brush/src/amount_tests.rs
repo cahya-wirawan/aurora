@@ -38,13 +38,13 @@ use crate::{
 #[cfg(target_os = "linux")]
 use crate::{stamp_dab, stamp_dab_hard, stamp_dab_preserving_alpha};
 
-type Tx = [f16; CHANNELS];
+pub(crate) type Tx = [f16; CHANNELS];
 
-fn surface() -> SurfaceId {
+pub(crate) fn surface() -> SurfaceId {
     SurfaceId::from_raw(0)
 }
 
-fn store() -> (tempfile::TempDir, TileStore) {
+pub(crate) fn store() -> (tempfile::TempDir, TileStore) {
     let dir = match tempfile::tempdir() {
         Ok(dir) => dir,
         Err(err) => unreachable!("tempdir: {err}"),
@@ -58,15 +58,15 @@ fn store() -> (tempfile::TempDir, TileStore) {
     }
 }
 
-fn h(v: f32) -> f16 {
+pub(crate) fn h(v: f32) -> f16 {
     f16::from_f32(v)
 }
 
-fn px(r: f32, g: f32, b: f32, a: f32) -> Tx {
+pub(crate) fn px(r: f32, g: f32, b: f32, a: f32) -> Tx {
     [h(r), h(g), h(b), h(a)]
 }
 
-fn bits(t: Tx) -> [u16; 4] {
+pub(crate) fn bits(t: Tx) -> [u16; 4] {
     [
         t[0].to_bits(),
         t[1].to_bits(),
@@ -75,7 +75,7 @@ fn bits(t: Tx) -> [u16; 4] {
     ]
 }
 
-fn texel(store: &mut TileStore, x: u32, y: u32) -> Tx {
+pub(crate) fn texel(store: &mut TileStore, x: u32, y: u32) -> Tx {
     let id = TileId {
         x: x / TILE,
         y: y / TILE,
@@ -94,7 +94,7 @@ fn texel(store: &mut TileStore, x: u32, y: u32) -> Tx {
     out
 }
 
-fn put(store: &mut TileStore, x: u32, y: u32, value: Tx) {
+pub(crate) fn put(store: &mut TileStore, x: u32, y: u32, value: Tx) {
     let Ok(tile) = store.get_mut(
         surface(),
         TileId {
@@ -113,29 +113,29 @@ fn put(store: &mut TileStore, x: u32, y: u32, value: Tx) {
 }
 
 /// A deterministic generator (xorshift64*).
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
         self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
     /// Uniform in `[0, 1)`.
-    fn unit(&mut self) -> f32 {
+    pub(crate) fn unit(&mut self) -> f32 {
         (self.next() >> 40) as f32 / (1u64 << 24) as f32
     }
-    fn range(&mut self, lo: f32, hi: f32) -> f32 {
+    pub(crate) fn range(&mut self, lo: f32, hi: f32) -> f32 {
         lo + (hi - lo) * self.unit()
     }
-    fn below(&mut self, n: u64) -> u64 {
+    pub(crate) fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
 }
 
 /// A selection with fractional values, defined by a formula.
-struct Wavy;
+pub(crate) struct Wavy;
 
 impl Coverage for Wavy {
     fn bounds(&self) -> Option<Rect> {
@@ -173,7 +173,7 @@ fn at(map: &HashMap<(u32, u32), Tx>, x: u32, y: u32) -> Tx {
 }
 
 /// The Brush dab's alpha at a texel, from its definition.
-fn soft_alpha(x: u32, y: u32, center: (f32, f32), radius: f32) -> f32 {
+pub(crate) fn soft_alpha(x: u32, y: u32, center: (f32, f32), radius: f32) -> f32 {
     let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
     let d = (px - center.0).hypot(py - center.1);
     if d > radius {
@@ -371,7 +371,7 @@ impl Model {
     }
 }
 
-const SIDE: u32 = 2 * TILE;
+pub(crate) const SIDE: u32 = 2 * TILE;
 
 /// Every texel of the first 2 x 2 tiles, engine against model.
 fn assert_matches(store: &mut TileStore, model: &Model, why: &str) {
@@ -564,7 +564,7 @@ fn random_clone_strokes_match_the_independent_model_bit_for_bit() {
 }
 
 /// FNV-1a over every texel's bits of the first 2 x 2 tiles.
-fn region_hash(store: &mut TileStore) -> u64 {
+pub(crate) fn region_hash(store: &mut TileStore) -> u64 {
     let mut hash = 0xCBF2_9CE4_8422_2325_u64;
     for y in 0..SIDE {
         for x in 0..SIDE {

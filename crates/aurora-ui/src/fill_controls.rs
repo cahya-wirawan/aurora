@@ -78,7 +78,7 @@ pub struct FillControls {
     /// The strength slider, 1 to 100.
     pub strength: WidgetId,
     /// The paint group's row (0.228.0): Opacity and Flow for the Brush,
-    /// Pencil (Opacity only) and Clone Stamp.
+    /// Pencil (Opacity only), Clone Stamp and (0.229.0) Eraser.
     pub paint: WidgetId,
     /// "Opacity N %" of the paint group.
     pub paint_opacity_readout: WidgetId,
@@ -125,6 +125,10 @@ pub struct FillView {
     pub clone_opacity: u8,
     /// Clone Stamp flow, 1 to 100 (0.228.0).
     pub clone_flow: u8,
+    /// Eraser opacity, 1 to 100 (0.229.0).
+    pub eraser_opacity: u8,
+    /// Eraser flow, 1 to 100 (0.229.0).
+    pub eraser_flow: u8,
 }
 
 /// "Opacity 100 %".
@@ -140,17 +144,20 @@ pub fn flow_readout_text(percent: u8) -> String {
 }
 
 /// Whether `tool` shows the paint group's Opacity (0.228.0): the Brush,
-/// the Pencil and the Clone Stamp.
+/// the Pencil and the Clone Stamp, and (0.229.0) the Eraser.
 #[must_use]
 pub const fn has_paint_opacity(tool: Tool) -> bool {
-    matches!(tool, Tool::Brush | Tool::Pencil | Tool::CloneStamp)
+    matches!(
+        tool,
+        Tool::Brush | Tool::Pencil | Tool::CloneStamp | Tool::Eraser
+    )
 }
 
-/// Whether `tool` also shows the paint group's Flow (0.228.0): the Brush
-/// and the Clone Stamp, not the Pencil.
+/// Whether `tool` also shows the paint group's Flow (0.228.0): the Brush,
+/// the Clone Stamp and (0.229.0) the Eraser, not the Pencil.
 #[must_use]
 pub const fn has_paint_flow(tool: Tool) -> bool {
-    matches!(tool, Tool::Brush | Tool::CloneStamp)
+    matches!(tool, Tool::Brush | Tool::CloneStamp | Tool::Eraser)
 }
 
 /// "Strength 50 %" (0.222.0).
@@ -227,7 +234,7 @@ fn reserve_readout_widths(
     Ok(())
 }
 
-/// The Brush, Pencil and Clone Stamp group (0.228.0): Opacity, and Flow for
+/// The Brush, Pencil, Clone Stamp and (0.229.0) Eraser group (0.228.0): Opacity, and Flow for
 /// the two that have one. Returns the group and its
 /// `[opacity readout, opacity, flow readout, flow]`.
 fn insert_paint_group(
@@ -472,8 +479,8 @@ pub fn sync_fill_controls(
                 Tool::Smudge | Tool::Blur | Tool::Sharpen | Tool::Dodge | Tool::Burn | Tool::Sponge
             ),
         ),
-        // The Brush's, Pencil's and Clone Stamp's Opacity and Flow (0.228.0);
-        // they keep the radius controls.
+        // The Brush's, Pencil's, Clone Stamp's and (0.229.0) Eraser's Opacity
+        // and Flow (0.228.0); they keep the radius controls.
         (fill.paint, has_paint_opacity(tool)),
     ] {
         changed |= set_item_shown(tree, group, shown)?;
@@ -522,6 +529,7 @@ pub fn sync_fill_controls(
     let (opacity, flow) = match tool {
         Tool::Pencil => (view.pencil_opacity, view.brush_flow),
         Tool::CloneStamp => (view.clone_opacity, view.clone_flow),
+        Tool::Eraser => (view.eraser_opacity, view.eraser_flow),
         _ => (view.brush_opacity, view.brush_flow),
     };
     changed |= widgets::set_label_text(
@@ -543,7 +551,8 @@ pub fn sync_fill_controls(
 /// Whether the active tool's group is shown: `Some(tool)` for the group
 /// currently displayed (`Some(Tool::Smudge)` for the Strength group, which
 /// the Blur and the Sharpen share, 0.223.0; `Some(Tool::Brush)` for the
-/// Opacity and Flow group the Pencil and Clone Stamp share, 0.228.0).
+/// Opacity and Flow group the Pencil, Clone Stamp and (0.229.0) Eraser
+/// share, 0.228.0).
 #[must_use]
 pub fn shown_fill_group(tree: &WidgetTree<WidgetKind>, controls: &ToolControls) -> Option<Tool> {
     let shown = |id| tree.style(id).is_some_and(|s| s.display != Display::None);
@@ -599,6 +608,8 @@ mod tests {
         pencil_opacity: 100,
         clone_opacity: 100,
         clone_flow: 100,
+        eraser_opacity: 100,
+        eraser_flow: 100,
     };
 
     fn built() -> (crate::Workspace, ToolControls) {
@@ -712,6 +723,8 @@ mod tests {
             pencil_opacity: 100,
             clone_opacity: 100,
             clone_flow: 100,
+            eraser_opacity: 100,
+            eraser_flow: 100,
         };
         assert!(sync(&mut ws, &controls, Tool::Gradient, view, None));
         assert!(!sync(&mut ws, &controls, Tool::Gradient, view, None));
@@ -807,7 +820,7 @@ mod tests {
         assert!((STRENGTH_MIN - 1.0).abs() < f64::EPSILON);
         assert!((STRENGTH_MAX - 100.0).abs() < f64::EPSILON);
         // Another tool hides it again (layout and assistive technology).
-        sync(&mut ws, &controls, Tool::Eraser, view, None);
+        sync(&mut ws, &controls, Tool::Move, view, None);
         assert!(!shown(&ws.tree, fill.smudge));
         assert!(hidden_to_at(&ws.tree, fill.smudge));
         assert_eq!(shown_fill_group(&ws.tree, &controls), None);
@@ -851,7 +864,7 @@ mod tests {
             assert!((v - value).abs() < f64::EPSILON, "{tool:?} {v}");
             assert_eq!(t, text, "{tool:?}");
         }
-        sync(&mut ws, &controls, Tool::Eraser, view, None);
+        sync(&mut ws, &controls, Tool::Move, view, None);
         assert!(!shown(&ws.tree, fill.smudge));
     }
 
@@ -912,6 +925,8 @@ mod tests {
             pencil_opacity: 55,
             clone_opacity: 25,
             clone_flow: 90,
+            eraser_opacity: 35,
+            eraser_flow: 65,
             ..VIEW
         }
     }
@@ -937,11 +952,14 @@ mod tests {
         for tool in Tool::ALL {
             sync(&mut ws, &controls, tool, paint_view(), None);
             ws.tree.compute_layout(1600.0, 900.0);
-            let wants = matches!(tool, Tool::Brush | Tool::Pencil | Tool::CloneStamp);
+            let wants = matches!(
+                tool,
+                Tool::Brush | Tool::Pencil | Tool::CloneStamp | Tool::Eraser
+            );
             assert_eq!(shown(&ws.tree, fill.paint), wants, "{tool:?}");
             assert_eq!(hidden_to_at(&ws.tree, fill.paint), !wants, "{tool:?}");
             assert_eq!(super::has_paint_opacity(tool), wants, "{tool:?}");
-            let flow = matches!(tool, Tool::Brush | Tool::CloneStamp);
+            let flow = matches!(tool, Tool::Brush | Tool::CloneStamp | Tool::Eraser);
             assert_eq!(super::has_paint_flow(tool), flow, "{tool:?}");
             if wants {
                 for id in [fill.paint_flow_readout, fill.paint_flow] {
@@ -976,6 +994,7 @@ mod tests {
         for (tool, opacity, flow) in [
             (Tool::Brush, 40.0, 70.0),
             (Tool::Pencil, 55.0, 70.0),
+            (Tool::Eraser, 35.0, 65.0),
             (Tool::CloneStamp, 25.0, 90.0),
         ] {
             sync(&mut ws, &controls, tool, paint_view(), None);

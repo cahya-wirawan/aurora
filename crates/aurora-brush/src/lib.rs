@@ -59,6 +59,8 @@ mod coverage;
 #[cfg(test)]
 mod coverage_tests;
 mod dab;
+#[cfg(test)]
+mod erase_amount_tests;
 mod fill;
 mod filter_brush;
 #[cfg(test)]
@@ -96,8 +98,8 @@ pub use filter_brush::{FilterKind, MAX_FILTER_PATCH_TEXELS, SHARPEN_GAIN, filter
 pub use mask_dab::{dab_falloff, hard_dab_covers, hard_dab_snap, stamp_toward, stamp_toward_hard};
 pub use smudge::{MAX_SMUDGE_PATCH_TEXELS, SmudgeCarry, smudge_dab_covered};
 pub use stamp::{
-    DabOutcome, erase_dab, erase_dab_covered, stamp_dab, stamp_dab_amount, stamp_dab_covered,
-    stamp_dab_hard, stamp_dab_hard_covered, stamp_dab_hard_preserving_alpha,
+    DabOutcome, erase_dab, erase_dab_amount, erase_dab_covered, stamp_dab, stamp_dab_amount,
+    stamp_dab_covered, stamp_dab_hard, stamp_dab_hard_covered, stamp_dab_hard_preserving_alpha,
     stamp_dab_hard_preserving_alpha_covered, stamp_dab_preserving_alpha,
     stamp_dab_preserving_alpha_covered, touched_tiles,
 };

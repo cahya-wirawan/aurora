@@ -5118,3 +5118,193 @@ fn a_clone_stroke_honours_its_own_opacity_and_flow_and_not_the_brushs() {
     let (soft, _) = colour_after(100, 100, 50);
     assert_ne!(soft, exact);
 }
+
+// -- The Eraser's Opacity and Flow (0.229.0) --------------------------------
+
+fn min_alpha_in(rig: &mut Rig, x0: u32, y0: u32, x1: u32, y1: u32) -> f32 {
+    let mut least = f32::MAX;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            least = least.min(rig.at(x, y)[3]);
+        }
+    }
+    least
+}
+
+#[test]
+fn an_eraser_stroke_crossing_itself_stays_over_its_opacity_floor_and_is_one_undo_step() {
+    let mut rig = Rig::new(rect(0, 0, 600, 400));
+    rig.rect_fill(40, 40, 200, 120, [0.5, 0.5, 0.5, 1.0]);
+    rig.settings.set_radius(Tool::Eraser, 15.0);
+    rig.settings.eraser_opacity = 40;
+    let path = [(60.0, 80.0), (180.0, 80.0), (60.0, 82.0), (180.0, 78.0)];
+    assert!(rig.stroke(Tool::Eraser, &path, false));
+    let least = min_alpha_in(&mut rig, 40, 40, 200, 120);
+    // The most a stroke can erase is 40 %: alpha 1.0 stays at or above 0.6.
+    assert!(least >= 0.6 - 1.0e-3, "past the ceiling: {least}");
+    assert!(least < 0.62, "it did erase up to the ceiling: {least}");
+    assert_eq!(rig.undo_order.undo_labels, ["Eraser Stroke"]);
+    // A second stroke starts from what it finds: 0.6 -> 0.36.
+    assert!(rig.stroke(Tool::Eraser, &path, false));
+    let least = min_alpha_in(&mut rig, 40, 40, 200, 120);
+    assert!((least - 0.36).abs() < 3.0e-3, "{least}");
+    assert_eq!(
+        rig.undo_order.undo_labels,
+        ["Eraser Stroke", "Eraser Stroke"]
+    );
+    // The default 100 % erases the same pixels outright.
+    let mut full = Rig::new(rect(0, 0, 600, 400));
+    full.rect_fill(40, 40, 200, 120, [0.5, 0.5, 0.5, 1.0]);
+    full.settings.set_radius(Tool::Eraser, 15.0);
+    assert!(full.stroke(Tool::Eraser, &path, false));
+    assert!(min_alpha_in(&mut full, 40, 40, 200, 120) < 0.01);
+}
+
+#[test]
+fn the_erasers_flow_scales_each_dab() {
+    let alpha_at_centre = |flow: u8| {
+        let mut rig = Rig::new(rect(0, 0, 600, 400));
+        rig.rect_fill(40, 40, 200, 120, [0.5, 0.5, 0.5, 1.0]);
+        rig.settings.set_radius(Tool::Eraser, 20.0);
+        rig.settings.eraser_flow = flow;
+        // A press with no movement: exactly one dab.
+        assert!(rig.stroke(Tool::Eraser, &[(100.5, 80.5)], false));
+        rig.at(100, 80)[3]
+    };
+    let full = alpha_at_centre(100);
+    let half = alpha_at_centre(50);
+    let fifth = alpha_at_centre(20);
+    // The centre texel's dab amount is a: alpha = 1 - a * flow.
+    let a = 1.0 - full;
+    assert!(a > 0.9, "{full}");
+    assert!((half - (1.0 - a * 0.5)).abs() < 2.0e-3, "{half}");
+    assert!((fifth - (1.0 - a * 0.2)).abs() < 2.0e-3, "{fifth}");
+}
+
+#[test]
+fn at_a_hundred_percent_the_eraser_is_exactly_the_earlier_entry_point() {
+    let run = |through_app: bool| {
+        let mut rig = Rig::new(rect(0, 0, 600, 400));
+        rig.rect_fill(40, 40, 300, 200, [0.5, 0.25, 0.75, 0.8]);
+        rig.settings.set_radius(Tool::Eraser, 17.0);
+        let mut drag = None;
+        for i in 0..40_u32 {
+            let p = (60.0 + 6.0 * i as f32, 80.0 + 2.5 * (i % 7) as f32);
+            if through_app {
+                let _ = crate::stamp_tool_dab_covered(
+                    DabTool::Eraser,
+                    false,
+                    &mut rig.store,
+                    rig.surface,
+                    p,
+                    &rig.settings,
+                    [0.0; 3],
+                    &mut drag,
+                    Some(&Half),
+                );
+            } else {
+                let _ = aurora_brush::erase_dab_covered(
+                    &mut rig.store,
+                    rig.surface,
+                    p,
+                    17.0,
+                    None,
+                    Some(&Half),
+                );
+            }
+        }
+        rig.snapshot(400, 260)
+    };
+    assert_eq!(run(true), run(false));
+}
+
+/// A uniform half-strength selection.
+struct Half;
+
+impl aurora_brush::Coverage for Half {
+    fn bounds(&self) -> Option<Rect> {
+        None
+    }
+    fn at(&self, _x: i64, _y: i64) -> f32 {
+        0.5
+    }
+}
+
+#[test]
+fn the_erasers_opacity_composes_with_the_selection_and_makes_no_phantom_tile() {
+    let mut rig = Rig::new(rect(0, 0, 600, 600));
+    rig.rect_fill(0, 0, 300, 300, [0.5, 0.5, 0.5, 1.0]);
+    rig.marquee((100.0, 100.0), (250.0, 250.0));
+    let sel = rect(100, 100, 150, 150);
+    rig.settings.set_radius(Tool::Eraser, 30.0);
+    rig.settings.eraser_opacity = 50;
+    rig.settings.eraser_flow = 80;
+    let tiles_before = rig.tiles();
+    assert!(rig.stroke(
+        Tool::Eraser,
+        &[(60.0, 175.0), (330.0, 175.0), (60.0, 178.0)],
+        false
+    ));
+    let mut inside_least = 1.0_f32;
+    for y in 0..300_u32 {
+        for x in 0..300_u32 {
+            let a = rig.at(x, y)[3];
+            if inside(sel, i64::from(x), i64::from(y)) {
+                inside_least = inside_least.min(a);
+            } else {
+                assert_eq!(a, 1.0, "nothing outside at ({x}, {y})");
+            }
+        }
+    }
+    assert!(inside_least >= 0.5 - 1.0e-3, "{inside_least}");
+    assert!(inside_least < 0.6, "it did erase: {inside_least}");
+    assert_eq!(rig.tiles(), tiles_before, "no tile appeared");
+    assert_eq!(rig.undo_order.undo_labels, ["Eraser Stroke"]);
+}
+
+#[test]
+fn the_erasers_lock_refusals_are_unchanged_by_opacity_and_flow() {
+    // The refusal is decided at the press from the lock alone, before any
+    // dab (and so any amount) is read.
+    use aurora_doc::LayerLock as L;
+    let none = L::none();
+    let pixels = L {
+        pixels: true,
+        ..none
+    };
+    let transparency = L {
+        transparency: true,
+        ..none
+    };
+    assert_eq!(
+        crate::press_refusal(Tool::Eraser, pixels),
+        Some(crate::LockRefusal::PixelsLocked)
+    );
+    assert_eq!(
+        crate::press_refusal(Tool::Eraser, transparency),
+        Some(crate::LockRefusal::TransparencyLocksEraser)
+    );
+    assert_eq!(crate::press_refusal(Tool::Eraser, none), None);
+}
+
+#[test]
+fn the_quick_mask_eraser_ignores_the_erasers_opacity_and_flow() {
+    let run = |opacity: u8, flow: u8| {
+        let mut rig = Rig::new(rect(0, 0, 400, 300));
+        rig.settings.eraser_opacity = opacity;
+        rig.settings.eraser_flow = flow;
+        let mut mode = rig.qm_enter();
+        fill_mask(&mut mode, 255);
+        let colours = white_on_black();
+        for p in [(150.0, 150.0), (170.0, 152.0), (190.0, 150.0)] {
+            let _ = quick_mask::paint_dab(&mut mode, DabTool::Eraser, p, &rig.settings, &colours);
+        }
+        (0..300_i64)
+            .flat_map(|y| (0..400_i64).map(move |x| (x, y)))
+            .map(|(x, y)| mode.mask.byte_at(x, y))
+            .collect::<Vec<u8>>()
+    };
+    let full = run(100, 100);
+    assert!(full.iter().any(|b| *b < 64), "the dabs did deselect");
+    assert_eq!(full, run(10, 10));
+}
