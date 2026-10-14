@@ -1025,6 +1025,150 @@ pub fn gradient_fill_covered(
     Ok(outcome)
 }
 
+/// What [`fill_with_coverage`] paints.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShapeFillSpec {
+    /// The straight encoded sRGB colour.
+    pub colour: [f32; 3],
+    /// The opacity the whole fill is capped at, `0..=1` (a texel's amount is
+    /// the shape's coverage there times this).
+    pub opacity: f32,
+    /// The tile cap, as [`FloodSpec::max_tiles`].
+    pub max_tiles: usize,
+}
+
+/// The texel `colour` makes over `current` at `amount` (`0..=1`): at `1`
+/// exactly what [`bucket_texel`] gives, below it source-over of the colour
+/// (opaque) at that alpha; under [`FillMode::PreserveAlpha`] the colour is
+/// moved toward `colour * alpha` by `amount` and the alpha is kept.
+fn solid_texel(mode: FillMode, colour: [f32; 3], amount: f32, current: &[f16]) -> Option<Texel> {
+    if amount >= 1.0 {
+        return bucket_texel(mode, colour, current);
+    }
+    if amount <= 0.0 {
+        return None;
+    }
+    let old = |c: usize| current.get(c).map_or(0.0, |v| v.to_f32());
+    let keep = 1.0 - amount;
+    let [red, green, blue] = colour;
+    match mode {
+        FillMode::Normal => Some([
+            f16::from_f32(red * amount + old(0) * keep),
+            f16::from_f32(green * amount + old(1) * keep),
+            f16::from_f32(blue * amount + old(2) * keep),
+            f16::from_f32(amount + old(3) * keep),
+        ]),
+        FillMode::PreserveAlpha => {
+            let alpha = current.get(3).copied()?;
+            let a = alpha.to_f32();
+            if a <= 0.0 {
+                return None;
+            }
+            Some([
+                f16::from_f32(old(0) * keep + red * a * amount),
+                f16::from_f32(old(1) * keep + green * a * amount),
+                f16::from_f32(old(2) * keep + blue * a * amount),
+                alpha,
+            ])
+        }
+    }
+}
+
+/// Fills a **shape given as a coverage** with one colour (Fill Path,
+/// 0.234.0): every texel of the layer-local `area` is painted by
+/// `shape.at(x, y) * spec.opacity` of the way from what it holds to the
+/// colour (source-over of the opaque colour at that alpha), then blended in
+/// by the optional `selection` like every other fill. At shape coverage `1`
+/// and opacity `1` a texel is exactly the Paint Bucket's
+/// ([`flood_fill_covered`]); the transparency lock ([`FillMode::PreserveAlpha`])
+/// recolours without ever changing alpha.
+///
+/// The area is first clipped to the shape's and the selection's bounds, so
+/// only tiles they can reach count toward `spec.max_tiles` and are read; a
+/// tile with no covered texel is neither read for writing nor created, and a
+/// fill that changes nothing captures nothing.
+///
+/// # Errors
+///
+/// [`FillError::TooLarge`] — before any write — when the clipped area spans
+/// more than `spec.max_tiles` tiles.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_with_coverage(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    area: (u32, u32, u32, u32),
+    shape: &dyn Coverage,
+    spec: &ShapeFillSpec,
+    mode: FillMode,
+    mut snapshot: Option<&mut StrokeSnapshot>,
+    selection: Option<&dyn Coverage>,
+) -> Result<FillOutcome, FillError> {
+    let mut outcome = FillOutcome::default();
+    let (mut x0, mut y0, mut x1, mut y1) = area;
+    let clip = |v: i64| u32::try_from(v.clamp(0, i64::from(u32::MAX))).unwrap_or(u32::MAX);
+    for bounds in [shape.bounds(), selection.and_then(Coverage::bounds)]
+        .into_iter()
+        .flatten()
+    {
+        x0 = x0.max(clip(bounds.x));
+        y0 = y0.max(clip(bounds.y));
+        x1 = x1.min(clip(bounds.right()));
+        y1 = y1.min(clip(bounds.bottom()));
+    }
+    if x0 >= x1 || y0 >= y1 || !spec.opacity.is_finite() || spec.opacity <= 0.0 {
+        return Ok(outcome);
+    }
+    let opacity = spec.opacity.min(1.0);
+    let (tx0, tx1) = (x0 / TILE, (x1 - 1) / TILE);
+    let (ty0, ty1) = (y0 / TILE, (y1 - 1) / TILE);
+    let tiles = u64::from(tx1 - tx0 + 1) * u64::from(ty1 - ty0 + 1);
+    if tiles > spec.max_tiles as u64 {
+        return Err(FillError::TooLarge {
+            max: spec.max_tiles,
+        });
+    }
+    for ty in ty0..=ty1 {
+        for tx in tx0..=tx1 {
+            let id = TileId { x: tx, y: ty };
+            let (origin_x, origin_y) = (tx.saturating_mul(TILE), ty.saturating_mul(TILE));
+            let lx0 = x0.max(origin_x) - origin_x;
+            let lx1 = x1.min(origin_x.saturating_add(TILE)) - origin_x;
+            let ly0 = y0.max(origin_y) - origin_y;
+            let ly1 = y1.min(origin_y.saturating_add(TILE)) - origin_y;
+            let tile_box = (lx0, ly0, lx1 - lx0, ly1 - ly0);
+            let Some(shape_cov) = tile_coverage_of(Some(shape), (origin_x, origin_y), tile_box)
+            else {
+                continue;
+            };
+            let Some(sel_cov) = tile_coverage_of(selection, (origin_x, origin_y), tile_box) else {
+                continue;
+            };
+            let mut pixels =
+                (ly0..ly1).flat_map(move |ly| (lx0..lx1).map(move |lx| (lx as usize, ly as usize)));
+            let mut texel_for = |lx: usize, ly: usize, current: &[f16]| {
+                let x = i64::from(origin_x) + i64::try_from(lx).unwrap_or(i64::MAX);
+                let y = i64::from(origin_y) + i64::try_from(ly).unwrap_or(i64::MAX);
+                let share = shape_cov.map_or(1.0, |cov| covered(cov, x, y));
+                let fresh = solid_texel(mode, spec.colour, share * opacity, current)?;
+                blended_by(sel_cov, (origin_x, origin_y), (lx, ly), current, fresh)
+            };
+            match write_tile(
+                store,
+                surface,
+                id,
+                &mut pixels,
+                &mut texel_for,
+                &mut snapshot,
+            ) {
+                Ok(true) => outcome.painted.push(id),
+                Ok(false) => {}
+                Err(err) => outcome.failed.push((id, err)),
+            }
+        }
+    }
+    Ok(outcome)
+}
+
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
 mod tests {
