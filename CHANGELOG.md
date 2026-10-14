@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.236.0] - 2026-10-14
+
+### Changed
+
+- Crop ratio presets: ratio dropdown, Portrait, whole-pixel constrained geometry
+
 ## [0.235.0] - 2026-10-14
 
 ### Changed
