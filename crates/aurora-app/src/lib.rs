@@ -543,6 +543,10 @@ mod background_autosave;
 mod background_composite;
 mod background_open;
 mod channels_app;
+mod clipboard_app;
+mod clipboard_pixels;
+#[cfg(test)]
+mod clipboard_tests;
 mod clone_stamp;
 #[cfg(test)]
 mod clone_stamp_tests;
@@ -5626,6 +5630,10 @@ enum AppCommand {
     InverseSelection,
     /// Make Selection from Path (0.233.0), `Primary+Enter`.
     MakeSelectionFromPath,
+    /// Copy, Cut, Copy Merged, Paste, Paste in Place, Layer via Copy and
+    /// Layer via Cut (0.235.0): handed back as
+    /// [`ActivatedCommand::Clipboard`] (not from inside a text field).
+    Clipboard(clipboard_app::ClipCommand),
 }
 
 /// This build's fixed, checked-in global shortcut bindings. Not (yet)
@@ -5740,6 +5748,37 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         ("Primary+Enter", AppCommand::MakeSelectionFromPath),
         ("Primary+D", AppCommand::Deselect),
         ("Primary+Shift+I", AppCommand::InverseSelection),
+        // 0.235.0: Photoshop's clipboard chords. A focused text field takes
+        // Primary+C/X/V first (`route_widget_key`); the Shift chords are not
+        // run from inside one (`handle_key`).
+        (
+            "Primary+C",
+            AppCommand::Clipboard(clipboard_app::ClipCommand::Copy),
+        ),
+        (
+            "Primary+X",
+            AppCommand::Clipboard(clipboard_app::ClipCommand::Cut),
+        ),
+        (
+            "Primary+Shift+C",
+            AppCommand::Clipboard(clipboard_app::ClipCommand::CopyMerged),
+        ),
+        (
+            "Primary+V",
+            AppCommand::Clipboard(clipboard_app::ClipCommand::Paste),
+        ),
+        (
+            "Primary+Shift+V",
+            AppCommand::Clipboard(clipboard_app::ClipCommand::PasteInPlace),
+        ),
+        (
+            "Primary+J",
+            AppCommand::Clipboard(clipboard_app::ClipCommand::LayerViaCopy),
+        ),
+        (
+            "Primary+Shift+J",
+            AppCommand::Clipboard(clipboard_app::ClipCommand::LayerViaCut),
+        ),
     ];
     let mut registry = ShortcutRegistry::new();
     for (source, command) in bindings {
@@ -5778,6 +5817,14 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
 trait ClipboardAccess {
     fn get_text(&mut self) -> Option<String>;
     fn set_text(&mut self, text: String);
+    /// The system clipboard's image, if it holds one (0.235.0). The
+    /// default: none, so a text-only fake need not know about images.
+    fn get_image(&mut self) -> Option<clipboard_pixels::ClipImage> {
+        None
+    }
+    /// Puts an 8-bit image on the system clipboard (0.235.0); failures
+    /// are silent (the internal clip still works).
+    fn set_image(&mut self, _image: &clipboard_pixels::ClipImage) {}
 }
 
 /// The real system clipboard, via `arboard`. Construction can fail (no
@@ -5829,6 +5876,36 @@ impl ClipboardAccess for SystemClipboard {
             && let Err(err) = clipboard.set_text(text)
         {
             tracing::warn!(?err, "failed to write to the system clipboard");
+        }
+    }
+
+    fn get_image(&mut self) -> Option<clipboard_pixels::ClipImage> {
+        match self.clipboard()?.get_image() {
+            Ok(image) => Some(clipboard_pixels::ClipImage {
+                width: u32::try_from(image.width).ok()?,
+                height: u32::try_from(image.height).ok()?,
+                rgba: image.bytes.into_owned(),
+            }),
+            Err(err) => {
+                tracing::debug!(?err, "no image on the system clipboard");
+                None
+            }
+        }
+    }
+
+    fn set_image(&mut self, image: &clipboard_pixels::ClipImage) {
+        let (Ok(width), Ok(height)) = (usize::try_from(image.width), usize::try_from(image.height))
+        else {
+            return;
+        };
+        if let Some(clipboard) = self.clipboard()
+            && let Err(err) = clipboard.set_image(arboard::ImageData {
+                width,
+                height,
+                bytes: std::borrow::Cow::Borrowed(&image.rgba),
+            })
+        {
+            tracing::debug!(?err, "could not put the image on the system clipboard");
         }
     }
 }
@@ -5925,6 +6002,8 @@ enum ActivatedCommand {
     /// Crop to Selection (0.226.0): palette, the Select menu (and the
     /// macOS Edit menu).
     CropToSelection,
+    /// A clipboard command (0.235.0).
+    Clipboard(clipboard_app::ClipCommand),
     /// Select > Modify (0.216.0): open the number prompt of a command.
     RefinePrompt(selection_refine::RefineKind),
     /// Select > Modify (0.216.0): apply a command with the number the
@@ -6273,6 +6352,11 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(selection_store::COMMAND_SAVE, selection_store::SAVE_TITLE),
     ];
     commands.extend(
+        clipboard_app::COMMANDS
+            .iter()
+            .map(|(id, title, _)| CommandEntry::new(*id, *title)),
+    );
+    commands.extend(
         paths_app::COMMANDS
             .iter()
             .map(|(id, title)| CommandEntry::new(*id, *title)),
@@ -6536,6 +6620,9 @@ fn activate_command(
     }
     if id == crop::COMMAND_CROP_TO_SELECTION {
         return Some(ActivatedCommand::CropToSelection);
+    }
+    if let Some(command) = clipboard_app::command_for(id) {
+        return Some(ActivatedCommand::Clipboard(command));
     }
     if let Some(command) = selection_store::command_for(id) {
         return Some(ActivatedCommand::SavedSelection(command));
@@ -10352,6 +10439,34 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(COMMAND_UNDO, "Undo", true, None),
             &muda::MenuItem::with_id(COMMAND_REDO, "Redo", true, None),
             &muda::PredefinedMenuItem::separator(),
+            &muda::MenuItem::with_id(clipboard_app::COMMAND_COPY, "Copy", true, None),
+            &muda::MenuItem::with_id(clipboard_app::COMMAND_CUT, "Cut", true, None),
+            &muda::MenuItem::with_id(
+                clipboard_app::COMMAND_COPY_MERGED,
+                "Copy Merged",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(clipboard_app::COMMAND_PASTE, "Paste", true, None),
+            &muda::MenuItem::with_id(
+                clipboard_app::COMMAND_PASTE_IN_PLACE,
+                "Paste in Place",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                clipboard_app::COMMAND_LAYER_VIA_COPY,
+                clipboard_app::LAYER_VIA_COPY_LABEL,
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                clipboard_app::COMMAND_LAYER_VIA_CUT,
+                clipboard_app::LAYER_VIA_CUT_LABEL,
+                true,
+                None,
+            ),
+            &muda::PredefinedMenuItem::separator(),
             &muda::MenuItem::with_id(COMMAND_SELECT_ALL, "Select All", true, None),
             &muda::MenuItem::with_id(COMMAND_SELECT_DESELECT, "Deselect", true, None),
             &muda::MenuItem::with_id(COMMAND_SELECT_INVERSE, "Inverse Selection", true, None),
@@ -10678,6 +10793,10 @@ enum UndoKind {
     /// is a content change (dirty): paths are authored work saved with the
     /// file, so an edit makes the document unsaved.
     Path,
+    /// Layer via Cut (0.235.0): the new layer (a `History` step) and the
+    /// erasure of the cut texels (a `PixelHistory` step), undone and redone
+    /// together as ONE step.
+    LayerViaCut,
 }
 
 use selection_history::SelectionStep;
@@ -10829,6 +10948,7 @@ fn default_step_label(kind: UndoKind) -> &'static str {
         UndoKind::Selection => "Selection Change",
         UndoKind::Crop => crop::CROP_LABEL,
         UndoKind::Path => "Path Change",
+        UndoKind::LayerViaCut => clipboard_app::LAYER_VIA_CUT_LABEL,
     }
 }
 
@@ -11219,9 +11339,11 @@ impl UndoOrder {
             UndoKind::Structural => history
                 .last_journal_description()
                 .unwrap_or_else(|| default_step_label(kind).to_owned()),
-            UndoKind::Pixel | UndoKind::Selection | UndoKind::Crop | UndoKind::Path => {
-                default_step_label(kind).to_owned()
-            }
+            UndoKind::Pixel
+            | UndoKind::Selection
+            | UndoKind::Crop
+            | UndoKind::Path
+            | UndoKind::LayerViaCut => default_step_label(kind).to_owned(),
         };
         self.record_labelled(kind, label, history, pixel_history);
     }
@@ -11512,7 +11634,8 @@ fn run_command(
         AppCommand::SwapColours
         | AppCommand::ResetColours
         | AppCommand::ToggleQuickMask
-        | AppCommand::MakeSelectionFromPath => {
+        | AppCommand::MakeSelectionFromPath
+        | AppCommand::Clipboard(_) => {
             CompositeInvalidation::None
         }
     }
@@ -11588,6 +11711,39 @@ fn step_undo_order(
                     None
                 }
             }
+            // Atomic (0.235.0 review): the pixel half goes first, because only it
+            // can fail (a tile or spilled snapshot that cannot be read);
+            // the layer half then only edits the in-memory tree, and if
+            // that is refused the pixel half is taken back, so the
+            // journal, the pixels and `undo_order` never disagree.
+            Some(UndoKind::LayerViaCut) => {
+                if let Some(store) = store
+                    && history.can_undo()
+                    && pixel_history.can_undo()
+                {
+                    apply_pixel_step(layers, pixel_history, store, UndoDirection::Undo).and_then(
+                        |_| match history.undo(layers) {
+                            Ok(_) => {
+                                undo_order.step_back();
+                                Some(CompositeInvalidation::Everything)
+                            }
+                            Err(err) => {
+                                tracing::warn!(?err, "undoing a Layer via Cut failed");
+                                let _ = apply_pixel_step(
+                                    layers,
+                                    pixel_history,
+                                    store,
+                                    UndoDirection::Redo,
+                                );
+                                None
+                            }
+                        },
+                    )
+                } else {
+                    tracing::warn!("the undo order names a Layer via Cut the history lacks");
+                    None
+                }
+            }
             Some(UndoKind::Selection) => undo_order
                 .apply_selection_step(UndoDirection::Undo)
                 .then_some(CompositeInvalidation::None),
@@ -11642,6 +11798,34 @@ fn step_undo_order(
                         .inspect(|_| undo_order.step_forward())
                 } else {
                     tracing::warn!("no live tile store; cannot redo a pixel edit");
+                    None
+                }
+            }
+            Some(UndoKind::LayerViaCut) => {
+                if let Some(store) = store
+                    && history.can_redo()
+                    && pixel_history.can_redo()
+                {
+                    apply_pixel_step(layers, pixel_history, store, UndoDirection::Redo).and_then(
+                        |_| match history.redo(layers) {
+                            Ok(_) => {
+                                undo_order.step_forward();
+                                Some(CompositeInvalidation::Everything)
+                            }
+                            Err(err) => {
+                                tracing::warn!(?err, "redoing a Layer via Cut failed");
+                                let _ = apply_pixel_step(
+                                    layers,
+                                    pixel_history,
+                                    store,
+                                    UndoDirection::Undo,
+                                );
+                                None
+                            }
+                        },
+                    )
+                } else {
+                    tracing::warn!("the undo order names a Layer via Cut the history lacks");
                     None
                 }
             }
@@ -12140,6 +12324,15 @@ fn handle_key(
                 matches!(workspace.tree.payload(id), Some(WidgetKind::TextField(_)))
             });
             return (!in_text_field).then_some(ActivatedCommand::Selection(selection_command));
+        }
+        if let AppCommand::Clipboard(clip_command) = command {
+            // A focused text field keeps the keyboard (its own copy, cut
+            // and paste are consumed before the registry; the Shift
+            // chords must not edit the document from inside one).
+            let in_text_field = focus.focused().is_some_and(|id| {
+                matches!(workspace.tree.payload(id), Some(WidgetKind::TextField(_)))
+            });
+            return (!in_text_field).then_some(ActivatedCommand::Clipboard(clip_command));
         }
         if command == AppCommand::CloseDocument {
             return Some(ActivatedCommand::Document(
@@ -25087,6 +25280,13 @@ enum LayerCommand {
     /// layer (0.201.0): one journaled `History::set_clipped` step labelled
     /// "Clip Layer"/"Release Clipping Mask"; the layer stays active.
     SetClip(bool),
+    /// Paste, Layer via Copy and Layer via Cut (0.235.0): a new pixel layer
+    /// with `bounds`, placed as [`Self::New`] places one, recorded under
+    /// `label`. The caller writes the pixels afterwards.
+    Paste {
+        bounds: aurora_core::Rect,
+        label: &'static str,
+    },
 }
 
 /// Everything [`perform_layer_command`] touches, borrowed from `App` (or
@@ -25355,6 +25555,30 @@ fn new_layer(cx: &mut LayerCommandContext<'_>) -> Option<aurora_doc::LayerId> {
     }
 }
 
+/// Paste (0.235.0): the empty pixel layer a paste fills, at
+/// [`new_layer_placement`], named like a New Layer, recorded as `label`.
+fn paste_layer(
+    cx: &mut LayerCommandContext<'_>,
+    bounds: aurora_core::Rect,
+    label: &'static str,
+) -> Option<AppliedLayerCommand> {
+    let placement = new_layer_placement(cx.layers, *cx.active_layer);
+    let name = next_layer_name(cx.layers);
+    match cx
+        .history
+        .add_pixel_layer_at(cx.layers, name, bounds, placement.parent, placement.index)
+    {
+        Ok(id) => Some(AppliedLayerCommand {
+            next_active: Some(id),
+            label: Some(label),
+        }),
+        Err(err) => {
+            tracing::warn!(?err, "Paste was refused by the layer tree");
+            None
+        }
+    }
+}
+
 /// Removes the active node and its subtree through `history` (one undo
 /// step, which restores the layers *and* — since a deleted layer's tiles
 /// stay in the store and its id is never reissued — their pixels).
@@ -25577,6 +25801,7 @@ fn perform_layer_command(cx: &mut LayerCommandContext<'_>, command: LayerCommand
             label: None,
         }),
         LayerCommand::SetClip(on) => set_clip(cx, on),
+        LayerCommand::Paste { bounds, label } => paste_layer(cx, bounds, label),
     };
     let Some(AppliedLayerCommand { next_active, label }) = next_active else {
         return false;
@@ -27874,6 +28099,8 @@ struct App {
     /// The real system clipboard — [`ClipboardAccess`]'s real
     /// implementation, used by the command palette's `Ctrl+C`/`Ctrl+V`.
     clipboard: SystemClipboard,
+    /// The internal pixel clipboard (0.235.0): App state, not document state.
+    pixel_clip: clipboard_app::PixelClipboard,
     /// The real native file picker — [`FileDialogAccess`]'s real
     /// implementation, used by [`COMMAND_FILE_OPEN`].
     file_dialog: SystemFileDialog,
@@ -28437,6 +28664,7 @@ impl App {
             presets,
             scale_factor: 1.0,
             clipboard: SystemClipboard::new(),
+            pixel_clip: clipboard_app::PixelClipboard::default(),
             file_dialog: SystemFileDialog,
             tool: aurora_ui::Tool::default(),
             // `with_id`, not `new` (0.172.0 fix): the startup autosave and
@@ -28895,6 +29123,7 @@ impl App {
             Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
             Some(ActivatedCommand::SetSelectionMode(mode)) => self.set_selection_mode(mode),
             Some(ActivatedCommand::CropToSelection) => self.crop_to_selection(),
+            Some(ActivatedCommand::Clipboard(command)) => self.run_clipboard_command(command),
             Some(ActivatedCommand::RefinePrompt(kind)) => self.open_refine_prompt(kind),
             Some(ActivatedCommand::RefineApply(kind, amount)) => self.run_refine(kind, amount),
             Some(ActivatedCommand::SavedSelection(command)) => self.run_saved_selection(command),
@@ -29209,6 +29438,11 @@ impl App {
     /// converge here through [`ActivatedCommand`], as Undo/Redo converge
     /// on [`Self::run_undo_redo`].
     fn run_layer_command(&mut self, command: LayerCommand) {
+        let _ = self.run_layer_command_checked(command);
+    }
+
+    /// [`Self::run_layer_command`], reporting whether the layer set changed.
+    fn run_layer_command_checked(&mut self, command: LayerCommand) -> bool {
         if command == LayerCommand::Delete
             && let Some(layer) = self.doc.active_layer
             && let Some(why) = delete_refusal(self.doc.layers.lock(layer).unwrap_or_default())
@@ -29221,7 +29455,7 @@ impl App {
         {
             self.lock_notice = Some((why, Some(layer)));
         }
-        let _ = perform_layer_command(
+        let applied = perform_layer_command(
             &mut LayerCommandContext {
                 workspace: &mut self.workspace,
                 focus: &mut self.focus,
@@ -29247,6 +29481,7 @@ impl App {
         }
         self.push_accessibility();
         self.needs_redraw = true;
+        applied
     }
 
     /// Opens a real, native `WindowEvent::DroppedFile` — the same
@@ -43433,8 +43668,9 @@ mod tests {
         // Panel Layout" and the three "Move Layers Panel ..." commands,
         // and (0.167.0) "Float Layers Panel" and "Dock Layers Panel" --
         // the first inserted (`palette_commands`'s own order) is what ends
-        // up selected. (0.202.0) "New Levels Layer" matches too.
-        assert_eq!(state.results().len(), 14);
+        // up selected. (0.202.0) "New Levels Layer" matches too, and
+        // (0.235.0) "Layer via Copy" and "Layer via Cut".
+        assert_eq!(state.results().len(), 16);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)

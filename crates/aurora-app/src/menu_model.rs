@@ -106,6 +106,23 @@ fn static_rows(title: &str) -> Vec<Row> {
             Cmd(crate::COMMAND_UNDO, "Undo"),
             Cmd(crate::COMMAND_REDO, "Redo"),
             Sep,
+            Cmd(crate::clipboard_app::COMMAND_COPY, "Copy"),
+            Cmd(crate::clipboard_app::COMMAND_CUT, "Cut"),
+            Cmd(crate::clipboard_app::COMMAND_COPY_MERGED, "Copy Merged"),
+            Cmd(crate::clipboard_app::COMMAND_PASTE, "Paste"),
+            Cmd(
+                crate::clipboard_app::COMMAND_PASTE_IN_PLACE,
+                "Paste in Place",
+            ),
+            Cmd(
+                crate::clipboard_app::COMMAND_LAYER_VIA_COPY,
+                crate::clipboard_app::LAYER_VIA_COPY_LABEL,
+            ),
+            Cmd(
+                crate::clipboard_app::COMMAND_LAYER_VIA_CUT,
+                crate::clipboard_app::LAYER_VIA_CUT_LABEL,
+            ),
+            Sep,
             Cmd(
                 crate::COMMAND_COLOURS_SWAP,
                 "Swap Foreground and Background Colours",
@@ -276,6 +293,9 @@ pub(crate) fn hint_command(id: &str) -> Option<AppCommand> {
         crate::COMMAND_COLOURS_SWAP => AppCommand::SwapColours,
         crate::COMMAND_COLOURS_RESET => AppCommand::ResetColours,
         crate::COMMAND_SELECT_ALL => AppCommand::SelectAll,
+        _ if crate::clipboard_app::command_for(id).is_some() => {
+            return crate::clipboard_app::command_for(id).map(AppCommand::Clipboard);
+        }
         crate::COMMAND_SELECT_DESELECT => AppCommand::Deselect,
         crate::COMMAND_SELECT_INVERSE => AppCommand::InverseSelection,
         crate::quick_mask::COMMAND_ID => AppCommand::ToggleQuickMask,
@@ -302,6 +322,7 @@ pub(crate) fn enabled(id: &str, context: &MenuContext) -> bool {
         | crate::path_paint::COMMAND_FILL
         | crate::path_paint::COMMAND_STROKE
         | crate::path_paint::COMMAND_MAKE_FROM_SELECTION => !context.quick_mask,
+        _ if crate::clipboard_app::command_for(id).is_some() => !context.quick_mask,
         _ if crate::selection_refine::RefineKind::for_command(id).is_some() => !context.quick_mask,
         _ if matches!(
             crate::selection_store::command_for(id),
@@ -414,6 +435,13 @@ pub(crate) const NATIVE_MENU_COMMANDS: &[&str] = &[
     crate::COMMAND_SELECT_INVERSE,
     crate::quick_mask::COMMAND_ID,
     crate::crop::COMMAND_CROP_TO_SELECTION,
+    crate::clipboard_app::COMMAND_COPY,
+    crate::clipboard_app::COMMAND_CUT,
+    crate::clipboard_app::COMMAND_COPY_MERGED,
+    crate::clipboard_app::COMMAND_PASTE,
+    crate::clipboard_app::COMMAND_PASTE_IN_PLACE,
+    crate::clipboard_app::COMMAND_LAYER_VIA_COPY,
+    crate::clipboard_app::COMMAND_LAYER_VIA_CUT,
     crate::paths_app::COMMAND_MAKE_SELECTION,
     crate::path_paint::COMMAND_FILL,
     crate::path_paint::COMMAND_STROKE,
