@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.235.0] - 2026-10-14
+
+### Changed
+
+- WIP 092: pixel clipboard pure module, arboard image-data
+
 ## [0.234.0] - 2026-10-14
 
 ### Changed
