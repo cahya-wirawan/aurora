@@ -265,7 +265,7 @@ impl PenState {
         self.press_at(paths, point, hit, None, close_radius, alt)
     }
 
-    /// [`Self::press`] with `segment`, the segment of the active path under
+    /// `press` with `segment`, the segment of the active path under
     /// the pointer (not an anchor): a press on it, with no subpath in
     /// progress, inserts an anchor there.
     #[allow(clippy::too_many_lines)]
