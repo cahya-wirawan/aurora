@@ -548,7 +548,7 @@ fn too_little_around_the_mask_is_refused_and_writes_nothing() {
     paint(&mut s, 5, 5, |_, _| texel(0.5, 0.5, 0.5, 1.0));
     let before = dump(&mut s, 12, 12);
     let mask = disc(2.5, 2.5, 2.4);
-    assert!(MIN_RING_TEXELS > 4);
+    const { assert!(MIN_RING_TEXELS > 4) };
     assert_eq!(
         heal(&mut s, &mask, false, None, None).err(),
         Some(HealRefusal::NotEnoughSurroundings)
@@ -681,7 +681,7 @@ fn the_transparency_lock_keeps_every_alpha_bit_for_bit() {
     assert!(heal(&mut free, &mask, false, None, None).is_ok());
     let t = getf(&mut free, 40, 40);
     assert!((t[3] - (0.6 + 40.0 / 400.0)).abs() < 0.02, "{t:?}");
-    assert!(dump(&mut free, 80, 80) != after);
+    assert_ne!(dump(&mut free, 80, 80), after);
 }
 
 #[test]
