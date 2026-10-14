@@ -154,16 +154,58 @@ fn options_style(scales: &Scales) -> Style {
     }
 }
 
-/// How an options-row item is sized: the readout takes the row's spare
-/// width (from a zero basis — a `Label`'s own width is `auto`, which in a
-/// row would be zero text-blind); the slider is exactly
-/// `size.options_control_width` wide (0.160.0 review: a design token, the
-/// design owner's decision, replacing a 1:2 flex split), shrinking only
-/// if the bar is narrower than that.
+/// How an options-row item is sized (0.228.3).
+///
+/// **The model.** Nothing in the options bar shrinks: every item has a
+/// base size it keeps (`flex_shrink` 0) and the bar clips what does not
+/// fit (`overflow.x` hidden, see `options_bar_style`), so no two items
+/// overlap and no readout is squeezed to nothing. A *readout* and a
+/// *checkbox* have their measured text as their base; a *slider* has the
+/// floor [`slider_floor`] (half of `size.options_control_width`,
+/// derived, no new token). Spare width is then shared by `flex_grow`:
+/// sliders and the groups holding them take it first ([`SLIDER_GROW`]
+/// each) up to `size.options_control_width`, and only what is left
+/// stretches the readouts (grow 1), as they always did, so the sliders
+/// give up width first and a wide bar looks as before.
+///
+/// **Why it was broken.** Until 0.228.3 every item shrank with a zero
+/// minimum, a readout's basis was zero (a `Label` is not measured) and
+/// the sliders were 224 px wide: in a bar narrower than about 1,300 px (a
+/// window of about 900 px with the rail open) the readouts, which took
+/// only the spare width, collapsed to nothing while the sliders kept
+/// theirs, and a checkbox could be squeezed to a few pixels. Groups cannot
+/// simply shrink either: taffy's automatic minimum of a nested flex
+/// container does not add up its children (measured: a group of 421 px
+/// of controls shrank to 130).
+///
+/// A readout's base is its text only under
+/// [`aurora_widgets::compute_text_layout`] (a label that reserves width,
+/// [`aurora_widgets::widgets::set_label_reserve`], is measured); under the
+/// text-blind `compute_layout` the base is zero and it grows from nothing
+/// as before.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum OptionsItem {
     Readout,
     Slider,
+    /// A checkbox (Radial, Reverse, Contiguous, a selection mode, a toning
+    /// range or mode): its own measured width, never shrunk.
+    Check,
+}
+
+/// The `flex_grow` of one options-bar slider; a group holding `n` sliders
+/// has `n` times this ([`group_grow`]), and a readout has 1, so spare
+/// width reaches the sliders (up to their maximum) before the readouts.
+pub(crate) const SLIDER_GROW: f32 = 1000.0;
+
+/// The `flex_grow` of an options group that holds `sliders` sliders.
+pub(crate) fn group_grow(sliders: u8) -> f32 {
+    SLIDER_GROW * f32::from(sliders)
+}
+
+/// The narrowest an options-bar slider is made when the bar is short of
+/// width: half of `size.options_control_width` (112 px at the shipped 224).
+pub(crate) fn slider_floor(scales: &Scales) -> u32 {
+    scales.size.options_control_width / 2
 }
 
 /// Re-styles `id` (already built) for the options row as `item`, shown or
@@ -179,22 +221,29 @@ pub(crate) fn set_options_item(
         .style(id)
         .cloned()
         .ok_or(WidgetError::UnknownWidget(id))?;
-    let zero = <taffy::Dimension as taffy::style_helpers::TaffyZero>::ZERO;
     let mut style = current.clone();
     style.display = if shown { Display::Flex } else { Display::None };
-    style.flex_shrink = 1.0;
-    style.min_size.width = zero;
     match item {
         OptionsItem::Readout => {
             style.flex_grow = 1.0;
-            style.flex_basis = zero;
+            style.flex_shrink = 0.0;
+            style.flex_basis = taffy::Dimension::auto();
         }
         OptionsItem::Slider => {
             #[allow(clippy::cast_precision_loss)]
-            let width = length(scales.size.options_control_width as f32);
-            style.flex_grow = 0.0;
-            style.flex_basis = taffy::Dimension::auto();
-            style.size.width = width;
+            let (width, floor) = (
+                length(scales.size.options_control_width as f32),
+                length(slider_floor(scales) as f32),
+            );
+            style.flex_grow = SLIDER_GROW;
+            style.flex_shrink = 0.0;
+            style.flex_basis = floor;
+            style.size.width = taffy::Dimension::auto();
+            style.min_size.width = floor;
+            style.max_size.width = width;
+        }
+        OptionsItem::Check => {
+            style.flex_shrink = 0.0;
         }
     }
     if style == current {
@@ -305,6 +354,11 @@ fn build(
         TOOL_RADIUS_MAX,
     )?;
     set_options_item(tree, scales, readout, OptionsItem::Readout, true)?;
+    widgets::set_label_reserve(
+        tree,
+        readout,
+        &[&radius_readout(Tool::Move, Some(TOOL_RADIUS_MAX))],
+    )?;
     set_options_item(tree, scales, radius, OptionsItem::Slider, false)?;
     let fill = crate::fill_controls::insert_fill_controls(tree, options, scales)?;
     let modes =
@@ -790,5 +844,71 @@ mod tests {
         assert_eq!(readout(&ws.tree, controls.readout).0, "Radius 31 px");
         sync(&mut ws.tree, controls, Tool::Brush, Some(31.0), None);
         assert!((slider(&ws.tree, controls.radius).0 - 31.0).abs() < 1e-9);
+    }
+    /// 0.228.3: how every kind of options-row item is sized.
+    #[test]
+    fn an_options_item_is_styled_by_its_kind_readouts_and_checks_never_shrink() {
+        let (ws, controls) = built(1600.0, 900.0);
+        let scales = scales();
+        let style = |id| match ws.tree.style(id) {
+            Some(style) => style.clone(),
+            None => unreachable!("known id"),
+        };
+        let floor = taffy::style_helpers::length(super::slider_floor(&scales) as f32);
+        assert_eq!(
+            super::slider_floor(&scales),
+            scales.size.options_control_width / 2
+        );
+        // A readout: its text is its base, never shrunk, takes leftovers last.
+        for id in [controls.readout, controls.fill.paint_opacity_readout] {
+            let readout = style(id);
+            assert_eq!(readout.flex_shrink, 0.0, "{id:?}");
+            assert_eq!(readout.flex_grow, 1.0, "{id:?}");
+            assert_eq!(readout.flex_basis, taffy::Dimension::auto(), "{id:?}");
+        }
+        // A slider: starts at the floor, grows first, capped at the token.
+        for id in [
+            controls.radius,
+            controls.fill.paint_opacity,
+            controls.fill.opacity,
+        ] {
+            let slider = style(id);
+            assert_eq!(slider.flex_shrink, 0.0, "{id:?}");
+            assert_eq!(slider.flex_basis, floor, "{id:?}");
+            assert_eq!(slider.min_size.width, floor, "{id:?}");
+            assert_eq!(
+                slider.max_size.width,
+                taffy::style_helpers::length(scales.size.options_control_width as f32),
+                "{id:?}"
+            );
+            assert_eq!(slider.flex_grow, super::SLIDER_GROW, "{id:?}");
+        }
+        // A checkbox is never shrunk; a group never shrinks and takes spare
+        // width for as many sliders as it holds.
+        for id in [
+            controls.fill.radial,
+            controls.fill.contiguous,
+            controls.modes.add,
+            controls.tone.shadows,
+        ] {
+            assert_eq!(style(id).flex_shrink, 0.0, "{id:?}");
+        }
+        assert_eq!(style(controls.fill.gradient).flex_shrink, 0.0);
+        assert_eq!(style(controls.fill.paint).flex_grow, super::group_grow(2));
+        assert_eq!(style(controls.fill.smudge).flex_grow, super::group_grow(1));
+    }
+
+    /// 0.228.3: the bar clips an end that does not fit.
+    #[test]
+    fn the_options_bar_clips_horizontally_and_not_vertically() {
+        let (ws, _) = built(1600.0, 900.0);
+        let overflow = ws.tree.style(ws.options_bar).map(|s| s.overflow);
+        assert_eq!(
+            overflow,
+            Some(taffy::Point {
+                x: taffy::Overflow::Hidden,
+                y: taffy::Overflow::Visible
+            })
+        );
     }
 }

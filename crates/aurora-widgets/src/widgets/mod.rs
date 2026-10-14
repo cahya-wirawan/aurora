@@ -215,7 +215,9 @@ pub use icon::{
     IconAccess, IconSize, IconState, IconTone, icon_side, icon_state, insert_icon, set_icon_access,
     set_icon_kind, set_icon_tone,
 };
-pub use label::{LabelState, insert_label, label_state, set_label_disabled, set_label_text};
+pub use label::{
+    LabelState, insert_label, label_state, set_label_disabled, set_label_reserve, set_label_text,
+};
 pub use list_row::ListRowState;
 pub use menu::{
     MenuItem, MenuItemKind, MenuKey, MenuOutcome, MenuState, activate_menu_item, close_menu,

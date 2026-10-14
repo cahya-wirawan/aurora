@@ -58,6 +58,9 @@ pub fn measure_widget(kind: &WidgetKind, measure: &mut TextMeasure<'_>) -> Optio
     if let WidgetKind::Button(state) = kind {
         return measure_toggle_button(state, measure);
     }
+    if let WidgetKind::Label(state) = kind {
+        return measure_label(state, measure);
+    }
     let WidgetKind::Checkbox(state) = kind else {
         return None;
     };
@@ -76,6 +79,40 @@ pub fn measure_widget(kind: &WidgetKind, measure: &mut TextMeasure<'_>) -> Optio
     Some(Size {
         width: (side + gap + width).ceil(),
         height: row_height(measure.scales).max(side),
+    })
+}
+
+/// A label's measured size (0.228.3): only a label that reserves width
+/// ([`crate::widgets::LabelState::reserve`]) is measured, as
+/// `ceil(widest of its text and the reserved texts)` wide and one row
+/// tall; any other label keeps its style's size. `None` when nothing
+/// shapes to a finite, positive width.
+fn measure_label(
+    state: &crate::widgets::LabelState,
+    measure: &mut TextMeasure<'_>,
+) -> Option<Size<f32>> {
+    if state.reserve.is_empty() {
+        return None;
+    }
+    let mut widest = 0.0_f32;
+    for text in std::iter::once(&state.text).chain(&state.reserve) {
+        let text = sanitize_label(text);
+        if text.trim().is_empty() {
+            continue;
+        }
+        let line = measure
+            .engine
+            .shape(&text, &label_style(measure.scales), measure.scale_factor);
+        if line.width.is_finite() {
+            widest = widest.max(line.width);
+        }
+    }
+    if widest <= 0.0 {
+        return None;
+    }
+    Some(Size {
+        width: widest.ceil(),
+        height: row_height(measure.scales),
     })
 }
 
@@ -713,5 +750,57 @@ mod tests {
             after_layout,
             "paint reuses the lines layout shaped"
         );
+    }
+    /// A row holding one label, laid out text-aware in 600 px.
+    fn label_row(
+        scales: &Scales,
+        text: &str,
+        reserve: &[&str],
+    ) -> (WidgetTree<WidgetKind>, WidgetId) {
+        let (mut tree, root) = new_tree(Style {
+            flex_direction: FlexDirection::Row,
+            ..Default::default()
+        });
+        let id = ok(crate::widgets::insert_label(&mut tree, root, scales, text));
+        ok(crate::widgets::set_label_reserve(&mut tree, id, reserve));
+        (tree, id)
+    }
+
+    fn label_width(tree: &mut WidgetTree<WidgetKind>, id: WidgetId, scales: &Scales) -> u32 {
+        let mut engine = engine();
+        compute_text_layout(
+            tree,
+            600.0,
+            100.0,
+            Some(TextMeasure {
+                engine: &mut engine,
+                scales,
+                scale_factor: 1.0,
+            }),
+        );
+        bounds(tree, id).width
+    }
+
+    #[test]
+    fn a_label_with_no_reserve_is_not_measured() {
+        let scales = test_scales();
+        let (mut tree, id) = label_row(&scales, "Opacity 100 %", &[]);
+        assert_eq!(label_width(&mut tree, id, &scales), 0);
+    }
+
+    #[test]
+    fn a_label_with_a_reserve_is_as_wide_as_the_widest_of_its_text_and_the_reserve() {
+        let scales = test_scales();
+        let (mut short, a) = label_row(&scales, "Opacity 5 %", &["Opacity 100 %"]);
+        let (mut full, b) = label_row(&scales, "Opacity 100 %", &["Opacity 100 %"]);
+        let (mut longer, c) = label_row(&scales, "A much longer readout text", &["Opacity 100 %"]);
+        let (short_w, full_w, longer_w) = (
+            label_width(&mut short, a, &scales),
+            label_width(&mut full, b, &scales),
+            label_width(&mut longer, c, &scales),
+        );
+        assert!(full_w > 40, "a real width: {full_w}");
+        assert_eq!(short_w, full_w, "a value change keeps the width");
+        assert!(longer_w > full_w, "the label's own text counts too");
     }
 }

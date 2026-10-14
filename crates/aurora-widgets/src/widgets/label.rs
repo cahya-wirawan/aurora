@@ -35,6 +35,15 @@ pub struct LabelState {
     pub text: String,
     /// Drawn in `text.disabled` and announced as disabled.
     pub disabled: bool,
+    /// Texts whose width this label also reserves (0.228.3), empty for an
+    /// ordinary label. Under text-aware layout
+    /// ([`crate::compute_text_layout`]) a label with a reserve is measured
+    /// as wide as the widest of its own text and these, so a readout
+    /// whose value changes while it is dragged (`Opacity 5 %` to
+    /// `Opacity 100 %`) keeps one width and the slider beside it does not
+    /// move under the pointer. A label with no reserve is not measured
+    /// (its style decides), as before.
+    pub reserve: Vec<String>,
 }
 
 fn node(state: &LabelState) -> Node {
@@ -72,6 +81,7 @@ pub fn insert_label(
     let state = LabelState {
         text: text.into(),
         disabled: false,
+        reserve: Vec::new(),
     };
     tree.insert(
         parent,
@@ -100,6 +110,32 @@ pub fn set_label_text(
         return Ok(false);
     }
     with_label_mut(tree, id, |state| text.clone_into(&mut state.text))?;
+    Ok(true)
+}
+
+/// Sets the texts `id` (a label) reserves width for
+/// ([`LabelState::reserve`]). Returns whether anything changed.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it exists but isn't a label.
+pub fn set_label_reserve(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    reserve: &[&str],
+) -> Result<bool, WidgetError> {
+    let same = {
+        let state = label_state(tree, id)?;
+        state.reserve.len() == reserve.len()
+            && state.reserve.iter().zip(reserve).all(|(a, b)| a == b)
+    };
+    if same {
+        return Ok(false);
+    }
+    with_label_mut(tree, id, |state| {
+        state.reserve = reserve.iter().map(|text| (*text).to_owned()).collect();
+    })?;
     Ok(true)
 }
 
@@ -289,6 +325,36 @@ mod tests {
         assert!(matches!(
             set_label_text(&mut tree, button, "x"),
             Err(WidgetError::UnknownWidget(got)) if got == button
+        ));
+    }
+    #[test]
+    fn set_label_reserve_reports_a_change_only_once_and_errors_on_a_non_label() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let id = match insert_label(&mut tree, root, &scales, "x") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(label_state(&tree, id).is_ok_and(|s| s.reserve.is_empty()));
+        assert!(matches!(
+            super::set_label_reserve(&mut tree, id, &["wide", "wider"]),
+            Ok(true)
+        ));
+        assert!(matches!(
+            super::set_label_reserve(&mut tree, id, &["wide", "wider"]),
+            Ok(false)
+        ));
+        assert!(matches!(
+            super::set_label_reserve(&mut tree, id, &["wide"]),
+            Ok(true)
+        ));
+        assert!(matches!(
+            super::set_label_reserve(&mut tree, id, &[]),
+            Ok(true)
+        ));
+        assert!(matches!(
+            super::set_label_reserve(&mut tree, root, &[]),
+            Err(WidgetError::WrongWidgetKind(_))
         ));
     }
 }

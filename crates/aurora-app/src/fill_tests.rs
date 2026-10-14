@@ -1523,10 +1523,10 @@ fn the_options_bar_edits_the_brush_pencil_and_clone_opacity_and_flow_each_on_its
 
 #[test]
 fn with_measured_text_the_paint_options_fit_the_bar_without_changing_its_height() {
-    // A 1600 px window (a ~1200 px options bar). Narrower than about 900 px
-    // the readouts, which take only spare width, collapse before the sliders
-    // shrink (the Gradient group does the same); disclosed in PLAN.md.
-    const WIDE: f32 = 1600.0;
+    // A 1100 px window (a ~780 px options bar, the rail open). Until 0.228.3
+    // the readouts collapsed to nothing in a bar narrower than about
+    // 1,200 px, so this test had to use a 1,600 px window.
+    const WIDE: f32 = 1100.0;
     let scales = crate::test_workspace_scales();
     let mut bar = Bar::new();
     let Ok(mut engine) = aurora_text::TextEngine::new() else {
@@ -1580,4 +1580,243 @@ fn with_measured_text_the_paint_options_fit_the_bar_without_changing_its_height(
             previous_right = b.right();
         }
     }
+}
+
+// -- the options bar in a narrow window (0.228.3) ----------------------------
+
+/// One shown leaf of the options bar: a readout, a slider or a checkbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leaf {
+    Readout,
+    Slider,
+    Check,
+}
+
+struct Item {
+    id: aurora_widgets::WidgetId,
+    parent: aurora_widgets::WidgetId,
+    leaf: Leaf,
+    x: i64,
+    right: i64,
+}
+
+/// Lays the options bar out for `tool` in a window `width` px wide with
+/// measured text and returns its shown leaves in tree order, plus the
+/// bar's (left, right).
+fn options_items(bar: &mut Bar, tool: Tool, width: f32) -> (Vec<Item>, (i64, i64)) {
+    let scales = crate::test_workspace_scales();
+    let Ok(mut engine) = aurora_text::TextEngine::new() else {
+        unreachable!("the bundled font loads");
+    };
+    crate::sync_tool_controls(
+        &mut bar.workspace,
+        Some(bar.controls),
+        tool,
+        &bar.settings,
+        None,
+    );
+    aurora_widgets::compute_text_layout(
+        &mut bar.workspace.tree,
+        width,
+        H,
+        Some(aurora_widgets::TextMeasure {
+            engine: &mut engine,
+            scales: &scales,
+            scale_factor: 1.0,
+        }),
+    );
+    let tree = &bar.workspace.tree;
+    let Some(strip) = tree.bounds(bar.workspace.options_bar) else {
+        unreachable!("laid out");
+    };
+    let mut items = Vec::new();
+    let mut stack = vec![bar.workspace.options_bar];
+    while let Some(id) = stack.pop() {
+        if tree
+            .style(id)
+            .is_some_and(|s| s.display == taffy::Display::None)
+        {
+            continue;
+        }
+        let leaf = match tree.payload(id) {
+            Some(WidgetKind::Label(_)) => Some(Leaf::Readout),
+            Some(WidgetKind::Slider(_)) => Some(Leaf::Slider),
+            Some(WidgetKind::Checkbox(_)) => Some(Leaf::Check),
+            _ => None,
+        };
+        if let (Some(leaf), Some(b), Some(parent)) = (leaf, tree.bounds(id), tree.parent(id)) {
+            items.push(Item {
+                id,
+                parent,
+                leaf,
+                x: b.x,
+                right: b.right(),
+            });
+        }
+        if let Some(children) = tree.children(id) {
+            stack.extend(children.iter().rev().copied());
+        }
+    }
+    (items, (strip.x, strip.right()))
+}
+
+fn item_width(item: &Item) -> i64 {
+    item.right - item.x
+}
+
+const OPTION_WINDOWS: [f32; 6] = [700.0, 900.0, 1000.0, 1100.0, 1300.0, 1600.0];
+
+#[test]
+fn no_options_bar_readout_slider_or_checkbox_collapses_or_overlaps_at_any_width() {
+    let mut bar = Bar::new();
+    for width in OPTION_WINDOWS {
+        for tool in Tool::ALL {
+            let (items, (left, _)) = options_items(&mut bar, tool, width);
+            assert!(!items.is_empty(), "{tool:?} at {width}: something is shown");
+            for item in &items {
+                assert!(
+                    item_width(item) > 0,
+                    "{tool:?} at {width}: a {:?} has no width",
+                    item.leaf
+                );
+                // A readout is its measured text, never a sliver.
+                if item.leaf == Leaf::Readout {
+                    assert!(
+                        item_width(item) >= 40,
+                        "{tool:?} at {width}: a readout is {} px",
+                        item_width(item)
+                    );
+                }
+                assert!(item.x >= left, "{tool:?} at {width}: starts inside the bar");
+            }
+            // Siblings never overlap: left to right in tree order.
+            for pair in items.windows(2) {
+                if let [a, b] = pair
+                    && a.parent == b.parent
+                {
+                    assert!(
+                        b.x >= a.right,
+                        "{tool:?} at {width}: {:?} overlaps the {:?} before it",
+                        b.leaf,
+                        a.leaf
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn with_room_every_options_bar_control_fits_inside_the_bar() {
+    let mut bar = Bar::new();
+    for width in [1300.0, 1600.0] {
+        for tool in Tool::ALL {
+            let (items, (_, right)) = options_items(&mut bar, tool, width);
+            for item in &items {
+                assert!(
+                    item.right <= right,
+                    "{tool:?} at {width}: a {:?} runs past the bar",
+                    item.leaf
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn in_a_narrow_bar_the_sliders_give_up_width_before_any_readout() {
+    let mut bar = Bar::new();
+    let floor = {
+        let scales = crate::test_workspace_scales();
+        i64::from(scales.size.options_control_width / 2)
+    };
+    let full = i64::from(crate::test_workspace_scales().size.options_control_width);
+    for tool in [
+        Tool::Brush,
+        Tool::Pencil,
+        Tool::CloneStamp,
+        Tool::Smudge,
+        Tool::Dodge,
+        Tool::Sponge,
+        Tool::Gradient,
+        Tool::PaintBucket,
+        Tool::MagicWand,
+    ] {
+        // The readouts' own widths are what they have at the narrowest
+        // window; widening only ever lengthens them, never below it.
+        let (narrow, _) = options_items(&mut bar, tool, 700.0);
+        for width in [900.0, 1000.0, 1100.0, 1300.0, 1600.0] {
+            let (wide, _) = options_items(&mut bar, tool, width);
+            assert_eq!(narrow.len(), wide.len());
+            for (n, w) in narrow.iter().zip(&wide) {
+                assert_eq!(n.id, w.id);
+                if n.leaf == Leaf::Slider {
+                    assert!(
+                        (floor..=full).contains(&item_width(w)),
+                        "{tool:?} at {width}: a slider is {} px",
+                        item_width(w)
+                    );
+                } else {
+                    assert!(
+                        item_width(w) >= item_width(n),
+                        "{tool:?} at {width}: a {:?} is narrower than at 700",
+                        w.leaf
+                    );
+                }
+            }
+        }
+    }
+    // At 700 px the Brush's three sliders are all at their floor: the bar
+    // is shorter than their controls, and nothing else was squeezed.
+    let (brush, _) = options_items(&mut bar, Tool::Brush, 700.0);
+    for item in brush.iter().filter(|i| i.leaf == Leaf::Slider) {
+        assert_eq!(item_width(item), floor, "a Brush slider at 700 px");
+    }
+    // Between the two, the Brush's sliders are wider than the floor but
+    // not yet full, with its readouts exactly where they were at 700.
+    let (narrow, _) = options_items(&mut bar, Tool::Brush, 700.0);
+    let (mid, _) = options_items(&mut bar, Tool::Brush, 1100.0);
+    let sliders: Vec<i64> = mid
+        .iter()
+        .filter(|i| i.leaf == Leaf::Slider)
+        .map(item_width)
+        .collect();
+    assert_eq!(sliders.len(), 3, "radius, opacity, flow");
+    assert!(
+        sliders.iter().all(|w| *w > floor && *w < full),
+        "{sliders:?}"
+    );
+    for (n, m) in narrow.iter().zip(&mid) {
+        if n.leaf == Leaf::Readout {
+            assert_eq!(item_width(n), item_width(m), "a readout kept its width");
+        }
+    }
+}
+
+#[test]
+fn the_options_bar_clips_what_does_not_fit_instead_of_wrapping_or_changing_height() {
+    let mut bar = Bar::new();
+    let (_, _) = options_items(&mut bar, Tool::Move, 1100.0);
+    let reference = bar
+        .workspace
+        .tree
+        .bounds(bar.workspace.options_bar)
+        .map_or(0, |b| b.height);
+    for width in OPTION_WINDOWS {
+        for tool in Tool::ALL {
+            let (_, _) = options_items(&mut bar, tool, width);
+            let height = bar
+                .workspace
+                .tree
+                .bounds(bar.workspace.options_bar)
+                .map_or(0, |b| b.height);
+            assert_eq!(height, reference, "{tool:?} at {width}");
+        }
+    }
+    let clips = bar
+        .workspace
+        .tree
+        .style(bar.workspace.options_bar)
+        .is_some_and(|s| s.overflow.x != taffy::Overflow::Visible);
+    assert!(clips, "the bar clips its end");
 }

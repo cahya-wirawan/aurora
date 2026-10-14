@@ -967,6 +967,13 @@ fn options_bar_style(scales: &Scales) -> Style {
             width: Dimension::ZERO,
             height: taffy::style_helpers::length(row + 2.0 * xs),
         },
+        // Too narrow for the tool's controls (0.228.3): they keep their
+        // sizes and the bar clips the end, rather than squeezing a
+        // readout or checkbox to nothing or overlapping a neighbour.
+        overflow: taffy::Point {
+            x: taffy::Overflow::Hidden,
+            y: taffy::Overflow::Visible,
+        },
         ..Default::default()
     }
 }

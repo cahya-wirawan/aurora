@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.228.3] - 2026-10-14
+
+### Fixed
+
+- Stop the options bar squeezing its readouts in a narrow window
+
 ## [0.228.2] - 2026-10-14
 
 ### Fixed
