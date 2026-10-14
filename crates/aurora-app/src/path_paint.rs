@@ -91,19 +91,47 @@ pub(crate) struct PathDabs {
     pub(crate) truncated: bool,
 }
 
+/// The arc length of a polyline, with the closing segment when `closed`.
+fn polyline_length(points: &[(f32, f32)], closed: bool) -> f64 {
+    let mut total = 0.0_f64;
+    for pair in points.windows(2) {
+        if let [a, b] = pair {
+            total += f64::from(b.0 - a.0).hypot(f64::from(b.1 - a.1));
+        }
+    }
+    if closed && let (Some(first), Some(last)) = (points.first(), points.last()) {
+        total += f64::from(first.0 - last.0).hypot(f64::from(first.1 - last.1));
+    }
+    total
+}
+
 /// The dab centres of `subpaths`, `step` apart along the arc length
 /// ([`aurora_brush::advance_segment`], the live Brush's own engine): each
 /// subpath restarts with a dab on its first point and a fresh carry; the
 /// spacing carries across the segments of one subpath; a closed subpath's
 /// closing segment is walked and a last dab that would land within a
 /// quarter step of its first is dropped; a subpath of one point, or of
-/// coincident points, is one dab. At most `cap` dabs are returned
-/// (`truncated` says more were due). A non-positive or non-finite `step`
+/// coincident points, is one dab. A path whose length over `step` (plus a
+/// dab per subpath) exceeds `cap` is refused BEFORE it is walked: no dabs
+/// and `truncated` set (it never allocates a dab list it cannot use). A non-positive or non-finite `step`
 /// gives none.
 #[must_use]
 pub(crate) fn path_dabs(subpaths: &[FlatSubpath], step: f32, cap: usize) -> PathDabs {
     let mut out = PathDabs::default();
     if !(step.is_finite() && step > 0.0) {
+        return out;
+    }
+    // Refuse before walking anything: the arc length (closing segments
+    // included) over the step, plus a dab per subpath, is the dab count.
+    let mut length = 0.0_f64;
+    for (points, closed) in subpaths {
+        length += polyline_length(points, *closed);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let wanted = length / f64::from(step) + subpaths.len() as f64;
+    #[allow(clippy::cast_precision_loss)]
+    if !wanted.is_finite() || wanted > cap as f64 {
+        out.truncated = true;
         return out;
     }
     'subpaths: for (points, closed) in subpaths {
@@ -267,6 +295,8 @@ pub(crate) fn stroke_path(
     let amount = settings.paint_amount(DabTool::Brush);
     let mut snapshot = StrokeSnapshot::new(surface);
     let mut painted: Vec<aurora_tile::TileId> = Vec::new();
+    let mut painted_seen: std::collections::HashSet<aurora_tile::TileId> =
+        std::collections::HashSet::new();
     let mut warned: std::collections::HashSet<aurora_tile::TileId> =
         std::collections::HashSet::new();
     for dab in planned.dabs {
@@ -283,7 +313,7 @@ pub(crate) fn stroke_path(
             amount,
         );
         for tile in outcome.painted() {
-            if !painted.contains(tile) {
+            if painted_seen.insert(*tile) {
                 painted.push(*tile);
             }
         }

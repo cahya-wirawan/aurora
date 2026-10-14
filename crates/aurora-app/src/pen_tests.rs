@@ -665,3 +665,42 @@ fn a_closed_last_subpath_is_never_continued() {
     click(&mut pen, &mut paths, (500.0, 500.0));
     assert_eq!(work(&paths).len(), 2);
 }
+
+#[test]
+fn a_segment_insertion_at_the_subpath_cap_is_refused_and_one_below_is_not() {
+    let mut paths = PathSet::new();
+    assert!(paths.ensure_work().is_ok());
+    let line = |n: usize| Subpath {
+        anchors: (0..n).map(|i| Anchor::corner(i as f32, 0.0)).collect(),
+        closed: false,
+    };
+    assert!(
+        paths
+            .set_subpaths(WORK_PATH_NAME, vec![line(MAX_ANCHORS_PER_SUBPATH)])
+            .is_ok()
+    );
+    let mut pen = PenState::default();
+    pen.set_active(Some(WORK_PATH_NAME.to_owned()));
+    let hit = SegmentHit {
+        subpath: 0,
+        segment: 3,
+        t: 0.5,
+        distance: 0.0,
+    };
+    let before = paths.clone();
+    let out = pen.press_at(&mut paths, (3.5, 0.0), None, Some(hit), R, false);
+    assert_eq!(out.refused, Some(super::SUBPATH_FULL_NOTICE));
+    assert!(out.step.is_none());
+    assert_eq!(paths, before, "nothing changed");
+    assert!(paths.validate().is_ok());
+    // One below the cap takes the new anchor and stays valid.
+    assert!(
+        paths
+            .set_subpaths(WORK_PATH_NAME, vec![line(MAX_ANCHORS_PER_SUBPATH - 1)])
+            .is_ok()
+    );
+    let out = pen.press_at(&mut paths, (3.5, 0.0), None, Some(hit), R, false);
+    assert!(out.refused.is_none() && out.step.is_some());
+    assert_eq!(work(&paths)[0].anchors.len(), MAX_ANCHORS_PER_SUBPATH);
+    assert!(paths.validate().is_ok());
+}

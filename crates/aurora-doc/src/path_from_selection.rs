@@ -30,7 +30,7 @@ pub const SIMPLIFY_TOLERANCE: f64 = 1.0;
 /// How many tolerances are tried (1, 2, 4, 8).
 pub const SIMPLIFY_TRIES: u32 = 4;
 /// The most pixel-edges a mask boundary may have before the trace gives up.
-pub const MAX_TRACE_EDGES: usize = 4_000_000;
+pub const MAX_TRACE_EDGES: usize = 1_000_000;
 
 /// Why a selection could not become a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +80,9 @@ fn ellipse_subpath(r: &Rect) -> Subpath {
 
 type P64 = (i64, i64);
 
+/// The side of the blocks the trace visits (the mask's own summary block).
+const TRACE_BLOCK: usize = 16;
+
 /// 0 right, 1 down, 2 left, 3 up (screen coordinates, y down).
 const DELTA: [P64; 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
 
@@ -98,19 +101,50 @@ fn trace_loops(mask: &SelectionMask) -> Option<Vec<Vec<P64>>> {
         }
         count <= MAX_TRACE_EDGES
     };
-    for y in b.y..b.bottom() {
-        for x in b.x..b.right() {
-            if !inside(x, y) {
+    // Blocks the mask says are wholly outside have no edge and are skipped;
+    // wholly inside ones only have edges on their rim.
+    let side = i64::try_from(TRACE_BLOCK).unwrap_or(16);
+    let mut by = b.y;
+    while by < b.bottom() {
+        let bh = (b.bottom() - by).min(side);
+        let mut bx = b.x;
+        while bx < b.right() {
+            let bw = (b.right() - bx).min(side);
+            bx += side;
+            let block = Rect {
+                x: bx - side,
+                y: by,
+                width: u32::try_from(bw).unwrap_or(0),
+                height: u32::try_from(bh).unwrap_or(0),
+            };
+            if mask.fully_excludes(&block) {
                 continue;
             }
-            let ok = (inside(x, y - 1) || add((x, y), 0))
-                && (inside(x + 1, y) || add((x + 1, y), 1))
-                && (inside(x, y + 1) || add((x + 1, y + 1), 2))
-                && (inside(x - 1, y) || add((x, y + 1), 3));
-            if !ok {
-                return None;
+            let solid = mask.fully_covers(&block);
+            for y in block.y..block.bottom() {
+                for x in block.x..block.right() {
+                    if solid
+                        && x != block.x
+                        && y != block.y
+                        && x != block.right() - 1
+                        && y != block.bottom() - 1
+                    {
+                        continue;
+                    }
+                    if !inside(x, y) {
+                        continue;
+                    }
+                    let ok = (inside(x, y - 1) || add((x, y), 0))
+                        && (inside(x + 1, y) || add((x + 1, y), 1))
+                        && (inside(x, y + 1) || add((x + 1, y + 1), 2))
+                        && (inside(x - 1, y) || add((x, y + 1), 3));
+                    if !ok {
+                        return None;
+                    }
+                }
             }
         }
+        by += side;
     }
     let mut starts: Vec<P64> = edges.keys().copied().collect();
     starts.sort_unstable();

@@ -269,3 +269,47 @@ fn a_single_pixel_selection_is_kept() {
     assert_eq!(path.subpaths.len(), 1);
     assert_eq!(path.subpaths[0].anchors.len(), 4);
 }
+
+#[test]
+fn the_block_skipping_trace_finds_exactly_the_naive_boundary() {
+    // A noisy blob over several 16-texel blocks, with solid and empty ones.
+    let sel = mask_selection(rect(5, 7, 90, 70), |x, y| {
+        let d = ((x - 50) as f64).hypot((y - 40) as f64);
+        let noise = (x * 31 + y * 17) % 7 == 0;
+        if (d < 30.0 && !(d > 12.0 && d < 14.0)) || (d < 36.0 && noise) {
+            1.0
+        } else {
+            0.0
+        }
+    });
+    let mask = match &sel.shape {
+        SelectionShape::Mask(m) => Arc::clone(m),
+        _ => unreachable!("mask"),
+    };
+    let inside = |x: i64, y: i64| mask.byte_at(x, y) >= 128;
+    let mut naive = 0_i64;
+    for y in 4..80 {
+        for x in 2..100 {
+            naive += i64::from(inside(x, y) != inside(x + 1, y));
+            naive += i64::from(inside(x, y) != inside(x, y + 1));
+        }
+    }
+    let loops = trace_loops(&mask).unwrap_or_else(|| unreachable!());
+    let mut traced = 0_i64;
+    for l in &loops {
+        for (i, p) in l.iter().enumerate() {
+            let q = l[(i + 1) % l.len()];
+            traced += (p.0 - q.0).abs() + (p.1 - q.1).abs();
+        }
+    }
+    assert_eq!(traced, naive);
+    // A big solid mask is just its rim.
+    let solid = mask_selection(rect(0, 0, 100, 80), |_, _| 1.0);
+    let SelectionShape::Mask(m) = &solid.shape else {
+        unreachable!("mask")
+    };
+    assert_eq!(
+        trace_loops(m),
+        Some(vec![vec![(0, 0), (100, 0), (100, 80), (0, 80)]])
+    );
+}

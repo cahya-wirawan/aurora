@@ -226,3 +226,16 @@ fn reversed_swaps_handles_and_order() {
     assert_eq!(back.anchors[1].handle_in, (5.0, 1.0));
     assert_eq!(reversed(&back), sub);
 }
+
+#[test]
+fn insert_anchor_refuses_a_full_subpath() {
+    let mut subs = vec![open(&vec![(0.0, 0.0); crate::MAX_ANCHORS_PER_SUBPATH])];
+    let hit = SegmentHit {
+        subpath: 0,
+        segment: 0,
+        t: 0.5,
+        distance: 0.0,
+    };
+    assert_eq!(insert_anchor(&mut subs, &hit), None);
+    assert_eq!(subs[0].anchors.len(), crate::MAX_ANCHORS_PER_SUBPATH);
+}

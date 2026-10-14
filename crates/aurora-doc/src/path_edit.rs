@@ -126,11 +126,15 @@ pub fn nearest_segment(subpaths: &[Subpath], point: Pt, radius: f32) -> Option<S
 }
 
 /// Inserts an anchor at `hit` (splitting the segment exactly). Returns the
-/// new anchor's index, or `None` when `hit` does not name a segment.
+/// new anchor's index, or `None` when `hit` does not name a segment or the
+/// subpath already holds [`crate::MAX_ANCHORS_PER_SUBPATH`] anchors.
 pub fn insert_anchor(subpaths: &mut [Subpath], hit: &SegmentHit) -> Option<usize> {
     let sub = subpaths.get_mut(hit.subpath)?;
     let n = sub.anchors.len();
-    if n < 2 || hit.segment >= n || (!sub.closed && hit.segment + 1 >= n) {
+    if !(2..crate::MAX_ANCHORS_PER_SUBPATH).contains(&n)
+        || hit.segment >= n
+        || (!sub.closed && hit.segment + 1 >= n)
+    {
         return None;
     }
     let next = (hit.segment + 1) % n;

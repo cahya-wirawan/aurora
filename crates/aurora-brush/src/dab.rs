@@ -69,6 +69,11 @@ pub fn dab_step(radius: f32, spacing: f32) -> f32 {
 /// radius mid-stroke); `carry` is a distance, so it stays meaningful. A
 /// `carry` already at or past the new `step` puts a dab at the start of the
 /// segment (0.226.1).
+/// The most dabs one call of [`advance_segment`] places, so a segment of
+/// tens of millions of pixels cannot allocate without end or stall once
+/// `f32` stops advancing (a live pointer event is nowhere near it).
+pub const MAX_DABS_PER_SEGMENT: usize = 1_000_000;
+
 #[must_use]
 pub fn advance_segment(
     prev: (f32, f32),
@@ -85,11 +90,15 @@ pub fn advance_segment(
     let mut dabs = Vec::new();
     let mut travelled = 0.0_f32;
     let mut carry = carry;
-    while carry + (segment_len - travelled) >= step {
+    while carry + (segment_len - travelled) >= step && dabs.len() < MAX_DABS_PER_SEGMENT {
         // `carry` is below `step` unless the step shrank since the last
         // event (a smaller radius mid-stroke): then a dab is already due
         // and lands at the segment's start, never behind it.
         let needed = (step - carry).max(0.0);
+        if needed > 0.0 && travelled + needed <= travelled {
+            // `f32` can no longer advance this far out: stop, never spin.
+            break;
+        }
         travelled += needed;
         dabs.push((prev.0 + ux * travelled, prev.1 + uy * travelled));
         carry = 0.0;
@@ -281,5 +290,17 @@ mod tests {
         let (dabs, carry) = advance_segment((5.0, 5.0), (5.0, 5.0), 1.5, 2.5);
         assert_eq!(dabs, Vec::new());
         assert_eq!(carry, 1.5);
+    }
+
+    #[test]
+    fn a_gigantic_segment_places_a_bounded_number_of_dabs_and_returns() {
+        use super::MAX_DABS_PER_SEGMENT;
+        let (dabs, _) = advance_segment((0.0, 0.0), (1.0e9, 0.0), 0.0, 1.0);
+        assert_eq!(dabs.len(), MAX_DABS_PER_SEGMENT);
+        // An ordinary segment is untouched by the bound.
+        assert_eq!(
+            advance_segment((0.0, 0.0), (100.0, 0.0), 0.0, 10.0).0.len(),
+            10
+        );
     }
 }

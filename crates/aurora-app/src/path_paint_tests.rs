@@ -112,7 +112,7 @@ fn degenerate_subpaths_and_steps() {
 fn the_cap_truncates_and_says_so() {
     let long = [line(&[(0.0, 0.0), (100.0, 0.0)], false)];
     let cut = path_dabs(&long, 1.0, 10);
-    assert_eq!(cut.dabs.len(), 10);
+    assert!(cut.dabs.len() <= 10);
     assert!(cut.truncated);
     let exact = path_dabs(&long, 10.0, 11);
     assert_eq!(exact.dabs.len(), 11);
@@ -123,7 +123,7 @@ fn the_cap_truncates_and_says_so() {
         1,
     );
     assert!(
-        many.truncated && many.dabs.len() == 1,
+        many.truncated && many.dabs.len() <= 1,
         "a second subpath past the cap"
     );
 }
@@ -257,5 +257,32 @@ fn make_work_path_keeps_every_subpath_of_a_selection_with_a_hole() {
         work.subpaths
             .iter()
             .all(|s| s.closed && s.anchors.len() >= 4)
+    );
+}
+
+#[test]
+fn a_huge_path_is_refused_before_it_is_walked() {
+    // 2e7 px at the smallest step: 4e7 dabs against a cap of 200,000.
+    let huge = [line(&[(-1.0e7, 0.0), (1.0e7, 0.0)], false)];
+    let out = path_dabs(&huge, 0.5, MAX_STROKE_DABS);
+    assert!(out.truncated && out.dabs.is_empty());
+    // The closing segment counts toward the length.
+    let closed = [line(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)], true)];
+    let refused = path_dabs(&closed, 1.0, 30);
+    assert!(
+        refused.truncated && refused.dabs.is_empty(),
+        "perimeter 34 plus a dab > 30"
+    );
+    assert!(!path_dabs(&closed, 1.0, 40).truncated);
+    // A normal path is unchanged.
+    let normal = path_dabs(&[line(&[(0.0, 0.0), (100.0, 0.0)], false)], 10.0, 1000);
+    assert_eq!(normal.dabs.len(), 11);
+    assert!(
+        path_dabs(
+            &[line(&[(0.0, 0.0), (f32::INFINITY, 0.0)], false)],
+            1.0,
+            100
+        )
+        .truncated
     );
 }

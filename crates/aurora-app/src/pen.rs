@@ -113,6 +113,9 @@ pub(crate) struct PenState {
 
 /// The notice for a path set that reached the point limit.
 pub(crate) const POINT_LIMIT_NOTICE: &str = "That path set has reached its point limit.";
+/// The notice for a subpath at its anchor limit.
+pub(crate) const SUBPATH_FULL_NOTICE: &str =
+    "This subpath already has the most points it can hold.";
 /// The notice for a coordinate out of range.
 pub(crate) const RANGE_NOTICE: &str = "That point is too far outside the document.";
 
@@ -367,11 +370,24 @@ impl PenState {
         if let (Some(hit), None, None, Some(name)) =
             (segment, hit, self.drawing, self.active.clone())
         {
+            let full = sub_mut(paths, &name)
+                .and_then(|subs| subs.get(hit.subpath))
+                .is_some_and(|s| s.anchors.len() >= MAX_ANCHORS_PER_SUBPATH);
+            if full {
+                out.refused = Some(SUBPATH_FULL_NOTICE);
+                return out;
+            }
             self.begin(paths, INSERT_POINT_LABEL);
-            let inserted = sub_mut(paths, &name)
-                .and_then(|subs| aurora_doc::insert_anchor(subs, &hit).map(|at| (subs, at)))
-                .map(|(_, at)| at);
+            let inserted =
+                sub_mut(paths, &name).and_then(|subs| aurora_doc::insert_anchor(subs, &hit));
             if let Some(at) = inserted {
+                if let Err(error) = paths.validate() {
+                    if let Some((before, _)) = self.before.take() {
+                        *paths = before;
+                    }
+                    out.refused = Some(release_notice(&error));
+                    return out;
+                }
                 self.selected = Some(AnchorRef {
                     subpath: hit.subpath,
                     anchor: at,
@@ -419,7 +435,7 @@ impl PenState {
         };
         if open.anchors.len() >= MAX_ANCHORS_PER_SUBPATH {
             self.before = None;
-            out.refused = Some("This subpath already has the most points it can hold.");
+            out.refused = Some(SUBPATH_FULL_NOTICE);
             return out;
         }
         open.anchors.push(Anchor::corner(point.0, point.1));

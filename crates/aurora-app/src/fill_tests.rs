@@ -2081,6 +2081,10 @@ mod path_paint_flows {
             &segment((50.0, 100.0), (250.0, 100.0)),
             None,
         ));
+        let mut unique = filled.painted.clone();
+        unique.sort_by_key(|t| (t.x, t.y));
+        unique.dedup();
+        assert_eq!(unique.len(), filled.painted.len(), "each tile once");
         assert!(doc.commit(filled, STROKE_PATH_LABEL));
         assert!(doc.at(150, 100)[3] > 0.95);
         assert!(doc.at(150, 100)[1] > 0.95);
@@ -2216,6 +2220,12 @@ mod path_paint_flows {
             Err(FillRefused::Notice(LockRefusal::Path(m))) if m == path_paint::TOO_MANY_DABS_NOTICE
         ));
         assert_eq!(doc.undo_order.undo.len(), before);
+        // A 2e7 px segment with the smallest brush is refused, not walked.
+        let enormous = segment((-1.0e7, 0.0), (1.0e7, 0.0));
+        assert!(matches!(
+            stroke(&mut doc, &enormous, None),
+            Err(FillRefused::Notice(LockRefusal::Path(m))) if m == path_paint::TOO_MANY_DABS_NOTICE
+        ));
         // A group or no pixel layer is the usual notice.
         assert!(matches!(
             path_paint::stroke_path(
