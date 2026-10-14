@@ -36,6 +36,9 @@ mod layer;
 // are re-exported at the crate root too, the same way every other
 // module's are.
 pub mod mask;
+mod path;
+#[cfg(test)]
+mod path_tests;
 mod quick_mask;
 #[cfg(test)]
 mod quick_mask_tests;
@@ -64,6 +67,11 @@ pub use layer::{
 pub use mask::{
     MASK_SURFACE_BIT, encode_mask_coverage_region, forget_mask_coverage, read_mask_coverage,
     write_mask_coverage, write_mask_coverage_region,
+};
+pub use path::{
+    Anchor, FLATTEN_TOLERANCE, MAX_ANCHORS_PER_SUBPATH, MAX_PATH_ANCHORS_TOTAL,
+    MAX_PATH_COORDINATE, MAX_PATHS, MAX_SEGMENTS_PER_CURVE, MAX_SUBPATHS, PATH_NAME_MAX_CHARS,
+    Path, PathSet, Subpath, WORK_PATH_NAME, selection_from_path, validate_path_name,
 };
 pub use quick_mask::{QuickMask, QuickMaskOutcome};
 pub use selection::{

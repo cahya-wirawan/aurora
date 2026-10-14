@@ -421,6 +421,11 @@ impl Selection {
 pub struct SelectionSet {
     active: Option<Selection>,
     saved: HashMap<String, Selection>,
+    /// The document's paths (0.233.0). They ride in the selection state so
+    /// every route the selections already take (save, autosave, recovery,
+    /// the document shelf, the Crop's shift) carries them too; they are not
+    /// selections and [`Self::is_empty`] does not count them.
+    paths: crate::PathSet,
 }
 
 impl SelectionSet {
@@ -429,7 +434,19 @@ impl SelectionSet {
         Self {
             active: None,
             saved: HashMap::new(),
+            paths: crate::PathSet::new(),
         }
+    }
+
+    /// The document's paths (0.233.0).
+    #[must_use]
+    pub fn paths(&self) -> &crate::PathSet {
+        &self.paths
+    }
+
+    /// Replaces the document's paths.
+    pub fn set_paths(&mut self, paths: crate::PathSet) {
+        self.paths = paths;
     }
 
     /// The current active selection, or `None` if nothing is selected
@@ -555,8 +572,14 @@ impl SelectionSet {
         for (name, selection) in &self.saved {
             saved.insert(name.clone(), selection.translated(dx, dy)?);
         }
+        // Paths follow, all or nothing with the rest (0.233.0).
+        let mut paths = self.paths.clone();
+        paths
+            .translate(dx, dy)
+            .map_err(|_| DocError::SelectionMaskInvalid)?;
         self.active = active;
         self.saved = saved;
+        self.paths = paths;
         Ok(())
     }
 

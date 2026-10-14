@@ -127,6 +127,10 @@ pub enum DocError {
     /// selection invariant never stores (0.218.1).
     #[error("a saved selection with no area selects nothing")]
     EmptySavedSelection,
+    /// A path (or a path name) broke one of the bounds of [`crate::PathSet`]
+    /// (0.233.0).
+    #[error("invalid path: {0}")]
+    InvalidPath(&'static str),
     /// A saved selection's name failed [`crate::validate_selection_name`],
     /// or [`crate::SelectionSet::from_parts`] was given a repeated one
     /// (0.218.0).
