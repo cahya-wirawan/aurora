@@ -593,11 +593,11 @@ mod selection_store;
 mod selection_view;
 mod small_machine;
 mod smudge_stamp;
+#[cfg(test)]
+mod smudge_stamp_tests;
 mod spot_heal_stamp;
 #[cfg(test)]
 mod spot_heal_stamp_tests;
-#[cfg(test)]
-mod smudge_stamp_tests;
 mod tone_stamp;
 #[cfg(test)]
 mod tone_stamp_tests;
