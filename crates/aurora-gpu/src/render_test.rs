@@ -2030,3 +2030,109 @@ fn canvas_pipeline_clip_edge_is_exact_for_a_grid_anchored_left_of_the_document()
     };
     assert_eq!(got, vec![GREEN, GREEN, CLEAR, CLEAR]);
 }
+
+// ---------------------------------------------------------------------------
+// 0.232.0: the Channels panel's per-channel display gain.
+// ---------------------------------------------------------------------------
+
+/// Renders [`VIEWPORT`] with tile (0,0) painted `rgba`, `gain` set on the
+/// residency (or left at its default for `None`), and reads `samples` back.
+fn render_gained(
+    rgba: [f32; 4],
+    gain: Option<[f32; 3]>,
+    samples: &[(u32, u32)],
+) -> Option<Vec<[u8; 4]>> {
+    let context = real_context()?;
+    let device = context.device();
+    let queue = context.queue();
+    let (_dir, mut store) = tile_store();
+    let surface = SurfaceId::from_raw(0);
+    paint(&mut store, surface, TileId { x: 0, y: 0 }, rgba);
+    let mut residency = TileResidency::new(device, queue, VIEWPORT);
+    if let Some(gain) = gain {
+        residency.set_channel_gain(gain);
+    }
+    residency.set_origin(queue, (0.0, 0.0), VIEWPORT, 1.0);
+    let stats = residency.sync(queue, &mut store, surface, false, usize::MAX);
+    assert_eq!(stats.errors, 0);
+    let mut canvas = CanvasPipeline::new(device);
+    Some(render_and_sample_pixels(
+        device,
+        queue,
+        &mut canvas,
+        &residency,
+        VIEWPORT,
+        samples,
+    ))
+}
+
+#[test]
+fn canvas_pipeline_zeroes_a_hidden_channel_in_the_displayed_picture_only() {
+    let samples = [(10, 10), (128, 128), (250, 250)];
+    let solid = [0.5, 0.75, 0.25, 1.0];
+    let Some(plain) = render_gained(solid, None, &samples) else {
+        return;
+    };
+    let Some(only_red) = render_gained(solid, Some([1.0, 0.0, 0.0]), &samples) else {
+        return;
+    };
+    let Some(no_green) = render_gained(solid, Some([1.0, 0.0, 1.0]), &samples) else {
+        return;
+    };
+    let Some(none) = render_gained(solid, Some([0.0, 0.0, 0.0]), &samples) else {
+        return;
+    };
+    for ((((p, red), ng), n), at) in plain
+        .iter()
+        .zip(&only_red)
+        .zip(&no_green)
+        .zip(&none)
+        .zip(samples)
+    {
+        assert!(
+            p[0] > 0 && p[1] > 0 && p[2] > 0,
+            "{at:?}: a real colour {p:?}"
+        );
+        assert_eq!(*red, [p[0], 0, 0, 255], "{at:?}: only red survives");
+        assert_eq!(*ng, [p[0], 0, p[2], 255], "{at:?}: green zeroed");
+        assert_eq!(*n, [0, 0, 0, 255], "{at:?}: nothing survives");
+    }
+}
+
+#[test]
+fn canvas_pipeline_with_every_channel_shown_is_bit_identical_to_no_gain() {
+    // Translucent content so the checkerboard and the over arithmetic are
+    // both in the picture; sampled at both checkerboard shades.
+    let samples = [(3, 3), (11, 3), (100, 100), (200, 40), (250, 250)];
+    let content = [0.3, 0.6, 0.9, 0.5];
+    let Some(plain) = render_gained(content, None, &samples) else {
+        return;
+    };
+    let Some(shown) = render_gained(content, Some([1.0, 1.0, 1.0]), &samples) else {
+        return;
+    };
+    assert_eq!(plain, shown);
+}
+
+#[test]
+fn canvas_pipeline_zeroes_the_checkerboard_of_a_hidden_channel_too() {
+    // A transparent texel shows the checkerboard; hiding blue zeroes it.
+    let samples = [(3, 3), (11, 3)];
+    let Some(plain) = render_gained([0.0, 0.0, 0.0, 0.0], None, &samples) else {
+        return;
+    };
+    let Some(no_blue) = render_gained([0.0, 0.0, 0.0, 0.0], Some([1.0, 1.0, 0.0]), &samples) else {
+        return;
+    };
+    for (p, n) in plain.iter().zip(&no_blue) {
+        assert!(p[2] > 0);
+        assert_eq!(*n, [p[0], p[1], 0, 255]);
+    }
+}
+
+#[test]
+fn the_canvas_shader_multiplies_by_the_channel_gain_last() {
+    let source = include_str!("shaders/canvas.wgsl");
+    assert!(source.contains("channel_gain: vec4<f32>"));
+    assert!(source.contains("* canvas.channel_gain.rgb"));
+}

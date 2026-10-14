@@ -378,7 +378,7 @@ fn tree_container_style() -> Style {
 
 /// Width of the fixed eye column on the left of every row
 /// (`spacing.xl`).
-fn eye_column(scales: &Scales) -> f32 {
+pub(crate) fn eye_column(scales: &Scales) -> f32 {
     #[allow(clippy::cast_precision_loss)]
     let width = scales.spacing.xl as f32;
     width
@@ -412,7 +412,7 @@ pub fn layer_row_height(scales: &Scales) -> u32 {
 }
 
 /// The icon side (`spacing.md`).
-fn icon_side(scales: &Scales) -> f32 {
+pub(crate) fn icon_side(scales: &Scales) -> f32 {
     aurora_widgets::widgets::icon_side(scales, IconSize::Small)
 }
 
@@ -428,7 +428,7 @@ fn label_inset(scales: &Scales, depth: usize) -> u32 {
 /// Absolutely positions `icon` inside its row at `(x, y)` (logical px from
 /// the row's top-left; the row's own `padding.top` band is where its line
 /// is, and an absolute child is placed against the row's padding box).
-fn place_icon(
+pub(crate) fn place_icon(
     tree: &mut WidgetTree<WidgetKind>,
     icon: WidgetId,
     x: f32,
@@ -715,7 +715,7 @@ fn insert_layer_row(
     Ok(row)
 }
 
-const fn eye_kind(visible: bool) -> IconKind {
+pub(crate) const fn eye_kind(visible: bool) -> IconKind {
     if visible {
         IconKind::Eye
     } else {
@@ -723,7 +723,7 @@ const fn eye_kind(visible: bool) -> IconKind {
     }
 }
 
-fn eye_access(name: &str, visible: bool) -> IconAccess {
+pub(crate) fn eye_access(name: &str, visible: bool) -> IconAccess {
     IconAccess::Button {
         label: format!("{} {name}", if visible { "Hide" } else { "Show" }),
         toggled: Some(visible),

@@ -36,6 +36,7 @@
 //! in particular).
 
 pub mod canvas_view;
+pub mod channels_panel;
 pub mod colour_controls;
 pub mod crop_overlay;
 pub mod curves_controls;
@@ -67,6 +68,14 @@ pub mod tools_panel;
 pub mod workspace;
 
 pub use canvas_view::CanvasView;
+pub use channels_panel::{
+    CHANNELS_TOOLBAR_ICON_SIZE, CHANNELS_TOOLBAR_LABEL, ChannelRow, ChannelRowPart,
+    ChannelVisibility, ChannelsAction, ChannelsPanel, ChannelsToolbar, CompositeChannel,
+    DELETE_UNAVAILABLE as CHANNELS_DELETE_UNAVAILABLE, NO_SAVED_SELECTIONS_TEXT,
+    channels_toolbar_height, eye_is_on, insert_channels_toolbar, is_channels_toolbar_button,
+    new_channels_panel, populate_channels_panel, select_channel_row, set_channels_toolbar_hover,
+    sync_channel_eyes, sync_channels_panel, sync_channels_toolbar,
+};
 pub use curves_controls::{
     CurvesChannel, CurvesControls, channel_curve, curves_controls_contains, curves_controls_shown,
     curves_params, curves_selected_channel, insert_curves_controls, select_curves_channel,

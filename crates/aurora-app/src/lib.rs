@@ -542,6 +542,7 @@ mod autosave_files;
 mod background_autosave;
 mod background_composite;
 mod background_open;
+mod channels_app;
 mod clone_stamp;
 #[cfg(test)]
 mod clone_stamp_tests;
@@ -3674,6 +3675,9 @@ fn apply_saved_collapse(workspace: &mut aurora_ui::Workspace, layout: &Workspace
         aurora_ui::DockPanel::Layers => layout.layers_collapsed,
         aurora_ui::DockPanel::Properties => layout.properties_collapsed,
         aurora_ui::DockPanel::History => layout.history_collapsed,
+        // 0.232.0: the Channels panel's collapse is not saved (the layout
+        // wire format has no field for it; adding one is a new version).
+        aurora_ui::DockPanel::Channels => false,
     };
     // Floating slots too (0.167.0): a floating panel's collapse is saved
     // and restored like a docked one's.
@@ -4713,6 +4717,10 @@ enum AccessibilityReaction {
     /// A `Click` on a Layer actions toolbar button (0.196.0): the app
     /// runs that action ([`AccessibilityEffects::layer_action`]).
     LayerAction(aurora_ui::LayerAction),
+    /// A `Click` on a Channels row or eye, or on a Channel actions toolbar
+    /// button (0.232.0): the app applies it
+    /// ([`AccessibilityEffects::channels`]).
+    Channels(ChannelsRequest),
     /// An action on a Tools-panel colour control or its picker popover
     /// (0.208.0): the app applies it to the colours
     /// ([`AccessibilityEffects::colour`]).
@@ -4826,6 +4834,11 @@ fn route_accessibility_action(
                 AccessibilityReaction::SelectTool(tool)
             } else if let Some(action) = workspace.layer_toolbar.action_for(id) {
                 AccessibilityReaction::LayerAction(action)
+            } else if let Some((row, part)) = workspace.channels_state.row_part(&workspace.tree, id)
+            {
+                AccessibilityReaction::Channels(ChannelsRequest::Row { row, part })
+            } else if let Some(action) = workspace.channels_state.toolbar.action_for(id) {
+                AccessibilityReaction::Channels(ChannelsRequest::Action(action))
             } else if aurora_ui::is_colour_control(&workspace.tree, id) {
                 AccessibilityReaction::ColourControl(aurora_widgets::ActionOutcome::Activated(id))
             } else if aurora_ui::is_menu_bar_part(&workspace.tree, id) {
@@ -5033,6 +5046,21 @@ struct AccessibilityEffects {
     /// A menu bar action an assistive technology took (0.225.0); the App
     /// applies it (`App::apply_menu_bar_outcome`).
     menu_bar: Option<MenuBarEdit>,
+    /// A Channels panel row or toolbar button an assistive technology
+    /// clicked (0.232.0); the App applies it (`App::apply_channels_request`).
+    channels: Option<ChannelsRequest>,
+}
+
+/// A Channels panel activation reduced to comparable data (0.232.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelsRequest {
+    /// A `Click` on a row (`part` Row) or its eye (Eye).
+    Row {
+        row: WidgetId,
+        part: aurora_ui::ChannelRowPart,
+    },
+    /// A `Click` on a toolbar button.
+    Action(aurora_ui::ChannelsAction),
 }
 
 /// A menu bar action, reduced to comparable data.
@@ -5358,6 +5386,14 @@ fn apply_accessibility_action(
         AccessibilityReaction::ToolControl(outcome) => {
             apply_tool_control_accessibility(cx, outcome);
         }
+        AccessibilityReaction::Channels(request) => {
+            return AccessibilityEffects {
+                relayout: true,
+                redraw: true,
+                channels: Some(request),
+                ..AccessibilityEffects::default()
+            };
+        }
         AccessibilityReaction::LayerAction(action) => {
             return AccessibilityEffects {
                 relayout: true,
@@ -5366,6 +5402,7 @@ fn apply_accessibility_action(
                 dialog: None,
                 close_tab: None,
                 layer_action: Some(action),
+                channels: None,
                 colour: None,
                 menu_bar: None,
             };
@@ -5408,6 +5445,7 @@ fn apply_accessibility_action(
                 dialog: None,
                 close_tab: None,
                 layer_action: None,
+                channels: None,
                 colour: None,
                 menu_bar: None,
             };
@@ -5440,6 +5478,7 @@ fn apply_accessibility_action(
                 dialog: None,
                 close_tab: Some(index),
                 layer_action: None,
+                channels: None,
                 colour: None,
                 menu_bar: None,
             };
@@ -5480,6 +5519,7 @@ fn apply_accessibility_action(
         dialog: dialog_result,
         close_tab: None,
         layer_action: None,
+        channels: None,
         colour: None,
         menu_bar: None,
     }
@@ -5891,6 +5931,10 @@ const COMMAND_TOGGLE_HISTORY: &str = "view.toggle_history";
 const COMMAND_CLOSE_LAYERS: &str = "view.close_layers";
 const COMMAND_CLOSE_PROPERTIES: &str = "view.close_properties";
 const COMMAND_CLOSE_HISTORY: &str = "view.close_history";
+/// The Channels panel's focus, toggle and close commands (0.232.0).
+const COMMAND_FOCUS_CHANNELS: &str = "view.focus_channels";
+const COMMAND_TOGGLE_CHANNELS: &str = "view.toggle_channels";
+const COMMAND_CLOSE_CHANNELS: &str = "view.close_channels";
 /// Collapses the whole right rail to its label strip, or expands it back
 /// (0.165.0, `aurora_ui::toggle_rail_collapsed`). One toggle id with one
 /// static label, like every other toggle here: neither the palette's
@@ -5905,8 +5949,8 @@ const COMMAND_TOGGLE_PANELS_LABEL: &str = "Collapse or Expand Panels";
 /// [`aurora_ui::PanelMove`]. One command per panel and move, the same
 /// per-panel shape as the focus/toggle/close commands, so a command
 /// never depends on where focus was before the palette took it.
-const PANEL_MOVE_COMMANDS: [(&str, aurora_ui::DockPanel, aurora_ui::PanelMove, &str); 9] = {
-    use aurora_ui::DockPanel::{History, Layers, Properties};
+const PANEL_MOVE_COMMANDS: [(&str, aurora_ui::DockPanel, aurora_ui::PanelMove, &str); 12] = {
+    use aurora_ui::DockPanel::{Channels, History, Layers, Properties};
     use aurora_ui::PanelMove::{Down, NextGroup, Up};
     [
         ("view.move_layers_up", Layers, Up, "Move Layers Panel Up"),
@@ -5953,6 +5997,24 @@ const PANEL_MOVE_COMMANDS: [(&str, aurora_ui::DockPanel, aurora_ui::PanelMove, &
             NextGroup,
             "Move History Panel to Next Group",
         ),
+        (
+            "view.move_channels_up",
+            Channels,
+            Up,
+            "Move Channels Panel Up",
+        ),
+        (
+            "view.move_channels_down",
+            Channels,
+            Down,
+            "Move Channels Panel Down",
+        ),
+        (
+            "view.move_channels_next_group",
+            Channels,
+            NextGroup,
+            "Move Channels Panel to Next Group",
+        ),
     ]
 };
 /// Restores the default panel arrangement (0.166.0) — since 0.167.0 that
@@ -5969,8 +6031,8 @@ const COMMAND_RESET_PANELS: &str = "window.reset_panels";
 /// expanding a collapsed rail, and lands focus on it
 /// (`aurora_ui::float_workspace_panel`/`dock_workspace_panel`). There is
 /// no keyboard way to *move* a floating panel yet (disclosed).
-const PANEL_FLOAT_COMMANDS: [(&str, aurora_ui::DockPanel, bool, &str); 6] = {
-    use aurora_ui::DockPanel::{History, Layers, Properties};
+const PANEL_FLOAT_COMMANDS: [(&str, aurora_ui::DockPanel, bool, &str); 8] = {
+    use aurora_ui::DockPanel::{Channels, History, Layers, Properties};
     [
         ("view.float_layers", Layers, true, "Float Layers Panel"),
         ("view.dock_layers", Layers, false, "Dock Layers Panel"),
@@ -5988,6 +6050,13 @@ const PANEL_FLOAT_COMMANDS: [(&str, aurora_ui::DockPanel, bool, &str); 6] = {
         ),
         ("view.float_history", History, true, "Float History Panel"),
         ("view.dock_history", History, false, "Dock History Panel"),
+        (
+            "view.float_channels",
+            Channels,
+            true,
+            "Float Channels Panel",
+        ),
+        ("view.dock_channels", Channels, false, "Dock Channels Panel"),
     ]
 };
 const COMMAND_FILE_OPEN: &str = "file.open";
@@ -6098,12 +6167,15 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
         CommandEntry::new(COMMAND_FOCUS_PROPERTIES, "Focus Properties Panel"),
         CommandEntry::new(COMMAND_FOCUS_HISTORY, "Focus History Panel"),
+        CommandEntry::new(COMMAND_FOCUS_CHANNELS, "Focus Channels Panel"),
         CommandEntry::new(COMMAND_TOGGLE_LAYERS, "Toggle Layers Panel"),
         CommandEntry::new(COMMAND_TOGGLE_PROPERTIES, "Toggle Properties Panel"),
         CommandEntry::new(COMMAND_TOGGLE_HISTORY, "Toggle History Panel"),
+        CommandEntry::new(COMMAND_TOGGLE_CHANNELS, "Toggle Channels Panel"),
         CommandEntry::new(COMMAND_CLOSE_LAYERS, "Close Layers Panel"),
         CommandEntry::new(COMMAND_CLOSE_PROPERTIES, "Close Properties Panel"),
         CommandEntry::new(COMMAND_CLOSE_HISTORY, "Close History Panel"),
+        CommandEntry::new(COMMAND_CLOSE_CHANNELS, "Close Channels Panel"),
         CommandEntry::new(COMMAND_TOGGLE_PANELS, COMMAND_TOGGLE_PANELS_LABEL),
         CommandEntry::new(COMMAND_RESET_PANELS, "Reset Panel Layout"),
         CommandEntry::new(document_tabs::COMMAND_FILE_NEW, "New Document"),
@@ -6184,6 +6256,7 @@ fn command_target(workspace: &aurora_ui::Workspace, id: &str) -> Option<WidgetId
         COMMAND_FOCUS_LAYERS => Some(workspace.layers.root),
         COMMAND_FOCUS_PROPERTIES => Some(workspace.properties.root),
         COMMAND_FOCUS_HISTORY => Some(workspace.history.root),
+        COMMAND_FOCUS_CHANNELS => Some(workspace.channels.root),
         _ => None,
     }
 }
@@ -6199,6 +6272,7 @@ fn command_collapse_target(
         COMMAND_TOGGLE_LAYERS => Some(workspace.layers),
         COMMAND_TOGGLE_PROPERTIES => Some(workspace.properties),
         COMMAND_TOGGLE_HISTORY => Some(workspace.history),
+        COMMAND_TOGGLE_CHANNELS => Some(workspace.channels),
         _ => None,
     }
 }
@@ -6214,6 +6288,7 @@ fn command_close_target(
         COMMAND_CLOSE_LAYERS => Some(workspace.layers),
         COMMAND_CLOSE_PROPERTIES => Some(workspace.properties),
         COMMAND_CLOSE_HISTORY => Some(workspace.history),
+        COMMAND_CLOSE_CHANNELS => Some(workspace.channels),
         _ => None,
     }
 }
@@ -6247,7 +6322,7 @@ fn activate_command(
     if let Some(target) = command_target(workspace, id) {
         // 0.164.0: a grouped panel's tab is selected first — a hidden tab
         // panel is not focusable.
-        for panel in [workspace.properties, workspace.history] {
+        for panel in [workspace.properties, workspace.history, workspace.channels] {
             if panel.root == target
                 && let Err(err) = aurora_ui::select_panel_tab(workspace, panel)
             {
@@ -6493,6 +6568,9 @@ enum WidgetOwner {
     /// A button of the Layers panel's bottom toolbar (0.196.0): an
     /// activation runs [`App::run_layer_action`].
     LayerToolbar,
+    /// A button of the Channels panel's foot toolbar (0.232.0): an
+    /// activation runs [`App::run_channels_action`].
+    ChannelsToolbar,
     /// A panel tab group's tab bar (0.164.0, `aurora_ui::PanelGroup`): a
     /// click, an arrow key or `Home`/`End` selects a tab in the widget
     /// layer, then [`follow_panel_tabs`] shows that tab's panel.
@@ -6632,6 +6710,27 @@ fn refill_reopened_panels(
             }
             aurora_ui::DockPanel::Properties => {
                 refresh_properties_panel(workspace, document.tool, document.tool_settings);
+            }
+            // The Channels panel is refilled from its own last state; the
+            // per-turn sync corrects it if the document differs.
+            aurora_ui::DockPanel::Channels => {
+                let (names, visibility) = (
+                    workspace.channels_state.names.clone(),
+                    workspace.channels_state.visibility,
+                );
+                let channels = workspace.channels;
+                let mut state = workspace.channels_state.clone();
+                if let Err(err) = aurora_ui::populate_channels_panel(
+                    &mut workspace.tree,
+                    channels,
+                    scales,
+                    &mut state,
+                    visibility,
+                    &names,
+                ) {
+                    tracing::warn!(?err, "failed to refill the Channels panel");
+                }
+                workspace.channels_state = state;
             }
         }
     }
@@ -6945,6 +7044,9 @@ fn widget_owner(
     }
     if aurora_ui::is_layer_toolbar_button(tree, id) {
         return Some(WidgetOwner::LayerToolbar);
+    }
+    if aurora_ui::is_channels_toolbar_button(tree, id) {
+        return Some(WidgetOwner::ChannelsToolbar);
     }
     if aurora_ui::is_panel_group_tab(tree, id) {
         return Some(WidgetOwner::PanelTabs);
@@ -8154,6 +8256,20 @@ fn layer_toolbar_click(
     match outcome {
         PointerOutcome::Action(aurora_widgets::ActionOutcome::Activated(id)) => {
             workspace.layer_toolbar.action_for(*id)
+        }
+        _ => None,
+    }
+}
+
+/// The Channel actions button a widget outcome activated, if it is an
+/// activation (0.232.0).
+fn channels_toolbar_click(
+    workspace: &aurora_ui::Workspace,
+    outcome: &PointerOutcome,
+) -> Option<aurora_ui::ChannelsAction> {
+    match outcome {
+        PointerOutcome::Action(aurora_widgets::ActionOutcome::Activated(id)) => {
+            workspace.channels_state.toolbar.action_for(*id)
         }
         _ => None,
     }
@@ -10225,6 +10341,7 @@ fn build_menu() -> muda::Menu {
                 None,
             ),
             &muda::MenuItem::with_id(COMMAND_FOCUS_HISTORY, "Focus History Panel", true, None),
+            &muda::MenuItem::with_id(COMMAND_FOCUS_CHANNELS, "Focus Channels Panel", true, None),
             &muda::PredefinedMenuItem::separator(),
             &muda::MenuItem::with_id(COMMAND_TOGGLE_LAYERS, "Toggle Layers Panel", true, None),
             &muda::MenuItem::with_id(
@@ -10234,6 +10351,7 @@ fn build_menu() -> muda::Menu {
                 None,
             ),
             &muda::MenuItem::with_id(COMMAND_TOGGLE_HISTORY, "Toggle History Panel", true, None),
+            &muda::MenuItem::with_id(COMMAND_TOGGLE_CHANNELS, "Toggle Channels Panel", true, None),
             &muda::PredefinedMenuItem::separator(),
             &muda::MenuItem::with_id(COMMAND_CLOSE_LAYERS, "Close Layers Panel", true, None),
             &muda::MenuItem::with_id(
@@ -10243,6 +10361,7 @@ fn build_menu() -> muda::Menu {
                 None,
             ),
             &muda::MenuItem::with_id(COMMAND_CLOSE_HISTORY, "Close History Panel", true, None),
+            &muda::MenuItem::with_id(COMMAND_CLOSE_CHANNELS, "Close Channels Panel", true, None),
             &muda::PredefinedMenuItem::separator(),
             &muda::MenuItem::with_id(
                 COMMAND_TOGGLE_WIDGET_GALLERY,
@@ -27421,6 +27540,9 @@ struct App {
     /// function's own doc comment.
     workspace: aurora_ui::Workspace,
     focus: FocusManager,
+    /// The last press on a Channels saved-selection row, for the double
+    /// click that loads it (0.232.0, [`channels_app::is_double_click`]).
+    channel_click: Option<(WidgetId, std::time::Instant)>,
     /// This build's fixed global keyboard shortcuts ([`default_shortcuts`]).
     shortcuts: ShortcutRegistry<AppCommand>,
     /// The modifier keys currently held down, tracked from
@@ -28098,6 +28220,7 @@ impl App {
             pointer_position: None,
             gallery: None,
             gallery_click: ClickTracker::default(),
+            channel_click: None,
             layer_controls,
             tool_settings,
             tool_controls,
@@ -28210,6 +28333,9 @@ impl App {
         if let Some(action) = effects.layer_action {
             self.run_layer_action(action);
         }
+        if let Some(request) = effects.channels {
+            self.apply_channels_request(request);
+        }
         if let Some(edit) = effects.menu_bar {
             let outcome = match edit {
                 MenuBarEdit::Activated(id) => {
@@ -28304,6 +28430,9 @@ impl App {
         if self.menu_bar_key(key) {
             return;
         }
+        if self.channels_row_key(key) {
+            return;
+        }
         if self.layer_row_key(key) {
             return;
         }
@@ -28344,6 +28473,11 @@ impl App {
                 WidgetOwner::LayerToolbar => {
                     if let Some(action) = layer_toolbar_click(&self.workspace, &outcome) {
                         self.run_layer_action(action);
+                    }
+                }
+                WidgetOwner::ChannelsToolbar => {
+                    if let Some(action) = channels_toolbar_click(&self.workspace, &outcome) {
+                        self.run_channels_action(action);
                     }
                 }
                 // A linked panel bar is never focused, so no key reaches it.
@@ -28645,6 +28779,136 @@ impl App {
         }
         self.push_accessibility();
         self.needs_redraw = true;
+    }
+
+    /// A primary press at `position` on a Channels row or eye (0.232.0):
+    /// an eye toggles, a saved row loads on a double click, any other
+    /// press selects the row. Returns whether it was one.
+    fn press_channels_row(&mut self, position: (f32, f32)) -> bool {
+        if self.dialog.is_some() || self.command_palette.is_some() {
+            return false;
+        }
+        let Some(hit) = self.workspace.tree.hit_test(position) else {
+            return false;
+        };
+        let Some((row_id, part)) = self
+            .workspace
+            .channels_state
+            .row_part(&self.workspace.tree, hit)
+        else {
+            return false;
+        };
+        let Some(row) = self.workspace.channels_state.row_of(row_id).cloned() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        let double = matches!(row, aurora_ui::ChannelRow::Saved(_))
+            && channels_app::is_double_click(self.channel_click, row_id, now);
+        self.channel_click = if double { None } else { Some((row_id, now)) };
+        let effect = channels_app::press_effect(&row, part, double, false);
+        self.apply_channel_effect(row_id, effect);
+        true
+    }
+
+    /// `Enter`, `Space` and the arrows on a focused Channels row (0.232.0):
+    /// the eye on a composite row, load or select on a saved one.
+    fn channels_row_key(&mut self, key: Key) -> bool {
+        let Some(row_id) = self.focus.focused() else {
+            return false;
+        };
+        let Some(row) = self.workspace.channels_state.row_of(row_id).cloned() else {
+            return false;
+        };
+        let modal = self.dialog.is_some() || self.command_palette.is_some();
+        let Some(action) = channels_app::key_action(key, self.modifiers, modal) else {
+            return false;
+        };
+        let effect = channels_app::key_effect(&row, action);
+        self.apply_channel_effect(row_id, effect);
+        true
+    }
+
+    fn apply_channels_request(&mut self, request: ChannelsRequest) {
+        match request {
+            ChannelsRequest::Action(action) => self.run_channels_action(action),
+            ChannelsRequest::Row { row, part } => {
+                let Some(kind) = self.workspace.channels_state.row_of(row).cloned() else {
+                    return;
+                };
+                // An assistive technology's `Click` is the row's default
+                // action: it loads a saved selection.
+                let effect = channels_app::press_effect(&kind, part, false, true);
+                self.apply_channel_effect(row, effect);
+            }
+        }
+    }
+
+    /// Applies one Channels row effect ([`channels_app::RowEffect`]).
+    fn apply_channel_effect(&mut self, row_id: WidgetId, effect: channels_app::RowEffect) {
+        use channels_app::RowEffect;
+        let Some(row) = self.workspace.channels_state.row_of(row_id).cloned() else {
+            return;
+        };
+        match effect {
+            RowEffect::Move(forward) => {
+                if let Some(next) = self.workspace.channels_state.neighbor(row_id, forward)
+                    && let Err(err) =
+                        self.focus
+                            .focus_with(&mut self.workspace.tree, next, FocusOrigin::Keyboard)
+                {
+                    tracing::warn!(?err, "failed to move focus between Channels rows");
+                }
+                self.push_accessibility();
+            }
+            RowEffect::ToggleEye(channel) => {
+                channels_app::toggle_eye(&mut self.doc, channel);
+                self.select_channel(&row);
+                self.sync_channels_now();
+            }
+            RowEffect::Select => self.select_channel(&row),
+            RowEffect::Load(name) => {
+                self.select_channel(&row);
+                self.run_saved_selection(selection_store::SavedSelectionCommand::Load(name));
+            }
+        }
+        self.relayout_after_gallery();
+    }
+
+    fn select_channel(&mut self, row: &aurora_ui::ChannelRow) {
+        let mut state = self.workspace.channels_state.clone();
+        if let Err(err) = aurora_ui::select_channel_row(&mut self.workspace.tree, &mut state, row) {
+            tracing::warn!(?err, "failed to select a Channels row");
+        }
+        self.workspace.channels_state = state;
+    }
+
+    /// One Channel actions toolbar button (0.232.0): New opens the Save
+    /// Selection prompt, Delete removes the selected saved selection.
+    fn run_channels_action(&mut self, action: aurora_ui::ChannelsAction) {
+        use selection_store::SavedSelectionCommand as Cmd;
+        match action {
+            aurora_ui::ChannelsAction::NewFromSelection => self.run_saved_selection(Cmd::Prompt),
+            aurora_ui::ChannelsAction::Delete => {
+                if let Some(name) = self
+                    .workspace
+                    .channels_state
+                    .selected_saved()
+                    .map(str::to_owned)
+                {
+                    self.run_saved_selection(Cmd::Delete(name));
+                    self.sync_channels_now();
+                }
+            }
+        }
+        self.relayout_after_gallery();
+    }
+
+    /// Keeps the Channels panel in line with the document (0.232.0),
+    /// every loop turn: the saved selections and the eyes.
+    fn sync_channels_now(&mut self) {
+        if channels_app::sync_channels(&mut self.workspace, &self.scales, &self.doc) {
+            self.relayout_after_gallery();
+        }
     }
 
     /// Runs one Layer actions toolbar button (0.196.0). Link, Fx and Mask
@@ -30605,6 +30869,11 @@ impl App {
             return;
         }
 
+        // A Channels panel row or eye (0.232.0), whatever the tool.
+        if button == PointerButton::Primary && self.press_channels_row(position) {
+            return;
+        }
+
         // A History-panel row (0.148.0) jumps to that step, whatever the
         // tool.
         if button == PointerButton::Primary && self.press_history_row(position) {
@@ -31926,6 +32195,7 @@ impl App {
     /// middle-button pan still in progress, critic C5) — a press is a
     /// second gesture, the same rule [`Self::handle_pointer_pressed`]
     /// applies to its layer-row and canvas branches.
+    #[allow(clippy::too_many_lines)]
     fn route_gallery(&mut self, phase: PointerPhase, position: (f32, f32)) -> bool {
         if phase == PointerPhase::Down && self.dialog.is_none() && self.command_palette.is_none() {
             self.light_dismiss_colour_popover(position);
@@ -31994,6 +32264,14 @@ impl App {
                     .and_then(|outcome| tool_button_click(&self.workspace, outcome))
             {
                 self.select_tool_command(tool);
+            }
+            if routed.owner == Some(WidgetOwner::ChannelsToolbar)
+                && let Some(action) = routed
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| channels_toolbar_click(&self.workspace, outcome))
+            {
+                self.run_channels_action(action);
             }
             if routed.owner == Some(WidgetOwner::LayerToolbar)
                 && let Some(action) = routed
@@ -32210,6 +32488,18 @@ impl App {
             Ok(true) => self.needs_redraw = true,
             Ok(false) => {}
             Err(err) => tracing::warn!(?err, "toolbar hover failed"),
+        }
+        // 0.232.0: and the Channel actions toolbar's.
+        let channels_hovered =
+            under.filter(|&id| aurora_ui::is_channels_toolbar_button(&self.workspace.tree, id));
+        match aurora_ui::set_channels_toolbar_hover(
+            &mut self.workspace.tree,
+            &self.workspace.channels_state.toolbar,
+            channels_hovered,
+        ) {
+            Ok(true) => self.needs_redraw = true,
+            Ok(false) => {}
+            Err(err) => tracing::warn!(?err, "channels toolbar hover failed"),
         }
         // 0.208.0: so are the swap and default-colours buttons.
         let colours = self.workspace.tools.colours;
@@ -33542,6 +33832,7 @@ impl App {
                     if let Some(canvas_size) =
                         canvas_area_physical_size(&self.workspace, self.scale_factor)
                     {
+                        residency.set_channel_gain(self.doc.channel_view.gain());
                         residency.set_document_clip(Some(document_clip_rect(
                             self.doc.canvas_size,
                             active_layer_origin(&self.doc.layers, self.doc.active_layer),
@@ -34269,6 +34560,7 @@ impl ApplicationHandler<AppEvent> for App {
         self.follow_document_tabs_now();
         self.sync_layer_controls_now();
         self.sync_tool_controls_now();
+        self.sync_channels_now();
         self.sync_curves_controls_now();
         self.sync_status_bar_now();
         let thumbnail_deadline = self.update_layer_thumbnails(now);
@@ -36577,6 +36869,7 @@ mod tests {
                         dialog: None,
                         close_tab: None,
                         layer_action: None,
+                        channels: None,
                         colour: None,
                         menu_bar: None,
                     },
@@ -36774,6 +37067,7 @@ mod tests {
             dialog: None,
             close_tab: None,
             layer_action: None,
+            channels: None,
             colour: None,
             menu_bar: None,
         };
@@ -87145,11 +87439,12 @@ mod panel_scroll_tests {
 
         use crate::tests::{FakeClipboard, FakeFileDialog};
         use crate::{
-            AccessibilityReaction, COMMAND_CLOSE_HISTORY, COMMAND_CLOSE_PROPERTIES,
-            COMMAND_FOCUS_HISTORY, COMMAND_TOGGLE_HISTORY, COMMAND_TOGGLE_PROPERTIES, ClickTracker,
-            FocusManager, Key, Modifiers, NamedKey, PointerPhase, WidgetId, WorkspaceLayout,
-            WorkspaceLayoutV1, activate_command, expand_properties_for_curves,
-            route_accessibility_action, route_widget_key, route_widget_pointer,
+            AccessibilityReaction, COMMAND_CLOSE_CHANNELS, COMMAND_CLOSE_HISTORY,
+            COMMAND_CLOSE_PROPERTIES, COMMAND_FOCUS_HISTORY, COMMAND_TOGGLE_HISTORY,
+            COMMAND_TOGGLE_PROPERTIES, ClickTracker, FocusManager, Key, Modifiers, NamedKey,
+            PointerPhase, WidgetId, WorkspaceLayout, WorkspaceLayoutV1, activate_command,
+            expand_properties_for_curves, route_accessibility_action, route_widget_key,
+            route_widget_pointer,
         };
 
         const WINDOW: (f32, f32) = (1274.0, 672.0);
@@ -87606,6 +87901,8 @@ mod panel_scroll_tests {
             ws.tree.compute_layout(WINDOW.0, WINDOW.1);
             assert_one_slot(&ws, "History closed");
             run(&mut ws, &mut focus, COMMAND_CLOSE_PROPERTIES);
+            assert_eq!(shown(&ws), Some(2), "Channels is still open");
+            run(&mut ws, &mut focus, COMMAND_CLOSE_CHANNELS);
             assert_eq!(shown(&ws), None);
             ws.tree.compute_layout(WINDOW.0, WINDOW.1);
             assert_eq!(
@@ -88005,8 +88302,13 @@ mod panel_scroll_tests {
                 assert_eq!(
                     shape(&ws),
                     vec![(
-                        vec![DockPanel::Properties, DockPanel::History, DockPanel::Layers],
-                        2
+                        vec![
+                            DockPanel::Properties,
+                            DockPanel::History,
+                            DockPanel::Channels,
+                            DockPanel::Layers
+                        ],
+                        3
                     )]
                 );
                 assert_eq!(
@@ -88030,7 +88332,7 @@ mod panel_scroll_tests {
                     shape(&ws),
                     vec![
                         (vec![DockPanel::Properties], 0),
-                        (vec![DockPanel::Layers], 0),
+                        (vec![DockPanel::Channels, DockPanel::Layers], 1),
                         (vec![DockPanel::History], 0)
                     ]
                 );
@@ -88099,7 +88401,8 @@ mod panel_scroll_tests {
                     saved,
                     vec![
                         (vec![DockPanel::Layers, DockPanel::Properties], 1),
-                        (vec![DockPanel::History], 0)
+                        (vec![DockPanel::History], 0),
+                        (vec![DockPanel::Channels], 0)
                     ]
                 );
                 crate::save_workspace_layout(&path, &original);
@@ -88188,11 +88491,12 @@ mod panel_scroll_tests {
                 assert_eq!(
                     shape(&loaded),
                     vec![
-                        (vec![DockPanel::History], 0),
+                        (vec![DockPanel::History, DockPanel::Channels], 0),
                         (vec![DockPanel::Layers], 0),
                         (vec![DockPanel::Properties], 0)
                     ],
-                    "unknown and duplicate dropped, empty slot gone, Properties appended"
+                    "unknown and duplicate dropped, empty slot gone, Properties appended, \
+                     Channels joins History"
                 );
                 every_panel_once_in_the_tree(&loaded);
 
@@ -88351,7 +88655,7 @@ mod panel_scroll_tests {
                     shape(&ws),
                     vec![
                         (vec![DockPanel::Layers], 0),
-                        (vec![DockPanel::Properties], 0),
+                        (vec![DockPanel::Properties, DockPanel::Channels], 1),
                         (vec![DockPanel::History], 0)
                     ],
                     "the drop was applied"
@@ -88374,7 +88678,7 @@ mod panel_scroll_tests {
                 assert_eq!(
                     shape(&ws),
                     vec![
-                        (vec![DockPanel::Properties], 0),
+                        (vec![DockPanel::Properties, DockPanel::Channels], 1),
                         (vec![DockPanel::History, DockPanel::Layers], 1)
                     ],
                     "joined as the selected tab"
@@ -89127,7 +89431,7 @@ mod panel_scroll_tests {
                 }
                 lay(&mut ws, 1.0, WINDOW);
                 let saved = ws.dock_arrangement();
-                assert!(saved.slots().is_empty());
+                assert_eq!(saved.slots().len(), 1, "Channels stays in the rail");
                 assert_eq!(saved.floating().len(), 2);
                 crate::save_workspace_layout(&path, &ws);
                 let bytes = match std::fs::read(&path) {
@@ -89177,7 +89481,7 @@ mod panel_scroll_tests {
                         .map(|s| (s.panels.clone(), s.selected))
                         .collect::<Vec<_>>(),
                     vec![
-                        (vec![DockPanel::History], 0),
+                        (vec![DockPanel::History, DockPanel::Channels], 0),
                         (vec![DockPanel::Properties, DockPanel::Layers], 1)
                     ],
                     "the 0.166.0 arrangement"

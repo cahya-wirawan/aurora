@@ -34,11 +34,19 @@ pub enum DockPanel {
     Layers,
     Properties,
     History,
+    /// The Channels panel (0.232.0): by default the third tab of the
+    /// Properties + History group.
+    Channels,
 }
 
 impl DockPanel {
     /// Every rail panel, in the default top-to-bottom order.
-    pub const ALL: [Self; 3] = [Self::Layers, Self::Properties, Self::History];
+    pub const ALL: [Self; 4] = [
+        Self::Layers,
+        Self::Properties,
+        Self::History,
+        Self::Channels,
+    ];
 
     /// The panel's title (its tab label and accessible name).
     #[must_use]
@@ -47,6 +55,7 @@ impl DockPanel {
             Self::Layers => "Layers",
             Self::Properties => "Properties",
             Self::History => "History",
+            Self::Channels => "Channels",
         }
     }
 
@@ -58,6 +67,7 @@ impl DockPanel {
             Self::Layers => "layers",
             Self::Properties => "properties",
             Self::History => "history",
+            Self::Channels => "channels",
         }
     }
 
@@ -162,14 +172,19 @@ pub struct DockArrangement {
 }
 
 impl Default for DockArrangement {
-    /// Layers on its own, then Properties + History as tabs, Properties
-    /// selected (0.164.0's grouping); nothing floating.
+    /// Layers on its own, then Properties + History + Channels as tabs,
+    /// Properties selected (0.164.0's grouping, Channels added as its
+    /// third tab in 0.232.0); nothing floating.
     fn default() -> Self {
         Self {
             slots: vec![
                 DockSlot::single(DockPanel::Layers),
                 DockSlot {
-                    panels: vec![DockPanel::Properties, DockPanel::History],
+                    panels: vec![
+                        DockPanel::Properties,
+                        DockPanel::History,
+                        DockPanel::Channels,
+                    ],
                     selected: crate::workspace::PANEL_GROUP_TAB_DEFAULT,
                 },
             ],
@@ -258,7 +273,9 @@ impl DockArrangement {
     /// first place, empty slots are dropped, an out-of-range selection
     /// selects the first tab (a selection naming a dropped entry falls to
     /// the first kept one), and every panel left out is appended to the
-    /// rail as a slot of its own, in [`DockPanel::ALL`] order. Rail slots
+    /// rail as a slot of its own, in [`DockPanel::ALL`] order (the one
+    /// exception, 0.232.0: a missing Channels panel joins the rail slot
+    /// that holds History as its last tab, when there is one). Rail slots
     /// keep their relative order; floating ones too, as their stacking
     /// order (first is bottom). A floating slot whose position is not
     /// finite is unrecoverable and is docked at the rail's end; a negative
@@ -323,6 +340,18 @@ impl DockArrangement {
         for panel in DockPanel::ALL {
             if !seen.contains(&panel) {
                 repaired = true;
+                // 0.232.0: a layout saved before the Channels panel
+                // existed gets it as one more tab of the rail group that
+                // holds History (Photoshop's History-and-friends group),
+                // else as a slot of its own like any other missing panel.
+                if panel == DockPanel::Channels
+                    && let Some(slot) = slots
+                        .iter_mut()
+                        .find(|slot| slot.panels.contains(&DockPanel::History))
+                {
+                    slot.panels.push(panel);
+                    continue;
+                }
                 slots.push(DockSlot::single(panel));
             }
         }
@@ -533,7 +562,7 @@ mod tests {
     use super::{
         DockArrangement, DockPanel, DockPlacement, DockSlot, DropTarget, PanelMove, SlotRef,
     };
-    use DockPanel::{History, Layers, Properties};
+    use DockPanel::{Channels, History, Layers, Properties};
 
     fn arrangement(slots: &[(&[DockPanel], usize)]) -> DockArrangement {
         let raw = slots
@@ -568,11 +597,11 @@ mod tests {
     }
 
     #[test]
-    fn the_default_is_layers_then_properties_and_history_as_tabs() {
+    fn the_default_is_layers_then_properties_history_and_channels_as_tabs() {
         let default = DockArrangement::default();
         assert_eq!(
             shape(&default),
-            vec![(vec![Layers], 0), (vec![Properties, History], 0)]
+            vec![(vec![Layers], 0), (vec![Properties, History, Channels], 0)]
         );
         assert!(every_panel_once(&default));
         for panel in DockPanel::ALL {
@@ -591,13 +620,16 @@ mod tests {
         let reordered = default.moved(Layers, DropTarget::Gap(2));
         assert_eq!(
             reordered.as_ref().map(shape),
-            Some(vec![(vec![Properties, History], 0), (vec![Layers], 0)])
+            Some(vec![
+                (vec![Properties, History, Channels], 0),
+                (vec![Layers], 0)
+            ])
         );
         // Join: Layers into the group, selected; its own slot is gone.
         let joined = default.moved(Layers, DropTarget::Join(1));
         assert_eq!(
             joined.as_ref().map(shape),
-            Some(vec![(vec![Properties, History, Layers], 2)])
+            Some(vec![(vec![Properties, History, Channels, Layers], 3)])
         );
         // Split: History out of the group into the top gap.
         let split = default.moved(History, DropTarget::Gap(0));
@@ -606,7 +638,7 @@ mod tests {
             Some(vec![
                 (vec![History], 0),
                 (vec![Layers], 0),
-                (vec![Properties], 0)
+                (vec![Properties, Channels], 0)
             ])
         );
         // The selected tab leaving: the tab now in its place is selected.
@@ -620,7 +652,7 @@ mod tests {
             Some(vec![
                 (vec![History], 0),
                 (vec![Layers], 0),
-                (vec![Properties], 0)
+                (vec![Properties, Channels], 1)
             ])
         );
         // No-ops: a lone panel just above or below itself, a join of its
@@ -643,7 +675,7 @@ mod tests {
     /// removes its slot — no empty slot survives any move.
     #[test]
     fn no_move_ever_leaves_an_empty_slot() {
-        let grouped = arrangement(&[(&[Layers, Properties, History], 1)]);
+        let grouped = arrangement(&[(&[Layers, Properties, History, Channels], 1)]);
         let mut frontier = vec![grouped];
         let mut seen = Vec::new();
         while let Some(next) = frontier.pop() {
@@ -661,8 +693,8 @@ mod tests {
             }
             seen.push(next);
         }
-        // Every reachable arrangement was checked; there are 13 of them
-        // for three panels (orderings of slots of ordered tabs).
+        // Every reachable arrangement was checked (orderings of slots of
+        // ordered tabs; 13 with three panels, many more with four).
         assert!(seen.len() >= 13, "{}", seen.len());
     }
 
@@ -679,7 +711,11 @@ mod tests {
         assert!(changed);
         assert_eq!(
             shape(&repaired),
-            vec![(vec![History], 0), (vec![Layers], 0), (vec![Properties], 0)]
+            vec![
+                (vec![History, Channels], 0),
+                (vec![Layers], 0),
+                (vec![Properties], 0)
+            ]
         );
         assert!(every_panel_once(&repaired));
         let (from_nothing, changed) = DockArrangement::repaired(vec![(vec![None], 0)]);
@@ -691,11 +727,52 @@ mod tests {
         // kept tab; one naming a kept panel keeps it.
         let (kept, _) = DockArrangement::repaired(vec![
             (vec![Some(Layers)], 0),
-            (vec![Some(Properties), Some(Layers), Some(History)], 2),
+            (
+                vec![
+                    Some(Properties),
+                    Some(Layers),
+                    Some(History),
+                    Some(Channels),
+                ],
+                2,
+            ),
         ]);
         assert_eq!(
             shape(&kept),
-            vec![(vec![Layers], 0), (vec![Properties, History], 1)]
+            vec![(vec![Layers], 0), (vec![Properties, History, Channels], 1)]
+        );
+        // 0.232.0: a layout saved before the Channels panel existed gets it
+        // as one more tab of the group holding History, selection kept.
+        let (old, changed) = DockArrangement::repaired(vec![
+            (vec![Some(Layers)], 0),
+            (vec![Some(Properties), Some(History)], 1),
+        ]);
+        assert!(changed);
+        assert_eq!(
+            shape(&old),
+            vec![(vec![Layers], 0), (vec![Properties, History, Channels], 1)]
+        );
+        // With History alone it joins that slot; with no rail History it
+        // is a slot of its own at the end.
+        let (lone, _) = DockArrangement::repaired(vec![
+            (vec![Some(Layers), Some(Properties)], 0),
+            (vec![Some(History)], 0),
+        ]);
+        assert_eq!(
+            shape(&lone),
+            vec![(vec![Layers, Properties], 0), (vec![History, Channels], 0)]
+        );
+        let (floating_history, _) = DockArrangement::repaired_placed(vec![
+            (DockPlacement::Rail, vec![Some(Layers), Some(Properties)], 0),
+            (
+                DockPlacement::Floating { x: 1.0, y: 1.0 },
+                vec![Some(History)],
+                0,
+            ),
+        ]);
+        assert_eq!(
+            shape(&floating_history),
+            vec![(vec![Layers, Properties], 0), (vec![Channels], 0)]
         );
     }
 
@@ -720,9 +797,9 @@ mod tests {
             default.move_target(History, PanelMove::NextGroup),
             Some(DropTarget::Join(0))
         );
-        let one_slot = arrangement(&[(&[Layers, Properties, History], 0)]);
+        let one_slot = arrangement(&[(&[Layers, Properties, History, Channels], 0)]);
         assert_eq!(one_slot.move_target(Layers, PanelMove::NextGroup), None);
-        let bottom = arrangement(&[(&[Properties, History], 0), (&[Layers], 0)]);
+        let bottom = arrangement(&[(&[Properties, History, Channels], 0), (&[Layers], 0)]);
         assert_eq!(bottom.move_target(Layers, PanelMove::Down), None);
         let _ = DockSlot::single(Layers);
     }
@@ -772,7 +849,10 @@ mod tests {
         let Some(one) = default.moved(History, DropTarget::Float { x: 10.0, y: 20.0 }) else {
             unreachable!("History floats");
         };
-        assert_eq!(shape(&one), vec![(vec![Layers], 0), (vec![Properties], 0)]);
+        assert_eq!(
+            shape(&one),
+            vec![(vec![Layers], 0), (vec![Properties, Channels], 0)]
+        );
         assert_eq!(floats(&one), vec![(vec![History], 0, 10.0, 20.0)]);
         assert_eq!(one.locate(History), Some((SlotRef::Floating(0), 0)));
         assert_eq!(one.position_of(History), None, "position_of is the rail's");
@@ -787,7 +867,7 @@ mod tests {
         let Some(joined) = two.moved(Properties, DropTarget::JoinFloating(0)) else {
             unreachable!("joins");
         };
-        assert!(joined.slots().is_empty(), "the rail emptied");
+        assert_eq!(shape(&joined), vec![(vec![Channels], 0)], "Channels stays");
         assert_eq!(
             floats(&joined).first().map(|f| (f.0.clone(), f.1)),
             Some((vec![History, Properties], 1))
@@ -804,7 +884,10 @@ mod tests {
         let Some(docked) = moved.moved_slot(Properties, DropTarget::Gap(0)) else {
             unreachable!("docks");
         };
-        assert_eq!(shape(&docked), vec![(vec![History, Properties], 1)]);
+        assert_eq!(
+            shape(&docked),
+            vec![(vec![History, Properties], 1), (vec![Channels], 0)]
+        );
         assert_eq!(floats(&docked), vec![(vec![Layers], 0, 50.0, 60.0)]);
         // Raising.
         assert_eq!(two.raised(1), None, "already on top");
@@ -904,9 +987,15 @@ mod tests {
             (DockPlacement::Rail, vec![Some(Properties)], 0),
         ]);
         assert!(changed);
+        // Channels, missing, joined History's slot, which is floating, so
+        // it is a slot of its own at the end.
         assert_eq!(
             shape(&repaired),
-            vec![(vec![Properties], 0), (vec![Layers], 0)]
+            vec![
+                (vec![Properties], 0),
+                (vec![Layers], 0),
+                (vec![Channels], 0)
+            ]
         );
         assert_eq!(floats(&repaired), vec![(vec![History], 0, 0.0, 7.0)]);
         assert!(every_panel_once_anywhere(&repaired));

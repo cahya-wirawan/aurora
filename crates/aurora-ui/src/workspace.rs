@@ -63,8 +63,9 @@ use crate::tools_panel::{ToolsPanel, insert_tools_panel};
 /// The options bar's accessible label.
 pub const OPTIONS_BAR_LABEL: &str = "Tool options";
 
-/// The Properties + History tab group's tab-list label (0.164.0).
-pub const PANEL_GROUP_LABEL: &str = "Properties and History";
+/// The Properties + History + Channels tab group's tab-list label (0.164.0;
+/// Channels joined in 0.232.0).
+pub const PANEL_GROUP_LABEL: &str = "Properties, History and Channels";
 
 /// The tab [`build_workspace`] selects in the default Properties + History group, and
 /// the one a saved layout without a tab falls back to: `0`, Properties
@@ -154,6 +155,12 @@ pub struct Workspace {
     pub properties: PanelHandle,
     /// The History panel — by default the second tab of that group.
     pub history: PanelHandle,
+    /// The Channels panel (0.232.0) — by default the third tab of that
+    /// group.
+    pub channels: PanelHandle,
+    /// The Channels panel's rows, selection and toolbar
+    /// ([`crate::channels_panel`]); `aurora-app` keeps its rows current.
+    pub channels_state: crate::channels_panel::ChannelsPanel,
     /// The rail's dock slots, top to bottom (0.166.0, drag-to-redock;
     /// [`crate::dock`]): each a lone panel or a tab group
     /// ([`crate::panel_group`]). The default is Layers on its own, then
@@ -248,6 +255,7 @@ impl Workspace {
             DockPanel::Layers => self.layers,
             DockPanel::Properties => self.properties,
             DockPanel::History => self.history,
+            DockPanel::Channels => self.channels,
         }
     }
 
@@ -529,17 +537,34 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         &mut tree,
         rail,
         PANEL_GROUP_LABEL,
-        &["Properties", "History"],
+        &["Properties", "History", "Channels"],
         PANEL_GROUP_TAB_DEFAULT,
         scales,
     ) {
         Ok(group) => group,
         Err(err) => unreachable!("rail was just inserted into this same tree: {err:?}"),
     };
-    let (properties, history) = match panel_group.members.as_slice() {
-        [properties, history] => (*properties, *history),
-        _ => unreachable!("the group was built with exactly two titles"),
+    let (properties, history, channels) = match panel_group.members.as_slice() {
+        [properties, history, channels] => (*properties, *history, *channels),
+        _ => unreachable!("the group was built with exactly three titles"),
     };
+    // 0.232.0: the Channels panel's foot toolbar and first rows.
+    let channels_toolbar =
+        match crate::channels_panel::insert_channels_toolbar(&mut tree, channels, scales) {
+            Ok(toolbar) => toolbar,
+            Err(err) => unreachable!("the Channels panel was just inserted: {err:?}"),
+        };
+    let mut channels_state = crate::channels_panel::new_channels_panel(channels_toolbar);
+    if let Err(err) = crate::channels_panel::populate_channels_panel(
+        &mut tree,
+        channels,
+        scales,
+        &mut channels_state,
+        crate::channels_panel::ChannelVisibility::ALL_ON,
+        &[],
+    ) {
+        unreachable!("the Channels panel was just inserted: {err:?}");
+    }
     // 0.161.0: Layers and Properties take their content's height (their
     // rows up to the `size.content_panel_max_rows` token, then they scroll); History keeps the zero-basis
     // `Fill` rule and absorbs what they leave. Equal thirds squeezed the
@@ -558,7 +583,12 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
     }
     // 0.165.0: the collapsed rail's label strip, right after the rail,
     // hidden until the rail collapses.
-    let panel_strip = insert_rail_strip(&mut tree, root, scales, [layers, properties, history]);
+    let panel_strip = insert_rail_strip(
+        &mut tree,
+        root,
+        scales,
+        [layers, properties, history, channels],
+    );
     // 0.166.0: the drag-to-redock drop indicator, hidden until a drag.
     let drop_indicator = match widgets::insert_drop_indicator(&mut tree, root) {
         Ok(id) => id,
@@ -583,6 +613,8 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         layers,
         properties,
         history,
+        channels,
+        channels_state,
         slots: vec![RailSlot::Panel(layers), RailSlot::Group(panel_group)],
         drop_indicator,
         floating: Vec::new(),
@@ -629,7 +661,7 @@ pub fn history_floor_rows(scales: &Scales) -> u32 {
 pub fn docked_sizing(panel: DockPanel) -> PanelSizing {
     match panel {
         DockPanel::Layers | DockPanel::Properties => PanelSizing::Content,
-        DockPanel::History => PanelSizing::Fill,
+        DockPanel::History | DockPanel::Channels => PanelSizing::Fill,
     }
 }
 
@@ -832,12 +864,13 @@ pub fn raise_floating(workspace: &mut Workspace, index: usize) -> Result<bool, W
 /// inserted into `root`. Infallible for the same reason
 /// [`build_workspace`] is: `root` is a node of this brand-new tree.
 /// Builds [`Workspace::panel_strip`] under `root`: one button per rail
-/// panel, `[layers, properties, history]`, each named by its own title.
+/// panel, `[layers, properties, history, channels]`, each named by its own
+/// title.
 fn insert_rail_strip(
     tree: &mut WidgetTree<WidgetKind>,
     root: WidgetId,
     scales: &Scales,
-    [layers, properties, history]: [PanelHandle; 3],
+    [layers, properties, history, channels]: [PanelHandle; 4],
 ) -> PanelStrip {
     match insert_panel_strip(
         tree,
@@ -847,6 +880,7 @@ fn insert_rail_strip(
             (layers, "Layers"),
             (properties, "Properties"),
             (history, "History"),
+            (channels, "Channels"),
         ],
     ) {
         Ok(strip) => strip,
@@ -1495,7 +1529,8 @@ mod tests {
     }
 
     #[test]
-    fn build_workspace_has_a_canvas_area_and_three_docked_panels() {
+    #[allow(clippy::too_many_lines)]
+    fn build_workspace_has_a_canvas_area_and_four_docked_panels() {
         let mut ws = build_workspace(&test_scales());
         assert_eq!(ws.tree.parent(ws.canvas_area), Some(ws.canvas_column));
         assert_eq!(ws.tree.parent(ws.canvas_column), Some(ws.root));
@@ -1513,17 +1548,19 @@ mod tests {
                 [
                     crate::workspace::test_group(&ws).bar,
                     ws.properties.root,
-                    ws.history.root
+                    ws.history.root,
+                    ws.channels.root
                 ]
                 .as_slice()
             ),
-            "the group holds its tab row, then Properties and History in mockup order"
+            "the group holds its tab row, then Properties, History and Channels"
         );
 
         for (panel, title, role) in [
             (ws.layers, "Layers", accesskit::Role::Region),
             (ws.properties, "Properties", accesskit::Role::TabPanel),
             (ws.history, "History", accesskit::Role::TabPanel),
+            (ws.channels, "Channels", accesskit::Role::TabPanel),
         ] {
             let Some(accessibility) = ws.tree.accessibility(panel.root) else {
                 unreachable!("just inserted");
