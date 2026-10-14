@@ -22,7 +22,9 @@ use taffy::style_helpers::length;
 use taffy::{Display, FlexDirection, Size, Style};
 
 use crate::tool::Tool;
-use crate::tool_controls::{ToolControls, set_item_shown, set_node_hidden};
+use crate::tool_controls::{
+    OptionsItem, ToolControls, set_item_shown, set_node_hidden, set_options_item,
+};
 
 /// The group's accessible name.
 pub const SELECTION_MODE_LABEL: &str = "Selection mode";
@@ -107,6 +109,7 @@ pub fn insert_selection_mode_controls(
     let mut ids = [group; 4];
     for (slot, mode) in ids.iter_mut().zip(SelectionMode::ALL) {
         *slot = widgets::insert_checkbox(tree, group, scales, selection_mode_label(mode))?;
+        set_options_item(tree, scales, *slot, OptionsItem::Check, true)?;
     }
     let [replace, add, subtract, intersect] = ids;
     widgets::set_checkbox_checked(tree, replace, Toggled::True)?;

@@ -33,7 +33,7 @@ use taffy::{Display, FlexDirection, Size, Style};
 
 use crate::tool::Tool;
 use crate::tool_controls::{
-    OptionsItem, ToolControls, set_item_shown, set_node_hidden, set_options_item,
+    OptionsItem, ToolControls, group_grow, set_item_shown, set_node_hidden, set_options_item,
 };
 
 /// The Paint Bucket tolerance slider's range (8-bit-equivalent units).
@@ -191,13 +191,16 @@ pub const fn is_fill_tool(tool: Tool) -> bool {
     matches!(tool, Tool::Gradient | Tool::PaintBucket | Tool::MagicWand)
 }
 
-fn group_style(scales: &Scales) -> Style {
+fn group_style(scales: &Scales, sliders: u8) -> Style {
     #[allow(clippy::cast_precision_loss)]
     let gap = length(scales.spacing.sm as f32);
     Style {
         display: Display::None,
         flex_direction: FlexDirection::Row,
-        flex_grow: 1.0,
+        // Takes spare width for its sliders first (see `OptionsItem`), and
+        // never shrinks: what does not fit is clipped by the bar.
+        flex_grow: group_grow(sliders),
+        flex_shrink: 0.0,
         align_items: Some(taffy::AlignItems::CENTER),
         gap: Size {
             width: gap,
@@ -211,71 +214,28 @@ fn group_style(scales: &Scales) -> Style {
     }
 }
 
-/// Adds both groups as the last children of `options` (hidden).
-///
-/// # Errors
-///
-/// Returns [`WidgetError::UnknownWidget`] if `options` doesn't exist.
-pub fn insert_fill_controls(
+/// Gives each readout the width of its widest possible text (0.228.3), so
+/// a value changing while its slider is dragged never moves the slider.
+fn reserve_readout_widths(
+    tree: &mut WidgetTree<WidgetKind>,
+    readouts: [(WidgetId, &[&String]); 5],
+) -> Result<(), WidgetError> {
+    for (id, texts) in readouts {
+        let texts: Vec<&str> = texts.iter().map(|text| text.as_str()).collect();
+        widgets::set_label_reserve(tree, id, &texts)?;
+    }
+    Ok(())
+}
+
+/// The Brush, Pencil and Clone Stamp group (0.228.0): Opacity, and Flow for
+/// the two that have one. Returns the group and its
+/// `[opacity readout, opacity, flow readout, flow]`.
+fn insert_paint_group(
     tree: &mut WidgetTree<WidgetKind>,
     options: WidgetId,
     scales: &Scales,
-) -> Result<FillControls, WidgetError> {
-    let gradient = widgets::insert_container(tree, options, group_style(scales))?;
-    // The type is one checkbox (a row tall, like every other options-bar
-    // control): a text or icon toggle pair is taller than the bar's row
-    // (a measured text toggle is 45 px, a 32 px icon button 48 px with the
-    // bar's padding against 37), which would make the canvas jump on a
-    // tool switch.
-    let radial = widgets::insert_checkbox(tree, gradient, scales, "Radial")?;
-    let reverse = widgets::insert_checkbox(tree, gradient, scales, "Reverse")?;
-    let opacity_readout = widgets::insert_label(tree, gradient, scales, opacity_readout_text(100))?;
-    let opacity = widgets::insert_slider(
-        tree,
-        gradient,
-        scales,
-        "Gradient opacity",
-        OPACITY_MAX,
-        OPACITY_MIN,
-        OPACITY_MAX,
-    )?;
-    set_options_item(tree, scales, opacity_readout, OptionsItem::Readout, true)?;
-    set_options_item(tree, scales, opacity, OptionsItem::Slider, true)?;
-
-    let bucket = widgets::insert_container(tree, options, group_style(scales))?;
-    let tolerance_readout =
-        widgets::insert_label(tree, bucket, scales, tolerance_readout_text(32))?;
-    let tolerance = widgets::insert_slider(
-        tree,
-        bucket,
-        scales,
-        "Paint Bucket tolerance",
-        32.0,
-        TOLERANCE_MIN,
-        TOLERANCE_MAX,
-    )?;
-    let contiguous = widgets::insert_checkbox(tree, bucket, scales, "Contiguous")?;
-    widgets::set_checkbox_checked(tree, contiguous, Toggled::True)?;
-    set_options_item(tree, scales, tolerance_readout, OptionsItem::Readout, true)?;
-    set_options_item(tree, scales, tolerance, OptionsItem::Slider, true)?;
-
-    let smudge = widgets::insert_container(tree, options, group_style(scales))?;
-    let strength_readout = widgets::insert_label(tree, smudge, scales, strength_readout_text(50))?;
-    let strength = widgets::insert_slider(
-        tree,
-        smudge,
-        scales,
-        "Strength",
-        50.0,
-        STRENGTH_MIN,
-        STRENGTH_MAX,
-    )?;
-    set_options_item(tree, scales, strength_readout, OptionsItem::Readout, true)?;
-    set_options_item(tree, scales, strength, OptionsItem::Slider, true)?;
-
-    // The Brush, Pencil and Clone Stamp (0.228.0): Opacity, and Flow for the
-    // two that have one.
-    let paint = widgets::insert_container(tree, options, group_style(scales))?;
+) -> Result<(WidgetId, [WidgetId; 4]), WidgetError> {
+    let paint = widgets::insert_container(tree, options, group_style(scales, 2))?;
     let paint_opacity_readout =
         widgets::insert_label(tree, paint, scales, opacity_readout_text(100))?;
     let paint_opacity = widgets::insert_slider(
@@ -306,6 +266,110 @@ pub fn insert_fill_controls(
         set_options_item(tree, scales, id, item, true)?;
     }
 
+    Ok((
+        paint,
+        [
+            paint_opacity_readout,
+            paint_opacity,
+            paint_flow_readout,
+            paint_flow,
+        ],
+    ))
+}
+
+/// Adds both groups as the last children of `options` (hidden).
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `options` doesn't exist.
+pub fn insert_fill_controls(
+    tree: &mut WidgetTree<WidgetKind>,
+    options: WidgetId,
+    scales: &Scales,
+) -> Result<FillControls, WidgetError> {
+    let gradient = widgets::insert_container(tree, options, group_style(scales, 1))?;
+    // The type is one checkbox (a row tall, like every other options-bar
+    // control): a text or icon toggle pair is taller than the bar's row
+    // (a measured text toggle is 45 px, a 32 px icon button 48 px with the
+    // bar's padding against 37), which would make the canvas jump on a
+    // tool switch.
+    let radial = widgets::insert_checkbox(tree, gradient, scales, "Radial")?;
+    let reverse = widgets::insert_checkbox(tree, gradient, scales, "Reverse")?;
+    set_options_item(tree, scales, radial, OptionsItem::Check, true)?;
+    set_options_item(tree, scales, reverse, OptionsItem::Check, true)?;
+    let opacity_readout = widgets::insert_label(tree, gradient, scales, opacity_readout_text(100))?;
+    let opacity = widgets::insert_slider(
+        tree,
+        gradient,
+        scales,
+        "Gradient opacity",
+        OPACITY_MAX,
+        OPACITY_MIN,
+        OPACITY_MAX,
+    )?;
+    set_options_item(tree, scales, opacity_readout, OptionsItem::Readout, true)?;
+    set_options_item(tree, scales, opacity, OptionsItem::Slider, true)?;
+
+    let bucket = widgets::insert_container(tree, options, group_style(scales, 1))?;
+    let tolerance_readout =
+        widgets::insert_label(tree, bucket, scales, tolerance_readout_text(32))?;
+    let tolerance = widgets::insert_slider(
+        tree,
+        bucket,
+        scales,
+        "Paint Bucket tolerance",
+        32.0,
+        TOLERANCE_MIN,
+        TOLERANCE_MAX,
+    )?;
+    let contiguous = widgets::insert_checkbox(tree, bucket, scales, "Contiguous")?;
+    widgets::set_checkbox_checked(tree, contiguous, Toggled::True)?;
+    set_options_item(tree, scales, contiguous, OptionsItem::Check, true)?;
+    set_options_item(tree, scales, tolerance_readout, OptionsItem::Readout, true)?;
+    set_options_item(tree, scales, tolerance, OptionsItem::Slider, true)?;
+
+    let smudge = widgets::insert_container(tree, options, group_style(scales, 1))?;
+    let strength_readout = widgets::insert_label(tree, smudge, scales, strength_readout_text(50))?;
+    let strength = widgets::insert_slider(
+        tree,
+        smudge,
+        scales,
+        "Strength",
+        50.0,
+        STRENGTH_MIN,
+        STRENGTH_MAX,
+    )?;
+    set_options_item(tree, scales, strength_readout, OptionsItem::Readout, true)?;
+    set_options_item(tree, scales, strength, OptionsItem::Slider, true)?;
+
+    let (
+        paint,
+        [
+            paint_opacity_readout,
+            paint_opacity,
+            paint_flow_readout,
+            paint_flow,
+        ],
+    ) = insert_paint_group(tree, options, scales)?;
+
+    reserve_readout_widths(
+        tree,
+        [
+            (opacity_readout, &[&opacity_readout_text(100)]),
+            (tolerance_readout, &[&tolerance_readout_text(u8::MAX)]),
+            // Shared by tools that name the value differently.
+            (
+                strength_readout,
+                &[
+                    &strength_readout_for(Tool::Smudge, 100),
+                    &strength_readout_for(Tool::Dodge, 100),
+                    &strength_readout_for(Tool::Sponge, 100),
+                ],
+            ),
+            (paint_opacity_readout, &[&opacity_readout_text(100)]),
+            (paint_flow_readout, &[&flow_readout_text(100)]),
+        ],
+    )?;
     set_node_hidden(tree, gradient, true)?;
     set_node_hidden(tree, bucket, true)?;
     set_node_hidden(tree, smudge, true)?;

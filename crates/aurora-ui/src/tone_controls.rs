@@ -23,7 +23,9 @@ use taffy::style_helpers::length;
 use taffy::{Display, FlexDirection, Size, Style};
 
 use crate::tool::Tool;
-use crate::tool_controls::{ToolControls, set_item_shown, set_node_hidden};
+use crate::tool_controls::{
+    OptionsItem, ToolControls, set_item_shown, set_node_hidden, set_options_item,
+};
 
 /// The Range group's accessible name.
 pub const TONE_RANGE_LABEL: &str = "Range";
@@ -155,6 +157,7 @@ pub fn insert_tone_controls(
     let mut ranges = [range_group; 3];
     for (slot, range) in ranges.iter_mut().zip(ToneRange::ALL) {
         *slot = widgets::insert_checkbox(tree, range_group, scales, tone_range_label(range))?;
+        set_options_item(tree, scales, *slot, OptionsItem::Check, true)?;
     }
     let [shadows, midtones, highlights] = ranges;
     widgets::set_checkbox_checked(tree, midtones, Toggled::True)?;
@@ -163,6 +166,7 @@ pub fn insert_tone_controls(
     let mut modes = [mode_group; 2];
     for (slot, mode) in modes.iter_mut().zip(SpongeMode::ALL) {
         *slot = widgets::insert_checkbox(tree, mode_group, scales, sponge_mode_label(mode))?;
+        set_options_item(tree, scales, *slot, OptionsItem::Check, true)?;
     }
     let [desaturate, saturate] = modes;
     widgets::set_checkbox_checked(tree, desaturate, Toggled::True)?;
