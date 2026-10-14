@@ -18,7 +18,7 @@
 //!
 //! **Cutting** is the same walk: [`cut_layer`] rewrites exactly the texels
 //! [`extract_layer`] copied, to `texel * (1 - c)` (zero at full coverage),
-//! through a [`StrokeSnapshot`] so the caller records one undo step. Both
+//! through a `StrokeSnapshot` so the caller records one undo step. Both
 //! decide with the one function [`split`], so "what was copied" and "what was
 //! erased" cannot drift apart. A texel with zero alpha (even with colour) is
 //! neither copied nor erased.
