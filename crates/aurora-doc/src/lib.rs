@@ -37,6 +37,8 @@ mod layer;
 // module's are.
 pub mod mask;
 mod path;
+mod path_edit;
+mod path_from_selection;
 #[cfg(test)]
 mod path_tests;
 mod quick_mask;
@@ -72,6 +74,13 @@ pub use path::{
     Anchor, FLATTEN_TOLERANCE, MAX_ANCHORS_PER_SUBPATH, MAX_PATH_ANCHORS_TOTAL,
     MAX_PATH_COORDINATE, MAX_PATHS, MAX_SEGMENTS_PER_CURVE, MAX_SUBPATHS, PATH_NAME_MAX_CHARS,
     Path, PathSet, Subpath, WORK_PATH_NAME, selection_from_path, validate_path_name,
+};
+pub use path_edit::{
+    SegmentHit, insert_anchor, nearest_segment, reversed, split_segment, toggle_corner_smooth,
+};
+pub use path_from_selection::{
+    MAX_TRACE_EDGES, PathFromSelectionError, SIMPLIFY_TOLERANCE, SIMPLIFY_TRIES,
+    path_from_selection,
 };
 pub use quick_mask::{QuickMask, QuickMaskOutcome};
 pub use selection::{
