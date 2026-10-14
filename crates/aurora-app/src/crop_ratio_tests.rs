@@ -847,6 +847,44 @@ fn a_press_outside_the_open_ratio_list_closes_it_and_a_press_inside_keeps_it() {
     ));
 }
 
+/// The routed press (`route_widget_pointer`, what `App` calls) light
+/// dismisses the open ratio list: a press outside the options bar's
+/// controls closes it and is reported as `dismissed`.
+#[test]
+fn the_routed_pointer_press_light_dismisses_the_open_ratio_list() {
+    let (mut workspace, controls) = bar();
+    let scales = crate::test_workspace_scales();
+    let settings = crate::ToolSettings::default();
+    let _ = crate::sync_tool_controls(&mut workspace, Some(controls), Tool::Crop, &settings, None);
+    assert!(
+        aurora_widgets::widgets::set_dropdown_open(&mut workspace.tree, controls.crop.ratio, true)
+            .is_ok()
+    );
+    workspace.tree.compute_layout(1600.0, 900.0);
+    let mut focus = aurora_widgets::FocusManager::default();
+    let mut click = aurora_widgets::ClickTracker::default();
+    let mut gallery = None;
+    let routed = crate::route_widget_pointer(
+        &mut workspace,
+        &mut focus,
+        &mut gallery,
+        None,
+        Some(&controls),
+        &mut click,
+        &scales,
+        false,
+        aurora_widgets::PointerPhase::Down,
+        (1590.0, 890.0),
+        aurora_widgets::shortcut::Modifiers::default(),
+        &mut aurora_widgets::NoTextHit,
+    );
+    assert!(routed.dismissed);
+    assert!(
+        aurora_widgets::widgets::dropdown_state(&workspace.tree, controls.crop.ratio)
+            .is_ok_and(|state| !state.is_open())
+    );
+}
+
 #[test]
 fn the_palette_lists_and_resolves_every_ratio_and_the_orientation_swap() {
     let commands = crate::palette_commands();
