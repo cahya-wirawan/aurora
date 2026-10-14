@@ -50,6 +50,8 @@ use aurora_tile::{
 };
 use half::f16;
 
+use crate::stroke_cover::StrokeCover;
+
 /// The whole-tile dirty rectangle every [`StrokeSnapshot::apply`] write
 /// marks — a snapshot restore always replaces a tile's entire content,
 /// unlike a dab's own partial-coverage dirty rect.
@@ -84,6 +86,11 @@ pub struct StrokeSnapshot {
     /// What this snapshot costs in memory ([`Self::memory_bytes`]),
     /// refreshed whenever a tile's representation changes.
     memory_bytes: u64,
+    /// The soft Brush's accumulated coverage of this stroke (0.230.0,
+    /// `stroke_cover`): lives and dies with the stroke, dropped when the
+    /// snapshot is packed for history, never counted in
+    /// [`Self::memory_bytes`] because it never reaches the undo stack.
+    cover: StrokeCover,
 }
 
 /// One captured tile's content, in one of three representations
@@ -130,7 +137,21 @@ impl StrokeSnapshot {
             tiles: HashMap::new(),
             spill: Vec::new(),
             memory_bytes: SNAPSHOT_OVERHEAD_BYTES,
+            cover: StrokeCover::default(),
         }
+    }
+
+    /// The soft Brush's accumulated stroke coverage (0.230.0), mutable.
+    pub(crate) fn cover_mut(&mut self) -> &mut StrokeCover {
+        &mut self.cover
+    }
+
+    /// How many tiles carry accumulated stroke coverage (0.230.0): at most
+    /// the tiles the stroke's soft dabs reached, 256 KiB of `f32` each,
+    /// freed when the stroke is pushed to history.
+    #[must_use]
+    pub fn stroke_coverage_tiles(&self) -> usize {
+        self.cover.tile_count()
     }
 
     #[must_use]
@@ -486,6 +507,9 @@ impl StrokeSnapshot {
     /// capture hundreds); a tile whose worker did not finish stays raw,
     /// which is larger but still exact.
     fn pack(&mut self) {
+        // The stroke is over: its accumulated coverage (0.230.0) is not
+        // history.
+        self.cover.clear();
         let raws: Vec<(TileId, &[f16])> = self
             .tiles
             .iter()

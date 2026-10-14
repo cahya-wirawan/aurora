@@ -34,9 +34,6 @@ use crate::{
     clone_dab_covered, hard_dab_snap, stamp_dab_amount, stamp_dab_covered,
     stamp_dab_hard_preserving_alpha_covered,
 };
-// Only the Linux-only legacy pin below uses these entry points.
-#[cfg(target_os = "linux")]
-use crate::{stamp_dab, stamp_dab_hard, stamp_dab_preserving_alpha};
 
 pub(crate) type Tx = [f16; CHANNELS];
 
@@ -161,11 +158,14 @@ struct Kind {
 }
 
 /// Sparse texels; absent is transparent black. `began` is the stroke-start
-/// copy the opacity cap reads.
+/// copy the soft Brush recomputes from and the Pencil's cap reads; `cover`
+/// is the soft Brush's accumulated stroke coverage `A` (0.230.0), absent
+/// meaning 0.
 #[derive(Clone, Default)]
 struct Model {
     now: HashMap<(u32, u32), Tx>,
     began: HashMap<(u32, u32), Tx>,
+    cover: HashMap<(u32, u32), f32>,
 }
 
 fn at(map: &HashMap<(u32, u32), Tx>, x: u32, y: u32) -> Tx {
@@ -195,6 +195,7 @@ fn hard_alpha(x: u32, y: u32, center: (f32, f32), radius: f32) -> f32 {
 impl Model {
     fn begin_stroke(&mut self) {
         self.began = self.now.clone();
+        self.cover.clear();
     }
 
     fn dab(
@@ -238,8 +239,36 @@ impl Model {
                 }
                 let cur = at(&self.now, x, y);
                 let s = at(&self.began, x, y);
-                let capped = opacity < 1.0;
                 let f = |t: Tx, i: usize| t[i].to_f32();
+                if !kind.hard {
+                    // The soft Brush (0.230.0): stroke compositing, written
+                    // from the description in `stroke_cover`.
+                    let amount = a * c;
+                    let a_old = self.cover.get(&(x, y)).copied().unwrap_or(0.0);
+                    let mut a_new = a_old + (opacity - a_old) * amount;
+                    if a_new > opacity {
+                        a_new = opacity;
+                    }
+                    if a_new.partial_cmp(&a_old) != Some(std::cmp::Ordering::Greater) {
+                        continue;
+                    }
+                    let fresh: Tx = if kind.lock {
+                        let alpha = f(cur, 3);
+                        if alpha <= 0.0 {
+                            continue;
+                        }
+                        let one = |i: usize| h(f(s, i) * (1.0 - a_new) + colour[i] * alpha * a_new);
+                        [one(0), one(1), one(2), cur[3]]
+                    } else {
+                        let one = |i: usize| h(f(s, i) * (1.0 - a_new) + colour[i] * a_new);
+                        [one(0), one(1), one(2), h(f(s, 3) * (1.0 - a_new) + a_new)]
+                    };
+                    self.cover.insert((x, y), a_new);
+                    self.now.insert((x, y), fresh);
+                    continue;
+                }
+                // The Pencil keeps its own rule.
+                let capped = opacity < 1.0;
                 let fresh: Tx = if kind.lock {
                     let alpha = f(cur, 3);
                     if alpha <= 0.0 {
@@ -257,15 +286,8 @@ impl Model {
                 } else if capped {
                     let painted = [colour[0] * a, colour[1] * a, colour[2] * a, a];
                     let lim = |i: usize| h(f(s, i) + (painted[i] - f(s, i)) * opacity);
-                    let t = [lim(0), lim(1), lim(2), lim(3)];
-                    if !kind.hard && f(t, 3) <= f(cur, 3) {
-                        continue;
-                    }
-                    t
+                    [lim(0), lim(1), lim(2), lim(3)]
                 } else {
-                    if !kind.hard && a <= f(cur, 3) {
-                        continue;
-                    }
                     [h(colour[0] * a), h(colour[1] * a), h(colour[2] * a), h(a)]
                 };
                 let out = if c < 1.0 {
@@ -577,9 +599,12 @@ pub(crate) fn region_hash(store: &mut TileStore) -> u64 {
     hash
 }
 
-/// The legacy entry points on a fixed random sequence; this exact sequence
-/// was hashed with the 0.227.0 code (before this round) to get the constants
-/// below, so Opacity 100 % / Flow 100 % is pinned to what shipped.
+/// The entry points whose behaviour 0.230.0 did **not** change (the
+/// Pencil's four forms and the Clone Stamp) on a fixed random sequence.
+/// This exact sequence was hashed with the 0.229.0 code to get the
+/// constants below, so the Pencil and the Clone Stamp are pinned to what
+/// shipped. (The soft Brush is deliberately not in it: its rule changed in
+/// 0.230.0 and is pinned by the independent model instead.)
 #[cfg(target_os = "linux")]
 fn legacy_hash() -> (u64, u64) {
     let mut rng = Rng(0x1234_5678_9ABC_DEF1);
@@ -593,8 +618,7 @@ fn legacy_hash() -> (u64, u64) {
         let colour = [rng.unit(), rng.unit(), rng.unit()];
         let cover: Option<&dyn Coverage> = if i % 2 == 0 { Some(&Wavy) } else { None };
         let outcome = match rng.below(5) {
-            0 => stamp_dab(&mut s, surface(), center, radius, colour, Some(&mut snap)),
-            1 => stamp_dab_covered(
+            0 => crate::stamp_dab_hard_covered(
                 &mut s,
                 surface(),
                 center,
@@ -603,7 +627,7 @@ fn legacy_hash() -> (u64, u64) {
                 Some(&mut snap),
                 cover,
             ),
-            2 => stamp_dab_preserving_alpha(
+            1 => crate::stamp_dab_hard_preserving_alpha(
                 &mut s,
                 surface(),
                 center,
@@ -611,7 +635,9 @@ fn legacy_hash() -> (u64, u64) {
                 colour,
                 Some(&mut snap),
             ),
-            3 => stamp_dab_hard(&mut s, surface(), center, radius, colour, Some(&mut snap)),
+            2 | 3 => {
+                crate::stamp_dab_hard(&mut s, surface(), center, radius, colour, Some(&mut snap))
+            }
             _ => stamp_dab_hard_preserving_alpha_covered(
                 &mut s,
                 surface(),
@@ -647,20 +673,21 @@ fn legacy_hash() -> (u64, u64) {
     (brush, region_hash(&mut s))
 }
 
-/// The hashes the 0.227.0 code produced for [`legacy_hash`] on Linux. The
-/// falloff uses `powf`, whose last bit differs between platform math
-/// libraries (macOS failed this pin), so the pin is Linux-only; the
-/// platform-independent guard is the differential test below.
+/// The hashes the 0.229.0 code produced for [`legacy_hash`] on Linux. The
+/// Clone Stamp's falloff uses `powf`, whose last bit differs between
+/// platform math libraries (macOS failed such a pin), so the pin is
+/// Linux-only; the platform-independent guard is the differential test
+/// below.
 #[cfg(target_os = "linux")]
-const LEGACY_BRUSH_HASH: u64 = 0x236b_8639_623e_9433;
+const LEGACY_PENCIL_HASH: u64 = 0x7450_e55c_299c_5167;
 #[cfg(target_os = "linux")]
-const LEGACY_CLONE_HASH: u64 = 0xb72b_4bd9_a93c_3dd6;
+const LEGACY_CLONE_HASH: u64 = 0xcb41_d6ac_dc5c_64e6;
 
 #[cfg(target_os = "linux")]
 #[test]
-fn the_legacy_entry_points_are_bit_identical_to_0_227_0() {
-    let (brush, clone) = legacy_hash();
-    assert_eq!(brush, LEGACY_BRUSH_HASH, "Brush/Pencil dabs changed");
+fn the_pencil_and_the_clone_stamp_are_bit_identical_to_0_229_0() {
+    let (pencil, clone) = legacy_hash();
+    assert_eq!(pencil, LEGACY_PENCIL_HASH, "Pencil dabs changed");
     assert_eq!(clone, LEGACY_CLONE_HASH, "Clone Stamp dabs changed");
 }
 
@@ -811,21 +838,44 @@ fn flow_scales_the_dab_alpha() {
 }
 
 #[test]
-fn flow_is_a_ceiling_on_the_soft_brushs_alpha_not_a_build_up() {
-    // The max-alpha rule does not accumulate (documented): a hundred dabs at
-    // flow 50 % leave the centre at one dab's alpha.
+fn flow_builds_up_toward_the_opacity_ceiling() {
+    // 0.230.0: Flow is a per-dab amount and the stroke accumulates it,
+    // `A' = A + (opacity - A) * a`; Opacity is the ceiling.
+    for (opacity, flow) in [(1.0_f32, 0.5_f32), (0.6, 0.5), (1.0, 0.1)] {
+        let (_dir, mut s) = store();
+        let mut snap = StrokeSnapshot::new(surface());
+        let mut a = 0.0_f32;
+        let mut previous = 0.0_f32;
+        for n in 1..=100 {
+            dab_at(
+                &mut s,
+                Some(&mut snap),
+                (100.5, 100.5),
+                20.0,
+                PaintAmount::new(opacity, flow),
+            );
+            a += (opacity - a) * flow;
+            let got = texel(&mut s, 100, 100)[3].to_f32();
+            assert!(
+                (got - a).abs() < 2e-3,
+                "o {opacity} f {flow} dab {n}: {got} vs {a}"
+            );
+            assert!(got >= previous, "it only builds up");
+            previous = got;
+        }
+        assert!(previous <= opacity + 1e-3, "never past the ceiling");
+        if flow >= 0.5 {
+            assert_eq!(texel(&mut s, 100, 100)[3].to_bits(), h(opacity).to_bits());
+        }
+    }
+    // A single dab at flow 50 % is still half an alpha; two are three quarters.
     let (_dir, mut s) = store();
     let mut snap = StrokeSnapshot::new(surface());
-    for _ in 0..100 {
-        dab_at(
-            &mut s,
-            Some(&mut snap),
-            (100.5, 100.5),
-            20.0,
-            PaintAmount::new(1.0, 0.5),
-        );
-    }
+    let half = PaintAmount::new(1.0, 0.5);
+    dab_at(&mut s, Some(&mut snap), (100.5, 100.5), 20.0, half);
     assert_eq!(texel(&mut s, 100, 100)[3].to_bits(), h(0.5).to_bits());
+    dab_at(&mut s, Some(&mut snap), (100.5, 100.5), 20.0, half);
+    assert_eq!(texel(&mut s, 100, 100)[3].to_bits(), h(0.75).to_bits());
 }
 
 #[test]
@@ -908,9 +958,11 @@ fn with_no_snapshot_every_dab_is_its_own_stroke() {
 }
 
 #[test]
-fn a_dab_never_lowers_a_texels_alpha_under_the_cap() {
+fn a_dab_composites_over_existing_paint_and_never_lowers_alpha() {
     let (_dir, mut s) = store();
-    // Existing paint, more opaque than a faint dab would make it.
+    // Existing paint, more opaque than a faint dab would make it: until
+    // 0.230.0 the max-alpha rule left it alone; now the dab is source-over
+    // at its coverage `A = opacity * flow * falloff = 0.5 * 0.3`.
     let existing = px(0.5, 0.25, 0.125, 0.5);
     put(&mut s, 100, 100, existing);
     let mut snap = StrokeSnapshot::new(surface());
@@ -921,7 +973,18 @@ fn a_dab_never_lowers_a_texels_alpha_under_the_cap() {
         20.0,
         PaintAmount::new(0.5, 0.3),
     );
-    assert_eq!(bits(texel(&mut s, 100, 100)), bits(existing));
+    let a = 0.5_f32 * 0.3;
+    let want = |old: f32, colour: f32| h(old * (1.0 - a) + colour * a);
+    assert_eq!(
+        bits(texel(&mut s, 100, 100)),
+        bits([
+            want(0.5, COLOUR[0]),
+            want(0.25, COLOUR[1]),
+            want(0.125, COLOUR[2]),
+            want(0.5, 1.0)
+        ])
+    );
+    assert!(texel(&mut s, 100, 100)[3].to_f32() > 0.5);
 }
 
 #[test]

@@ -828,9 +828,10 @@ fn a_brush_stroke_through_an_ellipse_changes_nothing_outside_it() {
             if c == 0.0 {
                 assert_eq!(a, 0.0, "outside the ellipse ({x}, {y})");
             } else {
-                // Repeated dabs converge towards the full value (the
-                // brush's max-alpha rule, disclosed since 0.211.0), so
-                // only the bounds are exact.
+                // Repeated dabs build up toward the full value (stroke
+                // compositing, 0.230.0: a fractional selection slows the
+                // build-up, it does not cap it), so only the bounds are
+                // exact.
                 assert!((0.0..=1.0).contains(&a), "({x}, {y}): {a}");
                 if a > 0.0 && a < 1.0 {
                     partial += 1;

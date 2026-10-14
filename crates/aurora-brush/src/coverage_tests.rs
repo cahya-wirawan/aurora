@@ -498,8 +498,21 @@ fn lerp_expected(old: [f16; 4], plain: [f16; 4], c: f32) -> [u16; 4] {
     out
 }
 
+/// Whether two texels (as `bits`) agree to within `f16` rounding done twice:
+/// 0.230.0 folds the coverage into the soft Brush's amount, which equals the
+/// lerp of the plain result mathematically but rounds once, not twice.
+fn within_rounding(got: [u16; 4], want: [u16; 4]) -> bool {
+    got.iter()
+        .zip(want)
+        .all(|(&g, w)| (f16::from_bits(g).to_f32() - f16::from_bits(w).to_f32()).abs() <= 2.5e-3)
+}
+
+/// 0.230.0: a fractional selection scales the soft Brush's *amount*
+/// (`a = falloff * flow * coverage`); because the result is linear in the
+/// coverage `A` this equals the lerp of the unselected result and the
+/// original, to rounding.
 #[test]
-fn fractional_coverage_is_an_exact_lerp_of_the_old_and_the_new_texel() {
+fn fractional_coverage_is_the_lerp_of_the_old_and_the_new_texel_to_rounding() {
     for c in [0.5_f32, 0.25, 0.9] {
         let cov = Constant(c);
         for kind in [Kind::Brush, Kind::Preserve] {
@@ -535,10 +548,11 @@ fn fractional_coverage_is_an_exact_lerp_of_the_old_and_the_new_texel() {
             for y in 60..200_u32 {
                 for x in 60..200_u32 {
                     let (o, p) = (texel(&mut original, x, y), texel(&mut plain, x, y));
-                    assert_eq!(
+                    assert!(
+                        within_rounding(bits(texel(&mut masked, x, y)), lerp_expected(o, p, c)),
+                        "c {c} ({x}, {y}): {:?} vs {:?}",
                         bits(texel(&mut masked, x, y)),
-                        lerp_expected(o, p, c),
-                        "c {c} ({x}, {y})"
+                        lerp_expected(o, p, c)
                     );
                     let far = (0..4).any(|i| (o[i].to_f32() - p[i].to_f32()).abs() > 0.05);
                     if bits(o) != bits(p) {
@@ -679,7 +693,10 @@ fn a_ramp_that_is_not_a_rectangle_blends_per_texel() {
             let p = texel(&mut plain, x, y);
             let want = lerp_expected([f16::ZERO; 4], p, c.min(1.0));
             let want = if c <= 0.0 { bits([f16::ZERO; 4]) } else { want };
-            assert_eq!(bits(texel(&mut masked, x, y)), want, "({x}, {y}) c {c}");
+            assert!(
+                within_rounding(bits(texel(&mut masked, x, y)), want),
+                "({x}, {y}) c {c}"
+            );
             if c > 0.0 && c < 1.0 && p[3].to_f32() > 0.0 {
                 seen_partial += 1;
             }

@@ -542,9 +542,6 @@ mod autosave_files;
 mod background_autosave;
 mod background_composite;
 mod background_open;
-mod brush_spacing;
-#[cfg(test)]
-mod brush_spacing_tests;
 mod clone_stamp;
 #[cfg(test)]
 mod clone_stamp_tests;
@@ -12924,7 +12921,6 @@ fn continue_drag(
     tool_settings: &ToolSettings,
     bounds: PanBounds,
 ) -> Vec<(f32, f32)> {
-    let spacing = brush_spacing::spacing_of(drag);
     match drag {
         Drag::Pan { last_screen } => {
             let delta = (
@@ -12981,15 +12977,9 @@ fn continue_drag(
             last_doc, carry, ..
         } => {
             let current_doc = view.to_document(canvas_point);
-            // 0.226.1: the soft Brush alone lays dense, per-event-capped
-            // dabs ([`brush_spacing`]); every other Brush-shaped drag keeps
-            // the old step.
-            let step = brush_spacing::event_step(
-                spacing,
+            let step = aurora_brush::dab_step(
                 tool_settings.dab_radius(DabTool::Brush),
-                *last_doc,
-                current_doc,
-                *carry,
+                aurora_brush::DEFAULT_SPACING,
             );
             let (dabs, new_carry) =
                 aurora_brush::advance_segment(*last_doc, current_doc, *carry, step);
@@ -71301,10 +71291,8 @@ mod tests {
             warned: std::collections::HashSet::new(),
         };
         // radius 24, DEFAULT_SPACING 0.25 -> step 6; a 12-unit segment
-        // lands dabs at 6 and 12. (0.226.1: this hand-built drag has no
-        // stroke snapshot, i.e. it is the Quick Mask shape, which keeps the
-        // old spacing; the layer Brush's dense step is pinned in
-        // `brush_spacing_tests`.) The segment's own start, 0, is not
+        // lands dabs at 6 and 12. (Every dab tool, the soft Brush included
+        // since 0.230.0, uses this spacing.) The segment's own start, 0, is not
         // re-emitted -- it was already painted by whatever started the
         // drag or the previous event.
         let dabs = continue_drag(
