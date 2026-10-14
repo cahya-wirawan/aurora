@@ -26769,6 +26769,8 @@ const ERASER_RADIUS: f32 = 24.0;
 /// site. **Not document state**: changing a radius records no undo step
 /// and is not saved in a `.aur` file or the workspace layout — it resets
 /// to [`BRUSH_RADIUS`]/[`ERASER_RADIUS`] on every launch.
+// Independent on/off options of different tools, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 struct ToolSettings {
     brush_radius: f32,

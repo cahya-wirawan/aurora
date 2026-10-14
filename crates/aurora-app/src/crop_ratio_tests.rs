@@ -10,6 +10,7 @@
     clippy::float_cmp,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
     clippy::cast_sign_loss
 )]
 
@@ -506,9 +507,8 @@ fn changing_the_ratio_refits_the_rectangle_about_its_centre_keeping_the_area() {
     let before = 346_i64 * 346;
     let after = i64::from(got.width) * i64::from(got.height);
     assert!((after - before).abs() * 100 < before * 2, "{got:?}");
-    assert_eq!(
+    assert!(
         (got.width * 9).abs_diff(got.height * 16) * 2 <= 16,
-        true,
         "{got:?}"
     );
     // The centre stays within a pixel.
