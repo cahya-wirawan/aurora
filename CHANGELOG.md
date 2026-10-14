@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.234.0] - 2026-10-14
+
+### Changed
+
+- Paths, round 2: Fill Path, Stroke Path, Make Work Path from Selection, Pen editing
+
 ## [0.233.0] - 2026-10-14
 
 ### Changed
