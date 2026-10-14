@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.233.0] - 2026-10-14
+
+### Changed
+
+- WIP: path model
+
 ## [0.232.0] - 2026-10-14
 
 ### Changed

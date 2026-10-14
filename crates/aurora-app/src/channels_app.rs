@@ -537,7 +537,8 @@ mod tests {
         let old: Vec<_> = saved
             .into_iter()
             .map(|mut slot| {
-                slot.panels.retain(|key| key != "channels");
+                slot.panels
+                    .retain(|key| key != "channels" && key != "paths");
                 slot
             })
             .collect();

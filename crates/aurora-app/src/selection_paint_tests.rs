@@ -1005,7 +1005,7 @@ fn a_history_panel_jump_applies_the_selection_of_the_row() {
 
 #[test]
 fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
-    assert_eq!(Tool::ALL.len(), 22);
+    assert_eq!(Tool::ALL.len(), 23);
     let table = crate::default_shortcuts_for(false);
     let chord = |shift| {
         KeyChord::new(
@@ -1063,7 +1063,7 @@ fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
     );
     // The tools panel has one button per tool, the new one wearing its
     // own icon.
-    assert_eq!(workspace.tools.buttons.len(), 22);
+    assert_eq!(workspace.tools.buttons.len(), 23);
     assert_eq!(
         aurora_ui::tool_icon(Tool::EllipticalMarquee),
         aurora_widgets::icons::IconKind::EllipseMarquee
@@ -3349,6 +3349,7 @@ fn the_fills_and_selection_tools_are_refused_and_the_rest_work() {
                 | Tool::Burn
                 | Tool::Sponge
                 | Tool::Crop
+                | Tool::Pen
         );
         assert_eq!(
             quick_mask::tool_refusal(tool),

@@ -116,13 +116,15 @@ pub enum Tool {
     /// Crops the document to a rectangle (0.226.0): non-destructive, the
     /// layers keep their pixels outside the new canvas.
     Crop,
+    /// Draws Bezier paths (0.233.0): real, in `aurora-app`'s `path_pen`.
+    Pen,
 }
 
 impl Tool {
     /// Every tool this enum has today, in the fixed order they're
     /// offered to the user (matches PLAN.md's own bullets: Move, Marquee
     /// Select, Zoom, Pan, Eyedropper, then Brush, Eraser, and the 0.209.0 fills Gradient and Paint Bucket).
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Move,
         Self::MarqueeSelect,
         Self::EllipticalMarquee,
@@ -143,6 +145,7 @@ impl Tool {
         Self::Dodge,
         Self::Burn,
         Self::Sponge,
+        Self::Pen,
         Self::Gradient,
         Self::PaintBucket,
     ];
@@ -188,6 +191,7 @@ impl Tool {
             Self::Burn => "Burn",
             Self::Sponge => "Sponge",
             Self::Crop => "Crop",
+            Self::Pen => "Pen",
         }
     }
 
@@ -211,7 +215,7 @@ impl Tool {
             Self::Smudge | Self::Blur => 'R',
             Self::Gradient | Self::PaintBucket => 'G',
             Self::Dodge | Self::Burn => 'O',
-            Self::Sponge => 'P',
+            Self::Sponge | Self::Pen => 'P',
             Self::Crop => 'C',
         }
     }
@@ -288,11 +292,11 @@ mod tests {
 
     #[test]
     fn all_lists_every_variant_once() {
-        assert_eq!(Tool::ALL.len(), 22);
+        assert_eq!(Tool::ALL.len(), 23);
         let mut seen = Tool::ALL.to_vec();
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
-        assert_eq!(seen.len(), 22, "ALL must not repeat a variant");
+        assert_eq!(seen.len(), 23, "ALL must not repeat a variant");
     }
 
     #[test]
@@ -306,11 +310,11 @@ mod tests {
         chords.sort_unstable();
         chords.dedup();
         assert_eq!(chords.len(), Tool::ALL.len());
-        // Only the grouped G, M, L, B, R, S and O keys share a letter, and only by Shift.
+        // Only the grouped G, M, L, B, R, S, O and P keys share a letter, and only by Shift.
         let mut letters = keys;
         letters.sort_unstable();
         letters.dedup();
-        assert_eq!(letters.len(), Tool::ALL.len() - 7);
+        assert_eq!(letters.len(), Tool::ALL.len() - 8);
         assert_eq!(Tool::Crop.shortcut_text(), "C");
         assert_eq!(Tool::Lasso.shortcut_text(), "L");
         assert_eq!(Tool::PolygonalLasso.shortcut_text(), "Shift+L");
@@ -328,6 +332,7 @@ mod tests {
         assert_eq!(Tool::Dodge.shortcut_text(), "O");
         assert_eq!(Tool::Burn.shortcut_text(), "Shift+O");
         assert_eq!(Tool::Sponge.shortcut_text(), "Shift+P");
+        assert_eq!(Tool::Pen.shortcut_text(), "P");
     }
 
     #[test]

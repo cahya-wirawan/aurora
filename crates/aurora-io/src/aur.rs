@@ -1924,6 +1924,13 @@ impl DocumentEntries {
             zip.start_file(crate::aur_selection::SELECTION_ENTRY, deflated)?;
             zip.write_all(&bytes)?;
         }
+        // 0.233.0: the paths ride in the selection set.
+        if let Some(set) = &self.selection
+            && let Some(bytes) = crate::aur_paths::encode_paths(set.paths())?
+        {
+            zip.start_file(crate::aur_paths::PATHS_ENTRY, deflated)?;
+            zip.write_all(&bytes)?;
+        }
         Ok(())
     }
 }
@@ -2344,13 +2351,26 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     let import_losses = read_import_losses(&mut zip);
     // After the manifest and journal are known good, before any tile is
     // written: a newer-version refusal then commits nothing.
-    let (selection, selection_dropped) = match crate::aur_selection::read_selection(&mut zip)? {
-        crate::aur_selection::SelectionRead::Absent => (aurora_doc::SelectionSet::new(), None),
-        crate::aur_selection::SelectionRead::Restored(set) => (set, None),
-        crate::aur_selection::SelectionRead::Dropped(why) => {
-            (aurora_doc::SelectionSet::new(), Some(why))
+    let (mut selection, mut selection_dropped) =
+        match crate::aur_selection::read_selection(&mut zip)? {
+            crate::aur_selection::SelectionRead::Absent => (aurora_doc::SelectionSet::new(), None),
+            crate::aur_selection::SelectionRead::Restored(set) => (set, None),
+            crate::aur_selection::SelectionRead::Dropped(why) => {
+                (aurora_doc::SelectionSet::new(), Some(why))
+            }
+        };
+    // 0.233.0: the paths (a newer version refuses here too); a dropped
+    // entry adds its reason to the selection's.
+    match crate::aur_paths::read_paths(&mut zip)? {
+        crate::aur_paths::PathsRead::Absent => {}
+        crate::aur_paths::PathsRead::Restored(paths) => selection.set_paths(paths),
+        crate::aur_paths::PathsRead::Dropped(why) => {
+            selection_dropped = Some(match selection_dropped {
+                Some(first) => format!("{first}; {why}"),
+                None => why,
+            });
         }
-    };
+    }
 
     // Every tile this scan commits is recorded, and undone if the scan
     // does not finish -- see `read_persisted_tiles` for why a partial

@@ -1216,7 +1216,8 @@ mod tests {
                     vec![
                         DockPanel::Properties,
                         DockPanel::History,
-                        DockPanel::Channels
+                        DockPanel::Channels,
+                        DockPanel::Paths
                     ],
                     0
                 ),
@@ -1272,13 +1273,14 @@ mod tests {
                     DockPanel::Properties,
                     DockPanel::History,
                     DockPanel::Channels,
+                    DockPanel::Paths,
                     DockPanel::Layers
                 ],
-                3
+                4
             )]
         );
         let group = crate::workspace::test_group(&ws);
-        assert_eq!(crate::panel_group_shown(&ws.tree, &group), Some(3));
+        assert_eq!(crate::panel_group_shown(&ws.tree, &group), Some(4));
         assert!(ws.tree.contains(layers_row), "the panel moved whole");
         assert_eq!(
             ws.tree
@@ -1304,9 +1306,10 @@ mod tests {
                     vec![
                         DockPanel::Properties,
                         DockPanel::Channels,
+                        DockPanel::Paths,
                         DockPanel::Layers
                     ],
-                    2
+                    3
                 )
             ]
         );
@@ -1334,7 +1337,10 @@ mod tests {
             shape(&ws),
             vec![
                 (vec![DockPanel::History], 0),
-                (vec![DockPanel::Properties, DockPanel::Channels], 1),
+                (
+                    vec![DockPanel::Properties, DockPanel::Channels, DockPanel::Paths],
+                    2
+                ),
                 (vec![DockPanel::Layers], 0)
             ]
         );
@@ -1347,13 +1353,23 @@ mod tests {
         );
         assert_eq!(out.target(), Some(DropTarget::Gap(3)));
         assert!(finish(&mut ws, &mut focus, out));
+        let paths_tab = centre(bounds(&ws, tab_of(&ws, DockPanel::Paths)));
+        let bottom = near_bottom(bounds(&ws, ws.rail));
+        let out = drag(
+            &mut ws,
+            paths_tab,
+            &[(paths_tab.0, paths_tab.1 + 30.0), bottom],
+        );
+        assert_eq!(out.target(), Some(DropTarget::Gap(4)));
+        assert!(finish(&mut ws, &mut focus, out));
         assert_eq!(
             shape(&ws),
             vec![
                 (vec![DockPanel::History], 0),
                 (vec![DockPanel::Properties], 0),
                 (vec![DockPanel::Layers], 0),
-                (vec![DockPanel::Channels], 0)
+                (vec![DockPanel::Channels], 0),
+                (vec![DockPanel::Paths], 0)
             ]
         );
         assert_eq!(ws.groups().count(), 0, "no group is left");
@@ -1368,7 +1384,8 @@ mod tests {
                 ws.history.root,
                 ws.properties.root,
                 ws.layers.root,
-                ws.channels.root
+                ws.channels.root,
+                ws.paths.root
             ]
         );
     }
@@ -1543,7 +1560,10 @@ mod tests {
             vec![
                 (vec![DockPanel::Layers], 0),
                 (vec![DockPanel::Properties], 0),
-                (vec![DockPanel::History, DockPanel::Channels], 0)
+                (
+                    vec![DockPanel::History, DockPanel::Channels, DockPanel::Paths],
+                    0
+                )
             ]
         );
         assert_eq!(focus.focused(), Some(ws.properties.root));
@@ -1558,7 +1578,10 @@ mod tests {
             shape(&ws),
             vec![
                 (vec![DockPanel::Properties, DockPanel::Layers], 1),
-                (vec![DockPanel::History, DockPanel::Channels], 0)
+                (
+                    vec![DockPanel::History, DockPanel::Channels, DockPanel::Paths],
+                    0
+                )
             ]
         );
         let layers_tab = tab_of(&ws, DockPanel::Layers);
@@ -1661,6 +1684,7 @@ mod tests {
             DockPanel::Properties,
             DockPanel::History,
             DockPanel::Channels,
+            DockPanel::Paths,
             DockPanel::Layers,
         ]
         .into_iter()
@@ -1832,7 +1856,8 @@ mod tests {
                 vec![
                     DockPanel::Properties,
                     DockPanel::History,
-                    DockPanel::Channels
+                    DockPanel::Channels,
+                    DockPanel::Paths
                 ],
                 0
             )]
@@ -1927,7 +1952,8 @@ mod tests {
                     vec![
                         DockPanel::Properties,
                         DockPanel::History,
-                        DockPanel::Channels
+                        DockPanel::Channels,
+                        DockPanel::Paths
                     ],
                     0
                 ),
@@ -1983,7 +2009,7 @@ mod tests {
 
         // Layers onto the floating group's tab strip.
         let layers = offset(bounds(&ws, ws.layers.header), 10.0, 5.0);
-        let Some(bar) = ws.groups().next().map(|group| group.bar) else {
+        let Some(bar) = ws.group_of(ws.history).map(|group| group.bar) else {
             unreachable!("a floating group");
         };
         let strip = centre(bounds(&ws, bar));
@@ -2002,8 +2028,8 @@ mod tests {
         );
         assert_eq!(
             shape(&ws),
-            vec![(vec![DockPanel::Channels], 0)],
-            "only Channels is left in the rail"
+            vec![(vec![DockPanel::Channels, DockPanel::Paths], 0)],
+            "only Channels and Paths are left in the rail"
         );
         every_panel_once(&ws);
 
@@ -2043,7 +2069,7 @@ mod tests {
         assert_eq!(
             shape(&ws),
             vec![
-                (vec![DockPanel::Channels], 0),
+                (vec![DockPanel::Channels, DockPanel::Paths], 0),
                 (vec![DockPanel::Properties], 0)
             ]
         );
@@ -2053,7 +2079,7 @@ mod tests {
         );
         // The last-but-one tab torn off over the canvas: two lone floats,
         // the emptied floating group gone.
-        let old_group = ws.groups().next().map(|group| group.root);
+        let old_group = ws.group_of(ws.history).map(|group| group.root);
         let history_tab = centre(bounds(&ws, tab_of(&ws, DockPanel::History)));
         assert!(drop_at(
             &mut ws,
@@ -2068,7 +2094,7 @@ mod tests {
             floating_shape(&ws),
             vec![(vec![DockPanel::Layers], 0), (vec![DockPanel::History], 0)]
         );
-        assert_eq!(ws.groups().count(), 0);
+        assert_eq!(ws.groups().count(), 1, "only the rail group is left");
         assert!(old_group.is_some_and(|root| !ws.tree.contains(root)));
         every_panel_once(&ws);
     }

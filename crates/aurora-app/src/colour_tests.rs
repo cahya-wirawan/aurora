@@ -209,10 +209,13 @@ fn x_and_d_are_bound_and_collide_with_no_tool_letter() {
                 Tool::Blur => Tool::Smudge,
                 Tool::Sharpen => Tool::CloneStamp,
                 // 0.224.0: bare O is the Dodge; the Sponge's Shift+P has no
-                // bare-letter tool.
+                // bare-letter tool (0.233.0: bare P is the Pen).
                 Tool::Burn => Tool::Dodge,
                 Tool::Sponge => {
-                    assert_eq!(shortcut_command(key), None);
+                    assert_eq!(
+                        shortcut_command(key),
+                        Some(AppCommand::SelectTool(Tool::Pen))
+                    );
                     continue;
                 }
                 _ => Tool::Gradient,

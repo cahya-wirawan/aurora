@@ -33,8 +33,11 @@ fn the_tools_are_wired_into_the_shortcuts_the_palette_and_the_tools_panel() {
             table.resolve(chord(shift(), 'p')),
             Some(&AppCommand::SelectTool(Tool::Sponge))
         );
-        // The bare P stays free, and the neighbours keep their tools.
-        assert_eq!(table.resolve(chord(Modifiers::none(), 'p')), None);
+        // Bare P is the Pen (0.233.0), and the neighbours keep their tools.
+        assert_eq!(
+            table.resolve(chord(Modifiers::none(), 'p')),
+            Some(&AppCommand::SelectTool(Tool::Pen))
+        );
         assert_eq!(
             table.resolve(chord(shift(), 'r')),
             Some(&AppCommand::SelectTool(Tool::Blur))

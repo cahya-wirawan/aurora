@@ -163,6 +163,11 @@ pub(crate) fn selection_loss_line(selection: &aurora_doc::SelectionSet) -> Optio
         .then(|| "Saved selections are not saved in a Photoshop file.".to_owned())
 }
 
+/// The report line for paths (0.233.0): a PSD does not carry them.
+pub(crate) fn paths_loss_line(selection: &aurora_doc::SelectionSet) -> Option<String> {
+    (!selection.paths().is_empty()).then(|| "Paths are not saved in a Photoshop file.".to_owned())
+}
+
 /// Records a PSD save on the document: a lossless one is a real save
 /// (clean, `.psd` path and name, through `document_close::after_save`);
 /// one with changes — Save Anyway included — leaves it untouched.

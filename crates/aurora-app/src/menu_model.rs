@@ -135,16 +135,19 @@ fn static_rows(title: &str) -> Vec<Row> {
             Cmd(crate::COMMAND_FOCUS_PROPERTIES, "Focus Properties Panel"),
             Cmd(crate::COMMAND_FOCUS_HISTORY, "Focus History Panel"),
             Cmd(crate::COMMAND_FOCUS_CHANNELS, "Focus Channels Panel"),
+            Cmd(crate::COMMAND_FOCUS_PATHS, "Focus Paths Panel"),
             Sep,
             Cmd(crate::COMMAND_TOGGLE_LAYERS, "Toggle Layers Panel"),
             Cmd(crate::COMMAND_TOGGLE_PROPERTIES, "Toggle Properties Panel"),
             Cmd(crate::COMMAND_TOGGLE_HISTORY, "Toggle History Panel"),
             Cmd(crate::COMMAND_TOGGLE_CHANNELS, "Toggle Channels Panel"),
+            Cmd(crate::COMMAND_TOGGLE_PATHS, "Toggle Paths Panel"),
             Sep,
             Cmd(crate::COMMAND_CLOSE_LAYERS, "Close Layers Panel"),
             Cmd(crate::COMMAND_CLOSE_PROPERTIES, "Close Properties Panel"),
             Cmd(crate::COMMAND_CLOSE_HISTORY, "Close History Panel"),
             Cmd(crate::COMMAND_CLOSE_CHANNELS, "Close Channels Panel"),
+            Cmd(crate::COMMAND_CLOSE_PATHS, "Close Paths Panel"),
             Sep,
             Cmd(
                 crate::COMMAND_TOGGLE_PANELS,
@@ -210,6 +213,12 @@ fn select_entries(context: &MenuContext) -> Vec<Entry> {
         crate::crop::COMMAND_CROP_TO_SELECTION,
         crate::crop::COMMAND_TITLE,
     ));
+    entries.push(Entry::Separator);
+    entries.extend(
+        crate::paths_app::COMMANDS
+            .iter()
+            .map(|(id, title)| item(id, title)),
+    );
     entries.push(Entry::Separator);
     entries.push(item(
         crate::selection_store::COMMAND_SAVE,
@@ -288,7 +297,8 @@ pub(crate) fn enabled(id: &str, context: &MenuContext) -> bool {
         crate::COMMAND_SELECT_ALL
         | crate::COMMAND_SELECT_DESELECT
         | crate::COMMAND_SELECT_INVERSE
-        | crate::crop::COMMAND_CROP_TO_SELECTION => !context.quick_mask,
+        | crate::crop::COMMAND_CROP_TO_SELECTION
+        | crate::paths_app::COMMAND_MAKE_SELECTION => !context.quick_mask,
         _ if crate::selection_refine::RefineKind::for_command(id).is_some() => !context.quick_mask,
         _ if matches!(
             crate::selection_store::command_for(id),
@@ -401,6 +411,7 @@ pub(crate) const NATIVE_MENU_COMMANDS: &[&str] = &[
     crate::COMMAND_SELECT_INVERSE,
     crate::quick_mask::COMMAND_ID,
     crate::crop::COMMAND_CROP_TO_SELECTION,
+    crate::paths_app::COMMAND_MAKE_SELECTION,
     crate::selection_refine::RefineKind::Feather.command_id(),
     crate::selection_refine::RefineKind::Expand.command_id(),
     crate::selection_refine::RefineKind::Contract.command_id(),
@@ -418,14 +429,17 @@ pub(crate) const NATIVE_MENU_COMMANDS: &[&str] = &[
     crate::COMMAND_FOCUS_PROPERTIES,
     crate::COMMAND_FOCUS_HISTORY,
     crate::COMMAND_FOCUS_CHANNELS,
+    crate::COMMAND_FOCUS_PATHS,
     crate::COMMAND_TOGGLE_LAYERS,
     crate::COMMAND_TOGGLE_PROPERTIES,
     crate::COMMAND_TOGGLE_HISTORY,
     crate::COMMAND_TOGGLE_CHANNELS,
+    crate::COMMAND_TOGGLE_PATHS,
     crate::COMMAND_CLOSE_LAYERS,
     crate::COMMAND_CLOSE_PROPERTIES,
     crate::COMMAND_CLOSE_HISTORY,
     crate::COMMAND_CLOSE_CHANNELS,
+    crate::COMMAND_CLOSE_PATHS,
     crate::COMMAND_TOGGLE_WIDGET_GALLERY,
     crate::COMMAND_TOGGLE_PANELS,
     crate::COMMAND_APP_QUIT,

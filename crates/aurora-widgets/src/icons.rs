@@ -145,11 +145,13 @@ pub enum IconKind {
     Sponge,
     /// Two overlapping corner brackets: the Crop tool (0.226.0).
     Crop,
+    /// A pen nib: the Pen tool (0.233.0).
+    Pen,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 42] = [
+    pub const ALL: [IconKind; 43] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -192,6 +194,7 @@ impl IconKind {
         IconKind::Burn,
         IconKind::Sponge,
         IconKind::Crop,
+        IconKind::Pen,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -241,6 +244,7 @@ impl IconKind {
             IconKind::Burn => "Burn",
             IconKind::Sponge => "Sponge",
             IconKind::Crop => "Crop",
+            IconKind::Pen => "Pen",
         }
     }
 }
@@ -812,6 +816,24 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
             stroke_part().m(4.5, 1.5).l(4.5, 11.5).l(14.5, 11.5),
             stroke_part().m(11.5, 14.5).l(11.5, 4.5).l(1.5, 4.5),
         ],
+        IconKind::Pen => vec![
+            // A nib: a pointed shield with its slit, and the vent hole.
+            stroke_part()
+                .m(8.0, 1.5)
+                .l(12.5, 6.5)
+                .l(10.5, 12.0)
+                .l(8.0, 14.5)
+                .l(5.5, 12.0)
+                .l(3.5, 6.5)
+                .closed(),
+            stroke_part().m(8.0, 8.0).l(8.0, 14.5),
+            fill_part()
+                .m(8.0, 5.0)
+                .l(9.0, 6.5)
+                .l(8.0, 8.0)
+                .l(7.0, 6.5)
+                .closed(),
+        ],
         IconKind::PaintBucket => vec![
             // A tilted bucket (a diamond), the paint line across it, and
             // the drop pouring from its corner.
@@ -959,7 +981,7 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 42);
+        assert_eq!(IconKind::ALL.len(), 43);
         for kind in [IconKind::SwapArrows, IconKind::DefaultColours] {
             assert!(IconKind::ALL.contains(&kind));
             assert!(!icon_parts(kind).is_empty(), "{kind:?}");
