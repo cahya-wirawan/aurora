@@ -431,3 +431,26 @@ fn live_edits_through_subpaths_mut_are_caught_by_validate() {
     }
     assert!(set.subpaths_mut("missing").is_none());
 }
+
+#[test]
+fn three_subpaths_leave_nothing_between_them() {
+    // The chaining detour must return to the hub after every subpath, or a
+    // stray edge joins the second and third squares.
+    let mut p = square("three", 2.0, 2.0, 6.0, true);
+    p.subpaths
+        .extend(square("three", 20.0, 2.0, 6.0, true).subpaths);
+    p.subpaths
+        .extend(square("three", 11.0, 20.0, 6.0, true).subpaths);
+    let size = (40, 40);
+    let Some(mask) = mask_of(&p, size) else {
+        unreachable!("selects");
+    };
+    let total: f64 = mask.data().iter().map(|&v| f64::from(v) / 255.0).sum();
+    assert!((total - 108.0).abs() < 1.0e-6, "area {total}");
+    for (x, y) in [(5, 5), (22, 5), (13, 22)] {
+        assert_eq!(cov8(&mask, x, y), 255);
+    }
+    for (x, y) in [(14, 5), (14, 12), (5, 14), (25, 14), (14, 30)] {
+        assert_eq!(cov8(&mask, x, y), 0, "({x}, {y})");
+    }
+}
