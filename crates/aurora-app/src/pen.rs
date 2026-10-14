@@ -32,6 +32,10 @@ pub(crate) const CLOSE_PATH_LABEL: &str = "Close Path";
 pub(crate) const DELETE_ANCHOR_LABEL: &str = "Delete Anchor";
 pub(crate) const CANCEL_SUBPATH_LABEL: &str = "Cancel Subpath";
 pub(crate) const REMOVE_POINT_LABEL: &str = "Remove Point";
+/// A click on a segment inserts an anchor there (0.234.0).
+pub(crate) const INSERT_POINT_LABEL: &str = "Add Point";
+/// Alt-click on an anchor toggles corner and smooth (0.234.0).
+pub(crate) const CONVERT_POINT_LABEL: &str = "Convert Point";
 
 /// A completed gesture: what to record as one undo step.
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +105,10 @@ pub(crate) struct PenState {
     before: Option<(PathSet, &'static str)>,
     /// The document the state belongs to.
     doc: Option<DocumentId>,
+    /// `Enter` ended the last subpath: the next click starts a new one
+    /// instead of continuing it (0.234.0). Cleared by a new anchor, an
+    /// undo/redo and a change of active path.
+    ended: bool,
 }
 
 /// The notice for a path set that reached the point limit.
@@ -165,6 +173,7 @@ impl PenState {
     pub(crate) fn set_active(&mut self, name: Option<String>) {
         if self.active != name {
             self.reset_editing();
+            self.ended = false;
         }
         self.active = name;
     }
@@ -196,6 +205,7 @@ impl PenState {
     /// active path stays if it still exists, else nothing is active.
     pub(crate) fn paths_replaced(&mut self, paths: &PathSet) {
         self.reset_editing();
+        self.ended = false;
         if self
             .active
             .as_deref()
@@ -243,11 +253,28 @@ impl PenState {
     /// `close_radius` the close tolerance in document px, `alt` whether Alt
     /// is held.
     #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     pub(crate) fn press(
         &mut self,
         paths: &mut PathSet,
         point: (f32, f32),
         hit: Option<PathPart>,
+        close_radius: f32,
+        alt: bool,
+    ) -> PenOutcome {
+        self.press_at(paths, point, hit, None, close_radius, alt)
+    }
+
+    /// [`Self::press`] with `segment`, the segment of the active path under
+    /// the pointer (not an anchor): a press on it, with no subpath in
+    /// progress, inserts an anchor there.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn press_at(
+        &mut self,
+        paths: &mut PathSet,
+        point: (f32, f32),
+        hit: Option<PathPart>,
+        segment: Option<aurora_doc::SegmentHit>,
         close_radius: f32,
         alt: bool,
     ) -> PenOutcome {
@@ -310,6 +337,16 @@ impl PenState {
             let Some(name) = self.active.clone() else {
                 return out;
             };
+            if alt {
+                // Alt-click converts the anchor: corner <-> smooth.
+                self.begin(paths, CONVERT_POINT_LABEL);
+                if let Some(s) = sub_mut(paths, &name).and_then(|subs| subs.get_mut(r.subpath)) {
+                    aurora_doc::toggle_corner_smooth(s, r.anchor);
+                }
+                self.selected = Some(r);
+                out.step = self.finish(paths);
+                return out;
+            }
             if let Some(a) = sub_mut(paths, &name).and_then(|subs| anchor_mut(subs, r).map(|a| *a))
             {
                 self.begin(paths, MOVE_ANCHOR_LABEL);
@@ -326,6 +363,24 @@ impl PenState {
             out.refused = Some(POINT_LIMIT_NOTICE);
             return out;
         }
+        // A press on a segment of the active path splits it.
+        if let (Some(hit), None, None, Some(name)) =
+            (segment, hit, self.drawing, self.active.clone())
+        {
+            self.begin(paths, INSERT_POINT_LABEL);
+            let inserted = sub_mut(paths, &name)
+                .and_then(|subs| aurora_doc::insert_anchor(subs, &hit).map(|at| (subs, at)))
+                .map(|(_, at)| at);
+            if let Some(at) = inserted {
+                self.selected = Some(AnchorRef {
+                    subpath: hit.subpath,
+                    anchor: at,
+                });
+                out.step = self.finish(paths);
+                return out;
+            }
+            self.before = None;
+        }
         if let Err(why) = self.ensure_active_for_add(paths) {
             out.refused = Some(why);
             return out;
@@ -338,7 +393,17 @@ impl PenState {
         let Some(subs) = sub_mut(paths, &name) else {
             return out;
         };
-        let index = if let Some(i) = drawing.filter(|&i| subs.get(i).is_some_and(|s| !s.closed)) {
+        // The subpath in progress, else (unless Enter ended it) the path's
+        // last subpath when it is still open: after an undo or a change of
+        // path the next click carries on drawing it.
+        let resume = (!self.ended)
+            .then(|| subs.len().checked_sub(1))
+            .flatten()
+            .filter(|&i| subs.get(i).is_some_and(|s| !s.closed));
+        let index = if let Some(i) = drawing
+            .filter(|&i| subs.get(i).is_some_and(|s| !s.closed))
+            .or(resume)
+        {
             i
         } else {
             if subs.len() >= MAX_SUBPATHS {
@@ -363,6 +428,7 @@ impl PenState {
             anchor: open.anchors.len() - 1,
         };
         self.drawing = Some(index);
+        self.ended = false;
         self.selected = Some(anchor);
         self.gesture = Some(Gesture::NewAnchor(anchor));
         out
@@ -456,7 +522,9 @@ impl PenState {
     /// `Enter`: ends the open subpath, so the next click starts a new one.
     /// No document change, no step.
     pub(crate) fn end_subpath(&mut self) -> bool {
-        self.drawing.take().is_some()
+        let was = self.drawing.take().is_some();
+        self.ended |= was;
+        was
     }
 
     /// `Escape`: removes the subpath in progress (if any), as one step.
@@ -513,8 +581,17 @@ impl PenState {
 
     /// `Delete`: removes the selected anchor.
     pub(crate) fn delete_selected(&mut self, paths: &mut PathSet) -> PenOutcome {
+        match self.selected {
+            Some(r) => self.delete_anchor(paths, r),
+            None => PenOutcome::default(),
+        }
+    }
+
+    /// `Delete` with no anchor selected: removes the anchor under the
+    /// pointer (`hovered`), as one step.
+    pub(crate) fn delete_anchor(&mut self, paths: &mut PathSet, r: AnchorRef) -> PenOutcome {
         let mut out = PenOutcome::default();
-        let (Some(r), Some(name)) = (self.selected, self.active.clone()) else {
+        let Some(name) = self.active.clone() else {
             return out;
         };
         out.redraw = true;

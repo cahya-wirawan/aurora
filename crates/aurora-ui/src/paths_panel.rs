@@ -160,6 +160,7 @@ impl PathsToolbar {
 /// What the toolbar needs to know to enable its buttons, beyond which path
 /// is selected (the caller keeps it current through [`sync_paths_panel`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PathsFacts {
     /// The selected path has no anchor (Make Selection is then disabled).
     pub selected_empty: bool,
@@ -565,12 +566,7 @@ pub fn select_path_row(
         set_tree_item_selected(tree, id, wanted.as_deref() == Some(row_name.as_str()))?;
     }
     state.selected = wanted;
-    sync_paths_toolbar(
-        tree,
-        &state.toolbar,
-        state.selected.is_some(),
-        state.facts,
-    )?;
+    sync_paths_toolbar(tree, &state.toolbar, state.selected.is_some(), state.facts)?;
     Ok(())
 }
 

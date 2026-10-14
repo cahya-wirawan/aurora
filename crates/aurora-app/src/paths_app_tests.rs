@@ -265,10 +265,10 @@ fn the_paths_panel_follows_the_document() {
     // Selecting a path highlights it; an empty one disables Make Selection.
     sync_paths(&mut ws, &s, &doc, Some("One"));
     assert_eq!(ws.paths_state.selected.as_deref(), Some("One"));
-    assert!(ws.paths_state.selected_empty);
+    assert!(ws.paths_state.facts.selected_empty);
     ok(doc.selection.paths_mut().set_subpaths("One", triangle()));
     sync_paths(&mut ws, &s, &doc, Some("One"));
-    assert!(!ws.paths_state.selected_empty);
+    assert!(!ws.paths_state.facts.selected_empty);
     // A name that no longer exists selects nothing.
     sync_paths(&mut ws, &s, &doc, Some("Gone"));
     assert_eq!(ws.paths_state.selected, None);

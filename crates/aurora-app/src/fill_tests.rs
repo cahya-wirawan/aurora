@@ -1893,3 +1893,341 @@ fn the_options_bar_clips_what_does_not_fit_instead_of_wrapping_or_changing_heigh
         .is_some_and(|s| s.overflow.x != taffy::Overflow::Visible);
     assert!(clips, "the bar clips its end");
 }
+
+// ---- 0.234.0: Fill Path and Stroke Path ----------------------------------
+
+mod path_paint_flows {
+    use super::*;
+    use crate::path_paint::{self, FILL_PATH_LABEL, STROKE_PATH_LABEL};
+    use aurora_doc::{Anchor, Path, Subpath};
+
+    fn square(x: f32, y: f32, side: f32, closed: bool) -> Path {
+        Path {
+            name: "Work Path".into(),
+            subpaths: vec![Subpath {
+                anchors: vec![
+                    Anchor::corner(x, y),
+                    Anchor::corner(x + side, y),
+                    Anchor::corner(x + side, y + side),
+                    Anchor::corner(x, y + side),
+                ],
+                closed,
+            }],
+        }
+    }
+
+    fn segment(a: (f32, f32), b: (f32, f32)) -> Path {
+        Path {
+            name: "Work Path".into(),
+            subpaths: vec![Subpath {
+                anchors: vec![Anchor::corner(a.0, a.1), Anchor::corner(b.0, b.1)],
+                closed: false,
+            }],
+        }
+    }
+
+    fn fill(
+        doc: &mut Doc,
+        path: &Path,
+        sel: Option<aurora_doc::Selection>,
+    ) -> Result<Filled, FillRefused> {
+        path_paint::fill_path(
+            &mut doc.store,
+            &doc.layers,
+            doc.layer,
+            CANVAS,
+            path,
+            &doc.settings,
+            GREEN,
+            sel,
+        )
+    }
+
+    fn stroke(
+        doc: &mut Doc,
+        path: &Path,
+        sel: Option<aurora_doc::Selection>,
+    ) -> Result<Filled, FillRefused> {
+        path_paint::stroke_path(
+            &mut doc.store,
+            &doc.layers,
+            doc.layer,
+            path,
+            &doc.settings,
+            GREEN,
+            sel,
+        )
+    }
+
+    fn all(doc: &mut Doc, w: u32, h: u32) -> Vec<[f32; 4]> {
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| doc.at(x, y))
+            .collect()
+    }
+
+    #[test]
+    fn fill_path_paints_the_interior_only_as_one_undoable_step() {
+        let mut doc = Doc::new(Doc::rect(0, 0, 600, 300));
+        let before = all(&mut doc, 300, 250);
+        let filled = ok(fill(&mut doc, &square(100.0, 50.0, 100.0, true), None));
+        assert!(doc.commit(filled, FILL_PATH_LABEL));
+        assert_eq!(doc.at(150, 100), [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(
+            doc.at(100, 50),
+            [0.0, 1.0, 0.0, 1.0],
+            "the first covered pixel"
+        );
+        assert_eq!(doc.at(99, 100), [0.0; 4]);
+        assert_eq!(doc.at(200, 100), [0.0; 4], "the right edge is exclusive");
+        assert_eq!(doc.at(150, 150), [0.0; 4]);
+        assert_eq!(history_labels(&doc), ["Fill Path"]);
+        assert!(doc.undo(UndoDirection::Undo));
+        assert_eq!(all(&mut doc, 300, 250), before);
+        assert!(doc.undo(UndoDirection::Redo));
+        assert_eq!(doc.at(150, 100), [0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn filling_the_whole_layer_equals_the_paint_bucket() {
+        let mut a = Doc::new(Doc::rect(0, 0, 600, 300));
+        let mut b = Doc::new(Doc::rect(0, 0, 600, 300));
+        let bucket = ok(a.bucket((10.0, 10.0)));
+        assert!(a.commit(bucket, fill_tools::PAINT_BUCKET_LABEL));
+        let filled = ok(fill(&mut b, &square(0.0, 0.0, 600.0, true), None));
+        assert!(!filled.painted.is_empty());
+        // The square is 600 wide and the canvas 300 tall: clipped to it.
+        for (x, y) in [(0, 0), (300, 150), (599, 299), (17, 211)] {
+            assert_eq!(a.at(x, y), b.at(x, y), "({x},{y})");
+        }
+    }
+
+    #[test]
+    fn fill_path_uses_the_brush_opacity_and_the_selection() {
+        let mut doc = Doc::new(Doc::rect(0, 0, 600, 300));
+        doc.settings.brush_opacity = 50;
+        let selection = aurora_doc::Selection {
+            bounds: Doc::rect(0, 0, 150, 300),
+            inverted: false,
+            shape: aurora_doc::SelectionShape::Rect,
+        };
+        let filled = ok(fill(
+            &mut doc,
+            &square(100.0, 50.0, 100.0, true),
+            Some(selection),
+        ));
+        assert!(doc.commit(filled, FILL_PATH_LABEL));
+        let inside = doc.at(120, 100);
+        assert!(
+            (inside[3] - 0.5).abs() < 2e-3 && (inside[1] - 0.5).abs() < 2e-3,
+            "{inside:?}"
+        );
+        assert_eq!(doc.at(170, 100), [0.0; 4], "outside the selection");
+    }
+
+    #[test]
+    fn fill_path_respects_the_locks_and_the_notices() {
+        let mut doc = Doc::new(Doc::rect(0, 0, 600, 300));
+        doc.lock(aurora_doc::LayerLock {
+            pixels: true,
+            ..aurora_doc::LayerLock::none()
+        });
+        let refused = fill(&mut doc, &square(0.0, 0.0, 50.0, true), None);
+        assert!(matches!(
+            refused,
+            Err(FillRefused::Notice(LockRefusal::PixelsLocked))
+        ));
+        doc.lock(aurora_doc::LayerLock {
+            transparency: true,
+            ..aurora_doc::LayerLock::none()
+        });
+        let locked = ok(fill(&mut doc, &square(0.0, 0.0, 50.0, true), None));
+        assert!(
+            locked.snapshot.is_empty(),
+            "transparent pixels stay untouched"
+        );
+        assert!(
+            !doc.commit(locked, FILL_PATH_LABEL),
+            "a no-op records nothing"
+        );
+        doc.lock(aurora_doc::LayerLock::none());
+        // Opaque pixels recolour with the alpha kept.
+        doc.rect_fill(0, 0, 50, 50, [1.0, 0.0, 0.0, 0.5]);
+        doc.lock(aurora_doc::LayerLock {
+            transparency: true,
+            ..aurora_doc::LayerLock::none()
+        });
+        let filled = ok(fill(&mut doc, &square(0.0, 0.0, 50.0, true), None));
+        assert!(doc.commit(filled, FILL_PATH_LABEL));
+        let px = doc.at(10, 10);
+        assert_eq!(px[3], 0.5);
+        assert!(px[0] == 0.0 && px[1] == 0.5, "recoloured: {px:?}");
+        // A path with no area says so.
+        doc.lock(aurora_doc::LayerLock::none());
+        let none = fill(&mut doc, &segment((0.0, 0.0), (10.0, 10.0)), None);
+        assert!(matches!(
+            none,
+            Err(FillRefused::Notice(LockRefusal::Path(m))) if m == path_paint::NOTHING_TO_FILL_NOTICE
+        ));
+    }
+
+    #[test]
+    fn stroke_path_paints_along_the_path_as_one_undoable_stroke() {
+        let mut doc = Doc::new(Doc::rect(0, 0, 600, 300));
+        doc.settings.brush_radius = 10.0;
+        let before = all(&mut doc, 300, 200);
+        let filled = ok(stroke(
+            &mut doc,
+            &segment((50.0, 100.0), (250.0, 100.0)),
+            None,
+        ));
+        assert!(doc.commit(filled, STROKE_PATH_LABEL));
+        assert!(doc.at(150, 100)[3] > 0.95);
+        assert!(doc.at(150, 100)[1] > 0.95);
+        assert_eq!(doc.at(150, 130), [0.0; 4]);
+        assert_eq!(doc.at(300, 100), [0.0; 4], "past the end");
+        assert_eq!(history_labels(&doc), ["Stroke Path"]);
+        assert_eq!(doc.undo_order.undo.len(), 1);
+        assert!(doc.undo(UndoDirection::Undo));
+        assert_eq!(all(&mut doc, 300, 200), before);
+    }
+
+    #[test]
+    fn stroke_path_is_the_live_brushs_dab_sequence() {
+        let mut doc = Doc::new(Doc::rect(0, 0, 600, 300));
+        let mut live = Doc::new(Doc::rect(0, 0, 600, 300));
+        doc.settings.brush_radius = 12.0;
+        doc.settings.brush_opacity = 70;
+        doc.settings.brush_flow = 60;
+        live.settings = doc.settings.clone();
+        let path = segment((40.0, 60.0), (230.0, 150.0));
+        ok(stroke(&mut doc, &path, None));
+        let flat = vec![(
+            path.subpaths
+                .iter()
+                .flat_map(|s| s.flatten(aurora_doc::FLATTEN_TOLERANCE))
+                .collect::<Vec<_>>(),
+            false,
+        )];
+        let step = aurora_brush::dab_step(12.0, aurora_brush::DEFAULT_SPACING);
+        let planned = path_paint::path_dabs(&flat, step, 100_000);
+        let mut drag = Some(Drag::Brush {
+            hard: false,
+            clone: None,
+            smudge: None,
+            filter: None,
+            tone: None,
+            last_doc: (0.0, 0.0),
+            carry: 0.0,
+            stroke: Some(aurora_brush::StrokeSnapshot::new(live.surface)),
+            warned: std::collections::HashSet::new(),
+        });
+        for dab in planned.dabs {
+            let _ = crate::selection_paint::dab_through_selection(
+                DabTool::Brush,
+                false,
+                &mut live.store,
+                live.surface,
+                Doc::rect(0, 0, 600, 300),
+                dab,
+                None,
+                &live.settings,
+                GREEN,
+                &mut drag,
+            );
+        }
+        assert_eq!(all(&mut doc, 260, 180), all(&mut live, 260, 180));
+    }
+
+    #[test]
+    fn the_opacity_ceiling_holds_over_a_self_overlapping_stroke() {
+        let mut doc = Doc::new(Doc::rect(0, 0, 600, 300));
+        doc.settings.brush_radius = 10.0;
+        doc.settings.brush_opacity = 50;
+        // Out and back over the same line.
+        let there_and_back = Path {
+            name: "Work Path".into(),
+            subpaths: vec![Subpath {
+                anchors: vec![
+                    Anchor::corner(50.0, 100.0),
+                    Anchor::corner(250.0, 100.0),
+                    Anchor::corner(50.0, 100.0),
+                ],
+                closed: false,
+            }],
+        };
+        let filled = ok(stroke(&mut doc, &there_and_back, None));
+        assert!(doc.commit(filled, STROKE_PATH_LABEL));
+        let alpha = doc.at(150, 100)[3];
+        assert!(alpha <= 0.5 + 2e-3 && alpha > 0.4, "{alpha}");
+    }
+
+    #[test]
+    fn stroke_path_closed_includes_the_closing_side_and_open_does_not() {
+        let mut closed = Doc::new(Doc::rect(0, 0, 600, 300));
+        let mut open = Doc::new(Doc::rect(0, 0, 600, 300));
+        closed.settings.brush_radius = 4.0;
+        open.settings.brush_radius = 4.0;
+        ok(stroke(&mut closed, &square(50.0, 50.0, 100.0, true), None));
+        ok(stroke(&mut open, &square(50.0, 50.0, 100.0, false), None));
+        assert!(closed.at(50, 100)[3] > 0.9, "the closing side");
+        assert_eq!(open.at(50, 100), [0.0; 4]);
+        assert!(open.at(100, 50)[3] > 0.9);
+    }
+
+    #[test]
+    fn stroke_path_respects_the_locks_the_selection_and_the_dab_cap() {
+        let mut doc = Doc::new(Doc::rect(0, 0, 600, 300));
+        doc.settings.brush_radius = 6.0;
+        doc.lock(aurora_doc::LayerLock {
+            pixels: true,
+            ..aurora_doc::LayerLock::none()
+        });
+        assert!(matches!(
+            stroke(&mut doc, &segment((0.0, 0.0), (50.0, 0.0)), None),
+            Err(FillRefused::Notice(LockRefusal::PixelsLocked))
+        ));
+        doc.lock(aurora_doc::LayerLock {
+            transparency: true,
+            ..aurora_doc::LayerLock::none()
+        });
+        let locked = ok(stroke(&mut doc, &segment((0.0, 0.0), (50.0, 0.0)), None));
+        assert!(locked.snapshot.is_empty());
+        doc.lock(aurora_doc::LayerLock::none());
+        let selection = aurora_doc::Selection {
+            bounds: Doc::rect(0, 0, 100, 300),
+            inverted: false,
+            shape: aurora_doc::SelectionShape::Rect,
+        };
+        let filled = ok(stroke(
+            &mut doc,
+            &segment((20.0, 50.0), (250.0, 50.0)),
+            Some(selection),
+        ));
+        assert!(doc.commit(filled, STROKE_PATH_LABEL));
+        assert!(doc.at(60, 50)[3] > 0.9);
+        assert_eq!(doc.at(200, 50), [0.0; 4], "outside the selection");
+        // A huge path is refused before anything is painted.
+        doc.settings.brush_radius = 1.0;
+        let huge = segment((0.0, 0.0), (900_000.0, 0.0));
+        let before = doc.undo_order.undo.len();
+        assert!(matches!(
+            stroke(&mut doc, &huge, None),
+            Err(FillRefused::Notice(LockRefusal::Path(m))) if m == path_paint::TOO_MANY_DABS_NOTICE
+        ));
+        assert_eq!(doc.undo_order.undo.len(), before);
+        // A group or no pixel layer is the usual notice.
+        assert!(matches!(
+            path_paint::stroke_path(
+                &mut doc.store,
+                &doc.layers,
+                aurora_doc::LayerId::from_raw(9999),
+                &huge,
+                &doc.settings,
+                GREEN,
+                None
+            ),
+            Err(FillRefused::Notice(LockRefusal::FillNeedsPixelLayer))
+        ));
+    }
+}

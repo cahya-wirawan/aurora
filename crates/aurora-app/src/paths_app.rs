@@ -15,6 +15,7 @@ use aurora_widgets::widgets::{
 };
 
 use crate::document_session::DocumentSession;
+use crate::path_paint;
 use crate::pen::{self, PenOutcome};
 use crate::{App, FocusManager, Key, LockRefusal, WidgetId, command_palette_style};
 
@@ -31,8 +32,14 @@ pub(crate) const RENAME_TITLE: &str = "Rename Path\u{2026}";
 
 /// The palette entries of the Paths commands (not the Pen's tool entry,
 /// which every tool has).
-pub(crate) const COMMANDS: [(&str, &str); 5] = [
+pub(crate) const COMMANDS: [(&str, &str); 8] = [
     (COMMAND_MAKE_SELECTION, MAKE_SELECTION_TITLE),
+    (path_paint::COMMAND_FILL, path_paint::FILL_TITLE),
+    (path_paint::COMMAND_STROKE, path_paint::STROKE_TITLE),
+    (
+        path_paint::COMMAND_MAKE_FROM_SELECTION,
+        path_paint::MAKE_FROM_SELECTION_TITLE,
+    ),
     (COMMAND_NEW, NEW_TITLE),
     (COMMAND_DELETE, DELETE_TITLE),
     (COMMAND_RENAME, RENAME_TITLE),
@@ -61,6 +68,12 @@ pub(crate) const SELECTION_FAILED_NOTICE: &str = "That path is too large to make
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PathsCommand {
     MakeSelection,
+    /// Fill the active path with the foreground colour (0.234.0).
+    Fill,
+    /// Stroke the active path with the Brush (0.234.0).
+    Stroke,
+    /// Replace the work path with the selection's outline (0.234.0).
+    MakeFromSelection,
     SaveWork,
     New,
     Delete,
@@ -73,6 +86,9 @@ pub(crate) enum PathsCommand {
 pub(crate) fn command_for(id: &str) -> Option<PathsCommand> {
     match id {
         COMMAND_MAKE_SELECTION => Some(PathsCommand::MakeSelection),
+        path_paint::COMMAND_FILL => Some(PathsCommand::Fill),
+        path_paint::COMMAND_STROKE => Some(PathsCommand::Stroke),
+        path_paint::COMMAND_MAKE_FROM_SELECTION => Some(PathsCommand::MakeFromSelection),
         COMMAND_SAVE_WORK => Some(PathsCommand::SaveWork),
         COMMAND_NEW => Some(PathsCommand::New),
         COMMAND_DELETE => Some(PathsCommand::Delete),
@@ -311,9 +327,13 @@ pub(crate) fn sync_paths(
 ) -> bool {
     let names: Vec<String> = doc.selection.paths().names().map(str::to_owned).collect();
     let selected = active.filter(|n| doc.selection.paths().get(n).is_some());
-    let selected_empty = selected
-        .and_then(|n| doc.selection.paths().get(n))
-        .is_some_and(aurora_doc::Path::is_empty);
+    let chosen = selected.and_then(|n| doc.selection.paths().get(n));
+    let facts = aurora_ui::PathsFacts {
+        selected_empty: chosen.is_some_and(aurora_doc::Path::is_empty),
+        can_fill: chosen.is_some_and(path_paint::path_can_fill),
+        can_stroke: chosen.is_some_and(path_paint::path_can_stroke),
+        has_selection: doc.selection.active().is_some(),
+    };
     let panel = workspace.paths;
     let mut state = workspace.paths_state.clone();
     let result = aurora_ui::sync_paths_panel(
@@ -323,7 +343,7 @@ pub(crate) fn sync_paths(
         &mut state,
         &names,
         selected,
-        selected_empty,
+        facts,
     );
     workspace.paths_state = state;
     match result {
@@ -393,10 +413,25 @@ impl App {
                 )
             });
         let alt = self.modifiers.alt;
-        let outcome = self.pen.press(
+        let segment = if hit.is_none() && zoom.is_finite() && zoom > 0.0 {
+            self.pen
+                .active()
+                .and_then(|name| self.doc.selection.paths().get(name))
+                .and_then(|path| {
+                    aurora_doc::nearest_segment(
+                        &path.subpaths,
+                        doc_point,
+                        self.pen_hit_radius() / zoom,
+                    )
+                })
+        } else {
+            None
+        };
+        let outcome = self.pen.press_at(
             self.doc.selection.paths_mut(),
             doc_point,
             hit,
+            segment,
             close_radius,
             alt,
         );
@@ -423,18 +458,38 @@ impl App {
         }
     }
 
+    /// The anchor of the active path under the pointer, if any.
+    fn pen_hovered_anchor(&self) -> Option<aurora_ui::AnchorRef> {
+        if self.tool != aurora_ui::Tool::Pen {
+            return None;
+        }
+        let canvas_point = crate::pointer_in_canvas(&self.workspace, self.pointer_position?)?;
+        let path = self.doc.selection.paths().get(self.pen.active()?)?;
+        match aurora_ui::path_hit(
+            path,
+            None,
+            &self.doc.canvas_view,
+            canvas_point,
+            self.pen_hit_radius(),
+        )? {
+            aurora_ui::PathPart::Anchor(r) => Some(r),
+            _ => None,
+        }
+    }
+
     /// Enter, Escape, Backspace and Delete for the Pen, offered after the
     /// focused widgets. Returns whether the key was used.
     pub(crate) fn pen_key_now(&mut self, key: Key) -> bool {
         let modal = self.dialog.is_some()
             || self.command_palette.is_some()
             || crate::crop_app::text_field_focused(&self.workspace.tree, self.focus.focused());
+        let hovered = self.pen_hovered_anchor();
         let action = pen_key_action(
             self.tool,
             modal,
             self.modifiers,
             self.pen.drawing().is_some(),
-            self.pen.selected().is_some(),
+            self.pen.selected().is_some() || hovered.is_some(),
             key,
         );
         let outcome = match action {
@@ -448,7 +503,12 @@ impl App {
             }
             PenKey::Cancel => self.pen.cancel_subpath(self.doc.selection.paths_mut()),
             PenKey::Backspace => self.pen.remove_last_point(self.doc.selection.paths_mut()),
-            PenKey::Delete => self.pen.delete_selected(self.doc.selection.paths_mut()),
+            PenKey::Delete => match (self.pen.selected(), hovered) {
+                (Some(_), _) | (None, None) => {
+                    self.pen.delete_selected(self.doc.selection.paths_mut())
+                }
+                (None, Some(r)) => self.pen.delete_anchor(self.doc.selection.paths_mut(), r),
+            },
         };
         self.pen_apply(outcome);
         true
@@ -574,6 +634,9 @@ impl App {
     pub(crate) fn run_paths_action(&mut self, action: aurora_ui::PathsAction) {
         let command = match action {
             aurora_ui::PathsAction::MakeSelection => PathsCommand::MakeSelection,
+            aurora_ui::PathsAction::FillPath => PathsCommand::Fill,
+            aurora_ui::PathsAction::StrokePath => PathsCommand::Stroke,
+            aurora_ui::PathsAction::MakeWorkPath => PathsCommand::MakeFromSelection,
             aurora_ui::PathsAction::NewPath => PathsCommand::New,
             aurora_ui::PathsAction::DeletePath => PathsCommand::Delete,
         };
@@ -598,6 +661,8 @@ impl App {
                     Err(text) => self.pen_notice(text),
                 }
             }
+            PathsCommand::Fill | PathsCommand::Stroke => self.run_path_paint(&command),
+            PathsCommand::MakeFromSelection => self.run_make_work_path(),
             PathsCommand::New => {
                 let name = self.doc.selection.paths().next_free_name();
                 let result = edit_paths(self.doc.selection.paths_mut(), NEW_PATH_LABEL, |set| {

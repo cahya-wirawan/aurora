@@ -68,7 +68,11 @@ pub(crate) const MIN_STROKE_DABS: usize = 256;
 /// [`MAX_STROKE_DABS`].
 #[must_use]
 pub(crate) fn stroke_dab_cap(radius: f32) -> usize {
-    let radius = if radius.is_finite() { radius.max(0.5) } else { 0.5 };
+    let radius = if radius.is_finite() {
+        radius.max(0.5)
+    } else {
+        0.5
+    };
     let area = std::f32::consts::PI * radius * radius;
     // Truncation is intended: a small positive count.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -185,7 +189,11 @@ pub(crate) fn fill_path(
     let mode = fill_tools::mode_for(layers.lock(layer).unwrap_or_default())?;
     let shape = match aurora_doc::selection_from_path(path, canvas_size) {
         Ok(Some(shape)) => shape,
-        Ok(None) => return Err(FillRefused::Notice(LockRefusal::Path(NOTHING_TO_FILL_NOTICE))),
+        Ok(None) => {
+            return Err(FillRefused::Notice(LockRefusal::Path(
+                NOTHING_TO_FILL_NOTICE,
+            )));
+        }
         Err(_) => return Err(FillRefused::Notice(LockRefusal::Path(FILL_FAILED_NOTICE))),
     };
     let shape_cover = selection_paint::layer_selection(Some(shape), bounds);
@@ -235,21 +243,23 @@ pub(crate) fn stroke_path(
     selection: Option<Selection>,
 ) -> Result<Filled, FillRefused> {
     let (bounds, surface) = pixel_target(layers, layer)?;
-    let preserve_alpha = match crate::paint_permission(
-        DabTool::Brush,
-        layers.lock(layer).unwrap_or_default(),
-    ) {
-        crate::PaintPermission::Refused(why) => return Err(FillRefused::Notice(why)),
-        crate::PaintPermission::PreserveAlpha => true,
-        crate::PaintPermission::Allowed => false,
-    };
+    let preserve_alpha =
+        match crate::paint_permission(DabTool::Brush, layers.lock(layer).unwrap_or_default()) {
+            crate::PaintPermission::Refused(why) => return Err(FillRefused::Notice(why)),
+            crate::PaintPermission::PreserveAlpha => true,
+            crate::PaintPermission::Allowed => false,
+        };
     let radius = settings.dab_radius(DabTool::Brush);
     let flat: Vec<FlatSubpath> = path
         .subpaths
         .iter()
         .map(|s| (s.flatten(aurora_doc::FLATTEN_TOLERANCE), s.closed))
         .collect();
-    let planned = path_dabs(&flat, dab_step(radius, DEFAULT_SPACING), stroke_dab_cap(radius));
+    let planned = path_dabs(
+        &flat,
+        dab_step(radius, DEFAULT_SPACING),
+        stroke_dab_cap(radius),
+    );
     if planned.truncated {
         return Err(FillRefused::Notice(LockRefusal::Path(TOO_MANY_DABS_NOTICE)));
     }
@@ -385,7 +395,10 @@ impl App {
             return;
         }
         let Some(selection) = self.doc.selection.active() else {
-            self.lock_notice = Some((LockRefusal::Path(NO_SELECTION_NOTICE), self.doc.active_layer));
+            self.lock_notice = Some((
+                LockRefusal::Path(NO_SELECTION_NOTICE),
+                self.doc.active_layer,
+            ));
             self.sync_status_bar_now();
             return;
         };

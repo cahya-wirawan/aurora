@@ -298,7 +298,10 @@ pub(crate) fn enabled(id: &str, context: &MenuContext) -> bool {
         | crate::COMMAND_SELECT_DESELECT
         | crate::COMMAND_SELECT_INVERSE
         | crate::crop::COMMAND_CROP_TO_SELECTION
-        | crate::paths_app::COMMAND_MAKE_SELECTION => !context.quick_mask,
+        | crate::paths_app::COMMAND_MAKE_SELECTION
+        | crate::path_paint::COMMAND_FILL
+        | crate::path_paint::COMMAND_STROKE
+        | crate::path_paint::COMMAND_MAKE_FROM_SELECTION => !context.quick_mask,
         _ if crate::selection_refine::RefineKind::for_command(id).is_some() => !context.quick_mask,
         _ if matches!(
             crate::selection_store::command_for(id),
@@ -412,6 +415,9 @@ pub(crate) const NATIVE_MENU_COMMANDS: &[&str] = &[
     crate::quick_mask::COMMAND_ID,
     crate::crop::COMMAND_CROP_TO_SELECTION,
     crate::paths_app::COMMAND_MAKE_SELECTION,
+    crate::path_paint::COMMAND_FILL,
+    crate::path_paint::COMMAND_STROKE,
+    crate::path_paint::COMMAND_MAKE_FROM_SELECTION,
     crate::selection_refine::RefineKind::Feather.command_id(),
     crate::selection_refine::RefineKind::Expand.command_id(),
     crate::selection_refine::RefineKind::Contract.command_id(),
