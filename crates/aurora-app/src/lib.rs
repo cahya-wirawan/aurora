@@ -565,6 +565,7 @@ mod layer_thumbnails;
 mod menu_bar_app;
 mod menu_bar_state;
 mod menu_model;
+mod path_paint;
 mod paths_app;
 #[cfg(test)]
 mod paths_undo_tests;
@@ -6814,7 +6815,7 @@ fn refill_reopened_panels(
             aurora_ui::DockPanel::Paths => {
                 let names = workspace.paths_state.names.clone();
                 let selected = workspace.paths_state.selected.clone();
-                let selected_empty = workspace.paths_state.selected_empty;
+                let facts = workspace.paths_state.facts;
                 let paths = workspace.paths;
                 let mut state = workspace.paths_state.clone();
                 if let Err(err) = aurora_ui::populate_paths_panel(
@@ -6833,7 +6834,7 @@ fn refill_reopened_panels(
                     &mut state,
                     &names,
                     selected.as_deref(),
-                    selected_empty,
+                    facts,
                 ) {
                     tracing::warn!(?err, "failed to re-select in the Paths panel");
                 }
@@ -10369,6 +10370,19 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(
                 paths_app::COMMAND_MAKE_SELECTION,
                 paths_app::MAKE_SELECTION_TITLE,
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(path_paint::COMMAND_FILL, path_paint::FILL_TITLE, true, None),
+            &muda::MenuItem::with_id(
+                path_paint::COMMAND_STROKE,
+                path_paint::STROKE_TITLE,
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                path_paint::COMMAND_MAKE_FROM_SELECTION,
+                path_paint::MAKE_FROM_SELECTION_TITLE,
                 true,
                 None,
             ),

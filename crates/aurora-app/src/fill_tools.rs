@@ -59,7 +59,7 @@ pub(crate) enum FillRefused {
     Nothing,
 }
 
-fn mode_for(lock: aurora_doc::LayerLock) -> Result<FillMode, FillRefused> {
+pub(crate) fn mode_for(lock: aurora_doc::LayerLock) -> Result<FillMode, FillRefused> {
     match paint_permission(DabTool::Brush, lock) {
         PaintPermission::Refused(why) => Err(FillRefused::Notice(why)),
         PaintPermission::PreserveAlpha => Ok(FillMode::PreserveAlpha),
@@ -67,7 +67,7 @@ fn mode_for(lock: aurora_doc::LayerLock) -> Result<FillMode, FillRefused> {
     }
 }
 
-fn refusal(err: &FillError) -> FillRefused {
+pub(crate) fn refusal(err: &FillError) -> FillRefused {
     match err {
         FillError::TooLarge { .. } => FillRefused::Notice(LockRefusal::FillTooLarge),
         FillError::Tile(_) => FillRefused::Nothing,
@@ -75,7 +75,7 @@ fn refusal(err: &FillError) -> FillRefused {
 }
 
 /// Quantises a settings percentage to a `0..=1` opacity.
-fn opacity_of(percent: u8) -> f32 {
+pub(crate) fn opacity_of(percent: u8) -> f32 {
     f32::from(percent.min(100)) / 100.0
 }
 

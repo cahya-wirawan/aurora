@@ -127,10 +127,10 @@ pub use levels_controls::{
 pub use path_overlay::{AnchorRef, PathPart, path_anchor_screen, path_hit, path_overlay_runs};
 pub use paths_panel::{
     MAKE_SELECTION_EMPTY, MAKE_SELECTION_UNAVAILABLE, NO_PATHS_TEXT, PATH_DELETE_UNAVAILABLE,
-    PATHS_TOOLBAR_ICON_SIZE, PATHS_TOOLBAR_LABEL, PathsAction, PathsPanel, PathsToolbar,
-    insert_paths_toolbar, is_paths_toolbar_button, new_paths_panel, paths_toolbar_height,
-    populate_paths_panel, select_path_row, set_paths_toolbar_hover, sync_paths_panel,
-    sync_paths_toolbar,
+    PATHS_TOOLBAR_ICON_SIZE, PATHS_TOOLBAR_LABEL, PathsAction, PathsFacts, PathsPanel,
+    PathsToolbar, insert_paths_toolbar, is_paths_toolbar_button, new_paths_panel,
+    paths_toolbar_height, populate_paths_panel, select_path_row, set_paths_toolbar_hover,
+    sync_paths_panel, sync_paths_toolbar,
 };
 #[cfg(test)]
 mod layer_filter_tests;

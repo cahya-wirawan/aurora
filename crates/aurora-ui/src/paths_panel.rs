@@ -43,6 +43,17 @@ pub const NO_PATHS_TEXT: &str = "No paths";
 /// The icon size the toolbar's buttons use (the Layers toolbar's).
 pub const PATHS_TOOLBAR_ICON_SIZE: IconSize = IconSize::Large;
 
+/// Why Fill Path is unavailable with no path selected.
+pub const FILL_UNAVAILABLE: &str = "Select a path to fill it";
+/// Why Fill Path is unavailable for a path with no area.
+pub const FILL_TOO_SMALL: &str = "Fill Path needs a subpath of at least three points";
+/// Why Stroke Path is unavailable with no path selected.
+pub const STROKE_UNAVAILABLE: &str = "Select a path to stroke it";
+/// Why Stroke Path is unavailable for a path with no line.
+pub const STROKE_TOO_SMALL: &str = "Stroke Path needs a subpath of at least two points";
+/// Why Make Work Path is unavailable with nothing selected.
+pub const MAKE_PATH_UNAVAILABLE: &str = "Make a selection to turn it into a work path";
+
 /// Why Make Selection is unavailable with no path selected.
 pub const MAKE_SELECTION_UNAVAILABLE: &str = "Select a path to make a selection from it";
 /// Why Make Selection is unavailable for an empty path.
@@ -55,6 +66,12 @@ pub const PATH_DELETE_UNAVAILABLE: &str = "Select a path to delete it";
 pub enum PathsAction {
     /// Replace the selection with the selected path's outline.
     MakeSelection,
+    /// Fill the selected path with the foreground colour (0.234.0).
+    FillPath,
+    /// Stroke the selected path with the Brush (0.234.0).
+    StrokePath,
+    /// Replace the work path with the selection's outline (0.234.0).
+    MakeWorkPath,
     /// Start a new, empty path.
     NewPath,
     /// Delete the selected path.
@@ -63,13 +80,23 @@ pub enum PathsAction {
 
 impl PathsAction {
     /// Every action, in toolbar order.
-    pub const ALL: [Self; 3] = [Self::MakeSelection, Self::NewPath, Self::DeletePath];
+    pub const ALL: [Self; 6] = [
+        Self::MakeSelection,
+        Self::FillPath,
+        Self::StrokePath,
+        Self::MakeWorkPath,
+        Self::NewPath,
+        Self::DeletePath,
+    ];
 
     /// The button's accessible name.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::MakeSelection => "Make selection from path",
+            Self::FillPath => "Fill path",
+            Self::StrokePath => "Stroke path",
+            Self::MakeWorkPath => "Make work path from selection",
             Self::NewPath => "New path",
             Self::DeletePath => "Delete path",
         }
@@ -81,6 +108,9 @@ impl PathsAction {
     pub const fn icon(self) -> IconKind {
         match self {
             Self::MakeSelection => IconKind::Marquee,
+            Self::FillPath => IconKind::PaintBucket,
+            Self::StrokePath => IconKind::Brush,
+            Self::MakeWorkPath => IconKind::Pen,
             Self::NewPath => IconKind::NewLayer,
             Self::DeletePath => IconKind::Delete,
         }
@@ -91,6 +121,9 @@ impl PathsAction {
     pub const fn description(self) -> &'static str {
         match self {
             Self::MakeSelection => "Replace the selection with the outline of the selected path",
+            Self::FillPath => "Fill the selected path with the foreground colour",
+            Self::StrokePath => "Stroke the selected path with the Brush",
+            Self::MakeWorkPath => "Replace the work path with the outline of the selection",
             Self::NewPath => "Start a new empty path",
             Self::DeletePath => "Delete the selected path",
         }
@@ -124,6 +157,21 @@ impl PathsToolbar {
     }
 }
 
+/// What the toolbar needs to know to enable its buttons, beyond which path
+/// is selected (the caller keeps it current through [`sync_paths_panel`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct PathsFacts {
+    /// The selected path has no anchor (Make Selection is then disabled).
+    pub selected_empty: bool,
+    /// The selected path has a subpath Fill Path can fill.
+    pub can_fill: bool,
+    /// The selected path has a subpath Stroke Path can stroke.
+    pub can_stroke: bool,
+    /// The document has a selection to turn into a path.
+    pub has_selection: bool,
+}
+
 /// The panel's live state: the toolbar, the rows as built (in screen
 /// order), the names they were built for and the selected row.
 #[derive(Debug, Clone, PartialEq)]
@@ -135,9 +183,8 @@ pub struct PathsPanel {
     pub names: Vec<String>,
     /// The selected path's name, if one is (and shown).
     pub selected: Option<String>,
-    /// Whether the selected path has no anchor (Make Selection is then
-    /// disabled); the caller keeps it current through [`sync_paths_panel`].
-    pub selected_empty: bool,
+    /// What the toolbar's enabled states depend on.
+    pub facts: PathsFacts,
 }
 
 impl PathsPanel {
@@ -276,6 +323,18 @@ fn build_toolbar(
                 widgets::set_button_disabled(tree, id, true)?;
                 PATH_DELETE_UNAVAILABLE
             }
+            PathsAction::FillPath => {
+                widgets::set_button_disabled(tree, id, true)?;
+                FILL_UNAVAILABLE
+            }
+            PathsAction::StrokePath => {
+                widgets::set_button_disabled(tree, id, true)?;
+                STROKE_UNAVAILABLE
+            }
+            PathsAction::MakeWorkPath => {
+                widgets::set_button_disabled(tree, id, true)?;
+                MAKE_PATH_UNAVAILABLE
+            }
             PathsAction::NewPath => action.description(),
         };
         widgets::set_button_description(tree, id, Some(text))?;
@@ -307,7 +366,9 @@ fn set_enabled(
 
 /// Mirrors the selection into the toolbar: Delete is enabled exactly when
 /// a path is selected; Make Selection when one is selected and has an
-/// anchor (the descriptions say why not otherwise). Returns whether
+/// anchor; Fill and Stroke when its subpaths are long enough; Make Work Path
+/// when the document has a selection (the descriptions say why not
+/// otherwise). Returns whether
 /// anything changed.
 ///
 /// # Errors
@@ -318,7 +379,7 @@ pub fn sync_paths_toolbar(
     tree: &mut WidgetTree<WidgetKind>,
     toolbar: &PathsToolbar,
     has_selected_path: bool,
-    selected_path_empty: bool,
+    facts: PathsFacts,
 ) -> Result<bool, WidgetError> {
     let mut changed = false;
     if let Some(button) = toolbar.button_for(PathsAction::MakeSelection) {
@@ -330,9 +391,46 @@ pub fn sync_paths_toolbar(
         changed |= set_enabled(
             tree,
             button,
-            has_selected_path && !selected_path_empty,
+            has_selected_path && !facts.selected_empty,
             PathsAction::MakeSelection.description(),
             reason,
+        )?;
+    }
+    if let Some(button) = toolbar.button_for(PathsAction::FillPath) {
+        let reason = if has_selected_path {
+            FILL_TOO_SMALL
+        } else {
+            FILL_UNAVAILABLE
+        };
+        changed |= set_enabled(
+            tree,
+            button,
+            has_selected_path && facts.can_fill,
+            PathsAction::FillPath.description(),
+            reason,
+        )?;
+    }
+    if let Some(button) = toolbar.button_for(PathsAction::StrokePath) {
+        let reason = if has_selected_path {
+            STROKE_TOO_SMALL
+        } else {
+            STROKE_UNAVAILABLE
+        };
+        changed |= set_enabled(
+            tree,
+            button,
+            has_selected_path && facts.can_stroke,
+            PathsAction::StrokePath.description(),
+            reason,
+        )?;
+    }
+    if let Some(button) = toolbar.button_for(PathsAction::MakeWorkPath) {
+        changed |= set_enabled(
+            tree,
+            button,
+            facts.has_selection,
+            PathsAction::MakeWorkPath.description(),
+            MAKE_PATH_UNAVAILABLE,
         )?;
     }
     if let Some(button) = toolbar.button_for(PathsAction::DeletePath) {
@@ -387,7 +485,7 @@ pub fn new_paths_panel(toolbar: PathsToolbar) -> PathsPanel {
         rows: Vec::new(),
         names: Vec::new(),
         selected: None,
-        selected_empty: false,
+        facts: PathsFacts::default(),
     }
 }
 
@@ -468,19 +566,14 @@ pub fn select_path_row(
         set_tree_item_selected(tree, id, wanted.as_deref() == Some(row_name.as_str()))?;
     }
     state.selected = wanted;
-    sync_paths_toolbar(
-        tree,
-        &state.toolbar,
-        state.selected.is_some(),
-        state.selected_empty,
-    )?;
+    sync_paths_toolbar(tree, &state.toolbar, state.selected.is_some(), state.facts)?;
     Ok(())
 }
 
 /// Keeps the panel current: rebuilds the rows when the path `names`
 /// changed since they were built (or the rows died with a closed panel),
 /// else only moves the highlight when `selected` changed, and always
-/// mirrors `selected_empty` into the toolbar. Cheap when nothing changed,
+/// mirrors `facts` into the toolbar. Cheap when nothing changed,
 /// so a caller runs it every event-loop turn. Returns whether anything
 /// changed (so a caller can re-lay-out).
 ///
@@ -494,7 +587,7 @@ pub fn sync_paths_panel(
     state: &mut PathsPanel,
     names: &[String],
     selected: Option<&str>,
-    selected_empty: bool,
+    facts: PathsFacts,
 ) -> Result<bool, WidgetError> {
     // A closed panel's body is emptied (`close_panel`): the remembered rows
     // (or the empty-state label) are gone and are rebuilt like a name change.
@@ -503,8 +596,8 @@ pub fn sync_paths_panel(
             .rows
             .first()
             .is_some_and(|(id, _)| !tree.contains(*id));
-    let empty_changed = state.selected_empty != selected_empty;
-    state.selected_empty = selected_empty;
+    let facts_changed = state.facts != facts;
+    state.facts = facts;
     if dead || state.names != names {
         state.selected = selected.map(str::to_owned);
         populate_paths_panel(tree, panel, scales, state, names)?;
@@ -514,13 +607,8 @@ pub fn sync_paths_panel(
         select_path_row(tree, state, selected)?;
         return Ok(true);
     }
-    if empty_changed {
-        return sync_paths_toolbar(
-            tree,
-            &state.toolbar,
-            state.selected.is_some(),
-            selected_empty,
-        );
+    if facts_changed {
+        return sync_paths_toolbar(tree, &state.toolbar, state.selected.is_some(), facts);
     }
     Ok(false)
 }

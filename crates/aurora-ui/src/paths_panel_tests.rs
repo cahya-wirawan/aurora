@@ -2,7 +2,7 @@
 
 use super::{
     MAKE_SELECTION_EMPTY, MAKE_SELECTION_UNAVAILABLE, NO_PATHS_TEXT, PATH_DELETE_UNAVAILABLE,
-    PATHS_TOOLBAR_LABEL, PathsAction, is_paths_toolbar_button, populate_paths_panel,
+    PATHS_TOOLBAR_LABEL, PathsAction, PathsFacts, is_paths_toolbar_button, populate_paths_panel,
     select_path_row, set_paths_toolbar_hover, sync_paths_panel, sync_paths_toolbar,
 };
 use crate::workspace::{Workspace, build_workspace, select_panel_tab};
@@ -148,7 +148,7 @@ fn selecting_a_row_highlights_it_and_enables_the_toolbar_with_reasons() {
     assert_eq!(description_of(&ws, delete), PATH_DELETE_UNAVAILABLE);
     assert_eq!(description_of(&ws, new), PathsAction::NewPath.description());
 
-    ws.paths_state.selected_empty = false;
+    ws.paths_state.facts = PathsFacts::default();
     let mut state = ws.paths_state.clone();
     assert!(select_path_row(&mut ws.tree, &mut state, Some("B")).is_ok());
     ws.paths_state = state;
@@ -174,7 +174,16 @@ fn selecting_a_row_highlights_it_and_enables_the_toolbar_with_reasons() {
 
     // An empty selected path cannot make a selection; Delete still works.
     assert_eq!(
-        sync_paths_toolbar(&mut ws.tree, &toolbar, true, true).ok(),
+        sync_paths_toolbar(
+            &mut ws.tree,
+            &toolbar,
+            true,
+            PathsFacts {
+                selected_empty: true,
+                ..PathsFacts::default()
+            }
+        )
+        .ok(),
         Some(true)
     );
     assert!(disabled(&ws, PathsAction::MakeSelection));
@@ -202,7 +211,10 @@ fn sync_rebuilds_on_a_name_change_and_only_rehighlights_on_a_selection_change() 
             &mut state,
             &names(list),
             sel,
-            empty,
+            PathsFacts {
+                selected_empty: empty,
+                ..PathsFacts::default()
+            },
         );
         ws.paths_state = state;
         out.ok()
@@ -264,6 +276,9 @@ fn the_toolbar_has_three_named_buttons_that_hover_and_are_not_other_toolbars() {
     assert_eq!(node.label(), Some(PATHS_TOOLBAR_LABEL));
     for (action, expected) in [
         (PathsAction::MakeSelection, "Make selection from path"),
+        (PathsAction::FillPath, "Fill path"),
+        (PathsAction::StrokePath, "Stroke path"),
+        (PathsAction::MakeWorkPath, "Make work path from selection"),
         (PathsAction::NewPath, "New path"),
         (PathsAction::DeletePath, "Delete path"),
     ] {
@@ -336,7 +351,7 @@ fn closing_and_reopening_the_panel_rebuilds_its_emptied_body() {
         &mut state,
         &[],
         None,
-        false,
+        PathsFacts::default(),
     );
     ws.paths_state = state;
     assert_eq!(out.ok(), Some(true), "the empty state came back");
@@ -353,7 +368,7 @@ fn closing_and_reopening_the_panel_rebuilds_its_emptied_body() {
         &mut state,
         &names(&["A"]),
         None,
-        false,
+        PathsFacts::default(),
     );
     ws.paths_state = state;
     assert_eq!(out.ok(), Some(true));
@@ -364,4 +379,93 @@ fn closing_and_reopening_the_panel_rebuilds_its_emptied_body() {
             .all(|(id, _)| ws.tree.contains(*id))
     );
     assert_eq!(ws.paths_state.rows.len(), 1);
+}
+
+#[test]
+fn fill_stroke_and_make_path_follow_their_facts() {
+    use super::{
+        FILL_TOO_SMALL, FILL_UNAVAILABLE, MAKE_PATH_UNAVAILABLE, STROKE_TOO_SMALL,
+        STROKE_UNAVAILABLE,
+    };
+    let mut ws = build_workspace(&scales());
+    let toolbar = ws.paths_state.toolbar;
+    let describe = |ws: &Workspace, a: PathsAction| {
+        toolbar
+            .button_for(a)
+            .map(|id| description_of(ws, id))
+            .unwrap_or_default()
+    };
+    // Nothing selected: all three off, each with its own reason.
+    assert!(disabled(&ws, PathsAction::FillPath));
+    assert!(disabled(&ws, PathsAction::StrokePath));
+    assert!(disabled(&ws, PathsAction::MakeWorkPath));
+    assert_eq!(describe(&ws, PathsAction::FillPath), FILL_UNAVAILABLE);
+    assert_eq!(describe(&ws, PathsAction::StrokePath), STROKE_UNAVAILABLE);
+    assert_eq!(
+        describe(&ws, PathsAction::MakeWorkPath),
+        MAKE_PATH_UNAVAILABLE
+    );
+    let sync = |ws: &mut Workspace, selected: bool, facts: PathsFacts| {
+        assert!(sync_paths_toolbar(&mut ws.tree, &toolbar, selected, facts).is_ok());
+    };
+    // A selected path with two points can be stroked, not filled.
+    sync(
+        &mut ws,
+        true,
+        PathsFacts {
+            can_stroke: true,
+            ..PathsFacts::default()
+        },
+    );
+    assert!(disabled(&ws, PathsAction::FillPath));
+    assert!(!disabled(&ws, PathsAction::StrokePath));
+    assert_eq!(describe(&ws, PathsAction::FillPath), FILL_TOO_SMALL);
+    // Three points can do both; the reason text follows.
+    sync(
+        &mut ws,
+        true,
+        PathsFacts {
+            can_fill: true,
+            can_stroke: true,
+            ..PathsFacts::default()
+        },
+    );
+    assert!(!disabled(&ws, PathsAction::FillPath));
+    assert_eq!(
+        describe(&ws, PathsAction::FillPath),
+        PathsAction::FillPath.description()
+    );
+    // Capable facts without a selected path still disable both.
+    sync(
+        &mut ws,
+        false,
+        PathsFacts {
+            can_fill: true,
+            can_stroke: true,
+            ..PathsFacts::default()
+        },
+    );
+    assert!(disabled(&ws, PathsAction::FillPath));
+    assert!(disabled(&ws, PathsAction::StrokePath));
+    assert_eq!(describe(&ws, PathsAction::StrokePath), STROKE_UNAVAILABLE);
+    // Make Work Path needs only a selection, not a path.
+    sync(
+        &mut ws,
+        false,
+        PathsFacts {
+            has_selection: true,
+            ..PathsFacts::default()
+        },
+    );
+    assert!(!disabled(&ws, PathsAction::MakeWorkPath));
+    assert!(!disabled(&ws, PathsAction::NewPath));
+    sync(
+        &mut ws,
+        true,
+        PathsFacts {
+            can_fill: true,
+            ..PathsFacts::default()
+        },
+    );
+    assert_eq!(describe(&ws, PathsAction::StrokePath), STROKE_TOO_SMALL);
 }

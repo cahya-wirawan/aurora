@@ -491,3 +491,216 @@ fn a_release_names_a_range_violation_and_a_cap_violation_differently() {
     let up = pen.release(&mut paths);
     assert_eq!(up.refused, Some(super::POINT_LIMIT_NOTICE));
 }
+
+// ---- 0.234.0: pen editing ------------------------------------------------
+
+use super::{CONVERT_POINT_LABEL, INSERT_POINT_LABEL};
+use aurora_doc::SegmentHit;
+
+fn open_line() -> (PenState, PathSet) {
+    let mut pen = PenState::default();
+    let mut paths = PathSet::new();
+    for p in [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)] {
+        click(&mut pen, &mut paths, p);
+    }
+    pen.end_subpath();
+    (pen, paths)
+}
+
+#[test]
+fn a_press_on_a_segment_inserts_an_anchor_as_one_add_point_step() {
+    let (mut pen, mut paths) = open_line();
+    let hit = SegmentHit {
+        subpath: 0,
+        segment: 0,
+        t: 0.25,
+        distance: 1.0,
+    };
+    let down = pen.press_at(&mut paths, (25.0, 1.0), None, Some(hit), R, false);
+    let Some(step) = down.step else {
+        unreachable!("a step");
+    };
+    assert_eq!(step.label, INSERT_POINT_LABEL);
+    assert_eq!(step.label, "Add Point");
+    assert!(!pen.dragging(), "no drag follows an insertion");
+    let subs = work(&paths);
+    assert_eq!(
+        points(&subs[0]),
+        vec![(0.0, 0.0), (25.0, 0.0), (100.0, 0.0), (100.0, 100.0)]
+    );
+    assert_eq!(pen.selected(), Some(r(0, 1)));
+    assert_eq!(step.before.work().map(|p| p.anchor_count()), Some(3));
+    assert_eq!(step.after.work().map(|p| p.anchor_count()), Some(4));
+}
+
+#[test]
+fn a_segment_press_while_a_subpath_is_in_progress_adds_at_the_pointer_instead() {
+    let mut pen = PenState::default();
+    let mut paths = PathSet::new();
+    click(&mut pen, &mut paths, (0.0, 0.0));
+    click(&mut pen, &mut paths, (100.0, 0.0));
+    let hit = SegmentHit {
+        subpath: 0,
+        segment: 0,
+        t: 0.5,
+        distance: 1.0,
+    };
+    let down = pen.press_at(&mut paths, (50.0, 1.0), None, Some(hit), R, false);
+    pen.release(&mut paths);
+    assert_eq!(
+        down.step.map(|s| s.label),
+        None,
+        "the add is recorded at the release"
+    );
+    assert_eq!(work(&paths)[0].anchors.len(), 3);
+    assert_eq!(work(&paths)[0].anchors[2].point, (50.0, 1.0));
+}
+
+#[test]
+fn an_anchor_hit_wins_over_a_segment() {
+    let (mut pen, mut paths) = open_line();
+    let hit = SegmentHit {
+        subpath: 0,
+        segment: 0,
+        t: 0.0,
+        distance: 0.0,
+    };
+    pen.press_at(
+        &mut paths,
+        (0.0, 0.0),
+        Some(PathPart::Anchor(r(0, 0))),
+        Some(hit),
+        R,
+        false,
+    );
+    assert!(pen.dragging());
+    assert_eq!(work(&paths)[0].anchors.len(), 3, "nothing inserted");
+}
+
+#[test]
+fn alt_click_on_an_anchor_converts_it_both_ways_as_one_step_each() {
+    let (mut pen, mut paths) = open_line();
+    let down = pen.press(
+        &mut paths,
+        (100.0, 0.0),
+        Some(PathPart::Anchor(r(0, 1))),
+        R,
+        true,
+    );
+    let Some(step) = down.step else {
+        unreachable!("a step");
+    };
+    assert_eq!(step.label, CONVERT_POINT_LABEL);
+    assert!(!pen.dragging());
+    let smooth = work(&paths)[0].anchors[1];
+    assert!(!smooth.is_corner());
+    assert!(smooth.handle_out.0 != 0.0 || smooth.handle_out.1 != 0.0);
+    let back = pen.press(
+        &mut paths,
+        (100.0, 0.0),
+        Some(PathPart::Anchor(r(0, 1))),
+        R,
+        true,
+    );
+    assert_eq!(back.step.map(|s| s.label), Some("Convert Point"));
+    assert!(work(&paths)[0].anchors[1].is_corner());
+}
+
+#[test]
+fn alt_click_on_a_lone_anchor_changes_nothing_and_records_nothing() {
+    let mut pen = PenState::default();
+    let mut paths = PathSet::new();
+    click(&mut pen, &mut paths, (5.0, 5.0));
+    let down = pen.press(
+        &mut paths,
+        (5.0, 5.0),
+        Some(PathPart::Anchor(r(0, 0))),
+        R,
+        true,
+    );
+    assert!(down.step.is_none());
+}
+
+#[test]
+fn delete_anchor_removes_a_chosen_anchor_without_a_selection() {
+    let (mut pen, mut paths) = open_line();
+    pen.reset_editing();
+    assert_eq!(pen.selected(), None);
+    let out = pen.delete_anchor(&mut paths, r(0, 1));
+    assert_eq!(out.step.map(|s| s.label), Some(DELETE_ANCHOR_LABEL));
+    assert_eq!(points(&work(&paths)[0]), vec![(0.0, 0.0), (100.0, 100.0)]);
+}
+
+#[test]
+fn after_an_undo_the_next_click_continues_an_open_last_subpath_unless_enter_ended_it() {
+    let mut pen = PenState::default();
+    let mut paths = PathSet::new();
+    click(&mut pen, &mut paths, (0.0, 0.0));
+    click(&mut pen, &mut paths, (10.0, 0.0));
+    // An undo replaces the path set from outside.
+    pen.paths_replaced(&paths);
+    assert!(pen.drawing().is_none());
+    click(&mut pen, &mut paths, (20.0, 0.0));
+    assert_eq!(work(&paths).len(), 1, "continued, not a new subpath");
+    assert_eq!(work(&paths)[0].anchors.len(), 3);
+    // Enter ends it: the next click starts a new subpath, even after the
+    // tool was switched away and back (reset_editing keeps the flag).
+    pen.end_subpath();
+    pen.reset_editing();
+    click(&mut pen, &mut paths, (50.0, 50.0));
+    assert_eq!(work(&paths).len(), 2);
+    // Switching path forgets the flag: with a closed last subpath nothing
+    // is continued, with an open one it is.
+    pen.set_active(None);
+    pen.set_active(Some(WORK_PATH_NAME.to_owned()));
+    click(&mut pen, &mut paths, (60.0, 60.0));
+    assert_eq!(work(&paths).len(), 2);
+    assert_eq!(work(&paths)[1].anchors.len(), 2);
+}
+
+#[test]
+fn a_closed_last_subpath_is_never_continued() {
+    let (mut pen, mut paths) = with_square();
+    pen.paths_replaced(&paths);
+    click(&mut pen, &mut paths, (500.0, 500.0));
+    assert_eq!(work(&paths).len(), 2);
+}
+
+#[test]
+fn a_segment_insertion_at_the_subpath_cap_is_refused_and_one_below_is_not() {
+    let mut paths = PathSet::new();
+    assert!(paths.ensure_work().is_ok());
+    let line = |n: usize| Subpath {
+        anchors: (0..n).map(|i| Anchor::corner(i as f32, 0.0)).collect(),
+        closed: false,
+    };
+    assert!(
+        paths
+            .set_subpaths(WORK_PATH_NAME, vec![line(MAX_ANCHORS_PER_SUBPATH)])
+            .is_ok()
+    );
+    let mut pen = PenState::default();
+    pen.set_active(Some(WORK_PATH_NAME.to_owned()));
+    let hit = SegmentHit {
+        subpath: 0,
+        segment: 3,
+        t: 0.5,
+        distance: 0.0,
+    };
+    let before = paths.clone();
+    let out = pen.press_at(&mut paths, (3.5, 0.0), None, Some(hit), R, false);
+    assert_eq!(out.refused, Some(super::SUBPATH_FULL_NOTICE));
+    assert!(out.step.is_none());
+    assert_eq!(paths, before, "nothing changed");
+    assert!(paths.validate().is_ok());
+    // One below the cap takes the new anchor and stays valid.
+    assert!(
+        paths
+            .set_subpaths(WORK_PATH_NAME, vec![line(MAX_ANCHORS_PER_SUBPATH - 1)])
+            .is_ok()
+    );
+    let out = pen.press_at(&mut paths, (3.5, 0.0), None, Some(hit), R, false);
+    assert!(out.refused.is_none() && out.step.is_some());
+    assert_eq!(work(&paths)[0].anchors.len(), MAX_ANCHORS_PER_SUBPATH);
+    assert!(paths.validate().is_ok());
+}
