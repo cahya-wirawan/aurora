@@ -700,9 +700,10 @@ fn note_text(note: Note, n: u64) -> String {
             aurora_core::effects::MAX_SHADOW_APRON
         ),
         Note::ClippingDropped => format!(
-            "{n} clipped layer{s} {is} shown unclipped — {} base is a group or an adjustment \
-             layer, or there is no layer beneath to clip to.",
-            if one { "its" } else { "their" }
+            "{n} clipped layer{s} {is} shown unclipped — {} base is an adjustment layer, {} a \
+             group (Aurora can't clip a group yet), or there is no layer beneath to clip to.",
+            if one { "its" } else { "their" },
+            if one { "it is" } else { "they are" }
         ),
         Note::AdjustmentUnderGroupFill => format!(
             "{n} adjustment layer{s} sit{} inside a group nested in a Pass Through group whose \
@@ -4760,14 +4761,18 @@ impl Builder<'_, '_, '_> {
         if props.clipped {
             match self.history.set_clipped(self.layers, id, true) {
                 Ok(_) => {
-                    // Aurora composites a clip group over a pixel base only.
-                    let base_is_pixel = self.layers.clip_base(id).is_some_and(|base| {
+                    // Aurora composites a clip group over a pixel or (since
+                    // 0.243.0) a group base.
+                    let base_is_clippable = self.layers.clip_base(id).is_some_and(|base| {
                         matches!(
                             self.layers.kind(base),
-                            Some(aurora_doc::LayerKind::Pixel { .. })
+                            Some(
+                                aurora_doc::LayerKind::Pixel { .. }
+                                    | aurora_doc::LayerKind::Group { .. }
+                            )
                         )
                     });
-                    if !base_is_pixel {
+                    if !base_is_clippable {
                         self.clip_refused = self.clip_refused.saturating_add(1);
                         self.note_adjustment_unclipped(id);
                     }

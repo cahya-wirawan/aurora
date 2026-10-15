@@ -18954,10 +18954,11 @@ thread_local! {
 }
 
 /// The layer `id` composites clipped to (0.201.0): its
-/// [`aurora_doc::LayerTree::clip_base`] when that base is a **pixel**
-/// layer. A clipped layer whose base is a group or an adjustment layer
-/// (or that has no base) composites as an ordinary layer: Aurora folds a
-/// clip group over a pixel base only.
+/// [`aurora_doc::LayerTree::clip_base`] when that base is a **pixel** layer
+/// or, since 0.243.0, a **group** (Photoshop limits the clipped layers to the
+/// shape of what the group composites to, as the corpus' `clipping-mask3/4/5`
+/// show). A clipped layer whose base is an adjustment layer (or that has no
+/// base) composites as an ordinary layer.
 fn clip_base_of(
     layers: &aurora_doc::LayerTree,
     id: aurora_doc::LayerId,
@@ -18970,7 +18971,11 @@ fn clip_base_of(
         return None;
     }
     let base = layers.clip_base(id)?;
-    matches!(layers.kind(base), Some(aurora_doc::LayerKind::Pixel { .. })).then_some(base)
+    matches!(
+        layers.kind(base),
+        Some(aurora_doc::LayerKind::Pixel { .. } | aurora_doc::LayerKind::Group { .. })
+    )
+    .then_some(base)
 }
 
 /// The layers clipped to `kept[index]`, bottom to top: the run of clipped
@@ -19089,6 +19094,23 @@ fn fold_clip_group(
     depth: usize,
     budget: &mut CompositeBudget,
 ) -> bool {
+    // A group base (0.243.0): its isolated composite, mask and all, is the
+    // clip group's content, folded with the group's own opacity and mode
+    // (a Pass Through group as Normal, as everywhere it is taken as a unit).
+    if matches!(layers.kind(base), Some(aurora_doc::LayerKind::Group { .. })) {
+        return fold_group_clip_group(
+            accumulator,
+            base,
+            clipped,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            budget,
+        );
+    }
     let with_effects = cover.is_none() && layer_renders_effects(layers, base);
     let mut changed = false;
     if with_effects {
@@ -19170,6 +19192,184 @@ fn fold_clip_group(
         fold_texels_in_mode(accumulator, &group, opacity, mode, doc_origin);
     });
     true
+}
+
+/// [`fold_clip_group`] for a **group** base (0.243.0): the group's own
+/// content is the clip group's content, each clipped layer folds atop it
+/// limited to that shape ([`fold_clipped_atop`]), and the result folds onto
+/// the accumulator with the group's opacity and Fill. Derived from
+/// Photoshop's merged images of `clipping-mask3/4/5.psd` and
+/// `passthrough_clipping_mask_*.psd`, where a layer clipped to a group is cut
+/// to the shape of the group's content (soft edges included).
+///
+/// An isolated group's content is its isolated composite ([`resolve_tile`]:
+/// children, mask, mode, and its opacity). A **Pass Through** group's
+/// children see the backdrop below it, so its content is what they add to
+/// the backdrop: the children fold onto a copy of the backdrop `B`, and onto
+/// a transparent tile for their own coverage `s`; the content, premultiplied,
+/// is `acc - (1 - s) * B` with alpha `s` (psd-tools unmixes the backdrop the
+/// same way), masked by the group's mask and folded as `Normal`.
+#[allow(clippy::too_many_arguments)]
+fn fold_group_clip_group(
+    accumulator: &mut [half::f16],
+    base: aurora_doc::LayerId,
+    clipped: &[aurora_doc::LayerId],
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> bool {
+    let pass_through = layers.blend_mode(base) == Some(aurora_doc::BlendMode::PassThrough);
+    let (mut group, opacity, mode) = if pass_through {
+        let Some((group, opacity)) = pass_through_content(
+            accumulator,
+            base,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            budget,
+        ) else {
+            return false;
+        };
+        (group, opacity, aurora_render::BlendMode::Normal)
+    } else {
+        let Some((texels, opacity, mode)) = resolve_tile(
+            base,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            budget,
+        ) else {
+            return false;
+        };
+        let mut group = aurora_render::transparent_tile();
+        aurora_render::composite_layer_into(
+            &mut group,
+            &texels,
+            1.0,
+            aurora_render::BlendMode::Normal,
+        );
+        (group, opacity, mode)
+    };
+    for &id in clipped {
+        fold_clipped_atop(
+            &mut group,
+            id,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            budget,
+        );
+    }
+    aurora_render::un_premultiply_in_place(&mut group);
+    profiled(ProfileSlot::LayerFold, || {
+        aurora_render::composite_layer_into(accumulator, &group, opacity, mode);
+    });
+    true
+}
+
+/// A Pass Through group's own content on this tile, premultiplied, and the
+/// opacity (times Fill) to fold it with ([`fold_group_clip_group`]).
+#[allow(clippy::too_many_arguments)]
+fn pass_through_content(
+    backdrop: &[half::f16],
+    base: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> Option<(Vec<half::f16>, f32)> {
+    if !admit_composite_node(base, layers, depth, budget) {
+        return None;
+    }
+    let opacity = content_opacity(layers, base)?;
+    let children = layers.children(base)?;
+    let mut acc = backdrop.to_vec();
+    let _ = fold_context_into(
+        &mut acc,
+        children,
+        layers,
+        store,
+        tile_id,
+        doc_origin,
+        reference_origin,
+        depth.saturating_add(1),
+        budget,
+        None,
+        true,
+    );
+    let mut own = aurora_render::transparent_tile();
+    let mut own_budget = CompositeBudget {
+        nodes: layers.len(),
+        reported: true,
+        store_errors: 0,
+        first_store_error: None,
+    };
+    let _ = fold_context_into(
+        &mut own,
+        children,
+        layers,
+        store,
+        tile_id,
+        doc_origin,
+        reference_origin,
+        depth.saturating_add(1),
+        &mut own_budget,
+        None,
+        true,
+    );
+    let coverage = layers.mask(base).filter(|mask| mask.enabled).map(|mask| {
+        let one = half::f16::from_f32(1.0);
+        apply_mask(
+            &vec![one; acc.len()],
+            mask,
+            layers.mask_surface_id(base),
+            store,
+            doc_origin,
+            budget,
+        )
+    });
+    let channels = aurora_tile::CHANNELS;
+    let mut content = vec![half::f16::ZERO; acc.len()];
+    for (index, ((out, (acc, below)), own)) in content
+        .chunks_exact_mut(channels)
+        .zip(
+            acc.chunks_exact(channels)
+                .zip(backdrop.chunks_exact(channels)),
+        )
+        .zip(own.chunks_exact(channels))
+        .enumerate()
+    {
+        let s = own.get(3).map_or(0.0, |a| a.to_f32()).clamp(0.0, 1.0);
+        let c = coverage.as_ref().map_or(1.0, |coverage| {
+            coverage
+                .get(index * channels + 3)
+                .map_or(0.0, |alpha| alpha.to_f32())
+        });
+        for (channel, (a, b)) in out.iter_mut().zip(acc.iter().zip(below)).take(3) {
+            let value = (-b.to_f32()).mul_add(1.0 - s, a.to_f32()).max(0.0);
+            *channel = half::f16::from_f32(value * c);
+        }
+        if let Some(alpha) = out.get_mut(3) {
+            *alpha = half::f16::from_f32(s * c);
+        }
+    }
+    Some((content, opacity))
 }
 
 /// Folds the node a [`FoldPlan`] starts at: the cover itself — the plain
