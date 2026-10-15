@@ -310,3 +310,62 @@ fn paths_and_a_damaged_selection_report_both_reasons() {
         "paths still restored"
     );
 }
+
+/// G-2's sibling: hostile coordinates (infinities, NaN, the extremes of
+/// `f32` and sums of two of them) in any slot of any anchor drop the
+/// paths with the ordinary notice and never panic.
+#[test]
+fn extreme_coordinates_in_any_slot_drop_the_paths() {
+    let v = PATHS_VERSION;
+    let hostile = [
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::MAX,
+        f32::MIN,
+        -f32::MAX,
+        1.0e30,
+    ];
+    for value in hostile {
+        for slot in 0..6 {
+            let mut anchor = [1.0_f32; 6];
+            if let Some(cell) = anchor.get_mut(slot) {
+                *cell = value;
+            }
+            let make = |name: &str| PathDto {
+                name: name.to_owned(),
+                subpaths: vec![(true, vec![anchor])],
+            };
+            assert!(
+                !dropped(&header(v, vec![make("n")], None)).is_empty(),
+                "slot {slot} value {value}"
+            );
+            // And as the work path.
+            let work = make(WORK_PATH_NAME);
+            assert!(
+                !dropped(&header(v, vec![], Some(work))).is_empty(),
+                "work path slot {slot} value {value}"
+            );
+        }
+    }
+    // Two huge but individually legal numbers whose sum overflows.
+    let mut sum = dto("s", 1);
+    sum.subpaths = vec![(false, vec![[f32::MAX, 0.0, f32::MAX, 0.0, 0.0, 0.0]])];
+    assert!(!dropped(&header(v, vec![sum], None)).is_empty());
+}
+
+/// The same hostile entry inside a container leaves the file open.
+#[test]
+fn a_container_with_hostile_path_coordinates_opens_without_the_paths() {
+    let mut bad = dto("n", 1);
+    bad.subpaths = vec![(true, vec![[f32::MAX, f32::MIN, 0.0, 0.0, 0.0, 0.0]])];
+    let file = with_entry(
+        &container(None),
+        PATHS_ENTRY,
+        Some(&header(PATHS_VERSION, vec![bad], None)),
+    );
+    let document = ok(open(&file));
+    assert!(document.selection.paths().is_empty());
+    assert!(document.selection_dropped.is_some());
+    assert_eq!(document.layers.len(), tree().len());
+}

@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.246.0] - 2026-10-15
+
+### Fixed
+
+- Harden the .aur save: durable Save As, hostile origins, deterministic manifest
+
 ## [0.245.0] - 2026-10-15
 
 ### Changed

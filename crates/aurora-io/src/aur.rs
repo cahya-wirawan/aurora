@@ -471,7 +471,8 @@ fn read_layer_clipping<R: Read + Seek>(
     }
     let wire: LayerClippingWire = postcard::from_bytes(&bytes)
         .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
-    // Bottom-most first, so each layer's base exists and is already settled.
+    // The wire order is top-first (`layer_ids` pre-order), and
+    // `set_clipped` does not depend on the order it is called in.
     for raw in wire.clipped {
         layers
             .set_clipped(aurora_doc::LayerId::from_raw(raw), true)

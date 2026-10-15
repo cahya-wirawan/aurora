@@ -178,6 +178,10 @@ impl RemovedSubtree {
 #[serde(try_from = "LayerTreeRepr")]
 pub struct LayerTree {
     ids: IdGenerator<Layer>,
+    // Written in ascending id order (0.246.0, G-17) so two saves of one
+    // document are byte-identical; the wire form is unchanged (a map is
+    // a length followed by its entries, in any order).
+    #[serde(serialize_with = "serialize_layers_sorted")]
     layers: HashMap<LayerId, LayerEntry>,
     /// Root-level layers. See this type's own doc comment for the
     /// ordering convention.
@@ -187,6 +191,20 @@ pub struct LayerTree {
     /// `.aur`'s `smart-objects` entry carries it. Cheap to clone (`Arc`s).
     #[serde(skip)]
     linked_files: std::collections::BTreeMap<String, crate::smart_object::LinkedFile>,
+}
+
+/// Serialises the layer map with its entries in ascending id order
+/// (0.246.0, G-17). `postcard` writes a map as a count and then each
+/// key and value, and readers collect the entries into a `HashMap`, so
+/// the order is free: this changes no byte of the format's meaning, only
+/// makes it canonical instead of the process's hash order.
+fn serialize_layers_sorted<S: serde::Serializer>(
+    layers: &HashMap<LayerId, LayerEntry>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut entries: Vec<(&LayerId, &LayerEntry)> = layers.iter().collect();
+    entries.sort_by_key(|(id, _)| id.to_raw());
+    serializer.collect_map(entries)
 }
 
 /// [`LayerTree`]'s own on-the-wire shape — field-for-field identical to
@@ -6594,5 +6612,110 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A tree of twelve layers across a group, for the canonical-order
+    /// tests below.
+    fn many_layer_tree() -> LayerTree {
+        let mut tree = LayerTree::new();
+        let group = match tree.add_group("g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for n in 0..11 {
+            let parent = if n % 2 == 0 { Some(group) } else { None };
+            if let Err(err) = tree.add_pixel_layer(format!("layer {n}"), bounds(), parent) {
+                unreachable!("{err:?}");
+            }
+        }
+        tree
+    }
+
+    /// `LayerTreeRepr`'s wire shape with the map spelled as a sequence of
+    /// pairs: `postcard` writes both as a count then the entries, so this
+    /// is how a test writes a map in any order it likes.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct PairsRepr {
+        ids: IdGenerator<Layer>,
+        layers: Vec<(super::LayerId, super::LayerEntry)>,
+        roots: Vec<super::LayerId>,
+    }
+
+    fn tree_bytes(tree: &LayerTree) -> Vec<u8> {
+        match postcard::to_allocvec(tree) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// G-17: the map is written in ascending id order.
+    #[test]
+    fn the_layer_map_is_written_in_ascending_id_order() {
+        let bytes = tree_bytes(&many_layer_tree());
+        let pairs: PairsRepr = match postcard::from_bytes(&bytes) {
+            Ok(pairs) => pairs,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(pairs.layers.len(), 12);
+        let raws: Vec<u64> = pairs.layers.iter().map(|(id, _)| id.to_raw()).collect();
+        let mut sorted = raws.clone();
+        sorted.sort_unstable();
+        assert_eq!(raws, sorted, "entries must be in ascending id order");
+    }
+
+    /// G-17: the same document gives the same bytes however its map was
+    /// built (each decode below fills a `HashMap` with a different hash
+    /// state), and bytes in the old hash-iteration order still decode to
+    /// that document, so the format needs no version bump.
+    #[test]
+    fn bytes_are_canonical_whatever_order_the_map_was_filled_in() {
+        let canonical = tree_bytes(&many_layer_tree());
+        let pairs: PairsRepr = match postcard::from_bytes(&canonical) {
+            Ok(pairs) => pairs,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut shuffled = PairsRepr {
+            ids: pairs.ids,
+            layers: pairs.layers,
+            roots: pairs.roots,
+        };
+        for round in 0..20 {
+            // A different order each round: rotate, and reverse on odd ones.
+            shuffled.layers.rotate_left(round % 7 + 1);
+            if round % 2 == 1 {
+                shuffled.layers.reverse();
+            }
+            let old_style = match postcard::to_allocvec(&shuffled) {
+                Ok(bytes) => bytes,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            // An old file (any order) is accepted by the current reader...
+            let tree: LayerTree = match postcard::from_bytes(&old_style) {
+                Ok(tree) => tree,
+                Err(err) => unreachable!("round {round}: {err:?}"),
+            };
+            // ...and written back, it is the canonical bytes exactly.
+            assert_eq!(tree_bytes(&tree), canonical, "round {round}");
+        }
+    }
+
+    /// G-17: the current writer's bytes are accepted by the unchanged
+    /// decoding logic (a plain `HashMap` map, as every older build reads).
+    #[test]
+    fn canonical_bytes_decode_as_an_ordinary_hash_map() {
+        let tree = many_layer_tree();
+        let bytes = tree_bytes(&tree);
+        let repr: super::LayerTreeRepr = match postcard::from_bytes(&bytes) {
+            Ok(repr) => repr,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(repr.layers.len(), 12);
+        assert_eq!(repr.roots.len(), tree.roots().len());
+        let ids: Vec<u64> = {
+            let mut v: Vec<u64> = repr.layers.keys().map(|id| id.to_raw()).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(ids, (0..12).collect::<Vec<u64>>());
     }
 }
