@@ -98,7 +98,8 @@
 //!   Curves (`curv`, 0.158.0), Levels (`levl`, 0.202.0) and Hue/Saturation
 //!   (`hue2`, 0.203.0/0.204.0) adjustment layers are imported as real
 //!   `aurora_doc::Adjustment` layers ([`PsdNode::Adjustment`]);
-//!   every other adjustment kind, a Grayscale file's Curves, and fill
+//!   every other adjustment kind, a Grayscale file's Hue/Saturation and
+//!   the kinds no Grayscale fixture checks (0.249.0), and fill
 //!   layers with no pixels are left out; text,
 //!   smart-object and shape layers open as their stored pixels. Every
 //!   one of those that a file actually uses is named in the report —
@@ -1977,20 +1978,28 @@ fn parse_curv(data: &[u8]) -> Result<CurvBlock, CurvRefusal> {
 /// channel wins, like psd-tools' dict); other channel ids are ignored, as
 /// psd-tools' `_apply_luts` ignores them in RGB. Each `(output, input)`
 /// level pair becomes the point `(input / 255, output / 255)`; the first
-/// and last points may be interior (movable endpoints). A Grayscale file's
-/// curves are not imported: its convention (psd-tools reads channel `1`
-/// as the grey curve and ignores `0`) has not been verified against
-/// Photoshop, and that file's corpus layers all sit in a Pass Through
-/// group, which confounds the comparison.
+/// and last points may be interior (movable endpoints).
+///
+/// **Grayscale (0.249.0).** A Grayscale file's one colour channel is
+/// channel `1` in the block (`curves_grayscale.psd`: every non-empty curve
+/// has bit 1 of its channel map set and a `Crv ` entry naming channel 1;
+/// the fourth layer's curve is channel 1 alone). It is imported as the
+/// same curve on red, green and blue, which act on the document's
+/// R = G = B grey, so the grey stays grey. Channel `0` (the RGB composite,
+/// which a Grayscale image does not have) is not known to be meaningful
+/// there, so a Grayscale block that carries one is left out and reported
+/// as before; channels `2` and `3` are ignored, as in RGB for ids above 3.
 fn curves_params(block: &CurvBlock, gray: bool) -> Result<aurora_core::CurvesParams, Note> {
-    if gray {
-        return Err(Note::CurvesGrayscale);
-    }
     let mut params = aurora_core::CurvesParams::identity();
+    let mut grey_curve = None;
     for (channel, levels) in &block.curves {
+        if gray && *channel == 0 {
+            return Err(Note::CurvesGrayscale);
+        }
         let slot = match channel {
             0 => None,
             1 => Some(&mut params.red),
+            2 | 3 if gray => continue,
             2 => Some(&mut params.green),
             3 => Some(&mut params.blue),
             _ => continue,
@@ -2009,10 +2018,19 @@ fn curves_params(block: &CurvBlock, gray: bool) -> Result<aurora_core::CurvesPar
             }
             Err(_) => return Err(Note::CurvesUnreadable),
         };
+        if gray {
+            grey_curve = Some(curve);
+            continue;
+        }
         match slot {
             None => params.composite = curve,
             Some(slot) => *slot = Some(curve),
         }
+    }
+    if let Some(curve) = grey_curve {
+        params.green = Some(curve.clone());
+        params.blue = Some(curve.clone());
+        params.red = Some(curve);
     }
     Ok(params)
 }
@@ -2065,12 +2083,18 @@ fn parse_levl(data: &[u8]) -> Result<LevlBlock, ()> {
 /// gamma by `100`. Any record outside [`aurora_core::LevelsChannel::new`]'s
 /// rules (an equal or reversed input range, a gamma outside 0.10..9.99, a
 /// level above 255) is unreadable: the layer is left out and reported
-/// rather than imported with a repaired value. A Grayscale file's Levels
-/// are not imported, as for Curves ([`curves_params`]).
+/// rather than imported with a repaired value.
+///
+/// **Grayscale (0.249.0).** A Grayscale file keeps its one channel in
+/// record `1` and leaves record `0` at the identity
+/// (`levels_grayscale.psd`: in all four layers record 0 is
+/// `0, 255, 0, 255, 100` and record 1 holds the adjustment, e.g. input
+/// 39..217, output 25..255, gamma 1.52). Record 1 is imported as the same
+/// channel on red, green and blue (the document's grey is R = G = B); a
+/// non-identity record 0 in a Grayscale file is not known to mean
+/// anything there, so such a layer is left out as before. Records 2 and 3
+/// are not read.
 fn levels_params(block: &LevlBlock, gray: bool) -> Result<aurora_core::LevelsParams, Note> {
-    if gray {
-        return Err(Note::LevelsGrayscale);
-    }
     let channel = |&(ib, iw, ob, ow, gamma): &LevlRecord| {
         if ib > 255 || iw > 255 || ob > 255 || ow > 255 {
             return Err(Note::LevelsUnreadable);
@@ -2085,6 +2109,18 @@ fn levels_params(block: &LevlBlock, gray: bool) -> Result<aurora_core::LevelsPar
         .map_err(|_| Note::LevelsUnreadable)
     };
     let [master, red, green, blue] = &block.records;
+    if gray {
+        if !channel(master)?.is_identity() {
+            return Err(Note::LevelsGrayscale);
+        }
+        let grey = channel(red)?;
+        return Ok(aurora_core::LevelsParams {
+            master: aurora_core::LevelsChannel::identity(),
+            red: grey,
+            green: grey,
+            blue: grey,
+        });
+    }
     Ok(aurora_core::LevelsParams {
         master: channel(master)?,
         red: channel(red)?,

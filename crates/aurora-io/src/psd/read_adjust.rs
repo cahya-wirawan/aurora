@@ -97,6 +97,28 @@ pub(super) enum Kind {
 }
 
 impl Kind {
+    /// Whether a Grayscale file's layer of this kind is imported (0.249.0).
+    /// Only the kinds a Grayscale fixture in the corpus checks against
+    /// Photoshop's own merged image are listed; every other kind keeps the
+    /// "hasn't verified Grayscale" left-out line. A Grayscale document is
+    /// held as R = G = B, so each listed kind acts on that grey exactly as
+    /// it does on an RGB document whose three channels are equal (its
+    /// block layout is the RGB one: `thrs` and `post` are 4 bytes, `nvrt`
+    /// is empty, `brit`/`CgEd` carry the same descriptor). **Exposure is
+    /// deliberately not listed**: its block is the RGB layout too, but
+    /// Photoshop applies it in the linear light of the file's grey profile
+    /// (`exposure_grayscale.psd` embeds "Dot Gain 20%", a 256-entry curve,
+    /// and a model using that curve reproduces Photoshop's merged image to
+    /// 0.01-0.3 levels where the sRGB model Aurora has is 11.4 levels off),
+    /// and Aurora ignores the embedded grey profile. The other listed kinds
+    /// act on the encoded value and do not depend on it.
+    pub(super) const fn gray_verified(self) -> bool {
+        matches!(
+            self,
+            Self::Invert | Self::Threshold | Self::Posterize | Self::BrightnessContrast
+        )
+    }
+
     /// The name Photoshop and Aurora give the adjustment.
     pub(super) const fn label(self) -> &'static str {
         match self {
@@ -364,7 +386,7 @@ fn parse_exposure(data: &[u8]) -> Result<ExposureBlock, ()> {
 /// down to `0.01`; a layer below Aurora's `0.10` is left out and reported,
 /// not clamped.
 pub(super) fn exposure_adjustment(block: &ExposureBlock, gray: bool) -> Result<Adjustment, Note> {
-    if gray {
+    if gray && !Kind::Exposure.gray_verified() {
         return Err(Note::Grayscale(Kind::Exposure));
     }
     aurora_core::ExposureParams::new(block.exposure, block.offset, block.gamma)
@@ -646,7 +668,7 @@ fn brightness_contrast_adjustment(
     gray: bool,
 ) -> Result<Adjustment, Note> {
     let unreadable = || Note::Unreadable(Kind::BrightnessContrast);
-    if gray {
+    if gray && !Kind::BrightnessContrast.gray_verified() {
         return Err(Note::Grayscale(Kind::BrightnessContrast));
     }
     let brit = brit.map_err(|()| unreadable())?;
@@ -684,6 +706,13 @@ fn brightness_contrast_adjustment(
     };
     if options {
         return Err(Note::BrightnessContrastOption);
+    }
+    // Use Legacy in a Grayscale file: the one fixture
+    // (`brightnesscontrast_legacy_grayscale.psd`) is 3.0 levels off
+    // (max 7) with the layer imported against 5.2 left out, where the RGB
+    // variant is 0.05 off; the difference is unexplained, so it stays out.
+    if gray && legacy {
+        return Err(Note::Grayscale(Kind::BrightnessContrast));
     }
     aurora_core::BrightnessContrastParams::new(brightness, contrast, legacy)
         .map(Adjustment::BrightnessContrast)
@@ -1115,23 +1144,23 @@ pub(super) fn adjustment(parsed: &Parsed, gray: bool) -> Result<Adjustment, Note
             .map_err(|()| Note::Unreadable(Kind::ColorBalance))
             .and_then(|b| color_balance_adjustment(b, gray)),
         Parsed::Invert(b) => match (b, gray) {
-            (_, true) => Err(Note::Grayscale(Kind::Invert)),
+            (_, true) if !Kind::Invert.gray_verified() => Err(Note::Grayscale(Kind::Invert)),
             (Err(()), _) => Err(Note::Unreadable(Kind::Invert)),
-            (Ok(()), false) => Ok(Adjustment::Invert),
+            (Ok(()), _) => Ok(Adjustment::Invert),
         },
         Parsed::Threshold(b) => match (b, gray) {
-            (_, true) => Err(Note::Grayscale(Kind::Threshold)),
+            (_, true) if !Kind::Threshold.gray_verified() => Err(Note::Grayscale(Kind::Threshold)),
             (Err(()), _) => Err(Note::Unreadable(Kind::Threshold)),
-            (Ok(level), false) => u8::try_from(*level)
+            (Ok(level), _) => u8::try_from(*level)
                 .map_err(|_| ())
                 .and_then(|l| aurora_core::ThresholdParams::new(l).map_err(|_| ()))
                 .map(Adjustment::Threshold)
                 .map_err(|()| Note::Unreadable(Kind::Threshold)),
         },
         Parsed::Posterize(b) => match (b, gray) {
-            (_, true) => Err(Note::Grayscale(Kind::Posterize)),
+            (_, true) if !Kind::Posterize.gray_verified() => Err(Note::Grayscale(Kind::Posterize)),
             (Err(()), _) => Err(Note::Unreadable(Kind::Posterize)),
-            (Ok(levels), false) => u8::try_from(*levels)
+            (Ok(levels), _) => u8::try_from(*levels)
                 .map_err(|_| ())
                 .and_then(|l| aurora_core::PosterizeParams::new(l).map_err(|_| ()))
                 .map(Adjustment::Posterize)
