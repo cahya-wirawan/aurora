@@ -16588,8 +16588,8 @@ fn pixel_layer_texels_unprofiled(
 /// groups (where Fill fades the group's composited content exactly like
 /// opacity, as psd-tools' `Compositor.apply` does with its `shape_const`)
 /// and adjustment layers (psd-tools' `_apply_adjustment` multiplies Fill in
-/// the same way). Not for a Pass Through group, whose Fill is still
-/// reported rather than applied (see [`fold_pass_through_group`]).
+/// the same way). Not for a Pass Through group, whose Fill multiplies its
+/// interpolation factor instead (0.243.0, [`fold_pass_through_group`]).
 #[must_use]
 fn content_opacity(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> Option<f32> {
     let opacity = layers.opacity(id)?;
@@ -18072,11 +18072,23 @@ fn fold_layer_into(
 /// in straight colour). With opacity `1` and no enabled mask the
 /// backdrop is not copied at all and the result is `C` exactly.
 ///
-/// The group's **Fill** opacity is still not applied (the PSD reader
-/// reports it), though every other layer's is since 0.181.0
-/// ([`content_opacity`]): psd-tools treats a Pass Through group with Fill
-/// below 100 % specially (it isolates adjustments inside it and falls back
-/// from pass-through compositing), and that is not reproduced here yet.
+/// The group's **Fill** (0.243.0) multiplies the interpolation factor:
+/// `result = B + (C - B) * (opacity * mask_coverage * fill)`. Derived from
+/// Photoshop's own merged images (`passthrough_fill_blendmode.psd`,
+/// `passthrough_fill_adjustment.psd`), where a group at Fill 40 % shows 40 %
+/// of what its children produce, blend modes included.
+///
+/// **Adjustments under a Fill below 100 %.** Photoshop does not let an
+/// adjustment layer inside such a group reach the backdrop: it adjusts only
+/// where the group's own content is (psd-tools' `isolate_adjustments`,
+/// confirmed on `passthrough_fill_adjustment.psd`: white backdrop texels
+/// stay white, group content is adjusted before the Fill mixes it in). So
+/// with Fill below 100 % an unclipped adjustment child is weighted, texel by
+/// texel, by the alpha the group's children below it paint on their own
+/// ([`fold_children_isolating_adjustments`]). Limits: only direct children
+/// are isolated (an adjustment inside a nested group is not), and the
+/// weight is the content's alpha including its layer opacity.
+///
 /// `Dissolve` cannot occur: the group's mode *is* Pass Through.
 ///
 /// Returns whether anything changed the accumulator, the same contract
@@ -18103,12 +18115,13 @@ fn fold_pass_through_group(
     let Some(children) = layers.children(id) else {
         return false;
     };
+    let fill = layers.fill_opacity(id).unwrap_or(1.0);
     // Exactly the backdrop, untouched: the formula above at `t = 0`.
-    if opacity <= 0.0 {
+    if opacity <= 0.0 || fill <= 0.0 {
         return false;
     }
     let mask = layers.mask(id).filter(|mask| mask.enabled);
-    let backdrop = (opacity < 1.0 || mask.is_some()).then(|| accumulator.to_vec());
+    let backdrop = (opacity < 1.0 || fill < 1.0 || mask.is_some()).then(|| accumulator.to_vec());
     // Occlusion culling (0.183.0): `plan` is the rest of the enclosing
     // context's plan when this group is opaque and on its path. A
     // translucent or masked group is a boundary for the enclosing search,
@@ -18128,19 +18141,34 @@ fn fold_pass_through_group(
         None
     };
     let plan = plan.or_else(|| confined.as_ref().map(FoldPlan::as_ref));
-    let changed = fold_context_into(
-        accumulator,
-        children,
-        layers,
-        store,
-        tile_id,
-        doc_origin,
-        reference_origin,
-        depth.saturating_add(1),
-        budget,
-        plan,
-        true,
-    ) > 0;
+    let isolate = fill < 1.0 && has_unclipped_adjustment(children, layers);
+    let changed = if isolate {
+        fold_children_isolating_adjustments(
+            accumulator,
+            children,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth.saturating_add(1),
+            budget,
+        ) > 0
+    } else {
+        fold_context_into(
+            accumulator,
+            children,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth.saturating_add(1),
+            budget,
+            plan,
+            true,
+        ) > 0
+    };
     if !changed {
         return false;
     }
@@ -18171,13 +18199,139 @@ fn fold_pass_through_group(
                 .get(index * aurora_tile::CHANNELS + 3)
                 .map_or(0.0, |alpha| alpha.to_f32())
         });
-        let t = (opacity * covered).clamp(0.0, 1.0);
+        let t = (opacity * covered * fill).clamp(0.0, 1.0);
         for (channel, &base) in out.iter_mut().zip(below) {
             let b = base.to_f32();
             *channel = half::f16::from_f32((channel.to_f32() - b).mul_add(t, b));
         }
     }
     true
+}
+
+/// Whether `nodes` hold an adjustment layer that is not clipped (0.243.0):
+/// the case [`fold_children_isolating_adjustments`] exists for.
+fn has_unclipped_adjustment(nodes: &[aurora_doc::LayerId], layers: &aurora_doc::LayerTree) -> bool {
+    nodes.iter().any(|&id| is_isolatable_adjustment(layers, id))
+}
+
+fn is_isolatable_adjustment(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> bool {
+    matches!(layers.kind(id), Some(aurora_doc::LayerKind::Adjustment(_))) && !layers.clipped(id)
+}
+
+/// Folds a Pass Through group's children (0.243.0) the way Photoshop does
+/// when the group's Fill is below 100 %: an unclipped adjustment layer
+/// adjusts only where the group's own content is, so its effect is weighted
+/// per texel by the alpha the children below it paint **on their own**.
+///
+/// The children fold into `accumulator` as usual, in segments split at each
+/// unclipped adjustment; the same segments also fold into a transparent
+/// `own` accumulator, whose alpha is the weight. An adjustment folds into
+/// `accumulator` and the result is `before + w * (after - before)` in
+/// premultiplied space (an adjustment never changes alpha, so this is the
+/// straight-colour interpolation psd-tools does). Returns how many nodes
+/// changed the accumulator.
+#[allow(clippy::too_many_arguments)]
+fn fold_children_isolating_adjustments(
+    accumulator: &mut [half::f16],
+    children: &[aurora_doc::LayerId],
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> usize {
+    let mut own = vec![half::f16::ZERO; accumulator.len()];
+    // The second fold of each segment has a budget of its own: charged to
+    // the pass's, the repeat visits would starve the real fold. (Its store
+    // errors are not counted; the real fold reads the same tiles and
+    // counts them.)
+    let mut own_budget = CompositeBudget {
+        nodes: layers.len(),
+        reported: true,
+        store_errors: 0,
+        first_store_error: None,
+    };
+    let mut folded = 0_usize;
+    // `children` is newest first: walk it from the end (the bottom).
+    let mut end = children.len();
+    while end > 0 {
+        // The segment is the run of non-adjustment nodes ending at `end`
+        // (exclusive) and reaching up (to smaller indices) to the next
+        // isolatable adjustment, which is the boundary.
+        let boundary = children.get(..end).and_then(|head| {
+            head.iter()
+                .rposition(|&id| is_isolatable_adjustment(layers, id))
+        });
+        let segment_start = boundary.map_or(0, |at| at + 1);
+        if let Some(segment) = children.get(segment_start..end)
+            && !segment.is_empty()
+        {
+            folded = folded.saturating_add(fold_context_into(
+                accumulator,
+                segment,
+                layers,
+                store,
+                tile_id,
+                doc_origin,
+                reference_origin,
+                depth,
+                budget,
+                None,
+                true,
+            ));
+            fold_context_into(
+                &mut own,
+                segment,
+                layers,
+                store,
+                tile_id,
+                doc_origin,
+                reference_origin,
+                depth,
+                &mut own_budget,
+                None,
+                true,
+            );
+        }
+        let Some(at) = boundary else { break };
+        end = at;
+        let Some(&adjustment) = children.get(at) else {
+            break;
+        };
+        let before = accumulator.to_vec();
+        if apply_adjustment_layer(
+            accumulator,
+            adjustment,
+            layers,
+            store,
+            doc_origin,
+            depth,
+            budget,
+        ) {
+            folded = folded.saturating_add(1);
+            weight_towards(accumulator, &before, &own);
+        }
+    }
+    folded
+}
+
+/// `out = before + w * (out - before)` per texel and channel, `w` the alpha
+/// of `own` at that texel ([`fold_children_isolating_adjustments`]).
+fn weight_towards(out: &mut [half::f16], before: &[half::f16], own: &[half::f16]) {
+    let channels = aurora_tile::CHANNELS;
+    for ((texel, was), own) in out
+        .chunks_exact_mut(channels)
+        .zip(before.chunks_exact(channels))
+        .zip(own.chunks_exact(channels))
+    {
+        let w = own.get(3).map_or(0.0, |a| a.to_f32()).clamp(0.0, 1.0);
+        for (channel, base) in texel.iter_mut().zip(was) {
+            let b = base.to_f32();
+            *channel = half::f16::from_f32((channel.to_f32() - b).mul_add(w, b));
+        }
+    }
 }
 
 /// How many distinct Curves parameter sets [`curves_lut`] keeps built per
@@ -18521,12 +18675,13 @@ fn is_cover_candidate(
 
 /// Whether `id` is a Pass Through group the cover search may descend
 /// into without leaving its context: opacity exactly `1` and no enabled
-/// mask, so [`fold_pass_through_group`] keeps no backdrop and its result
+/// mask and Fill 100 % (0.243.0), so [`fold_pass_through_group`] keeps no backdrop and its result
 /// is its children's fold, bit for bit.
 fn is_opaque_pass_through(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> bool {
     matches!(layers.kind(id), Some(aurora_doc::LayerKind::Group { .. }))
         && layers.blend_mode(id) == Some(aurora_doc::BlendMode::PassThrough)
         && layers.opacity(id) == Some(1.0)
+        && layers.fill_opacity(id).unwrap_or(1.0) >= 1.0
         && !layers.mask(id).is_some_and(|mask| mask.enabled)
 }
 

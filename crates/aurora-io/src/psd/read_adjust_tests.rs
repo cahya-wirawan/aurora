@@ -1114,22 +1114,49 @@ fn grouped_file(fill: u8, clipped: bool, with_pixels_below: bool) -> TestPsd {
     })
 }
 
+/// A Pass Through group at `fill` holding a nested Pass Through group that
+/// holds an adjustment (the case still shown at full strength).
+fn nested_grouped_file(fill: u8) -> TestPsd {
+    let adjustment = TestLayer::empty("Adjust 1").with(|l| {
+        l.blocks.push((*b"blnc", unhex(BLNC_FILL)));
+    });
+    TestPsd::new(1, 2, 2, 8).with(|p| {
+        p.layers = vec![
+            TestLayer::divider(),
+            TestLayer::divider(),
+            adjustment,
+            TestLayer::group("Inner", *b"pass"),
+            TestLayer::group("Outer", *b"pass").with(|g| {
+                g.blocks.push((*b"iOpa", vec![fill]));
+            }),
+        ];
+    })
+}
+
 #[test]
-fn an_adjustment_under_a_pass_through_group_with_reduced_fill_is_reported_as_stronger() {
-    let document = ok(read(&grouped_file(102, false, true).write()));
+fn an_adjustment_in_a_nested_group_under_reduced_fill_is_reported_as_stronger() {
+    let document = ok(read(&nested_grouped_file(102).write()));
     let items = document.report.items.join("\n");
     assert!(
         items.contains(
-            "1 adjustment layer sits inside a Pass Through group whose Fill is below 100%"
+            "1 adjustment layer sits inside a group nested in a Pass Through group whose Fill \
+             is below 100%"
         ) && items.contains("may look much stronger than in Photoshop"),
         "{items}"
     );
-    // The layer stays imported.
-    assert!(top_adjustment(&document).is_some());
     // Full Fill: no such line.
-    let document = ok(read(&grouped_file(255, false, true).write()));
+    let document = ok(read(&nested_grouped_file(255).write()));
     let items = document.report.items.join("\n");
     assert!(!items.contains("much stronger"), "{items}");
+}
+
+#[test]
+fn a_direct_adjustment_under_a_reduced_fill_group_is_isolated_not_reported() {
+    // 0.243.0: the compositor isolates it, so the open says nothing.
+    let document = ok(read(&grouped_file(102, false, true).write()));
+    let items = document.report.items.join("\n");
+    assert!(!items.contains("much stronger"), "{items}");
+    assert!(top_adjustment(&document).is_some(), "still imported");
 }
 
 #[test]
@@ -1165,13 +1192,12 @@ fn the_left_out_note_calls_four_kinds_approximations() {
 }
 
 #[test]
-fn corpus_files_where_aurora_shows_the_adjustment_stronger_say_so() {
+fn corpus_files_where_aurora_shows_the_adjustment_stronger_say_so_or_are_isolated() {
     if let Some(document) = corpus("passthrough_fill_adjustment.psd") {
         let items = document.report.items.join("\n");
-        assert!(
-            items.contains("sits inside a Pass Through group whose Fill is below 100%"),
-            "{items}"
-        );
+        // 0.243.0: the adjustment is a direct child of the group, which
+        // the compositor now isolates, so nothing is said.
+        assert!(!items.contains("much stronger"), "{items}");
         assert!(!adjustments_of(&document).is_empty());
     }
     if let Some(document) = corpus("passthrough_clipping_mask_adjustment.psd") {

@@ -296,7 +296,13 @@ fn psd_fidelity_audit() {
     if let Ok(extra) = std::env::var("AURORA_AUDIT_DIRS") {
         dirs.extend(extra.split(':').filter(|s| !s.is_empty()).map(Into::into));
     }
-    let files = audit_collect_files(&dirs);
+    let mut files = audit_collect_files(&dirs);
+    // `AURORA_AUDIT_ONLY`: keep the files whose path contains one of these
+    // `,`-separated fragments (a quick re-measure of a few files).
+    if let Ok(only) = std::env::var("AURORA_AUDIT_ONLY") {
+        let keep: Vec<_> = only.split(',').filter(|f| !f.is_empty()).collect();
+        files.retain(|f| keep.iter().any(|k| f.to_string_lossy().contains(k)));
+    }
     if files.is_empty() {
         println!("SKIPPED: no PSD/PSB corpus present under corpora/psd");
         return;
