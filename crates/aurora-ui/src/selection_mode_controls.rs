@@ -208,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_five_selection_tools_show_the_group() {
+    fn only_the_six_selection_tools_show_the_group() {
         let (mut ws, c) = built();
         for tool in Tool::ALL {
             sync(&mut ws, &c, tool, SelectionMode::Replace);
@@ -219,6 +219,7 @@ mod tests {
                     | Tool::Lasso
                     | Tool::PolygonalLasso
                     | Tool::MagicWand
+                    | Tool::QuickSelect
             );
             assert_eq!(tool.is_selection_tool(), want, "{tool:?}");
             assert_eq!(shown(&ws.tree, c.modes.group), want, "{tool:?}");

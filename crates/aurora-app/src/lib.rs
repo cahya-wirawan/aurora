@@ -550,6 +550,7 @@ mod clipboard_tests;
 mod clone_stamp;
 #[cfg(test)]
 mod clone_stamp_tests;
+mod colour_range_app;
 mod colour_state;
 mod crop;
 mod crop_app;
@@ -581,6 +582,7 @@ mod psd_save;
 #[cfg(test)]
 mod psd_save_tests;
 mod quick_mask;
+mod quick_select;
 mod selection_history;
 mod selection_modes;
 mod selection_paint;
@@ -5708,6 +5710,12 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
             AppCommand::SelectTool(aurora_ui::Tool::PolygonalLasso),
         ),
         ("w", AppCommand::SelectTool(aurora_ui::Tool::MagicWand)),
+        // 0.238.0: the Quick Select shares W with the Magic Wand, as Photoshop's
+        // grouped key does; Shift+W is its chord.
+        (
+            "Shift+W",
+            AppCommand::SelectTool(aurora_ui::Tool::QuickSelect),
+        ),
         ("z", AppCommand::SelectTool(aurora_ui::Tool::Zoom)),
         ("h", AppCommand::SelectTool(aurora_ui::Tool::Pan)),
         ("i", AppCommand::SelectTool(aurora_ui::Tool::Eyedropper)),
@@ -6021,6 +6029,11 @@ enum ActivatedCommand {
     /// Select > Modify (0.216.0): apply a command with the number the
     /// prompt accepted.
     RefineApply(selection_refine::RefineKind, f32),
+    /// Select > Colour Range (0.238.0): open the Fuzziness prompt.
+    ColourRangePrompt,
+    /// Select > Colour Range (0.238.0): apply it with the Fuzziness the
+    /// prompt accepted.
+    ColourRangeApply(u16),
     /// Save, Load or Delete a saved selection (0.218.0).
     SavedSelection(selection_store::SavedSelectionCommand),
     /// A Paths command (0.233.0).
@@ -6272,6 +6285,7 @@ const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
         aurora_ui::Tool::Crop => "tool.crop",
         aurora_ui::Tool::Pen => "tool.pen",
         aurora_ui::Tool::SpotHealing => "tool.spot_healing",
+        aurora_ui::Tool::QuickSelect => "tool.quick_select",
     }
 }
 
@@ -6310,6 +6324,7 @@ const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
 /// yet, so every save shows a picker. `COMMAND_LAYER_NEW`/
 /// `COMMAND_LAYER_DELETE` (0.143.0) resolve to [`ActivatedCommand::NewLayer`]/
 /// [`ActivatedCommand::DeleteLayer`], run by [`perform_layer_command`].
+#[allow(clippy::too_many_lines)]
 fn palette_commands() -> Vec<CommandEntry> {
     let mut commands = vec![
         CommandEntry::new(COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
@@ -6375,6 +6390,11 @@ fn palette_commands() -> Vec<CommandEntry> {
             .iter()
             .map(|(id, title)| CommandEntry::new(*id, *title)),
     );
+    // 0.238.0: Select > Colour Range.
+    commands.push(CommandEntry::new(
+        colour_range_app::COMMAND_ID,
+        colour_range_app::COMMAND_TITLE,
+    ));
     // 0.216.0: Select > Modify.
     commands.extend(
         selection_refine::RefineKind::ALL
@@ -6635,6 +6655,9 @@ fn activate_command(
     }
     if let Some(kind) = selection_refine::RefineKind::for_command(id) {
         return Some(ActivatedCommand::RefinePrompt(kind));
+    }
+    if id == colour_range_app::COMMAND_ID {
+        return Some(ActivatedCommand::ColourRangePrompt);
     }
     if id == quick_mask::COMMAND_ID {
         return Some(ActivatedCommand::ToggleQuickMask);
@@ -10571,6 +10594,12 @@ fn build_menu() -> muda::Menu {
                 None,
             ),
             &muda::MenuItem::with_id(
+                colour_range_app::COMMAND_ID,
+                colour_range_app::COMMAND_TITLE,
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
                 crop::COMMAND_CROP_TO_SELECTION,
                 crop::COMMAND_TITLE,
                 true,
@@ -12189,6 +12218,15 @@ fn handle_palette_key(
                 Some(Err(())) => return None,
                 None => {}
             }
+            // 0.238.0: the Colour Range Fuzziness prompt.
+            match colour_range_app::prompt_enter(&mut workspace.tree, root) {
+                Some(Ok(fuzziness)) => {
+                    close_command_palette(workspace, focus, palette);
+                    return Some(ActivatedCommand::ColourRangeApply(fuzziness));
+                }
+                Some(Err(())) => return None,
+                None => {}
+            }
             // 0.218.0: the Save Selection name prompt.
             match selection_store::prompt_enter(&mut workspace.tree, root) {
                 Some(Ok(name)) => {
@@ -12236,6 +12274,7 @@ fn handle_palette_key(
                 }
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
                 selection_store::follow_prompt_query(&mut workspace.tree, root);
+                colour_range_app::follow_prompt_query(&mut workspace.tree, root);
                 paths_app::follow_prompt_query(&mut workspace.tree, root);
             }
         }
@@ -12266,6 +12305,7 @@ fn handle_palette_key(
                 }
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
                 selection_store::follow_prompt_query(&mut workspace.tree, root);
+                colour_range_app::follow_prompt_query(&mut workspace.tree, root);
                 paths_app::follow_prompt_query(&mut workspace.tree, root);
             }
         }
@@ -12292,6 +12332,7 @@ fn handle_palette_key(
                 }
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
                 selection_store::follow_prompt_query(&mut workspace.tree, root);
+                colour_range_app::follow_prompt_query(&mut workspace.tree, root);
                 paths_app::follow_prompt_query(&mut workspace.tree, root);
             }
         }
@@ -12851,6 +12892,11 @@ enum Drag {
         /// The gesture's selection mode and starting selection (0.215.0).
         modal: Box<selection_modes::ModeGesture>,
     },
+    /// A Quick Select stroke (0.238.0; see [`quick_select`]). Like a Lasso
+    /// it keeps `before` and `current` and ends by recording one selection
+    /// step; the stamps read the active layer, so the stroke owns the
+    /// region it has grown.
+    QuickSelect(Box<quick_select::QuickDrag>),
     Brush {
         /// Whether this is the Pencil (0.220.0): the same drag, spacing,
         /// snapshot and undo as the Brush, but its dabs are hard-edged
@@ -13233,6 +13279,14 @@ fn commit_ending_drag(
             );
             undo_order.record_selection(label, before, current, history, pixel_history);
         }
+        // A Quick Select stroke is one selection step as well (0.238.0).
+        Some(Drag::QuickSelect(quick)) => {
+            let label = selection_modes::step_label(
+                quick.modal.mode,
+                quick_select::step_label(quick.current.is_some()),
+            );
+            undo_order.record_selection(label, quick.before, quick.current, history, pixel_history);
+        }
         Some(Drag::Move {
             layer_id,
             start_bounds,
@@ -13454,6 +13508,9 @@ fn begin_drag(
             current: None,
             modal: selection_modes::ModeGesture::boxed_replace(),
         }),
+        (aurora_ui::Tool::QuickSelect, PointerButton::Primary) => Some(Drag::QuickSelect(
+            Box::new(quick_select::QuickDrag::new(view.to_document(canvas_point))),
+        )),
         (aurora_ui::Tool::Lasso | aurora_ui::Tool::PolygonalLasso, PointerButton::Primary) => {
             Some(Drag::Lasso {
                 polygonal: tool == aurora_ui::Tool::PolygonalLasso,
@@ -13641,6 +13698,10 @@ fn continue_drag(
                 }
             }
             Vec::new()
+        }
+        Drag::QuickSelect(quick) => {
+            let current_doc = view.to_document(canvas_point);
+            quick_select::advance(quick, current_doc, tool_settings.dab_radius(DabTool::Brush))
         }
         Drag::Brush {
             last_doc, carry, ..
@@ -14043,6 +14104,10 @@ fn shift_drag_reference(drag: &mut Drag, delta: (f32, f32)) {
                 point.1 += delta.1;
             }
         }
+        Drag::QuickSelect(quick) => {
+            quick.last_doc.0 += delta.0;
+            quick.last_doc.1 += delta.1;
+        }
         Drag::Pan { .. } | Drag::Eyedropper => {}
     }
 }
@@ -14066,6 +14131,7 @@ fn drag_reference(drag: &Drag) -> Option<(f32, f32)> {
         | Drag::Gradient { start_doc, .. } => Some(*start_doc),
         Drag::Brush { last_doc, .. } | Drag::Eraser { last_doc, .. } => Some(*last_doc),
         Drag::Lasso { points, .. } => points.first().copied(),
+        Drag::QuickSelect(quick) => Some(quick.last_doc),
         Drag::Pan { .. } | Drag::Eyedropper => None,
     }
 }
@@ -26808,6 +26874,9 @@ struct ToolSettings {
     selection_mode: aurora_doc::SelectionMode,
     /// The last value used for each Select > Modify command (0.216.0).
     refine_amounts: selection_refine::RefineAmounts,
+    /// The last Fuzziness Select > Colour Range was run with (0.238.0;
+    /// default 40, 0..=200, not persisted).
+    colour_range_fuzziness: u16,
     /// The Smudge's strength, 1..=100 percent (0.222.0; default 50).
     smudge_strength: u8,
     /// The Blur's strength, 1..=100 percent (0.223.0; default 50).
@@ -26870,6 +26939,7 @@ impl Default for ToolSettings {
             gradient_opacity: 100,
             selection_mode: aurora_doc::SelectionMode::Replace,
             refine_amounts: selection_refine::RefineAmounts::default(),
+            colour_range_fuzziness: colour_range_app::DEFAULT_FUZZINESS,
             smudge_strength: DEFAULT_SMUDGE_STRENGTH,
             blur_strength: DEFAULT_SMUDGE_STRENGTH,
             sharpen_strength: DEFAULT_SMUDGE_STRENGTH,
@@ -27069,6 +27139,12 @@ enum LockRefusal {
     WandNeedsPixelLayer,
     /// A Magic Wand region is over the tile or area cap (0.214.0).
     SelectionTooLarge,
+    /// The Quick Select with no pixel layer to read (0.238.0).
+    QuickSelectNeedsPixelLayer,
+    /// Colour Range with no pixel layer to read (0.238.0).
+    ColourRangeNeedsPixelLayer,
+    /// Colour Range found no pixel near the foreground colour (0.238.0).
+    ColourRangeNothing,
     /// Select > Modify with nothing selected (0.216.0).
     RefineNeedsSelection,
     /// A Select > Modify result is over the mask cap or the work budget
@@ -27163,6 +27239,15 @@ impl LockRefusal {
             }
             LockRefusal::WandNeedsPixelLayer => {
                 "Select a pixel layer to use the Magic Wand. A group, an adjustment layer or no layer can't be sampled."
+            }
+            LockRefusal::QuickSelectNeedsPixelLayer => {
+                "Select a pixel layer to use Quick Select. A group, an adjustment layer or no layer can't be sampled."
+            }
+            LockRefusal::ColourRangeNeedsPixelLayer => {
+                "Select a pixel layer to use Colour Range. A group, an adjustment layer or no layer can't be sampled."
+            }
+            LockRefusal::ColourRangeNothing => {
+                "No pixel of this layer is near the foreground colour. Raise the Fuzziness or pick another colour."
             }
             LockRefusal::SelectionTooLarge => {
                 "That selection is too large to build in one step (over 64 megapixels). Use a smaller region; for the Magic Wand, raise the tolerance less or turn Contiguous on."
@@ -27354,10 +27439,17 @@ fn lock_refusal_applies(
         || (refusal == LockRefusal::BurnNeedsPixelLayer && tool == aurora_ui::Tool::Burn)
         || (refusal == LockRefusal::SpongeNeedsPixelLayer && tool == aurora_ui::Tool::Sponge)
         || (refusal == LockRefusal::WandNeedsPixelLayer && tool == aurora_ui::Tool::MagicWand)
+        || (refusal == LockRefusal::QuickSelectNeedsPixelLayer
+            && tool == aurora_ui::Tool::QuickSelect)
+        || matches!(
+            refusal,
+            LockRefusal::ColourRangeNeedsPixelLayer | LockRefusal::ColourRangeNothing
+        )
         || (refusal == LockRefusal::SelectionTooLarge
             && matches!(
                 tool,
                 aurora_ui::Tool::MagicWand
+                    | aurora_ui::Tool::QuickSelect
                     | aurora_ui::Tool::MarqueeSelect
                     | aurora_ui::Tool::EllipticalMarquee
                     | aurora_ui::Tool::Lasso
@@ -27419,6 +27511,7 @@ impl ToolSettings {
             | aurora_ui::Tool::CloneStamp
             | aurora_ui::Tool::Smudge
             | aurora_ui::Tool::SpotHealing
+            | aurora_ui::Tool::QuickSelect
             | aurora_ui::Tool::Blur
             | aurora_ui::Tool::Sharpen
             | aurora_ui::Tool::Dodge
@@ -27461,6 +27554,7 @@ impl ToolSettings {
             | aurora_ui::Tool::CloneStamp
             | aurora_ui::Tool::Smudge
             | aurora_ui::Tool::SpotHealing
+            | aurora_ui::Tool::QuickSelect
             | aurora_ui::Tool::Blur
             | aurora_ui::Tool::Sharpen
             | aurora_ui::Tool::Dodge
@@ -29266,6 +29360,10 @@ impl App {
             Some(ActivatedCommand::Clipboard(command)) => self.run_clipboard_command(command),
             Some(ActivatedCommand::RefinePrompt(kind)) => self.open_refine_prompt(kind),
             Some(ActivatedCommand::RefineApply(kind, amount)) => self.run_refine(kind, amount),
+            Some(ActivatedCommand::ColourRangePrompt) => self.open_colour_range_prompt(),
+            Some(ActivatedCommand::ColourRangeApply(fuzziness)) => {
+                self.run_colour_range(fuzziness);
+            }
             Some(ActivatedCommand::SavedSelection(command)) => self.run_saved_selection(command),
             Some(ActivatedCommand::Paths(command)) => self.run_paths_command(command),
             Some(ActivatedCommand::MovePanel(panel, direction)) => {
@@ -31355,6 +31453,7 @@ impl App {
         }
         if let Some(drag) = self.drag.as_mut() {
             let erasing = matches!(drag, Drag::Eraser { .. });
+            let quick = matches!(drag, Drag::QuickSelect(_));
             let dabs = continue_drag(
                 drag,
                 canvas_point,
@@ -31368,11 +31467,24 @@ impl App {
                 ),
             );
             for doc_point in dabs {
-                if erasing {
+                if quick {
+                    self.quick_select_stamp(doc_point);
+                } else if erasing {
                     self.erase_dab(doc_point);
                 } else {
                     self.paint_dab(doc_point);
                 }
+            }
+            if quick {
+                // The live selection follows the stamps (backing off after a
+                // slow rebuild; the release builds it exactly).
+                quick_select::refresh(
+                    &mut self.drag,
+                    &mut self.doc.selection,
+                    self.doc.canvas_size,
+                    false,
+                );
+                self.needs_redraw = true;
             }
         }
         // 0.216.0: a live combination the mask cap refused says so once.
@@ -31721,6 +31833,15 @@ impl App {
             self.sync_status_bar_now();
             return;
         }
+        // The Quick Select (0.238.0) needs a pixel layer to read.
+        if self.tool == aurora_ui::Tool::QuickSelect
+            && button == PointerButton::Primary
+            && let Some(why) = quick_select::press_refusal(&self.doc.layers, self.doc.active_layer)
+        {
+            self.lock_notice = Some((why, self.doc.active_layer));
+            self.sync_status_bar_now();
+            return;
+        }
         // The Paint Bucket fills on the press itself (0.209.0): no drag.
         if self.tool == aurora_ui::Tool::PaintBucket && button == PointerButton::Primary {
             let doc_point = self.doc.canvas_view.to_document(canvas_point);
@@ -31758,6 +31879,37 @@ impl App {
                 self.doc.canvas_size,
                 selection_modes::gesture_mode(&self.tool_settings, self.modifiers),
             );
+            self.needs_redraw = true;
+        }
+        if matches!(self.drag, Some(Drag::QuickSelect(_))) {
+            // Like the Lassos, a press in New mode deselects at once; the
+            // stamps then grow the new selection and Escape restores this one.
+            let mode = selection_modes::gesture_mode(&self.tool_settings, self.modifiers);
+            let began = quick_select::begin(
+                &mut self.drag,
+                &self.doc.layers,
+                self.doc.active_layer,
+                &mut self.doc.selection,
+                mode,
+            );
+            match began {
+                Ok(()) => {
+                    if let Some(Drag::QuickSelect(quick)) = self.drag.as_ref() {
+                        let at = quick.last_doc;
+                        self.quick_select_stamp(at);
+                    }
+                    quick_select::refresh(
+                        &mut self.drag,
+                        &mut self.doc.selection,
+                        self.doc.canvas_size,
+                        true,
+                    );
+                }
+                Err(why) => {
+                    self.lock_notice = Some((why, self.doc.active_layer));
+                    self.sync_status_bar_now();
+                }
+            }
             self.needs_redraw = true;
         }
         if matches!(self.drag, Some(Drag::Marquee { .. })) {
@@ -32431,7 +32583,10 @@ impl App {
         }
         // A finished Marquee drag is recorded as one selection step by
         // `commit_ending_drag` (0.213.0).
-        self.needs_redraw |= matches!(drag, Some(Drag::Marquee { .. } | Drag::Lasso { .. }));
+        self.needs_redraw |= matches!(
+            drag,
+            Some(Drag::Marquee { .. } | Drag::Lasso { .. } | Drag::QuickSelect(_))
+        );
         let canvas_size = canvas_area_logical_size(&self.workspace);
         commit_drag_into_history(
             &mut self.workspace,
@@ -32648,7 +32803,9 @@ impl App {
             self.pen_pointer_released();
         }
         let ending = self.drag.take();
-        let ending = lasso_tools::release_lasso(&mut self.drag, ending, &mut self.doc.selection);
+        let mut ending =
+            lasso_tools::release_lasso(&mut self.drag, ending, &mut self.doc.selection);
+        quick_select::release(&mut ending, &mut self.doc.selection, self.doc.canvas_size);
         if let Some((start_doc, end_doc)) = released_gradient(ending.as_ref()) {
             self.apply_gradient(start_doc, end_doc);
         }
@@ -33807,6 +33964,72 @@ impl App {
         }
     }
 
+    /// One Quick Select stamp at `doc_point` (0.238.0): grows the stroke's
+    /// region ([`quick_select::stamp`]); the live selection is rebuilt by the
+    /// caller after the batch.
+    fn quick_select_stamp(&mut self, doc_point: (f32, f32)) {
+        let Some(store) = self.doc.tile_store.as_mut() else {
+            return;
+        };
+        let outcome = quick_select::stamp(&mut self.drag, store, doc_point, &self.tool_settings);
+        if outcome == quick_select::StampOutcome::Capped {
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Select > Colour Range (0.238.0): opens the Fuzziness prompt, or says
+    /// why it cannot run. A live selection gesture ends first.
+    fn open_colour_range_prompt(&mut self) {
+        if self.quick_mask_refuses_command() {
+            return;
+        }
+        lasso_tools::cancel_selection_gesture(&mut self.drag, &mut self.doc.selection);
+        if colour_range_app::open_prompt(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.command_palette,
+            self.tool_settings.colour_range_fuzziness,
+        ) {
+            self.push_accessibility();
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Select > Colour Range (0.238.0): selects the pixels of the active
+    /// pixel layer near the foreground colour as one undo step
+    /// ([`colour_range_app::colour_range_step`]) and remembers the Fuzziness.
+    fn run_colour_range(&mut self, fuzziness: u16) {
+        if self.quick_mask_refuses_command() {
+            return;
+        }
+        lasso_tools::cancel_selection_gesture(&mut self.drag, &mut self.doc.selection);
+        self.tool_settings.colour_range_fuzziness = fuzziness;
+        let Some(store) = self.doc.tile_store.as_mut() else {
+            return;
+        };
+        match colour_range_app::colour_range_step(
+            &mut self.workspace,
+            &mut self.doc.undo_order,
+            &mut self.doc.history,
+            &mut self.doc.pixel_history,
+            &mut self.doc.selection,
+            store,
+            &self.doc.layers,
+            self.doc.active_layer,
+            self.colour.state.range_colour(),
+            fuzziness,
+            self.doc.canvas_size,
+            self.tool_settings.selection_mode,
+        ) {
+            colour_range_app::ColourRangeOutcome::Applied => self.needs_redraw = true,
+            colour_range_app::ColourRangeOutcome::Unchanged => {}
+            colour_range_app::ColourRangeOutcome::Refused(why) => {
+                self.lock_notice = Some((why, self.doc.active_layer));
+                self.sync_status_bar_now();
+            }
+        }
+    }
+
     /// Select > Modify (0.216.0): applies `kind` by `amount` as one undo
     /// step ([`selection_refine::refine_step`]) and remembers the amount.
     fn run_refine(&mut self, kind: selection_refine::RefineKind, amount: f32) {
@@ -34315,8 +34538,10 @@ impl App {
         // ([`Self::polygon_key_now`]).
         if !selection_view::escape_cancels_marquee_applies(
             key == Key::Named(NamedKey::Escape),
-            matches!(self.drag, Some(Drag::Marquee { .. } | Drag::Lasso { .. }))
-                && !lasso_tools::is_polygon(self.drag.as_ref()),
+            matches!(
+                self.drag,
+                Some(Drag::Marquee { .. } | Drag::Lasso { .. } | Drag::QuickSelect(_))
+            ) && !lasso_tools::is_polygon(self.drag.as_ref()),
             self.dialog.is_some(),
             self.command_palette.is_some(),
         ) {
@@ -70244,6 +70469,7 @@ mod tests {
                         | Tool::CloneStamp
                         | Tool::Smudge
                         | Tool::SpotHealing
+                        | Tool::QuickSelect
                         | Tool::Blur
                         | Tool::Sharpen
                         | Tool::Dodge
@@ -90752,7 +90978,7 @@ mod panel_scroll_tests {
                 toggle(&mut ws, &mut focus);
                 let hist = button(&ws, ws.history);
                 let mut reached = false;
-                for _ in 0..32 {
+                for _ in 0..48 {
                     if focus.focus_next(&mut ws.tree) == Some(hist) {
                         reached = true;
                         break;

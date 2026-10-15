@@ -57,9 +57,9 @@ pub const MAX_EXAMINED_TILES: usize = 4096;
 /// Tiles of source pixels a flood fill keeps decoded at once.
 const READ_CACHE_TILES: usize = 32;
 
-const TILE_SIDE: usize = TILE as usize;
+pub(crate) const TILE_SIDE: usize = TILE as usize;
 /// `u64` words in one tile's bitset.
-const WORDS: usize = TILE_SIDE * TILE_SIDE / 64;
+pub(crate) const WORDS: usize = TILE_SIDE * TILE_SIDE / 64;
 
 /// How a fill treats the layer's alpha.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +113,7 @@ impl FillOutcome {
 type Texel = [f16; CHANNELS];
 
 /// A texel's channels in 8-bit-equivalent units.
-type Quantised = [u8; CHANNELS];
+pub(crate) type Quantised = [u8; CHANNELS];
 
 #[allow(clippy::cast_sign_loss)]
 fn quantise_channel(value: f16) -> u8 {
@@ -121,20 +121,20 @@ fn quantise_channel(value: f16) -> u8 {
     (value.to_f32() * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
-fn quantise(texel: &[f16]) -> Quantised {
+pub(crate) fn quantise(texel: &[f16]) -> Quantised {
     let at = |i: usize| texel.get(i).copied().map_or(0, quantise_channel);
     [at(0), at(1), at(2), at(3)]
 }
 
 /// Whether `candidate` is within `tolerance` of `seed` on every channel.
-fn within_tolerance(seed: Quantised, candidate: Quantised, tolerance: u8) -> bool {
+pub(crate) fn within_tolerance(seed: Quantised, candidate: Quantised, tolerance: u8) -> bool {
     seed.iter()
         .zip(candidate.iter())
         .all(|(a, b)| a.abs_diff(*b) <= tolerance)
 }
 
 /// Layer-local pixel to (tile, tile-local x, tile-local y).
-fn split(x: u32, y: u32) -> (TileId, usize, usize) {
+pub(crate) fn split(x: u32, y: u32) -> (TileId, usize, usize) {
     (
         TileId {
             x: x / TILE,
@@ -147,7 +147,7 @@ fn split(x: u32, y: u32) -> (TileId, usize, usize) {
 
 /// Reads a layer's source pixels one decoded tile at a time. A tile the
 /// store does not hold reads as fully transparent without being created.
-struct Plane<'a> {
+pub(crate) struct Plane<'a> {
     store: &'a mut TileStore,
     surface: SurfaceId,
     cache: HashMap<TileId, Option<Rc<Vec<f16>>>>,
@@ -156,7 +156,7 @@ struct Plane<'a> {
 }
 
 impl<'a> Plane<'a> {
-    fn new(store: &'a mut TileStore, surface: SurfaceId) -> Self {
+    pub(crate) fn new(store: &'a mut TileStore, surface: SurfaceId) -> Self {
         Self {
             store,
             surface,
@@ -166,7 +166,7 @@ impl<'a> Plane<'a> {
         }
     }
 
-    fn tile(&mut self, id: TileId) -> Result<Option<Rc<Vec<f16>>>, TileError> {
+    pub(crate) fn tile(&mut self, id: TileId) -> Result<Option<Rc<Vec<f16>>>, TileError> {
         if let Some((last_id, tile)) = &self.last
             && *last_id == id
         {
@@ -193,7 +193,7 @@ impl<'a> Plane<'a> {
         Ok(tile)
     }
 
-    fn quantised(&mut self, x: u32, y: u32) -> Result<Quantised, TileError> {
+    pub(crate) fn quantised(&mut self, x: u32, y: u32) -> Result<Quantised, TileError> {
         let (id, lx, ly) = split(x, y);
         let Some(tile) = self.tile(id)? else {
             return Ok([0; CHANNELS]);
@@ -206,15 +206,15 @@ impl<'a> Plane<'a> {
 }
 
 /// The set of matched pixels, as one bitset per touched tile.
-struct Region {
-    tiles: Vec<(TileId, Box<[u64]>)>,
+pub(crate) struct Region {
+    pub(crate) tiles: Vec<(TileId, Box<[u64]>)>,
     index: HashMap<TileId, usize>,
     last: Option<(TileId, usize)>,
     max_tiles: usize,
 }
 
 impl Region {
-    fn new(max_tiles: usize) -> Self {
+    pub(crate) fn new(max_tiles: usize) -> Self {
         Self {
             tiles: Vec::new(),
             index: HashMap::new(),
@@ -250,7 +250,7 @@ impl Region {
         Ok(slot)
     }
 
-    fn contains(&mut self, x: u32, y: u32) -> bool {
+    pub(crate) fn contains(&mut self, x: u32, y: u32) -> bool {
         let (id, lx, ly) = split(x, y);
         let Some(slot) = self.slot(id) else {
             return false;
@@ -263,7 +263,7 @@ impl Region {
     }
 
     /// Marks `x0..=x1` of row `y`.
-    fn set_span(&mut self, y: u32, x0: u32, x1: u32) -> Result<(), FillError> {
+    pub(crate) fn set_span(&mut self, y: u32, x0: u32, x1: u32) -> Result<(), FillError> {
         let mut x = x0;
         while x <= x1 {
             let (id, lx, ly) = split(x, y);
@@ -635,6 +635,17 @@ pub fn wand_region(
     let Some(region) = flood_region(&mut plane, area, spec)? else {
         return Ok(None);
     };
+    region_to_wand(&region, spec.max_tiles)
+}
+
+/// The matched pixels of `region` as a [`WandRegion`] over their tight
+/// bounding box (`None` when no bit is set); the box may not exceed
+/// `max_tiles` tiles of area. Shared by the Magic Wand and the Quick
+/// Select (0.238.0).
+pub(crate) fn region_to_wand(
+    region: &Region,
+    max_tiles: usize,
+) -> Result<Option<WandRegion>, FillError> {
     // The tight box of the set bits, tile by tile.
     let mut lo = (u32::MAX, u32::MAX);
     let mut hi = (0_u32, 0_u32);
@@ -671,11 +682,9 @@ pub fn wand_region(
         return Ok(None);
     }
     let (bw, bh) = (hi.0 - lo.0 + 1, hi.1 - lo.1 + 1);
-    let max_area = (spec.max_tiles as u64).saturating_mul(u64::from(TILE) * u64::from(TILE));
+    let max_area = (max_tiles as u64).saturating_mul(u64::from(TILE) * u64::from(TILE));
     if u64::from(bw) * u64::from(bh) > max_area {
-        return Err(FillError::TooLarge {
-            max: spec.max_tiles,
-        });
+        return Err(FillError::TooLarge { max: max_tiles });
     }
     let mut data = vec![0_u8; (bw as usize).saturating_mul(bh as usize)];
     for (id, words) in &region.tiles {

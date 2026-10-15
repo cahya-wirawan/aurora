@@ -211,6 +211,8 @@ fn x_and_d_are_bound_and_collide_with_no_tool_letter() {
                 // 0.224.0: bare O is the Dodge; the Sponge's Shift+P has no
                 // bare-letter tool (0.233.0: bare P is the Pen).
                 Tool::Burn => Tool::Dodge,
+                // 0.238.0: bare W is the Magic Wand; Shift+W the Quick Select.
+                Tool::QuickSelect => Tool::MagicWand,
                 Tool::Sponge => {
                     assert_eq!(
                         shortcut_command(key),

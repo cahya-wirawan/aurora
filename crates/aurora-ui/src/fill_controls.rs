@@ -464,9 +464,15 @@ pub fn sync_fill_controls(
         (fill.gradient, tool == Tool::Gradient),
         // The Magic Wand shares the Paint Bucket's Tolerance and
         // Contiguous controls (0.214.0).
+        // The Quick Select (0.238.0) shares the Tolerance slider too, but
+        // not Contiguous (its growth is always connected), and keeps the
+        // radius controls.
         (
             fill.bucket,
-            matches!(tool, Tool::PaintBucket | Tool::MagicWand),
+            matches!(
+                tool,
+                Tool::PaintBucket | Tool::MagicWand | Tool::QuickSelect
+            ),
         ),
         // The Smudge's Strength (0.222.0), shared by the Blur and the
         // Sharpen (0.223.0) and, as Exposure or Flow, by the Dodge, Burn and
@@ -488,7 +494,7 @@ pub fn sync_fill_controls(
     }
     // The radius readout has nothing to say for a fill tool, nor (0.215.0)
     // for a selection tool, whose options are the mode group.
-    let no_radius = is_fill_tool(tool) || tool.is_selection_tool();
+    let no_radius = is_fill_tool(tool) || (tool.is_selection_tool() && tool != Tool::QuickSelect);
     changed |= set_item_shown(tree, controls.readout, !no_radius)?;
     changed |= set_node_hidden(tree, controls.readout, no_radius)?;
 
@@ -507,6 +513,9 @@ pub fn sync_fill_controls(
     )?;
     changed |= sync_slider(tree, fill.tolerance, f64::from(view.tolerance), captured)?;
     changed |= sync_checkbox(tree, fill.contiguous, view.contiguous)?;
+    let contiguous_shown = tool != Tool::QuickSelect;
+    changed |= set_item_shown(tree, fill.contiguous, contiguous_shown)?;
+    changed |= set_node_hidden(tree, fill.contiguous, !contiguous_shown)?;
     let strength = match tool {
         Tool::Blur => view.blur_strength,
         Tool::Sharpen => view.sharpen_strength,
@@ -675,6 +684,29 @@ mod tests {
         }
         sync(&mut ws, &controls, Tool::Gradient, VIEW, None);
         assert_eq!(shown_fill_group(&ws.tree, &controls), Some(Tool::Gradient));
+    }
+
+    #[test]
+    fn the_quick_select_shows_tolerance_and_radius_but_not_contiguous() {
+        let (mut ws, controls) = built();
+        let fill = controls.fill;
+        // The Magic Wand shows Contiguous and hides the radius readout.
+        sync(&mut ws, &controls, Tool::MagicWand, VIEW, None);
+        assert!(shown(&ws.tree, fill.contiguous));
+        assert!(!shown(&ws.tree, controls.readout));
+        sync(&mut ws, &controls, Tool::QuickSelect, VIEW, None);
+        ws.tree.compute_layout(1600.0, 900.0);
+        assert!(shown(&ws.tree, fill.bucket), "the Tolerance group");
+        assert!(shown(&ws.tree, fill.tolerance));
+        assert!(!shown(&ws.tree, fill.contiguous), "its growth is connected");
+        assert!(hidden_to_at(&ws.tree, fill.contiguous));
+        assert!(shown(&ws.tree, controls.readout), "the radius readout");
+        assert!(!is_fill_tool(Tool::QuickSelect));
+        assert!(Tool::QuickSelect.is_selection_tool());
+        // Coming back to the Paint Bucket restores Contiguous.
+        sync(&mut ws, &controls, Tool::PaintBucket, VIEW, None);
+        assert!(shown(&ws.tree, fill.contiguous));
+        assert!(!hidden_to_at(&ws.tree, fill.contiguous));
     }
 
     #[test]

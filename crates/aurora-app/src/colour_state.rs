@@ -55,6 +55,12 @@ impl ColourState {
         self.foreground
     }
 
+    /// The colour Select > Colour Range compares against (0.238.0): the
+    /// foreground.
+    pub(crate) const fn range_colour(&self) -> [f32; 3] {
+        self.foreground
+    }
+
     /// The background.
     pub(crate) const fn background(&self) -> [f32; 3] {
         self.background

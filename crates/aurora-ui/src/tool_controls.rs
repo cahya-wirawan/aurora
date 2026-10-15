@@ -596,6 +596,7 @@ mod tests {
                     | Tool::CloneStamp
                     | Tool::Smudge
                     | Tool::SpotHealing
+                    | Tool::QuickSelect
                     | Tool::Blur
                     | Tool::Sharpen
                     | Tool::Dodge

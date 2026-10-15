@@ -122,19 +122,24 @@ pub enum Tool {
     /// and the release heals it, real via `aurora_brush::spot_heal_covered`
     /// in `aurora-app`.
     SpotHealing,
+    /// Selects by painting over the active pixel layer (0.238.0): each
+    /// stamp grows a region of similar colour round the brush, real in
+    /// `aurora-app`'s `quick_select` over `aurora_brush::quick_select_stamp`.
+    QuickSelect,
 }
 
 impl Tool {
     /// Every tool this enum has today, in the fixed order they're
     /// offered to the user (matches PLAN.md's own bullets: Move, Marquee
     /// Select, Zoom, Pan, Eyedropper, then Brush, Eraser, and the 0.209.0 fills Gradient and Paint Bucket).
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::Move,
         Self::MarqueeSelect,
         Self::EllipticalMarquee,
         Self::Lasso,
         Self::PolygonalLasso,
         Self::MagicWand,
+        Self::QuickSelect,
         Self::Crop,
         Self::Zoom,
         Self::Pan,
@@ -166,6 +171,7 @@ impl Tool {
                 | Self::Lasso
                 | Self::PolygonalLasso
                 | Self::MagicWand
+                | Self::QuickSelect
         )
     }
 
@@ -198,6 +204,7 @@ impl Tool {
             Self::Crop => "Crop",
             Self::Pen => "Pen",
             Self::SpotHealing => "Spot Healing",
+            Self::QuickSelect => "Quick Select",
         }
     }
 
@@ -211,7 +218,7 @@ impl Tool {
             Self::Move => 'V',
             Self::MarqueeSelect | Self::EllipticalMarquee => 'M',
             Self::Lasso | Self::PolygonalLasso => 'L',
-            Self::MagicWand => 'W',
+            Self::MagicWand | Self::QuickSelect => 'W',
             Self::Zoom => 'Z',
             Self::Pan => 'H',
             Self::Eyedropper => 'I',
@@ -236,7 +243,8 @@ impl Tool {
     /// and `Shift+S` the Sharpen, 0.223.0: Photoshop shares R among the three,
     /// Aurora gives each its own chord; `O` the Dodge and `Shift+O` the Burn,
     /// and `Shift+P` the Sponge, 0.224.0: Photoshop shares O among the three,
-    /// and `Shift+P` is the free chord Aurora gives the Sponge).
+    /// and `Shift+P` is the free chord Aurora gives the Sponge; `W` the Magic
+    /// Wand and `Shift+W` the Quick Select, 0.238.0).
     #[must_use]
     pub const fn shortcut_needs_shift(self) -> bool {
         matches!(
@@ -249,6 +257,7 @@ impl Tool {
                 | Self::Sharpen
                 | Self::Burn
                 | Self::Sponge
+                | Self::QuickSelect
         )
     }
 
@@ -299,11 +308,11 @@ mod tests {
 
     #[test]
     fn all_lists_every_variant_once() {
-        assert_eq!(Tool::ALL.len(), 24);
+        assert_eq!(Tool::ALL.len(), 25);
         let mut seen = Tool::ALL.to_vec();
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
-        assert_eq!(seen.len(), 24, "ALL must not repeat a variant");
+        assert_eq!(seen.len(), 25, "ALL must not repeat a variant");
     }
 
     #[test]
@@ -317,11 +326,11 @@ mod tests {
         chords.sort_unstable();
         chords.dedup();
         assert_eq!(chords.len(), Tool::ALL.len());
-        // Only the grouped G, M, L, B, R, S, O and P keys share a letter, and only by Shift.
+        // Only the grouped G, M, L, W, B, R, S, O and P keys share a letter, and only by Shift.
         let mut letters = keys;
         letters.sort_unstable();
         letters.dedup();
-        assert_eq!(letters.len(), Tool::ALL.len() - 8);
+        assert_eq!(letters.len(), Tool::ALL.len() - 9);
         assert_eq!(Tool::Crop.shortcut_text(), "C");
         assert_eq!(Tool::Lasso.shortcut_text(), "L");
         assert_eq!(Tool::PolygonalLasso.shortcut_text(), "Shift+L");
@@ -335,6 +344,7 @@ mod tests {
         assert_eq!(Tool::CloneStamp.shortcut_text(), "S");
         assert_eq!(Tool::Smudge.shortcut_text(), "R");
         assert_eq!(Tool::SpotHealing.shortcut_text(), "J");
+        assert_eq!(Tool::QuickSelect.shortcut_text(), "Shift+W");
         assert_eq!(Tool::Blur.shortcut_text(), "Shift+R");
         assert_eq!(Tool::Sharpen.shortcut_text(), "Shift+S");
         assert_eq!(Tool::Dodge.shortcut_text(), "O");

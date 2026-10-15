@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.238.0] - 2026-10-15
+
+### Changed
+
+- Select Colour Range and the Quick Select tool
+
 ## [0.237.0] - 2026-10-14
 
 ### Changed

@@ -227,6 +227,7 @@ pub(crate) fn tool_refusal(tool: aurora_ui::Tool) -> Option<LockRefusal> {
         | Tool::Lasso
         | Tool::PolygonalLasso
         | Tool::MagicWand
+        | Tool::QuickSelect
         | Tool::CloneStamp
         | Tool::Smudge
         | Tool::Blur

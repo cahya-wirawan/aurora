@@ -53,6 +53,9 @@ mod amount_tests;
 mod clone;
 #[cfg(test)]
 mod clone_tests;
+mod colour_range;
+#[cfg(test)]
+mod colour_range_tests;
 mod coverage;
 #[cfg(test)]
 mod coverage_tests;
@@ -66,6 +69,9 @@ mod filter_brush_tests;
 #[cfg(test)]
 mod hard_dab_tests;
 mod mask_dab;
+mod quick_select;
+#[cfg(test)]
+mod quick_select_tests;
 #[cfg(test)]
 mod shape_fill_tests;
 mod smudge;
@@ -89,6 +95,10 @@ mod wand_tests;
 
 pub use amount::{MIN_AMOUNT, PaintAmount};
 pub use clone::{MAX_CLONE_OFFSET, MAX_CLONE_PATCH_TEXELS, clone_dab_amount, clone_dab_covered};
+pub use colour_range::{
+    ColourRangeMask, ColourRangeSpec, DELTA_E_PER_FUZZINESS, MAX_FUZZINESS, colour_distance,
+    colour_range, coverage_byte, lab_of_srgb,
+};
 pub use coverage::{Coverage, CoverageRegion};
 pub use dab::{DEFAULT_SPACING, MAX_DABS_PER_SEGMENT, advance_segment, dab_step, dabs_along_path};
 pub use fill::{
@@ -98,6 +108,10 @@ pub use fill::{
 };
 pub use filter_brush::{FilterKind, MAX_FILTER_PATCH_TEXELS, SHARPEN_GAIN, filter_dab_covered};
 pub use mask_dab::{dab_falloff, hard_dab_covers, hard_dab_snap, stamp_toward, stamp_toward_hard};
+pub use quick_select::{
+    MAX_QUICK_RADIUS, MAX_QUICK_WINDOW_TEXELS, QUICK_MIN_REACH, QUICK_REACH_RADII, QuickRegion,
+    QuickStamp, footprint, quick_select_region, quick_select_stamp, reach_of,
+};
 pub use smudge::{MAX_SMUDGE_PATCH_TEXELS, SmudgeCarry, smudge_dab_covered};
 pub use spot_heal::{
     HEAL_FEATHER, HealMask, HealRefusal, MAX_HEAL_ITERATIONS, MAX_HEAL_SIDE, MAX_HEAL_TEXELS,

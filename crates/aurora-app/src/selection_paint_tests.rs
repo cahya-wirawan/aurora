@@ -1005,7 +1005,7 @@ fn a_history_panel_jump_applies_the_selection_of_the_row() {
 
 #[test]
 fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
-    assert_eq!(Tool::ALL.len(), 24);
+    assert_eq!(Tool::ALL.len(), 25);
     let table = crate::default_shortcuts_for(false);
     let chord = |shift| {
         KeyChord::new(
@@ -1063,7 +1063,7 @@ fn the_elliptical_marquee_is_wired_to_shift_m_the_palette_and_the_tool_table() {
     );
     // The tools panel has one button per tool, the new one wearing its
     // own icon.
-    assert_eq!(workspace.tools.buttons.len(), 24);
+    assert_eq!(workspace.tools.buttons.len(), 25);
     assert_eq!(
         aurora_ui::tool_icon(Tool::EllipticalMarquee),
         aurora_widgets::icons::IconKind::EllipseMarquee
@@ -3341,6 +3341,7 @@ fn the_fills_and_selection_tools_are_refused_and_the_rest_work() {
                 | Tool::Lasso
                 | Tool::PolygonalLasso
                 | Tool::MagicWand
+                | Tool::QuickSelect
                 | Tool::CloneStamp
                 | Tool::Smudge
                 | Tool::Blur
@@ -5312,3 +5313,10 @@ fn the_quick_mask_eraser_ignores_the_erasers_opacity_and_flow() {
     assert!(full.iter().any(|b| *b < 64), "the dabs did deselect");
     assert_eq!(full, run(10, 10));
 }
+
+// ---- 0.238.0: Quick Select and Colour Range -----------------------------
+
+#[path = "colour_range_app_tests.rs"]
+mod colour_range_app_tests;
+#[path = "quick_select_app_tests.rs"]
+mod quick_select_app_tests;
