@@ -16588,8 +16588,8 @@ fn pixel_layer_texels_unprofiled(
 /// groups (where Fill fades the group's composited content exactly like
 /// opacity, as psd-tools' `Compositor.apply` does with its `shape_const`)
 /// and adjustment layers (psd-tools' `_apply_adjustment` multiplies Fill in
-/// the same way). Not for a Pass Through group, whose Fill is still
-/// reported rather than applied (see [`fold_pass_through_group`]).
+/// the same way). Not for a Pass Through group, whose Fill multiplies its
+/// interpolation factor instead (0.243.0, [`fold_pass_through_group`]).
 #[must_use]
 fn content_opacity(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> Option<f32> {
     let opacity = layers.opacity(id)?;
@@ -18072,11 +18072,23 @@ fn fold_layer_into(
 /// in straight colour). With opacity `1` and no enabled mask the
 /// backdrop is not copied at all and the result is `C` exactly.
 ///
-/// The group's **Fill** opacity is still not applied (the PSD reader
-/// reports it), though every other layer's is since 0.181.0
-/// ([`content_opacity`]): psd-tools treats a Pass Through group with Fill
-/// below 100 % specially (it isolates adjustments inside it and falls back
-/// from pass-through compositing), and that is not reproduced here yet.
+/// The group's **Fill** (0.243.0) multiplies the interpolation factor:
+/// `result = B + (C - B) * (opacity * mask_coverage * fill)`. Derived from
+/// Photoshop's own merged images (`passthrough_fill_blendmode.psd`,
+/// `passthrough_fill_adjustment.psd`), where a group at Fill 40 % shows 40 %
+/// of what its children produce, blend modes included.
+///
+/// **Adjustments under a Fill below 100 %.** Photoshop does not let an
+/// adjustment layer inside such a group reach the backdrop: it adjusts only
+/// where the group's own content is (psd-tools' `isolate_adjustments`,
+/// confirmed on `passthrough_fill_adjustment.psd`: white backdrop texels
+/// stay white, group content is adjusted before the Fill mixes it in). So
+/// with Fill below 100 % an unclipped adjustment child is weighted, texel by
+/// texel, by the alpha the group's children below it paint on their own
+/// ([`fold_children_isolating_adjustments`]). Limits: only direct children
+/// are isolated (an adjustment inside a nested group is not), and the
+/// weight is the content's alpha including its layer opacity.
+///
 /// `Dissolve` cannot occur: the group's mode *is* Pass Through.
 ///
 /// Returns whether anything changed the accumulator, the same contract
@@ -18103,12 +18115,13 @@ fn fold_pass_through_group(
     let Some(children) = layers.children(id) else {
         return false;
     };
+    let fill = layers.fill_opacity(id).unwrap_or(1.0);
     // Exactly the backdrop, untouched: the formula above at `t = 0`.
-    if opacity <= 0.0 {
+    if opacity <= 0.0 || fill <= 0.0 {
         return false;
     }
     let mask = layers.mask(id).filter(|mask| mask.enabled);
-    let backdrop = (opacity < 1.0 || mask.is_some()).then(|| accumulator.to_vec());
+    let backdrop = (opacity < 1.0 || fill < 1.0 || mask.is_some()).then(|| accumulator.to_vec());
     // Occlusion culling (0.183.0): `plan` is the rest of the enclosing
     // context's plan when this group is opaque and on its path. A
     // translucent or masked group is a boundary for the enclosing search,
@@ -18128,19 +18141,34 @@ fn fold_pass_through_group(
         None
     };
     let plan = plan.or_else(|| confined.as_ref().map(FoldPlan::as_ref));
-    let changed = fold_context_into(
-        accumulator,
-        children,
-        layers,
-        store,
-        tile_id,
-        doc_origin,
-        reference_origin,
-        depth.saturating_add(1),
-        budget,
-        plan,
-        true,
-    ) > 0;
+    let isolate = fill < 1.0 && has_unclipped_adjustment(children, layers);
+    let changed = if isolate {
+        fold_children_isolating_adjustments(
+            accumulator,
+            children,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth.saturating_add(1),
+            budget,
+        ) > 0
+    } else {
+        fold_context_into(
+            accumulator,
+            children,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth.saturating_add(1),
+            budget,
+            plan,
+            true,
+        ) > 0
+    };
     if !changed {
         return false;
     }
@@ -18171,13 +18199,139 @@ fn fold_pass_through_group(
                 .get(index * aurora_tile::CHANNELS + 3)
                 .map_or(0.0, |alpha| alpha.to_f32())
         });
-        let t = (opacity * covered).clamp(0.0, 1.0);
+        let t = (opacity * covered * fill).clamp(0.0, 1.0);
         for (channel, &base) in out.iter_mut().zip(below) {
             let b = base.to_f32();
             *channel = half::f16::from_f32((channel.to_f32() - b).mul_add(t, b));
         }
     }
     true
+}
+
+/// Whether `nodes` hold an adjustment layer that is not clipped (0.243.0):
+/// the case [`fold_children_isolating_adjustments`] exists for.
+fn has_unclipped_adjustment(nodes: &[aurora_doc::LayerId], layers: &aurora_doc::LayerTree) -> bool {
+    nodes.iter().any(|&id| is_isolatable_adjustment(layers, id))
+}
+
+fn is_isolatable_adjustment(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> bool {
+    matches!(layers.kind(id), Some(aurora_doc::LayerKind::Adjustment(_))) && !layers.clipped(id)
+}
+
+/// Folds a Pass Through group's children (0.243.0) the way Photoshop does
+/// when the group's Fill is below 100 %: an unclipped adjustment layer
+/// adjusts only where the group's own content is, so its effect is weighted
+/// per texel by the alpha the children below it paint **on their own**.
+///
+/// The children fold into `accumulator` as usual, in segments split at each
+/// unclipped adjustment; the same segments also fold into a transparent
+/// `own` accumulator, whose alpha is the weight. An adjustment folds into
+/// `accumulator` and the result is `before + w * (after - before)` in
+/// premultiplied space (an adjustment never changes alpha, so this is the
+/// straight-colour interpolation psd-tools does). Returns how many nodes
+/// changed the accumulator.
+#[allow(clippy::too_many_arguments)]
+fn fold_children_isolating_adjustments(
+    accumulator: &mut [half::f16],
+    children: &[aurora_doc::LayerId],
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> usize {
+    let mut own = vec![half::f16::ZERO; accumulator.len()];
+    // The second fold of each segment has a budget of its own: charged to
+    // the pass's, the repeat visits would starve the real fold. (Its store
+    // errors are not counted; the real fold reads the same tiles and
+    // counts them.)
+    let mut own_budget = CompositeBudget {
+        nodes: layers.len(),
+        reported: true,
+        store_errors: 0,
+        first_store_error: None,
+    };
+    let mut folded = 0_usize;
+    // `children` is newest first: walk it from the end (the bottom).
+    let mut end = children.len();
+    while end > 0 {
+        // The segment is the run of non-adjustment nodes ending at `end`
+        // (exclusive) and reaching up (to smaller indices) to the next
+        // isolatable adjustment, which is the boundary.
+        let boundary = children.get(..end).and_then(|head| {
+            head.iter()
+                .rposition(|&id| is_isolatable_adjustment(layers, id))
+        });
+        let segment_start = boundary.map_or(0, |at| at + 1);
+        if let Some(segment) = children.get(segment_start..end)
+            && !segment.is_empty()
+        {
+            folded = folded.saturating_add(fold_context_into(
+                accumulator,
+                segment,
+                layers,
+                store,
+                tile_id,
+                doc_origin,
+                reference_origin,
+                depth,
+                budget,
+                None,
+                true,
+            ));
+            fold_context_into(
+                &mut own,
+                segment,
+                layers,
+                store,
+                tile_id,
+                doc_origin,
+                reference_origin,
+                depth,
+                &mut own_budget,
+                None,
+                true,
+            );
+        }
+        let Some(at) = boundary else { break };
+        end = at;
+        let Some(&adjustment) = children.get(at) else {
+            break;
+        };
+        let before = accumulator.to_vec();
+        if apply_adjustment_layer(
+            accumulator,
+            adjustment,
+            layers,
+            store,
+            doc_origin,
+            depth,
+            budget,
+        ) {
+            folded = folded.saturating_add(1);
+            weight_towards(accumulator, &before, &own);
+        }
+    }
+    folded
+}
+
+/// `out = before + w * (out - before)` per texel and channel, `w` the alpha
+/// of `own` at that texel ([`fold_children_isolating_adjustments`]).
+fn weight_towards(out: &mut [half::f16], before: &[half::f16], own: &[half::f16]) {
+    let channels = aurora_tile::CHANNELS;
+    for ((texel, was), own) in out
+        .chunks_exact_mut(channels)
+        .zip(before.chunks_exact(channels))
+        .zip(own.chunks_exact(channels))
+    {
+        let w = own.get(3).map_or(0.0, |a| a.to_f32()).clamp(0.0, 1.0);
+        for (channel, base) in texel.iter_mut().zip(was) {
+            let b = base.to_f32();
+            *channel = half::f16::from_f32((channel.to_f32() - b).mul_add(w, b));
+        }
+    }
 }
 
 /// How many distinct Curves parameter sets [`curves_lut`] keeps built per
@@ -18521,12 +18675,13 @@ fn is_cover_candidate(
 
 /// Whether `id` is a Pass Through group the cover search may descend
 /// into without leaving its context: opacity exactly `1` and no enabled
-/// mask, so [`fold_pass_through_group`] keeps no backdrop and its result
+/// mask and Fill 100 % (0.243.0), so [`fold_pass_through_group`] keeps no backdrop and its result
 /// is its children's fold, bit for bit.
 fn is_opaque_pass_through(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId) -> bool {
     matches!(layers.kind(id), Some(aurora_doc::LayerKind::Group { .. }))
         && layers.blend_mode(id) == Some(aurora_doc::BlendMode::PassThrough)
         && layers.opacity(id) == Some(1.0)
+        && layers.fill_opacity(id).unwrap_or(1.0) >= 1.0
         && !layers.mask(id).is_some_and(|mask| mask.enabled)
 }
 
@@ -18799,10 +18954,11 @@ thread_local! {
 }
 
 /// The layer `id` composites clipped to (0.201.0): its
-/// [`aurora_doc::LayerTree::clip_base`] when that base is a **pixel**
-/// layer. A clipped layer whose base is a group or an adjustment layer
-/// (or that has no base) composites as an ordinary layer: Aurora folds a
-/// clip group over a pixel base only.
+/// [`aurora_doc::LayerTree::clip_base`] when that base is a **pixel** layer
+/// or, since 0.243.0, a **group** (Photoshop limits the clipped layers to the
+/// shape of what the group composites to, as the corpus' `clipping-mask3/4/5`
+/// show). A clipped layer whose base is an adjustment layer (or that has no
+/// base) composites as an ordinary layer.
 fn clip_base_of(
     layers: &aurora_doc::LayerTree,
     id: aurora_doc::LayerId,
@@ -18815,7 +18971,11 @@ fn clip_base_of(
         return None;
     }
     let base = layers.clip_base(id)?;
-    matches!(layers.kind(base), Some(aurora_doc::LayerKind::Pixel { .. })).then_some(base)
+    matches!(
+        layers.kind(base),
+        Some(aurora_doc::LayerKind::Pixel { .. } | aurora_doc::LayerKind::Group { .. })
+    )
+    .then_some(base)
 }
 
 /// The layers clipped to `kept[index]`, bottom to top: the run of clipped
@@ -18934,6 +19094,23 @@ fn fold_clip_group(
     depth: usize,
     budget: &mut CompositeBudget,
 ) -> bool {
+    // A group base (0.243.0): its isolated composite, mask and all, is the
+    // clip group's content, folded with the group's own opacity and mode
+    // (a Pass Through group as Normal, as everywhere it is taken as a unit).
+    if matches!(layers.kind(base), Some(aurora_doc::LayerKind::Group { .. })) {
+        return fold_group_clip_group(
+            accumulator,
+            base,
+            clipped,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            budget,
+        );
+    }
     let with_effects = cover.is_none() && layer_renders_effects(layers, base);
     let mut changed = false;
     if with_effects {
@@ -19015,6 +19192,184 @@ fn fold_clip_group(
         fold_texels_in_mode(accumulator, &group, opacity, mode, doc_origin);
     });
     true
+}
+
+/// [`fold_clip_group`] for a **group** base (0.243.0): the group's own
+/// content is the clip group's content, each clipped layer folds atop it
+/// limited to that shape ([`fold_clipped_atop`]), and the result folds onto
+/// the accumulator with the group's opacity and Fill. Derived from
+/// Photoshop's merged images of `clipping-mask3/4/5.psd` and
+/// `passthrough_clipping_mask_*.psd`, where a layer clipped to a group is cut
+/// to the shape of the group's content (soft edges included).
+///
+/// An isolated group's content is its isolated composite ([`resolve_tile`]:
+/// children, mask, mode, and its opacity). A **Pass Through** group's
+/// children see the backdrop below it, so its content is what they add to
+/// the backdrop: the children fold onto a copy of the backdrop `B`, and onto
+/// a transparent tile for their own coverage `s`; the content, premultiplied,
+/// is `acc - (1 - s) * B` with alpha `s` (psd-tools unmixes the backdrop the
+/// same way), masked by the group's mask and folded as `Normal`.
+#[allow(clippy::too_many_arguments)]
+fn fold_group_clip_group(
+    accumulator: &mut [half::f16],
+    base: aurora_doc::LayerId,
+    clipped: &[aurora_doc::LayerId],
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> bool {
+    let pass_through = layers.blend_mode(base) == Some(aurora_doc::BlendMode::PassThrough);
+    let (mut group, opacity, mode) = if pass_through {
+        let Some((group, opacity)) = pass_through_content(
+            accumulator,
+            base,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            budget,
+        ) else {
+            return false;
+        };
+        (group, opacity, aurora_render::BlendMode::Normal)
+    } else {
+        let Some((texels, opacity, mode)) = resolve_tile(
+            base,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            budget,
+        ) else {
+            return false;
+        };
+        let mut group = aurora_render::transparent_tile();
+        aurora_render::composite_layer_into(
+            &mut group,
+            &texels,
+            1.0,
+            aurora_render::BlendMode::Normal,
+        );
+        (group, opacity, mode)
+    };
+    for &id in clipped {
+        fold_clipped_atop(
+            &mut group,
+            id,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            budget,
+        );
+    }
+    aurora_render::un_premultiply_in_place(&mut group);
+    profiled(ProfileSlot::LayerFold, || {
+        aurora_render::composite_layer_into(accumulator, &group, opacity, mode);
+    });
+    true
+}
+
+/// A Pass Through group's own content on this tile, premultiplied, and the
+/// opacity (times Fill) to fold it with ([`fold_group_clip_group`]).
+#[allow(clippy::too_many_arguments)]
+fn pass_through_content(
+    backdrop: &[half::f16],
+    base: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> Option<(Vec<half::f16>, f32)> {
+    if !admit_composite_node(base, layers, depth, budget) {
+        return None;
+    }
+    let opacity = content_opacity(layers, base)?;
+    let children = layers.children(base)?;
+    let mut acc = backdrop.to_vec();
+    let _ = fold_context_into(
+        &mut acc,
+        children,
+        layers,
+        store,
+        tile_id,
+        doc_origin,
+        reference_origin,
+        depth.saturating_add(1),
+        budget,
+        None,
+        true,
+    );
+    let mut own = aurora_render::transparent_tile();
+    let mut own_budget = CompositeBudget {
+        nodes: layers.len(),
+        reported: true,
+        store_errors: 0,
+        first_store_error: None,
+    };
+    let _ = fold_context_into(
+        &mut own,
+        children,
+        layers,
+        store,
+        tile_id,
+        doc_origin,
+        reference_origin,
+        depth.saturating_add(1),
+        &mut own_budget,
+        None,
+        true,
+    );
+    let coverage = layers.mask(base).filter(|mask| mask.enabled).map(|mask| {
+        let one = half::f16::from_f32(1.0);
+        apply_mask(
+            &vec![one; acc.len()],
+            mask,
+            layers.mask_surface_id(base),
+            store,
+            doc_origin,
+            budget,
+        )
+    });
+    let channels = aurora_tile::CHANNELS;
+    let mut content = vec![half::f16::ZERO; acc.len()];
+    for (index, ((out, (acc, below)), own)) in content
+        .chunks_exact_mut(channels)
+        .zip(
+            acc.chunks_exact(channels)
+                .zip(backdrop.chunks_exact(channels)),
+        )
+        .zip(own.chunks_exact(channels))
+        .enumerate()
+    {
+        let s = own.get(3).map_or(0.0, |a| a.to_f32()).clamp(0.0, 1.0);
+        let c = coverage.as_ref().map_or(1.0, |coverage| {
+            coverage
+                .get(index * channels + 3)
+                .map_or(0.0, |alpha| alpha.to_f32())
+        });
+        for (channel, (a, b)) in out.iter_mut().zip(acc.iter().zip(below)).take(3) {
+            let value = (-b.to_f32()).mul_add(1.0 - s, a.to_f32()).max(0.0);
+            *channel = half::f16::from_f32(value * c);
+        }
+        if let Some(alpha) = out.get_mut(3) {
+            *alpha = half::f16::from_f32(s * c);
+        }
+    }
+    Some((content, opacity))
 }
 
 /// Folds the node a [`FoldPlan`] starts at: the cover itself — the plain
@@ -41702,19 +42057,23 @@ mod tests {
         ("passthrough_blendmodes2.psd", 1.0),
         ("passthrough_blendmodes3.psd", 2.0),
         // 0.241.0: the Exposure layers in the next four files are imported
-        // (they were left out). Opacity 86 -> 4 and vector mask 156 -> 8
-        // improve; the two Exposure -3.53 files do not: in
-        // `passthrough_fill_adjustment.psd` the Pass Through group's Fill
-        // (40 %) is not applied by Aurora (the report says so) while
-        // Photoshop shows almost none of the darkening (mean error 6.8
-        // with the layer left out, 165 now), and in the clipping-mask file
-        // the clipped layer is shown unclipped (reported), 170 -> 171.
+        // (they were left out).
+        // 0.243.0 re-pin: a Pass Through group's Fill is applied and an
+        // adjustment inside such a group adjusts only the group's own
+        // content, and a layer clipped to a group is clipped. Maxima
+        // (all pixels, measured): `passthrough_fill_blendmode.psd` 134 -> 19
+        // (mean 18.7 / 11.1 / 11.2 -> 4.2 / 0.9 / 0.9),
+        // `passthrough_fill_adjustment.psd` 172 -> 18 (mean 165 / 156 / 156
+        // -> 0.1 / 3.5 / 3.5), `passthrough_clipping_mask_adjustment.psd`
+        // 171 -> 8 (mean 55 / 39 / 39 -> 2.1 / 2.7 / 2.7). The residue is
+        // along the edges of a faint radial gradient (alpha a few levels),
+        // cause not isolated.
         ("passthrough_opacity.psd", 4.0),
-        ("passthrough_fill_blendmode.psd", 134.0),
-        ("passthrough_fill_adjustment.psd", 172.0),
+        ("passthrough_fill_blendmode.psd", 19.0),
+        ("passthrough_fill_adjustment.psd", 18.0),
         ("passthrough_vector_mask.psd", 8.0),
         ("passthrough_clipping_mask_blendmode.psd", 1.0),
-        ("passthrough_clipping_mask_adjustment.psd", 171.0),
+        ("passthrough_clipping_mask_adjustment.psd", 8.0),
     ];
 
     /// AC-4 (0.179.0): the user's own Photoshop template (not committed;
@@ -86839,7 +87198,7 @@ mod tests {
         /// The group-Fill decision (0.181.0): an isolated (non-Pass
         /// Through) group's Fill fades its composited content exactly like
         /// its opacity (psd-tools' `shape_const`); a Pass Through group's
-        /// Fill is still not applied, and reported on open.
+        /// Fill multiplies its interpolation factor since 0.243.0.
         #[test]
         fn isolated_group_fill_fades_its_content_like_opacity() {
             let (_dir, mut store) = real_tile_store();
@@ -86853,13 +87212,14 @@ mod tests {
             ok(layers.set_fill_opacity(group, 1.0));
             ok(layers.set_opacity(group, 0.5));
             assert_eq!(composite(&layers, &mut store), filled);
-            // Pass Through: Fill ignored (reported by the PSD reader).
+            // Pass Through (0.243.0): Fill 50 % mixes the children in half
+            // way, the same picture as for the isolated group.
             ok(layers.set_opacity(group, 1.0));
             ok(layers.set_fill_opacity(group, 0.5));
             ok(layers.set_blend_mode(group, aurora_doc::BlendMode::PassThrough));
             near(
                 texel(&composite(&layers, &mut store), 0, 0),
-                [1.0, 0.0, 0.0, 1.0],
+                [0.5, 0.0, 0.5, 1.0],
             );
         }
 
@@ -88924,6 +89284,7 @@ mod tests {
 
         include!("outer_glow_tests.rs");
         include!("clip_corpus_tests.rs");
+        include!("psd_audit_tests.rs");
         include!("small_machine_effect_tests.rs");
     }
 }

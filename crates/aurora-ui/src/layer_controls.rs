@@ -18,9 +18,9 @@
 //! `aurora-widgets` has no validated numeric field (its `TextField` is a
 //! free-text editor with no per-field parse-and-commit route in the app),
 //! so Opacity and Fill are sliders with a "100 %" readout label; the drag
-//! is one undo step. **Fill is not applied to a Pass Through group** (it
-//! is reported, design decision 3), so its slider is disabled there and
-//! its row says why in its accessible description.
+//! is one undo step. Fill is applied to a Pass Through group too since
+//! 0.243.0 (it multiplies the group's interpolation factor), so its slider
+//! is enabled there like everywhere else.
 //!
 //! **This module knows nothing about undo.** It builds the controls,
 //! mirrors a document's state into them ([`sync_layer_controls`]), and
@@ -595,7 +595,7 @@ pub fn sync_layer_readouts(
 /// `None`, or an id `layers` doesn't know, disables everything (their
 /// shown values are left as they were). `Some` re-enables them *first*,
 /// since `set_slider_value` refuses a disabled slider; Fill stays
-/// disabled while `active` is a Pass Through group (not applied there).
+/// enabled for every layer, a Pass Through group included (0.243.0).
 ///
 /// `captured` is the widget currently holding pointer capture: when it
 /// is a slider, that slider's value is **not** overwritten — mid-drag it
@@ -618,8 +618,9 @@ pub fn sync_layer_controls(
     };
     let is_group = layers.kind(id).is_some_and(aurora_doc::LayerKind::is_group);
     let mode = layers.blend_mode(id).unwrap_or_default();
-    let fill_unavailable = is_group && mode == BlendMode::PassThrough;
-    let mut changed = set_disabled(tree, controls, false, fill_unavailable)?;
+    // Fill applies to every kind of layer, a Pass Through group included
+    // (0.243.0).
+    let mut changed = set_disabled(tree, controls, false, false)?;
     changed |= sync_slider(
         tree,
         controls.opacity,
@@ -983,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_follows_the_layer_and_is_disabled_with_a_reason_for_a_pass_through_group() {
+    fn fill_follows_the_layer_and_is_enabled_for_a_pass_through_group_too() {
         let (mut ws, controls) = built(1600.0, 900.0);
         let tree = &mut ws.tree;
         let (mut layers, pixel) = doc();
@@ -995,11 +996,11 @@ mod tests {
             tree.accessibility(controls.fill_row)
                 .and_then(|n| n.description().map(str::to_owned))
         };
-        // Pass Through: Fill off, with the reason.
+        // Pass Through (0.243.0): Fill is applied to it now, so it is on.
         assert!(layers.set_blend_mode(group, BlendMode::PassThrough).is_ok());
         assert!(sync_layer_controls(tree, controls, &layers, Some(group), None).is_ok());
-        assert!(slider_value(tree, controls.fill).1);
-        assert!(reason(tree).is_some_and(|text| text.contains("Pass Through")));
+        assert!(!slider_value(tree, controls.fill).1);
+        assert_eq!(reason(tree), None);
         // An isolated group: Fill on, no reason.
         assert!(layers.set_blend_mode(group, BlendMode::Normal).is_ok());
         assert!(sync_layer_controls(tree, controls, &layers, Some(group), None).is_ok());

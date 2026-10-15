@@ -301,13 +301,224 @@ fn a_flagged_layer_with_a_group_base_or_nothing_beneath_composites_plain() {
         layers.set_clipped(group, true),
         Err(aurora_doc::DocError::GroupCannotBeClipped(_))
     ));
-    // A pixel layer above a group base: allowed in the model, plain here.
+    // A pixel layer above an (empty) group base clips to it since 0.243.0:
+    // the group has no content, so the clipped layer shows nothing.
     let top = solid(&mut layers, &mut store, BLUE);
     ok(layers.set_clipped(top, true));
     assert_eq!(layers.clip_base(top), Some(group));
-    assert_eq!(clip_base_of(&layers, top), None);
+    assert_eq!(clip_base_of(&layers, top), Some(group));
     let acc = composite(&layers, &mut store);
-    near(px(&acc, 1, 1), BLUE);
+    near(px(&acc, 1, 1), RED);
+}
+
+// ---- 0.243.0: groups as clip bases, Pass Through Fill ----
+
+const CLEAR: [f32; 4] = [0.0; 4];
+
+/// White backdrop, a group holding a layer painted by `paint`, and a full
+/// blue layer above the group clipped to it. The group's mode is `mode`.
+fn group_clip_tree(
+    store: &mut aurora_tile::TileStore,
+    mode: aurora_doc::BlendMode,
+    paint: impl Fn(usize, usize) -> [f32; 4],
+) -> (aurora_doc::LayerTree, aurora_doc::LayerId) {
+    let mut layers = aurora_doc::LayerTree::new();
+    solid(&mut layers, store, WHITE);
+    let group = ok(layers.add_group("g", None));
+    layer(&mut layers, store, Some(group), 10, paint);
+    if mode != aurora_doc::BlendMode::Normal {
+        ok(layers.set_blend_mode(group, mode));
+    }
+    let top = solid(&mut layers, store, BLUE);
+    clip(&mut layers, top);
+    (layers, group)
+}
+
+fn red_corner(x: usize, y: usize) -> [f32; 4] {
+    if x < 4 && y < 4 { RED } else { CLEAR }
+}
+
+#[test]
+fn a_layer_clipped_to_a_group_is_cut_to_the_groups_shape() {
+    for mode in [
+        aurora_doc::BlendMode::Normal,
+        aurora_doc::BlendMode::PassThrough,
+    ] {
+        let (_dir, mut store) = store();
+        let (layers, _group) = group_clip_tree(&mut store, mode, red_corner);
+        let acc = composite(&layers, &mut store);
+        near(px(&acc, 1, 1), BLUE);
+        near(px(&acc, 6, 1), WHITE);
+        near(px(&acc, 1, 6), WHITE);
+        near(px(&acc, 8, 8), WHITE);
+    }
+}
+
+#[test]
+fn a_group_clip_base_keeps_its_soft_edge_and_opacity() {
+    for mode in [
+        aurora_doc::BlendMode::Normal,
+        aurora_doc::BlendMode::PassThrough,
+    ] {
+        let (_dir, mut store) = store();
+        let (mut layers, group) = group_clip_tree(&mut store, mode, |x, _| {
+            if x < 4 { [0.5, 0.0, 0.0, 0.5] } else { CLEAR }
+        });
+        // Half-covered texel: the clipped blue is limited to alpha 0.5.
+        near(
+            px(&composite(&layers, &mut store), 1, 1),
+            [0.5, 0.5, 1.0, 1.0],
+        );
+        // The group's own opacity fades the whole clip group.
+        ok(layers.set_opacity(group, 0.5));
+        near(
+            px(&composite(&layers, &mut store), 1, 1),
+            [0.75, 0.75, 1.0, 1.0],
+        );
+        near(px(&composite(&layers, &mut store), 6, 1), WHITE);
+    }
+}
+
+#[test]
+fn a_pass_through_clip_base_keeps_what_its_children_blend_with_the_backdrop() {
+    let (_dir, mut store) = store();
+    let mut layers = aurora_doc::LayerTree::new();
+    solid(&mut layers, &mut store, [0.5, 0.5, 0.5, 1.0]);
+    let group = ok(layers.add_group("g", None));
+    ok(layers.set_blend_mode(group, aurora_doc::BlendMode::PassThrough));
+    let child = layer(&mut layers, &mut store, Some(group), 10, red_corner);
+    ok(layers.set_blend_mode(child, aurora_doc::BlendMode::Multiply));
+    // A fully transparent clipped layer changes nothing.
+    let clipped = layer(&mut layers, &mut store, None, 10, |_, _| CLEAR);
+    clip(&mut layers, clipped);
+    let acc = composite(&layers, &mut store);
+    // Multiply of grey 0.5 and red, not the isolated red.
+    near(px(&acc, 1, 1), [0.5, 0.0, 0.0, 1.0]);
+    near(px(&acc, 6, 6), [0.5, 0.5, 0.5, 1.0]);
+}
+
+/// A partly covered texel is where the backdrop has to be unmixed from the
+/// group's content: Multiply of a half-covered red over grey 0.5 gives
+/// (0.5, 0.25, 0.25) with or without a (transparent) clipped layer.
+#[test]
+fn a_pass_through_clip_base_unmixes_the_backdrop_at_partial_coverage() {
+    let (_dir, mut store) = store();
+    let mut layers = aurora_doc::LayerTree::new();
+    solid(&mut layers, &mut store, [0.5, 0.5, 0.5, 1.0]);
+    let group = ok(layers.add_group("g", None));
+    ok(layers.set_blend_mode(group, aurora_doc::BlendMode::PassThrough));
+    let child = layer(&mut layers, &mut store, Some(group), 10, |x, _| {
+        if x < 4 { [1.0, 0.0, 0.0, 0.5] } else { CLEAR }
+    });
+    ok(layers.set_blend_mode(child, aurora_doc::BlendMode::Multiply));
+    let plain = px(&composite(&layers, &mut store), 1, 1);
+    near(plain, [0.5, 0.25, 0.25, 1.0]);
+    let clipped = layer(&mut layers, &mut store, None, 10, |_, _| CLEAR);
+    clip(&mut layers, clipped);
+    near(px(&composite(&layers, &mut store), 1, 1), plain);
+}
+
+#[test]
+fn a_pass_through_groups_fill_scales_its_interpolation() {
+    let (_dir, mut store) = store();
+    let mut layers = aurora_doc::LayerTree::new();
+    solid(&mut layers, &mut store, [0.5, 0.5, 0.5, 1.0]);
+    let group = ok(layers.add_group("g", None));
+    ok(layers.set_blend_mode(group, aurora_doc::BlendMode::PassThrough));
+    let child = layer(&mut layers, &mut store, Some(group), 10, red_corner);
+    ok(layers.set_blend_mode(child, aurora_doc::BlendMode::Multiply));
+    ok(layers.set_fill_opacity(group, 0.5));
+    // B + (C - B) * 0.5 with C = Multiply(grey, red) = (0.5, 0, 0).
+    near(
+        px(&composite(&layers, &mut store), 1, 1),
+        [0.5, 0.25, 0.25, 1.0],
+    );
+    near(
+        px(&composite(&layers, &mut store), 6, 6),
+        [0.5, 0.5, 0.5, 1.0],
+    );
+    // Opacity and Fill multiply.
+    ok(layers.set_opacity(group, 0.5));
+    near(
+        px(&composite(&layers, &mut store), 1, 1),
+        [0.5, 0.375, 0.375, 1.0],
+    );
+    // Fill 0 leaves the backdrop alone.
+    ok(layers.set_fill_opacity(group, 0.0));
+    near(
+        px(&composite(&layers, &mut store), 1, 1),
+        [0.5, 0.5, 0.5, 1.0],
+    );
+}
+
+/// Under a Pass Through group's Fill below 100 %, an adjustment child
+/// adjusts only where the group's own content is.
+#[test]
+fn an_adjustment_in_a_reduced_fill_pass_through_group_skips_the_backdrop() {
+    let build = |fill: f32| {
+        let (dir, mut store) = store();
+        let mut layers = aurora_doc::LayerTree::new();
+        solid(&mut layers, &mut store, [0.25, 0.25, 0.25, 1.0]);
+        let group = ok(layers.add_group("g", None));
+        ok(layers.set_blend_mode(group, aurora_doc::BlendMode::PassThrough));
+        layer(&mut layers, &mut store, Some(group), 10, |x, _| {
+            if x < 5 { RED } else { CLEAR }
+        });
+        let invert = aurora_core::CurvesParams {
+            composite: curve_invert(),
+            ..aurora_core::CurvesParams::default()
+        };
+        ok(layers.add_adjustment_layer_at(
+            "c",
+            aurora_doc::Adjustment::Curves(invert),
+            Some(group),
+            0,
+        ));
+        ok(layers.set_fill_opacity(group, fill));
+        let acc = composite(&layers, &mut store);
+        drop(dir);
+        acc
+    };
+    let half = build(0.5);
+    // Content: red inverted is cyan, mixed 50 % into the grey backdrop.
+    near(px(&half, 1, 1), [0.125, 0.625, 0.625, 1.0]);
+    // No content: the adjustment leaves the backdrop alone (the unisolated
+    // fold would invert it to 0.75 and mix to 0.5).
+    near(px(&half, 8, 1), [0.25, 0.25, 0.25, 1.0]);
+    // Fill 100 %: a Pass Through adjustment reaches the backdrop, as ever.
+    let full = build(1.0);
+    near(px(&full, 1, 1), [0.0, 1.0, 1.0, 1.0]);
+    near(px(&full, 8, 1), [0.75, 0.75, 0.75, 1.0]);
+}
+
+#[test]
+fn culling_stays_bit_identical_with_group_clip_bases_and_reduced_fill_groups() {
+    let (_dir, mut store) = store();
+    let mut layers = aurora_doc::LayerTree::new();
+    layer(&mut layers, &mut store, None, 256, |_, _| RED);
+    // An opaque Pass Through group whose child covers the tile: a cover
+    // candidate, and a clip base.
+    let group = ok(layers.add_group("g", None));
+    ok(layers.set_blend_mode(group, aurora_doc::BlendMode::PassThrough));
+    layer(&mut layers, &mut store, Some(group), 256, |_, _| WHITE);
+    let c1 = layer(&mut layers, &mut store, None, 256, |x, _| {
+        [0.0, 0.5, 0.0, if x % 2 == 0 { 0.5 } else { 1.0 }]
+    });
+    clip(&mut layers, c1);
+    // A second Pass Through group with Fill below 100 %: never a cover.
+    let g2 = ok(layers.add_group("g2", None));
+    ok(layers.set_blend_mode(g2, aurora_doc::BlendMode::PassThrough));
+    layer(&mut layers, &mut store, Some(g2), 256, |_, _| BLUE);
+    ok(layers.set_fill_opacity(g2, 0.5));
+    set_culling(false);
+    let plain = composite(&layers, &mut store);
+    set_culling(true);
+    let culled = composite(&layers, &mut store);
+    assert!(same_bits(&plain, &culled));
+    // The reduced-Fill group blends 50 % blue over what is below: not a
+    // cover, so the layers below still show through.
+    let p = px(&culled, 4, 4);
+    assert!(p[0] > 0.0 && p[2] > 0.4 && p[2] < 1.0, "{p:?}");
 }
 
 fn culled_folds_now() -> u64 {

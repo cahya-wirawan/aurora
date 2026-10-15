@@ -495,7 +495,8 @@ fn a_pass_through_group_opens_as_pass_through_and_is_not_reported() {
     );
     assert!(document.report.is_empty(), "{:?}", document.report);
 
-    // A Fill below 100% on one is not applied, and says so.
+    // A Fill below 100% on one is composited (0.243.0), so it is not
+    // reported any more.
     let filled = TestPsd::new(1, 1, 1, 8)
         .with(|p| {
             p.layers = vec![
@@ -507,14 +508,11 @@ fn a_pass_through_group_opens_as_pass_through_and_is_not_reported() {
         })
         .write();
     let document = doc(&filled);
-    assert!(
-        document
-            .report
-            .items
-            .iter()
-            .any(|i| i.contains("1 Pass Through group has a Fill below 100%")),
-        "{:?}",
-        document.report
+    assert!(document.report.is_empty(), "{:?}", document.report);
+    let group = document.layers.roots().first().copied();
+    assert_eq!(
+        group.and_then(|id| document.layers.fill_opacity(id)),
+        Some(0.4)
     );
 
     // `pass` on a plain layer record (Photoshop never writes it) is

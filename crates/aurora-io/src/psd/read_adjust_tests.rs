@@ -1114,22 +1114,49 @@ fn grouped_file(fill: u8, clipped: bool, with_pixels_below: bool) -> TestPsd {
     })
 }
 
+/// A Pass Through group at `fill` holding a nested Pass Through group that
+/// holds an adjustment (the case still shown at full strength).
+fn nested_grouped_file(fill: u8) -> TestPsd {
+    let adjustment = TestLayer::empty("Adjust 1").with(|l| {
+        l.blocks.push((*b"blnc", unhex(BLNC_FILL)));
+    });
+    TestPsd::new(1, 2, 2, 8).with(|p| {
+        p.layers = vec![
+            TestLayer::divider(),
+            TestLayer::divider(),
+            adjustment,
+            TestLayer::group("Inner", *b"pass"),
+            TestLayer::group("Outer", *b"pass").with(|g| {
+                g.blocks.push((*b"iOpa", vec![fill]));
+            }),
+        ];
+    })
+}
+
 #[test]
-fn an_adjustment_under_a_pass_through_group_with_reduced_fill_is_reported_as_stronger() {
-    let document = ok(read(&grouped_file(102, false, true).write()));
+fn an_adjustment_in_a_nested_group_under_reduced_fill_is_reported_as_stronger() {
+    let document = ok(read(&nested_grouped_file(102).write()));
     let items = document.report.items.join("\n");
     assert!(
         items.contains(
-            "1 adjustment layer sits inside a Pass Through group whose Fill is below 100%"
+            "1 adjustment layer sits inside a group nested in a Pass Through group whose Fill \
+             is below 100%"
         ) && items.contains("may look much stronger than in Photoshop"),
         "{items}"
     );
-    // The layer stays imported.
-    assert!(top_adjustment(&document).is_some());
     // Full Fill: no such line.
-    let document = ok(read(&grouped_file(255, false, true).write()));
+    let document = ok(read(&nested_grouped_file(255).write()));
     let items = document.report.items.join("\n");
     assert!(!items.contains("much stronger"), "{items}");
+}
+
+#[test]
+fn a_direct_adjustment_under_a_reduced_fill_group_is_isolated_not_reported() {
+    // 0.243.0: the compositor isolates it, so the open says nothing.
+    let document = ok(read(&grouped_file(102, false, true).write()));
+    let items = document.report.items.join("\n");
+    assert!(!items.contains("much stronger"), "{items}");
+    assert!(top_adjustment(&document).is_some(), "still imported");
 }
 
 #[test]
@@ -1165,26 +1192,60 @@ fn the_left_out_note_calls_four_kinds_approximations() {
 }
 
 #[test]
-fn corpus_files_where_aurora_shows_the_adjustment_stronger_say_so() {
+fn corpus_files_where_aurora_shows_the_adjustment_stronger_say_so_or_are_isolated() {
     if let Some(document) = corpus("passthrough_fill_adjustment.psd") {
         let items = document.report.items.join("\n");
-        assert!(
-            items.contains("sits inside a Pass Through group whose Fill is below 100%"),
-            "{items}"
-        );
+        // 0.243.0: the adjustment is a direct child of the group, which
+        // the compositor now isolates, so nothing is said.
+        assert!(!items.contains("much stronger"), "{items}");
         assert!(!adjustments_of(&document).is_empty());
     }
     if let Some(document) = corpus("passthrough_clipping_mask_adjustment.psd") {
         let items = document.report.items.join("\n");
-        // The clipped layer here is a pixel layer whose base is a group, not
-        // a clipped adjustment: the existing clipping note names it, and no
-        // false claim about a clipped adjustment is made. (Aurora's error on
-        // this file is dominated by that unclipped layer.)
-        assert!(
-            items.contains("1 clipped layer is shown unclipped"),
-            "{items}"
-        );
+        // The clipped layer here is a pixel layer whose base is a group,
+        // which the compositor clips to since 0.243.0: nothing is said
+        // about clipping, and no false claim about a clipped adjustment.
+        assert!(!items.contains("shown unclipped"), "{items}");
         assert!(!items.contains("clipped adjustment layer"), "{items}");
         assert_eq!(adjustments_of(&document).len(), 2);
     }
+}
+
+/// 0.243.0: a clipped layer whose base is a group is clipped for real, so
+/// the open does not report it as shown unclipped; one with nothing
+/// beneath it still is.
+#[test]
+fn a_layer_clipped_to_a_group_is_not_reported_as_unclipped() {
+    let build = |with_group_below: bool| {
+        TestPsd::new(1, 2, 2, 8).with(|p| {
+            let mut layers = Vec::new();
+            if with_group_below {
+                layers.push(TestLayer::divider());
+                layers.push(TestLayer::pixels(
+                    "p",
+                    0,
+                    0,
+                    2,
+                    2,
+                    8,
+                    &[[255, 0, 0, 255]; 4],
+                ));
+                layers.push(TestLayer::group("G", *b"norm"));
+            }
+            layers.push(
+                TestLayer::pixels("clipped", 0, 0, 2, 2, 8, &[[0, 0, 255, 255]; 4])
+                    .with(|l| l.clipping = 1),
+            );
+            p.layers = layers;
+        })
+    };
+    let document = ok(read(&build(true).write()));
+    let items = document.report.items.join("\n");
+    assert!(!items.contains("shown unclipped"), "{items}");
+    let document = ok(read(&build(false).write()));
+    let items = document.report.items.join("\n");
+    assert!(
+        items.contains("1 clipped layer is shown unclipped"),
+        "{items}"
+    );
 }

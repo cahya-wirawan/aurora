@@ -466,8 +466,9 @@ enum Note {
     VectorMaskRasterised,
     VectorMaskDisabledDropped,
     ClippingDropped,
-    /// Adjustment layers under a Pass Through group whose Fill is below
-    /// 100 % (0.241.0).
+    /// Adjustment layers inside a group nested in a Pass Through group
+    /// whose Fill is below 100 % (0.241.0; 0.243.0 narrowed it to the
+    /// nested ones, since a direct child is isolated now).
     AdjustmentUnderGroupFill,
     /// Clipped adjustment layers shown unclipped (0.241.0).
     AdjustmentClipNotApplied,
@@ -490,7 +491,6 @@ enum Note {
     EffectsClamped,
     BlendIfNotApplied,
     KnockoutNotApplied,
-    PassThroughFillNotApplied,
     UnknownBlendMode,
     UnknownChannel,
     MissingColorChannel,
@@ -700,13 +700,15 @@ fn note_text(note: Note, n: u64) -> String {
             aurora_core::effects::MAX_SHADOW_APRON
         ),
         Note::ClippingDropped => format!(
-            "{n} clipped layer{s} {is} shown unclipped — {} base is a group or an adjustment \
-             layer, or there is no layer beneath to clip to.",
-            if one { "its" } else { "their" }
+            "{n} clipped layer{s} {is} shown unclipped — {} base is an adjustment layer, {} a \
+             group, or nothing is beneath.",
+            if one { "its" } else { "their" },
+            if one { "it is" } else { "they are" }
         ),
         Note::AdjustmentUnderGroupFill => format!(
-            "{n} adjustment layer{s} sit{} inside a Pass Through group whose Fill is below \
-             100%, which Aurora doesn't apply: {} may look much stronger than in Photoshop.",
+            "{n} adjustment layer{s} sit{} inside a group nested in a Pass Through group whose \
+             Fill is below 100%, which Aurora doesn't isolate: {} may look much stronger than in \
+             Photoshop.",
             if one { "s" } else { "" },
             if one { "it" } else { "they" },
         ),
@@ -763,12 +765,6 @@ fn note_text(note: Note, n: u64) -> String {
         Note::KnockoutNotApplied => format!(
             "{n} layer{s} or group{s} use{} Knockout, which Aurora doesn't apply yet.",
             if one { "s" } else { "" }
-        ),
-        Note::PassThroughFillNotApplied => format!(
-            "{n} Pass Through group{s} {has} a Fill below 100%, which Aurora doesn't apply to a \
-             group yet; {} composited at full Fill.",
-            if one { "it is" } else { "they are" },
-            has = if one { "has" } else { "have" },
         ),
         Note::UnknownBlendMode => format!(
             "{n} layer{s} or group{s} use a blend mode Aurora doesn't recognise and {is} shown \
@@ -3356,11 +3352,15 @@ fn build_tree(
                     Vec::new()
                 };
                 let props = props_for(record, notes);
-                // Pass Through groups composite for real since 0.179.0;
-                // only a Fill below 100% on one is not applied.
+                // Pass Through groups composite for real since 0.179.0 and
+                // their Fill since 0.243.0, which also isolates the
+                // adjustments that are direct children; only those in a
+                // nested group are still shown at full strength.
                 if props.blend == BlendMode::PassThrough && props.fill_opacity < 1.0 {
-                    notes.add(Note::PassThroughFillNotApplied);
-                    notes.add_n(Note::AdjustmentUnderGroupFill, count_adjustments(&children));
+                    notes.add_n(
+                        Note::AdjustmentUnderGroupFill,
+                        count_nested_adjustments(&children),
+                    );
                 }
                 // A group's mask region is the canvas (`Builder::add_nodes`).
                 let outcome =
@@ -3394,6 +3394,18 @@ fn build_tree(
         }
     }
     Ok(stack.pop().unwrap_or_default())
+}
+
+/// How many adjustment layers sit inside groups nested in `nodes` (direct
+/// children are not counted).
+fn count_nested_adjustments(nodes: &[PsdNode]) -> u64 {
+    nodes
+        .iter()
+        .map(|node| match node {
+            PsdNode::Group { children, .. } => count_adjustments(children),
+            PsdNode::Layer(_) | PsdNode::Adjustment(_) => 0,
+        })
+        .sum()
 }
 
 /// How many adjustment layers `nodes` hold, nested groups included.
@@ -4749,14 +4761,18 @@ impl Builder<'_, '_, '_> {
         if props.clipped {
             match self.history.set_clipped(self.layers, id, true) {
                 Ok(_) => {
-                    // Aurora composites a clip group over a pixel base only.
-                    let base_is_pixel = self.layers.clip_base(id).is_some_and(|base| {
+                    // Aurora composites a clip group over a pixel or (since
+                    // 0.243.0) a group base.
+                    let base_is_clippable = self.layers.clip_base(id).is_some_and(|base| {
                         matches!(
                             self.layers.kind(base),
-                            Some(aurora_doc::LayerKind::Pixel { .. })
+                            Some(
+                                aurora_doc::LayerKind::Pixel { .. }
+                                    | aurora_doc::LayerKind::Group { .. }
+                            )
                         )
                     });
-                    if !base_is_pixel {
+                    if !base_is_clippable {
                         self.clip_refused = self.clip_refused.saturating_add(1);
                         self.note_adjustment_unclipped(id);
                     }

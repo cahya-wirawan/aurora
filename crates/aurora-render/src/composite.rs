@@ -906,6 +906,18 @@ fn soft_light_d(x: f32) -> f32 {
     }
 }
 
+/// `VividLight` as `ColorBurn(Cb, 2 * Cs)` below `Cs = 0.5` and
+/// `ColorDodge(Cb, 2 * Cs - 1)` above, with those modes' own guard order
+/// (`Cb == 1` and `Cb == 0` first). Before 0.243.0 this was `VividLight`
+/// itself; `HardMix`, which thresholds it, still matches Photoshop with it.
+fn vivid_light_legacy(cb: f32, cs: f32) -> f32 {
+    if cs <= 0.5 {
+        blend_channel(BlendMode::ColorBurn, cb, 2.0 * cs)
+    } else {
+        blend_channel(BlendMode::ColorDodge, cb, 2.0 * cs - 1.0)
+    }
+}
+
 /// The per-channel blend function `B(Cb, Cs)` for `mode`, given one
 /// backdrop channel `cb` and one source channel `cs`, both straight
 /// (unpremultiplied) and in `0.0..=1.0` — the piece of the general
@@ -949,8 +961,15 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
         BlendMode::Difference => (cb - cs).abs(),
         BlendMode::Exclusion => cb + cs - 2.0 * cb * cs,
         BlendMode::Subtract => (cb - cs).max(0.0),
+        // 0.243.0: `Divide(0, 0)` is `0`, not `1` (Photoshop's merged image
+        // of `psd-tools`' `blend-modes/divide.psd`, three overlapping
+        // translucent primaries: the red channel of blue over green is
+        // `0/0`, and the result is the one `0` gives). `Divide(Cb, 0)` for
+        // `Cb > 0` stays `1`.
         BlendMode::Divide => {
-            if cs == 0.0 {
+            if cb == 0.0 {
+                0.0
+            } else if cs == 0.0 {
                 1.0
             } else {
                 (cb / cs).min(1.0)
@@ -1000,11 +1019,22 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
         // rather than re-deriving it. `2*Cs` (Cs<=0.5, range [0,1]) and
         // `2*Cs-1` (Cs>0.5, range (0,1]) are both valid inputs to those
         // arms as-is.
+        //
+        // 0.243.0: a source channel at `0` or `1` decides the result
+        // (`VividLight(Cb, 0) = 0`, `VividLight(Cb, 1) = 1`) before the
+        // backdrop's own `0`/`1` guards get a say, as in Photoshop's merged
+        // image of `psd-tools`' `blend-modes/vivid-light.psd`:
+        // `VividLight(0, 1) = 1` and `VividLight(1, 0) = 0` there, where
+        // `ColorDodge`'s `Cb == 0` and `ColorBurn`'s `Cb == 1` guards would
+        // have answered `0` and `1`. [`vivid_light_legacy`] keeps the old
+        // order for `HardMix`, whose own corpus file matches it.
         BlendMode::VividLight => {
-            if cs <= 0.5 {
-                blend_channel(BlendMode::ColorBurn, cb, 2.0 * cs)
+            if cs == 0.0 {
+                0.0
+            } else if cs == 1.0 {
+                1.0
             } else {
-                blend_channel(BlendMode::ColorDodge, cb, 2.0 * cs - 1.0)
+                vivid_light_legacy(cb, cs)
             }
         }
         // LinearLight: the branch form is `Cs <= 0.5 -> LinearBurn(Cb,
@@ -1035,7 +1065,7 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
         // HardMix: a hard threshold on VividLight's own result, reusing
         // that arm directly rather than re-deriving its branch logic.
         BlendMode::HardMix => {
-            if blend_channel(BlendMode::VividLight, cb, cs) < 0.5 {
+            if vivid_light_legacy(cb, cs) < 0.5 {
                 0.0
             } else {
                 1.0
@@ -21654,6 +21684,72 @@ mod tests {
         );
     }
 
+    /// 0.243.0: the in-shader `VividLight` takes Photoshop's source poles
+    /// (`Cs == 0 -> 0`, `Cs == 1 -> 1`) ahead of the backdrop's own
+    /// guards: Cb (1, 0, 0.5) under Cs (0, 1, 0.5), opaque, gives red 0
+    /// (the old order said 1) and green 1 (the old order said 0).
+    #[test]
+    fn composite_vivid_light_takes_the_source_poles_before_the_backdrop_guards() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+        let bottom_texels = solid_texels([1.0, 0.0, 0.5, 1.0]);
+        let top_texels = solid_texels([0.0, 1.0, 0.5, 1.0]);
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = tile_from_texels(device, queue, &top_texels, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_vivid_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+        assert_eq!(
+            read_texel_at(device, queue, &dst, 3, 3),
+            (0.0, 1.0, 0.5, 1.0)
+        );
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::VividLight),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader VividLight and the CPU disagree at the source poles",
+        );
+    }
+
     #[test]
     /// A non-`1.0` opacity on the `VividLight` path, exercising the
     /// `s.a * opacity.value` scale — **and the fixture that reaches the dodge
@@ -27396,7 +27492,9 @@ mod tests {
         // in blue.
         assert_eq!(
             read_texel_at(device, queue, &dst, 1, 1),
-            (0.3125, 0.3125, 0.75, 1.0),
+            // 0.243.0: blue was 0.75 (`Divide(0, 0) = 1`); Photoshop's merged
+            // image gives `Divide(0, 0) = 0`, which folds to 0.
+            (0.3125, 0.3125, 0.0, 1.0),
             "at (1, 1) Cb = (0.25, 0.25, 0) and Cs = (0.75, 0.75, 0): red and green take the \
              interior ratio 1/3 and blue the guard's 0/0 arm, folded at the top layer's own 0.75 \
              alpha. The two rivals below are quoted first as B (the blend term alone) and then as \
@@ -27413,7 +27511,8 @@ mod tests {
         // non-negative arms of the guard.
         assert_eq!(
             read_texel_at(device, queue, &dst, 3, 2),
-            (0.9375, 0.875, 0.75, 1.0),
+            // 0.243.0: blue is the 0/0 channel, 0 now (was 0.75).
+            (0.9375, 0.875, 0.0, 1.0),
             "at (3, 2) Cb = (0.75, 0.5, 0) and Cs = (0.25, 0, 0): RED IS RAILED (ratio 3, so a \
              dropped min gives 2.4375 here), GREEN takes the cb > 0, cs == 0 arm of the guard \
              (+inf on this adapter, which min maps to the same 1.0 the guard returns) and BLUE \
@@ -29261,5 +29360,49 @@ mod tests {
             "a whole tile must be a whole number of chunks, or a real fold \
              would reach the scalar remainder loop"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)]
+mod pole_tests {
+    use super::*;
+
+    /// 0.243.0, from Photoshop's merged images of `blend-modes/divide.psd`
+    /// and `vivid-light.psd`: `Divide(0, 0) = 0`, `Divide(Cb > 0, 0) = 1`.
+    #[test]
+    fn divide_of_zero_by_zero_is_zero_and_by_zero_otherwise_one() {
+        assert_eq!(blend_channel(BlendMode::Divide, 0.0, 0.0), 0.0);
+        assert_eq!(blend_channel(BlendMode::Divide, 0.25, 0.0), 1.0);
+        assert_eq!(blend_channel(BlendMode::Divide, 1.0, 0.0), 1.0);
+        assert_eq!(blend_channel(BlendMode::Divide, 0.0, 1.0), 0.0);
+        assert_eq!(blend_channel(BlendMode::Divide, 0.5, 1.0), 0.5);
+        assert_eq!(blend_channel(BlendMode::Divide, 0.5, 0.25), 1.0);
+    }
+
+    /// A source channel at 0 or 1 decides `VividLight` whatever the backdrop
+    /// is: `(Cb 0, Cs 1) = 1` and `(Cb 1, Cs 0) = 0`, the two corners the
+    /// corpus measured; the interior is unchanged.
+    #[test]
+    fn vivid_light_source_poles_decide_before_the_backdrop_guards() {
+        for cb in [0.0, 0.25, 0.5, 1.0] {
+            assert_eq!(blend_channel(BlendMode::VividLight, cb, 0.0), 0.0, "{cb}");
+            assert_eq!(blend_channel(BlendMode::VividLight, cb, 1.0), 1.0, "{cb}");
+        }
+        // Interior: ColorBurn(Cb, 2 Cs) below 0.5, ColorDodge above.
+        assert_eq!(blend_channel(BlendMode::VividLight, 0.75, 0.25), 0.5);
+        assert_eq!(blend_channel(BlendMode::VividLight, 0.25, 0.75), 0.5);
+        assert_eq!(blend_channel(BlendMode::VividLight, 0.0, 0.5), 0.0);
+        assert_eq!(blend_channel(BlendMode::VividLight, 1.0, 0.5), 1.0);
+    }
+
+    /// `HardMix` is unchanged: its own corpus file matches the old guard
+    /// order, so `HardMix(0, 1) = 0` and `HardMix(1, 0) = 1`.
+    #[test]
+    fn hard_mix_keeps_its_corner_values() {
+        assert_eq!(blend_channel(BlendMode::HardMix, 0.0, 1.0), 0.0);
+        assert_eq!(blend_channel(BlendMode::HardMix, 1.0, 0.0), 1.0);
+        assert_eq!(blend_channel(BlendMode::HardMix, 0.75, 0.75), 1.0);
+        assert_eq!(blend_channel(BlendMode::HardMix, 0.25, 0.25), 0.0);
     }
 }

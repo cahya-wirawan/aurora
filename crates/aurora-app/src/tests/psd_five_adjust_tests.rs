@@ -108,15 +108,15 @@ const FILES: [Row; 14] = [
         [86.0, 86.0, 78.0],
         [23.99, 25.33, 24.69],
     ),
-    // Exposure -3.53 in a Pass Through group whose Fill is 40 %: Aurora
-    // applies it at full Fill (reported), Photoshop shows almost none of
-    // it. Worse than left out (mean 6.8 / 15.1 / 15.1): a finding about the
-    // group Fill, not about Exposure.
+    // Exposure -3.53 in a Pass Through group whose Fill is 40 %. Before
+    // 0.243.0 Aurora applied it at full Fill to everything below (max 172,
+    // mean 165 / 156 / 156); the group Fill is applied now and the
+    // adjustment only reaches the group's own content.
     (
         "passthrough_fill_adjustment.psd",
         1,
-        [172.0; 3],
-        [165.25, 156.45, 156.45],
+        [1.0, 18.0, 18.0],
+        [0.104, 3.47, 3.47],
     ),
     // Left out: mean 86 / 70 / 70.
     (
@@ -132,14 +132,14 @@ const FILES: [Row; 14] = [
         [8.0, 7.0, 7.0],
         [4.02, 4.23, 4.15],
     ),
-    // Two Exposure -3.53 layers in masked groups, a clipped layer shown
-    // unclipped (reported): slightly worse than left out (mean 49.7 /
-    // 34.6 / 34.6), same cause as the Fill file.
+    // Two Exposure -3.53 layers in masked groups and a layer clipped to a
+    // group. Before 0.243.0 the clipped layer was shown unclipped (max 171 /
+    // 89 / 89, mean 54.8 / 39.1 / 39.1).
     (
         "passthrough_clipping_mask_adjustment.psd",
         2,
-        [171.0, 89.0, 89.0],
-        [54.83, 39.12, 39.12],
+        [5.0, 8.0, 8.0],
+        [2.13, 2.71, 2.71],
     ),
     // Left out: mean 14.1 / 13.1 / 0.1, max 137.
     (
