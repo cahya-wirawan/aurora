@@ -196,6 +196,9 @@ pub(crate) struct PendingPsdSave {
 pub(crate) enum PsdSaveStep {
     /// Nothing changed in the save: written, verified and in place.
     Saved,
+    /// As [`Self::Saved`], but the directory sync failed after the rename
+    /// (0.247.0): the file is in place, its durability unconfirmed.
+    SavedNotConfirmed,
     /// Written and verified beside the target; the user must agree.
     NeedsConfirmation(PendingPsdSave),
 }
@@ -271,8 +274,12 @@ pub(crate) fn begin_psd_save(
     // The fixed-order "carried from open" block goes last (category C).
     outcome.report.items.extend(source.carried);
     if outcome.report.is_empty() {
-        temp.persist().map_err(PsdSaveFailure::Write)?;
-        return Ok(PsdSaveStep::Saved);
+        let advisory = temp.persist().map_err(PsdSaveFailure::Write)?;
+        return Ok(if advisory.is_some() {
+            PsdSaveStep::SavedNotConfirmed
+        } else {
+            PsdSaveStep::Saved
+        });
     }
     Ok(PsdSaveStep::NeedsConfirmation(PendingPsdSave {
         temp,
@@ -289,7 +296,7 @@ pub(crate) fn finish_psd_save(
     pending: PendingPsdSave,
     doc_id: DocumentId,
     revision: crate::UndoRevision,
-) -> Result<(), PsdSaveFailure> {
+) -> Result<Option<String>, PsdSaveFailure> {
     if pending.doc_id != doc_id || pending.revision != revision {
         return Err(PsdSaveFailure::DocumentChanged);
     }
