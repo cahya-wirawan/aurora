@@ -4982,6 +4982,84 @@ mod tests {
         }
     }
 
+    /// 0.239.0: Vibrance, Exposure and Photo Filter layers, an edit of each
+    /// and the history survive a save and reopen (manifest and journal
+    /// replay), with no manifest version bump (ordinals 4, 5, 6 appended).
+    #[test]
+    fn round_trips_vibrance_exposure_and_photo_filter_layers_and_their_history() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        if let Err(err) = history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let edits = [
+            (
+                aurora_doc::Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
+                match aurora_core::VibranceParams::new(35.0, -12.0) {
+                    Ok(p) => aurora_doc::Adjustment::Vibrance(p),
+                    Err(err) => unreachable!("{err:?}"),
+                },
+            ),
+            (
+                aurora_doc::Adjustment::Exposure(aurora_core::ExposureParams::identity()),
+                match aurora_core::ExposureParams::new(-1.25, 0.0625, 2.2) {
+                    Ok(p) => aurora_doc::Adjustment::Exposure(p),
+                    Err(err) => unreachable!("{err:?}"),
+                },
+            ),
+            (
+                aurora_doc::Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+                match aurora_core::PhotoFilterParams::new([0.0, 0.4, 1.0], 61.0, false) {
+                    Ok(p) => aurora_doc::Adjustment::PhotoFilter(p),
+                    Err(err) => unreachable!("{err:?}"),
+                },
+            ),
+        ];
+        let mut wanted = Vec::new();
+        for (index, (start, edited)) in edits.into_iter().enumerate() {
+            let layer = match history.add_adjustment_layer_at(
+                &mut layers,
+                &format!("Adjustment {index}"),
+                start,
+                None,
+                0,
+            ) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = history.set_adjustment(&mut layers, layer, edited.clone()) {
+                unreachable!("{err:?}");
+            }
+            wanted.push((layer, edited));
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.into_inner()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let replayed = match document.history.replay() {
+            Ok(replayed) => replayed,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for (layer, edited) in &wanted {
+            assert_eq!(document.layers.adjustment(*layer), Some(edited));
+            assert_eq!(replayed.adjustment(*layer), Some(edited));
+        }
+    }
+
     /// 0.204.0: a ranged Hue/Saturation adjustment layer, its edit and its history
     /// survive a save and reopen (manifest and journal replay), with no
     /// manifest version bump: the variant is appended after `Levels`.
