@@ -114,10 +114,11 @@ fn lab_f(t: f32) -> f32 {
 }
 
 /// L*a*b* (D65) of a linear-light colour.
+#[allow(clippy::many_single_char_names)]
 fn lab_of_linear(r: f32, g: f32, b: f32) -> [f32; 3] {
     let x = (0.412_456_4 * r + 0.357_576_1 * g + 0.180_437_5 * b) / 0.950_47;
-    let y = 0.212_672_9 * r + 0.715_152_2 * g + 0.072_175_0 * b;
-    let z = (0.019_333_9 * r + 0.119_192_0 * g + 0.950_304_1 * b) / 1.088_83;
+    let y = 0.212_672_9 * r + 0.715_152_2 * g + 0.072_175 * b;
+    let z = (0.019_333_9 * r + 0.119_192 * g + 0.950_304_1 * b) / 1.088_83;
     let (fx, fy, fz) = (lab_f(x), lab_f(y), lab_f(z));
     [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
 }
@@ -183,6 +184,7 @@ fn threshold(fuzziness: u16) -> f32 {
 /// [`FillError::TooLarge`] when the searched window is over
 /// `spec.max_tiles` tiles of area; [`FillError::Tile`] if a tile cannot be
 /// read (nothing is returned then).
+#[allow(clippy::too_many_lines)]
 pub fn colour_range(
     store: &mut TileStore,
     surface: SurfaceId,
@@ -304,7 +306,7 @@ fn texel_coverage(
 ) -> u8 {
     let alpha_bits = bits[3];
     let alpha = f16::from_bits(alpha_bits).to_f32();
-    if !(alpha > 0.0) {
+    if alpha.is_nan() || alpha <= 0.0 {
         return 0;
     }
     let lab = if alpha_bits == ONE_BITS {

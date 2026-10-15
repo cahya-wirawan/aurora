@@ -269,9 +269,8 @@ pub(crate) fn colour_range_step(
         Err(why) => return ColourRangeOutcome::Refused(why),
     };
     let before = selection.active();
-    let combined = match aurora_doc::combine_selections(before.as_ref(), &picked, mode) {
-        Ok(combined) => combined,
-        Err(_) => return ColourRangeOutcome::Refused(LockRefusal::SelectionTooLarge),
+    let Ok(combined) = aurora_doc::combine_selections(before.as_ref(), &picked, mode) else {
+        return ColourRangeOutcome::Refused(LockRefusal::SelectionTooLarge);
     };
     match combined {
         Some(next) => selection.select(next),

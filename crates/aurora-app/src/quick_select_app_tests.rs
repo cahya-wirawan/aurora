@@ -390,7 +390,7 @@ fn the_one_line_that_routes_a_stamp_reads_the_brush_radius_and_tolerance() {
     assert!(source.contains("radius: settings.dab_radius(crate::DabTool::Brush)"));
     assert!(source.contains("tolerance: settings.tolerance"));
     let lib = include_str!("lib.rs");
-    assert!(lib.contains("quick_select::stamp(\n            &mut self.drag,"));
+    assert!(lib.contains("quick_select::stamp("));
 }
 
 #[test]

@@ -112,7 +112,7 @@ fn the_ramp_gives_partial_coverage_between_half_the_threshold_and_all_of_it() {
     );
     let s = ok_selection(&rig);
     let covers: Vec<f32> = (0..100).map(|x| s.coverage_at(x, 5)).collect();
-    assert!(covers.iter().any(|c| *c == 1.0));
+    assert!(covers.contains(&1.0));
     assert!(covers.iter().any(|c| *c > 0.0 && *c < 1.0), "a soft ramp");
     // Rises to a peak at the sample then falls: unimodal.
     let peak = covers
@@ -338,6 +338,6 @@ fn the_default_fuzziness_is_forty_and_the_app_reads_the_foreground_and_the_mode(
     assert_eq!(ToolSettings::default().colour_range_fuzziness, 40);
     // `App::run_colour_range` needs a window: pin what it feeds the step.
     let lib = include_str!("lib.rs");
-    assert!(lib.contains("self.colour.state.paint_colour(),\n            fuzziness,"));
+    assert!(lib.contains("self.colour.state.range_colour(),\n            fuzziness,"));
     assert!(lib.contains("self.tool_settings.selection_mode,\n        ) {\n            colour_range_app::ColourRangeOutcome::Applied"));
 }

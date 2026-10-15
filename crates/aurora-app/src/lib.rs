@@ -6324,6 +6324,7 @@ const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
 /// yet, so every save shows a picker. `COMMAND_LAYER_NEW`/
 /// `COMMAND_LAYER_DELETE` (0.143.0) resolve to [`ActivatedCommand::NewLayer`]/
 /// [`ActivatedCommand::DeleteLayer`], run by [`perform_layer_command`].
+#[allow(clippy::too_many_lines)]
 fn palette_commands() -> Vec<CommandEntry> {
     let mut commands = vec![
         CommandEntry::new(COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
@@ -34015,7 +34016,7 @@ impl App {
             store,
             &self.doc.layers,
             self.doc.active_layer,
-            self.colour.state.paint_colour(),
+            self.colour.state.range_colour(),
             fuzziness,
             self.doc.canvas_size,
             self.tool_settings.selection_mode,
@@ -70468,6 +70469,7 @@ mod tests {
                         | Tool::CloneStamp
                         | Tool::Smudge
                         | Tool::SpotHealing
+                        | Tool::QuickSelect
                         | Tool::Blur
                         | Tool::Sharpen
                         | Tool::Dodge
@@ -90976,7 +90978,7 @@ mod panel_scroll_tests {
                 toggle(&mut ws, &mut focus);
                 let hist = button(&ws, ws.history);
                 let mut reached = false;
-                for _ in 0..32 {
+                for _ in 0..48 {
                     if focus.focus_next(&mut ws.tree) == Some(hist) {
                         reached = true;
                         break;

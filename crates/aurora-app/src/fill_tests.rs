@@ -608,7 +608,7 @@ fn a_gradient_drag_applies_on_release_whatever_the_tool_or_button() {
     let squeeze = |text: &str| text.split_whitespace().collect::<String>();
     let squeezed = squeeze(production);
     assert!(squeezed.contains(&squeeze(
-        "let ending = self.drag.take(); let ending = lasso_tools::release_lasso(&mut self.drag, ending, &mut self.doc.selection); if let Some((start_doc, end_doc)) = released_gradient(ending.as_ref()) { self.apply_gradient(start_doc, end_doc); } self.commit_drag(ending);"
+        "let ending = self.drag.take(); let mut ending = lasso_tools::release_lasso(&mut self.drag, ending, &mut self.doc.selection); quick_select::release(&mut ending, &mut self.doc.selection, self.doc.canvas_size); if let Some((start_doc, end_doc)) = released_gradient(ending.as_ref()) { self.apply_gradient(start_doc, end_doc); } self.commit_drag(ending);"
     )));
 }
 
