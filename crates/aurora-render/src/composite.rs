@@ -27445,7 +27445,8 @@ mod tests {
         // non-negative arms of the guard.
         assert_eq!(
             read_texel_at(device, queue, &dst, 3, 2),
-            (0.9375, 0.875, 0.75, 1.0),
+            // 0.243.0: blue is the 0/0 channel, 0 now (was 0.75).
+            (0.9375, 0.875, 0.0, 1.0),
             "at (3, 2) Cb = (0.75, 0.5, 0) and Cs = (0.25, 0, 0): RED IS RAILED (ratio 3, so a \
              dropped min gives 2.4375 here), GREEN takes the cb > 0, cs == 0 arm of the guard \
              (+inf on this adapter, which min maps to the same 1.0 the guard returns) and BLUE \
