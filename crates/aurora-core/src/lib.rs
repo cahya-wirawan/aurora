@@ -8,6 +8,7 @@
 
 pub mod black_white;
 pub mod brightness_contrast;
+pub mod channel_mixer;
 pub mod color;
 pub mod color_balance;
 pub mod curves;
@@ -21,6 +22,7 @@ pub mod id;
 pub mod levels;
 pub mod photo_filter;
 pub mod posterize;
+pub mod selective_color;
 pub mod threshold;
 pub mod tone_curve;
 pub mod vibrance;
@@ -32,6 +34,10 @@ pub use black_white::{
 pub use brightness_contrast::{
     BRIGHTNESS_CONTRAST_MEAN, BRIGHTNESS_MAX, BrightnessContrastError, BrightnessContrastParams,
     CONTRAST_MAX, CONTRAST_MIN, LEGACY_MAX,
+};
+pub use channel_mixer::{
+    CHANNEL_MIXER_CONSTANT_MAX, CHANNEL_MIXER_OUTPUTS, CHANNEL_MIXER_SOURCE_MAX, ChannelMixerError,
+    ChannelMixerParams, MixerRow,
 };
 pub use color::{Channels, ColorSpace, PixelFormat, SampleFormat};
 pub use color_balance::{
@@ -54,6 +60,10 @@ pub use photo_filter::{
 };
 pub use posterize::{
     POSTERIZE_DEFAULT, POSTERIZE_MAX, POSTERIZE_MIN, PosterizeError, PosterizeParams,
+};
+pub use selective_color::{
+    InkRow, SELECTIVE_COLOR_INKS, SELECTIVE_COLOR_MAX, SELECTIVE_COLOR_RANGES, SelectiveColorError,
+    SelectiveColorParams,
 };
 pub use threshold::{
     THRESHOLD_DEFAULT, THRESHOLD_MAX, THRESHOLD_MIN, ThresholdError, ThresholdParams,
