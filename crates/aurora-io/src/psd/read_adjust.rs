@@ -93,6 +93,7 @@ pub(super) enum Kind {
     BrightnessContrast,
     ChannelMixer,
     SelectiveColor,
+    GradientMap,
 }
 
 impl Kind {
@@ -110,6 +111,7 @@ impl Kind {
             Self::BrightnessContrast => "Brightness/Contrast",
             Self::ChannelMixer => "Channel Mixer",
             Self::SelectiveColor => "Selective Color",
+            Self::GradientMap => "Gradient Map",
         }
     }
 }
@@ -211,8 +213,8 @@ pub(super) struct CgedBlock {
     pub auto: bool,
 }
 
-/// The last block of one of the nine kinds a record carried.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// The last block of one of the kinds a record carried.
+#[derive(Clone, Debug, PartialEq)]
 pub(super) enum Parsed {
     /// `nvrt`: an empty block.
     Invert(Result<(), ()>),
@@ -231,6 +233,10 @@ pub(super) enum Parsed {
     ChannelMixer(Result<MixerBlock, ()>),
     /// `selc` (0.245.0).
     SelectiveColor(Result<SelectiveBlock, ()>),
+    /// `grdm` (0.248.0).
+    GradientMap(Result<GradientBlock, ()>),
+    /// `clrL` (0.248.0): never applied, read only to say why.
+    ColorLookup(Result<LookupBlock, ()>),
 }
 
 /// The parser for `key`, or `None` for a key that is not one of the five.
@@ -247,6 +253,8 @@ pub(super) fn parse_block(key: [u8; 4], data: &[u8]) -> Option<Parsed> {
         b"brit" => Parsed::Brightness(parse_brit(data), None),
         b"mixr" => Parsed::ChannelMixer(parse_mixer(data)),
         b"selc" => Parsed::SelectiveColor(parse_selective(data)),
+        b"grdm" => Parsed::GradientMap(parse_gradient_map(data)),
+        b"clrL" => Parsed::ColorLookup(parse_color_lookup(data)),
         _ => return None,
     })
 }
@@ -266,6 +274,8 @@ pub(super) fn is_key(key: [u8; 4]) -> bool {
             | b"brit"
             | b"mixr"
             | b"selc"
+            | b"grdm"
+            | b"clrL"
     )
 }
 
@@ -807,6 +817,277 @@ pub(super) fn selective_color_adjustment(
     Ok(Adjustment::SelectiveColor(params))
 }
 
+// ---------------------------------------------------------------------
+// Gradient Map and Color Lookup (0.248.0)
+// ---------------------------------------------------------------------
+
+/// The longest `grdm` or `clrL` block read. A real Gradient Map block is
+/// under 300 bytes; 64 KiB allows over 3,000 stops, far beyond the cap.
+const MAX_GRADIENT_BLOCK_BYTES: usize = 64 * 1024;
+
+/// A colour stop as the file holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FileColourStop {
+    /// `0..=4096`.
+    pub location: u32,
+    /// Percent, `50` by default.
+    pub midpoint: u32,
+    /// The colour mode: `0` RGB.
+    pub mode: u16,
+    /// Four `u16` components; for RGB red, green, blue and a zero.
+    pub colour: [u16; 4],
+}
+
+/// A transparency stop as the file holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FileTransparencyStop {
+    pub location: u32,
+    pub midpoint: u32,
+    /// `0..=255`.
+    pub opacity: u16,
+}
+
+/// A parsed `grdm` block (0.248.0). Layout, checked on
+/// `layers/gradient-map.psd`, the three `gradient-map-v3-*.psd` and
+/// `fill_adjustments.psd` and against psd-tools 1.17.4's `GradientMap`:
+/// `u16` version (`1`, or `3` which adds a four-character interpolation
+/// method after the flags), `u8` Reverse, `u8` Dither, [method], a unicode
+/// name (`u32` count of UTF-16 units including a NUL), `u16` colour stop
+/// count and per stop `u32` location (`0..=4096`), `u32` midpoint percent,
+/// `u16` colour mode and four `u16` colour components and two pad bytes,
+/// `u16` transparency stop count and per stop `u32` location, `u32`
+/// midpoint, `u16` opacity (`0..=255`), then `u16` expansion (`2`), `u16`
+/// smoothness (`4096` = 100 %), `u16` length (`32`), `u16` gradient mode (`0`
+/// solid), `u32` random seed, `u16` show transparency, `u16` use vector
+/// colour, `u32` roughness, `u16` colour model, two colours of four `u16`,
+/// and two pad bytes. Colour components are `0..=65535` (`ffff` is full).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct GradientBlock {
+    pub reverse: bool,
+    pub dither: bool,
+    /// `Gcls` for a version 1 block.
+    pub method: [u8; 4],
+    pub colours: Vec<FileColourStop>,
+    pub transparency: Vec<FileTransparencyStop>,
+    pub smoothness: u16,
+    /// `0` Solid, `1` Noise.
+    pub gradient_mode: u16,
+}
+
+/// A parsed `clrL` block: `u16` version (`1`), `u32` data version (`16`) and
+/// a descriptor. **Every fixture holds an empty descriptor** (no `lookupType`,
+/// no name, no table); a non-empty one has never been seen, so only its
+/// presence, its `Nm  ` text and its `lookupType` enum are read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LookupBlock {
+    /// The descriptor holds no items at all.
+    pub empty: bool,
+    /// The `Nm  ` text, when there is one.
+    pub name: Option<String>,
+}
+
+/// Why a Color Lookup layer is left out (it never becomes a layer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ColorLookupReason {
+    /// An empty descriptor: no table was chosen.
+    NoTable,
+    /// A descriptor with a table or profile Aurora cannot apply.
+    Table,
+    Unreadable,
+}
+
+/// Why a Gradient Map layer is left out although its block is readable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum GradientReason {
+    /// A colour interpolation method other than Classic (Linear,
+    /// Perceptual or unknown): no fixture holds a picture it mapped.
+    Method,
+    /// A stop whose midpoint is not 50 %.
+    Midpoint,
+    /// A transparency stop below full opacity.
+    Transparency,
+    /// A colour stop not in RGB.
+    ColourMode,
+    /// A Noise gradient.
+    Noise,
+    /// More colour stops than Aurora allows.
+    Stops,
+}
+
+fn parse_gradient_map(data: &[u8]) -> Result<GradientBlock, ()> {
+    if data.len() > MAX_GRADIENT_BLOCK_BYTES {
+        return Err(());
+    }
+    let mut r = Reader::new(data);
+    let bad = |_| ();
+    let version = r.u16("gradient version").map_err(bad)?;
+    let reverse = flag(r.u8("gradient reverse").map_err(bad)?)?;
+    let dither = flag(r.u8("gradient dither").map_err(bad)?)?;
+    let method = match version {
+        1 => *b"Gcls",
+        3 => r.array::<4>("gradient method").map_err(bad)?,
+        _ => return Err(()),
+    };
+    // A unicode string: its length is checked against the bytes left
+    // before it is skipped.
+    let units = usize::try_from(r.u32("gradient name length").map_err(bad)?).map_err(|_| ())?;
+    r.skip(units.checked_mul(2).ok_or(())?, "gradient name")
+        .map_err(bad)?;
+    let colour_count = usize::from(r.u16("colour stop count").map_err(bad)?);
+    // 20 bytes a stop: refuse a count the block cannot hold before reading.
+    if colour_count.checked_mul(20).ok_or(())? > r.remaining() {
+        return Err(());
+    }
+    let mut colours = Vec::with_capacity(colour_count);
+    for _ in 0..colour_count {
+        let location = r.u32("stop location").map_err(bad)?;
+        let midpoint = r.u32("stop midpoint").map_err(bad)?;
+        let mode = r.u16("stop mode").map_err(bad)?;
+        let mut colour = [0_u16; 4];
+        for c in &mut colour {
+            *c = r.u16("stop colour").map_err(bad)?;
+        }
+        r.skip(2, "stop pad").map_err(bad)?;
+        colours.push(FileColourStop {
+            location,
+            midpoint,
+            mode,
+            colour,
+        });
+    }
+    let transparency_count = usize::from(r.u16("transparency stop count").map_err(bad)?);
+    if transparency_count.checked_mul(10).ok_or(())? > r.remaining() {
+        return Err(());
+    }
+    let mut transparency = Vec::with_capacity(transparency_count);
+    for _ in 0..transparency_count {
+        transparency.push(FileTransparencyStop {
+            location: r.u32("transparency location").map_err(bad)?,
+            midpoint: r.u32("transparency midpoint").map_err(bad)?,
+            opacity: r.u16("transparency opacity").map_err(bad)?,
+        });
+    }
+    // expansion, smoothness, length, mode, seed, show transparency, use
+    // vector colour, roughness, colour model, two colours, two pad bytes.
+    if r.u16("gradient expansion").map_err(bad)? != 2 {
+        return Err(());
+    }
+    let smoothness = r.u16("gradient smoothness").map_err(bad)?;
+    if r.u16("gradient length").map_err(bad)? != 32 {
+        return Err(());
+    }
+    let gradient_mode = r.u16("gradient mode").map_err(bad)?;
+    r.skip(4 + 2 + 2 + 4 + 2 + 16 + 2, "gradient settings")
+        .map_err(bad)?;
+    // Only the block's own padding may follow, as zeros.
+    let tail = r.take(r.remaining(), "gradient tail").map_err(bad)?;
+    if tail.len() > 3 || tail.iter().any(|&b| b != 0) {
+        return Err(());
+    }
+    Ok(GradientBlock {
+        reverse,
+        dither,
+        method,
+        colours,
+        transparency,
+        smoothness,
+        gradient_mode,
+    })
+}
+
+/// A `0`/`1` flag byte; anything else is unreadable.
+fn flag(v: u8) -> Result<bool, ()> {
+    match v {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(()),
+    }
+}
+
+/// A parsed block as Aurora's Gradient Map, or the reason it is left out.
+/// Only what the model can hold exactly is imported: Classic interpolation,
+/// default midpoints, opaque transparency stops, RGB colour stops, a Solid
+/// gradient. **Nothing about the result is compared with Photoshop's
+/// pixels** (no fixture holds a mapped picture).
+pub(super) fn gradient_map_adjustment(block: &GradientBlock, gray: bool) -> Result<Adjustment, Note> {
+    if gray {
+        return Err(Note::Grayscale(Kind::GradientMap));
+    }
+    let unreadable = || Note::Unreadable(Kind::GradientMap);
+    let left_out = |reason| Note::GradientLeftOut(reason);
+    if block.colours.len() < aurora_core::GRADIENT_MAP_MIN_STOPS {
+        return Err(unreadable());
+    }
+    if block.colours.len() > aurora_core::GRADIENT_MAP_MAX_STOPS {
+        return Err(left_out(GradientReason::Stops));
+    }
+    if block.gradient_mode > 1 || block.smoothness > 4096 {
+        return Err(unreadable());
+    }
+    if block.gradient_mode == 1 {
+        return Err(left_out(GradientReason::Noise));
+    }
+    if &block.method != b"Gcls" {
+        return Err(left_out(GradientReason::Method));
+    }
+    let mut stops = Vec::with_capacity(block.colours.len());
+    for s in &block.colours {
+        if s.location > 4096 || s.midpoint > 100 || s.colour[3] != 0 {
+            return Err(unreadable());
+        }
+        if s.mode != 0 {
+            return Err(left_out(GradientReason::ColourMode));
+        }
+        let [r, g, b, _] = s.colour;
+        stops.push(aurora_core::GradientStop::new(
+            f32::from(u16::try_from(s.location).map_err(|_| unreadable())?) / 4096.0,
+            [r, g, b].map(|c| f32::from(c) / 65535.0),
+        ));
+    }
+    if block.colours.iter().any(|s| s.midpoint != 50) {
+        return Err(left_out(GradientReason::Midpoint));
+    }
+    if block.transparency.iter().any(|t| t.opacity > 255) {
+        return Err(unreadable());
+    }
+    if block.transparency.iter().any(|t| t.opacity != 255) {
+        return Err(left_out(GradientReason::Transparency));
+    }
+    aurora_core::GradientMapParams::new(stops, block.reverse, block.dither)
+        .map(Adjustment::GradientMap)
+        .map_err(|_| unreadable())
+}
+
+/// A `clrL` block: see [`LookupBlock`].
+fn parse_color_lookup(data: &[u8]) -> Result<LookupBlock, ()> {
+    if data.len() > MAX_GRADIENT_BLOCK_BYTES || data.len() < 2 {
+        return Err(());
+    }
+    let mut r = Reader::new(data);
+    if r.u16("lookup version").map_err(|_| ())? != 1 {
+        return Err(());
+    }
+    let mut budget = ItemBudget {
+        remaining: MAX_DESCRIPTOR_ITEMS,
+    };
+    let d = descriptor::parse_adjustment_block(data.get(2..).ok_or(())?, &mut budget)
+        .map_err(|_| ())?;
+    let name = match d.get(b"Nm  ") {
+        Some(descriptor::Value::Text(t)) => Some(
+            t.chars()
+                .filter(|c| !c.is_control())
+                .take(64)
+                .collect::<String>(),
+        )
+        .filter(|t| !t.is_empty()),
+        _ => None,
+    };
+    Ok(LookupBlock {
+        empty: d.items.is_empty(),
+        name,
+    })
+}
+
 /// A parsed block as an adjustment, or the reason it is left out.
 pub(super) fn adjustment(parsed: &Parsed, gray: bool) -> Result<Adjustment, Note> {
     match parsed {
@@ -864,6 +1145,15 @@ pub(super) fn adjustment(parsed: &Parsed, gray: bool) -> Result<Adjustment, Note
         Parsed::Brightness(brit, cged) => {
             brightness_contrast_adjustment(*brit, cged.as_ref(), gray)
         }
+        Parsed::GradientMap(b) => b
+            .as_ref()
+            .map_err(|()| Note::Unreadable(Kind::GradientMap))
+            .and_then(|b| gradient_map_adjustment(b, gray)),
+        Parsed::ColorLookup(b) => Err(Note::ColorLookup(match b {
+            Err(()) => ColorLookupReason::Unreadable,
+            Ok(b) if b.empty => ColorLookupReason::NoTable,
+            Ok(_) => ColorLookupReason::Table,
+        })),
     }
 }
 
