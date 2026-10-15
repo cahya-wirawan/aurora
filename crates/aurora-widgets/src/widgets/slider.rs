@@ -122,6 +122,38 @@ pub fn set_slider_value(
     Ok(result)
 }
 
+/// Sets the range of `id` (a slider) and clamps its value into it
+/// (0.244.0). Returns whether the range or the value changed. A range that
+/// is not finite or has `min > max` leaves the slider untouched and returns
+/// `Ok(false)`.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it exists but isn't a slider.
+pub fn set_slider_range(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    min: f64,
+    max: f64,
+) -> Result<bool, WidgetError> {
+    let mut changed = false;
+    with_slider_mut(tree, id, |state| {
+        if !(min.is_finite() && max.is_finite() && min <= max) {
+            return Ok(());
+        }
+        let value = state.value.clamp(min, max);
+        changed = state.min.to_bits() != min.to_bits()
+            || state.max.to_bits() != max.to_bits()
+            || state.value.to_bits() != value.to_bits();
+        state.min = min;
+        state.max = max;
+        state.value = value;
+        Ok(())
+    })?;
+    Ok(changed)
+}
+
 /// Sets whether `id` (a slider) is disabled.
 ///
 /// # Errors
@@ -185,7 +217,9 @@ fn with_slider_mut(
 
 #[cfg(test)]
 mod tests {
-    use super::{insert_slider, set_slider_disabled, set_slider_label, set_slider_value};
+    use super::{
+        insert_slider, set_slider_disabled, set_slider_label, set_slider_range, set_slider_value,
+    };
     use crate::WidgetError;
     use crate::widgets::{WidgetKind, new_tree, test_scales};
     use accesskit::Action;
@@ -300,5 +334,36 @@ mod tests {
             set_slider_label(&mut tree, root, "x"),
             Err(WidgetError::WrongWidgetKind(_))
         ));
+    }
+
+    #[test]
+    fn set_slider_range_moves_the_range_clamps_the_value_and_refuses_a_bad_range() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let Ok(id) = insert_slider(&mut tree, root, &scales, "s", -90.0, -100.0, 100.0) else {
+            unreachable!("slider");
+        };
+        assert_eq!(
+            set_slider_range(&mut tree, id, -50.0, 100.0).ok(),
+            Some(true)
+        );
+        let state = |tree: &crate::WidgetTree<WidgetKind>| match tree.payload(id) {
+            Some(WidgetKind::Slider(s)) => (s.min, s.max, s.value),
+            other => unreachable!("{other:?}"),
+        };
+        assert_eq!(state(&tree), (-50.0, 100.0, -50.0), "the value is clamped");
+        assert_eq!(
+            set_slider_range(&mut tree, id, -50.0, 100.0).ok(),
+            Some(false)
+        );
+        for (lo, hi) in [(5.0, 1.0), (f64::NAN, 1.0), (0.0, f64::INFINITY)] {
+            assert_eq!(set_slider_range(&mut tree, id, lo, hi).ok(), Some(false));
+            assert_eq!(state(&tree), (-50.0, 100.0, -50.0));
+        }
+        assert_eq!(
+            set_slider_range(&mut tree, id, -100.0, 100.0).ok(),
+            Some(true)
+        );
+        assert!(set_slider_range(&mut tree, root, 0.0, 1.0).is_err());
     }
 }

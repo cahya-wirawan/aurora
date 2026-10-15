@@ -1700,3 +1700,33 @@ fn corpus_grayscale_and_cmyk_files_keep_the_left_out_policy() {
         );
     }
 }
+
+#[test]
+fn an_all_zero_brit_without_a_cged_is_unreadable_not_a_legacy_identity() {
+    // The default mode writes eight zero bytes and keeps its values in CgEd;
+    // without the descriptor this is not a legacy 0/0 layer (mean 127).
+    let document = ok(read(&file_with(b"brit", &[0; 8], |_| {}).write()));
+    let items = document.report.items.join("\n");
+    assert!(
+        items.contains("1 Brightness/Contrast layer was left out")
+            && items.contains("could not be read"),
+        "{items}"
+    );
+    assert_eq!(children_count(&document), 1);
+    // A real legacy 0/0 layer (mean 127) still imports.
+    let document = ok(read(
+        &file_with(b"brit", &brit(0, 0, 127, 0), |_| {}).write(),
+    ));
+    assert_eq!(top_adjustment_value(&document), Some(bc(0, 0, true)));
+    // Zero brightness and contrast with a stray mean is the options line, not this one.
+    let document = ok(read(
+        &file_with(b"brit", &brit(0, 0, 100, 0), |_| {}).write(),
+    ));
+    assert!(
+        document
+            .report
+            .items
+            .join("\n")
+            .contains("Auto, Lab-only or mean")
+    );
+}

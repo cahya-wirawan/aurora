@@ -165,10 +165,12 @@ pub enum AdjustSlider {
     ThresholdLevel,
     /// Posterize's level count, `2..=255`.
     PosterizeLevels,
-    /// Brightness/Contrast's brightness, `-150..=150` (`-100..=100` with
-    /// Use Legacy: an edit is clamped to the mode's range).
+    /// Brightness/Contrast's brightness. [`Self::range`] is the widest
+    /// (`-150..=150`); [`sync_adjust_controls`] narrows the built slider to
+    /// the layer's mode (`-100..=100` with Use Legacy).
     Brightness,
-    /// Its contrast, `-100..=100` (`-50..=100` in the default mode).
+    /// Its contrast. [`Self::range`] is the widest (`-100..=100`); the built
+    /// slider follows the mode (`-50..=100` in the default mode).
     Contrast,
 }
 
@@ -1066,6 +1068,15 @@ pub fn sync_adjust_controls(
         let Some(value) = slider.value_of(adjustment, range) else {
             continue;
         };
+        // Brightness/Contrast: the slider's range follows the layer's mode.
+        if let Some(bc) = adjustment.brightness_contrast() {
+            let ((b_lo, b_hi), (c_lo, c_hi)) = BrightnessContrastParams::ranges(bc.legacy());
+            let (lo, hi) = match slider {
+                AdjustSlider::Brightness => (b_lo, b_hi),
+                _ => (c_lo, c_hi),
+            };
+            changed |= widgets::set_slider_range(tree, id, f64::from(lo), f64::from(hi))?;
+        }
         if captured != Some(id) {
             let shown = match tree.payload(id) {
                 Some(WidgetKind::Slider(state)) => state.value,
@@ -1761,5 +1772,52 @@ mod tests {
                 .map(|p| p.contrast()),
             Some(-50)
         );
+    }
+
+    /// 0.244.0: the Brightness and Contrast sliders' ranges follow the
+    /// layer's mode when synced, and an out-of-range displayed value is
+    /// clamped into the new range.
+    #[test]
+    fn the_brightness_contrast_slider_ranges_follow_the_layers_mode() {
+        let scales = scales();
+        let mut ws = crate::build_workspace(&scales);
+        let controls = match insert_adjust_controls(&mut ws.tree, ws.properties.root, &scales) {
+            Ok(c) => c,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let bc = |b, c, legacy| match aurora_core::BrightnessContrastParams::new(b, c, legacy) {
+            Ok(p) => Adjustment::BrightnessContrast(p),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut layers = LayerTree::new();
+        let default = add(&mut layers, "D", bc(140, -50, false));
+        let legacy = add(&mut layers, "L", bc(90, -90, true));
+        let range_of =
+            |ws: &crate::Workspace, s: S| match ws.tree.payload(controls.sliders[s.index()]) {
+                Some(WidgetKind::Slider(state)) => (state.min, state.max, state.value),
+                other => unreachable!("{other:?}"),
+            };
+        let _ = show(&mut ws, controls, &layers, Some(default));
+        assert_eq!(range_of(&ws, S::Brightness), (-150.0, 150.0, 140.0));
+        assert_eq!(range_of(&ws, S::Contrast), (-50.0, 100.0, -50.0));
+        let _ = show(&mut ws, controls, &layers, Some(legacy));
+        assert_eq!(range_of(&ws, S::Brightness), (-100.0, 100.0, 90.0));
+        assert_eq!(range_of(&ws, S::Contrast), (-100.0, 100.0, -90.0));
+        // Back to the default mode: the range narrows again.
+        let _ = show(&mut ws, controls, &layers, Some(default));
+        assert_eq!(range_of(&ws, S::Contrast).0, -50.0);
+        // Toggling Use Legacy on the document narrows brightness to +-100
+        // (the value was clamped by the edit, so the slider follows).
+        let toggled = match layers
+            .adjustment(default)
+            .and_then(Adjustment::brightness_contrast)
+        {
+            Some(p) => Adjustment::BrightnessContrast(p.with_legacy(true)),
+            None => unreachable!("a Brightness/Contrast layer"),
+        };
+        let _ = layers.set_adjustment(default, toggled);
+        let _ = show(&mut ws, controls, &layers, Some(default));
+        assert_eq!(range_of(&ws, S::Brightness), (-100.0, 100.0, 100.0));
+        assert_eq!(range_of(&ws, S::Contrast), (-100.0, 100.0, -50.0));
     }
 }

@@ -234,7 +234,8 @@ pub use selection_outline::{
     set_selection_tint,
 };
 pub use slider::{
-    SliderState, insert_slider, set_slider_disabled, set_slider_label, set_slider_value,
+    SliderState, insert_slider, set_slider_disabled, set_slider_label, set_slider_range,
+    set_slider_value,
 };
 pub use tab_bar::{
     TAB_CLOSE_GLYPH, TabBarKey, TabBarOutcome, TabBarState, TabState, handle_tab_bar_key,

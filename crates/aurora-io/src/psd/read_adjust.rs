@@ -602,6 +602,12 @@ fn brightness_contrast_adjustment(
             )
         }
         Some(Err(())) => return Err(unreadable()),
+        // A default-mode layer writes eight zero bytes here and keeps its
+        // values in `CgEd`; all zeros without it is that shape with its
+        // descriptor missing, not a legacy 0/0 layer (whose mean is 127).
+        None if brit.brightness == 0 && brit.contrast == 0 && brit.mean == 0 && !brit.lab => {
+            return Err(unreadable());
+        }
         None => (
             brit.brightness,
             brit.contrast,

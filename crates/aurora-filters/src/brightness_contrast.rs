@@ -41,10 +41,12 @@
 //!
 //! at x = 64, 128 and 192 (levels; [`BRIGHTNESS`] is a bump, [`CONTRAST`] an
 //! S). The six numbers are a least-squares fit to the four tables.
-//! **Error against Photoshop's merged image (per fixture layer, mean of
-//! the absolute difference in levels, rows without the palette strip):
-//! see the corpus test's printed table, about 5 to 13 levels**: this is
-//! NOT within 3 levels. The first fixture (-95/-50) is the worst: its
+//! **Error against Photoshop's merged image: the whole of
+//! `brightnesscontrast_rgb.psd` has a mean absolute error of 8.75 levels
+//! per channel (max 52; 37.45 with the layers left out), measured by
+//! `aurora-app`'s `the_four_adjustments_match_photoshops_merged_images_in_the_corpus`.
+//! The four fixture layers' own tone curves are 5 to 13 levels off on
+//! average.** This is NOT within 3 levels. The first fixture (-95/-50) is the worst: its
 //! curve turns sharply up in the last 20 levels, which no smooth model
 //! here follows. Four samples cannot support a richer model without
 //! overfitting; the importer reports that the adjustment is approximate.
