@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.247.0] - 2026-10-15
+
+### Changed
+
+- Safe export and non-fatal directory-sync failure
+
 ## [0.246.0] - 2026-10-15
 
 ### Fixed
