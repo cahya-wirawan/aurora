@@ -587,7 +587,7 @@ fn vibrance_exposure_and_photo_filter_layers_refuse_a_psd_save_by_name() {
         assert!(
             text.contains("My layer")
                 && text.contains(kind)
-                && text.contains("can't write")
+                && text.contains(&format!("can't write {kind} layers to .psd yet"))
                 && text.contains(".aur"),
             "{text}"
         );

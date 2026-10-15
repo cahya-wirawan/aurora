@@ -44283,8 +44283,10 @@ mod tests {
         // and (0.167.0) "Float Layers Panel" and "Dock Layers Panel" --
         // the first inserted (`palette_commands`'s own order) is what ends
         // up selected. (0.202.0) "New Levels Layer" matches too, and
-        // (0.235.0) "Layer via Copy" and "Layer via Cut".
-        assert_eq!(state.results().len(), 16);
+        // (0.235.0) "Layer via Copy" and "Layer via Cut", and (0.239.0)
+        // "New Vibrance Layer", "New Exposure Layer" and "New Photo Filter
+        // Layer".
+        assert_eq!(state.results().len(), 19);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
