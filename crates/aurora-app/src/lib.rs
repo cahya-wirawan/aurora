@@ -539,6 +539,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::window::{Window, WindowId};
 
 mod adjust_app;
+mod aur_save;
 mod autosave_files;
 mod background_autosave;
 mod background_composite;
@@ -32256,13 +32257,12 @@ impl App {
     /// (ADR 0009, `aurora_io::write_aur`): every pixel layer's own
     /// tiles, not just the active one — the real answer to the
     /// non-`.aur` export path's own "active layer only" limit. Writes
-    /// to a sibling `.tmp` file first, verifies it by reading it back
-    /// with a throwaway `aurora_tile::TileStore` ([`verify_aur`]), then
-    /// atomically renames it over `path` — the same
-    /// [`write_verified`]-style discipline the flat-format export path
-    /// uses, just against a different verification step (`.aur` has no
-    /// single "does this decode to the right width/height" check the way a flat image
-    /// does).
+    /// to a uniquely named temp file beside the real target, syncs it,
+    /// verifies it by reading it back with a throwaway
+    /// `aurora_tile::TileStore` ([`verify_aur`]), then renames it over
+    /// `path` and syncs the directory (0.246.0: `aur_save`, the PSD
+    /// save's `aurora_io::replace_verified` path; before that a fixed
+    /// `<name>.tmp` that was never synced).
     ///
     /// **Scope, stated honestly**: `canvas_size` is `self.doc.canvas_size`,
     /// the document's own real, independent canvas size — no longer
@@ -32285,54 +32285,25 @@ impl App {
             return false;
         };
 
-        let Some(file_name) = path.file_name() else {
+        if path.file_name().is_none() {
             tracing::warn!(path = %path.display(), "save path has no file name");
             self.report_save_failure(path, &SaveFailure::Write);
             return false;
+        }
+
+        // 0.246.0 (G-15): the PSD save's safe path -- a unique exclusive
+        // temp file beside the real target, synced, verified by path,
+        // renamed, directory synced; the temp is removed on any failure.
+        let source = aur_save::AurSaveSource {
+            layers: &self.doc.layers,
+            history: &self.doc.history,
+            canvas_size: self.doc.canvas_size,
+            skipped_tiles: &self.doc.skipped_tiles,
+            import_losses: self.doc.import_losses.as_deref(),
+            selection: &self.doc.selection,
         };
-        let mut temp_name = file_name.to_os_string();
-        temp_name.push(".tmp");
-        let temp_path = path.with_file_name(temp_name);
-
-        let write_result: Result<(), aurora_io::IoError> = (|| {
-            let file = std::fs::File::create(&temp_path)?;
-            aurora_io::write_aur_with_import_losses(
-                file,
-                &self.doc.layers,
-                &self.doc.history,
-                self.doc.canvas_size,
-                None,
-                // What this document already knows it is missing, so an
-                // explicit Save of a file opened with tiles gone writes
-                // that fact out again instead of erasing it. `write_aur`
-                // still *refuses* rather than degrades -- a carried
-                // record names tiles that are not in the store at all,
-                // so it can never turn into a fresh skip here.
-                &self.doc.skipped_tiles,
-                self.doc.import_losses.as_deref(),
-                // 0.218.0: the selection in force (while Quick Mask is on
-                // that is the selection it started from, not the grid).
-                Some(&self.doc.selection),
-                store,
-            )
-        })();
-        if let Err(err) = write_result {
-            tracing::warn!(path = %temp_path.display(), ?err, "failed to write the temp .aur export file");
-            let _ = std::fs::remove_file(&temp_path);
-            self.report_save_failure(path, &SaveFailure::Write);
-            return false;
-        }
-
-        if !verify_aur(&temp_path) {
-            tracing::warn!(path = %temp_path.display(), "exported .aur file failed to verify by reading it back");
-            let _ = std::fs::remove_file(&temp_path);
-            self.report_save_failure(path, &SaveFailure::Write);
-            return false;
-        }
-
-        if let Err(err) = std::fs::rename(&temp_path, path) {
-            tracing::warn!(path = %path.display(), %err, "failed to replace the destination with the verified export");
-            let _ = std::fs::remove_file(&temp_path);
+        if let Err(err) = aur_save::save_aur_document(path, &source, store) {
+            tracing::warn!(path = %path.display(), ?err, "failed to save the .aur file safely");
             self.report_save_failure(path, &SaveFailure::Write);
             return false;
         }
