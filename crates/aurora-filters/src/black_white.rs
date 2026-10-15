@@ -26,11 +26,17 @@
 //! - **Tint** is the HSL colour with the tint hue and saturation whose
 //!   lightness is the grey (so the grey's lightness is kept), via the
 //!   Hue/Saturation maths this crate already has.
-//! - **No GPU port** (a later task): a visible Black & White layer keeps
-//!   the document on the CPU compositing path.
+//! - **GPU (0.242.0)**: `aurora-render`'s Black & White pass
+//!   (`shaders/black_white.wgsl`) ports [`BlackWhiteOp::grey`] and
+//!   [`BlackWhiteOp::apply`] line for line, sort network included
+//!   ([`BlackWhiteOp::packed_for_gpu`] hands it the six weights and the
+//!   Tint).
 
 use crate::hue_saturation::from_hsl;
 use aurora_core::BlackWhiteParams;
+
+/// How many `f32`s [`BlackWhiteOp::packed_for_gpu`] returns (0.242.0).
+pub const BLACK_WHITE_PACKED_LEN: usize = 12;
 
 /// A Black & White adjustment ready to apply to pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,6 +81,22 @@ impl BlackWhiteOp {
     #[must_use]
     pub const fn is_identity(&self) -> bool {
         false
+    }
+
+    /// The settings flattened for the GPU Black & White pass (0.242.0,
+    /// `aurora_render::TileCompositor::composite_black_white_with_opacity`,
+    /// `shaders/black_white.wgsl`): the six weights (`value / 100`, reds,
+    /// yellows, greens, cyans, blues, magentas), then `tint` as `0`/`1`,
+    /// the tint hue in degrees, the tint saturation (`/ 100`) and three
+    /// zeros. There is no identity flag: the layer never is one.
+    #[must_use]
+    pub fn packed_for_gpu(&self) -> [f32; BLACK_WHITE_PACKED_LEN] {
+        let [w0, w1, w2, w3, w4, w5] = self.weights;
+        let (tint, hue, saturation) = match self.tint {
+            Some((hue, saturation)) => (1.0, hue, saturation),
+            None => (0.0, 0.0, 0.0),
+        };
+        [w0, w1, w2, w3, w4, w5, tint, hue, saturation, 0.0, 0.0, 0.0]
     }
 
     /// The grey of one straight, encoded RGB pixel, in `[0, 1]`.

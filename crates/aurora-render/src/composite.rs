@@ -2239,6 +2239,15 @@ pub struct TileCompositor {
     /// The Hue/Saturation adjustment pass (0.206.0), built on first use.
     /// See [`Self::composite_hue_saturation_with_opacity`].
     hue_saturation: Option<UniformAdjustmentGpu>,
+    /// The Vibrance, Exposure, Photo Filter, Black & White and Color
+    /// Balance adjustment passes (0.242.0), each built on first use like
+    /// [`Self::levels`]. See [`Self::composite_vibrance_with_opacity`] and
+    /// its four siblings.
+    vibrance: Option<UniformAdjustmentGpu>,
+    exposure: Option<UniformAdjustmentGpu>,
+    photo_filter: Option<UniformAdjustmentGpu>,
+    black_white: Option<UniformAdjustmentGpu>,
+    color_balance: Option<UniformAdjustmentGpu>,
 }
 
 /// Builds [`TileCompositor::bind_group_layout_blend`]: the opacity
@@ -2496,6 +2505,11 @@ impl TileCompositor {
             curves: None,
             levels: None,
             hue_saturation: None,
+            vibrance: None,
+            exposure: None,
+            photo_filter: None,
+            black_white: None,
+            color_balance: None,
         }
     }
 
@@ -5161,10 +5175,63 @@ const HUE_SATURATION_SHADER: &str = concat!(
     "\n",
     include_str!("shaders/adjust_common.wgsl"),
     "\n",
+    include_str!("shaders/hsl_common.wgsl"),
+    "\n",
     include_str!("shaders/hue_saturation.wgsl")
+);
+/// The Vibrance pass's WGSL (0.242.0): shares the HSL helpers with
+/// Hue/Saturation.
+const VIBRANCE_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
+    "\n",
+    include_str!("shaders/hsl_common.wgsl"),
+    "\n",
+    include_str!("shaders/vibrance.wgsl")
+);
+/// The Exposure pass's WGSL (0.242.0).
+const EXPOSURE_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
+    "\n",
+    include_str!("shaders/exposure.wgsl")
+);
+/// The Photo Filter pass's WGSL (0.242.0).
+const PHOTO_FILTER_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
+    "\n",
+    include_str!("shaders/photo_filter.wgsl")
+);
+/// The Black & White pass's WGSL (0.242.0): Tint uses the shared HSL
+/// helpers.
+const BLACK_WHITE_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
+    "\n",
+    include_str!("shaders/hsl_common.wgsl"),
+    "\n",
+    include_str!("shaders/black_white.wgsl")
+);
+/// The Color Balance pass's WGSL (0.242.0).
+const COLOR_BALANCE_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
+    "\n",
+    include_str!("shaders/color_balance.wgsl")
 );
 const LABEL_LEVELS: &str = "composite.levels";
 const LABEL_HUE_SATURATION: &str = "composite.hue_saturation";
+const LABEL_VIBRANCE: &str = "composite.vibrance";
+const LABEL_EXPOSURE: &str = "composite.exposure";
+const LABEL_PHOTO_FILTER: &str = "composite.photo_filter";
+const LABEL_BLACK_WHITE: &str = "composite.black_white";
+const LABEL_COLOR_BALANCE: &str = "composite.color_balance";
 
 /// The `f32` length of a Levels pass's parameters (0.206.0), as
 /// `aurora_filters::LevelsLut::packed_for_gpu` builds them and
@@ -5175,6 +5242,19 @@ pub const LEVELS_GPU_PARAMS_LEN: usize = 32;
 /// The `f32` length of a Hue/Saturation pass's parameters (0.206.0), as
 /// `aurora_filters::HueSaturationOp::packed_for_gpu` builds them.
 pub const HUE_SATURATION_GPU_PARAMS_LEN: usize = 8;
+
+/// The `f32` lengths of the 0.242.0 passes' parameters, as the matching
+/// `aurora_filters::*Op::packed_for_gpu` builds them (`aurora-app` asserts
+/// the lengths agree).
+pub const VIBRANCE_GPU_PARAMS_LEN: usize = 4;
+/// See [`VIBRANCE_GPU_PARAMS_LEN`].
+pub const EXPOSURE_GPU_PARAMS_LEN: usize = 4;
+/// See [`VIBRANCE_GPU_PARAMS_LEN`].
+pub const PHOTO_FILTER_GPU_PARAMS_LEN: usize = 8;
+/// See [`VIBRANCE_GPU_PARAMS_LEN`].
+pub const BLACK_WHITE_GPU_PARAMS_LEN: usize = 12;
+/// See [`VIBRANCE_GPU_PARAMS_LEN`].
+pub const COLOR_BALANCE_GPU_PARAMS_LEN: usize = 16;
 
 /// A lazily built adjustment pass whose whole parameter set rides in one
 /// small uniform (0.206.0): bindings 1 (sampler), 3 (backdrop) and 4 (the
@@ -5400,6 +5480,231 @@ impl TileCompositor {
                 LABEL_HUE_SATURATION,
                 HUE_SATURATION_SHADER,
                 "fs_composite_hue_saturation",
+            )
+        });
+        pass.record(
+            context,
+            encoder,
+            &self.sampler,
+            params,
+            backdrop,
+            dst,
+            opacity,
+            code,
+        );
+        true
+    }
+
+    /// Records the Vibrance adjustment pass (0.242.0), the same shape as
+    /// [`Self::composite_levels_with_opacity`]: the CPU reference is
+    /// `aurora_filters::VibranceOp::apply`, `params` is
+    /// `VibranceOp::packed_for_gpu`'s output ([`VIBRANCE_GPU_PARAMS_LEN`] values).
+    /// Returns `false`, recording nothing, when `mode` has no adjustment
+    /// blend math or a value is not finite. See `shaders/vibrance.wgsl`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_vibrance_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &[f32; VIBRANCE_GPU_PARAMS_LEN],
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        if !params.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let device = context.device();
+        let pass = self.vibrance.get_or_insert_with(|| {
+            UniformAdjustmentGpu::new(
+                device,
+                LABEL_VIBRANCE,
+                VIBRANCE_SHADER,
+                "fs_composite_vibrance",
+            )
+        });
+        pass.record(
+            context,
+            encoder,
+            &self.sampler,
+            params,
+            backdrop,
+            dst,
+            opacity,
+            code,
+        );
+        true
+    }
+
+    /// Records the Exposure adjustment pass (0.242.0), the same shape as
+    /// [`Self::composite_levels_with_opacity`]: the CPU reference is
+    /// `aurora_filters::ExposureOp::apply`, `params` is
+    /// `ExposureOp::packed_for_gpu`'s output ([`EXPOSURE_GPU_PARAMS_LEN`] values).
+    /// Returns `false`, recording nothing, when `mode` has no adjustment
+    /// blend math or a value is not finite. See `shaders/exposure.wgsl`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_exposure_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &[f32; EXPOSURE_GPU_PARAMS_LEN],
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        if !params.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let device = context.device();
+        let pass = self.exposure.get_or_insert_with(|| {
+            UniformAdjustmentGpu::new(
+                device,
+                LABEL_EXPOSURE,
+                EXPOSURE_SHADER,
+                "fs_composite_exposure",
+            )
+        });
+        pass.record(
+            context,
+            encoder,
+            &self.sampler,
+            params,
+            backdrop,
+            dst,
+            opacity,
+            code,
+        );
+        true
+    }
+
+    /// Records the Photo Filter adjustment pass (0.242.0), the same shape as
+    /// [`Self::composite_levels_with_opacity`]: the CPU reference is
+    /// `aurora_filters::PhotoFilterOp::apply`, `params` is
+    /// `PhotoFilterOp::packed_for_gpu`'s output ([`PHOTO_FILTER_GPU_PARAMS_LEN`] values).
+    /// Returns `false`, recording nothing, when `mode` has no adjustment
+    /// blend math or a value is not finite. See `shaders/photo_filter.wgsl`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_photo_filter_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &[f32; PHOTO_FILTER_GPU_PARAMS_LEN],
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        if !params.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let device = context.device();
+        let pass = self.photo_filter.get_or_insert_with(|| {
+            UniformAdjustmentGpu::new(
+                device,
+                LABEL_PHOTO_FILTER,
+                PHOTO_FILTER_SHADER,
+                "fs_composite_photo_filter",
+            )
+        });
+        pass.record(
+            context,
+            encoder,
+            &self.sampler,
+            params,
+            backdrop,
+            dst,
+            opacity,
+            code,
+        );
+        true
+    }
+
+    /// Records the Black & White adjustment pass (0.242.0), the same shape as
+    /// [`Self::composite_levels_with_opacity`]: the CPU reference is
+    /// `aurora_filters::BlackWhiteOp::apply`, `params` is
+    /// `BlackWhiteOp::packed_for_gpu`'s output ([`BLACK_WHITE_GPU_PARAMS_LEN`] values).
+    /// Returns `false`, recording nothing, when `mode` has no adjustment
+    /// blend math or a value is not finite. See `shaders/black_white.wgsl`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_black_white_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &[f32; BLACK_WHITE_GPU_PARAMS_LEN],
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        if !params.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let device = context.device();
+        let pass = self.black_white.get_or_insert_with(|| {
+            UniformAdjustmentGpu::new(
+                device,
+                LABEL_BLACK_WHITE,
+                BLACK_WHITE_SHADER,
+                "fs_composite_black_white",
+            )
+        });
+        pass.record(
+            context,
+            encoder,
+            &self.sampler,
+            params,
+            backdrop,
+            dst,
+            opacity,
+            code,
+        );
+        true
+    }
+
+    /// Records the Color Balance adjustment pass (0.242.0), the same shape as
+    /// [`Self::composite_levels_with_opacity`]: the CPU reference is
+    /// `aurora_filters::ColorBalanceOp::apply`, `params` is
+    /// `ColorBalanceOp::packed_for_gpu`'s output ([`COLOR_BALANCE_GPU_PARAMS_LEN`] values).
+    /// Returns `false`, recording nothing, when `mode` has no adjustment
+    /// blend math or a value is not finite. See `shaders/color_balance.wgsl`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_color_balance_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &[f32; COLOR_BALANCE_GPU_PARAMS_LEN],
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        if !params.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let device = context.device();
+        let pass = self.color_balance.get_or_insert_with(|| {
+            UniformAdjustmentGpu::new(
+                device,
+                LABEL_COLOR_BALANCE,
+                COLOR_BALANCE_SHADER,
+                "fs_composite_color_balance",
             )
         });
         pass.record(

@@ -20,11 +20,17 @@
 //!   clamps its input to `[0, 1]` (`NaN` reads as `0`) and returns values
 //!   in `[0, 1]`, so a brightening exposure clips highlights as an
 //!   8-bit-referred display would.
-//! - **No GPU port** (a later task): a visible Exposure layer keeps the
-//!   document on the CPU compositing path.
+//! - **GPU (0.242.0)**: `aurora-render`'s Exposure pass
+//!   (`shaders/exposure.wgsl`) ports [`ExposureOp::apply`] line for line
+//!   ([`ExposureOp::packed_for_gpu`] hands it `2^exposure`, the offset and
+//!   `1 / gamma`, computed here once in `f32`). `pow` is guarded against a
+//!   non-positive base there, since WGSL leaves that indeterminate.
 
 use aurora_color::{linear_to_srgb, srgb_to_linear};
 use aurora_core::ExposureParams;
+
+/// How many `f32`s [`ExposureOp::packed_for_gpu`] returns (0.242.0).
+pub const EXPOSURE_PACKED_LEN: usize = 4;
 
 /// An Exposure adjustment ready to apply to pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,6 +57,21 @@ impl ExposureOp {
     #[must_use]
     pub fn is_identity(&self) -> bool {
         self.params.is_identity()
+    }
+
+    /// The settings flattened for the GPU Exposure pass (0.242.0,
+    /// `aurora_render::TileCompositor::composite_exposure_with_opacity`,
+    /// `shaders/exposure.wgsl`): `[identity, 2^exposure, offset, 1 /
+    /// gamma]`, `identity` as `0`/`1`; the scale and power are the very
+    /// `f32`s [`Self::apply`] uses.
+    #[must_use]
+    pub fn packed_for_gpu(&self) -> [f32; EXPOSURE_PACKED_LEN] {
+        [
+            f32::from(u8::from(self.is_identity())),
+            self.scale,
+            self.params.offset(),
+            self.power,
+        ]
     }
 
     /// One encoded channel in `[0, 1]` through the model.

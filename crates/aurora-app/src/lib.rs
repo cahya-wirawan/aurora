@@ -20179,7 +20179,9 @@ fn pixel_layer_mode_qualifies_for_gpu(
 /// Whether root `id` is an adjustment layer a GPU adjustment pass
 /// (Curves 0.159.0, `aurora_render::TileCompositor::composite_curves_with_opacity`;
 /// Levels and Hue/Saturation 0.206.0, `composite_levels_with_opacity` and
-/// `composite_hue_saturation_with_opacity`) composites exactly as
+/// `composite_hue_saturation_with_opacity`; Vibrance, Exposure, Photo
+/// Filter, Black & White and Color Balance 0.242.0,
+/// `composite_vibrance_with_opacity` and its four siblings) composites exactly as
 /// [`apply_adjustment_layer`] does on the CPU:
 ///
 /// - **blend mode**: `Normal` or one of the eighteen with their own GPU
@@ -20209,10 +20211,18 @@ fn adjustment_layer_qualifies_for_gpu(
         .blend_mode(id)
         .unwrap_or(aurora_doc::BlendMode::Normal);
     let expressible = match layers.adjustment(id) {
+        // Curves, Levels and Hue/Saturation (master / Colorize) have had a GPU
+        // pass since 0.159.0 / 0.206.0; Vibrance, Exposure, Photo Filter,
+        // Black & White and Color Balance since 0.242.0.
         Some(
             aurora_doc::Adjustment::Curves(_)
             | aurora_doc::Adjustment::Levels(_)
-            | aurora_doc::Adjustment::HueSaturation(_),
+            | aurora_doc::Adjustment::HueSaturation(_)
+            | aurora_doc::Adjustment::Vibrance(_)
+            | aurora_doc::Adjustment::Exposure(_)
+            | aurora_doc::Adjustment::PhotoFilter(_)
+            | aurora_doc::Adjustment::BlackWhite(_)
+            | aurora_doc::Adjustment::ColorBalance(_),
         ) => true,
         Some(aurora_doc::Adjustment::HueSaturationRanges(params)) => {
             aurora_filters::HueSaturationOp::with_ranges(params)
@@ -20220,16 +20230,10 @@ fn adjustment_layer_qualifies_for_gpu(
                 .is_some()
         }
         // Vibrance, Exposure and Photo Filter (0.239.0), Black & White and
-        // Color Balance (0.240.0) have no GPU pass yet: a visible layer of
-        // these kinds keeps the CPU path.
-        Some(
-            aurora_doc::Adjustment::Vibrance(_)
-            | aurora_doc::Adjustment::Exposure(_)
-            | aurora_doc::Adjustment::PhotoFilter(_)
-            | aurora_doc::Adjustment::BlackWhite(_)
-            | aurora_doc::Adjustment::ColorBalance(_),
-        )
-        | None => false,
+        // Color Balance (0.240.0) are per-pixel functions with a GPU pass each
+        // since 0.242.0 (`composite_vibrance_with_opacity` and its four
+        // siblings), admitted above; neutral or not, they qualify like Levels.
+        None => false,
     };
     expressible
         && !layers.mask(id).is_some_and(|mask| mask.enabled)
@@ -20581,7 +20585,8 @@ fn create_composite_accumulator(
 /// the unreachable state is unrepresentable rather than defended
 /// against. 0.86.1.
 /// Records one root adjustment layer's GPU pass into `encoder` (Curves
-/// 0.159.0; Levels and Hue/Saturation 0.206.0), in
+/// 0.159.0; Levels and Hue/Saturation 0.206.0; Vibrance, Exposure, Photo
+/// Filter, Black & White and Color Balance 0.242.0), in
 /// [`apply_adjustment_layer`]'s order: the same budget charge, the same
 /// skip for an identity adjustment under `Normal` (an exact passthrough,
 /// so no pass at all), and nothing to adjust while no layer below has
@@ -20668,18 +20673,119 @@ fn begin_gpu_adjustment_pass(
             }
             note_gpu_hue_saturation_dispatch();
         }
-        // No GPU pass for these (0.239.0); the predicate refuses them first.
         (
             _,
-            AdjustmentLut::Curves(_)
-            | AdjustmentLut::Vibrance(_)
+            lut @ (AdjustmentLut::Vibrance(_)
             | AdjustmentLut::Exposure(_)
             | AdjustmentLut::PhotoFilter(_)
             | AdjustmentLut::BlackWhite(_)
-            | AdjustmentLut::ColorBalance(_),
-        ) => return false,
+            | AdjustmentLut::ColorBalance(_)),
+        ) => {
+            if !record_photographer_adjustment_pass(
+                gpu, compositor, encoder, lut, from, to, opacity, mode,
+            ) {
+                return false;
+            }
+        }
+        // Curves with its own table set is the first arm; a Curves
+        // adjustment paired with another table kind cannot occur
+        // (`AdjustmentLut::of` builds the pair from the same value).
+        (_, AdjustmentLut::Curves(_)) => return false,
     }
     std::mem::swap(current_accumulator, spare_accumulator);
+    true
+}
+
+/// Records the GPU pass of one of the five photographer adjustments
+/// (Vibrance, Exposure, Photo Filter, Black & White, Color Balance; 0.242.0)
+/// and counts it. `false` when the compositor refused the pass, or `lut` is
+/// not one of the five (the caller then falls back to the CPU).
+#[allow(clippy::too_many_arguments)]
+fn record_photographer_adjustment_pass(
+    gpu: &aurora_gpu::GpuContext,
+    compositor: &mut aurora_render::TileCompositor,
+    encoder: &mut wgpu::CommandEncoder,
+    lut: &AdjustmentLut,
+    from: &wgpu::TextureView,
+    to: &wgpu::TextureView,
+    opacity: f32,
+    mode: aurora_render::BlendMode,
+) -> bool {
+    match lut {
+        AdjustmentLut::Vibrance(op) => {
+            if !compositor.composite_vibrance_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_vibrance_dispatch();
+        }
+        AdjustmentLut::Exposure(op) => {
+            if !compositor.composite_exposure_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_exposure_dispatch();
+        }
+        AdjustmentLut::PhotoFilter(op) => {
+            if !compositor.composite_photo_filter_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_photo_filter_dispatch();
+        }
+        AdjustmentLut::BlackWhite(op) => {
+            if !compositor.composite_black_white_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_black_white_dispatch();
+        }
+        AdjustmentLut::ColorBalance(op) => {
+            if !compositor.composite_color_balance_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_color_balance_dispatch();
+        }
+        AdjustmentLut::Curves(_) | AdjustmentLut::Levels(_) | AdjustmentLut::HueSaturation(_) => {
+            return false;
+        }
+    }
     true
 }
 
@@ -20699,6 +20805,25 @@ static GPU_LEVELS_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// Test-only count of GPU Hue/Saturation passes recorded (0.206.0).
 #[cfg(test)]
 static GPU_HUE_SATURATION_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only count of GPU Vibrance passes recorded (0.242.0).
+#[cfg(test)]
+static GPU_VIBRANCE_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Exposure passes recorded (0.242.0).
+#[cfg(test)]
+static GPU_EXPOSURE_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Photo Filter passes recorded (0.242.0).
+#[cfg(test)]
+static GPU_PHOTO_FILTER_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Black & White passes recorded (0.242.0).
+#[cfg(test)]
+static GPU_BLACK_WHITE_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Color Balance passes recorded (0.242.0).
+#[cfg(test)]
+static GPU_COLOR_BALANCE_DISPATCHES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
@@ -20725,6 +20850,46 @@ fn note_gpu_hue_saturation_dispatch() {
 #[cfg(not(test))]
 fn note_gpu_hue_saturation_dispatch() {}
 
+#[cfg(test)]
+fn note_gpu_vibrance_dispatch() {
+    GPU_VIBRANCE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_vibrance_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_exposure_dispatch() {
+    GPU_EXPOSURE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_exposure_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_photo_filter_dispatch() {
+    GPU_PHOTO_FILTER_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_photo_filter_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_black_white_dispatch() {
+    GPU_BLACK_WHITE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_black_white_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_color_balance_dispatch() {
+    GPU_COLOR_BALANCE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_color_balance_dispatch() {}
+
 /// Reads [`GPU_CURVES_DISPATCHES`] and resets it, like
 /// [`take_gpu_blend_dispatch_count`].
 #[cfg(test)]
@@ -20742,6 +20907,36 @@ fn take_gpu_levels_dispatch_count() -> u64 {
 #[cfg(test)]
 fn take_gpu_hue_saturation_dispatch_count() -> u64 {
     GPU_HUE_SATURATION_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_VIBRANCE_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_vibrance_dispatch_count() -> u64 {
+    GPU_VIBRANCE_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_EXPOSURE_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_exposure_dispatch_count() -> u64 {
+    GPU_EXPOSURE_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_PHOTO_FILTER_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_photo_filter_dispatch_count() -> u64 {
+    GPU_PHOTO_FILTER_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_BLACK_WHITE_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_black_white_dispatch_count() -> u64 {
+    GPU_BLACK_WHITE_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_COLOR_BALANCE_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_color_balance_dispatch_count() -> u64 {
+    GPU_COLOR_BALANCE_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn accumulator_or_create<'slot>(
@@ -22450,7 +22645,9 @@ fn begin_gpu_composite_tile(
         // hands one back as "nothing to fold", so a GPU pass reaching it
         // would silently drop it. As of 0.159.0 a qualifying Curves layer
         // (`adjustment_layer_qualifies_for_gpu`) is its own GPU pass, and as
-        // of 0.206.0 so is a Levels or Hue/Saturation one; any other
+        // of 0.206.0 so is a Levels or Hue/Saturation one, and of 0.242.0 a
+        // Vibrance, Exposure, Photo Filter, Black & White or Color Balance
+        // one; any other
         // visible adjustment (a mask, `Dissolve`, a mode without GPU
         // math, Hue/Saturation with colour ranges) is still this second,
         // local refusal behind the
@@ -85016,13 +85213,20 @@ mod tests {
             assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
         }
 
+        /// 0.242.0 (was `a_visible_layer_refuses_the_gpu_path_and_a_hidden_one_
+        /// does_not`): these five kinds now have a GPU pass each, so a
+        /// visible root, unmasked layer at `Normal` qualifies, neutral or not,
+        /// and a hidden one never disqualifies. The refusals that remain (a
+        /// mask, `Dissolve`, a mode without GPU math, a group) are pinned in
+        /// `gpu_photo_adjustment_tests`.
         #[test]
-        fn a_visible_layer_refuses_the_gpu_path_and_a_hidden_one_does_not() {
+        fn a_visible_layer_of_the_five_kinds_qualifies_for_the_gpu_path_and_a_hidden_one_is_ignored()
+         {
             for adjustment in [
                 vibrance(30.0, 0.0),
                 exposure(1.0, 0.0, 1.0),
                 filter([1.0, 0.5, 0.0], 40.0, true),
-                // Even a neutral one: there is no GPU pass for the kind.
+                // Neutral ones qualify too, as a neutral Levels does.
                 vibrance(0.0, 0.0),
                 exposure(0.0, 0.0, 1.0),
                 // 0.240.0: Black & White and Color Balance, neutral or not.
@@ -85035,10 +85239,10 @@ mod tests {
                     solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
                 assert!(crate::document_qualifies_for_gpu_compositing(&layers));
                 let id = add(&mut layers, adjustment);
-                assert!(!crate::adjustment_layer_qualifies_for_gpu(&layers, id));
+                assert!(crate::adjustment_layer_qualifies_for_gpu(&layers, id));
                 assert!(
-                    !crate::document_qualifies_for_gpu_compositing(&layers),
-                    "a visible layer keeps the document on the CPU"
+                    crate::document_qualifies_for_gpu_compositing(&layers),
+                    "a visible layer of these kinds keeps the document on the GPU"
                 );
                 if let Err(err) = layers.set_visible(id, false) {
                     unreachable!("{err:?}");
@@ -93878,6 +94082,8 @@ mod clip_tests;
 
 #[cfg(test)]
 mod gpu_adjustment_tests;
+#[cfg(test)]
+mod gpu_photo_adjustment_tests;
 
 #[cfg(test)]
 mod fill_tests;

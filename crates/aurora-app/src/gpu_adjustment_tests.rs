@@ -19,8 +19,8 @@
 use crate::tests::real_gpu_context;
 use aurora_doc::BlendMode;
 
-const TILE0: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
-const QUAD: aurora_core::Rect = aurora_core::Rect {
+pub(crate) const TILE0: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
+pub(crate) const QUAD: aurora_core::Rect = aurora_core::Rect {
     x: 0,
     y: 0,
     width: 512,
@@ -33,7 +33,7 @@ const QUAD: aurora_core::Rect = aurora_core::Rect {
 /// what is left is `pack2x16float`'s implementation-defined rounding
 /// direction (one `f16` step) and the GPU's own transcendental / division
 /// rounding (`pow`, `/`) flipping an `f16` rounding.
-fn tolerance() -> f32 {
+pub(crate) fn tolerance() -> f32 {
     2.0 * f32::from(half::f16::EPSILON)
 }
 
@@ -59,18 +59,18 @@ fn tolerance() -> f32 {
 /// 0.211.1: still 16 steps, now with [`Conditioning`]: the 11- and
 /// 17-step failures were not a gap in this bound but texels whose CPU
 /// result moves by up to ~0.03 for a one-step backdrop difference.
-fn translucent_tolerance() -> f32 {
+pub(crate) fn translucent_tolerance() -> f32 {
     16.0 / 2048.0
 }
 
-fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
+pub(crate) fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     match r {
         Ok(v) => v,
         Err(err) => unreachable!("{err:?}"),
     }
 }
 
-fn store() -> (tempfile::TempDir, aurora_tile::TileStore) {
+pub(crate) fn store() -> (tempfile::TempDir, aurora_tile::TileStore) {
     let dir = ok(tempfile::tempdir());
     let Some(budget) = std::num::NonZeroUsize::new(16) else {
         unreachable!("non-zero");
@@ -83,7 +83,7 @@ fn store() -> (tempfile::TempDir, aurora_tile::TileStore) {
 }
 
 /// A deterministic value in `[0, 1)` for texel `(x, y)` and a `salt`.
-fn hash(x: u32, y: u32, salt: u32) -> f32 {
+pub(crate) fn hash(x: u32, y: u32, salt: u32) -> f32 {
     let mut h = x
         .wrapping_mul(0x9E37_79B1)
         .wrapping_add(y.wrapping_mul(0x85EB_CA77))
@@ -97,14 +97,14 @@ fn hash(x: u32, y: u32, salt: u32) -> f32 {
 }
 
 /// Opaque uniform-random colours.
-fn random_opaque(x: u32, y: u32) -> [f32; 4] {
+pub(crate) fn random_opaque(x: u32, y: u32) -> [f32; 4] {
     [hash(x, y, 1), hash(x, y, 2), hash(x, y, 3), 1.0]
 }
 
 /// Named corner cases (black, white, greys, primaries, secondaries, tints,
 /// near-black and near-white near-greys) in the top rows, random colours
 /// below; opaque.
-fn edge_opaque(x: u32, y: u32) -> [f32; 4] {
+pub(crate) fn edge_opaque(x: u32, y: u32) -> [f32; 4] {
     const PALETTE: [[f32; 3]; 16] = [
         [0.0, 0.0, 0.0],
         [1.0, 1.0, 1.0],
@@ -133,7 +133,7 @@ fn edge_opaque(x: u32, y: u32) -> [f32; 4] {
 }
 
 /// A smooth colour ramp, opaque.
-fn ramp(x: u32, y: u32) -> [f32; 4] {
+pub(crate) fn ramp(x: u32, y: u32) -> [f32; 4] {
     [
         x as f32 / 255.0,
         y as f32 / 255.0,
@@ -149,9 +149,9 @@ fn ramp(x: u32, y: u32) -> [f32; 4] {
 /// amplified by up to `1 / ALPHA_FLOOR`. 0.25 (was 0.1 until 0.209.1) keeps
 /// that factor at 4: GitHub's Windows (WARP) and macOS (Apple Paravirtual)
 /// adapters kept finding new 10x cases at 0.1, each needing a wider bound.
-const ALPHA_FLOOR: f32 = 0.25;
+pub(crate) const ALPHA_FLOOR: f32 = 0.25;
 
-fn random_translucent(x: u32, y: u32) -> [f32; 4] {
+pub(crate) fn random_translucent(x: u32, y: u32) -> [f32; 4] {
     let a = if y < 16 {
         0.0
     } else {
@@ -161,7 +161,7 @@ fn random_translucent(x: u32, y: u32) -> [f32; 4] {
 }
 
 /// [`ramp`] at an alpha that varies across the tile.
-fn ramp_translucent(x: u32, y: u32) -> [f32; 4] {
+pub(crate) fn ramp_translucent(x: u32, y: u32) -> [f32; 4] {
     let [r, g, b, _] = ramp(x, y);
     let a = if y < 16 {
         0.0
@@ -173,7 +173,7 @@ fn ramp_translucent(x: u32, y: u32) -> [f32; 4] {
 
 /// Out-of-gamut straight colours (negative, above one) at alpha 1, which
 /// `straight_backdrop` leaves unclamped.
-fn out_of_gamut(x: u32, y: u32) -> [f32; 4] {
+pub(crate) fn out_of_gamut(x: u32, y: u32) -> [f32; 4] {
     [
         hash(x, y, 1) * 3.0 - 1.0,
         hash(x, y, 2) * 2.0 - 0.5,
@@ -182,7 +182,7 @@ fn out_of_gamut(x: u32, y: u32) -> [f32; 4] {
     ]
 }
 
-fn pattern_layer(
+pub(crate) fn pattern_layer(
     layers: &mut aurora_doc::LayerTree,
     store: &mut aurora_tile::TileStore,
     pattern: impl Fn(u32, u32) -> [f32; 4],
@@ -206,7 +206,7 @@ fn pattern_layer(
     id
 }
 
-fn add_adjustment(
+pub(crate) fn add_adjustment(
     layers: &mut aurora_doc::LayerTree,
     adjustment: aurora_doc::Adjustment,
 ) -> aurora_doc::LayerId {
@@ -247,14 +247,17 @@ fn colorize(h: f32, s: f32, l: f32) -> aurora_doc::Adjustment {
     )))
 }
 
-fn cpu_tile(layers: &aurora_doc::LayerTree, store: &mut aurora_tile::TileStore) -> Vec<f32> {
+pub(crate) fn cpu_tile(
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+) -> Vec<f32> {
     let mut budget = crate::CompositeBudget::for_pass(layers);
     let (texels, _) =
         crate::composite_roots_into_tile(layers, store, TILE0, (0, 0), (0, 0), &mut budget);
     texels.iter().map(|v| v.to_f32()).collect()
 }
 
-fn gpu_tile(
+pub(crate) fn gpu_tile(
     context: &aurora_gpu::GpuContext,
     compositor: &mut aurora_render::TileCompositor,
     layers: &aurora_doc::LayerTree,
@@ -278,42 +281,65 @@ fn gpu_tile(
     crate::finish_tile_readback(pending).map(|t| t.iter().map(|v| v.to_f32()).collect())
 }
 
-fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn max_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
         .fold(0.0, f32::max)
 }
 
-/// The passes recorded since the last call, `(curves, levels, hue_sat)`.
-fn take_counts() -> (u64, u64, u64) {
-    (
+/// The passes recorded since the last call, `[curves, levels, hue_sat,
+/// vibrance, exposure, photo_filter, black_white, color_balance]`.
+pub(crate) fn take_counts() -> [u64; 8] {
+    [
         crate::take_gpu_curves_dispatch_count(),
         crate::take_gpu_levels_dispatch_count(),
         crate::take_gpu_hue_saturation_dispatch_count(),
-    )
+        crate::take_gpu_vibrance_dispatch_count(),
+        crate::take_gpu_exposure_dispatch_count(),
+        crate::take_gpu_photo_filter_dispatch_count(),
+        crate::take_gpu_black_white_dispatch_count(),
+        crate::take_gpu_color_balance_dispatch_count(),
+    ]
 }
 
 /// Which adjustment pass a test expects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Pass {
+pub(crate) enum Pass {
     Levels,
     HueSaturation,
+    Vibrance,
+    Exposure,
+    PhotoFilter,
+    BlackWhite,
+    ColorBalance,
 }
 
 impl Pass {
-    fn expected(self, passes: u64) -> (u64, u64, u64) {
-        match self {
-            Self::Levels => (0, passes, 0),
-            Self::HueSaturation => (0, 0, passes),
+    /// The counters [`take_counts`] must read after `passes` passes of
+    /// `self` and none of any other kind.
+    pub(crate) fn expected(self, passes: u64) -> [u64; 8] {
+        let mut counts = [0; 8];
+        let slot = match self {
+            Self::Levels => 1,
+            Self::HueSaturation => 2,
+            Self::Vibrance => 3,
+            Self::Exposure => 4,
+            Self::PhotoFilter => 5,
+            Self::BlackWhite => 6,
+            Self::ColorBalance => 7,
+        };
+        if let Some(count) = counts.get_mut(slot) {
+            *count = passes;
         }
+        counts
     }
 }
 
 /// One GPU tile that must have run exactly `passes` passes of `pass` (and
 /// none of the others), compared against the CPU reference within `bound`.
 /// Returns `(cpu, worst |GPU - CPU|)`.
-fn gpu_matches_cpu(
+pub(crate) fn gpu_matches_cpu(
     context: &aurora_gpu::GpuContext,
     compositor: &mut aurora_render::TileCompositor,
     layers: &aurora_doc::LayerTree,
@@ -345,29 +371,29 @@ const CONDITIONING_STEPS: i32 = 1;
 /// one-step change in the CPU result reproduces the macOS value to the
 /// bit). No bound on the GPU/CPU difference holds there, so such texels
 /// are reported and held to a looser, sensitivity-relative bound instead.
-struct Conditioning {
+pub(crate) struct Conditioning {
     /// Texels whose sensitivity exceeds the limit, per texel.
-    ill: Vec<bool>,
+    pub(crate) ill: Vec<bool>,
     /// The sensitivity per texel.
-    sensitivity: Vec<f32>,
+    pub(crate) sensitivity: Vec<f32>,
     /// The unperturbed result, which must equal the CPU tile exactly:
     /// proof that the sensitivity is measured on the very reference the
     /// GPU is compared against.
-    base: Vec<f32>,
+    pub(crate) base: Vec<f32>,
 }
 
 /// The sensitivity above which a texel is excluded from the tight bound:
 /// `bound` minus the final readback's own one-step rounding direction
 /// (`pack2x16float` may round either way; `1 / ALPHA_FLOOR` of `2^-11`
 /// after the un-premultiply).
-fn conditioning_limit(bound: f32) -> f32 {
+pub(crate) fn conditioning_limit(bound: f32) -> f32 {
     bound - ALPHA_FLOOR.recip() / 2048.0
 }
 
 /// `v` moved by `k` `f16` steps (a premultiplied backdrop channel is never
 /// negative; a negative `v` is returned unchanged). Below zero it goes to
 /// the negative subnormals, which is what one step down from `0.0` is.
-fn f16_step(v: half::f16, k: i32) -> half::f16 {
+pub(crate) fn f16_step(v: half::f16, k: i32) -> half::f16 {
     let bits = v.to_bits();
     if bits & 0x8000 != 0 {
         return v;
@@ -385,7 +411,7 @@ fn f16_step(v: half::f16, k: i32) -> half::f16 {
 /// returns it), by running the CPU's own `apply_adjustment_layer` on the
 /// premultiplied backdrop and on every combination of its colour channels
 /// moved by up to [`CONDITIONING_STEPS`] `f16` steps.
-fn conditioning_of(
+pub(crate) fn conditioning_of(
     layers: &aurora_doc::LayerTree,
     store: &mut aurora_tile::TileStore,
     id: aurora_doc::LayerId,
@@ -448,7 +474,7 @@ fn conditioning_of(
 /// [`gpu_matches_cpu`] with the texels `exclude` marks ill-conditioned
 /// held to `bound + 2 * sensitivity` instead of `bound` (and the count of
 /// them printed and bounded to 1 % of the tile).
-fn gpu_matches_cpu_excluding(
+pub(crate) fn gpu_matches_cpu_excluding(
     context: &aurora_gpu::GpuContext,
     compositor: &mut aurora_render::TileCompositor,
     layers: &aurora_doc::LayerTree,
@@ -519,7 +545,7 @@ fn gpu_matches_cpu_excluding(
     (cpu, worst)
 }
 
-const GPU_MODES: [BlendMode; 19] = [
+pub(crate) const GPU_MODES: [BlendMode; 19] = [
     BlendMode::Normal,
     BlendMode::Multiply,
     BlendMode::Darken,
@@ -557,7 +583,7 @@ const STEEP_HUE_SAT_CASES: [&str; 3] = ["saturation +99", "saturation +100", "ex
 /// about 6-8 steps on the RTX 3090; Windows' WARP adapter measured 9 steps
 /// for Hue/Saturation under `ColorDodge`, 13 under `VividLight`): 20 steps of `2^-11` instead of
 /// `2 * f16::EPSILON`.
-fn mode_bound(mode: BlendMode) -> f32 {
+pub(crate) fn mode_bound(mode: BlendMode) -> f32 {
     match mode {
         BlendMode::ColorBurn
         | BlendMode::ColorDodge
@@ -659,13 +685,18 @@ fn cases_of(pass: Pass) -> Vec<(&'static str, aurora_doc::Adjustment)> {
     match pass {
         Pass::Levels => levels_cases(),
         Pass::HueSaturation => hue_sat_cases(),
+        Pass::Vibrance
+        | Pass::Exposure
+        | Pass::PhotoFilter
+        | Pass::BlackWhite
+        | Pass::ColorBalance => crate::gpu_photo_adjustment_tests::cases_of(pass),
     }
 }
 
 /// Runs every case of `pass` over `pattern` at `opacity` and `mode`,
 /// returning the worst difference. The adjustment must change the
 /// composite (or be an identity-like case).
-fn run_cases(
+pub(crate) fn run_cases(
     pass: Pass,
     pattern: impl Fn(u32, u32) -> [f32; 4] + Copy,
     opacity: f32,
@@ -682,7 +713,9 @@ fn run_cases(
         // translucent backdrop's one-step `Cb` difference past any fixed
         // bound; they are held to the opaque tolerance above instead.
         if bound > tolerance()
-            && (STEEP_LEVELS_CASES.contains(&name) || STEEP_HUE_SAT_CASES.contains(&name))
+            && (STEEP_LEVELS_CASES.contains(&name)
+                || STEEP_HUE_SAT_CASES.contains(&name)
+                || crate::gpu_photo_adjustment_tests::STEEP_CASES.contains(&name))
         {
             continue;
         }
@@ -828,7 +861,11 @@ fn gpu_hue_saturation_matches_the_cpu_on_translucent_backdrops() {
 /// Every admitted blend mode, one adjustment each, on the smooth ramp (as
 /// the Curves test): the GPU must differ from Normal for every other mode,
 /// or a dropped mode would pass.
-fn every_mode(pass: Pass, adjustment: aurora_doc::Adjustment, pattern: fn(u32, u32) -> [f32; 4]) {
+pub(crate) fn every_mode(
+    pass: Pass,
+    adjustment: aurora_doc::Adjustment,
+    pattern: fn(u32, u32) -> [f32; 4],
+) {
     let Some(context) = real_gpu_context() else {
         return;
     };
@@ -1132,7 +1169,7 @@ fn a_document_with_levels_and_hue_saturation_layers_composites_on_the_gpu() {
     };
     assert_eq!(
         take_counts(),
-        (0, 1, 2),
+        [0, 1, 2, 0, 0, 0, 0, 0],
         "Levels once, Hue/Saturation twice"
     );
     let cpu = cpu_tile(&layers, &mut store);
@@ -1205,7 +1242,7 @@ fn hue_saturation_with_active_ranges_stays_on_the_cpu_and_neutral_ranges_do_not(
             let Some(gpu) = gpu else {
                 unreachable!("{name}: should run on the GPU");
             };
-            assert_eq!(take_counts(), (0, 0, 1), "{name}");
+            assert_eq!(take_counts(), Pass::HueSaturation.expected(1), "{name}");
             let cpu = cpu_tile(&layers, &mut store);
             assert!(max_diff(&gpu, &cpu) <= tolerance(), "{name}");
         } else {
@@ -1213,7 +1250,7 @@ fn hue_saturation_with_active_ranges_stays_on_the_cpu_and_neutral_ranges_do_not(
                 gpu.is_none(),
                 "{name}: the tile must fall back, not drop it"
             );
-            assert_eq!(take_counts(), (0, 0, 0), "{name}: no pass recorded");
+            assert_eq!(take_counts(), [0; 8], "{name}: no pass recorded");
         }
     }
 }
@@ -1250,7 +1287,7 @@ fn unsupported_levels_and_hue_saturation_layers_fall_back_to_the_cpu() {
                 gpu_tile(&context, &mut compositor, &layers, &mut store).is_none(),
                 "{refusal}: the tile must fall back, not drop the layer"
             );
-            assert_eq!(take_counts(), (0, 0, 0), "{refusal}");
+            assert_eq!(take_counts(), [0; 8], "{refusal}");
         }
         // A disabled mask is ignored on both paths.
         let (_dir, mut store) = store();

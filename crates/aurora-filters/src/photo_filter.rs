@@ -16,8 +16,10 @@
 //!   ([`PhotoFilterOp::is_identity`]), an exact passthrough even for an
 //!   out-of-gamut value. A non-identity one clamps its input to `[0, 1]`
 //!   (`NaN` reads as `0`) and returns values in `[0, 1]`.
-//! - **No GPU port** (a later task): a visible Photo Filter layer keeps
-//!   the document on the CPU compositing path.
+//! - **GPU (0.242.0)**: `aurora-render`'s Photo Filter pass
+//!   (`shaders/photo_filter.wgsl`) ports [`PhotoFilterOp::apply`] line for
+//!   line ([`PhotoFilterOp::packed_for_gpu`] hands it the flags and the
+//!   transmission).
 
 use aurora_core::PhotoFilterParams;
 
@@ -27,6 +29,9 @@ const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
 fn luma([r, g, b]: [f32; 3]) -> f32 {
     LUMA[0].mul_add(r, LUMA[1].mul_add(g, LUMA[2] * b))
 }
+
+/// How many `f32`s [`PhotoFilterOp::packed_for_gpu`] returns (0.242.0).
+pub const PHOTO_FILTER_PACKED_LEN: usize = 8;
 
 /// A Photo Filter adjustment ready to apply to pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,6 +56,26 @@ impl PhotoFilterOp {
     #[must_use]
     pub fn is_identity(&self) -> bool {
         self.params.is_identity()
+    }
+
+    /// The settings flattened for the GPU Photo Filter pass (0.242.0,
+    /// `aurora_render::TileCompositor::composite_photo_filter_with_opacity`,
+    /// `shaders/photo_filter.wgsl`): `[identity, preserve_luminosity, 0, 0,
+    /// transmission_r, transmission_g, transmission_b, 0]`, flags as
+    /// `0`/`1`; the transmission is the very `f32`s [`Self::apply`] uses.
+    #[must_use]
+    pub fn packed_for_gpu(&self) -> [f32; PHOTO_FILTER_PACKED_LEN] {
+        let [t0, t1, t2] = self.transmission;
+        [
+            f32::from(u8::from(self.is_identity())),
+            f32::from(u8::from(self.params.preserve_luminosity())),
+            0.0,
+            0.0,
+            t0,
+            t1,
+            t2,
+            0.0,
+        ]
     }
 
     /// The adjusted colour of one straight, encoded RGB pixel.
