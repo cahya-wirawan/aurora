@@ -88924,6 +88924,7 @@ mod tests {
 
         include!("outer_glow_tests.rs");
         include!("clip_corpus_tests.rs");
+        include!("psd_audit_tests.rs");
         include!("small_machine_effect_tests.rs");
     }
 }
