@@ -39,6 +39,7 @@ fn put(bytes: &'static [u8]) -> impl FnOnce(&mut std::fs::File) -> Result<(), Io
     }
 }
 
+#[allow(clippy::unnecessary_wraps, clippy::trivially_copy_pass_by_ref)]
 fn accept(_: &Path, (): &()) -> Result<(), IoError> {
     Ok(())
 }
@@ -155,7 +156,7 @@ fn a_failed_rename_is_still_an_error_and_leaves_no_temp() {
     ok(std::fs::write(target.join("inner"), b"keep"));
     let outcome = write_verified_temp_with(&target, put(b"new"), sync_ok, accept);
     let result = match outcome {
-        Ok((_, temp)) => temp.persist_with(|_| Ok(())),
+        Ok(((), temp)) => temp.persist_with(|_| Ok(())),
         Err(err) => Err(err),
     };
     assert!(result.is_err());

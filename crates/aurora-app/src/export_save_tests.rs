@@ -48,6 +48,7 @@ fn sync_ok(file: &std::fs::File) -> std::io::Result<()> {
     file.sync_all()
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn dir_ok(_: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -85,7 +86,9 @@ fn the_temp_file_is_unique_hidden_and_exclusive_while_it_exists_and_gone_after()
             let found = names(dir.path());
             assert_eq!(found.len(), 1, "exactly the temp file exists: {found:?}");
             assert!(
-                is_unique_hidden_temp_of(&found[0], "export.png"),
+                found
+                    .first()
+                    .is_some_and(|name| is_unique_hidden_temp_of(name, "export.png")),
                 "not a hidden unique name: {found:?}"
             );
             seen.set(true);
@@ -331,6 +334,11 @@ fn a_psd_step_distinguishes_a_confirmed_save_from_an_unconfirmed_one() {
 fn the_save_callers_surface_the_advisory() {
     // Source-level pins (single-line needles only: CRLF-safe).
     let source = include_str!("lib.rs");
-    assert!(source.contains("self.note_save_advisory(advisory.as_deref());"));
+    // The .aur save, the export and Save Anyway each surface it.
+    let calls = source
+        .lines()
+        .filter(|line| line.trim() == "self.note_save_advisory(advisory.as_deref());")
+        .count();
+    assert_eq!(calls, 3, "aur save, export and Save Anyway");
     assert!(source.contains("self.note_save_advisory(Some(aurora_io::DIR_SYNC_ADVISORY));"));
 }

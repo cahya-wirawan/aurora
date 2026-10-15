@@ -171,7 +171,7 @@ pub fn write_verified_temp<T>(
     write: impl FnOnce(&mut File) -> Result<T, IoError>,
     verify: impl FnOnce(&Path, &T) -> Result<(), IoError>,
 ) -> Result<(T, VerifiedTemp), IoError> {
-    write_verified_temp_with(target, write, |file| file.sync_all(), verify)
+    write_verified_temp_with(target, write, File::sync_all, verify)
 }
 
 /// [`write_verified_temp`] with the data sync injected (tests): `sync`

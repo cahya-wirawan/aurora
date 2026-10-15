@@ -40,14 +40,7 @@ pub(crate) fn write_export_verified(
     width: u32,
     height: u32,
 ) -> Result<Option<String>, IoError> {
-    write_export_verified_with(
-        path,
-        bytes,
-        width,
-        height,
-        |file| file.sync_all(),
-        |dir| sync_directory(dir),
-    )
+    write_export_verified_with(path, bytes, width, height, File::sync_all, sync_directory)
 }
 
 /// [`write_export_verified`] with the data sync and the directory sync
