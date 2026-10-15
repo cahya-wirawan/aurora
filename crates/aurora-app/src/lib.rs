@@ -20212,7 +20212,8 @@ fn adjustment_layer_qualifies_for_gpu(
         .unwrap_or(aurora_doc::BlendMode::Normal);
     let expressible = match layers.adjustment(id) {
         // Curves, Levels and Hue/Saturation (master / Colorize) have had a GPU
-        // pass since 0.159.0 / 0.206.0.
+        // pass since 0.159.0 / 0.206.0; Vibrance, Exposure, Photo Filter,
+        // Black & White and Color Balance since 0.242.0.
         Some(
             aurora_doc::Adjustment::Curves(_)
             | aurora_doc::Adjustment::Levels(_)
