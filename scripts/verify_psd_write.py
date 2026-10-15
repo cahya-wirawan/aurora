@@ -321,6 +321,21 @@ def adjustment_summary(layer):
     bal = blocks.get_data(Tag.COLOR_BALANCE)
     if bal is not None:
         return ("balance", (tuple(bal.shadows), tuple(bal.midtones), tuple(bal.highlights), int(bal.luminosity)))
+    # 0.244.0: Threshold, Posterize, Invert, Brightness/Contrast.
+    thr = blocks.get_data(Tag.THRESHOLD)
+    if thr is not None:
+        return ("threshold", int(thr))
+    post = blocks.get_data(Tag.POSTERIZE)
+    if post is not None:
+        return ("posterize", int(post))
+    if blocks.get_data(Tag.INVERT) is not None or Tag.INVERT in blocks:
+        return ("invert", None)
+    brit = blocks.get_data(Tag.BRIGHTNESS_AND_CONTRAST)
+    if brit is not None:
+        extra = blocks.get_data(Tag.CONTENT_GENERATOR_EXTRA_DATA)
+        if extra is not None:
+            return ("brightness", (int(extra.get(b"Brgh", 0)), int(extra.get(b"Cntr", 0)), bool(extra.get(b"useLegacy", False))))
+        return ("brightness", (brit.brightness, brit.contrast, True))
     return None
 
 
@@ -422,6 +437,38 @@ def check_adjustments5(folder):
     print("OK: psd-tools read the Vibrance, Exposure, Photo Filter, Black & White and Color Balance blocks and records")
 
 
+def check_adjustments4(folder):
+    """0.244.0: Invert, Threshold, Posterize and Brightness/Contrast layers
+    read back in psd-tools with the integers of `adjustments4.json` (written
+    by the Rust fixture test `four_adjustments_fixture_for_psd_tools`)."""
+    spec_path = folder / "adjustments4.json"
+    if not spec_path.exists():
+        print("no adjustments4.json: the four-kind pass was skipped")
+        return
+    want = json.loads(spec_path.read_text(encoding="utf-8"))
+    psd = PSDImage.open(folder / "adjustments4.psd")
+    i = find_layer(psd, "Invert A")
+    check("Invert kind", i.kind, "invert")
+    check("Invert opacity", i.opacity, 128)
+    check("Invert blend", i.blend_mode.name, "MULTIPLY")
+    check("Invert mask bbox", tuple(i.mask.bbox), (2, 2, 12, 12))
+    p = find_layer(psd, "Posterize clipped")
+    check("Posterize kind", p.kind, "posterize")
+    check("Posterize levels", adjustment_summary(p)[1], want["posterize"])
+    check("Posterize clipping", bool(p.clipping), True)
+    t = find_layer(psd, "Threshold in group")
+    check("Threshold kind", t.kind, "threshold")
+    check("Threshold level", adjustment_summary(t)[1], want["threshold"])
+    check("Threshold group", t.parent.name, "Group")
+    b = find_layer(psd, "Bright")
+    check("Brightness kind", b.kind, "brightnesscontrast")
+    check("Brightness values", adjustment_summary(b)[1], (want["default"][0], want["default"][1], False))
+    legacy = find_layer(psd, "Legacy")
+    check("Legacy visible", legacy.visible, False)
+    check("Legacy values", adjustment_summary(legacy)[1], (want["legacy"][0], want["legacy"][1], True))
+    print("OK: psd-tools read the Invert, Threshold, Posterize and Brightness/Contrast blocks and records")
+
+
 def check_resaves(folder):
     """Each kept `resave_<name>.psd` against the original corpus file."""
     corpus = Path(__file__).resolve().parent.parent / "corpora/psd/reference/psd-tools-fixtures"
@@ -438,9 +485,9 @@ def check_resaves(folder):
         original = PSDImage.open(matches[0])
         resaved = PSDImage.open(saved)
         a = [(l.name, l.kind, adjustment_summary(l)) for l in original.descendants()
-             if l.kind in ("curves", "levels", "huesaturation", "vibrance", "exposure", "photofilter", "blackandwhite", "colorbalance")]
+             if l.kind in ("curves", "levels", "huesaturation", "vibrance", "exposure", "photofilter", "blackandwhite", "colorbalance", "invert", "threshold", "posterize", "brightnesscontrast")]
         b = [(l.name, l.kind, adjustment_summary(l)) for l in resaved.descendants()
-             if l.kind in ("curves", "levels", "huesaturation", "vibrance", "exposure", "photofilter", "blackandwhite", "colorbalance")]
+             if l.kind in ("curves", "levels", "huesaturation", "vibrance", "exposure", "photofilter", "blackandwhite", "colorbalance", "invert", "threshold", "posterize", "brightnesscontrast")]
         check(f"{name} adjustment layers", sorted(x[:2] for x in a), sorted(x[:2] for x in b))
         same = sum(1 for x in a if x in b)
         # Merged images: psd-tools' own composite of each file's layers and
@@ -533,3 +580,4 @@ if __name__ == "__main__":
     check_smart(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_adjustments(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_adjustments5(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
+    check_adjustments4(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
