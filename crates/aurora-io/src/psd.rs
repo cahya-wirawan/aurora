@@ -466,6 +466,11 @@ enum Note {
     VectorMaskRasterised,
     VectorMaskDisabledDropped,
     ClippingDropped,
+    /// Adjustment layers under a Pass Through group whose Fill is below
+    /// 100 % (0.241.0).
+    AdjustmentUnderGroupFill,
+    /// Clipped adjustment layers shown unclipped (0.241.0).
+    AdjustmentClipNotApplied,
     ShadowNoiseNotApplied,
     ShadowContourNotApplied,
     EffectScaleNotApplied,
@@ -533,7 +538,9 @@ fn note_text(note: Note, n: u64) -> String {
         Note::AdjustmentSkipped => format!(
             "{n} adjustment layer{s} (Brightness/Contrast, Channel Mixer and similar) {was} \
              left out — Aurora shows only Curves, Levels, Hue/Saturation, Vibrance, Exposure, \
-             Photo Filter, Black & White and Color Balance adjustment layers so far."
+             Photo Filter, Black & White and Color Balance adjustment layers so far (Vibrance, \
+             Photo Filter, Black & White and Color Balance are approximations that have not \
+             been compared with Photoshop)."
         ),
         Note::CurvesUnreadable => format!(
             "{n} Curves layer{s} {was} left out — {} settings could not be read.",
@@ -696,6 +703,17 @@ fn note_text(note: Note, n: u64) -> String {
             "{n} clipped layer{s} {is} shown unclipped — {} base is a group or an adjustment \
              layer, or there is no layer beneath to clip to.",
             if one { "its" } else { "their" }
+        ),
+        Note::AdjustmentUnderGroupFill => format!(
+            "{n} adjustment layer{s} sit{} inside a Pass Through group whose Fill is below \
+             100%, which Aurora doesn't apply: {} may look much stronger than in Photoshop.",
+            if one { "s" } else { "" },
+            if one { "it" } else { "they" },
+        ),
+        Note::AdjustmentClipNotApplied => format!(
+            "{n} clipped adjustment layer{s} {is} shown unclipped (clipping is not applied): \
+             {} may look much stronger than in Photoshop.",
+            if one { "it" } else { "they" },
         ),
         Note::DropShadowsNotShown => format!(
             "{n} drop shadow{s} {is}n't shown yet; {} kept with the layer.",
@@ -3342,6 +3360,7 @@ fn build_tree(
                 // only a Fill below 100% on one is not applied.
                 if props.blend == BlendMode::PassThrough && props.fill_opacity < 1.0 {
                     notes.add(Note::PassThroughFillNotApplied);
+                    notes.add_n(Note::AdjustmentUnderGroupFill, count_adjustments(&children));
                 }
                 // A group's mask region is the canvas (`Builder::add_nodes`).
                 let outcome =
@@ -3375,6 +3394,21 @@ fn build_tree(
         }
     }
     Ok(stack.pop().unwrap_or_default())
+}
+
+/// How many adjustment layers `nodes` hold, nested groups included.
+/// Iterative, so a deep tree cannot overflow the stack.
+fn count_adjustments(nodes: &[PsdNode]) -> u64 {
+    let mut count = 0_u64;
+    let mut stack: Vec<&PsdNode> = nodes.iter().collect();
+    while let Some(node) = stack.pop() {
+        match node {
+            PsdNode::Adjustment(_) => count += 1,
+            PsdNode::Group { children, .. } => stack.extend(children.iter()),
+            PsdNode::Layer(_) => {}
+        }
+    }
+    count
 }
 
 /// The unique IDs of every kept smart object in `nodes`. Iterative, so a
@@ -4415,6 +4449,7 @@ fn build_streamed(
         profile: &profile,
         canvas,
         clip_refused: 0,
+        clip_adjustments_refused: 0,
     };
     if nodes.is_empty() {
         if let Some(image) = composite {
@@ -4436,6 +4471,10 @@ fn build_streamed(
         builder.add_nodes(nodes, None, 0)?;
     }
     notes.add_n(Note::ClippingDropped, builder.clip_refused);
+    notes.add_n(
+        Note::AdjustmentClipNotApplied,
+        builder.clip_adjustments_refused,
+    );
     // No second `take_failure` check here (0.154.0 review I1): every read
     // this build makes (`decode_pending`) propagates its own error with
     // `?`; only the tree build's mask decode swallows one, and
@@ -4461,9 +4500,18 @@ struct Builder<'b, 'k, 's> {
     /// Layers whose clipping flag Aurora cannot honour (0.201.0): shown
     /// unclipped, reported as [`Note::ClippingDropped`].
     clip_refused: u64,
+    /// Of those, the adjustment layers (0.241.0), reported separately.
+    clip_adjustments_refused: u64,
 }
 
 impl Builder<'_, '_, '_> {
+    /// Counts `id` when it is an adjustment layer shown unclipped.
+    fn note_adjustment_unclipped(&mut self, id: LayerId) {
+        if self.layers.adjustment(id).is_some() {
+            self.clip_adjustments_refused = self.clip_adjustments_refused.saturating_add(1);
+        }
+    }
+
     /// Recursion depth is bounded by [`MAX_GROUP_DEPTH`] ([`decode`]
     /// refuses deeper files, and this re-checks rather than trusting a
     /// hand-built [`PsdFile`]).
@@ -4710,6 +4758,7 @@ impl Builder<'_, '_, '_> {
                     });
                     if !base_is_pixel {
                         self.clip_refused = self.clip_refused.saturating_add(1);
+                        self.note_adjustment_unclipped(id);
                     }
                 }
                 // The bottom-most layer of its group, or a group: shown
@@ -4717,7 +4766,10 @@ impl Builder<'_, '_, '_> {
                 Err(
                     aurora_doc::DocError::NoClipBase(_)
                     | aurora_doc::DocError::GroupCannotBeClipped(_),
-                ) => self.clip_refused = self.clip_refused.saturating_add(1),
+                ) => {
+                    self.clip_refused = self.clip_refused.saturating_add(1);
+                    self.note_adjustment_unclipped(id);
+                }
                 Err(err) => return Err(err.into()),
             }
         }

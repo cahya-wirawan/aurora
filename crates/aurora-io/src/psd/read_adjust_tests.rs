@@ -1081,3 +1081,110 @@ fn corpus_clipping_mask2_imports_its_clipped_color_balance() {
     assert_eq!(p.ranges()[1], [28.0, 100.0, 53.0]);
     let _ = name;
 }
+
+// ---------------------------------------------------------------------
+// Reports for adjustments Aurora shows stronger than Photoshop
+// ---------------------------------------------------------------------
+
+/// A group (Pass Through) holding a pixel layer and an adjustment, with the
+/// group's Fill byte set to `fill` and the adjustment clipped or not.
+fn grouped_file(fill: u8, clipped: bool, with_pixels_below: bool) -> TestPsd {
+    let adjustment = TestLayer::empty("Adjust 1").with(|l| {
+        l.blocks.push((*b"blnc", unhex(BLNC_FILL)));
+        l.clipping = u8::from(clipped);
+    });
+    TestPsd::new(1, 2, 2, 8).with(|p| {
+        let mut layers = vec![TestLayer::divider()];
+        if with_pixels_below {
+            layers.push(TestLayer::pixels(
+                "p",
+                0,
+                0,
+                2,
+                2,
+                8,
+                &[[255, 0, 0, 255]; 4],
+            ));
+        }
+        layers.push(adjustment);
+        layers.push(TestLayer::group("G", *b"pass").with(|g| {
+            g.blocks.push((*b"iOpa", vec![fill]));
+        }));
+        p.layers = layers;
+    })
+}
+
+#[test]
+fn an_adjustment_under_a_pass_through_group_with_reduced_fill_is_reported_as_stronger() {
+    let document = ok(read(&grouped_file(102, false, true).write()));
+    let items = document.report.items.join("\n");
+    assert!(
+        items.contains(
+            "1 adjustment layer sits inside a Pass Through group whose Fill is below 100%"
+        ) && items.contains("may look much stronger than in Photoshop"),
+        "{items}"
+    );
+    // The layer stays imported.
+    assert!(top_adjustment(&document).is_some());
+    // Full Fill: no such line.
+    let document = ok(read(&grouped_file(255, false, true).write()));
+    let items = document.report.items.join("\n");
+    assert!(!items.contains("much stronger"), "{items}");
+}
+
+#[test]
+fn a_clipped_adjustment_shown_unclipped_is_reported_as_stronger() {
+    // Clipped with nothing beneath it in its group: shown unclipped.
+    let document = ok(read(&grouped_file(255, true, false).write()));
+    let items = document.report.items.join("\n");
+    assert!(
+        items.contains("1 clipped adjustment layer is shown unclipped")
+            && items.contains("may look much stronger than in Photoshop"),
+        "{items}"
+    );
+    assert!(top_adjustment(&document).is_some(), "still imported");
+    // Clipped to a pixel layer: really clipped, nothing to report.
+    let document = ok(read(&grouped_file(255, true, true).write()));
+    let items = document.report.items.join("\n");
+    assert!(!items.contains("much stronger"), "{items}");
+}
+
+#[test]
+fn the_left_out_note_calls_four_kinds_approximations() {
+    let document = ok(read(
+        &file_with(b"blnc", &unhex(BLNC_FILL), |l| {
+            l.blocks.push((*b"brit", vec![0; 4]));
+        })
+        .write(),
+    ));
+    let items = document.report.items.join("\n");
+    assert!(
+        items.contains("approximations that have not been compared with Photoshop"),
+        "{items}"
+    );
+}
+
+#[test]
+fn corpus_files_where_aurora_shows_the_adjustment_stronger_say_so() {
+    if let Some(document) = corpus("passthrough_fill_adjustment.psd") {
+        let items = document.report.items.join("\n");
+        assert!(
+            items.contains("sits inside a Pass Through group whose Fill is below 100%"),
+            "{items}"
+        );
+        assert!(!adjustments_of(&document).is_empty());
+    }
+    if let Some(document) = corpus("passthrough_clipping_mask_adjustment.psd") {
+        let items = document.report.items.join("\n");
+        // The clipped layer here is a pixel layer whose base is a group, not
+        // a clipped adjustment: the existing clipping note names it, and no
+        // false claim about a clipped adjustment is made. (Aurora's error on
+        // this file is dominated by that unclipped layer.)
+        assert!(
+            items.contains("1 clipped layer is shown unclipped"),
+            "{items}"
+        );
+        assert!(!items.contains("clipped adjustment layer"), "{items}");
+        assert_eq!(adjustments_of(&document).len(), 2);
+    }
+}

@@ -306,9 +306,13 @@ fn each_kind_saved_to_psd_and_reopened_composites_the_same() {
             unreachable!("{label}: save failed")
         };
         // The tint colour and Lab colour come back within a fraction of a
-        // level, which the report does not itemise.
-        assert!(
-            outcome.report.items.is_empty(),
+        // level, which the report does not itemise. Black & White is the
+        // exception: its tint colour is stored as a colour and its preset
+        // name is cleared, so that one line is itemised.
+        let expected = usize::from(label == "Black & White");
+        assert_eq!(
+            outcome.report.items.len(),
+            expected,
             "{label}: {:?}",
             outcome.report.items
         );
@@ -464,7 +468,7 @@ fn corpus_files_with_the_five_kinds_survive_a_psd_save_and_reopen() {
         // None of the five kinds appears in the save report: Photoshop's
         // own values need no rounding (the report may name other things).
         for line in &outcome.report.items {
-            for kind in FIVE {
+            for kind in FIVE.iter().filter(|k| **k != "Black & White") {
                 assert!(
                     !line.contains(&format!("{kind} layer")),
                     "{relative}: {line}"

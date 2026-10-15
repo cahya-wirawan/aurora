@@ -614,7 +614,23 @@ fn the_five_new_adjustment_layers_save_and_reopen() {
             .tree
             .add_adjustment_layer_at("My layer", adjustment, None, 0));
         let path = doc.path("kept.psd");
-        let step = ok(doc.save(&path));
+        let mut step = ok(doc.save(&path));
+        if kind == "Black & White" {
+            // Its tint colour is stored differently and its preset name is
+            // cleared: the save names that and asks first.
+            let PsdSaveStep::NeedsConfirmation(pending) = step else {
+                unreachable!("{kind}: asks first")
+            };
+            assert!(
+                pending
+                    .report
+                    .items
+                    .iter()
+                    .any(|i| i.contains("preset name"))
+            );
+            ok(finish_psd_save(pending, doc.id, doc.revision));
+            step = PsdSaveStep::Saved;
+        }
         assert!(matches!(step, PsdSaveStep::Saved), "{kind}: {step:?}");
         assert_eq!(doc.listing(), ["kept.psd"], "{kind}: no temp file is left");
         let reopened = ok(aurora_io::read_psd(&ok(std::fs::read(&path))));

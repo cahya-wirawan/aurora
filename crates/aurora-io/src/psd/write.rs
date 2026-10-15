@@ -290,6 +290,10 @@ struct Losses {
     /// (0.205.0): Curves, Levels, Hue/Saturation; and since 0.241.0 Vibrance,
     /// Exposure, Photo Filter, Black & White, Color Balance (slots 3..=7).
     adjustment_rounded: [usize; 8],
+    /// Black & White layers written (0.241.0): each one's tint colour is
+    /// stored as a colour made from the tint hue and saturation, and the
+    /// preset name is cleared.
+    black_white_written: usize,
     /// Curves layers with points merged on the same 8-bit level.
     curve_merged: usize,
     /// Hue/Saturation layers with custom edges on a neutral range.
@@ -322,6 +326,8 @@ impl Losses {
             aurora_doc::Adjustment::BlackWhite(_) => 6,
             aurora_doc::Adjustment::ColorBalance(_) => 7,
         };
+        self.black_white_written +=
+            usize::from(matches!(adjustment, aurora_doc::Adjustment::BlackWhite(_)));
         if rounding.rounded
             && let Some(count) = self.adjustment_rounded.get_mut(slot)
         {
@@ -434,7 +440,7 @@ impl Losses {
             levels,
             hue,
             vibrance,
-            exposure,
+            _exposure, // f32 in the file: never rounded, so no report line
             photo_filter,
             black_white,
             color_balance,
@@ -475,12 +481,6 @@ impl Losses {
                 "fractional values will be rounded to whole numbers.",
             ),
             (
-                exposure,
-                "Exposure layer's",
-                "Exposure layers'",
-                "values will be rounded.",
-            ),
-            (
                 photo_filter,
                 "Photo Filter layer's",
                 "Photo Filter layers'",
@@ -503,6 +503,17 @@ impl Losses {
             if n > 0 {
                 items.push(format!("{} {what}", plural(n as u64, one, many)));
             }
+        }
+        if self.black_white_written > 0 {
+            items.push(format!(
+                "{} tint colour will be stored as a colour made from its hue and saturation, \
+                 and its preset name will be cleared.",
+                plural(
+                    self.black_white_written as u64,
+                    "Black & White layer's",
+                    "Black & White layers'"
+                )
+            ));
         }
         if self.hue_ranges_reset > 0 {
             items.push(format!(

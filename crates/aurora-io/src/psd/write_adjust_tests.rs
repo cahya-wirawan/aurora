@@ -1139,7 +1139,15 @@ fn exact_values_of_the_five_kinds_are_a_lossless_save() {
         ok(tree.add_adjustment_layer_at(name, a, None, 0));
     }
     let report = ok(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()));
-    assert!(report.items.is_empty(), "{:?}", report.items);
+    // Only Black & White is itemised: its tint colour is stored as a colour
+    // and its preset name is cleared.
+    assert_eq!(report.items.len(), 1, "{:?}", report.items);
+    assert!(
+        report
+            .items
+            .iter()
+            .all(|i| i.contains("Black & White layer's tint colour"))
+    );
 }
 
 fn five_doc() -> Doc {
@@ -1201,7 +1209,9 @@ fn the_five_kinds_round_trip_through_write_verify_and_read() {
     let dir = ok(tempfile::tempdir());
     let target = dir.path().join("five.psd");
     let outcome = ok(save(&mut doc, &target, false));
-    assert!(outcome.report.is_empty(), "{:?}", outcome.report);
+    // Only the Black & White layer is itemised (tint colour, preset name).
+    assert_eq!(outcome.report.items.len(), 1, "{:?}", outcome.report);
+    assert!(outcome.report.items[0].contains("Black & White layer's tint colour"));
     let back = read_back(&ok(std::fs::read(&target)));
     assert!(back.report.items.is_empty(), "{:?}", back.report.items);
     assert_eq!(
@@ -1360,4 +1370,51 @@ fn five_adjustments_fixture_for_psd_tools() {
         \"balance\": [[-4, 2, -5], [10, 4, -9], [1, -9, -3], 1], \
         \"bw\": [10, 20, 30, 40, 50, 60], \"bw_tint\": true, \"density\": 25, \"luminosity\": 1}\n";
     ok(std::fs::write(out.join("adjustments5.json"), json));
+}
+
+/// Every Black & White layer written is itemised (its tint colour becomes a
+/// colour made from hue and saturation, its preset name is cleared) so the
+/// "Save With Changes?" dialog names it; no Black & White layer, no line.
+#[test]
+fn black_and_white_layers_are_itemised_in_the_save_report() {
+    let line = |tree: &LayerTree| {
+        ok(psd_save_preflight(tree, (4, 4), PsdSaveOptions::default()))
+            .items
+            .into_iter()
+            .filter(|i| i.contains("Black & White"))
+            .collect::<Vec<_>>()
+    };
+    let mut tree = LayerTree::new();
+    ok(tree.add_pixel_layer("A", rect(0, 0, 4, 4), None));
+    ok(tree.add_adjustment_layer_at(
+        "Hue",
+        Adjustment::HueSaturation(HueSaturationParams::identity()),
+        None,
+        0,
+    ));
+    assert!(line(&tree).is_empty(), "no Black & White layer, no line");
+    ok(tree.add_adjustment_layer_at(
+        "Mono",
+        Adjustment::BlackWhite(BlackWhiteParams::default()),
+        None,
+        0,
+    ));
+    let one = line(&tree);
+    assert_eq!(one.len(), 1, "{one:?}");
+    assert!(
+        one[0].starts_with("1 Black & White layer's tint colour")
+            && one[0].contains("preset name will be cleared"),
+        "{one:?}"
+    );
+    ok(tree.add_adjustment_layer_at(
+        "Mono 2",
+        Adjustment::BlackWhite(BlackWhiteParams::default()),
+        None,
+        0,
+    ));
+    let two = line(&tree);
+    assert!(
+        two[0].starts_with("2 Black & White layers' tint colour"),
+        "{two:?}"
+    );
 }
