@@ -130,6 +130,10 @@ use crate::image::Image;
 
 mod descriptor;
 mod effects;
+mod lab;
+mod read_adjust;
+#[cfg(test)]
+mod read_adjust_tests;
 #[cfg(test)]
 mod effects_tests;
 mod smart;
@@ -437,6 +441,14 @@ enum Note {
     LevelsGrayscale,
     HueSaturationUnreadable,
     HueSaturationGrayscale,
+    /// A Vibrance, Exposure, Photo Filter, Black & White or Color Balance
+    /// layer whose block could not be read or is out of range (0.241.0).
+    Unreadable(read_adjust::Kind),
+    /// One of those five in a Grayscale file.
+    Grayscale(read_adjust::Kind),
+    /// A Photo Filter whose colour is not stored as Lab (version 3 or
+    /// another colour space).
+    PhotoFilterColour,
     FillSkipped,
     TextRasterised,
     SmartObjectRasterised,
@@ -519,9 +531,9 @@ fn note_text(note: Note, n: u64) -> String {
     let is = if one { "is" } else { "are" };
     match note {
         Note::AdjustmentSkipped => format!(
-            "{n} adjustment layer{s} (Brightness/Contrast, Color Balance and similar) {was} \
-             left out — Aurora shows only Curves, Levels and Hue/Saturation adjustment layers \
-             so far."
+            "{n} adjustment layer{s} (Brightness/Contrast, Channel Mixer and similar) {was} \
+             left out — Aurora shows only Curves, Levels, Hue/Saturation, Vibrance, Exposure, \
+             Photo Filter, Black & White and Color Balance adjustment layers so far."
         ),
         Note::CurvesUnreadable => format!(
             "{n} Curves layer{s} {was} left out — {} settings could not be read.",
@@ -554,6 +566,24 @@ fn note_text(note: Note, n: u64) -> String {
         Note::HueSaturationGrayscale => format!(
             "{n} Hue/Saturation layer{s} in this Grayscale file {was} left out — Aurora \
              hasn't yet verified how Photoshop applies Hue/Saturation to a Grayscale image."
+        ),
+        Note::Unreadable(kind) => format!(
+            "{n} {} layer{s} {was} left out — {} settings could not be read or fall outside \
+             the ranges Aurora's {} allows.",
+            kind.label(),
+            if one { "its" } else { "their" },
+            kind.label(),
+        ),
+        Note::Grayscale(kind) => format!(
+            "{n} {} layer{s} in this Grayscale file {was} left out — Aurora hasn't yet \
+             verified how Photoshop applies {} to a Grayscale image.",
+            kind.label(),
+            kind.label(),
+        ),
+        Note::PhotoFilterColour => format!(
+            "{n} Photo Filter layer{s} {was} left out — {} colour is not stored as Lab (the \
+             only form Aurora has checked against Photoshop's own files).",
+            if one { "its" } else { "their" },
         ),
         Note::FillSkipped => format!(
             "{n} shape or fill layer{s} (solid colour, gradient or pattern) with no stored \
@@ -1375,6 +1405,9 @@ struct Record {
     levels: Option<Result<LevlBlock, ()>>,
     /// The last `hue2` block, parsed (0.203.0).
     hue_saturation: Option<Result<HueBlock, ()>>,
+    /// The last `vibA`, `expA`, `phfl`, `blwh` or `blnc` block, parsed
+    /// (0.241.0).
+    other_adjustment: Option<read_adjust::Parsed>,
     /// The effects blocks to read (0.180.0), as `(priority, bytes)`:
     /// `lmfx` (0), `lfx2` (1), `lfxs` (2). Tried in that order; the first
     /// that reads wins, so a damaged `lmfx` falls back to `lfx2`.
@@ -1517,6 +1550,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let mut curves = None;
     let mut levels = None;
     let mut hue_saturation = None;
+    let mut other_adjustment = None;
     let mut effects_blocks: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut smart_blocks: Vec<aurora_doc::SmartObjectBlock> = Vec::new();
     let mut smart_filters = false;
@@ -1578,6 +1612,8 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
             b"levl" => levels = Some(parse_levl(data)),
             // Likewise Hue/Saturation (0.203.0).
             b"hue2" => hue_saturation = Some(parse_hue2(data)),
+            // Likewise the five of 0.241.0.
+            k if read_adjust::is_key(k) => other_adjustment = read_adjust::parse_block(k, data),
             k if ADJUSTMENT_KEYS.contains(&k) => features.adjustment = true,
             _ => {}
         }
@@ -1602,6 +1638,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
         curves,
         levels,
         hue_saturation,
+        other_adjustment,
         effects_blocks,
         effects: None,
         smart_blocks,
@@ -3370,6 +3407,20 @@ fn hue_saturation_node(
         Ok(block) => hue_saturation_adjustment(block, header.gray()),
         Err(()) => Err(Note::HueSaturationUnreadable),
     };
+    adjustment_node(src, record, header, params, notes, vector_budget)
+}
+
+/// A record whose adjustment is `params` (or the reason it is left out,
+/// reported) as an adjustment node: no pixels, so the mask region is the
+/// canvas, as for a group; effects are dropped.
+fn adjustment_node(
+    src: &mut dyn ByteSource,
+    record: &Record,
+    header: Header,
+    params: Result<aurora_doc::Adjustment, Note>,
+    notes: &mut Notes,
+    vector_budget: &mut vector::Budget,
+) -> Option<PsdNode> {
     let params = match params {
         Ok(params) => params,
         Err(note) => {
@@ -3448,10 +3499,17 @@ fn layer_node(
     if let (Some(hue), false) = (&record.hue_saturation, record.features.adjustment) {
         return hue_saturation_node(src, record, header, hue, notes, vector_budget);
     }
+    if let (Some(parsed), false) = (&record.other_adjustment, record.features.adjustment) {
+        // Vibrance, Exposure, Photo Filter, Black & White, Color Balance
+        // (0.241.0).
+        let params = read_adjust::adjustment(parsed, header.gray());
+        return adjustment_node(src, record, header, params, notes, vector_budget);
+    }
     if record.features.adjustment
         || record.curves.is_some()
         || record.levels.is_some()
         || record.hue_saturation.is_some()
+        || record.other_adjustment.is_some()
     {
         notes.add(Note::AdjustmentSkipped);
         return None;

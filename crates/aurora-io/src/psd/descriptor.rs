@@ -403,3 +403,21 @@ pub(super) fn parse_effects_block(
     }
     descriptor_body(&mut c, 0, budget)
 }
+
+/// Parses a `vibA` or `blwh` block (0.241.0): a `u32` descriptor version
+/// of `16` and the descriptor, with no object-version `u32` in front
+/// (unlike [`parse_effects_block`]).
+///
+/// # Errors
+///
+/// A [`DescriptorError`] for truncated, over-budget or unknown data.
+pub(super) fn parse_adjustment_block(
+    data: &[u8],
+    budget: &mut ItemBudget,
+) -> Result<Descriptor, DescriptorError> {
+    let mut c = Cursor { data, pos: 0 };
+    if c.u32()? != 16 {
+        return Err(DescriptorError::UnknownVersion);
+    }
+    descriptor_body(&mut c, 0, budget)
+}
