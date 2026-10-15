@@ -194,10 +194,7 @@ fn parse_vibrance(data: &[u8]) -> Result<VibranceBlock, ()> {
 
 /// A parsed block as Aurora's Vibrance. A Grayscale file's layers are not
 /// imported (as for Curves: nothing verified how Photoshop applies them).
-pub(super) fn vibrance_adjustment(
-    block: &VibranceBlock,
-    gray: bool,
-) -> Result<Adjustment, Note> {
+pub(super) fn vibrance_adjustment(block: &VibranceBlock, gray: bool) -> Result<Adjustment, Note> {
     if gray {
         return Err(Note::Grayscale(Kind::Vibrance));
     }

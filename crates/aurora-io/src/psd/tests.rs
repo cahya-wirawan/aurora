@@ -4799,7 +4799,7 @@ fn curves_reporting_covers_pass_through_other_kinds_grayscale_and_refusals() {
             curves_file(&curv_rgb_block(), |l| {
                 l.blocks = vec![(*b"brit", vec![0; 4])];
             }),
-            "1 adjustment layer (Brightness/Contrast, Color Balance and similar) was left out",
+            "1 adjustment layer (Brightness/Contrast, Channel Mixer and similar) was left out",
         ),
         (
             "curv and brit",

@@ -10,7 +10,8 @@
 //! # Adjustment layers (0.205.0)
 //!
 //! Curves, Levels and Hue/Saturation layers (including the per-colour-range
-//! variant) are written as adjustment records — see `write_adjust` for the
+//! variant), and since 0.241.0 Vibrance, Exposure, Photo Filter, Black &
+//! White and Color Balance layers (`vibA`, `expA`, `phfl`, `blwh`, `blnc`), are written as adjustment records — see `write_adjust` for the
 //! block layouts. The record has an empty rectangle and four empty colour
 //! channels like a group's records, a user mask and the usual properties
 //! (name, opacity, fill, blend mode, visibility, locks, clipping), and the
@@ -286,8 +287,9 @@ struct Losses {
     /// Layers carrying effects (0.180.0): no `lfx2` is written yet.
     effects: usize,
     /// Adjustment layers with values rounded to the file's resolution
-    /// (0.205.0): Curves, Levels, Hue/Saturation.
-    adjustment_rounded: [usize; 3],
+    /// (0.205.0): Curves, Levels, Hue/Saturation; and since 0.241.0 Vibrance,
+    /// Exposure, Photo Filter, Black & White, Color Balance (slots 3..=7).
+    adjustment_rounded: [usize; 8],
     /// Curves layers with points merged on the same 8-bit level.
     curve_merged: usize,
     /// Hue/Saturation layers with custom edges on a neutral range.
@@ -314,12 +316,11 @@ impl Losses {
             aurora_doc::Adjustment::Levels(_) => 1,
             aurora_doc::Adjustment::HueSaturation(_)
             | aurora_doc::Adjustment::HueSaturationRanges(_) => 2,
-            // Never encoded (the save is refused first, 0.239.0, 0.240.0).
-            aurora_doc::Adjustment::Vibrance(_)
-            | aurora_doc::Adjustment::Exposure(_)
-            | aurora_doc::Adjustment::PhotoFilter(_)
-            | aurora_doc::Adjustment::BlackWhite(_)
-            | aurora_doc::Adjustment::ColorBalance(_) => return,
+            aurora_doc::Adjustment::Vibrance(_) => 3,
+            aurora_doc::Adjustment::Exposure(_) => 4,
+            aurora_doc::Adjustment::PhotoFilter(_) => 5,
+            aurora_doc::Adjustment::BlackWhite(_) => 6,
+            aurora_doc::Adjustment::ColorBalance(_) => 7,
         };
         if rounding.rounded
             && let Some(count) = self.adjustment_rounded.get_mut(slot)
@@ -428,7 +429,16 @@ impl Losses {
                 )
             ));
         }
-        let [curves, levels, hue] = self.adjustment_rounded;
+        let [
+            curves,
+            levels,
+            hue,
+            vibrance,
+            exposure,
+            photo_filter,
+            black_white,
+            color_balance,
+        ] = self.adjustment_rounded;
         if curves > 0 {
             items.push(format!(
                 "{} point positions will be rounded to Photoshop's 255 levels.",
@@ -456,6 +466,43 @@ impl Losses {
                     "Hue/Saturation layers'"
                 )
             ));
+        }
+        for (n, one, many, what) in [
+            (
+                vibrance,
+                "Vibrance layer's",
+                "Vibrance layers'",
+                "fractional values will be rounded to whole numbers.",
+            ),
+            (
+                exposure,
+                "Exposure layer's",
+                "Exposure layers'",
+                "values will be rounded.",
+            ),
+            (
+                photo_filter,
+                "Photo Filter layer's",
+                "Photo Filter layers'",
+                "density will be rounded to a whole percent and its colour to hundredths of a \
+                 Lab unit.",
+            ),
+            (
+                black_white,
+                "Black & White layer's",
+                "Black & White layers'",
+                "fractional slider values will be rounded to whole numbers.",
+            ),
+            (
+                color_balance,
+                "Color Balance layer's",
+                "Color Balance layers'",
+                "fractional values will be rounded to whole numbers.",
+            ),
+        ] {
+            if n > 0 {
+                items.push(format!("{} {what}", plural(n as u64, one, many)));
+            }
         }
         if self.hue_ranges_reset > 0 {
             items.push(format!(
@@ -668,7 +715,7 @@ impl ByteHash {
 /// back (0.205.0).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PsdExpectedAdjustment {
-    /// `curv`, `levl` or `hue2`.
+    /// `curv`, `levl`, `hue2`, `vibA`, `expA`, `phfl`, `blwh` or `blnc`.
     pub key: [u8; 4],
     /// The block's data as written, zero-padded to a multiple of four.
     pub data: Vec<u8>,

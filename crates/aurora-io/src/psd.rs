@@ -130,12 +130,12 @@ use crate::image::Image;
 
 mod descriptor;
 mod effects;
+#[cfg(test)]
+mod effects_tests;
 mod lab;
 mod read_adjust;
 #[cfg(test)]
 mod read_adjust_tests;
-#[cfg(test)]
-mod effects_tests;
 mod smart;
 #[cfg(test)]
 mod smart_tests;

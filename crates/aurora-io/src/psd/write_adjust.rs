@@ -479,7 +479,10 @@ fn encode_exposure(params: &aurora_core::ExposureParams) -> Vec<u8> {
     data
 }
 
-fn encode_photo_filter(params: &aurora_core::PhotoFilterParams, rounding: &mut Rounding) -> Vec<u8> {
+fn encode_photo_filter(
+    params: &aurora_core::PhotoFilterParams,
+    rounding: &mut Rounding,
+) -> Vec<u8> {
     let (l, a, b) = read_adjust::photo_filter_components(params.colour());
     let mut data = Vec::with_capacity(20);
     push_u16(&mut data, 2);
@@ -522,16 +525,9 @@ const TINT_TOLERANCE: f32 = 0.01;
 
 fn encode_black_white(params: &aurora_core::BlackWhiteParams, rounding: &mut Rounding) -> Vec<u8> {
     let mut data = descriptor_start(10);
-    for (key, weight) in [
-        &b"Rd  "[..],
-        b"Yllw",
-        b"Grn ",
-        b"Cyn ",
-        b"Bl  ",
-        b"Mgnt",
-    ]
-    .into_iter()
-    .zip(params.weights())
+    for (key, weight) in [&b"Rd  "[..], b"Yllw", b"Grn ", b"Cyn ", b"Bl  ", b"Mgnt"]
+        .into_iter()
+        .zip(params.weights())
     {
         push_long(&mut data, key, long_of(rounding, weight));
     }

@@ -97,7 +97,11 @@ pub(super) fn lab_to_srgb(l: f64, a: f64, b: f64) -> [f32; 3] {
     let xyz = [f_inverse(fx) * wx, f_inverse(fy) * wy, f_inverse(fz) * wz];
     let linear = mul(&FROM_XYZ, xyz);
     let out = linear.map(|c| {
-        let c = if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 };
+        let c = if c.is_finite() {
+            c.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         #[allow(clippy::cast_possible_truncation)] // 0..=1
         {
             encode(c) as f32

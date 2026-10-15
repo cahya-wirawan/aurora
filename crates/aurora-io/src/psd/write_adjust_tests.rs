@@ -550,58 +550,6 @@ fn a_curve_that_collapses_to_one_level_is_refused_with_its_reason() {
     );
 }
 
-/// 0.239.0: Vibrance, Exposure and Photo Filter layers have no PSD block
-/// yet, so a PSD save is refused by name (never dropped or flattened), and
-/// the refusal names the layer, the kind and the way out.
-#[test]
-fn vibrance_exposure_photo_filter_black_white_and_color_balance_layers_refuse_a_psd_save_by_name() {
-    let cases: [(Adjustment, &str); 5] = [
-        (
-            Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
-            "Black & White",
-        ),
-        (
-            Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
-            "Color Balance",
-        ),
-        (
-            Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
-            "Vibrance",
-        ),
-        (
-            Adjustment::Exposure(aurora_core::ExposureParams::identity()),
-            "Exposure",
-        ),
-        (
-            Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
-            "Photo Filter",
-        ),
-    ];
-    for (adjustment, kind) in cases {
-        let mut tree = LayerTree::new();
-        ok(tree.add_pixel_layer("A", rect(0, 0, 4, 4), None));
-        ok(tree.add_adjustment_layer_at("My layer", adjustment, None, 0));
-        let Err(refusal) = psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()) else {
-            unreachable!("{kind} must refuse")
-        };
-        assert!(
-            matches!(
-                refusal,
-                PsdSaveRefusal::AdjustmentNotRepresentable { kind: k, .. } if k == kind
-            ),
-            "{refusal:?}"
-        );
-        let text = refusal.to_string();
-        assert!(
-            text.contains("My layer")
-                && text.contains(kind)
-                && text.contains(&format!("can't write {kind} layers to .psd yet"))
-                && text.contains(".aur"),
-            "{text}"
-        );
-    }
-}
-
 /// And a document without them still saves: the refusal is per layer.
 #[test]
 fn a_document_with_only_older_adjustments_still_preflights() {
@@ -826,4 +774,578 @@ fn colorize_with_range_adjustments_is_reported_as_not_kept_on_reopen() {
     // Yellows' record: edges 15 45 75 105 then hue 20, saturation -10.
     let tail = [0, 15, 0, 45, 0, 75, 0, 105, 0, 20, 255, 246];
     assert!(encoded.data.windows(tail.len()).any(|w| w == tail));
+}
+
+// ---------------------------------------------------------------------
+// Vibrance, Exposure, Photo Filter, Black & White, Color Balance (0.241.0)
+// ---------------------------------------------------------------------
+
+use super::read_adjust_tests::{
+    BLNC_CLIP, BLNC_FILL, BLWH, EXPA_FILL, EXPA_NEUTRAL, EXPA_RGB, PHFL, VIBA_FILL, VIBA_NEUTRAL,
+};
+use aurora_core::{
+    BlackWhiteParams, ColorBalanceParams, ExposureParams, PhotoFilterParams, VibranceParams,
+};
+
+fn encoded(adjustment: &Adjustment) -> super::write_adjust::EncodedAdjustment {
+    match encode_adjustment(adjustment) {
+        Ok(e) => e,
+        Err(reason) => unreachable!("{adjustment:?}: {reason}"),
+    }
+}
+
+/// `data` is `hex` (Photoshop's block, padded as Photoshop pads it).
+fn assert_photoshop_block(adjustment: &Adjustment, key: &[u8; 4], hex: &str) {
+    let e = encoded(adjustment);
+    assert_eq!(e.key, *key);
+    let want = unhex(hex);
+    assert_eq!(e.data, want, "{adjustment:?}");
+    assert!(!e.rounding.rounded, "{adjustment:?}");
+}
+
+#[test]
+fn the_writer_reproduces_photoshops_own_blocks_for_vibrance_exposure_and_color_balance() {
+    let vibrance = |v, s| Adjustment::Vibrance(ok(VibranceParams::new(v, s)));
+    assert_photoshop_block(&vibrance(-6.0, 2.0), b"vibA", VIBA_FILL);
+    // Both sliders at 0: Photoshop's empty descriptor, no keys.
+    assert_photoshop_block(&vibrance(0.0, 0.0), b"vibA", VIBA_NEUTRAL);
+    let exposure = |e: u32, o: u32, g: u32| {
+        Adjustment::Exposure(ok(ExposureParams::new(
+            f32::from_bits(e),
+            f32::from_bits(o),
+            f32::from_bits(g),
+        )))
+    };
+    assert_photoshop_block(
+        &exposure(0xbec7_ae14, 0x3c89_a027, 0x3f68_f5c3),
+        b"expA",
+        EXPA_FILL,
+    );
+    assert_photoshop_block(&exposure(0, 0, 0x3f80_0000), b"expA", EXPA_NEUTRAL);
+    for (hex, bits) in EXPA_RGB.iter().zip([
+        (0x4001_eb85, 0x3d9e_b852, 0x3fc2_8f5c),
+        (0xbd23_d70a, 0x3ed4_2c3d, 0x3ee1_47ae),
+        (0x3fa0_0000, 0, 0x3fc2_8f5c),
+        (0xbfe8_f5c3, 0x3df6_5fd9, 0x3f80_0000),
+    ]) {
+        assert_photoshop_block(&exposure(bits.0, bits.1, bits.2), b"expA", hex);
+    }
+    let balance = |v: [f32; 9], lum: bool| {
+        let r = [[v[0], v[1], v[2]], [v[3], v[4], v[5]], [v[6], v[7], v[8]]];
+        Adjustment::ColorBalance(ok(ColorBalanceParams::new(r, lum)))
+    };
+    assert_photoshop_block(
+        &balance([-4.0, 2.0, -5.0, 10.0, 4.0, -9.0, 1.0, -9.0, -3.0], true),
+        b"blnc",
+        BLNC_FILL,
+    );
+    assert_photoshop_block(
+        &balance([0.0, 0.0, 0.0, 28.0, 100.0, 53.0, 0.0, 0.0, 0.0], true),
+        b"blnc",
+        BLNC_CLIP,
+    );
+}
+
+/// The Black & White block is Photoshop's byte for byte but for the three
+/// tint-colour doubles, which come from the tint hue and saturation.
+#[test]
+fn the_black_and_white_block_is_photoshops_but_for_the_tint_colour() {
+    let params = ok(BlackWhiteParams::new(
+        aurora_core::BLACK_WHITE_DEFAULTS,
+        false,
+        200.0,
+        60.0,
+    ));
+    let e = encoded(&Adjustment::BlackWhite(params));
+    assert_eq!(e.key, *b"blwh");
+    assert!(!e.rounding.rounded);
+    let mut want = unhex(BLWH);
+    let at = want
+        .windows(4)
+        .position(|w| w == b"RGBC")
+        .unwrap_or_else(|| unreachable!("RGBC"));
+    let rgb = super::read_adjust::tint_rgb(200.0, 60.0);
+    for (i, v) in rgb.iter().enumerate() {
+        // After "RGBC" and the u32 count: per item a zero key length, the
+        // four-character key, "doub", then the value.
+        let value = at + 4 + 4 + i * 20 + 12;
+        want.splice(value..value + 8, v.to_be_bytes());
+    }
+    assert_eq!(e.data, want);
+    // Tint on only flips the bool byte (right after "useTint" + "bool").
+    let on = encoded(&Adjustment::BlackWhite(params.with_tint(true)));
+    let flag = want
+        .windows(11)
+        .position(|w| w == b"useTintbool")
+        .unwrap_or_else(|| unreachable!("useTint"))
+        + 11;
+    let mut want_on = want;
+    want_on[flag] = 1;
+    assert_eq!(on.data, want_on);
+    assert_eq!(on.data.len() % 4, 0);
+}
+
+/// The Photo Filter block has Photoshop's structure; the Lab components
+/// are the colour's own, in-gamut (Photoshop's preset stores an
+/// out-of-gamut Lab for the same sRGB colour, so the bytes differ there by
+/// design).
+#[test]
+fn the_photo_filter_block_has_photoshops_layout_and_the_colours_own_lab() {
+    let warming = ok(PhotoFilterParams::new(
+        [236.0 / 255.0, 138.0 / 255.0, 0.0],
+        25.0,
+        true,
+    ));
+    let e = encoded(&Adjustment::PhotoFilter(warming));
+    let photoshop = unhex(PHFL);
+    assert_eq!(e.key, *b"phfl");
+    assert_eq!(e.data.len(), photoshop.len());
+    // Version 2, colour space 7 (Lab), the zero fourth component, density
+    // 25 (u32), preserve luminosity, padding: all Photoshop's.
+    assert_eq!(e.data.get(..4), photoshop.get(..4));
+    assert_eq!(e.data.get(10..), photoshop.get(10..));
+    let comp = |i: usize| {
+        e.data
+            .get(4 + 2 * i..6 + 2 * i)
+            .and_then(|b| <[u8; 2]>::try_from(b).ok())
+            .map_or(0, i16::from_be_bytes)
+    };
+    // sRGB (236, 138, 0) in D50 Lab: L 67.19, a 33.14, b 72.79.
+    assert!((f64::from(comp(0)) - 6719.0).abs() <= 2.0, "{}", comp(0));
+    assert!((f64::from(comp(1)) - 3314.0).abs() <= 3.0, "{}", comp(1));
+    assert!((f64::from(comp(2)) - 7279.0).abs() <= 3.0, "{}", comp(2));
+    // And it reads back as the same colour within a third of a level.
+    assert!(!e.rounding.rounded);
+    let Adjustment::PhotoFilter(back) = e.readback else {
+        unreachable!("photo filter")
+    };
+    for (a, b) in back.colour().iter().zip(warming.colour()) {
+        assert!((a - b).abs() < 1.0 / 765.0, "{a} {b}");
+    }
+    assert_eq!((back.density(), back.preserve_luminosity()), (25.0, true));
+}
+
+/// What Photoshop wrote reads, is written, and reads back identically, for
+/// every real block of the five kinds.
+#[test]
+fn photoshops_blocks_survive_read_write_read() {
+    for (key, hex) in [
+        (b"vibA", VIBA_FILL),
+        (b"vibA", VIBA_NEUTRAL),
+        (b"expA", EXPA_FILL),
+        (b"expA", EXPA_RGB[0]),
+        (b"expA", EXPA_RGB[1]),
+        (b"phfl", PHFL),
+        (b"blwh", BLWH),
+        (b"blnc", BLNC_FILL),
+        (b"blnc", BLNC_CLIP),
+    ] {
+        let Some(parsed) = super::read_adjust::parse_block(key, &unhex(hex)) else {
+            unreachable!()
+        };
+        let Ok(first) = super::read_adjust::adjustment(&parsed, false) else {
+            unreachable!("{key:?} reads")
+        };
+        let e = encoded(&first);
+        // The colour of a Photo Filter and the tint of a Black & White
+        // come back within their own tolerance; everything else exactly.
+        match (&first, &e.readback) {
+            (Adjustment::PhotoFilter(a), Adjustment::PhotoFilter(b)) => {
+                for (x, y) in a.colour().iter().zip(b.colour()) {
+                    assert!((x - y).abs() < 1.0 / 765.0);
+                }
+                assert_eq!(
+                    (a.density(), a.preserve_luminosity()),
+                    (b.density(), b.preserve_luminosity())
+                );
+            }
+            (Adjustment::BlackWhite(a), Adjustment::BlackWhite(b)) => {
+                assert_eq!((a.weights(), a.tint()), (b.weights(), b.tint()));
+                assert!((a.tint_saturation() - b.tint_saturation()).abs() < 0.01);
+                assert!((a.tint_hue() - b.tint_hue()).abs() < 0.01);
+            }
+            (a, b) => assert_eq!(a, b, "{key:?}"),
+        }
+        assert_eq!(e.data.len() % 4, 0, "{key:?}");
+    }
+}
+
+#[test]
+fn extreme_values_of_the_five_kinds_read_back_as_themselves() {
+    let originals = [
+        Adjustment::Vibrance(ok(VibranceParams::new(-100.0, 100.0))),
+        Adjustment::Vibrance(ok(VibranceParams::new(100.0, -100.0))),
+        Adjustment::Exposure(ok(ExposureParams::new(-20.0, -0.5, 0.1))),
+        Adjustment::Exposure(ok(ExposureParams::new(20.0, 0.5, 9.99))),
+        Adjustment::ColorBalance(ok(ColorBalanceParams::new(
+            [[-100.0, 100.0, -100.0], [100.0; 3], [-100.0; 3]],
+            false,
+        ))),
+        Adjustment::BlackWhite(ok(BlackWhiteParams::new(
+            [-200.0, 300.0, -200.0, 300.0, 0.0, 1.0],
+            true,
+            0.0,
+            100.0,
+        ))),
+        Adjustment::PhotoFilter(ok(PhotoFilterParams::new([0.0; 3], 1.0, false))),
+        Adjustment::PhotoFilter(ok(PhotoFilterParams::new([1.0; 3], 100.0, true))),
+        Adjustment::PhotoFilter(ok(PhotoFilterParams::new([0.0, 0.0, 1.0], 50.0, true))),
+    ];
+    for original in originals {
+        let e = encoded(&original);
+        assert_eq!(e.data.len() % 4, 0, "{original:?}");
+        assert!(!e.rounding.rounded, "{original:?}");
+        match (&original, &e.readback) {
+            (Adjustment::PhotoFilter(a), Adjustment::PhotoFilter(b)) => {
+                for (x, y) in a.colour().iter().zip(b.colour()) {
+                    assert!((x - y).abs() < 1.0 / 765.0, "{a:?} {b:?}");
+                }
+            }
+            (Adjustment::BlackWhite(a), Adjustment::BlackWhite(b)) => {
+                assert_eq!((a.weights(), a.tint()), (b.weights(), b.tint()));
+                assert!((a.tint_saturation() - b.tint_saturation()).abs() < 0.01);
+            }
+            (a, b) => assert_eq!(a, b),
+        }
+    }
+}
+
+#[test]
+fn values_finer_than_the_file_are_rounded_and_itemised() {
+    let mut doc = Doc::new((8, 8));
+    doc.layer("Background", rect(0, 0, 8, 8), None);
+    let add = |doc: &mut Doc, name: &str, a: Adjustment| {
+        ok(doc.tree.add_adjustment_layer_at(name, a, None, 0));
+    };
+    add(
+        &mut doc,
+        "V",
+        Adjustment::Vibrance(ok(VibranceParams::new(10.4, -20.6))),
+    );
+    add(
+        &mut doc,
+        "E",
+        Adjustment::Exposure(ok(ExposureParams::new(1.234_567, 0.012_345, 1.789_01))),
+    );
+    add(
+        &mut doc,
+        "P",
+        Adjustment::PhotoFilter(ok(PhotoFilterParams::new([0.9, 0.5, 0.1], 33.4, true))),
+    );
+    add(
+        &mut doc,
+        "B",
+        Adjustment::BlackWhite(ok(BlackWhiteParams::new(
+            [40.4, 60.0, 40.0, 60.0, 20.0, 80.6],
+            false,
+            35.0,
+            25.0,
+        ))),
+    );
+    add(
+        &mut doc,
+        "C",
+        Adjustment::ColorBalance(ok(ColorBalanceParams::new(
+            [[1.5, 0.0, 0.0], [0.0; 3], [0.0; 3]],
+            true,
+        ))),
+    );
+    let report = ok(psd_save_preflight(
+        &doc.tree,
+        (8, 8),
+        PsdSaveOptions::default(),
+    ));
+    let text = report.items.join("\n");
+    assert!(
+        text.contains("1 Vibrance layer's fractional values will be rounded"),
+        "{text}"
+    );
+    assert!(
+        text.contains("1 Photo Filter layer's density will be rounded"),
+        "{text}"
+    );
+    assert!(
+        text.contains("1 Black & White layer's fractional slider values"),
+        "{text}"
+    );
+    assert!(
+        text.contains("1 Color Balance layer's fractional values"),
+        "{text}"
+    );
+    // Exposure is f32 in the file: nothing to report for it.
+    assert!(!text.contains("Exposure"), "{text}");
+    let (bytes, outcome) = ok(doc.write());
+    assert_eq!(outcome.report, report);
+    let back = read_back(&bytes);
+    let Some(Adjustment::Vibrance(v)) = adjustment_named(&back.layers, "V") else {
+        unreachable!()
+    };
+    assert_eq!((v.vibrance(), v.saturation()), (10.0, -21.0));
+    let Some(Adjustment::PhotoFilter(p)) = adjustment_named(&back.layers, "P") else {
+        unreachable!()
+    };
+    assert_eq!(p.density(), 33.0);
+    let Some(Adjustment::BlackWhite(b)) = adjustment_named(&back.layers, "B") else {
+        unreachable!()
+    };
+    assert_eq!(b.weights(), [40.0, 60.0, 40.0, 60.0, 20.0, 81.0]);
+    let Some(Adjustment::ColorBalance(c)) = adjustment_named(&back.layers, "C") else {
+        unreachable!()
+    };
+    assert_eq!(
+        c.ranges()[0],
+        [2.0, 0.0, 0.0],
+        "1.5 rounds half away from zero"
+    );
+    let Some(Adjustment::Exposure(e)) = adjustment_named(&back.layers, "E") else {
+        unreachable!()
+    };
+    assert_eq!(e.exposure().to_bits(), 1.234_567_f32.to_bits());
+}
+
+/// Exact values report nothing (a lossless save stays lossless).
+#[test]
+fn exact_values_of_the_five_kinds_are_a_lossless_save() {
+    let mut tree = LayerTree::new();
+    ok(tree.add_pixel_layer("A", rect(0, 0, 4, 4), None));
+    for (name, a) in [
+        (
+            "V",
+            Adjustment::Vibrance(ok(VibranceParams::new(10.0, -20.0))),
+        ),
+        ("E", Adjustment::Exposure(ExposureParams::identity())),
+        (
+            "P",
+            Adjustment::PhotoFilter(PhotoFilterParams::warming_85()),
+        ),
+        ("B", Adjustment::BlackWhite(BlackWhiteParams::default())),
+        (
+            "C",
+            Adjustment::ColorBalance(ColorBalanceParams::identity()),
+        ),
+    ] {
+        ok(tree.add_adjustment_layer_at(name, a, None, 0));
+    }
+    let report = ok(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()));
+    assert!(report.items.is_empty(), "{:?}", report.items);
+}
+
+fn five_doc() -> Doc {
+    let mut doc = Doc::new((16, 16));
+    doc.layer("Background", rect(0, 0, 16, 16), None);
+    let vibrance = ok(doc.tree.add_adjustment_layer_at(
+        "Vibrance A",
+        Adjustment::Vibrance(ok(VibranceParams::new(-6.0, 2.0))),
+        None,
+        0,
+    ));
+    ok(doc.tree.set_opacity(vibrance, 128.0 / 255.0));
+    ok(doc.tree.set_blend_mode(vibrance, BlendMode::Multiply));
+    doc.mask(vibrance, rect(2, 2, 10, 10), (0, 0, 10, 10), |x, y| {
+        f32::from(u16::try_from((x * 20 + y) % 255).unwrap_or(0)) / 255.0
+    });
+    let group = doc.group("Group", None);
+    doc.layer_in("Base", rect(0, 0, 16, 16), None, Some(group));
+    let clipped = ok(doc.tree.add_adjustment_layer_at(
+        "Balance clipped",
+        Adjustment::ColorBalance(ok(ColorBalanceParams::new(
+            [[-4.0, 2.0, -5.0], [10.0, 4.0, -9.0], [1.0, -9.0, -3.0]],
+            true,
+        ))),
+        Some(group),
+        0,
+    ));
+    ok(doc.tree.set_clipped(clipped, true));
+    ok(doc.tree.add_adjustment_layer_at(
+        "Exposure in group",
+        Adjustment::Exposure(ok(ExposureParams::new(2.03, 0.0775, 1.52))),
+        Some(group),
+        0,
+    ));
+    ok(doc.tree.add_adjustment_layer_at(
+        "Filter",
+        Adjustment::PhotoFilter(PhotoFilterParams::warming_85()),
+        None,
+        0,
+    ));
+    let bw = ok(doc.tree.add_adjustment_layer_at(
+        "Mono",
+        Adjustment::BlackWhite(ok(BlackWhiteParams::new(
+            [10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+            true,
+            200.0,
+            40.0,
+        ))),
+        None,
+        0,
+    ));
+    ok(doc.tree.set_visible(bw, false));
+    doc
+}
+
+#[test]
+fn the_five_kinds_round_trip_through_write_verify_and_read() {
+    let mut doc = five_doc();
+    let dir = ok(tempfile::tempdir());
+    let target = dir.path().join("five.psd");
+    let outcome = ok(save(&mut doc, &target, false));
+    assert!(outcome.report.is_empty(), "{:?}", outcome.report);
+    let back = read_back(&ok(std::fs::read(&target)));
+    assert!(back.report.items.is_empty(), "{:?}", back.report.items);
+    assert_eq!(
+        shape(&back.layers, back.layers.roots()),
+        shape(&doc.tree, doc.tree.roots())
+    );
+    for name in [
+        "Vibrance A",
+        "Balance clipped",
+        "Exposure in group",
+        "Filter",
+        "Mono",
+    ] {
+        let (want, got) = (id_named(&doc.tree, name), id_named(&back.layers, name));
+        let (a, b) = (
+            adjustment_named(&doc.tree, name),
+            adjustment_named(&back.layers, name),
+        );
+        match (a, b) {
+            (Some(Adjustment::PhotoFilter(a)), Some(Adjustment::PhotoFilter(b))) => {
+                for (x, y) in a.colour().iter().zip(b.colour()) {
+                    assert!((x - y).abs() < 1.0 / 765.0);
+                }
+            }
+            (Some(Adjustment::BlackWhite(a)), Some(Adjustment::BlackWhite(b))) => {
+                assert_eq!((a.weights(), a.tint()), (b.weights(), b.tint()));
+                assert!((a.tint_hue() - b.tint_hue()).abs() < 0.01);
+                assert!((a.tint_saturation() - b.tint_saturation()).abs() < 0.01);
+            }
+            (a, b) => assert_eq!(a, b, "{name}"),
+        }
+        assert_eq!(back.layers.opacity(got), doc.tree.opacity(want), "{name}");
+        assert_eq!(
+            back.layers.blend_mode(got),
+            doc.tree.blend_mode(want),
+            "{name}"
+        );
+        assert_eq!(back.layers.visible(got), doc.tree.visible(want), "{name}");
+        assert_eq!(
+            back.layers.clip_base(got).is_some(),
+            doc.tree.clip_base(want).is_some(),
+            "{name}"
+        );
+        assert_eq!(
+            back.layers.mask(got).map(|m| m.bounds),
+            doc.tree.mask(want).map(|m| m.bounds),
+            "{name}"
+        );
+    }
+}
+
+/// Each record has an empty rectangle and the key's block is the first
+/// tagged block, before `luni`.
+#[test]
+fn the_five_records_have_empty_rectangles_and_their_block_first() {
+    let mut doc = five_doc();
+    let (bytes, _) = ok(doc.write());
+    let recs = records(&bytes);
+    for name in [
+        "Vibrance A",
+        "Balance clipped",
+        "Exposure in group",
+        "Filter",
+        "Mono",
+    ] {
+        let rec = recs
+            .iter()
+            .find(|r| r.4 == name)
+            .unwrap_or_else(|| unreachable!("{name}"));
+        assert_eq!(rec.1, [0; 4], "{name}");
+    }
+    for key in [&b"vibA"[..], b"expA", b"phfl", b"blwh", b"blnc"] {
+        let mut needle = b"8BIM".to_vec();
+        needle.extend_from_slice(key);
+        let Some(at) = bytes.windows(8).position(|w| w == needle.as_slice()) else {
+            unreachable!("{key:?} block")
+        };
+        let len = be32_at(&bytes, at + 8);
+        assert_eq!(
+            bytes.get(at + 12 + len..at + 12 + len + 8),
+            Some(&b"8BIMluni"[..]),
+            "luni follows the {key:?} block directly"
+        );
+    }
+}
+
+/// The verifier compares the five kinds' bytes and read-back too.
+#[test]
+fn the_verifier_catches_a_wrong_block_or_readback_for_each_new_kind() {
+    let mut doc = five_doc();
+    let dir = ok(tempfile::tempdir());
+    let path = dir.path().join("five.psd");
+    let (bytes, outcome) = ok(doc.write());
+    ok(std::fs::write(&path, &bytes));
+    ok(super::write::verify_psd_file(&path, &outcome.expected));
+    for key in [b"vibA", b"expA", b"phfl", b"blwh", b"blnc"] {
+        let at = |e: &super::write::PsdExpectation| {
+            e.layers
+                .iter()
+                .position(|l| l.adjustment.as_ref().is_some_and(|a| a.key == *key))
+        };
+        let Some(i) = at(&outcome.expected) else {
+            unreachable!("{key:?}")
+        };
+        let mut wrong_bytes = outcome.expected.clone();
+        if let Some(a) = wrong_bytes
+            .layers
+            .get_mut(i)
+            .and_then(|l| l.adjustment.as_mut())
+            && let Some(byte) = a.data.get_mut(4)
+        {
+            *byte ^= 1;
+        }
+        let err = super::write::verify_psd_file(&path, &wrong_bytes);
+        assert!(
+            matches!(&err, Err(IoError::PsdVerifyFailed { what }) if what.contains("adjustment blocks")),
+            "{key:?}: {err:?}"
+        );
+        let mut wrong_readback = outcome.expected.clone();
+        if let Some(a) = wrong_readback
+            .layers
+            .get_mut(i)
+            .and_then(|l| l.adjustment.as_mut())
+        {
+            a.readback = Adjustment::Exposure(ExposureParams::identity());
+            if *key == *b"expA" {
+                a.readback = Adjustment::Vibrance(VibranceParams::identity());
+            }
+        }
+        let err = super::write::verify_psd_file(&path, &wrong_readback);
+        assert!(
+            matches!(&err, Err(IoError::PsdVerifyFailed { what }) if what.contains("adjustment")),
+            "{key:?}: {err:?}"
+        );
+    }
+}
+
+/// `adjustments5.psd` / `adjustments5.json` for `scripts/verify_psd_write.py
+/// check_adjustments5` (psd-tools).
+///
+/// ```text
+/// AURORA_PSD_FIXTURE_DIR=/tmp/psdw cargo test -p aurora-io --lib \
+///     five_adjustments_fixture_for_psd_tools -- --ignored
+/// ```
+#[test]
+#[ignore = "writes the fixture scripts/verify_psd_write.py reads"]
+fn five_adjustments_fixture_for_psd_tools() {
+    let Ok(out) = std::env::var("AURORA_PSD_FIXTURE_DIR") else {
+        unreachable!("set AURORA_PSD_FIXTURE_DIR");
+    };
+    let out = std::path::Path::new(&out);
+    let mut doc = five_doc();
+    let (bytes, _) = ok(doc.write());
+    ok(std::fs::write(out.join("adjustments5.psd"), &bytes));
+    let json = "{\"vibrance\": [-6, 2], \"exposure\": [2.03, 0.0775, 1.52], \
+        \"balance\": [[-4, 2, -5], [10, 4, -9], [1, -9, -3], 1], \
+        \"bw\": [10, 20, 30, 40, 50, 60], \"bw_tint\": true, \"density\": 25, \"luminosity\": 1}\n";
+    ok(std::fs::write(out.join("adjustments5.json"), json));
 }
