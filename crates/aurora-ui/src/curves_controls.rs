@@ -211,6 +211,9 @@ pub fn insert_curves_controls(
     built
 }
 
+// `CurvesControls` carries the other editors' ids (the adjust editors since
+// 0.239.0); it is `Copy` and these helpers take it by value.
+#[allow(clippy::large_types_passed_by_value)]
 fn set_enabled(
     tree: &mut WidgetTree<WidgetKind>,
     controls: CurvesControls,
@@ -228,6 +231,7 @@ fn set_enabled(
     Ok(changed)
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 fn set_shown(
     tree: &mut WidgetTree<WidgetKind>,
     controls: CurvesControls,
@@ -419,6 +423,7 @@ mod tests {
         (layers, pixel, curves)
     }
 
+    #[allow(clippy::large_types_passed_by_value)]
     fn shown_points(tree: &WidgetTree<WidgetKind>, controls: CurvesControls) -> Vec<CurvePoint> {
         ok(widgets::curve_editor_state(tree, controls.editor))
             .curve()

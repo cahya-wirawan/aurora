@@ -96,7 +96,7 @@ mod tests {
                 for rgb in [[0.1, 0.5, 0.9], [1.5, -0.25, 0.3], [f32::NAN, 0.0, 2.0]] {
                     let out = o.apply(rgb);
                     for (a, b) in out.iter().zip(rgb) {
-                        assert!(a.to_bits() == b.to_bits());
+                        assert_eq!(a.to_bits(), b.to_bits());
                     }
                 }
             }
@@ -109,9 +109,17 @@ mod tests {
         let colour = [0.8, 0.4, 0.0];
         let input = [0.5, 0.5, 0.5];
         // density 50: t = 1 + (c - 1) * 0.5 = [0.9, 0.7, 0.5]
-        assert!(near(op(colour, 50.0, false).apply(input), [0.45, 0.35, 0.25], 1e-6));
+        assert!(near(
+            op(colour, 50.0, false).apply(input),
+            [0.45, 0.35, 0.25],
+            1e-6
+        ));
         // density 100: the pixel times the colour itself.
-        assert!(near(op(colour, 100.0, false).apply(input), [0.4, 0.2, 0.0], 1e-6));
+        assert!(near(
+            op(colour, 100.0, false).apply(input),
+            [0.4, 0.2, 0.0],
+            1e-6
+        ));
         // density 1: almost nothing.
         let faint = op(colour, 1.0, false).apply(input);
         assert!(near(faint, [0.499, 0.497, 0.495], 1e-5), "{faint:?}");
@@ -120,7 +128,12 @@ mod tests {
     #[test]
     fn preserve_luminosity_restores_the_luma_when_nothing_clips() {
         let o = op([0.9, 0.55, 0.0], 60.0, true);
-        for input in [[0.3, 0.4, 0.5], [0.5, 0.5, 0.5], [0.2, 0.3, 0.25], [0.6, 0.5, 0.45]] {
+        for input in [
+            [0.3, 0.4, 0.5],
+            [0.5, 0.5, 0.5],
+            [0.2, 0.3, 0.25],
+            [0.6, 0.5, 0.45],
+        ] {
             let out = o.apply(input);
             assert!(out.iter().all(|c| (0.0..=1.0).contains(c)));
             assert!((luma(out) - luma(input)).abs() < 1e-5, "{input:?} {out:?}");
@@ -160,7 +173,10 @@ mod tests {
 
     #[test]
     fn output_stays_in_gamut_for_wild_input() {
-        for rgb in [[2.0_f32, -1.0, 0.5], [f32::NAN, f32::INFINITY, f32::NEG_INFINITY]] {
+        for rgb in [
+            [2.0_f32, -1.0, 0.5],
+            [f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+        ] {
             for preserve in [false, true] {
                 let out = op([0.0, 0.2, 1.0], 100.0, preserve).apply(rgb);
                 assert!(out.iter().all(|c| (0.0..=1.0).contains(c)), "{out:?}");

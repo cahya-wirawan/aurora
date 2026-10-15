@@ -1159,9 +1159,18 @@ mod vibrance_exposure_photo_filter_wire_tests {
     #[test]
     fn the_new_adjustments_are_ordinals_four_five_six_and_an_old_reader_refuses_them() {
         let cases = [
-            (Adjustment::Vibrance(aurora_core::VibranceParams::identity()), 4_u8),
-            (Adjustment::Exposure(aurora_core::ExposureParams::identity()), 5),
-            (Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()), 6),
+            (
+                Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
+                4_u8,
+            ),
+            (
+                Adjustment::Exposure(aurora_core::ExposureParams::identity()),
+                5,
+            ),
+            (
+                Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+                6,
+            ),
         ];
         for (adjustment, ordinal) in cases {
             let kind = LayerKind::Adjustment(adjustment);
@@ -1183,7 +1192,10 @@ mod vibrance_exposure_photo_filter_wire_tests {
         let v = Adjustment::Vibrance(aurora_core::VibranceParams::identity());
         let e = Adjustment::Exposure(aurora_core::ExposureParams::identity());
         let p = Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default());
-        assert_eq!((v.label(), e.label(), p.label()), ("Vibrance", "Exposure", "Photo Filter"));
+        assert_eq!(
+            (v.label(), e.label(), p.label()),
+            ("Vibrance", "Exposure", "Photo Filter")
+        );
         assert!(v.vibrance().is_some() && v.exposure().is_none() && v.photo_filter().is_none());
         assert!(e.exposure().is_some() && e.vibrance().is_none() && e.photo_filter().is_none());
         assert!(p.photo_filter().is_some() && p.vibrance().is_none() && p.exposure().is_none());

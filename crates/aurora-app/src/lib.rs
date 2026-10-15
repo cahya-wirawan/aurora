@@ -9042,6 +9042,7 @@ struct CurvesHistogramJob {
 /// of a drag already committed (the active layer changed under it, or a
 /// key press ended it) edits nothing until its capture ends.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // one `detached` flag per live-drag editor
 struct CurvesUiState {
     pending: Option<PendingCurves>,
     detached: bool,
@@ -9187,6 +9188,7 @@ fn settle_pending_curves_only(cx: &mut CurvesEdit<'_>, captured: Option<WidgetId
 /// Whether `outcome` belongs to the Curves editor (its channel tab bar
 /// or its curve editor), which `App::apply_tool_control` hands to
 /// [`apply_curves_outcome`] instead of the radius handler.
+#[allow(clippy::large_types_passed_by_value)] // `CurvesControls` is `Copy` and 448 bytes since 0.239.0
 fn is_curves_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutcome) -> bool {
     use aurora_widgets::ActionOutcome as Outcome;
     if is_levels_outcome(controls, outcome)
@@ -9206,6 +9208,7 @@ fn is_curves_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutco
 /// (0.202.0): its channel tab bar or one of its five sliders.
 /// Whether `outcome` is the Hue/Saturation editor's: a slider value or the
 /// Colorize checkbox ([`is_levels_outcome`]'s twin, 0.203.0).
+#[allow(clippy::large_types_passed_by_value)] // `CurvesControls` is `Copy` and 448 bytes since 0.239.0
 fn is_hue_saturation_outcome(
     controls: aurora_ui::CurvesControls,
     outcome: &PointerOutcome,
@@ -9224,6 +9227,7 @@ fn is_hue_saturation_outcome(
     }
 }
 
+#[allow(clippy::large_types_passed_by_value)] // `CurvesControls` is `Copy` and 448 bytes since 0.239.0
 fn hue_saturation_slider_captured(
     controls: Option<aurora_ui::CurvesControls>,
     captured: Option<WidgetId>,
@@ -9368,6 +9372,7 @@ fn apply_hue_saturation_outcome(
     CompositeInvalidation::Everything
 }
 
+#[allow(clippy::large_types_passed_by_value)] // `CurvesControls` is `Copy` and 448 bytes since 0.239.0
 fn is_levels_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutcome) -> bool {
     use aurora_widgets::ActionOutcome as Outcome;
     let Some(levels) = controls.levels else {
@@ -9381,6 +9386,7 @@ fn is_levels_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutco
 }
 
 /// Whether a Levels slider holds the pointer capture.
+#[allow(clippy::large_types_passed_by_value)] // `CurvesControls` is `Copy` and 448 bytes since 0.239.0
 fn levels_slider_captured(
     controls: Option<aurora_ui::CurvesControls>,
     captured: Option<WidgetId>,
@@ -29470,11 +29476,11 @@ impl App {
                 self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::Exposure));
             }
             Some(ActivatedCommand::NewPhotoFilterLayer) => {
-                self.run_layer_command(LayerCommand::NewAdjust(
-                    aurora_ui::AdjustKind::PhotoFilter,
-                ));
+                self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::PhotoFilter));
             }
-            Some(ActivatedCommand::PhotoFilterPreset(index)) => self.apply_photo_filter_preset(index),
+            Some(ActivatedCommand::PhotoFilterPreset(index)) => {
+                self.apply_photo_filter_preset(index);
+            }
             Some(ActivatedCommand::NewGroup) => self.run_layer_command(LayerCommand::NewGroup),
             Some(ActivatedCommand::SetClip(on)) => {
                 self.run_layer_command(LayerCommand::SetClip(on));
@@ -78388,8 +78394,7 @@ mod tests {
                             .any(|entry| entry.id == id && entry.title == title),
                         "{title} is in the palette"
                     );
-                    let mut workspace =
-                        aurora_ui::build_workspace(&crate::test_workspace_scales());
+                    let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
                     let mut focus = FocusManager::default();
                     let mut dialog = FakeFileDialog::default();
                     assert_eq!(
@@ -78400,7 +78405,10 @@ mod tests {
                     let before = rig.layers.roots().to_vec();
                     assert!(rig.run(command));
                     let added = only_new_root(&rig, &before);
-                    assert_eq!(rig.layers.kind(added), Some(&LayerKind::Adjustment(adjustment)));
+                    assert_eq!(
+                        rig.layers.kind(added),
+                        Some(&LayerKind::Adjustment(adjustment))
+                    );
                     assert_eq!(rig.layers.name(added), Some(format!("{stem} 1").as_str()));
                     assert_eq!(rig.active, Some(added));
                     assert!(rig.run(command));
@@ -83272,10 +83280,7 @@ mod tests {
                 None
             );
             assert!(
-                aurora_ui::hue_saturation_controls_shown(
-                    &rig.workspace.tree,
-                    rig.hs_controls()
-                ),
+                aurora_ui::hue_saturation_controls_shown(&rig.workspace.tree, rig.hs_controls()),
                 "and Hue/Saturation still shows for its own layer"
             );
         }
@@ -83287,15 +83292,21 @@ mod tests {
         fn photo_filter_presets_set_the_colour_in_one_step() {
             use aurora_ui::AdjustSlider as S;
             for (i, (name, _)) in aurora_core::PHOTO_FILTER_PRESETS.iter().enumerate() {
-                assert!(crate::palette_commands().iter().any(|entry| entry.id
-                    == crate::adjust_app::preset_command_id(i)
-                    && entry.title == format!("Photo Filter: {name}")));
+                assert!(
+                    crate::palette_commands()
+                        .iter()
+                        .any(|entry| entry.id == crate::adjust_app::preset_command_id(i)
+                            && entry.title == format!("Photo Filter: {name}"))
+                );
                 assert_eq!(
                     crate::adjust_app::preset_for_command(&crate::adjust_app::preset_command_id(i)),
                     Some(i)
                 );
             }
-            assert_eq!(crate::adjust_app::preset_for_command("photo_filter.preset.9"), None);
+            assert_eq!(
+                crate::adjust_app::preset_for_command("photo_filter.preset.9"),
+                None
+            );
             let filter = match aurora_core::PhotoFilterParams::new([0.5; 3], 61.0, false) {
                 Ok(p) => aurora_doc::Adjustment::PhotoFilter(p),
                 Err(err) => unreachable!("{err:?}"),
@@ -83315,8 +83326,14 @@ mod tests {
             );
             assert_eq!(rig.adj_slider(S::Green).0, 109.0, "the editor follows");
             assert_eq!(rig.undo_order.undo.len(), before + 1);
-            assert!(!crate::adjust_app::apply_preset(&mut edit!(rig), 2), "already set");
-            assert!(!crate::adjust_app::apply_preset(&mut edit!(rig), 99), "no such preset");
+            assert!(
+                !crate::adjust_app::apply_preset(&mut edit!(rig), 2),
+                "already set"
+            );
+            assert!(
+                !crate::adjust_app::apply_preset(&mut edit!(rig), 99),
+                "no such preset"
+            );
             assert_eq!(rig.undo_order.undo.len(), before + 1);
             rig.undo();
             assert_eq!(
@@ -84478,13 +84495,22 @@ mod tests {
         #[test]
         fn vibrance_follows_the_closed_form_and_keeps_alpha() {
             let (_dir, mut store) = real_tile_store();
-            let mut layers = solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
             let id = add(&mut layers, vibrance(100.0, 0.0));
             // s 0.5 -> 0.5 * (1 + 0.5) = 0.75 at the same hue and lightness.
-            assert_close(first(&layers, &mut store), [0.1, 0.4, 0.7, 1.0], "vibrance +100");
+            assert_close(
+                first(&layers, &mut store),
+                [0.1, 0.4, 0.7, 1.0],
+                "vibrance +100",
+            );
             // Negative vibrance halves the saturation: s 0.25, C 0.2, m 0.3.
             let _ = layers.set_adjustment(id, vibrance(-50.0, 0.0));
-            assert_close(first(&layers, &mut store), [0.3, 0.4, 0.5, 1.0], "vibrance -50");
+            assert_close(
+                first(&layers, &mut store),
+                [0.3, 0.4, 0.5, 1.0],
+                "vibrance -50",
+            );
             let _ = layers.set_adjustment(id, vibrance(0.0, -100.0));
             assert_close(first(&layers, &mut store), [0.4, 0.4, 0.4, 1.0], "grey");
             // Opacity blends back toward the backdrop.
@@ -84526,7 +84552,8 @@ mod tests {
         #[test]
         fn exposure_matches_an_independent_linear_light_model() {
             let (_dir, mut store) = real_tile_store();
-            let mut layers = solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
             let id = add(&mut layers, exposure(1.0, 0.0, 1.0));
             let model = |ev: f64, off: f64, gamma: f64| {
                 let want = |c: f32| {
@@ -84537,16 +84564,27 @@ mod tests {
                 [want(0.2), want(0.4), want(0.6), 1.0]
             };
             assert_close(first(&layers, &mut store), model(1.0, 0.0, 1.0), "+1 EV");
-            for (e, o, g) in [(-2.0, 0.0, 1.0), (0.5, 0.1, 1.0), (0.0, -0.05, 1.0), (0.0, 0.0, 2.2), (1.5, 0.05, 0.7)] {
+            for (e, o, g) in [
+                (-2.0, 0.0, 1.0),
+                (0.5, 0.1, 1.0),
+                (0.0, -0.05, 1.0),
+                (0.0, 0.0, 2.2),
+                (1.5, 0.05, 0.7),
+            ] {
                 let _ = layers.set_adjustment(id, exposure(e as f32, o as f32, g as f32));
-                assert_close(first(&layers, &mut store), model(e, o, g), &format!("{e} {o} {g}"));
+                assert_close(
+                    first(&layers, &mut store),
+                    model(e, o, g),
+                    &format!("{e} {o} {g}"),
+                );
             }
         }
 
         #[test]
         fn photo_filter_multiplies_and_optionally_restores_the_luma() {
             let (_dir, mut store) = real_tile_store();
-            let mut layers = solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
             let id = add(&mut layers, filter([1.0, 0.5, 0.0], 100.0, false));
             assert_close(first(&layers, &mut store), [0.2, 0.2, 0.0, 1.0], "multiply");
             // Luma 0.37192 -> 0.18556 after the multiply: a shift of 0.18636.
@@ -84558,7 +84596,11 @@ mod tests {
             );
             // Density 50: transmission (1, 0.75, 0.5).
             let _ = layers.set_adjustment(id, filter([1.0, 0.5, 0.0], 50.0, false));
-            assert_close(first(&layers, &mut store), [0.2, 0.3, 0.3, 1.0], "density 50");
+            assert_close(
+                first(&layers, &mut store),
+                [0.2, 0.3, 0.3, 1.0],
+                "density 50",
+            );
         }
 
         #[test]
@@ -84613,7 +84655,8 @@ mod tests {
                 unreachable!("a pixel layer");
             };
             fill_solid(&mut store, surface, TILE, [0.2, 0.4, 0.6, 0.5]);
-            let _ = match layers.add_adjustment_layer_at("A", vibrance(0.0, -100.0), Some(group), 0) {
+            let _ = match layers.add_adjustment_layer_at("A", vibrance(0.0, -100.0), Some(group), 0)
+            {
                 Ok(id) => id,
                 Err(err) => unreachable!("{err:?}"),
             };

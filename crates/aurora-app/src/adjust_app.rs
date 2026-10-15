@@ -52,7 +52,13 @@ fn next_name(layers: &LayerTree, stem: &str) -> String {
     let prefix = format!("{stem} ");
     let highest = layer_ids_in_order(layers)
         .into_iter()
-        .filter_map(|id| layers.name(id)?.strip_prefix(prefix.as_str())?.parse::<u64>().ok())
+        .filter_map(|id| {
+            layers
+                .name(id)?
+                .strip_prefix(prefix.as_str())?
+                .parse::<u64>()
+                .ok()
+        })
         .max()
         .unwrap_or(0);
     format!("{prefix}{}", highest.saturating_add(1))
@@ -65,10 +71,13 @@ pub(crate) fn new_layer(cx: &mut LayerCommandContext<'_>, kind: AdjustKind) -> O
     let placement = new_layer_placement(cx.layers, *cx.active_layer);
     let (stem, adjustment) = new_adjustment(kind);
     let name = next_name(cx.layers, stem);
-    match cx
-        .history
-        .add_adjustment_layer_at(cx.layers, name, adjustment, placement.parent, placement.index)
-    {
+    match cx.history.add_adjustment_layer_at(
+        cx.layers,
+        name,
+        adjustment,
+        placement.parent,
+        placement.index,
+    ) {
         Ok(id) => Some(id),
         Err(err) => {
             tracing::warn!(?err, "New {stem} Layer was refused by the layer tree");
@@ -81,6 +90,7 @@ pub(crate) fn new_layer(cx: &mut LayerCommandContext<'_>, kind: AdjustKind) -> O
 
 /// Whether `outcome` belongs to the Vibrance / Exposure / Photo Filter
 /// editors: one of their sliders or the Preserve Luminosity checkbox.
+#[allow(clippy::large_types_passed_by_value)] // `CurvesControls` is `Copy` and 448 bytes
 pub(crate) fn is_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutcome) -> bool {
     use aurora_widgets::ActionOutcome as Outcome;
     let Some(adjust) = controls.adjust else {
@@ -94,6 +104,7 @@ pub(crate) fn is_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerO
 }
 
 /// Whether the pointer capture is on one of the editors' sliders.
+#[allow(clippy::large_types_passed_by_value)] // `CurvesControls` is `Copy` and 448 bytes
 pub(crate) fn slider_captured(
     controls: Option<aurora_ui::CurvesControls>,
     captured: Option<WidgetId>,
@@ -130,7 +141,10 @@ pub(crate) fn finish(cx: &mut CurvesEdit<'_>) -> bool {
         return false;
     }
     if let Err(err) = cx.layers.set_adjustment(pending.layer, pending.start) {
-        tracing::warn!(?err, "failed to rewind an adjustment drag before recording it");
+        tracing::warn!(
+            ?err,
+            "failed to rewind an adjustment drag before recording it"
+        );
         return false;
     }
     record_step(cx, pending.layer, now)
@@ -237,7 +251,10 @@ pub(crate) fn sync(
     match aurora_ui::sync_adjust_controls(tree, adjust, layers, active, captured) {
         Ok(changed) => changed,
         Err(err) => {
-            tracing::warn!(?err, "failed to sync the Vibrance/Exposure/Photo Filter editors");
+            tracing::warn!(
+                ?err,
+                "failed to sync the Vibrance/Exposure/Photo Filter editors"
+            );
             false
         }
     }
@@ -274,7 +291,11 @@ pub(crate) fn apply_preset(cx: &mut CurvesEdit<'_>, index: usize) -> bool {
     let Some(active) = cx.active_layer.filter(|&id| cx.layers.contains(id)) else {
         return false;
     };
-    let Some(filter) = cx.layers.adjustment(active).and_then(Adjustment::photo_filter) else {
+    let Some(filter) = cx
+        .layers
+        .adjustment(active)
+        .and_then(Adjustment::photo_filter)
+    else {
         return false;
     };
     let colour = rgb.map(|c| f32::from(c) / 255.0);

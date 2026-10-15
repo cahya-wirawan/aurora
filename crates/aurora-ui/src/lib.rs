@@ -35,9 +35,9 @@
 //! what's real today and what's still honestly open (Move and Eyedropper
 //! in particular).
 
+pub mod adjust_controls;
 pub mod canvas_view;
 pub mod channels_panel;
-pub mod adjust_controls;
 pub mod colour_controls;
 pub mod crop_controls;
 pub mod crop_overlay;
@@ -71,6 +71,10 @@ pub mod tool_controls;
 pub mod tools_panel;
 pub mod workspace;
 
+pub use adjust_controls::{
+    AdjustControls, AdjustKind, AdjustSlider, adjust_controls_contains, adjust_controls_shown,
+    adjust_of, adjust_preserve_checked, insert_adjust_controls, sync_adjust_controls,
+};
 pub use canvas_view::CanvasView;
 pub use channels_panel::{
     CHANNELS_TOOLBAR_ICON_SIZE, CHANNELS_TOOLBAR_LABEL, ChannelRow, ChannelRowPart,
@@ -79,10 +83,6 @@ pub use channels_panel::{
     channels_toolbar_height, eye_is_on, insert_channels_toolbar, is_channels_toolbar_button,
     new_channels_panel, populate_channels_panel, select_channel_row, set_channels_toolbar_hover,
     sync_channel_eyes, sync_channels_panel, sync_channels_toolbar,
-};
-pub use adjust_controls::{
-    AdjustControls, AdjustKind, AdjustSlider, adjust_controls_contains, adjust_controls_shown,
-    adjust_of, adjust_preserve_checked, insert_adjust_controls, sync_adjust_controls,
 };
 pub use curves_controls::{
     CurvesChannel, CurvesControls, channel_curve, curves_controls_contains, curves_controls_shown,

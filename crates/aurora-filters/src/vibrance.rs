@@ -85,7 +85,7 @@ impl VibranceOp {
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp)]
+#[allow(clippy::float_cmp, clippy::many_single_char_names)]
 mod tests {
     use super::{VibranceOp, skin_guard};
     use aurora_core::VibranceParams as P;
@@ -103,7 +103,7 @@ mod tests {
         let [r, g, b] = rgb.map(f64::from);
         let max = r.max(g).max(b);
         let min = r.min(g).min(b);
-        let l = (max + min) / 2.0;
+        let l = max.midpoint(min);
         if max == min {
             return (0.0, 0.0, l as f32);
         }
@@ -173,7 +173,10 @@ mod tests {
                         let out = op(vibrance, 0.0).apply(input);
                         let (h2, s2, l2) = hsl(out);
                         let want = s * (1.0 + k * (1.0 - s));
-                        assert!(near(s2, want, 2e-4), "{hue} {s} {l} {vibrance}: {s2} {want}");
+                        assert!(
+                            near(s2, want, 2e-4),
+                            "{hue} {s} {l} {vibrance}: {s2} {want}"
+                        );
                         assert!(near(l2, l, 2e-4), "lightness {hue} {s} {l}");
                         let dh = (h2 - hue + 540.0).rem_euclid(360.0) - 180.0;
                         assert!(dh.abs() < 0.2, "hue {hue} {s} {l}: {h2}");
@@ -276,7 +279,10 @@ mod tests {
         for rgb in wild {
             for (v, s) in [(100.0, 100.0), (-100.0, 100.0), (50.0, -100.0)] {
                 let out = op(v, s).apply(rgb);
-                assert!(out.iter().all(|c| (0.0..=1.0).contains(c)), "{rgb:?} {out:?}");
+                assert!(
+                    out.iter().all(|c| (0.0..=1.0).contains(c)),
+                    "{rgb:?} {out:?}"
+                );
             }
         }
     }

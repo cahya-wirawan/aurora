@@ -32,10 +32,10 @@ pub use hue_ranges::{
 };
 pub use hue_saturation::{HueSaturationError, HueSaturationParams};
 pub use id::{Id, IdGenerator};
+pub use levels::{GAMMA_MAX, GAMMA_MIN, LevelsChannel, LevelsError, LevelsParams, MIN_INPUT_SPAN};
 pub use photo_filter::{
     DEFAULT_DENSITY, PHOTO_FILTER_PRESETS, PhotoFilterError, PhotoFilterParams,
 };
-pub use levels::{GAMMA_MAX, GAMMA_MIN, LevelsChannel, LevelsError, LevelsParams, MIN_INPUT_SPAN};
 pub use tone_curve::{
     CurvePoint, MAX_LUT_LEN, MAX_POINTS, MIN_POINT_SEPARATION, MIN_POINTS, ToneCurve,
     ToneCurveError,

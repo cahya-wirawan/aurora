@@ -160,6 +160,8 @@ impl ExposureParams {
     /// Whether the adjustment changes nothing: exposure and offset exactly
     /// zero and gamma exactly one.
     #[must_use]
+    // Exact comparison on purpose: only the neutral settings are skipped.
+    #[allow(clippy::float_cmp)]
     pub fn is_identity(&self) -> bool {
         self.exposure == 0.0 && self.offset == 0.0 && self.gamma == 1.0
     }

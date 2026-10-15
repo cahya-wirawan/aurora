@@ -594,20 +594,27 @@ fn vibrance_exposure_and_photo_filter_layers_refuse_the_psd_save_by_name() {
     ];
     for (adjustment, kind) in cases {
         let mut doc = Doc::new();
-        let id = ok(doc.tree.add_adjustment_layer_at("My layer", adjustment, None, 0));
+        let id = ok(doc
+            .tree
+            .add_adjustment_layer_at("My layer", adjustment, None, 0));
         let path = doc.path("nope.psd");
         let Err(failure) = doc.save(&path) else {
             unreachable!("{kind} must be refused")
         };
         let message = psd_save_failure_message("nope.psd", &failure);
         assert!(
-            message.contains(&format!("the {kind} layer \u{201c}My layer\u{201d} can't be saved to .psd"))
-                && message.contains("Aurora can't write")
+            message.contains(&format!(
+                "the {kind} layer \u{201c}My layer\u{201d} can't be saved to .psd"
+            )) && message.contains("Aurora can't write")
                 && message.contains("save as .aur"),
             "{message}"
         );
         assert!(!path.exists());
-        assert!(doc.listing().is_empty(), "no temp file is left: {:?}", doc.listing());
+        assert!(
+            doc.listing().is_empty(),
+            "no temp file is left: {:?}",
+            doc.listing()
+        );
         ok(doc.tree.remove(id));
         assert!(matches!(ok(doc.save(&path)), PsdSaveStep::Saved));
     }

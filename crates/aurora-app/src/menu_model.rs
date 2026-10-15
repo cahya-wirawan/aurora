@@ -145,7 +145,10 @@ fn static_rows(title: &str) -> Vec<Row> {
             ),
             Cmd(crate::COMMAND_LAYER_NEW_VIBRANCE, "New Vibrance Layer"),
             Cmd(crate::COMMAND_LAYER_NEW_EXPOSURE, "New Exposure Layer"),
-            Cmd(crate::COMMAND_LAYER_NEW_PHOTO_FILTER, "New Photo Filter Layer"),
+            Cmd(
+                crate::COMMAND_LAYER_NEW_PHOTO_FILTER,
+                "New Photo Filter Layer",
+            ),
             Sep,
             Cmd(crate::COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
             Cmd(crate::COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),

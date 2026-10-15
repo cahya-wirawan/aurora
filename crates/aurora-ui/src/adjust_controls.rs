@@ -415,7 +415,10 @@ fn set_display(
     id: WidgetId,
     display: Display,
 ) -> Result<bool, WidgetError> {
-    let mut style = tree.style(id).cloned().ok_or(WidgetError::UnknownWidget(id))?;
+    let mut style = tree
+        .style(id)
+        .cloned()
+        .ok_or(WidgetError::UnknownWidget(id))?;
     if style.display == display {
         return Ok(false);
     }
@@ -443,7 +446,11 @@ fn set_shown(
     for each in AdjustKind::ALL {
         let live = kind == Some(each);
         if let Some(&group) = controls.groups.get(each.index()) {
-            changed |= set_display(tree, group, if live { Display::Flex } else { Display::None })?;
+            changed |= set_display(
+                tree,
+                group,
+                if live { Display::Flex } else { Display::None },
+            )?;
         }
     }
     for slider in AdjustSlider::ALL {
@@ -546,7 +553,10 @@ pub fn sync_adjust_controls(
             changed = true;
         }
     }
-    for slider in AdjustSlider::ALL.into_iter().filter(|s| Some(s.kind()) == kind) {
+    for slider in AdjustSlider::ALL
+        .into_iter()
+        .filter(|s| Some(s.kind()) == kind)
+    {
         let (Some(&id), Some(&readout)) = (
             controls.sliders.get(slider.index()),
             controls.readouts.get(slider.index()),
@@ -635,6 +645,22 @@ mod tests {
         }
     }
 
+    fn add(layers: &mut LayerTree, name: &str, adjustment: Adjustment) -> aurora_doc::LayerId {
+        let Ok(id) = layers.add_adjustment_layer_at(name, adjustment, None, 0) else {
+            unreachable!("adjustment layer");
+        };
+        id
+    }
+
+    fn show(
+        ws: &mut crate::Workspace,
+        controls: super::AdjustControls,
+        layers: &LayerTree,
+        id: Option<aurora_doc::LayerId>,
+    ) -> Result<bool, aurora_widgets::WidgetError> {
+        sync_adjust_controls(&mut ws.tree, controls, layers, id, None)
+    }
+
     #[test]
     fn the_editor_shows_the_group_of_the_active_layer_kind() {
         let scales = scales();
@@ -645,12 +671,6 @@ mod tests {
         };
         assert_eq!(adjust_controls_shown(&ws.tree, controls), None);
         let mut layers = LayerTree::new();
-        fn add(layers: &mut LayerTree, name: &str, adjustment: Adjustment) -> aurora_doc::LayerId {
-            let Ok(id) = layers.add_adjustment_layer_at(name, adjustment, None, 0) else {
-                unreachable!("adjustment layer");
-            };
-            id
-        }
         let v = add(&mut layers, "V", vib(35.0, -12.0));
         let e = add(&mut layers, "E", exp(-1.25, 0.125, 2.2));
         let f = add(&mut layers, "F", filter([0.0, 0.5, 1.0], 61.0, false));
@@ -659,14 +679,6 @@ mod tests {
             "H",
             Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
         );
-        fn show(
-            ws: &mut crate::Workspace,
-            controls: super::AdjustControls,
-            layers: &LayerTree,
-            id: Option<aurora_doc::LayerId>,
-        ) -> Result<bool, aurora_widgets::WidgetError> {
-            sync_adjust_controls(&mut ws.tree, controls, layers, id, None)
-        }
         assert_eq!(show(&mut ws, controls, &layers, None).ok(), Some(false));
         assert_eq!(show(&mut ws, controls, &layers, Some(v)).ok(), Some(true));
         assert_eq!(
@@ -676,8 +688,14 @@ mod tests {
         let at = |ws: &crate::Workspace, s: S| slider_state(&ws.tree, controls.sliders[s.index()]);
         assert_eq!(at(&ws, S::Vibrance), (35.0, false));
         assert_eq!(at(&ws, S::VibranceSaturation), (-12.0, false));
-        assert!(at(&ws, S::Exposure).1 && at(&ws, S::Red).1, "other groups disabled");
-        match ws.tree.payload(controls.readouts[S::VibranceSaturation.index()]) {
+        assert!(
+            at(&ws, S::Exposure).1 && at(&ws, S::Red).1,
+            "other groups disabled"
+        );
+        match ws
+            .tree
+            .payload(controls.readouts[S::VibranceSaturation.index()])
+        {
             Some(WidgetKind::Label(label)) => assert_eq!(label.text, "Saturation: -12"),
             other => unreachable!("{other:?}"),
         }
@@ -749,7 +767,8 @@ mod tests {
         assert!(S::Gamma.with_value(&f, 2.0).is_none());
         assert!(S::Red.with_value(&v, 2.0).is_none());
         // Rounding.
-        let got = |s: S, base: &Adjustment, x: f64| s.with_value(base, x).and_then(|a| s.value_of(&a));
+        let got =
+            |s: S, base: &Adjustment, x: f64| s.with_value(base, x).and_then(|a| s.value_of(&a));
         assert_eq!(got(S::Vibrance, &v, 40.6), Some(41.0));
         assert!((got(S::Exposure, &e, 1.2349).unwrap_or(0.0) - 1.23).abs() < 1e-6);
         assert!((got(S::Offset, &e, 0.12349).unwrap_or(0.0) - 0.123).abs() < 1e-6);
@@ -778,7 +797,10 @@ mod tests {
         let v = vib(10.0, 20.0);
         let next = S::VibranceSaturation.with_value(&v, -30.0);
         let p = next.as_ref().and_then(Adjustment::vibrance);
-        assert_eq!(p.map(|p| (p.vibrance(), p.saturation())), Some((10.0, -30.0)));
+        assert_eq!(
+            p.map(|p| (p.vibrance(), p.saturation())),
+            Some((10.0, -30.0))
+        );
     }
 
     #[test]

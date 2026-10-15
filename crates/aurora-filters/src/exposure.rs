@@ -162,9 +162,24 @@ mod tests {
                 let v = step as f32 / 32.0;
                 let got = o.apply([v, 1.0 - v, 0.5 * v]);
                 let want = [
-                    model(f64::from(v), f64::from(ev), f64::from(offset), f64::from(gamma)),
-                    model(f64::from(1.0 - v), f64::from(ev), f64::from(offset), f64::from(gamma)),
-                    model(f64::from(0.5 * v), f64::from(ev), f64::from(offset), f64::from(gamma)),
+                    model(
+                        f64::from(v),
+                        f64::from(ev),
+                        f64::from(offset),
+                        f64::from(gamma),
+                    ),
+                    model(
+                        f64::from(1.0 - v),
+                        f64::from(ev),
+                        f64::from(offset),
+                        f64::from(gamma),
+                    ),
+                    model(
+                        f64::from(0.5 * v),
+                        f64::from(ev),
+                        f64::from(offset),
+                        f64::from(gamma),
+                    ),
                 ];
                 for (g, w) in got.iter().zip(want) {
                     assert!(

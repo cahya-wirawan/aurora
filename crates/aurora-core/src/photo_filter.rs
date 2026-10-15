@@ -181,6 +181,8 @@ impl PhotoFilterParams {
 
     /// Whether the adjustment changes nothing: a white filter.
     #[must_use]
+    // Exact comparison on purpose: only a bit-exact white is skipped.
+    #[allow(clippy::float_cmp)]
     pub fn is_identity(&self) -> bool {
         self.colour == [1.0, 1.0, 1.0]
     }
@@ -240,10 +242,17 @@ mod tests {
         assert!(d.preserve_luminosity());
         let [r, g, b] = d.colour();
         assert_eq!(
-            ((r * 255.0).round(), (g * 255.0).round(), (b * 255.0).round()),
+            (
+                (r * 255.0).round(),
+                (g * 255.0).round(),
+                (b * 255.0).round()
+            ),
             (236.0, 138.0, 0.0)
         );
-        assert_eq!(PHOTO_FILTER_PRESETS.first().map(|p| p.1), Some([236, 138, 0]));
+        assert_eq!(
+            PHOTO_FILTER_PRESETS.first().map(|p| p.1),
+            Some([236, 138, 0])
+        );
     }
 
     #[test]

@@ -5020,7 +5020,7 @@ mod tests {
         for (index, (start, edited)) in edits.into_iter().enumerate() {
             let layer = match history.add_adjustment_layer_at(
                 &mut layers,
-                &format!("Adjustment {index}"),
+                format!("Adjustment {index}"),
                 start,
                 None,
                 0,

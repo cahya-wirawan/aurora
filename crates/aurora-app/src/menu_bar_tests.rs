@@ -156,11 +156,17 @@ fn the_new_adjustment_layers_are_in_the_layer_menu_and_the_native_list() {
     for (id, label) in [
         (crate::COMMAND_LAYER_NEW_VIBRANCE, "New Vibrance Layer"),
         (crate::COMMAND_LAYER_NEW_EXPOSURE, "New Exposure Layer"),
-        (crate::COMMAND_LAYER_NEW_PHOTO_FILTER, "New Photo Filter Layer"),
+        (
+            crate::COMMAND_LAYER_NEW_PHOTO_FILTER,
+            "New Photo Filter Layer",
+        ),
     ] {
         assert_eq!(entry(layer, id).0, label);
         assert!(entry(layer, id).2, "{id} is enabled");
-        assert!(menu_model::NATIVE_MENU_COMMANDS.contains(&id), "{id} native");
+        assert!(
+            menu_model::NATIVE_MENU_COMMANDS.contains(&id),
+            "{id} native"
+        );
     }
 }
 

@@ -38,6 +38,56 @@ pub const fn crate_name() -> &'static str {
 mod tests {
     use super::crate_name;
 
+    /// Per-pixel cost of the 0.239.0 operations over a 4096 x 4096 layer
+    /// (16.8 Mpx) on pseudo-random pixels, in whatever profile the tests
+    /// run (dev). Not an assertion: run with
+    /// `cargo test -p aurora-filters --lib cost_probe -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement, prints timings"]
+    #[allow(clippy::cast_precision_loss, clippy::print_stderr)]
+    fn cost_probe_for_vibrance_exposure_and_photo_filter() {
+        use super::{ExposureOp, PhotoFilterOp, VibranceOp};
+        let count = 4096_usize * 4096;
+        let mut state = 0x9E37_79B9_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) as f32 / 16_777_216.0
+        };
+        let pixels: Vec<[f32; 3]> = (0..count).map(|_| [next(), next(), next()]).collect();
+        let vibrance = match aurora_core::VibranceParams::new(60.0, 20.0) {
+            Ok(p) => VibranceOp::new(&p),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let exposure = match aurora_core::ExposureParams::new(0.7, 0.02, 1.4) {
+            Ok(p) => ExposureOp::new(&p),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let filter = PhotoFilterOp::new(&aurora_core::PhotoFilterParams::default());
+        let time = |name: &str, f: &dyn Fn([f32; 3]) -> [f32; 3]| {
+            let start = std::time::Instant::now();
+            let mut sink = 0.0_f32;
+            for &p in &pixels {
+                sink += f(p)[1];
+            }
+            let elapsed = start.elapsed();
+            eprintln!(
+                "{name}: {:.3} s for {count} px = {:.1} ns/px (checksum {sink})",
+                elapsed.as_secs_f64(),
+                elapsed.as_secs_f64() * 1e9 / count as f64
+            );
+        };
+        time("vibrance", &|p| vibrance.apply(p));
+        time("exposure", &|p| exposure.apply(p));
+        time("photo filter", &|p| filter.apply(p));
+        let hue = super::HueSaturationOp::new(&aurora_core::HueSaturationParams::identity());
+        let hue =
+            match aurora_core::HueSaturationParams::new(20.0, 30.0, 10.0, false, 0.0, 25.0, 0.0) {
+                Ok(p) => super::HueSaturationOp::new(&p),
+                Err(_) => hue,
+            };
+        time("hue/saturation (reference)", &|p| hue.apply(p));
+    }
+
     #[test]
     fn reports_its_name() {
         assert_eq!(crate_name(), "aurora-filters");
