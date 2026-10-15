@@ -84459,6 +84459,53 @@ mod tests {
         /// Gray mix is the first row whatever tab is selected; undo moves the
         /// editor.
         #[test]
+        fn gradient_map_reverse_and_colour_sliders_are_wired_one_undo_step_each() {
+            use aurora_ui::AdjustSlider as S;
+            let (mut rig, id) = Rig::adjust_layer(aurora_doc::Adjustment::GradientMap(
+                aurora_core::GradientMapParams::black_to_white(),
+            ));
+            assert_eq!(
+                aurora_ui::adjust_controls_shown(&rig.workspace.tree, rig.adj_controls()),
+                Some(aurora_ui::AdjustKind::GradientMap)
+            );
+            let map = |rig: &Rig| match rig.adjustment(id).gradient_map() {
+                Some(p) => p.clone(),
+                None => unreachable!("a Gradient Map layer"),
+            };
+            assert!(!aurora_ui::adjust_gradient_reverse_checked(
+                &rig.workspace.tree,
+                rig.adj_controls()
+            ));
+            assert_eq!(rig.adj_slider(S::GradientEndGreen).0, 255.0);
+            assert_eq!(rig.adj_slider(S::GradientStartGreen).0, 0.0);
+            let before = rig.undo_order.undo.len();
+            // A colour slider: one undo step, one channel of one stop.
+            rig.adj_set(S::GradientEndBlue, 51.0);
+            assert_eq!(map(&rig).stops()[1].colour, [1.0, 1.0, 51.0 / 255.0]);
+            assert_eq!(map(&rig).stops()[0].colour, [0.0; 3]);
+            rig.adj_set(S::GradientStartRed, 255.0);
+            assert_eq!(map(&rig).stops()[0].colour, [1.0, 0.0, 0.0]);
+            assert_eq!(rig.undo_order.undo.len(), before + 2);
+            // The Reverse checkbox: one step, and the editor follows undo.
+            let reverse = rig.adj_controls().gradient_reverse;
+            let at = rig.centre(reverse);
+            rig.pointer(PointerPhase::Down, at);
+            rig.pointer(PointerPhase::Up, at);
+            rig.sync();
+            assert!(map(&rig).reverse());
+            assert!(!map(&rig).dither(), "only Reverse changed");
+            assert_eq!(rig.undo_order.undo.len(), before + 3);
+            rig.undo();
+            rig.sync();
+            assert!(!map(&rig).reverse());
+            assert!(!aurora_ui::adjust_gradient_reverse_checked(
+                &rig.workspace.tree,
+                rig.adj_controls()
+            ));
+            assert_eq!(map(&rig).stops()[0].colour, [1.0, 0.0, 0.0]);
+        }
+
+        #[test]
         #[allow(clippy::too_many_lines, clippy::redundant_closure_for_method_calls)]
         fn channel_mixer_and_selective_color_tabs_sliders_and_checkboxes_are_wired() {
             use aurora_ui::AdjustSlider as S;

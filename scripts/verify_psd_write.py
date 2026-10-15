@@ -513,6 +513,34 @@ def check_adjustments2(folder):
     print("OK: psd-tools read the Channel Mixer and Selective Color blocks and records")
 
 
+def check_gradient_map(folder):
+    """0.248.0: a Gradient Map layer reads back in psd-tools with the
+    integers of `gradientmap.json` (written by the Rust fixture test
+    `gradient_map_fixture_for_psd_tools`): version 1, the two flags, the
+    colour stops (location 0..4096, midpoint 50, RGB mode 0, 16-bit
+    components) and two fully opaque transparency stops. Photoshop has not
+    opened the file."""
+    spec_path = folder / "gradientmap.json"
+    if not spec_path.exists():
+        print("no gradientmap.json: the Gradient Map pass was skipped")
+        return
+    want = json.loads(spec_path.read_text(encoding="utf-8"))
+    psd = PSDImage.open(folder / "gradientmap.psd")
+    layer = find_layer(psd, "Map")
+    check("Map kind", layer.kind, "gradientmap")
+    check("Map opacity", layer.opacity, 128)
+    check("Map blend", layer.blend_mode.name, "MULTIPLY")
+    block = layer.tagged_blocks.get_data(Tag.GRADIENT_MAP)
+    check("Map version", block.version, 1)
+    check("Map flags", (int(block.is_reversed), int(block.is_dithered)), (want["reverse"], want["dither"]))
+    got = [(s.location, s.color[0], s.color[1], s.color[2]) for s in block.color_stops]
+    check("Map stops", got, [tuple(s) for s in want["stops"]])
+    check("Map midpoints and modes", [(s.midpoint, s.mode, s.color[3]) for s in block.color_stops], [(50, 0, 0)] * len(want["stops"]))
+    check("Map transparency", [(s.location, s.opacity) for s in block.transparency_stops], [(0, 255), (4096, 255)])
+    check("Map smoothness and length", (block.interpolation, block.length, block.mode), (4096, 32, 0))
+    print("OK: psd-tools read the Gradient Map block and record")
+
+
 def check_resaves(folder):
     """Each kept `resave_<name>.psd` against the original corpus file."""
     corpus = Path(__file__).resolve().parent.parent / "corpora/psd/reference/psd-tools-fixtures"
@@ -626,3 +654,4 @@ if __name__ == "__main__":
     check_adjustments5(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_adjustments4(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_adjustments2(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
+    check_gradient_map(Path(sys.argv[1] if len(sys.argv) > 1 else "."))

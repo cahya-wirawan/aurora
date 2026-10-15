@@ -692,3 +692,43 @@ fn the_neutral_check_values_are_unused() {
     // Keeps `GRADIENT_MAP_MAX_STOPS` in the public API under test.
     assert_eq!(GRADIENT_MAP_MAX_STOPS, 64);
 }
+
+/// Writes the fixture `scripts/verify_psd_write.py` reads (psd-tools is the
+/// independent reader):
+///
+/// ```text
+/// AURORA_PSD_FIXTURE_DIR=/tmp/psdw cargo test -p aurora-io --lib \
+///     gradient_map_fixture_for_psd_tools -- --ignored
+/// ```
+#[test]
+#[ignore = "writes the fixture scripts/verify_psd_write.py reads"]
+fn gradient_map_fixture_for_psd_tools() {
+    let Ok(out) = std::env::var("AURORA_PSD_FIXTURE_DIR") else {
+        unreachable!("set AURORA_PSD_FIXTURE_DIR");
+    };
+    let out = std::path::Path::new(&out);
+    let mut doc = Doc::new((16, 16));
+    doc.layer("Background", rect(0, 0, 16, 16), None);
+    let c = |k: u16| f32::from(k) / 65535.0;
+    let g = ok(doc.tree.add_adjustment_layer_at(
+        "Map",
+        gradient(
+            &[
+                (0.0, [0.0, 0.0, c(16384)]),
+                (0.5, [c(49152), c(32768), 0.0]),
+                (1.0, [1.0, 1.0, c(32768)]),
+            ],
+            true,
+            true,
+        ),
+        None,
+        0,
+    ));
+    ok(doc.tree.set_opacity(g, 128.0 / 255.0));
+    ok(doc.tree.set_blend_mode(g, aurora_doc::BlendMode::Multiply));
+    let (bytes, _) = ok(doc.write());
+    ok(std::fs::write(out.join("gradientmap.psd"), &bytes));
+    let json = "{\"stops\": [[0, 0, 0, 16384], [2048, 49152, 32768, 0], [4096, 65535, 65535, 32768]], \
+        \"reverse\": 1, \"dither\": 1}\n";
+    ok(std::fs::write(out.join("gradientmap.json"), json));
+}

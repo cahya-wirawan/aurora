@@ -247,7 +247,7 @@ Colour values in the pixel tiles are expressed in this colour space. The code ne
 
 Skipped on the wire (carried by other entries): `effects`, `smart_object`, `clipped`.
 
-`LayerKind` (`layer.rs:28`), variant ordinals: `0` `Pixel { bounds: Rect }`; `1` `Group { children: Vec<u64> }` (children top-to-bottom); `2` `Adjustment(Adjustment)`. `Adjustment` is the enum of 7.8 (ordinals 0..=12).
+`LayerKind` (`layer.rs:28`), variant ordinals: `0` `Pixel { bounds: Rect }`; `1` `Group { children: Vec<u64> }` (children top-to-bottom); `2` `Adjustment(Adjustment)`. `Adjustment` is the enum of 7.8 (ordinals 0..=15).
 
 `Rect` (`crates/aurora-core/src/geometry.rs:129`): `x: i64`, `y: i64` (zig-zag varints), `width: u32`, `height: u32` (varints).
 
@@ -481,6 +481,7 @@ See 8.5 for the entry layout. A `SmartObject` (`crates/aurora-doc/src/smart_obje
 | 12 | `BrightnessContrast(BrightnessContrastParams)` | tuple `(brightness: i16, contrast: i16, use_legacy: bool)` (zig-zag varints, then a byte) | 3..=7 | non-legacy: brightness -150..=150, contrast -50..=100; legacy: both -100..=100 | `brit` (+ `CgEd` for non-legacy per `write_adjust.rs`) | 0.244.0 |
 | 13 | `ChannelMixer(ChannelMixerParams)` | tuple of three rows `[red, green, blue, constant]` (percent) plus a `monochrome: bool`, 49 bytes | - | sources -200..=200, constant -100..=100 (each validated at decode via `try_from`) | `mixr` (a Monochrome mixer is refused on PSD save: the Gray row is unverified) | 0.245.0 |
 | 14 | `SelectiveColor(SelectiveColorParams)` | nine rows `[cyan, magenta, yellow, black]` (ranges in the order Reds, Yellows, Greens, Cyans, Blues, Magentas, Whites, Neutrals, Blacks) plus an `absolute: bool`, 145 bytes | - | sliders -100..=100 | `selc` (a non-neutral layer is refused on PSD save: the file's plate order is unverified) | 0.245.0 |
+| 15 | `GradientMap(GradientMapParams)` | a sequence of colour stops (a varint count, `2..=64`, then per stop four `f32` `[position, red, green, blue]`: position `0..=1` non-decreasing, channels `0..=1`), then `reverse: bool`, `dither: bool` and a method byte (`0` = Classic, the only value accepted): 1 + 16 per stop + 3 bytes (36 for two stops) | - | at most 64 stops; a count over 64 is refused before any stop is converted | `grdm` version 1 (Classic only; Linear/Perceptual, midpoints other than 50 %, transparency stops, Noise and non-RGB stops are not representable and the layer is left out on PSD open) | 0.248.0 |
 
 Sources: `crates/aurora-doc/src/layer.rs:66-122`; parameter files in `crates/aurora-core/src/` (`curves.rs`, `tone_curve.rs`, `levels.rs`, `hue_saturation.rs`, `hue_ranges.rs`, `vibrance.rs`, `exposure.rs`, `photo_filter.rs`, `black_white.rs`, `color_balance.rs`, `threshold.rs`, `posterize.rs`, `brightness_contrast.rs`); PSD key mapping from `Adjustment` in `crates/aurora-io/src/psd/write_adjust.rs:161-182` (`encode_adjustment`).
 
@@ -488,7 +489,7 @@ Standard Hue/Saturation range edges (`DEFAULT_HUE_RANGE_EDGES`, `hue_ranges.rs`)
 
 Normalisation rule for writers: a Hue/Saturation layer whose six ranges equal the standard edges with all adjustments zero SHOULD be written as ordinal 2 (`Adjustment::from_hue_saturation`), so that 0.203.0-era bytes are unchanged; ordinal 3 is also valid in that case and is decoded.
 
-Ordinals 13 (Channel Mixer) and 14 (Selective Color) were appended in 0.245.0, with no manifest version change; an older reader refuses such a file (see G-13).
+Ordinals 13 (Channel Mixer) and 14 (Selective Color) were appended in 0.245.0, and ordinal 15 (Gradient Map) in 0.248.0, with no manifest version change; an older reader refuses such a file (see G-13). Gradient Map is the first ordinal whose payload is variable length (the stop list); its parameters are `Clone` but not `Copy`.
 
 Adjustment layers have no content surface and no `bounds`; they apply to the composite below them *within their own group* (groups are isolated for adjustments, CLAUDE.md).
 
