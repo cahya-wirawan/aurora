@@ -16,7 +16,11 @@
 //! - `expA` is left out: Photoshop works in the linear light of the file's
 //!   grey profile (Dot Gain 20 % in the fixture), which Aurora ignores.
 
-#![allow(clippy::indexing_slicing, clippy::too_many_lines)]
+#![allow(
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    clippy::trivially_copy_pass_by_ref
+)]
 
 use aurora_core::{LevelsChannel, LevelsParams};
 use aurora_doc::Adjustment;

@@ -1571,23 +1571,22 @@ fn a_cged_block_without_brit_is_some_other_generator_and_stays_unsupported() {
 fn a_grayscale_file_s_four_layers_are_left_out_and_say_so() {
     // Since 0.249.0 Invert, Threshold and Posterize import in a Grayscale
     // file (`grayscale_adjust_tests`); Use Legacy stays out.
-    for (key, block, label) in [(b"brit", unhex(BRIT_LEGACY), "Brightness/Contrast")] {
-        let layer = TestLayer::empty("Adjust 1").with(|l| l.blocks.push((*key, block.clone())));
-        let bytes = TestPsd::new(1, 2, 2, 8)
-            .with(|p| {
-                p.color_mode = 1;
-                p.layers = vec![TestLayer::divider(), layer, TestLayer::group("G", *b"pass")];
-            })
-            .write();
-        let document = ok(read(&bytes));
-        let items = document.report.items.join("\n");
-        assert!(
-            items.contains(&format!(
-                "1 {label} layer in this Grayscale file was left out"
-            )),
-            "{label}: {items}"
-        );
-    }
+    let (key, block, label) = (b"brit", unhex(BRIT_LEGACY), "Brightness/Contrast");
+    let layer = TestLayer::empty("Adjust 1").with(|l| l.blocks.push((*key, block.clone())));
+    let bytes = TestPsd::new(1, 2, 2, 8)
+        .with(|p| {
+            p.color_mode = 1;
+            p.layers = vec![TestLayer::divider(), layer, TestLayer::group("G", *b"pass")];
+        })
+        .write();
+    let document = ok(read(&bytes));
+    let items = document.report.items.join("\n");
+    assert!(
+        items.contains(&format!(
+            "1 {label} layer in this Grayscale file was left out"
+        )),
+        "{label}: {items}"
+    );
 }
 
 #[test]
