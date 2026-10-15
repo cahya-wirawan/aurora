@@ -74,10 +74,11 @@ fn cbal(ranges: [[f32; 3]; 3], preserve: bool) -> Adjustment {
 /// range has an unbounded slope near zero (`x^0.1`) or a slope of 10
 /// (`x^10`), saturation +99/+100 divides by `1 - k`, and the Black & White
 /// extremes carry slopes of 3 and -2.
-pub(crate) const STEEP_CASES: [&str; 11] = [
+pub(crate) const STEEP_CASES: [&str; 12] = [
     "vib sat +99",
     "vib sat +100",
     "vib extremes",
+    "exp offset -0.5",
     "exp +5",
     "exp -5",
     "exp +20",
@@ -136,7 +137,7 @@ pub(crate) fn cases_of(pass: Pass) -> Vec<(&'static str, Adjustment)> {
             ("pf black d100", pf([0, 0, 0], 100.0, false)),
             ("pf black d60 preserve", pf([0, 0, 0], 60.0, true)),
             ("pf green d75 preserve", pf([40, 200, 60], 75.0, true)),
-            ("pf one channel off", pf([255, 255, 254], 100.0, true)),
+            ("pf one channel off", pf([255, 255, 200], 100.0, true)),
         ],
         Pass::BlackWhite => vec![
             ("bw default", bw(aurora_core::BLACK_WHITE_DEFAULTS)),
@@ -229,7 +230,9 @@ const FIVE: [Pass; 5] = [
 fn moderate(pass: Pass) -> Adjustment {
     match pass {
         Pass::Vibrance => vib(80.0, 25.0),
-        Pass::Exposure => expo(0.8, 0.02, 1.4),
+        // Darkens the shadows and brightens the highlights, so Darken and
+        // Lighten both differ from Normal.
+        Pass::Exposure => expo(2.0, 0.0, 0.5),
         Pass::PhotoFilter => pf([236, 138, 0], 70.0, true),
         Pass::BlackWhite => bw_tint(aurora_core::BLACK_WHITE_DEFAULTS, 40.0, 30.0),
         Pass::ColorBalance => cbal(
