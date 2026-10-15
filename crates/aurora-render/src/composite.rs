@@ -21684,7 +21684,7 @@ mod tests {
         );
     }
 
-    /// 0.243.0: the in-shader VividLight takes Photoshop's source poles
+    /// 0.243.0: the in-shader `VividLight` takes Photoshop's source poles
     /// (`Cs == 0 -> 0`, `Cs == 1 -> 1`) ahead of the backdrop's own
     /// guards: Cb (1, 0, 0.5) under Cs (0, 1, 0.5), opaque, gives red 0
     /// (the old order said 1) and green 1 (the old order said 0).
@@ -29364,6 +29364,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod pole_tests {
     use super::*;
 

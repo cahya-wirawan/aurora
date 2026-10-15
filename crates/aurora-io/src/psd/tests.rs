@@ -509,8 +509,9 @@ fn a_pass_through_group_opens_as_pass_through_and_is_not_reported() {
         .write();
     let document = doc(&filled);
     assert!(document.report.is_empty(), "{:?}", document.report);
+    let group = document.layers.roots().first().copied();
     assert_eq!(
-        document.layers.fill_opacity(document.layers.roots()[0]),
+        group.and_then(|id| document.layers.fill_opacity(id)),
         Some(0.4)
     );
 

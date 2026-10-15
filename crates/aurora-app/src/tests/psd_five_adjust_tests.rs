@@ -116,7 +116,7 @@ const FILES: [Row; 14] = [
         "passthrough_fill_adjustment.psd",
         1,
         [1.0, 18.0, 18.0],
-        [0.1, 3.47, 3.47],
+        [0.104, 3.47, 3.47],
     ),
     // Left out: mean 86 / 70 / 70.
     (

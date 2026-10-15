@@ -984,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_follows_the_layer_and_is_disabled_with_a_reason_for_a_pass_through_group() {
+    fn fill_follows_the_layer_and_is_enabled_for_a_pass_through_group_too() {
         let (mut ws, controls) = built(1600.0, 900.0);
         let tree = &mut ws.tree;
         let (mut layers, pixel) = doc();
@@ -996,11 +996,11 @@ mod tests {
             tree.accessibility(controls.fill_row)
                 .and_then(|n| n.description().map(str::to_owned))
         };
-        // Pass Through: Fill off, with the reason.
+        // Pass Through (0.243.0): Fill is applied to it now, so it is on.
         assert!(layers.set_blend_mode(group, BlendMode::PassThrough).is_ok());
         assert!(sync_layer_controls(tree, controls, &layers, Some(group), None).is_ok());
-        assert!(slider_value(tree, controls.fill).1);
-        assert!(reason(tree).is_some_and(|text| text.contains("Pass Through")));
+        assert!(!slider_value(tree, controls.fill).1);
+        assert_eq!(reason(tree), None);
         // An isolated group: Fill on, no reason.
         assert!(layers.set_blend_mode(group, BlendMode::Normal).is_ok());
         assert!(sync_layer_controls(tree, controls, &layers, Some(group), None).is_ok());
