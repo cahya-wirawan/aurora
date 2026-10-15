@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.249.0] - 2026-10-16
+
+### Changed
+
+- Grayscale PSD adjustments: Curves, Levels, Invert, Threshold, Posterize, Brightness/Contrast
+
 ## [0.248.0] - 2026-10-16
 
 ### Changed
