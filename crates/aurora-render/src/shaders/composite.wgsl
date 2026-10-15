@@ -1632,6 +1632,24 @@ fn blend_linear_light(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
 //     which.
 //
 fn vivid_light_channel(cb: f32, cs: f32) -> f32 {
+    // 0.243.0: a source channel at 0 or 1 decides the result before the
+    // backdrop's guards do (Photoshop's merged image of
+    // `blend-modes/vivid-light.psd`). Mirrors `blend_channel`'s
+    // `BlendMode::VividLight` arm; `hard_mix_channel` keeps the old order
+    // through `vivid_light_legacy_channel`.
+    if (cs == 0.0) {
+        return 0.0;
+    }
+    if (cs == 1.0) {
+        return 1.0;
+    }
+    return vivid_light_legacy_channel(cb, cs);
+}
+
+// `VividLight` before 0.243.0: `color_burn_channel` / `color_dodge_channel`
+// with their own guard order. `HardMix` thresholds this one
+// (`aurora_render::vivid_light_legacy`).
+fn vivid_light_legacy_channel(cb: f32, cs: f32) -> f32 {
     if (cs <= 0.5) {
         return color_burn_channel(cb, 2.0 * cs);
     }
@@ -1876,7 +1894,7 @@ fn blend_vivid_light(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
 // callees: nothing here would gain, and calling the helper once per channel is
 // what keeps that function's early-return guard structure intact.
 fn hard_mix_channel(cb: f32, cs: f32) -> f32 {
-    if (vivid_light_channel(cb, cs) < 0.5) {
+    if (vivid_light_legacy_channel(cb, cs) < 0.5) {
         return 0.0;
     }
     return 1.0;
@@ -2753,6 +2771,12 @@ fn blend_subtract(cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
 // `TileCompositor::bind_group_layout_blend` with the seventeen entry points
 // above; no new binding, no new layout.
 fn divide_channel(cb: f32, cs: f32) -> f32 {
+    // 0.243.0: `Divide(0, 0) = 0` (Photoshop's merged image of
+    // `blend-modes/divide.psd`); `Divide(Cb > 0, 0) = 1` stays. Mirrors
+    // `blend_channel`'s `BlendMode::Divide` arm.
+    if (cb == 0.0) {
+        return 0.0;
+    }
     if (cs == 0.0) {
         return 1.0;
     }

@@ -906,6 +906,18 @@ fn soft_light_d(x: f32) -> f32 {
     }
 }
 
+/// `VividLight` as `ColorBurn(Cb, 2 * Cs)` below `Cs = 0.5` and
+/// `ColorDodge(Cb, 2 * Cs - 1)` above, with those modes' own guard order
+/// (`Cb == 1` and `Cb == 0` first). Before 0.243.0 this was `VividLight`
+/// itself; `HardMix`, which thresholds it, still matches Photoshop with it.
+fn vivid_light_legacy(cb: f32, cs: f32) -> f32 {
+    if cs <= 0.5 {
+        blend_channel(BlendMode::ColorBurn, cb, 2.0 * cs)
+    } else {
+        blend_channel(BlendMode::ColorDodge, cb, 2.0 * cs - 1.0)
+    }
+}
+
 /// The per-channel blend function `B(Cb, Cs)` for `mode`, given one
 /// backdrop channel `cb` and one source channel `cs`, both straight
 /// (unpremultiplied) and in `0.0..=1.0` — the piece of the general
@@ -949,8 +961,15 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
         BlendMode::Difference => (cb - cs).abs(),
         BlendMode::Exclusion => cb + cs - 2.0 * cb * cs,
         BlendMode::Subtract => (cb - cs).max(0.0),
+        // 0.243.0: `Divide(0, 0)` is `0`, not `1` (Photoshop's merged image
+        // of `psd-tools`' `blend-modes/divide.psd`, three overlapping
+        // translucent primaries: the red channel of blue over green is
+        // `0/0`, and the result is the one `0` gives). `Divide(Cb, 0)` for
+        // `Cb > 0` stays `1`.
         BlendMode::Divide => {
-            if cs == 0.0 {
+            if cb == 0.0 {
+                0.0
+            } else if cs == 0.0 {
                 1.0
             } else {
                 (cb / cs).min(1.0)
@@ -1000,11 +1019,22 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
         // rather than re-deriving it. `2*Cs` (Cs<=0.5, range [0,1]) and
         // `2*Cs-1` (Cs>0.5, range (0,1]) are both valid inputs to those
         // arms as-is.
+        //
+        // 0.243.0: a source channel at `0` or `1` decides the result
+        // (`VividLight(Cb, 0) = 0`, `VividLight(Cb, 1) = 1`) before the
+        // backdrop's own `0`/`1` guards get a say, as in Photoshop's merged
+        // image of `psd-tools`' `blend-modes/vivid-light.psd`:
+        // `VividLight(0, 1) = 1` and `VividLight(1, 0) = 0` there, where
+        // `ColorDodge`'s `Cb == 0` and `ColorBurn`'s `Cb == 1` guards would
+        // have answered `0` and `1`. [`vivid_light_legacy`] keeps the old
+        // order for `HardMix`, whose own corpus file matches it.
         BlendMode::VividLight => {
-            if cs <= 0.5 {
-                blend_channel(BlendMode::ColorBurn, cb, 2.0 * cs)
+            if cs == 0.0 {
+                0.0
+            } else if cs == 1.0 {
+                1.0
             } else {
-                blend_channel(BlendMode::ColorDodge, cb, 2.0 * cs - 1.0)
+                vivid_light_legacy(cb, cs)
             }
         }
         // LinearLight: the branch form is `Cs <= 0.5 -> LinearBurn(Cb,
@@ -1035,7 +1065,7 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
         // HardMix: a hard threshold on VividLight's own result, reusing
         // that arm directly rather than re-deriving its branch logic.
         BlendMode::HardMix => {
-            if blend_channel(BlendMode::VividLight, cb, cs) < 0.5 {
+            if vivid_light_legacy(cb, cs) < 0.5 {
                 0.0
             } else {
                 1.0
@@ -27396,7 +27426,9 @@ mod tests {
         // in blue.
         assert_eq!(
             read_texel_at(device, queue, &dst, 1, 1),
-            (0.3125, 0.3125, 0.75, 1.0),
+            // 0.243.0: blue was 0.75 (`Divide(0, 0) = 1`); Photoshop's merged
+            // image gives `Divide(0, 0) = 0`, which folds to 0.
+            (0.3125, 0.3125, 0.0, 1.0),
             "at (1, 1) Cb = (0.25, 0.25, 0) and Cs = (0.75, 0.75, 0): red and green take the \
              interior ratio 1/3 and blue the guard's 0/0 arm, folded at the top layer's own 0.75 \
              alpha. The two rivals below are quoted first as B (the blend term alone) and then as \
@@ -29261,5 +29293,48 @@ mod tests {
             "a whole tile must be a whole number of chunks, or a real fold \
              would reach the scalar remainder loop"
         );
+    }
+}
+
+#[cfg(test)]
+mod pole_tests {
+    use super::*;
+
+    /// 0.243.0, from Photoshop's merged images of `blend-modes/divide.psd`
+    /// and `vivid-light.psd`: `Divide(0, 0) = 0`, `Divide(Cb > 0, 0) = 1`.
+    #[test]
+    fn divide_of_zero_by_zero_is_zero_and_by_zero_otherwise_one() {
+        assert_eq!(blend_channel(BlendMode::Divide, 0.0, 0.0), 0.0);
+        assert_eq!(blend_channel(BlendMode::Divide, 0.25, 0.0), 1.0);
+        assert_eq!(blend_channel(BlendMode::Divide, 1.0, 0.0), 1.0);
+        assert_eq!(blend_channel(BlendMode::Divide, 0.0, 1.0), 0.0);
+        assert_eq!(blend_channel(BlendMode::Divide, 0.5, 1.0), 0.5);
+        assert_eq!(blend_channel(BlendMode::Divide, 0.5, 0.25), 1.0);
+    }
+
+    /// A source channel at 0 or 1 decides `VividLight` whatever the backdrop
+    /// is: `(Cb 0, Cs 1) = 1` and `(Cb 1, Cs 0) = 0`, the two corners the
+    /// corpus measured; the interior is unchanged.
+    #[test]
+    fn vivid_light_source_poles_decide_before_the_backdrop_guards() {
+        for cb in [0.0, 0.25, 0.5, 1.0] {
+            assert_eq!(blend_channel(BlendMode::VividLight, cb, 0.0), 0.0, "{cb}");
+            assert_eq!(blend_channel(BlendMode::VividLight, cb, 1.0), 1.0, "{cb}");
+        }
+        // Interior: ColorBurn(Cb, 2 Cs) below 0.5, ColorDodge above.
+        assert_eq!(blend_channel(BlendMode::VividLight, 0.75, 0.25), 0.5);
+        assert_eq!(blend_channel(BlendMode::VividLight, 0.25, 0.75), 0.5);
+        assert_eq!(blend_channel(BlendMode::VividLight, 0.0, 0.5), 0.0);
+        assert_eq!(blend_channel(BlendMode::VividLight, 1.0, 0.5), 1.0);
+    }
+
+    /// `HardMix` is unchanged: its own corpus file matches the old guard
+    /// order, so `HardMix(0, 1) = 0` and `HardMix(1, 0) = 1`.
+    #[test]
+    fn hard_mix_keeps_its_corner_values() {
+        assert_eq!(blend_channel(BlendMode::HardMix, 0.0, 1.0), 0.0);
+        assert_eq!(blend_channel(BlendMode::HardMix, 1.0, 0.0), 1.0);
+        assert_eq!(blend_channel(BlendMode::HardMix, 0.75, 0.75), 1.0);
+        assert_eq!(blend_channel(BlendMode::HardMix, 0.25, 0.25), 0.0);
     }
 }
