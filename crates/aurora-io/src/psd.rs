@@ -135,6 +135,8 @@ mod effects;
 mod effects_tests;
 #[cfg(test)]
 mod gradient_lookup_tests;
+#[cfg(test)]
+mod grayscale_adjust_tests;
 mod lab;
 #[cfg(test)]
 mod mixer_selective_tests;
@@ -527,6 +529,9 @@ enum Note {
     BrokenGroups,
     ExtraChannels,
     ColorProfileIgnored,
+    /// A Grayscale file is held as RGB (grey on all three channels); a PSD
+    /// save writes RGB (0.249.0).
+    GrayscaleHeldAsRgb,
     FlattenedFallback,
 }
 
@@ -937,6 +942,10 @@ fn note_text(note: Note, n: u64) -> String {
         }
         Note::ColorProfileIgnored => "The file's embedded colour profile was ignored; its \
                                       colours are treated as sRGB."
+            .to_owned(),
+        Note::GrayscaleHeldAsRgb => "This Grayscale file is held as RGB (the grey on all three \
+                                     channels); saving it as a PSD writes an RGB file, not \
+                                     Grayscale."
             .to_owned(),
         Note::FlattenedFallback => "None of the file's layers could be opened, so its \
                                     flattened image was opened instead."
@@ -4382,6 +4391,9 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
     drop(head);
     let psb = header.psb();
     let mut notes = Notes::default();
+    if header.gray() {
+        notes.add(Note::GrayscaleHeldAsRgb);
+    }
 
     let color_data_len = r.length(src, false, "colour mode data length")?;
     r.advance(color_data_len, "colour mode data")?;

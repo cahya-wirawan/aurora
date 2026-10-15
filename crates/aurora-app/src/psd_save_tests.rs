@@ -1487,3 +1487,25 @@ fn adjustment_layers_save_losslessly_and_rounded_ones_ask_first() {
 fn listing_without_scratch(doc: &Doc) -> Vec<String> {
     doc.listing()
 }
+
+/// 0.249.0: a Grayscale PSD is held as RGB and a PSD save writes RGB, so
+/// the open report's line is carried into the save report (it is the only
+/// place the document remembers its original colour mode).
+#[test]
+fn a_grayscale_open_carries_the_colour_mode_change_into_the_save_report() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../corpora/psd/reference/psd-tools-fixtures/adjustments/invert_grayscale.psd");
+    let Ok(bytes) = std::fs::read(&path) else {
+        println!("SKIPPED: corpus file not present at {}", path.display());
+        return;
+    };
+    let opened = ok(aurora_io::psd::read(&bytes));
+    let none = aurora_io::SkippedTiles::new();
+    let lines = crate::psd_save::carried_losses(Some(&opened.report.items), &none);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("Grayscale") && l.contains("writes an RGB file")),
+        "{lines:?}"
+    );
+}

@@ -1569,12 +1569,9 @@ fn a_cged_block_without_brit_is_some_other_generator_and_stays_unsupported() {
 
 #[test]
 fn a_grayscale_file_s_four_layers_are_left_out_and_say_so() {
-    for (key, block, label) in [
-        (b"nvrt", vec![], "Invert"),
-        (b"thrs", level(128), "Threshold"),
-        (b"post", level(4), "Posterize"),
-        (b"brit", unhex(BRIT_LEGACY), "Brightness/Contrast"),
-    ] {
+    // Since 0.249.0 Invert, Threshold and Posterize import in a Grayscale
+    // file (`grayscale_adjust_tests`); Use Legacy stays out.
+    for (key, block, label) in [(b"brit", unhex(BRIT_LEGACY), "Brightness/Contrast")] {
         let layer = TestLayer::empty("Adjust 1").with(|l| l.blocks.push((*key, block.clone())));
         let bytes = TestPsd::new(1, 2, 2, 8)
             .with(|p| {
@@ -1685,16 +1682,10 @@ fn corpus_threshold_posterize_invert_and_legacy_files_import_photoshop_s_values(
 
 #[test]
 fn corpus_grayscale_and_cmyk_files_keep_the_left_out_policy() {
-    for (file, kind) in [
-        ("invert_grayscale.psd", "Invert"),
-        ("threshold_grayscale.psd", "Threshold"),
-        ("posterize_grayscale.psd", "Posterize"),
-        ("brightnesscontrast_grayscale.psd", "Brightness/Contrast"),
-        (
-            "brightnesscontrast_legacy_grayscale.psd",
-            "Brightness/Contrast",
-        ),
-    ] {
+    for (file, kind) in [(
+        "brightnesscontrast_legacy_grayscale.psd",
+        "Brightness/Contrast",
+    )] {
         let Some(document) = corpus(&format!("adjustments/{file}")) else {
             continue;
         };
