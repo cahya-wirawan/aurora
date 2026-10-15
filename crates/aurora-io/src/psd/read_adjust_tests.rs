@@ -800,7 +800,7 @@ fn a_grayscale_file_s_layers_are_left_out_and_say_so() {
 fn a_record_with_an_unmodelled_adjustment_key_is_still_left_out() {
     let document = ok(read(
         &file_with(b"blnc", &unhex(BLNC_FILL), |l| {
-            l.blocks.push((*b"grdm", vec![0; 4]));
+            l.blocks.push((*b"hue ", vec![0; 4]));
         })
         .write(),
     ));
@@ -816,13 +816,13 @@ fn every_key_is_recognised_and_only_these_five() {
         assert!(parse_block(k, &[]).is_some());
     }
     // The four of 0.244.0 are keys too (CgEd is not: it only attaches).
-    for k in [b"nvrt", b"thrs", b"post", b"brit", b"mixr", b"selc"] {
+    for k in [b"nvrt", b"thrs", b"post", b"brit", b"mixr", b"selc", b"grdm", b"clrL"] {
         assert!(read_adjust::is_key(*k));
         assert!(parse_block(k, &[]).is_some());
     }
     assert!(!read_adjust::is_key(*b"CgEd"));
     assert_eq!(parse_block(b"CgEd", &[]), None);
-    for k in [b"curv", b"levl", b"hue2", b"hue ", b"clrL", b"grdm"] {
+    for k in [b"curv", b"levl", b"hue2", b"hue "] {
         assert!(!read_adjust::is_key(*k));
         assert_eq!(parse_block(k, &[]), None);
     }
@@ -1189,7 +1189,7 @@ fn a_clipped_adjustment_shown_unclipped_is_reported_as_stronger() {
 fn the_left_out_note_calls_four_kinds_approximations() {
     let document = ok(read(
         &file_with(b"blnc", &unhex(BLNC_FILL), |l| {
-            l.blocks.push((*b"grdm", vec![0; 4]));
+            l.blocks.push((*b"hue ", vec![0; 4]));
         })
         .write(),
     ));

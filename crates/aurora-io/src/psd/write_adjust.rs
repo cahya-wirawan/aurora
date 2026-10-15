@@ -200,6 +200,7 @@ pub(super) fn encode_adjustment(
         Adjustment::SelectiveColor(params) => {
             (*b"selc", encode_selective_color(params, &mut rounding))
         }
+        Adjustment::GradientMap(params) => (*b"grdm", encode_gradient_map(params, &mut rounding)),
         Adjustment::Invert => (*b"nvrt", Vec::new()),
         Adjustment::Threshold(params) => (*b"thrs", encode_level(u16::from(params.level()))),
         Adjustment::Posterize(params) => (*b"post", encode_level(u16::from(params.levels()))),
@@ -730,5 +731,73 @@ pub(super) fn encode_selective_color(
     for v in params.ranges().iter().flatten() {
         push_i16(&mut data, whole_percent(*v, rounding));
     }
+    data
+}
+
+/// The gradient's name as written: Photoshop shows it in the gradient
+/// picker; the model keeps none.
+const GRADIENT_NAME: &str = "Custom";
+
+/// `grdm` (0.248.0), version 1 (Classic interpolation, no method field), in
+/// the layout of `layers/gradient-map.psd`: see
+/// [`super::read_adjust::GradientBlock`]. Positions are written in 4096ths
+/// and colours in 65,535ths, rounded to nearest; midpoints at 50 %, two fully
+/// opaque transparency stops at the ends, Solid, smoothness 100 % and the
+/// other settings as the fixture holds them (a random seed, `use vector
+/// colour` 1, roughness 2048, colour model 3, minimum 0 and maximum 32768).
+pub(super) fn encode_gradient_map(
+    params: &aurora_core::GradientMapParams,
+    rounding: &mut Rounding,
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(160 + params.stops().len() * 20);
+    push_u16(&mut data, 1);
+    data.push(u8::from(params.reverse()));
+    data.push(u8::from(params.dither()));
+    let name: Vec<u16> = GRADIENT_NAME.encode_utf16().chain([0]).collect();
+    push_u32(&mut data, u32::try_from(name.len()).unwrap_or(0));
+    for unit in name {
+        push_u16(&mut data, unit);
+    }
+    push_u16(&mut data, u16::try_from(params.stops().len()).unwrap_or(0));
+    for stop in params.stops() {
+        let location = to_level(stop.position, 4096.0);
+        if !level_is_exact(stop.position, location, 4096.0) {
+            rounding.rounded = true;
+        }
+        push_u32(&mut data, u32::from(location));
+        push_u32(&mut data, 50);
+        push_u16(&mut data, 0);
+        for c in stop.colour {
+            let level = to_level(c, 65535.0);
+            if !level_is_exact(c, level, 65535.0) {
+                rounding.rounded = true;
+            }
+            push_u16(&mut data, level);
+        }
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+    }
+    push_u16(&mut data, 2);
+    for location in [0, 4096] {
+        push_u32(&mut data, location);
+        push_u32(&mut data, 50);
+        push_u16(&mut data, 255);
+    }
+    push_u16(&mut data, 2); // expansion
+    push_u16(&mut data, 4096); // smoothness 100 %
+    push_u16(&mut data, 32); // length
+    push_u16(&mut data, 0); // Solid
+    push_u32(&mut data, 0x293a_5138); // random seed, as the fixture
+    push_u16(&mut data, 0); // show transparency
+    push_u16(&mut data, 1); // use vector colour
+    push_u32(&mut data, 2048); // roughness
+    push_u16(&mut data, 3); // colour model
+    for _ in 0..4 {
+        push_u16(&mut data, 0);
+    }
+    for _ in 0..4 {
+        push_u16(&mut data, 32768);
+    }
+    push_u16(&mut data, 0);
     data
 }

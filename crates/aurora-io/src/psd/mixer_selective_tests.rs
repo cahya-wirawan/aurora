@@ -32,6 +32,7 @@ use crate::error::IoError;
 
 /// `layers/channel-mixer.psd` and `fill_adjustments.psd` "Channel Mixer 1":
 /// the neutral mixer (version 1, Monochrome 0, four rows of five).
+pub(super) const MIXR_NEUTRAL_FOR_TESTS: &str = MIXR_NEUTRAL;
 const MIXR_NEUTRAL: &str =
     "0001000000640000000000000000000000640000000000000000000000640000000000000000000000640000";
 
@@ -408,17 +409,17 @@ fn a_non_neutral_mixer_is_reported_as_unvalidated_and_the_unverifiable_kinds_are
 fn the_left_out_note_no_longer_names_the_channel_mixer() {
     let document = ok(read(
         &file_with(b"mixr", &unhex(MIXR_NEUTRAL), |l| {
-            l.blocks.push((*b"grdm", vec![0; 4]));
+            l.blocks.push((*b"hue ", vec![0; 4]));
         })
         .write(),
     ));
     let items = document.report.items.join("\n");
     assert!(
-        items.contains("1 adjustment layer (Gradient Map, Color Lookup"),
+        items.contains("1 adjustment layer (of a kind"),
         "{items}"
     );
     assert!(
-        items.contains("Channel Mixer and Selective Color adjustment layers"),
+        items.contains("Channel Mixer, Selective Color and Gradient Map adjustment"),
         "{items}"
     );
     assert_eq!(
@@ -473,8 +474,10 @@ fn corpus_neutral_layers_import_as_identity_without_a_report_line() {
     );
     let items = document.report.items.join("\n");
     assert!(!items.contains("textbook"), "{items}");
-    // Only Gradient Map and Color Lookup remain left out.
-    assert!(items.contains("2 adjustment layers"), "{items}");
+    // 0.248.0: Gradient Map imports and Color Lookup has its own line, so
+    // nothing is left out as "of a kind Aurora does not know".
+    assert!(!items.contains("adjustment layers"), "{items}");
+    assert!(items.contains("1 Color Lookup layer was left out"), "{items}");
 }
 
 // ---------------------------------------------------------------------
