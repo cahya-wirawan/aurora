@@ -5312,3 +5312,10 @@ fn the_quick_mask_eraser_ignores_the_erasers_opacity_and_flow() {
     assert!(full.iter().any(|b| *b < 64), "the dabs did deselect");
     assert_eq!(full, run(10, 10));
 }
+
+// ---- 0.238.0: Quick Select and Colour Range -----------------------------
+
+#[path = "colour_range_app_tests.rs"]
+mod colour_range_app_tests;
+#[path = "quick_select_app_tests.rs"]
+mod quick_select_app_tests;

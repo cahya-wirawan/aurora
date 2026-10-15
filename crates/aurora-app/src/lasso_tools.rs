@@ -289,15 +289,32 @@ pub(crate) fn wand_select(
                 return Err(WandRefused::Nothing);
             }
         };
+    region_selection(&region, bounds, document_size)
+}
+
+/// The selection of a binary region found on a layer (`region` is
+/// layer-local, `layer_bounds` the layer's document rectangle): shifted to
+/// document space, clipped to the document like the lassos (a layer may
+/// reach past the canvas; nothing there can be painted or seen) and softened
+/// one texel ([`aurora_doc::antialiased_mask`]). Shared by the Magic Wand
+/// and the Quick Select (0.238.0).
+///
+/// # Errors
+///
+/// [`WandRefused::Nothing`] for an empty or off-document region,
+/// [`WandRefused::Notice`] over the mask cap.
+pub(crate) fn region_selection(
+    region: &aurora_brush::WandRegion,
+    layer_bounds: Rect,
+    document_size: (u32, u32),
+) -> Result<Selection, WandRefused> {
     // Layer-local to document space.
     let doc_bounds = Rect {
-        x: region.bounds.x.saturating_add(bounds.x),
-        y: region.bounds.y.saturating_add(bounds.y),
+        x: region.bounds.x.saturating_add(layer_bounds.x),
+        y: region.bounds.y.saturating_add(layer_bounds.y),
         width: region.bounds.width,
         height: region.bounds.height,
     };
-    // Clipped to the document, like the lassos (a layer may reach past the
-    // canvas; nothing there can be painted or seen).
     let Some((doc_bounds, data)) =
         crop_binary(doc_bounds, &region.data, &document_clip(document_size))
     else {
@@ -512,11 +529,15 @@ pub(crate) fn crop_binary(bounds: Rect, data: &[u8], clip: &Rect) -> Option<(Rec
 pub(crate) fn take_selection_drag(
     drag: &mut Option<Drag>,
 ) -> Option<Option<aurora_doc::Selection>> {
-    if !matches!(drag, Some(Drag::Marquee { .. } | Drag::Lasso { .. })) {
+    if !matches!(
+        drag,
+        Some(Drag::Marquee { .. } | Drag::Lasso { .. } | Drag::QuickSelect(_))
+    ) {
         return None;
     }
     match drag.take() {
         Some(Drag::Marquee { before, .. } | Drag::Lasso { before, .. }) => Some(before),
+        Some(Drag::QuickSelect(quick)) => Some(quick.before),
         _ => None,
     }
 }
@@ -637,7 +658,12 @@ pub(crate) fn take_on_tool_switch(
     from: aurora_ui::Tool,
     to: aurora_ui::Tool,
 ) -> Option<Drag> {
-    if from != to && matches!(drag, Some(Drag::Marquee { .. } | Drag::Lasso { .. })) {
+    if from != to
+        && matches!(
+            drag,
+            Some(Drag::Marquee { .. } | Drag::Lasso { .. } | Drag::QuickSelect(_))
+        )
+    {
         drag.take()
     } else {
         None

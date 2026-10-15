@@ -44,7 +44,8 @@ pub(crate) const fn resolve_mode(button: SelectionMode, modifiers: Modifiers) ->
 
 /// The mode of a gesture pressed with `modifiers` under the app's tool
 /// `settings`: the one place the options bar's button and the modifiers
-/// meet for the Marquees, the Lassos and the Magic Wand.
+/// meet for the Marquees, the Lassos, the Magic Wand and (0.238.0) the Quick
+/// Select.
 pub(crate) const fn gesture_mode(
     settings: &crate::ToolSettings,
     modifiers: Modifiers,
@@ -175,6 +176,7 @@ pub(crate) fn drag_refusal(drag: Option<&crate::Drag>) -> bool {
         Some(crate::Drag::Marquee { modal, .. } | crate::Drag::Lasso { modal, .. }) => {
             modal.take_refusal()
         }
+        Some(crate::Drag::QuickSelect(quick)) => quick.modal.take_refusal(),
         _ => false,
     }
 }
@@ -313,11 +315,11 @@ mod tests {
     }
 
     /// `App::handle_pointer_pressed` and `App::select_wand` need a window,
-    /// so this checks (one line at a time) that each of the three press
-    /// paths - the Lassos, the Marquees and the Magic Wand - asks
-    /// [`gesture_mode`] for its mode.
+    /// so this checks (one line at a time) that each of the four press
+    /// paths - the Lassos, the Marquees, the Magic Wand and the Quick
+    /// Select - asks [`gesture_mode`] for its mode.
     #[test]
-    fn the_three_press_paths_take_their_mode_from_gesture_mode() {
+    fn the_four_press_paths_take_their_mode_from_gesture_mode() {
         let source = include_str!("lib.rs");
         let call = [
             "selection_modes::gesture_mode(",
@@ -325,6 +327,6 @@ mod tests {
         ]
         .concat();
         let uses = source.lines().filter(|l| l.contains(&call)).count();
-        assert_eq!(uses, 3);
+        assert_eq!(uses, 4);
     }
 }

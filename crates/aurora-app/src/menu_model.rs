@@ -223,6 +223,10 @@ fn select_entries(context: &MenuContext) -> Vec<Entry> {
     );
     entries.push(Entry::Separator);
     entries.push(item(
+        crate::colour_range_app::COMMAND_ID,
+        crate::colour_range_app::COMMAND_TITLE,
+    ));
+    entries.push(item(
         crate::quick_mask::COMMAND_ID,
         crate::quick_mask::COMMAND_TITLE,
     ));
@@ -318,6 +322,7 @@ pub(crate) fn enabled(id: &str, context: &MenuContext) -> bool {
         | crate::COMMAND_SELECT_DESELECT
         | crate::COMMAND_SELECT_INVERSE
         | crate::crop::COMMAND_CROP_TO_SELECTION
+        | crate::colour_range_app::COMMAND_ID
         | crate::paths_app::COMMAND_MAKE_SELECTION
         | crate::path_paint::COMMAND_FILL
         | crate::path_paint::COMMAND_STROKE
@@ -435,6 +440,7 @@ pub(crate) const NATIVE_MENU_COMMANDS: &[&str] = &[
     crate::COMMAND_SELECT_INVERSE,
     crate::quick_mask::COMMAND_ID,
     crate::crop::COMMAND_CROP_TO_SELECTION,
+    crate::colour_range_app::COMMAND_ID,
     crate::clipboard_app::COMMAND_COPY,
     crate::clipboard_app::COMMAND_CUT,
     crate::clipboard_app::COMMAND_COPY_MERGED,

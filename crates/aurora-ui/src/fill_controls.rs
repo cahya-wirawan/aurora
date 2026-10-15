@@ -469,7 +469,10 @@ pub fn sync_fill_controls(
         // radius controls.
         (
             fill.bucket,
-            matches!(tool, Tool::PaintBucket | Tool::MagicWand | Tool::QuickSelect),
+            matches!(
+                tool,
+                Tool::PaintBucket | Tool::MagicWand | Tool::QuickSelect
+            ),
         ),
         // The Smudge's Strength (0.222.0), shared by the Blur and the
         // Sharpen (0.223.0) and, as Exposure or Flow, by the Dodge, Burn and
