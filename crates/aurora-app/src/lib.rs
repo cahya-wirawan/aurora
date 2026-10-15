@@ -20728,9 +20728,6 @@ fn adjustment_layer_qualifies_for_gpu(
         // Color Balance (0.240.0) are per-pixel functions with a GPU pass each
         // since 0.242.0 (`composite_vibrance_with_opacity` and its four
         // siblings), admitted above; neutral or not, they qualify like Levels.
-        // Invert, Threshold, Posterize and Brightness/Contrast (0.244.0) are
-        // CPU only: a visible layer of these kinds refuses the GPU path
-        // until a later task ports them.
         // Invert, Threshold, Posterize, Brightness/Contrast (0.244.0), Channel
         // Mixer, Selective Color (0.245.0) and Gradient Map (0.248.0) have a
         // GPU pass each since 0.250.0 (`composite_invert_with_opacity` and
@@ -21210,8 +21207,9 @@ fn begin_gpu_adjustment_pass(
             | AdjustmentLut::SelectiveColor(_)
             | AdjustmentLut::GradientMap(_)),
         ) => {
-            if !record_newest_adjustment_pass(gpu, compositor, encoder, lut, from, to, opacity, mode)
-            {
+            if !record_newest_adjustment_pass(
+                gpu, compositor, encoder, lut, from, to, opacity, mode,
+            ) {
                 return false;
             }
         }
@@ -21470,14 +21468,18 @@ const _: () = {
     assert!(aurora_filters::EXPOSURE_PACKED_LEN == aurora_render::EXPOSURE_GPU_PARAMS_LEN);
     assert!(aurora_filters::PHOTO_FILTER_PACKED_LEN == aurora_render::PHOTO_FILTER_GPU_PARAMS_LEN);
     assert!(aurora_filters::BLACK_WHITE_PACKED_LEN == aurora_render::BLACK_WHITE_GPU_PARAMS_LEN);
-    assert!(aurora_filters::COLOR_BALANCE_PACKED_LEN == aurora_render::COLOR_BALANCE_GPU_PARAMS_LEN);
+    assert!(
+        aurora_filters::COLOR_BALANCE_PACKED_LEN == aurora_render::COLOR_BALANCE_GPU_PARAMS_LEN
+    );
     assert!(aurora_filters::THRESHOLD_PACKED_LEN == aurora_render::THRESHOLD_GPU_PARAMS_LEN);
     assert!(aurora_filters::POSTERIZE_PACKED_LEN == aurora_render::POSTERIZE_GPU_PARAMS_LEN);
     assert!(
         aurora_filters::BRIGHTNESS_CONTRAST_PACKED_LEN
             == aurora_render::BRIGHTNESS_CONTRAST_GPU_PARAMS_LEN
     );
-    assert!(aurora_filters::CHANNEL_MIXER_PACKED_LEN == aurora_render::CHANNEL_MIXER_GPU_PARAMS_LEN);
+    assert!(
+        aurora_filters::CHANNEL_MIXER_PACKED_LEN == aurora_render::CHANNEL_MIXER_GPU_PARAMS_LEN
+    );
     assert!(
         aurora_filters::SELECTIVE_COLOR_PACKED_LEN == aurora_render::SELECTIVE_COLOR_GPU_PARAMS_LEN
     );
@@ -21523,8 +21525,7 @@ static GPU_COLOR_BALANCE_DISPATCHES: std::sync::atomic::AtomicU64 =
 
 /// Test-only count of GPU Invert passes recorded (0.250.0).
 #[cfg(test)]
-static GPU_INVERT_DISPATCHES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static GPU_INVERT_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Test-only count of GPU Threshold passes recorded (0.250.0).
 #[cfg(test)]
 static GPU_THRESHOLD_DISPATCHES: std::sync::atomic::AtomicU64 =
@@ -86575,11 +86576,14 @@ mod tests {
             }
         }
 
-        /// 0.244.0: these four kinds have no GPU pass, so a visible layer of
-        /// any of them refuses the GPU path for the whole document and a hidden
-        /// one does not; neutral or not.
+        /// 0.250.0 (was `a_visible_layer_of_the_four_new_kinds_refuses_the_gpu_
+        /// path_and_a_hidden_one_does_not`): these four kinds now have a GPU
+        /// pass each (Brightness/Contrast's default mode through the Curves
+        /// pass), so a visible root, unmasked layer at `Normal` qualifies,
+        /// neutral or not, and a hidden one never disqualifies.
         #[test]
-        fn a_visible_layer_of_the_four_new_kinds_refuses_the_gpu_path_and_a_hidden_one_does_not() {
+        fn a_visible_layer_of_the_four_244_kinds_qualifies_for_the_gpu_path_and_a_hidden_one_is_ignored()
+         {
             let bc = |b, c, legacy| match aurora_core::BrightnessContrastParams::new(b, c, legacy) {
                 Ok(p) => Adjustment::BrightnessContrast(p),
                 Err(err) => unreachable!("{err:?}"),
@@ -86602,12 +86606,12 @@ mod tests {
                 assert!(crate::document_qualifies_for_gpu_compositing(&layers));
                 let id = add(&mut layers, adjustment.clone());
                 assert!(
-                    !crate::adjustment_layer_qualifies_for_gpu(&layers, id),
+                    crate::adjustment_layer_qualifies_for_gpu(&layers, id),
                     "{adjustment:?}"
                 );
                 assert!(
-                    !crate::document_qualifies_for_gpu_compositing(&layers),
-                    "{adjustment:?}: a visible layer keeps the document on the CPU"
+                    crate::document_qualifies_for_gpu_compositing(&layers),
+                    "{adjustment:?}: a visible layer keeps the document on the GPU"
                 );
                 if let Err(err) = layers.set_visible(id, false) {
                     unreachable!("{err:?}");
@@ -86885,11 +86889,13 @@ mod tests {
             assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
         }
 
-        /// 0.245.0: a visible Channel Mixer or Selective Color layer refuses the
-        /// GPU path for the whole document (no GPU pass yet) and a hidden one
-        /// does not; neutral or not.
+        /// 0.250.0 (was `a_visible_channel_mixer_or_selective_color_layer_
+        /// refuses_the_gpu_path`): Channel Mixer, Selective Color and Gradient
+        /// Map now have a GPU pass each, so a visible root, unmasked layer
+        /// qualifies (neutral or not) and a hidden one never disqualifies.
         #[test]
-        fn a_visible_channel_mixer_or_selective_color_layer_refuses_the_gpu_path() {
+        fn a_visible_channel_mixer_selective_color_or_gradient_map_layer_qualifies_for_the_gpu_path()
+         {
             let mut ranges = [[0.0_f32; 4]; 9];
             ranges[2] = [10.0, 0.0, 0.0, -10.0];
             let strong_selective = match aurora_core::SelectiveColorParams::new(ranges, true) {
@@ -86920,12 +86926,12 @@ mod tests {
                 assert!(crate::document_qualifies_for_gpu_compositing(&layers));
                 let id = add(&mut layers, adjustment.clone());
                 assert!(
-                    !crate::adjustment_layer_qualifies_for_gpu(&layers, id),
+                    crate::adjustment_layer_qualifies_for_gpu(&layers, id),
                     "{adjustment:?}"
                 );
                 assert!(
-                    !crate::document_qualifies_for_gpu_compositing(&layers),
-                    "{adjustment:?}: a visible layer keeps the document on the CPU"
+                    crate::document_qualifies_for_gpu_compositing(&layers),
+                    "{adjustment:?}: a visible layer keeps the document on the GPU"
                 );
                 if let Err(err) = layers.set_visible(id, false) {
                     unreachable!("{err:?}");
@@ -95830,6 +95836,8 @@ mod clip_tests;
 
 #[cfg(test)]
 mod gpu_adjustment_tests;
+#[cfg(test)]
+mod gpu_newest_adjustment_tests;
 #[cfg(test)]
 mod gpu_photo_adjustment_tests;
 

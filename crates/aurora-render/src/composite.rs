@@ -5867,12 +5867,7 @@ impl TileCompositor {
         };
         let device = context.device();
         let pass = self.invert.get_or_insert_with(|| {
-            UniformAdjustmentGpu::new(
-                device,
-                LABEL_INVERT,
-                INVERT_SHADER,
-                "fs_composite_invert",
-            )
+            UniformAdjustmentGpu::new(device, LABEL_INVERT, INVERT_SHADER, "fs_composite_invert")
         });
         pass.record(
             context,

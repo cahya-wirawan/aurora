@@ -22,9 +22,9 @@
 )]
 
 use crate::gpu_adjustment_tests::{
-    GPU_MODES, Pass, QUAD, add_adjustment, cpu_tile, edge_opaque, every_mode, gpu_matches_cpu,
-    gpu_tile, hash, max_diff, mode_bound, ok, out_of_gamut, pattern_layer, ramp, ramp_translucent,
-    random_opaque, random_translucent, run_cases, store, take_counts, tolerance,
+    COUNTERS, GPU_MODES, Pass, QUAD, add_adjustment, cpu_tile, edge_opaque, every_mode,
+    gpu_matches_cpu, gpu_tile, hash, max_diff, mode_bound, ok, out_of_gamut, pattern_layer, ramp,
+    ramp_translucent, random_opaque, random_translucent, run_cases, store, take_counts, tolerance,
     translucent_tolerance,
 };
 use crate::tests::real_gpu_context;
@@ -233,7 +233,7 @@ pub(crate) fn cases_of(pass: Pass) -> Vec<(&'static str, Adjustment)> {
         Pass::PhotoFilter => photo_filter_cases(),
         Pass::BlackWhite => black_white_cases(),
         Pass::ColorBalance => color_balance_cases(),
-        Pass::Levels | Pass::HueSaturation => Vec::new(),
+        _ => Vec::new(),
     }
 }
 
@@ -263,7 +263,7 @@ fn moderate(pass: Pass) -> Adjustment {
             ],
             true,
         ),
-        Pass::Levels | Pass::HueSaturation => unreachable!("not one of the five"),
+        _ => unreachable!("not one of the five"),
     }
 }
 
@@ -276,7 +276,7 @@ fn neutral(pass: Pass) -> Option<Adjustment> {
         Pass::PhotoFilter => Some(pf([255, 255, 255], 80.0, true)),
         Pass::BlackWhite => None,
         Pass::ColorBalance => Some(cbal([[0.0; 3]; 3], true)),
-        Pass::Levels | Pass::HueSaturation => unreachable!("not one of the five"),
+        _ => unreachable!("not one of the five"),
     }
 }
 
@@ -615,7 +615,7 @@ fn a_document_with_all_five_adjustments_composites_on_the_gpu() {
     };
     assert_eq!(
         take_counts(),
-        [0, 0, 0, 1, 1, 1, 1, 1],
+        [0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
         "one pass of each of the five kinds"
     );
     let cpu = cpu_tile(&layers, &mut store);
@@ -659,7 +659,7 @@ fn unsupported_five_adjustment_layers_fall_back_to_the_cpu() {
                 gpu_tile(&context, &mut compositor, &layers, &mut store).is_none(),
                 "{pass:?} {refusal}: the tile must fall back, not drop the layer"
             );
-            assert_eq!(take_counts(), [0; 8], "{pass:?} {refusal}");
+            assert_eq!(take_counts(), [0; COUNTERS], "{pass:?} {refusal}");
         }
         // A disabled mask is ignored on both paths.
         let (_dir, mut store) = store();
