@@ -5060,6 +5060,85 @@ mod tests {
         }
     }
 
+    /// 0.240.0: Black & White and Color Balance layers, an edit of each and
+    /// the history survive a save and reopen (manifest and journal replay),
+    /// with no manifest version bump (ordinals 7 and 8 appended).
+    #[test]
+    fn round_trips_black_white_and_color_balance_layers_and_their_history() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        if let Err(err) = history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let edits = [
+            (
+                aurora_doc::Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
+                match aurora_core::BlackWhiteParams::new(
+                    [-200.0, 300.0, 12.5, 0.0, 99.0, 1.0],
+                    true,
+                    211.0,
+                    64.0,
+                ) {
+                    Ok(p) => aurora_doc::Adjustment::BlackWhite(p),
+                    Err(err) => unreachable!("{err:?}"),
+                },
+            ),
+            (
+                aurora_doc::Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+                match aurora_core::ColorBalanceParams::new(
+                    [[1.0, -2.0, 3.0], [-4.0, 5.0, -6.0], [7.0, -8.0, 100.0]],
+                    false,
+                ) {
+                    Ok(p) => aurora_doc::Adjustment::ColorBalance(p),
+                    Err(err) => unreachable!("{err:?}"),
+                },
+            ),
+        ];
+        let mut wanted = Vec::new();
+        for (index, (start, edited)) in edits.into_iter().enumerate() {
+            let layer = match history.add_adjustment_layer_at(
+                &mut layers,
+                format!("Adjustment {index}"),
+                start,
+                None,
+                0,
+            ) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = history.set_adjustment(&mut layers, layer, edited.clone()) {
+                unreachable!("{err:?}");
+            }
+            wanted.push((layer, edited));
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.into_inner()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let replayed = match document.history.replay() {
+            Ok(replayed) => replayed,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for (layer, edited) in &wanted {
+            assert_eq!(document.layers.adjustment(*layer), Some(edited));
+            assert_eq!(replayed.adjustment(*layer), Some(edited));
+        }
+    }
+
     /// 0.204.0: a ranged Hue/Saturation adjustment layer, its edit and its history
     /// survive a save and reopen (manifest and journal replay), with no
     /// manifest version bump: the variant is appended after `Levels`.

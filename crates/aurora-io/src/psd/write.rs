@@ -314,10 +314,12 @@ impl Losses {
             aurora_doc::Adjustment::Levels(_) => 1,
             aurora_doc::Adjustment::HueSaturation(_)
             | aurora_doc::Adjustment::HueSaturationRanges(_) => 2,
-            // Never encoded (the save is refused first, 0.239.0).
+            // Never encoded (the save is refused first, 0.239.0, 0.240.0).
             aurora_doc::Adjustment::Vibrance(_)
             | aurora_doc::Adjustment::Exposure(_)
-            | aurora_doc::Adjustment::PhotoFilter(_) => return,
+            | aurora_doc::Adjustment::PhotoFilter(_)
+            | aurora_doc::Adjustment::BlackWhite(_)
+            | aurora_doc::Adjustment::ColorBalance(_) => return,
         };
         if rounding.rounded
             && let Some(count) = self.adjustment_rounded.get_mut(slot)

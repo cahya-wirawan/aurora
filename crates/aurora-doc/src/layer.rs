@@ -101,6 +101,12 @@ pub enum Adjustment {
     /// A Photo Filter (0.239.0, [`aurora_core::PhotoFilterParams`]),
     /// applied by `aurora_filters::PhotoFilterOp`. **Ordinal 6.**
     PhotoFilter(aurora_core::PhotoFilterParams),
+    /// Black & White (0.240.0, [`aurora_core::BlackWhiteParams`]), applied
+    /// by `aurora_filters::BlackWhiteOp`. **Ordinal 7.**
+    BlackWhite(aurora_core::BlackWhiteParams),
+    /// Color Balance (0.240.0, [`aurora_core::ColorBalanceParams`]),
+    /// applied by `aurora_filters::ColorBalanceOp`. **Ordinal 8.**
+    ColorBalance(aurora_core::ColorBalanceParams),
 }
 
 impl Adjustment {
@@ -114,6 +120,8 @@ impl Adjustment {
             Self::Vibrance(_) => "Vibrance",
             Self::Exposure(_) => "Exposure",
             Self::PhotoFilter(_) => "Photo Filter",
+            Self::BlackWhite(_) => "Black & White",
+            Self::ColorBalance(_) => "Color Balance",
         }
     }
 
@@ -151,6 +159,24 @@ impl Adjustment {
     pub const fn photo_filter(&self) -> Option<aurora_core::PhotoFilterParams> {
         match self {
             Self::PhotoFilter(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    /// The Black & White settings, `None` for other adjustments.
+    #[must_use]
+    pub const fn black_white(&self) -> Option<aurora_core::BlackWhiteParams> {
+        match self {
+            Self::BlackWhite(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    /// The Color Balance settings, `None` for other adjustments.
+    #[must_use]
+    pub const fn color_balance(&self) -> Option<aurora_core::ColorBalanceParams> {
+        match self {
+            Self::ColorBalance(p) => Some(*p),
             _ => None,
         }
     }
@@ -1199,5 +1225,155 @@ mod vibrance_exposure_photo_filter_wire_tests {
         assert!(v.vibrance().is_some() && v.exposure().is_none() && v.photo_filter().is_none());
         assert!(e.exposure().is_some() && e.vibrance().is_none() && e.photo_filter().is_none());
         assert!(p.photo_filter().is_some() && p.vibrance().is_none() && p.exposure().is_none());
+    }
+}
+
+/// `Adjustment::{BlackWhite, ColorBalance}` are appended after `PhotoFilter`
+/// (ordinals 7, 8): every earlier encoding, ordinals 0 to 6, is unchanged
+/// and a 0.239.0 build refuses the new layers (0.240.0, ADR 0009).
+#[cfg(test)]
+mod black_white_color_balance_wire_tests {
+    use super::{Adjustment, LayerKind};
+
+    /// `Adjustment` exactly as a 0.239.0 build declares it.
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Adjustment239 {
+        Curves(aurora_core::CurvesParams),
+        Levels(aurora_core::LevelsParams),
+        HueSaturation(aurora_core::HueSaturationParams),
+        HueSaturationRanges(aurora_core::HueSaturationRangesParams),
+        Vibrance(aurora_core::VibranceParams),
+        Exposure(aurora_core::ExposureParams),
+        PhotoFilter(aurora_core::PhotoFilterParams),
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Kind239 {
+        Pixel { bounds: aurora_core::Rect },
+        Group { children: Vec<super::LayerId> },
+        Adjustment(Adjustment239),
+    }
+
+    fn encode<T: serde::Serialize>(value: &T) -> Vec<u8> {
+        match postcard::to_allocvec(value) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn ranged() -> aurora_core::HueSaturationRangesParams {
+        let plain = aurora_core::HueSaturationRangesParams::plain(
+            aurora_core::HueSaturationParams::identity(),
+        );
+        match plain.with_range(
+            2,
+            match aurora_core::HueRange::new([75.0, 105.0, 135.0, 165.0], 11.0, -22.0, 33.0) {
+                Ok(range) => range,
+                Err(err) => unreachable!("{err:?}"),
+            },
+        ) {
+            Some(ranged) => ranged,
+            None => unreachable!("range 2 exists"),
+        }
+    }
+
+    #[test]
+    fn ordinals_zero_to_six_keep_their_bytes() {
+        let pairs = [
+            (
+                Adjustment::Curves(aurora_core::CurvesParams::identity()),
+                Adjustment239::Curves(aurora_core::CurvesParams::identity()),
+            ),
+            (
+                Adjustment::Levels(aurora_core::LevelsParams::identity()),
+                Adjustment239::Levels(aurora_core::LevelsParams::identity()),
+            ),
+            (
+                Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
+                Adjustment239::HueSaturation(aurora_core::HueSaturationParams::identity()),
+            ),
+            (
+                Adjustment::HueSaturationRanges(ranged()),
+                Adjustment239::HueSaturationRanges(ranged()),
+            ),
+            (
+                Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
+                Adjustment239::Vibrance(aurora_core::VibranceParams::identity()),
+            ),
+            (
+                Adjustment::Exposure(aurora_core::ExposureParams::identity()),
+                Adjustment239::Exposure(aurora_core::ExposureParams::identity()),
+            ),
+            (
+                Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+                Adjustment239::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+            ),
+        ];
+        for (index, (new, old)) in pairs.into_iter().enumerate() {
+            let new_bytes = encode(&LayerKind::Adjustment(new));
+            let old_bytes = encode(&Kind239::Adjustment(old));
+            assert_eq!(new_bytes, old_bytes, "ordinal {index}");
+            assert_eq!(new_bytes.get(1).copied().map(usize::from), Some(index));
+            assert!(postcard::from_bytes::<Kind239>(&new_bytes).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_new_adjustments_are_ordinals_seven_and_eight_and_an_old_reader_refuses_them() {
+        let cases = [
+            (
+                Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
+                7_u8,
+            ),
+            (
+                Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+                8,
+            ),
+        ];
+        for (adjustment, ordinal) in cases {
+            let kind = LayerKind::Adjustment(adjustment);
+            let bytes = encode(&kind);
+            assert_eq!(bytes.get(..2), Some([2_u8, ordinal].as_slice()), "{kind:?}");
+            match postcard::from_bytes::<LayerKind>(&bytes) {
+                Ok(decoded) => assert_eq!(decoded, kind),
+                Err(err) => unreachable!("{err:?}"),
+            }
+            assert!(
+                postcard::from_bytes::<Kind239>(&bytes).is_err(),
+                "a 0.239.0 build refuses ordinal {ordinal}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_payload_is_a_decode_error_not_a_repair() {
+        let bw = LayerKind::Adjustment(Adjustment::BlackWhite(
+            aurora_core::BlackWhiteParams::default(),
+        ));
+        let mut bytes = encode(&bw);
+        // Replace the first weight (right after the two ordinal bytes) by NaN.
+        for (slot, byte) in bytes.iter_mut().skip(2).zip(f32::NAN.to_le_bytes()) {
+            *slot = byte;
+        }
+        assert!(postcard::from_bytes::<LayerKind>(&bytes).is_err());
+        let cb = LayerKind::Adjustment(Adjustment::ColorBalance(
+            aurora_core::ColorBalanceParams::identity(),
+        ));
+        let mut bytes = encode(&cb);
+        for (slot, byte) in bytes.iter_mut().skip(2).zip(1000.0_f32.to_le_bytes()) {
+            *slot = byte;
+        }
+        assert!(postcard::from_bytes::<LayerKind>(&bytes).is_err());
+    }
+
+    #[test]
+    fn labels_and_accessors_name_the_right_variant() {
+        let b = Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default());
+        let c = Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity());
+        assert_eq!((b.label(), c.label()), ("Black & White", "Color Balance"));
+        assert!(b.black_white().is_some() && b.color_balance().is_none());
+        assert!(c.color_balance().is_some() && c.black_white().is_none());
+        let v = Adjustment::Vibrance(aurora_core::VibranceParams::identity());
+        assert!(v.black_white().is_none() && v.color_balance().is_none());
     }
 }

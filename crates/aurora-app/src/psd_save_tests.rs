@@ -580,6 +580,14 @@ fn preflight_refusal_shows_couldnt_save_with_reason() {
 fn vibrance_exposure_and_photo_filter_layers_refuse_the_psd_save_by_name() {
     let cases = [
         (
+            aurora_doc::Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
+            "Black & White",
+        ),
+        (
+            aurora_doc::Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+            "Color Balance",
+        ),
+        (
             aurora_doc::Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
             "Vibrance",
         ),

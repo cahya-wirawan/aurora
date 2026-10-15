@@ -7,8 +7,12 @@
 //! ([`curves`]); Levels ([`levels`]) joined in 0.202.0 and Hue/Saturation
 //! ([`hue_saturation`]) in 0.203.0; Vibrance ([`vibrance`]), Exposure
 //! ([`exposure`]) and Photo Filter ([`photo_filter`]) joined in 0.239.0
-//! (CPU only); every other filter and adjustment is still to come.
+//! (CPU only); Black & White ([`black_white`]) and Color Balance
+//! ([`color_balance`]) joined in 0.240.0 (CPU only); every other filter and
+//! adjustment is still to come.
 
+pub mod black_white;
+pub mod color_balance;
 pub mod curves;
 pub mod exposure;
 pub mod hue_saturation;
@@ -18,6 +22,8 @@ pub mod shadow;
 pub mod stroke;
 pub mod vibrance;
 
+pub use black_white::BlackWhiteOp;
+pub use color_balance::{ColorBalanceOp, SHIFT_AT_100, range_weights};
 pub use curves::{CURVES_LUT_INTERVALS, CURVES_PACKED_HEADER, CURVES_PACKED_LEN, CurvesLut};
 pub use exposure::ExposureOp;
 pub use hue_saturation::{HUE_SATURATION_PACKED_LEN, HueSaturationOp, range_weight};
