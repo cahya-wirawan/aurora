@@ -1202,14 +1202,10 @@ fn corpus_files_where_aurora_shows_the_adjustment_stronger_say_so_or_are_isolate
     }
     if let Some(document) = corpus("passthrough_clipping_mask_adjustment.psd") {
         let items = document.report.items.join("\n");
-        // The clipped layer here is a pixel layer whose base is a group, not
-        // a clipped adjustment: the existing clipping note names it, and no
-        // false claim about a clipped adjustment is made. (Aurora's error on
-        // this file is dominated by that unclipped layer.)
-        assert!(
-            items.contains("1 clipped layer is shown unclipped"),
-            "{items}"
-        );
+        // The clipped layer here is a pixel layer whose base is a group,
+        // which the compositor clips to since 0.243.0: nothing is said
+        // about clipping, and no false claim about a clipped adjustment.
+        assert!(!items.contains("shown unclipped"), "{items}");
         assert!(!items.contains("clipped adjustment layer"), "{items}");
         assert_eq!(adjustments_of(&document).len(), 2);
     }

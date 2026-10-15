@@ -701,7 +701,7 @@ fn note_text(note: Note, n: u64) -> String {
         ),
         Note::ClippingDropped => format!(
             "{n} clipped layer{s} {is} shown unclipped — {} base is an adjustment layer, {} a \
-             group (Aurora can't clip a group yet), or there is no layer beneath to clip to.",
+             group, or nothing is beneath.",
             if one { "its" } else { "their" },
             if one { "it is" } else { "they are" }
         ),

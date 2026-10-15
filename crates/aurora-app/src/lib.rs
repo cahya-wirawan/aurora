@@ -87194,7 +87194,7 @@ mod tests {
         /// The group-Fill decision (0.181.0): an isolated (non-Pass
         /// Through) group's Fill fades its composited content exactly like
         /// its opacity (psd-tools' `shape_const`); a Pass Through group's
-        /// Fill is still not applied, and reported on open.
+        /// Fill multiplies its interpolation factor since 0.243.0.
         #[test]
         fn isolated_group_fill_fades_its_content_like_opacity() {
             let (_dir, mut store) = real_tile_store();
@@ -87208,13 +87208,14 @@ mod tests {
             ok(layers.set_fill_opacity(group, 1.0));
             ok(layers.set_opacity(group, 0.5));
             assert_eq!(composite(&layers, &mut store), filled);
-            // Pass Through: Fill ignored (reported by the PSD reader).
+            // Pass Through (0.243.0): Fill 50 % mixes the children in half
+            // way, the same picture as for the isolated group.
             ok(layers.set_opacity(group, 1.0));
             ok(layers.set_fill_opacity(group, 0.5));
             ok(layers.set_blend_mode(group, aurora_doc::BlendMode::PassThrough));
             near(
                 texel(&composite(&layers, &mut store), 0, 0),
-                [1.0, 0.0, 0.0, 1.0],
+                [0.5, 0.0, 0.5, 1.0],
             );
         }
 
