@@ -397,6 +397,27 @@ fn a_pass_through_clip_base_keeps_what_its_children_blend_with_the_backdrop() {
     near(px(&acc, 6, 6), [0.5, 0.5, 0.5, 1.0]);
 }
 
+/// A partly covered texel is where the backdrop has to be unmixed from the
+/// group's content: Multiply of a half-covered red over grey 0.5 gives
+/// (0.5, 0.25, 0.25) with or without a (transparent) clipped layer.
+#[test]
+fn a_pass_through_clip_base_unmixes_the_backdrop_at_partial_coverage() {
+    let (_dir, mut store) = store();
+    let mut layers = aurora_doc::LayerTree::new();
+    solid(&mut layers, &mut store, [0.5, 0.5, 0.5, 1.0]);
+    let group = ok(layers.add_group("g", None));
+    ok(layers.set_blend_mode(group, aurora_doc::BlendMode::PassThrough));
+    let child = layer(&mut layers, &mut store, Some(group), 10, |x, _| {
+        if x < 4 { [1.0, 0.0, 0.0, 0.5] } else { CLEAR }
+    });
+    ok(layers.set_blend_mode(child, aurora_doc::BlendMode::Multiply));
+    let plain = px(&composite(&layers, &mut store), 1, 1);
+    near(plain, [0.5, 0.25, 0.25, 1.0]);
+    let clipped = layer(&mut layers, &mut store, None, 10, |_, _| CLEAR);
+    clip(&mut layers, clipped);
+    near(px(&composite(&layers, &mut store), 1, 1), plain);
+}
+
 #[test]
 fn a_pass_through_groups_fill_scales_its_interpolation() {
     let (_dir, mut store) = store();

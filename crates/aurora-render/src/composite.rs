@@ -21684,6 +21684,72 @@ mod tests {
         );
     }
 
+    /// 0.243.0: the in-shader VividLight takes Photoshop's source poles
+    /// (`Cs == 0 -> 0`, `Cs == 1 -> 1`) ahead of the backdrop's own
+    /// guards: Cb (1, 0, 0.5) under Cs (0, 1, 0.5), opaque, gives red 0
+    /// (the old order said 1) and green 1 (the old order said 0).
+    #[test]
+    fn composite_vivid_light_takes_the_source_poles_before_the_backdrop_guards() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+        let bottom_texels = solid_texels([1.0, 0.0, 0.5, 1.0]);
+        let top_texels = solid_texels([0.0, 1.0, 0.5, 1.0]);
+        let backdrop = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 0.0, 0.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let bottom = tile_from_texels(device, queue, &bottom_texels, wgpu::TextureUsages::empty());
+        let top = tile_from_texels(device, queue, &top_texels, wgpu::TextureUsages::empty());
+        let dst = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let bottom_view = bottom.create_view(&wgpu::TextureViewDescriptor::default());
+        let top_view = top.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut compositor = TileCompositor::new(device);
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(
+                &context,
+                encoder,
+                &backdrop_view,
+                &bottom_view,
+                1.0,
+            );
+        });
+        submit_one(&context, |encoder| {
+            compositor.composite_vivid_light_over_with_opacity(
+                &context,
+                encoder,
+                &top_view,
+                &backdrop_view,
+                &dst_view,
+                1.0,
+            );
+        });
+        assert_eq!(
+            read_texel_at(device, queue, &dst, 3, 3),
+            (0.0, 1.0, 0.5, 1.0)
+        );
+        let cpu_out = composite_tile_cpu(&[
+            (&bottom_texels, 1.0, BlendMode::Normal),
+            (&top_texels, 1.0, BlendMode::VividLight),
+        ]);
+        assert_whole_tile_matches(
+            &read_rgba8(device, queue, &dst),
+            &rgba8_of(&cpu_out),
+            "the in-shader VividLight and the CPU disagree at the source poles",
+        );
+    }
+
     #[test]
     /// A non-`1.0` opacity on the `VividLight` path, exercising the
     /// `s.a * opacity.value` scale — **and the fixture that reaches the dodge

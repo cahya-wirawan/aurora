@@ -1210,3 +1210,42 @@ fn corpus_files_where_aurora_shows_the_adjustment_stronger_say_so_or_are_isolate
         assert_eq!(adjustments_of(&document).len(), 2);
     }
 }
+
+/// 0.243.0: a clipped layer whose base is a group is clipped for real, so
+/// the open does not report it as shown unclipped; one with nothing
+/// beneath it still is.
+#[test]
+fn a_layer_clipped_to_a_group_is_not_reported_as_unclipped() {
+    let build = |with_group_below: bool| {
+        TestPsd::new(1, 2, 2, 8).with(|p| {
+            let mut layers = Vec::new();
+            if with_group_below {
+                layers.push(TestLayer::divider());
+                layers.push(TestLayer::pixels(
+                    "p",
+                    0,
+                    0,
+                    2,
+                    2,
+                    8,
+                    &[[255, 0, 0, 255]; 4],
+                ));
+                layers.push(TestLayer::group("G", *b"norm"));
+            }
+            layers.push(
+                TestLayer::pixels("clipped", 0, 0, 2, 2, 8, &[[0, 0, 255, 255]; 4])
+                    .with(|l| l.clipping = 1),
+            );
+            p.layers = layers;
+        })
+    };
+    let document = ok(read(&build(true).write()));
+    let items = document.report.items.join("\n");
+    assert!(!items.contains("shown unclipped"), "{items}");
+    let document = ok(read(&build(false).write()));
+    let items = document.report.items.join("\n");
+    assert!(
+        items.contains("1 clipped layer is shown unclipped"),
+        "{items}"
+    );
+}
