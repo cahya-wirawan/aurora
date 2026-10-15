@@ -516,7 +516,15 @@ impl AdjustSlider {
             Self::Offset => (-(OFFSET_MAX as f64), OFFSET_MAX as f64),
             Self::Gamma => (GAMMA_MIN as f64, GAMMA_MAX as f64),
             Self::Density => (1.0, 100.0),
-            Self::Red | Self::Green | Self::Blue => (0.0, 255.0),
+            Self::Red
+            | Self::Green
+            | Self::Blue
+            | Self::GradientStartRed
+            | Self::GradientStartGreen
+            | Self::GradientStartBlue
+            | Self::GradientEndRed
+            | Self::GradientEndGreen
+            | Self::GradientEndBlue => (0.0, 255.0),
             Self::BwReds
             | Self::BwYellows
             | Self::BwGreens
@@ -544,12 +552,6 @@ impl AdjustSlider {
             | Self::SelectiveMagenta
             | Self::SelectiveYellow
             | Self::SelectiveBlack => (-(SELECTIVE_COLOR_MAX as f64), SELECTIVE_COLOR_MAX as f64),
-            Self::GradientStartRed
-            | Self::GradientStartGreen
-            | Self::GradientStartBlue
-            | Self::GradientEndRed
-            | Self::GradientEndGreen
-            | Self::GradientEndBlue => (0.0, 255.0),
         }
     }
 
@@ -1204,6 +1206,7 @@ fn set_checkbox_live(
 /// Shows exactly the group of `kind` (none: the whole column hides) and
 /// enables only its widgets; the two Black & White tint sliders are live
 /// only when `tint_on`.
+#[allow(clippy::too_many_lines)] // one block per widget kind
 fn set_shown(
     tree: &mut WidgetTree<WidgetKind>,
     controls: AdjustControls,
@@ -1515,7 +1518,9 @@ pub fn sync_adjust_controls(
     let kind = AdjustKind::of(adjustment);
     let tint_on = adjustment.black_white().is_some_and(|p| p.tint());
     let mixer_mono = adjustment.channel_mixer().is_some_and(|p| p.monochrome());
-    let gradient_colours = adjustment.gradient_map().is_some_and(|p| p.is_two_stop());
+    let gradient_colours = adjustment
+        .gradient_map()
+        .is_some_and(aurora_core::GradientMapParams::is_two_stop);
     let mut changed = set_shown(tree, controls, kind, tint_on, mixer_mono, gradient_colours)?;
     if let Some(filter) = adjustment.photo_filter() {
         changed |= sync_checkbox(tree, controls.preserve, filter.preserve_luminosity())?;
@@ -2556,10 +2561,7 @@ mod tests {
         }
     }
 
-    fn label_text(
-        ws: &crate::Workspace,
-        id: aurora_widgets::WidgetId,
-    ) -> String {
+    fn label_text(ws: &crate::Workspace, id: aurora_widgets::WidgetId) -> String {
         match ws.tree.payload(id) {
             Some(WidgetKind::Label(label)) => label.text.clone(),
             other => unreachable!("{other:?}"),

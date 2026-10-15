@@ -2011,7 +2011,13 @@ mod gradient_map_wire_tests {
             v.extend_from_slice(&[0, 0, 0]);
             v
         };
-        for bytes in [bad_position, bad_method, one_stop, vec![2, 15], vec![2, 15, 2]] {
+        for bytes in [
+            bad_position,
+            bad_method,
+            one_stop,
+            vec![2, 15],
+            vec![2, 15, 2],
+        ] {
             assert!(
                 postcard::from_bytes::<LayerKind>(&bytes).is_err(),
                 "{bytes:?}"

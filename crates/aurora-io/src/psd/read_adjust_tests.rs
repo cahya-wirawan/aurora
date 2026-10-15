@@ -816,7 +816,9 @@ fn every_key_is_recognised_and_only_these_five() {
         assert!(parse_block(k, &[]).is_some());
     }
     // The four of 0.244.0 are keys too (CgEd is not: it only attaches).
-    for k in [b"nvrt", b"thrs", b"post", b"brit", b"mixr", b"selc", b"grdm", b"clrL"] {
+    for k in [
+        b"nvrt", b"thrs", b"post", b"brit", b"mixr", b"selc", b"grdm", b"clrL",
+    ] {
         assert!(read_adjust::is_key(*k));
         assert!(parse_block(k, &[]).is_some());
     }

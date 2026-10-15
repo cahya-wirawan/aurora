@@ -414,10 +414,7 @@ fn the_left_out_note_no_longer_names_the_channel_mixer() {
         .write(),
     ));
     let items = document.report.items.join("\n");
-    assert!(
-        items.contains("1 adjustment layer (of a kind"),
-        "{items}"
-    );
+    assert!(items.contains("1 adjustment layer (of a kind"), "{items}");
     assert!(
         items.contains("Channel Mixer, Selective Color and Gradient Map adjustment"),
         "{items}"
@@ -477,7 +474,10 @@ fn corpus_neutral_layers_import_as_identity_without_a_report_line() {
     // 0.248.0: Gradient Map imports and Color Lookup has its own line, so
     // nothing is left out as "of a kind Aurora does not know".
     assert!(!items.contains("adjustment layers"), "{items}");
-    assert!(items.contains("1 Color Lookup layer was left out"), "{items}");
+    assert!(
+        items.contains("1 Color Lookup layer was left out"),
+        "{items}"
+    );
 }
 
 // ---------------------------------------------------------------------

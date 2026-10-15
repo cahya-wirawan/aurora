@@ -1009,7 +1009,10 @@ fn flag(v: u8) -> Result<bool, ()> {
 /// default midpoints, opaque transparency stops, RGB colour stops, a Solid
 /// gradient. **Nothing about the result is compared with Photoshop's
 /// pixels** (no fixture holds a mapped picture).
-pub(super) fn gradient_map_adjustment(block: &GradientBlock, gray: bool) -> Result<Adjustment, Note> {
+pub(super) fn gradient_map_adjustment(
+    block: &GradientBlock,
+    gray: bool,
+) -> Result<Adjustment, Note> {
     if gray {
         return Err(Note::Grayscale(Kind::GradientMap));
     }

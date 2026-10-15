@@ -164,11 +164,10 @@ impl TryFrom<Wire> for GradientMapParams {
         if v.0.len() > GRADIENT_MAP_MAX_STOPS {
             return Err(GradientMapError::TooManyStops);
         }
-        let stops = v
-            .0
-            .iter()
-            .map(|&[p, r, g, b]| GradientStop::new(p, [r, g, b]))
-            .collect();
+        let stops =
+            v.0.iter()
+                .map(|&[p, r, g, b]| GradientStop::new(p, [r, g, b]))
+                .collect();
         Self::new_with(stops, v.1, v.2, GradientInterpolation::from_byte(v.3)?)
     }
 }
@@ -394,11 +393,13 @@ mod tests {
         assert_eq!(with(&|s| s[1].colour[1] = -0.001), Err(E::Colour));
         assert!(with(&|s| s[1].colour = [1.0, 0.0, 1.0]).is_ok());
         // Equal positions (a hard step) are legal; going backwards is not.
-        assert!(with(&|s| {
-            s[0].position = 0.5;
-            s[1].position = 0.5;
-        })
-        .is_ok());
+        assert!(
+            with(&|s| {
+                s[0].position = 0.5;
+                s[1].position = 0.5;
+            })
+            .is_ok()
+        );
         assert_eq!(
             with(&|s| {
                 s[0].position = 0.6;
@@ -435,7 +436,11 @@ mod tests {
         let Ok(bytes) = postcard::to_allocvec(&p) else {
             unreachable!("encodes");
         };
-        assert_eq!(bytes.len(), 1 + 2 * 16 + 3, "count, two stops, two bools, method");
+        assert_eq!(
+            bytes.len(),
+            1 + 2 * 16 + 3,
+            "count, two stops, two bools, method"
+        );
         assert_eq!(bytes[0], 2);
         assert_eq!(bytes[33], 1, "reverse");
         assert_eq!(bytes[34], 0, "dither");

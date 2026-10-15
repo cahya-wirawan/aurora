@@ -129,7 +129,7 @@ fn fill_adjustments_error_by_hidden_layer() {
     let (w, h) = document.canvas_size;
     let mut layers = document.layers;
     for id in crate::layer_ids_in_order(&layers) {
-        let Some(label) = layers.adjustment(id).map(|a| a.label()) else {
+        let Some(label) = layers.adjustment(id).map(aurora_doc::Adjustment::label) else {
             continue;
         };
         let was = layers.visible(id);

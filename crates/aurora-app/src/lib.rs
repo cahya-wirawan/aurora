@@ -41616,7 +41616,11 @@ mod tests {
         // 0.241.0: five of those (Exposure, Vibrance, Color Balance, Black &
         // White, Photo Filter) are imported, 8 left out: max 230 -> 204, mean
         // 125.9 / 51.5 / 32.0 -> 106.6 / 30.5 / 26.0.
-        ("fill_adjustments.psd", 204.0, Some("1 Color Lookup layer was left out")),
+        (
+            "fill_adjustments.psd",
+            204.0,
+            Some("1 Color Lookup layer was left out"),
+        ),
         // A clipped layer whose base is not a pixel layer shown unclipped
         // (0.201.0: the other clipped layers are clipped for real).
         (
@@ -84459,6 +84463,7 @@ mod tests {
         /// Gray mix is the first row whatever tab is selected; undo moves the
         /// editor.
         #[test]
+        #[allow(clippy::indexing_slicing)]
         fn gradient_map_reverse_and_colour_sliders_are_wired_one_undo_step_each() {
             use aurora_ui::AdjustSlider as S;
             let (mut rig, id) = Rig::adjust_layer(aurora_doc::Adjustment::GradientMap(
@@ -86419,6 +86424,11 @@ mod tests {
         /// backdrop, in both directions, with a hard step, and the backdrop's
         /// alpha kept.
         #[test]
+        #[allow(
+            clippy::indexing_slicing,
+            clippy::needless_range_loop,
+            clippy::cast_possible_truncation
+        )]
         fn gradient_map_matches_an_independent_model_and_keeps_alpha() {
             let map = |stops: &[(f32, [f32; 3])], reverse: bool| {
                 let stops = stops
@@ -86489,7 +86499,11 @@ mod tests {
                 Adjustment::GradientMap(aurora_core::GradientMapParams::black_to_white()),
             );
             let got = first(&layers, &mut store);
-            assert_close(got, [0.362, 0.362, 0.362, 1.0], "black to white is the grey");
+            assert_close(
+                got,
+                [0.362, 0.362, 0.362, 1.0],
+                "black to white is the grey",
+            );
             let (_dir2, mut store2) = real_tile_store();
             let mut layers2 = solid_root_stack(
                 &mut store2,

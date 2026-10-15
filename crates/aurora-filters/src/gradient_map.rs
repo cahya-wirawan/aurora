@@ -110,7 +110,10 @@ mod tests {
     use aurora_core::{GradientMapParams, GradientStop};
 
     fn params(stops: &[(f32, [f32; 3])], reverse: bool) -> GradientMapParams {
-        let stops = stops.iter().map(|&(p, c)| GradientStop::new(p, c)).collect();
+        let stops = stops
+            .iter()
+            .map(|&(p, c)| GradientStop::new(p, c))
+            .collect();
         match GradientMapParams::new(stops, reverse, false) {
             Ok(p) => p,
             Err(err) => unreachable!("{err:?}"),
@@ -170,7 +173,10 @@ mod tests {
                     for &b in &steps {
                         let got = op.apply([r, g, b]);
                         let want = model(&FIVE, reverse, [r, g, b]);
-                        assert!(close(got, want), "{r} {g} {b} rev {reverse}: {got:?} {want:?}");
+                        assert!(
+                            close(got, want),
+                            "{r} {g} {b} rev {reverse}: {got:?} {want:?}"
+                        );
                     }
                 }
             }
@@ -200,10 +206,12 @@ mod tests {
         let op = GradientMapOp::new(&params(&FIVE, false));
         // Just below 0.5 the 0.3..0.5 segment is nearly its end colour; at
         // 0.5 and after, the second 0.5 stop's colour begins.
-        assert!(close(op.colour_at(0.499_999), [0.5, 0.5, 0.0]) || {
-            let c = op.colour_at(0.499_999);
-            (c[0] - 0.5).abs() < 1e-3 && (c[1] - 0.5).abs() < 1e-3
-        });
+        assert!(
+            close(op.colour_at(0.499_999), [0.5, 0.5, 0.0]) || {
+                let c = op.colour_at(0.499_999);
+                (c[0] - 0.5).abs() < 1e-3 && (c[1] - 0.5).abs() < 1e-3
+            }
+        );
         assert_eq!(op.colour_at(0.5), [0.0, 0.8, 0.8]);
         let after = op.colour_at(0.500_001);
         assert!((after[1] - 0.8).abs() < 1e-3 && after[0] < 1e-3);

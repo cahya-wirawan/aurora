@@ -10,6 +10,7 @@
     clippy::float_cmp,
     clippy::indexing_slicing,
     clippy::cast_possible_truncation,
+    clippy::trivially_copy_pass_by_ref,
     clippy::too_many_lines
 )]
 
@@ -139,7 +140,10 @@ fn map_of(a: Result<Adjustment, String>) -> GradientMapParams {
 }
 
 fn gradient(stops: &[(f32, [f32; 3])], reverse: bool, dither: bool) -> Adjustment {
-    let stops = stops.iter().map(|&(p, c)| GradientStop::new(p, c)).collect();
+    let stops = stops
+        .iter()
+        .map(|&(p, c)| GradientStop::new(p, c))
+        .collect();
     Adjustment::GradientMap(ok(GradientMapParams::new(stops, reverse, dither)))
 }
 
@@ -212,7 +216,10 @@ fn positions_and_colours_are_scaled_by_4096_and_65535() {
 
 #[test]
 fn what_the_model_cannot_hold_is_left_out_with_its_own_reason() {
-    let reason = |s: &Spec| read_one(b"grdm", &s.bytes(), false).unwrap_err();
+    let reason = |s: &Spec| match read_one(b"grdm", &s.bytes(), false) {
+        Err(note) => note,
+        Ok(a) => unreachable!("expected a note, got {a:?}"),
+    };
     let mut s = Spec::new();
     s.colours[0].1 = 49;
     assert_eq!(reason(&s), "GradientLeftOut(Midpoint)");
@@ -235,7 +242,10 @@ fn what_the_model_cannot_hold_is_left_out_with_its_own_reason() {
     assert_eq!(s.colours.len(), 65);
     assert_eq!(reason(&s), "GradientLeftOut(Stops)");
     s.colours.pop();
-    assert!(read_one(b"grdm", &s.bytes(), false).is_ok(), "64 stops import");
+    assert!(
+        read_one(b"grdm", &s.bytes(), false).is_ok(),
+        "64 stops import"
+    );
 }
 
 #[test]
@@ -373,7 +383,10 @@ fn a_gradient_map_opens_as_a_layer_with_an_honest_unvalidated_line() {
         items.contains("1 Gradient Map layer is shown with Classic colour interpolation"),
         "{items}"
     );
-    assert!(items.contains("has not been compared with Photoshop"), "{items}");
+    assert!(
+        items.contains("has not been compared with Photoshop"),
+        "{items}"
+    );
     assert!(!items.contains("smoothness"), "{items}");
 }
 
@@ -422,7 +435,10 @@ fn left_out_gradient_maps_get_their_own_report_lines_and_no_layer() {
         let (items, children, found) = items_of(b"grdm", &block);
         assert!(found.is_empty(), "{text}");
         assert_eq!(children, 1, "only the pixel layer: {text}");
-        assert!(items.contains("1 Gradient Map layer was left out"), "{items}");
+        assert!(
+            items.contains("1 Gradient Map layer was left out"),
+            "{items}"
+        );
         assert!(items.contains(text), "{text}: {items}");
         assert!(!items.contains("shown with Classic"), "{items}");
     }
@@ -431,15 +447,25 @@ fn left_out_gradient_maps_get_their_own_report_lines_and_no_layer() {
 #[test]
 fn the_generic_left_out_line_no_longer_claims_gradient_map_or_color_lookup() {
     let document = ok(read(
-        &file_with(b"mixr", &unhex(super::mixer_selective_tests::MIXR_NEUTRAL_FOR_TESTS), |l| {
-            l.blocks.push((*b"hue ", vec![0; 4]));
-        })
+        &file_with(
+            b"mixr",
+            &unhex(super::mixer_selective_tests::MIXR_NEUTRAL_FOR_TESTS),
+            |l| {
+                l.blocks.push((*b"hue ", vec![0; 4]));
+            },
+        )
         .write(),
     ));
     let items = document.report.items.join("\n");
-    assert!(items.contains("1 adjustment layer (of a kind Aurora does not know)"), "{items}");
+    assert!(
+        items.contains("1 adjustment layer (of a kind Aurora does not know)"),
+        "{items}"
+    );
     assert!(!items.contains("Gradient Map, Color Lookup"), "{items}");
-    assert!(items.contains("Selective Color and Gradient Map adjustment"), "{items}");
+    assert!(
+        items.contains("Selective Color and Gradient Map adjustment"),
+        "{items}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -489,11 +515,21 @@ fn a_color_lookup_with_a_table_is_left_out_and_its_name_is_reported() {
         unreachable!("readable")
     };
     assert!(!parsed_block.empty);
-    assert_eq!(parsed_block.name.as_deref(), Some("FujiFilmLook"), "controls dropped");
+    assert_eq!(
+        parsed_block.name.as_deref(),
+        Some("FujiFilmLook"),
+        "controls dropped"
+    );
     let (items, children, found) = items_of(b"clrL", &block);
     assert!(found.is_empty() && children == 1);
-    assert!(items.contains("1 Color Lookup layer was left out — it uses a lookup table"), "{items}");
-    assert!(items.contains("Named: \u{201c}FujiFilmLook\u{201d}."), "{items}");
+    assert!(
+        items.contains("1 Color Lookup layer was left out — it uses a lookup table"),
+        "{items}"
+    );
+    assert!(
+        items.contains("Named: \u{201c}FujiFilmLook\u{201d}."),
+        "{items}"
+    );
     assert!(
         read_one(b"clrL", &block, false).is_err() && read_one(b"clrL", &block, true).is_err(),
         "never becomes a layer, in colour or grey"
@@ -508,7 +544,10 @@ fn a_very_long_lookup_name_is_capped_and_garbage_is_unreadable() {
     };
     assert_eq!(b.name.map(|n| n.chars().count()), Some(64));
     let (items, ..) = items_of(b"clrL", &[0, 1, 0xde, 0xad]);
-    assert!(items.contains("1 Color Lookup layer was left out — its settings could not be read"), "{items}");
+    assert!(
+        items.contains("1 Color Lookup layer was left out — its settings could not be read"),
+        "{items}"
+    );
     assert!(read_one(b"clrL", &[], false).is_err());
     let mut bad_version = unhex(CLRL_EMPTY);
     bad_version[1] = 2;
@@ -556,7 +595,11 @@ fn the_writer_reads_back_as_itself_and_uses_photoshops_fixed_fields() {
     // 10-byte stops) and 40 bytes of settings: 62 bytes, then padding to
     // four (2 bytes in the original, 2 in ours). Ours is identical.
     let last = |d: &[u8]| d[d.len() - 2 - 62..d.len() - 2].to_vec();
-    assert_eq!(last(&e.data), last(&own), "transparency stops and settings match Photoshop's block");
+    assert_eq!(
+        last(&e.data),
+        last(&own),
+        "transparency stops and settings match Photoshop's block"
+    );
 }
 
 #[test]
@@ -574,7 +617,11 @@ fn photoshops_own_block_survives_read_write_read_with_its_values() {
 
 #[test]
 fn positions_and_colours_off_the_files_grid_are_rounded_and_itemised() {
-    let off_position = gradient(&[(0.0, [0.0; 3]), (0.3, [0.5; 3]), (1.0, [1.0; 3])], false, false);
+    let off_position = gradient(
+        &[(0.0, [0.0; 3]), (0.3, [0.5; 3]), (1.0, [1.0; 3])],
+        false,
+        false,
+    );
     let e = encoded(&off_position);
     assert!(e.rounding.rounded);
     let Adjustment::GradientMap(back) = e.readback else {
@@ -585,7 +632,12 @@ fn positions_and_colours_off_the_files_grid_are_rounded_and_itemised() {
     assert!(encoded(&off_colour).rounding.rounded);
     let mut tree = aurora_doc::LayerTree::new();
     ok(tree.add_pixel_layer("A", rect(0, 0, 4, 4), None));
-    ok(tree.add_adjustment_layer_at("G", gradient(&[(0.0, [0.0; 3]), (1.0, [1.0; 3])], false, false), None, 0));
+    ok(tree.add_adjustment_layer_at(
+        "G",
+        gradient(&[(0.0, [0.0; 3]), (1.0, [1.0; 3])], false, false),
+        None,
+        0,
+    ));
     let report = ok(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()));
     assert!(report.items.is_empty(), "{:?}", report.items);
     ok(tree.add_adjustment_layer_at("G2", off_colour, None, 0));
@@ -623,13 +675,23 @@ fn a_gradient_map_round_trips_through_write_verify_and_read() {
     let dir = ok(tempfile::tempdir());
     let target = dir.path().join("g.psd");
     let outcome = ok(save(&mut doc, &target, false));
-    assert!(outcome.report.items.is_empty(), "{:?}", outcome.report.items);
+    assert!(
+        outcome.report.items.is_empty(),
+        "{:?}",
+        outcome.report.items
+    );
     let bytes = ok(std::fs::read(&target));
     let document = read_back(&bytes);
     let found = adjustments_of(&document);
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].0, "Duotone");
-    assert_eq!(found[0].1, doc.tree.adjustment(g).cloned().unwrap_or(Adjustment::Invert));
+    assert_eq!(
+        found[0].1,
+        doc.tree
+            .adjustment(g)
+            .cloned()
+            .unwrap_or(Adjustment::Invert)
+    );
     let id = document
         .layers
         .roots()
@@ -637,7 +699,10 @@ fn a_gradient_map_round_trips_through_write_verify_and_read() {
         .copied()
         .find(|&i| document.layers.name(i) == Some("Duotone"));
     let Some(id) = id else { unreachable!("layer") };
-    assert_eq!(document.layers.blend_mode(id), Some(aurora_doc::BlendMode::Multiply));
+    assert_eq!(
+        document.layers.blend_mode(id),
+        Some(aurora_doc::BlendMode::Multiply)
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -682,7 +747,10 @@ fn corpus_gradient_maps_import_and_color_lookups_are_left_out() {
         assert_eq!(p.stops()[0].colour[0], f32::from(0x7b7a_u16) / 65535.0);
         assert!(found.iter().all(|(_, a)| a.label() != "Color Lookup"));
         let items = document.report.items.join("\n");
-        assert!(items.contains("1 Color Lookup layer was left out"), "{items}");
+        assert!(
+            items.contains("1 Color Lookup layer was left out"),
+            "{items}"
+        );
         assert!(!items.contains("2 adjustment layers"), "{items}");
     }
 }

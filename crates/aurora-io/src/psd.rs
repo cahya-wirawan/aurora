@@ -132,9 +132,9 @@ mod descriptor;
 mod effects;
 #[cfg(test)]
 mod effects_tests;
-mod lab;
 #[cfg(test)]
 mod gradient_lookup_tests;
+mod lab;
 #[cfg(test)]
 mod mixer_selective_tests;
 mod read_adjust;
@@ -559,12 +559,20 @@ impl Notes {
                 .iter()
                 .map(|(note, n)| {
                     let mut text = note_text(*note, *n);
-                    if matches!(note, Note::ColorLookup(read_adjust::ColorLookupReason::Table))
-                        && !self.1.is_empty()
+                    if matches!(
+                        note,
+                        Note::ColorLookup(read_adjust::ColorLookupReason::Table)
+                    ) && !self.1.is_empty()
                     {
-                        let names: Vec<String> =
-                            self.1.iter().map(|n| format!("\u{201c}{n}\u{201d}")).collect();
-                        text.push_str(&format!(" Named: {}.", names.join(", ")));
+                        let names: Vec<String> = self
+                            .1
+                            .iter()
+                            .map(|n| format!("\u{201c}{n}\u{201d}"))
+                            .collect();
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut text,
+                            format_args!(" Named: {}.", names.join(", ")),
+                        );
                     }
                     text
                 })
