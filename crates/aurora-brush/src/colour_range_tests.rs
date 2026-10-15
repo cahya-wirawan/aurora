@@ -279,7 +279,8 @@ fn it_matches_the_model_on_a_random_image_across_tile_edges() {
             for row in 0..mask.bounds.height {
                 for col in 0..mask.bounds.width {
                     let (x, y) = (mask.bounds.x as u32 + col, mask.bounds.y as u32 + row);
-                    bytes[(y * w + x) as usize] = mask.data[(row * mask.bounds.width + col) as usize];
+                    bytes[(y * w + x) as usize] =
+                        mask.data[(row * mask.bounds.width + col) as usize];
                 }
             }
         }
@@ -299,9 +300,15 @@ fn it_matches_the_model_on_a_random_image_across_tile_edges() {
             let bh = mask.bounds.height as usize;
             assert!(mask.data.iter().any(|b| *b != 0));
             assert!((0..bw).any(|c| mask.data[c] != 0), "top row");
-            assert!((0..bw).any(|c| mask.data[(bh - 1) * bw + c] != 0), "bottom row");
+            assert!(
+                (0..bw).any(|c| mask.data[(bh - 1) * bw + c] != 0),
+                "bottom row"
+            );
             assert!((0..bh).any(|r| mask.data[r * bw] != 0), "left column");
-            assert!((0..bh).any(|r| mask.data[r * bw + bw - 1] != 0), "right column");
+            assert!(
+                (0..bh).any(|r| mask.data[r * bw + bw - 1] != 0),
+                "right column"
+            );
         }
     }
     assert_eq!(checked, 5 * 60_000);
@@ -342,7 +349,11 @@ fn a_half_transparent_pixel_of_the_right_colour_is_half_covered() {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(mask.bounds, rect(0, 0, 1, 1), "the transparent texel is never covered");
+    assert_eq!(
+        mask.bounds,
+        rect(0, 0, 1, 1),
+        "the transparent texel is never covered"
+    );
     assert_eq!(mask.data, vec![128]);
 }
 
@@ -386,7 +397,10 @@ fn it_reads_only_the_window_and_clips_it_to_the_layer() {
         )
         .unwrap()
     };
-    assert_eq!(run(&mut store, rect(3, 4, 3, 2)).unwrap().bounds, rect(3, 4, 3, 2));
+    assert_eq!(
+        run(&mut store, rect(3, 4, 3, 2)).unwrap().bounds,
+        rect(3, 4, 3, 2)
+    );
     // A window hanging off the layer is clipped to it.
     assert_eq!(
         run(&mut store, rect(-5, -5, 8, 8)).unwrap().bounds,
