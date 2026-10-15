@@ -35,6 +35,7 @@
 //! what's real today and what's still honestly open (Move and Eyedropper
 //! in particular).
 
+pub mod adjust_controls;
 pub mod canvas_view;
 pub mod channels_panel;
 pub mod colour_controls;
@@ -70,6 +71,10 @@ pub mod tool_controls;
 pub mod tools_panel;
 pub mod workspace;
 
+pub use adjust_controls::{
+    AdjustControls, AdjustKind, AdjustSlider, adjust_controls_contains, adjust_controls_shown,
+    adjust_of, adjust_preserve_checked, insert_adjust_controls, sync_adjust_controls,
+};
 pub use canvas_view::CanvasView;
 pub use channels_panel::{
     CHANNELS_TOOLBAR_ICON_SIZE, CHANNELS_TOOLBAR_LABEL, ChannelRow, ChannelRowPart,

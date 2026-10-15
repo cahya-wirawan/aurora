@@ -139,6 +139,10 @@ pub struct CurvesControls {
     /// The Hue/Saturation editor built beside this column (0.203.0), set
     /// by [`crate::insert_tool_controls`], riding here like [`Self::levels`].
     pub hue_saturation: Option<crate::hue_saturation_controls::HueSaturationControls>,
+    /// The Vibrance, Exposure and Photo Filter editors built beside this
+    /// column (0.239.0), set by [`crate::insert_tool_controls`], riding
+    /// here like [`Self::levels`].
+    pub adjust: Option<crate::adjust_controls::AdjustControls>,
 }
 
 fn column_style(scales: &Scales) -> Style {
@@ -196,6 +200,7 @@ pub fn insert_curves_controls(
             editor,
             levels: None,
             hue_saturation: None,
+            adjust: None,
         };
         set_enabled(tree, controls, false)?;
         Ok(controls)
@@ -206,6 +211,9 @@ pub fn insert_curves_controls(
     built
 }
 
+// `CurvesControls` carries the other editors' ids (the adjust editors since
+// 0.239.0); it is `Copy` and these helpers take it by value.
+#[allow(clippy::large_types_passed_by_value)]
 fn set_enabled(
     tree: &mut WidgetTree<WidgetKind>,
     controls: CurvesControls,
@@ -223,6 +231,7 @@ fn set_enabled(
     Ok(changed)
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 fn set_shown(
     tree: &mut WidgetTree<WidgetKind>,
     controls: CurvesControls,
@@ -414,6 +423,7 @@ mod tests {
         (layers, pixel, curves)
     }
 
+    #[allow(clippy::large_types_passed_by_value)]
     fn shown_points(tree: &WidgetTree<WidgetKind>, controls: CurvesControls) -> Vec<CurvePoint> {
         ok(widgets::curve_editor_state(tree, controls.editor))
             .curve()

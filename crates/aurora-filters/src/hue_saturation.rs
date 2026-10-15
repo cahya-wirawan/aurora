@@ -36,7 +36,7 @@ use aurora_core::{
 /// lightness in `[0, 1]`.
 // `max` is one of `r`, `g`, `b` exactly, so the comparisons are exact.
 #[allow(clippy::float_cmp)]
-fn to_hsl([r, g, b]: [f32; 3]) -> (f32, f32, f32) {
+pub(crate) fn to_hsl([r, g, b]: [f32; 3]) -> (f32, f32, f32) {
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let lightness = (max + min) * 0.5;
@@ -65,7 +65,7 @@ fn to_hsl([r, g, b]: [f32; 3]) -> (f32, f32, f32) {
 }
 
 /// The RGB of an HSL colour, each channel clamped to `[0, 1]`.
-fn from_hsl(hue: f32, saturation: f32, lightness: f32) -> [f32; 3] {
+pub(crate) fn from_hsl(hue: f32, saturation: f32, lightness: f32) -> [f32; 3] {
     let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
     let sector = hue.rem_euclid(360.0) / 60.0;
     let second = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
@@ -96,7 +96,7 @@ fn adjust_lightness(lightness: f32, amount: f32) -> f32 {
 }
 
 /// The saturation slider: `amount` in `[-1, 1]`.
-fn adjust_saturation(saturation: f32, amount: f32) -> f32 {
+pub(crate) fn adjust_saturation(saturation: f32, amount: f32) -> f32 {
     if amount <= 0.0 {
         saturation * (1.0 + amount)
     } else if amount >= 1.0 {

@@ -550,6 +550,64 @@ fn a_curve_that_collapses_to_one_level_is_refused_with_its_reason() {
     );
 }
 
+/// 0.239.0: Vibrance, Exposure and Photo Filter layers have no PSD block
+/// yet, so a PSD save is refused by name (never dropped or flattened), and
+/// the refusal names the layer, the kind and the way out.
+#[test]
+fn vibrance_exposure_and_photo_filter_layers_refuse_a_psd_save_by_name() {
+    let cases: [(Adjustment, &str); 3] = [
+        (
+            Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
+            "Vibrance",
+        ),
+        (
+            Adjustment::Exposure(aurora_core::ExposureParams::identity()),
+            "Exposure",
+        ),
+        (
+            Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+            "Photo Filter",
+        ),
+    ];
+    for (adjustment, kind) in cases {
+        let mut tree = LayerTree::new();
+        ok(tree.add_pixel_layer("A", rect(0, 0, 4, 4), None));
+        ok(tree.add_adjustment_layer_at("My layer", adjustment, None, 0));
+        let Err(refusal) = psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()) else {
+            unreachable!("{kind} must refuse")
+        };
+        assert!(
+            matches!(
+                refusal,
+                PsdSaveRefusal::AdjustmentNotRepresentable { kind: k, .. } if k == kind
+            ),
+            "{refusal:?}"
+        );
+        let text = refusal.to_string();
+        assert!(
+            text.contains("My layer")
+                && text.contains(kind)
+                && text.contains(&format!("can't write {kind} layers to .psd yet"))
+                && text.contains(".aur"),
+            "{text}"
+        );
+    }
+}
+
+/// And a document without them still saves: the refusal is per layer.
+#[test]
+fn a_document_with_only_older_adjustments_still_preflights() {
+    let mut tree = LayerTree::new();
+    ok(tree.add_pixel_layer("A", rect(0, 0, 4, 4), None));
+    ok(tree.add_adjustment_layer_at(
+        "Hue",
+        Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
+        None,
+        0,
+    ));
+    assert!(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()).is_ok());
+}
+
 /// `adjustments.psd` / `adjustments.json` for `scripts/verify_psd_write.py
 /// check_adjustments` (psd-tools): the document of
 /// [`adjustments_doc`] and the integers each block should hold.

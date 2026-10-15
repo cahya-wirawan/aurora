@@ -89,6 +89,18 @@ pub enum Adjustment {
     /// their defaults is stored as `HueSaturation` instead
     /// ([`Adjustment::from_hue_saturation`]), so 0.203.0 bytes are unchanged.
     HueSaturationRanges(aurora_core::HueSaturationRangesParams),
+    /// Vibrance and Saturation (0.239.0, [`aurora_core::VibranceParams`]),
+    /// applied by `aurora_filters::VibranceOp`. **Appended after
+    /// `HueSaturationRanges`** (ordinal 4): an older build refuses a file
+    /// using it (ADR 0009 addendum).
+    Vibrance(aurora_core::VibranceParams),
+    /// Exposure, Offset and Gamma Correction (0.239.0,
+    /// [`aurora_core::ExposureParams`]), applied by
+    /// `aurora_filters::ExposureOp` in linear light. **Ordinal 5.**
+    Exposure(aurora_core::ExposureParams),
+    /// A Photo Filter (0.239.0, [`aurora_core::PhotoFilterParams`]),
+    /// applied by `aurora_filters::PhotoFilterOp`. **Ordinal 6.**
+    PhotoFilter(aurora_core::PhotoFilterParams),
 }
 
 impl Adjustment {
@@ -99,6 +111,9 @@ impl Adjustment {
             Self::Curves(_) => "Curves",
             Self::Levels(_) => "Levels",
             Self::HueSaturation(_) | Self::HueSaturationRanges(_) => "Hue/Saturation",
+            Self::Vibrance(_) => "Vibrance",
+            Self::Exposure(_) => "Exposure",
+            Self::PhotoFilter(_) => "Photo Filter",
         }
     }
 
@@ -109,6 +124,33 @@ impl Adjustment {
         match self {
             Self::HueSaturation(p) => Some(aurora_core::HueSaturationRangesParams::plain(*p)),
             Self::HueSaturationRanges(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    /// The Vibrance settings, `None` for other adjustments.
+    #[must_use]
+    pub const fn vibrance(&self) -> Option<aurora_core::VibranceParams> {
+        match self {
+            Self::Vibrance(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    /// The Exposure settings, `None` for other adjustments.
+    #[must_use]
+    pub const fn exposure(&self) -> Option<aurora_core::ExposureParams> {
+        match self {
+            Self::Exposure(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    /// The Photo Filter settings, `None` for other adjustments.
+    #[must_use]
+    pub const fn photo_filter(&self) -> Option<aurora_core::PhotoFilterParams> {
+        match self {
+            Self::PhotoFilter(p) => Some(*p),
             _ => None,
         }
     }
@@ -1057,5 +1099,105 @@ mod pass_through_wire_tests {
         assert_eq!(for_layer.len(), BlendMode::ALL.len() - 1);
         assert!(!for_layer.contains(&BlendMode::PassThrough));
         assert_eq!(for_group.get(1..), Some(for_layer.as_slice()));
+    }
+}
+
+/// `Adjustment::{Vibrance, Exposure, PhotoFilter}` are appended after
+/// `HueSaturationRanges` (ordinals 4, 5, 6): every earlier encoding is
+/// unchanged and a 0.238.0 build refuses the new layers (0.239.0, ADR 0009).
+#[cfg(test)]
+mod vibrance_exposure_photo_filter_wire_tests {
+    use super::{Adjustment, LayerKind};
+
+    /// `Adjustment` exactly as a 0.238.0 build declares it.
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Adjustment238 {
+        Curves(aurora_core::CurvesParams),
+        Levels(aurora_core::LevelsParams),
+        HueSaturation(aurora_core::HueSaturationParams),
+        HueSaturationRanges(aurora_core::HueSaturationRangesParams),
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Kind238 {
+        Pixel { bounds: aurora_core::Rect },
+        Group { children: Vec<super::LayerId> },
+        Adjustment(Adjustment238),
+    }
+
+    fn encode<T: serde::Serialize>(value: &T) -> Vec<u8> {
+        match postcard::to_allocvec(value) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn earlier_adjustments_keep_their_bytes() {
+        let pairs = [
+            (
+                Adjustment::Curves(aurora_core::CurvesParams::identity()),
+                Adjustment238::Curves(aurora_core::CurvesParams::identity()),
+            ),
+            (
+                Adjustment::Levels(aurora_core::LevelsParams::identity()),
+                Adjustment238::Levels(aurora_core::LevelsParams::identity()),
+            ),
+            (
+                Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
+                Adjustment238::HueSaturation(aurora_core::HueSaturationParams::identity()),
+            ),
+        ];
+        for (new, old) in pairs {
+            let new_bytes = encode(&LayerKind::Adjustment(new));
+            let old_bytes = encode(&Kind238::Adjustment(old));
+            assert_eq!(new_bytes, old_bytes);
+            assert!(postcard::from_bytes::<Kind238>(&new_bytes).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_new_adjustments_are_ordinals_four_five_six_and_an_old_reader_refuses_them() {
+        let cases = [
+            (
+                Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
+                4_u8,
+            ),
+            (
+                Adjustment::Exposure(aurora_core::ExposureParams::identity()),
+                5,
+            ),
+            (
+                Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+                6,
+            ),
+        ];
+        for (adjustment, ordinal) in cases {
+            let kind = LayerKind::Adjustment(adjustment);
+            let bytes = encode(&kind);
+            assert_eq!(bytes.get(..2), Some([2_u8, ordinal].as_slice()), "{kind:?}");
+            match postcard::from_bytes::<LayerKind>(&bytes) {
+                Ok(decoded) => assert_eq!(decoded, kind),
+                Err(err) => unreachable!("{err:?}"),
+            }
+            assert!(
+                postcard::from_bytes::<Kind238>(&bytes).is_err(),
+                "a 0.238.0 build refuses ordinal {ordinal}"
+            );
+        }
+    }
+
+    #[test]
+    fn labels_and_accessors_name_the_right_variant() {
+        let v = Adjustment::Vibrance(aurora_core::VibranceParams::identity());
+        let e = Adjustment::Exposure(aurora_core::ExposureParams::identity());
+        let p = Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default());
+        assert_eq!(
+            (v.label(), e.label(), p.label()),
+            ("Vibrance", "Exposure", "Photo Filter")
+        );
+        assert!(v.vibrance().is_some() && v.exposure().is_none() && v.photo_filter().is_none());
+        assert!(e.exposure().is_some() && e.vibrance().is_none() && e.photo_filter().is_none());
+        assert!(p.photo_filter().is_some() && p.vibrance().is_none() && p.exposure().is_none());
     }
 }

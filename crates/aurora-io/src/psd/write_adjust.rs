@@ -120,6 +120,16 @@ fn whole(value: f32) -> i16 {
     value.round() as i16
 }
 
+/// Why a Vibrance layer cannot be saved to PSD (0.239.0).
+const NOT_WRITTEN_VIBRANCE: &str =
+    "Aurora can't write Vibrance layers to .psd yet; save as .aur, or merge or remove the layer";
+/// Why an Exposure layer cannot be saved to PSD (0.239.0).
+const NOT_WRITTEN_EXPOSURE: &str =
+    "Aurora can't write Exposure layers to .psd yet; save as .aur, or merge or remove the layer";
+/// Why a Photo Filter layer cannot be saved to PSD (0.239.0).
+const NOT_WRITTEN_PHOTO_FILTER: &str = "Aurora can't write Photo Filter layers to .psd yet; save \
+     as .aur, or merge or remove the layer";
+
 /// Encodes `adjustment` as its tagged block.
 ///
 /// # Errors
@@ -132,6 +142,12 @@ pub(super) fn encode_adjustment(
     let (key, mut data) = match adjustment {
         Adjustment::Curves(params) => (*b"curv", encode_curv(params, &mut rounding)?),
         Adjustment::Levels(params) => (*b"levl", encode_levl(params, &mut rounding)),
+        // Vibrance, Exposure and Photo Filter (0.239.0): the file layouts
+        // (`vibA`, `expA`, `phfl`) are not written yet. The save is refused
+        // by name rather than dropping or flattening the layer.
+        Adjustment::Vibrance(_) => return Err(NOT_WRITTEN_VIBRANCE),
+        Adjustment::Exposure(_) => return Err(NOT_WRITTEN_EXPOSURE),
+        Adjustment::PhotoFilter(_) => return Err(NOT_WRITTEN_PHOTO_FILTER),
         Adjustment::HueSaturation(_) | Adjustment::HueSaturationRanges(_) => {
             let Some(params) = adjustment.hue_saturation() else {
                 return Err("its Hue/Saturation settings are unreadable");

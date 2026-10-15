@@ -538,6 +538,7 @@ use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
+mod adjust_app;
 mod autosave_files;
 mod background_autosave;
 mod background_composite;
@@ -5992,6 +5993,14 @@ enum ActivatedCommand {
     /// New Hue/Saturation Layer (0.203.0): palette and the macOS `Layer`
     /// menu only, no shortcut. Run as [`LayerCommand::NewHueSaturation`].
     NewHueSaturationLayer,
+    /// New Vibrance / Exposure / Photo Filter Layer (0.239.0): palette,
+    /// both Layer menus, no shortcut. Run as [`LayerCommand::NewAdjust`].
+    NewVibranceLayer,
+    NewExposureLayer,
+    NewPhotoFilterLayer,
+    /// A Photo Filter preset colour (0.239.0, palette only): index into
+    /// [`aurora_core::PHOTO_FILTER_PRESETS`].
+    PhotoFilterPreset(usize),
     /// New Group (0.196.0): palette, the macOS `Layer` menu and the Layers
     /// toolbar only, no shortcut. Run by [`perform_layer_command`] as
     /// [`LayerCommand::NewGroup`].
@@ -6239,6 +6248,9 @@ const COMMAND_LAYER_DELETE: &str = "layer.delete";
 const COMMAND_LAYER_NEW_CURVES: &str = "layer.new_curves";
 const COMMAND_LAYER_NEW_LEVELS: &str = "layer.new_levels";
 const COMMAND_LAYER_NEW_HUE_SATURATION: &str = "layer.new_hue_saturation";
+const COMMAND_LAYER_NEW_VIBRANCE: &str = "layer.new_vibrance";
+const COMMAND_LAYER_NEW_EXPOSURE: &str = "layer.new_exposure";
+const COMMAND_LAYER_NEW_PHOTO_FILTER: &str = "layer.new_photo_filter";
 const COMMAND_LAYER_NEW_GROUP: &str = "layer.new_group";
 const COMMAND_LAYER_CLIP_CREATE: &str = "layer.clip_create";
 const COMMAND_LAYER_CLIP_RELEASE: &str = "layer.clip_release";
@@ -6361,6 +6373,9 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_LAYER_NEW_CURVES, "New Curves Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_LEVELS, "New Levels Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_HUE_SATURATION, "New Hue/Saturation Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_VIBRANCE, "New Vibrance Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_EXPOSURE, "New Exposure Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_PHOTO_FILTER, "New Photo Filter Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_GROUP, "New Group"),
         CommandEntry::new(COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
         CommandEntry::new(COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),
@@ -6401,6 +6416,13 @@ fn palette_commands() -> Vec<CommandEntry> {
             .iter()
             .map(|kind| CommandEntry::new(kind.command_id(), kind.menu_label())),
     );
+    // 0.239.0: the Photo Filter preset colours.
+    commands.extend((0..aurora_core::PHOTO_FILTER_PRESETS.len()).map(|i| {
+        CommandEntry::new(
+            adjust_app::preset_command_id(i),
+            adjust_app::preset_command_title(i),
+        )
+    }));
     // 0.236.0: the Crop tool's aspect ratios.
     commands.extend(aurora_ui::CropRatio::ALL.iter().map(|choice| {
         CommandEntry::new(
@@ -6623,6 +6645,18 @@ fn activate_command(
     }
     if id == COMMAND_LAYER_NEW_HUE_SATURATION {
         return Some(ActivatedCommand::NewHueSaturationLayer);
+    }
+    if id == COMMAND_LAYER_NEW_VIBRANCE {
+        return Some(ActivatedCommand::NewVibranceLayer);
+    }
+    if id == COMMAND_LAYER_NEW_EXPOSURE {
+        return Some(ActivatedCommand::NewExposureLayer);
+    }
+    if id == COMMAND_LAYER_NEW_PHOTO_FILTER {
+        return Some(ActivatedCommand::NewPhotoFilterLayer);
+    }
+    if let Some(index) = adjust_app::preset_for_command(id) {
+        return Some(ActivatedCommand::PhotoFilterPreset(index));
     }
     if id == COMMAND_LAYER_NEW_GROUP {
         return Some(ActivatedCommand::NewGroup);
@@ -9008,6 +9042,7 @@ struct CurvesHistogramJob {
 /// of a drag already committed (the active layer changed under it, or a
 /// key press ended it) edits nothing until its capture ends.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // one `detached` flag per live-drag editor
 struct CurvesUiState {
     pending: Option<PendingCurves>,
     detached: bool,
@@ -9026,6 +9061,10 @@ struct CurvesUiState {
     hue_saturation_pending: Option<PendingHueSaturation>,
     /// [`Self::detached`]'s twin for the Hue/Saturation sliders.
     hue_saturation_detached: bool,
+    /// A live Vibrance / Exposure / Photo Filter slider drag (0.239.0).
+    adjust_pending: Option<adjust_app::PendingAdjust>,
+    /// [`Self::detached`]'s twin for those sliders.
+    adjust_detached: bool,
 }
 
 /// A live Hue/Saturation-slider drag: [`PendingLevels`]' twin, so the whole
@@ -9130,7 +9169,8 @@ fn settle_pending_curves(cx: &mut CurvesEdit<'_>, captured: Option<WidgetId>) ->
     // The Levels sliders' drag settles by the same rule (0.202.0).
     let levels = settle_pending_levels(cx, captured);
     let hue_saturation = settle_pending_hue_saturation(cx, captured);
-    settle_pending_curves_only(cx, captured) || levels || hue_saturation
+    let adjust = adjust_app::settle(cx, captured);
+    settle_pending_curves_only(cx, captured) || levels || hue_saturation || adjust
 }
 
 /// [`settle_pending_curves`] for the curve editor alone.
@@ -9148,9 +9188,13 @@ fn settle_pending_curves_only(cx: &mut CurvesEdit<'_>, captured: Option<WidgetId
 /// Whether `outcome` belongs to the Curves editor (its channel tab bar
 /// or its curve editor), which `App::apply_tool_control` hands to
 /// [`apply_curves_outcome`] instead of the radius handler.
+#[allow(clippy::large_types_passed_by_value)] // `CurvesControls` is `Copy` and 448 bytes since 0.239.0
 fn is_curves_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutcome) -> bool {
     use aurora_widgets::ActionOutcome as Outcome;
-    if is_levels_outcome(controls, outcome) || is_hue_saturation_outcome(controls, outcome) {
+    if is_levels_outcome(controls, outcome)
+        || is_hue_saturation_outcome(controls, outcome)
+        || adjust_app::is_outcome(controls, outcome)
+    {
         return true;
     }
     match outcome {
@@ -9164,6 +9208,7 @@ fn is_curves_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutco
 /// (0.202.0): its channel tab bar or one of its five sliders.
 /// Whether `outcome` is the Hue/Saturation editor's: a slider value or the
 /// Colorize checkbox ([`is_levels_outcome`]'s twin, 0.203.0).
+#[allow(clippy::large_types_passed_by_value)] // `CurvesControls` is `Copy` and 448 bytes since 0.239.0
 fn is_hue_saturation_outcome(
     controls: aurora_ui::CurvesControls,
     outcome: &PointerOutcome,
@@ -9182,6 +9227,7 @@ fn is_hue_saturation_outcome(
     }
 }
 
+#[allow(clippy::large_types_passed_by_value)] // `CurvesControls` is `Copy` and 448 bytes since 0.239.0
 fn hue_saturation_slider_captured(
     controls: Option<aurora_ui::CurvesControls>,
     captured: Option<WidgetId>,
@@ -9326,6 +9372,7 @@ fn apply_hue_saturation_outcome(
     CompositeInvalidation::Everything
 }
 
+#[allow(clippy::large_types_passed_by_value)] // `CurvesControls` is `Copy` and 448 bytes since 0.239.0
 fn is_levels_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutcome) -> bool {
     use aurora_widgets::ActionOutcome as Outcome;
     let Some(levels) = controls.levels else {
@@ -9339,6 +9386,7 @@ fn is_levels_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerOutco
 }
 
 /// Whether a Levels slider holds the pointer capture.
+#[allow(clippy::large_types_passed_by_value)] // `CurvesControls` is `Copy` and 448 bytes since 0.239.0
 fn levels_slider_captured(
     controls: Option<aurora_ui::CurvesControls>,
     captured: Option<WidgetId>,
@@ -9504,6 +9552,9 @@ fn apply_curves_outcome(
     if is_hue_saturation_outcome(controls, outcome) {
         return apply_hue_saturation_outcome(cx, outcome, captured);
     }
+    if adjust_app::is_outcome(controls, outcome) {
+        return adjust_app::apply_outcome(cx, outcome, captured);
+    }
     let _ = settle_pending_curves(cx, captured);
     let PointerOutcome::Action(aurora_widgets::ActionOutcome::CurveChanged { editor }) = outcome
     else {
@@ -9586,7 +9637,13 @@ fn end_curves_drag(cx: &mut CurvesEdit<'_>, click: &mut ClickTracker) -> bool {
         click.release_capture();
     }
     cx.state.hue_saturation_detached = false;
-    finish_hue_saturation(cx) || levels || curves
+    let hue_saturation = finish_hue_saturation(cx);
+    // So do the Vibrance / Exposure / Photo Filter sliders (0.239.0).
+    if adjust_app::slider_captured(cx.controls, click.captured()) {
+        click.release_capture();
+    }
+    cx.state.adjust_detached = false;
+    adjust_app::finish(cx) || hue_saturation || levels || curves
 }
 
 /// What a key that reaches the shortcuts does to the Curves editor first
@@ -9605,7 +9662,9 @@ fn end_curves_gesture_before_key(cx: &mut CurvesEdit<'_>, click: &mut ClickTrack
         cx.state.levels_pending.is_some() || levels_slider_captured(cx.controls, click.captured());
     let hue_saturation_live = cx.state.hue_saturation_pending.is_some()
         || hue_saturation_slider_captured(cx.controls, click.captured());
-    if !curves_live && !levels_live && !hue_saturation_live {
+    let adjust_live = cx.state.adjust_pending.is_some()
+        || adjust_app::slider_captured(cx.controls, click.captured());
+    if !curves_live && !levels_live && !hue_saturation_live && !adjust_live {
         return false;
     }
     end_curves_drag(cx, click)
@@ -9642,7 +9701,13 @@ fn end_curves_gestures(cx: &mut CurvesEdit<'_>, click: &mut ClickTracker) -> boo
     }
     let committed_hue_saturation = finish_hue_saturation(cx);
     cx.state.hue_saturation_detached = false;
-    let committed = finish_curves(cx) || committed_levels || committed_hue_saturation;
+    if adjust_app::slider_captured(cx.controls, click.captured()) {
+        click.release_capture();
+    }
+    let committed_adjust = adjust_app::finish(cx);
+    cx.state.adjust_detached = false;
+    let committed =
+        finish_curves(cx) || committed_levels || committed_hue_saturation || committed_adjust;
     cx.state.detached = false;
     cx.state.histogram = None;
     cx.state.job = None;
@@ -9975,6 +10040,7 @@ fn sync_curves_ui(
         curves_layer == Some(id)
             || aurora_ui::levels_params(cx.layers, id).is_some()
             || aurora_ui::hue_saturation_params(cx.layers, id).is_some()
+            || aurora_ui::adjust_of(cx.layers, id).is_some()
     });
     let expanded =
         expand_properties_for_curves(cx.workspace, &mut cx.state.shown_for, editor_layer);
@@ -10030,7 +10096,14 @@ fn sync_curves_ui(
         },
         None => false,
     };
-    let other_changed = levels_changed || hue_saturation_changed;
+    let adjust_changed = adjust_app::sync(
+        &mut cx.workspace.tree,
+        controls.adjust,
+        cx.layers,
+        cx.active_layer,
+        captured,
+    );
+    let other_changed = levels_changed || hue_saturation_changed || adjust_changed;
     match aurora_ui::sync_curves_controls(
         &mut cx.workspace.tree,
         controls,
@@ -10675,6 +10748,14 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(
                 COMMAND_LAYER_NEW_HUE_SATURATION,
                 "New Hue/Saturation Layer",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(COMMAND_LAYER_NEW_VIBRANCE, "New Vibrance Layer", true, None),
+            &muda::MenuItem::with_id(COMMAND_LAYER_NEW_EXPOSURE, "New Exposure Layer", true, None),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_PHOTO_FILTER,
+                "New Photo Filter Layer",
                 true,
                 None,
             ),
@@ -18155,6 +18236,12 @@ enum AdjustmentLut {
     Levels(std::rc::Rc<aurora_filters::LevelsLut>),
     /// Hue/Saturation (0.203.0): a per-pixel function, nothing to cache.
     HueSaturation(aurora_filters::HueSaturationOp),
+    /// Vibrance (0.239.0): a per-pixel function, nothing to cache.
+    Vibrance(aurora_filters::VibranceOp),
+    /// Exposure (0.239.0): a per-channel function in linear light.
+    Exposure(aurora_filters::ExposureOp),
+    /// Photo Filter (0.239.0): a per-pixel function.
+    PhotoFilter(aurora_filters::PhotoFilterOp),
 }
 
 impl AdjustmentLut {
@@ -18169,6 +18256,15 @@ impl AdjustmentLut {
             aurora_doc::Adjustment::HueSaturationRanges(params) => {
                 Self::HueSaturation(aurora_filters::HueSaturationOp::with_ranges(params))
             }
+            aurora_doc::Adjustment::Vibrance(params) => {
+                Self::Vibrance(aurora_filters::VibranceOp::new(params))
+            }
+            aurora_doc::Adjustment::Exposure(params) => {
+                Self::Exposure(aurora_filters::ExposureOp::new(params))
+            }
+            aurora_doc::Adjustment::PhotoFilter(params) => {
+                Self::PhotoFilter(aurora_filters::PhotoFilterOp::new(params))
+            }
         }
     }
 
@@ -18178,6 +18274,9 @@ impl AdjustmentLut {
             Self::Curves(lut) => lut.is_identity(),
             Self::Levels(lut) => lut.is_identity(),
             Self::HueSaturation(op) => op.is_identity(),
+            Self::Vibrance(op) => op.is_identity(),
+            Self::Exposure(op) => op.is_identity(),
+            Self::PhotoFilter(op) => op.is_identity(),
         }
     }
 
@@ -18187,6 +18286,9 @@ impl AdjustmentLut {
             Self::Curves(lut) => lut.apply(rgb),
             Self::Levels(lut) => lut.apply(rgb),
             Self::HueSaturation(op) => op.apply(rgb),
+            Self::Vibrance(op) => op.apply(rgb),
+            Self::Exposure(op) => op.apply(rgb),
+            Self::PhotoFilter(op) => op.apply(rgb),
         }
     }
 }
@@ -20078,7 +20180,14 @@ fn adjustment_layer_qualifies_for_gpu(
                 .packed_for_gpu()
                 .is_some()
         }
-        None => false,
+        // Vibrance, Exposure and Photo Filter (0.239.0) have no GPU pass
+        // yet: a visible layer of these kinds keeps the CPU path.
+        Some(
+            aurora_doc::Adjustment::Vibrance(_)
+            | aurora_doc::Adjustment::Exposure(_)
+            | aurora_doc::Adjustment::PhotoFilter(_),
+        )
+        | None => false,
     };
     expressible
         && !layers.mask(id).is_some_and(|mask| mask.enabled)
@@ -20517,7 +20626,14 @@ fn begin_gpu_adjustment_pass(
             }
             note_gpu_hue_saturation_dispatch();
         }
-        (_, AdjustmentLut::Curves(_)) => return false,
+        // No GPU pass for these (0.239.0); the predicate refuses them first.
+        (
+            _,
+            AdjustmentLut::Curves(_)
+            | AdjustmentLut::Vibrance(_)
+            | AdjustmentLut::Exposure(_)
+            | AdjustmentLut::PhotoFilter(_),
+        ) => return false,
     }
     std::mem::swap(current_accumulator, spare_accumulator);
     true
@@ -25441,6 +25557,8 @@ enum LayerCommand {
     NewLevels,
     /// New Hue/Saturation Layer (0.203.0): [`Self::NewLevels`]'s twin.
     NewHueSaturation,
+    /// New Vibrance / Exposure / Photo Filter Layer (0.239.0).
+    NewAdjust(aurora_ui::AdjustKind),
     /// New Group (0.196.0): an empty Pass Through group directly above the
     /// active node, placed exactly where [`Self::New`] places a layer,
     /// made active. See [`new_group`].
@@ -25961,6 +26079,12 @@ fn perform_layer_command(cx: &mut LayerCommandContext<'_>, command: LayerCommand
         }),
         LayerCommand::NewHueSaturation => {
             new_hue_saturation_layer(cx).map(|id| AppliedLayerCommand {
+                next_active: Some(id),
+                label: None,
+            })
+        }
+        LayerCommand::NewAdjust(kind) => {
+            adjust_app::new_layer(cx, kind).map(|id| AppliedLayerCommand {
                 next_active: Some(id),
                 label: None,
             })
@@ -27153,6 +27277,9 @@ enum LockRefusal {
     /// Crop to Selection with nothing (or only an inverted selection)
     /// selected (0.226.0).
     CropNeedsSelection,
+    /// A Photo Filter preset command with no Photo Filter layer active
+    /// (0.239.0).
+    AdjustNeedsPhotoFilter,
     /// The crop rectangle is the whole canvas (0.226.0).
     CropNoChange,
     /// The crop rectangle is empty or off the canvas (0.226.0).
@@ -27257,6 +27384,9 @@ impl LockRefusal {
             }
             LockRefusal::RefineTooLarge => {
                 "That selection is too large to modify in one step (over about 24 megapixels, or 64 megapixels once grown). Use a smaller selection or a smaller amount."
+            }
+            LockRefusal::AdjustNeedsPhotoFilter => {
+                "Select a Photo Filter layer first. Photo Filter presets set the colour of the active Photo Filter layer."
             }
             LockRefusal::CropNeedsSelection => {
                 "Make a rectangular selection first. Crop to Selection crops to the bounds of the selection you have."
@@ -27457,7 +27587,9 @@ fn lock_refusal_applies(
             ))
         || matches!(
             refusal,
-            LockRefusal::RefineNeedsSelection | LockRefusal::RefineTooLarge
+            LockRefusal::RefineNeedsSelection
+                | LockRefusal::RefineTooLarge
+                | LockRefusal::AdjustNeedsPhotoFilter
         )
         || matches!(
             refusal,
@@ -29336,6 +29468,18 @@ impl App {
             }
             Some(ActivatedCommand::NewHueSaturationLayer) => {
                 self.run_layer_command(LayerCommand::NewHueSaturation);
+            }
+            Some(ActivatedCommand::NewVibranceLayer) => {
+                self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::Vibrance));
+            }
+            Some(ActivatedCommand::NewExposureLayer) => {
+                self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::Exposure));
+            }
+            Some(ActivatedCommand::NewPhotoFilterLayer) => {
+                self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::PhotoFilter));
+            }
+            Some(ActivatedCommand::PhotoFilterPreset(index)) => {
+                self.apply_photo_filter_preset(index);
             }
             Some(ActivatedCommand::NewGroup) => self.run_layer_command(LayerCommand::NewGroup),
             Some(ActivatedCommand::SetClip(on)) => {
@@ -34167,6 +34311,28 @@ impl App {
         );
         if committed {
             self.doc.composite_cache.bump();
+        }
+    }
+
+    /// Sets the active Photo Filter layer's colour to a preset (0.239.0,
+    /// palette only): one undo step, or a calm notice when the active
+    /// layer is not a Photo Filter.
+    fn apply_photo_filter_preset(&mut self, index: usize) {
+        let is_filter = self.doc.active_layer.is_some_and(|id| {
+            self.doc
+                .layers
+                .adjustment(id)
+                .is_some_and(|a| a.photo_filter().is_some())
+        });
+        if !is_filter {
+            self.lock_notice = Some((LockRefusal::AdjustNeedsPhotoFilter, self.doc.active_layer));
+            self.needs_redraw = true;
+            return;
+        }
+        if adjust_app::apply_preset(&mut self.curves_edit(), index) {
+            self.doc.composite_cache.bump();
+            self.push_accessibility();
+            self.needs_redraw = true;
         }
     }
 
@@ -44117,8 +44283,10 @@ mod tests {
         // and (0.167.0) "Float Layers Panel" and "Dock Layers Panel" --
         // the first inserted (`palette_commands`'s own order) is what ends
         // up selected. (0.202.0) "New Levels Layer" matches too, and
-        // (0.235.0) "Layer via Copy" and "Layer via Cut".
-        assert_eq!(state.results().len(), 16);
+        // (0.235.0) "Layer via Copy" and "Layer via Cut", and (0.239.0)
+        // "New Vibrance Layer", "New Exposure Layer" and "New Photo Filter
+        // Layer".
+        assert_eq!(state.results().len(), 19);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -78192,6 +78360,71 @@ mod tests {
                 assert_eq!(rig.layers.roots(), [top, mid, bottom].as_slice());
                 rig.assert_coherent();
             }
+
+            #[test]
+            fn new_vibrance_exposure_and_photo_filter_layers_are_commands_and_one_undo_step_each() {
+                let cases: [(&str, &str, ActivatedCommand, LayerCommand, Adjustment, &str); 3] = [
+                    (
+                        crate::COMMAND_LAYER_NEW_VIBRANCE,
+                        "New Vibrance Layer",
+                        ActivatedCommand::NewVibranceLayer,
+                        LayerCommand::NewAdjust(aurora_ui::AdjustKind::Vibrance),
+                        Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
+                        "Vibrance",
+                    ),
+                    (
+                        crate::COMMAND_LAYER_NEW_EXPOSURE,
+                        "New Exposure Layer",
+                        ActivatedCommand::NewExposureLayer,
+                        LayerCommand::NewAdjust(aurora_ui::AdjustKind::Exposure),
+                        Adjustment::Exposure(aurora_core::ExposureParams::identity()),
+                        "Exposure",
+                    ),
+                    (
+                        crate::COMMAND_LAYER_NEW_PHOTO_FILTER,
+                        "New Photo Filter Layer",
+                        ActivatedCommand::NewPhotoFilterLayer,
+                        LayerCommand::NewAdjust(aurora_ui::AdjustKind::PhotoFilter),
+                        Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+                        "Photo Filter",
+                    ),
+                ];
+                for (id, title, activated, command, adjustment, stem) in cases {
+                    assert!(
+                        palette_commands()
+                            .iter()
+                            .any(|entry| entry.id == id && entry.title == title),
+                        "{title} is in the palette"
+                    );
+                    let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+                    let mut focus = FocusManager::default();
+                    let mut dialog = FakeFileDialog::default();
+                    assert_eq!(
+                        activate_command(&mut workspace, &mut focus, id, &mut dialog),
+                        Some(activated)
+                    );
+                    let (mut rig, [top, mid, bottom]) = Rig::three();
+                    let before = rig.layers.roots().to_vec();
+                    assert!(rig.run(command));
+                    let added = only_new_root(&rig, &before);
+                    assert_eq!(
+                        rig.layers.kind(added),
+                        Some(&LayerKind::Adjustment(adjustment))
+                    );
+                    assert_eq!(rig.layers.name(added), Some(format!("{stem} 1").as_str()));
+                    assert_eq!(rig.active, Some(added));
+                    assert!(rig.run(command));
+                    assert_eq!(
+                        rig.active.and_then(|id| rig.layers.name(id)),
+                        Some(format!("{stem} 2").as_str())
+                    );
+                    assert!(rig.undo_redo(AppCommand::Undo));
+                    assert!(rig.undo_redo(AppCommand::Undo));
+                    assert_eq!(rig.layers.roots(), before.as_slice());
+                    assert_eq!(rig.layers.roots(), [top, mid, bottom].as_slice());
+                    rig.assert_coherent();
+                }
+            }
         }
     }
 
@@ -82826,6 +83059,293 @@ mod tests {
             ));
         }
 
+        // -- Vibrance / Exposure / Photo Filter editors (0.239.0) ----------
+
+        impl Rig {
+            /// An adjustment layer on top of the backdrop, made active.
+            fn adjust_layer(adjustment: aurora_doc::Adjustment) -> (Self, LayerId) {
+                let (mut rig, _curves) = Self::backdrop();
+                let id = match rig
+                    .layers
+                    .add_adjustment_layer_at("Adjust 1", adjustment, None, 0)
+                {
+                    Ok(id) => id,
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                rig.active = Some(id);
+                rig.sync();
+                (rig, id)
+            }
+
+            fn adj_controls(&self) -> aurora_ui::AdjustControls {
+                match self.controls.curves.adjust {
+                    Some(adjust) => adjust,
+                    None => unreachable!("the strip builds the adjust editors"),
+                }
+            }
+
+            fn adjustment(&self, id: LayerId) -> aurora_doc::Adjustment {
+                match self.layers.adjustment(id) {
+                    Some(adjustment) => adjustment.clone(),
+                    None => unreachable!("{id:?} is an adjustment layer"),
+                }
+            }
+
+            fn adj_slider_id(&self, slider: aurora_ui::AdjustSlider) -> WidgetId {
+                match self.adj_controls().sliders.get(slider.index()) {
+                    Some(&id) => id,
+                    None => unreachable!("nine sliders"),
+                }
+            }
+
+            fn adj_along(&self, slider: aurora_ui::AdjustSlider, fraction: f32) -> (f32, f32) {
+                let Some(b) = self.workspace.tree.bounds(self.adj_slider_id(slider)) else {
+                    unreachable!("the slider is laid out");
+                };
+                #[allow(clippy::cast_precision_loss)]
+                let point = (
+                    b.x as f32 + fraction * b.width as f32,
+                    b.y as f32 + b.height as f32 / 2.0,
+                );
+                point
+            }
+
+            fn adj_set(&mut self, slider: aurora_ui::AdjustSlider, value: f64) {
+                let id = self.adj_slider_id(slider);
+                self.apply(&PointerOutcome::Action(
+                    aurora_widgets::ActionOutcome::ValueChanged { id, value },
+                ));
+                self.sync();
+            }
+
+            fn adj_slider(&self, slider: aurora_ui::AdjustSlider) -> (f64, bool) {
+                match self.workspace.tree.payload(self.adj_slider_id(slider)) {
+                    Some(aurora_widgets::widgets::WidgetKind::Slider(state)) => {
+                        (state.value, state.disabled)
+                    }
+                    other => unreachable!("{other:?}"),
+                }
+            }
+        }
+
+        fn vibrance_layer(v: f32, s: f32) -> aurora_doc::Adjustment {
+            match aurora_core::VibranceParams::new(v, s) {
+                Ok(p) => aurora_doc::Adjustment::Vibrance(p),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        /// 0.239.0: a Vibrance slider drag is **one** undo step through the
+        /// real pointer routing, undo moves the slider back and the
+        /// composite follows (0.2, 0.4, 0.6 has HSL saturation 0.5, so
+        /// vibrance 100 makes it 0.75: (0.1, 0.4, 0.7)).
+        #[test]
+        fn a_vibrance_slider_drag_is_one_undo_step_and_undo_moves_the_slider() {
+            use aurora_ui::AdjustSlider as S;
+            let (mut rig, id) = Rig::adjust_layer(vibrance_layer(0.0, 0.0));
+            assert_eq!(
+                aurora_ui::adjust_controls_shown(&rig.workspace.tree, rig.adj_controls()),
+                Some(aurora_ui::AdjustKind::Vibrance)
+            );
+            assert!(!rig.shown(), "the Curves editor is hidden");
+            assert!(!rig.adj_slider(S::Vibrance).1 && rig.adj_slider(S::Exposure).1);
+            let before = rig.undo_order.undo.len();
+            let down = rig.adj_along(S::Vibrance, 0.5);
+            rig.pointer(PointerPhase::Down, down);
+            for f in [0.6, 0.8, 1.0] {
+                let at = rig.adj_along(S::Vibrance, f);
+                rig.pointer(PointerPhase::Move, at);
+            }
+            let up = rig.adj_along(S::Vibrance, 1.0);
+            rig.pointer(PointerPhase::Up, up);
+            let p = rig.adjustment(id).vibrance();
+            assert_eq!(p.map(|p| p.vibrance()), Some(100.0), "dragged to the end");
+            assert_eq!(rig.undo_order.undo.len(), before + 1, "one undo step");
+            let got = rig.first();
+            for (g, w) in got.iter().zip([0.1, 0.4, 0.7, 1.0]) {
+                assert!((g - w).abs() <= 3e-3, "the composite follows: {got:?}");
+            }
+            rig.undo();
+            assert_eq!(rig.adjustment(id), vibrance_layer(0.0, 0.0));
+            assert_eq!(rig.adj_slider(S::Vibrance).0, 0.0);
+            rig.redo();
+            assert_eq!(rig.adjustment(id), vibrance_layer(100.0, 0.0));
+            assert_eq!(rig.adj_slider(S::Vibrance).0, 100.0);
+        }
+
+        /// A keyboard / assistive-technology value is one step; a no-op, a
+        /// NaN and the other adjustment's slider record nothing; a hostile
+        /// value clamps; the sliders edit only their own field.
+        #[test]
+        fn a_keyed_value_is_one_step_and_hostile_values_are_refused_or_clamped() {
+            use aurora_ui::AdjustSlider as S;
+            let (mut rig, id) = Rig::adjust_layer(aurora_doc::Adjustment::Exposure(
+                aurora_core::ExposureParams::identity(),
+            ));
+            let before = rig.undo_order.undo.len();
+            rig.adj_set(S::Offset, 0.1234);
+            let exposure = |rig: &Rig| match rig.adjustment(id).exposure() {
+                Some(p) => (p.exposure(), p.offset(), p.gamma()),
+                None => unreachable!("an Exposure layer"),
+            };
+            assert_eq!(exposure(&rig), (0.0, 0.123, 1.0), "snapped to 3 decimals");
+            rig.adj_set(S::Offset, 0.1234);
+            rig.adj_set(S::Offset, f64::NAN);
+            rig.adj_set(S::Offset, f64::INFINITY);
+            assert_eq!(rig.undo_order.undo.len(), before + 1);
+            rig.adj_set(S::Exposure, 9_999.0);
+            assert_eq!(exposure(&rig).0, 20.0);
+            rig.adj_set(S::Gamma, -5.0);
+            assert_eq!(exposure(&rig).2, 0.10_f32);
+            assert_eq!(rig.undo_order.undo.len(), before + 3);
+            // A Vibrance slider's outcome on an Exposure layer edits nothing.
+            rig.adj_set(S::Vibrance, 50.0);
+            assert_eq!(rig.undo_order.undo.len(), before + 3);
+            rig.undo();
+            rig.undo();
+            rig.undo();
+            assert_eq!(exposure(&rig), (0.0, 0.0, 1.0));
+        }
+
+        /// 0.239.0: the Photo Filter colour sliders, density and the
+        /// Preserve Luminosity checkbox are one step each, and the
+        /// composite follows ((1, 0.5, 0) at density 100 without
+        /// Preserve is the backdrop times the colour).
+        #[test]
+        fn photo_filter_controls_are_one_step_each_and_the_composite_follows() {
+            use aurora_ui::AdjustSlider as S;
+            let start = match aurora_core::PhotoFilterParams::new([1.0, 1.0, 1.0], 100.0, true) {
+                Ok(p) => aurora_doc::Adjustment::PhotoFilter(p),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let (mut rig, id) = Rig::adjust_layer(start);
+            assert_eq!(
+                aurora_ui::adjust_controls_shown(&rig.workspace.tree, rig.adj_controls()),
+                Some(aurora_ui::AdjustKind::PhotoFilter)
+            );
+            assert!(aurora_ui::adjust_preserve_checked(
+                &rig.workspace.tree,
+                rig.adj_controls()
+            ));
+            let before = rig.undo_order.undo.len();
+            rig.adj_set(S::Blue, 0.0);
+            rig.adj_set(S::Green, 128.0);
+            let checkbox = rig.adj_controls().preserve;
+            let at = rig.centre(checkbox);
+            rig.pointer(PointerPhase::Down, at);
+            rig.pointer(PointerPhase::Up, at);
+            assert_eq!(rig.undo_order.undo.len(), before + 3);
+            let filter = rig.adjustment(id).photo_filter();
+            assert_eq!(filter.map(|f| f.preserve_luminosity()), Some(false));
+            assert_eq!(filter.map(|f| f.colour()[2]), Some(0.0));
+            assert!(!aurora_ui::adjust_preserve_checked(
+                &rig.workspace.tree,
+                rig.adj_controls()
+            ));
+            let got = rig.first();
+            let want = [0.2, 0.4 * 128.0 / 255.0, 0.0, 1.0];
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() <= 3e-3, "{got:?} vs {want:?}");
+            }
+            rig.undo();
+            assert!(aurora_ui::adjust_preserve_checked(
+                &rig.workspace.tree,
+                rig.adj_controls()
+            ));
+            rig.undo();
+            rig.undo();
+            assert_eq!(
+                rig.adjustment(id).photo_filter().map(|f| f.colour()),
+                Some([1.0, 1.0, 1.0])
+            );
+        }
+
+        #[test]
+        fn the_adjust_editors_hide_for_other_layers() {
+            let (mut rig, _id) = Rig::adjust_layer(vibrance_layer(10.0, 0.0));
+            let pixel = rig.layers.roots().last().copied();
+            rig.active = pixel;
+            rig.sync();
+            assert_eq!(
+                aurora_ui::adjust_controls_shown(&rig.workspace.tree, rig.adj_controls()),
+                None
+            );
+            rig.active = None;
+            rig.sync();
+            assert_eq!(
+                aurora_ui::adjust_controls_shown(&rig.workspace.tree, rig.adj_controls()),
+                None
+            );
+            let (rig, _hs) = Rig::hue_saturation();
+            assert_eq!(
+                aurora_ui::adjust_controls_shown(&rig.workspace.tree, rig.adj_controls()),
+                None
+            );
+            assert!(
+                aurora_ui::hue_saturation_controls_shown(&rig.workspace.tree, rig.hs_controls()),
+                "and Hue/Saturation still shows for its own layer"
+            );
+        }
+
+        /// The Photo Filter preset commands: palette entries, one undo step
+        /// each, colour only (density and Preserve Luminosity kept), no
+        /// step for the colour already set, a refusal on another layer.
+        #[test]
+        fn photo_filter_presets_set_the_colour_in_one_step() {
+            use aurora_ui::AdjustSlider as S;
+            for (i, (name, _)) in aurora_core::PHOTO_FILTER_PRESETS.iter().enumerate() {
+                assert!(
+                    crate::palette_commands()
+                        .iter()
+                        .any(|entry| entry.id == crate::adjust_app::preset_command_id(i)
+                            && entry.title == format!("Photo Filter: {name}"))
+                );
+                assert_eq!(
+                    crate::adjust_app::preset_for_command(&crate::adjust_app::preset_command_id(i)),
+                    Some(i)
+                );
+            }
+            assert_eq!(
+                crate::adjust_app::preset_for_command("photo_filter.preset.9"),
+                None
+            );
+            let filter = match aurora_core::PhotoFilterParams::new([0.5; 3], 61.0, false) {
+                Ok(p) => aurora_doc::Adjustment::PhotoFilter(p),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let (mut rig, id) = Rig::adjust_layer(filter);
+            let before = rig.undo_order.undo.len();
+            assert!(crate::adjust_app::apply_preset(&mut edit!(rig), 2));
+            rig.sync();
+            let f = rig.adjustment(id).photo_filter();
+            assert_eq!(
+                f.map(|f| f.colour().map(|c| (c * 255.0).round())),
+                Some([0.0, 109.0, 255.0])
+            );
+            assert_eq!(
+                f.map(|f| (f.density(), f.preserve_luminosity())),
+                Some((61.0, false))
+            );
+            assert_eq!(rig.adj_slider(S::Green).0, 109.0, "the editor follows");
+            assert_eq!(rig.undo_order.undo.len(), before + 1);
+            assert!(
+                !crate::adjust_app::apply_preset(&mut edit!(rig), 2),
+                "already set"
+            );
+            assert!(
+                !crate::adjust_app::apply_preset(&mut edit!(rig), 99),
+                "no such preset"
+            );
+            assert_eq!(rig.undo_order.undo.len(), before + 1);
+            rig.undo();
+            assert_eq!(
+                rig.adjustment(id).photo_filter().map(|f| f.colour()),
+                Some([0.5; 3])
+            );
+            let (mut other, _v) = Rig::adjust_layer(vibrance_layer(1.0, 0.0));
+            assert!(!crate::adjust_app::apply_preset(&mut edit!(other), 0));
+        }
+
         fn close(got: f32, want: f32, what: &str) {
             assert!(
                 (got - want).abs() <= TOLERANCE,
@@ -83857,6 +84377,292 @@ mod tests {
                 unreachable!("{err:?}");
             }
             assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+        }
+    }
+
+    // -- Vibrance, Exposure and Photo Filter in the compositor (0.239.0) --
+    /// 0.239.0: the three adjustments through the CPU fold against
+    /// hand-computed references (formulas in `aurora_core::{vibrance,
+    /// exposure, photo_filter}`). The backdrop (0.2, 0.4, 0.6) is HSL hue
+    /// 210, saturation 0.5, lightness 0.4.
+    #[allow(clippy::float_cmp)]
+    mod vibrance_exposure_photo_filter_adjustments {
+        use super::*;
+        use aurora_doc::{Adjustment, BlendMode};
+
+        const TILE: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
+        const TOLERANCE: f32 = 3e-3;
+        const BACKDROP: [f32; 4] = [0.2, 0.4, 0.6, 1.0];
+
+        fn vibrance(v: f32, s: f32) -> Adjustment {
+            match aurora_core::VibranceParams::new(v, s) {
+                Ok(p) => Adjustment::Vibrance(p),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn exposure(e: f32, o: f32, g: f32) -> Adjustment {
+            match aurora_core::ExposureParams::new(e, o, g) {
+                Ok(p) => Adjustment::Exposure(p),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn filter(c: [f32; 3], d: f32, preserve: bool) -> Adjustment {
+            match aurora_core::PhotoFilterParams::new(c, d, preserve) {
+                Ok(p) => Adjustment::PhotoFilter(p),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn add(layers: &mut aurora_doc::LayerTree, a: Adjustment) -> aurora_doc::LayerId {
+            match layers.add_adjustment_layer_at("Adjust 1", a, None, 0) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn composite(
+            layers: &aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+        ) -> Vec<[f32; 4]> {
+            let mut budget = crate::CompositeBudget::for_pass(layers);
+            let (texels, _) =
+                crate::composite_roots_into_tile(layers, store, TILE, (0, 0), (0, 0), &mut budget);
+            texels
+                .chunks_exact(4)
+                .filter_map(|texel| match *texel {
+                    [r, g, b, a] => Some([r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()]),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn first(layers: &aurora_doc::LayerTree, store: &mut aurora_tile::TileStore) -> [f32; 4] {
+            composite(layers, store)
+                .first()
+                .copied()
+                .unwrap_or([f32::NAN; 4])
+        }
+
+        fn assert_close(got: [f32; 4], want: [f32; 4], what: &str) {
+            for (g, w) in got.iter().zip(want) {
+                assert!(
+                    (g - w).abs() <= TOLERANCE,
+                    "{what}: got {got:?}, want {want:?}"
+                );
+            }
+        }
+
+        fn srgb_to_linear(v: f64) -> f64 {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        }
+
+        fn linear_to_srgb(v: f64) -> f64 {
+            if v <= 0.003_130_8 {
+                v * 12.92
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            }
+        }
+
+        #[test]
+        fn neutral_layers_are_an_exact_passthrough() {
+            for neutral in [
+                vibrance(0.0, 0.0),
+                exposure(0.0, 0.0, 1.0),
+                filter([1.0, 1.0, 1.0], 80.0, true),
+            ] {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers = solid_root_stack(
+                    &mut store,
+                    &[
+                        ("bottom", BlendMode::Normal, 1.0, BACKDROP),
+                        ("top", BlendMode::Multiply, 0.5, [0.9, 0.3, 0.7, 0.6]),
+                    ],
+                );
+                let without = composite(&layers, &mut store);
+                let _ = add(&mut layers, neutral);
+                let with = composite(&layers, &mut store);
+                let bits =
+                    |v: &[[f32; 4]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&with), bits(&without));
+            }
+        }
+
+        #[test]
+        fn vibrance_follows_the_closed_form_and_keeps_alpha() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let id = add(&mut layers, vibrance(100.0, 0.0));
+            // s 0.5 -> 0.5 * (1 + 0.5) = 0.75 at the same hue and lightness.
+            assert_close(
+                first(&layers, &mut store),
+                [0.1, 0.4, 0.7, 1.0],
+                "vibrance +100",
+            );
+            // Negative vibrance halves the saturation: s 0.25, C 0.2, m 0.3.
+            let _ = layers.set_adjustment(id, vibrance(-50.0, 0.0));
+            assert_close(
+                first(&layers, &mut store),
+                [0.3, 0.4, 0.5, 1.0],
+                "vibrance -50",
+            );
+            let _ = layers.set_adjustment(id, vibrance(0.0, -100.0));
+            assert_close(first(&layers, &mut store), [0.4, 0.4, 0.4, 1.0], "grey");
+            // Opacity blends back toward the backdrop.
+            let _ = layers.set_adjustment(id, vibrance(100.0, 0.0));
+            if let Err(err) = layers.set_opacity(id, 0.5) {
+                unreachable!("{err:?}");
+            }
+            assert_close(first(&layers, &mut store), [0.15, 0.4, 0.65, 1.0], "50 %");
+        }
+
+        #[test]
+        fn a_translucent_backdrop_keeps_its_alpha() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("b", BlendMode::Normal, 1.0, [0.2, 0.4, 0.6, 0.5])],
+            );
+            for adjustment in [
+                vibrance(100.0, 0.0),
+                exposure(1.0, 0.0, 1.0),
+                filter([1.0, 0.5, 0.0], 100.0, false),
+            ] {
+                let id = add(&mut layers, adjustment);
+                let got = first(&layers, &mut store);
+                assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
+                let _ = layers.remove(id);
+            }
+            // And the colour is the one an opaque backdrop gets (vibrance),
+            // in the same form the unadjusted texel is read.
+            let plain = first(&layers, &mut store);
+            let _ = add(&mut layers, vibrance(100.0, 0.0));
+            let got = first(&layers, &mut store);
+            assert!((plain[0] - 0.2).abs() <= 3e-3, "{plain:?}");
+            for (g, w) in got.iter().zip([0.1, 0.4, 0.7]) {
+                assert!((g - w).abs() <= 3e-3, "adjusted at half alpha: {got:?}");
+            }
+        }
+
+        #[test]
+        fn exposure_matches_an_independent_linear_light_model() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let id = add(&mut layers, exposure(1.0, 0.0, 1.0));
+            let model = |ev: f64, off: f64, gamma: f64| {
+                let want = |c: f32| {
+                    let lin = srgb_to_linear(f64::from(c)) * ev.exp2() + off;
+                    let y = lin.signum() * lin.abs().powf(1.0 / gamma);
+                    linear_to_srgb(y.clamp(0.0, 1.0)) as f32
+                };
+                [want(0.2), want(0.4), want(0.6), 1.0]
+            };
+            assert_close(first(&layers, &mut store), model(1.0, 0.0, 1.0), "+1 EV");
+            for (e, o, g) in [
+                (-2.0, 0.0, 1.0),
+                (0.5, 0.1, 1.0),
+                (0.0, -0.05, 1.0),
+                (0.0, 0.0, 2.2),
+                (1.5, 0.05, 0.7),
+            ] {
+                let _ = layers.set_adjustment(id, exposure(e as f32, o as f32, g as f32));
+                assert_close(
+                    first(&layers, &mut store),
+                    model(e, o, g),
+                    &format!("{e} {o} {g}"),
+                );
+            }
+        }
+
+        #[test]
+        fn photo_filter_multiplies_and_optionally_restores_the_luma() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let id = add(&mut layers, filter([1.0, 0.5, 0.0], 100.0, false));
+            assert_close(first(&layers, &mut store), [0.2, 0.2, 0.0, 1.0], "multiply");
+            // Luma 0.37192 -> 0.18556 after the multiply: a shift of 0.18636.
+            let _ = layers.set_adjustment(id, filter([1.0, 0.5, 0.0], 100.0, true));
+            assert_close(
+                first(&layers, &mut store),
+                [0.386_36, 0.386_36, 0.186_36, 1.0],
+                "preserve luminosity",
+            );
+            // Density 50: transmission (1, 0.75, 0.5).
+            let _ = layers.set_adjustment(id, filter([1.0, 0.5, 0.0], 50.0, false));
+            assert_close(
+                first(&layers, &mut store),
+                [0.2, 0.3, 0.3, 1.0],
+                "density 50",
+            );
+        }
+
+        #[test]
+        fn a_visible_layer_refuses_the_gpu_path_and_a_hidden_one_does_not() {
+            for adjustment in [
+                vibrance(30.0, 0.0),
+                exposure(1.0, 0.0, 1.0),
+                filter([1.0, 0.5, 0.0], 40.0, true),
+                // Even a neutral one: there is no GPU pass for the kind.
+                vibrance(0.0, 0.0),
+                exposure(0.0, 0.0, 1.0),
+            ] {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers =
+                    solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+                assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+                let id = add(&mut layers, adjustment);
+                assert!(!crate::adjustment_layer_qualifies_for_gpu(&layers, id));
+                assert!(
+                    !crate::document_qualifies_for_gpu_compositing(&layers),
+                    "a visible layer keeps the document on the CPU"
+                );
+                if let Err(err) = layers.set_visible(id, false) {
+                    unreachable!("{err:?}");
+                }
+                assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+            }
+        }
+
+        #[test]
+        fn inside_a_group_it_adjusts_only_that_groups_own_layers() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("outside", BlendMode::Normal, 1.0, [1.0, 0.0, 0.0, 1.0])],
+            );
+            let group = match layers.add_group("group", None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            };
+            let inner = match layers.add_pixel_layer("inner", bounds, Some(group)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(inner) else {
+                unreachable!("a pixel layer");
+            };
+            fill_solid(&mut store, surface, TILE, [0.2, 0.4, 0.6, 0.5]);
+            let _ = match layers.add_adjustment_layer_at("A", vibrance(0.0, -100.0), Some(group), 0)
+            {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_close(first(&layers, &mut store), [0.7, 0.2, 0.2, 1.0], "group");
         }
     }
 
