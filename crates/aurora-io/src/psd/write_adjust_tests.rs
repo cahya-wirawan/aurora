@@ -554,8 +554,16 @@ fn a_curve_that_collapses_to_one_level_is_refused_with_its_reason() {
 /// yet, so a PSD save is refused by name (never dropped or flattened), and
 /// the refusal names the layer, the kind and the way out.
 #[test]
-fn vibrance_exposure_and_photo_filter_layers_refuse_a_psd_save_by_name() {
-    let cases: [(Adjustment, &str); 3] = [
+fn vibrance_exposure_photo_filter_black_white_and_color_balance_layers_refuse_a_psd_save_by_name() {
+    let cases: [(Adjustment, &str); 5] = [
+        (
+            Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
+            "Black & White",
+        ),
+        (
+            Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+            "Color Balance",
+        ),
         (
             Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
             "Vibrance",

@@ -5998,6 +5998,9 @@ enum ActivatedCommand {
     NewVibranceLayer,
     NewExposureLayer,
     NewPhotoFilterLayer,
+    /// New Black & White / Color Balance Layer (0.240.0): the same.
+    NewBlackWhiteLayer,
+    NewColorBalanceLayer,
     /// A Photo Filter preset colour (0.239.0, palette only): index into
     /// [`aurora_core::PHOTO_FILTER_PRESETS`].
     PhotoFilterPreset(usize),
@@ -6251,6 +6254,8 @@ const COMMAND_LAYER_NEW_HUE_SATURATION: &str = "layer.new_hue_saturation";
 const COMMAND_LAYER_NEW_VIBRANCE: &str = "layer.new_vibrance";
 const COMMAND_LAYER_NEW_EXPOSURE: &str = "layer.new_exposure";
 const COMMAND_LAYER_NEW_PHOTO_FILTER: &str = "layer.new_photo_filter";
+const COMMAND_LAYER_NEW_BLACK_WHITE: &str = "layer.new_black_white";
+const COMMAND_LAYER_NEW_COLOR_BALANCE: &str = "layer.new_color_balance";
 const COMMAND_LAYER_NEW_GROUP: &str = "layer.new_group";
 const COMMAND_LAYER_CLIP_CREATE: &str = "layer.clip_create";
 const COMMAND_LAYER_CLIP_RELEASE: &str = "layer.clip_release";
@@ -6376,6 +6381,8 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_LAYER_NEW_VIBRANCE, "New Vibrance Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_EXPOSURE, "New Exposure Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_PHOTO_FILTER, "New Photo Filter Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_BLACK_WHITE, "New Black & White Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_COLOR_BALANCE, "New Color Balance Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_GROUP, "New Group"),
         CommandEntry::new(COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
         CommandEntry::new(COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),
@@ -6654,6 +6661,12 @@ fn activate_command(
     }
     if id == COMMAND_LAYER_NEW_PHOTO_FILTER {
         return Some(ActivatedCommand::NewPhotoFilterLayer);
+    }
+    if id == COMMAND_LAYER_NEW_BLACK_WHITE {
+        return Some(ActivatedCommand::NewBlackWhiteLayer);
+    }
+    if id == COMMAND_LAYER_NEW_COLOR_BALANCE {
+        return Some(ActivatedCommand::NewColorBalanceLayer);
     }
     if let Some(index) = adjust_app::preset_for_command(id) {
         return Some(ActivatedCommand::PhotoFilterPreset(index));
@@ -10756,6 +10769,18 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(
                 COMMAND_LAYER_NEW_PHOTO_FILTER,
                 "New Photo Filter Layer",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_BLACK_WHITE,
+                "New Black & White Layer",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_COLOR_BALANCE,
+                "New Color Balance Layer",
                 true,
                 None,
             ),
@@ -18242,6 +18267,10 @@ enum AdjustmentLut {
     Exposure(aurora_filters::ExposureOp),
     /// Photo Filter (0.239.0): a per-pixel function.
     PhotoFilter(aurora_filters::PhotoFilterOp),
+    /// Black & White (0.240.0): a per-pixel function, never an identity.
+    BlackWhite(aurora_filters::BlackWhiteOp),
+    /// Color Balance (0.240.0): a per-pixel function.
+    ColorBalance(aurora_filters::ColorBalanceOp),
 }
 
 impl AdjustmentLut {
@@ -18265,6 +18294,12 @@ impl AdjustmentLut {
             aurora_doc::Adjustment::PhotoFilter(params) => {
                 Self::PhotoFilter(aurora_filters::PhotoFilterOp::new(params))
             }
+            aurora_doc::Adjustment::BlackWhite(params) => {
+                Self::BlackWhite(aurora_filters::BlackWhiteOp::new(params))
+            }
+            aurora_doc::Adjustment::ColorBalance(params) => {
+                Self::ColorBalance(aurora_filters::ColorBalanceOp::new(params))
+            }
         }
     }
 
@@ -18277,6 +18312,8 @@ impl AdjustmentLut {
             Self::Vibrance(op) => op.is_identity(),
             Self::Exposure(op) => op.is_identity(),
             Self::PhotoFilter(op) => op.is_identity(),
+            Self::BlackWhite(op) => op.is_identity(),
+            Self::ColorBalance(op) => op.is_identity(),
         }
     }
 
@@ -18289,6 +18326,8 @@ impl AdjustmentLut {
             Self::Vibrance(op) => op.apply(rgb),
             Self::Exposure(op) => op.apply(rgb),
             Self::PhotoFilter(op) => op.apply(rgb),
+            Self::BlackWhite(op) => op.apply(rgb),
+            Self::ColorBalance(op) => op.apply(rgb),
         }
     }
 }
@@ -20180,12 +20219,15 @@ fn adjustment_layer_qualifies_for_gpu(
                 .packed_for_gpu()
                 .is_some()
         }
-        // Vibrance, Exposure and Photo Filter (0.239.0) have no GPU pass
-        // yet: a visible layer of these kinds keeps the CPU path.
+        // Vibrance, Exposure and Photo Filter (0.239.0), Black & White and
+        // Color Balance (0.240.0) have no GPU pass yet: a visible layer of
+        // these kinds keeps the CPU path.
         Some(
             aurora_doc::Adjustment::Vibrance(_)
             | aurora_doc::Adjustment::Exposure(_)
-            | aurora_doc::Adjustment::PhotoFilter(_),
+            | aurora_doc::Adjustment::PhotoFilter(_)
+            | aurora_doc::Adjustment::BlackWhite(_)
+            | aurora_doc::Adjustment::ColorBalance(_),
         )
         | None => false,
     };
@@ -20632,7 +20674,9 @@ fn begin_gpu_adjustment_pass(
             AdjustmentLut::Curves(_)
             | AdjustmentLut::Vibrance(_)
             | AdjustmentLut::Exposure(_)
-            | AdjustmentLut::PhotoFilter(_),
+            | AdjustmentLut::PhotoFilter(_)
+            | AdjustmentLut::BlackWhite(_)
+            | AdjustmentLut::ColorBalance(_),
         ) => return false,
     }
     std::mem::swap(current_accumulator, spare_accumulator);
@@ -25557,7 +25601,8 @@ enum LayerCommand {
     NewLevels,
     /// New Hue/Saturation Layer (0.203.0): [`Self::NewLevels`]'s twin.
     NewHueSaturation,
-    /// New Vibrance / Exposure / Photo Filter Layer (0.239.0).
+    /// New Vibrance / Exposure / Photo Filter / Black & White / Color
+    /// Balance Layer (0.239.0, 0.240.0).
     NewAdjust(aurora_ui::AdjustKind),
     /// New Group (0.196.0): an empty Pass Through group directly above the
     /// active node, placed exactly where [`Self::New`] places a layer,
@@ -29477,6 +29522,14 @@ impl App {
             }
             Some(ActivatedCommand::NewPhotoFilterLayer) => {
                 self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::PhotoFilter));
+            }
+            Some(ActivatedCommand::NewBlackWhiteLayer) => {
+                self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::BlackWhite));
+            }
+            Some(ActivatedCommand::NewColorBalanceLayer) => {
+                self.run_layer_command(LayerCommand::NewAdjust(
+                    aurora_ui::AdjustKind::ColorBalance,
+                ));
             }
             Some(ActivatedCommand::PhotoFilterPreset(index)) => {
                 self.apply_photo_filter_preset(index);
@@ -44285,8 +44338,9 @@ mod tests {
         // up selected. (0.202.0) "New Levels Layer" matches too, and
         // (0.235.0) "Layer via Copy" and "Layer via Cut", and (0.239.0)
         // "New Vibrance Layer", "New Exposure Layer" and "New Photo Filter
-        // Layer".
-        assert_eq!(state.results().len(), 19);
+        // Layer", and (0.240.0) "New Black & White Layer" and "New Color
+        // Balance Layer".
+        assert_eq!(state.results().len(), 21);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -78363,7 +78417,7 @@ mod tests {
 
             #[test]
             fn new_vibrance_exposure_and_photo_filter_layers_are_commands_and_one_undo_step_each() {
-                let cases: [(&str, &str, ActivatedCommand, LayerCommand, Adjustment, &str); 3] = [
+                let cases: [(&str, &str, ActivatedCommand, LayerCommand, Adjustment, &str); 5] = [
                     (
                         crate::COMMAND_LAYER_NEW_VIBRANCE,
                         "New Vibrance Layer",
@@ -78387,6 +78441,22 @@ mod tests {
                         LayerCommand::NewAdjust(aurora_ui::AdjustKind::PhotoFilter),
                         Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
                         "Photo Filter",
+                    ),
+                    (
+                        crate::COMMAND_LAYER_NEW_BLACK_WHITE,
+                        "New Black & White Layer",
+                        ActivatedCommand::NewBlackWhiteLayer,
+                        LayerCommand::NewAdjust(aurora_ui::AdjustKind::BlackWhite),
+                        Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
+                        "Black & White",
+                    ),
+                    (
+                        crate::COMMAND_LAYER_NEW_COLOR_BALANCE,
+                        "New Color Balance Layer",
+                        ActivatedCommand::NewColorBalanceLayer,
+                        LayerCommand::NewAdjust(aurora_ui::AdjustKind::ColorBalance),
+                        Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+                        "Color Balance",
                     ),
                 ];
                 for (id, title, activated, command, adjustment, stem) in cases {
@@ -83287,6 +83357,184 @@ mod tests {
             );
         }
 
+        /// 0.240.0: a Black & White slider drag is **one** undo step through
+        /// the real pointer routing; Tint is one step per toggle and gates
+        /// the tint sliders; undo moves the editor back and the composite
+        /// follows.
+        #[test]
+        fn black_and_white_drag_and_tint_are_one_step_each() {
+            use aurora_ui::AdjustSlider as S;
+            let (mut rig, id) = Rig::adjust_layer(aurora_doc::Adjustment::BlackWhite(
+                aurora_core::BlackWhiteParams::default(),
+            ));
+            assert_eq!(
+                aurora_ui::adjust_controls_shown(&rig.workspace.tree, rig.adj_controls()),
+                Some(aurora_ui::AdjustKind::BlackWhite)
+            );
+            assert!(!rig.adj_slider(S::BwReds).1 && rig.adj_slider(S::TintHue).1);
+            assert!(!aurora_ui::adjust_tint_checked(
+                &rig.workspace.tree,
+                rig.adj_controls()
+            ));
+            let weights = |rig: &Rig| match rig.adjustment(id).black_white() {
+                Some(p) => p.weights(),
+                None => unreachable!("a Black & White layer"),
+            };
+            let before = rig.undo_order.undo.len();
+            let down = rig.adj_along(S::BwBlues, 0.5);
+            rig.pointer(PointerPhase::Down, down);
+            for f in [0.6, 0.8, 1.0] {
+                let at = rig.adj_along(S::BwBlues, f);
+                rig.pointer(PointerPhase::Move, at);
+            }
+            let up = rig.adj_along(S::BwBlues, 1.0);
+            rig.pointer(PointerPhase::Up, up);
+            assert_eq!(
+                weights(&rig),
+                [40.0, 60.0, 40.0, 60.0, 300.0, 80.0],
+                "dragged to the end"
+            );
+            assert_eq!(rig.undo_order.undo.len(), before + 1, "one undo step");
+            // Backdrop (0.2, 0.4, 0.6): 0.2 + 0.2 * 3.0 + 0.2 * 0.6 = 0.92.
+            let got = rig.first();
+            for g in &got[..3] {
+                assert!((g - 0.92).abs() <= 3e-3, "the composite follows: {got:?}");
+            }
+            // Tint: one step, enables the tint sliders; its sliders are one step each.
+            let tint = rig.adj_controls().tint;
+            let at = rig.centre(tint);
+            rig.pointer(PointerPhase::Down, at);
+            rig.pointer(PointerPhase::Up, at);
+            assert_eq!(rig.undo_order.undo.len(), before + 2);
+            assert!(rig.adjustment(id).black_white().is_some_and(|p| p.tint()));
+            assert!(aurora_ui::adjust_tint_checked(
+                &rig.workspace.tree,
+                rig.adj_controls()
+            ));
+            assert!(!rig.adj_slider(S::TintHue).1, "live with Tint on");
+            rig.adj_set(S::TintHue, 200.4);
+            rig.adj_set(S::TintSaturation, 80.0);
+            assert_eq!(
+                rig.adjustment(id)
+                    .black_white()
+                    .map(|p| (p.tint_hue(), p.tint_saturation())),
+                Some((200.0, 80.0))
+            );
+            assert_eq!(rig.undo_order.undo.len(), before + 4);
+            // Hostile values record nothing.
+            rig.adj_set(S::TintHue, f64::NAN);
+            rig.adj_set(S::TintHue, 200.0);
+            assert_eq!(rig.undo_order.undo.len(), before + 4);
+            rig.undo();
+            rig.undo();
+            rig.undo();
+            assert!(rig.adjustment(id).black_white().is_some_and(|p| !p.tint()));
+            assert!(rig.adj_slider(S::TintHue).1, "gated again");
+            rig.undo();
+            assert_eq!(weights(&rig), [40.0, 60.0, 40.0, 60.0, 20.0, 80.0]);
+            assert_eq!(rig.adj_slider(S::BwBlues).0, 20.0);
+            rig.redo();
+            assert_eq!(rig.adj_slider(S::BwBlues).0, 300.0);
+        }
+
+        /// 0.240.0: the Color Balance range tab edits no document, the
+        /// sliders edit the selected range one step each, Preserve
+        /// Luminosity is one step per toggle, and undo moves the editor.
+        #[test]
+        fn color_balance_range_tab_sliders_and_preserve_are_wired() {
+            use aurora_ui::AdjustSlider as S;
+            let (mut rig, id) = Rig::adjust_layer(aurora_doc::Adjustment::ColorBalance(
+                aurora_core::ColorBalanceParams::identity(),
+            ));
+            assert_eq!(
+                aurora_ui::adjust_controls_shown(&rig.workspace.tree, rig.adj_controls()),
+                Some(aurora_ui::AdjustKind::ColorBalance)
+            );
+            assert!(aurora_ui::adjust_balance_preserve_checked(
+                &rig.workspace.tree,
+                rig.adj_controls()
+            ));
+            let ranges = |rig: &Rig| match rig.adjustment(id).color_balance() {
+                Some(p) => p.ranges(),
+                None => unreachable!("a Color Balance layer"),
+            };
+            let before = rig.undo_order.undo.len();
+            // Midtones tab: a click, no document step.
+            let tab = match aurora_widgets::widgets::tab_bar_state(
+                &rig.workspace.tree,
+                rig.adj_controls().balance_range,
+            ) {
+                Ok(state) => state.tabs().get(1).copied(),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(tab) = tab else {
+                unreachable!("three tabs");
+            };
+            let at = rig.centre(tab);
+            rig.pointer(PointerPhase::Down, at);
+            rig.pointer(PointerPhase::Up, at);
+            rig.sync();
+            assert_eq!(
+                aurora_ui::adjust_balance_range(&rig.workspace.tree, rig.adj_controls()),
+                1
+            );
+            assert_eq!(rig.undo_order.undo.len(), before, "a tab is no undo step");
+            rig.adj_set(S::BalanceCyanRed, 60.0);
+            rig.adj_set(S::BalanceYellowBlue, -25.0);
+            assert_eq!(ranges(&rig), [[0.0; 3], [60.0, 0.0, -25.0], [0.0; 3]]);
+            assert_eq!(rig.undo_order.undo.len(), before + 2);
+            // Midtone red +60 on the backdrop (preserve on): the red channel rises.
+            let got = rig.first();
+            assert!(got[0] > BACKDROP[0] + 0.05, "{got:?}");
+            // The shadows tab shows its own (zero) values, the document unchanged.
+            let tab0 = match aurora_widgets::widgets::tab_bar_state(
+                &rig.workspace.tree,
+                rig.adj_controls().balance_range,
+            ) {
+                Ok(state) => state.tabs().first().copied(),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(tab0) = tab0 else {
+                unreachable!("three tabs");
+            };
+            let at = rig.centre(tab0);
+            rig.pointer(PointerPhase::Down, at);
+            rig.pointer(PointerPhase::Up, at);
+            rig.sync();
+            assert_eq!(rig.adj_slider(S::BalanceCyanRed).0, 0.0);
+            rig.adj_set(S::BalanceMagentaGreen, -100.0);
+            assert_eq!(
+                ranges(&rig),
+                [[0.0, -100.0, 0.0], [60.0, 0.0, -25.0], [0.0; 3]]
+            );
+            // Preserve Luminosity: one step.
+            let preserve = rig.adj_controls().balance_preserve;
+            let at = rig.centre(preserve);
+            rig.pointer(PointerPhase::Down, at);
+            rig.pointer(PointerPhase::Up, at);
+            assert!(
+                rig.adjustment(id)
+                    .color_balance()
+                    .is_some_and(|p| !p.preserve_luminosity())
+            );
+            assert_eq!(rig.undo_order.undo.len(), before + 4);
+            rig.undo();
+            assert!(aurora_ui::adjust_balance_preserve_checked(
+                &rig.workspace.tree,
+                rig.adj_controls()
+            ));
+            rig.undo();
+            assert_eq!(ranges(&rig), [[0.0; 3], [60.0, 0.0, -25.0], [0.0; 3]]);
+            // Back on the shadows tab; the NaN and the other adjustment's
+            // slider record nothing.
+            rig.adj_set(S::BalanceCyanRed, f64::NAN);
+            rig.adj_set(S::Vibrance, 50.0);
+            assert_eq!(rig.undo_order.undo.len(), before + 2);
+            rig.undo();
+            rig.undo();
+            assert_eq!(ranges(&rig), [[0.0; 3]; 3]);
+        }
+
         /// The Photo Filter preset commands: palette entries, one undo step
         /// each, colour only (density and Preserve Luminosity kept), no
         /// step for the colour already set, a refusal on another layer.
@@ -84415,6 +84663,20 @@ mod tests {
             }
         }
 
+        fn black_white(w: [f32; 6], tint: bool, hue: f32, sat: f32) -> Adjustment {
+            match aurora_core::BlackWhiteParams::new(w, tint, hue, sat) {
+                Ok(p) => Adjustment::BlackWhite(p),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn balance(ranges: [[f32; 3]; 3], preserve: bool) -> Adjustment {
+            match aurora_core::ColorBalanceParams::new(ranges, preserve) {
+                Ok(p) => Adjustment::ColorBalance(p),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
         fn add(layers: &mut aurora_doc::LayerTree, a: Adjustment) -> aurora_doc::LayerId {
             match layers.add_adjustment_layer_at("Adjust 1", a, None, 0) {
                 Ok(id) => id,
@@ -84605,6 +84867,145 @@ mod tests {
             );
         }
 
+        /// 0.240.0: Black & White through the CPU fold. The backdrop
+        /// (0.2, 0.4, 0.6) has max = blue, mid = green, min = red, so its
+        /// grey is `0.2 + 0.2 * w(blues) + 0.2 * w(cyans)` = 0.36 at the
+        /// defaults; alpha stays and opacity blends back toward the backdrop.
+        #[test]
+        fn black_and_white_follows_the_closed_form_and_keeps_alpha() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let defaults = [40.0, 60.0, 40.0, 60.0, 20.0, 80.0];
+            let id = add(&mut layers, black_white(defaults, false, 0.0, 0.0));
+            assert_close(
+                first(&layers, &mut store),
+                [0.36, 0.36, 0.36, 1.0],
+                "defaults",
+            );
+            // Blues 100, Cyans 0: 0.2 + 0.2 * 1.0 + 0.2 * 0.0.
+            let _ = layers.set_adjustment(
+                id,
+                black_white([40.0, 60.0, 40.0, 0.0, 100.0, 80.0], false, 0.0, 0.0),
+            );
+            assert_close(
+                first(&layers, &mut store),
+                [0.4, 0.4, 0.4, 1.0],
+                "blues and cyans",
+            );
+            // Opacity 50 % blends back toward the backdrop.
+            let _ = layers.set_adjustment(id, black_white(defaults, false, 0.0, 0.0));
+            if let Err(err) = layers.set_opacity(id, 0.5) {
+                unreachable!("{err:?}");
+            }
+            assert_close(first(&layers, &mut store), [0.28, 0.38, 0.48, 1.0], "50 %");
+            // Tint 0 % saturation is the plain grey; with saturation the
+            // result has the tint's hue at the grey's lightness.
+            if let Err(err) = layers.set_opacity(id, 1.0) {
+                unreachable!("{err:?}");
+            }
+            let _ = layers.set_adjustment(id, black_white(defaults, true, 0.0, 100.0));
+            // Hue 0, saturation 1, lightness 0.36: chroma 0.72 -> (0.72, 0, 0).
+            assert_close(
+                first(&layers, &mut store),
+                [0.72, 0.0, 0.0, 1.0],
+                "tint red",
+            );
+            // Translucent backdrop: alpha kept, colour as for an opaque one.
+            let (_dir2, mut store2) = real_tile_store();
+            let mut layers2 = solid_root_stack(
+                &mut store2,
+                &[("b", BlendMode::Normal, 1.0, [0.2, 0.4, 0.6, 0.5])],
+            );
+            let _ = add(&mut layers2, black_white(defaults, false, 0.0, 0.0));
+            let got = first(&layers2, &mut store2);
+            assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
+            for c in &got[..3] {
+                assert!((c - 0.36).abs() <= TOLERANCE, "{got:?}");
+            }
+        }
+
+        /// 0.240.0: Color Balance against an independent f64 model, neutral
+        /// as an exact passthrough, alpha kept.
+        #[test]
+        fn color_balance_matches_an_independent_model_and_neutral_is_exact() {
+            let model = |ranges: [[f32; 3]; 3], preserve: bool| {
+                let input = [0.2_f64, 0.4, 0.6];
+                let luma = |c: [f64; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+                let y = luma(input);
+                let w = [(1.0 - y).powi(2), 4.0 * y * (1.0 - y), y * y];
+                let d: [f64; 3] = [0, 1, 2].map(|c| {
+                    ranges
+                        .iter()
+                        .zip(w)
+                        .map(|(row, weight)| {
+                            weight * f64::from(row.get(c).copied().unwrap_or(0.0)) / 100.0 * 0.5
+                        })
+                        .sum()
+                });
+                let restore = if preserve { luma(d) } else { 0.0 };
+                let out = |c: usize| {
+                    let base = input.get(c).copied().unwrap_or(0.0);
+                    let moved = d.get(c).copied().unwrap_or(0.0);
+                    (base + moved - restore).clamp(0.0, 1.0) as f32
+                };
+                [out(0), out(1), out(2), 1.0]
+            };
+            let (_dir, mut store) = real_tile_store();
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let id = add(&mut layers, balance([[0.0; 3]; 3], true));
+            let plain = composite(&layers, &mut store);
+            let _ = layers.remove(id);
+            let without = composite(&layers, &mut store);
+            let bits = |v: &[[f32; 4]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&plain),
+                bits(&without),
+                "neutral is an exact passthrough"
+            );
+            let id = add(&mut layers, balance([[0.0; 3]; 3], true));
+            for (ranges, preserve) in [
+                ([[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [0.0; 3]], false),
+                (
+                    [
+                        [30.0, -20.0, 10.0],
+                        [-40.0, 60.0, -80.0],
+                        [100.0, 5.0, -100.0],
+                    ],
+                    false,
+                ),
+                (
+                    [
+                        [30.0, -20.0, 10.0],
+                        [-40.0, 60.0, -80.0],
+                        [100.0, 5.0, -100.0],
+                    ],
+                    true,
+                ),
+                ([[0.0; 3], [0.0; 3], [-100.0, 0.0, 100.0]], true),
+            ] {
+                let _ = layers.set_adjustment(id, balance(ranges, preserve));
+                assert_close(
+                    first(&layers, &mut store),
+                    model(ranges, preserve),
+                    &format!("{ranges:?} {preserve}"),
+                );
+            }
+            // Translucent backdrop keeps its alpha.
+            let (_dir2, mut store2) = real_tile_store();
+            let mut layers2 = solid_root_stack(
+                &mut store2,
+                &[("b", BlendMode::Normal, 1.0, [0.2, 0.4, 0.6, 0.5])],
+            );
+            let _ = add(
+                &mut layers2,
+                balance([[0.0; 3], [100.0, 0.0, 0.0], [0.0; 3]], false),
+            );
+            let got = first(&layers2, &mut store2);
+            assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
+        }
+
         #[test]
         fn a_visible_layer_refuses_the_gpu_path_and_a_hidden_one_does_not() {
             for adjustment in [
@@ -84614,6 +85015,10 @@ mod tests {
                 // Even a neutral one: there is no GPU pass for the kind.
                 vibrance(0.0, 0.0),
                 exposure(0.0, 0.0, 1.0),
+                // 0.240.0: Black & White and Color Balance, neutral or not.
+                Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
+                Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+                balance([[10.0, 0.0, -20.0], [0.0; 3], [0.0; 3]], true),
             ] {
                 let (_dir, mut store) = real_tile_store();
                 let mut layers =

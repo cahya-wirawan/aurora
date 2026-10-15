@@ -130,6 +130,13 @@ const NOT_WRITTEN_EXPOSURE: &str =
 const NOT_WRITTEN_PHOTO_FILTER: &str = "Aurora can't write Photo Filter layers to .psd yet; save \
      as .aur, or merge or remove the layer";
 
+/// Why a Black & White layer cannot be saved to PSD (0.240.0).
+const NOT_WRITTEN_BLACK_WHITE: &str = "Aurora can't write Black & White layers to .psd yet; save \
+     as .aur, or merge or remove the layer";
+/// Why a Color Balance layer cannot be saved to PSD (0.240.0).
+const NOT_WRITTEN_COLOR_BALANCE: &str = "Aurora can't write Color Balance layers to .psd yet; \
+     save as .aur, or merge or remove the layer";
+
 /// Encodes `adjustment` as its tagged block.
 ///
 /// # Errors
@@ -148,6 +155,10 @@ pub(super) fn encode_adjustment(
         Adjustment::Vibrance(_) => return Err(NOT_WRITTEN_VIBRANCE),
         Adjustment::Exposure(_) => return Err(NOT_WRITTEN_EXPOSURE),
         Adjustment::PhotoFilter(_) => return Err(NOT_WRITTEN_PHOTO_FILTER),
+        // Black & White (`blwh`) and Color Balance (`blnc`) likewise
+        // (0.240.0): refused by name, not written.
+        Adjustment::BlackWhite(_) => return Err(NOT_WRITTEN_BLACK_WHITE),
+        Adjustment::ColorBalance(_) => return Err(NOT_WRITTEN_COLOR_BALANCE),
         Adjustment::HueSaturation(_) | Adjustment::HueSaturationRanges(_) => {
             let Some(params) = adjustment.hue_saturation() else {
                 return Err("its Hue/Saturation settings are unreadable");

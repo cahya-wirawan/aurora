@@ -147,8 +147,8 @@ fn every_static_item_is_also_in_the_command_palette() {
     }
 }
 
-/// 0.239.0: Vibrance, Exposure and Photo Filter are in the in-window
-/// Layer menu and in the macOS menu's cross-check list.
+/// 0.239.0, 0.240.0: Vibrance, Exposure, Photo Filter, Black & White and
+/// Color Balance are in the in-window Layer menu and in the macOS menu's cross-check list.
 #[test]
 fn the_new_adjustment_layers_are_in_the_layer_menu_and_the_native_list() {
     let menus = menus_for(&context());
@@ -159,6 +159,14 @@ fn the_new_adjustment_layers_are_in_the_layer_menu_and_the_native_list() {
         (
             crate::COMMAND_LAYER_NEW_PHOTO_FILTER,
             "New Photo Filter Layer",
+        ),
+        (
+            crate::COMMAND_LAYER_NEW_BLACK_WHITE,
+            "New Black & White Layer",
+        ),
+        (
+            crate::COMMAND_LAYER_NEW_COLOR_BALANCE,
+            "New Color Balance Layer",
         ),
     ] {
         assert_eq!(entry(layer, id).0, label);

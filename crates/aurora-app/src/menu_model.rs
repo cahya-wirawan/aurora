@@ -91,6 +91,7 @@ fn modify_rows() -> Vec<(&'static str, String)> {
         .collect()
 }
 
+#[allow(clippy::too_many_lines)] // one row per menu command
 fn static_rows(title: &str) -> Vec<Row> {
     match title {
         "File" => vec![
@@ -148,6 +149,14 @@ fn static_rows(title: &str) -> Vec<Row> {
             Cmd(
                 crate::COMMAND_LAYER_NEW_PHOTO_FILTER,
                 "New Photo Filter Layer",
+            ),
+            Cmd(
+                crate::COMMAND_LAYER_NEW_BLACK_WHITE,
+                "New Black & White Layer",
+            ),
+            Cmd(
+                crate::COMMAND_LAYER_NEW_COLOR_BALANCE,
+                "New Color Balance Layer",
             ),
             Sep,
             Cmd(crate::COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
@@ -471,6 +480,8 @@ pub(crate) const NATIVE_MENU_COMMANDS: &[&str] = &[
     crate::COMMAND_LAYER_NEW_VIBRANCE,
     crate::COMMAND_LAYER_NEW_EXPOSURE,
     crate::COMMAND_LAYER_NEW_PHOTO_FILTER,
+    crate::COMMAND_LAYER_NEW_BLACK_WHITE,
+    crate::COMMAND_LAYER_NEW_COLOR_BALANCE,
     crate::COMMAND_LAYER_NEW_GROUP,
     crate::COMMAND_LAYER_CLIP_CREATE,
     crate::COMMAND_LAYER_CLIP_RELEASE,

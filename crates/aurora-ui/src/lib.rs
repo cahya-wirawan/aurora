@@ -72,8 +72,10 @@ pub mod tools_panel;
 pub mod workspace;
 
 pub use adjust_controls::{
-    AdjustControls, AdjustKind, AdjustSlider, adjust_controls_contains, adjust_controls_shown,
-    adjust_of, adjust_preserve_checked, insert_adjust_controls, sync_adjust_controls,
+    ADJUST_KIND_COUNT, ADJUST_SLIDER_COUNT, AdjustControls, AdjustKind, AdjustSlider,
+    adjust_balance_preserve_checked, adjust_balance_range, adjust_controls_contains,
+    adjust_controls_shown, adjust_of, adjust_preserve_checked, adjust_tint_checked,
+    insert_adjust_controls, sync_adjust_controls,
 };
 pub use canvas_view::CanvasView;
 pub use channels_panel::{

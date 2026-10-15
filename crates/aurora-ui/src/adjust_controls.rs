@@ -1,7 +1,8 @@
-//! The Properties panel's **Vibrance, Exposure and Photo Filter editors**
-//! (0.239.0): one hidden column holding three groups of sliders with a
-//! readout each (and Photo Filter's Preserve Luminosity checkbox), of
-//! which at most one is shown, the one matching the active layer.
+//! The Properties panel's **Vibrance, Exposure, Photo Filter, Black & White
+//! and Color Balance editors** (0.239.0, the last two 0.240.0): one hidden
+//! column holding five groups of sliders with a readout each (and the
+//! checkboxes and the Color Balance range selector), of which at most one
+//! is shown, the one matching the active layer.
 //!
 //! **Where it lives.** Inside the Properties panel's tool-controls strip
 //! beside the Hue/Saturation editor ([`crate::insert_tool_controls`]), so
@@ -20,11 +21,22 @@
 //! Density in whole percent; the Photo Filter colour as three 8-bit
 //! channel sliders (`0..=255`), because the properties panel has no
 //! colour picker. The presets (`Warming (85)` and the others) are palette
-//! commands, not widgets here.
+//! commands, not widgets here. Black & White: six whole-percent colour
+//! sliders, a Tint checkbox and the tint hue (degrees) and saturation
+//! (percent) sliders, which are live only while Tint is on. Color Balance:
+//! a three-tab range selector (Shadows, Midtones, Highlights; widget state
+//! only, never document state, no undo step, like the Hue/Saturation range
+//! selector), three whole-number sliders that edit the selected range, and
+//! a Preserve Luminosity checkbox.
+
+// `AdjustControls` is `Copy` and 400 bytes (twenty sliders and readouts since
+// 0.240.0); the helpers take it by value like the other editors' controls.
+#![allow(clippy::large_types_passed_by_value)]
 
 use aurora_core::{
-    EXPOSURE_MAX, ExposureParams, GAMMA_MAX, GAMMA_MIN, OFFSET_MAX, PhotoFilterParams,
-    VibranceParams,
+    BLACK_WHITE_DEFAULTS, BLACK_WHITE_MAX, BLACK_WHITE_MIN, BlackWhiteParams, COLOR_BALANCE_MAX,
+    COLOR_BALANCE_RANGES, DEFAULT_TINT_HUE, DEFAULT_TINT_SATURATION, EXPOSURE_MAX, ExposureParams,
+    GAMMA_MAX, GAMMA_MIN, OFFSET_MAX, PhotoFilterParams, VibranceParams,
 };
 use aurora_doc::{Adjustment, LayerId, LayerTree};
 use aurora_theme::Scales;
@@ -33,17 +45,30 @@ use aurora_widgets::{WidgetError, WidgetId, WidgetTree};
 use taffy::style_helpers::length;
 use taffy::{Display, FlexDirection, Size, Style};
 
-/// Which of the three adjustments an editor group belongs to.
+/// How many sliders the editors hold.
+pub const ADJUST_SLIDER_COUNT: usize = 20;
+/// How many editor groups there are.
+pub const ADJUST_KIND_COUNT: usize = 5;
+
+/// Which of the adjustments an editor group belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdjustKind {
     Vibrance,
     Exposure,
     PhotoFilter,
+    BlackWhite,
+    ColorBalance,
 }
 
 impl AdjustKind {
     /// Every kind, in group order.
-    pub const ALL: [Self; 3] = [Self::Vibrance, Self::Exposure, Self::PhotoFilter];
+    pub const ALL: [Self; ADJUST_KIND_COUNT] = [
+        Self::Vibrance,
+        Self::Exposure,
+        Self::PhotoFilter,
+        Self::BlackWhite,
+        Self::ColorBalance,
+    ];
 
     /// Position in [`Self::ALL`].
     #[must_use]
@@ -52,6 +77,8 @@ impl AdjustKind {
             Self::Vibrance => 0,
             Self::Exposure => 1,
             Self::PhotoFilter => 2,
+            Self::BlackWhite => 3,
+            Self::ColorBalance => 4,
         }
     }
 
@@ -62,12 +89,14 @@ impl AdjustKind {
             Adjustment::Vibrance(_) => Some(Self::Vibrance),
             Adjustment::Exposure(_) => Some(Self::Exposure),
             Adjustment::PhotoFilter(_) => Some(Self::PhotoFilter),
+            Adjustment::BlackWhite(_) => Some(Self::BlackWhite),
+            Adjustment::ColorBalance(_) => Some(Self::ColorBalance),
             _ => None,
         }
     }
 }
 
-/// One of the nine sliders.
+/// One of the twenty sliders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdjustSlider {
     /// Vibrance, `-100..=100`.
@@ -88,11 +117,28 @@ pub enum AdjustSlider {
     Green,
     /// The filter colour's blue level, `0..=255`.
     Blue,
+    /// Black & White's six colour sliders, `-200..=300`.
+    BwReds,
+    BwYellows,
+    BwGreens,
+    BwCyans,
+    BwBlues,
+    BwMagentas,
+    /// The Black & White tint hue, degrees `0..=360`.
+    TintHue,
+    /// The Black & White tint saturation, `0..=100`.
+    TintSaturation,
+    /// Color Balance's cyan-red slider of the selected range, `-100..=100`.
+    BalanceCyanRed,
+    /// Its magenta-green slider.
+    BalanceMagentaGreen,
+    /// Its yellow-blue slider.
+    BalanceYellowBlue,
 }
 
 impl AdjustSlider {
     /// Every slider, in layout order — the one place that order is fixed.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; ADJUST_SLIDER_COUNT] = [
         Self::Vibrance,
         Self::VibranceSaturation,
         Self::Exposure,
@@ -102,6 +148,17 @@ impl AdjustSlider {
         Self::Red,
         Self::Green,
         Self::Blue,
+        Self::BwReds,
+        Self::BwYellows,
+        Self::BwGreens,
+        Self::BwCyans,
+        Self::BwBlues,
+        Self::BwMagentas,
+        Self::TintHue,
+        Self::TintSaturation,
+        Self::BalanceCyanRed,
+        Self::BalanceMagentaGreen,
+        Self::BalanceYellowBlue,
     ];
 
     /// Position in [`Self::ALL`].
@@ -117,6 +174,17 @@ impl AdjustSlider {
             Self::Red => 6,
             Self::Green => 7,
             Self::Blue => 8,
+            Self::BwReds => 9,
+            Self::BwYellows => 10,
+            Self::BwGreens => 11,
+            Self::BwCyans => 12,
+            Self::BwBlues => 13,
+            Self::BwMagentas => 14,
+            Self::TintHue => 15,
+            Self::TintSaturation => 16,
+            Self::BalanceCyanRed => 17,
+            Self::BalanceMagentaGreen => 18,
+            Self::BalanceYellowBlue => 19,
         }
     }
 
@@ -127,6 +195,51 @@ impl AdjustSlider {
             Self::Vibrance | Self::VibranceSaturation => AdjustKind::Vibrance,
             Self::Exposure | Self::Offset | Self::Gamma => AdjustKind::Exposure,
             Self::Density | Self::Red | Self::Green | Self::Blue => AdjustKind::PhotoFilter,
+            Self::BwReds
+            | Self::BwYellows
+            | Self::BwGreens
+            | Self::BwCyans
+            | Self::BwBlues
+            | Self::BwMagentas
+            | Self::TintHue
+            | Self::TintSaturation => AdjustKind::BlackWhite,
+            Self::BalanceCyanRed | Self::BalanceMagentaGreen | Self::BalanceYellowBlue => {
+                AdjustKind::ColorBalance
+            }
+        }
+    }
+
+    /// Whether the slider is one of the two tint sliders, live only while
+    /// the Black & White Tint checkbox is on.
+    #[must_use]
+    pub const fn is_tint(self) -> bool {
+        matches!(self, Self::TintHue | Self::TintSaturation)
+    }
+
+    /// The Black & White colour slider's slot (`0..6`, reds first), `None`
+    /// for every other slider.
+    #[must_use]
+    pub const fn bw_slot(self) -> Option<usize> {
+        match self {
+            Self::BwReds => Some(0),
+            Self::BwYellows => Some(1),
+            Self::BwGreens => Some(2),
+            Self::BwCyans => Some(3),
+            Self::BwBlues => Some(4),
+            Self::BwMagentas => Some(5),
+            _ => None,
+        }
+    }
+
+    /// The Color Balance slider's slot (`0` cyan-red, `1` magenta-green,
+    /// `2` yellow-blue), `None` for every other slider.
+    #[must_use]
+    pub const fn balance_slot(self) -> Option<usize> {
+        match self {
+            Self::BalanceCyanRed => Some(0),
+            Self::BalanceMagentaGreen => Some(1),
+            Self::BalanceYellowBlue => Some(2),
+            _ => None,
         }
     }
 
@@ -143,6 +256,17 @@ impl AdjustSlider {
             Self::Red => "Filter red",
             Self::Green => "Filter green",
             Self::Blue => "Filter blue",
+            Self::BwReds => "Black and white reds",
+            Self::BwYellows => "Black and white yellows",
+            Self::BwGreens => "Black and white greens",
+            Self::BwCyans => "Black and white cyans",
+            Self::BwBlues => "Black and white blues",
+            Self::BwMagentas => "Black and white magentas",
+            Self::TintHue => "Black and white tint hue",
+            Self::TintSaturation => "Black and white tint saturation",
+            Self::BalanceCyanRed => "Color balance cyan to red",
+            Self::BalanceMagentaGreen => "Color balance magenta to green",
+            Self::BalanceYellowBlue => "Color balance yellow to blue",
         }
     }
 
@@ -159,6 +283,17 @@ impl AdjustSlider {
             Self::Red => "Red",
             Self::Green => "Green",
             Self::Blue => "Blue",
+            Self::BwReds => "Reds",
+            Self::BwYellows => "Yellows",
+            Self::BwGreens => "Greens",
+            Self::BwCyans => "Cyans",
+            Self::BwBlues => "Blues",
+            Self::BwMagentas => "Magentas",
+            Self::TintHue => "Tint hue",
+            Self::TintSaturation => "Tint saturation",
+            Self::BalanceCyanRed => "Cyan-Red",
+            Self::BalanceMagentaGreen => "Magenta-Green",
+            Self::BalanceYellowBlue => "Yellow-Blue",
         }
     }
 
@@ -172,6 +307,17 @@ impl AdjustSlider {
             Self::Gamma => (GAMMA_MIN as f64, GAMMA_MAX as f64),
             Self::Density => (1.0, 100.0),
             Self::Red | Self::Green | Self::Blue => (0.0, 255.0),
+            Self::BwReds
+            | Self::BwYellows
+            | Self::BwGreens
+            | Self::BwCyans
+            | Self::BwBlues
+            | Self::BwMagentas => (BLACK_WHITE_MIN as f64, BLACK_WHITE_MAX as f64),
+            Self::TintHue => (0.0, 360.0),
+            Self::TintSaturation => (0.0, 100.0),
+            Self::BalanceCyanRed | Self::BalanceMagentaGreen | Self::BalanceYellowBlue => {
+                (-(COLOR_BALANCE_MAX as f64), COLOR_BALANCE_MAX as f64)
+            }
         }
     }
 
@@ -185,12 +331,28 @@ impl AdjustSlider {
         }
     }
 
-    /// The readout text for `value`: `+1.50` style for Exposure, plain
-    /// otherwise.
+    /// The position a freshly built slider starts at (before a document is
+    /// mirrored into it).
+    #[must_use]
+    pub fn initial(self) -> f64 {
+        match self {
+            Self::Gamma => 1.0,
+            Self::Density => f64::from(aurora_core::DEFAULT_DENSITY),
+            Self::TintHue => f64::from(DEFAULT_TINT_HUE),
+            Self::TintSaturation => f64::from(DEFAULT_TINT_SATURATION),
+            other => other
+                .bw_slot()
+                .and_then(|slot| BLACK_WHITE_DEFAULTS.get(slot))
+                .map_or(0.0, |&w| f64::from(w)),
+        }
+    }
+
+    /// The readout text for `value`: `+1.50` style for Exposure and the
+    /// Color Balance sliders, plain otherwise.
     #[must_use]
     pub fn readout(self, value: f64) -> String {
         let places = self.decimals();
-        if self == Self::Exposure {
+        if self == Self::Exposure || self.balance_slot().is_some() {
             format!("{}: {value:+.places$}", self.short_label())
         } else {
             format!("{}: {value:.places$}", self.short_label())
@@ -198,9 +360,11 @@ impl AdjustSlider {
     }
 
     /// The slider position for `adjustment`, `None` when it is not this
-    /// slider's adjustment.
+    /// slider's adjustment. `range` is the Color Balance range selector's
+    /// tab (`0` shadows, `1` midtones, `2` highlights); every other slider
+    /// ignores it.
     #[must_use]
-    pub fn value_of(self, adjustment: &Adjustment) -> Option<f64> {
+    pub fn value_of(self, adjustment: &Adjustment, range: usize) -> Option<f64> {
         let channel = |i: usize| {
             adjustment
                 .photo_filter()
@@ -217,6 +381,23 @@ impl AdjustSlider {
             Self::Red => channel(0),
             Self::Green => channel(1),
             Self::Blue => channel(2),
+            Self::TintHue => adjustment.black_white().map(|p| f64::from(p.tint_hue())),
+            Self::TintSaturation => adjustment
+                .black_white()
+                .map(|p| f64::from(p.tint_saturation())),
+            Self::BwReds
+            | Self::BwYellows
+            | Self::BwGreens
+            | Self::BwCyans
+            | Self::BwBlues
+            | Self::BwMagentas => {
+                let weights = adjustment.black_white()?.weights();
+                weights.get(self.bw_slot()?).copied().map(f64::from)
+            }
+            Self::BalanceCyanRed | Self::BalanceMagentaGreen | Self::BalanceYellowBlue => {
+                let sliders = adjustment.color_balance()?.range(range)?;
+                sliders.get(self.balance_slot()?).copied().map(f64::from)
+            }
         }
     }
 
@@ -229,10 +410,16 @@ impl AdjustSlider {
     }
 
     /// `adjustment` with this slider moved to `value` (snapped), `None`
-    /// for a non-finite `value` or an adjustment of another kind.
+    /// for a non-finite `value` or an adjustment of another kind. `range`
+    /// is as for [`Self::value_of`].
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn with_value(self, adjustment: &Adjustment, value: f64) -> Option<Adjustment> {
+    pub fn with_value(
+        self,
+        adjustment: &Adjustment,
+        range: usize,
+        value: f64,
+    ) -> Option<Adjustment> {
         if !value.is_finite() {
             return None;
         }
@@ -272,11 +459,37 @@ impl AdjustSlider {
                 *slot = v / 255.0;
                 p.with_colour(colour).ok().map(Adjustment::PhotoFilter)
             }
+            Self::TintHue | Self::TintSaturation => {
+                let p: BlackWhiteParams = adjustment.black_white()?;
+                let next = if self == Self::TintHue {
+                    p.with_tint_hue(v)
+                } else {
+                    p.with_tint_saturation(v)
+                };
+                next.ok().map(Adjustment::BlackWhite)
+            }
+            Self::BwReds
+            | Self::BwYellows
+            | Self::BwGreens
+            | Self::BwCyans
+            | Self::BwBlues
+            | Self::BwMagentas => adjustment
+                .black_white()?
+                .with_weight(self.bw_slot()?, v)
+                .ok()
+                .map(Adjustment::BlackWhite),
+            Self::BalanceCyanRed | Self::BalanceMagentaGreen | Self::BalanceYellowBlue => {
+                adjustment
+                    .color_balance()?
+                    .with_slider(range, self.balance_slot()?, v)
+                    .ok()
+                    .map(Adjustment::ColorBalance)
+            }
         }
     }
 }
 
-/// `id`'s adjustment when it is Vibrance, Exposure or Photo Filter.
+/// `id`'s adjustment when it is one of the editors' kinds.
 #[must_use]
 pub fn adjust_of(layers: &LayerTree, id: LayerId) -> Option<&Adjustment> {
     layers
@@ -284,20 +497,30 @@ pub fn adjust_of(layers: &LayerTree, id: LayerId) -> Option<&Adjustment> {
         .filter(|adjustment| AdjustKind::of(adjustment).is_some())
 }
 
-/// The nine sliders, their readouts, Photo Filter's checkbox and the
-/// containers.
+/// The tab labels of the Color Balance range selector.
+const BALANCE_TAB_LABELS: [&str; 3] = ["Shad", "Mid", "High"];
+
+/// The sliders, their readouts, the checkboxes, the Color Balance range
+/// selector and the containers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdjustControls {
     /// The column container.
     pub root: WidgetId,
     /// The per-kind groups, indexed by [`AdjustKind::index`].
-    pub groups: [WidgetId; 3],
+    pub groups: [WidgetId; ADJUST_KIND_COUNT],
     /// The sliders, indexed by [`AdjustSlider::index`].
-    pub sliders: [WidgetId; 9],
+    pub sliders: [WidgetId; ADJUST_SLIDER_COUNT],
     /// Their readout labels, same order.
-    pub readouts: [WidgetId; 9],
+    pub readouts: [WidgetId; ADJUST_SLIDER_COUNT],
     /// Photo Filter's "Preserve Luminosity" checkbox.
     pub preserve: WidgetId,
+    /// Black & White's "Tint" checkbox.
+    pub tint: WidgetId,
+    /// Color Balance's "Preserve Luminosity" checkbox.
+    pub balance_preserve: WidgetId,
+    /// Color Balance's range selector tab bar: tab 0 Shadows, 1 Midtones,
+    /// 2 Highlights.
+    pub balance_range: WidgetId,
 }
 
 impl AdjustControls {
@@ -331,6 +554,7 @@ fn column_style(scales: &Scales, display: Display) -> Style {
 ///
 /// [`WidgetError::UnknownWidget`] if `parent` doesn't exist. On any
 /// failure the partly built column is removed again.
+#[allow(clippy::too_many_lines)] // one widget per slider, in layout order
 pub fn insert_adjust_controls(
     tree: &mut WidgetTree<WidgetKind>,
     parent: WidgetId,
@@ -346,22 +570,42 @@ pub fn insert_adjust_controls(
                 column_style(scales, Display::None),
             )?);
         }
+        let group_of = |kind: AdjustKind| {
+            groups
+                .get(kind.index())
+                .copied()
+                .ok_or(WidgetError::UnknownWidget(root))
+        };
         let mut sliders = Vec::new();
         let mut readouts = Vec::new();
         let mut preserve = None;
+        let mut tint = None;
+        let mut balance_preserve = None;
+        let mut balance_range = None;
         for slider in AdjustSlider::ALL {
-            let group = groups
-                .get(slider.kind().index())
-                .copied()
-                .ok_or(WidgetError::UnknownWidget(root))?;
+            let group = group_of(slider.kind())?;
+            // Controls that sit before a slider in its group.
+            if slider == AdjustSlider::TintHue {
+                tint = Some(widgets::insert_checkbox(tree, group, scales, "Tint")?);
+            }
+            if slider == AdjustSlider::BalanceCyanRed {
+                let bar = widgets::insert_tab_bar(
+                    tree,
+                    group,
+                    scales,
+                    "Color Balance range",
+                    BALANCE_TAB_LABELS.iter().map(|&l| l.to_owned()).collect(),
+                    0,
+                )?;
+                widgets::set_tab_accessible_names(
+                    tree,
+                    bar,
+                    COLOR_BALANCE_RANGES.iter().map(|&n| n.to_owned()).collect(),
+                )?;
+                balance_range = Some(bar);
+            }
             let (min, max) = slider.range();
-            let start = if slider == AdjustSlider::Gamma {
-                1.0
-            } else if slider == AdjustSlider::Density {
-                f64::from(aurora_core::DEFAULT_DENSITY)
-            } else {
-                0.0
-            };
+            let start = slider.initial();
             readouts.push(widgets::insert_label(
                 tree,
                 group,
@@ -385,13 +629,33 @@ pub fn insert_adjust_controls(
                     "Preserve Luminosity",
                 )?);
             }
+            if slider == AdjustSlider::BalanceYellowBlue {
+                balance_preserve = Some(widgets::insert_checkbox(
+                    tree,
+                    group,
+                    scales,
+                    "Preserve Luminosity",
+                )?);
+            }
         }
-        let (Some(preserve), Ok(sliders), Ok(readouts), Ok(groups)) = (
+        let (
+            Some(preserve),
+            Some(tint),
+            Some(balance_preserve),
+            Some(balance_range),
+            Ok(sliders),
+            Ok(readouts),
+            Ok(groups),
+        ) = (
             preserve,
-            <[WidgetId; 9]>::try_from(sliders),
-            <[WidgetId; 9]>::try_from(readouts),
-            <[WidgetId; 3]>::try_from(groups),
-        ) else {
+            tint,
+            balance_preserve,
+            balance_range,
+            <[WidgetId; ADJUST_SLIDER_COUNT]>::try_from(sliders),
+            <[WidgetId; ADJUST_SLIDER_COUNT]>::try_from(readouts),
+            <[WidgetId; ADJUST_KIND_COUNT]>::try_from(groups),
+        )
+        else {
             return Err(WidgetError::UnknownWidget(root));
         };
         let controls = AdjustControls {
@@ -400,8 +664,11 @@ pub fn insert_adjust_controls(
             sliders,
             readouts,
             preserve,
+            tint,
+            balance_preserve,
+            balance_range,
         };
-        set_shown(tree, controls, None)?;
+        set_shown(tree, controls, None, false)?;
         Ok(controls)
     })();
     if built.is_err() {
@@ -427,12 +694,32 @@ fn set_display(
     Ok(true)
 }
 
+/// Enables the checkbox `id` iff `live`; returns whether that changed it.
+fn set_checkbox_live(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    live: bool,
+) -> Result<bool, WidgetError> {
+    let disabled = match tree.payload(id) {
+        Some(WidgetKind::Checkbox(state)) => state.disabled,
+        Some(_) => return Err(WidgetError::WrongWidgetKind(id)),
+        None => return Err(WidgetError::UnknownWidget(id)),
+    };
+    if disabled == live {
+        widgets::set_checkbox_disabled(tree, id, !live)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Shows exactly the group of `kind` (none: the whole column hides) and
-/// enables only its widgets.
+/// enables only its widgets; the two Black & White tint sliders are live
+/// only when `tint_on`.
 fn set_shown(
     tree: &mut WidgetTree<WidgetKind>,
     controls: AdjustControls,
     kind: Option<AdjustKind>,
+    tint_on: bool,
 ) -> Result<bool, WidgetError> {
     let mut changed = set_display(
         tree,
@@ -460,7 +747,7 @@ fn set_shown(
         ) else {
             continue;
         };
-        let live = kind == Some(slider.kind());
+        let live = kind == Some(slider.kind()) && (!slider.is_tint() || tint_on);
         let disabled = match tree.payload(id) {
             Some(WidgetKind::Slider(state)) => state.disabled,
             Some(_) => return Err(WidgetError::WrongWidgetKind(id)),
@@ -472,14 +759,20 @@ fn set_shown(
         }
         changed |= widgets::set_label_disabled(tree, readout, !live)?;
     }
-    let checkbox_disabled = match tree.payload(controls.preserve) {
-        Some(WidgetKind::Checkbox(state)) => state.disabled,
-        Some(_) => return Err(WidgetError::WrongWidgetKind(controls.preserve)),
-        None => return Err(WidgetError::UnknownWidget(controls.preserve)),
-    };
-    let checkbox_live = kind == Some(AdjustKind::PhotoFilter);
-    if checkbox_disabled == checkbox_live {
-        widgets::set_checkbox_disabled(tree, controls.preserve, !checkbox_live)?;
+    changed |= set_checkbox_live(
+        tree,
+        controls.preserve,
+        kind == Some(AdjustKind::PhotoFilter),
+    )?;
+    changed |= set_checkbox_live(tree, controls.tint, kind == Some(AdjustKind::BlackWhite))?;
+    changed |= set_checkbox_live(
+        tree,
+        controls.balance_preserve,
+        kind == Some(AdjustKind::ColorBalance),
+    )?;
+    let tabs_live = kind == Some(AdjustKind::ColorBalance);
+    if widgets::tab_bar_state(tree, controls.balance_range)?.is_disabled() == tabs_live {
+        widgets::set_tab_bar_disabled(tree, controls.balance_range, !tabs_live)?;
         changed = true;
     }
     Ok(changed)
@@ -507,24 +800,92 @@ pub fn adjust_controls_shown(
     })
 }
 
+fn checkbox_checked(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> bool {
+    matches!(
+        tree.payload(id),
+        Some(WidgetKind::Checkbox(state)) if state.checked == accesskit::Toggled::True
+    )
+}
+
 /// Whether Photo Filter's Preserve Luminosity checkbox is checked.
 #[must_use]
 pub fn adjust_preserve_checked(tree: &WidgetTree<WidgetKind>, controls: AdjustControls) -> bool {
-    matches!(
-        tree.payload(controls.preserve),
-        Some(WidgetKind::Checkbox(state)) if state.checked == accesskit::Toggled::True
-    )
+    checkbox_checked(tree, controls.preserve)
+}
+
+/// Whether Black & White's Tint checkbox is checked.
+#[must_use]
+pub fn adjust_tint_checked(tree: &WidgetTree<WidgetKind>, controls: AdjustControls) -> bool {
+    checkbox_checked(tree, controls.tint)
+}
+
+/// Whether Color Balance's Preserve Luminosity checkbox is checked.
+#[must_use]
+pub fn adjust_balance_preserve_checked(
+    tree: &WidgetTree<WidgetKind>,
+    controls: AdjustControls,
+) -> bool {
+    checkbox_checked(tree, controls.balance_preserve)
+}
+
+/// The Color Balance range the three sliders edit: `0` shadows, `1`
+/// midtones, `2` highlights (the selector's selected tab; `0` if it cannot
+/// be read).
+#[must_use]
+pub fn adjust_balance_range(tree: &WidgetTree<WidgetKind>, controls: AdjustControls) -> usize {
+    widgets::tab_bar_state(tree, controls.balance_range)
+        .map_or(0, aurora_widgets::widgets::TabBarState::selected)
+}
+
+/// Sets slider `id` to `value`, also while it is disabled (a tint slider
+/// with Tint off still shows the stored colour); it stays disabled.
+fn put_slider_value(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    value: f64,
+) -> Result<(), WidgetError> {
+    let disabled = matches!(
+        tree.payload(id),
+        Some(WidgetKind::Slider(state)) if state.disabled
+    );
+    if disabled {
+        widgets::set_slider_disabled(tree, id, false)?;
+    }
+    let set = widgets::set_slider_value(tree, id, value);
+    if disabled {
+        widgets::set_slider_disabled(tree, id, true)?;
+    }
+    set.map(|_| ())
+}
+
+/// Sets `id`'s checkbox to `on`; returns whether it changed.
+fn sync_checkbox(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    on: bool,
+) -> Result<bool, WidgetError> {
+    if checkbox_checked(tree, id) == on {
+        return Ok(false);
+    }
+    let checked = if on {
+        accesskit::Toggled::True
+    } else {
+        accesskit::Toggled::False
+    };
+    widgets::set_checkbox_checked(tree, id, checked)?;
+    Ok(true)
 }
 
 /// Mirrors `active` into `controls`, in place — never inserting or
 /// removing a widget. Returns whether anything changed (cheap enough to
 /// run every event-loop iteration).
 ///
-/// - `active` not one of the three adjustments (or `None`): hidden and
+/// - `active` not one of the editors' adjustments (or `None`): hidden and
 ///   disabled.
 /// - Otherwise that kind's group is shown; every slider of it shows the
-///   document's value (a slider equal to `captured` is left alone:
-///   mid-drag it is the source of truth) and every readout follows.
+///   document's value (a slider equal to `captured` is left alone: mid-drag
+///   it is the source of truth; the Color Balance sliders show the range
+///   the selector holds) and every readout follows.
 ///
 /// # Errors
 ///
@@ -538,21 +899,25 @@ pub fn sync_adjust_controls(
     captured: Option<WidgetId>,
 ) -> Result<bool, WidgetError> {
     let Some(adjustment) = active.and_then(|id| adjust_of(layers, id)) else {
-        return set_shown(tree, controls, None);
+        return set_shown(tree, controls, None, false);
     };
     let kind = AdjustKind::of(adjustment);
-    let mut changed = set_shown(tree, controls, kind)?;
+    let tint_on = adjustment.black_white().is_some_and(|p| p.tint());
+    let mut changed = set_shown(tree, controls, kind, tint_on)?;
     if let Some(filter) = adjustment.photo_filter() {
-        let checked = if filter.preserve_luminosity() {
-            accesskit::Toggled::True
-        } else {
-            accesskit::Toggled::False
-        };
-        if adjust_preserve_checked(tree, controls) != filter.preserve_luminosity() {
-            widgets::set_checkbox_checked(tree, controls.preserve, checked)?;
-            changed = true;
-        }
+        changed |= sync_checkbox(tree, controls.preserve, filter.preserve_luminosity())?;
     }
+    if let Some(bw) = adjustment.black_white() {
+        changed |= sync_checkbox(tree, controls.tint, bw.tint())?;
+    }
+    if let Some(balance) = adjustment.color_balance() {
+        changed |= sync_checkbox(
+            tree,
+            controls.balance_preserve,
+            balance.preserve_luminosity(),
+        )?;
+    }
+    let range = adjust_balance_range(tree, controls);
     for slider in AdjustSlider::ALL
         .into_iter()
         .filter(|s| Some(s.kind()) == kind)
@@ -563,7 +928,7 @@ pub fn sync_adjust_controls(
         ) else {
             continue;
         };
-        let Some(value) = slider.value_of(adjustment) else {
+        let Some(value) = slider.value_of(adjustment, range) else {
             continue;
         };
         if captured != Some(id) {
@@ -572,7 +937,7 @@ pub fn sync_adjust_controls(
                 _ => return Err(WidgetError::WrongWidgetKind(id)),
             };
             if shown.to_bits() != value.to_bits() {
-                widgets::set_slider_value(tree, id, value)?;
+                put_slider_value(tree, id, value)?;
                 changed = true;
             }
         }
@@ -748,27 +1113,36 @@ mod tests {
         let v = vib(0.0, 0.0);
         let e = exp(0.0, 0.0, 1.0);
         let f = filter([1.0, 1.0, 1.0], 25.0, true);
+        let bw = Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default());
+        let cb = Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity());
         for s in S::ALL {
             let base = match s.kind() {
                 AdjustKind::Vibrance => &v,
                 AdjustKind::Exposure => &e,
                 AdjustKind::PhotoFilter => &f,
+                AdjustKind::BlackWhite => &bw,
+                AdjustKind::ColorBalance => &cb,
             };
             let (min, max) = s.range();
-            let lo = s.with_value(base, min - 50.0).and_then(|a| s.value_of(&a));
-            let hi = s.with_value(base, max + 50.0).and_then(|a| s.value_of(&a));
+            let lo = s
+                .with_value(base, 0, min - 50.0)
+                .and_then(|a| s.value_of(&a, 0));
+            let hi = s
+                .with_value(base, 0, max + 50.0)
+                .and_then(|a| s.value_of(&a, 0));
             assert!((lo.unwrap_or(f64::NAN) - min).abs() < 1e-6, "{s:?} {lo:?}");
             assert!((hi.unwrap_or(f64::NAN) - max).abs() < 1e-6, "{s:?} {hi:?}");
-            assert!(s.with_value(base, f64::NAN).is_none());
-            assert!(s.with_value(base, f64::INFINITY).is_none());
+            assert!(s.with_value(base, 0, f64::NAN).is_none());
+            assert!(s.with_value(base, 0, f64::INFINITY).is_none());
         }
         // The wrong kind of adjustment gives nothing.
-        assert!(S::Vibrance.with_value(&e, 5.0).is_none());
-        assert!(S::Gamma.with_value(&f, 2.0).is_none());
-        assert!(S::Red.with_value(&v, 2.0).is_none());
+        assert!(S::Vibrance.with_value(&e, 0, 5.0).is_none());
+        assert!(S::Gamma.with_value(&f, 0, 2.0).is_none());
+        assert!(S::Red.with_value(&v, 0, 2.0).is_none());
         // Rounding.
-        let got =
-            |s: S, base: &Adjustment, x: f64| s.with_value(base, x).and_then(|a| s.value_of(&a));
+        let got = |s: S, base: &Adjustment, x: f64| {
+            s.with_value(base, 0, x).and_then(|a| s.value_of(&a, 0))
+        };
         assert_eq!(got(S::Vibrance, &v, 40.6), Some(41.0));
         assert!((got(S::Exposure, &e, 1.2349).unwrap_or(0.0) - 1.23).abs() < 1e-6);
         assert!((got(S::Offset, &e, 0.12349).unwrap_or(0.0) - 0.123).abs() < 1e-6);
@@ -780,14 +1154,14 @@ mod tests {
     #[test]
     fn a_slider_edit_changes_only_its_own_field() {
         let e = exp(1.0, 0.25, 2.0);
-        let next = S::Offset.with_value(&e, -0.25);
+        let next = S::Offset.with_value(&e, 0, -0.25);
         let p = next.as_ref().and_then(Adjustment::exposure);
         assert_eq!(
             p.map(|p| (p.exposure(), p.offset(), p.gamma())),
             Some((1.0, -0.25, 2.0))
         );
         let f = filter([0.2, 0.4, 0.6], 30.0, false);
-        let next = S::Blue.with_value(&f, 255.0);
+        let next = S::Blue.with_value(&f, 0, 255.0);
         let p = next.as_ref().and_then(Adjustment::photo_filter);
         assert_eq!(
             p.map(|p| (p.colour()[0], p.colour()[1], p.colour()[2], p.density())),
@@ -795,7 +1169,7 @@ mod tests {
         );
         assert_eq!(p.map(|p| p.preserve_luminosity()), Some(false));
         let v = vib(10.0, 20.0);
-        let next = S::VibranceSaturation.with_value(&v, -30.0);
+        let next = S::VibranceSaturation.with_value(&v, 0, -30.0);
         let p = next.as_ref().and_then(Adjustment::vibrance);
         assert_eq!(
             p.map(|p| (p.vibrance(), p.saturation())),
@@ -808,11 +1182,314 @@ mod tests {
         for (_, [r, g, b]) in aurora_core::PHOTO_FILTER_PRESETS {
             let colour = [r, g, b].map(|c| f32::from(c) / 255.0);
             let f = filter(colour, 25.0, true);
-            let seen = [S::Red, S::Green, S::Blue].map(|s| s.value_of(&f));
+            let seen = [S::Red, S::Green, S::Blue].map(|s| s.value_of(&f, 0));
             assert_eq!(seen, [r, g, b].map(|c| Some(f64::from(c))));
             // And re-applying what the slider shows changes nothing.
-            let again = S::Green.with_value(&f, seen[1].unwrap_or(0.0));
+            let again = S::Green.with_value(&f, 0, seen[1].unwrap_or(0.0));
             assert_eq!(again, Some(f));
+        }
+    }
+
+    fn bw(weights: [f32; 6], tint: bool, hue: f32, sat: f32) -> Adjustment {
+        match aurora_core::BlackWhiteParams::new(weights, tint, hue, sat) {
+            Ok(p) => Adjustment::BlackWhite(p),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn cb(ranges: [[f32; 3]; 3], preserve: bool) -> Adjustment {
+        match aurora_core::ColorBalanceParams::new(ranges, preserve) {
+            Ok(p) => Adjustment::ColorBalance(p),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn built(ws: &mut crate::Workspace) -> super::AdjustControls {
+        match insert_adjust_controls(&mut ws.tree, ws.properties.root, &scales()) {
+            Ok(c) => c,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn readout(ws: &crate::Workspace, controls: super::AdjustControls, s: S) -> String {
+        match ws.tree.payload(controls.readouts[s.index()]) {
+            Some(WidgetKind::Label(label)) => label.text.clone(),
+            other => unreachable!("{other:?}"),
+        }
+    }
+
+    /// 0.240.0: the Black & White group mirrors its layer; the two tint
+    /// sliders are live only while Tint is on and follow the document.
+    #[test]
+    fn the_black_and_white_group_follows_its_layer_and_tint_gates_two_sliders() {
+        let mut ws = crate::build_workspace(&scales());
+        let controls = built(&mut ws);
+        let mut layers = LayerTree::new();
+        let off = add(
+            &mut layers,
+            "off",
+            bw([-200.0, 12.0, 300.0, 0.0, 99.0, 1.0], false, 211.0, 64.0),
+        );
+        let on = add(
+            &mut layers,
+            "on",
+            bw([40.0, 60.0, 40.0, 60.0, 20.0, 80.0], true, 35.0, 25.0),
+        );
+        let at = |ws: &crate::Workspace, s: S| slider_state(&ws.tree, controls.sliders[s.index()]);
+        assert_eq!(show(&mut ws, controls, &layers, Some(off)).ok(), Some(true));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::BlackWhite)
+        );
+        for (s, want) in [
+            (S::BwReds, -200.0),
+            (S::BwYellows, 12.0),
+            (S::BwGreens, 300.0),
+            (S::BwCyans, 0.0),
+            (S::BwBlues, 99.0),
+            (S::BwMagentas, 1.0),
+        ] {
+            assert_eq!(at(&ws, s), (want, false), "{s:?}");
+        }
+        assert_eq!(readout(&ws, controls, S::BwReds), "Reds: -200");
+        assert_eq!(readout(&ws, controls, S::BwMagentas), "Magentas: 1");
+        // Tint off: the tint sliders show the stored colour but are disabled.
+        assert_eq!(at(&ws, S::TintHue), (211.0, true));
+        assert_eq!(at(&ws, S::TintSaturation), (64.0, true));
+        assert!(!super::adjust_tint_checked(&ws.tree, controls));
+        // Other groups stay disabled.
+        assert!(at(&ws, S::Vibrance).1 && at(&ws, S::BalanceCyanRed).1 && at(&ws, S::Red).1);
+        let _ = show(&mut ws, controls, &layers, Some(on));
+        assert!(super::adjust_tint_checked(&ws.tree, controls));
+        assert_eq!(at(&ws, S::TintHue), (35.0, false));
+        assert_eq!(at(&ws, S::TintSaturation), (25.0, false));
+        assert_eq!(readout(&ws, controls, S::TintHue), "Tint hue: 35");
+        // The document changing the flag re-gates the sliders.
+        let _ = layers.set_adjustment(
+            on,
+            bw([40.0, 60.0, 40.0, 60.0, 20.0, 80.0], false, 35.0, 25.0),
+        );
+        let _ = show(&mut ws, controls, &layers, Some(on));
+        assert!(!super::adjust_tint_checked(&ws.tree, controls));
+        assert!(at(&ws, S::TintHue).1 && at(&ws, S::TintSaturation).1);
+        assert!(!at(&ws, S::BwReds).1, "the colour sliders stay live");
+    }
+
+    /// The Color Balance range selector rebinds the three sliders to a
+    /// range without touching the document; an edit changes one range only.
+    #[test]
+    fn the_color_balance_range_selector_rebinds_the_sliders_without_a_document_change() {
+        let mut ws = crate::build_workspace(&scales());
+        let controls = built(&mut ws);
+        let ranges = [[1.0, -2.0, 3.0], [-40.0, 50.0, -60.0], [70.0, 80.0, -90.0]];
+        let mut layers = LayerTree::new();
+        let id = add(&mut layers, "cb", cb(ranges, false));
+        let at = |ws: &crate::Workspace, s: S| slider_state(&ws.tree, controls.sliders[s.index()]);
+        let _ = show(&mut ws, controls, &layers, Some(id));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::ColorBalance)
+        );
+        assert_eq!(super::adjust_balance_range(&ws.tree, controls), 0);
+        assert!(!super::adjust_balance_preserve_checked(&ws.tree, controls));
+        assert!(
+            widgets::tab_bar_state(&ws.tree, controls.balance_range)
+                .is_ok_and(|t| !t.is_disabled())
+        );
+        assert_eq!(at(&ws, S::BalanceCyanRed), (1.0, false));
+        assert_eq!(readout(&ws, controls, S::BalanceCyanRed), "Cyan-Red: +1");
+        assert_eq!(
+            readout(&ws, controls, S::BalanceMagentaGreen),
+            "Magenta-Green: -2"
+        );
+        let before = layers.adjustment(id).cloned();
+        for (tab, row) in ranges.iter().enumerate() {
+            let _ = widgets::select_tab(&mut ws.tree, controls.balance_range, tab);
+            let _ = show(&mut ws, controls, &layers, Some(id));
+            assert_eq!(super::adjust_balance_range(&ws.tree, controls), tab);
+            for (slot, s) in [
+                S::BalanceCyanRed,
+                S::BalanceMagentaGreen,
+                S::BalanceYellowBlue,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(at(&ws, s), (f64::from(row[slot]), false), "tab {tab} {s:?}");
+            }
+        }
+        assert_eq!(
+            layers.adjustment(id).cloned(),
+            before,
+            "selecting a tab edits nothing"
+        );
+        // An edit on the highlights tab changes the highlights only.
+        let current = layers
+            .adjustment(id)
+            .cloned()
+            .unwrap_or_else(|| unreachable!("layer"));
+        let next = S::BalanceYellowBlue.with_value(&current, 2, 33.4);
+        let p = next.as_ref().and_then(Adjustment::color_balance);
+        assert_eq!(
+            p.map(|p| p.ranges()),
+            Some([[1.0, -2.0, 3.0], [-40.0, 50.0, -60.0], [70.0, 80.0, 33.0]])
+        );
+        assert_eq!(p.map(|p| p.preserve_luminosity()), Some(false));
+        // The same slider on another range is a different field.
+        let other = S::BalanceYellowBlue.with_value(&current, 0, 33.4);
+        assert_eq!(
+            other
+                .as_ref()
+                .and_then(Adjustment::color_balance)
+                .map(|p| p.ranges()),
+            Some([[1.0, -2.0, 33.0], [-40.0, 50.0, -60.0], [70.0, 80.0, -90.0]])
+        );
+        assert_eq!(S::BalanceYellowBlue.value_of(&current, 1), Some(-60.0));
+        assert_eq!(
+            S::BalanceYellowBlue.value_of(&current, 9),
+            None,
+            "no such range"
+        );
+        assert!(S::BalanceYellowBlue.with_value(&current, 9, 1.0).is_none());
+        // The checkbox follows the document.
+        let _ = layers.set_adjustment(id, cb(ranges, true));
+        let _ = show(&mut ws, controls, &layers, Some(id));
+        assert!(super::adjust_balance_preserve_checked(&ws.tree, controls));
+        // Another group disables the selector and the checkbox.
+        let v = add(&mut layers, "v", vib(0.0, 0.0));
+        let _ = show(&mut ws, controls, &layers, Some(v));
+        assert!(
+            widgets::tab_bar_state(&ws.tree, controls.balance_range)
+                .is_ok_and(aurora_widgets::widgets::TabBarState::is_disabled)
+        );
+        assert!(at(&ws, S::BalanceCyanRed).1);
+    }
+
+    #[test]
+    fn black_and_white_edits_change_only_their_own_field() {
+        let w = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let base = bw(w, true, 100.0, 40.0);
+        for (slot, s) in [
+            S::BwReds,
+            S::BwYellows,
+            S::BwGreens,
+            S::BwCyans,
+            S::BwBlues,
+            S::BwMagentas,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let next = s.with_value(&base, 0, 275.4);
+            let p = next.as_ref().and_then(Adjustment::black_white);
+            let mut want = w;
+            want[slot] = 275.0;
+            assert_eq!(p.map(|p| p.weights()), Some(want), "{s:?}");
+            assert_eq!(
+                p.map(|p| (p.tint(), p.tint_hue(), p.tint_saturation())),
+                Some((true, 100.0, 40.0))
+            );
+        }
+        let hue = S::TintHue
+            .with_value(&base, 0, 359.6)
+            .and_then(|a| a.black_white());
+        assert_eq!(
+            hue.map(|p| (p.tint_hue(), p.tint_saturation(), p.weights())),
+            Some((360.0, 40.0, w))
+        );
+        let sat = S::TintSaturation
+            .with_value(&base, 0, -5.0)
+            .and_then(|a| a.black_white());
+        assert_eq!(
+            sat.map(|p| (p.tint_hue(), p.tint_saturation())),
+            Some((100.0, 0.0))
+        );
+        // Wrong adjustment: nothing.
+        assert!(S::BwReds.with_value(&vib(0.0, 0.0), 0, 1.0).is_none());
+        assert!(S::BalanceCyanRed.with_value(&base, 0, 1.0).is_none());
+    }
+
+    /// Every slider's accessible name is unique and non-empty; the widgets
+    /// the editors build carry them; the two Preserve Luminosity checkboxes
+    /// sit in different groups, never shown together.
+    #[test]
+    fn accessible_names_are_unique_among_the_sliders() {
+        let mut names: Vec<&str> = S::ALL.iter().map(|s| s.label()).collect();
+        assert!(names.iter().all(|n| !n.is_empty()));
+        names.sort_unstable();
+        let total = names.len();
+        names.dedup();
+        assert_eq!(names.len(), total, "{names:?}");
+        let mut ws = crate::build_workspace(&scales());
+        let controls = built(&mut ws);
+        for s in S::ALL {
+            let id = controls.sliders[s.index()];
+            let node = ws.tree.accessibility(id);
+            assert_eq!(
+                node.and_then(accesskit::Node::label),
+                Some(s.label()),
+                "{s:?}"
+            );
+        }
+        let tabs = widgets::tab_bar_state(&ws.tree, controls.balance_range);
+        assert!(tabs.is_ok_and(|t| t.labels().len() == 3 && t.accessible_name(2) == "Highlights"));
+    }
+
+    #[test]
+    fn the_new_groups_hide_for_other_layers_and_every_slider_is_in_its_group() {
+        let mut ws = crate::build_workspace(&scales());
+        let controls = built(&mut ws);
+        let mut layers = LayerTree::new();
+        let id = add(&mut layers, "b", bw([1.0; 6], false, 0.0, 0.0));
+        let hs = add(
+            &mut layers,
+            "H",
+            Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
+        );
+        let _ = show(&mut ws, controls, &layers, Some(id));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::BlackWhite)
+        );
+        assert_eq!(show(&mut ws, controls, &layers, Some(hs)).ok(), Some(true));
+        assert_eq!(adjust_controls_shown(&ws.tree, controls), None);
+        for s in S::ALL {
+            assert!(
+                slider_state(&ws.tree, controls.sliders[s.index()]).1,
+                "{s:?} disabled"
+            );
+            let group = controls.groups[s.kind().index()];
+            assert!(
+                ws.tree.is_within(group, controls.sliders[s.index()]),
+                "{s:?}"
+            );
+            assert!(
+                ws.tree.is_within(group, controls.readouts[s.index()]),
+                "{s:?}"
+            );
+        }
+        assert!(ws.tree.is_within(
+            controls.groups[AdjustKind::BlackWhite.index()],
+            controls.tint
+        ));
+        assert!(ws.tree.is_within(
+            controls.groups[AdjustKind::ColorBalance.index()],
+            controls.balance_preserve
+        ));
+        assert!(ws.tree.is_within(
+            controls.groups[AdjustKind::ColorBalance.index()],
+            controls.balance_range
+        ));
+        assert!(ws.tree.is_within(
+            controls.groups[AdjustKind::PhotoFilter.index()],
+            controls.preserve
+        ));
+        assert_eq!(S::ALL.len(), super::ADJUST_SLIDER_COUNT);
+        for (i, s) in S::ALL.into_iter().enumerate() {
+            assert_eq!(s.index(), i);
+        }
+        for (i, k) in AdjustKind::ALL.into_iter().enumerate() {
+            assert_eq!(k.index(), i);
         }
     }
 }

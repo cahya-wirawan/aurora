@@ -1,5 +1,5 @@
-//! The app's half of the Vibrance, Exposure and Photo Filter adjustment
-//! layers (0.239.0): the New Layer commands, the Properties editors' edits
+//! The app's half of the Vibrance, Exposure, Photo Filter (0.239.0), Black &
+//! White and Color Balance (0.240.0) adjustment layers: the New Layer commands, the Properties editors' edits
 //! (one undo step per slider drag, per key or assistive-technology value,
 //! per Preserve Luminosity toggle) and the Photo Filter preset commands.
 //!
@@ -28,8 +28,9 @@ pub(crate) struct PendingAdjust {
 // -- New layer -------------------------------------------------------------
 
 /// The layer name stem and the adjustment a new layer of `kind` holds.
-/// Vibrance and Exposure start neutral; Photo Filter starts as Photoshop's
-/// own default (Warming Filter (85), density 25, Preserve Luminosity on).
+/// Vibrance, Exposure and Color Balance start neutral; Photo Filter starts
+/// as Photoshop's own default (Warming Filter (85), density 25, Preserve
+/// Luminosity on) and Black & White at Photoshop's six default values.
 fn new_adjustment(kind: AdjustKind) -> (&'static str, Adjustment) {
     match kind {
         AdjustKind::Vibrance => (
@@ -43,6 +44,16 @@ fn new_adjustment(kind: AdjustKind) -> (&'static str, Adjustment) {
         AdjustKind::PhotoFilter => (
             "Photo Filter",
             Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+        ),
+        // Black & White starts at Photoshop's defaults (it is never
+        // neutral); Color Balance starts neutral with Preserve Luminosity on.
+        AdjustKind::BlackWhite => (
+            "Black & White",
+            Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
+        ),
+        AdjustKind::ColorBalance => (
+            "Color Balance",
+            Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
         ),
     }
 }
@@ -98,7 +109,12 @@ pub(crate) fn is_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerO
     };
     match outcome {
         PointerOutcome::Action(Outcome::ValueChanged { id, .. }) => adjust.slider_of(*id).is_some(),
-        PointerOutcome::Action(Outcome::Toggled { id, .. }) => *id == adjust.preserve,
+        PointerOutcome::Action(Outcome::Toggled { id, .. }) => {
+            *id == adjust.preserve || *id == adjust.tint || *id == adjust.balance_preserve
+        }
+        // The Color Balance range selector (0.240.0): widget state only, no
+        // document edit, but a pending drag settles when it is used.
+        PointerOutcome::Action(Outcome::TabSelected { bar, .. }) => *bar == adjust.balance_range,
         _ => false,
     }
 }
@@ -159,7 +175,8 @@ pub(crate) fn settle(cx: &mut CurvesEdit<'_>, captured: Option<WidgetId>) -> boo
     cx.state.adjust_pending.is_some() && finish(cx)
 }
 
-/// Turns one editor outcome into a document edit: a slider with the
+/// Turns one editor outcome into a document edit (the Color Balance range
+/// selector is no edit: the next sync rebinds its sliders): a slider with the
 /// pointer captured is a live drag (one step when it ends); a slider
 /// without capture (an arrow key, an assistive technology) and a checkbox
 /// toggle are one step each. Every real change is `Everything`.
@@ -192,11 +209,29 @@ pub(crate) fn apply_outcome(
                 None,
             )
         }
+        aurora_widgets::ActionOutcome::Toggled { id, state } if *id == adjust.tint => {
+            let Some(bw) = current.black_white() else {
+                return CompositeInvalidation::None;
+            };
+            let on = *state == accesskit::Toggled::True;
+            (Adjustment::BlackWhite(bw.with_tint(on)), None)
+        }
+        aurora_widgets::ActionOutcome::Toggled { id, state } if *id == adjust.balance_preserve => {
+            let Some(balance) = current.color_balance() else {
+                return CompositeInvalidation::None;
+            };
+            let on = *state == accesskit::Toggled::True;
+            (
+                Adjustment::ColorBalance(balance.with_preserve_luminosity(on)),
+                None,
+            )
+        }
         aurora_widgets::ActionOutcome::ValueChanged { id, value } => {
             let Some(slider) = adjust.slider_of(*id) else {
                 return CompositeInvalidation::None;
             };
-            let Some(next) = slider.with_value(&current, *value) else {
+            let range = aurora_ui::adjust_balance_range(&cx.workspace.tree, adjust);
+            let Some(next) = slider.with_value(&current, range, *value) else {
                 return CompositeInvalidation::None;
             };
             (next, Some(*id))
@@ -238,6 +273,7 @@ pub(crate) fn apply_outcome(
 
 /// Mirrors the document into the editors (run every loop turn); returns
 /// whether anything shown changed.
+#[allow(clippy::large_types_passed_by_value)] // `AdjustControls` is `Copy` and 400 bytes
 pub(crate) fn sync(
     tree: &mut aurora_widgets::WidgetTree<aurora_widgets::widgets::WidgetKind>,
     controls: Option<aurora_ui::AdjustControls>,
@@ -253,7 +289,7 @@ pub(crate) fn sync(
         Err(err) => {
             tracing::warn!(
                 ?err,
-                "failed to sync the Vibrance/Exposure/Photo Filter editors"
+                "failed to sync the Vibrance/Exposure/Photo Filter/Black & White/Color Balance editors"
             );
             false
         }

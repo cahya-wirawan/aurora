@@ -6,7 +6,9 @@
 //! foundation every other crate builds on, so it stays free of anything
 //! crate-specific (no pixel storage, no tile concept, no document model).
 
+pub mod black_white;
 pub mod color;
+pub mod color_balance;
 pub mod curves;
 pub mod effects;
 pub mod error;
@@ -20,7 +22,14 @@ pub mod photo_filter;
 pub mod tone_curve;
 pub mod vibrance;
 
+pub use black_white::{
+    BLACK_WHITE_DEFAULTS, BLACK_WHITE_MAX, BLACK_WHITE_MIN, BLACK_WHITE_NAMES, BlackWhiteError,
+    BlackWhiteParams, DEFAULT_TINT_HUE, DEFAULT_TINT_SATURATION,
+};
 pub use color::{Channels, ColorSpace, PixelFormat, SampleFormat};
+pub use color_balance::{
+    COLOR_BALANCE_MAX, COLOR_BALANCE_RANGES, ColorBalanceError, ColorBalanceParams,
+};
 pub use curves::CurvesParams;
 pub use effects::LayerEffects;
 pub use error::CoreError;
