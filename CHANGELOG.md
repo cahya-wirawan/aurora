@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.248.0] - 2026-10-16
+
+### Changed
+
+- Gradient Map adjustment layer and the Color Lookup finding
+
 ## [0.247.0] - 2026-10-15
 
 ### Changed

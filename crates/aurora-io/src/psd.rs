@@ -132,6 +132,8 @@ mod descriptor;
 mod effects;
 #[cfg(test)]
 mod effects_tests;
+#[cfg(test)]
+mod gradient_lookup_tests;
 mod lab;
 #[cfg(test)]
 mod mixer_selective_tests;
@@ -460,6 +462,17 @@ enum Note {
     /// A Monochrome Channel Mixer or a Selective Color that adjusts something
     /// (0.245.0): the file layout is unverified, so it is left out.
     Unverified(read_adjust::Kind),
+    /// A Gradient Map layer whose block is readable but holds something the
+    /// model cannot (0.248.0).
+    GradientLeftOut(read_adjust::GradientReason),
+    /// A Gradient Map layer drawn at 100 % smoothness although the file says
+    /// less (0.248.0).
+    GradientSmoothness,
+    /// A Gradient Map layer, shown with a formula nothing was compared
+    /// against (0.248.0).
+    GradientUnvalidated,
+    /// A Color Lookup layer, never applied (0.248.0).
+    ColorLookup(read_adjust::ColorLookupReason),
     /// A Photo Filter whose colour is not stored as Lab (version 3 or
     /// another colour space).
     PhotoFilterColour,
@@ -517,7 +530,7 @@ enum Note {
 }
 
 #[derive(Debug, Default)]
-struct Notes(BTreeMap<Note, u64>);
+struct Notes(BTreeMap<Note, u64>, Vec<String>);
 
 impl Notes {
     fn add(&mut self, note: Note) {
@@ -531,12 +544,38 @@ impl Notes {
         }
     }
 
+    /// Remembers a Color Lookup layer's table name for the report (at most
+    /// five, each already cleaned and capped by the parser).
+    fn add_lookup_name(&mut self, name: &str) {
+        if self.1.len() < 5 {
+            self.1.push(name.to_owned());
+        }
+    }
+
     fn report(&self) -> PsdImportReport {
         PsdImportReport {
             items: self
                 .0
                 .iter()
-                .map(|(note, n)| note_text(*note, *n))
+                .map(|(note, n)| {
+                    let mut text = note_text(*note, *n);
+                    if matches!(
+                        note,
+                        Note::ColorLookup(read_adjust::ColorLookupReason::Table)
+                    ) && !self.1.is_empty()
+                    {
+                        let names: Vec<String> = self
+                            .1
+                            .iter()
+                            .map(|n| format!("\u{201c}{n}\u{201d}"))
+                            .collect();
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut text,
+                            format_args!(" Named: {}.", names.join(", ")),
+                        );
+                    }
+                    text
+                })
                 .collect(),
         }
     }
@@ -550,12 +589,13 @@ fn note_text(note: Note, n: u64) -> String {
     let is = if one { "is" } else { "are" };
     match note {
         Note::AdjustmentSkipped => format!(
-            "{n} adjustment layer{s} (Gradient Map, Color Lookup and similar) {was} \
+            "{n} adjustment layer{s} (of a kind Aurora does not know) {was} \
              left out — Aurora shows only Curves, Levels, Hue/Saturation, Vibrance, Exposure, \
              Photo Filter, Black & White, Color Balance, Invert, Threshold, Posterize, \
-             Brightness/Contrast, Channel Mixer and Selective Color adjustment layers so far \
-             (Vibrance, Photo Filter, Black & White and Color Balance are approximations that \
-             have not been compared with Photoshop)."
+             Brightness/Contrast, Channel Mixer, Selective Color and Gradient Map adjustment \
+             layers so far (Vibrance, Photo Filter, Black & White, Color Balance and Gradient \
+             Map are approximations that have not been compared with Photoshop; Color Lookup \
+             layers are reported on their own)."
         ),
         Note::CurvesUnreadable => format!(
             "{n} Curves layer{s} {was} left out — {} settings could not be read.",
@@ -634,6 +674,65 @@ fn note_text(note: Note, n: u64) -> String {
             if one { "is" } else { "are" },
             kind.label(),
         ),
+        Note::GradientLeftOut(reason) => format!(
+            "{n} Gradient Map layer{s} {was} left out — {}",
+            match reason {
+                read_adjust::GradientReason::Method => {
+                    "its gradient uses the Linear or Perceptual colour interpolation (or one \
+                     Aurora does not know), and no Photoshop file available shows what those \
+                     do to a picture; only the Classic method is drawn."
+                }
+                read_adjust::GradientReason::Midpoint => {
+                    "a colour stop's midpoint is not the default 50 %, which Aurora does not \
+                     model."
+                }
+                read_adjust::GradientReason::Transparency => {
+                    "its gradient has transparency stops below full opacity, which Aurora does \
+                     not model."
+                }
+                read_adjust::GradientReason::ColourMode => {
+                    "a colour stop is not stored as RGB."
+                }
+                read_adjust::GradientReason::Noise => {
+                    "its gradient is a Noise gradient, which Aurora does not model."
+                }
+                read_adjust::GradientReason::Stops => {
+                    "its gradient has more colour stops than Aurora allows."
+                }
+            }
+        ),
+        Note::GradientSmoothness => format!(
+            "{n} Gradient Map layer{s} {} a smoothness below 100 %, which Aurora does not apply; \
+             {} drawn as a smooth gradient.",
+            if one { "has" } else { "have" },
+            if one { "it is" } else { "they are" },
+        ),
+        Note::GradientUnvalidated => format!(
+            "{n} Gradient Map layer{s} {} shown with Classic colour interpolation in encoded \
+             sRGB on the grey 0.30 R + 0.59 G + 0.11 B; no Photoshop file available holds a \
+             picture a Gradient Map was applied to, so this has not been compared with Photoshop \
+             and may differ from its own rendering.",
+            if one { "is" } else { "are" },
+        ),
+        Note::ColorLookup(reason) => match reason {
+            read_adjust::ColorLookupReason::NoTable => format!(
+                "{n} Color Lookup layer{s} {was} left out — {} holds no lookup table (its \
+                 settings are empty: no 3D LUT or profile was chosen), and Aurora has no Color \
+                 Lookup adjustment.",
+                if one { "it" } else { "each" },
+            ),
+            read_adjust::ColorLookupReason::Table => format!(
+                "{n} Color Lookup layer{s} {was} left out — {} a lookup table (a 3D LUT or colour \
+                 profile) that Aurora cannot apply: it has no Color Lookup adjustment, and no \
+                 Photoshop file available shows how the table is stored.",
+                if one { "it uses" } else { "they use" },
+            ),
+            read_adjust::ColorLookupReason::Unreadable => format!(
+                "{n} Color Lookup layer{s} {was} left out — {} settings could not be read, and \
+                 Aurora has no Color Lookup adjustment.",
+                if one { "its" } else { "their" },
+            ),
+        },
         Note::PhotoFilterColour => format!(
             "{n} Photo Filter layer{s} {was} left out — {} colour is not stored as Lab (the \
              only form Aurora has checked against Photoshop's own files).",
@@ -3566,7 +3665,18 @@ fn other_adjustment_node(
         Ok(aurora_doc::Adjustment::SelectiveColor(p)) if !p.is_identity() => {
             notes.add(Note::Unvalidated(read_adjust::Kind::SelectiveColor));
         }
+        Ok(aurora_doc::Adjustment::GradientMap(_)) => {
+            notes.add(Note::GradientUnvalidated);
+            if matches!(parsed, read_adjust::Parsed::GradientMap(Ok(b)) if b.smoothness != 4096) {
+                notes.add(Note::GradientSmoothness);
+            }
+        }
         _ => {}
+    }
+    if let read_adjust::Parsed::ColorLookup(Ok(block)) = parsed
+        && let Some(name) = &block.name
+    {
+        notes.add_lookup_name(name);
     }
     if let Ok(aurora_doc::Adjustment::BrightnessContrast(p)) = &params
         && !p.legacy()

@@ -289,7 +289,7 @@ struct Losses {
     /// Adjustment layers with values rounded to the file's resolution
     /// (0.205.0): Curves, Levels, Hue/Saturation; and since 0.241.0 Vibrance,
     /// Exposure, Photo Filter, Black & White, Color Balance (slots 3..=7).
-    adjustment_rounded: [usize; 10],
+    adjustment_rounded: [usize; 11],
     /// Black & White layers written (0.241.0): each one's tint colour is
     /// stored as a colour made from the tint hue and saturation, and the
     /// preset name is cleared.
@@ -333,6 +333,7 @@ impl Losses {
             aurora_doc::Adjustment::ColorBalance(_) => Some(7),
             aurora_doc::Adjustment::ChannelMixer(_) => Some(8),
             aurora_doc::Adjustment::SelectiveColor(_) => Some(9),
+            aurora_doc::Adjustment::GradientMap(_) => Some(10),
             aurora_doc::Adjustment::Invert
             | aurora_doc::Adjustment::Threshold(_)
             | aurora_doc::Adjustment::Posterize(_)
@@ -461,6 +462,7 @@ impl Losses {
             color_balance,
             channel_mixer,
             selective_color,
+            gradient_map,
         ] = self.adjustment_rounded;
         if curves > 0 {
             items.push(format!(
@@ -527,6 +529,12 @@ impl Losses {
                 "Selective Color layer's",
                 "Selective Color layers'",
                 "fractional values will be rounded to whole percents.",
+            ),
+            (
+                gradient_map,
+                "Gradient Map layer's",
+                "Gradient Map layers'",
+                "stop positions will be rounded to 4096ths and its colours to 65,535ths.",
             ),
         ] {
             if n > 0 {

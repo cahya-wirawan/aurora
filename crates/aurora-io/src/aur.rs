@@ -5302,6 +5302,65 @@ mod tests {
         }
     }
 
+    /// 0.248.0: a Gradient Map layer (ordinal 15, a stop list rather than a
+    /// fixed record), an edit of it and the history survive a save and
+    /// reopen (manifest and journal replay), with no manifest version bump.
+    #[test]
+    fn round_trips_a_gradient_map_layer_and_its_history() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        if let Err(err) = history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let stops = vec![
+            aurora_core::GradientStop::new(0.0, [0.0, 0.0, 0.25]),
+            aurora_core::GradientStop::new(0.25, [0.5, 0.0, 0.5]),
+            aurora_core::GradientStop::new(0.25, [1.0, 0.5, 0.0]),
+            aurora_core::GradientStop::new(1.0, [1.0, 1.0, 0.75]),
+        ];
+        let edited = match aurora_core::GradientMapParams::new(stops, true, true) {
+            Ok(p) => aurora_doc::Adjustment::GradientMap(p),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let layer = match history.add_adjustment_layer_at(
+            &mut layers,
+            "Gradient Map 1",
+            aurora_doc::Adjustment::GradientMap(aurora_core::GradientMapParams::black_to_white()),
+            None,
+            0,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_adjustment(&mut layers, layer, edited.clone()) {
+            unreachable!("{err:?}");
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.into_inner()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let replayed = match document.history.replay() {
+            Ok(replayed) => replayed,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(document.layers.adjustment(layer), Some(&edited));
+        assert_eq!(replayed.adjustment(layer), Some(&edited));
+    }
+
     /// 0.204.0: a ranged Hue/Saturation adjustment layer, its edit and its history
     /// survive a save and reopen (manifest and journal replay), with no
     /// manifest version bump: the variant is appended after `Levels`.

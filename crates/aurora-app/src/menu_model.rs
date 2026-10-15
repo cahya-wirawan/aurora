@@ -173,6 +173,10 @@ fn static_rows(title: &str) -> Vec<Row> {
                 crate::COMMAND_LAYER_NEW_SELECTIVE_COLOR,
                 "New Selective Color Layer",
             ),
+            Cmd(
+                crate::COMMAND_LAYER_NEW_GRADIENT_MAP,
+                "New Gradient Map Layer",
+            ),
             Sep,
             Cmd(crate::COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
             Cmd(crate::COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),
@@ -503,6 +507,7 @@ pub(crate) const NATIVE_MENU_COMMANDS: &[&str] = &[
     crate::COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST,
     crate::COMMAND_LAYER_NEW_CHANNEL_MIXER,
     crate::COMMAND_LAYER_NEW_SELECTIVE_COLOR,
+    crate::COMMAND_LAYER_NEW_GRADIENT_MAP,
     crate::COMMAND_LAYER_NEW_GROUP,
     crate::COMMAND_LAYER_CLIP_CREATE,
     crate::COMMAND_LAYER_CLIP_RELEASE,
