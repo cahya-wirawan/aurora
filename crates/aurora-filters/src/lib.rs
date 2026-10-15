@@ -12,25 +12,33 @@
 //! adjustment is still to come.
 
 pub mod black_white;
+pub mod brightness_contrast;
 pub mod color_balance;
 pub mod curves;
 pub mod exposure;
 pub mod hue_saturation;
+pub mod invert;
 pub mod levels;
 pub mod photo_filter;
+pub mod posterize;
 pub mod shadow;
 pub mod stroke;
+pub mod threshold;
 pub mod vibrance;
 
 pub use black_white::{BLACK_WHITE_PACKED_LEN, BlackWhiteOp};
+pub use brightness_contrast::BrightnessContrastOp;
 pub use color_balance::{COLOR_BALANCE_PACKED_LEN, ColorBalanceOp, SHIFT_AT_100, range_weights};
 pub use curves::{CURVES_LUT_INTERVALS, CURVES_PACKED_HEADER, CURVES_PACKED_LEN, CurvesLut};
 pub use exposure::{EXPOSURE_PACKED_LEN, ExposureOp};
 pub use hue_saturation::{HUE_SATURATION_PACKED_LEN, HueSaturationOp, range_weight};
+pub use invert::InvertOp;
 pub use levels::{EXACT_INTERVALS, LEVELS_LUT_INTERVALS, LEVELS_PACKED_LEN, LevelsLut};
 pub use photo_filter::{PHOTO_FILTER_PACKED_LEN, PhotoFilterOp};
+pub use posterize::PosterizeOp;
 pub use shadow::shadow_coverage;
 pub use stroke::{StrokeSide, stroke_coverage, stroke_reach};
+pub use threshold::ThresholdOp;
 pub use vibrance::{VIBRANCE_PACKED_LEN, VibranceOp};
 
 /// The crate's own name, kept from the skeleton so CI's crate-name check
