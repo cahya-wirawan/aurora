@@ -895,6 +895,22 @@ fn gpu_hue_saturation_matches_the_cpu_on_translucent_backdrops() {
 /// Every admitted blend mode, one adjustment each, on the smooth ramp (as
 /// the Curves test): the GPU must differ from Normal for every other mode,
 /// or a dropped mode would pass.
+/// Pass and mode pairs whose blend term is the source itself (see
+/// [`every_mode`]).
+fn coincides_with_normal(pass: Pass, mode: BlendMode) -> bool {
+    match pass {
+        Pass::Invert => mode == BlendMode::LinearLight,
+        Pass::Threshold => matches!(
+            mode,
+            BlendMode::HardLight
+                | BlendMode::LinearLight
+                | BlendMode::VividLight
+                | BlendMode::PinLight
+        ),
+        _ => false,
+    }
+}
+
 pub(crate) fn every_mode(
     pass: Pass,
     adjustment: aurora_doc::Adjustment,
@@ -914,6 +930,17 @@ pub(crate) fn every_mode(
     for mode in GPU_MODES {
         ok(layers.set_blend_mode(id, mode));
         let what = format!("{pass:?} {mode:?}");
+        if pass == Pass::Invert && mode == BlendMode::HardMix {
+            // HardMix switches at Cb + Cs = 1, and an inversion has Cs =
+            // 1 - Cb: EVERY texel sits on the switch (up to rounding), so
+            // no value or flip bound exists. Only the dispatch is checked.
+            let _ = take_counts();
+            let Some(_) = gpu_tile(&context, &mut compositor, &layers, &mut store) else {
+                unreachable!("{what}: fell back");
+            };
+            assert_eq!(take_counts(), pass.expected(1), "{what}: pass recorded");
+            continue;
+        }
         if mode == BlendMode::HardMix {
             // HardMix thresholds `VividLight` at 0.5: a one-`f16`-step
             // difference in `Cs` near the threshold flips a channel between
@@ -950,6 +977,17 @@ pub(crate) fn every_mode(
         worst = worst.max(w);
         if mode == BlendMode::Normal {
             normal = cpu;
+        } else if coincides_with_normal(pass, mode) {
+            // For a binary source (Threshold: 0 or 1) HardLight, LinearLight,
+            // VividLight and PinLight return the source itself, and
+            // LinearLight(Cb, 1 - Cb) = clamp(Cb + 2 (1 - Cb) - 1) = 1 - Cb
+            // for Invert: these combinations ARE Normal, mathematically, so
+            // they cannot differ from it (the comparison against the CPU
+            // above still holds).
+            assert!(
+                max_diff(&cpu, &normal) < 0.01,
+                "{what}: this mode of this pass is Normal"
+            );
         } else {
             assert!(
                 max_diff(&cpu, &normal) > 0.01,

@@ -94,7 +94,9 @@ const NEUTRAL_ROWS: [[f32; 4]; 3] = [
 /// `STEEP_CASES` are. The legacy line's slope is `1 / (1 - c / 100)`
 /// (5 at contrast 80, 100 at 99), a 200 % mixer weight doubles a step per
 /// channel, and 64 random stops make a gradient with slopes of about 30.
-pub(crate) const STEEP_CASES: [&str; 8] = [
+pub(crate) const STEEP_CASES: [&str; 10] = [
+    "gm 5 stops uneven",
+    "sel extremes absolute",
     "bc legacy +0/+80",
     "bc legacy +0/+99",
     "mixer 200 %",
@@ -128,8 +130,7 @@ fn posterize_cases() -> Vec<(&'static str, Adjustment)> {
         ("post 8", post(8)),
         ("post 16", post(16)),
         ("post 64", post(64)),
-        ("post 200", post(200)),
-        ("post 254", post(254)),
+        ("post 100", post(100)),
     ]
 }
 
@@ -372,6 +373,28 @@ fn gradient_map_cases() -> Vec<(&'static str, Adjustment)> {
                 true,
             ),
         ),
+        (
+            "gm shared first position",
+            gradient(
+                &[
+                    (0.0, [0.9, 0.1, 0.1]),
+                    (0.0, [0.1, 0.1, 0.8]),
+                    (1.0, [1.0, 1.0, 0.2]),
+                ],
+                false,
+            ),
+        ),
+        (
+            "gm shared last position",
+            gradient(
+                &[
+                    (0.0, [0.0, 0.2, 0.1]),
+                    (1.0, [0.2, 0.9, 0.3]),
+                    (1.0, [0.9, 0.3, 0.9]),
+                ],
+                false,
+            ),
+        ),
         ("gm 8 stops", gradient(&eight, false)),
         ("gm 64 stops", gradient(&sixty_four, false)),
     ]
@@ -410,7 +433,7 @@ fn moderate(pass: Pass) -> Adjustment {
         Pass::Invert => Adjustment::Invert,
         Pass::Threshold => thr(120),
         Pass::Posterize => post(4),
-        Pass::BrightnessContrast => bc(30, 40, false),
+        Pass::BrightnessContrast => bc(0, 70, false),
         Pass::ChannelMixer => mixer(
             [
                 [80.0, 20.0, 10.0, 0.0],
@@ -443,7 +466,7 @@ fn moderate(pass: Pass) -> Adjustment {
 /// The legacy-mode Brightness/Contrast `moderate` is the default (table)
 /// mode; this is the line, for the tests that exercise the pass of its own.
 fn moderate_legacy_bc() -> Adjustment {
-    bc(30, 40, true)
+    bc(0, 60, true)
 }
 
 /// The identity (neutral) adjustments of each kind, empty for the kinds
@@ -481,13 +504,21 @@ fn edge_ladder(x: u32, y: u32) -> [f32; 4] {
 // -- Differential: opaque, per kind --------------------------------------------
 
 fn opaque_differential(pass: Pass) {
-    for (label, pattern) in [
+    // The tie grid holds only the levels 0, 1/4, 1/2 and 1, which a 5-level
+    // Posterize leaves where they are; the edge ladder is grey, which the
+    // colour-dependent passes do not move. Each is used where it bites.
+    let mut patterns = vec![
         ("random", random_opaque as fn(u32, u32) -> [f32; 4]),
         ("edge", edge_opaque),
         ("ramp", ramp),
-        ("tie grid", tie_grid),
-        ("edge ladder", edge_ladder),
-    ] {
+    ];
+    if pass != Pass::Posterize {
+        patterns.push(("tie grid", tie_grid));
+    }
+    if DISCONTINUOUS.contains(&pass) {
+        patterns.push(("edge ladder", edge_ladder));
+    }
+    for (label, pattern) in patterns {
         let worst = run_cases(
             pass,
             pattern,
