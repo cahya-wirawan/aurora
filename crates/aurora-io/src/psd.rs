@@ -457,6 +457,9 @@ enum Note {
     /// A Channel Mixer or Selective Color layer that is not neutral (0.245.0),
     /// shown with a textbook formula nothing was compared against.
     Unvalidated(read_adjust::Kind),
+    /// A Monochrome Channel Mixer or a Selective Color that adjusts something
+    /// (0.245.0): the file layout is unverified, so it is left out.
+    Unverified(read_adjust::Kind),
     /// A Photo Filter whose colour is not stored as Lab (version 3 or
     /// another colour space).
     PhotoFilterColour,
@@ -609,6 +612,19 @@ fn note_text(note: Note, n: u64) -> String {
              curve (its formula is unpublished); expect differences of several levels from \
              Photoshop's own rendering. The Use Legacy mode is a straight line and is closer.",
             if one { "is" } else { "are" },
+        ),
+        Note::Unverified(kind) => format!(
+            "{n} {} layer{s} {was} left out — {}",
+            kind.label(),
+            if kind == read_adjust::Kind::ChannelMixer {
+                "Aurora can't tell which row of the file holds a Monochrome mixer's Gray mix \
+                 (no Photoshop file or parser documents it), so it would not know what the \
+                 layer does."
+            } else {
+                "Aurora can't tell which of the file's ten colour plates is which range (no \
+                 Photoshop file or parser documents the order), so it could apply the \
+                 adjustment to the wrong colours."
+            },
         ),
         Note::Unvalidated(kind) => format!(
             "{n} {} layer{s} {} shown with a textbook formula that has not been compared with \

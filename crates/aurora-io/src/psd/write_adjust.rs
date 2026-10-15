@@ -47,6 +47,11 @@
 //!   lightness 0.5, as `doub` (Photoshop itself stores fractions there:
 //!   `225.00045776367188`).
 //! * `blnc`: nine `i16`, the preserve-luminosity byte and a pad byte.
+//! * `mixr` / `selc` (0.245.0, revised): a Monochrome mixer and a Selective
+//!   Color that adjusts anything are **refused** (the Gray row and the plate
+//!   order are unverified); a neutral Selective Color of either method and a
+//!   non-Monochrome mixer are written, the neutral ones byte for byte as
+//!   Photoshop writes them.
 //! * `mixr` (0.245.0): version `1`, the Monochrome `u16`, four rows of five
 //!   `i16` (red, green, blue, the CMYK-only fourth source, constant): the
 //!   three rows of the model with a zero fourth source, then the fourth row
@@ -162,6 +167,25 @@ fn whole(value: f32) -> i16 {
 pub(super) fn encode_adjustment(
     adjustment: &Adjustment,
 ) -> Result<EncodedAdjustment, &'static str> {
+    // The file layouts of a Monochrome mixer (which row is the Gray mix) and
+    // of a Selective Color that adjusts anything (the order of the ten
+    // plates) are not documented by any fixture or by psd-tools: writing
+    // them could make Photoshop apply a client's layer to the wrong colours.
+    match adjustment {
+        Adjustment::ChannelMixer(p) if p.monochrome() => {
+            return Err(
+                "its Monochrome Gray mix has no verified place in the file's rows (no Photoshop file \
+                 documents it)",
+            );
+        }
+        Adjustment::SelectiveColor(p) if !p.is_identity() => {
+            return Err(
+                "the order of the file's ten colour plates is not verified, so its adjustments \
+                 could land on the wrong colours",
+            );
+        }
+        _ => {}
+    }
     let mut rounding = Rounding::default();
     let mut extra = None;
     let (key, mut data) = match adjustment {
@@ -672,7 +696,7 @@ fn whole_percent(v: f32, rounding: &mut Rounding) -> i16 {
     w
 }
 
-fn encode_channel_mixer(
+pub(super) fn encode_channel_mixer(
     params: &aurora_core::ChannelMixerParams,
     rounding: &mut Rounding,
 ) -> Vec<u8> {
@@ -693,7 +717,7 @@ fn encode_channel_mixer(
     data
 }
 
-fn encode_selective_color(
+pub(super) fn encode_selective_color(
     params: &aurora_core::SelectiveColorParams,
     rounding: &mut Rounding,
 ) -> Vec<u8> {

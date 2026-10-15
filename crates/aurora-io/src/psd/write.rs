@@ -290,8 +290,6 @@ struct Losses {
     /// (0.205.0): Curves, Levels, Hue/Saturation; and since 0.241.0 Vibrance,
     /// Exposure, Photo Filter, Black & White, Color Balance (slots 3..=7).
     adjustment_rounded: [usize; 10],
-    /// Channel Mixer layers written with Monochrome on (0.245.0).
-    mixer_monochrome: usize,
     /// Black & White layers written (0.241.0): each one's tint colour is
     /// stored as a colour made from the tint hue and saturation, and the
     /// preset name is cleared.
@@ -337,9 +335,6 @@ impl Losses {
             | aurora_doc::Adjustment::Posterize(_)
             | aurora_doc::Adjustment::BrightnessContrast(_) => None,
         };
-        self.mixer_monochrome += usize::from(
-            matches!(adjustment, aurora_doc::Adjustment::ChannelMixer(p) if p.monochrome()),
-        );
         self.black_white_written +=
             usize::from(matches!(adjustment, aurora_doc::Adjustment::BlackWhite(_)));
         if rounding.rounded
@@ -531,17 +526,6 @@ impl Losses {
             if n > 0 {
                 items.push(format!("{} {what}", plural(n as u64, one, many)));
             }
-        }
-        if self.mixer_monochrome > 0 {
-            items.push(format!(
-                "{} Gray mix will be stored in the first output row, which has not been checked \
-                 against a Photoshop file, so Photoshop may read it differently.",
-                plural(
-                    self.mixer_monochrome as u64,
-                    "Channel Mixer layer's Monochrome",
-                    "Channel Mixer layers' Monochrome"
-                )
-            ));
         }
         if self.black_white_written > 0 {
             items.push(format!(

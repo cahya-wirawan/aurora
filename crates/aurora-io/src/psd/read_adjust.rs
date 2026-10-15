@@ -50,6 +50,12 @@
 //!   (`Vrsn` 1, `Brgh`, `Cntr`, `means`, `Lab `, `useLegacy`, `Auto`).
 //!   Layers using Auto, Lab-only or a mean other than 127 are left out.
 //!
+//! * 0.245.0 (revised): a Monochrome `mixr` and a `selc` that adjusts anything
+//!   are **left out** with their own report line, because psd-tools'
+//!   parsers (`psd/adjustments.py`, `ChannelMixer` and `SelectiveColor`)
+//!   name neither the Gray row nor the order of the ten plates and no
+//!   fixture constrains them. Neutral layers (any method) and non-Monochrome
+//!   mixers import.
 //! * 0.245.0: `mixr` and `selc`, checked on `layers/channel-mixer.psd`,
 //!   `layers/selective-color.psd` and `fill_adjustments.psd` (the neutral
 //!   layers; 44 and 84 bytes) and against psd-tools 1.17.4's parsers. **Only
@@ -719,6 +725,12 @@ pub(super) fn channel_mixer_adjustment(block: &MixerBlock, gray: bool) -> Result
     if gray {
         return Err(Note::Grayscale(Kind::ChannelMixer));
     }
+    // Which row holds the Gray mix is in no fixture and not in psd-tools
+    // (`psd/adjustments.py` `ChannelMixer.read`: version, monochrome, five
+    // `i16`, the rest kept as `unknown`): a Monochrome mixer is left out.
+    if block.monochrome {
+        return Err(Note::Unverified(Kind::ChannelMixer));
+    }
     aurora_core::ChannelMixerParams::new(block.rows.map(|r| r.map(f32::from)), block.monochrome)
         .map(Adjustment::ChannelMixer)
         .map_err(|_| Note::Unreadable(Kind::ChannelMixer))
@@ -773,9 +785,19 @@ pub(super) fn selective_color_adjustment(
     if block.unused != [0; 4] {
         return Err(Note::Unreadable(Kind::SelectiveColor));
     }
-    aurora_core::SelectiveColorParams::new(block.ranges.map(|r| r.map(f32::from)), block.absolute)
-        .map(Adjustment::SelectiveColor)
-        .map_err(|_| Note::Unreadable(Kind::SelectiveColor))
+    let params = aurora_core::SelectiveColorParams::new(
+        block.ranges.map(|r| r.map(f32::from)),
+        block.absolute,
+    )
+    .map_err(|_| Note::Unreadable(Kind::SelectiveColor))?;
+    // The order of the plates is in no fixture and not in psd-tools
+    // (`psd/adjustments.py` `SelectiveColor.read`: version, method, ten
+    // plates of four `i16`, no names): a layer that adjusts anything would
+    // be applied to colours nobody has verified, so it is left out.
+    if !params.is_identity() {
+        return Err(Note::Unverified(Kind::SelectiveColor));
+    }
+    Ok(Adjustment::SelectiveColor(params))
 }
 
 /// A parsed block as an adjustment, or the reason it is left out.

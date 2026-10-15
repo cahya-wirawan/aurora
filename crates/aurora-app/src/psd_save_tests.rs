@@ -572,6 +572,69 @@ fn preflight_refusal_shows_couldnt_save_with_reason() {
     assert!(psd_save_failure_message("big.psd", &failure).contains("use .psb"));
 }
 
+/// 0.245.0: a Selective Color that adjusts anything and a Monochrome Channel
+/// Mixer are refused by name through the app save flow (their file layout is
+/// unverified); neutral ones, and a colour mixer, save without a dialog.
+#[test]
+fn unverifiable_selective_color_and_monochrome_mixer_are_refused_by_name() {
+    let mut ranges = [[0.0_f32; 4]; 9];
+    ranges[2] = [10.0, 0.0, 0.0, 0.0];
+    for (name, adjustment, kind) in [
+        (
+            "Sel",
+            aurora_doc::Adjustment::SelectiveColor(ok(aurora_core::SelectiveColorParams::new(
+                ranges, false,
+            ))),
+            "Selective Color",
+        ),
+        (
+            "Mono",
+            aurora_doc::Adjustment::ChannelMixer(
+                aurora_core::ChannelMixerParams::identity().with_monochrome(true),
+            ),
+            "Channel Mixer",
+        ),
+    ] {
+        let mut doc = Doc::new();
+        ok(doc.tree.add_adjustment_layer_at(name, adjustment, None, 0));
+        let path = doc.path("copy.psd");
+        let Err(failure) = doc.save(&path) else {
+            unreachable!("refused")
+        };
+        let message = psd_save_failure_message("copy.psd", &failure);
+        assert!(
+            message.contains(&format!(
+                "the {kind} layer \u{201c}{name}\u{201d} can't be saved to .psd"
+            )) && message.contains("verified"),
+            "{message}"
+        );
+        assert!(!path.exists());
+    }
+    let mut doc = Doc::new();
+    ok(doc.tree.add_adjustment_layer_at(
+        "Neutral",
+        aurora_doc::Adjustment::SelectiveColor(
+            aurora_core::SelectiveColorParams::identity().with_absolute(true),
+        ),
+        None,
+        0,
+    ));
+    ok(doc.tree.add_adjustment_layer_at(
+        "Mixer",
+        aurora_doc::Adjustment::ChannelMixer(aurora_core::ChannelMixerParams::identity()),
+        None,
+        0,
+    ));
+    let path = doc.path("ok.psd");
+    let Ok(step) = doc.save(&path) else {
+        unreachable!("saves")
+    };
+    assert!(
+        matches!(step, PsdSaveStep::Saved),
+        "no dialog for neutral layers"
+    );
+}
+
 /// 0.241.0: Vibrance, Exposure, Photo Filter, Black & White and Color
 /// Balance layers save through the whole app flow (they were refused by
 /// name until now): exact values are lossless (no dialog, the target

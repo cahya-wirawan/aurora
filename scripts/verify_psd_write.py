@@ -499,20 +499,17 @@ def check_adjustments2(folder):
     # constant); the rows are checked from the whole block.
     red = want["mixer"][0]
     check("Mixer first row", list(data), [red[0], red[1], red[2], 0, red[3]])
-    mono_layer = find_layer(psd, "Mono")
-    version, mono, data = adjustment_summary(mono_layer)[1]
-    check("Mono flag", (version, mono), (1, 1))
-    gray = want["mono"][0]
-    check("Mono gray row", list(data), [gray[0], gray[1], gray[2], 0, gray[3]])
+    swap = find_layer(psd, "Swap")
+    version, mono, data = adjustment_summary(swap)[1]
+    check("Swap flag", (version, mono), (1, 0))
+    row = want["swap"][0]
+    check("Swap first row", list(data), [row[0], row[1], row[2], 0, row[3]])
     s = find_layer(psd, "Selective")
     check("Selective kind", s.kind, "selectivecolor")
     check("Selective visible", s.visible, False)
     version, method, plates = adjustment_summary(s)[1]
     check("Selective version and method", (version, method), (1, 1 if want["absolute"] else 0))
-    check("Selective unused plate", plates[0], (0, 0, 0, 0))
-    check("Selective reds", plates[1], tuple(want["selective_reds"]))
-    check("Selective neutrals", plates[8], tuple(want["selective_neutrals"]))
-    check("Selective blacks", plates[9], (0, 0, 0, 0))
+    check("Selective plates (neutral)", [tuple(p) for p in plates], [(0, 0, 0, 0)] * 10)
     print("OK: psd-tools read the Channel Mixer and Selective Color blocks and records")
 
 

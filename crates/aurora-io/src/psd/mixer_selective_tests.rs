@@ -131,10 +131,17 @@ fn the_mixer_layout_is_four_rows_of_red_green_blue_unused_constant() {
         "the fourth source is ignored, the fifth value is the constant"
     );
     assert!(!p.monochrome());
-    let Ok(Adjustment::ChannelMixer(p)) = read_one(b"mixr", &mixr(1, 1, rows), false) else {
-        unreachable!("readable")
+    // The flag parses, but a Monochrome mixer is left out: which row holds
+    // the Gray mix is unverified.
+    let Parsed::ChannelMixer(Ok(block)) = parsed(b"mixr", &mixr(1, 1, rows)) else {
+        unreachable!("parses")
     };
-    assert!(p.monochrome());
+    assert!(block.monochrome);
+    let r = read_one(b"mixr", &mixr(1, 1, rows), false);
+    assert!(
+        matches!(&r, Err(e) if e.contains("Unverified") && e.contains("ChannelMixer")),
+        "{r:?}"
+    );
     // A block with a tail (Photoshop pads tagged blocks) still reads.
     let mut longer = mixr(1, 0, ID_ROWS);
     longer.extend_from_slice(&[0, 0, 0, 0]);
@@ -150,18 +157,35 @@ fn the_selective_layout_is_a_method_an_unused_plate_and_nine_ranges() {
     for (i, plate) in plates.iter_mut().enumerate().skip(1) {
         *plate = [i as i16, -(i as i16), 10 * i as i16, -10 * i as i16];
     }
-    let Ok(Adjustment::SelectiveColor(p)) = read_one(b"selc", &selc(1, 1, plates), false) else {
-        unreachable!("readable")
-    };
-    assert!(p.absolute());
-    for r in 0..9 {
-        let i = (r + 1) as f32;
-        assert_eq!(p.range(r), Some([i, -i, 10.0 * i, -10.0 * i]), "range {r}");
+    // The block parses as written (this is the layout psd-tools reads) ...
+    for (method, absolute) in [(0, false), (1, true)] {
+        let Parsed::SelectiveColor(Ok(block)) = parsed(b"selc", &selc(1, method, plates)) else {
+            unreachable!("parses")
+        };
+        assert_eq!(block.absolute, absolute);
+        assert_eq!(block.unused, [0; 4]);
+        for r in 0..9 {
+            let i = (r + 1) as i16;
+            assert_eq!(block.ranges[r], [i, -i, 10 * i, -10 * i], "plate {}", r + 1);
+        }
+        // ... but a layer that adjusts anything is left out: the order of
+        // the plates is unverified.
+        let r = read_one(b"selc", &selc(1, method, plates), false);
+        assert!(
+            matches!(&r, Err(e) if e.contains("Unverified") && e.contains("SelectiveColor")),
+            "{r:?}"
+        );
     }
-    let Ok(Adjustment::SelectiveColor(p)) = read_one(b"selc", &selc(1, 0, plates), false) else {
-        unreachable!("readable")
-    };
-    assert!(!p.absolute());
+    // A neutral layer of either method imports, whatever its method.
+    for (method, absolute) in [(0, false), (1, true)] {
+        let Ok(Adjustment::SelectiveColor(p)) =
+            read_one(b"selc", &selc(1, method, [[0; 4]; 10]), false)
+        else {
+            unreachable!("neutral imports")
+        };
+        assert_eq!(p.absolute(), absolute);
+        assert!(p.is_identity());
+    }
 }
 
 #[test]
@@ -230,7 +254,10 @@ fn unknown_versions_flags_and_out_of_range_values_are_unreadable_not_repaired() 
     let edge = [[100, -100, 100, -100]; 10];
     let mut edge = edge;
     edge[0] = [0; 4];
-    assert!(read_one(b"selc", &selc(1, 0, edge), false).is_ok());
+    assert!(matches!(
+        parsed(b"selc", &selc(1, 0, edge)),
+        Parsed::SelectiveColor(Ok(_))
+    ));
     assert!(
         read_one(
             b"mixr",
@@ -296,34 +323,62 @@ fn hostile_blocks_never_panic_and_allocate_nothing_unbounded() {
 }
 
 #[test]
-fn a_non_neutral_layer_is_reported_as_unvalidated_and_a_neutral_one_is_not() {
+fn a_non_neutral_mixer_is_reported_as_unvalidated_and_the_unverifiable_kinds_are_left_out() {
     let strong = mixr(1, 0, [[50, 0, 0, 0, 0], ID_ROWS[1], ID_ROWS[2], ID_ROWS[3]]);
-    let mut plates = [[0_i16; 4]; 10];
-    plates[1] = [10, 0, 0, 0];
-    for (key, neutral, strong, name) in [
-        (b"mixr", unhex(MIXR_NEUTRAL), strong, "Channel Mixer"),
-        (
-            b"selc",
-            selc_neutral(),
-            selc(1, 0, plates),
-            "Selective Color",
+    // A neutral mixer imports silently; a non-Monochrome one is noted.
+    let document = ok(read(
+        &file_with(b"mixr", &unhex(MIXR_NEUTRAL), |_| {}).write(),
+    ));
+    let items = document.report.items.join("\n");
+    assert!(
+        !items.contains("textbook") && !items.contains("left out"),
+        "{items}"
+    );
+    assert_eq!(children_count(&document), 2, "pixels and the adjustment");
+    let document = ok(read(&file_with(b"mixr", &strong, |_| {}).write()));
+    let items = document.report.items.join("\n");
+    assert!(
+        items.contains(
+            "1 Channel Mixer layer is shown with a textbook formula that has not been compared with Photoshop"
         ),
-    ] {
-        let document = ok(read(&file_with(key, &neutral, |_| {}).write()));
-        let items = document.report.items.join("\n");
-        assert!(!items.contains("textbook"), "{name} neutral: {items}");
-        assert!(!items.contains("left out"), "{name} neutral: {items}");
-        assert_eq!(children_count(&document), 2, "pixels and the adjustment");
-        let document = ok(read(&file_with(key, &strong, |_| {}).write()));
+        "{items}"
+    );
+    assert!(top_adjustment(&document).is_some());
+    // A neutral Selective Color imports silently, of either method.
+    for method in [0, 1] {
+        let document = ok(read(
+            &file_with(b"selc", &selc(1, method, [[0; 4]; 10]), |_| {}).write(),
+        ));
         let items = document.report.items.join("\n");
         assert!(
-            items.contains(&format!(
-                "1 {name} layer is shown with a textbook formula that has not been compared with Photoshop"
-            )),
-            "{name}: {items}"
+            !items.contains("textbook") && !items.contains("left out"),
+            "{items}"
         );
-        assert!(top_adjustment(&document).is_some());
+        assert_eq!(children_count(&document), 2);
     }
+    // A Selective Color that adjusts anything is left out with its own line
+    // (the plate order is unverified); so is a Monochrome mixer.
+    let mut plates = [[0_i16; 4]; 10];
+    plates[1] = [10, 0, 0, 0];
+    let document = ok(read(
+        &file_with(b"selc", &selc(1, 0, plates), |_| {}).write(),
+    ));
+    let items = document.report.items.join("\n");
+    assert!(
+        items.contains("1 Selective Color layer was left out")
+            && items.contains("ten colour plates"),
+        "{items}"
+    );
+    assert_eq!(children_count(&document), 1, "only the pixel layer");
+    let document = ok(read(
+        &file_with(b"mixr", &mixr(1, 1, ID_ROWS), |_| {}).write(),
+    ));
+    let items = document.report.items.join("\n");
+    assert!(
+        items.contains("1 Channel Mixer layer was left out") && items.contains("Gray mix"),
+        "{items}"
+    );
+    assert_eq!(children_count(&document), 1, "only the pixel layer");
     // An unreadable one is left out with its own line, not repaired.
     let document = ok(read(
         &file_with(b"mixr", &mixr(2, 0, ID_ROWS), |_| {}).write(),
@@ -433,17 +488,21 @@ fn the_writer_reproduces_photoshops_neutral_blocks_byte_for_byte() {
 
 #[test]
 fn the_writer_places_every_value_in_the_layout_the_reader_parses() {
-    let a = mixer(
+    // The layout functions themselves (the writer refuses the Monochrome and
+    // the non-neutral Selective Color layers that need the unverified
+    // places, but the bytes they would produce are checked here).
+    let params = ok(ChannelMixerParams::new(
         [
             [1.0, 2.0, 3.0, 4.0],
             [5.0, 6.0, 7.0, 8.0],
             [-200.0, 200.0, -9.0, -100.0],
         ],
         true,
-    );
-    let e = encoded(&a);
+    ));
+    let mut rounding = super::write_adjust::Rounding::default();
+    let data = super::write_adjust::encode_channel_mixer(&params, &mut rounding);
     assert_eq!(
-        e.data,
+        data,
         mixr(
             1,
             1,
@@ -455,33 +514,108 @@ fn the_writer_places_every_value_in_the_layout_the_reader_parses() {
             ]
         )
     );
-    assert_eq!(e.readback, a);
-    let a = selective(
-        &[(0, [1.0, 2.0, 3.0, 4.0]), (8, [-5.0, 6.0, -7.0, 8.0])],
-        true,
-    );
-    let e = encoded(&a);
+    assert!(!rounding.rounded);
+    let mut ranges = [[0.0_f32; 4]; 9];
+    ranges[0] = [1.0, 2.0, 3.0, 4.0];
+    ranges[8] = [-5.0, 6.0, -7.0, 8.0];
+    let params = ok(SelectiveColorParams::new(ranges, true));
+    let data = super::write_adjust::encode_selective_color(&params, &mut rounding);
     let mut plates = [[0_i16; 4]; 10];
     plates[1] = [1, 2, 3, 4];
     plates[9] = [-5, 6, -7, 8];
-    assert_eq!(e.data, selc(1, 1, plates));
+    assert_eq!(data, selc(1, 1, plates));
+    // A non-Monochrome mixer is written and reads back as itself.
+    let a = mixer(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+            [-200.0, 200.0, -9.0, -100.0],
+        ],
+        false,
+    );
+    let e = encoded(&a);
     assert_eq!(e.readback, a);
+    assert_eq!(
+        e.data,
+        mixr(
+            1,
+            0,
+            [
+                [1, 2, 3, 0, 4],
+                [5, 6, 7, 0, 8],
+                [-200, 200, -9, 0, -100],
+                [0, 0, 0, 100, 0]
+            ]
+        )
+    );
+}
+
+#[test]
+fn the_writer_refuses_a_monochrome_mixer_and_a_non_neutral_selective_color_by_name() {
+    for a in [
+        mixer(ChannelMixerParams::identity().rows(), true),
+        mixer(
+            [
+                [30.0, 59.0, 11.0, 0.0],
+                [0.0, 100.0, 0.0, 0.0],
+                [0.0, 0.0, 100.0, 0.0],
+            ],
+            true,
+        ),
+        selective(&[(0, [1.0, 0.0, 0.0, 0.0])], false),
+        selective(&[(8, [0.0, 0.0, 0.0, -1.0])], true),
+    ] {
+        let r = encode_adjustment(&a);
+        assert!(
+            matches!(r, Err(reason) if reason.contains("verified")),
+            "{a:?}: {r:?}"
+        );
+    }
+    // Neutral Selective Color of either method, and a colour mixer, write.
+    for absolute in [false, true] {
+        let a = selective(&[], absolute);
+        let e = encoded(&a);
+        assert_eq!(e.readback, a);
+        assert_eq!(e.data, selc(1, i16::from(absolute), [[0; 4]; 10]));
+    }
+    let mut tree = LayerTree::new();
+    ok(tree.add_pixel_layer("A", rect(0, 0, 4, 4), None));
+    ok(tree.add_adjustment_layer_at("Neutral", selective(&[], true), None, 0));
+    assert!(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()).is_ok());
+    ok(tree.add_adjustment_layer_at(
+        "Sel",
+        selective(&[(2, [10.0, 0.0, 0.0, 0.0])], false),
+        None,
+        0,
+    ));
+    let r = psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default());
+    assert!(
+        matches!(&r, Err(super::write::PsdSaveRefusal::AdjustmentNotRepresentable { kind: "Selective Color", name, .. }) if name == "Sel"),
+        "{r:?}"
+    );
+    let mut tree = LayerTree::new();
+    ok(tree.add_pixel_layer("A", rect(0, 0, 4, 4), None));
+    ok(tree.add_adjustment_layer_at(
+        "Mono",
+        mixer(ChannelMixerParams::identity().rows(), true),
+        None,
+        0,
+    ));
+    let r = psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default());
+    assert!(
+        matches!(&r, Err(super::write::PsdSaveRefusal::AdjustmentNotRepresentable { kind: "Channel Mixer", name, .. }) if name == "Mono"),
+        "{r:?}"
+    );
 }
 
 #[test]
 fn every_edge_value_reads_back_as_itself() {
     let mut all = Vec::new();
     for v in [-200.0_f32, -199.0, -1.0, 0.0, 1.0, 199.0, 200.0] {
-        for mono in [false, true] {
-            all.push(mixer([[v, -v, 0.0, 100.0_f32.min(v.abs())]; 3], mono));
-        }
+        all.push(mixer([[v, -v, 0.0, 100.0_f32.min(v.abs())]; 3], false));
     }
-    for v in [-100.0_f32, -99.0, -1.0, 0.0, 1.0, 99.0, 100.0] {
-        for absolute in [false, true] {
-            let all_ranges: Vec<(usize, [f32; 4])> = (0..9).map(|i| (i, [v, -v, v, -v])).collect();
-            all.push(selective(&all_ranges, absolute));
-        }
-    }
+    all.push(selective(&[], false));
+    all.push(selective(&[], true));
     for a in all {
         let e = encoded(&a);
         assert_eq!(e.readback, a, "{a:?}");
@@ -506,13 +640,6 @@ fn fractional_values_are_rounded_and_itemised() {
         unreachable!("mixer")
     };
     assert_eq!(back.row(0), Some([30.0, 59.0, 11.0, 0.0]));
-    let a = selective(&[(2, [0.0, 0.0, 0.0, -49.6])], false);
-    let e = encoded(&a);
-    assert!(e.rounding.rounded);
-    let Adjustment::SelectiveColor(back) = e.readback else {
-        unreachable!("selective")
-    };
-    assert_eq!(back.range(2), Some([0.0, 0.0, 0.0, -50.0]));
     // Report lines through the preflight, and none for exact values.
     let mut tree = LayerTree::new();
     ok(tree.add_pixel_layer("A", rect(0, 0, 4, 4), None));
@@ -522,27 +649,15 @@ fn fractional_values_are_rounded_and_itemised() {
         None,
         0,
     ));
-    ok(tree.add_adjustment_layer_at("S", selective(&[(1, [10.0, 0.0, 0.0, 0.0])], true), None, 0));
+    ok(tree.add_adjustment_layer_at("S", selective(&[], true), None, 0));
     let report = ok(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()));
     assert!(report.items.is_empty(), "{:?}", report.items);
     ok(tree.add_adjustment_layer_at("M2", a_mixer_fractional(), None, 0));
-    ok(tree.add_adjustment_layer_at(
-        "S2",
-        selective(&[(1, [10.5, 0.0, 0.0, 0.0])], true),
-        None,
-        0,
-    ));
     let report = ok(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()));
     let text = report.items.join("\n");
     assert!(
         text.contains(
             "1 Channel Mixer layer's fractional values will be rounded to whole percents"
-        ),
-        "{text}"
-    );
-    assert!(
-        text.contains(
-            "1 Selective Color layer's fractional values will be rounded to whole percents"
         ),
         "{text}"
     );
@@ -557,33 +672,6 @@ fn a_mixer_fractional() -> Adjustment {
         ],
         false,
     )
-}
-
-#[test]
-fn a_monochrome_mixer_is_itemised_because_its_row_is_unverified() {
-    let mut tree = LayerTree::new();
-    ok(tree.add_pixel_layer("A", rect(0, 0, 4, 4), None));
-    ok(tree.add_adjustment_layer_at(
-        "Mono",
-        mixer(
-            [
-                [30.0, 59.0, 11.0, 0.0],
-                [0.0, 100.0, 0.0, 0.0],
-                [0.0, 0.0, 100.0, 0.0],
-            ],
-            true,
-        ),
-        None,
-        0,
-    ));
-    let report = ok(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()));
-    let text = report.items.join("\n");
-    assert!(
-        text.contains(
-            "1 Channel Mixer layer's Monochrome Gray mix will be stored in the first output row"
-        ),
-        "{text}"
-    );
 }
 
 fn two_doc() -> Doc {
@@ -607,25 +695,19 @@ fn two_doc() -> Doc {
     doc.mask(m, rect(2, 2, 10, 10), (0, 0, 10, 10), |x, y| {
         f32::from(u16::try_from((x * 20 + y) % 255).unwrap_or(0)) / 255.0
     });
-    let s = ok(doc.tree.add_adjustment_layer_at(
-        "Selective",
-        selective(
-            &[(0, [10.0, -20.0, 30.0, -40.0]), (7, [5.0, 5.0, 5.0, 5.0])],
-            true,
-        ),
-        None,
-        0,
-    ));
+    let s = ok(doc
+        .tree
+        .add_adjustment_layer_at("Selective", selective(&[], true), None, 0));
     ok(doc.tree.set_visible(s, false));
     ok(doc.tree.add_adjustment_layer_at(
-        "Mono",
+        "Swap",
         mixer(
             [
-                [30.0, 59.0, 11.0, 0.0],
-                [0.0, 100.0, 0.0, 0.0],
                 [0.0, 0.0, 100.0, 0.0],
+                [0.0, 100.0, 0.0, 0.0],
+                [100.0, 0.0, 0.0, 0.0],
             ],
-            true,
+            false,
         ),
         None,
         0,
@@ -647,8 +729,8 @@ fn both_kinds_round_trip_through_write_verify_and_read() {
     let dir = ok(tempfile::tempdir());
     let target = dir.path().join("two.psd");
     let outcome = ok(save(&mut doc, &target, false));
-    // Only the Monochrome line (and no rounding line): the values are exact.
-    assert_eq!(outcome.report.items.len(), 1, "{:?}", outcome.report.items);
+    // Lossless: the values are exact, nothing is itemised.
+    assert_eq!(outcome.report.items.len(), 0, "{:?}", outcome.report.items);
     let back = read_back(&ok(std::fs::read(&target)));
     // Both non-neutral kinds are noted as unvalidated on reopen.
     let text = back.report.items.join("\n");
@@ -656,11 +738,8 @@ fn both_kinds_round_trip_through_write_verify_and_read() {
         text.contains("2 Channel Mixer layers are shown with a textbook formula"),
         "{text}"
     );
-    assert!(
-        text.contains("1 Selective Color layer is shown with a textbook formula"),
-        "{text}"
-    );
-    for name in ["Mixer", "Selective", "Mono"] {
+    assert!(!text.contains("Selective Color"), "{text}");
+    for name in ["Mixer", "Selective", "Swap"] {
         let (want, got) = (id_named(&doc.tree, name), id_named(&back.layers, name));
         assert_eq!(
             back.layers.adjustment(got),
@@ -740,8 +819,7 @@ fn two_adjustments_fixture_for_psd_tools() {
     let (bytes, _) = ok(doc.write());
     ok(std::fs::write(out.join("adjustments2.psd"), &bytes));
     let json = "{\"mixer\": [[30, 59, 11, 5], [-20, 120, 0, 0], [10, 10, 80, -5]], \
-        \"mono\": [[30, 59, 11, 0], [0, 100, 0, 0], [0, 0, 100, 0]], \
-        \"selective_reds\": [10, -20, 30, -40], \"selective_neutrals\": [5, 5, 5, 5], \
+        \"swap\": [[0, 0, 100, 0], [0, 100, 0, 0], [100, 0, 0, 0]], \
         \"absolute\": true}\n";
     ok(std::fs::write(out.join("adjustments2.json"), json));
 }
