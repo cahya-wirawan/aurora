@@ -125,6 +125,10 @@ pub enum Adjustment {
     /// Selective Color (0.245.0, [`aurora_core::SelectiveColorParams`]),
     /// applied by `aurora_filters::SelectiveColorOp`. **Ordinal 14.**
     SelectiveColor(aurora_core::SelectiveColorParams),
+    /// Gradient Map (0.248.0, [`aurora_core::GradientMapParams`]), applied by
+    /// `aurora_filters::GradientMapOp`. **Ordinal 15.** Its parameters own a
+    /// stop list, so unlike the earlier kinds they are not `Copy`.
+    GradientMap(aurora_core::GradientMapParams),
 }
 
 impl Adjustment {
@@ -146,6 +150,16 @@ impl Adjustment {
             Self::BrightnessContrast(_) => "Brightness/Contrast",
             Self::ChannelMixer(_) => "Channel Mixer",
             Self::SelectiveColor(_) => "Selective Color",
+            Self::GradientMap(_) => "Gradient Map",
+        }
+    }
+
+    /// The Gradient Map settings, `None` for other adjustments.
+    #[must_use]
+    pub const fn gradient_map(&self) -> Option<&aurora_core::GradientMapParams> {
+        match self {
+            Self::GradientMap(p) => Some(p),
+            _ => None,
         }
     }
 
@@ -1829,5 +1843,192 @@ mod channel_mixer_selective_color_wire_tests {
         assert!(s.selective_color().is_some() && s.channel_mixer().is_none());
         assert!(Adjustment::Invert.channel_mixer().is_none());
         assert!(Adjustment::Invert.selective_color().is_none());
+    }
+}
+
+/// `Adjustment::GradientMap` is appended after `SelectiveColor` (ordinal 15):
+/// every earlier encoding, ordinals 0 to 14, is unchanged and a 0.247.0 build
+/// refuses the new layer (0.248.0, ADR 0009).
+#[cfg(test)]
+mod gradient_map_wire_tests {
+    use super::{Adjustment, LayerKind};
+
+    /// `Adjustment` exactly as a 0.247.0 build declares it.
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Adjustment247 {
+        Curves(aurora_core::CurvesParams),
+        Levels(aurora_core::LevelsParams),
+        HueSaturation(aurora_core::HueSaturationParams),
+        HueSaturationRanges(aurora_core::HueSaturationRangesParams),
+        Vibrance(aurora_core::VibranceParams),
+        Exposure(aurora_core::ExposureParams),
+        PhotoFilter(aurora_core::PhotoFilterParams),
+        BlackWhite(aurora_core::BlackWhiteParams),
+        ColorBalance(aurora_core::ColorBalanceParams),
+        Invert,
+        Threshold(aurora_core::ThresholdParams),
+        Posterize(aurora_core::PosterizeParams),
+        BrightnessContrast(aurora_core::BrightnessContrastParams),
+        ChannelMixer(aurora_core::ChannelMixerParams),
+        SelectiveColor(aurora_core::SelectiveColorParams),
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Kind247 {
+        Pixel { bounds: aurora_core::Rect },
+        Group { children: Vec<super::LayerId> },
+        Adjustment(Adjustment247),
+    }
+
+    fn encode<T: serde::Serialize>(value: &T) -> Vec<u8> {
+        match postcard::to_allocvec(value) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn map() -> aurora_core::GradientMapParams {
+        let stops = vec![
+            aurora_core::GradientStop::new(0.0, [0.25, 0.5, 0.75]),
+            aurora_core::GradientStop::new(0.5, [0.0, 1.0, 0.0]),
+            aurora_core::GradientStop::new(1.0, [1.0, 1.0, 0.5]),
+        ];
+        match aurora_core::GradientMapParams::new(stops, true, true) {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn ordinals_zero_to_fourteen_keep_their_bytes() {
+        let ranged = aurora_core::HueSaturationRangesParams::plain(
+            aurora_core::HueSaturationParams::identity(),
+        );
+        let threshold = aurora_core::ThresholdParams::default();
+        let posterize = aurora_core::PosterizeParams::default();
+        let bc = aurora_core::BrightnessContrastParams::identity();
+        let mixer = aurora_core::ChannelMixerParams::identity();
+        let selective = aurora_core::SelectiveColorParams::identity();
+        let pairs = [
+            (
+                Adjustment::Curves(aurora_core::CurvesParams::identity()),
+                Adjustment247::Curves(aurora_core::CurvesParams::identity()),
+            ),
+            (
+                Adjustment::Levels(aurora_core::LevelsParams::identity()),
+                Adjustment247::Levels(aurora_core::LevelsParams::identity()),
+            ),
+            (
+                Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
+                Adjustment247::HueSaturation(aurora_core::HueSaturationParams::identity()),
+            ),
+            (
+                Adjustment::HueSaturationRanges(ranged),
+                Adjustment247::HueSaturationRanges(ranged),
+            ),
+            (
+                Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
+                Adjustment247::Vibrance(aurora_core::VibranceParams::identity()),
+            ),
+            (
+                Adjustment::Exposure(aurora_core::ExposureParams::identity()),
+                Adjustment247::Exposure(aurora_core::ExposureParams::identity()),
+            ),
+            (
+                Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+                Adjustment247::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+            ),
+            (
+                Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
+                Adjustment247::BlackWhite(aurora_core::BlackWhiteParams::default()),
+            ),
+            (
+                Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+                Adjustment247::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+            ),
+            (Adjustment::Invert, Adjustment247::Invert),
+            (
+                Adjustment::Threshold(threshold),
+                Adjustment247::Threshold(threshold),
+            ),
+            (
+                Adjustment::Posterize(posterize),
+                Adjustment247::Posterize(posterize),
+            ),
+            (
+                Adjustment::BrightnessContrast(bc),
+                Adjustment247::BrightnessContrast(bc),
+            ),
+            (
+                Adjustment::ChannelMixer(mixer),
+                Adjustment247::ChannelMixer(mixer),
+            ),
+            (
+                Adjustment::SelectiveColor(selective),
+                Adjustment247::SelectiveColor(selective),
+            ),
+        ];
+        for (index, (new, old)) in pairs.into_iter().enumerate() {
+            let new_bytes = encode(&LayerKind::Adjustment(new));
+            let old_bytes = encode(&Kind247::Adjustment(old));
+            assert_eq!(new_bytes, old_bytes, "ordinal {index}");
+            assert_eq!(new_bytes.get(1).copied().map(usize::from), Some(index));
+            assert!(postcard::from_bytes::<Kind247>(&new_bytes).is_ok());
+        }
+    }
+
+    #[test]
+    fn gradient_map_is_ordinal_fifteen_and_an_old_reader_refuses_it() {
+        let kind = LayerKind::Adjustment(Adjustment::GradientMap(map()));
+        let bytes = encode(&kind);
+        assert_eq!(bytes.get(..2), Some([2_u8, 15].as_slice()));
+        // One count byte, three 16-byte stops, two bools and the method.
+        assert_eq!(bytes.len(), 2 + 1 + 3 * 16 + 3);
+        match postcard::from_bytes::<LayerKind>(&bytes) {
+            Ok(decoded) => assert_eq!(decoded, kind),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        assert!(
+            postcard::from_bytes::<Kind247>(&bytes).is_err(),
+            "a 0.247.0 build refuses ordinal 15"
+        );
+    }
+
+    #[test]
+    fn a_bad_payload_is_a_decode_error_not_a_repair() {
+        // A first stop at position 2.0; a method byte of 9; one stop only.
+        let mut bad_position = vec![2_u8, 15, 2];
+        bad_position.extend_from_slice(&2.0_f32.to_le_bytes());
+        bad_position.extend_from_slice(&[0; 12]);
+        bad_position.extend_from_slice(&[0; 16]);
+        bad_position.extend_from_slice(&[0, 0, 0]);
+        let mut bad_method = vec![2_u8, 15, 2];
+        bad_method.extend_from_slice(&[0; 32]);
+        bad_method.extend_from_slice(&[0, 0, 9]);
+        let one_stop = {
+            let mut v = vec![2_u8, 15, 1];
+            v.extend_from_slice(&[0; 16]);
+            v.extend_from_slice(&[0, 0, 0]);
+            v
+        };
+        for bytes in [bad_position, bad_method, one_stop, vec![2, 15], vec![2, 15, 2]] {
+            assert!(
+                postcard::from_bytes::<LayerKind>(&bytes).is_err(),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn labels_and_accessors_name_the_right_variant() {
+        let g = Adjustment::GradientMap(map());
+        assert_eq!(g.label(), "Gradient Map");
+        assert_eq!(g.gradient_map(), Some(&map()));
+        assert!(Adjustment::Invert.gradient_map().is_none());
+        assert!(
+            Adjustment::ChannelMixer(aurora_core::ChannelMixerParams::identity())
+                .gradient_map()
+                .is_none()
+        );
     }
 }
