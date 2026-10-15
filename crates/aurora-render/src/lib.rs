@@ -60,10 +60,11 @@ mod schedule;
 mod test_support;
 
 pub use composite::{
-    BLEND_MATH_PASS_COUNT, BlendMode, CURVES_GPU_LUT_CACHE_LEN, CURVES_GPU_LUT_INTERVALS,
-    CURVES_GPU_LUT_LEN, HUE_SATURATION_GPU_PARAMS_LEN, LEVELS_GPU_PARAMS_LEN, TileCompositor,
-    composite_layer_into, composite_tile_cpu, curves_mode_code, transparent_tile,
-    un_premultiply_in_place,
+    BLACK_WHITE_GPU_PARAMS_LEN, BLEND_MATH_PASS_COUNT, BlendMode, COLOR_BALANCE_GPU_PARAMS_LEN,
+    CURVES_GPU_LUT_CACHE_LEN, CURVES_GPU_LUT_INTERVALS, CURVES_GPU_LUT_LEN,
+    EXPOSURE_GPU_PARAMS_LEN, HUE_SATURATION_GPU_PARAMS_LEN, LEVELS_GPU_PARAMS_LEN,
+    PHOTO_FILTER_GPU_PARAMS_LEN, TileCompositor, VIBRANCE_GPU_PARAMS_LEN, composite_layer_into,
+    composite_tile_cpu, curves_mode_code, transparent_tile, un_premultiply_in_place,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use composite::{set_transparent_skip_enabled, transparent_chunks_skipped};

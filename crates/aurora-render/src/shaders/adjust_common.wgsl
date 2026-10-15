@@ -1,5 +1,6 @@
 // Helpers shared by the adjustment passes (Curves 0.159.0; Levels and
-// Hue/Saturation 0.206.0).
+// Hue/Saturation 0.206.0; Vibrance, Exposure, Photo Filter, Black & White
+// and Color Balance 0.242.0).
 //
 // NOT a standalone module: `composite.rs` compiles this file appended to
 // `composite.wgsl` and followed by one adjustment's own file
@@ -23,6 +24,26 @@ fn adjustment_f16(c_in: vec3<f32>) -> vec3<f32> {
     let rg = unpack2x16float(pack2x16float(c.rg));
     let b = unpack2x16float(pack2x16float(vec2<f32>(c.b, 0.0)));
     return vec3<f32>(rg.x, rg.y, b.x);
+}
+
+// The CPU ops' input rule (`|v| if v.is_nan() { 0.0 } else { v.clamp(0.0,
+// 1.0) }`) for the five 0.239.0/0.240.0 adjustments: NaN and negatives read
+// 0, above 1 reads 1. `!(v >= 0.0)` is true for NaN as well as negatives, so
+// no comparison with NaN is relied on for anything else. (`min` after the
+// zero test sees only a non-NaN operand, so WGSL's undefined `min` on NaN
+// is never reached.)
+fn clean_unit(c: vec3<f32>) -> vec3<f32> {
+    var v = c;
+    if (!(v.r >= 0.0)) { v.r = 0.0; }
+    if (!(v.g >= 0.0)) { v.g = 0.0; }
+    if (!(v.b >= 0.0)) { v.b = 0.0; }
+    return min(v, vec3<f32>(1.0));
+}
+
+// Rec.709 luma, `fma(0.2126, r, fma(0.7152, g, 0.0722 * b))` exactly as the
+// CPU's `luma` (Photo Filter and Color Balance).
+fn adjust_luma(c: vec3<f32>) -> f32 {
+    return fma(0.2126, c.r, fma(0.7152, c.g, 0.0722 * c.b));
 }
 
 // `blend_rgb(mode, cb, cs)` for the nineteen modes `aurora-render`'s

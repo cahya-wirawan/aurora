@@ -20179,7 +20179,9 @@ fn pixel_layer_mode_qualifies_for_gpu(
 /// Whether root `id` is an adjustment layer a GPU adjustment pass
 /// (Curves 0.159.0, `aurora_render::TileCompositor::composite_curves_with_opacity`;
 /// Levels and Hue/Saturation 0.206.0, `composite_levels_with_opacity` and
-/// `composite_hue_saturation_with_opacity`) composites exactly as
+/// `composite_hue_saturation_with_opacity`; Vibrance, Exposure, Photo
+/// Filter, Black & White and Color Balance 0.242.0,
+/// `composite_vibrance_with_opacity` and its four siblings) composites exactly as
 /// [`apply_adjustment_layer`] does on the CPU:
 ///
 /// - **blend mode**: `Normal` or one of the eighteen with their own GPU
@@ -20220,16 +20222,17 @@ fn adjustment_layer_qualifies_for_gpu(
                 .is_some()
         }
         // Vibrance, Exposure and Photo Filter (0.239.0), Black & White and
-        // Color Balance (0.240.0) have no GPU pass yet: a visible layer of
-        // these kinds keeps the CPU path.
+        // Color Balance (0.240.0) are per-pixel functions with a GPU pass
+        // each since 0.242.0 (`composite_vibrance_with_opacity` and its four
+        // siblings); neutral or not, they qualify like Levels does.
         Some(
             aurora_doc::Adjustment::Vibrance(_)
             | aurora_doc::Adjustment::Exposure(_)
             | aurora_doc::Adjustment::PhotoFilter(_)
             | aurora_doc::Adjustment::BlackWhite(_)
             | aurora_doc::Adjustment::ColorBalance(_),
-        )
-        | None => false,
+        ) => true,
+        None => false,
     };
     expressible
         && !layers.mask(id).is_some_and(|mask| mask.enabled)
@@ -20581,7 +20584,8 @@ fn create_composite_accumulator(
 /// the unreachable state is unrepresentable rather than defended
 /// against. 0.86.1.
 /// Records one root adjustment layer's GPU pass into `encoder` (Curves
-/// 0.159.0; Levels and Hue/Saturation 0.206.0), in
+/// 0.159.0; Levels and Hue/Saturation 0.206.0; Vibrance, Exposure, Photo
+/// Filter, Black & White and Color Balance 0.242.0), in
 /// [`apply_adjustment_layer`]'s order: the same budget charge, the same
 /// skip for an identity adjustment under `Normal` (an exact passthrough,
 /// so no pass at all), and nothing to adjust while no layer below has
@@ -20668,16 +20672,80 @@ fn begin_gpu_adjustment_pass(
             }
             note_gpu_hue_saturation_dispatch();
         }
-        // No GPU pass for these (0.239.0); the predicate refuses them first.
-        (
-            _,
-            AdjustmentLut::Curves(_)
-            | AdjustmentLut::Vibrance(_)
-            | AdjustmentLut::Exposure(_)
-            | AdjustmentLut::PhotoFilter(_)
-            | AdjustmentLut::BlackWhite(_)
-            | AdjustmentLut::ColorBalance(_),
-        ) => return false,
+        (_, AdjustmentLut::Vibrance(op)) => {
+            if !compositor.composite_vibrance_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_vibrance_dispatch();
+        }
+        (_, AdjustmentLut::Exposure(op)) => {
+            if !compositor.composite_exposure_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_exposure_dispatch();
+        }
+        (_, AdjustmentLut::PhotoFilter(op)) => {
+            if !compositor.composite_photo_filter_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_photo_filter_dispatch();
+        }
+        (_, AdjustmentLut::BlackWhite(op)) => {
+            if !compositor.composite_black_white_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_black_white_dispatch();
+        }
+        (_, AdjustmentLut::ColorBalance(op)) => {
+            if !compositor.composite_color_balance_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_color_balance_dispatch();
+        }
+        // Curves with its own table set is the first arm; a Curves
+        // adjustment paired with another table kind cannot occur
+        // (`AdjustmentLut::of` builds the pair from the same value).
+        (_, AdjustmentLut::Curves(_)) => return false,
     }
     std::mem::swap(current_accumulator, spare_accumulator);
     true
@@ -20699,6 +20767,25 @@ static GPU_LEVELS_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// Test-only count of GPU Hue/Saturation passes recorded (0.206.0).
 #[cfg(test)]
 static GPU_HUE_SATURATION_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only count of GPU Vibrance passes recorded (0.242.0).
+#[cfg(test)]
+static GPU_VIBRANCE_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Exposure passes recorded (0.242.0).
+#[cfg(test)]
+static GPU_EXPOSURE_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Photo Filter passes recorded (0.242.0).
+#[cfg(test)]
+static GPU_PHOTO_FILTER_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Black & White passes recorded (0.242.0).
+#[cfg(test)]
+static GPU_BLACK_WHITE_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Color Balance passes recorded (0.242.0).
+#[cfg(test)]
+static GPU_COLOR_BALANCE_DISPATCHES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
@@ -20725,6 +20812,46 @@ fn note_gpu_hue_saturation_dispatch() {
 #[cfg(not(test))]
 fn note_gpu_hue_saturation_dispatch() {}
 
+#[cfg(test)]
+fn note_gpu_vibrance_dispatch() {
+    GPU_VIBRANCE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_vibrance_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_exposure_dispatch() {
+    GPU_EXPOSURE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_exposure_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_photo_filter_dispatch() {
+    GPU_PHOTO_FILTER_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_photo_filter_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_black_white_dispatch() {
+    GPU_BLACK_WHITE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_black_white_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_color_balance_dispatch() {
+    GPU_COLOR_BALANCE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_color_balance_dispatch() {}
+
 /// Reads [`GPU_CURVES_DISPATCHES`] and resets it, like
 /// [`take_gpu_blend_dispatch_count`].
 #[cfg(test)]
@@ -20742,6 +20869,36 @@ fn take_gpu_levels_dispatch_count() -> u64 {
 #[cfg(test)]
 fn take_gpu_hue_saturation_dispatch_count() -> u64 {
     GPU_HUE_SATURATION_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_VIBRANCE_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_vibrance_dispatch_count() -> u64 {
+    GPU_VIBRANCE_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_EXPOSURE_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_exposure_dispatch_count() -> u64 {
+    GPU_EXPOSURE_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_PHOTO_FILTER_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_photo_filter_dispatch_count() -> u64 {
+    GPU_PHOTO_FILTER_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_BLACK_WHITE_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_black_white_dispatch_count() -> u64 {
+    GPU_BLACK_WHITE_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_COLOR_BALANCE_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_color_balance_dispatch_count() -> u64 {
+    GPU_COLOR_BALANCE_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn accumulator_or_create<'slot>(
@@ -22450,7 +22607,9 @@ fn begin_gpu_composite_tile(
         // hands one back as "nothing to fold", so a GPU pass reaching it
         // would silently drop it. As of 0.159.0 a qualifying Curves layer
         // (`adjustment_layer_qualifies_for_gpu`) is its own GPU pass, and as
-        // of 0.206.0 so is a Levels or Hue/Saturation one; any other
+        // of 0.206.0 so is a Levels or Hue/Saturation one, and of 0.242.0 a
+        // Vibrance, Exposure, Photo Filter, Black & White or Color Balance
+        // one; any other
         // visible adjustment (a mask, `Dissolve`, a mode without GPU
         // math, Hue/Saturation with colour ranges) is still this second,
         // local refusal behind the
@@ -85016,6 +85175,480 @@ mod tests {
             assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
         }
 
+        /// 0.242.0 (was `a_visible_layer_refuses_the_gpu_path_and_a_hidden_one_
+        /// does_not`): these five kinds now have a GPU pass each, so a
+        /// visible root, unmasked layer at `Normal` qualifies, neutral or not,
+        /// and a hidden one never disqualifies. The refusals that remain (a
+        /// mask, `Dissolve`, a mode without GPU math, a group) are pinned in
+        /// `gpu_photo_adjustment_tests`.
+        #[test]
+        fn a_visible_layer_of_the_five_kinds_qualifies_for_the_gpu_path_and_a_hidden_one_is_ignored()
+         {
+            for adjustment in [
+                vibrance(30.0, 0.0),
+                exposure(1.0, 0.0, 1.0),
+                filter([1.0, 0.5, 0.0], 40.0, true),
+                // Neutral ones qualify too, as a neutral Levels does.
+                vibrance(0.0, 0.0),
+                exposure(0.0, 0.0, 1.0),
+                // 0.240.0: Black & White and Color Balance, neutral or not.
+                Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
+                Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+                balance([[10.0, 0.0, -20.0], [0.0; 3], [0.0; 3]], true),
+            ] {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers =
+                    solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+                assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+                let id = add(&mut layers, adjustment);
+                assert!(crate::adjustment_layer_qualifies_for_gpu(&layers, id));
+                assert!(
+                    crate::document_qualifies_for_gpu_compositing(&layers),
+                    "a visible layer of these kinds keeps the document on the GPU"
+                );
+                if let Err(err) = layers.set_visible(id, false) {
+                    unreachable!("{err:?}");
+                }
+                assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+            }
+        }
+
+        #[test]
+        fn inside_a_group_it_adjusts_only_that_groups_own_layers() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("outside", BlendMode::Normal, 1.0, [1.0, 0.0, 0.0, 1.0])],
+            );
+            let group = match layers.add_group("group", None) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let bounds = aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            };
+            let inner = match layers.add_pixel_layer("inner", bounds, Some(group)) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let Some(surface) = layers.surface_id(inner) else {
+                unreachable!("a pixel layer");
+            };
+            fill_solid(&mut store, surface, TILE, [0.2, 0.4, 0.6, 0.5]);
+            let _ = add(&mut layers, params(0.0, -100.0, 0.0), Some(group));
+            // The group's isolated result is grey 0.4 at alpha 0.5, over
+            // the untouched red outside layer: 0.5 * 0.4 + 0.5 * (1, 0, 0).
+            assert_close(first(&layers, &mut store), [0.7, 0.2, 0.2, 1.0], "group");
+        }
+
+        #[test]
+        fn a_visible_masked_layer_refuses_the_gpu_path_and_a_hidden_one_does_not() {
+            // 0.206.0: an unmasked root layer has a GPU pass; a mask refuses.
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = stack(&mut store);
+            assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+            let id = add(&mut layers, params(30.0, 0.0, 0.0), None);
+            assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+            if let Err(err) = layers.add_mask(
+                id,
+                aurora_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 10,
+                },
+            ) {
+                unreachable!("{err:?}");
+            }
+            assert!(!crate::document_qualifies_for_gpu_compositing(&layers));
+            if let Err(err) = layers.set_visible(id, false) {
+                unreachable!("{err:?}");
+            }
+            assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+        }
+    }
+
+    // -- Vibrance, Exposure and Photo Filter in the compositor (0.239.0) --
+    /// 0.239.0: the three adjustments through the CPU fold against
+    /// hand-computed references (formulas in `aurora_core::{vibrance,
+    /// exposure, photo_filter}`). The backdrop (0.2, 0.4, 0.6) is HSL hue
+    /// 210, saturation 0.5, lightness 0.4.
+    #[allow(clippy::float_cmp)]
+    mod vibrance_exposure_photo_filter_adjustments {
+        use super::*;
+        use aurora_doc::{Adjustment, BlendMode};
+
+        const TILE: aurora_tile::TileId = aurora_tile::TileId { x: 0, y: 0 };
+        const TOLERANCE: f32 = 3e-3;
+        const BACKDROP: [f32; 4] = [0.2, 0.4, 0.6, 1.0];
+
+        fn vibrance(v: f32, s: f32) -> Adjustment {
+            match aurora_core::VibranceParams::new(v, s) {
+                Ok(p) => Adjustment::Vibrance(p),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn exposure(e: f32, o: f32, g: f32) -> Adjustment {
+            match aurora_core::ExposureParams::new(e, o, g) {
+                Ok(p) => Adjustment::Exposure(p),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn filter(c: [f32; 3], d: f32, preserve: bool) -> Adjustment {
+            match aurora_core::PhotoFilterParams::new(c, d, preserve) {
+                Ok(p) => Adjustment::PhotoFilter(p),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn black_white(w: [f32; 6], tint: bool, hue: f32, sat: f32) -> Adjustment {
+            match aurora_core::BlackWhiteParams::new(w, tint, hue, sat) {
+                Ok(p) => Adjustment::BlackWhite(p),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn balance(ranges: [[f32; 3]; 3], preserve: bool) -> Adjustment {
+            match aurora_core::ColorBalanceParams::new(ranges, preserve) {
+                Ok(p) => Adjustment::ColorBalance(p),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn add(layers: &mut aurora_doc::LayerTree, a: Adjustment) -> aurora_doc::LayerId {
+            match layers.add_adjustment_layer_at("Adjust 1", a, None, 0) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn composite(
+            layers: &aurora_doc::LayerTree,
+            store: &mut aurora_tile::TileStore,
+        ) -> Vec<[f32; 4]> {
+            let mut budget = crate::CompositeBudget::for_pass(layers);
+            let (texels, _) =
+                crate::composite_roots_into_tile(layers, store, TILE, (0, 0), (0, 0), &mut budget);
+            texels
+                .chunks_exact(4)
+                .filter_map(|texel| match *texel {
+                    [r, g, b, a] => Some([r.to_f32(), g.to_f32(), b.to_f32(), a.to_f32()]),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn first(layers: &aurora_doc::LayerTree, store: &mut aurora_tile::TileStore) -> [f32; 4] {
+            composite(layers, store)
+                .first()
+                .copied()
+                .unwrap_or([f32::NAN; 4])
+        }
+
+        fn assert_close(got: [f32; 4], want: [f32; 4], what: &str) {
+            for (g, w) in got.iter().zip(want) {
+                assert!(
+                    (g - w).abs() <= TOLERANCE,
+                    "{what}: got {got:?}, want {want:?}"
+                );
+            }
+        }
+
+        fn srgb_to_linear(v: f64) -> f64 {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        }
+
+        fn linear_to_srgb(v: f64) -> f64 {
+            if v <= 0.003_130_8 {
+                v * 12.92
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            }
+        }
+
+        #[test]
+        fn neutral_layers_are_an_exact_passthrough() {
+            for neutral in [
+                vibrance(0.0, 0.0),
+                exposure(0.0, 0.0, 1.0),
+                filter([1.0, 1.0, 1.0], 80.0, true),
+            ] {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers = solid_root_stack(
+                    &mut store,
+                    &[
+                        ("bottom", BlendMode::Normal, 1.0, BACKDROP),
+                        ("top", BlendMode::Multiply, 0.5, [0.9, 0.3, 0.7, 0.6]),
+                    ],
+                );
+                let without = composite(&layers, &mut store);
+                let _ = add(&mut layers, neutral);
+                let with = composite(&layers, &mut store);
+                let bits =
+                    |v: &[[f32; 4]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&with), bits(&without));
+            }
+        }
+
+        #[test]
+        fn vibrance_follows_the_closed_form_and_keeps_alpha() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let id = add(&mut layers, vibrance(100.0, 0.0));
+            // s 0.5 -> 0.5 * (1 + 0.5) = 0.75 at the same hue and lightness.
+            assert_close(
+                first(&layers, &mut store),
+                [0.1, 0.4, 0.7, 1.0],
+                "vibrance +100",
+            );
+            // Negative vibrance halves the saturation: s 0.25, C 0.2, m 0.3.
+            let _ = layers.set_adjustment(id, vibrance(-50.0, 0.0));
+            assert_close(
+                first(&layers, &mut store),
+                [0.3, 0.4, 0.5, 1.0],
+                "vibrance -50",
+            );
+            let _ = layers.set_adjustment(id, vibrance(0.0, -100.0));
+            assert_close(first(&layers, &mut store), [0.4, 0.4, 0.4, 1.0], "grey");
+            // Opacity blends back toward the backdrop.
+            let _ = layers.set_adjustment(id, vibrance(100.0, 0.0));
+            if let Err(err) = layers.set_opacity(id, 0.5) {
+                unreachable!("{err:?}");
+            }
+            assert_close(first(&layers, &mut store), [0.15, 0.4, 0.65, 1.0], "50 %");
+        }
+
+        #[test]
+        fn a_translucent_backdrop_keeps_its_alpha() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers = solid_root_stack(
+                &mut store,
+                &[("b", BlendMode::Normal, 1.0, [0.2, 0.4, 0.6, 0.5])],
+            );
+            for adjustment in [
+                vibrance(100.0, 0.0),
+                exposure(1.0, 0.0, 1.0),
+                filter([1.0, 0.5, 0.0], 100.0, false),
+            ] {
+                let id = add(&mut layers, adjustment);
+                let got = first(&layers, &mut store);
+                assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
+                let _ = layers.remove(id);
+            }
+            // And the colour is the one an opaque backdrop gets (vibrance),
+            // in the same form the unadjusted texel is read.
+            let plain = first(&layers, &mut store);
+            let _ = add(&mut layers, vibrance(100.0, 0.0));
+            let got = first(&layers, &mut store);
+            assert!((plain[0] - 0.2).abs() <= 3e-3, "{plain:?}");
+            for (g, w) in got.iter().zip([0.1, 0.4, 0.7]) {
+                assert!((g - w).abs() <= 3e-3, "adjusted at half alpha: {got:?}");
+            }
+        }
+
+        #[test]
+        fn exposure_matches_an_independent_linear_light_model() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let id = add(&mut layers, exposure(1.0, 0.0, 1.0));
+            let model = |ev: f64, off: f64, gamma: f64| {
+                let want = |c: f32| {
+                    let lin = srgb_to_linear(f64::from(c)) * ev.exp2() + off;
+                    let y = lin.signum() * lin.abs().powf(1.0 / gamma);
+                    linear_to_srgb(y.clamp(0.0, 1.0)) as f32
+                };
+                [want(0.2), want(0.4), want(0.6), 1.0]
+            };
+            assert_close(first(&layers, &mut store), model(1.0, 0.0, 1.0), "+1 EV");
+            for (e, o, g) in [
+                (-2.0, 0.0, 1.0),
+                (0.5, 0.1, 1.0),
+                (0.0, -0.05, 1.0),
+                (0.0, 0.0, 2.2),
+                (1.5, 0.05, 0.7),
+            ] {
+                let _ = layers.set_adjustment(id, exposure(e as f32, o as f32, g as f32));
+                assert_close(
+                    first(&layers, &mut store),
+                    model(e, o, g),
+                    &format!("{e} {o} {g}"),
+                );
+            }
+        }
+
+        #[test]
+        fn photo_filter_multiplies_and_optionally_restores_the_luma() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let id = add(&mut layers, filter([1.0, 0.5, 0.0], 100.0, false));
+            assert_close(first(&layers, &mut store), [0.2, 0.2, 0.0, 1.0], "multiply");
+            // Luma 0.37192 -> 0.18556 after the multiply: a shift of 0.18636.
+            let _ = layers.set_adjustment(id, filter([1.0, 0.5, 0.0], 100.0, true));
+            assert_close(
+                first(&layers, &mut store),
+                [0.386_36, 0.386_36, 0.186_36, 1.0],
+                "preserve luminosity",
+            );
+            // Density 50: transmission (1, 0.75, 0.5).
+            let _ = layers.set_adjustment(id, filter([1.0, 0.5, 0.0], 50.0, false));
+            assert_close(
+                first(&layers, &mut store),
+                [0.2, 0.3, 0.3, 1.0],
+                "density 50",
+            );
+        }
+
+        /// 0.240.0: Black & White through the CPU fold. The backdrop
+        /// (0.2, 0.4, 0.6) has max = blue, mid = green, min = red, so its
+        /// grey is `0.2 + 0.2 * w(blues) + 0.2 * w(cyans)` = 0.36 at the
+        /// defaults; alpha stays and opacity blends back toward the backdrop.
+        #[test]
+        fn black_and_white_follows_the_closed_form_and_keeps_alpha() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let defaults = [40.0, 60.0, 40.0, 60.0, 20.0, 80.0];
+            let id = add(&mut layers, black_white(defaults, false, 0.0, 0.0));
+            assert_close(
+                first(&layers, &mut store),
+                [0.36, 0.36, 0.36, 1.0],
+                "defaults",
+            );
+            // Blues 100, Cyans 0: 0.2 + 0.2 * 1.0 + 0.2 * 0.0.
+            let _ = layers.set_adjustment(
+                id,
+                black_white([40.0, 60.0, 40.0, 0.0, 100.0, 80.0], false, 0.0, 0.0),
+            );
+            assert_close(
+                first(&layers, &mut store),
+                [0.4, 0.4, 0.4, 1.0],
+                "blues and cyans",
+            );
+            // Opacity 50 % blends back toward the backdrop.
+            let _ = layers.set_adjustment(id, black_white(defaults, false, 0.0, 0.0));
+            if let Err(err) = layers.set_opacity(id, 0.5) {
+                unreachable!("{err:?}");
+            }
+            assert_close(first(&layers, &mut store), [0.28, 0.38, 0.48, 1.0], "50 %");
+            // Tint 0 % saturation is the plain grey; with saturation the
+            // result has the tint's hue at the grey's lightness.
+            if let Err(err) = layers.set_opacity(id, 1.0) {
+                unreachable!("{err:?}");
+            }
+            let _ = layers.set_adjustment(id, black_white(defaults, true, 0.0, 100.0));
+            // Hue 0, saturation 1, lightness 0.36: chroma 0.72 -> (0.72, 0, 0).
+            assert_close(
+                first(&layers, &mut store),
+                [0.72, 0.0, 0.0, 1.0],
+                "tint red",
+            );
+            // Translucent backdrop: alpha kept, colour as for an opaque one.
+            let (_dir2, mut store2) = real_tile_store();
+            let mut layers2 = solid_root_stack(
+                &mut store2,
+                &[("b", BlendMode::Normal, 1.0, [0.2, 0.4, 0.6, 0.5])],
+            );
+            let _ = add(&mut layers2, black_white(defaults, false, 0.0, 0.0));
+            let got = first(&layers2, &mut store2);
+            assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
+            for c in &got[..3] {
+                assert!((c - 0.36).abs() <= TOLERANCE, "{got:?}");
+            }
+        }
+
+        /// 0.240.0: Color Balance against an independent f64 model, neutral
+        /// as an exact passthrough, alpha kept.
+        #[test]
+        fn color_balance_matches_an_independent_model_and_neutral_is_exact() {
+            let model = |ranges: [[f32; 3]; 3], preserve: bool| {
+                let input = [0.2_f64, 0.4, 0.6];
+                let luma = |c: [f64; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+                let y = luma(input);
+                let w = [(1.0 - y).powi(2), 4.0 * y * (1.0 - y), y * y];
+                let d: [f64; 3] = [0, 1, 2].map(|c| {
+                    ranges
+                        .iter()
+                        .zip(w)
+                        .map(|(row, weight)| {
+                            weight * f64::from(row.get(c).copied().unwrap_or(0.0)) / 100.0 * 0.5
+                        })
+                        .sum()
+                });
+                let restore = if preserve { luma(d) } else { 0.0 };
+                let out = |c: usize| {
+                    let base = input.get(c).copied().unwrap_or(0.0);
+                    let moved = d.get(c).copied().unwrap_or(0.0);
+                    (base + moved - restore).clamp(0.0, 1.0) as f32
+                };
+                [out(0), out(1), out(2), 1.0]
+            };
+            let (_dir, mut store) = real_tile_store();
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let id = add(&mut layers, balance([[0.0; 3]; 3], true));
+            let plain = composite(&layers, &mut store);
+            let _ = layers.remove(id);
+            let without = composite(&layers, &mut store);
+            let bits = |v: &[[f32; 4]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&plain),
+                bits(&without),
+                "neutral is an exact passthrough"
+            );
+            let id = add(&mut layers, balance([[0.0; 3]; 3], true));
+            for (ranges, preserve) in [
+                ([[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [0.0; 3]], false),
+                (
+                    [
+                        [30.0, -20.0, 10.0],
+                        [-40.0, 60.0, -80.0],
+                        [100.0, 5.0, -100.0],
+                    ],
+                    false,
+                ),
+                (
+                    [
+                        [30.0, -20.0, 10.0],
+                        [-40.0, 60.0, -80.0],
+                        [100.0, 5.0, -100.0],
+                    ],
+                    true,
+                ),
+                ([[0.0; 3], [0.0; 3], [-100.0, 0.0, 100.0]], true),
+            ] {
+                let _ = layers.set_adjustment(id, balance(ranges, preserve));
+                assert_close(
+                    first(&layers, &mut store),
+                    model(ranges, preserve),
+                    &format!("{ranges:?} {preserve}"),
+                );
+            }
+            // Translucent backdrop keeps its alpha.
+            let (_dir2, mut store2) = real_tile_store();
+            let mut layers2 = solid_root_stack(
+                &mut store2,
+                &[("b", BlendMode::Normal, 1.0, [0.2, 0.4, 0.6, 0.5])],
+            );
+            let _ = add(
+                &mut layers2,
+                balance([[0.0; 3], [100.0, 0.0, 0.0], [0.0; 3]], false),
+            );
+            let got = first(&layers2, &mut store2);
+            assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
+        }
+
         #[test]
         fn a_visible_layer_refuses_the_gpu_path_and_a_hidden_one_does_not() {
             for adjustment in [
@@ -93878,6 +94511,8 @@ mod clip_tests;
 
 #[cfg(test)]
 mod gpu_adjustment_tests;
+#[cfg(test)]
+mod gpu_photo_adjustment_tests;
 
 #[cfg(test)]
 mod fill_tests;

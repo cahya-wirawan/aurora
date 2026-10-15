@@ -18,8 +18,9 @@
 //!   in `[0, 1]`.
 //! - **A grey pixel (`max == min`) has no hue and no saturation** and is
 //!   unchanged: there is nothing to make more vivid.
-//! - **No GPU port** (a later task): a visible Vibrance layer keeps the
-//!   document on the CPU compositing path.
+//! - **GPU (0.242.0)**: `aurora-render`'s Vibrance pass
+//!   (`shaders/vibrance.wgsl`) ports [`VibranceOp::apply`] line for line
+//!   ([`VibranceOp::packed_for_gpu`] hands it the settings).
 
 use crate::hue_saturation::{adjust_saturation, from_hsl, to_hsl};
 use aurora_core::VibranceParams;
@@ -51,6 +52,9 @@ fn vibrance_saturation(s: f32, amount: f32, hue: f32) -> f32 {
     }
 }
 
+/// How many `f32`s [`VibranceOp::packed_for_gpu`] returns (0.242.0).
+pub const VIBRANCE_PACKED_LEN: usize = 4;
+
 /// A Vibrance adjustment ready to apply to pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VibranceOp {
@@ -68,6 +72,21 @@ impl VibranceOp {
     #[must_use]
     pub fn is_identity(&self) -> bool {
         self.params.is_identity()
+    }
+
+    /// The settings flattened for the GPU Vibrance pass (0.242.0,
+    /// `aurora_render::TileCompositor::composite_vibrance_with_opacity`,
+    /// `shaders/vibrance.wgsl`): `[identity, vibrance, saturation, 0]`,
+    /// `identity` as `0`/`1`, the sliders divided by `100` in `f32` exactly
+    /// as [`Self::apply`] divides them.
+    #[must_use]
+    pub fn packed_for_gpu(&self) -> [f32; VIBRANCE_PACKED_LEN] {
+        [
+            f32::from(u8::from(self.is_identity())),
+            self.params.vibrance() / 100.0,
+            self.params.saturation() / 100.0,
+            0.0,
+        ]
     }
 
     /// The adjusted colour of one straight, encoded RGB pixel.

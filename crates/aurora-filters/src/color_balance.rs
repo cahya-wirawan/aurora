@@ -22,8 +22,10 @@
 //!   ([`ColorBalanceOp::is_identity`]), an exact passthrough even for an
 //!   out-of-gamut value. A non-identity one clamps its input to `[0, 1]`
 //!   (`NaN` reads as `0`) and returns values in `[0, 1]`.
-//! - **No GPU port** (a later task): a visible Color Balance layer keeps
-//!   the document on the CPU compositing path.
+//! - **GPU (0.242.0)**: `aurora-render`'s Color Balance pass
+//!   (`shaders/color_balance.wgsl`) ports [`ColorBalanceOp::apply`] line
+//!   for line ([`ColorBalanceOp::packed_for_gpu`] hands it the flags and
+//!   the nine channel shifts).
 
 use aurora_core::ColorBalanceParams;
 
@@ -45,6 +47,9 @@ pub fn range_weights(y: f32) -> [f32; 3] {
     let inverse = 1.0 - y;
     [inverse * inverse, 4.0 * y * inverse, y * y]
 }
+
+/// How many `f32`s [`ColorBalanceOp::packed_for_gpu`] returns (0.242.0).
+pub const COLOR_BALANCE_PACKED_LEN: usize = 16;
 
 /// A Color Balance adjustment ready to apply to pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,6 +76,35 @@ impl ColorBalanceOp {
     #[must_use]
     pub fn is_identity(&self) -> bool {
         self.params.is_identity()
+    }
+
+    /// The settings flattened for the GPU Color Balance pass (0.242.0,
+    /// `aurora_render::TileCompositor::composite_color_balance_with_opacity`,
+    /// `shaders/color_balance.wgsl`): four `vec4`s, `[identity,
+    /// preserve_luminosity, 0, 0]` then the shadows', midtones' and
+    /// highlights' `[red, green, blue, 0]` channel shifts (`slider / 100 *
+    /// SHIFT_AT_100`, the very `f32`s [`Self::apply`] uses).
+    #[must_use]
+    pub fn packed_for_gpu(&self) -> [f32; COLOR_BALANCE_PACKED_LEN] {
+        let [[sr, sg, sb], [mr, mg, mb], [hr, hg, hb]] = self.shifts;
+        [
+            f32::from(u8::from(self.is_identity())),
+            f32::from(u8::from(self.params.preserve_luminosity())),
+            0.0,
+            0.0,
+            sr,
+            sg,
+            sb,
+            0.0,
+            mr,
+            mg,
+            mb,
+            0.0,
+            hr,
+            hg,
+            hb,
+            0.0,
+        ]
     }
 
     /// The adjusted colour of one straight, encoded RGB pixel.
