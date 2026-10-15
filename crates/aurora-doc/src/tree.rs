@@ -6624,7 +6624,7 @@ mod tests {
         };
         for n in 0..11 {
             let parent = if n % 2 == 0 { Some(group) } else { None };
-            if let Err(err) = tree.add_pixel_layer(&format!("layer {n}"), bounds(), parent) {
+            if let Err(err) = tree.add_pixel_layer(format!("layer {n}"), bounds(), parent) {
                 unreachable!("{err:?}");
             }
         }

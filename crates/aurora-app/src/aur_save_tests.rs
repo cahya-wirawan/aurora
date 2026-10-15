@@ -35,7 +35,9 @@ fn write_bytes(bytes: &'static [u8]) -> impl FnOnce(&mut std::fs::File) -> Resul
 }
 
 fn is_unique_hidden_temp_of(name: &str, target_name: &str) -> bool {
-    name.starts_with(&format!(".{target_name}.")) && name.ends_with(".tmp") && name != target_name
+    name.starts_with(&format!(".{target_name}."))
+        && name.rsplit('.').next() == Some("tmp")
+        && name != target_name
 }
 
 /// G-15: the temp file is a fresh hidden, randomly named file, never the
@@ -57,12 +59,12 @@ fn the_temp_file_is_unique_hidden_verified_by_path_and_gone_afterwards() {
                     .filter(|n| n != "doc.aur")
                     .collect();
                 assert_eq!(during.len(), 1, "round {round}: {during:?}");
-                assert!(
-                    is_unique_hidden_temp_of(&during[0], "doc.aur"),
-                    "{during:?}"
-                );
-                assert_ne!(during[0], "doc.aur.tmp", "the old fixed temp name");
-                seen.borrow_mut().push(during[0].clone());
+                let Some(temp_name) = during.first() else {
+                    unreachable!("one temp");
+                };
+                assert!(is_unique_hidden_temp_of(temp_name, "doc.aur"), "{during:?}");
+                assert_ne!(temp_name, "doc.aur.tmp", "the old fixed temp name");
+                seen.borrow_mut().push(temp_name.clone());
                 file.write_all(b"new contents")?;
                 Ok(())
             },
@@ -85,7 +87,11 @@ fn the_temp_file_is_unique_hidden_verified_by_path_and_gone_afterwards() {
     }
     let seen = seen.into_inner();
     assert_eq!(seen.len(), 2);
-    assert_ne!(seen[0], seen[1], "each save gets its own temp name");
+    assert_ne!(
+        seen.first(),
+        seen.get(1),
+        "each save gets its own temp name"
+    );
 }
 
 /// G-15: the user's own `<name>.tmp` (the name the old code truncated and
