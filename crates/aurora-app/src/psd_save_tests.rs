@@ -578,6 +578,7 @@ fn preflight_refusal_shows_couldnt_save_with_reason() {
 /// replaced), the file reopens with the same kind, and a fractional value
 /// asks first, naming the kind.
 #[test]
+#[allow(clippy::float_cmp)] // an integer held in a float
 fn the_five_new_adjustment_layers_save_and_reopen() {
     use aurora_core::{
         BlackWhiteParams, ColorBalanceParams, ExposureParams, PhotoFilterParams, VibranceParams,

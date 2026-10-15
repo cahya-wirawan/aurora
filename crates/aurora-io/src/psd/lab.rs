@@ -45,6 +45,7 @@ const FROM_XYZ: [[f64; 3]; 3] = [
 const EPSILON: f64 = 216.0 / 24_389.0;
 const KAPPA: f64 = 24_389.0 / 27.0;
 
+#[allow(clippy::many_single_char_names)] // a dot product's own letters
 fn dot([a, b, c]: [f64; 3], [x, y, z]: [f64; 3]) -> f64 {
     a.mul_add(x, b.mul_add(y, c * z))
 }

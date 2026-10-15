@@ -4,6 +4,18 @@
 //! trip through the writer's two verifier passes and Aurora's reader, and
 //! the rounding the report itemises.
 
+#![allow(
+    clippy::float_cmp,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::bool_assert_comparison,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::type_complexity
+)]
+
 use aurora_core::{
     CurvePoint, CurvesParams, HueRange, HueSaturationParams, HueSaturationRangesParams,
     LevelsChannel, LevelsParams, ToneCurve,
@@ -940,7 +952,7 @@ fn photoshops_blocks_survive_read_write_read() {
         (b"blnc", BLNC_FILL),
         (b"blnc", BLNC_CLIP),
     ] {
-        let Some(parsed) = super::read_adjust::parse_block(key, &unhex(hex)) else {
+        let Some(parsed) = super::read_adjust::parse_block(*key, &unhex(hex)) else {
             unreachable!()
         };
         let Ok(first) = super::read_adjust::adjustment(&parsed, false) else {

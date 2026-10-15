@@ -66,7 +66,7 @@
 //! Checked with Aurora's own reader and psd-tools; **never opened in
 //! Photoshop**.
 
-use super::read_adjust::{self, Kind};
+use super::read_adjust;
 use aurora_core::{
     CurvesParams, DEFAULT_HUE_RANGE_EDGES, HUE_RANGE_COUNT, HueRange, HueSaturationParams,
     LevelsChannel, ToneCurve,
@@ -109,7 +109,7 @@ pub(super) struct EncodedAdjustment {
 
 /// Whether `key` is one of the eight blocks this module writes.
 pub(super) fn is_adjustment_key(key: [u8; 4]) -> bool {
-    matches!(&key, b"curv" | b"levl" | b"hue2") || read_adjust::is_key(&key)
+    matches!(&key, b"curv" | b"levl" | b"hue2") || read_adjust::is_key(key)
 }
 
 fn pad4(data: &mut Vec<u8>) {
@@ -153,7 +153,7 @@ pub(super) fn encode_adjustment(
     let (key, mut data) = match adjustment {
         Adjustment::Curves(params) => (*b"curv", encode_curv(params, &mut rounding)?),
         Adjustment::Levels(params) => (*b"levl", encode_levl(params, &mut rounding)),
-        Adjustment::Vibrance(params) => (*b"vibA", encode_vibrance(params, &mut rounding)),
+        Adjustment::Vibrance(params) => (*b"vibA", encode_vibrance(*params, &mut rounding)),
         Adjustment::Exposure(params) => (*b"expA", encode_exposure(params)),
         Adjustment::PhotoFilter(params) => (*b"phfl", encode_photo_filter(params, &mut rounding)),
         Adjustment::BlackWhite(params) => (*b"blwh", encode_black_white(params, &mut rounding)),
@@ -194,7 +194,7 @@ fn read_back(key: [u8; 4], data: &[u8]) -> Result<Adjustment, &'static str> {
                 .map(Adjustment::Levels)
                 .map_err(|_| "its Levels values are not valid once rounded to 8-bit levels")
         }
-        k if read_adjust::is_key(k) => read_back_new(k, data),
+        k if read_adjust::is_key(*k) => read_back_new(*k, data),
         _ => {
             let block = super::parse_hue2(data).map_err(|()| "its settings do not read back")?;
             super::hue_saturation_adjustment(&block, false).map_err(|_| {
@@ -394,7 +394,7 @@ fn encode_hue2(
 // ---------------------------------------------------------------------
 
 /// The adjustment the reader makes of one of the five new blocks.
-fn read_back_new(key: &[u8; 4], data: &[u8]) -> Result<Adjustment, &'static str> {
+fn read_back_new(key: [u8; 4], data: &[u8]) -> Result<Adjustment, &'static str> {
     let Some(parsed) = read_adjust::parse_block(key, data) else {
         return Err("its settings do not read back");
     };
@@ -413,13 +413,13 @@ fn descriptor_start(count: u32) -> Vec<u8> {
     push_u32(&mut data, 16);
     push_u32(&mut data, 1);
     push_u16(&mut data, 0);
-    descriptor_class_and_count(&mut data, b"null", count);
+    descriptor_class_and_count(&mut data, *b"null", count);
     data
 }
 
-fn descriptor_class_and_count(data: &mut Vec<u8>, class: &[u8; 4], count: u32) {
+fn descriptor_class_and_count(data: &mut Vec<u8>, class: [u8; 4], count: u32) {
     push_u32(data, 0);
-    data.extend_from_slice(class);
+    data.extend_from_slice(&class);
     push_u32(data, count);
 }
 
@@ -457,7 +457,7 @@ fn long_of(rounding: &mut Rounding, v: f32) -> i32 {
     w
 }
 
-fn encode_vibrance(params: &aurora_core::VibranceParams, rounding: &mut Rounding) -> Vec<u8> {
+fn encode_vibrance(params: aurora_core::VibranceParams, rounding: &mut Rounding) -> Vec<u8> {
     let items = [
         (&b"vibrance"[..], long_of(rounding, params.vibrance())),
         (&b"Strt"[..], long_of(rounding, params.saturation())),
@@ -539,7 +539,7 @@ fn encode_black_white(params: &aurora_core::BlackWhiteParams, rounding: &mut Rou
     data.extend_from_slice(b"Objc");
     push_u32(&mut data, 1);
     push_u16(&mut data, 0);
-    descriptor_class_and_count(&mut data, b"RGBC", 3);
+    descriptor_class_and_count(&mut data, *b"RGBC", 3);
     for (key, v) in [&b"Rd  "[..], b"Grn ", b"Bl  "].into_iter().zip(rgb) {
         push_double(&mut data, key, v);
     }
@@ -573,17 +573,4 @@ fn encode_color_balance(
     }
     data.push(u8::from(params.preserve_luminosity()));
     data
-}
-
-/// The kind a block key is the file form of, for the verifier's messages.
-#[allow(dead_code)]
-pub(super) fn kind_of_key(key: &[u8; 4]) -> Option<Kind> {
-    Some(match key {
-        b"vibA" => Kind::Vibrance,
-        b"expA" => Kind::Exposure,
-        b"phfl" => Kind::PhotoFilter,
-        b"blwh" => Kind::BlackWhite,
-        b"blnc" => Kind::ColorBalance,
-        _ => return None,
-    })
 }

@@ -179,8 +179,8 @@ fn the_corpus_files_with_the_five_kinds_import_them_and_report_the_error_against
             ) else {
                 unreachable!("three channels");
             };
-            assert!(max <= max_want, "{file} channel {c}: {:?}", with);
-            assert!(mean <= mean_want, "{file} channel {c}: {:?}", with);
+            assert!(max <= max_want, "{file} channel {c}: {with:?}");
+            assert!(mean <= mean_want, "{file} channel {c}: {with:?}");
         }
         // "5 Exposure layers were left out" style lines are gone.
         for line in &report {
@@ -351,6 +351,7 @@ fn each_kind_saved_to_psd_and_reopened_composites_the_same() {
 /// exactly: a Photo Filter colour (Lab hundredths) and a Black & White
 /// tint colour (stored as an RGB colour) come back within a fraction of a
 /// level; everything else must be equal.
+#[allow(clippy::float_cmp)] // integers held in floats compare exactly
 fn close(a: &aurora_doc::Adjustment, b: &aurora_doc::Adjustment) -> bool {
     use aurora_doc::Adjustment as A;
     match (a, b) {

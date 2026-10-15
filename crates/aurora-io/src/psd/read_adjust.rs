@@ -140,8 +140,8 @@ pub(super) enum Parsed {
 }
 
 /// The parser for `key`, or `None` for a key that is not one of the five.
-pub(super) fn parse_block(key: &[u8; 4], data: &[u8]) -> Option<Parsed> {
-    Some(match key {
+pub(super) fn parse_block(key: [u8; 4], data: &[u8]) -> Option<Parsed> {
+    Some(match &key {
         b"vibA" => Parsed::Vibrance(parse_vibrance(data)),
         b"expA" => Parsed::Exposure(parse_exposure(data)),
         b"phfl" => Parsed::PhotoFilter(parse_photo_filter(data)),
@@ -152,8 +152,8 @@ pub(super) fn parse_block(key: &[u8; 4], data: &[u8]) -> Option<Parsed> {
 }
 
 /// Whether `key` is one of the five blocks.
-pub(super) fn is_key(key: &[u8; 4]) -> bool {
-    matches!(key, b"vibA" | b"expA" | b"phfl" | b"blwh" | b"blnc")
+pub(super) fn is_key(key: [u8; 4]) -> bool {
+    matches!(&key, b"vibA" | b"expA" | b"phfl" | b"blwh" | b"blnc")
 }
 
 // ---------------------------------------------------------------------
@@ -358,7 +358,7 @@ pub(super) fn tint_hue_saturation(rgb: [f64; 3]) -> (f32, f32) {
     let [r, g, b] = rgb.map(|c| c.clamp(0.0, 255.0) / 255.0);
     let (max, min) = (r.max(g).max(b), r.min(g).min(b));
     let delta = max - min;
-    let lightness = (max + min) / 2.0;
+    let lightness = f64::midpoint(max, min);
     let denominator = 1.0 - (2.0 * lightness - 1.0).abs();
     if delta <= 0.0 || denominator <= 0.0 {
         return (aurora_core::DEFAULT_TINT_HUE, 0.0);

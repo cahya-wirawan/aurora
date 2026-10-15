@@ -1613,7 +1613,9 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
             // Likewise Hue/Saturation (0.203.0).
             b"hue2" => hue_saturation = Some(parse_hue2(data)),
             // Likewise the five of 0.241.0.
-            k if read_adjust::is_key(k) => other_adjustment = read_adjust::parse_block(k, data),
+            k if read_adjust::is_key(*k) => {
+                other_adjustment = read_adjust::parse_block(*k, data);
+            }
             k if ADJUSTMENT_KEYS.contains(&k) => features.adjustment = true,
             _ => {}
         }

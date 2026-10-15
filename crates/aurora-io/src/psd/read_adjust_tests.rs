@@ -4,12 +4,22 @@
 //! reader, hostile and truncated blocks, the Lab conversion, and the
 //! corpus files themselves (which print `SKIPPED` when absent).
 
-#![allow(clippy::float_cmp)]
+#![allow(
+    clippy::float_cmp,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::bool_assert_comparison,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::type_complexity
+)]
 
 use aurora_doc::{Adjustment, BlendMode};
 
 use super::read_adjust::{
-    self, ColorBalanceBlock, ExposureBlock, Parsed, PhotoColour, VibranceBlock, parse_block,
+    self, ColorBalanceBlock, ExposureBlock, Parsed, PhotoColour, VibranceBlock,
     tint_hue_saturation, tint_rgb,
 };
 use super::test_writer::{TestLayer, TestPsd};
@@ -63,6 +73,10 @@ fn ok<T>(result: Result<T, IoError>) -> T {
         Ok(value) => value,
         Err(err) => unreachable!("expected Ok, got {err:?}"),
     }
+}
+
+fn parse_block(key: &[u8; 4], data: &[u8]) -> Option<Parsed> {
+    read_adjust::parse_block(*key, data)
 }
 
 fn parsed(key: &[u8; 4], hex: &str) -> Parsed {
@@ -794,13 +808,13 @@ fn a_record_with_an_unmodelled_adjustment_key_is_still_left_out() {
 #[test]
 fn every_key_is_recognised_and_only_these_five() {
     for k in KEYS {
-        assert!(read_adjust::is_key(k));
+        assert!(read_adjust::is_key(*k));
         assert!(parse_block(k, &[]).is_some());
     }
     for k in [
         b"curv", b"levl", b"hue2", b"brit", b"mixr", b"hue ", b"nvrt",
     ] {
-        assert!(!read_adjust::is_key(k));
+        assert!(!read_adjust::is_key(*k));
         assert_eq!(parse_block(k, &[]), None);
     }
 }
