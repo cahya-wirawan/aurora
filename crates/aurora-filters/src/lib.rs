@@ -121,6 +121,29 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         time("color balance", &|p| balance.apply(p));
+        // 0.244.0: Invert, Threshold, Posterize, Brightness/Contrast.
+        let invert = super::InvertOp::new();
+        time("invert", &|p| invert.apply(p));
+        let threshold = match aurora_core::ThresholdParams::new(128) {
+            Ok(p) => super::ThresholdOp::new(&p),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        time("threshold", &|p| threshold.apply(p));
+        let posterize = match aurora_core::PosterizeParams::new(4) {
+            Ok(p) => super::PosterizeOp::new(&p),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        time("posterize", &|p| posterize.apply(p));
+        for (b, c, legacy, name) in [
+            (20, 57, true, "brightness/contrast, legacy"),
+            (23, 70, false, "brightness/contrast, default"),
+        ] {
+            let op = match aurora_core::BrightnessContrastParams::new(b, c, legacy) {
+                Ok(p) => super::BrightnessContrastOp::new(&p),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            time(name, &|p| op.apply(p));
+        }
     }
 
     #[test]

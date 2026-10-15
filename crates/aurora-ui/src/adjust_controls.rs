@@ -1245,6 +1245,9 @@ mod tests {
         let f = filter([1.0, 1.0, 1.0], 25.0, true);
         let bw = Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default());
         let cb = Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity());
+        let th = Adjustment::Threshold(aurora_core::ThresholdParams::default());
+        let po = Adjustment::Posterize(aurora_core::PosterizeParams::default());
+        let bc = Adjustment::BrightnessContrast(aurora_core::BrightnessContrastParams::identity());
         for s in S::ALL {
             let base = match s.kind() {
                 AdjustKind::Vibrance => &v,
@@ -1252,8 +1255,16 @@ mod tests {
                 AdjustKind::PhotoFilter => &f,
                 AdjustKind::BlackWhite => &bw,
                 AdjustKind::ColorBalance => &cb,
+                AdjustKind::Invert => continue,
+                AdjustKind::Threshold => &th,
+                AdjustKind::Posterize => &po,
+                AdjustKind::BrightnessContrast => &bc,
             };
-            let (min, max) = s.range();
+            let (mut min, max) = s.range();
+            if s == S::Contrast {
+                // The slider spans both modes; the default mode stops at -50.
+                min = f64::from(aurora_core::CONTRAST_MIN);
+            }
             let lo = s
                 .with_value(base, 0, min - 50.0)
                 .and_then(|a| s.value_of(&a, 0));
@@ -1621,5 +1632,128 @@ mod tests {
         for (i, k) in AdjustKind::ALL.into_iter().enumerate() {
             assert_eq!(k.index(), i);
         }
+    }
+
+    /// 0.244.0: the four new kinds' groups, sliders and snapping.
+    #[test]
+    fn threshold_posterize_brightness_contrast_and_invert_editors_follow_the_document() {
+        let scales = scales();
+        let mut ws = crate::build_workspace(&scales);
+        let controls = match insert_adjust_controls(&mut ws.tree, ws.properties.root, &scales) {
+            Ok(c) => c,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut layers = LayerTree::new();
+        let t = add(
+            &mut layers,
+            "T",
+            Adjustment::Threshold(match aurora_core::ThresholdParams::new(172) {
+                Ok(p) => p,
+                Err(err) => unreachable!("{err:?}"),
+            }),
+        );
+        let p = add(
+            &mut layers,
+            "P",
+            Adjustment::Posterize(match aurora_core::PosterizeParams::new(13) {
+                Ok(p) => p,
+                Err(err) => unreachable!("{err:?}"),
+            }),
+        );
+        let b = add(
+            &mut layers,
+            "B",
+            Adjustment::BrightnessContrast(
+                match aurora_core::BrightnessContrastParams::new(-95, -50, false) {
+                    Ok(p) => p,
+                    Err(err) => unreachable!("{err:?}"),
+                },
+            ),
+        );
+        let i = add(&mut layers, "I", Adjustment::Invert);
+        let at = |ws: &crate::Workspace, s: S| slider_state(&ws.tree, controls.sliders[s.index()]);
+        let _ = show(&mut ws, controls, &layers, Some(t));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::Threshold)
+        );
+        assert_eq!(at(&ws, S::ThresholdLevel), (172.0, false));
+        assert!(at(&ws, S::PosterizeLevels).1 && at(&ws, S::Brightness).1);
+        let _ = show(&mut ws, controls, &layers, Some(p));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::Posterize)
+        );
+        assert_eq!(at(&ws, S::PosterizeLevels), (13.0, false));
+        assert!(at(&ws, S::ThresholdLevel).1);
+        let _ = show(&mut ws, controls, &layers, Some(b));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::BrightnessContrast)
+        );
+        assert_eq!(at(&ws, S::Brightness), (-95.0, false));
+        assert_eq!(at(&ws, S::Contrast), (-50.0, false));
+        assert!(!crate::adjust_legacy_checked(&ws.tree, controls));
+        match ws.tree.payload(controls.readouts[S::Brightness.index()]) {
+            Some(WidgetKind::Label(label)) => assert_eq!(label.text, "Brightness: -95"),
+            other => unreachable!("{other:?}"),
+        }
+        let _ = show(&mut ws, controls, &layers, Some(i));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::Invert)
+        );
+        assert!(at(&ws, S::Brightness).1 && at(&ws, S::ThresholdLevel).1);
+        // `with_value` snaps, clamps to the slider and to the mode's range.
+        let adj = |id| layers.adjustment(id).cloned().unwrap_or(Adjustment::Invert);
+        assert_eq!(
+            S::ThresholdLevel
+                .with_value(&adj(t), 0, 300.0)
+                .and_then(|a| a.threshold())
+                .map(|p| p.level()),
+            Some(255)
+        );
+        assert_eq!(
+            S::ThresholdLevel
+                .with_value(&adj(t), 0, -4.0)
+                .and_then(|a| a.threshold())
+                .map(|p| p.level()),
+            Some(1)
+        );
+        assert_eq!(
+            S::PosterizeLevels
+                .with_value(&adj(p), 0, 0.4)
+                .and_then(|a| a.posterize())
+                .map(|p| p.levels()),
+            Some(2)
+        );
+        assert!(
+            S::ThresholdLevel.with_value(&adj(p), 0, 5.0).is_none(),
+            "another kind"
+        );
+        assert!(S::Contrast.with_value(&adj(b), 0, f64::NAN).is_none());
+        let legacy = Adjustment::BrightnessContrast(
+            match aurora_core::BrightnessContrastParams::new(0, 0, true) {
+                Ok(p) => p,
+                Err(err) => unreachable!("{err:?}"),
+            },
+        );
+        let got = |slider: S, value| {
+            slider
+                .with_value(&legacy, 0, value)
+                .and_then(|a| a.brightness_contrast())
+                .map(|p| (p.brightness(), p.contrast()))
+        };
+        assert_eq!(got(S::Brightness, 150.0), Some((100, 0)));
+        assert_eq!(got(S::Contrast, -100.0), Some((0, -100)));
+        let default =
+            Adjustment::BrightnessContrast(aurora_core::BrightnessContrastParams::identity());
+        assert_eq!(
+            S::Contrast
+                .with_value(&default, 0, -100.0)
+                .and_then(|a| a.brightness_contrast())
+                .map(|p| p.contrast()),
+            Some(-50)
+        );
     }
 }
