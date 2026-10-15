@@ -147,6 +147,23 @@ fn every_static_item_is_also_in_the_command_palette() {
     }
 }
 
+/// 0.239.0: Vibrance, Exposure and Photo Filter are in the in-window
+/// Layer menu and in the macOS menu's cross-check list.
+#[test]
+fn the_new_adjustment_layers_are_in_the_layer_menu_and_the_native_list() {
+    let menus = menus_for(&context());
+    let layer = menu(&menus, "Layer");
+    for (id, label) in [
+        (crate::COMMAND_LAYER_NEW_VIBRANCE, "New Vibrance Layer"),
+        (crate::COMMAND_LAYER_NEW_EXPOSURE, "New Exposure Layer"),
+        (crate::COMMAND_LAYER_NEW_PHOTO_FILTER, "New Photo Filter Layer"),
+    ] {
+        assert_eq!(entry(layer, id).0, label);
+        assert!(entry(layer, id).2, "{id} is enabled");
+        assert!(menu_model::NATIVE_MENU_COMMANDS.contains(&id), "{id} native");
+    }
+}
+
 #[test]
 fn the_native_menu_ids_are_a_subset_of_the_models() {
     let ids = all_commands(&menus_for(&context()));

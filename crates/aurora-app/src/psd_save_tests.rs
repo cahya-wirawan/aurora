@@ -572,6 +572,47 @@ fn preflight_refusal_shows_couldnt_save_with_reason() {
     assert!(psd_save_failure_message("big.psd", &failure).contains("use .psb"));
 }
 
+/// 0.239.0: Vibrance, Exposure and Photo Filter layers have no PSD block
+/// yet: the whole app flow refuses (no dialog to "Save Anyway", no file, no
+/// temp left), naming the layer and the way out, and the same document
+/// saves once the layer is gone.
+#[test]
+fn vibrance_exposure_and_photo_filter_layers_refuse_the_psd_save_by_name() {
+    let cases = [
+        (
+            aurora_doc::Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
+            "Vibrance",
+        ),
+        (
+            aurora_doc::Adjustment::Exposure(aurora_core::ExposureParams::identity()),
+            "Exposure",
+        ),
+        (
+            aurora_doc::Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+            "Photo Filter",
+        ),
+    ];
+    for (adjustment, kind) in cases {
+        let mut doc = Doc::new();
+        let id = ok(doc.tree.add_adjustment_layer_at("My layer", adjustment, None, 0));
+        let path = doc.path("nope.psd");
+        let Err(failure) = doc.save(&path) else {
+            unreachable!("{kind} must be refused")
+        };
+        let message = psd_save_failure_message("nope.psd", &failure);
+        assert!(
+            message.contains(&format!("the {kind} layer \u{201c}My layer\u{201d} can't be saved to .psd"))
+                && message.contains("Aurora can't write")
+                && message.contains("save as .aur"),
+            "{message}"
+        );
+        assert!(!path.exists());
+        assert!(doc.listing().is_empty(), "no temp file is left: {:?}", doc.listing());
+        ok(doc.tree.remove(id));
+        assert!(matches!(ok(doc.save(&path)), PsdSaveStep::Saved));
+    }
+}
+
 #[test]
 fn psb_refused_until_r5() {
     let mut doc = Doc::new();
