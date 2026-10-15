@@ -28,6 +28,26 @@
 //!   is stored signed as Photoshop does (a hue above 180 is written minus
 //!   360); the reader folds it back into 0..360.
 //!
+//! * `vibA` (0.241.0): a descriptor block (`u32` version 16, then the
+//!   action descriptor), the keys `vibrance` and `Strt`, both `long`,
+//!   each left out at `0` as Photoshop leaves them out
+//!   (`layers/vibrance.psd`'s neutral block is an empty descriptor).
+//! * `expA`: `u16` version `1`, three `f32` (exposure, offset, gamma),
+//!   padded to 16 bytes. Exact: Aurora's values are `f32` already.
+//! * `phfl`: version `2`, colour space `7` (Lab), `(L, a, b) * 100` as
+//!   `u16, i16, i16` and a zero, the density as a `u32` percent, the
+//!   preserve-luminosity byte (the layout of `layers/photo-filter.psd`).
+//!   The sRGB colour is converted to Lab with D50 white
+//!   ([`super::lab`]).
+//! * `blwh`: a descriptor block with the ten items Photoshop writes
+//!   (`layers/black-and-white.psd`): six `long` sliders, `useTint`, the
+//!   `tintColor` `RGBC` object of three `doub` 0..255, `bwPresetKind`
+//!   (written as the observed `1`) and an empty `blackAndWhitePresetFileName`.
+//!   The tint colour is the HSL colour of the tint hue and saturation at
+//!   lightness 0.5, as `doub` (Photoshop itself stores fractions there:
+//!   `225.00045776367188`).
+//! * `blnc`: nine `i16`, the preserve-luminosity byte and a pad byte.
+//!
 //! Aurora's model is finer than the file: curve points are 8-bit levels in
 //! the file, Levels values are 8-bit levels with a gamma in hundredths,
 //! Hue/Saturation values are whole numbers. Each value is rounded to
@@ -46,6 +66,7 @@
 //! Checked with Aurora's own reader and psd-tools; **never opened in
 //! Photoshop**.
 
+use super::read_adjust::{self, Kind};
 use aurora_core::{
     CurvesParams, DEFAULT_HUE_RANGE_EDGES, HUE_RANGE_COUNT, HueRange, HueSaturationParams,
     LevelsChannel, ToneCurve,
@@ -86,9 +107,9 @@ pub(super) struct EncodedAdjustment {
     pub rounding: Rounding,
 }
 
-/// Whether `key` is one of the three blocks this module writes.
+/// Whether `key` is one of the eight blocks this module writes.
 pub(super) fn is_adjustment_key(key: [u8; 4]) -> bool {
-    matches!(&key, b"curv" | b"levl" | b"hue2")
+    matches!(&key, b"curv" | b"levl" | b"hue2") || read_adjust::is_key(&key)
 }
 
 fn pad4(data: &mut Vec<u8>) {
@@ -120,23 +141,6 @@ fn whole(value: f32) -> i16 {
     value.round() as i16
 }
 
-/// Why a Vibrance layer cannot be saved to PSD (0.239.0).
-const NOT_WRITTEN_VIBRANCE: &str =
-    "Aurora can't write Vibrance layers to .psd yet; save as .aur, or merge or remove the layer";
-/// Why an Exposure layer cannot be saved to PSD (0.239.0).
-const NOT_WRITTEN_EXPOSURE: &str =
-    "Aurora can't write Exposure layers to .psd yet; save as .aur, or merge or remove the layer";
-/// Why a Photo Filter layer cannot be saved to PSD (0.239.0).
-const NOT_WRITTEN_PHOTO_FILTER: &str = "Aurora can't write Photo Filter layers to .psd yet; save \
-     as .aur, or merge or remove the layer";
-
-/// Why a Black & White layer cannot be saved to PSD (0.240.0).
-const NOT_WRITTEN_BLACK_WHITE: &str = "Aurora can't write Black & White layers to .psd yet; save \
-     as .aur, or merge or remove the layer";
-/// Why a Color Balance layer cannot be saved to PSD (0.240.0).
-const NOT_WRITTEN_COLOR_BALANCE: &str = "Aurora can't write Color Balance layers to .psd yet; \
-     save as .aur, or merge or remove the layer";
-
 /// Encodes `adjustment` as its tagged block.
 ///
 /// # Errors
@@ -149,16 +153,11 @@ pub(super) fn encode_adjustment(
     let (key, mut data) = match adjustment {
         Adjustment::Curves(params) => (*b"curv", encode_curv(params, &mut rounding)?),
         Adjustment::Levels(params) => (*b"levl", encode_levl(params, &mut rounding)),
-        // Vibrance, Exposure and Photo Filter (0.239.0): the file layouts
-        // (`vibA`, `expA`, `phfl`) are not written yet. The save is refused
-        // by name rather than dropping or flattening the layer.
-        Adjustment::Vibrance(_) => return Err(NOT_WRITTEN_VIBRANCE),
-        Adjustment::Exposure(_) => return Err(NOT_WRITTEN_EXPOSURE),
-        Adjustment::PhotoFilter(_) => return Err(NOT_WRITTEN_PHOTO_FILTER),
-        // Black & White (`blwh`) and Color Balance (`blnc`) likewise
-        // (0.240.0): refused by name, not written.
-        Adjustment::BlackWhite(_) => return Err(NOT_WRITTEN_BLACK_WHITE),
-        Adjustment::ColorBalance(_) => return Err(NOT_WRITTEN_COLOR_BALANCE),
+        Adjustment::Vibrance(params) => (*b"vibA", encode_vibrance(params, &mut rounding)),
+        Adjustment::Exposure(params) => (*b"expA", encode_exposure(params)),
+        Adjustment::PhotoFilter(params) => (*b"phfl", encode_photo_filter(params, &mut rounding)),
+        Adjustment::BlackWhite(params) => (*b"blwh", encode_black_white(params, &mut rounding)),
+        Adjustment::ColorBalance(params) => (*b"blnc", encode_color_balance(params, &mut rounding)),
         Adjustment::HueSaturation(_) | Adjustment::HueSaturationRanges(_) => {
             let Some(params) = adjustment.hue_saturation() else {
                 return Err("its Hue/Saturation settings are unreadable");
@@ -195,6 +194,7 @@ fn read_back(key: [u8; 4], data: &[u8]) -> Result<Adjustment, &'static str> {
                 .map(Adjustment::Levels)
                 .map_err(|_| "its Levels values are not valid once rounded to 8-bit levels")
         }
+        k if read_adjust::is_key(k) => read_back_new(k, data),
         _ => {
             let block = super::parse_hue2(data).map_err(|()| "its settings do not read back")?;
             super::hue_saturation_adjustment(&block, false).map_err(|_| {
@@ -387,4 +387,207 @@ fn encode_hue2(
         push_i16(&mut data, tracked(rounding, range.lightness()));
     }
     data
+}
+
+// ---------------------------------------------------------------------
+// Vibrance, Exposure, Photo Filter, Black & White, Color Balance (0.241.0)
+// ---------------------------------------------------------------------
+
+/// The adjustment the reader makes of one of the five new blocks.
+fn read_back_new(key: &[u8; 4], data: &[u8]) -> Result<Adjustment, &'static str> {
+    let Some(parsed) = read_adjust::parse_block(key, data) else {
+        return Err("its settings do not read back");
+    };
+    read_adjust::adjustment(&parsed, false)
+        .map_err(|_| "its values are not valid once rounded to what the file holds")
+}
+
+fn push_u32(data: &mut Vec<u8>, v: u32) {
+    data.extend_from_slice(&v.to_be_bytes());
+}
+
+/// The start of an action descriptor block: version 16, an empty (single
+/// NUL) name, class `null`, and `count` items.
+fn descriptor_start(count: u32) -> Vec<u8> {
+    let mut data = Vec::new();
+    push_u32(&mut data, 16);
+    push_u32(&mut data, 1);
+    push_u16(&mut data, 0);
+    descriptor_class_and_count(&mut data, b"null", count);
+    data
+}
+
+fn descriptor_class_and_count(data: &mut Vec<u8>, class: &[u8; 4], count: u32) {
+    push_u32(data, 0);
+    data.extend_from_slice(class);
+    push_u32(data, count);
+}
+
+/// A key: four characters are written as length 0 plus the four, longer
+/// ones with their length (Photoshop's own convention).
+fn push_key(data: &mut Vec<u8>, key: &[u8]) {
+    if key.len() == 4 {
+        push_u32(data, 0);
+    } else {
+        push_u32(data, u32::try_from(key.len()).unwrap_or(0));
+    }
+    data.extend_from_slice(key);
+}
+
+fn push_long(data: &mut Vec<u8>, key: &[u8], v: i32) {
+    push_key(data, key);
+    data.extend_from_slice(b"long");
+    data.extend_from_slice(&v.to_be_bytes());
+}
+
+fn push_double(data: &mut Vec<u8>, key: &[u8], v: f64) {
+    push_key(data, key);
+    data.extend_from_slice(b"doub");
+    data.extend_from_slice(&v.to_be_bytes());
+}
+
+/// A whole number of `v` as the `i32` a `long` holds, noting a change.
+#[allow(clippy::cast_possible_truncation)] // validated values are within a few hundred
+fn long_of(rounding: &mut Rounding, v: f32) -> i32 {
+    let w = v.round() as i32;
+    #[allow(clippy::cast_precision_loss)] // |w| is tiny
+    if (w as f32).to_bits() != v.to_bits() {
+        rounding.rounded = true;
+    }
+    w
+}
+
+fn encode_vibrance(params: &aurora_core::VibranceParams, rounding: &mut Rounding) -> Vec<u8> {
+    let items = [
+        (&b"vibrance"[..], long_of(rounding, params.vibrance())),
+        (&b"Strt"[..], long_of(rounding, params.saturation())),
+    ];
+    let written: Vec<_> = items.iter().filter(|(_, v)| *v != 0).collect();
+    let mut data = descriptor_start(u32::try_from(written.len()).unwrap_or(0));
+    for (key, value) in written {
+        push_long(&mut data, key, *value);
+    }
+    data
+}
+
+fn encode_exposure(params: &aurora_core::ExposureParams) -> Vec<u8> {
+    let mut data = Vec::with_capacity(16);
+    push_u16(&mut data, 1);
+    for v in [params.exposure(), params.offset(), params.gamma()] {
+        data.extend_from_slice(&v.to_be_bytes());
+    }
+    data
+}
+
+fn encode_photo_filter(params: &aurora_core::PhotoFilterParams, rounding: &mut Rounding) -> Vec<u8> {
+    let (l, a, b) = read_adjust::photo_filter_components(params.colour());
+    let mut data = Vec::with_capacity(20);
+    push_u16(&mut data, 2);
+    push_u16(&mut data, 7);
+    push_u16(&mut data, l);
+    push_i16(&mut data, a);
+    push_i16(&mut data, b);
+    push_u16(&mut data, 0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // 1..=100
+    let density = params.density().round().clamp(1.0, 100.0) as u32;
+    #[allow(clippy::cast_precision_loss)] // 1..=100
+    if (density as f32).to_bits() != params.density().to_bits() {
+        rounding.rounded = true;
+    }
+    push_u32(&mut data, density);
+    data.push(u8::from(params.preserve_luminosity()));
+    // The colour is Lab in hundredths: rounded when the file's colour is
+    // more than a third of an 8-bit level from the layer's.
+    let back = super::lab::lab_to_srgb(
+        f64::from(l) / 100.0,
+        f64::from(a) / 100.0,
+        f64::from(b) / 100.0,
+    );
+    if back
+        .iter()
+        .zip(params.colour())
+        .any(|(&got, want)| (got - want).abs() > COLOUR_TOLERANCE)
+    {
+        rounding.rounded = true;
+    }
+    data
+}
+
+/// A colour that returns within this of its value counts as unchanged
+/// (a third of an 8-bit level; Lab hundredths move it by about `1e-4`).
+const COLOUR_TOLERANCE: f32 = 1.0 / 765.0;
+
+/// A tint hue and saturation that return within this are unchanged.
+const TINT_TOLERANCE: f32 = 0.01;
+
+fn encode_black_white(params: &aurora_core::BlackWhiteParams, rounding: &mut Rounding) -> Vec<u8> {
+    let mut data = descriptor_start(10);
+    for (key, weight) in [
+        &b"Rd  "[..],
+        b"Yllw",
+        b"Grn ",
+        b"Cyn ",
+        b"Bl  ",
+        b"Mgnt",
+    ]
+    .into_iter()
+    .zip(params.weights())
+    {
+        push_long(&mut data, key, long_of(rounding, weight));
+    }
+    push_key(&mut data, b"useTint");
+    data.extend_from_slice(b"bool");
+    data.push(u8::from(params.tint()));
+    let rgb = read_adjust::tint_rgb(params.tint_hue(), params.tint_saturation());
+    push_key(&mut data, b"tintColor");
+    data.extend_from_slice(b"Objc");
+    push_u32(&mut data, 1);
+    push_u16(&mut data, 0);
+    descriptor_class_and_count(&mut data, b"RGBC", 3);
+    for (key, v) in [&b"Rd  "[..], b"Grn ", b"Bl  "].into_iter().zip(rgb) {
+        push_double(&mut data, key, v);
+    }
+    push_long(&mut data, b"bwPresetKind", 1);
+    push_key(&mut data, b"blackAndWhitePresetFileName");
+    data.extend_from_slice(b"TEXT");
+    push_u32(&mut data, 1);
+    push_u16(&mut data, 0);
+    let (hue, saturation) = read_adjust::tint_hue_saturation(rgb);
+    let hue_matters = params.tint_saturation() > 0.0;
+    if (saturation - params.tint_saturation()).abs() > TINT_TOLERANCE
+        || (hue_matters && (hue - params.tint_hue()).abs() > TINT_TOLERANCE)
+    {
+        rounding.rounded = true;
+    }
+    data
+}
+
+fn encode_color_balance(
+    params: &aurora_core::ColorBalanceParams,
+    rounding: &mut Rounding,
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(20);
+    for v in params.ranges().iter().flatten() {
+        #[allow(clippy::cast_possible_truncation)] // -100..=100
+        let w = v.round() as i16;
+        if f32::from(w).to_bits() != v.to_bits() {
+            rounding.rounded = true;
+        }
+        push_i16(&mut data, w);
+    }
+    data.push(u8::from(params.preserve_luminosity()));
+    data
+}
+
+/// The kind a block key is the file form of, for the verifier's messages.
+#[allow(dead_code)]
+pub(super) fn kind_of_key(key: &[u8; 4]) -> Option<Kind> {
+    Some(match key {
+        b"vibA" => Kind::Vibrance,
+        b"expA" => Kind::Exposure,
+        b"phfl" => Kind::PhotoFilter,
+        b"blwh" => Kind::BlackWhite,
+        b"blnc" => Kind::ColorBalance,
+        _ => return None,
+    })
 }

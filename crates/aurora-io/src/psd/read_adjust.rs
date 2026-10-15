@@ -44,7 +44,7 @@
 //! descriptor is an `Err`, never a panic, and nothing allocates more than
 //! the descriptor parser's bounded, byte-checked amount.
 
-use super::descriptor::{self, Descriptor, ItemBudget, Value};
+use super::descriptor::{self, Descriptor, ItemBudget};
 use super::{Note, Reader};
 use aurora_doc::Adjustment;
 
@@ -375,6 +375,26 @@ pub(super) fn tint_hue_saturation(rgb: [f64; 3]) -> (f32, f32) {
     } * 60.0;
     #[allow(clippy::cast_possible_truncation)] // 0..=360 and 0..=100
     (hue as f32, (delta / denominator * 100.0) as f32)
+}
+
+/// The `0..=255` RGB colour whose HSL hue and saturation are `hue` degrees
+/// and `saturation` percent, at lightness 0.5 (where the HSL saturation is
+/// the chroma): the inverse of [`tint_hue_saturation`], written as the
+/// Black & White `tintColor`.
+pub(super) fn tint_rgb(hue: f32, saturation: f32) -> [f64; 3] {
+    let chroma = f64::from(saturation.clamp(0.0, 100.0)) / 100.0;
+    let sector = f64::from(hue).rem_euclid(360.0) / 60.0;
+    let second = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match sector {
+        s if s < 1.0 => (chroma, second, 0.0),
+        s if s < 2.0 => (second, chroma, 0.0),
+        s if s < 3.0 => (0.0, chroma, second),
+        s if s < 4.0 => (0.0, second, chroma),
+        s if s < 5.0 => (second, 0.0, chroma),
+        _ => (chroma, 0.0, second),
+    };
+    let offset = 0.5 - chroma / 2.0;
+    [r, g, b].map(|c| (c + offset).clamp(0.0, 1.0) * 255.0)
 }
 
 /// A parsed block as Aurora's Black & White: sliders as stored (the same
