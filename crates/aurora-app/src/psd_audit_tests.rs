@@ -14,7 +14,8 @@
 // Environment: `AURORA_AUDIT_MAX_MB` (file size cap, default 64),
 // `AURORA_AUDIT_SECS` (per-file time cap, default 120), `AURORA_AUDIT_DIRS`
 // (extra directories, `:`-separated), `AURORA_AUDIT_OUT` (a TSV copy of the
-// table). A file that panics, fails to open or runs over its cap is printed
+// table), `AURORA_AUDIT_DUMP` (a directory for raw 8-bit images of both
+// sides, for a script to diff). A file that panics, fails to open or runs over its cap is printed
 // and the audit continues.
 
 /// One audited file's result.
@@ -27,6 +28,9 @@ struct AuditRow {
     report_lines: usize,
     first_report: String,
     millis: u128,
+    /// False when the file holds no real merged image: the numbers then
+    /// compare Aurora with a placeholder and say nothing about fidelity.
+    real_merged: bool,
 }
 
 impl AuditRow {
@@ -72,6 +76,71 @@ fn audit_diff(image: &aurora_io::Image, merged: &aurora_io::Image) -> Option<([f
     Some((sum.map(|s| s / n), max))
 }
 
+/// Whether the file says its merged image is real (image resource 1057,
+/// "version info", has-real-merged-data byte). A file saved without
+/// "Maximize Compatibility" stores a placeholder there, so it is no ground
+/// truth. `true` when the resource is absent (Photoshop's default).
+fn audit_has_real_merged_data(bytes: &[u8]) -> bool {
+    let be32 = |at: usize| -> Option<usize> {
+        let b = bytes.get(at..at.checked_add(4)?)?;
+        Some(u32::from_be_bytes([*b.first()?, *b.get(1)?, *b.get(2)?, *b.get(3)?]) as usize)
+    };
+    // Header 26 bytes, then the colour mode data section, then resources.
+    let Some(mode_len) = be32(26) else { return true };
+    let Some(res_at) = 30_usize.checked_add(mode_len) else { return true };
+    let Some(res_len) = be32(res_at) else { return true };
+    let mut at = res_at + 4;
+    let end = at.saturating_add(res_len).min(bytes.len());
+    while at + 8 <= end {
+        if bytes.get(at..at + 4) != Some(b"8BIM") {
+            break;
+        }
+        let id = match bytes.get(at + 4..at + 6) {
+            Some([hi, lo]) => u16::from_be_bytes([*hi, *lo]),
+            _ => 0,
+        };
+        let name_len = bytes.get(at + 6).map_or(0, |b| usize::from(*b));
+        let data_at = at + 6 + ((1 + name_len + 1) & !1);
+        let Some(len) = be32(data_at) else { break };
+        let body = data_at + 4;
+        if id == 1057 {
+            return bytes.get(body + 4).is_none_or(|b| *b != 0);
+        }
+        at = body.saturating_add((len + 1) & !1);
+    }
+    true
+}
+
+/// `AURORA_AUDIT_DUMP=dir`: writes `<file>.aurora.rgb` and
+/// `<file>.merged.rgb` (8-bit RGB, a transparent pixel over white; the
+/// size is in `<file>.size`) for a script to diff. Best effort.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn audit_dump(dir: &str, name: &str, image: &aurora_io::Image, merged: &aurora_io::Image) {
+    let flat = |img: &aurora_io::Image| {
+        let mut out = Vec::new();
+        for y in 0..img.height() {
+            for x in 0..img.width() {
+                let [r, g, b, a] = image_pixel(img, x, y);
+                for c in [r, g, b] {
+                    let v = f64::from(c) * f64::from(a) + (1.0 - f64::from(a));
+                    out.push((v * 255.0).round().clamp(0.0, 255.0) as u8);
+                }
+            }
+        }
+        out
+    };
+    let stem = std::path::Path::new(dir).join(name.replace('/', "__"));
+    let _ = std::fs::create_dir_all(dir);
+    let with = |ext: &str| {
+        let mut s = stem.clone().into_os_string();
+        s.push(ext);
+        std::path::PathBuf::from(s)
+    };
+    let _ = std::fs::write(with(".aurora.rgb"), flat(image));
+    let _ = std::fs::write(with(".merged.rgb"), flat(merged));
+    let _ = std::fs::write(with(".size"), format!("{} {}", image.width(), image.height()));
+}
+
 /// Opens, composites and measures one file (no caps: the caller applies
 /// them). Errors are strings, never panics.
 fn audit_one_file(path: &std::path::Path, name: &str) -> Result<AuditRow, String> {
@@ -88,6 +157,9 @@ fn audit_one_file(path: &std::path::Path, name: &str) -> Result<AuditRow, String
         &mut store,
         (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
     );
+    if let Ok(dir) = std::env::var("AURORA_AUDIT_DUMP") {
+        audit_dump(&dir, name, &image, &merged);
+    }
     let (mean, max) = audit_diff(&image, &merged).ok_or("merged image size differs")?;
     Ok(AuditRow {
         name: name.to_owned(),
@@ -96,6 +168,7 @@ fn audit_one_file(path: &std::path::Path, name: &str) -> Result<AuditRow, String
         report_lines: report.len(),
         first_report: report.first().cloned().unwrap_or_default(),
         millis: started.elapsed().as_millis(),
+        real_merged: audit_has_real_merged_data(&bytes),
     })
 }
 
@@ -188,11 +261,13 @@ fn audit_buckets(rows: &[AuditRow]) -> [usize; 4] {
 }
 
 fn audit_table(rows: &[AuditRow]) -> String {
+    use std::fmt::Write;
     let mut out = String::new();
     for row in rows {
         let first: String = row.first_report.chars().take(90).collect();
-        out.push_str(&format!(
-            "{:7.2} | {:7.2} {:7.2} {:7.2} | max {:3.0} | rep {:2} | {:6} ms | {} | {}\n",
+        let _ = writeln!(
+            out,
+            "{:7.2} | {:7.2} {:7.2} {:7.2} | max {:3.0} | rep {:2} | {:6} ms | {}{} | {}",
             row.score(),
             row.mean[0],
             row.mean[1],
@@ -201,8 +276,9 @@ fn audit_table(rows: &[AuditRow]) -> String {
             row.report_lines,
             row.millis,
             row.name,
+            if row.real_merged { "" } else { " [NO REAL MERGED IMAGE]" },
             first
-        ));
+        );
     }
     out
 }
@@ -247,12 +323,14 @@ fn psd_fidelity_audit() {
     }
     rows.sort_by(|a, b| b.score().total_cmp(&a.score()).then(a.name.cmp(&b.name)));
     let table = audit_table(&rows);
+    let (rows, placeholders): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| r.real_merged);
     println!("score | mean R G B (levels) | max | report lines | time | file | first report line");
     print!("{table}");
     let b = audit_buckets(&rows);
     println!(
-        "AUDIT: {} files measured, {} skipped; mean error <1 level: {}, <3: {}, <10: {}, worse: {}",
+        "AUDIT: {} files measured against a real merged image ({} more have only a placeholder), {} skipped; mean error <1 level: {}, <3: {}, <10: {}, worse: {}",
         rows.len(),
+        placeholders.len(),
         skipped.len(),
         b[0],
         b[1],
@@ -273,6 +351,7 @@ fn audit_buckets_and_diff_are_arithmetically_right() {
         report_lines: 0,
         first_report: String::new(),
         millis: 0,
+        real_merged: true,
     };
     let rows = [row(0.5), row(0.99), row(1.0), row(2.9), row(3.0), row(9.9), row(10.0), row(80.0)];
     assert_eq!(audit_buckets(&rows), [2, 2, 2, 2]);
@@ -286,6 +365,25 @@ fn audit_buckets_and_diff_are_arithmetically_right() {
         }
         AuditOutcome::Row(_) => unreachable!("a missing file has no row"),
     }
+    // The version-info resource: absent -> real; flag 0 -> placeholder.
+    let file = |version_info: Option<u8>| {
+        let mut b = vec![0_u8; 26];
+        b.extend_from_slice(&0_u32.to_be_bytes()); // colour mode data
+        let mut res = Vec::new();
+        // An unrelated resource first, with an odd-length name to pad.
+        res.extend_from_slice(b"8BIM\x03\xed\x01a\x00\x00\x00\x03abc\x00");
+        if let Some(flag) = version_info {
+            res.extend_from_slice(b"8BIM\x04\x21\x00\x00\x00\x00\x00\x07");
+            res.extend_from_slice(&[0, 0, 0, 1, flag, 0, 0, 0]);
+        }
+        b.extend_from_slice(&(res.len() as u32).to_be_bytes());
+        b.extend_from_slice(&res);
+        b
+    };
+    assert!(audit_has_real_merged_data(&file(None)));
+    assert!(audit_has_real_merged_data(&file(Some(1))));
+    assert!(!audit_has_real_merged_data(&file(Some(0))));
+    assert!(audit_has_real_merged_data(b"too short"));
     // Hostile bytes: skipped, not a panic.
     let dir = tempfile::tempdir().map_err(|e| e.to_string());
     if let Ok(dir) = dir {
