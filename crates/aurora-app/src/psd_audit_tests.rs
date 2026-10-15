@@ -114,7 +114,11 @@ fn audit_has_real_merged_data(bytes: &[u8]) -> bool {
 /// `AURORA_AUDIT_DUMP=dir`: writes `<file>.aurora.rgb` and
 /// `<file>.merged.rgb` (8-bit RGB, a transparent pixel over white; the
 /// size is in `<file>.size`) for a script to diff. Best effort.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names
+)]
 fn audit_dump(dir: &str, name: &str, image: &aurora_io::Image, merged: &aurora_io::Image) {
     let flat = |img: &aurora_io::Image| {
         let mut out = Vec::new();
