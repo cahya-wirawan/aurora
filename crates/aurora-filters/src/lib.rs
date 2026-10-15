@@ -51,7 +51,7 @@ mod tests {
     #[test]
     #[ignore = "measurement, prints timings"]
     #[allow(clippy::cast_precision_loss, clippy::print_stderr)]
-    fn cost_probe_for_vibrance_exposure_and_photo_filter() {
+    fn cost_probe_for_the_0_239_and_0_240_adjustments() {
         use super::{ExposureOp, PhotoFilterOp, VibranceOp};
         let count = 4096_usize * 4096;
         let mut state = 0x9E37_79B9_u32;
@@ -92,6 +92,27 @@ mod tests {
                 Err(_) => hue,
             };
         time("hue/saturation (reference)", &|p| hue.apply(p));
+        // 0.240.0: Black & White (plain and tinted) and Color Balance.
+        let bw = super::BlackWhiteOp::new(&aurora_core::BlackWhiteParams::default());
+        time("black & white", &|p| bw.apply(p));
+        let tinted = match aurora_core::BlackWhiteParams::new(
+            aurora_core::BLACK_WHITE_DEFAULTS,
+            true,
+            35.0,
+            25.0,
+        ) {
+            Ok(p) => super::BlackWhiteOp::new(&p),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        time("black & white, tinted", &|p| tinted.apply(p));
+        let balance = match aurora_core::ColorBalanceParams::new(
+            [[20.0, -10.0, 5.0], [30.0, 15.0, -25.0], [-10.0, 5.0, 10.0]],
+            true,
+        ) {
+            Ok(p) => super::ColorBalanceOp::new(&p),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        time("color balance", &|p| balance.apply(p));
     }
 
     #[test]

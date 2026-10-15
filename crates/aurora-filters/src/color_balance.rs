@@ -103,7 +103,10 @@ impl ColorBalanceOp {
 #[allow(
     clippy::float_cmp,
     clippy::needless_range_loop,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
 )]
 mod tests {
     use super::{ColorBalanceOp, SHIFT_AT_100, luma, range_weights};

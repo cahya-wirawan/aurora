@@ -29,6 +29,10 @@
 //! selector), three whole-number sliders that edit the selected range, and
 //! a Preserve Luminosity checkbox.
 
+// `AdjustControls` is `Copy` and 400 bytes (twenty sliders and readouts since
+// 0.240.0); the helpers take it by value like the other editors' controls.
+#![allow(clippy::large_types_passed_by_value)]
+
 use aurora_core::{
     BLACK_WHITE_DEFAULTS, BLACK_WHITE_MAX, BLACK_WHITE_MIN, BlackWhiteParams, COLOR_BALANCE_MAX,
     COLOR_BALANCE_RANGES, DEFAULT_TINT_HUE, DEFAULT_TINT_SATURATION, EXPOSURE_MAX, ExposureParams,
@@ -550,6 +554,7 @@ fn column_style(scales: &Scales, display: Display) -> Style {
 ///
 /// [`WidgetError::UnknownWidget`] if `parent` doesn't exist. On any
 /// failure the partly built column is removed again.
+#[allow(clippy::too_many_lines)] // one widget per slider, in layout order
 pub fn insert_adjust_controls(
     tree: &mut WidgetTree<WidgetKind>,
     parent: WidgetId,
@@ -1354,7 +1359,8 @@ mod tests {
         let v = add(&mut layers, "v", vib(0.0, 0.0));
         let _ = show(&mut ws, controls, &layers, Some(v));
         assert!(
-            widgets::tab_bar_state(&ws.tree, controls.balance_range).is_ok_and(|t| t.is_disabled())
+            widgets::tab_bar_state(&ws.tree, controls.balance_range)
+                .is_ok_and(aurora_widgets::widgets::TabBarState::is_disabled)
         );
         assert!(at(&ws, S::BalanceCyanRed).1);
     }

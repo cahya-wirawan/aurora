@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(d.weights(), BLACK_WHITE_DEFAULTS);
         assert!(!d.tint());
         assert_eq!((d.tint_hue(), d.tint_saturation()), (35.0, 25.0));
-        assert!(P::new(d.weights(), false, 35.0, 25.0) == Ok(d));
+        assert_eq!(P::new(d.weights(), false, 35.0, 25.0), Ok(d));
     }
 
     #[test]

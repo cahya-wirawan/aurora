@@ -123,7 +123,10 @@ impl BlackWhiteOp {
 #[allow(
     clippy::float_cmp,
     clippy::many_single_char_names,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
 )]
 mod tests {
     use super::BlackWhiteOp;

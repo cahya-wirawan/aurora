@@ -84934,14 +84934,21 @@ mod tests {
                 let luma = |c: [f64; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
                 let y = luma(input);
                 let w = [(1.0 - y).powi(2), 4.0 * y * (1.0 - y), y * y];
-                let mut d = [0.0_f64; 3];
-                for (c, slot) in d.iter_mut().enumerate() {
-                    for (r, weight) in w.iter().enumerate() {
-                        *slot += weight * f64::from(ranges[r][c]) / 100.0 * 0.5;
-                    }
-                }
+                let d: [f64; 3] = [0, 1, 2].map(|c| {
+                    ranges
+                        .iter()
+                        .zip(w)
+                        .map(|(row, weight)| {
+                            weight * f64::from(row.get(c).copied().unwrap_or(0.0)) / 100.0 * 0.5
+                        })
+                        .sum()
+                });
                 let restore = if preserve { luma(d) } else { 0.0 };
-                let out = |c: usize| (input[c] + d[c] - restore).clamp(0.0, 1.0) as f32;
+                let out = |c: usize| {
+                    let base = input.get(c).copied().unwrap_or(0.0);
+                    let moved = d.get(c).copied().unwrap_or(0.0);
+                    (base + moved - restore).clamp(0.0, 1.0) as f32
+                };
                 [out(0), out(1), out(2), 1.0]
             };
             let (_dir, mut store) = real_tile_store();

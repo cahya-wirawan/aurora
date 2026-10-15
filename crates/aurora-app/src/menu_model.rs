@@ -91,6 +91,7 @@ fn modify_rows() -> Vec<(&'static str, String)> {
         .collect()
 }
 
+#[allow(clippy::too_many_lines)] // one row per menu command
 fn static_rows(title: &str) -> Vec<Row> {
     match title {
         "File" => vec![

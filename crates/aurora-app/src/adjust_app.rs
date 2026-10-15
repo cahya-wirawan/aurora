@@ -273,6 +273,7 @@ pub(crate) fn apply_outcome(
 
 /// Mirrors the document into the editors (run every loop turn); returns
 /// whether anything shown changed.
+#[allow(clippy::large_types_passed_by_value)] // `AdjustControls` is `Copy` and 400 bytes
 pub(crate) fn sync(
     tree: &mut aurora_widgets::WidgetTree<aurora_widgets::widgets::WidgetKind>,
     controls: Option<aurora_ui::AdjustControls>,

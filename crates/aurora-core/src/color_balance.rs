@@ -198,7 +198,7 @@ impl ColorBalanceParams {
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp)]
+#[allow(clippy::float_cmp, clippy::indexing_slicing)]
 mod tests {
     use super::{ColorBalanceError as E, ColorBalanceParams as P};
 
