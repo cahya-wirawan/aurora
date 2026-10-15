@@ -689,12 +689,13 @@ fn brightness_contrast_adjustment(
 /// `fill_adjustments.psd`, both the neutral mixer: rows `100,0,0,0,0`,
 /// `0,100,0,0,0`, `0,0,100,0,0`, `0,0,0,100,0`, so the fourth source of a
 /// row is the black of a CMYK document and the fifth value the constant, as
-/// Adobe's spec says). At least 44 bytes; a longer block's tail is ignored.
-/// A non-zero fourth source on an RGB row has no meaning in RGB and is
-/// ignored. **No fixture has Monochrome on**, so which row holds the Gray
+/// Adobe's spec says). Exactly 44 bytes.
+/// A non-zero fourth source on an RGB row is left out as unreadable. **No fixture has Monochrome on**, so which row holds the Gray
 /// mix is unverified (the first is assumed).
 fn parse_mixer(data: &[u8]) -> Result<MixerBlock, ()> {
-    if data.len() < 44 {
+    // Exactly 44 bytes, as in every fixture: a longer block is something
+    // this layout does not describe.
+    if data.len() != 44 {
         return Err(());
     }
     let mut r = Reader::new(data);
@@ -713,7 +714,12 @@ fn parse_mixer(data: &[u8]) -> Result<MixerBlock, ()> {
         for v in &mut values {
             *v = r.i16("mixer value").map_err(unreadable)?;
         }
-        let [red, green, blue, _black, constant] = values;
+        let [red, green, blue, fourth, constant] = values;
+        // The fourth source is the black of a CMYK document; on an RGB row
+        // every fixture holds 0, and anything else is not understood.
+        if fourth != 0 {
+            return Err(());
+        }
         *row = [red, green, blue, constant];
     }
     Ok(MixerBlock { monochrome, rows })
@@ -742,7 +748,8 @@ pub(super) fn channel_mixer_adjustment(block: &MixerBlock, gray: bool) -> Result
 /// taken as unused and the next nine as the Photoshop menu order; a
 /// non-zero first plate is left out rather than guessed at).
 fn parse_selective(data: &[u8]) -> Result<SelectiveBlock, ()> {
-    if data.len() < 84 {
+    // Exactly 84 bytes, as in every fixture.
+    if data.len() != 84 {
         return Err(());
     }
     let mut r = Reader::new(data);

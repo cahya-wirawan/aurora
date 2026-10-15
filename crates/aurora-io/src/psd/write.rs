@@ -294,6 +294,9 @@ struct Losses {
     /// stored as a colour made from the tint hue and saturation, and the
     /// preset name is cleared.
     black_white_written: usize,
+    /// Channel Mixer layers that adjust something (0.245.0): written in the
+    /// layout Aurora inferred, not checked in Photoshop.
+    mixer_unchecked: usize,
     /// Curves layers with points merged on the same 8-bit level.
     curve_merged: usize,
     /// Hue/Saturation layers with custom edges on a neutral range.
@@ -335,6 +338,9 @@ impl Losses {
             | aurora_doc::Adjustment::Posterize(_)
             | aurora_doc::Adjustment::BrightnessContrast(_) => None,
         };
+        self.mixer_unchecked += usize::from(
+            matches!(adjustment, aurora_doc::Adjustment::ChannelMixer(p) if !p.is_identity()),
+        );
         self.black_white_written +=
             usize::from(matches!(adjustment, aurora_doc::Adjustment::BlackWhite(_)));
         if rounding.rounded
@@ -526,6 +532,23 @@ impl Losses {
             if n > 0 {
                 items.push(format!("{} {what}", plural(n as u64, one, many)));
             }
+        }
+        if self.mixer_unchecked > 0 {
+            items.push(format!(
+                "{} written in the layout Aurora inferred (output rows, the constant as the \
+                 fifth value) and not checked in Photoshop; Photoshop may render {} \
+                 differently.",
+                plural(
+                    self.mixer_unchecked as u64,
+                    "Channel Mixer layer is",
+                    "Channel Mixer layers are"
+                ),
+                if self.mixer_unchecked == 1 {
+                    "it"
+                } else {
+                    "them"
+                }
+            ));
         }
         if self.black_white_written > 0 {
             items.push(format!(

@@ -605,7 +605,8 @@ fn unverifiable_selective_color_and_monochrome_mixer_are_refused_by_name() {
         assert!(
             message.contains(&format!(
                 "the {kind} layer \u{201c}{name}\u{201d} can't be saved to .psd"
-            )) && message.contains("verified"),
+            )) && message.contains("verified")
+                && message.contains("save as .aur to keep it"),
             "{message}"
         );
         assert!(!path.exists());

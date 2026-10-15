@@ -113,9 +113,9 @@ fn photoshops_neutral_blocks_parse_to_the_identity_layers() {
 #[test]
 fn the_mixer_layout_is_four_rows_of_red_green_blue_unused_constant() {
     let rows = [
-        [1, 2, 3, 99, 4],
-        [5, 6, 7, 99, 8],
-        [-200, 200, -9, 99, -100],
+        [1, 2, 3, 0, 4],
+        [5, 6, 7, 0, 8],
+        [-200, 200, -9, 0, -100],
         [0, 0, 0, 100, 0],
     ];
     let Ok(Adjustment::ChannelMixer(p)) = read_one(b"mixr", &mixr(1, 0, rows), false) else {
@@ -128,7 +128,7 @@ fn the_mixer_layout_is_four_rows_of_red_green_blue_unused_constant() {
             [5.0, 6.0, 7.0, 8.0],
             [-200.0, 200.0, -9.0, -100.0]
         ],
-        "the fourth source is ignored, the fifth value is the constant"
+        "the fifth value is the constant"
     );
     assert!(!p.monochrome());
     // The flag parses, but a Monochrome mixer is left out: which row holds
@@ -142,13 +142,26 @@ fn the_mixer_layout_is_four_rows_of_red_green_blue_unused_constant() {
         matches!(&r, Err(e) if e.contains("Unverified") && e.contains("ChannelMixer")),
         "{r:?}"
     );
-    // A block with a tail (Photoshop pads tagged blocks) still reads.
+    // Exactly 44 bytes (as every fixture): a longer block is not understood.
     let mut longer = mixr(1, 0, ID_ROWS);
     longer.extend_from_slice(&[0, 0, 0, 0]);
-    assert_eq!(
-        read_one(b"mixr", &longer, false),
-        Ok(Adjustment::ChannelMixer(ChannelMixerParams::identity()))
-    );
+    let r = read_one(b"mixr", &longer, false);
+    assert!(matches!(&r, Err(e) if e.contains("Unreadable")), "{r:?}");
+    let mut longer = selc_neutral();
+    longer.extend_from_slice(&[0, 0, 0, 0]);
+    let r = read_one(b"selc", &longer, false);
+    assert!(matches!(&r, Err(e) if e.contains("Unreadable")), "{r:?}");
+    // A non-zero fourth (CMYK black) source on an RGB row is not understood
+    // either, in any of the three rows.
+    for row in 0..3 {
+        let mut rows = ID_ROWS;
+        rows[row][3] = 1;
+        let r = read_one(b"mixr", &mixr(1, 0, rows), false);
+        assert!(
+            matches!(&r, Err(e) if e.contains("Unreadable") && e.contains("ChannelMixer")),
+            "row {row}: {r:?}"
+        );
+    }
 }
 
 #[test]
@@ -653,6 +666,14 @@ fn fractional_values_are_rounded_and_itemised() {
     let report = ok(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()));
     assert!(report.items.is_empty(), "{:?}", report.items);
     ok(tree.add_adjustment_layer_at("M2", a_mixer_fractional(), None, 0));
+    // A mixer that adjusts something is written in an inferred layout.
+    assert!(
+        report
+            .items
+            .iter()
+            .all(|i| !i.contains("layout Aurora inferred")),
+        "an identity mixer adds no such line"
+    );
     let report = ok(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()));
     let text = report.items.join("\n");
     assert!(
@@ -729,8 +750,14 @@ fn both_kinds_round_trip_through_write_verify_and_read() {
     let dir = ok(tempfile::tempdir());
     let target = dir.path().join("two.psd");
     let outcome = ok(save(&mut doc, &target, false));
-    // Lossless: the values are exact, nothing is itemised.
-    assert_eq!(outcome.report.items.len(), 0, "{:?}", outcome.report.items);
+    // The values are exact: the only line is the unchecked mixer layout
+    // (two non-identity mixers).
+    assert_eq!(outcome.report.items.len(), 1, "{:?}", outcome.report.items);
+    assert!(
+        outcome.report.items[0].starts_with("2 Channel Mixer layers are written in the layout"),
+        "{:?}",
+        outcome.report.items
+    );
     let back = read_back(&ok(std::fs::read(&target)));
     // Both non-neutral kinds are noted as unvalidated on reopen.
     let text = back.report.items.join("\n");
@@ -822,4 +849,56 @@ fn two_adjustments_fixture_for_psd_tools() {
         \"swap\": [[0, 0, 100, 0], [0, 100, 0, 0], [100, 0, 0, 0]], \
         \"absolute\": true}\n";
     ok(std::fs::write(out.join("adjustments2.json"), json));
+}
+
+#[test]
+fn a_non_identity_mixer_is_itemised_as_an_unchecked_layout_and_an_identity_one_is_not() {
+    let mut tree = LayerTree::new();
+    ok(tree.add_pixel_layer("A", rect(0, 0, 4, 4), None));
+    ok(tree.add_adjustment_layer_at(
+        "Id",
+        mixer(ChannelMixerParams::identity().rows(), false),
+        None,
+        0,
+    ));
+    let report = ok(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()));
+    assert!(report.items.is_empty(), "{:?}", report.items);
+    let swap = [
+        [0.0, 0.0, 100.0, 0.0],
+        [0.0, 100.0, 0.0, 0.0],
+        [100.0, 0.0, 0.0, 0.0],
+    ];
+    ok(tree.add_adjustment_layer_at("One", mixer(swap, false), None, 0));
+    let report = ok(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()));
+    assert_eq!(report.items.len(), 1, "{:?}", report.items);
+    assert_eq!(
+        report.items[0],
+        "1 Channel Mixer layer is written in the layout Aurora inferred (output rows, the constant as the fifth value) and not checked in Photoshop; Photoshop may render it differently."
+    );
+    ok(tree.add_adjustment_layer_at("Two", mixer(swap, false), None, 0));
+    let report = ok(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()));
+    assert!(
+        report.items[0].starts_with("2 Channel Mixer layers are written in the layout")
+            && report.items[0].ends_with("may render them differently."),
+        "{:?}",
+        report.items
+    );
+}
+
+#[test]
+fn the_refusal_names_the_layer_and_offers_aur() {
+    for (name, a) in [
+        ("Mono", mixer(ChannelMixerParams::identity().rows(), true)),
+        ("Sel", selective(&[(1, [5.0, 0.0, 0.0, 0.0])], false)),
+    ] {
+        let mut tree = LayerTree::new();
+        ok(tree.add_pixel_layer("A", rect(0, 0, 4, 4), None));
+        ok(tree.add_adjustment_layer_at(name, a, None, 0));
+        let Err(refusal) = psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()) else {
+            unreachable!("refused")
+        };
+        let text = refusal.to_string();
+        assert!(text.contains(&format!("\u{201c}{name}\u{201d}")), "{text}");
+        assert!(text.contains("save as .aur to keep it"), "{text}");
+    }
 }

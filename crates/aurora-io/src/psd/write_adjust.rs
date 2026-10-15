@@ -175,13 +175,13 @@ pub(super) fn encode_adjustment(
         Adjustment::ChannelMixer(p) if p.monochrome() => {
             return Err(
                 "its Monochrome Gray mix has no verified place in the file's rows (no Photoshop file \
-                 documents it)",
+                 documents it); save as .aur to keep it",
             );
         }
         Adjustment::SelectiveColor(p) if !p.is_identity() => {
             return Err(
                 "the order of the file's ten colour plates is not verified, so its adjustments \
-                 could land on the wrong colours",
+                 could land on the wrong colours; save as .aur to keep it",
             );
         }
         _ => {}
