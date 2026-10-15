@@ -718,8 +718,8 @@ fn the_verifier_catches_a_wrong_block_or_readback_for_each_kind() {
     }
 }
 
-/// `adjustments5.psd` / `adjustments5.json` for `scripts/verify_psd_write.py
-/// check_adjustments5` (psd-tools).
+/// `adjustments2.psd` / `adjustments2.json` for `scripts/verify_psd_write.py
+/// check_adjustments2` (psd-tools).
 ///
 /// ```text
 /// AURORA_PSD_FIXTURE_DIR=/tmp/psdw cargo test -p aurora-io --lib \
@@ -734,10 +734,10 @@ fn two_adjustments_fixture_for_psd_tools() {
     let out = std::path::Path::new(&out);
     let mut doc = two_doc();
     let (bytes, _) = ok(doc.write());
-    ok(std::fs::write(out.join("adjustments5.psd"), &bytes));
+    ok(std::fs::write(out.join("adjustments2.psd"), &bytes));
     let json = "{\"mixer\": [[30, 59, 11, 5], [-20, 120, 0, 0], [10, 10, 80, -5]], \
         \"mono\": [[30, 59, 11, 0], [0, 100, 0, 0], [0, 0, 100, 0]], \
         \"selective_reds\": [10, -20, 30, -40], \"selective_neutrals\": [5, 5, 5, 5], \
         \"absolute\": true}\n";
-    ok(std::fs::write(out.join("adjustments5.json"), json));
+    ok(std::fs::write(out.join("adjustments2.json"), json));
 }
