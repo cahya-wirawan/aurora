@@ -90,11 +90,12 @@ pub const TOOL_COLUMNS: usize = 2;
 /// The groups of the strip, top to bottom, each one row of at most
 /// [`TOOL_COLUMNS`] buttons, a rule between consecutive groups. Together
 /// they hold every tool of [`Tool::ALL`], in that order.
-pub const TOOL_GROUPS: [&[Tool]; 13] = [
+pub const TOOL_GROUPS: [&[Tool]; 14] = [
     &[Tool::Move],
     &[Tool::MarqueeSelect, Tool::EllipticalMarquee],
     &[Tool::Lasso, Tool::PolygonalLasso],
-    &[Tool::MagicWand, Tool::Crop],
+    &[Tool::MagicWand, Tool::QuickSelect],
+    &[Tool::Crop],
     &[Tool::Zoom, Tool::Pan],
     &[Tool::Eyedropper],
     &[Tool::Brush, Tool::Pencil],
@@ -118,6 +119,7 @@ pub const fn tool_icon(tool: Tool) -> IconKind {
         Tool::Lasso => IconKind::Lasso,
         Tool::PolygonalLasso => IconKind::PolygonalLasso,
         Tool::MagicWand => IconKind::MagicWand,
+        Tool::QuickSelect => IconKind::QuickSelect,
         Tool::Zoom => IconKind::ZoomIn,
         Tool::Pan => IconKind::Hand,
         Tool::Eyedropper => IconKind::Eyedropper,
@@ -404,13 +406,14 @@ mod tests {
 
     /// The icon each tool must wear, written out independently of
     /// [`tool_icon`] so a mapped-to-the-wrong-tool slip fails.
-    const EXPECTED_ICONS: [(Tool, IconKind); 24] = [
+    const EXPECTED_ICONS: [(Tool, IconKind); 25] = [
         (Tool::Move, IconKind::Move),
         (Tool::MarqueeSelect, IconKind::Marquee),
         (Tool::EllipticalMarquee, IconKind::EllipseMarquee),
         (Tool::Lasso, IconKind::Lasso),
         (Tool::PolygonalLasso, IconKind::PolygonalLasso),
         (Tool::MagicWand, IconKind::MagicWand),
+        (Tool::QuickSelect, IconKind::QuickSelect),
         (Tool::Zoom, IconKind::ZoomIn),
         (Tool::Pan, IconKind::Hand),
         (Tool::Eyedropper, IconKind::Eyedropper),
@@ -533,6 +536,10 @@ mod tests {
             "Sponge tool, shortcut Shift+P"
         );
         assert_eq!(tool_description(Tool::Crop), "Crop tool, shortcut C");
+        assert_eq!(
+            tool_description(Tool::QuickSelect),
+            "Quick Select tool, shortcut Shift+W"
+        );
         assert_eq!(
             tool_description(Tool::Gradient),
             "Gradient tool, shortcut G"
@@ -719,14 +726,15 @@ mod tests {
             assert_eq!(strip.width, 72, "scale {scale_factor}");
             // The strip stretches to the window; its content is groups of
             // 32 px and 8 px rules under 4 px of padding: the Eraser ends
-            // 4 + 8*32 + 7*8 = 316 px down (0.214.0 added the Lasso row and
+            // 4 + 9*32 + 8*8 = 356 px down (0.238.0 gave the Crop a row of its
+            // own; before it 4 + 8*32 + 7*8 = 316; 0.214.0 added the Lasso row and
             // the Magic Wand row, 0.220.0 the Pencil's: Brush and Pencil
             // share a row, the Eraser has the next one).
             let last = bounds(
                 &ws,
                 ws.tools.button_for(Tool::Eraser).unwrap_or(ws.tools.root),
             );
-            assert_eq!(last.bottom() - strip.y, 316, "scale {scale_factor}");
+            assert_eq!(last.bottom() - strip.y, 356, "scale {scale_factor}");
             for (_, id) in ws.tools.buttons {
                 let b = bounds(&ws, id);
                 assert_eq!((b.width, b.height), (32, 32), "scale {scale_factor}");
@@ -747,9 +755,13 @@ mod tests {
             assert_eq!(at(Tool::Lasso).x + 32, at(Tool::PolygonalLasso).x);
             assert!(at(Tool::Lasso).y > at(Tool::EllipticalMarquee).y);
             assert!(at(Tool::MagicWand).y > at(Tool::Lasso).y);
-            // 0.226.0: the Crop shares the Magic Wand's row, right of it.
-            assert_eq!(at(Tool::Crop).y, at(Tool::MagicWand).y);
-            assert_eq!(at(Tool::MagicWand).x + 32, at(Tool::Crop).x);
+            // 0.238.0: the Quick Select shares the Magic Wand's row, right
+            // of it, and the Crop (which shared it from 0.226.0) has the next
+            // row to itself, in the left column.
+            assert_eq!(at(Tool::QuickSelect).y, at(Tool::MagicWand).y);
+            assert_eq!(at(Tool::MagicWand).x + 32, at(Tool::QuickSelect).x);
+            assert!(at(Tool::Crop).y > at(Tool::MagicWand).y);
+            assert_eq!(at(Tool::Crop).x, at(Tool::MagicWand).x);
             assert!(at(Tool::Zoom).y > at(Tool::Crop).y);
             assert_eq!(at(Tool::Eyedropper).x, at(Tool::Move).x);
             assert!(at(Tool::Zoom).y > at(Tool::Move).y);
@@ -795,7 +807,7 @@ mod tests {
             let bucket = at(Tool::PaintBucket);
             assert_eq!(
                 bucket.bottom() - strip.y,
-                4 + 13 * 32 + 12 * 8,
+                4 + 14 * 32 + 13 * 8,
                 "scale {scale_factor}"
             );
             assert!(

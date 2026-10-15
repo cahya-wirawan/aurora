@@ -149,11 +149,13 @@ pub enum IconKind {
     Pen,
     /// A diagonal sticking plaster: the Spot Healing tool (0.237.0).
     SpotHealing,
+    /// A brush tip with corner marks: the Quick Select tool (0.238.0).
+    QuickSelect,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 44] = [
+    pub const ALL: [IconKind; 45] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -198,6 +200,7 @@ impl IconKind {
         IconKind::Crop,
         IconKind::Pen,
         IconKind::SpotHealing,
+        IconKind::QuickSelect,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -249,6 +252,7 @@ impl IconKind {
             IconKind::Crop => "Crop",
             IconKind::Pen => "Pen",
             IconKind::SpotHealing => "Spot Healing",
+            IconKind::QuickSelect => "Quick Select",
         }
     }
 }
@@ -854,6 +858,13 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
                 .l(6.2, 8.0)
                 .closed(),
         ],
+        IconKind::QuickSelect => vec![
+            // A brush tip on a short handle, with the corner marks of a
+            // selection round its lower right.
+            circle(PartStyle::Stroke, 9.0, 6.0, 3.0),
+            stroke_part().m(7.0, 8.0).l(2.0, 13.0),
+            stroke_part().m(10.0, 14.0).l(14.0, 14.0).l(14.0, 10.0),
+        ],
         IconKind::PaintBucket => vec![
             // A tilted bucket (a diamond), the paint line across it, and
             // the drop pouring from its corner.
@@ -1001,7 +1012,7 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 44);
+        assert_eq!(IconKind::ALL.len(), 45);
         for kind in [IconKind::SwapArrows, IconKind::DefaultColours] {
             assert!(IconKind::ALL.contains(&kind));
             assert!(!icon_parts(kind).is_empty(), "{kind:?}");
