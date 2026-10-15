@@ -18155,6 +18155,12 @@ enum AdjustmentLut {
     Levels(std::rc::Rc<aurora_filters::LevelsLut>),
     /// Hue/Saturation (0.203.0): a per-pixel function, nothing to cache.
     HueSaturation(aurora_filters::HueSaturationOp),
+    /// Vibrance (0.239.0): a per-pixel function, nothing to cache.
+    Vibrance(aurora_filters::VibranceOp),
+    /// Exposure (0.239.0): a per-channel function in linear light.
+    Exposure(aurora_filters::ExposureOp),
+    /// Photo Filter (0.239.0): a per-pixel function.
+    PhotoFilter(aurora_filters::PhotoFilterOp),
 }
 
 impl AdjustmentLut {
@@ -18169,6 +18175,15 @@ impl AdjustmentLut {
             aurora_doc::Adjustment::HueSaturationRanges(params) => {
                 Self::HueSaturation(aurora_filters::HueSaturationOp::with_ranges(params))
             }
+            aurora_doc::Adjustment::Vibrance(params) => {
+                Self::Vibrance(aurora_filters::VibranceOp::new(params))
+            }
+            aurora_doc::Adjustment::Exposure(params) => {
+                Self::Exposure(aurora_filters::ExposureOp::new(params))
+            }
+            aurora_doc::Adjustment::PhotoFilter(params) => {
+                Self::PhotoFilter(aurora_filters::PhotoFilterOp::new(params))
+            }
         }
     }
 
@@ -18178,6 +18193,9 @@ impl AdjustmentLut {
             Self::Curves(lut) => lut.is_identity(),
             Self::Levels(lut) => lut.is_identity(),
             Self::HueSaturation(op) => op.is_identity(),
+            Self::Vibrance(op) => op.is_identity(),
+            Self::Exposure(op) => op.is_identity(),
+            Self::PhotoFilter(op) => op.is_identity(),
         }
     }
 
@@ -18187,6 +18205,9 @@ impl AdjustmentLut {
             Self::Curves(lut) => lut.apply(rgb),
             Self::Levels(lut) => lut.apply(rgb),
             Self::HueSaturation(op) => op.apply(rgb),
+            Self::Vibrance(op) => op.apply(rgb),
+            Self::Exposure(op) => op.apply(rgb),
+            Self::PhotoFilter(op) => op.apply(rgb),
         }
     }
 }
@@ -20078,7 +20099,14 @@ fn adjustment_layer_qualifies_for_gpu(
                 .packed_for_gpu()
                 .is_some()
         }
-        None => false,
+        // Vibrance, Exposure and Photo Filter (0.239.0) have no GPU pass
+        // yet: a visible layer of these kinds keeps the CPU path.
+        Some(
+            aurora_doc::Adjustment::Vibrance(_)
+            | aurora_doc::Adjustment::Exposure(_)
+            | aurora_doc::Adjustment::PhotoFilter(_),
+        )
+        | None => false,
     };
     expressible
         && !layers.mask(id).is_some_and(|mask| mask.enabled)
@@ -20517,7 +20545,14 @@ fn begin_gpu_adjustment_pass(
             }
             note_gpu_hue_saturation_dispatch();
         }
-        (_, AdjustmentLut::Curves(_)) => return false,
+        // No GPU pass for these (0.239.0); the predicate refuses them first.
+        (
+            _,
+            AdjustmentLut::Curves(_)
+            | AdjustmentLut::Vibrance(_)
+            | AdjustmentLut::Exposure(_)
+            | AdjustmentLut::PhotoFilter(_),
+        ) => return false,
     }
     std::mem::swap(current_accumulator, spare_accumulator);
     true

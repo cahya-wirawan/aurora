@@ -36,6 +36,7 @@ use taffy::style_helpers::{TaffyZero as _, length};
 use taffy::{Display, FlexDirection, Rect as LayoutRect, Size, Style};
 
 use crate::curves_controls::{CurvesControls, insert_curves_controls};
+use crate::adjust_controls::insert_adjust_controls;
 use crate::hue_saturation_controls::insert_hue_saturation_controls;
 use crate::levels_controls::insert_levels_controls;
 use crate::panel::{PanelHandle, panel_is_collapsed};
@@ -373,6 +374,8 @@ fn build(
     curves.levels = Some(insert_levels_controls(tree, root, scales)?);
     // The Hue/Saturation editor (0.203.0) likewise.
     curves.hue_saturation = Some(insert_hue_saturation_controls(tree, root, scales)?);
+    // The Vibrance, Exposure and Photo Filter editors (0.239.0) likewise.
+    curves.adjust = Some(insert_adjust_controls(tree, root, scales)?);
     let controls = ToolControls {
         root,
         options,

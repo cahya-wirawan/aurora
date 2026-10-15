@@ -139,6 +139,10 @@ pub struct CurvesControls {
     /// The Hue/Saturation editor built beside this column (0.203.0), set
     /// by [`crate::insert_tool_controls`], riding here like [`Self::levels`].
     pub hue_saturation: Option<crate::hue_saturation_controls::HueSaturationControls>,
+    /// The Vibrance, Exposure and Photo Filter editors built beside this
+    /// column (0.239.0), set by [`crate::insert_tool_controls`], riding
+    /// here like [`Self::levels`].
+    pub adjust: Option<crate::adjust_controls::AdjustControls>,
 }
 
 fn column_style(scales: &Scales) -> Style {
@@ -196,6 +200,7 @@ pub fn insert_curves_controls(
             editor,
             levels: None,
             hue_saturation: None,
+            adjust: None,
         };
         set_enabled(tree, controls, false)?;
         Ok(controls)
