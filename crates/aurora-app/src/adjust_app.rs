@@ -77,6 +77,12 @@ fn new_adjustment(kind: AdjustKind) -> (&'static str, Adjustment) {
             "Selective Color",
             Adjustment::SelectiveColor(aurora_core::SelectiveColorParams::identity()),
         ),
+        // 0.248.0: Gradient Map starts as black to white (a greyscale
+        // conversion, not an identity).
+        AdjustKind::GradientMap => (
+            "Gradient Map",
+            Adjustment::GradientMap(aurora_core::GradientMapParams::black_to_white()),
+        ),
         AdjustKind::ColorBalance => (
             "Color Balance",
             Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
@@ -142,6 +148,7 @@ pub(crate) fn is_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerO
                 || *id == adjust.legacy
                 || *id == adjust.mixer_mono
                 || *id == adjust.selective_absolute
+                || *id == adjust.gradient_reverse
         }
         // The Color Balance range selector (0.240.0): widget state only, no
         // document edit, but a pending drag settles when it is used.
@@ -288,6 +295,13 @@ pub(crate) fn apply_outcome(
                 Adjustment::SelectiveColor(selective.with_absolute(on)),
                 None,
             )
+        }
+        aurora_widgets::ActionOutcome::Toggled { id, state } if *id == adjust.gradient_reverse => {
+            let Some(gradient) = current.gradient_map() else {
+                return CompositeInvalidation::None;
+            };
+            let on = *state == accesskit::Toggled::True;
+            (Adjustment::GradientMap(gradient.with_reverse(on)), None)
         }
         aurora_widgets::ActionOutcome::ValueChanged { id, value } => {
             let Some(slider) = adjust.slider_of(*id) else {

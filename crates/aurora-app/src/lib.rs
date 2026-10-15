@@ -5954,6 +5954,8 @@ enum ActivatedCommand {
     /// New Channel Mixer / Selective Color Layer (0.245.0): the same.
     NewChannelMixerLayer,
     NewSelectiveColorLayer,
+    /// New Gradient Map Layer (0.248.0): black to white.
+    NewGradientMapLayer,
     /// A Photo Filter preset colour (0.239.0, palette only): index into
     /// [`aurora_core::PHOTO_FILTER_PRESETS`].
     PhotoFilterPreset(usize),
@@ -6215,6 +6217,7 @@ const COMMAND_LAYER_NEW_POSTERIZE: &str = "layer.new_posterize";
 const COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST: &str = "layer.new_brightness_contrast";
 const COMMAND_LAYER_NEW_CHANNEL_MIXER: &str = "layer.new_channel_mixer";
 const COMMAND_LAYER_NEW_SELECTIVE_COLOR: &str = "layer.new_selective_color";
+const COMMAND_LAYER_NEW_GRADIENT_MAP: &str = "layer.new_gradient_map";
 const COMMAND_LAYER_NEW_GROUP: &str = "layer.new_group";
 const COMMAND_LAYER_CLIP_CREATE: &str = "layer.clip_create";
 const COMMAND_LAYER_CLIP_RELEASE: &str = "layer.clip_release";
@@ -6354,6 +6357,7 @@ fn palette_commands() -> Vec<CommandEntry> {
             COMMAND_LAYER_NEW_SELECTIVE_COLOR,
             "New Selective Color Layer",
         ),
+        CommandEntry::new(COMMAND_LAYER_NEW_GRADIENT_MAP, "New Gradient Map Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_GROUP, "New Group"),
         CommandEntry::new(COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
         CommandEntry::new(COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),
@@ -6656,6 +6660,9 @@ fn activate_command(
     }
     if id == COMMAND_LAYER_NEW_SELECTIVE_COLOR {
         return Some(ActivatedCommand::NewSelectiveColorLayer);
+    }
+    if id == COMMAND_LAYER_NEW_GRADIENT_MAP {
+        return Some(ActivatedCommand::NewGradientMapLayer);
     }
     if let Some(index) = adjust_app::preset_for_command(id) {
         return Some(ActivatedCommand::PhotoFilterPreset(index));
@@ -10801,6 +10808,12 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(
                 COMMAND_LAYER_NEW_SELECTIVE_COLOR,
                 "New Selective Color Layer",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_GRADIENT_MAP,
+                "New Gradient Map Layer",
                 true,
                 None,
             ),
@@ -18403,6 +18416,7 @@ fn new_adjust_kind(command: &ActivatedCommand) -> Option<aurora_ui::AdjustKind> 
         }
         ActivatedCommand::NewChannelMixerLayer => Some(aurora_ui::AdjustKind::ChannelMixer),
         ActivatedCommand::NewSelectiveColorLayer => Some(aurora_ui::AdjustKind::SelectiveColor),
+        ActivatedCommand::NewGradientMapLayer => Some(aurora_ui::AdjustKind::GradientMap),
         _ => None,
     }
 }
@@ -18511,6 +18525,9 @@ enum AdjustmentLut {
     ChannelMixer(aurora_filters::ChannelMixerOp),
     /// Selective Color (0.245.0): a per-pixel function, CPU only.
     SelectiveColor(aurora_filters::SelectiveColorOp),
+    /// Gradient Map (0.248.0): a per-pixel function over a stop list, CPU
+    /// only (boxed: the stop list makes it the largest variant).
+    GradientMap(Box<aurora_filters::GradientMapOp>),
 }
 
 impl AdjustmentLut {
@@ -18556,6 +18573,9 @@ impl AdjustmentLut {
             aurora_doc::Adjustment::SelectiveColor(params) => {
                 Self::SelectiveColor(aurora_filters::SelectiveColorOp::new(params))
             }
+            aurora_doc::Adjustment::GradientMap(params) => {
+                Self::GradientMap(Box::new(aurora_filters::GradientMapOp::new(params)))
+            }
         }
     }
 
@@ -18576,6 +18596,7 @@ impl AdjustmentLut {
             Self::BrightnessContrast(op) => op.is_identity(),
             Self::ChannelMixer(op) => op.is_identity(),
             Self::SelectiveColor(op) => op.is_identity(),
+            Self::GradientMap(op) => op.is_identity(),
         }
     }
 
@@ -18596,6 +18617,7 @@ impl AdjustmentLut {
             Self::BrightnessContrast(op) => op.apply(rgb),
             Self::ChannelMixer(op) => op.apply(rgb),
             Self::SelectiveColor(op) => op.apply(rgb),
+            Self::GradientMap(op) => op.apply(rgb),
         }
     }
 }
@@ -20711,7 +20733,8 @@ fn adjustment_layer_qualifies_for_gpu(
             | aurora_doc::Adjustment::Posterize(_)
             | aurora_doc::Adjustment::BrightnessContrast(_)
             | aurora_doc::Adjustment::ChannelMixer(_)
-            | aurora_doc::Adjustment::SelectiveColor(_),
+            | aurora_doc::Adjustment::SelectiveColor(_)
+            | aurora_doc::Adjustment::GradientMap(_),
         )
         | None => false,
     };
@@ -21180,7 +21203,8 @@ fn begin_gpu_adjustment_pass(
             | AdjustmentLut::Posterize(_)
             | AdjustmentLut::BrightnessContrast(_)
             | AdjustmentLut::ChannelMixer(_)
-            | AdjustmentLut::SelectiveColor(_),
+            | AdjustmentLut::SelectiveColor(_)
+            | AdjustmentLut::GradientMap(_),
         ) => return false,
     }
     std::mem::swap(current_accumulator, spare_accumulator);
@@ -21284,7 +21308,8 @@ fn record_photographer_adjustment_pass(
         | AdjustmentLut::BrightnessContrast(_)
         // CPU only (0.245.0), refused before a pass is recorded.
         | AdjustmentLut::ChannelMixer(_)
-        | AdjustmentLut::SelectiveColor(_) => {
+        | AdjustmentLut::SelectiveColor(_)
+        | AdjustmentLut::GradientMap(_) => {
             return false;
         }
     }
@@ -30241,7 +30266,8 @@ impl App {
                 | ActivatedCommand::NewPosterizeLayer
                 | ActivatedCommand::NewBrightnessContrastLayer
                 | ActivatedCommand::NewChannelMixerLayer
-                | ActivatedCommand::NewSelectiveColorLayer),
+                | ActivatedCommand::NewSelectiveColorLayer
+                | ActivatedCommand::NewGradientMapLayer),
             ) => {
                 if let Some(kind) = new_adjust_kind(&command) {
                     self.run_layer_command(LayerCommand::NewAdjust(kind));
