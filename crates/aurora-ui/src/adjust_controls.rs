@@ -2183,4 +2183,199 @@ mod tests {
         assert_eq!(range_of(&ws, S::Brightness), (-100.0, 100.0, 100.0));
         assert_eq!(range_of(&ws, S::Contrast), (-100.0, 100.0, -50.0));
     }
+
+    /// 0.245.0: Channel Mixer and Selective Color. The sliders read and write
+    /// the row or range of the selector's tab; the Gray mix is the first row
+    /// whatever tab is selected; the two-step Selective Color selector maps to
+    /// the nine ranges; the readouts name the row or range; the selectors
+    /// are live only for their kind.
+    #[test]
+    fn channel_mixer_and_selective_color_editors_follow_their_selectors() {
+        let mut ws = crate::build_workspace(&scales());
+        let controls = built(&mut ws);
+        let at = |ws: &crate::Workspace, s: S| slider_state(&ws.tree, controls.sliders[s.index()]);
+        let mixer = Adjustment::ChannelMixer(
+            match aurora_core::ChannelMixerParams::new(
+                [
+                    [1.0, 2.0, 3.0, 4.0],
+                    [5.0, 6.0, 7.0, 8.0],
+                    [9.0, 10.0, 11.0, 12.0],
+                ],
+                false,
+            ) {
+                Ok(p) => p,
+                Err(err) => unreachable!("{err:?}"),
+            },
+        );
+        for (tab, row) in [
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+            [9.0, 10.0, 11.0, 12.0],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (slot, s) in [S::MixerRed, S::MixerGreen, S::MixerBlue, S::MixerConstant]
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(
+                    s.value_of(&mixer, tab),
+                    Some(f64::from(row[slot])),
+                    "{tab} {s:?}"
+                );
+                let edited = s.with_value(&mixer, tab, 50.2);
+                let want = edited
+                    .as_ref()
+                    .and_then(Adjustment::channel_mixer)
+                    .map(|p| p.rows());
+                let mut expected = mixer
+                    .channel_mixer()
+                    .map(|p| p.rows())
+                    .unwrap_or_else(|| unreachable!("mixer"));
+                expected[tab][slot] = 50.0;
+                assert_eq!(want, Some(expected), "{tab} {s:?}");
+            }
+        }
+        assert_eq!(S::MixerRed.value_of(&mixer, 3), None, "no such output");
+        assert_eq!(S::MixerRed.with_value(&mixer, 3, 5.0), None);
+        // The ranges: sources to 200, the constant to 100, both signed.
+        assert_eq!(S::MixerBlue.range(), (-200.0, 200.0));
+        assert_eq!(S::MixerConstant.range(), (-100.0, 100.0));
+        assert_eq!(S::MixerRed.snap(250.0), 200.0);
+        assert_eq!(S::MixerConstant.snap(-250.0), -100.0);
+        // Monochrome: the first row whatever the tab.
+        let mono = Adjustment::ChannelMixer(
+            mixer
+                .channel_mixer()
+                .map(|p| p.with_monochrome(true))
+                .unwrap_or_else(|| unreachable!("mixer")),
+        );
+        assert_eq!(S::MixerGreen.value_of(&mono, 2), Some(2.0));
+        let edited = S::MixerGreen.with_value(&mono, 2, 77.0);
+        assert_eq!(
+            edited
+                .as_ref()
+                .and_then(Adjustment::channel_mixer)
+                .map(|p| p.rows()[0][1]),
+            Some(77.0)
+        );
+        // In the tree: the output selector is live only for the mixer and idle in Monochrome.
+        let mut layers = LayerTree::new();
+        let id = add(&mut layers, "mix", mixer.clone());
+        let _ = show(&mut ws, controls, &layers, Some(id));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::ChannelMixer)
+        );
+        assert!(
+            widgets::tab_bar_state(&ws.tree, controls.mixer_output).is_ok_and(|t| !t.is_disabled())
+        );
+        assert!(
+            widgets::tab_bar_state(&ws.tree, controls.selective_range)
+                .is_ok_and(|t| t.is_disabled())
+        );
+        assert!(
+            widgets::tab_bar_state(&ws.tree, controls.balance_range).is_ok_and(|t| t.is_disabled())
+        );
+        assert!(!super::adjust_mixer_mono_checked(&ws.tree, controls));
+        assert_eq!(readout(&ws, controls, S::MixerRed), "Red output, Red: +1");
+        let _ = widgets::select_tab(&mut ws.tree, controls.mixer_output, 2);
+        let _ = show(&mut ws, controls, &layers, Some(id));
+        assert_eq!(
+            super::adjust_tab(&ws.tree, controls, AdjustKind::ChannelMixer),
+            2
+        );
+        assert_eq!(at(&ws, S::MixerBlue), (11.0, false));
+        assert_eq!(
+            readout(&ws, controls, S::MixerBlue),
+            "Blue output, Blue: +11"
+        );
+        assert_eq!(
+            super::adjust_tab(&ws.tree, controls, AdjustKind::Threshold),
+            0
+        );
+        let _ = layers.set_adjustment(id, mono);
+        let _ = show(&mut ws, controls, &layers, Some(id));
+        assert!(super::adjust_mixer_mono_checked(&ws.tree, controls));
+        assert!(
+            widgets::tab_bar_state(&ws.tree, controls.mixer_output).is_ok_and(|t| t.is_disabled())
+        );
+        assert_eq!(at(&ws, S::MixerBlue), (3.0, false), "the Gray row");
+        assert_eq!(readout(&ws, controls, S::MixerBlue), "Gray, Blue: +3");
+
+        // Selective Color: nine ranges in two steps.
+        let mut ranges = [[0.0_f32; 4]; 9];
+        for (i, row) in ranges.iter_mut().enumerate() {
+            *row = [i as f32, -(i as f32), 10.0 + i as f32, -10.0 - i as f32];
+        }
+        let selective = Adjustment::SelectiveColor(
+            match aurora_core::SelectiveColorParams::new(ranges, true) {
+                Ok(p) => p,
+                Err(err) => unreachable!("{err:?}"),
+            },
+        );
+        for (range, row) in ranges.iter().enumerate() {
+            for (slot, s) in [
+                S::SelectiveCyan,
+                S::SelectiveMagenta,
+                S::SelectiveYellow,
+                S::SelectiveBlack,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(s.value_of(&selective, range), Some(f64::from(row[slot])));
+                let edited = s.with_value(&selective, range, -5.0);
+                let mut want = ranges;
+                want[range][slot] = -5.0;
+                assert_eq!(
+                    edited
+                        .as_ref()
+                        .and_then(Adjustment::selective_color)
+                        .map(|p| p.ranges()),
+                    Some(want)
+                );
+            }
+        }
+        assert_eq!(S::SelectiveCyan.value_of(&selective, 9), None);
+        assert_eq!(S::SelectiveBlack.range(), (-100.0, 100.0));
+        let id = add(&mut layers, "sel", selective);
+        let _ = show(&mut ws, controls, &layers, Some(id));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::SelectiveColor)
+        );
+        assert!(super::adjust_selective_absolute_checked(&ws.tree, controls));
+        assert!(
+            widgets::tab_bar_state(&ws.tree, controls.mixer_output).is_ok_and(|t| t.is_disabled())
+        );
+        assert!(
+            widgets::tab_bar_state(&ws.tree, controls.selective_range)
+                .is_ok_and(|t| !t.is_disabled())
+        );
+        // Group 0 + colour bar tab 3 is Cyans; groups 1..3 are Whites, Neutrals, Blacks.
+        let _ = widgets::select_tab(&mut ws.tree, controls.selective_range, 3);
+        for (group, colour, want) in [(0, 3, 3), (0, 5, 5), (1, 0, 6), (2, 4, 7), (3, 1, 8)] {
+            let _ = widgets::select_tab(&mut ws.tree, controls.selective_group, group);
+            let _ = widgets::select_tab(&mut ws.tree, controls.selective_range, colour);
+            let _ = show(&mut ws, controls, &layers, Some(id));
+            let tab = super::adjust_tab(&ws.tree, controls, AdjustKind::SelectiveColor);
+            assert_eq!(tab, want, "group {group} colour {colour}");
+            assert_eq!(at(&ws, S::SelectiveCyan).0, want as f64);
+            assert_eq!(
+                widgets::tab_bar_state(&ws.tree, controls.selective_range)
+                    .is_ok_and(|t| t.is_disabled()),
+                group != 0,
+                "the colour bar is idle outside group 0"
+            );
+        }
+        assert_eq!(
+            readout(&ws, controls, S::SelectiveBlack),
+            "Blacks, Black: -18"
+        );
+        // Hidden again for another layer.
+        let _ = show(&mut ws, controls, &layers, None);
+        assert_eq!(adjust_controls_shown(&ws.tree, controls), None);
+    }
 }

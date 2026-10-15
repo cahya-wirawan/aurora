@@ -41645,7 +41645,7 @@ mod tests {
         // 0.241.0: five of those (Exposure, Vibrance, Color Balance, Black &
         // White, Photo Filter) are imported, 8 left out: max 230 -> 204, mean
         // 125.9 / 51.5 / 32.0 -> 106.6 / 30.5 / 26.0.
-        ("fill_adjustments.psd", 204.0, Some("4 adjustment layers")),
+        ("fill_adjustments.psd", 204.0, Some("2 adjustment layers")),
         // A clipped layer whose base is not a pixel layer shown unclipped
         // (0.201.0: the other clipped layers are clipped for real).
         (
@@ -45121,8 +45121,10 @@ mod tests {
         // "New Vibrance Layer", "New Exposure Layer" and "New Photo Filter
         // Layer", and (0.240.0) "New Black & White Layer" and "New Color
         // Balance Layer", and (0.244.0) "New Invert Layer", "New Threshold
-        // Layer", "New Posterize Layer" and "New Brightness/Contrast Layer".
-        assert_eq!(state.results().len(), 25);
+        // Layer", "New Posterize Layer" and "New Brightness/Contrast Layer",
+        // and (0.245.0) "New Channel Mixer Layer" and "New Selective Color
+        // Layer".
+        assert_eq!(state.results().len(), 27);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
