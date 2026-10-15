@@ -337,7 +337,13 @@ fn the_command_is_in_the_palette_and_routes_to_its_prompt() {
 fn the_default_fuzziness_is_forty_and_the_app_reads_the_foreground_and_the_mode() {
     assert_eq!(ToolSettings::default().colour_range_fuzziness, 40);
     // `App::run_colour_range` needs a window: pin what it feeds the step.
-    let lib = include_str!("lib.rs");
-    assert!(lib.contains("self.colour.state.range_colour(),\n            fuzziness,"));
-    assert!(lib.contains("self.tool_settings.selection_mode,\n        ) {\n            colour_range_app::ColourRangeOutcome::Applied"));
+    // Whitespace is dropped so a CRLF checkout (Windows) matches too.
+    let lib: String = include_str!("lib.rs")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(lib.contains("self.colour.state.range_colour(),fuzziness,"));
+    assert!(lib.contains(
+        "self.tool_settings.selection_mode,){colour_range_app::ColourRangeOutcome::Applied"
+    ));
 }
