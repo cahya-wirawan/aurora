@@ -548,3 +548,86 @@ fn a_bigger_fuzziness_never_covers_less() {
         previous = now;
     }
 }
+
+#[test]
+fn texels_past_the_layers_edge_are_never_read_even_if_the_tile_holds_them() {
+    let (_dir, mut store) = new_store();
+    // A 10 x 10 layer whose tile also holds red at (20, 20), outside it.
+    for y in 0..10 {
+        for x in 0..10 {
+            put(&mut store, x, y, [0.7, 0.2, 0.2, 1.0]);
+        }
+    }
+    put(&mut store, 20, 20, [0.7, 0.2, 0.2, 1.0]);
+    put(&mut store, 20, 5, [0.7, 0.2, 0.2, 1.0]);
+    put(&mut store, 5, 20, [0.7, 0.2, 0.2, 1.0]);
+    let mask = colour_range(
+        &mut store,
+        surface(),
+        (10, 10),
+        &spec([0.7, 0.2, 0.2], 40, rect(0, 0, 100, 100)),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(mask.bounds, rect(0, 0, 10, 10));
+}
+
+/// Costs (run with `--ignored --nocapture`); asserts nothing about time.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn measure_colour_range_and_quick_select_costs() {
+    let (w, h) = (4096_u32, 4096_u32);
+    let (_dir, mut store) = new_store();
+    let mut state = 1_u64;
+    for ty in 0..16_u32 {
+        for tx in 0..16_u32 {
+            let tile = store.get_mut(surface(), TileId { x: tx, y: ty }).unwrap();
+            for (i, texel) in tile.texels_mut().chunks_exact_mut(4).enumerate() {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let noise = ((state >> 40) % 64) as f32 / 255.0;
+                let base = 0.3 + 0.3 * ((i % 256) as f32 / 256.0);
+                texel[0] = f16::from_f32(base + noise);
+                texel[1] = f16::from_f32(0.4 + noise);
+                texel[2] = f16::from_f32(0.5);
+                texel[3] = f16::from_f32(1.0);
+            }
+        }
+    }
+    let start = std::time::Instant::now();
+    let m = colour_range(
+        &mut store,
+        surface(),
+        (w, h),
+        &spec([0.45, 0.45, 0.5], 40, rect(0, 0, w, h)),
+    )
+    .unwrap();
+    println!(
+        "colour range, noisy 16 Mpx: {:?} ({} bytes of mask)",
+        start.elapsed(),
+        m.map_or(0, |m| m.data.len())
+    );
+    for radius in [24.0_f32, 100.0, 256.0] {
+        let mut grown = crate::QuickRegion::new(MAX_FILL_TILES);
+        let start = std::time::Instant::now();
+        let st = crate::QuickStamp {
+            centre: (2000.0, 2000.0),
+            radius,
+            tolerance: 32,
+        };
+        let grew =
+            crate::quick_select_stamp(&mut store, surface(), (w, h), &st, &mut grown).unwrap();
+        println!(
+            "quick select stamp r={radius}, noisy: {:?} (grew {grew})",
+            start.elapsed()
+        );
+        let start = std::time::Instant::now();
+        let r = grown.to_region().unwrap();
+        println!(
+            "  to_region: {:?} ({} texels box)",
+            start.elapsed(),
+            r.map_or(0, |r| r.data.len())
+        );
+    }
+}
