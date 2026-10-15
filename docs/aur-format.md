@@ -479,6 +479,8 @@ See 8.5 for the entry layout. A `SmartObject` (`crates/aurora-doc/src/smart_obje
 | 10 | `Threshold(ThresholdParams)` | `u8` level (one raw byte) | 1 | 1..=255 | `thrs` | 0.244.0 |
 | 11 | `Posterize(PosterizeParams)` | `u8` level count (one raw byte) | 1 | 2..=255 | `post` | 0.244.0 |
 | 12 | `BrightnessContrast(BrightnessContrastParams)` | tuple `(brightness: i16, contrast: i16, use_legacy: bool)` (zig-zag varints, then a byte) | 3..=7 | non-legacy: brightness -150..=150, contrast -50..=100; legacy: both -100..=100 | `brit` (+ `CgEd` for non-legacy per `write_adjust.rs`) | 0.244.0 |
+| 13 | `ChannelMixer(ChannelMixerParams)` | tuple of three rows `[red, green, blue, constant]` (percent) plus a `monochrome: bool`, 49 bytes | - | sources -200..=200, constant -100..=100 (each validated at decode via `try_from`) | `mixr` (a Monochrome mixer is refused on PSD save: the Gray row is unverified) | 0.245.0 |
+| 14 | `SelectiveColor(SelectiveColorParams)` | nine rows `[cyan, magenta, yellow, black]` (ranges in the order Reds, Yellows, Greens, Cyans, Blues, Magentas, Whites, Neutrals, Blacks) plus an `absolute: bool`, 145 bytes | - | sliders -100..=100 | `selc` (a non-neutral layer is refused on PSD save: the file's plate order is unverified) | 0.245.0 |
 
 Sources: `crates/aurora-doc/src/layer.rs:66-122`; parameter files in `crates/aurora-core/src/` (`curves.rs`, `tone_curve.rs`, `levels.rs`, `hue_saturation.rs`, `hue_ranges.rs`, `vibrance.rs`, `exposure.rs`, `photo_filter.rs`, `black_white.rs`, `color_balance.rs`, `threshold.rs`, `posterize.rs`, `brightness_contrast.rs`); PSD key mapping from `Adjustment` in `crates/aurora-io/src/psd/write_adjust.rs:161-182` (`encode_adjustment`).
 
@@ -486,7 +488,7 @@ Standard Hue/Saturation range edges (`DEFAULT_HUE_RANGE_EDGES`, `hue_ranges.rs`)
 
 Normalisation rule for writers: a Hue/Saturation layer whose six ranges equal the standard edges with all adjustments zero SHOULD be written as ordinal 2 (`Adjustment::from_hue_saturation`), so that 0.203.0-era bytes are unchanged; ordinal 3 is also valid in that case and is decoded.
 
-Ordinals 13 and 14 do **not** exist on `main`. A separate unmerged branch (`102-mixer_selective_gradientmap_lookup`, commits "WIP: Channel Mixer and Selective Color ...") is referenced in the repository history; nothing on `main` defines them, so they are out of scope here (G-13).
+Ordinals 13 (Channel Mixer) and 14 (Selective Color) were appended in 0.245.0, with no manifest version change; an older reader refuses such a file (see G-13).
 
 Adjustment layers have no content surface and no `bounds`; they apply to the composite below them *within their own group* (groups are isolated for adjustments, CLAUDE.md).
 
@@ -804,7 +806,7 @@ Numbering is for cross-reference; "G-n" is used above. Citations are file and fu
 * **G-10. Introduction versions of the original `LayerOp` variants and of `SetBounds` are not documented** in the sources read. The ADR addenda start at 0.149.0.
 * **G-11. Documentation conflict on pixel alpha.** `aurora-gpu`'s residency and `aurora-render`'s mip filter describe the tile store as **straight alpha**; `aurora-brush` docs speak of "premultiplied" texels for their own arithmetic (`clone.rs`, `amount.rs`, `tone_brush.rs`, `filter_brush.rs`), and CLAUDE.md describes the brush's math as on "premultiplied `f16` channels". I took the GPU/mip statements (which describe what the store holds when uploading) as the stored convention. A third-party reader should verify with a real file before depending on it. No field in the file records the alpha mode.
 * **G-12. Integrity beyond ZIP CRC-32 is absent**, and the code does not itself assert that CRCs are checked on read; that is `zip` crate behaviour not exercised by a repo test.
-* **G-13. Adjustment ordinals 13 and 14** (Channel Mixer, Selective Color) are in WIP commits of an unmerged branch and are not part of `main`. If that branch merges they will be appended without a manifest version change; any older reader will refuse such files.
+* **G-13. Adjustment ordinals 13 and 14** (Channel Mixer, Selective Color) landed in 0.245.0 and are appended without a manifest version change; any older reader refuses such files. Their parameter layouts above come from `aurora-core`'s `channel_mixer.rs` and `selective_color.rs`; this spec was written before they merged, so re-check the byte counts against the code.
 * **G-14. Duplicate ZIP entry names, zero-length entries, ZIP64, and archive comments** are not specified. Tile entries are small, but the archive as a whole can exceed 4 GiB (a 300,000 px document can hold millions of tiles); the `zip` crate's Zip64 handling is assumed, not asserted by any test in this repo.
 * **G-15. Save As `.aur` is less careful than the PSD save and than the autosave.** `save_aur_file` (`lib.rs:32230`) writes `<name>.tmp` with a fixed name via `File::create` (it truncates an existing file of that name and is not exclusive), does not call `sync_all` on the file or the directory, then renames. The generic `safe_save` module (O_EXCL random temp name, `sync_all`, verify by path, rename, directory fsync) and the autosave writer (`create_new`, mode 0600, `sync_all`) are stronger. CLAUDE.md's "never overwrite a user's file in place; write to temp, verify, swap" is met; its durability implication is not.
 * **G-16. Stale ADR text.** ADR 0009 lines 57 and 59 (Vibrance/Exposure/PhotoFilter, ColorBalance addenda) say "PSD save of these layers is refused by name"; since 0.241.0 the PSD writer writes `vibA`, `expA`, `phfl`, `blwh`, `blnc` (CHANGELOG 0.241.0; `psd/write_adjust.rs:161-170`). The ADR's opening line ("a first entry `mimetype`" and "`history`: `History::replay`'s log") describes intent, not enforced rules (G-1, G-3). `aur.rs`'s comment in `read_layer_clipping` ("Bottom-most first") is also stale: the wire order is top-first (`layer_ids` pre-order) and `set_clipped` does not depend on order.
@@ -876,7 +878,7 @@ Numbering is for cross-reference; "G-n" is used above. Citations are file and fu
 
 **`ColorSpaceTag`:** 0 Srgb, 1 Icc.
 
-**`Adjustment`:** 0 Curves, 1 Levels, 2 HueSaturation, 3 HueSaturationRanges, 4 Vibrance, 5 Exposure, 6 PhotoFilter, 7 BlackWhite, 8 ColorBalance, 9 Invert, 10 Threshold, 11 Posterize, 12 BrightnessContrast. (Detail: 7.8.)
+**`Adjustment`:** 0 Curves, 1 Levels, 2 HueSaturation, 3 HueSaturationRanges, 4 Vibrance, 5 Exposure, 6 PhotoFilter, 7 BlackWhite, 8 ColorBalance, 9 Invert, 10 Threshold, 11 Posterize, 12 BrightnessContrast, 13 ChannelMixer, 14 SelectiveColor. (Detail: 7.8.)
 
 **`BlendMode`:** 0..=27 per 7.1 (27 = PassThrough, group-only).
 
