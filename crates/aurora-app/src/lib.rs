@@ -40801,6 +40801,8 @@ mod tests {
         (document, image)
     }
 
+    mod psd_five_adjust_tests;
+
     fn near(actual: [f32; 4], expected: [f32; 4]) -> bool {
         actual
             .iter()
@@ -40873,7 +40875,10 @@ mod tests {
         // Levels layer, 14 before 0.203.0 imported its master-only
         // Hue/Saturation layer: max 240 -> 230, mean 133.1 / 58.7 / 39.1 ->
         // 125.9 / 51.5 / 32.0).
-        ("fill_adjustments.psd", 230.0, Some("13 adjustment layers")),
+        // 0.241.0: five of those (Exposure, Vibrance, Color Balance, Black &
+        // White, Photo Filter) are imported, 8 left out: max 230 -> 204, mean
+        // 125.9 / 51.5 / 32.0 -> 106.6 / 30.5 / 26.0.
+        ("fill_adjustments.psd", 204.0, Some("8 adjustment layers")),
         // A clipped layer whose base is not a pixel layer shown unclipped
         // (0.201.0: the other clipped layers are clipped for real).
         (
@@ -40889,25 +40894,22 @@ mod tests {
         // Curves inside Pass Through groups — composited as Pass Through
         // since 0.179.0, so no longer reported; what remains is named in
         // each file's own report (a Levels layer left out, fill layers).
+        // 0.241.0: the Exposure layers these files hold (left out before)
+        // are imported: max 137 -> 23, 113 -> 18, 84 -> 2 (file 5 held the
+        // layer the old comment blamed on Hue/Saturation; it is Exposure).
         (
             "adjustments/adjustment_nested_composition_1.psd",
-            137.0,
+            23.0,
             None,
         ),
         ("adjustments/adjustment_nested_composition_2.psd", 3.0, None),
         ("adjustments/adjustment_nested_composition_3.psd", 1.0, None),
         (
             "adjustments/adjustment_nested_composition_4.psd",
-            113.0,
+            18.0,
             None,
         ),
-        // A Hue/Saturation layer left out (its Levels layer is imported since
-        // 0.202.0; the maximum is Hue/Saturation's, unchanged at 84).
-        (
-            "adjustments/adjustment_nested_composition_5.psd",
-            84.0,
-            Some("1 adjustment layer"),
-        ),
+        ("adjustments/adjustment_nested_composition_5.psd", 2.0, None),
     ];
 
     /// One corpus file's Curves differential (0.158.0): Aurora's CPU
@@ -41502,12 +41504,20 @@ mod tests {
         ("passthrough_blendmodes1.psd", 1.0),
         ("passthrough_blendmodes2.psd", 1.0),
         ("passthrough_blendmodes3.psd", 2.0),
-        ("passthrough_opacity.psd", 86.0),
+        // 0.241.0: the Exposure layers in the next four files are imported
+        // (they were left out). Opacity 86 -> 4 and vector mask 156 -> 8
+        // improve; the two Exposure -3.53 files do not: in
+        // `passthrough_fill_adjustment.psd` the Pass Through group's Fill
+        // (40 %) is not applied by Aurora (the report says so) while
+        // Photoshop shows almost none of the darkening (mean error 6.8
+        // with the layer left out, 165 now), and in the clipping-mask file
+        // the clipped layer is shown unclipped (reported), 170 -> 171.
+        ("passthrough_opacity.psd", 4.0),
         ("passthrough_fill_blendmode.psd", 134.0),
-        ("passthrough_fill_adjustment.psd", 152.0),
-        ("passthrough_vector_mask.psd", 156.0),
+        ("passthrough_fill_adjustment.psd", 172.0),
+        ("passthrough_vector_mask.psd", 8.0),
         ("passthrough_clipping_mask_blendmode.psd", 1.0),
-        ("passthrough_clipping_mask_adjustment.psd", 170.0),
+        ("passthrough_clipping_mask_adjustment.psd", 171.0),
     ];
 
     /// AC-4 (0.179.0): the user's own Photoshop template (not committed;
