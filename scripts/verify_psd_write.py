@@ -321,6 +321,13 @@ def adjustment_summary(layer):
     bal = blocks.get_data(Tag.COLOR_BALANCE)
     if bal is not None:
         return ("balance", (tuple(bal.shadows), tuple(bal.midtones), tuple(bal.highlights), int(bal.luminosity)))
+    # 0.245.0: Channel Mixer and Selective Color.
+    mix = blocks.get_data(Tag.CHANNEL_MIXER)
+    if mix is not None:
+        return ("mixer", (mix.version, mix.monochrome, tuple(mix.data)))
+    sel = blocks.get_data(Tag.SELECTIVE_COLOR)
+    if sel is not None:
+        return ("selective", (sel.version, sel.method, [tuple(p) for p in sel.data]))
     # 0.244.0: Threshold, Posterize, Invert, Brightness/Contrast.
     thr = blocks.get_data(Tag.THRESHOLD)
     if thr is not None:
@@ -469,6 +476,43 @@ def check_adjustments4(folder):
     print("OK: psd-tools read the Invert, Threshold, Posterize and Brightness/Contrast blocks and records")
 
 
+def check_adjustments2(folder):
+    """0.245.0: Channel Mixer and Selective Color layers read back in
+    psd-tools with the integers of `adjustments2.json` (written by the Rust
+    fixture test `two_adjustments_fixture_for_psd_tools`). Their layout is
+    psd-tools', which Aurora's parser also follows; Photoshop has not opened
+    the files."""
+    spec_path = folder / "adjustments2.json"
+    if not spec_path.exists():
+        print("no adjustments2.json: the two-kind pass was skipped")
+        return
+    want = json.loads(spec_path.read_text(encoding="utf-8"))
+    psd = PSDImage.open(folder / "adjustments2.psd")
+    m = find_layer(psd, "Mixer")
+    check("Mixer kind", m.kind, "channelmixer")
+    check("Mixer opacity", m.opacity, 128)
+    check("Mixer blend", m.blend_mode.name, "MULTIPLY")
+    check("Mixer mask bbox", tuple(m.mask.bbox), (2, 2, 12, 12))
+    version, mono, data = adjustment_summary(m)[1]
+    check("Mixer version and monochrome", (version, mono), (1, 0))
+    # psd-tools reads the first five values (row 0: red, green, blue, unused,
+    # constant); the rows are checked from the whole block.
+    red = want["mixer"][0]
+    check("Mixer first row", list(data), [red[0], red[1], red[2], 0, red[3]])
+    swap = find_layer(psd, "Swap")
+    version, mono, data = adjustment_summary(swap)[1]
+    check("Swap flag", (version, mono), (1, 0))
+    row = want["swap"][0]
+    check("Swap first row", list(data), [row[0], row[1], row[2], 0, row[3]])
+    s = find_layer(psd, "Selective")
+    check("Selective kind", s.kind, "selectivecolor")
+    check("Selective visible", s.visible, False)
+    version, method, plates = adjustment_summary(s)[1]
+    check("Selective version and method", (version, method), (1, 1 if want["absolute"] else 0))
+    check("Selective plates (neutral)", [tuple(p) for p in plates], [(0, 0, 0, 0)] * 10)
+    print("OK: psd-tools read the Channel Mixer and Selective Color blocks and records")
+
+
 def check_resaves(folder):
     """Each kept `resave_<name>.psd` against the original corpus file."""
     corpus = Path(__file__).resolve().parent.parent / "corpora/psd/reference/psd-tools-fixtures"
@@ -485,9 +529,9 @@ def check_resaves(folder):
         original = PSDImage.open(matches[0])
         resaved = PSDImage.open(saved)
         a = [(l.name, l.kind, adjustment_summary(l)) for l in original.descendants()
-             if l.kind in ("curves", "levels", "huesaturation", "vibrance", "exposure", "photofilter", "blackandwhite", "colorbalance", "invert", "threshold", "posterize", "brightnesscontrast")]
+             if l.kind in ("curves", "levels", "huesaturation", "vibrance", "exposure", "photofilter", "blackandwhite", "colorbalance", "invert", "threshold", "posterize", "brightnesscontrast", "channelmixer", "selectivecolor")]
         b = [(l.name, l.kind, adjustment_summary(l)) for l in resaved.descendants()
-             if l.kind in ("curves", "levels", "huesaturation", "vibrance", "exposure", "photofilter", "blackandwhite", "colorbalance", "invert", "threshold", "posterize", "brightnesscontrast")]
+             if l.kind in ("curves", "levels", "huesaturation", "vibrance", "exposure", "photofilter", "blackandwhite", "colorbalance", "invert", "threshold", "posterize", "brightnesscontrast", "channelmixer", "selectivecolor")]
         check(f"{name} adjustment layers", sorted(x[:2] for x in a), sorted(x[:2] for x in b))
         same = sum(1 for x in a if x in b)
         # Merged images: psd-tools' own composite of each file's layers and
@@ -581,3 +625,4 @@ if __name__ == "__main__":
     check_adjustments(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_adjustments5(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_adjustments4(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
+    check_adjustments2(Path(sys.argv[1] if len(sys.argv) > 1 else "."))

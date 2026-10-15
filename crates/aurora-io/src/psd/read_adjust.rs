@@ -50,6 +50,20 @@
 //!   (`Vrsn` 1, `Brgh`, `Cntr`, `means`, `Lab `, `useLegacy`, `Auto`).
 //!   Layers using Auto, Lab-only or a mean other than 127 are left out.
 //!
+//! * 0.245.0 (revised): a Monochrome `mixr` and a `selc` that adjusts anything
+//!   are **left out** with their own report line, because psd-tools'
+//!   parsers (`psd/adjustments.py`, `ChannelMixer` and `SelectiveColor`)
+//!   name neither the Gray row nor the order of the ten plates and no
+//!   fixture constrains them. Neutral layers (any method) and non-Monochrome
+//!   mixers import.
+//! * 0.245.0: `mixr` and `selc`, checked on `layers/channel-mixer.psd`,
+//!   `layers/selective-color.psd` and `fill_adjustments.psd` (the neutral
+//!   layers; 44 and 84 bytes) and against psd-tools 1.17.4's parsers. **Only
+//!   the neutral case is verified**: the Monochrome row of `mixr` and the
+//!   plate order of `selc` are not (no fixture has either), and the formulas
+//!   applied to a non-neutral layer are unvalidated approximations (see
+//!   `aurora-filters`' `channel_mixer` and `selective_color`).
+//!
 //! Every parser is total: short data, an unknown version or a hostile
 //! descriptor is an `Err`, never a panic, and nothing allocates more than
 //! the descriptor parser's bounded, byte-checked amount.
@@ -77,6 +91,8 @@ pub(super) enum Kind {
     Threshold,
     Posterize,
     BrightnessContrast,
+    ChannelMixer,
+    SelectiveColor,
 }
 
 impl Kind {
@@ -92,6 +108,8 @@ impl Kind {
             Self::Threshold => "Threshold",
             Self::Posterize => "Posterize",
             Self::BrightnessContrast => "Brightness/Contrast",
+            Self::ChannelMixer => "Channel Mixer",
+            Self::SelectiveColor => "Selective Color",
         }
     }
 }
@@ -157,6 +175,29 @@ pub(super) struct BritBlock {
     pub lab: bool,
 }
 
+/// A parsed `mixr` block (0.245.0): version `1`, the Monochrome flag, then
+/// four output rows of five `i16` (red, green, blue and a fourth source that
+/// only CMYK documents use, then the constant). Only the first three rows
+/// matter for RGB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MixerBlock {
+    pub monochrome: bool,
+    /// `[output][red, green, blue, constant]` for the red, green and blue
+    /// outputs.
+    pub rows: [[i16; 4]; 3],
+}
+
+/// A parsed `selc` block (0.245.0): version `1`, the method (`0` Relative,
+/// `1` Absolute) and ten plates of four `i16` (cyan, magenta, yellow,
+/// black). The first plate is unused; the other nine are Reds, Yellows,
+/// Greens, Cyans, Blues, Magentas, Whites, Neutrals, Blacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SelectiveBlock {
+    pub absolute: bool,
+    pub unused: [i16; 4],
+    pub ranges: [[i16; 4]; 9],
+}
+
 /// The `CgEd` descriptor of a non-legacy Brightness/Contrast layer
 /// (0.244.0): `Vrsn`, `Brgh`, `Cntr`, `means`, `Lab `, `useLegacy`, `Auto`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -186,6 +227,10 @@ pub(super) enum Parsed {
     PhotoFilter(Result<PhotoFilterBlock, ()>),
     BlackWhite(Result<BlackWhiteBlock, ()>),
     ColorBalance(Result<ColorBalanceBlock, ()>),
+    /// `mixr` (0.245.0).
+    ChannelMixer(Result<MixerBlock, ()>),
+    /// `selc` (0.245.0).
+    SelectiveColor(Result<SelectiveBlock, ()>),
 }
 
 /// The parser for `key`, or `None` for a key that is not one of the five.
@@ -200,6 +245,8 @@ pub(super) fn parse_block(key: [u8; 4], data: &[u8]) -> Option<Parsed> {
         b"thrs" => Parsed::Threshold(parse_level(data)),
         b"post" => Parsed::Posterize(parse_level(data)),
         b"brit" => Parsed::Brightness(parse_brit(data), None),
+        b"mixr" => Parsed::ChannelMixer(parse_mixer(data)),
+        b"selc" => Parsed::SelectiveColor(parse_selective(data)),
         _ => return None,
     })
 }
@@ -208,7 +255,17 @@ pub(super) fn parse_block(key: [u8; 4], data: &[u8]) -> Option<Parsed> {
 pub(super) fn is_key(key: [u8; 4]) -> bool {
     matches!(
         &key,
-        b"vibA" | b"expA" | b"phfl" | b"blwh" | b"blnc" | b"nvrt" | b"thrs" | b"post" | b"brit"
+        b"vibA"
+            | b"expA"
+            | b"phfl"
+            | b"blwh"
+            | b"blnc"
+            | b"nvrt"
+            | b"thrs"
+            | b"post"
+            | b"brit"
+            | b"mixr"
+            | b"selc"
     )
 }
 
@@ -623,6 +680,133 @@ fn brightness_contrast_adjustment(
         .map_err(|_| unreadable())
 }
 
+// ---------------------------------------------------------------------
+// Channel Mixer and Selective Color (0.245.0)
+// ---------------------------------------------------------------------
+
+/// A `mixr` block: `u16` version (`1`), `u16` Monochrome (`0` or `1`), then
+/// four rows of five `i16` (checked on `layers/channel-mixer.psd` and
+/// `fill_adjustments.psd`, both the neutral mixer: rows `100,0,0,0,0`,
+/// `0,100,0,0,0`, `0,0,100,0,0`, `0,0,0,100,0`, so the fourth source of a
+/// row is the black of a CMYK document and the fifth value the constant, as
+/// Adobe's spec says). Exactly 44 bytes.
+/// A non-zero fourth source on an RGB row is left out as unreadable. **No fixture has Monochrome on**, so which row holds the Gray
+/// mix is unverified (the first is assumed).
+fn parse_mixer(data: &[u8]) -> Result<MixerBlock, ()> {
+    // Exactly 44 bytes, as in every fixture: a longer block is something
+    // this layout does not describe.
+    if data.len() != 44 {
+        return Err(());
+    }
+    let mut r = Reader::new(data);
+    let unreadable = |_| ();
+    if r.u16("mixer version").map_err(unreadable)? != 1 {
+        return Err(());
+    }
+    let monochrome = match r.u16("mixer monochrome").map_err(unreadable)? {
+        0 => false,
+        1 => true,
+        _ => return Err(()),
+    };
+    let mut rows = [[0_i16; 4]; 3];
+    for row in &mut rows {
+        let mut values = [0_i16; 5];
+        for v in &mut values {
+            *v = r.i16("mixer value").map_err(unreadable)?;
+        }
+        let [red, green, blue, fourth, constant] = values;
+        // The fourth source is the black of a CMYK document; on an RGB row
+        // every fixture holds 0, and anything else is not understood.
+        if fourth != 0 {
+            return Err(());
+        }
+        *row = [red, green, blue, constant];
+    }
+    Ok(MixerBlock { monochrome, rows })
+}
+
+/// A parsed block as Aurora's Channel Mixer (sources `-200..=200`,
+/// constants `-100..=100`; anything else is left out, not repaired).
+pub(super) fn channel_mixer_adjustment(block: &MixerBlock, gray: bool) -> Result<Adjustment, Note> {
+    if gray {
+        return Err(Note::Grayscale(Kind::ChannelMixer));
+    }
+    // Which row holds the Gray mix is in no fixture and not in psd-tools
+    // (`psd/adjustments.py` `ChannelMixer.read`: version, monochrome, five
+    // `i16`, the rest kept as `unknown`): a Monochrome mixer is left out.
+    if block.monochrome {
+        return Err(Note::Unverified(Kind::ChannelMixer));
+    }
+    aurora_core::ChannelMixerParams::new(block.rows.map(|r| r.map(f32::from)), block.monochrome)
+        .map(Adjustment::ChannelMixer)
+        .map_err(|_| Note::Unreadable(Kind::ChannelMixer))
+}
+
+/// A `selc` block: `u16` version (`1`), `u16` method (`0` Relative, `1`
+/// Absolute), ten plates of four `i16` — 84 bytes, as in both fixtures
+/// (all neutral, so the **plate order is unverified**: the first plate is
+/// taken as unused and the next nine as the Photoshop menu order; a
+/// non-zero first plate is left out rather than guessed at).
+fn parse_selective(data: &[u8]) -> Result<SelectiveBlock, ()> {
+    // Exactly 84 bytes, as in every fixture.
+    if data.len() != 84 {
+        return Err(());
+    }
+    let mut r = Reader::new(data);
+    let unreadable = |_| ();
+    if r.u16("selective version").map_err(unreadable)? != 1 {
+        return Err(());
+    }
+    let absolute = match r.u16("selective method").map_err(unreadable)? {
+        0 => false,
+        1 => true,
+        _ => return Err(()),
+    };
+    let mut plate = || -> Result<[i16; 4], ()> {
+        let mut p = [0_i16; 4];
+        for v in &mut p {
+            *v = r.i16("selective value").map_err(unreadable)?;
+        }
+        Ok(p)
+    };
+    let unused = plate()?;
+    let mut ranges = [[0_i16; 4]; 9];
+    for range in &mut ranges {
+        *range = plate()?;
+    }
+    Ok(SelectiveBlock {
+        absolute,
+        unused,
+        ranges,
+    })
+}
+
+/// A parsed block as Aurora's Selective Color (`-100..=100` sliders).
+pub(super) fn selective_color_adjustment(
+    block: &SelectiveBlock,
+    gray: bool,
+) -> Result<Adjustment, Note> {
+    if gray {
+        return Err(Note::Grayscale(Kind::SelectiveColor));
+    }
+    if block.unused != [0; 4] {
+        return Err(Note::Unreadable(Kind::SelectiveColor));
+    }
+    let params = aurora_core::SelectiveColorParams::new(
+        block.ranges.map(|r| r.map(f32::from)),
+        block.absolute,
+    )
+    .map_err(|_| Note::Unreadable(Kind::SelectiveColor))?;
+    // The order of the plates is in no fixture and not in psd-tools
+    // (`psd/adjustments.py` `SelectiveColor.read`: version, method, ten
+    // plates of four `i16`, no names): a layer that adjusts anything would
+    // be applied to colours nobody has verified, so it is left out.
+    if !params.is_identity() {
+        return Err(Note::Unverified(Kind::SelectiveColor));
+    }
+    Ok(Adjustment::SelectiveColor(params))
+}
+
 /// A parsed block as an adjustment, or the reason it is left out.
 pub(super) fn adjustment(parsed: &Parsed, gray: bool) -> Result<Adjustment, Note> {
     match parsed {
@@ -669,6 +853,14 @@ pub(super) fn adjustment(parsed: &Parsed, gray: bool) -> Result<Adjustment, Note
                 .map(Adjustment::Posterize)
                 .map_err(|()| Note::Unreadable(Kind::Posterize)),
         },
+        Parsed::ChannelMixer(b) => b
+            .as_ref()
+            .map_err(|()| Note::Unreadable(Kind::ChannelMixer))
+            .and_then(|b| channel_mixer_adjustment(b, gray)),
+        Parsed::SelectiveColor(b) => b
+            .as_ref()
+            .map_err(|()| Note::Unreadable(Kind::SelectiveColor))
+            .and_then(|b| selective_color_adjustment(b, gray)),
         Parsed::Brightness(brit, cged) => {
             brightness_contrast_adjustment(*brit, cged.as_ref(), gray)
         }

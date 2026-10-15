@@ -67,6 +67,16 @@ fn new_adjustment(kind: AdjustKind) -> (&'static str, Adjustment) {
             "Brightness/Contrast",
             Adjustment::BrightnessContrast(aurora_core::BrightnessContrastParams::identity()),
         ),
+        // 0.245.0: Channel Mixer starts as the identity (each output its own
+        // source at 100 %), Selective Color neutral and Relative.
+        AdjustKind::ChannelMixer => (
+            "Channel Mixer",
+            Adjustment::ChannelMixer(aurora_core::ChannelMixerParams::identity()),
+        ),
+        AdjustKind::SelectiveColor => (
+            "Selective Color",
+            Adjustment::SelectiveColor(aurora_core::SelectiveColorParams::identity()),
+        ),
         AdjustKind::ColorBalance => (
             "Color Balance",
             Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
@@ -130,10 +140,17 @@ pub(crate) fn is_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerO
                 || *id == adjust.tint
                 || *id == adjust.balance_preserve
                 || *id == adjust.legacy
+                || *id == adjust.mixer_mono
+                || *id == adjust.selective_absolute
         }
         // The Color Balance range selector (0.240.0): widget state only, no
         // document edit, but a pending drag settles when it is used.
-        PointerOutcome::Action(Outcome::TabSelected { bar, .. }) => *bar == adjust.balance_range,
+        PointerOutcome::Action(Outcome::TabSelected { bar, .. }) => {
+            *bar == adjust.balance_range
+                || *bar == adjust.mixer_output
+                || *bar == adjust.selective_group
+                || *bar == adjust.selective_range
+        }
         _ => false,
     }
 }
@@ -199,6 +216,7 @@ pub(crate) fn settle(cx: &mut CurvesEdit<'_>, captured: Option<WidgetId>) -> boo
 /// pointer captured is a live drag (one step when it ends); a slider
 /// without capture (an arrow key, an assistive technology) and a checkbox
 /// toggle are one step each. Every real change is `Everything`.
+#[allow(clippy::too_many_lines)] // one arm per control of the editors
 pub(crate) fn apply_outcome(
     cx: &mut CurvesEdit<'_>,
     outcome: &PointerOutcome,
@@ -252,11 +270,30 @@ pub(crate) fn apply_outcome(
             let on = *state == accesskit::Toggled::True;
             (Adjustment::BrightnessContrast(bc.with_legacy(on)), None)
         }
+        aurora_widgets::ActionOutcome::Toggled { id, state } if *id == adjust.mixer_mono => {
+            let Some(mixer) = current.channel_mixer() else {
+                return CompositeInvalidation::None;
+            };
+            let on = *state == accesskit::Toggled::True;
+            (Adjustment::ChannelMixer(mixer.with_monochrome(on)), None)
+        }
+        aurora_widgets::ActionOutcome::Toggled { id, state }
+            if *id == adjust.selective_absolute =>
+        {
+            let Some(selective) = current.selective_color() else {
+                return CompositeInvalidation::None;
+            };
+            let on = *state == accesskit::Toggled::True;
+            (
+                Adjustment::SelectiveColor(selective.with_absolute(on)),
+                None,
+            )
+        }
         aurora_widgets::ActionOutcome::ValueChanged { id, value } => {
             let Some(slider) = adjust.slider_of(*id) else {
                 return CompositeInvalidation::None;
             };
-            let range = aurora_ui::adjust_balance_range(&cx.workspace.tree, adjust);
+            let range = aurora_ui::adjust_tab(&cx.workspace.tree, adjust, slider.kind());
             let Some(next) = slider.with_value(&current, range, *value) else {
                 return CompositeInvalidation::None;
             };

@@ -133,6 +133,8 @@ mod effects;
 #[cfg(test)]
 mod effects_tests;
 mod lab;
+#[cfg(test)]
+mod mixer_selective_tests;
 mod read_adjust;
 #[cfg(test)]
 mod read_adjust_tests;
@@ -452,6 +454,12 @@ enum Note {
     /// A Brightness/Contrast layer in the default mode, shown with Aurora's
     /// fitted approximation of Photoshop's curve (0.244.0).
     BrightnessContrastApproximate,
+    /// A Channel Mixer or Selective Color layer that is not neutral (0.245.0),
+    /// shown with a textbook formula nothing was compared against.
+    Unvalidated(read_adjust::Kind),
+    /// A Monochrome Channel Mixer or a Selective Color that adjusts something
+    /// (0.245.0): the file layout is unverified, so it is left out.
+    Unverified(read_adjust::Kind),
     /// A Photo Filter whose colour is not stored as Lab (version 3 or
     /// another colour space).
     PhotoFilterColour,
@@ -542,12 +550,12 @@ fn note_text(note: Note, n: u64) -> String {
     let is = if one { "is" } else { "are" };
     match note {
         Note::AdjustmentSkipped => format!(
-            "{n} adjustment layer{s} (Channel Mixer, Gradient Map and similar) {was} \
+            "{n} adjustment layer{s} (Gradient Map, Color Lookup and similar) {was} \
              left out — Aurora shows only Curves, Levels, Hue/Saturation, Vibrance, Exposure, \
-             Photo Filter, Black & White, Color Balance, Invert, Threshold, Posterize and \
-             Brightness/Contrast adjustment layers so far (Vibrance, Photo Filter, Black & \
-             White and Color Balance are approximations that have not been compared with \
-             Photoshop)."
+             Photo Filter, Black & White, Color Balance, Invert, Threshold, Posterize, \
+             Brightness/Contrast, Channel Mixer and Selective Color adjustment layers so far \
+             (Vibrance, Photo Filter, Black & White and Color Balance are approximations that \
+             have not been compared with Photoshop)."
         ),
         Note::CurvesUnreadable => format!(
             "{n} Curves layer{s} {was} left out — {} settings could not be read.",
@@ -604,6 +612,27 @@ fn note_text(note: Note, n: u64) -> String {
              curve (its formula is unpublished); expect differences of several levels from \
              Photoshop's own rendering. The Use Legacy mode is a straight line and is closer.",
             if one { "is" } else { "are" },
+        ),
+        Note::Unverified(kind) => format!(
+            "{n} {} layer{s} {was} left out — {}",
+            kind.label(),
+            if kind == read_adjust::Kind::ChannelMixer {
+                "Aurora can't tell which row of the file holds a Monochrome mixer's Gray mix \
+                 (no Photoshop file or parser documents it), so it would not know what the \
+                 layer does."
+            } else {
+                "Aurora can't tell which of the file's ten colour plates is which range (no \
+                 Photoshop file or parser documents the order), so it could apply the \
+                 adjustment to the wrong colours."
+            },
+        ),
+        Note::Unvalidated(kind) => format!(
+            "{n} {} layer{s} {} shown with a textbook formula that has not been compared with \
+             Photoshop (the files available hold only neutral {} layers); expect its result to \
+             differ from Photoshop's own rendering.",
+            kind.label(),
+            if one { "is" } else { "are" },
+            kind.label(),
         ),
         Note::PhotoFilterColour => format!(
             "{n} Photo Filter layer{s} {was} left out — {} colour is not stored as Lab (the \
@@ -3530,6 +3559,15 @@ fn other_adjustment_node(
     vector_budget: &mut vector::Budget,
 ) -> Option<PsdNode> {
     let params = read_adjust::adjustment(parsed, header.gray());
+    match &params {
+        Ok(aurora_doc::Adjustment::ChannelMixer(p)) if !p.is_identity() => {
+            notes.add(Note::Unvalidated(read_adjust::Kind::ChannelMixer));
+        }
+        Ok(aurora_doc::Adjustment::SelectiveColor(p)) if !p.is_identity() => {
+            notes.add(Note::Unvalidated(read_adjust::Kind::SelectiveColor));
+        }
+        _ => {}
+    }
     if let Ok(aurora_doc::Adjustment::BrightnessContrast(p)) = &params
         && !p.legacy()
         && !p.is_identity()

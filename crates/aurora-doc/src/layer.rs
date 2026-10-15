@@ -119,6 +119,12 @@ pub enum Adjustment {
     /// Brightness/Contrast (0.244.0, [`aurora_core::BrightnessContrastParams`]),
     /// applied by `aurora_filters::BrightnessContrastOp`. **Ordinal 12.**
     BrightnessContrast(aurora_core::BrightnessContrastParams),
+    /// Channel Mixer (0.245.0, [`aurora_core::ChannelMixerParams`]), applied
+    /// by `aurora_filters::ChannelMixerOp`. **Ordinal 13.**
+    ChannelMixer(aurora_core::ChannelMixerParams),
+    /// Selective Color (0.245.0, [`aurora_core::SelectiveColorParams`]),
+    /// applied by `aurora_filters::SelectiveColorOp`. **Ordinal 14.**
+    SelectiveColor(aurora_core::SelectiveColorParams),
 }
 
 impl Adjustment {
@@ -138,6 +144,26 @@ impl Adjustment {
             Self::Threshold(_) => "Threshold",
             Self::Posterize(_) => "Posterize",
             Self::BrightnessContrast(_) => "Brightness/Contrast",
+            Self::ChannelMixer(_) => "Channel Mixer",
+            Self::SelectiveColor(_) => "Selective Color",
+        }
+    }
+
+    /// The Channel Mixer settings, `None` for other adjustments.
+    #[must_use]
+    pub const fn channel_mixer(&self) -> Option<aurora_core::ChannelMixerParams> {
+        match self {
+            Self::ChannelMixer(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    /// The Selective Color settings, `None` for other adjustments.
+    #[must_use]
+    pub const fn selective_color(&self) -> Option<aurora_core::SelectiveColorParams> {
+        match self {
+            Self::SelectiveColor(p) => Some(*p),
+            _ => None,
         }
     }
 
@@ -1611,5 +1637,197 @@ mod invert_threshold_posterize_brightness_wire_tests {
         assert!(
             i.threshold().is_none() && i.posterize().is_none() && i.brightness_contrast().is_none()
         );
+    }
+}
+
+/// `Adjustment::{ChannelMixer, SelectiveColor}` are appended after
+/// `BrightnessContrast` (ordinals 13 and 14): every earlier encoding,
+/// ordinals 0 to 12, is unchanged and a 0.244.0 build refuses the new layers
+/// (0.245.0, ADR 0009).
+#[cfg(test)]
+mod channel_mixer_selective_color_wire_tests {
+    use super::{Adjustment, LayerKind};
+
+    /// `Adjustment` exactly as a 0.244.0 build declares it.
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Adjustment244 {
+        Curves(aurora_core::CurvesParams),
+        Levels(aurora_core::LevelsParams),
+        HueSaturation(aurora_core::HueSaturationParams),
+        HueSaturationRanges(aurora_core::HueSaturationRangesParams),
+        Vibrance(aurora_core::VibranceParams),
+        Exposure(aurora_core::ExposureParams),
+        PhotoFilter(aurora_core::PhotoFilterParams),
+        BlackWhite(aurora_core::BlackWhiteParams),
+        ColorBalance(aurora_core::ColorBalanceParams),
+        Invert,
+        Threshold(aurora_core::ThresholdParams),
+        Posterize(aurora_core::PosterizeParams),
+        BrightnessContrast(aurora_core::BrightnessContrastParams),
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Kind244 {
+        Pixel { bounds: aurora_core::Rect },
+        Group { children: Vec<super::LayerId> },
+        Adjustment(Adjustment244),
+    }
+
+    fn encode<T: serde::Serialize>(value: &T) -> Vec<u8> {
+        match postcard::to_allocvec(value) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn mixer() -> aurora_core::ChannelMixerParams {
+        match aurora_core::ChannelMixerParams::new(
+            [
+                [1.0, 2.0, 3.0, 4.0],
+                [5.0, 6.0, 7.0, 8.0],
+                [9.0, 10.0, 11.0, 12.0],
+            ],
+            true,
+        ) {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn selective() -> aurora_core::SelectiveColorParams {
+        let mut ranges = [[0.0_f32; 4]; 9];
+        ranges[8] = [-10.0, 20.0, -30.0, 40.0];
+        match aurora_core::SelectiveColorParams::new(ranges, true) {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn ordinals_zero_to_twelve_keep_their_bytes() {
+        let ranged = {
+            let plain = aurora_core::HueSaturationRangesParams::plain(
+                aurora_core::HueSaturationParams::identity(),
+            );
+            match aurora_core::HueRange::new([75.0, 105.0, 135.0, 165.0], 11.0, -22.0, 33.0) {
+                Ok(range) => plain.with_range(2, range),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        };
+        let Some(ranged) = ranged else {
+            unreachable!("range 2 exists");
+        };
+        let threshold = aurora_core::ThresholdParams::default();
+        let posterize = aurora_core::PosterizeParams::default();
+        let bc = aurora_core::BrightnessContrastParams::identity();
+        let pairs = [
+            (
+                Adjustment::Curves(aurora_core::CurvesParams::identity()),
+                Adjustment244::Curves(aurora_core::CurvesParams::identity()),
+            ),
+            (
+                Adjustment::Levels(aurora_core::LevelsParams::identity()),
+                Adjustment244::Levels(aurora_core::LevelsParams::identity()),
+            ),
+            (
+                Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
+                Adjustment244::HueSaturation(aurora_core::HueSaturationParams::identity()),
+            ),
+            (
+                Adjustment::HueSaturationRanges(ranged),
+                Adjustment244::HueSaturationRanges(ranged),
+            ),
+            (
+                Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
+                Adjustment244::Vibrance(aurora_core::VibranceParams::identity()),
+            ),
+            (
+                Adjustment::Exposure(aurora_core::ExposureParams::identity()),
+                Adjustment244::Exposure(aurora_core::ExposureParams::identity()),
+            ),
+            (
+                Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+                Adjustment244::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+            ),
+            (
+                Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
+                Adjustment244::BlackWhite(aurora_core::BlackWhiteParams::default()),
+            ),
+            (
+                Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+                Adjustment244::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+            ),
+            (Adjustment::Invert, Adjustment244::Invert),
+            (
+                Adjustment::Threshold(threshold),
+                Adjustment244::Threshold(threshold),
+            ),
+            (
+                Adjustment::Posterize(posterize),
+                Adjustment244::Posterize(posterize),
+            ),
+            (
+                Adjustment::BrightnessContrast(bc),
+                Adjustment244::BrightnessContrast(bc),
+            ),
+        ];
+        for (index, (new, old)) in pairs.into_iter().enumerate() {
+            let new_bytes = encode(&LayerKind::Adjustment(new));
+            let old_bytes = encode(&Kind244::Adjustment(old));
+            assert_eq!(new_bytes, old_bytes, "ordinal {index}");
+            assert_eq!(new_bytes.get(1).copied().map(usize::from), Some(index));
+            assert!(postcard::from_bytes::<Kind244>(&new_bytes).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_new_adjustments_are_ordinals_thirteen_and_fourteen_and_an_old_reader_refuses_them() {
+        let cases = [
+            (Adjustment::ChannelMixer(mixer()), 13_u8, 49_usize),
+            (Adjustment::SelectiveColor(selective()), 14, 145),
+        ];
+        for (adjustment, ordinal, payload) in cases {
+            let kind = LayerKind::Adjustment(adjustment);
+            let bytes = encode(&kind);
+            assert_eq!(bytes.get(..2), Some([2_u8, ordinal].as_slice()), "{kind:?}");
+            assert_eq!(bytes.len(), 2 + payload, "{kind:?}");
+            match postcard::from_bytes::<LayerKind>(&bytes) {
+                Ok(decoded) => assert_eq!(decoded, kind),
+                Err(err) => unreachable!("{err:?}"),
+            }
+            assert!(
+                postcard::from_bytes::<Kind244>(&bytes).is_err(),
+                "a 0.244.0 build refuses ordinal {ordinal}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_payload_is_a_decode_error_not_a_repair() {
+        // A source of 250 in the first slot of a mixer; a slider of 101 in
+        // Selective Color's first slot.
+        let mut bad_mixer = vec![2_u8, 13];
+        bad_mixer.extend_from_slice(&250.0_f32.to_le_bytes());
+        bad_mixer.extend_from_slice(&[0; 45]);
+        let mut bad_selective = vec![2_u8, 14];
+        bad_selective.extend_from_slice(&101.0_f32.to_le_bytes());
+        bad_selective.extend_from_slice(&[0; 141]);
+        for bytes in [bad_mixer, bad_selective, vec![2, 13, 0], vec![2, 14]] {
+            assert!(
+                postcard::from_bytes::<LayerKind>(&bytes).is_err(),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn labels_and_accessors_name_the_right_variant() {
+        let m = Adjustment::ChannelMixer(mixer());
+        let s = Adjustment::SelectiveColor(selective());
+        assert_eq!((m.label(), s.label()), ("Channel Mixer", "Selective Color"));
+        assert!(m.channel_mixer().is_some() && m.selective_color().is_none());
+        assert!(s.selective_color().is_some() && s.channel_mixer().is_none());
+        assert!(Adjustment::Invert.channel_mixer().is_none());
+        assert!(Adjustment::Invert.selective_color().is_none());
     }
 }

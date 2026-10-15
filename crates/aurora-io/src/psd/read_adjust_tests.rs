@@ -634,7 +634,11 @@ fn hostile_descriptors_are_refused_with_bounded_work() {
 
 const KEYS: [&[u8; 4]; 5] = [b"vibA", b"expA", b"phfl", b"blwh", b"blnc"];
 
-fn file_with(key: &[u8; 4], block: &[u8], tweak: impl FnOnce(&mut TestLayer)) -> TestPsd {
+pub(super) fn file_with(
+    key: &[u8; 4],
+    block: &[u8],
+    tweak: impl FnOnce(&mut TestLayer),
+) -> TestPsd {
     let block = block.to_vec();
     let key = *key;
     let layer = TestLayer::empty("Adjust 1").with(|l| {
@@ -653,13 +657,13 @@ fn file_with(key: &[u8; 4], block: &[u8], tweak: impl FnOnce(&mut TestLayer)) ->
     })
 }
 
-fn top_adjustment(document: &PsdDocument) -> Option<(aurora_doc::LayerId, Adjustment)> {
+pub(super) fn top_adjustment(document: &PsdDocument) -> Option<(aurora_doc::LayerId, Adjustment)> {
     let group = *document.layers.roots().first()?;
     let top = *document.layers.children(group)?.first()?;
     document.layers.adjustment(top).cloned().map(|a| (top, a))
 }
 
-fn children_count(document: &PsdDocument) -> usize {
+pub(super) fn children_count(document: &PsdDocument) -> usize {
     document
         .layers
         .roots()
@@ -796,7 +800,7 @@ fn a_grayscale_file_s_layers_are_left_out_and_say_so() {
 fn a_record_with_an_unmodelled_adjustment_key_is_still_left_out() {
     let document = ok(read(
         &file_with(b"blnc", &unhex(BLNC_FILL), |l| {
-            l.blocks.push((*b"mixr", vec![0; 4]));
+            l.blocks.push((*b"grdm", vec![0; 4]));
         })
         .write(),
     ));
@@ -812,13 +816,13 @@ fn every_key_is_recognised_and_only_these_five() {
         assert!(parse_block(k, &[]).is_some());
     }
     // The four of 0.244.0 are keys too (CgEd is not: it only attaches).
-    for k in [b"nvrt", b"thrs", b"post", b"brit"] {
+    for k in [b"nvrt", b"thrs", b"post", b"brit", b"mixr", b"selc"] {
         assert!(read_adjust::is_key(*k));
         assert!(parse_block(k, &[]).is_some());
     }
     assert!(!read_adjust::is_key(*b"CgEd"));
     assert_eq!(parse_block(b"CgEd", &[]), None);
-    for k in [b"curv", b"levl", b"hue2", b"mixr", b"hue ", b"clrL"] {
+    for k in [b"curv", b"levl", b"hue2", b"hue ", b"clrL", b"grdm"] {
         assert!(!read_adjust::is_key(*k));
         assert_eq!(parse_block(k, &[]), None);
     }
@@ -914,7 +918,7 @@ fn lab_conversion_hits_known_colours_and_round_trips() {
 // The corpus (SKIPPED when absent)
 // ---------------------------------------------------------------------
 
-fn corpus(relative: &str) -> Option<PsdDocument> {
+pub(super) fn corpus(relative: &str) -> Option<PsdDocument> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../corpora/psd/reference/psd-tools-fixtures")
         .join(relative);
@@ -925,7 +929,7 @@ fn corpus(relative: &str) -> Option<PsdDocument> {
     Some(ok(read(&bytes)))
 }
 
-fn adjustments_of(document: &PsdDocument) -> Vec<(String, Adjustment)> {
+pub(super) fn adjustments_of(document: &PsdDocument) -> Vec<(String, Adjustment)> {
     fn walk(
         tree: &aurora_doc::LayerTree,
         ids: &[aurora_doc::LayerId],
@@ -1185,7 +1189,7 @@ fn a_clipped_adjustment_shown_unclipped_is_reported_as_stronger() {
 fn the_left_out_note_calls_four_kinds_approximations() {
     let document = ok(read(
         &file_with(b"blnc", &unhex(BLNC_FILL), |l| {
-            l.blocks.push((*b"mixr", vec![0; 4]));
+            l.blocks.push((*b"grdm", vec![0; 4]));
         })
         .write(),
     ));

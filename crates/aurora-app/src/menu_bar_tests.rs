@@ -175,6 +175,14 @@ fn the_new_adjustment_layers_are_in_the_layer_menu_and_the_native_list() {
             crate::COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST,
             "New Brightness/Contrast Layer",
         ),
+        (
+            crate::COMMAND_LAYER_NEW_CHANNEL_MIXER,
+            "New Channel Mixer Layer",
+        ),
+        (
+            crate::COMMAND_LAYER_NEW_SELECTIVE_COLOR,
+            "New Selective Color Layer",
+        ),
     ] {
         assert_eq!(entry(layer, id).0, label);
         assert!(entry(layer, id).2, "{id} is enabled");

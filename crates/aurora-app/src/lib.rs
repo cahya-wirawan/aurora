@@ -6007,6 +6007,9 @@ enum ActivatedCommand {
     NewThresholdLayer,
     NewPosterizeLayer,
     NewBrightnessContrastLayer,
+    /// New Channel Mixer / Selective Color Layer (0.245.0): the same.
+    NewChannelMixerLayer,
+    NewSelectiveColorLayer,
     /// A Photo Filter preset colour (0.239.0, palette only): index into
     /// [`aurora_core::PHOTO_FILTER_PRESETS`].
     PhotoFilterPreset(usize),
@@ -6266,6 +6269,8 @@ const COMMAND_LAYER_NEW_INVERT: &str = "layer.new_invert";
 const COMMAND_LAYER_NEW_THRESHOLD: &str = "layer.new_threshold";
 const COMMAND_LAYER_NEW_POSTERIZE: &str = "layer.new_posterize";
 const COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST: &str = "layer.new_brightness_contrast";
+const COMMAND_LAYER_NEW_CHANNEL_MIXER: &str = "layer.new_channel_mixer";
+const COMMAND_LAYER_NEW_SELECTIVE_COLOR: &str = "layer.new_selective_color";
 const COMMAND_LAYER_NEW_GROUP: &str = "layer.new_group";
 const COMMAND_LAYER_CLIP_CREATE: &str = "layer.clip_create";
 const COMMAND_LAYER_CLIP_RELEASE: &str = "layer.clip_release";
@@ -6399,6 +6404,11 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(
             COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST,
             "New Brightness/Contrast Layer",
+        ),
+        CommandEntry::new(COMMAND_LAYER_NEW_CHANNEL_MIXER, "New Channel Mixer Layer"),
+        CommandEntry::new(
+            COMMAND_LAYER_NEW_SELECTIVE_COLOR,
+            "New Selective Color Layer",
         ),
         CommandEntry::new(COMMAND_LAYER_NEW_GROUP, "New Group"),
         CommandEntry::new(COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
@@ -6696,6 +6706,12 @@ fn activate_command(
     }
     if id == COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST {
         return Some(ActivatedCommand::NewBrightnessContrastLayer);
+    }
+    if id == COMMAND_LAYER_NEW_CHANNEL_MIXER {
+        return Some(ActivatedCommand::NewChannelMixerLayer);
+    }
+    if id == COMMAND_LAYER_NEW_SELECTIVE_COLOR {
+        return Some(ActivatedCommand::NewSelectiveColorLayer);
     }
     if let Some(index) = adjust_app::preset_for_command(id) {
         return Some(ActivatedCommand::PhotoFilterPreset(index));
@@ -10829,6 +10845,18 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(
                 COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST,
                 "New Brightness/Contrast Layer",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_CHANNEL_MIXER,
+                "New Channel Mixer Layer",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_SELECTIVE_COLOR,
+                "New Selective Color Layer",
                 true,
                 None,
             ),
@@ -18429,6 +18457,8 @@ fn new_adjust_kind(command: &ActivatedCommand) -> Option<aurora_ui::AdjustKind> 
         ActivatedCommand::NewBrightnessContrastLayer => {
             Some(aurora_ui::AdjustKind::BrightnessContrast)
         }
+        ActivatedCommand::NewChannelMixerLayer => Some(aurora_ui::AdjustKind::ChannelMixer),
+        ActivatedCommand::NewSelectiveColorLayer => Some(aurora_ui::AdjustKind::SelectiveColor),
         _ => None,
     }
 }
@@ -18533,6 +18563,10 @@ enum AdjustmentLut {
     /// Brightness/Contrast (0.244.0): a line or a built 16,385-sample table
     /// (cached per thread), CPU only.
     BrightnessContrast(std::rc::Rc<aurora_filters::BrightnessContrastOp>),
+    /// Channel Mixer (0.245.0): a per-pixel function, CPU only.
+    ChannelMixer(aurora_filters::ChannelMixerOp),
+    /// Selective Color (0.245.0): a per-pixel function, CPU only.
+    SelectiveColor(aurora_filters::SelectiveColorOp),
 }
 
 impl AdjustmentLut {
@@ -18572,6 +18606,12 @@ impl AdjustmentLut {
             aurora_doc::Adjustment::BrightnessContrast(params) => {
                 Self::BrightnessContrast(brightness_contrast_op(*params))
             }
+            aurora_doc::Adjustment::ChannelMixer(params) => {
+                Self::ChannelMixer(aurora_filters::ChannelMixerOp::new(params))
+            }
+            aurora_doc::Adjustment::SelectiveColor(params) => {
+                Self::SelectiveColor(aurora_filters::SelectiveColorOp::new(params))
+            }
         }
     }
 
@@ -18590,6 +18630,8 @@ impl AdjustmentLut {
             Self::Threshold(op) => op.is_identity(),
             Self::Posterize(op) => op.is_identity(),
             Self::BrightnessContrast(op) => op.is_identity(),
+            Self::ChannelMixer(op) => op.is_identity(),
+            Self::SelectiveColor(op) => op.is_identity(),
         }
     }
 
@@ -18608,6 +18650,8 @@ impl AdjustmentLut {
             Self::Threshold(op) => op.apply(rgb),
             Self::Posterize(op) => op.apply(rgb),
             Self::BrightnessContrast(op) => op.apply(rgb),
+            Self::ChannelMixer(op) => op.apply(rgb),
+            Self::SelectiveColor(op) => op.apply(rgb),
         }
     }
 }
@@ -20721,7 +20765,9 @@ fn adjustment_layer_qualifies_for_gpu(
             aurora_doc::Adjustment::Invert
             | aurora_doc::Adjustment::Threshold(_)
             | aurora_doc::Adjustment::Posterize(_)
-            | aurora_doc::Adjustment::BrightnessContrast(_),
+            | aurora_doc::Adjustment::BrightnessContrast(_)
+            | aurora_doc::Adjustment::ChannelMixer(_)
+            | aurora_doc::Adjustment::SelectiveColor(_),
         )
         | None => false,
     };
@@ -21188,7 +21234,9 @@ fn begin_gpu_adjustment_pass(
             | AdjustmentLut::Invert(_)
             | AdjustmentLut::Threshold(_)
             | AdjustmentLut::Posterize(_)
-            | AdjustmentLut::BrightnessContrast(_),
+            | AdjustmentLut::BrightnessContrast(_)
+            | AdjustmentLut::ChannelMixer(_)
+            | AdjustmentLut::SelectiveColor(_),
         ) => return false,
     }
     std::mem::swap(current_accumulator, spare_accumulator);
@@ -21289,7 +21337,10 @@ fn record_photographer_adjustment_pass(
         | AdjustmentLut::Invert(_)
         | AdjustmentLut::Threshold(_)
         | AdjustmentLut::Posterize(_)
-        | AdjustmentLut::BrightnessContrast(_) => {
+        | AdjustmentLut::BrightnessContrast(_)
+        // CPU only (0.245.0), refused before a pass is recorded.
+        | AdjustmentLut::ChannelMixer(_)
+        | AdjustmentLut::SelectiveColor(_) => {
             return false;
         }
     }
@@ -30239,7 +30290,9 @@ impl App {
                 command @ (ActivatedCommand::NewInvertLayer
                 | ActivatedCommand::NewThresholdLayer
                 | ActivatedCommand::NewPosterizeLayer
-                | ActivatedCommand::NewBrightnessContrastLayer),
+                | ActivatedCommand::NewBrightnessContrastLayer
+                | ActivatedCommand::NewChannelMixerLayer
+                | ActivatedCommand::NewSelectiveColorLayer),
             ) => {
                 if let Some(kind) = new_adjust_kind(&command) {
                     self.run_layer_command(LayerCommand::NewAdjust(kind));
@@ -41592,7 +41645,7 @@ mod tests {
         // 0.241.0: five of those (Exposure, Vibrance, Color Balance, Black &
         // White, Photo Filter) are imported, 8 left out: max 230 -> 204, mean
         // 125.9 / 51.5 / 32.0 -> 106.6 / 30.5 / 26.0.
-        ("fill_adjustments.psd", 204.0, Some("4 adjustment layers")),
+        ("fill_adjustments.psd", 204.0, Some("2 adjustment layers")),
         // A clipped layer whose base is not a pixel layer shown unclipped
         // (0.201.0: the other clipped layers are clipped for real).
         (
@@ -45068,8 +45121,10 @@ mod tests {
         // "New Vibrance Layer", "New Exposure Layer" and "New Photo Filter
         // Layer", and (0.240.0) "New Black & White Layer" and "New Color
         // Balance Layer", and (0.244.0) "New Invert Layer", "New Threshold
-        // Layer", "New Posterize Layer" and "New Brightness/Contrast Layer".
-        assert_eq!(state.results().len(), 25);
+        // Layer", "New Posterize Layer" and "New Brightness/Contrast Layer",
+        // and (0.245.0) "New Channel Mixer Layer" and "New Selective Color
+        // Layer".
+        assert_eq!(state.results().len(), 27);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -79230,6 +79285,68 @@ mod tests {
                 }
             }
 
+            /// 0.245.0: the Channel Mixer and Selective Color layers are palette
+            /// commands, each one undo step, named "<Kind> N", neutral to start.
+            #[test]
+            fn new_channel_mixer_and_selective_color_layers_are_one_undo_step() {
+                let cases: [(
+                    &str,
+                    &str,
+                    ActivatedCommand,
+                    aurora_ui::AdjustKind,
+                    Adjustment,
+                    &str,
+                ); 2] = [
+                    (
+                        crate::COMMAND_LAYER_NEW_CHANNEL_MIXER,
+                        "New Channel Mixer Layer",
+                        ActivatedCommand::NewChannelMixerLayer,
+                        aurora_ui::AdjustKind::ChannelMixer,
+                        Adjustment::ChannelMixer(aurora_core::ChannelMixerParams::identity()),
+                        "Channel Mixer 1",
+                    ),
+                    (
+                        crate::COMMAND_LAYER_NEW_SELECTIVE_COLOR,
+                        "New Selective Color Layer",
+                        ActivatedCommand::NewSelectiveColorLayer,
+                        aurora_ui::AdjustKind::SelectiveColor,
+                        Adjustment::SelectiveColor(aurora_core::SelectiveColorParams::identity()),
+                        "Selective Color 1",
+                    ),
+                ];
+                for (id, title, activated, kind, adjustment, name) in cases {
+                    assert!(
+                        palette_commands()
+                            .iter()
+                            .any(|entry| entry.id == id && entry.title == title),
+                        "{id}"
+                    );
+                    let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+                    let mut focus = FocusManager::default();
+                    let mut dialog = FakeFileDialog::default();
+                    assert_eq!(
+                        activate_command(&mut workspace, &mut focus, id, &mut dialog),
+                        Some(activated.clone())
+                    );
+                    assert_eq!(crate::new_adjust_kind(&activated), Some(kind), "{id}");
+                    let (mut rig, [top, mid, bottom]) = Rig::three();
+                    let before = rig.layers.roots().to_vec();
+                    assert!(rig.run(LayerCommand::NewAdjust(kind)));
+                    let added = only_new_root(&rig, &before);
+                    assert_eq!(
+                        rig.layers.kind(added),
+                        Some(&LayerKind::Adjustment(adjustment)),
+                        "{id}"
+                    );
+                    assert_eq!(rig.layers.name(added), Some(name));
+                    assert_eq!(rig.active, Some(added));
+                    assert!(rig.undo_redo(AppCommand::Undo));
+                    assert_eq!(rig.layers.roots(), before.as_slice());
+                    assert_eq!(rig.layers.roots(), [top, mid, bottom].as_slice());
+                    rig.assert_coherent();
+                }
+            }
+
             #[test]
             fn new_vibrance_exposure_and_photo_filter_layers_are_commands_and_one_undo_step_each() {
                 let cases: [(&str, &str, ActivatedCommand, LayerCommand, Adjustment, &str); 5] = [
@@ -84451,6 +84568,222 @@ mod tests {
             );
         }
 
+        /// 0.245.0: the Channel Mixer output tab and the Selective Color range
+        /// tab edit no document; their sliders edit the selected row or range
+        /// one step each; Monochrome and Absolute are one step per toggle; the
+        /// Gray mix is the first row whatever tab is selected; undo moves the
+        /// editor.
+        #[test]
+        #[allow(clippy::too_many_lines, clippy::redundant_closure_for_method_calls)]
+        fn channel_mixer_and_selective_color_tabs_sliders_and_checkboxes_are_wired() {
+            use aurora_ui::AdjustSlider as S;
+            let click_tab = |rig: &mut Rig, bar: aurora_widgets::WidgetId, index: usize| {
+                let tab = match aurora_widgets::widgets::tab_bar_state(&rig.workspace.tree, bar) {
+                    Ok(state) => state.tabs().get(index).copied(),
+                    Err(err) => unreachable!("{err:?}"),
+                };
+                let Some(tab) = tab else {
+                    unreachable!("tab {index}");
+                };
+                let at = rig.centre(tab);
+                println!(
+                    "TABDEBUG {index} {:?} {:?}",
+                    rig.workspace.tree.bounds(tab),
+                    rig.workspace.tree.bounds(bar)
+                );
+                rig.pointer(PointerPhase::Down, at);
+                rig.pointer(PointerPhase::Up, at);
+                rig.sync();
+            };
+            let click = |rig: &mut Rig, widget: aurora_widgets::WidgetId| {
+                let at = rig.centre(widget);
+                rig.pointer(PointerPhase::Down, at);
+                rig.pointer(PointerPhase::Up, at);
+            };
+            let (mut rig, id) = Rig::adjust_layer(aurora_doc::Adjustment::ChannelMixer(
+                aurora_core::ChannelMixerParams::identity(),
+            ));
+            assert_eq!(
+                aurora_ui::adjust_controls_shown(&rig.workspace.tree, rig.adj_controls()),
+                Some(aurora_ui::AdjustKind::ChannelMixer)
+            );
+            assert!(!aurora_ui::adjust_mixer_mono_checked(
+                &rig.workspace.tree,
+                rig.adj_controls()
+            ));
+            let rows = |rig: &Rig| match rig.adjustment(id).channel_mixer() {
+                Some(p) => (p.rows(), p.monochrome()),
+                None => unreachable!("a Channel Mixer layer"),
+            };
+            assert_eq!(rig.adj_slider(S::MixerRed).0, 100.0);
+            let before = rig.undo_order.undo.len();
+            let output_bar = rig.adj_controls().mixer_output;
+            click_tab(&mut rig, output_bar, 1);
+            assert_eq!(rig.undo_order.undo.len(), before, "a tab is no undo step");
+            assert_eq!(rig.adj_slider(S::MixerRed).0, 0.0);
+            assert_eq!(rig.adj_slider(S::MixerGreen).0, 100.0);
+            rig.adj_set(S::MixerRed, 50.0);
+            rig.adj_set(S::MixerConstant, 20.0);
+            assert_eq!(
+                rows(&rig).0,
+                [
+                    [100.0, 0.0, 0.0, 0.0],
+                    [50.0, 100.0, 0.0, 20.0],
+                    [0.0, 0.0, 100.0, 0.0]
+                ]
+            );
+            assert_eq!(rig.undo_order.undo.len(), before + 2);
+            // Sources span -200..200, the constant -100..100.
+            rig.adj_set(S::MixerBlue, 300.0);
+            assert_eq!(rows(&rig).0[1][2], 200.0);
+            rig.adj_set(S::MixerConstant, -300.0);
+            assert_eq!(rows(&rig).0[1][3], -100.0);
+            // Monochrome: one step; the output tab goes idle and the sliders
+            // edit the first row whatever tab was selected.
+            let mono = rig.adj_controls().mixer_mono;
+            click(&mut rig, mono);
+            rig.sync();
+            assert!(rows(&rig).1);
+            assert_eq!(rig.undo_order.undo.len(), before + 5);
+            assert_eq!(rig.adj_slider(S::MixerRed).0, 100.0, "the Gray row");
+            rig.adj_set(S::MixerRed, 30.0);
+            assert_eq!(rows(&rig).0[0][0], 30.0);
+            assert_eq!(rows(&rig).0[1][0], 50.0, "the green row is untouched");
+            assert!(
+                aurora_widgets::widgets::tab_bar_state(&rig.workspace.tree, output_bar)
+                    .is_ok_and(|s| s.is_disabled()),
+                "the output selector is idle while Monochrome is on"
+            );
+            rig.undo();
+            rig.undo();
+            assert!(!rows(&rig).1);
+            assert!(!aurora_ui::adjust_mixer_mono_checked(
+                &rig.workspace.tree,
+                rig.adj_controls()
+            ));
+            assert_eq!(rig.adj_slider(S::MixerBlue).0, 200.0, "the editor follows");
+
+            let (mut rig, id) = Rig::adjust_layer(aurora_doc::Adjustment::SelectiveColor(
+                aurora_core::SelectiveColorParams::identity(),
+            ));
+            assert_eq!(
+                aurora_ui::adjust_controls_shown(&rig.workspace.tree, rig.adj_controls()),
+                Some(aurora_ui::AdjustKind::SelectiveColor)
+            );
+            let state = |rig: &Rig| match rig.adjustment(id).selective_color() {
+                Some(p) => (p.ranges(), p.absolute()),
+                None => unreachable!("a Selective Color layer"),
+            };
+            let before = rig.undo_order.undo.len();
+            let range_bar = rig.adj_controls().selective_range;
+            let group_bar = rig.adj_controls().selective_group;
+            click_tab(&mut rig, group_bar, 1);
+            assert_eq!(
+                aurora_ui::adjust_tab(
+                    &rig.workspace.tree,
+                    rig.adj_controls(),
+                    aurora_ui::AdjustKind::SelectiveColor
+                ),
+                6
+            );
+            assert_eq!(rig.undo_order.undo.len(), before, "a tab is no undo step");
+            rig.adj_set(S::SelectiveBlack, -40.0);
+            rig.adj_set(S::SelectiveCyan, 15.0);
+            let mut want = [[0.0_f32; 4]; 9];
+            want[6] = [15.0, 0.0, 0.0, -40.0];
+            assert_eq!(state(&rig), (want, false));
+            assert_eq!(rig.undo_order.undo.len(), before + 2);
+            assert!(
+                aurora_widgets::widgets::tab_bar_state(&rig.workspace.tree, range_bar)
+                    .is_ok_and(|s| s.is_disabled()),
+                "the colour bar is idle outside the colour group"
+            );
+            let readout = rig
+                .adj_controls()
+                .readouts
+                .get(S::SelectiveBlack.index())
+                .copied();
+            let Some(readout) = readout else {
+                unreachable!("a readout");
+            };
+            let text = aurora_widgets::widgets::label_state(&rig.workspace.tree, readout)
+                .map(|l| l.text.clone());
+            assert_eq!(
+                text.ok().as_deref(),
+                Some("Whites, Black: -40"),
+                "names the range"
+            );
+            click_tab(&mut rig, group_bar, 3);
+            assert_eq!(
+                rig.adj_slider(S::SelectiveBlack).0,
+                0.0,
+                "Blacks is its own"
+            );
+            rig.adj_set(S::SelectiveYellow, 100.0);
+            want[8] = [0.0, 0.0, 100.0, 0.0];
+            assert_eq!(state(&rig), (want, false));
+            rig.adj_set(S::SelectiveYellow, 120.0);
+            assert_eq!(state(&rig).0[8][2], 100.0, "sliders clamp to -100..100");
+            // Back to the colour group: the colour bar picks Blues.
+            click_tab(&mut rig, group_bar, 0);
+            click_tab(&mut rig, range_bar, 4);
+            assert_eq!(
+                aurora_ui::adjust_tab(
+                    &rig.workspace.tree,
+                    rig.adj_controls(),
+                    aurora_ui::AdjustKind::SelectiveColor
+                ),
+                4
+            );
+            rig.adj_set(S::SelectiveMagenta, -25.0);
+            want[4] = [0.0, -25.0, 0.0, 0.0];
+            assert_eq!(state(&rig), (want, false));
+            let absolute = rig.adj_controls().selective_absolute;
+            click(&mut rig, absolute);
+            assert_eq!(state(&rig), (want, true));
+            assert_eq!(rig.undo_order.undo.len(), before + 5);
+            rig.undo();
+            assert!(!state(&rig).1);
+            assert!(!aurora_ui::adjust_selective_absolute_checked(
+                &rig.workspace.tree,
+                rig.adj_controls()
+            ));
+            // Every selector and checkbox of the two editors settles a pending
+            // drag (`is_outcome`), like the older editors' controls.
+            let curves = rig.controls.curves;
+            let adjust = rig.adj_controls();
+            for bar in [
+                adjust.balance_range,
+                adjust.mixer_output,
+                adjust.selective_group,
+                adjust.selective_range,
+            ] {
+                assert!(crate::adjust_app::is_outcome(
+                    curves,
+                    &PointerOutcome::Action(aurora_widgets::ActionOutcome::TabSelected {
+                        bar,
+                        index: 0
+                    })
+                ));
+            }
+            for id in [adjust.mixer_mono, adjust.selective_absolute, adjust.legacy] {
+                assert!(crate::adjust_app::is_outcome(
+                    curves,
+                    &PointerOutcome::Action(aurora_widgets::ActionOutcome::Toggled {
+                        id,
+                        state: accesskit::Toggled::True
+                    })
+                ));
+            }
+            // Every other editor group's sliders are idle for these layers.
+            assert!(
+                [S::Vibrance, S::BalanceCyanRed, S::MixerRed, S::Brightness]
+                    .into_iter()
+                    .all(|s| rig.adj_slider(s).1),
+                "only Selective Color's sliders are live"
+            );
+        }
+
         /// The Photo Filter preset commands: palette entries, one undo step
         /// each, colour only (density and Preserve Luminosity kept), no
         /// step for the colour already set, a refusal on another layer.
@@ -86030,6 +86363,229 @@ mod tests {
                 bc(0, 0, false),
                 bc(40, 20, false),
                 bc(0, 0, true),
+            ] {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers =
+                    solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+                assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+                let id = add(&mut layers, adjustment.clone());
+                assert!(
+                    !crate::adjustment_layer_qualifies_for_gpu(&layers, id),
+                    "{adjustment:?}"
+                );
+                assert!(
+                    !crate::document_qualifies_for_gpu_compositing(&layers),
+                    "{adjustment:?}: a visible layer keeps the document on the CPU"
+                );
+                if let Err(err) = layers.set_visible(id, false) {
+                    unreachable!("{err:?}");
+                }
+                assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+            }
+        }
+
+        /// 0.245.0: Channel Mixer against an independent f64 model, neutral as
+        /// an exact passthrough, alpha kept.
+        #[test]
+        fn channel_mixer_matches_an_independent_model_and_neutral_is_exact() {
+            let mixer = |rows: [[f32; 4]; 3], mono: bool| match aurora_core::ChannelMixerParams::new(
+                rows, mono,
+            ) {
+                Ok(p) => Adjustment::ChannelMixer(p),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let model = |rows: [[f32; 4]; 3], mono: bool| {
+                let (r, g, b) = (0.2_f64, 0.4_f64, 0.6_f64);
+                let mix = |row: [f32; 4]| {
+                    ((f64::from(row[0]) * r + f64::from(row[1]) * g + f64::from(row[2]) * b)
+                        / 100.0
+                        + f64::from(row[3]) / 100.0)
+                        .clamp(0.0, 1.0) as f32
+                };
+                if mono {
+                    let v = mix(rows[0]);
+                    [v, v, v, 1.0]
+                } else {
+                    [mix(rows[0]), mix(rows[1]), mix(rows[2]), 1.0]
+                }
+            };
+            let (_dir, mut store) = real_tile_store();
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let id = add(
+                &mut layers,
+                mixer(aurora_core::ChannelMixerParams::identity().rows(), false),
+            );
+            let plain = composite(&layers, &mut store);
+            let _ = layers.remove(id);
+            let without = composite(&layers, &mut store);
+            let bits = |v: &[[f32; 4]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&plain),
+                bits(&without),
+                "neutral is an exact passthrough"
+            );
+            let id = add(
+                &mut layers,
+                mixer(aurora_core::ChannelMixerParams::identity().rows(), false),
+            );
+            for (rows, mono) in [
+                (
+                    [
+                        [0.0, 0.0, 100.0, 0.0],
+                        [0.0, 100.0, 0.0, 0.0],
+                        [100.0, 0.0, 0.0, 0.0],
+                    ],
+                    false,
+                ),
+                (
+                    [
+                        [30.0, 59.0, 11.0, 0.0],
+                        [-50.0, 150.0, 20.0, 10.0],
+                        [80.0, -80.0, 100.0, -20.0],
+                    ],
+                    false,
+                ),
+                (
+                    [
+                        [30.0, 59.0, 11.0, 0.0],
+                        [-50.0, 150.0, 20.0, 10.0],
+                        [80.0, -80.0, 100.0, -20.0],
+                    ],
+                    true,
+                ),
+                ([[200.0, 200.0, 200.0, 100.0]; 3], false),
+            ] {
+                let _ = layers.set_adjustment(id, mixer(rows, mono));
+                assert_close(
+                    first(&layers, &mut store),
+                    model(rows, mono),
+                    &format!("{rows:?} {mono}"),
+                );
+            }
+            let (_dir2, mut store2) = real_tile_store();
+            let mut layers2 = solid_root_stack(
+                &mut store2,
+                &[("b", BlendMode::Normal, 1.0, [0.2, 0.4, 0.6, 0.5])],
+            );
+            let _ = add(
+                &mut layers2,
+                mixer(
+                    [
+                        [0.0, 0.0, 100.0, 0.0],
+                        [0.0, 100.0, 0.0, 0.0],
+                        [100.0, 0.0, 0.0, 0.0],
+                    ],
+                    false,
+                ),
+            );
+            let got = first(&layers2, &mut store2);
+            assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
+        }
+
+        /// 0.245.0: Selective Color against hand-worked values (the backdrop
+        /// 0.2, 0.4, 0.6 is 0.2 Blues, 0.2 Cyans, 0.12 Blacks, 0.48 Neutrals),
+        /// neutral as an exact passthrough, alpha kept.
+        #[test]
+        #[allow(clippy::indexing_slicing)]
+        fn selective_color_matches_hand_worked_values_and_neutral_is_exact() {
+            let selective = |set: &[(usize, [f32; 4])], absolute: bool| {
+                let mut ranges = [[0.0_f32; 4]; 9];
+                for (i, row) in set {
+                    ranges[*i] = *row;
+                }
+                match aurora_core::SelectiveColorParams::new(ranges, absolute) {
+                    Ok(p) => Adjustment::SelectiveColor(p),
+                    Err(err) => unreachable!("{err:?}"),
+                }
+            };
+            let (_dir, mut store) = real_tile_store();
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let id = add(&mut layers, selective(&[], false));
+            let plain = composite(&layers, &mut store);
+            let _ = layers.remove(id);
+            let without = composite(&layers, &mut store);
+            let bits = |v: &[[f32; 4]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&plain),
+                bits(&without),
+                "neutral is an exact passthrough"
+            );
+            let id = add(&mut layers, selective(&[], false));
+            // Blues cyan -50 %, Absolute: s_c = 0.2 * -0.5 = -0.1, cyan 0.8 -> 0.7.
+            let _ = layers.set_adjustment(id, selective(&[(4, [-50.0, 0.0, 0.0, 0.0])], true));
+            assert_close(
+                first(&layers, &mut store),
+                [0.3, 0.4, 0.6, 1.0],
+                "blues absolute",
+            );
+            // The same in Relative: 0.8 * -0.1 = -0.08, so red 0.28.
+            let _ = layers.set_adjustment(id, selective(&[(4, [-50.0, 0.0, 0.0, 0.0])], false));
+            assert_close(
+                first(&layers, &mut store),
+                [0.28, 0.4, 0.6, 1.0],
+                "blues relative",
+            );
+            // Cyans magenta +100 %, Absolute: s_m = 0.2, magenta 0.6 -> 0.8, green 0.2.
+            let _ = layers.set_adjustment(id, selective(&[(3, [0.0, 100.0, 0.0, 0.0])], true));
+            assert_close(
+                first(&layers, &mut store),
+                [0.2, 0.2, 0.6, 1.0],
+                "cyans magenta",
+            );
+            // Neutrals black +100 % Absolute: s_k = 0.48 on all three inks
+            // (0.8, 0.6, 0.4): red and green clip, blue is 1 - 0.88.
+            let _ = layers.set_adjustment(id, selective(&[(7, [0.0, 0.0, 0.0, 100.0])], true));
+            assert_close(
+                first(&layers, &mut store),
+                [0.0, 0.0, 0.12, 1.0],
+                "neutrals black",
+            );
+            // Whites touch nothing here (no lightness above half).
+            let _ =
+                layers.set_adjustment(id, selective(&[(6, [100.0, 100.0, 100.0, 100.0])], true));
+            assert_close(first(&layers, &mut store), BACKDROP, "whites do not weigh");
+            let (_dir2, mut store2) = real_tile_store();
+            let mut layers2 = solid_root_stack(
+                &mut store2,
+                &[("b", BlendMode::Normal, 1.0, [0.2, 0.4, 0.6, 0.5])],
+            );
+            let _ = add(
+                &mut layers2,
+                selective(&[(4, [-50.0, 0.0, 0.0, 0.0])], true),
+            );
+            let got = first(&layers2, &mut store2);
+            assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
+        }
+
+        /// 0.245.0: a visible Channel Mixer or Selective Color layer refuses the
+        /// GPU path for the whole document (no GPU pass yet) and a hidden one
+        /// does not; neutral or not.
+        #[test]
+        fn a_visible_channel_mixer_or_selective_color_layer_refuses_the_gpu_path() {
+            let mut ranges = [[0.0_f32; 4]; 9];
+            ranges[2] = [10.0, 0.0, 0.0, -10.0];
+            let strong_selective = match aurora_core::SelectiveColorParams::new(ranges, true) {
+                Ok(p) => p,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let strong_mixer = match aurora_core::ChannelMixerParams::new(
+                [
+                    [0.0, 0.0, 100.0, 0.0],
+                    [0.0, 100.0, 0.0, 0.0],
+                    [100.0, 0.0, 0.0, 0.0],
+                ],
+                true,
+            ) {
+                Ok(p) => p,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            for adjustment in [
+                Adjustment::ChannelMixer(aurora_core::ChannelMixerParams::identity()),
+                Adjustment::ChannelMixer(strong_mixer),
+                Adjustment::SelectiveColor(aurora_core::SelectiveColorParams::identity()),
+                Adjustment::SelectiveColor(strong_selective),
             ] {
                 let (_dir, mut store) = real_tile_store();
                 let mut layers =
@@ -89787,6 +90343,7 @@ mod tests {
         include!("clip_corpus_tests.rs");
         include!("psd_audit_tests.rs");
         include!("four_adjust_fidelity_tests.rs");
+        include!("two_adjust_fidelity_tests.rs");
         include!("small_machine_effect_tests.rs");
     }
 }

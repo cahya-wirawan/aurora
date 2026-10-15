@@ -653,7 +653,7 @@ fn extra_channels_and_adjustment_layers_are_reported() {
                     l.clipping = 1;
                     l.blocks.push((*b"lfx2", vec![0; 8]));
                 }),
-                TestLayer::empty("Levels 1").with(|l| l.blocks.push((*b"mixr", vec![0; 4]))),
+                TestLayer::empty("Levels 1").with(|l| l.blocks.push((*b"grdm", vec![0; 4]))),
                 TestLayer::empty("Color Fill").with(|l| l.blocks.push((*b"SoCo", vec![0; 4]))),
             ];
         })
@@ -1535,7 +1535,7 @@ fn the_merged_fallback_uses_merged_alpha_and_removes_the_white_matte() {
             // Every record left out, so the merged image is used.
             p.layers.push(
                 TestLayer::pixels("levels", 0, 0, 1, 1, 8, &[[0, 0, 0, 255]])
-                    .with(|l| l.blocks.push((*b"mixr", vec![0; 4]))),
+                    .with(|l| l.blocks.push((*b"grdm", vec![0; 4]))),
             );
             // c' = c*a + (1 - a), a = 128/255: c = 0, 1, ~0.5.
             p.merged = Some(vec![vec![127], vec![255], vec![191], vec![128]]);
@@ -2544,7 +2544,7 @@ fn a_grayscale_merged_fallback_reads_its_alpha_plane_as_alpha() {
             p.channels = 2;
             p.negative_count = true;
             p.layers
-                .push(TestLayer::empty("adj").with(|l| l.blocks.push((*b"mixr", vec![0; 4]))));
+                .push(TestLayer::empty("adj").with(|l| l.blocks.push((*b"grdm", vec![0; 4]))));
             p.merged = Some(vec![vec![60, 255], vec![255, 0]]);
         })
         .write();
@@ -4795,13 +4795,13 @@ fn curves_reporting_covers_pass_through_other_kinds_grayscale_and_refusals() {
         (
             "levels",
             curves_file(&curv_rgb_block(), |l| {
-                l.blocks = vec![(*b"mixr", vec![0; 4])];
+                l.blocks = vec![(*b"grdm", vec![0; 4])];
             }),
-            "1 adjustment layer (Channel Mixer, Gradient Map and similar) was left out",
+            "1 adjustment layer (Gradient Map, Color Lookup and similar) was left out",
         ),
         (
             "curv and brit",
-            curves_file(&curv_rgb_block(), |l| l.blocks.push((*b"mixr", vec![0; 4]))),
+            curves_file(&curv_rgb_block(), |l| l.blocks.push((*b"grdm", vec![0; 4]))),
             "1 adjustment layer",
         ),
         (

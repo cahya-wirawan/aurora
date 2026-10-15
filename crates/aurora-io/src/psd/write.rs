@@ -289,11 +289,14 @@ struct Losses {
     /// Adjustment layers with values rounded to the file's resolution
     /// (0.205.0): Curves, Levels, Hue/Saturation; and since 0.241.0 Vibrance,
     /// Exposure, Photo Filter, Black & White, Color Balance (slots 3..=7).
-    adjustment_rounded: [usize; 8],
+    adjustment_rounded: [usize; 10],
     /// Black & White layers written (0.241.0): each one's tint colour is
     /// stored as a colour made from the tint hue and saturation, and the
     /// preset name is cleared.
     black_white_written: usize,
+    /// Channel Mixer layers that adjust something (0.245.0): written in the
+    /// layout Aurora inferred, not checked in Photoshop.
+    mixer_unchecked: usize,
     /// Curves layers with points merged on the same 8-bit level.
     curve_merged: usize,
     /// Hue/Saturation layers with custom edges on a neutral range.
@@ -328,11 +331,16 @@ impl Losses {
             aurora_doc::Adjustment::PhotoFilter(_) => Some(5),
             aurora_doc::Adjustment::BlackWhite(_) => Some(6),
             aurora_doc::Adjustment::ColorBalance(_) => Some(7),
+            aurora_doc::Adjustment::ChannelMixer(_) => Some(8),
+            aurora_doc::Adjustment::SelectiveColor(_) => Some(9),
             aurora_doc::Adjustment::Invert
             | aurora_doc::Adjustment::Threshold(_)
             | aurora_doc::Adjustment::Posterize(_)
             | aurora_doc::Adjustment::BrightnessContrast(_) => None,
         };
+        self.mixer_unchecked += usize::from(
+            matches!(adjustment, aurora_doc::Adjustment::ChannelMixer(p) if !p.is_identity()),
+        );
         self.black_white_written +=
             usize::from(matches!(adjustment, aurora_doc::Adjustment::BlackWhite(_)));
         if rounding.rounded
@@ -451,6 +459,8 @@ impl Losses {
             photo_filter,
             black_white,
             color_balance,
+            channel_mixer,
+            selective_color,
         ] = self.adjustment_rounded;
         if curves > 0 {
             items.push(format!(
@@ -506,10 +516,39 @@ impl Losses {
                 "Color Balance layers'",
                 "fractional values will be rounded to whole numbers.",
             ),
+            (
+                channel_mixer,
+                "Channel Mixer layer's",
+                "Channel Mixer layers'",
+                "fractional values will be rounded to whole percents.",
+            ),
+            (
+                selective_color,
+                "Selective Color layer's",
+                "Selective Color layers'",
+                "fractional values will be rounded to whole percents.",
+            ),
         ] {
             if n > 0 {
                 items.push(format!("{} {what}", plural(n as u64, one, many)));
             }
+        }
+        if self.mixer_unchecked > 0 {
+            items.push(format!(
+                "{} written in the layout Aurora inferred (output rows, the constant as the \
+                 fifth value) and not checked in Photoshop; Photoshop may render {} \
+                 differently.",
+                plural(
+                    self.mixer_unchecked as u64,
+                    "Channel Mixer layer is",
+                    "Channel Mixer layers are"
+                ),
+                if self.mixer_unchecked == 1 {
+                    "it"
+                } else {
+                    "them"
+                }
+            ));
         }
         if self.black_white_written > 0 {
             items.push(format!(
