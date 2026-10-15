@@ -21,6 +21,9 @@
 
 use aurora_core::ChannelMixerParams;
 
+/// How many `f32`s [`ChannelMixerOp::packed_for_gpu`] returns (0.250.0).
+pub const CHANNEL_MIXER_PACKED_LEN: usize = 16;
+
 /// A Channel Mixer adjustment ready to apply to pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChannelMixerOp {
@@ -46,6 +49,34 @@ impl ChannelMixerOp {
     #[must_use]
     pub const fn is_identity(&self) -> bool {
         self.identity
+    }
+
+    /// The settings flattened for the GPU Channel Mixer pass (0.250.0,
+    /// `aurora_render::TileCompositor::composite_channel_mixer_with_opacity`,
+    /// `shaders/channel_mixer.wgsl`): `[monochrome, 0, 0, 0]` then the three
+    /// rows (red, green, blue output) of `[from red, from green, from blue,
+    /// constant]`, as fractions: the very `f32`s [`Self::apply`] multiplies.
+    #[must_use]
+    pub fn packed_for_gpu(&self) -> [f32; CHANNEL_MIXER_PACKED_LEN] {
+        let [r, g, b] = self.rows;
+        [
+            f32::from(u8::from(self.monochrome)),
+            0.0,
+            0.0,
+            0.0,
+            r[0],
+            r[1],
+            r[2],
+            r[3],
+            g[0],
+            g[1],
+            g[2],
+            g[3],
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+        ]
     }
 
     /// The mixed colour of one straight, encoded RGB pixel.

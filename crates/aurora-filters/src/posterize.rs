@@ -17,6 +17,9 @@
 
 use aurora_core::PosterizeParams;
 
+/// How many `f32`s [`PosterizeOp::packed_for_gpu`] returns (0.250.0).
+pub const POSTERIZE_PACKED_LEN: usize = 4;
+
 /// A Posterize adjustment ready to apply to pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PosterizeOp {
@@ -45,6 +48,20 @@ impl PosterizeOp {
     #[must_use]
     pub const fn is_identity(&self) -> bool {
         self.identity
+    }
+
+    /// The settings flattened for the GPU Posterize pass (0.250.0,
+    /// `aurora_render::TileCompositor::composite_posterize_with_opacity`,
+    /// `shaders/posterize.wgsl`): `[identity, n, n - 1, 0]`, `identity` as
+    /// `0`/`1`, `n` and `n - 1` the very `f32`s [`Self::apply`] uses.
+    #[must_use]
+    pub fn packed_for_gpu(&self) -> [f32; POSTERIZE_PACKED_LEN] {
+        [
+            f32::from(u8::from(self.identity)),
+            self.count,
+            self.top,
+            0.0,
+        ]
     }
 
     /// The number of levels.

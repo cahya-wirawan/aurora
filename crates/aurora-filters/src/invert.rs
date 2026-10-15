@@ -9,8 +9,9 @@
 //! output is in `[0, 1]`. **Invert is never an identity**: there is no
 //! parameter, and applying it twice returns the clamped input.
 //!
-//! No GPU pass: a visible Invert layer refuses the GPU compositing path
-//! (a later task ports it).
+//! GPU (0.250.0): `aurora_render::TileCompositor::composite_invert_with_opacity`
+//! (`shaders/invert.wgsl`) computes the same `1 - clamp(x)`; it has no
+//! parameters, so there is nothing to pack.
 
 /// An Invert adjustment. It has no settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

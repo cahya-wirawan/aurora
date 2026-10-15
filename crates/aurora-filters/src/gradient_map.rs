@@ -37,7 +37,11 @@
 //! a hard step is exact.
 
 use crate::threshold::LUMA;
-use aurora_core::GradientMapParams;
+use aurora_core::{GRADIENT_MAP_MAX_STOPS, GradientMapParams};
+
+/// How many `f32`s [`GradientMapOp::packed_for_gpu`] returns (0.250.0): a
+/// header `vec4` and [`aurora_core::GRADIENT_MAP_MAX_STOPS`] stops of four.
+pub const GRADIENT_MAP_PACKED_LEN: usize = 4 + 4 * GRADIENT_MAP_MAX_STOPS;
 
 /// A Gradient Map adjustment ready to apply to pixels.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +70,35 @@ impl GradientMapOp {
     #[must_use]
     pub const fn is_identity(&self) -> bool {
         false
+    }
+
+    /// The settings flattened for the GPU Gradient Map pass (0.250.0,
+    /// `aurora_render::TileCompositor::composite_gradient_map_with_opacity`,
+    /// `shaders/gradient_map.wgsl`): `[reverse, stop count, 0, 0]` then
+    /// [`GRADIENT_MAP_MAX_STOPS`] stops of `[position, red, green, blue]`,
+    /// in order of position (the very `f32`s [`Self::colour_at`] reads).
+    /// Slots past the count repeat the last stop so no slot is ever
+    /// uninitialised; the shader never reads them.
+    #[must_use]
+    pub fn packed_for_gpu(&self) -> [f32; GRADIENT_MAP_PACKED_LEN] {
+        let mut out = [0.0_f32; GRADIENT_MAP_PACKED_LEN];
+        let count = self.stops.len().min(GRADIENT_MAP_MAX_STOPS);
+        out[0] = f32::from(u8::from(self.reverse));
+        out[1] = u8::try_from(count).map_or(0.0, f32::from);
+        let last = self.stops.last().copied().unwrap_or([0.0; 4]);
+        for slot in 0..GRADIENT_MAP_MAX_STOPS {
+            let stop = if slot < count {
+                self.stops.get(slot).copied().unwrap_or(last)
+            } else {
+                last
+            };
+            for (j, v) in stop.into_iter().enumerate() {
+                if let Some(cell) = out.get_mut(4 + slot * 4 + j) {
+                    *cell = v;
+                }
+            }
+        }
+        out
     }
 
     /// The gradient's colour at `t` (`0..=1`; a value outside is clamped).

@@ -57,6 +57,11 @@
 //!   ([`BrightnessContrastOp::is_identity`], either mode); a non-identity
 //!   op clamps its input to `[0, 1]` (`NaN` reads as `0`) and returns
 //!   values in `[0, 1]`.
+//! - **GPU (0.250.0)**: the Use Legacy line is its own pass
+//!   ([`BrightnessContrastOp::packed_for_gpu`]); the default mode's table is
+//!   uploaded by the compositor's Curves pass
+//!   ([`BrightnessContrastOp::curve_for_gpu`]), so the GPU interpolates the
+//!   very 16,385 samples the CPU does and no spline is evaluated on the GPU.
 //! - **The default mode reuses [`crate::CurvesLut`]** (a 16,385-sample
 //!   table with linear interpolation), so it cannot be sharper than a
 //!   Curves layer; building it costs one table per parameter set, cached
@@ -66,6 +71,10 @@ use crate::CurvesLut;
 use aurora_core::{
     BRIGHTNESS_CONTRAST_MEAN, BrightnessContrastParams, CurvePoint, CurvesParams, ToneCurve,
 };
+
+/// How many `f32`s [`BrightnessContrastOp::packed_for_gpu`] returns
+/// (0.250.0).
+pub const BRIGHTNESS_CONTRAST_PACKED_LEN: usize = 4;
 
 /// The default mode's brightness displacement of the inner points at
 /// x = 64, 128, 192, in levels, at brightness 150.
@@ -113,8 +122,9 @@ enum Mode {
     Identity,
     /// Linear: `(in + shift - mean) * slope + mean` on the 0 to 1 scale.
     Legacy { shift: f32, mean: f32, slope: f32 },
-    /// The fitted tone curve.
-    Curve(Box<CurvesLut>),
+    /// The fitted tone curve, with the parameters it was built from (the
+    /// GPU Curves pass caches its table upload per parameter set).
+    Curve(Box<CurvesLut>, Box<CurvesParams>),
 }
 
 /// A Brightness/Contrast adjustment ready to apply to pixels.
@@ -149,19 +159,20 @@ impl BrightnessContrastOp {
             CurvePoint::new(x3, y3),
             CurvePoint::new(1.0, 1.0),
         ];
-        let lut = match ToneCurve::new(&points) {
-            Ok(composite) => CurvesLut::new(&CurvesParams {
+        let curve = match ToneCurve::new(&points) {
+            Ok(composite) => CurvesParams {
                 composite,
                 red: None,
                 green: None,
                 blue: None,
-            }),
+            },
             // Unreachable: the points are finite, ordered and 64 levels
             // apart. The identity is the calm fallback.
-            Err(_) => CurvesLut::new(&CurvesParams::identity()),
+            Err(_) => CurvesParams::identity(),
         };
+        let lut = CurvesLut::new(&curve);
         Self {
-            mode: Mode::Curve(Box::new(lut)),
+            mode: Mode::Curve(Box::new(lut), Box::new(curve)),
         }
     }
 
@@ -171,7 +182,42 @@ impl BrightnessContrastOp {
         match &self.mode {
             Mode::Identity => true,
             Mode::Legacy { .. } => false,
-            Mode::Curve(lut) => lut.is_identity(),
+            Mode::Curve(lut, _) => lut.is_identity(),
+        }
+    }
+
+    /// The settings of the two linear cases flattened for the GPU
+    /// Brightness/Contrast pass (0.250.0,
+    /// `aurora_render::TileCompositor::composite_brightness_contrast_with_opacity`,
+    /// `shaders/brightness_contrast.wgsl`): `[kind, shift, mean, slope]`,
+    /// `kind` 0 = not applied (an exact passthrough), 1 = the Use Legacy
+    /// line, 2 = the contrast-100 step at the pivot (`slope` is then 0: the
+    /// CPU's infinity never reaches the GPU). `None` for the default mode,
+    /// whose 16,385-sample table the Curves pass uploads
+    /// ([`Self::curve_for_gpu`]).
+    #[must_use]
+    pub fn packed_for_gpu(&self) -> Option<[f32; BRIGHTNESS_CONTRAST_PACKED_LEN]> {
+        match &self.mode {
+            Mode::Identity => Some([0.0; BRIGHTNESS_CONTRAST_PACKED_LEN]),
+            Mode::Legacy { shift, mean, slope } => Some(if slope.is_infinite() {
+                [2.0, *shift, *mean, 0.0]
+            } else {
+                [1.0, *shift, *mean, *slope]
+            }),
+            Mode::Curve(..) => None,
+        }
+    }
+
+    /// The default mode's tone curve, as the parameters it was built from
+    /// and its built table: what the GPU Curves pass maps the colour
+    /// through (composite curve only, so [`Self::apply`] and the Curves
+    /// pass compute the same function of each channel). `None` for the
+    /// identity and the legacy line.
+    #[must_use]
+    pub fn curve_for_gpu(&self) -> Option<(&CurvesParams, &CurvesLut)> {
+        match &self.mode {
+            Mode::Curve(lut, params) => Some((params, lut)),
+            Mode::Identity | Mode::Legacy { .. } => None,
         }
     }
 
@@ -189,7 +235,7 @@ impl BrightnessContrastOp {
                 };
                 out.clamp(0.0, 1.0)
             }
-            Mode::Curve(lut) => lut.map_channel(index, v),
+            Mode::Curve(lut, _) => lut.map_channel(index, v),
         }
     }
 
