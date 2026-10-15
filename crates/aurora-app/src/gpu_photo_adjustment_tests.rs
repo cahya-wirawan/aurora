@@ -89,130 +89,150 @@ pub(crate) const STEEP_CASES: [&str; 12] = [
     "bw extremes low",
 ];
 
+fn vibrance_cases() -> Vec<(&'static str, Adjustment)> {
+    vec![
+        ("vib +50", vib(50.0, 0.0)),
+        ("vib +100", vib(100.0, 0.0)),
+        ("vib -50", vib(-50.0, 0.0)),
+        ("vib -100", vib(-100.0, 0.0)),
+        ("vib sat +40", vib(0.0, 40.0)),
+        ("vib sat -60", vib(0.0, -60.0)),
+        ("vib sat -100", vib(0.0, -100.0)),
+        ("vib sat +99", vib(0.0, 99.0)),
+        ("vib sat +100", vib(0.0, 100.0)),
+        ("vib mixed", vib(70.0, -20.0)),
+        ("vib mixed 2", vib(-30.0, 40.0)),
+        ("vib extremes", vib(100.0, 100.0)),
+        ("vib extremes low", vib(-100.0, -100.0)),
+    ]
+}
+
+fn exposure_cases() -> Vec<(&'static str, Adjustment)> {
+    vec![
+        ("exp +1", expo(1.0, 0.0, 1.0)),
+        ("exp -1", expo(-1.0, 0.0, 1.0)),
+        ("exp +0.5", expo(0.5, 0.0, 1.0)),
+        ("exp -2", expo(-2.0, 0.0, 1.0)),
+        ("exp offset +0.1", expo(0.0, 0.1, 1.0)),
+        ("exp offset -0.1", expo(0.0, -0.1, 1.0)),
+        ("exp offset +0.5", expo(0.0, 0.5, 1.0)),
+        ("exp offset -0.5", expo(0.0, -0.5, 1.0)),
+        ("exp gamma 2.2", expo(0.0, 0.0, 2.2)),
+        ("exp gamma 0.45", expo(0.0, 0.0, 0.45)),
+        ("exp all", expo(1.5, 0.05, 1.8)),
+        ("exp +5", expo(5.0, 0.0, 1.0)),
+        ("exp -5", expo(-5.0, 0.0, 1.0)),
+        ("exp +20", expo(20.0, 0.0, 1.0)),
+        ("exp -20", expo(-20.0, 0.0, 1.0)),
+        ("exp gamma 0.10", expo(0.0, 0.0, 0.10)),
+        ("exp gamma 9.99", expo(0.0, 0.0, 9.99)),
+    ]
+}
+
+fn photo_filter_cases() -> Vec<(&'static str, Adjustment)> {
+    vec![
+        ("pf warming 85 preserve", pf([236, 138, 0], 50.0, true)),
+        ("pf warming 85 plain", pf([236, 138, 0], 50.0, false)),
+        (
+            "pf cooling 80 d100 preserve",
+            pf([0, 109, 255], 100.0, true),
+        ),
+        ("pf cooling 80 d100 plain", pf([0, 109, 255], 100.0, false)),
+        ("pf density 1", pf([0, 0, 0], 1.0, false)),
+        ("pf black d100", pf([0, 0, 0], 100.0, false)),
+        ("pf black d60 preserve", pf([0, 0, 0], 60.0, true)),
+        ("pf green d75 preserve", pf([40, 200, 60], 75.0, true)),
+        ("pf one channel off", pf([255, 255, 200], 100.0, true)),
+    ]
+}
+
+fn black_white_cases() -> Vec<(&'static str, Adjustment)> {
+    vec![
+        ("bw default", bw(aurora_core::BLACK_WHITE_DEFAULTS)),
+        ("bw extremes high", bw([300.0; 6])),
+        ("bw extremes low", bw([-200.0; 6])),
+        ("bw mixed", bw([100.0, -50.0, 200.0, 0.0, -100.0, 150.0])),
+        ("bw reds only", bw([300.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
+        ("bw blues only", bw([0.0, 0.0, 0.0, 0.0, 300.0, 0.0])),
+        (
+            "bw tint sepia",
+            bw_tint(aurora_core::BLACK_WHITE_DEFAULTS, 35.0, 25.0),
+        ),
+        (
+            "bw tint blue",
+            bw_tint([60.0, 80.0, 40.0, 60.0, 20.0, 70.0], 210.0, 100.0),
+        ),
+        (
+            "bw tint hue 0",
+            bw_tint(aurora_core::BLACK_WHITE_DEFAULTS, 0.0, 60.0),
+        ),
+        (
+            "bw tint hue 360",
+            bw_tint(aurora_core::BLACK_WHITE_DEFAULTS, 360.0, 60.0),
+        ),
+    ]
+}
+
+fn color_balance_cases() -> Vec<(&'static str, Adjustment)> {
+    vec![
+        (
+            "cb shadows",
+            cbal([[40.0, 0.0, -20.0], [0.0; 3], [0.0; 3]], false),
+        ),
+        (
+            "cb midtones",
+            cbal([[0.0; 3], [-30.0, 20.0, 10.0], [0.0; 3]], false),
+        ),
+        (
+            "cb highlights",
+            cbal([[0.0; 3], [0.0; 3], [10.0, -25.0, 35.0]], false),
+        ),
+        (
+            "cb all preserve",
+            cbal(
+                [[20.0, -10.0, 5.0], [-15.0, 30.0, -20.0], [10.0, 0.0, -40.0]],
+                true,
+            ),
+        ),
+        (
+            "cb all plain",
+            cbal(
+                [[20.0, -10.0, 5.0], [-15.0, 30.0, -20.0], [10.0, 0.0, -40.0]],
+                false,
+            ),
+        ),
+        (
+            "cb extremes preserve",
+            cbal(
+                [
+                    [100.0, -100.0, 100.0],
+                    [-100.0, 100.0, -100.0],
+                    [100.0, 100.0, -100.0],
+                ],
+                true,
+            ),
+        ),
+        (
+            "cb extremes plain",
+            cbal(
+                [
+                    [100.0, -100.0, 100.0],
+                    [-100.0, 100.0, -100.0],
+                    [100.0, 100.0, -100.0],
+                ],
+                false,
+            ),
+        ),
+    ]
+}
+
 pub(crate) fn cases_of(pass: Pass) -> Vec<(&'static str, Adjustment)> {
     match pass {
-        Pass::Vibrance => vec![
-            ("vib +50", vib(50.0, 0.0)),
-            ("vib +100", vib(100.0, 0.0)),
-            ("vib -50", vib(-50.0, 0.0)),
-            ("vib -100", vib(-100.0, 0.0)),
-            ("vib sat +40", vib(0.0, 40.0)),
-            ("vib sat -60", vib(0.0, -60.0)),
-            ("vib sat -100", vib(0.0, -100.0)),
-            ("vib sat +99", vib(0.0, 99.0)),
-            ("vib sat +100", vib(0.0, 100.0)),
-            ("vib mixed", vib(70.0, -20.0)),
-            ("vib mixed 2", vib(-30.0, 40.0)),
-            ("vib extremes", vib(100.0, 100.0)),
-            ("vib extremes low", vib(-100.0, -100.0)),
-        ],
-        Pass::Exposure => vec![
-            ("exp +1", expo(1.0, 0.0, 1.0)),
-            ("exp -1", expo(-1.0, 0.0, 1.0)),
-            ("exp +0.5", expo(0.5, 0.0, 1.0)),
-            ("exp -2", expo(-2.0, 0.0, 1.0)),
-            ("exp offset +0.1", expo(0.0, 0.1, 1.0)),
-            ("exp offset -0.1", expo(0.0, -0.1, 1.0)),
-            ("exp offset +0.5", expo(0.0, 0.5, 1.0)),
-            ("exp offset -0.5", expo(0.0, -0.5, 1.0)),
-            ("exp gamma 2.2", expo(0.0, 0.0, 2.2)),
-            ("exp gamma 0.45", expo(0.0, 0.0, 0.45)),
-            ("exp all", expo(1.5, 0.05, 1.8)),
-            ("exp +5", expo(5.0, 0.0, 1.0)),
-            ("exp -5", expo(-5.0, 0.0, 1.0)),
-            ("exp +20", expo(20.0, 0.0, 1.0)),
-            ("exp -20", expo(-20.0, 0.0, 1.0)),
-            ("exp gamma 0.10", expo(0.0, 0.0, 0.10)),
-            ("exp gamma 9.99", expo(0.0, 0.0, 9.99)),
-        ],
-        Pass::PhotoFilter => vec![
-            ("pf warming 85 preserve", pf([236, 138, 0], 50.0, true)),
-            ("pf warming 85 plain", pf([236, 138, 0], 50.0, false)),
-            (
-                "pf cooling 80 d100 preserve",
-                pf([0, 109, 255], 100.0, true),
-            ),
-            ("pf cooling 80 d100 plain", pf([0, 109, 255], 100.0, false)),
-            ("pf density 1", pf([0, 0, 0], 1.0, false)),
-            ("pf black d100", pf([0, 0, 0], 100.0, false)),
-            ("pf black d60 preserve", pf([0, 0, 0], 60.0, true)),
-            ("pf green d75 preserve", pf([40, 200, 60], 75.0, true)),
-            ("pf one channel off", pf([255, 255, 200], 100.0, true)),
-        ],
-        Pass::BlackWhite => vec![
-            ("bw default", bw(aurora_core::BLACK_WHITE_DEFAULTS)),
-            ("bw extremes high", bw([300.0; 6])),
-            ("bw extremes low", bw([-200.0; 6])),
-            ("bw mixed", bw([100.0, -50.0, 200.0, 0.0, -100.0, 150.0])),
-            ("bw reds only", bw([300.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
-            ("bw blues only", bw([0.0, 0.0, 0.0, 0.0, 300.0, 0.0])),
-            (
-                "bw tint sepia",
-                bw_tint(aurora_core::BLACK_WHITE_DEFAULTS, 35.0, 25.0),
-            ),
-            (
-                "bw tint blue",
-                bw_tint([60.0, 80.0, 40.0, 60.0, 20.0, 70.0], 210.0, 100.0),
-            ),
-            (
-                "bw tint hue 0",
-                bw_tint(aurora_core::BLACK_WHITE_DEFAULTS, 0.0, 60.0),
-            ),
-            (
-                "bw tint hue 360",
-                bw_tint(aurora_core::BLACK_WHITE_DEFAULTS, 360.0, 60.0),
-            ),
-        ],
-        Pass::ColorBalance => vec![
-            (
-                "cb shadows",
-                cbal([[40.0, 0.0, -20.0], [0.0; 3], [0.0; 3]], false),
-            ),
-            (
-                "cb midtones",
-                cbal([[0.0; 3], [-30.0, 20.0, 10.0], [0.0; 3]], false),
-            ),
-            (
-                "cb highlights",
-                cbal([[0.0; 3], [0.0; 3], [10.0, -25.0, 35.0]], false),
-            ),
-            (
-                "cb all preserve",
-                cbal(
-                    [[20.0, -10.0, 5.0], [-15.0, 30.0, -20.0], [10.0, 0.0, -40.0]],
-                    true,
-                ),
-            ),
-            (
-                "cb all plain",
-                cbal(
-                    [[20.0, -10.0, 5.0], [-15.0, 30.0, -20.0], [10.0, 0.0, -40.0]],
-                    false,
-                ),
-            ),
-            (
-                "cb extremes preserve",
-                cbal(
-                    [
-                        [100.0, -100.0, 100.0],
-                        [-100.0, 100.0, -100.0],
-                        [100.0, 100.0, -100.0],
-                    ],
-                    true,
-                ),
-            ),
-            (
-                "cb extremes plain",
-                cbal(
-                    [
-                        [100.0, -100.0, 100.0],
-                        [-100.0, 100.0, -100.0],
-                        [100.0, 100.0, -100.0],
-                    ],
-                    false,
-                ),
-            ),
-        ],
+        Pass::Vibrance => vibrance_cases(),
+        Pass::Exposure => exposure_cases(),
+        Pass::PhotoFilter => photo_filter_cases(),
+        Pass::BlackWhite => black_white_cases(),
+        Pass::ColorBalance => color_balance_cases(),
         Pass::Levels | Pass::HueSaturation => Vec::new(),
     }
 }

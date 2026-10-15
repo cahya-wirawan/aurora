@@ -20211,10 +20211,17 @@ fn adjustment_layer_qualifies_for_gpu(
         .blend_mode(id)
         .unwrap_or(aurora_doc::BlendMode::Normal);
     let expressible = match layers.adjustment(id) {
+        // Curves, Levels and Hue/Saturation (master / Colorize) have had a GPU
+        // pass since 0.159.0 / 0.206.0.
         Some(
             aurora_doc::Adjustment::Curves(_)
             | aurora_doc::Adjustment::Levels(_)
-            | aurora_doc::Adjustment::HueSaturation(_),
+            | aurora_doc::Adjustment::HueSaturation(_)
+            | aurora_doc::Adjustment::Vibrance(_)
+            | aurora_doc::Adjustment::Exposure(_)
+            | aurora_doc::Adjustment::PhotoFilter(_)
+            | aurora_doc::Adjustment::BlackWhite(_)
+            | aurora_doc::Adjustment::ColorBalance(_),
         ) => true,
         Some(aurora_doc::Adjustment::HueSaturationRanges(params)) => {
             aurora_filters::HueSaturationOp::with_ranges(params)
@@ -20222,16 +20229,9 @@ fn adjustment_layer_qualifies_for_gpu(
                 .is_some()
         }
         // Vibrance, Exposure and Photo Filter (0.239.0), Black & White and
-        // Color Balance (0.240.0) are per-pixel functions with a GPU pass
-        // each since 0.242.0 (`composite_vibrance_with_opacity` and its four
-        // siblings); neutral or not, they qualify like Levels does.
-        Some(
-            aurora_doc::Adjustment::Vibrance(_)
-            | aurora_doc::Adjustment::Exposure(_)
-            | aurora_doc::Adjustment::PhotoFilter(_)
-            | aurora_doc::Adjustment::BlackWhite(_)
-            | aurora_doc::Adjustment::ColorBalance(_),
-        ) => true,
+        // Color Balance (0.240.0) are per-pixel functions with a GPU pass each
+        // since 0.242.0 (`composite_vibrance_with_opacity` and its four
+        // siblings), admitted above; neutral or not, they qualify like Levels.
         None => false,
     };
     expressible
@@ -20672,7 +20672,46 @@ fn begin_gpu_adjustment_pass(
             }
             note_gpu_hue_saturation_dispatch();
         }
-        (_, AdjustmentLut::Vibrance(op)) => {
+        (
+            _,
+            lut @ (AdjustmentLut::Vibrance(_)
+            | AdjustmentLut::Exposure(_)
+            | AdjustmentLut::PhotoFilter(_)
+            | AdjustmentLut::BlackWhite(_)
+            | AdjustmentLut::ColorBalance(_)),
+        ) => {
+            if !record_photographer_adjustment_pass(
+                gpu, compositor, encoder, lut, from, to, opacity, mode,
+            ) {
+                return false;
+            }
+        }
+        // Curves with its own table set is the first arm; a Curves
+        // adjustment paired with another table kind cannot occur
+        // (`AdjustmentLut::of` builds the pair from the same value).
+        (_, AdjustmentLut::Curves(_)) => return false,
+    }
+    std::mem::swap(current_accumulator, spare_accumulator);
+    true
+}
+
+/// Records the GPU pass of one of the five photographer adjustments
+/// (Vibrance, Exposure, Photo Filter, Black & White, Color Balance; 0.242.0)
+/// and counts it. `false` when the compositor refused the pass, or `lut` is
+/// not one of the five (the caller then falls back to the CPU).
+#[allow(clippy::too_many_arguments)]
+fn record_photographer_adjustment_pass(
+    gpu: &aurora_gpu::GpuContext,
+    compositor: &mut aurora_render::TileCompositor,
+    encoder: &mut wgpu::CommandEncoder,
+    lut: &AdjustmentLut,
+    from: &wgpu::TextureView,
+    to: &wgpu::TextureView,
+    opacity: f32,
+    mode: aurora_render::BlendMode,
+) -> bool {
+    match lut {
+        AdjustmentLut::Vibrance(op) => {
             if !compositor.composite_vibrance_with_opacity(
                 gpu,
                 encoder,
@@ -20686,7 +20725,7 @@ fn begin_gpu_adjustment_pass(
             }
             note_gpu_vibrance_dispatch();
         }
-        (_, AdjustmentLut::Exposure(op)) => {
+        AdjustmentLut::Exposure(op) => {
             if !compositor.composite_exposure_with_opacity(
                 gpu,
                 encoder,
@@ -20700,7 +20739,7 @@ fn begin_gpu_adjustment_pass(
             }
             note_gpu_exposure_dispatch();
         }
-        (_, AdjustmentLut::PhotoFilter(op)) => {
+        AdjustmentLut::PhotoFilter(op) => {
             if !compositor.composite_photo_filter_with_opacity(
                 gpu,
                 encoder,
@@ -20714,7 +20753,7 @@ fn begin_gpu_adjustment_pass(
             }
             note_gpu_photo_filter_dispatch();
         }
-        (_, AdjustmentLut::BlackWhite(op)) => {
+        AdjustmentLut::BlackWhite(op) => {
             if !compositor.composite_black_white_with_opacity(
                 gpu,
                 encoder,
@@ -20728,7 +20767,7 @@ fn begin_gpu_adjustment_pass(
             }
             note_gpu_black_white_dispatch();
         }
-        (_, AdjustmentLut::ColorBalance(op)) => {
+        AdjustmentLut::ColorBalance(op) => {
             if !compositor.composite_color_balance_with_opacity(
                 gpu,
                 encoder,
@@ -20742,12 +20781,10 @@ fn begin_gpu_adjustment_pass(
             }
             note_gpu_color_balance_dispatch();
         }
-        // Curves with its own table set is the first arm; a Curves
-        // adjustment paired with another table kind cannot occur
-        // (`AdjustmentLut::of` builds the pair from the same value).
-        (_, AdjustmentLut::Curves(_)) => return false,
+        AdjustmentLut::Curves(_) | AdjustmentLut::Levels(_) | AdjustmentLut::HueSaturation(_) => {
+            return false;
+        }
     }
-    std::mem::swap(current_accumulator, spare_accumulator);
     true
 }
 
