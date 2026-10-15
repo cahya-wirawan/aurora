@@ -34,9 +34,11 @@
 #![allow(clippy::large_types_passed_by_value)]
 
 use aurora_core::{
-    BLACK_WHITE_DEFAULTS, BLACK_WHITE_MAX, BLACK_WHITE_MIN, BlackWhiteParams, COLOR_BALANCE_MAX,
-    COLOR_BALANCE_RANGES, DEFAULT_TINT_HUE, DEFAULT_TINT_SATURATION, EXPOSURE_MAX, ExposureParams,
-    GAMMA_MAX, GAMMA_MIN, OFFSET_MAX, PhotoFilterParams, VibranceParams,
+    BLACK_WHITE_DEFAULTS, BLACK_WHITE_MAX, BLACK_WHITE_MIN, BRIGHTNESS_MAX, BlackWhiteParams,
+    BrightnessContrastParams, COLOR_BALANCE_MAX, COLOR_BALANCE_RANGES, CONTRAST_MAX,
+    DEFAULT_TINT_HUE, DEFAULT_TINT_SATURATION, EXPOSURE_MAX, ExposureParams, GAMMA_MAX, GAMMA_MIN,
+    LEGACY_MAX, OFFSET_MAX, POSTERIZE_DEFAULT, POSTERIZE_MAX, POSTERIZE_MIN, PhotoFilterParams,
+    THRESHOLD_DEFAULT, THRESHOLD_MAX, THRESHOLD_MIN, VibranceParams,
 };
 use aurora_doc::{Adjustment, LayerId, LayerTree};
 use aurora_theme::Scales;
@@ -46,9 +48,9 @@ use taffy::style_helpers::length;
 use taffy::{Display, FlexDirection, Size, Style};
 
 /// How many sliders the editors hold.
-pub const ADJUST_SLIDER_COUNT: usize = 20;
+pub const ADJUST_SLIDER_COUNT: usize = 24;
 /// How many editor groups there are.
-pub const ADJUST_KIND_COUNT: usize = 5;
+pub const ADJUST_KIND_COUNT: usize = 9;
 
 /// Which of the adjustments an editor group belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,6 +60,14 @@ pub enum AdjustKind {
     PhotoFilter,
     BlackWhite,
     ColorBalance,
+    /// Invert (0.244.0): no settings, a note instead of sliders.
+    Invert,
+    /// Threshold (0.244.0): one level slider.
+    Threshold,
+    /// Posterize (0.244.0): one levels slider.
+    Posterize,
+    /// Brightness/Contrast (0.244.0): two sliders and Use Legacy.
+    BrightnessContrast,
 }
 
 impl AdjustKind {
@@ -68,6 +78,10 @@ impl AdjustKind {
         Self::PhotoFilter,
         Self::BlackWhite,
         Self::ColorBalance,
+        Self::Invert,
+        Self::Threshold,
+        Self::Posterize,
+        Self::BrightnessContrast,
     ];
 
     /// Position in [`Self::ALL`].
@@ -79,6 +93,10 @@ impl AdjustKind {
             Self::PhotoFilter => 2,
             Self::BlackWhite => 3,
             Self::ColorBalance => 4,
+            Self::Invert => 5,
+            Self::Threshold => 6,
+            Self::Posterize => 7,
+            Self::BrightnessContrast => 8,
         }
     }
 
@@ -91,12 +109,16 @@ impl AdjustKind {
             Adjustment::PhotoFilter(_) => Some(Self::PhotoFilter),
             Adjustment::BlackWhite(_) => Some(Self::BlackWhite),
             Adjustment::ColorBalance(_) => Some(Self::ColorBalance),
+            Adjustment::Invert => Some(Self::Invert),
+            Adjustment::Threshold(_) => Some(Self::Threshold),
+            Adjustment::Posterize(_) => Some(Self::Posterize),
+            Adjustment::BrightnessContrast(_) => Some(Self::BrightnessContrast),
             _ => None,
         }
     }
 }
 
-/// One of the twenty sliders.
+/// One of the twenty-four sliders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdjustSlider {
     /// Vibrance, `-100..=100`.
@@ -134,6 +156,15 @@ pub enum AdjustSlider {
     BalanceMagentaGreen,
     /// Its yellow-blue slider.
     BalanceYellowBlue,
+    /// Threshold's level, `1..=255`.
+    ThresholdLevel,
+    /// Posterize's level count, `2..=255`.
+    PosterizeLevels,
+    /// Brightness/Contrast's brightness, `-150..=150` (`-100..=100` with
+    /// Use Legacy: an edit is clamped to the mode's range).
+    Brightness,
+    /// Its contrast, `-100..=100` (`-50..=100` in the default mode).
+    Contrast,
 }
 
 impl AdjustSlider {
@@ -159,6 +190,10 @@ impl AdjustSlider {
         Self::BalanceCyanRed,
         Self::BalanceMagentaGreen,
         Self::BalanceYellowBlue,
+        Self::ThresholdLevel,
+        Self::PosterizeLevels,
+        Self::Brightness,
+        Self::Contrast,
     ];
 
     /// Position in [`Self::ALL`].
@@ -185,6 +220,10 @@ impl AdjustSlider {
             Self::BalanceCyanRed => 17,
             Self::BalanceMagentaGreen => 18,
             Self::BalanceYellowBlue => 19,
+            Self::ThresholdLevel => 20,
+            Self::PosterizeLevels => 21,
+            Self::Brightness => 22,
+            Self::Contrast => 23,
         }
     }
 
@@ -206,6 +245,9 @@ impl AdjustSlider {
             Self::BalanceCyanRed | Self::BalanceMagentaGreen | Self::BalanceYellowBlue => {
                 AdjustKind::ColorBalance
             }
+            Self::ThresholdLevel => AdjustKind::Threshold,
+            Self::PosterizeLevels => AdjustKind::Posterize,
+            Self::Brightness | Self::Contrast => AdjustKind::BrightnessContrast,
         }
     }
 
@@ -267,6 +309,10 @@ impl AdjustSlider {
             Self::BalanceCyanRed => "Color balance cyan to red",
             Self::BalanceMagentaGreen => "Color balance magenta to green",
             Self::BalanceYellowBlue => "Color balance yellow to blue",
+            Self::ThresholdLevel => "Threshold level",
+            Self::PosterizeLevels => "Posterize levels",
+            Self::Brightness => "Brightness",
+            Self::Contrast => "Contrast",
         }
     }
 
@@ -294,6 +340,10 @@ impl AdjustSlider {
             Self::BalanceCyanRed => "Cyan-Red",
             Self::BalanceMagentaGreen => "Magenta-Green",
             Self::BalanceYellowBlue => "Yellow-Blue",
+            Self::ThresholdLevel => "Threshold Level",
+            Self::PosterizeLevels => "Levels",
+            Self::Brightness => "Brightness",
+            Self::Contrast => "Contrast",
         }
     }
 
@@ -318,6 +368,10 @@ impl AdjustSlider {
             Self::BalanceCyanRed | Self::BalanceMagentaGreen | Self::BalanceYellowBlue => {
                 (-(COLOR_BALANCE_MAX as f64), COLOR_BALANCE_MAX as f64)
             }
+            Self::ThresholdLevel => (THRESHOLD_MIN as f64, THRESHOLD_MAX as f64),
+            Self::PosterizeLevels => (POSTERIZE_MIN as f64, POSTERIZE_MAX as f64),
+            Self::Brightness => (-(BRIGHTNESS_MAX as f64), BRIGHTNESS_MAX as f64),
+            Self::Contrast => (-(LEGACY_MAX as f64), CONTRAST_MAX as f64),
         }
     }
 
@@ -340,6 +394,8 @@ impl AdjustSlider {
             Self::Density => f64::from(aurora_core::DEFAULT_DENSITY),
             Self::TintHue => f64::from(DEFAULT_TINT_HUE),
             Self::TintSaturation => f64::from(DEFAULT_TINT_SATURATION),
+            Self::ThresholdLevel => f64::from(THRESHOLD_DEFAULT),
+            Self::PosterizeLevels => f64::from(POSTERIZE_DEFAULT),
             other => other
                 .bw_slot()
                 .and_then(|slot| BLACK_WHITE_DEFAULTS.get(slot))
@@ -352,7 +408,9 @@ impl AdjustSlider {
     #[must_use]
     pub fn readout(self, value: f64) -> String {
         let places = self.decimals();
-        if self == Self::Exposure || self.balance_slot().is_some() {
+        if matches!(self, Self::Exposure | Self::Brightness | Self::Contrast)
+            || self.balance_slot().is_some()
+        {
             format!("{}: {value:+.places$}", self.short_label())
         } else {
             format!("{}: {value:.places$}", self.short_label())
@@ -398,6 +456,14 @@ impl AdjustSlider {
                 let sliders = adjustment.color_balance()?.range(range)?;
                 sliders.get(self.balance_slot()?).copied().map(f64::from)
             }
+            Self::ThresholdLevel => adjustment.threshold().map(|p| f64::from(p.level())),
+            Self::PosterizeLevels => adjustment.posterize().map(|p| f64::from(p.levels())),
+            Self::Brightness => adjustment
+                .brightness_contrast()
+                .map(|p| f64::from(p.brightness())),
+            Self::Contrast => adjustment
+                .brightness_contrast()
+                .map(|p| f64::from(p.contrast())),
         }
     }
 
@@ -485,6 +551,36 @@ impl AdjustSlider {
                     .ok()
                     .map(Adjustment::ColorBalance)
             }
+            Self::ThresholdLevel => {
+                // `snap` clamped `v` into 1..=255.
+                #[allow(clippy::cast_sign_loss)]
+                let level = v as u8;
+                adjustment.threshold()?;
+                aurora_core::ThresholdParams::new(level)
+                    .ok()
+                    .map(Adjustment::Threshold)
+            }
+            Self::PosterizeLevels => {
+                #[allow(clippy::cast_sign_loss)]
+                let levels = v as u8;
+                adjustment.posterize()?;
+                aurora_core::PosterizeParams::new(levels)
+                    .ok()
+                    .map(Adjustment::Posterize)
+            }
+            Self::Brightness | Self::Contrast => {
+                let p = adjustment.brightness_contrast()?;
+                // The slider spans both modes; an edit stays in the mode's range.
+                let ((b0, b1), (c0, c1)) = BrightnessContrastParams::ranges(p.legacy());
+                let n = v as i16;
+                if self == Self::Brightness {
+                    p.with_brightness(n.clamp(b0, b1))
+                } else {
+                    p.with_contrast(n.clamp(c0, c1))
+                }
+                .ok()
+                .map(Adjustment::BrightnessContrast)
+            }
         }
     }
 }
@@ -521,6 +617,10 @@ pub struct AdjustControls {
     /// Color Balance's range selector tab bar: tab 0 Shadows, 1 Midtones,
     /// 2 Highlights.
     pub balance_range: WidgetId,
+    /// Brightness/Contrast's "Use Legacy" checkbox (0.244.0).
+    pub legacy: WidgetId,
+    /// The line Invert's group shows in place of sliders (0.244.0).
+    pub invert_note: WidgetId,
 }
 
 impl AdjustControls {
@@ -582,6 +682,13 @@ pub fn insert_adjust_controls(
         let mut tint = None;
         let mut balance_preserve = None;
         let mut balance_range = None;
+        let mut legacy = None;
+        let invert_note = widgets::insert_label(
+            tree,
+            group_of(AdjustKind::Invert)?,
+            scales,
+            "Invert has no settings.".to_owned(),
+        )?;
         for slider in AdjustSlider::ALL {
             let group = group_of(slider.kind())?;
             // Controls that sit before a slider in its group.
@@ -629,6 +736,9 @@ pub fn insert_adjust_controls(
                     "Preserve Luminosity",
                 )?);
             }
+            if slider == AdjustSlider::Contrast {
+                legacy = Some(widgets::insert_checkbox(tree, group, scales, "Use Legacy")?);
+            }
             if slider == AdjustSlider::BalanceYellowBlue {
                 balance_preserve = Some(widgets::insert_checkbox(
                     tree,
@@ -643,6 +753,7 @@ pub fn insert_adjust_controls(
             Some(tint),
             Some(balance_preserve),
             Some(balance_range),
+            Some(legacy),
             Ok(sliders),
             Ok(readouts),
             Ok(groups),
@@ -651,6 +762,7 @@ pub fn insert_adjust_controls(
             tint,
             balance_preserve,
             balance_range,
+            legacy,
             <[WidgetId; ADJUST_SLIDER_COUNT]>::try_from(sliders),
             <[WidgetId; ADJUST_SLIDER_COUNT]>::try_from(readouts),
             <[WidgetId; ADJUST_KIND_COUNT]>::try_from(groups),
@@ -667,6 +779,8 @@ pub fn insert_adjust_controls(
             tint,
             balance_preserve,
             balance_range,
+            legacy,
+            invert_note,
         };
         set_shown(tree, controls, None, false)?;
         Ok(controls)
@@ -770,6 +884,13 @@ fn set_shown(
         controls.balance_preserve,
         kind == Some(AdjustKind::ColorBalance),
     )?;
+    changed |= set_checkbox_live(
+        tree,
+        controls.legacy,
+        kind == Some(AdjustKind::BrightnessContrast),
+    )?;
+    changed |=
+        widgets::set_label_disabled(tree, controls.invert_note, kind != Some(AdjustKind::Invert))?;
     let tabs_live = kind == Some(AdjustKind::ColorBalance);
     if widgets::tab_bar_state(tree, controls.balance_range)?.is_disabled() == tabs_live {
         widgets::set_tab_bar_disabled(tree, controls.balance_range, !tabs_live)?;
@@ -826,6 +947,12 @@ pub fn adjust_balance_preserve_checked(
     controls: AdjustControls,
 ) -> bool {
     checkbox_checked(tree, controls.balance_preserve)
+}
+
+/// Whether Brightness/Contrast's Use Legacy checkbox is checked.
+#[must_use]
+pub fn adjust_legacy_checked(tree: &WidgetTree<WidgetKind>, controls: AdjustControls) -> bool {
+    checkbox_checked(tree, controls.legacy)
 }
 
 /// The Color Balance range the three sliders edit: `0` shadows, `1`
@@ -916,6 +1043,9 @@ pub fn sync_adjust_controls(
             controls.balance_preserve,
             balance.preserve_luminosity(),
         )?;
+    }
+    if let Some(bc) = adjustment.brightness_contrast() {
+        changed |= sync_checkbox(tree, controls.legacy, bc.legacy())?;
     }
     let range = adjust_balance_range(tree, controls);
     for slider in AdjustSlider::ALL

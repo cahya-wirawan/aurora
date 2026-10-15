@@ -5159,12 +5159,16 @@ mod tests {
             Ok(p) => aurora_doc::Adjustment::Posterize(p),
             Err(err) => unreachable!("{err:?}"),
         };
-        let brightness = |b, c, legacy| match aurora_core::BrightnessContrastParams::new(b, c, legacy) {
-            Ok(p) => aurora_doc::Adjustment::BrightnessContrast(p),
-            Err(err) => unreachable!("{err:?}"),
-        };
+        let brightness =
+            |b, c, legacy| match aurora_core::BrightnessContrastParams::new(b, c, legacy) {
+                Ok(p) => aurora_doc::Adjustment::BrightnessContrast(p),
+                Err(err) => unreachable!("{err:?}"),
+            };
         let edits = [
-            (aurora_doc::Adjustment::Invert, aurora_doc::Adjustment::Invert),
+            (
+                aurora_doc::Adjustment::Invert,
+                aurora_doc::Adjustment::Invert,
+            ),
             (threshold(128), threshold(232)),
             (posterize(4), posterize(255)),
             (brightness(0, 0, false), brightness(-95, -50, false)),

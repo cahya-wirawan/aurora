@@ -110,7 +110,10 @@ impl BrightnessContrastParams {
         if legacy {
             ((-LEGACY_MAX, LEGACY_MAX), (-LEGACY_MAX, LEGACY_MAX))
         } else {
-            ((-BRIGHTNESS_MAX, BRIGHTNESS_MAX), (CONTRAST_MIN, CONTRAST_MAX))
+            (
+                (-BRIGHTNESS_MAX, BRIGHTNESS_MAX),
+                (CONTRAST_MIN, CONTRAST_MAX),
+            )
         }
     }
 
@@ -256,7 +259,12 @@ mod tests {
             unreachable!("encodes");
         };
         assert_eq!(postcard::from_bytes::<P>(&bytes), Ok(p));
-        for bad in [(151_i16, 0_i16, false), (0, 101, false), (101, 0, true), (0, -101, true)] {
+        for bad in [
+            (151_i16, 0_i16, false),
+            (0, 101, false),
+            (101, 0, true),
+            (0, -101, true),
+        ] {
             let Ok(wire) = postcard::to_allocvec(&bad) else {
                 unreachable!("encodes");
             };

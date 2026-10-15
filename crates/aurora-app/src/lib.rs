@@ -6001,6 +6001,12 @@ enum ActivatedCommand {
     /// New Black & White / Color Balance Layer (0.240.0): the same.
     NewBlackWhiteLayer,
     NewColorBalanceLayer,
+    /// New Invert / Threshold / Posterize / Brightness/Contrast Layer
+    /// (0.244.0): the same.
+    NewInvertLayer,
+    NewThresholdLayer,
+    NewPosterizeLayer,
+    NewBrightnessContrastLayer,
     /// A Photo Filter preset colour (0.239.0, palette only): index into
     /// [`aurora_core::PHOTO_FILTER_PRESETS`].
     PhotoFilterPreset(usize),
@@ -6256,6 +6262,10 @@ const COMMAND_LAYER_NEW_EXPOSURE: &str = "layer.new_exposure";
 const COMMAND_LAYER_NEW_PHOTO_FILTER: &str = "layer.new_photo_filter";
 const COMMAND_LAYER_NEW_BLACK_WHITE: &str = "layer.new_black_white";
 const COMMAND_LAYER_NEW_COLOR_BALANCE: &str = "layer.new_color_balance";
+const COMMAND_LAYER_NEW_INVERT: &str = "layer.new_invert";
+const COMMAND_LAYER_NEW_THRESHOLD: &str = "layer.new_threshold";
+const COMMAND_LAYER_NEW_POSTERIZE: &str = "layer.new_posterize";
+const COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST: &str = "layer.new_brightness_contrast";
 const COMMAND_LAYER_NEW_GROUP: &str = "layer.new_group";
 const COMMAND_LAYER_CLIP_CREATE: &str = "layer.clip_create";
 const COMMAND_LAYER_CLIP_RELEASE: &str = "layer.clip_release";
@@ -6383,6 +6393,13 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_LAYER_NEW_PHOTO_FILTER, "New Photo Filter Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_BLACK_WHITE, "New Black & White Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_COLOR_BALANCE, "New Color Balance Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_INVERT, "New Invert Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_THRESHOLD, "New Threshold Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_POSTERIZE, "New Posterize Layer"),
+        CommandEntry::new(
+            COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST,
+            "New Brightness/Contrast Layer",
+        ),
         CommandEntry::new(COMMAND_LAYER_NEW_GROUP, "New Group"),
         CommandEntry::new(COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
         CommandEntry::new(COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),
@@ -6667,6 +6684,18 @@ fn activate_command(
     }
     if id == COMMAND_LAYER_NEW_COLOR_BALANCE {
         return Some(ActivatedCommand::NewColorBalanceLayer);
+    }
+    if id == COMMAND_LAYER_NEW_INVERT {
+        return Some(ActivatedCommand::NewInvertLayer);
+    }
+    if id == COMMAND_LAYER_NEW_THRESHOLD {
+        return Some(ActivatedCommand::NewThresholdLayer);
+    }
+    if id == COMMAND_LAYER_NEW_POSTERIZE {
+        return Some(ActivatedCommand::NewPosterizeLayer);
+    }
+    if id == COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST {
+        return Some(ActivatedCommand::NewBrightnessContrastLayer);
     }
     if let Some(index) = adjust_app::preset_for_command(id) {
         return Some(ActivatedCommand::PhotoFilterPreset(index));
@@ -10781,6 +10810,25 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(
                 COMMAND_LAYER_NEW_COLOR_BALANCE,
                 "New Color Balance Layer",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(COMMAND_LAYER_NEW_INVERT, "New Invert Layer", true, None),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_THRESHOLD,
+                "New Threshold Layer",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_POSTERIZE,
+                "New Posterize Layer",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST,
+                "New Brightness/Contrast Layer",
                 true,
                 None,
             ),
@@ -18372,6 +18420,44 @@ fn curves_lut(params: &aurora_core::CurvesParams) -> std::rc::Rc<aurora_filters:
     })
 }
 
+/// How many distinct Brightness/Contrast parameter sets
+/// [`brightness_contrast_op`] keeps built per thread (0.244.0), the Curves
+/// cache's rule: the default mode builds a 16,385-sample table.
+const BRIGHTNESS_CONTRAST_CACHE_LEN: usize = 8;
+
+/// A thread's built Brightness/Contrast ops, keyed by their parameters.
+type BrightnessContrastCache = Vec<(
+    aurora_core::BrightnessContrastParams,
+    std::rc::Rc<aurora_filters::BrightnessContrastOp>,
+)>;
+
+thread_local! {
+    /// Built Brightness/Contrast ops, so a composite pass builds each set
+    /// once rather than once per tile.
+    static BRIGHTNESS_CONTRAST_OPS: std::cell::RefCell<BrightnessContrastCache> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `params`' op, from this thread's cache when built before.
+fn brightness_contrast_op(
+    params: &aurora_core::BrightnessContrastParams,
+) -> std::rc::Rc<aurora_filters::BrightnessContrastOp> {
+    BRIGHTNESS_CONTRAST_OPS.with(|cache| {
+        let Ok(mut cache) = cache.try_borrow_mut() else {
+            return std::rc::Rc::new(aurora_filters::BrightnessContrastOp::new(params));
+        };
+        if let Some((_, op)) = cache.iter().find(|(cached, _)| cached == params) {
+            return std::rc::Rc::clone(op);
+        }
+        let op = std::rc::Rc::new(aurora_filters::BrightnessContrastOp::new(params));
+        if cache.len() >= BRIGHTNESS_CONTRAST_CACHE_LEN {
+            cache.remove(0);
+        }
+        cache.push((*params, std::rc::Rc::clone(&op)));
+        op
+    })
+}
+
 /// How many distinct Levels parameter sets [`levels_lut`] keeps built per
 /// thread (0.202.0), the Curves cache's rule.
 const LEVELS_LUT_CACHE_LEN: usize = 8;
@@ -18425,6 +18511,15 @@ enum AdjustmentLut {
     BlackWhite(aurora_filters::BlackWhiteOp),
     /// Color Balance (0.240.0): a per-pixel function.
     ColorBalance(aurora_filters::ColorBalanceOp),
+    /// Invert (0.244.0): a per-pixel function, CPU only.
+    Invert(aurora_filters::InvertOp),
+    /// Threshold (0.244.0): a per-pixel function, CPU only.
+    Threshold(aurora_filters::ThresholdOp),
+    /// Posterize (0.244.0): a per-channel function, CPU only.
+    Posterize(aurora_filters::PosterizeOp),
+    /// Brightness/Contrast (0.244.0): a line or a built 16,385-sample table
+    /// (cached per thread), CPU only.
+    BrightnessContrast(std::rc::Rc<aurora_filters::BrightnessContrastOp>),
 }
 
 impl AdjustmentLut {
@@ -18454,6 +18549,16 @@ impl AdjustmentLut {
             aurora_doc::Adjustment::ColorBalance(params) => {
                 Self::ColorBalance(aurora_filters::ColorBalanceOp::new(params))
             }
+            aurora_doc::Adjustment::Invert => Self::Invert(aurora_filters::InvertOp::new()),
+            aurora_doc::Adjustment::Threshold(params) => {
+                Self::Threshold(aurora_filters::ThresholdOp::new(params))
+            }
+            aurora_doc::Adjustment::Posterize(params) => {
+                Self::Posterize(aurora_filters::PosterizeOp::new(params))
+            }
+            aurora_doc::Adjustment::BrightnessContrast(params) => {
+                Self::BrightnessContrast(brightness_contrast_op(params))
+            }
         }
     }
 
@@ -18468,6 +18573,10 @@ impl AdjustmentLut {
             Self::PhotoFilter(op) => op.is_identity(),
             Self::BlackWhite(op) => op.is_identity(),
             Self::ColorBalance(op) => op.is_identity(),
+            Self::Invert(op) => op.is_identity(),
+            Self::Threshold(op) => op.is_identity(),
+            Self::Posterize(op) => op.is_identity(),
+            Self::BrightnessContrast(op) => op.is_identity(),
         }
     }
 
@@ -18482,6 +18591,10 @@ impl AdjustmentLut {
             Self::PhotoFilter(op) => op.apply(rgb),
             Self::BlackWhite(op) => op.apply(rgb),
             Self::ColorBalance(op) => op.apply(rgb),
+            Self::Invert(op) => op.apply(rgb),
+            Self::Threshold(op) => op.apply(rgb),
+            Self::Posterize(op) => op.apply(rgb),
+            Self::BrightnessContrast(op) => op.apply(rgb),
         }
     }
 }
@@ -20588,7 +20701,16 @@ fn adjustment_layer_qualifies_for_gpu(
         // Color Balance (0.240.0) are per-pixel functions with a GPU pass each
         // since 0.242.0 (`composite_vibrance_with_opacity` and its four
         // siblings), admitted above; neutral or not, they qualify like Levels.
-        None => false,
+        // Invert, Threshold, Posterize and Brightness/Contrast (0.244.0) are
+        // CPU only: a visible layer of these kinds refuses the GPU path
+        // until a later task ports them.
+        Some(
+            aurora_doc::Adjustment::Invert
+            | aurora_doc::Adjustment::Threshold(_)
+            | aurora_doc::Adjustment::Posterize(_)
+            | aurora_doc::Adjustment::BrightnessContrast(_),
+        )
+        | None => false,
     };
     expressible
         && !layers.mask(id).is_some_and(|mask| mask.enabled)
@@ -21046,6 +21168,14 @@ fn begin_gpu_adjustment_pass(
         // adjustment paired with another table kind cannot occur
         // (`AdjustmentLut::of` builds the pair from the same value).
         (_, AdjustmentLut::Curves(_)) => return false,
+        // CPU only (0.244.0).
+        (
+            _,
+            AdjustmentLut::Invert(_)
+            | AdjustmentLut::Threshold(_)
+            | AdjustmentLut::Posterize(_)
+            | AdjustmentLut::BrightnessContrast(_),
+        ) => return false,
     }
     std::mem::swap(current_accumulator, spare_accumulator);
     true
@@ -21137,7 +21267,15 @@ fn record_photographer_adjustment_pass(
             }
             note_gpu_color_balance_dispatch();
         }
-        AdjustmentLut::Curves(_) | AdjustmentLut::Levels(_) | AdjustmentLut::HueSaturation(_) => {
+        AdjustmentLut::Curves(_)
+        | AdjustmentLut::Levels(_)
+        | AdjustmentLut::HueSaturation(_)
+        // CPU only (0.244.0); `adjustment_layer_qualifies_for_gpu` refuses
+        // these before a pass is ever recorded.
+        | AdjustmentLut::Invert(_)
+        | AdjustmentLut::Threshold(_)
+        | AdjustmentLut::Posterize(_)
+        | AdjustmentLut::BrightnessContrast(_) => {
             return false;
         }
     }
@@ -30081,6 +30219,20 @@ impl App {
             Some(ActivatedCommand::NewColorBalanceLayer) => {
                 self.run_layer_command(LayerCommand::NewAdjust(
                     aurora_ui::AdjustKind::ColorBalance,
+                ));
+            }
+            Some(ActivatedCommand::NewInvertLayer) => {
+                self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::Invert));
+            }
+            Some(ActivatedCommand::NewThresholdLayer) => {
+                self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::Threshold));
+            }
+            Some(ActivatedCommand::NewPosterizeLayer) => {
+                self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::Posterize));
+            }
+            Some(ActivatedCommand::NewBrightnessContrastLayer) => {
+                self.run_layer_command(LayerCommand::NewAdjust(
+                    aurora_ui::AdjustKind::BrightnessContrast,
                 ));
             }
             Some(ActivatedCommand::PhotoFilterPreset(index)) => {

@@ -51,6 +51,22 @@ fn new_adjustment(kind: AdjustKind) -> (&'static str, Adjustment) {
             "Black & White",
             Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
         ),
+        // 0.244.0: Invert has no settings; Threshold starts at Photoshop's
+        // default 128, Posterize at its default 4 levels; Brightness/Contrast
+        // starts neutral in the default mode.
+        AdjustKind::Invert => ("Invert", Adjustment::Invert),
+        AdjustKind::Threshold => (
+            "Threshold",
+            Adjustment::Threshold(aurora_core::ThresholdParams::default()),
+        ),
+        AdjustKind::Posterize => (
+            "Posterize",
+            Adjustment::Posterize(aurora_core::PosterizeParams::default()),
+        ),
+        AdjustKind::BrightnessContrast => (
+            "Brightness/Contrast",
+            Adjustment::BrightnessContrast(aurora_core::BrightnessContrastParams::identity()),
+        ),
         AdjustKind::ColorBalance => (
             "Color Balance",
             Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
@@ -110,7 +126,10 @@ pub(crate) fn is_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerO
     match outcome {
         PointerOutcome::Action(Outcome::ValueChanged { id, .. }) => adjust.slider_of(*id).is_some(),
         PointerOutcome::Action(Outcome::Toggled { id, .. }) => {
-            *id == adjust.preserve || *id == adjust.tint || *id == adjust.balance_preserve
+            *id == adjust.preserve
+                || *id == adjust.tint
+                || *id == adjust.balance_preserve
+                || *id == adjust.legacy
         }
         // The Color Balance range selector (0.240.0): widget state only, no
         // document edit, but a pending drag settles when it is used.
@@ -225,6 +244,13 @@ pub(crate) fn apply_outcome(
                 Adjustment::ColorBalance(balance.with_preserve_luminosity(on)),
                 None,
             )
+        }
+        aurora_widgets::ActionOutcome::Toggled { id, state } if *id == adjust.legacy => {
+            let Some(bc) = current.brightness_contrast() else {
+                return CompositeInvalidation::None;
+            };
+            let on = *state == accesskit::Toggled::True;
+            (Adjustment::BrightnessContrast(bc.with_legacy(on)), None)
         }
         aurora_widgets::ActionOutcome::ValueChanged { id, value } => {
             let Some(slider) = adjust.slider_of(*id) else {

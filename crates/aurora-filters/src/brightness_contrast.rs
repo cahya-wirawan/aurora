@@ -248,7 +248,15 @@ mod tests {
     fn legacy_matches_the_fixtures_table_within_one_level() {
         // Measured pairs from brightnesscontrast_legacy_rgb.psd's merged image.
         let t = op(20, 57, true);
-        for (x, y) in [(52, 0), (56, 9), (64, 27), (96, 101), (128, 176), (160, 250), (162, 255)] {
+        for (x, y) in [
+            (52, 0),
+            (56, 9),
+            (64, 27),
+            (96, 101),
+            (128, 176),
+            (160, 250),
+            (162, 255),
+        ] {
             let got = grey(&t, x as f32 / 255.0) * 255.0;
             assert!((got - y as f32).abs() <= 1.0, "x {x}: {got} vs {y}");
         }
@@ -274,12 +282,22 @@ mod tests {
         let flat = op(0, -100, true);
         assert!((grey(&flat, 0.0) - 127.0 / 255.0).abs() < 1e-5);
         assert!((grey(&flat, 1.0) - 127.0 / 255.0).abs() < 1e-5);
-        assert_eq!(op(0, 10, true).apply([f32::NAN; 3])[0], op(0, 10, true).apply([0.0; 3])[0]);
+        assert_eq!(
+            op(0, 10, true).apply([f32::NAN; 3])[0],
+            op(0, 10, true).apply([0.0; 3])[0]
+        );
     }
 
     #[test]
     fn the_default_mode_pins_black_and_white_and_stays_in_range_for_every_corner() {
-        for (b, c) in [(150, 100), (150, -50), (-150, 100), (-150, -50), (-95, -50), (23, 70)] {
+        for (b, c) in [
+            (150, 100),
+            (150, -50),
+            (-150, 100),
+            (-150, -50),
+            (-95, -50),
+            (23, 70),
+        ] {
             let t = op(b, c, false);
             assert!(grey(&t, 0.0).abs() < 1e-6, "{b} {c}");
             assert!((grey(&t, 1.0) - 1.0).abs() < 1e-6, "{b} {c}");
@@ -294,8 +312,14 @@ mod tests {
     fn positive_brightness_lifts_the_middle_and_negative_lowers_it() {
         assert!(grey(&op(60, 0, false), 0.5) > 0.5 + 0.05);
         assert!(grey(&op(-60, 0, false), 0.5) < 0.5 - 0.05);
-        assert!(grey(&op(0, 60, false), 0.9) > 0.9, "contrast brightens highlights");
-        assert!(grey(&op(0, 60, false), 0.1) < 0.1, "contrast darkens shadows");
+        assert!(
+            grey(&op(0, 60, false), 0.9) > 0.9,
+            "contrast brightens highlights"
+        );
+        assert!(
+            grey(&op(0, 60, false), 0.1) < 0.1,
+            "contrast darkens shadows"
+        );
         assert!(grey(&op(0, -40, false), 0.9) < 0.9);
     }
 

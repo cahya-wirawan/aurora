@@ -77,7 +77,11 @@ mod tests {
     fn model(level: u8, rgb: [f32; 3]) -> f64 {
         let c = |v: f32| f64::from(v).clamp(0.0, 1.0);
         let grey = 0.30 * c(rgb[0]) + 0.59 * c(rgb[1]) + 0.11 * c(rgb[2]);
-        if (grey * 255.0).round() >= f64::from(level) { 1.0 } else { 0.0 }
+        if (grey * 255.0).round() >= f64::from(level) {
+            1.0
+        } else {
+            0.0
+        }
     }
 
     #[test]
@@ -109,10 +113,26 @@ mod tests {
     fn each_channel_has_its_own_weight() {
         // Level 25: the grey must reach 24.5 of 255, i.e. 0.0961.
         let t = op(25);
-        assert_eq!(t.apply([0.33, 0.0, 0.0]), [1.0; 3], "red 0.30 * 0.33 = 0.099");
-        assert_eq!(t.apply([0.31, 0.0, 0.0]), [0.0; 3], "red 0.30 * 0.31 = 0.093");
-        assert_eq!(t.apply([0.0, 0.17, 0.0])[0], 1.0, "green 0.59 * 0.17 = 0.100");
-        assert_eq!(t.apply([0.0, 0.16, 0.0])[0], 0.0, "green 0.59 * 0.16 = 0.094");
+        assert_eq!(
+            t.apply([0.33, 0.0, 0.0]),
+            [1.0; 3],
+            "red 0.30 * 0.33 = 0.099"
+        );
+        assert_eq!(
+            t.apply([0.31, 0.0, 0.0]),
+            [0.0; 3],
+            "red 0.30 * 0.31 = 0.093"
+        );
+        assert_eq!(
+            t.apply([0.0, 0.17, 0.0])[0],
+            1.0,
+            "green 0.59 * 0.17 = 0.100"
+        );
+        assert_eq!(
+            t.apply([0.0, 0.16, 0.0])[0],
+            0.0,
+            "green 0.59 * 0.16 = 0.094"
+        );
         assert_eq!(t.apply([0.0, 0.0, 1.0])[0], 1.0, "blue 0.11 * 1 = 0.11");
         assert_eq!(op(29).apply([0.0, 0.0, 1.0])[0], 0.0, "0.11 < 28.5 / 255");
         assert_eq!(op(28).apply([0.0, 0.0, 1.0])[0], 1.0, "0.11 >= 27.5 / 255");

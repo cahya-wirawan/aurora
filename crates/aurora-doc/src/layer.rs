@@ -1581,7 +1581,10 @@ mod invert_threshold_posterize_brightness_wire_tests {
             // Brightness 151 (zig-zag 302 = 0xAE 0x02), contrast 0, default mode.
             vec![2, 12, 0xAE, 0x02, 0, 0],
         ] {
-            assert!(postcard::from_bytes::<LayerKind>(&bytes).is_err(), "{bytes:?}");
+            assert!(
+                postcard::from_bytes::<LayerKind>(&bytes).is_err(),
+                "{bytes:?}"
+            );
         }
     }
 
@@ -1600,9 +1603,13 @@ mod invert_threshold_posterize_brightness_wire_tests {
             assert_eq!(a.label(), *label);
         }
         let [(i, _), (t, _), (p, _), (b, _)] = all;
-        assert!(t.threshold().is_some() && t.posterize().is_none() && t.brightness_contrast().is_none());
+        assert!(
+            t.threshold().is_some() && t.posterize().is_none() && t.brightness_contrast().is_none()
+        );
         assert!(p.posterize().is_some() && p.threshold().is_none());
         assert!(b.brightness_contrast().is_some() && b.threshold().is_none());
-        assert!(i.threshold().is_none() && i.posterize().is_none() && i.brightness_contrast().is_none());
+        assert!(
+            i.threshold().is_none() && i.posterize().is_none() && i.brightness_contrast().is_none()
+        );
     }
 }

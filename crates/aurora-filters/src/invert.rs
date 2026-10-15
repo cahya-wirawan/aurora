@@ -52,7 +52,10 @@ mod tests {
     fn out_of_gamut_and_nan_inputs_are_clamped_first() {
         let op = InvertOp::new();
         assert_eq!(op.apply([-3.0, 7.0, f32::NAN]), [1.0, 0.0, 1.0]);
-        assert_eq!(op.apply([f32::INFINITY, f32::NEG_INFINITY, 0.5]), [0.0, 1.0, 0.5]);
+        assert_eq!(
+            op.apply([f32::INFINITY, f32::NEG_INFINITY, 0.5]),
+            [0.0, 1.0, 0.5]
+        );
     }
 
     #[test]

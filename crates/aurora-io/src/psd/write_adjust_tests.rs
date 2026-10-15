@@ -1426,8 +1426,8 @@ fn black_and_white_layers_are_itemised_in_the_save_report() {
 mod four_kinds {
     use super::super::read_adjust_tests::{BRIT_LEGACY, CGED_BC1};
     use super::{
-        Adjustment, Doc, IoError, LayerTree, encode_adjustment, id_named, ok, psd_save_preflight,
-        read_back, records, rect, save, shape, unhex, PsdSaveOptions,
+        Adjustment, Doc, IoError, LayerTree, PsdSaveOptions, encode_adjustment, id_named, ok,
+        psd_save_preflight, read_back, records, rect, save, shape, unhex,
     };
     use aurora_core::{BrightnessContrastParams, PosterizeParams, ThresholdParams};
 
@@ -1453,7 +1453,10 @@ mod four_kinds {
     #[test]
     fn the_writer_reproduces_photoshops_own_blocks_byte_for_byte() {
         let e = encoded(&Adjustment::Invert);
-        assert_eq!((e.key, e.data.len(), e.extra.is_none()), (*b"nvrt", 0, true));
+        assert_eq!(
+            (e.key, e.data.len(), e.extra.is_none()),
+            (*b"nvrt", 0, true)
+        );
         for (a, key, hex) in [
             (threshold(232), b"thrs", "00e80000"),
             (threshold(60), b"thrs", "003c0000"),
@@ -1519,20 +1522,32 @@ mod four_kinds {
     pub(super) fn four_doc() -> Doc {
         let mut doc = Doc::new((16, 16));
         doc.layer("Background", rect(0, 0, 16, 16), None);
-        let invert = ok(doc.tree.add_adjustment_layer_at("Invert A", Adjustment::Invert, None, 0));
+        let invert = ok(doc
+            .tree
+            .add_adjustment_layer_at("Invert A", Adjustment::Invert, None, 0));
         ok(doc.tree.set_opacity(invert, 128.0 / 255.0));
-        ok(doc.tree.set_blend_mode(invert, aurora_doc::BlendMode::Multiply));
+        ok(doc
+            .tree
+            .set_blend_mode(invert, aurora_doc::BlendMode::Multiply));
         doc.mask(invert, rect(2, 2, 10, 10), (0, 0, 10, 10), |x, y| {
             f32::from(u16::try_from((x * 20 + y) % 255).unwrap_or(0)) / 255.0
         });
         let group = doc.group("Group", None);
         doc.layer_in("Base", rect(0, 0, 16, 16), None, Some(group));
         let clipped =
-            ok(doc.tree.add_adjustment_layer_at("Posterize clipped", posterize(7), Some(group), 0));
+            ok(doc
+                .tree
+                .add_adjustment_layer_at("Posterize clipped", posterize(7), Some(group), 0));
         ok(doc.tree.set_clipped(clipped, true));
-        ok(doc.tree.add_adjustment_layer_at("Threshold in group", threshold(172), Some(group), 0));
-        ok(doc.tree.add_adjustment_layer_at("Bright", bc(23, 70, false), None, 0));
-        let legacy = ok(doc.tree.add_adjustment_layer_at("Legacy", bc(20, 57, true), None, 0));
+        ok(doc
+            .tree
+            .add_adjustment_layer_at("Threshold in group", threshold(172), Some(group), 0));
+        ok(doc
+            .tree
+            .add_adjustment_layer_at("Bright", bc(23, 70, false), None, 0));
+        let legacy = ok(doc
+            .tree
+            .add_adjustment_layer_at("Legacy", bc(20, 57, true), None, 0));
         ok(doc.tree.set_visible(legacy, false));
         doc
     }
@@ -1562,9 +1577,17 @@ mod four_kinds {
         );
         for name in NAMES {
             let (want, got) = (id_named(&doc.tree, name), id_named(&back.layers, name));
-            assert_eq!(back.layers.adjustment(got), doc.tree.adjustment(want), "{name}");
+            assert_eq!(
+                back.layers.adjustment(got),
+                doc.tree.adjustment(want),
+                "{name}"
+            );
             assert_eq!(back.layers.opacity(got), doc.tree.opacity(want), "{name}");
-            assert_eq!(back.layers.blend_mode(got), doc.tree.blend_mode(want), "{name}");
+            assert_eq!(
+                back.layers.blend_mode(got),
+                doc.tree.blend_mode(want),
+                "{name}"
+            );
             assert_eq!(back.layers.visible(got), doc.tree.visible(want), "{name}");
             assert_eq!(
                 back.layers.clip_base(got).is_some(),
@@ -1592,7 +1615,8 @@ mod four_kinds {
             assert_eq!(rec.1, [0; 4], "{name}");
         }
         let at = |needle: &[u8]| bytes.windows(needle.len()).position(|w| w == needle);
-        let Some(brit_default) = at(b"8BIMbrit\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00") else {
+        let Some(brit_default) = at(b"8BIMbrit\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00")
+        else {
             unreachable!("the default mode's zero brit")
         };
         assert_eq!(
@@ -1620,7 +1644,10 @@ mod four_kinds {
         let path = dir.path().join("four.psd");
         let (bytes, outcome) = ok(doc.write());
         ok(std::fs::write(&path, &bytes));
-        ok(super::super::write::verify_psd_file(&path, &outcome.expected));
+        ok(super::super::write::verify_psd_file(
+            &path,
+            &outcome.expected,
+        ));
         for key in [b"thrs", b"post", b"brit"] {
             let Some(i) = outcome.expected.layers.iter().position(|l| {
                 l.adjustment
@@ -1672,7 +1699,11 @@ mod four_kinds {
             "{err:?}"
         );
         let mut missing = outcome.expected.clone();
-        if let Some(a) = missing.layers.get_mut(i).and_then(|l| l.adjustment.as_mut()) {
+        if let Some(a) = missing
+            .layers
+            .get_mut(i)
+            .and_then(|l| l.adjustment.as_mut())
+        {
             a.extra = None;
         }
         assert!(super::super::write::verify_psd_file(&path, &missing).is_err());

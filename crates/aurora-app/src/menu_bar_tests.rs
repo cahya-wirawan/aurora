@@ -168,6 +168,13 @@ fn the_new_adjustment_layers_are_in_the_layer_menu_and_the_native_list() {
             crate::COMMAND_LAYER_NEW_COLOR_BALANCE,
             "New Color Balance Layer",
         ),
+        (crate::COMMAND_LAYER_NEW_INVERT, "New Invert Layer"),
+        (crate::COMMAND_LAYER_NEW_THRESHOLD, "New Threshold Layer"),
+        (crate::COMMAND_LAYER_NEW_POSTERIZE, "New Posterize Layer"),
+        (
+            crate::COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST,
+            "New Brightness/Contrast Layer",
+        ),
     ] {
         assert_eq!(entry(layer, id).0, label);
         assert!(entry(layer, id).2, "{id} is enabled");

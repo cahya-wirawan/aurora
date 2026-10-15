@@ -2346,9 +2346,7 @@ fn raw_record<R: std::io::Read + Seek>(
         adjustment_blocks,
         want.adjustment
             .iter()
-            .flat_map(|a| {
-                std::iter::once((a.key, a.data.clone())).chain(a.extra.iter().cloned())
-            })
+            .flat_map(|a| std::iter::once((a.key, a.data.clone())).chain(a.extra.iter().cloned()))
             .collect::<Vec<_>>(),
     )?;
     check(

@@ -196,11 +196,7 @@ pub(super) fn encode_adjustment(
 }
 
 /// The adjustment the reader makes of a block, or why it would refuse.
-fn read_back(
-    key: [u8; 4],
-    data: &[u8],
-    extra: Option<&[u8]>,
-) -> Result<Adjustment, &'static str> {
+fn read_back(key: [u8; 4], data: &[u8], extra: Option<&[u8]>) -> Result<Adjustment, &'static str> {
     match &key {
         b"brit" => {
             let Some(mut parsed) = read_adjust::parse_block(key, data) else {

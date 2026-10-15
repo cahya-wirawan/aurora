@@ -580,7 +580,9 @@ fn brightness_contrast_adjustment(
                 return Err(unreadable());
             }
             let whole = |v: f64| {
-                (v.fract() == 0.0 && v.abs() <= 1_000.0).then(|| v as i16).ok_or_else(unreadable)
+                (v.fract() == 0.0 && v.abs() <= 1_000.0)
+                    .then(|| v as i16)
+                    .ok_or_else(unreadable)
             };
             (
                 whole(c.brightness)?,
