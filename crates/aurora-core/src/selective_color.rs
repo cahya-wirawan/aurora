@@ -230,7 +230,11 @@ mod tests {
         let Ok(bytes) = postcard::to_allocvec(&p) else {
             unreachable!("encodes");
         };
-        assert_eq!(bytes.len(), 36 * 4 + 1, "thirty-six f32s and a bool, positional");
+        assert_eq!(
+            bytes.len(),
+            36 * 4 + 1,
+            "thirty-six f32s and a bool, positional"
+        );
         assert_eq!(bytes.get(144), Some(&1));
         assert_eq!(postcard::from_bytes::<P>(&bytes), Ok(p));
         for slot in 0..36 {

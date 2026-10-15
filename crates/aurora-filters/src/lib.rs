@@ -13,6 +13,7 @@
 
 pub mod black_white;
 pub mod brightness_contrast;
+pub mod channel_mixer;
 pub mod color_balance;
 pub mod curves;
 pub mod exposure;
@@ -21,6 +22,7 @@ pub mod invert;
 pub mod levels;
 pub mod photo_filter;
 pub mod posterize;
+pub mod selective_color;
 pub mod shadow;
 pub mod stroke;
 pub mod threshold;
@@ -28,6 +30,7 @@ pub mod vibrance;
 
 pub use black_white::{BLACK_WHITE_PACKED_LEN, BlackWhiteOp};
 pub use brightness_contrast::BrightnessContrastOp;
+pub use channel_mixer::ChannelMixerOp;
 pub use color_balance::{COLOR_BALANCE_PACKED_LEN, ColorBalanceOp, SHIFT_AT_100, range_weights};
 pub use curves::{CURVES_LUT_INTERVALS, CURVES_PACKED_HEADER, CURVES_PACKED_LEN, CurvesLut};
 pub use exposure::{EXPOSURE_PACKED_LEN, ExposureOp};
@@ -36,6 +39,7 @@ pub use invert::InvertOp;
 pub use levels::{EXACT_INTERVALS, LEVELS_LUT_INTERVALS, LEVELS_PACKED_LEN, LevelsLut};
 pub use photo_filter::{PHOTO_FILTER_PACKED_LEN, PhotoFilterOp};
 pub use posterize::PosterizeOp;
+pub use selective_color::SelectiveColorOp;
 pub use shadow::shadow_coverage;
 pub use stroke::{StrokeSide, stroke_coverage, stroke_reach};
 pub use threshold::ThresholdOp;
@@ -140,6 +144,41 @@ mod tests {
         ] {
             let op = match aurora_core::BrightnessContrastParams::new(b, c, legacy) {
                 Ok(p) => super::BrightnessContrastOp::new(&p),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            time(name, &|p| op.apply(p));
+        }
+        // 0.245.0: Channel Mixer (colour and Monochrome) and Selective Color
+        // (Relative and Absolute).
+        for (mono, name) in [
+            (false, "channel mixer"),
+            (true, "channel mixer, monochrome"),
+        ] {
+            let op = match aurora_core::ChannelMixerParams::new(
+                [
+                    [30.0, 59.0, 11.0, 5.0],
+                    [-20.0, 120.0, 0.0, 0.0],
+                    [10.0, 10.0, 80.0, -5.0],
+                ],
+                mono,
+            ) {
+                Ok(p) => super::ChannelMixerOp::new(&p),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            time(name, &|p| op.apply(p));
+        }
+        let mut ranges = [[0.0_f32; 4]; 9];
+        for (i, row) in ranges.iter_mut().enumerate() {
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = (((i * 7 + j * 13) % 41) as f32 - 20.0) * 3.0;
+            }
+        }
+        for (absolute, name) in [
+            (false, "selective color, relative"),
+            (true, "selective color, absolute"),
+        ] {
+            let op = match aurora_core::SelectiveColorParams::new(ranges, absolute) {
+                Ok(p) => super::SelectiveColorOp::new(&p),
                 Err(err) => unreachable!("{err:?}"),
             };
             time(name, &|p| op.apply(p));

@@ -197,7 +197,10 @@ impl ChannelMixerParams {
     /// A copy with Monochrome switched.
     #[must_use]
     pub const fn with_monochrome(&self, monochrome: bool) -> Self {
-        Self { monochrome, ..*self }
+        Self {
+            monochrome,
+            ..*self
+        }
     }
 }
 
@@ -221,7 +224,10 @@ mod tests {
         for o in 0..3 {
             for s in 0..4 {
                 let v = if s == o { 99.0 } else { 1.0 };
-                assert!(!ok(P::identity().with_value(o, s, v)).is_identity(), "{o} {s}");
+                assert!(
+                    !ok(P::identity().with_value(o, s, v)).is_identity(),
+                    "{o} {s}"
+                );
             }
         }
         // A negative zero is a zero.
@@ -265,7 +271,11 @@ mod tests {
         let Ok(bytes) = postcard::to_allocvec(&p) else {
             unreachable!("encodes");
         };
-        assert_eq!(bytes.len(), 12 * 4 + 1, "twelve f32s and a bool, positional");
+        assert_eq!(
+            bytes.len(),
+            12 * 4 + 1,
+            "twelve f32s and a bool, positional"
+        );
         assert_eq!(bytes.get(48), Some(&1));
         assert_eq!(postcard::from_bytes::<P>(&bytes), Ok(p));
         for slot in 0..12 {
@@ -289,7 +299,12 @@ mod tests {
             }
         }
         // 150 in a constant slot is refused although 150 is a legal source.
-        let tuple = ([0.0_f32, 0.0, 0.0, 150.0], [0.0_f32; 4], [0.0_f32; 4], false);
+        let tuple = (
+            [0.0_f32, 0.0, 0.0, 150.0],
+            [0.0_f32; 4],
+            [0.0_f32; 4],
+            false,
+        );
         let Ok(wire) = postcard::to_allocvec(&tuple) else {
             unreachable!("encodes");
         };
