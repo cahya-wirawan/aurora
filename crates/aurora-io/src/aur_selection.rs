@@ -48,7 +48,7 @@ pub(crate) const MAX_SELECTION_ENTRY_BYTES: u64 =
     MAX_SELECTION_MASK_PIXELS + MAX_SAVED_SELECTION_BYTES + HEADER_ALLOWANCE;
 
 /// The farthest a selection's origin may lie from the document origin.
-const MAX_ORIGIN: i64 = 1 << 32;
+const MAX_ORIGIN: u64 = 1 << 32;
 
 const KIND_RECT: u8 = 0;
 const KIND_ELLIPSE: u8 = 1;
@@ -170,7 +170,9 @@ fn selection_of(meta: &SelectionMeta, blobs: &mut &[u8]) -> Result<Selection, St
 /// Whether `meta`'s origin and size are sane, and its mask size if it is
 /// one (every check that precedes any allocation).
 fn checked_mask_bytes(meta: &SelectionMeta) -> Result<u64, String> {
-    if meta.x.abs() > MAX_ORIGIN || meta.y.abs() > MAX_ORIGIN {
+    // `unsigned_abs`, not `abs`: `i64::MIN.abs()` overflows (a panic in a
+    // build with overflow checks, a wrap past this very check without).
+    if meta.x.unsigned_abs() > MAX_ORIGIN || meta.y.unsigned_abs() > MAX_ORIGIN {
         return Err("a selection lies absurdly far from the document".to_owned());
     }
     match meta.kind {

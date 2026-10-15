@@ -405,3 +405,79 @@ fn a_large_sparse_mask_is_small_in_the_file() {
     assert!(bytes.len() < 200_000, "deflated: {} bytes", bytes.len());
     same(&ok(open(&bytes)).selection, &set);
 }
+
+/// G-2: an origin of `i64::MIN` (whose `abs()` overflows) or any other
+/// hostile extreme takes the ordinary damaged-entry path, for every kind
+/// of selection, in the active slot and in a saved one, on either axis.
+#[test]
+fn extreme_origins_drop_the_selection_and_never_panic() {
+    let limit = 1_i64 << 32;
+    let hostile = [
+        i64::MIN,
+        i64::MIN + 1,
+        i64::MAX,
+        i64::MAX - 1,
+        i64::from(i32::MIN),
+        -limit - 1,
+        limit + 1,
+    ];
+    for kind in [KIND_RECT, KIND_ELLIPSE, KIND_MASK] {
+        for value in hostile {
+            for on_x in [true, false] {
+                let (x, y) = if on_x { (value, 0) } else { (0, value) };
+                let m = meta(kind, r(x, y, 2, 2));
+                let active = header_bytes(SELECTION_VERSION, Some(m), Vec::new());
+                let saved = header_bytes(SELECTION_VERSION, None, vec![("s".to_owned(), m)]);
+                for bytes in [active, saved] {
+                    // The two i32 extremes are inside the limit: only the
+                    // ones beyond 2^32 must drop.
+                    if value.unsigned_abs() > limit.unsigned_abs() {
+                        let why = dropped(&bytes);
+                        assert!(why.contains("far"), "kind {kind} value {value}: {why}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// G-2: the limit itself is exact on both sides and both axes.
+#[test]
+fn the_origin_limit_is_inclusive_at_plus_and_minus_two_to_the_32() {
+    let limit = 1_i64 << 32;
+    for (x, y) in [(limit, 0), (-limit, 0), (0, limit), (0, -limit)] {
+        let bytes = header_bytes(
+            SELECTION_VERSION,
+            Some(meta(KIND_RECT, r(x, y, 2, 2))),
+            Vec::new(),
+        );
+        assert!(
+            matches!(ok(decode_selection(&bytes)), SelectionRead::Restored(_)),
+            "({x}, {y}) is within the limit"
+        );
+        let (bx, by) = (x + x.signum(), y + y.signum());
+        let beyond = header_bytes(
+            SELECTION_VERSION,
+            Some(meta(KIND_RECT, r(bx, by, 2, 2))),
+            Vec::new(),
+        );
+        assert!(dropped(&beyond).contains("far"), "({bx}, {by})");
+    }
+}
+
+/// G-2 end to end: a container whose `selection` entry holds an
+/// `i64::MIN` origin opens, drops the selection with a notice and keeps
+/// the layers.
+#[test]
+fn a_container_with_an_i64_min_selection_origin_opens_without_it() {
+    let hostile = header_bytes(
+        SELECTION_VERSION,
+        Some(meta(KIND_MASK, r(i64::MIN, i64::MIN, 4, 4))),
+        Vec::new(),
+    );
+    let file = with_entry(&container(None), SELECTION_ENTRY, Some(&hostile));
+    let document = ok(open(&file));
+    assert!(document.selection.is_empty());
+    assert!(document.selection_dropped.is_some());
+    assert_eq!(document.layers.len(), tree().len());
+}
