@@ -572,60 +572,118 @@ fn preflight_refusal_shows_couldnt_save_with_reason() {
     assert!(psd_save_failure_message("big.psd", &failure).contains("use .psb"));
 }
 
-/// 0.239.0: Vibrance, Exposure and Photo Filter layers have no PSD block
-/// yet: the whole app flow refuses (no dialog to "Save Anyway", no file, no
-/// temp left), naming the layer and the way out, and the same document
-/// saves once the layer is gone.
+/// 0.241.0: Vibrance, Exposure, Photo Filter, Black & White and Color
+/// Balance layers save through the whole app flow (they were refused by
+/// name until now): exact values are lossless (no dialog, the target
+/// replaced), the file reopens with the same kind, and a fractional value
+/// asks first, naming the kind.
 #[test]
-fn the_new_adjustment_layers_refuse_the_psd_save_by_name() {
+#[allow(clippy::float_cmp)] // an integer held in a float
+fn the_five_new_adjustment_layers_save_and_reopen() {
+    use aurora_core::{
+        BlackWhiteParams, ColorBalanceParams, ExposureParams, PhotoFilterParams, VibranceParams,
+    };
     let cases = [
         (
-            aurora_doc::Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
+            aurora_doc::Adjustment::BlackWhite(BlackWhiteParams::default()),
             "Black & White",
         ),
         (
-            aurora_doc::Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+            aurora_doc::Adjustment::ColorBalance(ok(ColorBalanceParams::new(
+                [[10.0, -20.0, 30.0], [0.0; 3], [-5.0, 0.0, 5.0]],
+                false,
+            ))),
             "Color Balance",
         ),
         (
-            aurora_doc::Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
+            aurora_doc::Adjustment::Vibrance(ok(VibranceParams::new(40.0, -10.0))),
             "Vibrance",
         ),
         (
-            aurora_doc::Adjustment::Exposure(aurora_core::ExposureParams::identity()),
+            aurora_doc::Adjustment::Exposure(ok(ExposureParams::new(1.5, -0.1, 1.2))),
             "Exposure",
         ),
         (
-            aurora_doc::Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+            aurora_doc::Adjustment::PhotoFilter(PhotoFilterParams::warming_85()),
             "Photo Filter",
         ),
     ];
     for (adjustment, kind) in cases {
         let mut doc = Doc::new();
-        let id = ok(doc
+        ok(doc
             .tree
             .add_adjustment_layer_at("My layer", adjustment, None, 0));
-        let path = doc.path("nope.psd");
-        let Err(failure) = doc.save(&path) else {
-            unreachable!("{kind} must be refused")
-        };
-        let message = psd_save_failure_message("nope.psd", &failure);
-        assert!(
-            message.contains(&format!(
-                "the {kind} layer \u{201c}My layer\u{201d} can't be saved to .psd"
-            )) && message.contains("Aurora can't write")
-                && message.contains("save as .aur"),
-            "{message}"
+        let path = doc.path("kept.psd");
+        let mut step = ok(doc.save(&path));
+        if kind == "Black & White" {
+            // Its tint colour is stored differently and its preset name is
+            // cleared: the save names that and asks first.
+            let PsdSaveStep::NeedsConfirmation(pending) = step else {
+                unreachable!("{kind}: asks first")
+            };
+            assert!(
+                pending
+                    .report
+                    .items
+                    .iter()
+                    .any(|i| i.contains("preset name"))
+            );
+            ok(finish_psd_save(pending, doc.id, doc.revision));
+            step = PsdSaveStep::Saved;
+        }
+        assert!(matches!(step, PsdSaveStep::Saved), "{kind}: {step:?}");
+        assert_eq!(doc.listing(), ["kept.psd"], "{kind}: no temp file is left");
+        let reopened = ok(aurora_io::read_psd(&ok(std::fs::read(&path))));
+        assert_eq!(
+            names_bottom_up(&reopened.layers),
+            ["Background", "Top", "My layer"],
+            "{kind}"
         );
-        assert!(!path.exists());
-        assert!(
-            doc.listing().is_empty(),
-            "no temp file is left: {:?}",
-            doc.listing()
+        let id = find(&reopened.layers, "My layer");
+        assert_eq!(
+            reopened
+                .layers
+                .adjustment(id)
+                .map(aurora_doc::Adjustment::label),
+            Some(kind)
         );
-        ok(doc.tree.remove(id));
-        assert!(matches!(ok(doc.save(&path)), PsdSaveStep::Saved));
+        assert!(
+            reopened.report.is_empty(),
+            "{kind}: {:?}",
+            reopened.report.items
+        );
     }
+
+    // A fractional value is rounded to the file's whole number: Save
+    // Anyway first, and the report names the kind.
+    let mut doc = Doc::new();
+    ok(doc.tree.add_adjustment_layer_at(
+        "Vibrant",
+        aurora_doc::Adjustment::Vibrance(ok(VibranceParams::new(10.4, 0.0))),
+        None,
+        0,
+    ));
+    let target = doc.path("rounded.psd");
+    let PsdSaveStep::NeedsConfirmation(pending) = ok(doc.save(&target)) else {
+        unreachable!("asks first")
+    };
+    assert!(!target.exists());
+    assert!(
+        pending
+            .report
+            .items
+            .iter()
+            .any(|i| i.contains("Vibrance layer's fractional values")),
+        "{:?}",
+        pending.report.items
+    );
+    ok(finish_psd_save(pending, doc.id, doc.revision));
+    let reopened = ok(aurora_io::read_psd(&ok(std::fs::read(&target))));
+    let id = find(&reopened.layers, "Vibrant");
+    let Some(aurora_doc::Adjustment::Vibrance(v)) = reopened.layers.adjustment(id) else {
+        unreachable!("vibrance")
+    };
+    assert_eq!(v.vibrance(), 10.0);
 }
 
 #[test]

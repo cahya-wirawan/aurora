@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.241.0] - 2026-10-15
+
+### Changed
+
+- PSD read and write for Vibrance, Exposure, Photo Filter, Black & White and Color Balance
+
 ## [0.240.0] - 2026-10-15
 
 ### Changed

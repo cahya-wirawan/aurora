@@ -132,6 +132,10 @@ mod descriptor;
 mod effects;
 #[cfg(test)]
 mod effects_tests;
+mod lab;
+mod read_adjust;
+#[cfg(test)]
+mod read_adjust_tests;
 mod smart;
 #[cfg(test)]
 mod smart_tests;
@@ -437,6 +441,14 @@ enum Note {
     LevelsGrayscale,
     HueSaturationUnreadable,
     HueSaturationGrayscale,
+    /// A Vibrance, Exposure, Photo Filter, Black & White or Color Balance
+    /// layer whose block could not be read or is out of range (0.241.0).
+    Unreadable(read_adjust::Kind),
+    /// One of those five in a Grayscale file.
+    Grayscale(read_adjust::Kind),
+    /// A Photo Filter whose colour is not stored as Lab (version 3 or
+    /// another colour space).
+    PhotoFilterColour,
     FillSkipped,
     TextRasterised,
     SmartObjectRasterised,
@@ -454,6 +466,11 @@ enum Note {
     VectorMaskRasterised,
     VectorMaskDisabledDropped,
     ClippingDropped,
+    /// Adjustment layers under a Pass Through group whose Fill is below
+    /// 100 % (0.241.0).
+    AdjustmentUnderGroupFill,
+    /// Clipped adjustment layers shown unclipped (0.241.0).
+    AdjustmentClipNotApplied,
     ShadowNoiseNotApplied,
     ShadowContourNotApplied,
     EffectScaleNotApplied,
@@ -519,9 +536,11 @@ fn note_text(note: Note, n: u64) -> String {
     let is = if one { "is" } else { "are" };
     match note {
         Note::AdjustmentSkipped => format!(
-            "{n} adjustment layer{s} (Brightness/Contrast, Color Balance and similar) {was} \
-             left out — Aurora shows only Curves, Levels and Hue/Saturation adjustment layers \
-             so far."
+            "{n} adjustment layer{s} (Brightness/Contrast, Channel Mixer and similar) {was} \
+             left out — Aurora shows only Curves, Levels, Hue/Saturation, Vibrance, Exposure, \
+             Photo Filter, Black & White and Color Balance adjustment layers so far (Vibrance, \
+             Photo Filter, Black & White and Color Balance are approximations that have not \
+             been compared with Photoshop)."
         ),
         Note::CurvesUnreadable => format!(
             "{n} Curves layer{s} {was} left out — {} settings could not be read.",
@@ -554,6 +573,24 @@ fn note_text(note: Note, n: u64) -> String {
         Note::HueSaturationGrayscale => format!(
             "{n} Hue/Saturation layer{s} in this Grayscale file {was} left out — Aurora \
              hasn't yet verified how Photoshop applies Hue/Saturation to a Grayscale image."
+        ),
+        Note::Unreadable(kind) => format!(
+            "{n} {} layer{s} {was} left out — {} settings could not be read or fall outside \
+             the ranges Aurora's {} allows.",
+            kind.label(),
+            if one { "its" } else { "their" },
+            kind.label(),
+        ),
+        Note::Grayscale(kind) => format!(
+            "{n} {} layer{s} in this Grayscale file {was} left out — Aurora hasn't yet \
+             verified how Photoshop applies {} to a Grayscale image.",
+            kind.label(),
+            kind.label(),
+        ),
+        Note::PhotoFilterColour => format!(
+            "{n} Photo Filter layer{s} {was} left out — {} colour is not stored as Lab (the \
+             only form Aurora has checked against Photoshop's own files).",
+            if one { "its" } else { "their" },
         ),
         Note::FillSkipped => format!(
             "{n} shape or fill layer{s} (solid colour, gradient or pattern) with no stored \
@@ -666,6 +703,17 @@ fn note_text(note: Note, n: u64) -> String {
             "{n} clipped layer{s} {is} shown unclipped — {} base is a group or an adjustment \
              layer, or there is no layer beneath to clip to.",
             if one { "its" } else { "their" }
+        ),
+        Note::AdjustmentUnderGroupFill => format!(
+            "{n} adjustment layer{s} sit{} inside a Pass Through group whose Fill is below \
+             100%, which Aurora doesn't apply: {} may look much stronger than in Photoshop.",
+            if one { "s" } else { "" },
+            if one { "it" } else { "they" },
+        ),
+        Note::AdjustmentClipNotApplied => format!(
+            "{n} clipped adjustment layer{s} {is} shown unclipped (clipping is not applied): \
+             {} may look much stronger than in Photoshop.",
+            if one { "it" } else { "they" },
         ),
         Note::DropShadowsNotShown => format!(
             "{n} drop shadow{s} {is}n't shown yet; {} kept with the layer.",
@@ -1375,6 +1423,9 @@ struct Record {
     levels: Option<Result<LevlBlock, ()>>,
     /// The last `hue2` block, parsed (0.203.0).
     hue_saturation: Option<Result<HueBlock, ()>>,
+    /// The last `vibA`, `expA`, `phfl`, `blwh` or `blnc` block, parsed
+    /// (0.241.0).
+    other_adjustment: Option<read_adjust::Parsed>,
     /// The effects blocks to read (0.180.0), as `(priority, bytes)`:
     /// `lmfx` (0), `lfx2` (1), `lfxs` (2). Tried in that order; the first
     /// that reads wins, so a damaged `lmfx` falls back to `lfx2`.
@@ -1517,6 +1568,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let mut curves = None;
     let mut levels = None;
     let mut hue_saturation = None;
+    let mut other_adjustment = None;
     let mut effects_blocks: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut smart_blocks: Vec<aurora_doc::SmartObjectBlock> = Vec::new();
     let mut smart_filters = false;
@@ -1578,6 +1630,10 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
             b"levl" => levels = Some(parse_levl(data)),
             // Likewise Hue/Saturation (0.203.0).
             b"hue2" => hue_saturation = Some(parse_hue2(data)),
+            // Likewise the five of 0.241.0.
+            k if read_adjust::is_key(*k) => {
+                other_adjustment = read_adjust::parse_block(*k, data);
+            }
             k if ADJUSTMENT_KEYS.contains(&k) => features.adjustment = true,
             _ => {}
         }
@@ -1602,6 +1658,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
         curves,
         levels,
         hue_saturation,
+        other_adjustment,
         effects_blocks,
         effects: None,
         smart_blocks,
@@ -3303,6 +3360,7 @@ fn build_tree(
                 // only a Fill below 100% on one is not applied.
                 if props.blend == BlendMode::PassThrough && props.fill_opacity < 1.0 {
                     notes.add(Note::PassThroughFillNotApplied);
+                    notes.add_n(Note::AdjustmentUnderGroupFill, count_adjustments(&children));
                 }
                 // A group's mask region is the canvas (`Builder::add_nodes`).
                 let outcome =
@@ -3338,6 +3396,21 @@ fn build_tree(
     Ok(stack.pop().unwrap_or_default())
 }
 
+/// How many adjustment layers `nodes` hold, nested groups included.
+/// Iterative, so a deep tree cannot overflow the stack.
+fn count_adjustments(nodes: &[PsdNode]) -> u64 {
+    let mut count = 0_u64;
+    let mut stack: Vec<&PsdNode> = nodes.iter().collect();
+    while let Some(node) = stack.pop() {
+        match node {
+            PsdNode::Adjustment(_) => count += 1,
+            PsdNode::Group { children, .. } => stack.extend(children.iter()),
+            PsdNode::Layer(_) => {}
+        }
+    }
+    count
+}
+
 /// The unique IDs of every kept smart object in `nodes`. Iterative, so a
 /// deep tree cannot overflow the stack.
 fn collect_smart_ids(nodes: &[PsdNode], out: &mut std::collections::BTreeSet<String>) {
@@ -3370,6 +3443,20 @@ fn hue_saturation_node(
         Ok(block) => hue_saturation_adjustment(block, header.gray()),
         Err(()) => Err(Note::HueSaturationUnreadable),
     };
+    adjustment_node(src, record, header, params, notes, vector_budget)
+}
+
+/// A record whose adjustment is `params` (or the reason it is left out,
+/// reported) as an adjustment node: no pixels, so the mask region is the
+/// canvas, as for a group; effects are dropped.
+fn adjustment_node(
+    src: &mut dyn ByteSource,
+    record: &Record,
+    header: Header,
+    params: Result<aurora_doc::Adjustment, Note>,
+    notes: &mut Notes,
+    vector_budget: &mut vector::Budget,
+) -> Option<PsdNode> {
     let params = match params {
         Ok(params) => params,
         Err(note) => {
@@ -3448,10 +3535,17 @@ fn layer_node(
     if let (Some(hue), false) = (&record.hue_saturation, record.features.adjustment) {
         return hue_saturation_node(src, record, header, hue, notes, vector_budget);
     }
+    if let (Some(parsed), false) = (&record.other_adjustment, record.features.adjustment) {
+        // Vibrance, Exposure, Photo Filter, Black & White, Color Balance
+        // (0.241.0).
+        let params = read_adjust::adjustment(parsed, header.gray());
+        return adjustment_node(src, record, header, params, notes, vector_budget);
+    }
     if record.features.adjustment
         || record.curves.is_some()
         || record.levels.is_some()
         || record.hue_saturation.is_some()
+        || record.other_adjustment.is_some()
     {
         notes.add(Note::AdjustmentSkipped);
         return None;
@@ -4355,6 +4449,7 @@ fn build_streamed(
         profile: &profile,
         canvas,
         clip_refused: 0,
+        clip_adjustments_refused: 0,
     };
     if nodes.is_empty() {
         if let Some(image) = composite {
@@ -4376,6 +4471,10 @@ fn build_streamed(
         builder.add_nodes(nodes, None, 0)?;
     }
     notes.add_n(Note::ClippingDropped, builder.clip_refused);
+    notes.add_n(
+        Note::AdjustmentClipNotApplied,
+        builder.clip_adjustments_refused,
+    );
     // No second `take_failure` check here (0.154.0 review I1): every read
     // this build makes (`decode_pending`) propagates its own error with
     // `?`; only the tree build's mask decode swallows one, and
@@ -4401,9 +4500,18 @@ struct Builder<'b, 'k, 's> {
     /// Layers whose clipping flag Aurora cannot honour (0.201.0): shown
     /// unclipped, reported as [`Note::ClippingDropped`].
     clip_refused: u64,
+    /// Of those, the adjustment layers (0.241.0), reported separately.
+    clip_adjustments_refused: u64,
 }
 
 impl Builder<'_, '_, '_> {
+    /// Counts `id` when it is an adjustment layer shown unclipped.
+    fn note_adjustment_unclipped(&mut self, id: LayerId) {
+        if self.layers.adjustment(id).is_some() {
+            self.clip_adjustments_refused = self.clip_adjustments_refused.saturating_add(1);
+        }
+    }
+
     /// Recursion depth is bounded by [`MAX_GROUP_DEPTH`] ([`decode`]
     /// refuses deeper files, and this re-checks rather than trusting a
     /// hand-built [`PsdFile`]).
@@ -4650,6 +4758,7 @@ impl Builder<'_, '_, '_> {
                     });
                     if !base_is_pixel {
                         self.clip_refused = self.clip_refused.saturating_add(1);
+                        self.note_adjustment_unclipped(id);
                     }
                 }
                 // The bottom-most layer of its group, or a group: shown
@@ -4657,7 +4766,10 @@ impl Builder<'_, '_, '_> {
                 Err(
                     aurora_doc::DocError::NoClipBase(_)
                     | aurora_doc::DocError::GroupCannotBeClipped(_),
-                ) => self.clip_refused = self.clip_refused.saturating_add(1),
+                ) => {
+                    self.clip_refused = self.clip_refused.saturating_add(1);
+                    self.note_adjustment_unclipped(id);
+                }
                 Err(err) => return Err(err.into()),
             }
         }

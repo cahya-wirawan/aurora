@@ -305,6 +305,22 @@ def adjustment_summary(layer):
             (hue.enable, tuple(hue.colorization), tuple(hue.master),
              [(tuple(a), tuple(b)) for a, b in hue.items]),
         )
+    # 0.241.0: Vibrance, Exposure, Photo Filter, Black & White, Color Balance.
+    vib = blocks.get_data(Tag.VIBRANCE)
+    if vib is not None:
+        return ("vibrance", (int(vib.get(b"vibrance", 0)), int(vib.get(b"Strt", 0))))
+    exp = blocks.get_data(Tag.EXPOSURE)
+    if exp is not None:
+        return ("exposure", (exp.version, round(exp.exposure, 4), round(exp.offset, 4), round(exp.gamma, 4)))
+    phf = blocks.get_data(Tag.PHOTO_FILTER)
+    if phf is not None:
+        return ("photofilter", (phf.version, phf.color_space, tuple(phf.color_components), phf.density, phf.luminosity))
+    bw = blocks.get_data(Tag.BLACK_AND_WHITE)
+    if bw is not None:
+        return ("bw", (tuple(bw.get(k, 0) for k in (b"Rd  ", b"Yllw", b"Grn ", b"Cyn ", b"Bl  ", b"Mgnt")), bool(bw.get(b"useTint", False))))
+    bal = blocks.get_data(Tag.COLOR_BALANCE)
+    if bal is not None:
+        return ("balance", (tuple(bal.shadows), tuple(bal.midtones), tuple(bal.highlights), int(bal.luminosity)))
     return None
 
 
@@ -359,6 +375,53 @@ def check_adjustments(folder):
     check_resaves(folder)
 
 
+def check_adjustments5(folder):
+    """0.241.0: Vibrance, Exposure, Photo Filter, Black & White and Color
+    Balance layers read back in psd-tools with the integers/floats of
+    `adjustments5.json` (written by the Rust fixture test
+    `five_adjustments_fixture_for_psd_tools`)."""
+    spec_path = folder / "adjustments5.json"
+    if not spec_path.exists():
+        print("no adjustments5.json: the five-kind pass was skipped")
+        return
+    want = json.loads(spec_path.read_text(encoding="utf-8"))
+    psd = PSDImage.open(folder / "adjustments5.psd")
+    v = find_layer(psd, "Vibrance A")
+    check("Vibrance kind", v.kind, "vibrance")
+    check("Vibrance block", adjustment_summary(v)[1], tuple(want["vibrance"]))
+    check("Vibrance opacity", v.opacity, 128)
+    check("Vibrance blend", v.blend_mode.name, "MULTIPLY")
+    check("Vibrance mask bbox", tuple(v.mask.bbox), (2, 2, 12, 12))
+    e = find_layer(psd, "Exposure in group")
+    check("Exposure kind", e.kind, "exposure")
+    got = adjustment_summary(e)[1]
+    check("Exposure version", got[0], 1)
+    check("Exposure values", list(got[1:]), [round(x, 4) for x in want["exposure"]])
+    check("Exposure group", e.parent.name, "Group")
+    b = find_layer(psd, "Balance clipped")
+    check("Color Balance kind", b.kind, "colorbalance")
+    check("Color Balance clipping", bool(b.clipping), True)
+    sh, mid, hi, lum = adjustment_summary(b)[1]
+    check("Color Balance sliders", [list(sh), list(mid), list(hi), lum], want["balance"])
+    f = find_layer(psd, "Filter")
+    check("Photo Filter kind", f.kind, "photofilter")
+    ver, space, comps, density, lum = adjustment_summary(f)[1]
+    check("Photo Filter version/space", (ver, space), (2, 7))
+    check("Photo Filter density", density, want["density"])
+    check("Photo Filter luminosity", lum, want["luminosity"])
+    # Lab (67.19, 33.14, 72.79) for sRGB #EC8A00 under D50, in hundredths.
+    for got_c, exp_c, tol in zip(comps[:3], (6719, 3314, 7279), (3, 5, 5)):
+        c = got_c - 65536 if got_c > 32767 and exp_c != 6719 else got_c
+        check("Photo Filter Lab component", abs(c - exp_c) <= tol, True)
+    m = find_layer(psd, "Mono")
+    check("Black & White kind", m.kind, "blackandwhite")
+    check("Black & White visible", m.visible, False)
+    weights, tint = adjustment_summary(m)[1]
+    check("Black & White sliders", list(weights), want["bw"])
+    check("Black & White tint", tint, want["bw_tint"])
+    print("OK: psd-tools read the Vibrance, Exposure, Photo Filter, Black & White and Color Balance blocks and records")
+
+
 def check_resaves(folder):
     """Each kept `resave_<name>.psd` against the original corpus file."""
     corpus = Path(__file__).resolve().parent.parent / "corpora/psd/reference/psd-tools-fixtures"
@@ -375,9 +438,9 @@ def check_resaves(folder):
         original = PSDImage.open(matches[0])
         resaved = PSDImage.open(saved)
         a = [(l.name, l.kind, adjustment_summary(l)) for l in original.descendants()
-             if l.kind in ("curves", "levels", "huesaturation")]
+             if l.kind in ("curves", "levels", "huesaturation", "vibrance", "exposure", "photofilter", "blackandwhite", "colorbalance")]
         b = [(l.name, l.kind, adjustment_summary(l)) for l in resaved.descendants()
-             if l.kind in ("curves", "levels", "huesaturation")]
+             if l.kind in ("curves", "levels", "huesaturation", "vibrance", "exposure", "photofilter", "blackandwhite", "colorbalance")]
         check(f"{name} adjustment layers", sorted(x[:2] for x in a), sorted(x[:2] for x in b))
         same = sum(1 for x in a if x in b)
         # Merged images: psd-tools' own composite of each file's layers and
@@ -469,3 +532,4 @@ if __name__ == "__main__":
     check_clips(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_smart(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_adjustments(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
+    check_adjustments5(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
