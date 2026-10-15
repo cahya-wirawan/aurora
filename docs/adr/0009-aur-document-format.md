@@ -3,6 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-08-06
 **Deciders:** Cahya Wirawan
+**Specification:** [`docs/aur-format.md`](../aur-format.md) is the byte-level description of the format as implemented (derived from the code; where it disagrees with this ADR the code wins).
 **Related:** PRD §8.1, §12 Q7, §14 ("`.aur` is an open format"); ADR 0002 (300,000 px ceiling); ADR 0005 (tile size/scratch-disk budget); invariant §7.3.3 (history stores operations, not snapshots); PLAN.md M1.4 (crash-recovery journal's deferred on-disk half), M1.9
 
 ## Context
