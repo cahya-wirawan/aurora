@@ -40,10 +40,12 @@
 
 use aurora_core::{
     BLACK_WHITE_DEFAULTS, BLACK_WHITE_MAX, BLACK_WHITE_MIN, BRIGHTNESS_MAX, BlackWhiteParams,
-    BrightnessContrastParams, COLOR_BALANCE_MAX, COLOR_BALANCE_RANGES, CONTRAST_MAX,
+    BrightnessContrastParams, CHANNEL_MIXER_CONSTANT_MAX, CHANNEL_MIXER_OUTPUTS,
+    CHANNEL_MIXER_SOURCE_MAX, COLOR_BALANCE_MAX, COLOR_BALANCE_RANGES, CONTRAST_MAX,
     DEFAULT_TINT_HUE, DEFAULT_TINT_SATURATION, EXPOSURE_MAX, ExposureParams, GAMMA_MAX, GAMMA_MIN,
     LEGACY_MAX, OFFSET_MAX, POSTERIZE_DEFAULT, POSTERIZE_MAX, POSTERIZE_MIN, PhotoFilterParams,
-    THRESHOLD_DEFAULT, THRESHOLD_MAX, THRESHOLD_MIN, VibranceParams,
+    SELECTIVE_COLOR_MAX, SELECTIVE_COLOR_RANGES, THRESHOLD_DEFAULT, THRESHOLD_MAX, THRESHOLD_MIN,
+    VibranceParams,
 };
 use aurora_doc::{Adjustment, LayerId, LayerTree};
 use aurora_theme::Scales;
@@ -53,9 +55,9 @@ use taffy::style_helpers::length;
 use taffy::{Display, FlexDirection, Size, Style};
 
 /// How many sliders the editors hold.
-pub const ADJUST_SLIDER_COUNT: usize = 24;
+pub const ADJUST_SLIDER_COUNT: usize = 32;
 /// How many editor groups there are.
-pub const ADJUST_KIND_COUNT: usize = 9;
+pub const ADJUST_KIND_COUNT: usize = 11;
 
 /// Which of the adjustments an editor group belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -73,6 +75,12 @@ pub enum AdjustKind {
     Posterize,
     /// Brightness/Contrast (0.244.0): two sliders and Use Legacy.
     BrightnessContrast,
+    /// Channel Mixer (0.245.0): an output selector, three source sliders, a
+    /// constant and Monochrome.
+    ChannelMixer,
+    /// Selective Color (0.245.0): a nine-range selector, four ink sliders
+    /// and the Absolute method.
+    SelectiveColor,
 }
 
 impl AdjustKind {
@@ -87,6 +95,8 @@ impl AdjustKind {
         Self::Threshold,
         Self::Posterize,
         Self::BrightnessContrast,
+        Self::ChannelMixer,
+        Self::SelectiveColor,
     ];
 
     /// Position in [`Self::ALL`].
@@ -102,6 +112,8 @@ impl AdjustKind {
             Self::Threshold => 6,
             Self::Posterize => 7,
             Self::BrightnessContrast => 8,
+            Self::ChannelMixer => 9,
+            Self::SelectiveColor => 10,
         }
     }
 
@@ -118,12 +130,14 @@ impl AdjustKind {
             Adjustment::Threshold(_) => Some(Self::Threshold),
             Adjustment::Posterize(_) => Some(Self::Posterize),
             Adjustment::BrightnessContrast(_) => Some(Self::BrightnessContrast),
+            Adjustment::ChannelMixer(_) => Some(Self::ChannelMixer),
+            Adjustment::SelectiveColor(_) => Some(Self::SelectiveColor),
             _ => None,
         }
     }
 }
 
-/// One of the twenty-four sliders.
+/// One of the thirty-two sliders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdjustSlider {
     /// Vibrance, `-100..=100`.
@@ -172,6 +186,23 @@ pub enum AdjustSlider {
     /// Its contrast. [`Self::range`] is the widest (`-100..=100`); the built
     /// slider follows the mode (`-50..=100` in the default mode).
     Contrast,
+    /// Channel Mixer's red source of the selected output (the Gray mix
+    /// while Monochrome is on), `-200..=200`.
+    MixerRed,
+    /// Its green source.
+    MixerGreen,
+    /// Its blue source.
+    MixerBlue,
+    /// Its constant, `-100..=100`.
+    MixerConstant,
+    /// Selective Color's cyan slider of the selected range, `-100..=100`.
+    SelectiveCyan,
+    /// Its magenta slider.
+    SelectiveMagenta,
+    /// Its yellow slider.
+    SelectiveYellow,
+    /// Its black slider.
+    SelectiveBlack,
 }
 
 impl AdjustSlider {
@@ -201,6 +232,14 @@ impl AdjustSlider {
         Self::PosterizeLevels,
         Self::Brightness,
         Self::Contrast,
+        Self::MixerRed,
+        Self::MixerGreen,
+        Self::MixerBlue,
+        Self::MixerConstant,
+        Self::SelectiveCyan,
+        Self::SelectiveMagenta,
+        Self::SelectiveYellow,
+        Self::SelectiveBlack,
     ];
 
     /// Position in [`Self::ALL`].
@@ -231,6 +270,14 @@ impl AdjustSlider {
             Self::PosterizeLevels => 21,
             Self::Brightness => 22,
             Self::Contrast => 23,
+            Self::MixerRed => 24,
+            Self::MixerGreen => 25,
+            Self::MixerBlue => 26,
+            Self::MixerConstant => 27,
+            Self::SelectiveCyan => 28,
+            Self::SelectiveMagenta => 29,
+            Self::SelectiveYellow => 30,
+            Self::SelectiveBlack => 31,
         }
     }
 
@@ -255,6 +302,13 @@ impl AdjustSlider {
             Self::ThresholdLevel => AdjustKind::Threshold,
             Self::PosterizeLevels => AdjustKind::Posterize,
             Self::Brightness | Self::Contrast => AdjustKind::BrightnessContrast,
+            Self::MixerRed | Self::MixerGreen | Self::MixerBlue | Self::MixerConstant => {
+                AdjustKind::ChannelMixer
+            }
+            Self::SelectiveCyan
+            | Self::SelectiveMagenta
+            | Self::SelectiveYellow
+            | Self::SelectiveBlack => AdjustKind::SelectiveColor,
         }
     }
 
@@ -292,6 +346,32 @@ impl AdjustSlider {
         }
     }
 
+    /// The Channel Mixer slider's slot in a row (`0` red, `1` green, `2`
+    /// blue, `3` constant), `None` for every other slider.
+    #[must_use]
+    pub const fn mixer_slot(self) -> Option<usize> {
+        match self {
+            Self::MixerRed => Some(0),
+            Self::MixerGreen => Some(1),
+            Self::MixerBlue => Some(2),
+            Self::MixerConstant => Some(3),
+            _ => None,
+        }
+    }
+
+    /// The Selective Color slider's slot (`0` cyan, `1` magenta, `2`
+    /// yellow, `3` black), `None` for every other slider.
+    #[must_use]
+    pub const fn selective_slot(self) -> Option<usize> {
+        match self {
+            Self::SelectiveCyan => Some(0),
+            Self::SelectiveMagenta => Some(1),
+            Self::SelectiveYellow => Some(2),
+            Self::SelectiveBlack => Some(3),
+            _ => None,
+        }
+    }
+
     /// The slider's accessible name (unique among the editors' sliders).
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -320,6 +400,14 @@ impl AdjustSlider {
             Self::PosterizeLevels => "Posterize levels",
             Self::Brightness => "Brightness",
             Self::Contrast => "Contrast",
+            Self::MixerRed => "Channel mixer red source",
+            Self::MixerGreen => "Channel mixer green source",
+            Self::MixerBlue => "Channel mixer blue source",
+            Self::MixerConstant => "Channel mixer constant",
+            Self::SelectiveCyan => "Selective color cyan",
+            Self::SelectiveMagenta => "Selective color magenta",
+            Self::SelectiveYellow => "Selective color yellow",
+            Self::SelectiveBlack => "Selective color black",
         }
     }
 
@@ -351,6 +439,14 @@ impl AdjustSlider {
             Self::PosterizeLevels => "Levels",
             Self::Brightness => "Brightness",
             Self::Contrast => "Contrast",
+            Self::MixerRed => "Red",
+            Self::MixerGreen => "Green",
+            Self::MixerBlue => "Blue",
+            Self::MixerConstant => "Constant",
+            Self::SelectiveCyan => "Cyan",
+            Self::SelectiveMagenta => "Magenta",
+            Self::SelectiveYellow => "Yellow",
+            Self::SelectiveBlack => "Black",
         }
     }
 
@@ -379,6 +475,18 @@ impl AdjustSlider {
             Self::PosterizeLevels => (POSTERIZE_MIN as f64, POSTERIZE_MAX as f64),
             Self::Brightness => (-(BRIGHTNESS_MAX as f64), BRIGHTNESS_MAX as f64),
             Self::Contrast => (-(LEGACY_MAX as f64), CONTRAST_MAX as f64),
+            Self::MixerRed | Self::MixerGreen | Self::MixerBlue => (
+                -(CHANNEL_MIXER_SOURCE_MAX as f64),
+                CHANNEL_MIXER_SOURCE_MAX as f64,
+            ),
+            Self::MixerConstant => (
+                -(CHANNEL_MIXER_CONSTANT_MAX as f64),
+                CHANNEL_MIXER_CONSTANT_MAX as f64,
+            ),
+            Self::SelectiveCyan
+            | Self::SelectiveMagenta
+            | Self::SelectiveYellow
+            | Self::SelectiveBlack => (-(SELECTIVE_COLOR_MAX as f64), SELECTIVE_COLOR_MAX as f64),
         }
     }
 
@@ -417,6 +525,8 @@ impl AdjustSlider {
         let places = self.decimals();
         if matches!(self, Self::Exposure | Self::Brightness | Self::Contrast)
             || self.balance_slot().is_some()
+            || self.mixer_slot().is_some()
+            || self.selective_slot().is_some()
         {
             format!("{}: {value:+.places$}", self.short_label())
         } else {
@@ -425,9 +535,12 @@ impl AdjustSlider {
     }
 
     /// The slider position for `adjustment`, `None` when it is not this
-    /// slider's adjustment. `range` is the Color Balance range selector's
-    /// tab (`0` shadows, `1` midtones, `2` highlights); every other slider
-    /// ignores it.
+    /// slider's adjustment. `range` is the tab of the selector of the
+    /// slider's own kind ([`adjust_tab`]): Color Balance's range (`0`
+    /// shadows, `1` midtones, `2` highlights), Channel Mixer's output (`0`
+    /// red, `1` green, `2` blue; ignored while Monochrome is on, when the
+    /// first row is the Gray mix) or Selective Color's range (`0` Reds to `8`
+    /// Blacks); every other slider ignores it.
     #[must_use]
     pub fn value_of(self, adjustment: &Adjustment, range: usize) -> Option<f64> {
         let channel = |i: usize| {
@@ -471,6 +584,21 @@ impl AdjustSlider {
             Self::Contrast => adjustment
                 .brightness_contrast()
                 .map(|p| f64::from(p.contrast())),
+            Self::MixerRed | Self::MixerGreen | Self::MixerBlue | Self::MixerConstant => {
+                let p = adjustment.channel_mixer()?;
+                let output = if p.monochrome() { 0 } else { range };
+                p.row(output)?
+                    .get(self.mixer_slot()?)
+                    .copied()
+                    .map(f64::from)
+            }
+            Self::SelectiveCyan
+            | Self::SelectiveMagenta
+            | Self::SelectiveYellow
+            | Self::SelectiveBlack => {
+                let sliders = adjustment.selective_color()?.range(range)?;
+                sliders.get(self.selective_slot()?).copied().map(f64::from)
+            }
         }
     }
 
@@ -588,6 +716,21 @@ impl AdjustSlider {
                 .ok()
                 .map(Adjustment::BrightnessContrast)
             }
+            Self::MixerRed | Self::MixerGreen | Self::MixerBlue | Self::MixerConstant => {
+                let p = adjustment.channel_mixer()?;
+                let output = if p.monochrome() { 0 } else { range };
+                p.with_value(output, self.mixer_slot()?, v)
+                    .ok()
+                    .map(Adjustment::ChannelMixer)
+            }
+            Self::SelectiveCyan
+            | Self::SelectiveMagenta
+            | Self::SelectiveYellow
+            | Self::SelectiveBlack => adjustment
+                .selective_color()?
+                .with_slider(range, self.selective_slot()?, v)
+                .ok()
+                .map(Adjustment::SelectiveColor),
         }
     }
 }
@@ -602,6 +745,15 @@ pub fn adjust_of(layers: &LayerTree, id: LayerId) -> Option<&Adjustment> {
 
 /// The tab labels of the Color Balance range selector.
 const BALANCE_TAB_LABELS: [&str; 3] = ["Shad", "Mid", "High"];
+
+/// The tab labels of the Channel Mixer output selector.
+const MIXER_TAB_LABELS: [&str; 3] = ["Red", "Green", "Blue"];
+
+/// The tab labels of the Selective Color range selector (short, so nine fit
+/// the panel; the accessible names are the full range names).
+const SELECTIVE_TAB_LABELS: [&str; 9] = [
+    "Red", "Yel", "Grn", "Cyn", "Blu", "Mag", "Wht", "Neu", "Blk",
+];
 
 /// The sliders, their readouts, the checkboxes, the Color Balance range
 /// selector and the containers.
@@ -628,6 +780,15 @@ pub struct AdjustControls {
     pub legacy: WidgetId,
     /// The line Invert's group shows in place of sliders (0.244.0).
     pub invert_note: WidgetId,
+    /// Channel Mixer's output selector tab bar (0.245.0): tab 0 Red, 1
+    /// Green, 2 Blue; idle while Monochrome is on.
+    pub mixer_output: WidgetId,
+    /// Channel Mixer's "Monochrome" checkbox.
+    pub mixer_mono: WidgetId,
+    /// Selective Color's range selector tab bar: tab 0 Reds to 8 Blacks.
+    pub selective_range: WidgetId,
+    /// Selective Color's "Absolute" checkbox (off: Relative).
+    pub selective_absolute: WidgetId,
 }
 
 impl AdjustControls {
@@ -690,6 +851,10 @@ pub fn insert_adjust_controls(
         let mut balance_preserve = None;
         let mut balance_range = None;
         let mut legacy = None;
+        let mut mixer_output = None;
+        let mut mixer_mono = None;
+        let mut selective_range = None;
+        let mut selective_absolute = None;
         let invert_note = widgets::insert_label(
             tree,
             group_of(AdjustKind::Invert)?,
@@ -717,6 +882,44 @@ pub fn insert_adjust_controls(
                     COLOR_BALANCE_RANGES.iter().map(|&n| n.to_owned()).collect(),
                 )?;
                 balance_range = Some(bar);
+            }
+            if slider == AdjustSlider::MixerRed {
+                let bar = widgets::insert_tab_bar(
+                    tree,
+                    group,
+                    scales,
+                    "Channel Mixer output",
+                    MIXER_TAB_LABELS.iter().map(|&l| l.to_owned()).collect(),
+                    0,
+                )?;
+                widgets::set_tab_accessible_names(
+                    tree,
+                    bar,
+                    CHANNEL_MIXER_OUTPUTS
+                        .iter()
+                        .map(|&n| format!("{n} output"))
+                        .collect(),
+                )?;
+                mixer_output = Some(bar);
+            }
+            if slider == AdjustSlider::SelectiveCyan {
+                let bar = widgets::insert_tab_bar(
+                    tree,
+                    group,
+                    scales,
+                    "Selective Color range",
+                    SELECTIVE_TAB_LABELS.iter().map(|&l| l.to_owned()).collect(),
+                    0,
+                )?;
+                widgets::set_tab_accessible_names(
+                    tree,
+                    bar,
+                    SELECTIVE_COLOR_RANGES
+                        .iter()
+                        .map(|&n| n.to_owned())
+                        .collect(),
+                )?;
+                selective_range = Some(bar);
             }
             let (min, max) = slider.range();
             let start = slider.initial();
@@ -746,6 +949,13 @@ pub fn insert_adjust_controls(
             if slider == AdjustSlider::Contrast {
                 legacy = Some(widgets::insert_checkbox(tree, group, scales, "Use Legacy")?);
             }
+            if slider == AdjustSlider::MixerConstant {
+                mixer_mono = Some(widgets::insert_checkbox(tree, group, scales, "Monochrome")?);
+            }
+            if slider == AdjustSlider::SelectiveBlack {
+                selective_absolute =
+                    Some(widgets::insert_checkbox(tree, group, scales, "Absolute")?);
+            }
             if slider == AdjustSlider::BalanceYellowBlue {
                 balance_preserve = Some(widgets::insert_checkbox(
                     tree,
@@ -761,6 +971,10 @@ pub fn insert_adjust_controls(
             Some(balance_preserve),
             Some(balance_range),
             Some(legacy),
+            Some(mixer_output),
+            Some(mixer_mono),
+            Some(selective_range),
+            Some(selective_absolute),
             Ok(sliders),
             Ok(readouts),
             Ok(groups),
@@ -770,6 +984,10 @@ pub fn insert_adjust_controls(
             balance_preserve,
             balance_range,
             legacy,
+            mixer_output,
+            mixer_mono,
+            selective_range,
+            selective_absolute,
             <[WidgetId; ADJUST_SLIDER_COUNT]>::try_from(sliders),
             <[WidgetId; ADJUST_SLIDER_COUNT]>::try_from(readouts),
             <[WidgetId; ADJUST_KIND_COUNT]>::try_from(groups),
@@ -788,8 +1006,12 @@ pub fn insert_adjust_controls(
             balance_range,
             legacy,
             invert_note,
+            mixer_output,
+            mixer_mono,
+            selective_range,
+            selective_absolute,
         };
-        set_shown(tree, controls, None, false)?;
+        set_shown(tree, controls, None, false, false)?;
         Ok(controls)
     })();
     if built.is_err() {
@@ -841,6 +1063,7 @@ fn set_shown(
     controls: AdjustControls,
     kind: Option<AdjustKind>,
     tint_on: bool,
+    mixer_mono: bool,
 ) -> Result<bool, WidgetError> {
     let mut changed = set_display(
         tree,
@@ -898,10 +1121,37 @@ fn set_shown(
     )?;
     changed |=
         widgets::set_label_disabled(tree, controls.invert_note, kind != Some(AdjustKind::Invert))?;
-    let tabs_live = kind == Some(AdjustKind::ColorBalance);
-    if widgets::tab_bar_state(tree, controls.balance_range)?.is_disabled() == tabs_live {
-        widgets::set_tab_bar_disabled(tree, controls.balance_range, !tabs_live)?;
-        changed = true;
+    changed |= set_checkbox_live(
+        tree,
+        controls.mixer_mono,
+        kind == Some(AdjustKind::ChannelMixer),
+    )?;
+    changed |= set_checkbox_live(
+        tree,
+        controls.selective_absolute,
+        kind == Some(AdjustKind::SelectiveColor),
+    )?;
+    // The selectors are widget state only; each is live for its own kind
+    // (the Mixer's output selector is idle while Monochrome is on: the Gray
+    // mix is the first row).
+    for (bar, tabs_live) in [
+        (
+            controls.balance_range,
+            kind == Some(AdjustKind::ColorBalance),
+        ),
+        (
+            controls.mixer_output,
+            kind == Some(AdjustKind::ChannelMixer) && !mixer_mono,
+        ),
+        (
+            controls.selective_range,
+            kind == Some(AdjustKind::SelectiveColor),
+        ),
+    ] {
+        if widgets::tab_bar_state(tree, bar)?.is_disabled() == tabs_live {
+            widgets::set_tab_bar_disabled(tree, bar, !tabs_live)?;
+            changed = true;
+        }
     }
     Ok(changed)
 }
@@ -971,6 +1221,40 @@ pub fn adjust_balance_range(tree: &WidgetTree<WidgetKind>, controls: AdjustContr
         .map_or(0, aurora_widgets::widgets::TabBarState::selected)
 }
 
+/// Whether Channel Mixer's Monochrome checkbox is checked.
+#[must_use]
+pub fn adjust_mixer_mono_checked(tree: &WidgetTree<WidgetKind>, controls: AdjustControls) -> bool {
+    checkbox_checked(tree, controls.mixer_mono)
+}
+
+/// Whether Selective Color's Absolute checkbox is checked.
+#[must_use]
+pub fn adjust_selective_absolute_checked(
+    tree: &WidgetTree<WidgetKind>,
+    controls: AdjustControls,
+) -> bool {
+    checkbox_checked(tree, controls.selective_absolute)
+}
+
+/// The tab of the selector that belongs to a slider of `kind`, the `range`
+/// [`AdjustSlider::value_of`] and [`AdjustSlider::with_value`] take: Color
+/// Balance's range, Channel Mixer's output, Selective Color's range; `0` for
+/// every other kind.
+#[must_use]
+pub fn adjust_tab(
+    tree: &WidgetTree<WidgetKind>,
+    controls: AdjustControls,
+    kind: AdjustKind,
+) -> usize {
+    let bar = match kind {
+        AdjustKind::ColorBalance => controls.balance_range,
+        AdjustKind::ChannelMixer => controls.mixer_output,
+        AdjustKind::SelectiveColor => controls.selective_range,
+        _ => return 0,
+    };
+    widgets::tab_bar_state(tree, bar).map_or(0, aurora_widgets::widgets::TabBarState::selected)
+}
+
 /// Sets slider `id` to `value`, also while it is disabled (a tint slider
 /// with Tint off still shows the stored colour); it stays disabled.
 fn put_slider_value(
@@ -1033,11 +1317,12 @@ pub fn sync_adjust_controls(
     captured: Option<WidgetId>,
 ) -> Result<bool, WidgetError> {
     let Some(adjustment) = active.and_then(|id| adjust_of(layers, id)) else {
-        return set_shown(tree, controls, None, false);
+        return set_shown(tree, controls, None, false, false);
     };
     let kind = AdjustKind::of(adjustment);
     let tint_on = adjustment.black_white().is_some_and(|p| p.tint());
-    let mut changed = set_shown(tree, controls, kind, tint_on)?;
+    let mixer_mono = adjustment.channel_mixer().is_some_and(|p| p.monochrome());
+    let mut changed = set_shown(tree, controls, kind, tint_on, mixer_mono)?;
     if let Some(filter) = adjustment.photo_filter() {
         changed |= sync_checkbox(tree, controls.preserve, filter.preserve_luminosity())?;
     }
@@ -1054,11 +1339,17 @@ pub fn sync_adjust_controls(
     if let Some(bc) = adjustment.brightness_contrast() {
         changed |= sync_checkbox(tree, controls.legacy, bc.legacy())?;
     }
-    let range = adjust_balance_range(tree, controls);
+    if let Some(mixer) = adjustment.channel_mixer() {
+        changed |= sync_checkbox(tree, controls.mixer_mono, mixer.monochrome())?;
+    }
+    if let Some(selective) = adjustment.selective_color() {
+        changed |= sync_checkbox(tree, controls.selective_absolute, selective.absolute())?;
+    }
     for slider in AdjustSlider::ALL
         .into_iter()
         .filter(|s| Some(s.kind()) == kind)
     {
+        let range = adjust_tab(tree, controls, slider.kind());
         let (Some(&id), Some(&readout)) = (
             controls.sliders.get(slider.index()),
             controls.readouts.get(slider.index()),
@@ -1264,6 +1555,8 @@ mod tests {
         let th = Adjustment::Threshold(aurora_core::ThresholdParams::default());
         let po = Adjustment::Posterize(aurora_core::PosterizeParams::default());
         let bc = Adjustment::BrightnessContrast(aurora_core::BrightnessContrastParams::identity());
+        let cm = Adjustment::ChannelMixer(aurora_core::ChannelMixerParams::identity());
+        let sc = Adjustment::SelectiveColor(aurora_core::SelectiveColorParams::identity());
         for s in S::ALL {
             let base = match s.kind() {
                 AdjustKind::Vibrance => &v,
@@ -1275,6 +1568,8 @@ mod tests {
                 AdjustKind::Threshold => &th,
                 AdjustKind::Posterize => &po,
                 AdjustKind::BrightnessContrast => &bc,
+                AdjustKind::ChannelMixer => &cm,
+                AdjustKind::SelectiveColor => &sc,
             };
             let (mut min, max) = s.range();
             if s == S::Contrast {
