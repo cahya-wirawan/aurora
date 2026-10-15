@@ -183,6 +183,10 @@ fn the_new_adjustment_layers_are_in_the_layer_menu_and_the_native_list() {
             crate::COMMAND_LAYER_NEW_SELECTIVE_COLOR,
             "New Selective Color Layer",
         ),
+        (
+            crate::COMMAND_LAYER_NEW_GRADIENT_MAP,
+            "New Gradient Map Layer",
+        ),
     ] {
         assert_eq!(entry(layer, id).0, label);
         assert!(entry(layer, id).2, "{id} is enabled");

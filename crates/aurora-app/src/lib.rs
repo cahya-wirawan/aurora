@@ -41616,7 +41616,7 @@ mod tests {
         // 0.241.0: five of those (Exposure, Vibrance, Color Balance, Black &
         // White, Photo Filter) are imported, 8 left out: max 230 -> 204, mean
         // 125.9 / 51.5 / 32.0 -> 106.6 / 30.5 / 26.0.
-        ("fill_adjustments.psd", 204.0, Some("2 adjustment layers")),
+        ("fill_adjustments.psd", 204.0, Some("1 Color Lookup layer was left out")),
         // A clipped layer whose base is not a pixel layer shown unclipped
         // (0.201.0: the other clipped layers are clipped for real).
         (
@@ -45000,8 +45000,8 @@ mod tests {
         // Balance Layer", and (0.244.0) "New Invert Layer", "New Threshold
         // Layer", "New Posterize Layer" and "New Brightness/Contrast Layer",
         // and (0.245.0) "New Channel Mixer Layer" and "New Selective Color
-        // Layer".
-        assert_eq!(state.results().len(), 27);
+        // Layer", and (0.248.0) "New Gradient Map Layer".
+        assert_eq!(state.results().len(), 28);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -79173,7 +79173,7 @@ mod tests {
                     aurora_ui::AdjustKind,
                     Adjustment,
                     &str,
-                ); 2] = [
+                ); 3] = [
                     (
                         crate::COMMAND_LAYER_NEW_CHANNEL_MIXER,
                         "New Channel Mixer Layer",
@@ -79189,6 +79189,14 @@ mod tests {
                         aurora_ui::AdjustKind::SelectiveColor,
                         Adjustment::SelectiveColor(aurora_core::SelectiveColorParams::identity()),
                         "Selective Color 1",
+                    ),
+                    (
+                        crate::COMMAND_LAYER_NEW_GRADIENT_MAP,
+                        "New Gradient Map Layer",
+                        ActivatedCommand::NewGradientMapLayer,
+                        aurora_ui::AdjustKind::GradientMap,
+                        Adjustment::GradientMap(aurora_core::GradientMapParams::black_to_white()),
+                        "Gradient Map 1",
                     ),
                 ];
                 for (id, title, activated, kind, adjustment, name) in cases {
@@ -86360,6 +86368,91 @@ mod tests {
             assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
         }
 
+        /// 0.248.0: Gradient Map against an independent f64 model on a solid
+        /// backdrop, in both directions, with a hard step, and the backdrop's
+        /// alpha kept.
+        #[test]
+        fn gradient_map_matches_an_independent_model_and_keeps_alpha() {
+            let map = |stops: &[(f32, [f32; 3])], reverse: bool| {
+                let stops = stops
+                    .iter()
+                    .map(|&(p, c)| aurora_core::GradientStop::new(p, c))
+                    .collect();
+                match aurora_core::GradientMapParams::new(stops, reverse, false) {
+                    Ok(p) => Adjustment::GradientMap(p),
+                    Err(err) => unreachable!("{err:?}"),
+                }
+            };
+            // 0.30 * 0.2 + 0.59 * 0.4 + 0.11 * 0.6 = 0.362
+            let model = |stops: &[(f32, [f32; 3])], reverse: bool| {
+                let grey = 0.30_f64 * 0.2 + 0.59 * 0.4 + 0.11 * 0.6;
+                let t = if reverse { 1.0 - grey } else { grey };
+                let mut rgb = [0.0_f64; 3];
+                for (i, c) in stops[0].1.iter().enumerate() {
+                    rgb[i] = f64::from(*c);
+                }
+                for w in stops.windows(2) {
+                    let (p0, p1) = (f64::from(w[0].0), f64::from(w[1].0));
+                    if t >= p0 && t < p1 {
+                        let u = (t - p0) / (p1 - p0);
+                        for i in 0..3 {
+                            rgb[i] = f64::from(w[0].1[i])
+                                + (f64::from(w[1].1[i]) - f64::from(w[0].1[i])) * u;
+                        }
+                    }
+                }
+                if t >= f64::from(stops[stops.len() - 1].0) {
+                    for i in 0..3 {
+                        rgb[i] = f64::from(stops[stops.len() - 1].1[i]);
+                    }
+                }
+                [rgb[0] as f32, rgb[1] as f32, rgb[2] as f32, 1.0]
+            };
+            let three: [(f32, [f32; 3]); 3] = [
+                (0.0, [0.1, 0.0, 0.3]),
+                (0.5, [0.9, 0.4, 0.0]),
+                (1.0, [1.0, 1.0, 0.8]),
+            ];
+            let step: [(f32, [f32; 3]); 4] = [
+                (0.0, [0.0, 0.0, 0.0]),
+                (0.5, [1.0, 0.0, 0.0]),
+                (0.5, [0.0, 0.0, 1.0]),
+                (1.0, [1.0, 1.0, 1.0]),
+            ];
+            let (_dir, mut store) = real_tile_store();
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let id = add(&mut layers, map(&three, false));
+            for (stops, reverse) in [
+                (&three[..], false),
+                (&three[..], true),
+                (&step[..], false),
+                (&step[..], true),
+            ] {
+                let _ = layers.set_adjustment(id, map(stops, reverse));
+                assert_close(
+                    first(&layers, &mut store),
+                    model(stops, reverse),
+                    &format!("{stops:?} {reverse}"),
+                );
+            }
+            // A mapped layer is never a passthrough, even black to white.
+            let _ = layers.set_adjustment(
+                id,
+                Adjustment::GradientMap(aurora_core::GradientMapParams::black_to_white()),
+            );
+            let got = first(&layers, &mut store);
+            assert_close(got, [0.362, 0.362, 0.362, 1.0], "black to white is the grey");
+            let (_dir2, mut store2) = real_tile_store();
+            let mut layers2 = solid_root_stack(
+                &mut store2,
+                &[("b", BlendMode::Normal, 1.0, [0.2, 0.4, 0.6, 0.5])],
+            );
+            let _ = add(&mut layers2, map(&three, false));
+            let got = first(&layers2, &mut store2);
+            assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
+        }
+
         /// 0.245.0: Selective Color against hand-worked values (the backdrop
         /// 0.2, 0.4, 0.6 is 0.2 Blues, 0.2 Cyans, 0.12 Blacks, 0.48 Neutrals),
         /// neutral as an exact passthrough, alpha kept.
@@ -86463,6 +86556,7 @@ mod tests {
                 Adjustment::ChannelMixer(strong_mixer),
                 Adjustment::SelectiveColor(aurora_core::SelectiveColorParams::identity()),
                 Adjustment::SelectiveColor(strong_selective),
+                Adjustment::GradientMap(aurora_core::GradientMapParams::black_to_white()),
             ] {
                 let (_dir, mut store) = real_tile_store();
                 let mut layers =
@@ -90221,6 +90315,7 @@ mod tests {
         include!("psd_audit_tests.rs");
         include!("four_adjust_fidelity_tests.rs");
         include!("two_adjust_fidelity_tests.rs");
+        include!("gradient_fidelity_tests.rs");
         include!("small_machine_effect_tests.rs");
     }
 }
