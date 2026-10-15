@@ -749,11 +749,12 @@ const BALANCE_TAB_LABELS: [&str; 3] = ["Shad", "Mid", "High"];
 /// The tab labels of the Channel Mixer output selector.
 const MIXER_TAB_LABELS: [&str; 3] = ["Red", "Green", "Blue"];
 
-/// The tab labels of the Selective Color range selector (short, so nine fit
-/// the panel; the accessible names are the full range names).
-const SELECTIVE_TAB_LABELS: [&str; 9] = [
-    "Red", "Yel", "Grn", "Cyn", "Blu", "Mag", "Wht", "Neu", "Blk",
-];
+/// The tab labels of Selective Color's two selectors. Nine tabs do not fit
+/// the panel, so the range is chosen in two steps: a group bar (the six hue
+/// ranges together, then Whites, Neutrals, Blacks), and below it, live only
+/// for the hue group, a bar of the six hues.
+const SELECTIVE_GROUP_LABELS: [&str; 4] = ["Colors", "Whites", "Neutrals", "Blacks"];
+const SELECTIVE_HUE_LABELS: [&str; 6] = ["Red", "Yel", "Grn", "Cyn", "Blu", "Mag"];
 
 /// The sliders, their readouts, the checkboxes, the Color Balance range
 /// selector and the containers.
@@ -785,7 +786,11 @@ pub struct AdjustControls {
     pub mixer_output: WidgetId,
     /// Channel Mixer's "Monochrome" checkbox.
     pub mixer_mono: WidgetId,
-    /// Selective Color's range selector tab bar: tab 0 Reds to 8 Blacks.
+    /// Selective Color's group selector tab bar: tab 0 the six colour
+    /// ranges, 1 Whites, 2 Neutrals, 3 Blacks.
+    pub selective_group: WidgetId,
+    /// Selective Color's colour selector tab bar (live for group 0): tab 0
+    /// Reds to 5 Magentas.
     pub selective_range: WidgetId,
     /// Selective Color's "Absolute" checkbox (off: Relative).
     pub selective_absolute: WidgetId,
@@ -853,6 +858,7 @@ pub fn insert_adjust_controls(
         let mut legacy = None;
         let mut mixer_output = None;
         let mut mixer_mono = None;
+        let mut selective_group = None;
         let mut selective_range = None;
         let mut selective_absolute = None;
         let invert_note = widgets::insert_label(
@@ -903,12 +909,34 @@ pub fn insert_adjust_controls(
                 mixer_output = Some(bar);
             }
             if slider == AdjustSlider::SelectiveCyan {
+                let group_bar = widgets::insert_tab_bar(
+                    tree,
+                    group,
+                    scales,
+                    "Selective Color group",
+                    SELECTIVE_GROUP_LABELS
+                        .iter()
+                        .map(|&l| l.to_owned())
+                        .collect(),
+                    0,
+                )?;
+                widgets::set_tab_accessible_names(
+                    tree,
+                    group_bar,
+                    vec![
+                        "Colors".to_owned(),
+                        "Whites".to_owned(),
+                        "Neutrals".to_owned(),
+                        "Blacks".to_owned(),
+                    ],
+                )?;
+                selective_group = Some(group_bar);
                 let bar = widgets::insert_tab_bar(
                     tree,
                     group,
                     scales,
                     "Selective Color range",
-                    SELECTIVE_TAB_LABELS.iter().map(|&l| l.to_owned()).collect(),
+                    SELECTIVE_HUE_LABELS.iter().map(|&l| l.to_owned()).collect(),
                     0,
                 )?;
                 widgets::set_tab_accessible_names(
@@ -916,6 +944,7 @@ pub fn insert_adjust_controls(
                     bar,
                     SELECTIVE_COLOR_RANGES
                         .iter()
+                        .take(6)
                         .map(|&n| n.to_owned())
                         .collect(),
                 )?;
@@ -973,6 +1002,7 @@ pub fn insert_adjust_controls(
             Some(legacy),
             Some(mixer_output),
             Some(mixer_mono),
+            Some(selective_group),
             Some(selective_range),
             Some(selective_absolute),
             Ok(sliders),
@@ -986,6 +1016,7 @@ pub fn insert_adjust_controls(
             legacy,
             mixer_output,
             mixer_mono,
+            selective_group,
             selective_range,
             selective_absolute,
             <[WidgetId; ADJUST_SLIDER_COUNT]>::try_from(sliders),
@@ -1008,6 +1039,7 @@ pub fn insert_adjust_controls(
             invert_note,
             mixer_output,
             mixer_mono,
+            selective_group,
             selective_range,
             selective_absolute,
         };
@@ -1065,6 +1097,8 @@ fn set_shown(
     tint_on: bool,
     mixer_mono: bool,
 ) -> Result<bool, WidgetError> {
+    let selective_group = widgets::tab_bar_state(tree, controls.selective_group)
+        .map_or(0, aurora_widgets::widgets::TabBarState::selected);
     let mut changed = set_display(
         tree,
         controls.root,
@@ -1144,8 +1178,12 @@ fn set_shown(
             kind == Some(AdjustKind::ChannelMixer) && !mixer_mono,
         ),
         (
-            controls.selective_range,
+            controls.selective_group,
             kind == Some(AdjustKind::SelectiveColor),
+        ),
+        (
+            controls.selective_range,
+            kind == Some(AdjustKind::SelectiveColor) && selective_group == 0,
         ),
     ] {
         if widgets::tab_bar_state(tree, bar)?.is_disabled() == tabs_live {
@@ -1249,7 +1287,16 @@ pub fn adjust_tab(
     let bar = match kind {
         AdjustKind::ColorBalance => controls.balance_range,
         AdjustKind::ChannelMixer => controls.mixer_output,
-        AdjustKind::SelectiveColor => controls.selective_range,
+        AdjustKind::SelectiveColor => {
+            // Group 0 holds the six colour ranges (the second bar picks
+            // one); groups 1 to 3 are Whites, Neutrals and Blacks.
+            let group = widgets::tab_bar_state(tree, controls.selective_group)
+                .map_or(0, aurora_widgets::widgets::TabBarState::selected);
+            if group > 0 {
+                return 5 + group;
+            }
+            controls.selective_range
+        }
         _ => return 0,
     };
     widgets::tab_bar_state(tree, bar).map_or(0, aurora_widgets::widgets::TabBarState::selected)
@@ -1382,9 +1429,30 @@ pub fn sync_adjust_controls(
             Some(WidgetKind::Slider(state)) => slider.snap(state.value),
             _ => value,
         };
-        changed |= widgets::set_label_text(tree, readout, &slider.readout(shown_value))?;
+        let text = readout_for(slider, shown_value, adjustment, range);
+        changed |= widgets::set_label_text(tree, readout, &text)?;
     }
     Ok(changed)
+}
+
+/// The readout text of `slider` at `value`: the slider's own for most; for
+/// Channel Mixer and Selective Color it names the output or range the
+/// selector holds ("Green output, Red: +50", "Blues, Cyan: -20"), because
+/// those selectors' tabs are short.
+fn readout_for(slider: AdjustSlider, value: f64, adjustment: &Adjustment, tab: usize) -> String {
+    let plain = slider.readout(value);
+    let scope = match (slider.kind(), adjustment.channel_mixer()) {
+        (AdjustKind::ChannelMixer, Some(p)) if p.monochrome() => Some("Gray".to_owned()),
+        (AdjustKind::ChannelMixer, _) => CHANNEL_MIXER_OUTPUTS
+            .get(tab)
+            .map(|name| format!("{name} output")),
+        (AdjustKind::SelectiveColor, _) => SELECTIVE_COLOR_RANGES.get(tab).map(|n| (*n).to_owned()),
+        _ => None,
+    };
+    match scope {
+        Some(scope) => format!("{scope}, {plain}"),
+        None => plain,
+    }
 }
 
 /// Whether `id` is (or lies inside) the editors' column.

@@ -148,6 +148,7 @@ pub(crate) fn is_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerO
         PointerOutcome::Action(Outcome::TabSelected { bar, .. }) => {
             *bar == adjust.balance_range
                 || *bar == adjust.mixer_output
+                || *bar == adjust.selective_group
                 || *bar == adjust.selective_range
         }
         _ => false,
