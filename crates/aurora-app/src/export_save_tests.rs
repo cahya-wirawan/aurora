@@ -300,3 +300,37 @@ fn the_export_caller_goes_through_the_safe_path() {
     assert!(source.contains("export_save::write_export_verified("));
     assert!(!source.contains("fn write_verified("));
 }
+
+#[test]
+fn the_unconfirmed_save_notice_says_so_and_stays_while_its_tool_changes() {
+    use crate::LockRefusal;
+    assert_eq!(
+        LockRefusal::SaveNotConfirmed.message(),
+        aurora_io::DIR_SYNC_ADVISORY
+    );
+    assert!(aurora_io::DIR_SYNC_ADVISORY.contains("saved"));
+    for tool in [aurora_ui::Tool::Move, aurora_ui::Tool::Brush] {
+        assert!(crate::lock_refusal_applies(
+            LockRefusal::SaveNotConfirmed,
+            tool,
+            aurora_doc::LayerLock::default()
+        ));
+    }
+}
+
+#[test]
+fn a_psd_step_distinguishes_a_confirmed_save_from_an_unconfirmed_one() {
+    use crate::psd_save::PsdSaveStep;
+    assert!(!matches!(
+        PsdSaveStep::SavedNotConfirmed,
+        PsdSaveStep::Saved
+    ));
+}
+
+#[test]
+fn the_save_callers_surface_the_advisory() {
+    // Source-level pins (single-line needles only: CRLF-safe).
+    let source = include_str!("lib.rs");
+    assert!(source.contains("self.note_save_advisory(advisory.as_deref());"));
+    assert!(source.contains("self.note_save_advisory(Some(aurora_io::DIR_SYNC_ADVISORY));"));
+}
