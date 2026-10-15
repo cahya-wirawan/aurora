@@ -107,6 +107,18 @@ pub enum Adjustment {
     /// Color Balance (0.240.0, [`aurora_core::ColorBalanceParams`]),
     /// applied by `aurora_filters::ColorBalanceOp`. **Ordinal 8.**
     ColorBalance(aurora_core::ColorBalanceParams),
+    /// Invert (0.244.0), applied by `aurora_filters::InvertOp`; it has no
+    /// settings. **Ordinal 9.**
+    Invert,
+    /// Threshold (0.244.0, [`aurora_core::ThresholdParams`]), applied by
+    /// `aurora_filters::ThresholdOp`. **Ordinal 10.**
+    Threshold(aurora_core::ThresholdParams),
+    /// Posterize (0.244.0, [`aurora_core::PosterizeParams`]), applied by
+    /// `aurora_filters::PosterizeOp`. **Ordinal 11.**
+    Posterize(aurora_core::PosterizeParams),
+    /// Brightness/Contrast (0.244.0, [`aurora_core::BrightnessContrastParams`]),
+    /// applied by `aurora_filters::BrightnessContrastOp`. **Ordinal 12.**
+    BrightnessContrast(aurora_core::BrightnessContrastParams),
 }
 
 impl Adjustment {
@@ -122,6 +134,37 @@ impl Adjustment {
             Self::PhotoFilter(_) => "Photo Filter",
             Self::BlackWhite(_) => "Black & White",
             Self::ColorBalance(_) => "Color Balance",
+            Self::Invert => "Invert",
+            Self::Threshold(_) => "Threshold",
+            Self::Posterize(_) => "Posterize",
+            Self::BrightnessContrast(_) => "Brightness/Contrast",
+        }
+    }
+
+    /// The Threshold settings, `None` for other adjustments.
+    #[must_use]
+    pub const fn threshold(&self) -> Option<aurora_core::ThresholdParams> {
+        match self {
+            Self::Threshold(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    /// The Posterize settings, `None` for other adjustments.
+    #[must_use]
+    pub const fn posterize(&self) -> Option<aurora_core::PosterizeParams> {
+        match self {
+            Self::Posterize(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    /// The Brightness/Contrast settings, `None` for other adjustments.
+    #[must_use]
+    pub const fn brightness_contrast(&self) -> Option<aurora_core::BrightnessContrastParams> {
+        match self {
+            Self::BrightnessContrast(p) => Some(*p),
+            _ => None,
         }
     }
 
@@ -1375,5 +1418,198 @@ mod black_white_color_balance_wire_tests {
         assert!(c.color_balance().is_some() && c.black_white().is_none());
         let v = Adjustment::Vibrance(aurora_core::VibranceParams::identity());
         assert!(v.black_white().is_none() && v.color_balance().is_none());
+    }
+}
+
+/// `Adjustment::{Invert, Threshold, Posterize, BrightnessContrast}` are
+/// appended after `ColorBalance` (ordinals 9 to 12): every earlier encoding,
+/// ordinals 0 to 8, is unchanged and a 0.243.0 build refuses the new layers
+/// (0.244.0, ADR 0009).
+#[cfg(test)]
+mod invert_threshold_posterize_brightness_wire_tests {
+    use super::{Adjustment, LayerKind};
+
+    /// `Adjustment` exactly as a 0.243.0 build declares it.
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Adjustment243 {
+        Curves(aurora_core::CurvesParams),
+        Levels(aurora_core::LevelsParams),
+        HueSaturation(aurora_core::HueSaturationParams),
+        HueSaturationRanges(aurora_core::HueSaturationRangesParams),
+        Vibrance(aurora_core::VibranceParams),
+        Exposure(aurora_core::ExposureParams),
+        PhotoFilter(aurora_core::PhotoFilterParams),
+        BlackWhite(aurora_core::BlackWhiteParams),
+        ColorBalance(aurora_core::ColorBalanceParams),
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Kind243 {
+        Pixel { bounds: aurora_core::Rect },
+        Group { children: Vec<super::LayerId> },
+        Adjustment(Adjustment243),
+    }
+
+    fn encode<T: serde::Serialize>(value: &T) -> Vec<u8> {
+        match postcard::to_allocvec(value) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn ranged() -> aurora_core::HueSaturationRangesParams {
+        let plain = aurora_core::HueSaturationRangesParams::plain(
+            aurora_core::HueSaturationParams::identity(),
+        );
+        match plain.with_range(
+            2,
+            match aurora_core::HueRange::new([75.0, 105.0, 135.0, 165.0], 11.0, -22.0, 33.0) {
+                Ok(range) => range,
+                Err(err) => unreachable!("{err:?}"),
+            },
+        ) {
+            Some(ranged) => ranged,
+            None => unreachable!("range 2 exists"),
+        }
+    }
+
+    fn threshold() -> aurora_core::ThresholdParams {
+        match aurora_core::ThresholdParams::new(172) {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn posterize() -> aurora_core::PosterizeParams {
+        match aurora_core::PosterizeParams::new(13) {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn brightness_contrast() -> aurora_core::BrightnessContrastParams {
+        match aurora_core::BrightnessContrastParams::new(-95, -50, false) {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn ordinals_zero_to_eight_keep_their_bytes() {
+        let pairs = [
+            (
+                Adjustment::Curves(aurora_core::CurvesParams::identity()),
+                Adjustment243::Curves(aurora_core::CurvesParams::identity()),
+            ),
+            (
+                Adjustment::Levels(aurora_core::LevelsParams::identity()),
+                Adjustment243::Levels(aurora_core::LevelsParams::identity()),
+            ),
+            (
+                Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
+                Adjustment243::HueSaturation(aurora_core::HueSaturationParams::identity()),
+            ),
+            (
+                Adjustment::HueSaturationRanges(ranged()),
+                Adjustment243::HueSaturationRanges(ranged()),
+            ),
+            (
+                Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
+                Adjustment243::Vibrance(aurora_core::VibranceParams::identity()),
+            ),
+            (
+                Adjustment::Exposure(aurora_core::ExposureParams::identity()),
+                Adjustment243::Exposure(aurora_core::ExposureParams::identity()),
+            ),
+            (
+                Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+                Adjustment243::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+            ),
+            (
+                Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
+                Adjustment243::BlackWhite(aurora_core::BlackWhiteParams::default()),
+            ),
+            (
+                Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+                Adjustment243::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+            ),
+        ];
+        for (index, (new, old)) in pairs.into_iter().enumerate() {
+            let new_bytes = encode(&LayerKind::Adjustment(new));
+            let old_bytes = encode(&Kind243::Adjustment(old));
+            assert_eq!(new_bytes, old_bytes, "ordinal {index}");
+            assert_eq!(new_bytes.get(1).copied().map(usize::from), Some(index));
+            assert!(postcard::from_bytes::<Kind243>(&new_bytes).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_new_adjustments_are_ordinals_nine_to_twelve_and_an_old_reader_refuses_them() {
+        let cases = [
+            (Adjustment::Invert, 9_u8, vec![2_u8, 9]),
+            (Adjustment::Threshold(threshold()), 10, vec![2, 10, 172]),
+            (Adjustment::Posterize(posterize()), 11, vec![2, 11, 13]),
+            (
+                Adjustment::BrightnessContrast(brightness_contrast()),
+                12,
+                vec![2, 12, 189, 1, 99, 0],
+            ),
+        ];
+        for (adjustment, ordinal, bytes_want) in cases {
+            let kind = LayerKind::Adjustment(adjustment);
+            let bytes = encode(&kind);
+            assert_eq!(bytes.get(..2), Some([2_u8, ordinal].as_slice()), "{kind:?}");
+            // The payload bytes are pinned: a u8, a u8, or zig-zag varints.
+            assert_eq!(bytes, bytes_want, "{kind:?}");
+            match postcard::from_bytes::<LayerKind>(&bytes) {
+                Ok(decoded) => assert_eq!(decoded, kind),
+                Err(err) => unreachable!("{err:?}"),
+            }
+            assert!(
+                postcard::from_bytes::<Kind243>(&bytes).is_err(),
+                "a 0.243.0 build refuses ordinal {ordinal}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_payload_is_a_decode_error_not_a_repair() {
+        for bytes in [
+            vec![2_u8, 10, 0],
+            vec![2, 11, 0],
+            vec![2, 11, 1],
+            // Brightness 151 (zig-zag 302 = 0xAE 0x02), contrast 0, default mode.
+            vec![2, 12, 0xAE, 0x02, 0, 0],
+        ] {
+            assert!(
+                postcard::from_bytes::<LayerKind>(&bytes).is_err(),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn labels_and_accessors_name_the_right_variant() {
+        let all = [
+            (Adjustment::Invert, "Invert"),
+            (Adjustment::Threshold(threshold()), "Threshold"),
+            (Adjustment::Posterize(posterize()), "Posterize"),
+            (
+                Adjustment::BrightnessContrast(brightness_contrast()),
+                "Brightness/Contrast",
+            ),
+        ];
+        for (a, label) in &all {
+            assert_eq!(a.label(), *label);
+        }
+        let [(i, _), (t, _), (p, _), (b, _)] = all;
+        assert!(
+            t.threshold().is_some() && t.posterize().is_none() && t.brightness_contrast().is_none()
+        );
+        assert!(p.posterize().is_some() && p.threshold().is_none());
+        assert!(b.brightness_contrast().is_some() && b.threshold().is_none());
+        assert!(
+            i.threshold().is_none() && i.posterize().is_none() && i.brightness_contrast().is_none()
+        );
     }
 }

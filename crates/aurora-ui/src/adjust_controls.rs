@@ -4,6 +4,11 @@
 //! checkboxes and the Color Balance range selector), of which at most one
 //! is shown, the one matching the active layer.
 //!
+//! 0.244.0 adds four more groups: Invert (a note, no sliders), Threshold
+//! (one level slider), Posterize (one levels slider) and Brightness/Contrast
+//! (two sliders and a Use Legacy checkbox; the sliders span both modes and
+//! an edit is clamped to the layer's mode).
+//!
 //! **Where it lives.** Inside the Properties panel's tool-controls strip
 //! beside the Hue/Saturation editor ([`crate::insert_tool_controls`]), so
 //! every pointer, key and accessibility event on it reaches `aurora-app`
@@ -34,9 +39,11 @@
 #![allow(clippy::large_types_passed_by_value)]
 
 use aurora_core::{
-    BLACK_WHITE_DEFAULTS, BLACK_WHITE_MAX, BLACK_WHITE_MIN, BlackWhiteParams, COLOR_BALANCE_MAX,
-    COLOR_BALANCE_RANGES, DEFAULT_TINT_HUE, DEFAULT_TINT_SATURATION, EXPOSURE_MAX, ExposureParams,
-    GAMMA_MAX, GAMMA_MIN, OFFSET_MAX, PhotoFilterParams, VibranceParams,
+    BLACK_WHITE_DEFAULTS, BLACK_WHITE_MAX, BLACK_WHITE_MIN, BRIGHTNESS_MAX, BlackWhiteParams,
+    BrightnessContrastParams, COLOR_BALANCE_MAX, COLOR_BALANCE_RANGES, CONTRAST_MAX,
+    DEFAULT_TINT_HUE, DEFAULT_TINT_SATURATION, EXPOSURE_MAX, ExposureParams, GAMMA_MAX, GAMMA_MIN,
+    LEGACY_MAX, OFFSET_MAX, POSTERIZE_DEFAULT, POSTERIZE_MAX, POSTERIZE_MIN, PhotoFilterParams,
+    THRESHOLD_DEFAULT, THRESHOLD_MAX, THRESHOLD_MIN, VibranceParams,
 };
 use aurora_doc::{Adjustment, LayerId, LayerTree};
 use aurora_theme::Scales;
@@ -46,9 +53,9 @@ use taffy::style_helpers::length;
 use taffy::{Display, FlexDirection, Size, Style};
 
 /// How many sliders the editors hold.
-pub const ADJUST_SLIDER_COUNT: usize = 20;
+pub const ADJUST_SLIDER_COUNT: usize = 24;
 /// How many editor groups there are.
-pub const ADJUST_KIND_COUNT: usize = 5;
+pub const ADJUST_KIND_COUNT: usize = 9;
 
 /// Which of the adjustments an editor group belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,6 +65,14 @@ pub enum AdjustKind {
     PhotoFilter,
     BlackWhite,
     ColorBalance,
+    /// Invert (0.244.0): no settings, a note instead of sliders.
+    Invert,
+    /// Threshold (0.244.0): one level slider.
+    Threshold,
+    /// Posterize (0.244.0): one levels slider.
+    Posterize,
+    /// Brightness/Contrast (0.244.0): two sliders and Use Legacy.
+    BrightnessContrast,
 }
 
 impl AdjustKind {
@@ -68,6 +83,10 @@ impl AdjustKind {
         Self::PhotoFilter,
         Self::BlackWhite,
         Self::ColorBalance,
+        Self::Invert,
+        Self::Threshold,
+        Self::Posterize,
+        Self::BrightnessContrast,
     ];
 
     /// Position in [`Self::ALL`].
@@ -79,6 +98,10 @@ impl AdjustKind {
             Self::PhotoFilter => 2,
             Self::BlackWhite => 3,
             Self::ColorBalance => 4,
+            Self::Invert => 5,
+            Self::Threshold => 6,
+            Self::Posterize => 7,
+            Self::BrightnessContrast => 8,
         }
     }
 
@@ -91,12 +114,16 @@ impl AdjustKind {
             Adjustment::PhotoFilter(_) => Some(Self::PhotoFilter),
             Adjustment::BlackWhite(_) => Some(Self::BlackWhite),
             Adjustment::ColorBalance(_) => Some(Self::ColorBalance),
+            Adjustment::Invert => Some(Self::Invert),
+            Adjustment::Threshold(_) => Some(Self::Threshold),
+            Adjustment::Posterize(_) => Some(Self::Posterize),
+            Adjustment::BrightnessContrast(_) => Some(Self::BrightnessContrast),
             _ => None,
         }
     }
 }
 
-/// One of the twenty sliders.
+/// One of the twenty-four sliders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdjustSlider {
     /// Vibrance, `-100..=100`.
@@ -134,6 +161,17 @@ pub enum AdjustSlider {
     BalanceMagentaGreen,
     /// Its yellow-blue slider.
     BalanceYellowBlue,
+    /// Threshold's level, `1..=255`.
+    ThresholdLevel,
+    /// Posterize's level count, `2..=255`.
+    PosterizeLevels,
+    /// Brightness/Contrast's brightness. [`Self::range`] is the widest
+    /// (`-150..=150`); [`sync_adjust_controls`] narrows the built slider to
+    /// the layer's mode (`-100..=100` with Use Legacy).
+    Brightness,
+    /// Its contrast. [`Self::range`] is the widest (`-100..=100`); the built
+    /// slider follows the mode (`-50..=100` in the default mode).
+    Contrast,
 }
 
 impl AdjustSlider {
@@ -159,6 +197,10 @@ impl AdjustSlider {
         Self::BalanceCyanRed,
         Self::BalanceMagentaGreen,
         Self::BalanceYellowBlue,
+        Self::ThresholdLevel,
+        Self::PosterizeLevels,
+        Self::Brightness,
+        Self::Contrast,
     ];
 
     /// Position in [`Self::ALL`].
@@ -185,6 +227,10 @@ impl AdjustSlider {
             Self::BalanceCyanRed => 17,
             Self::BalanceMagentaGreen => 18,
             Self::BalanceYellowBlue => 19,
+            Self::ThresholdLevel => 20,
+            Self::PosterizeLevels => 21,
+            Self::Brightness => 22,
+            Self::Contrast => 23,
         }
     }
 
@@ -206,6 +252,9 @@ impl AdjustSlider {
             Self::BalanceCyanRed | Self::BalanceMagentaGreen | Self::BalanceYellowBlue => {
                 AdjustKind::ColorBalance
             }
+            Self::ThresholdLevel => AdjustKind::Threshold,
+            Self::PosterizeLevels => AdjustKind::Posterize,
+            Self::Brightness | Self::Contrast => AdjustKind::BrightnessContrast,
         }
     }
 
@@ -267,6 +316,10 @@ impl AdjustSlider {
             Self::BalanceCyanRed => "Color balance cyan to red",
             Self::BalanceMagentaGreen => "Color balance magenta to green",
             Self::BalanceYellowBlue => "Color balance yellow to blue",
+            Self::ThresholdLevel => "Threshold level",
+            Self::PosterizeLevels => "Posterize levels",
+            Self::Brightness => "Brightness",
+            Self::Contrast => "Contrast",
         }
     }
 
@@ -294,6 +347,10 @@ impl AdjustSlider {
             Self::BalanceCyanRed => "Cyan-Red",
             Self::BalanceMagentaGreen => "Magenta-Green",
             Self::BalanceYellowBlue => "Yellow-Blue",
+            Self::ThresholdLevel => "Threshold Level",
+            Self::PosterizeLevels => "Levels",
+            Self::Brightness => "Brightness",
+            Self::Contrast => "Contrast",
         }
     }
 
@@ -318,6 +375,10 @@ impl AdjustSlider {
             Self::BalanceCyanRed | Self::BalanceMagentaGreen | Self::BalanceYellowBlue => {
                 (-(COLOR_BALANCE_MAX as f64), COLOR_BALANCE_MAX as f64)
             }
+            Self::ThresholdLevel => (THRESHOLD_MIN as f64, THRESHOLD_MAX as f64),
+            Self::PosterizeLevels => (POSTERIZE_MIN as f64, POSTERIZE_MAX as f64),
+            Self::Brightness => (-(BRIGHTNESS_MAX as f64), BRIGHTNESS_MAX as f64),
+            Self::Contrast => (-(LEGACY_MAX as f64), CONTRAST_MAX as f64),
         }
     }
 
@@ -340,6 +401,8 @@ impl AdjustSlider {
             Self::Density => f64::from(aurora_core::DEFAULT_DENSITY),
             Self::TintHue => f64::from(DEFAULT_TINT_HUE),
             Self::TintSaturation => f64::from(DEFAULT_TINT_SATURATION),
+            Self::ThresholdLevel => f64::from(THRESHOLD_DEFAULT),
+            Self::PosterizeLevels => f64::from(POSTERIZE_DEFAULT),
             other => other
                 .bw_slot()
                 .and_then(|slot| BLACK_WHITE_DEFAULTS.get(slot))
@@ -352,7 +415,9 @@ impl AdjustSlider {
     #[must_use]
     pub fn readout(self, value: f64) -> String {
         let places = self.decimals();
-        if self == Self::Exposure || self.balance_slot().is_some() {
+        if matches!(self, Self::Exposure | Self::Brightness | Self::Contrast)
+            || self.balance_slot().is_some()
+        {
             format!("{}: {value:+.places$}", self.short_label())
         } else {
             format!("{}: {value:.places$}", self.short_label())
@@ -398,6 +463,14 @@ impl AdjustSlider {
                 let sliders = adjustment.color_balance()?.range(range)?;
                 sliders.get(self.balance_slot()?).copied().map(f64::from)
             }
+            Self::ThresholdLevel => adjustment.threshold().map(|p| f64::from(p.level())),
+            Self::PosterizeLevels => adjustment.posterize().map(|p| f64::from(p.levels())),
+            Self::Brightness => adjustment
+                .brightness_contrast()
+                .map(|p| f64::from(p.brightness())),
+            Self::Contrast => adjustment
+                .brightness_contrast()
+                .map(|p| f64::from(p.contrast())),
         }
     }
 
@@ -485,6 +558,36 @@ impl AdjustSlider {
                     .ok()
                     .map(Adjustment::ColorBalance)
             }
+            Self::ThresholdLevel => {
+                // `snap` clamped `v` into 1..=255.
+                #[allow(clippy::cast_sign_loss)]
+                let level = v as u8;
+                adjustment.threshold()?;
+                aurora_core::ThresholdParams::new(level)
+                    .ok()
+                    .map(Adjustment::Threshold)
+            }
+            Self::PosterizeLevels => {
+                #[allow(clippy::cast_sign_loss)]
+                let levels = v as u8;
+                adjustment.posterize()?;
+                aurora_core::PosterizeParams::new(levels)
+                    .ok()
+                    .map(Adjustment::Posterize)
+            }
+            Self::Brightness | Self::Contrast => {
+                let p = adjustment.brightness_contrast()?;
+                // The slider spans both modes; an edit stays in the mode's range.
+                let ((b0, b1), (c0, c1)) = BrightnessContrastParams::ranges(p.legacy());
+                let n = v as i16;
+                if self == Self::Brightness {
+                    p.with_brightness(n.clamp(b0, b1))
+                } else {
+                    p.with_contrast(n.clamp(c0, c1))
+                }
+                .ok()
+                .map(Adjustment::BrightnessContrast)
+            }
         }
     }
 }
@@ -521,6 +624,10 @@ pub struct AdjustControls {
     /// Color Balance's range selector tab bar: tab 0 Shadows, 1 Midtones,
     /// 2 Highlights.
     pub balance_range: WidgetId,
+    /// Brightness/Contrast's "Use Legacy" checkbox (0.244.0).
+    pub legacy: WidgetId,
+    /// The line Invert's group shows in place of sliders (0.244.0).
+    pub invert_note: WidgetId,
 }
 
 impl AdjustControls {
@@ -582,6 +689,13 @@ pub fn insert_adjust_controls(
         let mut tint = None;
         let mut balance_preserve = None;
         let mut balance_range = None;
+        let mut legacy = None;
+        let invert_note = widgets::insert_label(
+            tree,
+            group_of(AdjustKind::Invert)?,
+            scales,
+            "Invert has no settings.".to_owned(),
+        )?;
         for slider in AdjustSlider::ALL {
             let group = group_of(slider.kind())?;
             // Controls that sit before a slider in its group.
@@ -629,6 +743,9 @@ pub fn insert_adjust_controls(
                     "Preserve Luminosity",
                 )?);
             }
+            if slider == AdjustSlider::Contrast {
+                legacy = Some(widgets::insert_checkbox(tree, group, scales, "Use Legacy")?);
+            }
             if slider == AdjustSlider::BalanceYellowBlue {
                 balance_preserve = Some(widgets::insert_checkbox(
                     tree,
@@ -643,6 +760,7 @@ pub fn insert_adjust_controls(
             Some(tint),
             Some(balance_preserve),
             Some(balance_range),
+            Some(legacy),
             Ok(sliders),
             Ok(readouts),
             Ok(groups),
@@ -651,6 +769,7 @@ pub fn insert_adjust_controls(
             tint,
             balance_preserve,
             balance_range,
+            legacy,
             <[WidgetId; ADJUST_SLIDER_COUNT]>::try_from(sliders),
             <[WidgetId; ADJUST_SLIDER_COUNT]>::try_from(readouts),
             <[WidgetId; ADJUST_KIND_COUNT]>::try_from(groups),
@@ -667,6 +786,8 @@ pub fn insert_adjust_controls(
             tint,
             balance_preserve,
             balance_range,
+            legacy,
+            invert_note,
         };
         set_shown(tree, controls, None, false)?;
         Ok(controls)
@@ -770,6 +891,13 @@ fn set_shown(
         controls.balance_preserve,
         kind == Some(AdjustKind::ColorBalance),
     )?;
+    changed |= set_checkbox_live(
+        tree,
+        controls.legacy,
+        kind == Some(AdjustKind::BrightnessContrast),
+    )?;
+    changed |=
+        widgets::set_label_disabled(tree, controls.invert_note, kind != Some(AdjustKind::Invert))?;
     let tabs_live = kind == Some(AdjustKind::ColorBalance);
     if widgets::tab_bar_state(tree, controls.balance_range)?.is_disabled() == tabs_live {
         widgets::set_tab_bar_disabled(tree, controls.balance_range, !tabs_live)?;
@@ -826,6 +954,12 @@ pub fn adjust_balance_preserve_checked(
     controls: AdjustControls,
 ) -> bool {
     checkbox_checked(tree, controls.balance_preserve)
+}
+
+/// Whether Brightness/Contrast's Use Legacy checkbox is checked.
+#[must_use]
+pub fn adjust_legacy_checked(tree: &WidgetTree<WidgetKind>, controls: AdjustControls) -> bool {
+    checkbox_checked(tree, controls.legacy)
 }
 
 /// The Color Balance range the three sliders edit: `0` shadows, `1`
@@ -917,6 +1051,9 @@ pub fn sync_adjust_controls(
             balance.preserve_luminosity(),
         )?;
     }
+    if let Some(bc) = adjustment.brightness_contrast() {
+        changed |= sync_checkbox(tree, controls.legacy, bc.legacy())?;
+    }
     let range = adjust_balance_range(tree, controls);
     for slider in AdjustSlider::ALL
         .into_iter()
@@ -931,6 +1068,15 @@ pub fn sync_adjust_controls(
         let Some(value) = slider.value_of(adjustment, range) else {
             continue;
         };
+        // Brightness/Contrast: the slider's range follows the layer's mode.
+        if let Some(bc) = adjustment.brightness_contrast() {
+            let ((b_lo, b_hi), (c_lo, c_hi)) = BrightnessContrastParams::ranges(bc.legacy());
+            let (lo, hi) = match slider {
+                AdjustSlider::Brightness => (b_lo, b_hi),
+                _ => (c_lo, c_hi),
+            };
+            changed |= widgets::set_slider_range(tree, id, f64::from(lo), f64::from(hi))?;
+        }
         if captured != Some(id) {
             let shown = match tree.payload(id) {
                 Some(WidgetKind::Slider(state)) => state.value,
@@ -1115,6 +1261,9 @@ mod tests {
         let f = filter([1.0, 1.0, 1.0], 25.0, true);
         let bw = Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default());
         let cb = Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity());
+        let th = Adjustment::Threshold(aurora_core::ThresholdParams::default());
+        let po = Adjustment::Posterize(aurora_core::PosterizeParams::default());
+        let bc = Adjustment::BrightnessContrast(aurora_core::BrightnessContrastParams::identity());
         for s in S::ALL {
             let base = match s.kind() {
                 AdjustKind::Vibrance => &v,
@@ -1122,8 +1271,16 @@ mod tests {
                 AdjustKind::PhotoFilter => &f,
                 AdjustKind::BlackWhite => &bw,
                 AdjustKind::ColorBalance => &cb,
+                AdjustKind::Invert => continue,
+                AdjustKind::Threshold => &th,
+                AdjustKind::Posterize => &po,
+                AdjustKind::BrightnessContrast => &bc,
             };
-            let (min, max) = s.range();
+            let (mut min, max) = s.range();
+            if s == S::Contrast {
+                // The slider spans both modes; the default mode stops at -50.
+                min = f64::from(aurora_core::CONTRAST_MIN);
+            }
             let lo = s
                 .with_value(base, 0, min - 50.0)
                 .and_then(|a| s.value_of(&a, 0));
@@ -1491,5 +1648,176 @@ mod tests {
         for (i, k) in AdjustKind::ALL.into_iter().enumerate() {
             assert_eq!(k.index(), i);
         }
+    }
+
+    /// 0.244.0: the four new kinds' groups, sliders and snapping.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn threshold_posterize_brightness_contrast_and_invert_editors_follow_the_document() {
+        let scales = scales();
+        let mut ws = crate::build_workspace(&scales);
+        let controls = match insert_adjust_controls(&mut ws.tree, ws.properties.root, &scales) {
+            Ok(c) => c,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut layers = LayerTree::new();
+        let t = add(
+            &mut layers,
+            "T",
+            Adjustment::Threshold(match aurora_core::ThresholdParams::new(172) {
+                Ok(p) => p,
+                Err(err) => unreachable!("{err:?}"),
+            }),
+        );
+        let p = add(
+            &mut layers,
+            "P",
+            Adjustment::Posterize(match aurora_core::PosterizeParams::new(13) {
+                Ok(p) => p,
+                Err(err) => unreachable!("{err:?}"),
+            }),
+        );
+        let b = add(
+            &mut layers,
+            "B",
+            Adjustment::BrightnessContrast(
+                match aurora_core::BrightnessContrastParams::new(-95, -50, false) {
+                    Ok(p) => p,
+                    Err(err) => unreachable!("{err:?}"),
+                },
+            ),
+        );
+        let i = add(&mut layers, "I", Adjustment::Invert);
+        let at = |ws: &crate::Workspace, s: S| slider_state(&ws.tree, controls.sliders[s.index()]);
+        let _ = show(&mut ws, controls, &layers, Some(t));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::Threshold)
+        );
+        assert_eq!(at(&ws, S::ThresholdLevel), (172.0, false));
+        assert!(at(&ws, S::PosterizeLevels).1 && at(&ws, S::Brightness).1);
+        let _ = show(&mut ws, controls, &layers, Some(p));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::Posterize)
+        );
+        assert_eq!(at(&ws, S::PosterizeLevels), (13.0, false));
+        assert!(at(&ws, S::ThresholdLevel).1);
+        let _ = show(&mut ws, controls, &layers, Some(b));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::BrightnessContrast)
+        );
+        assert_eq!(at(&ws, S::Brightness), (-95.0, false));
+        assert_eq!(at(&ws, S::Contrast), (-50.0, false));
+        assert!(!crate::adjust_legacy_checked(&ws.tree, controls));
+        match ws.tree.payload(controls.readouts[S::Brightness.index()]) {
+            Some(WidgetKind::Label(label)) => assert_eq!(label.text, "Brightness: -95"),
+            other => unreachable!("{other:?}"),
+        }
+        let _ = show(&mut ws, controls, &layers, Some(i));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::Invert)
+        );
+        assert!(at(&ws, S::Brightness).1 && at(&ws, S::ThresholdLevel).1);
+        // `with_value` snaps, clamps to the slider and to the mode's range.
+        let adj = |id| layers.adjustment(id).cloned().unwrap_or(Adjustment::Invert);
+        assert_eq!(
+            S::ThresholdLevel
+                .with_value(&adj(t), 0, 300.0)
+                .and_then(|a| a.threshold())
+                .map(|p| p.level()),
+            Some(255)
+        );
+        assert_eq!(
+            S::ThresholdLevel
+                .with_value(&adj(t), 0, -4.0)
+                .and_then(|a| a.threshold())
+                .map(|p| p.level()),
+            Some(1)
+        );
+        assert_eq!(
+            S::PosterizeLevels
+                .with_value(&adj(p), 0, 0.4)
+                .and_then(|a| a.posterize())
+                .map(|p| p.levels()),
+            Some(2)
+        );
+        assert!(
+            S::ThresholdLevel.with_value(&adj(p), 0, 5.0).is_none(),
+            "another kind"
+        );
+        assert!(S::Contrast.with_value(&adj(b), 0, f64::NAN).is_none());
+        let legacy = Adjustment::BrightnessContrast(
+            match aurora_core::BrightnessContrastParams::new(0, 0, true) {
+                Ok(p) => p,
+                Err(err) => unreachable!("{err:?}"),
+            },
+        );
+        let got = |slider: S, value| {
+            slider
+                .with_value(&legacy, 0, value)
+                .and_then(|a| a.brightness_contrast())
+                .map(|p| (p.brightness(), p.contrast()))
+        };
+        assert_eq!(got(S::Brightness, 150.0), Some((100, 0)));
+        assert_eq!(got(S::Contrast, -100.0), Some((0, -100)));
+        let default =
+            Adjustment::BrightnessContrast(aurora_core::BrightnessContrastParams::identity());
+        assert_eq!(
+            S::Contrast
+                .with_value(&default, 0, -100.0)
+                .and_then(|a| a.brightness_contrast())
+                .map(|p| p.contrast()),
+            Some(-50)
+        );
+    }
+
+    /// 0.244.0: the Brightness and Contrast sliders' ranges follow the
+    /// layer's mode when synced, and an out-of-range displayed value is
+    /// clamped into the new range.
+    #[test]
+    fn the_brightness_contrast_slider_ranges_follow_the_layers_mode() {
+        let scales = scales();
+        let mut ws = crate::build_workspace(&scales);
+        let controls = match insert_adjust_controls(&mut ws.tree, ws.properties.root, &scales) {
+            Ok(c) => c,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let bc = |b, c, legacy| match aurora_core::BrightnessContrastParams::new(b, c, legacy) {
+            Ok(p) => Adjustment::BrightnessContrast(p),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut layers = LayerTree::new();
+        let default = add(&mut layers, "D", bc(140, -50, false));
+        let legacy = add(&mut layers, "L", bc(90, -90, true));
+        let range_of =
+            |ws: &crate::Workspace, s: S| match ws.tree.payload(controls.sliders[s.index()]) {
+                Some(WidgetKind::Slider(state)) => (state.min, state.max, state.value),
+                other => unreachable!("{other:?}"),
+            };
+        let _ = show(&mut ws, controls, &layers, Some(default));
+        assert_eq!(range_of(&ws, S::Brightness), (-150.0, 150.0, 140.0));
+        assert_eq!(range_of(&ws, S::Contrast), (-50.0, 100.0, -50.0));
+        let _ = show(&mut ws, controls, &layers, Some(legacy));
+        assert_eq!(range_of(&ws, S::Brightness), (-100.0, 100.0, 90.0));
+        assert_eq!(range_of(&ws, S::Contrast), (-100.0, 100.0, -90.0));
+        // Back to the default mode: the range narrows again.
+        let _ = show(&mut ws, controls, &layers, Some(default));
+        assert_eq!(range_of(&ws, S::Contrast).0, -50.0);
+        // Toggling Use Legacy on the document narrows brightness to +-100
+        // (the value was clamped by the edit, so the slider follows).
+        let toggled = match layers
+            .adjustment(default)
+            .and_then(Adjustment::brightness_contrast)
+        {
+            Some(p) => Adjustment::BrightnessContrast(p.with_legacy(true)),
+            None => unreachable!("a Brightness/Contrast layer"),
+        };
+        let _ = layers.set_adjustment(default, toggled);
+        let _ = show(&mut ws, controls, &layers, Some(default));
+        assert_eq!(range_of(&ws, S::Brightness), (-100.0, 100.0, 100.0));
+        assert_eq!(range_of(&ws, S::Contrast), (-100.0, 100.0, -50.0));
     }
 }

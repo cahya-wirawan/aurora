@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.244.0] - 2026-10-15
+
+### Changed
+
+- Invert, Threshold, Posterize and Brightness/Contrast adjustment layers
+
 ## [0.243.0] - 2026-10-15
 
 ### Changed

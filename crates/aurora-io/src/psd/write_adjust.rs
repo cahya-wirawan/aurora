@@ -95,6 +95,9 @@ pub(super) struct Rounding {
     pub colorize_ranges: bool,
 }
 
+/// A second tagged block of an adjustment record: key and data.
+pub(super) type ExtraBlock = ([u8; 4], Vec<u8>);
+
 /// One adjustment's tagged block, ready to write.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct EncodedAdjustment {
@@ -102,14 +105,17 @@ pub(super) struct EncodedAdjustment {
     pub key: [u8; 4],
     /// The block's data, zero-padded to a multiple of four.
     pub data: Vec<u8>,
-    /// What the reader makes of `data`.
+    /// A second block written after it (0.244.0): see
+    /// [`super::PsdExpectedAdjustment::extra`].
+    pub extra: Option<ExtraBlock>,
+    /// What the reader makes of the block (and its extra one).
     pub readback: Adjustment,
     pub rounding: Rounding,
 }
 
 /// Whether `key` is one of the eight blocks this module writes.
 pub(super) fn is_adjustment_key(key: [u8; 4]) -> bool {
-    matches!(&key, b"curv" | b"levl" | b"hue2") || read_adjust::is_key(key)
+    matches!(&key, b"curv" | b"levl" | b"hue2" | b"CgEd") || read_adjust::is_key(key)
 }
 
 fn pad4(data: &mut Vec<u8>) {
@@ -150,6 +156,7 @@ pub(super) fn encode_adjustment(
     adjustment: &Adjustment,
 ) -> Result<EncodedAdjustment, &'static str> {
     let mut rounding = Rounding::default();
+    let mut extra = None;
     let (key, mut data) = match adjustment {
         Adjustment::Curves(params) => (*b"curv", encode_curv(params, &mut rounding)?),
         Adjustment::Levels(params) => (*b"levl", encode_levl(params, &mut rounding)),
@@ -158,6 +165,14 @@ pub(super) fn encode_adjustment(
         Adjustment::PhotoFilter(params) => (*b"phfl", encode_photo_filter(params, &mut rounding)),
         Adjustment::BlackWhite(params) => (*b"blwh", encode_black_white(params, &mut rounding)),
         Adjustment::ColorBalance(params) => (*b"blnc", encode_color_balance(params, &mut rounding)),
+        Adjustment::Invert => (*b"nvrt", Vec::new()),
+        Adjustment::Threshold(params) => (*b"thrs", encode_level(u16::from(params.level()))),
+        Adjustment::Posterize(params) => (*b"post", encode_level(u16::from(params.levels()))),
+        Adjustment::BrightnessContrast(params) => {
+            let (brit, cged) = encode_brightness_contrast(*params);
+            extra = cged;
+            (*b"brit", brit)
+        }
         Adjustment::HueSaturation(_) | Adjustment::HueSaturationRanges(_) => {
             let Some(params) = adjustment.hue_saturation() else {
                 return Err("its Hue/Saturation settings are unreadable");
@@ -170,18 +185,32 @@ pub(super) fn encode_adjustment(
         }
     };
     pad4(&mut data);
-    let readback = read_back(key, &data)?;
+    if let Some((_, extra_data)) = &mut extra {
+        pad4(extra_data);
+    }
+    let readback = read_back(key, &data, extra.as_ref().map(|(_, d)| d.as_slice()))?;
     Ok(EncodedAdjustment {
         key,
         data,
+        extra,
         readback,
         rounding,
     })
 }
 
 /// The adjustment the reader makes of a block, or why it would refuse.
-fn read_back(key: [u8; 4], data: &[u8]) -> Result<Adjustment, &'static str> {
+fn read_back(key: [u8; 4], data: &[u8], extra: Option<&[u8]>) -> Result<Adjustment, &'static str> {
     match &key {
+        b"brit" => {
+            let Some(mut parsed) = read_adjust::parse_block(key, data) else {
+                return Err("its settings do not read back");
+            };
+            if let Some(extra) = extra {
+                read_adjust::attach_cged(&mut parsed, extra);
+            }
+            read_adjust::adjustment(&parsed, false)
+                .map_err(|_| "its values are not valid once written to the file")
+        }
         b"curv" => {
             let block = super::parse_curv(data).map_err(|_| "its curves do not read back")?;
             super::curves_params(&block, false)
@@ -556,6 +585,52 @@ fn encode_black_white(params: &aurora_core::BlackWhiteParams, rounding: &mut Rou
         rounding.rounded = true;
     }
     data
+}
+
+/// A `thrs` or `post` block: the level as a `u16` and two zero bytes
+/// (`00e80000` in `adjustments/threshold_rgb.psd`).
+fn encode_level(level: u16) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4);
+    push_u16(&mut data, level);
+    push_u16(&mut data, 0);
+    data
+}
+
+/// The `brit` block and, for the default mode, the `CgEd` descriptor.
+///
+/// Use Legacy: `brit` holds `i16` brightness, contrast, the mean 127, and two
+/// zero bytes (`0014 0039 007f 0000` in `brightnesscontrast_legacy_rgb.psd`).
+/// The default mode: `brit` is eight zero bytes and the settings live in a
+/// `CgEd` descriptor of seven items (`Vrsn` 1, `Brgh`, `Cntr`, `means` 127,
+/// `Lab ` false, `useLegacy` false, `Auto` false), byte for byte what
+/// `brightnesscontrast_rgb.psd` holds.
+fn encode_brightness_contrast(
+    params: aurora_core::BrightnessContrastParams,
+) -> (Vec<u8>, Option<ExtraBlock>) {
+    let mut brit = Vec::with_capacity(8);
+    if params.legacy() {
+        push_i16(&mut brit, params.brightness());
+        push_i16(&mut brit, params.contrast());
+        push_i16(&mut brit, i16::from(aurora_core::BRIGHTNESS_CONTRAST_MEAN));
+        brit.extend_from_slice(&[0, 0]);
+        return (brit, None);
+    }
+    brit.extend_from_slice(&[0; 8]);
+    let mut cged = descriptor_start(7);
+    push_long(&mut cged, b"Vrsn", 1);
+    push_long(&mut cged, b"Brgh", i32::from(params.brightness()));
+    push_long(&mut cged, b"Cntr", i32::from(params.contrast()));
+    push_long(
+        &mut cged,
+        b"means",
+        i32::from(aurora_core::BRIGHTNESS_CONTRAST_MEAN),
+    );
+    for key in [&b"Lab "[..], b"useLegacy", b"Auto"] {
+        push_key(&mut cged, key);
+        cged.extend_from_slice(b"bool");
+        cged.push(0);
+    }
+    (brit, Some((*b"CgEd", cged)))
 }
 
 fn encode_color_balance(

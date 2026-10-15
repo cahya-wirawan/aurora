@@ -7,6 +7,7 @@
 //! crate-specific (no pixel storage, no tile concept, no document model).
 
 pub mod black_white;
+pub mod brightness_contrast;
 pub mod color;
 pub mod color_balance;
 pub mod curves;
@@ -19,12 +20,18 @@ pub mod hue_saturation;
 pub mod id;
 pub mod levels;
 pub mod photo_filter;
+pub mod posterize;
+pub mod threshold;
 pub mod tone_curve;
 pub mod vibrance;
 
 pub use black_white::{
     BLACK_WHITE_DEFAULTS, BLACK_WHITE_MAX, BLACK_WHITE_MIN, BLACK_WHITE_NAMES, BlackWhiteError,
     BlackWhiteParams, DEFAULT_TINT_HUE, DEFAULT_TINT_SATURATION,
+};
+pub use brightness_contrast::{
+    BRIGHTNESS_CONTRAST_MEAN, BRIGHTNESS_MAX, BrightnessContrastError, BrightnessContrastParams,
+    CONTRAST_MAX, CONTRAST_MIN, LEGACY_MAX,
 };
 pub use color::{Channels, ColorSpace, PixelFormat, SampleFormat};
 pub use color_balance::{
@@ -44,6 +51,12 @@ pub use id::{Id, IdGenerator};
 pub use levels::{GAMMA_MAX, GAMMA_MIN, LevelsChannel, LevelsError, LevelsParams, MIN_INPUT_SPAN};
 pub use photo_filter::{
     DEFAULT_DENSITY, PHOTO_FILTER_PRESETS, PhotoFilterError, PhotoFilterParams,
+};
+pub use posterize::{
+    POSTERIZE_DEFAULT, POSTERIZE_MAX, POSTERIZE_MIN, PosterizeError, PosterizeParams,
+};
+pub use threshold::{
+    THRESHOLD_DEFAULT, THRESHOLD_MAX, THRESHOLD_MIN, ThresholdError, ThresholdParams,
 };
 pub use tone_curve::{
     CurvePoint, MAX_LUT_LEN, MAX_POINTS, MIN_POINT_SEPARATION, MIN_POINTS, ToneCurve,

@@ -6001,6 +6001,12 @@ enum ActivatedCommand {
     /// New Black & White / Color Balance Layer (0.240.0): the same.
     NewBlackWhiteLayer,
     NewColorBalanceLayer,
+    /// New Invert / Threshold / Posterize / Brightness/Contrast Layer
+    /// (0.244.0): the same.
+    NewInvertLayer,
+    NewThresholdLayer,
+    NewPosterizeLayer,
+    NewBrightnessContrastLayer,
     /// A Photo Filter preset colour (0.239.0, palette only): index into
     /// [`aurora_core::PHOTO_FILTER_PRESETS`].
     PhotoFilterPreset(usize),
@@ -6256,6 +6262,10 @@ const COMMAND_LAYER_NEW_EXPOSURE: &str = "layer.new_exposure";
 const COMMAND_LAYER_NEW_PHOTO_FILTER: &str = "layer.new_photo_filter";
 const COMMAND_LAYER_NEW_BLACK_WHITE: &str = "layer.new_black_white";
 const COMMAND_LAYER_NEW_COLOR_BALANCE: &str = "layer.new_color_balance";
+const COMMAND_LAYER_NEW_INVERT: &str = "layer.new_invert";
+const COMMAND_LAYER_NEW_THRESHOLD: &str = "layer.new_threshold";
+const COMMAND_LAYER_NEW_POSTERIZE: &str = "layer.new_posterize";
+const COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST: &str = "layer.new_brightness_contrast";
 const COMMAND_LAYER_NEW_GROUP: &str = "layer.new_group";
 const COMMAND_LAYER_CLIP_CREATE: &str = "layer.clip_create";
 const COMMAND_LAYER_CLIP_RELEASE: &str = "layer.clip_release";
@@ -6383,6 +6393,13 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_LAYER_NEW_PHOTO_FILTER, "New Photo Filter Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_BLACK_WHITE, "New Black & White Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_COLOR_BALANCE, "New Color Balance Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_INVERT, "New Invert Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_THRESHOLD, "New Threshold Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_POSTERIZE, "New Posterize Layer"),
+        CommandEntry::new(
+            COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST,
+            "New Brightness/Contrast Layer",
+        ),
         CommandEntry::new(COMMAND_LAYER_NEW_GROUP, "New Group"),
         CommandEntry::new(COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
         CommandEntry::new(COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),
@@ -6667,6 +6684,18 @@ fn activate_command(
     }
     if id == COMMAND_LAYER_NEW_COLOR_BALANCE {
         return Some(ActivatedCommand::NewColorBalanceLayer);
+    }
+    if id == COMMAND_LAYER_NEW_INVERT {
+        return Some(ActivatedCommand::NewInvertLayer);
+    }
+    if id == COMMAND_LAYER_NEW_THRESHOLD {
+        return Some(ActivatedCommand::NewThresholdLayer);
+    }
+    if id == COMMAND_LAYER_NEW_POSTERIZE {
+        return Some(ActivatedCommand::NewPosterizeLayer);
+    }
+    if id == COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST {
+        return Some(ActivatedCommand::NewBrightnessContrastLayer);
     }
     if let Some(index) = adjust_app::preset_for_command(id) {
         return Some(ActivatedCommand::PhotoFilterPreset(index));
@@ -10781,6 +10810,25 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(
                 COMMAND_LAYER_NEW_COLOR_BALANCE,
                 "New Color Balance Layer",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(COMMAND_LAYER_NEW_INVERT, "New Invert Layer", true, None),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_THRESHOLD,
+                "New Threshold Layer",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_POSTERIZE,
+                "New Posterize Layer",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST,
+                "New Brightness/Contrast Layer",
                 true,
                 None,
             ),
@@ -18372,6 +18420,57 @@ fn curves_lut(params: &aurora_core::CurvesParams) -> std::rc::Rc<aurora_filters:
     })
 }
 
+/// The adjustment kind a "New ... Layer" command of 0.244.0 creates.
+fn new_adjust_kind(command: &ActivatedCommand) -> Option<aurora_ui::AdjustKind> {
+    match command {
+        ActivatedCommand::NewInvertLayer => Some(aurora_ui::AdjustKind::Invert),
+        ActivatedCommand::NewThresholdLayer => Some(aurora_ui::AdjustKind::Threshold),
+        ActivatedCommand::NewPosterizeLayer => Some(aurora_ui::AdjustKind::Posterize),
+        ActivatedCommand::NewBrightnessContrastLayer => {
+            Some(aurora_ui::AdjustKind::BrightnessContrast)
+        }
+        _ => None,
+    }
+}
+
+/// How many distinct Brightness/Contrast parameter sets
+/// [`brightness_contrast_op`] keeps built per thread (0.244.0), the Curves
+/// cache's rule: the default mode builds a 16,385-sample table.
+const BRIGHTNESS_CONTRAST_CACHE_LEN: usize = 8;
+
+/// A thread's built Brightness/Contrast ops, keyed by their parameters.
+type BrightnessContrastCache = Vec<(
+    aurora_core::BrightnessContrastParams,
+    std::rc::Rc<aurora_filters::BrightnessContrastOp>,
+)>;
+
+thread_local! {
+    /// Built Brightness/Contrast ops, so a composite pass builds each set
+    /// once rather than once per tile.
+    static BRIGHTNESS_CONTRAST_OPS: std::cell::RefCell<BrightnessContrastCache> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `params`' op, from this thread's cache when built before.
+fn brightness_contrast_op(
+    params: aurora_core::BrightnessContrastParams,
+) -> std::rc::Rc<aurora_filters::BrightnessContrastOp> {
+    BRIGHTNESS_CONTRAST_OPS.with(|cache| {
+        let Ok(mut cache) = cache.try_borrow_mut() else {
+            return std::rc::Rc::new(aurora_filters::BrightnessContrastOp::new(&params));
+        };
+        if let Some((_, op)) = cache.iter().find(|(cached, _)| *cached == params) {
+            return std::rc::Rc::clone(op);
+        }
+        let op = std::rc::Rc::new(aurora_filters::BrightnessContrastOp::new(&params));
+        if cache.len() >= BRIGHTNESS_CONTRAST_CACHE_LEN {
+            cache.remove(0);
+        }
+        cache.push((params, std::rc::Rc::clone(&op)));
+        op
+    })
+}
+
 /// How many distinct Levels parameter sets [`levels_lut`] keeps built per
 /// thread (0.202.0), the Curves cache's rule.
 const LEVELS_LUT_CACHE_LEN: usize = 8;
@@ -18425,6 +18524,15 @@ enum AdjustmentLut {
     BlackWhite(aurora_filters::BlackWhiteOp),
     /// Color Balance (0.240.0): a per-pixel function.
     ColorBalance(aurora_filters::ColorBalanceOp),
+    /// Invert (0.244.0): a per-pixel function, CPU only.
+    Invert(aurora_filters::InvertOp),
+    /// Threshold (0.244.0): a per-pixel function, CPU only.
+    Threshold(aurora_filters::ThresholdOp),
+    /// Posterize (0.244.0): a per-channel function, CPU only.
+    Posterize(aurora_filters::PosterizeOp),
+    /// Brightness/Contrast (0.244.0): a line or a built 16,385-sample table
+    /// (cached per thread), CPU only.
+    BrightnessContrast(std::rc::Rc<aurora_filters::BrightnessContrastOp>),
 }
 
 impl AdjustmentLut {
@@ -18454,6 +18562,16 @@ impl AdjustmentLut {
             aurora_doc::Adjustment::ColorBalance(params) => {
                 Self::ColorBalance(aurora_filters::ColorBalanceOp::new(params))
             }
+            aurora_doc::Adjustment::Invert => Self::Invert(aurora_filters::InvertOp::new()),
+            aurora_doc::Adjustment::Threshold(params) => {
+                Self::Threshold(aurora_filters::ThresholdOp::new(params))
+            }
+            aurora_doc::Adjustment::Posterize(params) => {
+                Self::Posterize(aurora_filters::PosterizeOp::new(params))
+            }
+            aurora_doc::Adjustment::BrightnessContrast(params) => {
+                Self::BrightnessContrast(brightness_contrast_op(*params))
+            }
         }
     }
 
@@ -18468,6 +18586,10 @@ impl AdjustmentLut {
             Self::PhotoFilter(op) => op.is_identity(),
             Self::BlackWhite(op) => op.is_identity(),
             Self::ColorBalance(op) => op.is_identity(),
+            Self::Invert(op) => op.is_identity(),
+            Self::Threshold(op) => op.is_identity(),
+            Self::Posterize(op) => op.is_identity(),
+            Self::BrightnessContrast(op) => op.is_identity(),
         }
     }
 
@@ -18482,6 +18604,10 @@ impl AdjustmentLut {
             Self::PhotoFilter(op) => op.apply(rgb),
             Self::BlackWhite(op) => op.apply(rgb),
             Self::ColorBalance(op) => op.apply(rgb),
+            Self::Invert(op) => op.apply(rgb),
+            Self::Threshold(op) => op.apply(rgb),
+            Self::Posterize(op) => op.apply(rgb),
+            Self::BrightnessContrast(op) => op.apply(rgb),
         }
     }
 }
@@ -20588,7 +20714,16 @@ fn adjustment_layer_qualifies_for_gpu(
         // Color Balance (0.240.0) are per-pixel functions with a GPU pass each
         // since 0.242.0 (`composite_vibrance_with_opacity` and its four
         // siblings), admitted above; neutral or not, they qualify like Levels.
-        None => false,
+        // Invert, Threshold, Posterize and Brightness/Contrast (0.244.0) are
+        // CPU only: a visible layer of these kinds refuses the GPU path
+        // until a later task ports them.
+        Some(
+            aurora_doc::Adjustment::Invert
+            | aurora_doc::Adjustment::Threshold(_)
+            | aurora_doc::Adjustment::Posterize(_)
+            | aurora_doc::Adjustment::BrightnessContrast(_),
+        )
+        | None => false,
     };
     expressible
         && !layers.mask(id).is_some_and(|mask| mask.enabled)
@@ -21045,7 +21180,16 @@ fn begin_gpu_adjustment_pass(
         // Curves with its own table set is the first arm; a Curves
         // adjustment paired with another table kind cannot occur
         // (`AdjustmentLut::of` builds the pair from the same value).
-        (_, AdjustmentLut::Curves(_)) => return false,
+        // CPU only (0.244.0): the Invert, Threshold, Posterize and
+        // Brightness/Contrast layers.
+        (
+            _,
+            AdjustmentLut::Curves(_)
+            | AdjustmentLut::Invert(_)
+            | AdjustmentLut::Threshold(_)
+            | AdjustmentLut::Posterize(_)
+            | AdjustmentLut::BrightnessContrast(_),
+        ) => return false,
     }
     std::mem::swap(current_accumulator, spare_accumulator);
     true
@@ -21137,7 +21281,15 @@ fn record_photographer_adjustment_pass(
             }
             note_gpu_color_balance_dispatch();
         }
-        AdjustmentLut::Curves(_) | AdjustmentLut::Levels(_) | AdjustmentLut::HueSaturation(_) => {
+        AdjustmentLut::Curves(_)
+        | AdjustmentLut::Levels(_)
+        | AdjustmentLut::HueSaturation(_)
+        // CPU only (0.244.0); `adjustment_layer_qualifies_for_gpu` refuses
+        // these before a pass is ever recorded.
+        | AdjustmentLut::Invert(_)
+        | AdjustmentLut::Threshold(_)
+        | AdjustmentLut::Posterize(_)
+        | AdjustmentLut::BrightnessContrast(_) => {
             return false;
         }
     }
@@ -30082,6 +30234,16 @@ impl App {
                 self.run_layer_command(LayerCommand::NewAdjust(
                     aurora_ui::AdjustKind::ColorBalance,
                 ));
+            }
+            Some(
+                command @ (ActivatedCommand::NewInvertLayer
+                | ActivatedCommand::NewThresholdLayer
+                | ActivatedCommand::NewPosterizeLayer
+                | ActivatedCommand::NewBrightnessContrastLayer),
+            ) => {
+                if let Some(kind) = new_adjust_kind(&command) {
+                    self.run_layer_command(LayerCommand::NewAdjust(kind));
+                }
             }
             Some(ActivatedCommand::PhotoFilterPreset(index)) => {
                 self.apply_photo_filter_preset(index);
@@ -41430,7 +41592,7 @@ mod tests {
         // 0.241.0: five of those (Exposure, Vibrance, Color Balance, Black &
         // White, Photo Filter) are imported, 8 left out: max 230 -> 204, mean
         // 125.9 / 51.5 / 32.0 -> 106.6 / 30.5 / 26.0.
-        ("fill_adjustments.psd", 204.0, Some("8 adjustment layers")),
+        ("fill_adjustments.psd", 204.0, Some("4 adjustment layers")),
         // A clipped layer whose base is not a pixel layer shown unclipped
         // (0.201.0: the other clipped layers are clipped for real).
         (
@@ -44905,8 +45067,9 @@ mod tests {
         // (0.235.0) "Layer via Copy" and "Layer via Cut", and (0.239.0)
         // "New Vibrance Layer", "New Exposure Layer" and "New Photo Filter
         // Layer", and (0.240.0) "New Black & White Layer" and "New Color
-        // Balance Layer".
-        assert_eq!(state.results().len(), 21);
+        // Balance Layer", and (0.244.0) "New Invert Layer", "New Threshold
+        // Layer", "New Posterize Layer" and "New Brightness/Contrast Layer".
+        assert_eq!(state.results().len(), 25);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -78981,6 +79144,92 @@ mod tests {
                 rig.assert_coherent();
             }
 
+            /// 0.244.0: the four new adjustment layers are palette commands,
+            /// each one undo step, named "<Kind> N", with Photoshop's defaults.
+            #[test]
+            fn new_invert_threshold_posterize_and_brightness_contrast_layers_are_one_undo_step() {
+                let cases: [(
+                    &str,
+                    &str,
+                    ActivatedCommand,
+                    aurora_ui::AdjustKind,
+                    Adjustment,
+                    &str,
+                ); 4] = [
+                    (
+                        crate::COMMAND_LAYER_NEW_INVERT,
+                        "New Invert Layer",
+                        ActivatedCommand::NewInvertLayer,
+                        aurora_ui::AdjustKind::Invert,
+                        Adjustment::Invert,
+                        "Invert 1",
+                    ),
+                    (
+                        crate::COMMAND_LAYER_NEW_THRESHOLD,
+                        "New Threshold Layer",
+                        ActivatedCommand::NewThresholdLayer,
+                        aurora_ui::AdjustKind::Threshold,
+                        Adjustment::Threshold(aurora_core::ThresholdParams::default()),
+                        "Threshold 1",
+                    ),
+                    (
+                        crate::COMMAND_LAYER_NEW_POSTERIZE,
+                        "New Posterize Layer",
+                        ActivatedCommand::NewPosterizeLayer,
+                        aurora_ui::AdjustKind::Posterize,
+                        Adjustment::Posterize(aurora_core::PosterizeParams::default()),
+                        "Posterize 1",
+                    ),
+                    (
+                        crate::COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST,
+                        "New Brightness/Contrast Layer",
+                        ActivatedCommand::NewBrightnessContrastLayer,
+                        aurora_ui::AdjustKind::BrightnessContrast,
+                        Adjustment::BrightnessContrast(
+                            aurora_core::BrightnessContrastParams::identity(),
+                        ),
+                        "Brightness/Contrast 1",
+                    ),
+                ];
+                for (id, title, activated, kind, adjustment, name) in cases {
+                    assert!(
+                        palette_commands()
+                            .iter()
+                            .any(|entry| entry.id == id && entry.title == title),
+                        "{id}"
+                    );
+                    let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+                    let mut focus = FocusManager::default();
+                    let mut dialog = FakeFileDialog::default();
+                    assert_eq!(
+                        activate_command(&mut workspace, &mut focus, id, &mut dialog),
+                        Some(activated.clone())
+                    );
+                    assert_eq!(crate::new_adjust_kind(&activated), Some(kind), "{id}");
+                    let (mut rig, [top, mid, bottom]) = Rig::three();
+                    let before = rig.layers.roots().to_vec();
+                    assert!(rig.run(LayerCommand::NewAdjust(kind)));
+                    let added = only_new_root(&rig, &before);
+                    assert_eq!(
+                        rig.layers.kind(added),
+                        Some(&LayerKind::Adjustment(adjustment)),
+                        "{id}"
+                    );
+                    assert_eq!(rig.layers.name(added), Some(name));
+                    assert_eq!(rig.active, Some(added));
+                    assert!(rig.run(LayerCommand::NewAdjust(kind)));
+                    assert_eq!(
+                        rig.active.and_then(|a| rig.layers.name(a)),
+                        Some(name.replace('1', "2").as_str())
+                    );
+                    assert!(rig.undo_redo(AppCommand::Undo));
+                    assert!(rig.undo_redo(AppCommand::Undo));
+                    assert_eq!(rig.layers.roots(), before.as_slice());
+                    assert_eq!(rig.layers.roots(), [top, mid, bottom].as_slice());
+                    rig.assert_coherent();
+                }
+            }
+
             #[test]
             fn new_vibrance_exposure_and_photo_filter_layers_are_commands_and_one_undo_step_each() {
                 let cases: [(&str, &str, ActivatedCommand, LayerCommand, Adjustment, &str); 5] = [
@@ -79037,7 +79286,7 @@ mod tests {
                     let mut dialog = FakeFileDialog::default();
                     assert_eq!(
                         activate_command(&mut workspace, &mut focus, id, &mut dialog),
-                        Some(activated)
+                        Some(activated.clone())
                     );
                     let (mut rig, [top, mid, bottom]) = Rig::three();
                     let before = rig.layers.roots().to_vec();
@@ -84101,6 +84350,107 @@ mod tests {
             assert_eq!(ranges(&rig), [[0.0; 3]; 3]);
         }
 
+        /// 0.244.0: Threshold, Posterize and Brightness/Contrast sliders are one
+        /// undo step each through the real routing, Use Legacy is one step and
+        /// clamps the sliders into the legacy ranges, Invert shows only its note.
+        #[test]
+        fn threshold_posterize_brightness_contrast_and_invert_editors_are_wired() {
+            use aurora_ui::AdjustSlider as S;
+            let (mut rig, id) = Rig::adjust_layer(aurora_doc::Adjustment::Threshold(
+                aurora_core::ThresholdParams::default(),
+            ));
+            assert_eq!(
+                aurora_ui::adjust_controls_shown(&rig.workspace.tree, rig.adj_controls()),
+                Some(aurora_ui::AdjustKind::Threshold)
+            );
+            assert_eq!(rig.adj_slider(S::ThresholdLevel), (128.0, false));
+            assert!(
+                rig.adj_slider(S::Brightness).1,
+                "other groups stay disabled"
+            );
+            let before = rig.undo_order.undo.len();
+            rig.adj_set(S::ThresholdLevel, 200.0);
+            assert_eq!(rig.adjustment(id).threshold().map(|p| p.level()), Some(200));
+            assert_eq!(rig.undo_order.undo.len(), before + 1);
+            rig.adj_set(S::ThresholdLevel, f64::NAN);
+            assert_eq!(rig.undo_order.undo.len(), before + 1, "NaN records nothing");
+            rig.undo();
+            assert_eq!(rig.adj_slider(S::ThresholdLevel).0, 128.0);
+
+            let (mut rig, id) = Rig::adjust_layer(aurora_doc::Adjustment::Posterize(
+                aurora_core::PosterizeParams::default(),
+            ));
+            assert_eq!(rig.adj_slider(S::PosterizeLevels), (4.0, false));
+            rig.adj_set(S::PosterizeLevels, 1.0);
+            assert_eq!(
+                rig.adjustment(id).posterize().map(|p| p.levels()),
+                Some(2),
+                "the slider clamps to its 2..255 range"
+            );
+            rig.adj_set(S::PosterizeLevels, 13.0);
+            assert_eq!(rig.adjustment(id).posterize().map(|p| p.levels()), Some(13));
+
+            let (mut rig, id) = Rig::adjust_layer(aurora_doc::Adjustment::BrightnessContrast(
+                aurora_core::BrightnessContrastParams::identity(),
+            ));
+            assert_eq!(
+                aurora_ui::adjust_controls_shown(&rig.workspace.tree, rig.adj_controls()),
+                Some(aurora_ui::AdjustKind::BrightnessContrast)
+            );
+            assert!(!aurora_ui::adjust_legacy_checked(
+                &rig.workspace.tree,
+                rig.adj_controls()
+            ));
+            let before = rig.undo_order.undo.len();
+            rig.adj_set(S::Brightness, 140.0);
+            rig.adj_set(S::Contrast, -90.0);
+            let read = |rig: &Rig| match rig.adjustment(id).brightness_contrast() {
+                Some(p) => (p.brightness(), p.contrast(), p.legacy()),
+                None => unreachable!("a Brightness/Contrast layer"),
+            };
+            assert_eq!(read(&rig), (140, -50, false), "contrast clamps to -50");
+            let legacy = rig.adj_controls().legacy;
+            let at = rig.centre(legacy);
+            rig.pointer(PointerPhase::Down, at);
+            rig.pointer(PointerPhase::Up, at);
+            assert_eq!(
+                read(&rig),
+                (100, -50, true),
+                "one step, clamped into the legacy range"
+            );
+            assert_eq!(rig.undo_order.undo.len(), before + 3);
+            rig.adj_set(S::Contrast, -90.0);
+            assert_eq!(read(&rig), (100, -90, true));
+            rig.adj_set(S::Brightness, 140.0);
+            assert_eq!(read(&rig), (100, -90, true), "no change, no step");
+            assert_eq!(rig.undo_order.undo.len(), before + 4);
+            rig.undo();
+            rig.undo();
+            assert_eq!(read(&rig), (140, -50, false));
+            assert!(!aurora_ui::adjust_legacy_checked(
+                &rig.workspace.tree,
+                rig.adj_controls()
+            ));
+
+            let (rig, _) = Rig::adjust_layer(aurora_doc::Adjustment::Invert);
+            assert_eq!(
+                aurora_ui::adjust_controls_shown(&rig.workspace.tree, rig.adj_controls()),
+                Some(aurora_ui::AdjustKind::Invert)
+            );
+            assert!(
+                [
+                    S::ThresholdLevel,
+                    S::PosterizeLevels,
+                    S::Brightness,
+                    S::Contrast,
+                    S::Vibrance
+                ]
+                .into_iter()
+                .all(|s| rig.adj_slider(s).1),
+                "Invert has no live slider"
+            );
+        }
+
         /// The Photo Filter preset commands: palette entries, one undo step
         /// each, colour only (density and Preserve Luminosity kept), no
         /// step for the colour already set, a refusal on another layer.
@@ -85570,6 +85920,157 @@ mod tests {
             );
             let got = first(&layers2, &mut store2);
             assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
+        }
+
+        /// 0.244.0: Invert, Threshold, Posterize and Brightness/Contrast against
+        /// independent f64 models written from the documentation; the neutral
+        /// settings are exact passthroughs and a translucent backdrop keeps its
+        /// alpha.
+        #[test]
+        fn invert_threshold_posterize_and_brightness_contrast_match_independent_models() {
+            let (_dir, mut store) = real_tile_store();
+            let mut layers =
+                solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+            let id = add(&mut layers, Adjustment::Invert);
+            assert_close(first(&layers, &mut store), [0.8, 0.6, 0.4, 1.0], "invert");
+            // Threshold: grey 0.30 * 0.2 + 0.59 * 0.4 + 0.11 * 0.6 = 0.362 -> 92.3 of 255.
+            let threshold = |level: u8| match aurora_core::ThresholdParams::new(level) {
+                Ok(p) => Adjustment::Threshold(p),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            for (level, white) in [(92, 1.0), (93, 0.0), (1, 1.0), (255, 0.0)] {
+                let _ = layers.set_adjustment(id, threshold(level));
+                assert_close(
+                    first(&layers, &mut store),
+                    [white, white, white, 1.0],
+                    &format!("threshold {level}"),
+                );
+            }
+            // Posterize 4 levels: 0.2 -> bin 0, 0.4 -> bin 1, 0.6 -> bin 2.
+            let posterize = |levels: u8| match aurora_core::PosterizeParams::new(levels) {
+                Ok(p) => Adjustment::Posterize(p),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let _ = layers.set_adjustment(id, posterize(4));
+            assert_close(
+                first(&layers, &mut store),
+                [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0],
+                "posterize 4",
+            );
+            // Legacy Brightness/Contrast: contrast 50 doubles about 127, brightness 0.
+            let bc = |b: i16, c: i16, legacy: bool| match aurora_core::BrightnessContrastParams::new(
+                b, c, legacy,
+            ) {
+                Ok(p) => Adjustment::BrightnessContrast(p),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let _ = layers.set_adjustment(id, bc(0, 50, true));
+            let line = |v: f64| ((v * 255.0 - 127.0) * 2.0 + 127.0).clamp(0.0, 255.0) / 255.0;
+            let want = [0.2_f64, 0.4, 0.6].map(|v| line(v) as f32);
+            assert_close(
+                first(&layers, &mut store),
+                [want[0], want[1], want[2], 1.0],
+                "legacy contrast 50",
+            );
+            // The default mode lifts the middle for a positive brightness.
+            let _ = layers.set_adjustment(id, bc(60, 0, false));
+            let got = first(&layers, &mut store);
+            assert!(got[2] > 0.6 + 0.05 && got[0] > 0.2, "{got:?}");
+            // Neutral settings are exact passthroughs.
+            let _ = layers.remove(id);
+            let without = composite(&layers, &mut store);
+            let bits = |v: &[[f32; 4]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+            for neutral in [posterize(255), bc(0, 0, false), bc(0, 0, true)] {
+                let id = add(&mut layers, neutral.clone());
+                assert_eq!(
+                    bits(&composite(&layers, &mut store)),
+                    bits(&without),
+                    "{neutral:?}"
+                );
+                let _ = layers.remove(id);
+            }
+            // A translucent backdrop keeps its alpha for every kind.
+            let (_dir2, mut store2) = real_tile_store();
+            for adjustment in [
+                Adjustment::Invert,
+                threshold(10),
+                posterize(3),
+                bc(30, 30, false),
+            ] {
+                let mut layers2 = solid_root_stack(
+                    &mut store2,
+                    &[("b", BlendMode::Normal, 1.0, [0.2, 0.4, 0.6, 0.5])],
+                );
+                let _ = add(&mut layers2, adjustment.clone());
+                let got = first(&layers2, &mut store2);
+                assert!(
+                    (got[3] - 0.5).abs() <= 1e-3,
+                    "alpha kept: {adjustment:?} {got:?}"
+                );
+            }
+        }
+
+        /// 0.244.0: these four kinds have no GPU pass, so a visible layer of
+        /// any of them refuses the GPU path for the whole document and a hidden
+        /// one does not; neutral or not.
+        #[test]
+        fn a_visible_layer_of_the_four_new_kinds_refuses_the_gpu_path_and_a_hidden_one_does_not() {
+            let bc = |b, c, legacy| match aurora_core::BrightnessContrastParams::new(b, c, legacy) {
+                Ok(p) => Adjustment::BrightnessContrast(p),
+                Err(err) => unreachable!("{err:?}"),
+            };
+            for adjustment in [
+                Adjustment::Invert,
+                Adjustment::Threshold(aurora_core::ThresholdParams::default()),
+                Adjustment::Posterize(aurora_core::PosterizeParams::default()),
+                Adjustment::Posterize(match aurora_core::PosterizeParams::new(255) {
+                    Ok(p) => p,
+                    Err(err) => unreachable!("{err:?}"),
+                }),
+                bc(0, 0, false),
+                bc(40, 20, false),
+                bc(0, 0, true),
+            ] {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers =
+                    solid_root_stack(&mut store, &[("b", BlendMode::Normal, 1.0, BACKDROP)]);
+                assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+                let id = add(&mut layers, adjustment.clone());
+                assert!(
+                    !crate::adjustment_layer_qualifies_for_gpu(&layers, id),
+                    "{adjustment:?}"
+                );
+                assert!(
+                    !crate::document_qualifies_for_gpu_compositing(&layers),
+                    "{adjustment:?}: a visible layer keeps the document on the CPU"
+                );
+                if let Err(err) = layers.set_visible(id, false) {
+                    unreachable!("{err:?}");
+                }
+                assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+            }
+        }
+
+        /// 0.244.0: the per-thread Brightness/Contrast cache hands back the
+        /// same built op for equal parameters and a different one otherwise.
+        #[test]
+        fn the_brightness_contrast_op_is_cached_per_parameter_set() {
+            let p = |b| match aurora_core::BrightnessContrastParams::new(b, 10, false) {
+                Ok(p) => p,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let (a, b, c) = (
+                crate::brightness_contrast_op(p(20)),
+                crate::brightness_contrast_op(p(20)),
+                crate::brightness_contrast_op(p(21)),
+            );
+            assert!(std::rc::Rc::ptr_eq(&a, &b));
+            assert!(!std::rc::Rc::ptr_eq(&a, &c));
+            for i in 0..20 {
+                let _ = crate::brightness_contrast_op(p(i));
+            }
+            let again = crate::brightness_contrast_op(p(20));
+            assert_eq!(*again, *a, "an evicted entry is rebuilt equal");
         }
 
         /// 0.242.0 (was `a_visible_layer_refuses_the_gpu_path_and_a_hidden_one_
@@ -89285,6 +89786,7 @@ mod tests {
         include!("outer_glow_tests.rs");
         include!("clip_corpus_tests.rs");
         include!("psd_audit_tests.rs");
+        include!("four_adjust_fidelity_tests.rs");
         include!("small_machine_effect_tests.rs");
     }
 }

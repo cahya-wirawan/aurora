@@ -796,7 +796,7 @@ fn a_grayscale_file_s_layers_are_left_out_and_say_so() {
 fn a_record_with_an_unmodelled_adjustment_key_is_still_left_out() {
     let document = ok(read(
         &file_with(b"blnc", &unhex(BLNC_FILL), |l| {
-            l.blocks.push((*b"brit", vec![0; 4]));
+            l.blocks.push((*b"mixr", vec![0; 4]));
         })
         .write(),
     ));
@@ -811,9 +811,14 @@ fn every_key_is_recognised_and_only_these_five() {
         assert!(read_adjust::is_key(*k));
         assert!(parse_block(k, &[]).is_some());
     }
-    for k in [
-        b"curv", b"levl", b"hue2", b"brit", b"mixr", b"hue ", b"nvrt",
-    ] {
+    // The four of 0.244.0 are keys too (CgEd is not: it only attaches).
+    for k in [b"nvrt", b"thrs", b"post", b"brit"] {
+        assert!(read_adjust::is_key(*k));
+        assert!(parse_block(k, &[]).is_some());
+    }
+    assert!(!read_adjust::is_key(*b"CgEd"));
+    assert_eq!(parse_block(b"CgEd", &[]), None);
+    for k in [b"curv", b"levl", b"hue2", b"mixr", b"hue ", b"clrL"] {
         assert!(!read_adjust::is_key(*k));
         assert_eq!(parse_block(k, &[]), None);
     }
@@ -1180,7 +1185,7 @@ fn a_clipped_adjustment_shown_unclipped_is_reported_as_stronger() {
 fn the_left_out_note_calls_four_kinds_approximations() {
     let document = ok(read(
         &file_with(b"blnc", &unhex(BLNC_FILL), |l| {
-            l.blocks.push((*b"brit", vec![0; 4]));
+            l.blocks.push((*b"mixr", vec![0; 4]));
         })
         .write(),
     ));
@@ -1247,5 +1252,481 @@ fn a_layer_clipped_to_a_group_is_not_reported_as_unclipped() {
     assert!(
         items.contains("1 clipped layer is shown unclipped"),
         "{items}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Invert, Threshold, Posterize, Brightness/Contrast (0.244.0)
+// ---------------------------------------------------------------------
+
+/// `adjustments/brightnesscontrast_rgb.psd` "Brightness/Contrast 1": the
+/// `CgEd` descriptor (Brgh -95, Cntr -50), byte for byte.
+pub(super) const CGED_BC1: &str = "00000010000000010000000000006e756c6c00000007000000005672736e6c6f6e670000000100000000427267686c6f6e67ffffffa100000000436e74726c6f6e67ffffffce000000056d65616e736c6f6e670000007f000000004c616220626f6f6c00000000097573654c6567616379626f6f6c00000000004175746f626f6f6c0000";
+/// `adjustments/brightnesscontrast_legacy_rgb.psd`'s `brit`: 20, 57, 127.
+pub(super) const BRIT_LEGACY: &str = "00140039007f0000";
+
+/// A `CgEd` descriptor like Photoshop's, with the given values.
+fn cged(version: i32, brightness: i32, contrast: i32, means: i32, flags: [bool; 3]) -> Vec<u8> {
+    fn key(d: &mut Vec<u8>, k: &[u8]) {
+        let len = if k.len() == 4 { 0 } else { k.len() as u32 };
+        d.extend_from_slice(&len.to_be_bytes());
+        d.extend_from_slice(k);
+    }
+    let mut d = unhex("00000010000000010000000000006e756c6c00000007");
+    for (k, v) in [
+        (&b"Vrsn"[..], version),
+        (b"Brgh", brightness),
+        (b"Cntr", contrast),
+        (b"means", means),
+    ] {
+        key(&mut d, k);
+        d.extend_from_slice(b"long");
+        d.extend_from_slice(&v.to_be_bytes());
+    }
+    for (k, v) in [&b"Lab "[..], b"useLegacy", b"Auto"].into_iter().zip(flags) {
+        key(&mut d, k);
+        d.extend_from_slice(b"bool");
+        d.push(u8::from(v));
+    }
+    d.extend_from_slice(&[0, 0]);
+    d
+}
+
+fn brit(brightness: i16, contrast: i16, mean: i16, lab: u8) -> Vec<u8> {
+    let mut d = Vec::new();
+    for v in [brightness, contrast, mean] {
+        d.extend_from_slice(&v.to_be_bytes());
+    }
+    d.extend_from_slice(&[lab, 0]);
+    d
+}
+
+fn level(v: u16) -> Vec<u8> {
+    let mut d = v.to_be_bytes().to_vec();
+    d.extend_from_slice(&[0, 0]);
+    d
+}
+
+fn top_adjustment_value(document: &PsdDocument) -> Option<Adjustment> {
+    top_adjustment(document).map(|(_, a)| a)
+}
+
+fn bc(brightness: i16, contrast: i16, legacy: bool) -> Adjustment {
+    match aurora_core::BrightnessContrastParams::new(brightness, contrast, legacy) {
+        Ok(p) => Adjustment::BrightnessContrast(p),
+        Err(err) => unreachable!("{err:?}"),
+    }
+}
+
+#[test]
+fn photoshop_s_four_blocks_parse_to_their_values() {
+    assert_eq!(
+        parse_block(b"thrs", &unhex("00e80000")),
+        Some(Parsed::Threshold(Ok(232)))
+    );
+    assert_eq!(
+        parse_block(b"post", &unhex("000d0000")),
+        Some(Parsed::Posterize(Ok(13)))
+    );
+    assert_eq!(parse_block(b"nvrt", &[]), Some(Parsed::Invert(Ok(()))));
+    assert_eq!(
+        parse_block(b"brit", &unhex(BRIT_LEGACY)),
+        Some(Parsed::Brightness(
+            Ok(read_adjust::BritBlock {
+                brightness: 20,
+                contrast: 57,
+                mean: 127,
+                lab: false
+            }),
+            None
+        ))
+    );
+    let mut parsed =
+        parse_block(b"brit", &unhex("0000000000000000")).unwrap_or(Parsed::Invert(Err(())));
+    assert!(read_adjust::attach_cged(&mut parsed, &unhex(CGED_BC1)));
+    let Parsed::Brightness(_, Some(Ok(c))) = parsed else {
+        unreachable!("attached")
+    };
+    assert_eq!((c.brightness, c.contrast, c.means), (-95.0, -50.0, 127.0));
+    assert!(!c.lab && !c.legacy && !c.auto);
+    let mut other = Parsed::Invert(Ok(()));
+    assert!(!read_adjust::attach_cged(&mut other, &unhex(CGED_BC1)));
+}
+
+#[test]
+fn the_four_kinds_open_with_their_values_and_only_the_default_mode_is_reported() {
+    let cases: [(&[u8; 4], Vec<u8>, Adjustment, bool); 5] = [
+        (b"nvrt", vec![], Adjustment::Invert, false),
+        (
+            b"thrs",
+            level(172),
+            match aurora_core::ThresholdParams::new(172) {
+                Ok(p) => Adjustment::Threshold(p),
+                Err(err) => unreachable!("{err:?}"),
+            },
+            false,
+        ),
+        (
+            b"post",
+            level(21),
+            match aurora_core::PosterizeParams::new(21) {
+                Ok(p) => Adjustment::Posterize(p),
+                Err(err) => unreachable!("{err:?}"),
+            },
+            false,
+        ),
+        (b"brit", unhex(BRIT_LEGACY), bc(20, 57, true), false),
+        (b"brit", brit(0, 0, 127, 0), bc(0, 0, true), false),
+    ];
+    for (key, block, want, noted) in cases {
+        let document = ok(read(&file_with(key, &block, |_| {}).write()));
+        assert_eq!(
+            top_adjustment_value(&document),
+            Some(want.clone()),
+            "{key:?}"
+        );
+        let items = document.report.items.join("\n");
+        assert_eq!(items.contains("approximation"), noted, "{key:?}: {items}");
+    }
+    // The default mode: the CgEd descriptor carries the values.
+    let document = ok(read(
+        &file_with(b"brit", &[0; 8], |l| {
+            l.blocks.push((*b"CgEd", unhex(CGED_BC1)));
+        })
+        .write(),
+    ));
+    assert_eq!(top_adjustment_value(&document), Some(bc(-95, -50, false)));
+    let items = document.report.items.join("\n");
+    assert!(
+        items.contains("1 Brightness/Contrast layer is shown with an approximation"),
+        "{items}"
+    );
+    // 0 / 0 in the default mode is exact: no note.
+    let document = ok(read(
+        &file_with(b"brit", &[0; 8], |l| {
+            l.blocks.push((*b"CgEd", cged(1, 0, 0, 127, [false; 3])));
+        })
+        .write(),
+    ));
+    assert_eq!(top_adjustment_value(&document), Some(bc(0, 0, false)));
+    assert!(document.report.is_empty(), "{:?}", document.report.items);
+    // useLegacy in the descriptor selects the legacy mode and its ranges.
+    let document = ok(read(
+        &file_with(b"brit", &[0; 8], |l| {
+            l.blocks
+                .push((*b"CgEd", cged(1, 20, 57, 127, [false, true, false])));
+        })
+        .write(),
+    ));
+    assert_eq!(top_adjustment_value(&document), Some(bc(20, 57, true)));
+    assert!(!document.report.items.join("\n").contains("approximation"));
+}
+
+#[test]
+fn out_of_range_and_malformed_blocks_are_left_out_with_their_own_line() {
+    let cases: [(&[u8; 4], Vec<u8>, Option<Vec<u8>>, &str); 19] = [
+        (b"thrs", level(0), None, "1 Threshold layer was left out"),
+        (b"thrs", level(256), None, "1 Threshold layer was left out"),
+        // 257 and 258 would be 1 and 2 if the high byte were dropped.
+        (b"thrs", level(257), None, "1 Threshold layer was left out"),
+        (b"post", level(258), None, "1 Posterize layer was left out"),
+        (
+            b"thrs",
+            vec![0, 1, 0],
+            None,
+            "1 Threshold layer was left out",
+        ),
+        (
+            b"thrs",
+            vec![0, 1, 0, 0, 0],
+            None,
+            "1 Threshold layer was left out",
+        ),
+        (
+            b"thrs",
+            vec![0, 1, 0, 1],
+            None,
+            "1 Threshold layer was left out",
+        ),
+        (b"post", level(1), None, "1 Posterize layer was left out"),
+        (b"post", level(256), None, "1 Posterize layer was left out"),
+        (b"post", vec![], None, "1 Posterize layer was left out"),
+        (
+            b"nvrt",
+            vec![0, 0, 0, 0],
+            None,
+            "1 Invert layer was left out",
+        ),
+        (
+            b"brit",
+            vec![0; 7],
+            None,
+            "1 Brightness/Contrast layer was left out",
+        ),
+        (
+            b"brit",
+            brit(0, 101, 127, 0),
+            None,
+            "1 Brightness/Contrast layer was left out",
+        ),
+        (
+            b"brit",
+            brit(-101, 0, 127, 0),
+            None,
+            "1 Brightness/Contrast layer was left out",
+        ),
+        (
+            b"brit",
+            vec![0; 8],
+            Some(cged(1, 151, 0, 127, [false; 3])),
+            "1 Brightness/Contrast layer was left out",
+        ),
+        (
+            b"brit",
+            vec![0; 8],
+            Some(cged(1, 0, -51, 127, [false; 3])),
+            "1 Brightness/Contrast layer was left out",
+        ),
+        (
+            b"brit",
+            vec![0; 8],
+            Some(cged(2, 0, 0, 127, [false; 3])),
+            "1 Brightness/Contrast layer was left out",
+        ),
+        (
+            b"brit",
+            vec![0; 8],
+            Some(cged(1, 20, 57, 127, [false, true, false])[..40].to_vec()),
+            "1 Brightness/Contrast layer was left out",
+        ),
+        (
+            b"brit",
+            vec![0; 8],
+            Some(cged(1, 101, 0, 127, [false, true, false])),
+            "1 Brightness/Contrast layer was left out",
+        ),
+    ];
+    for (key, block, extra, needle) in cases {
+        let document = ok(read(
+            &file_with(key, &block, |l| {
+                if let Some(extra) = &extra {
+                    l.blocks.push((*b"CgEd", extra.clone()));
+                }
+            })
+            .write(),
+        ));
+        let items = document.report.items.join("\n");
+        assert!(items.contains(needle), "{key:?} {block:?}: {items}");
+        assert_eq!(
+            children_count(&document),
+            1,
+            "{key:?}: only the pixel layer"
+        );
+    }
+}
+
+#[test]
+fn unverified_options_are_left_out_with_a_line_that_names_them() {
+    let cases: [(Vec<u8>, Option<Vec<u8>>); 5] = [
+        (brit(20, 57, 127, 1), None),
+        (brit(20, 57, 100, 0), None),
+        (vec![0; 8], Some(cged(1, 0, 0, 127, [true, false, false]))),
+        (vec![0; 8], Some(cged(1, 0, 0, 127, [false, false, true]))),
+        (vec![0; 8], Some(cged(1, 0, 0, 100, [false; 3]))),
+    ];
+    for (block, extra) in cases {
+        let document = ok(read(
+            &file_with(b"brit", &block, |l| {
+                if let Some(extra) = &extra {
+                    l.blocks.push((*b"CgEd", extra.clone()));
+                }
+            })
+            .write(),
+        ));
+        let items = document.report.items.join("\n");
+        assert!(
+            items.contains("1 Brightness/Contrast layer was left out")
+                && items.contains("Auto, Lab-only or mean"),
+            "{items}"
+        );
+        assert_eq!(children_count(&document), 1);
+    }
+}
+
+#[test]
+fn a_cged_block_without_brit_is_some_other_generator_and_stays_unsupported() {
+    let document = ok(read(&file_with(b"CgEd", &unhex(CGED_BC1), |_| {}).write()));
+    let items = document.report.items.join("\n");
+    assert!(items.contains("1 adjustment layer"), "{items}");
+    assert_eq!(children_count(&document), 1);
+}
+
+#[test]
+fn a_grayscale_file_s_four_layers_are_left_out_and_say_so() {
+    for (key, block, label) in [
+        (b"nvrt", vec![], "Invert"),
+        (b"thrs", level(128), "Threshold"),
+        (b"post", level(4), "Posterize"),
+        (b"brit", unhex(BRIT_LEGACY), "Brightness/Contrast"),
+    ] {
+        let layer = TestLayer::empty("Adjust 1").with(|l| l.blocks.push((*key, block.clone())));
+        let bytes = TestPsd::new(1, 2, 2, 8)
+            .with(|p| {
+                p.color_mode = 1;
+                p.layers = vec![TestLayer::divider(), layer, TestLayer::group("G", *b"pass")];
+            })
+            .write();
+        let document = ok(read(&bytes));
+        let items = document.report.items.join("\n");
+        assert!(
+            items.contains(&format!(
+                "1 {label} layer in this Grayscale file was left out"
+            )),
+            "{label}: {items}"
+        );
+    }
+}
+
+#[test]
+fn hostile_blocks_never_panic() {
+    let mut cases: Vec<(&[u8; 4], Vec<u8>)> = Vec::new();
+    for key in [b"nvrt", b"thrs", b"post", b"brit"] {
+        for len in 0..12_usize {
+            cases.push((key, vec![0xff; len]));
+            cases.push((key, vec![0; len]));
+        }
+    }
+    let good = unhex(CGED_BC1);
+    for cut in 0..good.len() {
+        cases.push((b"brit", good[..cut].to_vec()));
+    }
+    for (key, block) in cases {
+        let _ = read(
+            &file_with(key, &block, |l| {
+                l.blocks.push((*b"CgEd", block.clone()));
+            })
+            .write(),
+        );
+    }
+    // A descriptor claiming four billion items, as the extra block.
+    let mut huge = unhex("00000010000000010000000000006e756c6c");
+    huge.extend_from_slice(&u32::MAX.to_be_bytes());
+    let document = ok(read(
+        &file_with(b"brit", &[0; 8], |l| {
+            l.blocks.push((*b"CgEd", huge.clone()));
+        })
+        .write(),
+    ));
+    assert!(
+        document
+            .report
+            .items
+            .join("\n")
+            .contains("1 Brightness/Contrast layer was left out")
+    );
+    // Every truncation of the real CgEd is left out, none imported.
+    for cut in 0..good.len().saturating_sub(2) {
+        let document = ok(read(
+            &file_with(b"brit", &[0; 8], |l| {
+                l.blocks.push((*b"CgEd", good[..cut].to_vec()));
+            })
+            .write(),
+        ));
+        assert_eq!(children_count(&document), 1, "cut {cut}");
+    }
+}
+
+fn corpus_adjustments(file: &str) -> Option<Vec<(String, Adjustment)>> {
+    corpus(&format!("adjustments/{file}")).map(|d| adjustments_of(&d))
+}
+
+#[test]
+fn corpus_threshold_posterize_invert_and_legacy_files_import_photoshop_s_values() {
+    let levels = |file: &str, f: fn(&Adjustment) -> Option<u8>| {
+        corpus_adjustments(file).map(|v| v.iter().map(|(_, a)| f(a)).collect::<Vec<_>>())
+    };
+    for file in ["threshold_rgb.psd", "threshold_16bits_rgb.psd"] {
+        if let Some(got) = levels(file, |a| a.threshold().map(|p| p.level())) {
+            assert_eq!(got, [60, 115, 172, 232].map(Some), "{file}");
+        }
+    }
+    for file in ["posterize_rgb.psd", "posterize_16bits_rgb.psd"] {
+        if let Some(got) = levels(file, |a| a.posterize().map(|p| p.levels())) {
+            assert_eq!(got, [3, 7, 13, 21].map(Some), "{file}");
+        }
+    }
+    if let Some(found) = corpus_adjustments("invert_rgb.psd") {
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, Adjustment::Invert);
+    }
+    if let Some(found) = corpus_adjustments("brightnesscontrast_legacy_rgb.psd") {
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, bc(20, 57, true));
+    }
+    if let Some(found) = corpus_adjustments("brightnesscontrast_rgb.psd") {
+        let got: Vec<_> = found.into_iter().map(|(_, a)| a).collect();
+        assert_eq!(
+            got,
+            vec![
+                bc(150, -21, false),
+                bc(23, 70, false),
+                bc(-31, 47, false),
+                bc(-95, -50, false)
+            ]
+        );
+    }
+}
+
+#[test]
+fn corpus_grayscale_and_cmyk_files_keep_the_left_out_policy() {
+    for (file, kind) in [
+        ("invert_grayscale.psd", "Invert"),
+        ("threshold_grayscale.psd", "Threshold"),
+        ("posterize_grayscale.psd", "Posterize"),
+        ("brightnesscontrast_grayscale.psd", "Brightness/Contrast"),
+        (
+            "brightnesscontrast_legacy_grayscale.psd",
+            "Brightness/Contrast",
+        ),
+    ] {
+        let Some(document) = corpus(&format!("adjustments/{file}")) else {
+            continue;
+        };
+        assert!(adjustments_of(&document).is_empty(), "{file}");
+        let items = document.report.items.join("\n");
+        assert!(
+            items.contains(&format!("{kind} layer")) && items.contains("Grayscale file"),
+            "{file}: {items}"
+        );
+    }
+}
+
+#[test]
+fn an_all_zero_brit_without_a_cged_is_unreadable_not_a_legacy_identity() {
+    // The default mode writes eight zero bytes and keeps its values in CgEd;
+    // without the descriptor this is not a legacy 0/0 layer (mean 127).
+    let document = ok(read(&file_with(b"brit", &[0; 8], |_| {}).write()));
+    let items = document.report.items.join("\n");
+    assert!(
+        items.contains("1 Brightness/Contrast layer was left out")
+            && items.contains("could not be read"),
+        "{items}"
+    );
+    assert_eq!(children_count(&document), 1);
+    // A real legacy 0/0 layer (mean 127) still imports.
+    let document = ok(read(
+        &file_with(b"brit", &brit(0, 0, 127, 0), |_| {}).write(),
+    ));
+    assert_eq!(top_adjustment_value(&document), Some(bc(0, 0, true)));
+    // Zero brightness and contrast with a stray mean is the options line, not this one.
+    let document = ok(read(
+        &file_with(b"brit", &brit(0, 0, 100, 0), |_| {}).write(),
+    ));
+    assert!(
+        document
+            .report
+            .items
+            .join("\n")
+            .contains("Auto, Lab-only or mean")
     );
 }

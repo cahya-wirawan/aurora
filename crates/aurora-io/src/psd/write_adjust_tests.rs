@@ -1418,3 +1418,316 @@ fn black_and_white_layers_are_itemised_in_the_save_report() {
         "{two:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Invert, Threshold, Posterize, Brightness/Contrast (0.244.0)
+// ---------------------------------------------------------------------
+
+mod four_kinds {
+    use super::super::read_adjust_tests::{BRIT_LEGACY, CGED_BC1};
+    use super::{
+        Adjustment, Doc, IoError, LayerTree, PsdSaveOptions, encode_adjustment, id_named, ok,
+        psd_save_preflight, read_back, records, rect, save, shape, unhex,
+    };
+    use aurora_core::{BrightnessContrastParams, PosterizeParams, ThresholdParams};
+
+    pub(super) fn threshold(level: u8) -> Adjustment {
+        Adjustment::Threshold(ok(ThresholdParams::new(level)))
+    }
+
+    pub(super) fn posterize(levels: u8) -> Adjustment {
+        Adjustment::Posterize(ok(PosterizeParams::new(levels)))
+    }
+
+    pub(super) fn bc(b: i16, c: i16, legacy: bool) -> Adjustment {
+        Adjustment::BrightnessContrast(ok(BrightnessContrastParams::new(b, c, legacy)))
+    }
+
+    fn encoded(a: &Adjustment) -> super::super::write_adjust::EncodedAdjustment {
+        match encode_adjustment(a) {
+            Ok(e) => e,
+            Err(reason) => unreachable!("{a:?}: {reason}"),
+        }
+    }
+
+    #[test]
+    fn the_writer_reproduces_photoshops_own_blocks_byte_for_byte() {
+        let e = encoded(&Adjustment::Invert);
+        assert_eq!(
+            (e.key, e.data.len(), e.extra.is_none()),
+            (*b"nvrt", 0, true)
+        );
+        for (a, key, hex) in [
+            (threshold(232), b"thrs", "00e80000"),
+            (threshold(60), b"thrs", "003c0000"),
+            (posterize(13), b"post", "000d0000"),
+            (posterize(3), b"post", "00030000"),
+            (bc(20, 57, true), b"brit", BRIT_LEGACY),
+        ] {
+            let e = encoded(&a);
+            assert_eq!(e.key, *key, "{a:?}");
+            assert_eq!(e.data, unhex(hex), "{a:?}");
+            assert!(e.extra.is_none() && !e.rounding.rounded, "{a:?}");
+            assert_eq!(e.readback, a);
+        }
+        // The default mode: an all-zero brit and Photoshop's CgEd, 132 bytes.
+        let e = encoded(&bc(-95, -50, false));
+        assert_eq!((e.key, e.data.clone()), (*b"brit", vec![0; 8]));
+        let Some((key, data)) = e.extra else {
+            unreachable!("CgEd")
+        };
+        assert_eq!(key, *b"CgEd");
+        assert_eq!(data, unhex(CGED_BC1));
+        assert_eq!(data.len(), 132);
+    }
+
+    #[test]
+    fn every_value_of_every_kind_reads_back_as_itself() {
+        let mut all = vec![Adjustment::Invert];
+        all.extend((1..=255_u8).map(threshold));
+        all.extend((2..=255_u8).map(posterize));
+        for legacy in [false, true] {
+            let ((b0, b1), (c0, c1)) = BrightnessContrastParams::ranges(legacy);
+            for b in [b0, b0 + 1, -1, 0, 1, b1 - 1, b1] {
+                for c in [c0, c0 + 1, -1, 0, 1, c1 - 1, c1] {
+                    all.push(bc(b, c, legacy));
+                }
+            }
+        }
+        for a in all {
+            let e = encoded(&a);
+            assert_eq!(e.readback, a, "{a:?}");
+            assert!(!e.rounding.rounded && !e.rounding.merged_points, "{a:?}");
+            assert_eq!(e.data.len() % 4, 0);
+        }
+    }
+
+    #[test]
+    fn these_kinds_are_a_lossless_save_with_no_report_line() {
+        let mut tree = LayerTree::new();
+        ok(tree.add_pixel_layer("A", rect(0, 0, 4, 4), None));
+        for (name, a) in [
+            ("I", Adjustment::Invert),
+            ("T", threshold(77)),
+            ("P", posterize(6)),
+            ("B", bc(-31, 47, false)),
+            ("L", bc(20, 57, true)),
+        ] {
+            ok(tree.add_adjustment_layer_at(name, a, None, 0));
+        }
+        let report = ok(psd_save_preflight(&tree, (4, 4), PsdSaveOptions::default()));
+        assert!(report.items.is_empty(), "{:?}", report.items);
+    }
+
+    pub(super) fn four_doc() -> Doc {
+        let mut doc = Doc::new((16, 16));
+        doc.layer("Background", rect(0, 0, 16, 16), None);
+        let invert = ok(doc
+            .tree
+            .add_adjustment_layer_at("Invert A", Adjustment::Invert, None, 0));
+        ok(doc.tree.set_opacity(invert, 128.0 / 255.0));
+        ok(doc
+            .tree
+            .set_blend_mode(invert, aurora_doc::BlendMode::Multiply));
+        doc.mask(invert, rect(2, 2, 10, 10), (0, 0, 10, 10), |x, y| {
+            f32::from(u16::try_from((x * 20 + y) % 255).unwrap_or(0)) / 255.0
+        });
+        let group = doc.group("Group", None);
+        doc.layer_in("Base", rect(0, 0, 16, 16), None, Some(group));
+        let clipped =
+            ok(doc
+                .tree
+                .add_adjustment_layer_at("Posterize clipped", posterize(7), Some(group), 0));
+        ok(doc.tree.set_clipped(clipped, true));
+        ok(doc
+            .tree
+            .add_adjustment_layer_at("Threshold in group", threshold(172), Some(group), 0));
+        ok(doc
+            .tree
+            .add_adjustment_layer_at("Bright", bc(23, 70, false), None, 0));
+        let legacy = ok(doc
+            .tree
+            .add_adjustment_layer_at("Legacy", bc(20, 57, true), None, 0));
+        ok(doc.tree.set_visible(legacy, false));
+        doc
+    }
+
+    const NAMES: [&str; 5] = [
+        "Invert A",
+        "Posterize clipped",
+        "Threshold in group",
+        "Bright",
+        "Legacy",
+    ];
+
+    #[test]
+    fn the_four_kinds_round_trip_through_write_verify_and_read() {
+        let mut doc = four_doc();
+        let dir = ok(tempfile::tempdir());
+        let target = dir.path().join("four.psd");
+        let outcome = ok(save(&mut doc, &target, false));
+        assert!(outcome.report.items.is_empty(), "{:?}", outcome.report);
+        let back = read_back(&ok(std::fs::read(&target)));
+        // Only the default-mode Brightness/Contrast layer is noted on reopen.
+        assert_eq!(back.report.items.len(), 1, "{:?}", back.report.items);
+        assert!(back.report.items[0].contains("approximation"));
+        assert_eq!(
+            shape(&back.layers, back.layers.roots()),
+            shape(&doc.tree, doc.tree.roots())
+        );
+        for name in NAMES {
+            let (want, got) = (id_named(&doc.tree, name), id_named(&back.layers, name));
+            assert_eq!(
+                back.layers.adjustment(got),
+                doc.tree.adjustment(want),
+                "{name}"
+            );
+            assert_eq!(back.layers.opacity(got), doc.tree.opacity(want), "{name}");
+            assert_eq!(
+                back.layers.blend_mode(got),
+                doc.tree.blend_mode(want),
+                "{name}"
+            );
+            assert_eq!(back.layers.visible(got), doc.tree.visible(want), "{name}");
+            assert_eq!(
+                back.layers.clip_base(got).is_some(),
+                doc.tree.clip_base(want).is_some(),
+                "{name}"
+            );
+            assert_eq!(
+                back.layers.mask(got).map(|m| m.bounds),
+                doc.tree.mask(want).map(|m| m.bounds),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_records_have_empty_rectangles_and_the_default_mode_writes_brit_then_cged() {
+        let mut doc = four_doc();
+        let (bytes, _) = ok(doc.write());
+        let recs = records(&bytes);
+        for name in NAMES {
+            let rec = recs
+                .iter()
+                .find(|r| r.4 == name)
+                .unwrap_or_else(|| unreachable!("{name}"));
+            assert_eq!(rec.1, [0; 4], "{name}");
+        }
+        let at = |needle: &[u8]| bytes.windows(needle.len()).position(|w| w == needle);
+        let Some(brit_default) = at(b"8BIMbrit\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00")
+        else {
+            unreachable!("the default mode's zero brit")
+        };
+        assert_eq!(
+            bytes.get(brit_default + 20..brit_default + 28),
+            Some(&b"8BIMCgEd"[..]),
+            "CgEd directly after brit"
+        );
+        assert!(at(b"8BIMbrit\x00\x00\x00\x08\x00\x14\x00\x39\x00\x7f\x00\x00").is_some());
+        let cged_len = 132;
+        assert_eq!(
+            bytes.get(brit_default + 28 + 4 + cged_len..brit_default + 28 + 4 + cged_len + 8),
+            Some(&b"8BIMluni"[..])
+        );
+        for key in [&b"nvrt"[..], b"thrs", b"post"] {
+            let mut needle = b"8BIM".to_vec();
+            needle.extend_from_slice(key);
+            assert!(at(&needle).is_some(), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_verifier_catches_a_wrong_block_a_wrong_extra_block_or_a_wrong_readback() {
+        let mut doc = four_doc();
+        let dir = ok(tempfile::tempdir());
+        let path = dir.path().join("four.psd");
+        let (bytes, outcome) = ok(doc.write());
+        ok(std::fs::write(&path, &bytes));
+        ok(super::super::write::verify_psd_file(
+            &path,
+            &outcome.expected,
+        ));
+        for key in [b"thrs", b"post", b"brit"] {
+            let Some(i) = outcome.expected.layers.iter().position(|l| {
+                l.adjustment
+                    .as_ref()
+                    .is_some_and(|a| a.key == *key && (key != b"brit" || a.extra.is_some()))
+            }) else {
+                unreachable!("{key:?}")
+            };
+            let mut wrong = outcome.expected.clone();
+            if let Some(a) = wrong.layers.get_mut(i).and_then(|l| l.adjustment.as_mut())
+                && let Some(byte) = a.data.get_mut(0)
+            {
+                *byte ^= 1;
+            }
+            let err = super::super::write::verify_psd_file(&path, &wrong);
+            assert!(
+                matches!(&err, Err(IoError::PsdVerifyFailed { what }) if what.contains("adjustment blocks")),
+                "{key:?}: {err:?}"
+            );
+            let mut wrong = outcome.expected.clone();
+            if let Some(a) = wrong.layers.get_mut(i).and_then(|l| l.adjustment.as_mut()) {
+                a.readback = Adjustment::Invert;
+            }
+            let err = super::super::write::verify_psd_file(&path, &wrong);
+            assert!(
+                matches!(&err, Err(IoError::PsdVerifyFailed { what }) if what.contains("adjustment")),
+                "{key:?}: {err:?}"
+            );
+        }
+        // The extra CgEd block is checked too.
+        let Some(i) = outcome
+            .expected
+            .layers
+            .iter()
+            .position(|l| l.adjustment.as_ref().is_some_and(|a| a.extra.is_some()))
+        else {
+            unreachable!("a default-mode layer")
+        };
+        let mut wrong = outcome.expected.clone();
+        if let Some(a) = wrong.layers.get_mut(i).and_then(|l| l.adjustment.as_mut())
+            && let Some((_, data)) = a.extra.as_mut()
+            && let Some(byte) = data.get_mut(60)
+        {
+            *byte ^= 1;
+        }
+        let err = super::super::write::verify_psd_file(&path, &wrong);
+        assert!(
+            matches!(&err, Err(IoError::PsdVerifyFailed { what }) if what.contains("adjustment blocks")),
+            "{err:?}"
+        );
+        let mut missing = outcome.expected.clone();
+        if let Some(a) = missing
+            .layers
+            .get_mut(i)
+            .and_then(|l| l.adjustment.as_mut())
+        {
+            a.extra = None;
+        }
+        assert!(super::super::write::verify_psd_file(&path, &missing).is_err());
+    }
+
+    /// `adjustments4.psd` / `adjustments4.json` for `scripts/verify_psd_write.py
+    /// check_adjustments4` (psd-tools).
+    ///
+    /// ```text
+    /// AURORA_PSD_FIXTURE_DIR=/tmp/psdw cargo test -p aurora-io --lib \
+    ///     four_adjustments_fixture_for_psd_tools -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "writes the fixture scripts/verify_psd_write.py reads"]
+    fn four_adjustments_fixture_for_psd_tools() {
+        let Ok(out) = std::env::var("AURORA_PSD_FIXTURE_DIR") else {
+            unreachable!("set AURORA_PSD_FIXTURE_DIR");
+        };
+        let out = std::path::Path::new(&out);
+        let mut doc = four_doc();
+        let (bytes, _) = ok(doc.write());
+        ok(std::fs::write(out.join("adjustments4.psd"), &bytes));
+        let json = "{\"threshold\": 172, \"posterize\": 7, \"default\": [23, 70], \
+            \"legacy\": [20, 57]}\n";
+        ok(std::fs::write(out.join("adjustments4.json"), json));
+    }
+}
