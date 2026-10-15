@@ -145,7 +145,9 @@ impl BlackWhiteParams {
         tint_hue: f32,
         tint_saturation: f32,
     ) -> Result<Self, BlackWhiteError> {
-        if weights.iter().any(|w| !w.is_finite()) || !tint_hue.is_finite() || !tint_saturation.is_finite()
+        if weights.iter().any(|w| !w.is_finite())
+            || !tint_hue.is_finite()
+            || !tint_saturation.is_finite()
         {
             return Err(BlackWhiteError::NotFinite);
         }
@@ -283,7 +285,12 @@ mod tests {
 
     #[test]
     fn the_wire_form_round_trips_and_refuses_bad_values() {
-        let p = ok(P::new([-200.0, 12.5, 300.0, 0.0, 99.0, 1.0], true, 211.0, 64.0));
+        let p = ok(P::new(
+            [-200.0, 12.5, 300.0, 0.0, 99.0, 1.0],
+            true,
+            211.0,
+            64.0,
+        ));
         let Ok(bytes) = postcard::to_allocvec(&p) else {
             unreachable!("encodes");
         };
@@ -302,7 +309,10 @@ mod tests {
             let Ok(bad) = wire(w, hue, sat) else {
                 unreachable!("encodes");
             };
-            assert!(postcard::from_bytes::<P>(&bad).is_err(), "{w:?} {hue} {sat}");
+            assert!(
+                postcard::from_bytes::<P>(&bad).is_err(),
+                "{w:?} {hue} {sat}"
+            );
         }
         assert!(postcard::from_bytes::<P>(bytes.get(..32).unwrap_or(&[])).is_err());
     }

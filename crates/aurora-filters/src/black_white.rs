@@ -103,8 +103,8 @@ impl BlackWhiteOp {
             .get(secondary_slot(first.1, second.1))
             .copied()
             .unwrap_or(0.0);
-        let grey = (first.0 - second.0).mul_add(primary, third.0)
-            + (second.0 - third.0) * secondary;
+        let grey =
+            (first.0 - second.0).mul_add(primary, third.0) + (second.0 - third.0) * secondary;
         grey.clamp(0.0, 1.0)
     }
 
@@ -120,7 +120,11 @@ impl BlackWhiteOp {
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp, clippy::many_single_char_names, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::float_cmp,
+    clippy::many_single_char_names,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::BlackWhiteOp;
     use crate::hue_saturation::to_hsl;
@@ -238,7 +242,10 @@ mod tests {
             for rgb in pixels() {
                 let want = model_grey(weights, rgb);
                 let got = f64::from(o.grey(rgb));
-                assert!((got - want).abs() < 2e-6, "{weights:?} {rgb:?}: {got} vs {want}");
+                assert!(
+                    (got - want).abs() < 2e-6,
+                    "{weights:?} {rgb:?}: {got} vs {want}"
+                );
                 assert_eq!(o.apply(rgb), [o.grey(rgb); 3]);
             }
         }
@@ -277,7 +284,10 @@ mod tests {
                 } else {
                     // Triangular: 1 - |dist| / 60 of the 0.2 raise.
                     let want = 0.2 * (1.0 - dist.abs() / 60.0);
-                    assert!((f64::from(d) - want).abs() < 2e-5, "slot {slot} hue {h}: {d}");
+                    assert!(
+                        (f64::from(d) - want).abs() < 2e-5,
+                        "slot {slot} hue {h}: {d}"
+                    );
                 }
             }
         }
@@ -314,7 +324,10 @@ mod tests {
                 let mut hi = lo;
                 lo[slot] = -50.0;
                 hi[slot] = 150.0;
-                assert!(op(hi).grey(rgb) >= op(lo).grey(rgb) - 1e-6, "{slot} {rgb:?}");
+                assert!(
+                    op(hi).grey(rgb) >= op(lo).grey(rgb) - 1e-6,
+                    "{slot} {rgb:?}"
+                );
             }
         }
     }
@@ -324,15 +337,27 @@ mod tests {
         let o = op([300.0, 300.0, 300.0, 300.0, 300.0, 300.0]);
         assert_eq!(o.apply([1.0, 0.0, 0.0]), [1.0; 3], "300 % of white clamps");
         let dark = op([-200.0; 6]);
-        assert_eq!(dark.apply([1.0, 0.0, 0.0]), [0.0; 3], "-200 % clamps to black");
+        assert_eq!(
+            dark.apply([1.0, 0.0, 0.0]),
+            [0.0; 3],
+            "-200 % clamps to black"
+        );
         for rgb in [
             [2.0_f32, -1.0, 0.5],
             [f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
             [1e30, -1e30, 0.0],
         ] {
-            for o in [op(BLACK_WHITE_DEFAULTS), tinted(BLACK_WHITE_DEFAULTS, 35.0, 25.0), o, dark] {
+            for o in [
+                op(BLACK_WHITE_DEFAULTS),
+                tinted(BLACK_WHITE_DEFAULTS, 35.0, 25.0),
+                o,
+                dark,
+            ] {
                 let out = o.apply(rgb);
-                assert!(out.iter().all(|c| (0.0..=1.0).contains(c)), "{rgb:?} {out:?}");
+                assert!(
+                    out.iter().all(|c| (0.0..=1.0).contains(c)),
+                    "{rgb:?} {out:?}"
+                );
             }
         }
         assert!(!o.is_identity() && !op(BLACK_WHITE_DEFAULTS).is_identity());
@@ -343,7 +368,12 @@ mod tests {
         let weights = BLACK_WHITE_DEFAULTS;
         let plain = op(weights);
         let sepia = tinted(weights, 35.0, 25.0);
-        for rgb in [[0.8, 0.4, 0.2], [0.3, 0.6, 0.9], [0.5, 0.5, 0.5], [0.2, 0.9, 0.4]] {
+        for rgb in [
+            [0.8, 0.4, 0.2],
+            [0.3, 0.6, 0.9],
+            [0.5, 0.5, 0.5],
+            [0.2, 0.9, 0.4],
+        ] {
             let grey = plain.grey(rgb);
             let out = sepia.apply(rgb);
             let (hue, s, l) = to_hsl(out);
@@ -357,7 +387,10 @@ mod tests {
         assert_eq!(sepia.apply([0.0; 3]), [0.0; 3]);
         assert_eq!(sepia.apply([1.0; 3]), [1.0; 3]);
         // Zero saturation is the plain grey; the tint flag off ignores hue.
-        assert_eq!(tinted(weights, 200.0, 0.0).apply([0.8, 0.4, 0.2]), plain.apply([0.8, 0.4, 0.2]));
+        assert_eq!(
+            tinted(weights, 200.0, 0.0).apply([0.8, 0.4, 0.2]),
+            plain.apply([0.8, 0.4, 0.2])
+        );
         let off = BlackWhiteOp::new(&params(weights, false, 200.0, 90.0));
         assert_eq!(off.apply([0.8, 0.4, 0.2]), plain.apply([0.8, 0.4, 0.2]));
         // Another hue gives another colour.

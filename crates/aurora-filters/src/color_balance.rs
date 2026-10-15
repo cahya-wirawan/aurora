@@ -100,7 +100,11 @@ impl ColorBalanceOp {
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp, clippy::needless_range_loop, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::float_cmp,
+    clippy::needless_range_loop,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::{ColorBalanceOp, SHIFT_AT_100, luma, range_weights};
     use aurora_core::ColorBalanceParams as P;
@@ -148,7 +152,11 @@ mod tests {
         out
     }
 
-    const MIXED: [[f32; 3]; 3] = [[30.0, -20.0, 10.0], [-40.0, 60.0, -80.0], [100.0, 5.0, -100.0]];
+    const MIXED: [[f32; 3]; 3] = [
+        [30.0, -20.0, 10.0],
+        [-40.0, 60.0, -80.0],
+        [100.0, 5.0, -100.0],
+    ];
 
     #[test]
     fn all_zero_sliders_are_an_exact_passthrough_even_out_of_gamut() {
@@ -251,15 +259,28 @@ mod tests {
 
     #[test]
     fn preserve_luminosity_restores_the_luma_when_nothing_clips() {
-        let ranges = [[20.0, -10.0, 15.0], [30.0, 25.0, -20.0], [-15.0, 10.0, 12.0]];
+        let ranges = [
+            [20.0, -10.0, 15.0],
+            [30.0, 25.0, -20.0],
+            [-15.0, 10.0, 12.0],
+        ];
         let kept = op(ranges, true);
         let free = op(ranges, false);
-        for input in [[0.3, 0.4, 0.5], [0.5, 0.5, 0.5], [0.2, 0.3, 0.25], [0.6, 0.5, 0.45], [0.45, 0.5, 0.4]] {
+        for input in [
+            [0.3, 0.4, 0.5],
+            [0.5, 0.5, 0.5],
+            [0.2, 0.3, 0.25],
+            [0.6, 0.5, 0.45],
+            [0.45, 0.5, 0.4],
+        ] {
             let out = kept.apply(input);
             assert!(out.iter().all(|c| (0.0..=1.0).contains(c)));
             assert!((luma(out) - luma(input)).abs() < 1e-5, "{input:?} {out:?}");
             // Without it the luma moves.
-            assert!((luma(free.apply(input)) - luma(input)).abs() > 1e-3, "{input:?}");
+            assert!(
+                (luma(free.apply(input)) - luma(input)).abs() > 1e-3,
+                "{input:?}"
+            );
         }
     }
 

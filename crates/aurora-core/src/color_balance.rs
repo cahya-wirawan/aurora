@@ -218,7 +218,10 @@ mod tests {
         assert!(ok(P::new([[-0.0; 3]; 3], true)).is_identity());
         for r in 0..3 {
             for s in 0..3 {
-                assert!(!ok(P::identity().with_slider(r, s, 1.0)).is_identity(), "{r} {s}");
+                assert!(
+                    !ok(P::identity().with_slider(r, s, 1.0)).is_identity(),
+                    "{r} {s}"
+                );
             }
         }
     }
@@ -275,7 +278,10 @@ mod tests {
 
     #[test]
     fn setters_edit_only_their_slot() {
-        let p = ok(P::new([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]], true));
+        let p = ok(P::new(
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
+            true,
+        ));
         for r in 0..3 {
             for s in 0..3 {
                 let q = ok(p.with_slider(r, s, -50.0));
