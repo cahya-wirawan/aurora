@@ -42057,19 +42057,23 @@ mod tests {
         ("passthrough_blendmodes2.psd", 1.0),
         ("passthrough_blendmodes3.psd", 2.0),
         // 0.241.0: the Exposure layers in the next four files are imported
-        // (they were left out). Opacity 86 -> 4 and vector mask 156 -> 8
-        // improve; the two Exposure -3.53 files do not: in
-        // `passthrough_fill_adjustment.psd` the Pass Through group's Fill
-        // (40 %) is not applied by Aurora (the report says so) while
-        // Photoshop shows almost none of the darkening (mean error 6.8
-        // with the layer left out, 165 now), and in the clipping-mask file
-        // the clipped layer is shown unclipped (reported), 170 -> 171.
+        // (they were left out).
+        // 0.243.0 re-pin: a Pass Through group's Fill is applied and an
+        // adjustment inside such a group adjusts only the group's own
+        // content, and a layer clipped to a group is clipped. Maxima
+        // (all pixels, measured): `passthrough_fill_blendmode.psd` 134 -> 19
+        // (mean 18.7 / 11.1 / 11.2 -> 4.2 / 0.9 / 0.9),
+        // `passthrough_fill_adjustment.psd` 172 -> 18 (mean 165 / 156 / 156
+        // -> 0.1 / 3.5 / 3.5), `passthrough_clipping_mask_adjustment.psd`
+        // 171 -> 8 (mean 55 / 39 / 39 -> 2.1 / 2.7 / 2.7). The residue is
+        // along the edges of a faint radial gradient (alpha a few levels),
+        // cause not isolated.
         ("passthrough_opacity.psd", 4.0),
-        ("passthrough_fill_blendmode.psd", 134.0),
-        ("passthrough_fill_adjustment.psd", 172.0),
+        ("passthrough_fill_blendmode.psd", 19.0),
+        ("passthrough_fill_adjustment.psd", 18.0),
         ("passthrough_vector_mask.psd", 8.0),
         ("passthrough_clipping_mask_blendmode.psd", 1.0),
-        ("passthrough_clipping_mask_adjustment.psd", 171.0),
+        ("passthrough_clipping_mask_adjustment.psd", 8.0),
     ];
 
     /// AC-4 (0.179.0): the user's own Photoshop template (not committed;
