@@ -446,6 +446,12 @@ enum Note {
     Unreadable(read_adjust::Kind),
     /// One of those five in a Grayscale file.
     Grayscale(read_adjust::Kind),
+    /// A Brightness/Contrast layer that uses Auto, Lab-only or a mean other
+    /// than 127 (0.244.0): nothing checked how Photoshop applies them.
+    BrightnessContrastOption,
+    /// A Brightness/Contrast layer in the default mode, shown with Aurora's
+    /// fitted approximation of Photoshop's curve (0.244.0).
+    BrightnessContrastApproximate,
     /// A Photo Filter whose colour is not stored as Lab (version 3 or
     /// another colour space).
     PhotoFilterColour,
@@ -536,11 +542,12 @@ fn note_text(note: Note, n: u64) -> String {
     let is = if one { "is" } else { "are" };
     match note {
         Note::AdjustmentSkipped => format!(
-            "{n} adjustment layer{s} (Brightness/Contrast, Channel Mixer and similar) {was} \
+            "{n} adjustment layer{s} (Channel Mixer, Gradient Map and similar) {was} \
              left out — Aurora shows only Curves, Levels, Hue/Saturation, Vibrance, Exposure, \
-             Photo Filter, Black & White and Color Balance adjustment layers so far (Vibrance, \
-             Photo Filter, Black & White and Color Balance are approximations that have not \
-             been compared with Photoshop)."
+             Photo Filter, Black & White, Color Balance, Invert, Threshold, Posterize and \
+             Brightness/Contrast adjustment layers so far (Vibrance, Photo Filter, Black & \
+             White and Color Balance are approximations that have not been compared with \
+             Photoshop)."
         ),
         Note::CurvesUnreadable => format!(
             "{n} Curves layer{s} {was} left out — {} settings could not be read.",
@@ -586,6 +593,17 @@ fn note_text(note: Note, n: u64) -> String {
              verified how Photoshop applies {} to a Grayscale image.",
             kind.label(),
             kind.label(),
+        ),
+        Note::BrightnessContrastOption => format!(
+            "{n} Brightness/Contrast layer{s} {was} left out — {} Auto, Lab-only or mean \
+             setting is not one Aurora has checked against Photoshop's own files.",
+            if one { "its" } else { "their" },
+        ),
+        Note::BrightnessContrastApproximate => format!(
+            "{n} Brightness/Contrast layer{s} {} shown with an approximation of Photoshop's \
+             curve (its formula is unpublished); expect differences of several levels from \
+             Photoshop's own rendering. The Use Legacy mode is a straight line and is closer.",
+            if one { "is" } else { "are" },
         ),
         Note::PhotoFilterColour => format!(
             "{n} Photo Filter layer{s} {was} left out — {} colour is not stored as Lab (the \
@@ -1565,6 +1583,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let mut levels = None;
     let mut hue_saturation = None;
     let mut other_adjustment = None;
+    let mut cged: Option<Vec<u8>> = None;
     let mut effects_blocks: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut smart_blocks: Vec<aurora_doc::SmartObjectBlock> = Vec::new();
     let mut smart_filters = false;
@@ -1630,9 +1649,21 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
             k if read_adjust::is_key(*k) => {
                 other_adjustment = read_adjust::parse_block(*k, data);
             }
+            b"CgEd" => cged = Some(data.to_vec()),
             k if ADJUSTMENT_KEYS.contains(&k) => features.adjustment = true,
             _ => {}
         }
+    }
+    // `CgEd` belongs to a Brightness/Contrast layer only next to its `brit`;
+    // alone it is some other content generator, which stays unsupported.
+    match (other_adjustment.as_mut(), &cged) {
+        (Some(parsed), Some(data)) => {
+            if !read_adjust::attach_cged(parsed, data) {
+                features.adjustment = true;
+            }
+        }
+        (None, Some(_)) => features.adjustment = true,
+        _ => {}
     }
 
     Ok(Record {
@@ -3551,6 +3582,12 @@ fn layer_node(
         // Vibrance, Exposure, Photo Filter, Black & White, Color Balance
         // (0.241.0).
         let params = read_adjust::adjustment(parsed, header.gray());
+        if let Ok(aurora_doc::Adjustment::BrightnessContrast(p)) = &params
+            && !p.legacy()
+            && !p.is_identity()
+        {
+            notes.add(Note::BrightnessContrastApproximate);
+        }
         return adjustment_node(src, record, header, params, notes, vector_budget);
     }
     if record.features.adjustment

@@ -63,6 +63,10 @@ pub(super) enum Kind {
     PhotoFilter,
     BlackWhite,
     ColorBalance,
+    Invert,
+    Threshold,
+    Posterize,
+    BrightnessContrast,
 }
 
 impl Kind {
@@ -74,6 +78,10 @@ impl Kind {
             Self::PhotoFilter => "Photo Filter",
             Self::BlackWhite => "Black & White",
             Self::ColorBalance => "Color Balance",
+            Self::Invert => "Invert",
+            Self::Threshold => "Threshold",
+            Self::Posterize => "Posterize",
+            Self::BrightnessContrast => "Brightness/Contrast",
         }
     }
 }
@@ -129,9 +137,40 @@ pub(super) struct ColorBalanceBlock {
     pub preserve_luminosity: bool,
 }
 
-/// The last block of one of the five kinds a record carried.
+/// A parsed legacy-layout `brit` block (0.244.0): `i16` brightness, `i16`
+/// contrast, `i16` mean, a `u8` Lab-only flag and a pad byte, 8 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BritBlock {
+    pub brightness: i16,
+    pub contrast: i16,
+    pub mean: i16,
+    pub lab: bool,
+}
+
+/// The `CgEd` descriptor of a non-legacy Brightness/Contrast layer
+/// (0.244.0): `Vrsn`, `Brgh`, `Cntr`, `means`, `Lab `, `useLegacy`, `Auto`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct CgedBlock {
+    pub version: f64,
+    pub brightness: f64,
+    pub contrast: f64,
+    pub means: f64,
+    pub lab: bool,
+    pub legacy: bool,
+    pub auto: bool,
+}
+
+/// The last block of one of the nine kinds a record carried.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Parsed {
+    /// `nvrt`: an empty block.
+    Invert(Result<(), ()>),
+    /// `thrs`: the level.
+    Threshold(Result<u16, ()>),
+    /// `post`: the level count.
+    Posterize(Result<u16, ()>),
+    /// `brit` and the record's `CgEd`, when it had one.
+    Brightness(Result<BritBlock, ()>, Option<Result<CgedBlock, ()>>),
     Vibrance(Result<VibranceBlock, ()>),
     Exposure(Result<ExposureBlock, ()>),
     PhotoFilter(Result<PhotoFilterBlock, ()>),
@@ -147,13 +186,30 @@ pub(super) fn parse_block(key: [u8; 4], data: &[u8]) -> Option<Parsed> {
         b"phfl" => Parsed::PhotoFilter(parse_photo_filter(data)),
         b"blwh" => Parsed::BlackWhite(parse_black_white(data)),
         b"blnc" => Parsed::ColorBalance(parse_color_balance(data)),
+        b"nvrt" => Parsed::Invert(if data.is_empty() { Ok(()) } else { Err(()) }),
+        b"thrs" => Parsed::Threshold(parse_level(data)),
+        b"post" => Parsed::Posterize(parse_level(data)),
+        b"brit" => Parsed::Brightness(parse_brit(data), None),
         _ => return None,
     })
 }
 
 /// Whether `key` is one of the five blocks.
 pub(super) fn is_key(key: [u8; 4]) -> bool {
-    matches!(&key, b"vibA" | b"expA" | b"phfl" | b"blwh" | b"blnc")
+    matches!(
+        &key,
+        b"vibA" | b"expA" | b"phfl" | b"blwh" | b"blnc" | b"nvrt" | b"thrs" | b"post" | b"brit"
+    )
+}
+
+/// Adds a record's `CgEd` block to a parsed `brit` (no effect on any other
+/// kind). Returns whether it attached.
+pub(super) fn attach_cged(parsed: &mut Parsed, data: &[u8]) -> bool {
+    if let Parsed::Brightness(_, slot) = parsed {
+        *slot = Some(parse_cged(data));
+        return true;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------
@@ -449,6 +505,106 @@ pub(super) fn color_balance_adjustment(
     .map_err(|_| Note::Unreadable(Kind::ColorBalance))
 }
 
+// ---------------------------------------------------------------------
+// Threshold, Posterize, Brightness/Contrast (0.244.0)
+// ---------------------------------------------------------------------
+
+/// A `thrs` or `post` block: a `u16` level and two zero bytes (checked on
+/// the fixtures `adjustments/{threshold,posterize}_*.psd`, `00e80000` etc).
+fn parse_level(data: &[u8]) -> Result<u16, ()> {
+    let [hi, lo, pad_a, pad_b] = <[u8; 4]>::try_from(data).map_err(|_| ())?;
+    if pad_a != 0 || pad_b != 0 {
+        return Err(());
+    }
+    Ok(u16::from_be_bytes([hi, lo]))
+}
+
+fn parse_brit(data: &[u8]) -> Result<BritBlock, ()> {
+    if data.len() != 8 {
+        return Err(());
+    }
+    let mut r = Reader::new(data);
+    let unreadable = |_| ();
+    let brightness = r.i16("brightness").map_err(unreadable)?;
+    let contrast = r.i16("contrast").map_err(unreadable)?;
+    let mean = r.i16("mean").map_err(unreadable)?;
+    let lab = r.u8("lab only").map_err(unreadable)? != 0;
+    Ok(BritBlock {
+        brightness,
+        contrast,
+        mean,
+        lab,
+    })
+}
+
+fn parse_cged(data: &[u8]) -> Result<CgedBlock, ()> {
+    let d = descriptor_of(data)?;
+    let flag = |key: &[u8]| match d.get(key) {
+        None => Err(()),
+        Some(v) => v.bool().ok_or(()),
+    };
+    let required = |key: &[u8]| match d.get(key) {
+        None => Err(()),
+        Some(v) => v.number().filter(|n| n.is_finite()).ok_or(()),
+    };
+    Ok(CgedBlock {
+        version: required(b"Vrsn")?,
+        brightness: required(b"Brgh")?,
+        contrast: required(b"Cntr")?,
+        means: required(b"means")?,
+        lab: flag(b"Lab ")?,
+        legacy: flag(b"useLegacy")?,
+        auto: flag(b"Auto")?,
+    })
+}
+
+/// A Brightness/Contrast layer from its `brit` block and, when the record
+/// had one, its `CgEd` descriptor (the default mode keeps its settings
+/// there and writes zeros to `brit`; Use Legacy has no `CgEd` in the
+/// fixtures). Layers using Auto, Lab-only or a mean other than 127 are left
+/// out (nothing checked how they apply).
+fn brightness_contrast_adjustment(
+    brit: &Result<BritBlock, ()>,
+    cged: Option<&Result<CgedBlock, ()>>,
+    gray: bool,
+) -> Result<Adjustment, Note> {
+    let unreadable = || Note::Unreadable(Kind::BrightnessContrast);
+    if gray {
+        return Err(Note::Grayscale(Kind::BrightnessContrast));
+    }
+    let brit = brit.as_ref().map_err(|()| unreadable())?;
+    let mean = i16::from(aurora_core::BRIGHTNESS_CONTRAST_MEAN);
+    let (brightness, contrast, legacy, options) = match cged {
+        Some(Ok(c)) => {
+            if (c.version - 1.0).abs() > f64::EPSILON {
+                return Err(unreadable());
+            }
+            let whole = |v: f64| {
+                (v.fract() == 0.0 && v.abs() <= 1_000.0).then(|| v as i16).ok_or_else(unreadable)
+            };
+            (
+                whole(c.brightness)?,
+                whole(c.contrast)?,
+                c.legacy,
+                c.lab || c.auto || whole(c.means)? != mean || brit.lab,
+            )
+        }
+        Some(Err(())) => return Err(unreadable()),
+        None => (
+            brit.brightness,
+            brit.contrast,
+            true,
+            brit.lab || brit.mean != mean,
+        ),
+    };
+    if options {
+        return Err(Note::BrightnessContrastOption);
+    }
+    aurora_core::BrightnessContrastParams::new(brightness, contrast, legacy)
+        .map(Adjustment::BrightnessContrast)
+        .map_err(|_| unreadable())
+}
+
 /// A parsed block as an adjustment, or the reason it is left out.
 pub(super) fn adjustment(parsed: &Parsed, gray: bool) -> Result<Adjustment, Note> {
     match parsed {
@@ -472,6 +628,30 @@ pub(super) fn adjustment(parsed: &Parsed, gray: bool) -> Result<Adjustment, Note
             .as_ref()
             .map_err(|()| Note::Unreadable(Kind::ColorBalance))
             .and_then(|b| color_balance_adjustment(b, gray)),
+        Parsed::Invert(b) => match (b, gray) {
+            (_, true) => Err(Note::Grayscale(Kind::Invert)),
+            (Err(()), _) => Err(Note::Unreadable(Kind::Invert)),
+            (Ok(()), false) => Ok(Adjustment::Invert),
+        },
+        Parsed::Threshold(b) => match (b, gray) {
+            (_, true) => Err(Note::Grayscale(Kind::Threshold)),
+            (Err(()), _) => Err(Note::Unreadable(Kind::Threshold)),
+            (Ok(level), false) => u8::try_from(*level)
+                .map_err(|_| ())
+                .and_then(|l| aurora_core::ThresholdParams::new(l).map_err(|_| ()))
+                .map(Adjustment::Threshold)
+                .map_err(|()| Note::Unreadable(Kind::Threshold)),
+        },
+        Parsed::Posterize(b) => match (b, gray) {
+            (_, true) => Err(Note::Grayscale(Kind::Posterize)),
+            (Err(()), _) => Err(Note::Unreadable(Kind::Posterize)),
+            (Ok(levels), false) => u8::try_from(*levels)
+                .map_err(|_| ())
+                .and_then(|l| aurora_core::PosterizeParams::new(l).map_err(|_| ()))
+                .map(Adjustment::Posterize)
+                .map_err(|()| Note::Unreadable(Kind::Posterize)),
+        },
+        Parsed::Brightness(brit, cged) => brightness_contrast_adjustment(brit, cged.as_ref(), gray),
     }
 }
 

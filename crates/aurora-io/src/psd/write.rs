@@ -315,21 +315,28 @@ impl Losses {
         adjustment: &aurora_doc::Adjustment,
         rounding: super::write_adjust::Rounding,
     ) {
+        // Invert, Threshold, Posterize and Brightness/Contrast (0.244.0) are
+        // whole numbers in the model and in the file: never rounded, so they
+        // have no slot and no report line.
         let slot = match adjustment {
-            aurora_doc::Adjustment::Curves(_) => 0,
-            aurora_doc::Adjustment::Levels(_) => 1,
+            aurora_doc::Adjustment::Curves(_) => Some(0),
+            aurora_doc::Adjustment::Levels(_) => Some(1),
             aurora_doc::Adjustment::HueSaturation(_)
-            | aurora_doc::Adjustment::HueSaturationRanges(_) => 2,
-            aurora_doc::Adjustment::Vibrance(_) => 3,
-            aurora_doc::Adjustment::Exposure(_) => 4,
-            aurora_doc::Adjustment::PhotoFilter(_) => 5,
-            aurora_doc::Adjustment::BlackWhite(_) => 6,
-            aurora_doc::Adjustment::ColorBalance(_) => 7,
+            | aurora_doc::Adjustment::HueSaturationRanges(_) => Some(2),
+            aurora_doc::Adjustment::Vibrance(_) => Some(3),
+            aurora_doc::Adjustment::Exposure(_) => Some(4),
+            aurora_doc::Adjustment::PhotoFilter(_) => Some(5),
+            aurora_doc::Adjustment::BlackWhite(_) => Some(6),
+            aurora_doc::Adjustment::ColorBalance(_) => Some(7),
+            aurora_doc::Adjustment::Invert
+            | aurora_doc::Adjustment::Threshold(_)
+            | aurora_doc::Adjustment::Posterize(_)
+            | aurora_doc::Adjustment::BrightnessContrast(_) => None,
         };
         self.black_white_written +=
             usize::from(matches!(adjustment, aurora_doc::Adjustment::BlackWhite(_)));
         if rounding.rounded
-            && let Some(count) = self.adjustment_rounded.get_mut(slot)
+            && let Some(count) = slot.and_then(|slot| self.adjustment_rounded.get_mut(slot))
         {
             *count += 1;
         }
@@ -730,6 +737,10 @@ pub struct PsdExpectedAdjustment {
     pub key: [u8; 4],
     /// The block's data as written, zero-padded to a multiple of four.
     pub data: Vec<u8>,
+    /// A second block written right after it (0.244.0): the `CgEd`
+    /// descriptor of a default-mode Brightness/Contrast layer, whose `brit`
+    /// block is all zeros.
+    pub extra: Option<([u8; 4], Vec<u8>)>,
     /// What Aurora's reader makes of it.
     pub readback: aurora_doc::Adjustment,
 }
@@ -1349,6 +1360,7 @@ fn plan_adjustment(
     plan.expected.adjustment = Some(PsdExpectedAdjustment {
         key: encoded.key,
         data: encoded.data,
+        extra: encoded.extra,
         readback: encoded.readback,
     });
     Ok(plan)
@@ -1430,6 +1442,13 @@ fn record_extra(plan: &LayerPlan) -> Result<Vec<u8>, IoError> {
         let len = u32::try_from(adjustment.data.len()).map_err(|_| too_large("adjustment"))?;
         extra.extend_from_slice(&len.to_be_bytes());
         extra.extend_from_slice(&adjustment.data);
+        if let Some((key, data)) = &adjustment.extra {
+            extra.extend_from_slice(b"8BIM");
+            extra.extend_from_slice(key);
+            let len = u32::try_from(data.len()).map_err(|_| too_large("adjustment"))?;
+            extra.extend_from_slice(&len.to_be_bytes());
+            extra.extend_from_slice(data);
+        }
     }
     extra.extend_from_slice(b"8BIM");
     extra.extend_from_slice(b"luni");
@@ -2327,7 +2346,9 @@ fn raw_record<R: std::io::Read + Seek>(
         adjustment_blocks,
         want.adjustment
             .iter()
-            .map(|a| (a.key, a.data.clone()))
+            .flat_map(|a| {
+                std::iter::once((a.key, a.data.clone())).chain(a.extra.iter().cloned())
+            })
             .collect::<Vec<_>>(),
     )?;
     check(
