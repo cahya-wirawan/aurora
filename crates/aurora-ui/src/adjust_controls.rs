@@ -421,9 +421,9 @@ impl AdjustSlider {
             Self::Offset => "Offset",
             Self::Gamma => "Gamma",
             Self::Density => "Density",
-            Self::Red => "Red",
-            Self::Green => "Green",
-            Self::Blue => "Blue",
+            Self::Red | Self::MixerRed => "Red",
+            Self::Green | Self::MixerGreen => "Green",
+            Self::Blue | Self::MixerBlue => "Blue",
             Self::BwReds => "Reds",
             Self::BwYellows => "Yellows",
             Self::BwGreens => "Greens",
@@ -439,9 +439,6 @@ impl AdjustSlider {
             Self::PosterizeLevels => "Levels",
             Self::Brightness => "Brightness",
             Self::Contrast => "Contrast",
-            Self::MixerRed => "Red",
-            Self::MixerGreen => "Green",
-            Self::MixerBlue => "Blue",
             Self::MixerConstant => "Constant",
             Self::SelectiveCyan => "Cyan",
             Self::SelectiveMagenta => "Magenta",
@@ -614,7 +611,7 @@ impl AdjustSlider {
     /// for a non-finite `value` or an adjustment of another kind. `range`
     /// is as for [`Self::value_of`].
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     pub fn with_value(
         self,
         adjustment: &Adjustment,
@@ -1466,7 +1463,14 @@ pub fn adjust_controls_contains(
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp, clippy::indexing_slicing)]
+#[allow(
+    clippy::float_cmp,
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    clippy::redundant_closure_for_method_calls,
+    clippy::useless_conversion,
+    clippy::map_unwrap_or
+)]
 mod tests {
     use super::{
         AdjustKind, AdjustSlider as S, adjust_controls_shown, adjust_preserve_checked,

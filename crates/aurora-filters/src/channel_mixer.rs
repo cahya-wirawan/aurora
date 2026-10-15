@@ -219,7 +219,7 @@ mod tests {
         }
         // Switching it off brings the other rows back.
         let colour = op(rows, false).apply([0.2, 0.4, 0.6]);
-        assert!(colour[0] != colour[1]);
+        assert_ne!(colour[0], colour[1]);
     }
 
     #[test]

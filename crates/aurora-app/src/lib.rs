@@ -84574,6 +84574,7 @@ mod tests {
         /// Gray mix is the first row whatever tab is selected; undo moves the
         /// editor.
         #[test]
+        #[allow(clippy::too_many_lines, clippy::redundant_closure_for_method_calls)]
         fn channel_mixer_and_selective_color_tabs_sliders_and_checkboxes_are_wired() {
             use aurora_ui::AdjustSlider as S;
             let click_tab = |rig: &mut Rig, bar: aurora_widgets::WidgetId, index: usize| {
@@ -84697,7 +84698,14 @@ mod tests {
                     .is_ok_and(|s| s.is_disabled()),
                 "the colour bar is idle outside the colour group"
             );
-            let readout = rig.adj_controls().readouts[S::SelectiveBlack.index()];
+            let readout = rig
+                .adj_controls()
+                .readouts
+                .get(S::SelectiveBlack.index())
+                .copied();
+            let Some(readout) = readout else {
+                unreachable!("a readout");
+            };
             let text = aurora_widgets::widgets::label_state(&rig.workspace.tree, readout)
                 .map(|l| l.text.clone());
             assert_eq!(
@@ -84740,6 +84748,33 @@ mod tests {
                 &rig.workspace.tree,
                 rig.adj_controls()
             ));
+            // Every selector and checkbox of the two editors settles a pending
+            // drag (`is_outcome`), like the older editors' controls.
+            let curves = rig.controls.curves;
+            let adjust = rig.adj_controls();
+            for bar in [
+                adjust.balance_range,
+                adjust.mixer_output,
+                adjust.selective_group,
+                adjust.selective_range,
+            ] {
+                assert!(crate::adjust_app::is_outcome(
+                    curves,
+                    &PointerOutcome::Action(aurora_widgets::ActionOutcome::TabSelected {
+                        bar,
+                        index: 0
+                    })
+                ));
+            }
+            for id in [adjust.mixer_mono, adjust.selective_absolute, adjust.legacy] {
+                assert!(crate::adjust_app::is_outcome(
+                    curves,
+                    &PointerOutcome::Action(aurora_widgets::ActionOutcome::Toggled {
+                        id,
+                        state: accesskit::Toggled::True
+                    })
+                ));
+            }
             // Every other editor group's sliders are idle for these layers.
             assert!(
                 [S::Vibrance, S::BalanceCyanRed, S::MixerRed, S::Brightness]
@@ -86452,6 +86487,7 @@ mod tests {
         /// 0.2, 0.4, 0.6 is 0.2 Blues, 0.2 Cyans, 0.12 Blacks, 0.48 Neutrals),
         /// neutral as an exact passthrough, alpha kept.
         #[test]
+        #[allow(clippy::indexing_slicing)]
         fn selective_color_matches_hand_worked_values_and_neutral_is_exact() {
             let selective = |set: &[(usize, [f32; 4])], absolute: bool| {
                 let mut ranges = [[0.0_f32; 4]; 9];

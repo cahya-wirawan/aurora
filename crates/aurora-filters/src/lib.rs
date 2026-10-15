@@ -62,7 +62,11 @@ mod tests {
     /// `cargo test -p aurora-filters --lib cost_probe -- --ignored --nocapture`.
     #[test]
     #[ignore = "measurement, prints timings"]
-    #[allow(clippy::cast_precision_loss, clippy::print_stderr)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::print_stderr,
+        clippy::too_many_lines
+    )]
     fn cost_probe_for_the_0_239_and_0_240_adjustments() {
         use super::{ExposureOp, PhotoFilterOp, VibranceOp};
         let count = 4096_usize * 4096;

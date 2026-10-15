@@ -44,6 +44,9 @@
 //!
 //! Input is clamped to `[0, 1]` (`NaN` reads as `0`).
 
+// Colour channels and inks are named `r g b` and `c m y k`, as in the docs.
+#![allow(clippy::many_single_char_names)]
+
 use aurora_core::SelectiveColorParams;
 
 /// The nine range weights of one straight, encoded pixel, in the

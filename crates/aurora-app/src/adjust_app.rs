@@ -216,6 +216,7 @@ pub(crate) fn settle(cx: &mut CurvesEdit<'_>, captured: Option<WidgetId>) -> boo
 /// pointer captured is a live drag (one step when it ends); a slider
 /// without capture (an arrow key, an assistive technology) and a checkbox
 /// toggle are one step each. Every real change is `Everything`.
+#[allow(clippy::too_many_lines)] // one arm per control of the editors
 pub(crate) fn apply_outcome(
     cx: &mut CurvesEdit<'_>,
     outcome: &PointerOutcome,
