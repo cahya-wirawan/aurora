@@ -1263,9 +1263,9 @@ fn a_layer_clipped_to_a_group_is_not_reported_as_unclipped() {
 
 /// `adjustments/brightnesscontrast_rgb.psd` "Brightness/Contrast 1": the
 /// `CgEd` descriptor (Brgh -95, Cntr -50), byte for byte.
-const CGED_BC1: &str = "00000010000000010000000000006e756c6c00000007000000005672736e6c6f6e670000000100000000427267686c6f6e67ffffffa100000000436e74726c6f6e67ffffffce000000056d65616e736c6f6e670000007f000000004c616220626f6f6c00000000097573654c6567616379626f6f6c00000000004175746f626f6f6c0000";
+pub(super) const CGED_BC1: &str = "00000010000000010000000000006e756c6c00000007000000005672736e6c6f6e670000000100000000427267686c6f6e67ffffffa100000000436e74726c6f6e67ffffffce000000056d65616e736c6f6e670000007f000000004c616220626f6f6c00000000097573654c6567616379626f6f6c00000000004175746f626f6f6c0000";
 /// `adjustments/brightnesscontrast_legacy_rgb.psd`'s `brit`: 20, 57, 127.
-const BRIT_LEGACY: &str = "00140039007f0000";
+pub(super) const BRIT_LEGACY: &str = "00140039007f0000";
 
 /// A `CgEd` descriptor like Photoshop's, with the given values.
 fn cged(version: i32, brightness: i32, contrast: i32, means: i32, flags: [bool; 3]) -> Vec<u8> {
