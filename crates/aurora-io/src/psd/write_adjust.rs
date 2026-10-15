@@ -95,6 +95,9 @@ pub(super) struct Rounding {
     pub colorize_ranges: bool,
 }
 
+/// A second tagged block of an adjustment record: key and data.
+pub(super) type ExtraBlock = ([u8; 4], Vec<u8>);
+
 /// One adjustment's tagged block, ready to write.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct EncodedAdjustment {
@@ -104,7 +107,7 @@ pub(super) struct EncodedAdjustment {
     pub data: Vec<u8>,
     /// A second block written after it (0.244.0): see
     /// [`super::PsdExpectedAdjustment::extra`].
-    pub extra: Option<([u8; 4], Vec<u8>)>,
+    pub extra: Option<ExtraBlock>,
     /// What the reader makes of the block (and its extra one).
     pub readback: Adjustment,
     pub rounding: Rounding,
@@ -166,7 +169,7 @@ pub(super) fn encode_adjustment(
         Adjustment::Threshold(params) => (*b"thrs", encode_level(u16::from(params.level()))),
         Adjustment::Posterize(params) => (*b"post", encode_level(u16::from(params.levels()))),
         Adjustment::BrightnessContrast(params) => {
-            let (brit, cged) = encode_brightness_contrast(params);
+            let (brit, cged) = encode_brightness_contrast(*params);
             extra = cged;
             (*b"brit", brit)
         }
@@ -602,8 +605,8 @@ fn encode_level(level: u16) -> Vec<u8> {
 /// `Lab ` false, `useLegacy` false, `Auto` false), byte for byte what
 /// `brightnesscontrast_rgb.psd` holds.
 fn encode_brightness_contrast(
-    params: &aurora_core::BrightnessContrastParams,
-) -> (Vec<u8>, Option<([u8; 4], Vec<u8>)>) {
+    params: aurora_core::BrightnessContrastParams,
+) -> (Vec<u8>, Option<ExtraBlock>) {
     let mut brit = Vec::with_capacity(8);
     if params.legacy() {
         push_i16(&mut brit, params.brightness());

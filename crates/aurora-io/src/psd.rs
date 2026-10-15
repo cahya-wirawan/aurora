@@ -3518,6 +3518,27 @@ fn adjustment_node(
     }))
 }
 
+/// Vibrance, Exposure, Photo Filter, Black & White, Color Balance
+/// (0.241.0), Invert, Threshold, Posterize and Brightness/Contrast
+/// (0.244.0) as an adjustment node, or the note saying why not.
+fn other_adjustment_node(
+    src: &mut dyn ByteSource,
+    record: &Record,
+    header: Header,
+    parsed: &read_adjust::Parsed,
+    notes: &mut Notes,
+    vector_budget: &mut vector::Budget,
+) -> Option<PsdNode> {
+    let params = read_adjust::adjustment(parsed, header.gray());
+    if let Ok(aurora_doc::Adjustment::BrightnessContrast(p)) = &params
+        && !p.legacy()
+        && !p.is_identity()
+    {
+        notes.add(Note::BrightnessContrastApproximate);
+    }
+    adjustment_node(src, record, header, params, notes, vector_budget)
+}
+
 /// One non-divider record as a layer node, or `None` when it is left out
 /// (an adjustment layer, or a fill layer with no pixels).
 fn layer_node(
@@ -3579,16 +3600,7 @@ fn layer_node(
         return hue_saturation_node(src, record, header, hue, notes, vector_budget);
     }
     if let (Some(parsed), false) = (&record.other_adjustment, record.features.adjustment) {
-        // Vibrance, Exposure, Photo Filter, Black & White, Color Balance
-        // (0.241.0).
-        let params = read_adjust::adjustment(parsed, header.gray());
-        if let Ok(aurora_doc::Adjustment::BrightnessContrast(p)) = &params
-            && !p.legacy()
-            && !p.is_identity()
-        {
-            notes.add(Note::BrightnessContrastApproximate);
-        }
-        return adjustment_node(src, record, header, params, notes, vector_budget);
+        return other_adjustment_node(src, record, header, parsed, notes, vector_budget);
     }
     if record.features.adjustment
         || record.curves.is_some()

@@ -40,6 +40,16 @@
 //! White tint colour is reduced to the HSL hue and saturation Aurora's tint
 //! uses ([`tint_hue_saturation`]).
 //!
+//! * 0.244.0, also checked against `adjustments/{invert,threshold,
+//!   posterize,brightnesscontrast}*_rgb.psd`: `nvrt` is an empty block;
+//!   `thrs` and `post` are a `u16` level and two zero bytes (`00e80000` is
+//!   level 232); `brit` is `i16` brightness, `i16` contrast, `i16` mean, a
+//!   `u8` Lab-only flag and a pad byte (the Use Legacy layer holds its
+//!   values here: `0014 0039 007f 0000`); a default-mode layer writes eight
+//!   zero bytes to `brit` and keeps its values in a `CgEd` descriptor
+//!   (`Vrsn` 1, `Brgh`, `Cntr`, `means`, `Lab `, `useLegacy`, `Auto`).
+//!   Layers using Auto, Lab-only or a mean other than 127 are left out.
+//!
 //! Every parser is total: short data, an unknown version or a hostile
 //! descriptor is an `Err`, never a panic, and nothing allocates more than
 //! the descriptor parser's bounded, byte-checked amount.
@@ -564,7 +574,7 @@ fn parse_cged(data: &[u8]) -> Result<CgedBlock, ()> {
 /// fixtures). Layers using Auto, Lab-only or a mean other than 127 are left
 /// out (nothing checked how they apply).
 fn brightness_contrast_adjustment(
-    brit: &Result<BritBlock, ()>,
+    brit: Result<BritBlock, ()>,
     cged: Option<&Result<CgedBlock, ()>>,
     gray: bool,
 ) -> Result<Adjustment, Note> {
@@ -572,7 +582,7 @@ fn brightness_contrast_adjustment(
     if gray {
         return Err(Note::Grayscale(Kind::BrightnessContrast));
     }
-    let brit = brit.as_ref().map_err(|()| unreadable())?;
+    let brit = brit.map_err(|()| unreadable())?;
     let mean = i16::from(aurora_core::BRIGHTNESS_CONTRAST_MEAN);
     let (brightness, contrast, legacy, options) = match cged {
         Some(Ok(c)) => {
@@ -581,7 +591,7 @@ fn brightness_contrast_adjustment(
             }
             let whole = |v: f64| {
                 (v.fract() == 0.0 && v.abs() <= 1_000.0)
-                    .then(|| v as i16)
+                    .then_some(v as i16)
                     .ok_or_else(unreadable)
             };
             (
@@ -653,7 +663,9 @@ pub(super) fn adjustment(parsed: &Parsed, gray: bool) -> Result<Adjustment, Note
                 .map(Adjustment::Posterize)
                 .map_err(|()| Note::Unreadable(Kind::Posterize)),
         },
-        Parsed::Brightness(brit, cged) => brightness_contrast_adjustment(brit, cged.as_ref(), gray),
+        Parsed::Brightness(brit, cged) => {
+            brightness_contrast_adjustment(*brit, cged.as_ref(), gray)
+        }
     }
 }
 

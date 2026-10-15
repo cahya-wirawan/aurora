@@ -4,6 +4,11 @@
 //! checkboxes and the Color Balance range selector), of which at most one
 //! is shown, the one matching the active layer.
 //!
+//! 0.244.0 adds four more groups: Invert (a note, no sliders), Threshold
+//! (one level slider), Posterize (one levels slider) and Brightness/Contrast
+//! (two sliders and a Use Legacy checkbox; the sliders span both modes and
+//! an edit is clamped to the layer's mode).
+//!
 //! **Where it lives.** Inside the Properties panel's tool-controls strip
 //! beside the Hue/Saturation editor ([`crate::insert_tool_controls`]), so
 //! every pointer, key and accessibility event on it reaches `aurora-app`
@@ -1636,6 +1641,7 @@ mod tests {
 
     /// 0.244.0: the four new kinds' groups, sliders and snapping.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn threshold_posterize_brightness_contrast_and_invert_editors_follow_the_document() {
         let scales = scales();
         let mut ws = crate::build_workspace(&scales);

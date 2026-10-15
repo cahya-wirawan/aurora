@@ -62,6 +62,11 @@ impl ThresholdOp {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::float_cmp,
+    clippy::cast_precision_loss,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::{LUMA, ThresholdOp, edge};
     use aurora_core::ThresholdParams;

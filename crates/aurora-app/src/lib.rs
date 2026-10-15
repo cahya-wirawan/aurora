@@ -18420,6 +18420,19 @@ fn curves_lut(params: &aurora_core::CurvesParams) -> std::rc::Rc<aurora_filters:
     })
 }
 
+/// The adjustment kind a "New ... Layer" command of 0.244.0 creates.
+fn new_adjust_kind(command: &ActivatedCommand) -> Option<aurora_ui::AdjustKind> {
+    match command {
+        ActivatedCommand::NewInvertLayer => Some(aurora_ui::AdjustKind::Invert),
+        ActivatedCommand::NewThresholdLayer => Some(aurora_ui::AdjustKind::Threshold),
+        ActivatedCommand::NewPosterizeLayer => Some(aurora_ui::AdjustKind::Posterize),
+        ActivatedCommand::NewBrightnessContrastLayer => {
+            Some(aurora_ui::AdjustKind::BrightnessContrast)
+        }
+        _ => None,
+    }
+}
+
 /// How many distinct Brightness/Contrast parameter sets
 /// [`brightness_contrast_op`] keeps built per thread (0.244.0), the Curves
 /// cache's rule: the default mode builds a 16,385-sample table.
@@ -18440,20 +18453,20 @@ thread_local! {
 
 /// `params`' op, from this thread's cache when built before.
 fn brightness_contrast_op(
-    params: &aurora_core::BrightnessContrastParams,
+    params: aurora_core::BrightnessContrastParams,
 ) -> std::rc::Rc<aurora_filters::BrightnessContrastOp> {
     BRIGHTNESS_CONTRAST_OPS.with(|cache| {
         let Ok(mut cache) = cache.try_borrow_mut() else {
-            return std::rc::Rc::new(aurora_filters::BrightnessContrastOp::new(params));
+            return std::rc::Rc::new(aurora_filters::BrightnessContrastOp::new(&params));
         };
-        if let Some((_, op)) = cache.iter().find(|(cached, _)| cached == params) {
+        if let Some((_, op)) = cache.iter().find(|(cached, _)| *cached == params) {
             return std::rc::Rc::clone(op);
         }
-        let op = std::rc::Rc::new(aurora_filters::BrightnessContrastOp::new(params));
+        let op = std::rc::Rc::new(aurora_filters::BrightnessContrastOp::new(&params));
         if cache.len() >= BRIGHTNESS_CONTRAST_CACHE_LEN {
             cache.remove(0);
         }
-        cache.push((*params, std::rc::Rc::clone(&op)));
+        cache.push((params, std::rc::Rc::clone(&op)));
         op
     })
 }
@@ -18557,7 +18570,7 @@ impl AdjustmentLut {
                 Self::Posterize(aurora_filters::PosterizeOp::new(params))
             }
             aurora_doc::Adjustment::BrightnessContrast(params) => {
-                Self::BrightnessContrast(brightness_contrast_op(params))
+                Self::BrightnessContrast(brightness_contrast_op(*params))
             }
         }
     }
@@ -21167,11 +21180,12 @@ fn begin_gpu_adjustment_pass(
         // Curves with its own table set is the first arm; a Curves
         // adjustment paired with another table kind cannot occur
         // (`AdjustmentLut::of` builds the pair from the same value).
-        (_, AdjustmentLut::Curves(_)) => return false,
-        // CPU only (0.244.0).
+        // CPU only (0.244.0): the Invert, Threshold, Posterize and
+        // Brightness/Contrast layers.
         (
             _,
-            AdjustmentLut::Invert(_)
+            AdjustmentLut::Curves(_)
+            | AdjustmentLut::Invert(_)
             | AdjustmentLut::Threshold(_)
             | AdjustmentLut::Posterize(_)
             | AdjustmentLut::BrightnessContrast(_),
@@ -30221,19 +30235,15 @@ impl App {
                     aurora_ui::AdjustKind::ColorBalance,
                 ));
             }
-            Some(ActivatedCommand::NewInvertLayer) => {
-                self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::Invert));
-            }
-            Some(ActivatedCommand::NewThresholdLayer) => {
-                self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::Threshold));
-            }
-            Some(ActivatedCommand::NewPosterizeLayer) => {
-                self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::Posterize));
-            }
-            Some(ActivatedCommand::NewBrightnessContrastLayer) => {
-                self.run_layer_command(LayerCommand::NewAdjust(
-                    aurora_ui::AdjustKind::BrightnessContrast,
-                ));
+            Some(
+                command @ (ActivatedCommand::NewInvertLayer
+                | ActivatedCommand::NewThresholdLayer
+                | ActivatedCommand::NewPosterizeLayer
+                | ActivatedCommand::NewBrightnessContrastLayer),
+            ) => {
+                if let Some(kind) = new_adjust_kind(&command) {
+                    self.run_layer_command(LayerCommand::NewAdjust(kind));
+                }
             }
             Some(ActivatedCommand::PhotoFilterPreset(index)) => {
                 self.apply_photo_filter_preset(index);
@@ -79193,8 +79203,9 @@ mod tests {
                     let mut dialog = FakeFileDialog::default();
                     assert_eq!(
                         activate_command(&mut workspace, &mut focus, id, &mut dialog),
-                        Some(activated)
+                        Some(activated.clone())
                     );
+                    assert_eq!(crate::new_adjust_kind(&activated), Some(kind), "{id}");
                     let (mut rig, [top, mid, bottom]) = Rig::three();
                     let before = rig.layers.roots().to_vec();
                     assert!(rig.run(LayerCommand::NewAdjust(kind)));
@@ -79275,7 +79286,7 @@ mod tests {
                     let mut dialog = FakeFileDialog::default();
                     assert_eq!(
                         activate_command(&mut workspace, &mut focus, id, &mut dialog),
-                        Some(activated)
+                        Some(activated.clone())
                     );
                     let (mut rig, [top, mid, bottom]) = Rig::three();
                     let before = rig.layers.roots().to_vec();
@@ -86049,16 +86060,16 @@ mod tests {
                 Err(err) => unreachable!("{err:?}"),
             };
             let (a, b, c) = (
-                crate::brightness_contrast_op(&p(20)),
-                crate::brightness_contrast_op(&p(20)),
-                crate::brightness_contrast_op(&p(21)),
+                crate::brightness_contrast_op(p(20)),
+                crate::brightness_contrast_op(p(20)),
+                crate::brightness_contrast_op(p(21)),
             );
             assert!(std::rc::Rc::ptr_eq(&a, &b));
             assert!(!std::rc::Rc::ptr_eq(&a, &c));
             for i in 0..20 {
-                let _ = crate::brightness_contrast_op(&p(i));
+                let _ = crate::brightness_contrast_op(p(i));
             }
-            let again = crate::brightness_contrast_op(&p(20));
+            let again = crate::brightness_contrast_op(p(20));
             assert_eq!(*again, *a, "an evicted entry is rebuilt equal");
         }
 

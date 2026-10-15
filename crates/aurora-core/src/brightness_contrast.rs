@@ -270,6 +270,6 @@ mod tests {
             };
             assert!(postcard::from_bytes::<P>(&wire).is_err(), "{bad:?}");
         }
-        assert!(postcard::from_bytes::<P>(&bytes[..1]).is_err());
+        assert!(postcard::from_bytes::<P>(bytes.get(..1).unwrap_or(&[])).is_err());
     }
 }

@@ -1391,7 +1391,7 @@ fn the_four_kinds_open_with_their_values_and_only_the_default_mode_is_reported()
     // The default mode: the CgEd descriptor carries the values.
     let document = ok(read(
         &file_with(b"brit", &[0; 8], |l| {
-            l.blocks.push((*b"CgEd", unhex(CGED_BC1)))
+            l.blocks.push((*b"CgEd", unhex(CGED_BC1)));
         })
         .write(),
     ));
@@ -1424,9 +1424,12 @@ fn the_four_kinds_open_with_their_values_and_only_the_default_mode_is_reported()
 
 #[test]
 fn out_of_range_and_malformed_blocks_are_left_out_with_their_own_line() {
-    let cases: [(&[u8; 4], Vec<u8>, Option<Vec<u8>>, &str); 17] = [
+    let cases: [(&[u8; 4], Vec<u8>, Option<Vec<u8>>, &str); 19] = [
         (b"thrs", level(0), None, "1 Threshold layer was left out"),
         (b"thrs", level(256), None, "1 Threshold layer was left out"),
+        // 257 and 258 would be 1 and 2 if the high byte were dropped.
+        (b"thrs", level(257), None, "1 Threshold layer was left out"),
+        (b"post", level(258), None, "1 Posterize layer was left out"),
         (
             b"thrs",
             vec![0, 1, 0],
@@ -1610,7 +1613,7 @@ fn hostile_blocks_never_panic() {
     huge.extend_from_slice(&u32::MAX.to_be_bytes());
     let document = ok(read(
         &file_with(b"brit", &[0; 8], |l| {
-            l.blocks.push((*b"CgEd", huge.clone()))
+            l.blocks.push((*b"CgEd", huge.clone()));
         })
         .write(),
     ));
@@ -1625,7 +1628,7 @@ fn hostile_blocks_never_panic() {
     for cut in 0..good.len().saturating_sub(2) {
         let document = ok(read(
             &file_with(b"brit", &[0; 8], |l| {
-                l.blocks.push((*b"CgEd", good[..cut].to_vec()))
+                l.blocks.push((*b"CgEd", good[..cut].to_vec()));
             })
             .write(),
         ));
