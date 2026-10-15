@@ -5998,6 +5998,9 @@ enum ActivatedCommand {
     NewVibranceLayer,
     NewExposureLayer,
     NewPhotoFilterLayer,
+    /// New Black & White / Color Balance Layer (0.240.0): the same.
+    NewBlackWhiteLayer,
+    NewColorBalanceLayer,
     /// A Photo Filter preset colour (0.239.0, palette only): index into
     /// [`aurora_core::PHOTO_FILTER_PRESETS`].
     PhotoFilterPreset(usize),
@@ -6251,6 +6254,8 @@ const COMMAND_LAYER_NEW_HUE_SATURATION: &str = "layer.new_hue_saturation";
 const COMMAND_LAYER_NEW_VIBRANCE: &str = "layer.new_vibrance";
 const COMMAND_LAYER_NEW_EXPOSURE: &str = "layer.new_exposure";
 const COMMAND_LAYER_NEW_PHOTO_FILTER: &str = "layer.new_photo_filter";
+const COMMAND_LAYER_NEW_BLACK_WHITE: &str = "layer.new_black_white";
+const COMMAND_LAYER_NEW_COLOR_BALANCE: &str = "layer.new_color_balance";
 const COMMAND_LAYER_NEW_GROUP: &str = "layer.new_group";
 const COMMAND_LAYER_CLIP_CREATE: &str = "layer.clip_create";
 const COMMAND_LAYER_CLIP_RELEASE: &str = "layer.clip_release";
@@ -6376,6 +6381,8 @@ fn palette_commands() -> Vec<CommandEntry> {
         CommandEntry::new(COMMAND_LAYER_NEW_VIBRANCE, "New Vibrance Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_EXPOSURE, "New Exposure Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_PHOTO_FILTER, "New Photo Filter Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_BLACK_WHITE, "New Black & White Layer"),
+        CommandEntry::new(COMMAND_LAYER_NEW_COLOR_BALANCE, "New Color Balance Layer"),
         CommandEntry::new(COMMAND_LAYER_NEW_GROUP, "New Group"),
         CommandEntry::new(COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
         CommandEntry::new(COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),
@@ -6654,6 +6661,12 @@ fn activate_command(
     }
     if id == COMMAND_LAYER_NEW_PHOTO_FILTER {
         return Some(ActivatedCommand::NewPhotoFilterLayer);
+    }
+    if id == COMMAND_LAYER_NEW_BLACK_WHITE {
+        return Some(ActivatedCommand::NewBlackWhiteLayer);
+    }
+    if id == COMMAND_LAYER_NEW_COLOR_BALANCE {
+        return Some(ActivatedCommand::NewColorBalanceLayer);
     }
     if let Some(index) = adjust_app::preset_for_command(id) {
         return Some(ActivatedCommand::PhotoFilterPreset(index));
@@ -10756,6 +10769,18 @@ fn build_menu() -> muda::Menu {
             &muda::MenuItem::with_id(
                 COMMAND_LAYER_NEW_PHOTO_FILTER,
                 "New Photo Filter Layer",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_BLACK_WHITE,
+                "New Black & White Layer",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                COMMAND_LAYER_NEW_COLOR_BALANCE,
+                "New Color Balance Layer",
                 true,
                 None,
             ),
@@ -18242,6 +18267,10 @@ enum AdjustmentLut {
     Exposure(aurora_filters::ExposureOp),
     /// Photo Filter (0.239.0): a per-pixel function.
     PhotoFilter(aurora_filters::PhotoFilterOp),
+    /// Black & White (0.240.0): a per-pixel function, never an identity.
+    BlackWhite(aurora_filters::BlackWhiteOp),
+    /// Color Balance (0.240.0): a per-pixel function.
+    ColorBalance(aurora_filters::ColorBalanceOp),
 }
 
 impl AdjustmentLut {
@@ -18265,6 +18294,12 @@ impl AdjustmentLut {
             aurora_doc::Adjustment::PhotoFilter(params) => {
                 Self::PhotoFilter(aurora_filters::PhotoFilterOp::new(params))
             }
+            aurora_doc::Adjustment::BlackWhite(params) => {
+                Self::BlackWhite(aurora_filters::BlackWhiteOp::new(params))
+            }
+            aurora_doc::Adjustment::ColorBalance(params) => {
+                Self::ColorBalance(aurora_filters::ColorBalanceOp::new(params))
+            }
         }
     }
 
@@ -18277,6 +18312,8 @@ impl AdjustmentLut {
             Self::Vibrance(op) => op.is_identity(),
             Self::Exposure(op) => op.is_identity(),
             Self::PhotoFilter(op) => op.is_identity(),
+            Self::BlackWhite(op) => op.is_identity(),
+            Self::ColorBalance(op) => op.is_identity(),
         }
     }
 
@@ -18289,6 +18326,8 @@ impl AdjustmentLut {
             Self::Vibrance(op) => op.apply(rgb),
             Self::Exposure(op) => op.apply(rgb),
             Self::PhotoFilter(op) => op.apply(rgb),
+            Self::BlackWhite(op) => op.apply(rgb),
+            Self::ColorBalance(op) => op.apply(rgb),
         }
     }
 }
@@ -20180,12 +20219,15 @@ fn adjustment_layer_qualifies_for_gpu(
                 .packed_for_gpu()
                 .is_some()
         }
-        // Vibrance, Exposure and Photo Filter (0.239.0) have no GPU pass
-        // yet: a visible layer of these kinds keeps the CPU path.
+        // Vibrance, Exposure and Photo Filter (0.239.0), Black & White and
+        // Color Balance (0.240.0) have no GPU pass yet: a visible layer of
+        // these kinds keeps the CPU path.
         Some(
             aurora_doc::Adjustment::Vibrance(_)
             | aurora_doc::Adjustment::Exposure(_)
-            | aurora_doc::Adjustment::PhotoFilter(_),
+            | aurora_doc::Adjustment::PhotoFilter(_)
+            | aurora_doc::Adjustment::BlackWhite(_)
+            | aurora_doc::Adjustment::ColorBalance(_),
         )
         | None => false,
     };
@@ -20632,7 +20674,9 @@ fn begin_gpu_adjustment_pass(
             AdjustmentLut::Curves(_)
             | AdjustmentLut::Vibrance(_)
             | AdjustmentLut::Exposure(_)
-            | AdjustmentLut::PhotoFilter(_),
+            | AdjustmentLut::PhotoFilter(_)
+            | AdjustmentLut::BlackWhite(_)
+            | AdjustmentLut::ColorBalance(_),
         ) => return false,
     }
     std::mem::swap(current_accumulator, spare_accumulator);
@@ -25557,7 +25601,8 @@ enum LayerCommand {
     NewLevels,
     /// New Hue/Saturation Layer (0.203.0): [`Self::NewLevels`]'s twin.
     NewHueSaturation,
-    /// New Vibrance / Exposure / Photo Filter Layer (0.239.0).
+    /// New Vibrance / Exposure / Photo Filter / Black & White / Color
+    /// Balance Layer (0.239.0, 0.240.0).
     NewAdjust(aurora_ui::AdjustKind),
     /// New Group (0.196.0): an empty Pass Through group directly above the
     /// active node, placed exactly where [`Self::New`] places a layer,
@@ -29477,6 +29522,14 @@ impl App {
             }
             Some(ActivatedCommand::NewPhotoFilterLayer) => {
                 self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::PhotoFilter));
+            }
+            Some(ActivatedCommand::NewBlackWhiteLayer) => {
+                self.run_layer_command(LayerCommand::NewAdjust(aurora_ui::AdjustKind::BlackWhite));
+            }
+            Some(ActivatedCommand::NewColorBalanceLayer) => {
+                self.run_layer_command(LayerCommand::NewAdjust(
+                    aurora_ui::AdjustKind::ColorBalance,
+                ));
             }
             Some(ActivatedCommand::PhotoFilterPreset(index)) => {
                 self.apply_photo_filter_preset(index);
