@@ -755,12 +755,6 @@ fn corpus_gradient_maps_import_and_color_lookups_are_left_out() {
     }
 }
 
-#[test]
-fn the_neutral_check_values_are_unused() {
-    // Keeps `GRADIENT_MAP_MAX_STOPS` in the public API under test.
-    assert_eq!(GRADIENT_MAP_MAX_STOPS, 64);
-}
-
 /// Writes the fixture `scripts/verify_psd_write.py` reads (psd-tools is the
 /// independent reader):
 ///

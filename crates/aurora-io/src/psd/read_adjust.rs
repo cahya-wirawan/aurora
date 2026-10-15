@@ -851,7 +851,7 @@ pub(super) struct FileTransparencyStop {
 /// `layers/gradient-map.psd`, the three `gradient-map-v3-*.psd` and
 /// `fill_adjustments.psd` and against psd-tools 1.17.4's `GradientMap`:
 /// `u16` version (`1`, or `3` which adds a four-character interpolation
-/// method after the flags), `u8` Reverse, `u8` Dither, [method], a unicode
+/// method after the flags), `u8` Reverse, `u8` Dither, `method`, a unicode
 /// name (`u32` count of UTF-16 units including a NUL), `u16` colour stop
 /// count and per stop `u32` location (`0..=4096`), `u32` midpoint percent,
 /// `u16` colour mode and four `u16` colour components and two pad bytes,
