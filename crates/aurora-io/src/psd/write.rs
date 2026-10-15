@@ -289,7 +289,9 @@ struct Losses {
     /// Adjustment layers with values rounded to the file's resolution
     /// (0.205.0): Curves, Levels, Hue/Saturation; and since 0.241.0 Vibrance,
     /// Exposure, Photo Filter, Black & White, Color Balance (slots 3..=7).
-    adjustment_rounded: [usize; 8],
+    adjustment_rounded: [usize; 10],
+    /// Channel Mixer layers written with Monochrome on (0.245.0).
+    mixer_monochrome: usize,
     /// Black & White layers written (0.241.0): each one's tint colour is
     /// stored as a colour made from the tint hue and saturation, and the
     /// preset name is cleared.
@@ -328,11 +330,16 @@ impl Losses {
             aurora_doc::Adjustment::PhotoFilter(_) => Some(5),
             aurora_doc::Adjustment::BlackWhite(_) => Some(6),
             aurora_doc::Adjustment::ColorBalance(_) => Some(7),
+            aurora_doc::Adjustment::ChannelMixer(_) => Some(8),
+            aurora_doc::Adjustment::SelectiveColor(_) => Some(9),
             aurora_doc::Adjustment::Invert
             | aurora_doc::Adjustment::Threshold(_)
             | aurora_doc::Adjustment::Posterize(_)
             | aurora_doc::Adjustment::BrightnessContrast(_) => None,
         };
+        self.mixer_monochrome += usize::from(
+            matches!(adjustment, aurora_doc::Adjustment::ChannelMixer(p) if p.monochrome()),
+        );
         self.black_white_written +=
             usize::from(matches!(adjustment, aurora_doc::Adjustment::BlackWhite(_)));
         if rounding.rounded
@@ -451,6 +458,8 @@ impl Losses {
             photo_filter,
             black_white,
             color_balance,
+            channel_mixer,
+            selective_color,
         ] = self.adjustment_rounded;
         if curves > 0 {
             items.push(format!(
@@ -506,10 +515,33 @@ impl Losses {
                 "Color Balance layers'",
                 "fractional values will be rounded to whole numbers.",
             ),
+            (
+                channel_mixer,
+                "Channel Mixer layer's",
+                "Channel Mixer layers'",
+                "fractional values will be rounded to whole percents.",
+            ),
+            (
+                selective_color,
+                "Selective Color layer's",
+                "Selective Color layers'",
+                "fractional values will be rounded to whole percents.",
+            ),
         ] {
             if n > 0 {
                 items.push(format!("{} {what}", plural(n as u64, one, many)));
             }
+        }
+        if self.mixer_monochrome > 0 {
+            items.push(format!(
+                "{} Gray mix will be stored in the first output row, which has not been checked \
+                 against a Photoshop file, so Photoshop may read it differently.",
+                plural(
+                    self.mixer_monochrome as u64,
+                    "Channel Mixer layer's Monochrome",
+                    "Channel Mixer layers' Monochrome"
+                )
+            ));
         }
         if self.black_white_written > 0 {
             items.push(format!(

@@ -47,6 +47,13 @@
 //!   lightness 0.5, as `doub` (Photoshop itself stores fractions there:
 //!   `225.00045776367188`).
 //! * `blnc`: nine `i16`, the preserve-luminosity byte and a pad byte.
+//! * `mixr` (0.245.0): version `1`, the Monochrome `u16`, four rows of five
+//!   `i16` (red, green, blue, the CMYK-only fourth source, constant): the
+//!   three rows of the model with a zero fourth source, then the fourth row
+//!   `0,0,0,100,0` as in the neutral fixtures. 44 bytes. Monochrome writes
+//!   the Gray mix in the first row (unverified).
+//! * `selc`: version `1`, the method `u16`, ten plates of four `i16`: an
+//!   unused zero plate, then the nine ranges in the model's order. 84 bytes.
 //!
 //! Aurora's model is finer than the file: curve points are 8-bit levels in
 //! the file, Levels values are 8-bit levels with a gamma in hundredths,
@@ -165,6 +172,10 @@ pub(super) fn encode_adjustment(
         Adjustment::PhotoFilter(params) => (*b"phfl", encode_photo_filter(params, &mut rounding)),
         Adjustment::BlackWhite(params) => (*b"blwh", encode_black_white(params, &mut rounding)),
         Adjustment::ColorBalance(params) => (*b"blnc", encode_color_balance(params, &mut rounding)),
+        Adjustment::ChannelMixer(params) => (*b"mixr", encode_channel_mixer(params, &mut rounding)),
+        Adjustment::SelectiveColor(params) => {
+            (*b"selc", encode_selective_color(params, &mut rounding))
+        }
         Adjustment::Invert => (*b"nvrt", Vec::new()),
         Adjustment::Threshold(params) => (*b"thrs", encode_level(u16::from(params.level()))),
         Adjustment::Posterize(params) => (*b"post", encode_level(u16::from(params.levels()))),
@@ -647,5 +658,53 @@ fn encode_color_balance(
         push_i16(&mut data, w);
     }
     data.push(u8::from(params.preserve_luminosity()));
+    data
+}
+
+/// A whole percent of a validated slider; `rounded` is set when that
+/// changed the value.
+#[allow(clippy::cast_possible_truncation)] // |v| <= 200
+fn whole_percent(v: f32, rounding: &mut Rounding) -> i16 {
+    let w = v.round() as i16;
+    if (f32::from(w) - v).abs() > 0.0 {
+        rounding.rounded = true;
+    }
+    w
+}
+
+fn encode_channel_mixer(
+    params: &aurora_core::ChannelMixerParams,
+    rounding: &mut Rounding,
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(44);
+    push_u16(&mut data, 1);
+    push_u16(&mut data, u16::from(params.monochrome()));
+    for row in params.rows() {
+        let [red, green, blue, constant] = row;
+        for v in [red, green, blue] {
+            push_i16(&mut data, whole_percent(v, rounding));
+        }
+        push_i16(&mut data, 0);
+        push_i16(&mut data, whole_percent(constant, rounding));
+    }
+    for v in [0, 0, 0, 100, 0] {
+        push_i16(&mut data, v);
+    }
+    data
+}
+
+fn encode_selective_color(
+    params: &aurora_core::SelectiveColorParams,
+    rounding: &mut Rounding,
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(84);
+    push_u16(&mut data, 1);
+    push_u16(&mut data, u16::from(params.absolute()));
+    for _ in 0..4 {
+        push_i16(&mut data, 0);
+    }
+    for v in params.ranges().iter().flatten() {
+        push_i16(&mut data, whole_percent(*v, rounding));
+    }
     data
 }
