@@ -565,6 +565,7 @@ mod document_session;
 mod document_tabs;
 #[cfg(test)]
 mod document_tabs_tests;
+mod export_save;
 mod fill_tools;
 mod filter_stamp;
 #[cfg(test)]
@@ -903,64 +904,6 @@ fn open_image(path: &Path) -> Result<aurora_io::Image, OpenFailure> {
             Err(OpenFailure::Decode(err))
         }
     }
-}
-
-/// Writes `bytes` to `path` without ever leaving a corrupt or partial
-/// file in `path`'s own place if something goes wrong partway through:
-/// writes to a sibling `.tmp` file first, verifies it actually reads
-/// and decodes back as a real image of exactly `width`x`height`
-/// (`aurora_io::decode_by_extension` against the file re-read from
-/// disk, not just the in-memory `bytes` — catching a truncated write,
-/// e.g. a full disk mid-write, not only a wrong encoder output), then
-/// atomically renames it over `path`. CLAUDE.md's own PSD/PSB
-/// round-trip rule applies here too, even though PNG/JPEG/TIFF aren't
-/// the round-trip-critical case that rule names: "never overwrite a
-/// user's file in place... write to temp, verify by reopening, then
-/// swap" — a half-written export silently destroying whatever used to
-/// be at `path` is exactly as bad regardless of format.
-///
-/// **Known gap, not built here**: CLAUDE.md's other half of that same
-/// rule — "warn with an itemized list before any lossy save" — has no
-/// UI to attach to yet (no warning-dialog widget exists, and this
-/// function has no way to know *why* a save might be lossy, e.g. a
-/// JPEG export silently dropping an alpha channel). Real, separate
-/// follow-on work.
-///
-/// Returns `false` (logged) on any failure — writing the temp file,
-/// reading/decoding it back, a size mismatch, or the final rename —
-/// leaving `path` itself untouched in every one of those cases; the
-/// temp file is cleaned up rather than left behind.
-#[must_use]
-fn write_verified(path: &Path, bytes: &[u8], width: u32, height: u32) -> bool {
-    let Some(file_name) = path.file_name() else {
-        tracing::warn!(path = %path.display(), "save path has no file name");
-        return false;
-    };
-    let mut temp_name = file_name.to_os_string();
-    temp_name.push(".tmp");
-    let temp_path = path.with_file_name(temp_name);
-
-    if let Err(err) = std::fs::write(&temp_path, bytes) {
-        tracing::warn!(path = %temp_path.display(), %err, "failed to write the temp export file");
-        return false;
-    }
-
-    let verified = std::fs::read(&temp_path)
-        .ok()
-        .and_then(|reread| aurora_io::decode_by_extension(path, &reread).ok())
-        .is_some_and(|image| image.width() == width && image.height() == height);
-    if !verified {
-        tracing::warn!(path = %temp_path.display(), "exported file failed to verify by reading it back");
-        let _ = std::fs::remove_file(&temp_path);
-        return false;
-    }
-
-    if let Err(err) = std::fs::rename(&temp_path, path) {
-        tracing::warn!(path = %path.display(), %err, "failed to replace the destination with the verified export");
-        let _ = std::fs::remove_file(&temp_path);
-        return false;
-    }
-    true
 }
 
 /// Whether `path`'s own extension names a real `.aur` document (ADR
@@ -1385,7 +1328,7 @@ fn create_dir_owner_only(dir: &Path) -> std::io::Result<()> {
 /// Reads `path` back as a `.aur` file, against a fresh, throwaway
 /// `aurora_tile::TileStore` ([`aur_verify_scratch_dir`]) — [`App::save_aur_file`]'s
 /// own "never leave a corrupt file in place" check, the `.aur`
-/// counterpart to [`write_verified`]'s own "decodes to the right
+/// counterpart to [`export_save::write_export_verified`]'s own "decodes to the right
 /// width/height" check for a flat image (`.aur` has no single such
 /// number to compare; successfully parsing the whole container,
 /// manifest, history, and every tile entry it names is itself the
@@ -1960,7 +1903,7 @@ fn autosave_path() -> PathBuf {
 /// Written to a **unique** sibling temp path and `rename`d into place,
 /// so a crash *during* an autosave can't leave a half-written container
 /// where the previous, complete one used to be — the same
-/// write-to-temp-then-swap discipline [`write_verified`]/
+/// write-to-temp-then-swap discipline [`export_save::write_export_verified`]/
 /// [`App::save_aur_file`] already apply to a user's real file.
 /// (`std::fs::rename` replaces an existing destination file on Windows
 /// as well as on Unix — `MOVEFILE_REPLACE_EXISTING` — so the swap is
@@ -4331,7 +4274,7 @@ enum SaveFailure {
     /// dimension limit, say).
     Encode(aurora_io::IoError),
     /// Writing, verifying by reading back, or the final rename failed
-    /// ([`write_verified`]/[`App::save_aur_file`], or a save path with no
+    /// ([`export_save::write_export_verified`]/[`App::save_aur_file`], or a save path with no
     /// file name); each of those leaves
     /// whatever was already at the path untouched and removes its own
     /// temp file. The detailed cause is in the log.
@@ -28109,6 +28052,9 @@ enum LockRefusal {
     /// A `.aur` file's selection entry was unusable and was left out
     /// (0.218.0); the document opened without it.
     SelectionDroppedOnOpen,
+    /// A save landed but the system would not confirm that its directory
+    /// entry reached the disk (0.247.0); the file is in place.
+    SaveNotConfirmed,
     /// The Clone Stamp pressed with no source set (0.221.0).
     CloneNeedsSource,
     /// The Clone Stamp with no pixel layer to sample or paint: none is
@@ -28226,6 +28172,7 @@ impl LockRefusal {
             LockRefusal::SelectionDroppedOnOpen => {
                 "This file's saved selection couldn't be restored and was left out. The rest of the document opened."
             }
+            LockRefusal::SaveNotConfirmed => aurora_io::DIR_SYNC_ADVISORY,
             LockRefusal::CloneNeedsSource => "Alt-click to set a clone source.",
             LockRefusal::CloneNeedsPixelLayer => {
                 "Select a pixel layer to clone. A group, an adjustment layer or no layer can't be sampled."
@@ -28345,6 +28292,7 @@ fn lock_refusal_applies(
                 | LockRefusal::SavedSelectionsFull
                 | LockRefusal::SavedSelectionsTooLarge
                 | LockRefusal::SelectionDroppedOnOpen
+                | LockRefusal::SaveNotConfirmed
         )
         || (matches!(
             refusal,
@@ -31971,7 +31919,7 @@ impl App {
     /// for why it, not any one layer's own `bounds`, is the real
     /// document extent), encoding via whichever format `path`'s own
     /// extension names (`aurora_io::encode_by_extension`), and writing
-    /// the result to disk with [`write_verified`]'s own "never leave a
+    /// the result to disk with [`export_save::write_export_verified`]'s own "never leave a
     /// corrupt file in place" discipline.
     ///
     /// **Scope, stated honestly**: this is the same real multi-layer
@@ -32098,8 +32046,13 @@ impl App {
             },
         };
         match psd_save::begin_psd_save(source, path) {
-            Ok(psd_save::PsdSaveStep::Saved) => {
+            Ok(
+                step @ (psd_save::PsdSaveStep::Saved | psd_save::PsdSaveStep::SavedNotConfirmed),
+            ) => {
                 tracing::info!(path = %path.display(), "saved as a lossless Photoshop file");
+                if matches!(step, psd_save::PsdSaveStep::SavedNotConfirmed) {
+                    self.note_save_advisory(Some(aurora_io::DIR_SYNC_ADVISORY));
+                }
                 psd_save::record_psd_save(&mut self.doc, path, true);
                 self.after_document_change();
                 PsdSaveOutcome::Saved
@@ -32159,13 +32112,23 @@ impl App {
         // the document is left as it is.
         match psd_save::finish_psd_save(pending, self.doc.id, self.doc.undo_order.content_revision)
         {
-            Ok(()) => {
+            Ok(advisory) => {
                 tracing::info!(path = %target.display(), "saved a Photoshop copy with changes");
+                self.note_save_advisory(advisory.as_deref());
             }
             Err(failure) => {
                 tracing::warn!(path = %target.display(), ?failure, "Save Anyway failed");
                 self.report_psd_save_failure(&target, &failure);
             }
+        }
+    }
+
+    /// A save that landed but whose directory sync failed (0.247.0): the
+    /// file is in place and the save counts as done, so only the calm
+    /// status-bar notice says the disk did not confirm it.
+    fn note_save_advisory(&mut self, advisory: Option<&str>) {
+        if advisory.is_some() {
+            self.lock_notice = Some((LockRefusal::SaveNotConfirmed, self.doc.active_layer));
         }
     }
 
@@ -32246,10 +32209,17 @@ impl App {
                 return;
             }
         };
-        if write_verified(path, &bytes, image.width(), image.height()) {
-            tracing::info!(path = %path.display(), "exported the composited document");
-        } else {
-            self.report_save_failure(path, &SaveFailure::Write);
+        // 0.247.0: the safe-save path (`export_save`); a directory-sync
+        // failure after the rename is a success with a calm notice.
+        match export_save::write_export_verified(path, &bytes, image.width(), image.height()) {
+            Ok(advisory) => {
+                tracing::info!(path = %path.display(), "exported the composited document");
+                self.note_save_advisory(advisory.as_deref());
+            }
+            Err(err) => {
+                tracing::warn!(path = %path.display(), ?err, "failed to export safely");
+                self.report_save_failure(path, &SaveFailure::Write);
+            }
         }
     }
 
@@ -32302,11 +32272,15 @@ impl App {
             import_losses: self.doc.import_losses.as_deref(),
             selection: &self.doc.selection,
         };
-        if let Err(err) = aur_save::save_aur_document(path, &source, store) {
-            tracing::warn!(path = %path.display(), ?err, "failed to save the .aur file safely");
-            self.report_save_failure(path, &SaveFailure::Write);
-            return false;
-        }
+        let advisory = match aur_save::save_aur_document(path, &source, store) {
+            Ok(advisory) => advisory,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), ?err, "failed to save the .aur file safely");
+                self.report_save_failure(path, &SaveFailure::Write);
+                return false;
+            }
+        };
+        self.note_save_advisory(advisory.as_deref());
         tracing::info!(path = %path.display(), "exported the document as .aur");
         // 0.174.0: the document now matches this file.
         let saved = document_close::after_save(&mut self.doc, path, true);
@@ -36854,7 +36828,7 @@ mod tests {
         tile_store_scratch_dir, tiles_are_bitwise_identical, toggle_command_palette,
         topmost_pixel_layer, translate_blend_mode, translate_key, translate_modifiers,
         translate_pointer_button, unwarned_failures, verify_aur, write_autosave,
-        write_session_marker, write_verified, zoom_steps_for_scroll,
+        write_session_marker, zoom_steps_for_scroll,
     };
     use super::{
         CaretStep, ControlFlow, apply_gallery_ime, caret_step, drop_stale_gallery_composition,
@@ -43742,100 +43716,6 @@ mod tests {
             !verify_aur(&garbage_path),
             "garbage bytes must not verify as a real .aur file"
         );
-    }
-
-    #[test]
-    fn write_verified_writes_a_real_verifiable_file() {
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let image = fake_image(4, 4);
-        let bytes = match aurora_io::png::encode(&image) {
-            Ok(bytes) => bytes,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let path = dir.path().join("export.png");
-
-        assert!(write_verified(&path, &bytes, 4, 4));
-        assert!(path.exists());
-        assert!(
-            !path.with_file_name("export.png.tmp").exists(),
-            "the temp file must be renamed away, not left behind"
-        );
-        let written = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let decoded = match aurora_io::decode_by_extension(&path, &written) {
-            Ok(image) => image,
-            Err(err) => {
-                unreachable!("the written file must itself be a real, decodable PNG: {err:?}")
-            }
-        };
-        assert_eq!(decoded.width(), 4);
-        assert_eq!(decoded.height(), 4);
-    }
-
-    #[test]
-    fn write_verified_rejects_corrupt_bytes_and_creates_no_destination_file() {
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let path = dir.path().join("export.png");
-
-        assert!(!write_verified(&path, b"not a real png", 4, 4));
-        assert!(
-            !path.exists(),
-            "a failed verify must not create the destination"
-        );
-        assert!(
-            !path.with_file_name("export.png.tmp").exists(),
-            "the failed temp file must be cleaned up, not left behind"
-        );
-    }
-
-    #[test]
-    fn write_verified_never_touches_an_existing_destination_on_failure() {
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let path = dir.path().join("export.png");
-        if let Err(err) = std::fs::write(&path, b"pre-existing content") {
-            unreachable!("{err:?}");
-        }
-
-        assert!(!write_verified(&path, b"not a real png", 4, 4));
-        let survived = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        assert_eq!(
-            survived, b"pre-existing content",
-            "a failed export must never overwrite what was already at the destination"
-        );
-    }
-
-    #[test]
-    fn write_verified_rejects_a_size_mismatch() {
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let image = fake_image(4, 4);
-        let bytes = match aurora_io::png::encode(&image) {
-            Ok(bytes) => bytes,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let path = dir.path().join("export.png");
-
-        // Claims the export is 8x8, but the real PNG bytes decode back
-        // as 4x4 -- must be treated as a verify failure, not silently
-        // accepted.
-        assert!(!write_verified(&path, &bytes, 8, 8));
-        assert!(!path.exists());
     }
 
     // -- keyboard shortcuts and the command palette --

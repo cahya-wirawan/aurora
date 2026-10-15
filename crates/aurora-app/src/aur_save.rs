@@ -41,12 +41,15 @@ pub(crate) struct AurSaveSource<'a> {
 /// when `verify` refuses the file; an [`IoError::Io`] when the temp file
 /// cannot be created, synced or renamed. The temp file is removed in
 /// every error case before the rename and the destination is untouched.
+///
+/// `Ok(Some(_))` (0.247.0) is a **successful** save whose directory sync
+/// failed after the rename: the file is in place, durability unconfirmed.
 pub(crate) fn replace_aur_verified(
     path: &Path,
     write: impl FnOnce(&mut File) -> Result<(), IoError>,
     verify: impl FnOnce(&Path) -> bool,
-) -> Result<(), IoError> {
-    aurora_io::replace_verified(path, write, |temp, ()| {
+) -> Result<Option<String>, IoError> {
+    aurora_io::replace_verified_advised(path, write, |temp, ()| {
         if verify(temp) {
             Ok(())
         } else {
@@ -56,6 +59,7 @@ pub(crate) fn replace_aur_verified(
             )))
         }
     })
+    .map(|((), advisory)| advisory)
 }
 
 /// [`save_aur_document`] with the verifier injected.
@@ -68,7 +72,7 @@ pub(crate) fn save_aur_document_with(
     source: &AurSaveSource<'_>,
     store: &mut aurora_tile::TileStore,
     verify: impl FnOnce(&Path) -> bool,
-) -> Result<(), IoError> {
+) -> Result<Option<String>, IoError> {
     replace_aur_verified(
         path,
         |file| {
@@ -103,7 +107,7 @@ pub(crate) fn save_aur_document(
     path: &Path,
     source: &AurSaveSource<'_>,
     store: &mut aurora_tile::TileStore,
-) -> Result<(), IoError> {
+) -> Result<Option<String>, IoError> {
     save_aur_document_with(path, source, store, crate::verify_aur)
 }
 

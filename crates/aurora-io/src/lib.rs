@@ -69,4 +69,7 @@ pub use psd::{
     encode_mask_pixels as encode_psd_mask, merged_image as decode_psd_merged_image,
     read as read_psd, read_streaming as read_psd_streaming, write_mask_pixels as write_psd_mask,
 };
-pub use safe_save::{VerifiedTemp, replace_verified, resolve_save_target, write_verified_temp};
+pub use safe_save::{
+    DIR_SYNC_ADVISORY, VerifiedTemp, replace_verified, replace_verified_advised,
+    resolve_save_target, write_verified_temp, write_verified_temp_with,
+};
