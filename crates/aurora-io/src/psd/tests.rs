@@ -2343,8 +2343,10 @@ fn grayscale_layers_expand_to_rgb_at_both_depths_with_alpha() {
                     "{depth}-bit {compression}"
                 );
             }
+            // 0.249.0: the only report line is the colour mode note.
+            assert_eq!(document.report.items.len(), 1, "{}", report_text(&document));
             assert!(
-                report_text(&document).is_empty(),
+                report_text(&document).contains("Grayscale file is held as RGB"),
                 "{}",
                 report_text(&document)
             );
@@ -4841,7 +4843,7 @@ fn curves_reporting_covers_pass_through_other_kinds_grayscale_and_refusals() {
                         l.channels.retain(|(id, _)| *id < 1);
                         l.blocks.push((
                             *b"curv",
-                            curv(1, 2, &[&[(0, 0), (147, 184), (255, 255)]], None),
+                            curv(1, 1, &[&[(0, 0), (147, 184), (255, 255)]], None),
                         ));
                     }),
                 ];
