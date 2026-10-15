@@ -84583,7 +84583,11 @@ mod tests {
                     unreachable!("tab {index}");
                 };
                 let at = rig.centre(tab);
-                println!("TABDEBUG {index} {:?} {:?}", rig.workspace.tree.bounds(tab), rig.workspace.tree.bounds(bar));
+                println!(
+                    "TABDEBUG {index} {:?} {:?}",
+                    rig.workspace.tree.bounds(tab),
+                    rig.workspace.tree.bounds(bar)
+                );
                 rig.pointer(PointerPhase::Down, at);
                 rig.pointer(PointerPhase::Up, at);
                 rig.sync();
@@ -84669,7 +84673,8 @@ mod tests {
             };
             let before = rig.undo_order.undo.len();
             let range_bar = rig.adj_controls().selective_range;
-            click_tab(&mut rig, range_bar, 6);
+            let group_bar = rig.adj_controls().selective_group;
+            click_tab(&mut rig, group_bar, 1);
             assert_eq!(
                 aurora_ui::adjust_tab(
                     &rig.workspace.tree,
@@ -84685,7 +84690,20 @@ mod tests {
             want[6] = [15.0, 0.0, 0.0, -40.0];
             assert_eq!(state(&rig), (want, false));
             assert_eq!(rig.undo_order.undo.len(), before + 2);
-            click_tab(&mut rig, range_bar, 8);
+            assert!(
+                aurora_widgets::widgets::tab_bar_state(&rig.workspace.tree, range_bar)
+                    .is_ok_and(|s| s.is_disabled()),
+                "the colour bar is idle outside the colour group"
+            );
+            let readout = rig.adj_controls().readouts[S::SelectiveBlack.index()];
+            let text = aurora_widgets::widgets::label_state(&rig.workspace.tree, readout)
+                .map(|l| l.text.clone());
+            assert_eq!(
+                text.ok().as_deref(),
+                Some("Whites, Black: -40"),
+                "names the range"
+            );
+            click_tab(&mut rig, group_bar, 3);
             assert_eq!(
                 rig.adj_slider(S::SelectiveBlack).0,
                 0.0,
@@ -84696,10 +84714,24 @@ mod tests {
             assert_eq!(state(&rig), (want, false));
             rig.adj_set(S::SelectiveYellow, 120.0);
             assert_eq!(state(&rig).0[8][2], 100.0, "sliders clamp to -100..100");
+            // Back to the colour group: the colour bar picks Blues.
+            click_tab(&mut rig, group_bar, 0);
+            click_tab(&mut rig, range_bar, 4);
+            assert_eq!(
+                aurora_ui::adjust_tab(
+                    &rig.workspace.tree,
+                    rig.adj_controls(),
+                    aurora_ui::AdjustKind::SelectiveColor
+                ),
+                4
+            );
+            rig.adj_set(S::SelectiveMagenta, -25.0);
+            want[4] = [0.0, -25.0, 0.0, 0.0];
+            assert_eq!(state(&rig), (want, false));
             let absolute = rig.adj_controls().selective_absolute;
             click(&mut rig, absolute);
             assert_eq!(state(&rig), (want, true));
-            assert_eq!(rig.undo_order.undo.len(), before + 4);
+            assert_eq!(rig.undo_order.undo.len(), before + 5);
             rig.undo();
             assert!(!state(&rig).1);
             assert!(!aurora_ui::adjust_selective_absolute_checked(
@@ -86464,11 +86496,12 @@ mod tests {
                 [0.2, 0.2, 0.6, 1.0],
                 "cyans magenta",
             );
-            // Neutrals black +100 % Absolute: s_k = 0.48; k = 0.4 -> 0.88 on all three.
+            // Neutrals black +100 % Absolute: s_k = 0.48 on all three inks
+            // (0.8, 0.6, 0.4): red and green clip, blue is 1 - 0.88.
             let _ = layers.set_adjustment(id, selective(&[(7, [0.0, 0.0, 0.0, 100.0])], true));
             assert_close(
                 first(&layers, &mut store),
-                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.12, 1.0],
                 "neutrals black",
             );
             // Whites touch nothing here (no lightness above half).
