@@ -1668,9 +1668,16 @@ mod tests {
         assert_eq!(list_node.role(), Role::ListBox);
         assert_eq!(list_node.label(), Some("Blend mode"));
 
-        let Some(rows) = tree.children(list) else {
+        let Some(body) = state.body() else {
+            unreachable!("open means a scroll container exists");
+        };
+        let Some(rows) = tree.children(body) else {
             unreachable!("just inserted");
         };
+        assert_eq!(
+            tree.children(list),
+            Some([body, state_bar(&state)].as_slice())
+        );
         assert_eq!(rows, state.rows());
         assert_eq!(rows.len(), 3);
         let mut selected = 0;
@@ -2194,8 +2201,9 @@ mod tests {
             unreachable!("open");
         };
         let order = tree.paint_order();
-        let mut expected_tail = vec![list];
+        let mut expected_tail = vec![list, body_id(&state)];
         expected_tail.extend_from_slice(state.rows());
+        expected_tail.push(state_bar(&state));
         assert!(
             order.ends_with(&expected_tail),
             "{order:?} must end with {expected_tail:?}"
@@ -2246,6 +2254,20 @@ mod tests {
         );
     }
 
+    fn body_id(state: &DropdownState) -> WidgetId {
+        match state.body() {
+            Some(body) => body,
+            None => unreachable!("open means a scroll container exists"),
+        }
+    }
+
+    fn state_bar(state: &DropdownState) -> WidgetId {
+        match state.scrollbar() {
+            Some(bar) => bar,
+            None => unreachable!("open means a scrollbar exists"),
+        }
+    }
+
     fn list_children(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Vec<WidgetId> {
         tree.children(id)
             .unwrap_or_default()
@@ -2272,7 +2294,10 @@ mod tests {
             vec![list],
             "exactly one list child"
         );
-        assert_eq!(tree.children(list), Some(state.rows()));
+        assert_eq!(
+            state.body().and_then(|body| tree.children(body)),
+            Some(state.rows())
+        );
         assert_eq!(state.rows().len(), state.options().len());
         for (index, &row) in state.rows().iter().enumerate() {
             assert!(tree.contains(row));

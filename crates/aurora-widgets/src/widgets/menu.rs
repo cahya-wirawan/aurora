@@ -1297,6 +1297,13 @@ mod tests {
         assert!(tree.contains(menu));
     }
 
+    /// The widget the item rows are children of (the scroll container).
+    fn items_of(tree: &WidgetTree<WidgetKind>, menu: WidgetId) -> WidgetId {
+        ok(ok(menu_state(tree, menu))
+            .body()
+            .ok_or(WidgetError::UnknownWidget(menu)))
+    }
+
     fn press(tree: &mut WidgetTree<WidgetKind>, menu: WidgetId, key: MenuKey) -> MenuOutcome {
         ok(handle_menu_key(tree, menu, key))
     }
@@ -1321,7 +1328,7 @@ mod tests {
     fn open_menu_builds_a_menu_with_one_child_per_item_in_order() {
         let (tree, menu) = opened(items());
         let state = snapshot(&tree, menu);
-        assert_eq!(tree.children(menu), Some(state.item_ids()));
+        assert_eq!(tree.children(items_of(&tree, menu)), Some(state.item_ids()));
         assert_eq!(state.item_ids().len(), 5);
         let roles: Vec<Option<Role>> = state
             .item_ids()
@@ -1506,7 +1513,11 @@ mod tests {
             crate::hit_test(&tree, f64::from(x), f64::from(y)),
             Some(last)
         );
-        assert_eq!(tree.paint_order().last(), Some(&last));
+        let order = tree.paint_order();
+        assert!(
+            order.iter().position(|&id| id == last) > order.iter().position(|&id| id == menu),
+            "the item paints after its menu"
+        );
     }
 
     #[test]
@@ -1597,7 +1608,7 @@ mod tests {
         assert_eq!(press(&mut tree, menu, MenuKey::Down), MenuOutcome::Moved(1));
         let state = snapshot(&tree, menu);
         assert_eq!(state.item_ids().len(), 5);
-        assert_eq!(tree.children(menu), Some(state.item_ids()));
+        assert_eq!(tree.children(items_of(&tree, menu)), Some(state.item_ids()));
         let Some(&new_copy) = state.item_ids().get(1) else {
             unreachable!("five items");
         };
@@ -1629,7 +1640,7 @@ mod tests {
         assert_eq!(tree.payload(button).cloned(), button_payload);
         let state = snapshot(&tree, menu);
         assert!(!state.item_ids().contains(&button));
-        assert_eq!(tree.children(menu), Some(state.item_ids()));
+        assert_eq!(tree.children(items_of(&tree, menu)), Some(state.item_ids()));
     }
 
     /// RT-1 (review): a stale [`MenuState`] written back after a move
@@ -1682,7 +1693,7 @@ mod tests {
         ok(tree.remove(cut));
         assert_eq!(press(&mut tree, menu, MenuKey::Home), MenuOutcome::Ignored);
         let state = snapshot(&tree, menu);
-        assert_eq!(tree.children(menu), Some(state.item_ids()));
+        assert_eq!(tree.children(items_of(&tree, menu)), Some(state.item_ids()));
         let Some(&new_cut) = state.item_ids().first() else {
             unreachable!("five items");
         };
@@ -1741,7 +1752,7 @@ mod tests {
         assert_eq!(press(&mut tree, menu, MenuKey::Down), MenuOutcome::Moved(1));
         assert!(!tree.contains(copy), "the overwritten item is gone");
         let state = snapshot(&tree, menu);
-        assert_eq!(tree.children(menu), Some(state.item_ids()));
+        assert_eq!(tree.children(items_of(&tree, menu)), Some(state.item_ids()));
         assert_eq!(state.item_ids().len(), 5);
     }
 

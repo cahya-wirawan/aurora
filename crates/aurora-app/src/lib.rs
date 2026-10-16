@@ -34522,6 +34522,28 @@ impl App {
             }
             return;
         }
+        // 0.259.0: over an open menu or dropdown list the wheel scrolls
+        // that list (it neither zooms the canvas nor closes the list).
+        if self.dialog.is_none()
+            && let Some(list) =
+                aurora_widgets::widgets::popup_scroll_target(&self.workspace.tree, position)
+        {
+            if scroll_panel(
+                &mut self.workspace.tree,
+                list,
+                delta,
+                self.scale_factor,
+                &self.scales,
+            ) {
+                let window_size = self.window.as_ref().map(|window| window.inner_size());
+                if let Some(size) = window_size {
+                    self.apply_resize((size.width, size.height));
+                }
+                self.push_accessibility();
+                self.needs_redraw = true;
+            }
+            return;
+        }
         let pointer_owned = self.drag.is_some()
             || self.rail_resize.is_some()
             || self.panel_drag.is_some()

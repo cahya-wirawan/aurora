@@ -599,3 +599,6 @@ mod tests {
         assert_eq!(tree.payload(row), Some(&WidgetKind::Container));
     }
 }
+
+#[cfg(test)]
+mod popup_scroll_tests;
