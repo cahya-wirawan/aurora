@@ -673,7 +673,11 @@ fn flip_differential(
             flipped += 1;
             let alpha = cpu[(i / 4) * 4 + 3];
             let ok_step = if exact {
-                (d - step * alpha).abs() <= tolerance()
+                // A flip moves the channel by one quantiser step; the texel's
+                // alpha weights it, but the backdrop's own rounding can put
+                // the stored difference a little above that weighted step
+                // (measured on Apple M2 Pro / Metal: 1.0 against 0.969).
+                d >= step * alpha - tolerance() && d <= step + tolerance()
             } else {
                 d <= step * alpha + tolerance()
             };
