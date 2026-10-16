@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.252.0] - 2026-10-16
+
+### Changed
+
+- Upgrade zip to 9.0.3
+
 ## [0.251.0] - 2026-10-16
 
 ### Added
