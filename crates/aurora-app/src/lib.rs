@@ -45558,6 +45558,7 @@ mod tests {
     /// genuinely centred horizontally, not just "not zero."
     #[test]
     fn opening_the_palette_gives_it_a_real_centred_size_and_position() {
+        use aurora_widgets::widgets::row_height as widgets_row_height;
         let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
@@ -45572,7 +45573,16 @@ mod tests {
             unreachable!("just laid out");
         };
         assert_eq!(bounds.width, 480, "must be the real, fixed palette width");
-        assert_eq!(bounds.height, 320, "must be the real, fixed palette height");
+        let scales = crate::test_workspace_scales();
+        let strip = widgets_row_height(&scales) + f32::from(u16::try_from(scales.spacing.xs).unwrap_or(0));
+        #[allow(clippy::cast_precision_loss)]
+        let rows = scales.size.content_panel_max_rows as f32;
+        #[allow(clippy::cast_possible_truncation)]
+        let expected = (strip + rows * widgets_row_height(&scales)) as u32;
+        assert_eq!(
+            bounds.height, expected,
+            "no fixed height since 0.257.0: the strip plus the capped rows"
+        );
         assert_eq!(bounds.y, 96, "must sit at the real, fixed top inset");
         assert_eq!(
             bounds.x, 260,
@@ -96518,3 +96528,6 @@ mod fill_tests;
 
 #[cfg(test)]
 mod menu_bar_tests;
+
+#[cfg(test)]
+mod palette_scroll_app_tests;

@@ -875,14 +875,18 @@ fn select_index(
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandEntry, command_palette_state, insert_command_palette, insert_command_prompt,
-        move_command_palette_selection, set_command_palette_commands, set_command_palette_message,
-        set_command_palette_query,
+        CommandEntry, PaletteStep, command_palette_state, insert_command_palette,
+        insert_command_prompt, move_command_palette_selection, select_command_palette_at,
+        set_command_palette_commands, set_command_palette_message, set_command_palette_query,
+        step_command_palette_selection,
     };
     use crate::WidgetError;
     use crate::shortcut::KeyChord;
-    use crate::widgets::{WidgetKind, new_tree};
+    use aurora_core::Rect;
+    use crate::tree::{WidgetId, WidgetTree};
+    use crate::widgets::{WidgetKind, new_tree, row_height, test_scales};
     use taffy::Style;
+    use taffy::style_helpers::{auto, length};
 
     fn commands() -> Vec<CommandEntry> {
         vec![
@@ -895,13 +899,127 @@ mod tests {
         ]
     }
 
+    fn ok<T>(result: Result<T, WidgetError>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn palette_in(
+        tree: &mut WidgetTree<WidgetKind>,
+        root: WidgetId,
+        commands: Vec<CommandEntry>,
+    ) -> WidgetId {
+        ok(insert_command_palette(tree, root, commands, &test_scales()))
+    }
+
+    /// `aurora-app`'s `command_palette_style`: an absolutely placed,
+    /// 480 px wide, auto-height root under a 96 px top inset.
+    fn app_style() -> Style {
+        Style {
+            position: taffy::Position::Absolute,
+            size: taffy::Size {
+                width: length(480.0_f32),
+                height: auto(),
+            },
+            inset: taffy::Rect {
+                top: length(96.0_f32),
+                left: length(0.0_f32),
+                right: length(0.0_f32),
+                bottom: auto(),
+            },
+            margin: taffy::Rect {
+                left: auto(),
+                right: auto(),
+                top: length(0.0_f32),
+                bottom: length(0.0_f32),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A tree whose root is the window, as in the app.
+    fn window_tree(width: f32, height: f32) -> (WidgetTree<WidgetKind>, WidgetId) {
+        new_tree(Style {
+            size: taffy::Size {
+                width: length(width),
+                height: length(height),
+            },
+            ..Default::default()
+        })
+    }
+
+    fn many(count: usize) -> Vec<CommandEntry> {
+        (0..count)
+            .map(|n| CommandEntry::new(format!("cmd.{n}"), format!("Command {n}")))
+            .collect()
+    }
+
+    /// A palette of `count` commands as the app opens it, laid out
+    /// text-aware-style (`compute_text_layout`, which syncs the linked
+    /// scrollbar) in a `width` x `height` logical window.
+    fn opened(count: usize, width: f32, height: f32) -> (WidgetTree<WidgetKind>, WidgetId) {
+        let (mut tree, root) = window_tree(width, height);
+        let palette = palette_in(&mut tree, root, many(count));
+        ok(tree.set_style(palette, app_style()));
+        crate::compute_text_layout(&mut tree, width, height, None);
+        (tree, palette)
+    }
+
+    fn relayout(tree: &mut WidgetTree<WidgetKind>, width: f32, height: f32) {
+        crate::compute_text_layout(tree, width, height, None);
+    }
+
+    fn bounds(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Rect {
+        match tree.bounds(id) {
+            Some(rect) => rect,
+            None => unreachable!("laid out"),
+        }
+    }
+
+    fn row_h() -> i64 {
+        #[allow(clippy::cast_possible_truncation)]
+        let h = row_height(&test_scales()) as i64;
+        h
+    }
+
+    fn strip_h() -> i64 {
+        row_h() + i64::from(test_scales().spacing.xs)
+    }
+
+    fn visible_cap() -> i64 {
+        i64::from(test_scales().size.content_panel_max_rows)
+    }
+
+    fn selected_index(tree: &WidgetTree<WidgetKind>, palette: WidgetId) -> Option<usize> {
+        ok(command_palette_state(tree, palette)).selected_index()
+    }
+
+    fn selected_id(tree: &WidgetTree<WidgetKind>, palette: WidgetId) -> Option<String> {
+        ok(command_palette_state(tree, palette))
+            .selected()
+            .map(|c| c.id.clone())
+    }
+
+    fn rows_of(tree: &WidgetTree<WidgetKind>, palette: WidgetId) -> Vec<WidgetId> {
+        ok(command_palette_state(tree, palette)).rows().to_vec()
+    }
+
+    /// The selected row lies wholly inside the viewport.
+    fn selected_is_inside_viewport(tree: &WidgetTree<WidgetKind>, palette: WidgetId) -> bool {
+        let state = ok(command_palette_state(tree, palette));
+        let Some(row) = state.selected_row() else {
+            return false;
+        };
+        let (r, v) = (bounds(tree, row), bounds(tree, state.viewport()));
+        r.y >= v.y && r.bottom() <= v.bottom()
+    }
+
     #[test]
     fn insert_command_palette_starts_with_every_command_matching_the_empty_query() {
         let (mut tree, root) = new_tree(Style::default());
-        let palette = match insert_command_palette(&mut tree, root, commands()) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
+        let palette = palette_in(&mut tree, root, commands());
 
         let Some(accessibility) = tree.accessibility(palette) else {
             unreachable!("just inserted");
@@ -909,17 +1027,14 @@ mod tests {
         assert_eq!(accessibility.role(), accesskit::Role::TextInput);
         assert_eq!(accessibility.value(), Some(""));
 
-        let state = match command_palette_state(&tree, palette) {
-            Ok(state) => state,
-            Err(err) => unreachable!("{err:?}"),
-        };
+        let state = ok(command_palette_state(&tree, palette));
         assert_eq!(state.results().len(), 3);
         assert_eq!(state.selected().map(|c| c.id.as_str()), Some("view.layers"));
 
-        let Some(rows) = tree.children(state.body()).and_then(|c| c.get(1..)) else {
+        let Some(rows) = tree.children(state.body()) else {
             unreachable!("just inserted");
         };
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 3, "the body holds exactly the result rows");
         let Some(&first_row) = rows.first() else {
             unreachable!("just asserted len() == 3");
         };
@@ -929,39 +1044,34 @@ mod tests {
         assert_eq!(first_accessibility.role(), accesskit::Role::ListBoxOption);
         assert_eq!(first_accessibility.label(), Some("Focus Layers Panel"));
         assert_eq!(first_accessibility.is_selected(), Some(true));
+        let Some(body_accessibility) = tree.accessibility(state.body()) else {
+            unreachable!("just inserted");
+        };
+        assert_eq!(body_accessibility.role(), accesskit::Role::ListBox);
     }
 
     #[test]
     fn insert_command_palette_rejects_an_unknown_parent() {
         let (mut tree, _root) = new_tree(Style::default());
         let bogus = accesskit::NodeId(999);
-        match insert_command_palette(&mut tree, bogus, commands()) {
+        match insert_command_palette(&mut tree, bogus, commands(), &test_scales()) {
             Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
             other => unreachable!("expected UnknownWidget, got {other:?}"),
         }
+        assert_eq!(tree.len(), 1, "nothing is left behind");
     }
 
     #[test]
     fn set_query_narrows_results_to_a_case_insensitive_title_match() {
         let (mut tree, root) = new_tree(Style::default());
-        let palette = match insert_command_palette(&mut tree, root, commands()) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
+        let palette = palette_in(&mut tree, root, commands());
+        ok(set_command_palette_query(&mut tree, palette, "undo"));
 
-        if let Err(err) = set_command_palette_query(&mut tree, palette, "undo") {
-            unreachable!("{err:?}");
-        }
-
-        let state = match command_palette_state(&tree, palette) {
-            Ok(state) => state,
-            Err(err) => unreachable!("{err:?}"),
-        };
+        let state = ok(command_palette_state(&tree, palette));
         assert_eq!(state.query(), "undo");
         let results = state.results();
         assert_eq!(results.len(), 1);
         assert_eq!(results.first().map(|c| c.id.as_str()), Some("edit.undo"));
-
         let Some(accessibility) = tree.accessibility(palette) else {
             unreachable!("just queried");
         };
@@ -971,306 +1081,131 @@ mod tests {
     #[test]
     fn set_query_matching_nothing_leaves_no_rows_and_no_selection() {
         let (mut tree, root) = new_tree(Style::default());
-        let palette = match insert_command_palette(&mut tree, root, commands()) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        if let Err(err) = set_command_palette_query(&mut tree, palette, "nonexistent") {
-            unreachable!("{err:?}");
-        }
+        let palette = palette_in(&mut tree, root, commands());
+        ok(set_command_palette_query(&mut tree, palette, "nonexistent"));
 
-        let state = match command_palette_state(&tree, palette) {
-            Ok(state) => state,
-            Err(err) => unreachable!("{err:?}"),
-        };
+        let state = ok(command_palette_state(&tree, palette));
         assert!(state.results().is_empty());
         assert_eq!(state.selected(), None);
-        // Only the query strip is left: it stays visible with no results.
-        assert_eq!(
-            tree.children(state.body()),
-            Some([state.query_strip()].as_slice())
-        );
+        assert_eq!(tree.children(state.body()).map(<[_]>::len), Some(0));
+        assert!(tree.contains(state.query_strip()), "the strip stays");
     }
 
     #[test]
     fn narrowing_the_query_removes_stale_rows_from_the_tree() {
         let (mut tree, root) = new_tree(Style::default());
-        let palette = match insert_command_palette(&mut tree, root, commands()) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let body = match command_palette_state(&tree, palette) {
-            Ok(state) => state.body(),
-            Err(err) => unreachable!("{err:?}"),
-        };
-        // The query strip plus one row per result.
-        assert_eq!(tree.children(body).map(<[_]>::len), Some(4));
-
-        if let Err(err) = set_command_palette_query(&mut tree, palette, "focus") {
-            unreachable!("{err:?}");
-        }
-        // "Undo" doesn't match "focus" -- its row must be gone, not just
-        // unlisted in `results()`.
+        let palette = palette_in(&mut tree, root, commands());
+        let body = ok(command_palette_state(&tree, palette)).body();
         assert_eq!(tree.children(body).map(<[_]>::len), Some(3));
+        ok(set_command_palette_query(&mut tree, palette, "focus"));
+        assert_eq!(tree.children(body).map(<[_]>::len), Some(2));
     }
 
     #[test]
     fn move_selection_wraps_forward_and_backward() {
         let (mut tree, root) = new_tree(Style::default());
-        let palette = match insert_command_palette(&mut tree, root, commands()) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-
-        let selected_id = |tree: &crate::WidgetTree<WidgetKind>| {
-            command_palette_state(tree, palette)
-                .ok()
-                .and_then(super::CommandPaletteState::selected)
-                .map(|c| c.id.clone())
-        };
-
-        assert_eq!(selected_id(&tree).as_deref(), Some("view.layers"));
-        if let Err(err) = move_command_palette_selection(&mut tree, palette, true) {
-            unreachable!("{err:?}");
-        }
-        assert_eq!(selected_id(&tree).as_deref(), Some("view.history"));
-        if let Err(err) = move_command_palette_selection(&mut tree, palette, true) {
-            unreachable!("{err:?}");
-        }
-        assert_eq!(selected_id(&tree).as_deref(), Some("edit.undo"));
-        if let Err(err) = move_command_palette_selection(&mut tree, palette, true) {
-            unreachable!("{err:?}");
-        }
+        let palette = palette_in(&mut tree, root, commands());
+        assert_eq!(selected_id(&tree, palette).as_deref(), Some("view.layers"));
+        ok(move_command_palette_selection(&mut tree, palette, true));
+        assert_eq!(selected_id(&tree, palette).as_deref(), Some("view.history"));
+        ok(move_command_palette_selection(&mut tree, palette, true));
+        assert_eq!(selected_id(&tree, palette).as_deref(), Some("edit.undo"));
+        ok(move_command_palette_selection(&mut tree, palette, true));
         assert_eq!(
-            selected_id(&tree).as_deref(),
+            selected_id(&tree, palette).as_deref(),
             Some("view.layers"),
             "must wrap back to the first result"
         );
-
-        if let Err(err) = move_command_palette_selection(&mut tree, palette, false) {
-            unreachable!("{err:?}");
-        }
+        ok(move_command_palette_selection(&mut tree, palette, false));
         assert_eq!(
-            selected_id(&tree).as_deref(),
+            selected_id(&tree, palette).as_deref(),
             Some("edit.undo"),
             "moving backward from the first result must wrap to the last"
         );
     }
 
     #[test]
-    fn move_selection_updates_the_selected_accessibility_flag_on_the_real_rows() {
+    fn move_selection_updates_the_flags_on_the_real_rows() {
         let (mut tree, root) = new_tree(Style::default());
-        let palette = match insert_command_palette(&mut tree, root, commands()) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
+        let palette = palette_in(&mut tree, root, commands());
+        let rows = rows_of(&tree, palette);
+        let (Some(&first_row), Some(&second_row)) = (rows.first(), rows.get(1)) else {
+            unreachable!("3 commands were inserted above");
         };
-        let (first_row, second_row) = {
-            let state = match command_palette_state(&tree, palette) {
-                Ok(state) => state,
-                Err(err) => unreachable!("{err:?}"),
-            };
-            let Some(rows) = tree.children(state.body()).and_then(|c| c.get(1..)) else {
-                unreachable!("just inserted");
-            };
-            let (Some(&a), Some(&b)) = (rows.first(), rows.get(1)) else {
-                unreachable!("3 commands were inserted above");
-            };
-            (a, b)
-        };
+        ok(move_command_palette_selection(&mut tree, palette, true));
 
-        if let Err(err) = move_command_palette_selection(&mut tree, palette, true) {
-            unreachable!("{err:?}");
-        }
-
-        let Some(first_accessibility) = tree.accessibility(first_row) else {
-            unreachable!("still exists");
+        let flag = |row| tree.accessibility(row).and_then(accesskit::Node::is_selected);
+        assert_eq!(flag(first_row), Some(false));
+        assert_eq!(flag(second_row), Some(true));
+        let payload = |selected| {
+            WidgetKind::ListRow(super::ListRowState {
+                selected,
+                disabled: false,
+                draws_label: false,
+            })
         };
-        assert_eq!(first_accessibility.is_selected(), Some(false));
-        let Some(second_accessibility) = tree.accessibility(second_row) else {
-            unreachable!("still exists");
-        };
-        assert_eq!(second_accessibility.is_selected(), Some(true));
+        assert_eq!(
+            tree.payload(first_row),
+            Some(&payload(false)),
+            "paint_widget reads the payload, so it must clear too"
+        );
+        assert_eq!(tree.payload(second_row), Some(&payload(true)));
     }
 
     #[test]
     fn move_selection_is_a_no_op_when_nothing_matches() {
         let (mut tree, root) = new_tree(Style::default());
-        let palette = match insert_command_palette(&mut tree, root, commands()) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        if let Err(err) = set_command_palette_query(&mut tree, palette, "nonexistent") {
-            unreachable!("{err:?}");
-        }
-        match move_command_palette_selection(&mut tree, palette, true) {
-            Ok(None) => {}
-            other => unreachable!("expected Ok(None), got {other:?}"),
-        }
+        let palette = palette_in(&mut tree, root, commands());
+        ok(set_command_palette_query(&mut tree, palette, "nonexistent"));
+        assert_eq!(
+            ok(move_command_palette_selection(&mut tree, palette, true)),
+            None
+        );
+        assert_eq!(
+            ok(step_command_palette_selection(
+                &mut tree,
+                palette,
+                PaletteStep::PageDown
+            )),
+            None
+        );
     }
 
     #[test]
-    fn command_palette_mutators_reject_a_wrong_widget_kind() {
+    fn command_palette_mutators_reject_a_wrong_widget_kind_and_an_unknown_widget() {
         let (mut tree, root) = new_tree(Style::default());
         match set_command_palette_query(&mut tree, root, "x") {
             Err(WidgetError::WrongWidgetKind(id)) => assert_eq!(id, root),
             other => unreachable!("expected WrongWidgetKind, got {other:?}"),
+        }
+        let bogus = accesskit::NodeId(999);
+        match set_command_palette_query(&mut tree, bogus, "x") {
+            Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
+            other => unreachable!("expected UnknownWidget, got {other:?}"),
+        }
+        match select_command_palette_at(&mut tree, bogus, (0.0, 0.0)) {
+            Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
+            other => unreachable!("expected UnknownWidget, got {other:?}"),
         }
     }
 
     #[test]
     fn rows_are_real_list_row_widgets_with_only_the_first_selected() {
         let (mut tree, root) = new_tree(Style::default());
-        let palette = match insert_command_palette(&mut tree, root, commands()) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let body = match command_palette_state(&tree, palette) {
-            Ok(state) => state.body(),
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let Some(rows) = tree.children(body).and_then(|c| c.get(1..)) else {
-            unreachable!("just inserted");
-        };
+        let palette = palette_in(&mut tree, root, commands());
+        let rows = rows_of(&tree, palette);
         let (Some(&first), Some(&second)) = (rows.first(), rows.get(1)) else {
             unreachable!("3 commands were inserted above");
         };
-        assert_eq!(
-            tree.payload(first),
-            Some(&WidgetKind::ListRow(super::ListRowState {
-                selected: true,
+        let payload = |selected| {
+            WidgetKind::ListRow(super::ListRowState {
+                selected,
                 disabled: false,
                 draws_label: false,
-            }))
-        );
-        assert_eq!(
-            tree.payload(second),
-            Some(&WidgetKind::ListRow(super::ListRowState {
-                selected: false,
-                disabled: false,
-                draws_label: false,
-            }))
-        );
-    }
-
-    #[test]
-    fn move_selection_updates_the_list_row_payloads_own_selected_flag_too() {
-        let (mut tree, root) = new_tree(Style::default());
-        let palette = match insert_command_palette(&mut tree, root, commands()) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
+            })
         };
-        let (first_row, second_row) = {
-            let state = match command_palette_state(&tree, palette) {
-                Ok(state) => state,
-                Err(err) => unreachable!("{err:?}"),
-            };
-            let Some(rows) = tree.children(state.body()).and_then(|c| c.get(1..)) else {
-                unreachable!("just inserted");
-            };
-            let (Some(&a), Some(&b)) = (rows.first(), rows.get(1)) else {
-                unreachable!("3 commands were inserted above");
-            };
-            (a, b)
-        };
-
-        if let Err(err) = move_command_palette_selection(&mut tree, palette, true) {
-            unreachable!("{err:?}");
-        }
-
-        assert_eq!(
-            tree.payload(first_row),
-            Some(&WidgetKind::ListRow(super::ListRowState {
-                selected: false,
-                disabled: false,
-                draws_label: false,
-            })),
-            "the row moved away from must clear its own payload flag, not just its accessibility \
-             one -- paint_widget reads the payload"
-        );
-        assert_eq!(
-            tree.payload(second_row),
-            Some(&WidgetKind::ListRow(super::ListRowState {
-                selected: true,
-                disabled: false,
-                draws_label: false,
-            }))
-        );
-    }
-
-    /// Headless (no GPU) proof that the real layout `body_style`/
-    /// `row_style` apply actually produces non-degenerate, vertically
-    /// stacked row bounds -- written *before* asking for a gallery
-    /// bless, the same "prove the layout half without a GPU first"
-    /// discipline `command_palette_style_positions_the_panel_with_a_
-    /// real_margin` (`tests/gallery.rs`) already established. Without
-    /// this, `paint_list_row`'s own highlight would tessellate to a
-    /// real mesh but at a degenerate zero-size rect -- invisible, not a
-    /// compile or logic error, so only a real bounds assertion catches
-    /// it.
-    #[test]
-    fn results_stack_vertically_and_share_the_panels_height() {
-        let (mut tree, root) = new_tree(Style::default());
-        let palette = match insert_command_palette(&mut tree, root, commands()) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        if let Err(err) = tree.set_style(
-            palette,
-            Style {
-                size: taffy::Size {
-                    width: taffy::style_helpers::length(300.0_f32),
-                    height: taffy::style_helpers::length(210.0_f32),
-                },
-                ..Default::default()
-            },
-        ) {
-            unreachable!("{err:?}");
-        }
-        tree.compute_layout(400.0, 300.0);
-
-        let body = match command_palette_state(&tree, palette) {
-            Ok(state) => state.body(),
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let Some(rows) = tree.children(body) else {
-            unreachable!("just inserted");
-        };
-        assert_eq!(
-            rows.len(),
-            4,
-            "the query strip plus all 3 commands matching the empty query"
-        );
-
-        let mut previous_bottom = None;
-        for &row in rows {
-            let Some(bounds) = tree.bounds(row) else {
-                unreachable!("just laid out");
-            };
-            assert!(bounds.width > 0, "a row must span real width: {bounds:?}");
-            assert!(bounds.height > 0, "a row must span real height: {bounds:?}");
-            if let Some(previous_bottom) = previous_bottom {
-                assert_eq!(
-                    bounds.y, previous_bottom,
-                    "rows must stack directly on top of one another, no gap or overlap"
-                );
-            }
-            previous_bottom = Some(bounds.y + i64::from(bounds.height));
-        }
-        assert_eq!(
-            previous_bottom,
-            tree.bounds(body).map(|b| b.y + i64::from(b.height)),
-            "the 3 rows together must exactly fill the body's own height"
-        );
-    }
-
-    #[test]
-    fn command_palette_mutators_reject_an_unknown_widget() {
-        let (mut tree, _root) = new_tree(Style::default());
-        let bogus = accesskit::NodeId(999);
-        match set_command_palette_query(&mut tree, bogus, "x") {
-            Err(WidgetError::UnknownWidget(id)) => assert_eq!(id, bogus),
-            other => unreachable!("expected UnknownWidget, got {other:?}"),
-        }
+        assert_eq!(tree.payload(first), Some(&payload(true)));
+        assert_eq!(tree.payload(second), Some(&payload(false)));
     }
 
     /// 0.168.0: a prompt is the palette with its own name and no
@@ -1279,17 +1214,15 @@ mod tests {
     #[test]
     fn a_prompt_never_filters_and_carries_its_label_and_message() {
         let (mut tree, root) = new_tree(Style::default());
-        let prompt = match insert_command_prompt(&mut tree, root, "Workspace Name", commands()) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        if let Err(err) = set_command_palette_query(&mut tree, prompt, "zzz no match") {
-            unreachable!("{err:?}");
-        }
-        let state = match command_palette_state(&tree, prompt) {
-            Ok(state) => state,
-            Err(err) => unreachable!("{err:?}"),
-        };
+        let prompt = ok(insert_command_prompt(
+            &mut tree,
+            root,
+            "Workspace Name",
+            commands(),
+            &test_scales(),
+        ));
+        ok(set_command_palette_query(&mut tree, prompt, "zzz no match"));
+        let state = ok(command_palette_state(&tree, prompt));
         assert!(!state.is_filtering());
         assert_eq!(state.label(), "Workspace Name");
         assert_eq!(state.results().len(), 3, "a prompt shows every row");
@@ -1301,43 +1234,442 @@ mod tests {
         assert_eq!(node.as_ref().and_then(|n| n.value()), Some("zzz no match"));
         assert_eq!(node.as_ref().and_then(|n| n.description()), None);
 
-        if let Err(err) = set_command_palette_message(&mut tree, prompt, Some("Bad".to_owned())) {
-            unreachable!("{err:?}");
-        }
-        let replaced = vec![CommandEntry::new("only", "Only Row")];
-        if let Err(err) = set_command_palette_commands(&mut tree, prompt, replaced) {
-            unreachable!("{err:?}");
-        }
-        let state = match command_palette_state(&tree, prompt) {
-            Ok(state) => state,
-            Err(err) => unreachable!("{err:?}"),
-        };
+        ok(set_command_palette_message(
+            &mut tree,
+            prompt,
+            Some("Bad".to_owned()),
+        ));
+        ok(set_command_palette_commands(
+            &mut tree,
+            prompt,
+            vec![CommandEntry::new("only", "Only Row")],
+        ));
+        let state = ok(command_palette_state(&tree, prompt));
         assert_eq!(state.message(), Some("Bad"));
         assert_eq!(state.query(), "zzz no match", "the query survives");
         assert_eq!(state.selected().map(|c| c.id.as_str()), Some("only"));
         assert_eq!(state.rows().len(), 1);
         let node = tree.accessibility(prompt).cloned();
         assert_eq!(node.as_ref().and_then(|n| n.description()), Some("Bad"));
-        if let Err(err) = set_command_palette_message(&mut tree, prompt, None) {
-            unreachable!("{err:?}");
-        }
+        ok(set_command_palette_message(&mut tree, prompt, None));
         let node = tree.accessibility(prompt).cloned();
         assert_eq!(node.as_ref().and_then(|n| n.description()), None);
 
-        // The ordinary palette still filters, under its own name.
-        let palette = match insert_command_palette(&mut tree, root, commands()) {
-            Ok(id) => id,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        if let Err(err) = set_command_palette_query(&mut tree, palette, "undo") {
-            unreachable!("{err:?}");
-        }
-        let state = match command_palette_state(&tree, palette) {
-            Ok(state) => state,
-            Err(err) => unreachable!("{err:?}"),
-        };
+        let palette = palette_in(&mut tree, root, commands());
+        ok(set_command_palette_query(&mut tree, palette, "undo"));
+        let state = ok(command_palette_state(&tree, palette));
         assert!(state.is_filtering());
         assert_eq!(state.label(), "Command Palette");
         assert_eq!(state.results().len(), 1);
+    }
+
+    // ---- 0.257.0: layout and scrolling with many commands ----
+
+    /// Every row is exactly `row_height` tall and each starts exactly one
+    /// row below the previous one: no overlap, at three window sizes
+    /// (1274x900, 800x600 and 1274x900 physical at scale factor 2, which
+    /// is 637x450 logical: layout is logical).
+    #[test]
+    fn two_hundred_commands_never_overlap_at_any_window_size() {
+        for (w, h) in [(1274.0, 900.0), (800.0, 600.0), (637.0, 450.0)] {
+            let (tree, palette) = opened(200, w, h);
+            let state = ok(command_palette_state(&tree, palette));
+            let rows = state.rows();
+            assert_eq!(rows.len(), 200);
+            let body = bounds(&tree, state.body());
+            let mut expected_y = body.y;
+            for &row in rows {
+                let r = bounds(&tree, row);
+                assert_eq!(i64::from(r.height), row_h(), "row height at {w}x{h}");
+                assert_eq!(r.y, expected_y, "rows stack at exactly one row pitch");
+                assert_eq!(r.x, body.x);
+                expected_y += row_h();
+            }
+            let strip = bounds(&tree, state.query_strip());
+            assert_eq!(i64::from(strip.height), strip_h(), "the strip is fixed");
+            assert!(
+                strip.bottom() <= body.y,
+                "the strip sits above the rows: {strip:?} {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_panel_stops_at_the_row_cap_and_fits_the_window() {
+        for (w, h) in [(1274.0, 900.0), (800.0, 600.0), (637.0, 450.0)] {
+            let (tree, palette) = opened(200, w, h);
+            let state = ok(command_palette_state(&tree, palette));
+            let root = bounds(&tree, palette);
+            let viewport = bounds(&tree, state.viewport());
+            assert_eq!(
+                i64::from(viewport.height),
+                visible_cap() * row_h(),
+                "the viewport shows the token's number of rows"
+            );
+            assert_eq!(
+                i64::from(root.height),
+                strip_h() + visible_cap() * row_h(),
+                "the panel is the strip plus the capped viewport"
+            );
+            assert!(
+                root.bottom() <= i64::from(h as u32),
+                "the panel fits the window at {w}x{h}: {root:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_rows_are_visible_at_open_and_the_rest_are_clipped() {
+        let (tree, palette) = opened(200, 1274.0, 900.0);
+        let state = ok(command_palette_state(&tree, palette));
+        assert_eq!(selected_index(&tree, palette), Some(0));
+        assert_eq!(tree.scroll_y(state.body()), Some(0.0));
+        assert!(selected_is_inside_viewport(&tree, palette));
+        let viewport = bounds(&tree, state.viewport());
+        let rows = state.rows();
+        #[allow(clippy::cast_sign_loss)]
+        let cap = visible_cap() as usize;
+        let last_shown = bounds(&tree, rows[cap - 1]);
+        assert!(last_shown.bottom() <= viewport.bottom());
+        let first_hidden = bounds(&tree, rows[cap]);
+        assert!(
+            first_hidden.bottom() > viewport.bottom(),
+            "the row after the cap lies below the viewport (clipped)"
+        );
+        assert_eq!(
+            tree.visible_rect(rows[cap], first_hidden),
+            None,
+            "the viewport clips that row away entirely"
+        );
+        assert_eq!(
+            tree.visible_rect(rows[0], bounds(&tree, rows[0])),
+            Some(bounds(&tree, rows[0])),
+            "while the first row is wholly visible"
+        );
+        assert!(tree.scroll_range(state.body()).unwrap_or(0.0) > 0.0);
+    }
+
+    #[test]
+    fn the_scrollbar_shows_for_overflow() {
+        let (tree, palette) = opened(200, 1274.0, 900.0);
+        let state = ok(command_palette_state(&tree, palette));
+        assert_ne!(
+            tree.style(state.scrollbar()).map(|s| s.display),
+            Some(taffy::Display::None),
+            "200 rows overflow: the bar is shown"
+        );
+        assert_eq!(
+            crate::widgets::scrollbar_target(&tree, state.scrollbar()),
+            Some(state.body())
+        );
+    }
+
+    #[test]
+    fn arrow_down_keeps_the_selected_row_inside_the_viewport() {
+        let (mut tree, palette) = opened(200, 1274.0, 900.0);
+        for step in 1..=60_usize {
+            ok(move_command_palette_selection(&mut tree, palette, true));
+            relayout(&mut tree, 1274.0, 900.0);
+            assert_eq!(selected_index(&tree, palette), Some(step));
+            assert!(
+                selected_is_inside_viewport(&tree, palette),
+                "after {step} presses the selected row is visible"
+            );
+        }
+        let body = ok(command_palette_state(&tree, palette)).body();
+        assert!(tree.scroll_y(body).unwrap_or(0.0) > 0.0, "it scrolled");
+    }
+
+    #[test]
+    fn arrow_up_from_the_top_wraps_to_the_last_row_and_scrolls_to_it() {
+        let (mut tree, palette) = opened(200, 1274.0, 900.0);
+        ok(move_command_palette_selection(&mut tree, palette, false));
+        relayout(&mut tree, 1274.0, 900.0);
+        assert_eq!(selected_index(&tree, palette), Some(199));
+        assert!(selected_is_inside_viewport(&tree, palette));
+        ok(move_command_palette_selection(&mut tree, palette, true));
+        relayout(&mut tree, 1274.0, 900.0);
+        assert_eq!(selected_index(&tree, palette), Some(0));
+        assert!(selected_is_inside_viewport(&tree, palette));
+        let body = ok(command_palette_state(&tree, palette)).body();
+        assert_eq!(tree.scroll_y(body), Some(0.0), "wrapping to the top");
+    }
+
+    #[test]
+    fn a_selection_reached_by_arrows_scrolls_just_far_enough() {
+        let (mut tree, palette) = opened(200, 1274.0, 900.0);
+        let body = ok(command_palette_state(&tree, palette)).body();
+        let cap = visible_cap();
+        for _ in 0..(cap - 1) {
+            ok(move_command_palette_selection(&mut tree, palette, true));
+        }
+        assert_eq!(
+            tree.scroll_y(body),
+            Some(0.0),
+            "the last visible row needs no scrolling"
+        );
+        ok(move_command_palette_selection(&mut tree, palette, true));
+        #[allow(clippy::cast_precision_loss)]
+        let one_row = row_h() as f32;
+        assert_eq!(
+            tree.scroll_y(body),
+            Some(one_row),
+            "one row past the viewport scrolls by exactly one row"
+        );
+    }
+
+    #[test]
+    fn a_short_list_has_no_scrollbar_and_the_panel_shrinks_to_fit() {
+        let mut list = many(200);
+        list.push(CommandEntry::new("z.a", "Zebra A"));
+        list.push(CommandEntry::new("z.b", "Zebra B"));
+        list.push(CommandEntry::new("z.c", "Zebra C"));
+        let (mut tree, root) = window_tree(1274.0, 900.0);
+        let palette = palette_in(&mut tree, root, list);
+        ok(tree.set_style(palette, app_style()));
+        relayout(&mut tree, 1274.0, 900.0);
+        let state = ok(command_palette_state(&tree, palette));
+        let tall = bounds(&tree, palette).height;
+        assert_ne!(
+            tree.style(state.scrollbar()).map(|s| s.display),
+            Some(taffy::Display::None)
+        );
+
+        ok(set_command_palette_query(&mut tree, palette, "zebra"));
+        relayout(&mut tree, 1274.0, 900.0);
+        let state = ok(command_palette_state(&tree, palette));
+        assert_eq!(state.rows().len(), 3);
+        assert_eq!(
+            i64::from(bounds(&tree, palette).height),
+            strip_h() + 3 * row_h(),
+            "strip plus three rows, nothing more"
+        );
+        assert!(bounds(&tree, palette).height < tall);
+        assert_eq!(
+            tree.style(state.scrollbar()).map(|s| s.display),
+            Some(taffy::Display::None),
+            "nothing to scroll: the bar hides itself"
+        );
+        assert_eq!(tree.scroll_range(state.body()), Some(0.0));
+    }
+
+    #[test]
+    fn a_no_match_palette_is_just_the_strip() {
+        let (mut tree, palette) = opened(200, 1274.0, 900.0);
+        ok(set_command_palette_query(&mut tree, palette, "nonexistent"));
+        relayout(&mut tree, 1274.0, 900.0);
+        assert_eq!(i64::from(bounds(&tree, palette).height), strip_h());
+    }
+
+    #[test]
+    fn scrolling_moves_the_rows_by_the_offset() {
+        let (mut tree, palette) = opened(200, 1274.0, 900.0);
+        let state = ok(command_palette_state(&tree, palette));
+        let body = state.body();
+        let rows = state.rows().to_vec();
+        let before = bounds(&tree, rows[5]).y;
+        assert_eq!(ok(tree.scroll_by(body, 3.0 * 21.0)), true);
+        assert_eq!(bounds(&tree, rows[5]).y, before - 63);
+        relayout(&mut tree, 1274.0, 900.0);
+        assert_eq!(
+            bounds(&tree, rows[5]).y,
+            before - 63,
+            "a relayout keeps the offset"
+        );
+        let over_rows = {
+            let r = bounds(&tree, rows[6]);
+            #[allow(clippy::cast_precision_loss)]
+            (r.x as f32 + 10.0, r.y as f32 + 5.0)
+        };
+        assert_eq!(
+            tree.scroll_container_at(over_rows),
+            Some(body),
+            "the wheel over the rows finds the list"
+        );
+    }
+
+    #[test]
+    fn a_click_after_scrolling_picks_the_row_under_the_pointer() {
+        let (mut tree, palette) = opened(200, 1274.0, 900.0);
+        let state = ok(command_palette_state(&tree, palette));
+        let body = state.body();
+        let rows = state.rows().to_vec();
+        ok(tree.scroll_by(body, 5.0 * 21.0));
+        let centre = |tree: &WidgetTree<WidgetKind>, row| {
+            let r = bounds(tree, row);
+            #[allow(clippy::cast_precision_loss)]
+            (r.x as f32 + 20.0, r.y as f32 + r.height as f32 / 2.0)
+        };
+        let target = centre(&tree, rows[9]);
+        let picked = ok(select_command_palette_at(&mut tree, palette, target));
+        assert_eq!(picked, Some(rows[9]));
+        assert_eq!(selected_id(&tree, palette).as_deref(), Some("cmd.9"));
+        // The old (unscrolled) place of row 0 is above the viewport: not a row.
+        let above = centre(&tree, rows[0]);
+        assert_eq!(ok(select_command_palette_at(&mut tree, palette, above)), None);
+        assert_eq!(selected_id(&tree, palette).as_deref(), Some("cmd.9"));
+        // The query strip is not a row either.
+        let strip = bounds(&tree, ok(command_palette_state(&tree, palette)).query_strip());
+        #[allow(clippy::cast_precision_loss)]
+        let on_strip = (strip.x as f32 + 5.0, strip.y as f32 + 5.0);
+        assert_eq!(ok(select_command_palette_at(&mut tree, palette, on_strip)), None);
+    }
+
+    #[test]
+    fn page_down_and_page_up_move_by_the_visible_rows_without_wrapping() {
+        let (mut tree, palette) = opened(200, 1274.0, 900.0);
+        let step = |tree: &mut WidgetTree<WidgetKind>, s| {
+            ok(step_command_palette_selection(tree, palette, s));
+            relayout(tree, 1274.0, 900.0);
+        };
+        step(&mut tree, PaletteStep::PageDown);
+        assert_eq!(selected_index(&tree, palette), Some(10), "one page = 10 rows");
+        assert!(selected_is_inside_viewport(&tree, palette));
+        step(&mut tree, PaletteStep::PageDown);
+        assert_eq!(selected_index(&tree, palette), Some(20));
+        assert!(selected_is_inside_viewport(&tree, palette));
+        step(&mut tree, PaletteStep::PageUp);
+        assert_eq!(selected_index(&tree, palette), Some(10));
+        step(&mut tree, PaletteStep::PageUp);
+        step(&mut tree, PaletteStep::PageUp);
+        assert_eq!(selected_index(&tree, palette), Some(0), "stops at the top");
+        step(&mut tree, PaletteStep::Last);
+        assert_eq!(selected_index(&tree, palette), Some(199));
+        assert!(selected_is_inside_viewport(&tree, palette));
+        step(&mut tree, PaletteStep::PageDown);
+        assert_eq!(selected_index(&tree, palette), Some(199), "stops at the end");
+        step(&mut tree, PaletteStep::First);
+        assert_eq!(selected_index(&tree, palette), Some(0));
+        assert!(selected_is_inside_viewport(&tree, palette));
+        step(&mut tree, PaletteStep::Next);
+        step(&mut tree, PaletteStep::Next);
+        step(&mut tree, PaletteStep::Previous);
+        assert_eq!(selected_index(&tree, palette), Some(1));
+        step(&mut tree, PaletteStep::Previous);
+        step(&mut tree, PaletteStep::Previous);
+        assert_eq!(selected_index(&tree, palette), Some(0), "no wrap upward");
+    }
+
+    #[test]
+    fn a_new_query_scrolls_back_to_the_top() {
+        let (mut tree, palette) = opened(200, 1274.0, 900.0);
+        let body = ok(command_palette_state(&tree, palette)).body();
+        ok(tree.scroll_by(body, 400.0));
+        assert!(tree.scroll_y(body).unwrap_or(0.0) > 0.0);
+        ok(set_command_palette_query(&mut tree, palette, "command 1"));
+        assert_eq!(tree.scroll_y(body), Some(0.0));
+        relayout(&mut tree, 1274.0, 900.0);
+        assert!(selected_is_inside_viewport(&tree, palette));
+        ok(tree.scroll_by(body, 100.0));
+        ok(set_command_palette_commands(&mut tree, palette, many(150)));
+        assert_eq!(tree.scroll_y(body), Some(0.0), "new commands too");
+    }
+
+    #[test]
+    fn a_prompt_with_many_rows_scrolls_the_same_way() {
+        let (mut tree, root) = window_tree(800.0, 600.0);
+        let prompt = ok(insert_command_prompt(
+            &mut tree,
+            root,
+            "Workspace Name",
+            many(120),
+            &test_scales(),
+        ));
+        ok(tree.set_style(prompt, app_style()));
+        relayout(&mut tree, 800.0, 600.0);
+        let state = ok(command_palette_state(&tree, prompt));
+        let viewport = bounds(&tree, state.viewport());
+        assert_eq!(i64::from(viewport.height), visible_cap() * row_h());
+        let mut y = bounds(&tree, state.body()).y;
+        for &row in state.rows() {
+            let r = bounds(&tree, row);
+            assert_eq!((r.y, i64::from(r.height)), (y, row_h()));
+            y += row_h();
+        }
+        for _ in 0..30 {
+            ok(move_command_palette_selection(&mut tree, prompt, true));
+        }
+        relayout(&mut tree, 800.0, 600.0);
+        assert!(selected_is_inside_viewport(&tree, prompt));
+    }
+
+    /// A caller that gives the root a definite height (the toolkit gallery
+    /// and older callers did) still gets non-overlapping, clipped rows.
+    #[test]
+    fn a_definite_height_root_clips_instead_of_squeezing_rows() {
+        let (mut tree, root) = window_tree(400.0, 300.0);
+        let palette = palette_in(&mut tree, root, many(200));
+        ok(tree.set_style(
+            palette,
+            Style {
+                size: taffy::Size {
+                    width: length(300.0_f32),
+                    height: length(150.0_f32),
+                },
+                ..Default::default()
+            },
+        ));
+        relayout(&mut tree, 400.0, 300.0);
+        let state = ok(command_palette_state(&tree, palette));
+        let root_b = bounds(&tree, palette);
+        let viewport = bounds(&tree, state.viewport());
+        assert!(viewport.bottom() <= root_b.bottom(), "{viewport:?} in {root_b:?}");
+        assert_eq!(
+            i64::from(bounds(&tree, state.query_strip()).height),
+            strip_h(),
+            "a crowded palette never shrinks its strip"
+        );
+        for pair in state.rows().windows(2) {
+            let (a, b) = (bounds(&tree, pair[0]), bounds(&tree, pair[1]));
+            assert_eq!(i64::from(a.height), row_h());
+            assert_eq!(b.y - a.y, row_h());
+        }
+    }
+
+    #[test]
+    fn three_commands_are_as_tall_as_the_strip_plus_three_rows() {
+        let (tree, palette) = opened(3, 800.0, 600.0);
+        let state = ok(command_palette_state(&tree, palette));
+        assert_eq!(
+            i64::from(bounds(&tree, palette).height),
+            strip_h() + 3 * row_h()
+        );
+        assert_eq!(
+            tree.style(state.scrollbar()).map(|s| s.display),
+            Some(taffy::Display::None)
+        );
+    }
+
+    #[test]
+    fn rows_outside_the_viewport_stay_in_the_accessibility_tree_and_scroll_is_reported() {
+        let (mut tree, palette) = opened(200, 1274.0, 900.0);
+        let (body, last_row, strip_id) = {
+            let state = ok(command_palette_state(&tree, palette));
+            (state.body(), state.rows()[199], state.query_strip())
+        };
+        ok(tree.scroll_by(body, 63.0));
+        let update = tree.accessibility_update(palette);
+        let node_of = |id: WidgetId| update.nodes.iter().find(|(n, _)| *n == id).map(|(_, n)| n);
+        let Some(last) = node_of(last_row) else {
+            unreachable!("every row is in the accessibility tree");
+        };
+        assert_eq!(last.role(), accesskit::Role::ListBoxOption);
+        let Some(list) = node_of(body) else {
+            unreachable!("the list is in the tree");
+        };
+        assert_eq!(list.role(), accesskit::Role::ListBox);
+        assert_eq!(list.scroll_y(), Some(63.0));
+        assert!(list.scroll_y_max().unwrap_or(0.0) > 0.0);
+        let selected = update
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.role() == accesskit::Role::ListBoxOption && n.is_selected() == Some(true))
+            .count();
+        assert_eq!(selected, 1, "exactly one selected option");
+        let Some(strip) = node_of(strip_id) else {
+            unreachable!("the strip is in the tree");
+        };
+        assert_eq!(strip.role(), accesskit::Role::GenericContainer);
+        assert_eq!(strip.label(), None, "the strip stays presentational");
     }
 }
