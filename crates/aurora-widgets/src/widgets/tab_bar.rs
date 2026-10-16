@@ -298,6 +298,13 @@ pub struct TabBarState {
     /// One `Tab` child per label, in order.
     tabs: Vec<WidgetId>,
     metrics: TabMetrics,
+    /// The tabs that are shown, as a half-open index range (0.260.0,
+    /// [`set_tab_window`]); `None` shows them all. A tab outside it is
+    /// `Display::None` and its node is `hidden`.
+    window: Option<(usize, usize)>,
+    /// A floor and a ceiling for every tab's width (0.260.0,
+    /// [`set_tab_width_limits`]); `None` is the equal-share default.
+    width_limits: Option<(f32, f32)>,
 }
 
 impl TabBarState {
@@ -312,7 +319,30 @@ impl TabBarState {
             selected,
             tabs: Vec::new(),
             metrics,
+            window: None,
+            width_limits: None,
         }
+    }
+
+    /// The shown tabs as a half-open index range, or `None` when every
+    /// tab is shown (0.260.0).
+    #[must_use]
+    pub fn window(&self) -> Option<(usize, usize)> {
+        self.window
+    }
+
+    /// The tab width floor and ceiling set by [`set_tab_width_limits`].
+    #[must_use]
+    pub fn width_limits(&self) -> Option<(f32, f32)> {
+        self.width_limits
+    }
+
+    /// Whether tab `index` is inside the shown window (0.260.0); every
+    /// tab is when there is none.
+    #[must_use]
+    pub fn is_tab_shown(&self, index: usize) -> bool {
+        self.window
+            .is_none_or(|(start, end)| index >= start && index < end)
     }
 
     #[must_use]
@@ -504,8 +534,12 @@ fn tab_node(
     len: usize,
     selected: bool,
     disabled: bool,
+    hidden: bool,
 ) -> Node {
     let mut node = Node::new(Role::Tab);
+    if hidden {
+        node.set_hidden();
+    }
     node.set_label(label.to_owned());
     if !description.is_empty() {
         node.set_description(description.to_owned());
@@ -742,7 +776,7 @@ pub fn set_tab_labels(
             tabs.push(tree.insert(
                 bar,
                 style.clone(),
-                tab_node("", "", index, len, false, disabled),
+                tab_node("", "", index, len, false, disabled, false),
                 WidgetKind::Tab(TabState {
                     label: String::new(),
                     selected: false,
@@ -766,8 +800,86 @@ pub fn set_tab_labels(
         state.labels = labels;
         state.selected = selected;
         state.tabs = tabs;
+        // A window that no longer fits the tabs (0.260.0) is dropped
+        // down to what exists: the caller sets it again.
+        if let Some((start, end)) = state.window {
+            let end = end.min(len);
+            state.window = (start < end).then_some((start, end));
+        }
         Ok(())
     })
+}
+
+/// Shows only the tabs `window.0..window.1` (a half-open index range) and
+/// hides the rest (0.260.0): a hidden tab keeps its widget, id and index,
+/// so selection indices stay the tabs' own, but it is `Display::None` and
+/// its node is `hidden` (not in the accessibility tree as a tab). `None`
+/// shows every tab. `Ok(false)` when nothing changed.
+///
+/// The window is not forced to contain the selected tab; the caller
+/// keeps it there.
+///
+/// # Errors
+///
+/// [`WidgetError::InvalidRange`] when the window is empty or runs past
+/// the last tab; [`WidgetError::UnknownWidget`] /
+/// [`WidgetError::WrongWidgetKind`] if `bar` is not a tab bar.
+pub fn set_tab_window(
+    tree: &mut WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    window: Option<(usize, usize)>,
+) -> Result<bool, WidgetError> {
+    let current = state(tree, bar)?;
+    if let Some((start, end)) = window
+        && (start >= end || end > current.labels.len())
+    {
+        #[allow(clippy::cast_precision_loss)]
+        return Err(WidgetError::InvalidRange {
+            min: start as f64,
+            max: end as f64,
+        });
+    }
+    if current.window == window {
+        return Ok(false);
+    }
+    with_tab_bar_mut(tree, bar, |state| {
+        state.window = window;
+        Ok(())
+    })?;
+    Ok(true)
+}
+
+/// Gives every tab a width floor and ceiling in logical px (0.260.0): a
+/// tab still grows from zero (`flex_basis: 0`, `flex_grow: 1`) but never
+/// below `min` nor above `max` (a `max` below `min` is raised to it).
+/// `None` restores the equal-share default. `Ok(false)` when unchanged.
+///
+/// # Errors
+///
+/// [`WidgetError::InvalidRange`] when a limit is not finite or `min` is
+/// not above zero; [`WidgetError::UnknownWidget`] /
+/// [`WidgetError::WrongWidgetKind`] if `bar` is not a tab bar.
+pub fn set_tab_width_limits(
+    tree: &mut WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    limits: Option<(f32, f32)>,
+) -> Result<bool, WidgetError> {
+    if let Some((min, max)) = limits
+        && !(min.is_finite() && max.is_finite() && min > 0.0)
+    {
+        return Err(WidgetError::InvalidRange {
+            min: f64::from(min),
+            max: f64::from(max),
+        });
+    }
+    if state(tree, bar)?.width_limits == limits {
+        return Ok(false);
+    }
+    with_tab_bar_mut(tree, bar, |state| {
+        state.width_limits = limits;
+        Ok(())
+    })?;
+    Ok(true)
 }
 
 /// Enables or disables `bar` and every tab in it. A request that matches
@@ -832,14 +944,41 @@ fn with_tab_bar_mut<T>(
     Ok(result)
 }
 
-/// A closable tab's style (0.175.0): the plain tab style with room for
-/// the close button on the right.
-fn tab_style_for(metrics: TabMetrics, closable: bool) -> Style {
-    let mut style = tab_style(metrics);
-    if closable {
-        style.padding.right = length(metrics.pad_h + metrics.close_width);
+/// A tab's style (0.175.0: room for the close button on a closable bar;
+/// 0.260.0: the width floor and ceiling, and `Display::None` outside the
+/// shown window).
+fn tab_style_for(state: &TabBarState, index: usize) -> Style {
+    let mut style = tab_style(state.metrics);
+    if state.closable {
+        style.padding.right = length(state.metrics.pad_h + state.metrics.close_width);
+    }
+    if let Some((min, max)) = state.width_limits {
+        style.min_size.width = length(min);
+        style.max_size.width = length(max.max(min));
+    }
+    if !state.is_tab_shown(index) {
+        style.display = taffy::Display::None;
     }
     style
+}
+
+/// Makes every tab's style match the bar's state; only a tab that differs
+/// is touched (0.260.0).
+fn sync_tab_styles(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Result<(), WidgetError> {
+    let current = state(tree, bar)?;
+    let wanted: Vec<(WidgetId, Style)> = current
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(index, &tab)| (tab, tab_style_for(current, index)))
+        .collect();
+    for (tab, style) in wanted {
+        if tree.style(tab) != Some(&style) {
+            tree.set_style(tab, style)?;
+            tree.mark_dirty(tab)?;
+        }
+    }
+    Ok(())
 }
 
 /// A close button's box: pinned to its tab's right edge, full height.
@@ -905,7 +1044,6 @@ fn sync_close_buttons(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Resul
         let label = names.get(index).map_or("", String::as_str);
         let was = matches!(tree.payload(tab), Some(WidgetKind::Tab(t)) if t.closable);
         if was != closable {
-            tree.set_style(tab, tab_style_for(metrics, closable))?;
             if let Some(WidgetKind::Tab(t)) = tree.payload_mut(tab) {
                 t.closable = closable;
             }
@@ -1038,7 +1176,8 @@ fn tab_children(tree: &WidgetTree<WidgetKind>, bar: WidgetId) -> Vec<WidgetId> {
 /// are not the tracked `tabs`), so it cannot leave a permanent duplicate.
 fn reconcile(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Result<(), WidgetError> {
     reconcile_tabs(tree, bar)?;
-    sync_close_buttons(tree, bar)
+    sync_close_buttons(tree, bar)?;
+    sync_tab_styles(tree, bar)
 }
 
 fn reconcile_tabs(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Result<(), WidgetError> {
@@ -1064,7 +1203,15 @@ fn reconcile_tabs(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Result<()
             );
             let description = current.descriptions.get(index).map_or("", String::as_str);
             let name = current.accessible_name(index);
-            let expected = tab_node(name, description, index, len, selected, current.disabled);
+            let expected = tab_node(
+                name,
+                description,
+                index,
+                len,
+                selected,
+                current.disabled,
+                !current.is_tab_shown(index),
+            );
             let node_ok = tree.accessibility(tab) == Some(&expected);
             (!(payload_ok && node_ok)).then_some((tab, index, expected))
         })
@@ -1105,6 +1252,7 @@ fn rebuild_tabs(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Result<(), 
         .map(|index| current.accessible_name(index).to_owned())
         .collect();
     let len = labels.len();
+    let shown: Vec<bool> = (0..len).map(|index| current.is_tab_shown(index)).collect();
     let mut tabs = Vec::with_capacity(len);
     for (index, label) in labels.into_iter().enumerate() {
         let on = index == selected;
@@ -1113,7 +1261,15 @@ fn rebuild_tabs(tree: &mut WidgetTree<WidgetKind>, bar: WidgetId) -> Result<(), 
         tabs.push(tree.insert(
             bar,
             style.clone(),
-            tab_node(name, description, index, len, on, disabled),
+            tab_node(
+                name,
+                description,
+                index,
+                len,
+                on,
+                disabled,
+                !shown.get(index).copied().unwrap_or(true),
+            ),
             WidgetKind::Tab(TabState {
                 label,
                 selected: on,
@@ -2316,5 +2472,174 @@ mod tests {
             ));
         }
         assert_structure_is_sound(&tree, bar);
+    }
+
+    // ---- 0.260.0: the shown window and the width limits ----
+
+    fn bar_of(n: usize) -> (WidgetTree<WidgetKind>, WidgetId) {
+        let scales = test_scales();
+        let (mut tree, root) = new_tree(sized_root());
+        let names: Vec<String> = (0..n).map(|i| format!("t{i}")).collect();
+        let bar = match insert_tab_bar(&mut tree, root, &scales, "Bar", names, 0) {
+            Ok(bar) => bar,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (tree, bar)
+    }
+
+    fn set_root_width(tree: &mut WidgetTree<WidgetKind>, width: f32) {
+        let root = tree.root();
+        let mut style = tree.style(root).cloned().unwrap_or_default();
+        style.size.width = length(width);
+        let _ = tree.set_style(root, style);
+    }
+
+    fn hidden(tree: &WidgetTree<WidgetKind>, tab: WidgetId) -> (bool, bool) {
+        (
+            tree.style(tab)
+                .is_some_and(|s| s.display == taffy::Display::None),
+            tree.accessibility(tab)
+                .is_some_and(accesskit::Node::is_hidden),
+        )
+    }
+
+    #[test]
+    fn a_window_hides_the_tabs_outside_it_in_layout_and_for_assistive_technology() {
+        let (mut tree, bar) = bar_of(5);
+        assert_eq!(
+            super::set_tab_window(&mut tree, bar, Some((1, 3))).ok(),
+            Some(true)
+        );
+        assert_eq!(
+            super::set_tab_window(&mut tree, bar, Some((1, 3))).ok(),
+            Some(false)
+        );
+        let tabs = tab_bar_state(&tree, bar)
+            .map(|s| s.tabs().to_vec())
+            .unwrap_or_default();
+        for (index, &tab) in tabs.iter().enumerate() {
+            let outside = !(1..3).contains(&index);
+            assert_eq!(hidden(&tree, tab), (outside, outside), "tab {index}");
+            // Positions in the set stay the documents' own.
+            let node = tree.accessibility(tab);
+            assert_eq!(
+                node.and_then(accesskit::Node::position_in_set),
+                Some(index + 1)
+            );
+            assert_eq!(node.and_then(accesskit::Node::size_of_set), Some(5));
+        }
+        assert_eq!(super::set_tab_window(&mut tree, bar, None).ok(), Some(true));
+        for &tab in &tabs {
+            assert_eq!(hidden(&tree, tab), (false, false));
+        }
+    }
+
+    #[test]
+    fn a_bad_window_is_refused_and_a_shrinking_label_list_clamps_it() {
+        let (mut tree, bar) = bar_of(5);
+        for bad in [(2, 2), (3, 2), (0, 6), (5, 6)] {
+            assert!(
+                super::set_tab_window(&mut tree, bar, Some(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(tab_bar_state(&tree, bar).is_ok_and(|s| s.window().is_none()));
+        let _ = super::set_tab_window(&mut tree, bar, Some((2, 5)));
+        let labels: Vec<String> = (0..4).map(|i| format!("t{i}")).collect();
+        let _ = set_tab_labels(&mut tree, bar, labels, 0);
+        assert!(tab_bar_state(&tree, bar).is_ok_and(|s| s.window() == Some((2, 4))));
+        let _ = set_tab_labels(&mut tree, bar, vec!["only".to_owned()], 0);
+        assert!(tab_bar_state(&tree, bar).is_ok_and(|s| s.window().is_none()));
+        // Growing again shows the new tabs (no stale window).
+        let labels: Vec<String> = (0..3).map(|i| format!("n{i}")).collect();
+        let _ = set_tab_labels(&mut tree, bar, labels, 2);
+        let tabs = tab_bar_state(&tree, bar)
+            .map(|s| s.tabs().to_vec())
+            .unwrap_or_default();
+        assert!(tabs.iter().all(|&t| hidden(&tree, t) == (false, false)));
+    }
+
+    #[test]
+    fn a_hidden_flag_overwritten_from_outside_or_a_rebuild_is_repaired() {
+        let (mut tree, bar) = bar_of(4);
+        let _ = super::set_tab_window(&mut tree, bar, Some((0, 2)));
+        let tabs = tab_bar_state(&tree, bar)
+            .map(|s| s.tabs().to_vec())
+            .unwrap_or_default();
+        let Some(&third) = tabs.get(2) else {
+            unreachable!("four tabs")
+        };
+        let mut node = tree
+            .accessibility(third)
+            .cloned()
+            .unwrap_or_else(|| accesskit::Node::new(Role::Tab));
+        node.clear_hidden();
+        let _ = tree.set_accessibility(third, node);
+        let mut style = tree.style(third).cloned().unwrap_or_default();
+        style.display = taffy::Display::Flex;
+        let _ = tree.set_style(third, style);
+        let _ = set_tab_bar_disabled(&mut tree, bar, false);
+        assert_eq!(hidden(&tree, third), (true, true));
+        // A rebuild (a tab removed from outside) keeps the window.
+        if let Some(&last) = tabs.last() {
+            let _ = tree.remove(last);
+        }
+        let _ = set_tab_bar_disabled(&mut tree, bar, false);
+        let rebuilt = tab_bar_state(&tree, bar)
+            .map(|s| s.tabs().to_vec())
+            .unwrap_or_default();
+        for (index, &tab) in rebuilt.iter().enumerate() {
+            let outside = index >= 2;
+            assert_eq!(
+                hidden(&tree, tab),
+                (outside, outside),
+                "rebuilt tab {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn width_limits_floor_and_cap_every_tab_and_bad_limits_are_refused() {
+        let (mut tree, bar) = bar_of(3);
+        for bad in [
+            (0.0, 10.0),
+            (-1.0, 10.0),
+            (f32::NAN, 10.0),
+            (10.0, f32::INFINITY),
+        ] {
+            assert!(super::set_tab_width_limits(&mut tree, bar, Some(bad)).is_err());
+        }
+        assert_eq!(
+            super::set_tab_width_limits(&mut tree, bar, Some((100.0, 180.0))).ok(),
+            Some(true)
+        );
+        assert_eq!(
+            super::set_tab_width_limits(&mut tree, bar, Some((100.0, 180.0))).ok(),
+            Some(false)
+        );
+        set_root_width(&mut tree, 2000.0);
+        tree.compute_layout(2000.0, 200.0);
+        let tabs = tab_bar_state(&tree, bar)
+            .map(|s| s.tabs().to_vec())
+            .unwrap_or_default();
+        for &tab in &tabs {
+            assert_eq!(tree.bounds(tab).map(|b| b.width), Some(180), "capped");
+        }
+        set_root_width(&mut tree, 300.0);
+        tree.compute_layout(300.0, 200.0);
+        for &tab in &tabs {
+            assert!(tree.bounds(tab).is_some_and(|b| b.width >= 100), "floored");
+        }
+        // A ceiling below the floor is raised to it.
+        let _ = super::set_tab_width_limits(&mut tree, bar, Some((100.0, 50.0)));
+        set_root_width(&mut tree, 2000.0);
+        tree.compute_layout(2000.0, 200.0);
+        for &tab in &tabs {
+            assert_eq!(tree.bounds(tab).map(|b| b.width), Some(100));
+        }
+        assert_eq!(
+            super::set_tab_width_limits(&mut tree, bar, None).ok(),
+            Some(true)
+        );
     }
 }

@@ -562,6 +562,8 @@ mod crop_ratio_tests;
 #[cfg(test)]
 mod crop_tests;
 mod document_close;
+mod document_overflow;
+mod document_overflow_app;
 mod document_session;
 mod document_tabs;
 #[cfg(test)]
@@ -4778,7 +4780,7 @@ fn route_accessibility_action(
         );
     // Read before the action: activating a popup item removes the popup.
     let on_menu_bar = request.target_tree == aurora_widgets::ACCESSIBILITY_TREE_ID
-        && aurora_ui::is_menu_bar_part(&workspace.tree, request.target_node);
+        && is_menu_owner_part(&workspace.tree, request.target_node);
     let handled = aurora_widgets::handle_action(&mut workspace.tree, focus, request);
     if on_panel_tabs && handled.is_ok() {
         follow_panel_tabs(
@@ -4818,7 +4820,7 @@ fn route_accessibility_action(
                 AccessibilityReaction::Paths(PathsRequest::Row(id))
             } else if aurora_ui::is_colour_control(&workspace.tree, id) {
                 AccessibilityReaction::ColourControl(aurora_widgets::ActionOutcome::Activated(id))
-            } else if aurora_ui::is_menu_bar_part(&workspace.tree, id) {
+            } else if is_menu_owner_part(&workspace.tree, id) {
                 AccessibilityReaction::MenuBar(aurora_widgets::ActionOutcome::Activated(id))
             } else if let Some(panel) = workspace.panel_strip.panel_for(id) {
                 open_from_panel_strip(workspace, focus, id);
@@ -7318,6 +7320,14 @@ fn wheel_scroll_panel(
     moved
 }
 
+/// Whether `id` belongs to a menu the app opens from a button: the
+/// in-window menu bar or its popup, or the document strip's "More
+/// documents" button or its popup (0.260.0). Both are routed as
+/// [`WidgetOwner::MenuBar`] and told apart in `App::apply_menu_bar_outcome`.
+fn is_menu_owner_part(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> bool {
+    aurora_ui::is_menu_bar_part(tree, id) || aurora_ui::is_document_overflow_part(tree, id)
+}
+
 /// The owner of `id`, if it is (or lies inside) the open gallery or the
 /// Layers panel's controls strip — including an open dropdown's popover
 /// list and rows, which are descendants of their dropdown.
@@ -7346,7 +7356,7 @@ fn widget_owner(
     if aurora_ui::is_colour_control(tree, id) {
         return Some(WidgetOwner::ColourControls);
     }
-    if aurora_ui::is_menu_bar_part(tree, id) {
+    if is_menu_owner_part(tree, id) {
         return Some(WidgetOwner::MenuBar);
     }
     if is_tool_button(tree, id) {
@@ -12882,6 +12892,20 @@ fn layout_workspace(
         );
     };
     pass(workspace);
+    // 0.260.0: the document strip shows the window of tabs that fits its
+    // laid-out width (and the "More documents" button); a change lays out
+    // again. Bounded: the window depends on the strip's width alone, so
+    // the second pass settles it.
+    for _ in 0..3 {
+        match aurora_ui::sync_document_tab_window(workspace, scales) {
+            Ok(true) => pass(workspace),
+            Ok(false) => break,
+            Err(err) => {
+                tracing::warn!(?err, "failed to fit the document tabs to the strip");
+                break;
+            }
+        }
+    }
     // 0.167.0: floating panels are kept inside the canvas area after
     // every layout — a window resize, a rail resize or collapse, a scale
     // change and the first layout after a load all come through here
@@ -29937,6 +29961,9 @@ struct App {
     /// The in-window menu bar's open menu (0.225.0,
     /// [`menu_bar_state::MenuBarState`]); never document state.
     menu_bar: menu_bar_state::MenuBarState,
+    /// The document strip's overflow menu (0.260.0,
+    /// [`document_overflow::OverflowState`]); never document state.
+    doc_overflow: document_overflow::OverflowState,
     /// Every Layers-panel row's own `WidgetId`, mapped to the `LayerId`
     /// it represents (`aurora_ui::populate_layers_panel`'s own return
     /// value) — what [`Self::handle_pointer_pressed`] looks a
@@ -30520,6 +30547,7 @@ impl App {
             quit_pending: false,
             colour: colour_state::ColourController::default(),
             menu_bar: menu_bar_state::MenuBarState::default(),
+            doc_overflow: document_overflow::OverflowState::default(),
             layer_rows,
             scroll_follow: ScrollFollow::default(),
             residency: None,

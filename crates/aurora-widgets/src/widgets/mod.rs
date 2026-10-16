@@ -253,8 +253,8 @@ pub use slider::{
 pub use tab_bar::{
     TAB_CLOSE_GLYPH, TabBarKey, TabBarOutcome, TabBarState, TabState, handle_tab_bar_key,
     insert_tab_bar, select_tab, set_tab_accessible_names, set_tab_bar_closable,
-    set_tab_bar_disabled, set_tab_descriptions, set_tab_labels, tab_bar_state, tab_close_button,
-    tab_close_index, tab_close_width,
+    set_tab_bar_disabled, set_tab_descriptions, set_tab_labels, set_tab_width_limits,
+    set_tab_window, tab_bar_state, tab_close_button, tab_close_index, tab_close_width,
 };
 pub use text_field::{
     ChordEffect, Composition, TEXT_FIELD_MAX_BYTES, TextFieldChord, TextFieldKey, TextFieldState,

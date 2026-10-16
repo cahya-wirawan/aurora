@@ -98,9 +98,12 @@ pub use dock::{
     DockArrangement, DockPanel, DockPlacement, DockSlot, DropTarget, FloatSlot, PanelMove, SlotRef,
 };
 pub use document_tabs::{
-    DOCUMENT_TABS_LABEL, INITIAL_DOCUMENT_TAB, document_tab_close_at, document_tab_close_index,
-    document_tab_selected, insert_document_tabs, is_document_strip_tab, is_document_tab,
-    link_document_panel, set_document_tab_descriptions, set_document_tab_names, sync_document_tabs,
+    DOCUMENT_OVERFLOW_LABEL, DOCUMENT_TABS_LABEL, INITIAL_DOCUMENT_TAB, document_tab_capacity,
+    document_tab_close_at, document_tab_close_index, document_tab_max_width,
+    document_tab_min_width, document_tab_selected, document_tab_window, insert_document_tabs,
+    is_document_overflow_part, is_document_strip_tab, is_document_tab, link_document_panel,
+    open_document_overflow_menu, set_document_tab_descriptions, set_document_tab_names,
+    sync_document_tab_window, sync_document_tabs,
 };
 pub use gallery_panel::{
     GALLERY_CURVE_CAPTION, GalleryPanel, apply_gallery_outcome, gallery_close_popovers,

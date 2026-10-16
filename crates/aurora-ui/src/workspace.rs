@@ -123,6 +123,11 @@ pub struct Workspace {
     /// [`Self::canvas_area`], one tab per open document; the canvas area
     /// is its `Role::TabPanel`. Not part of the saved layout.
     pub document_tabs: WidgetId,
+    /// The strip's overflow button (0.260.0): a chevron-down icon button
+    /// "More documents", the last child of [`Self::document_tabs`], shown
+    /// only while the tabs do not all fit
+    /// ([`crate::sync_document_tab_window`]).
+    pub document_overflow: WidgetId,
     /// Where the document canvas will render — `Canvas: infinite zoom,
     /// rotation, pan, ...` is a separate, still-open M1.8 bullet; this
     /// is an empty container reserving its place in the layout.
@@ -479,7 +484,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         Err(err) => unreachable!("root was just created by new_tree above: {err:?}"),
     };
 
-    let (canvas_column, menu_bar, options_bar, document_tabs, canvas_area) =
+    let (canvas_column, menu_bar, options_bar, document_tabs, document_overflow, canvas_area) =
         insert_canvas_column(&mut tree, root, scales);
     let selection_outline = match widgets::insert_selection_outline(&mut tree, canvas_area) {
         Ok(id) => id,
@@ -625,6 +630,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         menu_bar,
         options_bar,
         document_tabs,
+        document_overflow,
         canvas_area,
         selection_outline,
         status_bar,
@@ -922,6 +928,7 @@ fn insert_canvas_column(
     WidgetId,
     WidgetId,
     WidgetId,
+    WidgetId,
 ) {
     // The only element that grows: once the tools panel claims its
     // content width, the rail its fixed width and the divider none, the
@@ -966,9 +973,9 @@ fn insert_canvas_column(
         Err(err) => unreachable!("canvas_column was just inserted: {err:?}"),
     };
     // 0.173.0: the document tab strip takes one row off the canvas.
-    let document_tabs =
+    let (document_tabs, document_overflow) =
         match crate::document_tabs::insert_document_tabs(tree, canvas_column, scales) {
-            Ok(id) => id,
+            Ok(ids) => ids,
             Err(err) => unreachable!("canvas_column was just inserted: {err:?}"),
         };
     let canvas_area = match widgets::insert_container(
@@ -994,6 +1001,7 @@ fn insert_canvas_column(
         menu_bar,
         options_bar,
         document_tabs,
+        document_overflow,
         canvas_area,
     )
 }
