@@ -19,9 +19,9 @@
 
 use aurora_core::LayerEffects;
 use aurora_core::effects::{
-    ColorOverlay, DropShadow, EffectBlendMode, EffectColor, EffectGate, MAX_EFFECT_DISTANCE,
-    MAX_EFFECT_INSTANCES, MAX_EFFECT_SCALE, MAX_EFFECT_SIZE, OtherEffects, OuterGlow, Stroke,
-    StrokeFill, StrokePosition,
+    ColorOverlay, DropShadow, EffectBlendMode, EffectColor, EffectGate, GradientOverlay,
+    MAX_EFFECT_DISTANCE, MAX_EFFECT_INSTANCES, MAX_EFFECT_SCALE, MAX_EFFECT_SIZE, OtherEffects,
+    OuterGlow, Stroke, StrokeFill, StrokePosition,
 };
 
 use super::descriptor::{self, Descriptor, ItemBudget, Value};
@@ -331,12 +331,35 @@ pub(super) fn map_effects(d: &Descriptor, global_angle: f32) -> Result<ReadEffec
             noise: ctx.percent(e, b"Nose")?,
         });
     }
+    // Gradient overlays (task 110): modelled when the gradient reads and is
+    // aligned with the layer; otherwise counted (when shown) as an effect
+    // Aurora does not draw (a Noise gradient, an unknown style, one aligned
+    // to the document).
+    let mut unmodelled_gradients = 0u32;
+    for e in instances(d, b"GrFl", Some(b"gradientFillMulti"), &mut ctx)? {
+        let g = gate(e)?;
+        let mode = blend(e)?;
+        let opacity = ctx.opacity(e)?;
+        match super::fill::gradient(e) {
+            Ok(gradient) if gradient.align && gradient.validate().is_ok() => {
+                fx.gradient_overlays.push(GradientOverlay {
+                    gate: g,
+                    blend_mode: mode,
+                    opacity,
+                    gradient,
+                    dither: flag(e, b"Dthr", false)?,
+                    reference: None,
+                });
+            }
+            _ => unmodelled_gradients += u32::from(g.on()),
+        }
+    }
     fx.other = OtherEffects {
         inner_shadows: count_on(d, b"IrSh", Some(b"innerShadowMulti"), &mut ctx)?,
         inner_glows: count_on(d, b"IrGl", None, &mut ctx)?,
         bevels: count_on(d, b"ebbl", None, &mut ctx)?,
         satins: count_on(d, b"ChFX", None, &mut ctx)?,
-        gradient_overlays: count_on(d, b"GrFl", Some(b"gradientFillMulti"), &mut ctx)?,
+        gradient_overlays: unmodelled_gradients,
         pattern_overlays: count_on(d, b"patternFill", None, &mut ctx)?,
     };
     // Every clamp above keeps the value valid; this is the backstop for a

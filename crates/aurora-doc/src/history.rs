@@ -186,6 +186,39 @@ enum LayerOp {
         dx: i64,
         dy: i64,
     },
+    /// Replaces the gradient overlays of a layer's effects (task 110); the
+    /// layer must carry effects. Appended last: an Aurora older than this
+    /// build refuses a journal holding it (ADR 0009). Also the carrier for
+    /// the overlays `LayerEffects` holds in memory but cannot put on its
+    /// positional wire (`gradient_overlays` is `#[serde(skip)]`):
+    /// [`History::save_journal`] emits one after every `SetEffects` and
+    /// `Restore` that carries some.
+    SetGradientOverlays {
+        id: LayerId,
+        value: Vec<aurora_core::effects::GradientOverlay>,
+    },
+}
+
+/// Every `(layer, gradient overlays)` pair a journaled op carries in an
+/// effects value whose overlays would be lost on the wire.
+fn carried_gradient_overlays(
+    op: &LayerOp,
+) -> Vec<(LayerId, Vec<aurora_core::effects::GradientOverlay>)> {
+    match op {
+        LayerOp::Restore(subtree) => subtree
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                let fx = entry.effects.as_ref()?;
+                (!fx.gradient_overlays.is_empty()).then(|| (*id, fx.gradient_overlays.clone()))
+            })
+            .collect(),
+        LayerOp::SetEffects {
+            id,
+            value: Some(fx),
+        } if !fx.gradient_overlays.is_empty() => vec![(*id, fx.gradient_overlays.clone())],
+        _ => Vec::new(),
+    }
 }
 
 /// Every `(layer, smart object)` pair a journaled `Restore` carries in a
@@ -428,6 +461,16 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
             // offset and blur), so the whole composite is invalidated.
             Ok((LayerOp::SetEffects { id, value: old }, None))
         }
+        LayerOp::SetGradientOverlays { id, value } => {
+            let mut fx = tree.effects(id).cloned().ok_or(DocError::InvalidEffects(
+                aurora_core::effects::EffectsError::OutOfRange {
+                    field: "gradient overlays on a layer without effects",
+                },
+            ))?;
+            let old = std::mem::replace(&mut fx.gradient_overlays, value);
+            tree.set_effects(id, Some(fx))?;
+            Ok((LayerOp::SetGradientOverlays { id, value: old }, None))
+        }
         LayerOp::SetClipped { id, value } => {
             let old = tree.clipped(id);
             tree.set_clipped_flag(id, value)?;
@@ -598,6 +641,12 @@ fn describe(op: &LayerOp) -> String {
             Some(_) => format!("Changed layer effects on layer #{}", id.to_raw()),
             None => format!("Removed layer effects from layer #{}", id.to_raw()),
         },
+        LayerOp::SetGradientOverlays { id, value } => format!(
+            "Changed {} gradient overlay{} on layer #{}",
+            value.len(),
+            if value.len() == 1 { "" } else { "s" },
+            id.to_raw()
+        ),
         LayerOp::SetClipped { id, value } => {
             let verb = if *value {
                 "Clipped"
@@ -897,6 +946,14 @@ impl History {
                 wire.push(std::borrow::Cow::Owned(LayerOp::SetEffects {
                     id,
                     value: Some(value),
+                }));
+            }
+            // Gradient overlays (task 110) the same way, after the effects
+            // they belong to.
+            for (id, value) in carried_gradient_overlays(op) {
+                wire.push(std::borrow::Cow::Owned(LayerOp::SetGradientOverlays {
+                    id,
+                    value,
                 }));
             }
             // The clipping flag (0.201.0) the same way.
@@ -5830,5 +5887,112 @@ mod adjustment_tests {
         let id = crate::LayerId::from_raw(1);
         let bytes = postcard::to_allocvec(&LayerOp::SetClipped { id, value: true });
         assert_eq!(bytes.ok().and_then(|b| b.first().copied()), Some(18));
+    }
+
+    /// Task 110: `SetGradientOverlays` is appended last, so every earlier
+    /// op keeps its postcard ordinal, and the journal carries overlays
+    /// that `LayerEffects` itself cannot put on its wire.
+    #[test]
+    fn set_gradient_overlays_is_appended_and_the_journal_carries_the_overlays() {
+        let id = crate::LayerId::from_raw(3);
+        let bytes = match postcard::to_allocvec(&LayerOp::SetGradientOverlays {
+            id,
+            value: Vec::new(),
+        }) {
+            Ok(b) => b,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let clipped =
+            postcard::to_allocvec(&LayerOp::SetClipped { id, value: true }).unwrap_or_default();
+        let translate =
+            postcard::to_allocvec(&LayerOp::Translate { dx: 1, dy: 2 }).unwrap_or_default();
+        // Variant ordinals are the first byte (a varint below 128).
+        assert_eq!(bytes.first(), translate.first().map(|b| b + 1).as_ref());
+        assert!(bytes.first() > clipped.first());
+
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let layer = history
+            .add_pixel_layer(
+                &mut tree,
+                "p",
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 8,
+                    height: 8,
+                },
+                None,
+            )
+            .unwrap_or_else(|e| unreachable!("{e:?}"));
+        let overlay = aurora_core::effects::GradientOverlay {
+            gate: aurora_core::effects::EffectGate::default(),
+            blend_mode: aurora_core::effects::EffectBlendMode::Normal,
+            opacity: 0.5,
+            gradient: aurora_core::GradientFill {
+                colours: vec![aurora_core::FillStop {
+                    pos: 0.0,
+                    mid: 0.5,
+                    value: [0.1, 0.2, 0.3],
+                }],
+                alphas: Vec::new(),
+                style: aurora_core::GradientStyle::Linear,
+                angle: 12.0,
+                scale: 1.0,
+                reverse: false,
+                align: true,
+                offset: (0.0, 0.0),
+            },
+            dither: false,
+            reference: None,
+        };
+        let fx = aurora_core::LayerEffects {
+            gradient_overlays: vec![overlay.clone()],
+            ..aurora_core::LayerEffects::default()
+        };
+        history
+            .set_effects(&mut tree, layer, Some(fx))
+            .unwrap_or_else(|e| unreachable!("{e:?}"));
+        let journal = history.save_journal().unwrap_or_default();
+        let loaded = History::load_journal(&journal).unwrap_or_else(|e| unreachable!("{e:?}"));
+        let replayed = loaded.replay().unwrap_or_else(|e| unreachable!("{e:?}"));
+        assert_eq!(
+            replayed.effects(layer).map(|f| f.gradient_overlays.clone()),
+            Some(vec![overlay.clone()])
+        );
+        // Undo through the in-memory stack restores the previous (no)
+        // overlays, redo brings them back (the op's own inverse).
+        assert!(history.undo(&mut tree).is_ok());
+        assert!(tree.effects(layer).is_none());
+        assert!(history.redo(&mut tree).is_ok());
+        assert_eq!(
+            tree.effects(layer).map(|f| f.gradient_overlays.len()),
+            Some(1)
+        );
+        // The op itself replaces overlays and keeps the rest.
+        let mut direct = LayerTree::new();
+        let id2 = direct
+            .add_pixel_layer(
+                "d",
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 8,
+                    height: 8,
+                },
+                None,
+            )
+            .unwrap_or_else(|e| unreachable!("{e:?}"));
+        // Without effects the op is refused.
+        assert!(
+            crate::history::apply(
+                &mut direct,
+                LayerOp::SetGradientOverlays {
+                    id: id2,
+                    value: vec![overlay]
+                }
+            )
+            .is_err()
+        );
     }
 }

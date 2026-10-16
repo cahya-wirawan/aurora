@@ -404,6 +404,87 @@ fn read_layer_effects<R: Read + Seek>(
     Ok(())
 }
 
+/// The optional entry carrying every layer's gradient overlays (task 110;
+/// `aurora_core::LayerEffects::gradient_overlays` is `#[serde(skip)]`
+/// because [`LAYER_EFFECTS_ENTRY`]'s payload is positional). Written only
+/// when some layer has gradient overlays, so every other save stays
+/// byte-identical (and an Aurora that predates it reads such a file with
+/// the overlays missing, except that its journal holds the appended
+/// `SetGradientOverlays` op, which it refuses). **Versioned, and a newer
+/// version refuses the file** like [`LAYER_EFFECTS_ENTRY`]. Each pair
+/// names a layer that [`LAYER_EFFECTS_ENTRY`] already gave effects.
+const LAYER_GRADIENT_OVERLAYS_ENTRY: &str = "layer-gradient-overlays";
+
+/// [`LAYER_GRADIENT_OVERLAYS_ENTRY`]'s own schema version.
+const LAYER_GRADIENT_OVERLAYS_VERSION: u32 = 1;
+
+/// [`LAYER_GRADIENT_OVERLAYS_ENTRY`]'s payload: version first (frozen),
+/// then one `(raw layer id, overlays)` pair per layer with some.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LayerGradientOverlaysWire {
+    version: u32,
+    overlays: Vec<(u64, Vec<aurora_core::effects::GradientOverlay>)>,
+}
+
+fn layer_gradient_overlay_pairs(
+    layers: &LayerTree,
+) -> Vec<(u64, Vec<aurora_core::effects::GradientOverlay>)> {
+    layer_ids(layers)
+        .into_iter()
+        .filter_map(|id| {
+            let overlays = &layers.effects(id)?.gradient_overlays;
+            (!overlays.is_empty()).then(|| (id.to_raw(), overlays.clone()))
+        })
+        .collect()
+}
+
+/// Reads [`LAYER_GRADIENT_OVERLAYS_ENTRY`] if present and applies it.
+///
+/// # Errors
+///
+/// [`IoError::ManifestDeserialization`] for an unknown version, bytes that
+/// do not decode, a pair naming a layer without effects, or overlays that
+/// fail validation (`LayerTree::set_effects`).
+fn read_layer_gradient_overlays<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    layers: &mut LayerTree,
+) -> Result<(), IoError> {
+    let bytes = match zip.by_name(LAYER_GRADIENT_OVERLAYS_ENTRY) {
+        Ok(file) => read_capped(file, LAYER_GRADIENT_OVERLAYS_ENTRY, MAX_LAYER_EFFECTS_BYTES)?,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let (prefix, _rest) = postcard::take_from_bytes::<MaskDensityPrefix>(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    if prefix.version != LAYER_GRADIENT_OVERLAYS_VERSION {
+        let cause = if prefix.version > LAYER_GRADIENT_OVERLAYS_VERSION {
+            "the file was saved by a newer Aurora"
+        } else {
+            "the entry is damaged or of an unknown kind"
+        };
+        return Err(IoError::ManifestDeserialization(format!(
+            "unsupported layer-gradient-overlays version {} (this build understands version \
+             {LAYER_GRADIENT_OVERLAYS_VERSION}); {cause}",
+            prefix.version
+        )));
+    }
+    let wire: LayerGradientOverlaysWire = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    for (raw, overlays) in wire.overlays {
+        let id = aurora_doc::LayerId::from_raw(raw);
+        let mut effects = layers.effects(id).cloned().ok_or_else(|| {
+            IoError::ManifestDeserialization(
+                "gradient overlays on a layer without effects".to_string(),
+            )
+        })?;
+        effects.gradient_overlays = overlays;
+        layers
+            .set_effects(id, Some(effects))
+            .map_err(|err| IoError::ManifestDeserialization(format!("gradient overlays: {err}")))?;
+    }
+    Ok(())
+}
+
 /// The optional entry carrying which layers are clipped to the layer
 /// beneath them (0.201.0): `LayerEntry::clipped` is `#[serde(skip)]` in the
 /// positional manifest, like the effects. Written only when some layer is
@@ -1797,6 +1878,9 @@ struct DocumentEntries {
     mask_densities: Option<Vec<u8>>,
     /// [`LAYER_EFFECTS_ENTRY`], when some layer has effects (0.180.0).
     layer_effects: Option<Vec<u8>>,
+    /// [`LAYER_GRADIENT_OVERLAYS_ENTRY`], when some layer has gradient
+    /// overlays (task 110).
+    layer_gradient_overlays: Option<Vec<u8>>,
     /// [`LAYER_CLIPPING_ENTRY`], when some layer is clipped (0.201.0).
     layer_clipping: Option<Vec<u8>>,
     /// [`IMPORT_LOSSES_ENTRY`], when the document has any (0.177.0).
@@ -1857,6 +1941,19 @@ impl DocumentEntries {
                     .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
             )
         };
+        let overlays = layer_gradient_overlay_pairs(layers);
+        let layer_gradient_overlays = if overlays.is_empty() {
+            None
+        } else {
+            let wire = LayerGradientOverlaysWire {
+                version: LAYER_GRADIENT_OVERLAYS_VERSION,
+                overlays,
+            };
+            Some(
+                postcard::to_allocvec(&wire)
+                    .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
+            )
+        };
         let clipped = layer_clipping_ids(layers);
         let layer_clipping = if clipped.is_empty() {
             None
@@ -1875,6 +1972,7 @@ impl DocumentEntries {
             history,
             mask_densities,
             layer_effects,
+            layer_gradient_overlays,
             layer_clipping,
             import_losses: None,
             selection: None,
@@ -1901,6 +1999,10 @@ impl DocumentEntries {
         }
         if let Some(bytes) = &self.layer_effects {
             zip.start_file(LAYER_EFFECTS_ENTRY, deflated)?;
+            zip.write_all(bytes)?;
+        }
+        if let Some(bytes) = &self.layer_gradient_overlays {
+            zip.start_file(LAYER_GRADIENT_OVERLAYS_ENTRY, deflated)?;
             zip.write_all(bytes)?;
         }
         if let Some(bytes) = &self.layer_clipping {
@@ -2342,6 +2444,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     let mut layers = manifest.layers;
     read_mask_densities(&mut zip, &mut layers)?;
     read_layer_effects(&mut zip, &mut layers)?;
+    read_layer_gradient_overlays(&mut zip, &mut layers)?;
     read_layer_clipping(&mut zip, &mut layers)?;
     read_smart_objects(&mut zip, &mut layers)?;
 
@@ -7350,6 +7453,261 @@ mod tests {
             (vec![1, 0xFF, 0xFF], ""),
         ] {
             let tampered = with_named_entry(&bytes, super::LAYER_EFFECTS_ENTRY, Some(&payload));
+            let (_dir2, mut fresh) = real_tile_store();
+            match read(Cursor::new(tampered), &mut fresh) {
+                Err(crate::error::IoError::ManifestDeserialization(message)) => {
+                    assert!(message.contains(needle), "{message}");
+                }
+                other => unreachable!("expected a refusal, got {:?}", other.map(|_| ())),
+            }
+        }
+    }
+
+    fn gradient_overlay_fixture(angle: f64) -> aurora_core::effects::GradientOverlay {
+        let stop = |pos: f32, v: f32| aurora_core::FillStop {
+            pos,
+            mid: 0.4,
+            value: [v, 0.5, 1.0 - v],
+        };
+        aurora_core::effects::GradientOverlay {
+            gate: aurora_core::effects::EffectGate::default(),
+            blend_mode: aurora_core::effects::EffectBlendMode::Multiply,
+            opacity: 0.6,
+            gradient: aurora_core::GradientFill {
+                colours: vec![stop(0.0, 0.0), stop(1.0, 1.0)],
+                alphas: vec![aurora_core::FillStop {
+                    pos: 0.0,
+                    mid: 0.5,
+                    value: 0.75,
+                }],
+                style: aurora_core::GradientStyle::Reflected,
+                angle,
+                scale: 0.8,
+                reverse: true,
+                align: true,
+                offset: (10.0, -5.0),
+            },
+            dither: true,
+            reference: Some(aurora_core::effects::ReferenceBox {
+                dx: -1,
+                dy: 2,
+                width: 30,
+                height: 40,
+            }),
+        }
+    }
+
+    /// Layer "p" with a shadow and a gradient overlay, "q" with a gradient
+    /// overlay alone, saved through the real [`write`].
+    fn gradient_document(
+        store: &mut TileStore,
+        with_gradient: bool,
+    ) -> (Vec<u8>, aurora_doc::LayerId, aurora_doc::LayerId, History) {
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let mut add = |name: &str| match history.add_pixel_layer(&mut layers, name, bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (p, q) = (add("p"), add("q"));
+        if with_gradient {
+            for (id, shadow, angle) in [(p, true, 33.0), (q, false, 71.0)] {
+                let mut fx = if shadow {
+                    effects_fixture(3.0)
+                } else {
+                    aurora_core::LayerEffects::default()
+                };
+                fx.gradient_overlays = vec![gradient_overlay_fixture(angle)];
+                if let Err(err) = history.set_effects(&mut layers, id, Some(fx)) {
+                    unreachable!("{err:?}");
+                }
+            }
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        (bytes.into_inner(), p, q, history)
+    }
+
+    #[test]
+    fn gradient_overlays_survive_aur_round_trip_and_journal_replay() {
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, p, q, _) = gradient_document(&mut store, true);
+        assert!(
+            effects_entry_names(&bytes)
+                .iter()
+                .any(|n| n == super::LAYER_GRADIENT_OVERLAYS_ENTRY)
+        );
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let want = |angle: f64| vec![gradient_overlay_fixture(angle)];
+        assert_eq!(
+            document
+                .layers
+                .effects(p)
+                .map(|f| f.gradient_overlays.clone()),
+            Some(want(33.0))
+        );
+        assert_eq!(
+            document
+                .layers
+                .effects(q)
+                .map(|f| f.gradient_overlays.clone()),
+            Some(want(71.0))
+        );
+        // The rest of the effects came through the unchanged entry.
+        assert_eq!(
+            document.layers.effects(p).map(|f| f.drop_shadows.len()),
+            Some(1)
+        );
+        let replayed = match document.history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            replayed.effects(p).map(|f| f.gradient_overlays.clone()),
+            Some(want(33.0)),
+            "replay"
+        );
+        assert_eq!(
+            replayed.effects(q).map(|f| f.gradient_overlays.clone()),
+            Some(want(71.0)),
+            "replay"
+        );
+    }
+
+    #[test]
+    fn no_gradient_overlay_means_no_entry_and_a_missing_entry_opens_without_them() {
+        let (_dir, mut store) = real_tile_store();
+        let (plain, ..) = gradient_document(&mut store, false);
+        assert!(
+            effects_entry_names(&plain)
+                .iter()
+                .all(|n| n != super::LAYER_GRADIENT_OVERLAYS_ENTRY)
+        );
+        let (_dir1, mut store1) = real_tile_store();
+        let (with, p, q, _) = gradient_document(&mut store1, true);
+        let stripped = with_named_entry(&with, super::LAYER_GRADIENT_OVERLAYS_ENTRY, None);
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(stripped), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        for id in [p, q] {
+            assert_eq!(
+                document
+                    .layers
+                    .effects(id)
+                    .map(|f| f.gradient_overlays.len()),
+                Some(0)
+            );
+        }
+        // The `layer-effects` entry is the pre-task-110 wire: version 1.
+        assert_eq!(super::LAYER_EFFECTS_VERSION, 1);
+    }
+
+    fn entry_bytes(container: &[u8], name: &str) -> Option<Vec<u8>> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(container)).ok()?;
+        let mut file = archive.by_name(name).ok()?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).ok()?;
+        Some(bytes)
+    }
+
+    /// A save with no overlays is the container every build before task 110
+    /// wrote: no `layer-gradient-overlays` entry, the `layer-effects` entry
+    /// version 1 and re-encoding byte-identically; and with overlays that
+    /// entry is still the version-1 wire with the overlays skipped.
+    #[test]
+    fn a_save_without_overlays_is_the_pre_overlay_container_and_the_effects_wire_is_unchanged() {
+        let (_dir, mut store) = real_tile_store();
+        let (plain, ..) = effects_document(&mut store, true);
+        let names = effects_entry_names(&plain);
+        assert!(
+            names.iter().any(|n| n == super::LAYER_EFFECTS_ENTRY),
+            "{names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .all(|n| n != super::LAYER_GRADIENT_OVERLAYS_ENTRY),
+            "{names:?}"
+        );
+        let (_dir2, mut store2) = real_tile_store();
+        let (with, ..) = gradient_document(&mut store2, true);
+        for container in [&plain, &with] {
+            let Some(bytes) = entry_bytes(container, super::LAYER_EFFECTS_ENTRY) else {
+                unreachable!("layer-effects entry");
+            };
+            let wire: super::LayerEffectsWire = match postcard::from_bytes(&bytes) {
+                Ok(w) => w,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(wire.version, 1);
+            assert!(
+                wire.effects
+                    .iter()
+                    .all(|(_, fx)| fx.gradient_overlays.is_empty())
+            );
+            assert_eq!(postcard::to_allocvec(&wire).unwrap_or_default(), bytes);
+        }
+    }
+
+    #[test]
+    fn a_bad_gradient_overlay_entry_refuses_loudly() {
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, p, _q, _) = gradient_document(&mut store, true);
+        let encode = |wire: &super::LayerGradientOverlaysWire| {
+            postcard::to_allocvec(wire).unwrap_or_default()
+        };
+        let mut invalid = gradient_overlay_fixture(0.0);
+        invalid.gradient.scale = 0.0;
+        for (payload, needle) in [
+            (
+                encode(&super::LayerGradientOverlaysWire {
+                    version: super::LAYER_GRADIENT_OVERLAYS_VERSION + 1,
+                    overlays: Vec::new(),
+                }),
+                "saved by a newer Aurora",
+            ),
+            (
+                encode(&super::LayerGradientOverlaysWire {
+                    version: 0,
+                    overlays: Vec::new(),
+                }),
+                "the entry is damaged",
+            ),
+            (
+                encode(&super::LayerGradientOverlaysWire {
+                    version: super::LAYER_GRADIENT_OVERLAYS_VERSION,
+                    overlays: vec![(9_999, vec![gradient_overlay_fixture(0.0)])],
+                }),
+                "without effects",
+            ),
+            (
+                encode(&super::LayerGradientOverlaysWire {
+                    version: super::LAYER_GRADIENT_OVERLAYS_VERSION,
+                    overlays: vec![(p.to_raw(), vec![invalid])],
+                }),
+                "gradient overlays",
+            ),
+            (vec![1, 0xFF, 0xFF], ""),
+        ] {
+            let tampered =
+                with_named_entry(&bytes, super::LAYER_GRADIENT_OVERLAYS_ENTRY, Some(&payload));
             let (_dir2, mut fresh) = real_tile_store();
             match read(Cursor::new(tampered), &mut fresh) {
                 Err(crate::error::IoError::ManifestDeserialization(message)) => {

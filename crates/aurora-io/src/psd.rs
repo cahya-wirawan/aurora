@@ -967,8 +967,9 @@ fn note_text(note: Note, n: u64) -> String {
              glow's are not)."
         ),
         Note::OtherEffectsNotShown => format!(
-            "{n} other effect{s} (inner shadow, inner glow, bevel, satin, gradient or pattern \
-             overlay) {is}n't shown, and {} settings aren't kept.",
+            "{n} other effect{s} (inner shadow, inner glow, bevel, satin, pattern overlay, a \
+             gradient overlay Aurora can't draw -- a Noise gradient or one aligned to the \
+             document -- or any effect on a group) {is}n't shown, and {} settings aren't kept.",
             if one { "its" } else { "their" }
         ),
         Note::EffectsNotShown => format!(
@@ -3454,7 +3455,23 @@ fn props_for(record: &Record, notes: &mut Notes) -> PsdProps {
         clipped: record.clipping != 0,
         effects: match &record.effects {
             Some(Ok(read)) if !read.effects.is_empty() && read.effects.validate().is_ok() => {
-                Some(Box::new(read.effects.clone()))
+                let mut fx = read.effects.clone();
+                // Task 110: a gradient overlay spans the record rectangle
+                // (Photoshop's layer bounds). The offsets here are still
+                // absolute document coordinates; `Builder` makes them
+                // relative to the layer's bounds once it has them.
+                let r = record.bounds;
+                if r.width > 0 && r.height > 0 {
+                    for overlay in &mut fx.gradient_overlays {
+                        overlay.reference = Some(aurora_core::effects::ReferenceBox {
+                            dx: r.x,
+                            dy: r.y,
+                            width: r.width,
+                            height: r.height,
+                        });
+                    }
+                }
+                Some(Box::new(fx))
             }
             _ => None,
         },
@@ -3559,7 +3576,15 @@ fn note_unsupported_kept(
                 Note::OuterGlowsNotShown,
                 glows_undrawn as u64 + u64::from(read.glow_gradients),
             );
-            notes.add_n(Note::OtherEffectsNotShown, fx.shown_other());
+            notes.add_n(
+                Note::OtherEffectsNotShown,
+                fx.shown_other()
+                    + if overlays_drawn {
+                        0
+                    } else {
+                        fx.shown_gradient_overlays() as u64
+                    },
+            );
             if read.clamped {
                 notes.add(Note::EffectsClamped);
             }
@@ -5346,8 +5371,16 @@ impl Builder<'_, '_, '_> {
             }
         }
         if let Some(effects) = &props.effects {
-            self.history
-                .set_effects(self.layers, id, Some((**effects).clone()))?;
+            let mut effects = (**effects).clone();
+            if let Some(bounds) = self.layers.bounds(id) {
+                for overlay in &mut effects.gradient_overlays {
+                    if let Some(r) = &mut overlay.reference {
+                        r.dx = r.dx.saturating_sub(bounds.x);
+                        r.dy = r.dy.saturating_sub(bounds.y);
+                    }
+                }
+            }
+            self.history.set_effects(self.layers, id, Some(effects))?;
         }
         Ok(())
     }

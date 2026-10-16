@@ -16,6 +16,7 @@ pub mod effects;
 pub mod error;
 pub mod exposure;
 pub mod geometry;
+pub mod gradient_fill;
 pub mod gradient_map;
 pub mod hue_ranges;
 pub mod hue_saturation;
@@ -49,6 +50,9 @@ pub use effects::LayerEffects;
 pub use error::CoreError;
 pub use exposure::{EXPOSURE_MAX, ExposureError, ExposureParams, OFFSET_MAX};
 pub use geometry::{MAX_DOCUMENT_EXTENT, MAX_DOCUMENT_ORIGIN, Rect, Size};
+pub use gradient_fill::{
+    FillStop, GradientError, GradientFill, GradientFrame, GradientStyle, MAX_GRADIENT_STOPS,
+};
 pub use gradient_map::{
     GRADIENT_MAP_MAX_STOPS, GRADIENT_MAP_MIN_STOPS, GradientInterpolation, GradientMapError,
     GradientMapParams, GradientStop,

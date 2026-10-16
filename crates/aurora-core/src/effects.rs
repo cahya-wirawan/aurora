@@ -503,6 +503,54 @@ impl OuterGlow {
     }
 }
 
+/// The box an aligned gradient overlay is laid over when it is not the
+/// layer's own `bounds` (task 110): the layer's PSD record rectangle,
+/// kept as an offset of its top-left from the layer bounds' top-left, so
+/// it follows the layer when it moves. Aurora gives a shape layer the
+/// canvas's size where Photoshop's box is the shape's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReferenceBox {
+    pub dx: i64,
+    pub dy: i64,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ReferenceBox {
+    /// The box for a layer whose bounds are `bounds`.
+    #[must_use]
+    pub fn within(self, bounds: crate::Rect) -> crate::Rect {
+        crate::Rect {
+            x: bounds.x.saturating_add(self.dx),
+            y: bounds.y.saturating_add(self.dy),
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
+/// A gradient overlay (`GrFl`, task 110): a gradient drawn over the layer's
+/// interior in its own blend mode and opacity, above the colour overlays.
+///
+/// **Not on the `.aur` effects wire**: [`LayerEffects`] is positional
+/// `postcard`, so these ride in the optional `layer-gradient-overlays`
+/// entry (and `LayerOp::SetGradientOverlays`) instead, and
+/// `LayerEffects::gradient_overlays` is `#[serde(skip)]`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GradientOverlay {
+    pub gate: EffectGate,
+    pub blend_mode: EffectBlendMode,
+    /// `0.0..=1.0`.
+    pub opacity: f32,
+    /// The gradient; its `align` is always on (an overlay aligned to the
+    /// document is not modelled and is counted in [`OtherEffects`]).
+    pub gradient: crate::GradientFill,
+    /// `Dthr`, kept; not applied (the interior is `f16`).
+    pub dither: bool,
+    /// The box the gradient spans; `None` is the layer's `bounds`.
+    pub reference: Option<ReferenceBox>,
+}
+
 /// How many effects of each kind Aurora does not model yet, counting
 /// only instances whose own `present` and `enab` are both on. Kept so a
 /// report can name them; their settings are not kept.
@@ -546,6 +594,10 @@ pub struct LayerEffects {
     pub strokes: Vec<Stroke>,
     pub outer_glows: Vec<OuterGlow>,
     pub other: OtherEffects,
+    /// Gradient overlays (task 110). `#[serde(skip)]`: see
+    /// [`GradientOverlay`].
+    #[serde(skip)]
+    pub gradient_overlays: Vec<GradientOverlay>,
 }
 
 impl Default for LayerEffects {
@@ -558,6 +610,7 @@ impl Default for LayerEffects {
             strokes: Vec::new(),
             outer_glows: Vec::new(),
             other: OtherEffects::default(),
+            gradient_overlays: Vec::new(),
         }
     }
 }
@@ -603,6 +656,28 @@ impl LayerEffects {
         count(&self.color_overlays, "colour overlay")?;
         count(&self.strokes, "stroke")?;
         count(&self.outer_glows, "outer glow")?;
+        count(&self.gradient_overlays, "gradient overlay")?;
+        for g in &self.gradient_overlays {
+            unit(g.opacity, "opacity")?;
+            g.gradient
+                .validate()
+                .map_err(|e| EffectsError::OutOfRange { field: e.field })?;
+            if let Some(r) = g.reference
+                && (r.width == 0
+                    || r.height == 0
+                    || r.dx.unsigned_abs() > crate::MAX_DOCUMENT_ORIGIN.unsigned_abs()
+                    || r.dy.unsigned_abs() > crate::MAX_DOCUMENT_ORIGIN.unsigned_abs())
+            {
+                return Err(EffectsError::OutOfRange {
+                    field: "gradient reference box",
+                });
+            }
+            if !g.gradient.align {
+                return Err(EffectsError::OutOfRange {
+                    field: "gradient alignment",
+                });
+            }
+        }
         for s in &self.drop_shadows {
             color(s.color)?;
             unit(s.opacity, "opacity")?;
@@ -705,6 +780,16 @@ impl LayerEffects {
         self.shown_outer_glows() - self.shown_soft_glows()
     }
 
+    /// The gradient overlays Photoshop would draw and Aurora draws
+    /// (task 110).
+    #[must_use]
+    pub fn shown_gradient_overlays(&self) -> usize {
+        self.gradient_overlays
+            .iter()
+            .filter(|e| self.shows(e.gate))
+            .count()
+    }
+
     /// The not-yet-modelled effects Photoshop would draw.
     #[must_use]
     pub fn shown_other(&self) -> u64 {
@@ -719,6 +804,7 @@ impl LayerEffects {
             || self.shown_color_overlays() > 0
             || self.shown_strokes() > 0
             || self.shown_outer_glows() > 0
+            || self.shown_gradient_overlays() > 0
             || self.shown_other() > 0
     }
 
@@ -729,6 +815,7 @@ impl LayerEffects {
             && self.color_overlays.is_empty()
             && self.strokes.is_empty()
             && self.outer_glows.is_empty()
+            && self.gradient_overlays.is_empty()
             && self.other.total() == 0
     }
 }
@@ -867,5 +954,151 @@ mod tests {
         assert_eq!(fx.shown_strokes(), 3);
         assert_eq!(fx.shown_color_strokes(), 1);
         assert_eq!(fx.shown_unrendered_strokes(), 2);
+    }
+
+    fn ramp() -> crate::GradientFill {
+        let stop = |pos: f32, v: f32| crate::FillStop {
+            pos,
+            mid: 0.5,
+            value: [v; 3],
+        };
+        crate::GradientFill {
+            colours: vec![stop(0.0, 0.0), stop(1.0, 1.0)],
+            alphas: Vec::new(),
+            style: crate::GradientStyle::Linear,
+            angle: 0.0,
+            scale: 1.0,
+            reverse: false,
+            align: true,
+            offset: (0.0, 0.0),
+        }
+    }
+
+    fn overlay() -> GradientOverlay {
+        GradientOverlay {
+            gate: EffectGate::default(),
+            blend_mode: EffectBlendMode::Normal,
+            opacity: 1.0,
+            gradient: ramp(),
+            dither: false,
+            reference: None,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::indexing_slicing)]
+    fn gradient_overlay_validation_refuses_each_bad_field() {
+        let with = |o: GradientOverlay| LayerEffects {
+            gradient_overlays: vec![o],
+            ..LayerEffects::default()
+        };
+        assert_eq!(with(overlay()).validate(), Ok(()));
+        let mut bad = Vec::new();
+        for opacity in [-0.1, 1.1, f32::NAN] {
+            let mut o = overlay();
+            o.opacity = opacity;
+            bad.push(o);
+        }
+        let mut o = overlay();
+        o.gradient.colours.clear();
+        bad.push(o);
+        let mut o = overlay();
+        o.gradient.colours = vec![o.gradient.colours[0]; crate::MAX_GRADIENT_STOPS + 1];
+        bad.push(o);
+        let mut o = overlay();
+        o.gradient.scale = 0.0;
+        bad.push(o);
+        let mut o = overlay();
+        o.gradient.angle = f64::NAN;
+        bad.push(o);
+        let mut o = overlay();
+        o.gradient.offset = (2000.0, 0.0);
+        bad.push(o);
+        let mut o = overlay();
+        o.gradient.colours[0].value = [2.0, 0.0, 0.0];
+        bad.push(o);
+        let mut o = overlay();
+        o.gradient.colours.swap(0, 1);
+        bad.push(o);
+        let mut o = overlay();
+        o.gradient.align = false;
+        bad.push(o);
+        for (zero_w, zero_h, far) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut o = overlay();
+            o.reference = Some(ReferenceBox {
+                dx: if far { i64::MAX } else { 0 },
+                dy: 0,
+                width: u32::from(!zero_w),
+                height: u32::from(!zero_h),
+            });
+            bad.push(o);
+        }
+        for (n, o) in bad.into_iter().enumerate() {
+            assert!(with(o).validate().is_err(), "case {n}");
+        }
+        let many = LayerEffects {
+            gradient_overlays: vec![overlay(); MAX_EFFECT_INSTANCES + 1],
+            ..LayerEffects::default()
+        };
+        assert!(matches!(
+            many.validate(),
+            Err(EffectsError::TooManyInstances { .. })
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::indexing_slicing)]
+    fn gradient_overlays_are_gated_counted_and_not_on_the_effects_wire() {
+        let mut fx = LayerEffects {
+            gradient_overlays: vec![overlay()],
+            ..LayerEffects::default()
+        };
+        assert!(fx.shows_any());
+        assert!(!fx.is_empty());
+        assert_eq!(fx.shown_gradient_overlays(), 1);
+        fx.gradient_overlays[0].gate.present = false;
+        assert_eq!((fx.shown_gradient_overlays(), fx.shows_any()), (0, false));
+        fx.gradient_overlays[0].gate.present = true;
+        fx.enabled = false;
+        assert_eq!(fx.shown_gradient_overlays(), 0);
+        // `#[serde(skip)]`: the positional wire is the one before task 110.
+        let with = LayerEffects {
+            gradient_overlays: vec![overlay()],
+            ..LayerEffects::default()
+        };
+        let a = postcard::to_allocvec(&with).unwrap_or_default();
+        let b = postcard::to_allocvec(&LayerEffects::default()).unwrap_or_default();
+        assert_eq!(a, b);
+        let back: Result<LayerEffects, _> = postcard::from_bytes(&a);
+        assert_eq!(back.map(|f| f.gradient_overlays.len()).ok(), Some(0));
+    }
+
+    #[test]
+    fn a_reference_box_follows_the_layer_bounds() {
+        let r = ReferenceBox {
+            dx: -3,
+            dy: 5,
+            width: 7,
+            height: 9,
+        };
+        let moved = crate::Rect {
+            x: 100,
+            y: 200,
+            width: 50,
+            height: 50,
+        };
+        assert_eq!(
+            r.within(moved),
+            crate::Rect {
+                x: 97,
+                y: 205,
+                width: 7,
+                height: 9
+            }
+        );
     }
 }

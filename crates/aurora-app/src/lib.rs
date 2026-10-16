@@ -16643,6 +16643,7 @@ fn layer_renders_effects(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId
                 || fx.shown_drop_shadows() > 0
                 || fx.shown_color_strokes() > 0
                 || fx.shown_soft_glows() > 0
+                || fx.shown_gradient_overlays() > 0
         })
 }
 
@@ -17602,6 +17603,11 @@ fn fold_layer_with_effects(
                 && aurora_doc::BlendMode::from(overlay.blend_mode)
                     == aurora_doc::BlendMode::Dissolve
         })
+        && !fx.gradient_overlays.iter().any(|overlay| {
+            fx.shows(overlay.gate)
+                && aurora_doc::BlendMode::from(overlay.blend_mode)
+                    == aurora_doc::BlendMode::Dissolve
+        })
         && !strokes.iter().any(|(stroke, planes)| {
             planes.inside.is_some()
                 && aurora_doc::BlendMode::from(stroke.blend_mode) == aurora_doc::BlendMode::Dissolve
@@ -17657,6 +17663,45 @@ fn fold_layer_with_effects(
                     aurora_doc::BlendMode::from(overlay.blend_mode),
                     doc_origin,
                 );
+            }
+        }
+    }
+    // Step 2a (task 110): each shown gradient overlay, over the colour
+    // overlays (Photoshop stacks interior effects, bottom to top: colour
+    // overlay, gradient overlay, pattern overlay, stroke), evaluated per
+    // texel from the layer's bounds ([`gradient_overlay_texels`]), at its
+    // opacity in its own mode. Fill does not fade it; the shape (step 3)
+    // clips it.
+    if fx.shown_gradient_overlays() > 0 {
+        let bounds = layers.bounds(id).unwrap_or(aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        });
+        for overlay in fx.gradient_overlays.iter().filter(|o| fx.shows(o.gate)) {
+            let frame = overlay
+                .gradient
+                .frame(overlay.reference.map_or(bounds, |r| r.within(bounds)));
+            for run in &runs {
+                if let (Some(inside), Some(src)) =
+                    (interior.get_mut(run.clone()), source.get_mut(run.clone()))
+                {
+                    gradient_overlay_texels(
+                        src,
+                        &overlay.gradient,
+                        &frame,
+                        run.start / aurora_tile::CHANNELS,
+                        doc_origin,
+                    );
+                    fold_texels_in_mode(
+                        inside,
+                        src,
+                        overlay.opacity,
+                        aurora_doc::BlendMode::from(overlay.blend_mode),
+                        doc_origin,
+                    );
+                }
             }
         }
     }
@@ -17730,6 +17775,30 @@ fn fold_layer_with_effects(
         }
     }
     true
+}
+
+/// Fills `texels` (straight RGBA, the samples of the tile's texels from
+/// `first_texel` on) with `gradient` evaluated at each texel's centre in
+/// document space: the colour at the position along the gradient and its
+/// transparency stop as the alpha (task 110).
+#[allow(clippy::cast_precision_loss)]
+fn gradient_overlay_texels(
+    texels: &mut [half::f16],
+    gradient: &aurora_core::GradientFill,
+    frame: &aurora_core::GradientFrame<'_>,
+    first_texel: usize,
+    doc_origin: (i64, i64),
+) {
+    let side = aurora_tile::TILE as usize;
+    for (n, texel) in texels.chunks_exact_mut(aurora_tile::CHANNELS).enumerate() {
+        let index = first_texel + n;
+        let x = doc_origin.0 as f64 + (index % side) as f64 + 0.5;
+        let y = doc_origin.1 as f64 + (index / side) as f64 + 0.5;
+        let (rgb, alpha) = gradient.at(frame.position(x, y));
+        for (channel, value) in texel.iter_mut().zip([rgb[0], rgb[1], rgb[2], alpha]) {
+            *channel = half::f16::from_f32(value);
+        }
+    }
 }
 
 /// The sample ranges of `shape`'s rows that hold any texel whose alpha is
@@ -19199,6 +19268,45 @@ fn fold_clipped_atop(
     true
 }
 
+/// Adds each clipped layer's change to a clip group (`group` against
+/// `before`, scaled by the base's `opacity`) to `accumulator`, which holds
+/// the base with its effects and all ([`fold_clip_group`]). The sum is only
+/// a model, so where a texel's colour changes and the sum leaves the valid
+/// premultiplied range (below 0 or above the texel's own alpha, seen on
+/// `stroke-composite.psd` under a gradient overlay) it is clamped back into
+/// it. Task 110, with the judge's fixes: a channel whose change is exactly
+/// 0 is left untouched (legal HDR content above its alpha stays), and the
+/// clamp runs only for a finite, non-negative alpha, as `.max(0.0).min(a)`
+/// (never `f32::clamp`, which panics on a negative or NaN bound).
+fn add_clip_change(
+    accumulator: &mut [half::f16],
+    group: &[half::f16],
+    before: &[half::f16],
+    opacity: f32,
+) {
+    for ((acc, new), old) in accumulator
+        .chunks_exact_mut(aurora_tile::CHANNELS)
+        .zip(group.chunks_exact(aurora_tile::CHANNELS))
+        .zip(before.chunks_exact(aurora_tile::CHANNELS))
+    {
+        let alpha = acc.get(3).map_or(0.0, |a| a.to_f32());
+        for (channel, (n, o)) in acc.iter_mut().zip(new.iter().zip(old)).take(3) {
+            let delta = (n.to_f32() - o.to_f32()) * opacity;
+            #[allow(clippy::float_cmp)] // exactly zero: nothing to add
+            if delta == 0.0 {
+                continue;
+            }
+            let sum = channel.to_f32() + delta;
+            let sum = if alpha.is_finite() && alpha >= 0.0 {
+                sum.max(0.0).min(alpha)
+            } else {
+                sum
+            };
+            *channel = half::f16::from_f32(sum);
+        }
+    }
+}
+
 /// Folds a clip group (0.201.0): `base`, a pixel layer, and the `clipped`
 /// layers above it (bottom to top, [`clipped_above`]), into `accumulator`.
 /// `cover` is the base's already-read exactly-opaque texels when the
@@ -19307,15 +19415,7 @@ fn fold_clip_group(
     }
     if let Some(before) = before.clone() {
         if any {
-            for (index, ((acc, new), old)) in
-                accumulator.iter_mut().zip(&group).zip(&before).enumerate()
-            {
-                if index % aurora_tile::CHANNELS == 3 {
-                    continue;
-                }
-                let delta = (new.to_f32() - old.to_f32()) * opacity;
-                *acc = half::f16::from_f32(acc.to_f32() + delta);
-            }
+            add_clip_change(accumulator, &group, &before, opacity);
             changed = true;
         }
         return changed;
@@ -89998,14 +90098,16 @@ mod tests {
             // 0.181.0: Fill 0 on 'Polygon 2' (content hidden); its stroke is not drawn yet. Before it (0.180.0): 255 / 56.29, 63.67, 69.87 (max / mean per channel).
             // 0.182.0: unchanged by drawing drop shadows.
             // 0.190.0: Inner stroke now drawn; before 0.190.0: max 255 / 57.8164, 63.1807, 69.8682.
-            ("effects/shape-fx2.psd", 255.0, [12.4180, 41.8770, 69.8682]),
+            // Task 110: Polygon 1's gradient overlay is drawn; before: 255 / 12.4180, 41.8770, 69.8682.
+            ("effects/shape-fx2.psd", 255.0, [2.6016, 0.6280, 0.6280]),
             // 0.181.0: overlays now drawn, but on clipped layers shown unclipped, so they cover more than Photoshop's. Before it (0.180.0): 255 / 43.94, 47.46, 22.82 (max / mean per channel).
             // 0.182.0: unchanged by drawing drop shadows.
             // 0.190.0: Inner strokes now drawn (on clipped layers shown unclipped: blue is worse, red and green better); before: 255 / 52.6774, 53.5591, 26.0986.
+            // Task 110: the two 'Plain+Effects' gradient overlays are drawn (mean 13.98 -> 6.30 over channels); before: 255 / 45.1914, 46.6338, 27.2065.
             (
                 "effects/stroke-composite.psd",
                 255.0,
-                [45.1914, 46.6338, 27.2065],
+                [7.8800, 5.5871, 5.4319],
             ),
             // 0.181.0: Fill 0 hides the shape's pixels; its stroke is not drawn yet. Before it (0.180.0): 255 / 220.34, 52.00, 220.34 (max / mean per channel).
             // 0.182.0: unchanged by drawing drop shadows.
@@ -90019,7 +90121,8 @@ mod tests {
             // 0.182.0, drop shadows drawn; before (0.181.0): max 168, mean 10.990, 9.186, 10.466.
             // 0.190.0: Text stroke now drawn; before: 168 / 10.3246, 8.5522, 9.8170.
             // 0.191.0: The Outer Glow (Softer, white, Screen 35 %, size 41) on the "Outer Glow" text is drawn; before: 168 / 8.9371, 7.1427, 8.4219. Over the margins left and right of that text alone the mean falls 4.35 -> 2.16 levels (`the_fitted_glow_radius_reduces_the_error_against_photoshops_merged_image`).
-            ("layer_effects.psd", 168.0, [8.5358, 6.7384, 8.0221]),
+            // Task 110: the Gradient Overlay text is drawn; before: 168 / 8.5358, 6.7384, 8.0221.
+            ("layer_effects.psd", 168.0, [7.0919, 5.5328, 7.6226]),
             // 0.181.0: Fill 0 'divider' shape no longer drawn. Before it (0.180.0): 161 / 1.36, 1.32, 1.32 (max / mean per channel).
             // 0.182.0, drop shadows drawn; before (0.181.0): max 65, mean 1.191, 1.148, 1.137.
             // 0.190.0: A 2 px 10 % outside stroke on Rectangle 2 was drawn darker than Photoshop shows it; before: 65 / 0.2007, 0.1571, 0.1460 (0.189.0).
@@ -90095,10 +90198,12 @@ mod tests {
             ("fill_adjustments.psd", 230.0, [125.8756, 51.4564, 32.0369]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 162, mean 6.738, 12.118, 17.999.
             // 0.190.0: Strokes drawn; before: 162 / 4.4585, 9.8399, 15.7286.
-            ("layer_comps.psd", 136.0, [3.8984, 9.3481, 15.6275]),
+            // Task 110: gradient overlays drawn (reference box = the record rectangle); mean over channels 9.63 -> 9.51: red 3.90 -> 3.64 and blue 15.63 -> 15.40 better, green 9.35 -> 9.48 worse (not explained).
+            ("layer_comps.psd", 136.0, [3.6410, 9.4797, 15.4030]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 182, mean 6.800, 12.246, 18.372.
             // 0.190.0: Strokes drawn; before: 182 / 4.2692, 9.7118, 15.7745.
-            ("layer_comps.psb", 124.0, [3.8034, 9.3190, 15.7356]),
+            // Task 110: as layer_comps.psd (measured 3.5652 / 9.4646 / 15.5236).
+            ("layer_comps.psb", 124.0, [3.5653, 9.4647, 15.5237]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 245, mean 4.480, 7.851, 9.767.
             ("layer_params.psd", 244.0, [4.8987, 4.8851, 4.2994]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 245, mean 4.480, 7.851, 9.767.
@@ -90708,6 +90813,7 @@ mod tests {
         include!("two_adjust_fidelity_tests.rs");
         include!("gradient_fidelity_tests.rs");
         include!("shape_fidelity_tests.rs");
+        include!("gradient_overlay_tests.rs");
         include!("small_machine_effect_tests.rs");
     }
 }
