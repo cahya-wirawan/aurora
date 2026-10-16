@@ -22,6 +22,7 @@ pub mod hue_ranges;
 pub mod hue_saturation;
 pub mod id;
 pub mod levels;
+pub mod pattern;
 pub mod photo_filter;
 pub mod posterize;
 pub mod selective_color;

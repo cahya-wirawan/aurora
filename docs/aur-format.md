@@ -46,7 +46,7 @@ There is **no single global file-format version number**. Versioning is layered:
 | Tile codec | byte 4 of every tile payload | `1` (`VERSION` in `codec.rs`) | `crates/aurora-tile/src/codec.rs` |
 | Enum ordinals | `postcard` variant indices inside the manifest and journal | see Appendix B | `layer.rs`, `history.rs` |
 
-Per-entry schema versions: `mask-density` 1 (`MASK_DENSITY_VERSION`), `layer-effects` 1 (`LAYER_EFFECTS_VERSION`), `layer-clipping` 1 (`LAYER_CLIPPING_VERSION`), `smart-objects` 1 (`SMART_OBJECTS_VERSION`), `import-losses` 1 (`IMPORT_LOSSES_VERSION`), `skipped-tiles` 1 (`SKIPPED_TILES_VERSION`), `selection` 1 (`SELECTION_VERSION`, `aur_selection.rs`), `paths` 1 (`PATHS_VERSION`, `aur_paths.rs`).
+Per-entry schema versions: `mask-density` 1 (`MASK_DENSITY_VERSION`), `layer-effects` 1 (`LAYER_EFFECTS_VERSION`), `layer-patterns` 1 (`LAYER_PATTERNS_VERSION`), `layer-clipping` 1 (`LAYER_CLIPPING_VERSION`), `smart-objects` 1 (`SMART_OBJECTS_VERSION`), `import-losses` 1 (`IMPORT_LOSSES_VERSION`), `skipped-tiles` 1 (`SKIPPED_TILES_VERSION`), `selection` 1 (`SELECTION_VERSION`, `aur_selection.rs`), `paths` 1 (`PATHS_VERSION`, `aur_paths.rs`).
 
 The format has **evolved without bumping the manifest version**: every change since the first release was made by (a) adding an optional top-level ZIP entry, or (b) appending an enum variant (section 10). `MANIFEST_VERSION` has never changed from 1, and a reader that meets any other value refuses the file (`aur.rs` `read`, "unsupported manifest version").
 
@@ -128,6 +128,7 @@ All entry names are exact, case-sensitive ASCII strings, with `/` as separator a
 | `history` | **yes** | Deflated | `postcard` `Vec<LayerOp>` (section 5) | always | 64 MiB | `HISTORY_ENTRY` |
 | `mask-density` | no | Deflated | `postcard` `{version: u32, densities: Vec<(u64, f32)>}` (8.2) | some mask has density < 1.0 | 64 MiB | `MASK_DENSITY_ENTRY` |
 | `layer-effects` | no | Deflated | `postcard` `{version: u32, effects: Vec<(u64, LayerEffects)>}` (7.6) | some layer has effects | 16 MiB | `LAYER_EFFECTS_ENTRY` |
+| `layer-patterns` (+ `layer-pattern-pixels-<n>`) | no | Deflated | `postcard` `{version: u32, patterns: Vec<{id, name, width: u32, height: u32}>, overlays: Vec<(u64, Vec<PatternOverlay>)>}`; pixels: little-endian `u16` RGBA straight, exactly `width * height * 8` bytes per pattern, index = position in `patterns` (task 111) | the document has a pattern or a pattern overlay | meta 16 MiB; pixels 4 Mpx (32 MiB) each, 64 MiB and 256 patterns in all, sizes checked before any pixel is read | `LAYER_PATTERNS_ENTRY` |
 | `layer-clipping` | no | Deflated | `postcard` `{version: u32, clipped: Vec<u64>}` (7.5) | some layer is clipped to a base | 16 MiB | `LAYER_CLIPPING_ENTRY` |
 | `smart-objects` | no | Deflated | `postcard` `{version: u32, objects, files}` (8.5) | document has smart-object data or embedded files | 80 MiB | `SMART_OBJECTS_ENTRY` |
 | `smart-object-file-<n>` | only if named by `smart-objects` | **Stored** | one PSD linked-layer entry, framed (8.5) | one per record in `smart-objects.files`, `n` = 0-based index in that list | the record's `len` | `SMART_OBJECT_FILE_PREFIX` |
@@ -143,7 +144,7 @@ Unknown entry names (including directory entries) are ignored by the reference r
 
 ### 3.3 Ordering requirements
 
-* The writer emits entries in this order: `mimetype`, `manifest`, `history`, `mask-density`, `layer-effects`, `layer-clipping`, `smart-objects` followed by its `smart-object-file-<n>` entries in index order, `import-losses`, `selection`, `paths`, then all tile entries, then `skipped-tiles` (`DocumentEntries::write_to`, then the tile loop in `write_with_policy` and `write_snapshot`, then `skipped_tiles_entry`, all in `aur.rs`). The snapshot writer produces the same order.
+* The writer emits entries in this order: `mimetype`, `manifest`, `history`, `mask-density`, `layer-effects`, `layer-patterns` followed by its `layer-pattern-pixels-<n>` entries (task 111; the gradient-overlay entry of task 110 sits before it), `layer-clipping`, `smart-objects` followed by its `smart-object-file-<n>` entries in index order, `import-losses`, `selection`, `paths`, then all tile entries, then `skipped-tiles` (`DocumentEntries::write_to`, then the tile loop in `write_with_policy` and `write_snapshot`, then `skipped_tiles_entry`, all in `aur.rs`). The snapshot writer produces the same order.
 * `mimetype` SHOULD be first and Stored so that a magic-byte sniff works without parsing the central directory (ADR 0009; the app test at `crates/aurora-app/src/lib.rs:67594` asserts the entry exists and is Stored). No reader code depends on the position.
 * **A reader MUST NOT rely on entry order**; it looks every entry up by name through the central directory.
 * Tile entries are written in `persisted_surfaces` order (section 6.3): layers in depth-first pre-order of the tree (siblings in stored order), a pixel layer's content surface before its mask surface, within a surface row-major (rows outer, columns inner). This order is not significant to a reader.
@@ -171,6 +172,7 @@ Per-entry policy for an entry that is absent, malformed, oversized, or of an une
 | `mask-density` | ok (all masks density 1.0) | refuse | refuse | refuse (also: a pair naming a layer with no mask, or density outside 0..=1) | refuse (any value != 1, smaller or larger) |
 | `layer-effects` | ok | refuse | refuse | refuse (also: unknown layer, adjustment layer, `LayerEffects::validate` failure) | refuse (message distinguishes newer from damaged) |
 | `layer-clipping` | ok | refuse | refuse | refuse (also: unknown layer, a group, a layer with nothing beneath it) | refuse |
+| `layer-patterns` | ok | refuse | refuse | refuse (also: a pattern over the size caps, a missing or wrong-sized pixel entry, an overlay on a layer without effects or naming a pattern the file lacks, `LayerEffects::validate` failure) | refuse (message distinguishes newer from damaged) |
 | `smart-objects` | ok | refuse | refuse | refuse (also: object on missing or non-pixel layer, validation failure, missing/damaged/oversized embedded file, pool bounds) | refuse |
 | `skipped-tiles` | ok (nothing skipped) | refuse | refuse | refuse | **keep the `total` count, drop the record detail, do not fail** |
 | `import-losses` | `None` | one generic line, never fails | one generic line | one generic line | one generic line |
@@ -953,3 +955,7 @@ Writer:
 | Autosave, recovery, Save As | `crates/aurora-app/src/background_autosave.rs`, `autosave_files.rs`, `lib.rs` (`save_aur_file`, `write_autosave_temp`, `land_autosave_temp`, `verify_aur`, `read_aur_for_open`) |
 | PSD key mapping | `crates/aurora-io/src/psd/write_adjust.rs`, `psd/write.rs` |
 | Decision record | `docs/adr/0009-aur-document-format.md` (addenda are append-only and partly stale, G-16) |
+
+### Pattern overlays (task 111)
+
+`PatternOverlay { gate, blend_mode, opacity, pattern: String, scale: f32, origin: (f64, f64) }` rides in the `layer-patterns` entry, **not** in `layer-effects` (`LayerEffects::pattern_overlays` is `#[serde(skip)]`, so the `layer-effects` wire is the version-1 one, byte for byte). `pattern` is an ID in the entry's own pool; `scale` is 0.01..=10 (1.0 = 100 %); `origin` is the pixel where texel (0, 0) is centred, **relative to the layer's `bounds` top-left** (a PSD import stores Photoshop's `fxrp` reference point this way). The pool is `LayerTree::patterns()`; the journal carries only the overlays, through the appended `LayerOp::SetPatternOverlays` (ordinal after `SetGradientOverlays`; an older Aurora refuses a journal holding it, ADR 0009).

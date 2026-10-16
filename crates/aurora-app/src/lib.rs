@@ -16644,6 +16644,7 @@ fn layer_renders_effects(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId
                 || fx.shown_color_strokes() > 0
                 || fx.shown_soft_glows() > 0
                 || fx.shown_gradient_overlays() > 0
+                || fx.shown_pattern_overlays() > 0
         })
 }
 
@@ -17608,6 +17609,11 @@ fn fold_layer_with_effects(
                 && aurora_doc::BlendMode::from(overlay.blend_mode)
                     == aurora_doc::BlendMode::Dissolve
         })
+        && !fx.pattern_overlays.iter().any(|overlay| {
+            fx.shows(overlay.gate)
+                && aurora_doc::BlendMode::from(overlay.blend_mode)
+                    == aurora_doc::BlendMode::Dissolve
+        })
         && !strokes.iter().any(|(stroke, planes)| {
             planes.inside.is_some()
                 && aurora_doc::BlendMode::from(stroke.blend_mode) == aurora_doc::BlendMode::Dissolve
@@ -17691,6 +17697,45 @@ fn fold_layer_with_effects(
                         src,
                         &overlay.gradient,
                         &frame,
+                        run.start / aurora_tile::CHANNELS,
+                        doc_origin,
+                    );
+                    fold_texels_in_mode(
+                        inside,
+                        src,
+                        overlay.opacity,
+                        aurora_doc::BlendMode::from(overlay.blend_mode),
+                        doc_origin,
+                    );
+                }
+            }
+        }
+    }
+    // Step 2a' (task 111): each shown pattern overlay, over the gradient
+    // overlays, sampled per texel ([`pattern_overlay_texels`]) from its
+    // pattern in the document's pool, at its opacity in its own mode. Fill
+    // does not fade it; the shape (step 3) clips it. A pattern the pool
+    // lacks (a damaged document) draws nothing.
+    if fx.shown_pattern_overlays() > 0 {
+        let bounds = layers.bounds(id).unwrap_or(aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        });
+        for overlay in fx.pattern_overlays.iter().filter(|o| fx.shows(o.gate)) {
+            let Some(pattern) = layers.patterns().get(&overlay.pattern) else {
+                continue;
+            };
+            for run in &runs {
+                if let (Some(inside), Some(src)) =
+                    (interior.get_mut(run.clone()), source.get_mut(run.clone()))
+                {
+                    pattern_overlay_texels(
+                        src,
+                        pattern,
+                        overlay,
+                        bounds,
                         run.start / aurora_tile::CHANNELS,
                         doc_origin,
                     );
@@ -17796,6 +17841,36 @@ fn gradient_overlay_texels(
         let y = doc_origin.1 as f64 + (index / side) as f64 + 0.5;
         let (rgb, alpha) = gradient.at(frame.position(x, y));
         for (channel, value) in texel.iter_mut().zip([rgb[0], rgb[1], rgb[2], alpha]) {
+            *channel = half::f16::from_f32(value);
+        }
+    }
+}
+
+/// Fills `texels` (straight RGBA, the samples of the tile's texels from
+/// `first_texel` on) with `pattern` tiled by `overlay` (task 111): pixel
+/// `(x, y)` reads the pattern at `((x, y) - origin) / scale` in texel units
+/// with texel centres at the integers (so a whole-pixel origin at 100 %
+/// reads exact texels and anything else interpolates bilinearly), `origin`
+/// being the overlay's offset from the layer's `bounds`.
+#[allow(clippy::cast_precision_loss)]
+fn pattern_overlay_texels(
+    texels: &mut [half::f16],
+    pattern: &aurora_core::pattern::Pattern,
+    overlay: &aurora_core::effects::PatternOverlay,
+    bounds: aurora_core::Rect,
+    first_texel: usize,
+    doc_origin: (i64, i64),
+) {
+    let side = aurora_tile::TILE as usize;
+    let ox = bounds.x as f64 + overlay.origin.0;
+    let oy = bounds.y as f64 + overlay.origin.1;
+    let scale = f64::from(overlay.scale);
+    for (n, texel) in texels.chunks_exact_mut(aurora_tile::CHANNELS).enumerate() {
+        let index = first_texel + n;
+        let x = doc_origin.0 as f64 + (index % side) as f64;
+        let y = doc_origin.1 as f64 + (index / side) as f64;
+        let rgba = pattern.sample((x - ox) / scale, (y - oy) / scale);
+        for (channel, value) in texel.iter_mut().zip(rgba) {
             *channel = half::f16::from_f32(value);
         }
     }
@@ -90814,6 +90889,7 @@ mod tests {
         include!("gradient_fidelity_tests.rs");
         include!("shape_fidelity_tests.rs");
         include!("gradient_overlay_tests.rs");
+        include!("pattern_overlay_tests.rs");
         include!("small_machine_effect_tests.rs");
     }
 }

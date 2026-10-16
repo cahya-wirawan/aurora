@@ -551,6 +551,38 @@ pub struct GradientOverlay {
     pub reference: Option<ReferenceBox>,
 }
 
+/// A pattern overlay (`patternFill`, task 111): a pattern from the
+/// document's pool tiled over the layer's interior, in its own blend mode
+/// and opacity, above the gradient overlays.
+///
+/// **Not on the `.aur` effects wire** (like [`GradientOverlay`]): it rides
+/// in the optional `layer-patterns` entry and
+/// `LayerOp::SetPatternOverlays`.
+///
+/// **Placement** (derived from Photoshop's own pictures, see PLAN.md): the
+/// pattern's texel `(0, 0)` is centred on pixel `origin` (Photoshop's
+/// reference point, `fxrp`), texel `(i, j)` on `origin + (i, j) * scale`
+/// (scale `1.0` = 100 %), and the pattern tiles forever from there.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PatternOverlay {
+    pub gate: EffectGate,
+    pub blend_mode: EffectBlendMode,
+    /// `0.0..=1.0`.
+    pub opacity: f32,
+    /// The pattern's ID in the document's pool
+    /// (`aurora_doc::LayerTree::patterns`).
+    pub pattern: String,
+    /// `0.01..=10.0`; `1.0` is 100 %.
+    pub scale: f32,
+    /// The origin as an offset from the layer's `bounds` top-left, so it
+    /// follows the layer when it moves.
+    pub origin: (f64, f64),
+}
+
+/// The smallest and largest pattern scale (`Scl `, 1 % to 1000 %).
+pub const MIN_PATTERN_SCALE: f32 = 0.01;
+pub const MAX_PATTERN_SCALE: f32 = 10.0;
+
 /// How many effects of each kind Aurora does not model yet, counting
 /// only instances whose own `present` and `enab` are both on. Kept so a
 /// report can name them; their settings are not kept.
@@ -598,6 +630,10 @@ pub struct LayerEffects {
     /// [`GradientOverlay`].
     #[serde(skip)]
     pub gradient_overlays: Vec<GradientOverlay>,
+    /// Pattern overlays (task 111). `#[serde(skip)]`: see
+    /// [`PatternOverlay`].
+    #[serde(skip)]
+    pub pattern_overlays: Vec<PatternOverlay>,
 }
 
 impl Default for LayerEffects {
@@ -611,6 +647,7 @@ impl Default for LayerEffects {
             outer_glows: Vec::new(),
             other: OtherEffects::default(),
             gradient_overlays: Vec::new(),
+            pattern_overlays: Vec::new(),
         }
     }
 }
@@ -657,6 +694,30 @@ impl LayerEffects {
         count(&self.strokes, "stroke")?;
         count(&self.outer_glows, "outer glow")?;
         count(&self.gradient_overlays, "gradient overlay")?;
+        count(&self.pattern_overlays, "pattern overlay")?;
+        for p in &self.pattern_overlays {
+            unit(p.opacity, "opacity")?;
+            if p.pattern.is_empty() || p.pattern.len() > crate::pattern::MAX_PATTERN_ID_BYTES {
+                return Err(EffectsError::OutOfRange {
+                    field: "pattern ID",
+                });
+            }
+            if !(MIN_PATTERN_SCALE..=MAX_PATTERN_SCALE).contains(&p.scale) {
+                return Err(EffectsError::OutOfRange {
+                    field: "pattern scale",
+                });
+            }
+            let max = f64::from(crate::MAX_DOCUMENT_EXTENT);
+            if !(p.origin.0.is_finite()
+                && p.origin.1.is_finite()
+                && p.origin.0.abs() <= max
+                && p.origin.1.abs() <= max)
+            {
+                return Err(EffectsError::OutOfRange {
+                    field: "pattern origin",
+                });
+            }
+        }
         for g in &self.gradient_overlays {
             unit(g.opacity, "opacity")?;
             g.gradient
@@ -790,6 +851,16 @@ impl LayerEffects {
             .count()
     }
 
+    /// The pattern overlays Photoshop would draw and Aurora draws
+    /// (task 111).
+    #[must_use]
+    pub fn shown_pattern_overlays(&self) -> usize {
+        self.pattern_overlays
+            .iter()
+            .filter(|e| self.shows(e.gate))
+            .count()
+    }
+
     /// The not-yet-modelled effects Photoshop would draw.
     #[must_use]
     pub fn shown_other(&self) -> u64 {
@@ -805,6 +876,7 @@ impl LayerEffects {
             || self.shown_strokes() > 0
             || self.shown_outer_glows() > 0
             || self.shown_gradient_overlays() > 0
+            || self.shown_pattern_overlays() > 0
             || self.shown_other() > 0
     }
 
@@ -816,6 +888,7 @@ impl LayerEffects {
             && self.strokes.is_empty()
             && self.outer_glows.is_empty()
             && self.gradient_overlays.is_empty()
+            && self.pattern_overlays.is_empty()
             && self.other.total() == 0
     }
 }
@@ -1100,5 +1173,96 @@ mod tests {
                 height: 9
             }
         );
+    }
+
+    fn pattern_overlay() -> PatternOverlay {
+        PatternOverlay {
+            gate: EffectGate::default(),
+            blend_mode: EffectBlendMode::Normal,
+            opacity: 1.0,
+            pattern: "p".to_owned(),
+            scale: 1.0,
+            origin: (0.0, 0.0),
+        }
+    }
+
+    #[test]
+    fn pattern_overlay_validation_refuses_each_bad_field() {
+        let with = |o: PatternOverlay| LayerEffects {
+            pattern_overlays: vec![o],
+            ..LayerEffects::default()
+        };
+        assert_eq!(with(pattern_overlay()).validate(), Ok(()));
+        let mut bad = Vec::new();
+        for opacity in [-0.1, 1.1, f32::NAN] {
+            let mut o = pattern_overlay();
+            o.opacity = opacity;
+            bad.push(o);
+        }
+        for scale in [0.0, 0.009, 10.1, f32::NAN, f32::INFINITY, -1.0] {
+            let mut o = pattern_overlay();
+            o.scale = scale;
+            bad.push(o);
+        }
+        for origin in [
+            (f64::NAN, 0.0),
+            (0.0, f64::INFINITY),
+            (300_001.0, 0.0),
+            (0.0, -300_001.0),
+        ] {
+            let mut o = pattern_overlay();
+            o.origin = origin;
+            bad.push(o);
+        }
+        let mut o = pattern_overlay();
+        o.pattern = String::new();
+        bad.push(o);
+        let mut o = pattern_overlay();
+        o.pattern = "x".repeat(crate::pattern::MAX_PATTERN_ID_BYTES + 1);
+        bad.push(o);
+        for (n, o) in bad.into_iter().enumerate() {
+            assert!(with(o).validate().is_err(), "case {n}");
+        }
+        // The limits themselves are valid.
+        for (scale, origin) in [(0.01, (-300_000.0, 300_000.0)), (10.0, (0.0, 0.0))] {
+            let mut o = pattern_overlay();
+            o.scale = scale;
+            o.origin = origin;
+            assert_eq!(with(o).validate(), Ok(()));
+        }
+        let many = LayerEffects {
+            pattern_overlays: vec![pattern_overlay(); MAX_EFFECT_INSTANCES + 1],
+            ..LayerEffects::default()
+        };
+        assert!(matches!(
+            many.validate(),
+            Err(EffectsError::TooManyInstances { .. })
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::indexing_slicing)]
+    fn pattern_overlays_are_gated_counted_and_not_on_the_effects_wire() {
+        let mut fx = LayerEffects {
+            pattern_overlays: vec![pattern_overlay()],
+            ..LayerEffects::default()
+        };
+        assert!(fx.shows_any());
+        assert!(!fx.is_empty());
+        assert_eq!(fx.shown_pattern_overlays(), 1);
+        fx.pattern_overlays[0].gate.enabled = false;
+        assert_eq!((fx.shown_pattern_overlays(), fx.shows_any()), (0, false));
+        fx.pattern_overlays[0].gate.enabled = true;
+        fx.enabled = false;
+        assert_eq!(fx.shown_pattern_overlays(), 0);
+        let with = LayerEffects {
+            pattern_overlays: vec![pattern_overlay()],
+            ..LayerEffects::default()
+        };
+        let a = postcard::to_allocvec(&with).unwrap_or_default();
+        let b = postcard::to_allocvec(&LayerEffects::default()).unwrap_or_default();
+        assert_eq!(a, b);
+        let back: Result<LayerEffects, _> = postcard::from_bytes(&a);
+        assert_eq!(back.map(|f| f.pattern_overlays.len()).ok(), Some(0));
     }
 }

@@ -89,3 +89,10 @@ Each is written only when it has something to say, so an ordinary save stays byt
 - A real non-Rust reader implementation hits genuine friction with `postcard`'s wire format specifically (unlikely — it's a simple, documented varint-based format — but not yet tried by anyone outside this project)
 - `aurora_tile::codec`'s own on-disk format changes in a way that stops being safely embeddable as an opaque ZIP entry (e.g. if it ever needs random access *within* a tile's own payload, which stored-whole-tile access doesn't provide)
 - A future, genuinely huge-single-session workload (e.g. real-time collaborative editing, PRD's own "Beyond v1.0" territory) needs a append-only or memory-mapped access pattern ZIP's central-directory-rewrite-on-update model serves poorly — at that point, `rkyv`'s zero-copy mmap story or a purpose-built log-structured format become worth re-evaluating against the "open format" cost they'd bring back
+
+### Addendum (task 111): the pattern pool and pattern overlays
+
+- A new optional versioned entry `layer-patterns` (version 1) plus one `layer-pattern-pixels-<n>` entry per pattern (little-endian `u16` RGBA, deflated), written only when the document has a pattern or a pattern overlay, so every other save is byte-identical. A newer version, a damaged entry, an overlay naming a missing pattern or on a layer without effects, or any size over `aurora_core::pattern`'s caps (4 Mpx a pattern, 64 MiB and 256 patterns in all, checked from the metadata before any pixel is read) refuses the open. An Aurora that predates it ignores the entry.
+- `LayerOp::SetPatternOverlays { id, value }` is appended after `SetGradientOverlays`: an Aurora older than this build refuses a journal holding it. `save_journal` emits one after every `SetEffects` and `Restore` that carries pattern overlays; the pool itself is not journaled (the entry carries it).
+- `LayerEffects::pattern_overlays` is `#[serde(skip)]` like `gradient_overlays`: the `layer-effects` wire is unchanged.
+
