@@ -59,6 +59,7 @@ pub struct GradientError {
     pub field: &'static str,
 }
 
+#[allow(clippy::many_single_char_names)] // ramp maths, as in `aurora-io`'s old copy
 fn ramp<T: Copy>(stops: &[FillStop<T>], t: f32, lerp: impl Fn(T, T, f32) -> T) -> Option<T> {
     let first = stops.first()?;
     let last = stops.last()?;

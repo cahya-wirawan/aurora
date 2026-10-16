@@ -986,6 +986,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::indexing_slicing)]
     fn gradient_overlay_validation_refuses_each_bad_field() {
         let with = |o: GradientOverlay| LayerEffects {
             gradient_overlays: vec![o],
@@ -1050,6 +1051,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::indexing_slicing)]
     fn gradient_overlays_are_gated_counted_and_not_on_the_effects_wire() {
         let mut fx = LayerEffects {
             gradient_overlays: vec![overlay()],

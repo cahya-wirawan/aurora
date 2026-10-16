@@ -290,7 +290,7 @@ fn gradient_overlays_match_photoshops_merged_images_better_than_before() {
         let drawn = crate::layer_ids_in_order(&document.layers)
             .into_iter()
             .filter_map(|id| document.layers.effects(id))
-            .map(|fx| fx.shown_gradient_overlays())
+            .map(aurora_core::LayerEffects::shown_gradient_overlays)
             .sum::<usize>();
         assert!(drawn > 0, "{file}: no gradient overlay was read");
         let Some((mean, _max)) = audit_diff(&after, &merged) else {

@@ -508,7 +508,7 @@ fn list_effects_overlays(doc: &aurora_io::PsdDocument) -> usize {
         shown += doc
             .layers
             .effects(id)
-            .map_or(0, |fx| fx.shown_gradient_overlays());
+            .map_or(0, aurora_core::LayerEffects::shown_gradient_overlays);
     }
     shown
 }
