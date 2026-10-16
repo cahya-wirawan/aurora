@@ -127,7 +127,7 @@ impl AdjustKind {
     pub const fn of(adjustment: &Adjustment) -> Option<Self> {
         match adjustment {
             Adjustment::Vibrance(_) => Some(Self::Vibrance),
-            Adjustment::Exposure(_) => Some(Self::Exposure),
+            Adjustment::Exposure(_) | Adjustment::ExposureTrc(_) => Some(Self::Exposure),
             Adjustment::PhotoFilter(_) => Some(Self::PhotoFilter),
             Adjustment::BlackWhite(_) => Some(Self::BlackWhite),
             Adjustment::ColorBalance(_) => Some(Self::ColorBalance),
@@ -618,9 +618,11 @@ impl AdjustSlider {
         match self {
             Self::Vibrance => adjustment.vibrance().map(|p| f64::from(p.vibrance())),
             Self::VibranceSaturation => adjustment.vibrance().map(|p| f64::from(p.saturation())),
-            Self::Exposure => adjustment.exposure().map(|p| f64::from(p.exposure())),
-            Self::Offset => adjustment.exposure().map(|p| f64::from(p.offset())),
-            Self::Gamma => adjustment.exposure().map(|p| f64::from(p.gamma())),
+            Self::Exposure => adjustment
+                .exposure_sliders()
+                .map(|p| f64::from(p.exposure())),
+            Self::Offset => adjustment.exposure_sliders().map(|p| f64::from(p.offset())),
+            Self::Gamma => adjustment.exposure_sliders().map(|p| f64::from(p.gamma())),
             Self::Density => adjustment.photo_filter().map(|p| f64::from(p.density())),
             Self::Red => channel(0),
             Self::Green => channel(1),
@@ -717,13 +719,14 @@ impl AdjustSlider {
                 next.ok().map(Adjustment::Vibrance)
             }
             Self::Exposure | Self::Offset | Self::Gamma => {
-                let p: ExposureParams = adjustment.exposure()?;
+                let p: ExposureParams = adjustment.exposure_sliders()?;
                 let next = match self {
                     Self::Exposure => p.with_exposure(v),
                     Self::Offset => p.with_offset(v),
                     _ => p.with_gamma(v),
                 };
-                next.ok().map(Adjustment::Exposure)
+                // The same variant: a grey-profile layer keeps its table.
+                adjustment.with_exposure_sliders(next.ok()?)
             }
             Self::Density => adjustment
                 .photo_filter()?
@@ -874,6 +877,9 @@ pub struct AdjustControls {
     pub legacy: WidgetId,
     /// The line Invert's group shows in place of sliders (0.244.0).
     pub invert_note: WidgetId,
+    /// The line Exposure's group shows under the sliders while the layer
+    /// uses a Grayscale file's grey profile (task 112); hidden otherwise.
+    pub exposure_profile_note: WidgetId,
     /// Channel Mixer's output selector tab bar (0.245.0): tab 0 Red, 1
     /// Green, 2 Blue; idle while Monochrome is on.
     pub mixer_output: WidgetId,
@@ -1104,6 +1110,13 @@ pub fn insert_adjust_controls(
                 )?);
             }
         }
+        let exposure_profile_note = widgets::insert_label(
+            tree,
+            group_of(AdjustKind::Exposure)?,
+            scales,
+            EXPOSURE_PROFILE_NOTE.to_owned(),
+        )?;
+        widgets::set_label_disabled(tree, exposure_profile_note, true)?;
         let (
             Some(preserve),
             Some(tint),
@@ -1151,6 +1164,7 @@ pub fn insert_adjust_controls(
             balance_range,
             legacy,
             invert_note,
+            exposure_profile_note,
             mixer_output,
             mixer_mono,
             selective_group,
@@ -1202,6 +1216,10 @@ fn set_checkbox_live(
     }
     Ok(false)
 }
+
+/// What Exposure's group says under its sliders for a layer that uses a
+/// Grayscale file's grey profile (task 112).
+pub const EXPOSURE_PROFILE_NOTE: &str = "Uses the file's grey profile.";
 
 /// Shows exactly the group of `kind` (none: the whole column hides) and
 /// enables only its widgets; the two Black & White tint sliders are live
@@ -1522,6 +1540,11 @@ pub fn sync_adjust_controls(
         .gradient_map()
         .is_some_and(aurora_core::GradientMapParams::is_two_stop);
     let mut changed = set_shown(tree, controls, kind, tint_on, mixer_mono, gradient_colours)?;
+    changed |= widgets::set_label_disabled(
+        tree,
+        controls.exposure_profile_note,
+        adjustment.exposure_trc().is_none(),
+    )?;
     if let Some(filter) = adjustment.photo_filter() {
         changed |= sync_checkbox(tree, controls.preserve, filter.preserve_luminosity())?;
     }

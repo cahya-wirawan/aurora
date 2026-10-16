@@ -69,6 +69,7 @@
 //! the descriptor parser's bounded, byte-checked amount.
 
 use super::descriptor::{self, Descriptor, ItemBudget};
+use super::grey_profile::GreyProfile;
 use super::{Note, Reader};
 use aurora_doc::Adjustment;
 
@@ -104,14 +105,11 @@ impl Kind {
     /// held as R = G = B, so each listed kind acts on that grey exactly as
     /// it does on an RGB document whose three channels are equal (its
     /// block layout is the RGB one: `thrs` and `post` are 4 bytes, `nvrt`
-    /// is empty, `brit`/`CgEd` carry the same descriptor). **Exposure is
-    /// deliberately not listed**: its block is the RGB layout too, but
-    /// Photoshop applies it in the linear light of the file's grey profile
-    /// (`exposure_grayscale.psd` embeds "Dot Gain 20%", a 256-entry curve,
-    /// and a model using that curve reproduces Photoshop's merged image to
-    /// 0.01-0.3 levels where the sRGB model Aurora has is 11.4 levels off),
-    /// and Aurora ignores the embedded grey profile. The other listed kinds
-    /// act on the encoded value and do not depend on it.
+    /// is empty, `brit`/`CgEd` carry the same descriptor). **Exposure is not
+    /// listed**: Photoshop applies it through the file's grey profile, so it
+    /// is imported only with a measured profile (task 112,
+    /// [`exposure_adjustment`]). The other listed kinds act on the encoded
+    /// value and do not depend on the profile.
     pub(super) const fn gray_verified(self) -> bool {
         matches!(
             self,
@@ -385,13 +383,25 @@ fn parse_exposure(data: &[u8]) -> Result<ExposureBlock, ()> {
 /// `-0.5..=0.5`, gamma `0.10..=9.99`. Photoshop's Gamma Correction goes
 /// down to `0.01`; a layer below Aurora's `0.10` is left out and reported,
 /// not clamped.
-pub(super) fn exposure_adjustment(block: &ExposureBlock, gray: bool) -> Result<Adjustment, Note> {
-    if gray && !Kind::Exposure.gray_verified() {
-        return Err(Note::Grayscale(Kind::Exposure));
+pub(super) fn exposure_adjustment(
+    block: &ExposureBlock,
+    gray: bool,
+    profile: &GreyProfile,
+) -> Result<Adjustment, Note> {
+    let params = aurora_core::ExposureParams::new(block.exposure, block.offset, block.gamma)
+        .map_err(|_| Note::Unreadable(Kind::Exposure));
+    if !gray {
+        return params.map(Adjustment::Exposure);
     }
-    aurora_core::ExposureParams::new(block.exposure, block.offset, block.gamma)
-        .map(Adjustment::Exposure)
-        .map_err(|_| Note::Unreadable(Kind::Exposure))
+    // A Grayscale file (task 112): Photoshop applies Exposure in the file's
+    // grey profile, so the layer is imported only with a profile whose
+    // table was measured; with none, or any other, it is left out.
+    match profile {
+        GreyProfile::Absent => Err(Note::Grayscale(Kind::Exposure)),
+        GreyProfile::Unsupported(reason) => Err(Note::GreyExposureProfile(*reason)),
+        GreyProfile::Table(trc) => params
+            .map(|p| Adjustment::ExposureTrc(aurora_core::ExposureTrcParams::new(p, trc.clone()))),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1122,6 +1132,15 @@ fn parse_color_lookup(data: &[u8]) -> Result<LookupBlock, ()> {
 
 /// A parsed block as an adjustment, or the reason it is left out.
 pub(super) fn adjustment(parsed: &Parsed, gray: bool) -> Result<Adjustment, Note> {
+    adjustment_with_profile(parsed, gray, &GreyProfile::Absent)
+}
+
+/// As [`adjustment`], with the Grayscale file's grey profile (task 112).
+pub(super) fn adjustment_with_profile(
+    parsed: &Parsed,
+    gray: bool,
+    profile: &GreyProfile,
+) -> Result<Adjustment, Note> {
     match parsed {
         Parsed::Vibrance(b) => b
             .as_ref()
@@ -1130,7 +1149,7 @@ pub(super) fn adjustment(parsed: &Parsed, gray: bool) -> Result<Adjustment, Note
         Parsed::Exposure(b) => b
             .as_ref()
             .map_err(|()| Note::Unreadable(Kind::Exposure))
-            .and_then(|b| exposure_adjustment(b, gray)),
+            .and_then(|b| exposure_adjustment(b, gray, profile)),
         Parsed::PhotoFilter(b) => b
             .as_ref()
             .map_err(|()| Note::Unreadable(Kind::PhotoFilter))

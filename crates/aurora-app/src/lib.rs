@@ -18673,6 +18673,10 @@ enum AdjustmentLut {
     /// Gradient Map (0.248.0): a per-pixel function over a stop list (GPU
     /// pass since 0.250.0; boxed: the stop list makes it the largest variant).
     GradientMap(Box<aurora_filters::GradientMapOp>),
+    /// Exposure through a Grayscale file's grey profile (task 112): a
+    /// per-pixel function over the profile's table, CPU only (the GPU
+    /// predicate refuses it; boxed for the table).
+    ExposureTrc(Box<aurora_filters::ExposureTrcOp>),
 }
 
 impl AdjustmentLut {
@@ -18721,6 +18725,9 @@ impl AdjustmentLut {
             aurora_doc::Adjustment::GradientMap(params) => {
                 Self::GradientMap(Box::new(aurora_filters::GradientMapOp::new(params)))
             }
+            aurora_doc::Adjustment::ExposureTrc(params) => {
+                Self::ExposureTrc(Box::new(aurora_filters::ExposureTrcOp::new(params)))
+            }
         }
     }
 
@@ -18742,6 +18749,7 @@ impl AdjustmentLut {
             Self::ChannelMixer(op) => op.is_identity(),
             Self::SelectiveColor(op) => op.is_identity(),
             Self::GradientMap(op) => op.is_identity(),
+            Self::ExposureTrc(op) => op.is_identity(),
         }
     }
 
@@ -18763,6 +18771,7 @@ impl AdjustmentLut {
             Self::ChannelMixer(op) => op.apply(rgb),
             Self::SelectiveColor(op) => op.apply(rgb),
             Self::GradientMap(op) => op.apply(rgb),
+            Self::ExposureTrc(op) => op.apply(rgb),
         }
     }
 }
@@ -20917,7 +20926,9 @@ fn adjustment_layer_qualifies_for_gpu(
         // since 0.242.0 (`composite_vibrance_with_opacity` and its four
         // siblings), admitted above; neutral or not, they qualify like Levels.
 
-        None => false,
+        // Exposure through a grey profile (task 112) has no GPU port: its
+        // table encode is CPU only.
+        Some(aurora_doc::Adjustment::ExposureTrc(_)) | None => false,
     };
     expressible
         && !layers.mask(id).is_some_and(|mask| mask.enabled)
@@ -21379,7 +21390,8 @@ fn begin_gpu_adjustment_pass(
             | AdjustmentLut::BrightnessContrast(_)
             | AdjustmentLut::ChannelMixer(_)
             | AdjustmentLut::SelectiveColor(_)
-            | AdjustmentLut::GradientMap(_)),
+            | AdjustmentLut::GradientMap(_)
+            | AdjustmentLut::ExposureTrc(_)),
         ) => {
             if !record_newest_adjustment_pass(
                 gpu, compositor, encoder, lut, from, to, opacity, mode,
@@ -21493,7 +21505,8 @@ fn record_photographer_adjustment_pass(
         | AdjustmentLut::BrightnessContrast(_)
         | AdjustmentLut::ChannelMixer(_)
         | AdjustmentLut::SelectiveColor(_)
-        | AdjustmentLut::GradientMap(_) => {
+        | AdjustmentLut::GradientMap(_)
+        | AdjustmentLut::ExposureTrc(_) => {
             return false;
         }
     }
@@ -21645,7 +21658,8 @@ fn record_newest_adjustment_pass(
         | AdjustmentLut::Exposure(_)
         | AdjustmentLut::PhotoFilter(_)
         | AdjustmentLut::BlackWhite(_)
-        | AdjustmentLut::ColorBalance(_) => return false,
+        | AdjustmentLut::ColorBalance(_)
+        | AdjustmentLut::ExposureTrc(_) => return false,
     }
     true
 }
