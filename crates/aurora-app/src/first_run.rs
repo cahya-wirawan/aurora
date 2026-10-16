@@ -20,10 +20,14 @@
 //!
 //! **The marker is written only after the user acts**: "Get Started",
 //! `Escape` (both the same action) or "Open Command Palette" write it
-//! ([`write_marker`], a unique temporary file, `sync_all`, rename); a quit
-//! with the dialog still open writes nothing, so the welcome comes back.
-//! A write failure is logged and otherwise ignored: the welcome shows
-//! again next time, nothing breaks.
+//! ([`write_marker`], a unique temporary file, `sync_all`, rename). A quit
+//! with the dialog still open writes no marker and, because the layout
+//! file is itself a first-run trace, the exit does not save the layout
+//! either while the welcome is open ([`welcome_pending`], used by
+//! `save_layout_on_exit`): the welcome comes back. (A crash or kill
+//! cannot save the layout, so it comes back then too.) A marker write
+//! failure is logged and otherwise ignored: the welcome shows again next
+//! time, nothing breaks.
 //!
 //! Nothing here is sent anywhere; the text says so because it is true.
 
@@ -102,6 +106,12 @@ pub(crate) fn should_show_welcome(
     opening_file: bool,
 ) -> bool {
     first_run && !recovery_pending && !opening_file
+}
+
+/// Whether the welcome is open and undismissed: the open dialog is the
+/// welcome and the marker does not exist yet.
+pub(crate) fn welcome_pending(open: Option<&DialogPurpose>, marker_exists: bool) -> bool {
+    matches!(open, Some(DialogPurpose::Welcome)) && !marker_exists
 }
 
 /// The first-run decision from the file system: `layout_path` (where the

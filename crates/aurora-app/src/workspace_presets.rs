@@ -863,22 +863,52 @@ fn repaired_layout(mut layout: WorkspaceLayout) -> (WorkspaceLayout, bool) {
 
 /// A preset saved before 0.257.0 may be named "Photography" or "Graphic",
 /// which are now built-in names (a user preset can no longer be that).
-/// Rather than drop the user's work, it is kept as "`name` (custom)";
-/// Essentials was always reserved, so a file never holds it, and any other
-/// refusal stays a refusal.
+/// Rather than drop the user's work it is kept under the first free name of
+/// "`name` (custom)", "`name` (custom 2)", "`name` (custom 3)", ...: free
+/// meaning neither already kept nor spelt by any other entry of the file
+/// (`taken`, lower-cased), so a later entry is never pushed into a
+/// collision and dropped. Essentials was always reserved, so a file never
+/// holds it, and any other refusal stays a refusal.
 fn renamed_if_newly_reserved(
     raw: &str,
     error: WorkspaceNameError,
+    taken: &[String],
 ) -> Result<String, WorkspaceNameError> {
     if error != WorkspaceNameError::Reserved {
         return Err(error);
     }
-    match built_in_name(raw) {
-        Some(built_in) if built_in != ESSENTIALS => {
-            validate_workspace_name(&format!("{built_in} (custom)"))
-        }
-        _ => Err(error),
+    let Some(built_in) = built_in_name(raw).filter(|&name| name != ESSENTIALS) else {
+        return Err(error);
+    };
+    let is_free = |candidate: &str| !taken.contains(&candidate.to_lowercase());
+    let first = format!("{built_in} (custom)");
+    if is_free(&first) {
+        return validate_workspace_name(&first);
     }
+    // Bounded: the file holds at most `MAX_WORKSPACE_PRESETS` entries, so a
+    // free number exists within that many tries.
+    for number in 2..=MAX_WORKSPACE_PRESETS + 2 {
+        let candidate = format!("{built_in} (custom {number})");
+        if is_free(&candidate) {
+            return validate_workspace_name(&candidate);
+        }
+    }
+    Err(error)
+}
+
+/// Every name the file's first `count` entries spell, lower-cased and
+/// trimmed: what a migrated name must not collide with. Stops at the first
+/// entry that does not parse, like the decoder.
+fn spelled_names(mut rest: &[u8], count: u32) -> Vec<String> {
+    let mut names = Vec::new();
+    for _ in 0..count.min(u32::try_from(MAX_WORKSPACE_PRESETS).unwrap_or(u32::MAX)) {
+        let Ok((entry, after)) = postcard::take_from_bytes::<SavedPreset>(rest) else {
+            break;
+        };
+        rest = after;
+        names.push(entry.name.trim().to_lowercase());
+    }
+    names
 }
 
 /// Decodes a presets file, never failing: a bad header (garbage, a
@@ -898,6 +928,10 @@ pub(crate) fn decode_presets(bytes: &[u8]) -> (WorkspacePresets, bool) {
     }
     let mut presets = WorkspacePresets::default();
     let mut repaired = false;
+    // Names of the file's entries, plus each migrated name as it is chosen.
+    let mut taken = spelled_names(rest, header.count);
+    // (original name lower-cased, name it was migrated to).
+    let mut migrated: Vec<(String, String)> = Vec::new();
     for index in 0..header.count {
         // Review J2: at most `MAX_WORKSPACE_PRESETS` entries are read.
         // (`has_user` lowercases every kept name per check, so this loop
@@ -911,9 +945,14 @@ pub(crate) fn decode_presets(bytes: &[u8]) -> (WorkspacePresets, bool) {
             break;
         };
         rest = after;
-        let Ok(name) = validate_workspace_name(&entry.name)
-            .or_else(|err| renamed_if_newly_reserved(&entry.name, err))
-        else {
+        let Ok(name) = validate_workspace_name(&entry.name).or_else(|err| {
+            let renamed = renamed_if_newly_reserved(&entry.name, err, &taken);
+            if let Ok(new) = &renamed {
+                taken.push(new.to_lowercase());
+                migrated.push((entry.name.trim().to_lowercase(), new.clone()));
+            }
+            renamed
+        }) else {
             repaired = true;
             continue;
         };
@@ -930,7 +969,15 @@ pub(crate) fn decode_presets(bytes: &[u8]) -> (WorkspacePresets, bool) {
         repaired |= layout_repaired;
         presets.user.push(WorkspacePreset { name, layout });
     }
-    if !header.active.is_empty() && !presets.set_active(&header.active) {
+    // An old file's active name that spelt a migrated user preset keeps
+    // that preset active under its new name (a current file never holds a
+    // reserved name, so "Photography" there means the built-in).
+    let active_wanted = header.active.trim().to_lowercase();
+    let active = migrated
+        .iter()
+        .find(|(original, new)| *original == active_wanted && presets.has_user(new))
+        .map_or(header.active.as_str(), |(_, new)| new.as_str());
+    if !active.is_empty() && !presets.set_active(active) {
         repaired = true;
     }
     (presets, repaired)
@@ -2473,5 +2520,90 @@ mod tests {
             vec!["Photography (custom)", "Graphic (custom)", "Other"],
             "Essentials was always reserved and stays dropped"
         );
+    }
+
+    /// A migrated name never collides: an old file with "Photography" and
+    /// "Photography (custom)" keeps both (the first gets the next free
+    /// suffix), and every later suffix is numbered, none dropped.
+    #[test]
+    fn migrated_names_get_a_free_suffix_and_no_preset_is_dropped() {
+        let layout = encode(&essentials_layout());
+        let entries: Vec<(String, Vec<u8>)> = [
+            "Photography",
+            "Photography (custom)",
+            "photography (CUSTOM 2)",
+            "Graphic",
+            "Graphic (custom)",
+        ]
+        .iter()
+        .map(|n| ((*n).to_owned(), layout.clone()))
+        .collect();
+        let (presets, repaired) = decode_presets(&file("", &entries));
+        assert!(repaired);
+        let names: Vec<&str> = presets.user().iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Photography (custom 3)",
+                "Photography (custom)",
+                "photography (CUSTOM 2)",
+                "Graphic (custom 2)",
+                "Graphic (custom)",
+            ]
+        );
+        // The same file, order reversed, still keeps all five.
+        let mut reversed = entries;
+        reversed.reverse();
+        let (presets, _) = decode_presets(&file("", &reversed));
+        assert_eq!(presets.user().len(), 5, "none dropped");
+        // Names stay within the cap and valid.
+        for preset in presets.user() {
+            assert!(
+                validate_workspace_name(&preset.name).is_ok(),
+                "{}",
+                preset.name
+            );
+        }
+    }
+
+    /// The old header's active name that spelt a renamed user preset keeps
+    /// it active under the new name; a current file's "Photography" is the
+    /// built-in.
+    #[test]
+    fn an_active_migrated_preset_stays_active_under_its_new_name() {
+        let layout = encode(&essentials_layout());
+        let entries = vec![
+            ("Photography".to_owned(), layout.clone()),
+            ("Photography (custom)".to_owned(), layout.clone()),
+        ];
+        let (presets, _) = decode_presets(&file("Photography", &entries));
+        assert_eq!(presets.active_name(), "Photography (custom 2)");
+        assert!(presets.has_user("Photography (custom 2)"));
+        // Case and spaces in the header do not matter.
+        let (presets, _) = decode_presets(&file(" photography ", &entries));
+        assert_eq!(presets.active_name(), "Photography (custom 2)");
+        // An active name of another preset is untouched.
+        let (presets, _) = decode_presets(&file("Photography (custom)", &entries));
+        assert_eq!(presets.active_name(), "Photography (custom)");
+        // No migrated preset in the file: "Photography" is the built-in.
+        let plain = vec![("Other".to_owned(), layout)];
+        let (presets, repaired) = decode_presets(&file("Photography", &plain));
+        assert!(!repaired);
+        assert_eq!(presets.active_name(), "Photography");
+        assert!(!presets.has_user("Photography"));
+    }
+
+    /// The 100-preset cap still applies to migrated entries.
+    #[test]
+    fn the_preset_cap_still_applies_to_migrated_entries() {
+        let layout = encode(&essentials_layout());
+        let mut entries: Vec<(String, Vec<u8>)> = (0..MAX_WORKSPACE_PRESETS)
+            .map(|i| (format!("Look {i}"), layout.clone()))
+            .collect();
+        entries.push(("Photography".to_owned(), layout));
+        let (presets, repaired) = decode_presets(&file("", &entries));
+        assert!(repaired);
+        assert_eq!(presets.user().len(), MAX_WORKSPACE_PRESETS);
+        assert!(!presets.has_user("Photography (custom)"));
     }
 }

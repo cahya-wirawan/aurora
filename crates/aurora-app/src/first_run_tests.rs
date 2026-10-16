@@ -5,7 +5,7 @@ use crate::first_run::{
     FIRST_RUN_ENV, FirstRunOverride, MARKER_FILE_NAME, WELCOME_PALETTE, WELCOME_PALETTE_LABEL,
     WELCOME_START, WELCOME_START_LABEL, WELCOME_TITLE, WelcomeChoice, first_run_from_disk,
     first_run_override, is_first_run, marker_path_for, open_welcome_dialog, should_show_welcome,
-    welcome_actions, welcome_choice, welcome_message, write_marker,
+    welcome_actions, welcome_choice, welcome_message, welcome_pending, write_marker,
 };
 use crate::{
     DialogEffect, DialogPurpose, DialogResult, FocusManager, default_shortcuts, dialog_effect,
@@ -278,4 +278,15 @@ fn enter_and_escape_both_choose_get_started_and_never_open_the_palette() {
         );
         assert!(dialog.is_none(), "closed");
     }
+}
+
+#[test]
+fn the_welcome_is_pending_only_while_its_dialog_is_open_and_the_marker_absent() {
+    assert!(welcome_pending(Some(&DialogPurpose::Welcome), false));
+    assert!(
+        !welcome_pending(Some(&DialogPurpose::Welcome), true),
+        "dismissed"
+    );
+    assert!(!welcome_pending(Some(&DialogPurpose::CrashRecovery), false));
+    assert!(!welcome_pending(None, false), "no dialog");
 }
