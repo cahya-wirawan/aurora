@@ -34522,6 +34522,28 @@ impl App {
             }
             return;
         }
+        // 0.259.0: over an open menu or dropdown list the wheel scrolls
+        // that list (it neither zooms the canvas nor closes the list).
+        if self.dialog.is_none()
+            && let Some(list) =
+                aurora_widgets::widgets::popup_scroll_target(&self.workspace.tree, position)
+        {
+            if scroll_panel(
+                &mut self.workspace.tree,
+                list,
+                delta,
+                self.scale_factor,
+                &self.scales,
+            ) {
+                let window_size = self.window.as_ref().map(|window| window.inner_size());
+                if let Some(size) = window_size {
+                    self.apply_resize((size.width, size.height));
+                }
+                self.push_accessibility();
+                self.needs_redraw = true;
+            }
+            return;
+        }
         let pointer_owned = self.drag.is_some()
             || self.rail_resize.is_some()
             || self.panel_drag.is_some()
@@ -39772,11 +39794,10 @@ mod tests {
                 unreachable!("the AT click opened the menu");
             };
             assert_eq!(state.focus.focused(), Some(menu));
-            let Some(&item) = state
-                .workspace
-                .tree
-                .children(menu)
-                .and_then(<[WidgetId]>::first)
+            // The items sit in the menu's scroll container (0.259.0).
+            let Some(item) = aurora_widgets::widgets::menu_state(&state.workspace.tree, menu)
+                .ok()
+                .and_then(|menu| menu.item_ids().first().copied())
             else {
                 unreachable!("the menu has items");
             };
@@ -96740,3 +96761,6 @@ mod menu_bar_tests;
 
 #[cfg(test)]
 mod palette_scroll_app_tests;
+
+#[cfg(test)]
+mod menu_scroll_app_tests;

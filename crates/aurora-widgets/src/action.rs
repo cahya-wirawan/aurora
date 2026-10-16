@@ -527,9 +527,8 @@ fn dispatch(
         }
         (Target::Tab, Action::Click) => click_tab(tree, focus, id),
         (Target::MenuItem, Action::Click) => {
-            let Some(menu) = tree
-                .parent(id)
-                .filter(|&parent| matches!(tree.payload(parent), Some(WidgetKind::Menu(_))))
+            let Some(menu) = widgets::frame_of_row(tree, id)
+                .filter(|&frame| matches!(tree.payload(frame), Some(WidgetKind::Menu(_))))
             else {
                 return Err(unsupported);
             };

@@ -165,6 +165,9 @@ pub struct WidgetTree<W> {
     /// flag or a node can change), so neither [`Self::paint_order`] nor a
     /// per-hover [`Self::hit_test`] has to scan every node for it.
     popovers: BTreeSet<u64>,
+    /// Widgets to scroll into view once the next layout has measured them
+    /// ([`Self::request_scroll_into_view`]).
+    pending_reveals: Vec<WidgetId>,
 }
 
 /// `rect` grown by `outset` whole pixels on every side — the damage a
@@ -223,6 +226,7 @@ impl<W> WidgetTree<W> {
                 root,
                 next_id: 1,
                 damage: None,
+                pending_reveals: Vec::new(),
                 popovers: BTreeSet::new(),
             },
             root,
@@ -1009,6 +1013,9 @@ impl<W> WidgetTree<W> {
 
         self.apply_taffy_layout(self.root, &taffy, &taffy_ids, 0.0, 0.0);
         self.clamp_scrolls(self.root);
+        for id in std::mem::take(&mut self.pending_reveals) {
+            self.scroll_into_view(id);
+        }
 
         // No separate damage for a widget that became (or stopped being)
         // measured: `set_bounds` above already marked every laid-out
@@ -1417,6 +1424,19 @@ impl<W> WidgetTree<W> {
             return false;
         };
         self.set_scroll_y(container, wanted).unwrap_or(false)
+    }
+
+    /// Asks for [`Self::scroll_into_view`] on `id` **after the next
+    /// layout** (0.259.0): a list that has just been built (an opened
+    /// popup whose highlight is far down) has no bounds and no scroll
+    /// range yet, so scrolling it now would clamp to zero. The request is
+    /// resolved once, at the end of the next `compute_layout*`, and
+    /// forgotten; an id removed meanwhile is skipped. Costs nothing when
+    /// no request is pending.
+    pub fn request_scroll_into_view(&mut self, id: WidgetId) {
+        if !self.pending_reveals.contains(&id) {
+            self.pending_reveals.push(id);
+        }
     }
 
     /// The scroll container a wheel event at `point` should move: the

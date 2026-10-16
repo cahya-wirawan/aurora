@@ -252,22 +252,29 @@ fn inset_x(rect: (f32, f32, f32, f32), pad: f32) -> (f32, f32, f32, f32) {
 /// The label a menu's, an open dropdown list's or a command palette's
 /// option row shows, with whether that entry is enabled.
 fn row_label(tree: &WidgetTree<WidgetKind>, row: WidgetId) -> Option<(String, bool)> {
+    // A menu's or an open dropdown list's row (0.259.0: the rows sit in
+    // the popup's scroll container, two levels under the popup itself).
+    if let Some(frame) = crate::widgets::frame_of_row(tree, row) {
+        return match tree.payload(frame)? {
+            WidgetKind::Menu(menu) => {
+                let index = menu.item_ids().iter().position(|id| *id == row)?;
+                let item = menu.items().get(index)?;
+                Some((item.label.clone(), item.enabled))
+            }
+            WidgetKind::DropdownList => {
+                let dropdown = tree.parent(frame)?;
+                let Some(WidgetKind::Dropdown(state)) = tree.payload(dropdown) else {
+                    return None;
+                };
+                let index = state.rows().iter().position(|id| *id == row)?;
+                let option = state.options().get(index)?;
+                Some((option.clone(), !state.is_disabled()))
+            }
+            _ => None,
+        };
+    }
     let parent = tree.parent(row)?;
     match tree.payload(parent)? {
-        WidgetKind::Menu(menu) => {
-            let index = menu.item_ids().iter().position(|id| *id == row)?;
-            let item = menu.items().get(index)?;
-            Some((item.label.clone(), item.enabled))
-        }
-        WidgetKind::DropdownList => {
-            let dropdown = tree.parent(parent)?;
-            let Some(WidgetKind::Dropdown(state)) = tree.payload(dropdown) else {
-                return None;
-            };
-            let index = state.rows().iter().position(|id| *id == row)?;
-            let option = state.options().get(index)?;
-            Some((option.clone(), !state.is_disabled()))
-        }
         WidgetKind::Container => {
             // A command palette's result row: its results list is the
             // row's parent, and the palette's root sits above that.

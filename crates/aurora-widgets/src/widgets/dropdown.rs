@@ -189,6 +189,9 @@ use aurora_theme::Scales;
 use taffy::style_helpers::{auto, length, percent, zero};
 use taffy::{AlignItems, FlexDirection, Position, Rect as LayoutRect, Size, Style};
 
+use super::popup_list::{
+    self, MIN_VISIBLE_ROWS, cap_frame, fit_popup, insert_parts, reveal, window_span,
+};
 use super::{ListRowState, WidgetKind, row_height, spacing};
 use crate::error::WidgetError;
 use crate::shortcut::NamedKey;
@@ -201,6 +204,11 @@ use crate::tree::{PaintLayer, WidgetId, WidgetTree};
 pub enum DropdownKey {
     Up,
     Down,
+    /// The first option (0.259.0, open list only; a closed control
+    /// ignores it).
+    Home,
+    /// The last option (0.259.0, open list only).
+    End,
     Enter,
     Escape,
 }
@@ -214,6 +222,8 @@ impl DropdownKey {
         match key {
             NamedKey::ArrowUp => Some(Self::Up),
             NamedKey::ArrowDown => Some(Self::Down),
+            NamedKey::Home => Some(Self::Home),
+            NamedKey::End => Some(Self::End),
             NamedKey::Enter => Some(Self::Enter),
             NamedKey::Escape => Some(Self::Escape),
             _ => None,
@@ -279,6 +289,13 @@ pub struct DropdownState {
     rows: Vec<WidgetId>,
     /// `row_height(scales)` at insert time — see `row_style`.
     row_height: f32,
+    /// The scrollbar's thickness and the window margin, resolved at
+    /// insert time like `row_height` (the list is built lazily by
+    /// mutators that take no `Scales`).
+    scrollbar_thickness: f32,
+    margin: f32,
+    /// The open list's scroll container and scrollbar, `Some` while open.
+    parts: Option<(WidgetId, WidgetId)>,
 }
 
 impl DropdownState {
@@ -292,7 +309,23 @@ impl DropdownState {
             list: None,
             rows: Vec::new(),
             row_height,
+            scrollbar_thickness: 0.0,
+            margin: 0.0,
+            parts: None,
         }
+    }
+
+    /// The open list's scroll container, which the option rows are
+    /// children of (0.259.0); `None` while closed.
+    #[must_use]
+    pub fn body(&self) -> Option<WidgetId> {
+        self.parts.map(|(body, _)| body)
+    }
+
+    /// The scrollbar linked to [`Self::body`]; `None` while closed.
+    #[must_use]
+    pub fn scrollbar(&self) -> Option<WidgetId> {
+        self.parts.map(|(_, bar)| bar)
     }
 
     #[must_use]
@@ -379,7 +412,9 @@ impl DropdownState {
         let Some(highlighted) = self.highlighted else {
             return Ok(match key {
                 DropdownKey::Up | DropdownKey::Down | DropdownKey::Enter => self.open(),
-                DropdownKey::Escape => DropdownOutcome::Ignored,
+                DropdownKey::Escape | DropdownKey::Home | DropdownKey::End => {
+                    DropdownOutcome::Ignored
+                }
             });
         };
         let last = self.options.len().saturating_sub(1);
@@ -392,7 +427,17 @@ impl DropdownState {
                 self.highlighted = Some(highlighted - 1);
                 DropdownOutcome::HighlightMoved(highlighted - 1)
             }
-            DropdownKey::Up | DropdownKey::Down => DropdownOutcome::Ignored,
+            DropdownKey::Home if highlighted > 0 && highlighted <= last => {
+                self.highlighted = Some(0);
+                DropdownOutcome::HighlightMoved(0)
+            }
+            DropdownKey::End if highlighted < last => {
+                self.highlighted = Some(last);
+                DropdownOutcome::HighlightMoved(last)
+            }
+            DropdownKey::Up | DropdownKey::Down | DropdownKey::Home | DropdownKey::End => {
+                DropdownOutcome::Ignored
+            }
             DropdownKey::Enter => {
                 self.highlighted = None;
                 if highlighted >= self.options.len() {
@@ -558,22 +603,31 @@ fn control_style(scales: &Scales) -> Style {
 /// never pushes the dropdown's siblings around, anchored to the
 /// control's own bottom-left corner (`top: 100%`, `left: 0`) and as wide
 /// as the control, stacking its rows. Its height is its rows'.
-fn list_style() -> Style {
-    Style {
+fn list_style(above: bool, max_height: Option<f32>) -> Style {
+    // Below the control (`top: 100%`), or — when the window has no room
+    // below and more above — upward (`bottom: 100%`).
+    let (top, bottom) = if above {
+        (auto(), percent(1.0_f32))
+    } else {
+        (percent(1.0_f32), auto())
+    };
+    let mut style = Style {
         position: Position::Absolute,
         flex_direction: FlexDirection::Column,
         inset: LayoutRect {
             left: zero(),
             right: auto(),
-            top: percent(1.0_f32),
-            bottom: auto(),
+            top,
+            bottom,
         },
         size: Size {
             width: percent(1.0_f32),
             height: auto(),
         },
         ..Default::default()
-    }
+    };
+    cap_frame(&mut style, max_height);
+    style
 }
 
 /// One option row: exactly one row tall (`row_height(scales)`, resolved
@@ -609,7 +663,9 @@ pub fn insert_dropdown(
     selected: Option<usize>,
 ) -> Result<WidgetId, WidgetError> {
     checked_selection(selected, options.len())?;
-    let state = DropdownState::new(label.to_owned(), options, selected, row_height(scales));
+    let mut state = DropdownState::new(label.to_owned(), options, selected, row_height(scales));
+    state.scrollbar_thickness = popup_list::scrollbar_thickness(scales);
+    state.margin = spacing(scales.spacing.sm);
     tree.insert(
         parent,
         control_style(scales),
@@ -805,8 +861,7 @@ pub fn commit_dropdown_row(
 /// [`WidgetKind::Dropdown`] that lists `row` among its current rows.
 #[must_use]
 pub fn dropdown_of_row(tree: &WidgetTree<WidgetKind>, row: WidgetId) -> Option<WidgetId> {
-    let list = tree
-        .parent(row)
+    let list = popup_list::frame_of_row(tree, row)
         .filter(|&list| matches!(tree.payload(list), Some(WidgetKind::DropdownList)))?;
     let dropdown = tree.parent(list)?;
     state(tree, dropdown)
@@ -930,7 +985,11 @@ fn reconcile(
     });
     let keep = highlighted.and(owned).filter(|&list| {
         current.rows.len() == current.options.len()
-            && tree.children(list) == Some(current.rows.as_slice())
+            && current.parts.is_some_and(|(body, bar)| {
+                tree.children(list) == Some([body, bar].as_slice())
+                    && tree.parent(body) == Some(list)
+                    && tree.children(body) == Some(current.rows.as_slice())
+            })
     });
 
     remove_lists_except(tree, id, keep)?;
@@ -939,7 +998,9 @@ fn reconcile(
         return write_structure(tree, id, None, Vec::new());
     };
     if keep.is_some() {
-        return move_highlight(tree, id, previous, highlighted);
+        move_highlight(tree, id, previous, highlighted)?;
+        reveal_highlight(tree, id, highlighted);
+        return Ok(());
     }
     build_list(tree, id, highlighted)
 }
@@ -1037,9 +1098,32 @@ fn build_list(
     let label = current.label.clone();
     let options = current.options.clone();
     let row_style = row_style(current.row_height);
+    let (thickness, margin, row_h) = (
+        current.scrollbar_thickness,
+        current.margin,
+        current.row_height,
+    );
+    // Where the list goes and how tall it may be (0.259.0): the room
+    // between the control and the window edge, see `popup_list`.
+    #[allow(clippy::cast_precision_loss)]
+    let fit = window_span(tree)
+        .zip(tree.bounds(id))
+        .map(|(window, control)| {
+            fit_popup(
+                (control.y as f32, control.bottom() as f32),
+                window,
+                margin,
+                options.len() as f32 * row_h,
+                MIN_VISIBLE_ROWS * row_h,
+                true,
+            )
+        });
     let list = tree.insert(
         id,
-        list_style(),
+        list_style(
+            fit.is_some_and(|fit| fit.above),
+            fit.map(|fit| fit.max_height),
+        ),
         list_node(&label),
         WidgetKind::DropdownList,
     )?;
@@ -1048,12 +1132,13 @@ fn build_list(
     // On an error the half-built list is removed by `sync_structure`,
     // exactly as a failed row insert already is.
     tree.set_layer(list, PaintLayer::Popover)?;
+    let (body, scrollbar) = insert_parts(tree, list, thickness)?;
     let len = options.len();
     let mut rows = Vec::with_capacity(len);
     for (index, text) in options.iter().enumerate() {
         let on = index == highlighted;
         rows.push(tree.insert(
-            list,
+            body,
             row_style.clone(),
             option_node(text, index, len, on),
             WidgetKind::ListRow(ListRowState {
@@ -1063,20 +1148,35 @@ fn build_list(
             }),
         )?);
     }
-    write_structure(tree, id, Some(list), rows)
+    write_structure(tree, id, Some((list, body, scrollbar)), rows)?;
+    reveal_highlight(tree, id, highlighted);
+    Ok(())
 }
 
-/// Records the reconciled `list`/`rows` in `id`'s own state.
+/// Scrolls the highlighted option into the list's viewport (now when the
+/// list has a layout, and again after the next one).
+fn reveal_highlight(tree: &mut WidgetTree<WidgetKind>, id: WidgetId, highlighted: usize) {
+    let row = state(tree, id)
+        .ok()
+        .and_then(|state| state.rows.get(highlighted).copied());
+    if let Some(row) = row {
+        reveal(tree, row);
+    }
+}
+
+/// Records the reconciled `list`/`rows` (and the list's scroll container
+/// and scrollbar) in `id`'s own state.
 fn write_structure(
     tree: &mut WidgetTree<WidgetKind>,
     id: WidgetId,
-    list: Option<WidgetId>,
+    list: Option<(WidgetId, WidgetId, WidgetId)>,
     rows: Vec<WidgetId>,
 ) -> Result<(), WidgetError> {
     let Some(WidgetKind::Dropdown(state)) = tree.payload_mut(id) else {
         return Err(WidgetError::WrongWidgetKind(id));
     };
-    state.list = list;
+    state.list = list.map(|(list, _, _)| list);
+    state.parts = list.map(|(_, body, bar)| (body, bar));
     state.rows = rows;
     Ok(())
 }
@@ -1092,6 +1192,7 @@ fn close_after_failure(tree: &mut WidgetTree<WidgetKind>, id: WidgetId) {
     if let Some(WidgetKind::Dropdown(state)) = tree.payload_mut(id) {
         state.highlighted = None;
         state.list = None;
+        state.parts = None;
         state.rows.clear();
     }
 }
@@ -1567,9 +1668,16 @@ mod tests {
         assert_eq!(list_node.role(), Role::ListBox);
         assert_eq!(list_node.label(), Some("Blend mode"));
 
-        let Some(rows) = tree.children(list) else {
+        let Some(body) = state.body() else {
+            unreachable!("open means a scroll container exists");
+        };
+        let Some(rows) = tree.children(body) else {
             unreachable!("just inserted");
         };
+        assert_eq!(
+            tree.children(list),
+            Some([body, state_bar(&state)].as_slice())
+        );
         assert_eq!(rows, state.rows());
         assert_eq!(rows.len(), 3);
         let mut selected = 0;
@@ -2093,8 +2201,9 @@ mod tests {
             unreachable!("open");
         };
         let order = tree.paint_order();
-        let mut expected_tail = vec![list];
+        let mut expected_tail = vec![list, body_id(&state)];
         expected_tail.extend_from_slice(state.rows());
+        expected_tail.push(state_bar(&state));
         assert!(
             order.ends_with(&expected_tail),
             "{order:?} must end with {expected_tail:?}"
@@ -2145,6 +2254,20 @@ mod tests {
         );
     }
 
+    fn body_id(state: &DropdownState) -> WidgetId {
+        match state.body() {
+            Some(body) => body,
+            None => unreachable!("open means a scroll container exists"),
+        }
+    }
+
+    fn state_bar(state: &DropdownState) -> WidgetId {
+        match state.scrollbar() {
+            Some(bar) => bar,
+            None => unreachable!("open means a scrollbar exists"),
+        }
+    }
+
     fn list_children(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Vec<WidgetId> {
         tree.children(id)
             .unwrap_or_default()
@@ -2171,7 +2294,10 @@ mod tests {
             vec![list],
             "exactly one list child"
         );
-        assert_eq!(tree.children(list), Some(state.rows()));
+        assert_eq!(
+            state.body().and_then(|body| tree.children(body)),
+            Some(state.rows())
+        );
         assert_eq!(state.rows().len(), state.options().len());
         for (index, &row) in state.rows().iter().enumerate() {
             assert!(tree.contains(row));

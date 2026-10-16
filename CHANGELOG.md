@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.259.0] - 2026-10-16
+
+### Changed
+
+- Menus and dropdown lists stay inside the window and scroll
+
 ## [0.258.0] - 2026-10-16
 
 ### Fixed

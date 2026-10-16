@@ -175,6 +175,9 @@ use taffy::style_helpers::{auto, length, percent};
 use taffy::{FlexDirection, Position, Rect as LayoutRect, Size, Style};
 
 use super::list_row::ListRowState;
+use super::popup_list::{
+    self, MIN_VISIBLE_ROWS, cap_frame, fit_popup, insert_parts, reveal, window_span,
+};
 use super::{WidgetKind, row_height, spacing};
 use crate::error::WidgetError;
 use crate::shortcut::NamedKey;
@@ -237,6 +240,11 @@ pub enum MenuKey {
     Down,
     Home,
     End,
+    /// One page up (0.259.0): the enabled item about a viewport earlier,
+    /// no wrapping.
+    PageUp,
+    /// One page down (0.259.0), no wrapping.
+    PageDown,
     Enter,
     Space,
     Escape,
@@ -253,6 +261,8 @@ impl MenuKey {
             NamedKey::ArrowDown => Some(Self::Down),
             NamedKey::Home => Some(Self::Home),
             NamedKey::End => Some(Self::End),
+            NamedKey::PageUp => Some(Self::PageUp),
+            NamedKey::PageDown => Some(Self::PageDown),
             NamedKey::Enter => Some(Self::Enter),
             NamedKey::Space => Some(Self::Space),
             NamedKey::Escape => Some(Self::Escape),
@@ -289,6 +299,9 @@ pub struct MenuState {
     item_ids: Vec<WidgetId>,
     row_height: f32,
     separator_height: f32,
+    /// The scroll container holding the items and the scrollbar beside
+    /// it, `None` for a state built without a tree.
+    parts: Option<(WidgetId, WidgetId)>,
 }
 
 impl MenuState {
@@ -301,7 +314,21 @@ impl MenuState {
             item_ids: Vec::new(),
             row_height,
             separator_height,
+            parts: None,
         }
+    }
+
+    /// The scroll container that holds the item rows (0.259.0); the
+    /// items are its children, not the menu's.
+    #[must_use]
+    pub fn body(&self) -> Option<WidgetId> {
+        self.parts.map(|(body, _)| body)
+    }
+
+    /// The scrollbar linked to [`Self::body`]; hidden while the items fit.
+    #[must_use]
+    pub fn scrollbar(&self) -> Option<WidgetId> {
+        self.parts.map(|(_, bar)| bar)
     }
 
     /// The menu's accessible label.
@@ -371,7 +398,14 @@ impl MenuState {
     /// The pure transition table (see this module's doc comment). Does
     /// not mutate: the caller commits a `Moved` only once the tree has
     /// been brought in line with it.
+    #[cfg(test)]
     fn transition(&self, key: MenuKey) -> MenuOutcome {
+        self.transition_paged(key, 1)
+    }
+
+    /// `transition` with a page of `page` items for
+    /// `PageUp`/`PageDown`.
+    fn transition_paged(&self, key: MenuKey, page: usize) -> MenuOutcome {
         if key == MenuKey::Escape {
             return MenuOutcome::Cancelled;
         }
@@ -391,6 +425,19 @@ impl MenuState {
             MenuKey::Up => self.next_enabled(current, false),
             MenuKey::Home => self.items.iter().position(MenuItem::is_enabled_action),
             MenuKey::End => self.items.iter().rposition(MenuItem::is_enabled_action),
+            MenuKey::PageDown => {
+                let wanted = current.saturating_add(page.max(1));
+                (wanted..self.items.len())
+                    .find(|&index| self.is_enabled(index))
+                    .or_else(|| self.items.iter().rposition(MenuItem::is_enabled_action))
+            }
+            MenuKey::PageUp => {
+                let wanted = current.saturating_sub(page.max(1));
+                (0..=wanted)
+                    .rev()
+                    .find(|&index| self.is_enabled(index))
+                    .or_else(|| self.items.iter().position(MenuItem::is_enabled_action))
+            }
         };
         match target {
             Some(index) if index != current => MenuOutcome::Moved(index),
@@ -504,9 +551,10 @@ fn expected_children(items: &[MenuItem], highlighted: Option<usize>) -> Vec<(Nod
 }
 
 /// The menu's own layout: out of flow at `at` inside `parent`'s padding
-/// box, `width` wide, as tall as its children stacked.
-fn menu_style(at: (f32, f32), width: f32) -> Style {
-    Style {
+/// box, `width` wide, as tall as its children stacked but at most
+/// `max_height` (`None`: uncapped), clipping what does not fit.
+fn menu_style(at: (f32, f32), width: f32, max_height: Option<f32>) -> Style {
+    let mut style = Style {
         position: Position::Absolute,
         flex_direction: FlexDirection::Column,
         inset: LayoutRect {
@@ -520,7 +568,42 @@ fn menu_style(at: (f32, f32), width: f32) -> Style {
             height: auto(),
         },
         ..Default::default()
-    }
+    };
+    cap_frame(&mut style, max_height);
+    style
+}
+
+/// The tallest the popup may be (0.259.0): the room from its top edge
+/// to the bottom of the window less one `spacing.sm` margin, but never
+/// less than [`MIN_VISIBLE_ROWS`] rows (see `popup_list`'s docs). `None`
+/// when the tree has not been laid out, so nothing can be capped.
+fn menu_max_height(
+    tree: &WidgetTree<WidgetKind>,
+    parent: WidgetId,
+    scales: &Scales,
+    top_in_parent: f32,
+    content: f32,
+) -> Option<f32> {
+    let window = window_span(tree)?;
+    // Absolute coordinates: the parent's laid-out top plus the offset
+    // (`parent`'s vertical padding is not added: the only caller's is 0).
+    let parent_top = tree.bounds(parent).map_or(0.0, |b| {
+        #[allow(clippy::cast_precision_loss)]
+        let y = b.y as f32;
+        y
+    });
+    let top = parent_top + top_in_parent;
+    Some(
+        fit_popup(
+            (top, top),
+            window,
+            spacing(scales.spacing.sm),
+            content,
+            MIN_VISIBLE_ROWS * row_height(scales),
+            false,
+        )
+        .max_height,
+    )
 }
 
 /// One child: exactly `height` tall, never shrunk, full width — the
@@ -594,9 +677,18 @@ pub fn open_menu(
         row_height(scales),
         spacing(scales.spacing.xxs),
     );
+    let content = state
+        .items
+        .iter()
+        .map(|item| match item.kind {
+            MenuItemKind::Action => state.row_height,
+            MenuItemKind::Separator => state.separator_height,
+        })
+        .sum::<f32>();
+    let max_height = menu_max_height(tree, parent, scales, at.1, content);
     let menu = tree.insert(
         parent,
-        menu_style(at, width),
+        menu_style(at, width, max_height),
         menu_node(&state),
         WidgetKind::Menu(state),
     )?;
@@ -605,7 +697,14 @@ pub fn open_menu(
     // takes the same cleanup path as a failed child build.
     let built = tree
         .set_layer(menu, PaintLayer::Popover)
-        .and_then(|()| build_children(tree, menu))
+        .and_then(|()| insert_parts(tree, menu, popup_list::scrollbar_thickness(scales)))
+        .and_then(|parts| {
+            let Some(WidgetKind::Menu(state)) = tree.payload_mut(menu) else {
+                return Err(WidgetError::WrongWidgetKind(menu));
+            };
+            state.parts = Some(parts);
+            build_children(tree, menu)
+        })
         .and_then(|ids| {
             let Some(WidgetKind::Menu(state)) = tree.payload_mut(menu) else {
                 return Err(WidgetError::WrongWidgetKind(menu));
@@ -676,7 +775,8 @@ pub fn handle_menu_key(
 ) -> Result<MenuOutcome, WidgetError> {
     let previous = state(tree, menu)?.highlighted;
     let repaired = sync(tree, menu, previous)?;
-    let outcome = state(tree, menu)?.transition(key);
+    let page = page_items(tree, menu)?;
+    let outcome = state(tree, menu)?.transition_paged(key, page);
     match outcome {
         MenuOutcome::Ignored => {}
         MenuOutcome::Moved(index) => {
@@ -690,7 +790,12 @@ pub fn handle_menu_key(
                 return Err(WidgetError::WrongWidgetKind(menu));
             };
             state.highlighted = Some(index);
+            let row = state.item_ids.get(index).copied();
             sync_menu_node(tree, menu)?;
+            // Keep the highlight inside the viewport (0.259.0).
+            if let Some(row) = row {
+                reveal(tree, row);
+            }
         }
         MenuOutcome::Activated(_) if repaired => return Ok(MenuOutcome::Ignored),
         MenuOutcome::Activated(_) | MenuOutcome::Cancelled => tree.remove(menu)?,
@@ -761,11 +866,37 @@ pub fn close_menu(tree: &mut WidgetTree<WidgetKind>, menu: WidgetId) -> Result<(
 /// through `WidgetTree::payload_mut`, or an id since reused) can never
 /// make it touch a widget it does not own.
 fn is_own_item(tree: &WidgetTree<WidgetKind>, menu: WidgetId, id: WidgetId) -> bool {
-    tree.parent(id) == Some(menu)
+    tree.parent(id) == Some(items_parent(tree, menu))
         && matches!(
             tree.payload(id),
             Some(WidgetKind::ListRow(_) | WidgetKind::MenuSeparator)
         )
+}
+
+/// The widget the item rows are children of: the menu's scroll container
+/// (0.259.0), or the menu itself for a state built without one.
+fn items_parent(tree: &WidgetTree<WidgetKind>, menu: WidgetId) -> WidgetId {
+    state(tree, menu)
+        .ok()
+        .and_then(MenuState::body)
+        .unwrap_or(menu)
+}
+
+/// How many items a `PageUp`/`PageDown` moves: the rows the viewport
+/// showed at the last layout less one (so the page overlaps by an item),
+/// at least one. A menu never laid out pages by one.
+fn page_items(tree: &WidgetTree<WidgetKind>, menu: WidgetId) -> Result<usize, WidgetError> {
+    let current = state(tree, menu)?;
+    let shown = tree
+        .bounds(items_parent(tree, menu))
+        .map_or(0, |bounds| u64::from(bounds.height));
+    // Whole-row arithmetic in integer px: the row height is a small
+    // token-derived value, rounded to the nearest pixel.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let row = current.row_height.round().max(1.0) as u64;
+    Ok(usize::try_from((shown / row).saturating_sub(1))
+        .unwrap_or(1)
+        .max(1))
 }
 
 /// Brings `menu`'s children and its own node in line with its state at
@@ -781,15 +912,16 @@ fn sync(
     menu: WidgetId,
     highlighted: Option<usize>,
 ) -> Result<bool, WidgetError> {
+    let list = items_parent(tree, menu);
     let current = state(tree, menu)?;
-    // One pass over the menu's children: the `ListRow`/`MenuSeparator`
-    // ones (a child's parent is `menu` by construction) must be exactly
+    // One pass over the list's children: the `ListRow`/`MenuSeparator`
+    // ones (a child's parent is `list` by construction) must be exactly
     // the tracked ids, in order, one per item; each one's payload is
     // compared on the way.
     let mut intact = current.item_ids.len() == current.items.len();
     let mut seen = 0_usize;
     let mut stale = Vec::new();
-    for &child in tree.children(menu).unwrap_or_default() {
+    for &child in tree.children(list).unwrap_or_default() {
         if !intact {
             break;
         }
@@ -886,7 +1018,7 @@ fn rebuild_children(
 ) -> Result<Vec<WidgetId>, WidgetError> {
     let tracked: HashSet<WidgetId> = state(tree, menu)?.item_ids.iter().copied().collect();
     let doomed: Vec<WidgetId> = tree
-        .children(menu)
+        .children(items_parent(tree, menu))
         .unwrap_or_default()
         .iter()
         .copied()
@@ -912,6 +1044,7 @@ fn insert_children(
     menu: WidgetId,
     highlighted: Option<usize>,
 ) -> Result<Vec<WidgetId>, WidgetError> {
+    let list = items_parent(tree, menu);
     let current = state(tree, menu)?;
     let row = child_style(current.row_height);
     let separator = child_style(current.separator_height);
@@ -923,7 +1056,7 @@ fn insert_children(
             MenuItemKind::Action => row.clone(),
             MenuItemKind::Separator => separator.clone(),
         };
-        ids.push(tree.insert(menu, style, node, payload)?);
+        ids.push(tree.insert(list, style, node, payload)?);
     }
     Ok(ids)
 }
@@ -1082,12 +1215,14 @@ mod tests {
     }
 
     #[test]
-    fn named_keys_map_onto_the_seven_menu_keys_and_nothing_else() {
+    fn named_keys_map_onto_the_nine_menu_keys_and_nothing_else() {
         let cases = [
             (NamedKey::ArrowUp, Some(MenuKey::Up)),
             (NamedKey::ArrowDown, Some(MenuKey::Down)),
             (NamedKey::Home, Some(MenuKey::Home)),
             (NamedKey::End, Some(MenuKey::End)),
+            (NamedKey::PageUp, Some(MenuKey::PageUp)),
+            (NamedKey::PageDown, Some(MenuKey::PageDown)),
             (NamedKey::Enter, Some(MenuKey::Enter)),
             (NamedKey::Space, Some(MenuKey::Space)),
             (NamedKey::Escape, Some(MenuKey::Escape)),
@@ -1164,6 +1299,13 @@ mod tests {
         assert!(tree.contains(menu));
     }
 
+    /// The widget the item rows are children of (the scroll container).
+    fn items_of(tree: &WidgetTree<WidgetKind>, menu: WidgetId) -> WidgetId {
+        ok(ok(menu_state(tree, menu))
+            .body()
+            .ok_or(WidgetError::UnknownWidget(menu)))
+    }
+
     fn press(tree: &mut WidgetTree<WidgetKind>, menu: WidgetId, key: MenuKey) -> MenuOutcome {
         ok(handle_menu_key(tree, menu, key))
     }
@@ -1188,7 +1330,7 @@ mod tests {
     fn open_menu_builds_a_menu_with_one_child_per_item_in_order() {
         let (tree, menu) = opened(items());
         let state = snapshot(&tree, menu);
-        assert_eq!(tree.children(menu), Some(state.item_ids()));
+        assert_eq!(tree.children(items_of(&tree, menu)), Some(state.item_ids()));
         assert_eq!(state.item_ids().len(), 5);
         let roles: Vec<Option<Role>> = state
             .item_ids()
@@ -1373,7 +1515,11 @@ mod tests {
             crate::hit_test(&tree, f64::from(x), f64::from(y)),
             Some(last)
         );
-        assert_eq!(tree.paint_order().last(), Some(&last));
+        let order = tree.paint_order();
+        assert!(
+            order.iter().position(|&id| id == last) > order.iter().position(|&id| id == menu),
+            "the item paints after its menu"
+        );
     }
 
     #[test]
@@ -1464,7 +1610,7 @@ mod tests {
         assert_eq!(press(&mut tree, menu, MenuKey::Down), MenuOutcome::Moved(1));
         let state = snapshot(&tree, menu);
         assert_eq!(state.item_ids().len(), 5);
-        assert_eq!(tree.children(menu), Some(state.item_ids()));
+        assert_eq!(tree.children(items_of(&tree, menu)), Some(state.item_ids()));
         let Some(&new_copy) = state.item_ids().get(1) else {
             unreachable!("five items");
         };
@@ -1496,7 +1642,7 @@ mod tests {
         assert_eq!(tree.payload(button).cloned(), button_payload);
         let state = snapshot(&tree, menu);
         assert!(!state.item_ids().contains(&button));
-        assert_eq!(tree.children(menu), Some(state.item_ids()));
+        assert_eq!(tree.children(items_of(&tree, menu)), Some(state.item_ids()));
     }
 
     /// RT-1 (review): a stale [`MenuState`] written back after a move
@@ -1549,7 +1695,7 @@ mod tests {
         ok(tree.remove(cut));
         assert_eq!(press(&mut tree, menu, MenuKey::Home), MenuOutcome::Ignored);
         let state = snapshot(&tree, menu);
-        assert_eq!(tree.children(menu), Some(state.item_ids()));
+        assert_eq!(tree.children(items_of(&tree, menu)), Some(state.item_ids()));
         let Some(&new_cut) = state.item_ids().first() else {
             unreachable!("five items");
         };
@@ -1608,7 +1754,7 @@ mod tests {
         assert_eq!(press(&mut tree, menu, MenuKey::Down), MenuOutcome::Moved(1));
         assert!(!tree.contains(copy), "the overwritten item is gone");
         let state = snapshot(&tree, menu);
-        assert_eq!(tree.children(menu), Some(state.item_ids()));
+        assert_eq!(tree.children(items_of(&tree, menu)), Some(state.item_ids()));
         assert_eq!(state.item_ids().len(), 5);
     }
 
