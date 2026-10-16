@@ -1304,7 +1304,10 @@ fn a_document_with_all_fifteen_adjustment_kinds_composites_on_the_gpu() {
         "fifteen adjustments in one document: worst |GPU - CPU| = {worst:e}, {flips} of {} channels over the tolerance",
         gpu.len()
     );
-    assert!(flips * 200 <= gpu.len(), "{flips} channels disagree");
+    // Fifteen stacked passes, two of them quantisers: measured 0.2 % of the
+    // channels on the RTX 3090 and 0.85 % on the Windows software adapter
+    // (Microsoft Basic Render Driver / WARP), so the bound is 2 %.
+    assert!(flips * 50 <= gpu.len(), "{flips} channels disagree");
 }
 
 /// Masks, `Dissolve`, `Exclusion` and a non-separable mode keep every pass
