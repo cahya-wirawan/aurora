@@ -120,7 +120,9 @@ fn a_256_entry_table_makes_a_grey_profile_exposure() {
     assert_eq!(p.trc().entries(), entries.as_slice());
     // EXPA_FILL is the fixture's own block; the sliders are what it holds.
     assert!(
-        items(&d).contains("1 Exposure layer in this Grayscale file is drawn through the file's grey profile"),
+        items(&d).contains(
+            "1 Exposure layer in this Grayscale file is drawn through the file's grey profile"
+        ),
         "{}",
         items(&d)
     );
@@ -137,15 +139,21 @@ fn other_profiles_leave_the_layer_out_with_their_own_line() {
         (gray_profile(&curv(&[])), "plain gamma curve"),
         (gray_profile(&curv(&[0x0233])), "plain gamma curve"),
         (gray_profile(b"para\0\0\0\0\0\0\0\0"), "parametric curve"),
-        (gray_profile(&curv(&table(1024))), "(it has checked 256 entries)"),
+        (
+            gray_profile(&curv(&table(1024))),
+            "(it has checked 256 entries)",
+        ),
         (gray_profile(&curv(&down)), "decreases or does not run"),
         (gray_profile(&curv(&short)), "decreases or does not run"),
         (gray_profile(b"mft2\0\0\0\0\0\0\0\0"), "could not be read"),
-        ({
-            let mut p = gray_profile(&curv(&table(256)));
-            p[16..20].copy_from_slice(b"RGB ");
-            p
-        }, "is not a grey profile"),
+        (
+            {
+                let mut p = gray_profile(&curv(&table(256)));
+                p[16..20].copy_from_slice(b"RGB ");
+                p
+            },
+            "is not a grey profile",
+        ),
     ] {
         let d = open(&file(true, Some(&profile)));
         assert!(adjustments_of(&d).is_empty(), "{clause}");
@@ -155,7 +163,10 @@ fn other_profiles_leave_the_layer_out_with_their_own_line() {
                 && text.contains(clause),
             "{clause}: {text}"
         );
-        assert!(!text.contains("hasn't yet verified how Photoshop applies Exposure"), "{text}");
+        assert!(
+            !text.contains("hasn't yet verified how Photoshop applies Exposure"),
+            "{text}"
+        );
     }
 }
 
@@ -164,7 +175,8 @@ fn no_profile_keeps_the_old_left_out_line() {
     let d = open(&file(true, None));
     assert!(adjustments_of(&d).is_empty());
     assert!(
-        items(&d).contains("hasn't yet verified how Photoshop applies Exposure to a Grayscale image"),
+        items(&d)
+            .contains("hasn't yet verified how Photoshop applies Exposure to a Grayscale image"),
         "{}",
         items(&d)
     );
@@ -270,5 +282,8 @@ fn the_corpus_rgb_control_stays_a_plain_exposure() {
     };
     let all = adjustments_of(&d);
     assert_eq!(all.len(), 4);
-    assert!(all.iter().all(|(_, a)| matches!(a, Adjustment::Exposure(_))));
+    assert!(
+        all.iter()
+            .all(|(_, a)| matches!(a, Adjustment::Exposure(_)))
+    );
 }

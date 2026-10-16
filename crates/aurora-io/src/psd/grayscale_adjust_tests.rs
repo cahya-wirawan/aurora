@@ -532,13 +532,11 @@ fn the_corpus_grayscale_files_import_their_four_layers() {
 
 #[test]
 fn the_corpus_legacy_grayscale_file_stays_out() {
-    for (file, kind, n) in [
-        (
-            "brightnesscontrast_legacy_grayscale.psd",
-            "Brightness/Contrast",
-            1,
-        ),
-    ] {
+    for (file, kind, n) in [(
+        "brightnesscontrast_legacy_grayscale.psd",
+        "Brightness/Contrast",
+        1,
+    )] {
         let Some(document) = corpus(&format!("adjustments/{file}")) else {
             continue;
         };

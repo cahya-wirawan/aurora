@@ -2239,7 +2239,9 @@ mod exposure_trc_wire_tests {
 
     #[test]
     fn a_bad_payload_is_a_decode_error_not_a_repair() {
-        let good = encode(&LayerKind::Adjustment(Adjustment::ExposureTrc(trc_params())));
+        let good = encode(&LayerKind::Adjustment(
+            Adjustment::ExposureTrc(trc_params()),
+        ));
         let e = trc_params().exposure();
         let bad_gamma = encode(&(2_u8, 16_u8, (1.0_f32, 0.0_f32, 0.0_f32), vec![0_u16, 65535]));
         let descending = encode(&(2_u8, 16_u8, e, vec![0_u16, 9, 3, 65535]));

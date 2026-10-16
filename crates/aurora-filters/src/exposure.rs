@@ -461,7 +461,18 @@ mod tests {
         let tables = [
             table(|x| x.powf(1.8) * 0.8 + x * 0.2, 256),
             table(|x| x.powf(2.2), 1024),
-            table(|x| if x < 0.3 { 0.0 } else if x > 0.7 { 1.0 } else { (x - 0.3) / 0.4 }, 64),
+            table(
+                |x| {
+                    if x < 0.3 {
+                        0.0
+                    } else if x > 0.7 {
+                        1.0
+                    } else {
+                        (x - 0.3) / 0.4
+                    }
+                },
+                64,
+            ),
         ];
         let settings = [
             (2.03, 0.0775, 1.52),
@@ -564,7 +575,12 @@ mod tests {
 
     #[test]
     fn trc_encode_handles_plateaus_ends_and_bad_input() {
-        let o = trc_op(0.5, 0.0, 1.0, table(|x| if x < 0.5 { 0.0 } else { (x - 0.5) * 2.0 }, 11));
+        let o = trc_op(
+            0.5,
+            0.0,
+            1.0,
+            table(|x| if x < 0.5 { 0.0 } else { (x - 0.5) * 2.0 }, 11),
+        );
         // y = 0 sits on the plateau: the first entry reaching it, 0.
         assert!(o.encode(0.0).abs() < 1e-6);
         assert!(o.encode(-3.0).abs() < 1e-6);

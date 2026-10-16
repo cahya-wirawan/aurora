@@ -1863,6 +1863,71 @@ mod tests {
         assert_eq!(got(S::Green, &f, 138.4), Some(138.0));
     }
 
+    fn trc_exposure(ev: f32, offset: f32, gamma: f32) -> Adjustment {
+        let entries: Vec<u16> = (0..=255_u16).map(|i| i * 257).collect();
+        let (Ok(trc), Ok(p)) = (
+            aurora_core::GreyTrc::new(entries),
+            ExposureParams::new(ev, offset, gamma),
+        ) else {
+            unreachable!("valid");
+        };
+        Adjustment::ExposureTrc(aurora_core::ExposureTrcParams::new(p, trc))
+    }
+
+    /// Task 112: a grey-profile Exposure uses the Exposure editor, shows
+    /// the profile note (and only it does), and a slider edit keeps the
+    /// variant and its table.
+    #[test]
+    fn a_grey_profile_exposure_uses_the_exposure_editor_with_a_note() {
+        let scales = scales();
+        let mut ws = crate::build_workspace(&scales);
+        let controls = match insert_adjust_controls(&mut ws.tree, ws.properties.root, &scales) {
+            Ok(c) => c,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let note_hidden =
+            |ws: &crate::Workspace| match ws.tree.payload(controls.exposure_profile_note) {
+                Some(WidgetKind::Label(label)) => label.disabled,
+                other => unreachable!("{other:?}"),
+            };
+        let mut layers = LayerTree::new();
+        let plain = add(&mut layers, "E", exp(-1.25, 0.125, 2.2));
+        let grey = add(&mut layers, "G", trc_exposure(0.75, -0.25, 1.5));
+        let _ = show(&mut ws, controls, &layers, Some(grey));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::Exposure)
+        );
+        assert!(!note_hidden(&ws), "the note shows for a grey-profile layer");
+        let at = |ws: &crate::Workspace, s: S| slider_state(&ws.tree, controls.sliders[s.index()]);
+        assert_eq!(at(&ws, S::Exposure), (0.75, false));
+        assert_eq!(at(&ws, S::Offset), (-0.25, false));
+        assert!((at(&ws, S::Gamma).0 - 1.5).abs() < 1e-6);
+        let _ = show(&mut ws, controls, &layers, Some(plain));
+        assert!(note_hidden(&ws), "the note hides for a plain Exposure");
+        let _ = show(&mut ws, controls, &layers, None);
+        assert!(note_hidden(&ws));
+        // The edit keeps the variant and the table.
+        let before = trc_exposure(0.75, -0.25, 1.5);
+        let after = S::Exposure.with_value(&before, 0, 2.0);
+        match (&before, &after) {
+            (Adjustment::ExposureTrc(a), Some(Adjustment::ExposureTrc(b))) => {
+                assert_eq!(a.trc(), b.trc());
+                assert_eq!(b.exposure().exposure(), 2.0);
+                assert_eq!(b.exposure().offset(), -0.25);
+            }
+            other => unreachable!("{other:?}"),
+        }
+        // An out-of-range value is handled as in the plain variant.
+        assert_eq!(
+            S::Exposure.with_value(&before, 0, 99.0).is_some(),
+            S::Exposure
+                .with_value(&exp(0.75, -0.25, 1.5), 0, 99.0)
+                .is_some()
+        );
+        assert_eq!(AdjustKind::of(&before), Some(AdjustKind::Exposure));
+    }
+
     #[test]
     fn a_slider_edit_changes_only_its_own_field() {
         let e = exp(1.0, 0.25, 2.0);

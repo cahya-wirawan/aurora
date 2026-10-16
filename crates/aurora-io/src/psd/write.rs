@@ -347,10 +347,8 @@ impl Losses {
         );
         self.black_white_written +=
             usize::from(matches!(adjustment, aurora_doc::Adjustment::BlackWhite(_)));
-        self.exposure_trc += usize::from(matches!(
-            adjustment,
-            aurora_doc::Adjustment::ExposureTrc(_)
-        ));
+        self.exposure_trc +=
+            usize::from(matches!(adjustment, aurora_doc::Adjustment::ExposureTrc(_)));
         if rounding.rounded
             && let Some(count) = slot.and_then(|slot| self.adjustment_rounded.get_mut(slot))
         {

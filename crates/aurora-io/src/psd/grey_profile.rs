@@ -60,7 +60,12 @@ pub(super) enum GreyProfile {
 fn be32(data: &[u8], at: usize) -> Option<u32> {
     let end = at.checked_add(4)?;
     let b = data.get(at..end)?;
-    Some(u32::from_be_bytes([*b.first()?, *b.get(1)?, *b.get(2)?, *b.get(3)?]))
+    Some(u32::from_be_bytes([
+        *b.first()?,
+        *b.get(1)?,
+        *b.get(2)?,
+        *b.get(3)?,
+    ]))
 }
 
 fn usize32(data: &[u8], at: usize) -> Option<usize> {
@@ -85,7 +90,8 @@ pub(super) fn classify(profile: &[u8]) -> GreyProfile {
         if profile.get(at..at + 4) != Some(b"kTRC".as_slice()) {
             continue;
         }
-        let (Some(offset), Some(size)) = (usize32(profile, at + 4), usize32(profile, at + 8)) else {
+        let (Some(offset), Some(size)) = (usize32(profile, at + 4), usize32(profile, at + 8))
+        else {
             return unreadable;
         };
         let Some(end) = offset.checked_add(size).filter(|e| *e <= profile.len()) else {
@@ -119,7 +125,12 @@ fn curv(tag: &[u8]) -> GreyProfile {
     };
     let entries: Vec<u16> = data
         .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c.first().copied().unwrap_or(0), c.get(1).copied().unwrap_or(0)]))
+        .map(|c| {
+            u16::from_be_bytes([
+                c.first().copied().unwrap_or(0),
+                c.get(1).copied().unwrap_or(0),
+            ])
+        })
         .collect();
     match GreyTrc::new(entries) {
         Ok(trc) => GreyProfile::Table(trc),
@@ -199,17 +210,38 @@ mod tests {
             other => unreachable!("{other:?}"),
         };
         assert_eq!(reason(profile_with(&curv_tag(&[]))), GreyReason::GammaCurve);
-        assert_eq!(reason(profile_with(&curv_tag(&[0x0233]))), GreyReason::GammaCurve);
-        assert_eq!(reason(profile_with(&curv_tag(&ramp(1024)))), GreyReason::TableLength);
-        assert_eq!(reason(profile_with(&curv_tag(&ramp(255)))), GreyReason::TableLength);
+        assert_eq!(
+            reason(profile_with(&curv_tag(&[0x0233]))),
+            GreyReason::GammaCurve
+        );
+        assert_eq!(
+            reason(profile_with(&curv_tag(&ramp(1024)))),
+            GreyReason::TableLength
+        );
+        assert_eq!(
+            reason(profile_with(&curv_tag(&ramp(255)))),
+            GreyReason::TableLength
+        );
         let mut down = ramp(256);
         down.swap(10, 11);
-        assert_eq!(reason(profile_with(&curv_tag(&down))), GreyReason::TableShape);
+        assert_eq!(
+            reason(profile_with(&curv_tag(&down))),
+            GreyReason::TableShape
+        );
         let mut short_end = ramp(256);
         short_end[255] = 65000;
-        assert_eq!(reason(profile_with(&curv_tag(&short_end))), GreyReason::TableShape);
-        assert_eq!(reason(profile_with(b"para\0\0\0\0\0\0\0\0")), GreyReason::Parametric);
-        assert_eq!(reason(profile_with(b"mft2\0\0\0\0\0\0\0\0")), GreyReason::Unreadable);
+        assert_eq!(
+            reason(profile_with(&curv_tag(&short_end))),
+            GreyReason::TableShape
+        );
+        assert_eq!(
+            reason(profile_with(b"para\0\0\0\0\0\0\0\0")),
+            GreyReason::Parametric
+        );
+        assert_eq!(
+            reason(profile_with(b"mft2\0\0\0\0\0\0\0\0")),
+            GreyReason::Unreadable
+        );
         let mut rgb = profile_with(&curv_tag(&ramp(256)));
         rgb[16..20].copy_from_slice(b"RGB ");
         assert_eq!(reason(rgb), GreyReason::NotGray);
@@ -235,13 +267,25 @@ mod tests {
         // A tag count far past the bytes present.
         let mut many = good.clone();
         many[128..132].copy_from_slice(&u32::MAX.to_be_bytes());
-        assert_eq!(classify(&many), GreyProfile::Unsupported(GreyReason::Unreadable));
+        assert_eq!(
+            classify(&many),
+            GreyProfile::Unsupported(GreyReason::Unreadable)
+        );
         // A tag offset/size that overflows or runs past the end.
-        for (off, size) in [(u32::MAX, 16_u32), (144, u32::MAX), (u32::MAX, u32::MAX), (10_000, 4)] {
+        for (off, size) in [
+            (u32::MAX, 16_u32),
+            (144, u32::MAX),
+            (u32::MAX, u32::MAX),
+            (10_000, 4),
+        ] {
             let mut p = good.clone();
             p[136..140].copy_from_slice(&off.to_be_bytes());
             p[140..144].copy_from_slice(&size.to_be_bytes());
-            assert_eq!(classify(&p), GreyProfile::Unsupported(GreyReason::Unreadable), "{off} {size}");
+            assert_eq!(
+                classify(&p),
+                GreyProfile::Unsupported(GreyReason::Unreadable),
+                "{off} {size}"
+            );
         }
         // A curv count of 0xFFFFFFFF with 12 bytes of tag: refused as a
         // length, never allocated.

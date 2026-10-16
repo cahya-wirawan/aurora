@@ -138,9 +138,9 @@ mod fill;
 mod gradient_lookup_tests;
 #[cfg(test)]
 mod grayscale_adjust_tests;
-mod grey_profile;
 #[cfg(test)]
 mod grey_exposure_tests;
+mod grey_profile;
 mod lab;
 #[cfg(test)]
 mod mixer_selective_tests;

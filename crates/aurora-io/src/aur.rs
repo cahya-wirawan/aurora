@@ -5677,6 +5677,70 @@ mod tests {
         assert_eq!(replayed.adjustment(layer), Some(&edited));
     }
 
+    /// Task 112: a grey-profile Exposure layer (ordinal 16, the sliders and
+    /// the profile's table), an edit of its sliders and the history survive
+    /// a save and reopen (manifest and journal replay), with no manifest
+    /// version bump.
+    #[test]
+    fn round_trips_a_grey_profile_exposure_layer_and_its_history() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        if let Err(err) = history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            unreachable!("{err:?}");
+        }
+        let entries: Vec<u16> = (0..=255_u32)
+            .map(|i| {
+                let x = f64::from(i) / 255.0;
+                (x.powf(1.7) * 65535.0).round() as u16
+            })
+            .collect();
+        let (Ok(trc), Ok(first), Ok(second)) = (
+            aurora_core::GreyTrc::new(entries),
+            aurora_core::ExposureParams::new(1.5, 0.05, 1.2),
+            aurora_core::ExposureParams::new(-0.5, 0.0, 2.0),
+        ) else {
+            unreachable!("valid");
+        };
+        let initial = aurora_doc::Adjustment::ExposureTrc(aurora_core::ExposureTrcParams::new(
+            first,
+            trc.clone(),
+        ));
+        let edited =
+            aurora_doc::Adjustment::ExposureTrc(aurora_core::ExposureTrcParams::new(second, trc));
+        let layer =
+            match history.add_adjustment_layer_at(&mut layers, "Exposure 1", initial, None, 0) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+        if let Err(err) = history.set_adjustment(&mut layers, layer, edited.clone()) {
+            unreachable!("{err:?}");
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            &mut store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.into_inner()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let replayed = match document.history.replay() {
+            Ok(replayed) => replayed,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(document.layers.adjustment(layer), Some(&edited));
+        assert_eq!(replayed.adjustment(layer), Some(&edited));
+    }
+
     /// 0.204.0: a ranged Hue/Saturation adjustment layer, its edit and its history
     /// survive a save and reopen (manifest and journal replay), with no
     /// manifest version bump: the variant is appended after `Levels`.

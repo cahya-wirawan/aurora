@@ -40,7 +40,11 @@ fn error_against_merged(bytes: &[u8], plain: bool) -> ([f64; 3], [f64; 3]) {
     let mut ids = Vec::new();
     while let Some(id) = pending.pop() {
         pending.extend(document.layers.children(id).unwrap_or(&[]));
-        if let Some(p) = document.layers.adjustment(id).and_then(aurora_doc::Adjustment::exposure_trc) {
+        if let Some(p) = document
+            .layers
+            .adjustment(id)
+            .and_then(aurora_doc::Adjustment::exposure_trc)
+        {
             ids.push((id, p.exposure()));
         }
     }
@@ -62,8 +66,8 @@ fn error_against_merged(bytes: &[u8], plain: bool) -> ([f64; 3], [f64; 3]) {
 }
 
 /// Measured on the task's own build: the grey-profile model is within the
-/// 8-bit rounding noise of Photoshop's image (mean 0.33 in the Python model
-/// of the whole file), where the plain sRGB Exposure is 11 levels off.
+/// 8-bit rounding noise of Photoshop's image (mean 0.031, max 2), where the
+/// plain sRGB Exposure is 11.4 levels off.
 #[test]
 fn the_grayscale_fixture_matches_photoshop_through_its_grey_profile() {
     let Some(bytes) = fixture("adjustments/exposure_grayscale.psd") else {
@@ -74,9 +78,16 @@ fn the_grayscale_fixture_matches_photoshop_through_its_grey_profile() {
     println!("grey profile: max {max:?} mean {mean:.3?}");
     println!("plain sRGB:   max {plain_max:?} mean {plain_mean:.3?}");
     for c in 0..3 {
-        assert!(mean[c] < 2.0, "channel {c}: {mean:?}");
-        assert!(plain_mean[c] > 8.0, "the control must be clearly worse: {plain_mean:?}");
-        assert!(mean[c] * 4.0 < plain_mean[c]);
+        // Measured on this build: mean 0.031, max 2 (the plain sRGB model:
+        // mean 11.43, max 26).
+        assert!(
+            mean[c] < 0.1 && max[c] <= 3.0,
+            "channel {c}: {max:?} {mean:?}"
+        );
+        assert!(
+            plain_mean[c] > 8.0,
+            "the control must be clearly worse: {plain_mean:?}"
+        );
     }
 }
 
@@ -156,3 +167,39 @@ fn a_saved_psd_carries_a_plain_exposure_and_the_report_says_so() {
     assert_eq!((plain, trc), (4, 0));
 }
 
+/// The CPU-only rule: a grey-profile Exposure never qualifies for the GPU
+/// compositing path, and its CPU result is what `AdjustmentLut` computes.
+#[test]
+fn a_grey_profile_exposure_is_cpu_only_and_matches_its_op() {
+    let Some(bytes) = fixture("adjustments/exposure_grayscale.psd") else {
+        return;
+    };
+    let (_scratch, mut store) = real_tile_store();
+    let (document, _) = open_and_composite_psd(
+        &bytes,
+        &mut store,
+        (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+    );
+    let mut pending = document.layers.roots().to_vec();
+    let mut seen = 0;
+    while let Some(id) = pending.pop() {
+        pending.extend(document.layers.children(id).unwrap_or(&[]));
+        if let Some(adj) = document.layers.adjustment(id) {
+            seen += 1;
+            assert!(matches!(adj, aurora_doc::Adjustment::ExposureTrc(_)));
+            assert!(
+                !super::super::adjustment_layer_qualifies_for_gpu(&document.layers, id),
+                "no GPU port"
+            );
+            let lut = super::super::AdjustmentLut::of(adj);
+            let Some(p) = adj.exposure_trc() else {
+                unreachable!("grey-profile layer")
+            };
+            let op = aurora_filters::ExposureTrcOp::new(p);
+            for v in [0.0_f32, 0.2, 0.5, 0.8, 1.0] {
+                assert_eq!(lut.apply([v; 3]), op.apply([v; 3]));
+            }
+        }
+    }
+    assert_eq!(seen, 4);
+}
