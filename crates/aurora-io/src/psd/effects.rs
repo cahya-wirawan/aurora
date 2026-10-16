@@ -349,6 +349,7 @@ pub(super) fn map_effects(d: &Descriptor, global_angle: f32) -> Result<ReadEffec
                     opacity,
                     gradient,
                     dither: flag(e, b"Dthr", false)?,
+                    reference: None,
                 });
             }
             _ => unmodelled_gradients += u32::from(g.on()),

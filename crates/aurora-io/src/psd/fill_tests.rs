@@ -440,9 +440,9 @@ fn colour_and_opacity_ramps_clamp_sort_and_bend_at_the_midpoint() {
         ],
         vec![alpha_stop(100.0, 0), alpha_stop(0.0, 4096)],
     ));
-    assert_eq!(g.at_for_test(0.0).0, [0.0, 0.0, 1.0]);
-    assert_eq!(g.at_for_test(1.0).0, [1.0, 0.0, 0.0]);
-    let (mid, alpha) = g.at_for_test(0.5);
+    assert_eq!(g.at(0.0).0, [0.0, 0.0, 1.0]);
+    assert_eq!(g.at(1.0).0, [1.0, 0.0, 0.0]);
+    let (mid, alpha) = g.at(0.5);
     assert!((mid[0] - 0.5).abs() < 1e-6 && (mid[2] - 0.5).abs() < 1e-6, "{mid:?}");
     assert!((alpha - 0.5).abs() < 1e-6, "{alpha}");
     // A midpoint of 25 % puts the half-way colour a quarter along.
@@ -457,7 +457,7 @@ fn colour_and_opacity_ramps_clamp_sort_and_bend_at_the_midpoint() {
         ],
         vec![],
     ));
-    let (c, alpha) = g.at_for_test(0.25);
+    let (c, alpha) = g.at(0.25);
     assert!((c[0] - 0.5).abs() < 1e-5, "{c:?}");
     assert_eq!(alpha, 1.0, "no transparency stops means opaque");
 }

@@ -503,6 +503,32 @@ impl OuterGlow {
     }
 }
 
+/// The box an aligned gradient overlay is laid over when it is not the
+/// layer's own `bounds` (task 110): the layer's PSD record rectangle,
+/// kept as an offset of its top-left from the layer bounds' top-left, so
+/// it follows the layer when it moves. Aurora gives a shape layer the
+/// canvas's size where Photoshop's box is the shape's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReferenceBox {
+    pub dx: i64,
+    pub dy: i64,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ReferenceBox {
+    /// The box for a layer whose bounds are `bounds`.
+    #[must_use]
+    pub fn within(self, bounds: crate::Rect) -> crate::Rect {
+        crate::Rect {
+            x: bounds.x.saturating_add(self.dx),
+            y: bounds.y.saturating_add(self.dy),
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
 /// A gradient overlay (`GrFl`, task 110): a gradient drawn over the layer's
 /// interior in its own blend mode and opacity, above the colour overlays.
 ///
@@ -521,6 +547,8 @@ pub struct GradientOverlay {
     pub gradient: crate::GradientFill,
     /// `Dthr`, kept; not applied (the interior is `f16`).
     pub dither: bool,
+    /// The box the gradient spans; `None` is the layer's `bounds`.
+    pub reference: Option<ReferenceBox>,
 }
 
 /// How many effects of each kind Aurora does not model yet, counting
@@ -634,6 +662,16 @@ impl LayerEffects {
             g.gradient
                 .validate()
                 .map_err(|e| EffectsError::OutOfRange { field: e.field })?;
+            if let Some(r) = g.reference
+                && (r.width == 0
+                    || r.height == 0
+                    || r.dx.unsigned_abs() > crate::MAX_DOCUMENT_ORIGIN.unsigned_abs()
+                    || r.dy.unsigned_abs() > crate::MAX_DOCUMENT_ORIGIN.unsigned_abs())
+            {
+                return Err(EffectsError::OutOfRange {
+                    field: "gradient reference box",
+                });
+            }
             if !g.gradient.align {
                 return Err(EffectsError::OutOfRange {
                     field: "gradient alignment",

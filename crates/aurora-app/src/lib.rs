@@ -17680,7 +17680,9 @@ fn fold_layer_with_effects(
             height: 0,
         });
         for overlay in fx.gradient_overlays.iter().filter(|o| fx.shows(o.gate)) {
-            let frame = overlay.gradient.frame(bounds);
+            let frame = overlay
+                .gradient
+                .frame(overlay.reference.map_or(bounds, |r| r.within(bounds)));
             for run in &runs {
                 if let (Some(inside), Some(src)) =
                     (interior.get_mut(run.clone()), source.get_mut(run.clone()))
