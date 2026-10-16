@@ -229,6 +229,17 @@ fn a_shown_gradient_overlay_refuses_the_gpu_path_and_gates_hide_it() {
     set_gradients(&mut layers, id, vec![off]);
     assert!(!layer_renders_effects(&layers, id));
     assert!(document_qualifies_for_gpu_compositing(&layers));
+    // Hidden, it draws nothing even if the effect path is taken (a second
+    // shown overlay on the layer forces it).
+    let mut shown = grad_overlay(ramp_fill(0.0, [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]));
+    shown.opacity = 1.0;
+    let mut hidden = grad_overlay(ramp_fill(0.0, GBLACK, GBLACK));
+    hidden.gate.present = false;
+    set_gradients(&mut layers, id, vec![hidden, shown]);
+    near(
+        texel(&composite(&layers, &mut store), 5, 5),
+        [1.0, 0.0, 0.0, 1.0],
+    );
     let fx = aurora_core::LayerEffects {
         enabled: false,
         gradient_overlays: vec![grad_overlay(ramp_fill(0.0, GBLACK, GWHITE))],
