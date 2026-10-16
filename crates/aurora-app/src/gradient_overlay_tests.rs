@@ -253,7 +253,7 @@ fn a_shown_gradient_overlay_refuses_the_gpu_path_and_gates_hide_it() {
 /// Photoshop's merged images (levels) BEFORE task 110 -> AFTER:
 /// `fill_adjustments.psd` 54.38 -> 34.18, `effects/shape-fx2.psd`
 /// 41.39 -> 1.29, `layer_comps.psd` 9.63 -> 9.51,
-/// `effects/stroke-composite.psd` 13.98 -> 6.30, `layer_effects.psd`
+/// `effects/stroke-composite.psd` 13.98 -> 5.00 (6.30 before the clip-group clamp), `layer_effects.psd`
 /// 7.77 -> 6.75, `masks.psd` 0.164 -> 0.154. Bounds sit just above the
 /// measurement. `stroke-composite`'s max is not bounded: a clip group whose
 /// base carries effects adds each clipped layer's change to the
