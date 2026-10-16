@@ -967,8 +967,9 @@ fn note_text(note: Note, n: u64) -> String {
              glow's are not)."
         ),
         Note::OtherEffectsNotShown => format!(
-            "{n} other effect{s} (inner shadow, inner glow, bevel, satin, gradient or pattern \
-             overlay) {is}n't shown, and {} settings aren't kept.",
+            "{n} other effect{s} (inner shadow, inner glow, bevel, satin, pattern overlay, a \
+             gradient overlay Aurora can't draw -- a Noise gradient or one aligned to the \
+             document -- or any effect on a group) {is}n't shown, and {} settings aren't kept.",
             if one { "its" } else { "their" }
         ),
         Note::EffectsNotShown => format!(
@@ -3559,7 +3560,15 @@ fn note_unsupported_kept(
                 Note::OuterGlowsNotShown,
                 glows_undrawn as u64 + u64::from(read.glow_gradients),
             );
-            notes.add_n(Note::OtherEffectsNotShown, fx.shown_other());
+            notes.add_n(
+                Note::OtherEffectsNotShown,
+                fx.shown_other()
+                    + if overlays_drawn {
+                        0
+                    } else {
+                        fx.shown_gradient_overlays() as u64
+                    },
+            );
             if read.clamped {
                 notes.add(Note::EffectsClamped);
             }

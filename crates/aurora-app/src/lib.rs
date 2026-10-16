@@ -16643,6 +16643,7 @@ fn layer_renders_effects(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId
                 || fx.shown_drop_shadows() > 0
                 || fx.shown_color_strokes() > 0
                 || fx.shown_soft_glows() > 0
+                || fx.shown_gradient_overlays() > 0
         })
 }
 
@@ -17602,6 +17603,11 @@ fn fold_layer_with_effects(
                 && aurora_doc::BlendMode::from(overlay.blend_mode)
                     == aurora_doc::BlendMode::Dissolve
         })
+        && !fx.gradient_overlays.iter().any(|overlay| {
+            fx.shows(overlay.gate)
+                && aurora_doc::BlendMode::from(overlay.blend_mode)
+                    == aurora_doc::BlendMode::Dissolve
+        })
         && !strokes.iter().any(|(stroke, planes)| {
             planes.inside.is_some()
                 && aurora_doc::BlendMode::from(stroke.blend_mode) == aurora_doc::BlendMode::Dissolve
@@ -17657,6 +17663,43 @@ fn fold_layer_with_effects(
                     aurora_doc::BlendMode::from(overlay.blend_mode),
                     doc_origin,
                 );
+            }
+        }
+    }
+    // Step 2a (task 110): each shown gradient overlay, over the colour
+    // overlays (Photoshop stacks interior effects, bottom to top: colour
+    // overlay, gradient overlay, pattern overlay, stroke), evaluated per
+    // texel from the layer's bounds ([`gradient_overlay_texels`]), at its
+    // opacity in its own mode. Fill does not fade it; the shape (step 3)
+    // clips it.
+    if fx.shown_gradient_overlays() > 0 {
+        let bounds = layers.bounds(id).unwrap_or(aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        });
+        for overlay in fx.gradient_overlays.iter().filter(|o| fx.shows(o.gate)) {
+            let frame = overlay.gradient.frame(bounds);
+            for run in &runs {
+                if let (Some(inside), Some(src)) =
+                    (interior.get_mut(run.clone()), source.get_mut(run.clone()))
+                {
+                    gradient_overlay_texels(
+                        src,
+                        &overlay.gradient,
+                        &frame,
+                        run.start / aurora_tile::CHANNELS,
+                        doc_origin,
+                    );
+                    fold_texels_in_mode(
+                        inside,
+                        src,
+                        overlay.opacity,
+                        aurora_doc::BlendMode::from(overlay.blend_mode),
+                        doc_origin,
+                    );
+                }
             }
         }
     }
@@ -17730,6 +17773,30 @@ fn fold_layer_with_effects(
         }
     }
     true
+}
+
+/// Fills `texels` (straight RGBA, the samples of the tile's texels from
+/// `first_texel` on) with `gradient` evaluated at each texel's centre in
+/// document space: the colour at the position along the gradient and its
+/// transparency stop as the alpha (task 110).
+#[allow(clippy::cast_precision_loss)]
+fn gradient_overlay_texels(
+    texels: &mut [half::f16],
+    gradient: &aurora_core::GradientFill,
+    frame: &aurora_core::GradientFrame<'_>,
+    first_texel: usize,
+    doc_origin: (i64, i64),
+) {
+    let side = aurora_tile::TILE as usize;
+    for (n, texel) in texels.chunks_exact_mut(aurora_tile::CHANNELS).enumerate() {
+        let index = first_texel + n;
+        let x = doc_origin.0 as f64 + (index % side) as f64 + 0.5;
+        let y = doc_origin.1 as f64 + (index / side) as f64 + 0.5;
+        let (rgb, alpha) = gradient.at(frame.position(x, y));
+        for (channel, value) in texel.iter_mut().zip([rgb[0], rgb[1], rgb[2], alpha]) {
+            *channel = half::f16::from_f32(value);
+        }
+    }
 }
 
 /// The sample ranges of `shape`'s rows that hold any texel whose alpha is

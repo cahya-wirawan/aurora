@@ -70,7 +70,7 @@ use super::vector;
 pub(super) const MAX_FILL_BLOCK_BYTES: usize = 1 << 20;
 
 /// The most colour (and transparency) stops a gradient may hold.
-pub(super) const MAX_STOPS: usize = 256;
+pub(super) const MAX_STOPS: usize = aurora_core::MAX_GRADIENT_STOPS;
 
 /// Why a fill is not drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,36 +89,9 @@ pub(super) enum LeftOut {
     TooLarge,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Style {
-    Linear,
-    Radial,
-    Angle,
-    Reflected,
-    Diamond,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct Stop<T> {
-    /// `0..=1`.
-    pub pos: f32,
-    /// The midpoint towards the next stop, `0..=1` (`0.5` = even).
-    pub mid: f32,
-    pub value: T,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct Gradient {
-    pub colours: Vec<Stop<[f32; 3]>>,
-    pub alphas: Vec<Stop<f32>>,
-    pub style: Style,
-    pub angle: f64,
-    pub scale: f64,
-    pub reverse: bool,
-    pub align: bool,
-    /// Percent of the box width and height.
-    pub offset: (f64, f64),
-}
+pub(super) use aurora_core::gradient_fill::{
+    FillStop as Stop, GradientFill as Gradient, GradientStyle as Style,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Fill {
@@ -210,7 +183,7 @@ fn stops<T>(
     Ok(out)
 }
 
-fn gradient(d: &Descriptor) -> Result<Gradient, LeftOut> {
+pub(super) fn gradient(d: &Descriptor) -> Result<Gradient, LeftOut> {
     let grad = d
         .get(b"Grad")
         .and_then(Value::descriptor)
@@ -260,102 +233,6 @@ fn gradient(d: &Descriptor) -> Result<Gradient, LeftOut> {
         align: flag(d, b"Algn", true)?,
         offset,
     })
-}
-
-/// The value of a stop ramp at `t`: clamped outside the stops, linear
-/// between them, bent by the earlier stop's midpoint.
-fn ramp<T: Copy>(stops: &[Stop<T>], t: f32, lerp: impl Fn(T, T, f32) -> T) -> Option<T> {
-    let first = stops.first()?;
-    let last = stops.last()?;
-    if t <= first.pos {
-        return Some(first.value);
-    }
-    if t >= last.pos {
-        return Some(last.value);
-    }
-    for pair in stops.windows(2) {
-        let (a, b) = (pair.first()?, pair.get(1)?);
-        if t >= a.pos && t < b.pos {
-            let span = b.pos - a.pos;
-            let mut u = if span > 0.0 { (t - a.pos) / span } else { 1.0 };
-            let m = a.mid.clamp(0.001, 0.999);
-            if (m - 0.5).abs() > 1e-6 {
-                u = u.powf(0.5_f32.ln() / m.ln());
-            }
-            return Some(lerp(a.value, b.value, u));
-        }
-    }
-    Some(last.value)
-}
-
-impl Gradient {
-    /// The colour and opacity at `t` in `0..=1` (reverse already applied).
-    fn at(&self, t: f32) -> ([f32; 3], f32) {
-        let lerp3 = |a: [f32; 3], b: [f32; 3], u: f32| {
-            [
-                a[0] + (b[0] - a[0]) * u,
-                a[1] + (b[1] - a[1]) * u,
-                a[2] + (b[2] - a[2]) * u,
-            ]
-        };
-        let rgb = ramp(&self.colours, t, lerp3).unwrap_or([0.0; 3]);
-        let alpha = ramp(&self.alphas, t, |a, b, u| a + (b - a) * u).unwrap_or(1.0);
-        (rgb, alpha)
-    }
-
-    /// The geometry for reference box `b`, with the trigonometry done once.
-    pub(super) fn frame(&self, b: Rect) -> Frame<'_> {
-        let (w, h) = (f64::from(b.width), f64::from(b.height));
-        let a = self.angle.to_radians();
-        let (cos, sin) = (a.cos(), a.sin());
-        Frame {
-            gradient: self,
-            cx: b.x as f64 + w / 2.0 + self.offset.0 / 100.0 * w,
-            cy: b.y as f64 + h / 2.0 + self.offset.1 / 100.0 * h,
-            cos,
-            sin,
-            length: (self.scale * (w * cos.abs() + h * sin.abs())).max(1e-9),
-            radius: (self.scale * w.hypot(h) / 2.0).max(1e-9),
-            diamond: (self.scale * (w + h) / 2.0).max(1e-9),
-        }
-    }
-
-    /// The position `0..=1` along the gradient of document point `(x, y)`
-    /// for a reference box `b` (the tests' one-shot form of [`Frame`]).
-    #[cfg(test)]
-    pub(super) fn position(&self, x: f64, y: f64, b: Rect) -> f32 {
-        self.frame(b).position(x, y)
-    }
-}
-
-/// A gradient's per-box constants (centre, direction, lengths).
-pub(super) struct Frame<'a> {
-    gradient: &'a Gradient,
-    cx: f64,
-    cy: f64,
-    cos: f64,
-    sin: f64,
-    length: f64,
-    radius: f64,
-    diamond: f64,
-}
-
-impl Frame<'_> {
-    pub(super) fn position(&self, x: f64, y: f64) -> f32 {
-        let g = self.gradient;
-        let (dx, dy) = (x - self.cx, y - self.cy);
-        let along = dx * self.cos - dy * self.sin;
-        let across = dx * self.sin + dy * self.cos;
-        let t = match g.style {
-            Style::Linear => 0.5 + along / self.length,
-            Style::Reflected => along.abs() / (self.length / 2.0),
-            Style::Radial => dx.hypot(dy) / self.radius,
-            Style::Diamond => (along.abs() + across.abs()) / self.diamond,
-            Style::Angle => (dy.atan2(dx).to_degrees() + g.angle).rem_euclid(360.0) / 360.0,
-        };
-        let t = t.clamp(0.0, 1.0) as f32;
-        if g.reverse { 1.0 - t } else { t }
-    }
 }
 
 /// The reference box of a gradient: the path's bounds, else the canvas.
@@ -504,12 +381,4 @@ pub(super) fn parse_artboard(data: &[u8]) -> Result<Option<ArtboardBackground>, 
         },
         colour,
     }))
-}
-
-#[cfg(test)]
-impl Gradient {
-    /// [`Self::at`] for the tests.
-    pub(super) fn at_for_test(&self, t: f32) -> ([f32; 3], f32) {
-        self.at(t)
-    }
 }

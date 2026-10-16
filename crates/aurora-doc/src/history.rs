@@ -186,6 +186,39 @@ enum LayerOp {
         dx: i64,
         dy: i64,
     },
+    /// Replaces the gradient overlays of a layer's effects (task 110); the
+    /// layer must carry effects. Appended last: an Aurora older than this
+    /// build refuses a journal holding it (ADR 0009). Also the carrier for
+    /// the overlays `LayerEffects` holds in memory but cannot put on its
+    /// positional wire (`gradient_overlays` is `#[serde(skip)]`):
+    /// [`History::save_journal`] emits one after every `SetEffects` and
+    /// `Restore` that carries some.
+    SetGradientOverlays {
+        id: LayerId,
+        value: Vec<aurora_core::effects::GradientOverlay>,
+    },
+}
+
+/// Every `(layer, gradient overlays)` pair a journaled op carries in an
+/// effects value whose overlays would be lost on the wire.
+fn carried_gradient_overlays(
+    op: &LayerOp,
+) -> Vec<(LayerId, Vec<aurora_core::effects::GradientOverlay>)> {
+    match op {
+        LayerOp::Restore(subtree) => subtree
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                let fx = entry.effects.as_ref()?;
+                (!fx.gradient_overlays.is_empty()).then(|| (*id, fx.gradient_overlays.clone()))
+            })
+            .collect(),
+        LayerOp::SetEffects {
+            id,
+            value: Some(fx),
+        } if !fx.gradient_overlays.is_empty() => vec![(*id, fx.gradient_overlays.clone())],
+        _ => Vec::new(),
+    }
 }
 
 /// Every `(layer, smart object)` pair a journaled `Restore` carries in a
@@ -428,6 +461,19 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
             // offset and blur), so the whole composite is invalidated.
             Ok((LayerOp::SetEffects { id, value: old }, None))
         }
+        LayerOp::SetGradientOverlays { id, value } => {
+            let mut fx =
+                tree.effects(id)
+                    .cloned()
+                    .ok_or(DocError::InvalidEffects(
+                        aurora_core::effects::EffectsError::OutOfRange {
+                            field: "gradient overlays on a layer without effects",
+                        },
+                    ))?;
+            let old = std::mem::replace(&mut fx.gradient_overlays, value);
+            tree.set_effects(id, Some(fx))?;
+            Ok((LayerOp::SetGradientOverlays { id, value: old }, None))
+        }
         LayerOp::SetClipped { id, value } => {
             let old = tree.clipped(id);
             tree.set_clipped_flag(id, value)?;
@@ -598,6 +644,12 @@ fn describe(op: &LayerOp) -> String {
             Some(_) => format!("Changed layer effects on layer #{}", id.to_raw()),
             None => format!("Removed layer effects from layer #{}", id.to_raw()),
         },
+        LayerOp::SetGradientOverlays { id, value } => format!(
+            "Changed {} gradient overlay{} on layer #{}",
+            value.len(),
+            if value.len() == 1 { "" } else { "s" },
+            id.to_raw()
+        ),
         LayerOp::SetClipped { id, value } => {
             let verb = if *value {
                 "Clipped"
@@ -897,6 +949,14 @@ impl History {
                 wire.push(std::borrow::Cow::Owned(LayerOp::SetEffects {
                     id,
                     value: Some(value),
+                }));
+            }
+            // Gradient overlays (task 110) the same way, after the effects
+            // they belong to.
+            for (id, value) in carried_gradient_overlays(op) {
+                wire.push(std::borrow::Cow::Owned(LayerOp::SetGradientOverlays {
+                    id,
+                    value,
                 }));
             }
             // The clipping flag (0.201.0) the same way.

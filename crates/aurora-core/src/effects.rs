@@ -503,6 +503,26 @@ impl OuterGlow {
     }
 }
 
+/// A gradient overlay (`GrFl`, task 110): a gradient drawn over the layer's
+/// interior in its own blend mode and opacity, above the colour overlays.
+///
+/// **Not on the `.aur` effects wire**: [`LayerEffects`] is positional
+/// `postcard`, so these ride in the optional `layer-gradient-overlays`
+/// entry (and `LayerOp::SetGradientOverlays`) instead, and
+/// `LayerEffects::gradient_overlays` is `#[serde(skip)]`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GradientOverlay {
+    pub gate: EffectGate,
+    pub blend_mode: EffectBlendMode,
+    /// `0.0..=1.0`.
+    pub opacity: f32,
+    /// The gradient; its `align` is always on (an overlay aligned to the
+    /// document is not modelled and is counted in [`OtherEffects`]).
+    pub gradient: crate::GradientFill,
+    /// `Dthr`, kept; not applied (the interior is `f16`).
+    pub dither: bool,
+}
+
 /// How many effects of each kind Aurora does not model yet, counting
 /// only instances whose own `present` and `enab` are both on. Kept so a
 /// report can name them; their settings are not kept.
@@ -546,6 +566,10 @@ pub struct LayerEffects {
     pub strokes: Vec<Stroke>,
     pub outer_glows: Vec<OuterGlow>,
     pub other: OtherEffects,
+    /// Gradient overlays (task 110). `#[serde(skip)]`: see
+    /// [`GradientOverlay`].
+    #[serde(skip)]
+    pub gradient_overlays: Vec<GradientOverlay>,
 }
 
 impl Default for LayerEffects {
@@ -558,6 +582,7 @@ impl Default for LayerEffects {
             strokes: Vec::new(),
             outer_glows: Vec::new(),
             other: OtherEffects::default(),
+            gradient_overlays: Vec::new(),
         }
     }
 }
@@ -603,6 +628,18 @@ impl LayerEffects {
         count(&self.color_overlays, "colour overlay")?;
         count(&self.strokes, "stroke")?;
         count(&self.outer_glows, "outer glow")?;
+        count(&self.gradient_overlays, "gradient overlay")?;
+        for g in &self.gradient_overlays {
+            unit(g.opacity, "opacity")?;
+            g.gradient
+                .validate()
+                .map_err(|e| EffectsError::OutOfRange { field: e.field })?;
+            if !g.gradient.align {
+                return Err(EffectsError::OutOfRange {
+                    field: "gradient alignment",
+                });
+            }
+        }
         for s in &self.drop_shadows {
             color(s.color)?;
             unit(s.opacity, "opacity")?;
@@ -705,6 +742,16 @@ impl LayerEffects {
         self.shown_outer_glows() - self.shown_soft_glows()
     }
 
+    /// The gradient overlays Photoshop would draw and Aurora draws
+    /// (task 110).
+    #[must_use]
+    pub fn shown_gradient_overlays(&self) -> usize {
+        self.gradient_overlays
+            .iter()
+            .filter(|e| self.shows(e.gate))
+            .count()
+    }
+
     /// The not-yet-modelled effects Photoshop would draw.
     #[must_use]
     pub fn shown_other(&self) -> u64 {
@@ -719,6 +766,7 @@ impl LayerEffects {
             || self.shown_color_overlays() > 0
             || self.shown_strokes() > 0
             || self.shown_outer_glows() > 0
+            || self.shown_gradient_overlays() > 0
             || self.shown_other() > 0
     }
 
@@ -729,6 +777,7 @@ impl LayerEffects {
             && self.color_overlays.is_empty()
             && self.strokes.is_empty()
             && self.outer_glows.is_empty()
+            && self.gradient_overlays.is_empty()
             && self.other.total() == 0
     }
 }

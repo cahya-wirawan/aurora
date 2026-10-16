@@ -404,6 +404,91 @@ fn read_layer_effects<R: Read + Seek>(
     Ok(())
 }
 
+/// The optional entry carrying every layer's gradient overlays (task 110;
+/// `aurora_core::LayerEffects::gradient_overlays` is `#[serde(skip)]`
+/// because [`LAYER_EFFECTS_ENTRY`]'s payload is positional). Written only
+/// when some layer has gradient overlays, so every other save stays
+/// byte-identical (and an Aurora that predates it reads such a file with
+/// the overlays missing, except that its journal holds the appended
+/// `SetGradientOverlays` op, which it refuses). **Versioned, and a newer
+/// version refuses the file** like [`LAYER_EFFECTS_ENTRY`]. Each pair
+/// names a layer that [`LAYER_EFFECTS_ENTRY`] already gave effects.
+const LAYER_GRADIENT_OVERLAYS_ENTRY: &str = "layer-gradient-overlays";
+
+/// [`LAYER_GRADIENT_OVERLAYS_ENTRY`]'s own schema version.
+const LAYER_GRADIENT_OVERLAYS_VERSION: u32 = 1;
+
+/// [`LAYER_GRADIENT_OVERLAYS_ENTRY`]'s payload: version first (frozen),
+/// then one `(raw layer id, overlays)` pair per layer with some.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LayerGradientOverlaysWire {
+    version: u32,
+    overlays: Vec<(u64, Vec<aurora_core::effects::GradientOverlay>)>,
+}
+
+fn layer_gradient_overlay_pairs(
+    layers: &LayerTree,
+) -> Vec<(u64, Vec<aurora_core::effects::GradientOverlay>)> {
+    layer_ids(layers)
+        .into_iter()
+        .filter_map(|id| {
+            let overlays = &layers.effects(id)?.gradient_overlays;
+            (!overlays.is_empty()).then(|| (id.to_raw(), overlays.clone()))
+        })
+        .collect()
+}
+
+/// Reads [`LAYER_GRADIENT_OVERLAYS_ENTRY`] if present and applies it.
+///
+/// # Errors
+///
+/// [`IoError::ManifestDeserialization`] for an unknown version, bytes that
+/// do not decode, a pair naming a layer without effects, or overlays that
+/// fail validation (`LayerTree::set_effects`).
+fn read_layer_gradient_overlays<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    layers: &mut LayerTree,
+) -> Result<(), IoError> {
+    let bytes = match zip.by_name(LAYER_GRADIENT_OVERLAYS_ENTRY) {
+        Ok(file) => read_capped(
+            file,
+            LAYER_GRADIENT_OVERLAYS_ENTRY,
+            MAX_LAYER_EFFECTS_BYTES,
+        )?,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let (prefix, _rest) = postcard::take_from_bytes::<MaskDensityPrefix>(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    if prefix.version != LAYER_GRADIENT_OVERLAYS_VERSION {
+        let cause = if prefix.version > LAYER_GRADIENT_OVERLAYS_VERSION {
+            "the file was saved by a newer Aurora"
+        } else {
+            "the entry is damaged or of an unknown kind"
+        };
+        return Err(IoError::ManifestDeserialization(format!(
+            "unsupported layer-gradient-overlays version {} (this build understands version \
+             {LAYER_GRADIENT_OVERLAYS_VERSION}); {cause}",
+            prefix.version
+        )));
+    }
+    let wire: LayerGradientOverlaysWire = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    for (raw, overlays) in wire.overlays {
+        let id = aurora_doc::LayerId::from_raw(raw);
+        let mut effects = layers.effects(id).cloned().ok_or_else(|| {
+            IoError::ManifestDeserialization(
+                "gradient overlays on a layer without effects".to_string(),
+            )
+        })?;
+        effects.gradient_overlays = overlays;
+        layers
+            .set_effects(id, Some(effects))
+            .map_err(|err| IoError::ManifestDeserialization(format!("gradient overlays: {err}")))?;
+    }
+    Ok(())
+}
+
 /// The optional entry carrying which layers are clipped to the layer
 /// beneath them (0.201.0): `LayerEntry::clipped` is `#[serde(skip)]` in the
 /// positional manifest, like the effects. Written only when some layer is
@@ -1797,6 +1882,9 @@ struct DocumentEntries {
     mask_densities: Option<Vec<u8>>,
     /// [`LAYER_EFFECTS_ENTRY`], when some layer has effects (0.180.0).
     layer_effects: Option<Vec<u8>>,
+    /// [`LAYER_GRADIENT_OVERLAYS_ENTRY`], when some layer has gradient
+    /// overlays (task 110).
+    layer_gradient_overlays: Option<Vec<u8>>,
     /// [`LAYER_CLIPPING_ENTRY`], when some layer is clipped (0.201.0).
     layer_clipping: Option<Vec<u8>>,
     /// [`IMPORT_LOSSES_ENTRY`], when the document has any (0.177.0).
@@ -1857,6 +1945,19 @@ impl DocumentEntries {
                     .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
             )
         };
+        let overlays = layer_gradient_overlay_pairs(layers);
+        let layer_gradient_overlays = if overlays.is_empty() {
+            None
+        } else {
+            let wire = LayerGradientOverlaysWire {
+                version: LAYER_GRADIENT_OVERLAYS_VERSION,
+                overlays,
+            };
+            Some(
+                postcard::to_allocvec(&wire)
+                    .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
+            )
+        };
         let clipped = layer_clipping_ids(layers);
         let layer_clipping = if clipped.is_empty() {
             None
@@ -1875,6 +1976,7 @@ impl DocumentEntries {
             history,
             mask_densities,
             layer_effects,
+            layer_gradient_overlays,
             layer_clipping,
             import_losses: None,
             selection: None,
@@ -1901,6 +2003,10 @@ impl DocumentEntries {
         }
         if let Some(bytes) = &self.layer_effects {
             zip.start_file(LAYER_EFFECTS_ENTRY, deflated)?;
+            zip.write_all(bytes)?;
+        }
+        if let Some(bytes) = &self.layer_gradient_overlays {
+            zip.start_file(LAYER_GRADIENT_OVERLAYS_ENTRY, deflated)?;
             zip.write_all(bytes)?;
         }
         if let Some(bytes) = &self.layer_clipping {
@@ -2342,6 +2448,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     let mut layers = manifest.layers;
     read_mask_densities(&mut zip, &mut layers)?;
     read_layer_effects(&mut zip, &mut layers)?;
+    read_layer_gradient_overlays(&mut zip, &mut layers)?;
     read_layer_clipping(&mut zip, &mut layers)?;
     read_smart_objects(&mut zip, &mut layers)?;
 
