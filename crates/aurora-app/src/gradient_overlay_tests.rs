@@ -235,7 +235,7 @@ fn a_shown_gradient_overlay_refuses_the_gpu_path_and_gates_hide_it() {
     shown.opacity = 1.0;
     let mut hidden = grad_overlay(ramp_fill(0.0, GBLACK, GBLACK));
     hidden.gate.present = false;
-    set_gradients(&mut layers, id, vec![hidden, shown]);
+    set_gradients(&mut layers, id, vec![shown, hidden]);
     near(
         texel(&composite(&layers, &mut store), 5, 5),
         [1.0, 0.0, 0.0, 1.0],
