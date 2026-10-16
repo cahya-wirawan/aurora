@@ -858,7 +858,19 @@ fn a_fresh_write_has_the_old_envelope_field_for_field() {
         for (a, b) in o.iter().zip(&n) {
             let label = format!("{name}/{}", String::from_utf8_lossy(&a.name));
             assert_eq!(a.name, b.name, "{label}");
-            assert_eq!(a.version_made, b.version_made, "{label} version made by");
+            // The high byte of "version made by" names the host system the
+            // writer ran on (3 = Unix, 0 = DOS/Windows) and the external
+            // attributes carry the Unix mode only there, so those two are
+            // compared on Unix and the spec version (low byte) everywhere.
+            assert_eq!(
+                a.version_made & 0xff,
+                b.version_made & 0xff,
+                "{label} version made by (spec version)"
+            );
+            if cfg!(unix) {
+                assert_eq!(a.version_made, b.version_made, "{label} version made by");
+                assert_eq!(a.external, b.external, "{label} permissions");
+            }
             assert_eq!(a.version_needed, b.version_needed, "{label} version needed");
             assert_eq!(a.flags, b.flags, "{label} flags");
             assert_eq!(a.method, b.method, "{label} method");
@@ -866,7 +878,6 @@ fn a_fresh_write_has_the_old_envelope_field_for_field() {
             assert_eq!(a.crc, b.crc, "{label} crc");
             assert_eq!(a.usize, b.usize, "{label} size");
             assert_eq!((a.disk, a.internal), (b.disk, b.internal), "{label}");
-            assert_eq!(a.external, b.external, "{label} permissions");
             assert_eq!(a.extra, b.extra, "{label} extra fields");
             assert_eq!(a.comment_len, b.comment_len, "{label}");
         }
