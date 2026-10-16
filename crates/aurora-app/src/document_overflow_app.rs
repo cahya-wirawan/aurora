@@ -36,9 +36,8 @@ impl App {
         let scales = &self.scales;
         let mut engine = self.text_engine.as_mut();
         #[allow(clippy::cast_precision_loss)]
-        let estimate = |text: &str| {
-            text.chars().count() as f32 * scales.typography.size.md as f32 * 0.6
-        };
+        let estimate =
+            |text: &str| text.chars().count() as f32 * scales.typography.size.md as f32 * 0.6;
         let widest = labels
             .iter()
             .map(|label| {

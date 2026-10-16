@@ -2473,4 +2473,173 @@ mod tests {
         }
         assert_structure_is_sound(&tree, bar);
     }
+
+    // ---- 0.260.0: the shown window and the width limits ----
+
+    fn bar_of(n: usize) -> (WidgetTree<WidgetKind>, WidgetId) {
+        let scales = test_scales();
+        let (mut tree, root) = new_tree(sized_root());
+        let names: Vec<String> = (0..n).map(|i| format!("t{i}")).collect();
+        let bar = match insert_tab_bar(&mut tree, root, &scales, "Bar", names, 0) {
+            Ok(bar) => bar,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        (tree, bar)
+    }
+
+    fn set_root_width(tree: &mut WidgetTree<WidgetKind>, width: f32) {
+        let root = tree.root();
+        let mut style = tree.style(root).cloned().unwrap_or_default();
+        style.size.width = length(width);
+        let _ = tree.set_style(root, style);
+    }
+
+    fn hidden(tree: &WidgetTree<WidgetKind>, tab: WidgetId) -> (bool, bool) {
+        (
+            tree.style(tab)
+                .is_some_and(|s| s.display == taffy::Display::None),
+            tree.accessibility(tab)
+                .is_some_and(accesskit::Node::is_hidden),
+        )
+    }
+
+    #[test]
+    fn a_window_hides_the_tabs_outside_it_in_layout_and_for_assistive_technology() {
+        let (mut tree, bar) = bar_of(5);
+        assert_eq!(
+            super::set_tab_window(&mut tree, bar, Some((1, 3))).ok(),
+            Some(true)
+        );
+        assert_eq!(
+            super::set_tab_window(&mut tree, bar, Some((1, 3))).ok(),
+            Some(false)
+        );
+        let tabs = tab_bar_state(&tree, bar)
+            .map(|s| s.tabs().to_vec())
+            .unwrap_or_default();
+        for (index, &tab) in tabs.iter().enumerate() {
+            let outside = !(1..3).contains(&index);
+            assert_eq!(hidden(&tree, tab), (outside, outside), "tab {index}");
+            // Positions in the set stay the documents' own.
+            let node = tree.accessibility(tab);
+            assert_eq!(
+                node.and_then(accesskit::Node::position_in_set),
+                Some(index + 1)
+            );
+            assert_eq!(node.and_then(accesskit::Node::size_of_set), Some(5));
+        }
+        assert_eq!(super::set_tab_window(&mut tree, bar, None).ok(), Some(true));
+        for &tab in &tabs {
+            assert_eq!(hidden(&tree, tab), (false, false));
+        }
+    }
+
+    #[test]
+    fn a_bad_window_is_refused_and_a_shrinking_label_list_clamps_it() {
+        let (mut tree, bar) = bar_of(5);
+        for bad in [(2, 2), (3, 2), (0, 6), (5, 6)] {
+            assert!(
+                super::set_tab_window(&mut tree, bar, Some(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(tab_bar_state(&tree, bar).is_ok_and(|s| s.window().is_none()));
+        let _ = super::set_tab_window(&mut tree, bar, Some((2, 5)));
+        let labels: Vec<String> = (0..4).map(|i| format!("t{i}")).collect();
+        let _ = set_tab_labels(&mut tree, bar, labels, 0);
+        assert!(tab_bar_state(&tree, bar).is_ok_and(|s| s.window() == Some((2, 4))));
+        let _ = set_tab_labels(&mut tree, bar, vec!["only".to_owned()], 0);
+        assert!(tab_bar_state(&tree, bar).is_ok_and(|s| s.window().is_none()));
+        // Growing again shows the new tabs (no stale window).
+        let labels: Vec<String> = (0..3).map(|i| format!("n{i}")).collect();
+        let _ = set_tab_labels(&mut tree, bar, labels, 2);
+        let tabs = tab_bar_state(&tree, bar)
+            .map(|s| s.tabs().to_vec())
+            .unwrap_or_default();
+        assert!(tabs.iter().all(|&t| hidden(&tree, t) == (false, false)));
+    }
+
+    #[test]
+    fn a_hidden_flag_overwritten_from_outside_or_a_rebuild_is_repaired() {
+        let (mut tree, bar) = bar_of(4);
+        let _ = super::set_tab_window(&mut tree, bar, Some((0, 2)));
+        let tabs = tab_bar_state(&tree, bar)
+            .map(|s| s.tabs().to_vec())
+            .unwrap_or_default();
+        let Some(&third) = tabs.get(2) else {
+            unreachable!("four tabs")
+        };
+        let mut node = tree
+            .accessibility(third)
+            .cloned()
+            .unwrap_or_else(|| accesskit::Node::new(Role::Tab));
+        node.clear_hidden();
+        let _ = tree.set_accessibility(third, node);
+        let mut style = tree.style(third).cloned().unwrap_or_default();
+        style.display = taffy::Display::Flex;
+        let _ = tree.set_style(third, style);
+        let _ = set_tab_bar_disabled(&mut tree, bar, false);
+        assert_eq!(hidden(&tree, third), (true, true));
+        // A rebuild (a tab removed from outside) keeps the window.
+        if let Some(&last) = tabs.last() {
+            let _ = tree.remove(last);
+        }
+        let _ = set_tab_bar_disabled(&mut tree, bar, false);
+        let rebuilt = tab_bar_state(&tree, bar)
+            .map(|s| s.tabs().to_vec())
+            .unwrap_or_default();
+        for (index, &tab) in rebuilt.iter().enumerate() {
+            let outside = index >= 2;
+            assert_eq!(
+                hidden(&tree, tab),
+                (outside, outside),
+                "rebuilt tab {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn width_limits_floor_and_cap_every_tab_and_bad_limits_are_refused() {
+        let (mut tree, bar) = bar_of(3);
+        for bad in [
+            (0.0, 10.0),
+            (-1.0, 10.0),
+            (f32::NAN, 10.0),
+            (10.0, f32::INFINITY),
+        ] {
+            assert!(super::set_tab_width_limits(&mut tree, bar, Some(bad)).is_err());
+        }
+        assert_eq!(
+            super::set_tab_width_limits(&mut tree, bar, Some((100.0, 180.0))).ok(),
+            Some(true)
+        );
+        assert_eq!(
+            super::set_tab_width_limits(&mut tree, bar, Some((100.0, 180.0))).ok(),
+            Some(false)
+        );
+        set_root_width(&mut tree, 2000.0);
+        tree.compute_layout(2000.0, 200.0);
+        let tabs = tab_bar_state(&tree, bar)
+            .map(|s| s.tabs().to_vec())
+            .unwrap_or_default();
+        for &tab in &tabs {
+            assert_eq!(tree.bounds(tab).map(|b| b.width), Some(180), "capped");
+        }
+        set_root_width(&mut tree, 300.0);
+        tree.compute_layout(300.0, 200.0);
+        for &tab in &tabs {
+            assert!(tree.bounds(tab).is_some_and(|b| b.width >= 100), "floored");
+        }
+        // A ceiling below the floor is raised to it.
+        let _ = super::set_tab_width_limits(&mut tree, bar, Some((100.0, 50.0)));
+        set_root_width(&mut tree, 2000.0);
+        tree.compute_layout(2000.0, 200.0);
+        for &tab in &tabs {
+            assert_eq!(tree.bounds(tab).map(|b| b.width), Some(100));
+        }
+        assert_eq!(
+            super::set_tab_width_limits(&mut tree, bar, None).ok(),
+            Some(true)
+        );
+    }
 }

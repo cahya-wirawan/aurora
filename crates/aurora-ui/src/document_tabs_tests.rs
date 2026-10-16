@@ -135,7 +135,11 @@ fn the_window_always_holds_the_selected_tab_and_moves_by_the_least() {
                         assert_eq!((start, end), (0, count));
                         continue;
                     }
-                    assert_eq!(end - start, cap, "{count} {capacity} {selected} {previous:?}");
+                    assert_eq!(
+                        end - start,
+                        cap,
+                        "{count} {capacity} {selected} {previous:?}"
+                    );
                     assert!(end <= count);
                     assert!(
                         (start..end).contains(&selected),
@@ -213,7 +217,10 @@ fn every_count_and_width_keeps_visible_tabs_readable_inside_the_strip_with_the_a
                         assert!(w as f32 >= min - 1.0, "{case}: tab {index} is {w} wide");
                         assert!(w as f32 <= max + 1.0, "{case}: tab {index} is {w} wide");
                         assert!(x >= bx, "{case}: tab {index} starts left of the strip");
-                        assert!(x + w <= bx + bw + 1, "{case}: tab {index} ends past the strip");
+                        assert!(
+                            x + w <= bx + bw + 1,
+                            "{case}: tab {index} ends past the strip"
+                        );
                     } else {
                         assert!(node_hidden, "{case}: hidden tab {index} is announced");
                         assert_eq!(w, 0, "{case}: hidden tab {index} has width");
@@ -344,7 +351,10 @@ fn a_strip_that_was_never_laid_out_or_has_no_width_is_left_alone() {
     let mut ws = build_workspace(&scales);
     show(&mut ws, 30, 5);
     // No layout: width 0.
-    assert!(matches!(sync_document_tab_window(&mut ws, &scales), Ok(false)));
+    assert!(matches!(
+        sync_document_tab_window(&mut ws, &scales),
+        Ok(false)
+    ));
     assert_eq!(shown_indices(&ws).len(), 30);
     assert!(!overflow_shown(&ws));
     // A window of no width at all must not panic either.
@@ -371,7 +381,10 @@ fn layout_settles_in_two_passes_and_the_window_is_stable_afterwards() {
     let passes = lay_out(&mut ws, 800.0);
     assert!(passes <= 3, "{passes}");
     let settled = shown_indices(&ws);
-    assert!(matches!(sync_document_tab_window(&mut ws, &scales), Ok(false)));
+    assert!(matches!(
+        sync_document_tab_window(&mut ws, &scales),
+        Ok(false)
+    ));
     lay_out(&mut ws, 800.0);
     assert_eq!(shown_indices(&ws), settled);
 }

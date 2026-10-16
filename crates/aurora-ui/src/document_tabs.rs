@@ -91,7 +91,10 @@ pub fn insert_document_tabs(
     let _ = widgets::set_tab_width_limits(
         tree,
         bar,
-        Some((document_tab_min_width(scales), document_tab_max_width(scales))),
+        Some((
+            document_tab_min_width(scales),
+            document_tab_max_width(scales),
+        )),
     )?;
     let overflow = widgets::insert_icon_button(
         tree,

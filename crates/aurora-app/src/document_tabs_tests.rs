@@ -3529,3 +3529,358 @@ fn no_per_turn_app_hook_leaves_quick_mask_unconditionally() {
     let calls = source.matches("self.leave_quick_mask(").count();
     assert_eq!(calls, 2, "toggle_quick_mask and finish_close only");
 }
+
+// -- 0.260.0: the strip's window of tabs and its overflow menu --
+
+use crate::document_overflow::{OverflowAction, OverflowState};
+
+/// A rig holding `count` documents named "doc N", the last one active,
+/// and the temp dirs that keep their stores alive.
+fn many(count: usize) -> (Rig, Vec<tempfile::TempDir>) {
+    let mut dirs = Vec::new();
+    let mut rig: Option<Rig> = None;
+    for n in 0..count {
+        let dir = tempdir();
+        let (doc, _) = session(&format!("doc {n}"), 1, [0.5, 0.5, 0.5, 1.0], &dir);
+        dirs.push(dir);
+        match rig.as_mut() {
+            None => rig = Some(Rig::new(doc)),
+            Some(rig) => {
+                let _ = rig.open(doc);
+            }
+        }
+    }
+    match rig {
+        Some(rig) => (rig, dirs),
+        None => unreachable!("at least one document"),
+    }
+}
+
+/// The production layout seam at a physical window size and scale.
+fn lay_out(rig: &mut Rig, physical: (u32, u32), scale: f64) {
+    let (w, h) = crate::logical_size(physical, scale);
+    crate::layout_workspace(&mut rig.workspace, None, &rig.scales, scale, w, h);
+}
+
+fn resync(rig: &mut Rig) {
+    let _ = document_tabs::sync_document_tab_bar(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &mut rig.shelf,
+        &rig.doc,
+    );
+}
+
+fn shown_tabs(rig: &Rig) -> Vec<usize> {
+    match aurora_widgets::widgets::tab_bar_state(&rig.workspace.tree, rig.workspace.document_tabs) {
+        Ok(state) => (0..state.labels().len())
+            .filter(|&i| state.is_tab_shown(i))
+            .collect(),
+        Err(err) => unreachable!("{err:?}"),
+    }
+}
+
+fn active_index(rig: &Rig) -> usize {
+    rig.shelf
+        .tab_order(&rig.doc)
+        .iter()
+        .position(|&id| id == rig.doc.id)
+        .unwrap_or(usize::MAX)
+}
+
+fn overflow_visible(rig: &Rig) -> bool {
+    rig.workspace
+        .tree
+        .style(rig.workspace.document_overflow)
+        .is_some_and(|style| style.display != taffy::Display::None)
+}
+
+const SIZES: [((u32, u32), f64); 5] = [
+    ((1274, 800), 1.0),
+    ((800, 700), 1.0),
+    ((640, 600), 1.0),
+    ((2548, 1600), 2.0),
+    ((1280, 1200), 2.0),
+];
+
+/// Every count and size: only tabs inside the strip are shown, each at
+/// least the token floor wide; the overflow button is there exactly when
+/// some tabs are not; the active tab is shown after Ctrl+Tab through all
+/// of them, a close of the active one and a new document.
+#[test]
+fn the_window_keeps_the_active_tab_on_screen_through_switches_closes_and_opens() {
+    let min =
+        aurora_ui::document_tab_min_width(&load_scales().unwrap_or_else(|e| unreachable!("{e}")));
+    for count in [1_usize, 3, 12, 30] {
+        for (physical, scale) in SIZES {
+            let (mut rig, _dirs) = many(count);
+            lay_out(&mut rig, physical, scale);
+            let (window_w, _) = crate::logical_size(physical, scale);
+            let case = format!("n={count} {physical:?}@{scale}");
+            for step in 0..=count {
+                let case = format!("{case} step={step}");
+                resync(&mut rig);
+                lay_out(&mut rig, physical, scale);
+                let active = active_index(&rig);
+                let shown = shown_tabs(&rig);
+                assert!(shown.contains(&active), "{case}: active {active} hidden");
+                let bar = rig.workspace.document_tabs;
+                let Some(b) = rig.workspace.tree.bounds(bar) else {
+                    unreachable!("laid out")
+                };
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    assert!(
+                        (b.x + i64::from(b.width)) as f32 <= window_w + 1.0,
+                        "{case}"
+                    );
+                }
+                let tabs = strip(&rig).2;
+                for &i in &shown {
+                    let Some(r) = tabs.get(i).and_then(|&t| rig.workspace.tree.bounds(t)) else {
+                        unreachable!("tab {i}")
+                    };
+                    #[allow(clippy::cast_precision_loss)]
+                    {
+                        assert!(r.width as f32 >= min - 1.0 || count == 1, "{case} tab {i}");
+                    }
+                    assert!(
+                        r.x >= b.x && r.x + i64::from(r.width) <= b.x + i64::from(b.width) + 1
+                            || count == 1,
+                        "{case}: tab {i} outside the strip"
+                    );
+                }
+                assert_eq!(overflow_visible(&rig), shown.len() < count, "{case}");
+                if let Some(next) = rig.shelf.cycled(&rig.doc, true) {
+                    assert_eq!(rig.switch(next), SwitchOutcome::Switched);
+                }
+            }
+            if count > 1 {
+                // Close the active document: the neighbour takes over.
+                let active = rig.doc.id;
+                let effect = close::begin_close(&mut rig.cx(None), active);
+                assert!(matches!(effect, CloseStep::Close(_)), "{case}");
+                if let CloseStep::Close(id) = effect {
+                    let _ = close::close_document(&mut rig.cx(None), id, None);
+                }
+                resync(&mut rig);
+                lay_out(&mut rig, physical, scale);
+                assert!(
+                    shown_tabs(&rig).contains(&active_index(&rig)),
+                    "{case}: after close"
+                );
+            }
+            // A new document is appended and active.
+            let dir = tempdir();
+            let (doc, _) = session("fresh", 1, [1.0, 0.0, 0.0, 1.0], &dir);
+            let _ = rig.open(doc);
+            resync(&mut rig);
+            lay_out(&mut rig, physical, scale);
+            assert!(
+                shown_tabs(&rig).contains(&active_index(&rig)),
+                "{case}: after open"
+            );
+        }
+    }
+}
+
+/// 100 documents at the narrowest size: nothing panics, the active tab is
+/// shown, the button's description counts the tabs left out.
+#[test]
+fn a_hundred_documents_still_show_the_active_tab_and_count_the_rest() {
+    let (mut rig, _dirs) = many(100);
+    for (physical, scale) in SIZES {
+        lay_out(&mut rig, physical, scale);
+        let shown = shown_tabs(&rig);
+        assert!(shown.contains(&active_index(&rig)));
+        assert!(overflow_visible(&rig));
+        let description = rig
+            .workspace
+            .tree
+            .accessibility(rig.workspace.document_overflow)
+            .and_then(|node| node.description().map(str::to_owned));
+        assert_eq!(description, Some(format!("{} more", 100 - shown.len())));
+    }
+}
+
+fn open_overflow(rig: &mut Rig, state: &mut OverflowState) -> bool {
+    state.open(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &rig.scales,
+        &rig.shelf,
+        &rig.doc,
+        150.0,
+        false,
+    )
+}
+
+/// The overflow menu lists every document in tab order; choosing a row
+/// switches to that document and its tab is then shown; the strip's close
+/// button on a visible tab names that document, not a window slot.
+#[test]
+fn the_overflow_menu_lists_all_documents_and_choosing_one_switches_and_shows_its_tab() {
+    let (mut rig, _dirs) = many(30);
+    lay_out(&mut rig, (1274, 800), 1.0);
+    let mut state = OverflowState::default();
+    assert!(open_overflow(&mut rig, &mut state));
+    let Some(open) = state.open.clone() else {
+        unreachable!("open")
+    };
+    assert_eq!(open.documents, rig.shelf.tab_order(&rig.doc));
+    assert_eq!(open.documents.len(), 30);
+    let Ok(menu) = aurora_widgets::widgets::menu_state(&rig.workspace.tree, open.menu) else {
+        unreachable!("a menu")
+    };
+    assert_eq!(menu.items().len(), 30);
+    assert_eq!(
+        menu.items().first().map(|i| i.label.as_str()),
+        Some("doc 0")
+    );
+    assert_eq!(
+        menu.items().get(29).map(|i| i.label.as_str()),
+        Some("doc 29")
+    );
+    // Routing: the button, the popup and its rows are the menu owner's.
+    let overflow = rig.workspace.document_overflow;
+    for id in std::iter::once(overflow)
+        .chain(std::iter::once(open.menu))
+        .chain(menu.item_ids().iter().copied())
+    {
+        assert_eq!(
+            crate::widget_owner(&rig.workspace.tree, None, None, None, id),
+            Some(crate::WidgetOwner::MenuBar)
+        );
+    }
+    // Choose row 2 (hidden: the window is at the end).
+    assert!(!shown_tabs(&rig).contains(&2));
+    let outcome =
+        aurora_widgets::PointerOutcome::Action(aurora_widgets::ActionOutcome::MenuActivated {
+            menu: open.menu,
+            index: 2,
+        });
+    // The toolkit removes the popup on activation.
+    if let Err(err) = aurora_widgets::widgets::close_menu(&mut rig.workspace.tree, open.menu) {
+        unreachable!("{err:?}");
+    }
+    let action = state.action_for(&mut rig.workspace, &mut rig.focus, &outcome);
+    let Some(&target) = open.documents.get(2) else {
+        unreachable!("30 documents")
+    };
+    assert_eq!(action, OverflowAction::Switch(target));
+    assert!(state.open.is_none());
+    assert_eq!(rig.switch(target), SwitchOutcome::Switched);
+    lay_out(&mut rig, (1274, 800), 1.0);
+    assert_eq!(active_index(&rig), 2);
+    assert!(shown_tabs(&rig).contains(&2));
+    // Close "×" of every visible tab names its own document.
+    let bar = rig.workspace.document_tabs;
+    for index in shown_tabs(&rig) {
+        let Some(button) =
+            aurora_widgets::widgets::tab_close_button(&rig.workspace.tree, bar, index)
+        else {
+            unreachable!("closable")
+        };
+        let Some(b) = rig.workspace.tree.bounds(button) else {
+            unreachable!("laid out")
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let point = (
+            b.x as f32 + b.width as f32 / 2.0,
+            b.y as f32 + b.height as f32 / 2.0,
+        );
+        let hit = aurora_ui::document_tab_close_at(&rig.workspace.tree, bar, point);
+        assert_eq!(hit, Some(index));
+        assert_eq!(
+            close::tab_document(&rig.shelf, &rig.doc, index),
+            rig.shelf.tab_order(&rig.doc).get(index).copied()
+        );
+    }
+}
+
+/// Toggle, cancel, light dismiss, modal and a changed document set all
+/// close the menu; nothing is left stale.
+#[test]
+fn the_overflow_menu_closes_on_cancel_dismiss_modal_and_a_changed_document_set() {
+    let (mut rig, _dirs) = many(30);
+    lay_out(&mut rig, (1274, 800), 1.0);
+    let overflow = rig.workspace.document_overflow;
+    let mut state = OverflowState::default();
+    // The button toggles.
+    let press =
+        aurora_widgets::PointerOutcome::Action(aurora_widgets::ActionOutcome::Activated(overflow));
+    assert_eq!(
+        state.action_for(&mut rig.workspace, &mut rig.focus, &press),
+        OverflowAction::Toggle
+    );
+    // No button shown (few documents): no menu.
+    let (mut few, _d) = many(2);
+    lay_out(&mut few, (1274, 800), 1.0);
+    let mut none = OverflowState::default();
+    assert!(!open_overflow(&mut few, &mut none));
+    // Escape.
+    assert!(open_overflow(&mut rig, &mut state));
+    let Some(menu) = state.open.as_ref().map(|o| o.menu) else {
+        unreachable!("open")
+    };
+    let _ = aurora_widgets::widgets::close_menu(&mut rig.workspace.tree, menu);
+    let cancelled = aurora_widgets::PointerOutcome::MenuCancelled { menu };
+    assert_eq!(
+        state.action_for(&mut rig.workspace, &mut rig.focus, &cancelled),
+        OverflowAction::None
+    );
+    assert!(state.open.is_none());
+    assert_eq!(rig.focus.focused(), Some(overflow));
+    // A press elsewhere dismisses; a press on the button does not.
+    assert!(open_overflow(&mut rig, &mut state));
+    let Some(b) = rig.workspace.tree.bounds(overflow) else {
+        unreachable!("laid out")
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let on_button = (b.x as f32 + 2.0, b.y as f32 + 2.0);
+    assert!(!state.light_dismiss(&mut rig.workspace, &mut rig.focus, on_button));
+    assert!(state.light_dismiss(&mut rig.workspace, &mut rig.focus, (1.0, 1.0)));
+    assert!(state.open.is_none());
+    // A modal closes it.
+    assert!(open_overflow(&mut rig, &mut state));
+    assert!(!state.sync(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &rig.shelf,
+        &rig.doc,
+        false
+    ));
+    assert!(state.sync(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &rig.shelf,
+        &rig.doc,
+        true
+    ));
+    assert!(!open_overflow_modal(&mut rig, &mut state));
+    // A changed document set closes it.
+    assert!(open_overflow(&mut rig, &mut state));
+    let dir = tempdir();
+    let (doc, _) = session("late", 1, [0.0, 1.0, 0.0, 1.0], &dir);
+    let _ = rig.open(doc);
+    assert!(state.sync(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &rig.shelf,
+        &rig.doc,
+        false
+    ));
+    assert!(state.open.is_none());
+}
+
+fn open_overflow_modal(rig: &mut Rig, state: &mut OverflowState) -> bool {
+    state.open(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &rig.scales,
+        &rig.shelf,
+        &rig.doc,
+        150.0,
+        true,
+    )
+}
