@@ -171,6 +171,11 @@ fn node(state: &ScrollbarState) -> Node {
     node
 }
 
+/// A scrollbar's thickness: the `type.size.md` token, as `style_thick` uses it.
+pub(crate) fn thickness(scales: &Scales) -> f32 {
+    type_size(scales.typography.size.md)
+}
+
 /// Fills the available space along its own scrolling axis (a scrollbar
 /// is sized by the region it sits beside, not by its own content), with
 /// a fixed cross-axis thickness grounded in the type scale — see
@@ -222,8 +227,8 @@ fn node(state: &ScrollbarState) -> Node {
 /// that percentage back up, and the bar can overflow a crowded parent
 /// rather than yield space to its siblings. Not exercised by anything
 /// in this crate today.
-fn style(scales: &Scales, orientation: Orientation) -> Style {
-    let thickness = length(type_size(scales.typography.size.md));
+fn style_thick(thickness: f32, orientation: Orientation) -> Style {
+    let thickness = length(thickness);
     // `1.0_f32`, not a bare `1.0`: `percent` is generic and the literal
     // would otherwise land on a deprecated integer-fallback path.
     let full = percent(1.0_f32);
@@ -301,6 +306,29 @@ pub fn insert_scrollbar(
     value: f64,
     range: ScrollbarRange,
 ) -> Result<WidgetId, WidgetError> {
+    insert_scrollbar_thick(
+        tree,
+        parent,
+        thickness(scales),
+        orientation,
+        label,
+        value,
+        range,
+    )
+}
+
+/// [`insert_scrollbar`] with the thickness already resolved from the
+/// token — for a caller (an open dropdown list, built lazily by mutators
+/// that take no `Scales`) that resolved it earlier.
+pub(crate) fn insert_scrollbar_thick(
+    tree: &mut WidgetTree<WidgetKind>,
+    parent: WidgetId,
+    thickness: f32,
+    orientation: Orientation,
+    label: Option<&str>,
+    value: f64,
+    range: ScrollbarRange,
+) -> Result<WidgetId, WidgetError> {
     checked_range(range.min, range.max)?;
     let page_size = if range.page_size.is_finite() {
         range.page_size.max(0.0)
@@ -319,7 +347,7 @@ pub fn insert_scrollbar(
     };
     tree.insert(
         parent,
-        style(scales, orientation),
+        style_thick(thickness, orientation),
         node(&state),
         WidgetKind::Scrollbar(state),
     )

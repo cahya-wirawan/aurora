@@ -159,6 +159,7 @@ mod icon;
 mod label;
 mod list_row;
 mod menu;
+mod popup_list;
 mod scrollbar;
 mod selection_outline;
 mod slider;
@@ -233,6 +234,8 @@ pub use menu::{
     MenuItem, MenuItemKind, MenuKey, MenuOutcome, MenuState, activate_menu_item, close_menu,
     handle_menu_key, insert_separator, menu_state, open_menu,
 };
+pub(crate) use popup_list::frame_of_row;
+pub use popup_list::popup_scroll_target;
 pub use scrollbar::{
     ScrollbarRange, ScrollbarState, insert_scrollbar, link_scrollbar, scrollbar_target,
     set_scrollbar_disabled, set_scrollbar_value, settle_linked_scrollbars, sync_linked_scrollbars,
