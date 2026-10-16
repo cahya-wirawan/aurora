@@ -143,6 +143,11 @@ pub enum ActionOutcome {
     /// A curve editor's curve changed (its selection may have moved
     /// too). A request that moved only the selection is `Unchanged`.
     CurveChanged { editor: WidgetId },
+    /// A gradient bar's selected stop was dragged to a new position (the
+    /// stop is [`widgets::gradient_bar_state`]'s `selected`; its new
+    /// position is in `stops()`). Pointer drags only: the bar declares no
+    /// accessibility action.
+    GradientBarChanged { bar: WidgetId },
     /// The request was valid and routed, and changed nothing (a slider
     /// already at its maximum, the selected tab clicked again).
     Unchanged(WidgetId),
@@ -370,6 +375,7 @@ pub(crate) fn payload_disabled(kind: &WidgetKind) -> bool {
         WidgetKind::CurveEditor(state) => state.disabled(),
         WidgetKind::CurveEditorPoint(state) => state.is_disabled(),
         WidgetKind::Label(state) => state.disabled,
+        WidgetKind::GradientBar(state) => state.is_disabled(),
         WidgetKind::Container
         | WidgetKind::DropIndicator(_)
         | WidgetKind::Icon(_)
@@ -1834,9 +1840,10 @@ mod tests {
             WidgetKind::Icon(_) => 26,
             WidgetKind::Thumbnail(_) => 27,
             WidgetKind::SelectionOutline(_) => 28,
+            WidgetKind::GradientBar(_) => 29,
         }
     }
-    const KIND_COUNT: usize = 28;
+    const KIND_COUNT: usize = 29;
 
     /// The data a well-formed request for `action` on `id` would carry.
     fn well_formed(f: &Fixture, id: WidgetId, action: Action) -> Option<ActionData> {
