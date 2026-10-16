@@ -2453,12 +2453,15 @@ fn real_grayscale_fixture_matches_psd_tools() {
     }
     // The empty default-255 mask shows everything.
     assert_eq!(effective_mask(&document, fill, 3, 3), Some(1.0));
-    // The 16-bit sibling opens too. Its fill layer stores no pixels in
-    // `Lr16` (psd-tools' `numpy()` is `None` for it as well), so it is
-    // left out and reported, like any pixel-less fill.
+    // The 16-bit sibling opens too. Its gradient fill layer stores no
+    // pixels in `Lr16` (psd-tools' `numpy()` is `None` for it as well); since
+    // task 108 it is drawn from its gradient settings (before: left out).
     let sixteen = doc(fixture!("4x4_16bit_grayscale.psd"));
-    assert_eq!(names(&sixteen.layers, sixteen.layers.roots()), ["Layer 1"]);
-    assert!(report_text(&sixteen).contains("no stored pixels"));
+    assert_eq!(
+        names(&sixteen.layers, sixteen.layers.roots()),
+        ["Gradient Fill 1", "Layer 1"]
+    );
+    assert!(report_text(&sixteen).contains("stored no pixels"));
 }
 
 /// Open time for a document-sized mask (0.147.0): decode, build and
@@ -5724,3 +5727,5 @@ fn a_ranged_hue_saturation_layer_opens_as_an_adjustment_and_is_not_reported() {
     let items = document.report.items.join("\n");
     assert!(!items.contains("Hue/Saturation"), "{items}");
 }
+
+include!("fill_tests.rs");
