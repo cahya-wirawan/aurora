@@ -70,6 +70,8 @@
 pub mod action;
 mod caret;
 mod error;
+#[cfg(test)]
+mod gradient_bar_tests;
 pub mod icons;
 mod input;
 mod measure;

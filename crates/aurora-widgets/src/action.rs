@@ -999,6 +999,20 @@ mod tests {
         ok(crate::widgets::insert_thumbnail(
             &mut tree, root, &scales, 24,
         ));
+        // A selection outline declares no action (the old KIND_COUNT of 28
+        // left it, ordinal 28, outside the sweep's seen array).
+        ok(crate::widgets::insert_selection_outline(&mut tree, root));
+        // A gradient bar declares no action either (pointer only).
+        ok(crate::widgets::insert_gradient_bar(
+            &mut tree,
+            root,
+            &scales,
+            "Gradient preview",
+            &[
+                crate::widgets::GradientBarStop::new(0.0, [0.0; 3]),
+                crate::widgets::GradientBarStop::new(1.0, [1.0; 3]),
+            ],
+        ));
         tree.compute_layout(800.0, 600.0);
         let _ = tree.take_damage();
         Fixture {
