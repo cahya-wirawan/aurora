@@ -36,9 +36,9 @@
 
 use crate::gpu_adjustment_tests::{
     COUNTERS, GPU_MODES, Pass, QUAD, add_adjustment, cpu_tile, edge_opaque, every_mode,
-    gpu_matches_cpu, gpu_tile, hash, max_diff, ok, out_of_gamut, pattern_layer, ramp,
-    ramp_translucent, random_opaque, random_translucent, run_cases, store, take_counts, tolerance,
-    translucent_tolerance,
+    gpu_matches_cpu, gpu_matches_cpu_source_conditioned, gpu_tile, hash, max_diff, ok,
+    out_of_gamut, pattern_layer, ramp, ramp_translucent, random_opaque, random_translucent,
+    run_cases, store, take_counts, tolerance, translucent_tolerance,
 };
 use crate::tests::real_gpu_context;
 use aurora_doc::{Adjustment, BlendMode};
@@ -920,15 +920,21 @@ fn gpu_seven_adjustments_match_the_cpu_at_the_stable_modes_on_random_tiles() {
         let mut compositor = aurora_render::TileCompositor::new(context.device());
         for mode in stable {
             ok(layers.set_blend_mode(id, mode));
-            let _ = gpu_matches_cpu(
+            // A source-colour probe, not only the tight bound: a rounding
+            // tie in the adapter's `f16` step of `Cs` (see
+            // `source_conditioning`) must not fail a texel the CPU itself
+            // finds ill-conditioned; every other texel stays tight.
+            let _ = gpu_matches_cpu_source_conditioned(
                 &context,
                 &mut compositor,
-                &layers,
+                &mut layers,
                 &mut store,
+                id,
                 pass,
                 1,
                 tolerance(),
                 &format!("random {pass:?} {mode:?}"),
+                1,
             );
         }
     }
