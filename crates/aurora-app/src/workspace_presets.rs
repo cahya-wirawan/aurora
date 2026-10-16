@@ -1,7 +1,10 @@
 //! Workspace presets (0.168.0) — named, saved panel layouts to switch
 //! between, Photoshop-style.
 //!
-//! One preset is built in, [`ESSENTIALS`]: the default layout (every panel
+//! Three presets are built in (never stored in the presets file, never
+//! deletable or overwritable): [`ESSENTIALS`], [`PHOTOGRAPHY`] and
+//! [`GRAPHIC`] (0.257.0, see [`photography_layout`] and
+//! [`graphic_layout`]). Essentials is the default layout (every panel
 //! docked in the default order and grouping, the rail expanded at
 //! [`aurora_ui::RAIL_WIDTH_DEFAULT`], the default tab selected, nothing
 //! collapsed). The user's own presets are captured from the live layout
@@ -51,8 +54,14 @@ use super::{
     refocus_out_of_hidden, saved_dock, saved_float_stack, workspace_layout,
 };
 
-/// The built-in preset's name.
+/// The default built-in preset's name.
 pub(crate) const ESSENTIALS: &str = "Essentials";
+/// The built-in Photography preset's name (0.257.0).
+pub(crate) const PHOTOGRAPHY: &str = "Photography";
+/// The built-in Graphic preset's name (0.257.0).
+pub(crate) const GRAPHIC: &str = "Graphic";
+/// Every built-in preset, in palette order.
+pub(crate) const BUILT_IN_WORKSPACES: [&str; 3] = [ESSENTIALS, PHOTOGRAPHY, GRAPHIC];
 /// The longest workspace name accepted, in Unicode scalar values — an
 /// engineering cap (a palette row has to show it), not a design token.
 pub(crate) const WORKSPACE_NAME_MAX_CHARS: usize = 64;
@@ -93,7 +102,8 @@ pub(crate) struct WorkspacePreset {
     pub(crate) layout: WorkspaceLayout,
 }
 
-/// The user's presets and which preset is active (`None` is Essentials).
+/// The user's presets and which preset is active (`None` is Essentials;
+/// `Some` holds a user preset's name or a built-in's canonical spelling).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct WorkspacePresets {
     user: Vec<WorkspacePreset>,
@@ -118,11 +128,11 @@ impl WorkspacePresets {
             .position(|preset| preset.name.to_lowercase() == wanted)
     }
 
-    /// The saved layout `name` names (case-insensitive), Essentials
-    /// included; `None` for a name that is no preset.
+    /// The layout `name` names (case-insensitive), the built-ins included;
+    /// `None` for a name that is no preset.
     pub(crate) fn layout_of(&self, name: &str) -> Option<WorkspaceLayout> {
-        if is_essentials(name) {
-            return Some(essentials_layout());
+        if let Some(built_in) = built_in_name(name) {
+            return built_in_layout(built_in);
         }
         self.user_index(name)
             .and_then(|index| self.user.get(index))
@@ -156,11 +166,11 @@ impl WorkspacePresets {
         replaced
     }
 
-    /// Removes the user preset `name`; Essentials and unknown names are
+    /// Removes the user preset `name`; a built-in and unknown names are
     /// refused (`false`). Deleting the active preset makes Essentials
     /// active.
     fn delete(&mut self, name: &str) -> bool {
-        if is_essentials(name) {
+        if built_in_name(name).is_some() {
             return false;
         }
         let Some(index) = self.user_index(name) else {
@@ -179,8 +189,8 @@ impl WorkspacePresets {
 
     /// Makes `name` active, in its saved spelling. `false` for no preset.
     fn set_active(&mut self, name: &str) -> bool {
-        if is_essentials(name) {
-            self.active = None;
+        if let Some(built_in) = built_in_name(name) {
+            self.active = (built_in != ESSENTIALS).then(|| built_in.to_owned());
             return true;
         }
         match self.user_index(name).and_then(|index| self.user.get(index)) {
@@ -193,8 +203,23 @@ impl WorkspacePresets {
     }
 }
 
-fn is_essentials(name: &str) -> bool {
-    name.trim().to_lowercase() == ESSENTIALS.to_lowercase()
+/// The built-in preset `name` spells (trimmed, case-insensitive), in its
+/// canonical spelling.
+fn built_in_name(name: &str) -> Option<&'static str> {
+    let wanted = name.trim().to_lowercase();
+    BUILT_IN_WORKSPACES
+        .into_iter()
+        .find(|built_in| built_in.to_lowercase() == wanted)
+}
+
+/// The layout of the built-in preset with the canonical name `name`.
+fn built_in_layout(name: &str) -> Option<WorkspaceLayout> {
+    match name {
+        ESSENTIALS => Some(essentials_layout()),
+        PHOTOGRAPHY => Some(photography_layout()),
+        GRAPHIC => Some(graphic_layout()),
+        _ => None,
+    }
 }
 
 /// Why a workspace name was refused.
@@ -221,9 +246,9 @@ impl WorkspaceNameError {
                 "A workspace name can be at most {WORKSPACE_NAME_MAX_CHARS} characters long."
             ),
             Self::Reserved => {
-                format!(
-                    "\u{201c}{ESSENTIALS}\u{201d} is the built-in workspace; choose another name."
-                )
+                "That name belongs to a built-in workspace (Essentials, Photography or Graphic); \
+                 choose another name."
+                    .to_owned()
             }
         }
     }
@@ -233,7 +258,7 @@ impl WorkspaceNameError {
 /// field would insert (`aurora_widgets::widgets::is_insertable_char`:
 /// no controls, no line/paragraph separators, no bidi overrides or
 /// isolates U+202A–U+202E, U+2066–U+2069), at most
-/// [`WORKSPACE_NAME_MAX_CHARS`], not "Essentials" in any case. A name
+/// [`WORKSPACE_NAME_MAX_CHARS`], not a built-in's name in any case. A name
 /// read from the presets file goes through the same check.
 pub(crate) fn validate_workspace_name(raw: &str) -> Result<String, WorkspaceNameError> {
     let name = raw.trim();
@@ -249,7 +274,7 @@ pub(crate) fn validate_workspace_name(raw: &str) -> Result<String, WorkspaceName
     if name.chars().count() > WORKSPACE_NAME_MAX_CHARS {
         return Err(WorkspaceNameError::TooLong);
     }
-    if is_essentials(name) {
+    if built_in_name(name).is_some() {
         return Err(WorkspaceNameError::Reserved);
     }
     Ok(name.to_owned())
@@ -269,6 +294,71 @@ pub(crate) fn essentials_layout() -> WorkspaceLayout {
         dock: default_saved_dock(tab),
         float_stack: Vec::new(),
     }
+}
+
+/// The rail width of the built-in Photography preset: a little wider than
+/// the default ([`aurora_ui::RAIL_WIDTH_DEFAULT`]) so the Properties
+/// sliders and the Channels rows have room (inside the rail's limits).
+pub(crate) const PHOTOGRAPHY_RAIL_WIDTH: f32 = 300.0;
+
+/// A layout from a list of rail slots `(panels, selected)`, nothing
+/// floating; `repaired_layout`-clean by construction (tested).
+fn rail_layout(
+    rail_width: f32,
+    slots: &[(&[aurora_ui::DockPanel], usize)],
+    history_collapsed: bool,
+) -> WorkspaceLayout {
+    let raw = slots
+        .iter()
+        .map(|&(panels, selected)| (panels.iter().map(|&p| Some(p)).collect(), selected))
+        .collect();
+    let (arrangement, _) = aurora_ui::DockArrangement::repaired(raw);
+    let tab = u32::try_from(aurora_ui::PANEL_GROUP_TAB_DEFAULT).unwrap_or(0);
+    WorkspaceLayout {
+        rail_width,
+        layers_collapsed: false,
+        properties_collapsed: false,
+        history_collapsed,
+        panel_group_tab: tab,
+        rail_collapsed: false,
+        dock: saved_dock(&arrangement),
+        float_stack: saved_float_stack(&arrangement),
+    }
+}
+
+/// The built-in **Photography** layout (0.257.0; a choice by the delegated
+/// design owner, not compared with Photoshop). There is no Histogram panel
+/// yet, so it favours what a photographer reaches for: Layers on its own,
+/// and one group of Properties (where the adjustment layers' controls
+/// are, selected), Channels, History and Paths as tabs, in that order
+/// (History second to last, Paths last), with the rail wider
+/// ([`PHOTOGRAPHY_RAIL_WIDTH`]).
+pub(crate) fn photography_layout() -> WorkspaceLayout {
+    use aurora_ui::DockPanel::{Channels, History, Layers, Paths, Properties};
+    rail_layout(
+        PHOTOGRAPHY_RAIL_WIDTH,
+        &[(&[Layers], 0), (&[Properties, Channels, History, Paths], 0)],
+        false,
+    )
+}
+
+/// The built-in **Graphic** layout (0.257.0; a choice, not compared with
+/// Photoshop). Layers on its own; Properties, Paths (selected: the Pen's
+/// list is the thing a designer keeps in view) and Channels as tabs of
+/// one group; History in a slot of its own at the foot, collapsed to its
+/// title row so it stays one click away without taking height. The rail
+/// keeps the default width.
+pub(crate) fn graphic_layout() -> WorkspaceLayout {
+    use aurora_ui::DockPanel::{Channels, History, Layers, Paths, Properties};
+    rail_layout(
+        aurora_ui::RAIL_WIDTH_DEFAULT,
+        &[
+            (&[Layers], 0),
+            (&[Properties, Paths, Channels], 1),
+            (&[History], 0),
+        ],
+        true,
+    )
 }
 
 /// Applies `layout` to the live workspace, keeping focus where it can:
@@ -359,9 +449,9 @@ pub(crate) fn workspace_command_for(id: &str) -> Option<WorkspaceCommand> {
 }
 
 /// The palette's workspace entries, built from the presets each time the
-/// palette opens: "Workspace: `name`" for Essentials and each user preset,
-/// "Reset `active`", "Save Workspace As…", and "Delete Workspace: `name`"
-/// for each user preset (never Essentials).
+/// palette opens: "Workspace: `name`" for each built-in and each user
+/// preset, "Reset `active`", "Save Workspace As…", and "Delete Workspace:
+/// `name`" for each user preset (never a built-in).
 pub(crate) fn workspace_palette_entries(presets: &WorkspacePresets) -> Vec<CommandEntry> {
     let switch = |name: &str| {
         CommandEntry::new(
@@ -369,7 +459,7 @@ pub(crate) fn workspace_palette_entries(presets: &WorkspacePresets) -> Vec<Comma
             format!("Workspace: {name}"),
         )
     };
-    let mut entries = vec![switch(ESSENTIALS)];
+    let mut entries: Vec<CommandEntry> = BUILT_IN_WORKSPACES.into_iter().map(switch).collect();
     entries.extend(presets.user().iter().map(|preset| switch(&preset.name)));
     entries.push(CommandEntry::new(
         COMMAND_WORKSPACE_RESET_ACTIVE,
@@ -772,6 +862,56 @@ fn repaired_layout(mut layout: WorkspaceLayout) -> (WorkspaceLayout, bool) {
     (layout, repaired || arrangement_repaired)
 }
 
+/// A preset saved before 0.257.0 may be named "Photography" or "Graphic",
+/// which are now built-in names (a user preset can no longer be that).
+/// Rather than drop the user's work it is kept under the first free name of
+/// "`name` (custom)", "`name` (custom 2)", "`name` (custom 3)", ...: free
+/// meaning neither already kept nor spelt by any other entry of the file
+/// (`taken`, lower-cased), so a later entry is never pushed into a
+/// collision and dropped. Essentials was always reserved, so a file never
+/// holds it, and any other refusal stays a refusal.
+fn renamed_if_newly_reserved(
+    raw: &str,
+    error: WorkspaceNameError,
+    taken: &[String],
+) -> Result<String, WorkspaceNameError> {
+    if error != WorkspaceNameError::Reserved {
+        return Err(error);
+    }
+    let Some(built_in) = built_in_name(raw).filter(|&name| name != ESSENTIALS) else {
+        return Err(error);
+    };
+    let is_free = |candidate: &str| !taken.contains(&candidate.to_lowercase());
+    let first = format!("{built_in} (custom)");
+    if is_free(&first) {
+        return validate_workspace_name(&first);
+    }
+    // Bounded: the file holds at most `MAX_WORKSPACE_PRESETS` entries, so a
+    // free number exists within that many tries.
+    for number in 2..=MAX_WORKSPACE_PRESETS + 2 {
+        let candidate = format!("{built_in} (custom {number})");
+        if is_free(&candidate) {
+            return validate_workspace_name(&candidate);
+        }
+    }
+    Err(error)
+}
+
+/// Every name the file's first `count` entries spell, lower-cased and
+/// trimmed: what a migrated name must not collide with. Stops at the first
+/// entry that does not parse, like the decoder.
+fn spelled_names(mut rest: &[u8], count: u32) -> Vec<String> {
+    let mut names = Vec::new();
+    for _ in 0..count.min(u32::try_from(MAX_WORKSPACE_PRESETS).unwrap_or(u32::MAX)) {
+        let Ok((entry, after)) = postcard::take_from_bytes::<SavedPreset>(rest) else {
+            break;
+        };
+        rest = after;
+        names.push(entry.name.trim().to_lowercase());
+    }
+    names
+}
+
 /// Decodes a presets file, never failing: a bad header (garbage, a
 /// truncated file, another version) gives no user presets and Essentials
 /// active; a preset that fails to decode, has an invalid name or repeats
@@ -789,6 +929,10 @@ pub(crate) fn decode_presets(bytes: &[u8]) -> (WorkspacePresets, bool) {
     }
     let mut presets = WorkspacePresets::default();
     let mut repaired = false;
+    // Names of the file's entries, plus each migrated name as it is chosen.
+    let mut taken = spelled_names(rest, header.count);
+    // (original name lower-cased, name it was migrated to).
+    let mut migrated: Vec<(String, String)> = Vec::new();
     for index in 0..header.count {
         // Review J2: at most `MAX_WORKSPACE_PRESETS` entries are read.
         // (`has_user` lowercases every kept name per check, so this loop
@@ -802,7 +946,14 @@ pub(crate) fn decode_presets(bytes: &[u8]) -> (WorkspacePresets, bool) {
             break;
         };
         rest = after;
-        let Ok(name) = validate_workspace_name(&entry.name) else {
+        let Ok(name) = validate_workspace_name(&entry.name).or_else(|err| {
+            let renamed = renamed_if_newly_reserved(&entry.name, err, &taken);
+            if let Ok(new) = &renamed {
+                taken.push(new.to_lowercase());
+                migrated.push((entry.name.trim().to_lowercase(), new.clone()));
+            }
+            renamed
+        }) else {
             repaired = true;
             continue;
         };
@@ -819,7 +970,15 @@ pub(crate) fn decode_presets(bytes: &[u8]) -> (WorkspacePresets, bool) {
         repaired |= layout_repaired;
         presets.user.push(WorkspacePreset { name, layout });
     }
-    if !header.active.is_empty() && !presets.set_active(&header.active) {
+    // An old file's active name that spelt a migrated user preset keeps
+    // that preset active under its new name (a current file never holds a
+    // reserved name, so "Photography" there means the built-in).
+    let active_wanted = header.active.trim().to_lowercase();
+    let active = migrated
+        .iter()
+        .find(|(original, new)| *original == active_wanted && presets.has_user(new))
+        .map_or(header.active.as_str(), |(_, new)| new.as_str());
+    if !active.is_empty() && !presets.set_active(active) {
         repaired = true;
     }
     (presets, repaired)
@@ -2084,5 +2243,368 @@ mod tests {
         };
         rig.run(command);
         assert_eq!(rig.presets.active_name(), "My Look");
+    }
+
+    // -- Built-in Photography and Graphic (0.257.0) --
+
+    const NEW_BUILT_INS: [&str; 2] = [super::PHOTOGRAPHY, super::GRAPHIC];
+
+    fn keys_of(layout: &crate::WorkspaceLayout) -> Vec<(Vec<String>, u32)> {
+        layout
+            .dock
+            .iter()
+            .map(|slot| (slot.panels.clone(), slot.selected))
+            .collect()
+    }
+
+    /// Both new layouts are valid as built: the repair routine changes
+    /// nothing and every panel appears exactly once.
+    #[test]
+    fn built_in_layouts_pass_the_repair_routine_with_every_panel_once() {
+        for name in super::BUILT_IN_WORKSPACES {
+            let Some(layout) = WorkspacePresets::default().layout_of(name) else {
+                unreachable!("{name} is a preset");
+            };
+            let (repaired, changed) = super::repaired_layout(layout.clone());
+            assert!(!changed, "{name} needed repair");
+            assert_eq!(repaired, layout, "{name}");
+            let mut seen: Vec<&str> = layout
+                .dock
+                .iter()
+                .flat_map(|slot| slot.panels.iter().map(String::as_str))
+                .collect();
+            seen.sort_unstable();
+            let mut all: Vec<&str> = DockPanel::ALL.iter().map(|p| p.key()).collect();
+            all.sort_unstable();
+            assert_eq!(seen, all, "{name}: every panel exactly once");
+            assert!(layout.float_stack.is_empty(), "{name}: nothing floats");
+            assert!(layout.rail_width.is_finite(), "{name}");
+            assert!(
+                (150.0..=600.0).contains(&layout.rail_width),
+                "{name}: the rail width needs no clamp"
+            );
+            assert!(!layout.rail_collapsed, "{name}");
+            for slot in &layout.dock {
+                let len = u32::try_from(slot.panels.len()).unwrap_or(0);
+                assert!(slot.selected < len, "{name}: selected tab in range");
+            }
+        }
+    }
+
+    /// The chosen shapes (the report's design choices), pinned.
+    #[test]
+    fn photography_and_graphic_have_the_documented_shapes() {
+        let photography = super::photography_layout();
+        assert_eq!(
+            keys_of(&photography),
+            vec![
+                (vec!["layers".to_owned()], 0),
+                (
+                    ["properties", "channels", "history", "paths"]
+                        .map(str::to_owned)
+                        .to_vec(),
+                    0
+                ),
+            ]
+        );
+        assert!(photography.rail_width > aurora_ui::RAIL_WIDTH_DEFAULT);
+        assert!(!photography.history_collapsed);
+
+        let graphic = super::graphic_layout();
+        assert_eq!(
+            keys_of(&graphic),
+            vec![
+                (vec!["layers".to_owned()], 0),
+                (
+                    ["properties", "paths", "channels"]
+                        .map(str::to_owned)
+                        .to_vec(),
+                    1
+                ),
+                (vec!["history".to_owned()], 0),
+            ]
+        );
+        assert!(graphic.history_collapsed, "History starts collapsed");
+        assert!((graphic.rail_width - aurora_ui::RAIL_WIDTH_DEFAULT).abs() < f32::EPSILON);
+        assert_ne!(photography, graphic);
+        assert_ne!(photography, essentials_layout());
+        assert_ne!(graphic, essentials_layout());
+    }
+
+    /// The panel keys the shape test spells really are the panels' keys.
+    #[test]
+    fn the_keys_the_shape_test_spells_are_the_panel_keys() {
+        for (panel, key) in [
+            (DockPanel::Layers, "layers"),
+            (DockPanel::Properties, "properties"),
+            (DockPanel::History, "history"),
+            (DockPanel::Channels, "channels"),
+            (DockPanel::Paths, "paths"),
+        ] {
+            assert_eq!(panel.key(), key);
+        }
+    }
+
+    /// Switching applies the built-in to the live workspace (arrangement,
+    /// selected tabs, collapse, rail width), and Reset puts it back after
+    /// edits; Essentials restores the default.
+    #[test]
+    fn switching_to_a_built_in_applies_it_and_reset_restores_it() {
+        for name in NEW_BUILT_INS {
+            let mut rig = Rig::new();
+            let Some(wanted) = rig.presets.layout_of(name) else {
+                unreachable!("{name}")
+            };
+            let outcome = rig.run(WorkspaceCommand::Switch(name.to_owned()));
+            assert!(outcome.applied, "{name}");
+            assert!(outcome.presets_changed, "the active name changed");
+            assert_eq!(rig.presets.active_name(), name);
+            let live = live_layout(&rig.ws);
+            assert_eq!(keys_of(&live), keys_of(&wanted), "{name}: arrangement");
+            assert_eq!(live.history_collapsed, wanted.history_collapsed, "{name}");
+            assert!((live.rail_width - wanted.rail_width).abs() < 0.5, "{name}");
+
+            // Edit everything, then Reset gives the built-in back.
+            edit_everything(&mut rig);
+            assert_ne!(keys_of(&live_layout(&rig.ws)), keys_of(&wanted));
+            let reset = rig.run(WorkspaceCommand::ResetActive);
+            assert!(reset.applied);
+            let again = live_layout(&rig.ws);
+            assert_eq!(keys_of(&again), keys_of(&wanted), "{name}: reset");
+            assert_eq!(again.history_collapsed, wanted.history_collapsed);
+
+            // Back to Essentials: the default arrangement, nothing active.
+            rig.run(WorkspaceCommand::Switch(ESSENTIALS.to_owned()));
+            assert_eq!(rig.presets.active_name(), ESSENTIALS);
+            assert_eq!(
+                keys_of(&live_layout(&rig.ws)),
+                keys_of(&essentials_layout())
+            );
+        }
+    }
+
+    /// Names: every built-in is reserved in any case, trimmed; names that
+    /// merely start with one are fine.
+    #[test]
+    fn built_in_names_are_reserved_in_any_case() {
+        for name in super::BUILT_IN_WORKSPACES {
+            for spelled in [
+                name.to_owned(),
+                name.to_uppercase(),
+                name.to_lowercase(),
+                format!("  {name}  "),
+            ] {
+                assert_eq!(
+                    validate_workspace_name(&spelled),
+                    Err(WorkspaceNameError::Reserved),
+                    "{spelled:?}"
+                );
+            }
+        }
+        assert_eq!(
+            validate_workspace_name("Photography 2"),
+            Ok("Photography 2".to_owned())
+        );
+        assert_eq!(
+            validate_workspace_name("My Graphic"),
+            Ok("My Graphic".to_owned())
+        );
+        assert!(WorkspaceNameError::Reserved.message().contains("built-in"));
+    }
+
+    /// Saving over a built-in name is refused by the run path (it never
+    /// reaches the presets), and deleting one is refused.
+    #[test]
+    fn built_ins_cannot_be_overwritten_or_deleted() {
+        for name in NEW_BUILT_INS {
+            let mut rig = Rig::new();
+            edit_everything(&mut rig);
+            let outcome = rig.run(WorkspaceCommand::Save {
+                name: name.to_owned(),
+                replace: true,
+            });
+            assert!(!outcome.presets_changed, "{name} not overwritten");
+            assert!(rig.presets.user().is_empty());
+            let outcome = rig.run(WorkspaceCommand::Delete(name.to_owned()));
+            assert!(!outcome.presets_changed, "{name} not deleted");
+            assert!(rig.presets.layout_of(name).is_some());
+            assert!(!rig.presets.has_user(name));
+        }
+    }
+
+    /// The palette lists a switch entry for each built-in (after
+    /// Essentials, before the user's), and never a delete entry.
+    #[test]
+    fn the_palette_lists_the_built_ins_and_no_delete_for_them() {
+        let mut presets = WorkspacePresets::default();
+        presets.save("Mine".to_owned(), essentials_layout());
+        let entries = workspace_palette_entries(&presets);
+        let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+        let position = |t: &str| titles.iter().position(|&x| x == t);
+        let (Some(e), Some(p), Some(g), Some(m)) = (
+            position("Workspace: Essentials"),
+            position("Workspace: Photography"),
+            position("Workspace: Graphic"),
+            position("Workspace: Mine"),
+        ) else {
+            unreachable!("{titles:?}");
+        };
+        assert!(e < p && p < g && g < m, "{titles:?}");
+        for name in super::BUILT_IN_WORKSPACES {
+            assert!(
+                !titles.contains(&format!("Delete Workspace: {name}").as_str()),
+                "{name}"
+            );
+        }
+        assert!(titles.contains(&"Delete Workspace: Mine"));
+        assert!(titles.contains(&"Reset Mine"));
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"workspace.switch/Photography"));
+        assert!(ids.contains(&"workspace.switch/Graphic"));
+    }
+
+    /// Built-ins are not stored in the file: it holds the user's presets
+    /// and the active built-in name only, and the active built-in survives
+    /// a round trip.
+    #[test]
+    fn built_ins_are_not_stored_and_the_active_one_round_trips() {
+        let mut presets = WorkspacePresets::default();
+        assert!(presets.set_active("photography"));
+        assert_eq!(presets.active_name(), "Photography", "canonical spelling");
+        let bytes = match encode_presets(&presets) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err}"),
+        };
+        let (header, rest) = match postcard::take_from_bytes::<PresetsHeader>(&bytes) {
+            Ok(parts) => parts,
+            Err(err) => unreachable!("{err}"),
+        };
+        assert_eq!(header.count, 0, "no built-in entry is written");
+        assert!(rest.is_empty());
+        assert_eq!(header.active, "Photography");
+        let (decoded, repaired) = decode_presets(&bytes);
+        assert!(!repaired);
+        assert_eq!(decoded, presets);
+
+        let mut graphic = WorkspacePresets::default();
+        assert!(graphic.set_active("GRAPHIC"));
+        let bytes = match encode_presets(&graphic) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err}"),
+        };
+        assert_eq!(decode_presets(&bytes).0.active_name(), "Graphic");
+        // Essentials is the empty active name.
+        assert!(graphic.set_active("essentials"));
+        assert_eq!(graphic.active_name(), ESSENTIALS);
+        assert!(graphic.active.is_none());
+    }
+
+    /// A preset a user saved as "Photography" before it became a built-in
+    /// name is kept as "Photography (custom)", not dropped.
+    #[test]
+    fn an_older_user_preset_with_a_new_built_in_name_is_renamed_not_dropped() {
+        let layout = encode(&essentials_layout());
+        let bytes = file(
+            "",
+            &[
+                ("Photography".to_owned(), layout.clone()),
+                ("graphic".to_owned(), layout.clone()),
+                ("Essentials".to_owned(), layout.clone()),
+                ("Other".to_owned(), layout),
+            ],
+        );
+        let (presets, repaired) = decode_presets(&bytes);
+        assert!(repaired);
+        let names: Vec<&str> = presets.user().iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Photography (custom)", "Graphic (custom)", "Other"],
+            "Essentials was always reserved and stays dropped"
+        );
+    }
+
+    /// A migrated name never collides: an old file with "Photography" and
+    /// "Photography (custom)" keeps both (the first gets the next free
+    /// suffix), and every later suffix is numbered, none dropped.
+    #[test]
+    fn migrated_names_get_a_free_suffix_and_no_preset_is_dropped() {
+        let layout = encode(&essentials_layout());
+        let entries: Vec<(String, Vec<u8>)> = [
+            "Photography",
+            "Photography (custom)",
+            "photography (CUSTOM 2)",
+            "Graphic",
+            "Graphic (custom)",
+        ]
+        .iter()
+        .map(|n| ((*n).to_owned(), layout.clone()))
+        .collect();
+        let (presets, repaired) = decode_presets(&file("", &entries));
+        assert!(repaired);
+        let names: Vec<&str> = presets.user().iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Photography (custom 3)",
+                "Photography (custom)",
+                "photography (CUSTOM 2)",
+                "Graphic (custom 2)",
+                "Graphic (custom)",
+            ]
+        );
+        // The same file, order reversed, still keeps all five.
+        let mut reversed = entries;
+        reversed.reverse();
+        let (presets, _) = decode_presets(&file("", &reversed));
+        assert_eq!(presets.user().len(), 5, "none dropped");
+        // Names stay within the cap and valid.
+        for preset in presets.user() {
+            assert!(
+                validate_workspace_name(&preset.name).is_ok(),
+                "{}",
+                preset.name
+            );
+        }
+    }
+
+    /// The old header's active name that spelt a renamed user preset keeps
+    /// it active under the new name; a current file's "Photography" is the
+    /// built-in.
+    #[test]
+    fn an_active_migrated_preset_stays_active_under_its_new_name() {
+        let layout = encode(&essentials_layout());
+        let entries = vec![
+            ("Photography".to_owned(), layout.clone()),
+            ("Photography (custom)".to_owned(), layout.clone()),
+        ];
+        let (presets, _) = decode_presets(&file("Photography", &entries));
+        assert_eq!(presets.active_name(), "Photography (custom 2)");
+        assert!(presets.has_user("Photography (custom 2)"));
+        // Case and spaces in the header do not matter.
+        let (presets, _) = decode_presets(&file(" photography ", &entries));
+        assert_eq!(presets.active_name(), "Photography (custom 2)");
+        // An active name of another preset is untouched.
+        let (presets, _) = decode_presets(&file("Photography (custom)", &entries));
+        assert_eq!(presets.active_name(), "Photography (custom)");
+        // No migrated preset in the file: "Photography" is the built-in.
+        let plain = vec![("Other".to_owned(), layout)];
+        let (presets, repaired) = decode_presets(&file("Photography", &plain));
+        assert!(!repaired);
+        assert_eq!(presets.active_name(), "Photography");
+        assert!(!presets.has_user("Photography"));
+    }
+
+    /// The 100-preset cap still applies to migrated entries.
+    #[test]
+    fn the_preset_cap_still_applies_to_migrated_entries() {
+        let layout = encode(&essentials_layout());
+        let mut entries: Vec<(String, Vec<u8>)> = (0..MAX_WORKSPACE_PRESETS)
+            .map(|i| (format!("Look {i}"), layout.clone()))
+            .collect();
+        entries.push(("Photography".to_owned(), layout));
+        let (presets, repaired) = decode_presets(&file("", &entries));
+        assert!(repaired);
+        assert_eq!(presets.user().len(), MAX_WORKSPACE_PRESETS);
+        assert!(!presets.has_user("Photography (custom)"));
     }
 }

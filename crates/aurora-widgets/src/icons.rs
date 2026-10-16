@@ -151,11 +151,21 @@ pub enum IconKind {
     SpotHealing,
     /// A brush tip with corner marks: the Quick Select tool (0.238.0).
     QuickSelect,
+    /// Three overlapping rings, the red, green and blue channels: the
+    /// Channels panel's own glyph (0.257.0).
+    Channels,
+    /// A closed outline with a solid centre: Fill Path (0.257.0).
+    FillPath,
+    /// An open curve between two square anchors: Stroke Path (0.257.0).
+    StrokePath,
+    /// A dashed selection corner over a curve between two square anchors:
+    /// Make Work Path from Selection (0.257.0).
+    MakePath,
 }
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 45] = [
+    pub const ALL: [IconKind; 49] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -201,6 +211,10 @@ impl IconKind {
         IconKind::Pen,
         IconKind::SpotHealing,
         IconKind::QuickSelect,
+        IconKind::Channels,
+        IconKind::FillPath,
+        IconKind::StrokePath,
+        IconKind::MakePath,
     ];
 
     /// The icon's name, as the gallery labels it and a caller can use as
@@ -253,6 +267,10 @@ impl IconKind {
             IconKind::Pen => "Pen",
             IconKind::SpotHealing => "Spot Healing",
             IconKind::QuickSelect => "Quick Select",
+            IconKind::Channels => "Channels",
+            IconKind::FillPath => "Fill Path",
+            IconKind::StrokePath => "Stroke Path",
+            IconKind::MakePath => "Make Path",
         }
     }
 }
@@ -372,6 +390,16 @@ fn circle(style: PartStyle, cx: f32, cy: f32, r: f32) -> IconPart {
         .c([cx - k, cy + r], [cx - r, cy + k], [cx - r, cy])
         .c([cx - r, cy - k], [cx - k, cy - r], [cx, cy - r])
         .c([cx + k, cy - r], [cx + r, cy - k], [cx + r, cy])
+        .closed()
+}
+
+/// A path anchor: a small solid square (grid centre), 2 grid steps wide.
+fn anchor_square(cx: f32, cy: f32) -> IconPart {
+    fill_part()
+        .m(cx - 1.0, cy - 1.0)
+        .l(cx + 1.0, cy - 1.0)
+        .l(cx + 1.0, cy + 1.0)
+        .l(cx - 1.0, cy + 1.0)
         .closed()
 }
 
@@ -865,6 +893,48 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
             stroke_part().m(7.0, 8.0).l(2.0, 13.0),
             stroke_part().m(10.0, 14.0).l(14.0, 14.0).l(14.0, 10.0),
         ],
+        IconKind::Channels => vec![
+            // Three overlapping rings, one per colour channel.
+            circle(PartStyle::Stroke, 5.5, 5.5, 4.5),
+            circle(PartStyle::Stroke, 10.5, 5.5, 4.5),
+            circle(PartStyle::Stroke, 8.0, 10.0, 4.5),
+        ],
+        IconKind::FillPath => vec![
+            // A closed curved outline with a solid shape inside it.
+            stroke_part()
+                .m(2.0, 10.0)
+                .c([2.0, 5.0], [6.0, 2.0], [11.0, 2.5])
+                .c([14.0, 6.5], [12.5, 13.5], [6.0, 13.5])
+                .c([3.5, 13.5], [2.0, 12.0], [2.0, 10.0])
+                .closed(),
+            fill_part()
+                .m(4.5, 9.5)
+                .c([4.5, 7.0], [7.0, 5.0], [10.0, 5.5])
+                .c([11.0, 7.5], [10.0, 11.0], [7.0, 11.0])
+                .c([5.5, 11.0], [4.5, 10.5], [4.5, 9.5])
+                .closed(),
+        ],
+        IconKind::StrokePath => vec![
+            // An open S-curve with a square anchor at each end.
+            stroke_part()
+                .m(3.0, 12.0)
+                .c([3.0, 4.0], [12.0, 12.0], [12.0, 4.0]),
+            anchor_square(3.0, 12.0),
+            anchor_square(12.0, 4.0),
+        ],
+        IconKind::MakePath => vec![
+            // The corner of a dashed selection, and below it the curve
+            // that outline becomes, with its two square anchors.
+            stroke_part().m(2.0, 2.0).l(4.0, 2.0),
+            stroke_part().m(6.0, 2.0).l(8.0, 2.0),
+            stroke_part().m(2.0, 2.0).l(2.0, 4.0),
+            stroke_part().m(2.0, 6.0).l(2.0, 8.0),
+            stroke_part()
+                .m(5.0, 13.0)
+                .c([5.0, 6.0], [13.0, 12.0], [13.0, 5.5]),
+            anchor_square(5.0, 13.0),
+            anchor_square(13.0, 5.5),
+        ],
         IconKind::PaintBucket => vec![
             // A tilted bucket (a diamond), the paint line across it, and
             // the drop pouring from its corner.
@@ -1012,7 +1082,8 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        assert_eq!(IconKind::ALL.len(), 45);
+        // 49 since 0.257.0: Channels, Fill Path, Stroke Path and Make Path.
+        assert_eq!(IconKind::ALL.len(), 49);
         for kind in [IconKind::SwapArrows, IconKind::DefaultColours] {
             assert!(IconKind::ALL.contains(&kind));
             assert!(!icon_parts(kind).is_empty(), "{kind:?}");
@@ -1041,6 +1112,66 @@ mod tests {
     /// The clip glyph (0.201.1): an open corner arrow, strokes only, that
     /// points down: its lowest point is the end of the stem and its
     /// arrowhead is wider than the stem is long from the left edge.
+    /// 0.257.0: the four dedicated path and channel glyphs have the
+    /// parts they are described by, and none is a copy of the glyph it
+    /// replaced on the Paths and Channels toolbars.
+    #[test]
+    fn the_path_and_channel_glyphs_are_what_they_are_described_as() {
+        let fills = |kind| {
+            icon_parts(kind)
+                .iter()
+                .filter(|p| p.style == PartStyle::Fill)
+                .count()
+        };
+        let open_strokes = |kind| {
+            icon_parts(kind)
+                .iter()
+                .filter(|p| p.style == PartStyle::Stroke && !p.closed)
+                .count()
+        };
+        let closed_strokes = |kind| {
+            icon_parts(kind)
+                .iter()
+                .filter(|p| p.style == PartStyle::Stroke && p.closed)
+                .count()
+        };
+        // Channels: three closed rings, nothing solid.
+        assert_eq!(closed_strokes(IconKind::Channels), 3);
+        assert_eq!(fills(IconKind::Channels), 0);
+        // Fill Path: one closed outline and one solid shape inside it.
+        assert_eq!(closed_strokes(IconKind::FillPath), 1);
+        assert_eq!(fills(IconKind::FillPath), 1);
+        assert_eq!(open_strokes(IconKind::FillPath), 0);
+        // Stroke Path: one open curve and two square anchors, no outline.
+        assert_eq!(open_strokes(IconKind::StrokePath), 1);
+        assert_eq!(fills(IconKind::StrokePath), 2);
+        assert_eq!(closed_strokes(IconKind::StrokePath), 0);
+        let curve = icon_parts(IconKind::StrokePath);
+        assert!(
+            curve
+                .iter()
+                .any(|p| p.segs.iter().any(|s| matches!(s, Seg::Cubic(..)))),
+            "the stroke is a curve, not a line"
+        );
+        // Make Path: four selection dashes, one curve and two anchors.
+        assert_eq!(fills(IconKind::MakePath), 2);
+        assert_eq!(open_strokes(IconKind::MakePath), 5);
+        // None is a copy of the glyph it replaced.
+        for (new, old) in [
+            (IconKind::FillPath, IconKind::PaintBucket),
+            (IconKind::StrokePath, IconKind::Brush),
+            (IconKind::MakePath, IconKind::Pen),
+            (IconKind::Channels, IconKind::NewLayer),
+        ] {
+            assert_ne!(icon_parts(new), icon_parts(old), "{new:?}");
+        }
+        // And they have distinct, lower-case-free human names.
+        assert_eq!(IconKind::Channels.name(), "Channels");
+        assert_eq!(IconKind::FillPath.name(), "Fill Path");
+        assert_eq!(IconKind::StrokePath.name(), "Stroke Path");
+        assert_eq!(IconKind::MakePath.name(), "Make Path");
+    }
+
     #[test]
     fn the_clip_icon_is_an_open_corner_arrow_pointing_down() {
         let parts = icon_parts(IconKind::Clip);

@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.257.0] - 2026-10-16
+
+### Changed
+
+- Polish round: Photography and Graphic workspaces, new icons, first-run welcome
+
 ## [0.256.0] - 2026-10-16
 
 ### Changed
