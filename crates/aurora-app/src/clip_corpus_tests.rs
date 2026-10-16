@@ -64,15 +64,25 @@ fn clipped_files_against_their_merged_images_before_and_after() {
                 "CLIP {name}: {clipped} clipped layers; before mean {:?} max {:?} | after mean {:?} max {:?}",
                 b.mean, b.max, a.mean, a.max
             );
-            // `blend-and-clipping.psd`'s merged image is a placeholder and its
-            // eight shape layers store no pixels (task 108 draws them), so
-            // its error against the file's merged image is not a fidelity
-            // measure; the other clipped files keep the check.
-            if name == "blend-and-clipping.psd" {
-                continue;
-            }
-            for (after, before) in a.mean.iter().zip(b.mean) {
-                assert!(*after <= before + 0.05, "{name}: clipping made {name} worse");
+            // A file saved without Maximize Compatibility holds a placeholder
+            // merged image (`blend-and-clipping.psd`, whose eight shape
+            // layers also store no pixels, drawn since task 108), so a
+            // per-channel comparison with it measures nothing: the check
+            // that clipping did not make the file worse than leaving it
+            // unclipped still runs, on the three channels' summed mean, which
+            // is the one number a blank-vs-drawing comparison cannot flip
+            // channel by channel. A file with a real merged image keeps the
+            // per-channel check.
+            if audit_has_real_merged_data(&bytes) {
+                for (after, before) in a.mean.iter().zip(b.mean) {
+                    assert!(*after <= before + 0.05, "{name}: clipping made {name} worse");
+                }
+            } else {
+                let (after, before): (f64, f64) = (a.mean.iter().sum(), b.mean.iter().sum());
+                assert!(
+                    after <= before + 0.15,
+                    "{name}: clipping made {name} worse against its placeholder merged image"
+                );
             }
         }
     }

@@ -10,8 +10,20 @@
 //! ordinary pixel layer (a PSD save writes those pixels; the fill settings
 //! are not kept).
 //!
-//! # Bounded work
+//! # Memory
 //!
+//! A drawn fill is built eagerly: one `Vec<f16>` of the whole region at
+//! 8 bytes per pixel (straight RGBA), plus the vector mask's coverage
+//! plane at 2 bytes per pixel while it is drawn. A full-canvas fill (no
+//! vector mask, an inverted one, a mask density below 100 %) therefore
+//! costs 8 bytes per canvas pixel, and the shape's rasterisation 10 more
+//! at its peak. Both are charged to the file's vector pixel budget
+//! (`vector::Budget::pixels`) before any buffer exists, so a hostile or
+//! very large canvas leaves the fill out with a report line instead of
+//! allocating.
+//!
+//! # Bounded work
+//!//!
 //! The block is read through the descriptor parser (depth and item
 //! budgets), is at most [`MAX_FILL_BLOCK_BYTES`], holds at most
 //! [`MAX_STOPS`] stops, and the region it is drawn over is charged to the
@@ -291,27 +303,58 @@ impl Gradient {
         (rgb, alpha)
     }
 
-    /// The position `0..=1` along the gradient of document point `(x, y)`
-    /// for a reference box `b`.
-    pub(super) fn position(&self, x: f64, y: f64, b: Rect) -> f32 {
+    /// The geometry for reference box `b`, with the trigonometry done once.
+    pub(super) fn frame(&self, b: Rect) -> Frame<'_> {
         let (w, h) = (f64::from(b.width), f64::from(b.height));
-        let cx = b.x as f64 + w / 2.0 + self.offset.0 / 100.0 * w;
-        let cy = b.y as f64 + h / 2.0 + self.offset.1 / 100.0 * h;
-        let (dx, dy) = (x - cx, y - cy);
         let a = self.angle.to_radians();
         let (cos, sin) = (a.cos(), a.sin());
-        let along = dx * cos - dy * sin;
-        let across = dx * sin + dy * cos;
-        let length = (self.scale * (w * cos.abs() + h * sin.abs())).max(1e-9);
-        let t = match self.style {
-            Style::Linear => 0.5 + along / length,
-            Style::Reflected => along.abs() / (length / 2.0),
-            Style::Radial => dx.hypot(dy) / (self.scale * w.hypot(h) / 2.0).max(1e-9),
-            Style::Diamond => (along.abs() + across.abs()) / (self.scale * (w + h) / 2.0).max(1e-9),
-            Style::Angle => (dy.atan2(dx).to_degrees() + self.angle).rem_euclid(360.0) / 360.0,
+        Frame {
+            gradient: self,
+            cx: b.x as f64 + w / 2.0 + self.offset.0 / 100.0 * w,
+            cy: b.y as f64 + h / 2.0 + self.offset.1 / 100.0 * h,
+            cos,
+            sin,
+            length: (self.scale * (w * cos.abs() + h * sin.abs())).max(1e-9),
+            radius: (self.scale * w.hypot(h) / 2.0).max(1e-9),
+            diamond: (self.scale * (w + h) / 2.0).max(1e-9),
+        }
+    }
+
+    /// The position `0..=1` along the gradient of document point `(x, y)`
+    /// for a reference box `b` (the tests' one-shot form of [`Frame`]).
+    #[cfg(test)]
+    pub(super) fn position(&self, x: f64, y: f64, b: Rect) -> f32 {
+        self.frame(b).position(x, y)
+    }
+}
+
+/// A gradient's per-box constants (centre, direction, lengths).
+pub(super) struct Frame<'a> {
+    gradient: &'a Gradient,
+    cx: f64,
+    cy: f64,
+    cos: f64,
+    sin: f64,
+    length: f64,
+    radius: f64,
+    diamond: f64,
+}
+
+impl Frame<'_> {
+    pub(super) fn position(&self, x: f64, y: f64) -> f32 {
+        let g = self.gradient;
+        let (dx, dy) = (x - self.cx, y - self.cy);
+        let along = dx * self.cos - dy * self.sin;
+        let across = dx * self.sin + dy * self.cos;
+        let t = match g.style {
+            Style::Linear => 0.5 + along / self.length,
+            Style::Reflected => along.abs() / (self.length / 2.0),
+            Style::Radial => dx.hypot(dy) / self.radius,
+            Style::Diamond => (along.abs() + across.abs()) / self.diamond,
+            Style::Angle => (dy.atan2(dx).to_degrees() + g.angle).rem_euclid(360.0) / 360.0,
         };
         let t = t.clamp(0.0, 1.0) as f32;
-        if self.reverse { 1.0 - t } else { t }
+        if g.reverse { 1.0 - t } else { t }
     }
 }
 
@@ -325,25 +368,38 @@ pub(super) fn reference_box(g: &Gradient, path: Option<Rect>, canvas: Rect) -> R
 
 /// The straight-alpha `f16` RGBA pixels of `fill` over `region`, its
 /// opacity multiplied by the vector `raster`'s coverage (everywhere `1`
-/// without one). `None` when the buffer cannot be allocated.
+/// without one), the coverage first raised by the vector mask's `density`
+/// (`d * c + (1 - d)`, the rule `aurora-doc` applies to a mask density).
+/// `None` when the buffer cannot be allocated.
 pub(super) fn render(
     fill: &Fill,
     region: Rect,
     reference: Rect,
     raster: Option<&vector::Raster>,
+    density: f32,
 ) -> Option<Vec<f16>> {
     let (w, h) = (region.width as usize, region.height as usize);
     let len = w.checked_mul(h)?.checked_mul(4)?;
     let mut out: Vec<f16> = Vec::new();
     out.try_reserve_exact(len).ok()?;
+    let frame = match fill {
+        Fill::Gradient(g) => Some(g.frame(reference)),
+        Fill::Solid(_) => None,
+    };
     for row in 0..h {
         let y = region.y + row as i64;
         for col in 0..w {
             let x = region.x + col as i64;
             let cover = coverage_at(raster, x, y);
-            let (rgb, alpha) = match fill {
-                Fill::Solid(c) => (*c, 1.0),
-                Fill::Gradient(g) => g.at(g.position(x as f64, y as f64, reference)),
+            let cover = if raster.is_some() {
+                density * cover + (1.0 - density)
+            } else {
+                cover
+            };
+            let (rgb, alpha) = match (fill, &frame) {
+                (Fill::Gradient(g), Some(f)) => g.at(f.position(x as f64, y as f64)),
+                (Fill::Solid(c), _) => (*c, 1.0),
+                (Fill::Gradient(_), None) => ([0.0; 3], 1.0),
             };
             out.push(f16::from_f32(rgb[0]));
             out.push(f16::from_f32(rgb[1]));
@@ -386,6 +442,10 @@ pub(super) enum ArtboardLeft {
     /// White or black (types `1` and `2`): no corpus picture shows them.
     Unchecked,
     Unreadable,
+    /// The rectangle is empty or lies entirely off the canvas.
+    Empty,
+    /// Over the pixel budget, or the buffer cannot be allocated.
+    TooLarge,
 }
 
 /// Reads an artboard block. `Ok(None)` for a transparent background

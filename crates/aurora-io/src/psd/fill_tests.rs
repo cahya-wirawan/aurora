@@ -157,6 +157,113 @@ fn a_disabled_vector_mask_fills_the_whole_canvas() {
     let document = doc(&file.write());
     assert_eq!(fill_px(&document, 0, 0), Some(u8px(10, 20, 30, 255)));
     assert_eq!(fill_px(&document, 7, 7), Some(u8px(10, 20, 30, 255)));
+    let text = report_text(&document);
+    assert!(text.contains("vector mask that was turned off"), "{text}");
+}
+
+#[test]
+fn an_unreadable_vector_mask_fills_the_canvas_and_says_so() {
+    let file = empty_fill_file(
+        4,
+        4,
+        *b"SoCo",
+        solid_block(1.0, 2.0, 3.0),
+        Some(vec![0; 4]),
+    );
+    let document = doc(&file.write());
+    assert_eq!(fill_px(&document, 3, 3), Some(u8px(1, 2, 3, 255)));
+    let text = report_text(&document);
+    assert!(text.contains("vector mask that could not be read"), "{text}");
+}
+
+#[test]
+fn a_vector_mask_density_lets_the_hidden_area_show_through_the_baked_fill() {
+    // Flags bit 4 with a parameter block naming only a vector density of
+    // 128: coverage becomes `d * c + (1 - d)`, so outside the shape the
+    // fill keeps `1 - d` of its opacity and the layer spans the canvas.
+    let mut file = empty_fill_file(
+        8,
+        8,
+        *b"SoCo",
+        solid_block(255.0, 0.0, 0.0),
+        Some(vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1))),
+    );
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask = Some((0, 0, 0, 0, 0, 0x10));
+        layer.mask_tail = Some(vec![0x04, 128]);
+    }
+    let document = doc(&file.write());
+    let d = 128.0_f32 / 255.0;
+    let inside = fill_px(&document, 4, 4).map_or(f32::NAN, |p| p[3]);
+    let outside = fill_px(&document, 0, 0).map_or(f32::NAN, |p| p[3]);
+    assert_eq!(inside, f(1.0));
+    assert_eq!(outside, f(1.0 - d));
+    let text = report_text(&document);
+    assert!(!text.contains("density"), "applied, so not reported: {text}");
+}
+
+#[test]
+fn a_vector_mask_feather_on_a_baked_fill_is_reported() {
+    let mut file = empty_fill_file(
+        8,
+        8,
+        *b"SoCo",
+        solid_block(255.0, 0.0, 0.0),
+        Some(vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1))),
+    );
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask = Some((0, 0, 0, 0, 0, 0x10));
+        let mut tail = vec![0x08];
+        tail.extend_from_slice(&1.5_f64.to_be_bytes());
+        layer.mask_tail = Some(tail);
+    }
+    let text = report_text(&doc(&file.write()));
+    assert!(text.contains("feather"), "{text}");
+}
+
+#[test]
+fn a_rendered_mask_channel_is_not_applied_a_second_time_to_a_baked_fill() {
+    // Flags bit 3: `-2` is Photoshop's rendering of the vector mask (here a
+    // deliberately all-hidden plane). The vector mask is baked into the
+    // pixels, so applying the plane again would hide the whole fill.
+    let mut file = empty_fill_file(
+        8,
+        8,
+        *b"SoCo",
+        solid_block(255.0, 0.0, 0.0),
+        Some(vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1))),
+    );
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask = Some((0, 0, 8, 8, 0, 0x08));
+        layer.channels.push((-2, vec![0; 64]));
+    }
+    let document = doc(&file.write());
+    let id = root(&document.layers, 0);
+    assert!(document.layers.mask(id).is_none(), "no mask on top of the bake");
+    assert_eq!(fill_px(&document, 4, 4), Some(u8px(255, 0, 0, 255)));
+    // The genuine user mask (`-3`, shown for x < 4 only) still applies.
+    let mut file = empty_fill_file(
+        8,
+        8,
+        *b"SoCo",
+        solid_block(255.0, 0.0, 0.0),
+        Some(vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1))),
+    );
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask = Some((0, 0, 8, 8, 0, 0x18));
+        let mut tail = vec![0x00, 0];
+        for v in [0_i32, 0, 8, 4] {
+            tail.extend_from_slice(&v.to_be_bytes());
+        }
+        tail.extend_from_slice(&[0x00, 0]);
+        layer.mask_tail = Some(tail);
+        layer.channels.push((-2, vec![0; 64]));
+        layer.channels.push((-3, vec![255; 32]));
+    }
+    let document = doc(&file.write());
+    let id = root(&document.layers, 0);
+    assert_eq!(effective_mask(&document, id, 3, 3), Some(1.0));
+    assert_eq!(effective_mask(&document, id, 5, 3), Some(0.0));
 }
 
 #[test]
@@ -470,10 +577,13 @@ fn an_artboard_background_is_charged_to_the_pixel_budget_and_refused_over_it() {
     };
     let header = super::Header { version: 1, channels: 3, color_mode: 3, width: 8, height: 8, depth: 8 };
     let mut budget = super::vector::Budget { pixels: 11, work: 0 };
-    assert!(super::artboard_background(bg, header, &mut budget).is_none());
+    assert!(matches!(
+        super::artboard_background(bg, header, &mut budget),
+        Err(fill::ArtboardLeft::TooLarge)
+    ));
     assert_eq!(budget.pixels, 11, "a refusal charges nothing");
     let mut budget = super::vector::Budget { pixels: 12, work: 0 };
-    assert!(super::artboard_background(bg, header, &mut budget).is_some());
+    assert!(super::artboard_background(bg, header, &mut budget).is_ok());
     assert_eq!(budget.pixels, 0, "4 x 3 pixels were charged");
 }
 
@@ -504,4 +614,31 @@ fn an_inverted_vector_mask_draws_the_fill_outside_the_shape_across_the_canvas() 
     assert_eq!(fill_px(&document, 0, 0), Some(u8px(255, 0, 0, 255)), "outside the shape");
     assert_eq!(fill_px(&document, 7, 7), Some(u8px(255, 0, 0, 255)));
     assert!(fill_px(&document, 4, 4).is_some_and(|p| p[3] == 0.0), "the hole");
+}
+
+#[test]
+fn an_artboard_with_an_empty_or_off_canvas_rectangle_says_so() {
+    for rect in [(2.0, 2.0, 2.0, 2.0), (100.0, 100.0, 200.0, 200.0), (-9.0, -9.0, -1.0, -1.0)] {
+        let document = doc(&artboard_file(4, rect).write());
+        assert_eq!(document.layers.len(), 1, "{rect:?}: no background layer");
+        let text = report_text(&document);
+        assert!(text.contains("empty rectangle or one entirely off the canvas"), "{rect:?}: {text}");
+        assert!(!text.contains("could not be read"), "{rect:?}: {text}");
+    }
+}
+
+#[test]
+fn a_drawn_fills_buffer_is_charged_unless_it_is_the_shapes_own_charged_raster() {
+    use half::f16;
+    let region = square(10);
+    let raster = |outside| super::vector::Raster {
+        bounds: square(10),
+        coverage: vec![f16::ONE; 100],
+        outside,
+        charged: 200,
+    };
+    assert_eq!(super::fill_pixel_charge(Some(&raster(false)), 1.0, region), 0);
+    assert_eq!(super::fill_pixel_charge(Some(&raster(false)), 0.5, region), 100);
+    assert_eq!(super::fill_pixel_charge(Some(&raster(true)), 1.0, region), 100);
+    assert_eq!(super::fill_pixel_charge(None, 1.0, region), 100);
 }

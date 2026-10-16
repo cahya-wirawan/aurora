@@ -491,6 +491,9 @@ enum Note {
     /// Artboard background colours drawn as a layer (task 108).
     ArtboardBackgroundDrawn,
     ArtboardBackgroundNotDrawn(fill::ArtboardLeft),
+    /// A drawn fill whose vector mask was turned off (`true`) or could not
+    /// be read (`false`): the fill covers the whole canvas.
+    FillVectorMaskNotApplied(bool),
     TextRasterised,
     SmartObjectRasterised,
     ShapeRasterised,
@@ -789,7 +792,30 @@ fn note_text(note: Note, n: u64) -> String {
             fill::ArtboardLeft::Unreadable => {
                 format!("{n} artboard background{s} could not be read and {was} not drawn.")
             }
+            fill::ArtboardLeft::Empty => format!(
+                "{n} artboard{s} with a custom background colour {} an empty rectangle or one \
+                 entirely off the canvas, so no background was drawn.",
+                if one { "has" } else { "have" },
+            ),
+            fill::ArtboardLeft::TooLarge => format!(
+                "{n} artboard background{s} {was} too large to draw within the memory bound \
+                 and {was} not drawn."
+            ),
         },
+        Note::FillVectorMaskNotApplied(disabled) => format!(
+            "{n} drawn fill layer{s} had a vector mask that {} {}; the fill covers the whole \
+             canvas instead of the shape.",
+            if disabled {
+                "was turned off"
+            } else {
+                "could not be read"
+            },
+            if one {
+                "and is not applied"
+            } else {
+                "and are not applied"
+            },
+        ),
         Note::FillNotDrawn(reason) => format!(
             "{n} shape or fill layer{s} with no stored pixels {was} left out — {}.",
             match reason {
@@ -3630,16 +3656,13 @@ fn build_tree(
                 let mut children = children;
                 if let Some(block) = record.artboard.as_deref() {
                     match fill::parse_artboard(block) {
-                        Ok(Some(bg)) => {
-                            if let Some(node) = artboard_background(bg, header, vector_budget) {
+                        Ok(Some(bg)) => match artboard_background(bg, header, vector_budget) {
+                            Ok(node) => {
                                 children.insert(0, node);
                                 notes.add(Note::ArtboardBackgroundDrawn);
-                            } else {
-                                notes.add(Note::ArtboardBackgroundNotDrawn(
-                                    fill::ArtboardLeft::Unreadable,
-                                ));
                             }
-                        }
+                            Err(why) => notes.add(Note::ArtboardBackgroundNotDrawn(why)),
+                        },
                         Ok(None) => {}
                         Err(why) => notes.add(Note::ArtboardBackgroundNotDrawn(why)),
                     }
@@ -3965,7 +3988,7 @@ fn drawn_fill_node(
     };
     let canvas = canvas_of(header);
     // The vector mask, when it is used: a disabled or unreadable one draws
-    // the fill over the whole canvas, as Photoshop shows a disabled mask.
+    // the fill over the whole canvas (and says so).
     let mut path_box = None;
     let mut raster = None;
     if let Some(block) = record.vector.as_deref() {
@@ -3974,18 +3997,25 @@ fn drawn_fill_node(
             return left_out(notes, fill::LeftOut::TooLarge);
         }
         vector_budget.work -= records;
-        if let Ok(path) = vector::parse(block)
-            && !path.disable
-        {
-            raster = match vector::rasterize(&path, header.width, header.height, vector_budget) {
-                Ok(r) => Some(r),
-                Err(_) => return left_out(notes, fill::LeftOut::TooLarge),
-            };
-            path_box = vector::path_extent(&path, header.width, header.height);
+        match vector::parse(block) {
+            Ok(path) if !path.disable => {
+                raster = match vector::rasterize(&path, header.width, header.height, vector_budget)
+                {
+                    Ok(r) => Some(r),
+                    Err(_) => return left_out(notes, fill::LeftOut::TooLarge),
+                };
+                path_box = vector::path_extent(&path, header.width, header.height);
+            }
+            Ok(_) => notes.add(Note::FillVectorMaskNotApplied(true)),
+            Err(_) => notes.add(Note::FillVectorMaskNotApplied(false)),
         }
     }
+    // The vector mask's density is applied to the baked coverage; below
+    // 100 % the hidden area shows through, so the fill spans the canvas.
+    let params = record.mask.map(|m| m.parameters).unwrap_or_default();
+    let density = f32::from(params.vector_density.unwrap_or(u8::MAX)) / 255.0;
     let region = match &raster {
-        Some(r) if !r.outside => r.bounds,
+        Some(r) if !r.outside && density >= 1.0 => r.bounds,
         _ => canvas,
     };
     if region.width == 0 || region.height == 0 {
@@ -3993,18 +4023,16 @@ fn drawn_fill_node(
         notes.add(Note::FillDrawn);
         return Some(empty_fill_node(src, record, header, notes, vector_budget));
     }
-    let charge = u64::from(region.width) * u64::from(region.height);
-    if raster.as_ref().is_none_or(|r| r.outside) {
-        if charge > vector_budget.pixels {
-            return left_out(notes, fill::LeftOut::TooLarge);
-        }
-        vector_budget.pixels -= charge;
+    let charge = fill_pixel_charge(raster.as_ref(), density, region);
+    if charge > vector_budget.pixels {
+        return left_out(notes, fill::LeftOut::TooLarge);
     }
+    vector_budget.pixels -= charge;
     let reference = match &fill {
         fill::Fill::Gradient(g) => fill::reference_box(g, path_box, canvas),
         fill::Fill::Solid(_) => canvas,
     };
-    let Some(samples) = fill::render(&fill, region, reference, raster.as_ref()) else {
+    let Some(samples) = fill::render(&fill, region, reference, raster.as_ref(), density) else {
         return left_out(notes, fill::LeftOut::TooLarge);
     };
     let Ok(image) = Image::new(region.width, region.height, IccProfile::srgb(), samples) else {
@@ -4015,14 +4043,32 @@ fn drawn_fill_node(
         notes.add(Note::FillGradientApproximate);
     }
     let props = props_for(record, notes);
-    let outcome = masks_for(
-        src,
-        record,
-        header,
-        region.union(&canvas),
-        notes,
-        vector_budget,
-    );
+    let outcome = if raster.is_some() {
+        // The vector mask is baked into the pixels. Its rendering in the
+        // `-2` channel (flags bit 3) is therefore not applied again: only
+        // the pixel part is, as `masks_for` does beside an applied vector
+        // mask (the genuine user mask, `-3`, or a plain `-2`).
+        let user_density = params.user_density.unwrap_or(u8::MAX);
+        let mask =
+            pixel_part(src, record, header, user_density, vector_budget).unwrap_or_else(|_| {
+                notes.add(Note::MaskUnreadable);
+                None
+            });
+        MaskOutcome {
+            pixel_used: mask.is_some(),
+            mask,
+            vector_applied: true,
+        }
+    } else {
+        masks_for(
+            src,
+            record,
+            header,
+            region.union(&canvas),
+            notes,
+            vector_budget,
+        )
+    };
     note_unsupported(record, &outcome, notes, true);
     Some(PsdNode::Layer(PsdLayer {
         props,
@@ -4032,6 +4078,18 @@ fn drawn_fill_node(
         smart: None,
         pending: None,
     }))
+}
+
+/// The budget pixels a drawn fill's buffer adds to what the vector
+/// rasterisation was already charged: nothing when the region is the
+/// shape's own raster, the whole region when it is the canvas (no usable
+/// mask, an inverted one, or a density below 100 %).
+fn fill_pixel_charge(raster: Option<&vector::Raster>, density: f32, region: Rect) -> u64 {
+    if raster.is_none_or(|r| r.outside || density < 1.0) {
+        u64::from(region.width) * u64::from(region.height)
+    } else {
+        0
+    }
 }
 
 /// A drawn fill whose shape covers nothing: a layer with no pixels.
@@ -4056,13 +4114,14 @@ fn empty_fill_node(
 }
 
 /// An artboard's background colour as a pixel layer over its rectangle
-/// clipped to the canvas, or `None` when it is empty off the canvas, too
-/// large for the budget, or cannot be built.
+/// clipped to the canvas, or why there is none: empty or entirely off the
+/// canvas, over the pixel budget, or a buffer that cannot be built.
 fn artboard_background(
     bg: fill::ArtboardBackground,
     header: Header,
     budget: &mut vector::Budget,
-) -> Option<PsdNode> {
+) -> Result<PsdNode, fill::ArtboardLeft> {
+    use fill::ArtboardLeft as Left;
     let canvas = canvas_of(header);
     let x0 = bg.rect.x.max(0);
     let y0 = bg.rect.y.max(0);
@@ -4071,20 +4130,22 @@ fn artboard_background(
     let region = Rect {
         x: x0,
         y: y0,
-        width: u32::try_from((x1 - x0).max(0)).ok()?,
-        height: u32::try_from((y1 - y0).max(0)).ok()?,
+        width: u32::try_from((x1 - x0).max(0)).map_err(|_| Left::Empty)?,
+        height: u32::try_from((y1 - y0).max(0)).map_err(|_| Left::Empty)?,
     };
     if region.width == 0 || region.height == 0 {
-        return None;
+        return Err(Left::Empty);
     }
     let charge = u64::from(region.width) * u64::from(region.height);
     if charge > budget.pixels {
-        return None;
+        return Err(Left::TooLarge);
     }
-    let samples = fill::render(&fill::Fill::Solid(bg.colour), region, region, None)?;
-    let image = Image::new(region.width, region.height, IccProfile::srgb(), samples).ok()?;
+    let samples = fill::render(&fill::Fill::Solid(bg.colour), region, region, None, 1.0)
+        .ok_or(Left::TooLarge)?;
+    let image = Image::new(region.width, region.height, IccProfile::srgb(), samples)
+        .map_err(|_| Left::TooLarge)?;
     budget.pixels -= charge;
-    Some(PsdNode::Layer(PsdLayer {
+    Ok(PsdNode::Layer(PsdLayer {
         props: PsdProps {
             name: "Artboard background".to_owned(),
             blend: BlendMode::Normal,
