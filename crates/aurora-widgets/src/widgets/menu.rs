@@ -403,7 +403,7 @@ impl MenuState {
         self.transition_paged(key, 1)
     }
 
-    /// [`Self::transition`] with a page of `page` items for
+    /// `transition` with a page of `page` items for
     /// `PageUp`/`PageDown`.
     fn transition_paged(&self, key: MenuKey, page: usize) -> MenuOutcome {
         if key == MenuKey::Escape {
