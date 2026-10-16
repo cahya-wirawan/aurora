@@ -245,7 +245,7 @@ pub(crate) fn spans(stops: &[GradientBarStop]) -> Vec<Span> {
     out
 }
 
-/// The colour the bar shows at position `t`: the model [`spans`] draws
+/// The colour the bar shows at position `t`: the model `spans` draws
 /// (the later of two stops at one position wins, the ends held flat).
 #[must_use]
 pub fn gradient_bar_colour_at(stops: &[GradientBarStop], t: f32) -> Option<[f32; 3]> {
