@@ -90777,6 +90777,7 @@ mod tests {
         include!("two_adjust_fidelity_tests.rs");
         include!("gradient_fidelity_tests.rs");
         include!("shape_fidelity_tests.rs");
+        include!("gradient_overlay_tests.rs");
         include!("small_machine_effect_tests.rs");
     }
 }

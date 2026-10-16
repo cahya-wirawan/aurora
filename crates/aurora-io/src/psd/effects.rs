@@ -20,9 +20,8 @@
 use aurora_core::LayerEffects;
 use aurora_core::effects::{
     ColorOverlay, DropShadow, EffectBlendMode, EffectColor, EffectGate, GradientOverlay,
-    MAX_EFFECT_DISTANCE,
-    MAX_EFFECT_INSTANCES, MAX_EFFECT_SCALE, MAX_EFFECT_SIZE, OtherEffects, OuterGlow, Stroke,
-    StrokeFill, StrokePosition,
+    MAX_EFFECT_DISTANCE, MAX_EFFECT_INSTANCES, MAX_EFFECT_SCALE, MAX_EFFECT_SIZE, OtherEffects,
+    OuterGlow, Stroke, StrokeFill, StrokePosition,
 };
 
 use super::descriptor::{self, Descriptor, ItemBudget, Value};

@@ -101,17 +101,23 @@ impl GradientFill {
     /// The first [`GradientError`] found.
     pub fn validate(&self) -> Result<(), GradientError> {
         if self.colours.is_empty() || self.colours.len() > MAX_GRADIENT_STOPS {
-            return Err(GradientError { field: "colour stops" });
+            return Err(GradientError {
+                field: "colour stops",
+            });
         }
         if self.alphas.len() > MAX_GRADIENT_STOPS {
-            return Err(GradientError { field: "opacity stops" });
+            return Err(GradientError {
+                field: "opacity stops",
+            });
         }
         let mut last = 0.0_f32;
         for s in &self.colours {
             unit_f32(s.pos, "stop position")?;
             unit_f32(s.mid, "midpoint")?;
             if s.pos < last {
-                return Err(GradientError { field: "stop order" });
+                return Err(GradientError {
+                    field: "stop order",
+                });
             }
             last = s.pos;
             for c in s.value {
@@ -123,7 +129,9 @@ impl GradientFill {
             unit_f32(s.pos, "stop position")?;
             unit_f32(s.mid, "midpoint")?;
             if s.pos < last {
-                return Err(GradientError { field: "stop order" });
+                return Err(GradientError {
+                    field: "stop order",
+                });
             }
             last = s.pos;
             unit_f32(s.value, "stop opacity")?;

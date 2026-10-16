@@ -1352,3 +1352,192 @@ fn outer_glow_notes_name_what_is_not_drawn() {
         assert!(items.contains(needle), "{needle:?} missing from\n{items}");
     }
 }
+
+/// A `GrFl` descriptor: `Grad` of two colour stops, angle 30, reversed.
+fn gradient_fill<'a>(enab: bool, extra: Vec<(&'a [u8], V<'a>)>) -> V<'a> {
+    let stop = |r: f64, g: f64, b: f64, at: f64| {
+        V::Obj(vec![
+            (b"Clr ", rgb(r, g, b)),
+            (b"Type", V::Enum(b"Clry", b"UsrS")),
+            (b"Lctn", V::Long(at as i32)),
+            (b"Mdpn", V::Long(50)),
+        ])
+    };
+    let mut items = vec![
+        (b"enab" as &[u8], V::Bool(enab)),
+        (b"present", V::Bool(true)),
+        (b"Md  ", V::Enum(b"BlnM", b"Mltp")),
+        (b"Opct", V::Unit(b"#Prc", 40.0)),
+        (
+            b"Grad",
+            V::Obj(vec![
+                (b"GrdF", V::Enum(b"GrdF", b"CstS")),
+                (
+                    b"Clrs",
+                    V::List(vec![
+                        stop(255.0, 0.0, 0.0, 0.0),
+                        stop(0.0, 0.0, 255.0, 4096.0),
+                    ]),
+                ),
+                (
+                    b"Trns",
+                    V::List(vec![V::Obj(vec![
+                        (b"Opct", V::Unit(b"#Prc", 100.0)),
+                        (b"Lctn", V::Long(0)),
+                        (b"Mdpn", V::Long(50)),
+                    ])]),
+                ),
+            ]),
+        ),
+        (b"Angl", V::Unit(b"#Ang", 30.0)),
+        (b"Type", V::Enum(b"GrdT", b"Lnr ")),
+        (b"Rvrs", V::Bool(true)),
+        (b"Dthr", V::Bool(true)),
+        (b"Algn", V::Bool(true)),
+        (b"Scl ", V::Unit(b"#Prc", 80.0)),
+    ];
+    items.retain(|(k, _)| !extra.iter().any(|(e, _)| e == k));
+    items.extend(extra);
+    V::Obj(items)
+}
+
+#[test]
+fn a_gradient_overlay_is_modelled_with_every_field() {
+    let read = mapped(&effects_block(&[(b"GrFl", gradient_fill(true, vec![]))]));
+    let fx = &read.effects;
+    assert_eq!(fx.gradient_overlays.len(), 1);
+    assert_eq!(fx.other.gradient_overlays, 0);
+    let Some(o) = fx.gradient_overlays.first() else {
+        unreachable!("one overlay");
+    };
+    assert_eq!(o.blend_mode, EffectBlendMode::Multiply);
+    assert!((o.opacity - 0.4).abs() < 1e-6);
+    assert!(o.dither && o.gate.on() && o.reference.is_none());
+    let g = &o.gradient;
+    assert!((g.angle - 30.0).abs() < 1e-9 && (g.scale - 0.8).abs() < 1e-9);
+    assert!(g.reverse && g.align);
+    assert_eq!(g.style, aurora_core::GradientStyle::Linear);
+    assert_eq!(g.colours.len(), 2);
+    assert_eq!(g.colours.first().map(|s| s.value), Some([1.0, 0.0, 0.0]));
+    assert_eq!(g.colours.get(1).map(|s| s.pos), Some(1.0));
+    assert_eq!(g.alphas.len(), 1);
+}
+
+#[test]
+fn a_gradient_multi_list_keeps_every_instance_in_order() {
+    let read = mapped(&effects_block(&[(
+        b"gradientFillMulti",
+        V::List(vec![
+            gradient_fill(true, vec![]),
+            gradient_fill(false, vec![]),
+        ]),
+    )]));
+    let gates: Vec<bool> = read
+        .effects
+        .gradient_overlays
+        .iter()
+        .map(|o| o.gate.on())
+        .collect();
+    assert_eq!(gates, vec![true, false]);
+    assert_eq!(read.effects.shown_gradient_overlays(), 1);
+}
+
+#[test]
+fn unmodelled_gradient_overlays_are_counted_only_when_shown() {
+    let noise = |enab: bool| {
+        let mut v = gradient_fill(enab, vec![]);
+        if let V::Obj(items) = &mut v {
+            items.retain(|(k, _)| *k != b"Grad".as_slice());
+            items.push((b"Grad", V::Obj(vec![(b"GrdF", V::Enum(b"GrdF", b"ClNs"))])));
+        }
+        v
+    };
+    let read = mapped(&effects_block(&[(b"GrFl", noise(true))]));
+    assert!(read.effects.gradient_overlays.is_empty());
+    assert_eq!(read.effects.other.gradient_overlays, 1);
+    assert_eq!(
+        mapped(&effects_block(&[(b"GrFl", noise(false))]))
+            .effects
+            .other
+            .gradient_overlays,
+        0
+    );
+    // "Align with layer" off: not modelled, counted.
+    let unaligned = gradient_fill(true, vec![(b"Algn", V::Bool(false))]);
+    let read = mapped(&effects_block(&[(b"GrFl", unaligned)]));
+    assert!(read.effects.gradient_overlays.is_empty());
+    assert_eq!(read.effects.other.gradient_overlays, 1);
+    // An unknown style, and a missing Grad, likewise.
+    let style = gradient_fill(true, vec![(b"Type", V::Enum(b"GrdT", b"Xxxx"))]);
+    assert_eq!(
+        mapped(&effects_block(&[(b"GrFl", style)]))
+            .effects
+            .other
+            .gradient_overlays,
+        1
+    );
+    let none = V::Obj(vec![(b"enab", V::Bool(true))]);
+    assert_eq!(
+        mapped(&effects_block(&[(b"GrFl", none)]))
+            .effects
+            .other
+            .gradient_overlays,
+        1
+    );
+}
+
+#[test]
+fn a_hostile_gradient_overlay_never_panics_or_allocates_past_the_stop_cap() {
+    let stop = |at: i32| V::Obj(vec![(b"Clr ", rgb(1.0, 2.0, 3.0)), (b"Lctn", V::Long(at))]);
+    let many: Vec<V<'_>> = (0..300).map(|i| stop(i * 10)).collect();
+    let hostile = V::Obj(vec![
+        (b"enab", V::Bool(true)),
+        (
+            b"Grad",
+            V::Obj(vec![
+                (b"GrdF", V::Enum(b"GrdF", b"CstS")),
+                (b"Clrs", V::List(many)),
+            ]),
+        ),
+    ]);
+    let read = mapped(&effects_block(&[(b"GrFl", hostile)]));
+    assert!(read.effects.gradient_overlays.is_empty());
+    assert_eq!(read.effects.other.gradient_overlays, 1);
+    // NaN scale and an out-of-range scale: counted, no panic.
+    for scale in [f64::NAN, 0.0, 1.0e9] {
+        let g = gradient_fill(true, vec![(b"Scl ", V::Unit(b"#Prc", scale))]);
+        let read = mapped(&effects_block(&[(b"GrFl", g)]));
+        assert!(read.effects.gradient_overlays.is_empty(), "{scale}");
+    }
+}
+
+#[test]
+fn a_drawn_gradient_overlay_is_not_reported_and_keeps_its_record_rectangle() {
+    let block = effects_block(&[(b"GrFl", gradient_fill(true, vec![]))]);
+    let doc = open(
+        &TestPsd::new(1, 2, 2, 8)
+            .with(|p| {
+                p.layers = vec![
+                    TestLayer::pixels("px", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                        .with(|l| l.blocks.push((*b"lfx2", block.clone()))),
+                ];
+            })
+            .write(),
+    );
+    let items = doc.report.items.join("\n");
+    assert!(!items.contains("other effect"), "{items}");
+    let Some(id) = find(&doc.layers, "px") else {
+        unreachable!("layer");
+    };
+    let fx = doc.layers.effects(id);
+    assert_eq!(fx.map(|f| f.gradient_overlays.len()), Some(1));
+    // The overlay's box is the record rectangle (here 1 x 1), relative to
+    // the layer's own bounds.
+    let r = fx
+        .and_then(|f| f.gradient_overlays.first())
+        .and_then(|o| o.reference);
+    assert_eq!(
+        r.map(|r| (r.dx, r.dy, r.width, r.height)),
+        Some((0, 0, 1, 1))
+    );
+}

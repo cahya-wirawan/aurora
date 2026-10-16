@@ -955,4 +955,148 @@ mod tests {
         assert_eq!(fx.shown_color_strokes(), 1);
         assert_eq!(fx.shown_unrendered_strokes(), 2);
     }
+
+    fn ramp() -> crate::GradientFill {
+        let stop = |pos: f32, v: f32| crate::FillStop {
+            pos,
+            mid: 0.5,
+            value: [v; 3],
+        };
+        crate::GradientFill {
+            colours: vec![stop(0.0, 0.0), stop(1.0, 1.0)],
+            alphas: Vec::new(),
+            style: crate::GradientStyle::Linear,
+            angle: 0.0,
+            scale: 1.0,
+            reverse: false,
+            align: true,
+            offset: (0.0, 0.0),
+        }
+    }
+
+    fn overlay() -> GradientOverlay {
+        GradientOverlay {
+            gate: EffectGate::default(),
+            blend_mode: EffectBlendMode::Normal,
+            opacity: 1.0,
+            gradient: ramp(),
+            dither: false,
+            reference: None,
+        }
+    }
+
+    #[test]
+    fn gradient_overlay_validation_refuses_each_bad_field() {
+        let with = |o: GradientOverlay| LayerEffects {
+            gradient_overlays: vec![o],
+            ..LayerEffects::default()
+        };
+        assert_eq!(with(overlay()).validate(), Ok(()));
+        let mut bad = Vec::new();
+        for opacity in [-0.1, 1.1, f32::NAN] {
+            let mut o = overlay();
+            o.opacity = opacity;
+            bad.push(o);
+        }
+        let mut o = overlay();
+        o.gradient.colours.clear();
+        bad.push(o);
+        let mut o = overlay();
+        o.gradient.colours = vec![o.gradient.colours[0]; crate::MAX_GRADIENT_STOPS + 1];
+        bad.push(o);
+        let mut o = overlay();
+        o.gradient.scale = 0.0;
+        bad.push(o);
+        let mut o = overlay();
+        o.gradient.angle = f64::NAN;
+        bad.push(o);
+        let mut o = overlay();
+        o.gradient.offset = (2000.0, 0.0);
+        bad.push(o);
+        let mut o = overlay();
+        o.gradient.colours[0].value = [2.0, 0.0, 0.0];
+        bad.push(o);
+        let mut o = overlay();
+        o.gradient.colours.swap(0, 1);
+        bad.push(o);
+        let mut o = overlay();
+        o.gradient.align = false;
+        bad.push(o);
+        for (zero_w, zero_h, far) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut o = overlay();
+            o.reference = Some(ReferenceBox {
+                dx: if far { i64::MAX } else { 0 },
+                dy: 0,
+                width: u32::from(!zero_w),
+                height: u32::from(!zero_h),
+            });
+            bad.push(o);
+        }
+        for (n, o) in bad.into_iter().enumerate() {
+            assert!(with(o).validate().is_err(), "case {n}");
+        }
+        let many = LayerEffects {
+            gradient_overlays: vec![overlay(); MAX_EFFECT_INSTANCES + 1],
+            ..LayerEffects::default()
+        };
+        assert!(matches!(
+            many.validate(),
+            Err(EffectsError::TooManyInstances { .. })
+        ));
+    }
+
+    #[test]
+    fn gradient_overlays_are_gated_counted_and_not_on_the_effects_wire() {
+        let mut fx = LayerEffects {
+            gradient_overlays: vec![overlay()],
+            ..LayerEffects::default()
+        };
+        assert!(fx.shows_any());
+        assert!(!fx.is_empty());
+        assert_eq!(fx.shown_gradient_overlays(), 1);
+        fx.gradient_overlays[0].gate.present = false;
+        assert_eq!((fx.shown_gradient_overlays(), fx.shows_any()), (0, false));
+        fx.gradient_overlays[0].gate.present = true;
+        fx.enabled = false;
+        assert_eq!(fx.shown_gradient_overlays(), 0);
+        // `#[serde(skip)]`: the positional wire is the one before task 110.
+        let with = LayerEffects {
+            gradient_overlays: vec![overlay()],
+            ..LayerEffects::default()
+        };
+        let a = postcard::to_allocvec(&with).unwrap_or_default();
+        let b = postcard::to_allocvec(&LayerEffects::default()).unwrap_or_default();
+        assert_eq!(a, b);
+        let back: Result<LayerEffects, _> = postcard::from_bytes(&a);
+        assert_eq!(back.map(|f| f.gradient_overlays.len()).ok(), Some(0));
+    }
+
+    #[test]
+    fn a_reference_box_follows_the_layer_bounds() {
+        let r = ReferenceBox {
+            dx: -3,
+            dy: 5,
+            width: 7,
+            height: 9,
+        };
+        let moved = crate::Rect {
+            x: 100,
+            y: 200,
+            width: 50,
+            height: 50,
+        };
+        assert_eq!(
+            r.within(moved),
+            crate::Rect {
+                x: 97,
+                y: 205,
+                width: 7,
+                height: 9
+            }
+        );
+    }
 }
