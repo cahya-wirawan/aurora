@@ -879,6 +879,29 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_stops_at_interior_neighbours_on_both_sides() {
+        let inner = [
+            GradientBarStop::new(0.1, [0.0; 3]),
+            GradientBarStop::new(0.4, [0.5; 3]),
+            GradientBarStop::new(0.7, [1.0; 3]),
+        ];
+        let (mut tree, id) = bar(&inner);
+        assert!(select_gradient_stop(&mut tree, id, 1).is_ok());
+        let _ = move_selected_stop_from_point(&mut tree, id, 5000.0, 5.0);
+        assert_eq!(state(&tree, id).stops()[1].position, 0.7);
+        let _ = move_selected_stop_from_point(&mut tree, id, -5000.0, 5.0);
+        assert_eq!(state(&tree, id).stops()[1].position, 0.1);
+        // The end stops are bounded by their one neighbour, not by 0 and 1.
+        assert!(select_gradient_stop(&mut tree, id, 0).is_ok());
+        let _ = move_selected_stop_from_point(&mut tree, id, 5000.0, 5.0);
+        assert_eq!(state(&tree, id).stops()[0].position, 0.1);
+        // (stop 1 now sits at 0.1, so that is the last stop's lower bound)
+        assert!(select_gradient_stop(&mut tree, id, 2).is_ok());
+        let _ = move_selected_stop_from_point(&mut tree, id, -5000.0, 5.0);
+        assert_eq!(state(&tree, id).stops()[2].position, 0.1);
+    }
+
+    #[test]
     fn the_end_stops_are_bounded_by_zero_and_one() {
         let (mut tree, id) = bar(&stops3());
         assert_eq!(
