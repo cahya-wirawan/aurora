@@ -204,3 +204,35 @@ fn a_grey_profile_exposure_is_cpu_only_and_matches_its_op() {
     }
     assert_eq!(seen, 4);
 }
+
+/// The fixture's layers are masked, which alone keeps them off the GPU; an
+/// unmasked grey-profile Exposure must be refused for its own sake, with an
+/// unmasked plain Exposure (the control) admitted.
+#[test]
+fn an_unmasked_grey_profile_exposure_is_refused_by_the_gpu_predicate() {
+    let entries: Vec<u16> = (0..=255_u16).map(|i| i * 257).collect();
+    let (Ok(trc), Ok(sliders)) = (
+        aurora_core::GreyTrc::new(entries),
+        aurora_core::ExposureParams::new(1.0, 0.0, 1.0),
+    ) else {
+        unreachable!("valid");
+    };
+    let mut layers = aurora_doc::LayerTree::new();
+    let add = |layers: &mut aurora_doc::LayerTree, adjustment| match layers
+        .add_adjustment_layer_at("E", adjustment, None, 0)
+    {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let plain = add(&mut layers, aurora_doc::Adjustment::Exposure(sliders));
+    let grey = add(
+        &mut layers,
+        aurora_doc::Adjustment::ExposureTrc(aurora_core::ExposureTrcParams::new(sliders, trc)),
+    );
+    assert!(super::super::adjustment_layer_qualifies_for_gpu(
+        &layers, plain
+    ));
+    assert!(!super::super::adjustment_layer_qualifies_for_gpu(
+        &layers, grey
+    ));
+}
