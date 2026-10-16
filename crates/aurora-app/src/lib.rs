@@ -12390,6 +12390,48 @@ fn palette_row_click(
     ))
 }
 
+/// What an open command palette did with a pointer press ([`route_palette_press`]).
+#[derive(Debug, Clone, PartialEq)]
+enum PalettePress {
+    /// No palette is open: the press goes on to the ordinary routing.
+    NotOpen,
+    /// The palette took the press and nothing happened (not a primary
+    /// press, or not on a result row): the press must reach nothing else.
+    Swallowed,
+    /// A primary press on a result row, which ran Enter's path
+    /// (a prompt validates its typed text there, so a refused one is
+    /// `Ran(None)` with the prompt still open).
+    Ran(Option<ActivatedCommand>),
+}
+
+/// An open command palette owns every pointer press (0.257.0): only a
+/// primary press on a result row does anything ([`palette_row_click`]);
+/// every other press -- the query strip, the scrollbar, the panel's
+/// padding, a press outside it, any other button -- is swallowed, so no
+/// panel, layer row, tab, gallery or canvas tool underneath can start
+/// anything. (It does not light-dismiss the palette: Escape closes it,
+/// as before.)
+fn route_palette_press(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    palette: &mut Option<WidgetId>,
+    button: PointerButton,
+    position: (f32, f32),
+    clipboard: &mut dyn ClipboardAccess,
+    file_dialog: &mut dyn FileDialogAccess,
+) -> PalettePress {
+    if palette.is_none() {
+        return PalettePress::NotOpen;
+    }
+    if button != PointerButton::Primary {
+        return PalettePress::Swallowed;
+    }
+    match palette_row_click(workspace, focus, palette, position, clipboard, file_dialog) {
+        Some(picked) => PalettePress::Ran(picked),
+        None => PalettePress::Swallowed,
+    }
+}
+
 /// Routes one key press while the command palette is open — captures
 /// input directly rather than going through [`ShortcutRegistry`], the
 /// same "a modal dialog owns the keyboard while open" behaviour every
@@ -32981,6 +33023,13 @@ impl App {
         let position = logical_point(physical_position, self.scale_factor);
         self.pointer_position = Some(position);
 
+        // 0.257.0: while the command palette is open nothing underneath
+        // follows the pointer (a drag begun before it opened resumes, or
+        // is committed by its release, once the palette is gone).
+        if self.command_palette.is_some() {
+            return;
+        }
+
         // 0.166.0 (review I1: first): a panel press owns every move
         // until its release — below the threshold it is still a click;
         // past it, a drag that shows the drop indicator
@@ -33086,6 +33135,19 @@ impl App {
         }
     }
 
+    /// Finishes a palette row press ([`route_palette_press`] returned
+    /// [`PalettePress::Ran`]): runs what the row resolved to and re-lays
+    /// out.
+    fn finish_palette_press(&mut self, picked: Option<ActivatedCommand>) {
+        self.run_activated(picked);
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        self.needs_redraw = true;
+    }
+
     /// A real `WindowEvent::MouseInput { state: Pressed, .. }`: starts a
     /// dock-rail resize ([`RailResize`]) on the divider
     /// ([`pointer_on_rail_divider`]), performs the active Zoom tool's
@@ -33106,31 +33168,6 @@ impl App {
     /// from under its fixed reference point — are exactly the pair
     /// [`commit_ending_drag`] and [`DocumentSession::active_layer`]'s own doc
     /// comment describe.
-    #[allow(clippy::too_many_lines)]
-    /// A primary press on a command palette result row ([`palette_row_click`]):
-    /// runs what the row resolved to and re-lays out; `false` when the
-    /// press is not on a row.
-    fn palette_row_pressed(&mut self, position: (f32, f32)) -> bool {
-        let Some(picked) = palette_row_click(
-            &mut self.workspace,
-            &mut self.focus,
-            &mut self.command_palette,
-            position,
-            &mut self.clipboard,
-            &mut self.file_dialog,
-        ) else {
-            return false;
-        };
-        self.run_activated(picked);
-        let window_size = self.window.as_ref().map(|window| window.inner_size());
-        if let Some(size) = window_size {
-            self.apply_resize((size.width, size.height));
-        }
-        self.push_accessibility();
-        self.needs_redraw = true;
-        true
-    }
-
     #[allow(clippy::too_many_lines)]
     fn handle_pointer_pressed(&mut self, button: winit::event::MouseButton) {
         let Some(button) = translate_pointer_button(button) else {
@@ -33167,9 +33204,28 @@ impl App {
             }
         }
 
-        // 0.257.0: a press on a command palette result row runs it.
-        if button == PointerButton::Primary && self.palette_row_pressed(position) {
-            return;
+        // 0.257.0: the open command palette owns every press (any button):
+        // a primary press on a result row runs it, any other press --
+        // strip, scrollbar, padding, outside it -- does nothing and
+        // reaches no panel, layer row, tab or canvas tool underneath.
+        match route_palette_press(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.command_palette,
+            button,
+            position,
+            &mut self.clipboard,
+            &mut self.file_dialog,
+        ) {
+            PalettePress::NotOpen => {}
+            PalettePress::Swallowed => {
+                self.push_accessibility();
+                return;
+            }
+            PalettePress::Ran(picked) => {
+                self.finish_palette_press(picked);
+                return;
+            }
         }
 
         // 0.175.0: a document tab's "×" closes that tab's document — by

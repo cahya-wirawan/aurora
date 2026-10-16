@@ -15,8 +15,9 @@ use aurora_widgets::widgets::{self, WidgetKind, command_palette_state};
 use aurora_widgets::{FocusManager, WidgetId, WidgetTree};
 
 use crate::{
-    ActivatedCommand, COMMAND_UNDO, ClipboardAccess, FileDialogAccess, handle_palette_key,
-    open_command_palette, palette_row_click, palette_wheel_target, scroll_panel,
+    ActivatedCommand, COMMAND_UNDO, ClipboardAccess, FileDialogAccess, PalettePress, PointerButton,
+    handle_palette_key, open_command_palette, palette_row_click, palette_wheel_target,
+    route_palette_press, scroll_panel,
 };
 
 struct NoClipboard;
@@ -339,4 +340,131 @@ fn a_name_prompt_with_many_rows_is_laid_out_the_same_way() {
         };
         assert_eq!(i64::from(b.height), row_h());
     }
+}
+
+fn centre_of(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> (f32, f32) {
+    let Some(b) = tree.bounds(id) else {
+        unreachable!("laid out")
+    };
+    (
+        b.x as f32 + b.width as f32 / 2.0,
+        b.y as f32 + b.height as f32 / 2.0,
+    )
+}
+
+fn press(rig: &mut Rig, button: PointerButton, at: (f32, f32)) -> PalettePress {
+    route_palette_press(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &mut rig.palette,
+        button,
+        at,
+        &mut NoClipboard,
+        &mut NoFiles,
+    )
+}
+
+/// While the palette is open every press that is not a primary press on a
+/// result row is swallowed -- the strip, the scrollbar, the frame's
+/// padding, anywhere outside it, and any other button -- and changes
+/// nothing: the palette stays, its selection and scroll are as they were.
+#[test]
+fn every_other_press_is_swallowed_and_changes_nothing() {
+    let mut rig = Rig::open(SIZES[0]);
+    rig.named(NamedKey::ArrowDown);
+    rig.named(NamedKey::ArrowDown);
+    let state = rig.state();
+    let (list, scrollbar, strip) = (state.body(), state.scrollbar(), state.query_strip());
+    let selected = state.selected_index();
+    let root_bounds = rig.tree().bounds(rig.root());
+    let Some(root_b) = root_bounds else {
+        unreachable!("laid out")
+    };
+    let first_row = centre_of(rig.tree(), rig.state().rows()[0]);
+    let targets = [
+        ("strip", centre_of(rig.tree(), strip)),
+        ("scrollbar", centre_of(rig.tree(), scrollbar)),
+        (
+            "panel corner",
+            (root_b.x as f32 + 0.5, root_b.y as f32 + 0.5),
+        ),
+        ("outside, top left", (2.0, 2.0)),
+        ("outside, canvas area", (100.0, 700.0)),
+    ];
+    for (what, at) in targets {
+        for button in [PointerButton::Primary, PointerButton::Secondary] {
+            assert_eq!(
+                press(&mut rig, button, at),
+                PalettePress::Swallowed,
+                "{what} {button:?}"
+            );
+            assert!(rig.palette.is_some(), "{what}: the palette stays open");
+            assert_eq!(rig.state().selected_index(), selected, "{what}");
+            assert_eq!(rig.tree().scroll_y(list), Some(0.0), "{what}");
+        }
+    }
+    // A secondary press on a row is swallowed too and selects nothing.
+    assert_eq!(
+        press(&mut rig, PointerButton::Secondary, first_row),
+        PalettePress::Swallowed
+    );
+    assert_eq!(rig.state().selected_index(), selected);
+    assert!(rig.palette.is_some());
+    // With no palette open nothing is swallowed.
+    rig.palette = None;
+    assert_eq!(
+        press(&mut rig, PointerButton::Primary, (2.0, 2.0)),
+        PalettePress::NotOpen
+    );
+}
+
+/// A click on a prompt's row runs Enter's path, which validates the TYPED
+/// text: a refused name keeps the prompt open (`Ran(None)`), an accepted
+/// one runs the workspace command and closes it.
+#[test]
+fn a_prompt_row_click_validates_the_typed_name_like_enter() {
+    let mut rig = Rig {
+        workspace: aurora_ui::build_workspace(&crate::test_workspace_scales()),
+        focus: FocusManager::default(),
+        palette: None,
+        size: SIZES[0],
+    };
+    assert!(crate::workspace_presets::open_workspace_name_prompt(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &mut rig.palette,
+        "",
+    ));
+    rig.layout();
+    let type_text = |rig: &mut Rig, text: &str| {
+        for ch in text.chars() {
+            let t = ch.to_string();
+            rig.key(Key::Character(ch.to_ascii_lowercase()), Some(&t));
+        }
+    };
+    // "Essentials" is the built-in preset's name: refused.
+    type_text(&mut rig, "essentials");
+    let row = centre_of(rig.tree(), rig.state().rows()[0]);
+    assert_eq!(
+        press(&mut rig, PointerButton::Primary, row),
+        PalettePress::Ran(None),
+        "a refused name is not a command"
+    );
+    assert!(rig.palette.is_some(), "and the prompt stays open");
+    assert!(rig.state().message().is_some(), "with the reason shown");
+    // Replace the text by a valid name.
+    for _ in 0.."essentials".len() {
+        rig.named(NamedKey::Backspace);
+    }
+    type_text(&mut rig, "mine");
+    let row = centre_of(rig.tree(), rig.state().rows()[0]);
+    let outcome = press(&mut rig, PointerButton::Primary, row);
+    assert!(
+        matches!(
+            outcome,
+            PalettePress::Ran(Some(ActivatedCommand::Workspace(_)))
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(rig.palette, None, "an accepted name closes the prompt");
 }
