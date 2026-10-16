@@ -374,17 +374,30 @@ pub(super) fn map_effects(d: &Descriptor, global_angle: f32) -> Result<ReadEffec
         let g = gate(e)?;
         let mode = blend(e)?;
         let opacity = ctx.opacity(e)?;
-        let scale = ctx.num(e, b"Scl ", 100.0, 0.01, MIN_PATTERN_SCALE, MAX_PATTERN_SCALE)?;
+        let scale = ctx.num(
+            e,
+            b"Scl ",
+            100.0,
+            0.01,
+            MIN_PATTERN_SCALE,
+            MAX_PATTERN_SCALE,
+        )?;
         let id = e
             .get(b"Ptrn")
             .and_then(super::descriptor::Value::descriptor)
             .and_then(|p| p.get(b"Idnt"))
             .and_then(super::descriptor::Value::text)
-            .map(|t| t.trim_matches(|c: char| c == '\0' || c.is_whitespace()).to_owned())
+            .map(|t| {
+                t.trim_matches(|c: char| c == '\0' || c.is_whitespace())
+                    .to_owned()
+            })
             .filter(|t| !t.is_empty() && t.len() <= aurora_core::pattern::MAX_PATTERN_ID_BYTES);
         let linked = flag(e, b"Algn", true)?;
         let mut phase_zero = true;
-        if let Some(phase) = e.get(b"phase").and_then(super::descriptor::Value::descriptor) {
+        if let Some(phase) = e
+            .get(b"phase")
+            .and_then(super::descriptor::Value::descriptor)
+        {
             for key in [&b"Hrzn"[..], &b"Vrtc"[..]] {
                 if let Some(v) = phase.get(key) {
                     let v = v.number().ok_or(Unreadable)?;

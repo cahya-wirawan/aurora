@@ -633,8 +633,9 @@ fn read_layer_patterns<R: Read + Seek>(
                 _ => 0,
             })
             .collect();
-        let pattern = pat::Pattern::new(record.id, record.name, record.width, record.height, texels)
-            .map_err(|err| bad(format!("pattern {index}: {err}")))?;
+        let pattern =
+            pat::Pattern::new(record.id, record.name, record.width, record.height, texels)
+                .map_err(|err| bad(format!("pattern {index}: {err}")))?;
         layers
             .add_pattern(pattern)
             .map_err(|err| bad(err.to_string()))?;
@@ -8053,10 +8054,8 @@ mod tests {
         let (plain, ..) = pattern_document(&mut store, false);
         let names = effects_entry_names(&plain);
         assert!(
-            names
-                .iter()
-                .all(|n| n != super::LAYER_PATTERNS_ENTRY
-                    && !n.starts_with(super::LAYER_PATTERN_PIXELS_PREFIX)),
+            names.iter().all(|n| n != super::LAYER_PATTERNS_ENTRY
+                && !n.starts_with(super::LAYER_PATTERN_PIXELS_PREFIX)),
             "{names:?}"
         );
         // The container of a document with effects but no pattern is the
@@ -8084,7 +8083,11 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(wire.version, 1);
-        assert!(wire.effects.iter().all(|(_, fx)| fx.pattern_overlays.is_empty()));
+        assert!(
+            wire.effects
+                .iter()
+                .all(|(_, fx)| fx.pattern_overlays.is_empty())
+        );
         assert_eq!(postcard::to_allocvec(&wire).unwrap_or_default(), bytes);
         // Stripped of the entry, the file opens without patterns.
         let stripped = with_named_entry(&with, super::LAYER_PATTERNS_ENTRY, None);
@@ -8106,7 +8109,8 @@ mod tests {
             width: w,
             height: h,
         };
-        let encode = |wire: &super::LayerPatternsWire| postcard::to_allocvec(wire).unwrap_or_default();
+        let encode =
+            |wire: &super::LayerPatternsWire| postcard::to_allocvec(wire).unwrap_or_default();
         let good = || super::LayerPatternsWire {
             version: super::LAYER_PATTERNS_VERSION,
             patterns: vec![record("pa", 5, 3), record("pb", 2, 2)],
@@ -8189,7 +8193,15 @@ mod tests {
         // A budget just under the pool refuses the snapshot (the streaming
         // write takes over); one over it takes it.
         let take = |budget: usize, store: &mut TileStore| {
-            super::snapshot_best_effort(&layers, &history, (100, 100), None, &SkippedTiles::new(), budget, store)
+            super::snapshot_best_effort(
+                &layers,
+                &history,
+                (100, 100),
+                None,
+                &SkippedTiles::new(),
+                budget,
+                store,
+            )
         };
         assert!(matches!(take(bytes - 1, &mut store), Ok(None)));
         assert!(matches!(take(bytes + (1 << 20), &mut store), Ok(Some(_))));

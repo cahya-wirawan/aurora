@@ -2985,7 +2985,7 @@ mod tests {
                 layers,
                 roots: vec![colliding],
                 linked_files: std::collections::BTreeMap::new(),
-            patterns: std::collections::BTreeMap::new(),
+                patterns: std::collections::BTreeMap::new(),
             };
             assert!(forced.contains(colliding), "the guard, not `contains`");
             assert_eq!(
@@ -6761,12 +6761,16 @@ mod tests {
 
     #[test]
     fn the_pattern_pool_replaces_by_id_and_is_bounded() {
-        use aurora_core::pattern::{
-            MAX_PATTERN_POOL_BYTES, MAX_PATTERNS, Pattern, PatternError,
-        };
+        use aurora_core::pattern::{MAX_PATTERN_POOL_BYTES, MAX_PATTERNS, Pattern, PatternError};
         let pattern = |id: &str, w: u32, h: u32| {
-            Pattern::new(id.to_owned(), String::new(), w, h, vec![0; (w * h * 4) as usize])
-                .unwrap_or_else(|e| unreachable!("{e:?}"))
+            Pattern::new(
+                id.to_owned(),
+                String::new(),
+                w,
+                h,
+                vec![0; (w * h * 4) as usize],
+            )
+            .unwrap_or_else(|e| unreachable!("{e:?}"))
         };
         let mut tree = LayerTree::new();
         assert!(tree.patterns().is_empty());

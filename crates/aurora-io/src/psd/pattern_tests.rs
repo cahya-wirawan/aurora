@@ -126,7 +126,14 @@ fn texels(pool: &PatternPool, id: &str) -> Vec<u16> {
 
 #[test]
 fn an_rgb_8_bit_pattern_decodes_exactly_and_promotes_by_257() {
-    let bytes = block(&[rgb_item("a-1", 2, 2, &[0, 1, 2, 255], &[10, 20, 30, 40], &[7, 7, 7, 7])]);
+    let bytes = block(&[rgb_item(
+        "a-1",
+        2,
+        2,
+        &[0, 1, 2, 255],
+        &[10, 20, 30, 40],
+        &[7, 7, 7, 7],
+    )]);
     let pool = read_with(bytes, &["a-1"]);
     let p = pool.ready.get("a-1").map(|p| (p.width(), p.height()));
     assert_eq!(p, Some((2, 2)));
@@ -153,7 +160,16 @@ fn a_fourth_written_channel_is_alpha_and_a_grey_pattern_expands() {
     assert_eq!(texels(&pool, "al")[7], 65_535);
     assert_eq!(
         texels(&pool, "gr"),
-        vec![9 * 257, 9 * 257, 9 * 257, 65_535, 200 * 257, 200 * 257, 200 * 257, 65_535]
+        vec![
+            9 * 257,
+            9 * 257,
+            9 * 257,
+            65_535,
+            200 * 257,
+            200 * 257,
+            200 * 257,
+            65_535
+        ]
     );
 }
 
@@ -168,7 +184,10 @@ fn sixteen_bit_samples_are_kept_as_they_are() {
         23,
     );
     let pool = read_with(block(&[it]), &["d16"]);
-    assert_eq!(texels(&pool, "d16"), vec![1, 300, 9, 65_535, 65_535, 2, 40_000, 65_535]);
+    assert_eq!(
+        texels(&pool, "d16"),
+        vec![1, 300, 9, 65_535, 65_535, 2, 40_000, 65_535]
+    );
 }
 
 #[test]
@@ -246,12 +265,25 @@ fn every_unsupported_or_damaged_pattern_is_refused_by_name() {
     let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
     // Indexed, CMYK, Lab, Bitmap.
     for (name, mode) in [("idx", 2u32), ("cmyk", 4), ("lab", 9), ("bmp", 0)] {
-        cases.push((name, item(name, mode, 2, 1, &[raw8(&[1, 2]), raw8(&[1, 2]), raw8(&[1, 2])], 23)));
+        cases.push((
+            name,
+            item(
+                name,
+                mode,
+                2,
+                1,
+                &[raw8(&[1, 2]), raw8(&[1, 2]), raw8(&[1, 2])],
+                23,
+            ),
+        ));
     }
     // 32-bit and 1-bit depth.
     let mut d32 = raw8(&[0; 8]);
     d32.pixel_depth = 32;
-    cases.push(("d32", item("d32", 3, 2, 1, &[d32.clone(), d32.clone(), d32], 23)));
+    cases.push((
+        "d32",
+        item("d32", 3, 2, 1, &[d32.clone(), d32.clone(), d32], 23),
+    ));
     let mut d1 = raw8(&[0]);
     d1.pixel_depth = 1;
     cases.push(("d1", item("d1", 3, 2, 1, &[d1.clone(), d1.clone(), d1], 23)));
@@ -260,25 +292,65 @@ fn every_unsupported_or_damaged_pattern_is_refused_by_name() {
     c9.compression = 9;
     cases.push(("c9", item("c9", 3, 2, 1, &[c9.clone(), c9.clone(), c9], 23)));
     // Too few written colour channels; a short plane; a mismatched rectangle.
-    cases.push(("few", item("few", 3, 2, 1, &[raw8(&[1, 2]), raw8(&[1, 2])], 24)));
-    cases.push(("short", item("short", 3, 2, 1, &[raw8(&[1]), raw8(&[1, 2]), raw8(&[1, 2])], 23)));
+    cases.push((
+        "few",
+        item("few", 3, 2, 1, &[raw8(&[1, 2]), raw8(&[1, 2])], 24),
+    ));
+    cases.push((
+        "short",
+        item(
+            "short",
+            3,
+            2,
+            1,
+            &[raw8(&[1]), raw8(&[1, 2]), raw8(&[1, 2])],
+            23,
+        ),
+    ));
     let mut odd = raw8(&[1, 2]);
     odd.rect = Some([0, 0, 1, 3]);
-    cases.push(("rect", item("rect", 3, 2, 1, &[odd.clone(), odd.clone(), odd], 23)));
+    cases.push((
+        "rect",
+        item("rect", 3, 2, 1, &[odd.clone(), odd.clone(), odd], 23),
+    ));
     // A bad zlib stream, a bad PackBits row.
     let mut z = raw8(&[1, 2, 3]);
     z.compression = 2;
-    cases.push(("zbad", item("zbad", 3, 2, 1, &[z.clone(), z.clone(), z], 23)));
+    cases.push((
+        "zbad",
+        item("zbad", 3, 2, 1, &[z.clone(), z.clone(), z], 23),
+    ));
     let mut r = raw8(&[0, 1, 0, 0]);
     r.compression = 1;
-    cases.push(("rbad", item("rbad", 3, 2, 1, &[r.clone(), r.clone(), r], 23)));
+    cases.push((
+        "rbad",
+        item("rbad", 3, 2, 1, &[r.clone(), r.clone(), r], 23),
+    ));
     // Huge and degenerate sizes are refused on the size alone: the data is
     // one byte, so any allocation from the claim would be the bug.
-    for (name, w, h) in [("huge", 60_000, 60_000), ("zero", 0, 5), ("wide", 9_000, 1), ("big", 3_000, 3_000)] {
-        cases.push((name, item(name, 3, w, h, &[raw8(&[1]), raw8(&[1]), raw8(&[1])], 23)));
+    for (name, w, h) in [
+        ("huge", 60_000, 60_000),
+        ("zero", 0, 5),
+        ("wide", 9_000, 1),
+        ("big", 3_000, 3_000),
+    ] {
+        cases.push((
+            name,
+            item(name, 3, w, h, &[raw8(&[1]), raw8(&[1]), raw8(&[1])], 23),
+        ));
     }
     // More channel records than any pattern needs.
-    cases.push(("many", item("many", 3, 2, 1, &[raw8(&[1, 2]), raw8(&[1, 2]), raw8(&[1, 2])], 400)));
+    cases.push((
+        "many",
+        item(
+            "many",
+            3,
+            2,
+            1,
+            &[raw8(&[1, 2]), raw8(&[1, 2]), raw8(&[1, 2])],
+            400,
+        ),
+    ));
     let ids: Vec<&str> = cases.iter().map(|(n, _)| *n).chain(["good"]).collect();
     let mut items: Vec<Vec<u8>> = cases.into_iter().map(|(_, b)| b).collect();
     items.push(ok("good"));
@@ -298,7 +370,14 @@ fn a_pool_past_its_byte_cap_stops_at_the_cap() {
     let one = |id: String| {
         let n = 2048 * 2048;
         let plane = vec![7u8; n];
-        item(&id, 3, 2048, 2048, &[raw8(&plane), raw8(&plane), raw8(&plane)], 23)
+        item(
+            &id,
+            3,
+            2048,
+            2048,
+            &[raw8(&plane), raw8(&plane), raw8(&plane)],
+            23,
+        )
     };
     let ids: Vec<String> = (0..9).map(|i| format!("p{i}")).collect();
     let items: Vec<Vec<u8>> = ids.iter().map(|id| one(id.clone())).collect();
@@ -312,7 +391,14 @@ fn a_pool_past_its_byte_cap_stops_at_the_cap() {
 #[test]
 fn a_damaged_block_never_panics_at_any_truncation_or_byte_flip() {
     let good = block(&[
-        rgb_item("alpha", 3, 2, &[1, 2, 3, 4, 5, 6], &[6, 5, 4, 3, 2, 1], &[9; 6]),
+        rgb_item(
+            "alpha",
+            3,
+            2,
+            &[1, 2, 3, 4, 5, 6],
+            &[6, 5, 4, 3, 2, 1],
+            &[9; 6],
+        ),
         item("beta", 1, 2, 2, &[raw8(&[1, 2, 3, 4])], 25),
     ]);
     // Every prefix.
@@ -375,7 +461,12 @@ fn patterns_psd_yields_its_six_patterns_with_psd_tools_pixels() {
         unreachable!("diagonal pattern missing");
     };
     assert_eq!((diag.width(), diag.height()), (8, 8));
-    let red: Vec<u16> = diag.texels().chunks(4).take(8).map(|t| t[0] / 257).collect();
+    let red: Vec<u16> = diag
+        .texels()
+        .chunks(4)
+        .take(8)
+        .map(|t| t[0] / 257)
+        .collect();
     assert_eq!(red, vec![220, 255, 255, 255, 255, 255, 223, 56]);
     // A one-texel-wide pattern and the RLE-compressed Water pattern.
     let Some(v) = by_id("777f73b8-688d-1177-b2e5-b715d4e2a635") else {
@@ -388,7 +479,10 @@ fn patterns_psd_yields_its_six_patterns_with_psd_tools_pixels() {
     };
     assert_eq!((water.width(), water.height()), (80, 80));
     assert!(water.texels().chunks(4).all(|t| t[3] == 65_535));
-    assert_eq!(by_id("b2fdfd29-de85-11d5-838b-ff55e75fb875").map(|p| (p.width(), p.height())), Some((219, 265)));
+    assert_eq!(
+        by_id("b2fdfd29-de85-11d5-838b-ff55e75fb875").map(|p| (p.width(), p.height())),
+        Some((219, 265))
+    );
 }
 
 #[test]

@@ -499,16 +499,15 @@ fn corpus_files_with_the_five_kinds_survive_a_psd_save_and_reopen() {
     }
 }
 
-/// How many gradient overlays `doc` shows (task 110).
+/// How many gradient and pattern overlays `doc` shows (tasks 110, 111).
 fn list_effects_overlays(doc: &aurora_io::PsdDocument) -> usize {
     let mut shown = 0;
     let mut pending = doc.layers.roots().to_vec();
     while let Some(id) = pending.pop() {
         pending.extend(doc.layers.children(id).unwrap_or(&[]));
-        shown += doc
-            .layers
-            .effects(id)
-            .map_or(0, aurora_core::LayerEffects::shown_gradient_overlays);
+        shown += doc.layers.effects(id).map_or(0, |fx| {
+            fx.shown_gradient_overlays() + fx.shown_pattern_overlays()
+        });
     }
     shown
 }

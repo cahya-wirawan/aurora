@@ -258,11 +258,23 @@ mod tests {
             Err(PatternError::BadId)
         );
         assert_eq!(
-            Pattern::new("x".repeat(MAX_PATTERN_ID_BYTES + 1), String::new(), 1, 1, vec![0; 4]),
+            Pattern::new(
+                "x".repeat(MAX_PATTERN_ID_BYTES + 1),
+                String::new(),
+                1,
+                1,
+                vec![0; 4]
+            ),
             Err(PatternError::BadId)
         );
         // Huge claimed sizes fail on the size alone, with an empty buffer.
-        for (w, h) in [(0, 1), (1, 0), (MAX_PATTERN_SIDE + 1, 1), (3000, 3000), (u32::MAX, u32::MAX)] {
+        for (w, h) in [
+            (0, 1),
+            (1, 0),
+            (MAX_PATTERN_SIDE + 1, 1),
+            (3000, 3000),
+            (u32::MAX, u32::MAX),
+        ] {
             assert_eq!(
                 Pattern::new(id(), String::new(), w, h, Vec::new()),
                 Err(PatternError::BadSize),

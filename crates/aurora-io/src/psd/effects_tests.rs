@@ -1603,7 +1603,10 @@ fn pattern_fill<'a>(enab: bool, extra: Vec<(&'a [u8], V<'a>)>) -> V<'a> {
 
 #[test]
 fn a_pattern_overlay_is_modelled_with_every_field() {
-    let read = mapped(&effects_block(&[(b"patternFill", pattern_fill(true, vec![]))]));
+    let read = mapped(&effects_block(&[(
+        b"patternFill",
+        pattern_fill(true, vec![]),
+    )]));
     let fx = &read.effects;
     assert_eq!(fx.pattern_overlays.len(), 1);
     let Some(o) = fx.pattern_overlays.first() else {
@@ -1648,14 +1651,20 @@ fn unplaced_or_unnamed_pattern_overlays_are_counted_only_when_shown() {
         let on = mapped(&effects_block(&[(b"patternFill", make(true))]));
         assert!(on.effects.pattern_overlays.is_empty());
         assert_eq!(on.effects.other.pattern_overlays, 1);
-        assert_eq!((on.pattern_unreadable, on.pattern_unplaced), (unreadable, unplaced));
+        assert_eq!(
+            (on.pattern_unreadable, on.pattern_unplaced),
+            (unreadable, unplaced)
+        );
         let off = mapped(&effects_block(&[(b"patternFill", make(false))]));
         assert!(off.effects.pattern_overlays.is_empty());
         assert_eq!(off.effects.other.pattern_overlays, 0);
         assert_eq!((off.pattern_unreadable, off.pattern_unplaced), (0, 0));
     }
     // A disabled but well-formed overlay is kept (and not shown).
-    let read = mapped(&effects_block(&[(b"patternFill", pattern_fill(false, vec![]))]));
+    let read = mapped(&effects_block(&[(
+        b"patternFill",
+        pattern_fill(false, vec![]),
+    )]));
     assert_eq!(read.effects.pattern_overlays.len(), 1);
     assert_eq!(read.effects.shown_pattern_overlays(), 0);
 }

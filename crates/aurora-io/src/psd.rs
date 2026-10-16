@@ -139,11 +139,11 @@ mod gradient_lookup_tests;
 #[cfg(test)]
 mod grayscale_adjust_tests;
 mod lab;
+#[cfg(test)]
+mod mixer_selective_tests;
 mod pattern;
 #[cfg(test)]
 mod pattern_tests;
-#[cfg(test)]
-mod mixer_selective_tests;
 mod read_adjust;
 #[cfg(test)]
 mod read_adjust_tests;
