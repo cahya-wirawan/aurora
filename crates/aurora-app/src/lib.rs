@@ -90049,7 +90049,16 @@ mod tests {
             ),
             // 0.181.0: no real merged image (Maximize Compatibility off, stored blank white); clipping not applied. Before it (0.180.0): 255 / 2.60, 2.60, 2.60 (max / mean per channel).
             // 0.182.0: unchanged by drawing drop shadows.
-            ("blend-and-clipping.psd", 255.0, [2.6003, 2.6003, 2.6003]),
+            // Task 108: this file's merged image is a placeholder (saved
+            // without Maximize Compatibility, so it is no ground truth), and
+            // its eight solid-colour shape layers store no pixels. They used
+            // to be left out (the error then was Aurora's blank against the
+            // placeholder, 2.6003 mean); they are now drawn, so the numbers
+            // measure the drawing against a placeholder and say nothing about
+            // fidelity. Against psd-tools' own composite the drawing differs
+            // by a mean of 2.5 levels (blend modes). The max above 255 is an
+            // unclamped blend result of the now visible clipped layers.
+            ("blend-and-clipping.psd", 384.0, [26.49, 37.68, 13.75]),
             // 0.181.0: no real merged image (stored blank white): Aurora (255, 246, 206) at (16, 16) vs psd-tools' composite (254, 245, 206). Before it (0.180.0): 0 / 0.00, 0.00, 0.00 (max / mean per channel).
             // 0.182.0: unchanged by drawing drop shadows.
             (
@@ -90698,6 +90707,7 @@ mod tests {
         include!("four_adjust_fidelity_tests.rs");
         include!("two_adjust_fidelity_tests.rs");
         include!("gradient_fidelity_tests.rs");
+        include!("shape_fidelity_tests.rs");
         include!("small_machine_effect_tests.rs");
     }
 }

@@ -513,6 +513,41 @@ fn work_for(edges: &[Option<Vec<Edge>>], nonempty_groups: u64, rw: usize, rh: us
     work
 }
 
+/// The bounding box of the flattened path, rounded to whole pixels
+/// (task 108: the reference box of a fill layer's gradient). `None` when
+/// nothing is drawn or a subpath cannot be flattened within the bounds.
+/// Flattening was already charged by [`rasterize`].
+pub(super) fn path_extent(path: &VectorPath, width: u32, height: u32) -> Option<Rect> {
+    let (w, h) = (f64::from(width), f64::from(height));
+    if segment_total(path, w, h) > MAX_FLATTENED_SEGMENTS as u64 {
+        return None;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for subpath in &path.subpaths {
+        for (x, y) in &flatten(subpath, w, h).ok()?? {
+            x0 = x0.min(*x);
+            y0 = y0.min(*y);
+            x1 = x1.max(*x);
+            y1 = y1.max(*y);
+        }
+    }
+    if !(x0 <= x1 && y0 <= y1) {
+        return None;
+    }
+    let (left, top) = (x0.round(), y0.round());
+    Some(Rect {
+        x: left as i64,
+        y: top as i64,
+        width: (x1.round() - left).max(0.0) as u32,
+        height: (y1.round() - top).max(0.0) as u32,
+    })
+}
+
 /// Rasterises `path` over a `width × height` document, charging its
 /// raster and its work against `budget`, all checked before any buffer
 /// sized by them exists. The flattening charge — [`SEGMENT_CHARGE`] work
