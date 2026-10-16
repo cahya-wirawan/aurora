@@ -570,6 +570,7 @@ mod fill_tools;
 mod filter_stamp;
 #[cfg(test)]
 mod filter_stamp_tests;
+mod first_run;
 mod lasso_tools;
 mod layer_thumbnails;
 mod menu_bar_app;
@@ -3710,6 +3711,8 @@ enum DialogPurpose {
     /// "Save With Changes?" (0.177.0): a written PSD whose report is not
     /// empty waits in `App::pending_psd_save` for Save Anyway or Cancel.
     PsdSaveWithChanges,
+    /// "Welcome to Aurora" (0.257.0), the first-run welcome.
+    Welcome,
 }
 
 /// The open modal dialog (0.169.0): its widgets, what it was opened for,
@@ -3753,6 +3756,8 @@ enum DialogEffect {
     Quit(document_session::DocumentId, document_close::CloseChoice),
     /// Answer the Save With Changes dialog (0.177.0).
     PsdSave(psd_save::PsdSaveChoice),
+    /// Answer the first-run welcome (0.257.0).
+    Welcome(first_run::WelcomeChoice),
     /// The action id is not one this purpose's dialog has — logged,
     /// nothing done.
     Unknown,
@@ -3780,6 +3785,9 @@ fn dialog_effect(result: &DialogResult) -> DialogEffect {
         DialogPurpose::MoveRefused if action == MOVE_REFUSED_DISMISS => DialogEffect::Acknowledged,
         DialogPurpose::ExportedNotSaved if action == document_close::EXPORTED_NOT_SAVED_DISMISS => {
             DialogEffect::Acknowledged
+        }
+        DialogPurpose::Welcome => {
+            first_run::welcome_choice(action).map_or(DialogEffect::Unknown, DialogEffect::Welcome)
         }
         DialogPurpose::PsdSaveWithChanges => {
             psd_save::psd_save_choice(action).map_or(DialogEffect::Unknown, DialogEffect::PsdSave)
@@ -5593,6 +5601,15 @@ enum AppCommand {
 /// exactly the same mechanism a future settings-driven rebind would use,
 /// just with the source string checked in rather than read from
 /// preferences.
+/// The command palette's chord as the shortcut table spells it (`Ctrl+Shift+P`,
+/// `Cmd+Shift+P` on macOS), for the first-run welcome's text (0.257.0).
+fn palette_chord_text(shortcuts: &ShortcutRegistry<AppCommand>) -> String {
+    shortcuts
+        .chords_for(&AppCommand::ToggleCommandPalette)
+        .first()
+        .map_or_else(|| "the command palette".to_owned(), ToString::to_string)
+}
+
 fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
     default_shortcuts_for(PRIMARY_IS_META)
 }
@@ -27943,12 +27960,21 @@ fn run_shutdown_cleanup(state: &mut impl ShutdownState) {
     // offers it; the layout is still saved (the run came up).
     if state.keeps_unsaved_work() {
         remove_session_scratch(state);
-        if let Some((path, workspace)) = state.workspace_layout() {
-            save_workspace_layout(path, workspace);
-        }
+        save_layout_on_exit(state);
         return;
     }
     clean_shutdown_cleanup(state);
+    save_layout_on_exit(state);
+}
+
+/// Saves the dock layout at exit, except while the first-run welcome is
+/// still open (0.257.0): the layout file is one of the three traces that
+/// say "this is not a first run" (`first_run::is_first_run`), so saving it
+/// would stop a welcome nobody dismissed from ever coming back.
+fn save_layout_on_exit(state: &impl ShutdownState) {
+    if state.welcome_pending() {
+        return;
+    }
     if let Some((path, workspace)) = state.workspace_layout() {
         save_workspace_layout(path, workspace);
     }
@@ -28016,6 +28042,12 @@ trait ShutdownState {
     /// out of — `None` when the OS couldn't report a config directory
     /// ([`layout_path`]).
     fn workspace_layout(&self) -> Option<(&Path, &aurora_ui::Workspace)>;
+    /// Whether the first-run welcome is open and not yet dismissed
+    /// (0.257.0): the layout is then not saved ([`save_layout_on_exit`]).
+    /// `false` by default (test doubles).
+    fn welcome_pending(&self) -> bool {
+        false
+    }
 }
 
 /// [`clean_shutdown_cleanup`]'s scratch-directory step, split out so it
@@ -29724,6 +29756,9 @@ struct App {
     layout_path: Option<PathBuf>,
     /// The workspace presets file, beside [`Self::layout_path`] (0.168.0).
     presets_path: Option<PathBuf>,
+    /// The first-run welcome's marker file (0.257.0), written when the
+    /// welcome is dismissed; `None` when the OS reports no config directory.
+    welcome_marker: Option<PathBuf>,
     /// The user's workspace presets and the active one (0.168.0).
     presets: workspace_presets::WorkspacePresets,
     /// The window's current DPI scale factor (`Window::scale_factor`) —
@@ -30021,6 +30056,13 @@ impl ShutdownState for App {
             .as_deref()
             .map(|path| (path, &self.workspace))
     }
+
+    fn welcome_pending(&self) -> bool {
+        first_run::welcome_pending(
+            self.dialog.as_ref().map(|open| &open.purpose),
+            self.welcome_marker.as_deref().is_some_and(Path::exists),
+        )
+    }
 }
 
 impl App {
@@ -30263,6 +30305,24 @@ impl App {
                 failed.len(),
             );
         }
+        // 0.257.0: the first-run welcome, after (and so yielding to) crash
+        // recovery's dialog.
+        let welcome_marker = layout_path.as_deref().map(first_run::marker_path_for);
+        let first_run = first_run::first_run_from_disk(
+            first_run::first_run_override(std::env::var(first_run::FIRST_RUN_ENV).ok().as_deref()),
+            layout_path.as_deref(),
+            presets_path.as_deref(),
+        );
+        if first_run::should_show_welcome(first_run, had_previous_marker || was_recovered, false) {
+            let chord = palette_chord_text(&default_shortcuts());
+            first_run::open_welcome_dialog(
+                &mut workspace,
+                &mut focus,
+                &mut dialog,
+                &scales,
+                &chord,
+            );
+        }
         // 0.162.0: the status bar shows the startup document from the
         // first frame and the first accessibility tree on.
         // No window yet, so the scale factor is `winit`'s own 1.0 default
@@ -30297,6 +30357,7 @@ impl App {
             marker_path,
             layout_path,
             presets_path,
+            welcome_marker,
             presets,
             scale_factor: 1.0,
             clipboard: SystemClipboard::new(),
@@ -35000,9 +35061,48 @@ impl App {
             DialogEffect::Close(id, choice) => self.answer_close(id, choice),
             DialogEffect::Quit(id, choice) => self.answer_quit(id, choice),
             DialogEffect::PsdSave(choice) => self.answer_psd_save(choice),
+            DialogEffect::Welcome(choice) => self.answer_welcome(choice),
             DialogEffect::Unknown => {
                 tracing::warn!(?result, "a dialog result with no handler");
             }
+        }
+    }
+
+    /// The first-run welcome was answered (0.257.0): remember it (a
+    /// failed write is logged and ignored) and, for the second action,
+    /// open the command palette.
+    fn answer_welcome(&mut self, choice: first_run::WelcomeChoice) {
+        if let Some(path) = self.welcome_marker.as_deref()
+            && let Err(err) = first_run::write_marker(path)
+        {
+            tracing::warn!(?err, path = %path.display(), "failed to remember the welcome");
+        }
+        if choice == first_run::WelcomeChoice::OpenPalette && self.command_palette.is_none() {
+            open_command_palette(
+                &mut self.workspace,
+                &mut self.focus,
+                &mut self.command_palette,
+            );
+            // The same dynamic entries a key-opened palette lists.
+            workspace_presets::add_workspace_entries_if_opened(
+                &mut self.workspace,
+                false,
+                self.command_palette,
+                &self.presets,
+            );
+            document_tabs::add_document_entries_if_opened(
+                &mut self.workspace,
+                false,
+                self.command_palette,
+                document_tabs::document_palette_entries(&self.shelf, &self.doc),
+            );
+            selection_store::add_entries_if_opened(
+                &mut self.workspace,
+                false,
+                self.command_palette,
+                &self.doc.selection,
+            );
+            self.relayout_after_gallery();
         }
     }
 
@@ -47337,6 +47437,7 @@ mod tests {
             scratch: Some(scratch.clone()),
             aborted: aborted == Aborted::Yes,
             keeps_unsaved: false,
+            welcome_pending: false,
             layout: layout.map(|path| {
                 (
                     path,
@@ -47367,6 +47468,8 @@ mod tests {
         layout: Option<(PathBuf, aurora_ui::Workspace)>,
         /// 0.174.0 review Q-1: an unconfirmed exit with unsaved work.
         keeps_unsaved: bool,
+        /// 0.257.0: the first-run welcome is open.
+        welcome_pending: bool,
     }
 
     impl FakeShutdownState {
@@ -47409,6 +47512,10 @@ mod tests {
 
         fn keeps_unsaved_work(&self) -> bool {
             self.keeps_unsaved
+        }
+
+        fn welcome_pending(&self) -> bool {
+            self.welcome_pending
         }
 
         fn workspace_layout(&self) -> Option<(&std::path::Path, &aurora_ui::Workspace)> {
@@ -47670,6 +47777,7 @@ mod tests {
             aborted: false,
             layout: None,
             keeps_unsaved: false,
+            welcome_pending: false,
         };
         clean_shutdown_cleanup(&mut state);
         assert!(!marker.exists());
@@ -68792,6 +68900,41 @@ mod tests {
                     assert!(path.exists(), "another run's {} survived", path.display());
                 }
             }
+        }
+
+        /// 0.257.0: closing the window with the first-run welcome still open
+        /// does not save the layout file (a first-run trace), so the welcome
+        /// comes back; with it dismissed the layout is saved as always.
+        #[test]
+        fn closing_the_window_with_the_welcome_open_does_not_save_the_layout() {
+            for pending in [true, false] {
+                let dir = match tempfile::tempdir() {
+                    Ok(dir) => dir,
+                    Err(err) => unreachable!("{err}"),
+                };
+                let layout = dir.path().join("workspace-layout.postcard");
+                let mut fixture = shutdown_fixture(Aborted::No, Some(layout.clone()));
+                fixture.state.welcome_pending = pending;
+                crate::run_shutdown_cleanup(&mut fixture.state);
+                assert_eq!(layout.exists(), !pending, "pending = {pending}");
+                let first = crate::first_run::first_run_from_disk(
+                    crate::first_run::FirstRunOverride::Detect,
+                    Some(&layout),
+                    None,
+                );
+                assert_eq!(first, pending, "the welcome returns iff it was open");
+            }
+            // The unconfirmed-exit path (recovery data kept) obeys it too.
+            let dir = match tempfile::tempdir() {
+                Ok(dir) => dir,
+                Err(err) => unreachable!("{err}"),
+            };
+            let layout = dir.path().join("workspace-layout.postcard");
+            let mut fixture = shutdown_fixture(Aborted::No, Some(layout.clone()));
+            fixture.state.keeps_unsaved = true;
+            fixture.state.welcome_pending = true;
+            crate::run_shutdown_cleanup(&mut fixture.state);
+            assert!(!layout.exists());
         }
 
         /// 0.174.0 review Q-1: an exit the quit review never confirmed,
@@ -96388,6 +96531,8 @@ mod gpu_photo_adjustment_tests;
 
 #[cfg(test)]
 mod fill_tests;
+#[cfg(test)]
+mod first_run_tests;
 
 #[cfg(test)]
 mod menu_bar_tests;
