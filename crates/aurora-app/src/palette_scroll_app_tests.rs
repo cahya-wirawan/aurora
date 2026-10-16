@@ -3,6 +3,13 @@
 //! pitch, scroll under the keyboard, the wheel and the scrollbar's
 //! container, and a press on a row must run that row.
 
+#![allow(
+    clippy::indexing_slicing,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss
+)]
+
 use aurora_widgets::shortcut::{Key, KeyChord, Modifiers, NamedKey};
 use aurora_widgets::widgets::{self, WidgetKind, command_palette_state};
 use aurora_widgets::{FocusManager, WidgetId, WidgetTree};
@@ -53,7 +60,12 @@ impl Rig {
     }
 
     fn layout(&mut self) {
-        aurora_widgets::compute_text_layout(&mut self.workspace.tree, self.size.0, self.size.1, None);
+        aurora_widgets::compute_text_layout(
+            &mut self.workspace.tree,
+            self.size.0,
+            self.size.1,
+            None,
+        );
     }
 
     fn root(&self) -> WidgetId {
@@ -149,7 +161,10 @@ fn the_real_palette_rows_never_overlap_and_the_panel_fits_every_window() {
             i64::from(root.height),
             strip + i64::from(scales.size.content_panel_max_rows) * row_h()
         );
-        assert!(root.bottom() <= i64::from(size.1 as u32), "{root:?} in {size:?}");
+        assert!(
+            root.bottom() <= i64::from(size.1 as u32),
+            "{root:?} in {size:?}"
+        );
     }
 }
 
@@ -167,7 +182,10 @@ fn arrow_down_page_down_and_end_keep_the_selection_visible_and_enter_runs_it() {
     rig.named(NamedKey::PageUp);
     assert_eq!(rig.state().selected_index(), Some(40));
     rig.named(NamedKey::End);
-    assert_eq!(rig.state().selected_index(), Some(rig.state().rows().len() - 1));
+    assert_eq!(
+        rig.state().selected_index(),
+        Some(rig.state().rows().len() - 1)
+    );
     assert!(rig.selected_inside_viewport());
     rig.named(NamedKey::Home);
     assert_eq!(rig.state().selected_index(), Some(0));
@@ -207,7 +225,10 @@ fn the_wheel_over_the_palette_scrolls_the_rows_and_elsewhere_it_does_not() {
         unreachable!("laid out")
     };
     let over = (b.x as f32 + 30.0, b.y as f32 + 5.0);
-    assert_eq!(palette_wheel_target(rig.tree(), rig.palette, over), Some(list));
+    assert_eq!(
+        palette_wheel_target(rig.tree(), rig.palette, over),
+        Some(list)
+    );
     assert_eq!(
         palette_wheel_target(rig.tree(), rig.palette, (2.0, 2.0)),
         None,
@@ -244,10 +265,16 @@ fn a_press_on_a_scrolled_row_runs_that_row_and_a_press_elsewhere_does_nothing() 
     };
     // Scroll so Undo is near the top of the viewport, by whole rows.
     #[allow(clippy::cast_precision_loss)]
-    let offset = (index.saturating_sub(2) as f32) * widgets::row_height(&crate::test_workspace_scales());
+    let offset =
+        (index.saturating_sub(2) as f32) * widgets::row_height(&crate::test_workspace_scales());
     let _ = rig.workspace.tree.set_scroll_y(list, offset);
     rig.layout();
-    let Some(b) = rig.state().rows().get(index).and_then(|&r| rig.tree().bounds(r)) else {
+    let Some(b) = rig
+        .state()
+        .rows()
+        .get(index)
+        .and_then(|&r| rig.tree().bounds(r))
+    else {
         unreachable!("laid out")
     };
     // Not on a row: the strip. Nothing happens and the palette stays.

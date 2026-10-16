@@ -873,6 +873,12 @@ fn select_index(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss
+)]
 mod tests {
     use super::{
         CommandEntry, PaletteStep, command_palette_state, insert_command_palette,
@@ -882,9 +888,9 @@ mod tests {
     };
     use crate::WidgetError;
     use crate::shortcut::KeyChord;
-    use aurora_core::Rect;
     use crate::tree::{WidgetId, WidgetTree};
     use crate::widgets::{WidgetKind, new_tree, row_height, test_scales};
+    use aurora_core::Rect;
     use taffy::Style;
     use taffy::style_helpers::{auto, length};
 
@@ -1134,7 +1140,10 @@ mod tests {
         };
         ok(move_command_palette_selection(&mut tree, palette, true));
 
-        let flag = |row| tree.accessibility(row).and_then(accesskit::Node::is_selected);
+        let flag = |row| {
+            tree.accessibility(row)
+                .and_then(accesskit::Node::is_selected)
+        };
         assert_eq!(flag(first_row), Some(false));
         assert_eq!(flag(second_row), Some(true));
         let payload = |selected| {
@@ -1468,7 +1477,7 @@ mod tests {
         let body = state.body();
         let rows = state.rows().to_vec();
         let before = bounds(&tree, rows[5]).y;
-        assert_eq!(ok(tree.scroll_by(body, 3.0 * 21.0)), true);
+        assert!(ok(tree.scroll_by(body, 3.0 * 21.0)));
         assert_eq!(bounds(&tree, rows[5]).y, before - 63);
         relayout(&mut tree, 1274.0, 900.0);
         assert_eq!(
@@ -1506,13 +1515,22 @@ mod tests {
         assert_eq!(selected_id(&tree, palette).as_deref(), Some("cmd.9"));
         // The old (unscrolled) place of row 0 is above the viewport: not a row.
         let above = centre(&tree, rows[0]);
-        assert_eq!(ok(select_command_palette_at(&mut tree, palette, above)), None);
+        assert_eq!(
+            ok(select_command_palette_at(&mut tree, palette, above)),
+            None
+        );
         assert_eq!(selected_id(&tree, palette).as_deref(), Some("cmd.9"));
         // The query strip is not a row either.
-        let strip = bounds(&tree, ok(command_palette_state(&tree, palette)).query_strip());
+        let strip = bounds(
+            &tree,
+            ok(command_palette_state(&tree, palette)).query_strip(),
+        );
         #[allow(clippy::cast_precision_loss)]
         let on_strip = (strip.x as f32 + 5.0, strip.y as f32 + 5.0);
-        assert_eq!(ok(select_command_palette_at(&mut tree, palette, on_strip)), None);
+        assert_eq!(
+            ok(select_command_palette_at(&mut tree, palette, on_strip)),
+            None
+        );
     }
 
     #[test]
@@ -1523,7 +1541,11 @@ mod tests {
             relayout(tree, 1274.0, 900.0);
         };
         step(&mut tree, PaletteStep::PageDown);
-        assert_eq!(selected_index(&tree, palette), Some(10), "one page = 10 rows");
+        assert_eq!(
+            selected_index(&tree, palette),
+            Some(10),
+            "one page = 10 rows"
+        );
         assert!(selected_is_inside_viewport(&tree, palette));
         step(&mut tree, PaletteStep::PageDown);
         assert_eq!(selected_index(&tree, palette), Some(20));
@@ -1537,7 +1559,11 @@ mod tests {
         assert_eq!(selected_index(&tree, palette), Some(199));
         assert!(selected_is_inside_viewport(&tree, palette));
         step(&mut tree, PaletteStep::PageDown);
-        assert_eq!(selected_index(&tree, palette), Some(199), "stops at the end");
+        assert_eq!(
+            selected_index(&tree, palette),
+            Some(199),
+            "stops at the end"
+        );
         step(&mut tree, PaletteStep::First);
         assert_eq!(selected_index(&tree, palette), Some(0));
         assert!(selected_is_inside_viewport(&tree, palette));
@@ -1613,7 +1639,10 @@ mod tests {
         let state = ok(command_palette_state(&tree, palette));
         let root_b = bounds(&tree, palette);
         let viewport = bounds(&tree, state.viewport());
-        assert!(viewport.bottom() <= root_b.bottom(), "{viewport:?} in {root_b:?}");
+        assert!(
+            viewport.bottom() <= root_b.bottom(),
+            "{viewport:?} in {root_b:?}"
+        );
         assert_eq!(
             i64::from(bounds(&tree, state.query_strip()).height),
             strip_h(),
@@ -1663,7 +1692,9 @@ mod tests {
         let selected = update
             .nodes
             .iter()
-            .filter(|(_, n)| n.role() == accesskit::Role::ListBoxOption && n.is_selected() == Some(true))
+            .filter(|(_, n)| {
+                n.role() == accesskit::Role::ListBoxOption && n.is_selected() == Some(true)
+            })
             .count();
         assert_eq!(selected, 1, "exactly one selected option");
         let Some(strip) = node_of(strip_id) else {

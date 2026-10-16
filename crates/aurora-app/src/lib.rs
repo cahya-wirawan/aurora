@@ -520,8 +520,8 @@ use aurora_text::TextEngine;
 use aurora_theme::{Palette, Scales, Theme, ThemeSet};
 use aurora_widgets::shortcut::{Key, KeyChord, Modifiers, NamedKey, ShortcutRegistry};
 use aurora_widgets::widgets::{
-    CommandEntry, DialogAction, DialogHandle, DialogKeyOutcome, TextFieldChord, WidgetKind,
-    PaletteStep, command_palette_state, handle_text_field_chord, insert_command_palette,
+    CommandEntry, DialogAction, DialogHandle, DialogKeyOutcome, PaletteStep, TextFieldChord,
+    WidgetKind, command_palette_state, handle_text_field_chord, insert_command_palette,
     insert_dialog, move_command_palette_selection, select_command_palette_at,
     set_command_palette_query, step_command_palette_selection,
 };
@@ -12332,7 +12332,9 @@ fn palette_wheel_target(
     if !tree.is_within(root, hit) {
         return None;
     }
-    command_palette_state(tree, root).ok().map(|state| state.body())
+    command_palette_state(tree, root)
+        .ok()
+        .map(aurora_widgets::widgets::CommandPaletteState::body)
 }
 
 /// A primary press at `position` with the command palette open (0.257.0):
@@ -12341,6 +12343,7 @@ fn palette_wheel_target(
 /// to. `None` when the press is not on a result row (nothing changes and
 /// the press goes on as before). Hit-testing sees the rows where the
 /// palette's scrolling put them.
+#[allow(clippy::option_option)] // outer: was it a row press; inner: what it resolved to
 fn palette_row_click(
     workspace: &mut aurora_ui::Workspace,
     focus: &mut FocusManager,
@@ -12410,7 +12413,9 @@ fn handle_palette_key(
         }
         // 0.257.0: with a long list the selection also moves by page and
         // to either end (no wrap), staying scrolled into view.
-        Key::Named(named @ (NamedKey::PageDown | NamedKey::PageUp | NamedKey::Home | NamedKey::End)) => {
+        Key::Named(
+            named @ (NamedKey::PageDown | NamedKey::PageUp | NamedKey::Home | NamedKey::End),
+        ) => {
             let step = match named {
                 NamedKey::PageDown => PaletteStep::PageDown,
                 NamedKey::PageUp => PaletteStep::PageUp,
@@ -33065,6 +33070,7 @@ impl App {
         true
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_pointer_pressed(&mut self, button: winit::event::MouseButton) {
         let Some(button) = translate_pointer_button(button) else {
             return;
@@ -45574,10 +45580,12 @@ mod tests {
         };
         assert_eq!(bounds.width, 480, "must be the real, fixed palette width");
         let scales = crate::test_workspace_scales();
-        let strip = widgets_row_height(&scales) + f32::from(u16::try_from(scales.spacing.xs).unwrap_or(0));
+        let strip =
+            widgets_row_height(&scales) + f32::from(u16::try_from(scales.spacing.xs).unwrap_or(0));
         #[allow(clippy::cast_precision_loss)]
         let rows = scales.size.content_panel_max_rows as f32;
         #[allow(clippy::cast_possible_truncation)]
+        #[allow(clippy::cast_sign_loss)]
         let expected = (strip + rows * widgets_row_height(&scales)) as u32;
         assert_eq!(
             bounds.height, expected,
