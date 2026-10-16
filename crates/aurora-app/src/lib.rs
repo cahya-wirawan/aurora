@@ -84963,57 +84963,375 @@ mod tests {
             );
         }
 
-        /// 0.245.0: the Channel Mixer output tab and the Selective Color range
-        /// tab edit no document; their sliders edit the selected row or range
-        /// one step each; Monochrome and Absolute are one step per toggle; the
-        /// Gray mix is the first row whatever tab is selected; undo moves the
-        /// editor.
+        // -- Gradient Map stop editor (task 113) ---------------------------
+
+        fn gradient_layer(stops: &[(f32, [f32; 3])]) -> aurora_doc::Adjustment {
+            let stops = stops
+                .iter()
+                .map(|&(p, c)| aurora_core::GradientStop::new(p, c))
+                .collect();
+            match aurora_core::GradientMapParams::new(stops, false, false) {
+                Ok(p) => aurora_doc::Adjustment::GradientMap(p),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+
+        fn three_stops() -> aurora_doc::Adjustment {
+            gradient_layer(&[(0.0, [0.0; 3]), (0.5, [1.0, 0.0, 0.0]), (1.0, [1.0; 3])])
+        }
+
+        impl Rig {
+            fn gradient_params(&self, id: LayerId) -> aurora_core::GradientMapParams {
+                match self.adjustment(id).gradient_map() {
+                    Some(p) => p.clone(),
+                    None => unreachable!("a Gradient Map layer"),
+                }
+            }
+
+            /// The window point over stop `position` on the bar (a marker's
+            /// centre column, in the bar strip).
+            fn marker_at(&self, position: f32) -> (f32, f32) {
+                let bar = self.adj_controls().gradient_bar;
+                let Some(b) = self.workspace.tree.bounds(bar) else {
+                    unreachable!("the bar is laid out");
+                };
+                let side = self.scales.spacing.sm as f32;
+                (
+                    b.x as f32 + side / 2.0 + position * (b.width as f32 - side),
+                    b.y as f32 + 5.0,
+                )
+            }
+
+            fn bar_selected(&self) -> usize {
+                aurora_ui::adjust_gradient_selected(&self.workspace.tree, self.adj_controls())
+            }
+
+            fn click_widget(&mut self, id: WidgetId) {
+                let at = self.centre(id);
+                self.pointer(PointerPhase::Down, at);
+                self.pointer(PointerPhase::Up, at);
+            }
+        }
+
+        /// The Reverse checkbox and a stop's colour sliders: one undo step
+        /// each, the sliders edit the SELECTED stop (not only the two ends).
         #[test]
         #[allow(clippy::indexing_slicing)]
         fn gradient_map_reverse_and_colour_sliders_are_wired_one_undo_step_each() {
             use aurora_ui::AdjustSlider as S;
-            let (mut rig, id) = Rig::adjust_layer(aurora_doc::Adjustment::GradientMap(
-                aurora_core::GradientMapParams::black_to_white(),
-            ));
+            let (mut rig, id) = Rig::adjust_layer(three_stops());
             assert_eq!(
                 aurora_ui::adjust_controls_shown(&rig.workspace.tree, rig.adj_controls()),
                 Some(aurora_ui::AdjustKind::GradientMap)
             );
-            let map = |rig: &Rig| match rig.adjustment(id).gradient_map() {
-                Some(p) => p.clone(),
-                None => unreachable!("a Gradient Map layer"),
-            };
             assert!(!aurora_ui::adjust_gradient_reverse_checked(
                 &rig.workspace.tree,
                 rig.adj_controls()
             ));
-            assert_eq!(rig.adj_slider(S::GradientEndGreen).0, 255.0);
-            assert_eq!(rig.adj_slider(S::GradientStartGreen).0, 0.0);
             let before = rig.undo_order.undo.len();
-            // A colour slider: one undo step, one channel of one stop.
-            rig.adj_set(S::GradientEndBlue, 51.0);
-            assert_eq!(map(&rig).stops()[1].colour, [1.0, 1.0, 51.0 / 255.0]);
-            assert_eq!(map(&rig).stops()[0].colour, [0.0; 3]);
-            rig.adj_set(S::GradientStartRed, 255.0);
-            assert_eq!(map(&rig).stops()[0].colour, [1.0, 0.0, 0.0]);
-            assert_eq!(rig.undo_order.undo.len(), before + 2);
-            // The Reverse checkbox: one step, and the editor follows undo.
-            let reverse = rig.adj_controls().gradient_reverse;
-            let at = rig.centre(reverse);
+            // Stop 0 (the default selection): one channel, one step.
+            rig.adj_set(S::GradientBlue, 51.0);
+            assert_eq!(
+                rig.gradient_params(id).stops()[0].colour,
+                [0.0, 0.0, 51.0 / 255.0]
+            );
+            assert_eq!(rig.gradient_params(id).stops()[1].colour, [1.0, 0.0, 0.0]);
+            // The middle stop, chosen on the bar: its own sliders.
+            let at = rig.marker_at(0.5);
             rig.pointer(PointerPhase::Down, at);
             rig.pointer(PointerPhase::Up, at);
-            rig.sync();
-            assert!(map(&rig).reverse());
-            assert!(!map(&rig).dither(), "only Reverse changed");
+            assert_eq!(rig.bar_selected(), 1);
+            assert_eq!(rig.adj_slider(S::GradientRed).0, 255.0);
+            rig.adj_set(S::GradientGreen, 128.0);
+            assert_eq!(
+                rig.gradient_params(id).stops()[1].colour,
+                [1.0, 128.0 / 255.0, 0.0]
+            );
+            assert_eq!(rig.gradient_params(id).stops()[2].colour, [1.0; 3]);
+            assert_eq!(
+                rig.undo_order.undo.len(),
+                before + 2,
+                "selecting is no step"
+            );
+            // The Reverse checkbox: one step, and the editor follows undo.
+            let reverse = rig.adj_controls().gradient_reverse;
+            rig.click_widget(reverse);
+            assert!(rig.gradient_params(id).reverse());
+            assert!(!rig.gradient_params(id).dither(), "only Reverse changed");
             assert_eq!(rig.undo_order.undo.len(), before + 3);
             rig.undo();
-            rig.sync();
-            assert!(!map(&rig).reverse());
+            assert!(!rig.gradient_params(id).reverse());
             assert!(!aurora_ui::adjust_gradient_reverse_checked(
                 &rig.workspace.tree,
                 rig.adj_controls()
             ));
-            assert_eq!(map(&rig).stops()[0].colour, [1.0, 0.0, 0.0]);
+            rig.undo();
+            assert_eq!(rig.gradient_params(id).stops()[1].colour, [1.0, 0.0, 0.0]);
+            assert_eq!(
+                rig.adj_slider(S::GradientGreen).0,
+                0.0,
+                "the slider followed undo"
+            );
+        }
+
+        /// A marker press only selects (no undo step, the document is
+        /// untouched); a marker drag is **one** undo step at release, live
+        /// while dragging, and undo/redo move it.
+        #[test]
+        #[allow(clippy::indexing_slicing, clippy::float_cmp)]
+        fn a_marker_drag_is_one_undo_step_and_a_press_alone_is_none() {
+            use aurora_ui::AdjustSlider as S;
+            let (mut rig, id) = Rig::adjust_layer(three_stops());
+            let before = rig.undo_order.undo.len();
+            let content = rig.undo_order.content_revision;
+            let at = rig.marker_at(0.5);
+            rig.pointer(PointerPhase::Down, at);
+            assert_eq!(rig.bar_selected(), 1);
+            rig.pointer(PointerPhase::Up, at);
+            assert_eq!(rig.undo_order.undo.len(), before, "a press selects only");
+            assert_eq!(
+                rig.undo_order.content_revision, content,
+                "and never dirties"
+            );
+            assert_eq!(rig.gradient_params(id), rig.gradient_params(id));
+            // A drag with several moves.
+            rig.pointer(PointerPhase::Down, at);
+            for to in [0.45_f32, 0.4, 0.3, 0.2] {
+                let p = rig.marker_at(to);
+                rig.pointer(PointerPhase::Move, p);
+                assert!(
+                    (rig.gradient_params(id).stops()[1].position - to).abs() < 0.01,
+                    "live: {to}"
+                );
+                assert_eq!(
+                    rig.undo_order.undo.len(),
+                    before,
+                    "nothing recorded mid-drag"
+                );
+            }
+            let end = rig.marker_at(0.2);
+            rig.pointer(PointerPhase::Up, end);
+            assert_eq!(
+                rig.undo_order.undo.len(),
+                before + 1,
+                "one step for the drag"
+            );
+            let moved = rig.gradient_params(id).stops()[1].position;
+            assert!((moved - 0.2).abs() < 0.01, "{moved}");
+            assert_eq!(
+                rig.adj_slider(S::GradientPosition).0,
+                f64::from((moved * 1000.0).round() / 10.0)
+            );
+            assert_eq!(rig.gradient_params(id).stops()[0].position, 0.0);
+            assert_eq!(rig.gradient_params(id).stops()[2].position, 1.0);
+            rig.undo();
+            assert_eq!(rig.gradient_params(id).stops()[1].position, 0.5);
+            assert_eq!(rig.adj_slider(S::GradientPosition).0, 50.0);
+            rig.redo();
+            assert_eq!(rig.gradient_params(id).stops()[1].position, moved);
+            // A grab released where it started records nothing.
+            let steps = rig.undo_order.undo.len();
+            let at = rig.marker_at(moved);
+            rig.pointer(PointerPhase::Down, at);
+            rig.pointer(PointerPhase::Up, at);
+            assert_eq!(rig.undo_order.undo.len(), steps);
+        }
+
+        /// A drag never passes a neighbour: past it, the stop stops at it.
+        #[test]
+        #[allow(clippy::indexing_slicing, clippy::float_cmp)]
+        fn a_marker_drag_is_clamped_between_its_neighbours() {
+            let (mut rig, id) = Rig::adjust_layer(three_stops());
+            let at = rig.marker_at(0.5);
+            rig.pointer(PointerPhase::Down, at);
+            let far = (at.0 + 5000.0, at.1);
+            rig.pointer(PointerPhase::Move, far);
+            rig.pointer(PointerPhase::Up, far);
+            let p = rig.gradient_params(id);
+            assert_eq!(p.stops().len(), 3);
+            assert_eq!(p.stops()[1].position, 1.0);
+            assert_eq!(p.stops()[2].position, 1.0);
+            assert_eq!(p.stops()[0].position, 0.0);
+        }
+
+        /// Add Stop and Delete Stop: one undo step each, the new stop at the
+        /// midpoint with the interpolated colour and selected, never below
+        /// two stops or above 64, and undo/redo restore the gradient.
+        #[test]
+        #[allow(clippy::indexing_slicing, clippy::float_cmp)]
+        fn add_and_delete_stop_are_one_undo_step_each_within_the_limits() {
+            let (mut rig, id) = Rig::adjust_layer(three_stops());
+            let c = rig.adj_controls();
+            let before = rig.undo_order.undo.len();
+            // Stop 0 selected: the new stop goes between stops 0 and 1.
+            rig.click_widget(c.gradient_add);
+            let p = rig.gradient_params(id);
+            assert_eq!(p.stops().len(), 4);
+            assert_eq!(p.stops()[1].position, 0.25);
+            assert_eq!(p.stops()[1].colour, [0.5, 0.0, 0.0]);
+            assert_eq!(rig.bar_selected(), 1, "the new stop is selected");
+            assert_eq!(rig.undo_order.undo.len(), before + 1);
+            // Last stop selected: the new stop goes between it and the one
+            // before it.
+            let last = rig.marker_at(1.0);
+            rig.pointer(PointerPhase::Down, last);
+            rig.pointer(PointerPhase::Up, last);
+            assert_eq!(rig.bar_selected(), 3);
+            rig.click_widget(c.gradient_add);
+            let p = rig.gradient_params(id);
+            assert_eq!(p.stops().len(), 5);
+            assert_eq!(p.stops()[3].position, 0.75);
+            assert_eq!(rig.bar_selected(), 3);
+            assert_eq!(rig.undo_order.undo.len(), before + 2);
+            // Delete the selected stop: the previous one is selected.
+            rig.click_widget(c.gradient_delete);
+            assert_eq!(rig.gradient_params(id).stops().len(), 4);
+            assert_eq!(rig.bar_selected(), 2);
+            assert_eq!(rig.undo_order.undo.len(), before + 3);
+            rig.undo();
+            assert_eq!(rig.gradient_params(id).stops().len(), 5);
+            rig.undo();
+            rig.undo();
+            assert_eq!(
+                rig.gradient_params(id),
+                match three_stops().gradient_map() {
+                    Some(p) => p.clone(),
+                    None => unreachable!(),
+                }
+            );
+            assert!(rig.bar_selected() < 3, "selection clamped after undo");
+            rig.redo();
+            assert_eq!(rig.gradient_params(id).stops().len(), 4);
+            // Never below two: Delete is idle at two stops and a forced
+            // activation changes nothing.
+            let (mut rig, id) =
+                Rig::adjust_layer(gradient_layer(&[(0.0, [0.0; 3]), (1.0, [1.0; 3])]));
+            let c = rig.adj_controls();
+            let steps = rig.undo_order.undo.len();
+            rig.apply(&PointerOutcome::Action(
+                aurora_widgets::ActionOutcome::Activated(c.gradient_delete),
+            ));
+            assert_eq!(rig.gradient_params(id).stops().len(), 2);
+            assert_eq!(rig.undo_order.undo.len(), steps);
+        }
+
+        #[test]
+        fn add_stop_stops_at_sixty_four() {
+            let stops: Vec<(f32, [f32; 3])> =
+                (0..64).map(|i| (i as f32 / 63.0, [0.5; 3])).collect();
+            let (mut rig, id) = Rig::adjust_layer(gradient_layer(&stops));
+            let c = rig.adj_controls();
+            let steps = rig.undo_order.undo.len();
+            rig.apply(&PointerOutcome::Action(
+                aurora_widgets::ActionOutcome::Activated(c.gradient_add),
+            ));
+            assert_eq!(rig.gradient_params(id).stops().len(), 64);
+            assert_eq!(rig.undo_order.undo.len(), steps);
+        }
+
+        /// Previous Stop and Next Stop move the selection: widget state
+        /// only (no step, the content revision stays), the sliders follow.
+        #[test]
+        fn previous_and_next_stop_select_without_touching_the_document() {
+            use aurora_ui::AdjustSlider as S;
+            let (mut rig, id) = Rig::adjust_layer(three_stops());
+            let c = rig.adj_controls();
+            let (steps, content) = (rig.undo_order.undo.len(), rig.undo_order.content_revision);
+            let snapshot = rig.gradient_params(id);
+            rig.click_widget(c.gradient_next);
+            assert_eq!(rig.bar_selected(), 1);
+            assert_eq!(rig.adj_slider(S::GradientPosition).0, 50.0);
+            rig.click_widget(c.gradient_next);
+            assert_eq!(rig.bar_selected(), 2);
+            rig.click_widget(c.gradient_prev);
+            assert_eq!(rig.bar_selected(), 1);
+            rig.click_widget(c.gradient_prev);
+            rig.click_widget(c.gradient_prev);
+            assert_eq!(rig.bar_selected(), 0, "no wrap");
+            assert_eq!(rig.undo_order.undo.len(), steps);
+            assert_eq!(rig.undo_order.content_revision, content);
+            assert_eq!(rig.gradient_params(id), snapshot);
+        }
+
+        /// The stop editor works from the keyboard alone: Tab reaches the
+        /// buttons, Enter/Space activates them.
+        #[test]
+        fn the_stop_buttons_work_from_the_keyboard() {
+            use aurora_widgets::{KeyOutcome, shortcut::NamedKey};
+            let (mut rig, id) = Rig::adjust_layer(three_stops());
+            let c = rig.adj_controls();
+            let steps = rig.undo_order.undo.len();
+            for (button, key) in [
+                (c.gradient_next, NamedKey::Enter),
+                (c.gradient_add, NamedKey::Space),
+            ] {
+                if let Err(err) = rig.focus.focus_with(
+                    &mut rig.workspace.tree,
+                    button,
+                    aurora_widgets::FocusOrigin::Keyboard,
+                ) {
+                    unreachable!("{err:?}");
+                }
+                let outcome = aurora_widgets::handle_widget_key(
+                    &mut rig.workspace.tree,
+                    &mut rig.focus,
+                    key,
+                    Modifiers::none(),
+                );
+                let Ok(KeyOutcome::Handled(outcome)) = outcome else {
+                    unreachable!("a focused button takes {key:?}");
+                };
+                rig.apply(&outcome);
+                rig.sync();
+            }
+            assert_eq!(
+                rig.gradient_params(id).stops().len(),
+                4,
+                "Space on Add Stop added a stop"
+            );
+            assert_eq!(
+                rig.undo_order.undo.len(),
+                steps + 1,
+                "Enter on Next Stop recorded nothing"
+            );
+        }
+
+        /// The Position slider moves the selected stop (clamped), one step.
+        #[test]
+        #[allow(clippy::indexing_slicing, clippy::float_cmp)]
+        fn the_position_slider_moves_the_selected_stop_clamped_between_neighbours() {
+            use aurora_ui::AdjustSlider as S;
+            let (mut rig, id) = Rig::adjust_layer(three_stops());
+            let c = rig.adj_controls();
+            rig.click_widget(c.gradient_next);
+            let steps = rig.undo_order.undo.len();
+            rig.adj_set(S::GradientPosition, 70.0);
+            assert_eq!(rig.gradient_params(id).stops()[1].position, 0.7);
+            rig.adj_set(S::GradientPosition, 150.0);
+            assert_eq!(
+                rig.gradient_params(id).stops()[1].position,
+                1.0,
+                "clamped at the next stop"
+            );
+            assert_eq!(rig.undo_order.undo.len(), steps + 2);
+        }
+
+        /// A twelve-stop gradient is as editable as a two-stop one.
+        #[test]
+        #[allow(clippy::indexing_slicing)]
+        fn a_many_stop_gradient_is_fully_editable() {
+            let stops: Vec<(f32, [f32; 3])> =
+                (0..12).map(|i| (i as f32 / 11.0, [0.1; 3])).collect();
+            let (mut rig, id) = Rig::adjust_layer(gradient_layer(&stops));
+            let at = rig.marker_at(7.0 / 11.0);
+            rig.pointer(PointerPhase::Down, at);
+            assert_eq!(rig.bar_selected(), 7);
+            let to = rig.marker_at(0.6);
+            rig.pointer(PointerPhase::Move, to);
+            rig.pointer(PointerPhase::Up, to);
+            let p = rig.gradient_params(id);
+            assert!((p.stops()[7].position - 0.6).abs() < 0.01);
+            assert_eq!(p.stops().len(), 12);
         }
 
         #[test]
