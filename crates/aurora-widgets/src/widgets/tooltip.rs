@@ -1318,6 +1318,7 @@ mod tests {
             &mut tree,
             root,
             vec![CommandEntry::new("a", "Alpha")],
+            &scales,
         ));
         let range = ScrollbarRange {
             min: 0.0,

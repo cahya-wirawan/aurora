@@ -189,10 +189,12 @@ pub use color_swatch::{
     ColorSwatchState, insert_color_swatch, insert_color_swatch_styled, set_color_swatch_accessible,
     set_color_swatch_color, set_color_swatch_disabled,
 };
+pub(crate) use command_palette::enclosing_palette;
 pub use command_palette::{
-    CommandEntry, CommandPaletteState, command_palette_state, insert_command_palette,
-    insert_command_prompt, move_command_palette_selection, set_command_palette_commands,
-    set_command_palette_message, set_command_palette_query,
+    CommandEntry, CommandPaletteState, PaletteStep, command_palette_state, insert_command_palette,
+    insert_command_prompt, move_command_palette_selection, select_command_palette_at,
+    set_command_palette_commands, set_command_palette_message, set_command_palette_query,
+    step_command_palette_selection,
 };
 pub use curve_editor::{
     CurveEditorKey, CurveEditorOutcome, CurveEditorPointState, CurveEditorState,

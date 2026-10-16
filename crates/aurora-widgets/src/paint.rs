@@ -4948,7 +4948,7 @@ mod tests {
         let (mut tree, root) = new_tree(taffy::Style::default());
         let scales = scales();
         let commands = vec![CommandEntry::new("edit.undo", "Undo")];
-        let palette = match insert_command_palette(&mut tree, root, commands) {
+        let palette = match insert_command_palette(&mut tree, root, commands, &scales) {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -4984,7 +4984,7 @@ mod tests {
         let (mut tree, root) = new_tree(taffy::Style::default());
         let scales = scales();
         let commands = vec![CommandEntry::new("edit.undo", "Undo")];
-        let palette = match insert_command_palette(&mut tree, root, commands) {
+        let palette = match insert_command_palette(&mut tree, root, commands, &scales) {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -5030,7 +5030,7 @@ mod tests {
             CommandEntry::new("edit.undo", "Undo"),
             CommandEntry::new("edit.redo", "Redo"),
         ];
-        let palette = match insert_command_palette(&mut tree, root, commands) {
+        let palette = match insert_command_palette(&mut tree, root, commands, &scales) {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -5041,8 +5041,8 @@ mod tests {
         let Some(rows) = tree.children(body) else {
             unreachable!("just inserted");
         };
-        // `rows[0]` is the query strip (0.133.0).
-        let Some(&second_row) = rows.get(2) else {
+        // The body holds only result rows (the query strip left it in 0.257.0).
+        let Some(&second_row) = rows.get(1) else {
             unreachable!("two commands were inserted, so a second row exists");
         };
         let theme = dark_theme();
@@ -7615,6 +7615,7 @@ mod tests {
                     title: "X".to_owned(),
                     shortcut: None,
                 }],
+                &scales,
             ));
             tree.compute_layout(400.0, 400.0);
             assert_eq!(keyboard_focus(&mut tree, palette), None);

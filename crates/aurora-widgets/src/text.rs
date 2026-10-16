@@ -269,10 +269,9 @@ fn row_label(tree: &WidgetTree<WidgetKind>, row: WidgetId) -> Option<(String, bo
             Some((option.clone(), !state.is_disabled()))
         }
         WidgetKind::Container => {
-            // A command palette's result row: body container, then root.
-            if let Some(WidgetKind::CommandPalette(state)) =
-                tree.parent(parent).and_then(|root| tree.payload(root))
-            {
+            // A command palette's result row: its results list is the
+            // row's parent, and the palette's root sits above that.
+            if let Some((_, state)) = crate::widgets::enclosing_palette(tree, parent) {
                 return state.row_title(row).map(|title| (title.to_owned(), true));
             }
             // A plain list row that opted in (0.147.1,
@@ -762,10 +761,7 @@ fn container_text(
                 .map(|label| (label, None))
         }
         WidgetKind::Container => {
-            let root = tree.parent(parent)?;
-            let WidgetKind::CommandPalette(state) = tree.payload(root)? else {
-                return None;
-            };
+            let (root, state) = crate::widgets::enclosing_palette(tree, parent)?;
             (state.query_strip() == id).then(|| {
                 let query = state.query().to_owned();
                 let mut decor = decor(theme, query.len());
@@ -2947,6 +2943,7 @@ mod field_tests {
                 CommandEntry::new("b", "Redo"),
                 CommandEntry::new("c", "Toggle Layers"),
             ],
+            &crate::widgets::test_scales(),
         ));
         (tree, palette)
     }

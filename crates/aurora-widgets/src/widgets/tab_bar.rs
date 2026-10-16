@@ -1289,6 +1289,8 @@ mod tests {
             NamedKey::ArrowRight,
             NamedKey::Home,
             NamedKey::End,
+            NamedKey::PageUp,
+            NamedKey::PageDown,
             NamedKey::F1,
             NamedKey::F2,
             NamedKey::F3,
@@ -1318,6 +1320,8 @@ mod tests {
                 | NamedKey::ArrowRight
                 | NamedKey::Home
                 | NamedKey::End
+                | NamedKey::PageUp
+                | NamedKey::PageDown
                 | NamedKey::F1
                 | NamedKey::F2
                 | NamedKey::F3
@@ -1332,7 +1336,7 @@ mod tests {
                 | NamedKey::F12 => {}
             }
         }
-        assert_eq!(all.len(), 24);
+        assert_eq!(all.len(), 26);
         let mapped: Vec<(NamedKey, TabBarKey)> = all
             .into_iter()
             .filter_map(|k| TabBarKey::from_named_key(k).map(|t| (k, t)))

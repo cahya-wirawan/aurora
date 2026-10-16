@@ -21,31 +21,55 @@
 //! matching) — real, separate follow-on work if a plain substring match
 //! turns out not to be good enough in practice.
 //!
+//! **Layout (0.257.0 rewrite; before it, every row shared the body's
+//! height and, with a long list, drew on top of its neighbours).** The
+//! tree is
+//!
+//! ```text
+//! root (CommandPalette payload; the caller's style: size, position)
+//! └─ frame            Column, full width, as tall as its content
+//!    ├─ query strip   fixed height, never shrinks, draws the query
+//!    └─ viewport      Row, grows/shrinks inside the frame, at most
+//!       │             `size.content_panel_max_rows` rows tall, clips
+//!       ├─ body       the ListBox: a scroll container holding the rows
+//!       │  └─ rows    one fixed `row_height` each, never shrink
+//!       └─ scrollbar  a linked scrollbar, hidden while the rows fit
+//! ```
+//!
+//! so a palette with few results is as tall as its strip plus its rows,
+//! one with many stops at the cap and scrolls, and no row is ever
+//! squeezed below its own height. The caller sizes only the root (the
+//! app gives it a width, a top inset and an `auto` height). The row,
+//! strip and cap come from the `Scales` passed to
+//! [`insert_command_palette`] (`row_height`, `spacing.xs`,
+//! `size.content_panel_max_rows`) — the same tokens the dock panels'
+//! rows and their scrolling cap use.
+//!
+//! **Keyboard**: [`move_command_palette_selection`] (arrows, wrapping),
+//! [`step_command_palette_selection`] (page, first, last: no wrap) and
+//! [`select_command_palette_at`] (a pointer press) all keep the selected
+//! row scrolled into view. A new query or command list resets the scroll
+//! to the top (the selection resets to the first result).
+//!
 //! **Rendering** lives in `crate::paint`/`crate::text`, like every
-//! widget's: the root paints its panel, and since 0.133.0 the body's
-//! first child — a presentational *query strip*
-//! ([`CommandPaletteState::query_strip`]) sharing the body's height with
-//! the rows — draws the typed query with a caret at its end, and each
-//! result row draws its command's title
-//! ([`CommandPaletteState::row_title`]). With many results every row
-//! (and the strip) gets an even share of the body's height, which can
-//! fall below one text line — the text is then clipped, not scrolled. This
-//! includes the query strip itself (0.133.0 review, C5): it is a flex
-//! sibling of the rows inside the `ListBox`, so it shrinks as the result
-//! count grows. Moving it out of the body, as a fixed row-height sibling,
-//! is a known follow-up (it changes every committed palette golden), not
-//! done in 0.133.0. The strip's caret shows while focus is anywhere
-//! within the palette (the palette itself or one of its rows).
+//! widget's: the root paints its panel, the query strip
+//! ([`CommandPaletteState::query_strip`]) draws the typed query with a
+//! caret at its end, and each result row draws its command's title
+//! ([`CommandPaletteState::row_title`]); rows scrolled out of the
+//! viewport are clipped by the viewport like any scrolled panel row. The
+//! strip's caret shows while focus is anywhere within the palette (the
+//! palette itself or one of its rows).
 
-use accesskit::{Action, Node, Role};
-use taffy::style_helpers::{auto, percent};
-use taffy::{FlexDirection, Size, Style};
+use accesskit::{Action, Node, Orientation, Role};
+use aurora_theme::Scales;
+use taffy::style_helpers::{TaffyZero, auto, length, percent};
+use taffy::{Dimension, FlexDirection, Overflow, Size, Style};
 
 use crate::error::WidgetError;
 use crate::shortcut::KeyChord;
 use crate::tree::{WidgetId, WidgetTree};
 
-use super::{ListRowState, WidgetKind};
+use super::{ListRowState, ScrollbarRange, WidgetKind, insert_scrollbar, link_scrollbar};
 
 /// One entry a [`CommandPaletteState`] can offer — a title plus an
 /// optional shortcut label shown alongside it. Purely informational: a
@@ -78,6 +102,26 @@ impl CommandEntry {
     }
 }
 
+/// How [`step_command_palette_selection`] moves the selection. None of
+/// them wraps (an arrow key's wrapping is
+/// [`move_command_palette_selection`]'s own behaviour).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteStep {
+    /// One result down, stopping at the last.
+    Next,
+    /// One result up, stopping at the first.
+    Previous,
+    /// A page down: as many results as the viewport shows (at least
+    /// one), stopping at the last.
+    PageDown,
+    /// A page up, stopping at the first.
+    PageUp,
+    /// The first result.
+    First,
+    /// The last result.
+    Last,
+}
+
 /// A command palette's own state — the payload of its root widget
 /// ([`WidgetKind::CommandPalette`]). The filtered result rows themselves
 /// are real, separate [`WidgetTree`] nodes (the same "real nested tree
@@ -86,9 +130,17 @@ impl CommandEntry {
 /// [`set_command_palette_query`] knows what to remove before rebuilding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandPaletteState {
+    /// The results' scroll container (the `Role::ListBox`): the rows'
+    /// parent.
     body: WidgetId,
-    /// The body's first child, drawing the query (0.133.0).
+    /// The viewport row holding [`Self::body`] and [`Self::scrollbar`].
+    viewport: WidgetId,
+    /// The linked scrollbar beside the rows.
+    scrollbar: WidgetId,
+    /// The first child of the frame, drawing the query (0.133.0).
     query_strip: WidgetId,
+    /// Every result row's height (`row_height`), kept for paging.
+    row_height: f32,
     commands: Vec<CommandEntry>,
     query: String,
     /// Indices into `commands` that matched the current `query`, in
@@ -167,25 +219,52 @@ impl CommandPaletteState {
         self.rows.get(index).copied()
     }
 
+    /// The index of [`Self::selected`] among [`Self::results`].
+    #[must_use]
+    pub fn selected_index(&self) -> Option<usize> {
+        self.selected
+    }
+
+    /// The results list: the `Role::ListBox` scroll container whose
+    /// children are exactly the result rows (the query strip is not in
+    /// it, since 0.257.0).
     #[must_use]
     pub fn body(&self) -> WidgetId {
         self.body
     }
 
-    /// The query strip: the body's first child, sharing the body's
-    /// height with the rows (the same `flex_grow` share each row gets) and
-    /// drawing the query text with a caret at its end. It stays when no
-    /// command matches (then it has the whole body).
+    /// The viewport row clipping [`Self::body`] (and holding the
+    /// scrollbar): its height is what limits the palette's height.
+    #[must_use]
+    pub fn viewport(&self) -> WidgetId {
+        self.viewport
+    }
+
+    /// The scrollbar linked to [`Self::body`]; hidden while the rows fit.
+    #[must_use]
+    pub fn scrollbar(&self) -> WidgetId {
+        self.scrollbar
+    }
+
+    /// The query strip: a fixed-height row above the results (0.257.0;
+    /// before it shared the rows' height), drawing the query text with a
+    /// caret at its end. It stays when no command matches.
     #[must_use]
     pub fn query_strip(&self) -> WidgetId {
         self.query_strip
     }
 
-    /// The result rows, in display order (the body's children after the
-    /// query strip).
+    /// The result rows, in display order (the children of
+    /// [`Self::body`]).
     #[must_use]
     pub fn rows(&self) -> &[WidgetId] {
         &self.rows
+    }
+
+    /// Every result row's height in logical px (`row_height`).
+    #[must_use]
+    pub fn row_height(&self) -> f32 {
+        self.row_height
     }
 
     /// The title of the command result row `row` shows, or `None` if
@@ -198,37 +277,125 @@ impl CommandPaletteState {
     }
 }
 
-/// The results list's own layout: `Column`, filling the root panel
-/// (`percent(1.0)` on both axes) so its own rows stack top-to-bottom
-/// instead of the `Row`-direction default every `Style::default()`
-/// container otherwise gets — the same "labeled panel, `Column`,
-/// `flex_grow`" shape `aurora_ui::insert_panel` already establishes for
-/// stacking real content vertically.
-fn body_style() -> Style {
+/// The palette enclosing `id` (the root itself, the strip, the body, a
+/// row ...), with its root id: the walk up from `id` is at most six
+/// levels (a row is four below the root). For `crate::text`, which finds
+/// what to draw from a widget.
+pub(crate) fn enclosing_palette(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+) -> Option<(WidgetId, &CommandPaletteState)> {
+    let mut current = Some(id);
+    for _ in 0..6 {
+        let candidate = current?;
+        if let Some(WidgetKind::CommandPalette(state)) = tree.payload(candidate) {
+            return Some((candidate, state));
+        }
+        current = tree.parent(candidate);
+    }
+    None
+}
+
+/// The frame under the root: a `Column` as wide as the root and as tall
+/// as its content — or, when the caller gave the root a definite height,
+/// as tall as that (the root's cross-axis stretch).
+fn frame_style() -> Style {
     Style {
         flex_direction: FlexDirection::Column,
         size: Size {
             width: percent(1.0_f32),
-            height: percent(1.0_f32),
+            height: auto(),
         },
         ..Default::default()
     }
 }
 
-/// One result row's own layout: full body width, sharing the body's
-/// available height equally with every other row (`flex_grow: 1.0`
-/// each — the same "N siblings dividing their container's height
-/// evenly" idiom `aurora_ui::workspace`'s own docked-panel rail
-/// already uses) rather than a fixed pixel height. Deliberately not a
-/// `Scales`-derived literal: an even flexbox split needs no absolute
-/// size at all, so this doesn't need `insert_command_palette`/
-/// `rebuild_rows` to take a `&Scales` they otherwise have no use for.
-fn row_style() -> Style {
+/// The query strip's height: one row plus one `spacing.xs` of air, never
+/// shrunk by a crowded palette.
+fn strip_height(scales: &Scales) -> f32 {
+    super::row_height(scales) + super::spacing(scales.spacing.xs)
+}
+
+fn strip_style(scales: &Scales) -> Style {
     Style {
+        flex_shrink: 0.0,
+        size: Size {
+            width: percent(1.0_f32),
+            height: length(strip_height(scales)),
+        },
+        ..Default::default()
+    }
+}
+
+/// How many rows the viewport shows before it scrolls:
+/// `size.content_panel_max_rows`, the token the dock panels' scrolling
+/// cap already is, at least one.
+fn max_visible_rows(scales: &Scales) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let rows = scales.size.content_panel_max_rows as f32;
+    rows.max(1.0)
+}
+
+/// The viewport: it takes the rows' height up to the cap, then clips and
+/// the rows scroll. It may shrink below its basis (a root with a smaller
+/// definite height) and never needs more than the cap. Like a dock
+/// panel's viewport, a clipping scroll container's own minimum is zero,
+/// so the rows' total height never floors the palette.
+fn viewport_style(scales: &Scales) -> Style {
+    Style {
+        flex_direction: FlexDirection::Row,
         flex_grow: 1.0,
+        flex_shrink: 1.0,
         size: Size {
             width: percent(1.0_f32),
             height: auto(),
+        },
+        min_size: Size {
+            width: Dimension::ZERO,
+            height: Dimension::ZERO,
+        },
+        max_size: Size {
+            width: auto(),
+            height: length(max_visible_rows(scales) * super::row_height(scales)),
+        },
+        overflow: taffy::Point {
+            x: Overflow::Hidden,
+            y: Overflow::Hidden,
+        },
+        ..Default::default()
+    }
+}
+
+/// The results list's own layout: a `Column` scroll container that
+/// fills the viewport beside the scrollbar, its rows stacking
+/// top-to-bottom at their own height.
+fn body_style() -> Style {
+    Style {
+        flex_direction: FlexDirection::Column,
+        flex_grow: 1.0,
+        flex_basis: Dimension::ZERO,
+        min_size: Size {
+            width: Dimension::ZERO,
+            height: Dimension::ZERO,
+        },
+        overflow: taffy::Point {
+            x: Overflow::Hidden,
+            y: Overflow::Hidden,
+        },
+        ..Default::default()
+    }
+}
+
+/// One result row's own layout: full body width, exactly `row_height`
+/// tall, and never shrunk — the 0.133.0 layout shared the body's height
+/// evenly (`flex_grow`) and, past a few dozen commands, drew every row
+/// on top of its neighbours.
+fn row_style(row_height: f32) -> Style {
+    Style {
+        flex_shrink: 0.0,
+        size: Size {
+            width: percent(1.0_f32),
+            height: length(row_height),
         },
         ..Default::default()
     }
@@ -260,10 +427,13 @@ fn row_node(entry: &CommandEntry, selected: bool) -> Node {
 
 /// Inserts a new command palette as a child of `parent`: a
 /// `Role::TextInput` root (its `value` is always the current query text)
-/// holding a `Role::ListBox` body, itself holding one
-/// `Role::ListBoxOption` row per command in `commands` — the initial,
-/// empty query matches everything, mirroring what a real search field
-/// shows before the user types anything.
+/// holding a fixed-height query strip and a scrolling `Role::ListBox`
+/// with one `Role::ListBoxOption` row per command in `commands` — the
+/// initial, empty query matches everything, mirroring what a real search
+/// field shows before the user types anything. `scales` gives the row
+/// height, the strip height and the number of rows shown before it
+/// scrolls (see the module docs); the caller sizes and positions the
+/// root with [`WidgetTree::set_style`].
 ///
 /// # Errors
 ///
@@ -273,8 +443,16 @@ pub fn insert_command_palette(
     tree: &mut WidgetTree<WidgetKind>,
     parent: WidgetId,
     commands: Vec<CommandEntry>,
+    scales: &Scales,
 ) -> Result<WidgetId, WidgetError> {
-    insert_palette(tree, parent, PALETTE_LABEL.to_owned(), true, commands)
+    insert_palette(
+        tree,
+        parent,
+        PALETTE_LABEL.to_owned(),
+        true,
+        commands,
+        scales,
+    )
 }
 
 /// Inserts a *prompt* (0.168.0): the same widget as
@@ -294,8 +472,9 @@ pub fn insert_command_prompt(
     parent: WidgetId,
     label: impl Into<String>,
     commands: Vec<CommandEntry>,
+    scales: &Scales,
 ) -> Result<WidgetId, WidgetError> {
-    insert_palette(tree, parent, label.into(), false, commands)
+    insert_palette(tree, parent, label.into(), false, commands, scales)
 }
 
 fn insert_palette(
@@ -304,6 +483,7 @@ fn insert_palette(
     label: String,
     filtering: bool,
     commands: Vec<CommandEntry>,
+    scales: &Scales,
 ) -> Result<WidgetId, WidgetError> {
     let root = tree.insert(
         parent,
@@ -312,24 +492,25 @@ fn insert_palette(
         WidgetKind::Container,
     )?;
 
-    let mut body_node = Node::new(Role::ListBox);
-    body_node.set_label("Results");
-    let body = tree.insert(root, body_style(), body_node, WidgetKind::Container)?;
-    // Presentational: the root's own `Role::TextInput` value already is
-    // the query, so a labelled strip would announce it twice.
-    let query_strip = tree.insert(
-        body,
-        row_style(),
-        Node::new(Role::GenericContainer),
-        WidgetKind::Container,
-    )?;
+    let built = build_parts(tree, root, scales);
+    let (body, viewport, scrollbar, query_strip) = match built {
+        Ok(parts) => parts,
+        Err(err) => {
+            // Nothing is left behind when a part cannot be built.
+            let _ = tree.remove(root);
+            return Err(err);
+        }
+    };
 
     let Some(payload) = tree.payload_mut(root) else {
         unreachable!("root was just inserted above");
     };
     *payload = WidgetKind::CommandPalette(CommandPaletteState {
         body,
+        viewport,
+        scrollbar,
         query_strip,
+        row_height: super::row_height(scales),
         commands,
         query: String::new(),
         filtered: Vec::new(),
@@ -342,6 +523,54 @@ fn insert_palette(
 
     rebuild_rows(tree, root, String::new())?;
     Ok(root)
+}
+
+/// The palette's fixed skeleton under `root`: returns
+/// `(body, viewport, scrollbar, query_strip)`.
+fn build_parts(
+    tree: &mut WidgetTree<WidgetKind>,
+    root: WidgetId,
+    scales: &Scales,
+) -> Result<(WidgetId, WidgetId, WidgetId, WidgetId), WidgetError> {
+    let frame = tree.insert(
+        root,
+        frame_style(),
+        Node::new(Role::GenericContainer),
+        WidgetKind::Container,
+    )?;
+    // Presentational: the root's own `Role::TextInput` value already is
+    // the query, so a labelled strip would announce it twice.
+    let query_strip = tree.insert(
+        frame,
+        strip_style(scales),
+        Node::new(Role::GenericContainer),
+        WidgetKind::Container,
+    )?;
+    let viewport = tree.insert(
+        frame,
+        viewport_style(scales),
+        Node::new(Role::GenericContainer),
+        WidgetKind::Container,
+    )?;
+    let mut body_node = Node::new(Role::ListBox);
+    body_node.set_label("Results");
+    let body = tree.insert(viewport, body_style(), body_node, WidgetKind::Container)?;
+    tree.set_scrollable(body, true)?;
+    let scrollbar = insert_scrollbar(
+        tree,
+        viewport,
+        scales,
+        Orientation::Vertical,
+        None,
+        0.0,
+        ScrollbarRange {
+            min: 0.0,
+            max: 0.0,
+            page_size: 0.0,
+        },
+    )?;
+    link_scrollbar(tree, scrollbar, body)?;
+    Ok((body, viewport, scrollbar, query_strip))
 }
 
 fn state(
@@ -374,7 +603,8 @@ pub fn command_palette_state(
 /// result rows to match — removes every existing row and inserts fresh
 /// ones rather than diffing, the same one-shot-rebuild simplicity
 /// `aurora-ui`'s panel population already accepts. Selection resets to
-/// the first result, or to nothing when no command matches.
+/// the first result, or to nothing when no command matches, and the rows
+/// scroll back to the top.
 ///
 /// # Errors
 ///
@@ -444,6 +674,7 @@ fn rebuild_rows(
 ) -> Result<(), WidgetError> {
     let current = state(tree, root)?;
     let body = current.body;
+    let row_height = current.row_height;
     let query_strip = current.query_strip;
     let commands = current.commands.clone();
     let old_rows = current.rows.clone();
@@ -464,6 +695,9 @@ fn rebuild_rows(
     for row in old_rows {
         tree.remove(row)?;
     }
+    // New rows start at the top: the offset is reset while the list is
+    // empty, so no stale row is shifted.
+    tree.set_scroll_y(body, 0.0)?;
 
     let mut rows = Vec::with_capacity(filtered.len());
     for (position, &command_index) in filtered.iter().enumerate() {
@@ -472,7 +706,7 @@ fn rebuild_rows(
         };
         let row = tree.insert(
             body,
-            row_style(),
+            row_style(row_height),
             row_node(entry, position == 0),
             WidgetKind::ListRow(ListRowState {
                 selected: position == 0,
@@ -499,8 +733,9 @@ fn rebuild_rows(
 
 /// Moves `root`'s own selection cursor by one result, wrapping around —
 /// `forward: true` for the next result (`ArrowDown`), `false` for the
-/// previous one (`ArrowUp`). Returns the newly-selected row, or `None`
-/// (a no-op) when no result currently matches the query.
+/// previous one (`ArrowUp`) — and scrolls it into view. Returns the
+/// newly-selected row, or `None` (a no-op) when no result currently
+/// matches the query.
 ///
 /// # Errors
 ///
@@ -523,36 +758,117 @@ pub fn move_command_palette_selection(
         None if forward => 0,
         None => len - 1,
     };
+    select_index(tree, root, next_index)
+}
+
+/// Moves the selection without wrapping — one result, a page, or to
+/// either end ([`PaletteStep`]) — and scrolls it into view. A page is as
+/// many results as the viewport's last layout showed, at least one.
+/// Returns the newly-selected row, or `None` (a no-op) when no result
+/// matches the query.
+///
+/// # Errors
+///
+/// As [`move_command_palette_selection`].
+pub fn step_command_palette_selection(
+    tree: &mut WidgetTree<WidgetKind>,
+    root: WidgetId,
+    step: PaletteStep,
+) -> Result<Option<WidgetId>, WidgetError> {
+    let current = state(tree, root)?;
+    let len = current.rows.len();
+    if len == 0 {
+        return Ok(None);
+    }
+    let last = len - 1;
+    let from = current.selected.unwrap_or(0).min(last);
+    let page = {
+        let shown = tree.bounds(current.body).map_or(0, |b| b.height);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[allow(clippy::cast_precision_loss)]
+        let rows = if current.row_height > 0.0 {
+            (shown as f32 / current.row_height).floor() as usize
+        } else {
+            1
+        };
+        rows.max(1)
+    };
+    let target = match step {
+        PaletteStep::Next => (from + 1).min(last),
+        PaletteStep::Previous => from.saturating_sub(1),
+        PaletteStep::PageDown => from.saturating_add(page).min(last),
+        PaletteStep::PageUp => from.saturating_sub(page),
+        PaletteStep::First => 0,
+        PaletteStep::Last => last,
+    };
+    select_index(tree, root, target)
+}
+
+/// Selects the result row under `point` (window-logical px, the same
+/// space as [`WidgetTree::bounds`]) — the pointer-press half of the
+/// palette. Hit-testing sees the rows where scrolling put them, and a
+/// row the viewport clips is not hit. Returns the newly-selected row, or
+/// `None` (nothing changes) when `point` is not on a result row.
+///
+/// # Errors
+///
+/// As [`move_command_palette_selection`].
+pub fn select_command_palette_at(
+    tree: &mut WidgetTree<WidgetKind>,
+    root: WidgetId,
+    point: (f32, f32),
+) -> Result<Option<WidgetId>, WidgetError> {
+    let current = state(tree, root)?;
+    let Some(hit) = tree.hit_test(point) else {
+        return Ok(None);
+    };
+    let Some(index) = current.rows.iter().position(|&row| row == hit) else {
+        return Ok(None);
+    };
+    select_index(tree, root, index)
+}
+
+/// Makes row `index` the selected one: both highlight flags, the
+/// accessibility `selected` flags and the scroll position.
+fn select_index(
+    tree: &mut WidgetTree<WidgetKind>,
+    root: WidgetId,
+    index: usize,
+) -> Result<Option<WidgetId>, WidgetError> {
+    let current = state(tree, root)?;
+    let Some(&new_row) = current.rows.get(index) else {
+        return Ok(None);
+    };
     let old_row = current
         .selected
-        .and_then(|index| current.rows.get(index).copied());
-    let Some(&new_row) = current.rows.get(next_index) else {
-        unreachable!("next_index is always < len by construction");
-    };
+        .and_then(|selected| current.rows.get(selected).copied());
 
-    if let Some(row) = old_row {
-        if let Some(WidgetKind::ListRow(row_state)) = tree.payload_mut(row) {
-            row_state.selected = false;
+    if old_row != Some(new_row) {
+        if let Some(row) = old_row {
+            if let Some(WidgetKind::ListRow(row_state)) = tree.payload_mut(row) {
+                row_state.selected = false;
+            }
+            if let Some(node) = tree.accessibility(row) {
+                let mut updated = node.clone();
+                updated.set_selected(false);
+                tree.set_accessibility(row, updated)?;
+            }
         }
-        if let Some(node) = tree.accessibility(row) {
+        if let Some(WidgetKind::ListRow(row_state)) = tree.payload_mut(new_row) {
+            row_state.selected = true;
+        }
+        if let Some(node) = tree.accessibility(new_row) {
             let mut updated = node.clone();
-            updated.set_selected(false);
-            tree.set_accessibility(row, updated)?;
+            updated.set_selected(true);
+            tree.set_accessibility(new_row, updated)?;
         }
-    }
-    if let Some(WidgetKind::ListRow(row_state)) = tree.payload_mut(new_row) {
-        row_state.selected = true;
-    }
-    if let Some(node) = tree.accessibility(new_row) {
-        let mut updated = node.clone();
-        updated.set_selected(true);
-        tree.set_accessibility(new_row, updated)?;
     }
 
     let Some(WidgetKind::CommandPalette(state)) = tree.payload_mut(root) else {
         unreachable!("state(tree, root) above already confirmed this is a command palette");
     };
-    state.selected = Some(next_index);
+    state.selected = Some(index);
+    tree.scroll_into_view(new_row);
     Ok(Some(new_row))
 }
 
