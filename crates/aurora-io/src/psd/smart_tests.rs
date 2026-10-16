@@ -787,7 +787,12 @@ fn a_document_without_smart_objects_writes_no_smart_entries() {
     let history = std::mem::replace(&mut opened.document.history, History::new());
     let bytes = aur_bytes(&mut opened, &history);
     let archive = ok(zip::ZipArchive::new(Cursor::new(&bytes)));
-    assert!(archive.file_names().all(|n| !n.starts_with("smart-object")));
+    assert!(
+        archive
+            .file_names()
+            .filter_map(Result::ok)
+            .all(|n| !n.starts_with("smart-object"))
+    );
 }
 
 fn rewrite_entry(bytes: &[u8], name: &str, replacement: Option<&[u8]>) -> Vec<u8> {
@@ -798,7 +803,7 @@ fn rewrite_entry(bytes: &[u8], name: &str, replacement: Option<&[u8]>) -> Vec<u8
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for i in 0..src.len() {
         let mut file = ok(src.by_index(i));
-        let entry = file.name().to_owned();
+        let entry = String::from_utf8_lossy(file.name_raw()).into_owned();
         let mut data = Vec::new();
         ok(file.read_to_end(&mut data));
         if entry == name {

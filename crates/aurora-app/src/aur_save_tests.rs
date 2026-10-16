@@ -238,7 +238,11 @@ fn document(n: u32) -> (aurora_doc::LayerTree, aurora_doc::History) {
 /// Reads the container's `manifest` entry and its entry-name list.
 fn manifest_and_entries(file: &Path) -> (Vec<u8>, Vec<String>) {
     let mut archive = ok(zip::ZipArchive::new(Cursor::new(ok(std::fs::read(file)))));
-    let entries: Vec<String> = archive.file_names().map(str::to_owned).collect();
+    let entries: Vec<String> = archive
+        .file_names()
+        .filter_map(Result::ok)
+        .map(std::borrow::Cow::into_owned)
+        .collect();
     let mut manifest = Vec::new();
     let mut entry = ok(archive.by_name("manifest"));
     ok(entry.read_to_end(&mut manifest));

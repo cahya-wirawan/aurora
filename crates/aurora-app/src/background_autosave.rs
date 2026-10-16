@@ -1369,7 +1369,10 @@ mod tests {
                     if let Err(err) = std::io::Read::read_to_end(&mut entry, &mut bytes) {
                         unreachable!("{err:?}");
                     }
-                    (entry.name().to_owned(), bytes)
+                    (
+                        String::from_utf8_lossy(entry.name_raw()).into_owned(),
+                        bytes,
+                    )
                 })
                 .collect()
         };

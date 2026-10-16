@@ -34,6 +34,8 @@
 pub mod aur;
 mod aur_paths;
 mod aur_selection;
+#[cfg(test)]
+mod aur_zip_compat_tests;
 mod channels;
 mod error;
 mod image;

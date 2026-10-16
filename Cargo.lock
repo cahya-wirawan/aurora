@@ -197,15 +197,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
-dependencies = [
- "derive_arbitrary",
-]
-
-[[package]]
 name = "arboard"
 version = "3.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -428,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-ai"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-core",
  "aurora-tile",
@@ -438,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-app"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -480,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-brush"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-core",
  "aurora-gpu",
@@ -493,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-cli"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-ai",
  "aurora-brush",
@@ -515,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-color"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-core",
  "lcms2",
@@ -525,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-core"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "postcard",
  "serde",
@@ -535,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-doc"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-core",
  "aurora-graph",
@@ -551,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-filters"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-color",
  "aurora-core",
@@ -564,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-gpu"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-core",
  "aurora-tile",
@@ -580,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-graph"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-core",
  "aurora-tile",
@@ -590,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-io"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-color",
  "aurora-core",
@@ -612,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-plugin"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-core",
  "aurora-graph",
@@ -623,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-render"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-core",
  "aurora-gpu",
@@ -640,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-testkit"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "png 0.17.16",
  "tempfile",
@@ -650,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-text"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-core",
  "aurora-vector",
@@ -664,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-theme"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-color",
  "aurora-core",
@@ -676,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-tile"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-core",
  "criterion",
@@ -694,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-ui"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "accesskit",
  "aurora-ai",
@@ -722,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-vector"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "aurora-core",
  "lyon",
@@ -732,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-widgets"
-version = "0.251.0"
+version = "0.252.0"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -1225,17 +1216,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
-name = "derive_arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1282,17 +1262,6 @@ dependencies = [
  "block2 0.6.2",
  "libc",
  "objc2 0.6.4",
-]
-
-[[package]]
-name = "displaydoc"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6232dd377dcc64799954cbd3a9bb882e9cdc1308ccd87b1c098f1fb2eaf82a8"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.3",
 ]
 
 [[package]]
@@ -2244,6 +2213,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -3696,6 +3677,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8464ec13c3691491391d9fce00f6416c9a48e46972f72d7865688be2080192c9"
 
 [[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4661,19 +4648,16 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "2.4.2"
+version = "9.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
+checksum = "c2d98561b612a84ae525331a7a094429ef8a5772514ed507ff6db5f54badc971"
 dependencies = [
- "arbitrary",
  "crc32fast",
- "crossbeam-utils",
- "displaydoc",
  "flate2",
  "indexmap",
  "memchr",
- "thiserror 2.0.19",
- "zopfli",
+ "nix",
+ "typed-path",
 ]
 
 [[package]]
@@ -4681,18 +4665,6 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[package]]
-name = "zopfli"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f05cd8797d63865425ff89b5c4a48804f35ba0ce8d125800027ad6017d2b5249"
-dependencies = [
- "bumpalo",
- "crc32fast",
- "log",
- "simd-adler32",
-]
 
 [[package]]
 name = "zune-core"

@@ -601,7 +601,7 @@ fn a_recovered_autosave_with_a_damaged_selection_reports_why_and_opens_without_i
     let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for index in 0..archive.len() {
         let file = ok(archive.by_index_raw(index));
-        if file.name() != "selection" {
+        if file.name_raw() != b"selection" {
             ok(out.raw_copy_file(file));
         }
     }
