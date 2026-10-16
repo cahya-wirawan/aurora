@@ -7918,6 +7918,282 @@ mod tests {
             }
         }
     }
+
+    // ---- task 111: the pattern pool and pattern overlays ----
+
+    fn test_pattern(id: &str, w: u32, h: u32, seed: u16) -> aurora_core::pattern::Pattern {
+        let mut texels = Vec::new();
+        for i in 0..(w * h) {
+            let v = u16::try_from(i % 60_000).unwrap_or(0).wrapping_add(seed);
+            texels.extend_from_slice(&[v, v ^ 0x5555, v.wrapping_mul(3), 65_535 - (v % 7)]);
+        }
+        match aurora_core::pattern::Pattern::new(id.to_owned(), format!("name {id}"), w, h, texels)
+        {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn pattern_overlay_fixture(id: &str, scale: f32) -> aurora_core::effects::PatternOverlay {
+        aurora_core::effects::PatternOverlay {
+            gate: aurora_core::effects::EffectGate::default(),
+            blend_mode: aurora_core::effects::EffectBlendMode::Multiply,
+            opacity: 0.5,
+            pattern: id.to_owned(),
+            scale,
+            origin: (3.5, -2.0),
+        }
+    }
+
+    /// Layers "p" (with a shadow) and "q" carrying pattern overlays, a pool
+    /// of two patterns (one unused by any layer), saved through [`write`].
+    fn pattern_document(
+        store: &mut TileStore,
+        with_patterns: bool,
+    ) -> (Vec<u8>, aurora_doc::LayerId, aurora_doc::LayerId, History) {
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let mut add = |name: &str| match history.add_pixel_layer(&mut layers, name, bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (p, q) = (add("p"), add("q"));
+        if with_patterns {
+            for pattern in [test_pattern("pa", 5, 3, 1), test_pattern("pb", 2, 2, 9)] {
+                if let Err(err) = layers.add_pattern(pattern) {
+                    unreachable!("{err:?}");
+                }
+            }
+            for (id, shadow, pattern, scale) in [(p, true, "pa", 2.0), (q, false, "pb", 0.5)] {
+                let mut fx = if shadow {
+                    effects_fixture(3.0)
+                } else {
+                    aurora_core::LayerEffects::default()
+                };
+                fx.pattern_overlays = vec![pattern_overlay_fixture(pattern, scale)];
+                if let Err(err) = history.set_effects(&mut layers, id, Some(fx)) {
+                    unreachable!("{err:?}");
+                }
+            }
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        (bytes.into_inner(), p, q, history)
+    }
+
+    #[test]
+    fn patterns_and_overlays_survive_aur_round_trip_and_journal_replay() {
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, p, q, _) = pattern_document(&mut store, true);
+        let names = effects_entry_names(&bytes);
+        assert!(names.iter().any(|n| n == super::LAYER_PATTERNS_ENTRY));
+        assert!(
+            names
+                .iter()
+                .any(|n| *n == format!("{}0", super::LAYER_PATTERN_PIXELS_PREFIX))
+        );
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        // The pool, pixel for pixel (including the one no layer names).
+        assert_eq!(document.layers.patterns().len(), 2);
+        for want in [test_pattern("pa", 5, 3, 1), test_pattern("pb", 2, 2, 9)] {
+            assert_eq!(document.layers.patterns().get(want.id()), Some(&want));
+        }
+        assert_eq!(
+            document
+                .layers
+                .effects(p)
+                .map(|f| f.pattern_overlays.clone()),
+            Some(vec![pattern_overlay_fixture("pa", 2.0)])
+        );
+        assert_eq!(
+            document
+                .layers
+                .effects(q)
+                .map(|f| f.pattern_overlays.clone()),
+            Some(vec![pattern_overlay_fixture("pb", 0.5)])
+        );
+        assert_eq!(
+            document.layers.effects(p).map(|f| f.drop_shadows.len()),
+            Some(1)
+        );
+        let replayed = match document.history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            replayed.effects(p).map(|f| f.pattern_overlays.clone()),
+            Some(vec![pattern_overlay_fixture("pa", 2.0)]),
+            "replay"
+        );
+        assert_eq!(
+            replayed.effects(q).map(|f| f.pattern_overlays.clone()),
+            Some(vec![pattern_overlay_fixture("pb", 0.5)]),
+            "replay"
+        );
+    }
+
+    #[test]
+    fn no_pattern_means_no_entry_and_the_other_entries_are_unchanged() {
+        let (_dir, mut store) = real_tile_store();
+        let (plain, ..) = pattern_document(&mut store, false);
+        let names = effects_entry_names(&plain);
+        assert!(
+            names
+                .iter()
+                .all(|n| n != super::LAYER_PATTERNS_ENTRY
+                    && !n.starts_with(super::LAYER_PATTERN_PIXELS_PREFIX)),
+            "{names:?}"
+        );
+        // The container of a document with effects but no pattern is the
+        // one without the entry, byte for byte (two saves agree, and a
+        // document with only gradient overlays gets no pattern entry).
+        let (_dir2, mut store2) = real_tile_store();
+        let (again, ..) = pattern_document(&mut store2, false);
+        assert_eq!(effects_entry_names(&again), names);
+        let (_dir3, mut store3) = real_tile_store();
+        let (grad, ..) = gradient_document(&mut store3, true);
+        assert!(
+            effects_entry_names(&grad)
+                .iter()
+                .all(|n| n != super::LAYER_PATTERNS_ENTRY)
+        );
+        // With patterns the effects wire is still the version-1 one with
+        // the overlays skipped.
+        let (_dir4, mut store4) = real_tile_store();
+        let (with, ..) = pattern_document(&mut store4, true);
+        let Some(bytes) = entry_bytes(&with, super::LAYER_EFFECTS_ENTRY) else {
+            unreachable!("layer-effects entry");
+        };
+        let wire: super::LayerEffectsWire = match postcard::from_bytes(&bytes) {
+            Ok(w) => w,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(wire.version, 1);
+        assert!(wire.effects.iter().all(|(_, fx)| fx.pattern_overlays.is_empty()));
+        assert_eq!(postcard::to_allocvec(&wire).unwrap_or_default(), bytes);
+        // Stripped of the entry, the file opens without patterns.
+        let stripped = with_named_entry(&with, super::LAYER_PATTERNS_ENTRY, None);
+        let (_dir5, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(stripped), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(document.layers.patterns().is_empty());
+    }
+
+    #[test]
+    fn a_bad_pattern_entry_refuses_loudly() {
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, p, _q, _) = pattern_document(&mut store, true);
+        let record = |id: &str, w: u32, h: u32| super::PatternWire {
+            id: id.to_owned(),
+            name: String::new(),
+            width: w,
+            height: h,
+        };
+        let encode = |wire: &super::LayerPatternsWire| postcard::to_allocvec(wire).unwrap_or_default();
+        let good = || super::LayerPatternsWire {
+            version: super::LAYER_PATTERNS_VERSION,
+            patterns: vec![record("pa", 5, 3), record("pb", 2, 2)],
+            overlays: Vec::new(),
+        };
+        let mut newer = good();
+        newer.version += 1;
+        let mut zero = good();
+        zero.version = 0;
+        let mut dangling = good();
+        dangling.overlays = vec![(p.to_raw(), vec![pattern_overlay_fixture("nope", 1.0)])];
+        let mut no_effects = good();
+        no_effects.overlays = vec![(9_999, vec![pattern_overlay_fixture("pa", 1.0)])];
+        let mut invalid = good();
+        let mut bad = pattern_overlay_fixture("pa", 1.0);
+        bad.scale = 0.0;
+        invalid.overlays = vec![(p.to_raw(), vec![bad])];
+        let mut huge = good();
+        huge.patterns = vec![record("pa", 100_000, 100_000)];
+        let mut empty_id = good();
+        empty_id.patterns = vec![record("", 5, 3), record("pb", 2, 2)];
+        let mut many = good();
+        many.patterns = (0..=aurora_core::pattern::MAX_PATTERNS)
+            .map(|i| record(&format!("p{i}"), 1, 1))
+            .collect();
+        let mut wrong_size = good();
+        wrong_size.patterns = vec![record("pa", 5, 4), record("pb", 2, 2)];
+        for (payload, needle) in [
+            (encode(&newer), "saved by a newer Aurora"),
+            (encode(&zero), "the entry is damaged"),
+            (encode(&dangling), "does not hold"),
+            (encode(&no_effects), "without effects"),
+            (encode(&invalid), "pattern overlays"),
+            (encode(&huge), "out of range"),
+            (encode(&empty_id), "pattern ID"),
+            (encode(&many), "too many"),
+            (encode(&wrong_size), "damaged"),
+            (vec![1, 0xFF, 0xFF], ""),
+        ] {
+            let tampered = with_named_entry(&bytes, super::LAYER_PATTERNS_ENTRY, Some(&payload));
+            let (_dir2, mut fresh) = real_tile_store();
+            match read(Cursor::new(tampered), &mut fresh) {
+                Err(crate::error::IoError::ManifestDeserialization(message)) => {
+                    assert!(message.contains(needle), "{needle}: {message}");
+                }
+                other => unreachable!("{needle}: expected a refusal, got {:?}", other.map(|_| ())),
+            }
+        }
+        // A missing pixel entry, a short one.
+        let name = format!("{}0", super::LAYER_PATTERN_PIXELS_PREFIX);
+        let missing = with_named_entry(&bytes, &name, None);
+        let (_dir3, mut fresh) = real_tile_store();
+        assert!(matches!(
+            read(Cursor::new(missing), &mut fresh),
+            Err(crate::error::IoError::ManifestDeserialization(m)) if m.contains("missing")
+        ));
+        let short = with_named_entry(&bytes, &name, Some(&[1, 2, 3]));
+        let (_dir4, mut fresh) = real_tile_store();
+        assert!(matches!(
+            read(Cursor::new(short), &mut fresh),
+            Err(crate::error::IoError::ManifestDeserialization(m)) if m.contains("damaged")
+        ));
+    }
+
+    #[test]
+    fn the_autosave_bound_counts_the_pattern_pool() {
+        let (_dir, mut store) = real_tile_store();
+        let (_bytes, _p, _q, history) = pattern_document(&mut store, true);
+        let mut layers = LayerTree::new();
+        let id = match layers.add_pixel_layer("x", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let _ = id;
+        let big = test_pattern("big", 512, 512, 0);
+        let bytes = big.byte_len() as usize;
+        if let Err(err) = layers.add_pattern(big) {
+            unreachable!("{err:?}");
+        }
+        // A budget just under the pool refuses the snapshot (the streaming
+        // write takes over); one over it takes it.
+        let take = |budget: usize, store: &mut TileStore| {
+            super::snapshot_best_effort(&layers, &history, (100, 100), None, &SkippedTiles::new(), budget, store)
+        };
+        assert!(matches!(take(bytes - 1, &mut store), Ok(None)));
+        assert!(matches!(take(bytes + (1 << 20), &mut store), Ok(Some(_))));
+    }
 }
 
 /// The `import-losses` entry (0.177.0 review B-1).

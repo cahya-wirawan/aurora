@@ -6050,4 +6050,84 @@ mod adjustment_tests {
             .is_err()
         );
     }
+
+    /// Task 111: `SetPatternOverlays` is appended after
+    /// `SetGradientOverlays`, and the journal carries the overlays that
+    /// `LayerEffects` cannot put on its wire.
+    #[test]
+    fn set_pattern_overlays_is_appended_and_the_journal_carries_the_overlays() {
+        let id = crate::LayerId::from_raw(3);
+        let ordinal = |op: &LayerOp| {
+            postcard::to_allocvec(op)
+                .ok()
+                .and_then(|b| b.first().copied())
+        };
+        let grad = ordinal(&LayerOp::SetGradientOverlays {
+            id,
+            value: Vec::new(),
+        });
+        let pat = ordinal(&LayerOp::SetPatternOverlays {
+            id,
+            value: Vec::new(),
+        });
+        assert_eq!(pat, grad.map(|g| g + 1));
+
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+        let layer = history
+            .add_pixel_layer(&mut tree, "p", bounds, None)
+            .unwrap_or_else(|e| unreachable!("{e:?}"));
+        let overlay = aurora_core::effects::PatternOverlay {
+            gate: aurora_core::effects::EffectGate::default(),
+            blend_mode: aurora_core::effects::EffectBlendMode::Normal,
+            opacity: 0.5,
+            pattern: "pid".to_owned(),
+            scale: 2.0,
+            origin: (1.5, -2.0),
+        };
+        let fx = aurora_core::LayerEffects {
+            pattern_overlays: vec![overlay.clone()],
+            ..aurora_core::LayerEffects::default()
+        };
+        history
+            .set_effects(&mut tree, layer, Some(fx))
+            .unwrap_or_else(|e| unreachable!("{e:?}"));
+        let journal = history.save_journal().unwrap_or_default();
+        let loaded = History::load_journal(&journal).unwrap_or_else(|e| unreachable!("{e:?}"));
+        let replayed = loaded.replay().unwrap_or_else(|e| unreachable!("{e:?}"));
+        assert_eq!(
+            replayed.effects(layer).map(|f| f.pattern_overlays.clone()),
+            Some(vec![overlay.clone()])
+        );
+        assert!(history.undo(&mut tree).is_ok());
+        assert!(tree.effects(layer).is_none());
+        assert!(history.redo(&mut tree).is_ok());
+        assert_eq!(
+            tree.effects(layer).map(|f| f.pattern_overlays.len()),
+            Some(1)
+        );
+        // Without effects the op is refused.
+        let mut direct = LayerTree::new();
+        let id2 = direct
+            .add_pixel_layer("d", bounds, None)
+            .unwrap_or_else(|e| unreachable!("{e:?}"));
+        assert!(
+            crate::history::apply(
+                &mut direct,
+                LayerOp::SetPatternOverlays {
+                    id: id2,
+                    value: vec![overlay]
+                }
+            )
+            .is_err()
+        );
+        // A deleted layer's overlays come back with its `Restore`.
+        assert!(history.undo(&mut tree).is_ok());
+    }
 }

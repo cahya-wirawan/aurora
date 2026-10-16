@@ -6758,4 +6758,42 @@ mod tests {
         };
         assert_eq!(ids, (0..12).collect::<Vec<u64>>());
     }
+
+    #[test]
+    fn the_pattern_pool_replaces_by_id_and_is_bounded() {
+        use aurora_core::pattern::{
+            MAX_PATTERN_POOL_BYTES, MAX_PATTERNS, Pattern, PatternError,
+        };
+        let pattern = |id: &str, w: u32, h: u32| {
+            Pattern::new(id.to_owned(), String::new(), w, h, vec![0; (w * h * 4) as usize])
+                .unwrap_or_else(|e| unreachable!("{e:?}"))
+        };
+        let mut tree = LayerTree::new();
+        assert!(tree.patterns().is_empty());
+        assert!(tree.add_pattern(pattern("a", 2, 2)).is_ok());
+        assert!(tree.add_pattern(pattern("a", 3, 3)).is_ok());
+        assert_eq!(tree.patterns().len(), 1);
+        assert_eq!(tree.patterns().get("a").map(Pattern::width), Some(3));
+        // Count cap: ids up to the cap, the next refused, a replace allowed.
+        let mut tree = LayerTree::new();
+        for i in 0..MAX_PATTERNS {
+            assert!(tree.add_pattern(pattern(&format!("p{i}"), 1, 1)).is_ok());
+        }
+        assert!(matches!(
+            tree.add_pattern(pattern("one-more", 1, 1)),
+            Err(DocError::InvalidPattern(PatternError::PoolTooLarge))
+        ));
+        assert!(tree.add_pattern(pattern("p0", 1, 1)).is_ok());
+        // Byte cap: 2048 x 2048 is 32 MiB, so two fit and a third does not;
+        // replacing one with a same-sized pattern still fits.
+        let mut tree = LayerTree::new();
+        assert!(MAX_PATTERN_POOL_BYTES == 2 * 32 * 1024 * 1024);
+        assert!(tree.add_pattern(pattern("x", 2048, 2048)).is_ok());
+        assert!(tree.add_pattern(pattern("y", 2048, 2048)).is_ok());
+        assert!(matches!(
+            tree.add_pattern(pattern("z", 1, 1)),
+            Err(DocError::InvalidPattern(PatternError::PoolTooLarge))
+        ));
+        assert!(tree.add_pattern(pattern("y", 2048, 2048)).is_ok());
+    }
 }

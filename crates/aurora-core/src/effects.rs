@@ -1174,4 +1174,94 @@ mod tests {
             }
         );
     }
+
+    fn pattern_overlay() -> PatternOverlay {
+        PatternOverlay {
+            gate: EffectGate::default(),
+            blend_mode: EffectBlendMode::Normal,
+            opacity: 1.0,
+            pattern: "p".to_owned(),
+            scale: 1.0,
+            origin: (0.0, 0.0),
+        }
+    }
+
+    #[test]
+    fn pattern_overlay_validation_refuses_each_bad_field() {
+        let with = |o: PatternOverlay| LayerEffects {
+            pattern_overlays: vec![o],
+            ..LayerEffects::default()
+        };
+        assert_eq!(with(pattern_overlay()).validate(), Ok(()));
+        let mut bad = Vec::new();
+        for opacity in [-0.1, 1.1, f32::NAN] {
+            let mut o = pattern_overlay();
+            o.opacity = opacity;
+            bad.push(o);
+        }
+        for scale in [0.0, 0.009, 10.1, f32::NAN, f32::INFINITY, -1.0] {
+            let mut o = pattern_overlay();
+            o.scale = scale;
+            bad.push(o);
+        }
+        for origin in [
+            (f64::NAN, 0.0),
+            (0.0, f64::INFINITY),
+            (300_001.0, 0.0),
+            (0.0, -300_001.0),
+        ] {
+            let mut o = pattern_overlay();
+            o.origin = origin;
+            bad.push(o);
+        }
+        let mut o = pattern_overlay();
+        o.pattern = String::new();
+        bad.push(o);
+        let mut o = pattern_overlay();
+        o.pattern = "x".repeat(crate::pattern::MAX_PATTERN_ID_BYTES + 1);
+        bad.push(o);
+        for (n, o) in bad.into_iter().enumerate() {
+            assert!(with(o).validate().is_err(), "case {n}");
+        }
+        // The limits themselves are valid.
+        for (scale, origin) in [(0.01, (-300_000.0, 300_000.0)), (10.0, (0.0, 0.0))] {
+            let mut o = pattern_overlay();
+            o.scale = scale;
+            o.origin = origin;
+            assert_eq!(with(o).validate(), Ok(()));
+        }
+        let many = LayerEffects {
+            pattern_overlays: vec![pattern_overlay(); MAX_EFFECT_INSTANCES + 1],
+            ..LayerEffects::default()
+        };
+        assert!(matches!(
+            many.validate(),
+            Err(EffectsError::TooManyInstances { .. })
+        ));
+    }
+
+    #[test]
+    fn pattern_overlays_are_gated_counted_and_not_on_the_effects_wire() {
+        let mut fx = LayerEffects {
+            pattern_overlays: vec![pattern_overlay()],
+            ..LayerEffects::default()
+        };
+        assert!(fx.shows_any());
+        assert!(!fx.is_empty());
+        assert_eq!(fx.shown_pattern_overlays(), 1);
+        fx.pattern_overlays[0].gate.enabled = false;
+        assert_eq!((fx.shown_pattern_overlays(), fx.shows_any()), (0, false));
+        fx.pattern_overlays[0].gate.enabled = true;
+        fx.enabled = false;
+        assert_eq!(fx.shown_pattern_overlays(), 0);
+        let with = LayerEffects {
+            pattern_overlays: vec![pattern_overlay()],
+            ..LayerEffects::default()
+        };
+        let a = postcard::to_allocvec(&with).unwrap_or_default();
+        let b = postcard::to_allocvec(&LayerEffects::default()).unwrap_or_default();
+        assert_eq!(a, b);
+        let back: Result<LayerEffects, _> = postcard::from_bytes(&a);
+        assert_eq!(back.map(|f| f.pattern_overlays.len()).ok(), Some(0));
+    }
 }

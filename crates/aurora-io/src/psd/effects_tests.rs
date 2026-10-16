@@ -1571,3 +1571,116 @@ fn psd_save_still_itemises_effects_for_a_layer_with_only_a_gradient_overlay() {
         "{items}"
     );
 }
+
+// ---- task 111: pattern overlays ----
+
+/// A `patternFill` descriptor: Water at 200 %, 50 %, Multiply, linked, no
+/// phase; `extra` replaces items by key.
+fn pattern_fill<'a>(enab: bool, extra: Vec<(&'a [u8], V<'a>)>) -> V<'a> {
+    let mut items = vec![
+        (b"enab" as &[u8], V::Bool(enab)),
+        (b"present", V::Bool(true)),
+        (b"Md  ", V::Enum(b"BlnM", b"Mltp")),
+        (b"Opct", V::Unit(b"#Prc", 50.0)),
+        (
+            b"Ptrn",
+            V::Obj(vec![
+                (b"Nm  ", V::Text("Water\0")),
+                (b"Idnt", V::Text("2ab8ff7f-7c39\0")),
+            ]),
+        ),
+        (b"Scl ", V::Unit(b"#Prc", 200.0)),
+        (b"Algn", V::Bool(true)),
+        (
+            b"phase",
+            V::Obj(vec![(b"Hrzn", V::Doub(0.0)), (b"Vrtc", V::Doub(0.0))]),
+        ),
+    ];
+    items.retain(|(k, _)| !extra.iter().any(|(e, _)| e == k));
+    items.extend(extra);
+    V::Obj(items)
+}
+
+#[test]
+fn a_pattern_overlay_is_modelled_with_every_field() {
+    let read = mapped(&effects_block(&[(b"patternFill", pattern_fill(true, vec![]))]));
+    let fx = &read.effects;
+    assert_eq!(fx.pattern_overlays.len(), 1);
+    let Some(o) = fx.pattern_overlays.first() else {
+        unreachable!();
+    };
+    // The trailing NUL of the descriptor's text is not part of the ID.
+    assert_eq!(o.pattern, "2ab8ff7f-7c39");
+    assert_eq!(o.blend_mode, EffectBlendMode::Multiply);
+    assert!((o.opacity - 0.5).abs() < 1e-6);
+    assert!((o.scale - 2.0).abs() < 1e-6);
+    assert!(o.gate.on());
+    assert_eq!(fx.other.pattern_overlays, 0);
+    assert_eq!((read.pattern_unreadable, read.pattern_unplaced), (0, 0));
+    assert_eq!(fx.shown_pattern_overlays(), 1);
+    assert!(fx.shows_any());
+}
+
+#[test]
+fn unplaced_or_unnamed_pattern_overlays_are_counted_only_when_shown() {
+    let unlinked = |on| pattern_fill(on, vec![(b"Algn", V::Bool(false))]);
+    let phased = |on| {
+        pattern_fill(
+            on,
+            vec![(
+                b"phase",
+                V::Obj(vec![(b"Hrzn", V::Doub(3.0)), (b"Vrtc", V::Doub(0.0))]),
+            )],
+        )
+    };
+    let unnamed = |on| {
+        V::Obj(vec![
+            (b"enab" as &[u8], V::Bool(on)),
+            (b"present", V::Bool(true)),
+            (b"Md  ", V::Enum(b"BlnM", b"Nrml")),
+        ])
+    };
+    for (make, unreadable, unplaced) in [
+        (Box::new(unlinked) as Box<dyn Fn(bool) -> V<'static>>, 0, 1),
+        (Box::new(phased), 0, 1),
+        (Box::new(unnamed), 1, 0),
+    ] {
+        let on = mapped(&effects_block(&[(b"patternFill", make(true))]));
+        assert!(on.effects.pattern_overlays.is_empty());
+        assert_eq!(on.effects.other.pattern_overlays, 1);
+        assert_eq!((on.pattern_unreadable, on.pattern_unplaced), (unreadable, unplaced));
+        let off = mapped(&effects_block(&[(b"patternFill", make(false))]));
+        assert!(off.effects.pattern_overlays.is_empty());
+        assert_eq!(off.effects.other.pattern_overlays, 0);
+        assert_eq!((off.pattern_unreadable, off.pattern_unplaced), (0, 0));
+    }
+    // A disabled but well-formed overlay is kept (and not shown).
+    let read = mapped(&effects_block(&[(b"patternFill", pattern_fill(false, vec![]))]));
+    assert_eq!(read.effects.pattern_overlays.len(), 1);
+    assert_eq!(read.effects.shown_pattern_overlays(), 0);
+}
+
+#[test]
+fn a_pattern_scale_outside_photoshops_range_is_clamped_and_flagged() {
+    let read = mapped(&effects_block(&[(
+        b"patternFill",
+        pattern_fill(true, vec![(b"Scl ", V::Unit(b"#Prc", 5000.0))]),
+    )]));
+    assert!(read.clamped);
+    assert!(
+        read.effects
+            .pattern_overlays
+            .first()
+            .is_some_and(|o| (o.scale - 10.0).abs() < 1e-6)
+    );
+    let read = mapped(&effects_block(&[(
+        b"patternFill",
+        pattern_fill(true, vec![(b"Scl ", V::Unit(b"#Prc", 0.0))]),
+    )]));
+    assert!(
+        read.effects
+            .pattern_overlays
+            .first()
+            .is_some_and(|o| (o.scale - 0.01).abs() < 1e-6)
+    );
+}
