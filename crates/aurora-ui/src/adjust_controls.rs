@@ -127,7 +127,7 @@ impl AdjustKind {
     pub const fn of(adjustment: &Adjustment) -> Option<Self> {
         match adjustment {
             Adjustment::Vibrance(_) => Some(Self::Vibrance),
-            Adjustment::Exposure(_) => Some(Self::Exposure),
+            Adjustment::Exposure(_) | Adjustment::ExposureTrc(_) => Some(Self::Exposure),
             Adjustment::PhotoFilter(_) => Some(Self::PhotoFilter),
             Adjustment::BlackWhite(_) => Some(Self::BlackWhite),
             Adjustment::ColorBalance(_) => Some(Self::ColorBalance),
@@ -618,9 +618,11 @@ impl AdjustSlider {
         match self {
             Self::Vibrance => adjustment.vibrance().map(|p| f64::from(p.vibrance())),
             Self::VibranceSaturation => adjustment.vibrance().map(|p| f64::from(p.saturation())),
-            Self::Exposure => adjustment.exposure().map(|p| f64::from(p.exposure())),
-            Self::Offset => adjustment.exposure().map(|p| f64::from(p.offset())),
-            Self::Gamma => adjustment.exposure().map(|p| f64::from(p.gamma())),
+            Self::Exposure => adjustment
+                .exposure_sliders()
+                .map(|p| f64::from(p.exposure())),
+            Self::Offset => adjustment.exposure_sliders().map(|p| f64::from(p.offset())),
+            Self::Gamma => adjustment.exposure_sliders().map(|p| f64::from(p.gamma())),
             Self::Density => adjustment.photo_filter().map(|p| f64::from(p.density())),
             Self::Red => channel(0),
             Self::Green => channel(1),
@@ -717,13 +719,14 @@ impl AdjustSlider {
                 next.ok().map(Adjustment::Vibrance)
             }
             Self::Exposure | Self::Offset | Self::Gamma => {
-                let p: ExposureParams = adjustment.exposure()?;
+                let p: ExposureParams = adjustment.exposure_sliders()?;
                 let next = match self {
                     Self::Exposure => p.with_exposure(v),
                     Self::Offset => p.with_offset(v),
                     _ => p.with_gamma(v),
                 };
-                next.ok().map(Adjustment::Exposure)
+                // The same variant: a grey-profile layer keeps its table.
+                adjustment.with_exposure_sliders(next.ok()?)
             }
             Self::Density => adjustment
                 .photo_filter()?
@@ -874,6 +877,9 @@ pub struct AdjustControls {
     pub legacy: WidgetId,
     /// The line Invert's group shows in place of sliders (0.244.0).
     pub invert_note: WidgetId,
+    /// The line Exposure's group shows under the sliders while the layer
+    /// uses a Grayscale file's grey profile (task 112); hidden otherwise.
+    pub exposure_profile_note: WidgetId,
     /// Channel Mixer's output selector tab bar (0.245.0): tab 0 Red, 1
     /// Green, 2 Blue; idle while Monochrome is on.
     pub mixer_output: WidgetId,
@@ -1104,6 +1110,13 @@ pub fn insert_adjust_controls(
                 )?);
             }
         }
+        let exposure_profile_note = widgets::insert_label(
+            tree,
+            group_of(AdjustKind::Exposure)?,
+            scales,
+            EXPOSURE_PROFILE_NOTE.to_owned(),
+        )?;
+        widgets::set_label_disabled(tree, exposure_profile_note, true)?;
         let (
             Some(preserve),
             Some(tint),
@@ -1151,6 +1164,7 @@ pub fn insert_adjust_controls(
             balance_range,
             legacy,
             invert_note,
+            exposure_profile_note,
             mixer_output,
             mixer_mono,
             selective_group,
@@ -1202,6 +1216,10 @@ fn set_checkbox_live(
     }
     Ok(false)
 }
+
+/// What Exposure's group says under its sliders for a layer that uses a
+/// Grayscale file's grey profile (task 112).
+pub const EXPOSURE_PROFILE_NOTE: &str = "Uses the file's grey profile.";
 
 /// Shows exactly the group of `kind` (none: the whole column hides) and
 /// enables only its widgets; the two Black & White tint sliders are live
@@ -1522,6 +1540,11 @@ pub fn sync_adjust_controls(
         .gradient_map()
         .is_some_and(aurora_core::GradientMapParams::is_two_stop);
     let mut changed = set_shown(tree, controls, kind, tint_on, mixer_mono, gradient_colours)?;
+    changed |= widgets::set_label_disabled(
+        tree,
+        controls.exposure_profile_note,
+        adjustment.exposure_trc().is_none(),
+    )?;
     if let Some(filter) = adjustment.photo_filter() {
         changed |= sync_checkbox(tree, controls.preserve, filter.preserve_luminosity())?;
     }
@@ -1838,6 +1861,71 @@ mod tests {
         assert!((got(S::Gamma, &e, 2.226).unwrap_or(0.0) - 2.23).abs() < 1e-6);
         assert_eq!(got(S::Density, &f, 33.4), Some(33.0));
         assert_eq!(got(S::Green, &f, 138.4), Some(138.0));
+    }
+
+    fn trc_exposure(ev: f32, offset: f32, gamma: f32) -> Adjustment {
+        let entries: Vec<u16> = (0..=255_u16).map(|i| i * 257).collect();
+        let (Ok(trc), Ok(p)) = (
+            aurora_core::GreyTrc::new(entries),
+            ExposureParams::new(ev, offset, gamma),
+        ) else {
+            unreachable!("valid");
+        };
+        Adjustment::ExposureTrc(aurora_core::ExposureTrcParams::new(p, trc))
+    }
+
+    /// Task 112: a grey-profile Exposure uses the Exposure editor, shows
+    /// the profile note (and only it does), and a slider edit keeps the
+    /// variant and its table.
+    #[test]
+    fn a_grey_profile_exposure_uses_the_exposure_editor_with_a_note() {
+        let scales = scales();
+        let mut ws = crate::build_workspace(&scales);
+        let controls = match insert_adjust_controls(&mut ws.tree, ws.properties.root, &scales) {
+            Ok(c) => c,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let note_hidden =
+            |ws: &crate::Workspace| match ws.tree.payload(controls.exposure_profile_note) {
+                Some(WidgetKind::Label(label)) => label.disabled,
+                other => unreachable!("{other:?}"),
+            };
+        let mut layers = LayerTree::new();
+        let plain = add(&mut layers, "E", exp(-1.25, 0.125, 2.2));
+        let grey = add(&mut layers, "G", trc_exposure(0.75, -0.25, 1.5));
+        let _ = show(&mut ws, controls, &layers, Some(grey));
+        assert_eq!(
+            adjust_controls_shown(&ws.tree, controls),
+            Some(AdjustKind::Exposure)
+        );
+        assert!(!note_hidden(&ws), "the note shows for a grey-profile layer");
+        let at = |ws: &crate::Workspace, s: S| slider_state(&ws.tree, controls.sliders[s.index()]);
+        assert_eq!(at(&ws, S::Exposure), (0.75, false));
+        assert_eq!(at(&ws, S::Offset), (-0.25, false));
+        assert!((at(&ws, S::Gamma).0 - 1.5).abs() < 1e-6);
+        let _ = show(&mut ws, controls, &layers, Some(plain));
+        assert!(note_hidden(&ws), "the note hides for a plain Exposure");
+        let _ = show(&mut ws, controls, &layers, None);
+        assert!(note_hidden(&ws));
+        // The edit keeps the variant and the table.
+        let before = trc_exposure(0.75, -0.25, 1.5);
+        let after = S::Exposure.with_value(&before, 0, 2.0);
+        match (&before, &after) {
+            (Adjustment::ExposureTrc(a), Some(Adjustment::ExposureTrc(b))) => {
+                assert_eq!(a.trc(), b.trc());
+                assert_eq!(b.exposure().exposure(), 2.0);
+                assert_eq!(b.exposure().offset(), -0.25);
+            }
+            other => unreachable!("{other:?}"),
+        }
+        // An out-of-range value is handled as in the plain variant.
+        assert_eq!(
+            S::Exposure.with_value(&before, 0, 99.0).is_some(),
+            S::Exposure
+                .with_value(&exp(0.75, -0.25, 1.5), 0, 99.0)
+                .is_some()
+        );
+        assert_eq!(AdjustKind::of(&before), Some(AdjustKind::Exposure));
     }
 
     #[test]

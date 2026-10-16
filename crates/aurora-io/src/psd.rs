@@ -138,6 +138,9 @@ mod fill;
 mod gradient_lookup_tests;
 #[cfg(test)]
 mod grayscale_adjust_tests;
+#[cfg(test)]
+mod grey_exposure_tests;
+mod grey_profile;
 mod lab;
 #[cfg(test)]
 mod mixer_selective_tests;
@@ -485,6 +488,12 @@ enum Note {
     /// A Photo Filter whose colour is not stored as Lab (version 3 or
     /// another colour space).
     PhotoFilterColour,
+    /// An Exposure layer of a Grayscale file drawn through the file's grey
+    /// profile (task 112).
+    GreyExposureDrawn,
+    /// An Exposure layer of a Grayscale file left out because its grey
+    /// profile is not one Aurora has checked (task 112).
+    GreyExposureProfile(grey_profile::GreyReason),
     FillSkipped,
     /// Fill layers with no stored pixels, drawn from their fill and vector
     /// mask (task 108).
@@ -557,9 +566,14 @@ enum Note {
 }
 
 #[derive(Debug, Default)]
-struct Notes(BTreeMap<Note, u64>, Vec<String>);
+struct Notes(BTreeMap<Note, u64>, Vec<String>, grey_profile::GreyProfile);
 
 impl Notes {
+    /// The file's grey profile (task 112): what resource 1039 gave.
+    fn grey_profile(&self) -> &grey_profile::GreyProfile {
+        &self.2
+    }
+
     fn add(&mut self, note: Note) {
         self.add_n(note, 1);
     }
@@ -662,6 +676,17 @@ fn note_text(note: Note, n: u64) -> String {
             kind.label(),
             if one { "its" } else { "their" },
             kind.label(),
+        ),
+        Note::GreyExposureDrawn => format!(
+            "{n} Exposure layer{s} in this Grayscale file {is} drawn through the file's grey \
+             profile (its 256-entry tone curve decodes and encodes the grey), as Photoshop does; this was \
+             checked against one Photoshop file (Dot Gain 20%), and a PSD saved from here \
+             carries a plain Exposure instead."
+        ),
+        Note::GreyExposureProfile(reason) => format!(
+            "{n} Exposure layer{s} in this Grayscale file {was} left out — Photoshop applies \
+             Exposure in the file's grey profile and {}.",
+            reason.clause()
         ),
         Note::Grayscale(kind) => format!(
             "{n} {} layer{s} in this Grayscale file {was} left out — Aurora hasn't yet \
@@ -1490,6 +1515,9 @@ fn scan_resources(data: &[u8], notes: &mut Notes) -> f32 {
         }
         if id == 1039 && !looks_like_srgb(body) {
             notes.add(Note::ColorProfileIgnored);
+        }
+        if id == 1039 && notes.2 == grey_profile::GreyProfile::Absent {
+            notes.2 = grey_profile::classify(body);
         }
         if id == 1037
             && let Some(bytes) = body.get(..4)
@@ -3865,8 +3893,9 @@ fn other_adjustment_node(
     notes: &mut Notes,
     vector_budget: &mut vector::Budget,
 ) -> Option<PsdNode> {
-    let params = read_adjust::adjustment(parsed, header.gray());
+    let params = read_adjust::adjustment_with_profile(parsed, header.gray(), notes.grey_profile());
     match &params {
+        Ok(aurora_doc::Adjustment::ExposureTrc(_)) => notes.add(Note::GreyExposureDrawn),
         Ok(aurora_doc::Adjustment::ChannelMixer(p)) if !p.is_identity() => {
             notes.add(Note::Unvalidated(read_adjust::Kind::ChannelMixer));
         }

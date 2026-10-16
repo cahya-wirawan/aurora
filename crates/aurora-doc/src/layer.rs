@@ -129,6 +129,15 @@ pub enum Adjustment {
     /// `aurora_filters::GradientMapOp`. **Ordinal 15.** Its parameters own a
     /// stop list, so unlike the earlier kinds they are not `Copy`.
     GradientMap(aurora_core::GradientMapParams),
+    /// Exposure in a Grayscale file's grey profile (task 112,
+    /// [`aurora_core::ExposureTrcParams`]), applied by
+    /// `aurora_filters::ExposureTrcOp` on the CPU. **Ordinal 16.** Made only
+    /// by the PSD reader for an Exposure layer of a Grayscale file whose
+    /// embedded grey profile has a 256-entry tone curve; "New Exposure
+    /// Layer" still makes the plain [`Self::Exposure`]. It owns the
+    /// profile's table, so it is not `Copy`. A build older than task 112
+    /// refuses a file holding it (ADR 0009 addendum).
+    ExposureTrc(aurora_core::ExposureTrcParams),
 }
 
 impl Adjustment {
@@ -140,7 +149,7 @@ impl Adjustment {
             Self::Levels(_) => "Levels",
             Self::HueSaturation(_) | Self::HueSaturationRanges(_) => "Hue/Saturation",
             Self::Vibrance(_) => "Vibrance",
-            Self::Exposure(_) => "Exposure",
+            Self::Exposure(_) | Self::ExposureTrc(_) => "Exposure",
             Self::PhotoFilter(_) => "Photo Filter",
             Self::BlackWhite(_) => "Black & White",
             Self::ColorBalance(_) => "Color Balance",
@@ -233,6 +242,38 @@ impl Adjustment {
     pub const fn exposure(&self) -> Option<aurora_core::ExposureParams> {
         match self {
             Self::Exposure(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    /// The Exposure sliders of either Exposure variant (the plain one and
+    /// the grey-profile one), `None` for other adjustments.
+    #[must_use]
+    pub fn exposure_sliders(&self) -> Option<aurora_core::ExposureParams> {
+        match self {
+            Self::Exposure(p) => Some(*p),
+            Self::ExposureTrc(p) => Some(p.exposure()),
+            _ => None,
+        }
+    }
+
+    /// The grey-profile Exposure settings, `None` for other adjustments.
+    #[must_use]
+    pub const fn exposure_trc(&self) -> Option<&aurora_core::ExposureTrcParams> {
+        match self {
+            Self::ExposureTrc(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// This Exposure adjustment with its sliders replaced, in the same
+    /// variant (a grey-profile Exposure keeps its table); `None` for other
+    /// adjustments.
+    #[must_use]
+    pub fn with_exposure_sliders(&self, sliders: aurora_core::ExposureParams) -> Option<Self> {
+        match self {
+            Self::Exposure(_) => Some(Self::Exposure(sliders)),
+            Self::ExposureTrc(p) => Some(Self::ExposureTrc(p.with_exposure_params(sliders))),
             _ => None,
         }
     }
@@ -2036,5 +2077,227 @@ mod gradient_map_wire_tests {
                 .gradient_map()
                 .is_none()
         );
+    }
+}
+
+/// `Adjustment::ExposureTrc` is appended after `GradientMap` (ordinal 16):
+/// every earlier encoding, ordinals 0 to 15, is unchanged and a 0.254.0
+/// build refuses the new layer (task 112, ADR 0009).
+#[cfg(test)]
+mod exposure_trc_wire_tests {
+    use super::{Adjustment, LayerKind};
+
+    /// `Adjustment` exactly as a 0.254.0 build declares it.
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Adjustment254 {
+        Curves(aurora_core::CurvesParams),
+        Levels(aurora_core::LevelsParams),
+        HueSaturation(aurora_core::HueSaturationParams),
+        HueSaturationRanges(aurora_core::HueSaturationRangesParams),
+        Vibrance(aurora_core::VibranceParams),
+        Exposure(aurora_core::ExposureParams),
+        PhotoFilter(aurora_core::PhotoFilterParams),
+        BlackWhite(aurora_core::BlackWhiteParams),
+        ColorBalance(aurora_core::ColorBalanceParams),
+        Invert,
+        Threshold(aurora_core::ThresholdParams),
+        Posterize(aurora_core::PosterizeParams),
+        BrightnessContrast(aurora_core::BrightnessContrastParams),
+        ChannelMixer(aurora_core::ChannelMixerParams),
+        SelectiveColor(aurora_core::SelectiveColorParams),
+        GradientMap(aurora_core::GradientMapParams),
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Kind254 {
+        Pixel { bounds: aurora_core::Rect },
+        Group { children: Vec<super::LayerId> },
+        Adjustment(Adjustment254),
+    }
+
+    fn encode<T: serde::Serialize>(value: &T) -> Vec<u8> {
+        match postcard::to_allocvec(value) {
+            Ok(bytes) => bytes,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn trc_params() -> aurora_core::ExposureTrcParams {
+        let entries: Vec<u16> = (0..=255_u16).map(|i| i * 257).collect();
+        let trc = match aurora_core::GreyTrc::new(entries) {
+            Ok(t) => t,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let e = match aurora_core::ExposureParams::new(1.5, 0.25, 1.25) {
+            Ok(e) => e,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        aurora_core::ExposureTrcParams::new(e, trc)
+    }
+
+    #[test]
+    fn ordinals_zero_to_fifteen_keep_their_bytes() {
+        let ranged = aurora_core::HueSaturationRangesParams::plain(
+            aurora_core::HueSaturationParams::identity(),
+        );
+        let threshold = aurora_core::ThresholdParams::default();
+        let posterize = aurora_core::PosterizeParams::default();
+        let bc = aurora_core::BrightnessContrastParams::identity();
+        let mixer = aurora_core::ChannelMixerParams::identity();
+        let selective = aurora_core::SelectiveColorParams::identity();
+        let gm = aurora_core::GradientMapParams::black_to_white();
+        let pairs = [
+            (
+                Adjustment::Curves(aurora_core::CurvesParams::identity()),
+                Adjustment254::Curves(aurora_core::CurvesParams::identity()),
+            ),
+            (
+                Adjustment::Levels(aurora_core::LevelsParams::identity()),
+                Adjustment254::Levels(aurora_core::LevelsParams::identity()),
+            ),
+            (
+                Adjustment::HueSaturation(aurora_core::HueSaturationParams::identity()),
+                Adjustment254::HueSaturation(aurora_core::HueSaturationParams::identity()),
+            ),
+            (
+                Adjustment::HueSaturationRanges(ranged),
+                Adjustment254::HueSaturationRanges(ranged),
+            ),
+            (
+                Adjustment::Vibrance(aurora_core::VibranceParams::identity()),
+                Adjustment254::Vibrance(aurora_core::VibranceParams::identity()),
+            ),
+            (
+                Adjustment::Exposure(aurora_core::ExposureParams::identity()),
+                Adjustment254::Exposure(aurora_core::ExposureParams::identity()),
+            ),
+            (
+                Adjustment::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+                Adjustment254::PhotoFilter(aurora_core::PhotoFilterParams::default()),
+            ),
+            (
+                Adjustment::BlackWhite(aurora_core::BlackWhiteParams::default()),
+                Adjustment254::BlackWhite(aurora_core::BlackWhiteParams::default()),
+            ),
+            (
+                Adjustment::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+                Adjustment254::ColorBalance(aurora_core::ColorBalanceParams::identity()),
+            ),
+            (Adjustment::Invert, Adjustment254::Invert),
+            (
+                Adjustment::Threshold(threshold),
+                Adjustment254::Threshold(threshold),
+            ),
+            (
+                Adjustment::Posterize(posterize),
+                Adjustment254::Posterize(posterize),
+            ),
+            (
+                Adjustment::BrightnessContrast(bc),
+                Adjustment254::BrightnessContrast(bc),
+            ),
+            (
+                Adjustment::ChannelMixer(mixer),
+                Adjustment254::ChannelMixer(mixer),
+            ),
+            (
+                Adjustment::SelectiveColor(selective),
+                Adjustment254::SelectiveColor(selective),
+            ),
+            (
+                Adjustment::GradientMap(gm.clone()),
+                Adjustment254::GradientMap(gm),
+            ),
+        ];
+        for (index, (new, old)) in pairs.into_iter().enumerate() {
+            let new_bytes = encode(&LayerKind::Adjustment(new));
+            let old_bytes = encode(&Kind254::Adjustment(old));
+            assert_eq!(new_bytes, old_bytes, "ordinal {index}");
+            assert_eq!(new_bytes.get(1).copied().map(usize::from), Some(index));
+            assert!(postcard::from_bytes::<Kind254>(&new_bytes).is_ok());
+        }
+    }
+
+    #[test]
+    fn exposure_trc_is_ordinal_sixteen_and_an_old_reader_refuses_it() {
+        let kind = LayerKind::Adjustment(Adjustment::ExposureTrc(trc_params()));
+        let bytes = encode(&kind);
+        assert_eq!(bytes.get(..2), Some([2_u8, 16].as_slice()));
+        // Two tag bytes, three f32s, then the table (a varint length and
+        // varint entries).
+        assert_eq!(bytes.get(2..14).map(<[u8]>::len), Some(12));
+        match postcard::from_bytes::<LayerKind>(&bytes) {
+            Ok(decoded) => assert_eq!(decoded, kind),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        assert!(
+            postcard::from_bytes::<Kind254>(&bytes).is_err(),
+            "a 0.254.0 build refuses ordinal 16"
+        );
+    }
+
+    #[test]
+    fn a_bad_payload_is_a_decode_error_not_a_repair() {
+        let good = encode(&LayerKind::Adjustment(
+            Adjustment::ExposureTrc(trc_params()),
+        ));
+        let e = trc_params().exposure();
+        let bad_gamma = encode(&(2_u8, 16_u8, (1.0_f32, 0.0_f32, 0.0_f32), vec![0_u16, 65535]));
+        let descending = encode(&(2_u8, 16_u8, e, vec![0_u16, 9, 3, 65535]));
+        let short_ends = encode(&(2_u8, 16_u8, e, vec![0_u16, 100]));
+        let one_entry = encode(&(2_u8, 16_u8, e, vec![0_u16]));
+        // The control: the same shape with a valid table decodes.
+        let fine = encode(&(2_u8, 16_u8, e, vec![0_u16, 65535]));
+        assert!(postcard::from_bytes::<LayerKind>(&fine).is_ok());
+        for bytes in [
+            bad_gamma,
+            descending,
+            short_ends,
+            one_entry,
+            vec![2, 16],
+            vec![2, 16, 0, 0, 0, 0],
+        ] {
+            assert!(
+                postcard::from_bytes::<LayerKind>(&bytes).is_err(),
+                "{bytes:?}"
+            );
+        }
+        // Every truncation fails cleanly.
+        for n in 0..good.len() {
+            assert!(
+                postcard::from_bytes::<LayerKind>(good.get(..n).unwrap_or(&[])).is_err(),
+                "{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn labels_and_accessors_name_the_right_variant() {
+        let a = Adjustment::ExposureTrc(trc_params());
+        assert_eq!(a.label(), "Exposure");
+        assert_eq!(a.exposure_trc(), Some(&trc_params()));
+        assert!(a.exposure().is_none(), "the plain accessor stays plain");
+        assert_eq!(a.exposure_sliders(), Some(trc_params().exposure()));
+        let plain = Adjustment::Exposure(trc_params().exposure());
+        assert!(plain.exposure_trc().is_none());
+        assert_eq!(plain.exposure_sliders(), Some(trc_params().exposure()));
+        assert!(Adjustment::Invert.exposure_sliders().is_none());
+        // Replacing the sliders keeps the variant and the table.
+        let e = match aurora_core::ExposureParams::new(-1.0, 0.0, 1.0) {
+            Ok(e) => e,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        match a.with_exposure_sliders(e) {
+            Some(Adjustment::ExposureTrc(p)) => {
+                assert_eq!(p.exposure(), e);
+                assert_eq!(p.trc(), trc_params().trc());
+            }
+            other => unreachable!("{other:?}"),
+        }
+        assert_eq!(
+            plain.with_exposure_sliders(e),
+            Some(Adjustment::Exposure(e))
+        );
+        assert!(Adjustment::Invert.with_exposure_sliders(e).is_none());
     }
 }

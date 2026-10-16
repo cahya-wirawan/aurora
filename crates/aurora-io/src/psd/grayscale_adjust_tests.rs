@@ -13,8 +13,8 @@
 //!   grey -> the same record on red, green and blue.
 //! - `nvrt`, `thrs`, `post`, `brit`/`CgEd`: the RGB layouts, applied to the
 //!   grey (R = G = B, so a luma threshold is the grey value itself).
-//! - `expA` is left out: Photoshop works in the linear light of the file's
-//!   grey profile (Dot Gain 20 % in the fixture), which Aurora ignores.
+//! - `expA` is imported only with the file's grey profile (task 112, see
+//!   `grey_exposure_tests`); without one it is left out.
 
 #![allow(
     clippy::indexing_slicing,
@@ -403,7 +403,9 @@ fn the_default_brightness_contrast_imports_and_the_legacy_one_stays_out() {
 }
 
 #[test]
-fn exposure_stays_out_of_a_grayscale_file_because_the_grey_profile_decides_it() {
+fn exposure_without_a_grey_profile_stays_out_of_a_grayscale_file() {
+    // With a measured profile it is imported (`grey_exposure_tests`); with
+    // none embedded the old line stands.
     let exposure = unhex(super::read_adjust_tests::EXPA_FILL);
     let document = open(&gray_file(b"expA", &exposure, |_| {}));
     assert!(adjustments_of(&document).is_empty());
@@ -529,15 +531,12 @@ fn the_corpus_grayscale_files_import_their_four_layers() {
 }
 
 #[test]
-fn the_corpus_exposure_and_legacy_grayscale_files_stay_out() {
-    for (file, kind, n) in [
-        ("exposure_grayscale.psd", "Exposure", 4),
-        (
-            "brightnesscontrast_legacy_grayscale.psd",
-            "Brightness/Contrast",
-            1,
-        ),
-    ] {
+fn the_corpus_legacy_grayscale_file_stays_out() {
+    for (file, kind, n) in [(
+        "brightnesscontrast_legacy_grayscale.psd",
+        "Brightness/Contrast",
+        1,
+    )] {
         let Some(document) = corpus(&format!("adjustments/{file}")) else {
             continue;
         };

@@ -102,8 +102,111 @@ impl ExposureOp {
     }
 }
 
+/// An Exposure adjustment imported from a Grayscale file, applied in the
+/// linear light of the file's grey profile (task 112; see
+/// `aurora_core::exposure_trc` for what was measured).
+///
+/// Per channel: the encoded grey is decoded **through the profile's table**
+/// (linear interpolation between entries), `x = linear * 2^exposure +
+/// offset`, `y = sign(x) |x|^(1/gamma)` is clamped to `0..=1`, and `y` is
+/// encoded with the **inverse of the table** (the first entry reaching `y`,
+/// interpolated linearly between neighbours). A neutral layer is an exact
+/// passthrough (decode then encode would return the input to within the
+/// table's resolution). CPU only: the GPU predicate refuses this
+/// adjustment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExposureTrcOp {
+    inner: ExposureOp,
+    /// The table as linear light in `0..=1`, non-decreasing, first `0` and
+    /// last `1`.
+    table: Vec<f32>,
+}
+
+impl ExposureTrcOp {
+    /// Prepares `params` for application.
+    #[must_use]
+    pub fn new(params: &aurora_core::ExposureTrcParams) -> Self {
+        Self {
+            inner: ExposureOp::new(&params.exposure()),
+            table: params
+                .trc()
+                .entries()
+                .iter()
+                .map(|&v| f32::from(v) / f32::from(u16::MAX))
+                .collect(),
+        }
+    }
+
+    /// Whether [`Self::apply`] returns its input unchanged.
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        self.inner.is_identity()
+    }
+
+    /// The linear light of an encoded grey `v` (`0..=1`): the table read at
+    /// `v * (len - 1)`, interpolated.
+    #[must_use]
+    pub fn decode(&self, v: f32) -> f32 {
+        let v = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+        let span = (self.table.len() - 1) as f32;
+        let pos = v * span;
+        // `pos` is in `0..=span`, so the floor is a valid index.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let i = (pos.floor() as usize).min(self.table.len() - 1);
+        let lo = self.table.get(i).copied().unwrap_or(0.0);
+        let hi = self.table.get(i + 1).copied().unwrap_or(lo);
+        lo + (hi - lo) * (pos - i as f32)
+    }
+
+    /// The encoded grey whose table value is `y` (`0..=1`).
+    #[must_use]
+    pub fn encode(&self, y: f32) -> f32 {
+        let y = if y.is_nan() { 0.0 } else { y.clamp(0.0, 1.0) };
+        let i = self.table.partition_point(|&t| t < y);
+        if i == 0 {
+            return 0.0;
+        }
+        let (Some(&hi), Some(&lo)) = (self.table.get(i), self.table.get(i - 1)) else {
+            return 1.0;
+        };
+        let span = (self.table.len() - 1) as f32;
+        let frac = if hi > lo { (y - lo) / (hi - lo) } else { 0.0 };
+        (((i - 1) as f32 + frac) / span).clamp(0.0, 1.0)
+    }
+
+    fn channel(&self, encoded: f32) -> f32 {
+        let linear = self.decode(encoded);
+        let x = linear.mul_add(self.inner.scale, self.inner.params.offset());
+        let y = if x < 0.0 {
+            -(-x).powf(self.inner.power)
+        } else {
+            x.powf(self.inner.power)
+        };
+        self.encode(y)
+    }
+
+    /// The adjusted colour of one straight RGB pixel (grey held as
+    /// R = G = B).
+    #[must_use]
+    pub fn apply(&self, rgb: [f32; 3]) -> [f32; 3] {
+        if self.is_identity() {
+            return rgb;
+        }
+        rgb.map(|v| {
+            let clamped = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+            self.channel(clamped)
+        })
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::float_cmp)]
+#[allow(
+    clippy::float_cmp,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    clippy::manual_midpoint
+)]
 mod tests {
     use super::ExposureOp;
     use aurora_core::ExposureParams as P;
@@ -297,5 +400,220 @@ mod tests {
         assert_eq!(all[0], o.apply([0.2, 0.0, 0.0])[0]);
         assert_eq!(all[1], o.apply([0.0, 0.5, 0.0])[1]);
         assert_eq!(all[2], o.apply([0.0, 0.0, 0.8])[2]);
+    }
+
+    // ------------------------------------------------------------------
+    // ExposureTrcOp (task 112)
+    // ------------------------------------------------------------------
+
+    use super::ExposureTrcOp;
+    use aurora_core::{ExposureTrcParams, GreyTrc};
+
+    fn table(f: impl Fn(f64) -> f64, n: usize) -> GreyTrc {
+        let entries = (0..n)
+            .map(|i| {
+                let v = f(i as f64 / (n - 1) as f64).clamp(0.0, 1.0) * 65535.0;
+                v.round() as u16
+            })
+            .collect();
+        match GreyTrc::new(entries) {
+            Ok(t) => t,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn trc_op(ev: f32, offset: f32, gamma: f32, trc: GreyTrc) -> ExposureTrcOp {
+        match P::new(ev, offset, gamma) {
+            Ok(p) => ExposureTrcOp::new(&ExposureTrcParams::new(p, trc)),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn srgb_decode(v: f64) -> f64 {
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// The model in `f64`: the table read by interpolation to decode, and
+    /// inverted by brute force to encode.
+    fn trc_model(v: f64, ev: f64, offset: f64, gamma: f64, t: &[u16]) -> f64 {
+        let at = |i: usize| f64::from(t.get(i).copied().unwrap_or(0)) / 65535.0;
+        let pos = v.clamp(0.0, 1.0) * (t.len() - 1) as f64;
+        let i = pos.floor() as usize;
+        let lin = at(i) + (at((i + 1).min(t.len() - 1)) - at(i)) * (pos - i as f64);
+        let x = lin * 2.0_f64.powf(ev) + offset;
+        let y = (x.signum() * x.abs().powf(1.0 / gamma)).clamp(0.0, 1.0);
+        let n = t.len();
+        let value = |i: usize| f64::from(t.get(i).copied().unwrap_or(0)) / 65535.0;
+        for i in 0..n {
+            if value(i) >= y {
+                if i == 0 {
+                    return 0.0;
+                }
+                let (lo, hi) = (value(i - 1), value(i));
+                let frac = if hi > lo { (y - lo) / (hi - lo) } else { 0.0 };
+                return ((i - 1) as f64 + frac) / (n - 1) as f64;
+            }
+        }
+        1.0
+    }
+
+    #[test]
+    fn trc_op_matches_an_independent_model_over_a_grid() {
+        // A dot-gain-like curve, a power curve and a table with plateaus.
+        let tables = [
+            table(|x| x.powf(1.8) * 0.8 + x * 0.2, 256),
+            table(|x| x.powf(2.2), 1024),
+            table(
+                |x| {
+                    if x < 0.3 {
+                        0.0
+                    } else if x > 0.7 {
+                        1.0
+                    } else {
+                        (x - 0.3) / 0.4
+                    }
+                },
+                64,
+            ),
+        ];
+        let settings = [
+            (2.03, 0.0775, 1.52),
+            (-0.04, 0.4144, 0.44),
+            (1.25, 0.0, 1.52),
+            (-1.82, 0.1203, 1.0),
+            (0.0, 0.0, 2.0),
+            (-6.0, 0.0, 1.0),
+        ];
+        for t in &tables {
+            for (ev, off, g) in settings {
+                let o = trc_op(ev, off, g, t.clone());
+                for step in 0..=64 {
+                    let v = step as f32 / 64.0;
+                    let got = o.apply([v, 1.0 - v, 0.5 * v]);
+                    for (c, input) in got.iter().zip([v, 1.0 - v, 0.5 * v]) {
+                        let want = trc_model(
+                            f64::from(input),
+                            f64::from(ev),
+                            f64::from(off),
+                            f64::from(g),
+                            t.entries(),
+                        );
+                        assert!(
+                            (f64::from(*c) - want).abs() < 2e-4,
+                            "{ev} {off} {g} v={input}: {c} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trc_op_with_a_srgb_table_is_the_plain_exposure() {
+        let t = table(srgb_decode, 256);
+        for (ev, off, g) in [(1.0, 0.0, 1.0), (-1.82, 0.1203, 1.0), (0.5, 0.05, 1.4)] {
+            let a = trc_op(ev, off, g, t.clone());
+            let b = op(ev, off, g);
+            for step in 0..=32 {
+                let v = step as f32 / 32.0;
+                let (x, y) = (a.apply([v; 3]), b.apply([v; 3]));
+                for (p, q) in x.iter().zip(y) {
+                    assert!((p - q).abs() < 2e-3, "{ev} {off} {g} {v}: {p} vs {q}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trc_op_decodes_and_encodes_through_the_table() {
+        // A gamma 2.2 table: mid grey decodes to 0.5^2.2 = 0.2176 linear.
+        // Neutral sliders apart from gamma 2 give y = sqrt(0.2176) = 0.4665
+        // and the table encodes that as 0.4665^(1/2.2) = 0.7068. Decoding
+        // with sRGB instead (0.2140 linear) would give 0.7056 - close - so
+        // also check a point where the curves differ strongly.
+        let t = table(|x| x.powf(2.2), 1024);
+        let out = trc_op(0.0, 0.0, 2.0, t.clone()).apply([0.5; 3]);
+        let want = 0.5_f64.powf(2.2).sqrt().powf(1.0 / 2.2);
+        for c in out {
+            assert!((f64::from(c) - want).abs() < 1e-3, "{c} vs {want}");
+        }
+        // A table far from sRGB (linear): decode and encode are the
+        // identity, so +1 stop doubles the *encoded* value.
+        let lin = table(|x| x, 256);
+        let out = trc_op(1.0, 0.0, 1.0, lin).apply([0.25; 3]);
+        for c in out {
+            assert!((c - 0.5).abs() < 1e-3, "{c}");
+        }
+        // The sRGB-decode alternative would give a different answer there.
+        let srgb_alt = op(1.0, 0.0, 1.0).apply([0.25; 3]);
+        assert!((srgb_alt[0] - 0.5).abs() > 0.05);
+    }
+
+    #[test]
+    fn trc_decode_interpolates_and_clamps() {
+        let o = trc_op(0.5, 0.0, 1.0, table(|x| x * x, 5));
+        // Entries: 0, 1/16, 1/4, 9/16, 1 at 0, .25, .5, .75, 1.
+        assert!(o.decode(0.0).abs() < 1e-6);
+        assert!((o.decode(1.0) - 1.0).abs() < 1e-6);
+        assert!((o.decode(0.25) - 0.0625).abs() < 1e-4);
+        assert!((o.decode(0.375) - (0.0625 + 0.25) / 2.0).abs() < 1e-4);
+        assert!((o.decode(-4.0)).abs() < 1e-6);
+        assert!((o.decode(9.0) - 1.0).abs() < 1e-6);
+        assert!(o.decode(f32::NAN).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trc_op_identity_is_an_exact_passthrough() {
+        let o = trc_op(0.0, 0.0, 1.0, table(|x| x.powf(2.2), 256));
+        assert!(o.is_identity());
+        for rgb in [[0.1, 0.5, 0.9], [1.5, -0.25, 0.3], [f32::NAN, 0.0, 2.0]] {
+            let out = o.apply(rgb);
+            for (a, b) in out.iter().zip(rgb) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+        }
+        assert!(!trc_op(0.01, 0.0, 1.0, table(|x| x, 2)).is_identity());
+    }
+
+    #[test]
+    fn trc_encode_handles_plateaus_ends_and_bad_input() {
+        let o = trc_op(
+            0.5,
+            0.0,
+            1.0,
+            table(|x| if x < 0.5 { 0.0 } else { (x - 0.5) * 2.0 }, 11),
+        );
+        // y = 0 sits on the plateau: the first entry reaching it, 0.
+        assert!(o.encode(0.0).abs() < 1e-6);
+        assert!(o.encode(-3.0).abs() < 1e-6);
+        assert!(o.encode(f32::NAN).abs() < 1e-6);
+        assert!((o.encode(1.0) - 1.0).abs() < 1e-6);
+        assert!((o.encode(7.0) - 1.0).abs() < 1e-6);
+        // Entry 5 is 0 and entry 6 is 0.2: y = 0.1 is half way.
+        assert!((o.encode(0.1) - 0.55).abs() < 1e-4, "{}", o.encode(0.1));
+        // Monotone.
+        let mut last = 0.0;
+        for i in 0..=200 {
+            let e = o.encode(i as f32 / 200.0);
+            assert!(e >= last - 1e-7);
+            last = e;
+        }
+        // A two-entry table is the identity encode.
+        let id = trc_op(1.0, 0.0, 1.0, table(|x| x, 2));
+        assert!((id.encode(0.3) - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trc_op_output_is_always_in_range() {
+        let o = trc_op(20.0, 0.5, 0.1, table(|x| x.powf(1.5), 256));
+        for v in [-1.0, 0.0, 0.3, 1.0, 5.0, f32::NAN, f32::INFINITY] {
+            for c in o.apply([v; 3]) {
+                assert!((0.0..=1.0).contains(&c), "{v}: {c}");
+            }
+        }
     }
 }
