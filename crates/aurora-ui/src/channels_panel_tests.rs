@@ -523,3 +523,38 @@ fn closing_and_reopening_the_panel_rebuilds_its_emptied_rows() {
     );
     assert_eq!(ws.channels_state.rows.len(), 4);
 }
+
+/// 0.257.0: the New channel button draws the channels glyph (it reused the
+/// New Layer icon before), Delete keeps its bin.
+#[test]
+fn the_new_channel_button_draws_the_channels_glyph() {
+    assert_eq!(ChannelsAction::NewFromSelection.icon(), IconKind::Channels);
+    assert_eq!(ChannelsAction::Delete.icon(), IconKind::Delete);
+    let ws = built_workspace_for_icon_test();
+    for (action, kind) in [
+        (ChannelsAction::NewFromSelection, IconKind::Channels),
+        (ChannelsAction::Delete, IconKind::Delete),
+    ] {
+        let Some(button) = ws.channels_state.toolbar.button_for(action) else {
+            unreachable!("{action:?} has a button");
+        };
+        let drawn = ws
+            .tree
+            .children(button)
+            .unwrap_or_default()
+            .iter()
+            .find_map(|&child| match ws.tree.payload(child) {
+                Some(aurora_widgets::widgets::WidgetKind::Icon(icon)) => Some(icon.kind),
+                _ => None,
+            });
+        assert_eq!(drawn, Some(kind), "{action:?}");
+    }
+}
+
+fn built_workspace_for_icon_test() -> crate::workspace::Workspace {
+    const SCALES_TOML: &str = include_str!("../../../design/tokens/scales.toml");
+    match aurora_theme::Scales::from_toml_str(SCALES_TOML) {
+        Ok(scales) => crate::workspace::build_workspace(&scales),
+        Err(err) => unreachable!("{err:?}"),
+    }
+}

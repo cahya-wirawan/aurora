@@ -469,3 +469,49 @@ fn fill_stroke_and_make_path_follow_their_facts() {
     );
     assert_eq!(describe(&ws, PathsAction::StrokePath), STROKE_TOO_SMALL);
 }
+
+/// The icon kind drawn inside a toolbar button, found through the tree.
+fn drawn_icon(ws: &Workspace, button: WidgetId) -> Option<aurora_widgets::icons::IconKind> {
+    ws.tree
+        .children(button)
+        .unwrap_or_default()
+        .iter()
+        .find_map(|&child| match ws.tree.payload(child) {
+            Some(WidgetKind::Icon(icon)) => Some(icon.kind),
+            _ => None,
+        })
+}
+
+/// 0.257.0: Fill, Stroke and Make Work Path have glyphs of their own, and
+/// the button really draws the glyph its action names.
+#[test]
+fn the_path_buttons_draw_their_own_glyphs_not_a_tools_reused_one() {
+    use aurora_widgets::icons::IconKind;
+    let mut ws = build_workspace(&scales());
+    populate(&mut ws, &["Work Path"]);
+    let expected = [
+        (PathsAction::MakeSelection, IconKind::Marquee),
+        (PathsAction::FillPath, IconKind::FillPath),
+        (PathsAction::StrokePath, IconKind::StrokePath),
+        (PathsAction::MakeWorkPath, IconKind::MakePath),
+        (PathsAction::NewPath, IconKind::NewLayer),
+        (PathsAction::DeletePath, IconKind::Delete),
+    ];
+    for (action, kind) in expected {
+        assert_eq!(action.icon(), kind, "{action:?}");
+        let Some(button) = ws.paths_state.toolbar.button_for(action) else {
+            unreachable!("{action:?} has a button");
+        };
+        assert_eq!(drawn_icon(&ws, button), Some(kind), "{action:?} draws it");
+    }
+    for action in [
+        PathsAction::FillPath,
+        PathsAction::StrokePath,
+        PathsAction::MakeWorkPath,
+    ] {
+        assert!(
+            ![IconKind::PaintBucket, IconKind::Brush, IconKind::Pen].contains(&action.icon()),
+            "{action:?} no longer reuses a tool's glyph"
+        );
+    }
+}

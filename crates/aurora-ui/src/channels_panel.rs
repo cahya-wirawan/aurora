@@ -199,12 +199,12 @@ impl ChannelsAction {
         }
     }
 
-    /// The icon on the button. There is no dedicated "channel" glyph yet,
-    /// so the New Layer and Delete icons are reused.
+    /// The icon on the button: the channels glyph (0.257.0) for a new
+    /// channel, the Delete icon for deleting one.
     #[must_use]
     pub const fn icon(self) -> IconKind {
         match self {
-            Self::NewFromSelection => IconKind::NewLayer,
+            Self::NewFromSelection => IconKind::Channels,
             Self::Delete => IconKind::Delete,
         }
     }

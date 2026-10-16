@@ -102,15 +102,16 @@ impl PathsAction {
         }
     }
 
-    /// The icon on the button (existing icons: there is no dedicated
-    /// path glyph for these yet).
+    /// The icon on the button (0.257.0: Fill, Stroke and Make Work Path
+    /// have their own glyphs; Make Selection and New/Delete keep the
+    /// Marquee, New Layer and Delete icons, which say the same thing).
     #[must_use]
     pub const fn icon(self) -> IconKind {
         match self {
             Self::MakeSelection => IconKind::Marquee,
-            Self::FillPath => IconKind::PaintBucket,
-            Self::StrokePath => IconKind::Brush,
-            Self::MakeWorkPath => IconKind::Pen,
+            Self::FillPath => IconKind::FillPath,
+            Self::StrokePath => IconKind::StrokePath,
+            Self::MakeWorkPath => IconKind::MakePath,
             Self::NewPath => IconKind::NewLayer,
             Self::DeletePath => IconKind::Delete,
         }
