@@ -335,6 +335,21 @@ pub(crate) enum Pass {
 }
 
 impl Pass {
+    /// Whether this is one of the seven 0.250.0 kinds (steep or binary
+    /// sources; see [`source_conditioning`]).
+    pub(crate) fn is_newest(self) -> bool {
+        matches!(
+            self,
+            Self::Invert
+                | Self::Threshold
+                | Self::Posterize
+                | Self::BrightnessContrast
+                | Self::ChannelMixer
+                | Self::SelectiveColor
+                | Self::GradientMap
+        )
+    }
+
     /// The counters [`take_counts`] must read after `passes` passes of
     /// `self` and none of any other kind.
     pub(crate) fn expected(self, passes: u64) -> [u64; COUNTERS] {
@@ -497,6 +512,157 @@ pub(crate) fn conditioning_of(
     }
 }
 
+/// Per-texel conditioning of an OPAQUE tile with respect to the adjustment's
+/// own SOURCE colour (`Cs`), for the adjustment layer `id` at its current
+/// blend mode and content opacity; `without` is the composite of the tile
+/// without the layer (the pattern, opaque), `bound` the bound the caller
+/// compares with.
+///
+/// [`conditioning_of`] perturbs the backdrop, which is the right probe for a
+/// translucent tile (the adapters' `straight_backdrop` division moves `Cb`).
+/// On an opaque tile `Cb` is bit-identical on both sides and what can differ
+/// is `Cs`: the adjustment's result is rounded to `f16` in the shader
+/// (`pack2x16float`, whose rounding direction WGSL leaves to the
+/// implementation: WARP and Metal differ from the RTX 3090 at exact
+/// round-half ties) where the CPU rounds half to even. An inversion
+/// `1 - Cb` of a small `f16` is exactly such a tie one time in 2^k. A steep
+/// or binary source meets a dividing or thresholding blend term (`ColorDodge`
+/// `Cb / (1 - Cs)` with `1 - Cs = Cb`, `ColorBurn`, `VividLight`, `Divide`,
+/// `HardMix`) and one `f16` step of `Cs` becomes a large step of the result.
+///
+/// So the probe moves `Cs` itself: the source tile the CPU builds is moved
+/// by up to one `f16` step per colour channel (all 27 combinations), each
+/// folded with the very `composite_layer_into` call
+/// `apply_adjustment_layer` uses, and a texel's sensitivity is the largest
+/// change of its result. A channel is moved unless its result is exactly 0
+/// or exactly 1 -- the outputs of a clamp or a constant (Threshold, the
+/// steps, a clipped mix), identical on every adapter. Every other channel
+/// is moved, EXACTLY-REPRESENTABLE ONES TOO: the GPU evaluates the same
+/// arithmetic in a different order or fused, its f32 can sit an ulp below
+/// the `f16` the CPU's sits on, and `pack2x16float` is then free to give
+/// the lower neighbour (measured on the RTX 3090: Channel Mixer green
+/// 0.501953125 landed one step low and flipped a `HardMix` texel whose
+/// Cb + Cs was exactly 1).
+/// A texel is ill-conditioned when its sensitivity exceeds `bound` less two
+/// `f16` steps (`2/2048`, the adapter's own rounding of the result: one step
+/// of `Cs` then leaves no room in the bound); callers hold it to
+/// `bound + 2 * sensitivity` and every other texel to `bound`, so a shader
+/// that is wrong at a well-conditioned texel still fails. The probe is
+/// computed from CPU values only, so the same texels are ill-conditioned on
+/// every adapter. Opaque tiles only: the result is not weighted by alpha.
+pub(crate) fn source_conditioning(
+    layers: &aurora_doc::LayerTree,
+    id: aurora_doc::LayerId,
+    without: &[f32],
+    bound: f32,
+) -> Conditioning {
+    use half::f16;
+    let Some(adjustment) = layers.adjustment(id) else {
+        unreachable!("an adjustment layer");
+    };
+    let lut = crate::AdjustmentLut::of(adjustment);
+    let opacity = crate::content_opacity(layers, id).unwrap_or(1.0);
+    let mode = crate::translate_blend_mode(
+        layers
+            .blend_mode(id)
+            .unwrap_or(aurora_doc::BlendMode::Normal),
+    );
+    let one = f16::from_f32(1.0);
+    // The backdrop as the compositor holds it (opaque: straight = stored).
+    let mut backdrop: Vec<f16> = Vec::with_capacity(without.len());
+    for px in without.chunks_exact(4) {
+        if let [r, g, b, _] = *px {
+            backdrop.extend([f16::from_f32(r), f16::from_f32(g), f16::from_f32(b), one]);
+        }
+    }
+    let mut source: Vec<f16> = Vec::with_capacity(backdrop.len());
+    let mut rounded: Vec<[bool; 3]> = Vec::with_capacity(backdrop.len() / 4);
+    for texel in backdrop.chunks_exact(4) {
+        if let [r, g, b, _] = *texel {
+            let out = lut.apply([r.to_f32(), g.to_f32(), b.to_f32()]);
+            rounded.push(out.map(|v| v != 0.0 && v != 1.0));
+            let [r, g, b] = out;
+            source.extend([f16::from_f32(r), f16::from_f32(g), f16::from_f32(b), one]);
+        }
+    }
+    let fold = |src: &[f16]| -> Vec<f32> {
+        let mut mixed = backdrop.clone();
+        aurora_render::composite_layer_into(&mut mixed, src, opacity, mode);
+        mixed.iter().map(|v| v.to_f32()).collect()
+    };
+    let base = fold(&source);
+    let mut sensitivity = vec![0.0_f32; base.len() / 4];
+    for dr in -1..=1 {
+        for dg in -1..=1 {
+            for db in -1..=1 {
+                let moved: Vec<f16> = source
+                    .chunks_exact(4)
+                    .zip(&rounded)
+                    .flat_map(|(t, r)| {
+                        let step = |v: f16, d: i32, free: bool| {
+                            if free { f16_step(v, d) } else { v }
+                        };
+                        [
+                            step(t[0], dr, r[0]),
+                            step(t[1], dg, r[1]),
+                            step(t[2], db, r[2]),
+                            t[3],
+                        ]
+                    })
+                    .collect();
+                let out = fold(&moved);
+                for (i, s) in sensitivity.iter_mut().enumerate() {
+                    for c in 0..3 {
+                        *s = s.max((out[i * 4 + c] - base[i * 4 + c]).abs());
+                    }
+                }
+            }
+        }
+    }
+    let limit = bound - 2.0 / 2048.0;
+    let ill = sensitivity.iter().map(|s| *s > limit).collect();
+    Conditioning {
+        ill,
+        sensitivity,
+        base,
+    }
+}
+
+/// [`gpu_matches_cpu`] with the texels that are ill-conditioned with respect
+/// to the adjustment's source colour (see [`source_conditioning`]) held to
+/// `bound + 2 * sensitivity`, at most `max_ill_percent` of the tile. The
+/// layer `id` is the adjustment under test.
+pub(crate) fn gpu_matches_cpu_source_conditioned(
+    context: &aurora_gpu::GpuContext,
+    compositor: &mut aurora_render::TileCompositor,
+    layers: &mut aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    id: aurora_doc::LayerId,
+    pass: Pass,
+    passes: u64,
+    bound: f32,
+    what: &str,
+    max_ill_percent: usize,
+) -> (Vec<f32>, f32) {
+    let visible = layers.visible(id).unwrap_or(true);
+    ok(layers.set_visible(id, false));
+    let without = cpu_tile(layers, store);
+    ok(layers.set_visible(id, visible));
+    let conditioning = source_conditioning(layers, id, &without, bound);
+    gpu_matches_cpu_excluding_capped(
+        context,
+        compositor,
+        layers,
+        store,
+        pass,
+        passes,
+        bound,
+        what,
+        Some(&conditioning),
+        max_ill_percent,
+    )
+}
+
 /// [`gpu_matches_cpu`] with the texels `exclude` marks ill-conditioned
 /// held to `bound + 2 * sensitivity` instead of `bound` (and the count of
 /// them printed and bounded to 1 % of the tile).
@@ -510,6 +676,28 @@ pub(crate) fn gpu_matches_cpu_excluding(
     bound: f32,
     what: &str,
     exclude: Option<&Conditioning>,
+) -> (Vec<f32>, f32) {
+    gpu_matches_cpu_excluding_capped(
+        context, compositor, layers, store, pass, passes, bound, what, exclude, 1,
+    )
+}
+
+/// [`gpu_matches_cpu_excluding`] with the share of texels that may be
+/// ill-conditioned set by `max_ill_percent` (1 by default). A steep or
+/// binary source under a dividing blend mode makes a large share of the
+/// tile sensitive (see [`source_conditioning`]); the cap keeps "mostly
+/// excluded" from passing as "tested".
+pub(crate) fn gpu_matches_cpu_excluding_capped(
+    context: &aurora_gpu::GpuContext,
+    compositor: &mut aurora_render::TileCompositor,
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    pass: Pass,
+    passes: u64,
+    bound: f32,
+    what: &str,
+    exclude: Option<&Conditioning>,
+    max_ill_percent: usize,
 ) -> (Vec<f32>, f32) {
     assert!(
         crate::document_qualifies_for_gpu_compositing(layers),
@@ -563,8 +751,8 @@ pub(crate) fn gpu_matches_cpu_excluding(
             conditioning_limit(bound)
         );
         assert!(
-            count * 100 < e.ill.len(),
-            "{what}: {count} ill-conditioned texels is not a small set"
+            count * 100 < e.ill.len() * max_ill_percent,
+            "{what}: {count} ill-conditioned texels is more than {max_ill_percent} % of the tile"
         );
     }
     println!("{what}: worst |GPU - CPU| = {worst:e} (bound {bound:e})");
@@ -941,39 +1129,74 @@ pub(crate) fn every_mode(
             assert_eq!(take_counts(), pass.expected(1), "{what}: pass recorded");
             continue;
         }
-        if mode == BlendMode::HardMix {
-            // HardMix thresholds `VividLight` at 0.5: a one-`f16`-step
-            // difference in `Cs` near the threshold flips a channel between
-            // 0 and 1 (disclosed since 0.115.1), so no value bound exists.
-            // Hold it to a bound on how many channels may flip instead.
-            let _ = take_counts();
-            let Some(gpu) = gpu_tile(&context, &mut compositor, &layers, &mut store) else {
-                unreachable!("{what}: fell back");
+        let (cpu, w) = if pass.is_newest() {
+            // The seven 0.250.0 kinds meet the dividing and thresholding
+            // blend terms with steep or binary sources: the texels whose
+            // result moves by more than the bound allows for one `f16` step
+            // of the source colour (see `source_conditioning`) are held to
+            // `bound + 2 * sensitivity`, every other texel to the tight
+            // bound. The share of ill-conditioned texels is capped per mode.
+            // It is computed from CPU values alone, so it is the same on
+            // every adapter: measured on the RTX 3090 at most 8 % (Invert
+            // under ColorDodge, 5.7 % under VividLight; ColorBurn, Divide and
+            // the rest below 1 %: VividLight, ColorBurn, ColorDodge and
+            // Divide divide by a quantity that a step of the source can bring
+            // near zero), HardMix 0.14 % (it flips at its switch only).
+            let max_ill_percent = match mode {
+                BlendMode::ColorBurn
+                | BlendMode::ColorDodge
+                | BlendMode::VividLight
+                | BlendMode::Divide => 12,
+                // HardMix (0.14 % measured) and the rest: 1 %.
+                _ => 1,
             };
-            assert_eq!(take_counts(), pass.expected(1), "{what}: pass recorded");
-            let cpu = cpu_tile(&layers, &mut store);
-            let flipped = gpu
-                .iter()
-                .zip(&cpu)
-                .filter(|(g, c)| (*g - *c).abs() > mode_bound(mode))
-                .count();
-            println!("{what}: {flipped} of {} channels flipped", gpu.len());
-            assert!(
-                flipped * 1000 <= gpu.len(),
-                "{what}: {flipped} channels flipped"
-            );
-            continue;
-        }
-        let (cpu, w) = gpu_matches_cpu(
-            &context,
-            &mut compositor,
-            &layers,
-            &mut store,
-            pass,
-            1,
-            mode_bound(mode),
-            &what,
-        );
+            gpu_matches_cpu_source_conditioned(
+                &context,
+                &mut compositor,
+                &mut layers,
+                &mut store,
+                id,
+                pass,
+                1,
+                mode_bound(mode),
+                &what,
+                max_ill_percent,
+            )
+        } else {
+            if mode == BlendMode::HardMix {
+                // HardMix thresholds `VividLight` at 0.5: a one-`f16`-step
+                // difference in `Cs` near the threshold flips a channel between
+                // 0 and 1 (disclosed since 0.115.1), so no value bound exists.
+                // Hold it to a bound on how many channels may flip instead.
+                let _ = take_counts();
+                let Some(gpu) = gpu_tile(&context, &mut compositor, &layers, &mut store) else {
+                    unreachable!("{what}: fell back");
+                };
+                assert_eq!(take_counts(), pass.expected(1), "{what}: pass recorded");
+                let cpu = cpu_tile(&layers, &mut store);
+                let flipped = gpu
+                    .iter()
+                    .zip(&cpu)
+                    .filter(|(g, c)| (*g - *c).abs() > mode_bound(mode))
+                    .count();
+                println!("{what}: {flipped} of {} channels flipped", gpu.len());
+                assert!(
+                    flipped * 1000 <= gpu.len(),
+                    "{what}: {flipped} channels flipped"
+                );
+                continue;
+            }
+            gpu_matches_cpu(
+                &context,
+                &mut compositor,
+                &layers,
+                &mut store,
+                pass,
+                1,
+                mode_bound(mode),
+                &what,
+            )
+        };
         worst = worst.max(w);
         if mode == BlendMode::Normal {
             normal = cpu;
