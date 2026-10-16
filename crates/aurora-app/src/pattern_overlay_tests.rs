@@ -57,7 +57,10 @@ fn a_pattern_tiles_from_the_origin_at_whole_texels_at_100_percent() {
     let acc = composite(&layers, &mut store);
     for y in 0..10 {
         for x in 0..10 {
-            let want = [PRED, PGREEN, PBLUE, PWHITE][(y % 2) * 2 + x % 2];
+            let want = [PRED, PGREEN, PBLUE, PWHITE]
+                .get((y % 2) * 2 + x % 2)
+                .copied()
+                .unwrap_or([f32::NAN; 4]);
             near(texel(&acc, x, y), want);
         }
     }

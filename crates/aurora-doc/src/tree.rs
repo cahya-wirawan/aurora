@@ -6791,7 +6791,7 @@ mod tests {
         // Byte cap: 2048 x 2048 is 32 MiB, so two fit and a third does not;
         // replacing one with a same-sized pattern still fits.
         let mut tree = LayerTree::new();
-        assert!(MAX_PATTERN_POOL_BYTES == 2 * 32 * 1024 * 1024);
+        const { assert!(MAX_PATTERN_POOL_BYTES == 2 * 32 * 1024 * 1024) };
         assert!(tree.add_pattern(pattern("x", 2048, 2048)).is_ok());
         assert!(tree.add_pattern(pattern("y", 2048, 2048)).is_ok());
         assert!(matches!(

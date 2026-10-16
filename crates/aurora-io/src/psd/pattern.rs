@@ -26,6 +26,8 @@
 //! compression or an over-cap size is a refused pattern (reported by the
 //! caller), never an approximation.
 
+#![allow(clippy::many_single_char_names)] // the format's own w, h, n, c, v
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use aurora_core::pattern::{MAX_PATTERN_POOL_BYTES, MAX_PATTERNS, Pattern};

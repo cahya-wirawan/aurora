@@ -57,7 +57,8 @@ impl std::fmt::Debug for Pattern {
             .field("id", &self.id)
             .field("name", &self.name)
             .field("size", &(self.width, self.height))
-            .finish()
+            .field("bytes", &self.byte_len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -83,6 +84,7 @@ impl Pattern {
     /// # Errors
     ///
     /// As [`Self::new`].
+    #[allow(clippy::needless_pass_by_value)] // the name is truncated into a new string
     pub fn from_shared(
         id: String,
         name: String,
@@ -231,6 +233,7 @@ impl Pattern {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -298,12 +301,25 @@ mod tests {
         // Half way between texels 1 and 2 on x.
         let mid = p.sample(1.5, 0.0);
         let (a, b) = (p.texel(1, 0), p.texel(2, 0));
-        assert!((mid[0] - (a[0] + b[0]) / 2.0).abs() < 1e-6);
+        assert!((mid[0] - f32::midpoint(a[0], b[0])).abs() < 1e-6);
         assert_eq!(mid[1], a[1]);
         // Half way across the wrap seam.
         let seam = p.sample(3.5, 0.0);
         let (a, b) = (p.texel(3, 0), p.texel(0, 0));
-        assert!((seam[0] - (a[0] + b[0]) / 2.0).abs() < 1e-6);
+        assert!((seam[0] - f32::midpoint(a[0], b[0])).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_four_taps_are_weighted_by_their_own_fractions() {
+        // R is 1000 * x and G is 1000 * y, so the red read-back is the x
+        // position and the green one the y position, each linear.
+        let p = pattern(4, 3);
+        let s = p.sample(1.25, 0.75);
+        assert!((s[0] * 65535.0 - 1250.0).abs() < 0.5, "{s:?}");
+        assert!((s[1] * 65535.0 - 750.0).abs() < 0.5, "{s:?}");
+        let s = p.sample(2.9, 1.1);
+        assert!((s[0] * 65535.0 - 2900.0).abs() < 0.5, "{s:?}");
+        assert!((s[1] * 65535.0 - 1100.0).abs() < 0.5, "{s:?}");
     }
 
     #[test]

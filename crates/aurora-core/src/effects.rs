@@ -1241,6 +1241,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::indexing_slicing)]
     fn pattern_overlays_are_gated_counted_and_not_on_the_effects_wire() {
         let mut fx = LayerEffects {
             pattern_overlays: vec![pattern_overlay()],

@@ -4,7 +4,8 @@
     clippy::cast_possible_truncation,
     clippy::too_many_lines,
     clippy::indexing_slicing,
-    clippy::needless_pass_by_value
+    clippy::needless_pass_by_value,
+    clippy::many_single_char_names
 )]
 
 use std::collections::BTreeSet;
@@ -415,7 +416,7 @@ fn a_damaged_block_never_panics_at_any_truncation_or_byte_flip() {
     };
     for _ in 0..3000 {
         let mut b = good.clone();
-        for _ in 0..1 + (next() % 4) {
+        for _ in 0..=(next() % 4) {
             let at = (next() % b.len() as u64) as usize;
             b[at] = next() as u8;
         }
