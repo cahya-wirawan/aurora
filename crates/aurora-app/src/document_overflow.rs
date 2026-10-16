@@ -86,6 +86,7 @@ impl OverflowState {
     /// Opens the menu listing every document of `shelf` and `active` in tab
     /// order, `widest_text` px being the widest row's text. `false` when
     /// a modal is open, the button is not shown, or the toolkit refuses.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
         &mut self,
         workspace: &mut Workspace,

@@ -229,7 +229,13 @@ fn every_count_and_width_keeps_visible_tabs_readable_inside_the_strip_with_the_a
                 let fits = count as f32 * min + (count - 1) as f32 * 8.0 <= bw as f32;
                 assert_eq!(overflow_shown(&ws), !fits, "{case}");
                 assert_eq!(shown.len() == count, fits, "{case}");
-                if !fits {
+                if fits {
+                    let hidden = ws
+                        .tree
+                        .accessibility(ws.document_overflow)
+                        .is_some_and(accesskit::Node::is_hidden);
+                    assert!(hidden, "{case}: the button is announced while hidden");
+                } else {
                     let (ox, _, ow, _) = rect(&ws, ws.document_overflow);
                     assert!(ow > 0, "{case}");
                     assert!(ox >= bx && ox + ow <= bx + bw + 1, "{case}: button outside");
@@ -245,12 +251,6 @@ fn every_count_and_width_keeps_visible_tabs_readable_inside_the_strip_with_the_a
                     assert!(!node.is_hidden(), "{case}");
                     let expected = format!("{} more", count - shown.len());
                     assert_eq!(node.description(), Some(expected.as_str()), "{case}");
-                } else {
-                    let hidden = ws
-                        .tree
-                        .accessibility(ws.document_overflow)
-                        .is_some_and(accesskit::Node::is_hidden);
-                    assert!(hidden, "{case}: the button is announced while hidden");
                 }
             }
         }
