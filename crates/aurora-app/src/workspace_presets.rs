@@ -2268,16 +2268,16 @@ mod tests {
             vec![
                 (vec!["layers".to_owned()], 0),
                 (
-                    ["properties", "paths", "channels"].map(str::to_owned).to_vec(),
+                    ["properties", "paths", "channels"]
+                        .map(str::to_owned)
+                        .to_vec(),
                     1
                 ),
                 (vec!["history".to_owned()], 0),
             ]
         );
         assert!(graphic.history_collapsed, "History starts collapsed");
-        assert!(
-            (graphic.rail_width - aurora_ui::RAIL_WIDTH_DEFAULT).abs() < f32::EPSILON
-        );
+        assert!((graphic.rail_width - aurora_ui::RAIL_WIDTH_DEFAULT).abs() < f32::EPSILON);
         assert_ne!(photography, graphic);
         assert_ne!(photography, essentials_layout());
         assert_ne!(graphic, essentials_layout());
@@ -2304,9 +2304,8 @@ mod tests {
     fn switching_to_a_built_in_applies_it_and_reset_restores_it() {
         for name in NEW_BUILT_INS {
             let mut rig = Rig::new();
-            let wanted = match rig.presets.layout_of(name) {
-                Some(layout) => layout,
-                None => unreachable!("{name}"),
+            let Some(wanted) = rig.presets.layout_of(name) else {
+                unreachable!("{name}")
             };
             let outcome = rig.run(WorkspaceCommand::Switch(name.to_owned()));
             assert!(outcome.applied, "{name}");

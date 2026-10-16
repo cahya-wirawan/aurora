@@ -555,7 +555,6 @@ mod clone_stamp_tests;
 mod colour_range_app;
 mod colour_state;
 mod crop;
-mod first_run;
 mod crop_app;
 #[cfg(test)]
 mod crop_ratio_tests;
@@ -571,6 +570,7 @@ mod fill_tools;
 mod filter_stamp;
 #[cfg(test)]
 mod filter_stamp_tests;
+mod first_run;
 mod lasso_tools;
 mod layer_thumbnails;
 mod menu_bar_app;
@@ -30287,15 +30287,19 @@ impl App {
         // recovery's dialog.
         let welcome_marker = layout_path.as_deref().map(first_run::marker_path_for);
         let first_run = first_run::first_run_from_disk(
-            first_run::first_run_override(
-                std::env::var(first_run::FIRST_RUN_ENV).ok().as_deref(),
-            ),
+            first_run::first_run_override(std::env::var(first_run::FIRST_RUN_ENV).ok().as_deref()),
             layout_path.as_deref(),
             presets_path.as_deref(),
         );
         if first_run::should_show_welcome(first_run, had_previous_marker || was_recovered, false) {
             let chord = palette_chord_text(&default_shortcuts());
-            first_run::open_welcome_dialog(&mut workspace, &mut focus, &mut dialog, &scales, &chord);
+            first_run::open_welcome_dialog(
+                &mut workspace,
+                &mut focus,
+                &mut dialog,
+                &scales,
+                &chord,
+            );
         }
         // 0.162.0: the status bar shows the startup document from the
         // first frame and the first accessibility tree on.
@@ -35052,7 +35056,11 @@ impl App {
             tracing::warn!(?err, path = %path.display(), "failed to remember the welcome");
         }
         if choice == first_run::WelcomeChoice::OpenPalette && self.command_palette.is_none() {
-            open_command_palette(&mut self.workspace, &mut self.focus, &mut self.command_palette);
+            open_command_palette(
+                &mut self.workspace,
+                &mut self.focus,
+                &mut self.command_palette,
+            );
             // The same dynamic entries a key-opened palette lists.
             workspace_presets::add_workspace_entries_if_opened(
                 &mut self.workspace,

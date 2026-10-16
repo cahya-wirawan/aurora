@@ -22,7 +22,11 @@ fn temp() -> tempfile::TempDir {
 #[test]
 fn the_override_reads_one_and_zero_spellings_and_detects_otherwise() {
     for on in ["1", "true", "TRUE", " on ", "Yes"] {
-        assert_eq!(first_run_override(Some(on)), FirstRunOverride::Force, "{on}");
+        assert_eq!(
+            first_run_override(Some(on)),
+            FirstRunOverride::Force,
+            "{on}"
+        );
     }
     for off in ["0", "false", "OFF", " no "] {
         assert_eq!(
@@ -32,7 +36,11 @@ fn the_override_reads_one_and_zero_spellings_and_detects_otherwise() {
         );
     }
     for other in [None, Some(""), Some("maybe"), Some("2")] {
-        assert_eq!(first_run_override(other), FirstRunOverride::Detect, "{other:?}");
+        assert_eq!(
+            first_run_override(other),
+            FirstRunOverride::Detect,
+            "{other:?}"
+        );
     }
     assert_eq!(FIRST_RUN_ENV, "AURORA_FIRST_RUN");
 }
@@ -46,7 +54,12 @@ fn a_first_run_means_none_of_the_three_traces_exists() {
     assert!(!is_first_run(detect, false, false, true), "presets file");
     // The override wins both ways.
     assert!(is_first_run(FirstRunOverride::Force, true, true, true));
-    assert!(!is_first_run(FirstRunOverride::Suppress, false, false, false));
+    assert!(!is_first_run(
+        FirstRunOverride::Suppress,
+        false,
+        false,
+        false
+    ));
 }
 
 #[test]
@@ -65,10 +78,7 @@ fn the_decision_from_disk_follows_the_files() {
     let detect = FirstRunOverride::Detect;
     assert!(first_run_from_disk(detect, Some(&layout), Some(&presets)));
     // The marker sits beside the layout file.
-    assert_eq!(
-        marker_path_for(&layout),
-        dir.path().join(MARKER_FILE_NAME)
-    );
+    assert_eq!(marker_path_for(&layout), dir.path().join(MARKER_FILE_NAME));
     if let Err(err) = write_marker(&marker_path_for(&layout)) {
         unreachable!("{err}");
     }
@@ -97,7 +107,11 @@ fn the_decision_from_disk_follows_the_files() {
     // No config directory: nowhere to remember it, so only when forced.
     assert!(!first_run_from_disk(detect, None, None));
     assert!(first_run_from_disk(FirstRunOverride::Force, None, None));
-    assert!(!first_run_from_disk(FirstRunOverride::Suppress, Some(&layout), None));
+    assert!(!first_run_from_disk(
+        FirstRunOverride::Suppress,
+        Some(&layout),
+        None
+    ));
 }
 
 #[test]
@@ -129,7 +143,7 @@ fn the_marker_is_written_atomically_and_a_failure_is_an_error_not_a_panic() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     assert!(
-        names.iter().all(|n| !n.ends_with(".tmp")),
+        names.iter().all(|n| !n.contains(".tmp")),
         "temporary removed: {names:?}"
     );
 }
@@ -205,7 +219,10 @@ fn the_dialog_is_an_alert_with_get_started_as_default_and_cancel() {
 fn the_actions_map_to_choices_and_the_default_is_also_the_cancel() {
     let actions = welcome_actions();
     assert_eq!(actions.len(), 2);
-    assert_eq!(welcome_choice(WELCOME_START), Some(WelcomeChoice::GetStarted));
+    assert_eq!(
+        welcome_choice(WELCOME_START),
+        Some(WelcomeChoice::GetStarted)
+    );
     assert_eq!(
         welcome_choice(WELCOME_PALETTE),
         Some(WelcomeChoice::OpenPalette)
@@ -238,7 +255,13 @@ fn enter_and_escape_both_choose_get_started_and_never_open_the_palette() {
         let mut focus = FocusManager::default();
         let mut dialog = None;
         let scales = crate::test_layout_scales();
-        open_welcome_dialog(&mut workspace, &mut focus, &mut dialog, &scales, "Ctrl+Shift+P");
+        open_welcome_dialog(
+            &mut workspace,
+            &mut focus,
+            &mut dialog,
+            &scales,
+            "Ctrl+Shift+P",
+        );
         let result = crate::handle_dialog_key(
             &mut workspace,
             &mut focus,
