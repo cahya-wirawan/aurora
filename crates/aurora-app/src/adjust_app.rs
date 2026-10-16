@@ -143,8 +143,8 @@ pub(crate) fn is_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerO
         PointerOutcome::Action(Outcome::ValueChanged { id, .. }) => adjust.slider_of(*id).is_some(),
         // The Gradient Map stop editor (task 113): a marker drag, a marker
         // press (selection only) and the four stop buttons.
-        PointerOutcome::Action(Outcome::GradientBarChanged { bar }) => *bar == adjust.gradient_bar,
-        PointerOutcome::Changed(bar) => *bar == adjust.gradient_bar,
+        PointerOutcome::Action(Outcome::GradientBarChanged { bar })
+        | PointerOutcome::Changed(bar) => *bar == adjust.gradient_bar,
         PointerOutcome::Action(Outcome::Activated(id)) => gradient_button(adjust, *id).is_some(),
         PointerOutcome::Action(Outcome::Toggled { id, .. }) => {
             *id == adjust.preserve
@@ -177,6 +177,7 @@ enum GradientButton {
 }
 
 /// The stop button `id` is, if any.
+#[allow(clippy::large_types_passed_by_value)] // `AdjustControls` is `Copy`
 fn gradient_button(adjust: aurora_ui::AdjustControls, id: WidgetId) -> Option<GradientButton> {
     [
         (adjust.gradient_prev, GradientButton::Previous),

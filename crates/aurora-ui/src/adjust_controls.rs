@@ -507,7 +507,6 @@ impl AdjustSlider {
             | Self::GradientRed
             | Self::GradientGreen
             | Self::GradientBlue => (0.0, 255.0),
-            Self::GradientPosition => (0.0, 100.0),
             Self::BwReds
             | Self::BwYellows
             | Self::BwGreens
@@ -515,7 +514,7 @@ impl AdjustSlider {
             | Self::BwBlues
             | Self::BwMagentas => (BLACK_WHITE_MIN as f64, BLACK_WHITE_MAX as f64),
             Self::TintHue => (0.0, 360.0),
-            Self::TintSaturation => (0.0, 100.0),
+            Self::TintSaturation | Self::GradientPosition => (0.0, 100.0),
             Self::BalanceCyanRed | Self::BalanceMagentaGreen | Self::BalanceYellowBlue => {
                 (-(COLOR_BALANCE_MAX as f64), COLOR_BALANCE_MAX as f64)
             }

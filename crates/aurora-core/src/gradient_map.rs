@@ -416,7 +416,13 @@ impl GradientMapParams {
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp, clippy::indexing_slicing)]
+#[allow(
+    clippy::float_cmp,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::{
         GRADIENT_MAP_MAX_STOPS, GradientInterpolation, GradientMapError as E,
@@ -595,7 +601,10 @@ mod tests {
         assert_eq!(p.with_stop_colour(3, [0.0; 3]), Err(E::Index));
         assert_eq!(p.with_stop_colour(0, [0.0, 1.2, 0.0]), Err(E::Colour));
         assert_eq!(p.with_stop_colour(0, [0.0, -0.1, 0.0]), Err(E::Colour));
-        assert_eq!(p.with_stop_colour(0, [f32::NAN, 0.0, 0.0]), Err(E::NotFinite));
+        assert_eq!(
+            p.with_stop_colour(0, [f32::NAN, 0.0, 0.0]),
+            Err(E::NotFinite)
+        );
         assert!(p.with_stop_colour(0, [1.0, 0.0, 1.0]).is_ok());
     }
 
@@ -704,8 +713,11 @@ mod tests {
                     }
                 }
             }
-            let got: Vec<(f32, [f32; 3])> =
-                params.stops().iter().map(|s| (s.position, s.colour)).collect();
+            let got: Vec<(f32, [f32; 3])> = params
+                .stops()
+                .iter()
+                .map(|s| (s.position, s.colour))
+                .collect();
             assert_eq!(got, model, "step {step}");
             // Re-validating the result by construction proves the invariants.
             assert!(P::new(params.stops().to_vec(), false, false).is_ok());

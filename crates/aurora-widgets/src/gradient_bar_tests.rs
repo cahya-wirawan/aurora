@@ -1,4 +1,10 @@
 //! Task 113: the gradient bar's pointer routing and paint, headless.
+#![allow(
+    clippy::indexing_slicing,
+    clippy::manual_midpoint,
+    clippy::many_single_char_names,
+    clippy::float_cmp
+)]
 
 use aurora_theme::{Palette, Theme, ThemeSet};
 use taffy::style_helpers::length;
@@ -31,6 +37,10 @@ fn theme() -> Theme {
     }
 }
 
+const WIDE: f32 = 200.0;
+const TALL: f32 = 100.0;
+const CLIPPED: f32 = 80.0;
+
 fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     match r {
         Ok(v) => v,
@@ -58,8 +68,8 @@ fn rig_with(stops: &[Stop], clip: bool) -> Rig {
         display: Display::Flex,
         flex_direction: FlexDirection::Column,
         size: Size {
-            width: length(200.0_f32),
-            height: length(100.0_f32),
+            width: length(WIDE),
+            height: length(TALL),
         },
         ..Default::default()
     });
@@ -76,8 +86,8 @@ fn rig_with(stops: &[Stop], clip: bool) -> Rig {
                     y: Overflow::Hidden,
                 },
                 size: Size {
-                    width: length(80.0_f32),
-                    height: length(100.0_f32),
+                    width: length(CLIPPED),
+                    height: length(TALL),
                 },
                 ..Default::default()
             },
@@ -95,7 +105,7 @@ fn rig_with(stops: &[Stop], clip: bool) -> Rig {
     if clip {
         // The bar keeps its full width inside the narrow clipping parent.
         let mut style = tree.style(bar).cloned().unwrap_or_default();
-        style.size.width = length(200.0_f32);
+        style.size.width = length(WIDE);
         ok(tree.set_style(bar, style));
     }
     tree.compute_layout(200.0, 100.0);

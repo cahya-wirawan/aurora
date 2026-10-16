@@ -1178,6 +1178,7 @@ mod tests {
     #[test]
     fn the_gradient_bars_fit_in_the_shorter_column() {
         let (ws, g, _) = opened(1200.0);
+        #[allow(clippy::indexing_slicing)]
         let state = |i: usize| match widgets::gradient_bar_state(&ws.tree, g.gradient_bars[i]) {
             Ok(s) => s.clone(),
             Err(err) => unreachable!("{err:?}"),
@@ -1192,7 +1193,10 @@ mod tests {
             let Some(node) = ws.tree.accessibility(bar) else {
                 unreachable!("bar node")
             };
-            assert_eq!(node.label(), Some(super::GALLERY_GRADIENT_BAR_CAPTIONS[i]));
+            assert_eq!(
+                node.label(),
+                super::GALLERY_GRADIENT_BAR_CAPTIONS.get(i).copied()
+            );
             names.push(node.label().unwrap_or_default().to_owned());
         }
         names.sort();

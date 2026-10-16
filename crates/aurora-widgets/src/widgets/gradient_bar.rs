@@ -41,6 +41,11 @@
 //! no actions, whose description lists every stop in text
 //! (`Stop 1 of 3: position 0 percent, colour 0 0 0; ...`, colour as
 //! `0..=255` integers) and ends with the selected stop.
+#![allow(
+    clippy::manual_midpoint,clippy::manual_clamp, // `max` then `min` on purpose: they turn a NaN into a bound, `clamp` would pass it on
+    clippy::many_single_char_names,
+    clippy::float_cmp, // exact ties between marker distances
+    clippy::format_push_string)]
 
 use accesskit::{Node, Role};
 use aurora_core::Rect;
@@ -1042,7 +1047,7 @@ mod tests {
         assert_eq!(n.role(), Role::Image);
         assert_eq!(n.label(), Some("Gradient preview"));
         assert!(!n.is_hidden());
-        assert!(n.supports_action(accesskit::Action::Focus) == false);
+        assert!(!n.supports_action(accesskit::Action::Focus));
         assert!(!n.is_disabled());
         assert!(
             n.description()

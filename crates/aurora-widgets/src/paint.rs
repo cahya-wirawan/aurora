@@ -1486,6 +1486,7 @@ fn enclosing_rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
 /// (`accent.primary` is the selection token, gated at 3:1 against
 /// `surface.panel`). A part an ancestor's clip would cut is not drawn (a
 /// mesh is not scissored), like the colour picker's markers.
+#[allow(clippy::many_single_char_names)]
 fn paint_gradient_bar(
     tree: &WidgetTree<WidgetKind>,
     id: WidgetId,
