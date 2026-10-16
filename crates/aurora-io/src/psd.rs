@@ -4949,25 +4949,30 @@ fn resolve_patterns(
         let Some(Ok(read)) = &mut record.effects else {
             continue;
         };
-        let mut dropped = 0u32;
+        let (mut unreadable, mut unplaced) = (0u32, 0u32);
         let mut kept = Vec::new();
         for mut overlay in std::mem::take(&mut read.effects.pattern_overlays) {
             // An origin far outside any document is a damaged reference
             // point; the layer-relative value must stay within the
             // effects' own range once `Builder` subtracts the bounds.
             let origin = origin.filter(|(x, y)| x.abs() <= 100_000.0 && y.abs() <= 100_000.0);
+            let shown = u32::from(read.effects.shows(overlay.gate));
             match (pool.ready.contains_key(&overlay.pattern), origin) {
                 (true, Some(origin)) => {
                     overlay.origin = origin;
                     used.insert(overlay.pattern.clone());
                     kept.push(overlay);
                 }
-                _ => dropped += u32::from(read.effects.shows(overlay.gate)),
+                // The pattern's pixels cannot be had.
+                (false, _) => unreadable += shown,
+                // The pattern is there, the layer has no usable origin.
+                (true, None) => unplaced += shown,
             }
         }
         read.effects.pattern_overlays = kept;
-        read.pattern_unreadable += dropped;
-        read.effects.other.pattern_overlays += dropped;
+        read.pattern_unreadable += unreadable;
+        read.pattern_unplaced += unplaced;
+        read.effects.other.pattern_overlays += unreadable + unplaced;
     }
     Ok(pool
         .ready

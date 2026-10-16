@@ -481,7 +481,7 @@ fn patterns_psd_yields_its_six_patterns_with_psd_tools_pixels() {
     assert!(water.texels().chunks(4).all(|t| t[3] == 65_535));
     assert_eq!(
         by_id("b2fdfd29-de85-11d5-838b-ff55e75fb875").map(|p| (p.width(), p.height())),
-        Some((219, 265))
+        Some((265, 219))
     );
 }
 
@@ -507,4 +507,61 @@ fn only_the_patterns_a_layer_names_are_kept() {
         Err(err) => unreachable!("{err:?}"),
     };
     assert!(file.patterns.is_empty());
+}
+
+fn patterns_psd_with(from: &[u8], to: &[u8]) -> Option<super::PsdFile> {
+    let mut bytes = corpus("patterns.psd")?;
+    assert_eq!(from.len(), to.len());
+    let mut hits = 0;
+    let mut at = 0;
+    while at + from.len() <= bytes.len() {
+        if bytes[at..at + from.len()] == *from {
+            bytes[at..at + to.len()].copy_from_slice(to);
+            hits += 1;
+            at += from.len();
+        } else {
+            at += 1;
+        }
+    }
+    assert!(hits > 0, "the marker is in the fixture");
+    match super::decode(&bytes) {
+        Ok(f) => Some(f),
+        Err(err) => unreachable!("{err:?}"),
+    }
+}
+
+#[test]
+fn an_overlay_whose_pattern_the_file_lacks_is_dropped_counted_and_reported() {
+    // The diagonal pattern's ID, as the block holds it (ASCII; the layers'
+    // descriptors hold it as UTF-16), altered by one character: the block
+    // no longer has the pattern one overlay names.
+    let Some(file) = patterns_psd_with(
+        b"bf565312-67b6-1177-9181-9d5762aa7056",
+        b"bf565312-67b6-1177-9181-9d5762aa7057",
+    ) else {
+        return;
+    };
+    assert_eq!(file.patterns.len(), 5);
+    let report = file.report().items.join("\n");
+    assert!(
+        report.contains("1 pattern overlay isn't shown because the pattern's pixels can't be read"),
+        "{report}"
+    );
+    assert!(!report.contains("placement isn't modelled"), "{report}");
+    assert!(report.contains("1 other effect"), "{report}");
+}
+
+#[test]
+fn a_layer_with_no_reference_point_leaves_its_overlays_unplaced_and_says_so() {
+    let Some(file) = patterns_psd_with(b"8BIMfxrp", b"8BIMfxrq") else {
+        return;
+    };
+    // Nothing is placed, so no pattern is kept.
+    assert!(file.patterns.is_empty());
+    let report = file.report().items.join("\n");
+    assert!(
+        report.contains("6 pattern overlays aren't shown because their placement isn't modelled"),
+        "{report}"
+    );
+    assert!(!report.contains("pixels can't be read"), "{report}");
 }

@@ -243,3 +243,15 @@ fn the_pattern_pool_and_overlays_survive_a_save_and_reopen_of_an_imported_psd() 
     };
     assert!(mean.iter().all(|m| *m == 0.0) && max == 0.0, "{mean:?} {max}");
 }
+
+#[test]
+fn the_pattern_sits_above_the_gradient_overlay_and_the_colour_overlay() {
+    let (_d, mut store) = real_tile_store();
+    let (mut layers, id) = patterned(&mut store, PBLUE, pat_overlay("q", 1.0, (0.0, 0.0)));
+    let mut fx = layers.effects(id).cloned().unwrap_or_default();
+    fx.gradient_overlays = vec![grad_overlay(ramp_fill(0.0, GWHITE, GWHITE))];
+    fx.color_overlays = vec![overlay(EffectBlendMode::Normal, [0.0, 0.0, 0.0], 1.0)];
+    ok(layers.set_effects(id, Some(fx)));
+    // Interior order: colour, gradient, pattern, stroke.
+    near(texel(&composite(&layers, &mut store), 0, 0), PRED);
+}
