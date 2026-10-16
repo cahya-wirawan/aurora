@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.260.1] - 2026-10-16
+
+### Fixed
+
+- Command palette: its scrollbar takes presses and drags
+
 ## [0.260.0] - 2026-10-16
 
 ### Changed
