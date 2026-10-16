@@ -12442,6 +12442,32 @@ fn route_palette_press(
     }
 }
 
+/// Whether `id` is the open command palette's own scrollbar (or a part of
+/// it): a linked scrollbar with the palette's root among its ancestors.
+/// The palette swallows every other press ([`route_palette_press`]); this
+/// one is the exception, because the scrollbar is how a pointer scrolls the
+/// rows (the wheel already does).
+fn is_palette_scrollbar(
+    tree: &WidgetTree<WidgetKind>,
+    palette: Option<WidgetId>,
+    id: WidgetId,
+) -> bool {
+    let Some(root) = palette else {
+        return false;
+    };
+    if aurora_widgets::widgets::scrollbar_target(tree, id).is_none() {
+        return false;
+    }
+    let mut at = Some(id);
+    while let Some(current) = at {
+        if current == root {
+            return true;
+        }
+        at = tree.parent(current);
+    }
+    false
+}
+
 /// Routes one key press while the command palette is open — captures
 /// input directly rather than going through [`ShortcutRegistry`], the
 /// same "a modal dialog owns the keyboard while open" behaviour every
@@ -33055,6 +33081,10 @@ impl App {
         // follows the pointer (a drag begun before it opened resumes, or
         // is committed by its release, once the palette is gone).
         if self.command_palette.is_some() {
+            // Except a drag of the palette's own scrollbar thumb.
+            if self.palette_scrollbar_captured() {
+                self.route_gallery(PointerPhase::Move, position);
+            }
             return;
         }
 
@@ -33236,6 +33266,15 @@ impl App {
         // a primary press on a result row runs it, any other press --
         // strip, scrollbar, padding, outside it -- does nothing and
         // reaches no panel, layer row, tab or canvas tool underneath.
+        if button == PointerButton::Primary
+            && self.workspace.tree.hit_test(position).is_some_and(|hit| {
+                is_palette_scrollbar(&self.workspace.tree, self.command_palette, hit)
+            })
+        {
+            self.route_gallery(PointerPhase::Down, position);
+            self.push_accessibility();
+            return;
+        }
         match route_palette_press(
             &mut self.workspace,
             &mut self.focus,
@@ -34792,6 +34831,26 @@ impl App {
         run_shutdown_cleanup(self);
     }
 
+    /// Whether the widget captured by a press (a drag in progress) is the
+    /// open command palette's scrollbar.
+    fn palette_scrollbar_captured(&self) -> bool {
+        self.gallery_click
+            .captured()
+            .is_some_and(|id| is_palette_scrollbar(&self.workspace.tree, self.command_palette, id))
+    }
+
+    /// Whether this pointer phase belongs to the open palette's scrollbar:
+    /// a press on it, or a move or release of a drag it captured. Only then
+    /// does the palette let a widget route see the pointer.
+    fn palette_scrollbar_gesture(&self, phase: PointerPhase, position: (f32, f32)) -> bool {
+        match phase {
+            PointerPhase::Down => self.workspace.tree.hit_test(position).is_some_and(|hit| {
+                is_palette_scrollbar(&self.workspace.tree, self.command_palette, hit)
+            }),
+            _ => self.palette_scrollbar_captured(),
+        }
+    }
+
     /// Routes one primary-button event to the Widget Gallery or (0.135.0)
     /// the Layers-panel controls ([`route_widget_pointer`]), applying a
     /// control's document edit ([`Self::apply_layer_control`]) and
@@ -34810,6 +34869,7 @@ impl App {
             self.light_dismiss_colour_popover(position);
             self.light_dismiss_menu_bar(position);
         }
+        let palette_scrollbar = self.palette_scrollbar_gesture(phase, position);
         let controls = self.layer_controls.controls;
         let tool_controls = self.tool_controls;
         #[allow(clippy::cast_possible_truncation)]
@@ -34832,7 +34892,7 @@ impl App {
             tool_controls.as_ref(),
             &mut self.gallery_click,
             &self.scales,
-            self.dialog.is_some() || self.command_palette.is_some(),
+            self.dialog.is_some() || (self.command_palette.is_some() && !palette_scrollbar),
             phase,
             position,
             self.modifiers,

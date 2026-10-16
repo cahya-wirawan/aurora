@@ -468,3 +468,54 @@ fn a_prompt_row_click_validates_the_typed_name_like_enter() {
     );
     assert_eq!(rig.palette, None, "an accepted name closes the prompt");
 }
+
+/// The palette's own scrollbar is the one thing a press may reach: it is
+/// recognised as the palette's, a row is not, and a track press through
+/// the widget router (modal lifted for it, as `route_gallery` does)
+/// scrolls the rows.
+#[test]
+fn the_palettes_scrollbar_takes_a_press_and_scrolls_the_rows() {
+    let mut rig = Rig::open(SIZES[0]);
+    let (list, scrollbar, row) = {
+        let state = rig.state();
+        (state.body(), state.scrollbar(), state.rows()[0])
+    };
+    let bar = centre_of(rig.tree(), scrollbar);
+    let hit = rig.tree().hit_test(bar);
+    assert!(
+        hit.is_some_and(|h| crate::is_palette_scrollbar(rig.tree(), rig.palette, h)),
+        "the bar is the palette's"
+    );
+    assert!(!crate::is_palette_scrollbar(rig.tree(), rig.palette, row));
+    assert!(!crate::is_palette_scrollbar(rig.tree(), None, scrollbar));
+    // Press low on the track: the rows scroll down.
+    let Some(b) = rig.tree().bounds(scrollbar) else {
+        unreachable!("laid out")
+    };
+    let low = (
+        b.x as f32 + b.width as f32 / 2.0,
+        (b.y + i64::from(b.height)) as f32 - 2.0,
+    );
+    let mut click = crate::ClickTracker::default();
+    let scales = crate::test_workspace_scales();
+    let mut gallery = None;
+    let routed = crate::route_widget_pointer(
+        &mut rig.workspace,
+        &mut rig.focus,
+        &mut gallery,
+        None,
+        None,
+        &mut click,
+        &scales,
+        false,
+        crate::PointerPhase::Down,
+        low,
+        crate::Modifiers::none(),
+        &mut crate::NoTextHit,
+    );
+    assert_eq!(routed.owner, Some(crate::WidgetOwner::PanelScrollbar));
+    assert!(
+        rig.tree().scroll_y(list).is_some_and(|y| y > 0.0),
+        "the track press scrolled the rows"
+    );
+}
