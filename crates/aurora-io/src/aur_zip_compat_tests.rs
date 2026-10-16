@@ -1135,3 +1135,105 @@ fn the_mimetype_entry_is_not_needed_to_open() {
     let (_d, _s, doc) = open(&bytes);
     assert_eq!(doc.canvas_size, (64, 64));
 }
+
+fn with_known_missing() -> SkippedTiles {
+    SkippedTiles::from_parts(
+        1,
+        vec![crate::aur::SkippedTileRecord {
+            surface: 1,
+            tile_x: 0,
+            tile_y: 0,
+            reason: "lost".to_owned(),
+        }],
+    )
+}
+
+/// The `skipped-tiles` record is Deflated, by the explicit save and by
+/// the autosave snapshot alike.
+#[test]
+fn the_skipped_tiles_entry_is_deflated_in_both_writers() {
+    let (_d, mut store) = store();
+    let mut tree = LayerTree::new();
+    let mut history = History::new();
+    ok(history.add_pixel_layer(&mut tree, "S", r(0, 0, 64, 64), None));
+    let mut out = Cursor::new(Vec::new());
+    ok(crate::aur::write(
+        &mut out,
+        &tree,
+        &history,
+        (64, 64),
+        None,
+        &with_known_missing(),
+        &mut store,
+    ));
+    let snapshot = ok(snapshot_best_effort(
+        &tree,
+        &history,
+        (64, 64),
+        None,
+        &with_known_missing(),
+        usize::MAX,
+        &mut store,
+    ));
+    let Some(snapshot) = snapshot else {
+        unreachable!("unbounded budget gives a snapshot")
+    };
+    let mut snap = Cursor::new(Vec::new());
+    ok(write_snapshot(&mut snap, &snapshot));
+    for bytes in [out.into_inner(), snap.into_inner()] {
+        let table = entry_table(&bytes);
+        let Some(entry) = table.iter().find(|e| e.name == "skipped-tiles") else {
+            unreachable!("no skipped-tiles entry")
+        };
+        assert_eq!(entry.method, CompressionMethod::Deflated);
+        let (_d2, _s2, doc) = open(&bytes);
+        assert_eq!(doc.skipped_tiles.total(), 1);
+    }
+}
+
+/// An embedded smart-object file whose length differs from the record's
+/// is refused even when it is a well-framed entry.
+#[test]
+fn a_smart_object_file_of_the_wrong_length_is_refused() {
+    let table = entry_table(&fixture("rich.aur"));
+    let mut shorter = 9_u64.to_be_bytes().to_vec();
+    shorter.extend_from_slice(&[0; 9 + 3]);
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for e in &table {
+        let stored = e.method == CompressionMethod::Stored;
+        let o = if stored {
+            zip::write::SimpleFileOptions::default().compression_method(CompressionMethod::Stored)
+        } else {
+            deflated()
+        };
+        ok(out.start_file(e.name.clone(), o));
+        let data = if e.name == "smart-object-file-0" {
+            &shorter
+        } else {
+            &e.data
+        };
+        ok(out.write_all(data));
+    }
+    let bytes = ok(out.finish()).into_inner();
+    assert_eq!(shorter.len(), 20, "a valid framed entry, shorter than 24");
+    let (_d, mut store) = store();
+    assert!(read(Cursor::new(bytes), &mut store).is_err());
+}
+
+/// `read_capped` at its boundary: exactly `cap` bytes read, one more is
+/// refused from the directory's claim.
+#[test]
+fn read_capped_accepts_exactly_the_cap_and_refuses_one_more() {
+    for (len, accepted) in [(10_usize, true), (11, false)] {
+        let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        ok(out.start_file("e", deflated()));
+        ok(out.write_all(&vec![7_u8; len]));
+        let bytes = ok(out.finish()).into_inner();
+        let mut archive = ok(ZipArchive::new(Cursor::new(bytes)));
+        let got = crate::aur::read_capped(ok(archive.by_name("e")), "e", 10);
+        assert_eq!(got.is_ok(), accepted, "{len} bytes");
+        if let Ok(data) = got {
+            assert_eq!(data.len(), 10);
+        }
+    }
+}
