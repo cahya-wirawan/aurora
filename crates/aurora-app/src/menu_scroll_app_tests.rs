@@ -30,12 +30,12 @@ fn context(saved: usize) -> MenuContext {
     let mut saved_selections = Vec::new();
     for index in 0..saved {
         saved_selections.push(CommandEntry::new(
-            &format!("select.load:s{index}"),
-            &format!("Load Selection: s{index}"),
+            format!("select.load:s{index}"),
+            format!("Load Selection: s{index}"),
         ));
         saved_selections.push(CommandEntry::new(
-            &format!("select.delete_saved:s{index}"),
-            &format!("Delete Saved Selection: s{index}"),
+            format!("select.delete_saved:s{index}"),
+            format!("Delete Saved Selection: s{index}"),
         ));
     }
     MenuContext {
@@ -213,7 +213,7 @@ fn row_pitch(rig: &Rig) -> (i64, i64) {
     let scales = &rig.scales;
     (
         widgets::row_height(scales) as i64,
-        scales.spacing.xxs as i64,
+        i64::from(scales.spacing.xxs),
     )
 }
 

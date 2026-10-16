@@ -210,6 +210,7 @@ pub fn popup_scroll_target(tree: &WidgetTree<WidgetKind>, point: (f32, f32)) -> 
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // exact arithmetic on small whole numbers
 mod tests {
     use super::{PopupFit, fit_popup};
 

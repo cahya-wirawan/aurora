@@ -2,7 +2,16 @@
 //! popup is capped to the room the window has, its rows keep a fixed
 //! pitch, and the keyboard, the wheel and a click all reach every row.
 
-#![allow(clippy::indexing_slicing, clippy::cast_precision_loss)]
+// Test-only: included by `mod.rs` under `#[cfg(test)]` (the style lint
+// ignores everything after that marker; the layout fixtures use literal px).
+#![allow(
+    clippy::indexing_slicing,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless
+)]
 
 use super::{
     DropdownKey, MenuItem, MenuKey, MenuOutcome, WidgetKind, activate_menu_item,
