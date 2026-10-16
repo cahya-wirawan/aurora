@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.256.0] - 2026-10-16
+
+### Changed
+
+- Gradient Map stop editor with a GradientBar preview
+
 ## [0.255.0] - 2026-10-16
 
 ### Changed
