@@ -178,6 +178,15 @@ enum Capture {
         id: WidgetId,
         anchor: usize,
     },
+    /// A gradient bar's marker drag (task 113): `stop` is the stop the
+    /// `Down` grabbed and `count` the bar's stop count then, so an owner
+    /// that selects or removes a stop mid-drag ends the drag rather than
+    /// moving a different stop.
+    GradientStop {
+        bar: WidgetId,
+        stop: usize,
+        count: usize,
+    },
 }
 
 impl Capture {
@@ -187,7 +196,8 @@ impl Capture {
             | Self::PickerArea { picker: id }
             | Self::PickerHue { picker: id }
             | Self::CurvePoint { editor: id, .. }
-            | Self::TextField { id, .. } => id,
+            | Self::TextField { id, .. }
+            | Self::GradientStop { bar: id, .. } => id,
         }
     }
 }
@@ -289,6 +299,7 @@ enum Interactive {
     TextField,
     Picker,
     Curve,
+    Gradient,
 }
 
 fn classify(kind: &WidgetKind) -> Option<Interactive> {
@@ -304,6 +315,7 @@ fn classify(kind: &WidgetKind) -> Option<Interactive> {
         WidgetKind::TextField(_) => Interactive::TextField,
         WidgetKind::ColorPicker(_) | WidgetKind::ColorPickerPart(_) => Interactive::Picker,
         WidgetKind::CurveEditor(_) | WidgetKind::CurveEditorPoint(_) => Interactive::Curve,
+        WidgetKind::GradientBar(_) => Interactive::Gradient,
         _ => return None,
     })
 }
@@ -529,7 +541,29 @@ fn pointer_down(
         Interactive::Range => range_down(tree, focus, click, id, point),
         Interactive::Picker => picker_down(tree, focus, click, id, point),
         Interactive::Curve => curve_down(tree, focus, click, id, point),
+        Interactive::Gradient => gradient_down(tree, click, id, point),
     }
+}
+
+/// A gradient bar's `Down` (task 113): a press on a marker selects that
+/// stop and grabs it for a drag; a press anywhere else on the bar does
+/// nothing. Never takes focus (the bar is not a tab stop).
+fn gradient_down(
+    tree: &mut WidgetTree<WidgetKind>,
+    click: &mut ClickTracker,
+    bar: WidgetId,
+    point: (f32, f32),
+) -> Result<PointerOutcome, ActionRejection> {
+    let Some(stop) = widgets::gradient_bar_stop_at(tree, bar, point.0, point.1)? else {
+        return Ok(PointerOutcome::Ignored);
+    };
+    widgets::select_gradient_stop(tree, bar, stop)?;
+    click.captured = Some(Capture::GradientStop {
+        bar,
+        stop,
+        count: widgets::gradient_bar_state(tree, bar)?.stops().len(),
+    });
+    Ok(PointerOutcome::Changed(bar))
 }
 
 /// A text field's `Down` after focusing it: places the caret where `hit`
@@ -814,6 +848,21 @@ fn pointer_move(
                 },
             )
         }
+        Capture::GradientStop { bar, stop, count } => {
+            let state = widgets::gradient_bar_state(tree, bar)?;
+            if state.selected() != stop || state.stops().len() != count {
+                click.captured = None;
+                return Ok(PointerOutcome::Cancelled(bar));
+            }
+            Ok(
+                match widgets::move_selected_stop_from_point(tree, bar, point.0, point.1)? {
+                    widgets::GradientBarOutcome::Changed => {
+                        PointerOutcome::Action(ActionOutcome::GradientBarChanged { bar })
+                    }
+                    widgets::GradientBarOutcome::Ignored => PointerOutcome::Ignored,
+                },
+            )
+        }
         Capture::TextField { id, anchor } => {
             // An IME composition begun mid-drag freezes the caret: the
             // drawn text is no longer the content (`TextHit::offset_at`).
@@ -882,9 +931,11 @@ fn pointer_up(
         // Never armed — a value widget *captures* on `Down` instead, and a
         // captured `Up` returned `Released` above — so an `Up` matching
         // the armed id cannot be one of these.
-        Interactive::Range | Interactive::TextField | Interactive::Picker | Interactive::Curve => {
-            Ok(PointerOutcome::Cancelled(armed))
-        }
+        Interactive::Range
+        | Interactive::TextField
+        | Interactive::Picker
+        | Interactive::Curve
+        | Interactive::Gradient => Ok(PointerOutcome::Cancelled(armed)),
     }
 }
 

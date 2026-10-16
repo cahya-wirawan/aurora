@@ -323,10 +323,106 @@ impl GradientMapParams {
             .ok_or(GradientMapError::Index)? = value;
         Self::new_with(stops, self.reverse, self.dither, self.interpolation)
     }
+
+    /// A copy with stop `stop` moved to `position`, **clamped between its
+    /// neighbours** (the previous stop's position, or `0` for the first;
+    /// the next stop's, or `1` for the last), so the stops stay in order
+    /// and a drag never reorders them. Equal positions (a hard step) are
+    /// allowed: the result may sit exactly on a neighbour.
+    ///
+    /// # Errors
+    /// [`GradientMapError::Index`] for a stop past the last,
+    /// [`GradientMapError::NotFinite`] for a `NaN` or infinite position.
+    pub fn with_stop_position(&self, stop: usize, position: f32) -> Result<Self, GradientMapError> {
+        if !position.is_finite() {
+            return Err(GradientMapError::NotFinite);
+        }
+        self.stops.get(stop).ok_or(GradientMapError::Index)?;
+        let low = stop
+            .checked_sub(1)
+            .and_then(|before| self.stops.get(before))
+            .map_or(0.0, |s| s.position);
+        let high = stop
+            .checked_add(1)
+            .and_then(|after| self.stops.get(after))
+            .map_or(1.0, |s| s.position);
+        // `max` then `min`, never `f32::clamp`: it panics when the bounds
+        // cross, and a bound is data here.
+        let position = position.max(low).min(high);
+        let mut stops = self.stops.clone();
+        if let Some(s) = stops.get_mut(stop) {
+            s.position = position;
+        }
+        Self::new_with(stops, self.reverse, self.dither, self.interpolation)
+    }
+
+    /// A copy with stop `stop`'s colour replaced.
+    ///
+    /// # Errors
+    /// [`GradientMapError::Index`] for a stop past the last,
+    /// [`GradientMapError::NotFinite`] / [`GradientMapError::Colour`] for a
+    /// channel that is not a finite number in `0..=1` (never clamped).
+    pub fn with_stop_colour(
+        &self,
+        stop: usize,
+        colour: [f32; 3],
+    ) -> Result<Self, GradientMapError> {
+        let mut stops = self.stops.clone();
+        stops.get_mut(stop).ok_or(GradientMapError::Index)?.colour = colour;
+        Self::new_with(stops, self.reverse, self.dither, self.interpolation)
+    }
+
+    /// A copy with one more stop **between `stop` and the stop after it**,
+    /// at the midpoint of their positions with the colour halfway between
+    /// theirs (linear, in encoded sRGB: the model's own interpolation, so
+    /// the gradient the layer draws does not change). Returns the new
+    /// params and the new stop's index (`stop + 1`).
+    ///
+    /// # Errors
+    /// [`GradientMapError::Index`] when there is no stop after `stop`,
+    /// [`GradientMapError::TooManyStops`] at [`GRADIENT_MAP_MAX_STOPS`].
+    pub fn insert_stop_after(&self, stop: usize) -> Result<(Self, usize), GradientMapError> {
+        let after = stop.checked_add(1).ok_or(GradientMapError::Index)?;
+        let (Some(a), Some(b)) = (self.stops.get(stop), self.stops.get(after)) else {
+            return Err(GradientMapError::Index);
+        };
+        let colour = [0, 1, 2].map(|c| {
+            let (x, y) = (
+                a.colour.get(c).copied().unwrap_or(0.0),
+                b.colour.get(c).copied().unwrap_or(0.0),
+            );
+            x + (y - x) * 0.5
+        });
+        let inserted = GradientStop::new(a.position + (b.position - a.position) * 0.5, colour);
+        let mut stops = self.stops.clone();
+        stops.insert(after, inserted);
+        Ok((
+            Self::new_with(stops, self.reverse, self.dither, self.interpolation)?,
+            after,
+        ))
+    }
+
+    /// A copy without stop `stop`.
+    ///
+    /// # Errors
+    /// [`GradientMapError::Index`] for a stop past the last,
+    /// [`GradientMapError::TooFewStops`] at [`GRADIENT_MAP_MIN_STOPS`].
+    pub fn remove_stop(&self, stop: usize) -> Result<Self, GradientMapError> {
+        self.stops.get(stop).ok_or(GradientMapError::Index)?;
+        let mut stops = self.stops.clone();
+        stops.remove(stop);
+        Self::new_with(stops, self.reverse, self.dither, self.interpolation)
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp, clippy::indexing_slicing)]
+#[allow(
+    clippy::float_cmp,
+    clippy::indexing_slicing,
+    clippy::many_single_char_names,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::{
         GRADIENT_MAP_MAX_STOPS, GradientInterpolation, GradientMapError as E,
@@ -334,6 +430,13 @@ mod tests {
     };
 
     fn ok(p: Result<P, E>) -> P {
+        match p {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn pair(p: Result<(P, usize), E>) -> (P, usize) {
         match p {
             Ok(p) => p,
             Err(err) => unreachable!("{err:?}"),
@@ -420,6 +523,205 @@ mod tests {
         assert_eq!(p.with_stop_channel(0, 3, 0.0), Err(E::Index));
         assert_eq!(p.with_stop_channel(0, 0, 1.5), Err(E::Colour));
         assert_eq!(p.with_stop_channel(0, 0, f32::NAN), Err(E::NotFinite));
+    }
+
+    // ---- task 113: the stop-edit helpers ----
+
+    fn three() -> P {
+        ok(P::new(
+            vec![
+                S::new(0.0, [0.0, 0.0, 0.0]),
+                S::new(0.25, [1.0, 0.0, 0.5]),
+                S::new(1.0, [1.0, 1.0, 1.0]),
+            ],
+            true,
+            true,
+        ))
+    }
+
+    /// The gradient's colour at `t`, written independently of the crate's
+    /// code: the later stop wins at a shared position, linear between.
+    fn eval(stops: &[S], t: f32) -> [f32; 3] {
+        let mut colour = stops[0].colour;
+        for (i, s) in stops.iter().enumerate() {
+            if t >= s.position {
+                colour = s.colour;
+                if let Some(next) = stops.get(i + 1)
+                    && t < next.position
+                {
+                    let f = (t - s.position) / (next.position - s.position);
+                    colour = [0, 1, 2].map(|c| s.colour[c] + (next.colour[c] - s.colour[c]) * f);
+                }
+            }
+        }
+        colour
+    }
+
+    #[test]
+    fn with_stop_position_clamps_between_the_neighbours() {
+        let p = three();
+        // Inside the neighbours: taken as is.
+        assert_eq!(ok(p.with_stop_position(1, 0.6)).stops()[1].position, 0.6);
+        // Past the next stop or before the previous one: stops at it.
+        assert_eq!(ok(p.with_stop_position(1, 5.0)).stops()[1].position, 1.0);
+        assert_eq!(ok(p.with_stop_position(1, -5.0)).stops()[1].position, 0.0);
+        // The ends are bounded by 0 and 1 and by their one neighbour.
+        assert_eq!(ok(p.with_stop_position(0, 0.9)).stops()[0].position, 0.25);
+        assert_eq!(ok(p.with_stop_position(0, -3.0)).stops()[0].position, 0.0);
+        assert_eq!(ok(p.with_stop_position(2, 0.1)).stops()[2].position, 0.25);
+        assert_eq!(ok(p.with_stop_position(2, 9.0)).stops()[2].position, 1.0);
+        // Everything else is untouched, flags included.
+        let q = ok(p.with_stop_position(1, 0.5));
+        assert_eq!(q.stops()[0], p.stops()[0]);
+        assert_eq!(q.stops()[2], p.stops()[2]);
+        assert_eq!(q.stops()[1].colour, p.stops()[1].colour);
+        assert!(q.reverse() && q.dither());
+        assert_eq!(p.with_stop_position(3, 0.5), Err(E::Index));
+        assert_eq!(p.with_stop_position(usize::MAX, 0.5), Err(E::Index));
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(p.with_stop_position(1, bad), Err(E::NotFinite));
+        }
+    }
+
+    #[test]
+    fn a_stop_may_sit_exactly_on_a_neighbour_for_a_hard_step() {
+        let q = ok(three().with_stop_position(1, 1.0));
+        assert_eq!(q.stops()[1].position, q.stops()[2].position);
+        let r = ok(three().with_stop_position(1, 0.0));
+        assert_eq!(r.stops()[0].position, r.stops()[1].position);
+    }
+
+    #[test]
+    fn with_stop_colour_replaces_a_colour_and_never_clamps() {
+        let p = three();
+        let q = ok(p.with_stop_colour(1, [0.1, 0.2, 0.3]));
+        assert_eq!(q.stops()[1].colour, [0.1, 0.2, 0.3]);
+        assert_eq!(q.stops()[1].position, 0.25);
+        assert_eq!(q.stops()[0], p.stops()[0]);
+        assert_eq!(p.with_stop_colour(3, [0.0; 3]), Err(E::Index));
+        assert_eq!(p.with_stop_colour(0, [0.0, 1.2, 0.0]), Err(E::Colour));
+        assert_eq!(p.with_stop_colour(0, [0.0, -0.1, 0.0]), Err(E::Colour));
+        assert_eq!(
+            p.with_stop_colour(0, [f32::NAN, 0.0, 0.0]),
+            Err(E::NotFinite)
+        );
+        assert!(p.with_stop_colour(0, [1.0, 0.0, 1.0]).is_ok());
+    }
+
+    #[test]
+    fn insert_stop_after_puts_a_midpoint_stop_that_leaves_the_gradient_alone() {
+        let p = three();
+        let (q, at) = pair(p.insert_stop_after(1));
+        assert_eq!(at, 2);
+        assert_eq!(q.stops().len(), 4);
+        assert_eq!(q.stops()[2].position, 0.625);
+        assert_eq!(q.stops()[2].colour, [1.0, 0.5, 0.75]);
+        assert_eq!(q.stops()[1], p.stops()[1]);
+        assert_eq!(q.stops()[3], p.stops()[2]);
+        assert!(q.reverse() && q.dither());
+        // The drawn gradient is unchanged by an insertion.
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            let (a, b) = (eval(p.stops(), t), eval(q.stops(), t));
+            for c in 0..3 {
+                assert!((a[c] - b[c]).abs() < 1e-5, "t = {t}");
+            }
+        }
+        // The first gap too, and the position of a tie.
+        let (r, at0) = pair(p.insert_stop_after(0));
+        assert_eq!((at0, r.stops()[1].position), (1, 0.125));
+        let tie = ok(three().with_stop_position(1, 0.0));
+        let (t, _) = pair(tie.insert_stop_after(0));
+        assert_eq!(t.stops()[1].position, 0.0, "a hard step stays a hard step");
+    }
+
+    #[test]
+    fn insert_stop_after_is_refused_past_the_end_and_at_the_cap() {
+        let p = three();
+        assert_eq!(p.insert_stop_after(2), Err(E::Index));
+        assert_eq!(p.insert_stop_after(usize::MAX), Err(E::Index));
+        let mut q = p;
+        while q.stops().len() < GRADIENT_MAP_MAX_STOPS {
+            q = pair(q.insert_stop_after(0)).0;
+        }
+        assert_eq!(q.stops().len(), GRADIENT_MAP_MAX_STOPS);
+        assert_eq!(q.insert_stop_after(0), Err(E::TooManyStops));
+    }
+
+    #[test]
+    fn remove_stop_never_goes_below_two() {
+        let p = three();
+        let q = ok(p.remove_stop(1));
+        assert_eq!(q.stops(), &[p.stops()[0], p.stops()[2]]);
+        assert!(q.reverse() && q.dither());
+        assert_eq!(q.remove_stop(0), Err(E::TooFewStops));
+        assert_eq!(q.remove_stop(1), Err(E::TooFewStops));
+        assert_eq!(q.remove_stop(2), Err(E::Index));
+        assert_eq!(p.remove_stop(3), Err(E::Index));
+        assert_eq!(ok(p.remove_stop(0)).stops()[0], p.stops()[1]);
+        assert_eq!(ok(p.remove_stop(2)).stops()[1], p.stops()[1]);
+    }
+
+    /// A plain model of the edits (`f32` pairs, no validation), driven by a
+    /// small deterministic generator, against the crate's helpers.
+    #[test]
+    fn random_edit_sequences_match_an_independent_model() {
+        let mut seed = 0x2545_f491_u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let mut params = P::black_to_white();
+        let mut model: Vec<(f32, [f32; 3])> = vec![(0.0, [0.0; 3]), (1.0, [1.0; 3])];
+        for step in 0..600 {
+            let n = model.len();
+            let pick = |u: f32| ((u * n as f32) as usize).min(n - 1);
+            match (next() * 4.0) as u32 {
+                0 => {
+                    let i = pick(next());
+                    let want = next() * 1.4 - 0.2;
+                    let lo = if i == 0 { 0.0 } else { model[i - 1].0 };
+                    let hi = if i + 1 == n { 1.0 } else { model[i + 1].0 };
+                    model[i].0 = want.max(lo).min(hi);
+                    params = ok(params.with_stop_position(i, want));
+                }
+                1 => {
+                    let i = pick(next());
+                    let colour = [next(), next(), next()];
+                    model[i].1 = colour;
+                    params = ok(params.with_stop_colour(i, colour));
+                }
+                2 => {
+                    let i = pick(next());
+                    if i + 1 < n && n < GRADIENT_MAP_MAX_STOPS {
+                        let (a, b) = (model[i], model[i + 1]);
+                        let mid = (
+                            a.0 + (b.0 - a.0) * 0.5,
+                            [0, 1, 2].map(|c| a.1[c] + (b.1[c] - a.1[c]) * 0.5),
+                        );
+                        model.insert(i + 1, mid);
+                        let (q, at) = pair(params.insert_stop_after(i));
+                        assert_eq!(at, i + 1, "step {step}");
+                        params = q;
+                    }
+                }
+                _ => {
+                    let i = pick(next());
+                    if n > 2 {
+                        model.remove(i);
+                        params = ok(params.remove_stop(i));
+                    }
+                }
+            }
+            let got: Vec<(f32, [f32; 3])> = params
+                .stops()
+                .iter()
+                .map(|s| (s.position, s.colour))
+                .collect();
+            assert_eq!(got, model, "step {step}");
+            // Re-validating the result by construction proves the invariants.
+            assert!(P::new(params.stops().to_vec(), false, false).is_ok());
+        }
     }
 
     #[test]

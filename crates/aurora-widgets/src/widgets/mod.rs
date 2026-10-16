@@ -154,6 +154,7 @@ mod curve_editor;
 mod dialog;
 mod drop_indicator;
 mod dropdown;
+mod gradient_bar;
 mod icon;
 mod label;
 mod list_row;
@@ -211,6 +212,13 @@ pub use dropdown::{
     dropdown_state, handle_dropdown_key, insert_dropdown, set_dropdown_disabled, set_dropdown_open,
     set_dropdown_options, set_dropdown_selected, toggle_dropdown,
 };
+pub use gradient_bar::{
+    GRADIENT_BAR_MAX_STOPS, GRADIENT_BAR_POSITION_STEP, GradientBarOutcome, GradientBarState,
+    GradientBarStop, gradient_bar_colour_at, gradient_bar_description, gradient_bar_state,
+    gradient_bar_stop_at, insert_gradient_bar, move_selected_stop_from_point, select_gradient_stop,
+    set_gradient_bar_disabled, set_gradient_bar_stops,
+};
+pub(crate) use gradient_bar::{geometry as gradient_bar_geometry, spans as gradient_bar_spans};
 pub use icon::{
     IconAccess, IconSize, IconState, IconTone, icon_side, icon_state, insert_icon, set_icon_access,
     set_icon_kind, set_icon_tone,
@@ -460,6 +468,12 @@ pub enum WidgetKind {
     /// painted by `paint::paint_selection_outline`; AT-`hidden`, never
     /// focusable, no actions.
     SelectionOutline(SelectionOutlineState),
+    /// A gradient bar (task 113): a preview of a list of colour stops with
+    /// a marker per stop under it, created by `gradient_bar.rs`'s
+    /// [`insert_gradient_bar`]. A named `Role::Image` listing the stops in
+    /// its description; never focusable, no actions; the pointer selects
+    /// and drags markers (`pointer.rs`).
+    GradientBar(GradientBarState),
 }
 
 /// Builds a [`WidgetTree`] whose root is a plain [`WidgetKind::Container`]

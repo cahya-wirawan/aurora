@@ -272,6 +272,7 @@ pub fn paint_widget_ops_frame(
     let gradients = match tree.payload(id) {
         Some(WidgetKind::ColorPickerPart(state)) => color_picker_gradients(tree, id, state, theme),
         Some(WidgetKind::Thumbnail(state)) => thumbnail_gradients(tree, id, state, scale_factor),
+        Some(WidgetKind::GradientBar(state)) => gradient_bar_gradients(tree, id, state, theme),
         _ => Vec::new(),
     };
     let mut ops: Vec<PaintOp> = gradients
@@ -473,6 +474,7 @@ fn kind_disabled(kind: &WidgetKind) -> bool {
         WidgetKind::CurveEditor(state) => state.disabled(),
         WidgetKind::CurveEditorPoint(state) => state.is_disabled(),
         WidgetKind::Label(state) => state.disabled,
+        WidgetKind::GradientBar(state) => state.is_disabled(),
         WidgetKind::Icon(state) => state.tone == IconTone::Disabled,
         WidgetKind::Container
         | WidgetKind::DropIndicator(_)
@@ -502,6 +504,7 @@ fn gets_focus_ring(kind: &WidgetKind) -> bool {
             | WidgetKind::ListRow(_)
             | WidgetKind::Thumbnail(_)
             | WidgetKind::SelectionOutline(_)
+            | WidgetKind::GradientBar(_)
             | WidgetKind::Tooltip
             | WidgetKind::Dialog
             | WidgetKind::MenuSeparator
@@ -1130,6 +1133,9 @@ pub fn paint_widget(
         }
         // Whole or not at all: see `paint_icon`.
         WidgetKind::Icon(state) => paint_icon(state, full, bounds, theme, scale_factor),
+        WidgetKind::GradientBar(state) => {
+            paint_gradient_bar(tree, id, state, full, theme, scales, scale_factor)
+        }
         // A label paints no solids; `crate::text_runs` draws its text.
         // A thumbnail's picture is a vertex-coloured mesh
         // (`thumbnail_gradients`), so it paints no solids.
@@ -1382,6 +1388,164 @@ fn thumbnail_gradients(
     } else {
         vec![mesh]
     }
+}
+
+/// A gradient bar's gradient (task 113, `widgets::gradient_bar`): one
+/// vertex-coloured quad per span between stops
+/// (`widgets::gradient_bar_spans`), each cut to the visible rectangle with
+/// its end colours re-evaluated there, so a bar an ancestor clips shows
+/// exactly the part of the gradient that is visible. Disabled bars dim
+/// with `state.disabled_opacity`.
+fn gradient_bar_gradients(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    state: &crate::widgets::GradientBarState,
+    theme: &Theme,
+) -> Vec<ColorMesh> {
+    let Some(full) = tree.bounds(id) else {
+        return Vec::new();
+    };
+    let Some(visible) = clip_to_clipping_ancestors(tree, id, full) else {
+        return Vec::new();
+    };
+    let Some(g) = crate::widgets::gradient_bar_geometry(full, state) else {
+        return Vec::new();
+    };
+    let alpha = if state.is_disabled() {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let (vx0, vy0, vx1, vy1) = (
+        visible.x as f32,
+        visible.y as f32,
+        visible.x as f32 + visible.width as f32,
+        visible.y as f32 + visible.height as f32,
+    );
+    let (y0, y1) = (g.bar_top.max(vy0), (g.bar_top + g.bar_height).min(vy1));
+    if y1 <= y0 {
+        return Vec::new();
+    }
+    let mut mesh = ColorMesh::default();
+    for span in crate::widgets::gradient_bar_spans(state.stops()) {
+        let (x0, x1) = (g.x_of(span.from), g.x_of(span.to));
+        let (cx0, cx1) = (x0.max(vx0), x1.min(vx1));
+        if cx1 <= cx0 {
+            continue;
+        }
+        let at = |x: f32| {
+            let t = if x1 > x0 { (x - x0) / (x1 - x0) } else { 0.0 };
+            let [r, gr, b] = [0, 1, 2].map(|c| {
+                let (a, z) = (
+                    span.from_colour.get(c).copied().unwrap_or(0.0),
+                    span.to_colour.get(c).copied().unwrap_or(0.0),
+                );
+                a + (z - a) * t
+            });
+            [r, gr, b, alpha]
+        };
+        let Ok(base) = u32::try_from(mesh.vertices.len()) else {
+            break;
+        };
+        for (px, py, color) in [
+            (cx0, y0, at(cx0)),
+            (cx1, y0, at(cx1)),
+            (cx1, y1, at(cx1)),
+            (cx0, y1, at(cx0)),
+        ] {
+            mesh.vertices.push(aurora_vector::ColorVertex {
+                position: Point { x: px, y: py },
+                color,
+            });
+        }
+        mesh.indices
+            .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    if mesh.indices.is_empty() {
+        Vec::new()
+    } else {
+        vec![mesh]
+    }
+}
+
+/// The whole-pixel box around the logical rectangle `(x, y, w, h)`.
+fn enclosing_rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Rect {
+        x: x.floor() as i64,
+        y: y.floor() as i64,
+        width: ((x + w).ceil() - x.floor()).max(0.0) as u32,
+        height: ((y + h).ceil() - y.floor()).max(0.0) as u32,
+    }
+}
+
+/// A gradient bar's solids (task 113): a `border.control` outline round
+/// the bar and one marker per stop under it, filled with the stop's colour
+/// (content) and outlined like a colour swatch; the selected stop's marker
+/// is drawn last with an `accent.primary` outline of `size.indicator_width`
+/// (`accent.primary` is the selection token, gated at 3:1 against
+/// `surface.panel`). A part an ancestor's clip would cut is not drawn (a
+/// mesh is not scissored), like the colour picker's markers.
+#[allow(clippy::many_single_char_names)]
+fn paint_gradient_bar(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    state: &crate::widgets::GradientBarState,
+    full: Rect,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    let Some(g) = crate::widgets::gradient_bar_geometry(full, state) else {
+        return Ok(vec![]);
+    };
+    let alpha = if state.is_disabled() {
+        theme.state.disabled_opacity
+    } else {
+        1.0
+    };
+    let tolerance = tolerance_for_scale_factor(scale_factor);
+    let whole = |x: f32, y: f32, w: f32, h: f32| {
+        let bbox = enclosing_rect(x, y, w, h);
+        clip_to_clipping_ancestors(tree, id, bbox) == Some(bbox)
+    };
+    let mut paints = Vec::new();
+    if whole(g.left, g.bar_top, g.width, g.bar_height) {
+        let path = rounded_rect(g.left, g.bar_top, g.width, g.bar_height, 0.0);
+        if let Some(outline) = control_outline(&path, theme, alpha, scale_factor)? {
+            paints.push(outline);
+        }
+    }
+    let selected = state.selected();
+    let order = (0..state.stops().len())
+        .filter(|&i| i != selected)
+        .chain(std::iter::once(selected).filter(|&i| i < state.stops().len()));
+    for i in order {
+        let Some(stop) = state.stops().get(i) else {
+            continue;
+        };
+        let (x, y, w, h) = g.marker_rect(stop.position);
+        if !whole(x, y, w, h) {
+            continue;
+        }
+        let path = rounded_rect(x, y, w, h, scales.radius.sm as f32);
+        let mesh = fill(&path, tolerance).map_err(WidgetError::Paint)?;
+        let [r, gr, b] = stop.colour;
+        paints.push((mesh, [r, gr, b, alpha]));
+        if i == selected {
+            let width = scales.size.indicator_width as f32;
+            let half = width / 2.0;
+            if w > width && h > width {
+                let ring = rounded_rect(x + half, y + half, w - width, h - width, 0.0);
+                let mesh = stroke(&ring, width, tolerance).map_err(WidgetError::Paint)?;
+                let [ar, ag, ab] = theme.accent.primary.to_srgb_f32();
+                paints.push((mesh, [ar, ag, ab, alpha]));
+            }
+        } else if let Some(outline) = control_outline(&path, theme, alpha, scale_factor)? {
+            paints.push(outline);
+        }
+    }
+    Ok(paints)
 }
 
 /// `mesh` cut to the axis-aligned `rect` (Sutherland-Hodgman, one triangle

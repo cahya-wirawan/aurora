@@ -118,6 +118,10 @@ pub struct GalleryPanel {
     /// after any expand, never cache a child id across one.
     pub tree_rows: [WidgetId; 3],
     pub picker: WidgetId,
+    /// Gradient bars (task 113), in the left column under the tree: normal
+    /// (first stop selected), a marker selected, disabled, and many stops
+    /// (see [`GALLERY_GRADIENT_BAR_CAPTIONS`] for the captions over them).
+    pub gradient_bars: [WidgetId; 4],
     pub curve: WidgetId,
     /// The caption under [`Self::curve`] (0.161.0): a `Label` reading
     /// [`GALLERY_CURVE_CAPTION`], so the demo editor's static bell can't
@@ -155,6 +159,34 @@ fn px(token: u32) -> f32 {
 #[must_use]
 pub fn gallery_editor_size(scales: &Scales) -> f32 {
     GALLERY_EDITOR_ROWS * row_height(scales)
+}
+
+/// The captions over the gallery's four gradient bars (task 113), in
+/// [`GalleryPanel::gradient_bars`] order.
+pub const GALLERY_GRADIENT_BAR_CAPTIONS: [&str; 4] = [
+    "Gradient bar: normal",
+    "Gradient bar: marker selected",
+    "Gradient bar: disabled",
+    "Gradient bar: many stops",
+];
+
+/// The sample stops of the gallery's gradient bars: demo data.
+fn gallery_gradient_stops(many: bool) -> Vec<widgets::GradientBarStop> {
+    if many {
+        (0..9_u8)
+            .map(|i| {
+                let t = f32::from(i) / 8.0;
+                let hot = if i % 2 == 0 { 1.0 } else { 0.0 };
+                widgets::GradientBarStop::new(t, [t, hot, 1.0 - t])
+            })
+            .collect()
+    } else {
+        vec![
+            widgets::GradientBarStop::new(0.0, [0.1, 0.0, 0.3]),
+            widgets::GradientBarStop::new(0.45, [0.9, 0.2, 0.2]),
+            widgets::GradientBarStop::new(1.0, [1.0, 0.9, 0.5]),
+        ]
+    }
 }
 
 /// The caption under the gallery's curve editor (0.161.0).
@@ -348,6 +380,24 @@ fn build(
     let [first_row, second_row] = insert_tree_children(tree, parent_row, scales)?;
     widgets::set_tree_item_expanded(tree, parent_row, true)?;
 
+    let mut gradient_bars = [holder; 4];
+    for (i, (slot, caption)) in gradient_bars
+        .iter_mut()
+        .zip(GALLERY_GRADIENT_BAR_CAPTIONS)
+        .enumerate()
+    {
+        widgets::insert_label(tree, left, scales, caption)?;
+        *slot = widgets::insert_gradient_bar(
+            tree,
+            left,
+            scales,
+            caption,
+            &gallery_gradient_stops(i == 3),
+        )?;
+    }
+    widgets::select_gradient_stop(tree, gradient_bars[1], 1)?;
+    widgets::set_gradient_bar_disabled(tree, gradient_bars[2], true)?;
+
     let size = gallery_editor_size(scales);
     let picker =
         widgets::insert_color_picker(tree, right, scales, "Colour picker", SAMPLE_PICKER, size)?;
@@ -413,6 +463,7 @@ fn build(
         tree_view,
         tree_rows: [parent_row, first_row, second_row],
         picker,
+        gradient_bars,
         curve,
         curve_caption,
         toggle_buttons: [toggle_off, toggle_on, toggle_disabled],
@@ -1086,6 +1137,9 @@ mod tests {
         // more wrapped line (20 px) under each of the three captions.
         // 1060 since 0.224.0: three toning-tool icons more (41), one
         // more wrapped line (20 px) under each of the three captions.
+        // Unchanged by task 113: the four gradient bars (each a caption
+        // and a 36 px bar) went into the LEFT column, which stays shorter
+        // than the right one (`the_gradient_bars_fit_in_the_shorter_column`).
         assert!((min - 1060.0).abs() < f32::EPSILON, "{min}");
         let last_row_vs_body = |height: f32| {
             let (ws, g, _) = opened(height);
@@ -1115,6 +1169,59 @@ mod tests {
         assert!(row <= bottom, "{row} <= {bottom} at {min}");
         let (row, bottom) = last_row_vs_body(min - widgets::row_height(&scales) * 2.0);
         assert!(row > bottom, "clipped below the minimum: {row} > {bottom}");
+    }
+
+    /// Task 113: the four gradient bars sit in the left column, show the
+    /// states their captions name, carry unique accessible names, and end
+    /// above the bottom of the content at the pinned minimum height, so
+    /// they add nothing to it.
+    #[test]
+    fn the_gradient_bars_fit_in_the_shorter_column() {
+        let (ws, g, _) = opened(1200.0);
+        #[allow(clippy::indexing_slicing)]
+        let state = |i: usize| match widgets::gradient_bar_state(&ws.tree, g.gradient_bars[i]) {
+            Ok(s) => s.clone(),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(state(0).selected(), 0);
+        assert_eq!(state(1).selected(), 1);
+        assert!(state(2).is_disabled());
+        assert!(!state(0).is_disabled() && !state(1).is_disabled() && !state(3).is_disabled());
+        assert!(state(3).stops().len() > 8, "many stops");
+        let mut names: Vec<String> = Vec::new();
+        for (i, &bar) in g.gradient_bars.iter().enumerate() {
+            let Some(node) = ws.tree.accessibility(bar) else {
+                unreachable!("bar node")
+            };
+            assert_eq!(
+                node.label(),
+                super::GALLERY_GRADIENT_BAR_CAPTIONS.get(i).copied()
+            );
+            names.push(node.label().unwrap_or_default().to_owned());
+        }
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 4);
+        let (Some(content), Some(body), Some(last)) = (
+            gallery_content_height(&ws.tree, &g),
+            ws.tree.bounds(g.panel.body),
+            ws.tree.bounds(g.gradient_bars[3]),
+        ) else {
+            unreachable!()
+        };
+        assert!(
+            last.bottom() <= body.y + i64::from(content),
+            "the left column stays the shorter one: {} vs {}",
+            last.bottom(),
+            body.y + i64::from(content)
+        );
+        for &bar in &g.gradient_bars {
+            assert!(
+                ws.tree
+                    .bounds(bar)
+                    .is_some_and(|b| b.width > 0 && b.height > 0)
+            );
+        }
     }
 
     /// The same pin under the app's real, text-measured layout (0.140.0

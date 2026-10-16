@@ -141,6 +141,11 @@ pub(crate) fn is_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerO
     };
     match outcome {
         PointerOutcome::Action(Outcome::ValueChanged { id, .. }) => adjust.slider_of(*id).is_some(),
+        // The Gradient Map stop editor (task 113): a marker drag, a marker
+        // press (selection only) and the four stop buttons.
+        PointerOutcome::Action(Outcome::GradientBarChanged { bar })
+        | PointerOutcome::Changed(bar) => *bar == adjust.gradient_bar,
+        PointerOutcome::Action(Outcome::Activated(id)) => gradient_button(adjust, *id).is_some(),
         PointerOutcome::Action(Outcome::Toggled { id, .. }) => {
             *id == adjust.preserve
                 || *id == adjust.tint
@@ -162,7 +167,30 @@ pub(crate) fn is_outcome(controls: aurora_ui::CurvesControls, outcome: &PointerO
     }
 }
 
-/// Whether the pointer capture is on one of the editors' sliders.
+/// What a Gradient Map stop button does (task 113).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GradientButton {
+    Previous,
+    Next,
+    Add,
+    Delete,
+}
+
+/// The stop button `id` is, if any.
+#[allow(clippy::large_types_passed_by_value)] // `AdjustControls` is `Copy`
+fn gradient_button(adjust: aurora_ui::AdjustControls, id: WidgetId) -> Option<GradientButton> {
+    [
+        (adjust.gradient_prev, GradientButton::Previous),
+        (adjust.gradient_next, GradientButton::Next),
+        (adjust.gradient_add, GradientButton::Add),
+        (adjust.gradient_delete, GradientButton::Delete),
+    ]
+    .into_iter()
+    .find_map(|(button, which)| (button == id).then_some(which))
+}
+
+/// Whether the pointer capture is on one of the editors' sliders or the
+/// Gradient Map bar's marker.
 #[allow(clippy::large_types_passed_by_value)] // `CurvesControls` is `Copy` and 448 bytes
 pub(crate) fn slider_captured(
     controls: Option<aurora_ui::CurvesControls>,
@@ -171,7 +199,7 @@ pub(crate) fn slider_captured(
     controls
         .and_then(|controls| controls.adjust)
         .zip(captured)
-        .is_some_and(|(adjust, id)| adjust.slider_of(id).is_some())
+        .is_some_and(|(adjust, id)| adjust.slider_of(id).is_some() || id == adjust.gradient_bar)
 }
 
 /// Records one edit as a structural step.
@@ -302,6 +330,89 @@ pub(crate) fn apply_outcome(
             };
             let on = *state == accesskit::Toggled::True;
             (Adjustment::GradientMap(gradient.with_reverse(on)), None)
+        }
+        aurora_widgets::ActionOutcome::Activated(id) => {
+            let Some(button) = gradient_button(adjust, *id) else {
+                return CompositeInvalidation::None;
+            };
+            let Some(gradient) = current.gradient_map() else {
+                return CompositeInvalidation::None;
+            };
+            let tree = &mut cx.workspace.tree;
+            let selected = aurora_ui::adjust_gradient_selected(tree, adjust);
+            let count = gradient.stops().len();
+            // Selecting is widget state: no undo step, never dirty.
+            let select = |tree: &mut aurora_widgets::WidgetTree<_>, to: usize| {
+                if let Err(err) =
+                    aurora_widgets::widgets::select_gradient_stop(tree, adjust.gradient_bar, to)
+                {
+                    tracing::warn!(?err, "a Gradient Map stop could not be selected");
+                }
+            };
+            let (next, reselect) = match button {
+                GradientButton::Previous => {
+                    if selected > 0 {
+                        select(tree, selected - 1);
+                    }
+                    return CompositeInvalidation::None;
+                }
+                GradientButton::Next => {
+                    if selected + 1 < count {
+                        select(tree, selected + 1);
+                    }
+                    return CompositeInvalidation::None;
+                }
+                GradientButton::Add => {
+                    // Between the selected stop and the one after it; for the
+                    // last stop, between it and the one before.
+                    let after = if selected + 1 < count {
+                        selected
+                    } else {
+                        count.saturating_sub(2)
+                    };
+                    match gradient.insert_stop_after(after) {
+                        Ok((next, at)) => (next, at),
+                        Err(_) => return CompositeInvalidation::None,
+                    }
+                }
+                GradientButton::Delete => match gradient.remove_stop(selected) {
+                    Ok(next) => (next, selected.saturating_sub(1)),
+                    Err(_) => return CompositeInvalidation::None,
+                },
+            };
+            // The bar takes the new stops first so the selection can move
+            // onto a stop it did not have.
+            let stops: Vec<_> = next
+                .stops()
+                .iter()
+                .map(|s| aurora_widgets::widgets::GradientBarStop::new(s.position, s.colour))
+                .collect();
+            if let Err(err) =
+                aurora_widgets::widgets::set_gradient_bar_stops(tree, adjust.gradient_bar, &stops)
+            {
+                tracing::warn!(?err, "the Gradient Map bar could not take the new stops");
+            }
+            select(tree, reselect);
+            (Adjustment::GradientMap(next), None)
+        }
+        aurora_widgets::ActionOutcome::GradientBarChanged { bar }
+            if *bar == adjust.gradient_bar =>
+        {
+            let Some(gradient) = current.gradient_map() else {
+                return CompositeInvalidation::None;
+            };
+            let Ok(state) = aurora_widgets::widgets::gradient_bar_state(&cx.workspace.tree, *bar)
+            else {
+                return CompositeInvalidation::None;
+            };
+            let selected = state.selected();
+            let Some(position) = state.stops().get(selected).map(|s| s.position) else {
+                return CompositeInvalidation::None;
+            };
+            let Ok(next) = gradient.with_stop_position(selected, position) else {
+                return CompositeInvalidation::None;
+            };
+            (Adjustment::GradientMap(next), Some(*bar))
         }
         aurora_widgets::ActionOutcome::ValueChanged { id, value } => {
             let Some(slider) = adjust.slider_of(*id) else {

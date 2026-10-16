@@ -55,7 +55,7 @@ use taffy::style_helpers::length;
 use taffy::{Display, FlexDirection, Size, Style};
 
 /// How many sliders the editors hold.
-pub const ADJUST_SLIDER_COUNT: usize = 38;
+pub const ADJUST_SLIDER_COUNT: usize = 36;
 /// How many editor groups there are.
 pub const ADJUST_KIND_COUNT: usize = 12;
 
@@ -209,14 +209,12 @@ pub enum AdjustSlider {
     SelectiveYellow,
     /// Its black slider.
     SelectiveBlack,
-    /// A two-stop Gradient Map's start colour, `0..=255` per channel.
-    GradientStartRed,
-    GradientStartGreen,
-    GradientStartBlue,
-    /// Its end colour.
-    GradientEndRed,
-    GradientEndGreen,
-    GradientEndBlue,
+    /// The selected Gradient Map stop's position, `0..=100` percent.
+    GradientPosition,
+    /// The selected stop's colour, `0..=255` per channel.
+    GradientRed,
+    GradientGreen,
+    GradientBlue,
 }
 
 impl AdjustSlider {
@@ -254,12 +252,10 @@ impl AdjustSlider {
         Self::SelectiveMagenta,
         Self::SelectiveYellow,
         Self::SelectiveBlack,
-        Self::GradientStartRed,
-        Self::GradientStartGreen,
-        Self::GradientStartBlue,
-        Self::GradientEndRed,
-        Self::GradientEndGreen,
-        Self::GradientEndBlue,
+        Self::GradientPosition,
+        Self::GradientRed,
+        Self::GradientGreen,
+        Self::GradientBlue,
     ];
 
     /// Position in [`Self::ALL`].
@@ -298,12 +294,10 @@ impl AdjustSlider {
             Self::SelectiveMagenta => 29,
             Self::SelectiveYellow => 30,
             Self::SelectiveBlack => 31,
-            Self::GradientStartRed => 32,
-            Self::GradientStartGreen => 33,
-            Self::GradientStartBlue => 34,
-            Self::GradientEndRed => 35,
-            Self::GradientEndGreen => 36,
-            Self::GradientEndBlue => 37,
+            Self::GradientPosition => 32,
+            Self::GradientRed => 33,
+            Self::GradientGreen => 34,
+            Self::GradientBlue => 35,
         }
     }
 
@@ -335,12 +329,10 @@ impl AdjustSlider {
             | Self::SelectiveMagenta
             | Self::SelectiveYellow
             | Self::SelectiveBlack => AdjustKind::SelectiveColor,
-            Self::GradientStartRed
-            | Self::GradientStartGreen
-            | Self::GradientStartBlue
-            | Self::GradientEndRed
-            | Self::GradientEndGreen
-            | Self::GradientEndBlue => AdjustKind::GradientMap,
+            Self::GradientPosition
+            | Self::GradientRed
+            | Self::GradientGreen
+            | Self::GradientBlue => AdjustKind::GradientMap,
         }
     }
 
@@ -404,18 +396,15 @@ impl AdjustSlider {
         }
     }
 
-    /// The Gradient Map slider's `(end, channel)`: `end` is `false` for the
-    /// start colour and `true` for the end colour, `channel` `0` red, `1`
-    /// green, `2` blue; `None` for every other slider.
+    /// The colour channel of the selected stop a Gradient Map colour slider
+    /// edits: `0` red, `1` green, `2` blue; `None` for every other slider
+    /// (the position slider included).
     #[must_use]
-    pub const fn gradient_slot(self) -> Option<(bool, usize)> {
+    pub const fn gradient_channel(self) -> Option<usize> {
         match self {
-            Self::GradientStartRed => Some((false, 0)),
-            Self::GradientStartGreen => Some((false, 1)),
-            Self::GradientStartBlue => Some((false, 2)),
-            Self::GradientEndRed => Some((true, 0)),
-            Self::GradientEndGreen => Some((true, 1)),
-            Self::GradientEndBlue => Some((true, 2)),
+            Self::GradientRed => Some(0),
+            Self::GradientGreen => Some(1),
+            Self::GradientBlue => Some(2),
             _ => None,
         }
     }
@@ -456,12 +445,10 @@ impl AdjustSlider {
             Self::SelectiveMagenta => "Selective color magenta",
             Self::SelectiveYellow => "Selective color yellow",
             Self::SelectiveBlack => "Selective color black",
-            Self::GradientStartRed => "Gradient map start red",
-            Self::GradientStartGreen => "Gradient map start green",
-            Self::GradientStartBlue => "Gradient map start blue",
-            Self::GradientEndRed => "Gradient map end red",
-            Self::GradientEndGreen => "Gradient map end green",
-            Self::GradientEndBlue => "Gradient map end blue",
+            Self::GradientPosition => "Gradient stop position",
+            Self::GradientRed => "Gradient stop red",
+            Self::GradientGreen => "Gradient stop green",
+            Self::GradientBlue => "Gradient stop blue",
         }
     }
 
@@ -498,12 +485,10 @@ impl AdjustSlider {
             Self::SelectiveMagenta => "Magenta",
             Self::SelectiveYellow => "Yellow",
             Self::SelectiveBlack => "Black",
-            Self::GradientStartRed => "Start red",
-            Self::GradientStartGreen => "Start green",
-            Self::GradientStartBlue => "Start blue",
-            Self::GradientEndRed => "End red",
-            Self::GradientEndGreen => "End green",
-            Self::GradientEndBlue => "End blue",
+            Self::GradientPosition => "Position",
+            Self::GradientRed => "Stop red",
+            Self::GradientGreen => "Stop green",
+            Self::GradientBlue => "Stop blue",
         }
     }
 
@@ -519,12 +504,9 @@ impl AdjustSlider {
             Self::Red
             | Self::Green
             | Self::Blue
-            | Self::GradientStartRed
-            | Self::GradientStartGreen
-            | Self::GradientStartBlue
-            | Self::GradientEndRed
-            | Self::GradientEndGreen
-            | Self::GradientEndBlue => (0.0, 255.0),
+            | Self::GradientRed
+            | Self::GradientGreen
+            | Self::GradientBlue => (0.0, 255.0),
             Self::BwReds
             | Self::BwYellows
             | Self::BwGreens
@@ -532,7 +514,7 @@ impl AdjustSlider {
             | Self::BwBlues
             | Self::BwMagentas => (BLACK_WHITE_MIN as f64, BLACK_WHITE_MAX as f64),
             Self::TintHue => (0.0, 360.0),
-            Self::TintSaturation => (0.0, 100.0),
+            Self::TintSaturation | Self::GradientPosition => (0.0, 100.0),
             Self::BalanceCyanRed | Self::BalanceMagentaGreen | Self::BalanceYellowBlue => {
                 (-(COLOR_BALANCE_MAX as f64), COLOR_BALANCE_MAX as f64)
             }
@@ -561,6 +543,7 @@ impl AdjustSlider {
         match self {
             Self::Exposure | Self::Gamma => 2,
             Self::Offset => 3,
+            Self::GradientPosition => 1,
             _ => 0,
         }
     }
@@ -576,7 +559,6 @@ impl AdjustSlider {
             Self::TintSaturation => f64::from(DEFAULT_TINT_SATURATION),
             Self::ThresholdLevel => f64::from(THRESHOLD_DEFAULT),
             Self::PosterizeLevels => f64::from(POSTERIZE_DEFAULT),
-            Self::GradientEndRed | Self::GradientEndGreen | Self::GradientEndBlue => 255.0,
             other => other
                 .bw_slot()
                 .and_then(|slot| BLACK_WHITE_DEFAULTS.get(slot))
@@ -589,7 +571,9 @@ impl AdjustSlider {
     #[must_use]
     pub fn readout(self, value: f64) -> String {
         let places = self.decimals();
-        if matches!(self, Self::Exposure | Self::Brightness | Self::Contrast)
+        if self == Self::GradientPosition {
+            format!("{}: {value:.places$} %", self.short_label())
+        } else if matches!(self, Self::Exposure | Self::Brightness | Self::Contrast)
             || self.balance_slot().is_some()
             || self.mixer_slot().is_some()
             || self.selective_slot().is_some()
@@ -667,19 +651,17 @@ impl AdjustSlider {
                 let sliders = adjustment.selective_color()?.range(range)?;
                 sliders.get(self.selective_slot()?).copied().map(f64::from)
             }
-            Self::GradientStartRed
-            | Self::GradientStartGreen
-            | Self::GradientStartBlue
-            | Self::GradientEndRed
-            | Self::GradientEndGreen
-            | Self::GradientEndBlue => {
-                // Only a two-stop gradient has a start and an end colour to
-                // edit; any other shows its summary and nothing here.
-                let p = adjustment.gradient_map().filter(|p| p.is_two_stop())?;
-                let (end, channel) = self.gradient_slot()?;
-                let stop = p.stops().get(usize::from(end))?;
+            Self::GradientPosition => {
+                // `range` is the selected stop (the gradient bar's selection).
+                let stop = adjustment.gradient_map()?.stops().get(range)?;
+                // A tenth of a percent, the bar's own grid: the f32 position
+                // times 100 is not exactly representable.
+                Some((f64::from(stop.position) * 1000.0).round() / 10.0)
+            }
+            Self::GradientRed | Self::GradientGreen | Self::GradientBlue => {
+                let stop = adjustment.gradient_map()?.stops().get(range)?;
                 stop.colour
-                    .get(channel)
+                    .get(self.gradient_channel()?)
                     .map(|c| f64::from((c * 255.0).round()))
             }
         }
@@ -815,18 +797,16 @@ impl AdjustSlider {
                 .with_slider(range, self.selective_slot()?, v)
                 .ok()
                 .map(Adjustment::SelectiveColor),
-            Self::GradientStartRed
-            | Self::GradientStartGreen
-            | Self::GradientStartBlue
-            | Self::GradientEndRed
-            | Self::GradientEndGreen
-            | Self::GradientEndBlue => {
-                let p = adjustment.gradient_map().filter(|p| p.is_two_stop())?;
-                let (end, channel) = self.gradient_slot()?;
-                p.with_stop_channel(usize::from(end), channel, v / 255.0)
-                    .ok()
-                    .map(Adjustment::GradientMap)
-            }
+            Self::GradientPosition => adjustment
+                .gradient_map()?
+                .with_stop_position(range, v / 100.0)
+                .ok()
+                .map(Adjustment::GradientMap),
+            Self::GradientRed | Self::GradientGreen | Self::GradientBlue => adjustment
+                .gradient_map()?
+                .with_stop_channel(range, self.gradient_channel()?, v / 255.0)
+                .ok()
+                .map(Adjustment::GradientMap),
         }
     }
 }
@@ -897,6 +877,15 @@ pub struct AdjustControls {
     pub gradient_summary: WidgetId,
     /// Gradient Map's "Reverse" checkbox.
     pub gradient_reverse: WidgetId,
+    /// Gradient Map's gradient preview bar with a marker per stop (task 113).
+    pub gradient_bar: WidgetId,
+    /// Its "Previous Stop" and "Next Stop" buttons (select a stop from the
+    /// keyboard).
+    pub gradient_prev: WidgetId,
+    pub gradient_next: WidgetId,
+    /// Its "Add Stop" and "Delete Stop" buttons.
+    pub gradient_add: WidgetId,
+    pub gradient_delete: WidgetId,
 }
 
 impl AdjustControls {
@@ -966,6 +955,8 @@ pub fn insert_adjust_controls(
         let mut selective_absolute = None;
         let mut gradient_summary = None;
         let mut gradient_reverse = None;
+        let mut gradient_widgets = None;
+        let mut gradient_edit_buttons = None;
         let invert_note = widgets::insert_label(
             tree,
             group_of(AdjustKind::Invert)?,
@@ -975,13 +966,27 @@ pub fn insert_adjust_controls(
         for slider in AdjustSlider::ALL {
             let group = group_of(slider.kind())?;
             // Controls that sit before a slider in its group.
-            if slider == AdjustSlider::GradientStartRed {
+            if slider == AdjustSlider::GradientPosition {
+                let bar = widgets::insert_gradient_bar(
+                    tree,
+                    group,
+                    scales,
+                    GRADIENT_PREVIEW_LABEL,
+                    &[
+                        widgets::GradientBarStop::new(0.0, [0.0; 3]),
+                        widgets::GradientBarStop::new(1.0, [1.0; 3]),
+                    ],
+                )?;
+                let row = widgets::insert_container(tree, group, button_row_style(scales))?;
+                let prev = widgets::insert_button(tree, row, scales, GRADIENT_PREVIOUS_LABEL)?;
+                let next = widgets::insert_button(tree, row, scales, GRADIENT_NEXT_LABEL)?;
                 gradient_summary = Some(widgets::insert_label(
                     tree,
                     group,
                     scales,
-                    "2 colour stops".to_owned(),
+                    gradient_summary_text(0, 2),
                 )?);
+                gradient_widgets = Some((bar, prev, next));
             }
             if slider == AdjustSlider::TintHue {
                 tint = Some(widgets::insert_checkbox(tree, group, scales, "Tint")?);
@@ -1094,7 +1099,11 @@ pub fn insert_adjust_controls(
             if slider == AdjustSlider::MixerConstant {
                 mixer_mono = Some(widgets::insert_checkbox(tree, group, scales, "Monochrome")?);
             }
-            if slider == AdjustSlider::GradientEndBlue {
+            if slider == AdjustSlider::GradientBlue {
+                let row = widgets::insert_container(tree, group, button_row_style(scales))?;
+                let add = widgets::insert_button(tree, row, scales, GRADIENT_ADD_LABEL)?;
+                let delete = widgets::insert_button(tree, row, scales, GRADIENT_DELETE_LABEL)?;
+                gradient_edit_buttons = Some((add, delete));
                 gradient_reverse = Some(widgets::insert_checkbox(tree, group, scales, "Reverse")?);
             }
             if slider == AdjustSlider::SelectiveBlack {
@@ -1130,6 +1139,8 @@ pub fn insert_adjust_controls(
             Some(selective_absolute),
             Some(gradient_summary),
             Some(gradient_reverse),
+            Some((gradient_bar, gradient_prev, gradient_next)),
+            Some((gradient_add, gradient_delete)),
             Ok(sliders),
             Ok(readouts),
             Ok(groups),
@@ -1146,6 +1157,8 @@ pub fn insert_adjust_controls(
             selective_absolute,
             gradient_summary,
             gradient_reverse,
+            gradient_widgets,
+            gradient_edit_buttons,
             <[WidgetId; ADJUST_SLIDER_COUNT]>::try_from(sliders),
             <[WidgetId; ADJUST_SLIDER_COUNT]>::try_from(readouts),
             <[WidgetId; ADJUST_KIND_COUNT]>::try_from(groups),
@@ -1172,14 +1185,43 @@ pub fn insert_adjust_controls(
             selective_absolute,
             gradient_summary,
             gradient_reverse,
+            gradient_bar,
+            gradient_prev,
+            gradient_next,
+            gradient_add,
+            gradient_delete,
         };
-        set_shown(tree, controls, None, false, false, false)?;
+        set_shown(tree, controls, None, false, false)?;
         Ok(controls)
     })();
     if built.is_err() {
         let _ = tree.remove(root);
     }
     built
+}
+
+/// The Gradient Map editor's accessible names (task 113). The visible
+/// button text is the name, so each is unique among the editors.
+pub const GRADIENT_PREVIEW_LABEL: &str = "Gradient preview";
+pub const GRADIENT_PREVIOUS_LABEL: &str = "Previous Stop";
+pub const GRADIENT_NEXT_LABEL: &str = "Next Stop";
+pub const GRADIENT_ADD_LABEL: &str = "Add Stop";
+pub const GRADIENT_DELETE_LABEL: &str = "Delete Stop";
+
+/// A row of buttons: side by side with `spacing.xs` between them.
+fn button_row_style(scales: &Scales) -> Style {
+    #[allow(clippy::cast_precision_loss)]
+    let gap = length(scales.spacing.xs as f32);
+    Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        flex_shrink: 0.0,
+        gap: Size {
+            width: gap,
+            height: gap,
+        },
+        ..Default::default()
+    }
 }
 
 fn set_display(
@@ -1231,7 +1273,6 @@ fn set_shown(
     kind: Option<AdjustKind>,
     tint_on: bool,
     mixer_mono: bool,
-    gradient_colours: bool,
 ) -> Result<bool, WidgetError> {
     let selective_group = widgets::tab_bar_state(tree, controls.selective_group)
         .map_or(0, aurora_widgets::widgets::TabBarState::selected);
@@ -1261,9 +1302,7 @@ fn set_shown(
         ) else {
             continue;
         };
-        let live = kind == Some(slider.kind())
-            && (!slider.is_tint() || tint_on)
-            && (slider.gradient_slot().is_none() || gradient_colours);
+        let live = kind == Some(slider.kind()) && (!slider.is_tint() || tint_on);
         let disabled = match tree.payload(id) {
             Some(WidgetKind::Slider(state)) => state.disabled,
             Some(_) => return Err(WidgetError::WrongWidgetKind(id)),
@@ -1313,6 +1352,37 @@ fn set_shown(
         controls.gradient_summary,
         kind != Some(AdjustKind::GradientMap),
     )?;
+    // The gradient bar and its buttons: the bar is live for the kind, each
+    // button by what the selected stop and the stop count allow.
+    let gradient_live = kind == Some(AdjustKind::GradientMap);
+    let (count, selected) = widgets::gradient_bar_state(tree, controls.gradient_bar)
+        .map(|state| (state.stops().len(), state.selected()))?;
+    changed |= widgets::set_gradient_bar_disabled(tree, controls.gradient_bar, !gradient_live)?
+        == widgets::GradientBarOutcome::Changed;
+    for (button, live) in [
+        (controls.gradient_prev, gradient_live && selected > 0),
+        (
+            controls.gradient_next,
+            gradient_live && selected + 1 < count,
+        ),
+        (
+            controls.gradient_add,
+            gradient_live && count < aurora_core::GRADIENT_MAP_MAX_STOPS,
+        ),
+        (
+            controls.gradient_delete,
+            gradient_live && count > aurora_core::GRADIENT_MAP_MIN_STOPS,
+        ),
+    ] {
+        let disabled = matches!(
+            tree.payload(button),
+            Some(WidgetKind::Button(state)) if state.disabled
+        );
+        if disabled == live {
+            widgets::set_button_disabled(tree, button, !live)?;
+            changed = true;
+        }
+    }
     // The selectors are widget state only; each is live for its own kind
     // (the Mixer's output selector is idle while Monochrome is on: the Gray
     // mix is the first row).
@@ -1431,20 +1501,34 @@ pub fn adjust_gradient_reverse_checked(
     checkbox_checked(tree, controls.gradient_reverse)
 }
 
-/// The summary row's text for a gradient: its stop count, and whether the
-/// colours can be edited here.
+/// The summary row's text for a gradient: the selected stop (`selected` is
+/// 0-based) and the stop count, `"Stop 2 of 5"`.
 #[must_use]
-pub fn gradient_summary_text(stops: usize) -> String {
-    match stops {
-        2 => "2 colour stops".to_owned(),
-        n => format!("{n} colour stops (only two-stop gradients are editable here)"),
-    }
+pub fn gradient_summary_text(selected: usize, count: usize) -> String {
+    format!("Stop {} of {count}", selected.saturating_add(1))
+}
+
+/// The selected stop of Gradient Map's gradient bar (`0` if it cannot be
+/// read): widget state, not document state.
+#[must_use]
+pub fn adjust_gradient_selected(tree: &WidgetTree<WidgetKind>, controls: AdjustControls) -> usize {
+    widgets::gradient_bar_state(tree, controls.gradient_bar)
+        .map_or(0, aurora_widgets::widgets::GradientBarState::selected)
+}
+
+/// The stops a gradient shows on the bar.
+fn bar_stops(gradient: &aurora_core::GradientMapParams) -> Vec<widgets::GradientBarStop> {
+    gradient
+        .stops()
+        .iter()
+        .map(|s| widgets::GradientBarStop::new(s.position, s.colour))
+        .collect()
 }
 
 /// The tab of the selector that belongs to a slider of `kind`, the `range`
 /// [`AdjustSlider::value_of`] and [`AdjustSlider::with_value`] take: Color
-/// Balance's range, Channel Mixer's output, Selective Color's range; `0` for
-/// every other kind.
+/// Balance's range, Channel Mixer's output, Selective Color's range, Gradient
+/// Map's selected stop; `0` for every other kind.
 #[must_use]
 pub fn adjust_tab(
     tree: &WidgetTree<WidgetKind>,
@@ -1454,6 +1538,7 @@ pub fn adjust_tab(
     let bar = match kind {
         AdjustKind::ColorBalance => controls.balance_range,
         AdjustKind::ChannelMixer => controls.mixer_output,
+        AdjustKind::GradientMap => return adjust_gradient_selected(tree, controls),
         AdjustKind::SelectiveColor => {
             // Group 0 holds the six colour ranges (the second bar picks
             // one); groups 1 to 3 are Whites, Neutrals and Blacks.
@@ -1531,15 +1616,20 @@ pub fn sync_adjust_controls(
     captured: Option<WidgetId>,
 ) -> Result<bool, WidgetError> {
     let Some(adjustment) = active.and_then(|id| adjust_of(layers, id)) else {
-        return set_shown(tree, controls, None, false, false, false);
+        return set_shown(tree, controls, None, false, false);
     };
     let kind = AdjustKind::of(adjustment);
     let tint_on = adjustment.black_white().is_some_and(|p| p.tint());
     let mixer_mono = adjustment.channel_mixer().is_some_and(|p| p.monochrome());
-    let gradient_colours = adjustment
-        .gradient_map()
-        .is_some_and(aurora_core::GradientMapParams::is_two_stop);
-    let mut changed = set_shown(tree, controls, kind, tint_on, mixer_mono, gradient_colours)?;
+    // The bar mirrors the gradient first: `set_shown` reads its stop count
+    // and selection to decide which buttons are live.
+    let mut changed = false;
+    if let Some(gradient) = adjustment.gradient_map() {
+        changed |=
+            widgets::set_gradient_bar_stops(tree, controls.gradient_bar, &bar_stops(gradient))?
+                == widgets::GradientBarOutcome::Changed;
+    }
+    changed |= set_shown(tree, controls, kind, tint_on, mixer_mono)?;
     changed |= widgets::set_label_disabled(
         tree,
         controls.exposure_profile_note,
@@ -1572,7 +1662,10 @@ pub fn sync_adjust_controls(
         changed |= widgets::set_label_text(
             tree,
             controls.gradient_summary,
-            &gradient_summary_text(gradient.stops().len()),
+            &gradient_summary_text(
+                adjust_gradient_selected(tree, controls),
+                gradient.stops().len(),
+            ),
         )?;
     }
     for slider in AdjustSlider::ALL
@@ -2636,7 +2729,7 @@ mod tests {
         assert_eq!(adjust_controls_shown(&ws.tree, controls), None);
     }
 
-    // ---- 0.248.0: the Gradient Map editor ----
+    // ---- 0.248.0 / task 113: the Gradient Map stop editor ----
 
     fn gradient(stops: &[(f32, [f32; 3])], reverse: bool) -> Adjustment {
         let stops = stops
@@ -2649,6 +2742,17 @@ mod tests {
         }
     }
 
+    /// `count` evenly spaced stops, the i-th grey `i / (count - 1)`.
+    fn ramp(count: usize) -> Adjustment {
+        let stops: Vec<(f32, [f32; 3])> = (0..count)
+            .map(|i| {
+                let t = i as f32 / (count - 1) as f32;
+                (t, [t, 1.0 - t, 0.5])
+            })
+            .collect();
+        gradient(&stops, false)
+    }
+
     fn label_text(ws: &crate::Workspace, id: aurora_widgets::WidgetId) -> String {
         match ws.tree.payload(id) {
             Some(WidgetKind::Label(label)) => label.text.clone(),
@@ -2656,104 +2760,382 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_two_stop_gradient_edits_its_start_and_end_colours() {
+    fn button_disabled(ws: &crate::Workspace, id: aurora_widgets::WidgetId) -> bool {
+        match ws.tree.payload(id) {
+            Some(WidgetKind::Button(state)) => state.disabled,
+            other => unreachable!("{other:?}"),
+        }
+    }
+
+    struct Rig {
+        ws: crate::Workspace,
+        controls: super::AdjustControls,
+        layers: LayerTree,
+    }
+
+    fn rig() -> Rig {
         let scales = scales();
         let mut ws = crate::build_workspace(&scales);
         let controls = match insert_adjust_controls(&mut ws.tree, ws.properties.root, &scales) {
             Ok(c) => c,
             Err(err) => unreachable!("{err:?}"),
         };
-        let mut layers = LayerTree::new();
-        let id = add(
-            &mut layers,
-            "G",
-            gradient(&[(0.0, [1.0, 0.0, 0.0]), (1.0, [0.0, 0.2, 1.0])], true),
-        );
-        let _ = show(&mut ws, controls, &layers, Some(id));
-        assert_eq!(
-            adjust_controls_shown(&ws.tree, controls),
-            Some(AdjustKind::GradientMap)
-        );
-        let at = |ws: &crate::Workspace, s: S| slider_state(&ws.tree, controls.sliders[s.index()]);
-        assert_eq!(at(&ws, S::GradientStartRed), (255.0, false));
-        assert_eq!(at(&ws, S::GradientStartGreen), (0.0, false));
-        assert_eq!(at(&ws, S::GradientEndGreen), (51.0, false));
-        assert_eq!(at(&ws, S::GradientEndBlue), (255.0, false));
-        assert!(super::adjust_gradient_reverse_checked(&ws.tree, controls));
-        assert_eq!(label_text(&ws, controls.gradient_summary), "2 colour stops");
-        assert_eq!(
-            label_text(&ws, controls.readouts[S::GradientEndRed.index()]),
-            "End red: 0"
-        );
-        // An edit changes only its channel of its stop and keeps the rest.
-        let a = layers.adjustment(id).cloned().unwrap_or(Adjustment::Invert);
-        let edited = S::GradientStartGreen
-            .with_value(&a, 0, 128.0)
-            .and_then(|e| e.gradient_map().cloned());
-        let Some(edited) = edited else {
-            unreachable!("two-stop edit")
-        };
-        assert_eq!(edited.stops()[0].colour, [1.0, 128.0 / 255.0, 0.0]);
-        assert_eq!(edited.stops()[1].colour, [0.0, 0.2, 1.0]);
-        assert!(edited.reverse());
-        // The other sliders of other kinds give nothing for this layer.
-        assert!(S::Red.with_value(&a, 0, 5.0).is_none());
+        Rig {
+            ws,
+            controls,
+            layers: LayerTree::new(),
+        }
+    }
+
+    impl Rig {
+        fn show(&mut self, a: Adjustment) -> aurora_doc::LayerId {
+            let id = add(&mut self.layers, "G", a);
+            let _ = show(&mut self.ws, self.controls, &self.layers, Some(id));
+            id
+        }
+        fn resync(&mut self, id: aurora_doc::LayerId) {
+            let _ = show(&mut self.ws, self.controls, &self.layers, Some(id));
+        }
+        fn select(&mut self, stop: usize) {
+            let r =
+                widgets::select_gradient_stop(&mut self.ws.tree, self.controls.gradient_bar, stop);
+            assert!(r.is_ok(), "{r:?}");
+        }
+        fn slider(&self, s: S) -> (f64, bool) {
+            slider_state(&self.ws.tree, self.controls.sliders[s.index()])
+        }
+        fn readout(&self, s: S) -> String {
+            label_text(&self.ws, self.controls.readouts[s.index()])
+        }
+        fn bar(&self) -> aurora_widgets::widgets::GradientBarState {
+            match widgets::gradient_bar_state(&self.ws.tree, self.controls.gradient_bar) {
+                Ok(state) => state.clone(),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
     }
 
     #[test]
-    fn a_gradient_with_more_stops_shows_a_summary_and_no_editable_colours() {
-        let scales = scales();
-        let mut ws = crate::build_workspace(&scales);
-        let controls = match insert_adjust_controls(&mut ws.tree, ws.properties.root, &scales) {
-            Ok(c) => c,
-            Err(err) => unreachable!("{err:?}"),
-        };
-        let mut layers = LayerTree::new();
-        let three = gradient(
-            &[(0.0, [0.0; 3]), (0.5, [1.0, 0.0, 0.0]), (1.0, [1.0; 3])],
-            false,
+    fn the_editor_shows_the_bar_the_selected_stop_and_its_sliders() {
+        let mut r = rig();
+        let g = gradient(
+            &[
+                (0.0, [1.0, 0.0, 0.0]),
+                (0.4, [0.0, 0.2, 1.0]),
+                (1.0, [1.0; 3]),
+            ],
+            true,
         );
-        let id = add(&mut layers, "G3", three.clone());
-        let _ = show(&mut ws, controls, &layers, Some(id));
+        r.show(g);
         assert_eq!(
-            adjust_controls_shown(&ws.tree, controls),
+            adjust_controls_shown(&r.ws.tree, r.controls),
             Some(AdjustKind::GradientMap)
         );
-        assert!(label_text(&ws, controls.gradient_summary).starts_with("3 colour stops"));
-        for s in [
-            S::GradientStartRed,
-            S::GradientStartGreen,
-            S::GradientStartBlue,
-            S::GradientEndRed,
-            S::GradientEndGreen,
-            S::GradientEndBlue,
-        ] {
-            assert!(
-                slider_state(&ws.tree, controls.sliders[s.index()]).1,
-                "{s:?} is disabled for a three-stop gradient"
-            );
-            assert!(s.value_of(&three, 0).is_none());
-            assert!(s.with_value(&three, 0, 10.0).is_none());
-        }
-        assert!(!super::adjust_gradient_reverse_checked(&ws.tree, controls));
-        // Reverse stays live, and back on a two-stop layer the sliders wake.
-        let two = add(
-            &mut layers,
-            "G2",
-            Adjustment::GradientMap(aurora_core::GradientMapParams::black_to_white()),
-        );
-        let _ = show(&mut ws, controls, &layers, Some(two));
-        assert!(!slider_state(&ws.tree, controls.sliders[S::GradientEndRed.index()]).1);
+        let bar = r.bar();
+        assert_eq!(bar.stops().len(), 3);
+        assert_eq!(bar.stops()[1].position, 0.4);
+        assert_eq!(bar.stops()[1].colour, [0.0, 0.2, 1.0]);
+        assert!(!bar.is_disabled());
         assert_eq!(
-            slider_state(&ws.tree, controls.sliders[S::GradientEndRed.index()]).0,
-            255.0
+            label_text(&r.ws, r.controls.gradient_summary),
+            "Stop 1 of 3"
         );
-        // Hidden for another kind.
-        let _ = show(&mut ws, controls, &layers, None);
-        assert_eq!(adjust_controls_shown(&ws.tree, controls), None);
-        assert!(slider_state(&ws.tree, controls.sliders[S::GradientEndRed.index()]).1);
-        assert_eq!(super::gradient_summary_text(2), "2 colour stops");
-        assert!(super::gradient_summary_text(7).starts_with("7 colour stops"));
+        assert_eq!(r.slider(S::GradientPosition), (0.0, false));
+        assert_eq!(r.slider(S::GradientRed), (255.0, false));
+        assert!(super::adjust_gradient_reverse_checked(
+            &r.ws.tree, r.controls
+        ));
+        assert_eq!(r.readout(S::GradientPosition), "Position: 0.0 %");
+        assert_eq!(r.readout(S::GradientRed), "Stop red: 255");
+    }
+
+    #[test]
+    fn selecting_another_stop_rebinds_the_sliders_on_the_next_sync() {
+        let mut r = rig();
+        let id = r.show(gradient(
+            &[
+                (0.0, [1.0, 0.0, 0.0]),
+                (0.4, [0.0, 0.2, 1.0]),
+                (1.0, [1.0; 3]),
+            ],
+            false,
+        ));
+        r.select(1);
+        // Not yet mirrored: the sliders still show stop 1 until the sync.
+        r.resync(id);
+        assert_eq!(
+            label_text(&r.ws, r.controls.gradient_summary),
+            "Stop 2 of 3"
+        );
+        assert_eq!(r.slider(S::GradientPosition), (40.0, false));
+        assert_eq!(r.slider(S::GradientRed), (0.0, false));
+        assert_eq!(r.slider(S::GradientGreen), (51.0, false));
+        assert_eq!(r.slider(S::GradientBlue), (255.0, false));
+        assert_eq!(r.readout(S::GradientPosition), "Position: 40.0 %");
+        assert_eq!(r.readout(S::GradientGreen), "Stop green: 51");
+        r.select(2);
+        r.resync(id);
+        assert_eq!(r.slider(S::GradientPosition), (100.0, false));
+        assert_eq!(r.slider(S::GradientRed), (255.0, false));
+        assert_eq!(
+            super::adjust_tab(&r.ws.tree, r.controls, AdjustKind::GradientMap),
+            2
+        );
+        assert_eq!(super::adjust_gradient_selected(&r.ws.tree, r.controls), 2);
+    }
+
+    #[test]
+    fn an_edit_changes_only_the_selected_stops_value() {
+        let g = gradient(
+            &[
+                (0.0, [1.0, 0.0, 0.0]),
+                (0.4, [0.0, 0.2, 1.0]),
+                (1.0, [1.0; 3]),
+            ],
+            true,
+        );
+        let colour = S::GradientGreen.with_value(&g, 1, 128.0);
+        let Some(p) = colour.as_ref().and_then(Adjustment::gradient_map) else {
+            unreachable!("edit")
+        };
+        assert_eq!(p.stops()[1].colour, [0.0, 128.0 / 255.0, 1.0]);
+        assert_eq!(p.stops()[0].colour, [1.0, 0.0, 0.0]);
+        assert_eq!(p.stops()[2].colour, [1.0; 3]);
+        assert_eq!(p.stops()[1].position, 0.4);
+        assert!(p.reverse(), "flags survive");
+        let moved = S::GradientPosition.with_value(&g, 1, 25.0);
+        let Some(p) = moved.as_ref().and_then(Adjustment::gradient_map) else {
+            unreachable!("edit")
+        };
+        assert_eq!(p.stops()[1].position, 0.25);
+        assert_eq!(p.stops()[1].colour, [0.0, 0.2, 1.0]);
+        // A position past a neighbour stops at it; a stop that is not there
+        // gives nothing.
+        let past = S::GradientPosition.with_value(&g, 0, 99.0);
+        assert_eq!(
+            past.as_ref()
+                .and_then(Adjustment::gradient_map)
+                .map(|p| p.stops()[0].position),
+            Some(0.4)
+        );
+        let before = S::GradientPosition.with_value(&g, 2, 10.0);
+        assert_eq!(
+            before
+                .as_ref()
+                .and_then(Adjustment::gradient_map)
+                .map(|p| p.stops()[2].position),
+            Some(0.4)
+        );
+        assert!(S::GradientRed.with_value(&g, 3, 5.0).is_none());
+        assert!(S::GradientRed.value_of(&g, 3).is_none());
+        assert!(S::GradientPosition.value_of(&g, 7).is_none());
+        assert!(
+            S::Red.with_value(&g, 0, 5.0).is_none(),
+            "another kind's slider"
+        );
+    }
+
+    #[test]
+    fn every_stop_count_from_two_to_sixty_four_is_editable() {
+        let mut r = rig();
+        for count in [2_usize, 3, 7, 16, 63, 64] {
+            let id = r.show(ramp(count));
+            assert_eq!(r.bar().stops().len(), count);
+            for s in [
+                S::GradientPosition,
+                S::GradientRed,
+                S::GradientGreen,
+                S::GradientBlue,
+            ] {
+                assert!(!r.slider(s).1, "{s:?} at {count} stops");
+            }
+            for stop in [0, count / 2, count - 1] {
+                r.select(stop);
+                r.resync(id);
+                let want = (f64::from(stop as u32) / f64::from((count - 1) as u32) * 1000.0)
+                    .round()
+                    / 10.0;
+                assert_eq!(
+                    r.slider(S::GradientPosition).0,
+                    want,
+                    "{count} stops, stop {stop}"
+                );
+                assert_eq!(
+                    label_text(&r.ws, r.controls.gradient_summary),
+                    format!("Stop {} of {count}", stop + 1)
+                );
+            }
+            r.select(0);
+        }
+    }
+
+    #[test]
+    fn the_buttons_are_live_only_when_their_action_is_possible() {
+        let mut r = rig();
+        let c = r.controls;
+        let id = r.show(ramp(3));
+        let live = |r: &Rig| {
+            [
+                c.gradient_prev,
+                c.gradient_next,
+                c.gradient_add,
+                c.gradient_delete,
+            ]
+            .map(|b| !button_disabled(&r.ws, b))
+        };
+        assert_eq!(live(&r), [false, true, true, true], "first of three");
+        r.select(1);
+        r.resync(id);
+        assert_eq!(live(&r), [true, true, true, true]);
+        r.select(2);
+        r.resync(id);
+        assert_eq!(live(&r), [true, false, true, true], "last of three");
+        r.select(0);
+        let id = r.show(ramp(2));
+        assert_eq!(
+            live(&r),
+            [false, true, true, false],
+            "never below two stops"
+        );
+        r.select(1);
+        r.resync(id);
+        assert_eq!(live(&r), [true, false, true, false]);
+        let id = r.show(ramp(64));
+        r.select(0);
+        r.resync(id);
+        assert_eq!(live(&r), [false, true, false, true], "no add at 64 stops");
+        // Hidden for another layer: everything idle.
+        let _ = show(&mut r.ws, c, &r.layers, None);
+        assert_eq!(live(&r), [false; 4]);
+        assert!(r.bar().is_disabled());
+    }
+
+    #[test]
+    fn the_selection_is_pulled_back_when_the_gradient_gets_shorter() {
+        let mut r = rig();
+        let id = r.show(ramp(5));
+        r.select(4);
+        r.resync(id);
+        let shorter = ramp(3);
+        let Ok(()) = r.layers.set_adjustment(id, shorter) else {
+            unreachable!("set")
+        };
+        r.resync(id);
+        assert_eq!(r.bar().selected(), 2);
+        assert_eq!(
+            label_text(&r.ws, r.controls.gradient_summary),
+            "Stop 3 of 3"
+        );
+        assert_eq!(r.slider(S::GradientPosition).0, 100.0);
+    }
+
+    #[test]
+    fn the_stop_controls_have_unique_accessible_names_and_the_buttons_take_the_keyboard() {
+        use accesskit::Action;
+        let mut r = rig();
+        let id = r.show(ramp(3));
+        r.select(1);
+        r.resync(id);
+        let c = r.controls;
+        let Some(group) = c.groups.get(AdjustKind::GradientMap.index()).copied() else {
+            unreachable!("group")
+        };
+        let mut names = Vec::new();
+        let mut stack = vec![group];
+        while let Some(id) = stack.pop() {
+            if let Some(node) = r.ws.tree.accessibility(id)
+                && let Some(label) = node.label()
+                && !label.is_empty()
+            {
+                names.push(label.to_owned());
+            }
+            stack.extend(r.ws.tree.children(id).unwrap_or_default().iter().copied());
+        }
+        for want in [
+            "Gradient preview",
+            "Previous Stop",
+            "Next Stop",
+            "Add Stop",
+            "Delete Stop",
+            "Reverse",
+            "Gradient stop position",
+            "Gradient stop red",
+            "Gradient stop green",
+            "Gradient stop blue",
+        ] {
+            assert_eq!(
+                names.iter().filter(|n| n.as_str() == want).count(),
+                1,
+                "{want}: {names:?}"
+            );
+        }
+        // Unique across all the editors' sliders too.
+        let mut all: Vec<&str> = S::ALL.iter().map(|s| s.label()).collect();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), super::ADJUST_SLIDER_COUNT);
+        for button in [
+            c.gradient_prev,
+            c.gradient_next,
+            c.gradient_add,
+            c.gradient_delete,
+        ] {
+            let Some(node) = r.ws.tree.accessibility(button) else {
+                unreachable!("button node")
+            };
+            assert!(node.supports_action(Action::Focus), "a tab stop");
+            assert!(node.supports_action(Action::Click), "Enter/Space/AT click");
+        }
+        let Some(bar) = r.ws.tree.accessibility(c.gradient_bar) else {
+            unreachable!("bar node")
+        };
+        assert!(
+            !bar.supports_action(Action::Focus),
+            "the bar is not a tab stop"
+        );
+        assert_eq!(bar.role(), accesskit::Role::Image);
+    }
+
+    #[test]
+    fn the_bars_description_lists_the_stops_and_follows_the_document() {
+        let mut r = rig();
+        let id = r.show(gradient(
+            &[(0.0, [0.0; 3]), (0.5, [1.0, 0.0, 0.0]), (1.0, [1.0; 3])],
+            false,
+        ));
+        let text = |r: &Rig| {
+            r.ws.tree
+                .accessibility(r.controls.gradient_bar)
+                .and_then(|n| n.description().map(str::to_owned))
+                .unwrap_or_default()
+        };
+        assert!(
+            text(&r).contains("Stop 2 of 3: position 50 percent, colour 255 0 0"),
+            "{}",
+            text(&r)
+        );
+        assert!(text(&r).ends_with("Selected: stop 1"));
+        r.select(2);
+        assert!(text(&r).ends_with("Selected: stop 3"));
+        let two = ramp(2);
+        let Ok(()) = r.layers.set_adjustment(id, two) else {
+            unreachable!("set")
+        };
+        r.resync(id);
+        assert!(text(&r).contains("Stop 2 of 2"));
+        assert!(!text(&r).contains("of 3"));
+    }
+
+    #[test]
+    fn the_summary_names_the_selected_stop_and_the_count() {
+        assert_eq!(super::gradient_summary_text(0, 2), "Stop 1 of 2");
+        assert_eq!(super::gradient_summary_text(63, 64), "Stop 64 of 64");
+        assert_eq!(S::GradientPosition.gradient_channel(), None);
+        assert_eq!(
+            [S::GradientRed, S::GradientGreen, S::GradientBlue].map(S::gradient_channel),
+            [Some(0), Some(1), Some(2)]
+        );
+        assert_eq!(S::Red.gradient_channel(), None);
+        assert_eq!(S::GradientBlue.index(), super::ADJUST_SLIDER_COUNT - 1);
     }
 }
