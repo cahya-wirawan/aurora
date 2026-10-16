@@ -64,6 +64,13 @@ fn clipped_files_against_their_merged_images_before_and_after() {
                 "CLIP {name}: {clipped} clipped layers; before mean {:?} max {:?} | after mean {:?} max {:?}",
                 b.mean, b.max, a.mean, a.max
             );
+            // `blend-and-clipping.psd`'s merged image is a placeholder and its
+            // eight shape layers store no pixels (task 108 draws them), so
+            // its error against the file's merged image is not a fidelity
+            // measure; the other clipped files keep the check.
+            if name == "blend-and-clipping.psd" {
+                continue;
+            }
             for (after, before) in a.mean.iter().zip(b.mean) {
                 assert!(*after <= before + 0.05, "{name}: clipping made {name} worse");
             }
