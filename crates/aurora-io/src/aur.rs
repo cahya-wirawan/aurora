@@ -485,6 +485,183 @@ fn read_layer_gradient_overlays<R: Read + Seek>(
     Ok(())
 }
 
+/// The optional entry carrying the document's pattern pool and every
+/// layer's pattern overlays (task 111): `aurora_core::LayerEffects::
+/// pattern_overlays` is `#[serde(skip)]` because [`LAYER_EFFECTS_ENTRY`]'s
+/// payload is positional, and the pool is not part of the manifest. The
+/// pool's pixels are their own entries, [`LAYER_PATTERN_PIXELS_PREFIX`]
+/// plus the pattern's index in the list (little-endian `u16`, RGBA
+/// straight, exactly `width * height * 8` bytes). Written only when the
+/// document has a pattern or a pattern overlay, so every other save stays
+/// byte-identical (and an Aurora that predates it reads such a file
+/// without the overlays, except that its journal holds the appended
+/// `SetPatternOverlays` op, which it refuses). **Versioned, and a newer
+/// version refuses the file**; a damaged entry, an overlay on a layer
+/// without effects or naming a pattern the pool lacks, a pattern over
+/// `aurora_core::pattern`'s caps or whose pixels are missing or of the
+/// wrong length refuse it loudly, like the other optional entries.
+const LAYER_PATTERNS_ENTRY: &str = "layer-patterns";
+
+/// The name prefix of a pattern's pixel entry (`layer-pattern-pixels-0`, ...).
+const LAYER_PATTERN_PIXELS_PREFIX: &str = "layer-pattern-pixels-";
+
+/// [`LAYER_PATTERNS_ENTRY`]'s own schema version.
+const LAYER_PATTERNS_VERSION: u32 = 1;
+
+/// One pattern's record; its pixels are the entry
+/// `layer-pattern-pixels-<index>`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PatternWire {
+    id: String,
+    name: String,
+    width: u32,
+    height: u32,
+}
+
+/// [`LAYER_PATTERNS_ENTRY`]'s payload: version first (frozen), the pool's
+/// records, then one `(raw layer id, overlays)` pair per layer with some.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LayerPatternsWire {
+    version: u32,
+    patterns: Vec<PatternWire>,
+    overlays: Vec<(u64, Vec<aurora_core::effects::PatternOverlay>)>,
+}
+
+/// What [`DocumentEntries`] carries for the pattern entries: the metadata
+/// and the pool's pixels (shared, not copied).
+#[derive(Debug, Clone)]
+struct PatternEntries {
+    meta: Vec<u8>,
+    pixels: Vec<std::sync::Arc<Vec<u16>>>,
+}
+
+/// The pattern entries for `layers`, or `None` when it has no pattern and
+/// no pattern overlay.
+fn pattern_entries(layers: &LayerTree) -> Result<Option<PatternEntries>, IoError> {
+    let overlays: Vec<(u64, Vec<aurora_core::effects::PatternOverlay>)> = layer_ids(layers)
+        .into_iter()
+        .filter_map(|id| {
+            let overlays = &layers.effects(id)?.pattern_overlays;
+            (!overlays.is_empty()).then(|| (id.to_raw(), overlays.clone()))
+        })
+        .collect();
+    let pool = layers.patterns();
+    if overlays.is_empty() && pool.is_empty() {
+        return Ok(None);
+    }
+    let wire = LayerPatternsWire {
+        version: LAYER_PATTERNS_VERSION,
+        patterns: pool
+            .values()
+            .map(|p| PatternWire {
+                id: p.id().to_owned(),
+                name: p.name().to_owned(),
+                width: p.width(),
+                height: p.height(),
+            })
+            .collect(),
+        overlays,
+    };
+    let meta = postcard::to_allocvec(&wire)
+        .map_err(|source| IoError::ManifestSerialization(source.to_string()))?;
+    Ok(Some(PatternEntries {
+        meta,
+        pixels: pool.values().map(|p| p.shared_texels().clone()).collect(),
+    }))
+}
+
+/// Reads [`LAYER_PATTERNS_ENTRY`] if present and applies it.
+///
+/// # Errors
+///
+/// [`IoError::ManifestDeserialization`] as described on the entry.
+fn read_layer_patterns<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    layers: &mut LayerTree,
+) -> Result<(), IoError> {
+    use aurora_core::pattern as pat;
+    let bytes = match zip.by_name(LAYER_PATTERNS_ENTRY) {
+        Ok(file) => read_capped(file, LAYER_PATTERNS_ENTRY, MAX_LAYER_EFFECTS_BYTES)?,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let (prefix, _rest) = postcard::take_from_bytes::<MaskDensityPrefix>(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    if prefix.version != LAYER_PATTERNS_VERSION {
+        let cause = if prefix.version > LAYER_PATTERNS_VERSION {
+            "the file was saved by a newer Aurora"
+        } else {
+            "the entry is damaged or of an unknown kind"
+        };
+        return Err(IoError::ManifestDeserialization(format!(
+            "unsupported layer-patterns version {} (this build understands version \
+             {LAYER_PATTERNS_VERSION}); {cause}",
+            prefix.version
+        )));
+    }
+    let wire: LayerPatternsWire = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    let bad = |what: String| IoError::ManifestDeserialization(format!("patterns: {what}"));
+    if wire.patterns.len() > pat::MAX_PATTERNS {
+        return Err(bad("too many patterns".to_owned()));
+    }
+    let mut pool: u64 = 0;
+    for (index, record) in wire.patterns.into_iter().enumerate() {
+        // The size is checked before any pixel is read or allocated.
+        let texels = pat::Pattern::texel_count(record.width, record.height)
+            .map_err(|err| bad(format!("pattern {index}: {err}")))?;
+        let len = texels * 8;
+        pool = pool.saturating_add(len);
+        if pool > pat::MAX_PATTERN_POOL_BYTES {
+            return Err(bad("the patterns are too large".to_owned()));
+        }
+        let name = format!("{LAYER_PATTERN_PIXELS_PREFIX}{index}");
+        let raw = match zip.by_name(&name) {
+            Ok(file) => read_capped(file, &name, len)?,
+            Err(zip::result::ZipError::FileNotFound) => {
+                return Err(bad(format!("the pixels of pattern {index} are missing")));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if raw.len() as u64 != len {
+            return Err(bad(format!("the pixels of pattern {index} are damaged")));
+        }
+        let texels: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|pair| match pair {
+                [lo, hi] => u16::from_le_bytes([*lo, *hi]),
+                _ => 0,
+            })
+            .collect();
+        let pattern = pat::Pattern::new(record.id, record.name, record.width, record.height, texels)
+            .map_err(|err| bad(format!("pattern {index}: {err}")))?;
+        layers
+            .add_pattern(pattern)
+            .map_err(|err| bad(err.to_string()))?;
+    }
+    for (raw, overlays) in wire.overlays {
+        let id = aurora_doc::LayerId::from_raw(raw);
+        if let Some(missing) = overlays
+            .iter()
+            .find(|o| !layers.patterns().contains_key(&o.pattern))
+        {
+            return Err(bad(format!(
+                "an overlay names the pattern {:?}, which the file does not hold",
+                missing.pattern
+            )));
+        }
+        let mut effects = layers
+            .effects(id)
+            .cloned()
+            .ok_or_else(|| bad("pattern overlays on a layer without effects".to_owned()))?;
+        effects.pattern_overlays = overlays;
+        layers
+            .set_effects(id, Some(effects))
+            .map_err(|err| bad(format!("pattern overlays: {err}")))?;
+    }
+    Ok(())
+}
+
 /// The optional entry carrying which layers are clipped to the layer
 /// beneath them (0.201.0): `LayerEntry::clipped` is `#[serde(skip)]` in the
 /// positional manifest, like the effects. Written only when some layer is
@@ -1881,6 +2058,9 @@ struct DocumentEntries {
     /// [`LAYER_GRADIENT_OVERLAYS_ENTRY`], when some layer has gradient
     /// overlays (task 110).
     layer_gradient_overlays: Option<Vec<u8>>,
+    /// [`LAYER_PATTERNS_ENTRY`] and the pool's pixels, when the document
+    /// has a pattern or a pattern overlay (task 111).
+    layer_patterns: Option<PatternEntries>,
     /// [`LAYER_CLIPPING_ENTRY`], when some layer is clipped (0.201.0).
     layer_clipping: Option<Vec<u8>>,
     /// [`IMPORT_LOSSES_ENTRY`], when the document has any (0.177.0).
@@ -1973,6 +2153,7 @@ impl DocumentEntries {
             mask_densities,
             layer_effects,
             layer_gradient_overlays,
+            layer_patterns: pattern_entries(layers)?,
             layer_clipping,
             import_losses: None,
             selection: None,
@@ -2004,6 +2185,18 @@ impl DocumentEntries {
         if let Some(bytes) = &self.layer_gradient_overlays {
             zip.start_file(LAYER_GRADIENT_OVERLAYS_ENTRY, deflated)?;
             zip.write_all(bytes)?;
+        }
+        if let Some(patterns) = &self.layer_patterns {
+            zip.start_file(LAYER_PATTERNS_ENTRY, deflated)?;
+            zip.write_all(&patterns.meta)?;
+            for (index, pixels) in patterns.pixels.iter().enumerate() {
+                zip.start_file(format!("{LAYER_PATTERN_PIXELS_PREFIX}{index}"), deflated)?;
+                // Little-endian, in bounded chunks (a pattern is up to 32 MiB).
+                for chunk in pixels.chunks(32 * 1024) {
+                    let bytes: Vec<u8> = chunk.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    zip.write_all(&bytes)?;
+                }
+            }
         }
         if let Some(bytes) = &self.layer_clipping {
             zip.start_file(LAYER_CLIPPING_ENTRY, deflated)?;
@@ -2189,6 +2382,13 @@ pub fn snapshot_best_effort(
         .map(|f| f.entry.len())
         .fold(0usize, usize::saturating_add);
     bound = bound.saturating_add(pool);
+    // The pattern pool (task 111) is shared too, and counted the same way.
+    let patterns: usize = layers
+        .patterns()
+        .values()
+        .map(|p| usize::try_from(p.byte_len()).unwrap_or(usize::MAX))
+        .fold(0usize, usize::saturating_add);
+    bound = bound.saturating_add(patterns);
     if bound > max_texel_bytes {
         return Ok(None);
     }
@@ -2445,6 +2645,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     read_mask_densities(&mut zip, &mut layers)?;
     read_layer_effects(&mut zip, &mut layers)?;
     read_layer_gradient_overlays(&mut zip, &mut layers)?;
+    read_layer_patterns(&mut zip, &mut layers)?;
     read_layer_clipping(&mut zip, &mut layers)?;
     read_smart_objects(&mut zip, &mut layers)?;
 

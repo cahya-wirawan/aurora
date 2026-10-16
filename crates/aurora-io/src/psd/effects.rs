@@ -20,8 +20,9 @@
 use aurora_core::LayerEffects;
 use aurora_core::effects::{
     ColorOverlay, DropShadow, EffectBlendMode, EffectColor, EffectGate, GradientOverlay,
-    MAX_EFFECT_DISTANCE, MAX_EFFECT_INSTANCES, MAX_EFFECT_SCALE, MAX_EFFECT_SIZE, OtherEffects,
-    OuterGlow, Stroke, StrokeFill, StrokePosition,
+    MAX_EFFECT_DISTANCE, MAX_EFFECT_INSTANCES, MAX_EFFECT_SCALE, MAX_EFFECT_SIZE,
+    MAX_PATTERN_SCALE, MIN_PATTERN_SCALE, OtherEffects, OuterGlow, PatternOverlay, Stroke,
+    StrokeFill, StrokePosition,
 };
 
 use super::descriptor::{self, Descriptor, ItemBudget, Value};
@@ -40,6 +41,15 @@ pub(super) struct ReadEffects {
     /// Shown outer glows with a contour other than Linear, stored and
     /// drawn with a Linear one (0.191.0).
     pub glow_contours: u32,
+    /// Shown pattern overlays whose pixels cannot be had (no pattern named,
+    /// or, once the document's pattern blocks are read, a missing or
+    /// refused one); counted in `other.pattern_overlays`, never drawn
+    /// (task 111).
+    pub pattern_unreadable: u32,
+    /// Shown pattern overlays whose placement is not modelled: not linked
+    /// with the layer, or a phase offset (no Photoshop picture to derive
+    /// either from); counted in `other.pattern_overlays` (task 111).
+    pub pattern_unplaced: u32,
 }
 
 /// Why a layer's effects were not read.
@@ -354,13 +364,57 @@ pub(super) fn map_effects(d: &Descriptor, global_angle: f32) -> Result<ReadEffec
             _ => unmodelled_gradients += u32::from(g.on()),
         }
     }
+    // Pattern overlays (task 111): kept when a pattern is named and the
+    // placement is the modelled one (linked with the layer, no phase); the
+    // caller resolves the pattern's pixels and the origin (the layer's
+    // `fxrp`) afterwards and drops what it cannot.
+    let mut pattern_unreadable = 0u32;
+    let mut pattern_unplaced = 0u32;
+    for e in instances(d, b"patternFill", Some(b"patternFillMulti"), &mut ctx)? {
+        let g = gate(e)?;
+        let mode = blend(e)?;
+        let opacity = ctx.opacity(e)?;
+        let scale = ctx.num(e, b"Scl ", 100.0, 0.01, MIN_PATTERN_SCALE, MAX_PATTERN_SCALE)?;
+        let id = e
+            .get(b"Ptrn")
+            .and_then(super::descriptor::Value::descriptor)
+            .and_then(|p| p.get(b"Idnt"))
+            .and_then(super::descriptor::Value::text)
+            .map(|t| t.trim_matches(|c: char| c == '\0' || c.is_whitespace()).to_owned())
+            .filter(|t| !t.is_empty() && t.len() <= aurora_core::pattern::MAX_PATTERN_ID_BYTES);
+        let linked = flag(e, b"Algn", true)?;
+        let mut phase_zero = true;
+        if let Some(phase) = e.get(b"phase").and_then(super::descriptor::Value::descriptor) {
+            for key in [&b"Hrzn"[..], &b"Vrtc"[..]] {
+                if let Some(v) = phase.get(key) {
+                    let v = v.number().ok_or(Unreadable)?;
+                    if !v.is_finite() || v.abs() > 1e-6 {
+                        phase_zero = false;
+                    }
+                }
+            }
+        }
+        match id {
+            None => pattern_unreadable += u32::from(g.on()),
+            Some(_) if !linked || !phase_zero => pattern_unplaced += u32::from(g.on()),
+            Some(pattern) => fx.pattern_overlays.push(PatternOverlay {
+                gate: g,
+                blend_mode: mode,
+                opacity,
+                pattern,
+                scale,
+                origin: (0.0, 0.0),
+            }),
+        }
+    }
     fx.other = OtherEffects {
         inner_shadows: count_on(d, b"IrSh", Some(b"innerShadowMulti"), &mut ctx)?,
         inner_glows: count_on(d, b"IrGl", None, &mut ctx)?,
         bevels: count_on(d, b"ebbl", None, &mut ctx)?,
         satins: count_on(d, b"ChFX", None, &mut ctx)?,
         gradient_overlays: unmodelled_gradients,
-        pattern_overlays: count_on(d, b"patternFill", None, &mut ctx)?,
+        // The drawn ones are `fx.pattern_overlays`; these are the rest.
+        pattern_overlays: pattern_unreadable + pattern_unplaced,
     };
     // Every clamp above keeps the value valid; this is the backstop for a
     // case the mapping missed, so a stored value is always a valid one.
@@ -370,5 +424,7 @@ pub(super) fn map_effects(d: &Descriptor, global_angle: f32) -> Result<ReadEffec
         clamped: ctx.clamped,
         glow_gradients,
         glow_contours,
+        pattern_unreadable,
+        pattern_unplaced,
     })
 }

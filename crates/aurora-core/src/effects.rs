@@ -551,6 +551,38 @@ pub struct GradientOverlay {
     pub reference: Option<ReferenceBox>,
 }
 
+/// A pattern overlay (`patternFill`, task 111): a pattern from the
+/// document's pool tiled over the layer's interior, in its own blend mode
+/// and opacity, above the gradient overlays.
+///
+/// **Not on the `.aur` effects wire** (like [`GradientOverlay`]): it rides
+/// in the optional `layer-patterns` entry and
+/// `LayerOp::SetPatternOverlays`.
+///
+/// **Placement** (derived from Photoshop's own pictures, see PLAN.md): the
+/// pattern's texel `(0, 0)` is centred on pixel `origin` (Photoshop's
+/// reference point, `fxrp`), texel `(i, j)` on `origin + (i, j) * scale`
+/// (scale `1.0` = 100 %), and the pattern tiles forever from there.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PatternOverlay {
+    pub gate: EffectGate,
+    pub blend_mode: EffectBlendMode,
+    /// `0.0..=1.0`.
+    pub opacity: f32,
+    /// The pattern's ID in the document's pool
+    /// (`aurora_doc::LayerTree::patterns`).
+    pub pattern: String,
+    /// `0.01..=10.0`; `1.0` is 100 %.
+    pub scale: f32,
+    /// The origin as an offset from the layer's `bounds` top-left, so it
+    /// follows the layer when it moves.
+    pub origin: (f64, f64),
+}
+
+/// The smallest and largest pattern scale (`Scl `, 1 % to 1000 %).
+pub const MIN_PATTERN_SCALE: f32 = 0.01;
+pub const MAX_PATTERN_SCALE: f32 = 10.0;
+
 /// How many effects of each kind Aurora does not model yet, counting
 /// only instances whose own `present` and `enab` are both on. Kept so a
 /// report can name them; their settings are not kept.
@@ -598,6 +630,10 @@ pub struct LayerEffects {
     /// [`GradientOverlay`].
     #[serde(skip)]
     pub gradient_overlays: Vec<GradientOverlay>,
+    /// Pattern overlays (task 111). `#[serde(skip)]`: see
+    /// [`PatternOverlay`].
+    #[serde(skip)]
+    pub pattern_overlays: Vec<PatternOverlay>,
 }
 
 impl Default for LayerEffects {
@@ -611,6 +647,7 @@ impl Default for LayerEffects {
             outer_glows: Vec::new(),
             other: OtherEffects::default(),
             gradient_overlays: Vec::new(),
+            pattern_overlays: Vec::new(),
         }
     }
 }
@@ -657,6 +694,30 @@ impl LayerEffects {
         count(&self.strokes, "stroke")?;
         count(&self.outer_glows, "outer glow")?;
         count(&self.gradient_overlays, "gradient overlay")?;
+        count(&self.pattern_overlays, "pattern overlay")?;
+        for p in &self.pattern_overlays {
+            unit(p.opacity, "opacity")?;
+            if p.pattern.is_empty() || p.pattern.len() > crate::pattern::MAX_PATTERN_ID_BYTES {
+                return Err(EffectsError::OutOfRange {
+                    field: "pattern ID",
+                });
+            }
+            if !(MIN_PATTERN_SCALE..=MAX_PATTERN_SCALE).contains(&p.scale) {
+                return Err(EffectsError::OutOfRange {
+                    field: "pattern scale",
+                });
+            }
+            let max = f64::from(crate::MAX_DOCUMENT_EXTENT);
+            if !(p.origin.0.is_finite()
+                && p.origin.1.is_finite()
+                && p.origin.0.abs() <= max
+                && p.origin.1.abs() <= max)
+            {
+                return Err(EffectsError::OutOfRange {
+                    field: "pattern origin",
+                });
+            }
+        }
         for g in &self.gradient_overlays {
             unit(g.opacity, "opacity")?;
             g.gradient
@@ -790,6 +851,16 @@ impl LayerEffects {
             .count()
     }
 
+    /// The pattern overlays Photoshop would draw and Aurora draws
+    /// (task 111).
+    #[must_use]
+    pub fn shown_pattern_overlays(&self) -> usize {
+        self.pattern_overlays
+            .iter()
+            .filter(|e| self.shows(e.gate))
+            .count()
+    }
+
     /// The not-yet-modelled effects Photoshop would draw.
     #[must_use]
     pub fn shown_other(&self) -> u64 {
@@ -805,6 +876,7 @@ impl LayerEffects {
             || self.shown_strokes() > 0
             || self.shown_outer_glows() > 0
             || self.shown_gradient_overlays() > 0
+            || self.shown_pattern_overlays() > 0
             || self.shown_other() > 0
     }
 
@@ -816,6 +888,7 @@ impl LayerEffects {
             && self.strokes.is_empty()
             && self.outer_glows.is_empty()
             && self.gradient_overlays.is_empty()
+            && self.pattern_overlays.is_empty()
             && self.other.total() == 0
     }
 }

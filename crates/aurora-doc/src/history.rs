@@ -197,6 +197,17 @@ enum LayerOp {
         id: LayerId,
         value: Vec<aurora_core::effects::GradientOverlay>,
     },
+    /// Replaces the pattern overlays of a layer's effects (task 111), the
+    /// way [`Self::SetGradientOverlays`] does gradient ones; appended after
+    /// it, so an Aurora older than this build refuses a journal holding it
+    /// (ADR 0009). [`History::save_journal`] emits one after every
+    /// `SetEffects` and `Restore` that carries pattern overlays. The
+    /// patterns themselves are not journaled: they are the document's pool
+    /// (`.aur` entry `layer-patterns`).
+    SetPatternOverlays {
+        id: LayerId,
+        value: Vec<aurora_core::effects::PatternOverlay>,
+    },
 }
 
 /// Every `(layer, gradient overlays)` pair a journaled op carries in an
@@ -217,6 +228,27 @@ fn carried_gradient_overlays(
             id,
             value: Some(fx),
         } if !fx.gradient_overlays.is_empty() => vec![(*id, fx.gradient_overlays.clone())],
+        _ => Vec::new(),
+    }
+}
+
+/// Every `(layer, pattern overlays)` pair, as [`carried_gradient_overlays`].
+fn carried_pattern_overlays(
+    op: &LayerOp,
+) -> Vec<(LayerId, Vec<aurora_core::effects::PatternOverlay>)> {
+    match op {
+        LayerOp::Restore(subtree) => subtree
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                let fx = entry.effects.as_ref()?;
+                (!fx.pattern_overlays.is_empty()).then(|| (*id, fx.pattern_overlays.clone()))
+            })
+            .collect(),
+        LayerOp::SetEffects {
+            id,
+            value: Some(fx),
+        } if !fx.pattern_overlays.is_empty() => vec![(*id, fx.pattern_overlays.clone())],
         _ => Vec::new(),
     }
 }
@@ -471,6 +503,16 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
             tree.set_effects(id, Some(fx))?;
             Ok((LayerOp::SetGradientOverlays { id, value: old }, None))
         }
+        LayerOp::SetPatternOverlays { id, value } => {
+            let mut fx = tree.effects(id).cloned().ok_or(DocError::InvalidEffects(
+                aurora_core::effects::EffectsError::OutOfRange {
+                    field: "pattern overlays on a layer without effects",
+                },
+            ))?;
+            let old = std::mem::replace(&mut fx.pattern_overlays, value);
+            tree.set_effects(id, Some(fx))?;
+            Ok((LayerOp::SetPatternOverlays { id, value: old }, None))
+        }
         LayerOp::SetClipped { id, value } => {
             let old = tree.clipped(id);
             tree.set_clipped_flag(id, value)?;
@@ -643,6 +685,12 @@ fn describe(op: &LayerOp) -> String {
         },
         LayerOp::SetGradientOverlays { id, value } => format!(
             "Changed {} gradient overlay{} on layer #{}",
+            value.len(),
+            if value.len() == 1 { "" } else { "s" },
+            id.to_raw()
+        ),
+        LayerOp::SetPatternOverlays { id, value } => format!(
+            "Changed {} pattern overlay{} on layer #{}",
             value.len(),
             if value.len() == 1 { "" } else { "s" },
             id.to_raw()
@@ -952,6 +1000,13 @@ impl History {
             // they belong to.
             for (id, value) in carried_gradient_overlays(op) {
                 wire.push(std::borrow::Cow::Owned(LayerOp::SetGradientOverlays {
+                    id,
+                    value,
+                }));
+            }
+            // Pattern overlays (task 111) the same way.
+            for (id, value) in carried_pattern_overlays(op) {
+                wire.push(std::borrow::Cow::Owned(LayerOp::SetPatternOverlays {
                     id,
                     value,
                 }));

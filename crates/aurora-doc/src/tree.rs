@@ -191,6 +191,11 @@ pub struct LayerTree {
     /// `.aur`'s `smart-objects` entry carries it. Cheap to clone (`Arc`s).
     #[serde(skip)]
     linked_files: std::collections::BTreeMap<String, crate::smart_object::LinkedFile>,
+    /// The document's pool of patterns (task 111), keyed by pattern ID.
+    /// `#[serde(skip)]`: the `.aur` entry `layer-patterns` carries it.
+    /// Cheap to clone (`Arc`ed pixels).
+    #[serde(skip)]
+    patterns: std::collections::BTreeMap<String, aurora_core::pattern::Pattern>,
 }
 
 /// Serialises the layer map with its entries in ascending id order
@@ -304,6 +309,7 @@ impl TryFrom<LayerTreeRepr> for LayerTree {
             layers,
             roots,
             linked_files: std::collections::BTreeMap::new(),
+            patterns: std::collections::BTreeMap::new(),
         })
     }
 }
@@ -821,6 +827,7 @@ impl LayerTree {
             layers: HashMap::new(),
             roots: Vec::new(),
             linked_files: std::collections::BTreeMap::new(),
+            patterns: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2488,6 +2495,37 @@ impl LayerTree {
         Ok(())
     }
 
+    /// The document's patterns, by ID (task 111).
+    #[must_use]
+    pub fn patterns(&self) -> &std::collections::BTreeMap<String, aurora_core::pattern::Pattern> {
+        &self.patterns
+    }
+
+    /// Adds (or replaces, by ID) a pattern in the pool.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::InvalidPattern`] when the pool would pass
+    /// [`aurora_core::pattern::MAX_PATTERNS`] patterns or
+    /// [`aurora_core::pattern::MAX_PATTERN_POOL_BYTES`] bytes.
+    pub fn add_pattern(&mut self, pattern: aurora_core::pattern::Pattern) -> Result<(), DocError> {
+        use aurora_core::pattern as p;
+        let others: u64 = self
+            .patterns
+            .iter()
+            .filter(|(id, _)| id.as_str() != pattern.id())
+            .map(|(_, v)| v.byte_len())
+            .fold(0u64, u64::saturating_add);
+        let count = self.patterns.len() + usize::from(!self.patterns.contains_key(pattern.id()));
+        if count > p::MAX_PATTERNS
+            || others.saturating_add(pattern.byte_len()) > p::MAX_PATTERN_POOL_BYTES
+        {
+            return Err(DocError::InvalidPattern(p::PatternError::PoolTooLarge));
+        }
+        self.patterns.insert(pattern.id().to_owned(), pattern);
+        Ok(())
+    }
+
     /// Sets the mask's [`LayerMask::density`] (0.149.0).
     ///
     /// # Errors
@@ -2947,6 +2985,7 @@ mod tests {
                 layers,
                 roots: vec![colliding],
                 linked_files: std::collections::BTreeMap::new(),
+            patterns: std::collections::BTreeMap::new(),
             };
             assert!(forced.contains(colliding), "the guard, not `contains`");
             assert_eq!(
@@ -2967,6 +3006,7 @@ mod tests {
             layers,
             roots: vec![below],
             linked_files: std::collections::BTreeMap::new(),
+            patterns: std::collections::BTreeMap::new(),
         };
         assert_eq!(
             forced.mask_surface_id(below),

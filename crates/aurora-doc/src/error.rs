@@ -36,6 +36,9 @@ pub enum DocError {
     /// Smart-object data failed its bounds (0.200.0).
     #[error("invalid smart object data: {0}")]
     InvalidSmartObject(crate::smart_object::SmartObjectError),
+    /// A pattern failed its bounds, or the pool is full (task 111).
+    #[error("invalid pattern: {0}")]
+    InvalidPattern(aurora_core::pattern::PatternError),
     /// [`crate::LayerTree::set_clipped`] was asked to clip a layer that has
     /// no layer beneath it in its group (0.201.0): there is nothing to
     /// clip to.

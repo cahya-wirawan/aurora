@@ -155,6 +155,14 @@ impl Value {
         }
     }
 
+    /// A `TEXT` value.
+    pub(super) fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(v) => Some(v),
+            _ => None,
+        }
+    }
+
     /// An `enum`'s value.
     pub(super) fn enum_value(&self) -> Option<&[u8]> {
         match self {

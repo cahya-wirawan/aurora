@@ -139,6 +139,9 @@ mod gradient_lookup_tests;
 #[cfg(test)]
 mod grayscale_adjust_tests;
 mod lab;
+mod pattern;
+#[cfg(test)]
+mod pattern_tests;
 #[cfg(test)]
 mod mixer_selective_tests;
 mod read_adjust;
@@ -254,6 +257,8 @@ pub struct PsdFile {
     /// The embedded smart-object files some layer's
     /// [`PsdLayer::smart`] names (0.200.0), in first-use order.
     pub linked_files: Vec<aurora_doc::LinkedFile>,
+    /// The patterns some layer's pattern overlay names (task 111).
+    pub patterns: Vec<aurora_core::pattern::Pattern>,
     notes: Notes,
 }
 
@@ -529,6 +534,8 @@ enum Note {
     StrokesNotShown,
     OuterGlowsNotShown,
     OtherEffectsNotShown,
+    PatternOverlaysUnreadable,
+    PatternOverlaysUnplaced,
     EffectsNotShown,
     AdjustmentEffectsDropped,
     EffectsUnreadable,
@@ -967,9 +974,20 @@ fn note_text(note: Note, n: u64) -> String {
              glow's are not)."
         ),
         Note::OtherEffectsNotShown => format!(
-            "{n} other effect{s} (inner shadow, inner glow, bevel, satin, pattern overlay, a \
-             gradient overlay Aurora can't draw -- a Noise gradient or one aligned to the \
+            "{n} other effect{s} (inner shadow, inner glow, bevel, satin, a pattern overlay \
+             Aurora can't draw (listed separately), a gradient overlay Aurora can't draw -- a Noise gradient or one aligned to the \
              document -- or any effect on a group) {is}n't shown, and {} settings aren't kept.",
+            if one { "its" } else { "their" }
+        ),
+        Note::PatternOverlaysUnreadable => format!(
+            "{n} pattern overlay{s} {is}n't shown because the pattern's pixels can't be read \
+             (the pattern is missing from the file, or it is not an 8- or 16-bit RGB or \
+             Grayscale pattern, or it is over Aurora's size limits)."
+        ),
+        Note::PatternOverlaysUnplaced => format!(
+            "{n} pattern overlay{s} {is}n't shown because {} placement isn't modelled (it is \
+             not linked with the layer, has a phase offset, or the layer has no reference \
+             point).",
             if one { "its" } else { "their" }
         ),
         Note::EffectsNotShown => format!(
@@ -3582,8 +3600,16 @@ fn note_unsupported_kept(
                     + if overlays_drawn {
                         0
                     } else {
-                        fx.shown_gradient_overlays() as u64
+                        (fx.shown_gradient_overlays() + fx.shown_pattern_overlays()) as u64
                     },
+            );
+            notes.add_n(
+                Note::PatternOverlaysUnreadable,
+                u64::from(read.pattern_unreadable),
+            );
+            notes.add_n(
+                Note::PatternOverlaysUnplaced,
+                u64::from(read.pattern_unplaced),
             );
             if read.clamped {
                 notes.add(Note::EffectsClamped);
@@ -4746,6 +4772,8 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
     };
     // The document-level linked-layer lists (0.200.0), located only.
     let mut linked_windows: Vec<([u8; 4], Window)> = Vec::new();
+    // The document-level pattern blocks (task 111), located only.
+    let mut pattern_windows: Vec<Window> = Vec::new();
     if section.remaining() > 0 {
         let info_len = section.length(src, psb, "layer info length")?;
         let mut body = section.sub(info_len, "layer info")?;
@@ -4757,6 +4785,7 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         for (key, mut data) in read_block_windows(src, &mut section, psb, 4)? {
             match &key {
                 b"lnk2" | b"lnkD" | b"lnk3" | b"lnkE" => linked_windows.push((key, data)),
+                b"Patt" | b"Pat2" | b"Pat3" => pattern_windows.push(data),
                 b"Lr16" | b"Layr" if info.records.is_empty() => {
                     let tagged_alpha = info.merged_alpha;
                     info = read_layer_info(src, &mut data, header)?;
@@ -4808,6 +4837,11 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
             }
         }
     }
+    // Pattern overlays (task 111): the patterns the layers name are read
+    // from the global blocks, then each overlay is resolved (a pattern
+    // that cannot be had, or a layer with no reference point, drops it
+    // into the counted-but-undrawn effects).
+    let patterns = resolve_patterns(src, &mut pattern_windows, &mut info.records)?;
     // Smart objects (0.200.0): matched to their embedded files before the
     // tree is built, so the build knows which ones are kept.
     let resolved = smart::resolve(src, &mut info.records, &linked_windows, &mut effects_budget)?;
@@ -4871,8 +4905,76 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         layers,
         composite,
         linked_files,
+        patterns,
         notes,
     })
+}
+
+/// The layer's `fxrp` reference point (two big-endian doubles), from the
+/// block copy kept with its smart-object blocks.
+fn reference_point(record: &Record) -> Option<(f64, f64)> {
+    let block = record.smart_blocks.iter().find(|b| b.key == *b"fxrp")?;
+    let x = f64::from_be_bytes(block.data.get(..8)?.try_into().ok()?);
+    let y = f64::from_be_bytes(block.data.get(8..16)?.try_into().ok()?);
+    (x.is_finite() && y.is_finite()).then_some((x, y))
+}
+
+/// Reads the patterns the records' pattern overlays name and resolves each
+/// overlay (task 111): its origin is the record's `fxrp` (absolute for
+/// now; `Builder` makes it relative to the layer's bounds), and an overlay
+/// whose pattern is missing or refused, or whose layer has no `fxrp`, is
+/// removed and counted (`ReadEffects::pattern_unreadable`,
+/// `OtherEffects::pattern_overlays`) when it was shown. Returns the
+/// patterns that survive, once each.
+fn resolve_patterns(
+    src: &mut dyn ByteSource,
+    windows: &mut [Window],
+    records: &mut [Record],
+) -> Result<Vec<aurora_core::pattern::Pattern>, IoError> {
+    let mut wanted = std::collections::BTreeSet::new();
+    for record in records.iter() {
+        if let Some(Ok(read)) = &record.effects {
+            for overlay in &read.effects.pattern_overlays {
+                wanted.insert(overlay.pattern.clone());
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pool = pattern::read_pool(src, windows, &wanted)?;
+    let mut used = std::collections::BTreeSet::new();
+    for record in records.iter_mut() {
+        let origin = reference_point(record);
+        let Some(Ok(read)) = &mut record.effects else {
+            continue;
+        };
+        let mut dropped = 0u32;
+        let mut kept = Vec::new();
+        for mut overlay in std::mem::take(&mut read.effects.pattern_overlays) {
+            // An origin far outside any document is a damaged reference
+            // point; the layer-relative value must stay within the
+            // effects' own range once `Builder` subtracts the bounds.
+            let origin = origin.filter(|(x, y)| x.abs() <= 100_000.0 && y.abs() <= 100_000.0);
+            match (pool.ready.contains_key(&overlay.pattern), origin) {
+                (true, Some(origin)) => {
+                    overlay.origin = origin;
+                    used.insert(overlay.pattern.clone());
+                    kept.push(overlay);
+                }
+                _ => dropped += u32::from(read.effects.shows(overlay.gate)),
+            }
+        }
+        read.effects.pattern_overlays = kept;
+        read.pattern_unreadable += dropped;
+        read.effects.other.pattern_overlays += dropped;
+    }
+    Ok(pool
+        .ready
+        .into_iter()
+        .filter(|(id, _)| used.contains(id))
+        .map(|(_, p)| p)
+        .collect())
 }
 
 /// The file's own stored merged composite (0.158.0) — what Photoshop
@@ -5019,6 +5121,7 @@ fn build_streamed(
         layers: nodes,
         composite,
         linked_files,
+        patterns,
         mut notes,
         ..
     } = file;
@@ -5031,6 +5134,9 @@ fn build_streamed(
     let mut layers = LayerTree::new();
     for file in linked_files {
         layers.add_linked_file(file)?;
+    }
+    for pattern in patterns {
+        layers.add_pattern(pattern)?;
     }
     let mut history = History::new();
     let profile = SharedProfile::new();
@@ -5379,6 +5485,17 @@ impl Builder<'_, '_, '_> {
                         r.dy = r.dy.saturating_sub(bounds.y);
                     }
                 }
+                // Pattern origins likewise (task 111): absolute from the
+                // file, relative to the layer once placed.
+                #[allow(clippy::cast_precision_loss)] // layer origins are far below 2^53
+                for overlay in &mut effects.pattern_overlays {
+                    overlay.origin.0 -= bounds.x as f64;
+                    overlay.origin.1 -= bounds.y as f64;
+                }
+                let limit = f64::from(aurora_core::MAX_DOCUMENT_EXTENT);
+                effects
+                    .pattern_overlays
+                    .retain(|o| o.origin.0.abs() <= limit && o.origin.1.abs() <= limit);
             }
             self.history.set_effects(self.layers, id, Some(effects))?;
         }
