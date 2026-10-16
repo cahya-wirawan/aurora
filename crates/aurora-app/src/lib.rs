@@ -42041,6 +42041,7 @@ mod tests {
     }
 
     mod psd_five_adjust_tests;
+    mod psd_grey_exposure_tests;
 
     fn near(actual: [f32; 4], expected: [f32; 4]) -> bool {
         actual

@@ -102,16 +102,18 @@ impl ExposureOp {
     }
 }
 
-/// An Exposure adjustment imported from a Grayscale file, whose result is
-/// encoded through the file's grey profile (task 112; see
+/// An Exposure adjustment imported from a Grayscale file, applied in the
+/// linear light of the file's grey profile (task 112; see
 /// `aurora_core::exposure_trc` for what was measured).
 ///
-/// Per channel: the encoded value is decoded with the **sRGB** curve,
-/// `x = linear * 2^exposure + offset`, `y = sign(x) |x|^(1/gamma)` clamped
-/// to `0..=1`, and `y` is encoded with the **inverse of the profile's
-/// table** (the first entry reaching `y`, interpolated linearly between
-/// neighbours). A neutral layer is an exact passthrough. CPU only: the GPU
-/// predicate refuses this adjustment.
+/// Per channel: the encoded grey is decoded **through the profile's table**
+/// (linear interpolation between entries), `x = linear * 2^exposure +
+/// offset`, `y = sign(x) |x|^(1/gamma)` is clamped to `0..=1`, and `y` is
+/// encoded with the **inverse of the table** (the first entry reaching `y`,
+/// interpolated linearly between neighbours). A neutral layer is an exact
+/// passthrough (decode then encode would return the input to within the
+/// table's resolution). CPU only: the GPU predicate refuses this
+/// adjustment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExposureTrcOp {
     inner: ExposureOp,
@@ -141,6 +143,21 @@ impl ExposureTrcOp {
         self.inner.is_identity()
     }
 
+    /// The linear light of an encoded grey `v` (`0..=1`): the table read at
+    /// `v * (len - 1)`, interpolated.
+    #[must_use]
+    pub fn decode(&self, v: f32) -> f32 {
+        let v = if v.is_nan() { 0.0 } else { v.max(0.0).min(1.0) };
+        let span = (self.table.len() - 1) as f32;
+        let pos = v * span;
+        // `pos` is in `0..=span`, so the floor is a valid index.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let i = (pos.floor() as usize).min(self.table.len() - 1);
+        let lo = self.table.get(i).copied().unwrap_or(0.0);
+        let hi = self.table.get(i + 1).copied().unwrap_or(lo);
+        lo + (hi - lo) * (pos - i as f32)
+    }
+
     /// The encoded grey whose table value is `y` (`0..=1`).
     #[must_use]
     pub fn encode(&self, y: f32) -> f32 {
@@ -158,7 +175,7 @@ impl ExposureTrcOp {
     }
 
     fn channel(&self, encoded: f32) -> f32 {
-        let linear = srgb_to_linear(encoded);
+        let linear = self.decode(encoded);
         let x = linear.mul_add(self.inner.scale, self.inner.params.offset());
         let y = if x < 0.0 {
             -(-x).powf(self.inner.power)
@@ -414,9 +431,14 @@ mod tests {
         }
     }
 
-    /// The model with the table inverted by brute force in `f64`.
+    /// The model in `f64`: the table read by interpolation to decode, and
+    /// inverted by brute force to encode.
     fn trc_model(v: f64, ev: f64, offset: f64, gamma: f64, t: &[u16]) -> f64 {
-        let x = srgb_decode(v) * 2.0_f64.powf(ev) + offset;
+        let at = |i: usize| f64::from(t.get(i).copied().unwrap_or(0)) / 65535.0;
+        let pos = v.clamp(0.0, 1.0) * (t.len() - 1) as f64;
+        let i = pos.floor() as usize;
+        let lin = at(i) + (at((i + 1).min(t.len() - 1)) - at(i)) * (pos - i as f64);
+        let x = lin * 2.0_f64.powf(ev) + offset;
         let y = (x.signum() * x.abs().powf(1.0 / gamma)).clamp(0.0, 1.0);
         let n = t.len();
         let value = |i: usize| f64::from(t.get(i).copied().unwrap_or(0)) / 65535.0;
@@ -490,18 +512,41 @@ mod tests {
     }
 
     #[test]
-    fn trc_op_uses_the_table_to_encode_not_to_decode() {
-        // Decode is sRGB: with +0 stops and a non-neutral gamma, mid grey
-        // goes to linear 0.2140, gamma 2 lifts it to 0.4626 and a gamma 2.2
-        // table encodes that as 0.4626^(1/2.2) = 0.7052. If the table were
-        // used to decode too, the answer would differ.
+    fn trc_op_decodes_and_encodes_through_the_table() {
+        // A gamma 2.2 table: mid grey decodes to 0.5^2.2 = 0.2176 linear.
+        // Neutral sliders apart from gamma 2 give y = sqrt(0.2176) = 0.4665
+        // and the table encodes that as 0.4665^(1/2.2) = 0.7068. Decoding
+        // with sRGB instead (0.2140 linear) would give 0.7056 - close - so
+        // also check a point where the curves differ strongly.
         let t = table(|x| x.powf(2.2), 1024);
-        let out = trc_op(0.0, 0.0, 2.0, t).apply([0.5; 3]);
-        let lin: f64 = srgb_decode(0.5);
-        let want = lin.sqrt().powf(1.0 / 2.2);
+        let out = trc_op(0.0, 0.0, 2.0, t.clone()).apply([0.5; 3]);
+        let want = 0.5_f64.powf(2.2).sqrt().powf(1.0 / 2.2);
         for c in out {
             assert!((f64::from(c) - want).abs() < 1e-3, "{c} vs {want}");
         }
+        // A table far from sRGB (linear): decode and encode are the
+        // identity, so +1 stop doubles the *encoded* value.
+        let lin = table(|x| x, 256);
+        let out = trc_op(1.0, 0.0, 1.0, lin).apply([0.25; 3]);
+        for c in out {
+            assert!((c - 0.5).abs() < 1e-3, "{c}");
+        }
+        // The sRGB-decode alternative would give a different answer there.
+        let srgb_alt = op(1.0, 0.0, 1.0).apply([0.25; 3]);
+        assert!((srgb_alt[0] - 0.5).abs() > 0.05);
+    }
+
+    #[test]
+    fn trc_decode_interpolates_and_clamps() {
+        let o = trc_op(0.5, 0.0, 1.0, table(|x| x * x, 5));
+        // Entries: 0, 1/16, 1/4, 9/16, 1 at 0, .25, .5, .75, 1.
+        assert!(o.decode(0.0).abs() < 1e-6);
+        assert!((o.decode(1.0) - 1.0).abs() < 1e-6);
+        assert!((o.decode(0.25) - 0.0625).abs() < 1e-4);
+        assert!((o.decode(0.375) - (0.0625 + 0.25) / 2.0).abs() < 1e-4);
+        assert!((o.decode(-4.0)).abs() < 1e-6);
+        assert!((o.decode(9.0) - 1.0).abs() < 1e-6);
+        assert!(o.decode(f32::NAN).abs() < 1e-6);
     }
 
     #[test]

@@ -9,19 +9,23 @@
 //! 256-entry `curv` table, device value to linear Y). Against Photoshop's
 //! own merged image (four Exposure layers with different settings, one
 //! with a non-trivial mask) the model that fits to 0.27-0.37 levels mean
-//! (8-bit rounding noise is 0.29) is: the encoded grey is decoded with
-//! the **sRGB** curve, `x = linear * 2^exposure + offset`, `y = sign(x)
+//! per layer (8-bit rounding noise is 0.29) is Photoshop's colour-managed
+//! one: the stored grey is decoded to linear light **through the
+//! profile's table**, `x = linear * 2^exposure + offset`, `y = sign(x)
 //! |x|^(1/gamma)` clamped to `0..1`, and `y` is encoded with the
-//! **inverse of the profile's table**, not with sRGB. Decoding with the
-//! table, or encoding with sRGB, are 5 to 40 levels off. The asymmetry is
-//! what Photoshop's files show; why it does so is not known. With a table
-//! equal to the sRGB curve the model is the plain Exposure.
+//! **inverse of the table**. Aurora treats a Grayscale document's grey as
+//! sRGB-tagged and ignores the profile, so the plain Exposure decodes with
+//! sRGB instead and is 11 levels off on that file. With a table equal to
+//! the sRGB curve the model is the plain Exposure.
 //!
-//! **Not measured**: a neutral layer (exposure 0, offset 0, gamma 1) is
-//! left an exact passthrough here, as in the RGB Exposure; no fixture says
-//! what Photoshop does with one. Every other gray profile (no profile, a
-//! gamma curve, a parametric curve, a table of another length) has no
-//! fixture and is not imported.
+//! (A first reading of the fixture went through psd-tools' `composite()`,
+//! which already converts the grey to sRGB with the profile, and appeared
+//! to show an sRGB decode with a table encode; the raw stored values
+//! settle it.)
+//!
+//! **Not measured**: only the 256-entry "Dot Gain 20%" table has a
+//! fixture. Every other gray profile (no profile, a gamma curve, a
+//! parametric curve, a table of another length) is not imported.
 //!
 //! # Validation
 //!

@@ -679,7 +679,7 @@ fn note_text(note: Note, n: u64) -> String {
         ),
         Note::GreyExposureDrawn => format!(
             "{n} Exposure layer{s} in this Grayscale file {is} drawn through the file's grey \
-             profile (its 256-entry tone curve encodes the result), as Photoshop does; this was \
+             profile (its 256-entry tone curve decodes and encodes the grey), as Photoshop does; this was \
              checked against one Photoshop file (Dot Gain 20%), and a PSD saved from here \
              carries a plain Exposure instead."
         ),
