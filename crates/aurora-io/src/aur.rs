@@ -5682,6 +5682,7 @@ mod tests {
     /// a save and reopen (manifest and journal replay), with no manifest
     /// version bump.
     #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn round_trips_a_grey_profile_exposure_layer_and_its_history() {
         let (_dir, mut store) = real_tile_store();
         let mut layers = LayerTree::new();

@@ -4,18 +4,19 @@
 //! plain sRGB Exposure, and the save-then-reopen behaviour (a PSD carries a
 //! plain Exposure, itemised).
 
+#![allow(clippy::indexing_slicing, clippy::float_cmp)]
+
 use super::{composite_difference, open_and_composite_psd, real_tile_store};
 
 fn fixture(relative: &str) -> Option<Vec<u8>> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../corpora/psd/reference/psd-tools-fixtures")
         .join(relative);
-    match std::fs::read(&path) {
-        Ok(bytes) => Some(bytes),
-        Err(_) => {
-            println!("SKIPPED: corpus file not present at {}", path.display());
-            None
-        }
+    if let Ok(bytes) = std::fs::read(&path) {
+        Some(bytes)
+    } else {
+        println!("SKIPPED: corpus file not present at {}", path.display());
+        None
     }
 }
 

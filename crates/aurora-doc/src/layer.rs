@@ -149,7 +149,7 @@ impl Adjustment {
             Self::Levels(_) => "Levels",
             Self::HueSaturation(_) | Self::HueSaturationRanges(_) => "Hue/Saturation",
             Self::Vibrance(_) => "Vibrance",
-            Self::Exposure(_) => "Exposure",
+            Self::Exposure(_) | Self::ExposureTrc(_) => "Exposure",
             Self::PhotoFilter(_) => "Photo Filter",
             Self::BlackWhite(_) => "Black & White",
             Self::ColorBalance(_) => "Color Balance",
@@ -160,7 +160,6 @@ impl Adjustment {
             Self::ChannelMixer(_) => "Channel Mixer",
             Self::SelectiveColor(_) => "Selective Color",
             Self::GradientMap(_) => "Gradient Map",
-            Self::ExposureTrc(_) => "Exposure",
         }
     }
 

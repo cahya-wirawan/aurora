@@ -6,7 +6,13 @@
 //! corpus fixture (which prints `SKIPPED` when absent) carries Dot Gain
 //! 20%.
 
-#![allow(clippy::indexing_slicing, clippy::too_many_lines)]
+#![allow(
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 
 use aurora_doc::Adjustment;
 

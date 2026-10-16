@@ -165,6 +165,11 @@ impl GreyReason {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 mod tests {
     use super::{GreyProfile, GreyReason, classify};
 
@@ -172,7 +177,7 @@ mod tests {
     /// bytes, type signature first).
     pub(super) fn profile_with(tag: &[u8]) -> Vec<u8> {
         let mut p = vec![0_u8; 128];
-        p.get_mut(16..20).map(|s| s.copy_from_slice(b"GRAY"));
+        p[16..20].copy_from_slice(b"GRAY");
         p.extend_from_slice(&1_u32.to_be_bytes());
         p.extend_from_slice(b"kTRC");
         p.extend_from_slice(&144_u32.to_be_bytes());

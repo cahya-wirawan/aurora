@@ -147,7 +147,7 @@ impl ExposureTrcOp {
     /// `v * (len - 1)`, interpolated.
     #[must_use]
     pub fn decode(&self, v: f32) -> f32 {
-        let v = if v.is_nan() { 0.0 } else { v.max(0.0).min(1.0) };
+        let v = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
         let span = (self.table.len() - 1) as f32;
         let pos = v * span;
         // `pos` is in `0..=span`, so the floor is a valid index.
@@ -161,7 +161,7 @@ impl ExposureTrcOp {
     /// The encoded grey whose table value is `y` (`0..=1`).
     #[must_use]
     pub fn encode(&self, y: f32) -> f32 {
-        let y = if y.is_nan() { 0.0 } else { y.max(0.0).min(1.0) };
+        let y = if y.is_nan() { 0.0 } else { y.clamp(0.0, 1.0) };
         let i = self.table.partition_point(|&t| t < y);
         if i == 0 {
             return 0.0;
@@ -171,7 +171,7 @@ impl ExposureTrcOp {
         };
         let span = (self.table.len() - 1) as f32;
         let frac = if hi > lo { (y - lo) / (hi - lo) } else { 0.0 };
-        (((i - 1) as f32 + frac) / span).max(0.0).min(1.0)
+        (((i - 1) as f32 + frac) / span).clamp(0.0, 1.0)
     }
 
     fn channel(&self, encoded: f32) -> f32 {
@@ -193,14 +193,20 @@ impl ExposureTrcOp {
             return rgb;
         }
         rgb.map(|v| {
-            let clamped = if v.is_nan() { 0.0 } else { v.max(0.0).min(1.0) };
+            let clamped = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
             self.channel(clamped)
         })
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp)]
+#[allow(
+    clippy::float_cmp,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    clippy::manual_midpoint
+)]
 mod tests {
     use super::ExposureOp;
     use aurora_core::ExposureParams as P;
@@ -567,7 +573,7 @@ mod tests {
         for rgb in [[0.1, 0.5, 0.9], [1.5, -0.25, 0.3], [f32::NAN, 0.0, 2.0]] {
             let out = o.apply(rgb);
             for (a, b) in out.iter().zip(rgb) {
-                assert!(a.to_bits() == b.to_bits());
+                assert_eq!(a.to_bits(), b.to_bits());
             }
         }
         assert!(!trc_op(0.01, 0.0, 1.0, table(|x| x, 2)).is_identity());
