@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.255.0] - 2026-10-16
+
+### Changed
+
+- Exposure in Grayscale PSDs through the file's gray profile
+
 ## [0.254.0] - 2026-10-16
 
 ### Added
