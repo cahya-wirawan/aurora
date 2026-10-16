@@ -156,7 +156,10 @@ fn a_press_on_a_marker_selects_and_grabs_it_without_taking_focus() {
 fn a_press_between_markers_does_nothing_and_grabs_nothing() {
     let mut r = rig();
     let x = (r.x(0.0) + r.x(0.5)) / 2.0;
-    assert_eq!(ok(r.event(PointerPhase::Down, (x, 5.0))), PointerOutcome::Ignored);
+    assert_eq!(
+        ok(r.event(PointerPhase::Down, (x, 5.0))),
+        PointerOutcome::Ignored
+    );
     assert_eq!(r.click.captured(), None);
     assert_eq!(r.state().selected(), 0);
 }
@@ -174,11 +177,20 @@ fn a_drag_reports_each_move_and_the_up_releases() {
     );
     assert!((r.state().stops()[1].position - 0.3).abs() < 0.001);
     // The same place again changes nothing.
-    assert_eq!(ok(r.event(PointerPhase::Move, (to, 20.0))), PointerOutcome::Ignored);
-    assert_eq!(ok(r.event(PointerPhase::Up, (to, 20.0))), PointerOutcome::Released(r.bar));
+    assert_eq!(
+        ok(r.event(PointerPhase::Move, (to, 20.0))),
+        PointerOutcome::Ignored
+    );
+    assert_eq!(
+        ok(r.event(PointerPhase::Up, (to, 20.0))),
+        PointerOutcome::Released(r.bar)
+    );
     assert_eq!(r.click.captured(), None);
     // After the release a move edits nothing.
-    assert_eq!(ok(r.event(PointerPhase::Move, (r.x(0.4), 20.0))), PointerOutcome::Ignored);
+    assert_eq!(
+        ok(r.event(PointerPhase::Move, (r.x(0.4), 20.0))),
+        PointerOutcome::Ignored
+    );
     assert!((r.state().stops()[1].position - 0.3).abs() < 0.001);
 }
 
@@ -271,7 +283,10 @@ fn close(a: [f32; 3], b: [f32; 3]) -> bool {
 fn the_bar_paints_its_gradient_across_the_track_in_the_stops_own_colours() {
     let r = rig();
     let all = ops(&r, &theme());
-    assert!(matches!(all.first(), Some(PaintOp::Gradient(_))), "gradient first");
+    assert!(
+        matches!(all.first(), Some(PaintOp::Gradient(_))),
+        "gradient first"
+    );
     let Some(mesh) = gradient(&all) else {
         unreachable!("a gradient")
     };
@@ -298,7 +313,10 @@ fn the_bar_paints_its_gradient_across_the_track_in_the_stops_own_colours() {
     }
     let ys: Vec<f32> = mesh.vertices.iter().map(|v| v.position.y).collect();
     assert_eq!(ys.iter().copied().fold(f32::MAX, f32::min), 0.0);
-    assert_eq!(ys.iter().copied().fold(f32::MIN, f32::max), scales.spacing.lg as f32);
+    assert_eq!(
+        ys.iter().copied().fold(f32::MIN, f32::max),
+        scales.spacing.lg as f32
+    );
 }
 
 #[test]
@@ -339,14 +357,22 @@ fn a_clipped_bar_paints_only_the_visible_part_with_the_gradients_own_colours() {
     let Some(mesh) = gradient(&all) else {
         unreachable!("a gradient")
     };
-    let max_x = mesh.vertices.iter().map(|v| v.position.x).fold(f32::MIN, f32::max);
+    let max_x = mesh
+        .vertices
+        .iter()
+        .map(|v| v.position.x)
+        .fold(f32::MIN, f32::max);
     assert_eq!(max_x, 80.0, "cut at the clip");
     let half = test_scales().spacing.sm as f32 / 2.0;
     let track = 200.0 - 2.0 * half;
     for v in &mesh.vertices {
         let t = (v.position.x - half) / track;
         let want = gradient_bar_colour_at(&stops(), t).unwrap_or([9.0; 3]);
-        assert!(close([v.color[0], v.color[1], v.color[2]], want), "x {}", v.position.x);
+        assert!(
+            close([v.color[0], v.color[1], v.color[2]], want),
+            "x {}",
+            v.position.x
+        );
     }
 }
 
@@ -376,8 +402,13 @@ fn the_selected_marker_alone_has_the_accent_outline_and_is_drawn_last() {
     ok(widgets::select_gradient_stop(&mut r.tree, r.bar, 2));
     let all = ops(&r, &t);
     let s = solids(&all);
-    assert_eq!(find(&all).len(), 1);
-    assert!((centre(s[s.len() - 1]) - r.x(1.0)).abs() < 1.0, "now on stop 2");
+    let rings = find(&all);
+    assert_eq!(rings.len(), 1);
+    assert_eq!(rings.first().copied(), s.len().checked_sub(1), "still last");
+    assert!(
+        (centre(s[s.len() - 1]) - r.x(1.0)).abs() < 1.0,
+        "now on stop 2"
+    );
 }
 
 #[test]
@@ -406,9 +437,17 @@ fn a_disabled_bar_dims_the_gradient_and_every_solid() {
     let Some(mesh) = gradient(&all) else {
         unreachable!("a gradient")
     };
-    assert!(mesh.vertices.iter().all(|v| v.color[3] == t.state.disabled_opacity));
+    assert!(
+        mesh.vertices
+            .iter()
+            .all(|v| v.color[3] == t.state.disabled_opacity)
+    );
     assert!(!solids(&all).is_empty());
-    assert!(solids(&all).iter().all(|(_, c)| c[3] <= t.state.disabled_opacity));
+    assert!(
+        solids(&all)
+            .iter()
+            .all(|(_, c)| c[3] <= t.state.disabled_opacity)
+    );
 }
 
 #[test]
