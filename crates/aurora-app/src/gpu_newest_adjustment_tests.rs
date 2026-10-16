@@ -14,7 +14,7 @@
 //! ordinary tolerance; on a translucent backdrop the adapters' `straight_
 //! backdrop` division can differ from the CPU's by an `f16` step, which can
 //! put a texel on the other side of an edge. Those runs count the channels
-//! that disagree, bound the fraction at 0.1 % (the HardMix rule of
+//! that disagree, bound the fraction at 0.1 % (the `HardMix` rule of
 //! 0.115.1/0.242.0) and assert each disagreement is exactly one step of the
 //! quantiser (a bin of `1 / (n - 1)` for Posterize, black against white for
 //! Threshold, the colour jump of the stop for Gradient Map).
@@ -25,6 +25,7 @@
 
 #![allow(
     clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
     clippy::indexing_slicing,

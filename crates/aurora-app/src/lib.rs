@@ -20717,7 +20717,20 @@ fn adjustment_layer_qualifies_for_gpu(
             | aurora_doc::Adjustment::Exposure(_)
             | aurora_doc::Adjustment::PhotoFilter(_)
             | aurora_doc::Adjustment::BlackWhite(_)
-            | aurora_doc::Adjustment::ColorBalance(_),
+            | aurora_doc::Adjustment::ColorBalance(_)
+            // Invert, Threshold, Posterize, Brightness/Contrast (0.244.0), Channel
+            // Mixer, Selective Color (0.245.0) and Gradient Map (0.248.0) have a
+            // GPU pass each since 0.250.0 (`composite_invert_with_opacity` and
+            // its six siblings; Brightness/Contrast's default mode is a table
+            // and goes through the Curves pass). Neutral or not, they qualify
+            // like Levels.
+            | aurora_doc::Adjustment::Invert
+            | aurora_doc::Adjustment::Threshold(_)
+            | aurora_doc::Adjustment::Posterize(_)
+            | aurora_doc::Adjustment::BrightnessContrast(_)
+            | aurora_doc::Adjustment::ChannelMixer(_)
+            | aurora_doc::Adjustment::SelectiveColor(_)
+            | aurora_doc::Adjustment::GradientMap(_),
         ) => true,
         Some(aurora_doc::Adjustment::HueSaturationRanges(params)) => {
             aurora_filters::HueSaturationOp::with_ranges(params)
@@ -20728,21 +20741,7 @@ fn adjustment_layer_qualifies_for_gpu(
         // Color Balance (0.240.0) are per-pixel functions with a GPU pass each
         // since 0.242.0 (`composite_vibrance_with_opacity` and its four
         // siblings), admitted above; neutral or not, they qualify like Levels.
-        // Invert, Threshold, Posterize, Brightness/Contrast (0.244.0), Channel
-        // Mixer, Selective Color (0.245.0) and Gradient Map (0.248.0) have a
-        // GPU pass each since 0.250.0 (`composite_invert_with_opacity` and
-        // its six siblings; Brightness/Contrast's default mode is a table
-        // and goes through the Curves pass). Neutral or not, they qualify
-        // like Levels.
-        Some(
-            aurora_doc::Adjustment::Invert
-            | aurora_doc::Adjustment::Threshold(_)
-            | aurora_doc::Adjustment::Posterize(_)
-            | aurora_doc::Adjustment::BrightnessContrast(_)
-            | aurora_doc::Adjustment::ChannelMixer(_)
-            | aurora_doc::Adjustment::SelectiveColor(_)
-            | aurora_doc::Adjustment::GradientMap(_),
-        ) => true,
+
         None => false,
     };
     expressible
@@ -21326,6 +21325,40 @@ fn record_photographer_adjustment_pass(
     true
 }
 
+/// The Brightness/Contrast pass proper: the Use Legacy line (and the
+/// not-applied case) is a pass of its own; the default mode's table goes
+/// through the Curves pass. `false` when the compositor refused it.
+#[allow(clippy::too_many_arguments)]
+fn record_brightness_contrast_pass(
+    gpu: &aurora_gpu::GpuContext,
+    compositor: &mut aurora_render::TileCompositor,
+    encoder: &mut wgpu::CommandEncoder,
+    op: &aurora_filters::BrightnessContrastOp,
+    from: &wgpu::TextureView,
+    to: &wgpu::TextureView,
+    opacity: f32,
+    mode: aurora_render::BlendMode,
+) -> bool {
+    if let Some(packed) = op.packed_for_gpu() {
+        return compositor.composite_brightness_contrast_with_opacity(
+            gpu, encoder, &packed, from, to, opacity, mode,
+        );
+    }
+    let Some((params, table)) = op.curve_for_gpu() else {
+        return false;
+    };
+    compositor.composite_curves_with_opacity(
+        gpu,
+        encoder,
+        params,
+        || table.packed_for_gpu(),
+        from,
+        to,
+        opacity,
+        mode,
+    )
+}
+
 /// Records the GPU pass of one of the seven newest adjustments (Invert,
 /// Threshold, Posterize, Brightness/Contrast, Channel Mixer, Selective
 /// Color, Gradient Map; 0.250.0) and counts it. Brightness/Contrast's
@@ -21381,26 +21414,9 @@ fn record_newest_adjustment_pass(
             note_gpu_posterize_dispatch();
         }
         AdjustmentLut::BrightnessContrast(op) => {
-            if let Some(packed) = op.packed_for_gpu() {
-                if !compositor.composite_brightness_contrast_with_opacity(
-                    gpu, encoder, &packed, from, to, opacity, mode,
-                ) {
-                    return false;
-                }
-            } else if let Some((params, table)) = op.curve_for_gpu() {
-                if !compositor.composite_curves_with_opacity(
-                    gpu,
-                    encoder,
-                    params,
-                    || table.packed_for_gpu(),
-                    from,
-                    to,
-                    opacity,
-                    mode,
-                ) {
-                    return false;
-                }
-            } else {
+            if !record_brightness_contrast_pass(
+                gpu, compositor, encoder, op, from, to, opacity, mode,
+            ) {
                 return false;
             }
             note_gpu_brightness_contrast_dispatch();
