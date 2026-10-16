@@ -131,6 +131,7 @@ use crate::image::Image;
 
 mod descriptor;
 mod effects;
+mod fill;
 #[cfg(test)]
 mod effects_tests;
 #[cfg(test)]
@@ -480,6 +481,13 @@ enum Note {
     /// another colour space).
     PhotoFilterColour,
     FillSkipped,
+    /// Fill layers with no stored pixels, drawn from their fill and vector
+    /// mask (task 108).
+    FillDrawn,
+    /// A drawn gradient fill, whose geometry is only partly checked.
+    FillGradientApproximate,
+    /// A fill layer with no stored pixels that could not be drawn.
+    FillNotDrawn(fill::LeftOut),
     TextRasterised,
     SmartObjectRasterised,
     ShapeRasterised,
@@ -747,6 +755,29 @@ fn note_text(note: Note, n: u64) -> String {
         Note::FillSkipped => format!(
             "{n} shape or fill layer{s} (solid colour, gradient or pattern) with no stored \
              pixels {was} left out — Aurora doesn't have vector shapes or fill layers yet."
+        ),
+        Note::FillDrawn => format!(
+            "{n} shape or fill layer{s} (solid colour or gradient) stored no pixels; {} drawn \
+             from the fill and the vector shape and opened as ordinary pixels (a PSD save \
+             writes those pixels; the fill and the shape cannot be edited).",
+            if one { "it was" } else { "they were" },
+        ),
+        Note::FillGradientApproximate => format!(
+            "{n} gradient fill layer{s} {} drawn from the file's gradient settings; \
+             Photoshop's gradient geometry has been compared with only two of its pictures, so \
+             the gradient can be placed or sized differently from Photoshop's own rendering.",
+            if one { "was" } else { "were" },
+        ),
+        Note::FillNotDrawn(reason) => format!(
+            "{n} shape or fill layer{s} with no stored pixels {was} left out — {}.",
+            match reason {
+                fill::LeftOut::Pattern => "a pattern fill, whose pattern Aurora does not read",
+                fill::LeftOut::Unreadable => "its fill settings could not be read",
+                fill::LeftOut::Colour => "its colour is not stored as RGB or grey",
+                fill::LeftOut::Noise => "a Noise gradient",
+                fill::LeftOut::Style => "a gradient style Aurora does not know",
+                fill::LeftOut::TooLarge => "drawing it would exceed the work or memory bound",
+            },
         ),
         Note::TextRasterised => {
             format!("{n} text layer{s} opened as pixels; the text can't be edited.")
@@ -1569,6 +1600,9 @@ struct Record {
     /// The first `vmsk`/`vsms` block's data (0.150.0), copied out of the
     /// record's extra data (0.154.0) so the record owns it.
     vector: Option<Vec<u8>>,
+    /// The first `SoCo`/`GdFl`/`PtFl` block as `(key, data)`, at most
+    /// [`fill::MAX_FILL_BLOCK_BYTES`] long (task 108).
+    fill: Option<([u8; 4], Vec<u8>)>,
     /// The last `curv` block, parsed (0.158.0).
     curves: Option<Result<CurvBlock, CurvRefusal>>,
     /// The last `levl` block, parsed (0.202.0).
@@ -1717,6 +1751,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let mut fill_opacity = None;
     let mut protected = None;
     let mut vector = None;
+    let mut fill_block: Option<([u8; 4], Vec<u8>)> = None;
     let mut curves = None;
     let mut levels = None;
     let mut hue_saturation = None;
@@ -1775,7 +1810,12 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
                 }
             }
             b"knko" => features.knockout = data.first().is_some_and(|v| *v != 0),
-            k if FILL_KEYS.contains(&k) => features.fill = true,
+            k if FILL_KEYS.contains(&k) => {
+                features.fill = true;
+                if fill_block.is_none() && data.len() <= fill::MAX_FILL_BLOCK_BYTES {
+                    fill_block = Some((*k, data.to_vec()));
+                }
+            }
             // Before the generic arm: Curves is imported (0.158.0), so it
             // does not mark the record as an other-kind adjustment.
             b"curv" => curves = Some(parse_curv(data)),
@@ -1820,6 +1860,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
         fill_opacity,
         features,
         vector,
+        fill: fill_block,
         curves,
         levels,
         hue_saturation,
@@ -3805,8 +3846,7 @@ fn layer_node(
         return None;
     }
     if record.features.fill && record.area() == 0 {
-        notes.add(Note::FillSkipped);
-        return None;
+        return drawn_fill_node(src, record, header, notes, vector_budget);
     }
     // Located, not decoded (0.154.0): `decode` or `read_streaming`
     // decodes it later, one layer at a time.
@@ -3851,6 +3891,113 @@ fn layer_node(
         smart,
         pending,
     }))
+}
+
+/// A shape or fill layer that stores no pixels (task 108), drawn from its
+/// solid colour or gradient and its vector mask as an ordinary pixel layer.
+/// What cannot be drawn is left out and reported, as before.
+fn drawn_fill_node(
+    src: &mut dyn ByteSource,
+    record: &Record,
+    header: Header,
+    notes: &mut Notes,
+    vector_budget: &mut vector::Budget,
+) -> Option<PsdNode> {
+    let left_out = |notes: &mut Notes, why: fill::LeftOut| {
+        notes.add(Note::FillNotDrawn(why));
+        None
+    };
+    let Some((key, data)) = record.fill.as_ref() else {
+        notes.add(Note::FillSkipped);
+        return None;
+    };
+    let fill = match fill::parse(*key, data) {
+        Ok(fill) => fill,
+        Err(why) => return left_out(notes, why),
+    };
+    let canvas = canvas_of(header);
+    // The vector mask, when it is used: a disabled or unreadable one draws
+    // the fill over the whole canvas, as Photoshop shows a disabled mask.
+    let mut path_box = None;
+    let mut raster = None;
+    if let Some(block) = record.vector.as_deref() {
+        let records = (block.len() / 26) as u64 + 1;
+        if records > vector_budget.work {
+            return left_out(notes, fill::LeftOut::TooLarge);
+        }
+        vector_budget.work -= records;
+        if let Ok(path) = vector::parse(block)
+            && !path.disable
+        {
+            raster = match vector::rasterize(&path, header.width, header.height, vector_budget) {
+                Ok(r) => Some(r),
+                Err(_) => return left_out(notes, fill::LeftOut::TooLarge),
+            };
+            path_box = vector::path_extent(&path, header.width, header.height);
+        }
+    }
+    let region = match &raster {
+        Some(r) if !r.outside => r.bounds,
+        _ => canvas,
+    };
+    if region.width == 0 || region.height == 0 {
+        // The shape covers nothing: an empty layer, as drawn.
+        notes.add(Note::FillDrawn);
+        return Some(empty_fill_node(src, record, header, notes, vector_budget));
+    }
+    let charge = u64::from(region.width) * u64::from(region.height);
+    if raster.as_ref().is_none_or(|r| r.outside) {
+        if charge > vector_budget.pixels {
+            return left_out(notes, fill::LeftOut::TooLarge);
+        }
+        vector_budget.pixels -= charge;
+    }
+    let reference = match &fill {
+        fill::Fill::Gradient(g) => fill::reference_box(g, path_box, canvas),
+        fill::Fill::Solid(_) => canvas,
+    };
+    let Some(samples) = fill::render(&fill, region, reference, raster.as_ref()) else {
+        return left_out(notes, fill::LeftOut::TooLarge);
+    };
+    let Ok(image) = Image::new(region.width, region.height, IccProfile::srgb(), samples) else {
+        return left_out(notes, fill::LeftOut::Unreadable);
+    };
+    notes.add(Note::FillDrawn);
+    if matches!(fill, fill::Fill::Gradient(_)) {
+        notes.add(Note::FillGradientApproximate);
+    }
+    let props = props_for(record, notes);
+    let outcome = masks_for(src, record, header, region.union(&canvas), notes, vector_budget);
+    note_unsupported(record, &outcome, notes, true);
+    Some(PsdNode::Layer(PsdLayer {
+        props,
+        bounds: region,
+        image: Some(image),
+        mask: outcome.mask,
+        smart: None,
+        pending: None,
+    }))
+}
+
+/// A drawn fill whose shape covers nothing: a layer with no pixels.
+fn empty_fill_node(
+    src: &mut dyn ByteSource,
+    record: &Record,
+    header: Header,
+    notes: &mut Notes,
+    vector_budget: &mut vector::Budget,
+) -> PsdNode {
+    let props = props_for(record, notes);
+    let outcome = masks_for(src, record, header, canvas_of(header), notes, vector_budget);
+    note_unsupported(record, &outcome, notes, true);
+    PsdNode::Layer(PsdLayer {
+        props,
+        bounds: record.bounds,
+        image: None,
+        mask: outcome.mask,
+        smart: None,
+        pending: None,
+    })
 }
 
 fn canvas_of(header: Header) -> Rect {
