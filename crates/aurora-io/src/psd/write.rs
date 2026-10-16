@@ -294,6 +294,9 @@ struct Losses {
     /// stored as a colour made from the tint hue and saturation, and the
     /// preset name is cleared.
     black_white_written: usize,
+    /// Exposure layers that use a Grayscale file's grey profile (task 112):
+    /// written as a plain Exposure, the profile does not travel.
+    exposure_trc: usize,
     /// Channel Mixer layers that adjust something (0.245.0): written in the
     /// layout Aurora inferred, not checked in Photoshop.
     mixer_unchecked: usize,
@@ -327,7 +330,7 @@ impl Losses {
             aurora_doc::Adjustment::HueSaturation(_)
             | aurora_doc::Adjustment::HueSaturationRanges(_) => Some(2),
             aurora_doc::Adjustment::Vibrance(_) => Some(3),
-            aurora_doc::Adjustment::Exposure(_) => Some(4),
+            aurora_doc::Adjustment::Exposure(_) | aurora_doc::Adjustment::ExposureTrc(_) => Some(4),
             aurora_doc::Adjustment::PhotoFilter(_) => Some(5),
             aurora_doc::Adjustment::BlackWhite(_) => Some(6),
             aurora_doc::Adjustment::ColorBalance(_) => Some(7),
@@ -344,6 +347,10 @@ impl Losses {
         );
         self.black_white_written +=
             usize::from(matches!(adjustment, aurora_doc::Adjustment::BlackWhite(_)));
+        self.exposure_trc += usize::from(matches!(
+            adjustment,
+            aurora_doc::Adjustment::ExposureTrc(_)
+        ));
         if rounding.rounded
             && let Some(count) = slot.and_then(|slot| self.adjustment_rounded.get_mut(slot))
         {
@@ -556,6 +563,21 @@ impl Losses {
                 } else {
                     "them"
                 }
+            ));
+        }
+        if self.exposure_trc > 0 {
+            items.push(format!(
+                "{} the grey profile of the Grayscale file it came from, which an RGB file \
+                 cannot carry; {} will be saved as a plain Exposure with the same sliders, and \
+                 Photoshop will render {} in sRGB light, differently (about 11 levels on \
+                 average in the one file this was measured on).",
+                plural(
+                    self.exposure_trc as u64,
+                    "Exposure layer uses",
+                    "Exposure layers use"
+                ),
+                if self.exposure_trc == 1 { "it" } else { "they" },
+                if self.exposure_trc == 1 { "it" } else { "them" },
             ));
         }
         if self.black_white_written > 0 {

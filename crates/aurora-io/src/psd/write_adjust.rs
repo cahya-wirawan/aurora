@@ -193,6 +193,9 @@ pub(super) fn encode_adjustment(
         Adjustment::Levels(params) => (*b"levl", encode_levl(params, &mut rounding)),
         Adjustment::Vibrance(params) => (*b"vibA", encode_vibrance(*params, &mut rounding)),
         Adjustment::Exposure(params) => (*b"expA", encode_exposure(params)),
+        // The grey profile has no place in an RGB file: the sliders are
+        // written as a plain Exposure (task 112; the save report says so).
+        Adjustment::ExposureTrc(params) => (*b"expA", encode_exposure(&params.exposure())),
         Adjustment::PhotoFilter(params) => (*b"phfl", encode_photo_filter(params, &mut rounding)),
         Adjustment::BlackWhite(params) => (*b"blwh", encode_black_white(params, &mut rounding)),
         Adjustment::ColorBalance(params) => (*b"blnc", encode_color_balance(params, &mut rounding)),

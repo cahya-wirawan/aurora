@@ -15,6 +15,7 @@ pub mod curves;
 pub mod effects;
 pub mod error;
 pub mod exposure;
+pub mod exposure_trc;
 pub mod geometry;
 pub mod gradient_fill;
 pub mod gradient_map;
@@ -50,6 +51,9 @@ pub use curves::CurvesParams;
 pub use effects::LayerEffects;
 pub use error::CoreError;
 pub use exposure::{EXPOSURE_MAX, ExposureError, ExposureParams, OFFSET_MAX};
+pub use exposure_trc::{
+    ExposureTrcParams, GREY_TRC_MAX_ENTRIES, GREY_TRC_MIN_ENTRIES, GreyTrc, GreyTrcError,
+};
 pub use geometry::{MAX_DOCUMENT_EXTENT, MAX_DOCUMENT_ORIGIN, Rect, Size};
 pub use gradient_fill::{
     FillStop, GradientError, GradientFill, GradientFrame, GradientStyle, MAX_GRADIENT_STOPS,
