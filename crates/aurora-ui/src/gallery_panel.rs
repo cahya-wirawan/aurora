@@ -1137,10 +1137,12 @@ mod tests {
         // more wrapped line (20 px) under each of the three captions.
         // 1060 since 0.224.0: three toning-tool icons more (41), one
         // more wrapped line (20 px) under each of the three captions.
+        // 1120 since 0.257.0: four path and channel icons more (49), one
+        // more wrapped line (20 px) under each of the three captions.
         // Unchanged by task 113: the four gradient bars (each a caption
         // and a 36 px bar) went into the LEFT column, which stays shorter
         // than the right one (`the_gradient_bars_fit_in_the_shorter_column`).
-        assert!((min - 1060.0).abs() < f32::EPSILON, "{min}");
+        assert!((min - 1120.0).abs() < f32::EPSILON, "{min}");
         let last_row_vs_body = |height: f32| {
             let (ws, g, _) = opened(height);
             // The taller column's last widget: since 0.133.1 stopped the
@@ -1270,7 +1272,7 @@ mod tests {
         #[allow(clippy::cast_precision_loss)]
         let min = (body.y + i64::from(content)) as f32;
         assert!(
-            (min - 1060.0).abs() < f32::EPSILON,
+            (min - 1120.0).abs() < f32::EPSILON,
             "measured minimum {min}"
         );
     }

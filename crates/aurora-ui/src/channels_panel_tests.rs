@@ -538,15 +538,12 @@ fn the_new_channel_button_draws_the_channels_glyph() {
         let Some(button) = ws.channels_state.toolbar.button_for(action) else {
             unreachable!("{action:?} has a button");
         };
-        let drawn = ws
-            .tree
-            .children(button)
-            .unwrap_or_default()
-            .iter()
-            .find_map(|&child| match ws.tree.payload(child) {
-                Some(aurora_widgets::widgets::WidgetKind::Icon(icon)) => Some(icon.kind),
-                _ => None,
-            });
+        let drawn = match ws.tree.payload(button) {
+            Some(aurora_widgets::widgets::WidgetKind::Button(state)) => {
+                state.icon.map(|(kind, _)| kind)
+            }
+            _ => None,
+        };
         assert_eq!(drawn, Some(kind), "{action:?}");
     }
 }

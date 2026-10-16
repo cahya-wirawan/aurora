@@ -555,6 +555,7 @@ mod clone_stamp_tests;
 mod colour_range_app;
 mod colour_state;
 mod crop;
+mod first_run;
 mod crop_app;
 #[cfg(test)]
 mod crop_ratio_tests;
@@ -3710,6 +3711,8 @@ enum DialogPurpose {
     /// "Save With Changes?" (0.177.0): a written PSD whose report is not
     /// empty waits in `App::pending_psd_save` for Save Anyway or Cancel.
     PsdSaveWithChanges,
+    /// "Welcome to Aurora" (0.257.0), the first-run welcome.
+    Welcome,
 }
 
 /// The open modal dialog (0.169.0): its widgets, what it was opened for,
@@ -3753,6 +3756,8 @@ enum DialogEffect {
     Quit(document_session::DocumentId, document_close::CloseChoice),
     /// Answer the Save With Changes dialog (0.177.0).
     PsdSave(psd_save::PsdSaveChoice),
+    /// Answer the first-run welcome (0.257.0).
+    Welcome(first_run::WelcomeChoice),
     /// The action id is not one this purpose's dialog has — logged,
     /// nothing done.
     Unknown,
@@ -3780,6 +3785,9 @@ fn dialog_effect(result: &DialogResult) -> DialogEffect {
         DialogPurpose::MoveRefused if action == MOVE_REFUSED_DISMISS => DialogEffect::Acknowledged,
         DialogPurpose::ExportedNotSaved if action == document_close::EXPORTED_NOT_SAVED_DISMISS => {
             DialogEffect::Acknowledged
+        }
+        DialogPurpose::Welcome => {
+            first_run::welcome_choice(action).map_or(DialogEffect::Unknown, DialogEffect::Welcome)
         }
         DialogPurpose::PsdSaveWithChanges => {
             psd_save::psd_save_choice(action).map_or(DialogEffect::Unknown, DialogEffect::PsdSave)
@@ -5593,6 +5601,15 @@ enum AppCommand {
 /// exactly the same mechanism a future settings-driven rebind would use,
 /// just with the source string checked in rather than read from
 /// preferences.
+/// The command palette's chord as the shortcut table spells it (`Ctrl+Shift+P`,
+/// `Cmd+Shift+P` on macOS), for the first-run welcome's text (0.257.0).
+fn palette_chord_text(shortcuts: &ShortcutRegistry<AppCommand>) -> String {
+    shortcuts
+        .chords_for(&AppCommand::ToggleCommandPalette)
+        .first()
+        .map_or_else(|| "the command palette".to_owned(), ToString::to_string)
+}
+
 fn default_shortcuts() -> ShortcutRegistry<AppCommand> {
     default_shortcuts_for(PRIMARY_IS_META)
 }
@@ -29724,6 +29741,9 @@ struct App {
     layout_path: Option<PathBuf>,
     /// The workspace presets file, beside [`Self::layout_path`] (0.168.0).
     presets_path: Option<PathBuf>,
+    /// The first-run welcome's marker file (0.257.0), written when the
+    /// welcome is dismissed; `None` when the OS reports no config directory.
+    welcome_marker: Option<PathBuf>,
     /// The user's workspace presets and the active one (0.168.0).
     presets: workspace_presets::WorkspacePresets,
     /// The window's current DPI scale factor (`Window::scale_factor`) —
@@ -30263,6 +30283,20 @@ impl App {
                 failed.len(),
             );
         }
+        // 0.257.0: the first-run welcome, after (and so yielding to) crash
+        // recovery's dialog.
+        let welcome_marker = layout_path.as_deref().map(first_run::marker_path_for);
+        let first_run = first_run::first_run_from_disk(
+            first_run::first_run_override(
+                std::env::var(first_run::FIRST_RUN_ENV).ok().as_deref(),
+            ),
+            layout_path.as_deref(),
+            presets_path.as_deref(),
+        );
+        if first_run::should_show_welcome(first_run, had_previous_marker || was_recovered, false) {
+            let chord = palette_chord_text(&default_shortcuts());
+            first_run::open_welcome_dialog(&mut workspace, &mut focus, &mut dialog, &scales, &chord);
+        }
         // 0.162.0: the status bar shows the startup document from the
         // first frame and the first accessibility tree on.
         // No window yet, so the scale factor is `winit`'s own 1.0 default
@@ -30297,6 +30331,7 @@ impl App {
             marker_path,
             layout_path,
             presets_path,
+            welcome_marker,
             presets,
             scale_factor: 1.0,
             clipboard: SystemClipboard::new(),
@@ -35000,9 +35035,44 @@ impl App {
             DialogEffect::Close(id, choice) => self.answer_close(id, choice),
             DialogEffect::Quit(id, choice) => self.answer_quit(id, choice),
             DialogEffect::PsdSave(choice) => self.answer_psd_save(choice),
+            DialogEffect::Welcome(choice) => self.answer_welcome(choice),
             DialogEffect::Unknown => {
                 tracing::warn!(?result, "a dialog result with no handler");
             }
+        }
+    }
+
+    /// The first-run welcome was answered (0.257.0): remember it (a
+    /// failed write is logged and ignored) and, for the second action,
+    /// open the command palette.
+    fn answer_welcome(&mut self, choice: first_run::WelcomeChoice) {
+        if let Some(path) = self.welcome_marker.as_deref()
+            && let Err(err) = first_run::write_marker(path)
+        {
+            tracing::warn!(?err, path = %path.display(), "failed to remember the welcome");
+        }
+        if choice == first_run::WelcomeChoice::OpenPalette && self.command_palette.is_none() {
+            open_command_palette(&mut self.workspace, &mut self.focus, &mut self.command_palette);
+            // The same dynamic entries a key-opened palette lists.
+            workspace_presets::add_workspace_entries_if_opened(
+                &mut self.workspace,
+                false,
+                self.command_palette,
+                &self.presets,
+            );
+            document_tabs::add_document_entries_if_opened(
+                &mut self.workspace,
+                false,
+                self.command_palette,
+                document_tabs::document_palette_entries(&self.shelf, &self.doc),
+            );
+            selection_store::add_entries_if_opened(
+                &mut self.workspace,
+                false,
+                self.command_palette,
+                &self.doc.selection,
+            );
+            self.relayout_after_gallery();
         }
     }
 
@@ -96388,6 +96458,8 @@ mod gpu_photo_adjustment_tests;
 
 #[cfg(test)]
 mod fill_tests;
+#[cfg(test)]
+mod first_run_tests;
 
 #[cfg(test)]
 mod menu_bar_tests;

@@ -470,16 +470,12 @@ fn fill_stroke_and_make_path_follow_their_facts() {
     assert_eq!(describe(&ws, PathsAction::StrokePath), STROKE_TOO_SMALL);
 }
 
-/// The icon kind drawn inside a toolbar button, found through the tree.
+/// The icon kind drawn inside a toolbar button (its `ButtonState::icon`).
 fn drawn_icon(ws: &Workspace, button: WidgetId) -> Option<aurora_widgets::icons::IconKind> {
-    ws.tree
-        .children(button)
-        .unwrap_or_default()
-        .iter()
-        .find_map(|&child| match ws.tree.payload(child) {
-            Some(WidgetKind::Icon(icon)) => Some(icon.kind),
-            _ => None,
-        })
+    match ws.tree.payload(button) {
+        Some(WidgetKind::Button(state)) => state.icon.map(|(kind, _)| kind),
+        _ => None,
+    }
 }
 
 /// 0.257.0: Fill, Stroke and Make Work Path have glyphs of their own, and
