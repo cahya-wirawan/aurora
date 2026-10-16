@@ -334,3 +334,40 @@ fn an_imported_overlay_spans_the_record_rectangle_not_the_canvas_sized_layer() {
     }
     assert_eq!(seen, 2, "Rectangle 1 and Rectangle 3");
 }
+
+// ---- the clip-group sum (judge fixes) ----
+
+/// One premultiplied texel as an `f16` tile slice.
+fn t4(v: [f32; 4]) -> Vec<half::f16> {
+    v.iter().map(|x| half::f16::from_f32(*x)).collect()
+}
+
+fn clip_sum(acc: [f32; 4], new: [f32; 4], old: [f32; 4]) -> [f32; 4] {
+    let mut a = t4(acc);
+    crate::add_clip_change(&mut a, &t4(new), &t4(old), 1.0);
+    [0, 1, 2, 3].map(|i| a.get(i).map_or(f32::NAN, |v| v.to_f32()))
+}
+
+#[test]
+fn the_clip_sum_is_clamped_into_the_premultiplied_range_where_it_changes() {
+    // Over alpha: 0.9 + 0.4 = 1.3 -> alpha 1. Under zero: 0.1 - 0.4 -> 0.
+    let got = clip_sum([0.9, 0.1, 0.5, 1.0], [0.4, 0.0, 0.5, 1.0], [0.0, 0.4, 0.5, 1.0]);
+    near(got, [1.0, 0.0, 0.5, 1.0]);
+}
+
+#[test]
+fn an_unchanged_channel_keeps_hdr_content_above_its_alpha() {
+    let got = clip_sum([2.0, 0.5, 0.5, 1.0], [0.3, 0.8, 0.5, 1.0], [0.3, 0.5, 0.5, 1.0]);
+    assert_eq!(got.first().copied(), Some(2.0), "delta 0 leaves 2.0 alone");
+    near([0.0, got[1], 0.0, 0.0], [0.0, 0.8, 0.0, 0.0]);
+}
+
+#[test]
+fn a_negative_or_nan_alpha_never_panics_and_is_not_clamped() {
+    // Negative alpha: the bound would be negative; the sum is kept.
+    let got = clip_sum([0.5, 0.5, 0.5, -0.5], [0.4, 0.4, 0.4, 1.0], [0.0, 0.0, 0.0, 1.0]);
+    near(got, [0.9, 0.9, 0.9, -0.5]);
+    // NaN alpha: no panic, the sum is kept.
+    let got = clip_sum([0.5, 0.5, 0.5, f32::NAN], [0.4, 0.4, 0.4, 1.0], [0.0, 0.0, 0.0, 1.0]);
+    assert!(got.iter().take(3).all(|c| (c - 0.9).abs() < 2e-3), "{got:?}");
+}

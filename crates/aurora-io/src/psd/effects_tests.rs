@@ -1541,3 +1541,33 @@ fn a_drawn_gradient_overlay_is_not_reported_and_keeps_its_record_rectangle() {
         Some((0, 0, 1, 1))
     );
 }
+
+#[test]
+fn psd_save_still_itemises_effects_for_a_layer_with_only_a_gradient_overlay() {
+    let mut layers = LayerTree::new();
+    let mut history = aurora_doc::History::new();
+    let bounds = aurora_core::Rect {
+        x: 0,
+        y: 0,
+        width: 4,
+        height: 4,
+    };
+    let id = match history.add_pixel_layer(&mut layers, "g", bounds, None) {
+        Ok(id) => id,
+        Err(err) => unreachable!("{err:?}"),
+    };
+    let read = mapped(&effects_block(&[(b"GrFl", gradient_fill(true, vec![]))]));
+    assert_eq!(read.effects.gradient_overlays.len(), 1);
+    if let Err(err) = layers.set_effects(id, Some(read.effects)) {
+        unreachable!("{err:?}");
+    }
+    let opts = super::write::PsdSaveOptions::default();
+    let items = match super::write::psd_save_preflight(&layers, (4, 4), opts) {
+        Ok(report) => report.items.join("\n"),
+        Err(err) => unreachable!("{err:?}"),
+    };
+    assert!(
+        items.contains("1 layer's effects aren't saved to .psd yet (they are kept in .aur)."),
+        "{items}"
+    );
+}

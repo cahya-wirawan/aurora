@@ -7619,6 +7619,53 @@ mod tests {
         assert_eq!(super::LAYER_EFFECTS_VERSION, 1);
     }
 
+    fn entry_bytes(container: &[u8], name: &str) -> Option<Vec<u8>> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(container)).ok()?;
+        let mut file = archive.by_name(name).ok()?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).ok()?;
+        Some(bytes)
+    }
+
+    /// A save with no overlays is the container every build before task 110
+    /// wrote: no `layer-gradient-overlays` entry, the `layer-effects` entry
+    /// version 1 and re-encoding byte-identically; and with overlays that
+    /// entry is still the version-1 wire with the overlays skipped.
+    #[test]
+    fn a_save_without_overlays_is_the_pre_overlay_container_and_the_effects_wire_is_unchanged() {
+        let (_dir, mut store) = real_tile_store();
+        let (plain, ..) = effects_document(&mut store, true);
+        let names = effects_entry_names(&plain);
+        assert!(
+            names.iter().any(|n| n == super::LAYER_EFFECTS_ENTRY),
+            "{names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .all(|n| n != super::LAYER_GRADIENT_OVERLAYS_ENTRY),
+            "{names:?}"
+        );
+        let (_dir2, mut store2) = real_tile_store();
+        let (with, ..) = gradient_document(&mut store2, true);
+        for container in [&plain, &with] {
+            let Some(bytes) = entry_bytes(container, super::LAYER_EFFECTS_ENTRY) else {
+                unreachable!("layer-effects entry");
+            };
+            let wire: super::LayerEffectsWire = match postcard::from_bytes(&bytes) {
+                Ok(w) => w,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(wire.version, 1);
+            assert!(
+                wire.effects
+                    .iter()
+                    .all(|(_, fx)| fx.gradient_overlays.is_empty())
+            );
+            assert_eq!(postcard::to_allocvec(&wire).unwrap_or_default(), bytes);
+        }
+    }
+
     #[test]
     fn a_bad_gradient_overlay_entry_refuses_loudly() {
         let (_dir, mut store) = real_tile_store();

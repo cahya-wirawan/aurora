@@ -19268,6 +19268,45 @@ fn fold_clipped_atop(
     true
 }
 
+/// Adds each clipped layer's change to a clip group (`group` against
+/// `before`, scaled by the base's `opacity`) to `accumulator`, which holds
+/// the base with its effects and all ([`fold_clip_group`]). The sum is only
+/// a model, so where a texel's colour changes and the sum leaves the valid
+/// premultiplied range (below 0 or above the texel's own alpha, seen on
+/// `stroke-composite.psd` under a gradient overlay) it is clamped back into
+/// it. Task 110, with the judge's fixes: a channel whose change is exactly
+/// 0 is left untouched (legal HDR content above its alpha stays), and the
+/// clamp runs only for a finite, non-negative alpha, as `.max(0.0).min(a)`
+/// (never `f32::clamp`, which panics on a negative or NaN bound).
+fn add_clip_change(
+    accumulator: &mut [half::f16],
+    group: &[half::f16],
+    before: &[half::f16],
+    opacity: f32,
+) {
+    for ((acc, new), old) in accumulator
+        .chunks_exact_mut(aurora_tile::CHANNELS)
+        .zip(group.chunks_exact(aurora_tile::CHANNELS))
+        .zip(before.chunks_exact(aurora_tile::CHANNELS))
+    {
+        let alpha = acc.get(3).map_or(0.0, |a| a.to_f32());
+        for (channel, (n, o)) in acc.iter_mut().zip(new.iter().zip(old)).take(3) {
+            let delta = (n.to_f32() - o.to_f32()) * opacity;
+            #[allow(clippy::float_cmp)] // exactly zero: nothing to add
+            if delta == 0.0 {
+                continue;
+            }
+            let sum = channel.to_f32() + delta;
+            let sum = if alpha.is_finite() && alpha >= 0.0 {
+                sum.max(0.0).min(alpha)
+            } else {
+                sum
+            };
+            *channel = half::f16::from_f32(sum);
+        }
+    }
+}
+
 /// Folds a clip group (0.201.0): `base`, a pixel layer, and the `clipped`
 /// layers above it (bottom to top, [`clipped_above`]), into `accumulator`.
 /// `cover` is the base's already-read exactly-opaque texels when the
@@ -19376,22 +19415,7 @@ fn fold_clip_group(
     }
     if let Some(before) = before.clone() {
         if any {
-            for ((acc, new), old) in accumulator
-                .chunks_exact_mut(aurora_tile::CHANNELS)
-                .zip(group.chunks_exact(aurora_tile::CHANNELS))
-                .zip(before.chunks_exact(aurora_tile::CHANNELS))
-            {
-                // Task 110: the sum of the base's effects-and-all texel and
-                // the clipped layer's change is only a model; where it
-                // leaves the valid premultiplied range (below 0 or above
-                // the texel's own alpha, seen on `stroke-composite.psd`
-                // under a gradient overlay) it is clamped back into it.
-                let alpha = acc.get(3).map_or(0.0, |a| a.to_f32());
-                for (channel, (n, o)) in acc.iter_mut().zip(new.iter().zip(old)).take(3) {
-                    let delta = (n.to_f32() - o.to_f32()) * opacity;
-                    *channel = half::f16::from_f32((channel.to_f32() + delta).clamp(0.0, alpha));
-                }
-            }
+            add_clip_change(accumulator, &group, &before, opacity);
             changed = true;
         }
         return changed;
