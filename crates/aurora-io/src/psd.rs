@@ -488,6 +488,9 @@ enum Note {
     FillGradientApproximate,
     /// A fill layer with no stored pixels that could not be drawn.
     FillNotDrawn(fill::LeftOut),
+    /// Artboard background colours drawn as a layer (task 108).
+    ArtboardBackgroundDrawn,
+    ArtboardBackgroundNotDrawn(fill::ArtboardLeft),
     TextRasterised,
     SmartObjectRasterised,
     ShapeRasterised,
@@ -768,6 +771,21 @@ fn note_text(note: Note, n: u64) -> String {
              the gradient can be placed or sized differently from Photoshop's own rendering.",
             if one { "was" } else { "were" },
         ),
+        Note::ArtboardBackgroundDrawn => format!(
+            "{n} artboard{s} with a custom background colour: the colour {} drawn as a pixel \
+             layer at the bottom of {} (Aurora has no artboards; a PSD save writes that layer).",
+            if one { "was" } else { "were" },
+            if one { "the artboard's group" } else { "each artboard's group" },
+        ),
+        Note::ArtboardBackgroundNotDrawn(reason) => match reason {
+            fill::ArtboardLeft::Unchecked => format!(
+                "{n} artboard{s} with a white or black background: the background {was} not \
+                 drawn (no Photoshop picture of one has been checked)."
+            ),
+            fill::ArtboardLeft::Unreadable => format!(
+                "{n} artboard background{s} could not be read and {was} not drawn."
+            ),
+        },
         Note::FillNotDrawn(reason) => format!(
             "{n} shape or fill layer{s} with no stored pixels {was} left out — {}.",
             match reason {
@@ -1603,6 +1621,8 @@ struct Record {
     /// The first `SoCo`/`GdFl`/`PtFl` block as `(key, data)`, at most
     /// [`fill::MAX_FILL_BLOCK_BYTES`] long (task 108).
     fill: Option<([u8; 4], Vec<u8>)>,
+    /// The first `artb`/`artd`/`abdd` block (task 108).
+    artboard: Option<Vec<u8>>,
     /// The last `curv` block, parsed (0.158.0).
     curves: Option<Result<CurvBlock, CurvRefusal>>,
     /// The last `levl` block, parsed (0.202.0).
@@ -1752,6 +1772,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let mut protected = None;
     let mut vector = None;
     let mut fill_block: Option<([u8; 4], Vec<u8>)> = None;
+    let mut artboard_block: Option<Vec<u8>> = None;
     let mut curves = None;
     let mut levels = None;
     let mut hue_saturation = None;
@@ -1809,6 +1830,11 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
                     vector = Some(data.to_vec());
                 }
             }
+            b"artb" | b"artd" | b"abdd" => {
+                if artboard_block.is_none() && data.len() <= fill::MAX_ARTBOARD_BLOCK_BYTES {
+                    artboard_block = Some(data.to_vec());
+                }
+            }
             b"knko" => features.knockout = data.first().is_some_and(|v| *v != 0),
             k if FILL_KEYS.contains(&k) => {
                 features.fill = true;
@@ -1861,6 +1887,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
         features,
         vector,
         fill: fill_block,
+        artboard: artboard_block,
         curves,
         levels,
         hue_saturation,
@@ -3596,6 +3623,23 @@ fn build_tree(
                     notes.add(Note::BrokenGroups);
                     Vec::new()
                 };
+                let mut children = children;
+                if let Some(block) = record.artboard.as_deref() {
+                    match fill::parse_artboard(block) {
+                        Ok(Some(bg)) => {
+                            if let Some(node) = artboard_background(bg, header, vector_budget) {
+                                children.insert(0, node);
+                                notes.add(Note::ArtboardBackgroundDrawn);
+                            } else {
+                                notes.add(Note::ArtboardBackgroundNotDrawn(
+                                    fill::ArtboardLeft::Unreadable,
+                                ));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(why) => notes.add(Note::ArtboardBackgroundNotDrawn(why)),
+                    }
+                }
                 let props = props_for(record, notes);
                 // Pass Through groups composite for real since 0.179.0 and
                 // their Fill since 0.243.0, which also isolates the
@@ -3998,6 +4042,54 @@ fn empty_fill_node(
         smart: None,
         pending: None,
     })
+}
+
+/// An artboard's background colour as a pixel layer over its rectangle
+/// clipped to the canvas, or `None` when it is empty off the canvas, too
+/// large for the budget, or cannot be built.
+fn artboard_background(
+    bg: fill::ArtboardBackground,
+    header: Header,
+    budget: &mut vector::Budget,
+) -> Option<PsdNode> {
+    let canvas = canvas_of(header);
+    let x0 = bg.rect.x.max(0);
+    let y0 = bg.rect.y.max(0);
+    let x1 = (bg.rect.x + i64::from(bg.rect.width)).min(i64::from(canvas.width));
+    let y1 = (bg.rect.y + i64::from(bg.rect.height)).min(i64::from(canvas.height));
+    let region = Rect {
+        x: x0,
+        y: y0,
+        width: u32::try_from((x1 - x0).max(0)).ok()?,
+        height: u32::try_from((y1 - y0).max(0)).ok()?,
+    };
+    if region.width == 0 || region.height == 0 {
+        return None;
+    }
+    let charge = u64::from(region.width) * u64::from(region.height);
+    if charge > budget.pixels {
+        return None;
+    }
+    let samples = fill::render(&fill::Fill::Solid(bg.colour), region, region, None)?;
+    let image = Image::new(region.width, region.height, IccProfile::srgb(), samples).ok()?;
+    budget.pixels -= charge;
+    Some(PsdNode::Layer(PsdLayer {
+        props: PsdProps {
+            name: "Artboard background".to_owned(),
+            blend: BlendMode::Normal,
+            opacity: 1.0,
+            fill_opacity: 1.0,
+            visible: true,
+            lock: aurora_doc::LayerLock::default(),
+            clipped: false,
+            effects: None,
+        },
+        bounds: region,
+        image: Some(image),
+        mask: None,
+        smart: None,
+        pending: None,
+    }))
 }
 
 fn canvas_of(header: Header) -> Rect {

@@ -126,7 +126,7 @@ pub(super) fn parse(key: [u8; 4], data: &[u8]) -> Result<Fill, LeftOut> {
     }
 }
 
-/// An `RGBC` (0..255) or grey (`Grsc`, 0..255) colour descriptor.
+/// An `RGBC` (0..255) or grey (`Grsc`, ink percent) colour descriptor.
 fn colour(c: &Descriptor) -> Result<[f32; 3], LeftOut> {
     let channel = |key: &[u8]| -> Option<f32> {
         let v = c.get(key)?.number()?;
@@ -138,7 +138,10 @@ fn colour(c: &Descriptor) -> Result<[f32; 3], LeftOut> {
             _ => Err(LeftOut::Unreadable),
         }
     } else if c.get(b"Gry ").is_some() {
-        let g = channel(b"Gry ").ok_or(LeftOut::Unreadable)?;
+        // A Grayscale colour is the ink percentage: 100 is black (checked
+        // on `4x4_16bit_grayscale.psd`: 90.6 shows as level 24).
+        let ink = c.get(b"Gry ").and_then(Value::number).filter(|v| v.is_finite());
+        let g = (1.0 - ink.ok_or(LeftOut::Unreadable)? / 100.0).clamp(0.0, 1.0) as f32;
         Ok([g, g, g])
     } else {
         Err(LeftOut::Colour)
@@ -352,4 +355,86 @@ fn coverage_at(raster: Option<&vector::Raster>, x: i64, y: i64) -> f32 {
     }
     let index = (y - b.y) as usize * b.width as usize + (x - b.x) as usize;
     r.coverage.get(index).map_or(0.0, |c| c.to_f32())
+}
+
+// ---------------------------------------------------------------------
+// Artboard background colour (task 108)
+// ---------------------------------------------------------------------
+
+/// The most an `artb`/`artd`/`abdd` block may hold.
+pub(super) const MAX_ARTBOARD_BLOCK_BYTES: usize = 1 << 16;
+
+/// An artboard's custom background colour over its rectangle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ArtboardBackground {
+    pub rect: Rect,
+    pub colour: [f32; 3],
+}
+
+/// Why an artboard's background is not drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ArtboardLeft {
+    /// White or black (types `1` and `2`): no corpus picture shows them.
+    Unchecked,
+    Unreadable,
+}
+
+/// Reads an artboard block. `Ok(None)` for a transparent background
+/// (type `3`, nothing to draw). Type `4` is a custom colour
+/// (`artboard-bgcolor.psd`: Photoshop's merged image shows exactly the
+/// `Clr ` colour inside `artboardRect`); the other types are not drawn.
+pub(super) fn parse_artboard(data: &[u8]) -> Result<Option<ArtboardBackground>, ArtboardLeft> {
+    if data.len() > MAX_ARTBOARD_BLOCK_BYTES {
+        return Err(ArtboardLeft::Unreadable);
+    }
+    let mut budget = ItemBudget::new();
+    let d = descriptor::parse_adjustment_block(data, &mut budget)
+        .map_err(|_| ArtboardLeft::Unreadable)?;
+    let kind = d
+        .get(b"artboardBackgroundType")
+        .and_then(Value::number)
+        .ok_or(ArtboardLeft::Unreadable)?;
+    #[allow(clippy::float_cmp)] // a small stored integer
+    match kind {
+        k if k == 3.0 => return Ok(None),
+        k if k == 4.0 => {}
+        _ => return Err(ArtboardLeft::Unchecked),
+    }
+    let c = d
+        .get(b"Clr ")
+        .and_then(Value::descriptor)
+        .ok_or(ArtboardLeft::Unreadable)?;
+    let colour = colour(c).map_err(|_| ArtboardLeft::Unreadable)?;
+    let r = d
+        .get(b"artboardRect")
+        .and_then(Value::descriptor)
+        .ok_or(ArtboardLeft::Unreadable)?;
+    let edge = |key: &[u8]| -> Result<i64, ArtboardLeft> {
+        let v = r
+            .get(key)
+            .and_then(Value::number)
+            .filter(|v| v.is_finite() && v.abs() < 1e9)
+            .ok_or(ArtboardLeft::Unreadable)?;
+        Ok(v.round() as i64)
+    };
+    let (top, left, bottom, right) = (edge(b"Top ")?, edge(b"Left")?, edge(b"Btom")?, edge(b"Rght")?);
+    let width = right.saturating_sub(left).max(0);
+    let height = bottom.saturating_sub(top).max(0);
+    Ok(Some(ArtboardBackground {
+        rect: Rect {
+            x: left,
+            y: top,
+            width: u32::try_from(width).map_err(|_| ArtboardLeft::Unreadable)?,
+            height: u32::try_from(height).map_err(|_| ArtboardLeft::Unreadable)?,
+        },
+        colour,
+    }))
+}
+
+#[cfg(test)]
+impl Gradient {
+    /// [`Self::at`] for the tests.
+    pub(super) fn at_for_test(&self, t: f32) -> ([f32; 3], f32) {
+        self.at(t)
+    }
 }

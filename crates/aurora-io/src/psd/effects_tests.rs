@@ -28,7 +28,7 @@ use super::test_writer::{TestLayer, TestPsd};
 // A tiny descriptor encoder, for fixtures
 // ---------------------------------------------------------------------
 
-enum V<'a> {
+pub(super) enum V<'a> {
     Obj(Vec<(&'a [u8], V<'a>)>),
     Glob(Vec<(&'a [u8], V<'a>)>),
     ObjArray(Vec<(&'a [u8], V<'a>)>),
@@ -178,7 +178,7 @@ fn put_value(o: &mut Vec<u8>, v: &V<'_>) {
     }
 }
 
-fn descriptor_bytes(items: &[(&[u8], V<'_>)]) -> Vec<u8> {
+pub(super) fn descriptor_bytes(items: &[(&[u8], V<'_>)]) -> Vec<u8> {
     let mut o = Vec::new();
     put_body(&mut o, items);
     o
@@ -200,7 +200,7 @@ fn parsed(bytes: &[u8]) -> Descriptor {
     }
 }
 
-fn rgb<'a>(r: f64, g: f64, b: f64) -> V<'a> {
+pub(super) fn rgb<'a>(r: f64, g: f64, b: f64) -> V<'a> {
     V::Obj(vec![
         (b"Rd  ", V::Doub(r)),
         (b"Grn ", V::Doub(g)),

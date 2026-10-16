@@ -54,3 +54,46 @@ fn error_by_hidden_layer_for_named_files() {
         }
     }
 }
+
+/// `(file, mean bound after, max bound after)`: task 108's two fixes
+/// against Photoshop's merged images. "Before" (mean levels, 0.250.0):
+/// `vector-mask2.psd` 71.0, `4x4_16bit_rgb.psd` 174.6, `4x4_16bit_grayscale.psd`
+/// 185.0, `artboard-bgcolor.psd` 66.8. What remains: the gradient's length
+/// (Photoshop's is about 16 % shorter than the conventional one on the one
+/// linear picture), the 4x4 reflected picture whose symmetry axis does not
+/// follow the stored angle, a pattern fill and a pattern/gradient overlay.
+const SHAPE_FIDELITY: [(&str, f64, f64); 4] = [
+    ("vector-mask2.psd", 5.0, 70.0),
+    ("colormodes/4x4_16bit_rgb.psd", 27.5, 135.0),
+    ("colormodes/4x4_16bit_grayscale.psd", 18.0, 45.0),
+    ("artboard-bgcolor.psd", 0.05, 1.0),
+];
+
+#[test]
+fn drawn_fills_and_artboard_backgrounds_match_photoshops_merged_images() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../corpora/psd/reference/psd-tools-fixtures");
+    for (file, mean_bound, max_bound) in SHAPE_FIDELITY {
+        let path = root.join(file);
+        let Ok(bytes) = std::fs::read(&path) else {
+            println!("SKIPPED: corpus file not present at {}", path.display());
+            continue;
+        };
+        let Ok(merged) = aurora_io::decode_psd_merged_image(&bytes) else {
+            unreachable!("{file}: no merged image");
+        };
+        let (_scratch, mut store) = real_tile_store();
+        let (_document, after) = open_and_composite_psd(
+            &bytes,
+            &mut store,
+            (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+        );
+        let Some((mean, max)) = audit_diff(&after, &merged) else {
+            unreachable!("{file}: sizes differ");
+        };
+        let mean = mean.iter().sum::<f64>() / 3.0;
+        println!("SHAPE-FIDELITY {file}: mean {mean:.3} max {max:.0}");
+        assert!(mean <= mean_bound, "{file}: mean {mean} over {mean_bound}");
+        assert!(max <= max_bound, "{file}: max {max} over {max_bound}");
+    }
+}
