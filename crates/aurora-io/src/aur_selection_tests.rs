@@ -110,7 +110,11 @@ fn open(bytes: &[u8]) -> Result<AurDocument, crate::IoError> {
 
 fn entry_names(bytes: &[u8]) -> Vec<String> {
     let archive = ok(zip::ZipArchive::new(Cursor::new(bytes)));
-    archive.file_names().map(str::to_owned).collect()
+    archive
+        .file_names()
+        .filter_map(Result::ok)
+        .map(std::borrow::Cow::into_owned)
+        .collect()
 }
 
 /// `bytes` with the selection entry replaced by `payload` (or removed).
@@ -119,7 +123,7 @@ fn with_entry(bytes: &[u8], name: &str, payload: Option<&[u8]>) -> Vec<u8> {
     let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for index in 0..archive.len() {
         let file = ok(archive.by_index_raw(index));
-        if file.name() == name {
+        if file.name_raw() == name.as_bytes() {
             continue;
         }
         ok(out.raw_copy_file(file));

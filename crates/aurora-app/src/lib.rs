@@ -43230,7 +43230,7 @@ mod tests {
                 Ok(entry) => entry,
                 Err(err) => unreachable!("{err:?}"),
             };
-            if entry.name() == mask_entry {
+            if entry.name_raw() == mask_entry.as_bytes() {
                 continue;
             }
             if let Err(err) = rebuilt.raw_copy_file(entry) {
@@ -67838,7 +67838,11 @@ mod tests {
             Ok(archive) => archive,
             Err(err) => unreachable!("the autosave must be a real ZIP container: {err}"),
         };
-        let names: Vec<String> = archive.file_names().map(str::to_owned).collect();
+        let names: Vec<String> = archive
+            .file_names()
+            .filter_map(Result::ok)
+            .map(std::borrow::Cow::into_owned)
+            .collect();
         for entry in ["mimetype", "manifest", "history"] {
             assert!(
                 names.iter().any(|name| name == entry),

@@ -206,10 +206,28 @@ fn build_rich() -> Vec<u8> {
         }),
     ));
     let base_surface = surface_of(&tree, base);
-    put(&mut store, base_surface, TileId { x: 0, y: 0 }, 0, [1.0, 0.5, 0.25, 1.0]);
-    put(&mut store, base_surface, TileId { x: 1, y: 0 }, 5, [0.0, 1.0, 0.0, 1.0]);
+    put(
+        &mut store,
+        base_surface,
+        TileId { x: 0, y: 0 },
+        0,
+        [1.0, 0.5, 0.25, 1.0],
+    );
+    put(
+        &mut store,
+        base_surface,
+        TileId { x: 1, y: 0 },
+        5,
+        [0.0, 1.0, 0.0, 1.0],
+    );
     let top_surface = surface_of(&tree, top);
-    put(&mut store, top_surface, TileId { x: 0, y: 0 }, 1, [0.25, 0.25, 0.25, 0.5]);
+    put(
+        &mut store,
+        top_surface,
+        TileId { x: 0, y: 0 },
+        1,
+        [0.25, 0.25, 0.25, 0.5],
+    );
     let _ = curves;
     let losses = vec![
         "Opened with changes: line one.".to_owned(),
@@ -289,8 +307,20 @@ fn build_snapshot() -> Vec<u8> {
     let mut history = History::new();
     let a = ok(history.add_pixel_layer(&mut tree, "Snap A", r(0, 0, 300, 100), None));
     let b = ok(history.add_pixel_layer(&mut tree, "Snap B", r(0, 0, 300, 100), None));
-    put(&mut store, surface_of(&tree, a), TileId { x: 0, y: 0 }, 3, [0.5, 0.5, 0.0, 1.0]);
-    put(&mut store, surface_of(&tree, b), TileId { x: 1, y: 0 }, 9, [0.0, 0.5, 0.5, 0.75]);
+    put(
+        &mut store,
+        surface_of(&tree, a),
+        TileId { x: 0, y: 0 },
+        3,
+        [0.5, 0.5, 0.0, 1.0],
+    );
+    put(
+        &mut store,
+        surface_of(&tree, b),
+        TileId { x: 1, y: 0 },
+        9,
+        [0.0, 0.5, 0.5, 0.75],
+    );
     let snapshot = ok(snapshot_best_effort(
         &tree,
         &history,
@@ -318,7 +348,7 @@ fn rewritten_with(bytes: &[u8], method: CompressionMethod) -> Vec<u8> {
     let options = zip::write::SimpleFileOptions::default().compression_method(method);
     for index in 0..src.len() {
         let mut file = ok(src.by_index(index));
-        let name = file.name().to_owned();
+        let name = String::from_utf8_lossy(file.name_raw()).into_owned();
         let mut data = Vec::new();
         ok(file.read_to_end(&mut data));
         ok(out.start_file(name, options));
@@ -382,7 +412,7 @@ fn entry_table(bytes: &[u8]) -> Vec<EntryInfo> {
         let mut data = Vec::new();
         ok(file.read_to_end(&mut data));
         out.push(EntryInfo {
-            name: file.name().to_owned(),
+            name: String::from_utf8_lossy(file.name_raw()).into_owned(),
             method: file.compression(),
             crc32: file.crc32(),
             size: file.size(),
@@ -496,7 +526,10 @@ fn old_rich_fixture_opens_with_every_optional_entry() {
     let top = layer_named(&doc, "Top");
     let group = layer_named(&doc, "Group");
     let curves = layer_named(&doc, "Curves 1");
-    assert!(matches!(doc.layers.kind(group), Some(LayerKind::Group { .. })));
+    assert!(matches!(
+        doc.layers.kind(group),
+        Some(LayerKind::Group { .. })
+    ));
     assert_eq!(doc.layers.parent(curves), Some(group));
     assert!(matches!(
         doc.layers.adjustment(curves),
@@ -512,19 +545,37 @@ fn old_rich_fixture_opens_with_every_optional_entry() {
         Some("so-1")
     );
     assert_eq!(
-        doc.layers.linked_files().get("so-1").map(|f| f.entry.as_ref()),
+        doc.layers
+            .linked_files()
+            .get("so-1")
+            .map(|f| f.entry.as_ref()),
         Some(&framed_file())
     );
     assert_px(
-        get(&mut store, surface_of(&doc.layers, base), TileId { x: 0, y: 0 }, 0),
+        get(
+            &mut store,
+            surface_of(&doc.layers, base),
+            TileId { x: 0, y: 0 },
+            0,
+        ),
         [1.0, 0.5, 0.25, 1.0],
     );
     assert_px(
-        get(&mut store, surface_of(&doc.layers, base), TileId { x: 1, y: 0 }, 5),
+        get(
+            &mut store,
+            surface_of(&doc.layers, base),
+            TileId { x: 1, y: 0 },
+            5,
+        ),
         [0.0, 1.0, 0.0, 1.0],
     );
     assert_px(
-        get(&mut store, surface_of(&doc.layers, top), TileId { x: 0, y: 0 }, 1),
+        get(
+            &mut store,
+            surface_of(&doc.layers, top),
+            TileId { x: 0, y: 0 },
+            1,
+        ),
         [0.25, 0.25, 0.25, 0.5],
     );
     assert_eq!(doc.import_losses.as_ref().map(Vec::len), Some(2));
@@ -570,11 +621,21 @@ fn old_autosave_snapshot_fixture_opens() {
     let a = layer_named(&doc, "Snap A");
     let b = layer_named(&doc, "Snap B");
     assert_px(
-        get(&mut store, surface_of(&doc.layers, a), TileId { x: 0, y: 0 }, 3),
+        get(
+            &mut store,
+            surface_of(&doc.layers, a),
+            TileId { x: 0, y: 0 },
+            3,
+        ),
         [0.5, 0.5, 0.0, 1.0],
     );
     assert_px(
-        get(&mut store, surface_of(&doc.layers, b), TileId { x: 1, y: 0 }, 9),
+        get(
+            &mut store,
+            surface_of(&doc.layers, b),
+            TileId { x: 1, y: 0 },
+            9,
+        ),
         [0.0, 0.5, 0.5, 0.75],
     );
     assert!(doc.selection.active().is_some());
@@ -594,7 +655,12 @@ fn a_reader_does_not_care_which_method_wrote_which_entry() {
         let (_d, mut store, doc) = open(&bytes);
         let a = layer_named(&doc, "Snap A");
         assert_px(
-            get(&mut store, surface_of(&doc.layers, a), TileId { x: 0, y: 0 }, 3),
+            get(
+                &mut store,
+                surface_of(&doc.layers, a),
+                TileId { x: 0, y: 0 },
+                3,
+            ),
             [0.5, 0.5, 0.0, 1.0],
         );
         assert_eq!(doc.selection.saved_count(), 2);

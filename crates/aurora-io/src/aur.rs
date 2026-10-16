@@ -976,8 +976,8 @@ const MAX_TOTAL_TILES_PER_DOCUMENT: u64 = {
 /// pair: `ZipFile::size()` is the container's own *claim* about the
 /// uncompressed size and a crafted archive is free to lie about it, so
 /// the actual read is bounded by `Read::take` as well.
-pub(crate) fn read_capped(
-    mut file: zip::read::ZipFile<'_>,
+pub(crate) fn read_capped<R: Read + ?Sized>(
+    mut file: zip::read::ZipFile<'_, R>,
     name: &str,
     cap: u64,
 ) -> Result<Vec<u8>, IoError> {
@@ -3194,7 +3194,10 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert!(
-            archive.file_names().all(|name| !name.starts_with("tiles/")),
+            archive
+                .file_names()
+                .filter_map(Result::ok)
+                .all(|name| !name.starts_with("tiles/")),
             "a never-painted layer must not write out any tile entries: {:?}",
             archive.file_names().collect::<Vec<_>>()
         );
@@ -3284,6 +3287,7 @@ mod tests {
         assert_eq!(
             archive
                 .file_names()
+                .filter_map(Result::ok)
                 .filter(|name| name.starts_with("tiles/"))
                 .count(),
             1,
@@ -4416,6 +4420,7 @@ mod tests {
         let prefix = format!("tiles/{}/", mask_surface.to_raw());
         let mask_entries = archive
             .file_names()
+            .filter_map(Result::ok)
             .filter(|name| name.starts_with(&prefix))
             .count();
         assert_eq!(
@@ -4617,7 +4622,7 @@ mod tests {
                 Ok(file) => file,
                 Err(err) => unreachable!("{err:?}"),
             };
-            if file.name() == super::MASK_DENSITY_ENTRY {
+            if file.name_raw() == super::MASK_DENSITY_ENTRY.as_bytes() {
                 continue;
             }
             if let Err(err) = out.raw_copy_file(file) {
@@ -4651,7 +4656,10 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert!(
-            archive.file_names().any(|n| n == super::MASK_DENSITY_ENTRY),
+            archive
+                .file_names()
+                .filter_map(Result::ok)
+                .any(|n| n == super::MASK_DENSITY_ENTRY),
             "{:?}",
             archive.file_names().collect::<Vec<_>>()
         );
@@ -4719,7 +4727,10 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert!(
-            archive.file_names().all(|n| n != super::MASK_DENSITY_ENTRY),
+            archive
+                .file_names()
+                .filter_map(Result::ok)
+                .all(|n| n != super::MASK_DENSITY_ENTRY),
             "{:?}",
             archive.file_names().collect::<Vec<_>>()
         );
@@ -5796,7 +5807,11 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         let mask_prefix = format!("tiles/{}/", mask_surface.to_raw());
-        let names: Vec<&str> = archive.file_names().collect();
+        let names: Vec<String> = archive
+            .file_names()
+            .filter_map(Result::ok)
+            .map(std::borrow::Cow::into_owned)
+            .collect();
         assert!(
             !names.iter().any(|name| name.starts_with(&mask_prefix)),
             "an unpainted mask must write no entries at all: {names:?}"
@@ -7195,7 +7210,7 @@ mod tests {
                 Ok(file) => file,
                 Err(err) => unreachable!("{err:?}"),
             };
-            if file.name() == name {
+            if file.name_raw() == name.as_bytes() {
                 continue;
             }
             if let Err(err) = out.raw_copy_file(file) {
@@ -7218,7 +7233,11 @@ mod tests {
 
     fn effects_entry_names(bytes: &[u8]) -> Vec<String> {
         match zip::ZipArchive::new(Cursor::new(bytes)) {
-            Ok(archive) => archive.file_names().map(str::to_owned).collect(),
+            Ok(archive) => archive
+                .file_names()
+                .filter_map(Result::ok)
+                .map(std::borrow::Cow::into_owned)
+                .collect(),
             Err(err) => unreachable!("{err:?}"),
         }
     }
@@ -7406,7 +7425,11 @@ mod import_losses_tests {
 
     fn entry_names(bytes: &[u8]) -> Vec<String> {
         let archive = ok(zip::ZipArchive::new(Cursor::new(bytes)));
-        archive.file_names().map(str::to_owned).collect()
+        archive
+            .file_names()
+            .filter_map(Result::ok)
+            .map(std::borrow::Cow::into_owned)
+            .collect()
     }
 
     /// `bytes` with the `import-losses` entry replaced by `payload`.
@@ -7415,7 +7438,7 @@ mod import_losses_tests {
         let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
         for index in 0..archive.len() {
             let file = ok(archive.by_index_raw(index));
-            if file.name() == IMPORT_LOSSES_ENTRY {
+            if file.name_raw() == IMPORT_LOSSES_ENTRY.as_bytes() {
                 continue;
             }
             ok(out.raw_copy_file(file));
