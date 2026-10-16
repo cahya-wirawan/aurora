@@ -43,6 +43,8 @@ impl App {
         // One popover at a time: the colour picker and the blend-mode list
         // (and the gallery's) close first.
         self.close_colour_popover_now(false);
+        self.doc_overflow
+            .close(&mut self.workspace, &mut self.focus, false);
         let controls = self.layer_controls.controls;
         crate::close_open_popovers(
             &mut self.workspace.tree,
@@ -105,6 +107,11 @@ impl App {
 
     /// What a routed outcome on the bar means (opening, closing, running).
     pub(crate) fn apply_menu_bar_outcome(&mut self, outcome: &PointerOutcome) {
+        // The document strip's overflow button and popup (0.260.0) share
+        // this route.
+        if self.apply_document_overflow_outcome(outcome) {
+            return;
+        }
         let action = self
             .menu_bar
             .action_for(&mut self.workspace, &mut self.focus, outcome);
@@ -185,6 +192,12 @@ impl App {
         {
             self.relayout_after_gallery();
         }
+        if self
+            .doc_overflow
+            .light_dismiss(&mut self.workspace, &mut self.focus, position)
+        {
+            self.relayout_after_gallery();
+        }
     }
 
     /// Tints the title under the pointer and, while a menu is open, switches
@@ -213,6 +226,7 @@ impl App {
     /// open menu under a modal.
     pub(crate) fn sync_menu_bar_now(&mut self) {
         self.menu_bar.forget_stale(&mut self.workspace);
+        self.sync_document_overflow_now();
         let modal = self.menu_bar_modal();
         if self
             .menu_bar
