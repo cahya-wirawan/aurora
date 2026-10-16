@@ -748,3 +748,390 @@ fn every_fixture_round_trips_through_the_current_writer() {
 fn write_is_deterministic_across_two_calls() {
     assert_eq!(entry_table(&build_rich()), entry_table(&build_rich()));
 }
+
+// ---------------------------------------------------------------------
+// The raw envelope, read without the crate under test
+// ---------------------------------------------------------------------
+
+fn u16_at(b: &[u8], at: usize) -> u16 {
+    b.get(at..at + 2)
+        .and_then(|s| <[u8; 2]>::try_from(s).ok())
+        .map_or(0, u16::from_le_bytes)
+}
+
+fn u32_at(b: &[u8], at: usize) -> u32 {
+    b.get(at..at + 4)
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        .map_or(0, u32::from_le_bytes)
+}
+
+/// One central-directory record, parsed by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawCd {
+    /// Position of the record itself in the file.
+    at: usize,
+    name: Vec<u8>,
+    version_made: u16,
+    version_needed: u16,
+    flags: u16,
+    method: u16,
+    time: u16,
+    date: u16,
+    crc: u32,
+    csize: u32,
+    usize: u32,
+    disk: u16,
+    internal: u16,
+    external: u32,
+    local_offset: u32,
+    extra: Vec<u8>,
+    comment_len: u16,
+}
+
+fn raw_central_directory(b: &[u8]) -> Vec<RawCd> {
+    let Some(eocd) = b.windows(4).rposition(|w| w == b"PK\x05\x06") else {
+        unreachable!("no end of central directory")
+    };
+    let count = usize::from(u16_at(b, eocd + 10));
+    let mut at = u32_at(b, eocd + 16) as usize;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        assert_eq!(b.get(at..at + 4), Some(&b"PK\x01\x02"[..]));
+        let nlen = usize::from(u16_at(b, at + 28));
+        let elen = usize::from(u16_at(b, at + 30));
+        let clen = u16_at(b, at + 32);
+        out.push(RawCd {
+            at,
+            name: b.get(at + 46..at + 46 + nlen).unwrap_or_default().to_vec(),
+            version_made: u16_at(b, at + 4),
+            version_needed: u16_at(b, at + 6),
+            flags: u16_at(b, at + 8),
+            method: u16_at(b, at + 10),
+            time: u16_at(b, at + 12),
+            date: u16_at(b, at + 14),
+            crc: u32_at(b, at + 16),
+            csize: u32_at(b, at + 20),
+            usize: u32_at(b, at + 24),
+            disk: u16_at(b, at + 34),
+            internal: u16_at(b, at + 36),
+            external: u32_at(b, at + 38),
+            local_offset: u32_at(b, at + 42),
+            extra: b
+                .get(at + 46 + nlen..at + 46 + nlen + elen)
+                .unwrap_or_default()
+                .to_vec(),
+            comment_len: clen,
+        });
+        at += 46 + nlen + elen + usize::from(clen);
+    }
+    out
+}
+
+/// Start of an entry's payload (after its local header).
+fn payload_at(b: &[u8], cd: &RawCd) -> usize {
+    let l = cd.local_offset as usize;
+    assert_eq!(b.get(l..l + 4), Some(&b"PK\x03\x04"[..]));
+    l + 30 + usize::from(u16_at(b, l + 26)) + usize::from(u16_at(b, l + 28))
+}
+
+fn cd_named<'a>(cds: &'a [RawCd], prefix: &str) -> &'a RawCd {
+    match cds.iter().find(|c| c.name.starts_with(prefix.as_bytes())) {
+        Some(c) => c,
+        None => unreachable!("no entry starting {prefix}"),
+    }
+}
+
+fn put_u32(b: &mut [u8], at: usize, v: u32) {
+    if let Some(s) = b.get_mut(at..at + 4) {
+        s.copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Everything the envelope says about each entry, except the sizes of a
+/// compressed stream (and so the offsets that follow them).
+#[test]
+fn a_fresh_write_has_the_old_envelope_field_for_field() {
+    for (name, fresh) in build_all() {
+        let old = fixture(name);
+        let (o, n) = (raw_central_directory(&old), raw_central_directory(&fresh));
+        assert_eq!(o.len(), n.len(), "{name}");
+        for (a, b) in o.iter().zip(&n) {
+            let label = format!("{name}/{}", String::from_utf8_lossy(&a.name));
+            assert_eq!(a.name, b.name, "{label}");
+            assert_eq!(a.version_made, b.version_made, "{label} version made by");
+            assert_eq!(a.version_needed, b.version_needed, "{label} version needed");
+            assert_eq!(a.flags, b.flags, "{label} flags");
+            assert_eq!(a.method, b.method, "{label} method");
+            assert_eq!((a.time, a.date), (b.time, b.date), "{label} timestamp");
+            assert_eq!(a.crc, b.crc, "{label} crc");
+            assert_eq!(a.usize, b.usize, "{label} size");
+            assert_eq!((a.disk, a.internal), (b.disk, b.internal), "{label}");
+            assert_eq!(a.external, b.external, "{label} permissions");
+            assert_eq!(a.extra, b.extra, "{label} extra fields");
+            assert_eq!(a.comment_len, b.comment_len, "{label}");
+        }
+    }
+}
+
+/// The timestamps are the deterministic MS-DOS 1980-01-01 00:00 the old
+/// build wrote (no `time` feature), so equal documents give equal bytes.
+#[test]
+fn entries_carry_the_fixed_1980_timestamp() {
+    for cd in raw_central_directory(&build_rich()) {
+        assert_eq!(cd.time, 0);
+        assert_eq!(cd.date, (1 << 5) | 1, "1980-01-01");
+    }
+}
+
+/// With no deflate stream in the file, the whole file is byte for byte
+/// what zip 2.4.2 wrote.
+#[test]
+fn a_stored_only_file_is_byte_identical_to_the_old_one() {
+    let (_, fresh) = build_all()
+        .into_iter()
+        .find(|(n, _)| *n == "all-stored.aur")
+        .unwrap_or_default();
+    assert_eq!(fresh, fixture("all-stored.aur"));
+}
+
+// ---------------------------------------------------------------------
+// Hostile and odd containers (what zip 9.0.3 does, tested)
+// ---------------------------------------------------------------------
+
+fn good_parts() -> (Vec<u8>, Vec<u8>) {
+    let table = entry_table(&fixture("empty.aur"));
+    let get = |n: &str| {
+        table
+            .iter()
+            .find(|e| e.name == n)
+            .map(|e| e.data.clone())
+            .unwrap_or_default()
+    };
+    (get("manifest"), get("history"))
+}
+
+fn deflated() -> zip::write::SimpleFileOptions {
+    zip::write::SimpleFileOptions::default().compression_method(CompressionMethod::Deflated)
+}
+
+/// Two entries with the same name, made by writing `manifesx` second and
+/// renaming it in both headers (the writer refuses real duplicates).
+fn duplicate_manifest(first_good: bool) -> Vec<u8> {
+    let (manifest, history) = good_parts();
+    let junk = vec![0xFF_u8; 40];
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    ok(out.start_file("manifest", deflated()));
+    ok(out.write_all(if first_good { &manifest } else { &junk }));
+    ok(out.start_file("history", deflated()));
+    ok(out.write_all(&history));
+    ok(out.start_file("manifesx", deflated()));
+    ok(out.write_all(if first_good { &junk } else { &manifest }));
+    let mut bytes = ok(out.finish()).into_inner();
+    let mut i = 0;
+    while let Some(w) = bytes.get_mut(i..i + 8) {
+        if w == b"manifesx" {
+            w.copy_from_slice(b"manifest");
+        }
+        i += 1;
+    }
+    bytes
+}
+
+#[test]
+fn the_writer_refuses_a_duplicate_entry_name() {
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    ok(out.start_file("manifest", deflated()));
+    assert!(out.start_file("manifest", deflated()).is_err());
+}
+
+/// G-14: two central-directory records with one name collapse to ONE
+/// entry, at the position of the first, holding the data of the LAST.
+#[test]
+fn duplicate_names_collapse_to_the_last_record_at_the_first_position() {
+    for first_good in [true, false] {
+        let bytes = duplicate_manifest(first_good);
+        assert_eq!(raw_central_directory(&bytes).len(), 3, "three raw records");
+        let mut archive = ok(ZipArchive::new(Cursor::new(&bytes)));
+        assert_eq!(archive.len(), 2, "the duplicate collapsed");
+        let names: Vec<String> = archive
+            .file_names()
+            .filter_map(Result::ok)
+            .map(std::borrow::Cow::into_owned)
+            .collect();
+        assert_eq!(names, ["manifest", "history"], "first position");
+        let mut data = Vec::new();
+        ok(ok(archive.by_name("manifest")).read_to_end(&mut data));
+        let (good, _) = good_parts();
+        assert_eq!(data == good, !first_good, "the last record's data wins");
+        let (_d, mut store) = store();
+        let opened = read(Cursor::new(bytes), &mut store);
+        assert_eq!(opened.is_ok(), !first_good, "{opened:?}");
+    }
+}
+
+#[test]
+fn a_flipped_payload_byte_fails_the_crc_for_stored_and_deflated_entries() {
+    // Stored: a tile entry of the large fixture and a smart-object file.
+    for (file, prefix) in [("large.aur", "tiles/"), ("rich.aur", "smart-object-file-0")] {
+        let mut bytes = fixture(file);
+        let cds = raw_central_directory(&bytes);
+        let cd = cd_named(&cds, prefix);
+        assert_eq!(cd.method, 0, "{prefix} is Stored");
+        let at = payload_at(&bytes, cd) + 3;
+        if let Some(b) = bytes.get_mut(at) {
+            *b ^= 0x55;
+        }
+        let (_d, mut store) = store();
+        assert!(
+            read(Cursor::new(bytes), &mut store).is_err(),
+            "{file}/{prefix}: a corrupt Stored entry must not read"
+        );
+    }
+    // Deflated: the manifest.
+    let mut bytes = fixture("rich.aur");
+    let cds = raw_central_directory(&bytes);
+    let cd = cd_named(&cds, "manifest");
+    assert_eq!(cd.method, 8);
+    let at = payload_at(&bytes, cd) + 5;
+    if let Some(b) = bytes.get_mut(at) {
+        *b ^= 0x55;
+    }
+    let (_d, mut store) = store();
+    assert!(read(Cursor::new(bytes), &mut store).is_err());
+}
+
+#[test]
+fn a_wrong_crc_in_the_directory_is_refused() {
+    let mut bytes = fixture("rich.aur");
+    let cds = raw_central_directory(&bytes);
+    let cd = cd_named(&cds, "manifest").clone();
+    put_u32(&mut bytes, cd.at + 16, cd.crc ^ 1);
+    let (_d, mut store) = store();
+    assert!(read(Cursor::new(bytes), &mut store).is_err());
+}
+
+/// A directory that claims more than the cap is refused from the claim
+/// alone (nothing is read), whatever the real data is.
+#[test]
+fn an_overstated_size_is_refused_before_reading() {
+    let mut bytes = fixture("empty.aur");
+    let cds = raw_central_directory(&bytes);
+    let cd = cd_named(&cds, "manifest").clone();
+    put_u32(&mut bytes, cd.at + 24, 200 * 1024 * 1024);
+    let (_d, mut store) = store();
+    match read(Cursor::new(bytes), &mut store) {
+        Err(crate::IoError::EntryTooLarge { name, size, .. }) => {
+            assert_eq!(name, "manifest");
+            assert_eq!(size, 200 * 1024 * 1024);
+        }
+        other => unreachable!("expected EntryTooLarge, got {other:?}"),
+    }
+}
+
+/// An entry that claims to be smaller than it is never yields the extra
+/// bytes: zip 9 fails the read, and `read_capped` would refuse anyway.
+#[test]
+fn an_understated_size_never_yields_more_than_it_claimed() {
+    let mut bytes = fixture("rich.aur");
+    let cds = raw_central_directory(&bytes);
+    let cd = cd_named(&cds, "manifest").clone();
+    assert!(cd.usize > 20);
+    put_u32(&mut bytes, cd.at + 24, 20);
+    let mut archive = ok(ZipArchive::new(Cursor::new(&bytes)));
+    let mut got = Vec::new();
+    let result = ok(archive.by_name("manifest")).read_to_end(&mut got);
+    // zip 9 stops one byte past the claim and fails the read.
+    assert!(got.len() <= 21, "{} bytes leaked", got.len());
+    assert!(result.is_err(), "the lying entry must fail its read");
+    let (_d, mut store) = store();
+    assert!(read(Cursor::new(bytes), &mut store).is_err());
+}
+
+#[test]
+fn an_empty_and_a_truncated_archive_are_refused() {
+    let (_d, mut store) = store();
+    let empty = ok(zip::ZipWriter::new(Cursor::new(Vec::new())).finish()).into_inner();
+    match read(Cursor::new(empty), &mut store) {
+        Err(crate::IoError::MissingEntry(name)) => assert_eq!(name, "manifest"),
+        other => unreachable!("{other:?}"),
+    }
+    let full = fixture("rich.aur");
+    for cut in [0, 10, full.len() / 2, full.len() - 1] {
+        let part = full.get(..cut).unwrap_or_default().to_vec();
+        assert!(read(Cursor::new(part), &mut store).is_err(), "cut at {cut}");
+    }
+}
+
+/// G-14: ZIP64 records, an archive comment and a zero-length entry are
+/// all read; only the entries Aurora names matter.
+#[test]
+fn zip64_comment_and_empty_extra_entries_are_read() {
+    let table = entry_table(&fixture("rich.aur"));
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    ok(out.set_raw_comment(b"a comment"[..].into()));
+    for e in &table {
+        let method = if e.method == CompressionMethod::Stored {
+            CompressionMethod::Stored
+        } else {
+            CompressionMethod::Deflated
+        };
+        let o = zip::write::SimpleFileOptions::default()
+            .compression_method(method)
+            .large_file(true);
+        ok(out.start_file(e.name.clone(), o));
+        ok(out.write_all(&e.data));
+    }
+    ok(out.start_file("zz-unknown-empty", deflated()));
+    let bytes = ok(out.finish()).into_inner();
+    let first = raw_central_directory(&bytes);
+    let local = first.first().map_or(0, |c| c.local_offset as usize);
+    assert!(
+        u16_at(&bytes, local + 28) > 0,
+        "large_file entries carry a ZIP64 extra field in their local header"
+    );
+    let (_d, _s, doc) = open(&bytes);
+    assert_eq!(doc.canvas_size, (300, 100));
+    assert_eq!(doc.selection.saved_count(), 2);
+    assert_eq!(doc.layers.linked_files().len(), 1);
+}
+
+/// More than 65,535 entries needs the ZIP64 end-of-directory record.
+#[test]
+fn an_archive_with_over_65535_entries_uses_zip64_and_still_opens() {
+    let table = entry_table(&fixture("empty.aur"));
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for e in &table {
+        let o = if e.method == CompressionMethod::Stored {
+            zip::write::SimpleFileOptions::default().compression_method(CompressionMethod::Stored)
+        } else {
+            deflated()
+        };
+        ok(out.start_file(e.name.clone(), o));
+        ok(out.write_all(&e.data));
+    }
+    for i in 0..70_000_u32 {
+        ok(out.start_file(
+            format!("zz-pad-{i}"),
+            zip::write::SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        ));
+    }
+    let bytes = ok(out.finish()).into_inner();
+    assert!(bytes.windows(4).any(|w| w == b"PK\x06\x06"), "ZIP64 EOCD");
+    assert_eq!(ok(ZipArchive::new(Cursor::new(&bytes))).len(), 70_003);
+    let (_d, _s, doc) = open(&bytes);
+    assert_eq!(doc.canvas_size, (64, 64));
+}
+
+/// The mimetype entry is never read: a Stored archive without it opens.
+#[test]
+fn the_mimetype_entry_is_not_needed_to_open() {
+    let table = entry_table(&fixture("empty.aur"));
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for e in table.iter().filter(|e| e.name != "mimetype") {
+        ok(out.start_file(e.name.clone(), deflated()));
+        ok(out.write_all(&e.data));
+    }
+    let bytes = ok(out.finish()).into_inner();
+    let (_d, _s, doc) = open(&bytes);
+    assert_eq!(doc.canvas_size, (64, 64));
+}
