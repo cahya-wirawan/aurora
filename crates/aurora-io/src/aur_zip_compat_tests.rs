@@ -895,7 +895,10 @@ fn entries_carry_the_fixed_1980_timestamp() {
 }
 
 /// With no deflate stream in the file, the whole file is byte for byte
-/// what zip 2.4.2 wrote.
+/// what zip 2.4.2 wrote. Unix only: the made-by host byte and the external
+/// attributes in the central directory name the writing system (see
+/// `a_fresh_write_has_the_old_envelope_field_for_field`).
+#[cfg(unix)]
 #[test]
 fn a_stored_only_file_is_byte_identical_to_the_old_one() {
     let (_, fresh) = build_all()
