@@ -880,6 +880,7 @@ mod tests {
                 title: "Undo".to_owned(),
                 shortcut: None,
             }],
+            &scales,
         ));
         let swatch = ok(insert_color_swatch(
             &mut tree,

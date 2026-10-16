@@ -520,9 +520,10 @@ use aurora_text::TextEngine;
 use aurora_theme::{Palette, Scales, Theme, ThemeSet};
 use aurora_widgets::shortcut::{Key, KeyChord, Modifiers, NamedKey, ShortcutRegistry};
 use aurora_widgets::widgets::{
-    CommandEntry, DialogAction, DialogHandle, DialogKeyOutcome, TextFieldChord, WidgetKind,
-    command_palette_state, handle_text_field_chord, insert_command_palette, insert_dialog,
-    move_command_palette_selection, set_command_palette_query,
+    CommandEntry, DialogAction, DialogHandle, DialogKeyOutcome, PaletteStep, TextFieldChord,
+    WidgetKind, command_palette_state, handle_text_field_chord, insert_command_palette,
+    insert_dialog, move_command_palette_selection, select_command_palette_at,
+    set_command_palette_query, step_command_palette_selection,
 };
 use aurora_widgets::{
     ClickTracker, FocusOrigin, KeyOutcome, NoTextHit, PointerEvent, PointerOutcome, PointerPhase,
@@ -10962,14 +10963,16 @@ fn build_menu() -> muda::Menu {
 /// to work.
 fn command_palette_style() -> taffy::Style {
     const WIDTH: f32 = 480.0;
-    const HEIGHT: f32 = 320.0;
     const TOP_INSET: f32 = 96.0;
 
+    // No height (0.257.0): the palette is as tall as its query strip plus
+    // its rows, up to the viewport cap `aurora_widgets`' palette applies
+    // itself (`size.content_panel_max_rows` rows), then it scrolls.
     taffy::Style {
         position: taffy::Position::Absolute,
         size: taffy::Size {
             width: taffy::style_helpers::length(WIDTH),
-            height: taffy::style_helpers::length(HEIGHT),
+            height: taffy::style_helpers::auto(),
         },
         inset: taffy::Rect {
             top: taffy::style_helpers::length(TOP_INSET),
@@ -11004,8 +11007,12 @@ fn open_command_palette(
     if palette.is_some() {
         return;
     }
-    let root = match insert_command_palette(&mut workspace.tree, workspace.root, palette_commands())
-    {
+    let root = match insert_command_palette(
+        &mut workspace.tree,
+        workspace.root,
+        palette_commands(),
+        &workspace.scales,
+    ) {
         Ok(root) => root,
         Err(err) => {
             tracing::warn!(?err, "failed to open the command palette");
@@ -12326,6 +12333,105 @@ fn palette_query_with_paste(query: &str, pasted: &str) -> String {
     out
 }
 
+/// The scroll container a wheel event at `position` moves while the
+/// command palette is open (0.257.0): the palette's results list, when
+/// the pointer is anywhere over the palette (its rows, its query strip or
+/// its scrollbar). `None` otherwise, so the ordinary routing
+/// ([`wheel_target`]) runs. Before 0.257.0 the palette showed every
+/// result at once and the wheel zoomed the canvas behind it.
+fn palette_wheel_target(
+    tree: &aurora_widgets::WidgetTree<WidgetKind>,
+    palette: Option<WidgetId>,
+    position: (f32, f32),
+) -> Option<WidgetId> {
+    let root = palette?;
+    let hit = tree.hit_test(position)?;
+    if !tree.is_within(root, hit) {
+        return None;
+    }
+    command_palette_state(tree, root)
+        .ok()
+        .map(aurora_widgets::widgets::CommandPaletteState::body)
+}
+
+/// A primary press at `position` with the command palette open (0.257.0):
+/// on a result row it selects that row and activates it exactly as
+/// `Enter` does (a prompt's checks included), returning what it resolved
+/// to. `None` when the press is not on a result row (nothing changes and
+/// the press goes on as before). Hit-testing sees the rows where the
+/// palette's scrolling put them.
+#[allow(clippy::option_option)] // outer: was it a row press; inner: what it resolved to
+fn palette_row_click(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    palette: &mut Option<WidgetId>,
+    position: (f32, f32),
+    clipboard: &mut dyn ClipboardAccess,
+    file_dialog: &mut dyn FileDialogAccess,
+) -> Option<Option<ActivatedCommand>> {
+    let root = (*palette)?;
+    match select_command_palette_at(&mut workspace.tree, root, position) {
+        Ok(Some(_)) => {}
+        Ok(None) => return None,
+        Err(err) => {
+            tracing::warn!(?err, "failed to select a command palette row");
+            return None;
+        }
+    }
+    let enter = KeyChord::new(Modifiers::default(), Key::Named(NamedKey::Enter));
+    Some(handle_palette_key(
+        workspace,
+        focus,
+        palette,
+        enter,
+        None,
+        clipboard,
+        file_dialog,
+    ))
+}
+
+/// What an open command palette did with a pointer press ([`route_palette_press`]).
+#[derive(Debug, Clone, PartialEq)]
+enum PalettePress {
+    /// No palette is open: the press goes on to the ordinary routing.
+    NotOpen,
+    /// The palette took the press and nothing happened (not a primary
+    /// press, or not on a result row): the press must reach nothing else.
+    Swallowed,
+    /// A primary press on a result row, which ran Enter's path
+    /// (a prompt validates its typed text there, so a refused one is
+    /// `Ran(None)` with the prompt still open).
+    Ran(Option<ActivatedCommand>),
+}
+
+/// An open command palette owns every pointer press (0.257.0): only a
+/// primary press on a result row does anything ([`palette_row_click`]);
+/// every other press -- the query strip, the scrollbar, the panel's
+/// padding, a press outside it, any other button -- is swallowed, so no
+/// panel, layer row, tab, gallery or canvas tool underneath can start
+/// anything. (It does not light-dismiss the palette: Escape closes it,
+/// as before.)
+fn route_palette_press(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    palette: &mut Option<WidgetId>,
+    button: PointerButton,
+    position: (f32, f32),
+    clipboard: &mut dyn ClipboardAccess,
+    file_dialog: &mut dyn FileDialogAccess,
+) -> PalettePress {
+    if palette.is_none() {
+        return PalettePress::NotOpen;
+    }
+    if button != PointerButton::Primary {
+        return PalettePress::Swallowed;
+    }
+    match palette_row_click(workspace, focus, palette, position, clipboard, file_dialog) {
+        Some(picked) => PalettePress::Ran(picked),
+        None => PalettePress::Swallowed,
+    }
+}
+
 /// Routes one key press while the command palette is open — captures
 /// input directly rather than going through [`ShortcutRegistry`], the
 /// same "a modal dialog owns the keyboard while open" behaviour every
@@ -12362,6 +12468,21 @@ fn handle_palette_key(
         Key::Named(NamedKey::ArrowUp) => {
             if let Err(err) = move_command_palette_selection(&mut workspace.tree, root, false) {
                 tracing::warn!(?err, "failed to move command palette selection");
+            }
+        }
+        // 0.257.0: with a long list the selection also moves by page and
+        // to either end (no wrap), staying scrolled into view.
+        Key::Named(
+            named @ (NamedKey::PageDown | NamedKey::PageUp | NamedKey::Home | NamedKey::End),
+        ) => {
+            let step = match named {
+                NamedKey::PageDown => PaletteStep::PageDown,
+                NamedKey::PageUp => PaletteStep::PageUp,
+                NamedKey::Home => PaletteStep::First,
+                _ => PaletteStep::Last,
+            };
+            if let Err(err) = step_command_palette_selection(&mut workspace.tree, root, step) {
+                tracing::warn!(?err, "failed to step command palette selection");
             }
         }
         Key::Named(NamedKey::Enter) => {
@@ -12698,6 +12819,8 @@ fn translate_named_key(named: winit::keyboard::NamedKey) -> Option<NamedKey> {
         Winit::ArrowRight => NamedKey::ArrowRight,
         Winit::Home => NamedKey::Home,
         Winit::End => NamedKey::End,
+        Winit::PageUp => NamedKey::PageUp,
+        Winit::PageDown => NamedKey::PageDown,
         Winit::F1 => NamedKey::F1,
         Winit::F2 => NamedKey::F2,
         Winit::F3 => NamedKey::F3,
@@ -32900,6 +33023,13 @@ impl App {
         let position = logical_point(physical_position, self.scale_factor);
         self.pointer_position = Some(position);
 
+        // 0.257.0: while the command palette is open nothing underneath
+        // follows the pointer (a drag begun before it opened resumes, or
+        // is committed by its release, once the palette is gone).
+        if self.command_palette.is_some() {
+            return;
+        }
+
         // 0.166.0 (review I1: first): a panel press owns every move
         // until its release — below the threshold it is still a click;
         // past it, a drag that shows the drop indicator
@@ -33005,6 +33135,19 @@ impl App {
         }
     }
 
+    /// Finishes a palette row press ([`route_palette_press`] returned
+    /// [`PalettePress::Ran`]): runs what the row resolved to and re-lays
+    /// out.
+    fn finish_palette_press(&mut self, picked: Option<ActivatedCommand>) {
+        self.run_activated(picked);
+        let window_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = window_size {
+            self.apply_resize((size.width, size.height));
+        }
+        self.push_accessibility();
+        self.needs_redraw = true;
+    }
+
     /// A real `WindowEvent::MouseInput { state: Pressed, .. }`: starts a
     /// dock-rail resize ([`RailResize`]) on the divider
     /// ([`pointer_on_rail_divider`]), performs the active Zoom tool's
@@ -33057,6 +33200,30 @@ impl App {
             DialogPointer::Chosen(result) => {
                 self.run_dialog_result(&result);
                 self.relayout_after_gallery();
+                return;
+            }
+        }
+
+        // 0.257.0: the open command palette owns every press (any button):
+        // a primary press on a result row runs it, any other press --
+        // strip, scrollbar, padding, outside it -- does nothing and
+        // reaches no panel, layer row, tab or canvas tool underneath.
+        match route_palette_press(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.command_palette,
+            button,
+            position,
+            &mut self.clipboard,
+            &mut self.file_dialog,
+        ) {
+            PalettePress::NotOpen => {}
+            PalettePress::Swallowed => {
+                self.push_accessibility();
+                return;
+            }
+            PalettePress::Ran(picked) => {
+                self.finish_palette_press(picked);
                 return;
             }
         }
@@ -34333,6 +34500,28 @@ impl App {
         let Some(position) = self.pointer_position else {
             return;
         };
+        // 0.257.0: over the open command palette the wheel scrolls its
+        // results (a modal dialog still swallows it).
+        if self.dialog.is_none()
+            && let Some(list) =
+                palette_wheel_target(&self.workspace.tree, self.command_palette, position)
+        {
+            if scroll_panel(
+                &mut self.workspace.tree,
+                list,
+                delta,
+                self.scale_factor,
+                &self.scales,
+            ) {
+                let window_size = self.window.as_ref().map(|window| window.inner_size());
+                if let Some(size) = window_size {
+                    self.apply_resize((size.width, size.height));
+                }
+                self.push_accessibility();
+                self.needs_redraw = true;
+            }
+            return;
+        }
         let pointer_owned = self.drag.is_some()
             || self.rail_resize.is_some()
             || self.panel_drag.is_some()
@@ -45531,6 +45720,7 @@ mod tests {
     /// genuinely centred horizontally, not just "not zero."
     #[test]
     fn opening_the_palette_gives_it_a_real_centred_size_and_position() {
+        use aurora_widgets::widgets::row_height as widgets_row_height;
         let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
         let mut focus = FocusManager::default();
         let mut palette = None;
@@ -45545,7 +45735,18 @@ mod tests {
             unreachable!("just laid out");
         };
         assert_eq!(bounds.width, 480, "must be the real, fixed palette width");
-        assert_eq!(bounds.height, 320, "must be the real, fixed palette height");
+        let scales = crate::test_workspace_scales();
+        let strip =
+            widgets_row_height(&scales) + f32::from(u16::try_from(scales.spacing.xs).unwrap_or(0));
+        #[allow(clippy::cast_precision_loss)]
+        let rows = scales.size.content_panel_max_rows as f32;
+        #[allow(clippy::cast_possible_truncation)]
+        #[allow(clippy::cast_sign_loss)]
+        let expected = (strip + rows * widgets_row_height(&scales)) as u32;
+        assert_eq!(
+            bounds.height, expected,
+            "no fixed height since 0.257.0: the strip plus the capped rows"
+        );
         assert_eq!(bounds.y, 96, "must sit at the real, fixed top inset");
         assert_eq!(
             bounds.x, 260,
@@ -96536,3 +96737,6 @@ mod first_run_tests;
 
 #[cfg(test)]
 mod menu_bar_tests;
+
+#[cfg(test)]
+mod palette_scroll_app_tests;

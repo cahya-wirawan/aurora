@@ -346,6 +346,7 @@ mod tests {
                 CommandEntry::new("a", "Undo"),
                 CommandEntry::new("b", "Redo"),
             ],
+            &crate::widgets::test_scales(),
         ));
         let rows = ok(command_palette_state(&tree, palette)).rows().to_vec();
         let Some(&row) = rows.first() else {

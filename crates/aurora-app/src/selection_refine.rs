@@ -241,6 +241,7 @@ pub(crate) fn open_prompt(
         workspace.root,
         kind.prompt_label(),
         prompt_entries(kind, &query),
+        &workspace.scales,
     ) {
         Ok(root) => root,
         Err(err) => {

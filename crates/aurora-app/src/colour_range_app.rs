@@ -102,6 +102,7 @@ pub(crate) fn open_prompt(
         workspace.root,
         PROMPT_LABEL,
         prompt_entries(&query),
+        &workspace.scales,
     ) {
         Ok(root) => root,
         Err(err) => {

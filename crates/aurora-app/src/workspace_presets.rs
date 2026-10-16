@@ -544,6 +544,7 @@ pub(crate) fn open_workspace_name_prompt(
         workspace.root,
         WORKSPACE_NAME_PROMPT_LABEL,
         name_prompt_entries(query),
+        &workspace.scales,
     ) {
         Ok(root) => root,
         Err(err) => {

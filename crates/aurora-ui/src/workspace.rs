@@ -202,6 +202,10 @@ pub struct Workspace {
     /// a caller first populates it. `aurora-app` hit-tests a press (and
     /// looks up an assistive technology's `Click`) here to jump.
     pub history_rows: HashMap<WidgetId, usize>,
+    /// The scales the workspace was built with (0.257.0), kept so code
+    /// that inserts widgets later (the command palette's rows and strip)
+    /// takes its sizes from the same tokens as the panels.
+    pub scales: Scales,
 }
 
 /// A floating slot in the tree (0.167.0): its frame (a
@@ -639,6 +643,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         panel_strip,
         history_current: None,
         history_rows: HashMap::new(),
+        scales: scales.clone(),
     }
 }
 

@@ -1492,15 +1492,25 @@ fn command_palette_style() -> Style {
     }
 }
 
+/// The y of the middle of the gallery palette's one result row (0.257.0):
+/// the row sits under the fixed-height query strip (`row_height` plus
+/// `spacing.xs`) and is one `row_height` tall, so the old "panel centre"
+/// pixel is the panel's own fill now, not the highlight.
+fn command_palette_row_centre_y(scales: &Scales) -> u32 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let row = aurora_widgets::widgets::row_height(scales) as u32;
+    COMMAND_PALETTE_MARGIN + row + scales.spacing.xs + row / 2
+}
+
 /// A real, laid-out tree with one `CommandPalette` — `paint_widget`
 /// resolves exactly one visual state for it today (see this file's own
-/// module doc comment), so there's only one cell, not a row. No
-/// `&Scales` parameter, unlike every other `*_gallery_tree` function
-/// here — `insert_command_palette` genuinely doesn't need one.
-fn command_palette_gallery_tree() -> (WidgetTree<WidgetKind>, [WidgetId; 1]) {
+/// module doc comment), so there's only one cell, not a row. Since 0.257.0
+/// it takes `&Scales` like the other `*_gallery_tree` functions: the
+/// palette's strip, rows and scrolling cap come from the tokens.
+fn command_palette_gallery_tree(scales: &Scales) -> (WidgetTree<WidgetKind>, [WidgetId; 1]) {
     let (mut tree, root) = new_tree(Style::default());
     let commands = vec![CommandEntry::new("edit.undo", "Undo")];
-    let palette = match insert_command_palette(&mut tree, root, commands) {
+    let palette = match insert_command_palette(&mut tree, root, commands, scales) {
         Ok(id) => id,
         Err(err) => unreachable!("{err:?}"),
     };
@@ -6122,12 +6132,10 @@ fn text_field_gallery_matches_the_golden_image_in_color_critical_theme() {
 }
 
 /// This gallery's one command is always the selected result, and
-/// `command_palette_gallery_tree`'s own body/row layout
-/// (`command_palette::body_style`/`row_style`) makes that one row fill
-/// the entire panel interior — so the "panel centre" pixel this test
-/// samples is actually the row's own `accent.primary` highlight, painted
-/// on top of the panel's `surface.raised` fill beneath it, not
-/// `surface.raised` directly (see
+/// `command_palette_gallery_tree`'s own layout (a fixed strip and one
+/// fixed-height row since 0.257.0; before it the row filled the whole
+/// interior) leaves the "panel centre" pixel this test samples on the
+/// panel's `surface.raised` fill (the row's own highlight is checked by
 /// `command_palette_gallery_paints_the_selected_rows_own_highlight`
 /// below for the real, exact-colour proof of that). This test only
 /// proves the weaker, layout-agnostic thing: *something* opaque was
@@ -6146,7 +6154,7 @@ fn render_gallery_produces_the_command_palettes_own_panel() {
     };
     let scales = scales();
     let theme = dark_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,
@@ -6191,7 +6199,7 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight() {
     };
     let scales = scales();
     let theme = dark_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,
@@ -6204,7 +6212,7 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight() {
     let panel_centre = sample_at(
         &image,
         COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.0 / 2,
-        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.1 / 2,
+        command_palette_row_centre_y(&scales),
     );
     assert_eq!(
         panel_centre[..3],
@@ -6224,7 +6232,7 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight() {
 /// of the fix this sandbox can actually prove outright.
 #[test]
 fn command_palette_style_positions_the_panel_with_a_real_margin() {
-    let (tree, [palette]) = command_palette_gallery_tree();
+    let (tree, [palette]) = command_palette_gallery_tree(&scales());
     let Some(bounds) = tree.bounds(palette) else {
         unreachable!("just laid out");
     };
@@ -6273,6 +6281,16 @@ fn command_palette_style_positions_the_panel_with_a_real_margin() {
 /// and still `x=31` clear / `x=33` accent on the row. Text is filtered
 /// out of every golden, so the strip's query and the row's title are
 /// not in it.
+///
+/// **Blessed a sixth time, 0.257.0** (with its four siblings): the strip
+/// is a fixed `row_height + spacing.xs` (29 px) row and the one result
+/// row a fixed `row_height` (21 px), instead of sharing the body's
+/// height. Decoded down the centre column of the new Dark golden:
+/// `NEUTRAL_CLEAR` to `y=31`, `surface.raised` `[49,49,54]` for
+/// `y=32..61` (the strip), `accent.primary` `[120,172,255]` for
+/// `y=61..82` (the row), `surface.raised` for `y=82..160`, then clear.
+/// The exact-colour highlight tests now sample the row's own centre
+/// ([`command_palette_row_centre_y`]), not the panel's.
 #[test]
 fn command_palette_gallery_matches_the_golden_image() {
     let Some(context) = real_context() else {
@@ -6280,7 +6298,7 @@ fn command_palette_gallery_matches_the_golden_image() {
     };
     let scales = scales();
     let theme = dark_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,
@@ -6313,7 +6331,7 @@ fn render_gallery_produces_the_command_palettes_own_panel_in_light_theme() {
     };
     let scales = scales();
     let theme = light_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,
@@ -6357,7 +6375,7 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_light_theme
     };
     let scales = scales();
     let theme = light_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,
@@ -6370,7 +6388,7 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_light_theme
     let panel_centre = sample_at(
         &image,
         COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.0 / 2,
-        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.1 / 2,
+        command_palette_row_centre_y(&scales),
     );
     assert_eq!(
         panel_centre[..3],
@@ -6411,7 +6429,7 @@ fn command_palette_gallery_matches_the_golden_image_in_light_theme() {
     };
     let scales = scales();
     let theme = light_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,
@@ -6448,7 +6466,7 @@ fn render_gallery_produces_the_command_palettes_own_panel_in_high_contrast_dark_
     };
     let scales = scales();
     let theme = high_contrast_dark_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,
@@ -6491,7 +6509,7 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_high_contra
     };
     let scales = scales();
     let theme = high_contrast_dark_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,
@@ -6504,7 +6522,7 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_high_contra
     let panel_centre = sample_at(
         &image,
         COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.0 / 2,
-        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.1 / 2,
+        command_palette_row_centre_y(&scales),
     );
     assert_eq!(
         panel_centre[..3],
@@ -6557,7 +6575,7 @@ fn command_palette_gallery_matches_the_golden_image_in_high_contrast_dark_theme(
     };
     let scales = scales();
     let theme = high_contrast_dark_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,
@@ -6595,7 +6613,7 @@ fn render_gallery_produces_the_command_palettes_own_panel_in_high_contrast_light
     };
     let scales = scales();
     let theme = high_contrast_light_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,
@@ -6637,7 +6655,7 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_high_contra
     };
     let scales = scales();
     let theme = high_contrast_light_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,
@@ -6650,7 +6668,7 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_high_contra
     let panel_centre = sample_at(
         &image,
         COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.0 / 2,
-        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.1 / 2,
+        command_palette_row_centre_y(&scales),
     );
     assert_eq!(
         panel_centre[..3],
@@ -6695,7 +6713,7 @@ fn command_palette_gallery_matches_the_golden_image_in_high_contrast_light_theme
     };
     let scales = scales();
     let theme = high_contrast_light_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,
@@ -6731,7 +6749,7 @@ fn render_gallery_produces_the_command_palettes_own_panel_in_color_critical_them
     };
     let scales = scales();
     let theme = color_critical_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,
@@ -6774,7 +6792,7 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_color_criti
     };
     let scales = scales();
     let theme = color_critical_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,
@@ -6787,7 +6805,7 @@ fn command_palette_gallery_paints_the_selected_rows_own_highlight_in_color_criti
     let panel_centre = sample_at(
         &image,
         COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.0 / 2,
-        COMMAND_PALETTE_MARGIN + COMMAND_PALETTE_CELL.1 / 2,
+        command_palette_row_centre_y(&scales),
     );
     assert_eq!(
         panel_centre[..3],
@@ -6830,7 +6848,7 @@ fn command_palette_gallery_matches_the_golden_image_in_color_critical_theme() {
     };
     let scales = scales();
     let theme = color_critical_theme();
-    let (tree, _ids) = command_palette_gallery_tree();
+    let (tree, _ids) = command_palette_gallery_tree(&scales);
 
     let image = render_gallery(
         &context,

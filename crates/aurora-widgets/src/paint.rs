@@ -4948,7 +4948,7 @@ mod tests {
         let (mut tree, root) = new_tree(taffy::Style::default());
         let scales = scales();
         let commands = vec![CommandEntry::new("edit.undo", "Undo")];
-        let palette = match insert_command_palette(&mut tree, root, commands) {
+        let palette = match insert_command_palette(&mut tree, root, commands, &scales) {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -4984,7 +4984,7 @@ mod tests {
         let (mut tree, root) = new_tree(taffy::Style::default());
         let scales = scales();
         let commands = vec![CommandEntry::new("edit.undo", "Undo")];
-        let palette = match insert_command_palette(&mut tree, root, commands) {
+        let palette = match insert_command_palette(&mut tree, root, commands, &scales) {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -4995,23 +4995,28 @@ mod tests {
         let Some(row) = selected_row else {
             unreachable!("one command was inserted, so the first result is selected");
         };
-        if let Err(err) = tree.set_bounds(
-            row,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 200,
-                height: 24,
+        // A real layout (0.257.0): the row sits inside the palette's
+        // clipping viewport, so a hand-set rect outside it would be
+        // clipped away. Rows are exactly one `row_height` tall.
+        if let Err(err) = tree.set_style(
+            palette,
+            taffy::Style {
+                size: taffy::Size {
+                    width: taffy::style_helpers::length(200.0_f32),
+                    height: taffy::style_helpers::auto(),
+                },
+                ..Default::default()
             },
         ) {
             unreachable!("{err:?}");
         }
+        tree.compute_layout(400.0, 300.0);
         let theme = dark_theme();
 
         let (mesh, color) = single_paint(&tree, row, &theme, &scales, 1.0);
         assert!(
             !mesh.vertices.is_empty() && !mesh.indices.is_empty(),
-            "a 200x24 selected row must tessellate to real geometry"
+            "a laid-out selected row must tessellate to real geometry"
         );
         let [r, g, b] = theme.accent.primary.to_srgb_f32();
         assert_eq!(
@@ -5030,7 +5035,7 @@ mod tests {
             CommandEntry::new("edit.undo", "Undo"),
             CommandEntry::new("edit.redo", "Redo"),
         ];
-        let palette = match insert_command_palette(&mut tree, root, commands) {
+        let palette = match insert_command_palette(&mut tree, root, commands, &scales) {
             Ok(id) => id,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -5041,8 +5046,8 @@ mod tests {
         let Some(rows) = tree.children(body) else {
             unreachable!("just inserted");
         };
-        // `rows[0]` is the query strip (0.133.0).
-        let Some(&second_row) = rows.get(2) else {
+        // The body holds only result rows (the query strip left it in 0.257.0).
+        let Some(&second_row) = rows.get(1) else {
             unreachable!("two commands were inserted, so a second row exists");
         };
         let theme = dark_theme();
@@ -7615,6 +7620,7 @@ mod tests {
                     title: "X".to_owned(),
                     shortcut: None,
                 }],
+                &scales(),
             ));
             tree.compute_layout(400.0, 400.0);
             assert_eq!(keyboard_focus(&mut tree, palette), None);
