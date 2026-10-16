@@ -35,6 +35,7 @@ fn alpha_stop(opacity: f64, location: i32) -> V<'static> {
 }
 
 /// A custom-stops gradient block of the given style, angle and scale.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn gradient_block(
     style: &'static [u8; 4],
     angle: f64,
@@ -59,6 +60,7 @@ fn gradient_block(
     ])
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn black_to_white(style: &'static [u8; 4], angle: f64, scale: f64, reverse: bool) -> Vec<u8> {
     gradient_block(
         style,
@@ -94,7 +96,7 @@ fn fill_px(document: &PsdDocument, x: i64, y: i64) -> Option<[f32; 4]> {
     if ix < 0 || iy < 0 || ix >= i64::from(placed.image.width()) || iy >= i64::from(placed.image.height()) {
         return None;
     }
-    Some(px(&placed.image, ix as u32, iy as u32))
+    Some(px(&placed.image, u32::try_from(ix).ok()?, u32::try_from(iy).ok()?))
 }
 
 fn empty_fill_file(width: u32, height: u32, key: [u8; 4], block: Vec<u8>, vector: Option<Vec<u8>>) -> TestPsd {
@@ -238,7 +240,7 @@ fn fill_blocks_parse_exactly() {
 #[test]
 fn a_grayscale_stop_is_ink_percent_so_100_is_black() {
     let gray = |v: f64| V::Obj(vec![(b"Gry ", V::Doub(v))]);
-    let block = fill_block(&[(b"Clr ", gray(90.64667969942093))]);
+    let block = fill_block(&[(b"Clr ", gray(90.646_679_699_420_93))]);
     let Ok(Fill::Solid(c)) = fill::parse(*b"SoCo", &block) else {
         unreachable!("grey solid")
     };
@@ -272,7 +274,7 @@ fn hostile_fill_blocks_are_refused_without_a_panic() {
     // Truncations of a good block never panic.
     let good = black_to_white(b"Lnr ", 0.0, 100.0, false);
     for cut in 0..good.len() {
-        let _ = fill::parse(*b"GdFl", &good[..cut]);
+        let _ = fill::parse(*b"GdFl", good.get(..cut).unwrap_or(&[]));
     }
 }
 
@@ -421,6 +423,8 @@ fn an_artboard_rectangle_past_the_canvas_is_clipped_to_it() {
     let document = doc(&artboard_file(4, (-3.0, -3.0, 100.0, 100.0)).write());
     assert_eq!(fill_px(&document, 0, 0), Some(u8px(18, 108, 200, 255)));
     assert_eq!(fill_px(&document, 7, 5), Some(u8px(18, 108, 200, 255)));
+    let image = &document.pixels.first().map(|p| (p.image.width(), p.image.height()));
+    assert_eq!(*image, Some((8, 6)), "the layer is the canvas, not the rectangle");
 }
 
 #[test]
@@ -484,4 +488,20 @@ fn a_gradients_reference_box_is_the_shape_only_when_aligned_and_non_empty() {
     assert_eq!(fill::reference_box(&g, Some(flat), canvas), canvas);
     g.align = false;
     assert_eq!(fill::reference_box(&g, Some(shape), canvas), canvas);
+}
+
+#[test]
+fn an_inverted_vector_mask_draws_the_fill_outside_the_shape_across_the_canvas() {
+    // Flags bit 0: invert. The shape becomes a hole in a canvas-wide fill.
+    let file = empty_fill_file(
+        8,
+        8,
+        *b"SoCo",
+        solid_block(255.0, 0.0, 0.0),
+        Some(vmsk(1, &rect_path(0.25, 0.25, 0.75, 0.75, 1))),
+    );
+    let document = doc(&file.write());
+    assert_eq!(fill_px(&document, 0, 0), Some(u8px(255, 0, 0, 255)), "outside the shape");
+    assert_eq!(fill_px(&document, 7, 7), Some(u8px(255, 0, 0, 255)));
+    assert!(fill_px(&document, 4, 4).is_some_and(|p| p[3] == 0.0), "the hole");
 }

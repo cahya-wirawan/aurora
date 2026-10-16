@@ -42,13 +42,10 @@ fn error_by_hidden_layer_for_named_files() {
             let name = layers.name(id).unwrap_or("?").to_string();
             let was = layers.visible(id);
             let _ = layers.set_visible(id, false);
-            if let Ok(image) = composite_document(&layers, &mut store, w, h) {
-                if let Some((mean, max)) = audit_diff(&image, &merged) {
-                    println!(
-                        "DIAG   hide {name:?}: mean {:.3} max {max:.0}",
-                        mean_of(mean)
-                    );
-                }
+            if let Ok(image) = composite_document(&layers, &mut store, w, h)
+                && let Some((mean, max)) = audit_diff(&image, &merged)
+            {
+                println!("DIAG   hide {name:?}: mean {:.3} max {max:.0}", mean_of(mean));
             }
             let _ = layers.set_visible(id, was.unwrap_or(true));
         }

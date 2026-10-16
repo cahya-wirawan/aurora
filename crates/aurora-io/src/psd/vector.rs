@@ -529,7 +529,7 @@ pub(super) fn path_extent(path: &VectorPath, width: u32, height: u32) -> Option<
         f64::NEG_INFINITY,
     );
     for subpath in &path.subpaths {
-        for (x, y) in flatten(subpath, w, h).ok()??.iter() {
+        for (x, y) in &flatten(subpath, w, h).ok()?? {
             x0 = x0.min(*x);
             y0 = y0.min(*y);
             x1 = x1.max(*x);

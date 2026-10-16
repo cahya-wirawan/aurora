@@ -131,9 +131,9 @@ use crate::image::Image;
 
 mod descriptor;
 mod effects;
-mod fill;
 #[cfg(test)]
 mod effects_tests;
+mod fill;
 #[cfg(test)]
 mod gradient_lookup_tests;
 #[cfg(test)]
@@ -775,16 +775,20 @@ fn note_text(note: Note, n: u64) -> String {
             "{n} artboard{s} with a custom background colour: the colour {} drawn as a pixel \
              layer at the bottom of {} (Aurora has no artboards; a PSD save writes that layer).",
             if one { "was" } else { "were" },
-            if one { "the artboard's group" } else { "each artboard's group" },
+            if one {
+                "the artboard's group"
+            } else {
+                "each artboard's group"
+            },
         ),
         Note::ArtboardBackgroundNotDrawn(reason) => match reason {
             fill::ArtboardLeft::Unchecked => format!(
                 "{n} artboard{s} with a white or black background: the background {was} not \
                  drawn (no Photoshop picture of one has been checked)."
             ),
-            fill::ArtboardLeft::Unreadable => format!(
-                "{n} artboard background{s} could not be read and {was} not drawn."
-            ),
+            fill::ArtboardLeft::Unreadable => {
+                format!("{n} artboard background{s} could not be read and {was} not drawn.")
+            }
         },
         Note::FillNotDrawn(reason) => format!(
             "{n} shape or fill layer{s} with no stored pixels {was} left out — {}.",
@@ -4011,7 +4015,14 @@ fn drawn_fill_node(
         notes.add(Note::FillGradientApproximate);
     }
     let props = props_for(record, notes);
-    let outcome = masks_for(src, record, header, region.union(&canvas), notes, vector_budget);
+    let outcome = masks_for(
+        src,
+        record,
+        header,
+        region.union(&canvas),
+        notes,
+        vector_budget,
+    );
     note_unsupported(record, &outcome, notes, true);
     Some(PsdNode::Layer(PsdLayer {
         props,

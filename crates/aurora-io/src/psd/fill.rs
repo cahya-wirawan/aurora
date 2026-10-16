@@ -39,6 +39,15 @@
 //! picture (`4x4_16bit_rgb.psd`) whose symmetry axis does not match the
 //! stored 30 degrees. The other forms are unchecked.
 
+// Pixel/geometry arithmetic on small, bounded values, as in `vector.rs`.
+#![allow(
+    clippy::many_single_char_names,
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+
 use aurora_core::Rect;
 use half::f16;
 
@@ -114,8 +123,8 @@ pub(super) fn parse(key: [u8; 4], data: &[u8]) -> Result<Fill, LeftOut> {
         return Err(LeftOut::TooLarge);
     }
     let mut budget = ItemBudget::new();
-    let d = descriptor::parse_adjustment_block(data, &mut budget)
-        .map_err(|_| LeftOut::Unreadable)?;
+    let d =
+        descriptor::parse_adjustment_block(data, &mut budget).map_err(|_| LeftOut::Unreadable)?;
     match &key {
         b"SoCo" => {
             let c = d.get(b"Clr ").and_then(Value::descriptor);
@@ -140,7 +149,10 @@ fn colour(c: &Descriptor) -> Result<[f32; 3], LeftOut> {
     } else if c.get(b"Gry ").is_some() {
         // A Grayscale colour is the ink percentage: 100 is black (checked
         // on `4x4_16bit_grayscale.psd`: 90.6 shows as level 24).
-        let ink = c.get(b"Gry ").and_then(Value::number).filter(|v| v.is_finite());
+        let ink = c
+            .get(b"Gry ")
+            .and_then(Value::number)
+            .filter(|v| v.is_finite());
         let g = (1.0 - ink.ok_or(LeftOut::Unreadable)? / 100.0).clamp(0.0, 1.0) as f32;
         Ok([g, g, g])
     } else {
@@ -194,10 +206,13 @@ fn gradient(d: &Descriptor) -> Result<Gradient, LeftOut> {
     if grad.get(b"GrdF").and_then(Value::enum_value) != Some(b"CstS") {
         return Err(LeftOut::Noise);
     }
-    let colours = stops(
-        grad.get(b"Clrs").ok_or(LeftOut::Unreadable)?,
-        |s| colour(s.get(b"Clr ").and_then(Value::descriptor).ok_or(LeftOut::Unreadable)?),
-    )?;
+    let colours = stops(grad.get(b"Clrs").ok_or(LeftOut::Unreadable)?, |s| {
+        colour(
+            s.get(b"Clr ")
+                .and_then(Value::descriptor)
+                .ok_or(LeftOut::Unreadable)?,
+        )
+    })?;
     if colours.is_empty() {
         return Err(LeftOut::Unreadable);
     }
@@ -292,12 +307,8 @@ impl Gradient {
             Style::Linear => 0.5 + along / length,
             Style::Reflected => along.abs() / (length / 2.0),
             Style::Radial => dx.hypot(dy) / (self.scale * w.hypot(h) / 2.0).max(1e-9),
-            Style::Diamond => {
-                (along.abs() + across.abs()) / (self.scale * (w + h) / 2.0).max(1e-9)
-            }
-            Style::Angle => {
-                (dy.atan2(dx).to_degrees() + self.angle).rem_euclid(360.0) / 360.0
-            }
+            Style::Diamond => (along.abs() + across.abs()) / (self.scale * (w + h) / 2.0).max(1e-9),
+            Style::Angle => (dy.atan2(dx).to_degrees() + self.angle).rem_euclid(360.0) / 360.0,
         };
         let t = t.clamp(0.0, 1.0) as f32;
         if self.reverse { 1.0 - t } else { t }
@@ -346,10 +357,8 @@ pub(super) fn render(
 fn coverage_at(raster: Option<&vector::Raster>, x: i64, y: i64) -> f32 {
     let Some(r) = raster else { return 1.0 };
     let b = r.bounds;
-    let inside = x >= b.x
-        && y >= b.y
-        && x < b.x + i64::from(b.width)
-        && y < b.y + i64::from(b.height);
+    let inside =
+        x >= b.x && y >= b.y && x < b.x + i64::from(b.width) && y < b.y + i64::from(b.height);
     if !inside {
         return if r.outside { 1.0 } else { 0.0 };
     }
@@ -394,11 +403,12 @@ pub(super) fn parse_artboard(data: &[u8]) -> Result<Option<ArtboardBackground>, 
         .get(b"artboardBackgroundType")
         .and_then(Value::number)
         .ok_or(ArtboardLeft::Unreadable)?;
-    #[allow(clippy::float_cmp)] // a small stored integer
-    match kind {
-        k if k == 3.0 => return Ok(None),
-        k if k == 4.0 => {}
-        _ => return Err(ArtboardLeft::Unchecked),
+    // A small stored integer: 3 is transparent, 4 a custom colour.
+    if (kind - 3.0).abs() < 0.5 {
+        return Ok(None);
+    }
+    if (kind - 4.0).abs() >= 0.5 {
+        return Err(ArtboardLeft::Unchecked);
     }
     let c = d
         .get(b"Clr ")
@@ -417,7 +427,12 @@ pub(super) fn parse_artboard(data: &[u8]) -> Result<Option<ArtboardBackground>, 
             .ok_or(ArtboardLeft::Unreadable)?;
         Ok(v.round() as i64)
     };
-    let (top, left, bottom, right) = (edge(b"Top ")?, edge(b"Left")?, edge(b"Btom")?, edge(b"Rght")?);
+    let (top, left, bottom, right) = (
+        edge(b"Top ")?,
+        edge(b"Left")?,
+        edge(b"Btom")?,
+        edge(b"Rght")?,
+    );
     let width = right.saturating_sub(left).max(0);
     let height = bottom.saturating_sub(top).max(0);
     Ok(Some(ArtboardBackground {
