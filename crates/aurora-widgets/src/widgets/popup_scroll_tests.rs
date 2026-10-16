@@ -561,6 +561,7 @@ fn a_row_clicked_after_scrolling_is_committed() {
         );
     };
     assert_eq!(index, 27);
+    assert_eq!(super::dropdown_of_row(&combo.tree, hit), Some(combo.id));
     let outcome = ok(commit_dropdown_row(&mut combo.tree, combo.id, hit));
     assert_eq!(
         outcome,
@@ -581,4 +582,71 @@ fn the_wheel_target_over_an_open_dropdown_is_its_list() {
         popup_scroll_target(&combo.tree, ((view.x + 10) as f32, (view.y + 10) as f32)),
         Some(combo.body())
     );
+}
+
+#[test]
+fn a_page_down_moves_one_viewport_less_one_item_exactly() {
+    let items: Vec<MenuItem> = (0..94)
+        .map(|i| MenuItem::action(&format!("Item {i}")))
+        .collect();
+    let mut menu = open((640.0, 480.0), (40.0, 30.0), items);
+    let rows_shown =
+        (i64::from(menu.bounds(menu.body()).height) / row_height(&test_scales()) as i64) as usize;
+    assert!(rows_shown > 4 && rows_shown < 94);
+    assert_eq!(
+        menu.press(MenuKey::PageDown),
+        MenuOutcome::Moved(rows_shown - 1)
+    );
+    assert_eq!(
+        menu.press(MenuKey::PageDown),
+        MenuOutcome::Moved(2 * (rows_shown - 1))
+    );
+    assert_eq!(
+        menu.press(MenuKey::PageUp),
+        MenuOutcome::Moved(rows_shown - 1)
+    );
+}
+
+#[test]
+fn the_parents_offset_counts_toward_the_room_below() {
+    // The menu's parent starts 100 px down the window: the popup's
+    // absolute top is 100 + 30, so the cap is smaller than for a parent
+    // at the top.
+    let size = (640.0, 480.0);
+    let (mut tree, root) = window(size.0, size.1);
+    let parent = ok(tree.insert(
+        root,
+        Style {
+            margin: taffy::Rect {
+                left: length(0.0_f32),
+                right: length(0.0_f32),
+                top: length(100.0_f32),
+                bottom: length(0.0_f32),
+            },
+            size: Size {
+                width: length(300.0_f32),
+                height: length(40.0_f32),
+            },
+            ..Default::default()
+        },
+        accesskit::Node::new(accesskit::Role::GenericContainer),
+        WidgetKind::Container,
+    ));
+    lay(&mut tree, size);
+    let menu = ok(open_menu(
+        &mut tree,
+        parent,
+        &test_scales(),
+        "Select",
+        (0.0, 30.0),
+        200.0,
+        many_items(94),
+    ));
+    lay(&mut tree, size);
+    let Some(frame) = tree.bounds(menu) else {
+        unreachable!("laid out");
+    };
+    assert_eq!(frame.y, 130);
+    let margin = test_scales().spacing.sm as i64;
+    assert_eq!(frame.bottom(), 480 - margin);
 }

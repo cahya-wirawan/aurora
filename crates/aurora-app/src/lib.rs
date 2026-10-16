@@ -39794,11 +39794,10 @@ mod tests {
                 unreachable!("the AT click opened the menu");
             };
             assert_eq!(state.focus.focused(), Some(menu));
-            let Some(&item) = state
-                .workspace
-                .tree
-                .children(menu)
-                .and_then(<[WidgetId]>::first)
+            // The items sit in the menu's scroll container (0.259.0).
+            let Some(item) = aurora_widgets::widgets::menu_state(&state.workspace.tree, menu)
+                .ok()
+                .and_then(|menu| menu.item_ids().first().copied())
             else {
                 unreachable!("the menu has items");
             };

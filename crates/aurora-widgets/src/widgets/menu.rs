@@ -1215,12 +1215,14 @@ mod tests {
     }
 
     #[test]
-    fn named_keys_map_onto_the_seven_menu_keys_and_nothing_else() {
+    fn named_keys_map_onto_the_nine_menu_keys_and_nothing_else() {
         let cases = [
             (NamedKey::ArrowUp, Some(MenuKey::Up)),
             (NamedKey::ArrowDown, Some(MenuKey::Down)),
             (NamedKey::Home, Some(MenuKey::Home)),
             (NamedKey::End, Some(MenuKey::End)),
+            (NamedKey::PageUp, Some(MenuKey::PageUp)),
+            (NamedKey::PageDown, Some(MenuKey::PageDown)),
             (NamedKey::Enter, Some(MenuKey::Enter)),
             (NamedKey::Space, Some(MenuKey::Space)),
             (NamedKey::Escape, Some(MenuKey::Escape)),

@@ -244,6 +244,15 @@ mod tests {
     }
 
     #[test]
+    fn no_flip_when_the_side_above_is_no_roomier() {
+        // 10 px below, 5 px above: stays below at the minimum.
+        let fit = fit_popup((13.0, 462.0), WINDOW, 8.0, 900.0, 63.0, true);
+        assert!(!fit.above);
+        let fit = fit_popup((13.0, 20.0), (0.0, 38.0), 8.0, 900.0, 63.0, true);
+        assert!(!fit.above, "10 below beats 5 above");
+    }
+
+    #[test]
     fn a_short_list_needs_less_than_the_minimum() {
         // Two rows (42 px) of content: the minimum is the content.
         let fit = fit_popup((460.0, 460.0), WINDOW, 8.0, 42.0, 63.0, false);
