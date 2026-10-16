@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.250.0] - 2026-10-16
+
+### Changed
+
+- GPU compositing for the seven newest adjustment layers
+
 ## [0.249.0] - 2026-10-16
 
 ### Changed

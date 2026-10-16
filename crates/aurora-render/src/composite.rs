@@ -2278,6 +2278,17 @@ pub struct TileCompositor {
     photo_filter: Option<UniformAdjustmentGpu>,
     black_white: Option<UniformAdjustmentGpu>,
     color_balance: Option<UniformAdjustmentGpu>,
+    /// The Invert, Threshold, Posterize, Brightness/Contrast (Use Legacy
+    /// line), Channel Mixer, Selective Color and Gradient Map adjustment
+    /// passes (0.250.0), each built on first use like [`Self::levels`]. See
+    /// [`Self::composite_invert_with_opacity`] and its six siblings.
+    invert: Option<UniformAdjustmentGpu>,
+    threshold: Option<UniformAdjustmentGpu>,
+    posterize: Option<UniformAdjustmentGpu>,
+    brightness_contrast: Option<UniformAdjustmentGpu>,
+    channel_mixer: Option<UniformAdjustmentGpu>,
+    selective_color: Option<UniformAdjustmentGpu>,
+    gradient_map: Option<UniformAdjustmentGpu>,
 }
 
 /// Builds [`TileCompositor::bind_group_layout_blend`]: the opacity
@@ -2540,6 +2551,13 @@ impl TileCompositor {
             photo_filter: None,
             black_white: None,
             color_balance: None,
+            invert: None,
+            threshold: None,
+            posterize: None,
+            brightness_contrast: None,
+            channel_mixer: None,
+            selective_color: None,
+            gradient_map: None,
         }
     }
 
@@ -5255,6 +5273,69 @@ const COLOR_BALANCE_SHADER: &str = concat!(
     "\n",
     include_str!("shaders/color_balance.wgsl")
 );
+/// The Invert pass's WGSL (0.250.0).
+const INVERT_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
+    "\n",
+    include_str!("shaders/invert.wgsl")
+);
+/// The Threshold pass's WGSL (0.250.0).
+const THRESHOLD_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
+    "\n",
+    include_str!("shaders/threshold.wgsl")
+);
+/// The Posterize pass's WGSL (0.250.0).
+const POSTERIZE_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
+    "\n",
+    include_str!("shaders/posterize.wgsl")
+);
+/// The Brightness/Contrast pass's WGSL (0.250.0).
+const BRIGHTNESS_CONTRAST_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
+    "\n",
+    include_str!("shaders/brightness_contrast.wgsl")
+);
+/// The Channel Mixer pass's WGSL (0.250.0).
+const CHANNEL_MIXER_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
+    "\n",
+    include_str!("shaders/channel_mixer.wgsl")
+);
+/// The Selective Color pass's WGSL (0.250.0).
+const SELECTIVE_COLOR_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
+    "\n",
+    include_str!("shaders/selective_color.wgsl")
+);
+/// The Gradient Map pass's WGSL (0.250.0).
+const GRADIENT_MAP_SHADER: &str = concat!(
+    include_str!("shaders/composite.wgsl"),
+    "\n",
+    include_str!("shaders/adjust_common.wgsl"),
+    "\n",
+    include_str!("shaders/gradient_map.wgsl")
+);
+const LABEL_INVERT: &str = "composite.invert";
+const LABEL_THRESHOLD: &str = "composite.threshold";
+const LABEL_POSTERIZE: &str = "composite.posterize";
+const LABEL_BRIGHTNESS_CONTRAST: &str = "composite.brightness_contrast";
+const LABEL_CHANNEL_MIXER: &str = "composite.channel_mixer";
+const LABEL_SELECTIVE_COLOR: &str = "composite.selective_color";
+const LABEL_GRADIENT_MAP: &str = "composite.gradient_map";
 const LABEL_LEVELS: &str = "composite.levels";
 const LABEL_HUE_SATURATION: &str = "composite.hue_saturation";
 const LABEL_VIBRANCE: &str = "composite.vibrance";
@@ -5285,6 +5366,22 @@ pub const PHOTO_FILTER_GPU_PARAMS_LEN: usize = 8;
 pub const BLACK_WHITE_GPU_PARAMS_LEN: usize = 12;
 /// See [`VIBRANCE_GPU_PARAMS_LEN`].
 pub const COLOR_BALANCE_GPU_PARAMS_LEN: usize = 16;
+
+/// The `f32` lengths of the 0.250.0 passes' parameters, as the matching
+/// `aurora_filters::*Op::packed_for_gpu` builds them (`aurora-app` asserts
+/// the lengths agree at compile time). Invert has no parameters.
+pub const THRESHOLD_GPU_PARAMS_LEN: usize = 4;
+/// See [`THRESHOLD_GPU_PARAMS_LEN`].
+pub const POSTERIZE_GPU_PARAMS_LEN: usize = 4;
+/// See [`THRESHOLD_GPU_PARAMS_LEN`]: the Use Legacy line (the default mode
+/// goes through the Curves pass).
+pub const BRIGHTNESS_CONTRAST_GPU_PARAMS_LEN: usize = 4;
+/// See [`THRESHOLD_GPU_PARAMS_LEN`].
+pub const CHANNEL_MIXER_GPU_PARAMS_LEN: usize = 16;
+/// See [`THRESHOLD_GPU_PARAMS_LEN`].
+pub const SELECTIVE_COLOR_GPU_PARAMS_LEN: usize = 40;
+/// See [`THRESHOLD_GPU_PARAMS_LEN`]: a header `vec4` and 64 stops of four.
+pub const GRADIENT_MAP_GPU_PARAMS_LEN: usize = 260;
 
 /// A lazily built adjustment pass whose whole parameter set rides in one
 /// small uniform (0.206.0): bindings 1 (sampler), 3 (backdrop) and 4 (the
@@ -5735,6 +5832,307 @@ impl TileCompositor {
                 LABEL_COLOR_BALANCE,
                 COLOR_BALANCE_SHADER,
                 "fs_composite_color_balance",
+            )
+        });
+        pass.record(
+            context,
+            encoder,
+            &self.sampler,
+            params,
+            backdrop,
+            dst,
+            opacity,
+            code,
+        );
+        true
+    }
+
+    /// Records the Invert adjustment pass (0.250.0), the same shape as
+    /// [`Self::composite_levels_with_opacity`]: the CPU reference is
+    /// `aurora_filters::InvertOp::apply`, `params` is none: Invert has no parameters.
+    /// Returns `false`, recording nothing, when `mode` has no adjustment
+    /// blend math or a value is not finite. See `shaders/invert.wgsl`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_invert_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        let device = context.device();
+        let pass = self.invert.get_or_insert_with(|| {
+            UniformAdjustmentGpu::new(device, LABEL_INVERT, INVERT_SHADER, "fs_composite_invert")
+        });
+        pass.record(
+            context,
+            encoder,
+            &self.sampler,
+            &[],
+            backdrop,
+            dst,
+            opacity,
+            code,
+        );
+        true
+    }
+
+    /// Records the Threshold adjustment pass (0.250.0), the same shape as
+    /// [`Self::composite_levels_with_opacity`]: the CPU reference is
+    /// `aurora_filters::ThresholdOp::apply`, `params` is `ThresholdOp::packed_for_gpu`'s output ([`THRESHOLD_GPU_PARAMS_LEN`] values).
+    /// Returns `false`, recording nothing, when `mode` has no adjustment
+    /// blend math or a value is not finite. See `shaders/threshold.wgsl`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_threshold_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &[f32; THRESHOLD_GPU_PARAMS_LEN],
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        if !params.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let device = context.device();
+        let pass = self.threshold.get_or_insert_with(|| {
+            UniformAdjustmentGpu::new(
+                device,
+                LABEL_THRESHOLD,
+                THRESHOLD_SHADER,
+                "fs_composite_threshold",
+            )
+        });
+        pass.record(
+            context,
+            encoder,
+            &self.sampler,
+            params,
+            backdrop,
+            dst,
+            opacity,
+            code,
+        );
+        true
+    }
+
+    /// Records the Posterize adjustment pass (0.250.0), the same shape as
+    /// [`Self::composite_levels_with_opacity`]: the CPU reference is
+    /// `aurora_filters::PosterizeOp::apply`, `params` is `PosterizeOp::packed_for_gpu`'s output ([`POSTERIZE_GPU_PARAMS_LEN`] values).
+    /// Returns `false`, recording nothing, when `mode` has no adjustment
+    /// blend math or a value is not finite. See `shaders/posterize.wgsl`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_posterize_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &[f32; POSTERIZE_GPU_PARAMS_LEN],
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        if !params.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let device = context.device();
+        let pass = self.posterize.get_or_insert_with(|| {
+            UniformAdjustmentGpu::new(
+                device,
+                LABEL_POSTERIZE,
+                POSTERIZE_SHADER,
+                "fs_composite_posterize",
+            )
+        });
+        pass.record(
+            context,
+            encoder,
+            &self.sampler,
+            params,
+            backdrop,
+            dst,
+            opacity,
+            code,
+        );
+        true
+    }
+
+    /// Records the Brightness/Contrast adjustment pass (0.250.0), the same shape as
+    /// [`Self::composite_levels_with_opacity`]: the CPU reference is
+    /// `aurora_filters::BrightnessContrastOp::apply`, `params` is `BrightnessContrastOp::packed_for_gpu`'s output ([`BRIGHTNESS_CONTRAST_GPU_PARAMS_LEN`] values). Only the Use Legacy line (and the not-applied case) is
+    /// computed by this pass; the default mode's table goes through
+    /// [`Self::composite_curves_with_opacity`].
+    /// Returns `false`, recording nothing, when `mode` has no adjustment
+    /// blend math or a value is not finite. See `shaders/brightness_contrast.wgsl`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_brightness_contrast_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &[f32; BRIGHTNESS_CONTRAST_GPU_PARAMS_LEN],
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        if !params.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let device = context.device();
+        let pass = self.brightness_contrast.get_or_insert_with(|| {
+            UniformAdjustmentGpu::new(
+                device,
+                LABEL_BRIGHTNESS_CONTRAST,
+                BRIGHTNESS_CONTRAST_SHADER,
+                "fs_composite_brightness_contrast",
+            )
+        });
+        pass.record(
+            context,
+            encoder,
+            &self.sampler,
+            params,
+            backdrop,
+            dst,
+            opacity,
+            code,
+        );
+        true
+    }
+
+    /// Records the Channel Mixer adjustment pass (0.250.0), the same shape as
+    /// [`Self::composite_levels_with_opacity`]: the CPU reference is
+    /// `aurora_filters::ChannelMixerOp::apply`, `params` is `ChannelMixerOp::packed_for_gpu`'s output ([`CHANNEL_MIXER_GPU_PARAMS_LEN`] values).
+    /// Returns `false`, recording nothing, when `mode` has no adjustment
+    /// blend math or a value is not finite. See `shaders/channel_mixer.wgsl`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_channel_mixer_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &[f32; CHANNEL_MIXER_GPU_PARAMS_LEN],
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        if !params.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let device = context.device();
+        let pass = self.channel_mixer.get_or_insert_with(|| {
+            UniformAdjustmentGpu::new(
+                device,
+                LABEL_CHANNEL_MIXER,
+                CHANNEL_MIXER_SHADER,
+                "fs_composite_channel_mixer",
+            )
+        });
+        pass.record(
+            context,
+            encoder,
+            &self.sampler,
+            params,
+            backdrop,
+            dst,
+            opacity,
+            code,
+        );
+        true
+    }
+
+    /// Records the Selective Color adjustment pass (0.250.0), the same shape as
+    /// [`Self::composite_levels_with_opacity`]: the CPU reference is
+    /// `aurora_filters::SelectiveColorOp::apply`, `params` is `SelectiveColorOp::packed_for_gpu`'s output ([`SELECTIVE_COLOR_GPU_PARAMS_LEN`] values).
+    /// Returns `false`, recording nothing, when `mode` has no adjustment
+    /// blend math or a value is not finite. See `shaders/selective_color.wgsl`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_selective_color_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &[f32; SELECTIVE_COLOR_GPU_PARAMS_LEN],
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        if !params.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let device = context.device();
+        let pass = self.selective_color.get_or_insert_with(|| {
+            UniformAdjustmentGpu::new(
+                device,
+                LABEL_SELECTIVE_COLOR,
+                SELECTIVE_COLOR_SHADER,
+                "fs_composite_selective_color",
+            )
+        });
+        pass.record(
+            context,
+            encoder,
+            &self.sampler,
+            params,
+            backdrop,
+            dst,
+            opacity,
+            code,
+        );
+        true
+    }
+
+    /// Records the Gradient Map adjustment pass (0.250.0), the same shape as
+    /// [`Self::composite_levels_with_opacity`]: the CPU reference is
+    /// `aurora_filters::GradientMapOp::apply`, `params` is `GradientMapOp::packed_for_gpu`'s output ([`GRADIENT_MAP_GPU_PARAMS_LEN`] values).
+    /// Returns `false`, recording nothing, when `mode` has no adjustment
+    /// blend math or a value is not finite. See `shaders/gradient_map.wgsl`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_gradient_map_with_opacity(
+        &mut self,
+        context: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &[f32; GRADIENT_MAP_GPU_PARAMS_LEN],
+        backdrop: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        opacity: f32,
+        mode: BlendMode,
+    ) -> bool {
+        let Some(code) = curves_mode_code(mode) else {
+            return false;
+        };
+        if !params.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let device = context.device();
+        let pass = self.gradient_map.get_or_insert_with(|| {
+            UniformAdjustmentGpu::new(
+                device,
+                LABEL_GRADIENT_MAP,
+                GRADIENT_MAP_SHADER,
+                "fs_composite_gradient_map",
             )
         });
         pass.record(

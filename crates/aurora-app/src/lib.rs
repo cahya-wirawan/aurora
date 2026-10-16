@@ -18512,21 +18512,22 @@ enum AdjustmentLut {
     BlackWhite(aurora_filters::BlackWhiteOp),
     /// Color Balance (0.240.0): a per-pixel function.
     ColorBalance(aurora_filters::ColorBalanceOp),
-    /// Invert (0.244.0): a per-pixel function, CPU only.
+    /// Invert (0.244.0): a per-pixel function (GPU pass since 0.250.0).
     Invert(aurora_filters::InvertOp),
-    /// Threshold (0.244.0): a per-pixel function, CPU only.
+    /// Threshold (0.244.0): a per-pixel function (GPU pass since 0.250.0).
     Threshold(aurora_filters::ThresholdOp),
-    /// Posterize (0.244.0): a per-channel function, CPU only.
+    /// Posterize (0.244.0): a per-channel function (GPU pass since 0.250.0).
     Posterize(aurora_filters::PosterizeOp),
     /// Brightness/Contrast (0.244.0): a line or a built 16,385-sample table
-    /// (cached per thread), CPU only.
+    /// (cached per thread); the line is a GPU pass of its own and the table
+    /// goes through the Curves pass (0.250.0).
     BrightnessContrast(std::rc::Rc<aurora_filters::BrightnessContrastOp>),
-    /// Channel Mixer (0.245.0): a per-pixel function, CPU only.
+    /// Channel Mixer (0.245.0): a per-pixel function (GPU pass since 0.250.0).
     ChannelMixer(aurora_filters::ChannelMixerOp),
-    /// Selective Color (0.245.0): a per-pixel function, CPU only.
+    /// Selective Color (0.245.0): a per-pixel function (GPU pass since 0.250.0).
     SelectiveColor(aurora_filters::SelectiveColorOp),
-    /// Gradient Map (0.248.0): a per-pixel function over a stop list, CPU
-    /// only (boxed: the stop list makes it the largest variant).
+    /// Gradient Map (0.248.0): a per-pixel function over a stop list (GPU
+    /// pass since 0.250.0; boxed: the stop list makes it the largest variant).
     GradientMap(Box<aurora_filters::GradientMapOp>),
 }
 
@@ -20672,7 +20673,10 @@ fn pixel_layer_mode_qualifies_for_gpu(
 /// Levels and Hue/Saturation 0.206.0, `composite_levels_with_opacity` and
 /// `composite_hue_saturation_with_opacity`; Vibrance, Exposure, Photo
 /// Filter, Black & White and Color Balance 0.242.0,
-/// `composite_vibrance_with_opacity` and its four siblings) composites exactly as
+/// `composite_vibrance_with_opacity` and its four siblings; Invert,
+/// Threshold, Posterize, Brightness/Contrast, Channel Mixer, Selective Color
+/// and Gradient Map 0.250.0, `composite_invert_with_opacity` and its six
+/// siblings) composites exactly as
 /// [`apply_adjustment_layer`] does on the CPU:
 ///
 /// - **blend mode**: `Normal` or one of the eighteen with their own GPU
@@ -20713,7 +20717,20 @@ fn adjustment_layer_qualifies_for_gpu(
             | aurora_doc::Adjustment::Exposure(_)
             | aurora_doc::Adjustment::PhotoFilter(_)
             | aurora_doc::Adjustment::BlackWhite(_)
-            | aurora_doc::Adjustment::ColorBalance(_),
+            | aurora_doc::Adjustment::ColorBalance(_)
+            // Invert, Threshold, Posterize, Brightness/Contrast (0.244.0), Channel
+            // Mixer, Selective Color (0.245.0) and Gradient Map (0.248.0) have a
+            // GPU pass each since 0.250.0 (`composite_invert_with_opacity` and
+            // its six siblings; Brightness/Contrast's default mode is a table
+            // and goes through the Curves pass). Neutral or not, they qualify
+            // like Levels.
+            | aurora_doc::Adjustment::Invert
+            | aurora_doc::Adjustment::Threshold(_)
+            | aurora_doc::Adjustment::Posterize(_)
+            | aurora_doc::Adjustment::BrightnessContrast(_)
+            | aurora_doc::Adjustment::ChannelMixer(_)
+            | aurora_doc::Adjustment::SelectiveColor(_)
+            | aurora_doc::Adjustment::GradientMap(_),
         ) => true,
         Some(aurora_doc::Adjustment::HueSaturationRanges(params)) => {
             aurora_filters::HueSaturationOp::with_ranges(params)
@@ -20724,19 +20741,8 @@ fn adjustment_layer_qualifies_for_gpu(
         // Color Balance (0.240.0) are per-pixel functions with a GPU pass each
         // since 0.242.0 (`composite_vibrance_with_opacity` and its four
         // siblings), admitted above; neutral or not, they qualify like Levels.
-        // Invert, Threshold, Posterize and Brightness/Contrast (0.244.0) are
-        // CPU only: a visible layer of these kinds refuses the GPU path
-        // until a later task ports them.
-        Some(
-            aurora_doc::Adjustment::Invert
-            | aurora_doc::Adjustment::Threshold(_)
-            | aurora_doc::Adjustment::Posterize(_)
-            | aurora_doc::Adjustment::BrightnessContrast(_)
-            | aurora_doc::Adjustment::ChannelMixer(_)
-            | aurora_doc::Adjustment::SelectiveColor(_)
-            | aurora_doc::Adjustment::GradientMap(_),
-        )
-        | None => false,
+
+        None => false,
     };
     expressible
         && !layers.mask(id).is_some_and(|mask| mask.enabled)
@@ -21190,22 +21196,26 @@ fn begin_gpu_adjustment_pass(
                 return false;
             }
         }
-        // Curves with its own table set is the first arm; a Curves
-        // adjustment paired with another table kind cannot occur
-        // (`AdjustmentLut::of` builds the pair from the same value).
-        // CPU only (0.244.0): the Invert, Threshold, Posterize and
-        // Brightness/Contrast layers.
         (
             _,
-            AdjustmentLut::Curves(_)
-            | AdjustmentLut::Invert(_)
+            lut @ (AdjustmentLut::Invert(_)
             | AdjustmentLut::Threshold(_)
             | AdjustmentLut::Posterize(_)
             | AdjustmentLut::BrightnessContrast(_)
             | AdjustmentLut::ChannelMixer(_)
             | AdjustmentLut::SelectiveColor(_)
-            | AdjustmentLut::GradientMap(_),
-        ) => return false,
+            | AdjustmentLut::GradientMap(_)),
+        ) => {
+            if !record_newest_adjustment_pass(
+                gpu, compositor, encoder, lut, from, to, opacity, mode,
+            ) {
+                return false;
+            }
+        }
+        // Curves with its own table set is the first arm; a Curves
+        // adjustment paired with another table kind cannot occur
+        // (`AdjustmentLut::of` builds the pair from the same value).
+        (_, AdjustmentLut::Curves(_)) => return false,
     }
     std::mem::swap(current_accumulator, spare_accumulator);
     true
@@ -21300,13 +21310,12 @@ fn record_photographer_adjustment_pass(
         AdjustmentLut::Curves(_)
         | AdjustmentLut::Levels(_)
         | AdjustmentLut::HueSaturation(_)
-        // CPU only (0.244.0); `adjustment_layer_qualifies_for_gpu` refuses
-        // these before a pass is ever recorded.
+        // The 0.250.0 kinds have their own recorder
+        // ([`record_newest_adjustment_pass`]).
         | AdjustmentLut::Invert(_)
         | AdjustmentLut::Threshold(_)
         | AdjustmentLut::Posterize(_)
         | AdjustmentLut::BrightnessContrast(_)
-        // CPU only (0.245.0), refused before a pass is recorded.
         | AdjustmentLut::ChannelMixer(_)
         | AdjustmentLut::SelectiveColor(_)
         | AdjustmentLut::GradientMap(_) => {
@@ -21315,6 +21324,183 @@ fn record_photographer_adjustment_pass(
     }
     true
 }
+
+/// The Brightness/Contrast pass proper: the Use Legacy line (and the
+/// not-applied case) is a pass of its own; the default mode's table goes
+/// through the Curves pass. `false` when the compositor refused it.
+#[allow(clippy::too_many_arguments)]
+fn record_brightness_contrast_pass(
+    gpu: &aurora_gpu::GpuContext,
+    compositor: &mut aurora_render::TileCompositor,
+    encoder: &mut wgpu::CommandEncoder,
+    op: &aurora_filters::BrightnessContrastOp,
+    from: &wgpu::TextureView,
+    to: &wgpu::TextureView,
+    opacity: f32,
+    mode: aurora_render::BlendMode,
+) -> bool {
+    if let Some(packed) = op.packed_for_gpu() {
+        return compositor.composite_brightness_contrast_with_opacity(
+            gpu, encoder, &packed, from, to, opacity, mode,
+        );
+    }
+    let Some((params, table)) = op.curve_for_gpu() else {
+        return false;
+    };
+    compositor.composite_curves_with_opacity(
+        gpu,
+        encoder,
+        params,
+        || table.packed_for_gpu(),
+        from,
+        to,
+        opacity,
+        mode,
+    )
+}
+
+/// Records the GPU pass of one of the seven newest adjustments (Invert,
+/// Threshold, Posterize, Brightness/Contrast, Channel Mixer, Selective
+/// Color, Gradient Map; 0.250.0) and counts it. Brightness/Contrast's
+/// default mode is a table: it goes through the Curves pass (the very
+/// 16,385 samples the CPU interpolates, uploaded once per parameter set)
+/// and is counted as a Brightness/Contrast dispatch, not a Curves one.
+/// `false` when the compositor refused the pass, or `lut` is not one of the
+/// seven (the caller then falls back to the CPU).
+#[allow(clippy::too_many_arguments)]
+fn record_newest_adjustment_pass(
+    gpu: &aurora_gpu::GpuContext,
+    compositor: &mut aurora_render::TileCompositor,
+    encoder: &mut wgpu::CommandEncoder,
+    lut: &AdjustmentLut,
+    from: &wgpu::TextureView,
+    to: &wgpu::TextureView,
+    opacity: f32,
+    mode: aurora_render::BlendMode,
+) -> bool {
+    match lut {
+        AdjustmentLut::Invert(_) => {
+            if !compositor.composite_invert_with_opacity(gpu, encoder, from, to, opacity, mode) {
+                return false;
+            }
+            note_gpu_invert_dispatch();
+        }
+        AdjustmentLut::Threshold(op) => {
+            if !compositor.composite_threshold_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_threshold_dispatch();
+        }
+        AdjustmentLut::Posterize(op) => {
+            if !compositor.composite_posterize_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_posterize_dispatch();
+        }
+        AdjustmentLut::BrightnessContrast(op) => {
+            if !record_brightness_contrast_pass(
+                gpu, compositor, encoder, op, from, to, opacity, mode,
+            ) {
+                return false;
+            }
+            note_gpu_brightness_contrast_dispatch();
+        }
+        AdjustmentLut::ChannelMixer(op) => {
+            if !compositor.composite_channel_mixer_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_channel_mixer_dispatch();
+        }
+        AdjustmentLut::SelectiveColor(op) => {
+            if !compositor.composite_selective_color_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_selective_color_dispatch();
+        }
+        AdjustmentLut::GradientMap(op) => {
+            if !compositor.composite_gradient_map_with_opacity(
+                gpu,
+                encoder,
+                &op.packed_for_gpu(),
+                from,
+                to,
+                opacity,
+                mode,
+            ) {
+                return false;
+            }
+            note_gpu_gradient_map_dispatch();
+        }
+        AdjustmentLut::Curves(_)
+        | AdjustmentLut::Levels(_)
+        | AdjustmentLut::HueSaturation(_)
+        | AdjustmentLut::Vibrance(_)
+        | AdjustmentLut::Exposure(_)
+        | AdjustmentLut::PhotoFilter(_)
+        | AdjustmentLut::BlackWhite(_)
+        | AdjustmentLut::ColorBalance(_) => return false,
+    }
+    true
+}
+
+// The packed parameter lengths of the 0.242.0 and 0.250.0 passes must agree
+// between `aurora-filters` (what `packed_for_gpu` returns) and
+// `aurora-render` (what the pass's uniform holds): a mismatch is a compile
+// error, not a runtime surprise.
+const _: () = {
+    assert!(aurora_filters::VIBRANCE_PACKED_LEN == aurora_render::VIBRANCE_GPU_PARAMS_LEN);
+    assert!(aurora_filters::EXPOSURE_PACKED_LEN == aurora_render::EXPOSURE_GPU_PARAMS_LEN);
+    assert!(aurora_filters::PHOTO_FILTER_PACKED_LEN == aurora_render::PHOTO_FILTER_GPU_PARAMS_LEN);
+    assert!(aurora_filters::BLACK_WHITE_PACKED_LEN == aurora_render::BLACK_WHITE_GPU_PARAMS_LEN);
+    assert!(
+        aurora_filters::COLOR_BALANCE_PACKED_LEN == aurora_render::COLOR_BALANCE_GPU_PARAMS_LEN
+    );
+    assert!(aurora_filters::THRESHOLD_PACKED_LEN == aurora_render::THRESHOLD_GPU_PARAMS_LEN);
+    assert!(aurora_filters::POSTERIZE_PACKED_LEN == aurora_render::POSTERIZE_GPU_PARAMS_LEN);
+    assert!(
+        aurora_filters::BRIGHTNESS_CONTRAST_PACKED_LEN
+            == aurora_render::BRIGHTNESS_CONTRAST_GPU_PARAMS_LEN
+    );
+    assert!(
+        aurora_filters::CHANNEL_MIXER_PACKED_LEN == aurora_render::CHANNEL_MIXER_GPU_PARAMS_LEN
+    );
+    assert!(
+        aurora_filters::SELECTIVE_COLOR_PACKED_LEN == aurora_render::SELECTIVE_COLOR_GPU_PARAMS_LEN
+    );
+    assert!(aurora_filters::GRADIENT_MAP_PACKED_LEN == aurora_render::GRADIENT_MAP_GPU_PARAMS_LEN);
+};
 
 /// Test-only count of GPU Curves passes recorded (0.159.0), the
 /// [`GpuBlendDispatches`] convention for the passes that are not a blend
@@ -21351,6 +21537,34 @@ static GPU_BLACK_WHITE_DISPATCHES: std::sync::atomic::AtomicU64 =
 /// Test-only count of GPU Color Balance passes recorded (0.242.0).
 #[cfg(test)]
 static GPU_COLOR_BALANCE_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only count of GPU Invert passes recorded (0.250.0).
+#[cfg(test)]
+static GPU_INVERT_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Threshold passes recorded (0.250.0).
+#[cfg(test)]
+static GPU_THRESHOLD_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Posterize passes recorded (0.250.0).
+#[cfg(test)]
+static GPU_POSTERIZE_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Brightness/Contrast passes recorded (0.250.0).
+#[cfg(test)]
+static GPU_BRIGHTNESS_CONTRAST_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Channel Mixer passes recorded (0.250.0).
+#[cfg(test)]
+static GPU_CHANNEL_MIXER_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Selective Color passes recorded (0.250.0).
+#[cfg(test)]
+static GPU_SELECTIVE_COLOR_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Test-only count of GPU Gradient Map passes recorded (0.250.0).
+#[cfg(test)]
+static GPU_GRADIENT_MAP_DISPATCHES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
@@ -21417,6 +21631,62 @@ fn note_gpu_color_balance_dispatch() {
 #[cfg(not(test))]
 fn note_gpu_color_balance_dispatch() {}
 
+#[cfg(test)]
+fn note_gpu_invert_dispatch() {
+    GPU_INVERT_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_invert_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_threshold_dispatch() {
+    GPU_THRESHOLD_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_threshold_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_posterize_dispatch() {
+    GPU_POSTERIZE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_posterize_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_brightness_contrast_dispatch() {
+    GPU_BRIGHTNESS_CONTRAST_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_brightness_contrast_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_channel_mixer_dispatch() {
+    GPU_CHANNEL_MIXER_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_channel_mixer_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_selective_color_dispatch() {
+    GPU_SELECTIVE_COLOR_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_selective_color_dispatch() {}
+
+#[cfg(test)]
+fn note_gpu_gradient_map_dispatch() {
+    GPU_GRADIENT_MAP_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn note_gpu_gradient_map_dispatch() {}
+
 /// Reads [`GPU_CURVES_DISPATCHES`] and resets it, like
 /// [`take_gpu_blend_dispatch_count`].
 #[cfg(test)]
@@ -21464,6 +21734,48 @@ fn take_gpu_black_white_dispatch_count() -> u64 {
 #[cfg(test)]
 fn take_gpu_color_balance_dispatch_count() -> u64 {
     GPU_COLOR_BALANCE_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_INVERT_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_invert_dispatch_count() -> u64 {
+    GPU_INVERT_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_THRESHOLD_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_threshold_dispatch_count() -> u64 {
+    GPU_THRESHOLD_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_POSTERIZE_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_posterize_dispatch_count() -> u64 {
+    GPU_POSTERIZE_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_BRIGHTNESS_CONTRAST_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_brightness_contrast_dispatch_count() -> u64 {
+    GPU_BRIGHTNESS_CONTRAST_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_CHANNEL_MIXER_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_channel_mixer_dispatch_count() -> u64 {
+    GPU_CHANNEL_MIXER_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_SELECTIVE_COLOR_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_selective_color_dispatch_count() -> u64 {
+    GPU_SELECTIVE_COLOR_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads [`GPU_GRADIENT_MAP_DISPATCHES`] and resets it.
+#[cfg(test)]
+fn take_gpu_gradient_map_dispatch_count() -> u64 {
+    GPU_GRADIENT_MAP_DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn accumulator_or_create<'slot>(
@@ -86280,11 +86592,14 @@ mod tests {
             }
         }
 
-        /// 0.244.0: these four kinds have no GPU pass, so a visible layer of
-        /// any of them refuses the GPU path for the whole document and a hidden
-        /// one does not; neutral or not.
+        /// 0.250.0 (was `a_visible_layer_of_the_four_new_kinds_refuses_the_gpu_
+        /// path_and_a_hidden_one_does_not`): these four kinds now have a GPU
+        /// pass each (Brightness/Contrast's default mode through the Curves
+        /// pass), so a visible root, unmasked layer at `Normal` qualifies,
+        /// neutral or not, and a hidden one never disqualifies.
         #[test]
-        fn a_visible_layer_of_the_four_new_kinds_refuses_the_gpu_path_and_a_hidden_one_does_not() {
+        fn a_visible_layer_of_the_four_244_kinds_qualifies_for_the_gpu_path_and_a_hidden_one_is_ignored()
+         {
             let bc = |b, c, legacy| match aurora_core::BrightnessContrastParams::new(b, c, legacy) {
                 Ok(p) => Adjustment::BrightnessContrast(p),
                 Err(err) => unreachable!("{err:?}"),
@@ -86307,12 +86622,12 @@ mod tests {
                 assert!(crate::document_qualifies_for_gpu_compositing(&layers));
                 let id = add(&mut layers, adjustment.clone());
                 assert!(
-                    !crate::adjustment_layer_qualifies_for_gpu(&layers, id),
+                    crate::adjustment_layer_qualifies_for_gpu(&layers, id),
                     "{adjustment:?}"
                 );
                 assert!(
-                    !crate::document_qualifies_for_gpu_compositing(&layers),
-                    "{adjustment:?}: a visible layer keeps the document on the CPU"
+                    crate::document_qualifies_for_gpu_compositing(&layers),
+                    "{adjustment:?}: a visible layer keeps the document on the GPU"
                 );
                 if let Err(err) = layers.set_visible(id, false) {
                     unreachable!("{err:?}");
@@ -86590,11 +86905,13 @@ mod tests {
             assert!((got[3] - 0.5).abs() <= 1e-3, "alpha kept: {got:?}");
         }
 
-        /// 0.245.0: a visible Channel Mixer or Selective Color layer refuses the
-        /// GPU path for the whole document (no GPU pass yet) and a hidden one
-        /// does not; neutral or not.
+        /// 0.250.0 (was `a_visible_channel_mixer_or_selective_color_layer_
+        /// refuses_the_gpu_path`): Channel Mixer, Selective Color and Gradient
+        /// Map now have a GPU pass each, so a visible root, unmasked layer
+        /// qualifies (neutral or not) and a hidden one never disqualifies.
         #[test]
-        fn a_visible_channel_mixer_or_selective_color_layer_refuses_the_gpu_path() {
+        fn a_visible_channel_mixer_selective_color_or_gradient_map_layer_qualifies_for_the_gpu_path()
+         {
             let mut ranges = [[0.0_f32; 4]; 9];
             ranges[2] = [10.0, 0.0, 0.0, -10.0];
             let strong_selective = match aurora_core::SelectiveColorParams::new(ranges, true) {
@@ -86625,12 +86942,12 @@ mod tests {
                 assert!(crate::document_qualifies_for_gpu_compositing(&layers));
                 let id = add(&mut layers, adjustment.clone());
                 assert!(
-                    !crate::adjustment_layer_qualifies_for_gpu(&layers, id),
+                    crate::adjustment_layer_qualifies_for_gpu(&layers, id),
                     "{adjustment:?}"
                 );
                 assert!(
-                    !crate::document_qualifies_for_gpu_compositing(&layers),
-                    "{adjustment:?}: a visible layer keeps the document on the CPU"
+                    crate::document_qualifies_for_gpu_compositing(&layers),
+                    "{adjustment:?}: a visible layer keeps the document on the GPU"
                 );
                 if let Err(err) = layers.set_visible(id, false) {
                     unreachable!("{err:?}");
@@ -95535,6 +95852,8 @@ mod clip_tests;
 
 #[cfg(test)]
 mod gpu_adjustment_tests;
+#[cfg(test)]
+mod gpu_newest_adjustment_tests;
 #[cfg(test)]
 mod gpu_photo_adjustment_tests;
 

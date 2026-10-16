@@ -288,9 +288,14 @@ pub(crate) fn max_diff(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0, f32::max)
 }
 
+/// How many dispatch counters [`take_counts`] reads.
+pub(crate) const COUNTERS: usize = 15;
+
 /// The passes recorded since the last call, `[curves, levels, hue_sat,
-/// vibrance, exposure, photo_filter, black_white, color_balance]`.
-pub(crate) fn take_counts() -> [u64; 8] {
+/// vibrance, exposure, photo_filter, black_white, color_balance, invert,
+/// threshold, posterize, brightness_contrast, channel_mixer,
+/// selective_color, gradient_map]`.
+pub(crate) fn take_counts() -> [u64; COUNTERS] {
     [
         crate::take_gpu_curves_dispatch_count(),
         crate::take_gpu_levels_dispatch_count(),
@@ -300,6 +305,13 @@ pub(crate) fn take_counts() -> [u64; 8] {
         crate::take_gpu_photo_filter_dispatch_count(),
         crate::take_gpu_black_white_dispatch_count(),
         crate::take_gpu_color_balance_dispatch_count(),
+        crate::take_gpu_invert_dispatch_count(),
+        crate::take_gpu_threshold_dispatch_count(),
+        crate::take_gpu_posterize_dispatch_count(),
+        crate::take_gpu_brightness_contrast_dispatch_count(),
+        crate::take_gpu_channel_mixer_dispatch_count(),
+        crate::take_gpu_selective_color_dispatch_count(),
+        crate::take_gpu_gradient_map_dispatch_count(),
     ]
 }
 
@@ -313,13 +325,20 @@ pub(crate) enum Pass {
     PhotoFilter,
     BlackWhite,
     ColorBalance,
+    Invert,
+    Threshold,
+    Posterize,
+    BrightnessContrast,
+    ChannelMixer,
+    SelectiveColor,
+    GradientMap,
 }
 
 impl Pass {
     /// The counters [`take_counts`] must read after `passes` passes of
     /// `self` and none of any other kind.
-    pub(crate) fn expected(self, passes: u64) -> [u64; 8] {
-        let mut counts = [0; 8];
+    pub(crate) fn expected(self, passes: u64) -> [u64; COUNTERS] {
+        let mut counts = [0; COUNTERS];
         let slot = match self {
             Self::Levels => 1,
             Self::HueSaturation => 2,
@@ -328,6 +347,13 @@ impl Pass {
             Self::PhotoFilter => 5,
             Self::BlackWhite => 6,
             Self::ColorBalance => 7,
+            Self::Invert => 8,
+            Self::Threshold => 9,
+            Self::Posterize => 10,
+            Self::BrightnessContrast => 11,
+            Self::ChannelMixer => 12,
+            Self::SelectiveColor => 13,
+            Self::GradientMap => 14,
         };
         if let Some(count) = counts.get_mut(slot) {
             *count = passes;
@@ -690,6 +716,13 @@ fn cases_of(pass: Pass) -> Vec<(&'static str, aurora_doc::Adjustment)> {
         | Pass::PhotoFilter
         | Pass::BlackWhite
         | Pass::ColorBalance => crate::gpu_photo_adjustment_tests::cases_of(pass),
+        Pass::Invert
+        | Pass::Threshold
+        | Pass::Posterize
+        | Pass::BrightnessContrast
+        | Pass::ChannelMixer
+        | Pass::SelectiveColor
+        | Pass::GradientMap => crate::gpu_newest_adjustment_tests::cases_of(pass),
     }
 }
 
@@ -715,7 +748,8 @@ pub(crate) fn run_cases(
         if bound > tolerance()
             && (STEEP_LEVELS_CASES.contains(&name)
                 || STEEP_HUE_SAT_CASES.contains(&name)
-                || crate::gpu_photo_adjustment_tests::STEEP_CASES.contains(&name))
+                || crate::gpu_photo_adjustment_tests::STEEP_CASES.contains(&name)
+                || crate::gpu_newest_adjustment_tests::STEEP_CASES.contains(&name))
         {
             continue;
         }
@@ -861,6 +895,22 @@ fn gpu_hue_saturation_matches_the_cpu_on_translucent_backdrops() {
 /// Every admitted blend mode, one adjustment each, on the smooth ramp (as
 /// the Curves test): the GPU must differ from Normal for every other mode,
 /// or a dropped mode would pass.
+/// Pass and mode pairs whose blend term is the source itself (see
+/// [`every_mode`]).
+fn coincides_with_normal(pass: Pass, mode: BlendMode) -> bool {
+    match pass {
+        Pass::Invert => mode == BlendMode::LinearLight,
+        Pass::Threshold => matches!(
+            mode,
+            BlendMode::HardLight
+                | BlendMode::LinearLight
+                | BlendMode::VividLight
+                | BlendMode::PinLight
+        ),
+        _ => false,
+    }
+}
+
 pub(crate) fn every_mode(
     pass: Pass,
     adjustment: aurora_doc::Adjustment,
@@ -880,6 +930,17 @@ pub(crate) fn every_mode(
     for mode in GPU_MODES {
         ok(layers.set_blend_mode(id, mode));
         let what = format!("{pass:?} {mode:?}");
+        if pass == Pass::Invert && mode == BlendMode::HardMix {
+            // HardMix switches at Cb + Cs = 1, and an inversion has Cs =
+            // 1 - Cb: EVERY texel sits on the switch (up to rounding), so
+            // no value or flip bound exists. Only the dispatch is checked.
+            let _ = take_counts();
+            let Some(_) = gpu_tile(&context, &mut compositor, &layers, &mut store) else {
+                unreachable!("{what}: fell back");
+            };
+            assert_eq!(take_counts(), pass.expected(1), "{what}: pass recorded");
+            continue;
+        }
         if mode == BlendMode::HardMix {
             // HardMix thresholds `VividLight` at 0.5: a one-`f16`-step
             // difference in `Cs` near the threshold flips a channel between
@@ -916,6 +977,17 @@ pub(crate) fn every_mode(
         worst = worst.max(w);
         if mode == BlendMode::Normal {
             normal = cpu;
+        } else if coincides_with_normal(pass, mode) {
+            // For a binary source (Threshold: 0 or 1) HardLight, LinearLight,
+            // VividLight and PinLight return the source itself, and
+            // LinearLight(Cb, 1 - Cb) = clamp(Cb + 2 (1 - Cb) - 1) = 1 - Cb
+            // for Invert: these combinations ARE Normal, mathematically, so
+            // they cannot differ from it (the comparison against the CPU
+            // above still holds).
+            assert!(
+                max_diff(&cpu, &normal) < 0.01,
+                "{what}: this mode of this pass is Normal"
+            );
         } else {
             assert!(
                 max_diff(&cpu, &normal) > 0.01,
@@ -1169,7 +1241,7 @@ fn a_document_with_levels_and_hue_saturation_layers_composites_on_the_gpu() {
     };
     assert_eq!(
         take_counts(),
-        [0, 1, 2, 0, 0, 0, 0, 0],
+        [0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         "Levels once, Hue/Saturation twice"
     );
     let cpu = cpu_tile(&layers, &mut store);
@@ -1250,7 +1322,7 @@ fn hue_saturation_with_active_ranges_stays_on_the_cpu_and_neutral_ranges_do_not(
                 gpu.is_none(),
                 "{name}: the tile must fall back, not drop it"
             );
-            assert_eq!(take_counts(), [0; 8], "{name}: no pass recorded");
+            assert_eq!(take_counts(), [0; COUNTERS], "{name}: no pass recorded");
         }
     }
 }
@@ -1287,7 +1359,7 @@ fn unsupported_levels_and_hue_saturation_layers_fall_back_to_the_cpu() {
                 gpu_tile(&context, &mut compositor, &layers, &mut store).is_none(),
                 "{refusal}: the tile must fall back, not drop the layer"
             );
-            assert_eq!(take_counts(), [0; 8], "{refusal}");
+            assert_eq!(take_counts(), [0; COUNTERS], "{refusal}");
         }
         // A disabled mask is ignored on both paths.
         let (_dir, mut store) = store();

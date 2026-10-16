@@ -15,6 +15,11 @@
 //!   Photoshop's 8-bit mode compares the *rounded* grey. A grey exactly on
 //!   the edge is white; a pixel promoted from 8 bits can sit exactly there,
 //!   where `f16` storage (not Photoshop's integer arithmetic) decides.
+//! - **GPU (0.250.0)**: the compositor's Threshold pass computes the grey
+//!   with the same `fma` order and compares it with the same `f32` edge, so
+//!   a grey exactly on the edge is decided identically on both sides for the
+//!   same input texel; only a backdrop texel whose un-premultiplied `f16`
+//!   value differs (translucent backdrops) can flip.
 //! - **Never an identity**; the input is clamped to `[0, 1]` (`NaN` reads
 //!   as `0`) and the output is exactly `0.0` or `1.0`.
 
@@ -29,6 +34,9 @@ pub const LUMA: [f32; 3] = [0.30, 0.59, 0.11];
 pub fn edge(level: u8) -> f32 {
     (f32::from(level) - 0.5) / 255.0
 }
+
+/// How many `f32`s [`ThresholdOp::packed_for_gpu`] returns (0.250.0).
+pub const THRESHOLD_PACKED_LEN: usize = 4;
 
 /// A Threshold adjustment ready to apply to pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,6 +57,15 @@ impl ThresholdOp {
     #[must_use]
     pub const fn is_identity(&self) -> bool {
         false
+    }
+
+    /// The settings flattened for the GPU Threshold pass (0.250.0,
+    /// `aurora_render::TileCompositor::composite_threshold_with_opacity`,
+    /// `shaders/threshold.wgsl`): `[edge, LUMA red, LUMA green, LUMA
+    /// blue]`, the very `f32`s [`Self::apply`] compares and weighs with.
+    #[must_use]
+    pub const fn packed_for_gpu(&self) -> [f32; THRESHOLD_PACKED_LEN] {
+        [self.edge, LUMA[0], LUMA[1], LUMA[2]]
     }
 
     /// The black or white of one straight, encoded RGB pixel.

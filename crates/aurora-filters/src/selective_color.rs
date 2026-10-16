@@ -110,6 +110,9 @@ pub fn range_weights(rgb: [f32; 3]) -> [f32; 9] {
     w
 }
 
+/// How many `f32`s [`SelectiveColorOp::packed_for_gpu`] returns (0.250.0).
+pub const SELECTIVE_COLOR_PACKED_LEN: usize = 40;
+
 /// A Selective Color adjustment ready to apply to pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SelectiveColorOp {
@@ -135,6 +138,27 @@ impl SelectiveColorOp {
     #[must_use]
     pub const fn is_identity(&self) -> bool {
         self.identity
+    }
+
+    /// The settings flattened for the GPU Selective Color pass (0.250.0,
+    /// `aurora_render::TileCompositor::composite_selective_color_with_opacity`,
+    /// `shaders/selective_color.wgsl`): `[absolute, 0, 0, 0]` then the nine
+    /// ranges (Reds, Yellows, Greens, Cyans, Blues, Magentas, Whites,
+    /// Neutrals, Blacks) of `[cyan, magenta, yellow, black]` as fractions,
+    /// the very `f32`s [`Self::apply`] weighs. No identity flag is sent: an
+    /// all-zero adjustment passes every channel through on the general path
+    /// (the `delta == 0 && d_k == 0` rule), exactly as the CPU's early
+    /// return does.
+    #[must_use]
+    pub fn packed_for_gpu(&self) -> [f32; SELECTIVE_COLOR_PACKED_LEN] {
+        let mut out = [0.0_f32; SELECTIVE_COLOR_PACKED_LEN];
+        out[0] = f32::from(u8::from(self.absolute));
+        for (i, v) in self.sliders.iter().flatten().enumerate() {
+            if let Some(slot) = out.get_mut(4 + i) {
+                *slot = *v;
+            }
+        }
+        out
     }
 
     /// The adjusted colour of one straight, encoded RGB pixel.
