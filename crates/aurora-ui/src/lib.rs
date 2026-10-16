@@ -74,8 +74,8 @@ pub mod workspace;
 pub use adjust_controls::{
     ADJUST_KIND_COUNT, ADJUST_SLIDER_COUNT, AdjustControls, AdjustKind, AdjustSlider,
     adjust_balance_preserve_checked, adjust_balance_range, adjust_controls_contains,
-    adjust_controls_shown, adjust_gradient_reverse_checked, adjust_legacy_checked,
-    adjust_mixer_mono_checked, adjust_of, adjust_preserve_checked,
+    adjust_controls_shown, adjust_gradient_reverse_checked, adjust_gradient_selected,
+    adjust_legacy_checked, adjust_mixer_mono_checked, adjust_of, adjust_preserve_checked,
     adjust_selective_absolute_checked, adjust_tab, adjust_tint_checked, insert_adjust_controls,
     sync_adjust_controls,
 };
