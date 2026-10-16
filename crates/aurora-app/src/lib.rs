@@ -19376,14 +19376,21 @@ fn fold_clip_group(
     }
     if let Some(before) = before.clone() {
         if any {
-            for (index, ((acc, new), old)) in
-                accumulator.iter_mut().zip(&group).zip(&before).enumerate()
+            for ((acc, new), old) in accumulator
+                .chunks_exact_mut(aurora_tile::CHANNELS)
+                .zip(group.chunks_exact(aurora_tile::CHANNELS))
+                .zip(before.chunks_exact(aurora_tile::CHANNELS))
             {
-                if index % aurora_tile::CHANNELS == 3 {
-                    continue;
+                // Task 110: the sum of the base's effects-and-all texel and
+                // the clipped layer's change is only a model; where it
+                // leaves the valid premultiplied range (below 0 or above
+                // the texel's own alpha, seen on `stroke-composite.psd`
+                // under a gradient overlay) it is clamped back into it.
+                let alpha = acc.get(3).map_or(0.0, |a| a.to_f32());
+                for (channel, (n, o)) in acc.iter_mut().zip(new.iter().zip(old)).take(3) {
+                    let delta = (n.to_f32() - o.to_f32()) * opacity;
+                    *channel = half::f16::from_f32((channel.to_f32() + delta).clamp(0.0, alpha));
                 }
-                let delta = (new.to_f32() - old.to_f32()) * opacity;
-                *acc = half::f16::from_f32(acc.to_f32() + delta);
             }
             changed = true;
         }
@@ -90067,14 +90074,16 @@ mod tests {
             // 0.181.0: Fill 0 on 'Polygon 2' (content hidden); its stroke is not drawn yet. Before it (0.180.0): 255 / 56.29, 63.67, 69.87 (max / mean per channel).
             // 0.182.0: unchanged by drawing drop shadows.
             // 0.190.0: Inner stroke now drawn; before 0.190.0: max 255 / 57.8164, 63.1807, 69.8682.
-            ("effects/shape-fx2.psd", 255.0, [12.4180, 41.8770, 69.8682]),
+            // Task 110: Polygon 1's gradient overlay is drawn; before: 255 / 12.4180, 41.8770, 69.8682.
+            ("effects/shape-fx2.psd", 255.0, [2.6016, 0.6280, 0.6280]),
             // 0.181.0: overlays now drawn, but on clipped layers shown unclipped, so they cover more than Photoshop's. Before it (0.180.0): 255 / 43.94, 47.46, 22.82 (max / mean per channel).
             // 0.182.0: unchanged by drawing drop shadows.
             // 0.190.0: Inner strokes now drawn (on clipped layers shown unclipped: blue is worse, red and green better); before: 255 / 52.6774, 53.5591, 26.0986.
+            // Task 110: the two 'Plain+Effects' gradient overlays are drawn (mean 13.98 -> 6.30 over channels); before: 255 / 45.1914, 46.6338, 27.2065.
             (
                 "effects/stroke-composite.psd",
                 255.0,
-                [45.1914, 46.6338, 27.2065],
+                [7.8800, 5.5871, 5.4319],
             ),
             // 0.181.0: Fill 0 hides the shape's pixels; its stroke is not drawn yet. Before it (0.180.0): 255 / 220.34, 52.00, 220.34 (max / mean per channel).
             // 0.182.0: unchanged by drawing drop shadows.
@@ -90088,7 +90097,8 @@ mod tests {
             // 0.182.0, drop shadows drawn; before (0.181.0): max 168, mean 10.990, 9.186, 10.466.
             // 0.190.0: Text stroke now drawn; before: 168 / 10.3246, 8.5522, 9.8170.
             // 0.191.0: The Outer Glow (Softer, white, Screen 35 %, size 41) on the "Outer Glow" text is drawn; before: 168 / 8.9371, 7.1427, 8.4219. Over the margins left and right of that text alone the mean falls 4.35 -> 2.16 levels (`the_fitted_glow_radius_reduces_the_error_against_photoshops_merged_image`).
-            ("layer_effects.psd", 168.0, [8.5358, 6.7384, 8.0221]),
+            // Task 110: the Gradient Overlay text is drawn; before: 168 / 8.5358, 6.7384, 8.0221.
+            ("layer_effects.psd", 168.0, [7.0919, 5.5328, 7.6226]),
             // 0.181.0: Fill 0 'divider' shape no longer drawn. Before it (0.180.0): 161 / 1.36, 1.32, 1.32 (max / mean per channel).
             // 0.182.0, drop shadows drawn; before (0.181.0): max 65, mean 1.191, 1.148, 1.137.
             // 0.190.0: A 2 px 10 % outside stroke on Rectangle 2 was drawn darker than Photoshop shows it; before: 65 / 0.2007, 0.1571, 0.1460 (0.189.0).
@@ -90164,10 +90174,12 @@ mod tests {
             ("fill_adjustments.psd", 230.0, [125.8756, 51.4564, 32.0369]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 162, mean 6.738, 12.118, 17.999.
             // 0.190.0: Strokes drawn; before: 162 / 4.4585, 9.8399, 15.7286.
-            ("layer_comps.psd", 136.0, [3.8984, 9.3481, 15.6275]),
+            // Task 110: gradient overlays drawn (reference box = the record rectangle); mean over channels 9.63 -> 9.51: red 3.90 -> 3.64 and blue 15.63 -> 15.40 better, green 9.35 -> 9.48 worse (not explained).
+            ("layer_comps.psd", 136.0, [3.6410, 9.4797, 15.4030]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 182, mean 6.800, 12.246, 18.372.
             // 0.190.0: Strokes drawn; before: 182 / 4.2692, 9.7118, 15.7745.
-            ("layer_comps.psb", 124.0, [3.8034, 9.3190, 15.7356]),
+            // Task 110: as layer_comps.psd (measured 3.5652 / 9.4646 / 15.5236).
+            ("layer_comps.psb", 124.0, [3.5653, 9.4647, 15.5237]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 245, mean 4.480, 7.851, 9.767.
             ("layer_params.psd", 244.0, [4.8987, 4.8851, 4.2994]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 245, mean 4.480, 7.851, 9.767.

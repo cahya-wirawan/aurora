@@ -179,7 +179,7 @@ fn the_reference_box_places_the_gradient_and_the_shape_clips_it() {
     o.reference = None;
     set_gradients(&mut layers, id, vec![o]);
     let acc = composite(&layers, &mut store);
-    assert!((grey_at(&acc, 3, 3) - 0.5).abs() < 0.01);
+    assert!(grey_at(&acc, 3, 3) < 0.01, "t is near 0 far left of the 4096 box's centre");
 }
 
 #[test]
@@ -310,7 +310,7 @@ fn an_imported_overlay_spans_the_record_rectangle_not_the_canvas_sized_layer() {
         let Some(fx) = document.layers.effects(id) else {
             continue;
         };
-        for o in &fx.gradient_overlays {
+        for o in fx.gradient_overlays.iter().filter(|o| fx.shows(o.gate)) {
             let (Some(r), Some(b)) = (o.reference, document.layers.bounds(id)) else {
                 unreachable!("an imported overlay carries its record rectangle");
             };
