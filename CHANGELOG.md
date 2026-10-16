@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.251.0] - 2026-10-16
+
+### Added
+
+- Draw pixel-less fill layers and artboard backgrounds when a PSD opens
+
 ## [0.250.0] - 2026-10-16
 
 ### Changed
