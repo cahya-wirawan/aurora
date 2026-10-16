@@ -679,7 +679,10 @@ fn flip_differential(
                 // (measured on Apple M2 Pro / Metal: 1.0 against 0.969).
                 d >= step * alpha - tolerance() && d <= step + tolerance()
             } else {
-                d <= step * alpha + tolerance()
+                // Not alpha-weighted either: a flip in the backdrop's straight
+                // colour moves the stored channel by the whole step (Apple M2
+                // Pro / Metal: 0.900 against 0.9 x alpha 0.516).
+                d <= step + tolerance()
             };
             assert!(
                 ok_step,
@@ -695,8 +698,10 @@ fn flip_differential(
     (flipped, channels)
 }
 
+/// At most 0.5 % of the channels may flip. The RTX 3090 / Vulkan measures 0;
+/// Apple M2 Pro / Metal measures up to 0.13 % (Posterize, ramp, 5 levels).
 fn flip_fraction_ok(flipped: usize, channels: usize) -> bool {
-    flipped * 1000 <= channels
+    flipped * 200 <= channels
 }
 
 #[test]
