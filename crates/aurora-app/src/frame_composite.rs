@@ -141,6 +141,10 @@ pub(crate) fn composite_tiles(
     pool.install(|| {
         let _ = crate::with_shadow_cache(crate::ShadowCache::begin_pass);
     });
+    // One "already reported" flag for the whole pass, shared by every
+    // tile's budget, so a malformed document warns once per pass as in
+    // the sequential loop.
+    let pass_reported = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let batch_len = pool
         .current_num_threads()
         .saturating_mul(4)
@@ -152,7 +156,16 @@ pub(crate) fn composite_tiles(
             batch
                 .par_iter()
                 .with_max_len(1)
-                .map(|&tile_id| composite_one(&shared, serial, layers, tile_id, reference_origin))
+                .map(|&tile_id| {
+                    composite_one(
+                        &shared,
+                        serial,
+                        layers,
+                        tile_id,
+                        reference_origin,
+                        &pass_reported,
+                    )
+                })
                 .collect()
         });
         let store: &mut TileStore = match shared.into_inner() {
@@ -181,12 +194,13 @@ fn composite_one(
     layers: &aurora_doc::LayerTree,
     tile_id: TileId,
     reference_origin: (i64, i64),
+    pass_reported: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> TileResult {
     #[cfg(test)]
     let before = crate::COMPOSITE_PROFILE.with(std::cell::Cell::get);
     let mut source = SharedMirror::new(shared, serial);
     let doc_origin = crate::composite_tile_doc_origin(reference_origin, tile_id);
-    let mut budget = crate::CompositeBudget::for_tile_of_pass(layers);
+    let mut budget = crate::CompositeBudget::for_tile_of_shared_pass(layers, pass_reported);
     let (texels, folded) = crate::profiled(crate::ProfileSlot::TileComposite, || {
         crate::composite_roots_into_tile(
             layers,

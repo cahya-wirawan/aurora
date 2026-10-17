@@ -489,3 +489,28 @@ fn nyepi_whole_canvas_composites_the_same_in_parallel() {
     }
     println!("nyepi parallel frame differential: {compared} samples");
 }
+
+/// Budgets sharing one pass flag report once for the whole pass, as the
+/// sequential loop's single budget does; an unshared budget is unaffected.
+#[test]
+fn budgets_sharing_a_pass_report_once() {
+    let layers = aurora_doc::LayerTree::new();
+    let pass = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut first = crate::CompositeBudget::for_tile_of_shared_pass(&layers, &pass);
+    let mut second = crate::CompositeBudget::for_tile_of_shared_pass(&layers, &pass);
+    assert!(second.store_error().is_none(), "nothing tallied yet");
+    assert!(first.should_report(), "the pass's first breach reports");
+    assert!(!first.should_report(), "and only once on that tile");
+    assert!(
+        !second.should_report(),
+        "another tile of the pass stays quiet"
+    );
+    let mut other = crate::CompositeBudget::for_tile_of_pass(&layers);
+    assert!(
+        other.should_report(),
+        "an unshared budget reports on its own"
+    );
+    let fresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut next_pass = crate::CompositeBudget::for_tile_of_shared_pass(&layers, &fresh);
+    assert!(next_pass.should_report(), "a new pass reports again");
+}

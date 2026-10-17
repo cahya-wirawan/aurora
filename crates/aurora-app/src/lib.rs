@@ -16231,6 +16231,12 @@ struct CompositeBudget {
     /// `aurora_tile::TileError` is neither `Clone` nor cheap to hold on
     /// to while the store it borrows from is still being mutated.
     first_store_error: Option<String>,
+    /// The pass's own "already reported" flag when several threads fold
+    /// one pass's tiles, each with its own budget (60 FPS round 7, the
+    /// frame pool): [`Self::should_report`] answers `true` once for the
+    /// whole pass, as the sequential loop's single budget does. `None`
+    /// keeps `reported` alone.
+    pass_reported: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl CompositeBudget {
@@ -16254,6 +16260,21 @@ impl CompositeBudget {
             reported: false,
             store_errors: 0,
             first_store_error: None,
+            pass_reported: None,
+        }
+    }
+
+    /// [`Self::for_tile_of_pass`] whose report is once per *pass* across
+    /// every budget sharing `pass_reported` (60 FPS round 7, the frame
+    /// pool). The store-error tally stays per tile: the frame path never
+    /// reads it (the live canvas ignores it, see [`Self::note_store_error`]).
+    fn for_tile_of_shared_pass(
+        layers: &aurora_doc::LayerTree,
+        pass_reported: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            pass_reported: Some(std::sync::Arc::clone(pass_reported)),
+            ..Self::for_tile_of_pass(layers)
         }
     }
 
@@ -16282,7 +16303,10 @@ impl CompositeBudget {
     fn should_report(&mut self) -> bool {
         let first = !self.reported;
         self.reported = true;
-        first
+        match &self.pass_reported {
+            Some(pass) => first && !pass.swap(true, std::sync::atomic::Ordering::SeqCst),
+            None => first,
+        }
     }
 
     /// Records that one layer's tile could not be read out of the store
@@ -18931,6 +18955,7 @@ fn fold_children_isolating_adjustments(
         reported: true,
         store_errors: 0,
         first_store_error: None,
+        pass_reported: None,
     };
     let mut folded = 0_usize;
     // `children` is newest first: walk it from the end (the bottom).
@@ -19494,6 +19519,7 @@ fn opaque_cover_texels(
         reported: true,
         store_errors: 0,
         first_store_error: None,
+        pass_reported: None,
     };
     let texels = pixel_layer_texels(
         id,
@@ -20142,6 +20168,7 @@ fn pass_through_content(
         reported: true,
         store_errors: 0,
         first_store_error: None,
+        pass_reported: None,
     };
     let _ = fold_context_into(
         &mut own,
