@@ -41,7 +41,10 @@ winit = { workspace = true }
 wgpu = { workspace = true }
 rfd = { workspace = true }
 arboard = { workspace = true }
-half = { workspace = true }
+half = { workspace = true, features = ["bytemuck"] }
+# 0.265.0: a tile's f16 samples go to and come back from the GPU as
+# their own bytes (a cast on little-endian targets, no per-sample loop).
+bytemuck = { workspace = true }
 # The background compositor's own thread pool (0.188.0): it folds several
 # view tiles at once (`background_composite`). PRD §8's chosen crate for
 # CPU tile parallelism, already a workspace dependency via `aurora-gpu`.

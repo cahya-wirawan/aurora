@@ -154,3 +154,107 @@ fn widget_paint_cost_per_frame_is_measured_on_the_startup_workspace() {
         "widget paints took {demo:.2} / {many:.2} ms a frame"
     );
 }
+
+/// The per-sample loop `begin_gpu_composite_tile` used before 0.265.0 to
+/// turn a source tile into upload bytes: the reference the cast is
+/// checked against.
+fn reference_le_bytes(samples: &[half::f16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
+
+/// Every bit pattern an `f16` can hold (NaN payloads, signalling NaNs,
+/// both zeros, subnormals, infinities), repeated to a whole tile.
+fn every_bit_pattern_tile() -> Vec<half::f16> {
+    (0..aurora_tile::SAMPLES)
+        .map(|i| half::f16::from_bits((i % 65_536) as u16))
+        .collect()
+}
+
+#[test]
+fn f16_le_bytes_matches_the_per_sample_loop() {
+    let texels = every_bit_pattern_tile();
+    let bytes = crate::f16_le_bytes(&texels);
+    assert_eq!(bytes.as_ref(), reference_le_bytes(&texels).as_slice());
+    assert!(crate::f16_le_bytes(&[]).is_empty());
+}
+
+#[test]
+fn f16_samples_from_le_bytes_inverts_the_bytes_bit_for_bit() {
+    let texels = every_bit_pattern_tile();
+    let mut bytes = reference_le_bytes(&texels);
+    let back = crate::f16_samples_from_le_bytes(&bytes);
+    assert_eq!(back.len(), texels.len());
+    assert!(
+        back.iter()
+            .zip(&texels)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+    );
+    // A trailing odd byte is ignored, as the old loop's `chunks_exact` did.
+    bytes.push(0xAB);
+    assert_eq!(crate::f16_samples_from_le_bytes(&bytes).len(), texels.len());
+    // An unaligned start (a mapped range need not be 2-aligned) decodes.
+    let shifted = bytes.get(1..).unwrap_or_default();
+    let odd = crate::f16_samples_from_le_bytes(shifted);
+    assert_eq!(odd.len(), texels.len());
+    assert_eq!(
+        odd.first().map(|s| s.to_bits()),
+        Some(u16::from_le_bytes([0x00, 0x01]))
+    );
+    assert_eq!(
+        crate::decode_f16_samples(&reference_le_bytes(&texels)).map(|v| v.len()),
+        Some(aurora_tile::SAMPLES)
+    );
+    assert!(crate::decode_f16_samples(&[0, 0, 0]).is_none());
+}
+
+/// The per-sample byte conversions every GPU-composited tile runs (the
+/// source upload in `begin_gpu_composite_tile` and the readback decode in
+/// `decode_f16_samples`), timed on one tile in this crate's own profile:
+/// the pre-0.265.0 loops against the casts that replaced them.
+#[test]
+fn gpu_tile_byte_conversions_are_measured() {
+    let texels: Vec<half::f16> = (0..aurora_tile::SAMPLES)
+        .map(|i| half::f16::from_f32((i % 1024) as f32 / 1024.0))
+        .collect();
+    let runs = 20;
+    let (mut old_encode, mut old_decode, mut new_encode, mut new_decode) = (
+        Vec::with_capacity(runs),
+        Vec::with_capacity(runs),
+        Vec::with_capacity(runs),
+        Vec::with_capacity(runs),
+    );
+    for _ in 0..runs {
+        let t0 = Instant::now();
+        let bytes = reference_le_bytes(&texels);
+        old_encode.push(t0.elapsed().as_secs_f64() * 1000.0);
+        let t1 = Instant::now();
+        let mut out = Vec::with_capacity(aurora_tile::SAMPLES);
+        for pair in bytes.chunks_exact(2) {
+            if let Ok(pair) = <[u8; 2]>::try_from(pair) {
+                out.push(half::f16::from_le_bytes(pair));
+            }
+        }
+        old_decode.push(t1.elapsed().as_secs_f64() * 1000.0);
+        let t2 = Instant::now();
+        let cast = crate::f16_le_bytes(&texels);
+        let cast_len = cast.len();
+        new_encode.push(t2.elapsed().as_secs_f64() * 1000.0);
+        let t3 = Instant::now();
+        let back = crate::f16_samples_from_le_bytes(&bytes);
+        new_decode.push(t3.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(cast_len, bytes.len());
+        assert_eq!(back.len(), out.len());
+    }
+    let (oe, _, _) = stats(&mut old_encode);
+    let (od, _, _) = stats(&mut old_decode);
+    let (ne, _, _) = stats(&mut new_encode);
+    let (nd, _, _) = stats(&mut new_decode);
+    println!(
+        "gpu tile byte conversions (one 256x256 RGBA f16 tile, n={runs}): encode loop \
+         {oe:.3}ms -> cast {ne:.3}ms; decode loop {od:.3}ms -> copy {nd:.3}ms"
+    );
+}

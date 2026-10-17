@@ -21440,6 +21440,44 @@ fn adjustment_layer_qualifies_for_gpu(
         && aurora_render::curves_mode_code(translate_blend_mode(mode)).is_some()
 }
 
+/// `samples` as little-endian bytes, the layout an `Rgba16Float` texture
+/// upload takes (0.265.0). On a little-endian target that is the samples'
+/// own memory, borrowed with no copy; elsewhere each sample is written
+/// with `to_le_bytes`. Bit-identical to the per-sample loop it replaced
+/// (`f16_le_bytes_matches_the_per_sample_loop`), which cost about 1.2 ms
+/// a tile in the dev profile.
+#[must_use]
+fn f16_le_bytes(samples: &[half::f16]) -> std::borrow::Cow<'_, [u8]> {
+    if cfg!(target_endian = "little") {
+        std::borrow::Cow::Borrowed(bytemuck::cast_slice(samples))
+    } else {
+        let mut bytes = Vec::with_capacity(samples.len() * 2);
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        std::borrow::Cow::Owned(bytes)
+    }
+}
+
+/// The inverse of [`f16_le_bytes`]: every whole little-endian pair of
+/// `data` as a sample (a trailing odd byte is ignored, as the per-sample
+/// loop this replaced did). On a little-endian target it is one copy
+/// (`bytemuck::pod_collect_to_vec`, which also copes with an unaligned
+/// mapped range).
+#[must_use]
+fn f16_samples_from_le_bytes(data: &[u8]) -> Vec<half::f16> {
+    let whole = data.get(..data.len() - data.len() % 2).unwrap_or_default();
+    if cfg!(target_endian = "little") {
+        bytemuck::pod_collect_to_vec(whole)
+    } else {
+        whole
+            .chunks_exact(2)
+            .filter_map(|pair| <[u8; 2]>::try_from(pair).ok())
+            .map(half::f16::from_le_bytes)
+            .collect()
+    }
+}
+
 /// Decodes a raw, mapped `Rgba16Float`, `TILE`×`TILE` readback buffer's
 /// own byte range into a real, [`aurora_tile::SAMPLES`]-length
 /// `Vec<half::f16>` — the shared decode step [`finish_tile_readback`]
@@ -21453,13 +21491,7 @@ fn adjustment_layer_qualifies_for_gpu(
 /// test never will" reason [`finish_tile_readback`]'s own doc comment
 /// gives.
 fn decode_f16_samples(data: &[u8]) -> Option<Vec<half::f16>> {
-    let mut out = Vec::with_capacity(aurora_tile::SAMPLES);
-    for bytes in data.chunks_exact(2) {
-        let Ok(pair) = <[u8; 2]>::try_from(bytes) else {
-            continue;
-        };
-        out.push(half::f16::from_le_bytes(pair));
-    }
+    let out = f16_samples_from_le_bytes(data);
     if out.len() == aurora_tile::SAMPLES {
         Some(out)
     } else {
@@ -24285,10 +24317,7 @@ fn begin_gpu_composite_tile(
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let mut bytes = Vec::with_capacity(texels.len() * 2);
-        for sample in &texels {
-            bytes.extend_from_slice(&sample.to_le_bytes());
-        }
+        let bytes = f16_le_bytes(&texels);
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &src_texture,
