@@ -60,8 +60,8 @@ pub use aur::{
 };
 pub use aur_colour::DocumentColour;
 pub use colour_import::{
-    ColourImport, ColourReport, SourceProfile, Tagging, bring_into_working, convert_rgba,
-    decode_to_working,
+    ColourImport, ColourReport, ConvertDirection, SourceProfile, Tagging, bring_into_working,
+    convert_profile_rgba, convert_rgba, decode_to_working,
 };
 pub use error::{IoError, psd_color_mode_name};
 pub use image::Image;

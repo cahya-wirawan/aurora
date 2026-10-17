@@ -19,7 +19,7 @@
 use std::io::Read as _;
 use std::path::Path;
 
-use aurora_color::{IccProfile, MAX_PROFILE_BYTES, Transform, inspect_rgb_source};
+use aurora_color::{IccProfile, MAX_PROFILE_BYTES, inspect_rgb_source};
 use aurora_io::{Image, SourceProfile};
 
 use crate::LockRefusal;
@@ -92,11 +92,14 @@ pub(crate) fn export_image(image: Image, output: Option<&SourceProfile>) -> Resu
     let Ok(profile) = IccProfile::from_bytes(&output.bytes) else {
         return Err(image);
     };
-    let Ok(transform) = Transform::from_working(&profile) else {
-        return Err(image);
-    };
     let mut samples = image.samples().to_vec();
-    if aurora_io::convert_rgba(&mut samples, &transform).is_err() {
+    if aurora_io::convert_profile_rgba(
+        &mut samples,
+        &output.bytes,
+        aurora_io::ConvertDirection::FromWorking,
+    )
+    .is_err()
+    {
         return Err(image);
     }
     match Image::new(image.width(), image.height(), profile, samples) {

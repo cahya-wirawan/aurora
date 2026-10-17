@@ -5122,8 +5122,12 @@ pub fn merged_image_in_working_space(bytes: &[u8]) -> Result<Image, IoError> {
     let _angle = scan_resources(data, &mut notes);
     let embedded = notes.3.take();
     let plan = plan_colour(embedded.as_deref(), header.gray(), &mut notes);
-    if let Some(transform) = &plan.transform {
-        let _ = crate::convert_rgba(image.samples_mut(), transform);
+    if let Some(profile) = &plan.convert_from {
+        let _ = crate::convert_profile_rgba(
+            image.samples_mut(),
+            profile,
+            crate::ConvertDirection::ToWorking,
+        );
     }
     Ok(image)
 }
@@ -5272,7 +5276,7 @@ fn build_streamed(
     let embedded = notes.3.take();
     let plan = plan_colour(embedded.as_deref(), gray, &mut notes);
     let mut builder = Builder {
-        to_working: plan.transform,
+        to_working: plan.convert_from,
         adjustments_seen: 0,
         layers: &mut layers,
         history: &mut history,
@@ -5337,7 +5341,8 @@ fn build_streamed(
 
 /// What the embedded profile means for this open.
 struct ColourPlan {
-    transform: Option<aurora_color::Transform>,
+    /// The profile bytes to convert layers from, when they need converting.
+    convert_from: Option<Vec<u8>>,
     colour: crate::ColourImport,
     /// Report lines for the "Opened With Changes" dialog.
     warnings: Vec<String>,
@@ -5348,7 +5353,7 @@ struct ColourPlan {
 /// an info line, not a warning.
 fn plan_colour(embedded: Option<&[u8]>, gray: bool, notes: &mut Notes) -> ColourPlan {
     let mut plan = ColourPlan {
-        transform: None,
+        convert_from: None,
         colour: crate::ColourImport::default(),
         warnings: Vec::new(),
     };
@@ -5374,7 +5379,7 @@ fn plan_colour(embedded: Option<&[u8]>, gray: bool, notes: &mut Notes) -> Colour
         )),
         Ok(source) if source.equivalent_to_srgb => {}
         Ok(source) => match aurora_color::Transform::to_working(&source.profile) {
-            Ok(transform) => {
+            Ok(_checked) => {
                 plan.colour.report.info.push(format!(
                     "Converted from \"{}\" to sRGB.",
                     source.description
@@ -5383,7 +5388,7 @@ fn plan_colour(embedded: Option<&[u8]>, gray: bool, notes: &mut Notes) -> Colour
                     bytes: bytes.to_vec(),
                     description: source.description,
                 });
-                plan.transform = Some(transform);
+                plan.convert_from = Some(bytes.to_vec());
             }
             Err(_) => plan.warnings.push(
                 "The file's embedded colour profile could not be used for a conversion; its \
@@ -5400,7 +5405,7 @@ fn plan_colour(embedded: Option<&[u8]>, gray: bool, notes: &mut Notes) -> Colour
 struct Builder<'b, 'k, 's> {
     /// The embedded profile's conversion into the working space, when the
     /// file's colours are not sRGB.
-    to_working: Option<aurora_color::Transform>,
+    to_working: Option<Vec<u8>>,
     /// Adjustment layers added (the conversion note names them).
     adjustments_seen: u64,
     layers: &'b mut LayerTree,
@@ -5420,8 +5425,13 @@ impl Builder<'_, '_, '_> {
     /// Converts `image` from the file's profile into the working space, in
     /// place, when the file has one worth converting.
     fn to_working_in_place(&self, image: &mut Image) {
-        if let Some(transform) = &self.to_working
-            && crate::convert_rgba(image.samples_mut(), transform).is_err()
+        if let Some(profile) = &self.to_working
+            && crate::convert_profile_rgba(
+                image.samples_mut(),
+                profile,
+                crate::ConvertDirection::ToWorking,
+            )
+            .is_err()
         {
             tracing::warn!("a layer's colour conversion failed; its colours are left as stored");
         }

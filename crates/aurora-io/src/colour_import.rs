@@ -142,16 +142,7 @@ pub fn bring_into_working(samples: &mut [f16], tagging: Tagging<'_>, gray: bool)
     if source.equivalent_to_srgb {
         return out;
     }
-    let transform = match Transform::to_working(&source.profile) {
-        Ok(t) => t,
-        Err(_) => {
-            out.report
-                .warnings
-                .push(ignored("it could not be used for a conversion".to_owned()));
-            return out;
-        }
-    };
-    if convert_rgba(samples, &transform).is_err() {
+    if convert_profile_rgba(samples, bytes, ConvertDirection::ToWorking).is_err() {
         out.report
             .warnings
             .push(ignored("the conversion failed".to_owned()));
@@ -169,8 +160,9 @@ pub fn bring_into_working(samples: &mut [f16], tagging: Tagging<'_>, gray: bool)
 }
 
 /// Converts the colour channels of straight RGBA `samples` through
-/// `transform` in place, alpha untouched. Any partial trailing pixel is
-/// left alone.
+/// `transform` in place, alpha untouched. Pixels that are fully transparent
+/// are skipped (their colour is invisible and, in a layer image, they are
+/// most of it); any partial trailing pixel is left alone.
 ///
 /// # Errors
 ///
@@ -182,27 +174,104 @@ pub fn convert_rgba(
 ) -> Result<(), aurora_color::ColorError> {
     let mut rgb: Vec<f32> = Vec::with_capacity(CHUNK_PIXELS * 3);
     let mut converted: Vec<f32> = Vec::new();
+    let mut kept: Vec<usize> = Vec::with_capacity(CHUNK_PIXELS);
     for chunk in samples.chunks_mut(CHUNK_PIXELS * 4) {
         rgb.clear();
+        kept.clear();
         let whole = chunk.len() / 4 * 4;
         let Some(pixels) = chunk.get_mut(..whole) else {
             continue;
         };
-        for px in pixels.chunks_exact(4) {
+        for (i, px) in pixels.chunks_exact(4).enumerate() {
+            // Alpha zero (either sign): the colour cannot be seen.
+            if px.get(3).is_some_and(|a| a.to_bits() & 0x7fff == 0) {
+                continue;
+            }
+            kept.push(i);
             for c in px.iter().take(3) {
                 rgb.push(c.to_f32());
             }
         }
+        if kept.is_empty() {
+            continue;
+        }
         converted.clear();
         converted.resize(rgb.len(), 0.0);
         transform.transform(&rgb, &mut converted)?;
-        for (px, out) in pixels.chunks_exact_mut(4).zip(converted.chunks_exact(3)) {
-            for (dst, v) in px.iter_mut().zip(out) {
-                *dst = f16::from_f32(*v);
+        for (&i, out) in kept.iter().zip(converted.chunks_exact(3)) {
+            if let Some(px) = pixels.get_mut(i * 4..i * 4 + 3) {
+                for (dst, v) in px.iter_mut().zip(out) {
+                    *dst = f16::from_f32(*v);
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Which way [`convert_profile_rgba`] converts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConvertDirection {
+    /// From the profile into the sRGB working space.
+    ToWorking,
+    /// From the working space into the profile.
+    FromWorking,
+}
+
+/// The fewest samples worth a thread of their own.
+const PARALLEL_MIN_SAMPLES: usize = 1 << 20;
+
+/// [`convert_rgba`] through the RGB profile `profile_bytes`, spread over the
+/// machine's cores for a big image (each thread builds its own `lcms2`
+/// transform; they share nothing). The result is identical to the single
+/// threaded one: every pixel is converted independently.
+///
+/// # Errors
+///
+/// [`aurora_color::ColorError`] if the profile cannot be used or a chunk is
+/// refused; on an error part of the image may already be converted, so a
+/// caller that needs the original keeps a copy.
+pub fn convert_profile_rgba(
+    samples: &mut [f16],
+    profile_bytes: &[u8],
+    direction: ConvertDirection,
+) -> Result<(), aurora_color::ColorError> {
+    let build = || -> Result<Transform, aurora_color::ColorError> {
+        let profile = IccProfile::from_bytes(profile_bytes)?;
+        match direction {
+            ConvertDirection::ToWorking => Transform::to_working(&profile),
+            ConvertDirection::FromWorking => Transform::from_working(&profile),
+        }
+    };
+    let threads = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(8);
+    if threads <= 1 || samples.len() < PARALLEL_MIN_SAMPLES {
+        return convert_rgba(samples, &build()?);
+    }
+    // Whole pixels per part.
+    let part = (samples.len() / threads).div_ceil(4) * 4;
+    let results: Vec<Result<(), aurora_color::ColorError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = samples
+            .chunks_mut(part.max(4))
+            .map(|piece| {
+                scope.spawn(move || {
+                    let transform = build()?;
+                    convert_rgba(piece, &transform)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or(Err(aurora_color::ColorError::UnsupportedChannels(
+                        aurora_core::Channels::Rgb,
+                    )))
+            })
+            .collect()
+    });
+    results.into_iter().collect()
 }
 
 /// Decodes `bytes` by `path`'s extension into the working space

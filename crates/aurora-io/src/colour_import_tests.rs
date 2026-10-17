@@ -323,11 +323,59 @@ fn white_stays_white_under_the_relative_colorimetric_intent() {
     ) else {
         unreachable!()
     };
-    let Ok(bytes) = d50.to_bytes() else { unreachable!() };
-    let mut samples = vec![f16::from_f32(1.0), f16::from_f32(1.0), f16::from_f32(1.0), f16::from_f32(1.0)];
+    let Ok(bytes) = d50.to_bytes() else {
+        unreachable!()
+    };
+    let mut samples = vec![
+        f16::from_f32(1.0),
+        f16::from_f32(1.0),
+        f16::from_f32(1.0),
+        f16::from_f32(1.0),
+    ];
     let imported = bring_into_working(&mut samples, Tagging::Icc(&bytes), false);
     assert!(imported.source.is_some(), "{:?}", imported.report);
     for c in samples.iter().take(3) {
         assert!((c.to_f32() - 1.0).abs() < 2e-3, "{samples:?}");
     }
+}
+
+#[test]
+fn the_parallel_conversion_equals_the_single_threaded_one_and_skips_transparent_pixels() {
+    use super::{ConvertDirection, convert_profile_rgba, convert_rgba};
+    // Over the parallel threshold (2^20 samples), a varied pattern, with
+    // every third pixel fully transparent.
+    let pixels = 300_000_usize;
+    let mut original: Vec<f16> = Vec::with_capacity(pixels * 4);
+    for i in 0..pixels {
+        let t = |k: usize| f16::from_f32(((i * k) % 251) as f32 / 250.0);
+        let a = if i % 3 == 0 { 0.0 } else { 1.0 };
+        original.extend([t(7), t(13), t(29), f16::from_f32(a)]);
+    }
+    let bytes = adobe_bytes();
+    let mut parallel = original.clone();
+    assert!(convert_profile_rgba(&mut parallel, &bytes, ConvertDirection::ToWorking).is_ok());
+    let Ok(adobe) = IccProfile::from_bytes(&bytes) else {
+        unreachable!()
+    };
+    let Ok(t) = Transform::to_working(&adobe) else {
+        unreachable!()
+    };
+    let mut single = original.clone();
+    assert!(convert_rgba(&mut single, &t).is_ok());
+    assert_eq!(bits_of(&parallel), bits_of(&single));
+    assert_ne!(bits_of(&parallel), bits_of(&original));
+    for (i, (p, o)) in parallel
+        .chunks_exact(4)
+        .zip(original.chunks_exact(4))
+        .enumerate()
+    {
+        if i % 3 == 0 {
+            assert_eq!(bits_of(p), bits_of(o), "transparent pixel {i} untouched");
+        }
+        assert_eq!(p.get(3), o.get(3), "alpha {i}");
+    }
+}
+
+fn bits_of(s: &[f16]) -> Vec<u16> {
+    s.iter().map(|v| v.to_bits()).collect()
 }

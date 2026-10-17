@@ -278,3 +278,96 @@ fn the_colour_metadata_survives_a_save_and_a_reopen_through_the_app_writer() {
     };
     assert_eq!(doc.colour, colour);
 }
+
+struct PickOnce(Option<std::path::PathBuf>);
+
+impl crate::FileDialogAccess for PickOnce {
+    fn pick_file(&mut self) -> Option<std::path::PathBuf> {
+        self.0.take()
+    }
+
+    fn save_file(&mut self) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+#[test]
+fn the_output_profile_commands_resolve_and_a_cancelled_dialog_does_nothing() {
+    let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+    let mut focus = crate::FocusManager::default();
+    let path = std::path::PathBuf::from("/tmp/p.icc");
+    let picked = crate::activate_command(
+        &mut workspace,
+        &mut focus,
+        super::COMMAND_SET_OUTPUT,
+        &mut PickOnce(Some(path.clone())),
+    );
+    assert_eq!(
+        picked,
+        Some(crate::ActivatedCommand::SetOutputProfile(path))
+    );
+    let cancelled = crate::activate_command(
+        &mut workspace,
+        &mut focus,
+        super::COMMAND_SET_OUTPUT,
+        &mut PickOnce(None),
+    );
+    assert_eq!(cancelled, None);
+    let cleared = crate::activate_command(
+        &mut workspace,
+        &mut focus,
+        super::COMMAND_CLEAR_OUTPUT,
+        &mut PickOnce(None),
+    );
+    assert_eq!(cleared, Some(crate::ActivatedCommand::ClearOutputProfile));
+}
+
+#[test]
+fn both_commands_are_in_the_palette_and_the_edit_menu() {
+    let palette = crate::palette_commands();
+    for id in [super::COMMAND_SET_OUTPUT, super::COMMAND_CLEAR_OUTPUT] {
+        assert!(palette.iter().any(|entry| entry.id == id), "{id}");
+    }
+    let menus = crate::menu_model::build_menus(
+        &crate::menu_model::MenuContext::default(),
+        &crate::default_shortcuts_for(false),
+    );
+    let Some(edit) = menus.iter().find(|m| m.title == "Edit") else {
+        unreachable!()
+    };
+    for id in [super::COMMAND_SET_OUTPUT, super::COMMAND_CLEAR_OUTPUT] {
+        assert!(
+            edit.entries.iter().any(|e| matches!(
+                e,
+                crate::menu_model::Entry::Item { command, enabled: true, .. } if command == id
+            )),
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn a_chosen_profile_file_becomes_the_output_profile_or_a_notice() {
+    // The same judging the App method runs, end to end from a file.
+    let dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => unreachable!("{e}"),
+    };
+    let ok_path = dir.path().join("a.icc");
+    assert!(std::fs::write(&ok_path, adobe_bytes()).is_ok());
+    let bad_path = dir.path().join("b.icc");
+    assert!(std::fs::write(&bad_path, b"junk").is_ok());
+    let mut colour = aurora_io::DocumentColour::default();
+    for path in [&ok_path, &bad_path] {
+        if let Ok(profile) = load_output_profile(path) {
+            colour.output = Some(profile);
+        }
+        assert_eq!(
+            colour.output.is_some(),
+            expect_set || colour.output.is_some()
+        );
+    }
+    assert!(colour.output.is_some());
+    // The refused one left the earlier choice alone.
+    assert_eq!(load_output_profile(&bad_path).err(), Some(NOTICE_NOT_RGB));
+}
