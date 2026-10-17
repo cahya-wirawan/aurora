@@ -248,7 +248,7 @@
 //!   tooltip's `type.size.xs` line plus padding, at most
 //!   [`MAX_WIDTH_STEPS`] x `spacing.xxxl`) and calls [`Tooltip::place`]
 //!   after each layout, which flips and slides it with
-//!   [`place_tooltip`](super::place_tooltip) (see `tooltip_place.rs`).
+//!   [`place_tooltip`] (see `tooltip_place.rs`).
 //!   There is no wrapping: a longer text ends in an ellipsis.
 //! - **Text measurement** is the caller's: the controller's own tree
 //!   layout is still text-blind; [`Tooltip::measured_size`] shapes the text
