@@ -693,6 +693,140 @@ struct LayerStrokePaintsWire {
     paints: Vec<(u64, StrokePaintList)>,
 }
 
+/// Decodes a [`LayerStrokePaintsWire`] with bounded counts (see
+/// [`read_layer_stroke_paints`]). The shape is the derived one: a tuple of
+/// the version and the pairs. Each list is read element by element with a
+/// running count checked against its bound (and against `size_hint` when
+/// the format gives one), so nothing past the bound is ever built.
+struct StrokePaintsSeed {
+    max_layers: usize,
+}
+
+struct PairsSeed {
+    max_layers: usize,
+}
+
+struct PairSeed;
+
+struct PaintListSeed;
+
+impl<'de> serde::de::DeserializeSeed<'de> for StrokePaintsSeed {
+    type Value = LayerStrokePaintsWire;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        struct V(usize);
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = LayerStrokePaintsWire;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a stroke-paints entry")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let version = seq
+                    .next_element::<u32>()?
+                    .ok_or_else(|| serde::de::Error::custom("missing version"))?;
+                let paints = seq
+                    .next_element_seed(PairsSeed { max_layers: self.0 })?
+                    .ok_or_else(|| serde::de::Error::custom("missing paints"))?;
+                Ok(LayerStrokePaintsWire { version, paints })
+            }
+        }
+        d.deserialize_tuple(2, V(self.max_layers))
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for PairsSeed {
+    type Value = Vec<(u64, StrokePaintList)>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        struct V(usize);
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Vec<(u64, StrokePaintList)>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a list of layer stroke paints")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                if seq.size_hint().is_some_and(|n| n > self.0) {
+                    return Err(serde::de::Error::custom("too many layers"));
+                }
+                let mut out = Vec::new();
+                while let Some(pair) = seq.next_element_seed(PairSeed)? {
+                    out.push(pair);
+                    if out.len() > self.0 {
+                        return Err(serde::de::Error::custom("too many layers"));
+                    }
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_seq(V(self.max_layers))
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for PairSeed {
+    type Value = (u64, StrokePaintList);
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = (u64, StrokePaintList);
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a layer id and its stroke paints")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let id = seq
+                    .next_element::<u64>()?
+                    .ok_or_else(|| serde::de::Error::custom("missing layer id"))?;
+                let list = seq
+                    .next_element_seed(PaintListSeed)?
+                    .ok_or_else(|| serde::de::Error::custom("missing paints"))?;
+                Ok((id, list))
+            }
+        }
+        d.deserialize_tuple(2, V)
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for PaintListSeed {
+    type Value = StrokePaintList;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = StrokePaintList;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a layer's stroke paints")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let max = aurora_core::effects::MAX_EFFECT_INSTANCES;
+                if seq.size_hint().is_some_and(|n| n > max) {
+                    return Err(serde::de::Error::custom("too many strokes on one layer"));
+                }
+                let mut out = Vec::new();
+                while let Some(paint) = seq.next_element()? {
+                    out.push(paint);
+                    if out.len() > max {
+                        return Err(serde::de::Error::custom("too many strokes on one layer"));
+                    }
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_seq(V)
+    }
+}
+
 fn layer_stroke_paint_pairs(layers: &LayerTree) -> Vec<(u64, StrokePaintList)> {
     layer_ids(layers)
         .into_iter()
@@ -739,8 +873,20 @@ fn read_layer_stroke_paints<R: Read + Seek>(
             prefix.version
         )));
     }
-    let wire: LayerStrokePaintsWire = postcard::from_bytes(&bytes)
-        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    // Decoded with the element counts bounded while decoding (a `None` is
+    // one byte on the wire and over a hundred in memory, so an unbounded
+    // `Vec` would let a 16 MiB entry allocate gigabytes): at most one pair
+    // per layer of the document, at most `MAX_EFFECT_INSTANCES` paints per
+    // pair, each count checked before anything is allocated for it.
+    let wire = {
+        use serde::de::DeserializeSeed;
+        let mut de = postcard::Deserializer::from_bytes(&bytes);
+        StrokePaintsSeed {
+            max_layers: layers.len(),
+        }
+        .deserialize(&mut de)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?
+    };
     let bad = |what: &str| IoError::ManifestDeserialization(format!("stroke paints: {what}"));
     for (raw, paints) in wire.paints {
         let id = aurora_doc::LayerId::from_raw(raw);
@@ -8661,6 +8807,57 @@ mod tests {
             match read(Cursor::new(tampered), &mut fresh) {
                 Err(crate::error::IoError::ManifestDeserialization(message)) => {
                     assert!(message.contains(needle), "{needle}: {message}");
+                }
+                other => unreachable!("expected a refusal, got {:?}", other.map(|_| ())),
+            }
+        }
+    }
+
+    /// A `None` is one byte on the wire and over a hundred in memory; the
+    /// counts are bounded while decoding, so neither a long list of them nor
+    /// a long list of layers is ever built. `postcard` drops a visitor's
+    /// message ("Serde Deserialization Error") or hits the end of the buffer
+    /// first; either way the refusal comes from the decoder, whereas every
+    /// later check says "stroke paints: ...": without the bound the
+    /// payloads would decode (building the lists) and fail there.
+    #[test]
+    fn a_stroke_paint_entry_with_a_huge_list_is_refused_before_it_is_built() {
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, p, ..) = stroke_paint_document(&mut store, true);
+        let varint = |n: usize| postcard::to_allocvec(&n).unwrap_or_default();
+        let id = postcard::to_allocvec(&p.to_raw()).unwrap_or_default();
+        let head = vec![super::LAYER_STROKE_PAINTS_VERSION as u8];
+        // One layer whose paint list claims a million entries, each a one
+        // byte `None` that is really there: ~1 MB on the wire, ~150 MB if
+        // it were decoded into a `Vec`.
+        let mut inner_bomb = head.clone();
+        inner_bomb.extend(varint(1));
+        inner_bomb.extend(&id);
+        inner_bomb.extend(varint(1_000_000));
+        inner_bomb.resize(inner_bomb.len() + 1_000_000, 0);
+        // A million layers claimed for a two-layer document, each really
+        // present with an empty list (the pairs are tiny; the count is the
+        // bound).
+        let mut outer_bomb = head.clone();
+        outer_bomb.extend(varint(1_000_000));
+        for _ in 0..1_000_000 {
+            outer_bomb.extend(&id);
+            outer_bomb.extend(varint(0));
+        }
+        // More pairs than layers, really present.
+        let mut crowded = head;
+        crowded.extend(varint(3));
+        for _ in 0..3 {
+            crowded.extend(&id);
+            crowded.extend(varint(0));
+        }
+        for payload in [inner_bomb, outer_bomb, crowded] {
+            let tampered =
+                with_named_entry(&bytes, super::LAYER_STROKE_PAINTS_ENTRY, Some(&payload));
+            let (_dir2, mut fresh) = real_tile_store();
+            match read(Cursor::new(tampered), &mut fresh) {
+                Err(crate::error::IoError::ManifestDeserialization(message)) => {
+                    assert!(!message.contains("stroke paints:"), "{message}");
                 }
                 other => unreachable!("expected a refusal, got {:?}", other.map(|_| ())),
             }
