@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.269.0] - 2026-10-17
+
+### Changed
+
+- 60 FPS round 4: docs and version; gate the endian-specific upload tests
+
 ## [0.268.0] - 2026-10-17
 
 ### Changed
