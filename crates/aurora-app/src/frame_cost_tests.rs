@@ -56,7 +56,7 @@ fn laid_out_workspace(
         height: 1024,
     };
     for i in 0..extra_layers {
-        let _ = ok(layers.add_pixel_layer(&format!("Layer {i}"), bounds, None));
+        let _ = ok(layers.add_pixel_layer(format!("Layer {i}"), bounds, None));
     }
     let _panels = crate::install_startup_panels(
         &mut workspace,
