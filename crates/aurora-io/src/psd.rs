@@ -5284,15 +5284,6 @@ fn build_streamed(
     // any pixel is decoded, so every layer image is converted on its way
     // to the sink. A Grayscale file keeps its old handling.
     let gray = notes.0.contains_key(&Note::GrayscaleHeldAsRgb);
-    #[cfg(test)]
-    let embedded = if std::env::var_os("AURORA_AUDIT_NO_COLOUR_CONVERSION").is_some() {
-        // Test builds only: the pre-colour-management pipeline, so the
-        // corpus audit can measure it on the same (converted-merged) basis.
-        notes.3.take().map(|_| Vec::new()).filter(|_| false)
-    } else {
-        notes.3.take()
-    };
-    #[cfg(not(test))]
     let embedded = notes.3.take();
     let plan = plan_colour(embedded.as_deref(), gray, &mut notes);
     let mut builder = Builder {

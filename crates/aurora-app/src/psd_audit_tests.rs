@@ -145,6 +145,47 @@ fn audit_dump(dir: &str, name: &str, image: &aurora_io::Image, merged: &aurora_i
     let _ = std::fs::write(with(".size"), format!("{} {}", image.width(), image.height()));
 }
 
+/// `AURORA_AUDIT_STRIP_PROFILE=1`: the file with its colour profile resource
+/// (1039) renamed to an unused id, so it opens through the pre-colour-
+/// management pipeline (layers taken as sRGB, nothing converted) while the
+/// merged image is still converted to the working space. **The audit's basis
+/// changed with colour management:** the opened document is now in sRGB, so
+/// it is compared with the converted merged image; this knob measures the old
+/// pipeline on that same new basis, which is the only fair before/after.
+fn audit_strip_profile(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    let be32 = |b: &[u8], at: usize| -> Option<usize> {
+        let s = b.get(at..at + 4)?;
+        usize::try_from(u32::from_be_bytes([*s.first()?, *s.get(1)?, *s.get(2)?, *s.get(3)?])).ok()
+    };
+    let Some(mode_len) = be32(bytes, 26) else {
+        return out;
+    };
+    let section = 30 + mode_len;
+    let (Some(len), mut at) = (be32(bytes, section), section + 4) else {
+        return out;
+    };
+    let end = (at + len).min(bytes.len());
+    while at + 12 <= end {
+        let (Some(id_hi), Some(id_lo)) = (bytes.get(at + 4), bytes.get(at + 5)) else {
+            break;
+        };
+        let id = u16::from_be_bytes([*id_hi, *id_lo]);
+        let name = usize::from(bytes.get(at + 6).copied().unwrap_or(0)) + 1;
+        let name = name + name % 2;
+        let Some(size) = be32(bytes, at + 6 + name) else {
+            break;
+        };
+        if id == 1039
+            && let Some(slot) = out.get_mut(at + 4..at + 6)
+        {
+            slot.copy_from_slice(&0x7FFF_u16.to_be_bytes());
+        }
+        at += 6 + name + 4 + size + size % 2;
+    }
+    out
+}
+
 /// Opens, composites and measures one file (no caps: the caller applies
 /// them). Errors are strings, never panics.
 fn audit_one_file(path: &std::path::Path, name: &str) -> Result<AuditRow, String> {
@@ -152,6 +193,11 @@ fn audit_one_file(path: &std::path::Path, name: &str) -> Result<AuditRow, String
     let bytes = std::fs::read(path).map_err(|e| format!("unreadable: {e}"))?;
     let merged = aurora_io::decode_psd_merged_image_in_working_space(&bytes)
         .map_err(|e| format!("no merged image: {e:?}"))?;
+    let bytes = if std::env::var_os("AURORA_AUDIT_STRIP_PROFILE").is_some() {
+        audit_strip_profile(&bytes)
+    } else {
+        bytes
+    };
     let document = aurora_io::read_psd(&bytes).map_err(|e| format!("not opened: {e:?}"))?;
     let report = document.report.items.clone();
     drop(document);
