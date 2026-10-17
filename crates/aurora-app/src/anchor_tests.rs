@@ -269,3 +269,97 @@ fn corpus_composites_the_same_on_the_document_grid_as_on_the_old_anchor() {
     println!("corpus anchor differential: {opened} files, {compared} old anchors compared");
     assert!(opened > 10 && compared > 5, "{opened} {compared}");
 }
+
+/// Nyepi's whole canvas composited on the pre-round-3 anchor (its layers'
+/// common negative origin, where a layer reads its own tiles aligned) and
+/// on the document grid (every such layer read through
+/// `read_layer_window`), equal bit for bit; prints the warm full-composite
+/// time of each, three interleaved runs. Not run by default (minutes in
+/// the dev profile).
+#[test]
+#[ignore = "measures the Nyepi template; run with --ignored"]
+fn nyepi_full_composite_on_the_old_anchor_and_the_document_grid() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../images/flat-design-nyepi-template/6739968.psd");
+    let Ok(bytes) = std::fs::read(&path) else {
+        println!("SKIPPED: the Nyepi template is not present");
+        return;
+    };
+    let document = ok(crate::open_psd_document(&bytes));
+    let (_d, mut store) = store_with_budget(16_384);
+    let incoming: Vec<_> = document
+        .pixels
+        .iter()
+        .map(|p| (p.layer, &p.image, p.offset))
+        .collect();
+    let (_freed, failed) = crate::replace_document_pixels(
+        &mut store,
+        aurora_doc::LayerTree::new(),
+        aurora_doc::History::new(),
+        &document.layers,
+        &incoming,
+        &document.masks,
+    );
+    assert_eq!(failed, 0);
+    let layers = &document.layers;
+    let mut origins: std::collections::HashMap<(i64, i64), usize> =
+        std::collections::HashMap::new();
+    for id in pixel_layers(layers) {
+        *origins.entry(old_anchor(layers, id)).or_default() += 1;
+    }
+    // The most common anchor other than the document's own (Nyepi's open
+    // active layer sits at (-124, -36), shared by nine layers; most layers
+    // anchor at (0, 0) either way).
+    let Some((&old, &count)) = origins
+        .iter()
+        .filter(|(a, _)| **a != (0, 0))
+        .max_by_key(|(_, n)| **n)
+    else {
+        unreachable!("pixel layers");
+    };
+    println!(
+        "nyepi: old anchor {old:?} shared by {count} pixel layers, {} at (0, 0)",
+        origins.get(&(0, 0)).copied().unwrap_or(0)
+    );
+    let canvas = document.canvas_size;
+    let warm = |store: &mut aurora_tile::TileStore, anchor: (i64, i64)| {
+        let (w, h) = (i64::from(canvas.0), i64::from(canvas.1));
+        let first = ((0 - anchor.0).div_euclid(T), (0 - anchor.1).div_euclid(T));
+        let last = (
+            (w - 1 - anchor.0).div_euclid(T),
+            (h - 1 - anchor.1).div_euclid(T),
+        );
+        let started = std::time::Instant::now();
+        let mut budget = CompositeBudget::for_pass(layers);
+        for ty in first.1..=last.1 {
+            for tx in first.0..=last.0 {
+                let id = aurora_tile::TileId {
+                    x: tx as u32,
+                    y: ty as u32,
+                };
+                budget.next_tile(layers);
+                let origin = (anchor.0 + tx * T, anchor.1 + ty * T);
+                let _ = composite_roots_into_tile(layers, store, id, origin, anchor, &mut budget);
+            }
+        }
+        started.elapsed().as_secs_f64() * 1000.0
+    };
+    // The bit-for-bit check first (fresh: the shadow cache is cleared
+    // before every tile).
+    let a = canvas_on_grid(layers, &mut store, old, canvas);
+    let b = canvas_on_grid(layers, &mut store, (0, 0), canvas);
+    let bad = mismatches(&a, &b);
+    assert!(bad.is_empty(), "{} samples differ", bad.len());
+    // The shadow cache (256 MiB) cannot hold both grids' coverage, so each
+    // grid gets a cold pass before its warm one.
+    for run in 0..3 {
+        let _ = warm(&mut store, old);
+        let old_ms = warm(&mut store, old);
+        let _ = warm(&mut store, (0, 0));
+        let doc_ms = warm(&mut store, (0, 0));
+        println!(
+            "nyepi warm full composite: run {run} old anchor {old_ms:.0}ms document grid \
+             {doc_ms:.0}ms"
+        );
+    }
+}
