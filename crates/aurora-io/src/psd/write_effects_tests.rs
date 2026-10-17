@@ -3,8 +3,8 @@
 //! holds reads back equal through Aurora's own reader.
 
 use aurora_core::effects::{
-    ColorOverlay, DropShadow, EffectBlendMode, EffectColor, EffectGate, GradientOverlay,
-    OuterGlow, PatternOverlay, Stroke, StrokeFill, StrokePaint, StrokePosition,
+    ColorOverlay, DropShadow, EffectBlendMode, EffectColor, EffectGate, GradientOverlay, OuterGlow,
+    PatternOverlay, Stroke, StrokeFill, StrokePaint, StrokePosition,
 };
 use aurora_core::gradient_fill::{FillStop, GradientFill, GradientStyle};
 use aurora_core::pattern::Pattern;
@@ -426,10 +426,23 @@ fn photoshops_field_names_and_units_are_used() {
         .and_then(|l| l.first())
         .and_then(Value::descriptor)
         .unwrap_or_else(|| unreachable!("stroke"));
-    assert_eq!(stroke.get(b"Styl").and_then(Value::enum_value), Some(&b"InsF"[..]));
-    assert_eq!(stroke.get(b"PntT").and_then(Value::enum_value), Some(&b"SClr"[..]));
+    assert_eq!(
+        stroke.get(b"Styl").and_then(Value::enum_value),
+        Some(&b"InsF"[..])
+    );
+    assert_eq!(
+        stroke.get(b"PntT").and_then(Value::enum_value),
+        Some(&b"SClr"[..])
+    );
     assert_eq!(stroke.get(b"Sz  ").and_then(Value::number), Some(6.5));
-    assert_eq!(stroke.get(b"Clr ").and_then(Value::descriptor).and_then(|c| c.get(b"Grn ")).and_then(Value::number), Some(255.0));
+    assert_eq!(
+        stroke
+            .get(b"Clr ")
+            .and_then(Value::descriptor)
+            .and_then(|c| c.get(b"Grn "))
+            .and_then(Value::number),
+        Some(255.0)
+    );
 }
 
 #[test]
@@ -532,7 +545,10 @@ fn a_fractional_global_angle_is_rounded_and_itemised() {
         items.contains("global light angle is saved as a whole number"),
         "{items}"
     );
-    assert!(items.contains("drop shadow follows global light"), "{items}");
+    assert!(
+        items.contains("drop shadow follows global light"),
+        "{items}"
+    );
 }
 
 #[test]
@@ -544,8 +560,10 @@ fn contours_extra_glows_and_extra_patterns_are_itemised() {
     });
     fx.outer_glows.push(OuterGlow::default());
     fx.outer_glows.push(OuterGlow::default());
-    fx.pattern_overlays.push(pattern_overlay("pat-a", (0.0, 0.0)));
-    fx.pattern_overlays.push(pattern_overlay("pat-a", (0.0, 0.0)));
+    fx.pattern_overlays
+        .push(pattern_overlay("pat-a", (0.0, 0.0)));
+    fx.pattern_overlays
+        .push(pattern_overlay("pat-a", (0.0, 0.0)));
     let (mut doc, _) = doc_with(fx, &[pattern("pat-a")]);
     let (bytes, outcome) = ok(doc.write());
     let items = outcome.report.items.join("\n");
@@ -571,7 +589,8 @@ fn undrawn_strokes_and_missing_patterns_are_left_out_and_itemised() {
         paint: None,
         ..Stroke::default()
     });
-    fx.pattern_overlays.push(pattern_overlay("missing", (0.0, 0.0)));
+    fx.pattern_overlays
+        .push(pattern_overlay("missing", (0.0, 0.0)));
     let (mut doc, _) = doc_with(fx, &[]);
     let (bytes, outcome) = ok(doc.write());
     let items = outcome.report.items.join("\n");
@@ -652,7 +671,8 @@ fn only_the_patterns_a_layer_names_are_written() {
 #[allow(clippy::cast_precision_loss)]
 fn pattern_origin_is_written_as_the_layers_fxrp_in_document_coordinates() {
     let mut fx = LayerEffects::default();
-    fx.pattern_overlays.push(pattern_overlay("pat-a", (3.5, 1.5)));
+    fx.pattern_overlays
+        .push(pattern_overlay("pat-a", (3.5, 1.5)));
     let mut doc = Doc::new((16, 12));
     let img = image(10, 8, |_, _| [1.0, 0.0, 0.0, 1.0]);
     let id = doc.layer("Styled", rect(0, 0, 16, 12), Some((&img, 0, 0)));

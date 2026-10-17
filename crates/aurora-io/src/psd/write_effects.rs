@@ -183,10 +183,7 @@ fn obj(class: &str, items: Items) -> Value {
 }
 
 fn unit(code: &[u8; 4], value: f64) -> Value {
-    Value::Unit {
-        unit: *code,
-        value,
-    }
+    Value::Unit { unit: *code, value }
 }
 
 fn percent(value: f64) -> Value {
@@ -567,17 +564,18 @@ fn gradient_descriptor(g: &GradientFill) -> (Value, bool) {
             )
         })
         .collect();
-    let transparency = |pos: f32, mid: f32, a: f32, stop: &mut dyn FnMut(f32, f32) -> (i32, i32)| {
-        let (l, m) = stop(pos, mid);
-        obj(
-            "TrnS",
-            vec![
-                ("Opct", percent(by_div(a, 100.0))),
-                ("Lctn", Value::Integer(l)),
-                ("Mdpn", Value::Integer(m)),
-            ],
-        )
-    };
+    let transparency =
+        |pos: f32, mid: f32, a: f32, stop: &mut dyn FnMut(f32, f32) -> (i32, i32)| {
+            let (l, m) = stop(pos, mid);
+            obj(
+                "TrnS",
+                vec![
+                    ("Opct", percent(by_div(a, 100.0))),
+                    ("Lctn", Value::Integer(l)),
+                    ("Mdpn", Value::Integer(m)),
+                ],
+            )
+        };
     let alphas: Vec<Value> = if g.alphas.is_empty() {
         // Photoshop always holds at least two opacity stops.
         vec![
@@ -626,10 +624,7 @@ fn gradient_items(g: &GradientFill, loss: &mut EffectLosses) -> Items {
             "Ofst",
             obj(
                 "Pnt ",
-                vec![
-                    ("Hrzn", percent(g.offset.0)),
-                    ("Vrtc", percent(g.offset.1)),
-                ],
+                vec![("Hrzn", percent(g.offset.0)), ("Vrtc", percent(g.offset.1))],
             ),
         ),
     ]
@@ -898,7 +893,10 @@ fn pattern_item(p: &Pattern) -> Result<Vec<u8>, Unwritable> {
     put_u32(&mut array, 4); // channels
     for plane in 0..4usize {
         put_u32(&mut array, 1); // written
-        put_u32(&mut array, u32::try_from(23 + bytes).map_err(|_| Unwritable)?);
+        put_u32(
+            &mut array,
+            u32::try_from(23 + bytes).map_err(|_| Unwritable)?,
+        );
         put_u32(&mut array, depth);
         for edge in [0, 0, height, width] {
             put_u32(&mut array, edge);
@@ -921,10 +919,16 @@ fn pattern_item(p: &Pattern) -> Result<Vec<u8>, Unwritable> {
     put_u32(&mut array, 0); // the two records past the channels: not written
     put_u32(&mut array, 0);
     put_u32(&mut body, 3);
-    put_u32(&mut body, u32::try_from(array.len()).map_err(|_| Unwritable)?);
+    put_u32(
+        &mut body,
+        u32::try_from(array.len()).map_err(|_| Unwritable)?,
+    );
     body.extend_from_slice(&array);
     let mut item = Vec::new();
-    put_u32(&mut item, u32::try_from(body.len()).map_err(|_| Unwritable)?);
+    put_u32(
+        &mut item,
+        u32::try_from(body.len()).map_err(|_| Unwritable)?,
+    );
     item.extend_from_slice(&body);
     while item.len() % 4 != 0 {
         item.push(0);

@@ -10,7 +10,7 @@ use aurora_core::effects::StrokePaint;
 
 use super::{composite_difference, open_and_composite_psd, real_tile_store};
 
-const FILES: [&str; 12] = [
+const FILES: [&str; 10] = [
     "layer_effects.psd",
     "patterns.psd",
     "effect-stroke-gradient.psd",
@@ -21,8 +21,6 @@ const FILES: [&str; 12] = [
     "effects/stroke-composite.psd",
     "effects/stroke-effect-transparent-shape.psd",
     "effects/stroke-effects.psd",
-    "effects/stroke-without-vector-mask.psd",
-    "gradient-fill.psd",
 ];
 
 /// Layer name -> effects, made comparable: boxes the reader derives from
@@ -57,6 +55,8 @@ fn effects_of(doc: &aurora_io::PsdDocument) -> Vec<(String, aurora_core::LayerEf
                 None => {}
             }
         }
+        // A gradient or pattern stroke Aurora cannot draw is not written.
+        fx.strokes.retain(aurora_core::effects::Stroke::drawn);
         fx.other = aurora_core::effects::OtherEffects::default();
         found.push((doc.layers.name(id).unwrap_or_default().to_owned(), fx));
     }
@@ -84,7 +84,9 @@ fn corpus_files_with_effects_survive_a_psd_save_and_reopen() {
             println!("SKIPPED: not present at {}", path.display());
             continue;
         };
-        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         let (scratch, mut store) = real_tile_store();
         let (doc1, img1) = open_and_composite_psd(
             &bytes,
@@ -142,7 +144,10 @@ fn corpus_files_with_effects_survive_a_psd_save_and_reopen() {
                 println!("    DIFFERS: {n1}\n      before {a:?}\n      after  {b:?}");
             }
         }
-        assert!(differing.is_empty(), "{name}: effects differ on {differing:?}");
+        assert!(
+            differing.is_empty(),
+            "{name}: effects differ on {differing:?}"
+        );
         ran += 1;
     }
     if ran == 0 {

@@ -618,9 +618,7 @@ impl Losses {
         }
         items.extend(self.fx.items());
         if self.fx_angle_rounded {
-            items.push(
-                "The global light angle is saved as a whole number of degrees.".to_owned(),
-            );
+            items.push("The global light angle is saved as a whole number of degrees.".to_owned());
         }
         if self.fx_gradient_box > 0 {
             items.push(format!(
@@ -1578,14 +1576,23 @@ fn gradient_box_differs(layers: &LayerTree, id: LayerId, bounds: Rect, rect: [i3
         width: u32::try_from(i64::from(right) - i64::from(left)).unwrap_or(0),
         height: u32::try_from(i64::from(bottom) - i64::from(top)).unwrap_or(0),
     };
+    // Only a gradient that is shown matters.
     let boxes = fx
         .gradient_overlays
         .iter()
+        .filter(|o| fx.shows(o.gate))
         .map(|o| o.reference)
-        .chain(fx.strokes.iter().filter_map(|s| match &s.paint {
-            Some(aurora_core::effects::StrokePaint::Gradient { reference, .. }) => Some(*reference),
-            _ => None,
-        }));
+        .chain(
+            fx.strokes
+                .iter()
+                .filter(|s| fx.shows(s.gate))
+                .filter_map(|s| match &s.paint {
+                    Some(aurora_core::effects::StrokePaint::Gradient { reference, .. }) => {
+                        Some(*reference)
+                    }
+                    _ => None,
+                }),
+        );
     boxes
         .into_iter()
         .any(|r| r.map_or(bounds, |r| r.within(bounds)) != written)
@@ -2086,10 +2093,7 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
     let pattern_block = if pool.is_empty() {
         None
     } else {
-        Some(
-            super::write_effects::pattern_block(&pool)
-                .map_err(|_| too_large("pattern block"))?,
-        )
+        Some(super::write_effects::pattern_block(&pool).map_err(|_| too_large("pattern block"))?)
     };
     let linked = linked_to_write(layers, &plans);
     let linked_bytes: u64 = linked
