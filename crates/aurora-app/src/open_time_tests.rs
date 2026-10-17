@@ -32,6 +32,17 @@ fn nyepi_or_skip() -> Option<std::path::PathBuf> {
     path
 }
 
+/// A corpus file a test needs is absent: prints SKIPPED, and fails when
+/// `AURORA_REQUIRE_CORPUS` is set. Call it from the `else` of a read.
+pub(crate) fn corpus_file_absent(path: &std::path::Path) {
+    println!("SKIPPED: corpus file not present at {}", path.display());
+    assert!(
+        std::env::var_os("AURORA_REQUIRE_CORPUS").is_none(),
+        "AURORA_REQUIRE_CORPUS is set and {} is missing",
+        path.display()
+    );
+}
+
 fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     match r {
         Ok(v) => v,
@@ -186,15 +197,21 @@ const NYEPI_FINGERPRINT_0_188_0: (u64, usize) = (6_569_619_393_056_216_672, 4021
 /// off.
 const NYEPI_FINGERPRINT_COLOUR_MANAGED: (u64, usize) = (11_645_406_218_592_391_587, 4021);
 
-/// The file at `path` with its colour profile resource (1039) renamed to an
-/// unused id, written beside the test's scratch store: it opens through the
-/// pre-0.264.0 pipeline (layers taken as sRGB, nothing converted). The same
-/// rewrite as `AURORA_AUDIT_STRIP_PROFILE`'s in the fidelity audit.
-fn nyepi_without_its_profile(path: &std::path::Path, into: &std::path::Path) -> std::path::PathBuf {
-    let mut bytes = ok(std::fs::read(path));
+/// `bytes` with its colour profile resource (1039) renamed to an unused id:
+/// the file opens through the pre-0.264.0 pipeline (layers taken as sRGB,
+/// nothing converted). Returns the bytes and how many resources it renamed.
+/// Shared with the fidelity audits' `AURORA_AUDIT_STRIP_PROFILE` knob.
+pub(crate) fn strip_colour_profile(bytes: &[u8]) -> (Vec<u8>, usize) {
+    let mut bytes = bytes.to_vec();
     let be32 = |b: &[u8], at: usize| -> Option<usize> {
         let s = b.get(at..at + 4)?;
-        usize::try_from(u32::from_be_bytes([*s.first()?, *s.get(1)?, *s.get(2)?, *s.get(3)?])).ok()
+        usize::try_from(u32::from_be_bytes([
+            *s.first()?,
+            *s.get(1)?,
+            *s.get(2)?,
+            *s.get(3)?,
+        ]))
+        .ok()
     };
     let mut renamed = 0;
     if let Some(mode_len) = be32(&bytes, 26) {
@@ -221,7 +238,16 @@ fn nyepi_without_its_profile(path: &std::path::Path, into: &std::path::Path) -> 
             }
         }
     }
-    assert_eq!(renamed, 1, "the template carries one colour profile resource");
+    (bytes, renamed)
+}
+
+/// The file at `path` without its colour profile, written into `into`.
+fn nyepi_without_its_profile(path: &std::path::Path, into: &std::path::Path) -> std::path::PathBuf {
+    let (bytes, renamed) = strip_colour_profile(&ok(std::fs::read(path)));
+    assert_eq!(
+        renamed, 1,
+        "the template carries one colour profile resource"
+    );
     let out = into.join("nyepi-without-profile.psd");
     ok(std::fs::write(&out, bytes));
     out
