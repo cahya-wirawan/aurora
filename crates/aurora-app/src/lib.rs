@@ -619,6 +619,9 @@ mod tone_stamp;
 #[cfg(test)]
 mod tone_stamp_tests;
 mod tooltip_app;
+mod widget_paint_cache;
+#[cfg(test)]
+mod widget_paint_cache_tests;
 mod workspace_presets;
 use background_open::{
     BackgroundFailure, DecodedFile, FinishedOpen, OpenInstaller, OpenStep, OpenWorker,
@@ -30383,6 +30386,10 @@ struct App {
     /// `path_pipeline`, under the same "needs only a real device" rule.
     text_pipeline: Option<TextPipeline>,
     glyph_atlas: Option<GlyphAtlas>,
+    /// 60 FPS round 3: the widget layer's meshes and GPU buffers, reused
+    /// for every widget whose paint inputs did not change
+    /// ([`widget_paint_cache`]).
+    widget_paint_cache: widget_paint_cache::WidgetPaintCache,
     /// Shapes and rasterizes widget labels (`aurora_text::TextEngine`,
     /// the bundled UI font). CPU-only; built in `resumed` too. `None` only
     /// if the bundled font failed to parse, which is logged — widgets
@@ -30928,6 +30935,7 @@ impl App {
             gradient_pipeline: None,
             text_pipeline: None,
             glyph_atlas: None,
+            widget_paint_cache: widget_paint_cache::WidgetPaintCache::default(),
             text_engine: None,
             pointer_position: None,
             gallery: None,
@@ -37105,7 +37113,7 @@ impl App {
                     );
                 }
                 let text = self.text_engine.as_mut().zip(self.glyph_atlas.as_mut());
-                let widget_paints = collect_widget_paints(
+                let widget_paints = self.widget_paint_cache.frame_gpu_ops(
                     &self.workspace.tree,
                     focus_paint,
                     caret_owner,
@@ -37289,6 +37297,9 @@ impl App {
 /// gradient — for the colour picker (`0.125.0`, the first gradient
 /// consumer) that would show a square that no longer matches the colour
 /// it reports.
+// Test-only since 60 FPS round 3: `App::redraw` paints through
+// `widget_paint_cache`, which these remain the fresh reference for.
+#[cfg_attr(not(test), allow(dead_code))]
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 fn target_paint_ops(
@@ -37305,19 +37316,7 @@ fn target_paint_ops(
     for id in tree.paint_order() {
         match paint_widget_ops_frame(tree, id, focus, focused, theme, scales, scale_factor) {
             Ok(widget_ops) => {
-                ops.extend(widget_ops.into_iter().map(|op| match op {
-                    PaintOp::Solid((mesh, color)) => {
-                        PaintOp::Solid((mesh, target_paint_color(color, format)))
-                    }
-                    gradient @ PaintOp::Gradient(_) => gradient,
-                    // A label's colour is a token colour exactly like a
-                    // solid's, so it is converted the same way — and so is
-                    // every caret, selection and underline colour a text
-                    // field's run carries (0.133.0).
-                    PaintOp::Text(run) => {
-                        PaintOp::Text(run.map_colors(|c| target_paint_color(c, format)))
-                    }
-                }));
+                ops.extend(widget_ops.into_iter().map(|op| target_paint_op(op, format)));
             }
             Err(err) => {
                 tracing::warn!(
@@ -37329,6 +37328,21 @@ fn target_paint_ops(
         }
     }
     ops
+}
+
+/// One op converted for a render target of `format`, as
+/// [`target_paint_ops`] converts every op (shared with the widget paint
+/// cache, `widget_paint_cache`, so the two cannot disagree).
+fn target_paint_op(op: PaintOp, format: wgpu::TextureFormat) -> PaintOp {
+    match op {
+        PaintOp::Solid((mesh, color)) => PaintOp::Solid((mesh, target_paint_color(color, format))),
+        gradient @ PaintOp::Gradient(_) => gradient,
+        // A label's colour is a token colour exactly like a
+        // solid's, so it is converted the same way — and so is
+        // every caret, selection and underline colour a text
+        // field's run carries (0.133.0).
+        PaintOp::Text(run) => PaintOp::Text(run.map_colors(|c| target_paint_color(c, format))),
+    }
 }
 
 /// Uploads every op [`target_paint_ops`] resolves for `tree` as a real
@@ -37349,6 +37363,9 @@ fn target_paint_ops(
 /// With `text` absent (no engine — the bundled font failed to load — or
 /// no atlas yet) text runs are dropped and everything else draws as
 /// before.
+// Test-only since 60 FPS round 3: `App::redraw` paints through
+// `widget_paint_cache`, which these remain the fresh reference for.
+#[cfg_attr(not(test), allow(dead_code))]
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 fn collect_widget_paints(

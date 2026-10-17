@@ -74,6 +74,7 @@ struct WidgetOps {
 }
 
 impl WidgetPaintCache {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stats(&self) -> PaintCacheStats {
         self.stats
     }
@@ -193,6 +194,7 @@ impl WidgetPaintCache {
     /// pins), with every unchanged widget's meshes reused rather than
     /// re-tessellated.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn frame_paint_ops(
         &mut self,
         tree: &WidgetTree<WidgetKind>,
@@ -227,13 +229,18 @@ impl WidgetPaintCache {
         gpu: &aurora_gpu::GpuContext,
         format: wgpu::TextureFormat,
         scale_factor: f64,
-        text: Option<(&mut aurora_text::TextEngine, &mut aurora_widgets::GlyphAtlas)>,
+        text: Option<(
+            &mut aurora_text::TextEngine,
+            &mut aurora_widgets::GlyphAtlas,
+        )>,
     ) -> Vec<GpuPaintOp> {
         let widgets = self.walk(tree, focus, focused, theme, scales, format, scale_factor);
         let mut frame_ops = Vec::new();
         for widget in widgets {
             if let Some(entry) = self.entries.get_mut(&widget.id) {
-                let meshes = entry.gpu.get_or_insert_with(|| upload_meshes(gpu, &entry.ops));
+                let meshes = entry
+                    .gpu
+                    .get_or_insert_with(|| upload_meshes(gpu, &entry.ops));
                 frame_ops.extend(meshes.iter().cloned().map(FrameOp::Ready));
             }
             frame_ops.extend(widget.overlay.into_iter().map(FrameOp::Fresh));
@@ -264,7 +271,9 @@ impl WidgetPaintCache {
 
 /// The GPU meshes of an entry's mesh ops (solids and gradients only).
 fn upload_meshes(gpu: &aurora_gpu::GpuContext, ops: &[PaintOp]) -> Vec<GpuPaintOp> {
-    ops.iter().filter_map(|op| upload_mesh_op(gpu, op)).collect()
+    ops.iter()
+        .filter_map(|op| upload_mesh_op(gpu, op))
+        .collect()
 }
 
 fn upload_mesh_op(gpu: &aurora_gpu::GpuContext, op: &PaintOp) -> Option<GpuPaintOp> {
