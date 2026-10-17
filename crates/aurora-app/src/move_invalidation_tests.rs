@@ -486,9 +486,10 @@ fn a_shadow_offset_reaches_the_tile_it_lands_on() {
         "the shadow"
     );
     // The move is vertical, so the content stays in column 0: only the
-    // shadow (x 300..400 at 180 degrees) reaches column 1, not column 2.
+    // shadow (the 256-px stored tile shifted 300 px right: x 300..556)
+    // reaches columns 1 and 2, not column 3.
     assert!(
-        cache.is_current(aurora_tile::TileId { x: 2, y: 0 }),
+        cache.is_current(aurora_tile::TileId { x: 3, y: 0 }),
         "past the shadow"
     );
     assert!(
