@@ -258,3 +258,27 @@ fn gpu_tile_byte_conversions_are_measured() {
          {oe:.3}ms -> cast {ne:.3}ms; decode loop {od:.3}ms -> copy {nd:.3}ms"
     );
 }
+
+/// What one transparent seed tile costs (`aurora_render::transparent_tile`,
+/// allocated for every recomposited tile, empty ones included).
+#[test]
+fn transparent_tile_seed_is_measured() {
+    let runs = 20;
+    let mut seed = Vec::with_capacity(runs);
+    let mut zeroed = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let t0 = Instant::now();
+        let tile = aurora_render::transparent_tile();
+        seed.push(t0.elapsed().as_secs_f64() * 1000.0);
+        assert!(tile.iter().all(|s| s.to_bits() == 0));
+        let t1 = Instant::now();
+        let raw = vec![0u16; aurora_tile::SAMPLES];
+        zeroed.push(t1.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(raw.len(), tile.len());
+    }
+    let (s, _, _) = stats(&mut seed);
+    let (z, _, _) = stats(&mut zeroed);
+    println!(
+        "transparent tile seed: n={runs} transparent_tile {s:.3}ms vs zeroed u16 alloc {z:.3}ms"
+    );
+}
