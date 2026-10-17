@@ -1693,3 +1693,138 @@ fn a_pattern_scale_outside_photoshops_range_is_clamped_and_flagged() {
             .is_some_and(|o| (o.scale - 0.01).abs() < 1e-6)
     );
 }
+
+// ---- task 118: gradient and pattern strokes ----
+
+/// A `FrFX` descriptor with the paint type `paint` (`GrFl` or `Ptrn`),
+/// whose gradient / pattern items come from `source` (a `gradient_fill` or
+/// `pattern_fill` descriptor's items); `extra` replaces items by key.
+fn painted_stroke<'a>(paint: &'static [u8], source: V<'a>, extra: Vec<(&'a [u8], V<'a>)>) -> V<'a> {
+    let mut items = vec![
+        (b"enab" as &[u8], V::Bool(true)),
+        (b"present", V::Bool(true)),
+        (b"PntT", V::Enum(b"FrFl", paint)),
+        (b"Styl", V::Enum(b"FStl", b"OutF")),
+        (b"Md  ", V::Enum(b"BlnM", b"Nrml")),
+        (b"Opct", V::Unit(b"#Prc", 70.0)),
+        (b"Sz  ", V::Unit(b"#Pxl", 5.0)),
+    ];
+    if let V::Obj(source_items) = source {
+        for (key, value) in source_items {
+            let skip = [
+                b"enab".as_slice(),
+                b"present".as_slice(),
+                b"Md  ".as_slice(),
+                b"Opct".as_slice(),
+            ];
+            if !skip.contains(&key) {
+                items.push((key, value));
+            }
+        }
+    }
+    for (key, value) in extra {
+        items.retain(|(k, _)| *k != key);
+        items.push((key, value));
+    }
+    V::Obj(items)
+}
+
+#[test]
+fn a_gradient_stroke_is_painted_when_its_gradient_reads() {
+    use aurora_core::effects::{StrokeFill, StrokePaint};
+    let read = mapped(&effects_block(&[(
+        b"FrFX",
+        painted_stroke(b"GrFl", gradient_fill(true, vec![]), vec![]),
+    )]));
+    let Some(stroke) = read.effects.strokes.first() else {
+        unreachable!("one stroke");
+    };
+    assert_eq!(stroke.fill, StrokeFill::Gradient);
+    assert!((stroke.opacity - 0.7).abs() < 1e-6 && (stroke.size - 5.0).abs() < 1e-6);
+    let Some(StrokePaint::Gradient {
+        gradient,
+        reference,
+    }) = &stroke.paint
+    else {
+        unreachable!("a gradient paint, got {:?}", stroke.paint);
+    };
+    assert!(reference.is_none(), "the box is the caller's");
+    assert!(gradient.reverse && gradient.align);
+    assert!((gradient.angle - 30.0).abs() < 1e-9);
+    assert_eq!(gradient.colours.len(), 2);
+    assert!(stroke.drawn());
+    assert_eq!(read.effects.shown_drawn_strokes(), 1);
+    assert_eq!(read.effects.shown_unrendered_strokes(), 0);
+}
+
+#[test]
+fn a_gradient_stroke_aurora_cannot_paint_stays_undrawn() {
+    let noise = {
+        let mut v = gradient_fill(true, vec![]);
+        if let V::Obj(items) = &mut v {
+            items.retain(|(k, _)| *k != b"Grad".as_slice());
+            items.push((b"Grad", V::Obj(vec![(b"GrdF", V::Enum(b"GrdF", b"ClNs"))])));
+        }
+        v
+    };
+    let unaligned = gradient_fill(true, vec![(b"Algn", V::Bool(false))]);
+    for source in [noise, unaligned] {
+        let read = mapped(&effects_block(&[(
+            b"FrFX",
+            painted_stroke(b"GrFl", source, vec![]),
+        )]));
+        let Some(stroke) = read.effects.strokes.first() else {
+            unreachable!("the stroke is kept");
+        };
+        assert!(stroke.paint.is_none() && !stroke.drawn());
+        assert_eq!(read.effects.shown_unrendered_strokes(), 1);
+    }
+}
+
+#[test]
+fn a_pattern_stroke_keeps_its_id_and_scale_and_waits_for_its_origin() {
+    use aurora_core::effects::{StrokeFill, StrokePaint};
+    let read = mapped(&effects_block(&[(
+        b"FrFX",
+        painted_stroke(b"Ptrn", pattern_fill(true, vec![]), vec![]),
+    )]));
+    let Some(stroke) = read.effects.strokes.first() else {
+        unreachable!("one stroke");
+    };
+    assert_eq!(stroke.fill, StrokeFill::Pattern);
+    let Some(StrokePaint::Pattern {
+        pattern,
+        scale,
+        origin,
+    }) = &stroke.paint
+    else {
+        unreachable!("a pattern paint, got {:?}", stroke.paint);
+    };
+    assert_eq!(pattern, "2ab8ff7f-7c39");
+    assert!((scale - 2.0).abs() < 1e-6);
+    assert_eq!(*origin, (0.0, 0.0));
+}
+
+#[test]
+fn an_unnamed_unlinked_or_phased_pattern_stroke_stays_undrawn() {
+    let unlinked = pattern_fill(true, vec![(b"Algn", V::Bool(false))]);
+    let phased = pattern_fill(
+        true,
+        vec![(
+            b"phase",
+            V::Obj(vec![(b"Hrzn", V::Doub(3.0)), (b"Vrtc", V::Doub(0.0))]),
+        )],
+    );
+    let unnamed = pattern_fill(true, vec![(b"Ptrn", V::Obj(vec![]))]);
+    for source in [unlinked, phased, unnamed] {
+        let read = mapped(&effects_block(&[(
+            b"FrFX",
+            painted_stroke(b"Ptrn", source, vec![]),
+        )]));
+        let Some(stroke) = read.effects.strokes.first() else {
+            unreachable!("the stroke is kept");
+        };
+        assert!(stroke.paint.is_none(), "{stroke:?}");
+        assert_eq!(read.effects.shown_unrendered_strokes(), 1);
+    }
+}

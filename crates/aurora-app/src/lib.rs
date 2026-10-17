@@ -91156,10 +91156,11 @@ mod tests {
             // 0.182.0: unchanged by drawing drop shadows.
             ("clipping-mask2.psd", 255.0, [50.8407, 65.1006, 53.0559]),
             // 0.182.0: unchanged by drawing drop shadows.
+            // Task 118: the 'Text' layer's gradient stroke is drawn ('Text 2''s is not: its gradient is not modelled); before: 255 / 31.1161, 23.8722, 19.5429.
             (
                 "effect-stroke-gradient.psd",
-                255.0,
-                [31.1161, 23.8722, 19.5429],
+                248.0,
+                [23.6092, 18.0220, 11.2299],
             ),
             // 0.182.0: unchanged by drawing drop shadows.
             // 0.190.0: Outside and inside strokes drawn; before: 255 / 12.2021, 37.6904, 37.1924.
@@ -91172,10 +91173,11 @@ mod tests {
             ("effects/shape-fx.psd", 0.0, [0.0000, 0.0000, 0.0000]),
             // 0.182.0: unchanged by drawing drop shadows.
             // 0.190.0: Solid strokes drawn (raster ones match Photoshop pixel for pixel); shape layers differ in their gradient fill, gradient and pattern strokes are not drawn, green is worse; before: 255 / 58.2448, 23.1956, 44.6420.
+            // Task 118: the gradient and pattern strokes are drawn; on the pixels they change the summed error against Photoshop falls 377,360 -> 242,280 (red is 0.21 worse overall, green 0.56 and blue 0.03 better); the rest of the gap is the shape layers' own gradient fill and the gradient ramp length, as for gradient overlays; before: 255 / 37.9004, 24.9445, 27.3005.
             (
                 "effects/stroke-effects.psd",
                 255.0,
-                [37.9004, 24.9445, 27.3005],
+                [38.1145, 24.3832, 27.2692],
             ),
             // 0.182.0: unchanged by drawing drop shadows.
             // 0.203.0: its master-only Hue/Saturation layer imported; before: 240 / 133.1256, 58.7064, 39.0855.
@@ -91799,6 +91801,7 @@ mod tests {
         include!("shape_fidelity_tests.rs");
         include!("gradient_overlay_tests.rs");
         include!("pattern_overlay_tests.rs");
+        include!("stroke_paint_tests.rs");
         include!("small_machine_effect_tests.rs");
     }
 }
