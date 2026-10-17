@@ -931,7 +931,7 @@ fn psd_save_itemises_unsaved_effects() {
         Err(err) => unreachable!("{err:?}"),
     };
     assert!(!report(&layers).contains("effects"));
-    // Turned off still counts: the effects are lost from the .psd either way.
+    // Turned off still counts: the switch is written with the effects.
     let mut off = LayerEffects::default();
     off.enabled = false;
     off.color_overlays
@@ -946,7 +946,7 @@ fn psd_save_itemises_unsaved_effects() {
     }
     let items = report(&layers);
     assert!(
-        items.contains("2 layers' effects aren't saved to .psd yet (they are kept in .aur)."),
+        items.contains("2 layers' effects are saved in the file"),
         "{items}"
     );
 }
@@ -1283,7 +1283,7 @@ fn stroke_notes_on_open_and_psd_save() {
         Err(err) => unreachable!("{err:?}"),
     };
     assert!(
-        items.contains("1 layer's effects aren't saved to .psd yet"),
+        items.contains("1 layer's effects are saved in the file"),
         "{items}"
     );
 }
@@ -1567,7 +1567,7 @@ fn psd_save_still_itemises_effects_for_a_layer_with_only_a_gradient_overlay() {
         Err(err) => unreachable!("{err:?}"),
     };
     assert!(
-        items.contains("1 layer's effects aren't saved to .psd yet (they are kept in .aur)."),
+        items.contains("1 layer's effects are saved in the file"),
         "{items}"
     );
 }
