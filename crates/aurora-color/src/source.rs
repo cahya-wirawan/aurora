@@ -584,6 +584,11 @@ mod tests {
     /// point `wtpt` (XYZ). No matrices or curves: the first profile in the
     /// tests that is not matrix/TRC, so intent and black point compensation
     /// can matter.
+    #[allow(
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     pub(crate) fn lut_profile(white: [f64; 3]) -> Vec<u8> {
         fn s15(v: f64) -> [u8; 4] {
             let n = (v * 65536.0).round() as i32;

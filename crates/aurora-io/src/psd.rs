@@ -5129,16 +5129,15 @@ pub fn merged_image_in_working_space(bytes: &[u8]) -> Result<Image, IoError> {
     let _angle = scan_resources(data, &mut notes);
     let embedded = notes.3.take();
     let plan = plan_colour(embedded.as_deref(), header.gray(), &mut notes);
-    if let Some(profile) = &plan.convert_from {
-        if crate::convert_profile_rgba(
+    if let Some(profile) = &plan.convert_from
+        && crate::convert_profile_rgba(
             image.samples_mut(),
             profile,
             crate::ConvertDirection::ToWorking,
         )
         .is_ok()
-        {
-            crate::clamp_colour_unit(image.samples_mut());
-        }
+    {
+        crate::clamp_colour_unit(image.samples_mut());
     }
     Ok(image)
 }
@@ -5250,6 +5249,7 @@ impl PsdPixelSink for Collect {
 
 /// [`build_document`]'s body (0.154.0), handing pixels to `sink` and
 /// decoding each pending layer from `src` as it is reached.
+#[allow(clippy::too_many_lines)] // the colour plan and its report lines (round 1)
 fn build_streamed(
     file: PsdFile,
     src: Option<&mut dyn ByteSource>,
@@ -5284,6 +5284,15 @@ fn build_streamed(
     // any pixel is decoded, so every layer image is converted on its way
     // to the sink. A Grayscale file keeps its old handling.
     let gray = notes.0.contains_key(&Note::GrayscaleHeldAsRgb);
+    #[cfg(test)]
+    let embedded = if std::env::var_os("AURORA_AUDIT_NO_COLOUR_CONVERSION").is_some() {
+        // Test builds only: the pre-colour-management pipeline, so the
+        // corpus audit can measure it on the same (converted-merged) basis.
+        notes.3.take().map(|_| Vec::new()).filter(|_| false)
+    } else {
+        notes.3.take()
+    };
+    #[cfg(not(test))]
     let embedded = notes.3.take();
     let plan = plan_colour(embedded.as_deref(), gray, &mut notes);
     let mut builder = Builder {
@@ -5301,7 +5310,7 @@ fn build_streamed(
     };
     if nodes.is_empty() {
         if let Some(mut image) = composite {
-            builder.to_working_in_place(&mut image);
+            builder.bring_image_into_working(&mut image);
             let bounds = Rect {
                 width: image.width(),
                 height: image.height(),
@@ -5471,7 +5480,7 @@ impl Builder<'_, '_, '_> {
     /// (PSD layers feed blend modes, adjustment tables and effects that
     /// assume in-gamut colour; Photoshop clips out-of-gamut colour when it
     /// converts to sRGB too).
-    fn to_working_in_place(&mut self, image: &mut Image) {
+    fn bring_image_into_working(&mut self, image: &mut Image) {
         let Some(profile) = &self.to_working else {
             return;
         };
@@ -5560,7 +5569,7 @@ impl Builder<'_, '_, '_> {
                         (None, None) => None,
                     };
                     if let Some(image) = image.as_mut() {
-                        self.to_working_in_place(image);
+                        self.bring_image_into_working(image);
                     }
                     if let (Some(image), Some(smart)) = (&image, layer.smart) {
                         // The fingerprint of the pixels as they will sit in
