@@ -49,10 +49,13 @@
 //! compositor) that passes that test is invalidated; the rest keep their
 //! pixels, which the move cannot have changed.
 //!
-//! Two more things a move can change are handled by bumping everything:
-//! the grid anchor ([`composite_reference_origin`] is `min(origin, 0)` per
-//! axis of the active layer, so a tile id names other pixels once it
-//! moves), and a surface the store cannot be asked about.
+//! Two more things a move could change are handled by bumping everything:
+//! the grid anchor (a tile id would name other pixels once it moved), and
+//! a surface the store cannot be asked about. Since 60 FPS round 3 the
+//! anchor is the document's corner ([`composite_reference_origin`]) and no
+//! longer depends on the active layer, so a move never changes it and a
+//! layer at a negative origin (most PSD layers) narrows like any other;
+//! the anchor guard stays as a check of that contract.
 //!
 //! Culling ([`fold_plan_for_tile`]) uses `bounds` to choose candidates but
 //! is bit-identical to the plain fold, so a composite tile is still a
@@ -241,7 +244,8 @@ fn layer_holds_tile_in(
 
 /// The live document half of a Move drag's pointer event: sets `layer`'s
 /// `bounds` and invalidates what that changed ([`invalidate_moved_layer`]).
-/// `active` is the document's active layer (the grid anchor's layer).
+/// `active` is the document's active layer (it no longer moves the grid
+/// anchor, which is the document's corner since 60 FPS round 3).
 /// On an error the tree is unchanged and nothing is invalidated.
 pub(crate) fn move_layer_live(
     layers: &mut aurora_doc::LayerTree,

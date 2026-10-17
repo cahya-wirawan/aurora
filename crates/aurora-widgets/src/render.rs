@@ -79,8 +79,8 @@ use aurora_gpu::{Blend, PipelineCache, PipelineKey};
 use aurora_vector::{ColorMesh, Mesh};
 
 pub use crate::text_render::{
-    AtlasLayout, AtlasSlot, GlyphAtlas, GlyphBatch, GpuGlyphMesh, PendingUpload, TextPipeline,
-    upload_glyph_meshes, upload_paint_ops,
+    AtlasLayout, AtlasSlot, FrameOp, GlyphAtlas, GlyphBatch, GpuGlyphMesh, PendingUpload,
+    TextPipeline, upload_frame_ops, upload_glyph_meshes, upload_paint_ops,
 };
 
 const PATH_SHADER: &str = include_str!("shaders/path.wgsl");
@@ -101,6 +101,9 @@ const UNIFORM_SIZE: u64 = 32;
 /// [`PathPipeline`] draws directly. Built once per (re)tessellation
 /// (whenever a shape's own geometry changes), not rebuilt every frame a
 /// caller redraws the same, unchanged shape.
+// Clone (60 FPS round 3): the buffers are reference-counted handles, so a
+// clone shares them; the widget paint cache hands cached meshes to a frame.
+#[derive(Clone)]
 pub struct GpuMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -360,6 +363,7 @@ const GRADIENT_UNIFORM_SIZE: u64 = 16;
 /// a vertex-coloured gradient, drawn by a [`GradientPipeline`]. Same
 /// hand-built little-endian byte layout as [`GpuMesh::upload`] (no
 /// `bytemuck`): per vertex, `x, y, r, g, b, a` as six `f32`s.
+#[derive(Clone)]
 pub struct GpuColorMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -618,7 +622,7 @@ impl std::fmt::Debug for GradientPipeline {
 /// `linearize_paint_color`), exactly as before this type existed.
 /// `Gradient`'s vertex colours are never linearized by a caller; see
 /// [`GradientPipeline`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 ///
 /// `Text` (0.132.0) is one run's glyph quads plus its colour, which a
 /// caller linearizes exactly as it does a `Solid`'s. The colour is already

@@ -73,6 +73,7 @@ fn laid_out_workspace(
 /// Measures the widget layer of one redraw: tessellation (`target_paint_ops`)
 /// and the whole `collect_widget_paints` (tessellation + text resolve + one
 /// GPU buffer pair per mesh), `frames` times on an unchanged tree.
+#[allow(clippy::too_many_lines)]
 fn measure_widget_paints(label: &str, extra_layers: usize, frames: usize) -> f64 {
     let Some(context) = real_gpu_context() else {
         return 0.0;
@@ -131,6 +132,70 @@ fn measure_widget_paints(label: &str, extra_layers: usize, frames: usize) -> f64
             timeout: None,
         });
     }
+    // 60 FPS round 3: the same frames through the widget paint cache, on
+    // the unchanged tree (after one cold frame) and with one button's hover
+    // toggled every frame.
+    let mut cache = crate::widget_paint_cache::WidgetPaintCache::default();
+    let buttons: Vec<_> = workspace
+        .tree
+        .paint_order()
+        .into_iter()
+        .filter(|&id| {
+            matches!(
+                workspace.tree.payload(id),
+                Some(aurora_widgets::widgets::WidgetKind::Button(_))
+            )
+        })
+        .collect();
+    let mut cached = Vec::with_capacity(frames);
+    let mut hovered = Vec::with_capacity(frames);
+    let mut cached_ops = 0;
+    for frame in 0..=2 * frames {
+        let hover = frame > frames;
+        if hover && let Some(&b) = buttons.get(frame % buttons.len().max(1)) {
+            let _ =
+                aurora_widgets::widgets::set_button_hovered(&mut workspace.tree, b, frame % 2 == 0);
+        }
+        let t2 = Instant::now();
+        engine.begin_frame();
+        aurora_widgets::update_field_scrolls(
+            &mut engine,
+            &mut workspace.tree,
+            &theme,
+            &scales,
+            1.0,
+        );
+        let paints = cache.frame_gpu_ops(
+            &workspace.tree,
+            None,
+            None,
+            &theme,
+            &scales,
+            &context,
+            format,
+            1.0,
+            Some((&mut engine, &mut atlas)),
+        );
+        let ms = t2.elapsed().as_secs_f64() * 1000.0;
+        if hover {
+            hovered.push(ms);
+        } else if frame > 0 {
+            cached.push(ms);
+            cached_ops = paints.len();
+        }
+        drop(paints);
+        let _ = context.device().poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+    }
+    assert_eq!(cached_ops, ops_count, "the cached frame draws as many ops");
+    let (c_mean, c_min, c_max) = stats(&mut cached);
+    let (h_mean, h_min, h_max) = stats(&mut hovered);
+    println!(
+        "widget paints ({label}) cached: unchanged mean={c_mean:.2}ms [{c_min:.2}..{c_max:.2}] \
+         one hover change/frame mean={h_mean:.2}ms [{h_min:.2}..{h_max:.2}]"
+    );
     let (t_mean, t_min, t_max) = stats(&mut tessellate);
     let (w_mean, w_min, w_max) = stats(&mut whole);
     println!(
@@ -284,7 +349,7 @@ fn transparent_tile_seed_is_measured() {
 }
 
 /// A dab on a layer whose origin is inside the document (so the composite
-/// grid's anchor, `min(origin, 0)`, is not the layer origin) must make the
+/// grid's anchor, the document corner, is not the layer origin) must make the
 /// composite tiles under the painted area stale, and only those. Before
 /// the 0.265.0 fix it invalidated composite tile (0, 0) (the painted
 /// layer-local id) and left (1, 0), (2, 0), (1, 1), (2, 1) current.
@@ -321,14 +386,16 @@ fn a_dab_on_a_layer_inside_the_document_invalidates_the_tiles_it_lands_on() {
 fn a_dab_on_a_layer_at_the_anchor_invalidates_exactly_its_painted_tile() {
     let mut layers = aurora_doc::LayerTree::new();
     let bounds = aurora_core::Rect {
-        x: -124,
-        y: -36,
+        x: 0,
+        y: 0,
         width: 1024,
         height: 1024,
     };
     let id = ok(layers.add_pixel_layer("anchor", bounds, None));
     let reference = crate::composite_reference_origin(&layers, Some(id));
-    assert_eq!(reference, (-124, -36));
+    // 60 FPS round 3: the anchor is the document corner, so a layer there
+    // is the one whose painted ids are composite ids.
+    assert_eq!(reference, (0, 0));
     let mut cache = crate::CompositeCache::default();
     for x in 0..4 {
         for y in 0..4 {

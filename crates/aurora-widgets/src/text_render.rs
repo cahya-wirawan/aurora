@@ -271,36 +271,76 @@ pub fn upload_paint_ops(
     scale_factor: f32,
     color: impl Fn([f32; 4]) -> [f32; 4],
 ) -> Vec<GpuPaintOp> {
+    upload_frame_ops(
+        device,
+        queue,
+        engine,
+        atlas,
+        ops.into_iter().map(FrameOp::Fresh).collect(),
+        scale_factor,
+        color,
+    )
+}
+
+/// One op of a frame for [`upload_frame_ops`] (60 FPS round 3): a
+/// [`PaintOp`] still to upload, or a solid or gradient [`GpuPaintOp`]
+/// uploaded on an earlier frame (a widget paint cache's hit), passed
+/// through in its place.
+#[derive(Debug)]
+pub enum FrameOp {
+    /// Uploaded (and, for a solid or text run, colour-converted) here.
+    Fresh(PaintOp),
+    /// Emitted as is, in order. Must not be a `Text` op: a glyph mesh
+    /// refers to atlas slots that a later frame's `prepare` may reuse.
+    Ready(GpuPaintOp),
+}
+
+/// [`upload_paint_ops`] for a frame that mixes fresh ops with ones
+/// uploaded earlier ([`FrameOp`]); the output order is the input order,
+/// each `Ready` op standing where it was given.
+pub fn upload_frame_ops(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    engine: &mut TextEngine,
+    atlas: &mut GlyphAtlas,
+    ops: Vec<FrameOp>,
+    scale_factor: f32,
+    color: impl Fn([f32; 4]) -> [f32; 4],
+) -> Vec<GpuPaintOp> {
     enum Staged {
         Solid(GpuMesh, [f32; 4]),
         Gradient(GpuColorMesh),
         Text(Vec<QuadGlyph>, [f32; 4]),
+        Ready(GpuPaintOp),
     }
     let staged: Vec<Staged> = ops
         .into_iter()
         .flat_map(|op| match op {
-            PaintOp::Solid((mesh, c)) => {
-                vec![Staged::Solid(
-                    GpuMesh::upload(device, queue, &mesh),
-                    color(c),
-                )]
-            }
-            PaintOp::Gradient(mesh) => {
-                vec![Staged::Gradient(GpuColorMesh::upload(device, queue, &mesh))]
-            }
-            // One run can be several ops (a field's line, selection,
-            // selected glyphs, underlines, caret): each rect is an
-            // ordinary solid, drawn by the path pipeline in paint order.
-            PaintOp::Text(run) => resolve_run(engine, &run, scale_factor)
-                .into_iter()
-                .map(|piece| match piece {
-                    Resolved::Glyphs(quads, c) => Staged::Text(quads, color(c)),
-                    Resolved::Rect(rect, c) => Staged::Solid(
-                        GpuMesh::upload(device, queue, &rect_mesh(rect, scale_factor)),
+            FrameOp::Ready(op) => vec![Staged::Ready(op)],
+            FrameOp::Fresh(op) => match op {
+                PaintOp::Solid((mesh, c)) => {
+                    vec![Staged::Solid(
+                        GpuMesh::upload(device, queue, &mesh),
                         color(c),
-                    ),
-                })
-                .collect(),
+                    )]
+                }
+                PaintOp::Gradient(mesh) => {
+                    vec![Staged::Gradient(GpuColorMesh::upload(device, queue, &mesh))]
+                }
+                // One run can be several ops (a field's line, selection,
+                // selected glyphs, underlines, caret): each rect is an
+                // ordinary solid, drawn by the path pipeline in paint order.
+                PaintOp::Text(run) => resolve_run(engine, &run, scale_factor)
+                    .into_iter()
+                    .map(|piece| match piece {
+                        Resolved::Glyphs(quads, c) => Staged::Text(quads, color(c)),
+                        Resolved::Rect(rect, c) => Staged::Solid(
+                            GpuMesh::upload(device, queue, &rect_mesh(rect, scale_factor)),
+                            color(c),
+                        ),
+                    })
+                    .collect(),
+            },
         })
         .collect();
     let all_quads: Vec<QuadGlyph> = staged
@@ -327,6 +367,7 @@ pub fn upload_paint_ops(
         .filter_map(|s| match s {
             Staged::Solid(mesh, c) => Some(GpuPaintOp::Solid(mesh, c)),
             Staged::Gradient(mesh) => Some(GpuPaintOp::Gradient(mesh)),
+            Staged::Ready(op) => Some(op),
             Staged::Text(_, c) => meshes
                 .next()
                 .flatten()
@@ -576,6 +617,7 @@ impl std::fmt::Debug for GlyphAtlas {
 /// One run's glyph quads: a range of indices into a frame's shared glyph
 /// vertex and index buffers ([`upload_glyph_meshes`]). The buffers are
 /// reference-counted handles, so every run of a frame holds the same two.
+#[derive(Clone)]
 pub struct GpuGlyphMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
