@@ -577,6 +577,7 @@ mod filter_stamp;
 #[cfg(test)]
 mod filter_stamp_tests;
 mod first_run;
+mod frame_composite;
 #[cfg(test)]
 mod frame_cost_tests;
 mod lasso_tools;
@@ -16230,6 +16231,12 @@ struct CompositeBudget {
     /// `aurora_tile::TileError` is neither `Clone` nor cheap to hold on
     /// to while the store it borrows from is still being mutated.
     first_store_error: Option<String>,
+    /// The pass's own "already reported" flag when several threads fold
+    /// one pass's tiles, each with its own budget (60 FPS round 7, the
+    /// frame pool): [`Self::should_report`] answers `true` once for the
+    /// whole pass, as the sequential loop's single budget does. `None`
+    /// keeps `reported` alone.
+    pass_reported: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl CompositeBudget {
@@ -16253,6 +16260,21 @@ impl CompositeBudget {
             reported: false,
             store_errors: 0,
             first_store_error: None,
+            pass_reported: None,
+        }
+    }
+
+    /// [`Self::for_tile_of_pass`] whose report is once per *pass* across
+    /// every budget sharing `pass_reported` (60 FPS round 7, the frame
+    /// pool). The store-error tally stays per tile: the frame path never
+    /// reads it (the live canvas ignores it, see [`Self::note_store_error`]).
+    fn for_tile_of_shared_pass(
+        layers: &aurora_doc::LayerTree,
+        pass_reported: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            pass_reported: Some(std::sync::Arc::clone(pass_reported)),
+            ..Self::for_tile_of_pass(layers)
         }
     }
 
@@ -16281,7 +16303,10 @@ impl CompositeBudget {
     fn should_report(&mut self) -> bool {
         let first = !self.reported;
         self.reported = true;
-        first
+        match &self.pass_reported {
+            Some(pass) => first && !pass.swap(true, std::sync::atomic::Ordering::SeqCst),
+            None => first,
+        }
     }
 
     /// Records that one layer's tile could not be read out of the store
@@ -18930,6 +18955,7 @@ fn fold_children_isolating_adjustments(
         reported: true,
         store_errors: 0,
         first_store_error: None,
+        pass_reported: None,
     };
     let mut folded = 0_usize;
     // `children` is newest first: walk it from the end (the bottom).
@@ -19493,6 +19519,7 @@ fn opaque_cover_texels(
         reported: true,
         store_errors: 0,
         first_store_error: None,
+        pass_reported: None,
     };
     let texels = pixel_layer_texels(
         id,
@@ -20141,6 +20168,7 @@ fn pass_through_content(
         reported: true,
         store_errors: 0,
         first_store_error: None,
+        pass_reported: None,
     };
     let _ = fold_context_into(
         &mut own,
@@ -20438,7 +20466,9 @@ fn composite_roots_into_tile(
     // that folded a root.
     clear_candidate_texels();
     if folded > 0 {
-        aurora_render::un_premultiply_in_place(&mut composited);
+        profiled(ProfileSlot::Straighten, || {
+            aurora_render::un_premultiply_in_place(&mut composited);
+        });
         note_composite_straighten_pass();
     }
     (composited, folded)
@@ -21679,7 +21709,7 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
         );
         return None;
     };
-    let decoded = decode_f16_samples(&data);
+    let decoded = profiled(ProfileSlot::ReadbackDecode, || decode_f16_samples(&data));
     drop(data);
     buffer.unmap();
     // Straighten once, here: what came back is the GPU fold's finished
@@ -21688,7 +21718,9 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
     // -- is straight alpha. See this function's own doc comment above
     // for why this is the CPU's job on both paths.
     decoded.map(|mut texels| {
-        aurora_render::un_premultiply_in_place(&mut texels);
+        profiled(ProfileSlot::ReadbackStraighten, || {
+            aurora_render::un_premultiply_in_place(&mut texels);
+        });
         texels
     })
 }
@@ -23090,6 +23122,18 @@ enum ProfileSlot {
     ShadowMiss,
     /// [`fold_plan_for_tile`]: the cover search.
     CullSearch,
+    /// [`composite_roots_into_tile`], inclusive (60 FPS round 7).
+    TileComposite,
+    /// `aurora_render::un_premultiply_in_place` on a composite tile
+    /// (60 FPS round 7).
+    Straighten,
+    /// [`install_composited_tile`] (60 FPS round 7).
+    Install,
+    /// [`finish_tile_readback`]'s decode of the mapped GPU readback
+    /// (60 FPS round 7).
+    ReadbackDecode,
+    /// [`finish_tile_readback`]'s straightening pass (60 FPS round 7).
+    ReadbackStraighten,
 }
 
 /// Calls and nanoseconds per [`ProfileSlot`] on this thread (0.183.0,
@@ -23097,13 +23141,13 @@ enum ProfileSlot {
 #[cfg(test)]
 #[derive(Debug, Default, Clone, Copy)]
 struct CompositeProfile {
-    slots: [(u64, u64); 6],
+    slots: [(u64, u64); 11],
 }
 
 #[cfg(test)]
 thread_local! {
     static COMPOSITE_PROFILE: std::cell::Cell<CompositeProfile> =
-        const { std::cell::Cell::new(CompositeProfile { slots: [(0, 0); 6] }) };
+        const { std::cell::Cell::new(CompositeProfile { slots: [(0, 0); 11] }) };
     /// Test-only: context nodes skipped below a cover by occlusion culling
     /// (0.183.0, [`fold_context_into`]), so tests can see a cull happen —
     /// the cull being output-identical, nothing else can.
@@ -26175,7 +26219,9 @@ fn recomposite_tiles(
                                    doc_origin: (i64, i64),
                                    budget: &mut CompositeBudget| {
         budget.next_tile(layers);
-        composite_roots_into_tile(layers, store, tile_id, doc_origin, reference_origin, budget)
+        profiled(ProfileSlot::TileComposite, || {
+            composite_roots_into_tile(layers, store, tile_id, doc_origin, reference_origin, budget)
+        })
     };
 
     // Phase 1: issue every GPU-qualifying, not-yet-current tile's GPU
@@ -26220,6 +26266,25 @@ fn recomposite_tiles(
     // since "the shipping build is unaffected" is only true of the profile
     // Aurora actually ships.
     let gpu_arm_reachable = gpu_qualifies && gpu.is_some() && compositor.is_some();
+    // 60 FPS round 7: with no GPU arm every stale tile takes the CPU path,
+    // and when more than one is stale they fold in parallel on the frame
+    // pool, bit for bit what the loop below computes (`frame_composite`).
+    if !gpu_arm_reachable
+        && recomposite_tiles_in_parallel(
+            tiles,
+            layers,
+            store,
+            cache,
+            reference_origin,
+            &mut tile_costs,
+        )
+    {
+        tile_costs.finish();
+        phases.mark();
+        phases.mark();
+        phases.mark();
+        return;
+    }
     for &tile_id in tiles {
         if cache.is_current(tile_id) {
             continue;
@@ -26290,7 +26355,9 @@ fn recomposite_tiles(
             // where phase 1's time goes -- see PLAN.md, M1.10, 0.93.1.
             let (composited, folded) =
                 composite_tile_cpu_path(layers, store, tile_id, doc_origin, &mut budget);
-            write_composited(store, cache, tile_id, &composited);
+            profiled(ProfileSlot::Install, || {
+                write_composited(store, cache, tile_id, &composited);
+            });
             tile_costs.mark_cpu_fallback(folded);
         }
     }
@@ -26330,6 +26397,54 @@ fn recomposite_tiles(
         write_composited(store, cache, tile_id, &composited);
     }
     phases.mark();
+}
+
+/// [`recomposite_tiles`]' CPU-only case on the frame pool (60 FPS round
+/// 7): composites and installs the stale tiles of `tiles` (each once, in
+/// order) and returns `true`, or returns `false` having done nothing when
+/// fewer than [`frame_composite::MIN_PARALLEL_TILES`] are stale (a dab:
+/// the redraw handler composites at most
+/// [`background_composite::SYNC_TILE_LIMIT`] tiles itself and those keep
+/// the sequential loop), the pool is unavailable or (tests) disabled.
+fn recomposite_tiles_in_parallel(
+    tiles: &[aurora_tile::TileId],
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    cache: &mut CompositeCache,
+    reference_origin: (i64, i64),
+    tile_costs: &mut RecompositeTileCosts,
+) -> bool {
+    if !frame_composite::parallel_enabled() {
+        return false;
+    }
+    let mut seen = HashSet::new();
+    let stale: Vec<aurora_tile::TileId> = tiles
+        .iter()
+        .copied()
+        .filter(|&tile_id| !cache.is_current(tile_id) && seen.insert(tile_id))
+        .collect();
+    if stale.len() < frame_composite::MIN_PARALLEL_TILES {
+        return false;
+    }
+    let Some(pool) = frame_composite::frame_pool() else {
+        return false;
+    };
+    frame_composite::composite_tiles(
+        pool,
+        &stale,
+        layers,
+        store,
+        reference_origin,
+        |store, tile_id, composited, folded| {
+            tile_costs.begin_tile();
+            tile_costs.mark_gpu_issue(false, false);
+            profiled(ProfileSlot::Install, || {
+                install_composited_tile(store, cache, tile_id, &composited);
+            });
+            tile_costs.mark_cpu_fallback(folded);
+        },
+    );
+    true
 }
 
 /// Which composite `aurora_tile::TileId`s [`recomposite_visible_tiles`]
@@ -66622,6 +66737,14 @@ mod tests {
         let target = frame_timing_target(device, viewport);
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let mut stages = FrameStages::with_capacity(frames as usize);
+        // 60 FPS round 7: the frame pool as the shipping build uses it,
+        // unless `AURORA_R7_SEQUENTIAL` asks for the old loop.
+        let parallel = std::env::var_os("AURORA_R7_SEQUENTIAL").is_none();
+        crate::frame_composite::set_parallel_enabled_for_tests(parallel);
+        println!(
+            "measure_pan_and_paint_frames: parallel frame recomposite {parallel} (threads {})",
+            crate::frame_composite::frame_composite_threads()
+        );
         zero_frame_counters();
         for step in 0..frames {
             let x = start.0 + step * pan_step_px.0;
@@ -66756,6 +66879,7 @@ mod tests {
                 .store_deltas
                 .push(store_stat_deltas(&stats_before, store.stats()));
         }
+        crate::frame_composite::set_parallel_enabled_for_tests(false);
         stages
     }
 
@@ -68066,6 +68190,7 @@ mod tests {
             "a single Normal-blend, full-bounds pixel layer must qualify for the GPU path"
         );
 
+        let profile_before = crate::COMPOSITE_PROFILE.with(std::cell::Cell::get);
         let mut stages = measure_pan_and_paint_frames(
             &context,
             &layers,
@@ -68078,6 +68203,7 @@ mod tests {
             (200, 120),
             None,
         );
+        print_composite_profile_per_frame("gate32", profile_before, 40);
         report_frame_distribution("gate (GPU path, 32 tiles)", &stages);
         report_frame_stages(
             "recomposite_and_present_loop (GPU path, 300,000px ceiling, pan+paint)",
@@ -68620,6 +68746,40 @@ mod tests {
         canvas_surface: aurora_tile::SurfaceId,
     }
 
+    /// Prints the CPU composite's per-stage profile (60 FPS round 7):
+    /// calls and milliseconds per frame for each [`crate::ProfileSlot`]
+    /// since `before`, on this thread.
+    fn print_composite_profile_per_frame(
+        label: &str,
+        before: crate::CompositeProfile,
+        frames: u32,
+    ) {
+        let now = crate::COMPOSITE_PROFILE.with(std::cell::Cell::get);
+        let names = [
+            "read_layer_window",
+            "pixel_layer_texels (incl.)",
+            "plain layer fold",
+            "effects fold (incl.)",
+            "shadow miss",
+            "cull search",
+            "tile composite (incl.)",
+            "straighten",
+            "install",
+            "readback decode",
+            "readback straighten",
+        ];
+        let frames = f64::from(frames.max(1));
+        for ((name, (calls, nanos)), (calls0, nanos0)) in
+            names.iter().zip(now.slots).zip(before.slots)
+        {
+            #[allow(clippy::cast_precision_loss)]
+            let ms = nanos.saturating_sub(nanos0) as f64 / 1e6 / frames;
+            #[allow(clippy::cast_precision_loss)]
+            let per_frame = calls.saturating_sub(calls0) as f64 / frames;
+            println!("{label}: profile {name}: {per_frame:.1} calls/frame, {ms:.2} ms/frame");
+        }
+    }
+
     /// Builds the two-root fixture: two root-level pixel layers at
     /// **identical** bounds (`0, 0, 300_000, 300_000`, the Phase 0
     /// ceiling), both with real stored content at every tile the pan will
@@ -68938,6 +69098,7 @@ mod tests {
              it is the whole-tile coverage claim being checked, not just non-emptiness"
         );
 
+        let profile_before = crate::COMPOSITE_PROFILE.with(std::cell::Cell::get);
         let mut stages = measure_pan_and_paint_frames(
             &context,
             &fixture.layers,
@@ -68950,6 +69111,7 @@ mod tests {
             TWO_ROOT_PAN_STEP,
             None,
         );
+        print_composite_profile_per_frame(MAIN_LABEL, profile_before, TWO_ROOT_FRAMES);
         // `report_frame_stages` returns the census it prints (0.100.0)
         // precisely so this assertion can exist. Slot 1 is
         // `real_fold_tiles` -- the count of *tiles* that folded at least
@@ -69012,6 +69174,7 @@ mod tests {
             "hiding the backdrop must not accidentally re-qualify the document for the GPU \
              path -- the active layer is still {CPU_ONLY_BLEND_MODE:?}-blended"
         );
+        let control_profile_before = crate::COMPOSITE_PROFILE.with(std::cell::Cell::get);
         let mut control_stages = measure_pan_and_paint_frames(
             &context,
             &control.layers,
@@ -69024,6 +69187,7 @@ mod tests {
             TWO_ROOT_PAN_STEP,
             None,
         );
+        print_composite_profile_per_frame(CONTROL_LABEL, control_profile_before, TWO_ROOT_FRAMES);
         let [control_folds, control_first] =
             report_frame_stages(CONTROL_LABEL, &mut control_stages);
         let control_later = control_folds.saturating_sub(control_first);
@@ -91947,6 +92111,7 @@ mod tests {
 
         /// One full-composite breakdown line (0.183.0): store hits and
         /// misses, the profile slots and the folds culled since `before`.
+        #[allow(clippy::large_types_passed_by_value)] // test-only, once per edit
         fn print_breakdown(
             what: &str,
             store: &aurora_tile::TileStore,
@@ -98082,9 +98247,15 @@ mod gpu_newest_adjustment_tests;
 mod gpu_photo_adjustment_tests;
 
 #[cfg(test)]
+mod dab_timing_tests;
+#[cfg(test)]
 mod fill_tests;
 #[cfg(test)]
 mod first_run_tests;
+#[cfg(test)]
+mod fold_fingerprint_tests;
+#[cfg(test)]
+mod frame_composite_tests;
 
 #[cfg(test)]
 mod menu_bar_tests;

@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.272.0] - 2026-10-18
+
+### Added
+
+- Record 60 FPS round 7: inlined CPU fold blend term, frame pool for larger recomposites
+
 ## [0.271.0] - 2026-10-17
 
 ### Added
