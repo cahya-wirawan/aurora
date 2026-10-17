@@ -368,6 +368,59 @@ const LABEL_DIVIDE_BIND_GROUP: &str = "composite.divide.bind_group";
 /// or a frame capture actually names.
 const LABEL_DIVIDE_PASS: &str = "composite.divide.pass";
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: when set, [`TileCompositor::prewarm`] builds the
+    /// `fs_composite_opacity` pipeline against a layout missing its
+    /// binding 2, so the build fails validation.
+    static PREWARM_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the test hook asks [`TileCompositor::prewarm`] to fail
+/// (always `false` outside tests).
+fn prewarm_fault_injected() -> bool {
+    #[cfg(test)]
+    {
+        PREWARM_FAULT.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// Runs `f` inside `wgpu` error scopes for every error filter and returns
+/// its value, or the first error the scopes captured (60 FPS round 5's
+/// [`TileCompositor::prewarm`]). On native backends the scope's future is
+/// already resolved when popped, so one poll with a no-op waker reads it;
+/// a backend whose future were still pending would report no error.
+/// An error goes to the innermost scope whose filter matches it, and the
+/// scopes are popped innermost first, so when several are captured the
+/// one returned is, in order of precedence, an `Internal` error, then an
+/// `OutOfMemory` error, then a `Validation` error.
+///
+/// # Errors
+///
+/// The first error any of the scopes captured while `f` ran.
+pub fn capture_wgpu_errors<T>(
+    device: &wgpu::Device,
+    f: impl FnOnce() -> T,
+) -> Result<T, wgpu::Error> {
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let value = f();
+    let mut first = None;
+    for scope in [internal, memory, validation] {
+        let mut popped = std::pin::pin!(scope.pop());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        if let std::task::Poll::Ready(Some(err)) = popped.as_mut().poll(&mut context) {
+            first.get_or_insert(err);
+        }
+    }
+    first.map_or(Ok(value), Err)
+}
+
 /// Everything that differs between one shader-computed blend mode's
 /// composite pass and another's: the `shaders/composite.wgsl` fragment
 /// entry point, and the four `wgpu` debug labels that name its pipeline,
@@ -2568,6 +2621,87 @@ impl TileCompositor {
         }
     }
 
+    /// Builds, ahead of first use, the render pipelines every document's
+    /// first GPU composite needs: the two `Normal` passes
+    /// ([`Self::composite_over`], [`Self::composite_over_with_opacity`])
+    /// and, when `blend_modes` is true, every blend-math pass. Returns how
+    /// many pipelines it newly created.
+    ///
+    /// 60 FPS round 5: without it the first GPU-composited tile of a
+    /// session paid the pipeline build (10-17 ms on an RTX 3090/Vulkan,
+    /// the largest single cost of the gate fixture's slowest idle frame).
+    /// Each pipeline is built from exactly the [`PipelineKey`], layout and
+    /// label its composite call builds lazily, so the cache entry is the
+    /// one that call would have made and no pixel can change.
+    ///
+    /// # Errors
+    ///
+    /// The first `wgpu` error a pipeline build raised (validation, out of
+    /// memory, internal), captured by error scopes rather than reaching
+    /// `wgpu`'s default uncaptured-error panic: a failed prewarm must
+    /// never abort startup. On an error the pipeline cache is emptied
+    /// (a failed build leaves an invalid handle behind), so the composite
+    /// call that later needs a pipeline builds it lazily, exactly as it
+    /// would have without the prewarm. The caller logs the error.
+    pub fn prewarm(
+        &mut self,
+        device: &wgpu::Device,
+        blend_modes: bool,
+    ) -> Result<usize, wgpu::Error> {
+        let built = capture_wgpu_errors(device, || self.prewarm_uncaptured(device, blend_modes));
+        if built.is_err() {
+            // A pipeline build that failed inside a scope still returns a
+            // handle -- an invalid one -- and the cache kept it. Binding
+            // it later, outside any scope, would reach `wgpu`'s default
+            // uncaptured-error panic, so the whole cache is dropped and
+            // every pipeline is built again on first use, as without the
+            // prewarm.
+            self.pipelines = PipelineCache::new();
+        }
+        built
+    }
+
+    fn prewarm_uncaptured(&mut self, device: &wgpu::Device, blend_modes: bool) -> usize {
+        let before = self.pipelines.len();
+        let shader = &self.shader;
+        let opacity_layout = if prewarm_fault_injected() {
+            &self.bind_group_layout
+        } else {
+            &self.bind_group_layout_opacity
+        };
+        for (fragment_entry, layout) in [
+            ("fs_composite", &self.bind_group_layout),
+            ("fs_composite_opacity", opacity_layout),
+        ] {
+            let key = PipelineKey {
+                shader: LABEL,
+                vertex_entry: "vs_composite",
+                fragment_entry,
+                target_format: wgpu::TextureFormat::Rgba16Float,
+                blend: Blend::AlphaBlending,
+            };
+            let _ = self.pipelines.get_or_create_with(key.clone(), || {
+                composite_pipeline(device, shader, &key, layout, LABEL)
+            });
+        }
+        if blend_modes {
+            let layout = &self.bind_group_layout_blend;
+            for blend_pass in ALL_BLEND_PASSES {
+                let key = PipelineKey {
+                    shader: LABEL,
+                    vertex_entry: "vs_composite",
+                    fragment_entry: blend_pass.fragment_entry,
+                    target_format: wgpu::TextureFormat::Rgba16Float,
+                    blend: Blend::None,
+                };
+                let _ = self.pipelines.get_or_create_with(key.clone(), || {
+                    composite_pipeline(device, shader, &key, layout, blend_pass.pipeline)
+                });
+            }
+        }
+        self.pipelines.len().saturating_sub(before)
+    }
+
     /// Blends `src` over `dst` in place: `dst`'s existing content is
     /// preserved (`LoadOp::Load`, not cleared) and `src` is drawn on top
     /// with straight-alpha "source-over" blending. Both views must be
@@ -2816,10 +2950,11 @@ impl TileCompositor {
     ///
     /// **The aliasing failure mode is a raw `wgpu` panic.** Passing the
     /// same view for `dst` and `backdrop` trips `wgpu`'s own validation
-    /// rather than corrupting pixels silently — but nothing in this
-    /// workspace installs an error scope or an uncaptured-error handler
-    /// (`push_error_scope`/`on_uncaptured_error` appear nowhere under
-    /// `crates/`), so that validation failure reaches the user as
+    /// rather than corrupting pixels silently — but no error scope or
+    /// uncaptured-error handler covers composite calls (the only scopes
+    /// under `crates/` are [`capture_wgpu_errors`]'s, used by the
+    /// startup prewarm since 60 FPS round 5), so that validation failure
+    /// reaches the user as
     /// `wgpu`'s default panic, in a workspace whose lints otherwise deny
     /// `panic!` precisely because a panic loses unsaved work. That gap is
     /// **pre-existing and workspace-wide**; this method inherits it and
@@ -8411,6 +8546,178 @@ mod tests {
 
         let (r, g, b, a) = read_first_texel(device, queue, &dst);
         assert_eq!((r, g, b, a), (0.0, 0.0, 1.0, 1.0));
+    }
+
+    /// 60 FPS round 5: [`TileCompositor::prewarm`] builds exactly the
+    /// pipelines the composite calls would build lazily -- after it, no
+    /// `Normal` or blend-math call adds a cache entry -- and is
+    /// idempotent. Prints how long the build takes (not asserted).
+    #[test]
+    fn prewarm_builds_the_pipelines_the_composite_calls_use() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+        let dst = solid_tile(device, queue, [0.0, 0.0, 0.0, 0.0], usage);
+        let src = solid_tile(device, queue, [1.0, 0.5, 0.25, 0.5], usage);
+        let backdrop = solid_tile(device, queue, [0.25, 0.5, 1.0, 1.0], usage);
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        let started = std::time::Instant::now();
+        assert_eq!(compositor.prewarm(device, false).ok(), Some(2));
+        let normal_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(
+            compositor.prewarm(device, false).ok(),
+            Some(0),
+            "idempotent"
+        );
+        submit_one(&context, |encoder| {
+            compositor.composite_over(&context, encoder, &dst_view, &src_view);
+            compositor.composite_over_with_opacity(&context, encoder, &dst_view, &src_view, 0.5);
+        });
+        assert_eq!(
+            compositor.pipelines.len(),
+            2,
+            "the Normal calls must find the prewarmed pipelines"
+        );
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            compositor.prewarm(device, true).ok(),
+            Some(ALL_BLEND_PASSES.len())
+        );
+        let blend_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(compositor.prewarm(device, true).ok(), Some(0), "idempotent");
+        for pass in ALL_BLEND_PASSES {
+            submit_one(&context, |encoder| {
+                compositor.composite_blend_over_with_opacity(
+                    &context,
+                    encoder,
+                    &src_view,
+                    &backdrop_view,
+                    &dst_view,
+                    0.5,
+                    pass,
+                );
+            });
+        }
+        submit_one(&context, |encoder| {
+            compositor.composite_multiply_over_with_opacity(
+                &context,
+                encoder,
+                &src_view,
+                &backdrop_view,
+                &dst_view,
+                0.5,
+            );
+            compositor.composite_divide_over_with_opacity(
+                &context,
+                encoder,
+                &src_view,
+                &backdrop_view,
+                &dst_view,
+                0.5,
+            );
+        });
+        assert_eq!(
+            compositor.pipelines.len(),
+            2 + ALL_BLEND_PASSES.len(),
+            "every blend-math call must find its prewarmed pipeline"
+        );
+        println!(
+            "prewarm: Normal pipelines {normal_ms:.2} ms, {} blend pipelines {blend_ms:.2} ms",
+            ALL_BLEND_PASSES.len()
+        );
+    }
+
+    /// A pipeline build that fails validation inside
+    /// [`capture_wgpu_errors`] comes back as an `Err`, not as `wgpu`'s
+    /// uncaptured-error panic (what keeps a failed prewarm from aborting
+    /// startup), and a clean build comes back `Ok`.
+    #[test]
+    fn capture_wgpu_errors_returns_a_validation_error_instead_of_panicking() {
+        use super::{Blend, LABEL, PipelineKey, capture_wgpu_errors, composite_pipeline};
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let compositor = TileCompositor::new(device);
+        let key = PipelineKey {
+            shader: LABEL,
+            vertex_entry: "vs_composite",
+            fragment_entry: "fs_composite_opacity",
+            target_format: wgpu::TextureFormat::Rgba16Float,
+            blend: Blend::AlphaBlending,
+        };
+        // `fs_composite_opacity` reads binding 2, which this layout lacks.
+        let failed = capture_wgpu_errors(device, || {
+            composite_pipeline(
+                device,
+                &compositor.shader,
+                &key,
+                &compositor.bind_group_layout,
+                LABEL,
+            )
+        });
+        assert!(
+            failed.is_err(),
+            "a layout missing binding 2 must fail validation"
+        );
+        let built = capture_wgpu_errors(device, || {
+            composite_pipeline(
+                device,
+                &compositor.shader,
+                &key,
+                &compositor.bind_group_layout_opacity,
+                LABEL,
+            )
+        });
+        assert!(built.is_ok(), "the matching layout must build cleanly");
+    }
+
+    /// A prewarm whose pipeline build fails (forced through the test
+    /// hook) returns `Err` and leaves no invalid pipeline cached: the next
+    /// real `composite_over_with_opacity` builds a valid one and draws
+    /// the right pixel instead of hitting `wgpu`'s uncaptured-error panic.
+    #[test]
+    fn a_failed_prewarm_leaves_the_compositor_usable() {
+        use super::PREWARM_FAULT;
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+        let dst = solid_tile(
+            device,
+            queue,
+            [0.0, 0.0, 1.0, 1.0],
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let src = solid_tile(
+            device,
+            queue,
+            [1.0, 0.0, 0.0, 1.0],
+            wgpu::TextureUsages::empty(),
+        );
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        PREWARM_FAULT.with(|fault| fault.set(true));
+        let failed = compositor.prewarm(device, false);
+        PREWARM_FAULT.with(|fault| fault.set(false));
+        assert!(failed.is_err(), "the injected fault must fail the prewarm");
+        assert_eq!(compositor.pipelines.len(), 0, "nothing may stay cached");
+        submit_one(&context, |encoder| {
+            compositor.composite_over_with_opacity(&context, encoder, &dst_view, &src_view, 0.5);
+        });
+        let (r, g, b, a) = read_first_texel(device, queue, &dst);
+        assert_eq!((r, g, b, a), (0.5, 0.0, 0.5, 1.0));
     }
 
     #[test]

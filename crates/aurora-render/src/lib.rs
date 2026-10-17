@@ -66,8 +66,8 @@ pub use composite::{
     EXPOSURE_GPU_PARAMS_LEN, GRADIENT_MAP_GPU_PARAMS_LEN, HUE_SATURATION_GPU_PARAMS_LEN,
     LEVELS_GPU_PARAMS_LEN, PHOTO_FILTER_GPU_PARAMS_LEN, POSTERIZE_GPU_PARAMS_LEN,
     SELECTIVE_COLOR_GPU_PARAMS_LEN, THRESHOLD_GPU_PARAMS_LEN, TileCompositor,
-    VIBRANCE_GPU_PARAMS_LEN, composite_layer_into, composite_tile_cpu, curves_mode_code,
-    transparent_tile, un_premultiply_in_place,
+    VIBRANCE_GPU_PARAMS_LEN, capture_wgpu_errors, composite_layer_into, composite_tile_cpu,
+    curves_mode_code, transparent_tile, un_premultiply_in_place,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use composite::{set_transparent_skip_enabled, transparent_chunks_skipped};
