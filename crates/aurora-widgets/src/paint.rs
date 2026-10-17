@@ -129,7 +129,7 @@ use crate::error::WidgetError;
 use crate::icons::icon_paths;
 use crate::input::FocusManager;
 use crate::text::{TextRun, intersect, text_runs};
-use crate::tree::{WidgetId, WidgetTree};
+use crate::tree::{PaintClip, WidgetId, WidgetTree};
 use crate::widgets::{
     ButtonState, CheckboxState, ColorPickerPartRole, ColorPickerPartState, ColorSwatchState,
     CurveEditorState, DropdownState, Hsv, IconState, IconTone, ListRowState, MARKER_RING_WIDTH,
@@ -268,6 +268,36 @@ pub fn paint_widget_ops_frame(
     scales: &Scales,
     scale_factor: f32,
 ) -> Result<Vec<PaintOp>, WidgetError> {
+    let mut ops = paint_widget_mesh_ops(tree, id, theme, scales, scale_factor)?;
+    // Text after the widget's own shapes (its label sits on its fill),
+    // before its focus ring (the ring outlines the whole widget).
+    ops.extend(paint_widget_overlay_ops(
+        tree,
+        id,
+        focus,
+        focused,
+        theme,
+        scales,
+        scale_factor,
+    )?);
+    Ok(ops)
+}
+
+/// The mesh half of [`paint_widget_ops_frame`] (60 FPS round 3): the
+/// widget's gradients, then its solids. A function of [`WidgetMeshKey`]
+/// and the theme, scales and scale factor alone, so a caller holding the
+/// ops for an equal key may reuse them (`aurora-app`'s widget paint cache).
+///
+/// # Errors
+///
+/// As [`paint_widget`].
+pub fn paint_widget_mesh_ops(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<PaintOp>, WidgetError> {
     let solids = paint_widget(tree, id, theme, scales, scale_factor)?;
     let gradients = match tree.payload(id) {
         Some(WidgetKind::ColorPickerPart(state)) => color_picker_gradients(tree, id, state, theme),
@@ -275,13 +305,66 @@ pub fn paint_widget_ops_frame(
         Some(WidgetKind::GradientBar(state)) => gradient_bar_gradients(tree, id, state, theme),
         _ => Vec::new(),
     };
-    let mut ops: Vec<PaintOp> = gradients
+    Ok(gradients
         .into_iter()
         .map(PaintOp::Gradient)
         .chain(solids.into_iter().map(PaintOp::Solid))
-        .collect();
-    // Text after the widget's own shapes (its label sits on its fill),
-    // before its focus ring (the ring outlines the whole widget).
+        .collect())
+}
+
+/// Everything [`paint_widget_mesh_ops`] reads from the tree for `id`: its
+/// payload, full bounds, whether it was text-measured, and its paint clip
+/// ([`WidgetTree::paint_clip`]). `None` for an unknown widget. **Keep this
+/// in step with the painters:** a painter that starts reading anything
+/// else of the tree (another widget's state, its style) must add it here,
+/// or a paint cache would reuse stale meshes.
+#[must_use]
+pub fn widget_mesh_key(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<WidgetMeshKey> {
+    Some(WidgetMeshKey {
+        payload: tree.payload(id)?.clone(),
+        bounds: tree.bounds(id)?,
+        measured: tree.is_measured(id),
+        clip: tree.paint_clip(id),
+    })
+}
+
+/// See [`widget_mesh_key`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct WidgetMeshKey {
+    payload: WidgetKind,
+    bounds: Rect,
+    measured: Option<bool>,
+    clip: PaintClip,
+}
+
+impl WidgetMeshKey {
+    /// Whether `tree` still holds exactly this key for `id`, without
+    /// cloning the payload.
+    #[must_use]
+    pub fn matches(&self, tree: &WidgetTree<WidgetKind>, id: WidgetId) -> bool {
+        tree.payload(id) == Some(&self.payload)
+            && tree.bounds(id) == Some(self.bounds)
+            && tree.is_measured(id) == self.measured
+            && tree.paint_clip(id) == self.clip
+    }
+}
+
+/// The overlay half of [`paint_widget_ops_frame`]: the widget's text runs
+/// and, when it anchors the focus ring, the ring. Never cached.
+///
+/// # Errors
+///
+/// As [`paint_widget_ops_frame`].
+pub fn paint_widget_overlay_ops(
+    tree: &WidgetTree<WidgetKind>,
+    id: WidgetId,
+    focus: Option<FocusPaint>,
+    focused: Option<WidgetId>,
+    theme: &Theme,
+    scales: &Scales,
+    scale_factor: f32,
+) -> Result<Vec<PaintOp>, WidgetError> {
+    let mut ops = Vec::new();
     if let Some(bounds) = tree.bounds(id)
         && let Some(clip) = clip_to_clipping_ancestors(tree, id, bounds)
     {

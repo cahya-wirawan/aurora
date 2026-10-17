@@ -433,15 +433,30 @@ impl<W> WidgetTree<W> {
     /// root's own bounds (the window). `bounds` is returned untouched
     /// when nothing clips it at all.
     pub(crate) fn visible_rect(&self, id: WidgetId, bounds: Rect) -> Option<Rect> {
+        self.paint_clip(id).apply(bounds)
+    }
+
+    /// Everything [`Self::visible_rect`] reads besides the rect it is
+    /// given (60 FPS round 3): whether `id` sits in a popover whose owner
+    /// is clipped away, and the intersection of its clipping ancestors'
+    /// edges per axis (the window's too, inside a popover). Two calls that
+    /// return equal values clip every rect alike, which is what lets a
+    /// paint cache key a widget's meshes on it.
+    #[must_use]
+    pub fn paint_clip(&self, id: WidgetId) -> PaintClip {
         let popover = self.popover_root_of(id);
         if popover.is_some_and(|popover| self.popover_owner_hidden(popover)) {
-            return None;
+            return PaintClip {
+                hidden: true,
+                x: None,
+                y: None,
+            };
         }
-        let mut left = bounds.x;
-        let mut top = bounds.y;
-        let mut right = bounds.x.saturating_add(i64::from(bounds.width));
-        let mut bottom = bounds.y.saturating_add(i64::from(bounds.height));
-        let mut clipped = false;
+        let mut x: Option<(i64, i64)> = None;
+        let mut y: Option<(i64, i64)> = None;
+        let narrow = |axis: &mut Option<(i64, i64)>, lo: i64, hi: i64| {
+            *axis = Some(axis.map_or((lo, hi), |(l, h)| (l.max(lo), h.min(hi))));
+        };
         // A popover root is not clipped by anything above it: its walk
         // starts with no ancestor at all.
         let mut current = if self.layer(id) == Some(PaintLayer::Popover) {
@@ -452,14 +467,14 @@ impl<W> WidgetTree<W> {
         while let Some(ancestor) = current {
             if let (Some(style), Some(clip)) = (self.style(ancestor), self.bounds(ancestor)) {
                 if style.overflow.x != Overflow::Visible {
-                    clipped = true;
-                    left = left.max(clip.x);
-                    right = right.min(clip.x.saturating_add(i64::from(clip.width)));
+                    narrow(&mut x, clip.x, clip.x.saturating_add(i64::from(clip.width)));
                 }
                 if style.overflow.y != Overflow::Visible {
-                    clipped = true;
-                    top = top.max(clip.y);
-                    bottom = bottom.min(clip.y.saturating_add(i64::from(clip.height)));
+                    narrow(
+                        &mut y,
+                        clip.y,
+                        clip.y.saturating_add(i64::from(clip.height)),
+                    );
                 }
             }
             // A popover root's own `Overflow::Hidden` still clips its
@@ -474,28 +489,22 @@ impl<W> WidgetTree<W> {
         if popover.is_some()
             && let Some(window) = self.bounds(self.root)
         {
-            clipped = true;
-            left = left.max(window.x);
-            top = top.max(window.y);
-            right = right.min(window.x.saturating_add(i64::from(window.width)));
-            bottom = bottom.min(window.y.saturating_add(i64::from(window.height)));
+            narrow(
+                &mut x,
+                window.x,
+                window.x.saturating_add(i64::from(window.width)),
+            );
+            narrow(
+                &mut y,
+                window.y,
+                window.y.saturating_add(i64::from(window.height)),
+            );
         }
-        // Returned untouched, not merely unchanged, when nothing clips at
-        // all: a widget whose bounds are still the default zero rect must
-        // keep painting the degenerate shape it always did, rather than
-        // being turned into nothing by an empty intersection with itself.
-        if !clipped {
-            return Some(bounds);
+        PaintClip {
+            hidden: false,
+            x,
+            y,
         }
-        if right <= left || bottom <= top {
-            return None;
-        }
-        Some(Rect {
-            x: left,
-            y: top,
-            width: u32::try_from(right - left).ok()?,
-            height: u32::try_from(bottom - top).ok()?,
-        })
     }
 
     /// Adds a new widget as the last child of `parent`, laid out per
@@ -1603,6 +1612,52 @@ impl<W> std::fmt::Debug for WidgetTree<W> {
             .field("len", &self.nodes.len())
             .field("root", &self.root)
             .finish_non_exhaustive()
+    }
+}
+
+/// What clips a widget's paint ([`WidgetTree::paint_clip`]): hidden with
+/// its popover's owner, or the `[lo, hi)` edges its clipping ancestors
+/// leave per axis (`None` = nothing clips that axis).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaintClip {
+    hidden: bool,
+    x: Option<(i64, i64)>,
+    y: Option<(i64, i64)>,
+}
+
+impl PaintClip {
+    /// `bounds` clipped: exactly what [`WidgetTree::visible_rect`] returns.
+    /// `bounds` is returned untouched when nothing clips it at all: a
+    /// widget whose bounds are still the default zero rect must keep
+    /// painting the degenerate shape it always did, rather than being
+    /// turned into nothing by an empty intersection with itself.
+    #[must_use]
+    pub fn apply(self, bounds: Rect) -> Option<Rect> {
+        if self.hidden {
+            return None;
+        }
+        if self.x.is_none() && self.y.is_none() {
+            return Some(bounds);
+        }
+        let (mut left, mut right) = (bounds.x, bounds.x.saturating_add(i64::from(bounds.width)));
+        let (mut top, mut bottom) = (bounds.y, bounds.y.saturating_add(i64::from(bounds.height)));
+        if let Some((lo, hi)) = self.x {
+            left = left.max(lo);
+            right = right.min(hi);
+        }
+        if let Some((lo, hi)) = self.y {
+            top = top.max(lo);
+            bottom = bottom.min(hi);
+        }
+        if right <= left || bottom <= top {
+            return None;
+        }
+        Some(Rect {
+            x: left,
+            y: top,
+            width: u32::try_from(right - left).ok()?,
+            height: u32::try_from(bottom - top).ok()?,
+        })
     }
 }
 

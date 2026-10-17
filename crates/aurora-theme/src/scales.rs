@@ -7,7 +7,7 @@
 
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct TypeSizeScale {
     pub xs: u32,
     pub sm: u32,
@@ -18,21 +18,21 @@ pub struct TypeSizeScale {
     pub display: u32,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct TypeWeightScale {
     pub regular: u32,
     pub medium: u32,
     pub semibold: u32,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct TypeLineHeightScale {
     pub tight: f32,
     pub normal: f32,
     pub relaxed: f32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TypeScale {
     /// Still an open placeholder in the design source itself
     /// (`design/tokens/scales.toml`: "Variable font family: TBD") — not
@@ -45,14 +45,14 @@ pub struct TypeScale {
     pub line_height: TypeLineHeightScale,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct DensityMultiplier {
     pub compact: f32,
     pub comfortable: f32,
     pub spacious: f32,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct SpacingScale {
     pub base: u32,
     pub xxs: u32,
@@ -69,7 +69,7 @@ pub struct SpacingScale {
 /// Fixed control sizes for workspace chrome (`[size]` in `scales.toml`,
 /// 0.160.0). Widths are logical px, not scaled by density;
 /// [`Self::content_panel_max_rows`] is a row count.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct SizeScale {
     /// The width of a slider in the options bar — a provisional default
     /// (224) for the design owner to tune.
@@ -95,7 +95,7 @@ pub struct SizeScale {
     pub colour_swatch: u32,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct RadiusScale {
     pub none: u32,
     pub sm: u32,
@@ -104,14 +104,14 @@ pub struct RadiusScale {
     pub pill: u32,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct ElevationLevel {
     pub blur: u32,
     pub y: u32,
     pub alpha: f32,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct ElevationScale {
     #[serde(rename = "0")]
     pub level_0: ElevationLevel,
@@ -121,28 +121,28 @@ pub struct ElevationScale {
     pub level_2: ElevationLevel,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct MotionDuration {
     pub fast: u32,
     pub base: u32,
     pub slow: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct MotionEasing {
     pub standard: String,
     pub entrance: String,
     pub exit: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct MotionScale {
     pub duration: MotionDuration,
     pub easing: MotionEasing,
 }
 
 /// The full parsed contents of `scales.toml`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Scales {
     #[serde(rename = "type")]
     pub typography: TypeScale,
