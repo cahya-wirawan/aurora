@@ -132,6 +132,15 @@ fn static_rows(title: &str) -> Vec<Row> {
                 crate::COMMAND_COLOURS_RESET,
                 "Default Foreground and Background Colours",
             ),
+            Sep,
+            Cmd(
+                crate::colour_app::COMMAND_SET_OUTPUT,
+                crate::colour_app::TITLE_SET_OUTPUT,
+            ),
+            Cmd(
+                crate::colour_app::COMMAND_CLEAR_OUTPUT,
+                crate::colour_app::TITLE_CLEAR_OUTPUT,
+            ),
         ],
         "Layer" => vec![
             Cmd(crate::COMMAND_LAYER_NEW, "New Layer"),

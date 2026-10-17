@@ -54,7 +54,7 @@
 //!   trait via a blanket `&T` impl, confirmed by reading the source
 //!   rather than assumed.
 
-use aurora_color::{IccProfile, dither_quantize, promote_u8, promote_u16};
+use aurora_color::{dither_quantize, promote_u8, promote_u16};
 use half::f16;
 use std::io::Cursor;
 use tiff::ColorType;
@@ -82,8 +82,13 @@ const ICC_PROFILE_TAG: u16 = 34675;
 ///
 /// See `decode_current_image`.
 pub fn decode(bytes: &[u8]) -> Result<Image, IoError> {
+    decode_parts(bytes)?.into_image()
+}
+
+/// [`decode`]'s body: pixels as stored plus the unjudged colour tag.
+pub(crate) fn decode_parts(bytes: &[u8]) -> Result<crate::colour_import::ImageParts, IoError> {
     let mut decoder = Decoder::new(Cursor::new(bytes))?;
-    decode_current_image(&mut decoder)
+    decode_current_parts(&mut decoder)
 }
 
 /// Decodes `bytes` into one real [`Image`] per IFD, in file order —
@@ -119,11 +124,22 @@ pub fn decode_all(bytes: &[u8]) -> Result<Vec<Image>, IoError> {
 /// tag's own bytes fail to parse, or [`IoError::TiffDecode`] for any
 /// other real decode failure.
 fn decode_current_image(decoder: &mut Decoder<Cursor<&[u8]>>) -> Result<Image, IoError> {
+    decode_current_parts(decoder)?.into_image()
+}
+
+fn decode_current_parts(
+    decoder: &mut Decoder<Cursor<&[u8]>>,
+) -> Result<crate::colour_import::ImageParts, IoError> {
     let (width, height) = decoder.dimensions()?;
     let color_type = decoder.colortype()?;
-    let color_space = match decoder.find_tag(Tag::Unknown(ICC_PROFILE_TAG))? {
-        Some(value) => IccProfile::from_bytes(&value.into_u8_vec()?)?,
-        None => IccProfile::srgb(),
+    let icc = match decoder.find_tag(Tag::Unknown(ICC_PROFILE_TAG))? {
+        Some(value) => Some(value.into_u8_vec()?),
+        None => None,
+    };
+    let tag = crate::colour_import::SourceTag {
+        icc,
+        srgb_chunk: false,
+        gray: matches!(color_type, ColorType::Gray(_) | ColorType::GrayA(_)),
     };
     let result = decoder.read_image()?;
 
@@ -194,7 +210,12 @@ fn decode_current_image(decoder: &mut Decoder<Cursor<&[u8]>>) -> Result<Image, I
         _ => unreachable!("channels is always one of the four match arms above"),
     };
 
-    Image::new(width, height, color_space, samples)
+    Ok(crate::colour_import::ImageParts {
+        width,
+        height,
+        samples,
+        tag,
+    })
 }
 
 /// `image`'s own samples, dither-quantized to 8-bit RGBA — the shared

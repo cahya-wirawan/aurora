@@ -89,45 +89,71 @@ impl Transform {
         channels: Channels,
         intent: RenderingIntent,
     ) -> Result<Self, ColorError> {
+        Self::new_with_options(src, dst, channels, intent, false)
+    }
+
+    /// [`Self::new`] with an explicit black point compensation choice.
+    /// [`Self::new`] keeps its older default (none); the colour-managed
+    /// import and export paths ask for it ([`Self::to_working`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub fn new_with_options(
+        src: &IccProfile,
+        dst: &IccProfile,
+        channels: Channels,
+        intent: RenderingIntent,
+        black_point_compensation: bool,
+    ) -> Result<Self, ColorError> {
         let intent = intent.to_lcms2();
+        let flags = if black_point_compensation {
+            lcms2::Flags::BLACKPOINT_COMPENSATION
+        } else {
+            lcms2::Flags::default()
+        };
         let inner = match channels {
             Channels::Gray => Inner::Gray(
-                lcms2::Transform::new(
+                lcms2::Transform::new_flags(
                     &src.inner,
                     lcms2::PixelFormat::GRAY_FLT,
                     &dst.inner,
                     lcms2::PixelFormat::GRAY_FLT,
                     intent,
+                    flags,
                 )
                 .map_err(ColorError::TransformCreationFailed)?,
             ),
             Channels::Rgb => Inner::Rgb(
-                lcms2::Transform::new(
+                lcms2::Transform::new_flags(
                     &src.inner,
                     lcms2::PixelFormat::RGB_FLT,
                     &dst.inner,
                     lcms2::PixelFormat::RGB_FLT,
                     intent,
+                    flags,
                 )
                 .map_err(ColorError::TransformCreationFailed)?,
             ),
             Channels::Rgba => Inner::Rgba(
-                lcms2::Transform::new(
+                lcms2::Transform::new_flags(
                     &src.inner,
                     lcms2::PixelFormat::RGBA_FLT,
                     &dst.inner,
                     lcms2::PixelFormat::RGBA_FLT,
                     intent,
+                    flags,
                 )
                 .map_err(ColorError::TransformCreationFailed)?,
             ),
             Channels::Cmyk => Inner::Cmyk(
-                lcms2::Transform::new(
+                lcms2::Transform::new_flags(
                     &src.inner,
                     lcms2::PixelFormat::CMYK_FLT,
                     &dst.inner,
                     lcms2::PixelFormat::CMYK_FLT,
                     intent,
+                    flags,
                 )
                 .map_err(ColorError::TransformCreationFailed)?,
             ),

@@ -129,6 +129,8 @@ use half::f16;
 use crate::error::IoError;
 use crate::image::Image;
 
+#[cfg(test)]
+mod colour_tests;
 mod descriptor;
 mod effects;
 #[cfg(test)]
@@ -409,6 +411,9 @@ pub struct PsdDocument {
     /// restart at zero for every new tree.
     pub masks: Vec<PsdMaskPixels>,
     pub report: PsdImportReport,
+    /// What the open did about colour (profile kept as metadata, calm
+    /// info lines). Warnings are in [`Self::report`].
+    pub colour: crate::ColourImport,
 }
 
 /// One pixel layer's decoded image, placed in its layer's surface.
@@ -562,6 +567,7 @@ enum Note {
     BrokenGroups,
     ExtraChannels,
     ColorProfileIgnored,
+    ColorProfileTooLarge,
     /// A Grayscale file is held as RGB (grey on all three channels); a PSD
     /// save writes RGB (0.249.0).
     GrayscaleHeldAsRgb,
@@ -569,7 +575,14 @@ enum Note {
 }
 
 #[derive(Debug, Default)]
-struct Notes(BTreeMap<Note, u64>, Vec<String>, grey_profile::GreyProfile);
+struct Notes(
+    BTreeMap<Note, u64>,
+    Vec<String>,
+    grey_profile::GreyProfile,
+    /// Resource 1039's bytes, when present and within
+    /// `aurora_color::MAX_PROFILE_BYTES` (colour-managed open).
+    Option<Vec<u8>>,
+);
 
 impl Notes {
     /// The file's grey profile (task 112): what resource 1039 gave.
@@ -1071,6 +1084,9 @@ fn note_text(note: Note, n: u64) -> String {
         Note::ColorProfileIgnored => "The file's embedded colour profile was ignored; its \
                                       colours are treated as sRGB."
             .to_owned(),
+        Note::ColorProfileTooLarge => "The file's embedded colour profile is larger than \
+                                       allowed and was ignored; its colours are treated as sRGB."
+            .to_owned(),
         Note::GrayscaleHeldAsRgb => "This Grayscale file is held as RGB (the grey on all three \
                                      channels); saving it as a PSD writes an RGB file, not \
                                      Grayscale."
@@ -1518,8 +1534,10 @@ fn scan_resources(data: &[u8], notes: &mut Notes) -> f32 {
         if size % 2 == 1 && r.skip(1, "resource padding").is_err() {
             return angle;
         }
-        if id == 1039 && !looks_like_srgb(body) {
-            notes.add(Note::ColorProfileIgnored);
+        if id == 1039 && notes.3.is_none() && body.len() <= aurora_color::MAX_PROFILE_BYTES {
+            notes.3 = Some(body.to_vec());
+        } else if id == 1039 && body.len() > aurora_color::MAX_PROFILE_BYTES {
+            notes.add(Note::ColorProfileTooLarge);
         }
         if id == 1039 && notes.2 == grey_profile::GreyProfile::Absent {
             notes.2 = grey_profile::classify(body);
@@ -5083,6 +5101,47 @@ pub fn merged_image(bytes: &[u8]) -> Result<Image, IoError> {
     decode_merged(&mut r, header, false)
 }
 
+/// [`merged_image`], converted from the file's embedded RGB profile into
+/// the working space exactly as an open converts the layers (the corpus
+/// audit compares an opened document with this, so both must be in the
+/// same space). A file with no usable non-sRGB profile is [`merged_image`]
+/// unchanged.
+///
+/// **The audit's basis changed with colour management.** For a file whose
+/// profile is not sRGB, the opened document is now in sRGB (layers
+/// converted, then clipped to `0..=1`), so the audit compares it with this
+/// converted-and-clipped merged image, not with the stored one. Audit
+/// numbers for such files before and after colour management are therefore
+/// not on one basis; `psd_audit_tests` records the same-basis comparison.
+///
+/// # Errors
+///
+/// As [`merged_image`].
+pub fn merged_image_in_working_space(bytes: &[u8]) -> Result<Image, IoError> {
+    let mut image = merged_image(bytes)?;
+    let mut r = Reader::new(bytes);
+    let header = read_header(&mut r)?;
+    let color = r.length(false, "colour mode data length")?;
+    r.skip(color, "colour mode data")?;
+    let resources = r.length(false, "image resources length")?;
+    let data = r.take(resources, "image resources")?;
+    let mut notes = Notes::default();
+    let _angle = scan_resources(data, &mut notes);
+    let embedded = notes.3.take();
+    let plan = plan_colour(embedded.as_deref(), header.gray(), &mut notes);
+    if let Some(profile) = &plan.convert_from
+        && crate::convert_profile_rgba(
+            image.samples_mut(),
+            profile,
+            crate::ConvertDirection::ToWorking,
+        )
+        .is_ok()
+    {
+        crate::clamp_colour_unit(image.samples_mut());
+    }
+    Ok(image)
+}
+
 /// Builds a real Aurora document from a decoded file: every layer and
 /// group, in the file's own stacking order (Aurora lists top-first, so
 /// each level is walked bottom-to-top and inserted at index 0), with its
@@ -5151,6 +5210,8 @@ pub struct PsdStreamedDocument {
     pub history: History,
     pub canvas_size: (u32, u32),
     pub report: PsdImportReport,
+    /// See [`PsdDocument::colour`].
+    pub colour: crate::ColourImport,
 }
 
 /// The sink [`build_document`] and [`read`] collect into.
@@ -5169,6 +5230,7 @@ impl Collect {
             pixels: self.pixels,
             masks: self.masks,
             report: document.report,
+            colour: document.colour,
         }
     }
 }
@@ -5187,6 +5249,7 @@ impl PsdPixelSink for Collect {
 
 /// [`build_document`]'s body (0.154.0), handing pixels to `sink` and
 /// decoding each pending layer from `src` as it is reached.
+#[allow(clippy::too_many_lines)] // the colour plan and its report lines (round 1)
 fn build_streamed(
     file: PsdFile,
     src: Option<&mut dyn ByteSource>,
@@ -5217,7 +5280,16 @@ fn build_streamed(
     }
     let mut history = History::new();
     let profile = SharedProfile::new();
+    // Colour management (round 1): judge the embedded profile once, before
+    // any pixel is decoded, so every layer image is converted on its way
+    // to the sink. A Grayscale file keeps its old handling.
+    let gray = notes.0.contains_key(&Note::GrayscaleHeldAsRgb);
+    let embedded = notes.3.take();
+    let plan = plan_colour(embedded.as_deref(), gray, &mut notes);
     let mut builder = Builder {
+        to_working: plan.convert_from,
+        adjustments_seen: 0,
+        conversion_failed: 0,
         layers: &mut layers,
         history: &mut history,
         sink,
@@ -5228,7 +5300,8 @@ fn build_streamed(
         clip_adjustments_refused: 0,
     };
     if nodes.is_empty() {
-        if let Some(image) = composite {
+        if let Some(mut image) = composite {
+            builder.bring_image_into_working(&mut image);
             let bounds = Rect {
                 width: image.width(),
                 height: image.height(),
@@ -5246,6 +5319,42 @@ fn build_streamed(
     } else {
         builder.add_nodes(nodes, None, 0)?;
     }
+    let mut colour = plan.colour;
+    let mut extra_items: Vec<String> = plan.warnings;
+    if builder.conversion_failed > 0 {
+        extra_items.push(format!(
+            "{} layer{} could not be converted from the file's colour profile and {} shown as \
+             stored (treated as sRGB).",
+            builder.conversion_failed,
+            if builder.conversion_failed == 1 {
+                ""
+            } else {
+                "s"
+            },
+            if builder.conversion_failed == 1 {
+                "is"
+            } else {
+                "are"
+            },
+        ));
+    }
+    if let Some(source) = &colour.source {
+        let line = crate::colour_import::converted_on_open_line(&source.description, true);
+        extra_items.push(if builder.conversion_failed > 0 {
+            // Not every layer converted: do not claim the whole file did.
+            line.replacen("The colours were", "The other layers' colours were", 1)
+        } else {
+            line
+        });
+    }
+    if colour.source.is_some() && builder.adjustments_seen > 0 {
+        extra_items.push(
+            "The colours were converted to sRGB when the file was opened, but its adjustment \
+             layers (and any layer effects) compute in sRGB, not in the file's own profile, so \
+             they can differ from Photoshop."
+                .to_owned(),
+        );
+    }
     notes.add_n(Note::ClippingDropped, builder.clip_refused);
     notes.add_n(
         Note::AdjustmentClipNotApplied,
@@ -5256,17 +5365,89 @@ fn build_streamed(
     // `?`; only the tree build's mask decode swallows one, and
     // `decode_source` checks for that before it returns.
     history.clear_undo();
+    let mut report = notes.report();
+    report.items.extend(extra_items);
+    colour.report.warnings.clear();
     Ok(PsdStreamedDocument {
         layers,
         history,
         canvas_size: (width, height),
-        report: notes.report(),
+        report,
+        colour,
     })
+}
+
+/// What the embedded profile means for this open.
+struct ColourPlan {
+    /// The profile bytes to convert layers from, when they need converting.
+    convert_from: Option<Vec<u8>>,
+    colour: crate::ColourImport,
+    /// Report lines for the "Opened With Changes" dialog.
+    warnings: Vec<String>,
+}
+
+/// Judges resource 1039 (`embedded`) for an RGB file; a Grayscale file
+/// keeps its older note (the profile is not applied). No profile at all is
+/// an info line, not a warning.
+fn plan_colour(embedded: Option<&[u8]>, gray: bool, notes: &mut Notes) -> ColourPlan {
+    let mut plan = ColourPlan {
+        convert_from: None,
+        colour: crate::ColourImport::default(),
+        warnings: Vec::new(),
+    };
+    let Some(bytes) = embedded else {
+        if !gray {
+            plan.colour
+                .report
+                .info
+                .push("No colour profile: assumed sRGB.".to_owned());
+        }
+        return plan;
+    };
+    if gray {
+        if !looks_like_srgb(bytes) {
+            notes.add(Note::ColorProfileIgnored);
+        }
+        return plan;
+    }
+    match aurora_color::inspect_rgb_source(bytes) {
+        Err(problem) => plan.warnings.push(format!(
+            "The file's embedded colour profile was not used ({}); its colours are treated as sRGB.",
+            problem.describe()
+        )),
+        Ok(source) if source.equivalent_to_srgb => {}
+        Ok(source) => match aurora_color::Transform::to_working(&source.profile) {
+            Ok(_checked) => {
+                plan.colour.report.info.push(format!(
+                    "Converted from \"{}\" to sRGB.",
+                    source.description
+                ));
+                plan.colour.source = Some(crate::SourceProfile {
+                    bytes: bytes.to_vec(),
+                    description: source.description,
+                });
+                plan.convert_from = Some(bytes.to_vec());
+            }
+            Err(_) => plan.warnings.push(
+                "The file's embedded colour profile could not be used for a conversion; its \
+                 colours are treated as sRGB."
+                    .to_owned(),
+            ),
+        },
+    }
+    plan
 }
 
 /// `'k` and `'s` are the sink's and the source's own lifetimes, kept apart
 /// from `'b` because a `&mut dyn` trait object's lifetime is invariant.
 struct Builder<'b, 'k, 's> {
+    /// The embedded profile's conversion into the working space, when the
+    /// file's colours are not sRGB.
+    to_working: Option<Vec<u8>>,
+    /// Adjustment layers added (the conversion note names them).
+    adjustments_seen: u64,
+    /// Layers whose colour conversion failed and were left as stored.
+    conversion_failed: u64,
     layers: &'b mut LayerTree,
     history: &'b mut History,
     sink: &'b mut (dyn PsdPixelSink + 'k),
@@ -5281,6 +5462,35 @@ struct Builder<'b, 'k, 's> {
 }
 
 impl Builder<'_, '_, '_> {
+    /// Converts `image` from the file's profile into the working space, in
+    /// place, when the file has one worth converting.
+    ///
+    /// All or nothing (`convert_profile_rgba` stages before it writes): a
+    /// layer whose conversion fails keeps its stored colours and is counted
+    /// for the report. A converted layer is then clamped to `0..=1`
+    /// (PSD layers feed blend modes, adjustment tables and effects that
+    /// assume in-gamut colour; Photoshop clips out-of-gamut colour when it
+    /// converts to sRGB too).
+    fn bring_image_into_working(&mut self, image: &mut Image) {
+        let Some(profile) = &self.to_working else {
+            return;
+        };
+        match crate::convert_profile_rgba(
+            image.samples_mut(),
+            profile,
+            crate::ConvertDirection::ToWorking,
+        ) {
+            Ok(()) => crate::clamp_colour_unit(image.samples_mut()),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "a layer's colour conversion failed; its colours are left as stored"
+                );
+                self.conversion_failed = self.conversion_failed.saturating_add(1);
+            }
+        }
+    }
+
     /// Counts `id` when it is an adjustment layer shown unclipped.
     fn note_adjustment_unclipped(&mut self, id: LayerId) {
         if self.layers.adjustment(id).is_some() {
@@ -5291,6 +5501,7 @@ impl Builder<'_, '_, '_> {
     /// Recursion depth is bounded by [`MAX_GROUP_DEPTH`] ([`decode`]
     /// refuses deeper files, and this re-checks rather than trusting a
     /// hand-built [`PsdFile`]).
+    #[allow(clippy::too_many_lines)] // one more step per layer (colour conversion)
     fn add_nodes(
         &mut self,
         nodes: Vec<PsdNode>,
@@ -5338,7 +5549,7 @@ impl Builder<'_, '_, '_> {
                     // Decoded here, after the layer exists and its mask is
                     // attached, and handed on before the next layer's
                     // channels are read (0.154.0).
-                    let image = match (layer.image, layer.pending) {
+                    let mut image = match (layer.image, layer.pending) {
                         (Some(image), _) => Some(image),
                         (None, Some(pending)) => {
                             let Some(src) = self.src.as_deref_mut() else {
@@ -5348,6 +5559,9 @@ impl Builder<'_, '_, '_> {
                         }
                         (None, None) => None,
                     };
+                    if let Some(image) = image.as_mut() {
+                        self.bring_image_into_working(image);
+                    }
                     if let (Some(image), Some(smart)) = (&image, layer.smart) {
                         // The fingerprint of the pixels as they will sit in
                         // the layer's surface, so a later save can tell
@@ -5384,6 +5598,7 @@ impl Builder<'_, '_, '_> {
                         parent,
                         0,
                     )?;
+                    self.adjustments_seen = self.adjustments_seen.saturating_add(1);
                     self.apply(id, &adjustment.props)?;
                     if let Some(mask) = adjustment.mask {
                         self.attach_mask(id, mask, self.canvas)?;

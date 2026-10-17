@@ -1509,3 +1509,65 @@ fn a_grayscale_open_carries_the_colour_mode_change_into_the_save_report() {
         "{lines:?}"
     );
 }
+
+fn adobe_source() -> aurora_io::SourceProfile {
+    let Ok(p) = aurora_color::IccProfile::synthetic_rgb(
+        [0.3127, 0.3290],
+        [[0.64, 0.33], [0.21, 0.71], [0.15, 0.06]],
+        2.199_218_75,
+    ) else {
+        unreachable!()
+    };
+    let Ok(bytes) = p.to_bytes() else {
+        unreachable!()
+    };
+    aurora_io::SourceProfile {
+        description: "Adobe RGB (1998)".to_owned(),
+        bytes,
+    }
+}
+
+#[test]
+fn a_document_converted_from_another_profile_makes_the_psd_save_ask() {
+    // A flat, otherwise lossless document saves without a dialog...
+    let mut doc = Doc::new();
+    let clean = doc.path("clean.psd");
+    assert!(matches!(
+        ok(doc.save_carrying(&clean, Vec::new())),
+        PsdSaveStep::Saved
+    ));
+    // ...but one with a source profile carries the itemised line and asks.
+    let colour = aurora_io::DocumentColour {
+        source: Some(adobe_source()),
+        output: None,
+    };
+    let lines = crate::psd_save::colour_loss_lines(&colour);
+    assert_eq!(lines.len(), 1);
+    let line = lines.first().cloned().unwrap_or_default();
+    assert!(line.contains("Adobe RGB (1998)"), "{line}");
+    assert!(line.contains("saved as sRGB"), "{line}");
+    assert!(line.contains("not kept"), "{line}");
+    assert!(line.contains("clipped"), "{line}");
+    let target = doc.path("converted.psd");
+    let PsdSaveStep::NeedsConfirmation(pending) = ok(doc.save_carrying(&target, lines.clone()))
+    else {
+        unreachable!("a converted document must ask before a Photoshop save")
+    };
+    assert_eq!(pending.report.items, lines);
+    // Nothing without a source profile; an output profile is itemised too.
+    assert!(crate::psd_save::colour_loss_lines(&aurora_io::DocumentColour::default()).is_empty());
+    let both = crate::psd_save::colour_loss_lines(&aurora_io::DocumentColour {
+        source: None,
+        output: Some(adobe_source()),
+    });
+    assert_eq!(both.len(), 1);
+    assert!(both.first().is_some_and(|l| l.contains("output profile")));
+}
+
+#[test]
+fn the_conversion_is_kept_in_the_import_losses_text() {
+    let line = aurora_io::converted_on_open_line("Adobe RGB (1998)", false);
+    assert!(line.contains("converted from \"Adobe RGB (1998)\" to sRGB"));
+    assert!(!line.contains("clipped"));
+    assert!(aurora_io::converted_on_open_line("X", true).contains("clipped"));
+}

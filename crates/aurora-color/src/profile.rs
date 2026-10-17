@@ -31,6 +31,62 @@ impl IccProfile {
         }
     }
 
+    /// A synthetic RGB matrix/gamma profile: `white` and the three
+    /// `primaries` are CIE xy chromaticities, `gamma` a pure power curve
+    /// (`0` means the sRGB parametric curve). Lets tests, and tools that
+    /// need one, make an Adobe-RGB- or Display-P3-like profile without a
+    /// file.
+    ///
+    /// # Errors
+    ///
+    /// [`ColorError::InvalidProfile`] if `lcms2` rejects the chromaticities.
+    pub fn synthetic_rgb(
+        white: [f64; 2],
+        primaries: [[f64; 2]; 3],
+        gamma: f64,
+    ) -> Result<Self, ColorError> {
+        let xyy = |p: [f64; 2]| lcms2::CIExyY {
+            x: p[0],
+            y: p[1],
+            Y: 1.0,
+        };
+        let curve = if gamma == 0.0 {
+            lcms2::ToneCurve::new_parametric(
+                4,
+                &[2.4, 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045],
+            )
+            .map_err(ColorError::InvalidProfile)?
+        } else {
+            lcms2::ToneCurve::new(gamma)
+        };
+        let triple = lcms2::CIExyYTRIPLE {
+            Red: xyy(primaries[0]),
+            Green: xyy(primaries[1]),
+            Blue: xyy(primaries[2]),
+        };
+        let inner = lcms2::Profile::new_rgb(&xyy(white), &triple, &[&curve, &curve, &curve])
+            .map_err(ColorError::InvalidProfile)?;
+        Ok(Self { inner })
+    }
+
+    /// A synthetic grayscale profile (D65 white, a pure power `gamma`
+    /// curve): for tests of the wrong-colour-space refusal and of grey
+    /// imports.
+    ///
+    /// # Errors
+    ///
+    /// [`ColorError::InvalidProfile`] if `lcms2` rejects it.
+    pub fn synthetic_gray(gamma: f64) -> Result<Self, ColorError> {
+        let curve = lcms2::ToneCurve::new(gamma);
+        let white = lcms2::CIExyY {
+            x: 0.3127,
+            y: 0.3290,
+            Y: 1.0,
+        };
+        let inner = lcms2::Profile::new_gray(&white, &curve).map_err(ColorError::InvalidProfile)?;
+        Ok(Self { inner })
+    }
+
     /// Re-serializes this profile back to raw ICC bytes — [`Self::from_bytes`]'s
     /// own inverse, what a caller needs to embed a real profile into a
     /// file (a `.aur` document's own manifest, or eventually a PNG/TIFF

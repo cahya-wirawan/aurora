@@ -45,7 +45,7 @@
 //!   file written with the new `sRGB` chunk looks like on the way back
 //!   in.
 
-use aurora_color::{IccProfile, dither_quantize, promote_u8, promote_u16, quantize_u16};
+use aurora_color::{dither_quantize, promote_u8, promote_u16, quantize_u16};
 use half::f16;
 
 use crate::error::IoError;
@@ -63,14 +63,22 @@ use crate::image::Image;
 /// produce — see this module's own doc comment), or [`IoError::Color`]
 /// if the source file's own embedded `iCCP` profile fails to parse.
 pub fn decode(bytes: &[u8]) -> Result<Image, IoError> {
+    decode_parts(bytes)?.into_image()
+}
+
+/// [`decode`]'s body: the pixels exactly as stored, and the colour tag the
+/// file carried, unjudged (colour-managed import judges it).
+pub(crate) fn decode_parts(bytes: &[u8]) -> Result<crate::colour_import::ImageParts, IoError> {
     let mut decoder = png::Decoder::new(bytes);
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
     let mut reader = decoder.read_info()?;
-    let color_space = match &reader.info().icc_profile {
-        Some(bytes) => IccProfile::from_bytes(bytes)?,
-        // No `iCCP` chunk at all -- PNG's own convention for an
-        // untagged file, the same default this crate has always used.
-        None => IccProfile::srgb(),
+    let tag = crate::colour_import::SourceTag {
+        icc: reader.info().icc_profile.as_ref().map(|c| c.to_vec()),
+        srgb_chunk: reader.info().srgb.is_some(),
+        gray: matches!(
+            reader.info().color_type,
+            png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha
+        ),
     };
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf)?;
@@ -117,7 +125,12 @@ pub fn decode(bytes: &[u8]) -> Result<Image, IoError> {
         crate::channels::gray_alpha_to_rgba(&promoted)
     };
 
-    Image::new(info.width, info.height, color_space, samples)
+    Ok(crate::colour_import::ImageParts {
+        width: info.width,
+        height: info.height,
+        samples,
+        tag,
+    })
 }
 
 /// Builds the `png::Info` [`encode`]/[`encode_16`] both encode against:

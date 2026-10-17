@@ -29,6 +29,7 @@ pub(crate) struct AurSaveSource<'a> {
     pub(crate) skipped_tiles: &'a aurora_io::SkippedTiles,
     pub(crate) import_losses: Option<&'a [String]>,
     pub(crate) selection: &'a aurora_doc::SelectionSet,
+    pub(crate) colour: &'a aurora_io::DocumentColour,
 }
 
 /// Writes `path` safely: `write` fills a fresh temp file, `verify` (given
@@ -76,7 +77,7 @@ pub(crate) fn save_aur_document_with(
     replace_aur_verified(
         path,
         |file| {
-            aurora_io::write_aur_with_import_losses(
+            aurora_io::write_aur_with_import_losses_and_colour(
                 file,
                 source.layers,
                 source.history,
@@ -90,6 +91,7 @@ pub(crate) fn save_aur_document_with(
                 // The selection in force (while Quick Mask is on, the
                 // one it started from).
                 Some(source.selection),
+                Some(source.colour),
                 store,
             )
         },

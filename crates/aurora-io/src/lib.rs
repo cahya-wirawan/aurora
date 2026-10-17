@@ -32,11 +32,13 @@
 //! `LayerTree`/`History` shape `.aur` does; writing PSD/PSB remains open.
 
 pub mod aur;
+mod aur_colour;
 mod aur_paths;
 mod aur_selection;
 #[cfg(test)]
 mod aur_zip_compat_tests;
 mod channels;
+mod colour_import;
 mod error;
 mod image;
 pub mod import;
@@ -52,7 +54,15 @@ pub use aur::{
     snapshot_best_effort as snapshot_aur_best_effort, write as write_aur,
     write_best_effort as write_aur_best_effort,
     write_best_effort_with_import_losses as write_aur_best_effort_with_import_losses,
+    write_best_effort_with_import_losses_and_colour as write_aur_best_effort_with_import_losses_and_colour,
     write_snapshot as write_aur_snapshot, write_with_import_losses as write_aur_with_import_losses,
+    write_with_import_losses_and_colour as write_aur_with_import_losses_and_colour,
+};
+pub use aur_colour::DocumentColour;
+pub use colour_import::{
+    ColourImport, ColourReport, ConvertDirection, SourceProfile, Tagging, bring_into_working,
+    clamp_colour_unit, convert_profile_rgba, convert_rgba, converted_on_open_line,
+    decode_to_working,
 };
 pub use error::{IoError, psd_color_mode_name};
 pub use image::Image;
@@ -69,7 +79,8 @@ pub use psd::{
     PsdDocument, PsdImportReport, PsdMaskPixels, PsdPixelSink, PsdPixels, PsdStreamedDocument,
     build_document as build_psd_document, decode as decode_psd,
     encode_mask_pixels as encode_psd_mask, merged_image as decode_psd_merged_image,
-    read as read_psd, read_streaming as read_psd_streaming, write_mask_pixels as write_psd_mask,
+    merged_image_in_working_space as decode_psd_merged_image_in_working_space, read as read_psd,
+    read_streaming as read_psd_streaming, write_mask_pixels as write_psd_mask,
 };
 pub use safe_save::{
     DIR_SYNC_ADVISORY, VerifiedTemp, replace_verified, replace_verified_advised,

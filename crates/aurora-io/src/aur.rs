@@ -1709,6 +1709,7 @@ pub fn write<W: Write + Seek>(
             unreadable: UnreadableTile::Refuse,
             import_losses: None,
             selection: None,
+            colour: None,
         },
         store,
     )?;
@@ -2045,6 +2046,7 @@ pub fn write_best_effort<W: Write + Seek>(
             unreadable: UnreadableTile::Skip,
             import_losses: None,
             selection: None,
+            colour: None,
         },
         store,
     )
@@ -2080,6 +2082,7 @@ pub fn write_with_import_losses<W: Write + Seek>(
             unreadable: UnreadableTile::Refuse,
             import_losses,
             selection,
+            colour: None,
         },
         store,
     )?;
@@ -2115,6 +2118,80 @@ pub fn write_best_effort_with_import_losses<W: Write + Seek>(
             unreadable: UnreadableTile::Skip,
             import_losses,
             selection,
+            colour: None,
+        },
+        store,
+    )
+}
+
+/// [`write_with_import_losses`], also recording the document's colour
+/// metadata as the optional `colour` entry.
+///
+/// # Errors
+///
+/// As [`write()`].
+#[allow(clippy::too_many_arguments)]
+pub fn write_with_import_losses_and_colour<W: Write + Seek>(
+    writer: W,
+    layers: &LayerTree,
+    history: &History,
+    canvas_size: (u32, u32),
+    profile: Option<&aurora_color::IccProfile>,
+    known_missing: &SkippedTiles,
+    import_losses: Option<&[String]>,
+    selection: Option<&aurora_doc::SelectionSet>,
+    colour: Option<&crate::aur_colour::DocumentColour>,
+    store: &mut TileStore,
+) -> Result<(), IoError> {
+    let _empty = write_with_policy(
+        writer,
+        layers,
+        history,
+        canvas_size,
+        WritePolicy {
+            profile,
+            known_missing,
+            unreadable: UnreadableTile::Refuse,
+            import_losses,
+            selection,
+            colour,
+        },
+        store,
+    )?;
+    Ok(())
+}
+
+/// [`write_best_effort_with_import_losses`], also recording the colour
+/// metadata.
+///
+/// # Errors
+///
+/// As [`write_best_effort`].
+#[allow(clippy::too_many_arguments)]
+pub fn write_best_effort_with_import_losses_and_colour<W: Write + Seek>(
+    writer: W,
+    layers: &LayerTree,
+    history: &History,
+    canvas_size: (u32, u32),
+    profile: Option<&aurora_color::IccProfile>,
+    known_missing: &SkippedTiles,
+    import_losses: Option<&[String]>,
+    selection: Option<&aurora_doc::SelectionSet>,
+    colour: Option<&crate::aur_colour::DocumentColour>,
+    store: &mut TileStore,
+) -> Result<Vec<SkippedTile>, IoError> {
+    write_with_policy(
+        writer,
+        layers,
+        history,
+        canvas_size,
+        WritePolicy {
+            profile,
+            known_missing,
+            unreadable: UnreadableTile::Skip,
+            import_losses,
+            selection,
+            colour,
         },
         store,
     )
@@ -2149,6 +2226,8 @@ struct WritePolicy<'a> {
     import_losses: Option<&'a [String]>,
     /// The selections to persist (0.218.0).
     selection: Option<&'a aurora_doc::SelectionSet>,
+    /// The document's source/output colour profiles.
+    colour: Option<&'a crate::aur_colour::DocumentColour>,
 }
 
 fn write_with_policy<W: Write + Seek>(
@@ -2165,6 +2244,7 @@ fn write_with_policy<W: Write + Seek>(
         unreadable,
         import_losses,
         selection,
+        colour,
     } = policy;
     // Before a single byte is written: every rectangle the tile loop
     // below will derive a grid from, range-checked, and their grids
@@ -2185,6 +2265,7 @@ fn write_with_policy<W: Write + Seek>(
     let mut header = DocumentEntries::build(layers, history, canvas_size, profile)?;
     header.import_losses = encode_import_losses(import_losses)?;
     header.selection = selection.cloned();
+    header.colour = crate::aur_colour::encode_colour(colour)?;
     header.write_to(&mut zip, stored, deflated)?;
 
     for (surface, bounds) in persisted_surfaces(layers) {
@@ -2324,6 +2405,8 @@ struct DocumentEntries {
     /// entry is encoded when written, so a background autosave does its
     /// compression off the UI thread (masks are shared, not copied).
     selection: Option<aurora_doc::SelectionSet>,
+    /// The `colour` entry's bytes, when the document has colour metadata.
+    colour: Option<Vec<u8>>,
     /// [`SMART_OBJECTS_ENTRY`] and the embedded files, when the document
     /// has any (0.200.0).
     smart_objects: Option<SmartEntries>,
@@ -2426,6 +2509,7 @@ impl DocumentEntries {
             layer_clipping,
             import_losses: None,
             selection: None,
+            colour: None,
             smart_objects: smart_entries(layers)?,
         })
     }
@@ -2485,6 +2569,10 @@ impl DocumentEntries {
         }
         if let Some(bytes) = &self.import_losses {
             zip.start_file(IMPORT_LOSSES_ENTRY, deflated)?;
+            zip.write_all(bytes)?;
+        }
+        if let Some(bytes) = &self.colour {
+            zip.start_file(crate::aur_colour::COLOUR_ENTRY, deflated)?;
             zip.write_all(bytes)?;
         }
         if let Some(set) = &self.selection
@@ -2556,6 +2644,20 @@ impl AurSnapshot {
     /// [`IoError::ManifestSerialization`] if the lines cannot be encoded.
     pub fn set_import_losses(&mut self, lines: Option<&[String]>) -> Result<(), IoError> {
         self.entries.import_losses = encode_import_losses(lines)?;
+        Ok(())
+    }
+
+    /// Records the colour metadata to write as the optional `colour`
+    /// entry; `None` or an empty value writes none.
+    ///
+    /// # Errors
+    ///
+    /// [`IoError::ManifestSerialization`] if it cannot be encoded.
+    pub fn set_colour(
+        &mut self,
+        colour: Option<&crate::aur_colour::DocumentColour>,
+    ) -> Result<(), IoError> {
+        self.entries.colour = crate::aur_colour::encode_colour(colour)?;
         Ok(())
     }
 
@@ -2816,6 +2918,11 @@ pub struct AurDocument {
     /// `None` when it restored or was absent. A newer version refuses the
     /// whole open instead.
     pub selection_dropped: Option<String>,
+    /// The document's source/output colour profiles (the optional
+    /// `colour` entry); empty when the file has none.
+    pub colour: crate::aur_colour::DocumentColour,
+    /// Why the `colour` entry was dropped, when it was.
+    pub colour_dropped: Option<String>,
 }
 
 /// Reads a complete `.aur` document from `reader`, writing every
@@ -2951,6 +3058,16 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
         }
     }
 
+    let (colour, colour_dropped) = match crate::aur_colour::read_colour(&mut zip)? {
+        crate::aur_colour::ColourRead::Absent => {
+            (crate::aur_colour::DocumentColour::default(), None)
+        }
+        crate::aur_colour::ColourRead::Restored(c, why) => (c, why),
+        crate::aur_colour::ColourRead::Dropped(why) => {
+            (crate::aur_colour::DocumentColour::default(), Some(why))
+        }
+    };
+
     // Every tile this scan commits is recorded, and undone if the scan
     // does not finish -- see `read_persisted_tiles` for why a partial
     // read must not survive. `elided` is the same idea for the
@@ -2976,6 +3093,8 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
         import_losses,
         selection,
         selection_dropped,
+        colour,
+        colour_dropped,
     })
 }
 
