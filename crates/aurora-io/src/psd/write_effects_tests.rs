@@ -748,5 +748,7 @@ fn nothing_to_write_gives_no_block() {
         global_angle: 120.0,
         patterns: tree.patterns(),
     };
-    assert!(write_effects::encode(&LayerEffects::default(), None, &ctx).is_none());
+    let (encoded, lost) = write_effects::encode(&LayerEffects::default(), None, &ctx);
+    assert!(encoded.is_none());
+    assert_eq!(lost, write_effects::EffectLosses::default());
 }

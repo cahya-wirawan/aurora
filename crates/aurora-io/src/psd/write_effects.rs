@@ -443,7 +443,6 @@ pub(super) struct Encoded {
     pub fxrp: Option<[u8; 16]>,
     /// The patterns the block names.
     pub patterns: Vec<String>,
-    pub losses: EffectLosses,
 }
 
 /// The global light angle for the file and whether it had to be rounded:
@@ -786,14 +785,29 @@ fn push_kind(root: &mut Items, single: &'static str, multi: &'static str, mut va
     }
 }
 
-/// `fx` as an `lfx2` block, its `fxrp` and the patterns it names. `None`
-/// when no effect can be written. `bounds` is the layer's bounds (pattern
-/// origins are relative to them).
-pub(super) fn encode(fx: &LayerEffects, bounds: Option<Rect>, ctx: &Ctx<'_>) -> Option<Encoded> {
+/// `fx` as an `lfx2` block, its `fxrp` and the patterns it names (`None`
+/// when no effect can be written), and what was left out or rounded
+/// (reported even when nothing could be written). `bounds` is the layer's
+/// bounds (pattern origins are relative to them).
+pub(super) fn encode(
+    fx: &LayerEffects,
+    bounds: Option<Rect>,
+    ctx: &Ctx<'_>,
+) -> (Option<Encoded>, EffectLosses) {
+    let mut loss = EffectLosses::default();
+    let encoded = encode_into(fx, bounds, ctx, &mut loss);
+    (encoded, loss)
+}
+
+fn encode_into(
+    fx: &LayerEffects,
+    bounds: Option<Rect>,
+    ctx: &Ctx<'_>,
+    loss: &mut EffectLosses,
+) -> Option<Encoded> {
     if fx.validate().is_err() {
         return None;
     }
-    let mut loss = EffectLosses::default();
     let mut place = PatternPlace::default();
     let mut root: Items = vec![
         ("Scl ", percent(f64::from(fx.scale))),
@@ -802,7 +816,7 @@ pub(super) fn encode(fx: &LayerEffects, bounds: Option<Rect>, ctx: &Ctx<'_>) -> 
     let shadows: Vec<Value> = fx
         .drop_shadows
         .iter()
-        .map(|s| drop_shadow(s, ctx, &mut loss))
+        .map(|s| drop_shadow(s, ctx, &mut *loss))
         .collect();
     push_kind(&mut root, "DrSh", "dropShadowMulti", shadows);
     let fills: Vec<Value> = fx.color_overlays.iter().map(color_overlay).collect();
@@ -810,23 +824,23 @@ pub(super) fn encode(fx: &LayerEffects, bounds: Option<Rect>, ctx: &Ctx<'_>) -> 
     let strokes: Vec<Value> = fx
         .strokes
         .iter()
-        .filter_map(|s| stroke(s, ctx, bounds, &mut place, &mut loss))
+        .filter_map(|s| stroke(s, ctx, bounds, &mut place, &mut *loss))
         .collect();
     push_kind(&mut root, "FrFX", "frameFXMulti", strokes);
     if let Some(glow) = fx.outer_glows.first() {
-        root.push(("OrGl", outer_glow(glow, &mut loss)));
+        root.push(("OrGl", outer_glow(glow, &mut *loss)));
     }
     loss.extra_glows += fx.outer_glows.len().saturating_sub(1);
     let gradients: Vec<Value> = fx
         .gradient_overlays
         .iter()
-        .map(|o| gradient_overlay(o, &mut loss))
+        .map(|o| gradient_overlay(o, &mut *loss))
         .collect();
     push_kind(&mut root, "GrFl", "gradientFillMulti", gradients);
     let mut patterns = fx
         .pattern_overlays
         .iter()
-        .filter_map(|o| pattern_overlay(o, ctx, bounds, &mut place, &mut loss));
+        .filter_map(|o| pattern_overlay(o, ctx, bounds, &mut place, &mut *loss));
     if let Some(first) = patterns.next() {
         root.push(("patternFill", first));
     }
@@ -856,7 +870,6 @@ pub(super) fn encode(fx: &LayerEffects, bounds: Option<Rect>, ctx: &Ctx<'_>) -> 
         lfx2,
         fxrp,
         patterns: place.ids.into_iter().collect(),
-        losses: loss,
     })
 }
 

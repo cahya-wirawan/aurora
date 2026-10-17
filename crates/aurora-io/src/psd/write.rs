@@ -1016,10 +1016,9 @@ fn census_of(
         if layers.blend_mode(id) == Some(BlendMode::Dissolve) {
             losses.dissolve += 1;
         }
-        if let Some(fx) = layers.effects(id)
-            && let Some(encoded) = super::write_effects::encode(fx, layers.bounds(id), ctx)
-        {
-            losses.fx.add(encoded.losses);
+        if let Some(fx) = layers.effects(id) {
+            let (_, lost) = super::write_effects::encode(fx, layers.bounds(id), ctx);
+            losses.fx.add(lost);
         }
         match layers.kind(id) {
             Some(LayerKind::Group { children }) => {
@@ -1320,7 +1319,7 @@ fn plan_props(
         expected: PsdExpectedLayer {
             effects: layers
                 .effects(id)
-                .and_then(|fx| super::write_effects::encode(fx, layers.bounds(id), ctx))
+                .and_then(|fx| super::write_effects::encode(fx, layers.bounds(id), ctx).0)
                 .map(|e| PsdExpectedEffects {
                     lfx2: e.lfx2,
                     fxrp: e.fxrp,
