@@ -410,3 +410,62 @@ fn a_dab_on_a_layer_at_the_anchor_invalidates_exactly_its_painted_tile() {
         .collect();
     assert_eq!(stale, vec![(2, 1)]);
 }
+
+/// One redraw's widget layer through the widget paint cache (60 FPS round
+/// 4), as a closure the canvas frame benchmarks call once a frame so the
+/// whole frame is measured rather than estimated: the startup workspace,
+/// `TextEngine::begin_frame`, [`aurora_widgets::update_field_scrolls`] and
+/// [`crate::widget_paint_cache::WidgetPaintCache::frame_gpu_ops`], with one
+/// button's hover toggled every frame (a pointer moving over the chrome
+/// while painting would do more; an unchanged tree less). `None` without a
+/// GPU or the committed tokens.
+pub(crate) fn cached_widget_frame(
+    context: &crate::tests::GpuTestContext,
+) -> Option<impl FnMut() + '_> {
+    let (Ok(scales), Ok(theme)) = (crate::load_scales(), crate::load_theme()) else {
+        return None;
+    };
+    let mut engine = aurora_text::TextEngine::new().ok()?;
+    let mut atlas = crate::GlyphAtlas::new(context.device());
+    let mut workspace = laid_out_workspace(0, &mut engine, &scales);
+    let mut cache = crate::widget_paint_cache::WidgetPaintCache::default();
+    let buttons: Vec<_> = workspace
+        .tree
+        .paint_order()
+        .into_iter()
+        .filter(|&id| {
+            matches!(
+                workspace.tree.payload(id),
+                Some(aurora_widgets::widgets::WidgetKind::Button(_))
+            )
+        })
+        .collect();
+    let mut frame = 0usize;
+    Some(move || {
+        frame += 1;
+        if let Some(&b) = buttons.get(frame % buttons.len().max(1)) {
+            let _ =
+                aurora_widgets::widgets::set_button_hovered(&mut workspace.tree, b, frame % 2 == 0);
+        }
+        engine.begin_frame();
+        aurora_widgets::update_field_scrolls(
+            &mut engine,
+            &mut workspace.tree,
+            &theme,
+            &scales,
+            1.0,
+        );
+        let paints = cache.frame_gpu_ops(
+            &workspace.tree,
+            None,
+            None,
+            &theme,
+            &scales,
+            context,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            1.0,
+            Some((&mut engine, &mut atlas)),
+        );
+        drop(paints);
+    })
+}

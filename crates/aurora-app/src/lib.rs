@@ -66383,6 +66383,7 @@ mod tests {
         frames: u32,
         start: (u32, u32),
         pan_step_px: (u32, u32),
+        mut widget_frame: Option<&mut dyn FnMut()>,
     ) -> FrameStages {
         let device = gpu.device();
         let queue = gpu.queue();
@@ -66492,6 +66493,14 @@ mod tests {
                 timeout: None,
             });
             let t_submit_poll = std::time::Instant::now();
+            // 60 FPS round 4: the redraw's widget layer, when asked for,
+            // after the canvas so no canvas stage contains it. `total`
+            // below then is the whole frame; without it `total` is
+            // unchanged.
+            if let Some(widgets) = widget_frame.as_mut() {
+                widgets();
+                stages.widget_paint.push(ms(t_submit_poll.elapsed()));
+            }
 
             // `total` keeps its pre-instrumentation definition byte for
             // byte -- `t0.elapsed()`, read here before anything else is
@@ -66651,6 +66660,9 @@ mod tests {
         /// time fell, but no fresh internal probe split has actually
         /// been taken since 0.92.0.
         upload_sync: Vec<f64>,
+        /// The redraw's widget layer through the widget paint cache, when
+        /// the caller passed one (60 FPS round 4); empty otherwise.
+        widget_paint: Vec<f64>,
         /// Building the command encoder, bind group, pipeline and the
         /// one render pass. Records commands; runs nothing.
         record_pass: Vec<f64>,
@@ -66738,6 +66750,7 @@ mod tests {
                 stamp_dab: Vec::with_capacity(frames),
                 recomposite: Vec::with_capacity(frames),
                 upload_sync: Vec::with_capacity(frames),
+                widget_paint: Vec::with_capacity(frames),
                 record_pass: Vec::with_capacity(frames),
                 submit_poll: Vec::with_capacity(frames),
                 gpu_tiles: Vec::with_capacity(frames),
@@ -67583,6 +67596,7 @@ mod tests {
             40,
             (100_000, 100_000),
             (200, 120),
+            None,
         );
         report_frame_stages(
             "recomposite_and_present_loop (GPU path, 300,000px ceiling, pan+paint)",
@@ -67705,6 +67719,130 @@ mod tests {
     /// GitHub Actions CI runs actually produced (2026-08-12) -- the
     /// original 180ms figure (~3.3x this sandbox's own local p99) caused
     /// real CI failures, the same correction as the sibling test above.
+    /// The GPU-path gate fixture's document (one 300,000 px Normal pixel
+    /// layer) in a store of `budget_tiles` resident tiles, for the 60 FPS
+    /// round 4 variants of the gate benchmark. The gate test itself keeps
+    /// its own, unchanged setup.
+    fn gpu_gate_document(
+        budget_tiles: usize,
+    ) -> (
+        tempfile::TempDir,
+        aurora_tile::TileStore,
+        aurora_doc::LayerTree,
+        aurora_doc::LayerId,
+        aurora_tile::SurfaceId,
+    ) {
+        let Ok(dir) = tempfile::tempdir() else {
+            unreachable!("a temporary directory");
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(budget_tiles) else {
+            unreachable!("a non-zero budget");
+        };
+        let Ok(store) = aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) else {
+            unreachable!("scratch dir just created by tempfile must be usable");
+        };
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 300_000,
+            height: 300_000,
+        };
+        let Ok(layer_id) = layers.add_pixel_layer("canvas", bounds, None) else {
+            unreachable!("a pixel layer");
+        };
+        let Some(surface) = layers.surface_id(layer_id) else {
+            unreachable!("just created as a pixel layer");
+        };
+        assert!(document_qualifies_for_gpu_compositing(&layers));
+        (dir, store, layers, layer_id, surface)
+    }
+
+    /// The smallest resident share a live document gets (60 FPS round 4):
+    /// the pool's 128 MiB floor (`aurora_tile::budget_bytes_for_ram` when
+    /// RAM cannot be read or is small) is 256 tiles of 512 KiB, the active
+    /// group gets at least three quarters, split between the document and
+    /// its background mirror: 96 tiles. A machine with 16 GiB or more gets
+    /// thousands. The gate fixture's 32 tiles is below every live share.
+    const SMALLEST_LIVE_SHARE_TILES: usize = 96;
+
+    /// The gate benchmark with a store budget a live document can actually
+    /// have ([`SMALLEST_LIVE_SHARE_TILES`]) instead of the gate's 32 tiles,
+    /// whose composite tiles are evicted and re-paged between frames.
+    #[test]
+    fn recomposite_and_present_loop_measures_pan_while_painting_with_a_live_store_budget() {
+        const BUDGET_MS: f64 = 3000.0;
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store, layers, layer_id, surface) =
+            gpu_gate_document(SMALLEST_LIVE_SHARE_TILES);
+        let label = "recomposite_and_present_loop (GPU path, live budget 96 tiles, pan+paint)";
+        let mut stages = measure_pan_and_paint_frames(
+            &context,
+            &layers,
+            layer_id,
+            surface,
+            &mut store,
+            (800, 600),
+            40,
+            (100_000, 100_000),
+            (200, 120),
+            None,
+        );
+        report_frame_stages(label, &mut stages);
+        let (mean, p50, p99, max) = ms_stats(&mut stages.total);
+        println!("{label}: n=40 mean={mean:.2}ms p50={p50:.2}ms p99={p99:.2}ms max={max:.2}ms");
+        assert!(p99 < BUDGET_MS, "p99 {p99:.2} ms over the CI-safety bound");
+    }
+
+    /// The whole frame (60 FPS round 4): the gate benchmark's canvas frame
+    /// plus the redraw's widget layer through the widget paint cache
+    /// ([`crate::frame_cost_tests::cached_widget_frame`]), so the real frame
+    /// is measured instead of estimated as canvas + widget paint. Run on
+    /// both the gate's 32-tile store and the live budget. The widget
+    /// meshes are prepared but not drawn (the pass draws the canvas only),
+    /// so the GPU cost of drawing them is not in it.
+    #[test]
+    fn the_whole_frame_with_widget_paint_is_measured_on_the_gpu_gate_document() {
+        const BUDGET_MS: f64 = 3000.0;
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        for budget in [32, SMALLEST_LIVE_SHARE_TILES] {
+            let Some(mut widgets) = crate::frame_cost_tests::cached_widget_frame(&context) else {
+                unreachable!("the committed tokens and font load");
+            };
+            let (_dir, mut store, layers, layer_id, surface) = gpu_gate_document(budget);
+            let mut stages = measure_pan_and_paint_frames(
+                &context,
+                &layers,
+                layer_id,
+                surface,
+                &mut store,
+                (800, 600),
+                40,
+                (100_000, 100_000),
+                (200, 120),
+                Some(&mut widgets),
+            );
+            let label = format!("whole frame (GPU path, budget {budget} tiles)");
+            let (w_mean, _, _, w_max) = ms_stats(&mut stages.widget_paint);
+            let (r_mean, _, _, _) = ms_stats(&mut stages.recomposite);
+            let (u_mean, _, _, _) = ms_stats(&mut stages.upload_sync);
+            let (mean, p50, p99, max) = ms_stats(&mut stages.total);
+            println!(
+                "{label}: real frame: total mean={mean:.2}ms p50={p50:.2}ms max={max:.2}ms \
+                 recomposite mean={r_mean:.2}ms upload_sync mean={u_mean:.2}ms \
+                 widget_paint mean={w_mean:.2}ms (max {w_max:.2}) (nominal budget 16.7ms)"
+            );
+            assert!(
+                p99 < BUDGET_MS,
+                "{label}: p99 {p99:.2} ms over the CI-safety bound"
+            );
+        }
+    }
+
     #[test]
     fn recomposite_and_present_loop_exercises_the_cpu_fallback_path() {
         // Real GitHub Actions CI runs (2026-08-12) hit p99 up to 409ms --
@@ -67761,6 +67899,7 @@ mod tests {
             12,
             (50_000, 50_000),
             (200, 120),
+            None,
         );
         report_frame_stages(
             "recomposite_and_present_loop (CPU fallback path, 300,000px ceiling, pan+paint)",
@@ -68325,6 +68464,7 @@ mod tests {
             TWO_ROOT_FRAMES,
             TWO_ROOT_START,
             TWO_ROOT_PAN_STEP,
+            None,
         );
         // `report_frame_stages` returns the census it prints (0.100.0)
         // precisely so this assertion can exist. Slot 1 is
@@ -68398,6 +68538,7 @@ mod tests {
             TWO_ROOT_FRAMES,
             TWO_ROOT_START,
             TWO_ROOT_PAN_STEP,
+            None,
         );
         let [control_folds, control_first] =
             report_frame_stages(CONTROL_LABEL, &mut control_stages);
