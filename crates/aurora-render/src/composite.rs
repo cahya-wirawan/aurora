@@ -30328,6 +30328,26 @@ mod tests {
     /// translucent, so both arms of the backdrop recovery run), and three
     /// opacities. The transparent-chunk skip is turned off for the
     /// comparison so every chunk takes the rewritten loop.
+    ///
+    /// **NaN payloads, measured 2026-10-17 (`x86_64` with F16C, rustc 1.97).**
+    /// In the release profile the two loops agree on every bit, NaN
+    /// payloads included, and that is asserted below for any optimised
+    /// build. In the dev profile (opt-level 1) they differ in 18,414
+    /// samples, all `Difference` with a negative NaN source colour channel
+    /// (0xFC01..=0xFFFF): the round-5 loop gives 0xFE01 and up, this one
+    /// 0x7E01 and up, i.e. which NaN wins `backdrop_inverse * Cs +
+    /// backdrop_alpha * |Cb - Cs|` (both NaN, opposite signs). That choice
+    /// is the compiler's operand order for a commutative add, which the
+    /// source does not fix, and the **round-5 loop was already profile
+    /// dependent in the same way**: per-configuration hashes of this sweep
+    /// showed the round-5 loop's dev output differing from its own release
+    /// output in 36 of the 1,248 configurations (all `Difference`), the
+    /// round-6 loop's dev output differing from release in 18, and the two
+    /// loops' release outputs identical in all 1,248. So the shipping build
+    /// is unchanged bit for bit, and the dev build moved closer to it.
+    /// (The per-configuration hashes were a one-time instrumentation of
+    /// this sweep, not kept; the dev run of this test still prints the
+    /// count and asserts that nothing but a NaN's payload differs.)
     #[test]
     fn per_mode_fold_is_bit_identical_to_the_round5_loop_over_every_f16_pattern() {
         let backdrops = [[0.2, 0.35, 0.55, 1.0], [0.15, 0.05, 0.1, 0.5]];
@@ -30374,6 +30394,13 @@ mod tests {
             "per-mode fold: {compared} samples compared, {nan_payload_differences} differ only \
              in a NaN's payload"
         );
+        // The shipping profile: bit for bit, NaN payloads included.
+        if !cfg!(debug_assertions) {
+            assert_eq!(
+                nan_payload_differences, 0,
+                "in an optimised build the per-mode loop must equal the round-5 loop bit for bit"
+            );
+        }
     }
 
     /// 60 FPS round 6: the chunked [`un_premultiply_in_place`] against its
