@@ -362,10 +362,6 @@ fn a_chosen_profile_file_becomes_the_output_profile_or_a_notice() {
         if let Ok(profile) = load_output_profile(path) {
             colour.output = Some(profile);
         }
-        assert_eq!(
-            colour.output.is_some(),
-            expect_set || colour.output.is_some()
-        );
     }
     assert!(colour.output.is_some());
     // The refused one left the earlier choice alone.
