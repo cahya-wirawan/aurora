@@ -582,6 +582,9 @@ mod layer_thumbnails;
 mod menu_bar_app;
 mod menu_bar_state;
 mod menu_model;
+mod move_invalidation;
+#[cfg(test)]
+mod move_invalidation_tests;
 mod path_paint;
 mod paths_app;
 #[cfg(test)]
@@ -17885,36 +17888,7 @@ fn effect_reach_rects(
     rects: &[aurora_core::Rect],
 ) -> Vec<aurora_core::Rect> {
     let mut out = rects.to_vec();
-    let Some(fx) = layers.effects(layer) else {
-        return out;
-    };
-    if !layer_renders_effects(layers, layer) {
-        return out;
-    }
-    // `(offset, apron)` of every drawn effect: a shadow's own, a stroke's
-    // apron with no offset (0.190.0).
-    let mut reaches: Vec<((i64, i64), u32)> = fx
-        .drop_shadows
-        .iter()
-        .filter(|s| fx.shows(s.gate))
-        .map(|shadow| {
-            let g = shadow.geometry();
-            (g.offset, g.apron)
-        })
-        .collect();
-    reaches.extend(
-        fx.strokes
-            .iter()
-            .filter(|s| fx.shows(s.gate) && stroke_paintable(s, layers))
-            .map(|stroke| ((0, 0), stroke.geometry().apron)),
-    );
-    // 0.191.0: a Softer outer glow reaches its apron on every side.
-    reaches.extend(
-        fx.outer_glows
-            .iter()
-            .filter(|g| fx.shows(g.gate) && !g.precise)
-            .map(|glow| ((0, 0), glow.geometry().apron)),
-    );
+    let reaches = move_invalidation::effect_reaches(layers, layer);
     for (offset, apron) in reaches {
         let a = i64::from(apron);
         for r in rects {
@@ -34644,10 +34618,13 @@ impl App {
     /// practice — `layer_id` always comes from `Drag::Move` itself, set
     /// from a real active pixel layer when the drag began — but this
     /// reports rather than assumes it, the same discipline every other
-    /// fallible call in this crate already applies. Bumps
-    /// `self.doc.composite_cache` unconditionally — a moved layer's own
-    /// content lands at different composite tiles now, whether or not
-    /// `set_bounds` itself succeeded.
+    /// fallible call in this crate already applies. Invalidates
+    /// `self.doc.composite_cache` through
+    /// [`move_invalidation::move_layer_live`] (60 FPS round 2): only the
+    /// composite tiles the layer's stored content and its effects' reach
+    /// cover at the old and the new origin, or everything when the grid
+    /// anchor moved; a refused `set_bounds` changes nothing and
+    /// invalidates nothing.
     ///
     /// **One failure is also shown, not only logged**:
     /// `aurora_doc::DocError::LayerOriginOutOfRange`, the one a user can
@@ -34674,7 +34651,17 @@ impl App {
             self.lock_notice = Some((LockRefusal::PositionLocked, Some(layer_id)));
             return;
         }
-        if let Err(err) = self.doc.layers.set_bounds(layer_id, bounds) {
+        // Round 2 of the 60 FPS work: only what the move can have changed
+        // is invalidated (`move_invalidation`'s soundness argument); the
+        // anchor moving still bumps everything.
+        if let Err(err) = move_invalidation::move_layer_live(
+            &mut self.doc.layers,
+            &mut self.doc.composite_cache,
+            self.doc.tile_store.as_ref(),
+            self.doc.active_layer,
+            layer_id,
+            bounds,
+        ) {
             tracing::warn!(?err, "failed to reposition the active layer");
             // Ask, open, and only then latch. The latch must not happen
             // when `open_move_refused_dialog` was a no-op because another
@@ -34688,7 +34675,6 @@ impl App {
                 mark_move_refusal_reported(&mut self.drag);
             }
         }
-        self.doc.composite_cache.bump();
     }
 
     /// Opens the move-refused dialog, on exactly the terms
@@ -96140,7 +96126,7 @@ mod occlusion_cull_tests {
     /// Paints every stored tile of a layer-local surface whose grid starts
     /// at `bounds`' origin and covers `bounds`, with `paint(x, y)` at each
     /// document position.
-    fn paint_surface(
+    pub(super) fn paint_surface(
         store: &mut aurora_tile::TileStore,
         surface: aurora_tile::SurfaceId,
         bounds: aurora_core::Rect,
@@ -96924,30 +96910,30 @@ mod occlusion_cull_tests {
     }
 
     /// A small seeded generator (xorshift64*), so failures reproduce.
-    struct Rng(u64);
+    pub(super) struct Rng(pub(super) u64);
 
     impl Rng {
-        fn next(&mut self) -> u64 {
+        pub(super) fn next(&mut self) -> u64 {
             self.0 ^= self.0 >> 12;
             self.0 ^= self.0 << 25;
             self.0 ^= self.0 >> 27;
             self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
         }
-        fn below(&mut self, n: u64) -> u64 {
+        pub(super) fn below(&mut self, n: u64) -> u64 {
             self.next() % n.max(1)
         }
-        fn pick<V: Copy>(&mut self, items: &[V], fallback: V) -> V {
+        pub(super) fn pick<V: Copy>(&mut self, items: &[V], fallback: V) -> V {
             items
                 .get(self.below(items.len() as u64) as usize)
                 .copied()
                 .unwrap_or(fallback)
         }
-        fn chance(&mut self, percent: u64) -> bool {
+        pub(super) fn chance(&mut self, percent: u64) -> bool {
             self.below(100) < percent
         }
     }
 
-    fn random_node(
+    pub(super) fn random_node(
         rng: &mut Rng,
         layers: &mut aurora_doc::LayerTree,
         store: &mut aurora_tile::TileStore,
