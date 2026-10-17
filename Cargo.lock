@@ -560,6 +560,7 @@ version = "0.268.0"
 dependencies = [
  "aurora-core",
  "aurora-tile",
+ "bytemuck",
  "half",
  "pollster 1.0.1",
  "rayon",
