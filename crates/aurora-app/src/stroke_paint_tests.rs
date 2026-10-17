@@ -397,12 +397,23 @@ fn stroke_effects_psd_opens_its_gradient_and_pattern_strokes_painted() {
     let Some(reference) = reference else {
         unreachable!("a gradient stroke spans the record rectangle");
     };
-    assert!(reference.width > 0 && reference.height > 0);
+    // The record rectangle of the 'Gradient' shape (pinned from the file).
+    assert_eq!(
+        reference,
+        ReferenceBox {
+            dx: 33,
+            dy: 130,
+            width: 24,
+            height: 24
+        }
+    );
     let Some(StrokePaint::Pattern { pattern, origin, .. }) = paint_of("Pattern") else {
         unreachable!("the Pattern layer's stroke is painted");
     };
     assert!(layers.patterns().contains_key(&pattern));
-    assert!(origin.0.is_finite() && origin.1.is_finite());
+    // The layer's `fxrp` reference point (pinned from the file), relative
+    // to the layer's bounds (which start at the origin).
+    assert_eq!(origin, (-201.0, -71.0));
     assert!(
         !document
             .report
@@ -412,4 +423,36 @@ fn stroke_effects_psd_opens_its_gradient_and_pattern_strokes_painted() {
         "{:?}",
         document.report.items
     );
+}
+
+/// The gradient is evaluated at each texel's own row: a vertical gradient
+/// on the inside stroke's top rows (the interior fold starts at the
+/// shape's first row, not at the tile's).
+#[test]
+fn a_vertical_gradient_stroke_follows_the_texels_row() {
+    let (_d, mut store) = real_tile_store();
+    let g = ramp_fill(90.0, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+    let (layers, _) = stroked_layer(
+        &mut store,
+        vec![
+            painted_stroke(
+                StrokePosition::Inside,
+                2.0,
+                StrokeFill::Gradient,
+                Some(gradient_paint(g.clone())),
+            ),
+            painted_stroke(
+                StrokePosition::Outside,
+                2.0,
+                StrokeFill::Gradient,
+                Some(gradient_paint(g.clone())),
+            ),
+        ],
+    );
+    let acc = square_composite(&layers, &mut store);
+    for (x, y) in [(120, 100), (120, 101), (120, 138), (120, 139), (120, 140), (120, 141), (120, 98)] {
+        near(texel(&acc, x, y), gradient_texel(&g, x, y));
+    }
+    // And the colour really does change from the top edge to the bottom one.
+    assert_ne!(texel(&acc, 120, 100), texel(&acc, 120, 139));
 }

@@ -6289,6 +6289,14 @@ mod adjustment_tests {
             "one paint for two strokes"
         );
         assert!(
+            crate::history::apply(&mut tree, op(layer, vec![None])).is_err(),
+            "too few entries, none of them a paint"
+        );
+        assert!(
+            crate::history::apply(&mut tree, op(layer, vec![None, None, None])).is_err(),
+            "too many entries"
+        );
+        assert!(
             crate::history::apply(&mut tree, op(layer, vec![Some(paint.clone()), None])).is_err(),
             "a pattern paint on a solid stroke"
         );
