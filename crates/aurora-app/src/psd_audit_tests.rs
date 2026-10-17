@@ -150,7 +150,7 @@ fn audit_dump(dir: &str, name: &str, image: &aurora_io::Image, merged: &aurora_i
 fn audit_one_file(path: &std::path::Path, name: &str) -> Result<AuditRow, String> {
     let started = std::time::Instant::now();
     let bytes = std::fs::read(path).map_err(|e| format!("unreadable: {e}"))?;
-    let merged = aurora_io::decode_psd_merged_image(&bytes)
+    let merged = aurora_io::decode_psd_merged_image_in_working_space(&bytes)
         .map_err(|e| format!("no merged image: {e:?}"))?;
     let document = aurora_io::read_psd(&bytes).map_err(|e| format!("not opened: {e:?}"))?;
     let report = document.report.items.clone();

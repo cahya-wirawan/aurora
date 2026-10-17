@@ -310,3 +310,24 @@ fn a_large_image_converts_in_chunks_without_changing_the_result() {
             .all(|p| p.iter().map(|s| s.to_bits()).collect::<Vec<_>>() == first)
     );
 }
+
+#[test]
+fn white_stays_white_under_the_relative_colorimetric_intent() {
+    // A profile whose white point is D50, not sRGB's D65: relative
+    // colorimetric maps its white to the working space's white; absolute
+    // colorimetric would keep the tint (and so would not be white).
+    let Ok(d50) = IccProfile::synthetic_rgb(
+        [0.3457, 0.3585],
+        [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]],
+        0.0,
+    ) else {
+        unreachable!()
+    };
+    let Ok(bytes) = d50.to_bytes() else { unreachable!() };
+    let mut samples = vec![f16::from_f32(1.0), f16::from_f32(1.0), f16::from_f32(1.0), f16::from_f32(1.0)];
+    let imported = bring_into_working(&mut samples, Tagging::Icc(&bytes), false);
+    assert!(imported.source.is_some(), "{:?}", imported.report);
+    for c in samples.iter().take(3) {
+        assert!((c.to_f32() - 1.0).abs() < 2e-3, "{samples:?}");
+    }
+}

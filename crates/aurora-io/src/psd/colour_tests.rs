@@ -187,3 +187,27 @@ fn the_merged_image_is_converted_the_same_way() {
     let plain = super::merged_image_in_working_space(&psd(Vec::new()));
     assert!(plain.is_ok());
 }
+
+#[test]
+fn a_file_with_only_a_merged_image_is_converted_too() {
+    let Ok(bytes) = adobe_like().to_bytes() else { unreachable!() };
+    let planes = vec![vec![51, 255], vec![153, 0], vec![102, 0]];
+    let make = |resources: Vec<u8>| {
+        TestPsd::new(1, 2, 1, 8)
+            .with(|p| {
+                p.resources = resources;
+                p.merged = Some(planes.clone());
+            })
+            .write()
+    };
+    let plain = open(&make(Vec::new()));
+    let document = open(&make(resource_1039(&bytes)));
+    assert_ne!(first_pixel(&document)[..3], first_pixel(&plain)[..3]);
+    let Ok(t) = Transform::to_working(&adobe_like()) else { unreachable!() };
+    let mut want = [0.0_f32; 3];
+    assert!(t.transform(&[51.0 / 255.0, 153.0 / 255.0, 102.0 / 255.0], &mut want).is_ok());
+    let got = first_pixel(&document);
+    for (g, w) in got.iter().zip(want) {
+        assert!((g - w).abs() < 3e-3, "{got:?} vs {want:?}");
+    }
+}
