@@ -142,9 +142,7 @@ pub fn encode_with(texels: &[f16], scratch: &mut EncodeScratch) -> Vec<u8> {
     debug_assert_eq!(texels.len(), crate::SAMPLES);
     scratch.raw.clear();
     scratch.raw.reserve(texels.len() * 2);
-    for texel in texels {
-        scratch.raw.extend_from_slice(&texel.to_le_bytes());
-    }
+    extend_le_bytes(texels, &mut scratch.raw);
     let max = lz4_flex::block::get_maximum_output_size(scratch.raw.len());
     if scratch.block.len() < max {
         scratch.block.resize(max, 0);
@@ -255,10 +253,27 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<f16>, TileError> {
 /// alignment assumption about a freshly-decompressed `Vec<u8>`.
 fn raw_bytes(texels: &[f16]) -> Vec<u8> {
     let mut raw = Vec::with_capacity(texels.len() * 2);
+    extend_le_bytes(texels, &mut raw);
+    raw
+}
+
+/// Appends `texels` to `raw` as little-endian bytes, two per sample.
+///
+/// On a little-endian target that is the samples' own memory, appended in
+/// one copy (60 FPS round 4): the per-sample `extend_from_slice` loop it
+/// replaced cost about 0.25 ms a tile in the dev test profile, on every
+/// eviction. Pinned against that loop over every `f16` bit pattern.
+#[cfg(target_endian = "little")]
+fn extend_le_bytes(texels: &[f16], raw: &mut Vec<u8>) {
+    raw.extend_from_slice(bytemuck::cast_slice(texels));
+}
+
+/// Big-endian spelling of [`extend_le_bytes`]: one sample at a time.
+#[cfg(not(target_endian = "little"))]
+fn extend_le_bytes(texels: &[f16], raw: &mut Vec<u8>) {
     for texel in texels {
         raw.extend_from_slice(&texel.to_le_bytes());
     }
-    raw
 }
 
 /// The exact-length half of [`EXPECTED_DECODED_BYTES`]'s own contract,
@@ -283,19 +298,192 @@ fn from_raw_bytes(raw: &[u8]) -> Result<Vec<f16>, TileError> {
     // bytes `lz4_flex` really produced have not; a no-op repeat on the
     // raw branch, which checked the same length before copying.
     length_checked(raw)?;
-    let mut texels = Vec::with_capacity(crate::SAMPLES);
+    Ok(texels_from_le_bytes(raw))
+}
+
+/// The samples of little-endian `raw`, two bytes each (an odd trailing
+/// byte, which [`length_checked`] rules out, is ignored). On a
+/// little-endian target one copy (60 FPS round 4; the per-pair loop it
+/// replaced is the reference it is pinned against, over every pattern).
+#[cfg(target_endian = "little")]
+fn texels_from_le_bytes(raw: &[u8]) -> Vec<f16> {
+    use half::vec::HalfBitsVecExt as _;
+    let even = raw.get(..raw.len() / 2 * 2).unwrap_or_default();
+    let mut texels: Vec<f16> = vec![0u16; even.len() / 2].reinterpret_into();
+    // Equal lengths by construction: `even` is twice `texels.len()` bytes.
+    bytemuck::cast_slice_mut::<f16, u8>(&mut texels).copy_from_slice(even);
+    texels
+}
+
+/// Big-endian spelling of [`texels_from_le_bytes`]: one pair at a time.
+#[cfg(not(target_endian = "little"))]
+fn texels_from_le_bytes(raw: &[u8]) -> Vec<f16> {
+    let mut texels = Vec::with_capacity(raw.len() / 2);
     for pair in raw.chunks_exact(2) {
-        let bytes: [u8; 2] = match pair.try_into() {
-            Ok(bytes) => bytes,
-            Err(_) => unreachable!("chunks_exact(2) guarantees a length-2 slice"),
-        };
-        texels.push(f16::from_le_bytes(bytes));
+        if let [lo, hi] = pair {
+            texels.push(f16::from_le_bytes([*lo, *hi]));
+        }
     }
-    Ok(texels)
+    texels
 }
 
 #[cfg(test)]
 mod tests {
+    /// The 0.268.0 encoder, verbatim but for its name: the per-sample raw
+    /// byte loop, then the same lz4 and header. The reference every tile
+    /// file written before 60 FPS round 4 came from.
+    fn encode_0268(texels: &[half::f16]) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(texels.len() * 2);
+        for texel in texels {
+            raw.extend_from_slice(&texel.to_le_bytes());
+        }
+        let compressed = lz4_flex::compress_prepend_size(&raw);
+        let (flag, payload): (u8, Vec<u8>) = if compressed.len() < raw.len() {
+            (1, compressed)
+        } else {
+            (0, raw)
+        };
+        let mut out = Vec::with_capacity(super::HEADER_LEN + payload.len());
+        out.extend_from_slice(&super::MAGIC);
+        out.push(super::VERSION);
+        out.push(flag);
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    /// The 0.268.0 decoder's sample loop over a raw payload.
+    fn samples_0268(raw: &[u8]) -> Vec<u16> {
+        raw.chunks_exact(2)
+            .map(|p| match p {
+                [lo, hi] => half::f16::from_le_bytes([*lo, *hi]).to_bits(),
+                _ => unreachable!("chunks_exact(2)"),
+            })
+            .collect()
+    }
+
+    /// Tiles covering every `f16` bit pattern (each four times, in four
+    /// arrangements: NaN payloads, -0, subnormals, infinities included),
+    /// blank and constant tiles, and seeded random tiles both compressible
+    /// and not.
+    fn round4_tiles() -> Vec<(String, Vec<half::f16>)> {
+        let n = crate::SAMPLES;
+        let from = |f: &dyn Fn(usize) -> u16| -> Vec<half::f16> {
+            (0..n).map(|i| half::f16::from_bits(f(i))).collect()
+        };
+        let mut state = 0x9e37_79b9u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let random: Vec<u16> = (0..n).map(|_| next() as u16).collect();
+        let lumpy: Vec<u16> = (0..n)
+            .map(|i| if i % 64 < 8 { next() as u16 } else { 0x3c00 })
+            .collect();
+        vec![
+            ("every pattern".into(), from(&|i| i as u16)),
+            (
+                "every pattern x7".into(),
+                from(&|i| (i as u16).wrapping_mul(7)),
+            ),
+            (
+                "every pattern reversed".into(),
+                from(&|i| u16::MAX - i as u16),
+            ),
+            (
+                "every pattern high byte first".into(),
+                from(&|i| (i as u16).rotate_left(8)),
+            ),
+            ("blank".into(), crate::Tile::blank().texels().to_vec()),
+            ("negative zero".into(), from(&|_| 0x8000)),
+            ("signalling NaN".into(), from(&|_| 0x7c01)),
+            (
+                "random".into(),
+                from(&|i| random.get(i).copied().unwrap_or(0)),
+            ),
+            (
+                "lumpy".into(),
+                from(&|i| lumpy.get(i).copied().unwrap_or(0)),
+            ),
+        ]
+    }
+
+    /// 60 FPS round 4: what reaches the scratch disk, spill files, the
+    /// autosave and `.aur` files is byte for byte what 0.268.0 wrote, old
+    /// files decode to the same bits, and every tile round-trips.
+    #[test]
+    fn encoded_bytes_are_identical_to_the_0268_encoder_and_old_files_decode_the_same() {
+        let mut scratch = super::EncodeScratch::default();
+        for (what, texels) in round4_tiles() {
+            let old = encode_0268(&texels);
+            assert_eq!(super::encode(&texels), old, "{what}: encode");
+            assert_eq!(
+                super::encode_with(&texels, &mut scratch),
+                old,
+                "{what}: encode_with"
+            );
+            let bits: Vec<u16> = texels.iter().map(|t| t.to_bits()).collect();
+            let decoded = match super::decode(&old) {
+                Ok(d) => d,
+                Err(err) => unreachable!("{what}: an old file decodes: {err}"),
+            };
+            let decoded: Vec<u16> = decoded.iter().map(|t| t.to_bits()).collect();
+            assert_eq!(decoded, bits, "{what}: old bytes decode to the same bits");
+            // The old decoder's loop over the raw payload agrees too.
+            let raw = match old.get(5) {
+                Some(1) => old
+                    .get(super::HEADER_LEN..)
+                    .and_then(|p| lz4_flex::decompress_size_prepended(p).ok())
+                    .unwrap_or_default(),
+                _ => old.get(super::HEADER_LEN..).unwrap_or_default().to_vec(),
+            };
+            assert_eq!(
+                samples_0268(&raw),
+                bits,
+                "{what}: the 0.268.0 loop reads the payload"
+            );
+        }
+    }
+
+    /// 60 FPS round 4: the bulk byte conversions against the per-sample
+    /// loops they replaced, over every `f16` bit pattern, at aligned and
+    /// unaligned starts.
+    #[test]
+    fn the_bulk_byte_conversions_match_the_per_sample_loops_for_every_pattern() {
+        use half::f16;
+        let texels: Vec<f16> = (0..=u16::MAX).map(f16::from_bits).collect();
+        let mut reference = Vec::new();
+        for texel in &texels {
+            reference.extend_from_slice(&texel.to_le_bytes());
+        }
+        let mut raw = vec![0xa5u8, 0x5a];
+        super::extend_le_bytes(&texels, &mut raw);
+        assert_eq!(raw.get(..2), Some([0xa5u8, 0x5a].as_slice()), "appends");
+        assert_eq!(raw.get(2..), Some(reference.as_slice()));
+        assert_eq!(super::raw_bytes(&texels), reference);
+        for start in [0usize, 1, 2, 3] {
+            let bytes = raw.get(2 + start..).unwrap_or_default();
+            let mut want = Vec::new();
+            for pair in bytes.chunks_exact(2) {
+                if let [lo, hi] = pair {
+                    want.push(f16::from_le_bytes([*lo, *hi]).to_bits());
+                }
+            }
+            let got: Vec<u16> = super::texels_from_le_bytes(bytes)
+                .iter()
+                .map(|t| t.to_bits())
+                .collect();
+            assert_eq!(got, want, "start {start}");
+        }
+        let round: Vec<u16> = super::texels_from_le_bytes(&reference)
+            .iter()
+            .map(|t| t.to_bits())
+            .collect();
+        assert_eq!(round, (0..=u16::MAX).collect::<Vec<_>>());
+    }
+
     #[test]
     fn encode_with_is_byte_identical_to_encode_for_every_kind_of_tile() {
         let mut scratch = super::EncodeScratch::default();

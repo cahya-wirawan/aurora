@@ -451,6 +451,85 @@ const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
 /// same contract `premultiply_rgba` and the pre-0.96.0 spelling of
 /// [`extend_premultiplied_le_bytes`] both have.
 fn serialize_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
+    #[cfg(target_endian = "little")]
+    if copy_if_premultiplied_already(texels, out) {
+        return;
+    }
+    serialize_converting(texels, out);
+}
+
+/// The fast path of [`serialize_premultiplied_le_bytes`] (60 FPS round
+/// 4): when premultiplying every texel of `texels` would leave its bits as
+/// they are, the output is the samples' own little-endian bytes, so they
+/// are copied in one `memcpy` and `true` is returned. Otherwise (or when
+/// `texels` is not whole texels, `out` is shorter than the output, or the
+/// samples are not 8-byte aligned) nothing is written and `false` is
+/// returned, and the caller converts. On the frame path most uploaded
+/// tiles take it: an empty tile is all `+0.0`, and an opaque document's
+/// composite is all alpha `1.0`. Until 0.268.0 every tile was converted,
+/// 0.42 ms a tile in the dev test profile, most of `upload_sync`.
+///
+/// A texel premultiplies to itself when all four samples are `+0.0`
+/// (`+0 * +0 = +0`), or when alpha is exactly `1.0` (bits `0x3c00`) and no
+/// colour sample is NaN: `f16 -> f32` is exact, multiplying by `1.0` is
+/// exact for every non-NaN `f32` (infinities, zeros of either sign and the
+/// `f16` subnormals, which are normal `f32`s, included), and `f32 -> f16`
+/// of an exactly representable value is exact. A NaN is excluded because
+/// the conversion quietens a signalling one. Pinned against
+/// [`serialize_converting`] over every `f16` bit pattern in every channel.
+#[cfg(target_endian = "little")]
+fn copy_if_premultiplied_already(texels: &[f16], out: &mut [u8]) -> bool {
+    // One texel is one little-endian `u64`: r | g << 16 | b << 32 | a << 48.
+    let Ok(words) = bytemuck::try_cast_slice::<f16, u64>(texels) else {
+        return false;
+    };
+    let bytes: &[u8] = bytemuck::cast_slice(texels);
+    let Some(dest) = out.get_mut(..bytes.len()) else {
+        return false;
+    };
+    if !texels_premultiply_to_themselves(words) {
+        return false;
+    }
+    dest.copy_from_slice(bytes);
+    true
+}
+
+/// `f16` bits of `1.0` in a texel word's alpha lane.
+#[cfg(target_endian = "little")]
+const OPAQUE_ALPHA: u64 = 0x3c00;
+/// The three colour lanes' magnitude bits (sign cleared).
+#[cfg(target_endian = "little")]
+const COLOUR_MAGNITUDE: u64 = 0x0000_7fff_7fff_7fff;
+/// Added to the magnitudes, sets a lane's bit 15 exactly when the lane is
+/// above `0x7c00` (+inf), i.e. NaN: `0x7c00 + 0x03ff = 0x7fff`,
+/// `0x7c01 + 0x03ff = 0x8000`, and `0x7fff + 0x03ff = 0x83fe` cannot carry
+/// into the next lane.
+#[cfg(target_endian = "little")]
+const NAN_PROBE: u64 = 0x0000_03ff_03ff_03ff;
+/// Bit 15 of each colour lane.
+#[cfg(target_endian = "little")]
+const LANE_TOP: u64 = 0x0000_8000_8000_8000;
+
+/// Whether every texel word is all `+0.0` or opaque with no NaN colour
+/// (see [`copy_if_premultiplied_already`]). Stops at the first texel that
+/// is neither, so a tile that must be converted pays little for the check.
+#[cfg(target_endian = "little")]
+fn texels_premultiply_to_themselves(words: &[u64]) -> bool {
+    for &texel in words {
+        if texel == 0 {
+            continue;
+        }
+        if texel >> 48 != OPAQUE_ALPHA || ((texel & COLOUR_MAGNITUDE) + NAN_PROBE) & LANE_TOP != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// The converting core of [`serialize_premultiplied_le_bytes`]: the whole
+/// of that function until 0.268.0, unchanged, and still what every tile
+/// that does not premultiply to itself goes through.
+fn serialize_converting(texels: &[f16], out: &mut [u8]) {
     // `wide`/`narrow` name the sample width (`f32`/`f16`) of the scratch
     // buffers. `wide` is deliberately *not* a reference to the rejected
     // crate of the same name -- see this function's own doc comment.
@@ -4245,5 +4324,240 @@ mod tests {
             (clip[2] - floor).abs() < 1e-6 && (clip[3] - floor).abs() < 1e-6,
             "{clip:?}"
         );
+    }
+}
+
+/// 60 FPS round 4: the bulk serializer against the 0.268.0 one, bit for
+/// bit, over every `f16` bit pattern in every channel.
+#[cfg(all(test, target_endian = "little"))]
+mod bulk_serializer_tests {
+    use super::{
+        CHANNELS, CHUNK_SAMPLES, SAMPLES, serialize_converting, serialize_premultiplied_le_bytes,
+        texels_premultiply_to_themselves,
+    };
+    use half::f16;
+
+    /// Both serializers into equal, pre-filled buffers of `out_len` bytes.
+    fn assert_same(texels: &[f16], out_len: usize, what: &str) {
+        let mut new = vec![0xa5u8; out_len];
+        let mut old = vec![0xa5u8; out_len];
+        serialize_premultiplied_le_bytes(texels, &mut new);
+        serialize_converting(texels, &mut old);
+        if new != old {
+            let at = new.iter().zip(&old).position(|(a, b)| a != b);
+            assert_eq!(new, old, "{what}: first differing byte {at:?}");
+        }
+    }
+
+    fn bits(texels: &[u16]) -> Vec<f16> {
+        texels.iter().map(|&b| f16::from_bits(b)).collect()
+    }
+
+    /// Alphas that exercise the fast path (1.0, +0) and its edges.
+    const ALPHAS: [u16; 14] = [
+        0x3c00, 0x0000, 0x8000, 0x3bff, 0x3c01, 0xbc00, 0x7c00, 0xfc00, 0x7e00, 0x7c01, 0x0001,
+        0x3800, 0x0400, 0x7bff,
+    ];
+
+    #[test]
+    fn every_colour_bit_pattern_under_each_alpha_matches_the_0268_serializer() {
+        for &alpha in &ALPHAS {
+            // Texel i carries patterns i, 7i and 13i (bijections mod 2^16),
+            // so every pattern reaches every colour channel.
+            let mut raw = Vec::with_capacity(SAMPLES);
+            for i in 0..65_536u32 {
+                raw.extend_from_slice(&[
+                    i as u16,
+                    i.wrapping_mul(7) as u16,
+                    i.wrapping_mul(13) as u16,
+                    alpha,
+                ]);
+            }
+            assert_eq!(raw.len(), SAMPLES);
+            assert_same(&bits(&raw), SAMPLES * 2, &format!("alpha {alpha:#06x}"));
+        }
+    }
+
+    #[test]
+    fn every_alpha_bit_pattern_matches_the_0268_serializer() {
+        for colour in [
+            0x0000u16, 0x8000, 0x3c00, 0x3555, 0x0001, 0x7c00, 0x7e00, 0x7c01,
+        ] {
+            let mut raw = Vec::with_capacity(SAMPLES);
+            for i in 0..65_536u32 {
+                raw.extend_from_slice(&[colour, colour ^ 0x8000, 0x2e66, i as u16]);
+            }
+            assert_same(&bits(&raw), SAMPLES * 2, &format!("colour {colour:#06x}"));
+        }
+    }
+
+    #[test]
+    fn a_chunk_mixing_copyable_and_converted_texels_matches_the_0268_serializer() {
+        let opaque = [0x3a00u16, 0x0001, 0xfc00, 0x3c00];
+        let zero = [0u16; 4];
+        let others: [[u16; 4]; 6] = [
+            [0x3a00, 0x3000, 0x2000, 0x3800],
+            [0x7c01, 0x3000, 0x2000, 0x3c00],
+            [0x3000, 0x7e00, 0x2000, 0x3c00],
+            [0x3000, 0x2000, 0xfe01, 0x3c00],
+            [0x8000, 0x0000, 0x0000, 0x0000],
+            [0x0000, 0x0000, 0x0000, 0x8000],
+        ];
+        let texels_per_chunk = CHUNK_SAMPLES / CHANNELS;
+        for other in others {
+            for at in 0..texels_per_chunk {
+                let mut raw = Vec::new();
+                for t in 0..texels_per_chunk * 3 {
+                    let texel = if t % texels_per_chunk == at {
+                        other
+                    } else if t % 2 == 0 {
+                        opaque
+                    } else {
+                        zero
+                    };
+                    raw.extend_from_slice(&texel);
+                }
+                let texels = bits(&raw);
+                assert!(!texels_premultiply_to_themselves(bytemuck::cast_slice(
+                    texels.get(..CHUNK_SAMPLES).unwrap_or_default()
+                )));
+                assert_same(&texels, raw.len() * 2, &format!("{other:?} at {at}"));
+            }
+        }
+        let copyable: Vec<u16> = (0..CHUNK_SAMPLES / CHANNELS)
+            .flat_map(|t| if t % 3 == 0 { zero } else { opaque })
+            .collect();
+        assert!(texels_premultiply_to_themselves(bytemuck::cast_slice(
+            &bits(&copyable)
+        )));
+    }
+
+    #[test]
+    fn odd_lengths_and_mis_sized_outputs_match_the_0268_serializer() {
+        // Patterns from a small LCG, a third of texels opaque, a third zero.
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 16) as u16
+        };
+        let mut raw = Vec::new();
+        for t in 0..(3 * CHUNK_SAMPLES / CHANNELS + 9) {
+            match t % 3 {
+                0 => raw.extend_from_slice(&[next() & 0x7bff, next() & 0x3fff, 0x1234, 0x3c00]),
+                1 => raw.extend_from_slice(&[0, 0, 0, 0]),
+                _ => raw.extend_from_slice(&[next(), next(), next(), next()]),
+            }
+        }
+        let texels = bits(&raw);
+        for len in [
+            0,
+            1,
+            3,
+            4,
+            5,
+            255,
+            256,
+            257,
+            511,
+            512,
+            513,
+            767,
+            768,
+            800,
+            raw.len() - 1,
+            raw.len(),
+        ] {
+            let texels = texels.get(..len).unwrap_or_default();
+            for out_len in [
+                0,
+                1,
+                7,
+                8,
+                9,
+                CHUNK_SAMPLES * 2 - 1,
+                CHUNK_SAMPLES * 2,
+                CHUNK_SAMPLES * 2 + 5,
+                (len * 2).saturating_sub(3),
+                len * 2,
+                len * 2 + 11,
+            ] {
+                assert_same(texels, out_len, &format!("len {len} out {out_len}"));
+            }
+        }
+    }
+
+    fn tile(texel: impl Fn(usize) -> [u16; 4]) -> Vec<f16> {
+        bits(&(0..SAMPLES / CHANNELS).flat_map(texel).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn the_copy_path_is_taken_exactly_for_tiles_that_premultiply_to_themselves() {
+        let opaque = |t: usize| {
+            [
+                t as u16 & 0x7bff,
+                0xfc00,
+                0x0001 | (t as u16 & 0x8000),
+                0x3c00,
+            ]
+        };
+        let copy = |texels: &[f16]| {
+            let mut out = vec![0u8; texels.len() * 2];
+            super::copy_if_premultiplied_already(texels, &mut out)
+        };
+        assert!(copy(&tile(|_| [0; 4])), "an empty tile is copied");
+        assert!(copy(&tile(opaque)), "an opaque tile is copied");
+        assert!(copy(&tile(|t| if t % 5 == 0 { [0; 4] } else { opaque(t) })));
+        // One texel anywhere that is neither sends the tile to conversion.
+        for (at, bad) in [
+            (0, [0x3000, 0x3000, 0x3000, 0x3bff]),
+            (7, [0x7c01, 0x3000, 0x3000, 0x3c00]),
+            (300, [0x3000, 0xfe00, 0x3000, 0x3c00]),
+            (65_535, [0x3000, 0x3000, 0x7fff, 0x3c00]),
+            (1_000, [0x8000, 0, 0, 0]),
+            (2_000, [0, 0, 0, 0x8000]),
+            (3_000, [0, 0, 0x0001, 0]),
+            (4_000, [0x3000, 0x3000, 0x3000, 0xbc00]),
+        ] {
+            let texels = tile(|t| if t == at { bad } else { opaque(t) });
+            assert!(!copy(&texels), "{bad:x?} at {at} must be converted");
+            assert_same(&texels, SAMPLES * 2, &format!("{bad:x?} at {at}"));
+        }
+        // A short output or a misaligned start is converted, not copied.
+        let empty = tile(|_| [0; 4]);
+        assert!(!super::copy_if_premultiplied_already(
+            &empty,
+            &mut vec![0u8; SAMPLES * 2 - 1]
+        ));
+        let misaligned = empty.get(1..1 + CHUNK_SAMPLES).unwrap_or_default();
+        assert!(!copy(misaligned));
+        assert_same(misaligned, CHUNK_SAMPLES * 2, "misaligned");
+        assert_same(misaligned, CHUNK_SAMPLES * 2 - 3, "misaligned, short");
+    }
+
+    /// The predicate over every bit pattern in each lane of one texel,
+    /// against a reference written with `f16::is_nan`.
+    #[test]
+    fn the_copy_predicate_matches_its_definition_for_every_pattern_in_every_lane() {
+        let reference = |t: [u16; 4]| {
+            let [r, g, b, a] = t.map(f16::from_bits);
+            t == [0; 4]
+                || (t[3] == 0x3c00 && !r.is_nan() && !g.is_nan() && !b.is_nan()) && !a.is_nan()
+        };
+        for base in [[0x3000u16, 0xb000, 0x0001, 0x3c00], [0; 4]] {
+            for lane in 0..CHANNELS {
+                for p in 0..=u16::MAX {
+                    let mut t = base;
+                    if let Some(s) = t.get_mut(lane) {
+                        *s = p;
+                    }
+                    let texels = bits(&t);
+                    assert_eq!(
+                        texels_premultiply_to_themselves(bytemuck::cast_slice(&texels)),
+                        reference(t),
+                        "{t:#06x?}"
+                    );
+                }
+            }
+        }
     }
 }
