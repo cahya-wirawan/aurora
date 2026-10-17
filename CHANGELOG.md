@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.262.0] - 2026-10-17
+
+### Changed
+
+- Tooltips appear in the app: docs and version
+
 ## [0.261.0] - 2026-10-17
 
 ### Changed

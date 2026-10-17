@@ -70,6 +70,7 @@ pub mod tool;
 pub mod tool_controls;
 pub mod toolbar_tooltips;
 pub mod tools_panel;
+pub mod tooltip_hover;
 pub mod workspace;
 
 pub use adjust_controls::{
@@ -231,6 +232,10 @@ pub use tools_panel::{
     TOOLS_PANEL_LABEL, ToolsPanel, insert_tools_panel, is_tools_panel_button, selected_tool,
     set_tools_panel_hover, sync_tools_panel, tool_description, tool_icon, tools_panel_contains,
     tools_panel_width,
+};
+pub use tooltip_hover::{
+    HoverBlockers, TOOLTIP_SHOW_DELAY, TooltipHover, foreign_popover_open, hover_point,
+    preferred_side,
 };
 pub use workspace::{
     FloatFrame, OPTIONS_BAR_LABEL, PANEL_GROUP_LABEL, PANEL_GROUP_TAB_DEFAULT, RAIL_WIDTH_DEFAULT,

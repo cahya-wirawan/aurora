@@ -241,24 +241,18 @@
 //!   [`Tooltip::dismiss`] it whenever it opens another popover. Like
 //!   every popover, it also stops painting and hit-testing when its
 //!   owner is wholly clipped away.
-//! - **No viewport flip or collision handling**: the tooltip always hangs
-//!   directly below its owner, left-aligned; the part running past the
-//!   window (the tree root's own bounds) is clamped away rather than the
-//!   tooltip being moved (`paint::clip_to_clipping_ancestors`).
-//! - **No text measurement**: its width is its owner's width
-//!   (`percent(1.0)`), its height one `typography.size.xs` line plus
-//!   `spacing.xxs` padding above and below — a stand-in until text can be
-//!   measured, not a design decision. No glyphs are drawn at all (a
-//!   crate-wide gap): the text reaches the accessibility tree only.
-//!   **On small or narrow owners this makes the tooltip nearly
-//!   unusable**: a `Checkbox` (a 13 × 13 px box under the shipped
-//!   scales; a `ColorSwatch` is as small) gets a tooltip 16 px wide —
-//!   nothing but its own `spacing.xs` padding either side, which already
-//!   exceeds the box (pinned by a test) — far too narrow for any real
-//!   text, and a *vertical* `Scrollbar` gets a sliver the scrollbar's
-//!   width hanging below its bottom end.
-//!   Both are allowed owners anyway, because the fix is text
-//!   measurement, not a narrower allowlist.
+//! - **Placement is opt-in** (0.262.0): an unplaced tooltip still hangs
+//!   directly below its owner at the owner's width and the part past the
+//!   window is clamped away. A caller that wants a content-wide box inside
+//!   the window measures it ([`Tooltip::measured_size`], the text at the
+//!   tooltip's `type.size.xs` line plus padding, at most
+//!   [`MAX_WIDTH_STEPS`] x `spacing.xxxl`) and calls [`Tooltip::place`]
+//!   after each layout, which flips and slides it with
+//!   [`place_tooltip`](super::place_tooltip) (see `tooltip_place.rs`).
+//!   There is no wrapping: a longer text ends in an ellipsis.
+//! - **Text measurement** is the caller's: the controller's own tree
+//!   layout is still text-blind; [`Tooltip::measured_size`] shapes the text
+//!   with the same engine, style and scale factor the paint reuses.
 //! - **No shadow**: the mockup's `box-shadow: var(--elevation-1)`
 //!   (`design/gallery/index.html:126-133`) is not rendered — nothing in
 //!   `paint.rs` draws shadows. See `paint::paint_tooltip` for the fill,
@@ -282,12 +276,15 @@
 use std::time::{Duration, Instant};
 
 use accesskit::{Node, Role};
+use aurora_text::{TextEngine, TextStyle};
 use aurora_theme::Scales;
 use taffy::style_helpers::{auto, length, percent, zero};
 use taffy::{Position, Rect as LayoutRect, Size, Style};
 
+use super::tooltip_place::{TooltipSide, place_tooltip, tooltip_size};
 use super::{WidgetKind, spacing, type_size};
 use crate::error::WidgetError;
+use crate::text::{label_style, sanitize_label};
 use crate::tree::{PaintLayer, WidgetId, WidgetTree};
 
 /// Where a [`Tooltip`] is in its show/hide cycle — see this module's own
@@ -445,6 +442,31 @@ struct TooltipMetrics {
     pad_v: f32,
     pad_h: f32,
     min_height: f32,
+    /// The widest a tooltip grows: [`MAX_WIDTH_STEPS`] x `spacing.xxxl`.
+    max_width: f32,
+    /// The gap between the owner and the tooltip: `spacing.xxs`.
+    gap: f32,
+    /// The text's size in px (`type.size.xs`).
+    text_px: f32,
+}
+
+/// How many `spacing.xxxl` steps wide a tooltip may grow before its text
+/// ends in an ellipsis (5 x 64 = 320 logical px under the shipped scales).
+/// The scales have no tooltip-width token; the same "n steps of the
+/// spacing scale" rule the document tab strip's ceiling uses
+/// (`3 * spacing.xxxl`). A design-owner question, raised in the 0.262.0
+/// report, not an invented token.
+pub const MAX_WIDTH_STEPS: u32 = 5;
+
+/// Where a placed tooltip sits relative to its owner, and how big it is:
+/// the offset of its top-left corner from the owner's top-left corner (so
+/// it follows an owner that moves) and its box, logical px.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Frame {
+    dx: f32,
+    dy: f32,
+    width: f32,
+    height: f32,
 }
 
 /// A tooltip attached to one owner widget — see this module's own doc
@@ -462,6 +484,12 @@ pub struct Tooltip {
     metrics: TooltipMetrics,
     model: Model,
     node: Option<WidgetId>,
+    /// The last placement ([`Tooltip::place`]); `None` until placed and
+    /// again after a hide.
+    frame: Option<Frame>,
+    /// Whether the shown node is hidden from assistive technology
+    /// ([`Tooltip::with_assistive_hidden`]).
+    assistive_hidden: bool,
 }
 
 /// Whether `kind` may own a tooltip — see "Allowed owners" in this
@@ -502,9 +530,12 @@ fn allowed_owner(kind: &WidgetKind) -> bool {
     }
 }
 
-fn tooltip_node(text: &str) -> Node {
+fn tooltip_node(text: &str, hidden: bool) -> Node {
     let mut node = Node::new(Role::Tooltip);
     node.set_label(text.to_owned());
+    if hidden {
+        node.set_hidden();
+    }
     node
 }
 
@@ -514,19 +545,39 @@ fn tooltip_node(text: &str) -> Node {
 /// `spacing.xs` horizontally — the mockup's `.tooltip` padding.
 /// `Position::Absolute`, so it takes no part in the owner's own layout:
 /// the owner's size is unchanged by showing it.
-fn tooltip_style(metrics: TooltipMetrics) -> Style {
+fn tooltip_style(metrics: TooltipMetrics, frame: Option<Frame>) -> Style {
+    // Placed (0.262.0): an explicit box at an offset from the owner's
+    // corner. Unplaced: the original hang below the owner at its width.
+    let (inset, size) = match frame {
+        Some(frame) => (
+            LayoutRect {
+                left: length(frame.dx),
+                right: auto(),
+                top: length(frame.dy),
+                bottom: auto(),
+            },
+            Size {
+                width: length(frame.width),
+                height: length(frame.height),
+            },
+        ),
+        None => (
+            LayoutRect {
+                left: zero(),
+                right: auto(),
+                top: percent(1.0_f32),
+                bottom: auto(),
+            },
+            Size {
+                width: percent(1.0_f32),
+                height: auto(),
+            },
+        ),
+    };
     Style {
         position: Position::Absolute,
-        inset: LayoutRect {
-            left: zero(),
-            right: auto(),
-            top: percent(1.0_f32),
-            bottom: auto(),
-        },
-        size: Size {
-            width: percent(1.0_f32),
-            height: auto(),
-        },
+        inset,
+        size,
         min_size: Size {
             width: auto(),
             height: length(metrics.min_height),
@@ -572,10 +623,26 @@ impl Tooltip {
                 pad_v,
                 pad_h: spacing(scales.spacing.xs),
                 min_height: type_size(scales.typography.size.xs) + pad_v * 2.0,
+                max_width: spacing(scales.spacing.xxxl.saturating_mul(MAX_WIDTH_STEPS)),
+                gap: spacing(scales.spacing.xxs),
+                text_px: type_size(scales.typography.size.xs),
             },
             model: Model::IDLE,
             node: None,
+            frame: None,
+            assistive_hidden: false,
         })
+    }
+
+    /// Hides the shown tooltip node from assistive technology (it stays
+    /// drawn). For an owner that already carries the very words as its
+    /// own accessible description — the toolbar buttons — so a screen
+    /// reader never announces them twice. The default is visible, the
+    /// shape this module's tests pin.
+    #[must_use]
+    pub fn with_assistive_hidden(mut self, hidden: bool) -> Self {
+        self.assistive_hidden = hidden;
+        self
     }
 
     #[must_use]
@@ -733,6 +800,95 @@ impl Tooltip {
         self.delay = delay;
     }
 
+    /// The box this tooltip would take for its current text, logical px:
+    /// the text measured with the tooltip's own `type.size.xs` line (the
+    /// very shaping the paint reuses) plus its padding, at most
+    /// `MAX_WIDTH_STEPS` x `spacing.xxxl` wide (longer text ends in an
+    /// ellipsis when drawn), at least one line plus padding tall. Without
+    /// a text engine (the UI font failed to load) the width is estimated
+    /// from the character count; no glyphs are drawn then anyway.
+    #[must_use]
+    pub fn measured_size(
+        &self,
+        engine: Option<&mut TextEngine>,
+        scales: &Scales,
+        scale_factor: f32,
+    ) -> (f32, f32) {
+        let text = sanitize_label(&self.text);
+        let base = label_style(scales);
+        let style = TextStyle {
+            size_px: self.metrics.text_px,
+            ..base
+        };
+        let (width, height) = if let Some(engine) = engine {
+            let line = engine.shape(&text, &style, scale_factor);
+            (line.width, line.line_height)
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            let chars = text.chars().count() as f32;
+            (
+                chars * style.size_px * 0.6,
+                style.size_px * style.line_height,
+            )
+        };
+        tooltip_size(
+            width,
+            height,
+            self.metrics.pad_h,
+            self.metrics.pad_v,
+            self.metrics.max_width,
+            self.metrics.min_height,
+        )
+    }
+
+    /// Puts a shown tooltip of `size` beside its owner inside `window`
+    /// (both logical px; the owner's bounds are those of the last layout),
+    /// preferring `prefer` and flipping/sliding to stay inside —
+    /// [`place_tooltip`]. Returns whether the node's style changed, which
+    /// is when the caller must lay out again; an unchanged placement is a
+    /// no-op, so calling this after every layout settles (the second call
+    /// finds the same answer). Does nothing for a tooltip that is not
+    /// shown, and while the owner has no bounds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_hover`].
+    pub fn place(
+        &mut self,
+        tree: &mut WidgetTree<WidgetKind>,
+        size: (f32, f32),
+        window: (f32, f32),
+        prefer: TooltipSide,
+    ) -> Result<bool, WidgetError> {
+        if !tree.contains(self.owner) {
+            self.model = Model::IDLE;
+            self.node = None;
+            self.frame = None;
+            return Err(WidgetError::UnknownWidget(self.owner));
+        }
+        let Some(node) = self.node.filter(|&id| self.is_own_node(tree, id)) else {
+            return Ok(false);
+        };
+        let Some(owner) = tree.bounds(self.owner) else {
+            return Ok(false);
+        };
+        let placement = place_tooltip(owner, size, window, self.metrics.gap, prefer);
+        #[allow(clippy::cast_precision_loss)]
+        let frame = Frame {
+            dx: placement.x - owner.x as f32,
+            dy: placement.y - owner.y as f32,
+            width: size.0,
+            height: size.1,
+        };
+        if self.frame == Some(frame) {
+            return Ok(false);
+        }
+        tree.set_style(node, tooltip_style(self.metrics, Some(frame)))?;
+        tree.mark_dirty(node)?;
+        self.frame = Some(frame);
+        Ok(true)
+    }
+
     /// Removes the tooltip's node (if shown) and returns to `Idle` with
     /// every flag cleared — the next hover or focus report is a fresh
     /// rise. Call before dropping a controller whose owner stays alive.
@@ -769,6 +925,11 @@ impl Tooltip {
         };
         self.model = next;
         self.node = node;
+        if node.is_none() {
+            // A hidden tooltip forgets its placement: the next show is
+            // placed afresh against wherever its owner is by then.
+            self.frame = None;
+        }
         Ok(())
     }
 
@@ -791,7 +952,7 @@ impl Tooltip {
     /// Does not touch `self.node` — [`Self::commit`] does, once every
     /// tree operation has succeeded.
     fn ensure_node(&self, tree: &mut WidgetTree<WidgetKind>) -> Result<WidgetId, WidgetError> {
-        let expected = tooltip_node(&self.text);
+        let expected = tooltip_node(&self.text, self.assistive_hidden);
         if let Some(id) = self.node
             && self.is_own_node(tree, id)
         {
@@ -806,7 +967,7 @@ impl Tooltip {
         }
         let id = tree.insert(
             self.owner,
-            tooltip_style(self.metrics),
+            tooltip_style(self.metrics, self.frame),
             expected,
             WidgetKind::Tooltip,
         )?;
@@ -2192,5 +2353,168 @@ mod tests {
         };
         assert_eq!(owner.width, scales.typography.size.md);
         assert_eq!(tip.width, 2 * scales.spacing.xs);
+    }
+
+    // ---- placement and measured size (0.262.0) ------------------------
+
+    use super::{MAX_WIDTH_STEPS, TooltipSide};
+    use aurora_text::TextEngine;
+
+    fn bounds_of(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> aurora_core::Rect {
+        match tree.bounds(id) {
+            Some(b) => b,
+            None => unreachable!("laid out"),
+        }
+    }
+
+    fn engine() -> TextEngine {
+        match TextEngine::new() {
+            Ok(engine) => engine,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    #[test]
+    fn placing_an_unshown_tooltip_does_nothing_and_a_gone_owner_errors() {
+        let (mut tree, button, mut tooltip) = fixture();
+        tree.compute_layout(200.0, 120.0);
+        assert!(!ok(tooltip.place(
+            &mut tree,
+            (60.0, 20.0),
+            (200.0, 120.0),
+            TooltipSide::Below
+        )));
+        assert_eq!(tooltip.frame, None);
+        ok(tree.remove(button));
+        assert!(matches!(
+            tooltip.place(&mut tree, (60.0, 20.0), (200.0, 120.0), TooltipSide::Below),
+            Err(WidgetError::UnknownWidget(id)) if id == button
+        ));
+    }
+
+    #[test]
+    fn a_placed_tooltip_lands_exactly_where_place_tooltip_says() {
+        let (mut tree, button, mut tooltip) = fixture();
+        tree.compute_layout(200.0, 120.0);
+        let node = show(&mut tree, &mut tooltip, Instant::now());
+        let size = (90.0, 20.0);
+        let window = (200.0, 120.0);
+        assert!(ok(tooltip.place(
+            &mut tree,
+            size,
+            window,
+            TooltipSide::Below
+        )));
+        tree.compute_layout(200.0, 120.0);
+        let owner = bounds_of(&tree, button);
+        let expected =
+            super::place_tooltip(owner, size, window, tooltip.metrics.gap, TooltipSide::Below);
+        let tip = bounds_of(&tree, node);
+        assert_eq!((tip.x as f32, tip.y as f32), (expected.x, expected.y));
+        assert_eq!((tip.width, tip.height), (90, 20));
+        // Idempotent: the same answer changes nothing.
+        assert!(!ok(tooltip.place(
+            &mut tree,
+            size,
+            window,
+            TooltipSide::Below
+        )));
+    }
+
+    #[test]
+    fn a_tooltip_near_the_window_edge_is_kept_inside_it() {
+        let (mut tree, _button, mut tooltip) = fixture();
+        tree.compute_layout(200.0, 120.0);
+        let node = show(&mut tree, &mut tooltip, Instant::now());
+        // A window barely larger than the owner's corner: the box is
+        // slid back inside rather than clipped.
+        let window = (60.0, 40.0);
+        ok(tooltip.place(&mut tree, (50.0, 20.0), window, TooltipSide::Below));
+        tree.compute_layout(200.0, 120.0);
+        let tip = bounds_of(&tree, node);
+        assert!(tip.x >= 0 && tip.y >= 0, "{tip:?}");
+        assert!(tip.x + i64::from(tip.width) <= 60, "{tip:?}");
+        assert!(tip.y + i64::from(tip.height) <= 40, "{tip:?}");
+    }
+
+    #[test]
+    fn hiding_forgets_the_placement_so_the_next_show_is_placed_afresh() {
+        let (mut tree, _button, mut tooltip) = fixture();
+        tree.compute_layout(200.0, 120.0);
+        let t0 = Instant::now();
+        show(&mut tree, &mut tooltip, t0);
+        ok(tooltip.place(&mut tree, (60.0, 20.0), (200.0, 120.0), TooltipSide::Below));
+        assert!(tooltip.frame.is_some());
+        ok(tooltip.owner_pressed(&mut tree));
+        assert_eq!(tooltip.frame, None);
+        ok(tooltip.set_hover(&mut tree, false, false, t0));
+        ok(tooltip.set_hover(&mut tree, true, false, t0));
+        ok(tooltip.tick(&mut tree, t0 + DELAY));
+        assert!(ok(tooltip.place(
+            &mut tree,
+            (60.0, 20.0),
+            (200.0, 120.0),
+            TooltipSide::Below
+        )));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn the_measured_size_follows_the_text_and_is_capped() {
+        let scales = test_scales();
+        let (tree, button, _) = fixture();
+        let mut engine = engine();
+        let make = |text: &str| ok(Tooltip::new(&tree, button, &scales, text, DELAY));
+        let short = make("Brush (B)").measured_size(Some(&mut engine), &scales, 1.0);
+        let long =
+            make("Elliptical Marquee (Shift+M)").measured_size(Some(&mut engine), &scales, 1.0);
+        assert!(long.0 > short.0, "{long:?} vs {short:?}");
+        let pad = 2.0 * spacing(scales.spacing.xs);
+        assert!(short.0 > pad, "text plus padding: {short:?}");
+        assert!(
+            short.1 >= type_size(scales.typography.size.xs) + 2.0 * spacing(scales.spacing.xxs)
+        );
+        let huge = "W".repeat(400);
+        let capped = make(&huge).measured_size(Some(&mut engine), &scales, 1.0);
+        assert_eq!(
+            capped.0,
+            spacing(scales.spacing.xxxl) * MAX_WIDTH_STEPS as f32,
+            "capped at five xxxl steps"
+        );
+        // Without an engine it still answers, finite and capped.
+        let blind = make(&huge).measured_size(None, &scales, 1.0);
+        assert_eq!(blind.0, capped.0);
+        // The width does not depend on the display scale factor: it is logical.
+        let at2 = make("Brush (B)").measured_size(Some(&mut engine), &scales, 2.0);
+        assert!((at2.0 - short.0).abs() <= 1.0, "{at2:?} vs {short:?}");
+    }
+
+    #[test]
+    fn an_assistive_hidden_tooltip_is_hidden_and_the_default_is_not() {
+        let (mut tree, _b, mut plain) = fixture();
+        let node = show(&mut tree, &mut plain, Instant::now());
+        let hidden_default = tree
+            .accessibility(node)
+            .is_some_and(accesskit::Node::is_hidden);
+        assert!(!hidden_default, "default: announced like before");
+        let (mut tree, button, _) = fixture();
+        let mut quiet = ok(Tooltip::new(
+            &tree,
+            button,
+            &test_scales(),
+            "Apply the change",
+            DELAY,
+        ))
+        .with_assistive_hidden(true);
+        let node = show(&mut tree, &mut quiet, Instant::now());
+        let access = tree.accessibility(node);
+        assert!(access.is_some_and(accesskit::Node::is_hidden));
+        assert_eq!(access.and_then(|n| n.label()), Some("Apply the change"));
+        // The owner's node is untouched either way.
+        assert!(
+            !tree
+                .accessibility(button)
+                .is_some_and(accesskit::Node::is_hidden)
+        );
     }
 }

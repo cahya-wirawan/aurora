@@ -601,7 +601,8 @@ pub fn text_runs(
                     size_px: token_px(scales.typography.size.xs),
                     ..style
                 };
-                TextRun {
+                // A tooltip capped at its maximum width ends in "…".
+                ellipsized(TextRun {
                     style: small,
                     ..run(
                         label,
@@ -609,7 +610,7 @@ pub fn text_runs(
                         inset_x(full, token_px(scales.spacing.xs)),
                         HAlign::Start,
                     )
-                }
+                })
             })
             .into_iter()
             .collect(),
