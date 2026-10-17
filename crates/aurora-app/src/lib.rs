@@ -23791,7 +23791,11 @@ impl RecompositeTileCosts {
 /// with a cold driver pipeline cache). Blend-mode pipelines stay lazy:
 /// all 18 cost about 138 ms with a cold driver cache (6 ms warm). Every
 /// `wgpu` error is captured and logged, so a failed prewarm never aborts
-/// startup; the first frame then builds the pipeline exactly as before.
+/// startup, and what a failed build may have cached (an invalid handle)
+/// is dropped -- a fresh `CanvasPipeline` here, an emptied cache inside
+/// `TileCompositor::prewarm` -- so the first frame builds the pipelines
+/// lazily, as it did before the prewarm (where a failing build fails as
+/// it always did).
 fn prewarm_gpu_pipelines(
     device: &wgpu::Device,
     canvas_pipeline: &mut aurora_gpu::CanvasPipeline,
@@ -23801,6 +23805,9 @@ fn prewarm_gpu_pipelines(
     if let Err(err) = aurora_render::capture_wgpu_errors(device, || {
         let _ = canvas_pipeline.pipeline(device, surface_format);
     }) {
+        // A failed build leaves an invalid pipeline cached; a fresh
+        // `CanvasPipeline` builds it again on the first frame.
+        *canvas_pipeline = aurora_gpu::CanvasPipeline::new(device);
         tracing::warn!(
             %err,
             "prewarming the canvas pipeline failed; it will be built on first use"
