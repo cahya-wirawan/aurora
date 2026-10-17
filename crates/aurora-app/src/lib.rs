@@ -14857,7 +14857,8 @@ fn active_layer_origin(
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct PanBounds {
     /// The lowest document-space position the canvas area's own
-    /// top-left corner may show — [`active_layer_origin`].
+    /// top-left corner may show — [`active_layer_origin`], the document
+    /// corner since 0.268.0.
     min_doc: (f32, f32),
     /// The highest document-space position the canvas area's own
     /// bottom-right corner may show — `min_doc` plus
@@ -25574,8 +25575,8 @@ fn install_composited_tile(
 /// discipline `TileResidency::sync` itself already uses.
 ///
 /// **Per-layer origins, handled for real**: the atlas's own visible
-/// grid is anchored to `active_layer`'s own document-space origin
-/// (`canvas_local_origin`'s own doc comment) — for a layer that
+/// grid is anchored to the document's own origin since 0.268.0
+/// (`DOCUMENT_GRID_ORIGIN`; before that, `min(active layer origin, 0)`) — for a layer that
 /// shares that exact origin, its own `TileId` space already lines up,
 /// so its tile is read directly; for one that doesn't (a document with
 /// two layers at different `bounds`, e.g. after a Move), a document-
@@ -30159,8 +30160,8 @@ fn canvas_local_origin(view: &aurora_ui::CanvasView, layer_origin: (f32, f32)) -
 /// The document rectangle in the composite grid's own pixels — what
 /// [`aurora_gpu::TileResidency::set_document_clip`] takes (0.193.0): the
 /// document's `(0, 0)..(width, height)` minus the grid anchor
-/// ([`active_layer_origin`]), the same offset [`canvas_local_origin`]
-/// subtracts, so the clip lands on the document wherever the anchor is.
+/// ([`active_layer_origin`], the document origin since 0.268.0), the same
+/// offset [`canvas_local_origin`] subtracts.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 fn document_clip_rect(canvas_size: (u32, u32), anchor: (f32, f32)) -> (f32, f32, f32, f32) {
@@ -75466,7 +75467,7 @@ mod tests {
     // `max_doc` is that plus one constant: one addition, not an
     // accumulated computation.
     #[allow(clippy::float_cmp)]
-    fn the_far_pan_bound_is_the_active_layers_origin_plus_the_document_ceiling() {
+    fn the_far_pan_bound_is_the_document_ceiling_for_every_layer() {
         // The design decision, pinned directly so a later
         // "simplification" to a bare ceiling constant fails here rather
         // than silently in the app. It is neither the raw document

@@ -32,6 +32,10 @@ use aurora_widgets::{
 };
 
 /// The inputs every cached mesh depends on besides its own key.
+///
+/// The GPU device is not part of it: it is created once in `resumed` and
+/// never recreated. A future device-loss recovery must clear the cache,
+/// because the cached buffers belong to the old device.
 #[derive(Debug, Clone, PartialEq)]
 struct Globals {
     theme: Theme,
