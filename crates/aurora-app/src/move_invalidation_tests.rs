@@ -104,7 +104,7 @@ impl Shown {
     }
 }
 
-fn pixel_layers(layers: &aurora_doc::LayerTree) -> Vec<aurora_doc::LayerId> {
+pub(super) fn pixel_layers(layers: &aurora_doc::LayerTree) -> Vec<aurora_doc::LayerId> {
     let mut out = Vec::new();
     let mut pending: Vec<aurora_doc::LayerId> = layers.roots().to_vec();
     while let Some(id) = pending.pop() {
@@ -117,7 +117,7 @@ fn pixel_layers(layers: &aurora_doc::LayerTree) -> Vec<aurora_doc::LayerId> {
 }
 
 /// Every reaching effect kind, on top of whatever the generator gave.
-fn reaching_effects(rng: &mut Rng) -> aurora_core::LayerEffects {
+pub(super) fn reaching_effects(rng: &mut Rng) -> aurora_core::LayerEffects {
     let mut fx = aurora_core::LayerEffects::default();
     if rng.chance(60) {
         fx.drop_shadows.push(aurora_core::effects::DropShadow {
@@ -193,7 +193,8 @@ fn run_moves(
             unreachable!("a pixel layer");
         };
         let (x, y) = if rng.chance(15) {
-            // Across the anchor sometimes: negative coordinates move it.
+            // Across the document corner sometimes: negative coordinates
+            // (which moved the anchor before 60 FPS round 3).
             (rng.below(500) as i64 - 250, rng.below(500) as i64 - 250)
         } else {
             (
@@ -282,7 +283,9 @@ fn random_trees_narrow_move_equals_full_recomposite() {
          {masked} extra masks"
     );
     assert!(narrow > 100, "the narrow path ran: {narrow}");
-    assert!(bumped > 10, "the anchor bump ran: {bumped}");
+    // 60 FPS round 3: the grid is the document's, so a move to a negative
+    // origin narrows too and nothing bumps.
+    assert_eq!(bumped, 0, "the anchor never moves: {bumped}");
     assert!(kept > 1000, "narrowing kept tiles to check: {kept}");
     assert!(
         invalidated > 100,
@@ -348,7 +351,7 @@ fn a_moved_clip_base_under_effects_and_adjustments_equals_full_recomposite() {
 }
 
 #[test]
-fn a_move_across_the_anchor_bumps_and_one_inside_it_does_not() {
+fn a_move_to_a_negative_origin_narrows_like_one_inside_the_document() {
     let (_d, mut store) = store_with_budget(64);
     let mut layers = aurora_doc::LayerTree::new();
     let id = layer(
@@ -388,8 +391,16 @@ fn a_move_across_the_anchor_bumps_and_one_inside_it_does_not() {
         id,
         rect(-5, 10, 100, 100),
     ));
-    assert_eq!(r, MoveInvalidation::Everything, "the anchor moved");
-    assert!(!cache.is_current(aurora_tile::TileId { x: 3, y: 3 }));
+    // 60 FPS round 3: a negative origin no longer moves the anchor, so the
+    // move narrows: the stored tile at x 20 covers columns 0 and 1, at x -5
+    // column 0 (x -5..251), on rows 0 and 1 (already stale from the first
+    // move, so they need not be counted again).
+    assert!(
+        matches!(r, MoveInvalidation::Narrow(_)),
+        "the anchor held: {r:?}"
+    );
+    assert!(cache.is_current(aurora_tile::TileId { x: 3, y: 3 }));
+    assert!(cache.is_current(aurora_tile::TileId { x: 2, y: 0 }));
 }
 
 /// The cost of a 256-px-tile layer moved over the old content's edge: the
@@ -561,7 +572,7 @@ fn apron_case(fx: aurora_core::LayerEffects) {
     );
 }
 
-fn corpus_files() -> Vec<std::path::PathBuf> {
+pub(super) fn corpus_files() -> Vec<std::path::PathBuf> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpora/psd/reference");
     let mut pending = vec![root];
     let mut files = Vec::new();
@@ -722,6 +733,88 @@ fn move_drag_recomposite_cost_is_measured() {
             let max = times.iter().copied().fold(0.0, f64::max);
             println!(
                 "move drag ({}): run {run} n={FRAMES} mean={mean:.2}ms max={max:.2}ms \
+                 recomposited={:.1} tiles/event of {}",
+                if narrow { "narrow" } else { "bump" },
+                f64::from(recomposited) / FRAMES as f64,
+                view.len()
+            );
+            assert!(mean < 5000.0, "CI-safety bound only: {mean:.2}ms");
+        }
+    }
+}
+
+/// 60 FPS round 3: the same drag as [`move_drag_recomposite_cost_is_measured`]
+/// but for a layer that stays at a negative origin (the common PSD case,
+/// Nyepi's layers sit at (-124, -36)). While the grid was anchored at
+/// `min(active origin, 0)` the anchor moved with the layer and every event
+/// re-composited the whole view; the grid is anchored to the document now.
+/// The "bump" rows are the whole-view recomposite, the "narrow" rows what
+/// [`move_layer_live`] invalidates. Prints timings, asserts a CI-safe bound.
+#[test]
+fn negative_origin_move_drag_recomposite_cost_is_measured() {
+    const FRAMES: usize = 40;
+    let (_d, mut store) = store_with_budget(512);
+    let mut layers = aurora_doc::LayerTree::new();
+    let _ = layer(
+        &mut layers,
+        &mut store,
+        None,
+        rect(-124, -36, 2296, 1352),
+        &opaque,
+    );
+    let mid = layer(
+        &mut layers,
+        &mut store,
+        None,
+        rect(-124, -36, 2296, 1352),
+        &translucent,
+    );
+    ok(layers.set_blend_mode(mid, aurora_doc::BlendMode::Multiply));
+    let start = rect(-400, -200, 600, 500);
+    let moved = layer(&mut layers, &mut store, None, start, &opaque);
+    let view: Vec<aurora_tile::TileId> = (0..5)
+        .flat_map(|y| (0..8).map(move |x| aurora_tile::TileId { x, y }))
+        .collect();
+    for run in 0..3 {
+        for narrow in [false, true] {
+            ok(layers.set_bounds(moved, start));
+            let mut cache = CompositeCache::default();
+            let reference = composite_reference_origin(&layers, Some(moved));
+            for &id in &view {
+                let _ = composite(&layers, &mut store, id, reference, false);
+                cache.mark_current(id);
+            }
+            let mut times = Vec::with_capacity(FRAMES);
+            let mut recomposited = 0;
+            for frame in 0..FRAMES {
+                let t0 = std::time::Instant::now();
+                let to = rect(-400 + 7 * frame as i64, -200 + 3 * frame as i64, 600, 500);
+                if narrow {
+                    let _ = ok(move_layer_live(
+                        &mut layers,
+                        &mut cache,
+                        Some(&store),
+                        Some(moved),
+                        moved,
+                        to,
+                    ));
+                } else {
+                    ok(layers.set_bounds(moved, to));
+                    cache.bump();
+                }
+                let reference = composite_reference_origin(&layers, Some(moved));
+                for &id in &view {
+                    if !cache.is_current(id) {
+                        let _ = composite(&layers, &mut store, id, reference, false);
+                        cache.mark_current(id);
+                        recomposited += 1;
+                    }
+                }
+                times.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            let mean = times.iter().sum::<f64>() / times.len() as f64;
+            println!(
+                "negative-origin move drag ({}): run {run} n={FRAMES} mean={mean:.2}ms \
                  recomposited={:.1} tiles/event of {}",
                 if narrow { "narrow" } else { "bump" },
                 f64::from(recomposited) / FRAMES as f64,

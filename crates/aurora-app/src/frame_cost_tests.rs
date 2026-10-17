@@ -284,7 +284,7 @@ fn transparent_tile_seed_is_measured() {
 }
 
 /// A dab on a layer whose origin is inside the document (so the composite
-/// grid's anchor, `min(origin, 0)`, is not the layer origin) must make the
+/// grid's anchor, the document corner, is not the layer origin) must make the
 /// composite tiles under the painted area stale, and only those. Before
 /// the 0.265.0 fix it invalidated composite tile (0, 0) (the painted
 /// layer-local id) and left (1, 0), (2, 0), (1, 1), (2, 1) current.
@@ -321,14 +321,16 @@ fn a_dab_on_a_layer_inside_the_document_invalidates_the_tiles_it_lands_on() {
 fn a_dab_on_a_layer_at_the_anchor_invalidates_exactly_its_painted_tile() {
     let mut layers = aurora_doc::LayerTree::new();
     let bounds = aurora_core::Rect {
-        x: -124,
-        y: -36,
+        x: 0,
+        y: 0,
         width: 1024,
         height: 1024,
     };
     let id = ok(layers.add_pixel_layer("anchor", bounds, None));
     let reference = crate::composite_reference_origin(&layers, Some(id));
-    assert_eq!(reference, (-124, -36));
+    // 60 FPS round 3: the anchor is the document corner, so a layer there
+    // is the one whose painted ids are composite ids.
+    assert_eq!(reference, (0, 0));
     let mut cache = crate::CompositeCache::default();
     for x in 0..4 {
         for y in 0..4 {

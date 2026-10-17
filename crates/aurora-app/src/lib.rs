@@ -540,6 +540,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::window::{Window, WindowId};
 
 mod adjust_app;
+#[cfg(test)]
+mod anchor_tests;
 mod aur_save;
 mod autosave_files;
 mod background_autosave;
@@ -14754,46 +14756,51 @@ fn active_pixel_layer(
 }
 
 /// The document-space point every composite `aurora_tile::TileId` is
-/// measured from — the active layer's own `bounds.x`/`bounds.y` capped at
-/// the document's corner (`min(bounds, 0)` per axis, 0.193.0), or
-/// `(0, 0)` when there is no active layer or it isn't a pixel layer
-/// (the same absent-precondition honesty [`active_pixel_layer`] already
-/// uses).
+/// measured from: **the document's own top-left corner, `(0, 0)`, always**
+/// (60 FPS round 3). The arguments are kept so every caller still names
+/// the state the anchor used to depend on; neither is read.
 ///
-/// **This is the grid anchor, and it is the *only* way "which layer is
-/// active" reaches the composite at all.** `recomposite_visible_tiles`
-/// takes `active_layer` solely to compute this value; every function it
-/// then calls (`begin_gpu_composite_tile`, `composite_roots_into_tile`,
-/// `resolve_tile`) receives `reference_origin` and never the active
-/// layer's own id. So two different active layers that share an origin
-/// produce byte-identical composites for every `TileId`, which is what
-/// lets a layer *switch* skip invalidating the cache when the origin
-/// didn't actually move (`press_layer_row`), and what lets an
-/// undo/redo's own narrowed invalidation be measured against a single,
-/// unmoved anchor (`after_undo_redo`).
+/// Until round 3 the anchor was the active pixel layer's origin capped at
+/// the document corner (`min(bounds, 0)` per axis, 0.193.0), so a live
+/// Move of a layer at a negative origin (most PSD layers, Nyepi's sit at
+/// (-124, -36)) moved the anchor every pointer event and re-composited the
+/// whole view, and switching to a layer at another negative origin
+/// re-anchored the grid. Anchoring to the document removes both. What the
+/// old anchor bought was composite tiles left of or above the document,
+/// and nothing composites those any more: the live canvas is clipped to
+/// the document (`doc_clip`, 0.193.0), the pan bound's near edge is the
+/// document corner ([`pan_bounds`]), and export, the Curves histogram and
+/// the clipboard already composite from `(0, 0)`. Compositing is pointwise
+/// in document space (every reader goes through [`pixel_layer_texels`],
+/// which reads a layer whose origin is off the grid through
+/// `read_layer_window`), so a document pixel composites to the same value
+/// on any grid; the differentials in `anchor_tests` pin that bit for bit.
+///
+/// **It is the *only* way "which layer is active" could reach the
+/// composite, and it no longer does.** `recomposite_visible_tiles` and
+/// `composite_roots_into_tile` receive `reference_origin` and never the
+/// active layer's own id, so the composite is now independent of the
+/// active layer altogether.
 ///
 /// One definition, shared: [`active_layer_origin`] is this same value in
-/// `f32` for the pan-bound/canvas-local-origin math, and
-/// `recomposite_visible_tiles` calls this directly.
+/// `f32` for the pan-bound/canvas-local-origin math (the GPU residency's
+/// origin, the document clip and the eyedropper's composite sample).
 #[must_use]
 fn composite_reference_origin(
-    layers: &aurora_doc::LayerTree,
-    active_layer: Option<aurora_doc::LayerId>,
+    _layers: &aurora_doc::LayerTree,
+    _active_layer: Option<aurora_doc::LayerId>,
 ) -> (i64, i64) {
-    // 0.193.0: never right of / below the document's own corner. A tile
-    // id is unsigned, so the grid cannot show anything left of or above
-    // its anchor; an anchor at a layer origin inside the document (say
-    // (300, 150)) would make the document's top-left unreachable, and
-    // the pan bound is the document rectangle. A layer at a negative
-    // origin (Nyepi's (-124, -36)) still anchors the grid exactly as
-    // before.
-    active_pixel_layer(layers, active_layer)
-        .map_or((0, 0), |(_, bounds)| (bounds.x.min(0), bounds.y.min(0)))
+    DOCUMENT_GRID_ORIGIN
 }
 
-/// The active layer's own document-space origin (`bounds.x`/`bounds.y`,
-/// as `f32`), or `(0.0, 0.0)` if there's no active layer or it isn't a
-/// pixel layer — the `f32` face of [`composite_reference_origin`], which
+/// The composite tile grid's anchor (60 FPS round 3): the document's own
+/// top-left corner. See [`composite_reference_origin`].
+const DOCUMENT_GRID_ORIGIN: (i64, i64) = (0, 0);
+
+/// The composite grid's anchor as `f32` — the document's corner,
+/// `(0.0, 0.0)`, since 60 FPS round 3 (it was the active layer's origin,
+/// later capped at the corner; the name and arguments are historical) —
+/// the `f32` face of [`composite_reference_origin`], which
 /// it delegates to so the anchor has exactly one definition. What
 /// [`canvas_local_origin`]
 /// needs to convert a document-space point into the active layer's own
@@ -14804,9 +14811,10 @@ fn composite_reference_origin(
 /// **This value is also the canvas pan boundary**, both edges of it
 /// ([`pan_bounds`], [`clamp_pan_to_active_layer`]) — the near one is
 /// this origin and the far one is this origin plus the document
-/// ceiling. So the bound moves when *either* of this function's two
-/// inputs does: a different layer becoming active, or the active
-/// layer's own `bounds` changing under it.
+/// ceiling. Before 60 FPS round 3 the bound moved when *either* of this
+/// function's two inputs did (a different layer becoming active, or the
+/// active layer's own `bounds` changing under it); it no longer reads
+/// either, and the re-clamps those paths do are now no-ops.
 ///
 /// **And since 0.57.10 there is a third input that is not one of
 /// this function's own**: the canvas area's own logical size
@@ -14895,10 +14903,10 @@ fn pan_bounds(
     // 0.193.0: the near edge is the document's own top-left corner,
     // whichever layer is active (it used to be that layer's origin, which
     // offset the artboard by the layer's negative origin and hid the
-    // document's left/top part behind a positive one). The grid anchor
-    // ([`active_layer_origin`]) is never right of or below it, so the
-    // corner is always addressable. The far edge is still measured from
-    // the anchor, as `TileResidency::set_origin` clamps it.
+    // document's left/top part behind a positive one). Since 60 FPS round 3
+    // the grid anchor ([`active_layer_origin`]) IS that corner. The far
+    // edge is still measured from the anchor, as
+    // `TileResidency::set_origin` clamps it.
     let anchor = active_layer_origin(layers, active_layer);
     let min_doc = (0.0, 0.0);
     PanBounds {
@@ -17941,12 +17949,10 @@ fn invalidate_painted_tiles(
         .collect();
     let reach = effect_reach_rects(layers, layer, &rects);
     // 0.265.0 (fix): the painted ids are composite ids only when the layer's
-    // origin IS the grid anchor. Since 0.193.0 the anchor is
-    // `min(origin, 0)` per axis, so a layer at a positive origin (most PSD
-    // layers, any layer moved into the document) painted the right pixels
-    // but left the composite tiles they land on marked current, and
-    // invalidated tile ids that cover other pixels instead. Such a layer's
-    // painted area goes through the document-space rectangles.
+    // origin IS the grid anchor, which since 60 FPS round 3 is the
+    // document's corner: a layer at any other origin (most PSD layers, any
+    // moved layer) has its painted area mapped through the document-space
+    // rectangles.
     if !anchored || reach.len() > rects.len() {
         cache.invalidate_doc_rects(&reach, reference_origin);
     }
@@ -42321,8 +42327,10 @@ mod tests {
     /// the anchor still has to invalidate everything, because every
     /// cached `TileId` now names a *different* document-space window.
     #[test]
-    fn switching_to_a_layer_at_a_different_origin_invalidates_every_cached_tile() {
-        // `b` at a negative origin: the only kind that moves the anchor.
+    fn switching_to_a_layer_at_a_different_origin_keeps_every_cached_tile() {
+        // `b` at a negative origin: the only kind that moved the anchor
+        // before 60 FPS round 3. The grid is the document's now, so the
+        // switch keeps the cache.
         let (mut workspace, layers, layer_rows, a, b) = two_layers_one_negative();
         let mut history = aurora_doc::History::new();
         let mut pixel_history = aurora_brush::PixelHistory::new();
@@ -42341,9 +42349,14 @@ mod tests {
             cache.mark_current(tile);
         }
         assert_ne!(
+            layers.bounds(a).map(|r| (r.x, r.y)),
+            layers.bounds(b).map(|r| (r.x, r.y)),
+            "setup: `b` really is somewhere else"
+        );
+        assert_eq!(
             composite_reference_origin(&layers, Some(a)),
             composite_reference_origin(&layers, Some(b)),
-            "setup: `b` really is somewhere else"
+            "the anchor does not follow the active layer"
         );
 
         press_layer_row(
@@ -42363,9 +42376,8 @@ mod tests {
         assert_eq!(active_layer, Some(b));
         for tile in cached {
             assert!(
-                !cache.is_current(tile),
-                "the anchor moved, so {tile:?} names a different window now and must be \
-                 recomputed"
+                cache.is_current(tile),
+                "the anchor held, so {tile:?} still names the same window"
             );
         }
     }
@@ -75300,14 +75312,14 @@ mod tests {
                 "zoom {zoom}"
             );
         }
-        // The render anchor is still the layer's origin, so the document
-        // corner sits (124, 36) inside the grid: addressable, not negative.
-        assert_eq!(active_layer_origin(&layers, Some(id)), (-124.0, -36.0));
+        // 60 FPS round 3: the render anchor is the document corner, not the
+        // layer's origin, so the corner sits at the grid's own origin.
+        assert_eq!(active_layer_origin(&layers, Some(id)), (0.0, 0.0));
         let mut view = CanvasView::new();
         clamp_pan_to_active_layer(&mut view, &layers, Some(id), None);
         assert_eq!(
             canvas_local_origin(&view, active_layer_origin(&layers, Some(id))),
-            (124.0, 36.0)
+            (0.0, 0.0)
         );
     }
 
@@ -75340,9 +75352,10 @@ mod tests {
 
     #[test]
     fn the_pan_bound_is_the_document_corner_for_a_mixed_sign_origin() {
-        // Negative on x only: x anchors at the layer, y at the document.
+        // Negative on x only: since 60 FPS round 3 both axes anchor at the
+        // document (x anchored at the layer before).
         let (layers, id) = one_layer_at(-50, 80);
-        assert_eq!(composite_reference_origin(&layers, Some(id)), (-50, 0));
+        assert_eq!(composite_reference_origin(&layers, Some(id)), (0, 0));
         assert_eq!(
             corner_after_panning_to_the_extreme(&layers, Some(id), None, 1.0),
             (0.0, 0.0)
@@ -75452,12 +75465,12 @@ mod tests {
         assert_eq!(at_origin.min_doc, (0.0, 0.0));
         assert_eq!(at_origin.max_doc, (ceiling, ceiling));
 
-        // The moved layer's own bounds are (-300, -150) -- the grid
-        // anchor, and so the far end of the bound, move with it (0.193.0:
-        // the near end is always the document corner).
+        // The moved layer's own bounds are (-300, -150). Until 60 FPS round 3
+        // the grid anchor, and so the far end of the bound, moved with it;
+        // the anchor is the document corner now, for every layer.
         let moved = pan_bounds(&layers, Some(b), None);
         assert_eq!(moved.min_doc, (0.0, 0.0));
-        assert_eq!(moved.max_doc, (-300.0 + ceiling, -150.0 + ceiling));
+        assert_eq!(moved.max_doc, (ceiling, ceiling));
     }
 
     /// **The headline test.** Panning wildly past the document's far
@@ -75497,7 +75510,7 @@ mod tests {
         // bound, not merely somewhere no-longer-past it.
         let far = view.to_document(canvas);
         assert!(
-            (far.0 - (ceiling - 300.0)).abs() <= 1.0 && (far.1 - (ceiling - 150.0)).abs() <= 1.0,
+            (far.0 - ceiling).abs() <= 1.0 && (far.1 - ceiling).abs() <= 1.0,
             "the far corner must be pinned on max_doc; got {far:?}"
         );
     }
@@ -75559,8 +75572,7 @@ mod tests {
 
         let at_logical = view.to_document(logical);
         assert!(
-            (at_logical.0 - (ceiling - 300.0)).abs() <= 1.0
-                && (at_logical.1 - (ceiling - 150.0)).abs() <= 1.0,
+            (at_logical.0 - ceiling).abs() <= 1.0 && (at_logical.1 - ceiling).abs() <= 1.0,
             "the far corner must land on max_doc at the *logical* canvas size; \
              got {at_logical:?}"
         );
@@ -75719,7 +75731,7 @@ mod tests {
         pan_bounds(&layers, Some(b), Some(small)).apply(&mut view);
         let pinned = view.to_document(small);
         assert!(
-            (pinned.0 - (ceiling - 300.0)).abs() <= 1.0,
+            (pinned.0 - ceiling).abs() <= 1.0,
             "setup: pinned exactly on the far bound at the small canvas; \
              got {pinned:?}"
         );
