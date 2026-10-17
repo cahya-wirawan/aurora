@@ -963,11 +963,101 @@ fn soft_light_d(x: f32) -> f32 {
 /// `ColorDodge(Cb, 2 * Cs - 1)` above, with those modes' own guard order
 /// (`Cb == 1` and `Cb == 0` first). Before 0.243.0 this was `VividLight`
 /// itself; `HardMix`, which thresholds it, still matches Photoshop with it.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn vivid_light_legacy(cb: f32, cs: f32) -> f32 {
     if cs <= 0.5 {
-        blend_channel(BlendMode::ColorBurn, cb, 2.0 * cs)
+        blend_color_burn(cb, 2.0 * cs)
     } else {
-        blend_channel(BlendMode::ColorDodge, cb, 2.0 * cs - 1.0)
+        blend_color_dodge(cb, 2.0 * cs - 1.0)
+    }
+}
+
+// 60 FPS round 7: the arms other arms reuse, as their own functions.
+// Until round 7 those arms called `blend_channel` itself, and a
+// recursive function is never inlined, `#[inline(always)]` or not, so
+// every blend term of the CPU fold was a call through the full `match`.
+// The bodies are the arms' own, verbatim.
+
+/// `Difference`: `|Cb - Cs|`. Deliberately never inlined (60 FPS round
+/// 7): inlined, the release build picks the other operand of
+/// `fold_texel_with`'s `backdrop_inverse * Cs + backdrop_alpha * B` when
+/// both are NaN (a negative NaN source channel), which changes the NaN's
+/// payload in 18,414 samples of
+/// `per_mode_fold_is_bit_identical_to_the_round5_loop_over_every_f16_pattern`.
+/// Called, the shipping build keeps main's bits, NaN payloads included.
+#[inline(never)]
+fn blend_difference(cb: f32, cs: f32) -> f32 {
+    (cb - cs).abs()
+}
+
+/// `Darken`: `min(Cb, Cs)`.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn blend_darken(cb: f32, cs: f32) -> f32 {
+    cb.min(cs)
+}
+
+/// `Multiply`: `Cb * Cs`.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn blend_multiply(cb: f32, cs: f32) -> f32 {
+    cb * cs
+}
+
+/// `Lighten`: `max(Cb, Cs)`.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn blend_lighten(cb: f32, cs: f32) -> f32 {
+    cb.max(cs)
+}
+
+/// `Screen`: `Cb + Cs - Cb * Cs`.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn blend_screen(cb: f32, cs: f32) -> f32 {
+    cb + cs - cb * cs
+}
+
+/// `ColorDodge`, with its `Cb == 0` then `Cs == 1` guards.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+// Exact guards, as `blend_channel`'s arms always were.
+#[allow(clippy::float_cmp)]
+fn blend_color_dodge(cb: f32, cs: f32) -> f32 {
+    if cb == 0.0 {
+        0.0
+    } else if cs == 1.0 {
+        1.0
+    } else {
+        (cb / (1.0 - cs)).min(1.0)
+    }
+}
+
+/// `ColorBurn`, with its `Cb == 1` then `Cs == 0` guards.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+// Exact guards, as `blend_channel`'s arms always were.
+#[allow(clippy::float_cmp)]
+fn blend_color_burn(cb: f32, cs: f32) -> f32 {
+    if cb == 1.0 {
+        1.0
+    } else if cs == 0.0 {
+        0.0
+    } else {
+        1.0 - ((1.0 - cb) / cs).min(1.0)
+    }
+}
+
+/// `HardLight`: `Multiply(Cb, 2 Cs)` at `Cs <= 0.5`, else
+/// `Screen(Cb, 2 Cs - 1)`.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn blend_hard_light(cb: f32, cs: f32) -> f32 {
+    if cs <= 0.5 {
+        blend_multiply(cb, 2.0 * cs)
+    } else {
+        blend_screen(cb, 2.0 * cs - 1.0)
     }
 }
 
@@ -1012,11 +1102,11 @@ fn vivid_light_legacy(cb: f32, cs: f32) -> f32 {
 fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
     match mode {
         BlendMode::Normal => cs,
-        BlendMode::Darken => cb.min(cs),
-        BlendMode::Multiply => cb * cs,
-        BlendMode::Lighten => cb.max(cs),
-        BlendMode::Screen => cb + cs - cb * cs,
-        BlendMode::Difference => (cb - cs).abs(),
+        BlendMode::Darken => blend_darken(cb, cs),
+        BlendMode::Multiply => blend_multiply(cb, cs),
+        BlendMode::Lighten => blend_lighten(cb, cs),
+        BlendMode::Screen => blend_screen(cb, cs),
+        BlendMode::Difference => blend_difference(cb, cs),
         BlendMode::Exclusion => cb + cs - 2.0 * cb * cs,
         BlendMode::Subtract => (cb - cs).max(0.0),
         // 0.243.0: `Divide(0, 0)` is `0`, not `1` (Photoshop's merged image
@@ -1033,37 +1123,15 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
                 (cb / cs).min(1.0)
             }
         }
-        BlendMode::ColorDodge => {
-            if cb == 0.0 {
-                0.0
-            } else if cs == 1.0 {
-                1.0
-            } else {
-                (cb / (1.0 - cs)).min(1.0)
-            }
-        }
+        BlendMode::ColorDodge => blend_color_dodge(cb, cs),
         BlendMode::LinearDodge => (cb + cs).min(1.0),
-        BlendMode::ColorBurn => {
-            if cb == 1.0 {
-                1.0
-            } else if cs == 0.0 {
-                0.0
-            } else {
-                1.0 - ((1.0 - cb) / cs).min(1.0)
-            }
-        }
+        BlendMode::ColorBurn => blend_color_burn(cb, cs),
         BlendMode::LinearBurn => (cb + cs - 1.0).max(0.0),
         // HardLight (W3C spec): branches on the *source*. Composed from
         // the two families already implemented above rather than
         // re-derived: `Cs <= 0.5` is `Multiply(Cb, 2*Cs)`, else
         // `Screen(Cb, 2*Cs-1)`.
-        BlendMode::HardLight => {
-            if cs <= 0.5 {
-                blend_channel(BlendMode::Multiply, cb, 2.0 * cs)
-            } else {
-                blend_channel(BlendMode::Screen, cb, 2.0 * cs - 1.0)
-            }
-        }
+        BlendMode::HardLight => blend_hard_light(cb, cs),
         // Overlay (W3C spec): `Overlay(Cb, Cs) = HardLight(Cs, Cb)` --
         // the exact same two formulas as HardLight above, just branching
         // on the backdrop instead of the source. Expressed literally as
@@ -1071,7 +1139,7 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
         // HardLight's own arm above) rather than as an independently
         // re-derived pair of branches, so the "same shape, one flipped"
         // relationship is visible in the code, not just in a comment.
-        BlendMode::Overlay => blend_channel(BlendMode::HardLight, cs, cb),
+        BlendMode::Overlay => blend_hard_light(cs, cb),
         // VividLight: branches on the source, reusing ColorBurn/
         // ColorDodge's own already-implemented 0/1 edge-case handling
         // rather than re-deriving it. `2*Cs` (Cs<=0.5, range [0,1]) and
@@ -1115,9 +1183,9 @@ fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
         // re-deriving it.
         BlendMode::PinLight => {
             if cs <= 0.5 {
-                blend_channel(BlendMode::Darken, cb, 2.0 * cs)
+                blend_darken(cb, 2.0 * cs)
             } else {
-                blend_channel(BlendMode::Lighten, cb, 2.0 * cs - 1.0)
+                blend_lighten(cb, 2.0 * cs - 1.0)
             }
         }
         // HardMix: a hard threshold on VividLight's own result, reusing
@@ -30932,6 +31000,72 @@ mod tests {
     }
 }
 
+/// 60 FPS round 7: per-tile cost of the CPU fold and the straightening
+/// pass, the two-root fixture's two folds (`Normal` onto a transparent
+/// accumulator, `Exclusion` onto an opaque one) and a few more modes.
+/// Prints only; run with `--ignored` in the release profile.
+#[cfg(test)]
+mod fold_timing {
+    use super::*;
+
+    fn tile(texel: [f32; CHANNELS]) -> Vec<f16> {
+        let mut out = Vec::with_capacity(SAMPLES);
+        for i in 0..SAMPLES / CHANNELS {
+            #[allow(clippy::cast_precision_loss)]
+            let wobble = (i % 251) as f32 / 4096.0;
+            out.extend(texel.map(|c| f16::from_f32((c - wobble).max(0.0))));
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "timing only; run with --ignored --nocapture in release"]
+    fn time_the_fold_and_the_straighten_per_tile() {
+        const RUNS: u32 = 200;
+        let backdrop = tile([0.20, 0.35, 0.55, 1.0]);
+        let canvas = tile([0.675, 0.45, 0.1875, 0.75]);
+        let time = |label: &str, f: &mut dyn FnMut()| {
+            f();
+            let started = std::time::Instant::now();
+            for _ in 0..RUNS {
+                f();
+            }
+            println!(
+                "fold timing: {label}: {:.3} ms per tile",
+                started.elapsed().as_secs_f64() * 1000.0 / f64::from(RUNS)
+            );
+        };
+        time("Normal onto transparent", &mut || {
+            let mut out = transparent_tile();
+            composite_layer_into(&mut out, &backdrop, 1.0, BlendMode::Normal);
+            std::hint::black_box(&out);
+        });
+        for mode in [
+            BlendMode::Normal,
+            BlendMode::Exclusion,
+            BlendMode::Multiply,
+            BlendMode::Overlay,
+            BlendMode::ColorDodge,
+            BlendMode::SoftLight,
+            BlendMode::Hue,
+        ] {
+            time(&format!("{mode:?} onto opaque"), &mut || {
+                let mut out = backdrop.clone();
+                composite_layer_into(&mut out, &canvas, 1.0, mode);
+                std::hint::black_box(&out);
+            });
+        }
+        time("straighten an opaque tile", &mut || {
+            let mut out = backdrop.clone();
+            un_premultiply_in_place(&mut out);
+            std::hint::black_box(&out);
+        });
+        time("clone a tile (baseline)", &mut || {
+            std::hint::black_box(backdrop.clone());
+        });
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
 mod pole_tests {
@@ -30973,5 +31107,113 @@ mod pole_tests {
         assert_eq!(blend_channel(BlendMode::HardMix, 1.0, 0.0), 1.0);
         assert_eq!(blend_channel(BlendMode::HardMix, 0.75, 0.75), 1.0);
         assert_eq!(blend_channel(BlendMode::HardMix, 0.25, 0.25), 0.0);
+    }
+}
+
+/// 60 FPS round 7: a fingerprint of the CPU fold and the straightening pass
+/// over every `f16` bit pattern in each input sample, every mode and three
+/// opacities, one FNV-1a hash per configuration, written to the file named
+/// by `AURORA_FOLD_FINGERPRINT`. Run in two builds and diff the files to
+/// compare them bit for bit, NaN payloads included.
+#[cfg(test)]
+mod fold_fingerprint {
+    use super::*;
+
+    const MODES: [BlendMode; 26] = [
+        BlendMode::Normal,
+        BlendMode::Darken,
+        BlendMode::Multiply,
+        BlendMode::Lighten,
+        BlendMode::Screen,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+        BlendMode::Subtract,
+        BlendMode::Divide,
+        BlendMode::ColorDodge,
+        BlendMode::LinearDodge,
+        BlendMode::ColorBurn,
+        BlendMode::LinearBurn,
+        BlendMode::Overlay,
+        BlendMode::SoftLight,
+        BlendMode::HardLight,
+        BlendMode::VividLight,
+        BlendMode::LinearLight,
+        BlendMode::PinLight,
+        BlendMode::HardMix,
+        BlendMode::Hue,
+        BlendMode::Saturation,
+        BlendMode::Color,
+        BlendMode::Luminosity,
+        BlendMode::DarkerColor,
+        BlendMode::LighterColor,
+    ];
+
+    fn fnv(samples: &[f16]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for sample in samples {
+            for byte in sample.to_bits().to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    fn every_pattern_at(
+        position: usize,
+        backdrop: [f32; 4],
+        source: [f32; 4],
+    ) -> (Vec<f16>, Vec<f16>) {
+        let mut dst = Vec::with_capacity(SAMPLES);
+        let mut src = Vec::with_capacity(SAMPLES);
+        for pattern in 0..=u16::MAX {
+            let mut d = backdrop.map(f16::from_f32);
+            let mut s = source.map(f16::from_f32);
+            let slot = if position < 4 {
+                d.get_mut(position)
+            } else {
+                s.get_mut(position - 4)
+            };
+            if let Some(slot) = slot {
+                *slot = f16::from_bits(pattern);
+            }
+            dst.extend_from_slice(&d);
+            src.extend_from_slice(&s);
+        }
+        (dst, src)
+    }
+
+    #[test]
+    #[ignore = "writes a fingerprint file; run with --ignored"]
+    fn write_the_fold_fingerprint() {
+        let Some(path) = std::env::var_os("AURORA_FOLD_FINGERPRINT") else {
+            return;
+        };
+        let mut lines = Vec::new();
+        for skip in [false, true] {
+            set_transparent_skip_enabled(skip);
+            for backdrop in [
+                [0.2, 0.35, 0.55, 1.0],
+                [0.15, 0.05, 0.1, 0.5],
+                [0.0, 0.0, 0.0, 0.0],
+            ] {
+                for source in [[0.9, 0.6, 0.25, 0.75], [0.3, 0.8, 0.1, 1.0]] {
+                    for position in 0..8 {
+                        let (dst, src) = every_pattern_at(position, backdrop, source);
+                        for mode in MODES {
+                            for opacity in [1.0, 0.5, 0.0] {
+                                let mut out = dst.clone();
+                                composite_layer_into(&mut out, &src, opacity, mode);
+                                lines.push(format!("{skip} {backdrop:?} {source:?} {position} {mode:?} {opacity} {:016x}", fnv(&out)));
+                                un_premultiply_in_place(&mut out);
+                                lines.push(format!("straightened {skip} {backdrop:?} {source:?} {position} {mode:?} {opacity} {:016x}", fnv(&out)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        set_transparent_skip_enabled(true);
+        let _ = std::fs::write(path, lines.join("\n"));
     }
 }
