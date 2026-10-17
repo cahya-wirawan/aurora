@@ -2568,6 +2568,54 @@ impl TileCompositor {
         }
     }
 
+    /// Builds, ahead of first use, the render pipelines every document's
+    /// first GPU composite needs: the two `Normal` passes
+    /// ([`Self::composite_over`], [`Self::composite_over_with_opacity`])
+    /// and, when `blend_modes` is true, every blend-math pass. Returns how
+    /// many pipelines it newly created.
+    ///
+    /// 60 FPS round 5: without it the first GPU-composited tile of a
+    /// session paid the pipeline build (10-17 ms on an RTX 3090/Vulkan,
+    /// the largest single cost of the gate fixture's slowest idle frame).
+    /// Each pipeline is built from exactly the [`PipelineKey`], layout and
+    /// label its composite call builds lazily, so the cache entry is the
+    /// one that call would have made and no pixel can change.
+    pub fn prewarm(&mut self, device: &wgpu::Device, blend_modes: bool) -> usize {
+        let before = self.pipelines.len();
+        let shader = &self.shader;
+        for (fragment_entry, layout) in [
+            ("fs_composite", &self.bind_group_layout),
+            ("fs_composite_opacity", &self.bind_group_layout_opacity),
+        ] {
+            let key = PipelineKey {
+                shader: LABEL,
+                vertex_entry: "vs_composite",
+                fragment_entry,
+                target_format: wgpu::TextureFormat::Rgba16Float,
+                blend: Blend::AlphaBlending,
+            };
+            let _ = self.pipelines.get_or_create_with(key.clone(), || {
+                composite_pipeline(device, shader, &key, layout, LABEL)
+            });
+        }
+        if blend_modes {
+            let layout = &self.bind_group_layout_blend;
+            for blend_pass in ALL_BLEND_PASSES {
+                let key = PipelineKey {
+                    shader: LABEL,
+                    vertex_entry: "vs_composite",
+                    fragment_entry: blend_pass.fragment_entry,
+                    target_format: wgpu::TextureFormat::Rgba16Float,
+                    blend: Blend::None,
+                };
+                let _ = self.pipelines.get_or_create_with(key.clone(), || {
+                    composite_pipeline(device, shader, &key, layout, blend_pass.pipeline)
+                });
+            }
+        }
+        self.pipelines.len().saturating_sub(before)
+    }
+
     /// Blends `src` over `dst` in place: `dst`'s existing content is
     /// preserved (`LoadOp::Load`, not cleared) and `src` is drawn on top
     /// with straight-alpha "source-over" blending. Both views must be
@@ -8411,6 +8459,86 @@ mod tests {
 
         let (r, g, b, a) = read_first_texel(device, queue, &dst);
         assert_eq!((r, g, b, a), (0.0, 0.0, 1.0, 1.0));
+    }
+
+    /// 60 FPS round 5: [`TileCompositor::prewarm`] builds exactly the
+    /// pipelines the composite calls would build lazily -- after it, no
+    /// `Normal` or blend-math call adds a cache entry -- and is
+    /// idempotent. Prints how long the build takes (not asserted).
+    #[test]
+    fn prewarm_builds_the_pipelines_the_composite_calls_use() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let queue = context.queue();
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+        let dst = solid_tile(device, queue, [0.0, 0.0, 0.0, 0.0], usage);
+        let src = solid_tile(device, queue, [1.0, 0.5, 0.25, 0.5], usage);
+        let backdrop = solid_tile(device, queue, [0.25, 0.5, 1.0, 1.0], usage);
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut compositor = TileCompositor::new(device);
+        let started = std::time::Instant::now();
+        assert_eq!(compositor.prewarm(device, false), 2);
+        let normal_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(compositor.prewarm(device, false), 0, "idempotent");
+        submit_one(&context, |encoder| {
+            compositor.composite_over(&context, encoder, &dst_view, &src_view);
+            compositor.composite_over_with_opacity(&context, encoder, &dst_view, &src_view, 0.5);
+        });
+        assert_eq!(
+            compositor.pipelines.len(),
+            2,
+            "the Normal calls must find the prewarmed pipelines"
+        );
+
+        let started = std::time::Instant::now();
+        assert_eq!(compositor.prewarm(device, true), ALL_BLEND_PASSES.len());
+        let blend_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(compositor.prewarm(device, true), 0, "idempotent");
+        for pass in ALL_BLEND_PASSES {
+            submit_one(&context, |encoder| {
+                compositor.composite_blend_over_with_opacity(
+                    &context,
+                    encoder,
+                    &src_view,
+                    &backdrop_view,
+                    &dst_view,
+                    0.5,
+                    pass,
+                );
+            });
+        }
+        submit_one(&context, |encoder| {
+            compositor.composite_multiply_over_with_opacity(
+                &context,
+                encoder,
+                &src_view,
+                &backdrop_view,
+                &dst_view,
+                0.5,
+            );
+            compositor.composite_divide_over_with_opacity(
+                &context,
+                encoder,
+                &src_view,
+                &backdrop_view,
+                &dst_view,
+                0.5,
+            );
+        });
+        assert_eq!(
+            compositor.pipelines.len(),
+            2 + ALL_BLEND_PASSES.len(),
+            "every blend-math call must find its prewarmed pipeline"
+        );
+        println!(
+            "prewarm: Normal pipelines {normal_ms:.2} ms, {} blend pipelines {blend_ms:.2} ms",
+            ALL_BLEND_PASSES.len()
+        );
     }
 
     #[test]

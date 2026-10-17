@@ -37588,8 +37588,17 @@ impl ApplicationHandler<AppEvent> for App {
                 canvas_size,
             ));
             self.residency_viewport = Some(canvas_size);
-            self.canvas_pipeline = Some(aurora_gpu::CanvasPipeline::new(gpu.device()));
-            self.compositor = Some(aurora_render::TileCompositor::new(gpu.device()));
+            // 60 FPS round 5: the canvas pipeline for this surface and the
+            // compositor's `Normal` pipelines are built here, at startup,
+            // instead of inside the first frame that needs them (10-17 ms
+            // measured there). Blend-mode pipelines stay lazy: all 18 cost
+            // about 136 ms (dev profile), too much to add to startup.
+            let mut canvas_pipeline = aurora_gpu::CanvasPipeline::new(gpu.device());
+            let _ = canvas_pipeline.pipeline(gpu.device(), surface.format());
+            self.canvas_pipeline = Some(canvas_pipeline);
+            let mut compositor = aurora_render::TileCompositor::new(gpu.device());
+            let _ = compositor.prewarm(gpu.device(), false);
+            self.compositor = Some(compositor);
         } else {
             tracing::warn!(
                 "canvas area has no computed layout yet; canvas rendering disabled this session"
@@ -66391,10 +66400,15 @@ mod tests {
         let mut canvas_pipeline = aurora_gpu::CanvasPipeline::new(device);
         let mut compositor = aurora_render::TileCompositor::new(device);
         let mut cache = CompositeCache::default();
+        // As `App` does at startup (60 FPS round 5) unless
+        // `AURORA_R5_COLD` asks for the old lazy first frame.
+        if std::env::var_os("AURORA_R5_COLD").is_none() {
+            let _ = canvas_pipeline.pipeline(device, wgpu::TextureFormat::Rgba8Unorm);
+            let _ = compositor.prewarm(device, false);
+        }
 
         let target = frame_timing_target(device, viewport);
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
-
         let mut stages = FrameStages::with_capacity(frames as usize);
         zero_frame_counters();
         for step in 0..frames {
@@ -66567,6 +66581,7 @@ mod tests {
     /// the frames over budget against the frames under it. Reads the
     /// vectors in frame order, so it must run before anything sorts them
     /// ([`ms_stats`] sorts in place). Prints only; asserts nothing.
+    #[allow(clippy::too_many_lines)] // a flat list of printouts, diagnostic only
     fn report_frame_distribution(label: &str, stages: &FrameStages) {
         let mut sorted = stages.total.clone();
         sorted.sort_by(f64::total_cmp);
@@ -66591,10 +66606,32 @@ mod tests {
             sorted_percentile(&sorted, 1.0),
             over.len(),
         );
+        // Frame 0 is the fixture's cold first frame (the whole view's
+        // tiles created, and the process's first GPU composite, about
+        // 11 ms of one-time cost a warm-up composite removes); frames 1..
+        // are the steady pan.
+        let mut steady: Vec<f64> = stages.total.iter().skip(1).copied().collect();
+        steady.sort_by(f64::total_cmp);
+        println!(
+            "{label}: steady (frames 1..) p50={:.2} p90={:.2} p99={:.2} max={:.2} over16.7={}",
+            sorted_percentile(&steady, 0.50),
+            sorted_percentile(&steady, 0.90),
+            sorted_percentile(&steady, 0.99),
+            sorted_percentile(&steady, 1.0),
+            steady.iter().filter(|&&t| t > FRAME_BUDGET_MS).count(),
+        );
         let row = |i: usize| -> [f64; 13] {
             let at = |v: &Vec<f64>| v.get(i).copied().unwrap_or(0.0);
-            let phases = stages.recomposite_phases.get(i).copied().unwrap_or_default();
-            let costs = stages.recomposite_tile_costs.get(i).copied().unwrap_or_default();
+            let phases = stages
+                .recomposite_phases
+                .get(i)
+                .copied()
+                .unwrap_or_default();
+            let costs = stages
+                .recomposite_tile_costs
+                .get(i)
+                .copied()
+                .unwrap_or_default();
             let d = stages.store_deltas.get(i).copied().unwrap_or_default();
             #[allow(clippy::cast_precision_loss)]
             let f = |x: u64| x as f64;
@@ -66616,6 +66653,21 @@ mod tests {
         };
         for &i in &over {
             let r = row(i);
+            let c = stages
+                .recomposite_tile_costs
+                .get(i)
+                .copied()
+                .unwrap_or_default();
+            println!(
+                "{label}:   frame {i:>2} phase1 split gpu_ok={:.2} gpu_declined={:.2} \
+                 cpu_empty={:.2} cpu_real={:.2} other={:.2} gpu_tiles={}",
+                c[0],
+                c[1],
+                c[2],
+                c[3],
+                c[4],
+                stages.gpu_tiles.get(i).copied().unwrap_or(0)
+            );
             println!(
                 "{label}:   frame {i:>2} total={:.2} origin+dab={:.2} recomp[p1={:.2} (cpu {:.2}) \
                  poll={:.2} drain={:.2}] upload={:.2} pass+submit={:.2} widget={:.2} | \
@@ -66645,7 +66697,19 @@ mod tests {
                  pass+submit={:.2} widget={:.2} | created={:.1} evicted={:.1} paged_in={:.1} \
                  uploaded={:.1}",
                 frames.len(),
-                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12]
+                r[0],
+                r[1],
+                r[2],
+                r[3],
+                r[4],
+                r[5],
+                r[6],
+                r[7],
+                r[8],
+                r[9],
+                r[10],
+                r[11],
+                r[12]
             );
         }
     }
