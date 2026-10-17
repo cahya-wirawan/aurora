@@ -577,4 +577,218 @@ mod tests {
         assert!(t.transform(&[0.0, 1.0, 0.0], &mut got).is_ok());
         assert!(got[0] < -0.05, "extended range must survive: {got:?}");
     }
+
+    /// A hand-assembled ICC v2 RGB input profile with a `lut16` `A2B0` into
+    /// Lab, linear in `L*` along the grey axis with a **lifted black**
+    /// (`L* = 5` at device black, 100 at white) and the given media white
+    /// point `wtpt` (XYZ). No matrices or curves: the first profile in the
+    /// tests that is not matrix/TRC, so intent and black point compensation
+    /// can matter.
+    pub(crate) fn lut_profile(white: [f64; 3]) -> Vec<u8> {
+        fn s15(v: f64) -> [u8; 4] {
+            let n = (v * 65536.0).round() as i32;
+            n.to_be_bytes()
+        }
+        let mut desc = Vec::new();
+        desc.extend_from_slice(b"desc\0\0\0\0");
+        let text = b"LUT test profile\0";
+        desc.extend_from_slice(&(text.len() as u32).to_be_bytes());
+        desc.extend_from_slice(text);
+        desc.extend_from_slice(&[0; 8]); // unicode language and count
+        desc.extend_from_slice(&[0; 2]); // script code
+        desc.push(0);
+        desc.extend_from_slice(&[0; 67]);
+        while desc.len() % 4 != 0 {
+            desc.push(0);
+        }
+        let mut wtpt = Vec::new();
+        wtpt.extend_from_slice(b"XYZ \0\0\0\0");
+        for v in white {
+            wtpt.extend_from_slice(&s15(v));
+        }
+        let mut a2b = Vec::new();
+        a2b.extend_from_slice(b"mft2\0\0\0\0");
+        a2b.extend_from_slice(&[3, 3, 2, 0]);
+        for (i, v) in [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+            .iter()
+            .enumerate()
+        {
+            let _ = i;
+            a2b.extend_from_slice(&s15(*v));
+        }
+        a2b.extend_from_slice(&2_u16.to_be_bytes()); // input table entries
+        a2b.extend_from_slice(&2_u16.to_be_bytes()); // output table entries
+        for _ in 0..3 {
+            a2b.extend_from_slice(&0_u16.to_be_bytes());
+            a2b.extend_from_slice(&65535_u16.to_be_bytes());
+        }
+        for r in 0..2_u16 {
+            for g in 0..2_u16 {
+                for b in 0..2_u16 {
+                    // v2 Lab16: L 0..=0xFF00 for 0..100, a and b 0x8000 = 0.
+                    let mean = f64::from(r + g + b) / 3.0;
+                    let l = (5.0 + 95.0 * mean) / 100.0 * 65280.0;
+                    a2b.extend_from_slice(&(l.round() as u16).to_be_bytes());
+                    a2b.extend_from_slice(&0x8000_u16.to_be_bytes());
+                    a2b.extend_from_slice(&0x8000_u16.to_be_bytes());
+                }
+            }
+        }
+        for _ in 0..3 {
+            a2b.extend_from_slice(&0_u16.to_be_bytes());
+            a2b.extend_from_slice(&65535_u16.to_be_bytes());
+        }
+        while a2b.len() % 4 != 0 {
+            a2b.push(0);
+        }
+        // `A2B1` (relative colorimetric) shares `A2B0`'s data: lcms2 only
+        // honours black point compensation for an intent whose table the
+        // profile lists.
+        let tags: [(&[u8; 4], &Vec<u8>); 4] = [
+            (b"desc", &desc),
+            (b"wtpt", &wtpt),
+            (b"A2B0", &a2b),
+            (b"A2B1", &a2b),
+        ];
+        let table_len = 4 + 12 * tags.len();
+        let mut offset = 128 + table_len;
+        let mut table = (tags.len() as u32).to_be_bytes().to_vec();
+        let mut body = Vec::new();
+        let mut a2b_offset = 0;
+        for (sig, data) in tags {
+            if sig == b"A2B1" {
+                table.extend_from_slice(sig);
+                table.extend_from_slice(&(a2b_offset as u32).to_be_bytes());
+                table.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                continue;
+            }
+            if sig == b"A2B0" {
+                a2b_offset = offset;
+            }
+            table.extend_from_slice(sig);
+            table.extend_from_slice(&(offset as u32).to_be_bytes());
+            table.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            body.extend_from_slice(data);
+            offset += data.len();
+        }
+        let mut out = vec![0_u8; 128];
+        let total = (128 + table.len() + body.len()) as u32;
+        out[0..4].copy_from_slice(&total.to_be_bytes());
+        out[8..12].copy_from_slice(&0x0240_0000_u32.to_be_bytes());
+        out[12..16].copy_from_slice(b"scnr");
+        out[16..20].copy_from_slice(b"RGB ");
+        out[20..24].copy_from_slice(b"Lab ");
+        out[36..40].copy_from_slice(b"acsp");
+        for (i, v) in [0.9642, 1.0, 0.8249].iter().enumerate() {
+            out[68 + i * 4..72 + i * 4].copy_from_slice(&s15(*v));
+        }
+        out.extend_from_slice(&table);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn convert(profile: &IccProfile, bpc: bool, intent: RenderingIntent, px: [f32; 3]) -> [f32; 3] {
+        let Ok(t) =
+            Transform::new_with_options(profile, &IccProfile::srgb(), Channels::Rgb, intent, bpc)
+        else {
+            unreachable!()
+        };
+        let mut out = [0.0_f32; 3];
+        assert!(t.transform(&px, &mut out).is_ok());
+        out
+    }
+
+    #[test]
+    fn a_lut_profile_with_a_lifted_black_is_accepted_and_not_srgb() {
+        let bytes = lut_profile([0.9642, 1.0, 0.8249]);
+        let Ok(source) = inspect_rgb_source(&bytes) else {
+            unreachable!("the hand-built LUT profile must be valid")
+        };
+        assert!(!source.equivalent_to_srgb);
+        assert_eq!(source.description, "LUT test profile");
+    }
+
+    #[test]
+    fn black_point_compensation_lowers_a_lifted_black_and_leaves_white() {
+        let Ok(p) = IccProfile::from_bytes(&lut_profile([0.9642, 1.0, 0.8249])) else {
+            unreachable!()
+        };
+        let rel = RenderingIntent::RelativeColorimetric;
+        let off = convert(&p, false, rel, [0.0; 3]);
+        let on = convert(&p, true, rel, [0.0; 3]);
+        // Without BPC the lifted black (L* = 5) shows as a clearly non-black
+        // sRGB value; with it the black lands on (about) zero.
+        assert!(
+            off.iter().all(|&c| c > 0.05),
+            "BPC off keeps the lifted black: {off:?}"
+        );
+        assert!(
+            on.iter().all(|&c| c < 0.02),
+            "BPC on maps black to black: {on:?}"
+        );
+        // White is not moved by compensation.
+        let w_on = convert(&p, true, rel, [1.0; 3]);
+        let w_off = convert(&p, false, rel, [1.0; 3]);
+        for (a, b) in w_on.iter().zip(w_off) {
+            assert!((a - b).abs() < 0.02, "{w_on:?} vs {w_off:?}");
+            assert!(*a > 0.97, "{w_on:?}");
+        }
+    }
+
+    #[test]
+    fn absolute_colorimetric_keeps_the_media_white_tint_that_relative_removes() {
+        // A warm media white (D50 is the PCS white; this one is not).
+        let Ok(p) = IccProfile::from_bytes(&lut_profile([0.90, 0.95, 0.60])) else {
+            unreachable!()
+        };
+        let rel = convert(&p, false, RenderingIntent::RelativeColorimetric, [1.0; 3]);
+        let abs = convert(&p, false, RenderingIntent::AbsoluteColorimetric, [1.0; 3]);
+        assert!(
+            rel.iter().all(|&c| c > 0.97),
+            "relative maps white to white: {rel:?}"
+        );
+        let spread = abs
+            .iter()
+            .zip(rel)
+            .map(|(a, r)| (a - r).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            spread > 0.02,
+            "absolute differs from relative: {abs:?} vs {rel:?}"
+        );
+        // The tint is a reduction (white is dimmer in the channels whose
+        // media-white component is below the PCS white's).
+        assert!(abs.iter().any(|&c| c < rel[0] - 0.02), "{abs:?}");
+    }
+
+    #[test]
+    fn the_working_space_transform_uses_relative_intent_with_black_point_compensation() {
+        // The policy itself, through `Transform::to_working` (not a hand-built
+        // transform): a LUT profile with a lifted black and a tinted media
+        // white comes out with black at black and white at white.
+        let Ok(p) = IccProfile::from_bytes(&lut_profile([0.90, 0.95, 0.60])) else {
+            unreachable!()
+        };
+        let Ok(t) = Transform::to_working(&p) else {
+            unreachable!()
+        };
+        let mut black = [1.0_f32; 3];
+        let mut white = [0.0_f32; 3];
+        assert!(t.transform(&[0.0; 3], &mut black).is_ok());
+        assert!(t.transform(&[1.0; 3], &mut white).is_ok());
+        assert!(
+            black.iter().all(|&c| c < 0.02),
+            "black stays black: {black:?}"
+        );
+        assert!(
+            white.iter().all(|&c| c > 0.97),
+            "white stays white: {white:?}"
+        );
+        // And the output direction is the same policy.
+        let Ok(back) = Transform::from_working(&IccProfile::srgb()) else {
+            unreachable!()
+        };
+        let mut v = [0.0_f32; 3];
+        assert!(back.transform(&[0.5; 3], &mut v).is_ok());
+    }
 }
