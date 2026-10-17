@@ -6,7 +6,17 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# 2026-10-17 (0.270.1): `zbus_names`, `zvariant` and `zvariant_derive` are
+# flagged unmaintained (informational, no vulnerability): they were merged
+# into `zbus` 6.0. Aurora gets them only through accesskit's Linux adapter
+# (`accesskit_winit` -> `accesskit_unix` -> `zbus` 5 / `atspi`), and even the
+# newest `accesskit_unix` (0.24.0) still requires `zbus` ^5.19, so no upgrade
+# removes them. Revisit when accesskit moves to `zbus` 6.
+ignore = [
+    { id = "RUSTSEC-2026-0370", reason = "unmaintained zbus-family crate via accesskit_unix; merged into zbus 6, no upgrade path yet" },
+    { id = "RUSTSEC-2026-0371", reason = "unmaintained zbus_names via accesskit_unix; merged into zbus 6, no upgrade path yet" },
+    { id = "RUSTSEC-2026-0372", reason = "unmaintained zbus-family crate via accesskit_unix; merged into zbus 6, no upgrade path yet" },
+]
 
 [licenses]
 version = 2
