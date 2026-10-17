@@ -164,67 +164,70 @@ fn the_parallel_path_folds_on_the_pool() {
     }
 }
 
-/// Fewer than two stale tiles keep the sequential loop; current tiles are
-/// skipped; a tile named twice is composited once.
+/// At most `SYNC_TILE_LIMIT` stale tiles (a dab) keep the sequential
+/// loop; current tiles are skipped; a tile named twice is composited once.
 #[test]
-fn one_stale_tile_stays_sequential_and_duplicates_composite_once() {
+fn a_dabs_tiles_stay_sequential_and_duplicates_composite_once() {
     if !pool_or_skip() {
         return;
     }
+    assert_eq!(
+        crate::frame_composite::MIN_PARALLEL_TILES,
+        crate::background_composite::SYNC_TILE_LIMIT + 1
+    );
     let (_d, mut store) = store_with_budget(256);
     let mut layers = aurora_doc::LayerTree::new();
     let _ = layer(
         &mut layers,
         &mut store,
         None,
-        rect(0, 0, 1024, 1024),
+        rect(0, 0, 1280, 256),
         &opaque,
     );
     let _switch = Parallel::set(true);
     let mut cache = CompositeCache::default();
     let mut costs = crate::RecompositeTileCosts::start();
-    let a = aurora_tile::TileId { x: 0, y: 0 };
-    let b = aurora_tile::TileId { x: 1, y: 0 };
+    let t = |x| aurora_tile::TileId { x, y: 0 };
+    let _ = crate::frame_composite::take_pooled_tiles();
+    // Three stale tiles, named twice each: the most a dab composites
+    // synchronously, so the pool declines and nothing is done.
     assert!(!crate::recomposite_tiles_in_parallel(
-        &[a, a],
+        &[t(0), t(1), t(2), t(0), t(1), t(2)],
         &layers,
         &mut store,
         &mut cache,
         (0, 0),
         &mut costs,
     ));
-    assert!(!cache.is_current(a), "nothing done when declined");
-    cache.mark_current(a);
-    assert!(!crate::recomposite_tiles_in_parallel(
-        &[a, b],
+    assert!(!cache.is_current(t(0)), "nothing done when declined");
+    // Through `recomposite_tiles`, three stale tiles fold sequentially.
+    recomposite_tiles(
+        &[t(0), t(1), t(2)],
         &layers,
+        None,
         &mut store,
         &mut cache,
-        (0, 0),
-        &mut costs,
-    ));
+        None,
+        None,
+    );
+    assert_eq!(crate::frame_composite::take_pooled_tiles(), 0);
+    assert!(cache.is_current(t(2)));
+    // Four stale of six named (two current, one named twice): the pool
+    // composites exactly the four, once each.
     let composites_before = tile_composites();
-    let before = crate::RECOMPOSITE_FOLD_COUNTS
-        .get(1)
-        .map_or(0, |n| n.load(std::sync::atomic::Ordering::Relaxed));
-    let c = aurora_tile::TileId { x: 2, y: 0 };
     assert!(crate::recomposite_tiles_in_parallel(
-        &[a, b, c, b, c],
+        &[t(0), t(3), t(1), t(4), t(5), t(4), t(6), t(2)],
         &layers,
         &mut store,
         &mut cache,
         (0, 0),
         &mut costs,
     ));
-    let after = crate::RECOMPOSITE_FOLD_COUNTS
-        .get(1)
-        .map_or(0, |n| n.load(std::sync::atomic::Ordering::Relaxed));
-    // Process-global, so other tests can add; at least the two stale tiles.
-    assert!(after - before >= 2, "{before} {after}");
-    assert!(cache.is_current(b) && cache.is_current(c));
-    // Exactly two composites (the pool's profile is merged into this
-    // thread's): `b` and `c` once each, `a` not at all.
-    assert_eq!(tile_composites() - composites_before, 2);
+    assert_eq!(tile_composites() - composites_before, 4);
+    assert_eq!(crate::frame_composite::take_pooled_tiles(), 4);
+    for x in 0..7 {
+        assert!(cache.is_current(t(x)), "{x}");
+    }
 }
 
 /// Tile composites recorded on this thread's profile (the pool's merged in).
@@ -513,4 +516,127 @@ fn budgets_sharing_a_pass_report_once() {
     let fresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut next_pass = crate::CompositeBudget::for_tile_of_shared_pass(&layers, &fresh);
     assert!(next_pass.should_report(), "a new pass reports again");
+}
+
+/// Poisons the composite tiles `tiles`, so a tile a path fails to install
+/// cannot pass by showing an earlier result.
+fn poison(store: &mut aurora_tile::TileStore, tiles: &[aurora_tile::TileId]) {
+    for &id in tiles {
+        if let Ok(dest) = store.get_mut(composite_surface_id(), id) {
+            dest.texels_mut().fill(half::f16::from_bits(0x7E01));
+        }
+    }
+}
+
+#[track_caller]
+fn assert_installed(
+    store: &mut aurora_tile::TileStore,
+    tiles: &[aurora_tile::TileId],
+    want: &[Vec<half::f16>],
+    what: &str,
+) {
+    for (&id, want) in tiles.iter().zip(want) {
+        let got = ok(store.get(composite_surface_id(), id)).texels().to_vec();
+        let bad = mismatches(&got, want);
+        assert!(
+            bad.is_empty(),
+            "{what}: tile {id:?}: {} samples differ",
+            bad.len()
+        );
+    }
+}
+
+/// The shipping decision path with the pool on (60 FPS round 7): without a
+/// worker a whole view folds on the pool; with one, a structural edit goes
+/// to the worker and a dab's tiles fold sequentially in the redraw
+/// handler. Every path installs the sequential loop's bits.
+#[test]
+fn the_redraw_decision_uses_the_pool_only_without_a_worker() {
+    if !pool_or_skip() {
+        return;
+    }
+    let (_d, mut store) = store_with_budget(256);
+    let mut layers = aurora_doc::LayerTree::new();
+    let _ = layer(
+        &mut layers,
+        &mut store,
+        None,
+        rect(0, 0, 1024, 1024),
+        &opaque,
+    );
+    let top = layer(
+        &mut layers,
+        &mut store,
+        None,
+        rect(40, 30, 900, 800),
+        &translucent,
+    );
+    ok(layers.set_blend_mode(top, aurora_doc::BlendMode::Exclusion));
+    assert!(!crate::document_qualifies_for_gpu_compositing(&layers));
+    let tiles = grid(4);
+    let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
+    let _switch = Parallel::set(true);
+    let _ = crate::frame_composite::take_pooled_tiles();
+
+    // No worker (what `recomposite_or_dispatch` does without one): the
+    // pool composites the whole view.
+    poison(&mut store, &tiles);
+    let mut cache = CompositeCache::default();
+    recomposite_tiles(&tiles, &layers, None, &mut store, &mut cache, None, None);
+    assert_eq!(crate::frame_composite::take_pooled_tiles(), 16);
+    assert_installed(&mut store, &tiles, &sequential, "no worker");
+
+    // A worker: the whole view is dispatched, nothing folds on the pool.
+    poison(&mut store, &tiles);
+    let waker: crate::background_composite::Waker = std::sync::Arc::new(|| {});
+    let mut worker = crate::background_composite::CompositeWorker::with_threads(waker, 2);
+    let mut cache = CompositeCache::default();
+    let reference_origin = crate::composite_reference_origin(&layers, None);
+    let start = std::time::Instant::now();
+    while !tiles.iter().all(|&t| cache.is_current(t)) {
+        assert!(
+            start.elapsed() < std::time::Duration::from_mins(2),
+            "never settled"
+        );
+        crate::dispatch_or_composite_tiles(
+            &tiles,
+            &layers,
+            None,
+            &mut store,
+            &mut cache,
+            &mut worker,
+        );
+        let _ = worker.wait_until_idle(
+            Some(&mut crate::background_composite::CompositeTarget {
+                layers: &layers,
+                reference_origin,
+                store: &mut store,
+                cache: &mut cache,
+            }),
+            std::time::Duration::from_mins(2),
+        );
+    }
+    assert_eq!(crate::frame_composite::take_pooled_tiles(), 0);
+    assert_installed(&mut store, &tiles, &sequential, "worker");
+
+    // A dab: three stale tiles, composited in the redraw handler,
+    // sequentially.
+    let dab: Vec<_> = tiles.iter().copied().take(3).collect();
+    poison(&mut store, &dab);
+    for &id in &dab {
+        cache.note_invalidated(id);
+    }
+    let composites_before = tile_composites();
+    crate::dispatch_or_composite_tiles(&tiles, &layers, None, &mut store, &mut cache, &mut worker);
+    assert_eq!(
+        tile_composites() - composites_before,
+        3,
+        "synchronous, here"
+    );
+    assert_eq!(
+        crate::frame_composite::take_pooled_tiles(),
+        0,
+        "not on the pool"
+    );
+    assert_installed(&mut store, &dab, &sequential, "dab");
 }

@@ -3,7 +3,8 @@
 //!
 //! [`crate::recomposite_tiles`] composites a CPU-path document's stale
 //! visible tiles one after another on the calling (UI) thread. When more
-//! than one tile is stale and no GPU arm can run, it hands them here: a
+//! than [`crate::background_composite::SYNC_TILE_LIMIT`] tiles are stale
+//! ([`MIN_PARALLEL_TILES`]) and no GPU arm can run, it hands them here: a
 //! small rayon pool ([`frame_composite_threads`] threads) folds each tile
 //! with the very same [`crate::composite_roots_into_tile`], reading the
 //! document's store through [`crate::background_composite::SharedMirror`]
@@ -20,6 +21,13 @@
 //! [`crate::small_machine::shadow_cache_bytes`], like the background
 //! compositor's pool; the UI thread keeps its own for single-tile work, so
 //! this adds at most one more cache of that cap.
+//!
+//! **Not for a dab.** The redraw handler composites a brush dab's one to
+//! three stale tiles itself (`SYNC_TILE_LIMIT`), and under CPU load
+//! waking the pool costs more than folding them (measured, PLAN.md 60 FPS
+//! round 7), so they keep the sequential loop. More stale tiles reach this
+//! path only without a background worker, when its dispatch fails, or for
+//! a GPU-qualifying document without a GPU.
 //!
 //! **Threads.** At most [`FRAME_COMPOSITE_MAX_THREADS`], never more than
 //! the machine's parallelism; a machine with one core (or whose
@@ -40,6 +48,13 @@ use crate::background_composite::SharedMirror;
 /// two-root fixture (see PLAN.md, 60 FPS round 7), and a four-core machine
 /// then still gets one thread per core while the UI thread waits.
 pub(crate) const FRAME_COMPOSITE_MAX_THREADS: usize = 4;
+
+/// The fewest stale tiles [`crate::recomposite_tiles`] hands to the pool:
+/// one more than [`crate::background_composite::SYNC_TILE_LIMIT`], the
+/// most a brush dab composites synchronously, so a dab never waits for
+/// the pool to wake.
+pub(crate) const MIN_PARALLEL_TILES: usize =
+    crate::background_composite::SYNC_TILE_LIMIT.saturating_add(1);
 
 /// The fewest tiles a parallel batch holds (60 FPS round 7): a batch is
 /// four tiles per thread or this many, whichever is more, so a typical
@@ -103,6 +118,18 @@ thread_local! {
     /// the pool's threads would not update on the caller; the tests of
     /// this module and the frame measurements turn it on.
     static PARALLEL_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: tiles this thread installed from the frame pool.
+    static POOLED_TILES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Reads and resets this thread's count of tiles installed from the pool.
+#[cfg(test)]
+pub(crate) fn take_pooled_tiles() -> u64 {
+    POOLED_TILES.with(|n| n.replace(0))
 }
 
 /// Turns the parallel frame recomposite on or off on this thread (tests).
@@ -174,7 +201,10 @@ pub(crate) fn composite_tiles(
         };
         for (&tile_id, result) in batch.iter().zip(results) {
             #[cfg(test)]
-            merge_profile(result.profile);
+            {
+                merge_profile(result.profile);
+                POOLED_TILES.with(|n| n.set(n.get().saturating_add(1)));
+            }
             install(store, tile_id, result.texels, result.folded);
         }
     }

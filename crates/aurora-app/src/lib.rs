@@ -26402,7 +26402,10 @@ fn recomposite_tiles(
 /// [`recomposite_tiles`]' CPU-only case on the frame pool (60 FPS round
 /// 7): composites and installs the stale tiles of `tiles` (each once, in
 /// order) and returns `true`, or returns `false` having done nothing when
-/// fewer than two are stale, the pool is unavailable or (tests) disabled.
+/// fewer than [`frame_composite::MIN_PARALLEL_TILES`] are stale (a dab:
+/// the redraw handler composites at most
+/// [`background_composite::SYNC_TILE_LIMIT`] tiles itself and those keep
+/// the sequential loop), the pool is unavailable or (tests) disabled.
 fn recomposite_tiles_in_parallel(
     tiles: &[aurora_tile::TileId],
     layers: &aurora_doc::LayerTree,
@@ -26420,7 +26423,7 @@ fn recomposite_tiles_in_parallel(
         .copied()
         .filter(|&tile_id| !cache.is_current(tile_id) && seen.insert(tile_id))
         .collect();
-    if stale.len() < 2 {
+    if stale.len() < frame_composite::MIN_PARALLEL_TILES {
         return false;
     }
     let Some(pool) = frame_composite::frame_pool() else {
