@@ -117,7 +117,7 @@ fn reaching_effects(rng: &mut Rng) -> aurora_core::LayerEffects {
             distance: (5 + rng.below(40)) as f32,
             size: rng.below(12) as f32,
             use_global_light: false,
-            local_angle: rng.pick(&[30.0, 120.0, 200.0, 300.0], 120.0),
+            angle: rng.pick(&[30.0, 120.0, 200.0, 300.0], 120.0),
             ..aurora_core::effects::DropShadow::default()
         });
     }
@@ -455,7 +455,7 @@ fn a_shadow_offset_reaches_the_tile_it_lands_on() {
         drop_shadows: vec![aurora_core::effects::DropShadow {
             distance: 300.0,
             use_global_light: false,
-            local_angle: 180.0,
+            angle: 180.0,
             size: 0.0,
             ..aurora_core::effects::DropShadow::default()
         }],
@@ -472,7 +472,7 @@ fn a_shadow_offset_reaches_the_tile_it_lands_on() {
         Some(&store),
         id,
         (0, 0),
-        (10, 0),
+        (0, 10),
         (0, 0),
         (0, 0),
     );
@@ -485,9 +485,71 @@ fn a_shadow_offset_reaches_the_tile_it_lands_on() {
         !cache.is_current(aurora_tile::TileId { x: 1, y: 0 }),
         "the shadow"
     );
+    // The move is vertical, so the content stays in column 0: only the
+    // shadow (x 300..400 at 180 degrees) reaches column 1, not column 2.
+    assert!(
+        cache.is_current(aurora_tile::TileId { x: 2, y: 0 }),
+        "past the shadow"
+    );
     assert!(
         cache.is_current(aurora_tile::TileId { x: 3, y: 3 }),
         "far away"
+    );
+}
+
+/// A glow reaching across a tile edge by its apron alone: content fills
+/// stored tile 0 exactly (x 0..256) and a vertical move keeps it there, so
+/// only the glow's apron reaches column 1.
+#[test]
+fn a_glow_apron_reaches_across_a_tile_edge() {
+    apron_case(aurora_core::LayerEffects {
+        outer_glows: vec![aurora_core::effects::OuterGlow {
+            size: 20.0,
+            ..aurora_core::effects::OuterGlow::default()
+        }],
+        ..aurora_core::LayerEffects::default()
+    });
+}
+
+/// The same for an Outside stroke.
+#[test]
+fn a_stroke_apron_reaches_across_a_tile_edge() {
+    apron_case(aurora_core::LayerEffects {
+        strokes: vec![aurora_core::effects::Stroke {
+            size: 8.0,
+            ..aurora_core::effects::Stroke::default()
+        }],
+        ..aurora_core::LayerEffects::default()
+    });
+}
+
+fn apron_case(fx: aurora_core::LayerEffects) {
+    let (_d, mut store) = store_with_budget(64);
+    let mut layers = aurora_doc::LayerTree::new();
+    let id = layer(&mut layers, &mut store, None, rect(0, 0, 256, 100), &opaque);
+    ok(layers.set_effects(id, Some(fx)));
+    let mut cache = CompositeCache::default();
+    for id in grid() {
+        cache.mark_current(id);
+    }
+    let r = invalidate_moved_layer(
+        &mut cache,
+        &layers,
+        Some(&store),
+        id,
+        (0, 0),
+        (0, 10),
+        (0, 0),
+        (0, 0),
+    );
+    assert!(matches!(r, MoveInvalidation::Narrow(_)));
+    assert!(
+        !cache.is_current(aurora_tile::TileId { x: 1, y: 0 }),
+        "the apron"
+    );
+    assert!(
+        cache.is_current(aurora_tile::TileId { x: 2, y: 0 }),
+        "past the apron"
     );
 }
 
