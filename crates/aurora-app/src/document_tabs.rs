@@ -107,7 +107,7 @@ pub(crate) fn autosave_outgoing(cx: &mut SwitchContext<'_>) -> bool {
         tracing::warn!(id, "no tile store; the parked document is not autosaved");
         return false;
     };
-    let submitted = crate::request_autosave(
+    let submitted = crate::request_autosave_with_colour(
         park.worker,
         &path,
         id,
@@ -118,6 +118,7 @@ pub(crate) fn autosave_outgoing(cx: &mut SwitchContext<'_>) -> bool {
         store,
         cx.doc.import_losses.as_deref(),
         Some(&cx.doc.selection),
+        Some(&cx.doc.colour),
     );
     cx.doc.park_autosave = submitted.map(|generation| (revision, generation));
     true

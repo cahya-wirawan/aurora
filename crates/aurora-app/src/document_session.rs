@@ -321,6 +321,11 @@ pub(crate) struct DocumentSession {
     /// open and a recovered document. A Photoshop save lists them, so a
     /// file re-saved over itself never loses that content silently.
     pub(crate) import_losses: Option<Vec<String>>,
+    /// The document's colour metadata: the profile its file came in (its
+    /// pixels were converted into the sRGB working space on open) and the
+    /// output profile export converts to. Saved in the `.aur` `colour`
+    /// entry and the autosave; not undoable, not dirtying (metadata).
+    pub(crate) colour: aurora_io::DocumentColour,
     /// This document's Layers-panel filter (0.199.0): view state, not
     /// document state (no undo, not saved, never dirty). Copied from
     /// `Workspace::layer_view` when the session stops being active
@@ -595,6 +600,7 @@ impl DocumentSession {
             path: None,
             saved_revision: Some(undo_order.content_revision),
             import_losses: None,
+            colour: aurora_io::DocumentColour::default(),
             layer_filter: aurora_ui::LayerFilter::default(),
             clone_stamp: crate::clone_stamp::CloneStamp::default(),
             channel_view: aurora_ui::ChannelVisibility::default(),

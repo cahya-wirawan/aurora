@@ -263,6 +263,7 @@ fn save(path: &Path, layers: &aurora_doc::LayerTree, history: &aurora_doc::Histo
         skipped_tiles: &skipped,
         import_losses: None,
         selection: &selection,
+        colour: &aurora_io::DocumentColour::default(),
     };
     ok(save_aur_document_with(path, &source, &mut live, |temp| {
         let (_scratch, mut check) = store();
@@ -311,6 +312,7 @@ fn the_saved_file_reopens_identically_and_a_failed_verify_changes_nothing() {
         skipped_tiles: &skipped,
         import_losses: None,
         selection: &selection,
+        colour: &aurora_io::DocumentColour::default(),
     };
     assert!(save_aur_document_with(&path, &source, &mut live, |_| false).is_err());
     assert_eq!(ok(std::fs::read(&path)), before);

@@ -221,7 +221,7 @@ pub(crate) fn final_autosave_unsaved(
                 .ok()
         };
         let before = modified(&path);
-        crate::write_autosave(
+        crate::write_autosave_with_colour(
             &path,
             &session.layers,
             &session.history,
@@ -230,6 +230,7 @@ pub(crate) fn final_autosave_unsaved(
             store,
             session.import_losses.as_deref(),
             Some(&session.selection),
+            Some(&session.colour),
         );
         let after = modified(&path);
         session.park_autosave = None;

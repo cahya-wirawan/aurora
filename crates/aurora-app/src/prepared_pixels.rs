@@ -115,16 +115,29 @@ pub(crate) struct PreparedMask {
 pub(crate) struct PreparedImage {
     pub(crate) size: (u32, u32),
     pub(crate) tiles: Result<PreparedTiles, IoError>,
+    /// What the decode did about colour (the source profile, info lines
+    /// and warnings).
+    pub(crate) colour: aurora_io::ColourImport,
 }
 
 impl PreparedImage {
+    /// This image with its open's colour result attached.
+    pub(crate) fn with_colour(mut self, colour: aurora_io::ColourImport) -> Self {
+        self.colour = colour;
+        self
+    }
+
     /// Encodes `image`'s tiles at surface-local `(0, 0)`, the flat
     /// image's one layer, and drops it.
     pub(crate) fn new(image: Image) -> Self {
         let size = (image.width(), image.height());
         let tiles = aurora_io::encode_image_tiles_at(&image, 0, 0).map(in_memory);
         drop(image);
-        Self { size, tiles }
+        Self {
+            size,
+            tiles,
+            colour: aurora_io::ColourImport::default(),
+        }
     }
 }
 
@@ -138,6 +151,8 @@ pub(crate) struct PreparedPsd {
     pub(crate) pixels: Vec<PreparedLayer>,
     pub(crate) masks: Vec<PreparedMask>,
     pub(crate) report: aurora_io::PsdImportReport,
+    /// What the open did about colour.
+    pub(crate) colour: aurora_io::ColourImport,
     /// Where the open's time went (0.189.0).
     pub(crate) timings: Box<OpenTimings>,
 }
@@ -175,6 +190,7 @@ impl PreparedPsd {
             pixels,
             masks,
             report,
+            colour,
         } = document;
         let pixels = pixels
             .into_iter()
@@ -194,6 +210,7 @@ impl PreparedPsd {
             pixels,
             masks: prepare_masks(&masks),
             report,
+            colour,
             timings: Box::default(),
         }
     }
@@ -319,6 +336,7 @@ impl PreparedPsd {
             pixels,
             masks,
             report: document.report,
+            colour: document.colour,
             timings: Box::new(timings),
         })
     }

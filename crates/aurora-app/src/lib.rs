@@ -894,7 +894,17 @@ fn document_from_size(
 /// file must never crash or leave `App` in a half-updated state, the
 /// same honesty [`recover_document`] already applies to a bad autosave —
 /// and, since 0.143.1, it must not fail *silently* either.
+#[cfg(test)]
 fn open_image(path: &Path) -> Result<aurora_io::Image, OpenFailure> {
+    open_image_with_colour(path).map(|(image, _)| image)
+}
+
+/// [`open_image`], also returning what the open did about colour: the
+/// pixels are converted into the sRGB working space when the file carries
+/// a valid RGB profile of another space ([`aurora_io::decode_to_working`]).
+fn open_image_with_colour(
+    path: &Path,
+) -> Result<(aurora_io::Image, aurora_io::ColourImport), OpenFailure> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -902,8 +912,8 @@ fn open_image(path: &Path) -> Result<aurora_io::Image, OpenFailure> {
             return Err(OpenFailure::Read(err));
         }
     };
-    match aurora_io::decode_by_extension(path, &bytes) {
-        Ok(image) => Ok(image),
+    match aurora_io::decode_to_working(path, &bytes) {
+        Ok(decoded) => Ok(decoded),
         Err(err) => {
             tracing::warn!(path = %path.display(), %err, "failed to decode the chosen file");
             Err(OpenFailure::Decode(err))
@@ -967,6 +977,19 @@ fn unwritten_layers_item(unwritten: usize) -> Option<String> {
     })
 }
 
+/// The status-bar line for what an open did about colour: the conversion,
+/// or the sRGB assumption; `None` when the file was sRGB-tagged (or an
+/// sRGB-equivalent profile) and nothing happened.
+fn colour_open_notice(colour: &aurora_io::ColourImport) -> Option<&'static str> {
+    if colour.source.is_some() {
+        Some("Converted from the file's colour profile to sRGB.")
+    } else if colour.report.info.iter().any(|l| l.contains("assumed sRGB")) {
+        Some("No colour profile in this file: assumed sRGB.")
+    } else {
+        None
+    }
+}
+
 /// Decodes a chosen PSD/PSB file's bytes into a whole document
 /// (`aurora_io::read_psd`) — [`App::open_psd_file`]'s testable half. A
 /// refusal is an [`OpenFailure::Decode`] carrying the reader's own typed
@@ -1007,7 +1030,9 @@ fn decode_chosen_file_with(
         // (0.153.0, `prepared_pixels`): the UI thread's install only
         // inserts them.
         OpenRoute::Image => {
-            open_image(path).map(|image| DecodedFile::Image(PreparedImage::new(image)))
+            open_image_with_colour(path).map(|(image, colour)| {
+                DecodedFile::Image(PreparedImage::new(image).with_colour(colour))
+            })
         }
         // Streamed (0.154.0): parsed from the file, never read whole, and
         // decoded, encoded and staged one layer at a time.
@@ -1957,6 +1982,7 @@ fn autosave_path() -> PathBuf {
 /// well. Nothing else can: a tile an earlier writer dropped is not in
 /// `store` at all, so this pass would otherwise walk past it as "never
 /// painted".
+/// [`write_autosave_with_colour`] for a document with no colour metadata.
 #[allow(clippy::too_many_arguments)]
 fn write_autosave(
     path: &Path,
@@ -1967,6 +1993,21 @@ fn write_autosave(
     store: &mut aurora_tile::TileStore,
     import_losses: Option<&[String]>,
     selection: Option<&aurora_doc::SelectionSet>,
+) {
+    write_autosave_with_colour(path, layers, history, canvas_size, skipped, store, import_losses, selection, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_autosave_with_colour(
+    path: &Path,
+    layers: &aurora_doc::LayerTree,
+    history: &aurora_doc::History,
+    canvas_size: (u32, u32),
+    skipped: &mut aurora_io::SkippedTiles,
+    store: &mut aurora_tile::TileStore,
+    import_losses: Option<&[String]>,
+    selection: Option<&aurora_doc::SelectionSet>,
+    colour: Option<&aurora_io::DocumentColour>,
 ) {
     let temp_path = autosave_temp_path(path);
     let Some(mut file) = create_autosave_temp(&temp_path) else {
@@ -1982,7 +2023,7 @@ fn write_autosave(
     // Where this write is allowed to land, decided by whether it turned
     // out to be complete -- see this function's own doc comment.
     let destination;
-    match aurora_io::write_aur_best_effort_with_import_losses(
+    match aurora_io::write_aur_best_effort_with_import_losses_and_colour(
         &mut file,
         layers,
         history,
@@ -1991,6 +2032,7 @@ fn write_autosave(
         skipped,
         import_losses,
         selection,
+        colour,
         store,
     ) {
         // The complete-vs-`.partial` choice keys on what *this* write
@@ -2079,7 +2121,9 @@ const AUTOSAVE_SNAPSHOT_BUDGET_BYTES: usize = 2 << 30;
 /// A document whose tiles would not fit [`AUTOSAVE_SNAPSHOT_BUDGET_BYTES`]
 /// falls back to [`write_autosave`] on this thread — the pre-0.152.0
 /// behaviour, streamed, never holding the document twice.
+/// [`request_autosave_with_colour`] for a document with no colour metadata.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn request_autosave(
     worker: &mut background_autosave::AutosaveWorker,
     path: &Path,
@@ -2092,7 +2136,24 @@ fn request_autosave(
     import_losses: Option<&[String]>,
     selection: Option<&aurora_doc::SelectionSet>,
 ) -> Option<background_autosave::Generation> {
-    request_autosave_within(
+    request_autosave_with_colour(worker, path, document, layers, history, canvas_size, skipped, store, import_losses, selection, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_autosave_with_colour(
+    worker: &mut background_autosave::AutosaveWorker,
+    path: &Path,
+    document: u64,
+    layers: &aurora_doc::LayerTree,
+    history: &aurora_doc::History,
+    canvas_size: (u32, u32),
+    skipped: &mut aurora_io::SkippedTiles,
+    store: &mut aurora_tile::TileStore,
+    import_losses: Option<&[String]>,
+    selection: Option<&aurora_doc::SelectionSet>,
+    colour: Option<&aurora_io::DocumentColour>,
+) -> Option<background_autosave::Generation> {
+    request_autosave_within_with_colour(
         worker,
         AUTOSAVE_SNAPSHOT_BUDGET_BYTES,
         path,
@@ -2104,6 +2165,7 @@ fn request_autosave(
         store,
         import_losses,
         selection,
+        colour,
     )
 }
 
@@ -2114,6 +2176,8 @@ fn request_autosave(
 /// without it, a write still in flight (or waiting) for the *previous*
 /// document would finish after this synchronous one and rename itself
 /// over it, and a crash would then recover the wrong document.
+/// [`request_autosave_within_with_colour`] for a document with no colour metadata.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn request_autosave_within(
     worker: &mut background_autosave::AutosaveWorker,
@@ -2128,11 +2192,29 @@ fn request_autosave_within(
     import_losses: Option<&[String]>,
     selection: Option<&aurora_doc::SelectionSet>,
 ) -> Option<background_autosave::Generation> {
+    request_autosave_within_with_colour(worker, budget, path, document, layers, history, canvas_size, skipped, store, import_losses, selection, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_autosave_within_with_colour(
+    worker: &mut background_autosave::AutosaveWorker,
+    budget: usize,
+    path: &Path,
+    document: u64,
+    layers: &aurora_doc::LayerTree,
+    history: &aurora_doc::History,
+    canvas_size: (u32, u32),
+    skipped: &mut aurora_io::SkippedTiles,
+    store: &mut aurora_tile::TileStore,
+    import_losses: Option<&[String]>,
+    selection: Option<&aurora_doc::SelectionSet>,
+    colour: Option<&aurora_io::DocumentColour>,
+) -> Option<background_autosave::Generation> {
     // 0.173.0 review (R-1): the generation of a *complete* autosave this
     // call submitted (or wrote), `None` when there is none — a failed or
     // partial snapshot, a dropped job, a failed synchronous write — so a
     // caller can tell "saved once it lands" from "not saved at all".
-    match snapshot_autosave(
+    match snapshot_autosave_with_colour(
         path,
         layers,
         history,
@@ -2142,6 +2224,7 @@ fn request_autosave_within(
         store,
         import_losses,
         selection,
+        colour,
     ) {
         SnapshotOutcome::Taken(mut job) => {
             job.document = document;
@@ -2154,7 +2237,7 @@ fn request_autosave_within(
             let generation = worker.supersede(document);
             let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
             let before = modified(path);
-            write_autosave(
+            write_autosave_with_colour(
                 path,
                 layers,
                 history,
@@ -2163,6 +2246,7 @@ fn request_autosave_within(
                 store,
                 import_losses,
                 selection,
+                colour,
             );
             // Complete only if the canonical file was (re)written: a
             // failed write leaves it as it was, and a partial one goes to
@@ -2207,6 +2291,7 @@ enum SnapshotOutcome {
 /// out with whatever tile this snapshot could not read folded in, and a
 /// snapshot missing tiles is routed to [`partial_autosave_path`], never
 /// over a complete autosave.
+/// [`snapshot_autosave_with_colour`] for a document with no colour metadata.
 #[allow(clippy::too_many_arguments)]
 fn snapshot_autosave(
     path: &Path,
@@ -2218,6 +2303,22 @@ fn snapshot_autosave(
     store: &mut aurora_tile::TileStore,
     import_losses: Option<&[String]>,
     selection: Option<&aurora_doc::SelectionSet>,
+) -> SnapshotOutcome {
+    snapshot_autosave_with_colour(path, layers, history, canvas_size, skipped, max_texel_bytes, store, import_losses, selection, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn snapshot_autosave_with_colour(
+    path: &Path,
+    layers: &aurora_doc::LayerTree,
+    history: &aurora_doc::History,
+    canvas_size: (u32, u32),
+    skipped: &mut aurora_io::SkippedTiles,
+    max_texel_bytes: usize,
+    store: &mut aurora_tile::TileStore,
+    import_losses: Option<&[String]>,
+    selection: Option<&aurora_doc::SelectionSet>,
+    colour: Option<&aurora_io::DocumentColour>,
 ) -> SnapshotOutcome {
     // 0.218.0: the selection's raster coverage is shared, not copied, but
     // it is alive until the write ends, so it counts against the bound.
@@ -2254,6 +2355,10 @@ fn snapshot_autosave(
     };
     // 0.218.0: the selections survive a crash (the writer thread encodes).
     snapshot.set_selection(selection);
+    if let Err(err) = snapshot.set_colour(colour) {
+        tracing::warn!(?err, path = %path.display(), "failed to encode the autosave's colour profiles");
+        return SnapshotOutcome::Failed;
+    }
     // Review B-1: what the document's open dropped survives a recovery.
     if let Err(err) = snapshot.set_import_losses(import_losses) {
         tracing::warn!(?err, path = %path.display(), "failed to encode the autosave's import losses");
@@ -2627,6 +2732,7 @@ fn read_autosave_container(
             import_losses: document.import_losses,
             selection: document.selection,
             selection_dropped: document.selection_dropped,
+            colour: document.colour,
         }),
         Err(err) => {
             tracing::warn!(?err, path = %path.display(), "failed to read the autosave container");
@@ -2658,6 +2764,8 @@ struct RecoveredDocument {
     selection: aurora_doc::SelectionSet,
     /// Why its selection entry was dropped, if it was (0.218.1).
     selection_dropped: Option<String>,
+    /// The source/output colour profiles the autosave carried.
+    colour: aurora_io::DocumentColour,
 }
 
 /// What [`App::new`] starts this session with — see
@@ -2682,6 +2790,8 @@ struct StartupDocument {
     /// Why a recovered document's selection entry was dropped (0.218.1),
     /// for the status-bar notice `App::new` raises.
     selection_dropped: Option<String>,
+    /// A recovered document's source/output profiles; empty otherwise.
+    colour: aurora_io::DocumentColour,
     /// Whether this really came from an autosave — what the
     /// crash-recovery dialog's own message reports
     /// ([`crash_recovery_dialog_message`]).
@@ -2834,6 +2944,7 @@ fn recovered_shelf(sessions: Vec<RecoveredSession>) -> DocumentShelf {
             // status bar to tell: a known gap (0.218.1), the entry is
             // simply left out.
             selection_dropped: _,
+            colour,
         } = document;
         let active_layer = topmost_pixel_layer(&layers);
         let canvas_view = load_document_view(
@@ -2859,6 +2970,7 @@ fn recovered_shelf(sessions: Vec<RecoveredSession>) -> DocumentShelf {
         session.name = format!("Recovered {}", number + 2);
         session.import_losses = import_losses;
         session.selection = selection;
+        session.colour = colour;
         // 0.174.0: recovered work is in no file the user chose.
         session.saved_revision = None;
         shelf.parked.push(session);
@@ -2890,6 +3002,7 @@ fn startup_document_from(
             import_losses: None,
             selection: aurora_doc::SelectionSet::new(),
             selection_dropped: None,
+            colour: aurora_io::DocumentColour::default(),
             was_recovered: false,
             autosave: None,
             recovered_from: None,
@@ -2926,6 +3039,7 @@ fn startup_document_from(
                 import_losses,
                 selection,
                 selection_dropped,
+                colour,
             }) = recovered
             {
                 // Nothing written back out: the file on disk *is* this
@@ -2945,6 +3059,7 @@ fn startup_document_from(
                     import_losses,
                     selection,
                     selection_dropped,
+                    colour,
                     was_recovered: true,
                     autosave: None,
                     recovered_from: Some(position),
@@ -3017,6 +3132,7 @@ fn startup_document_from(
         import_losses: None,
         selection: aurora_doc::SelectionSet::new(),
         selection_dropped: None,
+        colour: aurora_io::DocumentColour::default(),
         was_recovered: false,
         autosave,
         recovered_from: None,
@@ -28911,6 +29027,9 @@ enum LockRefusal {
     /// A save landed but the system would not confirm that its directory
     /// entry reached the disk (0.247.0); the file is in place.
     SaveNotConfirmed,
+    /// A calm colour-management notice (open conversion, output profile):
+    /// fixed text, no dialog, no history row.
+    Colour(&'static str),
     /// The Clone Stamp pressed with no source set (0.221.0).
     CloneNeedsSource,
     /// The Clone Stamp with no pixel layer to sample or paint: none is
@@ -29029,6 +29148,7 @@ impl LockRefusal {
                 "This file's saved selection couldn't be restored and was left out. The rest of the document opened."
             }
             LockRefusal::SaveNotConfirmed => aurora_io::DIR_SYNC_ADVISORY,
+            LockRefusal::Colour(text) => text,
             LockRefusal::CloneNeedsSource => "Alt-click to set a clone source.",
             LockRefusal::CloneNeedsPixelLayer => {
                 "Select a pixel layer to clone. A group, an adjustment layer or no layer can't be sampled."
@@ -29141,7 +29261,7 @@ fn lock_refusal_applies(
     press_refusal(tool, lock) == Some(refusal)
         || delete_refusal(lock) == Some(refusal)
         || refusal == LockRefusal::HistoryUnavailable
-        || matches!(refusal, LockRefusal::Path(_))
+        || matches!(refusal, LockRefusal::Path(_) | LockRefusal::Colour(_))
         || matches!(
             refusal,
             LockRefusal::SavedSelectionNeedsSelection
@@ -30477,6 +30597,7 @@ impl App {
             import_losses: startup_import_losses,
             selection: startup_selection,
             selection_dropped: startup_selection_dropped,
+            colour: startup_colour,
             was_recovered,
             autosave: startup_autosave,
             recovered_from,
@@ -30689,6 +30810,7 @@ impl App {
                 }
                 doc.import_losses = startup_import_losses;
                 doc.selection = startup_selection;
+                doc.colour = startup_colour;
                 doc
             },
             shelf: recovered_shelf(extra_sessions),
@@ -31659,7 +31781,7 @@ impl App {
         }
         let own_autosave = self.autosave.session_path(self.doc.id.get());
         if let Some(store) = self.doc.tile_store.as_mut() {
-            request_autosave(
+            request_autosave_with_colour(
                 &mut self.autosave_worker,
                 &own_autosave,
                 self.doc.id.get(),
@@ -31670,6 +31792,7 @@ impl App {
                 store,
                 self.doc.import_losses.as_deref(),
                 None,
+                Some(&self.doc.colour),
             );
         } else {
             tracing::warn!("no live tile store; the new document is not autosaved");
@@ -32126,7 +32249,16 @@ impl App {
             .file_stem()
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("Image");
-        let PreparedImage { size, tiles } = image;
+        let PreparedImage {
+            size,
+            tiles,
+            colour,
+        } = image;
+        // Metadata first: the install's autosave carries it.
+        self.doc.colour = aurora_io::DocumentColour {
+            source: colour.source.clone(),
+            output: None,
+        };
         let (layers, history, layer_id) = document_from_size(name, size);
         // The image's own real, decoded dimensions -- known exactly
         // here, rather than derived back out of the one layer just
@@ -32144,9 +32276,12 @@ impl App {
         ) else {
             return false;
         };
-        if let Some(item) = unwritten_layers_item(unwritten) {
-            self.doc.import_losses = Some(vec![item.clone()]);
-            let report = aurora_io::PsdImportReport { items: vec![item] };
+        self.announce_colour_open(&colour);
+        let mut items: Vec<String> = colour.report.warnings.clone();
+        items.extend(unwritten_layers_item(unwritten));
+        if !items.is_empty() {
+            self.doc.import_losses = Some(items.clone());
+            let report = aurora_io::PsdImportReport { items };
             if let Some(message) = psd_report_message(&display_file_name(path), &report)
                 && !self.open_psd_report_dialog(&message)
             {
@@ -32186,8 +32321,13 @@ impl App {
             pixels,
             masks,
             report,
+            colour,
             timings,
         } = document;
+        self.doc.colour = aurora_io::DocumentColour {
+            source: colour.source.clone(),
+            output: None,
+        };
         tracing::info!(
             total_ms = timings.total.as_millis(),
             encode_ms = timings.encode.as_millis(),
@@ -32204,6 +32344,7 @@ impl App {
             return false;
         };
         report.items.extend(unwritten_layers_item(unwritten));
+        self.announce_colour_open(&colour);
         // Review H-1: kept for a later Photoshop save of this document.
         self.doc.import_losses = (!report.items.is_empty()).then(|| report.items.clone());
         if let Some(message) = psd_report_message(&display_file_name(path), &report) {
@@ -32217,6 +32358,19 @@ impl App {
             }
         }
         true
+    }
+
+    /// Raises the calm status-bar line for what an open did about colour
+    /// ([`colour_open_notice`]) and logs the detail. Info lines never open
+    /// a dialog; warnings go to the open report instead.
+    fn announce_colour_open(&mut self, colour: &aurora_io::ColourImport) {
+        for line in &colour.report.info {
+            tracing::info!(%line, "colour management on open");
+        }
+        if let Some(text) = colour_open_notice(colour) {
+            self.lock_notice = Some((LockRefusal::Colour(text), self.doc.active_layer));
+            self.sync_status_bar_now();
+        }
     }
 
     /// Opens the [`PSD_REPORT_TITLE`] dialog with `message`, relaid out
@@ -32341,7 +32495,7 @@ impl App {
             self.doc.skipped_tiles = aurora_io::SkippedTiles::new();
             // A snapshot here, the write on the autosave worker (0.152.0).
             let own_autosave = self.autosave.session_path(self.doc.id.get());
-            request_autosave(
+            request_autosave_with_colour(
                 &mut self.autosave_worker,
                 &own_autosave,
                 self.doc.id.get(),
@@ -32352,6 +32506,7 @@ impl App {
                 store,
                 self.doc.import_losses.as_deref(),
                 None,
+                Some(&self.doc.colour),
             );
         } else {
             // Nothing to free beyond the in-memory structure itself:
@@ -32486,7 +32641,10 @@ impl App {
             import_losses,
             selection,
             selection_dropped,
+            colour,
+            colour_dropped,
         } = document;
+        self.doc.colour = colour;
         // Review B-1: what this document's own first open dropped, kept
         // across the `.aur` (set before the install's autosave).
         self.doc.import_losses = import_losses;
@@ -32522,7 +32680,7 @@ impl App {
         // carries the opened document's real tiles.
         if let Some(store) = self.doc.tile_store.as_mut() {
             let own_autosave = self.autosave.session_path(self.doc.id.get());
-            request_autosave(
+            request_autosave_with_colour(
                 &mut self.autosave_worker,
                 &own_autosave,
                 self.doc.id.get(),
@@ -32533,6 +32691,7 @@ impl App {
                 store,
                 self.doc.import_losses.as_deref(),
                 Some(&selection),
+                Some(&self.doc.colour),
             );
         }
 
@@ -32573,6 +32732,15 @@ impl App {
         if let Some(why) = &selection_dropped {
             tracing::warn!(%why, path = %path.display(), "a .aur file's selection was left out");
             self.lock_notice = Some((LockRefusal::SelectionDroppedOnOpen, self.doc.active_layer));
+            self.sync_status_bar_now();
+        } else if let Some(why) = &colour_dropped {
+            tracing::warn!(%why, path = %path.display(), "a .aur file's colour profiles were left out");
+            self.lock_notice = Some((
+                LockRefusal::Colour(
+                    "This file's colour profiles couldn't be restored and were left out. The pixels are unchanged (sRGB).",
+                ),
+                self.doc.active_layer,
+            ));
             self.sync_status_bar_now();
         }
         // Dropped, deliberately not committed through `commit_drag`:
@@ -33166,6 +33334,7 @@ impl App {
             skipped_tiles: &self.doc.skipped_tiles,
             import_losses: self.doc.import_losses.as_deref(),
             selection: &self.doc.selection,
+            colour: &self.doc.colour,
         };
         let advisory = match aur_save::save_aur_document(path, &source, store) {
             Ok(advisory) => advisory,
@@ -83190,6 +83359,7 @@ mod tests {
             pixels: prepared_layers,
             masks: prepared_masks,
             report: _,
+            colour: _,
             timings: _,
         } = document;
         let started = std::time::Instant::now();
