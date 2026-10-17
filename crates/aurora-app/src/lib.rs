@@ -21682,7 +21682,7 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
         );
         return None;
     };
-    let decoded = decode_f16_samples(&data);
+    let decoded = profiled(ProfileSlot::ReadbackDecode, || decode_f16_samples(&data));
     drop(data);
     buffer.unmap();
     // Straighten once, here: what came back is the GPU fold's finished
@@ -21691,7 +21691,9 @@ fn finish_tile_readback(pending: PendingGpuReadback) -> Option<Vec<half::f16>> {
     // -- is straight alpha. See this function's own doc comment above
     // for why this is the CPU's job on both paths.
     decoded.map(|mut texels| {
-        aurora_render::un_premultiply_in_place(&mut texels);
+        profiled(ProfileSlot::ReadbackStraighten, || {
+            aurora_render::un_premultiply_in_place(&mut texels);
+        });
         texels
     })
 }
@@ -23100,6 +23102,11 @@ enum ProfileSlot {
     Straighten,
     /// [`install_composited_tile`] (60 FPS round 7).
     Install,
+    /// [`finish_tile_readback`]'s decode of the mapped GPU readback
+    /// (60 FPS round 7).
+    ReadbackDecode,
+    /// [`finish_tile_readback`]'s straightening pass (60 FPS round 7).
+    ReadbackStraighten,
 }
 
 /// Calls and nanoseconds per [`ProfileSlot`] on this thread (0.183.0,
@@ -23107,13 +23114,13 @@ enum ProfileSlot {
 #[cfg(test)]
 #[derive(Debug, Default, Clone, Copy)]
 struct CompositeProfile {
-    slots: [(u64, u64); 9],
+    slots: [(u64, u64); 11],
 }
 
 #[cfg(test)]
 thread_local! {
     static COMPOSITE_PROFILE: std::cell::Cell<CompositeProfile> =
-        const { std::cell::Cell::new(CompositeProfile { slots: [(0, 0); 9] }) };
+        const { std::cell::Cell::new(CompositeProfile { slots: [(0, 0); 11] }) };
     /// Test-only: context nodes skipped below a cover by occlusion culling
     /// (0.183.0, [`fold_context_into`]), so tests can see a cull happen —
     /// the cull being output-identical, nothing else can.
@@ -68153,6 +68160,7 @@ mod tests {
             "a single Normal-blend, full-bounds pixel layer must qualify for the GPU path"
         );
 
+        let profile_before = crate::COMPOSITE_PROFILE.with(std::cell::Cell::get);
         let mut stages = measure_pan_and_paint_frames(
             &context,
             &layers,
@@ -68165,6 +68173,7 @@ mod tests {
             (200, 120),
             None,
         );
+        print_composite_profile_per_frame("gate32", profile_before, 40);
         report_frame_distribution("gate (GPU path, 32 tiles)", &stages);
         report_frame_stages(
             "recomposite_and_present_loop (GPU path, 300,000px ceiling, pan+paint)",
@@ -68726,6 +68735,8 @@ mod tests {
             "tile composite (incl.)",
             "straighten",
             "install",
+            "readback decode",
+            "readback straighten",
         ];
         let frames = f64::from(frames.max(1));
         for ((name, (calls, nanos)), (calls0, nanos0)) in
@@ -92070,6 +92081,7 @@ mod tests {
 
         /// One full-composite breakdown line (0.183.0): store hits and
         /// misses, the profile slots and the folds culled since `before`.
+        #[allow(clippy::large_types_passed_by_value)] // test-only, once per edit
         fn print_breakdown(
             what: &str,
             store: &aurora_tile::TileStore,
