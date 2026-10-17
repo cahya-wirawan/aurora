@@ -23838,6 +23838,88 @@ fn prewarm_gpu_pipelines(
     }
 }
 
+/// 60 FPS round 6: composites one transparent tile through the GPU path's
+/// own steps -- accumulator and source textures with the frame's
+/// descriptors, a `write_texture` upload, a `Normal` pass, the readback
+/// copy into a `MAP_READ` buffer, a submit, `map_async` and a blocking
+/// poll -- on textures and a buffer of its own, at startup, so the
+/// one-time work the first of each step does (memory blocks, staging,
+/// descriptor pools, command pools, the first submit and map) is not
+/// paid inside the first frame. Touches no document, store or atlas, so
+/// it cannot change a pixel; the decoded result is dropped. Every `wgpu`
+/// error is captured and logged; nothing it built outlives it.
+fn warm_up_gpu_composite(
+    gpu: &aurora_gpu::GpuContext,
+    compositor: &mut aurora_render::TileCompositor,
+) -> bool {
+    let device = gpu.device();
+    let queue = gpu.queue();
+    let started = std::time::Instant::now();
+    let warmed = aurora_render::capture_wgpu_errors(device, || {
+        let tile_extent = wgpu::Extent3d {
+            width: aurora_tile::TILE,
+            height: aurora_tile::TILE,
+            depth_or_array_layers: 1,
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu-composite-warm-up"),
+        });
+        let accumulator =
+            create_composite_accumulator(device, &mut encoder, tile_extent, "gpu-composite-a");
+        let src_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gpu-composite-src"),
+            size: tile_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let transparent = aurora_render::transparent_tile();
+        let bytes = f16_le_bytes(&transparent);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &src_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(aurora_tile::TILE * 8),
+                rows_per_image: Some(aurora_tile::TILE),
+            },
+            tile_extent,
+        );
+        let src_view = src_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        compositor.composite_over_with_opacity(gpu, &mut encoder, &accumulator.1, &src_view, 1.0);
+        let readback = record_tile_readback(device, &mut encoder, &accumulator.0);
+        queue.submit(std::iter::once(encoder.finish()));
+        let pending = map_pending_readback(readback, aurora_tile::TileId { x: 0, y: 0 });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        finish_tile_readback(pending).is_some()
+    });
+    match warmed {
+        Ok(read_back) => {
+            tracing::info!(
+                read_back,
+                ms = started.elapsed().as_secs_f64() * 1000.0,
+                "GPU composite path warmed up"
+            );
+            read_back
+        }
+        Err(err) => {
+            tracing::warn!(%err, "warming up the GPU composite path failed");
+            false
+        }
+    }
+}
+
 /// GPU-accelerated compositing for one visible composite tile, for the
 /// tractable case [`document_qualifies_for_gpu_compositing`] confirms for
 /// the whole document: every visible top-level layer is an
@@ -37650,6 +37732,7 @@ impl ApplicationHandler<AppEvent> for App {
                 &mut compositor,
                 surface.format(),
             );
+            let _ = warm_up_gpu_composite(&gpu, &mut compositor);
             self.canvas_pipeline = Some(canvas_pipeline);
             self.compositor = Some(compositor);
         } else {
@@ -66459,6 +66542,13 @@ mod tests {
             let _ = canvas_pipeline.pipeline(device, wgpu::TextureFormat::Rgba8Unorm);
             let _ = compositor.prewarm(device, false).ok();
         }
+        // 60 FPS round 6: as `App` does at startup, unless
+        // `AURORA_R6_NO_WARM_UP` asks for the cold first GPU composite.
+        if std::env::var_os("AURORA_R5_COLD").is_none()
+            && std::env::var_os("AURORA_R6_NO_WARM_UP").is_none()
+        {
+            let _ = crate::warm_up_gpu_composite(gpu, &mut compositor);
+        }
         // 60 FPS round 6: `AURORA_R6_BLEND_PREWARM=background` starts the
         // blend pipelines' background build as `App` does and does not wait
         // for it; `finished` waits until it is done (the first frame of a
@@ -77568,6 +77658,84 @@ mod tests {
             0,
             "and no blend pass may be recorded for it either -- the Darken layer's own arm is \
              the one that can be observed directly"
+        );
+    }
+
+    /// 60 FPS round 6: the startup warm-up of the GPU composite path reads
+    /// its own tile back, and a tile composited afterwards (Normal,
+    /// Multiply, Darken, Screen layers) is bit for bit the tile a compositor
+    /// that was never warmed up produces.
+    #[test]
+    fn warming_up_the_gpu_composite_path_changes_no_pixel() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[
+                (
+                    "l1",
+                    aurora_doc::BlendMode::Normal,
+                    1.0,
+                    [0.5, 0.75, 1.0, 1.0],
+                ),
+                (
+                    "l2",
+                    aurora_doc::BlendMode::Multiply,
+                    0.5,
+                    [0.5, 0.25, 0.5, 0.75],
+                ),
+                (
+                    "l3",
+                    aurora_doc::BlendMode::Darken,
+                    0.75,
+                    [0.75, 0.5, 0.25, 1.0],
+                ),
+                (
+                    "l4",
+                    aurora_doc::BlendMode::Screen,
+                    0.5,
+                    [0.25, 0.5, 0.75, 0.5],
+                ),
+            ],
+        );
+        assert!(document_qualifies_for_gpu_compositing(&layers));
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        let composite = |warm: bool, store: &mut aurora_tile::TileStore| {
+            let mut compositor = aurora_render::TileCompositor::new(context.device());
+            if warm {
+                assert!(crate::warm_up_gpu_composite(&context, &mut compositor));
+            }
+            let mut budget = CompositeBudget::for_pass(&layers);
+            let pending = begin_gpu_composite_tile(
+                &context,
+                &mut compositor,
+                &layers,
+                store,
+                tile,
+                (0, 0),
+                (0, 0),
+                &mut budget,
+            );
+            let Some(pending) = pending else {
+                unreachable!("every layer is stored at this tile");
+            };
+            let _ = context.device().poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            crate::finish_tile_readback(pending).unwrap_or_default()
+        };
+        let warmed = composite(true, &mut store);
+        let cold = composite(false, &mut store);
+        assert_eq!(warmed.len(), aurora_tile::SAMPLES);
+        assert!(
+            warmed
+                .iter()
+                .map(|s| s.to_bits())
+                .eq(cold.iter().map(|s| s.to_bits())),
+            "a warmed-up compositor must composite the same bits"
         );
     }
 
