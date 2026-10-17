@@ -382,6 +382,13 @@ impl EffectLosses {
             if n == 1 {
                 format!("1 {one}{rest}")
             } else {
+                // The verb agrees with the plural noun.
+                let rest = rest
+                    .replacen(" isn't", " aren't", 1)
+                    .replacen(" is ", " are ", 1)
+                    .replacen(" follows ", " follow ", 1)
+                    .replacen(" has ", " have ", 1)
+                    .replacen(" names ", " name ", 1);
                 format!("{n} {one}s{rest}")
             }
         };
@@ -390,7 +397,7 @@ impl EffectLosses {
             items.push(many(
                 self.contours,
                 "effect",
-                " had a custom contour; it is saved with the Linear contour.",
+                " had a custom contour (saved with the Linear contour).",
             ));
         }
         if self.extra_glows > 0 {
@@ -411,7 +418,7 @@ impl EffectLosses {
             items.push(many(
                 self.detached_angles,
                 "drop shadow",
-                " follows global light at an angle other than the file's, so it is saved with its own angle.",
+                " follows global light at an angle other than the file's; written with its own angle instead.",
             ));
         }
         if self.strokes_left_out > 0 {
