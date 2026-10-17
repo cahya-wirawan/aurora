@@ -168,6 +168,7 @@ mod text_field;
 mod thumbnail;
 pub(crate) use text_field::floor_char_boundary;
 mod tooltip;
+mod tooltip_place;
 mod tree_view;
 
 pub use button::{
@@ -267,7 +268,8 @@ pub use thumbnail::{
     THUMBNAIL_TEXELS, ThumbnailImage, ThumbnailState, insert_thumbnail, set_thumbnail_image,
     thumbnail_state,
 };
-pub use tooltip::{Tooltip, TooltipPhase};
+pub use tooltip::{MAX_WIDTH_STEPS as TOOLTIP_MAX_WIDTH_STEPS, Tooltip, TooltipPhase};
+pub use tooltip_place::{TooltipPlacement, TooltipSide, place_tooltip, tooltip_size};
 pub use tree_view::{
     MAX_TREE_DEPTH, TreeItemState, insert_tree_item, insert_tree_view, set_tree_item_description,
     set_tree_item_disabled, set_tree_item_expanded, set_tree_item_flat, set_tree_item_key,

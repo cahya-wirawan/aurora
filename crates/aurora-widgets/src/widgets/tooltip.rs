@@ -282,12 +282,15 @@
 use std::time::{Duration, Instant};
 
 use accesskit::{Node, Role};
+use aurora_text::{TextEngine, TextStyle};
 use aurora_theme::Scales;
 use taffy::style_helpers::{auto, length, percent, zero};
 use taffy::{Position, Rect as LayoutRect, Size, Style};
 
+use super::tooltip_place::{TooltipSide, place_tooltip, tooltip_size};
 use super::{WidgetKind, spacing, type_size};
 use crate::error::WidgetError;
+use crate::text::{label_style, sanitize_label};
 use crate::tree::{PaintLayer, WidgetId, WidgetTree};
 
 /// Where a [`Tooltip`] is in its show/hide cycle — see this module's own
@@ -445,6 +448,31 @@ struct TooltipMetrics {
     pad_v: f32,
     pad_h: f32,
     min_height: f32,
+    /// The widest a tooltip grows: [`MAX_WIDTH_STEPS`] x `spacing.xxxl`.
+    max_width: f32,
+    /// The gap between the owner and the tooltip: `spacing.xxs`.
+    gap: f32,
+    /// The text's size in px (`type.size.xs`).
+    text_px: f32,
+}
+
+/// How many `spacing.xxxl` steps wide a tooltip may grow before its text
+/// ends in an ellipsis (5 x 64 = 320 logical px under the shipped scales).
+/// The scales have no tooltip-width token; the same "n steps of the
+/// spacing scale" rule the document tab strip's ceiling uses
+/// (`3 * spacing.xxxl`). A design-owner question, raised in the 0.262.0
+/// report, not an invented token.
+pub const MAX_WIDTH_STEPS: u32 = 5;
+
+/// Where a placed tooltip sits relative to its owner, and how big it is:
+/// the offset of its top-left corner from the owner's top-left corner (so
+/// it follows an owner that moves) and its box, logical px.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Frame {
+    dx: f32,
+    dy: f32,
+    width: f32,
+    height: f32,
 }
 
 /// A tooltip attached to one owner widget — see this module's own doc
@@ -462,6 +490,9 @@ pub struct Tooltip {
     metrics: TooltipMetrics,
     model: Model,
     node: Option<WidgetId>,
+    /// The last placement ([`Tooltip::place`]); `None` until placed and
+    /// again after a hide.
+    frame: Option<Frame>,
 }
 
 /// Whether `kind` may own a tooltip — see "Allowed owners" in this
@@ -514,19 +545,39 @@ fn tooltip_node(text: &str) -> Node {
 /// `spacing.xs` horizontally — the mockup's `.tooltip` padding.
 /// `Position::Absolute`, so it takes no part in the owner's own layout:
 /// the owner's size is unchanged by showing it.
-fn tooltip_style(metrics: TooltipMetrics) -> Style {
+fn tooltip_style(metrics: TooltipMetrics, frame: Option<Frame>) -> Style {
+    // Placed (0.262.0): an explicit box at an offset from the owner's
+    // corner. Unplaced: the original hang below the owner at its width.
+    let (inset, size) = match frame {
+        Some(frame) => (
+            LayoutRect {
+                left: length(frame.dx),
+                right: auto(),
+                top: length(frame.dy),
+                bottom: auto(),
+            },
+            Size {
+                width: length(frame.width),
+                height: length(frame.height),
+            },
+        ),
+        None => (
+            LayoutRect {
+                left: zero(),
+                right: auto(),
+                top: percent(1.0_f32),
+                bottom: auto(),
+            },
+            Size {
+                width: percent(1.0_f32),
+                height: auto(),
+            },
+        ),
+    };
     Style {
         position: Position::Absolute,
-        inset: LayoutRect {
-            left: zero(),
-            right: auto(),
-            top: percent(1.0_f32),
-            bottom: auto(),
-        },
-        size: Size {
-            width: percent(1.0_f32),
-            height: auto(),
-        },
+        inset,
+        size,
         min_size: Size {
             width: auto(),
             height: length(metrics.min_height),
@@ -572,9 +623,13 @@ impl Tooltip {
                 pad_v,
                 pad_h: spacing(scales.spacing.xs),
                 min_height: type_size(scales.typography.size.xs) + pad_v * 2.0,
+                max_width: spacing(scales.spacing.xxxl.saturating_mul(MAX_WIDTH_STEPS)),
+                gap: spacing(scales.spacing.xxs),
+                text_px: type_size(scales.typography.size.xs),
             },
             model: Model::IDLE,
             node: None,
+            frame: None,
         })
     }
 
@@ -733,6 +788,95 @@ impl Tooltip {
         self.delay = delay;
     }
 
+    /// The box this tooltip would take for its current text, logical px:
+    /// the text measured with the tooltip's own `type.size.xs` line (the
+    /// very shaping the paint reuses) plus its padding, at most
+    /// `MAX_WIDTH_STEPS` x `spacing.xxxl` wide (longer text ends in an
+    /// ellipsis when drawn), at least one line plus padding tall. Without
+    /// a text engine (the UI font failed to load) the width is estimated
+    /// from the character count; no glyphs are drawn then anyway.
+    #[must_use]
+    pub fn measured_size(
+        &self,
+        engine: Option<&mut TextEngine>,
+        scales: &Scales,
+        scale_factor: f32,
+    ) -> (f32, f32) {
+        let text = sanitize_label(&self.text);
+        let base = label_style(scales);
+        let style = TextStyle {
+            size_px: self.metrics.text_px,
+            ..base
+        };
+        let (width, height) = match engine {
+            Some(engine) => {
+                let line = engine.shape(&text, &style, scale_factor);
+                (line.width, line.line_height)
+            }
+            None => {
+                #[allow(clippy::cast_precision_loss)]
+                let chars = text.chars().count() as f32;
+                (chars * style.size_px * 0.6, style.size_px * style.line_height)
+            }
+        };
+        tooltip_size(
+            width,
+            height,
+            self.metrics.pad_h,
+            self.metrics.pad_v,
+            self.metrics.max_width,
+            self.metrics.min_height,
+        )
+    }
+
+    /// Puts a shown tooltip of `size` beside its owner inside `window`
+    /// (both logical px; the owner's bounds are those of the last layout),
+    /// preferring `prefer` and flipping/sliding to stay inside —
+    /// [`place_tooltip`]. Returns whether the node's style changed, which
+    /// is when the caller must lay out again; an unchanged placement is a
+    /// no-op, so calling this after every layout settles (the second call
+    /// finds the same answer). Does nothing for a tooltip that is not
+    /// shown, and while the owner has no bounds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_hover`].
+    pub fn place(
+        &mut self,
+        tree: &mut WidgetTree<WidgetKind>,
+        size: (f32, f32),
+        window: (f32, f32),
+        prefer: TooltipSide,
+    ) -> Result<bool, WidgetError> {
+        if !tree.contains(self.owner) {
+            self.model = Model::IDLE;
+            self.node = None;
+            self.frame = None;
+            return Err(WidgetError::UnknownWidget(self.owner));
+        }
+        let Some(node) = self.node.filter(|&id| self.is_own_node(tree, id)) else {
+            return Ok(false);
+        };
+        let Some(owner) = tree.bounds(self.owner) else {
+            return Ok(false);
+        };
+        let placement = place_tooltip(owner, size, window, self.metrics.gap, prefer);
+        #[allow(clippy::cast_precision_loss)]
+        let frame = Frame {
+            dx: placement.x - owner.x as f32,
+            dy: placement.y - owner.y as f32,
+            width: size.0,
+            height: size.1,
+        };
+        if self.frame == Some(frame) {
+            return Ok(false);
+        }
+        tree.set_style(node, tooltip_style(self.metrics, Some(frame)))?;
+        tree.mark_dirty(node)?;
+        self.frame = Some(frame);
+        Ok(true)
+    }
+
     /// Removes the tooltip's node (if shown) and returns to `Idle` with
     /// every flag cleared — the next hover or focus report is a fresh
     /// rise. Call before dropping a controller whose owner stays alive.
@@ -769,6 +913,11 @@ impl Tooltip {
         };
         self.model = next;
         self.node = node;
+        if node.is_none() {
+            // A hidden tooltip forgets its placement: the next show is
+            // placed afresh against wherever its owner is by then.
+            self.frame = None;
+        }
         Ok(())
     }
 
@@ -806,7 +955,7 @@ impl Tooltip {
         }
         let id = tree.insert(
             self.owner,
-            tooltip_style(self.metrics),
+            tooltip_style(self.metrics, self.frame),
             expected,
             WidgetKind::Tooltip,
         )?;
