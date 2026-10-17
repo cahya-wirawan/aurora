@@ -98,10 +98,13 @@ fn assert_converted(ext: &str, tolerance: f32) {
     }
     // The converted values really differ from the stored ones.
     assert_ne!(bits(&image).get(..3), bits(&stored).get(..3), "{ext}");
+    // lcms2 stamps the current time into every serialisation, so compare
+    // outside the header's date and profile-ID fields (a flake on CI when
+    // two serialisations straddled a second).
     let kept = imported.source.as_ref().map(|s| s.bytes.clone());
-    assert_eq!(
-        kept,
-        Some(adobe_bytes()),
+    assert!(
+        kept.as_deref()
+            .is_some_and(|k| aurora_color::icc_bytes_match_ignoring_stamps(k, &adobe_bytes())),
         "{ext}: the source profile is kept"
     );
     assert!(

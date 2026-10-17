@@ -101,9 +101,11 @@ fn the_exported_file_embeds_exactly_the_profile_its_pixels_are_in() {
         else {
             unreachable!()
         };
-        assert_eq!(
-            imported.source.as_ref().map(|s| s.bytes.clone()),
-            Some(adobe_bytes()),
+        // Outside lcms2's per-serialisation date and profile-ID stamps.
+        assert!(
+            imported.source.as_ref().is_some_and(|s| {
+                aurora_color::icc_bytes_match_ignoring_stamps(&s.bytes, &adobe_bytes())
+            }),
             "{ext}"
         );
         let tolerance = if ext == "a.jpg" { 0.03 } else { 0.01 };
