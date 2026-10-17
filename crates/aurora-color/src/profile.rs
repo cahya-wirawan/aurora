@@ -51,8 +51,11 @@ impl IccProfile {
             Y: 1.0,
         };
         let curve = if gamma == 0.0 {
-            lcms2::ToneCurve::new_parametric(4, &[2.4, 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045])
-                .map_err(ColorError::InvalidProfile)?
+            lcms2::ToneCurve::new_parametric(
+                4,
+                &[2.4, 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045],
+            )
+            .map_err(ColorError::InvalidProfile)?
         } else {
             lcms2::ToneCurve::new(gamma)
         };
@@ -63,6 +66,24 @@ impl IccProfile {
         };
         let inner = lcms2::Profile::new_rgb(&xyy(white), &triple, &[&curve, &curve, &curve])
             .map_err(ColorError::InvalidProfile)?;
+        Ok(Self { inner })
+    }
+
+    /// A synthetic grayscale profile (D65 white, a pure power `gamma`
+    /// curve): for tests of the wrong-colour-space refusal and of grey
+    /// imports.
+    ///
+    /// # Errors
+    ///
+    /// [`ColorError::InvalidProfile`] if `lcms2` rejects it.
+    pub fn synthetic_gray(gamma: f64) -> Result<Self, ColorError> {
+        let curve = lcms2::ToneCurve::new(gamma);
+        let white = lcms2::CIExyY {
+            x: 0.3127,
+            y: 0.3290,
+            Y: 1.0,
+        };
+        let inner = lcms2::Profile::new_gray(&white, &curve).map_err(ColorError::InvalidProfile)?;
         Ok(Self { inner })
     }
 

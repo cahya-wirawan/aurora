@@ -311,7 +311,11 @@ fn within_srgb_tolerance(to_working: &Transform) -> bool {
     if to_working.transform(&src, &mut dst).is_err() {
         return false;
     }
-    let worst = src.iter().zip(&dst).map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max);
+    let worst = src
+        .iter()
+        .zip(&dst)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
     worst <= SRGB_EQUIVALENCE_TOLERANCE
 }
 
@@ -366,7 +370,9 @@ mod tests {
         let Ok(p) = IccProfile::synthetic_rgb(D65, ADOBE_PRIMARIES, ADOBE_GAMMA) else {
             unreachable!("synthetic profile")
         };
-        let Ok(b) = p.to_bytes() else { unreachable!("serialises") };
+        let Ok(b) = p.to_bytes() else {
+            unreachable!("serialises")
+        };
         b
     }
 
@@ -380,40 +386,44 @@ mod tests {
             unreachable!("ECI-RGBv2 is a valid RGB profile")
         };
         assert!(!eci.equivalent_to_srgb);
-        assert!(eci.description.to_lowercase().contains("eci"), "{}", eci.description);
+        assert!(
+            eci.description.to_lowercase().contains("eci"),
+            "{}",
+            eci.description
+        );
         let Ok(adobe) = inspect_rgb_source(&adobe_like_bytes()) else {
             unreachable!("synthetic profile is valid")
         };
         assert!(!adobe.equivalent_to_srgb);
         // A gamma-2.2 sRGB-primaries profile is close to sRGB but over the
         // half-step tolerance in the darks.
-        let Ok(g22) = IccProfile::synthetic_rgb(D65, [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]], 2.2)
-            .and_then(|p| p.to_bytes())
+        let Ok(g22) =
+            IccProfile::synthetic_rgb(D65, [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]], 2.2)
+                .and_then(|p| p.to_bytes())
         else {
             unreachable!()
         };
-        let Ok(g22) = inspect_rgb_source(&g22) else { unreachable!() };
+        let Ok(g22) = inspect_rgb_source(&g22) else {
+            unreachable!()
+        };
         assert!(!g22.equivalent_to_srgb);
     }
 
     #[test]
     fn the_built_in_srgb_is_srgb() {
-        let Ok(bytes) = IccProfile::srgb().to_bytes() else { unreachable!() };
-        let Ok(s) = inspect_rgb_source(&bytes) else { unreachable!() };
+        let Ok(bytes) = IccProfile::srgb().to_bytes() else {
+            unreachable!()
+        };
+        let Ok(s) = inspect_rgb_source(&bytes) else {
+            unreachable!()
+        };
         assert!(s.equivalent_to_srgb);
     }
 
     #[test]
     fn non_rgb_wrong_class_garbage_and_oversized_profiles_are_refused_with_a_reason() {
         // A gray profile.
-        let Ok(gray) = lcms2::ToneCurve::new_parametric(1, &[2.2])
-            .map_err(|_| ())
-            .and_then(|c| {
-                lcms2::Profile::new_gray(&lcms2::CIExyY { x: 0.3127, y: 0.329, Y: 1.0 }, &c)
-                    .map_err(|_| ())
-            })
-            .and_then(|p| p.icc().map_err(|_| ()))
-        else {
+        let Ok(gray) = IccProfile::synthetic_gray(2.2).and_then(|p| p.to_bytes()) else {
             unreachable!()
         };
         assert_eq!(
@@ -447,7 +457,11 @@ mod tests {
         );
         // Every reason reads as a sentence fragment.
         assert!(ProfileProblem::TooLarge(9).describe().contains("larger"));
-        assert!(ProfileProblem::WrongSpace(ProfileSpace::Cmyk).describe().contains("CMYK"));
+        assert!(
+            ProfileProblem::WrongSpace(ProfileSpace::Cmyk)
+                .describe()
+                .contains("CMYK")
+        );
     }
 
     #[test]
@@ -511,16 +525,36 @@ mod tests {
         let adobe = matrix(ADOBE_PRIMARIES, D65);
         let srgb_inv = invert(matrix([[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]], D65));
         let encode = |v: f64| {
-            if v <= 0.003_130_8 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+            if v <= 0.003_130_8 {
+                12.92 * v
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            }
         };
-        let Ok(src) = IccProfile::synthetic_rgb(D65, ADOBE_PRIMARIES, ADOBE_GAMMA) else { unreachable!() };
-        let Ok(t) = Transform::to_working(&src) else { unreachable!() };
-        for input in [[1.0_f32, 0.0, 0.0], [0.2, 0.6, 0.4], [0.9, 0.9, 0.1], [0.5, 0.5, 0.5], [0.0, 1.0, 0.0]] {
-            let lin: Vec<f64> = input.iter().map(|&v| f64::from(v).powf(ADOBE_GAMMA)).collect();
-            let xyz: Vec<f64> = (0..3).map(|i| adobe[i][0] * lin[0] + adobe[i][1] * lin[1] + adobe[i][2] * lin[2]).collect();
+        let Ok(src) = IccProfile::synthetic_rgb(D65, ADOBE_PRIMARIES, ADOBE_GAMMA) else {
+            unreachable!()
+        };
+        let Ok(t) = Transform::to_working(&src) else {
+            unreachable!()
+        };
+        for input in [
+            [1.0_f32, 0.0, 0.0],
+            [0.2, 0.6, 0.4],
+            [0.9, 0.9, 0.1],
+            [0.5, 0.5, 0.5],
+            [0.0, 1.0, 0.0],
+        ] {
+            let lin: Vec<f64> = input
+                .iter()
+                .map(|&v| f64::from(v).powf(ADOBE_GAMMA))
+                .collect();
+            let xyz: Vec<f64> = (0..3)
+                .map(|i| adobe[i][0] * lin[0] + adobe[i][1] * lin[1] + adobe[i][2] * lin[2])
+                .collect();
             let want: Vec<f64> = (0..3)
                 .map(|i| {
-                    let v = srgb_inv[i][0] * xyz[0] + srgb_inv[i][1] * xyz[1] + srgb_inv[i][2] * xyz[2];
+                    let v =
+                        srgb_inv[i][0] * xyz[0] + srgb_inv[i][1] * xyz[1] + srgb_inv[i][2] * xyz[2];
                     // Extended range: odd extension of the encode.
                     // lcms2 extends the sRGB curve below zero linearly.
                     if v < 0.0 { 12.92 * v } else { encode(v) }
@@ -529,7 +563,10 @@ mod tests {
             let mut got = [0.0_f32; 3];
             assert!(t.transform(&input, &mut got).is_ok());
             for (g, w) in got.iter().zip(&want) {
-                assert!((f64::from(*g) - w).abs() < 2e-3, "{input:?}: got {got:?}, want {want:?}");
+                assert!(
+                    (f64::from(*g) - w).abs() < 2e-3,
+                    "{input:?}: got {got:?}, want {want:?}"
+                );
             }
         }
         // Adobe green is outside sRGB: red goes negative, kept.

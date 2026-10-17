@@ -234,3 +234,7 @@ pub fn decode_to_working(path: &Path, bytes: &[u8]) -> Result<(Image, ColourImpo
     let image = Image::new(parts.width, parts.height, IccProfile::srgb(), parts.samples)?;
     Ok((image, imported))
 }
+
+#[cfg(test)]
+#[path = "colour_import_tests.rs"]
+mod tests;
