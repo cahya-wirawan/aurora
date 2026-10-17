@@ -575,6 +575,8 @@ mod filter_stamp;
 #[cfg(test)]
 mod filter_stamp_tests;
 mod first_run;
+#[cfg(test)]
+mod frame_cost_tests;
 mod lasso_tools;
 mod layer_thumbnails;
 mod menu_bar_app;
