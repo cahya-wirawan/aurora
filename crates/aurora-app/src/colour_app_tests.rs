@@ -81,8 +81,8 @@ fn an_output_profile_converts_the_pixels_and_tags_the_image_with_it() {
     }
     // Alpha untouched.
     assert_eq!(
-        out.samples().get(3).map(|a| a.to_f32()),
-        Some(204.0 / 255.0)
+        out.samples().get(3).map(|a| a.to_bits()),
+        Some(f16::from_f32(204.0 / 255.0).to_bits())
     );
 }
 
