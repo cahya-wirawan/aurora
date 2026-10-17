@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.267.0] - 2026-10-17
+
+### Changed
+
+- 60 FPS round 2: a live Move invalidates narrowly, docs and version
+
 ## [0.266.1] - 2026-10-17
 
 ### Fixed
