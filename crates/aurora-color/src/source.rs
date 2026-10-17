@@ -31,12 +31,13 @@ use crate::transform::{RenderingIntent, Transform};
 pub const MAX_PROFILE_BYTES: usize = 8 * 1024 * 1024;
 
 /// How far (in encoded sRGB, `0..=1`) a profile may drift from the built-in
-/// sRGB over a lattice of colours and still count as sRGB: half an 8-bit
-/// step. A profile inside it changes no 8-bit pixel by more than rounding,
-/// so converting through it would only add noise (almost every JPEG carries
-/// "sRGB IEC61966-2.1", whose tables differ from `lcms2`'s built-in by
-/// roughly a thousandth). A choice, not a standard.
-pub const SRGB_EQUIVALENCE_TOLERANCE: f32 = 0.5 / 255.0;
+/// sRGB over a lattice of colours and still count as sRGB: two 8-bit steps.
+/// Real sRGB profiles differ from `lcms2`'s analytic curve by a fraction of
+/// a step to about one and a half (the corpus's colord sRGB measures 1.4
+/// steps, in the darks), and converting through one would only add noise;
+/// a gamma-2.2 stand-in is over 5 steps off and is converted. A choice, not
+/// a standard.
+pub const SRGB_EQUIVALENCE_TOLERANCE: f32 = 2.0 / 255.0;
 
 /// The longest description kept, in characters.
 const MAX_DESCRIPTION_CHARS: usize = 96;
@@ -310,9 +311,8 @@ fn within_srgb_tolerance(to_working: &Transform) -> bool {
     if to_working.transform(&src, &mut dst).is_err() {
         return false;
     }
-    src.iter()
-        .zip(&dst)
-        .all(|(a, b)| (a - b).abs() <= SRGB_EQUIVALENCE_TOLERANCE)
+    let worst = src.iter().zip(&dst).map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max);
+    worst <= SRGB_EQUIVALENCE_TOLERANCE
 }
 
 impl Transform {
@@ -348,5 +348,193 @@ impl Transform {
             RenderingIntent::RelativeColorimetric,
             true,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SRGB_ICC: &[u8] = include_bytes!("../../../corpora/icc/sRGB.icc");
+    const ECI_RGBV2_ICC: &[u8] = include_bytes!("../../../corpora/icc/ECI-RGBv2.icc");
+
+    const D65: [f64; 2] = [0.3127, 0.3290];
+    pub(crate) const ADOBE_PRIMARIES: [[f64; 2]; 3] = [[0.64, 0.33], [0.21, 0.71], [0.15, 0.06]];
+    pub(crate) const ADOBE_GAMMA: f64 = 2.199_218_75;
+
+    pub(crate) fn adobe_like_bytes() -> Vec<u8> {
+        let Ok(p) = IccProfile::synthetic_rgb(D65, ADOBE_PRIMARIES, ADOBE_GAMMA) else {
+            unreachable!("synthetic profile")
+        };
+        let Ok(b) = p.to_bytes() else { unreachable!("serialises") };
+        b
+    }
+
+    #[test]
+    fn the_corpus_srgb_profile_counts_as_srgb_and_a_wide_gamut_one_does_not() {
+        let Ok(srgb) = inspect_rgb_source(SRGB_ICC) else {
+            unreachable!("sRGB.icc is a valid RGB profile")
+        };
+        assert!(srgb.equivalent_to_srgb, "the colord sRGB profile is sRGB");
+        let Ok(eci) = inspect_rgb_source(ECI_RGBV2_ICC) else {
+            unreachable!("ECI-RGBv2 is a valid RGB profile")
+        };
+        assert!(!eci.equivalent_to_srgb);
+        assert!(eci.description.to_lowercase().contains("eci"), "{}", eci.description);
+        let Ok(adobe) = inspect_rgb_source(&adobe_like_bytes()) else {
+            unreachable!("synthetic profile is valid")
+        };
+        assert!(!adobe.equivalent_to_srgb);
+        // A gamma-2.2 sRGB-primaries profile is close to sRGB but over the
+        // half-step tolerance in the darks.
+        let Ok(g22) = IccProfile::synthetic_rgb(D65, [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]], 2.2)
+            .and_then(|p| p.to_bytes())
+        else {
+            unreachable!()
+        };
+        let Ok(g22) = inspect_rgb_source(&g22) else { unreachable!() };
+        assert!(!g22.equivalent_to_srgb);
+    }
+
+    #[test]
+    fn the_built_in_srgb_is_srgb() {
+        let Ok(bytes) = IccProfile::srgb().to_bytes() else { unreachable!() };
+        let Ok(s) = inspect_rgb_source(&bytes) else { unreachable!() };
+        assert!(s.equivalent_to_srgb);
+    }
+
+    #[test]
+    fn non_rgb_wrong_class_garbage_and_oversized_profiles_are_refused_with_a_reason() {
+        // A gray profile.
+        let Ok(gray) = lcms2::ToneCurve::new_parametric(1, &[2.2])
+            .map_err(|_| ())
+            .and_then(|c| {
+                lcms2::Profile::new_gray(&lcms2::CIExyY { x: 0.3127, y: 0.329, Y: 1.0 }, &c)
+                    .map_err(|_| ())
+            })
+            .and_then(|p| p.icc().map_err(|_| ()))
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            inspect_rgb_source(&gray).err(),
+            Some(ProfileProblem::WrongSpace(ProfileSpace::Gray))
+        );
+        // Garbage, a truncated header, a size past the data.
+        assert!(matches!(
+            inspect_rgb_source(b"not an icc profile"),
+            Err(ProfileProblem::NotIcc(_))
+        ));
+        let good = adobe_like_bytes();
+        assert!(matches!(
+            inspect_rgb_source(good.get(..200).unwrap_or_default()),
+            Err(ProfileProblem::NotIcc(_))
+        ));
+        // Wrong class: an abstract profile ('abst') with the RGB space.
+        let mut abst = good.clone();
+        if let Some(c) = abst.get_mut(12..16) {
+            c.copy_from_slice(b"abst");
+        }
+        assert_eq!(
+            inspect_rgb_source(&abst).err(),
+            Some(ProfileProblem::WrongClass(*b"abst"))
+        );
+        // Too large is refused before anything parses it.
+        let big = vec![0_u8; MAX_PROFILE_BYTES + 1];
+        assert_eq!(
+            inspect_rgb_source(&big).err(),
+            Some(ProfileProblem::TooLarge(MAX_PROFILE_BYTES + 1))
+        );
+        // Every reason reads as a sentence fragment.
+        assert!(ProfileProblem::TooLarge(9).describe().contains("larger"));
+        assert!(ProfileProblem::WrongSpace(ProfileSpace::Cmyk).describe().contains("CMYK"));
+    }
+
+    #[test]
+    fn a_hostile_description_tag_never_panics() {
+        // Flip every byte of the tag table region of a real profile.
+        let good = adobe_like_bytes();
+        for at in 128..good.len().min(400) {
+            let mut bad = good.clone();
+            if let Some(b) = bad.get_mut(at) {
+                *b = 0xFF;
+            }
+            let _ = profile_description(&bad);
+            let _ = inspect_rgb_source(&bad);
+        }
+        assert_eq!(profile_description(&[0; 10]), None);
+    }
+
+    #[test]
+    fn adobe_like_to_srgb_matches_an_independent_matrix_computation() {
+        // Both spaces are D65 matrix/TRC spaces, so relative colorimetric
+        // is exactly: decode the gamma, RGB -> XYZ with the primaries'
+        // matrix, XYZ -> sRGB linear, sRGB encode. Computed here in f64,
+        // not through lcms2.
+        fn matrix(p: [[f64; 2]; 3], w: [f64; 2]) -> [[f64; 3]; 3] {
+            let xyz = |c: [f64; 2]| [c[0] / c[1], 1.0, (1.0 - c[0] - c[1]) / c[1]];
+            let (r, g, b, wp) = (xyz(p[0]), xyz(p[1]), xyz(p[2]), xyz(w));
+            let m = [[r[0], g[0], b[0]], [r[1], g[1], b[1]], [r[2], g[2], b[2]]];
+            let inv = invert(m);
+            let s: Vec<f64> = (0..3)
+                .map(|i| inv[i][0] * wp[0] + inv[i][1] * wp[1] + inv[i][2] * wp[2])
+                .collect();
+            [
+                [m[0][0] * s[0], m[0][1] * s[1], m[0][2] * s[2]],
+                [m[1][0] * s[0], m[1][1] * s[1], m[1][2] * s[2]],
+                [m[2][0] * s[0], m[2][1] * s[1], m[2][2] * s[2]],
+            ]
+        }
+        fn invert(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+            let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+            let c = |a: usize, b: usize, c: usize, d: usize| m[a][b] * m[c][d];
+            [
+                [
+                    (c(1, 1, 2, 2) - c(1, 2, 2, 1)) / det,
+                    (c(0, 2, 2, 1) - c(0, 1, 2, 2)) / det,
+                    (c(0, 1, 1, 2) - c(0, 2, 1, 1)) / det,
+                ],
+                [
+                    (c(1, 2, 2, 0) - c(1, 0, 2, 2)) / det,
+                    (c(0, 0, 2, 2) - c(0, 2, 2, 0)) / det,
+                    (c(0, 2, 1, 0) - c(0, 0, 1, 2)) / det,
+                ],
+                [
+                    (c(1, 0, 2, 1) - c(1, 1, 2, 0)) / det,
+                    (c(0, 1, 2, 0) - c(0, 0, 2, 1)) / det,
+                    (c(0, 0, 1, 1) - c(0, 1, 1, 0)) / det,
+                ],
+            ]
+        }
+        let adobe = matrix(ADOBE_PRIMARIES, D65);
+        let srgb_inv = invert(matrix([[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]], D65));
+        let encode = |v: f64| {
+            if v <= 0.003_130_8 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+        };
+        let Ok(src) = IccProfile::synthetic_rgb(D65, ADOBE_PRIMARIES, ADOBE_GAMMA) else { unreachable!() };
+        let Ok(t) = Transform::to_working(&src) else { unreachable!() };
+        for input in [[1.0_f32, 0.0, 0.0], [0.2, 0.6, 0.4], [0.9, 0.9, 0.1], [0.5, 0.5, 0.5], [0.0, 1.0, 0.0]] {
+            let lin: Vec<f64> = input.iter().map(|&v| f64::from(v).powf(ADOBE_GAMMA)).collect();
+            let xyz: Vec<f64> = (0..3).map(|i| adobe[i][0] * lin[0] + adobe[i][1] * lin[1] + adobe[i][2] * lin[2]).collect();
+            let want: Vec<f64> = (0..3)
+                .map(|i| {
+                    let v = srgb_inv[i][0] * xyz[0] + srgb_inv[i][1] * xyz[1] + srgb_inv[i][2] * xyz[2];
+                    // Extended range: odd extension of the encode.
+                    // lcms2 extends the sRGB curve below zero linearly.
+                    if v < 0.0 { 12.92 * v } else { encode(v) }
+                })
+                .collect();
+            let mut got = [0.0_f32; 3];
+            assert!(t.transform(&input, &mut got).is_ok());
+            for (g, w) in got.iter().zip(&want) {
+                assert!((f64::from(*g) - w).abs() < 2e-3, "{input:?}: got {got:?}, want {want:?}");
+            }
+        }
+        // Adobe green is outside sRGB: red goes negative, kept.
+        let mut got = [0.0_f32; 3];
+        assert!(t.transform(&[0.0, 1.0, 0.0], &mut got).is_ok());
+        assert!(got[0] < -0.05, "extended range must survive: {got:?}");
     }
 }
