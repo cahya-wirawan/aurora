@@ -675,7 +675,7 @@ fn pattern_origin_is_written_as_the_layers_fxrp_in_document_coordinates() {
         .push(pattern_overlay("pat-a", (3.5, 1.5)));
     let mut doc = Doc::new((16, 12));
     let img = image(10, 8, |_, _| [1.0, 0.0, 0.0, 1.0]);
-    let id = doc.layer("Styled", rect(0, 0, 16, 12), Some((&img, 0, 0)));
+    let id = doc.layer("Styled", rect(5, 4, 10, 8), Some((&img, 0, 0)));
     ok(doc.tree.add_pattern(pattern("pat-a")));
     ok(doc.tree.set_effects(id, Some(fx)));
     let (bytes, _) = ok(doc.write());
@@ -689,8 +689,8 @@ fn pattern_origin_is_written_as_the_layers_fxrp_in_document_coordinates() {
             .and_then(|b| <[u8; 8]>::try_from(b).ok())
             .map_or(f64::NAN, f64::from_be_bytes)
     };
-    // The layer's bounds start at the document origin: the origin is as set.
-    assert_eq!((f(at + 12), f(at + 20)), (3.5, 1.5));
+    // The origin is relative to the layer's bounds; the file's is absolute.
+    assert_eq!((f(at + 12), f(at + 20)), (8.5, 5.5));
     let (back, rid) = read_ids(&bytes);
     let o = back
         .layers
@@ -703,7 +703,7 @@ fn pattern_origin_is_written_as_the_layers_fxrp_in_document_coordinates() {
         width: 0,
         height: 0,
     });
-    assert_eq!((o.0 + b.x as f64, o.1 + b.y as f64), (3.5, 1.5));
+    assert_eq!((o.0 + b.x as f64, o.1 + b.y as f64), (8.5, 5.5));
 }
 
 #[test]

@@ -713,12 +713,22 @@ def check_effects(folder):
         for n in layers:
             want = [e for e in a[n] if e[0] == "master" or e[1]]
             got = [e for e in (b.get(n) or []) if e[0] == "master" or e[1]]
+            # A gradient or pattern stroke Aurora could not draw is itemised in
+            # the save report and not written: those may be fewer, never more.
+            def split(effects):
+                solid = [e for e in effects if not (e[0] == "stroke" and e[11] != b"SClr")]
+                other = [e for e in effects if e[0] == "stroke" and e[11] != b"SClr"]
+                return solid, other
+            want, want_paint = split(want)
+            got, got_paint = split(got)
+            if len(got_paint) > len(want_paint):
+                fail(f"{name}/{n}: more painted strokes than the original")
             kinds_w = sorted(e[0] for e in want)
             kinds_g = sorted(e[0] for e in got)
             # Kinds Aurora does not model (inner shadow, bevel, ...) are not in
             # EFFECT_KINDS, so the comparison is over the written kinds.
             check(f"{name}/{n} effect kinds", kinds_g, kinds_w)
-            if want != got:
+            if [e for e in want if e[0] != "master"] != [e for e in got if e[0] != "master"]:
                 print(f"  note: {name}/{n}: values differ from the original (rounded or detached): "
                       f"{[e for e in want if e not in got][:2]} -> {[e for e in got if e not in want][:2]}")
         angle_o = original.image_resources.get_data(Resource.GLOBAL_ANGLE) if hasattr(Resource, "GLOBAL_ANGLE") else None
