@@ -73,6 +73,7 @@ fn laid_out_workspace(
 /// Measures the widget layer of one redraw: tessellation (`target_paint_ops`)
 /// and the whole `collect_widget_paints` (tessellation + text resolve + one
 /// GPU buffer pair per mesh), `frames` times on an unchanged tree.
+#[allow(clippy::too_many_lines)]
 fn measure_widget_paints(label: &str, extra_layers: usize, frames: usize) -> f64 {
     let Some(context) = real_gpu_context() else {
         return 0.0;
