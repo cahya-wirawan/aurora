@@ -277,6 +277,64 @@ fn cached_widget_paints_equal_fresh_ones_through_ui_changes() {
     s.format = wgpu::TextureFormat::Bgra8UnormSrgb;
     let _ = s.frame("srgb target");
 
+    // A clip change alone: a clipping ancestor shrinks while its
+    // children keep their bounds (no relayout), so only their paint clip
+    // differs.
+    let clipping: Vec<WidgetId> = s
+        .workspace
+        .tree
+        .paint_order()
+        .into_iter()
+        .filter(|&id| {
+            s.workspace.tree.style(id).is_some_and(|st| {
+                st.overflow.y != taffy::Overflow::Visible
+                    && s.workspace.tree.children(id).is_some_and(|c| !c.is_empty())
+            })
+        })
+        .collect();
+    let mut clipped = 0;
+    for &c in clipping.iter().take(6) {
+        let Some(b) = s.workspace.tree.bounds(c) else {
+            continue;
+        };
+        if b.height < 4 {
+            continue;
+        }
+        ok(s.tree().set_bounds(
+            c,
+            aurora_core::Rect {
+                height: b.height / 2,
+                ..b
+            },
+        ));
+        clipped += 1;
+        let _ = s.frame("clip shrunk");
+        ok(s.tree().set_bounds(c, b));
+        let _ = s.frame("clip restored");
+    }
+    assert!(clipped >= 1, "a clip change was exercised");
+
+    // The measured flag alone: a text-blind layout clears it; every
+    // checkbox's bounds are then put back, so only the flag differs.
+    let boxes = s.ids(|k| matches!(k, WidgetKind::Checkbox(_)));
+    let saved: Vec<_> = boxes
+        .iter()
+        .filter_map(|&b| s.workspace.tree.bounds(b).map(|r| (b, r)))
+        .collect();
+    s.tree().compute_layout(1600.0, 1000.0);
+    for &(b, r) in &saved {
+        ok(s.tree().set_bounds(b, r));
+    }
+    assert!(
+        saved
+            .iter()
+            .any(|&(b, _)| s.workspace.tree.is_measured(b) == Some(false)),
+        "setup: a checkbox lost its measured flag"
+    );
+    let _ = s.frame("measured flag cleared");
+    s.relayout(1600.0, 1000.0);
+    let _ = s.frame("measured again");
+
     let last = s.frame("settled");
     assert_eq!(last.misses, 0, "settled again: {last:?}");
     println!(
