@@ -752,3 +752,21 @@ fn nothing_to_write_gives_no_block() {
     assert!(encoded.is_none());
     assert_eq!(lost, write_effects::EffectLosses::default());
 }
+
+#[test]
+fn a_pattern_of_whole_8_bit_values_is_written_with_8_bit_planes() {
+    let eight = pattern("same");
+    // The same size, name and ID, with samples that are not whole 8-bit values.
+    let texels: Vec<u16> = eight.texels().iter().map(|v| v + 1).collect();
+    let deep = ok(Pattern::new(
+        "same".to_owned(),
+        "Stripes".to_owned(),
+        3,
+        2,
+        texels,
+    ));
+    let short = write_effects::pattern_block(&[&eight]).unwrap_or_default();
+    let long = write_effects::pattern_block(&[&deep]).unwrap_or_default();
+    assert!(!short.is_empty() && short.len() < long.len());
+    assert_eq!(long.len() - short.len(), 24);
+}

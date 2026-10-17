@@ -22,6 +22,17 @@
 //! read back ([`PsdSaveRefusal::AdjustmentNotRepresentable`]). Checked with
 //! Aurora's own reader and psd-tools; never opened in Photoshop.
 //!
+//! # Layer effects (task 120)
+//!
+//! A pixel layer's or group's `aurora_core::LayerEffects` are written as an
+//! `lfx2` tagged block (drop shadows, colour overlays, strokes, outer
+//! glows, gradient and pattern overlays), the layer's `fxrp` reference
+//! point for pattern effects, the document's global light angle as image
+//! resource 1037 and the patterns the effects name as a global `Patt`
+//! block before the linked lists. See `write_effects` for what is rounded
+//! or left out (always itemised). Checked with Aurora's own reader and
+//! psd-tools; never opened in Photoshop, and the report says so.
+//!
 //! # Groups (0.178.0)
 //!
 //! A group is two records bracketing its children, the way Photoshop
