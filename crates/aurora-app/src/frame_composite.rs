@@ -13,8 +13,9 @@
 //! bit-identical to the sequential loop; only the store's LRU order and
 //! which pages are resident can differ, which no pixel sees.
 //!
-//! **Bounded.** Tiles go in batches of twice the pool's thread count, so at
-//! most that many composite results (512 KiB each) wait for installation.
+//! **Bounded.** Tiles go in batches of four per thread (at least
+//! `MIN_BATCH_TILES`, 16), so at most that many composite results
+//! (512 KiB each, 8 MiB for 16) wait for installation.
 //! The pool's threads share one drop-shadow coverage cache of
 //! [`crate::small_machine::shadow_cache_bytes`], like the background
 //! compositor's pool; the UI thread keeps its own for single-tile work, so
@@ -39,6 +40,13 @@ use crate::background_composite::SharedMirror;
 /// two-root fixture (see PLAN.md, 60 FPS round 7), and a four-core machine
 /// then still gets one thread per core while the UI thread waits.
 pub(crate) const FRAME_COMPOSITE_MAX_THREADS: usize = 4;
+
+/// The fewest tiles a parallel batch holds (60 FPS round 7): a batch is
+/// four tiles per thread or this many, whichever is more, so a typical
+/// view (nine to sixteen tiles) is one batch and no thread idles while a
+/// short last batch runs. At most this many composites (512 KiB each)
+/// wait for installation on a machine with four threads or fewer.
+const MIN_BATCH_TILES: usize = 16;
 
 /// How many threads the frame pool has: the machine's parallelism, capped
 /// at [`FRAME_COMPOSITE_MAX_THREADS`]; `1` (no pool) when it cannot be read.
@@ -133,7 +141,10 @@ pub(crate) fn composite_tiles(
     pool.install(|| {
         let _ = crate::with_shadow_cache(crate::ShadowCache::begin_pass);
     });
-    let batch_len = pool.current_num_threads().max(1).saturating_mul(2);
+    let batch_len = pool
+        .current_num_threads()
+        .saturating_mul(4)
+        .max(MIN_BATCH_TILES);
     for batch in tiles.chunks(batch_len) {
         let serial = store.serial();
         let shared = Mutex::new(&mut *store);
