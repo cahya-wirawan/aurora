@@ -4,6 +4,13 @@
 //! for bit, on random trees (masks, clipping, adjustments above, Pass
 //! Through groups, shadows, strokes, glows, overlays) and on the corpus.
 
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+
 use std::collections::HashMap;
 
 use crate::move_invalidation::{MoveInvalidation, invalidate_moved_layer, move_layer_live};
@@ -717,7 +724,7 @@ fn move_drag_recomposite_cost_is_measured() {
                 "move drag ({}): run {run} n={FRAMES} mean={mean:.2}ms max={max:.2}ms \
                  recomposited={:.1} tiles/event of {}",
                 if narrow { "narrow" } else { "bump" },
-                recomposited as f64 / FRAMES as f64,
+                f64::from(recomposited) / FRAMES as f64,
                 view.len()
             );
             assert!(mean < 5000.0, "CI-safety bound only: {mean:.2}ms");
