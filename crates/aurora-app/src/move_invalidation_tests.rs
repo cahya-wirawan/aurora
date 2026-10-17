@@ -221,7 +221,7 @@ fn run_moves(
 fn random_trees_narrow_move_equals_full_recomposite() {
     let mut rng = Rng(0x5EED_0125_0002_0001);
     let (mut narrow, mut bumped, mut kept, mut invalidated) = (0, 0, 0, 0);
-    let mut clipped = 0;
+    let (mut clipped, mut masked) = (0, 0);
     let trees = 48;
     for tree in 0..trees {
         let (_d, mut store) = store_with_budget(1024);
@@ -237,6 +237,20 @@ fn random_trees_narrow_move_equals_full_recomposite() {
             }
             if rng.chance(25) && layers.set_clipped(id, true).is_ok() {
                 clipped += 1;
+            }
+            // Masks of every flavour on the moved layer's neighbours and
+            // itself: inverted, disabled, reduced density.
+            if rng.chance(20) && layers.add_mask(id, rect(100, 80, 400, 300)).is_ok() {
+                masked += 1;
+                if rng.chance(50) {
+                    ok(layers.set_mask_inverted(id, true));
+                }
+                if rng.chance(30) {
+                    ok(layers.set_mask_enabled(id, false));
+                }
+                if rng.chance(30) {
+                    ok(layers.set_mask_density(id, 0.5));
+                }
             }
         }
         let Some(&moved) = pixels.get(rng.below(pixels.len() as u64) as usize) else {
@@ -257,7 +271,8 @@ fn random_trees_narrow_move_equals_full_recomposite() {
     }
     println!(
         "narrow move differential: {trees} trees, {narrow} narrow steps ({invalidated} tiles \
-         invalidated), {bumped} anchor bumps, {kept} kept tiles checked, {clipped} clipped layers"
+         invalidated), {bumped} anchor bumps, {kept} kept tiles checked, {clipped} clipped layers, \
+         {masked} extra masks"
     );
     assert!(narrow > 100, "the narrow path ran: {narrow}");
     assert!(bumped > 10, "the anchor bump ran: {bumped}");
@@ -267,6 +282,7 @@ fn random_trees_narrow_move_equals_full_recomposite() {
         "narrowing invalidated tiles: {invalidated}"
     );
     assert!(clipped > 5, "clip groups exercised: {clipped}");
+    assert!(masked > 5, "masks exercised: {masked}");
 }
 
 /// A clip base moved under a clipped layer with a shadow, a stroke and a
