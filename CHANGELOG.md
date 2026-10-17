@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.270.1] - 2026-10-17
+
+### Fixed
+
+- Cargo deny: ignore the zbus-family unmaintained advisories reached via accesskit_unix
+
 ## [0.270.0] - 2026-10-17
 
 ### Changed
