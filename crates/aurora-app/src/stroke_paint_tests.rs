@@ -479,7 +479,16 @@ fn a_gradient_strokes_box_follows_the_layers_bounds() {
                 StrokePosition::Outside,
                 3.0,
                 StrokeFill::Gradient,
-                Some(gradient_paint(g.clone())),
+                Some(StrokePaint::Gradient {
+                    gradient: g.clone(),
+                    // Twice the square's width, so the ring is mid-ramp.
+                    reference: Some(ReferenceBox {
+                        dx: 100,
+                        dy: 100,
+                        width: 80,
+                        height: 40,
+                    }),
+                }),
             )],
             ..aurora_core::LayerEffects::default()
         };
@@ -491,9 +500,11 @@ fn a_gradient_strokes_box_follows_the_layers_bounds() {
         rows.push(row);
     }
     assert_eq!(rows.first(), rows.get(1));
-    // The ring right of the square really carries the ramp's blue end.
-    let Some(Some(first)) = rows.first().map(|r| r.get(3).copied()) else {
-        unreachable!("five texels");
-    };
-    assert!(f32::from_bits(first[2]) > f32::from_bits(first[0]));
+    // Mid-ramp, and changing from pixel to pixel along the ring.
+    let ring: Vec<[u32; 4]> = rows
+        .first()
+        .map(|r| r.iter().skip(2).copied().collect())
+        .unwrap_or_default();
+    assert_eq!(ring.len(), 3);
+    assert!(ring.windows(2).all(|w| w.first() != w.get(1)), "{ring:?}");
 }
