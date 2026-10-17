@@ -1282,8 +1282,9 @@ fn stroke_notes_on_open_and_psd_save() {
         Ok(report) => report.items.join("\n"),
         Err(err) => unreachable!("{err:?}"),
     };
+    // Aurora could not draw it, so it is not written, and the report says so.
     assert!(
-        items.contains("1 layer's effects are saved in the file"),
+        items.contains("1 gradient or pattern stroke that Aurora couldn't draw isn't saved"),
         "{items}"
     );
 }
