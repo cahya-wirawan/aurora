@@ -578,7 +578,6 @@ mod lasso_tools;
 mod layer_thumbnails;
 mod menu_bar_app;
 mod menu_bar_state;
-mod tooltip_app;
 mod menu_model;
 mod path_paint;
 mod paths_app;
@@ -611,6 +610,7 @@ mod spot_heal_stamp_tests;
 mod tone_stamp;
 #[cfg(test)]
 mod tone_stamp_tests;
+mod tooltip_app;
 mod workspace_presets;
 use background_open::{
     BackgroundFailure, DecodedFile, FinishedOpen, OpenInstaller, OpenStep, OpenWorker,

@@ -387,7 +387,13 @@ mod tests {
     #[test]
     fn a_window_too_small_for_any_side_picks_the_roomiest_and_clamps() {
         // 100 x 40 window, 120 x 24 box: it cannot fit sideways at all.
-        let p = place_tooltip(rect(10, 4, 20, 10), SIZE, (100.0, 40.0), GAP, TooltipSide::Right);
+        let p = place_tooltip(
+            rect(10, 4, 20, 10),
+            SIZE,
+            (100.0, 40.0),
+            GAP,
+            TooltipSide::Right,
+        );
         // Below has 40 - 14 - 4 = 22 < 24, Above has 0, Right 100-30-4=66,
         // Left 6: the roomiest is Right, clamped to the window.
         assert_eq!(p.side, TooltipSide::Right);

@@ -101,3 +101,37 @@ impl App {
         self.tooltip_hover.next_deadline()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! `App` needs a window, so the glue is pinned by single-line source
+    //! checks of where it is called from (the rules are tested in
+    //! `aurora_ui::tooltip_hover`).
+
+    const SOURCE: &str = include_str!("lib.rs");
+
+    fn count(needle: &str) -> usize {
+        SOURCE.lines().filter(|line| line.trim() == needle).count()
+    }
+
+    #[test]
+    fn a_press_a_key_and_the_wheel_dismiss_the_tooltip() {
+        assert_eq!(count("self.dismiss_tooltip();"), 3);
+    }
+
+    #[test]
+    fn the_pointer_moving_and_leaving_report_to_the_tooltips() {
+        assert_eq!(count("self.update_tooltip_hover(Some(position));"), 1);
+        assert_eq!(count("self.update_tooltip_hover(None);"), 1);
+    }
+
+    #[test]
+    fn losing_window_focus_clears_it_and_the_loop_steps_it_once() {
+        assert_eq!(count("self.clear_tooltip();"), 1);
+        assert_eq!(count("let tooltip_deadline = self.tooltip_step(now);"), 1);
+        assert_eq!(
+            count("let deadline = earliest_deadline(deadline, tooltip_deadline);"),
+            1
+        );
+    }
+}

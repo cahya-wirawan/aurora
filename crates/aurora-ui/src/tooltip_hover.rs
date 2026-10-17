@@ -91,10 +91,7 @@ impl HoverBlockers {
 /// Where the tooltips should see the pointer: `None` (as if it had left)
 /// while any blocker owns it.
 #[must_use]
-pub fn hover_point(
-    position: Option<(f32, f32)>,
-    blockers: HoverBlockers,
-) -> Option<(f32, f32)> {
+pub fn hover_point(position: Option<(f32, f32)>, blockers: HoverBlockers) -> Option<(f32, f32)> {
     if blockers.any() { None } else { position }
 }
 
@@ -203,7 +200,13 @@ impl TooltipHover {
         let mut changed = false;
         if self.owner() != Some(owner) {
             changed |= self.drop_current(workspace);
-            match Tooltip::new(&workspace.tree, owner, scales, text.clone(), TOOLTIP_SHOW_DELAY) {
+            match Tooltip::new(
+                &workspace.tree,
+                owner,
+                scales,
+                text.clone(),
+                TOOLTIP_SHOW_DELAY,
+            ) {
                 Ok(tooltip) => self.current = Some(tooltip.with_assistive_hidden(true)),
                 Err(err) => {
                     // Not an allowed owner kind: no tooltip for it.
@@ -376,12 +379,10 @@ mod tests {
         fn settle(&mut self, window: (f32, f32)) {
             for _ in 0..4 {
                 self.layout(window);
-                let moved = ok(self.hover.place(
-                    &mut self.ws,
-                    Some(&mut self.engine),
-                    &self.scales,
-                    1.0,
-                ));
+                let moved =
+                    ok(self
+                        .hover
+                        .place(&mut self.ws, Some(&mut self.engine), &self.scales, 1.0));
                 if !moved {
                     return;
                 }
@@ -437,7 +438,9 @@ mod tests {
         assert_eq!(rig.hover.owner(), Some(brush));
         assert_eq!(rig.hover.shown_node(), None);
         assert_eq!(rig.hover.next_deadline(), Some(t0 + TOOLTIP_SHOW_DELAY));
-        assert!(!ok(rig.hover.tick(&mut rig.ws, t0 + Duration::from_millis(499))));
+        assert!(!ok(rig
+            .hover
+            .tick(&mut rig.ws, t0 + Duration::from_millis(499))));
         assert_eq!(rig.hover.shown_node(), None);
         assert!(ok(rig.hover.tick(&mut rig.ws, t0 + TOOLTIP_SHOW_DELAY)));
         assert!(rig.hover.shown_node().is_some());
@@ -463,10 +466,17 @@ mod tests {
         assert!(!ok(rig.hover.pointer(&mut rig.ws, &rig.scales, None, t0)));
         assert_eq!(rig.hover.owner(), None);
         assert_eq!(rig.hover.next_deadline(), None);
-        assert!(!ok(rig.hover.tick(&mut rig.ws, t0 + Duration::from_secs(9))));
+        assert!(!ok(rig
+            .hover
+            .tick(&mut rig.ws, t0 + Duration::from_secs(9))));
         // A point over a widget with no tooltip arms nothing either.
         let at = rig.centre(rig.ws.canvas_area);
-        assert!(!ok(rig.hover.pointer(&mut rig.ws, &rig.scales, Some(at), t0)));
+        assert!(!ok(rig.hover.pointer(
+            &mut rig.ws,
+            &rig.scales,
+            Some(at),
+            t0
+        )));
         assert_eq!(rig.hover.owner(), None);
         assert_eq!(rig.hover.next_deadline(), None);
     }
@@ -479,24 +489,19 @@ mod tests {
         rig.point_at(brush, t0);
         ok(rig.hover.tick(&mut rig.ws, t0 + TOOLTIP_SHOW_DELAY));
         assert_eq!(rig.popover_count(), 1);
-        let changed = ok(rig.hover.pointer(
-            &mut rig.ws,
-            &rig.scales,
-            None,
-            t0 + Duration::from_secs(1),
-        ));
+        let changed =
+            ok(rig
+                .hover
+                .pointer(&mut rig.ws, &rig.scales, None, t0 + Duration::from_secs(1)));
         assert!(changed, "a node went away");
         assert_eq!(rig.popover_count(), 0);
         assert_eq!(rig.hover.owner(), None);
         // And a pending one is cancelled by leaving too.
         rig.point_at(brush, t0 + Duration::from_secs(2));
         assert!(rig.hover.next_deadline().is_some());
-        ok(rig.hover.pointer(
-            &mut rig.ws,
-            &rig.scales,
-            None,
-            t0 + Duration::from_secs(2),
-        ));
+        ok(rig
+            .hover
+            .pointer(&mut rig.ws, &rig.scales, None, t0 + Duration::from_secs(2)));
         assert_eq!(rig.hover.next_deadline(), None);
     }
 
@@ -533,7 +538,9 @@ mod tests {
         let t1 = t0 + Duration::from_secs(2);
         rig.point_at(brush, t1);
         assert_eq!(rig.hover.next_deadline(), None);
-        assert!(!ok(rig.hover.tick(&mut rig.ws, t1 + Duration::from_secs(9))));
+        assert!(!ok(rig
+            .hover
+            .tick(&mut rig.ws, t1 + Duration::from_secs(9))));
         assert_eq!(rig.hover.shown_node(), None);
         // Leave and come back: armed afresh.
         ok(rig.hover.pointer(&mut rig.ws, &rig.scales, None, t1));
@@ -550,7 +557,9 @@ mod tests {
         rig.point_at(brush, t0);
         assert!(!ok(rig.hover.dismiss(&mut rig.ws)), "nothing was shown");
         assert_eq!(rig.hover.next_deadline(), None);
-        assert!(!ok(rig.hover.tick(&mut rig.ws, t0 + Duration::from_secs(9))));
+        assert!(!ok(rig
+            .hover
+            .tick(&mut rig.ws, t0 + Duration::from_secs(9))));
         // With nothing at all, a dismissal is a no-op.
         let mut idle = TooltipHover::new();
         assert!(!ok(idle.dismiss(&mut rig.ws)));
@@ -634,9 +643,7 @@ mod tests {
         let t0 = Instant::now();
         for tool in Tool::ALL {
             let button = rig.tool_button(tool);
-            ok(rig
-                .hover
-                .pointer(&mut rig.ws, &rig.scales, None, t0));
+            ok(rig.hover.pointer(&mut rig.ws, &rig.scales, None, t0));
             rig.point_at(button, t0);
             assert_eq!(
                 rig.hover.text(),
@@ -695,7 +702,10 @@ mod tests {
         let marquee = rig.tool_button(Tool::EllipticalMarquee);
         let node = show(&mut rig, marquee, WINDOW);
         let (owner, tip) = (rect_of(&rig, marquee), rect_of(&rig, node));
-        assert!(tip.width > owner.width, "wider than the 32 px button: {tip:?}");
+        assert!(
+            tip.width > owner.width,
+            "wider than the 32 px button: {tip:?}"
+        );
         assert!(
             f64::from(tip.width) <= 5.0 * 64.0,
             "capped at five xxxl steps: {tip:?}"
@@ -754,7 +764,10 @@ mod tests {
         };
         let tip = rect_of(&rig, node);
         assert!(inside(tip, small), "{tip:?} in {small:?}");
-        assert_eq!(tip.width, wide.width, "the box does not depend on the window");
+        assert_eq!(
+            tip.width, wide.width,
+            "the box does not depend on the window"
+        );
         // Growing it back moves it back beside the button.
         rig.settle(WINDOW);
         let Some(node) = rig.hover.shown_node() else {
@@ -771,10 +784,14 @@ mod tests {
         rig.point_at(brush, t0);
         ok(rig.hover.tick(&mut rig.ws, t0 + TOOLTIP_SHOW_DELAY));
         rig.layout(WINDOW);
-        let first = ok(rig.hover.place(&mut rig.ws, Some(&mut rig.engine), &rig.scales, 1.0));
+        let first = ok(rig
+            .hover
+            .place(&mut rig.ws, Some(&mut rig.engine), &rig.scales, 1.0));
         assert!(first, "a fresh node needs its placement");
         rig.layout(WINDOW);
-        let second = ok(rig.hover.place(&mut rig.ws, Some(&mut rig.engine), &rig.scales, 1.0));
+        let second = ok(rig
+            .hover
+            .place(&mut rig.ws, Some(&mut rig.engine), &rig.scales, 1.0));
         assert!(!second, "and then nothing changes");
     }
 
