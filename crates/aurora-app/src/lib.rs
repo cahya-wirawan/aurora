@@ -98251,6 +98251,8 @@ mod fill_tests;
 #[cfg(test)]
 mod first_run_tests;
 #[cfg(test)]
+mod fold_fingerprint_tests;
+#[cfg(test)]
 mod frame_composite_tests;
 
 #[cfg(test)]
