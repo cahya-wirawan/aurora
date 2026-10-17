@@ -4,7 +4,7 @@
 //! RGB ICC profile other than sRGB is converted into it when it is opened
 //! ([`bring_into_working`]): relative colorimetric with black point
 //! compensation ([`aurora_color::Transform::to_working`]), in `f32` on the
-//! straight colour channels (alpha untouched, extended range kept), and the
+//! straight colour channels (alpha untouched, out-of-gamut colour clipped to 0..1), and the
 //! source profile is returned as [`SourceProfile`] so the document can keep
 //! it as metadata. A profile that is sRGB for practical purposes
 //! ([`aurora_color::SRGB_EQUIVALENCE_TOLERANCE`]) changes no pixel at all. A
@@ -96,7 +96,7 @@ pub enum Tagging<'a> {
 
 /// The open-report line for a successful conversion from `description`'s
 /// profile; `clips` says whether out-of-gamut colour was clipped (PSD
-/// layers are, a flat image keeps extended range). Kept in the document's
+/// layers and flat images alike are). Kept in the document's
 /// import losses, so it survives a `.aur` save and shows in a later Photoshop
 /// save's report.
 #[must_use]
@@ -165,6 +165,9 @@ pub fn bring_into_working(samples: &mut [f16], tagging: Tagging<'_>, gray: bool)
             .push(ignored("the conversion failed".to_owned()));
         return out;
     }
+    // Out-of-gamut results are clipped, as Photoshop clips a conversion
+    // to sRGB (design owner, 2026-10-17): flat images and PSD layers alike.
+    clamp_colour_unit(samples);
     out.report.info.push(format!(
         "Converted from \"{}\" to sRGB.",
         source.description

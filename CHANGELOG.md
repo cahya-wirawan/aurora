@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.266.0] - 2026-10-17
+
+### Changed
+
+- Clip flat images after a profile conversion; repair four corpus tests: docs and version
+
 ## [0.265.0] - 2026-10-17
 
 ### Changed

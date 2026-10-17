@@ -94,6 +94,7 @@ pub(crate) fn autosave_outgoing(cx: &mut SwitchContext<'_>) -> bool {
     // L-2 (0.175.0): nor while that write is still queued or in flight.
     if let Some((saved, generation)) = cx.doc.park_autosave
         && saved == revision
+        && !cx.doc.colour_unsaved
         && (park
             .worker
             .landed(id)

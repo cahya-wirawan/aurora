@@ -326,6 +326,9 @@ pub(crate) struct DocumentSession {
     /// output profile export converts to. Saved in the `.aur` `colour`
     /// entry and the autosave; not undoable, not dirtying (metadata).
     pub(crate) colour: aurora_io::DocumentColour,
+    /// The colour metadata (the output profile) changed since the last
+    /// save: an unsaved edit that has no undo step (2026-10-17).
+    pub(crate) colour_unsaved: bool,
     /// This document's Layers-panel filter (0.199.0): view state, not
     /// document state (no undo, not saved, never dirty). Copied from
     /// `Workspace::layer_view` when the session stops being active
@@ -572,12 +575,13 @@ impl DocumentSession {
     /// Live gestures not yet committed are not counted; every close and
     /// quit path commits them first.
     pub(crate) fn is_dirty(&self) -> bool {
-        self.saved_revision != Some(self.undo_order.content_revision)
+        self.colour_unsaved || self.saved_revision != Some(self.undo_order.content_revision)
     }
 
     /// Records that the document now matches a file (an open's install,
     /// a successful `.aur` save).
     pub(crate) fn mark_clean(&mut self) {
+        self.colour_unsaved = false;
         self.saved_revision = Some(self.undo_order.content_revision);
     }
 
@@ -601,6 +605,7 @@ impl DocumentSession {
             saved_revision: Some(undo_order.content_revision),
             import_losses: None,
             colour: aurora_io::DocumentColour::default(),
+            colour_unsaved: false,
             layer_filter: aurora_ui::LayerFilter::default(),
             clone_stamp: crate::clone_stamp::CloneStamp::default(),
             channel_view: aurora_ui::ChannelVisibility::default(),
@@ -810,6 +815,19 @@ mod tests {
         });
         name.clone_into(&mut session.name);
         session
+    }
+
+    /// 2026-10-17: a colour-metadata change (the output profile) is an
+    /// unsaved edit without an undo step; a save clears it.
+    #[test]
+    fn a_colour_metadata_change_makes_the_document_unsaved_until_it_is_saved() {
+        let mut session = named("colour");
+        session.mark_clean();
+        assert!(!session.is_dirty());
+        session.colour_unsaved = true;
+        assert!(session.is_dirty());
+        session.mark_clean();
+        assert!(!session.is_dirty());
     }
 
     fn names_in_order(shelf: &super::DocumentShelf, active: &DocumentSession) -> Vec<String> {

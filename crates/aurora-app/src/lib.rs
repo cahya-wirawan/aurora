@@ -32398,10 +32398,7 @@ impl App {
         // carried into a Photoshop save's report), not only a status line.
         let mut items: Vec<String> = Vec::new();
         if let Some(source) = &colour.source {
-            items.push(aurora_io::converted_on_open_line(
-                &source.description,
-                false,
-            ));
+            items.push(aurora_io::converted_on_open_line(&source.description, true));
         }
         items.extend(colour.report.warnings.clone());
         items.extend(unwritten_layers_item(unwritten));
@@ -43119,6 +43116,7 @@ mod tests {
     /// [`curves_corpus_diff`] for any PSD path: Aurora's composite against
     /// the file's own merged image.
     #[allow(
+        clippy::too_many_lines,
         clippy::many_single_char_names,
         clippy::cast_possible_wrap,
         clippy::cast_possible_truncation,
@@ -43127,12 +43125,23 @@ mod tests {
     )]
     fn psd_merged_diff(path: &std::path::Path, relative: &str) -> Option<CurvesDiff> {
         let Ok(bytes) = std::fs::read(path) else {
-            println!("SKIPPED: corpus file not present at {}", path.display());
+            crate::open_time_tests::corpus_file_absent(path);
             return None;
         };
-        let merged = match aurora_io::decode_psd_merged_image(&bytes) {
+        // In the working space (sRGB): since 0.264.0 the opened document is
+        // converted from the file's profile, so Photoshop's merged image is
+        // converted the same way before the two are compared. For a file
+        // with no profile or an sRGB one this is the raw merged image.
+        let merged = match aurora_io::decode_psd_merged_image_in_working_space(&bytes) {
             Ok(image) => image,
             Err(err) => unreachable!("{relative}: {err:?}"),
+        };
+        // `AURORA_AUDIT_STRIP_PROFILE=1`: open the file through the pre-0.264.0
+        // pipeline (profile removed) against the same converted merged image.
+        let bytes = if std::env::var_os("AURORA_AUDIT_STRIP_PROFILE").is_some() {
+            crate::open_time_tests::strip_colour_profile(&bytes).0
+        } else {
+            bytes
         };
         let (_scratch, mut store) = real_tile_store();
         let (document, image) = open_and_composite_psd(
@@ -91507,18 +91516,19 @@ mod tests {
             // 0.182.0: unchanged by drawing drop shadows.
             // 0.203.0: its master-only Hue/Saturation layer imported; before: 240 / 133.1256, 58.7064, 39.0855.
             ("fill_adjustments.psd", 230.0, [125.8756, 51.4564, 32.0369]),
+            // 0.265.1: THE BASIS CHANGED with 0.264.0's colour management. These four files carry an Adobe RGB (1998) profile; the opened document is now sRGB, so it is compared with Photoshop's merged image converted to sRGB the same way (`decode_psd_merged_image_in_working_space`). The four entries below are not comparable with the numbers in their comments. On this basis the old pipeline (profile stripped, `AURORA_AUDIT_STRIP_PROFILE=1`) measures: layer_comps.psd max 174 / mean 4.6221, 9.2321, 22.1661; layer_comps.psb max 145 / 4.5633, 9.2236, 22.3145; layer_params max 251 / 18.8520, 5.8728, 9.4513, so the conversion is far closer to Photoshop (layer_comps blue 22.2 -> 5.3, layer_params red 18.9 -> 6.0; green changes by under 0.01). Before the basis change (raw merged image): layer_comps.psd 136 / 3.6410, 9.4797, 15.4030; layer_comps.psb 124 / 3.5653, 9.4647, 15.5237; layer_params 244 / 4.8987, 4.8851, 4.2994.
             // 0.182.0, drop shadows drawn; before (0.181.0): max 162, mean 6.738, 12.118, 17.999.
             // 0.190.0: Strokes drawn; before: 162 / 4.4585, 9.8399, 15.7286.
             // Task 110: gradient overlays drawn (reference box = the record rectangle); mean over channels 9.63 -> 9.51: red 3.90 -> 3.64 and blue 15.63 -> 15.40 better, green 9.35 -> 9.48 worse (not explained).
-            ("layer_comps.psd", 136.0, [3.6410, 9.4797, 15.4030]),
+            ("layer_comps.psd", 162.0, [2.4443, 9.2351, 5.3467]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 182, mean 6.800, 12.246, 18.372.
             // 0.190.0: Strokes drawn; before: 182 / 4.2692, 9.7118, 15.7745.
             // Task 110: as layer_comps.psd (measured 3.5652 / 9.4646 / 15.5236).
-            ("layer_comps.psb", 124.0, [3.5653, 9.4647, 15.5237]),
+            ("layer_comps.psb", 127.0, [2.3718, 9.2261, 5.4342]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 245, mean 4.480, 7.851, 9.767.
-            ("layer_params.psd", 244.0, [4.8987, 4.8851, 4.2994]),
+            ("layer_params.psd", 252.0, [5.9676, 4.9552, 4.5911]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 245, mean 4.480, 7.851, 9.767.
-            ("layer_params.psb", 244.0, [4.8987, 4.8851, 4.2994]),
+            ("layer_params.psb", 252.0, [5.9676, 4.9552, 4.5911]),
             // 0.182.0: unchanged by drawing drop shadows.
             ("patterns.psd", 105.0, [12.4678, 13.5450, 13.8416]),
             // 0.182.0: unchanged by drawing drop shadows.
