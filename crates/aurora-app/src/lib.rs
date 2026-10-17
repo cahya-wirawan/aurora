@@ -66400,6 +66400,7 @@ mod tests {
         for step in 0..frames {
             let x = start.0 + step * pan_step_px.0;
             let y = start.1 + step * pan_step_px.1;
+            let stats_before = *store.stats();
             let t0 = std::time::Instant::now();
 
             #[allow(clippy::cast_precision_loss)]
@@ -66525,8 +66526,128 @@ mod tests {
                 sync_stats,
                 take_composite_write_outcomes(),
             );
+            stages
+                .store_deltas
+                .push(store_stat_deltas(&stats_before, store.stats()));
         }
         stages
+    }
+
+    /// `[tiles_created, evictions, faults, pending_hits, resident_hits]`
+    /// grown between two snapshots of one store's [`aurora_tile::Stats`]
+    /// (60 FPS round 5's per-frame cause attribution).
+    fn store_stat_deltas(before: &aurora_tile::Stats, after: &aurora_tile::Stats) -> [u64; 5] {
+        [
+            after.tiles_created.saturating_sub(before.tiles_created),
+            after.evictions.saturating_sub(before.evictions),
+            after.faults.saturating_sub(before.faults),
+            after.pending_hits.saturating_sub(before.pending_hits),
+            after.resident_hits.saturating_sub(before.resident_hits),
+        ]
+    }
+
+    /// The nominal per-frame budget of 60 FPS, in milliseconds.
+    const FRAME_BUDGET_MS: f64 = 16.7;
+
+    /// The value at fraction `p` of an already sorted slice (nearest rank).
+    fn sorted_percentile(sorted: &[f64], p: f64) -> f64 {
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation
+        )]
+        let index = ((sorted.len().saturating_sub(1)) as f64 * p).round() as usize;
+        sorted.get(index).copied().unwrap_or(0.0)
+    }
+
+    /// 60 FPS round 5: prints the per-frame distribution of `total`
+    /// (p50, p90, p99, max, a histogram, the count over
+    /// [`FRAME_BUDGET_MS`]) and, for every frame over budget, its stage
+    /// split and the store's counter deltas, then the mean stage split of
+    /// the frames over budget against the frames under it. Reads the
+    /// vectors in frame order, so it must run before anything sorts them
+    /// ([`ms_stats`] sorts in place). Prints only; asserts nothing.
+    fn report_frame_distribution(label: &str, stages: &FrameStages) {
+        let mut sorted = stages.total.clone();
+        sorted.sort_by(f64::total_cmp);
+        let edges = [8.0, 12.0, FRAME_BUDGET_MS, 25.0, 33.3];
+        let mut buckets = [0usize; 6];
+        for &t in &stages.total {
+            let slot = edges.iter().take_while(|&&e| t >= e).count();
+            if let Some(b) = buckets.get_mut(slot) {
+                *b += 1;
+            }
+        }
+        let over: Vec<usize> = (0..stages.total.len())
+            .filter(|&i| stages.total.get(i).is_some_and(|&t| t > FRAME_BUDGET_MS))
+            .collect();
+        println!(
+            "{label}: dist n={} p50={:.2} p90={:.2} p99={:.2} max={:.2} over16.7={} \
+             hist[<8,8-12,12-16.7,16.7-25,25-33,>=33]={buckets:?}",
+            stages.total.len(),
+            sorted_percentile(&sorted, 0.50),
+            sorted_percentile(&sorted, 0.90),
+            sorted_percentile(&sorted, 0.99),
+            sorted_percentile(&sorted, 1.0),
+            over.len(),
+        );
+        let row = |i: usize| -> [f64; 13] {
+            let at = |v: &Vec<f64>| v.get(i).copied().unwrap_or(0.0);
+            let phases = stages.recomposite_phases.get(i).copied().unwrap_or_default();
+            let costs = stages.recomposite_tile_costs.get(i).copied().unwrap_or_default();
+            let d = stages.store_deltas.get(i).copied().unwrap_or_default();
+            #[allow(clippy::cast_precision_loss)]
+            let f = |x: u64| x as f64;
+            [
+                at(&stages.total),
+                at(&stages.set_origin) + at(&stages.stamp_dab),
+                phases[0],
+                costs[2] + costs[3],
+                phases[1],
+                phases[2],
+                at(&stages.upload_sync),
+                at(&stages.record_pass) + at(&stages.submit_poll),
+                at(&stages.widget_paint),
+                f(d[0]),
+                f(d[1]),
+                f(d[2]) + f(d[3]),
+                f(u64::from(stages.uploaded.get(i).copied().unwrap_or(0))),
+            ]
+        };
+        for &i in &over {
+            let r = row(i);
+            println!(
+                "{label}:   frame {i:>2} total={:.2} origin+dab={:.2} recomp[p1={:.2} (cpu {:.2}) \
+                 poll={:.2} drain={:.2}] upload={:.2} pass+submit={:.2} widget={:.2} | \
+                 created={} evicted={} paged_in={} uploaded={}",
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12]
+            );
+        }
+        let mean_of = |frames: &[usize]| -> [f64; 13] {
+            let mut sum = [0.0f64; 13];
+            for &i in frames {
+                for (s, v) in sum.iter_mut().zip(row(i)) {
+                    *s += v;
+                }
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let n = frames.len().max(1) as f64;
+            sum.map(|s| s / n)
+        };
+        let under: Vec<usize> = (0..stages.total.len())
+            .filter(|i| !over.contains(i))
+            .collect();
+        for (name, frames) in [("over", &over), ("under", &under)] {
+            let r = mean_of(frames);
+            println!(
+                "{label}:   mean of {} {name}-budget frames: total={:.2} origin+dab={:.2} \
+                 recomp[p1={:.2} (cpu {:.2}) poll={:.2} drain={:.2}] upload={:.2} \
+                 pass+submit={:.2} widget={:.2} | created={:.1} evicted={:.1} paged_in={:.1} \
+                 uploaded={:.1}",
+                frames.len(),
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12]
+            );
+        }
     }
 
     /// Zeroes every process-global test counter
@@ -66740,6 +66861,11 @@ mod tests {
         /// `TileResidency::sync`. Reported side by side so the two can be
         /// compared, never conflated.
         composite_writes: Vec<[u64; 3]>,
+        /// 60 FPS round 5: per-frame deltas of the tile store's own
+        /// counters, `[tiles_created, evictions, faults, pending_hits,
+        /// resident_hits]`, so a frame over budget can be attributed to
+        /// first-touch tiles, eviction bursts or page-ins. Diagnostic only.
+        store_deltas: Vec<[u64; 5]>,
     }
 
     impl FrameStages {
@@ -66760,6 +66886,7 @@ mod tests {
                 uploaded: Vec::with_capacity(frames),
                 bytes_uploaded: Vec::with_capacity(frames),
                 composite_writes: Vec::with_capacity(frames),
+                store_deltas: Vec::with_capacity(frames),
             }
         }
 
@@ -67598,6 +67725,7 @@ mod tests {
             (200, 120),
             None,
         );
+        report_frame_distribution("gate (GPU path, 32 tiles)", &stages);
         report_frame_stages(
             "recomposite_and_present_loop (GPU path, 300,000px ceiling, pan+paint)",
             &mut stages,
@@ -67790,6 +67918,7 @@ mod tests {
             (200, 120),
             None,
         );
+        report_frame_distribution(label, &stages);
         report_frame_stages(label, &mut stages);
         let (mean, p50, p99, max) = ms_stats(&mut stages.total);
         println!("{label}: n=40 mean={mean:.2}ms p50={p50:.2}ms p99={p99:.2}ms max={max:.2}ms");
@@ -67827,6 +67956,7 @@ mod tests {
                 Some(&mut widgets),
             );
             let label = format!("whole frame (GPU path, budget {budget} tiles)");
+            report_frame_distribution(&label, &stages);
             let (w_mean, _, _, w_max) = ms_stats(&mut stages.widget_paint);
             let (r_mean, _, _, _) = ms_stats(&mut stages.recomposite);
             let (u_mean, _, _, _) = ms_stats(&mut stages.upload_sync);
@@ -67901,6 +68031,7 @@ mod tests {
             (200, 120),
             None,
         );
+        report_frame_distribution("gate (CPU fallback path)", &stages);
         report_frame_stages(
             "recomposite_and_present_loop (CPU fallback path, 300,000px ceiling, pan+paint)",
             &mut stages,
