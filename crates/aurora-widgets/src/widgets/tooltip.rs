@@ -493,6 +493,9 @@ pub struct Tooltip {
     /// The last placement ([`Tooltip::place`]); `None` until placed and
     /// again after a hide.
     frame: Option<Frame>,
+    /// Whether the shown node is hidden from assistive technology
+    /// ([`Tooltip::with_assistive_hidden`]).
+    assistive_hidden: bool,
 }
 
 /// Whether `kind` may own a tooltip — see "Allowed owners" in this
@@ -533,9 +536,12 @@ fn allowed_owner(kind: &WidgetKind) -> bool {
     }
 }
 
-fn tooltip_node(text: &str) -> Node {
+fn tooltip_node(text: &str, hidden: bool) -> Node {
     let mut node = Node::new(Role::Tooltip);
     node.set_label(text.to_owned());
+    if hidden {
+        node.set_hidden();
+    }
     node
 }
 
@@ -630,7 +636,19 @@ impl Tooltip {
             model: Model::IDLE,
             node: None,
             frame: None,
+            assistive_hidden: false,
         })
+    }
+
+    /// Hides the shown tooltip node from assistive technology (it stays
+    /// drawn). For an owner that already carries the very words as its
+    /// own accessible description — the toolbar buttons — so a screen
+    /// reader never announces them twice. The default is visible, the
+    /// shape this module's tests pin.
+    #[must_use]
+    pub fn with_assistive_hidden(mut self, hidden: bool) -> Self {
+        self.assistive_hidden = hidden;
+        self
     }
 
     #[must_use]
@@ -940,7 +958,7 @@ impl Tooltip {
     /// Does not touch `self.node` — [`Self::commit`] does, once every
     /// tree operation has succeeded.
     fn ensure_node(&self, tree: &mut WidgetTree<WidgetKind>) -> Result<WidgetId, WidgetError> {
-        let expected = tooltip_node(&self.text);
+        let expected = tooltip_node(&self.text, self.assistive_hidden);
         if let Some(id) = self.node
             && self.is_own_node(tree, id)
         {

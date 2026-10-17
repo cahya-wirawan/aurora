@@ -69,6 +69,7 @@ pub mod tone_controls;
 pub mod tool;
 pub mod tool_controls;
 pub mod toolbar_tooltips;
+pub mod tooltip_hover;
 pub mod tools_panel;
 pub mod workspace;
 
@@ -226,6 +227,10 @@ pub use tool_controls::{
     radius_slider_shown, sync_tool_controls, tool_controls_contains,
 };
 pub use toolbar_tooltips::{tool_tooltip_text, tooltip_text_for};
+pub use tooltip_hover::{
+    HoverBlockers, TOOLTIP_SHOW_DELAY, TooltipHover, foreign_popover_open, hover_point,
+    preferred_side,
+};
 pub use tools_panel::{
     DEFAULT_BACKGROUND, DEFAULT_FOREGROUND, TOOL_COLUMNS, TOOL_GROUPS, TOOL_ICON_SIZE,
     TOOLS_PANEL_LABEL, ToolsPanel, insert_tools_panel, is_tools_panel_button, selected_tool,

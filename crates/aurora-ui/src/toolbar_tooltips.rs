@@ -2,27 +2,22 @@
 //! the Tools panel, the Layers bottom toolbar and the Paths and Channels
 //! foot toolbars.
 //!
-//! **What exists, and what does not (read this).** This module is the
-//! *content contract* only: [`tooltip_text_for`] answers, for any widget
-//! of the workspace, the one string a tooltip on it would show (or
-//! `None`). The toolkit's `Tooltip` controller is **not yet wired into the
-//! live app**: it hangs directly below its owner at the owner's width
-//! (`aurora_widgets::widgets::Tooltip`), which is 32 px for these buttons
-//! and cannot hold "Elliptical Marquee (Shift+M)", and the Layers toolbar
-//! sits on the rail's bottom edge, so a tooltip below it would be off the
-//! window. Wiring needs a content-width, edge-aware placement in the
-//! toolkit and per-button hover tracking in the app; both are design and
-//! layout decisions that were not made here. Until then every one of these
-//! buttons keeps the same words as its accessible *description*, which a
-//! screen reader already reads.
+//! **What this module is.** The *content contract*:
+//! [`tooltip_text_for`] answers, for any widget of the workspace, the one
+//! string a tooltip on it would show (or `None`). Since 0.262.0 the live
+//! app shows it: [`crate::tooltip_hover`] tracks the pointer, times the
+//! hover delay and places the toolkit's `Tooltip` at its measured width
+//! inside the window.
 //!
-//! **No double announcement.** When the controller is wired it must not
-//! copy this text into the owner's description a second time: the shown
-//! tooltip is a `Role::Tooltip` child of the button (`tooltip.rs`'s
-//! accessibility vocabulary) and never part of the owner's name. The
-//! Tools panel's description ("Brush tool, shortcut B") and its tooltip
-//! ("Brush (B)") are deliberately different strings for that reason: the
-//! description is read after the name, the tooltip is a visual hint.
+//! **No double announcement.** The shown tooltip is a `Role::Tooltip`
+//! child of the button (`tooltip.rs`'s accessibility vocabulary), never
+//! part of the owner's name, and the app hides that node from assistive
+//! technology (`Tooltip::with_assistive_hidden`) because the button
+//! already carries the same words as its accessible *description* (the
+//! Layers, Paths and Channels buttons: the tooltip IS the description) or
+//! a deliberately different, longer one (the Tools panel's "Brush tool,
+//! shortcut B" against "Brush (B)"). A tooltip never copies its text into
+//! the owner's description.
 //!
 //! **Disabled buttons** show their *reason* (the button's description,
 //! "Layer effects can't be added from here yet"), never a bare action
@@ -41,6 +36,12 @@ pub fn tool_tooltip_text(tool: Tool) -> String {
     format!("{} ({})", tool.label(), tool.shortcut_text())
 }
 
+/// The Swap Colours button's tooltip.
+pub const SWAP_COLOURS_TOOLTIP: &str = "Swap Colours (X)";
+
+/// The Default Colours button's tooltip.
+pub const DEFAULT_COLOURS_TOOLTIP: &str = "Default Colours (D)";
+
 /// The description a Button currently carries: for the toolbar buttons
 /// that is what the action does, or why it is unavailable.
 fn button_description(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<String> {
@@ -51,13 +52,25 @@ fn button_description(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<Str
 }
 
 /// The tooltip text for widget `id`: a Tools panel button's
-/// [`tool_tooltip_text`]; a Layers, Paths or Channels toolbar button's
-/// current description (the reason, while it is disabled); `None` for
-/// anything else.
+/// [`tool_tooltip_text`]; the Swap/Default Colours buttons' fixed texts;
+/// the document strip's "More documents" button; a Layers, Paths or
+/// Channels toolbar button's current description (the reason, while it is
+/// disabled); `None` for anything else. The menu bar's text buttons and
+/// the tabs' close buttons have no tooltip (see [`crate::tooltip_hover`]).
 #[must_use]
 pub fn tooltip_text_for(workspace: &Workspace, id: WidgetId) -> Option<String> {
     if let Some(tool) = workspace.tools.tool_for(id) {
         return Some(tool_tooltip_text(tool));
+    }
+    let colours = workspace.tools.colours;
+    if id == colours.swap {
+        return Some(SWAP_COLOURS_TOOLTIP.to_owned());
+    }
+    if id == colours.defaults {
+        return Some(DEFAULT_COLOURS_TOOLTIP.to_owned());
+    }
+    if id == workspace.document_overflow {
+        return Some(crate::document_tabs::DOCUMENT_OVERFLOW_LABEL.to_owned());
     }
     let tree = &workspace.tree;
     let toolbar_button = crate::is_layer_toolbar_button(tree, id)
