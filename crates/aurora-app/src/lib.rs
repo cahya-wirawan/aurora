@@ -553,6 +553,7 @@ mod clipboard_tests;
 mod clone_stamp;
 #[cfg(test)]
 mod clone_stamp_tests;
+mod colour_app;
 mod colour_range_app;
 mod colour_state;
 mod crop;
@@ -983,7 +984,12 @@ fn unwritten_layers_item(unwritten: usize) -> Option<String> {
 fn colour_open_notice(colour: &aurora_io::ColourImport) -> Option<&'static str> {
     if colour.source.is_some() {
         Some("Converted from the file's colour profile to sRGB.")
-    } else if colour.report.info.iter().any(|l| l.contains("assumed sRGB")) {
+    } else if colour
+        .report
+        .info
+        .iter()
+        .any(|l| l.contains("assumed sRGB"))
+    {
         Some("No colour profile in this file: assumed sRGB.")
     } else {
         None
@@ -1029,11 +1035,9 @@ fn decode_chosen_file_with(
         // The tiles are built and encoded here too, on the decode thread
         // (0.153.0, `prepared_pixels`): the UI thread's install only
         // inserts them.
-        OpenRoute::Image => {
-            open_image_with_colour(path).map(|(image, colour)| {
-                DecodedFile::Image(PreparedImage::new(image).with_colour(colour))
-            })
-        }
+        OpenRoute::Image => open_image_with_colour(path).map(|(image, colour)| {
+            DecodedFile::Image(PreparedImage::new(image).with_colour(colour))
+        }),
         // Streamed (0.154.0): parsed from the file, never read whole, and
         // decoded, encoded and staged one layer at a time.
         OpenRoute::Psd => PreparedPsd::stream(path, staging).map(DecodedFile::Psd),
@@ -1994,7 +1998,17 @@ fn write_autosave(
     import_losses: Option<&[String]>,
     selection: Option<&aurora_doc::SelectionSet>,
 ) {
-    write_autosave_with_colour(path, layers, history, canvas_size, skipped, store, import_losses, selection, None)
+    write_autosave_with_colour(
+        path,
+        layers,
+        history,
+        canvas_size,
+        skipped,
+        store,
+        import_losses,
+        selection,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2136,7 +2150,19 @@ fn request_autosave(
     import_losses: Option<&[String]>,
     selection: Option<&aurora_doc::SelectionSet>,
 ) -> Option<background_autosave::Generation> {
-    request_autosave_with_colour(worker, path, document, layers, history, canvas_size, skipped, store, import_losses, selection, None)
+    request_autosave_with_colour(
+        worker,
+        path,
+        document,
+        layers,
+        history,
+        canvas_size,
+        skipped,
+        store,
+        import_losses,
+        selection,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2192,7 +2218,20 @@ fn request_autosave_within(
     import_losses: Option<&[String]>,
     selection: Option<&aurora_doc::SelectionSet>,
 ) -> Option<background_autosave::Generation> {
-    request_autosave_within_with_colour(worker, budget, path, document, layers, history, canvas_size, skipped, store, import_losses, selection, None)
+    request_autosave_within_with_colour(
+        worker,
+        budget,
+        path,
+        document,
+        layers,
+        history,
+        canvas_size,
+        skipped,
+        store,
+        import_losses,
+        selection,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2304,7 +2343,18 @@ fn snapshot_autosave(
     import_losses: Option<&[String]>,
     selection: Option<&aurora_doc::SelectionSet>,
 ) -> SnapshotOutcome {
-    snapshot_autosave_with_colour(path, layers, history, canvas_size, skipped, max_texel_bytes, store, import_losses, selection, None)
+    snapshot_autosave_with_colour(
+        path,
+        layers,
+        history,
+        canvas_size,
+        skipped,
+        max_texel_bytes,
+        store,
+        import_losses,
+        selection,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6114,6 +6164,10 @@ enum ActivatedCommand {
     ResetColours,
     /// Toggle Quick Mask mode (0.217.0): `Q`, the palette, the Select menu.
     ToggleQuickMask,
+    /// Set the document's output profile from a chosen ICC file.
+    SetOutputProfile(PathBuf),
+    /// Clear the document's output profile (export writes sRGB).
+    ClearOutputProfile,
     /// Select All / Deselect / Inverse (0.212.0): `App` state, so handed
     /// back like the colour commands.
     Selection(selection_view::SelectionCommand),
@@ -6524,6 +6578,15 @@ fn palette_commands() -> Vec<CommandEntry> {
             .iter()
             .map(|(id, title)| CommandEntry::new(*id, *title)),
     );
+    // Colour management: the document's output profile.
+    commands.push(CommandEntry::new(
+        colour_app::COMMAND_SET_OUTPUT,
+        colour_app::TITLE_SET_OUTPUT,
+    ));
+    commands.push(CommandEntry::new(
+        colour_app::COMMAND_CLEAR_OUTPUT,
+        colour_app::TITLE_CLEAR_OUTPUT,
+    ));
     // 0.238.0: Select > Colour Range.
     commands.push(CommandEntry::new(
         colour_range_app::COMMAND_ID,
@@ -6835,6 +6898,14 @@ fn activate_command(
     }
     if let Some(kind) = selection_refine::RefineKind::for_command(id) {
         return Some(ActivatedCommand::RefinePrompt(kind));
+    }
+    if id == colour_app::COMMAND_SET_OUTPUT {
+        return file_dialog
+            .pick_file()
+            .map(ActivatedCommand::SetOutputProfile);
+    }
+    if id == colour_app::COMMAND_CLEAR_OUTPUT {
+        return Some(ActivatedCommand::ClearOutputProfile);
     }
     if id == colour_range_app::COMMAND_ID {
         return Some(ActivatedCommand::ColourRangePrompt);
@@ -31282,6 +31353,8 @@ impl App {
             Some(ActivatedCommand::ResetColours) => self.reset_colours(),
             Some(ActivatedCommand::Selection(command)) => self.run_selection_command(command),
             Some(ActivatedCommand::ToggleQuickMask) => self.toggle_quick_mask(),
+            Some(ActivatedCommand::SetOutputProfile(path)) => self.set_output_profile(&path),
+            Some(ActivatedCommand::ClearOutputProfile) => self.clear_output_profile(),
             Some(ActivatedCommand::SelectTool(tool)) => self.select_tool_command(tool),
             Some(ActivatedCommand::SetSelectionMode(mode)) => self.set_selection_mode(mode),
             Some(ActivatedCommand::CropToSelection) => self.crop_to_selection(),
@@ -33262,6 +33335,16 @@ impl App {
                     self.report_save_failure(path, &SaveFailure::Composite(err));
                 }
                 return;
+            }
+        };
+        // Colour management: with an output profile the pixels are
+        // converted to it and the file embeds exactly that profile; if the
+        // conversion cannot be made, sRGB is exported, with a notice.
+        let image = match colour_app::export_image(image, self.doc.colour.output.as_ref()) {
+            Ok(image) => image,
+            Err(unconverted) => {
+                self.colour_notice(colour_app::NOTICE_EXPORT_FALLBACK);
+                unconverted
             }
         };
         let bytes = match aurora_io::encode_by_extension(path, &image) {
