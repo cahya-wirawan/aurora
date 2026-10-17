@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.270.0] - 2026-10-17
+
+### Changed
+
+- 60 FPS round 5: docs and version
+
 ## [0.269.0] - 2026-10-17
 
 ### Changed
