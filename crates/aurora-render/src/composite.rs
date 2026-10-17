@@ -435,6 +435,34 @@ const LABEL_DIVIDE_PASS: &str = "composite.divide.pass";
 /// caller-supplied encoder is an eighth slot, so the method now carries
 /// an explicit `allow` — but a mode is still a `const` here rather than
 /// yet another argument at every call site.
+/// Runs `f` inside `wgpu` error scopes for every error filter and returns
+/// its value, or the first error the scopes captured (60 FPS round 5's
+/// [`TileCompositor::prewarm`]). On native backends the scope's future is
+/// already resolved when popped, so one poll with a no-op waker reads it;
+/// a backend whose future were still pending would report no error.
+///
+/// # Errors
+///
+/// The first error any of the scopes captured while `f` ran.
+pub fn capture_wgpu_errors<T>(
+    device: &wgpu::Device,
+    f: impl FnOnce() -> T,
+) -> Result<T, wgpu::Error> {
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let value = f();
+    let mut first = None;
+    for scope in [internal, memory, validation] {
+        let mut popped = std::pin::pin!(scope.pop());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        if let std::task::Poll::Ready(Some(err)) = popped.as_mut().poll(&mut context) {
+            first.get_or_insert(err);
+        }
+    }
+    first.map_or(Ok(value), Err)
+}
+
 struct BlendPass {
     /// The `shaders/composite.wgsl` `@fragment` entry point that
     /// computes this mode's formula. It is also the discriminating
@@ -2580,7 +2608,24 @@ impl TileCompositor {
     /// Each pipeline is built from exactly the [`PipelineKey`], layout and
     /// label its composite call builds lazily, so the cache entry is the
     /// one that call would have made and no pixel can change.
-    pub fn prewarm(&mut self, device: &wgpu::Device, blend_modes: bool) -> usize {
+    ///
+    /// # Errors
+    ///
+    /// The first `wgpu` error a pipeline build raised (validation, out of
+    /// memory, internal), captured by error scopes rather than reaching
+    /// `wgpu`'s default uncaptured-error panic: a failed prewarm must
+    /// never abort startup. The caller logs it; the composite call that
+    /// later needs the pipeline behaves exactly as it would have without
+    /// the prewarm.
+    pub fn prewarm(
+        &mut self,
+        device: &wgpu::Device,
+        blend_modes: bool,
+    ) -> Result<usize, wgpu::Error> {
+        capture_wgpu_errors(device, || self.prewarm_uncaptured(device, blend_modes))
+    }
+
+    fn prewarm_uncaptured(&mut self, device: &wgpu::Device, blend_modes: bool) -> usize {
         let before = self.pipelines.len();
         let shader = &self.shader;
         for (fragment_entry, layout) in [
@@ -8482,9 +8527,13 @@ mod tests {
 
         let mut compositor = TileCompositor::new(device);
         let started = std::time::Instant::now();
-        assert_eq!(compositor.prewarm(device, false), 2);
+        assert_eq!(compositor.prewarm(device, false).ok(), Some(2));
         let normal_ms = started.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(compositor.prewarm(device, false), 0, "idempotent");
+        assert_eq!(
+            compositor.prewarm(device, false).ok(),
+            Some(0),
+            "idempotent"
+        );
         submit_one(&context, |encoder| {
             compositor.composite_over(&context, encoder, &dst_view, &src_view);
             compositor.composite_over_with_opacity(&context, encoder, &dst_view, &src_view, 0.5);
@@ -8496,9 +8545,12 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        assert_eq!(compositor.prewarm(device, true), ALL_BLEND_PASSES.len());
+        assert_eq!(
+            compositor.prewarm(device, true).ok(),
+            Some(ALL_BLEND_PASSES.len())
+        );
         let blend_ms = started.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(compositor.prewarm(device, true), 0, "idempotent");
+        assert_eq!(compositor.prewarm(device, true).ok(), Some(0), "idempotent");
         for pass in ALL_BLEND_PASSES {
             submit_one(&context, |encoder| {
                 compositor.composite_blend_over_with_opacity(
@@ -8539,6 +8591,51 @@ mod tests {
             "prewarm: Normal pipelines {normal_ms:.2} ms, {} blend pipelines {blend_ms:.2} ms",
             ALL_BLEND_PASSES.len()
         );
+    }
+
+    /// A pipeline build that fails validation inside
+    /// [`capture_wgpu_errors`] comes back as an `Err`, not as `wgpu`'s
+    /// uncaptured-error panic (what keeps a failed prewarm from aborting
+    /// startup), and a clean build comes back `Ok`.
+    #[test]
+    fn capture_wgpu_errors_returns_a_validation_error_instead_of_panicking() {
+        use super::{Blend, LABEL, PipelineKey, capture_wgpu_errors, composite_pipeline};
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let compositor = TileCompositor::new(device);
+        let key = PipelineKey {
+            shader: LABEL,
+            vertex_entry: "vs_composite",
+            fragment_entry: "fs_composite_opacity",
+            target_format: wgpu::TextureFormat::Rgba16Float,
+            blend: Blend::AlphaBlending,
+        };
+        // `fs_composite_opacity` reads binding 2, which this layout lacks.
+        let failed = capture_wgpu_errors(device, || {
+            composite_pipeline(
+                device,
+                &compositor.shader,
+                &key,
+                &compositor.bind_group_layout,
+                LABEL,
+            )
+        });
+        assert!(
+            failed.is_err(),
+            "a layout missing binding 2 must fail validation"
+        );
+        let built = capture_wgpu_errors(device, || {
+            composite_pipeline(
+                device,
+                &compositor.shader,
+                &key,
+                &compositor.bind_group_layout_opacity,
+                LABEL,
+            )
+        });
+        assert!(built.is_ok(), "the matching layout must build cleanly");
     }
 
     #[test]

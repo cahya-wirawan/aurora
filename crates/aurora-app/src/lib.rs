@@ -37594,10 +37594,28 @@ impl ApplicationHandler<AppEvent> for App {
             // measured there). Blend-mode pipelines stay lazy: all 18 cost
             // about 136 ms (dev profile), too much to add to startup.
             let mut canvas_pipeline = aurora_gpu::CanvasPipeline::new(gpu.device());
-            let _ = canvas_pipeline.pipeline(gpu.device(), surface.format());
+            if let Err(err) = aurora_render::capture_wgpu_errors(gpu.device(), || {
+                let _ = canvas_pipeline.pipeline(gpu.device(), surface.format());
+            }) {
+                tracing::warn!(
+                    %err,
+                    "prewarming the canvas pipeline failed; it will be built on first use"
+                );
+            }
             self.canvas_pipeline = Some(canvas_pipeline);
             let mut compositor = aurora_render::TileCompositor::new(gpu.device());
-            let _ = compositor.prewarm(gpu.device(), false);
+            let prewarm_started = std::time::Instant::now();
+            match compositor.prewarm(gpu.device(), false) {
+                Ok(built) => tracing::info!(
+                    built,
+                    ms = prewarm_started.elapsed().as_secs_f64() * 1000.0,
+                    "composite pipelines prewarmed"
+                ),
+                Err(err) => tracing::warn!(
+                    %err,
+                    "prewarming the composite pipelines failed; they will be built on first use"
+                ),
+            }
             self.compositor = Some(compositor);
         } else {
             tracing::warn!(
@@ -66404,7 +66422,7 @@ mod tests {
         // `AURORA_R5_COLD` asks for the old lazy first frame.
         if std::env::var_os("AURORA_R5_COLD").is_none() {
             let _ = canvas_pipeline.pipeline(device, wgpu::TextureFormat::Rgba8Unorm);
-            let _ = compositor.prewarm(device, false);
+            let _ = compositor.prewarm(device, false).ok();
         }
 
         let target = frame_timing_target(device, viewport);

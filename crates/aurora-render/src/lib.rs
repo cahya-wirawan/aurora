@@ -70,7 +70,9 @@ pub use composite::{
     transparent_tile, un_premultiply_in_place,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub use composite::{set_transparent_skip_enabled, transparent_chunks_skipped};
+pub use composite::{
+    capture_wgpu_errors, set_transparent_skip_enabled, transparent_chunks_skipped,
+};
 pub use executor::{Executor, TaskId};
 pub use mip::{MipLevel, downsample};
 pub use preview::{PreviewError, upload_preview};
