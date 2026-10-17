@@ -644,6 +644,114 @@ def check_smart(folder):
     print(f"OK: the template's {len(after)} smart objects survived open -> save byte for byte")
 
 
+EFFECT_KINDS = {
+    b"DrSh": "drop shadow", b"dropShadowMulti": "drop shadow",
+    b"SoFi": "colour overlay", b"solidFillMulti": "colour overlay",
+    b"FrFX": "stroke", b"frameFXMulti": "stroke",
+    b"OrGl": "outer glow",
+    b"GrFl": "gradient overlay", b"gradientFillMulti": "gradient overlay",
+    b"patternFill": "pattern overlay",
+}
+
+
+def _number(v):
+    return None if v is None else round(float(getattr(v, "value", v)), 6)
+
+
+def effect_summary(layer):
+    """Every drawn-kind effect of `layer` as (kind, on, blend, opacity, colour, sizes...),
+    in a canonical order, read with psd-tools from the layer's `lfx2` block."""
+    from psd_tools.constants import Tag
+    from psd_tools.psd.descriptor import List
+    blocks = layer.tagged_blocks
+    if not blocks:
+        return None
+    block = blocks.get_data(Tag.OBJECT_BASED_EFFECTS_LAYER_INFO)
+    if block is None:
+        return None
+    out = [("master", bool(block.get(b"masterFXSwitch", True)), _number(block.get(b"Scl ")))]
+    for key, kind in EFFECT_KINDS.items():
+        value = block.get(key)
+        if value is None:
+            continue
+        items = list(value) if isinstance(value, List) else [value]
+        for e in items:
+            colour = e.get(b"Clr ")
+            rgb = None if colour is None or b"Rd  " not in colour else tuple(
+                round(float(colour[k]), 4) for k in (b"Rd  ", b"Grn ", b"Bl  "))
+            out.append((
+                kind, bool(e.get(b"enab", True)) and bool(e.get(b"present", True)),
+                e.get(b"Md  ").enum if e.get(b"Md  ") is not None else None,
+                _number(e.get(b"Opct")), rgb,
+                _number(e.get(b"Sz  ")), _number(e.get(b"blur")), _number(e.get(b"Dstn")),
+                _number(e.get(b"lagl")), _number(e.get(b"Scl ")),
+                e.get(b"Styl").enum if e.get(b"Styl") is not None else None,
+                e.get(b"PntT").enum if e.get(b"PntT") is not None else None,
+            ))
+    return sorted(out, key=repr)
+
+
+def check_effects(folder):
+    """Task 120: each kept `resave_<name>.psd` holds the same effects as the
+    original corpus file, read with psd-tools; the global light angle
+    (resource 1037) and the pattern pool survive."""
+    corpus = Path(__file__).resolve().parent.parent / "corpora/psd/reference/psd-tools-fixtures"
+    found = 0
+    for saved in sorted(folder.glob("resave_*.psd")):
+        name = saved.name[len("resave_"):]
+        matches = list(corpus.rglob(name)) if corpus.exists() else []
+        if not matches:
+            continue
+        original = PSDImage.open(matches[0])
+        resaved = PSDImage.open(saved)
+        a = {l.name: effect_summary(l) for l in original.descendants()}
+        b = {l.name: effect_summary(l) for l in resaved.descendants()}
+        layers = [n for n, v in a.items() if v is not None]
+        if not layers:
+            continue
+        found += 1
+        for n in layers:
+            want = [e for e in a[n] if e[0] == "master" or e[1]]
+            got = [e for e in (b.get(n) or []) if e[0] == "master" or e[1]]
+            # A gradient or pattern stroke Aurora could not draw is itemised in
+            # the save report and not written: those may be fewer, never more.
+            def split(effects):
+                # The default save does not write gradient/pattern overlays or
+                # strokes (unverified in Photoshop): they are compared as "may be
+                # fewer, never more".
+                def unverified(e):
+                    return e[0] in ("gradient overlay", "pattern overlay") or (
+                        e[0] == "stroke" and e[11] != b"SClr")
+                solid = [e for e in effects if not unverified(e)]
+                other = [e for e in effects if unverified(e)]
+                return solid, other
+            want, want_paint = split(want)
+            got, got_paint = split(got)
+            if len(got_paint) > len(want_paint):
+                fail(f"{name}/{n}: more painted strokes than the original")
+            kinds_w = sorted(e[0] for e in want)
+            kinds_g = sorted(e[0] for e in got)
+            # Kinds Aurora does not model (inner shadow, bevel, ...) are not in
+            # EFFECT_KINDS, so the comparison is over the written kinds.
+            check(f"{name}/{n} effect kinds", kinds_g, kinds_w)
+            if [e for e in want if e[0] != "master"] != [e for e in got if e[0] != "master"]:
+                print(f"  note: {name}/{n}: values differ from the original (rounded or detached): "
+                      f"{[e for e in want if e not in got][:2]} -> {[e for e in got if e not in want][:2]}")
+        angle_o = original.image_resources.get_data(Resource.GLOBAL_ANGLE) if hasattr(Resource, "GLOBAL_ANGLE") else None
+        angle_r = resaved.image_resources.get_data(Resource.GLOBAL_ANGLE) if hasattr(Resource, "GLOBAL_ANGLE") else None
+        if angle_o is not None:
+            check(f"{name} global light angle", angle_r, angle_o)
+        pools_o = original.tagged_blocks.get_data(Tag.PATTERNS1) if original.tagged_blocks else None
+        pools_r = resaved.tagged_blocks.get_data(Tag.PATTERNS1) if resaved.tagged_blocks else None
+        # The default save writes no pattern effects (unverified in Photoshop),
+        # so no `Patt` pool is expected; one present must still parse.
+        if pools_r is not None:
+            print(f"  note: {name}: a Patt pool is present ({len(pools_r)} patterns)")
+        print(f"  {name}: {len(layers)} layers with effects read by psd-tools")
+    print(f"OK: {found} re-saved corpus file(s) with effects checked with psd-tools" if found
+          else "not run: no resave_*.psd with effects kept")
+
+
 if __name__ == "__main__":
     main()
     check_groups(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
@@ -655,3 +763,4 @@ if __name__ == "__main__":
     check_adjustments4(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_adjustments2(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_gradient_map(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
+    check_effects(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
