@@ -378,6 +378,14 @@ pub enum StrokeFill {
 /// (and `LayerOp::SetStrokePaints`) instead, and [`Stroke::paint`] is
 /// `#[serde(skip)]`. The stroke's `fill` (on the wire) says which kind it
 /// is; the paint must match it ([`LayerEffects::validate`]).
+///
+/// **Not compared with Photoshop:** a gradient stroke's reference box (for
+/// a PSD import, the layer's record rectangle, as for gradient overlays)
+/// and the gradient's length and ramp along it, and a pattern stroke's
+/// placement (the layer's `fxrp` point, as for pattern overlays), are
+/// carried over from the overlays' findings, not checked against a
+/// Photoshop picture of a stroke. On `stroke-effects.psd` the drawn strokes
+/// come out close to Photoshop's but not equal.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StrokePaint {
     /// A gradient laid over `reference` (the layer's `bounds` when

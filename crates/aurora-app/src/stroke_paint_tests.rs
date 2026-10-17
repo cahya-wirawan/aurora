@@ -462,3 +462,38 @@ fn a_vertical_gradient_stroke_follows_the_texels_row() {
         texel(&acc, 120, 139).map(f32::to_bits)
     );
 }
+
+/// A gradient stroke's reference box is relative to the layer's bounds: the
+/// same square one pixel to the right (bounds and box moved together) gives
+/// the same picture one pixel over.
+#[test]
+fn a_gradient_strokes_box_follows_the_layers_bounds() {
+    let g = ramp_fill(0.0, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+    let mut rows = Vec::new();
+    for ox in [0_i64, 1] {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let id = painted(&mut layers, &mut store, (ox, 0), (100 + ox, 100, 40, 40));
+        let fx = aurora_core::LayerEffects {
+            strokes: vec![painted_stroke(
+                StrokePosition::Outside,
+                3.0,
+                StrokeFill::Gradient,
+                Some(gradient_paint(g.clone())),
+            )],
+            ..aurora_core::LayerEffects::default()
+        };
+        ok(layers.set_effects(id, Some(fx)));
+        let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+        let row: Vec<[u32; 4]> = (138..143)
+            .map(|x| texel(&acc, usize::try_from(x + ox).unwrap_or(0), 121).map(f32::to_bits))
+            .collect();
+        rows.push(row);
+    }
+    assert_eq!(rows.first(), rows.get(1));
+    // The ring right of the square really carries the ramp's blue end.
+    let Some(Some(first)) = rows.first().map(|r| r.get(3).copied()) else {
+        unreachable!("five texels");
+    };
+    assert!(f32::from_bits(first[2]) > f32::from_bits(first[0]));
+}

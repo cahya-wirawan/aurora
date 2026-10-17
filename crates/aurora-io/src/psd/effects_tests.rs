@@ -1828,3 +1828,60 @@ fn an_unnamed_unlinked_or_phased_pattern_stroke_stays_undrawn() {
         assert_eq!(read.effects.shown_unrendered_strokes(), 1);
     }
 }
+
+/// A gradient stroke on a raster layer that starts left of and above the
+/// canvas (the only case where Aurora's bounds do not start at the origin):
+/// its box is the record rectangle, stored relative to the layer's bounds
+/// (the bounds are the union with the canvas, 19 x 18, and the record
+/// rectangle is 4 x 4 at their corner, so the offset is zero). Not compared with Photoshop's box (see `StrokePaint`).
+#[test]
+fn a_gradient_stroke_box_is_made_relative_to_the_layers_bounds_on_open() {
+    use aurora_core::effects::StrokePaint;
+    let block = effects_block(&[(
+        b"FrFX",
+        painted_stroke(b"GrFl", gradient_fill(true, vec![]), vec![]),
+    )]);
+    let doc = open(
+        &TestPsd::new(1, 16, 16, 8)
+            .with(|p| {
+                p.layers = vec![
+                    TestLayer::pixels("a", -3, -2, 4, 4, 8, &[[1, 2, 3, 255]; 16])
+                        .with(|l| l.blocks.push((*b"lfx2", block.clone()))),
+                ];
+            })
+            .write(),
+    );
+    let Some(&id) = doc.layers.roots().first() else {
+        unreachable!("one layer");
+    };
+    assert_eq!(
+        doc.layers.bounds(id),
+        Some(aurora_core::Rect {
+            x: -3,
+            y: -2,
+            width: 19,
+            height: 18
+        })
+    );
+    let paint = doc
+        .layers
+        .effects(id)
+        .and_then(|fx| fx.strokes.first())
+        .and_then(|s| s.paint.clone());
+    let Some(StrokePaint::Gradient {
+        reference: Some(reference),
+        ..
+    }) = paint
+    else {
+        unreachable!("a painted gradient stroke with a box, got {paint:?}");
+    };
+    assert_eq!(
+        (
+            reference.dx,
+            reference.dy,
+            reference.width,
+            reference.height
+        ),
+        (0, 0, 4, 4)
+    );
+}

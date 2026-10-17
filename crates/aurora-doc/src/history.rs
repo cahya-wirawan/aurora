@@ -6229,6 +6229,9 @@ mod adjustment_tests {
             value: Vec::new(),
         });
         assert_eq!(paints, pat.map(|p| p + 1));
+        // The absolute ordinal is frozen too: a reordering of the enum would
+        // change what every saved journal means.
+        assert_eq!(paints, Some(22));
 
         let mut tree = LayerTree::new();
         let mut history = History::new();
