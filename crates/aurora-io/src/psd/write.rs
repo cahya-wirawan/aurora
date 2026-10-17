@@ -1185,6 +1185,7 @@ fn quantize(value: f32, losses: &mut Losses) -> u16 {
 /// ([`aurora_color::IccProfile::srgb_bytes`]): `lcms2` stamps the time
 /// into a serialised profile's header, and a file's verify (or a test
 /// comparing two writes) must see the bytes the write used.
+#[cfg(test)]
 pub(crate) fn icc_resource() -> Result<Vec<u8>, IoError> {
     resources_for(None)
 }
@@ -2071,6 +2072,7 @@ fn write_header<W: Write>(
 
 /// [`write_psd`] with the file-size limit as a parameter, so a test can
 /// reach it without writing 2 GiB.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn write_psd_limited<W: Write + Seek>(
     mut writer: W,
     layers: &LayerTree,

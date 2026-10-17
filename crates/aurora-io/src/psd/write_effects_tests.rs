@@ -636,7 +636,7 @@ fn pattern_pool_block_round_trips_8_and_16_bit_patterns() {
     let eight = pattern("p8");
     let deep = sixteen_bit_pattern("p16");
     let block = write_effects::pattern_block(&[&eight, &deep]).unwrap_or_default();
-    assert!(!block.is_empty() && block.len() % 4 == 0);
+    assert!(!block.is_empty() && block.len().is_multiple_of(4));
     let mut fx = LayerEffects::default();
     fx.pattern_overlays.push(pattern_overlay("p8", (0.0, 0.0)));
     fx.strokes.push(Stroke {

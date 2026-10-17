@@ -182,20 +182,20 @@ fn obj(class: &str, items: Items) -> Value {
     })
 }
 
-fn unit(code: &[u8; 4], value: f64) -> Value {
-    Value::Unit { unit: *code, value }
+fn unit(code: [u8; 4], value: f64) -> Value {
+    Value::Unit { unit: code, value }
 }
 
 fn percent(value: f64) -> Value {
-    unit(b"#Prc", value)
+    unit(*b"#Prc", value)
 }
 
 fn pixels(value: f64) -> Value {
-    unit(b"#Pxl", value)
+    unit(*b"#Pxl", value)
 }
 
 fn angle(value: f64) -> Value {
-    unit(b"#Ang", value)
+    unit(*b"#Ang", value)
 }
 
 fn enum_of(type_id: &str, value: &[u8]) -> Value {
@@ -856,7 +856,7 @@ fn encode_into(
     };
     let mut lfx2 = effects_block(&descriptor).ok()?;
     // Padded inside the block's length, like the adjustment blocks.
-    while lfx2.len() % 4 != 0 {
+    while !lfx2.len().is_multiple_of(4) {
         lfx2.push(0);
     }
     let fxrp = place.origin.map(|(x, y)| {
@@ -943,7 +943,7 @@ fn pattern_item(p: &Pattern) -> Result<Vec<u8>, Unwritable> {
         u32::try_from(body.len()).map_err(|_| Unwritable)?,
     );
     item.extend_from_slice(&body);
-    while item.len() % 4 != 0 {
+    while !item.len().is_multiple_of(4) {
         item.push(0);
     }
     Ok(item)
