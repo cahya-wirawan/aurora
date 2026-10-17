@@ -121,9 +121,8 @@ pub fn bring_into_working(samples: &mut [f16], tagging: Tagging<'_>, gray: bool)
         // A grey image's profile is grey (or a mismatched RGB one): not
         // applied in round 1.
         let named = aurora_color::profile_description(bytes);
-        let is_gray_profile = parse_header(bytes)
-            .map(|h| h.space == aurora_color::ProfileSpace::Gray)
-            .unwrap_or(false);
+        let is_gray_profile =
+            parse_header(bytes).is_ok_and(|h| h.space == aurora_color::ProfileSpace::Gray);
         if is_gray_profile {
             out.report.warnings.push(ignored(format!(
                 "grayscale profiles are not applied yet{}",
@@ -184,7 +183,7 @@ pub fn convert_rgba(
         };
         for (i, px) in pixels.chunks_exact(4).enumerate() {
             // Alpha zero (either sign): the colour cannot be seen.
-            if px.get(3).is_some_and(|a| a.to_bits() & 0x7fff == 0) {
+            if px.get(3).is_some_and(|a| a.to_bits() << 1 == 0) {
                 continue;
             }
             kept.push(i);

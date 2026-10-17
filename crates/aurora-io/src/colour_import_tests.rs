@@ -85,7 +85,10 @@ fn assert_converted(ext: &str, tolerance: f32) {
         .take(3)
         .map(|s| s.to_f32())
         .collect();
-    let want = expected(&src, [first[0], first[1], first[2]]);
+    let &[r, g, b, ..] = first.as_slice() else {
+        unreachable!()
+    };
+    let want = expected(&src, [r, g, b]);
     for (got, want) in image.samples().iter().take(3).zip(want) {
         assert!(
             (got.to_f32() - want).abs() <= tolerance,

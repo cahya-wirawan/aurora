@@ -2008,7 +2008,7 @@ fn write_autosave(
         import_losses,
         selection,
         None,
-    )
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -29205,7 +29205,7 @@ impl LockRefusal {
             LockRefusal::QuickMaskNothing => {
                 "Quick Mask selected nothing, so there is no selection."
             }
-            LockRefusal::Path(text) => text,
+            LockRefusal::Path(text) | LockRefusal::Colour(text) => text,
             LockRefusal::SavedSelectionNeedsSelection => {
                 "Make a selection first. Save Selection keeps the selection you have."
             }
@@ -29219,7 +29219,6 @@ impl LockRefusal {
                 "This file's saved selection couldn't be restored and was left out. The rest of the document opened."
             }
             LockRefusal::SaveNotConfirmed => aurora_io::DIR_SYNC_ADVISORY,
-            LockRefusal::Colour(text) => text,
             LockRefusal::CloneNeedsSource => "Alt-click to set a clone source.",
             LockRefusal::CloneNeedsPixelLayer => {
                 "Select a pixel layer to clone. A group, an adjustment layer or no layer can't be sampled."
@@ -32683,6 +32682,7 @@ impl App {
     /// the checked `bytes`, and its live read ([`read_prechecked_aur`])
     /// still runs here, on the UI thread, because the live store is the
     /// UI thread's.
+    #[allow(clippy::too_many_lines)] // one more carried field (colour)
     fn open_aur_file(&mut self, path: &Path, bytes: &[u8]) -> bool {
         // Before the read, not after it as until 0.143.1: once the live
         // read has succeeded the current document's aliased tiles are

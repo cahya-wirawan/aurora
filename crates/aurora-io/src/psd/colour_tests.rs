@@ -108,7 +108,7 @@ fn an_adobe_like_profile_converts_the_layers_and_is_kept_as_metadata() {
 fn an_srgb_profile_changes_nothing() {
     let none = first_pixel(&open(&psd(Vec::new())));
     let document = open(&psd(resource_1039(SRGB_ICC)));
-    assert_eq!(first_pixel(&document), none);
+    assert_eq!(bits4(first_pixel(&document)), bits4(none));
     assert!(document.colour.source.is_none());
     assert!(document.report.items.is_empty());
     // Untagged: an info line, no change, no warning.
@@ -132,7 +132,7 @@ fn a_damaged_or_wrong_profile_is_reported_and_the_file_still_opens() {
     };
     for bad in [b"junk".to_vec(), gray] {
         let document = open(&psd(resource_1039(&bad)));
-        assert_eq!(first_pixel(&document), none);
+        assert_eq!(bits4(first_pixel(&document)), bits4(none));
         assert!(document.colour.source.is_none());
         assert_eq!(
             document.report.items.len(),
@@ -217,4 +217,8 @@ fn a_file_with_only_a_merged_image_is_converted_too() {
     for (g, w) in got.iter().zip(want) {
         assert!((g - w).abs() < 3e-3, "{got:?} vs {want:?}");
     }
+}
+
+fn bits4(p: [f32; 4]) -> [u32; 4] {
+    p.map(f32::to_bits)
 }

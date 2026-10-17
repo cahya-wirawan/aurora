@@ -5447,6 +5447,7 @@ impl Builder<'_, '_, '_> {
     /// Recursion depth is bounded by [`MAX_GROUP_DEPTH`] ([`decode`]
     /// refuses deeper files, and this re-checks rather than trusting a
     /// hand-built [`PsdFile`]).
+    #[allow(clippy::too_many_lines)] // one more step per layer (colour conversion)
     fn add_nodes(
         &mut self,
         nodes: Vec<PsdNode>,

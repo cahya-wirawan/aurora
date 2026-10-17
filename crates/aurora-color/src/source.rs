@@ -479,6 +479,9 @@ mod tests {
         assert_eq!(profile_description(&[0; 10]), None);
     }
 
+    // Fixed 3 x 3 matrix arithmetic in a test: indices are constants or
+    // 0..3 loops, and the names are the standard ones (r, g, b, m).
+    #[allow(clippy::indexing_slicing, clippy::many_single_char_names)]
     #[test]
     fn adobe_like_to_srgb_matches_an_independent_matrix_computation() {
         // Both spaces are D65 matrix/TRC spaces, so relative colorimetric
