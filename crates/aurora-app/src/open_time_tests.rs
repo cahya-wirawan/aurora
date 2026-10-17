@@ -16,6 +16,22 @@ fn nyepi_path() -> Option<std::path::PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// [`nyepi_path`] for a test that needs the file: prints SKIPPED when it is
+/// absent, and fails instead when `AURORA_REQUIRE_CORPUS` is set (the
+/// convention of the effects write round), so a gate that should have the
+/// local corpus cannot pass without running these.
+fn nyepi_or_skip() -> Option<std::path::PathBuf> {
+    let path = nyepi_path();
+    if path.is_none() {
+        println!("SKIPPED: the Nyepi template is not present");
+        assert!(
+            std::env::var_os("AURORA_REQUIRE_CORPUS").is_none(),
+            "AURORA_REQUIRE_CORPUS is set and the Nyepi template is missing"
+        );
+    }
+    path
+}
+
 fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     match r {
         Ok(v) => v,
@@ -153,19 +169,84 @@ fn stream_fingerprint(path: &std::path::Path, threads: usize) -> (u64, usize) {
 /// template, fingerprinted by running this test's [`fingerprint`] on a
 /// checkout of 0.188.0 (before the lookup-table decode, the zero-tile
 /// reuse and the parallel encode): the new path must not change a byte.
+///
+/// **Only for the template with its colour profile removed** (see
+/// [`nyepi_without_its_profile`]): since 0.264.0 the template's embedded
+/// Adobe RGB (1998) profile is converted to sRGB on open, so the real file
+/// no longer opens to these bytes (it gives [`NYEPI_FINGERPRINT_COLOUR_MANAGED`]).
+/// The profile-less file still does, which pins the decode, zero-tile reuse
+/// and parallel-encode paths to 0.188.0 exactly as before.
 const NYEPI_FINGERPRINT_0_188_0: (u64, usize) = (6_569_619_393_056_216_672, 4021);
+
+/// The template's tiles as opened since 0.264.0 (Adobe RGB layers converted
+/// to sRGB at open): same 4021 tiles, different texels. Before 0.264.0 the
+/// real file opened to [`NYEPI_FINGERPRINT_0_188_0`]. Re-recorded in 0.265.1
+/// after checking that the profile-less copy still matches the old value
+/// and that this value is the same on 1 and 7 threads and with the overlap
+/// off.
+const NYEPI_FINGERPRINT_COLOUR_MANAGED: (u64, usize) = (11_645_406_218_592_391_587, 4021);
+
+/// The file at `path` with its colour profile resource (1039) renamed to an
+/// unused id, written beside the test's scratch store: it opens through the
+/// pre-0.264.0 pipeline (layers taken as sRGB, nothing converted). The same
+/// rewrite as `AURORA_AUDIT_STRIP_PROFILE`'s in the fidelity audit.
+fn nyepi_without_its_profile(path: &std::path::Path, into: &std::path::Path) -> std::path::PathBuf {
+    let mut bytes = ok(std::fs::read(path));
+    let be32 = |b: &[u8], at: usize| -> Option<usize> {
+        let s = b.get(at..at + 4)?;
+        usize::try_from(u32::from_be_bytes([*s.first()?, *s.get(1)?, *s.get(2)?, *s.get(3)?])).ok()
+    };
+    let mut renamed = 0;
+    if let Some(mode_len) = be32(&bytes, 26) {
+        let section = 30 + mode_len;
+        if let (Some(len), mut at) = (be32(&bytes, section), section + 4) {
+            let end = (at + len).min(bytes.len());
+            while at + 12 <= end {
+                let (Some(hi), Some(lo)) = (bytes.get(at + 4).copied(), bytes.get(at + 5).copied())
+                else {
+                    break;
+                };
+                let name = usize::from(bytes.get(at + 6).copied().unwrap_or(0)) + 1;
+                let name = name + name % 2;
+                let Some(size) = be32(&bytes, at + 6 + name) else {
+                    break;
+                };
+                if u16::from_be_bytes([hi, lo]) == 1039
+                    && let Some(slot) = bytes.get_mut(at + 4..at + 6)
+                {
+                    slot.copy_from_slice(&0x7FFF_u16.to_be_bytes());
+                    renamed += 1;
+                }
+                at += 6 + name + 4 + size + size % 2;
+            }
+        }
+    }
+    assert_eq!(renamed, 1, "the template carries one colour profile resource");
+    let out = into.join("nyepi-without-profile.psd");
+    ok(std::fs::write(&out, bytes));
+    out
+}
 
 #[test]
 fn nyepi_tiles_are_the_0_188_0_tiles_on_any_thread_count() {
-    let Some(path) = nyepi_path() else {
-        println!("SKIPPED: the Nyepi template is not present");
+    let Some(path) = nyepi_or_skip() else {
         return;
     };
     let one = stream_fingerprint(&path, 1);
     assert_eq!(stream_fingerprint(&path, 7), one, "7 threads");
     assert_eq!(
-        one, NYEPI_FINGERPRINT_0_188_0,
-        "against the recorded 0.188.0 tiles"
+        one, NYEPI_FINGERPRINT_COLOUR_MANAGED,
+        "against the recorded colour-managed tiles"
+    );
+    // The explanation of the change from 0.188.0's value: take the profile
+    // away and the old tiles come back, on any thread count.
+    let scratch = ok(tempfile::tempdir());
+    let plain = nyepi_without_its_profile(&path, scratch.path());
+    let old = stream_fingerprint(&plain, 1);
+    assert_eq!(stream_fingerprint(&plain, 7), old, "7 threads, no profile");
+    assert_eq!(
+        old, NYEPI_FINGERPRINT_0_188_0,
+        "without its profile the template opens to the 0.188.0 tiles"
     );
 }
 
@@ -298,13 +379,12 @@ fn the_real_open_overlaps_only_on_a_large_machine_and_never_changes_a_tile() {
 /// the overlap off, as on a small machine.
 #[test]
 fn nyepi_tiles_are_the_0_188_0_tiles_with_the_overlap_off() {
-    let Some(path) = nyepi_path() else {
-        println!("SKIPPED: the Nyepi template is not present");
+    let Some(path) = nyepi_or_skip() else {
         return;
     };
     let (in_place, overlapped_layers) = overlap_fingerprint(&path, 7, false);
     assert_eq!(overlapped_layers, 0);
-    assert_eq!(in_place, NYEPI_FINGERPRINT_0_188_0);
+    assert_eq!(in_place, NYEPI_FINGERPRINT_COLOUR_MANAGED);
 }
 
 /// Populating the Layers panel for the Nyepi template's ~223 layers in 9
