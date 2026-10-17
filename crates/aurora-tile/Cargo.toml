@@ -39,7 +39,8 @@ similar_names = "allow"
 aurora-core = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-half = { workspace = true }
+half = { workspace = true, features = ["bytemuck"] }
+bytemuck = { workspace = true }
 lru = { workspace = true }
 lz4_flex = { workspace = true }
 serde = { workspace = true }

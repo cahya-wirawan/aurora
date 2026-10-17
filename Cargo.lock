@@ -672,6 +672,7 @@ name = "aurora-tile"
 version = "0.268.0"
 dependencies = [
  "aurora-core",
+ "bytemuck",
  "criterion",
  "half",
  "libc",

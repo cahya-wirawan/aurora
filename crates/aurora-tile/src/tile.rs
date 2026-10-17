@@ -83,10 +83,17 @@ pub struct Tile {
 
 impl Tile {
     /// A new, fully-transparent tile (all channels zero).
+    ///
+    /// Every sample is `+0.0` (bits `0`). Built from a zeroed `u16`
+    /// buffer (60 FPS round 4): `vec![f16::from_f32(0.0); SAMPLES]` filled
+    /// the 512 KiB one sample at a time, about 0.2 ms a tile in the dev
+    /// test profile, on every composite tile a pan brings into view; a
+    /// zeroed integer buffer is one zeroed allocation, with the same bits.
     #[must_use]
     pub fn blank() -> Self {
+        use half::vec::HalfBitsVecExt as _;
         Self {
-            texels: std::sync::Arc::new(vec![f16::from_f32(0.0); SAMPLES]),
+            texels: std::sync::Arc::new(vec![0u16; SAMPLES].reinterpret_into()),
             dirty: None,
         }
     }
@@ -214,6 +221,19 @@ mod tests {
         assert_eq!(tile.texels().len(), SAMPLES);
         assert!(tile.texels().iter().all(|s| s.to_f32() == 0.0));
         assert!(tile.take_dirty().is_none());
+    }
+
+    #[test]
+    fn blank_tile_is_every_sample_positive_zero_bits() {
+        let tile = Tile::blank();
+        assert_eq!(tile.texels().len(), SAMPLES);
+        assert!(tile.texels().iter().all(|s| s.to_bits() == 0));
+        assert!(
+            tile.texels()
+                .iter()
+                .all(|s| s.to_bits() == half::f16::from_f32(0.0).to_bits()),
+            "the same bits as the per-sample fill it replaced"
+        );
     }
 
     #[test]
