@@ -17614,20 +17614,21 @@ fn fold_stroke_plane(
             continue;
         }
         let index = first_texel + n;
-        let x = doc_origin.0 as f64 + (index % side) as f64;
-        let y = doc_origin.1 as f64 + (index / side) as f64;
+        let px = doc_origin.0 as f64 + (index % side) as f64;
+        let py = doc_origin.1 as f64 + (index / side) as f64;
         let (rgb, paint_alpha) = match &shown.ink {
             StrokeInk::Solid(rgb) => (rgb.map(half::f16::to_f32), 1.0),
             StrokeInk::Gradient { gradient, frame } => {
-                gradient.at(frame.position(x + 0.5, y + 0.5))
+                gradient.at(frame.position(px + 0.5, py + 0.5))
             }
             StrokeInk::Pattern {
                 pattern,
                 scale,
                 origin,
             } => {
-                let [r, g, b, a] = pattern.sample((x - origin.0) / scale, (y - origin.1) / scale);
-                ([r, g, b], a)
+                let [pr, pg, pb, pa] =
+                    pattern.sample((px - origin.0) / scale, (py - origin.1) / scale);
+                ([pr, pg, pb], pa)
             }
         };
         source.extend([

@@ -295,7 +295,10 @@ fn a_stroke_without_its_paint_or_pattern_draws_nothing() {
         // A mismatched paint is refused by validation; the others are kept.
         let _ = layers.set_effects(id, Some(fx));
         let acc = square_composite(&layers, &mut store);
-        assert_eq!(texel(&acc, 140, 120), texel(&plain, 140, 120));
+        assert_eq!(
+            texel(&acc, 140, 120).map(f32::to_bits),
+            texel(&plain, 140, 120).map(f32::to_bits)
+        );
         near(texel(&acc, 140, 120), [0.0; 4]);
     }
 }
@@ -454,5 +457,8 @@ fn a_vertical_gradient_stroke_follows_the_texels_row() {
         near(texel(&acc, x, y), gradient_texel(&g, x, y));
     }
     // And the colour really does change from the top edge to the bottom one.
-    assert_ne!(texel(&acc, 120, 100), texel(&acc, 120, 139));
+    assert_ne!(
+        texel(&acc, 120, 100).map(f32::to_bits),
+        texel(&acc, 120, 139).map(f32::to_bits)
+    );
 }

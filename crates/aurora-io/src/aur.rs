@@ -8426,22 +8426,23 @@ mod tests {
         pattern: Option<aurora_core::effects::StrokePaint>,
     ) -> aurora_core::LayerEffects {
         use aurora_core::effects::{Stroke, StrokeFill};
-        let mut fx = aurora_core::LayerEffects::default();
-        fx.strokes = vec![
-            Stroke::default(),
-            Stroke {
-                fill: StrokeFill::Gradient,
-                paint: gradient,
-                size: 4.0,
-                ..Stroke::default()
-            },
-            Stroke {
-                fill: StrokeFill::Pattern,
-                paint: pattern,
-                ..Stroke::default()
-            },
-        ];
-        fx
+        aurora_core::LayerEffects {
+            strokes: vec![
+                Stroke::default(),
+                Stroke {
+                    fill: StrokeFill::Gradient,
+                    paint: gradient,
+                    size: 4.0,
+                    ..Stroke::default()
+                },
+                Stroke {
+                    fill: StrokeFill::Pattern,
+                    paint: pattern,
+                    ..Stroke::default()
+                },
+            ],
+            ..aurora_core::LayerEffects::default()
+        }
     }
 
     /// Layer "p" with a solid, a gradient and a pattern stroke, "q" with a
@@ -8458,10 +8459,8 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         let (p, q) = (add("p"), add("q"));
-        if with_paints {
-            if let Err(err) = layers.add_pattern(test_pattern("pa", 5, 3, 1)) {
-                unreachable!("{err:?}");
-            }
+        if with_paints && let Err(err) = layers.add_pattern(test_pattern("pa", 5, 3, 1)) {
+            unreachable!("{err:?}");
         }
         let fx = if with_paints {
             painted_strokes(
@@ -8471,8 +8470,10 @@ mod tests {
         } else {
             painted_strokes(None, None)
         };
-        let mut solid = aurora_core::LayerEffects::default();
-        solid.strokes = vec![aurora_core::effects::Stroke::default()];
+        let solid = aurora_core::LayerEffects {
+            strokes: vec![aurora_core::effects::Stroke::default()],
+            ..aurora_core::LayerEffects::default()
+        };
         for (id, fx) in [(p, fx), (q, solid)] {
             if let Err(err) = history.set_effects(&mut layers, id, Some(fx)) {
                 unreachable!("{err:?}");
@@ -8585,7 +8586,7 @@ mod tests {
             document
                 .layers
                 .effects(p)
-                .map(|f| f.shown_unrendered_strokes()),
+                .map(aurora_core::LayerEffects::shown_unrendered_strokes),
             Some(2)
         );
     }

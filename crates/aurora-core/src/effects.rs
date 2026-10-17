@@ -1154,14 +1154,20 @@ mod tests {
         assert_eq!(fx.shown_unrendered_strokes(), 2);
         // Giving the gradient stroke its paint draws it; the pattern one
         // is still not.
-        fx.strokes[1].paint = Some(stroke_gradient());
+        if let Some(s) = fx.strokes.get_mut(1) {
+            s.paint = Some(stroke_gradient());
+        }
         assert_eq!(fx.shown_drawn_strokes(), 2);
         assert_eq!(fx.shown_unrendered_strokes(), 1);
-        fx.strokes[2].paint = Some(stroke_pattern());
+        if let Some(s) = fx.strokes.get_mut(2) {
+            s.paint = Some(stroke_pattern());
+        }
         assert_eq!(fx.shown_drawn_strokes(), 3);
         assert_eq!(fx.shown_unrendered_strokes(), 0);
         // A hidden stroke is neither.
-        fx.strokes[1].gate.present = false;
+        if let Some(s) = fx.strokes.get_mut(1) {
+            s.gate.present = false;
+        }
         assert_eq!(fx.shown_drawn_strokes(), 2);
     }
 
