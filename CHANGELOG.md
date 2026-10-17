@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.266.1] - 2026-10-17
+
+### Fixed
+
+- Colour tests: compare ICC bytes outside lcms2's time stamps
+
 ## [0.266.0] - 2026-10-17
 
 ### Changed
