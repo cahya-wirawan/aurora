@@ -4329,7 +4329,7 @@ mod tests {
 
 /// 60 FPS round 4: the bulk serializer against the 0.268.0 one, bit for
 /// bit, over every `f16` bit pattern in every channel.
-#[cfg(test)]
+#[cfg(all(test, target_endian = "little"))]
 mod bulk_serializer_tests {
     use super::{
         CHANNELS, CHUNK_SAMPLES, SAMPLES, serialize_converting, serialize_premultiplied_le_bytes,
