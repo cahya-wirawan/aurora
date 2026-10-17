@@ -436,7 +436,7 @@ impl<W> WidgetTree<W> {
         self.paint_clip(id).apply(bounds)
     }
 
-    /// Everything [`Self::visible_rect`] reads besides the rect it is
+    /// Everything `visible_rect` reads besides the rect it is
     /// given (60 FPS round 3): whether `id` sits in a popover whose owner
     /// is clipped away, and the intersection of its clipping ancestors'
     /// edges per axis (the window's too, inside a popover). Two calls that
@@ -1626,7 +1626,7 @@ pub struct PaintClip {
 }
 
 impl PaintClip {
-    /// `bounds` clipped: exactly what [`WidgetTree::visible_rect`] returns.
+    /// `bounds` clipped: exactly what `WidgetTree::visible_rect` returns.
     /// `bounds` is returned untouched when nothing clips it at all: a
     /// widget whose bounds are still the default zero rect must keep
     /// painting the degenerate shape it always did, rather than being
