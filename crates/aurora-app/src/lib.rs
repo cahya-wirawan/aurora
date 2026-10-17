@@ -900,7 +900,7 @@ fn open_image(path: &Path) -> Result<aurora_io::Image, OpenFailure> {
     open_image_with_colour(path).map(|(image, _)| image)
 }
 
-/// [`open_image`], also returning what the open did about colour: the
+/// `open_image`, also returning what the open did about colour: the
 /// pixels are converted into the sRGB working space when the file carries
 /// a valid RGB profile of another space ([`aurora_io::decode_to_working`]).
 fn open_image_with_colour(
@@ -2116,7 +2116,7 @@ fn write_autosave_with_colour(
 }
 
 /// The most texel bytes an autosave snapshot may copy before
-/// [`request_autosave`] falls back to [`write_autosave`]'s streaming
+/// `request_autosave` falls back to [`write_autosave`]'s streaming
 /// write on the UI thread (0.152.0). A snapshot is a second in-memory
 /// copy of the document's tiles, so it must stay bounded (§7.3.1); 2 GiB
 /// is four times the 4096x4096 four-layer document the 0.151.0 install
@@ -32152,7 +32152,7 @@ impl App {
     ///
     /// Opens `path` as a real document — a real, multi-layer `.aur` file
     /// ([`Self::open_aur_file`]) if the extension names one, otherwise a
-    /// flat image ([`open_image`]) as a fresh, single-layer document sized
+    /// flat image (`open_image`) as a fresh, single-layer document sized
     /// to it in the new session ([`replace_document`] rebuilds the panels),
     /// writing the image's own pixels into the live tile store
     /// (`aurora_io::write_into_store`) so the canvas actually shows it.
