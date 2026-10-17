@@ -329,6 +329,124 @@ fn texels_from_le_bytes(raw: &[u8]) -> Vec<f16> {
 
 #[cfg(test)]
 mod tests {
+    /// The 0.268.0 encoder, verbatim but for its name: the per-sample raw
+    /// byte loop, then the same lz4 and header. The reference every tile
+    /// file written before 60 FPS round 4 came from.
+    fn encode_0268(texels: &[half::f16]) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(texels.len() * 2);
+        for texel in texels {
+            raw.extend_from_slice(&texel.to_le_bytes());
+        }
+        let compressed = lz4_flex::compress_prepend_size(&raw);
+        let (flag, payload): (u8, Vec<u8>) = if compressed.len() < raw.len() {
+            (1, compressed)
+        } else {
+            (0, raw)
+        };
+        let mut out = Vec::with_capacity(super::HEADER_LEN + payload.len());
+        out.extend_from_slice(&super::MAGIC);
+        out.push(super::VERSION);
+        out.push(flag);
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    /// The 0.268.0 decoder's sample loop over a raw payload.
+    fn samples_0268(raw: &[u8]) -> Vec<u16> {
+        raw.chunks_exact(2)
+            .map(|p| match p {
+                [lo, hi] => half::f16::from_le_bytes([*lo, *hi]).to_bits(),
+                _ => unreachable!("chunks_exact(2)"),
+            })
+            .collect()
+    }
+
+    /// Tiles covering every `f16` bit pattern (each four times, in four
+    /// arrangements: NaN payloads, -0, subnormals, infinities included),
+    /// blank and constant tiles, and seeded random tiles both compressible
+    /// and not.
+    fn round4_tiles() -> Vec<(String, Vec<half::f16>)> {
+        let n = crate::SAMPLES;
+        let from = |f: &dyn Fn(usize) -> u16| -> Vec<half::f16> {
+            (0..n).map(|i| half::f16::from_bits(f(i))).collect()
+        };
+        let mut state = 0x9e37_79b9u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let random: Vec<u16> = (0..n).map(|_| next() as u16).collect();
+        let lumpy: Vec<u16> = (0..n)
+            .map(|i| if i % 64 < 8 { next() as u16 } else { 0x3c00 })
+            .collect();
+        vec![
+            ("every pattern".into(), from(&|i| i as u16)),
+            (
+                "every pattern x7".into(),
+                from(&|i| (i as u16).wrapping_mul(7)),
+            ),
+            (
+                "every pattern reversed".into(),
+                from(&|i| u16::MAX - i as u16),
+            ),
+            (
+                "every pattern high byte first".into(),
+                from(&|i| (i as u16).rotate_left(8)),
+            ),
+            ("blank".into(), crate::Tile::blank().texels().to_vec()),
+            ("negative zero".into(), from(&|_| 0x8000)),
+            ("signalling NaN".into(), from(&|_| 0x7c01)),
+            (
+                "random".into(),
+                from(&|i| random.get(i).copied().unwrap_or(0)),
+            ),
+            (
+                "lumpy".into(),
+                from(&|i| lumpy.get(i).copied().unwrap_or(0)),
+            ),
+        ]
+    }
+
+    /// 60 FPS round 4: what reaches the scratch disk, spill files, the
+    /// autosave and `.aur` files is byte for byte what 0.268.0 wrote, old
+    /// files decode to the same bits, and every tile round-trips.
+    #[test]
+    fn encoded_bytes_are_identical_to_the_0268_encoder_and_old_files_decode_the_same() {
+        let mut scratch = super::EncodeScratch::default();
+        for (what, texels) in round4_tiles() {
+            let old = encode_0268(&texels);
+            assert_eq!(super::encode(&texels), old, "{what}: encode");
+            assert_eq!(
+                super::encode_with(&texels, &mut scratch),
+                old,
+                "{what}: encode_with"
+            );
+            let bits: Vec<u16> = texels.iter().map(|t| t.to_bits()).collect();
+            let decoded = match super::decode(&old) {
+                Ok(d) => d,
+                Err(err) => unreachable!("{what}: an old file decodes: {err}"),
+            };
+            let decoded: Vec<u16> = decoded.iter().map(|t| t.to_bits()).collect();
+            assert_eq!(decoded, bits, "{what}: old bytes decode to the same bits");
+            // The old decoder's loop over the raw payload agrees too.
+            let raw = match old.get(5) {
+                Some(1) => old
+                    .get(super::HEADER_LEN..)
+                    .and_then(|p| lz4_flex::decompress_size_prepended(p).ok())
+                    .unwrap_or_default(),
+                _ => old.get(super::HEADER_LEN..).unwrap_or_default().to_vec(),
+            };
+            assert_eq!(
+                samples_0268(&raw),
+                bits,
+                "{what}: the 0.268.0 loop reads the payload"
+            );
+        }
+    }
+
     /// 60 FPS round 4: the bulk byte conversions against the per-sample
     /// loops they replaced, over every `f16` bit pattern, at aligned and
     /// unaligned starts.
