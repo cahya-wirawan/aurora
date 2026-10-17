@@ -90,7 +90,12 @@ fn strip_unverified(doc: &mut aurora_io::PsdDocument) {
     }
 }
 
+/// Files allowed to change by a bounded amount in the save round trip, each
+/// with its reason. Empty: none are.
+const COMPOSITE_ALLOWLIST: [(&str, f64); 0] = [];
+
 #[test]
+#[allow(clippy::too_many_lines)]
 fn corpus_files_with_effects_survive_a_psd_save_and_reopen() {
     let keep = std::env::var_os("AURORA_PSD_FIXTURE_DIR").map(std::path::PathBuf::from);
     let mut paths: Vec<std::path::PathBuf> = FILES
@@ -185,7 +190,6 @@ fn corpus_files_with_effects_survive_a_psd_save_and_reopen() {
         // is not the saved record rectangle, which the default no longer
         // writes. The allowlist of files allowed to differ is empty; add a
         // file here only with a written reason.
-        const COMPOSITE_ALLOWLIST: [(&str, f64); 0] = [];
         let bound = COMPOSITE_ALLOWLIST
             .iter()
             .find(|(n, _)| *n == name)
