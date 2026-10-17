@@ -9,7 +9,7 @@ exclude = ["spike"]
 # See CLAUDE.md's "Versioning" section: SemVer, minor bumped per PLAN.md
 # step, patch bumped per bug fix. A release is a `vX.Y.Z` tag matching
 # this exact value, pushed once the bump is committed.
-version = "0.264.0"
+version = "0.265.0"
 # Not published: `aurora-core` and `aurora` are taken on crates.io by unrelated
 # projects (PRD §12 Q2b), and nothing needs publishing to build or ship the
 # application. This also lets cargo-deny's allow-wildcard-paths exempt the
@@ -57,6 +57,7 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 toml = "0.9"
 half = "2"
+bytemuck = "1"
 # ADR 0008: statically linked via lcms2-sys's vendored build (no dynamic-link
 # packaging burden, unlike ADR 0007's RAW decision) -- see spike/raw-icc.
 lcms2 = "6.1.1"

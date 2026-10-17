@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.265.0] - 2026-10-17
+
+### Changed
+
+- Faster GPU-path frames and the stale-canvas fix: docs and version
+
 ## [0.264.0] - 2026-10-17
 
 ### Changed
