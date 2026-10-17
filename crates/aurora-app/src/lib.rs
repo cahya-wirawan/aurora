@@ -23785,6 +23785,41 @@ impl RecompositeTileCosts {
     fn finish(&mut self) {}
 }
 
+/// 60 FPS round 5: builds the canvas pipeline for the window's surface
+/// format and the compositor's `Normal` pipelines at startup, instead of
+/// inside the first frame that needs them (measured there at 10-17 ms
+/// with a cold driver pipeline cache). Blend-mode pipelines stay lazy:
+/// all 18 cost about 138 ms with a cold driver cache (6 ms warm). Every
+/// `wgpu` error is captured and logged, so a failed prewarm never aborts
+/// startup; the first frame then builds the pipeline exactly as before.
+fn prewarm_gpu_pipelines(
+    device: &wgpu::Device,
+    canvas_pipeline: &mut aurora_gpu::CanvasPipeline,
+    compositor: &mut aurora_render::TileCompositor,
+    surface_format: wgpu::TextureFormat,
+) {
+    if let Err(err) = aurora_render::capture_wgpu_errors(device, || {
+        let _ = canvas_pipeline.pipeline(device, surface_format);
+    }) {
+        tracing::warn!(
+            %err,
+            "prewarming the canvas pipeline failed; it will be built on first use"
+        );
+    }
+    let started = std::time::Instant::now();
+    match compositor.prewarm(device, false) {
+        Ok(built) => tracing::info!(
+            built,
+            ms = started.elapsed().as_secs_f64() * 1000.0,
+            "composite pipelines prewarmed"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "prewarming the composite pipelines failed; they will be built on first use"
+        ),
+    }
+}
+
 /// GPU-accelerated compositing for one visible composite tile, for the
 /// tractable case [`document_qualifies_for_gpu_compositing`] confirms for
 /// the whole document: every visible top-level layer is an
@@ -37588,34 +37623,16 @@ impl ApplicationHandler<AppEvent> for App {
                 canvas_size,
             ));
             self.residency_viewport = Some(canvas_size);
-            // 60 FPS round 5: the canvas pipeline for this surface and the
-            // compositor's `Normal` pipelines are built here, at startup,
-            // instead of inside the first frame that needs them (10-17 ms
-            // measured there). Blend-mode pipelines stay lazy: all 18 cost
-            // about 136 ms (dev profile), too much to add to startup.
+            // 60 FPS round 5: see `prewarm_gpu_pipelines`.
             let mut canvas_pipeline = aurora_gpu::CanvasPipeline::new(gpu.device());
-            if let Err(err) = aurora_render::capture_wgpu_errors(gpu.device(), || {
-                let _ = canvas_pipeline.pipeline(gpu.device(), surface.format());
-            }) {
-                tracing::warn!(
-                    %err,
-                    "prewarming the canvas pipeline failed; it will be built on first use"
-                );
-            }
-            self.canvas_pipeline = Some(canvas_pipeline);
             let mut compositor = aurora_render::TileCompositor::new(gpu.device());
-            let prewarm_started = std::time::Instant::now();
-            match compositor.prewarm(gpu.device(), false) {
-                Ok(built) => tracing::info!(
-                    built,
-                    ms = prewarm_started.elapsed().as_secs_f64() * 1000.0,
-                    "composite pipelines prewarmed"
-                ),
-                Err(err) => tracing::warn!(
-                    %err,
-                    "prewarming the composite pipelines failed; they will be built on first use"
-                ),
-            }
+            prewarm_gpu_pipelines(
+                gpu.device(),
+                &mut canvas_pipeline,
+                &mut compositor,
+                surface.format(),
+            );
+            self.canvas_pipeline = Some(canvas_pipeline);
             self.compositor = Some(compositor);
         } else {
             tracing::warn!(
