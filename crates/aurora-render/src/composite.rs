@@ -1748,6 +1748,11 @@ fn fold_chunks_in_mode(
 /// the excluded cases (a `-0.0` backdrop channel, a NaN source colour) are
 /// pinned as really changing the result by
 /// `the_skip_predicate_excludes_cases_where_the_fold_is_not_the_identity`.
+// `always` (60 FPS round 7): with the blend term inlined, each mode's
+// `fold_chunks` copy grew and this check stopped being inlined into it,
+// which made a transparent source chunk about a quarter slower.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn chunk_folds_to_backdrop(dst: &[f16], src: &[f16]) -> bool {
     const ONE: u16 = 0x3C00;
     const INF: u16 = 0x7C00;
@@ -31054,6 +31059,27 @@ mod fold_timing {
                 composite_layer_into(&mut out, &canvas, 1.0, mode);
                 std::hint::black_box(&out);
             });
+        }
+        // A transparent source (most of an empty layer's tiles): every
+        // chunk takes the transparent-chunk skip.
+        let empty = transparent_tile();
+        for mode in [BlendMode::Normal, BlendMode::Exclusion] {
+            time(
+                &format!("{mode:?}, transparent source, onto opaque"),
+                &mut || {
+                    let mut out = backdrop.clone();
+                    composite_layer_into(&mut out, &empty, 1.0, mode);
+                    std::hint::black_box(&out);
+                },
+            );
+            time(
+                &format!("{mode:?}, transparent source, onto transparent"),
+                &mut || {
+                    let mut out = transparent_tile();
+                    composite_layer_into(&mut out, &empty, 1.0, mode);
+                    std::hint::black_box(&out);
+                },
+            );
         }
         time("straighten an opaque tile", &mut || {
             let mut out = backdrop.clone();
