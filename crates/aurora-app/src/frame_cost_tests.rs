@@ -444,8 +444,11 @@ pub(crate) fn cached_widget_frame(
     Some(move || {
         frame += 1;
         if let Some(&b) = buttons.get(frame % buttons.len().max(1)) {
-            let _ =
-                aurora_widgets::widgets::set_button_hovered(&mut workspace.tree, b, frame % 2 == 0);
+            let _ = aurora_widgets::widgets::set_button_hovered(
+                &mut workspace.tree,
+                b,
+                frame.is_multiple_of(2),
+            );
         }
         engine.begin_frame();
         aurora_widgets::update_field_scrolls(
