@@ -32,6 +32,7 @@
 //! `LayerTree`/`History` shape `.aur` does; writing PSD/PSB remains open.
 
 pub mod aur;
+mod aur_colour;
 mod aur_paths;
 mod aur_selection;
 #[cfg(test)]
@@ -53,8 +54,11 @@ pub use aur::{
     snapshot_best_effort as snapshot_aur_best_effort, write as write_aur,
     write_best_effort as write_aur_best_effort,
     write_best_effort_with_import_losses as write_aur_best_effort_with_import_losses,
+    write_best_effort_with_import_losses_and_colour as write_aur_best_effort_with_import_losses_and_colour,
     write_snapshot as write_aur_snapshot, write_with_import_losses as write_aur_with_import_losses,
+    write_with_import_losses_and_colour as write_aur_with_import_losses_and_colour,
 };
+pub use aur_colour::DocumentColour;
 pub use colour_import::{
     ColourImport, ColourReport, SourceProfile, Tagging, bring_into_working, convert_rgba,
     decode_to_working,
