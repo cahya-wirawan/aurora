@@ -22,7 +22,7 @@ use aurora_core::effects::{
     ColorOverlay, DropShadow, EffectBlendMode, EffectColor, EffectGate, GradientOverlay,
     MAX_EFFECT_DISTANCE, MAX_EFFECT_INSTANCES, MAX_EFFECT_SCALE, MAX_EFFECT_SIZE,
     MAX_PATTERN_SCALE, MIN_PATTERN_SCALE, OtherEffects, OuterGlow, PatternOverlay, Stroke,
-    StrokeFill, StrokePosition,
+    StrokeFill, StrokePaint, StrokePosition,
 };
 
 use super::descriptor::{self, Descriptor, ItemBudget, Value};
@@ -50,6 +50,53 @@ pub(super) struct ReadEffects {
     /// with the layer, or a phase offset (no Photoshop picture to derive
     /// either from); counted in `other.pattern_overlays` (task 111).
     pub pattern_unplaced: u32,
+}
+
+/// The pattern id, scale and placement test shared by pattern strokes
+/// (task 118): `Some` only for a pattern that is named and linked with the
+/// layer with no phase offset; the origin is filled in later.
+fn stroke_pattern(e: &Descriptor, ctx: &mut Ctx) -> Result<Option<StrokePaint>, Unreadable> {
+    let scale = ctx.num(
+        e,
+        b"Scl ",
+        100.0,
+        0.01,
+        MIN_PATTERN_SCALE,
+        MAX_PATTERN_SCALE,
+    )?;
+    let id = e
+        .get(b"Ptrn")
+        .and_then(super::descriptor::Value::descriptor)
+        .and_then(|p| p.get(b"Idnt"))
+        .and_then(super::descriptor::Value::text)
+        .map(|t| {
+            t.trim_matches(|c: char| c == '\0' || c.is_whitespace())
+                .to_owned()
+        })
+        .filter(|t| !t.is_empty() && t.len() <= aurora_core::pattern::MAX_PATTERN_ID_BYTES);
+    let linked = flag(e, b"Algn", true)?;
+    let mut phase_zero = true;
+    if let Some(phase) = e
+        .get(b"phase")
+        .and_then(super::descriptor::Value::descriptor)
+    {
+        for key in [&b"Hrzn"[..], &b"Vrtc"[..]] {
+            if let Some(v) = phase.get(key) {
+                let v = v.number().ok_or(Unreadable)?;
+                if !v.is_finite() || v.abs() > 1e-6 {
+                    phase_zero = false;
+                }
+            }
+        }
+    }
+    Ok(match id {
+        Some(pattern) if linked && phase_zero => Some(StrokePaint::Pattern {
+            pattern,
+            scale,
+            origin: (0.0, 0.0),
+        }),
+        _ => None,
+    })
 }
 
 /// Why a layer's effects were not read.
@@ -301,6 +348,23 @@ pub(super) fn map_effects(d: &Descriptor, global_angle: f32) -> Result<ReadEffec
             Some(Ok(b"Ptrn")) => StrokeFill::Pattern,
             Some(_) => return Err(Unreadable),
         };
+        // Task 118: a gradient or pattern stroke is painted when its paint
+        // reads; otherwise it stays an undrawn stroke, reported as before.
+        // A pattern's pixels and origin are resolved by the caller
+        // (`resolve_patterns`), which drops the paint it cannot place.
+        let paint = match fill {
+            StrokeFill::Color => None,
+            StrokeFill::Gradient => match super::fill::gradient(e) {
+                Ok(gradient) if gradient.align && gradient.validate().is_ok() => {
+                    Some(StrokePaint::Gradient {
+                        gradient,
+                        reference: None,
+                    })
+                }
+                _ => None,
+            },
+            StrokeFill::Pattern => stroke_pattern(e, &mut ctx)?,
+        };
         fx.strokes.push(Stroke {
             gate: gate(e)?,
             position,
@@ -310,6 +374,7 @@ pub(super) fn map_effects(d: &Descriptor, global_angle: f32) -> Result<ReadEffec
             size: ctx.size(e, b"Sz  ", 3.0)?,
             // A gradient or pattern stroke has no `Clr `.
             color: ctx.color(e)?,
+            paint,
         });
     }
     let mut glow_gradients = 0u32;

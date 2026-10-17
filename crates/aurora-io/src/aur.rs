@@ -663,6 +663,111 @@ fn read_layer_patterns<R: Read + Seek>(
     Ok(())
 }
 
+/// The optional entry carrying the paints of every layer's gradient and
+/// pattern strokes (task 118; `aurora_core::effects::Stroke::paint` is
+/// `#[serde(skip)]` because [`LAYER_EFFECTS_ENTRY`]'s payload is
+/// positional). Written only when some stroke has a paint, so every other
+/// save stays byte-identical (and an Aurora that predates it reads such a
+/// file with those strokes reported as undrawn, except that its journal
+/// holds the appended `SetStrokePaints` op, which it refuses).
+/// **Versioned, and a newer version refuses the file** like
+/// [`LAYER_EFFECTS_ENTRY`]. Each pair names a layer that
+/// [`LAYER_EFFECTS_ENTRY`] already gave effects, with one `Option` per
+/// stroke of those effects, in order; a paint must match its stroke's
+/// `fill`, and a pattern paint must name a pattern the pool
+/// ([`LAYER_PATTERNS_ENTRY`], read first) holds. Any violation, or damage,
+/// refuses the open loudly.
+const LAYER_STROKE_PAINTS_ENTRY: &str = "layer-stroke-paints";
+
+/// [`LAYER_STROKE_PAINTS_ENTRY`]'s own schema version.
+const LAYER_STROKE_PAINTS_VERSION: u32 = 1;
+
+/// One layer's stroke paints, one per stroke in order.
+type StrokePaintList = Vec<Option<aurora_core::effects::StrokePaint>>;
+
+/// [`LAYER_STROKE_PAINTS_ENTRY`]'s payload: version first (frozen), then
+/// one `(raw layer id, paints)` pair per layer with some.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LayerStrokePaintsWire {
+    version: u32,
+    paints: Vec<(u64, StrokePaintList)>,
+}
+
+fn layer_stroke_paint_pairs(layers: &LayerTree) -> Vec<(u64, StrokePaintList)> {
+    layer_ids(layers)
+        .into_iter()
+        .filter_map(|id| {
+            let strokes = &layers.effects(id)?.strokes;
+            strokes.iter().any(|s| s.paint.is_some()).then(|| {
+                (
+                    id.to_raw(),
+                    strokes.iter().map(|s| s.paint.clone()).collect(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Reads [`LAYER_STROKE_PAINTS_ENTRY`] if present and applies it.
+///
+/// # Errors
+///
+/// [`IoError::ManifestDeserialization`] for an unknown version, bytes that
+/// do not decode, a pair naming a layer without effects or with another
+/// number of strokes, a paint that does not match its stroke, a pattern
+/// the pool lacks, or paints that fail validation.
+fn read_layer_stroke_paints<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    layers: &mut LayerTree,
+) -> Result<(), IoError> {
+    let bytes = match zip.by_name(LAYER_STROKE_PAINTS_ENTRY) {
+        Ok(file) => read_capped(file, LAYER_STROKE_PAINTS_ENTRY, MAX_LAYER_EFFECTS_BYTES)?,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let (prefix, _rest) = postcard::take_from_bytes::<MaskDensityPrefix>(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    if prefix.version != LAYER_STROKE_PAINTS_VERSION {
+        let cause = if prefix.version > LAYER_STROKE_PAINTS_VERSION {
+            "the file was saved by a newer Aurora"
+        } else {
+            "the entry is damaged or of an unknown kind"
+        };
+        return Err(IoError::ManifestDeserialization(format!(
+            "unsupported layer-stroke-paints version {} (this build understands version \
+             {LAYER_STROKE_PAINTS_VERSION}); {cause}",
+            prefix.version
+        )));
+    }
+    let wire: LayerStrokePaintsWire = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    let bad = |what: &str| IoError::ManifestDeserialization(format!("stroke paints: {what}"));
+    for (raw, paints) in wire.paints {
+        let id = aurora_doc::LayerId::from_raw(raw);
+        let mut effects = layers
+            .effects(id)
+            .cloned()
+            .ok_or_else(|| bad("paints on a layer without effects"))?;
+        if effects.strokes.len() != paints.len() {
+            return Err(bad("the paints do not match the layer's strokes"));
+        }
+        for (stroke, paint) in effects.strokes.iter_mut().zip(paints) {
+            if let Some(aurora_core::effects::StrokePaint::Pattern { pattern, .. }) = &paint
+                && !layers.patterns().contains_key(pattern)
+            {
+                return Err(bad(&format!(
+                    "a stroke names the pattern {pattern:?}, which the file does not hold"
+                )));
+            }
+            stroke.paint = paint;
+        }
+        layers
+            .set_effects(id, Some(effects))
+            .map_err(|err| bad(&err.to_string()))?;
+    }
+    Ok(())
+}
+
 /// The optional entry carrying which layers are clipped to the layer
 /// beneath them (0.201.0): `LayerEntry::clipped` is `#[serde(skip)]` in the
 /// positional manifest, like the effects. Written only when some layer is
@@ -2062,6 +2167,9 @@ struct DocumentEntries {
     /// [`LAYER_PATTERNS_ENTRY`] and the pool's pixels, when the document
     /// has a pattern or a pattern overlay (task 111).
     layer_patterns: Option<PatternEntries>,
+    /// [`LAYER_STROKE_PAINTS_ENTRY`], when some stroke has a paint
+    /// (task 118).
+    layer_stroke_paints: Option<Vec<u8>>,
     /// [`LAYER_CLIPPING_ENTRY`], when some layer is clipped (0.201.0).
     layer_clipping: Option<Vec<u8>>,
     /// [`IMPORT_LOSSES_ENTRY`], when the document has any (0.177.0).
@@ -2135,6 +2243,19 @@ impl DocumentEntries {
                     .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
             )
         };
+        let paints = layer_stroke_paint_pairs(layers);
+        let layer_stroke_paints = if paints.is_empty() {
+            None
+        } else {
+            let wire = LayerStrokePaintsWire {
+                version: LAYER_STROKE_PAINTS_VERSION,
+                paints,
+            };
+            Some(
+                postcard::to_allocvec(&wire)
+                    .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
+            )
+        };
         let clipped = layer_clipping_ids(layers);
         let layer_clipping = if clipped.is_empty() {
             None
@@ -2155,6 +2276,7 @@ impl DocumentEntries {
             layer_effects,
             layer_gradient_overlays,
             layer_patterns: pattern_entries(layers)?,
+            layer_stroke_paints,
             layer_clipping,
             import_losses: None,
             selection: None,
@@ -2198,6 +2320,10 @@ impl DocumentEntries {
                     zip.write_all(&bytes)?;
                 }
             }
+        }
+        if let Some(bytes) = &self.layer_stroke_paints {
+            zip.start_file(LAYER_STROKE_PAINTS_ENTRY, deflated)?;
+            zip.write_all(bytes)?;
         }
         if let Some(bytes) = &self.layer_clipping {
             zip.start_file(LAYER_CLIPPING_ENTRY, deflated)?;
@@ -2647,6 +2773,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     read_layer_effects(&mut zip, &mut layers)?;
     read_layer_gradient_overlays(&mut zip, &mut layers)?;
     read_layer_patterns(&mut zip, &mut layers)?;
+    read_layer_stroke_paints(&mut zip, &mut layers)?;
     read_layer_clipping(&mut zip, &mut layers)?;
     read_smart_objects(&mut zip, &mut layers)?;
 
@@ -8270,6 +8397,329 @@ mod tests {
         };
         assert!(matches!(take(bytes - 1, &mut store), Ok(None)));
         assert!(matches!(take(bytes + (1 << 20), &mut store), Ok(Some(_))));
+    }
+
+    // ---- task 118: stroke paints ----
+
+    fn stroke_paint_gradient(angle: f64) -> aurora_core::effects::StrokePaint {
+        aurora_core::effects::StrokePaint::Gradient {
+            gradient: gradient_overlay_fixture(angle).gradient,
+            reference: Some(aurora_core::effects::ReferenceBox {
+                dx: 1,
+                dy: -2,
+                width: 20,
+                height: 30,
+            }),
+        }
+    }
+
+    fn stroke_paint_pattern(id: &str) -> aurora_core::effects::StrokePaint {
+        aurora_core::effects::StrokePaint::Pattern {
+            pattern: id.to_owned(),
+            scale: 1.5,
+            origin: (2.5, -1.0),
+        }
+    }
+
+    fn painted_strokes(
+        gradient: Option<aurora_core::effects::StrokePaint>,
+        pattern: Option<aurora_core::effects::StrokePaint>,
+    ) -> aurora_core::LayerEffects {
+        use aurora_core::effects::{Stroke, StrokeFill};
+        let mut fx = aurora_core::LayerEffects::default();
+        fx.strokes = vec![
+            Stroke::default(),
+            Stroke {
+                fill: StrokeFill::Gradient,
+                paint: gradient,
+                size: 4.0,
+                ..Stroke::default()
+            },
+            Stroke {
+                fill: StrokeFill::Pattern,
+                paint: pattern,
+                ..Stroke::default()
+            },
+        ];
+        fx
+    }
+
+    /// Layer "p" with a solid, a gradient and a pattern stroke, "q" with a
+    /// solid stroke only; one pattern in the pool.
+    fn stroke_paint_document(
+        store: &mut TileStore,
+        with_paints: bool,
+    ) -> (Vec<u8>, aurora_doc::LayerId, aurora_doc::LayerId, History) {
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let mut add = |name: &str| match history.add_pixel_layer(&mut layers, name, bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let (p, q) = (add("p"), add("q"));
+        if with_paints {
+            if let Err(err) = layers.add_pattern(test_pattern("pa", 5, 3, 1)) {
+                unreachable!("{err:?}");
+            }
+        }
+        let fx = if with_paints {
+            painted_strokes(
+                Some(stroke_paint_gradient(33.0)),
+                Some(stroke_paint_pattern("pa")),
+            )
+        } else {
+            painted_strokes(None, None)
+        };
+        let mut solid = aurora_core::LayerEffects::default();
+        solid.strokes = vec![aurora_core::effects::Stroke::default()];
+        for (id, fx) in [(p, fx), (q, solid)] {
+            if let Err(err) = history.set_effects(&mut layers, id, Some(fx)) {
+                unreachable!("{err:?}");
+            }
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        (bytes.into_inner(), p, q, history)
+    }
+
+    fn stroke_paints_of(
+        tree: &LayerTree,
+        id: aurora_doc::LayerId,
+    ) -> Option<Vec<Option<aurora_core::effects::StrokePaint>>> {
+        tree.effects(id)
+            .map(|f| f.strokes.iter().map(|s| s.paint.clone()).collect())
+    }
+
+    #[test]
+    fn stroke_paints_survive_aur_round_trip_and_journal_replay() {
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, p, q, _) = stroke_paint_document(&mut store, true);
+        assert!(
+            effects_entry_names(&bytes)
+                .iter()
+                .any(|n| n == super::LAYER_STROKE_PAINTS_ENTRY)
+        );
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let want = Some(vec![
+            None,
+            Some(stroke_paint_gradient(33.0)),
+            Some(stroke_paint_pattern("pa")),
+        ]);
+        assert_eq!(stroke_paints_of(&document.layers, p), want);
+        assert_eq!(stroke_paints_of(&document.layers, q), Some(vec![None]));
+        // The wire fields rode the unchanged entry.
+        assert_eq!(
+            document.layers.effects(p).map(|f| f
+                .strokes
+                .iter()
+                .map(|s| s.fill)
+                .collect::<Vec<_>>()),
+            Some(vec![
+                aurora_core::effects::StrokeFill::Color,
+                aurora_core::effects::StrokeFill::Gradient,
+                aurora_core::effects::StrokeFill::Pattern,
+            ])
+        );
+        let replayed = match document.history.replay() {
+            Ok(tree) => tree,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(stroke_paints_of(&replayed, p), want, "replay");
+        assert_eq!(stroke_paints_of(&replayed, q), Some(vec![None]), "replay");
+    }
+
+    #[test]
+    fn no_stroke_paint_means_no_entry_and_a_missing_entry_opens_undrawn() {
+        let (_dir, mut store) = real_tile_store();
+        let (plain, ..) = stroke_paint_document(&mut store, false);
+        assert!(
+            effects_entry_names(&plain)
+                .iter()
+                .all(|n| n != super::LAYER_STROKE_PAINTS_ENTRY)
+        );
+        let (_dir1, mut store1) = real_tile_store();
+        let (with, p, ..) = stroke_paint_document(&mut store1, true);
+        // The effects wire is the version-1 one, byte for byte.
+        let Some(bytes) = entry_bytes(&with, super::LAYER_EFFECTS_ENTRY) else {
+            unreachable!("layer-effects entry");
+        };
+        let wire: super::LayerEffectsWire = match postcard::from_bytes(&bytes) {
+            Ok(w) => w,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(wire.version, 1);
+        assert!(
+            wire.effects
+                .iter()
+                .all(|(_, fx)| fx.strokes.iter().all(|s| s.paint.is_none()))
+        );
+        assert_eq!(postcard::to_allocvec(&wire).unwrap_or_default(), bytes);
+        // Without the entry the file opens, its gradient and pattern
+        // strokes kept but undrawn (what an older Aurora sees).
+        let stripped = with_named_entry(&with, super::LAYER_STROKE_PAINTS_ENTRY, None);
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(stripped), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            stroke_paints_of(&document.layers, p),
+            Some(vec![None, None, None])
+        );
+        assert_eq!(
+            document
+                .layers
+                .effects(p)
+                .map(|f| f.shown_unrendered_strokes()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_bad_stroke_paint_entry_refuses_loudly() {
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, p, q, _) = stroke_paint_document(&mut store, true);
+        let encode =
+            |wire: &super::LayerStrokePaintsWire| postcard::to_allocvec(wire).unwrap_or_default();
+        let wire = |paints| super::LayerStrokePaintsWire {
+            version: super::LAYER_STROKE_PAINTS_VERSION,
+            paints,
+        };
+        let mut invalid = stroke_paint_pattern("pa");
+        if let aurora_core::effects::StrokePaint::Pattern { scale, .. } = &mut invalid {
+            *scale = 99.0;
+        }
+        for (payload, needle) in [
+            (
+                encode(&super::LayerStrokePaintsWire {
+                    version: super::LAYER_STROKE_PAINTS_VERSION + 1,
+                    paints: Vec::new(),
+                }),
+                "saved by a newer Aurora",
+            ),
+            (
+                encode(&super::LayerStrokePaintsWire {
+                    version: 0,
+                    paints: Vec::new(),
+                }),
+                "the entry is damaged",
+            ),
+            (encode(&wire(vec![(9_999, vec![None])])), "without effects"),
+            (
+                encode(&wire(vec![(p.to_raw(), vec![None, None])])),
+                "do not match",
+            ),
+            (
+                // A pattern paint on the gradient stroke.
+                encode(&wire(vec![(
+                    p.to_raw(),
+                    vec![None, Some(stroke_paint_pattern("pa")), None],
+                )])),
+                "stroke paint",
+            ),
+            (
+                // A paint on a solid stroke.
+                encode(&wire(vec![(
+                    q.to_raw(),
+                    vec![Some(stroke_paint_gradient(1.0))],
+                )])),
+                "stroke paint",
+            ),
+            (
+                // A pattern the pool lacks.
+                encode(&wire(vec![(
+                    p.to_raw(),
+                    vec![None, None, Some(stroke_paint_pattern("missing"))],
+                )])),
+                "does not hold",
+            ),
+            (
+                encode(&wire(vec![(p.to_raw(), vec![None, None, Some(invalid)])])),
+                "pattern scale",
+            ),
+            (vec![1, 0xFF, 0xFF], ""),
+        ] {
+            let tampered =
+                with_named_entry(&bytes, super::LAYER_STROKE_PAINTS_ENTRY, Some(&payload));
+            let (_dir2, mut fresh) = real_tile_store();
+            match read(Cursor::new(tampered), &mut fresh) {
+                Err(crate::error::IoError::ManifestDeserialization(message)) => {
+                    assert!(message.contains(needle), "{needle}: {message}");
+                }
+                other => unreachable!("expected a refusal, got {:?}", other.map(|_| ())),
+            }
+        }
+    }
+
+    #[test]
+    fn stroke_paints_ride_the_autosave_snapshot() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let p = match history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.add_pattern(test_pattern("pa", 5, 3, 1)) {
+            unreachable!("{err:?}");
+        }
+        let fx = painted_strokes(
+            Some(stroke_paint_gradient(10.0)),
+            Some(stroke_paint_pattern("pa")),
+        );
+        if let Err(err) = history.set_effects(&mut layers, p, Some(fx)) {
+            unreachable!("{err:?}");
+        }
+        let snapshot = match super::snapshot_best_effort(
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            1 << 30,
+            &mut store,
+        ) {
+            Ok(Some(snapshot)) => snapshot,
+            other => unreachable!("snapshot: {:?}", other.map(|s| s.is_some())),
+        };
+        let mut out = Cursor::new(Vec::new());
+        if let Err(err) = super::write_snapshot(&mut out, &snapshot) {
+            unreachable!("{err:?}");
+        }
+        let bytes = out.into_inner();
+        assert!(
+            effects_entry_names(&bytes)
+                .iter()
+                .any(|n| n == super::LAYER_STROKE_PAINTS_ENTRY)
+        );
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            stroke_paints_of(&document.layers, p),
+            Some(vec![
+                None,
+                Some(stroke_paint_gradient(10.0)),
+                Some(stroke_paint_pattern("pa")),
+            ])
+        );
     }
 }
 
