@@ -284,8 +284,13 @@ struct Losses {
     rounded_opacity: usize,
     rounded_density: usize,
     dissolve: usize,
-    /// Layers carrying effects (0.180.0): no `lfx2` is written yet.
-    effects: usize,
+    /// What the effects the file holds differ in (task 120).
+    fx: super::write_effects::EffectLosses,
+    /// The global light angle was fractional and is written whole.
+    fx_angle_rounded: bool,
+    /// Layers whose gradient effects were laid over a box other than the
+    /// rectangle the layer is saved with.
+    fx_gradient_box: usize,
     /// Adjustment layers with values rounded to the file's resolution
     /// (0.205.0): Curves, Levels, Hue/Saturation; and since 0.241.0 Vibrance,
     /// Exposure, Photo Filter, Black & White, Color Balance (slots 3..=7).
@@ -611,10 +616,23 @@ impl Losses {
                 )
             ));
         }
-        if self.effects > 0 {
+        items.extend(self.fx.items());
+        if self.fx_angle_rounded {
+            items.push(
+                "The global light angle is saved as a whole number of degrees.".to_owned(),
+            );
+        }
+        if self.fx_gradient_box > 0 {
             items.push(format!(
-                "{} effects aren't saved to .psd yet (they are kept in .aur).",
-                plural(self.effects as u64, "layer's", "layers'")
+                "{} gradient effects were laid over a box other than the area the layer is \
+                 saved with; Photoshop will align them to the saved area.",
+                plural(self.fx_gradient_box as u64, "layer's", "layers'")
+            ));
+        }
+        if self.fx.layers > 0 {
+            items.push(format!(
+                "{} effects are saved in the file, but Aurora hasn't checked them in Photoshop.",
+                plural(self.fx.layers as u64, "layer's", "layers'")
             ));
         }
         items.extend(self.smart_object_items());
@@ -812,9 +830,22 @@ pub struct PsdExpectedAdjustment {
     pub readback: aurora_doc::Adjustment,
 }
 
+/// A record's layer effects as [`verify_psd_file`] expects to read them
+/// back (task 120): the `lfx2` block as written and the `fxrp` reference
+/// point written with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PsdExpectedEffects {
+    pub lfx2: Vec<u8>,
+    pub fxrp: Option<[u8; 16]>,
+    /// The IDs of the patterns the block names.
+    pub patterns: Vec<String>,
+}
+
 /// One layer record as [`verify_psd_file`] expects to read it back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PsdExpectedLayer {
+    /// The record's layer effects, when it has any written (task 120).
+    pub effects: Option<PsdExpectedEffects>,
     /// The record's adjustment block, for an adjustment layer (0.205.0).
     pub adjustment: Option<PsdExpectedAdjustment>,
     /// The record's smart-object data, when it is written back as one
@@ -855,6 +886,12 @@ pub struct PsdExpectation {
     /// The embedded files written after `Lr16` (0.200.0), list by list in
     /// `lnk2`, `lnkD`, `lnk3`, `lnkE` order, each list's in file order.
     pub linked: Vec<PsdExpectedLinked>,
+    /// The global light angle written as image resource 1037, if any
+    /// (task 120).
+    pub global_angle: Option<i32>,
+    /// The length and hash of the `Patt` block written before the linked
+    /// lists, if any (task 120).
+    pub patterns: Option<(u64, u64)>,
 }
 
 /// [`write_psd`]'s result.
@@ -924,7 +961,10 @@ fn preflight_losses(
     }
     let mut losses = Losses::default();
     let mut census = Census::default();
-    census_of(layers, roots, 0, &mut census, &mut losses);
+    let (angle, rounded) = effects_angle(layers);
+    losses.fx_angle_rounded = rounded;
+    let ctx = effects_ctx(layers, angle);
+    census_of(layers, roots, 0, &mut census, &mut losses, &ctx);
     if let Some(depth) = census.too_deep {
         return Err(PsdSaveRefusal::GroupsTooDeep {
             depth,
@@ -955,6 +995,7 @@ fn census_of(
     depth: usize,
     census: &mut Census,
     losses: &mut Losses,
+    ctx: &super::write_effects::Ctx<'_>,
 ) {
     for &id in ids {
         census.records = census.records.saturating_add(1);
@@ -977,8 +1018,10 @@ fn census_of(
         if layers.blend_mode(id) == Some(BlendMode::Dissolve) {
             losses.dissolve += 1;
         }
-        if layers.effects(id).is_some() {
-            losses.effects += 1;
+        if let Some(fx) = layers.effects(id)
+            && let Some(encoded) = super::write_effects::encode(fx, layers.bounds(id), ctx)
+        {
+            losses.fx.add(encoded.losses);
         }
         match layers.kind(id) {
             Some(LayerKind::Group { children }) => {
@@ -987,7 +1030,7 @@ fn census_of(
                 if level > MAX_GROUP_DEPTH {
                     census.too_deep = Some(census.too_deep.map_or(level, |d| d.max(level)));
                 } else {
-                    census_of(layers, children, level, census, losses);
+                    census_of(layers, children, level, census, losses, ctx);
                 }
             }
             Some(LayerKind::Adjustment(adjustment)) => {
@@ -1135,9 +1178,22 @@ fn quantize(value: f32, losses: &mut Losses) -> u16 {
 /// into a serialised profile's header, and a file's verify (or a test
 /// comparing two writes) must see the bytes the write used.
 pub(crate) fn icc_resource() -> Result<Vec<u8>, IoError> {
+    resources_for(None)
+}
+
+/// The image resources: the global light angle (1037, task 120) when
+/// layer effects follow one, then the ICC profile.
+pub(crate) fn resources_for(global_angle: Option<i32>) -> Result<Vec<u8>, IoError> {
     let profile = aurora_color::IccProfile::srgb_bytes()?;
     let size = u32::try_from(profile.len()).map_err(|_| too_large("ICC profile"))?;
-    let mut out = Vec::with_capacity(profile.len() + 13);
+    let mut out = Vec::with_capacity(profile.len() + 13 + 16);
+    if let Some(angle) = global_angle {
+        out.extend_from_slice(b"8BIM");
+        out.extend_from_slice(&1037u16.to_be_bytes());
+        out.extend_from_slice(&[0, 0]); // empty Pascal name, padded to even
+        out.extend_from_slice(&4u32.to_be_bytes());
+        out.extend_from_slice(&angle.to_be_bytes());
+    }
     out.extend_from_slice(b"8BIM");
     out.extend_from_slice(&1039u16.to_be_bytes());
     out.extend_from_slice(&[0, 0]); // empty Pascal name, padded to even
@@ -1233,13 +1289,14 @@ fn plan_layers(
     layers: &LayerTree,
     store: &mut TileStore,
     losses: &mut Losses,
+    ctx: &super::write_effects::Ctx<'_>,
 ) -> Result<Vec<LayerPlan>, IoError> {
     let mut plans = Vec::new();
     for (id, kind) in file_order(layers)? {
         plans.push(match kind {
-            PsdRecordKind::Layer => plan_layer(layers, store, id, losses)?,
+            PsdRecordKind::Layer => plan_layer(layers, store, id, losses, ctx)?,
             PsdRecordKind::GroupEnd => plan_group_end(),
-            PsdRecordKind::Group => plan_group(layers, id)?,
+            PsdRecordKind::Group => plan_group(layers, id, ctx)?,
         });
     }
     Ok(plans)
@@ -1251,6 +1308,7 @@ fn plan_props(
     id: LayerId,
     kind: PsdRecordKind,
     rect: [i32; 4],
+    ctx: &super::write_effects::Ctx<'_>,
 ) -> Result<LayerPlan, IoError> {
     let name = layers.name(id).unwrap_or_default();
     let luni = written_name(name);
@@ -1262,6 +1320,14 @@ fn plan_props(
         mask,
         pascal: pascal_name(&written),
         expected: PsdExpectedLayer {
+            effects: layers
+                .effects(id)
+                .and_then(|fx| super::write_effects::encode(fx, layers.bounds(id), ctx))
+                .map(|e| PsdExpectedEffects {
+                    lfx2: e.lfx2,
+                    fxrp: e.fxrp,
+                    patterns: e.patterns,
+                }),
             adjustment: None,
             smart: None,
             kind,
@@ -1291,6 +1357,7 @@ fn plan_group_end() -> LayerPlan {
         mask: None,
         pascal: pascal_name(PSD_GROUP_END_NAME),
         expected: PsdExpectedLayer {
+            effects: None,
             adjustment: None,
             smart: None,
             kind: PsdRecordKind::GroupEnd,
@@ -1311,8 +1378,12 @@ fn plan_group_end() -> LayerPlan {
 }
 
 /// A group's folder record: its own properties and mask, no pixels.
-fn plan_group(layers: &LayerTree, id: LayerId) -> Result<LayerPlan, IoError> {
-    plan_props(layers, id, PsdRecordKind::Group, [0; 4])
+fn plan_group(
+    layers: &LayerTree,
+    id: LayerId,
+    ctx: &super::write_effects::Ctx<'_>,
+) -> Result<LayerPlan, IoError> {
+    plan_props(layers, id, PsdRecordKind::Group, [0; 4], ctx)
 }
 
 /// `id`'s user mask: the rectangle (its document-space `bounds`), the
@@ -1415,6 +1486,7 @@ fn plan_adjustment(
     layers: &LayerTree,
     id: LayerId,
     adjustment: &aurora_doc::Adjustment,
+    ctx: &super::write_effects::Ctx<'_>,
 ) -> Result<LayerPlan, IoError> {
     let encoded = super::write_adjust::encode_adjustment(adjustment).map_err(|reason| {
         refused(PsdSaveRefusal::AdjustmentNotRepresentable {
@@ -1423,7 +1495,7 @@ fn plan_adjustment(
             reason,
         })
     })?;
-    let mut plan = plan_props(layers, id, PsdRecordKind::Layer, [0; 4])?;
+    let mut plan = plan_props(layers, id, PsdRecordKind::Layer, [0; 4], ctx)?;
     plan.expected.adjustment = Some(PsdExpectedAdjustment {
         key: encoded.key,
         data: encoded.data,
@@ -1438,10 +1510,13 @@ fn plan_layer(
     store: &mut TileStore,
     id: LayerId,
     losses: &mut Losses,
+    ctx: &super::write_effects::Ctx<'_>,
 ) -> Result<LayerPlan, IoError> {
     let bounds = match layers.kind(id) {
         Some(LayerKind::Pixel { bounds }) => bounds,
-        Some(LayerKind::Adjustment(adjustment)) => return plan_adjustment(layers, id, adjustment),
+        Some(LayerKind::Adjustment(adjustment)) => {
+            return plan_adjustment(layers, id, adjustment, ctx);
+        }
         _ => {
             return Err(IoError::PsdMalformed {
                 what: "a record that is neither a pixel nor an adjustment layer",
@@ -1471,11 +1546,68 @@ fn plan_layer(
     let right = left
         .checked_add(i32::try_from(ew).map_err(|_| too_large("layer width"))?)
         .ok_or_else(|| too_large("layer width"))?;
-    let mut plan = plan_props(layers, id, PsdRecordKind::Layer, [top, left, bottom, right])?;
+    let mut plan = plan_props(
+        layers,
+        id,
+        PsdRecordKind::Layer,
+        [top, left, bottom, right],
+        ctx,
+    )?;
+    losses.fx_gradient_box += usize::from(gradient_box_differs(
+        layers,
+        id,
+        *bounds,
+        [top, left, bottom, right],
+    ));
     plan.surface = Some(surface);
     plan.extent = extent;
     plan.expected.smart = smart_for(layers, store, id, (surface, bounds, extent), losses)?;
     Ok(plan)
+}
+
+/// Whether a gradient effect of `id` was laid over a box other than the
+/// rectangle the layer is written with.
+fn gradient_box_differs(layers: &LayerTree, id: LayerId, bounds: Rect, rect: [i32; 4]) -> bool {
+    let Some(fx) = layers.effects(id) else {
+        return false;
+    };
+    let [top, left, bottom, right] = rect;
+    let written = Rect {
+        x: i64::from(left),
+        y: i64::from(top),
+        width: u32::try_from(i64::from(right) - i64::from(left)).unwrap_or(0),
+        height: u32::try_from(i64::from(bottom) - i64::from(top)).unwrap_or(0),
+    };
+    let boxes = fx
+        .gradient_overlays
+        .iter()
+        .map(|o| o.reference)
+        .chain(fx.strokes.iter().filter_map(|s| match &s.paint {
+            Some(aurora_core::effects::StrokePaint::Gradient { reference, .. }) => Some(*reference),
+            _ => None,
+        }));
+    boxes
+        .into_iter()
+        .any(|r| r.map_or(bounds, |r| r.within(bounds)) != written)
+}
+
+/// The global light angle for the file (whole degrees) and whether it
+/// had to be rounded (task 120).
+fn effects_angle(layers: &LayerTree) -> (Option<i32>, bool) {
+    match file_order(layers) {
+        Ok(order) => super::write_effects::global_angle_of(
+            order.iter().filter_map(|(id, _)| layers.effects(*id)),
+        ),
+        Err(_) => (None, false),
+    }
+}
+
+fn effects_ctx(layers: &LayerTree, angle: Option<i32>) -> super::write_effects::Ctx<'_> {
+    #[allow(clippy::cast_precision_loss)] // within ±360
+    super::write_effects::Ctx {
+        global_angle: angle.map_or(aurora_core::effects::DEFAULT_GLOBAL_ANGLE, |a| a as f32),
+        patterns: layers.patterns(),
+    }
 }
 
 /// A record's extra data: the mask data (20 bytes, or empty), empty
@@ -1541,6 +1673,21 @@ fn record_extra(plan: &LayerPlan) -> Result<Vec<u8>, IoError> {
     extra.extend_from_slice(b"iOpa");
     extra.extend_from_slice(&4u32.to_be_bytes());
     extra.extend_from_slice(&[plan.expected.fill, 0, 0, 0]);
+    if let Some(effects) = &plan.expected.effects {
+        extra.extend_from_slice(b"8BIM");
+        extra.extend_from_slice(b"lfx2");
+        let len = u32::try_from(effects.lfx2.len()).map_err(|_| too_large("effects"))?;
+        extra.extend_from_slice(&len.to_be_bytes());
+        extra.extend_from_slice(&effects.lfx2);
+        if let Some(point) = &effects.fxrp
+            && plan.expected.smart.is_none()
+        {
+            extra.extend_from_slice(b"8BIM");
+            extra.extend_from_slice(b"fxrp");
+            extra.extend_from_slice(&16u32.to_be_bytes());
+            extra.extend_from_slice(point);
+        }
+    }
     if let Some(smart) = &plan.expected.smart {
         for block in &smart.blocks {
             extra.extend_from_slice(b"8BIM");
@@ -1882,7 +2029,11 @@ impl Default for WriteLimits {
 }
 
 /// The file header, empty colour-mode data and the image resources.
-fn write_header<W: Write>(w: &mut W, (width, height): (u32, u32)) -> Result<(), IoError> {
+fn write_header<W: Write>(
+    w: &mut W,
+    (width, height): (u32, u32),
+    global_angle: Option<i32>,
+) -> Result<(), IoError> {
     // Header: 4 channels (RGB + merged transparency), 16-bit, RGB.
     w.write_all(b"8BPS")?;
     w.write_all(&1u16.to_be_bytes())?;
@@ -1893,7 +2044,7 @@ fn write_header<W: Write>(w: &mut W, (width, height): (u32, u32)) -> Result<(), 
     w.write_all(&16u16.to_be_bytes())?;
     w.write_all(&3u16.to_be_bytes())?;
     w.write_all(&0u32.to_be_bytes())?; // colour mode data
-    let resources = icc_resource()?;
+    let resources = resources_for(global_angle)?;
     let resources_len = u32::try_from(resources.len()).map_err(|_| too_large("resources"))?;
     w.write_all(&resources_len.to_be_bytes())?;
     w.write_all(&resources)?;
@@ -1920,7 +2071,26 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
             composite: composite.size(),
         }));
     }
-    let mut plans = plan_layers(layers, store, &mut losses)?;
+    let (angle, _) = effects_angle(layers);
+    let ctx = effects_ctx(layers, angle);
+    let mut plans = plan_layers(layers, store, &mut losses, &ctx)?;
+    let pattern_ids: std::collections::BTreeSet<&String> = plans
+        .iter()
+        .filter_map(|p| p.expected.effects.as_ref())
+        .flat_map(|e| e.patterns.iter())
+        .collect();
+    let pool: Vec<&aurora_core::pattern::Pattern> = pattern_ids
+        .iter()
+        .filter_map(|id| layers.patterns().get(id.as_str()))
+        .collect();
+    let pattern_block = if pool.is_empty() {
+        None
+    } else {
+        Some(
+            super::write_effects::pattern_block(&pool)
+                .map_err(|_| too_large("pattern block"))?,
+        )
+    };
     let linked = linked_to_write(layers, &plans);
     let linked_bytes: u64 = linked
         .iter()
@@ -1947,7 +2117,7 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
     let (width, height) = canvas;
     let limit = pos(w)?.saturating_add(max_bytes);
 
-    write_header(w, canvas)?;
+    write_header(w, canvas, angle)?;
 
     let section_at = pos(w)?;
     w.write_all(&0u32.to_be_bytes())?; // section length, filled in below
@@ -1975,6 +2145,20 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
     if pad != 0 {
         w.write_all(&vec![0u8; usize::try_from(4 - pad).unwrap_or(0)])?;
     }
+    let patterns_expected = match &pattern_block {
+        Some(block) => {
+            let len = u32::try_from(block.len()).map_err(|_| too_large("pattern block"))?;
+            w.write_all(b"8BIM")?;
+            w.write_all(b"Patt")?;
+            w.write_all(&len.to_be_bytes())?;
+            w.write_all(block)?;
+            check_size(w, limit)?;
+            let mut hash = ByteHash::new();
+            hash.update(block);
+            Some((block.len() as u64, hash.0))
+        }
+        None => None,
+    };
     let linked_expected = write_linked_blocks(w, &linked, limit)?;
     let section_end = pos(w)?;
     patch(
@@ -1994,6 +2178,8 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
             layers: plans.into_iter().map(|p| p.expected).collect(),
             merged_hash,
             linked: linked_expected,
+            global_angle: angle,
+            patterns: patterns_expected,
         },
     })
 }
@@ -2290,7 +2476,7 @@ fn raw_header<R: std::io::Read + Seek>(
     let color = raw.u32()?;
     raw.skip(u64::from(color))?;
     let resources = raw.u32()?;
-    let want = icc_resource()?;
+    let want = resources_for(expected.global_angle)?;
     check("image resources length", resources as usize, want.len())?;
     let got = raw.bytes(want.len())?;
     if got != want {
@@ -2386,6 +2572,7 @@ fn raw_record<R: std::io::Read + Seek>(
     let mut protected = None;
     let mut smart_blocks: Vec<aurora_doc::SmartObjectBlock> = Vec::new();
     let mut adjustment_blocks: Vec<([u8; 4], Vec<u8>)> = Vec::new();
+    let (mut lfx2, mut fxrp) = (None, None);
     while raw.pos()? < extra_end {
         check("tagged block signature", raw.array::<4>()?, *b"8BIM")?;
         let key = raw.array::<4>()?;
@@ -2401,6 +2588,8 @@ fn raw_record<R: std::io::Read + Seek>(
                     .map(u32::from_be_bytes);
             }
             b"lsct" => section = Some(data),
+            b"lfx2" => lfx2 = Some(data),
+            b"fxrp" if want.smart.is_none() => fxrp = <[u8; 16]>::try_from(data.as_slice()).ok(),
             k if super::write_adjust::is_adjustment_key(*k) => adjustment_blocks.push((key, data)),
             k if aurora_doc::smart_object::SMART_OBJECT_BLOCK_KEYS.contains(k) => {
                 smart_blocks.push(aurora_doc::SmartObjectBlock { key, data });
@@ -2415,6 +2604,19 @@ fn raw_record<R: std::io::Read + Seek>(
             .iter()
             .flat_map(|a| std::iter::once((a.key, a.data.clone())).chain(a.extra.iter().cloned()))
             .collect::<Vec<_>>(),
+    )?;
+    check(
+        &format!("layer {i} effects block"),
+        lfx2,
+        want.effects.as_ref().map(|e| e.lfx2.clone()),
+    )?;
+    check(
+        &format!("layer {i} effects reference point"),
+        fxrp,
+        want.smart
+            .is_none()
+            .then(|| want.effects.as_ref().and_then(|e| e.fxrp))
+            .flatten(),
     )?;
     check(
         &format!("layer {i} smart object blocks"),
@@ -2490,7 +2692,12 @@ fn verify_raw<R: std::io::Read + Seek>(inner: R, expected: &PsdExpectation) -> R
     let lr16_end = lr16_start + u64::from(lr16_len);
     check("Lr16 length", raw.pos()?, lr16_end)?;
     raw.skip((4 - u64::from(lr16_len) % 4) % 4)?;
-    raw_linked(&mut raw, section_start + section, &expected.linked)?;
+    raw_linked(
+        &mut raw,
+        section_start + section,
+        &expected.linked,
+        expected.patterns,
+    )?;
     raw.inner.seek(SeekFrom::Start(section_start + section))?;
     raw_merged(&mut raw, expected)
 }
@@ -2502,13 +2709,31 @@ fn raw_linked<R: std::io::Read + Seek>(
     raw: &mut Raw<R>,
     section_end: u64,
     want: &[PsdExpectedLinked],
+    want_patterns: Option<(u64, u64)>,
 ) -> Result<(), IoError> {
     const CHUNK: u64 = 1 << 20;
     let mut got = Vec::new();
+    let mut got_patterns = None;
     while raw.pos()? + 12 <= section_end {
         check("global block signature", raw.array::<4>()?, *b"8BIM")?;
         let key = raw.array::<4>()?;
         let len = u64::from(raw.u32()?);
+        if key == *b"Patt" {
+            // The pattern pool (task 120), hashed in chunks.
+            let mut hash = ByteHash::new();
+            let mut left = len;
+            if raw.pos()? + len > section_end {
+                return Err(mismatch("the pattern block runs past its section"));
+            }
+            while left > 0 {
+                let n = left.min(CHUNK);
+                let bytes = raw.bytes(usize::try_from(n).map_err(|_| mismatch("a length"))?)?;
+                hash.update(&bytes);
+                left -= n;
+            }
+            got_patterns = Some((len, hash.0));
+            continue;
+        }
         if !aurora_doc::smart_object::LINKED_LIST_KEYS.contains(&key) {
             return Err(mismatch("an unexpected global block after Lr16"));
         }
@@ -2550,6 +2775,7 @@ fn raw_linked<R: std::io::Read + Seek>(
             });
         }
     }
+    check("pattern block", got_patterns, want_patterns)?;
     check("linked-layer entries", got, want.to_vec())
 }
 

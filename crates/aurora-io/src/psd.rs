@@ -162,6 +162,9 @@ pub mod write;
 mod write_adjust;
 #[cfg(test)]
 mod write_adjust_tests;
+mod write_effects;
+#[cfg(test)]
+mod write_effects_tests;
 #[cfg(test)]
 mod write_tests;
 
