@@ -37,6 +37,7 @@ mod aur_selection;
 #[cfg(test)]
 mod aur_zip_compat_tests;
 mod channels;
+mod colour_import;
 mod error;
 mod image;
 pub mod import;
@@ -53,6 +54,10 @@ pub use aur::{
     write_best_effort as write_aur_best_effort,
     write_best_effort_with_import_losses as write_aur_best_effort_with_import_losses,
     write_snapshot as write_aur_snapshot, write_with_import_losses as write_aur_with_import_losses,
+};
+pub use colour_import::{
+    ColourImport, ColourReport, SourceProfile, Tagging, bring_into_working, convert_rgba,
+    decode_to_working,
 };
 pub use error::{IoError, psd_color_mode_name};
 pub use image::Image;

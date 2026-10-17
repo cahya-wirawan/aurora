@@ -40,7 +40,7 @@
 //!   quality control (an export dialog with a slider) to drive
 //!   [`encode_with_quality`] with anything else yet.
 
-use aurora_color::{IccProfile, dither_quantize, promote_u8};
+use aurora_color::{dither_quantize, promote_u8};
 use half::f16;
 use jpeg_encoder::{ColorType, Encoder};
 use zune_jpeg::JpegDecoder;
@@ -68,6 +68,11 @@ const DEFAULT_QUALITY: u8 = 90;
 /// [`IoError::Color`] if an embedded ICC profile's own bytes fail to
 /// parse.
 pub fn decode(bytes: &[u8]) -> Result<Image, IoError> {
+    decode_parts(bytes)?.into_image()
+}
+
+/// [`decode`]'s body: pixels as stored plus the unjudged colour tag.
+pub(crate) fn decode_parts(bytes: &[u8]) -> Result<crate::colour_import::ImageParts, IoError> {
     let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
     let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), options);
     let pixels = decoder.decode()?;
@@ -87,9 +92,10 @@ pub fn decode(bytes: &[u8]) -> Result<Image, IoError> {
     // markers the source carried (or `None` for a genuinely untagged
     // one, or a corrupt/incomplete ICC marker sequence -- see its own
     // doc comment) -- this module doesn't need to know either detail.
-    let color_space = match decoder.icc_profile() {
-        Some(bytes) => IccProfile::from_bytes(&bytes)?,
-        None => IccProfile::srgb(),
+    let tag = crate::colour_import::SourceTag {
+        icc: decoder.icc_profile(),
+        srgb_chunk: false,
+        gray: decoder.input_colorspace() == Some(ColorSpace::Luma),
     };
 
     let samples: Vec<f16> = pixels
@@ -97,12 +103,12 @@ pub fn decode(bytes: &[u8]) -> Result<Image, IoError> {
         .map(|&sample| f16::from_f32(promote_u8(sample)))
         .collect();
 
-    Image::new(
-        u32::from(info.width),
-        u32::from(info.height),
-        color_space,
+    Ok(crate::colour_import::ImageParts {
+        width: u32::from(info.width),
+        height: u32::from(info.height),
         samples,
-    )
+        tag,
+    })
 }
 
 /// Encodes `image` as a JPEG at `DEFAULT_QUALITY` — see
