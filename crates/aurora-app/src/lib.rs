@@ -17943,12 +17943,18 @@ fn invalidate_painted_tiles(
     painted: &[aurora_tile::TileId],
     reference_origin: (i64, i64),
 ) {
-    for &tile in painted {
-        cache.invalidate(tile);
-    }
     let Some(bounds) = layers.bounds(layer) else {
+        for &tile in painted {
+            cache.invalidate(tile);
+        }
         return;
     };
+    let anchored = (bounds.x, bounds.y) == reference_origin;
+    if anchored {
+        for &tile in painted {
+            cache.invalidate(tile);
+        }
+    }
     let t = i64::from(aurora_tile::TILE);
     let rects: Vec<aurora_core::Rect> = painted
         .iter()
@@ -17960,7 +17966,14 @@ fn invalidate_painted_tiles(
         })
         .collect();
     let reach = effect_reach_rects(layers, layer, &rects);
-    if reach.len() > rects.len() {
+    // 0.265.0 (fix): the painted ids are composite ids only when the layer's
+    // origin IS the grid anchor. Since 0.193.0 the anchor is
+    // `min(origin, 0)` per axis, so a layer at a positive origin (most PSD
+    // layers, any layer moved into the document) painted the right pixels
+    // but left the composite tiles they land on marked current, and
+    // invalidated tile ids that cover other pixels instead. Such a layer's
+    // painted area goes through the document-space rectangles.
+    if !anchored || reach.len() > rects.len() {
         cache.invalidate_doc_rects(&reach, reference_origin);
     }
 }

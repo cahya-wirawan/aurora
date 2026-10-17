@@ -282,3 +282,64 @@ fn transparent_tile_seed_is_measured() {
         "transparent tile seed: n={runs} transparent_tile {s:.3}ms vs zeroed u16 alloc {z:.3}ms"
     );
 }
+
+/// A dab on a layer whose origin is inside the document (so the composite
+/// grid's anchor, `min(origin, 0)`, is not the layer origin) must make the
+/// composite tiles under the painted area stale, and only those. Before
+/// the 0.265.0 fix it invalidated composite tile (0, 0) (the painted
+/// layer-local id) and left (1, 0), (2, 0), (1, 1), (2, 1) current.
+#[test]
+fn a_dab_on_a_layer_inside_the_document_invalidates_the_tiles_it_lands_on() {
+    let mut layers = aurora_doc::LayerTree::new();
+    let bounds = aurora_core::Rect {
+        x: 300,
+        y: 150,
+        width: 512,
+        height: 512,
+    };
+    let id = ok(layers.add_pixel_layer("offset", bounds, None));
+    let reference = crate::composite_reference_origin(&layers, Some(id));
+    assert_eq!(reference, (0, 0));
+    let mut cache = crate::CompositeCache::default();
+    for x in 0..4 {
+        for y in 0..4 {
+            cache.mark_current(aurora_tile::TileId { x, y });
+        }
+    }
+    // Layer-local tile (0, 0) covers document (300..556, 150..406).
+    let local = aurora_tile::TileId { x: 0, y: 0 };
+    crate::invalidate_painted_tiles(&mut cache, &layers, id, &[local], reference);
+    let stale: Vec<(u32, u32)> = (0..4)
+        .flat_map(|x| (0..4).map(move |y| (x, y)))
+        .filter(|&(x, y)| !cache.is_current(aurora_tile::TileId { x, y }))
+        .collect();
+    assert_eq!(stale, vec![(1, 0), (1, 1), (2, 0), (2, 1)]);
+}
+
+/// A layer whose origin is the anchor keeps the exact id mapping.
+#[test]
+fn a_dab_on_a_layer_at_the_anchor_invalidates_exactly_its_painted_tile() {
+    let mut layers = aurora_doc::LayerTree::new();
+    let bounds = aurora_core::Rect {
+        x: -124,
+        y: -36,
+        width: 1024,
+        height: 1024,
+    };
+    let id = ok(layers.add_pixel_layer("anchor", bounds, None));
+    let reference = crate::composite_reference_origin(&layers, Some(id));
+    assert_eq!(reference, (-124, -36));
+    let mut cache = crate::CompositeCache::default();
+    for x in 0..4 {
+        for y in 0..4 {
+            cache.mark_current(aurora_tile::TileId { x, y });
+        }
+    }
+    let painted = aurora_tile::TileId { x: 2, y: 1 };
+    crate::invalidate_painted_tiles(&mut cache, &layers, id, &[painted], reference);
+    let stale: Vec<(u32, u32)> = (0..4)
+        .flat_map(|x| (0..4).map(move |y| (x, y)))
+        .filter(|&(x, y)| !cache.is_current(aurora_tile::TileId { x, y }))
+        .collect();
+    assert_eq!(stale, vec![(2, 1)]);
+}
