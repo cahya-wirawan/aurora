@@ -190,3 +190,36 @@ fn the_autosave_snapshot_carries_the_colour() {
     ok(write_snapshot(&mut out, &snapshot));
     assert_eq!(ok(open(&out.into_inner())).colour, colour);
 }
+
+#[test]
+fn a_bad_source_profile_does_not_drop_a_good_output_profile() {
+    let good = adobe();
+    let base = container(None);
+    let payload = ok(postcard::to_allocvec(&Wire {
+        version: COLOUR_VERSION,
+        source: Some(b"not a profile".to_vec()),
+        output: Some(good.bytes.clone()),
+    }));
+    let doc = ok(open(&with_entry(&base, &payload)));
+    assert_eq!(doc.colour.source, None);
+    assert_eq!(doc.colour.output, Some(good.clone()));
+    assert!(
+        doc.colour_dropped
+            .as_deref()
+            .is_some_and(|w| w.contains("source"))
+    );
+    // And the other way round.
+    let payload = ok(postcard::to_allocvec(&Wire {
+        version: COLOUR_VERSION,
+        source: Some(good.bytes.clone()),
+        output: Some(vec![1, 2, 3]),
+    }));
+    let doc = ok(open(&with_entry(&base, &payload)));
+    assert_eq!(doc.colour.source, Some(good));
+    assert_eq!(doc.colour.output, None);
+    assert!(
+        doc.colour_dropped
+            .as_deref()
+            .is_some_and(|w| w.contains("output"))
+    );
+}

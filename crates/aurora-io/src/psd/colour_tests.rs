@@ -82,7 +82,7 @@ fn an_adobe_like_profile_converts_the_layers_and_is_kept_as_metadata() {
     );
     let got = first_pixel(&document);
     for (g, w) in got.iter().zip(want) {
-        assert!((g - w).abs() < 3e-3, "{got:?} vs {want:?}");
+        assert!((g - w.clamp(0.0, 1.0)).abs() < 3e-3, "{got:?} vs {want:?}");
     }
     assert!((got[3] - 1.0).abs() < f32::EPSILON, "alpha untouched");
     assert_eq!(
@@ -97,10 +97,22 @@ fn an_adobe_like_profile_converts_the_layers_and_is_kept_as_metadata() {
             .iter()
             .any(|l| l.contains("Converted from"))
     );
-    assert!(
-        document.report.items.is_empty(),
+    // The conversion is an itemised line (kept in the document's import
+    // losses), and nothing else is reported.
+    assert_eq!(
+        document.report.items.len(),
+        1,
         "{:?}",
         document.report.items
+    );
+    assert!(
+        document
+            .report
+            .items
+            .iter()
+            .any(|l| l.contains("converted from")
+                && l.contains("clipped")
+                && l.contains("not kept"))
     );
 }
 
@@ -215,10 +227,72 @@ fn a_file_with_only_a_merged_image_is_converted_too() {
     );
     let got = first_pixel(&document);
     for (g, w) in got.iter().zip(want) {
-        assert!((g - w).abs() < 3e-3, "{got:?} vs {want:?}");
+        assert!((g - w.clamp(0.0, 1.0)).abs() < 3e-3, "{got:?} vs {want:?}");
     }
 }
 
 fn bits4(p: [f32; 4]) -> [u32; 4] {
     p.map(f32::to_bits)
+}
+
+#[test]
+fn out_of_gamut_psd_colour_is_clipped_into_zero_to_one() {
+    // Adobe RGB green is outside sRGB; the unclamped conversion has R < 0.
+    let Ok(bytes) = adobe_like().to_bytes() else {
+        unreachable!()
+    };
+    let file = TestPsd::new(1, 1, 1, 8)
+        .with(|p| {
+            p.resources = resource_1039(&bytes);
+            p.layers
+                .push(TestLayer::pixels("L", 0, 0, 1, 1, 8, &[[0, 255, 0, 255]]));
+        })
+        .write();
+    let document = open(&file);
+    let p = first_pixel(&document);
+    assert!(p.iter().all(|c| (0.0..=1.0).contains(c)), "{p:?}");
+    assert!(p[0] < 0.01, "red clipped to zero: {p:?}");
+    // The flat merged fallback is clipped too.
+    let flat = TestPsd::new(1, 1, 1, 8)
+        .with(|p| {
+            p.resources = resource_1039(&bytes);
+            p.merged = Some(vec![vec![0], vec![255], vec![0]]);
+        })
+        .write();
+    let p = first_pixel(&open(&flat));
+    assert!(p.iter().all(|c| (0.0..=1.0).contains(c)), "{p:?}");
+    let merged = match super::merged_image_in_working_space(&flat) {
+        Ok(i) => i,
+        Err(e) => unreachable!("{e:?}"),
+    };
+    assert!(
+        merged
+            .samples()
+            .iter()
+            .all(|c| (0.0..=1.0).contains(&c.to_f32()))
+    );
+}
+
+#[test]
+fn a_layer_whose_conversion_fails_is_left_as_stored_and_reported() {
+    let Ok(bytes) = adobe_like().to_bytes() else {
+        unreachable!()
+    };
+    let file = psd(resource_1039(&bytes));
+    let plain = first_pixel(&open(&psd(Vec::new())));
+    crate::colour_import::TEST_FAIL_CHUNK.with(|c| c.set(Some(0)));
+    let document = open(&file);
+    crate::colour_import::TEST_FAIL_CHUNK.with(|c| c.set(None));
+    // Stored colours, untouched; the profile is still recorded as the
+    // file's, the user is told, and the open does not claim a conversion.
+    assert_eq!(bits4(first_pixel(&document)), bits4(plain));
+    assert!(
+        document
+            .report
+            .items
+            .iter()
+            .any(|l| l.contains("could not be converted") && l.contains("treated as sRGB")),
+        "{:?}",
+        document.report.items
+    );
 }

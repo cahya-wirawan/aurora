@@ -382,3 +382,80 @@ fn the_parallel_conversion_equals_the_single_threaded_one_and_skips_transparent_
 fn bits_of(s: &[f16]) -> Vec<u16> {
     s.iter().map(|v| v.to_bits()).collect()
 }
+
+#[test]
+fn a_failed_chunk_leaves_the_image_exactly_as_it_was() {
+    use super::{ConvertDirection, convert_profile_rgba_with};
+    let bytes = adobe_bytes();
+    // Small (single-threaded path), a failure in the second chunk, so the
+    // first chunk had already converted before it failed.
+    let pixels = 40_000_usize;
+    let original: Vec<f16> = (0..pixels)
+        .flat_map(|i| {
+            let t = |k: usize| f16::from_f32(((i * k) % 251) as f32 / 250.0);
+            [t(3), t(5), t(7), f16::from_f32(1.0)]
+        })
+        .collect();
+    let mut samples = original.clone();
+    assert!(
+        convert_profile_rgba_with(&mut samples, &bytes, ConvertDirection::ToWorking, Some(1))
+            .is_err()
+    );
+    assert_eq!(bits_of(&samples), bits_of(&original));
+    // The parallel path (over the threshold), failing in part zero's chunk.
+    let big: Vec<f16> = (0..300_000_usize)
+        .flat_map(|i| {
+            let t = |k: usize| f16::from_f32(((i * k) % 251) as f32 / 250.0);
+            [t(3), t(5), t(7), f16::from_f32(1.0)]
+        })
+        .collect();
+    let mut samples = big.clone();
+    assert!(
+        convert_profile_rgba_with(&mut samples, &bytes, ConvertDirection::ToWorking, Some(1))
+            .is_err()
+    );
+    assert_eq!(bits_of(&samples), bits_of(&big));
+    // And without the injection the same input converts.
+    assert!(
+        convert_profile_rgba_with(&mut samples, &bytes, ConvertDirection::ToWorking, None).is_ok()
+    );
+    assert_ne!(bits_of(&samples), bits_of(&big));
+}
+
+#[test]
+fn clamping_keeps_alpha_and_fixes_out_of_range_colour() {
+    let mut samples = vec![
+        f16::from_f32(-1.15),
+        f16::from_f32(1.4),
+        f16::from_f32(0.5),
+        f16::from_f32(0.25),
+    ];
+    super::clamp_colour_unit(&mut samples);
+    let v: Vec<f32> = samples.iter().map(|s| s.to_f32()).collect();
+    assert_eq!(v, vec![0.0, 1.0, 0.5, 0.25]);
+}
+
+#[test]
+fn a_failed_conversion_is_reported_truthfully_and_leaves_the_pixels_alone() {
+    let original = vec![
+        f16::from_f32(0.2),
+        f16::from_f32(0.6),
+        f16::from_f32(0.4),
+        f16::from_f32(1.0),
+    ];
+    let mut samples = original.clone();
+    super::TEST_FAIL_CHUNK.with(|c| c.set(Some(0)));
+    let imported = bring_into_working(&mut samples, Tagging::Icc(&adobe_bytes()), false);
+    super::TEST_FAIL_CHUNK.with(|c| c.set(None));
+    assert_eq!(bits_of(&samples), bits_of(&original));
+    assert_eq!(imported.source, None, "no source profile is claimed");
+    assert!(imported.report.info.is_empty(), "no 'Converted' line");
+    assert_eq!(imported.report.warnings.len(), 1);
+    assert!(
+        imported
+            .report
+            .warnings
+            .iter()
+            .any(|l| l.contains("treated as sRGB"))
+    );
+}

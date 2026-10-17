@@ -168,6 +168,30 @@ pub(crate) fn paths_loss_line(selection: &aurora_doc::SelectionSet) -> Option<St
     (!selection.paths().is_empty()).then(|| "Paths are not saved in a Photoshop file.".to_owned())
 }
 
+/// The report lines for a document with colour metadata: a PSD is written in
+/// sRGB (the working space, with the sRGB profile as resource 1039), so a
+/// document converted from another profile on open does not get that
+/// profile back, and an output profile is not applied. Empty for a document
+/// with neither. Each line makes the save "lossy", so the user is asked.
+pub(crate) fn colour_loss_lines(colour: &aurora_io::DocumentColour) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(source) = &colour.source {
+        lines.push(format!(
+            "Colours were converted from \u{201c}{}\u{201d} to sRGB on open; the file is saved as \
+             sRGB, the original profile is not kept, and out-of-gamut colours are clipped.",
+            source.description
+        ));
+    }
+    if let Some(output) = &colour.output {
+        lines.push(format!(
+            "The output profile \u{201c}{}\u{201d} is not applied to a Photoshop file; it is \
+             saved as sRGB.",
+            output.description
+        ));
+    }
+    lines
+}
+
 /// Records a PSD save on the document: a lossless one is a real save
 /// (clean, `.psd` path and name, through `document_close::after_save`);
 /// one with changes — Save Anyway included — leaves it untouched.

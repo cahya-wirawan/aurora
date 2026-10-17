@@ -62,7 +62,8 @@ struct VersionPrefix {
 #[derive(Debug)]
 pub(crate) enum ColourRead {
     Absent,
-    Restored(DocumentColour),
+    /// The usable profiles, and why the others were left out, if any.
+    Restored(DocumentColour, Option<String>),
     /// Unusable and dropped; why, for the user.
     Dropped(String),
 }
@@ -123,17 +124,27 @@ pub(crate) fn decode_colour(bytes: &[u8]) -> Result<ColourRead, IoError> {
             "its colour profiles are of an unknown kind and were left out".to_owned(),
         ));
     }
-    let source = wire.source.map(judged);
-    let output = wire.output.map(judged);
-    if matches!(source, Some(None)) || matches!(output, Some(None)) {
-        return Ok(ColourRead::Dropped(
-            "a colour profile it carried is not usable and was left out".to_owned(),
-        ));
-    }
-    Ok(ColourRead::Restored(DocumentColour {
-        source: source.flatten(),
-        output: output.flatten(),
-    }))
+    // Each profile is judged on its own: an unusable source profile must
+    // not take a good output profile with it.
+    let mut dropped: Vec<&str> = Vec::new();
+    let mut judge = |bytes: Option<Vec<u8>>, name: &'static str| {
+        bytes.and_then(|b| {
+            let kept = judged(b);
+            if kept.is_none() {
+                dropped.push(name);
+            }
+            kept
+        })
+    };
+    let source = judge(wire.source, "source");
+    let output = judge(wire.output, "output");
+    let why = (!dropped.is_empty()).then(|| {
+        format!(
+            "its {} colour profile was not usable and was left out",
+            dropped.join(" and its ")
+        )
+    });
+    Ok(ColourRead::Restored(DocumentColour { source, output }, why))
 }
 
 /// Reads the `colour` entry of `zip`.

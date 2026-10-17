@@ -5107,6 +5107,13 @@ pub fn merged_image(bytes: &[u8]) -> Result<Image, IoError> {
 /// same space). A file with no usable non-sRGB profile is [`merged_image`]
 /// unchanged.
 ///
+/// **The audit's basis changed with colour management.** For a file whose
+/// profile is not sRGB, the opened document is now in sRGB (layers
+/// converted, then clipped to `0..=1`), so the audit compares it with this
+/// converted-and-clipped merged image, not with the stored one. Audit
+/// numbers for such files before and after colour management are therefore
+/// not on one basis; `psd_audit_tests` records the same-basis comparison.
+///
 /// # Errors
 ///
 /// As [`merged_image`].
@@ -5123,11 +5130,15 @@ pub fn merged_image_in_working_space(bytes: &[u8]) -> Result<Image, IoError> {
     let embedded = notes.3.take();
     let plan = plan_colour(embedded.as_deref(), header.gray(), &mut notes);
     if let Some(profile) = &plan.convert_from {
-        let _ = crate::convert_profile_rgba(
+        if crate::convert_profile_rgba(
             image.samples_mut(),
             profile,
             crate::ConvertDirection::ToWorking,
-        );
+        )
+        .is_ok()
+        {
+            crate::clamp_colour_unit(image.samples_mut());
+        }
     }
     Ok(image)
 }
@@ -5278,6 +5289,7 @@ fn build_streamed(
     let mut builder = Builder {
         to_working: plan.convert_from,
         adjustments_seen: 0,
+        conversion_failed: 0,
         layers: &mut layers,
         history: &mut history,
         sink,
@@ -5309,6 +5321,32 @@ fn build_streamed(
     }
     let mut colour = plan.colour;
     let mut extra_items: Vec<String> = plan.warnings;
+    if builder.conversion_failed > 0 {
+        extra_items.push(format!(
+            "{} layer{} could not be converted from the file's colour profile and {} shown as \
+             stored (treated as sRGB).",
+            builder.conversion_failed,
+            if builder.conversion_failed == 1 {
+                ""
+            } else {
+                "s"
+            },
+            if builder.conversion_failed == 1 {
+                "is"
+            } else {
+                "are"
+            },
+        ));
+    }
+    if let Some(source) = &colour.source {
+        let line = crate::colour_import::converted_on_open_line(&source.description, true);
+        extra_items.push(if builder.conversion_failed > 0 {
+            // Not every layer converted: do not claim the whole file did.
+            line.replacen("The colours were", "The other layers' colours were", 1)
+        } else {
+            line
+        });
+    }
     if colour.source.is_some() && builder.adjustments_seen > 0 {
         extra_items.push(
             "The colours were converted to sRGB when the file was opened, but its adjustment \
@@ -5408,6 +5446,8 @@ struct Builder<'b, 'k, 's> {
     to_working: Option<Vec<u8>>,
     /// Adjustment layers added (the conversion note names them).
     adjustments_seen: u64,
+    /// Layers whose colour conversion failed and were left as stored.
+    conversion_failed: u64,
     layers: &'b mut LayerTree,
     history: &'b mut History,
     sink: &'b mut (dyn PsdPixelSink + 'k),
@@ -5424,16 +5464,30 @@ struct Builder<'b, 'k, 's> {
 impl Builder<'_, '_, '_> {
     /// Converts `image` from the file's profile into the working space, in
     /// place, when the file has one worth converting.
-    fn to_working_in_place(&self, image: &mut Image) {
-        if let Some(profile) = &self.to_working
-            && crate::convert_profile_rgba(
-                image.samples_mut(),
-                profile,
-                crate::ConvertDirection::ToWorking,
-            )
-            .is_err()
-        {
-            tracing::warn!("a layer's colour conversion failed; its colours are left as stored");
+    ///
+    /// All or nothing (`convert_profile_rgba` stages before it writes): a
+    /// layer whose conversion fails keeps its stored colours and is counted
+    /// for the report. A converted layer is then clamped to `0..=1`
+    /// (PSD layers feed blend modes, adjustment tables and effects that
+    /// assume in-gamut colour; Photoshop clips out-of-gamut colour when it
+    /// converts to sRGB too).
+    fn to_working_in_place(&mut self, image: &mut Image) {
+        let Some(profile) = &self.to_working else {
+            return;
+        };
+        match crate::convert_profile_rgba(
+            image.samples_mut(),
+            profile,
+            crate::ConvertDirection::ToWorking,
+        ) {
+            Ok(()) => crate::clamp_colour_unit(image.samples_mut()),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "a layer's colour conversion failed; its colours are left as stored"
+                );
+                self.conversion_failed = self.conversion_failed.saturating_add(1);
+            }
         }
     }
 

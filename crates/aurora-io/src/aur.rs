@@ -3062,7 +3062,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
         crate::aur_colour::ColourRead::Absent => {
             (crate::aur_colour::DocumentColour::default(), None)
         }
-        crate::aur_colour::ColourRead::Restored(c) => (c, None),
+        crate::aur_colour::ColourRead::Restored(c, why) => (c, why),
         crate::aur_colour::ColourRead::Dropped(why) => {
             (crate::aur_colour::DocumentColour::default(), Some(why))
         }

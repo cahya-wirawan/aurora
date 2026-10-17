@@ -32349,7 +32349,17 @@ impl App {
             return false;
         };
         self.announce_colour_open(&colour);
-        let mut items: Vec<String> = colour.report.warnings.clone();
+        // The conversion is a change the user should be able to see again
+        // (kept in the import losses, so it survives a `.aur` save and is
+        // carried into a Photoshop save's report), not only a status line.
+        let mut items: Vec<String> = Vec::new();
+        if let Some(source) = &colour.source {
+            items.push(aurora_io::converted_on_open_line(
+                &source.description,
+                false,
+            ));
+        }
+        items.extend(colour.report.warnings.clone());
         items.extend(unwritten_layers_item(unwritten));
         if !items.is_empty() {
             self.doc.import_losses = Some(items.clone());
@@ -33178,6 +33188,7 @@ impl App {
                 );
                 carried.extend(psd_save::selection_loss_line(&self.doc.selection));
                 carried.extend(psd_save::paths_loss_line(&self.doc.selection));
+                carried.extend(psd_save::colour_loss_lines(&self.doc.colour));
                 carried
             },
         };
