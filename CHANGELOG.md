@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.264.0] - 2026-10-17
+
+### Changed
+
+- Colour management round 1: embedded profiles are honoured, docs and version
+
 ## [0.263.1] - 2026-10-17
 
 ### Fixed
