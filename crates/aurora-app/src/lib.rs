@@ -578,6 +578,7 @@ mod lasso_tools;
 mod layer_thumbnails;
 mod menu_bar_app;
 mod menu_bar_state;
+mod tooltip_app;
 mod menu_model;
 mod path_paint;
 mod paths_app;
@@ -30111,6 +30112,9 @@ struct App {
     /// The in-window menu bar's open menu (0.225.0,
     /// [`menu_bar_state::MenuBarState`]); never document state.
     menu_bar: menu_bar_state::MenuBarState,
+    /// The toolbar tooltips' tracker (0.262.0, `aurora_ui::TooltipHover`);
+    /// never document state.
+    tooltip_hover: aurora_ui::TooltipHover,
     /// The document strip's overflow menu (0.260.0,
     /// [`document_overflow::OverflowState`]); never document state.
     doc_overflow: document_overflow::OverflowState,
@@ -30697,6 +30701,7 @@ impl App {
             quit_pending: false,
             colour: colour_state::ColourController::default(),
             menu_bar: menu_bar_state::MenuBarState::default(),
+            tooltip_hover: aurora_ui::TooltipHover::new(),
             doc_overflow: document_overflow::OverflowState::default(),
             layer_rows,
             scroll_follow: ScrollFollow::default(),
@@ -30912,6 +30917,7 @@ impl App {
         let Some(key) = key else {
             return;
         };
+        self.dismiss_tooltip();
         // 0.166.0: any key cancels a live panel press or drag, so no
         // command (the palette, Collapse Panels, a panel move) runs under
         // it; `Escape` is then consumed — that is all it meant.
@@ -33236,6 +33242,7 @@ impl App {
         self.update_gallery_hover(Some(position));
         self.update_toolbar_hover(Some(position));
         self.update_menu_bar_hover(Some(position));
+        self.update_tooltip_hover(Some(position));
 
         if let Some(resize) = self.rail_resize {
             let new_width = resized_rail_width(resize, position.0);
@@ -33358,6 +33365,9 @@ impl App {
         let Some(position) = self.pointer_position else {
             return;
         };
+        // 0.262.0: a press hides the tooltip before it is routed, so a
+        // tooltip over the press can never swallow it.
+        self.dismiss_tooltip();
         // Any pointer press hides the focus ring (`:focus-visible`),
         // app-wide, whatever the press lands on.
         self.focus
@@ -34691,6 +34701,7 @@ impl App {
         let Some(position) = self.pointer_position else {
             return;
         };
+        self.dismiss_tooltip();
         // 0.257.0: over the open command palette the wheel scrolls its
         // results (a modal dialog still swallows it).
         if self.dialog.is_none()
@@ -37359,6 +37370,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // panel drag live.
                 if !focused {
                     self.cancel_panel_drag();
+                    self.clear_tooltip();
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -37426,6 +37438,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.update_gallery_hover(None);
                 self.update_toolbar_hover(None);
                 self.update_menu_bar_hover(None);
+                self.update_tooltip_hover(None);
             }
             _ => {}
         }
@@ -37549,6 +37562,7 @@ impl ApplicationHandler<AppEvent> for App {
         self.sync_curves_controls_now();
         self.sync_status_bar_now();
         let thumbnail_deadline = self.update_layer_thumbnails(now);
+        let tooltip_deadline = self.tooltip_step(now);
         // The caret blink (0.139.0): after everything above that can move
         // focus or edit a field, so the signature it observes is this
         // iteration's. A flip the last frame did not draw asks for one
@@ -37567,6 +37581,7 @@ impl ApplicationHandler<AppEvent> for App {
             self.needs_redraw = true;
         }
         let deadline = earliest_deadline(deadline, ants.next_tick);
+        let deadline = earliest_deadline(deadline, tooltip_deadline);
         // `ControlFlow::Wait` would otherwise block indefinitely, and
         // muda's channel has no event-loop wakeup of its own to
         // interrupt that wait -- so macOS also re-polls on a short timer,
