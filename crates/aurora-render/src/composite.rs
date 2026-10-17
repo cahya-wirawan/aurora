@@ -2592,6 +2592,23 @@ fn blend_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+/// The [`PipelineKey`] of `blend_pass`'s pipeline: the one spelling shared
+/// by the composite call, [`TileCompositor::prewarm`] and the background
+/// build (60 FPS round 6).
+fn blend_pipeline_key(blend_pass: &BlendPass) -> PipelineKey {
+    PipelineKey {
+        shader: LABEL,
+        vertex_entry: "vs_composite",
+        fragment_entry: blend_pass.fragment_entry,
+        target_format: wgpu::TextureFormat::Rgba16Float,
+        // The shader computes the whole composite itself, so the
+        // fixed-function unit must do nothing at all -- a plain
+        // replace. This is the one thing that makes real blend-mode
+        // math expressible on the GPU.
+        blend: Blend::None,
+    }
+}
+
 /// Builds the one render pipeline shape every entry point in
 /// `shaders/composite.wgsl` uses: the fullscreen-triangle vertex stage,
 /// one `Rgba16Float` colour target, no depth, no multisampling, and
@@ -2621,23 +2638,6 @@ fn blend_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 /// count, not a compile error. Keep that one-entry-point-one-layout
 /// pairing intact, or fold the layout into `PipelineKey` (an
 /// `aurora-gpu` API change, not attempted here) before it stops holding.
-/// The [`PipelineKey`] of `blend_pass`'s pipeline: the one spelling shared
-/// by the composite call, [`TileCompositor::prewarm`] and the background
-/// build (60 FPS round 6).
-fn blend_pipeline_key(blend_pass: &BlendPass) -> PipelineKey {
-    PipelineKey {
-        shader: LABEL,
-        vertex_entry: "vs_composite",
-        fragment_entry: blend_pass.fragment_entry,
-        target_format: wgpu::TextureFormat::Rgba16Float,
-        // The shader computes the whole composite itself, so the
-        // fixed-function unit must do nothing at all -- a plain
-        // replace. This is the one thing that makes real blend-mode
-        // math expressible on the GPU.
-        blend: Blend::None,
-    }
-}
-
 fn composite_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
@@ -2931,10 +2931,26 @@ impl TileCompositor {
         Ok(())
     }
 
+    /// Drops every cached render pipeline (60 FPS round 6), so each is
+    /// built again on first use. For a caller whose own `wgpu` error scope
+    /// caught an error while this compositor may have built a pipeline
+    /// (an invalid handle must never stay cached), as
+    /// [`Self::prewarm`] does for its own failures.
+    pub fn discard_cached_pipelines(&mut self) {
+        self.pipelines = PipelineCache::new();
+    }
+
+    /// How many render pipelines are cached.
+    #[must_use]
+    pub fn cached_pipeline_count(&self) -> usize {
+        self.pipelines.len()
+    }
+
     /// Takes into the cache whatever the background build has finished
     /// (never waiting) and returns whether it is still building (60 FPS
-    /// round 6). Composite calls do this themselves; a caller can also
-    /// call it from an idle loop turn.
+    /// round 6). Every blend composite call does this itself, so nothing
+    /// needs to call it for the pipelines to be used; the app does not.
+    /// Tests and measurements use it to wait for the build.
     pub fn poll_background_pipelines(&mut self) -> bool {
         self.adopt_background_pipelines();
         self.background.is_some()
@@ -30285,28 +30301,9 @@ mod tests {
         texels.iter().map(|sample| sample.to_bits()).collect()
     }
 
-    /// **The headline test for 0.98.0, and it is unqualified.** The
-    /// vectorized fold must be bit-for-bit identical to the scalar loop
-    /// it replaced — every sample, no exceptions, no tolerance — for
-    /// every blend mode, at every opacity including two that exercise
-    /// the clamp, on a fixture straddling the chunk boundary and
-    /// carrying both signed zeros, both subnormal extremes and the
-    /// largest finite `f16`, and on an all-transparent accumulator,
-    /// where every texel takes the `backdrop_alpha == 0.0` arm that
-    /// skips the straightening divisions (the *only* arm a real
-    /// single-root document ever takes, per 0.97.1's correction).
-    ///
-    /// Its fixture is deliberately **finite**: no infinity, no NaN. That
-    /// is not a fixture chosen to make the test pass — the
-    /// infinity-and-NaN case is covered, and covered adversarially, by
-    /// `a_hostile_fixture_folds_identically_except_for_the_nan_payload_operand`
-    /// immediately below, which documents exactly what it can and cannot
-    /// assert and why. Splitting them this way keeps *this* assertion
-    /// absolute rather than blanket-weakening one test to accommodate a
-    /// case that only affects NaN payloads.
     /// [`composite_layer_into`]'s whole-chunk loop as it was before 60 FPS
     /// round 6, verbatim: the mode matched per texel inside
-    /// [`fold_texel`]. The round-6 per-mode instantiation must match it
+    /// `fold_texel` (copied below as `fold_texel_round5`). The round-6 per-mode instantiation must match it
     /// bit for bit wherever the result is not a NaN.
     fn composite_layer_into_round5(out: &mut [f16], texels: &[f16], opacity: f32, mode: BlendMode) {
         let opacity = opacity.clamp(0.0, 1.0);
@@ -30409,7 +30406,8 @@ mod tests {
     /// **NaN payloads, measured 2026-10-17 (`x86_64` with F16C, rustc 1.97).**
     /// In the release profile the two loops agree on every bit, NaN
     /// payloads included, and that is asserted below for any optimised
-    /// build. In the dev profile (opt-level 1) they differ in 18,414
+    /// `x86_64` build (other targets print the count without asserting).
+    /// In the dev profile (opt-level 1) they differ in 18,414
     /// samples, all `Difference` with a negative NaN source colour channel
     /// (0xFC01..=0xFFFF): the round-5 loop gives 0xFE01 and up, this one
     /// 0x7E01 and up, i.e. which NaN wins `backdrop_inverse * Cs +
@@ -30471,8 +30469,10 @@ mod tests {
             "per-mode fold: {compared} samples compared, {nan_payload_differences} differ only \
              in a NaN's payload"
         );
-        // The shipping profile: bit for bit, NaN payloads included.
-        if !cfg!(debug_assertions) {
+        // Optimised builds on x86_64, where this was measured: bit for bit,
+        // NaN payloads included. Rust leaves NaN payloads unspecified, so
+        // other targets only report the count.
+        if !cfg!(debug_assertions) && cfg!(target_arch = "x86_64") {
             assert_eq!(
                 nan_payload_differences, 0,
                 "in an optimised build the per-mode loop must equal the round-5 loop bit for bit"
@@ -30522,6 +30522,25 @@ mod tests {
         }
     }
 
+    /// **The headline test for 0.98.0, and it is unqualified.** The
+    /// vectorized fold must be bit-for-bit identical to the scalar loop
+    /// it replaced — every sample, no exceptions, no tolerance — for
+    /// every blend mode, at every opacity including two that exercise
+    /// the clamp, on a fixture straddling the chunk boundary and
+    /// carrying both signed zeros, both subnormal extremes and the
+    /// largest finite `f16`, and on an all-transparent accumulator,
+    /// where every texel takes the `backdrop_alpha == 0.0` arm that
+    /// skips the straightening divisions (the *only* arm a real
+    /// single-root document ever takes, per 0.97.1's correction).
+    ///
+    /// Its fixture is deliberately **finite**: no infinity, no NaN. That
+    /// is not a fixture chosen to make the test pass — the
+    /// infinity-and-NaN case is covered, and covered adversarially, by
+    /// `a_hostile_fixture_folds_identically_except_for_the_nan_payload_operand`
+    /// immediately below, which documents exactly what it can and cannot
+    /// assert and why. Splitting them this way keeps *this* assertion
+    /// absolute rather than blanket-weakening one test to accommodate a
+    /// case that only affects NaN payloads.
     #[test]
     fn vectorized_fold_is_bit_identical_to_the_scalar_reference() {
         let source = boundary_fixture(1);
