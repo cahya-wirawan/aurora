@@ -2508,10 +2508,22 @@ pub struct TileCompositor {
     /// How many pipelines were taken from [`Self::background`] into the
     /// cache (test evidence that a composite used one).
     background_adopted: usize,
-    /// Test-only: the background build's thread, so a test can wait for
-    /// it to finish without taking anything from [`Self::background`].
-    #[cfg(test)]
-    background_thread: Option<std::thread::JoinHandle<()>>,
+    /// The background build's thread and its stop flag. Joined by
+    /// [`Self::stop_background_pipelines`] (and so on drop): the thread
+    /// holds a clone of the device, and a thread still inside the driver,
+    /// or the last to drop the device, while the process exits was
+    /// measured to crash or hang the exit on NVIDIA/Vulkan (the driver's
+    /// exit handlers racing `vkDestroyDevice` on the background thread).
+    background_thread: Option<(
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    )>,
+}
+
+impl Drop for TileCompositor {
+    fn drop(&mut self) {
+        self.stop_background_pipelines();
+    }
 }
 
 /// Builds [`TileCompositor::bind_group_layout_blend`]: the opacity
@@ -2800,7 +2812,6 @@ impl TileCompositor {
             gradient_map: None,
             background: None,
             background_adopted: 0,
-            #[cfg(test)]
             background_thread: None,
         }
     }
@@ -2891,12 +2902,17 @@ impl TileCompositor {
             self.bind_group_layout_blend.clone()
         };
         let (sender, receiver) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_seen = std::sync::Arc::clone(&stop);
         let thread = std::thread::Builder::new()
             .name("aurora-pipeline-prewarm".to_owned())
             .spawn(move || {
                 let started = std::time::Instant::now();
                 let mut built = 0_usize;
                 for (key, label) in wanted {
+                    if stop_seen.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
                     match capture_wgpu_errors(&device, || {
                         composite_pipeline(&device, &shader, &key, &layout, label)
                     }) {
@@ -2921,14 +2937,27 @@ impl TileCompositor {
                     "blend pipelines prewarmed in the background"
                 );
             })?;
-        #[cfg(test)]
-        {
-            self.background_thread = Some(thread);
-        }
-        #[cfg(not(test))]
-        drop(thread);
+        self.background_thread = Some((thread, stop));
         self.background = Some(receiver);
         Ok(())
+    }
+
+    /// Stops the background pipeline build, if one is running, and waits
+    /// for its thread to end (at most the one pipeline it is building:
+    /// about 7.5 ms with a cold driver cache). Whatever it finished is
+    /// adopted first. Called on drop, and by the app at shutdown, so the
+    /// thread never outlives the compositor or reaches process exit.
+    pub fn stop_background_pipelines(&mut self) {
+        self.adopt_background_pipelines();
+        if let Some((thread, stop)) = self.background_thread.take() {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            // The thread checks the flag before each build and returns when
+            // its channel is closed, so closing it too ends it sooner.
+            self.background = None;
+            if thread.join().is_err() {
+                tracing::warn!("the background pipeline build panicked");
+            }
+        }
     }
 
     /// Drops every cached render pipeline (60 FPS round 6), so each is
@@ -9192,7 +9221,7 @@ mod tests {
                 .prewarm_blend_pipelines_in_background(device)
                 .is_ok()
         );
-        if let Some(thread) = compositor.background_thread.take() {
+        if let Some((thread, _)) = compositor.background_thread.take() {
             assert!(thread.join().is_ok());
         }
         assert_eq!(
@@ -9204,6 +9233,52 @@ mod tests {
         assert_eq!(compositor.background_adopted, ALL_BLEND_PASSES.len());
         assert_eq!(compositor.pipelines.len(), ALL_BLEND_PASSES.len());
         assert!(!compositor.poll_background_pipelines(), "the build is over");
+    }
+
+    /// 60 FPS round 6: stopping the background build (what dropping the
+    /// compositor does) joins its thread: once it returns, the thread has
+    /// ended, so it cannot reach process exit still inside the driver.
+    #[test]
+    fn stopping_the_background_build_joins_its_thread() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let mut compositor = TileCompositor::new(device);
+        assert!(
+            compositor
+                .prewarm_blend_pipelines_in_background(device)
+                .is_ok()
+        );
+        // The thread holds a clone of this flag until it returns, so once
+        // only this clone is left, the thread has ended.
+        let Some((_, stop)) = &compositor.background_thread else {
+            unreachable!("just started");
+        };
+        let stop = std::sync::Arc::clone(stop);
+        compositor.stop_background_pipelines();
+        assert_eq!(
+            std::sync::Arc::strong_count(&stop),
+            1,
+            "the thread must have ended when stop returns"
+        );
+        assert!(compositor.background_thread.is_none());
+        assert!(!compositor.poll_background_pipelines());
+        assert!(compositor.background_adopted <= ALL_BLEND_PASSES.len());
+
+        // Dropping a compositor whose build is running does the same.
+        let mut dropped = TileCompositor::new(device);
+        assert!(
+            dropped
+                .prewarm_blend_pipelines_in_background(device)
+                .is_ok()
+        );
+        let Some((_, stop)) = &dropped.background_thread else {
+            unreachable!("just started");
+        };
+        let stop = std::sync::Arc::clone(stop);
+        drop(dropped);
+        assert_eq!(std::sync::Arc::strong_count(&stop), 1);
     }
 
     /// 60 FPS round 6: a composite that runs before the background build

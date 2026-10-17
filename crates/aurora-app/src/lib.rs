@@ -35392,6 +35392,12 @@ impl App {
     /// silently pass `None` for the store and the scratch directory and
     /// still pass the whole gate. See [`ShutdownState`].
     fn finish_shutdown(&mut self) {
+        // 60 FPS round 6: the blend pipelines' background build must not
+        // reach process exit still running (see
+        // `TileCompositor::stop_background_pipelines`).
+        if let Some(compositor) = self.compositor.as_mut() {
+            compositor.stop_background_pipelines();
+        }
         // Review L-3: a Save With Changes still waiting is abandoned —
         // dropping it deletes its temp file; the target was never touched.
         // (A quit is not deferred for it.)
