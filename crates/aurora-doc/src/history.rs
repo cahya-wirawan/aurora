@@ -208,6 +208,19 @@ enum LayerOp {
         id: LayerId,
         value: Vec<aurora_core::effects::PatternOverlay>,
     },
+    /// Replaces the paints of a layer's strokes (task 118): one entry per
+    /// stroke of the layer's effects, in order (`None` for a solid stroke
+    /// or one Aurora cannot paint). The layer must carry effects with
+    /// exactly that many strokes. Appended after
+    /// [`Self::SetPatternOverlays`], so an Aurora older than this build
+    /// refuses a journal holding it (ADR 0009).
+    /// [`History::save_journal`] emits one after every `SetEffects` and
+    /// `Restore` that carries a stroke paint. The patterns themselves are
+    /// the document's pool (`.aur` entry `layer-patterns`).
+    SetStrokePaints {
+        id: LayerId,
+        value: Vec<Option<aurora_core::effects::StrokePaint>>,
+    },
 }
 
 /// Every `(layer, gradient overlays)` pair a journaled op carries in an
@@ -249,6 +262,33 @@ fn carried_pattern_overlays(
             id,
             value: Some(fx),
         } if !fx.pattern_overlays.is_empty() => vec![(*id, fx.pattern_overlays.clone())],
+        _ => Vec::new(),
+    }
+}
+
+/// Every `(layer, stroke paints)` pair, as [`carried_gradient_overlays`]:
+/// one `Option` per stroke, only for layers where some stroke has a paint.
+fn carried_stroke_paints(
+    op: &LayerOp,
+) -> Vec<(LayerId, Vec<Option<aurora_core::effects::StrokePaint>>)> {
+    fn paints(
+        fx: &aurora_core::LayerEffects,
+    ) -> Option<Vec<Option<aurora_core::effects::StrokePaint>>> {
+        fx.strokes
+            .iter()
+            .any(|s| s.paint.is_some())
+            .then(|| fx.strokes.iter().map(|s| s.paint.clone()).collect())
+    }
+    match op {
+        LayerOp::Restore(subtree) => subtree
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| Some((*id, paints(entry.effects.as_ref()?)?)))
+            .collect(),
+        LayerOp::SetEffects {
+            id,
+            value: Some(fx),
+        } => paints(fx).map(|p| vec![(*id, p)]).unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -513,6 +553,26 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
             tree.set_effects(id, Some(fx))?;
             Ok((LayerOp::SetPatternOverlays { id, value: old }, None))
         }
+        LayerOp::SetStrokePaints { id, value } => {
+            let invalid = |field: &'static str| {
+                DocError::InvalidEffects(aurora_core::effects::EffectsError::OutOfRange { field })
+            };
+            let mut fx = tree
+                .effects(id)
+                .cloned()
+                .ok_or_else(|| invalid("stroke paints on a layer without effects"))?;
+            if fx.strokes.len() != value.len() {
+                return Err(invalid("stroke paints do not match the strokes"));
+            }
+            let old: Vec<Option<aurora_core::effects::StrokePaint>> = fx
+                .strokes
+                .iter_mut()
+                .zip(value)
+                .map(|(stroke, paint)| std::mem::replace(&mut stroke.paint, paint))
+                .collect();
+            tree.set_effects(id, Some(fx))?;
+            Ok((LayerOp::SetStrokePaints { id, value: old }, None))
+        }
         LayerOp::SetClipped { id, value } => {
             let old = tree.clipped(id);
             tree.set_clipped_flag(id, value)?;
@@ -693,6 +753,16 @@ fn describe(op: &LayerOp) -> String {
             "Changed {} pattern overlay{} on layer #{}",
             value.len(),
             if value.len() == 1 { "" } else { "s" },
+            id.to_raw()
+        ),
+        LayerOp::SetStrokePaints { id, value } => format!(
+            "Changed {} stroke paint{} on layer #{}",
+            value.iter().flatten().count(),
+            if value.iter().flatten().count() == 1 {
+                ""
+            } else {
+                "s"
+            },
             id.to_raw()
         ),
         LayerOp::SetClipped { id, value } => {
@@ -1007,6 +1077,13 @@ impl History {
             // Pattern overlays (task 111) the same way.
             for (id, value) in carried_pattern_overlays(op) {
                 wire.push(std::borrow::Cow::Owned(LayerOp::SetPatternOverlays {
+                    id,
+                    value,
+                }));
+            }
+            // Stroke paints (task 118) the same way.
+            for (id, value) in carried_stroke_paints(op) {
+                wire.push(std::borrow::Cow::Owned(LayerOp::SetStrokePaints {
                     id,
                     value,
                 }));
@@ -6129,5 +6206,109 @@ mod adjustment_tests {
         );
         // A deleted layer's overlays come back with its `Restore`.
         assert!(history.undo(&mut tree).is_ok());
+    }
+
+    /// Task 118: `SetStrokePaints` is appended after `SetPatternOverlays`,
+    /// and the journal carries the paints `LayerEffects` cannot put on its
+    /// wire.
+    #[test]
+    fn set_stroke_paints_is_appended_and_the_journal_carries_the_paints() {
+        use aurora_core::effects::{Stroke, StrokeFill, StrokePaint};
+        let id = crate::LayerId::from_raw(3);
+        let ordinal = |op: &LayerOp| {
+            postcard::to_allocvec(op)
+                .ok()
+                .and_then(|b| b.first().copied())
+        };
+        let pat = ordinal(&LayerOp::SetPatternOverlays {
+            id,
+            value: Vec::new(),
+        });
+        let paints = ordinal(&LayerOp::SetStrokePaints {
+            id,
+            value: Vec::new(),
+        });
+        assert_eq!(paints, pat.map(|p| p + 1));
+        // The absolute ordinal is frozen too: a reordering of the enum would
+        // change what every saved journal means.
+        assert_eq!(paints, Some(22));
+
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+        let layer = history
+            .add_pixel_layer(&mut tree, "p", bounds, None)
+            .unwrap_or_else(|e| unreachable!("{e:?}"));
+        let paint = StrokePaint::Pattern {
+            pattern: "pid".to_owned(),
+            scale: 2.0,
+            origin: (1.5, -2.0),
+        };
+        let fx = aurora_core::LayerEffects {
+            strokes: vec![
+                Stroke::default(),
+                Stroke {
+                    fill: StrokeFill::Pattern,
+                    paint: Some(paint.clone()),
+                    ..Stroke::default()
+                },
+            ],
+            ..aurora_core::LayerEffects::default()
+        };
+        history
+            .set_effects(&mut tree, layer, Some(fx))
+            .unwrap_or_else(|e| unreachable!("{e:?}"));
+        let journal = history.save_journal().unwrap_or_default();
+        let loaded = History::load_journal(&journal).unwrap_or_else(|e| unreachable!("{e:?}"));
+        let replayed = loaded.replay().unwrap_or_else(|e| unreachable!("{e:?}"));
+        let paints_of = |tree: &LayerTree| {
+            tree.effects(layer).map(|f| {
+                f.strokes
+                    .iter()
+                    .map(|s| s.paint.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(paints_of(&replayed), Some(vec![None, Some(paint.clone())]));
+        assert!(history.undo(&mut tree).is_ok());
+        assert!(tree.effects(layer).is_none());
+        assert!(history.redo(&mut tree).is_ok());
+        assert_eq!(paints_of(&tree), Some(vec![None, Some(paint.clone())]));
+        // Without effects, or with the wrong stroke count, or with a paint
+        // that does not match the stroke's fill, the op is refused.
+        let mut direct = LayerTree::new();
+        let id2 = direct
+            .add_pixel_layer("d", bounds, None)
+            .unwrap_or_else(|e| unreachable!("{e:?}"));
+        let op = |id, value| LayerOp::SetStrokePaints { id, value };
+        assert!(crate::history::apply(&mut direct, op(id2, vec![Some(paint.clone())])).is_err());
+        assert!(
+            crate::history::apply(&mut tree, op(layer, vec![Some(paint.clone())])).is_err(),
+            "one paint for two strokes"
+        );
+        assert!(
+            crate::history::apply(&mut tree, op(layer, vec![None])).is_err(),
+            "too few entries, none of them a paint"
+        );
+        assert!(
+            crate::history::apply(&mut tree, op(layer, vec![None, None, None])).is_err(),
+            "too many entries"
+        );
+        assert!(
+            crate::history::apply(&mut tree, op(layer, vec![Some(paint.clone()), None])).is_err(),
+            "a pattern paint on a solid stroke"
+        );
+        // The applied op returns the inverse, restoring the old paints.
+        let inverse = crate::history::apply(&mut tree, op(layer, vec![None, None]))
+            .unwrap_or_else(|e| unreachable!("{e:?}"));
+        assert_eq!(paints_of(&tree), Some(vec![None, None]));
+        assert!(
+            matches!(inverse.0, LayerOp::SetStrokePaints { ref value, .. } if value == &vec![None, Some(paint.clone())])
+        );
     }
 }

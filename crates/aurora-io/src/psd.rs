@@ -990,7 +990,9 @@ fn note_text(note: Note, n: u64) -> String {
         ),
         Note::StrokesNotShown => format!(
             "{n} gradient, pattern or other non-solid stroke effect{s} {is}n't shown (Aurora \
-             draws solid-colour strokes on pixel layers only); {} kept with the layer.",
+             draws solid-colour strokes, and gradient and pattern strokes whose paint it can \
+             read, on pixel layers only; a Noise gradient, a document-aligned gradient, or a \
+             pattern it cannot read or place is not drawn); {} kept with the layer.",
             if one { "it is" } else { "they are" }
         ),
         Note::OuterGlowsNotShown => format!(
@@ -3516,6 +3518,20 @@ fn props_for(record: &Record, notes: &mut Notes) -> PsdProps {
                             height: r.height,
                         });
                     }
+                    // Task 118: a gradient stroke spans the same box.
+                    for stroke in &mut fx.strokes {
+                        if let Some(aurora_core::effects::StrokePaint::Gradient {
+                            reference, ..
+                        }) = &mut stroke.paint
+                        {
+                            *reference = Some(aurora_core::effects::ReferenceBox {
+                                dx: r.x,
+                                dy: r.y,
+                                width: r.width,
+                                height: r.height,
+                            });
+                        }
+                    }
                 }
                 Some(Box::new(fx))
             }
@@ -3589,9 +3605,7 @@ fn note_unsupported_kept(
                 }
                 notes.add_n(Note::GlowContourNotApplied, u64::from(read.glow_contours));
                 // 0.190.0: solid-colour strokes are drawn too.
-                for stroke in fx.strokes.iter().filter(|e| {
-                    fx.shows(e.gate) && e.fill == aurora_core::effects::StrokeFill::Color
-                }) {
+                for stroke in fx.strokes.iter().filter(|e| fx.shows(e.gate) && e.drawn()) {
                     if stroke.geometry().capped {
                         notes.add(Note::StrokeSizeCapped);
                     }
@@ -4966,6 +4980,13 @@ fn resolve_patterns(
             for overlay in &read.effects.pattern_overlays {
                 wanted.insert(overlay.pattern.clone());
             }
+            for stroke in &read.effects.strokes {
+                if let Some(aurora_core::effects::StrokePaint::Pattern { pattern, .. }) =
+                    &stroke.paint
+                {
+                    wanted.insert(pattern.clone());
+                }
+            }
         }
     }
     if wanted.is_empty() {
@@ -4996,6 +5017,25 @@ fn resolve_patterns(
                 (false, _) => unreadable += shown,
                 // The pattern is there, the layer has no usable origin.
                 (true, None) => unplaced += shown,
+            }
+        }
+        // Pattern strokes (task 118): placed at the layer's `fxrp` like an
+        // overlay; a stroke whose pattern cannot be had, or whose layer has
+        // no usable origin, loses its paint and is reported as undrawn.
+        for stroke in &mut read.effects.strokes {
+            let Some(aurora_core::effects::StrokePaint::Pattern {
+                pattern, origin: o, ..
+            }) = &mut stroke.paint
+            else {
+                continue;
+            };
+            let usable = origin.filter(|(x, y)| x.abs() <= 100_000.0 && y.abs() <= 100_000.0);
+            match (pool.ready.contains_key(pattern.as_str()), usable) {
+                (true, Some(origin)) => {
+                    *o = origin;
+                    used.insert(pattern.clone());
+                }
+                _ => stroke.paint = None,
             }
         }
         read.effects.pattern_overlays = kept;
@@ -5530,6 +5570,31 @@ impl Builder<'_, '_, '_> {
                 effects
                     .pattern_overlays
                     .retain(|o| o.origin.0.abs() <= limit && o.origin.1.abs() <= limit);
+                // Stroke paints likewise (task 118); a paint that cannot be
+                // made relative within range is dropped (the stroke is then
+                // reported undrawn).
+                for stroke in &mut effects.strokes {
+                    match &mut stroke.paint {
+                        Some(aurora_core::effects::StrokePaint::Gradient {
+                            reference: Some(r),
+                            ..
+                        }) => {
+                            r.dx = r.dx.saturating_sub(bounds.x);
+                            r.dy = r.dy.saturating_sub(bounds.y);
+                        }
+                        Some(aurora_core::effects::StrokePaint::Pattern { origin, .. }) => {
+                            #[allow(clippy::cast_precision_loss)]
+                            {
+                                origin.0 -= bounds.x as f64;
+                                origin.1 -= bounds.y as f64;
+                            }
+                            if origin.0.abs() > limit || origin.1.abs() > limit {
+                                stroke.paint = None;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             self.history.set_effects(self.layers, id, Some(effects))?;
         }

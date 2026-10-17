@@ -16831,7 +16831,7 @@ fn layer_renders_effects(layers: &aurora_doc::LayerTree, id: aurora_doc::LayerId
         && layers.effects(id).is_some_and(|fx| {
             fx.shown_color_overlays() > 0
                 || fx.shown_drop_shadows() > 0
-                || fx.shown_color_strokes() > 0
+                || fx.shown_drawn_strokes() > 0
                 || fx.shown_soft_glows() > 0
                 || fx.shown_gradient_overlays() > 0
                 || fx.shown_pattern_overlays() > 0
@@ -17474,44 +17474,169 @@ fn keep_plane(planes: &mut StrokePlanes, kind: CoverageKind, plane: &std::sync::
     }
 }
 
-/// Each shown solid-colour stroke of `fx` with its planes on `tile`, in
-/// list order.
+/// What a stroke is painted with, resolved for one layer (task 118).
+enum StrokeInk<'a> {
+    /// A solid colour, straight RGB.
+    Solid([half::f16; 3]),
+    /// A gradient evaluated at each texel's centre, as a gradient overlay
+    /// ([`gradient_overlay_texels`]); its transparency stop multiplies the
+    /// stroke's coverage.
+    Gradient {
+        gradient: &'a aurora_core::GradientFill,
+        frame: aurora_core::GradientFrame<'a>,
+    },
+    /// A pattern sampled as a pattern overlay does
+    /// ([`pattern_overlay_texels`]); its alpha multiplies the coverage.
+    Pattern {
+        pattern: &'a aurora_core::pattern::Pattern,
+        scale: f64,
+        origin: (f64, f64),
+    },
+}
+
+/// The ink of `stroke` on layer `id`, or `None` when Aurora cannot paint
+/// it: a gradient or pattern stroke without its paint, or one whose pattern
+/// the document's pool lacks (a damaged document).
+fn stroke_ink<'a>(
+    stroke: &'a aurora_core::effects::Stroke,
+    id: aurora_doc::LayerId,
+    layers: &'a aurora_doc::LayerTree,
+) -> Option<StrokeInk<'a>> {
+    use aurora_core::effects::{StrokeFill, StrokePaint};
+    let bounds = layers.bounds(id).unwrap_or(aurora_core::Rect {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+    });
+    match (stroke.fill, stroke.paint.as_ref()) {
+        (StrokeFill::Color, _) => Some(StrokeInk::Solid(
+            [stroke.color.r, stroke.color.g, stroke.color.b].map(half::f16::from_f32),
+        )),
+        (
+            StrokeFill::Gradient,
+            Some(StrokePaint::Gradient {
+                gradient,
+                reference,
+            }),
+        ) => Some(StrokeInk::Gradient {
+            gradient,
+            frame: gradient.frame(reference.map_or(bounds, |r| r.within(bounds))),
+        }),
+        (
+            StrokeFill::Pattern,
+            Some(StrokePaint::Pattern {
+                pattern,
+                scale,
+                origin,
+            }),
+        ) => Some(StrokeInk::Pattern {
+            pattern: layers.patterns().get(pattern)?,
+            scale: f64::from(*scale),
+            #[allow(clippy::cast_precision_loss)] // layer origins are far below 2^53
+            origin: (bounds.x as f64 + origin.0, bounds.y as f64 + origin.1),
+        }),
+        _ => None,
+    }
+}
+
+/// One drawn stroke of a layer on one composite tile.
+struct ShownStroke<'a> {
+    stroke: &'a aurora_core::effects::Stroke,
+    ink: StrokeInk<'a>,
+    planes: StrokePlanes,
+}
+
+/// Each shown, paintable stroke of `fx` with its planes on `tile`, in list
+/// order.
 fn shown_stroke_planes<'a>(
     fx: &'a aurora_core::LayerEffects,
     id: aurora_doc::LayerId,
-    layers: &aurora_doc::LayerTree,
+    layers: &'a aurora_doc::LayerTree,
     store: &mut dyn TileSource,
     tile: CompositeTileAt,
     own: Option<&[half::f16]>,
     budget: &mut CompositeBudget,
-) -> Vec<(&'a aurora_core::effects::Stroke, StrokePlanes)> {
+) -> Vec<ShownStroke<'a>> {
     fx.strokes
         .iter()
-        .filter(|s| fx.shows(s.gate) && s.fill == aurora_core::effects::StrokeFill::Color)
-        .map(|stroke| {
-            (
+        .filter(|s| fx.shows(s.gate))
+        .filter_map(|stroke| {
+            let ink = stroke_ink(stroke, id, layers)?;
+            Some(ShownStroke {
                 stroke,
-                stroke_tile_planes(id, layers, store, tile, own, stroke, budget),
-            )
+                ink,
+                planes: stroke_tile_planes(id, layers, store, tile, own, stroke, budget),
+            })
         })
         .collect()
 }
 
+/// Whether [`stroke_ink`] has an ink for `stroke` (without needing the
+/// layer's bounds): the cheap test the reach and the GPU predicate use.
+fn stroke_paintable(stroke: &aurora_core::effects::Stroke, layers: &aurora_doc::LayerTree) -> bool {
+    match stroke.paint.as_ref() {
+        _ if stroke.fill == aurora_core::effects::StrokeFill::Color => true,
+        Some(aurora_core::effects::StrokePaint::Pattern { pattern, .. }) => {
+            stroke.fill == aurora_core::effects::StrokeFill::Pattern
+                && layers.patterns().contains_key(pattern)
+        }
+        Some(aurora_core::effects::StrokePaint::Gradient { .. }) => {
+            stroke.fill == aurora_core::effects::StrokeFill::Gradient
+        }
+        None => false,
+    }
+}
+
 /// Folds one coverage `plane` (a slice of texels' worth, matching `target`)
-/// in `stroke`'s colour onto `target` (premultiplied, the accumulator and
-/// the interior alike), at the stroke's opacity × `factor`, in its own
-/// mode.
+/// in `shown`'s ink onto `target` (premultiplied, the accumulator and the
+/// interior alike), at the stroke's opacity × `factor`, in its own mode.
+/// `first_texel` is the tile index of the plane's first texel and
+/// `doc_origin` the tile's document origin, which a gradient or pattern ink
+/// needs to place each texel; a texel with no coverage is not evaluated.
+#[allow(clippy::cast_precision_loss)]
 fn fold_stroke_plane(
     target: &mut [half::f16],
     plane: &[f32],
-    stroke: &aurora_core::effects::Stroke,
+    first_texel: usize,
+    shown: &ShownStroke<'_>,
     factor: f32,
     doc_origin: (i64, i64),
 ) {
-    let [r, g, b] = [stroke.color.r, stroke.color.g, stroke.color.b].map(half::f16::from_f32);
+    let stroke = shown.stroke;
+    let side = aurora_tile::TILE as usize;
+    let zero = half::f16::from_f32(0.0);
     let mut source = Vec::with_capacity(plane.len() * aurora_tile::CHANNELS);
-    for &cover in plane {
-        source.extend([r, g, b, half::f16::from_f32(cover)]);
+    for (n, &cover) in plane.iter().enumerate() {
+        if cover <= 0.0 {
+            // Nothing to fold here; the colour is irrelevant at alpha 0.
+            source.extend([zero; aurora_tile::CHANNELS]);
+            continue;
+        }
+        let index = first_texel + n;
+        let px = doc_origin.0 as f64 + (index % side) as f64;
+        let py = doc_origin.1 as f64 + (index / side) as f64;
+        let (rgb, paint_alpha) = match &shown.ink {
+            StrokeInk::Solid(rgb) => (rgb.map(half::f16::to_f32), 1.0),
+            StrokeInk::Gradient { gradient, frame } => {
+                gradient.at(frame.position(px + 0.5, py + 0.5))
+            }
+            StrokeInk::Pattern {
+                pattern,
+                scale,
+                origin,
+            } => {
+                let [pr, pg, pb, pa] =
+                    pattern.sample((px - origin.0) / scale, (py - origin.1) / scale);
+                ([pr, pg, pb], pa)
+            }
+        };
+        source.extend([
+            half::f16::from_f32(rgb[0]),
+            half::f16::from_f32(rgb[1]),
+            half::f16::from_f32(rgb[2]),
+            half::f16::from_f32(cover * paint_alpha),
+        ]);
     }
     fold_texels_in_mode(
         target,
@@ -17590,7 +17715,7 @@ fn effect_reach_rects(
     reaches.extend(
         fx.strokes
             .iter()
-            .filter(|s| fx.shows(s.gate) && s.fill == aurora_core::effects::StrokeFill::Color)
+            .filter(|s| fx.shows(s.gate) && stroke_paintable(s, layers))
             .map(|stroke| ((0, 0), stroke.geometry().apron)),
     );
     // 0.191.0: a Softer outer glow reaches its apron on every side.
@@ -17754,7 +17879,7 @@ fn fold_layer_with_effects(
     if own.is_none()
         && shadows.is_empty()
         && glows.is_empty()
-        && !strokes.iter().any(|(_, planes)| planes.outside.is_some())
+        && !strokes.iter().any(|s| s.planes.outside.is_some())
     {
         return false;
     }
@@ -17804,9 +17929,10 @@ fn fold_layer_with_effects(
                 && aurora_doc::BlendMode::from(overlay.blend_mode)
                     == aurora_doc::BlendMode::Dissolve
         })
-        && !strokes.iter().any(|(stroke, planes)| {
-            planes.inside.is_some()
-                && aurora_doc::BlendMode::from(stroke.blend_mode) == aurora_doc::BlendMode::Dissolve
+        && !strokes.iter().any(|s| {
+            s.planes.inside.is_some()
+                && aurora_doc::BlendMode::from(s.stroke.blend_mode)
+                    == aurora_doc::BlendMode::Dissolve
         });
     let runs = if row_restricted {
         shape_row_runs(&shape)
@@ -17944,16 +18070,17 @@ fn fold_layer_with_effects(
     // overlays (Photoshop's order: the stroke is the topmost interior
     // effect), at the stroke's opacity in its own mode. Fill does not fade
     // it; the shape (step 3) clips it.
-    for (stroke, planes) in &strokes {
-        let Some(plane) = &planes.inside else {
+    for shown in &strokes {
+        let Some(plane) = &shown.planes.inside else {
             continue;
         };
         for run in &runs {
+            let first = run.start / aurora_tile::CHANNELS;
             if let (Some(inside), Some(cover)) = (
                 interior.get_mut(run.clone()),
-                plane.get(run.start / aurora_tile::CHANNELS..run.end / aurora_tile::CHANNELS),
+                plane.get(first..run.end / aurora_tile::CHANNELS),
             ) {
-                fold_stroke_plane(inside, cover, stroke, 1.0, doc_origin);
+                fold_stroke_plane(inside, cover, first, shown, 1.0, doc_origin);
             }
         }
     }
@@ -17997,9 +18124,9 @@ fn fold_layer_with_effects(
     // layer, in list order, at the stroke's opacity × the layer's opacity
     // (as a shadow's, beneath this). Fill does not fade it; the plane is
     // already zero where the shape is opaque.
-    for (stroke, planes) in &strokes {
-        if let Some(plane) = &planes.outside {
-            fold_stroke_plane(accumulator, plane, stroke, shadow_factor, doc_origin);
+    for shown in &strokes {
+        if let Some(plane) = &shown.planes.outside {
+            fold_stroke_plane(accumulator, plane, 0, shown, shadow_factor, doc_origin);
         }
     }
     if let Some(backdrop) = backdrop {
@@ -18246,12 +18373,9 @@ fn fold_glows_beneath(
 /// shadow's knockout also hides. Empty when no stroke reaches the tile
 /// (callers read a missing entry as zero). `texels` is the tile's texel
 /// count; a plane of another length is ignored.
-fn outside_stroke_cover(
-    strokes: &[(&aurora_core::effects::Stroke, StrokePlanes)],
-    texels: usize,
-) -> Vec<f32> {
+fn outside_stroke_cover(strokes: &[ShownStroke<'_>], texels: usize) -> Vec<f32> {
     let mut cover: Vec<f32> = Vec::new();
-    for plane in strokes.iter().filter_map(|(_, p)| p.outside.as_deref()) {
+    for plane in strokes.iter().filter_map(|s| s.planes.outside.as_deref()) {
         if plane.len() != texels {
             continue;
         }
@@ -91033,10 +91157,11 @@ mod tests {
             // 0.182.0: unchanged by drawing drop shadows.
             ("clipping-mask2.psd", 255.0, [50.8407, 65.1006, 53.0559]),
             // 0.182.0: unchanged by drawing drop shadows.
+            // Task 118: the 'Text' layer's gradient stroke is drawn ('Text 2''s is not: its gradient is not modelled); before: 255 / 31.1161, 23.8722, 19.5429.
             (
                 "effect-stroke-gradient.psd",
-                255.0,
-                [31.1161, 23.8722, 19.5429],
+                248.0,
+                [23.6092, 18.0220, 11.2299],
             ),
             // 0.182.0: unchanged by drawing drop shadows.
             // 0.190.0: Outside and inside strokes drawn; before: 255 / 12.2021, 37.6904, 37.1924.
@@ -91049,10 +91174,11 @@ mod tests {
             ("effects/shape-fx.psd", 0.0, [0.0000, 0.0000, 0.0000]),
             // 0.182.0: unchanged by drawing drop shadows.
             // 0.190.0: Solid strokes drawn (raster ones match Photoshop pixel for pixel); shape layers differ in their gradient fill, gradient and pattern strokes are not drawn, green is worse; before: 255 / 58.2448, 23.1956, 44.6420.
+            // Task 118: the gradient and pattern strokes are drawn; on the pixels they change the summed error against Photoshop falls 377,360 -> 242,280 (red is 0.21 worse overall, green 0.56 and blue 0.03 better); the rest of the gap is the shape layers' own gradient fill and the gradient ramp length, as for gradient overlays; before: 255 / 37.9004, 24.9445, 27.3005.
             (
                 "effects/stroke-effects.psd",
                 255.0,
-                [37.9004, 24.9445, 27.3005],
+                [38.1145, 24.3832, 27.2692],
             ),
             // 0.182.0: unchanged by drawing drop shadows.
             // 0.203.0: its master-only Hue/Saturation layer imported; before: 240 / 133.1256, 58.7064, 39.0855.
@@ -91676,6 +91802,7 @@ mod tests {
         include!("shape_fidelity_tests.rs");
         include!("gradient_overlay_tests.rs");
         include!("pattern_overlay_tests.rs");
+        include!("stroke_paint_tests.rs");
         include!("small_machine_effect_tests.rs");
     }
 }

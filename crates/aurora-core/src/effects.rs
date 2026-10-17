@@ -360,14 +360,118 @@ pub enum StrokePosition {
     Center,
 }
 
-/// What a stroke is filled with (`PntT`). Only `Color` is ever rendered
-/// (from E4); the other two are kept so they can be reported.
+/// What a stroke is filled with (`PntT`). `Color` is drawn from E4;
+/// `Gradient` and `Pattern` are drawn when the stroke also carries a
+/// [`StrokePaint`] (task 118), else they are kept so they can be reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum StrokeFill {
     #[default]
     Color,
     Gradient,
     Pattern,
+}
+
+/// The gradient or pattern a non-solid stroke is painted with (task 118).
+///
+/// **Not on the `.aur` effects wire**: [`LayerEffects`] is positional
+/// `postcard`, so these ride in the optional `layer-stroke-paints` entry
+/// (and `LayerOp::SetStrokePaints`) instead, and [`Stroke::paint`] is
+/// `#[serde(skip)]`. The stroke's `fill` (on the wire) says which kind it
+/// is; the paint must match it ([`LayerEffects::validate`]).
+///
+/// **Not compared with Photoshop:** a gradient stroke's reference box (for
+/// a PSD import, the layer's record rectangle, as for gradient overlays)
+/// and the gradient's length and ramp along it, and a pattern stroke's
+/// placement (the layer's `fxrp` point, as for pattern overlays), are
+/// carried over from the overlays' findings, not checked against a
+/// Photoshop picture of a stroke. On `stroke-effects.psd` the drawn strokes
+/// come out close to Photoshop's but not equal.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum StrokePaint {
+    /// A gradient laid over `reference` (the layer's `bounds` when
+    /// `None`), exactly as a [`GradientOverlay`]'s. Its `align` is always
+    /// on.
+    Gradient {
+        gradient: crate::GradientFill,
+        reference: Option<ReferenceBox>,
+    },
+    /// A pattern from the document's pool, placed as a
+    /// [`PatternOverlay`]'s.
+    Pattern {
+        /// The pattern's ID in the document's pool.
+        pattern: String,
+        /// `0.01..=10.0`; `1.0` is 100 %.
+        scale: f32,
+        /// The origin as an offset from the layer's `bounds` top-left.
+        origin: (f64, f64),
+    },
+}
+
+impl StrokePaint {
+    /// The [`StrokeFill`] this paint belongs to.
+    #[must_use]
+    pub fn fill(&self) -> StrokeFill {
+        match self {
+            Self::Gradient { .. } => StrokeFill::Gradient,
+            Self::Pattern { .. } => StrokeFill::Pattern,
+        }
+    }
+
+    fn validate(&self) -> Result<(), EffectsError> {
+        match self {
+            Self::Gradient {
+                gradient,
+                reference,
+            } => {
+                gradient
+                    .validate()
+                    .map_err(|e| EffectsError::OutOfRange { field: e.field })?;
+                if let Some(r) = reference
+                    && (r.width == 0
+                        || r.height == 0
+                        || r.dx.unsigned_abs() > crate::MAX_DOCUMENT_ORIGIN.unsigned_abs()
+                        || r.dy.unsigned_abs() > crate::MAX_DOCUMENT_ORIGIN.unsigned_abs())
+                {
+                    return Err(EffectsError::OutOfRange {
+                        field: "gradient reference box",
+                    });
+                }
+                if !gradient.align {
+                    return Err(EffectsError::OutOfRange {
+                        field: "gradient alignment",
+                    });
+                }
+                Ok(())
+            }
+            Self::Pattern {
+                pattern,
+                scale,
+                origin,
+            } => {
+                if pattern.is_empty() || pattern.len() > crate::pattern::MAX_PATTERN_ID_BYTES {
+                    return Err(EffectsError::OutOfRange {
+                        field: "pattern ID",
+                    });
+                }
+                if !(MIN_PATTERN_SCALE..=MAX_PATTERN_SCALE).contains(scale) {
+                    return Err(EffectsError::OutOfRange {
+                        field: "pattern scale",
+                    });
+                }
+                let max = f64::from(crate::MAX_DOCUMENT_EXTENT);
+                if !(origin.0.is_finite()
+                    && origin.1.is_finite()
+                    && origin.0.abs() <= max
+                    && origin.1.abs() <= max)
+                {
+                    return Err(EffectsError::OutOfRange {
+                        field: "pattern origin",
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// A stroke (`FrFX`).
@@ -382,6 +486,24 @@ pub struct Stroke {
     /// `Sz  `, pixels, `0.0..=MAX_EFFECT_SIZE`.
     pub size: f32,
     pub color: EffectColor,
+    /// What a gradient or pattern stroke is painted with (task 118);
+    /// `None` for a solid stroke, and for a gradient or pattern one
+    /// Aurora cannot draw (a Noise gradient, a pattern it cannot read).
+    /// `#[serde(skip)]`: see [`StrokePaint`].
+    #[serde(skip)]
+    pub paint: Option<StrokePaint>,
+}
+
+impl Stroke {
+    /// Whether Aurora draws this stroke: a solid one, or a gradient or
+    /// pattern one that carries its paint.
+    #[must_use]
+    pub fn drawn(&self) -> bool {
+        match self.fill {
+            StrokeFill::Color => true,
+            StrokeFill::Gradient | StrokeFill::Pattern => self.paint.is_some(),
+        }
+    }
 }
 
 impl Default for Stroke {
@@ -394,6 +516,7 @@ impl Default for Stroke {
             opacity: 1.0,
             size: 3.0,
             color: EffectColor::default(),
+            paint: None,
         }
     }
 }
@@ -757,6 +880,14 @@ impl LayerEffects {
             color(s.color)?;
             unit(s.opacity, "opacity")?;
             in_range(s.size, 0.0, MAX_EFFECT_SIZE, "size")?;
+            if let Some(paint) = &s.paint {
+                if paint.fill() != s.fill {
+                    return Err(EffectsError::OutOfRange {
+                        field: "stroke paint",
+                    });
+                }
+                paint.validate()?;
+            }
         }
         for g in &self.outer_glows {
             color(g.color)?;
@@ -799,21 +930,23 @@ impl LayerEffects {
         self.strokes.iter().filter(|e| self.shows(e.gate)).count()
     }
 
-    /// The solid-colour strokes Photoshop would draw and Aurora draws
-    /// (0.190.0).
+    /// The strokes Photoshop would draw and Aurora draws: solid ones
+    /// (0.190.0) and gradient or pattern ones that carry their paint
+    /// (task 118).
     #[must_use]
-    pub fn shown_color_strokes(&self) -> usize {
+    pub fn shown_drawn_strokes(&self) -> usize {
         self.strokes
             .iter()
-            .filter(|e| self.shows(e.gate) && e.fill == StrokeFill::Color)
+            .filter(|e| self.shows(e.gate) && e.drawn())
             .count()
     }
 
-    /// The gradient and pattern strokes Photoshop would draw and Aurora
-    /// does not (0.190.0).
+    /// The strokes Photoshop would draw and Aurora does not: a gradient or
+    /// pattern stroke it could not read (task 118; before that, every
+    /// such stroke).
     #[must_use]
     pub fn shown_unrendered_strokes(&self) -> usize {
-        self.shown_strokes() - self.shown_color_strokes()
+        self.shown_strokes() - self.shown_drawn_strokes()
     }
 
     /// The outer glows Photoshop would draw.
@@ -1010,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn only_solid_colour_strokes_are_drawn() {
+    fn only_solid_and_painted_strokes_are_drawn() {
         let mut fx = LayerEffects::default();
         fx.strokes.push(Stroke::default());
         fx.strokes.push(Stroke {
@@ -1025,8 +1158,146 @@ mod tests {
         off.gate.enabled = false;
         fx.strokes.push(off);
         assert_eq!(fx.shown_strokes(), 3);
-        assert_eq!(fx.shown_color_strokes(), 1);
+        assert_eq!(fx.shown_drawn_strokes(), 1);
         assert_eq!(fx.shown_unrendered_strokes(), 2);
+        // Giving the gradient stroke its paint draws it; the pattern one
+        // is still not.
+        if let Some(s) = fx.strokes.get_mut(1) {
+            s.paint = Some(stroke_gradient());
+        }
+        assert_eq!(fx.shown_drawn_strokes(), 2);
+        assert_eq!(fx.shown_unrendered_strokes(), 1);
+        if let Some(s) = fx.strokes.get_mut(2) {
+            s.paint = Some(stroke_pattern());
+        }
+        assert_eq!(fx.shown_drawn_strokes(), 3);
+        assert_eq!(fx.shown_unrendered_strokes(), 0);
+        // A hidden stroke is neither.
+        if let Some(s) = fx.strokes.get_mut(1) {
+            s.gate.present = false;
+        }
+        assert_eq!(fx.shown_drawn_strokes(), 2);
+    }
+
+    fn stroke_gradient() -> StrokePaint {
+        StrokePaint::Gradient {
+            gradient: ramp(),
+            reference: None,
+        }
+    }
+
+    fn stroke_pattern() -> StrokePaint {
+        StrokePaint::Pattern {
+            pattern: "p".to_owned(),
+            scale: 1.0,
+            origin: (0.0, 0.0),
+        }
+    }
+
+    #[test]
+    fn a_stroke_paint_must_match_its_fill_and_be_valid() {
+        let with = |fill, paint: Option<StrokePaint>| LayerEffects {
+            strokes: vec![Stroke {
+                fill,
+                paint,
+                ..Stroke::default()
+            }],
+            ..LayerEffects::default()
+        };
+        assert!(
+            with(StrokeFill::Gradient, Some(stroke_gradient()))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            with(StrokeFill::Pattern, Some(stroke_pattern()))
+                .validate()
+                .is_ok()
+        );
+        // The kind on the wire and the paint must agree, both ways, and a
+        // solid stroke carries none.
+        for (fill, paint) in [
+            (StrokeFill::Pattern, stroke_gradient()),
+            (StrokeFill::Gradient, stroke_pattern()),
+            (StrokeFill::Color, stroke_gradient()),
+            (StrokeFill::Color, stroke_pattern()),
+        ] {
+            assert_eq!(
+                with(fill, Some(paint)).validate(),
+                Err(EffectsError::OutOfRange {
+                    field: "stroke paint"
+                })
+            );
+        }
+        // The paint's own limits.
+        let bad_scale = StrokePaint::Pattern {
+            pattern: "p".to_owned(),
+            scale: 11.0,
+            origin: (0.0, 0.0),
+        };
+        let bad_id = StrokePaint::Pattern {
+            pattern: String::new(),
+            scale: 1.0,
+            origin: (0.0, 0.0),
+        };
+        let bad_origin = StrokePaint::Pattern {
+            pattern: "p".to_owned(),
+            scale: 1.0,
+            origin: (f64::NAN, 0.0),
+        };
+        for paint in [bad_scale, bad_id, bad_origin] {
+            assert!(with(StrokeFill::Pattern, Some(paint)).validate().is_err());
+        }
+        let mut unaligned = ramp();
+        unaligned.align = false;
+        let unaligned = StrokePaint::Gradient {
+            gradient: unaligned,
+            reference: None,
+        };
+        assert!(
+            with(StrokeFill::Gradient, Some(unaligned))
+                .validate()
+                .is_err()
+        );
+        let empty_box = StrokePaint::Gradient {
+            gradient: ramp(),
+            reference: Some(ReferenceBox {
+                dx: 0,
+                dy: 0,
+                width: 0,
+                height: 4,
+            }),
+        };
+        assert!(
+            with(StrokeFill::Gradient, Some(empty_box))
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_stroke_paint_is_not_on_the_effects_wire() {
+        let fx = LayerEffects {
+            strokes: vec![Stroke {
+                fill: StrokeFill::Gradient,
+                paint: Some(stroke_gradient()),
+                ..Stroke::default()
+            }],
+            ..LayerEffects::default()
+        };
+        let plain = LayerEffects {
+            strokes: vec![Stroke {
+                fill: StrokeFill::Gradient,
+                ..Stroke::default()
+            }],
+            ..LayerEffects::default()
+        };
+        let bytes = postcard::to_allocvec(&fx).unwrap_or_default();
+        // Byte-identical to the same stroke without a paint: the wire
+        // knows nothing of it.
+        assert_eq!(bytes, postcard::to_allocvec(&plain).unwrap_or_default());
+        let back: Result<LayerEffects, _> = postcard::from_bytes(&bytes);
+        assert_eq!(back.ok(), Some(plain));
     }
 
     fn ramp() -> crate::GradientFill {
