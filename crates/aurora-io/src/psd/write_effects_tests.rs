@@ -926,3 +926,31 @@ fn a_pattern_that_cannot_be_encoded_drops_its_effect_instead_of_the_save() {
     let d = parse(&encoded.lfx2);
     assert!(d.get(b"patternFill").is_none() && d.get(b"FrFX").is_some());
 }
+
+#[test]
+fn with_the_switch_off_no_paint_is_encoded_even_when_the_pool_has_the_pattern() {
+    let pool: std::collections::BTreeMap<String, Pattern> =
+        std::iter::once(("pat-a".to_owned(), pattern("pat-a"))).collect();
+    let ctx = Ctx {
+        paints: false,
+        global_angle: 120.0,
+        patterns: &pool,
+    };
+    let mut fx = rich_effects();
+    fx.color_overlays.clear();
+    fx.drop_shadows.clear();
+    fx.outer_glows.clear();
+    fx.strokes.clear();
+    let (encoded, _) = write_effects::encode(&fx, None, &ctx);
+    assert!(
+        encoded.is_none(),
+        "only gradient and pattern overlays were set"
+    );
+    // And a mixed layer keeps its solid parts only, with no `fxrp` or pool.
+    let fx = rich_effects();
+    let (encoded, _) = write_effects::encode(&fx, None, &ctx);
+    let encoded = encoded.unwrap_or_else(|| unreachable!("solid kinds"));
+    assert!(encoded.fxrp.is_none() && encoded.patterns.is_empty());
+    let d = parse(&encoded.lfx2);
+    assert!(d.get(b"GrFl").is_none() && d.get(b"patternFill").is_none());
+}

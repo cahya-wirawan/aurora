@@ -716,8 +716,14 @@ def check_effects(folder):
             # A gradient or pattern stroke Aurora could not draw is itemised in
             # the save report and not written: those may be fewer, never more.
             def split(effects):
-                solid = [e for e in effects if not (e[0] == "stroke" and e[11] != b"SClr")]
-                other = [e for e in effects if e[0] == "stroke" and e[11] != b"SClr"]
+                # The default save does not write gradient/pattern overlays or
+                # strokes (unverified in Photoshop): they are compared as "may be
+                # fewer, never more".
+                def unverified(e):
+                    return e[0] in ("gradient overlay", "pattern overlay") or (
+                        e[0] == "stroke" and e[11] != b"SClr")
+                solid = [e for e in effects if not unverified(e)]
+                other = [e for e in effects if unverified(e)]
                 return solid, other
             want, want_paint = split(want)
             got, got_paint = split(got)
@@ -737,8 +743,10 @@ def check_effects(folder):
             check(f"{name} global light angle", angle_r, angle_o)
         pools_o = original.tagged_blocks.get_data(Tag.PATTERNS1) if original.tagged_blocks else None
         pools_r = resaved.tagged_blocks.get_data(Tag.PATTERNS1) if resaved.tagged_blocks else None
-        if pools_o:
-            check(f"{name} pattern pool is written", pools_r is not None, True)
+        # The default save writes no pattern effects (unverified in Photoshop),
+        # so no `Patt` pool is expected; one present must still parse.
+        if pools_r is not None:
+            print(f"  note: {name}: a Patt pool is present ({len(pools_r)} patterns)")
         print(f"  {name}: {len(layers)} layers with effects read by psd-tools")
     print(f"OK: {found} re-saved corpus file(s) with effects checked with psd-tools" if found
           else "not run: no resave_*.psd with effects kept")
