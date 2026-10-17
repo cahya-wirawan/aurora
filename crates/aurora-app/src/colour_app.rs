@@ -115,6 +115,7 @@ impl crate::App {
         match load_output_profile(path) {
             Ok(profile) => {
                 self.doc.colour.output = Some(profile);
+                self.doc.colour_unsaved = true;
                 self.colour_notice(NOTICE_SET);
             }
             Err(why) => self.colour_notice(why),
@@ -123,7 +124,9 @@ impl crate::App {
 
     /// Clear Output Profile: export goes back to sRGB.
     pub(crate) fn clear_output_profile(&mut self) {
-        self.doc.colour.output = None;
+        if self.doc.colour.output.take().is_some() {
+            self.doc.colour_unsaved = true;
+        }
         self.colour_notice(NOTICE_CLEARED);
     }
 

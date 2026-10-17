@@ -88,7 +88,8 @@ fn assert_converted(ext: &str, tolerance: f32) {
     let &[r, g, b, ..] = first.as_slice() else {
         unreachable!()
     };
-    let want = expected(&src, [r, g, b]);
+    // The conversion clips out-of-gamut results to 0..1.
+    let want = expected(&src, [r, g, b]).map(|v| v.clamp(0.0, 1.0));
     for (got, want) in image.samples().iter().take(3).zip(want) {
         assert!(
             (got.to_f32() - want).abs() <= tolerance,
@@ -265,21 +266,33 @@ fn a_grayscale_profile_on_grayscale_data_is_reported_not_applied() {
 }
 
 #[test]
-fn extended_range_survives_the_conversion() {
-    // Adobe green is outside sRGB: red goes negative and stays negative
-    // in f16; a value above one stays above one.
+fn out_of_gamut_colour_is_clipped_after_the_conversion() {
+    // Adobe green is outside sRGB: its red would go negative. The result
+    // is clipped to 0..1 like Photoshop's conversion (design owner,
+    // 2026-10-17); alpha is untouched.
     let mut samples = vec![
         f16::from_f32(0.0),
         f16::from_f32(1.0),
         f16::from_f32(0.0),
-        f16::from_f32(1.0),
+        f16::from_f32(0.5),
     ];
     let imported = bring_into_working(&mut samples, Tagging::Icc(&adobe_bytes()), false);
     assert!(imported.source.is_some());
-    assert!(
-        samples.first().is_some_and(|r| r.to_f32() < -0.05),
+    assert_eq!(
+        samples.first().map(|r| r.to_f32()),
+        Some(0.0),
         "{samples:?}"
     );
+    assert!(
+        samples.iter().all(|c| (0.0..=1.0).contains(&c.to_f32())),
+        "{samples:?}"
+    );
+    assert_eq!(
+        samples.get(3).map(|a| a.to_f32()),
+        Some(0.5),
+        "alpha untouched"
+    );
+    // A value above one is clipped to one, too.
     let mut hdr = vec![
         f16::from_f32(1.5),
         f16::from_f32(1.5),
@@ -287,7 +300,13 @@ fn extended_range_survives_the_conversion() {
         f16::from_f32(1.0),
     ];
     let _ = bring_into_working(&mut hdr, Tagging::Icc(&adobe_bytes()), false);
-    assert!(hdr.iter().take(3).all(|c| c.to_f32() > 1.2), "{hdr:?}");
+    assert!(hdr.iter().take(3).all(|c| c.to_f32() <= 1.0), "{hdr:?}");
+    // An sRGB-equivalent profile is still a bit-exact no-op: nothing is
+    // clipped when nothing was converted.
+    let mut untouched = vec![f16::from_f32(1.5); 4];
+    let before = untouched.clone();
+    let _ = bring_into_working(&mut untouched, Tagging::Untagged, false);
+    assert_eq!(untouched, before);
 }
 
 #[test]

@@ -32398,10 +32398,7 @@ impl App {
         // carried into a Photoshop save's report), not only a status line.
         let mut items: Vec<String> = Vec::new();
         if let Some(source) = &colour.source {
-            items.push(aurora_io::converted_on_open_line(
-                &source.description,
-                false,
-            ));
+            items.push(aurora_io::converted_on_open_line(&source.description, true));
         }
         items.extend(colour.report.warnings.clone());
         items.extend(unwritten_layers_item(unwritten));
