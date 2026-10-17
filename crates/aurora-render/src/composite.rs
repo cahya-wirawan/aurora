@@ -31081,6 +31081,23 @@ mod fold_timing {
                 },
             );
         }
+        // A dab in an otherwise empty tile: most chunks skip, a few fold.
+        let mut dab = transparent_tile();
+        for (i, texel) in dab.chunks_exact_mut(CHANNELS).enumerate() {
+            let (x, y) = ((i % 256) as f32 - 128.0, (i / 256) as f32 - 128.0);
+            if x * x + y * y < 40.0 * 40.0 {
+                for (c, v) in texel.iter_mut().zip([0.6, 0.4, 0.2, 0.8]) {
+                    *c = f16::from_f32(v);
+                }
+            }
+        }
+        for mode in [BlendMode::Normal, BlendMode::Exclusion] {
+            time(&format!("{mode:?}, a dab, onto transparent"), &mut || {
+                let mut out = transparent_tile();
+                composite_layer_into(&mut out, &dab, 1.0, mode);
+                std::hint::black_box(&out);
+            });
+        }
         time("straighten an opaque tile", &mut || {
             let mut out = backdrop.clone();
             un_premultiply_in_place(&mut out);
