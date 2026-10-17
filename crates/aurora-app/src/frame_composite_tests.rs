@@ -203,6 +203,7 @@ fn one_stale_tile_stays_sequential_and_duplicates_composite_once() {
         (0, 0),
         &mut costs,
     ));
+    let composites_before = tile_composites();
     let before = crate::RECOMPOSITE_FOLD_COUNTS
         .get(1)
         .map_or(0, |n| n.load(std::sync::atomic::Ordering::Relaxed));
@@ -221,6 +222,53 @@ fn one_stale_tile_stays_sequential_and_duplicates_composite_once() {
     // Process-global, so other tests can add; at least the two stale tiles.
     assert!(after - before >= 2, "{before} {after}");
     assert!(cache.is_current(b) && cache.is_current(c));
+    // Exactly two composites (the pool's profile is merged into this
+    // thread's): `b` and `c` once each, `a` not at all.
+    assert_eq!(tile_composites() - composites_before, 2);
+}
+
+/// Tile composites recorded on this thread's profile (the pool's merged in).
+fn tile_composites() -> u64 {
+    crate::COMPOSITE_PROFILE.with(|profile| {
+        profile
+            .get()
+            .slots
+            .get(crate::ProfileSlot::TileComposite as usize)
+            .map_or(0, |slot| slot.0)
+    })
+}
+
+/// A document the GPU can composite keeps the GPU arm with the parallel
+/// path on: no tile is composited on the CPU.
+#[test]
+fn a_gpu_document_keeps_the_gpu_arm_with_the_pool_on() {
+    if !pool_or_skip() {
+        return;
+    }
+    let Some(context) = crate::tests::real_gpu_context() else {
+        return;
+    };
+    let (_d, mut store) = store_with_budget(256);
+    let mut layers = aurora_doc::LayerTree::new();
+    let _ = layer(&mut layers, &mut store, None, rect(0, 0, 512, 512), &opaque);
+    assert!(crate::document_qualifies_for_gpu_compositing(&layers));
+    let mut compositor = aurora_render::TileCompositor::new(context.device());
+    let _switch = Parallel::set(true);
+    let mut cache = CompositeCache::default();
+    let before = tile_composites();
+    recomposite_tiles(
+        &grid(2),
+        &layers,
+        None,
+        &mut store,
+        &mut cache,
+        Some(&context),
+        Some(&mut compositor),
+    );
+    assert_eq!(tile_composites() - before, 0, "every tile went to the GPU");
+    for id in grid(2) {
+        assert!(cache.is_current(id), "{id:?}");
+    }
 }
 
 #[test]
