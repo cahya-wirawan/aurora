@@ -60,7 +60,7 @@ impl App {
     }
 
     /// Drops any tooltip outright (window blur, a dialog or the palette
-    /// opening, a document switch).
+    /// opening); a document switch is not wired: its Ctrl+Tab key press dismisses instead.
     pub(crate) fn clear_tooltip(&mut self) {
         if self.tooltip_hover.clear(&mut self.workspace) {
             self.tooltip_tree_changed();

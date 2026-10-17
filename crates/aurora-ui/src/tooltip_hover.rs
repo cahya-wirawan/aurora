@@ -26,7 +26,7 @@
 //! - a press, a key, a wheel step ([`TooltipHover::dismiss`]): the owner's
 //!   tooltip stays hidden until the pointer leaves it and comes back
 //!   (WCAG 2.2 1.4.13 "dismissible");
-//! - a dialog or the palette opening, a document switch
+//! - a dialog or the palette opening, a window blur
 //!   ([`TooltipHover::clear`]).
 //!
 //! **Hoverable, not blocking.** A pointer that moves onto the shown tooltip
