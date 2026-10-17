@@ -560,3 +560,88 @@ fn corpus_narrow_move_equals_full_recomposite() {
         "{opened} {narrow} {kept}"
     );
 }
+
+/// What a Move drag's pointer event costs in recompositing, the old way
+/// (bump every cached tile) against the narrow one, on the same fixture:
+/// a 2048 x 1280 view (8 x 5 composite tiles) of an opaque background, a
+/// Multiply layer over all of it and a 300 x 300 layer dragged 7 px an
+/// event. Printed, not asserted, but for a loose CI-safety bound.
+#[test]
+fn move_drag_recomposite_cost_is_measured() {
+    const FRAMES: usize = 40;
+    let (_d, mut store) = store_with_budget(512);
+    let mut layers = aurora_doc::LayerTree::new();
+    let _ = layer(
+        &mut layers,
+        &mut store,
+        None,
+        rect(0, 0, 2048, 1280),
+        &opaque,
+    );
+    let mid = layer(
+        &mut layers,
+        &mut store,
+        None,
+        rect(0, 0, 2048, 1280),
+        &translucent,
+    );
+    ok(layers.set_blend_mode(mid, aurora_doc::BlendMode::Multiply));
+    let moved = layer(
+        &mut layers,
+        &mut store,
+        None,
+        rect(400, 300, 300, 300),
+        &opaque,
+    );
+    let view: Vec<aurora_tile::TileId> = (0..5)
+        .flat_map(|y| (0..8).map(move |x| aurora_tile::TileId { x, y }))
+        .collect();
+    for run in 0..3 {
+        for narrow in [false, true] {
+            ok(layers.set_bounds(moved, rect(400, 300, 300, 300)));
+            let mut cache = CompositeCache::default();
+            let reference = composite_reference_origin(&layers, Some(moved));
+            for &id in &view {
+                let _ = composite(&layers, &mut store, id, reference, false);
+                cache.mark_current(id);
+            }
+            let mut times = Vec::with_capacity(FRAMES);
+            let mut recomposited = 0;
+            for frame in 0..FRAMES {
+                let t0 = std::time::Instant::now();
+                let to = rect(400 + 7 * frame as i64, 300 + 3 * frame as i64, 300, 300);
+                if narrow {
+                    let _ = ok(move_layer_live(
+                        &mut layers,
+                        &mut cache,
+                        Some(&store),
+                        Some(moved),
+                        moved,
+                        to,
+                    ));
+                } else {
+                    ok(layers.set_bounds(moved, to));
+                    cache.bump();
+                }
+                for &id in &view {
+                    if !cache.is_current(id) {
+                        let _ = composite(&layers, &mut store, id, reference, false);
+                        cache.mark_current(id);
+                        recomposited += 1;
+                    }
+                }
+                times.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            let mean = times.iter().sum::<f64>() / times.len() as f64;
+            let max = times.iter().copied().fold(0.0, f64::max);
+            println!(
+                "move drag ({}): run {run} n={FRAMES} mean={mean:.2}ms max={max:.2}ms \
+                 recomposited={:.1} tiles/event of {}",
+                if narrow { "narrow" } else { "bump" },
+                recomposited as f64 / FRAMES as f64,
+                view.len()
+            );
+            assert!(mean < 5000.0, "CI-safety bound only: {mean:.2}ms");
+        }
+    }
+}
