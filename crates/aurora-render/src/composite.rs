@@ -2508,6 +2508,10 @@ pub struct TileCompositor {
     /// How many pipelines were taken from [`Self::background`] into the
     /// cache (test evidence that a composite used one).
     background_adopted: usize,
+    /// Test-only: the background build's thread, so a test can wait for
+    /// it to finish without taking anything from [`Self::background`].
+    #[cfg(test)]
+    background_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Builds [`TileCompositor::bind_group_layout_blend`]: the opacity
@@ -2796,6 +2800,8 @@ impl TileCompositor {
             gradient_map: None,
             background: None,
             background_adopted: 0,
+            #[cfg(test)]
+            background_thread: None,
         }
     }
 
@@ -2885,7 +2891,7 @@ impl TileCompositor {
             self.bind_group_layout_blend.clone()
         };
         let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("aurora-pipeline-prewarm".to_owned())
             .spawn(move || {
                 let started = std::time::Instant::now();
@@ -2915,6 +2921,12 @@ impl TileCompositor {
                     "blend pipelines prewarmed in the background"
                 );
             })?;
+        #[cfg(test)]
+        {
+            self.background_thread = Some(thread);
+        }
+        #[cfg(not(test))]
+        drop(thread);
         self.background = Some(receiver);
         Ok(())
     }
@@ -6596,8 +6608,8 @@ impl std::fmt::Debug for TileCompositor {
 mod tests {
 
     use super::{
-        chunk_folds_to_backdrop, fold_texel, set_transparent_skip_enabled,
-        transparent_chunks_skipped, un_premultiply_per_sample,
+        chunk_folds_to_backdrop, set_transparent_skip_enabled, transparent_chunks_skipped,
+        un_premultiply_per_sample,
     };
     use half::slice::HalfFloatSliceExt as _;
 
@@ -9147,6 +9159,35 @@ mod tests {
              {built_ms:.2} ms",
             ALL_BLEND_PASSES.len()
         );
+    }
+
+    /// 60 FPS round 6: once the background thread has finished, the
+    /// composite calls themselves take its pipelines (nothing else has
+    /// adopted them yet) and build none.
+    #[test]
+    fn composite_calls_adopt_the_finished_background_pipelines() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let mut compositor = TileCompositor::new(device);
+        assert!(
+            compositor
+                .prewarm_blend_pipelines_in_background(device)
+                .is_ok()
+        );
+        if let Some(thread) = compositor.background_thread.take() {
+            assert!(thread.join().is_ok());
+        }
+        assert_eq!(
+            compositor.pipelines.len(),
+            0,
+            "nothing adopted before a composite"
+        );
+        let _ = blend_pass_texels(&context, &mut compositor);
+        assert_eq!(compositor.background_adopted, ALL_BLEND_PASSES.len());
+        assert_eq!(compositor.pipelines.len(), ALL_BLEND_PASSES.len());
+        assert!(!compositor.poll_background_pipelines(), "the build is over");
     }
 
     /// 60 FPS round 6: a composite that runs before the background build
@@ -30284,7 +30325,7 @@ mod tests {
                 let [dr, dg, db, da] = dst else { continue };
                 let [sr, sg, sb, sa] = src else { continue };
                 let [nr, ng, nb, na] =
-                    fold_texel([*dr, *dg, *db, *da], [*sr, *sg, *sb, *sa], opacity, mode);
+                    fold_texel_round5([*dr, *dg, *db, *da], [*sr, *sg, *sb, *sa], opacity, mode);
                 *dr = nr;
                 *dg = ng;
                 *db = nb;
@@ -30292,6 +30333,42 @@ mod tests {
             }
             dst_chunk.convert_from_f32_slice(&dst_wide);
         }
+    }
+
+    /// `fold_texel` as it was before round 6, verbatim (the arithmetic
+    /// now lives in `fold_texel_with`; a copy here keeps the reference
+    /// independent of it).
+    fn fold_texel_round5(
+        dst: [f32; CHANNELS],
+        src: [f32; CHANNELS],
+        opacity: f32,
+        mode: BlendMode,
+    ) -> [f32; CHANNELS] {
+        let [dr, dg, db, da] = dst;
+        let [sr, sg, sb, sa] = src;
+        let alpha = sa * opacity;
+        let inverse = 1.0 - alpha;
+        let backdrop_alpha = da;
+        let backdrop_inverse = 1.0 - backdrop_alpha;
+        let straight_backdrop = if backdrop_alpha > 0.0 {
+            [
+                dr / backdrop_alpha,
+                dg / backdrop_alpha,
+                db / backdrop_alpha,
+            ]
+        } else {
+            [0.0, 0.0, 0.0]
+        };
+        let [br, bg, bb] = blend_rgb(mode, straight_backdrop, [sr, sg, sb]);
+        let blended_r = backdrop_inverse * sr + backdrop_alpha * br;
+        let blended_g = backdrop_inverse * sg + backdrop_alpha * bg;
+        let blended_b = backdrop_inverse * sb + backdrop_alpha * bb;
+        [
+            inverse * dr + alpha * blended_r,
+            inverse * dg + alpha * blended_g,
+            inverse * db + alpha * blended_b,
+            alpha + da * inverse,
+        ]
     }
 
     /// One tile (65,536 texels) whose texel `i` is `base` with the sample
