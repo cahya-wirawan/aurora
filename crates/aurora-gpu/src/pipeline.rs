@@ -65,6 +65,25 @@ impl PipelineCache {
         self.pipelines.entry(key).or_insert_with(build)
     }
 
+    /// Caches `pipeline` under `key` unless a pipeline is cached for it
+    /// already, which is kept (60 FPS round 6: a pipeline built on another
+    /// thread from the same descriptor). Returns whether it was inserted.
+    pub fn insert_if_absent(&mut self, key: PipelineKey, pipeline: wgpu::RenderPipeline) -> bool {
+        match self.pipelines.entry(key) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(pipeline);
+                true
+            }
+        }
+    }
+
+    /// Whether a pipeline is cached for `key`.
+    #[must_use]
+    pub fn contains(&self, key: &PipelineKey) -> bool {
+        self.pipelines.contains_key(key)
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.pipelines.len()

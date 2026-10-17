@@ -23788,8 +23788,9 @@ impl RecompositeTileCosts {
 /// 60 FPS round 5: builds the canvas pipeline for the window's surface
 /// format and the compositor's `Normal` pipelines at startup, instead of
 /// inside the first frame that needs them (measured there at 10-17 ms
-/// with a cold driver pipeline cache). Blend-mode pipelines stay lazy:
-/// all 18 cost about 138 ms with a cold driver cache (6 ms warm). Every
+/// with a cold driver pipeline cache). Blend-mode pipelines (all 18 cost
+/// about 138 ms with a cold driver cache, 6 ms warm) are started on a
+/// background thread (round 6), so startup does not wait for them. Every
 /// `wgpu` error is captured and logged, so a failed prewarm never aborts
 /// startup, and what a failed build may have cached (an invalid handle)
 /// is dropped -- a fresh `CanvasPipeline` here, an emptied cache inside
@@ -23824,6 +23825,16 @@ fn prewarm_gpu_pipelines(
             %err,
             "prewarming the composite pipelines failed; they will be built on first use"
         ),
+    }
+    // 60 FPS round 6: the blend-mode pipelines are built on a background
+    // thread instead of by the first frame using each mode; a frame that
+    // gets there first builds its own (`TileCompositor::prewarm_blend_pipelines_in_background`).
+    if let Err(err) = compositor.prewarm_blend_pipelines_in_background(device) {
+        tracing::warn!(
+            %err,
+            "could not start building the blend pipelines in the background; they will be built \
+             on first use"
+        );
     }
 }
 
@@ -66448,6 +66459,23 @@ mod tests {
             let _ = canvas_pipeline.pipeline(device, wgpu::TextureFormat::Rgba8Unorm);
             let _ = compositor.prewarm(device, false).ok();
         }
+        // 60 FPS round 6: `AURORA_R6_BLEND_PREWARM=background` starts the
+        // blend pipelines' background build as `App` does and does not wait
+        // for it; `finished` waits until it is done (the first frame of a
+        // session that has been open for a moment). Unset, they stay lazy,
+        // as the gate fixtures always measured them.
+        match std::env::var("AURORA_R6_BLEND_PREWARM").as_deref() {
+            Ok("background") => {
+                let _ = compositor.prewarm_blend_pipelines_in_background(device);
+            }
+            Ok("finished") => {
+                let _ = compositor.prewarm_blend_pipelines_in_background(device);
+                while compositor.poll_background_pipelines() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            _ => {}
+        }
 
         let target = frame_timing_target(device, viewport);
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
@@ -67756,6 +67784,83 @@ mod tests {
     /// now confirmed by bisect rather than hypothesized), and the
     /// disclosed limitations — chiefly that the poll-wait number is
     /// wall-clock stall, not GPU execution time.
+    /// 60 FPS round 6: the frame that first composites a blend mode on the
+    /// GPU path. A `Normal` backdrop under a `Multiply` canvas layer, both
+    /// document-sized, otherwise the gate fixture. Run with
+    /// `AURORA_R6_BLEND_PREWARM` unset (lazy: frame 0 builds the Multiply
+    /// pipeline), `background` or `finished` (see
+    /// [`measure_pan_and_paint_frames`]) to compare frame 0. Prints; asserts
+    /// only the CI-safety budget and that the GPU path ran.
+    #[test]
+    fn recomposite_and_present_loop_measures_the_first_blend_mode_frame() {
+        const BUDGET_MS: f64 = 3000.0;
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(64) else {
+            unreachable!("64 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 300_000,
+            height: 300_000,
+        };
+        let backdrop = match layers.add_pixel_layer("backdrop", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let canvas = match layers.add_pixel_layer("canvas", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(canvas, aurora_doc::BlendMode::Multiply) {
+            unreachable!("{err:?}");
+        }
+        let (Some(backdrop_surface), Some(canvas_surface)) =
+            (layers.surface_id(backdrop), layers.surface_id(canvas))
+        else {
+            unreachable!("just created as pixel layers");
+        };
+        assert!(document_qualifies_for_gpu_compositing(&layers));
+        let start = (100_000, 100_000);
+        let tiles = panned_tile_superset((800, 600), 1, start, (200, 120));
+        preseed_full_tiles(&mut store, backdrop_surface, &tiles, [0.2, 0.35, 0.55, 1.0]);
+        let mode = std::env::var("AURORA_R6_BLEND_PREWARM").unwrap_or_else(|_| "lazy".to_owned());
+        let mut stages = measure_pan_and_paint_frames(
+            &context,
+            &layers,
+            canvas,
+            canvas_surface,
+            &mut store,
+            (800, 600),
+            12,
+            start,
+            (200, 120),
+            None,
+        );
+        let frame0 = stages.total.first().copied().unwrap_or(f64::NAN);
+        let recomposite0 = stages.recomposite.first().copied().unwrap_or(f64::NAN);
+        let gpu0 = stages.gpu_tiles.first().copied().unwrap_or_default();
+        let (mean, p50, p99, max) = ms_stats(&mut stages.total);
+        println!(
+            "first blend-mode frame (blend prewarm {mode}): frame0 total={frame0:.2}ms \
+             recomposite={recomposite0:.2}ms gpu_tiles={gpu0} | n=12 mean={mean:.2}ms \
+             p50={p50:.2}ms max={max:.2}ms"
+        );
+        assert!(gpu0 > 0, "frame 0 must take the GPU path");
+        assert!(p99 < BUDGET_MS, "p99 {p99:.2}ms over the CI-safety budget");
+    }
+
     #[test]
     fn recomposite_and_present_loop_measures_pan_while_painting_at_the_300000px_ceiling() {
         // Real GitHub Actions CI runs (2026-08-12) hit p99 up to 889ms --

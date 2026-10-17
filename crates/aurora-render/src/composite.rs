@@ -2500,6 +2500,14 @@ pub struct TileCompositor {
     channel_mixer: Option<UniformAdjustmentGpu>,
     selective_color: Option<UniformAdjustmentGpu>,
     gradient_map: Option<UniformAdjustmentGpu>,
+    /// Blend-math pipelines a background thread is building (60 FPS
+    /// round 6, [`Self::prewarm_blend_pipelines_in_background`]), handed
+    /// over as each one finishes. `None` before the build starts and once
+    /// every pipeline it built has been taken.
+    background: Option<std::sync::mpsc::Receiver<(PipelineKey, wgpu::RenderPipeline)>>,
+    /// How many pipelines were taken from [`Self::background`] into the
+    /// cache (test evidence that a composite used one).
+    background_adopted: usize,
 }
 
 /// Builds [`TileCompositor::bind_group_layout_blend`]: the opacity
@@ -2609,6 +2617,23 @@ fn blend_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 /// count, not a compile error. Keep that one-entry-point-one-layout
 /// pairing intact, or fold the layout into `PipelineKey` (an
 /// `aurora-gpu` API change, not attempted here) before it stops holding.
+/// The [`PipelineKey`] of `blend_pass`'s pipeline: the one spelling shared
+/// by the composite call, [`TileCompositor::prewarm`] and the background
+/// build (60 FPS round 6).
+fn blend_pipeline_key(blend_pass: &BlendPass) -> PipelineKey {
+    PipelineKey {
+        shader: LABEL,
+        vertex_entry: "vs_composite",
+        fragment_entry: blend_pass.fragment_entry,
+        target_format: wgpu::TextureFormat::Rgba16Float,
+        // The shader computes the whole composite itself, so the
+        // fixed-function unit must do nothing at all -- a plain
+        // replace. This is the one thing that makes real blend-mode
+        // math expressible on the GPU.
+        blend: Blend::None,
+    }
+}
+
 fn composite_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
@@ -2769,6 +2794,8 @@ impl TileCompositor {
             channel_mixer: None,
             selective_color: None,
             gradient_map: None,
+            background: None,
+            background_adopted: 0,
         }
     }
 
@@ -2812,7 +2839,137 @@ impl TileCompositor {
         built
     }
 
+    /// Starts building every blend-math pipeline on a background thread
+    /// (60 FPS round 6), so the first frame that composites a blend mode
+    /// finds its pipeline built instead of paying the build (about 7.5 ms
+    /// each with a cold driver cache, 138 ms for all 18). Each pipeline is
+    /// built from the [`PipelineKey`], layout, shader module and label its
+    /// composite call builds lazily, on a clone of the same device, so the
+    /// cached pipeline is the one that call would have made and no pixel
+    /// can change. A composite call takes whatever the thread has finished
+    /// (never waiting for it) and builds the rest itself, as without this.
+    ///
+    /// Each build runs inside [`capture_wgpu_errors`] on the background
+    /// thread (`wgpu` keeps error scopes per thread, so they catch only
+    /// that thread's errors); a build that fails is logged and never
+    /// handed over, so no invalid pipeline is ever cached and that mode is
+    /// built lazily on first use. Calling this again while a build is
+    /// pending does nothing.
+    ///
+    /// # Errors
+    ///
+    /// The thread could not be spawned; nothing changes and every
+    /// pipeline is built on first use.
+    pub fn prewarm_blend_pipelines_in_background(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> std::io::Result<()> {
+        if self.background.is_some() {
+            return Ok(());
+        }
+        let wanted: Vec<(PipelineKey, &'static str)> = ALL_BLEND_PASSES
+            .iter()
+            .map(|pass| (blend_pipeline_key(pass), pass.pipeline))
+            .filter(|(key, _)| !self.pipelines.contains(key))
+            .collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let device = device.clone();
+        let shader = self.shader.clone();
+        // The test hook is read here, on the calling thread (it is
+        // thread-local), and carried into the build.
+        let layout = if prewarm_fault_injected() {
+            self.bind_group_layout.clone()
+        } else {
+            self.bind_group_layout_blend.clone()
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("aurora-pipeline-prewarm".to_owned())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let mut built = 0_usize;
+                for (key, label) in wanted {
+                    match capture_wgpu_errors(&device, || {
+                        composite_pipeline(&device, &shader, &key, &layout, label)
+                    }) {
+                        Ok(pipeline) => {
+                            if sender.send((key, pipeline)).is_err() {
+                                // The compositor is gone; nobody wants the rest.
+                                return;
+                            }
+                            built += 1;
+                        }
+                        Err(err) => tracing::warn!(
+                            %err,
+                            pipeline = label,
+                            "building a blend pipeline in the background failed; it will be \
+                             built on first use"
+                        ),
+                    }
+                }
+                tracing::info!(
+                    built,
+                    ms = started.elapsed().as_secs_f64() * 1000.0,
+                    "blend pipelines prewarmed in the background"
+                );
+            })?;
+        self.background = Some(receiver);
+        Ok(())
+    }
+
+    /// Takes into the cache whatever the background build has finished
+    /// (never waiting) and returns whether it is still building (60 FPS
+    /// round 6). Composite calls do this themselves; a caller can also
+    /// call it from an idle loop turn.
+    pub fn poll_background_pipelines(&mut self) -> bool {
+        self.adopt_background_pipelines();
+        self.background.is_some()
+    }
+
+    /// Moves every pipeline the background build has finished into the
+    /// cache, without waiting (60 FPS round 6). A pipeline the cache
+    /// already holds (built lazily meanwhile) is kept and the background
+    /// one dropped.
+    fn adopt_background_pipelines(&mut self) {
+        let Some(receiver) = &self.background else {
+            return;
+        };
+        loop {
+            match receiver.try_recv() {
+                Ok((key, pipeline)) => {
+                    if self.pipelines.insert_if_absent(key, pipeline) {
+                        self.background_adopted += 1;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.background = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Test-only: blocks until the background build has finished and
+    /// adopts everything it built.
+    #[cfg(test)]
+    fn wait_for_background_pipelines(&mut self) {
+        while let Some(receiver) = &self.background {
+            match receiver.recv() {
+                Ok((key, pipeline)) => {
+                    if self.pipelines.insert_if_absent(key, pipeline) {
+                        self.background_adopted += 1;
+                    }
+                }
+                Err(_) => self.background = None,
+            }
+        }
+    }
+
     fn prewarm_uncaptured(&mut self, device: &wgpu::Device, blend_modes: bool) -> usize {
+        self.adopt_background_pipelines();
         let before = self.pipelines.len();
         let shader = &self.shader;
         let opacity_layout = if prewarm_fault_injected() {
@@ -2838,13 +2995,7 @@ impl TileCompositor {
         if blend_modes {
             let layout = &self.bind_group_layout_blend;
             for blend_pass in ALL_BLEND_PASSES {
-                let key = PipelineKey {
-                    shader: LABEL,
-                    vertex_entry: "vs_composite",
-                    fragment_entry: blend_pass.fragment_entry,
-                    target_format: wgpu::TextureFormat::Rgba16Float,
-                    blend: Blend::None,
-                };
+                let key = blend_pipeline_key(blend_pass);
                 let _ = self.pipelines.get_or_create_with(key.clone(), || {
                     composite_pipeline(device, shader, &key, layout, blend_pass.pipeline)
                 });
@@ -5088,19 +5239,10 @@ impl TileCompositor {
         opacity: f32,
         blend_pass: &BlendPass,
     ) {
+        self.adopt_background_pipelines();
         let device = context.device();
         let opacity = opacity.clamp(0.0, 1.0);
-        let key = PipelineKey {
-            shader: LABEL,
-            vertex_entry: "vs_composite",
-            fragment_entry: blend_pass.fragment_entry,
-            target_format: wgpu::TextureFormat::Rgba16Float,
-            // The shader computes the whole composite itself, so the
-            // fixed-function unit must do nothing at all -- a plain
-            // replace. This is the one thing that makes real blend-mode
-            // math expressible on the GPU.
-            blend: Blend::None,
-        };
+        let key = blend_pipeline_key(blend_pass);
         let layout = &self.bind_group_layout_blend;
         let shader = &self.shader;
         let pipeline = self.pipelines.get_or_create_with(key.clone(), || {
@@ -8871,6 +9013,215 @@ mod tests {
         });
         let (r, g, b, a) = read_first_texel(device, queue, &dst);
         assert_eq!((r, g, b, a), (0.5, 0.0, 0.5, 1.0));
+    }
+
+    /// Composites `src` over `backdrop` with every blend pass through
+    /// `compositor` and returns each pass's resulting first texel.
+    fn blend_pass_texels(
+        context: &aurora_gpu::GpuContext,
+        compositor: &mut TileCompositor,
+    ) -> Vec<(f32, f32, f32, f32)> {
+        let device = context.device();
+        let queue = context.queue();
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+        let src = solid_tile(device, queue, [0.75, 0.5, 0.25, 0.75], usage);
+        let backdrop = solid_tile(device, queue, [0.25, 0.5, 0.75, 1.0], usage);
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        ALL_BLEND_PASSES
+            .iter()
+            .map(|pass| {
+                let dst = solid_tile(device, queue, [0.0, 0.0, 0.0, 0.0], usage);
+                let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+                submit_one(context, |encoder| {
+                    compositor.composite_blend_over_with_opacity(
+                        context,
+                        encoder,
+                        &src_view,
+                        &backdrop_view,
+                        &dst_view,
+                        0.5,
+                        pass,
+                    );
+                });
+                read_first_texel(device, queue, &dst)
+            })
+            .collect()
+    }
+
+    /// 60 FPS round 6: the background build hands over one pipeline per
+    /// blend pass, every blend composite then finds its pipeline cached
+    /// (none is rebuilt), and the pixels equal those of pipelines built
+    /// lazily by a compositor that never prewarmed. Prints the build time.
+    #[test]
+    fn background_blend_pipelines_are_used_and_draw_the_same_pixels() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let mut warmed = TileCompositor::new(device);
+        let started = std::time::Instant::now();
+        assert!(warmed.prewarm_blend_pipelines_in_background(device).is_ok());
+        let spawn_ms = started.elapsed().as_secs_f64() * 1000.0;
+        warmed.wait_for_background_pipelines();
+        let built_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(warmed.background_adopted, ALL_BLEND_PASSES.len());
+        assert_eq!(warmed.pipelines.len(), ALL_BLEND_PASSES.len());
+        let warmed_texels = blend_pass_texels(&context, &mut warmed);
+        assert_eq!(
+            warmed.pipelines.len(),
+            ALL_BLEND_PASSES.len(),
+            "every blend composite must find its background-built pipeline"
+        );
+        assert!(
+            warmed.prewarm_blend_pipelines_in_background(device).is_ok(),
+            "a second call with everything cached does nothing"
+        );
+        assert!(warmed.background.is_none());
+
+        let mut lazy = TileCompositor::new(device);
+        let lazy_texels = blend_pass_texels(&context, &mut lazy);
+        assert_eq!(lazy.pipelines.len(), ALL_BLEND_PASSES.len());
+        assert_eq!(lazy.background_adopted, 0);
+
+        // What a frame's first use of one mode costs on the calling
+        // thread: recording the pass, which builds the pipeline when it is
+        // not cached. Printed, not asserted.
+        let record_ms = |compositor: &mut TileCompositor, pass: &super::BlendPass| {
+            let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+            let queue = context.queue();
+            let src = solid_tile(device, queue, [0.75, 0.5, 0.25, 0.75], usage);
+            let dst = solid_tile(device, queue, [0.0, 0.0, 0.0, 0.0], usage);
+            let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+            let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let started = std::time::Instant::now();
+            compositor.composite_blend_over_with_opacity(
+                &context,
+                &mut encoder,
+                &src_view,
+                &src_view,
+                &dst_view,
+                0.5,
+                pass,
+            );
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            queue.submit(std::iter::once(encoder.finish()));
+            ms
+        };
+        let (mut first_lazy, mut first_adopted) = (0.0, 0.0);
+        for pass in ALL_BLEND_PASSES {
+            let mut cold = TileCompositor::new(device);
+            first_lazy += record_ms(&mut cold, pass);
+            let mut adopted = TileCompositor::new(device);
+            assert!(
+                adopted
+                    .prewarm_blend_pipelines_in_background(device)
+                    .is_ok()
+            );
+            adopted.wait_for_background_pipelines();
+            first_adopted += record_ms(&mut adopted, pass);
+        }
+        println!(
+            "first use of a blend pass on the calling thread, mean over {} passes: lazy {:.3} ms, \
+             background-built {:.3} ms",
+            ALL_BLEND_PASSES.len(),
+            first_lazy / ALL_BLEND_PASSES.len() as f64,
+            first_adopted / ALL_BLEND_PASSES.len() as f64
+        );
+        for ((pass, warmed), lazy) in ALL_BLEND_PASSES
+            .iter()
+            .zip(&warmed_texels)
+            .zip(&lazy_texels)
+        {
+            assert_eq!(
+                [warmed.0, warmed.1, warmed.2, warmed.3].map(f32::to_bits),
+                [lazy.0, lazy.1, lazy.2, lazy.3].map(f32::to_bits),
+                "{} drew differently through the background-built pipeline",
+                pass.fragment_entry
+            );
+        }
+        println!(
+            "background blend prewarm: spawn {spawn_ms:.2} ms (caller's cost), all {} built \
+             {built_ms:.2} ms",
+            ALL_BLEND_PASSES.len()
+        );
+    }
+
+    /// 60 FPS round 6: a composite that runs before the background build
+    /// has finished does not wait -- it builds what it needs itself -- and
+    /// what the thread delivers later for a mode already built is
+    /// dropped, not swapped in.
+    #[test]
+    fn a_composite_during_the_background_build_builds_its_own_pipeline() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let mut compositor = TileCompositor::new(device);
+        assert!(
+            compositor
+                .prewarm_blend_pipelines_in_background(device)
+                .is_ok()
+        );
+        let texels = blend_pass_texels(&context, &mut compositor);
+        compositor.wait_for_background_pipelines();
+        assert_eq!(compositor.pipelines.len(), ALL_BLEND_PASSES.len());
+        assert!(compositor.background_adopted <= ALL_BLEND_PASSES.len());
+        let again = blend_pass_texels(&context, &mut compositor);
+        assert_eq!(
+            texels
+                .iter()
+                .map(|t| [t.0, t.1, t.2, t.3].map(f32::to_bits))
+                .collect::<Vec<_>>(),
+            again
+                .iter()
+                .map(|t| [t.0, t.1, t.2, t.3].map(f32::to_bits))
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "composite during background build: {} of {} pipelines taken from the thread",
+            compositor.background_adopted,
+            ALL_BLEND_PASSES.len()
+        );
+    }
+
+    /// 60 FPS round 6: a background build that fails (forced through the
+    /// test hook: the wrong layout) hands nothing over, so no invalid
+    /// pipeline is cached, and the composite builds a valid one itself and
+    /// draws what a never-prewarmed compositor draws.
+    #[test]
+    fn a_failed_background_build_is_never_cached() {
+        use super::PREWARM_FAULT;
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let mut compositor = TileCompositor::new(device);
+        PREWARM_FAULT.with(|fault| fault.set(true));
+        let spawned = compositor.prewarm_blend_pipelines_in_background(device);
+        PREWARM_FAULT.with(|fault| fault.set(false));
+        assert!(spawned.is_ok());
+        compositor.wait_for_background_pipelines();
+        assert_eq!(
+            compositor.background_adopted, 0,
+            "nothing may be handed over"
+        );
+        assert_eq!(compositor.pipelines.len(), 0, "nothing may be cached");
+        let texels = blend_pass_texels(&context, &mut compositor);
+        let mut lazy = TileCompositor::new(device);
+        let lazy_texels = blend_pass_texels(&context, &mut lazy);
+        assert_eq!(
+            texels
+                .iter()
+                .map(|t| [t.0, t.1, t.2, t.3].map(f32::to_bits))
+                .collect::<Vec<_>>(),
+            lazy_texels
+                .iter()
+                .map(|t| [t.0, t.1, t.2, t.3].map(f32::to_bits))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
