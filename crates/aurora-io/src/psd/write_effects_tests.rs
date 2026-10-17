@@ -349,6 +349,26 @@ fn lfx2_of(bytes: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
+/// Writes `doc` with the unverified kinds (gradient and pattern effects,
+/// `Patt`, `fxrp`) switched ON.
+fn write_on(doc: &mut Doc) -> (Vec<u8>, super::write::PsdWriteOutcome) {
+    let mut out = std::io::Cursor::new(Vec::new());
+    let mut source = &doc.composite;
+    let outcome = ok(super::write::write_psd_limited(
+        &mut out,
+        &doc.tree,
+        doc.canvas,
+        &mut source,
+        &mut doc.store,
+        super::write::PsdSaveOptions::default(),
+        super::write::WriteLimits {
+            unverified_effects: true,
+            ..Default::default()
+        },
+    ));
+    (out.into_inner(), outcome)
+}
+
 fn verify(bytes: &[u8], outcome: &super::write::PsdWriteOutcome) {
     let dir = ok(tempfile::tempdir());
     let path = dir.path().join("fx.psd");
@@ -360,7 +380,7 @@ fn verify(bytes: &[u8], outcome: &super::write::PsdWriteOutcome) {
 fn every_effect_kind_reads_back_equal() {
     let (mut doc, id) = doc_with(rich_effects(), &[pattern("pat-a")]);
     let want = normalised(&doc.tree, id);
-    let (bytes, outcome) = ok(doc.write());
+    let (bytes, outcome) = write_on(&mut doc);
     verify(&bytes, &outcome);
     let (back, rid) = read_ids(&bytes);
     assert_eq!(normalised(&back.layers, rid), want);
@@ -381,7 +401,7 @@ fn every_effect_kind_reads_back_equal() {
 #[test]
 fn single_instances_use_single_keys_and_two_use_the_multi_list() {
     let (mut doc, _) = doc_with(rich_effects(), &[pattern("pat-a")]);
-    let (bytes, _) = ok(doc.write());
+    let (bytes, _) = write_on(&mut doc);
     let d = parse(&lfx2_of(&bytes));
     assert!(d.get(b"dropShadowMulti").is_some() && d.get(b"DrSh").is_none());
     assert!(d.get(b"frameFXMulti").is_some() && d.get(b"FrFX").is_none());
@@ -395,7 +415,7 @@ fn single_instances_use_single_keys_and_two_use_the_multi_list() {
 #[test]
 fn photoshops_field_names_and_units_are_used() {
     let (mut doc, _) = doc_with(rich_effects(), &[pattern("pat-a")]);
-    let (bytes, _) = ok(doc.write());
+    let (bytes, _) = write_on(&mut doc);
     let d = parse(&lfx2_of(&bytes));
     let shadow = d
         .get(b"dropShadowMulti")
@@ -565,7 +585,7 @@ fn contours_extra_glows_and_extra_patterns_are_itemised() {
     fx.pattern_overlays
         .push(pattern_overlay("pat-a", (0.0, 0.0)));
     let (mut doc, _) = doc_with(fx, &[pattern("pat-a")]);
-    let (bytes, outcome) = ok(doc.write());
+    let (bytes, outcome) = write_on(&mut doc);
     let items = outcome.report.items.join("\n");
     assert!(items.contains("1 effect had a custom contour"), "{items}");
     assert!(items.contains("1 extra outer glow isn't saved"), "{items}");
@@ -592,7 +612,7 @@ fn undrawn_strokes_and_missing_patterns_are_left_out_and_itemised() {
     fx.pattern_overlays
         .push(pattern_overlay("missing", (0.0, 0.0)));
     let (mut doc, _) = doc_with(fx, &[]);
-    let (bytes, outcome) = ok(doc.write());
+    let (bytes, outcome) = write_on(&mut doc);
     let items = outcome.report.items.join("\n");
     assert!(
         items.contains("1 gradient or pattern stroke that Aurora couldn't draw"),
@@ -617,7 +637,7 @@ fn gradient_stops_finer_than_the_file_are_rounded_and_itemised() {
     let mut fx = LayerEffects::default();
     fx.gradient_overlays.push(gradient_overlay(g));
     let (mut doc, _) = doc_with(fx, &[]);
-    let (_, outcome) = ok(doc.write());
+    let (_, outcome) = write_on(&mut doc);
     let items = outcome.report.items.join("\n");
     assert!(
         items.contains("1 gradient has stop positions or midpoints finer"),
@@ -627,7 +647,7 @@ fn gradient_stops_finer_than_the_file_are_rounded_and_itemised() {
     let mut fx = LayerEffects::default();
     fx.gradient_overlays.push(gradient_overlay(gradient()));
     let (mut doc, _) = doc_with(fx, &[]);
-    let (_, outcome) = ok(doc.write());
+    let (_, outcome) = write_on(&mut doc);
     assert!(!outcome.report.items.join("\n").contains("finer"));
 }
 
@@ -649,7 +669,7 @@ fn pattern_pool_block_round_trips_8_and_16_bit_patterns() {
         ..Stroke::default()
     });
     let (mut doc, _) = doc_with(fx, &[eight.clone(), deep.clone()]);
-    let (bytes, outcome) = ok(doc.write());
+    let (bytes, outcome) = write_on(&mut doc);
     verify(&bytes, &outcome);
     let (back, _) = read_ids(&bytes);
     assert_eq!(back.layers.patterns().get("p8"), Some(&eight));
@@ -661,7 +681,7 @@ fn only_the_patterns_a_layer_names_are_written() {
     let mut fx = LayerEffects::default();
     fx.pattern_overlays.push(pattern_overlay("p8", (0.0, 0.0)));
     let (mut doc, _) = doc_with(fx, &[pattern("p8"), pattern("unused")]);
-    let (bytes, _) = ok(doc.write());
+    let (bytes, _) = write_on(&mut doc);
     let (back, _) = read_ids(&bytes);
     assert!(back.layers.patterns().contains_key("p8"));
     assert!(!back.layers.patterns().contains_key("unused"));
@@ -678,7 +698,7 @@ fn pattern_origin_is_written_as_the_layers_fxrp_in_document_coordinates() {
     let id = doc.layer("Styled", rect(5, 4, 10, 8), Some((&img, 0, 0)));
     ok(doc.tree.add_pattern(pattern("pat-a")));
     ok(doc.tree.set_effects(id, Some(fx)));
-    let (bytes, _) = ok(doc.write());
+    let (bytes, _) = write_on(&mut doc);
     let at = bytes
         .windows(8)
         .position(|w| w == b"8BIMfxrp")
@@ -737,7 +757,7 @@ fn groups_carry_effects_too() {
 #[test]
 fn effects_block_is_padded_inside_its_length() {
     let (mut doc, _) = doc_with(rich_effects(), &[pattern("pat-a")]);
-    let (bytes, _) = ok(doc.write());
+    let (bytes, _) = write_on(&mut doc);
     assert_eq!(lfx2_of(&bytes).len() % 4, 0);
 }
 
@@ -745,6 +765,7 @@ fn effects_block_is_padded_inside_its_length() {
 fn nothing_to_write_gives_no_block() {
     let tree = LayerTree::new();
     let ctx = Ctx {
+        paints: true,
         global_angle: 120.0,
         patterns: tree.patterns(),
     };
@@ -769,4 +790,139 @@ fn a_pattern_of_whole_8_bit_values_is_written_with_8_bit_planes() {
     let long = write_effects::pattern_block(&[&deep]).unwrap_or_default();
     assert!(!short.is_empty() && short.len() < long.len());
     assert_eq!(long.len() - short.len(), 24);
+}
+
+fn has(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes.windows(needle.len()).any(|w| w == needle)
+}
+
+#[test]
+fn the_default_writes_only_the_verified_kinds_and_itemises_the_rest() {
+    let (mut doc, _) = doc_with(rich_effects(), &[pattern("pat-a")]);
+    let (bytes, outcome) = ok(doc.write());
+    // None of the unverified layouts reach the file.
+    for needle in [
+        &b"Grdn"[..],
+        b"Clrt",
+        b"patternFill",
+        b"Ptrn",
+        b"8BIMPatt",
+        b"8BIMfxrp",
+        b"GrFl",
+    ] {
+        assert!(!has(&bytes, needle), "{}", String::from_utf8_lossy(needle));
+    }
+    // The verified kinds do: shadows, colour overlay, the solid stroke, the glow.
+    let d = parse(&lfx2_of(&bytes));
+    assert!(d.get(b"dropShadowMulti").is_some());
+    assert!(d.get(b"SoFi").is_some() && d.get(b"OrGl").is_some());
+    let strokes = d.get(b"FrFX").and_then(Value::descriptor);
+    assert_eq!(
+        strokes
+            .and_then(|s| s.get(b"PntT"))
+            .and_then(Value::enum_value),
+        Some(&b"SClr"[..])
+    );
+    assert!(d.get(b"GrFl").is_none() && d.get(b"patternFill").is_none());
+    // The pool is not written either, and the verifier agrees.
+    assert_eq!(outcome.expected.patterns, None);
+    verify(&bytes, &outcome);
+    let items = outcome.report.items.join("\n");
+    for kind in [
+        "gradient overlay",
+        "gradient stroke",
+        "pattern overlay",
+        "pattern stroke",
+    ] {
+        assert!(
+            items.contains(&format!(
+                "Not saved (unverified in Photoshop): {kind} on “Styled”."
+            )),
+            "{kind}: {items}"
+        );
+    }
+    assert!(
+        items.contains("hasn't checked them in Photoshop"),
+        "{items}"
+    );
+    assert!(
+        items.contains("how Photoshop draws them is verified")
+            || items.contains("neither the layout nor how Photoshop draws"),
+        "{items}"
+    );
+    // The reader sees exactly the verified subset.
+    let (back, rid) = read_ids(&bytes);
+    let got = back.layers.effects(rid).cloned().unwrap_or_default();
+    assert!(got.gradient_overlays.is_empty() && got.pattern_overlays.is_empty());
+    assert_eq!(got.strokes.len(), 1);
+    assert_eq!(got.strokes.first().map(|s| s.fill), Some(StrokeFill::Color));
+    assert!(back.layers.patterns().is_empty());
+}
+
+#[test]
+fn the_preflight_names_what_the_default_does_not_save() {
+    let (doc, _) = doc_with(rich_effects(), &[pattern("pat-a")]);
+    let report = ok(super::write::psd_save_preflight(
+        &doc.tree,
+        doc.canvas,
+        super::write::PsdSaveOptions::default(),
+    ));
+    let items = report.items.join("\n");
+    assert!(items.contains("gradient overlay on “Styled”"), "{items}");
+    assert!(items.contains("pattern stroke on “Styled”"), "{items}");
+}
+
+#[test]
+fn outer_glow_fixed_values_are_itemised() {
+    let mut fx = LayerEffects::default();
+    fx.outer_glows.push(OuterGlow::default());
+    let (mut doc, _) = doc_with(fx, &[]);
+    let (_, outcome) = ok(doc.write());
+    let items = outcome.report.items.join("\n");
+    assert!(
+        items.contains("1 outer glow is saved with Photoshop's fixed Range 50 %"),
+        "{items}"
+    );
+}
+
+#[test]
+fn a_pattern_that_cannot_be_encoded_drops_its_effect_instead_of_the_save() {
+    let good = pattern("good");
+    let bad = pattern("bad");
+    let pool: std::collections::BTreeMap<String, Pattern> = [good.clone(), bad.clone()]
+        .into_iter()
+        .map(|p| (p.id().to_owned(), p))
+        .collect();
+    // The encoder fails for one pattern; it is left out of the usable pool.
+    let usable = write_effects::usable_patterns(&pool, |p| {
+        if p.id() == "bad" {
+            Err(write_effects::Unwritable)
+        } else {
+            Ok(Vec::new())
+        }
+    });
+    assert!(usable.contains_key("good") && !usable.contains_key("bad"));
+    let ctx = Ctx {
+        paints: true,
+        global_angle: 120.0,
+        patterns: &usable,
+    };
+    let mut fx = LayerEffects::default();
+    fx.color_overlays.push(ColorOverlay::default());
+    fx.pattern_overlays.push(pattern_overlay("bad", (0.0, 0.0)));
+    fx.strokes.push(Stroke {
+        fill: StrokeFill::Pattern,
+        paint: Some(StrokePaint::Pattern {
+            pattern: "good".to_owned(),
+            scale: 1.0,
+            origin: (0.0, 0.0),
+        }),
+        ..Stroke::default()
+    });
+    let (encoded, lost) = write_effects::encode(&fx, None, &ctx);
+    let encoded = encoded.unwrap_or_else(|| unreachable!("the rest is written"));
+    assert_eq!(encoded.patterns, ["good".to_owned()]);
+    assert_eq!(lost.patterns_missing, 1);
+    let d = parse(&encoded.lfx2);
+    assert!(d.get(b"patternFill").is_none() && d.get(b"FrFX").is_some());
 }

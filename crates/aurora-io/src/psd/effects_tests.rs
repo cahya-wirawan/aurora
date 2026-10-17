@@ -1284,7 +1284,7 @@ fn stroke_notes_on_open_and_psd_save() {
     };
     // Aurora could not draw it, so it is not written, and the report says so.
     assert!(
-        items.contains("1 gradient or pattern stroke that Aurora couldn't draw isn't saved"),
+        items.contains("Not saved (unverified in Photoshop): gradient stroke on"),
         "{items}"
     );
 }
@@ -1568,7 +1568,7 @@ fn psd_save_still_itemises_effects_for_a_layer_with_only_a_gradient_overlay() {
         Err(err) => unreachable!("{err:?}"),
     };
     assert!(
-        items.contains("1 layer's effects are saved in the file"),
+        items.contains("Not saved (unverified in Photoshop): gradient overlay on"),
         "{items}"
     );
 }

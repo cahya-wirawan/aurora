@@ -302,6 +302,9 @@ struct Losses {
     /// Layers whose gradient effects were laid over a box other than the
     /// rectangle the layer is saved with.
     fx_gradient_box: usize,
+    /// Layers (by name) holding effects of kinds that are not saved by
+    /// default, with the kinds.
+    fx_unverified: Vec<(String, Vec<&'static str>)>,
     /// Adjustment layers with values rounded to the file's resolution
     /// (0.205.0): Curves, Levels, Hue/Saturation; and since 0.241.0 Vibrance,
     /// Exposure, Photo Filter, Black & White, Color Balance (slots 3..=7).
@@ -403,6 +406,33 @@ fn name_list(names: &[&str]) -> String {
 
 impl Losses {
     /// One line per reason a smart object's data was not written back.
+    /// One line per effect kind that is not saved by default, naming the
+    /// layers.
+    fn unverified_items(&self) -> Vec<String> {
+        let mut items = Vec::new();
+        for kind in [
+            "gradient overlay",
+            "gradient stroke",
+            "pattern overlay",
+            "pattern stroke",
+        ] {
+            let names: Vec<&str> = self
+                .fx_unverified
+                .iter()
+                .filter(|(_, kinds)| kinds.contains(&kind))
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            items.push(format!(
+                "Not saved (unverified in Photoshop): {kind} on {}.",
+                name_list(&names)
+            ));
+        }
+        items
+    }
+
     fn smart_object_items(&self) -> Vec<String> {
         let mut items = Vec::new();
         for (drop, reason) in [
@@ -638,9 +668,11 @@ impl Losses {
                 plural(self.fx_gradient_box as u64, "layer's", "layers'")
             ));
         }
+        items.extend(self.unverified_items());
         if self.fx.layers > 0 {
             items.push(format!(
-                "{} effects are saved in the file, but Aurora hasn't checked them in Photoshop.",
+                "{} effects are saved in the file, but Aurora hasn't checked them in Photoshop: \
+                 neither the layout nor how Photoshop draws them is verified.",
                 plural(self.fx.layers as u64, "layer's", "layers'")
             ));
         }
@@ -936,7 +968,7 @@ pub fn psd_save_preflight(
     canvas: (u32, u32),
     opts: PsdSaveOptions,
 ) -> Result<PsdWriteReport, PsdSaveRefusal> {
-    preflight_losses(layers, canvas, opts).map(Losses::report)
+    preflight_losses(layers, canvas, opts, false).map(Losses::report)
 }
 
 /// What [`preflight_losses`] counts over the whole tree.
@@ -953,6 +985,7 @@ fn preflight_losses(
     layers: &LayerTree,
     canvas: (u32, u32),
     opts: PsdSaveOptions,
+    paints: bool,
 ) -> Result<Losses, PsdSaveRefusal> {
     if opts.format == PsdFormat::Psb {
         return Err(PsdSaveRefusal::PsbNotYetSupported);
@@ -972,7 +1005,8 @@ fn preflight_losses(
     let mut census = Census::default();
     let (angle, rounded) = effects_angle(layers);
     losses.fx_angle_rounded = rounded;
-    let ctx = effects_ctx(layers, angle);
+    let patterns = effect_patterns(layers, paints);
+    let ctx = effects_ctx(&patterns, angle, paints);
     census_of(layers, roots, 0, &mut census, &mut losses, &ctx);
     if let Some(depth) = census.too_deep {
         return Err(PsdSaveRefusal::GroupsTooDeep {
@@ -1030,6 +1064,14 @@ fn census_of(
         if let Some(fx) = layers.effects(id) {
             let (_, lost) = super::write_effects::encode(fx, layers.bounds(id), ctx);
             losses.fx.add(lost);
+            if !ctx.paints {
+                let kinds = super::write_effects::unverified_kinds(fx);
+                if !kinds.is_empty() {
+                    losses
+                        .fx_unverified
+                        .push((layers.name(id).unwrap_or_default().to_owned(), kinds));
+                }
+            }
         }
         match layers.kind(id) {
             Some(LayerKind::Group { children }) => {
@@ -1620,11 +1662,29 @@ fn effects_angle(layers: &LayerTree) -> (Option<i32>, bool) {
     }
 }
 
-fn effects_ctx(layers: &LayerTree, angle: Option<i32>) -> super::write_effects::Ctx<'_> {
+/// The patterns effects may name: none unless the unverified kinds are on,
+/// then the document's patterns that can be written.
+fn effect_patterns(
+    layers: &LayerTree,
+    paints: bool,
+) -> std::collections::BTreeMap<String, aurora_core::pattern::Pattern> {
+    if paints {
+        super::write_effects::writable_patterns(layers.patterns())
+    } else {
+        std::collections::BTreeMap::new()
+    }
+}
+
+fn effects_ctx(
+    patterns: &std::collections::BTreeMap<String, aurora_core::pattern::Pattern>,
+    angle: Option<i32>,
+    paints: bool,
+) -> super::write_effects::Ctx<'_> {
     #[allow(clippy::cast_precision_loss)] // within ±360
     super::write_effects::Ctx {
+        paints,
         global_angle: angle.map_or(aurora_core::effects::DEFAULT_GLOBAL_ANGLE, |a| a as f32),
-        patterns: layers.patterns(),
+        patterns,
     }
 }
 
@@ -2035,6 +2095,10 @@ pub(crate) struct WriteLimits {
     /// More written pixels than this and Aurora's reader would refuse the
     /// file: reported, not refused (N-1).
     pub reopen_budget: u64,
+    /// Also write the effect kinds that are not saved by default:
+    /// gradient and pattern overlays and strokes, `Patt` and `fxrp`
+    /// (task 120). Internal; no UI sets it.
+    pub unverified_effects: bool,
 }
 
 impl Default for WriteLimits {
@@ -2042,6 +2106,7 @@ impl Default for WriteLimits {
         Self {
             max_bytes: PSD_MAX_FILE_BYTES,
             reopen_budget: super::PIXEL_BUDGET,
+            unverified_effects: false,
         }
     }
 }
@@ -2083,7 +2148,8 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
     limits: WriteLimits,
 ) -> Result<PsdWriteOutcome, IoError> {
     let max_bytes = limits.max_bytes;
-    let mut losses = preflight_losses(layers, canvas, opts).map_err(refused)?;
+    let mut losses =
+        preflight_losses(layers, canvas, opts, limits.unverified_effects).map_err(refused)?;
     if composite.size() != canvas {
         return Err(refused(PsdSaveRefusal::CompositeSizeMismatch {
             canvas,
@@ -2091,7 +2157,8 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
         }));
     }
     let (angle, _) = effects_angle(layers);
-    let ctx = effects_ctx(layers, angle);
+    let effect_pool = effect_patterns(layers, limits.unverified_effects);
+    let ctx = effects_ctx(&effect_pool, angle, limits.unverified_effects);
     let mut plans = plan_layers(layers, store, &mut losses, &ctx)?;
     let pattern_ids: std::collections::BTreeSet<&String> = plans
         .iter()
@@ -2100,7 +2167,7 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
         .collect();
     let pool: Vec<&aurora_core::pattern::Pattern> = pattern_ids
         .iter()
-        .filter_map(|id| layers.patterns().get(id.as_str()))
+        .filter_map(|id| effect_pool.get(id.as_str()))
         .collect();
     let pattern_block = if pool.is_empty() {
         None

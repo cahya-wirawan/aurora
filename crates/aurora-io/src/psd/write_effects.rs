@@ -27,6 +27,17 @@
 //!   not in the document's pool, extra outer glows and pattern overlays are
 //!   not written.
 //!
+//! # What is written by default
+//!
+//! **Only the kinds whose layout the reader parses from Photoshop-authored
+//! corpus blocks**: drop shadows, colour overlays, solid strokes and outer
+//! glows. Gradient overlays and strokes, pattern overlays and strokes, the
+//! `Patt` pool and `fxrp` are encoded here but **not written** unless the
+//! internal switch [`Ctx::paints`] is on (`WriteLimits::unverified_effects`,
+//! no UI): nothing but Aurora's own reader has seen those layouts, and a
+//! block Photoshop misreads would damage a client file. They are itemised
+//! in the save report as not saved.
+//!
 //! Nothing here has been opened in Photoshop.
 
 #![allow(clippy::float_cmp, clippy::cast_possible_truncation)]
@@ -342,6 +353,12 @@ pub(super) struct EffectLosses {
     pub mixed_origins: usize,
     /// Gradients whose stop positions or midpoints were rounded.
     pub gradients_rounded: usize,
+    /// Outer glows written with Photoshop's fixed Range 50 %, Jitter 0 %
+    /// and anti-aliasing off (Aurora keeps none of the three).
+    pub glows_normalised: usize,
+    /// Gradient and pattern effects written with forced alignment and
+    /// phase (and no dither on strokes): Aurora models only those.
+    pub paints_normalised: usize,
 }
 
 impl EffectLosses {
@@ -355,6 +372,8 @@ impl EffectLosses {
         self.patterns_missing += other.patterns_missing;
         self.mixed_origins += other.mixed_origins;
         self.gradients_rounded += other.gradients_rounded;
+        self.glows_normalised += other.glows_normalised;
+        self.paints_normalised += other.paints_normalised;
     }
 
     /// The report lines (without the "not checked in Photoshop" one).
@@ -406,7 +425,7 @@ impl EffectLosses {
             items.push(many(
                 self.patterns_missing,
                 "pattern effect",
-                " names a pattern the document doesn't hold and isn't saved.",
+                " names a pattern the document doesn't hold, or one that can't be saved, and isn't saved.",
             ));
         }
         if self.mixed_origins > 0 {
@@ -414,6 +433,20 @@ impl EffectLosses {
                 self.mixed_origins,
                 "layer",
                 " has pattern effects placed differently; the file holds one placement per layer, so they share the first.",
+            ));
+        }
+        if self.glows_normalised > 0 {
+            items.push(many(
+                self.glows_normalised,
+                "outer glow",
+                " is saved with Photoshop's fixed Range 50 %, Jitter 0 % and anti-aliasing off (Aurora doesn't keep them).",
+            ));
+        }
+        if self.paints_normalised > 0 {
+            items.push(many(
+                self.paints_normalised,
+                "gradient or pattern effect",
+                " is saved aligned with its layer, with no pattern phase and no stroke dither (Aurora doesn't model other settings).",
             ));
         }
         if self.gradients_rounded > 0 {
@@ -430,6 +463,9 @@ impl EffectLosses {
 /// What the encoder needs from the document.
 #[derive(Clone, Copy)]
 pub(super) struct Ctx<'a> {
+    /// Write the unverified kinds too: gradient and pattern overlays and
+    /// strokes (and with them `Patt` and `fxrp`). Off by default.
+    pub paints: bool,
     /// The global light angle (resource 1037), whole degrees.
     pub global_angle: f32,
     pub patterns: &'a BTreeMap<String, Pattern>,
@@ -501,9 +537,10 @@ fn color_overlay(o: &ColorOverlay) -> Value {
 }
 
 fn outer_glow(g: &OuterGlow, loss: &mut EffectLosses) -> Value {
-    // The model keeps whether the contour was Linear only for shadows; a
-    // glow with another contour was already read as Linear.
-    let _ = loss;
+    // Range, Jitter and anti-aliasing are written as Photoshop's defaults:
+    // Aurora keeps none of them (a glow's contour was already read as
+    // Linear).
+    loss.glows_normalised += 1;
     let mut items = gate(g.gate);
     items.extend([
         ("Md  ", blend(g.blend_mode)),
@@ -719,6 +756,9 @@ fn stroke(
     place: &mut PatternPlace,
     loss: &mut EffectLosses,
 ) -> Option<Value> {
+    if s.fill != StrokeFill::Color && !ctx.paints {
+        return None;
+    }
     let mut items = gate(s.gate);
     let position: &[u8] = match s.position {
         StrokePosition::Outside => b"OutF",
@@ -785,6 +825,43 @@ fn push_kind(root: &mut Items, single: &'static str, multi: &'static str, mut va
     }
 }
 
+/// The kinds `fx` holds that are not written without
+/// [`Ctx::paints`], for the save report.
+pub(super) fn unverified_kinds(fx: &LayerEffects) -> Vec<&'static str> {
+    let mut kinds = Vec::new();
+    if !fx.gradient_overlays.is_empty() {
+        kinds.push("gradient overlay");
+    }
+    if fx.strokes.iter().any(|s| s.fill == StrokeFill::Gradient) {
+        kinds.push("gradient stroke");
+    }
+    if !fx.pattern_overlays.is_empty() {
+        kinds.push("pattern overlay");
+    }
+    if fx.strokes.iter().any(|s| s.fill == StrokeFill::Pattern) {
+        kinds.push("pattern stroke");
+    }
+    kinds
+}
+
+/// The patterns of `pool` that `encode_item` can write, cloned (pixels are
+/// shared). A pattern it cannot write is left out, so the effects naming it
+/// are dropped with an itemised line instead of refusing the save.
+pub(super) fn usable_patterns(
+    pool: &BTreeMap<String, Pattern>,
+    encode_item: impl Fn(&Pattern) -> Result<Vec<u8>, Unwritable>,
+) -> BTreeMap<String, Pattern> {
+    pool.iter()
+        .filter(|(_, p)| encode_item(p).is_ok())
+        .map(|(id, p)| (id.clone(), p.clone()))
+        .collect()
+}
+
+/// [`usable_patterns`] with the real encoder.
+pub(super) fn writable_patterns(pool: &BTreeMap<String, Pattern>) -> BTreeMap<String, Pattern> {
+    usable_patterns(pool, pattern_item)
+}
+
 /// `fx` as an `lfx2` block, its `fxrp` and the patterns it names (`None`
 /// when no effect can be written), and what was left out or rounded
 /// (reported even when nothing could be written). `bounds` is the layer's
@@ -831,22 +908,35 @@ fn encode_into(
         root.push(("OrGl", outer_glow(glow, &mut *loss)));
     }
     loss.extra_glows += fx.outer_glows.len().saturating_sub(1);
-    let gradients: Vec<Value> = fx
-        .gradient_overlays
-        .iter()
-        .map(|o| gradient_overlay(o, &mut *loss))
-        .collect();
+    let gradients: Vec<Value> = if ctx.paints {
+        fx.gradient_overlays
+            .iter()
+            .map(|o| gradient_overlay(o, &mut *loss))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    loss.paints_normalised += gradients.len();
     push_kind(&mut root, "GrFl", "gradientFillMulti", gradients);
-    let mut patterns = fx
-        .pattern_overlays
-        .iter()
-        .filter_map(|o| pattern_overlay(o, ctx, bounds, &mut place, &mut *loss));
-    if let Some(first) = patterns.next() {
-        root.push(("patternFill", first));
+    if ctx.paints {
+        let mut patterns = fx
+            .pattern_overlays
+            .iter()
+            .filter_map(|o| pattern_overlay(o, ctx, bounds, &mut place, &mut *loss));
+        let first = patterns.next();
+        drop(patterns);
+        if let Some(first) = first {
+            root.push(("patternFill", first));
+            loss.paints_normalised += 1;
+        }
+        // Only the first pattern overlay is written; the others are counted.
+        loss.extra_patterns += fx.pattern_overlays.len().saturating_sub(1);
+        loss.paints_normalised += fx
+            .strokes
+            .iter()
+            .filter(|s| s.fill != StrokeFill::Color && s.paint.is_some())
+            .count();
     }
-    drop(patterns);
-    // Only the first pattern overlay is written; the others are counted.
-    loss.extra_patterns += fx.pattern_overlays.len().saturating_sub(1);
     loss.mixed_origins += usize::from(place.mixed);
     if root.len() <= 2 {
         return None;
