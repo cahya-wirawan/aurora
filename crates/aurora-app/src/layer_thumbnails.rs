@@ -1515,16 +1515,23 @@ mod tests {
         fn settle(&mut self, visible: &[LayerId], mut now: Instant) -> Instant {
             let end = Instant::now() + Duration::from_secs(10);
             loop {
-                let _ = self
-                    .service
-                    .update(self.doc, &self.layers, &mut self.store, visible, now);
+                let again =
+                    self.service
+                        .update(self.doc, &self.layers, &mut self.store, visible, now);
                 let _ = self.service.drain();
                 // A layer whose tiles are still being read from the scratch
                 // disk (the per-turn read cap deferred it) is not pending
                 // yet: wait for those too, or a store that paged tiles out
                 // (a small residency share, as on a busy macOS runner)
                 // returns before every visible layer has its job.
-                if self.service.pending_len() == 0 && self.service.gathering.is_empty() {
+                // ... and for the layers not requested yet: one update
+                // submits at most `MAX_JOBS_PER_UPDATE` jobs and asks to be
+                // called again, so a fast worker can drain the first four
+                // before the rest exist (a macOS CI flake, 0.270.1).
+                if again.is_none()
+                    && self.service.pending_len() == 0
+                    && self.service.gathering.is_empty()
+                {
                     return now;
                 }
                 assert!(Instant::now() < end, "the worker never finished");
