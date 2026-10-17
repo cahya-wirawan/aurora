@@ -74,7 +74,8 @@ pub use psd::{
     PsdDocument, PsdImportReport, PsdMaskPixels, PsdPixelSink, PsdPixels, PsdStreamedDocument,
     build_document as build_psd_document, decode as decode_psd,
     encode_mask_pixels as encode_psd_mask, merged_image as decode_psd_merged_image,
-    read as read_psd, read_streaming as read_psd_streaming, write_mask_pixels as write_psd_mask,
+    merged_image_in_working_space as decode_psd_merged_image_in_working_space, read as read_psd,
+    read_streaming as read_psd_streaming, write_mask_pixels as write_psd_mask,
 };
 pub use safe_save::{
     DIR_SYNC_ADVISORY, VerifiedTemp, replace_verified, replace_verified_advised,

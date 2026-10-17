@@ -72,6 +72,12 @@ impl Image {
         &self.color_space
     }
 
+    /// The samples, mutably: colour conversion at import rewrites them in
+    /// place.
+    pub(crate) fn samples_mut(&mut self) -> &mut [f16] {
+        &mut self.samples
+    }
+
     /// `width * height * 4` `f16` samples, row-major RGBA.
     #[must_use]
     pub fn samples(&self) -> &[f16] {
