@@ -179,6 +179,7 @@ pub fn place_tooltip(
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use aurora_core::Rect;
 

@@ -33242,7 +33242,6 @@ impl App {
         self.update_gallery_hover(Some(position));
         self.update_toolbar_hover(Some(position));
         self.update_menu_bar_hover(Some(position));
-        self.update_tooltip_hover(Some(position));
 
         if let Some(resize) = self.rail_resize {
             let new_width = resized_rail_width(resize, position.0);
@@ -35352,6 +35351,8 @@ impl App {
             Ok(false) => {}
             Err(err) => tracing::warn!(?err, "tools panel hover failed"),
         }
+        // 0.262.0: and the tooltips follow the same pointer.
+        self.update_tooltip_hover(position);
     }
 
     /// Reports the pointer (`None`: it left the window) to the gallery's
@@ -37438,7 +37439,6 @@ impl ApplicationHandler<AppEvent> for App {
                 self.update_gallery_hover(None);
                 self.update_toolbar_hover(None);
                 self.update_menu_bar_hover(None);
-                self.update_tooltip_hover(None);
             }
             _ => {}
         }

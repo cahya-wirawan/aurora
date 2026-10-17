@@ -820,19 +820,16 @@ impl Tooltip {
             size_px: self.metrics.text_px,
             ..base
         };
-        let (width, height) = match engine {
-            Some(engine) => {
-                let line = engine.shape(&text, &style, scale_factor);
-                (line.width, line.line_height)
-            }
-            None => {
-                #[allow(clippy::cast_precision_loss)]
-                let chars = text.chars().count() as f32;
-                (
-                    chars * style.size_px * 0.6,
-                    style.size_px * style.line_height,
-                )
-            }
+        let (width, height) = if let Some(engine) = engine {
+            let line = engine.shape(&text, &style, scale_factor);
+            (line.width, line.line_height)
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            let chars = text.chars().count() as f32;
+            (
+                chars * style.size_px * 0.6,
+                style.size_px * style.line_height,
+            )
         };
         tooltip_size(
             width,
@@ -2462,6 +2459,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn the_measured_size_follows_the_text_and_is_capped() {
         let scales = test_scales();
         let (tree, button, _) = fixture();
@@ -2495,7 +2493,9 @@ mod tests {
     fn an_assistive_hidden_tooltip_is_hidden_and_the_default_is_not() {
         let (mut tree, _b, mut plain) = fixture();
         let node = show(&mut tree, &mut plain, Instant::now());
-        let hidden_default = tree.accessibility(node).is_some_and(|n| n.is_hidden());
+        let hidden_default = tree
+            .accessibility(node)
+            .is_some_and(accesskit::Node::is_hidden);
         assert!(!hidden_default, "default: announced like before");
         let (mut tree, button, _) = fixture();
         let mut quiet = ok(Tooltip::new(
@@ -2508,9 +2508,13 @@ mod tests {
         .with_assistive_hidden(true);
         let node = show(&mut tree, &mut quiet, Instant::now());
         let access = tree.accessibility(node);
-        assert!(access.is_some_and(|n| n.is_hidden()));
+        assert!(access.is_some_and(accesskit::Node::is_hidden));
         assert_eq!(access.and_then(|n| n.label()), Some("Apply the change"));
         // The owner's node is untouched either way.
-        assert!(!tree.accessibility(button).is_some_and(|n| n.is_hidden()));
+        assert!(
+            !tree
+                .accessibility(button)
+                .is_some_and(accesskit::Node::is_hidden)
+        );
     }
 }

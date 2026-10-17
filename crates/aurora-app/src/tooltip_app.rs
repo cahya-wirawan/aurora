@@ -121,8 +121,11 @@ mod tests {
 
     #[test]
     fn the_pointer_moving_and_leaving_report_to_the_tooltips() {
-        assert_eq!(count("self.update_tooltip_hover(Some(position));"), 1);
-        assert_eq!(count("self.update_tooltip_hover(None);"), 1);
+        // At the end of `update_toolbar_hover`, which the pointer move and
+        // `CursorLeft` both call.
+        assert_eq!(count("self.update_tooltip_hover(position);"), 1);
+        assert_eq!(count("self.update_toolbar_hover(Some(position));"), 1);
+        assert_eq!(count("self.update_toolbar_hover(None);"), 1);
     }
 
     #[test]

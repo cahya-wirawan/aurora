@@ -206,6 +206,27 @@ mod tests {
         assert_eq!(tooltip_text_for(&ws, button), None);
     }
 
+    /// The colour buttons and the document strip's overflow button.
+    #[test]
+    fn colour_and_overflow_buttons_have_fixed_texts() {
+        let ws = workspace();
+        let colours = ws.tools.colours;
+        assert_eq!(
+            tooltip_text_for(&ws, colours.swap).as_deref(),
+            Some("Swap Colours (X)")
+        );
+        assert_eq!(
+            tooltip_text_for(&ws, colours.defaults).as_deref(),
+            Some("Default Colours (D)")
+        );
+        assert_eq!(
+            tooltip_text_for(&ws, ws.document_overflow).as_deref(),
+            Some("More documents")
+        );
+        // The swatches name colours; they get no tooltip.
+        assert_eq!(tooltip_text_for(&ws, colours.foreground), None);
+    }
+
     /// Not a toolbar button: no tooltip.
     #[test]
     fn other_widgets_have_no_toolbar_tooltip() {

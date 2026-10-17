@@ -311,6 +311,7 @@ pub fn foreign_popover_open(tree: &WidgetTree<WidgetKind>, own: Option<WidgetId>
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use std::time::{Duration, Instant};
 
