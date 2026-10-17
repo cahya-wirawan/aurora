@@ -51,6 +51,7 @@
 //! What stays synchronous is listed on [`SYNC_TILE_LIMIT`] and in PLAN.md's
 //! 0.186.0 entry.
 
+use std::borrow::BorrowMut;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
@@ -766,7 +767,7 @@ impl WorkerContext<'_> {
 /// Locks the mirror. A poisoned lock (a task panicked while holding it,
 /// which a release build's `panic = "abort"` never sees) is used as is:
 /// the store's own state is never left half-updated by a reader.
-fn lock(store: &Mutex<TileStore>) -> MutexGuard<'_, TileStore> {
+fn lock<S>(store: &Mutex<S>) -> MutexGuard<'_, S> {
     match store.lock() {
         Ok(store) => store,
         Err(poisoned) => poisoned.into_inner(),
@@ -781,13 +782,26 @@ fn lock(store: &Mutex<TileStore>) -> MutexGuard<'_, TileStore> {
 /// bump LRU recency under the lock themselves; the keys read are promoted
 /// in one go before a page-in and when the task finishes, so a page-in's
 /// eviction spares what the job is using.
-struct SharedMirror<'a> {
-    store: &'a Mutex<TileStore>,
+///
+/// `S` is what the mutex holds (60 FPS round 7): the worker's own mirror
+/// store, or the frame path's `&mut TileStore` borrowed for one parallel
+/// batch (`crate::frame_composite`).
+pub(crate) struct SharedMirror<'a, S: BorrowMut<TileStore> = TileStore> {
+    store: &'a Mutex<S>,
     serial: u64,
     hits: Vec<TileKey>,
 }
 
-impl SharedMirror<'_> {
+impl<'a, S: BorrowMut<TileStore>> SharedMirror<'a, S> {
+    /// A view of `store`, whose [`TileStore::serial`] is `serial`.
+    pub(crate) fn new(store: &'a Mutex<S>, serial: u64) -> Self {
+        Self {
+            store,
+            serial,
+            hits: Vec::new(),
+        }
+    }
+
     /// Promotes the resident tiles this task has read (LRU recency only;
     /// nothing a fold sees).
     fn promote(store: &mut TileStore, hits: &mut Vec<TileKey>) {
@@ -798,20 +812,21 @@ impl SharedMirror<'_> {
         }
     }
 
-    fn finish(mut self) {
+    /// Ends this task's reads: promotes what it read.
+    pub(crate) fn finish(mut self) {
         if !self.hits.is_empty() {
-            Self::promote(&mut lock(self.store), &mut self.hits);
+            Self::promote((*lock(self.store)).borrow_mut(), &mut self.hits);
         }
     }
 }
 
-impl crate::TileSource for SharedMirror<'_> {
+impl<S: BorrowMut<TileStore>> crate::TileSource for SharedMirror<'_, S> {
     fn contains_tile(&self, surface: SurfaceId, id: TileId) -> bool {
-        lock(self.store).contains_tile(surface, id)
+        lock(self.store).borrow().contains_tile(surface, id)
     }
 
     fn content_version(&self, surface: SurfaceId, id: TileId) -> u64 {
-        lock(self.store).content_version(surface, id)
+        lock(self.store).borrow().content_version(surface, id)
     }
 
     fn serial(&self) -> u64 {
@@ -823,7 +838,8 @@ impl crate::TileSource for SharedMirror<'_> {
         surface: SurfaceId,
         id: TileId,
     ) -> Result<crate::SourceTexels<'_>, aurora_tile::TileError> {
-        let mut store = lock(self.store);
+        let mut guard = lock(self.store);
+        let store: &mut TileStore = (*guard).borrow_mut();
         if let Some(texels) = store.peek_shared(surface, id) {
             self.hits.push((surface, id));
             return Ok(crate::SourceTexels::Shared(texels));
@@ -838,7 +854,7 @@ impl crate::TileSource for SharedMirror<'_> {
                 aurora_tile::SAMPLES
             ])));
         }
-        Self::promote(&mut store, &mut self.hits);
+        Self::promote(store, &mut self.hits);
         store.get(surface, id)?;
         let texels = match store.peek_shared(surface, id) {
             Some(texels) => texels,
@@ -874,11 +890,7 @@ fn composite_job(
                 hook();
             }
         }
-        let mut source = SharedMirror {
-            store: mirror,
-            serial,
-            hits: Vec::new(),
-        };
+        let mut source = SharedMirror::new(mirror, serial);
         let doc_origin = crate::composite_tile_doc_origin(job.reference_origin, tile_id);
         let mut budget = crate::CompositeBudget::for_tile_of_pass(job.layers);
         let (texels, _folded) = crate::composite_roots_into_tile(

@@ -577,6 +577,7 @@ mod filter_stamp;
 #[cfg(test)]
 mod filter_stamp_tests;
 mod first_run;
+mod frame_composite;
 #[cfg(test)]
 mod frame_cost_tests;
 mod lasso_tools;
@@ -26231,6 +26232,25 @@ fn recomposite_tiles(
     // since "the shipping build is unaffected" is only true of the profile
     // Aurora actually ships.
     let gpu_arm_reachable = gpu_qualifies && gpu.is_some() && compositor.is_some();
+    // 60 FPS round 7: with no GPU arm every stale tile takes the CPU path,
+    // and when more than one is stale they fold in parallel on the frame
+    // pool, bit for bit what the loop below computes (`frame_composite`).
+    if !gpu_arm_reachable
+        && recomposite_tiles_in_parallel(
+            tiles,
+            layers,
+            store,
+            cache,
+            reference_origin,
+            &mut tile_costs,
+        )
+    {
+        tile_costs.finish();
+        phases.mark();
+        phases.mark();
+        phases.mark();
+        return;
+    }
     for &tile_id in tiles {
         if cache.is_current(tile_id) {
             continue;
@@ -26343,6 +26363,51 @@ fn recomposite_tiles(
         write_composited(store, cache, tile_id, &composited);
     }
     phases.mark();
+}
+
+/// [`recomposite_tiles`]' CPU-only case on the frame pool (60 FPS round
+/// 7): composites and installs the stale tiles of `tiles` (each once, in
+/// order) and returns `true`, or returns `false` having done nothing when
+/// fewer than two are stale, the pool is unavailable or (tests) disabled.
+fn recomposite_tiles_in_parallel(
+    tiles: &[aurora_tile::TileId],
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    cache: &mut CompositeCache,
+    reference_origin: (i64, i64),
+    tile_costs: &mut RecompositeTileCosts,
+) -> bool {
+    if !frame_composite::parallel_enabled() {
+        return false;
+    }
+    let mut seen = HashSet::new();
+    let stale: Vec<aurora_tile::TileId> = tiles
+        .iter()
+        .copied()
+        .filter(|&tile_id| !cache.is_current(tile_id) && seen.insert(tile_id))
+        .collect();
+    if stale.len() < 2 {
+        return false;
+    }
+    let Some(pool) = frame_composite::frame_pool() else {
+        return false;
+    };
+    frame_composite::composite_tiles(
+        pool,
+        &stale,
+        layers,
+        store,
+        reference_origin,
+        |store, tile_id, composited, folded| {
+            tile_costs.begin_tile();
+            tile_costs.mark_gpu_issue(false, false);
+            profiled(ProfileSlot::Install, || {
+                install_composited_tile(store, cache, tile_id, &composited);
+            });
+            tile_costs.mark_cpu_fallback(folded);
+        },
+    );
+    true
 }
 
 /// Which composite `aurora_tile::TileId`s [`recomposite_visible_tiles`]
@@ -66635,6 +66700,14 @@ mod tests {
         let target = frame_timing_target(device, viewport);
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let mut stages = FrameStages::with_capacity(frames as usize);
+        // 60 FPS round 7: the frame pool as the shipping build uses it,
+        // unless `AURORA_R7_SEQUENTIAL` asks for the old loop.
+        let parallel = std::env::var_os("AURORA_R7_SEQUENTIAL").is_none();
+        crate::frame_composite::set_parallel_enabled_for_tests(parallel);
+        println!(
+            "measure_pan_and_paint_frames: parallel frame recomposite {parallel} (threads {})",
+            crate::frame_composite::frame_composite_threads()
+        );
         zero_frame_counters();
         for step in 0..frames {
             let x = start.0 + step * pan_step_px.0;
@@ -66769,6 +66842,7 @@ mod tests {
                 .store_deltas
                 .push(store_stat_deltas(&stats_before, store.stats()));
         }
+        crate::frame_composite::set_parallel_enabled_for_tests(false);
         stages
     }
 
@@ -98134,6 +98208,8 @@ mod gpu_photo_adjustment_tests;
 mod fill_tests;
 #[cfg(test)]
 mod first_run_tests;
+#[cfg(test)]
+mod frame_composite_tests;
 
 #[cfg(test)]
 mod menu_bar_tests;
