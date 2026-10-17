@@ -2182,7 +2182,7 @@ fn straighten_channel(channel: f16, alpha: f32) -> f16 {
 /// fail those, since the caller's skip would otherwise silently stop
 /// being output-identical.
 ///
-/// **Chunked (60 FPS round 6).** Whole [`CHUNK_SAMPLES`] chunks are
+/// **Chunked (60 FPS round 6).** Whole 64-texel chunks are
 /// widened and narrowed a chunk at a time (`convert_to_f32_slice` /
 /// `convert_from_f32_slice`, eight lanes per F16C instruction, as
 /// [`composite_layer_into`] does since 0.98.0) instead of one sample at a
