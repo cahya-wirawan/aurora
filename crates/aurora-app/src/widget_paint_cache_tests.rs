@@ -288,3 +288,59 @@ fn cached_widget_paints_equal_fresh_ones_through_ui_changes() {
     );
     assert!(scrolled >= 1, "scrolling exercised");
 }
+
+/// The GPU path of the cache against [`crate::collect_widget_paints`]: the
+/// same ops in the same order (kind, colour, index count), cold, warm and
+/// after a hover change, and a warm frame reuses the cold frame's buffers.
+#[test]
+fn cached_gpu_widget_paints_match_fresh_uploads() {
+    let Some(context) = crate::tests::real_gpu_context() else {
+        return;
+    };
+    let mut s = Scene::new();
+    let mut atlas = crate::GlyphAtlas::new(context.device());
+    let buttons = s.ids(|k| matches!(k, WidgetKind::Button(_)));
+    for step in 0..4 {
+        if step == 2
+            && let Some(&b) = buttons.first()
+        {
+            let _ = ok(aurora_widgets::widgets::set_button_hovered(
+                s.tree(),
+                b,
+                true,
+            ));
+        }
+        s.engine.begin_frame();
+        let fresh = crate::collect_widget_paints(
+            &s.workspace.tree,
+            None,
+            None,
+            &s.theme,
+            &s.scales,
+            &context,
+            s.format,
+            s.scale_factor,
+            Some((&mut s.engine, &mut atlas)),
+        );
+        s.engine.begin_frame();
+        let cached = s.cache.frame_gpu_ops(
+            &s.workspace.tree,
+            None,
+            None,
+            &s.theme,
+            &s.scales,
+            &context,
+            s.format,
+            s.scale_factor,
+            Some((&mut s.engine, &mut atlas)),
+        );
+        let describe = |ops: &[aurora_widgets::GpuPaintOp]| -> Vec<String> {
+            ops.iter().map(|op| format!("{op:?}")).collect()
+        };
+        assert_eq!(describe(&cached), describe(&fresh), "step {step}");
+        let stats = s.cache.stats();
+        if step == 1 || step == 3 {
+            assert_eq!(stats.misses, 0, "step {step}: warm {stats:?}");
+        }
+    }
+}
