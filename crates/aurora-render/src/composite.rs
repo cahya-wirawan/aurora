@@ -1004,6 +1004,11 @@ fn vivid_light_legacy(cb: f32, cs: f32) -> f32 {
 // at all, and this arm exists purely for exhaustiveness", even though
 // both currently produce the same value.
 #[allow(clippy::match_same_arms)]
+// `always`, not a hint (60 FPS round 6): the per-mode instantiation in
+// `fold_chunks_in_mode` only removes the per-texel `match` if this is
+// inlined, and the dev profile's opt-level 1 does not inline it otherwise.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
     match mode {
         BlendMode::Normal => cs,
@@ -1411,6 +1416,11 @@ fn blend_lighter_color(cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
 /// exhaustive match: a future [`BlendMode`] addition should force this
 /// function to be revisited, not silently fall through some default.
 #[must_use]
+// `always`, not a hint (60 FPS round 6): the per-mode instantiation in
+// `fold_chunks_in_mode` only removes the per-texel `match` if this is
+// inlined, and the dev profile's opt-level 1 does not inline it otherwise.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
     match mode {
         BlendMode::Hue => blend_hue(cb, cs),
@@ -1471,6 +1481,26 @@ fn fold_texel(
     opacity: f32,
     mode: BlendMode,
 ) -> [f32; CHANNELS] {
+    fold_texel_with(dst, src, opacity, |cb, cs| blend_rgb(mode, cb, cs))
+}
+
+/// [`fold_texel`] with the blend term passed in (60 FPS round 6), so
+/// [`fold_chunks`] is instantiated once per [`BlendMode`] with the mode a
+/// constant and [`blend_rgb`]'s `match` folds away at compile time
+/// instead of running for each of a tile's 65,536 texels. The arithmetic
+/// and its operand order are [`fold_texel`]'s, which is this function
+/// with `blend_rgb(mode, ..)` as the blend term.
+// `always`, not a hint (60 FPS round 6): the per-mode instantiation in
+// `fold_chunks_in_mode` only removes the per-texel `match` if this is
+// inlined, and the dev profile's opt-level 1 does not inline it otherwise.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn fold_texel_with(
+    dst: [f32; CHANNELS],
+    src: [f32; CHANNELS],
+    opacity: f32,
+    blend: impl Fn([f32; 3], [f32; 3]) -> [f32; 3],
+) -> [f32; CHANNELS] {
     let [dr, dg, db, da] = dst;
     let [sr, sg, sb, sa] = src;
     let alpha = sa * opacity;
@@ -1490,7 +1520,7 @@ fn fold_texel(
     } else {
         [0.0, 0.0, 0.0]
     };
-    let [br, bg, bb] = blend_rgb(mode, straight_backdrop, [sr, sg, sb]);
+    let [br, bg, bb] = blend(straight_backdrop, [sr, sg, sb]);
     let blended_r = backdrop_inverse * sr + backdrop_alpha * br;
     let blended_g = backdrop_inverse * sg + backdrop_alpha * bg;
     let blended_b = backdrop_inverse * sb + backdrop_alpha * bb;
@@ -1500,6 +1530,111 @@ fn fold_texel(
         inverse * db + alpha * blended_b,
         alpha + da * inverse,
     ]
+}
+
+/// [`composite_layer_into`]'s whole-chunk loop for one blend term
+/// (60 FPS round 6; the loop itself is 0.98.0's). Returns how many chunks
+/// the transparent-chunk skip left untouched. `#[inline(always)]` so each
+/// arm of [`fold_chunks_in_mode`] gets its own copy with the mode a
+/// constant.
+// `always`, not a hint (60 FPS round 6): the per-mode instantiation in
+// `fold_chunks_in_mode` only removes the per-texel `match` if this is
+// inlined, and the dev profile's opt-level 1 does not inline it otherwise.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn fold_chunks(
+    head_out: &mut [f16],
+    head_src: &[f16],
+    opacity: f32,
+    skip: bool,
+    blend: impl Fn([f32; 3], [f32; 3]) -> [f32; 3] + Copy,
+) -> u64 {
+    // `wide` names the sample width: these hold one chunk's `f16`
+    // samples widened to `f32` for the duration of that chunk's fold.
+    let mut dst_wide = [0f32; CHUNK_SAMPLES];
+    let mut src_wide = [0f32; CHUNK_SAMPLES];
+    let mut skipped = 0_u64;
+    for (dst_chunk, src_chunk) in head_out
+        .chunks_exact_mut(CHUNK_SAMPLES)
+        .zip(head_src.chunks_exact(CHUNK_SAMPLES))
+    {
+        if skip && chunk_folds_to_backdrop(dst_chunk, src_chunk) {
+            skipped += 1;
+            continue;
+        }
+        // Two vectorized f16 -> f32 passes: 8 lanes per `vcvtph2ps`, one
+        // feature-detection check per slice rather than per sample.
+        dst_chunk.convert_to_f32_slice(&mut dst_wide);
+        src_chunk.convert_to_f32_slice(&mut src_wide);
+        for (dst, src) in dst_wide
+            .chunks_exact_mut(CHANNELS)
+            .zip(src_wide.chunks_exact(CHANNELS))
+        {
+            let [dr, dg, db, da] = dst else { continue };
+            let [sr, sg, sb, sa] = src else { continue };
+            let [nr, ng, nb, na] =
+                fold_texel_with([*dr, *dg, *db, *da], [*sr, *sg, *sb, *sa], opacity, blend);
+            *dr = nr;
+            *dg = ng;
+            *db = nb;
+            *da = na;
+        }
+        // One vectorized f32 -> f16 pass: 8 lanes per `vcvtps2ph`. Every
+        // sample written back is a computed value, so unlike 0.92.0's
+        // serializer there is no channel that must come from the
+        // original `f16` chunk instead.
+        dst_chunk.convert_from_f32_slice(&dst_wide);
+    }
+    skipped
+}
+
+/// [`fold_chunks`] with `mode` made a compile-time constant: one
+/// instantiation per [`BlendMode`] (60 FPS round 6). Exhaustive, so a new
+/// mode cannot be left out.
+fn fold_chunks_in_mode(
+    head_out: &mut [f16],
+    head_src: &[f16],
+    opacity: f32,
+    skip: bool,
+    mode: BlendMode,
+) -> u64 {
+    macro_rules! per_mode {
+        ($($variant:ident),* $(,)?) => {
+            match mode {
+                $(BlendMode::$variant => fold_chunks(head_out, head_src, opacity, skip, |cb, cs| {
+                    blend_rgb(BlendMode::$variant, cb, cs)
+                }),)*
+            }
+        };
+    }
+    per_mode!(
+        Normal,
+        Darken,
+        Multiply,
+        Lighten,
+        Screen,
+        Difference,
+        Exclusion,
+        Subtract,
+        Divide,
+        ColorDodge,
+        LinearDodge,
+        ColorBurn,
+        LinearBurn,
+        Overlay,
+        SoftLight,
+        HardLight,
+        VividLight,
+        LinearLight,
+        PinLight,
+        HardMix,
+        Hue,
+        Saturation,
+        Color,
+        Luminosity,
+        DarkerColor,
+        LighterColor,
+    )
 }
 
 /// Whether folding `src` over `dst` (one chunk, straight-alpha source,
@@ -1897,46 +2032,13 @@ pub fn composite_layer_into(out: &mut [f16], texels: &[f16], opacity: f32, mode:
         return;
     };
 
-    // `wide` names the sample width: these hold one chunk's `f16`
-    // samples widened to `f32` for the duration of that chunk's fold.
-    let mut dst_wide = [0f32; CHUNK_SAMPLES];
-    let mut src_wide = [0f32; CHUNK_SAMPLES];
     // 0.184.0: a chunk whose source is wholly transparent over an in-range
     // backdrop folds to the backdrop bit for bit (`chunk_folds_to_backdrop`),
     // so it is left untouched rather than converted and folded.
     let skip = !opacity.is_nan() && transparent_skip_enabled();
-    let mut skipped = 0_u64;
-    for (dst_chunk, src_chunk) in head_out
-        .chunks_exact_mut(CHUNK_SAMPLES)
-        .zip(head_src.chunks_exact(CHUNK_SAMPLES))
-    {
-        if skip && chunk_folds_to_backdrop(dst_chunk, src_chunk) {
-            skipped += 1;
-            continue;
-        }
-        // Two vectorized f16 -> f32 passes: 8 lanes per `vcvtph2ps`, one
-        // feature-detection check per slice rather than per sample.
-        dst_chunk.convert_to_f32_slice(&mut dst_wide);
-        src_chunk.convert_to_f32_slice(&mut src_wide);
-        for (dst, src) in dst_wide
-            .chunks_exact_mut(CHANNELS)
-            .zip(src_wide.chunks_exact(CHANNELS))
-        {
-            let [dr, dg, db, da] = dst else { continue };
-            let [sr, sg, sb, sa] = src else { continue };
-            let [nr, ng, nb, na] =
-                fold_texel([*dr, *dg, *db, *da], [*sr, *sg, *sb, *sa], opacity, mode);
-            *dr = nr;
-            *dg = ng;
-            *db = nb;
-            *da = na;
-        }
-        // One vectorized f32 -> f16 pass: 8 lanes per `vcvtps2ph`. Every
-        // sample written back is a computed value, so unlike 0.92.0's
-        // serializer there is no channel that must come from the
-        // original `f16` chunk instead.
-        dst_chunk.convert_from_f32_slice(&dst_wide);
-    }
+    // 60 FPS round 6: the chunk loop is instantiated once per mode
+    // (`fold_chunks_in_mode`), so the mode is not matched per texel.
+    let skipped = fold_chunks_in_mode(head_out, head_src, opacity, skip, mode);
     if skipped > 0 {
         note_transparent_chunks_skipped(skipped);
     }
@@ -2079,7 +2181,56 @@ fn straighten_channel(channel: f16, alpha: f32) -> f16 {
 /// the zero-alpha arm to write anything other than what it read must
 /// fail those, since the caller's skip would otherwise silently stop
 /// being output-identical.
+///
+/// **Chunked (60 FPS round 6).** Whole [`CHUNK_SAMPLES`] chunks are
+/// widened and narrowed a chunk at a time (`convert_to_f32_slice` /
+/// `convert_from_f32_slice`, eight lanes per F16C instruction, as
+/// [`composite_layer_into`] does since 0.98.0) instead of one sample at a
+/// time, with the same `f32` arithmetic per channel; every alpha sample is
+/// then written back from the chunk's own original bits, so alpha is never
+/// round-tripped (a NaN alpha keeps its payload, as before). What is left
+/// after the whole chunks takes the per-sample loop below.
+/// `chunked_un_premultiply_is_bit_identical_to_the_per_sample_loop` pins
+/// it against that loop over every `f16` pattern.
 pub fn un_premultiply_in_place(texels: &mut [f16]) {
+    let whole = (texels.len() / CHUNK_SAMPLES) * CHUNK_SAMPLES;
+    let Some((head, tail)) = texels.split_at_mut_checked(whole) else {
+        return;
+    };
+    let mut wide = [0f32; CHUNK_SAMPLES];
+    let mut original = [f16::ZERO; CHUNK_SAMPLES];
+    for chunk in head.chunks_exact_mut(CHUNK_SAMPLES) {
+        original.copy_from_slice(chunk);
+        chunk.convert_to_f32_slice(&mut wide);
+        for texel in wide.chunks_exact_mut(CHANNELS) {
+            let [r, g, b, a] = texel else { continue };
+            let alpha = *a;
+            if alpha > 0.0 {
+                *r = (*r / alpha).clamp(-F16_MAX, F16_MAX);
+                *g = (*g / alpha).clamp(-F16_MAX, F16_MAX);
+                *b = (*b / alpha).clamp(-F16_MAX, F16_MAX);
+            } else {
+                *r = 0.0;
+                *g = 0.0;
+                *b = 0.0;
+            }
+        }
+        chunk.convert_from_f32_slice(&wide);
+        for (texel, kept) in chunk
+            .chunks_exact_mut(CHANNELS)
+            .zip(original.chunks_exact(CHANNELS))
+        {
+            if let ([_, _, _, a], [_, _, _, kept_a]) = (texel, kept) {
+                *a = *kept_a;
+            }
+        }
+    }
+    un_premultiply_per_sample(tail);
+}
+
+/// [`un_premultiply_in_place`]'s per-sample loop: what it was before
+/// round 6, and still its spelling for anything after the whole chunks.
+fn un_premultiply_per_sample(texels: &mut [f16]) {
     for texel in texels.chunks_exact_mut(CHANNELS) {
         let [r, g, b, a] = texel else { continue };
         let alpha = a.to_f32();
@@ -6303,8 +6454,10 @@ impl std::fmt::Debug for TileCompositor {
 mod tests {
 
     use super::{
-        chunk_folds_to_backdrop, set_transparent_skip_enabled, transparent_chunks_skipped,
+        chunk_folds_to_backdrop, fold_texel, set_transparent_skip_enabled,
+        transparent_chunks_skipped, un_premultiply_per_sample,
     };
+    use half::slice::HalfFloatSliceExt as _;
 
     /// Every mode `composite_layer_into` takes (0.184.0).
     const TRANSPARENT_SKIP_MODES: [BlendMode; 26] = [
@@ -29759,6 +29912,161 @@ mod tests {
     /// assert and why. Splitting them this way keeps *this* assertion
     /// absolute rather than blanket-weakening one test to accommodate a
     /// case that only affects NaN payloads.
+    /// [`composite_layer_into`]'s whole-chunk loop as it was before 60 FPS
+    /// round 6, verbatim: the mode matched per texel inside
+    /// [`fold_texel`]. The round-6 per-mode instantiation must match it
+    /// bit for bit wherever the result is not a NaN.
+    fn composite_layer_into_round5(out: &mut [f16], texels: &[f16], opacity: f32, mode: BlendMode) {
+        let opacity = opacity.clamp(0.0, 1.0);
+        let mut dst_wide = [0f32; CHUNK_SAMPLES];
+        let mut src_wide = [0f32; CHUNK_SAMPLES];
+        for (dst_chunk, src_chunk) in out
+            .chunks_exact_mut(CHUNK_SAMPLES)
+            .zip(texels.chunks_exact(CHUNK_SAMPLES))
+        {
+            dst_chunk.convert_to_f32_slice(&mut dst_wide);
+            src_chunk.convert_to_f32_slice(&mut src_wide);
+            for (dst, src) in dst_wide
+                .chunks_exact_mut(CHANNELS)
+                .zip(src_wide.chunks_exact(CHANNELS))
+            {
+                let [dr, dg, db, da] = dst else { continue };
+                let [sr, sg, sb, sa] = src else { continue };
+                let [nr, ng, nb, na] =
+                    fold_texel([*dr, *dg, *db, *da], [*sr, *sg, *sb, *sa], opacity, mode);
+                *dr = nr;
+                *dg = ng;
+                *db = nb;
+                *da = na;
+            }
+            dst_chunk.convert_from_f32_slice(&dst_wide);
+        }
+    }
+
+    /// One tile (65,536 texels) whose texel `i` is `base` with the sample
+    /// at `position` (0..8: backdrop R, G, B, A, then source R, G, B, A)
+    /// replaced by the `f16` with bit pattern `i`: every pattern, once.
+    fn every_pattern_at(
+        position: usize,
+        backdrop: [f32; CHANNELS],
+        source: [f32; CHANNELS],
+    ) -> (Vec<f16>, Vec<f16>) {
+        let mut dst = Vec::with_capacity(SAMPLES);
+        let mut src = Vec::with_capacity(SAMPLES);
+        for pattern in 0..=u16::MAX {
+            let mut d = backdrop.map(f16::from_f32);
+            let mut s = source.map(f16::from_f32);
+            let slot = if position < CHANNELS {
+                d.get_mut(position)
+            } else {
+                s.get_mut(position - CHANNELS)
+            };
+            if let Some(slot) = slot {
+                *slot = f16::from_bits(pattern);
+            }
+            dst.extend_from_slice(&d);
+            src.extend_from_slice(&s);
+        }
+        (dst, src)
+    }
+
+    /// 60 FPS round 6: the per-mode instantiation of the chunk loop
+    /// (`fold_chunks_in_mode`) against the round-5 loop, bit for bit with
+    /// NaN payloads aside, for every blend mode, every `f16` bit pattern in
+    /// each of the eight input samples, two backdrops (opaque and
+    /// translucent, so both arms of the backdrop recovery run), and three
+    /// opacities. The transparent-chunk skip is turned off for the
+    /// comparison so every chunk takes the rewritten loop.
+    #[test]
+    fn per_mode_fold_is_bit_identical_to_the_round5_loop_over_every_f16_pattern() {
+        let backdrops = [[0.2, 0.35, 0.55, 1.0], [0.15, 0.05, 0.1, 0.5]];
+        let source = [0.9, 0.6, 0.25, 0.75];
+        set_transparent_skip_enabled(false);
+        let mut compared = 0_usize;
+        let mut nan_payload_differences = 0_usize;
+        for backdrop in backdrops {
+            for position in 0..2 * CHANNELS {
+                let (dst, src) = every_pattern_at(position, backdrop, source);
+                for mode in ALL_MODES {
+                    for opacity in [1.0, 0.5, 0.0] {
+                        let mut new = dst.clone();
+                        let mut old = dst.clone();
+                        composite_layer_into(&mut new, &src, opacity, mode);
+                        composite_layer_into_round5(&mut old, &src, opacity, mode);
+                        // Bit for bit, except that where the round-5 loop
+                        // produced a NaN this one need only produce a NaN:
+                        // which operand's payload survives an operation on
+                        // a NaN is an instruction-selection detail (the
+                        // class disclosed at
+                        // `a_hostile_fixture_folds_identically_except_for_the_nan_payload_operand`).
+                        let first = new.iter().zip(old.iter()).position(|(a, b)| {
+                            a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan())
+                        });
+                        assert_eq!(
+                            first, None,
+                            "{mode:?} at opacity {opacity}, varying input sample {position} \
+                             over backdrop {backdrop:?}: first differing sample"
+                        );
+                        nan_payload_differences += new
+                            .iter()
+                            .zip(old.iter())
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        compared += new.len();
+                    }
+                }
+            }
+        }
+        set_transparent_skip_enabled(true);
+        assert_eq!(compared, 2 * 2 * CHANNELS * ALL_MODES.len() * 3 * SAMPLES);
+        println!(
+            "per-mode fold: {compared} samples compared, {nan_payload_differences} differ only \
+             in a NaN's payload"
+        );
+    }
+
+    /// 60 FPS round 6: the chunked [`un_premultiply_in_place`] against its
+    /// own per-sample loop (the pre-round-6 body), bit for bit, for every
+    /// `f16` pattern in each of the four samples of a texel over three
+    /// base texels, plus a length that leaves a partial chunk and a
+    /// partial texel at the end.
+    #[test]
+    fn chunked_un_premultiply_is_bit_identical_to_the_per_sample_loop() {
+        let bases = [
+            [0.2, 0.35, 0.55, 1.0],
+            [0.1, 0.05, 0.3, 0.5],
+            [0.0, 0.0, 0.0, 0.0],
+        ];
+        for base in bases {
+            for position in 0..CHANNELS {
+                let (texels, _) = every_pattern_at(position, base, [0.0; CHANNELS]);
+                let mut chunked = texels.clone();
+                let mut per_sample = texels.clone();
+                un_premultiply_in_place(&mut chunked);
+                un_premultiply_per_sample(&mut per_sample);
+                assert_eq!(
+                    bits(&chunked),
+                    bits(&per_sample),
+                    "varying sample {position} over base {base:?}"
+                );
+                // A length that is not a whole number of chunks, and not a
+                // whole number of texels: the tail takes the per-sample
+                // loop and the partial texel is left alone.
+                let odd = CHUNK_SAMPLES * 3 + CHANNELS * 5 + 2;
+                let mut chunked = texels.get(..odd).map(<[f16]>::to_vec).unwrap_or_default();
+                let mut per_sample = chunked.clone();
+                un_premultiply_in_place(&mut chunked);
+                un_premultiply_per_sample(&mut per_sample);
+                assert_eq!(
+                    bits(&chunked),
+                    bits(&per_sample),
+                    "odd length, sample {position}"
+                );
+                assert_eq!(chunked.len(), odd);
+            }
+        }
+    }
+
     #[test]
     fn vectorized_fold_is_bit_identical_to_the_scalar_reference() {
         let source = boundary_fixture(1);
