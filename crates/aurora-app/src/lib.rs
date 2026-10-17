@@ -43116,6 +43116,7 @@ mod tests {
     /// [`curves_corpus_diff`] for any PSD path: Aurora's composite against
     /// the file's own merged image.
     #[allow(
+        clippy::too_many_lines,
         clippy::many_single_char_names,
         clippy::cast_possible_wrap,
         clippy::cast_possible_truncation,

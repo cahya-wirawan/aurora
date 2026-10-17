@@ -263,10 +263,10 @@ fn a_shown_gradient_overlay_refuses_the_gpu_path_and_gates_hide_it() {
 /// 0.265.1: measured against the merged image converted to the working space
 /// (the files are compared with the opened, colour-converted document since
 /// 0.264.0). The bounds were not changed: the converted-basis means are
-/// fill_adjustments 13.20, shape-fx2 1.29, layer_comps 5.68 (Adobe RGB, was
-/// 9.51 on the raw basis), stroke-composite 5.00, layer_effects 5.76,
-/// masks 0.154, all under them, so the bounds are now looser for
-/// fill_adjustments and layer_comps than "just above the measurement".
+/// `fill_adjustments` 13.20, `shape-fx2` 1.29, `layer_comps` 5.68 (Adobe RGB, was
+/// 9.51 on the raw basis), `stroke-composite` 5.00, `layer_effects` 5.76,
+/// `masks` 0.154, all under them, so the bounds are now looser for
+/// `fill_adjustments` and `layer_comps` than "just above the measurement".
 const GRADIENT_OVERLAY_FIDELITY: [(&str, f64); 6] = [
     ("fill_adjustments.psd", 34.5),
     ("effects/shape-fx2.psd", 1.4),
