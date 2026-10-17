@@ -1004,6 +1004,11 @@ fn vivid_light_legacy(cb: f32, cs: f32) -> f32 {
 // at all, and this arm exists purely for exhaustiveness", even though
 // both currently produce the same value.
 #[allow(clippy::match_same_arms)]
+// `always`, not a hint (60 FPS round 6): the per-mode instantiation in
+// `fold_chunks_in_mode` only removes the per-texel `match` if this is
+// inlined, and the dev profile's opt-level 1 does not inline it otherwise.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
     match mode {
         BlendMode::Normal => cs,
@@ -1411,6 +1416,11 @@ fn blend_lighter_color(cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
 /// exhaustive match: a future [`BlendMode`] addition should force this
 /// function to be revisited, not silently fall through some default.
 #[must_use]
+// `always`, not a hint (60 FPS round 6): the per-mode instantiation in
+// `fold_chunks_in_mode` only removes the per-texel `match` if this is
+// inlined, and the dev profile's opt-level 1 does not inline it otherwise.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
     match mode {
         BlendMode::Hue => blend_hue(cb, cs),
@@ -1471,6 +1481,26 @@ fn fold_texel(
     opacity: f32,
     mode: BlendMode,
 ) -> [f32; CHANNELS] {
+    fold_texel_with(dst, src, opacity, |cb, cs| blend_rgb(mode, cb, cs))
+}
+
+/// [`fold_texel`] with the blend term passed in (60 FPS round 6), so
+/// [`fold_chunks`] is instantiated once per [`BlendMode`] with the mode a
+/// constant and [`blend_rgb`]'s `match` folds away at compile time
+/// instead of running for each of a tile's 65,536 texels. The arithmetic
+/// and its operand order are [`fold_texel`]'s, which is this function
+/// with `blend_rgb(mode, ..)` as the blend term.
+// `always`, not a hint (60 FPS round 6): the per-mode instantiation in
+// `fold_chunks_in_mode` only removes the per-texel `match` if this is
+// inlined, and the dev profile's opt-level 1 does not inline it otherwise.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn fold_texel_with(
+    dst: [f32; CHANNELS],
+    src: [f32; CHANNELS],
+    opacity: f32,
+    blend: impl Fn([f32; 3], [f32; 3]) -> [f32; 3],
+) -> [f32; CHANNELS] {
     let [dr, dg, db, da] = dst;
     let [sr, sg, sb, sa] = src;
     let alpha = sa * opacity;
@@ -1490,7 +1520,7 @@ fn fold_texel(
     } else {
         [0.0, 0.0, 0.0]
     };
-    let [br, bg, bb] = blend_rgb(mode, straight_backdrop, [sr, sg, sb]);
+    let [br, bg, bb] = blend(straight_backdrop, [sr, sg, sb]);
     let blended_r = backdrop_inverse * sr + backdrop_alpha * br;
     let blended_g = backdrop_inverse * sg + backdrop_alpha * bg;
     let blended_b = backdrop_inverse * sb + backdrop_alpha * bb;
@@ -1500,6 +1530,111 @@ fn fold_texel(
         inverse * db + alpha * blended_b,
         alpha + da * inverse,
     ]
+}
+
+/// [`composite_layer_into`]'s whole-chunk loop for one blend term
+/// (60 FPS round 6; the loop itself is 0.98.0's). Returns how many chunks
+/// the transparent-chunk skip left untouched. `#[inline(always)]` so each
+/// arm of [`fold_chunks_in_mode`] gets its own copy with the mode a
+/// constant.
+// `always`, not a hint (60 FPS round 6): the per-mode instantiation in
+// `fold_chunks_in_mode` only removes the per-texel `match` if this is
+// inlined, and the dev profile's opt-level 1 does not inline it otherwise.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn fold_chunks(
+    head_out: &mut [f16],
+    head_src: &[f16],
+    opacity: f32,
+    skip: bool,
+    blend: impl Fn([f32; 3], [f32; 3]) -> [f32; 3] + Copy,
+) -> u64 {
+    // `wide` names the sample width: these hold one chunk's `f16`
+    // samples widened to `f32` for the duration of that chunk's fold.
+    let mut dst_wide = [0f32; CHUNK_SAMPLES];
+    let mut src_wide = [0f32; CHUNK_SAMPLES];
+    let mut skipped = 0_u64;
+    for (dst_chunk, src_chunk) in head_out
+        .chunks_exact_mut(CHUNK_SAMPLES)
+        .zip(head_src.chunks_exact(CHUNK_SAMPLES))
+    {
+        if skip && chunk_folds_to_backdrop(dst_chunk, src_chunk) {
+            skipped += 1;
+            continue;
+        }
+        // Two vectorized f16 -> f32 passes: 8 lanes per `vcvtph2ps`, one
+        // feature-detection check per slice rather than per sample.
+        dst_chunk.convert_to_f32_slice(&mut dst_wide);
+        src_chunk.convert_to_f32_slice(&mut src_wide);
+        for (dst, src) in dst_wide
+            .chunks_exact_mut(CHANNELS)
+            .zip(src_wide.chunks_exact(CHANNELS))
+        {
+            let [dr, dg, db, da] = dst else { continue };
+            let [sr, sg, sb, sa] = src else { continue };
+            let [nr, ng, nb, na] =
+                fold_texel_with([*dr, *dg, *db, *da], [*sr, *sg, *sb, *sa], opacity, blend);
+            *dr = nr;
+            *dg = ng;
+            *db = nb;
+            *da = na;
+        }
+        // One vectorized f32 -> f16 pass: 8 lanes per `vcvtps2ph`. Every
+        // sample written back is a computed value, so unlike 0.92.0's
+        // serializer there is no channel that must come from the
+        // original `f16` chunk instead.
+        dst_chunk.convert_from_f32_slice(&dst_wide);
+    }
+    skipped
+}
+
+/// [`fold_chunks`] with `mode` made a compile-time constant: one
+/// instantiation per [`BlendMode`] (60 FPS round 6). Exhaustive, so a new
+/// mode cannot be left out.
+fn fold_chunks_in_mode(
+    head_out: &mut [f16],
+    head_src: &[f16],
+    opacity: f32,
+    skip: bool,
+    mode: BlendMode,
+) -> u64 {
+    macro_rules! per_mode {
+        ($($variant:ident),* $(,)?) => {
+            match mode {
+                $(BlendMode::$variant => fold_chunks(head_out, head_src, opacity, skip, |cb, cs| {
+                    blend_rgb(BlendMode::$variant, cb, cs)
+                }),)*
+            }
+        };
+    }
+    per_mode!(
+        Normal,
+        Darken,
+        Multiply,
+        Lighten,
+        Screen,
+        Difference,
+        Exclusion,
+        Subtract,
+        Divide,
+        ColorDodge,
+        LinearDodge,
+        ColorBurn,
+        LinearBurn,
+        Overlay,
+        SoftLight,
+        HardLight,
+        VividLight,
+        LinearLight,
+        PinLight,
+        HardMix,
+        Hue,
+        Saturation,
+        Color,
+        Luminosity,
+        DarkerColor,
+        LighterColor,
+    )
 }
 
 /// Whether folding `src` over `dst` (one chunk, straight-alpha source,
@@ -1897,46 +2032,13 @@ pub fn composite_layer_into(out: &mut [f16], texels: &[f16], opacity: f32, mode:
         return;
     };
 
-    // `wide` names the sample width: these hold one chunk's `f16`
-    // samples widened to `f32` for the duration of that chunk's fold.
-    let mut dst_wide = [0f32; CHUNK_SAMPLES];
-    let mut src_wide = [0f32; CHUNK_SAMPLES];
     // 0.184.0: a chunk whose source is wholly transparent over an in-range
     // backdrop folds to the backdrop bit for bit (`chunk_folds_to_backdrop`),
     // so it is left untouched rather than converted and folded.
     let skip = !opacity.is_nan() && transparent_skip_enabled();
-    let mut skipped = 0_u64;
-    for (dst_chunk, src_chunk) in head_out
-        .chunks_exact_mut(CHUNK_SAMPLES)
-        .zip(head_src.chunks_exact(CHUNK_SAMPLES))
-    {
-        if skip && chunk_folds_to_backdrop(dst_chunk, src_chunk) {
-            skipped += 1;
-            continue;
-        }
-        // Two vectorized f16 -> f32 passes: 8 lanes per `vcvtph2ps`, one
-        // feature-detection check per slice rather than per sample.
-        dst_chunk.convert_to_f32_slice(&mut dst_wide);
-        src_chunk.convert_to_f32_slice(&mut src_wide);
-        for (dst, src) in dst_wide
-            .chunks_exact_mut(CHANNELS)
-            .zip(src_wide.chunks_exact(CHANNELS))
-        {
-            let [dr, dg, db, da] = dst else { continue };
-            let [sr, sg, sb, sa] = src else { continue };
-            let [nr, ng, nb, na] =
-                fold_texel([*dr, *dg, *db, *da], [*sr, *sg, *sb, *sa], opacity, mode);
-            *dr = nr;
-            *dg = ng;
-            *db = nb;
-            *da = na;
-        }
-        // One vectorized f32 -> f16 pass: 8 lanes per `vcvtps2ph`. Every
-        // sample written back is a computed value, so unlike 0.92.0's
-        // serializer there is no channel that must come from the
-        // original `f16` chunk instead.
-        dst_chunk.convert_from_f32_slice(&dst_wide);
-    }
+    // 60 FPS round 6: the chunk loop is instantiated once per mode
+    // (`fold_chunks_in_mode`), so the mode is not matched per texel.
+    let skipped = fold_chunks_in_mode(head_out, head_src, opacity, skip, mode);
     if skipped > 0 {
         note_transparent_chunks_skipped(skipped);
     }
@@ -2079,7 +2181,56 @@ fn straighten_channel(channel: f16, alpha: f32) -> f16 {
 /// the zero-alpha arm to write anything other than what it read must
 /// fail those, since the caller's skip would otherwise silently stop
 /// being output-identical.
+///
+/// **Chunked (60 FPS round 6).** Whole 64-texel chunks are
+/// widened and narrowed a chunk at a time (`convert_to_f32_slice` /
+/// `convert_from_f32_slice`, eight lanes per F16C instruction, as
+/// [`composite_layer_into`] does since 0.98.0) instead of one sample at a
+/// time, with the same `f32` arithmetic per channel; every alpha sample is
+/// then written back from the chunk's own original bits, so alpha is never
+/// round-tripped (a NaN alpha keeps its payload, as before). What is left
+/// after the whole chunks takes the per-sample loop below.
+/// `chunked_un_premultiply_is_bit_identical_to_the_per_sample_loop` pins
+/// it against that loop over every `f16` pattern.
 pub fn un_premultiply_in_place(texels: &mut [f16]) {
+    let whole = (texels.len() / CHUNK_SAMPLES) * CHUNK_SAMPLES;
+    let Some((head, tail)) = texels.split_at_mut_checked(whole) else {
+        return;
+    };
+    let mut wide = [0f32; CHUNK_SAMPLES];
+    let mut original = [f16::ZERO; CHUNK_SAMPLES];
+    for chunk in head.chunks_exact_mut(CHUNK_SAMPLES) {
+        original.copy_from_slice(chunk);
+        chunk.convert_to_f32_slice(&mut wide);
+        for texel in wide.chunks_exact_mut(CHANNELS) {
+            let [r, g, b, a] = texel else { continue };
+            let alpha = *a;
+            if alpha > 0.0 {
+                *r = (*r / alpha).clamp(-F16_MAX, F16_MAX);
+                *g = (*g / alpha).clamp(-F16_MAX, F16_MAX);
+                *b = (*b / alpha).clamp(-F16_MAX, F16_MAX);
+            } else {
+                *r = 0.0;
+                *g = 0.0;
+                *b = 0.0;
+            }
+        }
+        chunk.convert_from_f32_slice(&wide);
+        for (texel, kept) in chunk
+            .chunks_exact_mut(CHANNELS)
+            .zip(original.chunks_exact(CHANNELS))
+        {
+            if let ([_, _, _, a], [_, _, _, kept_a]) = (texel, kept) {
+                *a = *kept_a;
+            }
+        }
+    }
+    un_premultiply_per_sample(tail);
+}
+
+/// [`un_premultiply_in_place`]'s per-sample loop: what it was before
+/// round 6, and still its spelling for anything after the whole chunks.
+fn un_premultiply_per_sample(texels: &mut [f16]) {
     for texel in texels.chunks_exact_mut(CHANNELS) {
         let [r, g, b, a] = texel else { continue };
         let alpha = a.to_f32();
@@ -2349,6 +2500,30 @@ pub struct TileCompositor {
     channel_mixer: Option<UniformAdjustmentGpu>,
     selective_color: Option<UniformAdjustmentGpu>,
     gradient_map: Option<UniformAdjustmentGpu>,
+    /// Blend-math pipelines a background thread is building (60 FPS
+    /// round 6, [`Self::prewarm_blend_pipelines_in_background`]), handed
+    /// over as each one finishes. `None` before the build starts and once
+    /// every pipeline it built has been taken.
+    background: Option<std::sync::mpsc::Receiver<(PipelineKey, wgpu::RenderPipeline)>>,
+    /// How many pipelines were taken from [`Self::background`] into the
+    /// cache (test evidence that a composite used one).
+    background_adopted: usize,
+    /// The background build's thread and its stop flag. Joined by
+    /// [`Self::stop_background_pipelines`] (and so on drop): the thread
+    /// holds a clone of the device, and a thread still inside the driver,
+    /// or the last to drop the device, while the process exits was
+    /// measured to crash or hang the exit on NVIDIA/Vulkan (the driver's
+    /// exit handlers racing `vkDestroyDevice` on the background thread).
+    background_thread: Option<(
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    )>,
+}
+
+impl Drop for TileCompositor {
+    fn drop(&mut self) {
+        self.stop_background_pipelines();
+    }
 }
 
 /// Builds [`TileCompositor::bind_group_layout_blend`]: the opacity
@@ -2427,6 +2602,23 @@ fn blend_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             },
         ],
     })
+}
+
+/// The [`PipelineKey`] of `blend_pass`'s pipeline: the one spelling shared
+/// by the composite call, [`TileCompositor::prewarm`] and the background
+/// build (60 FPS round 6).
+fn blend_pipeline_key(blend_pass: &BlendPass) -> PipelineKey {
+    PipelineKey {
+        shader: LABEL,
+        vertex_entry: "vs_composite",
+        fragment_entry: blend_pass.fragment_entry,
+        target_format: wgpu::TextureFormat::Rgba16Float,
+        // The shader computes the whole composite itself, so the
+        // fixed-function unit must do nothing at all -- a plain
+        // replace. This is the one thing that makes real blend-mode
+        // math expressible on the GPU.
+        blend: Blend::None,
+    }
 }
 
 /// Builds the one render pipeline shape every entry point in
@@ -2618,6 +2810,9 @@ impl TileCompositor {
             channel_mixer: None,
             selective_color: None,
             gradient_map: None,
+            background: None,
+            background_adopted: 0,
+            background_thread: None,
         }
     }
 
@@ -2661,7 +2856,177 @@ impl TileCompositor {
         built
     }
 
+    /// Starts building every blend-math pipeline on a background thread
+    /// (60 FPS round 6), so the first frame that composites a blend mode
+    /// finds its pipeline built instead of paying the build (about 7.5 ms
+    /// each with a cold driver cache, 138 ms for all 18). Each pipeline is
+    /// built from the [`PipelineKey`], layout, shader module and label its
+    /// composite call builds lazily, on a clone of the same device, so the
+    /// cached pipeline is the one that call would have made and no pixel
+    /// can change. A composite call takes whatever the thread has finished
+    /// (never waiting for it) and builds the rest itself, as without this.
+    ///
+    /// Each build runs inside [`capture_wgpu_errors`] on the background
+    /// thread (`wgpu` keeps error scopes per thread, so they catch only
+    /// that thread's errors); a build that fails is logged and never
+    /// handed over, so no invalid pipeline is ever cached and that mode is
+    /// built lazily on first use. Calling this again while a build is
+    /// pending does nothing.
+    ///
+    /// # Errors
+    ///
+    /// The thread could not be spawned; nothing changes and every
+    /// pipeline is built on first use.
+    pub fn prewarm_blend_pipelines_in_background(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> std::io::Result<()> {
+        if self.background.is_some() {
+            return Ok(());
+        }
+        let wanted: Vec<(PipelineKey, &'static str)> = ALL_BLEND_PASSES
+            .iter()
+            .map(|pass| (blend_pipeline_key(pass), pass.pipeline))
+            .filter(|(key, _)| !self.pipelines.contains(key))
+            .collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let device = device.clone();
+        let shader = self.shader.clone();
+        // The test hook is read here, on the calling thread (it is
+        // thread-local), and carried into the build.
+        let layout = if prewarm_fault_injected() {
+            self.bind_group_layout.clone()
+        } else {
+            self.bind_group_layout_blend.clone()
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_seen = std::sync::Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("aurora-pipeline-prewarm".to_owned())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let mut built = 0_usize;
+                for (key, label) in wanted {
+                    if stop_seen.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    match capture_wgpu_errors(&device, || {
+                        composite_pipeline(&device, &shader, &key, &layout, label)
+                    }) {
+                        Ok(pipeline) => {
+                            if sender.send((key, pipeline)).is_err() {
+                                // The compositor is gone; nobody wants the rest.
+                                return;
+                            }
+                            built += 1;
+                        }
+                        Err(err) => tracing::warn!(
+                            %err,
+                            pipeline = label,
+                            "building a blend pipeline in the background failed; it will be \
+                             built on first use"
+                        ),
+                    }
+                }
+                tracing::info!(
+                    built,
+                    ms = started.elapsed().as_secs_f64() * 1000.0,
+                    "blend pipelines prewarmed in the background"
+                );
+            })?;
+        self.background_thread = Some((thread, stop));
+        self.background = Some(receiver);
+        Ok(())
+    }
+
+    /// Stops the background pipeline build, if one is running, and waits
+    /// for its thread to end (at most the one pipeline it is building:
+    /// about 7.5 ms with a cold driver cache). Whatever it finished is
+    /// adopted first. Called on drop, and by the app at shutdown, so the
+    /// thread never outlives the compositor or reaches process exit.
+    pub fn stop_background_pipelines(&mut self) {
+        self.adopt_background_pipelines();
+        if let Some((thread, stop)) = self.background_thread.take() {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            // The thread checks the flag before each build and returns when
+            // its channel is closed, so closing it too ends it sooner.
+            self.background = None;
+            if thread.join().is_err() {
+                tracing::warn!("the background pipeline build panicked");
+            }
+        }
+    }
+
+    /// Drops every cached render pipeline (60 FPS round 6), so each is
+    /// built again on first use. For a caller whose own `wgpu` error scope
+    /// caught an error while this compositor may have built a pipeline
+    /// (an invalid handle must never stay cached), as
+    /// [`Self::prewarm`] does for its own failures.
+    pub fn discard_cached_pipelines(&mut self) {
+        self.pipelines = PipelineCache::new();
+    }
+
+    /// How many render pipelines are cached.
+    #[must_use]
+    pub fn cached_pipeline_count(&self) -> usize {
+        self.pipelines.len()
+    }
+
+    /// Takes into the cache whatever the background build has finished
+    /// (never waiting) and returns whether it is still building (60 FPS
+    /// round 6). Every blend composite call does this itself, so nothing
+    /// needs to call it for the pipelines to be used; the app does not.
+    /// Tests and measurements use it to wait for the build.
+    pub fn poll_background_pipelines(&mut self) -> bool {
+        self.adopt_background_pipelines();
+        self.background.is_some()
+    }
+
+    /// Moves every pipeline the background build has finished into the
+    /// cache, without waiting (60 FPS round 6). A pipeline the cache
+    /// already holds (built lazily meanwhile) is kept and the background
+    /// one dropped.
+    fn adopt_background_pipelines(&mut self) {
+        let Some(receiver) = &self.background else {
+            return;
+        };
+        loop {
+            match receiver.try_recv() {
+                Ok((key, pipeline)) => {
+                    if self.pipelines.insert_if_absent(key, pipeline) {
+                        self.background_adopted += 1;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.background = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Test-only: blocks until the background build has finished and
+    /// adopts everything it built.
+    #[cfg(test)]
+    fn wait_for_background_pipelines(&mut self) {
+        while let Some(receiver) = &self.background {
+            match receiver.recv() {
+                Ok((key, pipeline)) => {
+                    if self.pipelines.insert_if_absent(key, pipeline) {
+                        self.background_adopted += 1;
+                    }
+                }
+                Err(_) => self.background = None,
+            }
+        }
+    }
+
     fn prewarm_uncaptured(&mut self, device: &wgpu::Device, blend_modes: bool) -> usize {
+        self.adopt_background_pipelines();
         let before = self.pipelines.len();
         let shader = &self.shader;
         let opacity_layout = if prewarm_fault_injected() {
@@ -2687,13 +3052,7 @@ impl TileCompositor {
         if blend_modes {
             let layout = &self.bind_group_layout_blend;
             for blend_pass in ALL_BLEND_PASSES {
-                let key = PipelineKey {
-                    shader: LABEL,
-                    vertex_entry: "vs_composite",
-                    fragment_entry: blend_pass.fragment_entry,
-                    target_format: wgpu::TextureFormat::Rgba16Float,
-                    blend: Blend::None,
-                };
+                let key = blend_pipeline_key(blend_pass);
                 let _ = self.pipelines.get_or_create_with(key.clone(), || {
                     composite_pipeline(device, shader, &key, layout, blend_pass.pipeline)
                 });
@@ -4937,19 +5296,10 @@ impl TileCompositor {
         opacity: f32,
         blend_pass: &BlendPass,
     ) {
+        self.adopt_background_pipelines();
         let device = context.device();
         let opacity = opacity.clamp(0.0, 1.0);
-        let key = PipelineKey {
-            shader: LABEL,
-            vertex_entry: "vs_composite",
-            fragment_entry: blend_pass.fragment_entry,
-            target_format: wgpu::TextureFormat::Rgba16Float,
-            // The shader computes the whole composite itself, so the
-            // fixed-function unit must do nothing at all -- a plain
-            // replace. This is the one thing that makes real blend-mode
-            // math expressible on the GPU.
-            blend: Blend::None,
-        };
+        let key = blend_pipeline_key(blend_pass);
         let layout = &self.bind_group_layout_blend;
         let shader = &self.shader;
         let pipeline = self.pipelines.get_or_create_with(key.clone(), || {
@@ -6304,7 +6654,9 @@ mod tests {
 
     use super::{
         chunk_folds_to_backdrop, set_transparent_skip_enabled, transparent_chunks_skipped,
+        un_premultiply_per_sample,
     };
+    use half::slice::HalfFloatSliceExt as _;
 
     /// Every mode `composite_layer_into` takes (0.184.0).
     const TRANSPARENT_SKIP_MODES: [BlendMode; 26] = [
@@ -8718,6 +9070,290 @@ mod tests {
         });
         let (r, g, b, a) = read_first_texel(device, queue, &dst);
         assert_eq!((r, g, b, a), (0.5, 0.0, 0.5, 1.0));
+    }
+
+    /// Composites `src` over `backdrop` with every blend pass through
+    /// `compositor` and returns each pass's resulting first texel.
+    fn blend_pass_texels(
+        context: &aurora_gpu::GpuContext,
+        compositor: &mut TileCompositor,
+    ) -> Vec<(f32, f32, f32, f32)> {
+        let device = context.device();
+        let queue = context.queue();
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+        let src = solid_tile(device, queue, [0.75, 0.5, 0.25, 0.75], usage);
+        let backdrop = solid_tile(device, queue, [0.25, 0.5, 0.75, 1.0], usage);
+        let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        ALL_BLEND_PASSES
+            .iter()
+            .map(|pass| {
+                let dst = solid_tile(device, queue, [0.0, 0.0, 0.0, 0.0], usage);
+                let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+                submit_one(context, |encoder| {
+                    compositor.composite_blend_over_with_opacity(
+                        context,
+                        encoder,
+                        &src_view,
+                        &backdrop_view,
+                        &dst_view,
+                        0.5,
+                        pass,
+                    );
+                });
+                read_first_texel(device, queue, &dst)
+            })
+            .collect()
+    }
+
+    /// 60 FPS round 6: the background build hands over one pipeline per
+    /// blend pass, every blend composite then finds its pipeline cached
+    /// (none is rebuilt), and the pixels equal those of pipelines built
+    /// lazily by a compositor that never prewarmed. Prints the build time.
+    #[test]
+    fn background_blend_pipelines_are_used_and_draw_the_same_pixels() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let mut warmed = TileCompositor::new(device);
+        let started = std::time::Instant::now();
+        assert!(warmed.prewarm_blend_pipelines_in_background(device).is_ok());
+        let spawn_ms = started.elapsed().as_secs_f64() * 1000.0;
+        warmed.wait_for_background_pipelines();
+        let built_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(warmed.background_adopted, ALL_BLEND_PASSES.len());
+        assert_eq!(warmed.pipelines.len(), ALL_BLEND_PASSES.len());
+        let warmed_texels = blend_pass_texels(&context, &mut warmed);
+        assert_eq!(
+            warmed.pipelines.len(),
+            ALL_BLEND_PASSES.len(),
+            "every blend composite must find its background-built pipeline"
+        );
+        assert!(
+            warmed.prewarm_blend_pipelines_in_background(device).is_ok(),
+            "a second call with everything cached does nothing"
+        );
+        assert!(warmed.background.is_none());
+
+        let mut lazy = TileCompositor::new(device);
+        let lazy_texels = blend_pass_texels(&context, &mut lazy);
+        assert_eq!(lazy.pipelines.len(), ALL_BLEND_PASSES.len());
+        assert_eq!(lazy.background_adopted, 0);
+
+        // What a frame's first use of one mode costs on the calling
+        // thread: recording the pass, which builds the pipeline when it is
+        // not cached. Printed, not asserted.
+        let record_ms = |compositor: &mut TileCompositor, pass: &super::BlendPass| {
+            let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+            let queue = context.queue();
+            let src = solid_tile(device, queue, [0.75, 0.5, 0.25, 0.75], usage);
+            let dst = solid_tile(device, queue, [0.0, 0.0, 0.0, 0.0], usage);
+            let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+            let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let started = std::time::Instant::now();
+            compositor.composite_blend_over_with_opacity(
+                &context,
+                &mut encoder,
+                &src_view,
+                &src_view,
+                &dst_view,
+                0.5,
+                pass,
+            );
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            queue.submit(std::iter::once(encoder.finish()));
+            ms
+        };
+        let (mut first_lazy, mut first_adopted) = (0.0, 0.0);
+        for pass in ALL_BLEND_PASSES {
+            let mut cold = TileCompositor::new(device);
+            first_lazy += record_ms(&mut cold, pass);
+            let mut adopted = TileCompositor::new(device);
+            assert!(
+                adopted
+                    .prewarm_blend_pipelines_in_background(device)
+                    .is_ok()
+            );
+            adopted.wait_for_background_pipelines();
+            first_adopted += record_ms(&mut adopted, pass);
+        }
+        println!(
+            "first use of a blend pass on the calling thread, mean over {} passes: lazy {:.3} ms, \
+             background-built {:.3} ms",
+            ALL_BLEND_PASSES.len(),
+            first_lazy / ALL_BLEND_PASSES.len() as f64,
+            first_adopted / ALL_BLEND_PASSES.len() as f64
+        );
+        for ((pass, warmed), lazy) in ALL_BLEND_PASSES
+            .iter()
+            .zip(&warmed_texels)
+            .zip(&lazy_texels)
+        {
+            assert_eq!(
+                [warmed.0, warmed.1, warmed.2, warmed.3].map(f32::to_bits),
+                [lazy.0, lazy.1, lazy.2, lazy.3].map(f32::to_bits),
+                "{} drew differently through the background-built pipeline",
+                pass.fragment_entry
+            );
+        }
+        println!(
+            "background blend prewarm: spawn {spawn_ms:.2} ms (caller's cost), all {} built \
+             {built_ms:.2} ms",
+            ALL_BLEND_PASSES.len()
+        );
+    }
+
+    /// 60 FPS round 6: once the background thread has finished, the
+    /// composite calls themselves take its pipelines (nothing else has
+    /// adopted them yet) and build none.
+    #[test]
+    fn composite_calls_adopt_the_finished_background_pipelines() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let mut compositor = TileCompositor::new(device);
+        assert!(
+            compositor
+                .prewarm_blend_pipelines_in_background(device)
+                .is_ok()
+        );
+        if let Some((thread, _)) = compositor.background_thread.take() {
+            assert!(thread.join().is_ok());
+        }
+        assert_eq!(
+            compositor.pipelines.len(),
+            0,
+            "nothing adopted before a composite"
+        );
+        let _ = blend_pass_texels(&context, &mut compositor);
+        assert_eq!(compositor.background_adopted, ALL_BLEND_PASSES.len());
+        assert_eq!(compositor.pipelines.len(), ALL_BLEND_PASSES.len());
+        assert!(!compositor.poll_background_pipelines(), "the build is over");
+    }
+
+    /// 60 FPS round 6: stopping the background build (what dropping the
+    /// compositor does) joins its thread: once it returns, the thread has
+    /// ended, so it cannot reach process exit still inside the driver.
+    #[test]
+    fn stopping_the_background_build_joins_its_thread() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let mut compositor = TileCompositor::new(device);
+        assert!(
+            compositor
+                .prewarm_blend_pipelines_in_background(device)
+                .is_ok()
+        );
+        // The thread holds a clone of this flag until it returns, so once
+        // only this clone is left, the thread has ended.
+        let Some((_, stop)) = &compositor.background_thread else {
+            unreachable!("just started");
+        };
+        let stop = std::sync::Arc::clone(stop);
+        compositor.stop_background_pipelines();
+        assert_eq!(
+            std::sync::Arc::strong_count(&stop),
+            1,
+            "the thread must have ended when stop returns"
+        );
+        assert!(compositor.background_thread.is_none());
+        assert!(!compositor.poll_background_pipelines());
+        assert!(compositor.background_adopted <= ALL_BLEND_PASSES.len());
+
+        // Dropping a compositor whose build is running does the same.
+        let mut dropped = TileCompositor::new(device);
+        assert!(
+            dropped
+                .prewarm_blend_pipelines_in_background(device)
+                .is_ok()
+        );
+        let Some((_, stop)) = &dropped.background_thread else {
+            unreachable!("just started");
+        };
+        let stop = std::sync::Arc::clone(stop);
+        drop(dropped);
+        assert_eq!(std::sync::Arc::strong_count(&stop), 1);
+    }
+
+    /// 60 FPS round 6: a composite that runs before the background build
+    /// has finished does not wait -- it builds what it needs itself -- and
+    /// what the thread delivers later for a mode already built is
+    /// dropped, not swapped in.
+    #[test]
+    fn a_composite_during_the_background_build_builds_its_own_pipeline() {
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let mut compositor = TileCompositor::new(device);
+        assert!(
+            compositor
+                .prewarm_blend_pipelines_in_background(device)
+                .is_ok()
+        );
+        let texels = blend_pass_texels(&context, &mut compositor);
+        compositor.wait_for_background_pipelines();
+        assert_eq!(compositor.pipelines.len(), ALL_BLEND_PASSES.len());
+        assert!(compositor.background_adopted <= ALL_BLEND_PASSES.len());
+        let again = blend_pass_texels(&context, &mut compositor);
+        assert_eq!(
+            texels
+                .iter()
+                .map(|t| [t.0, t.1, t.2, t.3].map(f32::to_bits))
+                .collect::<Vec<_>>(),
+            again
+                .iter()
+                .map(|t| [t.0, t.1, t.2, t.3].map(f32::to_bits))
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "composite during background build: {} of {} pipelines taken from the thread",
+            compositor.background_adopted,
+            ALL_BLEND_PASSES.len()
+        );
+    }
+
+    /// 60 FPS round 6: a background build that fails (forced through the
+    /// test hook: the wrong layout) hands nothing over, so no invalid
+    /// pipeline is cached, and the composite builds a valid one itself and
+    /// draws what a never-prewarmed compositor draws.
+    #[test]
+    fn a_failed_background_build_is_never_cached() {
+        use super::PREWARM_FAULT;
+        let Some(context) = real_context() else {
+            return;
+        };
+        let device = context.device();
+        let mut compositor = TileCompositor::new(device);
+        PREWARM_FAULT.with(|fault| fault.set(true));
+        let spawned = compositor.prewarm_blend_pipelines_in_background(device);
+        PREWARM_FAULT.with(|fault| fault.set(false));
+        assert!(spawned.is_ok());
+        compositor.wait_for_background_pipelines();
+        assert_eq!(
+            compositor.background_adopted, 0,
+            "nothing may be handed over"
+        );
+        assert_eq!(compositor.pipelines.len(), 0, "nothing may be cached");
+        let texels = blend_pass_texels(&context, &mut compositor);
+        let mut lazy = TileCompositor::new(device);
+        let lazy_texels = blend_pass_texels(&context, &mut lazy);
+        assert_eq!(
+            texels
+                .iter()
+                .map(|t| [t.0, t.1, t.2, t.3].map(f32::to_bits))
+                .collect::<Vec<_>>(),
+            lazy_texels
+                .iter()
+                .map(|t| [t.0, t.1, t.2, t.3].map(f32::to_bits))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -29738,6 +30374,227 @@ mod tests {
     /// fixtures that matter most.
     fn bits(texels: &[f16]) -> Vec<u16> {
         texels.iter().map(|sample| sample.to_bits()).collect()
+    }
+
+    /// [`composite_layer_into`]'s whole-chunk loop as it was before 60 FPS
+    /// round 6, verbatim: the mode matched per texel inside
+    /// `fold_texel` (copied below as `fold_texel_round5`). The round-6 per-mode instantiation must match it
+    /// bit for bit wherever the result is not a NaN.
+    fn composite_layer_into_round5(out: &mut [f16], texels: &[f16], opacity: f32, mode: BlendMode) {
+        let opacity = opacity.clamp(0.0, 1.0);
+        let mut dst_wide = [0f32; CHUNK_SAMPLES];
+        let mut src_wide = [0f32; CHUNK_SAMPLES];
+        for (dst_chunk, src_chunk) in out
+            .chunks_exact_mut(CHUNK_SAMPLES)
+            .zip(texels.chunks_exact(CHUNK_SAMPLES))
+        {
+            dst_chunk.convert_to_f32_slice(&mut dst_wide);
+            src_chunk.convert_to_f32_slice(&mut src_wide);
+            for (dst, src) in dst_wide
+                .chunks_exact_mut(CHANNELS)
+                .zip(src_wide.chunks_exact(CHANNELS))
+            {
+                let [dr, dg, db, da] = dst else { continue };
+                let [sr, sg, sb, sa] = src else { continue };
+                let [nr, ng, nb, na] =
+                    fold_texel_round5([*dr, *dg, *db, *da], [*sr, *sg, *sb, *sa], opacity, mode);
+                *dr = nr;
+                *dg = ng;
+                *db = nb;
+                *da = na;
+            }
+            dst_chunk.convert_from_f32_slice(&dst_wide);
+        }
+    }
+
+    /// `fold_texel` as it was before round 6, verbatim (the arithmetic
+    /// now lives in `fold_texel_with`; a copy here keeps the reference
+    /// independent of it).
+    fn fold_texel_round5(
+        dst: [f32; CHANNELS],
+        src: [f32; CHANNELS],
+        opacity: f32,
+        mode: BlendMode,
+    ) -> [f32; CHANNELS] {
+        let [dr, dg, db, da] = dst;
+        let [sr, sg, sb, sa] = src;
+        let alpha = sa * opacity;
+        let inverse = 1.0 - alpha;
+        let backdrop_alpha = da;
+        let backdrop_inverse = 1.0 - backdrop_alpha;
+        let straight_backdrop = if backdrop_alpha > 0.0 {
+            [
+                dr / backdrop_alpha,
+                dg / backdrop_alpha,
+                db / backdrop_alpha,
+            ]
+        } else {
+            [0.0, 0.0, 0.0]
+        };
+        let [br, bg, bb] = blend_rgb(mode, straight_backdrop, [sr, sg, sb]);
+        let blended_r = backdrop_inverse * sr + backdrop_alpha * br;
+        let blended_g = backdrop_inverse * sg + backdrop_alpha * bg;
+        let blended_b = backdrop_inverse * sb + backdrop_alpha * bb;
+        [
+            inverse * dr + alpha * blended_r,
+            inverse * dg + alpha * blended_g,
+            inverse * db + alpha * blended_b,
+            alpha + da * inverse,
+        ]
+    }
+
+    /// One tile (65,536 texels) whose texel `i` is `base` with the sample
+    /// at `position` (0..8: backdrop R, G, B, A, then source R, G, B, A)
+    /// replaced by the `f16` with bit pattern `i`: every pattern, once.
+    fn every_pattern_at(
+        position: usize,
+        backdrop: [f32; CHANNELS],
+        source: [f32; CHANNELS],
+    ) -> (Vec<f16>, Vec<f16>) {
+        let mut dst = Vec::with_capacity(SAMPLES);
+        let mut src = Vec::with_capacity(SAMPLES);
+        for pattern in 0..=u16::MAX {
+            let mut d = backdrop.map(f16::from_f32);
+            let mut s = source.map(f16::from_f32);
+            let slot = if position < CHANNELS {
+                d.get_mut(position)
+            } else {
+                s.get_mut(position - CHANNELS)
+            };
+            if let Some(slot) = slot {
+                *slot = f16::from_bits(pattern);
+            }
+            dst.extend_from_slice(&d);
+            src.extend_from_slice(&s);
+        }
+        (dst, src)
+    }
+
+    /// 60 FPS round 6: the per-mode instantiation of the chunk loop
+    /// (`fold_chunks_in_mode`) against the round-5 loop, bit for bit with
+    /// NaN payloads aside, for every blend mode, every `f16` bit pattern in
+    /// each of the eight input samples, two backdrops (opaque and
+    /// translucent, so both arms of the backdrop recovery run), and three
+    /// opacities. The transparent-chunk skip is turned off for the
+    /// comparison so every chunk takes the rewritten loop.
+    ///
+    /// **NaN payloads, measured 2026-10-17 (`x86_64` with F16C, rustc 1.97).**
+    /// In the release profile the two loops agree on every bit, NaN
+    /// payloads included, and that is asserted below for any optimised
+    /// `x86_64` build (other targets print the count without asserting).
+    /// In the dev profile (opt-level 1) they differ in 18,414
+    /// samples, all `Difference` with a negative NaN source colour channel
+    /// (0xFC01..=0xFFFF): the round-5 loop gives 0xFE01 and up, this one
+    /// 0x7E01 and up, i.e. which NaN wins `backdrop_inverse * Cs +
+    /// backdrop_alpha * |Cb - Cs|` (both NaN, opposite signs). That choice
+    /// is the compiler's operand order for a commutative add, which the
+    /// source does not fix, and the **round-5 loop was already profile
+    /// dependent in the same way**: per-configuration hashes of this sweep
+    /// showed the round-5 loop's dev output differing from its own release
+    /// output in 36 of the 1,248 configurations (all `Difference`), the
+    /// round-6 loop's dev output differing from release in 18, and the two
+    /// loops' release outputs identical in all 1,248. So the shipping build
+    /// is unchanged bit for bit, and the dev build moved closer to it.
+    /// (The per-configuration hashes were a one-time instrumentation of
+    /// this sweep, not kept; the dev run of this test still prints the
+    /// count and asserts that nothing but a NaN's payload differs.)
+    #[test]
+    fn per_mode_fold_is_bit_identical_to_the_round5_loop_over_every_f16_pattern() {
+        let backdrops = [[0.2, 0.35, 0.55, 1.0], [0.15, 0.05, 0.1, 0.5]];
+        let source = [0.9, 0.6, 0.25, 0.75];
+        set_transparent_skip_enabled(false);
+        let mut compared = 0_usize;
+        let mut nan_payload_differences = 0_usize;
+        for backdrop in backdrops {
+            for position in 0..2 * CHANNELS {
+                let (dst, src) = every_pattern_at(position, backdrop, source);
+                for mode in ALL_MODES {
+                    for opacity in [1.0, 0.5, 0.0] {
+                        let mut new = dst.clone();
+                        let mut old = dst.clone();
+                        composite_layer_into(&mut new, &src, opacity, mode);
+                        composite_layer_into_round5(&mut old, &src, opacity, mode);
+                        // Bit for bit, except that where the round-5 loop
+                        // produced a NaN this one need only produce a NaN:
+                        // which operand's payload survives an operation on
+                        // a NaN is an instruction-selection detail (the
+                        // class disclosed at
+                        // `a_hostile_fixture_folds_identically_except_for_the_nan_payload_operand`).
+                        let first = new.iter().zip(old.iter()).position(|(a, b)| {
+                            a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan())
+                        });
+                        assert_eq!(
+                            first, None,
+                            "{mode:?} at opacity {opacity}, varying input sample {position} \
+                             over backdrop {backdrop:?}: first differing sample"
+                        );
+                        nan_payload_differences += new
+                            .iter()
+                            .zip(old.iter())
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        compared += new.len();
+                    }
+                }
+            }
+        }
+        set_transparent_skip_enabled(true);
+        assert_eq!(compared, 2 * 2 * CHANNELS * ALL_MODES.len() * 3 * SAMPLES);
+        println!(
+            "per-mode fold: {compared} samples compared, {nan_payload_differences} differ only \
+             in a NaN's payload"
+        );
+        // Optimised builds on x86_64, where this was measured: bit for bit,
+        // NaN payloads included. Rust leaves NaN payloads unspecified, so
+        // other targets only report the count.
+        if !cfg!(debug_assertions) && cfg!(target_arch = "x86_64") {
+            assert_eq!(
+                nan_payload_differences, 0,
+                "in an optimised build the per-mode loop must equal the round-5 loop bit for bit"
+            );
+        }
+    }
+
+    /// 60 FPS round 6: the chunked [`un_premultiply_in_place`] against its
+    /// own per-sample loop (the pre-round-6 body), bit for bit, for every
+    /// `f16` pattern in each of the four samples of a texel over three
+    /// base texels, plus a length that leaves a partial chunk and a
+    /// partial texel at the end.
+    #[test]
+    fn chunked_un_premultiply_is_bit_identical_to_the_per_sample_loop() {
+        let bases = [
+            [0.2, 0.35, 0.55, 1.0],
+            [0.1, 0.05, 0.3, 0.5],
+            [0.0, 0.0, 0.0, 0.0],
+        ];
+        for base in bases {
+            for position in 0..CHANNELS {
+                let (texels, _) = every_pattern_at(position, base, [0.0; CHANNELS]);
+                let mut chunked = texels.clone();
+                let mut per_sample = texels.clone();
+                un_premultiply_in_place(&mut chunked);
+                un_premultiply_per_sample(&mut per_sample);
+                assert_eq!(
+                    bits(&chunked),
+                    bits(&per_sample),
+                    "varying sample {position} over base {base:?}"
+                );
+                // A length that is not a whole number of chunks, and not a
+                // whole number of texels: the tail takes the per-sample
+                // loop and the partial texel is left alone.
+                let odd = CHUNK_SAMPLES * 3 + CHANNELS * 5 + 2;
+                let mut chunked = texels.get(..odd).map(<[f16]>::to_vec).unwrap_or_default();
+                let mut per_sample = chunked.clone();
+                un_premultiply_in_place(&mut chunked);
+                un_premultiply_per_sample(&mut per_sample);
+                assert_eq!(
+                    bits(&chunked),
+                    bits(&per_sample),
+                    "odd length, sample {position}"
+                );
+                assert_eq!(chunked.len(), odd);
+            }
+        }
     }
 
     /// **The headline test for 0.98.0, and it is unqualified.** The

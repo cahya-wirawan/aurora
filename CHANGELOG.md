@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.271.0] - 2026-10-17
+
+### Added
+
+- Record 60 FPS round 6: per-mode CPU fold, background blend pipelines, startup warm-up
+
 ## [0.270.2] - 2026-10-17
 
 ### Fixed

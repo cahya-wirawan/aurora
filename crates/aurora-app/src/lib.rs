@@ -23788,8 +23788,9 @@ impl RecompositeTileCosts {
 /// 60 FPS round 5: builds the canvas pipeline for the window's surface
 /// format and the compositor's `Normal` pipelines at startup, instead of
 /// inside the first frame that needs them (measured there at 10-17 ms
-/// with a cold driver pipeline cache). Blend-mode pipelines stay lazy:
-/// all 18 cost about 138 ms with a cold driver cache (6 ms warm). Every
+/// with a cold driver pipeline cache). Blend-mode pipelines (all 18 cost
+/// about 138 ms with a cold driver cache, 6 ms warm) are started on a
+/// background thread (round 6), so startup does not wait for them. Every
 /// `wgpu` error is captured and logged, so a failed prewarm never aborts
 /// startup, and what a failed build may have cached (an invalid handle)
 /// is dropped -- a fresh `CanvasPipeline` here, an emptied cache inside
@@ -23824,6 +23825,139 @@ fn prewarm_gpu_pipelines(
             %err,
             "prewarming the composite pipelines failed; they will be built on first use"
         ),
+    }
+    // 60 FPS round 6: the blend-mode pipelines are built on a background
+    // thread instead of by the first frame using each mode; a frame that
+    // gets there first builds its own (`TileCompositor::prewarm_blend_pipelines_in_background`).
+    if let Err(err) = compositor.prewarm_blend_pipelines_in_background(device) {
+        tracing::warn!(
+            %err,
+            "could not start building the blend pipelines in the background; they will be built \
+             on first use"
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: makes [`warm_up_gpu_composite`] raise a validation error.
+    static WARM_UP_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the test hook asks [`warm_up_gpu_composite`] to fail (always
+/// `false` outside tests).
+fn warm_up_fault_injected() -> bool {
+    #[cfg(test)]
+    {
+        WARM_UP_FAULT.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// 60 FPS round 6: composites one transparent tile through the GPU path's
+/// own steps -- accumulator and source textures with the frame's
+/// descriptors, a `write_texture` upload, a `Normal` pass, the readback
+/// copy into a `MAP_READ` buffer, a submit, `map_async` and a blocking
+/// poll -- on textures and a buffer of its own, at startup, so the
+/// one-time work the first of each step does (memory blocks, staging,
+/// descriptor pools, command pools, the first submit and map) is not
+/// paid inside the first frame. Touches no document, store or atlas, so
+/// it cannot change a pixel; the decoded result is dropped. Every `wgpu`
+/// error is captured and logged; nothing it built outlives it.
+fn warm_up_gpu_composite(
+    gpu: &aurora_gpu::GpuContext,
+    compositor: &mut aurora_render::TileCompositor,
+) -> bool {
+    let device = gpu.device();
+    let queue = gpu.queue();
+    let started = std::time::Instant::now();
+    let warmed = aurora_render::capture_wgpu_errors(device, || {
+        let tile_extent = wgpu::Extent3d {
+            width: aurora_tile::TILE,
+            height: aurora_tile::TILE,
+            depth_or_array_layers: 1,
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu-composite-warm-up"),
+        });
+        let accumulator =
+            create_composite_accumulator(device, &mut encoder, tile_extent, "gpu-composite-a");
+        let src_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gpu-composite-src"),
+            size: tile_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let transparent = aurora_render::transparent_tile();
+        let bytes = f16_le_bytes(&transparent);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &src_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(aurora_tile::TILE * 8),
+                rows_per_image: Some(aurora_tile::TILE),
+            },
+            tile_extent,
+        );
+        let src_view = src_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        compositor.composite_over_with_opacity(gpu, &mut encoder, &accumulator.1, &src_view, 1.0);
+        let readback = record_tile_readback(device, &mut encoder, &accumulator.0);
+        queue.submit(std::iter::once(encoder.finish()));
+        let pending = map_pending_readback(readback, aurora_tile::TileId { x: 0, y: 0 });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        let read_back = finish_tile_readback(pending).is_some();
+        if warm_up_fault_injected() {
+            // Test hook: a validation error after the pass was recorded.
+            let _ = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("gpu-composite-warm-up-fault"),
+                size: wgpu::Extent3d {
+                    width: 0,
+                    height: 0,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+        }
+        read_back
+    });
+    match warmed {
+        Ok(read_back) => {
+            tracing::info!(
+                read_back,
+                ms = started.elapsed().as_secs_f64() * 1000.0,
+                "GPU composite path warmed up"
+            );
+            read_back
+        }
+        Err(err) => {
+            // The `Normal` pass may have built (and cached) its pipeline
+            // inside the failed scope; an invalid handle must not stay
+            // cached, so every pipeline is built again on first use.
+            compositor.discard_cached_pipelines();
+            tracing::warn!(%err, "warming up the GPU composite path failed");
+            false
+        }
     }
 }
 
@@ -35258,6 +35392,12 @@ impl App {
     /// silently pass `None` for the store and the scratch directory and
     /// still pass the whole gate. See [`ShutdownState`].
     fn finish_shutdown(&mut self) {
+        // 60 FPS round 6: the blend pipelines' background build must not
+        // reach process exit still running (see
+        // `TileCompositor::stop_background_pipelines`).
+        if let Some(compositor) = self.compositor.as_mut() {
+            compositor.stop_background_pipelines();
+        }
         // Review L-3: a Save With Changes still waiting is abandoned —
         // dropping it deletes its temp file; the target was never touched.
         // (A quit is not deferred for it.)
@@ -37639,6 +37779,7 @@ impl ApplicationHandler<AppEvent> for App {
                 &mut compositor,
                 surface.format(),
             );
+            let _ = warm_up_gpu_composite(&gpu, &mut compositor);
             self.canvas_pipeline = Some(canvas_pipeline);
             self.compositor = Some(compositor);
         } else {
@@ -66448,6 +66589,35 @@ mod tests {
             let _ = canvas_pipeline.pipeline(device, wgpu::TextureFormat::Rgba8Unorm);
             let _ = compositor.prewarm(device, false).ok();
         }
+        // 60 FPS round 6: as `App` does at startup, unless
+        // `AURORA_R6_NO_WARM_UP` asks for the cold first GPU composite.
+        if std::env::var_os("AURORA_R5_COLD").is_none()
+            && std::env::var_os("AURORA_R6_NO_WARM_UP").is_none()
+        {
+            let started = std::time::Instant::now();
+            let _ = crate::warm_up_gpu_composite(gpu, &mut compositor);
+            println!(
+                "measure_pan_and_paint_frames: GPU composite warm-up {:.2} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        // 60 FPS round 6: `AURORA_R6_BLEND_PREWARM=background` starts the
+        // blend pipelines' background build as `App` does and does not wait
+        // for it; `finished` waits until it is done (the first frame of a
+        // session that has been open for a moment). Unset, they stay lazy,
+        // as the gate fixtures always measured them.
+        match std::env::var("AURORA_R6_BLEND_PREWARM").as_deref() {
+            Ok("background") => {
+                let _ = compositor.prewarm_blend_pipelines_in_background(device);
+            }
+            Ok("finished") => {
+                let _ = compositor.prewarm_blend_pipelines_in_background(device);
+                while compositor.poll_background_pipelines() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            _ => {}
+        }
 
         let target = frame_timing_target(device, viewport);
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
@@ -67756,6 +67926,83 @@ mod tests {
     /// now confirmed by bisect rather than hypothesized), and the
     /// disclosed limitations — chiefly that the poll-wait number is
     /// wall-clock stall, not GPU execution time.
+    /// 60 FPS round 6: the frame that first composites a blend mode on the
+    /// GPU path. A `Normal` backdrop under a `Multiply` canvas layer, both
+    /// document-sized, otherwise the gate fixture. Run with
+    /// `AURORA_R6_BLEND_PREWARM` unset (lazy: frame 0 builds the Multiply
+    /// pipeline), `background` or `finished` (see
+    /// [`measure_pan_and_paint_frames`]) to compare frame 0. Prints; asserts
+    /// only the CI-safety budget and that the GPU path ran.
+    #[test]
+    fn recomposite_and_present_loop_measures_the_first_blend_mode_frame() {
+        const BUDGET_MS: f64 = 3000.0;
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let Some(budget) = std::num::NonZeroUsize::new(64) else {
+            unreachable!("64 is non-zero");
+        };
+        let mut store = match aurora_tile::TileStore::new(dir.path().to_path_buf(), budget) {
+            Ok(store) => store,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut layers = aurora_doc::LayerTree::new();
+        let bounds = aurora_core::Rect {
+            x: 0,
+            y: 0,
+            width: 300_000,
+            height: 300_000,
+        };
+        let backdrop = match layers.add_pixel_layer("backdrop", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let canvas = match layers.add_pixel_layer("canvas", bounds, None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = layers.set_blend_mode(canvas, aurora_doc::BlendMode::Multiply) {
+            unreachable!("{err:?}");
+        }
+        let (Some(backdrop_surface), Some(canvas_surface)) =
+            (layers.surface_id(backdrop), layers.surface_id(canvas))
+        else {
+            unreachable!("just created as pixel layers");
+        };
+        assert!(document_qualifies_for_gpu_compositing(&layers));
+        let start = (100_000, 100_000);
+        let tiles = panned_tile_superset((800, 600), 1, start, (200, 120));
+        preseed_full_tiles(&mut store, backdrop_surface, &tiles, [0.2, 0.35, 0.55, 1.0]);
+        let mode = std::env::var("AURORA_R6_BLEND_PREWARM").unwrap_or_else(|_| "lazy".to_owned());
+        let mut stages = measure_pan_and_paint_frames(
+            &context,
+            &layers,
+            canvas,
+            canvas_surface,
+            &mut store,
+            (800, 600),
+            12,
+            start,
+            (200, 120),
+            None,
+        );
+        let frame0 = stages.total.first().copied().unwrap_or(f64::NAN);
+        let recomposite0 = stages.recomposite.first().copied().unwrap_or(f64::NAN);
+        let gpu0 = stages.gpu_tiles.first().copied().unwrap_or_default();
+        let (mean, p50, p99, max) = ms_stats(&mut stages.total);
+        println!(
+            "first blend-mode frame (blend prewarm {mode}): frame0 total={frame0:.2}ms \
+             recomposite={recomposite0:.2}ms gpu_tiles={gpu0} | n=12 mean={mean:.2}ms \
+             p50={p50:.2}ms max={max:.2}ms"
+        );
+        assert!(gpu0 > 0, "frame 0 must take the GPU path");
+        assert!(p99 < BUDGET_MS, "p99 {p99:.2}ms over the CI-safety budget");
+    }
+
     #[test]
     fn recomposite_and_present_loop_measures_pan_while_painting_at_the_300000px_ceiling() {
         // Real GitHub Actions CI runs (2026-08-12) hit p99 up to 889ms --
@@ -77463,6 +77710,146 @@ mod tests {
             0,
             "and no blend pass may be recorded for it either -- the Darken layer's own arm is \
              the one that can be observed directly"
+        );
+    }
+
+    /// 60 FPS round 6: the startup warm-up of the GPU composite path reads
+    /// its own tile back, and a tile composited afterwards (Normal,
+    /// Multiply, Darken, Screen layers) is bit for bit the tile a compositor
+    /// that was never warmed up produces.
+    #[test]
+    fn warming_up_the_gpu_composite_path_changes_no_pixel() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[
+                (
+                    "l1",
+                    aurora_doc::BlendMode::Normal,
+                    1.0,
+                    [0.5, 0.75, 1.0, 1.0],
+                ),
+                (
+                    "l2",
+                    aurora_doc::BlendMode::Multiply,
+                    0.5,
+                    [0.5, 0.25, 0.5, 0.75],
+                ),
+                (
+                    "l3",
+                    aurora_doc::BlendMode::Darken,
+                    0.75,
+                    [0.75, 0.5, 0.25, 1.0],
+                ),
+                (
+                    "l4",
+                    aurora_doc::BlendMode::Screen,
+                    0.5,
+                    [0.25, 0.5, 0.75, 0.5],
+                ),
+            ],
+        );
+        assert!(document_qualifies_for_gpu_compositing(&layers));
+        let tile = aurora_tile::TileId { x: 0, y: 0 };
+        let composite = |warm: bool, store: &mut aurora_tile::TileStore| {
+            let mut compositor = aurora_render::TileCompositor::new(context.device());
+            if warm {
+                assert!(crate::warm_up_gpu_composite(&context, &mut compositor));
+            }
+            let mut budget = CompositeBudget::for_pass(&layers);
+            let pending = begin_gpu_composite_tile(
+                &context,
+                &mut compositor,
+                &layers,
+                store,
+                tile,
+                (0, 0),
+                (0, 0),
+                &mut budget,
+            );
+            let Some(pending) = pending else {
+                unreachable!("every layer is stored at this tile");
+            };
+            let _ = context.device().poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            crate::finish_tile_readback(pending).unwrap_or_default()
+        };
+        let warmed = composite(true, &mut store);
+        let cold = composite(false, &mut store);
+        assert_eq!(warmed.len(), aurora_tile::SAMPLES);
+        assert!(
+            warmed
+                .iter()
+                .map(|s| s.to_bits())
+                .eq(cold.iter().map(|s| s.to_bits())),
+            "a warmed-up compositor must composite the same bits"
+        );
+    }
+
+    /// 60 FPS round 6: a warm-up that fails (forced through the test hook)
+    /// reports it, leaves no pipeline cached -- the `Normal` pass built one
+    /// inside the failed scope -- and the next tile composites to the same
+    /// bits as with a compositor that never warmed up.
+    #[test]
+    fn a_failed_warm_up_leaves_no_pipeline_cached() {
+        let Some(context) = real_gpu_context() else {
+            return;
+        };
+        let (_dir, mut store) = real_tile_store();
+        let layers = solid_root_stack(
+            &mut store,
+            &[(
+                "l1",
+                aurora_doc::BlendMode::Normal,
+                0.5,
+                [0.5, 0.75, 1.0, 1.0],
+            )],
+        );
+        let mut compositor = aurora_render::TileCompositor::new(context.device());
+        crate::WARM_UP_FAULT.with(|fault| fault.set(true));
+        let warmed = crate::warm_up_gpu_composite(&context, &mut compositor);
+        crate::WARM_UP_FAULT.with(|fault| fault.set(false));
+        assert!(!warmed, "the injected fault must fail the warm-up");
+        assert_eq!(
+            compositor.cached_pipeline_count(),
+            0,
+            "nothing may stay cached"
+        );
+        let mut composite = |compositor: &mut aurora_render::TileCompositor| {
+            let mut budget = CompositeBudget::for_pass(&layers);
+            let pending = begin_gpu_composite_tile(
+                &context,
+                compositor,
+                &layers,
+                &mut store,
+                aurora_tile::TileId { x: 0, y: 0 },
+                (0, 0),
+                (0, 0),
+                &mut budget,
+            );
+            let Some(pending) = pending else {
+                unreachable!("the layer is stored at this tile");
+            };
+            let _ = context.device().poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            crate::finish_tile_readback(pending).unwrap_or_default()
+        };
+        let after_failure = composite(&mut compositor);
+        let mut fresh = aurora_render::TileCompositor::new(context.device());
+        let cold = composite(&mut fresh);
+        assert_eq!(after_failure.len(), aurora_tile::SAMPLES);
+        assert!(
+            after_failure
+                .iter()
+                .map(|s| s.to_bits())
+                .eq(cold.iter().map(|s| s.to_bits()))
         );
     }
 
