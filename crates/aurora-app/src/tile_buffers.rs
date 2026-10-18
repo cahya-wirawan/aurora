@@ -14,6 +14,18 @@
 //! took about 10,000. Keeping a few buffers per thread takes that out of
 //! the allocator's hands.
 //!
+//! **Only Linux (glibc) reuses a buffer for [`zeroed`]** (round 9 review).
+//! Clearing a recycled buffer is a 512 KiB `memset`, about 15 µs. On the
+//! Apple M2 Pro that made the plain-photo CPU recomposite about 6 % slower
+//! than main (24 MP sequential 83.2-83.9 -> 88.0-88.5 ms, 60 MP 207-208 ->
+//! 220-221), because a fresh `calloc` there costs less than that: the VM
+//! hands out zero-filled pages. On Linux the same change measured equal to
+//! main on that document (24 MP 189-210 against 190-223 ms, 60 MP 472-475
+//! against 472-503, noisy), since glibc's `calloc` clears a reused heap
+//! chunk itself; there it is the page faults (above) that the pool
+//! removes. Elsewhere [`zeroed`] is `transparent_tile` as on main, and
+//! only [`copy_of`] (which overwrites the whole buffer either way) reuses.
+//!
 //! A buffer handed out has exactly the content the allocation it replaces
 //! had (all `+0.0` bits for [`zeroed`], a copy of the source for
 //! [`copy_of`]), so nothing a composite computes changes. A thread keeps at
@@ -34,15 +46,15 @@ fn take() -> Option<Vec<half::f16>> {
 
 /// A tile-sized buffer of `+0.0` (bit pattern `0x0000`), what
 /// `aurora_render::transparent_tile` returns.
+/// Reuses a kept buffer on Linux (glibc) only; see the module docs.
 pub(crate) fn zeroed() -> Vec<half::f16> {
-    match take() {
-        Some(mut buffer) => {
-            buffer.clear();
-            buffer.resize(aurora_tile::SAMPLES, half::f16::from_bits(0));
-            buffer
-        }
-        None => aurora_render::transparent_tile(),
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if let Some(mut buffer) = take() {
+        buffer.clear();
+        buffer.resize(aurora_tile::SAMPLES, half::f16::from_bits(0));
+        return buffer;
     }
+    aurora_render::transparent_tile()
 }
 
 /// A copy of `source` (`source.to_vec()`).
@@ -99,6 +111,28 @@ mod tests {
                 .all(|(a, b)| a.to_bits() == b.to_bits())
         );
         assert_eq!(copy.len(), source.len());
+    }
+
+    /// On Linux (glibc) [`zeroed`] reuses a kept buffer (the dab's
+    /// page-fault fix); a kept buffer always serves [`copy_of`].
+    #[test]
+    fn kept_buffers_are_reused_where_intended() {
+        super::FREE.with(|free| free.borrow_mut().clear());
+        let buffer = vec![half::f16::ONE; aurora_tile::SAMPLES];
+        let address = buffer.as_ptr();
+        recycle(buffer);
+        let copy = copy_of(&[half::f16::ZERO; 8]);
+        assert_eq!(copy.as_ptr(), address, "copy_of reuses a kept buffer");
+        recycle(copy);
+        let zero = zeroed();
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        assert_eq!(
+            zero.as_ptr(),
+            address,
+            "zeroed reuses a kept buffer on glibc"
+        );
+        assert!(zero.iter().all(|v| v.to_bits() == 0));
+        super::FREE.with(|free| free.borrow_mut().clear());
     }
 
     #[test]
