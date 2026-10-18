@@ -1417,6 +1417,7 @@ impl TileResidency {
     /// inconsistency, not a judgement call. Saturating leaves
     /// [`Self::zoom_floor`] computing `viewport / (u32::MAX - TILE)` ≈
     /// 1.0 — a sane, conservative floor, not garbage.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn grid_for(viewport_px: (u32, u32)) -> (u32, u32) {
         Self::grid_for_coverage(viewport_px, 1)
     }
@@ -1618,6 +1619,7 @@ impl TileResidency {
     /// asserts that implication directly rather than leaving it to a
     /// clamp that would then be both untested and, if it ever did fire,
     /// pan-dependent again.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn uniform_values(
         grid: (u32, u32),
         origin: TileId,
@@ -1685,6 +1687,7 @@ impl TileResidency {
 
     /// The zoom `uniform_values` actually renders at: the caller's, made
     /// sane by [`Self::guard_zoom`] and raised to the atlas's floor.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn rendered_zoom_value(grid: (u32, u32), viewport_px: (u32, u32), zoom: f32) -> f32 {
         Self::rendered_zoom_value_c(grid, viewport_px, zoom, 1)
     }
@@ -1712,6 +1715,7 @@ impl TileResidency {
     /// unwrapped top-left (`origin * TILE + sub_tile`) -- the inverse of
     /// the `uv` mapping `uniform_values` writes. `None` is [`NO_CLIP`];
     /// a non-finite rectangle collapses to an empty one that clips all.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn clip_values(
         grid: (u32, u32),
         origin: TileId,
