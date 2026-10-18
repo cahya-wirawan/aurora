@@ -469,6 +469,65 @@ fn a_dab_invalidates_exactly_the_pyramid_tiles_above_it_and_they_rebuild() {
 }
 
 #[test]
+fn a_live_move_leaves_no_stale_pyramid_tile() {
+    let mut doc = document((2100, 1100));
+    let mut cache = crate::CompositeCache::default();
+    let _ = settle(&mut doc, &mut cache, 3);
+    let before = cache.pyramid.current_len();
+    let bounds = doc.layers.bounds(doc.top).unwrap_or_else(|| unreachable!());
+    let moved = aurora_core::Rect {
+        x: bounds.x + 40,
+        y: bounds.y + 20,
+        ..bounds
+    };
+    let _ = ok(crate::move_invalidation::move_layer_live(
+        &mut doc.layers,
+        &mut cache,
+        Some(&doc.store),
+        Some(doc.top),
+        doc.top,
+        moved,
+    ));
+    assert!(cache.pyramid.current_len() < before);
+    let _ = settle(&mut doc, &mut cache, 3);
+    for level in 1..=3 {
+        assert_level_matches_export(&mut doc, level, TOLERANCE);
+    }
+}
+
+#[test]
+fn an_undo_rectangle_drops_the_ancestors_of_the_tiles_it_reaches() {
+    // A pixel undo invalidates the rectangles it restored
+    // (`invalidate_doc_rects`); here the layer's pixels in one tile change
+    // by hand, as a restore would change them.
+    let mut doc = document((2100, 1100));
+    let mut cache = crate::CompositeCache::default();
+    let _ = settle(&mut doc, &mut cache, 3);
+    let tile = ok(doc.store.get_mut(doc.top_surface, TileId { x: 2, y: 1 }));
+    for texel in tile.texels_mut().chunks_exact_mut(CHANNELS) {
+        for (slot, v) in texel.iter_mut().zip([0.0_f32, 0.5, 1.0, 1.0]) {
+            *slot = half::f16::from_f32(v);
+        }
+    }
+    cache.invalidate_doc_rects(
+        &[aurora_core::Rect {
+            x: 512,
+            y: 256,
+            width: 256,
+            height: 256,
+        }],
+        (0, 0),
+    );
+    assert!(!cache.pyramid.is_current(1, TileId { x: 1, y: 0 }));
+    assert!(!cache.pyramid.is_current(2, TileId { x: 0, y: 0 }));
+    assert!(cache.pyramid.is_current(1, TileId { x: 0, y: 0 }));
+    let _ = settle(&mut doc, &mut cache, 3);
+    for level in 1..=3 {
+        assert_level_matches_export(&mut doc, level, TOLERANCE);
+    }
+}
+
+#[test]
 fn a_structural_change_drops_the_whole_pyramid() {
     // Visibility, opacity, blend mode, a structural undo: all bump the
     // composite cache, and the pyramid with it.

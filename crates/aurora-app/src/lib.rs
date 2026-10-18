@@ -73371,7 +73371,9 @@ mod tests {
         let mut view = CanvasView::new();
         view.zoom_at((0.0, 0.0), 0.25);
         let doc_origin = canvas_local_origin(&view, (0.0, 0.0));
-        let rendered_zoom = crate::zoomed_view::rendered_canvas_zoom(
+        // The 1:1 atlas alone (0.275.0): it is what would draw this view
+        // without the zoomed-out view, and it still clamps.
+        let rendered_zoom = aurora_gpu::TileResidency::effective_zoom(
             canvas,
             effective_residency_zoom(view.zoom(), 1.0),
         );
