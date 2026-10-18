@@ -994,6 +994,12 @@ pub struct TileResidency {
     /// hidden. A view setting only -- nothing stored is touched. See
     /// [`Self::set_channel_gain`].
     channel_gain: [f32; 3],
+    /// How many viewports per axis the atlas covers at zoom 1 (1 for the
+    /// canvas's own atlas; 2 for the zoomed-out view's, see
+    /// [`Self::with_coverage`]).
+    coverage: u32,
+    /// Mip levels the texture has (the canvas atlas keeps its four).
+    mip_levels: u32,
 }
 
 impl TileResidency {
@@ -1042,7 +1048,35 @@ impl TileResidency {
     /// exactly), and establishes an initial origin of `(0, 0)`.
     #[must_use]
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, viewport_px: (u32, u32)) -> Self {
-        let grid = Self::grid_for(viewport_px);
+        Self::with_coverage(device, queue, viewport_px, 1)
+    }
+
+    /// The largest [`Self::with_coverage`] factor accepted.
+    pub const MAX_COVERAGE: u32 = 4;
+
+    /// An atlas covering `coverage` viewports per axis at zoom 1 (clamped
+    /// to `1..=`[`Self::MAX_COVERAGE`]), so it can render down to about
+    /// `1 / coverage` of the 1:1 zoom without fabricating content: the
+    /// zoom floor ([`Self::min_zoom_for_viewport_with_coverage`]) is
+    /// derived from its grid exactly as [`Self::min_zoom_for_viewport`]
+    /// is from the canvas atlas's. `coverage == 1` is [`Self::new`]
+    /// exactly (same grid, same four mip levels, same uniform).
+    ///
+    /// The zoomed-out view (`aurora-app`) uses `coverage == 2` to show a
+    /// pyramid level at a zoom in `(0.5, 1]` of that level. Such an atlas
+    /// has one mip level only (the levels it shows come from the
+    /// document's composite pyramid, not from this texture's chain), so
+    /// [`Self::upload_mip`] refuses any level above 0 on it.
+    #[must_use]
+    pub fn with_coverage(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        viewport_px: (u32, u32),
+        coverage: u32,
+    ) -> Self {
+        let coverage = coverage.clamp(1, Self::MAX_COVERAGE);
+        let mip_levels = if coverage == 1 { MIP_LEVELS } else { 1 };
+        let grid = Self::grid_for_coverage(viewport_px, coverage);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tile-residency"),
             size: wgpu::Extent3d {
@@ -1054,7 +1088,7 @@ impl TileResidency {
                 height: grid.1.saturating_mul(TILE),
                 depth_or_array_layers: 1,
             },
-            mip_level_count: MIP_LEVELS,
+            mip_level_count: mip_levels,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
@@ -1122,6 +1156,8 @@ impl TileResidency {
             sub_tile: (0.0, 0.0),
             doc_clip: None,
             channel_gain: FULL_GAIN,
+            coverage,
+            mip_levels,
         };
         residency.write_uniform(queue, viewport_px, 1.0);
         residency
@@ -1331,7 +1367,7 @@ impl TileResidency {
         let sub_tile = self.sub_tile;
         let doc_clip = self.doc_clip;
         let channel_gain = self.channel_gain;
-        *self = Self::new(device, queue, viewport_px);
+        *self = Self::with_coverage(device, queue, viewport_px, self.coverage);
         self.origin = origin;
         self.sub_tile = sub_tile;
         self.doc_clip = doc_clip;
@@ -1382,9 +1418,24 @@ impl TileResidency {
     /// [`Self::zoom_floor`] computing `viewport / (u32::MAX - TILE)` ≈
     /// 1.0 — a sane, conservative floor, not garbage.
     fn grid_for(viewport_px: (u32, u32)) -> (u32, u32) {
+        Self::grid_for_coverage(viewport_px, 1)
+    }
+
+    /// [`Self::grid_for`] for an atlas covering `coverage` viewports per
+    /// axis: the viewport multiplied first (saturating), then the same
+    /// formula, so `coverage == 1` is `grid_for` exactly.
+    fn grid_for_coverage(viewport_px: (u32, u32), coverage: u32) -> (u32, u32) {
         (
-            viewport_px.0.div_ceil(TILE).saturating_add(1),
-            viewport_px.1.div_ceil(TILE).saturating_add(1),
+            viewport_px
+                .0
+                .saturating_mul(coverage)
+                .div_ceil(TILE)
+                .saturating_add(1),
+            viewport_px
+                .1
+                .saturating_mul(coverage)
+                .div_ceil(TILE)
+                .saturating_add(1),
         )
     }
 
@@ -1473,7 +1524,18 @@ impl TileResidency {
     /// both M1.3 work, both larger than a bug fix.
     #[must_use]
     pub fn min_zoom_for_viewport(viewport_px: (u32, u32)) -> f32 {
-        let grid = Self::grid_for(viewport_px);
+        Self::min_zoom_for_viewport_with_coverage(viewport_px, 1)
+    }
+
+    /// [`Self::min_zoom_for_viewport`] for an atlas built by
+    /// [`Self::with_coverage`] with `coverage` (clamped the same way).
+    /// For `coverage == 2` it is at most 0.5 for every viewport at least
+    /// one tile across, which is what lets the zoomed-out view show a
+    /// pyramid level at any zoom in `(0.5, 1]` of it.
+    #[must_use]
+    pub fn min_zoom_for_viewport_with_coverage(viewport_px: (u32, u32), coverage: u32) -> f32 {
+        let coverage = coverage.clamp(1, Self::MAX_COVERAGE);
+        let grid = Self::grid_for_coverage(viewport_px, coverage);
         Self::zoom_floor(
             viewport_px,
             grid.0.saturating_mul(TILE) as f32,
@@ -1563,6 +1625,18 @@ impl TileResidency {
         viewport_px: (u32, u32),
         zoom: f32,
     ) -> [f32; 4] {
+        Self::uniform_values_c(grid, origin, sub_tile, viewport_px, zoom, 1)
+    }
+
+    /// [`Self::uniform_values`] for an atlas of `coverage`.
+    fn uniform_values_c(
+        grid: (u32, u32),
+        origin: TileId,
+        sub_tile: (f32, f32),
+        viewport_px: (u32, u32),
+        zoom: f32,
+        coverage: u32,
+    ) -> [f32; 4] {
         let tex_w = grid.0.saturating_mul(TILE) as f32;
         let tex_h = grid.1.saturating_mul(TILE) as f32;
         // The floor is taken against whichever atlas is *smaller*: the
@@ -1579,7 +1653,7 @@ impl TileResidency {
         // `saturating_add`, but re-deriving `tex_w`/`tex_h` from them is
         // still a `u32` multiply and must not reintroduce the overflow
         // panic those two functions exist to close.
-        let zoom = Self::rendered_zoom_value(grid, viewport_px, zoom);
+        let zoom = Self::rendered_zoom_value_c(grid, viewport_px, zoom, coverage);
         // Absolute scroll (origin in texels, a genuinely fractional
         // position -- `origin * TILE` plus the sub-tile remainder), then
         // wrapped into [0, tex_w)/[0, tex_h) for the repeat sampler --
@@ -1612,7 +1686,17 @@ impl TileResidency {
     /// The zoom `uniform_values` actually renders at: the caller's, made
     /// sane by [`Self::guard_zoom`] and raised to the atlas's floor.
     fn rendered_zoom_value(grid: (u32, u32), viewport_px: (u32, u32), zoom: f32) -> f32 {
-        let capped = Self::grid_for(viewport_px);
+        Self::rendered_zoom_value_c(grid, viewport_px, zoom, 1)
+    }
+
+    /// [`Self::rendered_zoom_value`] for an atlas of `coverage`.
+    fn rendered_zoom_value_c(
+        grid: (u32, u32),
+        viewport_px: (u32, u32),
+        zoom: f32,
+        coverage: u32,
+    ) -> f32 {
+        let capped = Self::grid_for_coverage(viewport_px, coverage);
         let floor = Self::zoom_floor(
             viewport_px,
             grid.0.min(capped.0).saturating_mul(TILE) as f32,
@@ -1636,6 +1720,20 @@ impl TileResidency {
         zoom: f32,
         rect: Option<(f32, f32, f32, f32)>,
     ) -> [f32; 4] {
+        Self::clip_values_c(grid, origin, sub_tile, viewport_px, zoom, rect, 1)
+    }
+
+    /// [`Self::clip_values`] for an atlas of `coverage`.
+    #[allow(clippy::too_many_arguments)]
+    fn clip_values_c(
+        grid: (u32, u32),
+        origin: TileId,
+        sub_tile: (f32, f32),
+        viewport_px: (u32, u32),
+        zoom: f32,
+        rect: Option<(f32, f32, f32, f32)>,
+        coverage: u32,
+    ) -> [f32; 4] {
         let Some((x0, y0, x1, y1)) = rect else {
             return NO_CLIP;
         };
@@ -1645,7 +1743,7 @@ impl TileResidency {
         {
             return [0.0, 0.0, 0.0, 0.0];
         }
-        let zoom = Self::rendered_zoom_value(grid, viewport_px, zoom);
+        let zoom = Self::rendered_zoom_value_c(grid, viewport_px, zoom, coverage);
         let scroll = (
             (origin.x * TILE) as f32 + sub_tile.0,
             (origin.y * TILE) as f32 + sub_tile.1,
@@ -1660,14 +1758,22 @@ impl TileResidency {
     }
 
     fn write_uniform(&self, queue: &wgpu::Queue, viewport_px: (u32, u32), zoom: f32) {
-        let values = Self::uniform_values(self.grid, self.origin, self.sub_tile, viewport_px, zoom);
-        let clip = Self::clip_values(
+        let values = Self::uniform_values_c(
+            self.grid,
+            self.origin,
+            self.sub_tile,
+            viewport_px,
+            zoom,
+            self.coverage,
+        );
+        let clip = Self::clip_values_c(
             self.grid,
             self.origin,
             self.sub_tile,
             viewport_px,
             zoom,
             self.doc_clip,
+            self.coverage,
         );
         let [gain_r, gain_g, gain_b] = self.channel_gain;
         let mut bytes = Vec::with_capacity(UNIFORM_SIZE as usize);
@@ -1998,7 +2104,7 @@ impl TileResidency {
         mip_level: u32,
         texels: &[f16],
     ) -> Result<(), GpuError> {
-        if mip_level >= MIP_LEVELS {
+        if mip_level >= self.mip_levels {
             return Err(GpuError::InvalidMipLevel(mip_level));
         }
         let size = TILE >> mip_level;
@@ -2667,6 +2773,97 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn coverage_one_is_the_canvas_atlas_exactly() {
+        for viewport in [(1, 1), (255, 257), (1920, 1080), (1366, 768), (3024, 1964)] {
+            assert_eq!(
+                TileResidency::grid_for_coverage(viewport, 1),
+                TileResidency::grid_for(viewport)
+            );
+            assert_eq!(
+                TileResidency::min_zoom_for_viewport_with_coverage(viewport, 1).to_bits(),
+                TileResidency::min_zoom_for_viewport(viewport).to_bits()
+            );
+            let grid = TileResidency::grid_for(viewport);
+            for zoom in [0.3_f32, 0.94, 1.0, 1.7, 8.0] {
+                let a = TileResidency::uniform_values(
+                    grid,
+                    TileId { x: 3, y: 1 },
+                    (17.5, 3.25),
+                    viewport,
+                    zoom,
+                );
+                let b = TileResidency::uniform_values_c(
+                    grid,
+                    TileId { x: 3, y: 1 },
+                    (17.5, 3.25),
+                    viewport,
+                    zoom,
+                    1,
+                );
+                assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits));
+            }
+        }
+    }
+
+    #[test]
+    fn a_double_coverage_atlas_renders_every_zoom_above_one_half_unclamped() {
+        // The zoomed-out view shows a pyramid level at a zoom in
+        // (0.5, 1]; its atlas must honour every such zoom, and never
+        // sample past its coverage (no duplicated content).
+        for viewport in [
+            (256, 256),
+            (1000, 700),
+            (1920, 1080),
+            (1366, 768),
+            (3024, 1964),
+        ] {
+            let floor = TileResidency::min_zoom_for_viewport_with_coverage(viewport, 2);
+            assert!(floor <= 0.5, "{viewport:?}: floor {floor}");
+            let grid = TileResidency::grid_for_coverage(viewport, 2);
+            for zoom in [0.5_f32.next_up(), 0.6, 0.75, 0.99, 1.0] {
+                for sub in [(0.0, 0.0), (255.9, 128.0)] {
+                    let [_, _, sx, sy] = TileResidency::uniform_values_c(
+                        grid,
+                        TileId { x: 0, y: 0 },
+                        sub,
+                        viewport,
+                        zoom,
+                        2,
+                    );
+                    let tex = ((grid.0 * TILE) as f32, (grid.1 * TILE) as f32);
+                    let want = (
+                        viewport.0 as f32 / zoom / tex.0,
+                        viewport.1 as f32 / zoom / tex.1,
+                    );
+                    assert!((sx - want.0).abs() <= want.0 * 1e-6, "{viewport:?} {zoom}");
+                    assert!((sy - want.1).abs() <= want.1 * 1e-6, "{viewport:?} {zoom}");
+                    // Covered: the window plus the sub-tile offset stays
+                    // inside the atlas.
+                    assert!(sx * tex.0 + sub.0 <= tex.0, "{viewport:?} {zoom}");
+                    assert!(sy * tex.1 + sub.1 <= tex.1, "{viewport:?} {zoom}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_is_clamped_to_its_documented_range() {
+        let viewport = (1920, 1080);
+        assert_eq!(
+            TileResidency::min_zoom_for_viewport_with_coverage(viewport, 0).to_bits(),
+            TileResidency::min_zoom_for_viewport(viewport).to_bits()
+        );
+        assert_eq!(
+            TileResidency::min_zoom_for_viewport_with_coverage(viewport, 99).to_bits(),
+            TileResidency::min_zoom_for_viewport_with_coverage(
+                viewport,
+                TileResidency::MAX_COVERAGE
+            )
+            .to_bits()
+        );
+    }
+
     // `min_zoom_for_viewport` and the clamp inside `uniform_values` are
     // the *same* expression applied to the same inputs; an exact
     // comparison is what pins them together.
