@@ -20354,8 +20354,8 @@ fn fold_planned_node(
 /// paths — had exactly one place to be fixed, which is where 0.52.0
 /// fixed it (below).
 ///
-/// The accumulator starts fully transparent
-/// (`aurora_render::transparent_tile`) and each resolved child buffer is
+/// The accumulator starts fully transparent (`tile_buffers::zeroed`,
+/// the same all-`0x0000` bits as `aurora_render::transparent_tile`) and each resolved child buffer is
 /// dropped at the end of its own iteration, so peak memory here is one
 /// tile buffer plus whatever the recursion below it holds, rather than
 /// one full [`aurora_tile::SAMPLES`]-length buffer per root layer —
@@ -20410,8 +20410,8 @@ fn fold_planned_node(
 /// `None` for all of them, e.g. nothing stored under the tile); or
 /// [`CompositeBudget`] refused further work before any root resolved
 /// (`charge_node`/depth refusals, which also return `None`). All three
-/// leave the returned buffer `aurora_render::transparent_tile`'s
-/// own untouched output — which since 0.94.0 is returned *without* the
+/// leave the returned buffer `tile_buffers::zeroed`'s untouched
+/// all-`0x0000` output (the bits of `aurora_render::transparent_tile`) — which since 0.94.0 is returned *without* the
 /// straightening pass running over it, since on that specific buffer the
 /// pass is a bitwise identity. So this count is now load-bearing for more
 /// than diagnostics: it is the predicate that skip reads.
@@ -20483,12 +20483,12 @@ fn composite_roots_into_tile(
     // asserted here:
     //
     // 1. *Provenance.* `composited` was seeded by
-    //    `aurora_render::transparent_tile` above and the **only** thing
+    //    `tile_buffers::zeroed` above (round 9; the same all-`0x0000`
+    //    bits `aurora_render::transparent_tile` gives) and the **only** thing
     //    that ever writes to it is the `composite_layer_into` call in the
     //    loop above -- which sits inside the same `if let Some(..)` that
     //    increments `folded`. So `folded == 0` means literally no write
-    //    happened, and the buffer is still `transparent_tile`'s own
-    //    output. `composite_roots_into_tile_returns_a_bitwise_transparent_buffer_when_no_root_folds`
+    //    happened, and the buffer is still all `0x0000`. `composite_roots_into_tile_returns_a_bitwise_transparent_buffer_when_no_root_folds`
     //    (and its never-painted-pixel-layer sibling) pin that end to end,
     //    on bits.
     // 2. *What that output is.* `transparent_tile` is all canonical
