@@ -540,6 +540,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::window::{Window, WindowId};
 
 mod adjust_app;
+mod adjust_tables;
 #[cfg(test)]
 mod anchor_tests;
 mod aur_save;
@@ -19381,15 +19382,40 @@ fn apply_adjustment_layer(
 
     let one = half::f16::from_f32(1.0);
     let mut source = Vec::with_capacity(backdrop.len());
-    for texel in backdrop.chunks_exact(4) {
-        if let [r, g, b, _] = *texel {
-            let [r, g, b] = lut.apply([r.to_f32(), g.to_f32(), b.to_f32()]);
-            source.extend([
-                half::f16::from_f32(r),
-                half::f16::from_f32(g),
-                half::f16::from_f32(b),
-                one,
-            ]);
+    // 60 FPS round 9: a channel-separable adjustment maps each channel's
+    // `f16` through a table holding exactly what the loop below computes
+    // for it (`adjust_tables`).
+    let tables = match &lut {
+        AdjustmentLut::Curves(curves) => {
+            adjust_tables::channel_tables(adjustment, Some(curves), None)
+        }
+        AdjustmentLut::Levels(levels) => {
+            adjust_tables::channel_tables(adjustment, None, Some(levels))
+        }
+        _ => None,
+    };
+    if let Some([red, green, blue]) = &tables {
+        for texel in backdrop.chunks_exact(4) {
+            if let [r, g, b, _] = *texel {
+                source.extend([
+                    adjust_tables::lookup(red, r),
+                    adjust_tables::lookup(green, g),
+                    adjust_tables::lookup(blue, b),
+                    one,
+                ]);
+            }
+        }
+    } else {
+        for texel in backdrop.chunks_exact(4) {
+            if let [r, g, b, _] = *texel {
+                let [r, g, b] = lut.apply([r.to_f32(), g.to_f32(), b.to_f32()]);
+                source.extend([
+                    half::f16::from_f32(r),
+                    half::f16::from_f32(g),
+                    half::f16::from_f32(b),
+                    one,
+                ]);
+            }
         }
     }
     if let Some(mask) = layers.mask(id)
@@ -19424,6 +19450,16 @@ fn apply_adjustment_layer(
 
     for (out, mixed) in accumulator.chunks_exact_mut(4).zip(mixed.chunks_exact(4)) {
         if let ([r, g, b, alpha], [mr, mg, mb, _]) = (out, mixed) {
+            // 60 FPS round 9: at alpha exactly 1 the product is the mixed
+            // value itself, and an `f16` -> `f32` -> `f16` round trip of a
+            // non-NaN value is exact, so it is copied; a NaN keeps the
+            // arithmetic (its payload may change on the way).
+            if alpha.to_bits() == one.to_bits() && !(mr.is_nan() || mg.is_nan() || mb.is_nan()) {
+                *r = *mr;
+                *g = *mg;
+                *b = *mb;
+                continue;
+            }
             let a = alpha.to_f32();
             *r = half::f16::from_f32(mr.to_f32() * a);
             *g = half::f16::from_f32(mg.to_f32() * a);

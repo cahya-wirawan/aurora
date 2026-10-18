@@ -352,6 +352,9 @@ fn frames(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, mode: Mo
     let mut upload = Vec::new();
     let mut stale_in = Vec::new();
     let mut stale_left = Vec::new();
+    let profile_before = crate::COMPOSITE_PROFILE.with(std::cell::Cell::get);
+    let _ = super::take_recomposite_phase_ms();
+    let mut phase_sum = [0.0_f64; 3];
     for step in 0..FRAMES {
         let x = START.0 + step * PAN_STEP.0;
         let y = START.1 + step * PAN_STEP.1;
@@ -440,6 +443,12 @@ fn frames(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, mode: Mo
             timeout: None,
         });
         let t4 = Instant::now();
+        let phases = super::take_recomposite_phase_ms();
+        if step > 0 {
+            for (sum, phase) in phase_sum.iter_mut().zip(phases) {
+                *sum += phase;
+            }
+        }
         total.push(ms(t4 - t0));
         recomposite.push(ms(t2 - t1));
         upload.push(ms(t3 - t2));
@@ -462,6 +471,17 @@ fn frames(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, mode: Mo
     crate::frame_composite::set_parallel_enabled_for_tests(false);
     let pool = crate::frame_composite::take_diagnostics();
     let steady = total.get(1..).unwrap_or_default();
+    if std::env::var_os("AURORA_R9_PROFILE").is_some() {
+        super::print_composite_profile_per_frame(label, profile_before, FRAMES);
+        let n = f64::from(FRAMES - 1);
+        println!(
+            "R9 phases doc={label} mode={} issue={:.2} poll={:.2} drain={:.2}",
+            mode.name(),
+            phase_sum[0] / n,
+            phase_sum[1] / n,
+            phase_sum[2] / n
+        );
+    }
     println!(
         "R9 frames doc={label} path={path} mode={} n={} frame0={:.2} mean={:.2} p50={:.2} \
          p90={:.2} max={:.2} over16.7={} recomp_mean={:.2} upload_mean={:.2} stale_in={:.2} \
@@ -715,4 +735,77 @@ fn r9_photo_full_24mp() {
 #[ignore = "measurement; run with --ignored --nocapture in release"]
 fn r9_photo_full_60mp() {
     measure(MP60, "60mp", "full");
+}
+
+#[test]
+#[ignore = "probe"]
+fn r9_probe_adjustment_steps() {
+    let noise = noise_tiles(1, 7, half::f16::ONE);
+    let Some(tile) = noise.first() else {
+        unreachable!()
+    };
+    let aurora_doc::Adjustment::Curves(params) = curves() else {
+        unreachable!()
+    };
+    let lut = crate::curves_lut(&params);
+    let n = 50;
+    let mut t = [Duration::ZERO; 5];
+    for _ in 0..n {
+        let s = Instant::now();
+        let mut backdrop = tile.clone();
+        aurora_render::un_premultiply_in_place(&mut backdrop);
+        t[0] += s.elapsed();
+        let s = Instant::now();
+        let one = half::f16::ONE;
+        let mut source = Vec::with_capacity(backdrop.len());
+        for texel in backdrop.chunks_exact(4) {
+            if let [r, g, b, _] = *texel {
+                let [r, g, b] = lut.apply([r.to_f32(), g.to_f32(), b.to_f32()]);
+                source.extend([
+                    half::f16::from_f32(r),
+                    half::f16::from_f32(g),
+                    half::f16::from_f32(b),
+                    one,
+                ]);
+            }
+        }
+        t[1] += s.elapsed();
+        let s = Instant::now();
+        let mut x = 0.0f32;
+        for texel in backdrop.chunks_exact(4) {
+            if let [r, g, b, _] = *texel {
+                let [r, g, b] = lut.apply([r.to_f32(), g.to_f32(), b.to_f32()]);
+                x += r + g + b;
+            }
+        }
+        std::hint::black_box(x);
+        t[2] += s.elapsed();
+        let s = Instant::now();
+        let mut mixed = backdrop;
+        aurora_render::composite_layer_into(
+            &mut mixed,
+            &source,
+            0.8,
+            aurora_render::BlendMode::Normal,
+        );
+        t[3] += s.elapsed();
+        let s = Instant::now();
+        let mut acc = tile.clone();
+        for (out, mixed) in acc.chunks_exact_mut(4).zip(mixed.chunks_exact(4)) {
+            if let ([r, g, b, alpha], [mr, mg, mb, _]) = (out, mixed) {
+                let a = alpha.to_f32();
+                *r = half::f16::from_f32(mr.to_f32() * a);
+                *g = half::f16::from_f32(mg.to_f32() * a);
+                *b = half::f16::from_f32(mb.to_f32() * a);
+            }
+        }
+        std::hint::black_box(&acc);
+        t[4] += s.elapsed();
+    }
+    for (name, d) in ["unpremul", "lut+convert", "lut only", "fold", "writeback"]
+        .iter()
+        .zip(t)
+    {
+        println!("R9 probe {name} {:.3} ms/tile", ms(d) / f64::from(n));
+    }
 }
