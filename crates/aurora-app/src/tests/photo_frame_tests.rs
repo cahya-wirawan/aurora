@@ -485,7 +485,7 @@ fn frames(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, mode: Mo
     println!(
         "R9 frames doc={label} path={path} mode={} n={} frame0={:.2} mean={:.2} p50={:.2} \
          p90={:.2} max={:.2} over16.7={} recomp_mean={:.2} upload_mean={:.2} stale_in={:.2} \
-         stale_left={:.2} pool_passes={} held={} bounded={}",
+         stale_left={:.2} pool_passes={} held={} scope_lookups={}",
         mode.name(),
         steady.len(),
         total.first().copied().unwrap_or(0.0),
@@ -500,7 +500,12 @@ fn frames(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, mode: Mo
         mean(stale_left.get(1..).unwrap_or_default()),
         pool.passes,
         photo.store.held_tile_count_bound(),
-        crate::frame_composite::snapshot_is_bounded(&photo.store),
+        crate::frame_composite::Scope::of(
+            &photo.layers,
+            &residency.visible_tiles().collect::<Vec<_>>(),
+            reference_origin
+        )
+        .lookups(),
     );
 }
 
@@ -577,13 +582,14 @@ fn dabs(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str
 fn full(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str) {
     let all = photo.all_tiles();
     let reference_origin = crate::composite_reference_origin(&photo.layers, Some(photo.active));
-    let (snapshot, entries) = crate::frame_composite::time_snapshot(&photo.store);
+    let (snapshot, entries) =
+        crate::frame_composite::time_snapshot(&photo.store, &photo.layers, &all, reference_origin);
     println!(
         "R9 snapshot doc={label} held={} entries={entries} ms={:.3}",
         photo.store.held_tile_count_bound(),
         ms(snapshot),
     );
-    let mut run = |how: &str, gpu_arm: bool, parallel: bool, limit: usize| {
+    let mut run = |how: &str, gpu_arm: bool, parallel: bool, limit: Option<usize>| {
         let device = gpu.device();
         let mut compositor = aurora_render::TileCompositor::new(device);
         let _ = compositor.prewarm(device, false).ok();
@@ -603,9 +609,7 @@ fn full(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str
         );
         let took = started.elapsed();
         crate::frame_composite::set_parallel_enabled_for_tests(false);
-        crate::frame_composite::set_snapshot_limit_for_tests(
-            crate::frame_composite::MAX_SNAPSHOT_TILES,
-        );
+        crate::frame_composite::set_snapshot_limit_for_tests(None);
         let current = all.iter().filter(|&&tile| cache.is_current(tile)).count();
         assert_eq!(current, all.len(), "every tile composited");
         println!(
@@ -616,26 +620,10 @@ fn full(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str
         );
     };
     if path == "gpu" {
-        run(
-            "gpu",
-            true,
-            false,
-            crate::frame_composite::MAX_SNAPSHOT_TILES,
-        );
+        run("gpu", true, false, None);
     }
-    run(
-        "cpu_sequential",
-        false,
-        false,
-        crate::frame_composite::MAX_SNAPSHOT_TILES,
-    );
-    run(
-        "cpu_pool_shipping",
-        false,
-        true,
-        crate::frame_composite::MAX_SNAPSHOT_TILES,
-    );
-    run("cpu_pool_unbounded", false, true, usize::MAX);
+    run("cpu_sequential", false, false, None);
+    run("cpu_pool_shipping", false, true, None);
 
     // The background worker: one dispatch of every tile, then wait.
     let mut worker = crate::background_composite::CompositeWorker::new(std::sync::Arc::new(|| {}));
@@ -649,13 +637,13 @@ fn full(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str
     };
     let dispatched = worker.dispatch(&mut target, all.clone());
     let dispatch_ms = ms(started.elapsed());
-    let installed = worker.wait_until_idle(Some(&mut target), Duration::from_secs(600));
+    let installed = worker.wait_until_idle(Some(&mut target), Duration::from_mins(10));
     let took = ms(started.elapsed());
     // A second dispatch with nothing changed: the per-dispatch UI cost.
     let again = Instant::now();
     let _ = worker.dispatch(&mut target, all.clone());
     let redispatch_ms = ms(again.elapsed());
-    let _ = worker.wait_until_idle(Some(&mut target), Duration::from_secs(600));
+    let _ = worker.wait_until_idle(Some(&mut target), Duration::from_mins(10));
     worker.shutdown();
     println!(
         "R9 full doc={label} path={path} how=worker dispatched={dispatched} installed={installed} \
@@ -739,6 +727,7 @@ fn r9_photo_full_60mp() {
 
 #[test]
 #[ignore = "probe"]
+#[allow(clippy::many_single_char_names)]
 fn r9_probe_adjustment_steps() {
     let noise = noise_tiles(1, 7, half::f16::ONE);
     let Some(tile) = noise.first() else {

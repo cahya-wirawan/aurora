@@ -87,13 +87,13 @@ pub(crate) fn channel_tables(
         map(2)
     };
     let tables = [red, green, blue];
-    if let Ok(mut cached) = cache().lock() {
-        if !cached.iter().any(|(key, _)| key == adjustment) {
-            if cached.len() >= CACHE_LEN {
-                cached.remove(0);
-            }
-            cached.push((adjustment.clone(), tables.clone()));
+    if let Ok(mut cached) = cache().lock()
+        && !cached.iter().any(|(key, _)| key == adjustment)
+    {
+        if cached.len() >= CACHE_LEN {
+            cached.remove(0);
         }
+        cached.push((adjustment.clone(), tables.clone()));
     }
     Some(tables)
 }

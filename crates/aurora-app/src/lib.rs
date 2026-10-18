@@ -19381,43 +19381,7 @@ fn apply_adjustment_layer(
     aurora_render::un_premultiply_in_place(&mut backdrop);
 
     let one = half::f16::from_f32(1.0);
-    let mut source = Vec::with_capacity(backdrop.len());
-    // 60 FPS round 9: a channel-separable adjustment maps each channel's
-    // `f16` through a table holding exactly what the loop below computes
-    // for it (`adjust_tables`).
-    let tables = match &lut {
-        AdjustmentLut::Curves(curves) => {
-            adjust_tables::channel_tables(adjustment, Some(curves), None)
-        }
-        AdjustmentLut::Levels(levels) => {
-            adjust_tables::channel_tables(adjustment, None, Some(levels))
-        }
-        _ => None,
-    };
-    if let Some([red, green, blue]) = &tables {
-        for texel in backdrop.chunks_exact(4) {
-            if let [r, g, b, _] = *texel {
-                source.extend([
-                    adjust_tables::lookup(red, r),
-                    adjust_tables::lookup(green, g),
-                    adjust_tables::lookup(blue, b),
-                    one,
-                ]);
-            }
-        }
-    } else {
-        for texel in backdrop.chunks_exact(4) {
-            if let [r, g, b, _] = *texel {
-                let [r, g, b] = lut.apply([r.to_f32(), g.to_f32(), b.to_f32()]);
-                source.extend([
-                    half::f16::from_f32(r),
-                    half::f16::from_f32(g),
-                    half::f16::from_f32(b),
-                    one,
-                ]);
-            }
-        }
-    }
+    let mut source = adjusted_source(adjustment, &lut, &backdrop);
     if let Some(mask) = layers.mask(id)
         && mask.enabled
     {
@@ -19467,6 +19431,54 @@ fn apply_adjustment_layer(
         }
     }
     true
+}
+
+/// The adjusted copy of the straight `backdrop` [`apply_adjustment_layer`]
+/// blends: each texel's colour through `lut`, alpha `1`.
+fn adjusted_source(
+    adjustment: &aurora_doc::Adjustment,
+    lut: &AdjustmentLut,
+    backdrop: &[half::f16],
+) -> Vec<half::f16> {
+    let one = half::f16::from_f32(1.0);
+    let mut source = Vec::with_capacity(backdrop.len());
+    // 60 FPS round 9: a channel-separable adjustment maps each channel's
+    // `f16` through a table holding exactly what the loop below computes
+    // for it (`adjust_tables`).
+    let tables = match lut {
+        AdjustmentLut::Curves(curves) => {
+            adjust_tables::channel_tables(adjustment, Some(curves), None)
+        }
+        AdjustmentLut::Levels(levels) => {
+            adjust_tables::channel_tables(adjustment, None, Some(levels))
+        }
+        _ => None,
+    };
+    if let Some([red, green, blue]) = &tables {
+        for texel in backdrop.chunks_exact(4) {
+            if let [r, g, b, _] = *texel {
+                source.extend([
+                    adjust_tables::lookup(red, r),
+                    adjust_tables::lookup(green, g),
+                    adjust_tables::lookup(blue, b),
+                    one,
+                ]);
+            }
+        }
+    } else {
+        for texel in backdrop.chunks_exact(4) {
+            if let [r, g, b, _] = *texel {
+                let [r, g, b] = lut.apply([r.to_f32(), g.to_f32(), b.to_f32()]);
+                source.extend([
+                    half::f16::from_f32(r),
+                    half::f16::from_f32(g),
+                    half::f16::from_f32(b),
+                    one,
+                ]);
+            }
+        }
+    }
+    source
 }
 
 /// How many cover candidates [`fold_plan_for_tile`] reads per context
@@ -26463,8 +26475,9 @@ fn recomposite_tiles(
 /// fewer than [`frame_composite::MIN_PARALLEL_TILES`] are stale (a dab:
 /// the redraw handler composites at most
 /// [`background_composite::SYNC_TILE_LIMIT`] tiles itself and those keep
-/// the sequential loop), the store holds more tiles than a pass may
-/// snapshot ([`frame_composite::MAX_SNAPSHOT_TILES`]), the pool is
+/// the sequential loop), the tiles the pass may read need more store
+/// lookups than its snapshot may make ([`frame_composite::Scope`],
+/// round 9), the pool is
 /// unavailable or (tests) disabled.
 fn recomposite_tiles_in_parallel(
     tiles: &[aurora_tile::TileId],
@@ -26483,9 +26496,11 @@ fn recomposite_tiles_in_parallel(
         .copied()
         .filter(|&tile_id| !cache.is_current(tile_id) && seen.insert(tile_id))
         .collect();
-    if stale.len() < frame_composite::MIN_PARALLEL_TILES
-        || !frame_composite::snapshot_is_bounded(store)
-    {
+    if stale.len() < frame_composite::MIN_PARALLEL_TILES {
+        return false;
+    }
+    let scope = frame_composite::Scope::of(layers, &stale, reference_origin);
+    if !scope.is_bounded(stale.len()) {
         return false;
     }
     let Some(pool) = frame_composite::frame_pool() else {
@@ -26493,6 +26508,7 @@ fn recomposite_tiles_in_parallel(
     };
     frame_composite::composite_tiles(
         pool,
+        scope,
         &stale,
         layers,
         store,

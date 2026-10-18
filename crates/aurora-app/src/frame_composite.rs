@@ -92,26 +92,177 @@ pub(crate) const MIN_PARALLEL_TILES: usize =
 /// How far a helper may run ahead of the caller's installed prefix.
 pub(crate) const HELPER_WINDOW_TILES: usize = 16;
 
-/// The most tiles a store may hold (by
-/// [`TileStore::held_tile_count_bound`]) for a pass to use the helpers
-/// (60 FPS round 8). A pass's [`Snapshot`] walks every held tile on the
-/// calling thread, so on a larger store the caller keeps the sequential
-/// loop. Measured (release, i3-10100, `time_a_pass_over_a_large_store`)
-/// at 0.13-0.16 µs a held tile (1.3 ms for 10,000, 8 ms for 50,000), so
-/// this bounds the walk to about 0.6 ms, less than three helpers save on
-/// a four-tile pass of a plain two-layer document (PLAN.md, round 8). In
-/// the live app a large document's bigger recomposites go to the
-/// background worker anyway; this path runs only without one.
+/// The base bound on the store lookups a pass's [`Snapshot`] makes on
+/// the calling thread (60 FPS rounds 8 and 9). Round 8 snapshotted every
+/// tile the store held, at 0.13-0.16 µs a held tile
+/// (`time_a_pass_over_a_large_store`), and kept the sequential loop for a
+/// store holding more than this, which turned the pool off for a 60 MP
+/// photo with three layers once its composite was cached (about 4,750
+/// held tiles). Round 9 scopes the snapshot to the tiles the pass can
+/// read ([`Scope`]), so its cost follows the pass, not the document; a
+/// pass may make this many lookups, or [`SNAPSHOT_KEYS_PER_TILE`] per
+/// tile it composites when that is more.
 pub(crate) const MAX_SNAPSHOT_TILES: usize = 4_096;
 
-/// Whether a pass over `store` may use the helpers: its snapshot is
-/// bounded ([`MAX_SNAPSHOT_TILES`]).
-pub(crate) fn snapshot_is_bounded(store: &TileStore) -> bool {
-    #[cfg(test)]
-    let limit = SNAPSHOT_LIMIT.with(std::cell::Cell::get);
-    #[cfg(not(test))]
-    let limit = MAX_SNAPSHOT_TILES;
-    store.held_tile_count_bound() <= limit
+/// Scope lookups a pass may make per tile it composites, beyond
+/// [`MAX_SNAPSHOT_TILES`]: a lookup costs well under a microsecond and a
+/// tile at least a hundred, so a pass of many tiles (a whole-document
+/// recomposite) still uses the helpers.
+pub(crate) const SNAPSHOT_KEYS_PER_TILE: usize = 64;
+
+/// How far beyond the pass's own tiles, in document pixels, the scope
+/// reaches: a fold reads outside its tile only for a layer effect's apron,
+/// at most [`aurora_core::effects::MAX_SHADOW_APRON`], plus a tile of
+/// slack. A read outside the scope is not answered from the snapshot: the
+/// helper hands the tile back and the caller composites it against the
+/// store ([`SnapshotSource`]), so the margin bounds cost, never
+/// correctness.
+const SCOPE_MARGIN_PX: i64 =
+    aurora_core::effects::MAX_SHADOW_APRON as i64 + aurora_tile::TILE as i64;
+
+/// A half-open range of one surface's tile ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TileRange {
+    x0: u32,
+    x1: u32,
+    y0: u32,
+    y1: u32,
+}
+
+impl TileRange {
+    fn contains(self, id: TileId) -> bool {
+        (self.x0..self.x1).contains(&id.x) && (self.y0..self.y1).contains(&id.y)
+    }
+
+    fn len(self) -> usize {
+        let w = usize::try_from(self.x1.saturating_sub(self.x0)).unwrap_or(usize::MAX);
+        let h = usize::try_from(self.y1.saturating_sub(self.y0)).unwrap_or(usize::MAX);
+        w.saturating_mul(h)
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            x0: self.x0.min(other.x0),
+            x1: self.x1.max(other.x1),
+            y0: self.y0.min(other.y0),
+            y1: self.y1.max(other.y1),
+        }
+    }
+}
+
+/// The source tiles a pass may read (60 FPS round 9): for every surface
+/// of the layer tree (pixel content and masks), the range of its own tile
+/// ids under the document rectangle the pass's composite tiles cover,
+/// grown by [`SCOPE_MARGIN_PX`]. A bounding rectangle, so a pass of
+/// scattered tiles scopes the rectangle between them.
+#[derive(Debug, Default)]
+pub(crate) struct Scope {
+    ranges: HashMap<SurfaceId, TileRange>,
+}
+
+impl Scope {
+    /// The scope of compositing `tiles` (on the grid anchored at
+    /// `reference_origin`) of `layers`.
+    pub(crate) fn of(
+        layers: &aurora_doc::LayerTree,
+        tiles: &[TileId],
+        reference_origin: (i64, i64),
+    ) -> Self {
+        let side = i64::from(aurora_tile::TILE);
+        let mut scope = Self::default();
+        #[cfg(test)]
+        if HOOKS.with(std::cell::Cell::get).empty_scope {
+            return scope;
+        }
+        let mut rect: Option<(i64, i64, i64, i64)> = None;
+        for &tile in tiles {
+            let (x, y) = crate::composite_tile_doc_origin(reference_origin, tile);
+            let (x0, y0, x1, y1) = rect.unwrap_or((x, y, x + side, y + side));
+            rect = Some((x0.min(x), y0.min(y), x1.max(x + side), y1.max(y + side)));
+        }
+        let Some((x0, y0, x1, y1)) = rect else {
+            return scope;
+        };
+        let (x0, y0, x1, y1) = (
+            x0.saturating_sub(SCOPE_MARGIN_PX),
+            y0.saturating_sub(SCOPE_MARGIN_PX),
+            x1.saturating_add(SCOPE_MARGIN_PX),
+            y1.saturating_add(SCOPE_MARGIN_PX),
+        );
+        // The ids of a surface whose tile (0, 0) sits at `origin` that
+        // meet the rectangle; ids are unsigned, so the range starts at 0.
+        let range_at = |origin: (i64, i64)| -> Option<TileRange> {
+            let to_id = |v: i64| u32::try_from(v.clamp(0, i64::from(u32::MAX))).ok();
+            let lo_x = x0.saturating_sub(origin.0).div_euclid(side);
+            let lo_y = y0.saturating_sub(origin.1).div_euclid(side);
+            let hi_x = x1
+                .saturating_sub(origin.0)
+                .saturating_add(side - 1)
+                .div_euclid(side);
+            let hi_y = y1
+                .saturating_sub(origin.1)
+                .saturating_add(side - 1)
+                .div_euclid(side);
+            let range = TileRange {
+                x0: to_id(lo_x)?,
+                x1: to_id(hi_x)?,
+                y0: to_id(lo_y)?,
+                y1: to_id(hi_y)?,
+            };
+            (range.len() > 0).then_some(range)
+        };
+        let mut add = |surface: SurfaceId, origin: (i64, i64)| {
+            if let Some(range) = range_at(origin) {
+                scope
+                    .ranges
+                    .entry(surface)
+                    .and_modify(|r| *r = r.union(range))
+                    .or_insert(range);
+            }
+        };
+        let mut stack: Vec<aurora_doc::LayerId> = layers.roots().to_vec();
+        let mut budget = layers.len();
+        while let Some(id) = stack.pop() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            if let (Some(surface), Some(bounds)) = (layers.surface_id(id), layers.bounds(id)) {
+                add(surface, (bounds.x, bounds.y));
+            }
+            if let (Some(surface), Some(mask)) = (layers.mask_surface_id(id), layers.mask(id)) {
+                add(surface, (mask.bounds.x, mask.bounds.y));
+            }
+            if let Some(children) = layers.children(id) {
+                stack.extend_from_slice(children);
+            }
+        }
+        scope
+    }
+
+    fn contains(&self, surface: SurfaceId, id: TileId) -> bool {
+        self.ranges
+            .get(&surface)
+            .is_some_and(|range| range.contains(id))
+    }
+
+    /// How many store lookups a snapshot of this scope makes.
+    pub(crate) fn lookups(&self) -> usize {
+        self.ranges
+            .values()
+            .fold(0_usize, |sum, range| sum.saturating_add(range.len()))
+    }
+
+    /// Whether a pass of `tiles` composite tiles may snapshot this scope:
+    /// at most [`MAX_SNAPSHOT_TILES`] lookups, or
+    /// [`SNAPSHOT_KEYS_PER_TILE`] per tile.
+    pub(crate) fn is_bounded(&self, tiles: usize) -> bool {
+        #[cfg(test)]
+        if let Some(limit) = SNAPSHOT_LIMIT.with(std::cell::Cell::get) {
+            return self.lookups() <= limit;
+        }
+        self.lookups() <= MAX_SNAPSHOT_TILES.max(tiles.saturating_mul(SNAPSHOT_KEYS_PER_TILE))
+    }
 }
 
 /// How long, in mean tile times, the caller waits for a tile a helper
@@ -202,9 +353,9 @@ thread_local! {
     static DIAGNOSTICS: std::cell::Cell<Diagnostics> = const {
         std::cell::Cell::new(Diagnostics::ZERO)
     };
-    /// Test-only: [`snapshot_is_bounded`]'s limit on this thread (the
-    /// large-store timing raises it to measure the unbounded walk).
-    static SNAPSHOT_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_SNAPSHOT_TILES) };
+    /// Test-only: replaces [`Scope::is_bounded`]'s rule on this thread
+    /// with "at most this many lookups" (`None`: the shipping rule).
+    static SNAPSHOT_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// Test-only: hooks the next passes on this thread run with.
     static HOOKS: std::cell::Cell<TestHooks> = const { std::cell::Cell::new(TestHooks::NONE) };
 }
@@ -222,6 +373,9 @@ pub(crate) struct TestHooks {
     /// tile they may (all, or a window's worth) or this long has passed,
     /// so the helpers composite the tiles a differential compares.
     pub(crate) caller_yields: Option<Duration>,
+    /// Snapshot nothing ([`Scope::of`] is empty), so every helper read
+    /// is out of scope and every helper tile is handed back.
+    pub(crate) empty_scope: bool,
 }
 
 #[cfg(test)]
@@ -230,20 +384,30 @@ impl TestHooks {
         no_helpers: false,
         helper_stall: None,
         caller_yields: None,
+        empty_scope: false,
     };
 }
 
-/// Test-only: sets [`snapshot_is_bounded`]'s limit on this thread.
+/// Test-only: replaces [`Scope::is_bounded`]'s rule on this thread with
+/// "at most `limit` lookups" (`None` restores the shipping rule).
 #[cfg(test)]
-pub(crate) fn set_snapshot_limit_for_tests(limit: usize) {
+pub(crate) fn set_snapshot_limit_for_tests(limit: Option<usize>) {
     SNAPSHOT_LIMIT.with(|slot| slot.set(limit));
 }
 
-/// Test-only: how long a pass's [`Snapshot`] of `store` takes to build.
+/// Test-only: how long a pass's [`Snapshot`] of `store` takes to build
+/// for compositing `tiles` of `layers` (the scope included), and how many
+/// held tiles it took.
 #[cfg(test)]
-pub(crate) fn time_snapshot(store: &TileStore) -> (Duration, usize) {
+pub(crate) fn time_snapshot(
+    store: &TileStore,
+    layers: &aurora_doc::LayerTree,
+    tiles: &[TileId],
+    reference_origin: (i64, i64),
+) -> (Duration, usize) {
     let began = Instant::now();
-    let snapshot = Snapshot::of(store);
+    let scope = Scope::of(layers, tiles, reference_origin);
+    let snapshot = Snapshot::of(store, scope);
     (began.elapsed(), snapshot.tiles.len())
 }
 
@@ -350,53 +514,81 @@ type TileKey = (SurfaceId, TileId);
 /// A held tile's content version and, when resident, its texels.
 type SnapshotEntry = (u64, Option<Arc<Vec<half::f16>>>);
 
-/// Every tile a store holds at the start of a pass: its content version
-/// and, when resident, its texels (a reference count on the store's
-/// copy-on-write buffer). The composite surface's texels are left out, so
-/// installing a composite never copies a buffer a snapshot shares (the
-/// fold never reads that surface).
+/// Every tile of the pass's [`Scope`] that the store holds at the start
+/// of the pass: its content version and, when resident, its texels (a
+/// reference count on the store's copy-on-write buffer). The composite
+/// surface is never answered for (the fold never reads it), so installing
+/// a composite never copies a buffer a snapshot shares.
 struct Snapshot {
     serial: u64,
+    scope: Scope,
     tiles: HashMap<TileKey, SnapshotEntry>,
 }
 
 impl Snapshot {
-    fn of(store: &TileStore) -> Self {
+    fn of(store: &TileStore, scope: Scope) -> Self {
         let composite = crate::composite_surface_id();
-        let tiles = store
-            .held_tile_versions()
-            .into_iter()
-            .map(|(key, version)| {
-                let texels = if key.0 == composite {
-                    None
-                } else {
-                    store.peek_shared(key.0, key.1)
-                };
-                (key, (version, texels))
-            })
-            .collect();
+        let mut tiles = HashMap::new();
+        for (&surface, range) in &scope.ranges {
+            if surface == composite {
+                continue;
+            }
+            for y in range.y0..range.y1 {
+                for x in range.x0..range.x1 {
+                    let id = TileId { x, y };
+                    if store.contains_tile(surface, id) {
+                        tiles.insert(
+                            (surface, id),
+                            (
+                                store.content_version(surface, id),
+                                store.peek_shared(surface, id),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
         Self {
             serial: store.serial(),
+            scope,
             tiles,
         }
     }
+
+    /// Whether the snapshot can answer for `(surface, id)`: inside its
+    /// scope, and not the composite surface.
+    fn answers(&self, surface: SurfaceId, id: TileId) -> bool {
+        surface != crate::composite_surface_id() && self.scope.contains(surface, id)
+    }
 }
 
-/// A helper's view of the store: the pass's [`Snapshot`]. A read the
-/// snapshot cannot answer marks the tile missed (the helper then hands
-/// it back) and fails, as a store read failure would.
+/// A helper's view of the store: the pass's [`Snapshot`]. A question the
+/// snapshot cannot answer (a tile outside its scope, or a read of a tile
+/// it holds no texels for) marks the tile missed, and the helper hands
+/// it back. For an out-of-scope tile `contains_tile` says `true`, so the
+/// fold goes on to read it (and fails) rather than treating a tile the
+/// snapshot knows nothing about as absent; either way a missed tile's
+/// result is dropped.
 struct SnapshotSource<'a> {
     snapshot: &'a Snapshot,
-    missed: bool,
+    missed: std::cell::Cell<bool>,
     hits: Vec<TileKey>,
 }
 
 impl crate::TileSource for SnapshotSource<'_> {
     fn contains_tile(&self, surface: SurfaceId, id: TileId) -> bool {
+        if !self.snapshot.answers(surface, id) {
+            self.missed.set(true);
+            return true;
+        }
         self.snapshot.tiles.contains_key(&(surface, id))
     }
 
     fn content_version(&self, surface: SurfaceId, id: TileId) -> u64 {
+        if !self.snapshot.answers(surface, id) {
+            self.missed.set(true);
+            return 0;
+        }
         self.snapshot
             .tiles
             .get(&(surface, id))
@@ -412,11 +604,13 @@ impl crate::TileSource for SnapshotSource<'_> {
         surface: SurfaceId,
         id: TileId,
     ) -> Result<crate::SourceTexels<'_>, aurora_tile::TileError> {
-        if let Some((_, Some(texels))) = self.snapshot.tiles.get(&(surface, id)) {
+        if self.snapshot.answers(surface, id)
+            && let Some((_, Some(texels))) = self.snapshot.tiles.get(&(surface, id))
+        {
             self.hits.push((surface, id));
             return Ok(crate::SourceTexels::Shared(Arc::clone(texels)));
         }
-        self.missed = true;
+        self.missed.set(true);
         Err(aurora_tile::TileError::Io {
             surface,
             id,
@@ -475,12 +669,13 @@ impl Pass {
         layers: &aurora_doc::LayerTree,
         store: &TileStore,
         reference_origin: (i64, i64),
+        scope: Scope,
     ) -> Self {
         Self {
             tiles: tiles.to_vec(),
             layers: layers.clone(),
             reference_origin,
-            snapshot: Snapshot::of(store),
+            snapshot: Snapshot::of(store, scope),
             next: AtomicUsize::new(0),
             installed: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -577,7 +772,7 @@ fn helper_composite(pass: &Pass, tile_id: TileId, started: Instant) -> Option<He
     let before = crate::COMPOSITE_PROFILE.with(std::cell::Cell::get);
     let mut source = SnapshotSource {
         snapshot: &pass.snapshot,
-        missed: false,
+        missed: std::cell::Cell::new(false),
         hits: Vec::new(),
     };
     let doc_origin = crate::composite_tile_doc_origin(pass.reference_origin, tile_id);
@@ -596,7 +791,7 @@ fn helper_composite(pass: &Pass, tile_id: TileId, started: Instant) -> Option<He
     // goes through a report (`wanted_report`), so either alone would hand
     // the tile back. Both are kept: a future read path that skips a
     // failed tile without reporting must still not keep its result.
-    if source.missed || budget.wanted_report() {
+    if source.missed.get() || budget.wanted_report() {
         return None;
     }
     Some(HelperTile {
@@ -640,6 +835,7 @@ impl Timing {
 /// sequential loop computes for that tile.
 pub(crate) fn composite_tiles(
     frame: &FramePool,
+    scope: Scope,
     tiles: &[TileId],
     layers: &aurora_doc::LayerTree,
     store: &mut TileStore,
@@ -659,7 +855,7 @@ pub(crate) fn composite_tiles(
         Err(poisoned) => poisoned.into_inner().begin_pass(),
     }
     let mut budget = crate::CompositeBudget::for_pass(layers);
-    let pass = Arc::new(Pass::new(tiles, layers, store, reference_origin));
+    let pass = Arc::new(Pass::new(tiles, layers, store, reference_origin, scope));
     // Closes the pass however this function ends, an unwind included, so
     // no helper is left claiming (or sleeping on the window) for a pass
     // nobody will install.

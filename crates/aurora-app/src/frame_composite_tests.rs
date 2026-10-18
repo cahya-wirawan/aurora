@@ -378,14 +378,14 @@ struct SnapshotLimit;
 
 impl SnapshotLimit {
     fn set(limit: usize) -> Self {
-        crate::frame_composite::set_snapshot_limit_for_tests(limit);
+        crate::frame_composite::set_snapshot_limit_for_tests(Some(limit));
         Self
     }
 }
 
 impl Drop for SnapshotLimit {
     fn drop(&mut self) {
-        crate::frame_composite::set_snapshot_limit_for_tests(MAX_SNAPSHOT_TILES);
+        crate::frame_composite::set_snapshot_limit_for_tests(None);
     }
 }
 
@@ -410,12 +410,13 @@ fn hold_far_tiles(store: &mut aurora_tile::TileStore, layers: &aurora_doc::Layer
     }
 }
 
-/// A store holding more tiles than a pass may snapshot keeps the
-/// sequential loop (the snapshot walk is O(held tiles) on the caller);
-/// with the limit lifted the same store, its far tiles paged out, folds
-/// through the helpers to the same bits.
+/// Tiles the pass cannot read do not turn the pool off (60 FPS round 9):
+/// a store holding more than [`MAX_SNAPSHOT_TILES`] tiles far from the
+/// view (most paged out) folds the view through the helpers, its
+/// snapshot scoped to the view, to the sequential loop's bits; round 8
+/// kept the sequential loop for any store that large.
 #[test]
-fn a_store_too_large_to_snapshot_keeps_the_sequential_loop() {
+fn far_tiles_do_not_turn_the_pool_off() {
     let Some(_pool) = pool_or_skip() else {
         return;
     };
@@ -424,19 +425,17 @@ fn a_store_too_large_to_snapshot_keeps_the_sequential_loop() {
     hold_far_tiles(&mut store, &layers, 4_200);
     ok(store.flush());
     assert!(store.held_tile_count_bound() > MAX_SNAPSHOT_TILES);
-    assert!(!crate::frame_composite::snapshot_is_bounded(&store));
     let tiles = grid(4);
+    let scope = crate::frame_composite::Scope::of(&layers, &tiles, (0, 0));
+    assert!(scope.is_bounded(tiles.len()), "{}", scope.lookups());
+    let (_, held) = crate::frame_composite::time_snapshot(&store, &layers, &tiles, (0, 0));
+    assert!(
+        held < 200,
+        "the snapshot holds the view's tiles only: {held}"
+    );
     let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
     poison(&mut store, &tiles);
-    let _switch = Parallel::set(true);
     let _ = crate::frame_composite::take_pooled_tiles();
-    let mut cache = CompositeCache::default();
-    recomposite_tiles(&tiles, &layers, None, &mut store, &mut cache, None, None);
-    assert_eq!(crate::frame_composite::take_pooled_tiles(), 0, "sequential");
-    assert_installed(&mut store, &tiles, &sequential, "over the limit");
-
-    let _limit = SnapshotLimit::set(usize::MAX);
-    poison(&mut store, &tiles);
     let (parallel, _) = recomposite(&layers, &mut store, &tiles, true);
     assert_eq!(crate::frame_composite::take_pooled_tiles(), 16, "pooled");
     for ((id, want), got) in tiles.iter().zip(&sequential).zip(&parallel) {
@@ -444,12 +443,65 @@ fn a_store_too_large_to_snapshot_keeps_the_sequential_loop() {
     }
 }
 
-/// The large-store numbers behind [`MAX_SNAPSHOT_TILES`] (60 FPS round
-/// 8): for stores holding 4,000 to 50,000 tiles (all but the view's
-/// paged out), the snapshot walk alone, and a 9- and a 16-tile pass
-/// sequentially, through the shipping decision (sequential above the
-/// limit) and with the helpers forced. Per-run means; release, with
-/// `--ignored --nocapture`.
+/// A pass whose scope needs more lookups than the bound keeps the
+/// sequential loop (here with the bound lowered to 10), and the scope's
+/// lookups follow the pass: about the view plus its margin per surface.
+#[test]
+fn a_pass_whose_scope_is_too_large_keeps_the_sequential_loop() {
+    let Some(_pool) = pool_or_skip() else {
+        return;
+    };
+    let (_d, mut store) = store_with_budget(256);
+    let layers = cpu_document(&mut store);
+    let tiles = grid(4);
+    let scope = crate::frame_composite::Scope::of(&layers, &tiles, (0, 0));
+    // Two surfaces; the 4 x 4 view grown by the margin (640 px) on each
+    // side is tiles 0..7 (ids are unsigned) for the backdrop at (0, 0)
+    // and 0..7 for the layer at (40, 30).
+    assert_eq!(scope.lookups(), 2 * 7 * 7, "{scope:?}");
+    let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
+    poison(&mut store, &tiles);
+    let _limit = SnapshotLimit::set(10);
+    let _switch = Parallel::set(true);
+    let _ = crate::frame_composite::take_pooled_tiles();
+    let mut cache = CompositeCache::default();
+    recomposite_tiles(&tiles, &layers, None, &mut store, &mut cache, None, None);
+    assert_eq!(crate::frame_composite::take_pooled_tiles(), 0, "sequential");
+    assert_installed(&mut store, &tiles, &sequential, "over the bound");
+}
+
+/// A helper read outside the pass's scope is handed back, never answered
+/// as an absent tile: with an empty scope every helper tile goes back to
+/// the caller, and the installed bits are the sequential loop's.
+#[test]
+fn an_out_of_scope_read_is_handed_back() {
+    let Some(_pool) = pool_or_skip() else {
+        return;
+    };
+    let (_d, mut store) = store_with_budget(256);
+    let layers = cpu_document(&mut store);
+    let tiles = grid(4);
+    let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
+    poison(&mut store, &tiles);
+    let _hooks = Hooks::set(TestHooks {
+        caller_yields: Some(YIELD_LIMIT),
+        empty_scope: true,
+        ..TestHooks::NONE
+    });
+    let _switch = Parallel::set(true);
+    let mut cache = CompositeCache::default();
+    recomposite_tiles(&tiles, &layers, None, &mut store, &mut cache, None, None);
+    let diagnostics = take_diagnostics();
+    assert!(diagnostics.handed_back > 0, "{diagnostics:?}");
+    assert_eq!(diagnostics.helper_tiles, 0, "{diagnostics:?}");
+    assert_installed(&mut store, &tiles, &sequential, "empty scope");
+}
+
+/// The snapshot's cost at large stores (60 FPS rounds 8 and 9): for
+/// stores holding 4,000 to 50,000 tiles (all but the view's paged out),
+/// the scoped snapshot alone, and a 9- and a 16-tile pass sequentially,
+/// through the shipping decision and with the helpers forced. Per-run
+/// means; release, with `--ignored --nocapture`.
 #[test]
 #[ignore = "timing only; run with --ignored --nocapture"]
 fn time_a_pass_over_a_large_store() {
@@ -462,16 +514,15 @@ fn time_a_pass_over_a_large_store() {
         let layers = cpu_document(&mut store);
         hold_far_tiles(&mut store, &layers, held);
         ok(store.flush());
-        let (walk, len) = crate::frame_composite::time_snapshot(&store);
+        let (walk, len) = crate::frame_composite::time_snapshot(&store, &layers, &grid(4), (0, 0));
         println!(
-            "large store: {len} held tiles (bound {}): snapshot walk {:.3} ms",
+            "large store: {} held tiles: scoped snapshot of a 4 x 4 view {:.3} ms ({len} tiles)",
             store.held_tile_count_bound(),
             walk.as_secs_f64() * 1e3
         );
         for side in [3_u32, 4] {
             let tiles = grid(side);
-            let mut time = |parallel: bool, limit: usize| {
-                let _limit = SnapshotLimit::set(limit);
+            let mut time = |parallel: bool| {
                 let _switch = Parallel::set(parallel);
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..runs {
@@ -482,12 +533,11 @@ fn time_a_pass_over_a_large_store() {
                 }
                 total.as_secs_f64() * 1e3 / f64::from(runs)
             };
-            let sequential = time(false, MAX_SNAPSHOT_TILES);
-            let shipping = time(true, MAX_SNAPSHOT_TILES);
-            let forced = time(true, usize::MAX);
+            let sequential = time(false);
+            let shipping = time(true);
             println!(
                 "large store: {held} held, {} tiles: sequential {sequential:.3} ms, \
-                 shipping decision {shipping:.3} ms, helpers forced {forced:.3} ms",
+                 shipping decision {shipping:.3} ms",
                 side * side
             );
         }
@@ -707,6 +757,13 @@ fn random_trees_composite_the_same_in_parallel() {
         let mut tiles = grid(4);
         tiles.push(aurora_tile::TileId { x: 1, y: 1 });
         compared += check(&layers, &mut store, &tiles, &format!("tree {tree}"));
+        // 60 FPS round 9: with every tile resident, no helper read falls
+        // outside the pass's scope (effects' aprons, masks and layers at
+        // other origins included), so nothing is handed back.
+        let diagnostics = take_diagnostics();
+        if budget == 1024 {
+            assert_eq!(diagnostics.handed_back, 0, "tree {tree}: {diagnostics:?}");
+        }
     }
     println!("parallel frame differential: {trees} trees, {compared} samples");
     assert!(compared > 1_000_000, "{compared}");
