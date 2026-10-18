@@ -234,6 +234,9 @@ pub(crate) struct Diagnostics {
     pub(crate) setup_ns: u64,
     /// Nanoseconds the caller spent waiting on helpers' tiles.
     pub(crate) wait_ns: u64,
+    /// The most tiles helpers had claimed by the time a
+    /// [`TestHooks::caller_yields`] wait ended (the window's bound).
+    pub(crate) claimed_while_yielding: u64,
     /// Passes in which some helper claimed a tile, and the nanoseconds
     /// from each such pass's start to its first helper claim, summed.
     pub(crate) helper_claimed_passes: u64,
@@ -248,6 +251,7 @@ impl Diagnostics {
         helper_tiles: 0,
         duplicates: 0,
         handed_back: 0,
+        claimed_while_yielding: 0,
         setup_ns: 0,
         wait_ns: 0,
         helper_claimed_passes: 0,
@@ -634,6 +638,11 @@ pub(crate) fn composite_tiles(
             while pass.next.load(Ordering::Acquire) < claimable && Instant::now() < until {
                 std::thread::sleep(Duration::from_micros(100));
             }
+            // Leave a stray claim in progress time to land, so the bound
+            // is what is observed.
+            std::thread::sleep(Duration::from_millis(20));
+            let claimed = pass.next.load(Ordering::Acquire) as u64;
+            note(|d| d.claimed_while_yielding = d.claimed_while_yielding.max(claimed));
         }
     }
 

@@ -14,8 +14,8 @@
 )]
 
 use crate::frame_composite::{
-    FRAME_COMPOSITE_MAX_THREADS, TestHooks, frame_composite_threads, frame_pool,
-    set_parallel_enabled_for_tests, set_test_hooks, take_diagnostics,
+    FRAME_COMPOSITE_MAX_THREADS, HELPER_WINDOW_TILES, TestHooks, frame_composite_threads,
+    frame_pool, set_parallel_enabled_for_tests, set_test_hooks, take_diagnostics,
 };
 use crate::move_invalidation_tests::{corpus_files, pixel_layers, reaching_effects};
 use crate::occlusion_cull_tests::{
@@ -310,6 +310,41 @@ fn a_helper_hands_back_a_tile_it_cannot_read() {
     let diagnostics = take_diagnostics();
     assert!(diagnostics.handed_back > 0, "{diagnostics:?}");
     assert_installed(&mut store, &tiles, &sequential, "handed back");
+}
+
+/// Helpers run at most [`HELPER_WINDOW_TILES`] ahead of the caller's
+/// installed prefix, so at most that many results wait for installation,
+/// however many tiles a pass has; the pass still installs every tile.
+#[test]
+fn helpers_stay_within_the_window() {
+    if !pool_or_skip() {
+        return;
+    }
+    let (_d, mut store) = store_with_budget(512);
+    let mut layers = aurora_doc::LayerTree::new();
+    let _ = layer(
+        &mut layers,
+        &mut store,
+        None,
+        rect(0, 0, 2048, 2048),
+        &opaque,
+    );
+    let tiles = grid(8);
+    let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
+    poison(&mut store, &tiles);
+    let _hooks = Hooks::set(TestHooks {
+        caller_yields: Some(std::time::Duration::from_secs(20)),
+        ..TestHooks::NONE
+    });
+    let _switch = Parallel::set(true);
+    let mut cache = CompositeCache::default();
+    recomposite_tiles(&tiles, &layers, None, &mut store, &mut cache, None, None);
+    let diagnostics = take_diagnostics();
+    assert_eq!(
+        diagnostics.claimed_while_yielding, HELPER_WINDOW_TILES as u64,
+        "{diagnostics:?}"
+    );
+    assert_installed(&mut store, &tiles, &sequential, "window");
 }
 
 /// A helper's budget never logs: a breach only records the wish, and the
