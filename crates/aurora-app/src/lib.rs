@@ -617,6 +617,7 @@ mod smudge_stamp_tests;
 mod spot_heal_stamp;
 #[cfg(test)]
 mod spot_heal_stamp_tests;
+mod tile_buffers;
 mod tone_stamp;
 #[cfg(test)]
 mod tone_stamp_tests;
@@ -16974,7 +16975,7 @@ fn pixel_layer_texels_unprofiled(
             return None;
         }
         match store.texels(surface, tile_id) {
-            Ok(tile) => tile.to_vec(),
+            Ok(tile) => tile_buffers::copy_of(&tile),
             Err(err) => {
                 // Recorded, not just logged: the live canvas is
                 // content to skip this layer and repaint, but the
@@ -18759,6 +18760,7 @@ fn fold_layer_into(
             profiled(ProfileSlot::LayerFold, || {
                 aurora_render::composite_layer_into(accumulator, &texels, opacity, blend_mode);
             });
+            tile_buffers::recycle(texels);
             true
         }
         None => false,
@@ -20433,7 +20435,7 @@ fn composite_roots_into_tile(
     reference_origin: (i64, i64),
     budget: &mut CompositeBudget,
 ) -> (Vec<half::f16>, usize) {
-    let mut composited = aurora_render::transparent_tile();
+    let mut composited = tile_buffers::zeroed();
     // 0.184.0 review (SK-3): the memo holds only this tile's own search
     // results and is cleared on the way out, so it is empty here; the clear
     // stays for release builds, where this assertion is compiled out.
@@ -20466,6 +20468,9 @@ fn composite_roots_into_tile(
         plan.as_ref().map(FoldPlan::as_ref),
         false,
     );
+    if let Some(plan) = plan {
+        tile_buffers::recycle(plan.cover);
+    }
     // The accumulator has stopped being an accumulator and is now this
     // tile's finished composite, handed to callers (export, the
     // eyedropper, the canvas atlas) that all expect straight alpha --
@@ -26428,6 +26433,7 @@ fn recomposite_tiles(
             profiled(ProfileSlot::Install, || {
                 write_composited(store, cache, tile_id, &composited);
             });
+            tile_buffers::recycle(composited);
             tile_costs.mark_cpu_fallback(folded);
         }
     }
@@ -26519,6 +26525,7 @@ fn recomposite_tiles_in_parallel(
             profiled(ProfileSlot::Install, || {
                 install_composited_tile(store, cache, tile_id, &composited);
             });
+            tile_buffers::recycle(composited);
             tile_costs.mark_cpu_fallback(folded);
         },
     );
@@ -27316,12 +27323,7 @@ fn read_layer_window_unprofiled(
             let texels: &[half::f16] = &src;
             // First real source tile for this window: now, and only
             // now, is a destination buffer worth having.
-            let out = out.get_or_insert_with(|| {
-                vec![
-                    half::f16::from_f32(0.0);
-                    aurora_tile::TILE as usize * aurora_tile::TILE as usize * aurora_tile::CHANNELS
-                ]
-            });
+            let out = out.get_or_insert_with(tile_buffers::zeroed);
             // 0.183.0: one slice copy per row, straight from the resident
             // tile (no whole-tile `to_vec`); the same samples land in the
             // same places as the old per-texel copy, so bit-identical.
