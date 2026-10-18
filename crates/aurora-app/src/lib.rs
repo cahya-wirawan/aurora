@@ -540,6 +540,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::window::{Window, WindowId};
 
 mod adjust_app;
+mod adjust_tables;
 #[cfg(test)]
 mod anchor_tests;
 mod aur_save;
@@ -616,6 +617,7 @@ mod smudge_stamp_tests;
 mod spot_heal_stamp;
 #[cfg(test)]
 mod spot_heal_stamp_tests;
+mod tile_buffers;
 mod tone_stamp;
 #[cfg(test)]
 mod tone_stamp_tests;
@@ -16973,7 +16975,7 @@ fn pixel_layer_texels_unprofiled(
             return None;
         }
         match store.texels(surface, tile_id) {
-            Ok(tile) => tile.to_vec(),
+            Ok(tile) => tile_buffers::copy_of(&tile),
             Err(err) => {
                 // Recorded, not just logged: the live canvas is
                 // content to skip this layer and repaint, but the
@@ -18758,6 +18760,7 @@ fn fold_layer_into(
             profiled(ProfileSlot::LayerFold, || {
                 aurora_render::composite_layer_into(accumulator, &texels, opacity, blend_mode);
             });
+            tile_buffers::recycle(texels);
             true
         }
         None => false,
@@ -19380,18 +19383,7 @@ fn apply_adjustment_layer(
     aurora_render::un_premultiply_in_place(&mut backdrop);
 
     let one = half::f16::from_f32(1.0);
-    let mut source = Vec::with_capacity(backdrop.len());
-    for texel in backdrop.chunks_exact(4) {
-        if let [r, g, b, _] = *texel {
-            let [r, g, b] = lut.apply([r.to_f32(), g.to_f32(), b.to_f32()]);
-            source.extend([
-                half::f16::from_f32(r),
-                half::f16::from_f32(g),
-                half::f16::from_f32(b),
-                one,
-            ]);
-        }
-    }
+    let mut source = adjusted_source(adjustment, &lut, &backdrop);
     if let Some(mask) = layers.mask(id)
         && mask.enabled
     {
@@ -19424,6 +19416,16 @@ fn apply_adjustment_layer(
 
     for (out, mixed) in accumulator.chunks_exact_mut(4).zip(mixed.chunks_exact(4)) {
         if let ([r, g, b, alpha], [mr, mg, mb, _]) = (out, mixed) {
+            // 60 FPS round 9: at alpha exactly 1 the product is the mixed
+            // value itself, and an `f16` -> `f32` -> `f16` round trip of a
+            // non-NaN value is exact, so it is copied; a NaN keeps the
+            // arithmetic (its payload may change on the way).
+            if alpha.to_bits() == one.to_bits() && !(mr.is_nan() || mg.is_nan() || mb.is_nan()) {
+                *r = *mr;
+                *g = *mg;
+                *b = *mb;
+                continue;
+            }
             let a = alpha.to_f32();
             *r = half::f16::from_f32(mr.to_f32() * a);
             *g = half::f16::from_f32(mg.to_f32() * a);
@@ -19431,6 +19433,54 @@ fn apply_adjustment_layer(
         }
     }
     true
+}
+
+/// The adjusted copy of the straight `backdrop` [`apply_adjustment_layer`]
+/// blends: each texel's colour through `lut`, alpha `1`.
+fn adjusted_source(
+    adjustment: &aurora_doc::Adjustment,
+    lut: &AdjustmentLut,
+    backdrop: &[half::f16],
+) -> Vec<half::f16> {
+    let one = half::f16::from_f32(1.0);
+    let mut source = Vec::with_capacity(backdrop.len());
+    // 60 FPS round 9: a channel-separable adjustment maps each channel's
+    // `f16` through a table holding exactly what the loop below computes
+    // for it (`adjust_tables`).
+    let tables = match lut {
+        AdjustmentLut::Curves(curves) => {
+            adjust_tables::channel_tables(adjustment, Some(curves), None)
+        }
+        AdjustmentLut::Levels(levels) => {
+            adjust_tables::channel_tables(adjustment, None, Some(levels))
+        }
+        _ => None,
+    };
+    if let Some([red, green, blue]) = &tables {
+        for texel in backdrop.chunks_exact(4) {
+            if let [r, g, b, _] = *texel {
+                source.extend([
+                    adjust_tables::lookup(red, r),
+                    adjust_tables::lookup(green, g),
+                    adjust_tables::lookup(blue, b),
+                    one,
+                ]);
+            }
+        }
+    } else {
+        for texel in backdrop.chunks_exact(4) {
+            if let [r, g, b, _] = *texel {
+                let [r, g, b] = lut.apply([r.to_f32(), g.to_f32(), b.to_f32()]);
+                source.extend([
+                    half::f16::from_f32(r),
+                    half::f16::from_f32(g),
+                    half::f16::from_f32(b),
+                    one,
+                ]);
+            }
+        }
+    }
+    source
 }
 
 /// How many cover candidates [`fold_plan_for_tile`] reads per context
@@ -20304,8 +20354,8 @@ fn fold_planned_node(
 /// paths — had exactly one place to be fixed, which is where 0.52.0
 /// fixed it (below).
 ///
-/// The accumulator starts fully transparent
-/// (`aurora_render::transparent_tile`) and each resolved child buffer is
+/// The accumulator starts fully transparent (`tile_buffers::zeroed`,
+/// the same all-`0x0000` bits as `aurora_render::transparent_tile`) and each resolved child buffer is
 /// dropped at the end of its own iteration, so peak memory here is one
 /// tile buffer plus whatever the recursion below it holds, rather than
 /// one full [`aurora_tile::SAMPLES`]-length buffer per root layer —
@@ -20360,8 +20410,8 @@ fn fold_planned_node(
 /// `None` for all of them, e.g. nothing stored under the tile); or
 /// [`CompositeBudget`] refused further work before any root resolved
 /// (`charge_node`/depth refusals, which also return `None`). All three
-/// leave the returned buffer `aurora_render::transparent_tile`'s
-/// own untouched output — which since 0.94.0 is returned *without* the
+/// leave the returned buffer `tile_buffers::zeroed`'s untouched
+/// all-`0x0000` output (the bits of `aurora_render::transparent_tile`) — which since 0.94.0 is returned *without* the
 /// straightening pass running over it, since on that specific buffer the
 /// pass is a bitwise identity. So this count is now load-bearing for more
 /// than diagnostics: it is the predicate that skip reads.
@@ -20385,7 +20435,7 @@ fn composite_roots_into_tile(
     reference_origin: (i64, i64),
     budget: &mut CompositeBudget,
 ) -> (Vec<half::f16>, usize) {
-    let mut composited = aurora_render::transparent_tile();
+    let mut composited = tile_buffers::zeroed();
     // 0.184.0 review (SK-3): the memo holds only this tile's own search
     // results and is cleared on the way out, so it is empty here; the clear
     // stays for release builds, where this assertion is compiled out.
@@ -20418,6 +20468,9 @@ fn composite_roots_into_tile(
         plan.as_ref().map(FoldPlan::as_ref),
         false,
     );
+    if let Some(plan) = plan {
+        tile_buffers::recycle(plan.cover);
+    }
     // The accumulator has stopped being an accumulator and is now this
     // tile's finished composite, handed to callers (export, the
     // eyedropper, the canvas atlas) that all expect straight alpha --
@@ -20430,12 +20483,12 @@ fn composite_roots_into_tile(
     // asserted here:
     //
     // 1. *Provenance.* `composited` was seeded by
-    //    `aurora_render::transparent_tile` above and the **only** thing
+    //    `tile_buffers::zeroed` above (round 9; the same all-`0x0000`
+    //    bits `aurora_render::transparent_tile` gives) and the **only** thing
     //    that ever writes to it is the `composite_layer_into` call in the
     //    loop above -- which sits inside the same `if let Some(..)` that
     //    increments `folded`. So `folded == 0` means literally no write
-    //    happened, and the buffer is still `transparent_tile`'s own
-    //    output. `composite_roots_into_tile_returns_a_bitwise_transparent_buffer_when_no_root_folds`
+    //    happened, and the buffer is still all `0x0000`. `composite_roots_into_tile_returns_a_bitwise_transparent_buffer_when_no_root_folds`
     //    (and its never-painted-pixel-layer sibling) pin that end to end,
     //    on bits.
     // 2. *What that output is.* `transparent_tile` is all canonical
@@ -26380,6 +26433,7 @@ fn recomposite_tiles(
             profiled(ProfileSlot::Install, || {
                 write_composited(store, cache, tile_id, &composited);
             });
+            tile_buffers::recycle(composited);
             tile_costs.mark_cpu_fallback(folded);
         }
     }
@@ -26427,8 +26481,9 @@ fn recomposite_tiles(
 /// fewer than [`frame_composite::MIN_PARALLEL_TILES`] are stale (a dab:
 /// the redraw handler composites at most
 /// [`background_composite::SYNC_TILE_LIMIT`] tiles itself and those keep
-/// the sequential loop), the store holds more tiles than a pass may
-/// snapshot ([`frame_composite::MAX_SNAPSHOT_TILES`]), the pool is
+/// the sequential loop), the tiles the pass may read need more store
+/// lookups than its snapshot may make ([`frame_composite::Scope`],
+/// round 9), the pool is
 /// unavailable or (tests) disabled.
 fn recomposite_tiles_in_parallel(
     tiles: &[aurora_tile::TileId],
@@ -26447,9 +26502,11 @@ fn recomposite_tiles_in_parallel(
         .copied()
         .filter(|&tile_id| !cache.is_current(tile_id) && seen.insert(tile_id))
         .collect();
-    if stale.len() < frame_composite::MIN_PARALLEL_TILES
-        || !frame_composite::snapshot_is_bounded(store)
-    {
+    if stale.len() < frame_composite::MIN_PARALLEL_TILES {
+        return false;
+    }
+    let scope = frame_composite::Scope::of(layers, &stale, reference_origin);
+    if !scope.is_bounded(stale.len()) {
         return false;
     }
     let Some(pool) = frame_composite::frame_pool() else {
@@ -26457,6 +26514,7 @@ fn recomposite_tiles_in_parallel(
     };
     frame_composite::composite_tiles(
         pool,
+        scope,
         &stale,
         layers,
         store,
@@ -26467,6 +26525,7 @@ fn recomposite_tiles_in_parallel(
             profiled(ProfileSlot::Install, || {
                 install_composited_tile(store, cache, tile_id, &composited);
             });
+            tile_buffers::recycle(composited);
             tile_costs.mark_cpu_fallback(folded);
         },
     );
@@ -27264,12 +27323,7 @@ fn read_layer_window_unprofiled(
             let texels: &[half::f16] = &src;
             // First real source tile for this window: now, and only
             // now, is a destination buffer worth having.
-            let out = out.get_or_insert_with(|| {
-                vec![
-                    half::f16::from_f32(0.0);
-                    aurora_tile::TILE as usize * aurora_tile::TILE as usize * aurora_tile::CHANNELS
-                ]
-            });
+            let out = out.get_or_insert_with(tile_buffers::zeroed);
             // 0.183.0: one slice copy per row, straight from the resident
             // tile (no whole-tile `to_vec`); the same samples land in the
             // same places as the old per-texel copy, so bit-identical.
@@ -43230,6 +43284,7 @@ mod tests {
         (document, image)
     }
 
+    mod photo_frame_tests;
     mod psd_effects_write_tests;
     mod psd_five_adjust_tests;
     mod psd_grey_exposure_tests;
