@@ -420,6 +420,10 @@ impl CompositeWorker {
         target: &mut CompositeTarget<'_>,
         tiles: Vec<TileId>,
     ) -> bool {
+        #[cfg(test)]
+        if FAIL_DISPATCH.with(std::cell::Cell::get) {
+            return false;
+        }
         if !self.ensure_thread() {
             return false;
         }
@@ -1027,4 +1031,11 @@ fn worker_loop(
         }
         context.wake();
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook (task 136 review, ZV-3): makes [`CompositeWorker::dispatch`]
+    /// refuse, as a failed thread spawn or mirror would.
+    pub(crate) static FAIL_DISPATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

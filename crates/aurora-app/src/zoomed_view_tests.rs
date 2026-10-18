@@ -816,3 +816,34 @@ fn a_pyramid_write_that_fails_is_not_counted_and_asks_for_no_redraw() {
     let _ = settle(&mut doc, &mut cache, 2);
     assert_level_matches_export(&mut doc, 2, TOLERANCE);
 }
+
+#[test]
+fn a_refused_worker_dispatch_is_composited_under_the_frame_budget() {
+    // ZV-3: 16 x 16 tiles stale, the worker refusing: one frame composites
+    // a bounded part of them and asks for another, not the whole document.
+    let mut doc = document((4096, 4096));
+    let mut cache = crate::CompositeCache::default();
+    let mut worker = crate::background_composite::CompositeWorker::new(std::sync::Arc::new(|| {}));
+    let visible: Vec<TileId> = (0..16)
+        .flat_map(|y| (0..16).map(move |x| TileId { x, y }))
+        .collect();
+    crate::background_composite::FAIL_DISPATCH.with(|fail| fail.set(true));
+    let step = advance(
+        0,
+        &visible,
+        doc.size,
+        &doc.layers,
+        Some(doc.top),
+        &mut doc.store,
+        &mut cache,
+        Level0::Worker(&mut worker),
+        Duration::from_mins(1),
+    );
+    crate::background_composite::FAIL_DISPATCH.with(|fail| fail.set(false));
+    worker.shutdown();
+    let done = visible.iter().filter(|&&id| cache.is_current(id)).count();
+    assert!(done >= super::LEVEL0_CHUNK, "{done}");
+    assert!(done < visible.len(), "the whole document in one frame");
+    assert!(step.more);
+    assert!(!step.complete);
+}
