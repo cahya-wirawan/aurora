@@ -30679,12 +30679,10 @@ fn apply_zoomed_out_centring(
     drag: Option<&mut Drag>,
     pointer: Option<(f32, f32)>,
     atlas_floor: f32,
-    canvas_px: (u32, u32),
     canvas_logical: Option<(f32, f32)>,
     doc_size: (u32, u32),
     scale_factor: f64,
 ) {
-    let _ = canvas_px;
     let zoom = effective_residency_zoom(view.zoom(), scale_factor);
     if zoom >= atlas_floor {
         return;
@@ -37747,7 +37745,6 @@ impl App {
                 self.drag.as_mut(),
                 pointer,
                 zoomed_view::atlas_floor(canvas_size, limit),
-                canvas_size,
                 canvas_area_logical_size(&self.workspace),
                 self.doc.canvas_size,
                 self.scale_factor,

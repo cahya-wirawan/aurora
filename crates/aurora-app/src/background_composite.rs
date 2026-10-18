@@ -420,11 +420,7 @@ impl CompositeWorker {
         target: &mut CompositeTarget<'_>,
         tiles: Vec<TileId>,
     ) -> bool {
-        #[cfg(test)]
-        if FAIL_DISPATCH.with(std::cell::Cell::get) {
-            return false;
-        }
-        if !self.ensure_thread() {
+        if dispatch_refused_for_tests() || !self.ensure_thread() {
             return false;
         }
         let serial = target.store.serial();
@@ -1031,6 +1027,17 @@ fn worker_loop(
         }
         context.wake();
     }
+}
+
+/// Whether [`FAIL_DISPATCH`] is set (always `false` outside tests).
+#[cfg(test)]
+fn dispatch_refused_for_tests() -> bool {
+    FAIL_DISPATCH.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn dispatch_refused_for_tests() -> bool {
+    false
 }
 
 #[cfg(test)]
