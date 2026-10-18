@@ -43230,6 +43230,7 @@ mod tests {
         (document, image)
     }
 
+    mod photo_frame_tests;
     mod psd_effects_write_tests;
     mod psd_five_adjust_tests;
     mod psd_grey_exposure_tests;
