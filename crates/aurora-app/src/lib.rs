@@ -626,6 +626,7 @@ mod widget_paint_cache;
 #[cfg(test)]
 mod widget_paint_cache_tests;
 mod workspace_presets;
+mod zoomed_view;
 use background_open::{
     BackgroundFailure, DecodedFile, FinishedOpen, OpenInstaller, OpenStep, OpenWorker,
     background_open_step,
@@ -1669,7 +1670,8 @@ fn replace_document_pixels_prepared(
     masks: Vec<PreparedMask>,
 ) -> (usize, usize) {
     let freed = aurora_doc::forget_document_surfaces(outgoing_layers, outgoing_history, store)
-        + store.forget_surface(composite_surface_id());
+        + store.forget_surface(composite_surface_id())
+        + zoomed_view::forget_pyramid_surfaces(store);
     // Every incoming tile is inserted only after the sweep above has
     // finished -- all of them, not just the first layer's: with a
     // multi-layer PSD (0.144.0) every one of its layer ids, not only id 0,
@@ -1721,7 +1723,8 @@ fn replace_document_pixels_synchronously(
     masks: &[aurora_io::PsdMaskPixels],
 ) -> (usize, usize) {
     let freed = aurora_doc::forget_document_surfaces(outgoing_layers, outgoing_history, store)
-        + store.forget_surface(composite_surface_id());
+        + store.forget_surface(composite_surface_id())
+        + zoomed_view::forget_pyramid_surfaces(store);
     let mut failed = 0_usize;
     for (incoming_layer, image, (dx, dy)) in incoming {
         let Some(surface) = incoming_layers.surface_id(*incoming_layer) else {
@@ -5760,6 +5763,10 @@ enum AppCommand {
     CloseDocument,
     /// Swap the foreground and background colours (0.208.0), `X`.
     SwapColours,
+    /// View > Fit on Screen (0.275.0), `Primary+0`.
+    FitOnScreen,
+    /// View > 100% (0.275.0), `Primary+1`.
+    ActualPixels,
     /// Reset the colours to black over white (0.208.0), `D`.
     ResetColours,
     /// Toggle Quick Mask mode (0.217.0), `Q`: handed back as
@@ -5809,6 +5816,8 @@ fn primary_modifier(primary_is_meta: bool) -> &'static str {
 /// (`primary_is_meta`) or `Ctrl`. A binding spelled `Primary+…` takes
 /// that modifier; `Ctrl+Tab`/`Ctrl+Shift+Tab` stay literal `Ctrl` on
 /// every platform (`Cmd+Tab` is macOS's application switcher).
+// One flat table of bindings; splitting it would only scatter it.
+#[allow(clippy::too_many_lines)]
 fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> {
     let bindings = [
         ("Tab", AppCommand::FocusNext),
@@ -5900,6 +5909,8 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         ),
         // 0.208.0: Photoshop's colour keys, bare like the tool letters.
         ("x", AppCommand::SwapColours),
+        ("Primary+0", AppCommand::FitOnScreen),
+        ("Primary+1", AppCommand::ActualPixels),
         ("d", AppCommand::ResetColours),
         // 0.217.0: Photoshop's Quick Mask key, bare like the tool letters.
         ("q", AppCommand::ToggleQuickMask),
@@ -6172,6 +6183,9 @@ enum ActivatedCommand {
     /// Swap the foreground and background colours (0.208.0): `X`, the
     /// palette and the Tools panel's swap button.
     SwapColours,
+    /// Fit on Screen or 100% (0.275.0): `Primary+0`/`Primary+1`, the
+    /// palette and the View menus.
+    ViewZoom(zoomed_view::ViewZoom),
     /// Reset the colours to black over white (0.208.0): `D`, the palette
     /// and the Tools panel's defaults button.
     ResetColours,
@@ -6570,6 +6584,14 @@ fn palette_commands() -> Vec<CommandEntry> {
             "Swap Foreground and Background Colours",
         ),
         CommandEntry::new(
+            zoomed_view::COMMAND_FIT_ON_SCREEN,
+            zoomed_view::FIT_ON_SCREEN_TITLE,
+        ),
+        CommandEntry::new(
+            zoomed_view::COMMAND_ACTUAL_PIXELS,
+            zoomed_view::ACTUAL_PIXELS_TITLE,
+        ),
+        CommandEntry::new(
             COMMAND_COLOURS_RESET,
             "Default Foreground and Background Colours",
         ),
@@ -6905,6 +6927,14 @@ fn activate_command(
     }
     if id == COMMAND_COLOURS_SWAP {
         return Some(ActivatedCommand::SwapColours);
+    }
+    if id == zoomed_view::COMMAND_FIT_ON_SCREEN {
+        return Some(ActivatedCommand::ViewZoom(zoomed_view::ViewZoom::Fit));
+    }
+    if id == zoomed_view::COMMAND_ACTUAL_PIXELS {
+        return Some(ActivatedCommand::ViewZoom(
+            zoomed_view::ViewZoom::ActualPixels,
+        ));
     }
     if id == COMMAND_COLOURS_RESET {
         return Some(ActivatedCommand::ResetColours);
@@ -11069,6 +11099,19 @@ fn build_menu() -> muda::Menu {
         "View",
         true,
         &[
+            &muda::MenuItem::with_id(
+                zoomed_view::COMMAND_FIT_ON_SCREEN,
+                zoomed_view::FIT_ON_SCREEN_TITLE,
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                zoomed_view::COMMAND_ACTUAL_PIXELS,
+                zoomed_view::ACTUAL_PIXELS_TITLE,
+                true,
+                None,
+            ),
+            &muda::PredefinedMenuItem::separator(),
             &muda::MenuItem::with_id(COMMAND_FOCUS_LAYERS, "Focus Layers Panel", true, None),
             &muda::MenuItem::with_id(
                 COMMAND_FOCUS_PROPERTIES,
@@ -12129,6 +12172,8 @@ fn run_command(
         // The colours and Quick Mask are `App` state too (handed back as
         // `ActivatedCommand::{SwapColours, ResetColours, ToggleQuickMask}`).
         AppCommand::SwapColours
+        | AppCommand::FitOnScreen
+        | AppCommand::ActualPixels
         | AppCommand::ResetColours
         | AppCommand::ToggleQuickMask
         | AppCommand::MakeSelectionFromPath
@@ -12953,6 +12998,14 @@ fn handle_key(
         }
         if command == AppCommand::SwapColours {
             return Some(ActivatedCommand::SwapColours);
+        }
+        if command == AppCommand::FitOnScreen {
+            return Some(ActivatedCommand::ViewZoom(zoomed_view::ViewZoom::Fit));
+        }
+        if command == AppCommand::ActualPixels {
+            return Some(ActivatedCommand::ViewZoom(
+                zoomed_view::ViewZoom::ActualPixels,
+            ));
         }
         if command == AppCommand::ResetColours {
             return Some(ActivatedCommand::ResetColours);
@@ -26100,6 +26153,32 @@ fn dispatch_or_composite_tiles(
     cache: &mut CompositeCache,
     worker: &mut background_composite::CompositeWorker,
 ) {
+    let _ = dispatch_or_composite_tiles_bounded(
+        tiles,
+        layers,
+        active_layer,
+        store,
+        cache,
+        worker,
+        None,
+    );
+}
+
+/// [`dispatch_or_composite_tiles`] with the synchronous fallback for a
+/// refused dispatch bounded by `budget` (task 136 review, ZV-3: on the
+/// zoomed-out path the needed set can be the whole document, which the
+/// unbounded fallback would composite in one frame). `None` is the
+/// unbounded original. Returns whether fallback work was left for a later
+/// frame.
+fn dispatch_or_composite_tiles_bounded(
+    tiles: &[aurora_tile::TileId],
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    store: &mut aurora_tile::TileStore,
+    cache: &mut CompositeCache,
+    worker: &mut background_composite::CompositeWorker,
+    budget: Option<std::time::Duration>,
+) -> bool {
     let reference_origin = composite_reference_origin(layers, active_layer);
     let mut target = background_composite::CompositeTarget {
         layers,
@@ -26118,7 +26197,7 @@ fn dispatch_or_composite_tiles(
         .filter(|&tile| !worker.covers(&target, tile))
         .collect();
     if uncovered.is_empty() {
-        return;
+        return false;
     }
     if uncovered.len() <= background_composite::SYNC_TILE_LIMIT {
         recomposite_tiles(
@@ -26130,15 +26209,27 @@ fn dispatch_or_composite_tiles(
             None,
             None,
         );
-        return;
+        return false;
     }
     if worker.is_busy() && worker.active_is_healthy(&target) {
         // Left to finish; its `Done` wakes the loop and the next redraw
         // dispatches what it didn't cover.
-        return;
+        return false;
     }
     if !worker.dispatch(&mut target, stale) {
-        recomposite_tiles(
+        let Some(budget) = budget else {
+            recomposite_tiles(
+                &uncovered,
+                layers,
+                active_layer,
+                target.store,
+                target.cache,
+                None,
+                None,
+            );
+            return false;
+        };
+        return zoomed_view::recomposite_within_budget(
             &uncovered,
             layers,
             active_layer,
@@ -26146,8 +26237,11 @@ fn dispatch_or_composite_tiles(
             target.cache,
             None,
             None,
-        );
+            budget,
+        )
+        .1;
     }
+    false
 }
 
 /// [`recomposite_visible_tiles`] over an explicit tile list (0.186.0).
@@ -26632,6 +26726,9 @@ struct CompositeCache {
     /// The stamp of the content each composite tile shows (0.186.0, BG-3):
     /// a provisional install never replaces newer content with older.
     displayed: HashMap<aurora_tile::TileId, u64>,
+    /// Which zoomed-out pyramid tiles are current (0.275.0): every way a
+    /// tile above leaves `current` drops its ancestors here too.
+    pyramid: zoomed_view::PyramidState,
 }
 
 impl Default for CompositeCache {
@@ -26645,6 +26742,7 @@ impl Default for CompositeCache {
             invalidated_at: HashMap::new(),
             in_flight: HashSet::new(),
             displayed: HashMap::new(),
+            pyramid: zoomed_view::PyramidState::default(),
         }
     }
 }
@@ -26653,6 +26751,7 @@ impl CompositeCache {
     /// Invalidates every cached tile.
     fn bump(&mut self) {
         self.current.clear();
+        self.pyramid.clear();
         self.stamp = self.stamp.wrapping_add(1);
         self.bumped_at = self.stamp;
         self.invalidated_at.clear();
@@ -26687,6 +26786,7 @@ impl CompositeCache {
 
     fn note_invalidated(&mut self, id: aurora_tile::TileId) {
         self.current.remove(&id);
+        self.pyramid.drop_ancestors(id);
         // Only a tile a background job may still deliver needs the record;
         // anything else is simply no longer current.
         if self.in_flight.contains(&id) {
@@ -26728,6 +26828,7 @@ impl CompositeCache {
     /// `stamp` and is **not** current, so the newest job recomposites it.
     fn mark_provisional(&mut self, id: aurora_tile::TileId, stamp: u64) {
         self.current.remove(&id);
+        self.pyramid.drop_ancestors(id);
         self.displayed.insert(id, stamp);
     }
 
@@ -30219,7 +30320,11 @@ fn guarded_scale_factor(scale_factor: f64) -> f32 {
 /// to, in the *logical*-pixel zoom that view speaks, so that the atlas
 /// renders exactly the zoom the view reports.
 ///
-/// [`aurora_gpu::TileResidency::min_zoom_for_viewport`] is the single
+/// **Since 0.275.0 the floor is [`zoomed_view::MIN_PHYSICAL_ZOOM`]**: below
+/// the atlas floor the frame draws the zoomed-out view, which renders the
+/// view's zoom exactly, so the identity below holds against whichever
+/// atlas draws. Until then:
+/// [`aurora_gpu::TileResidency::min_zoom_for_viewport`] was the single
 /// source of truth for the floor itself; it is expressed against the
 /// **physical** viewport the atlas is sized in, so converting it into
 /// `CanvasView`'s logical zoom is a division by the same
@@ -30241,7 +30346,35 @@ fn guarded_scale_factor(scale_factor: f64) -> f32 {
 /// number being one, so rounding it up is always the safe direction.
 #[must_use]
 fn canvas_min_zoom(canvas_size: (u32, u32), scale_factor: f64) -> f32 {
-    let floor = aurora_gpu::TileResidency::min_zoom_for_viewport(canvas_size);
+    canvas_min_zoom_within(canvas_size, scale_factor, u32::MAX)
+}
+
+/// The largest texture side `gpu` allows (`u32::MAX` with no device: then
+/// nothing is drawn and no cap applies).
+#[must_use]
+fn texture_limit(gpu: Option<&GpuContext>) -> u32 {
+    gpu.map_or(u32::MAX, |gpu| {
+        gpu.device().limits().max_texture_dimension_2d
+    })
+}
+
+/// [`canvas_min_zoom`] on a device whose largest texture side is `limit`
+/// (task 136 review, ZV-1): on a canvas area too large for the device's
+/// textures the zoomed-out atlas is capped and its floor rises, and so
+/// does this one ([`zoomed_view::physical_floor`]).
+#[must_use]
+fn canvas_min_zoom_within(canvas_size: (u32, u32), scale_factor: f64, limit: u32) -> f32 {
+    // 0.275.0: below the 1:1 atlas's floor the frame draws the zoomed-out
+    // view (`zoomed_view`), which renders every zoom down to
+    // `MIN_PHYSICAL_ZOOM`, so that is the floor now; the atlas floor
+    // (`TileResidency::min_zoom_for_viewport`) only decides which of the
+    // two atlases a frame draws. A degenerate canvas size keeps the atlas
+    // floor's own fallback.
+    let floor = if canvas_size.0 == 0 || canvas_size.1 == 0 {
+        aurora_gpu::TileResidency::min_zoom_for_viewport(canvas_size)
+    } else {
+        zoomed_view::physical_floor(canvas_size, limit)
+    };
     let scale = guarded_scale_factor(scale_factor);
     let mut min_zoom = floor / scale;
     let mut steps = 0;
@@ -30522,6 +30655,63 @@ fn load_document_view(
 /// to have). Named `canvas_local_origin` rather than the old
 /// `tile_origin_for_view`, since "tile origin" no longer describes what
 /// this returns.
+/// The render viewport the zoomed-out atlas draws into: the canvas area
+/// rectangle less the frame's shift (a centred document starts right of /
+/// below the area's corner), never past the area.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+fn zoomed_view_rect(
+    (x, y, w, h): (f32, f32, f32, f32),
+    frame: &zoomed_view::ZoomedFrame,
+) -> (f32, f32, f32, f32) {
+    let sx = (frame.shift_px.0 as f32).min((w - 1.0).max(0.0));
+    let sy = (frame.shift_px.1 as f32).min((h - 1.0).max(0.0));
+    (x + sx, y + sy, (w - sx).max(1.0), (h - sy).max(1.0))
+}
+
+/// While the view is zoomed out below the 1:1 atlas floor, centres the
+/// document on any axis where it is narrower than the canvas area (0.275.0),
+/// keeping a live drag's reference under the pointer as
+/// [`apply_canvas_min_zoom`] does. At or above the floor nothing changes
+/// (the document stays pinned to its corner as before).
+fn apply_zoomed_out_centring(
+    view: &mut aurora_ui::CanvasView,
+    drag: Option<&mut Drag>,
+    pointer: Option<(f32, f32)>,
+    atlas_floor: f32,
+    canvas_logical: Option<(f32, f32)>,
+    doc_size: (u32, u32),
+    scale_factor: f64,
+) {
+    let zoom = effective_residency_zoom(view.zoom(), scale_factor);
+    if zoom >= atlas_floor {
+        return;
+    }
+    let Some(canvas_logical) = canvas_logical else {
+        return;
+    };
+    let pan = zoomed_view::centred_pan(
+        view.pan(),
+        view.zoom(),
+        canvas_logical,
+        doc_size,
+        guarded_scale_factor(scale_factor),
+    );
+    let before_pan = view.pan();
+    if pan == before_pan {
+        return;
+    }
+    let anchor = drag.as_deref().and_then(|drag| {
+        pointer.or_else(|| drag_reference(drag).map(|reference| view.to_screen(reference)))
+    });
+    let before = anchor.map(|anchor| view.to_document(anchor));
+    view.pan_by((pan.0 - before_pan.0, pan.1 - before_pan.1));
+    if let (Some(drag), Some(anchor), Some(before)) = (drag, anchor, before) {
+        let after = view.to_document(anchor);
+        shift_drag_reference(drag, (after.0 - before.0, after.1 - before.1));
+    }
+}
+
 #[must_use]
 fn canvas_local_origin(view: &aurora_ui::CanvasView, layer_origin: (f32, f32)) -> (f32, f32) {
     let (doc_x, doc_y) = view.to_document((0.0, 0.0));
@@ -30727,6 +30917,16 @@ struct App {
     /// sub-window rather than growing/shrinking with the canvas area; a
     /// real, separate follow-on fix, not new scope this field invents.
     residency: Option<aurora_gpu::TileResidency>,
+    /// The zoomed-out view's atlas (0.275.0, `zoomed_view`), built on the
+    /// first frame below the 1:1 atlas floor, with the viewport it was
+    /// sized for; `zoomed_key` is the (composite cache id, canvas size,
+    /// level) its slots were filled for, and any change forgets them.
+    zoomed_residency: Option<(aurora_gpu::TileResidency, (u32, u32))>,
+    zoomed_key: Option<(u64, (u32, u32), u32)>,
+    /// The last frame drew the zoomed-out atlas: the next 1:1 frame must
+    /// forget the canvas atlas's slots, because the zoomed-out atlas
+    /// consumed the composite tiles' dirty flags at level 0.
+    zoomed_drawn: bool,
     /// The render pipeline that draws `residency`'s own atlas to the
     /// screen (`aurora_gpu::CanvasPipeline`) — built alongside
     /// `residency`, `None` under the same conditions.
@@ -31301,6 +31501,9 @@ impl App {
             layer_rows,
             scroll_follow: ScrollFollow::default(),
             residency: None,
+            zoomed_residency: None,
+            zoomed_key: None,
+            zoomed_drawn: false,
             canvas_pipeline: None,
             compositor: None,
             path_pipeline: None,
@@ -31753,6 +31956,7 @@ impl App {
                 self.run_layer_command(LayerCommand::SetClip(on));
             }
             Some(ActivatedCommand::SwapColours) => self.swap_colours(),
+            Some(ActivatedCommand::ViewZoom(command)) => self.apply_view_zoom(command),
             Some(ActivatedCommand::ResetColours) => self.reset_colours(),
             Some(ActivatedCommand::Selection(command)) => self.run_selection_command(command),
             Some(ActivatedCommand::ToggleQuickMask) => self.toggle_quick_mask(),
@@ -35823,6 +36027,21 @@ impl App {
 
     /// Swap Foreground and Background (0.208.0): `X`, the palette, the
     /// swap button.
+    /// Fit on Screen or 100% (0.275.0, `zoomed_view::apply_view_zoom`).
+    fn apply_view_zoom(&mut self, command: zoomed_view::ViewZoom) {
+        let Some(canvas) = canvas_area_logical_size(&self.workspace) else {
+            return;
+        };
+        zoomed_view::apply_view_zoom(
+            &mut self.doc.canvas_view,
+            command,
+            canvas,
+            self.doc.canvas_size,
+            guarded_scale_factor(self.scale_factor),
+        );
+        self.needs_redraw = true;
+    }
+
     fn swap_colours(&mut self) {
         let effect = self.colour.swap(&mut self.workspace);
         self.apply_colour_effect(effect);
@@ -37139,7 +37358,11 @@ impl App {
                 &mut self.doc.canvas_view,
                 self.drag.as_mut(),
                 pointer,
-                canvas_min_zoom(canvas_size, self.scale_factor),
+                canvas_min_zoom_within(
+                    canvas_size,
+                    self.scale_factor,
+                    texture_limit(self.gpu.as_ref()),
+                ),
                 bounds,
             );
             if gpu_target_needs_resize(self.residency_viewport, canvas_size)
@@ -37386,6 +37609,92 @@ impl App {
     /// Both halves were fixed together; see
     /// `composite_roots_into_tile`'s own doc comment and that shader's
     /// own comment.
+    /// The zoomed-out half of a frame (0.275.0, `zoomed_view`): when the
+    /// view's physical zoom is below the 1:1 atlas floor, sizes the
+    /// zoomed-out atlas, advances the pyramid under the frame's budgets,
+    /// uploads the shown level and returns the frame's geometry; `None`
+    /// (nothing touched) at or above the floor.
+    fn prepare_zoomed_frame(&mut self, gpu: &GpuContext) -> Option<zoomed_view::ZoomedFrame> {
+        let canvas_px = canvas_area_physical_size(&self.workspace, self.scale_factor)?;
+        let zoom = effective_residency_zoom(self.doc.canvas_view.zoom(), self.scale_factor);
+        let limit = gpu.device().limits().max_texture_dimension_2d;
+        if zoom >= zoomed_view::atlas_floor(canvas_px, limit) {
+            return None;
+        }
+        let store = self.doc.tile_store.as_mut()?;
+        let anchor = active_layer_origin(&self.doc.layers, self.doc.active_layer);
+        let frame = zoomed_view::plan(
+            canvas_local_origin(&self.doc.canvas_view, anchor),
+            zoom,
+            canvas_px,
+            self.doc.canvas_size,
+            zoomed_view::zoomed_floor(canvas_px, limit),
+        );
+        let fresh = !matches!(&self.zoomed_residency, Some((_, size)) if *size == canvas_px);
+        if fresh {
+            self.zoomed_residency = Some((
+                aurora_gpu::TileResidency::with_coverage(
+                    gpu.device(),
+                    gpu.queue(),
+                    canvas_px,
+                    zoomed_view::COVERAGE,
+                ),
+                canvas_px,
+            ));
+        }
+        let (atlas, _) = self.zoomed_residency.as_mut()?;
+        let key = (
+            self.doc.composite_cache.id(),
+            self.doc.canvas_size,
+            frame.level,
+        );
+        if fresh || self.zoomed_key != Some(key) || !self.zoomed_drawn {
+            atlas.forget_slots();
+            self.zoomed_key = Some(key);
+        }
+        atlas.set_channel_gain(self.doc.channel_view.gain());
+        atlas.set_document_clip(Some(frame.doc_clip));
+        atlas.set_origin(
+            gpu.queue(),
+            frame.level_origin,
+            frame.viewport_px,
+            frame.level_zoom,
+        );
+        let gpu_path =
+            document_qualifies_for_gpu_compositing(&self.doc.layers) && self.compositor.is_some();
+        let level0 = match self.composite_worker.as_mut() {
+            Some(worker) if !gpu_path => zoomed_view::Level0::Worker(worker),
+            _ => zoomed_view::Level0::Sync(Some(gpu), self.compositor.as_mut()),
+        };
+        let advance = zoomed_view::advance(
+            frame.level,
+            &frame.visible,
+            self.doc.canvas_size,
+            &self.doc.layers,
+            self.doc.active_layer,
+            store,
+            &mut self.doc.composite_cache,
+            level0,
+            zoomed_view::PYRAMID_FRAME_BUDGET,
+        );
+        if advance.more {
+            self.needs_redraw = true;
+        }
+        let _ = atlas.sync_only(
+            gpu.queue(),
+            store,
+            zoomed_view::level_surface(frame.level),
+            usize::MAX,
+            &frame.visible,
+        );
+        // At once, not when the frame is drawn (task 136 review, ZV-2): the
+        // upload consumed the composite tiles' dirty flags at level 0, so
+        // even a frame whose surface texture never arrives must make the
+        // next 1:1 frame forget the canvas atlas's slots.
+        self.zoomed_drawn = true;
+        Some(frame)
+    }
+
     // One linear per-frame flow (build widget paints, sync the canvas
     // atlas, one shared render pass drawing both) -- splitting further
     // would just relocate lines across more functions without reducing
@@ -37423,12 +37732,22 @@ impl App {
                 self.doc.active_layer,
                 canvas_area_logical_size(&self.workspace),
             );
+            let limit = texture_limit(self.gpu.as_ref());
             apply_canvas_min_zoom(
                 &mut self.doc.canvas_view,
                 self.drag.as_mut(),
                 pointer,
-                canvas_min_zoom(canvas_size, self.scale_factor),
+                canvas_min_zoom_within(canvas_size, self.scale_factor, limit),
                 bounds,
+            );
+            apply_zoomed_out_centring(
+                &mut self.doc.canvas_view,
+                self.drag.as_mut(),
+                pointer,
+                zoomed_view::atlas_floor(canvas_size, limit),
+                canvas_area_logical_size(&self.workspace),
+                self.doc.canvas_size,
+                self.scale_factor,
             );
         }
         // 0.162.0: after the zoom floor above (which can move the zoom),
@@ -37452,6 +37771,21 @@ impl App {
         self.sync_quick_mask_tint_now();
         // 0.227.0: the Crop tool's shield beneath the outline.
         self.sync_crop_shield_now();
+        // 0.275.0: the zoomed-out view's pyramid work and upload, before
+        // the surface is borrowed (it needs `&mut self`); `None` at or
+        // above the 1:1 atlas floor, where the frame is exactly as before.
+        let zoomed_frame = match self.gpu.take() {
+            Some(gpu) => {
+                let frame = if self.surface.is_some() {
+                    self.prepare_zoomed_frame(&gpu)
+                } else {
+                    None
+                };
+                self.gpu = Some(gpu);
+                frame
+            }
+            None => None,
+        };
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
         };
@@ -37505,7 +37839,12 @@ impl App {
 
                 // Sync before drawing, so this frame shows the latest
                 // painted pixels rather than lagging one frame behind.
-                if let Some(residency) = self.residency.as_mut() {
+                if zoomed_frame.is_some() {
+                    self.zoomed_drawn = true;
+                } else if let Some(residency) = self.residency.as_mut() {
+                    if std::mem::take(&mut self.zoomed_drawn) {
+                        residency.forget_slots();
+                    }
                     if let Some(canvas_size) =
                         canvas_area_physical_size(&self.workspace, self.scale_factor)
                     {
@@ -37573,17 +37912,20 @@ impl App {
                     let viewport = canvas_area_physical_rect(&self.workspace, self.scale_factor);
                     let scissor =
                         viewport.and_then(|rect| clamp_canvas_to_surface(rect, surface.size()));
+                    let (atlas, viewport) = match zoomed_frame.as_ref() {
+                        Some(frame) => (
+                            self.zoomed_residency.as_ref().map(|(atlas, _)| atlas),
+                            viewport.map(|rect| zoomed_view_rect(rect, frame)),
+                        ),
+                        None => (self.residency.as_ref(), viewport),
+                    };
                     if let (
                         Some(residency),
                         Some(canvas_pipeline),
                         Some((x, y, w, h)),
                         Some(clip),
-                    ) = (
-                        self.residency.as_ref(),
-                        self.canvas_pipeline.as_mut(),
-                        viewport,
-                        scissor,
-                    ) {
+                    ) = (atlas, self.canvas_pipeline.as_mut(), viewport, scissor)
+                    {
                         let bind_group = canvas_pipeline.bind_group(gpu.device(), residency);
                         let pipeline = canvas_pipeline.pipeline(gpu.device(), surface.format());
                         // The viewport keeps the canvas area's own rect, so
@@ -43288,6 +43630,7 @@ mod tests {
     mod psd_effects_write_tests;
     mod psd_five_adjust_tests;
     mod psd_grey_exposure_tests;
+    mod zoomed_frame_tests;
 
     fn near(actual: [f32; 4], expected: [f32; 4]) -> bool {
         actual
@@ -72999,7 +73342,7 @@ mod tests {
         for (canvas, scale_factor) in CANVAS_CASES {
             let floor = canvas_min_zoom(canvas, scale_factor);
             let passed = effective_residency_zoom(floor, scale_factor);
-            let rendered = aurora_gpu::TileResidency::effective_zoom(canvas, passed);
+            let rendered = crate::zoomed_view::rendered_canvas_zoom(canvas, passed);
             assert!(
                 (rendered - passed).abs() <= f32::EPSILON * passed,
                 "canvas {canvas:?} at scale factor {scale_factor}: the view's \
@@ -73029,7 +73372,7 @@ mod tests {
 
                 let layer_origin = (300.0, 150.0);
                 let doc_origin = canvas_local_origin(&view, layer_origin);
-                let rendered_zoom = aurora_gpu::TileResidency::effective_zoom(
+                let rendered_zoom = crate::zoomed_view::rendered_canvas_zoom(
                     canvas,
                     effective_residency_zoom(view.zoom(), scale_factor),
                 );
@@ -73099,6 +73442,8 @@ mod tests {
         let mut view = CanvasView::new();
         view.zoom_at((0.0, 0.0), 0.25);
         let doc_origin = canvas_local_origin(&view, (0.0, 0.0));
+        // The 1:1 atlas alone (0.275.0): it is what would draw this view
+        // without the zoomed-out view, and it still clamps.
         let rendered_zoom = aurora_gpu::TileResidency::effective_zoom(
             canvas,
             effective_residency_zoom(view.zoom(), 1.0),
@@ -73166,7 +73511,7 @@ mod tests {
             view.zoom_at((0.0, 0.0), aurora_ui::canvas_view::MIN_ZOOM);
 
             let doc_origin = canvas_local_origin(&view, (0.0, 0.0));
-            let rendered_zoom = aurora_gpu::TileResidency::effective_zoom(
+            let rendered_zoom = crate::zoomed_view::rendered_canvas_zoom(
                 canvas,
                 effective_residency_zoom(view.zoom(), scale_factor),
             );
@@ -73229,9 +73574,13 @@ mod tests {
         let mut corrected = 0_u32;
         for width in [1280_u32, 1366, 1440, 1600, 1920, 2560, 3440, 3840] {
             for height in [720_u32, 768, 800, 900, 1080, 1440, 1600, 2160] {
-                for scale_factor in [1.0_f64, 1.25, 1.5, 1.75, 2.0, 2.25, 3.0] {
+                // 1.45 and 1.7: the scale factors at which 1/32 (the
+                // floor since 0.275.0) needs the correction.
+                for scale_factor in [1.0_f64, 1.25, 1.45, 1.5, 1.7, 1.75, 2.0, 2.25, 3.0] {
                     let canvas = (width, height);
-                    let atlas_floor = aurora_gpu::TileResidency::min_zoom_for_viewport(canvas);
+                    // 0.275.0: the floor the round trip must reach is the
+                    // zoomed-out view's, the atlas that draws there.
+                    let atlas_floor = crate::zoomed_view::MIN_PHYSICAL_ZOOM;
                     let min_zoom = canvas_min_zoom(canvas, scale_factor);
                     let round_trip = effective_residency_zoom(min_zoom, scale_factor);
                     assert!(
@@ -76877,7 +77226,11 @@ mod tests {
     /// pointer rests on a panel.
     #[test]
     fn raising_the_zoom_floor_re_anchors_the_stroke_with_the_pointer_off_canvas() {
-        let floor = canvas_min_zoom((1920, 1080), 1.0);
+        // A floor that genuinely rises: the 1:1 atlas's (since 0.275.0
+        // the canvas floor is the zoomed-out view's 1/32, which these
+        // setups' zooms are already above; the re-anchoring under test
+        // is the same for any raise).
+        let floor = aurora_gpu::TileResidency::min_zoom_for_viewport((1920, 1080));
         let pointer = (400.0, 300.0);
         let mut view = CanvasView::new();
         view.zoom_at((0.0, 0.0), 0.25);
@@ -77164,7 +77517,11 @@ mod tests {
     /// it costs; part (b) is the same raise with the live drag passed.
     #[test]
     fn resizing_mid_stroke_re_anchors_the_stroke_instead_of_painting_a_line_never_drawn() {
-        let floor = canvas_min_zoom((1920, 1080), 1.0);
+        // A floor that genuinely rises: the 1:1 atlas's (since 0.275.0
+        // the canvas floor is the zoomed-out view's 1/32, which these
+        // setups' zooms are already above; the re-anchoring under test
+        // is the same for any raise).
+        let floor = aurora_gpu::TileResidency::min_zoom_for_viewport((1920, 1080));
         let pointer = (400.0, 300.0);
         // A view below the floor is exactly what a freshly opened
         // document plus a zoom-out leaves behind, until the next
@@ -77336,7 +77693,11 @@ mod tests {
     /// amount; measuring at the anchor would correct by nothing at all.
     #[test]
     fn raising_the_zoom_floor_shifts_to_document_by_a_different_amount_at_every_point() {
-        let floor = canvas_min_zoom((1920, 1080), 1.0);
+        // A floor that genuinely rises: the 1:1 atlas's (since 0.275.0
+        // the canvas floor is the zoomed-out view's 1/32, which these
+        // setups' zooms are already above; the re-anchoring under test
+        // is the same for any raise).
+        let floor = aurora_gpu::TileResidency::min_zoom_for_viewport((1920, 1080));
         let mut view = CanvasView::new();
         view.zoom_at((0.0, 0.0), 0.25);
         // A non-zero pan too: the identity is not an artefact of the

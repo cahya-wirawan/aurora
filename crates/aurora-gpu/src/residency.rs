@@ -994,6 +994,12 @@ pub struct TileResidency {
     /// hidden. A view setting only -- nothing stored is touched. See
     /// [`Self::set_channel_gain`].
     channel_gain: [f32; 3],
+    /// How many viewports per axis the atlas covers at zoom 1 (1 for the
+    /// canvas's own atlas; 2 for the zoomed-out view's, see
+    /// [`Self::with_coverage`]).
+    coverage: u32,
+    /// Mip levels the texture has (the canvas atlas keeps its four).
+    mip_levels: u32,
 }
 
 impl TileResidency {
@@ -1042,7 +1048,46 @@ impl TileResidency {
     /// exactly), and establishes an initial origin of `(0, 0)`.
     #[must_use]
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, viewport_px: (u32, u32)) -> Self {
-        let grid = Self::grid_for(viewport_px);
+        Self::with_coverage(device, queue, viewport_px, 1)
+    }
+
+    /// The largest [`Self::with_coverage`] factor accepted.
+    pub const MAX_COVERAGE: u32 = 4;
+
+    /// An atlas covering `coverage` viewports per axis at zoom 1 (clamped
+    /// to `1..=`[`Self::MAX_COVERAGE`]), so it can render down to about
+    /// `1 / coverage` of the 1:1 zoom without fabricating content: the
+    /// zoom floor ([`Self::min_zoom_for_viewport_with_coverage`]) is
+    /// derived from its grid exactly as [`Self::min_zoom_for_viewport`]
+    /// is from the canvas atlas's. `coverage == 1` is [`Self::new`]
+    /// exactly (same grid, same four mip levels, same uniform).
+    ///
+    /// The zoomed-out view (`aurora-app`) uses `coverage == 2` to show a
+    /// pyramid level at a zoom in `(0.5, 1]` of that level. Such an atlas
+    /// has one mip level only (the levels it shows come from the
+    /// document's composite pyramid, not from this texture's chain), so
+    /// [`Self::upload_mip`] refuses any level above 0 on it.
+    #[must_use]
+    pub fn with_coverage(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        viewport_px: (u32, u32),
+        coverage: u32,
+    ) -> Self {
+        let coverage = coverage.clamp(1, Self::MAX_COVERAGE);
+        let mip_levels = if coverage == 1 { MIP_LEVELS } else { 1 };
+        // Never larger than the device can allocate (task 136 review,
+        // ZV-1): wgpu's default limits allow 8192 texels a side, which a
+        // double-coverage atlas passes from a canvas area of about 3,968
+        // physical pixels and the canvas atlas from about 7,936. The floor
+        // (`min_zoom_for_viewport_within`, `rendered_zoom_value_c`) is
+        // derived from this real grid, so a capped atlas renders a higher
+        // floor rather than fabricating or failing.
+        let grid = Self::grid_for_coverage_within(
+            viewport_px,
+            coverage,
+            device.limits().max_texture_dimension_2d,
+        );
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tile-residency"),
             size: wgpu::Extent3d {
@@ -1054,7 +1099,7 @@ impl TileResidency {
                 height: grid.1.saturating_mul(TILE),
                 depth_or_array_layers: 1,
             },
-            mip_level_count: MIP_LEVELS,
+            mip_level_count: mip_levels,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
@@ -1122,6 +1167,8 @@ impl TileResidency {
             sub_tile: (0.0, 0.0),
             doc_clip: None,
             channel_gain: FULL_GAIN,
+            coverage,
+            mip_levels,
         };
         residency.write_uniform(queue, viewport_px, 1.0);
         residency
@@ -1331,7 +1378,7 @@ impl TileResidency {
         let sub_tile = self.sub_tile;
         let doc_clip = self.doc_clip;
         let channel_gain = self.channel_gain;
-        *self = Self::new(device, queue, viewport_px);
+        *self = Self::with_coverage(device, queue, viewport_px, self.coverage);
         self.origin = origin;
         self.sub_tile = sub_tile;
         self.doc_clip = doc_clip;
@@ -1381,10 +1428,38 @@ impl TileResidency {
     /// inconsistency, not a judgement call. Saturating leaves
     /// [`Self::zoom_floor`] computing `viewport / (u32::MAX - TILE)` ≈
     /// 1.0 — a sane, conservative floor, not garbage.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn grid_for(viewport_px: (u32, u32)) -> (u32, u32) {
+        Self::grid_for_coverage(viewport_px, 1)
+    }
+
+    /// [`Self::grid_for`] for an atlas covering `coverage` viewports per
+    /// axis: the viewport multiplied first (saturating), then the same
+    /// formula, so `coverage == 1` is `grid_for` exactly.
+    /// [`Self::grid_for_coverage`] capped so neither side of the texture
+    /// exceeds `max_dimension` texels (at least one tile).
+    fn grid_for_coverage_within(
+        viewport_px: (u32, u32),
+        coverage: u32,
+        max_dimension: u32,
+    ) -> (u32, u32) {
+        let cap = (max_dimension / TILE).max(1);
+        let grid = Self::grid_for_coverage(viewport_px, coverage);
+        (grid.0.min(cap), grid.1.min(cap))
+    }
+
+    fn grid_for_coverage(viewport_px: (u32, u32), coverage: u32) -> (u32, u32) {
         (
-            viewport_px.0.div_ceil(TILE).saturating_add(1),
-            viewport_px.1.div_ceil(TILE).saturating_add(1),
+            viewport_px
+                .0
+                .saturating_mul(coverage)
+                .div_ceil(TILE)
+                .saturating_add(1),
+            viewport_px
+                .1
+                .saturating_mul(coverage)
+                .div_ceil(TILE)
+                .saturating_add(1),
         )
     }
 
@@ -1473,7 +1548,33 @@ impl TileResidency {
     /// both M1.3 work, both larger than a bug fix.
     #[must_use]
     pub fn min_zoom_for_viewport(viewport_px: (u32, u32)) -> f32 {
-        let grid = Self::grid_for(viewport_px);
+        Self::min_zoom_for_viewport_with_coverage(viewport_px, 1)
+    }
+
+    /// [`Self::min_zoom_for_viewport`] for an atlas built by
+    /// [`Self::with_coverage`] with `coverage` (clamped the same way).
+    /// For `coverage == 2` it is at most 0.5 for every viewport at least
+    /// one tile across, which is what lets the zoomed-out view show a
+    /// pyramid level at any zoom in `(0.5, 1]` of it.
+    #[must_use]
+    pub fn min_zoom_for_viewport_with_coverage(viewport_px: (u32, u32), coverage: u32) -> f32 {
+        Self::min_zoom_for_viewport_within(viewport_px, coverage, u32::MAX)
+    }
+
+    /// The zoom floor of an atlas built by [`Self::with_coverage`] on a
+    /// device whose `max_texture_dimension_2d` is `max_dimension`: the
+    /// atlas's grid is capped to that size, and this is the floor of the
+    /// capped grid (above 1.0 for a canvas area wider than the device's
+    /// largest texture less a tile). Equal to
+    /// [`Self::min_zoom_for_viewport_with_coverage`] whenever the grid fits.
+    #[must_use]
+    pub fn min_zoom_for_viewport_within(
+        viewport_px: (u32, u32),
+        coverage: u32,
+        max_dimension: u32,
+    ) -> f32 {
+        let coverage = coverage.clamp(1, Self::MAX_COVERAGE);
+        let grid = Self::grid_for_coverage_within(viewport_px, coverage, max_dimension);
         Self::zoom_floor(
             viewport_px,
             grid.0.saturating_mul(TILE) as f32,
@@ -1494,6 +1595,16 @@ impl TileResidency {
     #[must_use]
     pub fn effective_zoom(viewport_px: (u32, u32), zoom: f32) -> f32 {
         Self::guard_zoom(zoom).max(Self::min_zoom_for_viewport(viewport_px))
+    }
+
+    /// [`Self::effective_zoom`] for an atlas of `coverage`
+    /// ([`Self::with_coverage`]).
+    #[must_use]
+    pub fn effective_zoom_with_coverage(viewport_px: (u32, u32), zoom: f32, coverage: u32) -> f32 {
+        Self::guard_zoom(zoom).max(Self::min_zoom_for_viewport_with_coverage(
+            viewport_px,
+            coverage,
+        ))
     }
 
     /// Defensive, not decorative. [`Self::uniform_values`] divides by
@@ -1556,12 +1667,25 @@ impl TileResidency {
     /// asserts that implication directly rather than leaving it to a
     /// clamp that would then be both untested and, if it ever did fire,
     /// pan-dependent again.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn uniform_values(
         grid: (u32, u32),
         origin: TileId,
         sub_tile: (f32, f32),
         viewport_px: (u32, u32),
         zoom: f32,
+    ) -> [f32; 4] {
+        Self::uniform_values_c(grid, origin, sub_tile, viewport_px, zoom, 1)
+    }
+
+    /// [`Self::uniform_values`] for an atlas of `coverage`.
+    fn uniform_values_c(
+        grid: (u32, u32),
+        origin: TileId,
+        sub_tile: (f32, f32),
+        viewport_px: (u32, u32),
+        zoom: f32,
+        coverage: u32,
     ) -> [f32; 4] {
         let tex_w = grid.0.saturating_mul(TILE) as f32;
         let tex_h = grid.1.saturating_mul(TILE) as f32;
@@ -1579,7 +1703,7 @@ impl TileResidency {
         // `saturating_add`, but re-deriving `tex_w`/`tex_h` from them is
         // still a `u32` multiply and must not reintroduce the overflow
         // panic those two functions exist to close.
-        let zoom = Self::rendered_zoom_value(grid, viewport_px, zoom);
+        let zoom = Self::rendered_zoom_value_c(grid, viewport_px, zoom, coverage);
         // Absolute scroll (origin in texels, a genuinely fractional
         // position -- `origin * TILE` plus the sub-tile remainder), then
         // wrapped into [0, tex_w)/[0, tex_h) for the repeat sampler --
@@ -1611,8 +1735,19 @@ impl TileResidency {
 
     /// The zoom `uniform_values` actually renders at: the caller's, made
     /// sane by [`Self::guard_zoom`] and raised to the atlas's floor.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn rendered_zoom_value(grid: (u32, u32), viewport_px: (u32, u32), zoom: f32) -> f32 {
-        let capped = Self::grid_for(viewport_px);
+        Self::rendered_zoom_value_c(grid, viewport_px, zoom, 1)
+    }
+
+    /// [`Self::rendered_zoom_value`] for an atlas of `coverage`.
+    fn rendered_zoom_value_c(
+        grid: (u32, u32),
+        viewport_px: (u32, u32),
+        zoom: f32,
+        coverage: u32,
+    ) -> f32 {
+        let capped = Self::grid_for_coverage(viewport_px, coverage);
         let floor = Self::zoom_floor(
             viewport_px,
             grid.0.min(capped.0).saturating_mul(TILE) as f32,
@@ -1628,6 +1763,7 @@ impl TileResidency {
     /// unwrapped top-left (`origin * TILE + sub_tile`) -- the inverse of
     /// the `uv` mapping `uniform_values` writes. `None` is [`NO_CLIP`];
     /// a non-finite rectangle collapses to an empty one that clips all.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn clip_values(
         grid: (u32, u32),
         origin: TileId,
@@ -1635,6 +1771,20 @@ impl TileResidency {
         viewport_px: (u32, u32),
         zoom: f32,
         rect: Option<(f32, f32, f32, f32)>,
+    ) -> [f32; 4] {
+        Self::clip_values_c(grid, origin, sub_tile, viewport_px, zoom, rect, 1)
+    }
+
+    /// [`Self::clip_values`] for an atlas of `coverage`.
+    #[allow(clippy::too_many_arguments)]
+    fn clip_values_c(
+        grid: (u32, u32),
+        origin: TileId,
+        sub_tile: (f32, f32),
+        viewport_px: (u32, u32),
+        zoom: f32,
+        rect: Option<(f32, f32, f32, f32)>,
+        coverage: u32,
     ) -> [f32; 4] {
         let Some((x0, y0, x1, y1)) = rect else {
             return NO_CLIP;
@@ -1645,7 +1795,7 @@ impl TileResidency {
         {
             return [0.0, 0.0, 0.0, 0.0];
         }
-        let zoom = Self::rendered_zoom_value(grid, viewport_px, zoom);
+        let zoom = Self::rendered_zoom_value_c(grid, viewport_px, zoom, coverage);
         let scroll = (
             (origin.x * TILE) as f32 + sub_tile.0,
             (origin.y * TILE) as f32 + sub_tile.1,
@@ -1660,14 +1810,22 @@ impl TileResidency {
     }
 
     fn write_uniform(&self, queue: &wgpu::Queue, viewport_px: (u32, u32), zoom: f32) {
-        let values = Self::uniform_values(self.grid, self.origin, self.sub_tile, viewport_px, zoom);
-        let clip = Self::clip_values(
+        let values = Self::uniform_values_c(
+            self.grid,
+            self.origin,
+            self.sub_tile,
+            viewport_px,
+            zoom,
+            self.coverage,
+        );
+        let clip = Self::clip_values_c(
             self.grid,
             self.origin,
             self.sub_tile,
             viewport_px,
             zoom,
             self.doc_clip,
+            self.coverage,
         );
         let [gain_r, gain_g, gain_b] = self.channel_gain;
         let mut bytes = Vec::with_capacity(UNIFORM_SIZE as usize);
@@ -1717,6 +1875,45 @@ impl TileResidency {
         force: bool,
         byte_budget: usize,
     ) -> SyncStats {
+        let ids: Vec<TileId> = self.visible_tiles().collect();
+        self.sync_ids(queue, store, surface, force, byte_budget, &ids)
+    }
+
+    /// [`Self::sync`] restricted to `tiles` (those of them inside the
+    /// atlas's current window; the rest are ignored), in the order given.
+    /// The zoomed-out view (`aurora-app`) uploads only the tiles its frame
+    /// shows, plus the ring its bilinear filter can reach, instead of the
+    /// whole double-coverage grid, so a level change costs the tiles on
+    /// screen and not the grid. A slot not uploaded keeps whatever it held,
+    /// so the caller must only ever sample the tiles it passes.
+    pub fn sync_only(
+        &mut self,
+        queue: &wgpu::Queue,
+        store: &mut TileStore,
+        surface: SurfaceId,
+        byte_budget: usize,
+        tiles: &[TileId],
+    ) -> SyncStats {
+        let (origin, grid) = (self.origin, self.grid);
+        let inside = |id: &TileId| {
+            id.x >= origin.x
+                && id.y >= origin.y
+                && id.x - origin.x < grid.0
+                && id.y - origin.y < grid.1
+        };
+        let ids: Vec<TileId> = tiles.iter().copied().filter(inside).collect();
+        self.sync_ids(queue, store, surface, false, byte_budget, &ids)
+    }
+
+    fn sync_ids(
+        &mut self,
+        queue: &wgpu::Queue,
+        store: &mut TileStore,
+        surface: SurfaceId,
+        force: bool,
+        byte_budget: usize,
+        ids: &[TileId],
+    ) -> SyncStats {
         let mut stats = SyncStats::default();
         let mut bytes_left = byte_budget;
         // *One* buffer, reused across every tile this call uploads, and
@@ -1738,208 +1935,202 @@ impl TileResidency {
         // short tile would upload its own bytes followed by the tail of the
         // previous tile's.
         let mut bytes: Vec<u8> = vec![0u8; TILE_BYTES];
-        for gy in 0..self.grid.1 {
-            for gx in 0..self.grid.0 {
-                let id = TileId {
-                    x: self.origin.x + gx,
-                    y: self.origin.y + gy,
-                };
-                let slot = (id.x % self.grid.0, id.y % self.grid.1);
-                let resident = self.slots.get(&slot) == Some(&id);
-                // Peeked, not taken (0.68.7). Until then this was
-                // `take_dirty`, three lines above a budget check that can
-                // `continue` -- so a tile the budget skipped had already
-                // had its dirty flag consumed and was silently never
-                // uploaded on a later frame either, until some unrelated
-                // edit marked it dirty afresh. The flag is now consumed
-                // only once this loop has committed to uploading.
-                let dirty = store.is_dirty(surface, id);
-                if !force && resident && !dirty {
-                    continue;
-                }
-                if bytes_left < TILE_BYTES {
-                    stats.remaining += 1;
-                    continue;
-                }
-                // Committed: the budget is there and the tile is about to
-                // be read and written. Consuming it before `get` rather
-                // than after is deliberate -- `get` borrows `store`
-                // immutably for the rest of the iteration.
-                //
-                // **What makes that ordering safe is the `Err` arm's
-                // `self.slots.remove(&slot)`, not the store's own
-                // residency.** The resident check above is against
-                // `self.slots` -- this atlas's slot mapping -- and not
-                // against `store`, so a `get` that fails after this line
-                // has consumed the dirty record leaves nothing else that
-                // remembers an upload is owed: the slot would still map to
-                // `id`, read as resident on the next call, and the tile
-                // would be skipped for the life of the mapping, silently,
-                // with `SyncStats` reporting `errors: 0, remaining: 0`.
-                // Dropping the mapping is what turns that into a retry.
-                //
-                // This became load-bearing in `aurora-tile` 0.91.0: before
-                // it, `is_dirty` could only be `true` for a *resident*
-                // tile, and a resident tile's `get` cannot fail the way a
-                // page-in can, so the failure path was unreachable for a
-                // dirty tile. It is reachable now (a scratch-disk read
-                // error, or the store dropping a failed write's file), so
-                // the ordering needs the slot invalidation to stay sound.
-                let _ = store.take_dirty(surface, id);
-                let tile = match store.get(surface, id) {
-                    Ok(tile) => tile,
-                    Err(err) => {
-                        // One bad tile shouldn't abort uploading the
-                        // rest of the visible grid this frame; there is
-                        // nothing more localized to retry against here.
-                        // Still needs a real upload attempt later, same
-                        // as a budget-skipped tile.
-                        //
-                        // And this line is what makes that later attempt
-                        // actually happen -- see the comment above the
-                        // `take_dirty` call for why nothing else would.
-                        // `slot` was derived from `id`, but by the time this
-                        // runs the map might hold a *different* id at that
-                        // same slot (panning can revisit a slot before this
-                        // tile does). Removing it is still safe either way:
-                        // if it still mapped `slot` to `id`, this is exactly
-                        // the invalidation this whole comment is about; if it
-                        // had already moved on to some other id, dropping
-                        // that entry costs at worst one redundant re-upload
-                        // of that other id later -- never a skipped one.
-                        self.slots.remove(&slot);
-                        // A cost worth naming, not just a mechanism: for a
-                        // tile that fails every time (a permanently corrupt
-                        // scratch file, or one `cap_failed_writes` already
-                        // dropped), this is no longer "retried once, then
-                        // silently skipped" -- it is "retried, and warned
-                        // about, every single frame, forever." Harmless
-                        // today because the only real caller
-                        // (`aurora-app`'s `redraw`) discards this
-                        // `SyncStats` outright, but a future caller that
-                        // honors `remaining != 0` as "request another
-                        // frame" would spin indefinitely on this tile.
-                        tracing::warn!(?id, %err, "skipping tile for this frame's upload");
-                        stats.remaining += 1;
-                        stats.errors += 1;
-                        continue;
-                    }
-                };
-                // A whole tile, or nothing. `TileStore` hands back
-                // `SAMPLES` samples for every tile it has, so this is not
-                // expected to fire -- it is what makes the reused,
-                // pre-sized `bytes` buffer above sound rather than merely
-                // probably-sound. A short tile would leave the tail of the
-                // *previous* tile's bytes in the buffer and upload them as
-                // if they were this tile's. Handled exactly like the `get`
-                // failure above, and for the same reason: drop the slot
-                // mapping so the tile is retried instead of silently
-                // sticking as resident-but-never-uploaded.
-                //
-                // **This guard is defensive and, as of 0.96.1, provably
-                // unreachable through any current API, which is why it has
-                // no test** -- disclosed rather than left as a silent
-                // coverage gap. `aurora_tile::Tile`'s only non-blank
-                // constructor, `Tile::from_texels`, is `pub(crate)`, so no
-                // code outside `aurora-tile` (this crate and its tests
-                // included) can build a wrong-length tile at all;
-                // `Tile::blank()` is `SAMPLES` by construction and
-                // `texels_mut()` hands out a `&mut [f16]`, which cannot
-                // resize. Inside `aurora-tile`, both `from_texels` call
-                // sites are fed by `codec::decode`, whose own exact-length
-                // check `a_truncated_scratch_file_pages_in_as_an_error_not_a_short_tile`
-                // pins. Kept anyway, because it is a length compare per
-                // tile against a half-megabyte memcpy: cheap insurance
-                // against a future `aurora-tile` change (a public
-                // `from_texels`, a variable tile size) reintroducing the
-                // possibility, and the cost of being wrong here is a
-                // corrupted upload of another tile's pixels rather than an
-                // error.
-                if tile.texels().len() != SAMPLES {
+        for &id in ids {
+            let slot = (id.x % self.grid.0, id.y % self.grid.1);
+            let resident = self.slots.get(&slot) == Some(&id);
+            // Peeked, not taken (0.68.7). Until then this was
+            // `take_dirty`, three lines above a budget check that can
+            // `continue` -- so a tile the budget skipped had already
+            // had its dirty flag consumed and was silently never
+            // uploaded on a later frame either, until some unrelated
+            // edit marked it dirty afresh. The flag is now consumed
+            // only once this loop has committed to uploading.
+            let dirty = store.is_dirty(surface, id);
+            if !force && resident && !dirty {
+                continue;
+            }
+            if bytes_left < TILE_BYTES {
+                stats.remaining += 1;
+                continue;
+            }
+            // Committed: the budget is there and the tile is about to
+            // be read and written. Consuming it before `get` rather
+            // than after is deliberate -- `get` borrows `store`
+            // immutably for the rest of the iteration.
+            //
+            // **What makes that ordering safe is the `Err` arm's
+            // `self.slots.remove(&slot)`, not the store's own
+            // residency.** The resident check above is against
+            // `self.slots` -- this atlas's slot mapping -- and not
+            // against `store`, so a `get` that fails after this line
+            // has consumed the dirty record leaves nothing else that
+            // remembers an upload is owed: the slot would still map to
+            // `id`, read as resident on the next call, and the tile
+            // would be skipped for the life of the mapping, silently,
+            // with `SyncStats` reporting `errors: 0, remaining: 0`.
+            // Dropping the mapping is what turns that into a retry.
+            //
+            // This became load-bearing in `aurora-tile` 0.91.0: before
+            // it, `is_dirty` could only be `true` for a *resident*
+            // tile, and a resident tile's `get` cannot fail the way a
+            // page-in can, so the failure path was unreachable for a
+            // dirty tile. It is reachable now (a scratch-disk read
+            // error, or the store dropping a failed write's file), so
+            // the ordering needs the slot invalidation to stay sound.
+            let _ = store.take_dirty(surface, id);
+            let tile = match store.get(surface, id) {
+                Ok(tile) => tile,
+                Err(err) => {
+                    // One bad tile shouldn't abort uploading the
+                    // rest of the visible grid this frame; there is
+                    // nothing more localized to retry against here.
+                    // Still needs a real upload attempt later, same
+                    // as a budget-skipped tile.
+                    //
+                    // And this line is what makes that later attempt
+                    // actually happen -- see the comment above the
+                    // `take_dirty` call for why nothing else would.
+                    // `slot` was derived from `id`, but by the time this
+                    // runs the map might hold a *different* id at that
+                    // same slot (panning can revisit a slot before this
+                    // tile does). Removing it is still safe either way:
+                    // if it still mapped `slot` to `id`, this is exactly
+                    // the invalidation this whole comment is about; if it
+                    // had already moved on to some other id, dropping
+                    // that entry costs at worst one redundant re-upload
+                    // of that other id later -- never a skipped one.
                     self.slots.remove(&slot);
-                    tracing::warn!(
-                        ?id,
-                        samples = tile.texels().len(),
-                        expected = SAMPLES,
-                        "skipping tile for this frame's upload: unexpected sample count"
-                    );
+                    // A cost worth naming, not just a mechanism: for a
+                    // tile that fails every time (a permanently corrupt
+                    // scratch file, or one `cap_failed_writes` already
+                    // dropped), this is no longer "retried once, then
+                    // silently skipped" -- it is "retried, and warned
+                    // about, every single frame, forever." Harmless
+                    // today because the only real caller
+                    // (`aurora-app`'s `redraw`) discards this
+                    // `SyncStats` outright, but a future caller that
+                    // honors `remaining != 0` as "request another
+                    // frame" would spin indefinitely on this tile.
+                    tracing::warn!(?id, %err, "skipping tile for this frame's upload");
                     stats.remaining += 1;
                     stats.errors += 1;
                     continue;
                 }
-                // Premultiplied on the way in -- see `premultiply_rgba`
-                // for why the atlas, and only the atlas, holds that
-                // convention (it is the test-only reference now; this
-                // function is what actually applies it, on both this path
-                // and `upload_mip`'s). The store's own tile is untouched.
-                //
-                // **The sequential core, called directly, deliberately
-                // (0.96.2).** `write_premultiplied_le_bytes` -- which
-                // dispatches onto the bounded `rayon` pool when there is
-                // parallel width to win -- is still here, still tested, and
-                // still what `upload_mip` uses. This frame-critical path does
-                // not use it, and that is a measured decision rather than an
-                // oversight:
-                //
-                // - **Idle**, the parallel arm won ~0.5 ms of whole-frame mean
-                //   (8.16/8.07/8.63 ms sequential -> 7.89/7.69/7.46 ms
-                //   parallel), in a case that was already comfortably inside
-                //   the 16.7 ms budget.
-                // - **Under 8 competing CPU-bound threads** on the same box (4
-                //   physical / 8 logical cores) it *lost* the budget outright:
-                //   whole-frame mean 14.59/17.95/17.59 ms sequential ->
-                //   34.34/34.57/36.70 ms parallel, i.e. ~2.1x over budget on a
-                //   path that had been at or near it. `upload_sync` alone rose
-                //   from ~3.9 ms to ~20.8 ms. Bounding the pool to four
-                //   workers (0.96.1) cut that by about a quarter and nowhere
-                //   near removed it.
-                //
-                // The cause is structural, not a tuning miss: this call is
-                // synchronous on the frame thread, so `install` blocks until
-                // the *slowest* of up to 64 blocks gets a scheduler slice,
-                // while the sequential walk only ever needs one. Desktop
-                // multitasking is the normal case for an editor, so trading a
-                // ~0.5 ms win where the budget passed for a ~17 ms loss where
-                // it then fails is net-negative against the project's own
-                // 60 FPS gate.
-                //
-                // **What would justify putting the parallel arm back here**:
-                // either a load-sensing design that can tell a contended
-                // machine from an idle one cheaply enough to ask per frame
-                // (`getloadavg` is a 1-minute average and not in `std`; a
-                // per-frame timing feedback loop is a design, not a patch), or
-                // measurement across several core counts showing no contended
-                // regression at all. Neither exists yet. PLAN.md's 0.96.1 and
-                // 0.96.2 entries carry the full tables.
-                serialize_premultiplied_le_bytes(tile.texels(), &mut bytes);
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &self.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d {
-                            x: slot.0 * TILE,
-                            y: slot.1 * TILE,
-                            z: 0,
-                        },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &bytes,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(TILE * 8),
-                        rows_per_image: Some(TILE),
-                    },
-                    wgpu::Extent3d {
-                        width: TILE,
-                        height: TILE,
-                        depth_or_array_layers: 1,
-                    },
+            };
+            // A whole tile, or nothing. `TileStore` hands back
+            // `SAMPLES` samples for every tile it has, so this is not
+            // expected to fire -- it is what makes the reused,
+            // pre-sized `bytes` buffer above sound rather than merely
+            // probably-sound. A short tile would leave the tail of the
+            // *previous* tile's bytes in the buffer and upload them as
+            // if they were this tile's. Handled exactly like the `get`
+            // failure above, and for the same reason: drop the slot
+            // mapping so the tile is retried instead of silently
+            // sticking as resident-but-never-uploaded.
+            //
+            // **This guard is defensive and, as of 0.96.1, provably
+            // unreachable through any current API, which is why it has
+            // no test** -- disclosed rather than left as a silent
+            // coverage gap. `aurora_tile::Tile`'s only non-blank
+            // constructor, `Tile::from_texels`, is `pub(crate)`, so no
+            // code outside `aurora-tile` (this crate and its tests
+            // included) can build a wrong-length tile at all;
+            // `Tile::blank()` is `SAMPLES` by construction and
+            // `texels_mut()` hands out a `&mut [f16]`, which cannot
+            // resize. Inside `aurora-tile`, both `from_texels` call
+            // sites are fed by `codec::decode`, whose own exact-length
+            // check `a_truncated_scratch_file_pages_in_as_an_error_not_a_short_tile`
+            // pins. Kept anyway, because it is a length compare per
+            // tile against a half-megabyte memcpy: cheap insurance
+            // against a future `aurora-tile` change (a public
+            // `from_texels`, a variable tile size) reintroducing the
+            // possibility, and the cost of being wrong here is a
+            // corrupted upload of another tile's pixels rather than an
+            // error.
+            if tile.texels().len() != SAMPLES {
+                self.slots.remove(&slot);
+                tracing::warn!(
+                    ?id,
+                    samples = tile.texels().len(),
+                    expected = SAMPLES,
+                    "skipping tile for this frame's upload: unexpected sample count"
                 );
-                self.slots.insert(slot, id);
-                bytes_left -= TILE_BYTES;
-                stats.uploaded += 1;
-                stats.bytes_uploaded += TILE_BYTES as u64;
+                stats.remaining += 1;
+                stats.errors += 1;
+                continue;
             }
+            // Premultiplied on the way in -- see `premultiply_rgba`
+            // for why the atlas, and only the atlas, holds that
+            // convention (it is the test-only reference now; this
+            // function is what actually applies it, on both this path
+            // and `upload_mip`'s). The store's own tile is untouched.
+            //
+            // **The sequential core, called directly, deliberately
+            // (0.96.2).** `write_premultiplied_le_bytes` -- which
+            // dispatches onto the bounded `rayon` pool when there is
+            // parallel width to win -- is still here, still tested, and
+            // still what `upload_mip` uses. This frame-critical path does
+            // not use it, and that is a measured decision rather than an
+            // oversight:
+            //
+            // - **Idle**, the parallel arm won ~0.5 ms of whole-frame mean
+            //   (8.16/8.07/8.63 ms sequential -> 7.89/7.69/7.46 ms
+            //   parallel), in a case that was already comfortably inside
+            //   the 16.7 ms budget.
+            // - **Under 8 competing CPU-bound threads** on the same box (4
+            //   physical / 8 logical cores) it *lost* the budget outright:
+            //   whole-frame mean 14.59/17.95/17.59 ms sequential ->
+            //   34.34/34.57/36.70 ms parallel, i.e. ~2.1x over budget on a
+            //   path that had been at or near it. `upload_sync` alone rose
+            //   from ~3.9 ms to ~20.8 ms. Bounding the pool to four
+            //   workers (0.96.1) cut that by about a quarter and nowhere
+            //   near removed it.
+            //
+            // The cause is structural, not a tuning miss: this call is
+            // synchronous on the frame thread, so `install` blocks until
+            // the *slowest* of up to 64 blocks gets a scheduler slice,
+            // while the sequential walk only ever needs one. Desktop
+            // multitasking is the normal case for an editor, so trading a
+            // ~0.5 ms win where the budget passed for a ~17 ms loss where
+            // it then fails is net-negative against the project's own
+            // 60 FPS gate.
+            //
+            // **What would justify putting the parallel arm back here**:
+            // either a load-sensing design that can tell a contended
+            // machine from an idle one cheaply enough to ask per frame
+            // (`getloadavg` is a 1-minute average and not in `std`; a
+            // per-frame timing feedback loop is a design, not a patch), or
+            // measurement across several core counts showing no contended
+            // regression at all. Neither exists yet. PLAN.md's 0.96.1 and
+            // 0.96.2 entries carry the full tables.
+            serialize_premultiplied_le_bytes(tile.texels(), &mut bytes);
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: slot.0 * TILE,
+                        y: slot.1 * TILE,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(TILE * 8),
+                    rows_per_image: Some(TILE),
+                },
+                wgpu::Extent3d {
+                    width: TILE,
+                    height: TILE,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.slots.insert(slot, id);
+            bytes_left -= TILE_BYTES;
+            stats.uploaded += 1;
+            stats.bytes_uploaded += TILE_BYTES as u64;
         }
         stats
     }
@@ -1998,7 +2189,7 @@ impl TileResidency {
         mip_level: u32,
         texels: &[f16],
     ) -> Result<(), GpuError> {
-        if mip_level >= MIP_LEVELS {
+        if mip_level >= self.mip_levels {
             return Err(GpuError::InvalidMipLevel(mip_level));
         }
         let size = TILE >> mip_level;
@@ -2667,10 +2858,152 @@ mod tests {
     }
 
     #[test]
+    fn coverage_one_is_the_canvas_atlas_exactly() {
+        for viewport in [(1, 1), (255, 257), (1920, 1080), (1366, 768), (3024, 1964)] {
+            assert_eq!(
+                TileResidency::grid_for_coverage(viewport, 1),
+                TileResidency::grid_for(viewport)
+            );
+            assert_eq!(
+                TileResidency::min_zoom_for_viewport_with_coverage(viewport, 1).to_bits(),
+                TileResidency::min_zoom_for_viewport(viewport).to_bits()
+            );
+            let grid = TileResidency::grid_for(viewport);
+            for zoom in [0.3_f32, 0.94, 1.0, 1.7, 8.0] {
+                let a = TileResidency::uniform_values(
+                    grid,
+                    TileId { x: 3, y: 1 },
+                    (17.5, 3.25),
+                    viewport,
+                    zoom,
+                );
+                let b = TileResidency::uniform_values_c(
+                    grid,
+                    TileId { x: 3, y: 1 },
+                    (17.5, 3.25),
+                    viewport,
+                    zoom,
+                    1,
+                );
+                assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits));
+            }
+        }
+    }
+
+    #[test]
+    fn a_double_coverage_atlas_renders_every_zoom_above_one_half_unclamped() {
+        // The zoomed-out view shows a pyramid level at a zoom in
+        // (0.5, 1]; its atlas must honour every such zoom, and never
+        // sample past its coverage (no duplicated content).
+        for viewport in [
+            (256, 256),
+            (1000, 700),
+            (1920, 1080),
+            (1366, 768),
+            (3024, 1964),
+        ] {
+            let floor = TileResidency::min_zoom_for_viewport_with_coverage(viewport, 2);
+            assert!(floor <= 0.5, "{viewport:?}: floor {floor}");
+            let grid = TileResidency::grid_for_coverage(viewport, 2);
+            for zoom in [0.5_f32.next_up(), 0.6, 0.75, 0.99, 1.0] {
+                for sub in [(0.0, 0.0), (255.9, 128.0)] {
+                    let [_, _, sx, sy] = TileResidency::uniform_values_c(
+                        grid,
+                        TileId { x: 0, y: 0 },
+                        sub,
+                        viewport,
+                        zoom,
+                        2,
+                    );
+                    let tex = ((grid.0 * TILE) as f32, (grid.1 * TILE) as f32);
+                    let want = (
+                        viewport.0 as f32 / zoom / tex.0,
+                        viewport.1 as f32 / zoom / tex.1,
+                    );
+                    assert!((sx - want.0).abs() <= want.0 * 1e-6, "{viewport:?} {zoom}");
+                    assert!((sy - want.1).abs() <= want.1 * 1e-6, "{viewport:?} {zoom}");
+                    // Covered: the window plus the sub-tile offset stays
+                    // inside the atlas.
+                    assert!(sx * tex.0 + sub.0 <= tex.0, "{viewport:?} {zoom}");
+                    assert!(sy * tex.1 + sub.1 <= tex.1, "{viewport:?} {zoom}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_atlas_grid_exceeds_the_device_texture_limit() {
+        // Every canvas area up to 8K and past it, on wgpu's default limit
+        // and a larger and a smaller one.
+        for limit in [8192_u32, 16_384, 4096] {
+            for width in (256..=9000).step_by(97) {
+                for height in [256_u32, 1080, 2160, 4320, 8000] {
+                    for coverage in [1, 2] {
+                        let grid = TileResidency::grid_for_coverage_within(
+                            (width, height),
+                            coverage,
+                            limit,
+                        );
+                        assert!(grid.0 * TILE <= limit && grid.1 * TILE <= limit);
+                        let floor = TileResidency::min_zoom_for_viewport_within(
+                            (width, height),
+                            coverage,
+                            limit,
+                        );
+                        assert!(floor.is_finite() && floor > 0.0);
+                        // Within the limit the cap changes nothing.
+                        let free = TileResidency::grid_for_coverage((width, height), coverage);
+                        if free.0 * TILE <= limit && free.1 * TILE <= limit {
+                            assert_eq!(grid, free);
+                            assert_eq!(
+                                floor.to_bits(),
+                                TileResidency::min_zoom_for_viewport_with_coverage(
+                                    (width, height),
+                                    coverage
+                                )
+                                .to_bits()
+                            );
+                        }
+                        // The floor really is the capped grid's: any zoom at
+                        // or above it is rendered as asked.
+                        let [_, _, sx, _] = TileResidency::uniform_values_c(
+                            grid,
+                            TileId { x: 0, y: 0 },
+                            (255.0, 0.0),
+                            (width, height),
+                            floor,
+                            coverage,
+                        );
+                        let tex = (grid.0 * TILE) as f32;
+                        assert!(sx * tex + 255.0 <= tex * (1.0 + 1e-6), "{width} {coverage}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_is_clamped_to_its_documented_range() {
+        let viewport = (1920, 1080);
+        assert_eq!(
+            TileResidency::min_zoom_for_viewport_with_coverage(viewport, 0).to_bits(),
+            TileResidency::min_zoom_for_viewport(viewport).to_bits()
+        );
+        assert_eq!(
+            TileResidency::min_zoom_for_viewport_with_coverage(viewport, 99).to_bits(),
+            TileResidency::min_zoom_for_viewport_with_coverage(
+                viewport,
+                TileResidency::MAX_COVERAGE
+            )
+            .to_bits()
+        );
+    }
+
     // `min_zoom_for_viewport` and the clamp inside `uniform_values` are
     // the *same* expression applied to the same inputs; an exact
     // comparison is what pins them together.
     #[allow(clippy::float_cmp)]
+    #[test]
     fn min_zoom_for_viewport_is_exactly_the_floor_the_uniform_applies() {
         // The public promise (`min_zoom_for_viewport`) and the private
         // behaviour (`uniform_values`) must not be two formulas that

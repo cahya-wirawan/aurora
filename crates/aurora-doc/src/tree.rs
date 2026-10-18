@@ -133,7 +133,7 @@ impl RemovedSubtree {
             {
                 out.push(aurora_tile::SurfaceId::from_raw(id.to_raw()));
             }
-            if id.to_raw() < crate::MASK_SURFACE_BIT - 1 {
+            if id.to_raw() < crate::MASK_SURFACE_BIT - crate::RESERVED_TOP_SURFACES {
                 out.push(aurora_tile::SurfaceId::from_raw(
                     id.to_raw() | crate::MASK_SURFACE_BIT,
                 ));
@@ -1945,7 +1945,9 @@ impl LayerTree {
     /// than assert.
     #[must_use]
     pub fn mask_surface_id(&self, id: LayerId) -> Option<aurora_tile::SurfaceId> {
-        if !self.contains(id) || id.to_raw() >= crate::MASK_SURFACE_BIT - 1 {
+        if !self.contains(id)
+            || id.to_raw() >= crate::MASK_SURFACE_BIT - crate::RESERVED_TOP_SURFACES
+        {
             return None;
         }
         Some(aurora_tile::SurfaceId::from_raw(
@@ -2973,6 +2975,8 @@ mod tests {
         // last line behind a validator, so the test has to reach past
         // the validator to exercise it.
         for raw in [
+            crate::MASK_SURFACE_BIT - crate::RESERVED_TOP_SURFACES,
+            crate::MASK_SURFACE_BIT - 2,
             crate::MASK_SURFACE_BIT - 1,
             crate::MASK_SURFACE_BIT,
             u64::MAX,
@@ -2998,7 +3002,8 @@ mod tests {
         // ... while an ordinary id one step below the boundary block
         // still gets one, so the guard is a boundary and not a blanket
         // refusal.
-        let below: super::LayerId = Id::from_raw(crate::MASK_SURFACE_BIT - 2);
+        let below: super::LayerId =
+            Id::from_raw(crate::MASK_SURFACE_BIT - crate::RESERVED_TOP_SURFACES - 1);
         let mut layers = HashMap::new();
         layers.insert(below, pixel_entry("below", None));
         let forced = LayerTree {
@@ -3010,7 +3015,9 @@ mod tests {
         };
         assert_eq!(
             forced.mask_surface_id(below),
-            Some(aurora_tile::SurfaceId::from_raw(u64::MAX - 1)),
+            Some(aurora_tile::SurfaceId::from_raw(
+                u64::MAX - crate::RESERVED_TOP_SURFACES
+            )),
         );
     }
 
@@ -6538,6 +6545,8 @@ mod tests {
             0,
             1,
             5,
+            crate::MASK_SURFACE_BIT - crate::RESERVED_TOP_SURFACES - 1,
+            crate::MASK_SURFACE_BIT - crate::RESERVED_TOP_SURFACES,
             crate::MASK_SURFACE_BIT - 2,
             crate::MASK_SURFACE_BIT - 1,
             crate::MASK_SURFACE_BIT,
@@ -6575,7 +6584,8 @@ mod tests {
     fn expected_boundary_surfaces(raw: u64, pixel: bool) -> Vec<aurora_tile::SurfaceId> {
         let in_mask_half = (raw & crate::MASK_SURFACE_BIT) != 0;
         let masked_form = raw | crate::MASK_SURFACE_BIT;
-        let masked_form_is_the_composite_sentinel = masked_form == u64::MAX;
+        let masked_form_is_the_composite_sentinel =
+            masked_form > u64::MAX - crate::RESERVED_TOP_SURFACES;
         let mut out = Vec::new();
         if pixel && !in_mask_half {
             out.push(aurora_tile::SurfaceId::from_raw(raw));

@@ -191,6 +191,15 @@ fn static_rows(title: &str) -> Vec<Row> {
             Cmd(crate::COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),
         ],
         "View" => vec![
+            Cmd(
+                crate::zoomed_view::COMMAND_FIT_ON_SCREEN,
+                crate::zoomed_view::FIT_ON_SCREEN_TITLE,
+            ),
+            Cmd(
+                crate::zoomed_view::COMMAND_ACTUAL_PIXELS,
+                crate::zoomed_view::ACTUAL_PIXELS_TITLE,
+            ),
+            Sep,
             Cmd(crate::COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
             Cmd(crate::COMMAND_FOCUS_PROPERTIES, "Focus Properties Panel"),
             Cmd(crate::COMMAND_FOCUS_HISTORY, "Focus History Panel"),
@@ -338,6 +347,8 @@ pub(crate) fn hint_command(id: &str) -> Option<AppCommand> {
             AppCommand::ToggleClippingMask
         }
         crate::COMMAND_COLOURS_SWAP => AppCommand::SwapColours,
+        crate::zoomed_view::COMMAND_FIT_ON_SCREEN => AppCommand::FitOnScreen,
+        crate::zoomed_view::COMMAND_ACTUAL_PIXELS => AppCommand::ActualPixels,
         crate::COMMAND_COLOURS_RESET => AppCommand::ResetColours,
         crate::COMMAND_SELECT_ALL => AppCommand::SelectAll,
         _ if crate::clipboard_app::command_for(id).is_some() => {
@@ -473,6 +484,8 @@ pub(crate) fn menu_bar_enabled(is_macos: bool, env: Option<&str>) -> bool {
 /// `build_menu` must update it by hand.
 #[cfg(test)]
 pub(crate) const NATIVE_MENU_COMMANDS: &[&str] = &[
+    crate::zoomed_view::COMMAND_FIT_ON_SCREEN,
+    crate::zoomed_view::COMMAND_ACTUAL_PIXELS,
     crate::COMMAND_FILE_OPEN,
     crate::COMMAND_FILE_SAVE,
     crate::document_close::COMMAND_FILE_CLOSE,

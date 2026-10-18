@@ -420,7 +420,7 @@ impl CompositeWorker {
         target: &mut CompositeTarget<'_>,
         tiles: Vec<TileId>,
     ) -> bool {
-        if !self.ensure_thread() {
+        if dispatch_refused_for_tests() || !self.ensure_thread() {
             return false;
         }
         let serial = target.store.serial();
@@ -1027,4 +1027,22 @@ fn worker_loop(
         }
         context.wake();
     }
+}
+
+/// Whether [`FAIL_DISPATCH`] is set (always `false` outside tests).
+#[cfg(test)]
+fn dispatch_refused_for_tests() -> bool {
+    FAIL_DISPATCH.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn dispatch_refused_for_tests() -> bool {
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook (task 136 review, ZV-3): makes [`CompositeWorker::dispatch`]
+    /// refuse, as a failed thread spawn or mirror would.
+    pub(crate) static FAIL_DISPATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.275.0] - 2026-10-19
+
+### Added
+
+- Record the zoomed-out view: the canvas zooms out to 1/32 over a composite pyramid, with Fit on Screen and 100%
+
 ## [0.274.0] - 2026-10-18
 
 ### Added

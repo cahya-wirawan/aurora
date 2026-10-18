@@ -328,6 +328,15 @@
 /// excluded), for every id any `LayerTree` this crate will hand out.
 pub const MASK_SURFACE_BIT: u64 = 1 << 63;
 
+/// How many surface ids at the very top of the id space `aurora-app`
+/// reserves for itself (0.275.0): `u64::MAX` is its composite surface and
+/// the ones just below it hold the zoomed-out view's composite pyramid
+/// levels. No mask surface may land on any of them, so
+/// [`crate::LayerTree::mask_surface_id`] refuses the layer ids whose
+/// masked form would (`MASK_SURFACE_BIT - RESERVED_TOP_SURFACES` and up;
+/// unreachable by `IdGenerator`, only by a hand-built tree).
+pub const RESERVED_TOP_SURFACES: u64 = 8;
+
 /// Writes one texel of mask coverage at tile-local `(x, y)`.
 ///
 /// `coverage` is clamped to `0.0..=1.0` and stored as `(v, v, v, 1.0)`,

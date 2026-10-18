@@ -55,6 +55,7 @@ mod executor;
 mod latency;
 mod mip;
 mod preview;
+mod pyramid;
 mod schedule;
 #[cfg(test)]
 mod test_support;
@@ -74,4 +75,5 @@ pub use composite::{set_transparent_skip_enabled, transparent_chunks_skipped};
 pub use executor::{Executor, TaskId};
 pub use mip::{MipLevel, downsample};
 pub use preview::{PreviewError, upload_preview};
+pub use pyramid::downsample_quad;
 pub use schedule::{ScheduledWork, schedule, tiles_for_rect};
