@@ -301,6 +301,15 @@ fn a_stalled_helper_is_not_waited_for() {
         16,
         "{diagnostics:?}"
     );
+    // The pass is over, so the stalled helpers stop stalling at once and
+    // free the pool: the next pass's helpers composite tiles again.
+    poison(&mut store, &tiles);
+    let (again, _) = recomposite(&layers, &mut store, &tiles, true);
+    let diagnostics = take_diagnostics();
+    assert!(diagnostics.helper_tiles > 0, "{diagnostics:?}");
+    for ((id, want), got) in tiles.iter().zip(&sequential).zip(&again) {
+        assert!(mismatches(got, want).is_empty(), "{id:?}");
+    }
     assert_installed(&mut store, &tiles, &sequential, "stalled helper");
 }
 
