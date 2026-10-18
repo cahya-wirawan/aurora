@@ -93,7 +93,7 @@ impl Shape {
         }
     }
 
-    fn selected() -> Vec<Self> {
+    pub(super) fn selected() -> Vec<Self> {
         let Ok(list) = std::env::var("AURORA_R9_SHAPES") else {
             return Self::ALL.to_vec();
         };

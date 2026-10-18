@@ -43557,6 +43557,7 @@ mod tests {
     mod psd_effects_write_tests;
     mod psd_five_adjust_tests;
     mod psd_grey_exposure_tests;
+    mod zoomed_frame_tests;
 
     fn near(actual: [f32; 4], expected: [f32; 4]) -> bool {
         actual
