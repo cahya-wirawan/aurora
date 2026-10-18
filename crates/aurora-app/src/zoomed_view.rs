@@ -281,6 +281,21 @@ pub(crate) fn fit_zoom(canvas: (f32, f32), doc: (u32, u32)) -> Option<f32> {
     zoom.is_finite().then_some(zoom)
 }
 
+/// The zoom the canvas really draws a physical `zoom` at in a canvas area
+/// of `canvas_px`: the 1:1 atlas's at or above its floor, the zoomed-out
+/// atlas's (its level zoom, back in document scale) below it. The test
+/// oracle for "the render path and the pointer path agree".
+#[cfg(test)]
+#[must_use]
+pub(crate) fn rendered_canvas_zoom(canvas_px: (u32, u32), zoom: f32) -> f32 {
+    if zoom >= aurora_gpu::TileResidency::min_zoom_for_viewport(canvas_px) || !zoom.is_finite() {
+        return aurora_gpu::TileResidency::effective_zoom(canvas_px, zoom);
+    }
+    let scale = level_scale(level_for_zoom(zoom));
+    aurora_gpu::TileResidency::effective_zoom_with_coverage(canvas_px, zoom * scale, COVERAGE)
+        / scale
+}
+
 /// Palette and menu id of View > Fit on Screen (`Primary+0`).
 pub(crate) const COMMAND_FIT_ON_SCREEN: &str = "view.fit-on-screen";
 /// Its title.

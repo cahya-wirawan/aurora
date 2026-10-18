@@ -417,10 +417,10 @@ fn a_cold_pyramid_is_built_progressively_under_its_budget() {
     assert!(!step.complete);
     assert!(step.more);
     let _ = settle(&mut doc, &mut cache, 2);
-    // Level 2's one tile (0, 0) needs the four level-1 tiles under it
+    // Level 2 has two tiles (1100 / 1024); level 1 (550 x 350) six.
     // that are in the document (1100 x 700: level 1 is 550 x 350, so
     // (0, 0), (1, 0), (0, 1), (1, 1)).
-    assert_eq!(cache.pyramid.current_len(), 1 + 4);
+    assert_eq!(cache.pyramid.current_len(), 2 + 6);
 }
 
 #[test]

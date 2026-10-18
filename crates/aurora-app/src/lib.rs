@@ -73268,7 +73268,7 @@ mod tests {
         for (canvas, scale_factor) in CANVAS_CASES {
             let floor = canvas_min_zoom(canvas, scale_factor);
             let passed = effective_residency_zoom(floor, scale_factor);
-            let rendered = aurora_gpu::TileResidency::effective_zoom(canvas, passed);
+            let rendered = crate::zoomed_view::rendered_canvas_zoom(canvas, passed);
             assert!(
                 (rendered - passed).abs() <= f32::EPSILON * passed,
                 "canvas {canvas:?} at scale factor {scale_factor}: the view's \
@@ -73298,7 +73298,7 @@ mod tests {
 
                 let layer_origin = (300.0, 150.0);
                 let doc_origin = canvas_local_origin(&view, layer_origin);
-                let rendered_zoom = aurora_gpu::TileResidency::effective_zoom(
+                let rendered_zoom = crate::zoomed_view::rendered_canvas_zoom(
                     canvas,
                     effective_residency_zoom(view.zoom(), scale_factor),
                 );
@@ -73368,7 +73368,7 @@ mod tests {
         let mut view = CanvasView::new();
         view.zoom_at((0.0, 0.0), 0.25);
         let doc_origin = canvas_local_origin(&view, (0.0, 0.0));
-        let rendered_zoom = aurora_gpu::TileResidency::effective_zoom(
+        let rendered_zoom = crate::zoomed_view::rendered_canvas_zoom(
             canvas,
             effective_residency_zoom(view.zoom(), 1.0),
         );
@@ -73435,7 +73435,7 @@ mod tests {
             view.zoom_at((0.0, 0.0), aurora_ui::canvas_view::MIN_ZOOM);
 
             let doc_origin = canvas_local_origin(&view, (0.0, 0.0));
-            let rendered_zoom = aurora_gpu::TileResidency::effective_zoom(
+            let rendered_zoom = crate::zoomed_view::rendered_canvas_zoom(
                 canvas,
                 effective_residency_zoom(view.zoom(), scale_factor),
             );
@@ -73498,9 +73498,13 @@ mod tests {
         let mut corrected = 0_u32;
         for width in [1280_u32, 1366, 1440, 1600, 1920, 2560, 3440, 3840] {
             for height in [720_u32, 768, 800, 900, 1080, 1440, 1600, 2160] {
-                for scale_factor in [1.0_f64, 1.25, 1.5, 1.75, 2.0, 2.25, 3.0] {
+                // 1.45 and 1.7: the scale factors at which 1/32 (the
+                // floor since 0.275.0) needs the correction.
+                for scale_factor in [1.0_f64, 1.25, 1.45, 1.5, 1.7, 1.75, 2.0, 2.25, 3.0] {
                     let canvas = (width, height);
-                    let atlas_floor = aurora_gpu::TileResidency::min_zoom_for_viewport(canvas);
+                    // 0.275.0: the floor the round trip must reach is the
+                    // zoomed-out view's, the atlas that draws there.
+                    let atlas_floor = crate::zoomed_view::MIN_PHYSICAL_ZOOM;
                     let min_zoom = canvas_min_zoom(canvas, scale_factor);
                     let round_trip = effective_residency_zoom(min_zoom, scale_factor);
                     assert!(
@@ -77146,7 +77150,11 @@ mod tests {
     /// pointer rests on a panel.
     #[test]
     fn raising_the_zoom_floor_re_anchors_the_stroke_with_the_pointer_off_canvas() {
-        let floor = canvas_min_zoom((1920, 1080), 1.0);
+        // A floor that genuinely rises: the 1:1 atlas's (since 0.275.0
+        // the canvas floor is the zoomed-out view's 1/32, which these
+        // setups' zooms are already above; the re-anchoring under test
+        // is the same for any raise).
+        let floor = aurora_gpu::TileResidency::min_zoom_for_viewport((1920, 1080));
         let pointer = (400.0, 300.0);
         let mut view = CanvasView::new();
         view.zoom_at((0.0, 0.0), 0.25);
@@ -77433,7 +77441,11 @@ mod tests {
     /// it costs; part (b) is the same raise with the live drag passed.
     #[test]
     fn resizing_mid_stroke_re_anchors_the_stroke_instead_of_painting_a_line_never_drawn() {
-        let floor = canvas_min_zoom((1920, 1080), 1.0);
+        // A floor that genuinely rises: the 1:1 atlas's (since 0.275.0
+        // the canvas floor is the zoomed-out view's 1/32, which these
+        // setups' zooms are already above; the re-anchoring under test
+        // is the same for any raise).
+        let floor = aurora_gpu::TileResidency::min_zoom_for_viewport((1920, 1080));
         let pointer = (400.0, 300.0);
         // A view below the floor is exactly what a freshly opened
         // document plus a zoom-out leaves behind, until the next
@@ -77605,7 +77617,11 @@ mod tests {
     /// amount; measuring at the anchor would correct by nothing at all.
     #[test]
     fn raising_the_zoom_floor_shifts_to_document_by_a_different_amount_at_every_point() {
-        let floor = canvas_min_zoom((1920, 1080), 1.0);
+        // A floor that genuinely rises: the 1:1 atlas's (since 0.275.0
+        // the canvas floor is the zoomed-out view's 1/32, which these
+        // setups' zooms are already above; the re-anchoring under test
+        // is the same for any raise).
+        let floor = aurora_gpu::TileResidency::min_zoom_for_viewport((1920, 1080));
         let mut view = CanvasView::new();
         view.zoom_at((0.0, 0.0), 0.25);
         // A non-zero pan too: the identity is not an artefact of the

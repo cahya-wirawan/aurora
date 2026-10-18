@@ -1559,6 +1559,16 @@ impl TileResidency {
         Self::guard_zoom(zoom).max(Self::min_zoom_for_viewport(viewport_px))
     }
 
+    /// [`Self::effective_zoom`] for an atlas of `coverage`
+    /// ([`Self::with_coverage`]).
+    #[must_use]
+    pub fn effective_zoom_with_coverage(viewport_px: (u32, u32), zoom: f32, coverage: u32) -> f32 {
+        Self::guard_zoom(zoom).max(Self::min_zoom_for_viewport_with_coverage(
+            viewport_px,
+            coverage,
+        ))
+    }
+
     /// Defensive, not decorative. [`Self::uniform_values`] divides by
     /// `zoom`, and [`Self::set_origin`]'s contract used to argue no
     /// guard was needed because `aurora_ui::CanvasView` clamps zoom to
