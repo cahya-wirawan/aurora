@@ -1,70 +1,105 @@
 //! The frame path's CPU recomposite, in parallel across tiles (60 FPS
-//! round 7).
+//! rounds 7 and 8).
 //!
 //! [`crate::recomposite_tiles`] composites a CPU-path document's stale
 //! visible tiles one after another on the calling (UI) thread. When more
 //! than [`crate::background_composite::SYNC_TILE_LIMIT`] tiles are stale
-//! ([`MIN_PARALLEL_TILES`]) and no GPU arm can run, it hands them here: a
-//! small rayon pool ([`frame_composite_threads`] threads) folds each tile
-//! with the very same [`crate::composite_roots_into_tile`], reading the
-//! document's store through [`crate::background_composite::SharedMirror`]
-//! (the background compositor's own `TileSource` over a `Mutex`), and the
-//! caller installs the results in tile order. A tile's composite is a pure
-//! function of the store's content and the layer tree, so the result is
-//! bit-identical to the sequential loop; only the store's LRU order and
-//! which pages are resident can differ, which no pixel sees.
+//! ([`MIN_PARALLEL_TILES`]) and no GPU arm can run, it hands them here.
 //!
-//! **Bounded.** Tiles go in batches of four per thread (at least
-//! `MIN_BATCH_TILES`, 16), so at most that many composite results
-//! (512 KiB each, 8 MiB for 16) wait for installation.
-//! The pool's threads share one drop-shadow coverage cache of
+//! **The calling thread does the work; helpers only help (round 8).**
+//! Round 7 handed every tile to a rayon pool and blocked in
+//! `ThreadPool::install` until the pool had done them all. Under CPU load
+//! that wait is a scheduling cost, not a compositing one: the caller
+//! sleeps, the pool's threads have to be woken and scheduled, and the
+//! caller has to be scheduled again when the last one finishes. On a
+//! loaded Apple M2 Pro that made the pooled frame 2-5x slower than the
+//! sequential loop (PLAN.md, round 8). Now:
+//!
+//! - The caller claims tiles one at a time from a shared atomic index
+//!   and composites each itself, against the store, with the sequential
+//!   loop's own code and its single pass budget.
+//! - [`FramePool::helpers`] helper tasks are spawned (never waited for to
+//!   start) and claim tiles from the same index. A helper reads a
+//!   **snapshot** of the store taken at the start of the pass (every held
+//!   tile's content version and, for a resident tile, its copy-on-write
+//!   texels: an `Arc`, no copy) and the pass's own clone of the layer
+//!   tree, so it never touches the store and owns everything it reads:
+//!   the caller can return while a helper is still running.
+//! - A helper that needs a tile the snapshot has no texels for (evicted,
+//!   not resident), or whose tile would log a bound breach, hands the
+//!   tile back: the caller composites it itself, so every page-in and
+//!   every report happens on the caller, once per pass as in the
+//!   sequential loop.
+//! - Once the index is exhausted, the caller installs the results in
+//!   tile order. For a tile a helper claimed and has not finished, it
+//!   waits only while the helper is plausibly still working on it
+//!   ([`STRAGGLER_WAIT_TILES`] mean tile times since the helper started
+//!   it), spinning, never sleeping; past that, or with no tile time known
+//!   yet, it composites the tile itself. A helper that never starts costs
+//!   nothing; one preempted mid-tile costs at most that wait plus a tile.
+//!
+//! So the caller never waits for a tile no helper has started, and the
+//! worst case is the sequential loop plus the pass's setup (a layer-tree
+//! clone and the snapshot, [`Pass::new`]) plus that bounded wait per
+//! straggling helper. A tile's composite is a pure function of the
+//! store's content and the layer tree, so whoever computes it the result
+//! is bit-identical to the sequential loop; only the store's LRU order
+//! (the caller promotes what a helper read when it installs that tile)
+//! and which pages are resident can differ, which no pixel sees.
+//!
+//! **Bounded.** A helper claims a tile only while it is fewer than
+//! [`HELPER_WINDOW_TILES`] ahead of the caller's installed prefix, so at
+//! most about that many results (512 KiB each, 8 MiB for 16) wait for
+//! installation. The helpers share one drop-shadow coverage cache of
 //! [`crate::small_machine::shadow_cache_bytes`], like the background
-//! compositor's pool; the UI thread keeps its own for single-tile work, so
-//! this adds at most one more cache of that cap.
+//! compositor's pool; the caller keeps its own thread's. A helper still
+//! running when the pass ends holds the snapshot's reference counts
+//! until it finishes its tile; a write to such a tile in that window
+//! copies it once (copy-on-write).
 //!
 //! **Not for a dab.** The redraw handler composites a brush dab's one to
-//! three stale tiles itself (`SYNC_TILE_LIMIT`), and under CPU load
-//! waking the pool costs more than folding them (measured, PLAN.md 60 FPS
-//! round 7), so they keep the sequential loop. More stale tiles reach this
-//! path only without a background worker, when its dispatch fails, or for
-//! a GPU-qualifying document without a GPU.
+//! three stale tiles itself (`SYNC_TILE_LIMIT`), and they keep the
+//! sequential loop. More stale tiles reach this path only without a
+//! background worker, when its dispatch fails, or for a GPU-qualifying
+//! document without a GPU.
 //!
-//! **Threads.** At most [`FRAME_COMPOSITE_MAX_THREADS`], never more than
-//! the machine's parallelism; a machine with one core (or whose
-//! parallelism cannot be read) gets no pool and keeps the sequential loop.
-//! The calling thread waits while the pool works, so the frame uses at most
-//! that many cores. The background compositor's pool is separate and may
-//! run at the same time.
+//! **Threads.** The caller plus at most [`FRAME_COMPOSITE_MAX_THREADS`]
+//! − 1 helpers, and never more helpers than the machine's parallelism −
+//! 1; a machine with one core (or whose parallelism cannot be read) gets
+//! no pool and keeps the sequential loop. The background compositor's
+//! pool is separate and may run at the same time.
 
-use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
-use aurora_tile::{TileId, TileStore};
-use rayon::prelude::*;
+use aurora_tile::{SurfaceId, TileId, TileStore};
 
-use crate::background_composite::SharedMirror;
-
-/// The most threads the frame pool folds on. Four: on the 4-core/8-thread
-/// development machine a fifth thread or more gains little on the
-/// two-root fixture (see PLAN.md, 60 FPS round 7), and a four-core machine
-/// then still gets one thread per core while the UI thread waits.
+/// The most threads a frame recomposite uses: the calling thread and
+/// three helpers. Four: on the 4-core/8-thread development machine a fifth
+/// thread or more gains little on the two-root fixture (see PLAN.md, 60
+/// FPS round 7).
 pub(crate) const FRAME_COMPOSITE_MAX_THREADS: usize = 4;
 
 /// The fewest stale tiles [`crate::recomposite_tiles`] hands to the pool:
 /// one more than [`crate::background_composite::SYNC_TILE_LIMIT`], the
-/// most a brush dab composites synchronously, so a dab never waits for
-/// the pool to wake.
+/// most a brush dab composites synchronously, so a dab never pays the
+/// pass's setup.
 pub(crate) const MIN_PARALLEL_TILES: usize =
     crate::background_composite::SYNC_TILE_LIMIT.saturating_add(1);
 
-/// The fewest tiles a parallel batch holds (60 FPS round 7): a batch is
-/// four tiles per thread or this many, whichever is more, so a typical
-/// view (nine to sixteen tiles) is one batch and no thread idles while a
-/// short last batch runs. At most this many composites (512 KiB each)
-/// wait for installation on a machine with four threads or fewer.
-const MIN_BATCH_TILES: usize = 16;
+/// How far a helper may run ahead of the caller's installed prefix.
+pub(crate) const HELPER_WINDOW_TILES: usize = 16;
 
-/// How many threads the frame pool has: the machine's parallelism, capped
-/// at [`FRAME_COMPOSITE_MAX_THREADS`]; `1` (no pool) when it cannot be read.
+/// How long, in mean tile times, the caller waits for a tile a helper
+/// started before compositing it itself.
+const STRAGGLER_WAIT_TILES: u32 = 2;
+
+/// How many threads a frame recomposite uses, the calling thread
+/// included: the machine's parallelism, capped at
+/// [`FRAME_COMPOSITE_MAX_THREADS`]; `1` (no helpers) when it cannot be
+/// read.
 #[must_use]
 pub(crate) fn frame_composite_threads() -> usize {
     let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
@@ -78,25 +113,45 @@ pub(crate) fn frame_composite_threads() -> usize {
     available.clamp(1, FRAME_COMPOSITE_MAX_THREADS)
 }
 
+/// The helpers' thread pool and the drop-shadow cache they share.
+pub(crate) struct FramePool {
+    pool: rayon::ThreadPool,
+    shadows: crate::SharedShadowCache,
+    helpers: usize,
+}
+
+impl FramePool {
+    /// How many helper tasks a pass spawns at most (the pool's threads).
+    #[cfg(test)]
+    pub(crate) fn helpers(&self) -> usize {
+        self.helpers
+    }
+}
+
 /// The frame pool, built on first use; `None` with one thread, or if rayon
 /// cannot start it (the caller then keeps the sequential loop).
-pub(crate) fn frame_pool() -> Option<&'static rayon::ThreadPool> {
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+pub(crate) fn frame_pool() -> Option<&'static FramePool> {
+    static POOL: OnceLock<Option<FramePool>> = OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = frame_composite_threads();
-        if threads < 2 {
+        let helpers = frame_composite_threads().saturating_sub(1);
+        if helpers == 0 {
             return None;
         }
         let shadows = crate::new_shared_shadow_cache(crate::small_machine::shadow_cache_bytes());
+        let for_threads = Arc::clone(&shadows);
         match rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
+            .num_threads(helpers)
             .thread_name(|index| format!("aurora-frame-composite-{index}"))
             .start_handler(move |_| {
-                crate::use_shared_shadow_cache(Some(std::sync::Arc::clone(&shadows)));
+                crate::use_shared_shadow_cache(Some(Arc::clone(&for_threads)));
             })
             .build()
         {
-            Ok(pool) => Some(pool),
+            Ok(pool) => Some(FramePool {
+                pool,
+                shadows,
+                helpers,
+            }),
             Err(err) => {
                 tracing::warn!(
                     ?err,
@@ -115,18 +170,113 @@ thread_local! {
     /// pool on this thread. Off by default in tests, because many tests
     /// read per-thread counters ([`crate::COMPOSITE_PROFILE`], the
     /// straighten and cull tallies, `aurora_render`'s skip counter) that
-    /// the pool's threads would not update on the caller; the tests of
+    /// the helpers' threads would not update on the caller; the tests of
     /// this module and the frame measurements turn it on.
     static PARALLEL_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only: tiles this thread installed through [`composite_tiles`].
+    static POOLED_TILES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Test-only: what [`composite_tiles`] did on this thread, summed
+    /// over passes since the last [`take_diagnostics`].
+    static DIAGNOSTICS: std::cell::Cell<Diagnostics> = const {
+        std::cell::Cell::new(Diagnostics::ZERO)
+    };
+    /// Test-only: hooks the next passes on this thread run with.
+    static HOOKS: std::cell::Cell<TestHooks> = const { std::cell::Cell::new(TestHooks::NONE) };
+}
+
+/// Test-only switches for [`composite_tiles`]'s protocol.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TestHooks {
+    /// Spawn no helper at all (helpers that never start).
+    pub(crate) no_helpers: bool,
+    /// A helper sleeps this long (or until its pass ends) after claiming
+    /// each tile, before compositing it (a helper preempted mid-tile).
+    pub(crate) helper_stall: Option<Duration>,
+    /// The caller claims nothing until the helpers have claimed every
+    /// tile they may (all, or a window's worth) or this long has passed,
+    /// so the helpers composite the tiles a differential compares.
+    pub(crate) caller_yields: Option<Duration>,
 }
 
 #[cfg(test)]
-thread_local! {
-    /// Test-only: tiles this thread installed from the frame pool.
-    static POOLED_TILES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+impl TestHooks {
+    pub(crate) const NONE: Self = Self {
+        no_helpers: false,
+        helper_stall: None,
+        caller_yields: None,
+    };
 }
 
-/// Reads and resets this thread's count of tiles installed from the pool.
+/// Test-only: sets the hooks the next passes on this thread run with.
+#[cfg(test)]
+pub(crate) fn set_test_hooks(hooks: TestHooks) {
+    HOOKS.with(|slot| slot.set(hooks));
+}
+
+/// Test-only: what [`composite_tiles`] did, summed over passes.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Diagnostics {
+    pub(crate) passes: u64,
+    /// Tiles the caller claimed and composited.
+    pub(crate) caller_tiles: u64,
+    /// Tiles a helper composited and the caller installed.
+    pub(crate) helper_tiles: u64,
+    /// Tiles a helper claimed and the caller composited itself because
+    /// the helper had not finished in time.
+    pub(crate) duplicates: u64,
+    /// Tiles a helper handed back (a tile it could not read, or a bound
+    /// breach to report).
+    pub(crate) handed_back: u64,
+    /// Nanoseconds the caller spent setting passes up (tree clone,
+    /// snapshot, spawning helpers).
+    pub(crate) setup_ns: u64,
+    /// Nanoseconds the caller spent waiting on helpers' tiles.
+    pub(crate) wait_ns: u64,
+    /// Passes in which some helper claimed a tile, and the nanoseconds
+    /// from each such pass's start to its first helper claim, summed.
+    pub(crate) helper_claimed_passes: u64,
+    pub(crate) first_claim_ns: u64,
+}
+
+#[cfg(test)]
+impl Diagnostics {
+    const ZERO: Self = Self {
+        passes: 0,
+        caller_tiles: 0,
+        helper_tiles: 0,
+        duplicates: 0,
+        handed_back: 0,
+        setup_ns: 0,
+        wait_ns: 0,
+        helper_claimed_passes: 0,
+        first_claim_ns: 0,
+    };
+}
+
+/// Reads and resets this thread's [`Diagnostics`].
+#[cfg(test)]
+pub(crate) fn take_diagnostics() -> Diagnostics {
+    DIAGNOSTICS.with(|d| d.replace(Diagnostics::ZERO))
+}
+
+#[cfg(test)]
+fn note(f: impl FnOnce(&mut Diagnostics)) {
+    DIAGNOSTICS.with(|cell| {
+        let mut d = cell.get();
+        f(&mut d);
+        cell.set(d);
+    });
+}
+
+#[cfg(test)]
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Reads and resets this thread's count of tiles installed through the
+/// frame pool's path (the caller's and the helpers').
 #[cfg(test)]
 pub(crate) fn take_pooled_tiles() -> u64 {
     POOLED_TILES.with(|n| n.replace(0))
@@ -152,102 +302,533 @@ pub(crate) const fn parallel_enabled() -> bool {
     true
 }
 
-/// Composites `tiles` (distinct, stale, all on the CPU path) on `pool` and
-/// calls `install` for each in `tiles` order with the composite and its
-/// fold count, exactly what the sequential loop computes for that tile.
+type TileKey = (SurfaceId, TileId);
+
+/// A held tile's content version and, when resident, its texels.
+type SnapshotEntry = (u64, Option<Arc<Vec<half::f16>>>);
+
+/// Every tile a store holds at the start of a pass: its content version
+/// and, when resident, its texels (a reference count on the store's
+/// copy-on-write buffer). The composite surface's texels are left out, so
+/// installing a composite never copies a buffer a snapshot shares (the
+/// fold never reads that surface).
+struct Snapshot {
+    serial: u64,
+    tiles: HashMap<TileKey, SnapshotEntry>,
+}
+
+impl Snapshot {
+    fn of(store: &TileStore) -> Self {
+        let composite = crate::composite_surface_id();
+        let tiles = store
+            .held_tile_versions()
+            .into_iter()
+            .map(|(key, version)| {
+                let texels = if key.0 == composite {
+                    None
+                } else {
+                    store.peek_shared(key.0, key.1)
+                };
+                (key, (version, texels))
+            })
+            .collect();
+        Self {
+            serial: store.serial(),
+            tiles,
+        }
+    }
+}
+
+/// A helper's view of the store: the pass's [`Snapshot`]. A read the
+/// snapshot cannot answer marks the tile missed (the helper then hands
+/// it back) and fails, as a store read failure would.
+struct SnapshotSource<'a> {
+    snapshot: &'a Snapshot,
+    missed: bool,
+    hits: Vec<TileKey>,
+}
+
+impl crate::TileSource for SnapshotSource<'_> {
+    fn contains_tile(&self, surface: SurfaceId, id: TileId) -> bool {
+        self.snapshot.tiles.contains_key(&(surface, id))
+    }
+
+    fn content_version(&self, surface: SurfaceId, id: TileId) -> u64 {
+        self.snapshot
+            .tiles
+            .get(&(surface, id))
+            .map_or(0, |entry| entry.0)
+    }
+
+    fn serial(&self) -> u64 {
+        self.snapshot.serial
+    }
+
+    fn texels(
+        &mut self,
+        surface: SurfaceId,
+        id: TileId,
+    ) -> Result<crate::SourceTexels<'_>, aurora_tile::TileError> {
+        if let Some((_, Some(texels))) = self.snapshot.tiles.get(&(surface, id)) {
+            self.hits.push((surface, id));
+            return Ok(crate::SourceTexels::Shared(Arc::clone(texels)));
+        }
+        self.missed = true;
+        Err(aurora_tile::TileError::Io {
+            surface,
+            id,
+            source: std::io::Error::other("not resident when the frame pass began"),
+        })
+    }
+}
+
+/// A tile a helper composited.
+struct HelperTile {
+    texels: Vec<half::f16>,
+    folded: usize,
+    /// The resident tiles it read, for the caller's LRU promotion.
+    hits: Vec<TileKey>,
+    /// How long it took, for the caller's wait estimate.
+    took: Duration,
+    #[cfg(test)]
+    profile: crate::CompositeProfile,
+}
+
+/// What a helper left for one tile it claimed.
+#[derive(Default)]
+struct Slot {
+    /// When the helper started it.
+    started: Option<Instant>,
+    /// Its result, once done.
+    result: Option<HelperTile>,
+    /// The helper handed it back (the caller composites it).
+    handed_back: bool,
+}
+
+/// One pass, shared by the caller and its helpers.
+struct Pass {
+    tiles: Vec<TileId>,
+    layers: aurora_doc::LayerTree,
+    reference_origin: (i64, i64),
+    snapshot: Snapshot,
+    /// The next tile index nobody has claimed.
+    next: AtomicUsize,
+    /// How many tiles the caller has installed (the helpers' window).
+    installed: AtomicUsize,
+    /// The pass is over: helpers stop claiming and drop their results.
+    closed: AtomicBool,
+    slots: Vec<Mutex<Slot>>,
+    #[cfg(test)]
+    began: Instant,
+    #[cfg(test)]
+    first_claim_ns: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    hooks: TestHooks,
+}
+
+impl Pass {
+    fn new(
+        tiles: &[TileId],
+        layers: &aurora_doc::LayerTree,
+        store: &TileStore,
+        reference_origin: (i64, i64),
+    ) -> Self {
+        Self {
+            tiles: tiles.to_vec(),
+            layers: layers.clone(),
+            reference_origin,
+            snapshot: Snapshot::of(store),
+            next: AtomicUsize::new(0),
+            installed: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            slots: tiles.iter().map(|_| Mutex::new(Slot::default())).collect(),
+            #[cfg(test)]
+            began: Instant::now(),
+            #[cfg(test)]
+            first_claim_ns: std::sync::atomic::AtomicU64::new(u64::MAX),
+            #[cfg(test)]
+            hooks: HOOKS.with(std::cell::Cell::get),
+        }
+    }
+
+    fn slot(&self, index: usize) -> Option<MutexGuard<'_, Slot>> {
+        self.slots.get(index).map(|slot| match slot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        })
+    }
+
+    /// Claims the next tile for a helper, if one is left within the
+    /// window; `None` when the pass is over or every tile is claimed.
+    /// Sleeps while the window is full (a helper is never on the critical
+    /// path).
+    fn claim_for_helper(&self) -> Option<usize> {
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            let index = self.next.load(Ordering::Acquire);
+            if index >= self.tiles.len() {
+                return None;
+            }
+            let limit = self
+                .installed
+                .load(Ordering::Acquire)
+                .saturating_add(HELPER_WINDOW_TILES);
+            if index >= limit {
+                std::thread::sleep(Duration::from_micros(50));
+                continue;
+            }
+            if self
+                .next
+                .compare_exchange(index, index + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(index);
+            }
+        }
+    }
+}
+
+/// A helper task: claims and composites tiles until none is left or the
+/// pass is over.
+fn run_helper(pass: &Pass) {
+    while let Some(index) = pass.claim_for_helper() {
+        #[cfg(test)]
+        {
+            let _ = pass
+                .first_claim_ns
+                .fetch_min(nanos(pass.began.elapsed()), Ordering::AcqRel);
+        }
+        let started = Instant::now();
+        if let Some(mut slot) = pass.slot(index) {
+            slot.started = Some(started);
+        }
+        #[cfg(test)]
+        if let Some(stall) = pass.hooks.helper_stall {
+            // Stalls until the pass is over (or `stall` passes), so a
+            // stalled helper frees its pool thread with its pass.
+            while started.elapsed() < stall && !pass.closed.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let Some(&tile_id) = pass.tiles.get(index) else {
+            return;
+        };
+        let result = helper_composite(pass, tile_id, started);
+        if pass.closed.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(mut slot) = pass.slot(index) {
+            match result {
+                Some(tile) => slot.result = Some(tile),
+                None => slot.handed_back = true,
+            }
+        }
+    }
+}
+
+/// One tile on a helper, or `None` to hand it back to the caller.
+fn helper_composite(pass: &Pass, tile_id: TileId, started: Instant) -> Option<HelperTile> {
+    #[cfg(test)]
+    let before = crate::COMPOSITE_PROFILE.with(std::cell::Cell::get);
+    let mut source = SnapshotSource {
+        snapshot: &pass.snapshot,
+        missed: false,
+        hits: Vec::new(),
+    };
+    let doc_origin = crate::composite_tile_doc_origin(pass.reference_origin, tile_id);
+    let mut budget = crate::CompositeBudget::quiet_for_tile(&pass.layers);
+    let (texels, folded) = crate::profiled(crate::ProfileSlot::TileComposite, || {
+        crate::composite_roots_into_tile(
+            &pass.layers,
+            &mut source,
+            tile_id,
+            doc_origin,
+            pass.reference_origin,
+            &mut budget,
+        )
+    });
+    if source.missed || budget.wanted_report() {
+        return None;
+    }
+    Some(HelperTile {
+        texels,
+        folded,
+        hits: source.hits,
+        took: started.elapsed(),
+        #[cfg(test)]
+        profile: profile_delta(before, crate::COMPOSITE_PROFILE.with(std::cell::Cell::get)),
+    })
+}
+
+/// A finished tile on the caller's side.
+enum Done {
+    Own(Vec<half::f16>, usize),
+    Helper(Box<HelperTile>),
+}
+
+/// Tile times seen this pass (the caller's and installed helpers'), for
+/// the straggler wait.
+#[derive(Default)]
+struct Timing {
+    total: Duration,
+    tiles: u32,
+}
+
+impl Timing {
+    fn add(&mut self, took: Duration) {
+        self.total += took;
+        self.tiles = self.tiles.saturating_add(1);
+    }
+
+    fn mean(&self) -> Option<Duration> {
+        (self.tiles > 0).then(|| self.total / self.tiles)
+    }
+}
+
+/// Composites `tiles` (distinct, stale, all on the CPU path) on the
+/// calling thread with `frame`'s helpers and calls `install` for each in
+/// `tiles` order with the composite and its fold count, exactly what the
+/// sequential loop computes for that tile.
 pub(crate) fn composite_tiles(
-    pool: &rayon::ThreadPool,
+    frame: &FramePool,
     tiles: &[TileId],
     layers: &aurora_doc::LayerTree,
     store: &mut TileStore,
     reference_origin: (i64, i64),
     mut install: impl FnMut(&mut TileStore, TileId, Vec<half::f16>, usize),
 ) {
-    // A new pass for the pool's shared drop-shadow cache, as
-    // `CompositeBudget::for_pass` begins one on the calling thread's.
-    pool.install(|| {
-        let _ = crate::with_shadow_cache(crate::ShadowCache::begin_pass);
-    });
-    // One "already reported" flag for the whole pass, shared by every
-    // tile's budget, so a malformed document warns once per pass as in
-    // the sequential loop.
-    let pass_reported = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let batch_len = pool
-        .current_num_threads()
-        .saturating_mul(4)
-        .max(MIN_BATCH_TILES);
-    for batch in tiles.chunks(batch_len) {
-        let serial = store.serial();
-        let shared = Mutex::new(&mut *store);
-        let results: Vec<TileResult> = pool.install(|| {
-            batch
-                .par_iter()
-                .with_max_len(1)
-                .map(|&tile_id| {
-                    composite_one(
-                        &shared,
-                        serial,
-                        layers,
-                        tile_id,
-                        reference_origin,
-                        &pass_reported,
-                    )
-                })
-                .collect()
+    let count = tiles.len();
+    if count == 0 {
+        return;
+    }
+    #[cfg(test)]
+    let setup_began = Instant::now();
+    // A new pass for the helpers' shared drop-shadow cache, and (through
+    // `for_pass`) for this thread's, as the sequential loop begins one.
+    match frame.shadows.lock() {
+        Ok(mut cache) => cache.begin_pass(),
+        Err(poisoned) => poisoned.into_inner().begin_pass(),
+    }
+    let mut budget = crate::CompositeBudget::for_pass(layers);
+    let pass = Arc::new(Pass::new(tiles, layers, store, reference_origin));
+    let helpers = frame.helpers.min(count.saturating_sub(1));
+    #[cfg(test)]
+    let helpers = if pass.hooks.no_helpers { 0 } else { helpers };
+    for _ in 0..helpers {
+        let pass = Arc::clone(&pass);
+        frame.pool.spawn(move || run_helper(&pass));
+    }
+    #[cfg(test)]
+    {
+        let setup = nanos(setup_began.elapsed());
+        note(|d| {
+            d.passes += 1;
+            d.setup_ns = d.setup_ns.saturating_add(setup);
         });
-        let store: &mut TileStore = match shared.into_inner() {
-            Ok(store) => store,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for (&tile_id, result) in batch.iter().zip(results) {
-            #[cfg(test)]
-            {
-                merge_profile(result.profile);
-                POOLED_TILES.with(|n| n.set(n.get().saturating_add(1)));
+        if let Some(limit) = pass.hooks.caller_yields {
+            let until = Instant::now() + limit;
+            // Helpers stop at the window while nothing is installed.
+            let claimable = count.min(HELPER_WINDOW_TILES);
+            while pass.next.load(Ordering::Acquire) < claimable && Instant::now() < until {
+                std::thread::sleep(Duration::from_micros(100));
             }
-            install(store, tile_id, result.texels, result.folded);
+        }
+    }
+
+    let mut done: Vec<Option<Done>> = (0..count).map(|_| None).collect();
+    let mut installed = 0_usize;
+    let mut timing = Timing::default();
+
+    // Claim and composite until every tile is claimed, installing the
+    // finished prefix as it grows.
+    loop {
+        let index = pass.next.fetch_add(1, Ordering::AcqRel);
+        let Some(&tile_id) = tiles.get(index) else {
+            break;
+        };
+        let began = Instant::now();
+        let (texels, folded) = own_composite(layers, store, tile_id, reference_origin, &mut budget);
+        timing.add(began.elapsed());
+        #[cfg(test)]
+        note(|d| d.caller_tiles += 1);
+        if let Some(slot) = done.get_mut(index) {
+            *slot = Some(Done::Own(texels, folded));
+        }
+        installed = install_ready(
+            &pass,
+            &mut done,
+            installed,
+            store,
+            &mut timing,
+            &mut install,
+        );
+    }
+
+    // Every tile is claimed: finish the ones helpers hold, in order.
+    while installed < count {
+        let Some(&tile_id) = tiles.get(installed) else {
+            break;
+        };
+        let entry = if let Some(tile) = wait_for_helper(&pass, installed, timing.mean()) {
+            Done::Helper(Box::new(tile))
+        } else {
+            let (texels, folded) =
+                own_composite(layers, store, tile_id, reference_origin, &mut budget);
+            Done::Own(texels, folded)
+        };
+        if let Some(slot) = done.get_mut(installed) {
+            *slot = Some(entry);
+        }
+        installed = install_ready(
+            &pass,
+            &mut done,
+            installed,
+            store,
+            &mut timing,
+            &mut install,
+        );
+    }
+    pass.closed.store(true, Ordering::Release);
+    #[cfg(test)]
+    {
+        let first = pass.first_claim_ns.load(Ordering::Acquire);
+        if first != u64::MAX {
+            note(|d| {
+                d.helper_claimed_passes += 1;
+                d.first_claim_ns = d.first_claim_ns.saturating_add(first);
+            });
         }
     }
 }
 
-/// One tile's result, plus (in tests) the profile its thread recorded.
-struct TileResult {
-    texels: Vec<half::f16>,
-    folded: usize,
-    #[cfg(test)]
-    profile: crate::CompositeProfile,
-}
-
-fn composite_one(
-    shared: &Mutex<&mut TileStore>,
-    serial: u64,
+/// The caller's own composite of one tile: the sequential loop's.
+fn own_composite(
     layers: &aurora_doc::LayerTree,
+    store: &mut TileStore,
     tile_id: TileId,
     reference_origin: (i64, i64),
-    pass_reported: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> TileResult {
-    #[cfg(test)]
-    let before = crate::COMPOSITE_PROFILE.with(std::cell::Cell::get);
-    let mut source = SharedMirror::new(shared, serial);
+    budget: &mut crate::CompositeBudget,
+) -> (Vec<half::f16>, usize) {
+    budget.next_tile(layers);
     let doc_origin = crate::composite_tile_doc_origin(reference_origin, tile_id);
-    let mut budget = crate::CompositeBudget::for_tile_of_shared_pass(layers, pass_reported);
-    let (texels, folded) = crate::profiled(crate::ProfileSlot::TileComposite, || {
+    crate::profiled(crate::ProfileSlot::TileComposite, || {
         crate::composite_roots_into_tile(
             layers,
-            &mut source,
+            store,
             tile_id,
             doc_origin,
             reference_origin,
-            &mut budget,
+            budget,
         )
-    });
-    source.finish();
-    TileResult {
-        texels,
-        folded,
-        #[cfg(test)]
-        profile: profile_delta(before, crate::COMPOSITE_PROFILE.with(std::cell::Cell::get)),
+    })
+}
+
+/// Waits for the helper that claimed tile `index` while it is plausibly
+/// still working on it ([`STRAGGLER_WAIT_TILES`] × `mean` since it
+/// started, spinning), and returns its result; `None` when the caller
+/// should composite the tile itself (handed back, too slow, or no tile
+/// time known yet).
+fn wait_for_helper(pass: &Pass, index: usize, mean: Option<Duration>) -> Option<HelperTile> {
+    #[cfg(test)]
+    let waited_from = Instant::now();
+    let mut deadline: Option<Instant> = None;
+    let mut handed_back = false;
+    let outcome = loop {
+        {
+            let mut slot = pass.slot(index)?;
+            if let Some(tile) = slot.result.take() {
+                break Some(tile);
+            }
+            if slot.handed_back {
+                handed_back = true;
+                break None;
+            }
+            if deadline.is_none() {
+                let Some(mean) = mean else {
+                    break None;
+                };
+                let started = slot.started.unwrap_or_else(Instant::now);
+                deadline = Some(started + mean * STRAGGLER_WAIT_TILES);
+            }
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break None;
+        }
+        for _ in 0..64 {
+            std::hint::spin_loop();
+        }
+    };
+    #[cfg(test)]
+    {
+        let waited = nanos(waited_from.elapsed());
+        note(|d| {
+            d.wait_ns = d.wait_ns.saturating_add(waited);
+            if handed_back {
+                d.handed_back += 1;
+            } else if outcome.is_none() {
+                d.duplicates += 1;
+            }
+        });
     }
+    #[cfg(not(test))]
+    let _ = handed_back;
+    outcome
+}
+
+/// Installs the finished prefix from `installed` on, in order, and
+/// returns the new prefix length (also published to the helpers' window).
+fn install_ready(
+    pass: &Pass,
+    done: &mut [Option<Done>],
+    mut installed: usize,
+    store: &mut TileStore,
+    timing: &mut Timing,
+    install: &mut impl FnMut(&mut TileStore, TileId, Vec<half::f16>, usize),
+) -> usize {
+    loop {
+        let entry = match done.get_mut(installed) {
+            Some(entry @ Some(_)) => entry.take(),
+            Some(None) => pass
+                .slot(installed)
+                .and_then(|mut slot| slot.result.take())
+                .map(|tile| Done::Helper(Box::new(tile))),
+            None => None,
+        };
+        let Some(entry) = entry else {
+            break;
+        };
+        let Some(&tile_id) = pass.tiles.get(installed) else {
+            break;
+        };
+        let (texels, folded) = match entry {
+            Done::Own(texels, folded) => (texels, folded),
+            Done::Helper(tile) => {
+                let tile = *tile;
+                // The LRU recency the sequential loop's reads would have
+                // given the resident tiles this helper read.
+                for (surface, id) in tile.hits {
+                    if store.is_resident(surface, id) {
+                        let _ = store.get(surface, id);
+                    }
+                }
+                timing.add(tile.took);
+                #[cfg(test)]
+                {
+                    merge_profile(tile.profile);
+                    note(|d| d.helper_tiles += 1);
+                }
+                (tile.texels, tile.folded)
+            }
+        };
+        #[cfg(test)]
+        POOLED_TILES.with(|n| n.set(n.get().saturating_add(1)));
+        install(store, tile_id, texels, folded);
+        installed += 1;
+        pass.installed.store(installed, Ordering::Release);
+    }
+    installed
 }
 
 #[cfg(test)]
@@ -263,8 +844,9 @@ fn profile_delta(
     delta
 }
 
-/// Adds a pool task's profile to the calling thread's, so a measurement
-/// on the caller sees the work its pool did (CPU time summed over threads).
+/// Adds a helper's profile to the calling thread's, so a measurement on
+/// the caller sees the work its helpers did (CPU time summed over
+/// threads).
 #[cfg(test)]
 fn merge_profile(delta: crate::CompositeProfile) {
     crate::COMPOSITE_PROFILE.with(|profile| {

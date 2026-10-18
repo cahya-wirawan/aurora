@@ -14,8 +14,8 @@
 )]
 
 use crate::frame_composite::{
-    FRAME_COMPOSITE_MAX_THREADS, frame_composite_threads, frame_pool,
-    set_parallel_enabled_for_tests,
+    FRAME_COMPOSITE_MAX_THREADS, TestHooks, frame_composite_threads, frame_pool,
+    set_parallel_enabled_for_tests, set_test_hooks, take_diagnostics,
 };
 use crate::move_invalidation_tests::{corpus_files, pixel_layers, reaching_effects};
 use crate::occlusion_cull_tests::{
@@ -57,6 +57,12 @@ fn recomposite(
 ) -> (Vec<Vec<half::f16>>, usize) {
     clear_shadow_cache();
     let _switch = Parallel::set(parallel);
+    // The caller lets the helpers claim first, so they composite most of
+    // the tiles compared (on its own the caller would often do them all).
+    let _hooks = Hooks::set(TestHooks {
+        caller_yields: Some(std::time::Duration::from_secs(20)),
+        ..TestHooks::NONE
+    });
     let mut cache = CompositeCache::default();
     recomposite_tiles(tiles, layers, None, store, &mut cache, None, None);
     let current = tiles.iter().filter(|&&id| cache.is_current(id)).count();
@@ -121,27 +127,65 @@ fn the_thread_count_is_bounded() {
         assert_eq!(frame_pool().is_some(), threads > 1);
     }
     if let Some(pool) = frame_pool() {
-        assert_eq!(pool.current_num_threads(), threads);
+        assert_eq!(
+            pool.helpers(),
+            threads - 1,
+            "the caller is one of the threads"
+        );
     }
 }
 
-/// The parallel path really runs on the pool's threads (the differentials
-/// below would pass if it quietly fell back to the sequential loop).
+/// Resets the protocol's test hooks even if a test fails half way.
+struct Hooks;
+
+impl Hooks {
+    fn set(hooks: TestHooks) -> Self {
+        set_test_hooks(hooks);
+        let _ = take_diagnostics();
+        Self
+    }
+}
+
+impl Drop for Hooks {
+    fn drop(&mut self) {
+        set_test_hooks(TestHooks::NONE);
+    }
+}
+
+/// A 4 x 4-tile view over an opaque backdrop under a translucent
+/// `Exclusion` layer (a CPU-path document).
+fn cpu_document(store: &mut aurora_tile::TileStore) -> aurora_doc::LayerTree {
+    let mut layers = aurora_doc::LayerTree::new();
+    let _ = layer(&mut layers, store, None, rect(0, 0, 1024, 1024), &opaque);
+    let top = layer(
+        &mut layers,
+        store,
+        None,
+        rect(40, 30, 900, 800),
+        &translucent,
+    );
+    ok(layers.set_blend_mode(top, aurora_doc::BlendMode::Exclusion));
+    assert!(!crate::document_qualifies_for_gpu_compositing(&layers));
+    layers
+}
+
+/// The parallel path really composites on the helpers when the caller
+/// lets them (the differentials below would pass if the caller quietly
+/// did everything), and their tiles are the sequential loop's bits.
 #[test]
-fn the_parallel_path_folds_on_the_pool() {
+fn helpers_composite_tiles_the_caller_installs() {
     if !pool_or_skip() {
         return;
     }
     let (_d, mut store) = store_with_budget(256);
-    let mut layers = aurora_doc::LayerTree::new();
-    let _ = layer(
-        &mut layers,
-        &mut store,
-        None,
-        rect(0, 0, 1024, 1024),
-        &opaque,
-    );
+    let layers = cpu_document(&mut store);
     let tiles = grid(4);
+    let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
+    poison(&mut store, &tiles);
+    let _hooks = Hooks::set(TestHooks {
+        caller_yields: Some(std::time::Duration::from_secs(20)),
+        ..TestHooks::NONE
+    });
     let _switch = Parallel::set(true);
     let mut cache = CompositeCache::default();
     let before = crate::COMPOSITE_STRAIGHTEN_PASSES.with(std::cell::Cell::get);
@@ -154,14 +198,136 @@ fn the_parallel_path_folds_on_the_pool() {
         (0, 0),
         &mut costs,
     ));
-    // The calling thread straightened nothing itself: the pool did.
+    let diagnostics = take_diagnostics();
+    assert_eq!(diagnostics.passes, 1);
+    assert!(diagnostics.helper_tiles > 0, "{diagnostics:?}");
     assert_eq!(
-        crate::COMPOSITE_STRAIGHTEN_PASSES.with(std::cell::Cell::get),
-        before
+        diagnostics.helper_tiles + diagnostics.caller_tiles + diagnostics.duplicates,
+        16,
+        "{diagnostics:?}"
     );
+    // The helpers' straightening was not done on this thread.
+    let straightened = crate::COMPOSITE_STRAIGHTEN_PASSES.with(std::cell::Cell::get) - before;
+    assert!(straightened < 16, "{straightened}");
     for &id in &tiles {
         assert!(cache.is_current(id), "{id:?}");
     }
+    assert_installed(&mut store, &tiles, &sequential, "helpers");
+}
+
+/// Helpers that never start cost the caller nothing: it composites every
+/// tile itself, waits for nobody, and installs the sequential loop's bits.
+#[test]
+fn helpers_that_never_start_leave_the_caller_doing_everything() {
+    if !pool_or_skip() {
+        return;
+    }
+    let (_d, mut store) = store_with_budget(256);
+    let layers = cpu_document(&mut store);
+    let tiles = grid(4);
+    let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
+    poison(&mut store, &tiles);
+    let _hooks = Hooks::set(TestHooks {
+        no_helpers: true,
+        ..TestHooks::NONE
+    });
+    let _switch = Parallel::set(true);
+    let mut cache = CompositeCache::default();
+    recomposite_tiles(&tiles, &layers, None, &mut store, &mut cache, None, None);
+    let diagnostics = take_diagnostics();
+    assert_eq!(diagnostics.caller_tiles, 16, "{diagnostics:?}");
+    assert_eq!(diagnostics.helper_tiles, 0);
+    assert_eq!(diagnostics.duplicates, 0);
+    assert_eq!(diagnostics.wait_ns, 0, "nothing was waited for");
+    assert_eq!(crate::frame_composite::take_pooled_tiles(), 16);
+    assert_installed(&mut store, &tiles, &sequential, "no helpers");
+}
+
+/// A helper preempted in the middle of its tile does not hold the frame:
+/// the caller composites that tile itself after a bounded wait and
+/// returns long before the helper would have finished.
+#[test]
+fn a_stalled_helper_is_not_waited_for() {
+    if !pool_or_skip() {
+        return;
+    }
+    let (_d, mut store) = store_with_budget(256);
+    let layers = cpu_document(&mut store);
+    let tiles = grid(4);
+    let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
+    poison(&mut store, &tiles);
+    // Long enough that a slow (dev, loaded) pass still ends well before
+    // it; a stalled helper only occupies a pool thread, which other tests'
+    // passes do without (their callers composite instead).
+    let stall = std::time::Duration::from_secs(30);
+    let _hooks = Hooks::set(TestHooks {
+        helper_stall: Some(stall),
+        // Let a helper claim a tile before the caller starts, so one is
+        // certainly stalled mid-pass.
+        caller_yields: Some(std::time::Duration::from_secs(5)),
+        ..TestHooks::NONE
+    });
+    let _switch = Parallel::set(true);
+    let mut cache = CompositeCache::default();
+    let started = std::time::Instant::now();
+    recomposite_tiles(&tiles, &layers, None, &mut store, &mut cache, None, None);
+    let took = started.elapsed();
+    let diagnostics = take_diagnostics();
+    assert!(took < stall, "waited for the stalled helper: {took:?}");
+    assert_eq!(diagnostics.helper_tiles, 0, "{diagnostics:?}");
+    // Every tile a stalled helper claimed was composited by the caller.
+    if diagnostics.helper_claimed_passes > 0 {
+        assert!(diagnostics.duplicates > 0, "{diagnostics:?}");
+    }
+    assert_eq!(
+        diagnostics.caller_tiles + diagnostics.duplicates,
+        16,
+        "{diagnostics:?}"
+    );
+    assert_installed(&mut store, &tiles, &sequential, "stalled helper");
+}
+
+/// A helper that needs a tile that is not resident hands the tile back,
+/// and the caller pages it in and composites it: the same bits.
+#[test]
+fn a_helper_hands_back_a_tile_it_cannot_read() {
+    if !pool_or_skip() {
+        return;
+    }
+    // A budget far below the document's tiles, so most are evicted.
+    let (_d, mut store) = store_with_budget(4);
+    let layers = cpu_document(&mut store);
+    let tiles = grid(4);
+    let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
+    poison(&mut store, &tiles);
+    let _hooks = Hooks::set(TestHooks {
+        caller_yields: Some(std::time::Duration::from_secs(20)),
+        ..TestHooks::NONE
+    });
+    let _switch = Parallel::set(true);
+    let mut cache = CompositeCache::default();
+    recomposite_tiles(&tiles, &layers, None, &mut store, &mut cache, None, None);
+    let diagnostics = take_diagnostics();
+    assert!(diagnostics.handed_back > 0, "{diagnostics:?}");
+    assert_installed(&mut store, &tiles, &sequential, "handed back");
+}
+
+/// A helper's budget never logs: a breach only records the wish, and the
+/// helper hands the tile to the caller, whose single pass budget reports
+/// once per pass (`composite_budget_reports_a_breach_once_per_pass...`).
+#[test]
+fn a_helpers_budget_never_reports() {
+    let layers = aurora_doc::LayerTree::new();
+    let mut quiet = crate::CompositeBudget::quiet_for_tile(&layers);
+    assert!(!quiet.wanted_report());
+    assert!(!quiet.should_report(), "a helper logs nothing");
+    assert!(
+        quiet.wanted_report(),
+        "but its tile goes back to the caller"
+    );
+    let mut loud = crate::CompositeBudget::for_tile_of_pass(&layers);
+    assert!(loud.should_report());
+    assert!(!loud.wanted_report());
 }
 
 /// At most `SYNC_TILE_LIMIT` stale tiles (a dab) keep the sequential
@@ -491,31 +657,6 @@ fn nyepi_whole_canvas_composites_the_same_in_parallel() {
         }
     }
     println!("nyepi parallel frame differential: {compared} samples");
-}
-
-/// Budgets sharing one pass flag report once for the whole pass, as the
-/// sequential loop's single budget does; an unshared budget is unaffected.
-#[test]
-fn budgets_sharing_a_pass_report_once() {
-    let layers = aurora_doc::LayerTree::new();
-    let pass = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut first = crate::CompositeBudget::for_tile_of_shared_pass(&layers, &pass);
-    let mut second = crate::CompositeBudget::for_tile_of_shared_pass(&layers, &pass);
-    assert!(second.store_error().is_none(), "nothing tallied yet");
-    assert!(first.should_report(), "the pass's first breach reports");
-    assert!(!first.should_report(), "and only once on that tile");
-    assert!(
-        !second.should_report(),
-        "another tile of the pass stays quiet"
-    );
-    let mut other = crate::CompositeBudget::for_tile_of_pass(&layers);
-    assert!(
-        other.should_report(),
-        "an unshared budget reports on its own"
-    );
-    let fresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut next_pass = crate::CompositeBudget::for_tile_of_shared_pass(&layers, &fresh);
-    assert!(next_pass.should_report(), "a new pass reports again");
 }
 
 /// Poisons the composite tiles `tiles`, so a tile a path fails to install
