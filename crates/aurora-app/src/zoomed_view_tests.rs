@@ -84,6 +84,9 @@ fn tiles_past_the_document_are_not_in_it() {
     assert!(!tile_in_document(1, TileId { x: 2, y: 0 }, canvas));
     assert!(tile_in_document(2, TileId { x: 0, y: 0 }, canvas));
     assert!(!tile_in_document(2, TileId { x: 1, y: 0 }, canvas));
+    // A document exactly four tiles wide ends where tile 4 starts.
+    assert!(!tile_in_document(0, TileId { x: 4, y: 0 }, (1024, 600)));
+    assert!(tile_in_document(0, TileId { x: 3, y: 0 }, (1024, 600)));
 }
 
 // -------------------------------------------------------------- geometry
