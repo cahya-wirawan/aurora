@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.273.0] - 2026-10-18
+
+### Added
+
+- Record 60 FPS round 8: the frame pool's caller composites, opaque chunks skip straightening
+
 ## [0.272.0] - 2026-10-18
 
 ### Added
