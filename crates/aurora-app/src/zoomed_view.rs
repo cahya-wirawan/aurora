@@ -90,6 +90,44 @@ pub(crate) fn level_for_zoom(zoom: f32) -> u32 {
     level
 }
 
+/// [`level_for_zoom`] for a zoomed-out atlas whose floor is `floor`
+/// (task 136 review, ZV-1): one level deeper while the level zoom would be
+/// below the floor, so the atlas never clamps and the render path keeps
+/// the zoom the pointer path divides by. With the double-coverage atlas's
+/// usual floor (at most 0.5) this is [`level_for_zoom`] exactly; on a
+/// canvas area too large for the device's textures the level zoom can be
+/// a magnification of up to twice the floor.
+#[must_use]
+pub(crate) fn level_for_zoom_within(zoom: f32, floor: f32) -> u32 {
+    let mut level = level_for_zoom(zoom);
+    while level < MAX_LEVEL && zoom * level_scale(level) < floor {
+        level += 1;
+    }
+    level
+}
+
+/// The 1:1 canvas atlas's floor on a device whose largest texture side is
+/// `limit` (the frame draws the zoomed-out view below it).
+#[must_use]
+pub(crate) fn atlas_floor(canvas_px: (u32, u32), limit: u32) -> f32 {
+    aurora_gpu::TileResidency::min_zoom_for_viewport_within(canvas_px, 1, limit)
+}
+
+/// The zoomed-out atlas's floor on a device whose largest texture side is
+/// `limit`.
+#[must_use]
+pub(crate) fn zoomed_floor(canvas_px: (u32, u32), limit: u32) -> f32 {
+    aurora_gpu::TileResidency::min_zoom_for_viewport_within(canvas_px, COVERAGE, limit)
+}
+
+/// The canvas's physical zoom floor: [`MIN_PHYSICAL_ZOOM`], or higher on a
+/// canvas area so large that even the deepest level would have to be shown
+/// below the zoomed-out atlas's floor.
+#[must_use]
+pub(crate) fn physical_floor(canvas_px: (u32, u32), limit: u32) -> f32 {
+    MIN_PHYSICAL_ZOOM.max(zoomed_floor(canvas_px, limit) / level_scale(MAX_LEVEL))
+}
+
 /// `2^level` as `f32`.
 #[must_use]
 pub(crate) fn level_scale(level: u32) -> f32 {
@@ -181,7 +219,8 @@ pub(crate) struct ZoomedFrame {
 
 /// The frame for a view whose top-left canvas pixel is document point
 /// `view_origin` at physical zoom `zoom`, in a canvas area of `canvas_px`
-/// physical pixels, over a document of `doc_size` pixels.
+/// physical pixels, over a document of `doc_size` pixels, for a
+/// zoomed-out atlas whose floor is `floor` ([`zoomed_floor`]).
 #[must_use]
 #[allow(
     clippy::cast_possible_truncation,
@@ -193,13 +232,14 @@ pub(crate) fn plan(
     zoom: f32,
     canvas_px: (u32, u32),
     doc_size: (u32, u32),
+    floor: f32,
 ) -> ZoomedFrame {
     let zoom = if zoom.is_finite() && zoom > 0.0 {
         zoom
     } else {
         1.0
     };
-    let level = level_for_zoom(zoom);
+    let level = level_for_zoom_within(zoom, floor);
     let scale = level_scale(level);
     let axis = |origin: f32, canvas: u32| {
         let origin = if origin.is_finite() { origin } else { 0.0 };
@@ -292,12 +332,26 @@ pub(crate) fn fit_zoom(canvas: (f32, f32), doc: (u32, u32)) -> Option<f32> {
 #[cfg(test)]
 #[must_use]
 pub(crate) fn rendered_canvas_zoom(canvas_px: (u32, u32), zoom: f32) -> f32 {
-    if zoom >= aurora_gpu::TileResidency::min_zoom_for_viewport(canvas_px) || !zoom.is_finite() {
-        return aurora_gpu::TileResidency::effective_zoom(canvas_px, zoom);
+    rendered_canvas_zoom_within(canvas_px, zoom, u32::MAX)
+}
+
+/// [`rendered_canvas_zoom`] on a device whose largest texture side is
+/// `limit`: both atlases capped to it, as `TileResidency::with_coverage`
+/// caps them.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn rendered_canvas_zoom_within(canvas_px: (u32, u32), zoom: f32, limit: u32) -> f32 {
+    let one = atlas_floor(canvas_px, limit);
+    if zoom >= one || !zoom.is_finite() || zoom <= 0.0 {
+        return if zoom.is_finite() && zoom > 0.0 {
+            zoom.max(one)
+        } else {
+            one.max(1.0)
+        };
     }
-    let scale = level_scale(level_for_zoom(zoom));
-    aurora_gpu::TileResidency::effective_zoom_with_coverage(canvas_px, zoom * scale, COVERAGE)
-        / scale
+    let floor = zoomed_floor(canvas_px, limit);
+    let scale = level_scale(level_for_zoom_within(zoom, floor));
+    (zoom * scale).max(floor) / scale
 }
 
 /// Palette and menu id of View > Fit on Screen (`Primary+0`).
@@ -426,14 +480,57 @@ fn current_at(cache: &crate::CompositeCache, level: u32, id: TileId) -> bool {
     }
 }
 
-/// Builds level-`level` tile `id` from its children and marks it current.
+/// Recomposites `tiles` in chunks of [`LEVEL0_CHUNK`] until `budget` is
+/// spent (always at least one chunk, so a frame always progresses);
+/// returns the tiles done and whether any were left.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn recomposite_within_budget(
+    tiles: &[TileId],
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    store: &mut aurora_tile::TileStore,
+    cache: &mut crate::CompositeCache,
+    gpu: Option<&aurora_gpu::GpuContext>,
+    mut compositor: Option<&mut aurora_render::TileCompositor>,
+    budget: Duration,
+) -> (usize, bool) {
+    let started = Instant::now();
+    let mut done = 0;
+    for chunk in tiles.chunks(LEVEL0_CHUNK) {
+        if done > 0 && started.elapsed() >= budget {
+            return (done, true);
+        }
+        crate::recomposite_tiles(
+            chunk,
+            layers,
+            active_layer,
+            store,
+            cache,
+            gpu,
+            compositor.as_deref_mut(),
+        );
+        done += chunk.len();
+    }
+    (done, false)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook (ZV-4): makes every pyramid tile write fail, as a store
+    /// that cannot page a tile in would.
+    pub(crate) static FAIL_PYRAMID_WRITES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Builds level-`level` tile `id` from its children and marks it current;
+/// whether it did (a store error leaves it as it was, not current).
 fn build_tile(
     store: &mut aurora_tile::TileStore,
     cache: &mut crate::CompositeCache,
     level: u32,
     id: TileId,
     canvas: (u32, u32),
-) {
+) -> bool {
     let child_surface = level_surface(level - 1);
     let mut children: [Option<std::sync::Arc<Vec<half::f16>>>; 4] = [None, None, None, None];
     let mut owned: [Option<Vec<half::f16>>; 4] = [None, None, None, None];
@@ -482,14 +579,22 @@ fn build_tile(
         width: TILE,
         height: TILE,
     };
-    if let Ok(dest) = store.get_mut(level_surface(level), id)
+    #[cfg(test)]
+    let refused = FAIL_PYRAMID_WRITES.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let refused = false;
+    let mut written = false;
+    if !refused
+        && let Ok(dest) = store.get_mut(level_surface(level), id)
         && dest.texels().len() == out.len()
     {
         dest.texels_mut().copy_from_slice(&out);
         dest.mark_dirty(full);
         cache.pyramid.mark_current(level, id);
+        written = true;
     }
     crate::tile_buffers::recycle(out);
+    written
 }
 
 /// One frame's worth of pyramid work for showing `visible` tiles of
@@ -527,33 +632,31 @@ pub(crate) fn advance(
     if !level0_tiles.is_empty() {
         match level0 {
             Level0::Worker(worker) => {
-                crate::dispatch_or_composite_tiles(
+                if crate::dispatch_or_composite_tiles_bounded(
                     &level0_tiles,
                     layers,
                     active_layer,
                     store,
                     cache,
                     worker,
-                );
-            }
-            Level0::Sync(gpu, mut compositor) => {
-                let started = Instant::now();
-                for chunk in level0_tiles.chunks(LEVEL0_CHUNK) {
-                    if started.elapsed() >= LEVEL0_FRAME_BUDGET {
-                        result.more = true;
-                        break;
-                    }
-                    crate::recomposite_tiles(
-                        chunk,
-                        layers,
-                        active_layer,
-                        store,
-                        cache,
-                        gpu,
-                        compositor.as_deref_mut(),
-                    );
-                    result.composited += chunk.len();
+                    Some(LEVEL0_FRAME_BUDGET),
+                ) {
+                    result.more = true;
                 }
+            }
+            Level0::Sync(gpu, compositor) => {
+                let (done, more) = recomposite_within_budget(
+                    &level0_tiles,
+                    layers,
+                    active_layer,
+                    store,
+                    cache,
+                    gpu,
+                    compositor,
+                    LEVEL0_FRAME_BUDGET,
+                );
+                result.composited += done;
+                result.more |= more;
             }
         }
     }
@@ -584,8 +687,11 @@ pub(crate) fn advance(
                 result.more = true;
                 break 'levels;
             }
-            build_tile(store, cache, l, id, canvas);
-            result.built += 1;
+            // Only a written tile counts (ZV-4): a store that keeps failing
+            // must not keep the loop redrawing.
+            if build_tile(store, cache, l, id, canvas) {
+                result.built += 1;
+            }
         }
     }
     result.complete = visible

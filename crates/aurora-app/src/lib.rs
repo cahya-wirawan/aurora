@@ -26153,6 +26153,32 @@ fn dispatch_or_composite_tiles(
     cache: &mut CompositeCache,
     worker: &mut background_composite::CompositeWorker,
 ) {
+    let _ = dispatch_or_composite_tiles_bounded(
+        tiles,
+        layers,
+        active_layer,
+        store,
+        cache,
+        worker,
+        None,
+    );
+}
+
+/// [`dispatch_or_composite_tiles`] with the synchronous fallback for a
+/// refused dispatch bounded by `budget` (task 136 review, ZV-3: on the
+/// zoomed-out path the needed set can be the whole document, which the
+/// unbounded fallback would composite in one frame). `None` is the
+/// unbounded original. Returns whether fallback work was left for a later
+/// frame.
+fn dispatch_or_composite_tiles_bounded(
+    tiles: &[aurora_tile::TileId],
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    store: &mut aurora_tile::TileStore,
+    cache: &mut CompositeCache,
+    worker: &mut background_composite::CompositeWorker,
+    budget: Option<std::time::Duration>,
+) -> bool {
     let reference_origin = composite_reference_origin(layers, active_layer);
     let mut target = background_composite::CompositeTarget {
         layers,
@@ -26171,7 +26197,7 @@ fn dispatch_or_composite_tiles(
         .filter(|&tile| !worker.covers(&target, tile))
         .collect();
     if uncovered.is_empty() {
-        return;
+        return false;
     }
     if uncovered.len() <= background_composite::SYNC_TILE_LIMIT {
         recomposite_tiles(
@@ -26183,15 +26209,27 @@ fn dispatch_or_composite_tiles(
             None,
             None,
         );
-        return;
+        return false;
     }
     if worker.is_busy() && worker.active_is_healthy(&target) {
         // Left to finish; its `Done` wakes the loop and the next redraw
         // dispatches what it didn't cover.
-        return;
+        return false;
     }
     if !worker.dispatch(&mut target, stale) {
-        recomposite_tiles(
+        let Some(budget) = budget else {
+            recomposite_tiles(
+                &uncovered,
+                layers,
+                active_layer,
+                target.store,
+                target.cache,
+                None,
+                None,
+            );
+            return false;
+        };
+        return zoomed_view::recomposite_within_budget(
             &uncovered,
             layers,
             active_layer,
@@ -26199,8 +26237,11 @@ fn dispatch_or_composite_tiles(
             target.cache,
             None,
             None,
-        );
+            budget,
+        )
+        .1;
     }
+    false
 }
 
 /// [`recomposite_visible_tiles`] over an explicit tile list (0.186.0).
@@ -30305,6 +30346,24 @@ fn guarded_scale_factor(scale_factor: f64) -> f32 {
 /// number being one, so rounding it up is always the safe direction.
 #[must_use]
 fn canvas_min_zoom(canvas_size: (u32, u32), scale_factor: f64) -> f32 {
+    canvas_min_zoom_within(canvas_size, scale_factor, u32::MAX)
+}
+
+/// The largest texture side `gpu` allows (`u32::MAX` with no device: then
+/// nothing is drawn and no cap applies).
+#[must_use]
+fn texture_limit(gpu: Option<&GpuContext>) -> u32 {
+    gpu.map_or(u32::MAX, |gpu| {
+        gpu.device().limits().max_texture_dimension_2d
+    })
+}
+
+/// [`canvas_min_zoom`] on a device whose largest texture side is `limit`
+/// (task 136 review, ZV-1): on a canvas area too large for the device's
+/// textures the zoomed-out atlas is capped and its floor rises, and so
+/// does this one ([`zoomed_view::physical_floor`]).
+#[must_use]
+fn canvas_min_zoom_within(canvas_size: (u32, u32), scale_factor: f64, limit: u32) -> f32 {
     // 0.275.0: below the 1:1 atlas's floor the frame draws the zoomed-out
     // view (`zoomed_view`), which renders every zoom down to
     // `MIN_PHYSICAL_ZOOM`, so that is the floor now; the atlas floor
@@ -30314,7 +30373,7 @@ fn canvas_min_zoom(canvas_size: (u32, u32), scale_factor: f64) -> f32 {
     let floor = if canvas_size.0 == 0 || canvas_size.1 == 0 {
         aurora_gpu::TileResidency::min_zoom_for_viewport(canvas_size)
     } else {
-        zoomed_view::MIN_PHYSICAL_ZOOM
+        zoomed_view::physical_floor(canvas_size, limit)
     };
     let scale = guarded_scale_factor(scale_factor);
     let mut min_zoom = floor / scale;
@@ -30619,13 +30678,15 @@ fn apply_zoomed_out_centring(
     view: &mut aurora_ui::CanvasView,
     drag: Option<&mut Drag>,
     pointer: Option<(f32, f32)>,
+    atlas_floor: f32,
     canvas_px: (u32, u32),
     canvas_logical: Option<(f32, f32)>,
     doc_size: (u32, u32),
     scale_factor: f64,
 ) {
+    let _ = canvas_px;
     let zoom = effective_residency_zoom(view.zoom(), scale_factor);
-    if zoom >= aurora_gpu::TileResidency::min_zoom_for_viewport(canvas_px) {
+    if zoom >= atlas_floor {
         return;
     }
     let Some(canvas_logical) = canvas_logical else {
@@ -37299,7 +37360,11 @@ impl App {
                 &mut self.doc.canvas_view,
                 self.drag.as_mut(),
                 pointer,
-                canvas_min_zoom(canvas_size, self.scale_factor),
+                canvas_min_zoom_within(
+                    canvas_size,
+                    self.scale_factor,
+                    texture_limit(self.gpu.as_ref()),
+                ),
                 bounds,
             );
             if gpu_target_needs_resize(self.residency_viewport, canvas_size)
@@ -37554,7 +37619,8 @@ impl App {
     fn prepare_zoomed_frame(&mut self, gpu: &GpuContext) -> Option<zoomed_view::ZoomedFrame> {
         let canvas_px = canvas_area_physical_size(&self.workspace, self.scale_factor)?;
         let zoom = effective_residency_zoom(self.doc.canvas_view.zoom(), self.scale_factor);
-        if zoom >= aurora_gpu::TileResidency::min_zoom_for_viewport(canvas_px) {
+        let limit = gpu.device().limits().max_texture_dimension_2d;
+        if zoom >= zoomed_view::atlas_floor(canvas_px, limit) {
             return None;
         }
         let store = self.doc.tile_store.as_mut()?;
@@ -37564,6 +37630,7 @@ impl App {
             zoom,
             canvas_px,
             self.doc.canvas_size,
+            zoomed_view::zoomed_floor(canvas_px, limit),
         );
         let fresh = !matches!(&self.zoomed_residency, Some((_, size)) if *size == canvas_px);
         if fresh {
@@ -37622,6 +37689,11 @@ impl App {
             usize::MAX,
             &frame.visible,
         );
+        // At once, not when the frame is drawn (task 136 review, ZV-2): the
+        // upload consumed the composite tiles' dirty flags at level 0, so
+        // even a frame whose surface texture never arrives must make the
+        // next 1:1 frame forget the canvas atlas's slots.
+        self.zoomed_drawn = true;
         Some(frame)
     }
 
@@ -37662,17 +37734,19 @@ impl App {
                 self.doc.active_layer,
                 canvas_area_logical_size(&self.workspace),
             );
+            let limit = texture_limit(self.gpu.as_ref());
             apply_canvas_min_zoom(
                 &mut self.doc.canvas_view,
                 self.drag.as_mut(),
                 pointer,
-                canvas_min_zoom(canvas_size, self.scale_factor),
+                canvas_min_zoom_within(canvas_size, self.scale_factor, limit),
                 bounds,
             );
             apply_zoomed_out_centring(
                 &mut self.doc.canvas_view,
                 self.drag.as_mut(),
                 pointer,
+                zoomed_view::atlas_floor(canvas_size, limit),
                 canvas_size,
                 canvas_area_logical_size(&self.workspace),
                 self.doc.canvas_size,

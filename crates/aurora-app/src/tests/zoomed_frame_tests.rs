@@ -122,7 +122,13 @@ impl Rig {
             };
             let _ = worker.drain(Some(&mut target));
         }
-        let frame = zoomed_view::plan(origin, zoom, VIEWPORT, photo.size);
+        let frame = zoomed_view::plan(
+            origin,
+            zoom,
+            VIEWPORT,
+            photo.size,
+            zoomed_view::zoomed_floor(VIEWPORT, gpu.device().limits().max_texture_dimension_2d),
+        );
         if self.level != Some(frame.level) {
             self.atlas.forget_slots();
             self.level = Some(frame.level);
@@ -247,11 +253,15 @@ fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str,
     let (frames, total, times) = rig.until_complete(gpu, photo, zoom, origin, 2_000);
     let (mean, p90, max) = stats(&times);
     let pyramid = rig.cache.pyramid.current_len();
+    // The level-0 composite the pyramid is built from stays in the store
+    // too (512 KiB a tile, pageable).
+    let level0 = rig.cache.current.len();
     println!(
         "R10 cold doc={label} path={path} how={how} zoom={zoom:.4} level={level} frames={frames} \
          ms={total:.0} ui_mean={mean:.2} ui_p90={p90:.2} ui_max={max:.2} pyramid_tiles={pyramid} \
-         pyramid_mib={:.1} held={}",
+         pyramid_mib={:.1} level0_tiles={level0} level0_mib={:.1} held={}",
         pyramid as f64 * 0.5,
+        level0 as f64 * 0.5,
         photo.store.held_tile_count_bound()
     );
 

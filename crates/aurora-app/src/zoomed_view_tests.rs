@@ -98,7 +98,13 @@ fn fitting_a_60_mp_photo_shows_all_of_it_at_level_two() {
     let canvas_px = (1600, 900);
     let doc = (9504, 6336);
     let zoom = 900.0 / 6336.0;
-    let frame = plan((-(1600.0 / zoom - 9504.0) / 2.0, 0.0), zoom, canvas_px, doc);
+    let frame = plan(
+        (-(1600.0 / zoom - 9504.0) / 2.0, 0.0),
+        zoom,
+        canvas_px,
+        doc,
+        super::zoomed_floor(canvas_px, u32::MAX),
+    );
     assert_eq!(frame.level, 2);
     assert!((frame.level_zoom - zoom * 4.0).abs() < 1e-6);
     // Ten by seven level-2 tiles cover 9504 x 6336 / 4.
@@ -113,7 +119,13 @@ fn fitting_a_60_mp_photo_shows_all_of_it_at_level_two() {
 
 #[test]
 fn a_panned_zoomed_out_view_starts_at_the_level_texel_under_its_corner() {
-    let frame = plan((2048.0, 1024.0), 0.25, (1000, 800), (20_000, 12_000));
+    let frame = plan(
+        (2048.0, 1024.0),
+        0.25,
+        (1000, 800),
+        (20_000, 12_000),
+        super::zoomed_floor((1000, 800), u32::MAX),
+    );
     assert_eq!(frame.level, 2);
     assert_eq!(frame.level_origin, (512.0, 256.0));
     assert_eq!(frame.shift_px, (0, 0));
@@ -127,7 +139,13 @@ fn a_panned_zoomed_out_view_starts_at_the_level_texel_under_its_corner() {
 
 #[test]
 fn a_view_wholly_past_the_document_shows_no_tiles() {
-    let frame = plan((50_000.0, 0.0), 0.25, (1000, 800), (20_000, 12_000));
+    let frame = plan(
+        (50_000.0, 0.0),
+        0.25,
+        (1000, 800),
+        (20_000, 12_000),
+        super::zoomed_floor((1000, 800), u32::MAX),
+    );
     assert!(frame.visible.is_empty());
 }
 
@@ -603,7 +621,13 @@ fn the_zoomed_out_atlas_draws_the_scaled_export_at_a_power_of_two_zoom() {
     let mut cache = crate::CompositeCache::default();
     let _ = settle(&mut doc, &mut cache, 2);
     let viewport = (512, 256);
-    let frame = plan((0.0, 0.0), 0.25, viewport, doc.size);
+    let frame = plan(
+        (0.0, 0.0),
+        0.25,
+        viewport,
+        doc.size,
+        super::zoomed_floor(viewport, u32::MAX),
+    );
     assert_eq!(frame.level, 2);
     assert_eq!(frame.level_zoom, 1.0);
     let mut atlas =
@@ -650,4 +674,145 @@ fn the_zoomed_out_atlas_draws_the_scaled_export_at_a_power_of_two_zoom() {
             );
         }
     }
+}
+
+// ---------------------------------------------------- review (ZV-1..ZV-4)
+
+/// Canvas areas up to 8K and past it, at wgpu's default 8192 limit.
+const BIG_CANVASES: [(u32, u32); 7] = [
+    (1920, 1080),
+    (3968, 2160),
+    (4000, 2250),
+    (5120, 2880),
+    (6016, 3384),
+    (7680, 4320),
+    (8000, 4500),
+];
+
+#[test]
+fn a_capped_atlas_keeps_the_render_and_pointer_zoom_equal_at_every_zoom() {
+    for limit in [8192_u32, 16_384, u32::MAX] {
+        for canvas in BIG_CANVASES {
+            let floor = super::physical_floor(canvas, limit);
+            let mut zoom = floor;
+            while zoom < 2.0 {
+                let rendered = super::rendered_canvas_zoom_within(canvas, zoom, limit);
+                assert!(
+                    (rendered - zoom).abs() <= zoom * 1e-6,
+                    "canvas {canvas:?} limit {limit}: zoom {zoom} rendered at {rendered}"
+                );
+                zoom *= 1.013;
+            }
+        }
+    }
+}
+
+#[test]
+fn the_level_rises_past_a_capped_atlas_floor() {
+    // 5120 px wide on an 8192 limit: the double-coverage grid is capped to
+    // 32 tiles, so its floor is 5120 / 7936.
+    let canvas = (5120, 2880);
+    let floor = super::zoomed_floor(canvas, 8192);
+    assert!((floor - 5120.0 / 7936.0).abs() < 1e-6, "{floor}");
+    let frame = plan((0.0, 0.0), 0.55, canvas, (20_000, 12_000), floor);
+    assert_eq!(frame.level, 1);
+    assert!((frame.level_zoom - 1.1).abs() < 1e-6);
+    // An uncapped atlas shows the same zoom at level 0.
+    assert_eq!(super::level_for_zoom_within(0.55, 0.5), 0);
+    // A floor above 1 (a canvas wider than the largest texture) still finds
+    // a level the atlas draws without clamping.
+    for zoom in [0.06_f32, 0.3, 0.52, 0.9] {
+        let level = super::level_for_zoom_within(zoom, 1.13);
+        assert!(zoom * level_scale(level) >= 1.13, "{zoom}");
+    }
+    // The canvas floor rises with it when even level 5 would clamp.
+    let huge = (8000, 4500);
+    let physical = super::physical_floor(huge, 8192);
+    assert!(physical * level_scale(MAX_LEVEL) >= super::zoomed_floor(huge, 8192));
+    assert_eq!(super::physical_floor((1920, 1080), 8192), MIN_PHYSICAL_ZOOM);
+    let logical = crate::canvas_min_zoom_within(huge, 1.0, 8192);
+    assert!(logical >= physical);
+}
+
+#[test]
+fn the_zoomed_out_frame_marks_itself_drawn_as_soon_as_it_uploads() {
+    // ZV-2, a source pin (the method needs a window): `zoomed_drawn` is set
+    // right after the upload inside `prepare_zoomed_frame`, so a frame whose
+    // surface texture never arrives still makes the next 1:1 frame forget
+    // the canvas atlas's slots.
+    let source = include_str!("lib.rs");
+    let start = source
+        .find("fn prepare_zoomed_frame(")
+        .unwrap_or_else(|| unreachable!("the method exists"));
+    let body = source.get(start..).unwrap_or_default();
+    let end = body.find("\n    fn redraw(").unwrap_or(body.len());
+    let body = body.get(..end).unwrap_or_default();
+    let upload = body.find("sync_only(").unwrap_or(usize::MAX);
+    let marked = body.find("self.zoomed_drawn = true;").unwrap_or(0);
+    assert!(upload < usize::MAX && marked > upload, "{upload} {marked}");
+}
+
+#[test]
+fn a_budgeted_recomposite_always_progresses_and_stops_at_its_budget() {
+    let mut doc = document((2100, 1100));
+    let mut cache = crate::CompositeCache::default();
+    let tiles: Vec<TileId> = (0..5)
+        .flat_map(|y| (0..9).map(move |x| TileId { x, y }))
+        .collect();
+    let (done, more) = super::recomposite_within_budget(
+        &tiles,
+        &doc.layers,
+        Some(doc.top),
+        &mut doc.store,
+        &mut cache,
+        None,
+        None,
+        Duration::ZERO,
+    );
+    assert_eq!(done, super::LEVEL0_CHUNK);
+    assert!(more);
+    let (done, more) = super::recomposite_within_budget(
+        &tiles,
+        &doc.layers,
+        Some(doc.top),
+        &mut doc.store,
+        &mut cache,
+        None,
+        None,
+        Duration::from_mins(1),
+    );
+    assert_eq!(done, tiles.len());
+    assert!(!more);
+}
+
+#[test]
+fn a_pyramid_write_that_fails_is_not_counted_and_asks_for_no_redraw() {
+    let mut doc = document((1100, 700));
+    let mut cache = crate::CompositeCache::default();
+    let _ = settle(&mut doc, &mut cache, 0);
+    let visible: Vec<TileId> = (0..1)
+        .flat_map(|y| (0..2).map(move |x| TileId { x, y }))
+        .collect();
+    super::FAIL_PYRAMID_WRITES.with(|fail| fail.set(true));
+    let step = advance(
+        2,
+        &visible,
+        doc.size,
+        &doc.layers,
+        Some(doc.top),
+        &mut doc.store,
+        &mut cache,
+        Level0::Sync(None, None),
+        Duration::from_mins(1),
+    );
+    super::FAIL_PYRAMID_WRITES.with(|fail| fail.set(false));
+    assert_eq!(step.built, 0);
+    assert!(!step.complete);
+    assert!(
+        !step.more,
+        "a persistent store error must not keep redrawing"
+    );
+    assert_eq!(cache.pyramid.current_len(), 0);
+    let _ = settle(&mut doc, &mut cache, 2);
+    assert_level_matches_export(&mut doc, 2, TOLERANCE);
 }

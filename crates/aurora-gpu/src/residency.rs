@@ -1076,7 +1076,18 @@ impl TileResidency {
     ) -> Self {
         let coverage = coverage.clamp(1, Self::MAX_COVERAGE);
         let mip_levels = if coverage == 1 { MIP_LEVELS } else { 1 };
-        let grid = Self::grid_for_coverage(viewport_px, coverage);
+        // Never larger than the device can allocate (task 136 review,
+        // ZV-1): wgpu's default limits allow 8192 texels a side, which a
+        // double-coverage atlas passes from a canvas area of about 3,968
+        // physical pixels and the canvas atlas from about 7,936. The floor
+        // (`min_zoom_for_viewport_within`, `rendered_zoom_value_c`) is
+        // derived from this real grid, so a capped atlas renders a higher
+        // floor rather than fabricating or failing.
+        let grid = Self::grid_for_coverage_within(
+            viewport_px,
+            coverage,
+            device.limits().max_texture_dimension_2d,
+        );
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tile-residency"),
             size: wgpu::Extent3d {
@@ -1425,6 +1436,18 @@ impl TileResidency {
     /// [`Self::grid_for`] for an atlas covering `coverage` viewports per
     /// axis: the viewport multiplied first (saturating), then the same
     /// formula, so `coverage == 1` is `grid_for` exactly.
+    /// [`Self::grid_for_coverage`] capped so neither side of the texture
+    /// exceeds `max_dimension` texels (at least one tile).
+    fn grid_for_coverage_within(
+        viewport_px: (u32, u32),
+        coverage: u32,
+        max_dimension: u32,
+    ) -> (u32, u32) {
+        let cap = (max_dimension / TILE).max(1);
+        let grid = Self::grid_for_coverage(viewport_px, coverage);
+        (grid.0.min(cap), grid.1.min(cap))
+    }
+
     fn grid_for_coverage(viewport_px: (u32, u32), coverage: u32) -> (u32, u32) {
         (
             viewport_px
@@ -1535,8 +1558,23 @@ impl TileResidency {
     /// pyramid level at any zoom in `(0.5, 1]` of it.
     #[must_use]
     pub fn min_zoom_for_viewport_with_coverage(viewport_px: (u32, u32), coverage: u32) -> f32 {
+        Self::min_zoom_for_viewport_within(viewport_px, coverage, u32::MAX)
+    }
+
+    /// The zoom floor of an atlas built by [`Self::with_coverage`] on a
+    /// device whose `max_texture_dimension_2d` is `max_dimension`: the
+    /// atlas's grid is capped to that size, and this is the floor of the
+    /// capped grid (above 1.0 for a canvas area wider than the device's
+    /// largest texture less a tile). Equal to
+    /// [`Self::min_zoom_for_viewport_with_coverage`] whenever the grid fits.
+    #[must_use]
+    pub fn min_zoom_for_viewport_within(
+        viewport_px: (u32, u32),
+        coverage: u32,
+        max_dimension: u32,
+    ) -> f32 {
         let coverage = coverage.clamp(1, Self::MAX_COVERAGE);
-        let grid = Self::grid_for_coverage(viewport_px, coverage);
+        let grid = Self::grid_for_coverage_within(viewport_px, coverage, max_dimension);
         Self::zoom_floor(
             viewport_px,
             grid.0.saturating_mul(TILE) as f32,
@@ -2888,6 +2926,57 @@ mod tests {
                     // inside the atlas.
                     assert!(sx * tex.0 + sub.0 <= tex.0, "{viewport:?} {zoom}");
                     assert!(sy * tex.1 + sub.1 <= tex.1, "{viewport:?} {zoom}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_atlas_grid_exceeds_the_device_texture_limit() {
+        // Every canvas area up to 8K and past it, on wgpu's default limit
+        // and a larger and a smaller one.
+        for limit in [8192_u32, 16_384, 4096] {
+            for width in (256..=9000).step_by(97) {
+                for height in [256_u32, 1080, 2160, 4320, 8000] {
+                    for coverage in [1, 2] {
+                        let grid = TileResidency::grid_for_coverage_within(
+                            (width, height),
+                            coverage,
+                            limit,
+                        );
+                        assert!(grid.0 * TILE <= limit && grid.1 * TILE <= limit);
+                        let floor = TileResidency::min_zoom_for_viewport_within(
+                            (width, height),
+                            coverage,
+                            limit,
+                        );
+                        assert!(floor.is_finite() && floor > 0.0);
+                        // Within the limit the cap changes nothing.
+                        let free = TileResidency::grid_for_coverage((width, height), coverage);
+                        if free.0 * TILE <= limit && free.1 * TILE <= limit {
+                            assert_eq!(grid, free);
+                            assert_eq!(
+                                floor.to_bits(),
+                                TileResidency::min_zoom_for_viewport_with_coverage(
+                                    (width, height),
+                                    coverage
+                                )
+                                .to_bits()
+                            );
+                        }
+                        // The floor really is the capped grid's: any zoom at
+                        // or above it is rendered as asked.
+                        let [_, _, sx, _] = TileResidency::uniform_values_c(
+                            grid,
+                            TileId { x: 0, y: 0 },
+                            (255.0, 0.0),
+                            (width, height),
+                            floor,
+                            coverage,
+                        );
+                        let tex = (grid.0 * TILE) as f32;
+                        assert!(sx * tex + 255.0 <= tex * (1.0 + 1e-6), "{width} {coverage}");
+                    }
                 }
             }
         }
