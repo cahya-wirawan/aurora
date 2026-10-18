@@ -16313,6 +16313,10 @@ impl CompositeBudget {
             self.wanted_report = true;
             return false;
         }
+        #[cfg(test)]
+        if first {
+            COMPOSITE_REPORTS.with(|n| n.set(n.get() + 1));
+        }
         first
     }
 
@@ -23156,6 +23160,14 @@ struct CompositeProfile {
 
 #[cfg(test)]
 thread_local! {
+    /// Test-only: how many times a [`CompositeBudget`] on this thread
+    /// answered `true` to [`CompositeBudget::should_report`] (a warning
+    /// logged), 60 FPS round 8.
+    static COMPOSITE_REPORTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
     static COMPOSITE_PROFILE: std::cell::Cell<CompositeProfile> =
         const { std::cell::Cell::new(CompositeProfile { slots: [(0, 0); 11] }) };
     /// Test-only: context nodes skipped below a cover by occlusion culling
@@ -26415,7 +26427,9 @@ fn recomposite_tiles(
 /// fewer than [`frame_composite::MIN_PARALLEL_TILES`] are stale (a dab:
 /// the redraw handler composites at most
 /// [`background_composite::SYNC_TILE_LIMIT`] tiles itself and those keep
-/// the sequential loop), the pool is unavailable or (tests) disabled.
+/// the sequential loop), the store holds more tiles than a pass may
+/// snapshot ([`frame_composite::MAX_SNAPSHOT_TILES`]), the pool is
+/// unavailable or (tests) disabled.
 fn recomposite_tiles_in_parallel(
     tiles: &[aurora_tile::TileId],
     layers: &aurora_doc::LayerTree,
@@ -26433,7 +26447,9 @@ fn recomposite_tiles_in_parallel(
         .copied()
         .filter(|&tile_id| !cache.is_current(tile_id) && seen.insert(tile_id))
         .collect();
-    if stale.len() < frame_composite::MIN_PARALLEL_TILES {
+    if stale.len() < frame_composite::MIN_PARALLEL_TILES
+        || !frame_composite::snapshot_is_bounded(store)
+    {
         return false;
     }
     let Some(pool) = frame_composite::frame_pool() else {

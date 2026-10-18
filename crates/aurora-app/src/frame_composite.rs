@@ -92,6 +92,28 @@ pub(crate) const MIN_PARALLEL_TILES: usize =
 /// How far a helper may run ahead of the caller's installed prefix.
 pub(crate) const HELPER_WINDOW_TILES: usize = 16;
 
+/// The most tiles a store may hold (by
+/// [`TileStore::held_tile_count_bound`]) for a pass to use the helpers
+/// (60 FPS round 8). A pass's [`Snapshot`] walks every held tile on the
+/// calling thread, so on a larger store the caller keeps the sequential
+/// loop. Measured (release, i3-10100, `time_a_pass_over_a_large_store`)
+/// at 0.13-0.16 µs a held tile (1.3 ms for 10,000, 8 ms for 50,000), so
+/// this bounds the walk to about 0.6 ms, less than three helpers save on
+/// a four-tile pass of a plain two-layer document (PLAN.md, round 8). In
+/// the live app a large document's bigger recomposites go to the
+/// background worker anyway; this path runs only without one.
+pub(crate) const MAX_SNAPSHOT_TILES: usize = 4_096;
+
+/// Whether a pass over `store` may use the helpers: its snapshot is
+/// bounded ([`MAX_SNAPSHOT_TILES`]).
+pub(crate) fn snapshot_is_bounded(store: &TileStore) -> bool {
+    #[cfg(test)]
+    let limit = SNAPSHOT_LIMIT.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let limit = MAX_SNAPSHOT_TILES;
+    store.held_tile_count_bound() <= limit
+}
+
 /// How long, in mean tile times, the caller waits for a tile a helper
 /// started before compositing it itself.
 const STRAGGLER_WAIT_TILES: u32 = 2;
@@ -180,6 +202,9 @@ thread_local! {
     static DIAGNOSTICS: std::cell::Cell<Diagnostics> = const {
         std::cell::Cell::new(Diagnostics::ZERO)
     };
+    /// Test-only: [`snapshot_is_bounded`]'s limit on this thread (the
+    /// large-store timing raises it to measure the unbounded walk).
+    static SNAPSHOT_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_SNAPSHOT_TILES) };
     /// Test-only: hooks the next passes on this thread run with.
     static HOOKS: std::cell::Cell<TestHooks> = const { std::cell::Cell::new(TestHooks::NONE) };
 }
@@ -206,6 +231,20 @@ impl TestHooks {
         helper_stall: None,
         caller_yields: None,
     };
+}
+
+/// Test-only: sets [`snapshot_is_bounded`]'s limit on this thread.
+#[cfg(test)]
+pub(crate) fn set_snapshot_limit_for_tests(limit: usize) {
+    SNAPSHOT_LIMIT.with(|slot| slot.set(limit));
+}
+
+/// Test-only: how long a pass's [`Snapshot`] of `store` takes to build.
+#[cfg(test)]
+pub(crate) fn time_snapshot(store: &TileStore) -> (Duration, usize) {
+    let began = Instant::now();
+    let snapshot = Snapshot::of(store);
+    (began.elapsed(), snapshot.tiles.len())
 }
 
 /// Test-only: sets the hooks the next passes on this thread run with.
@@ -553,6 +592,10 @@ fn helper_composite(pass: &Pass, tile_id: TileId, started: Instant) -> Option<He
             &mut budget,
         )
     });
+    // `missed` is the direct signal; with today's fold a missed read also
+    // goes through a report (`wanted_report`), so either alone would hand
+    // the tile back. Both are kept: a future read path that skips a
+    // failed tile without reporting must still not keep its result.
     if source.missed || budget.wanted_report() {
         return None;
     }
@@ -617,6 +660,10 @@ pub(crate) fn composite_tiles(
     }
     let mut budget = crate::CompositeBudget::for_pass(layers);
     let pass = Arc::new(Pass::new(tiles, layers, store, reference_origin));
+    // Closes the pass however this function ends, an unwind included, so
+    // no helper is left claiming (or sleeping on the window) for a pass
+    // nobody will install.
+    let _close = ClosePass(Arc::clone(&pass));
     let helpers = frame.helpers.min(count.saturating_sub(1));
     #[cfg(test)]
     let helpers = if pass.hooks.no_helpers { 0 } else { helpers };
@@ -700,7 +747,6 @@ pub(crate) fn composite_tiles(
             &mut install,
         );
     }
-    pass.closed.store(true, Ordering::Release);
     #[cfg(test)]
     {
         let first = pass.first_claim_ns.load(Ordering::Acquire);
@@ -710,6 +756,16 @@ pub(crate) fn composite_tiles(
                 d.first_claim_ns = d.first_claim_ns.saturating_add(first);
             });
         }
+    }
+}
+
+/// Marks its pass closed when dropped (the end of [`composite_tiles`],
+/// normal or not): helpers stop claiming and drop what they finish.
+struct ClosePass(Arc<Pass>);
+
+impl Drop for ClosePass {
+    fn drop(&mut self) {
+        self.0.closed.store(true, Ordering::Release);
     }
 }
 
@@ -760,7 +816,15 @@ fn wait_for_helper(pass: &Pass, index: usize, mean: Option<Duration>) -> Option<
                     break None;
                 };
                 let started = slot.started.unwrap_or_else(Instant::now);
-                deadline = Some(started + mean * STRAGGLER_WAIT_TILES);
+                // An unrepresentable deadline (it cannot happen with real
+                // tile times) means "do not wait".
+                let Some(at) = mean
+                    .checked_mul(STRAGGLER_WAIT_TILES)
+                    .and_then(|wait| started.checked_add(wait))
+                else {
+                    break None;
+                };
+                deadline = Some(at);
             }
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {

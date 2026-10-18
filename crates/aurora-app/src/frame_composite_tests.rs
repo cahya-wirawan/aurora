@@ -14,8 +14,9 @@
 )]
 
 use crate::frame_composite::{
-    FRAME_COMPOSITE_MAX_THREADS, HELPER_WINDOW_TILES, TestHooks, frame_composite_threads,
-    frame_pool, set_parallel_enabled_for_tests, set_test_hooks, take_diagnostics,
+    FRAME_COMPOSITE_MAX_THREADS, HELPER_WINDOW_TILES, MAX_SNAPSHOT_TILES, TestHooks,
+    frame_composite_threads, frame_pool, set_parallel_enabled_for_tests, set_test_hooks,
+    take_diagnostics,
 };
 use crate::move_invalidation_tests::{corpus_files, pixel_layers, reaching_effects};
 use crate::occlusion_cull_tests::{
@@ -23,6 +24,12 @@ use crate::occlusion_cull_tests::{
     translucent,
 };
 use crate::{CompositeCache, composite_surface_id, recomposite_tiles};
+
+/// How long a test's caller waits for the helpers to claim tiles before
+/// claiming itself (60 FPS round 8: short, so a pass whose helpers are
+/// busy elsewhere costs seconds, and a test that needs the helpers'
+/// work fails on its assertion instead of hanging).
+const YIELD_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Resets the parallel switch even if a test fails half way.
 struct Parallel;
@@ -60,7 +67,7 @@ fn recomposite(
     // The caller lets the helpers claim first, so they composite most of
     // the tiles compared (on its own the caller would often do them all).
     let _hooks = Hooks::set(TestHooks {
-        caller_yields: Some(std::time::Duration::from_secs(20)),
+        caller_yields: Some(YIELD_LIMIT),
         ..TestHooks::NONE
     });
     let mut cache = CompositeCache::default();
@@ -105,12 +112,22 @@ fn check(
     compared
 }
 
-fn pool_or_skip() -> bool {
+/// The frame pool is one per process, so tests that use its helpers
+/// take turns: a test's helper work (a 256-deep tree, a stalled helper)
+/// must not leave another test's caller without helpers.
+static POOL_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// This test's turn on the frame pool, or `None` (and a SKIPPED line)
+/// on a machine with no pool.
+fn pool_or_skip() -> Option<std::sync::MutexGuard<'static, ()>> {
     if frame_pool().is_none() {
         println!("SKIPPED: no frame pool (one core)");
-        return false;
+        return None;
     }
-    true
+    Some(match POOL_TESTS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    })
 }
 
 #[test]
@@ -174,16 +191,16 @@ fn cpu_document(store: &mut aurora_tile::TileStore) -> aurora_doc::LayerTree {
 /// did everything), and their tiles are the sequential loop's bits.
 #[test]
 fn helpers_composite_tiles_the_caller_installs() {
-    if !pool_or_skip() {
+    let Some(_pool) = pool_or_skip() else {
         return;
-    }
+    };
     let (_d, mut store) = store_with_budget(256);
     let layers = cpu_document(&mut store);
     let tiles = grid(4);
     let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
     poison(&mut store, &tiles);
     let _hooks = Hooks::set(TestHooks {
-        caller_yields: Some(std::time::Duration::from_secs(20)),
+        caller_yields: Some(YIELD_LIMIT),
         ..TestHooks::NONE
     });
     let _switch = Parallel::set(true);
@@ -219,9 +236,9 @@ fn helpers_composite_tiles_the_caller_installs() {
 /// tile itself, waits for nobody, and installs the sequential loop's bits.
 #[test]
 fn helpers_that_never_start_leave_the_caller_doing_everything() {
-    if !pool_or_skip() {
+    let Some(_pool) = pool_or_skip() else {
         return;
-    }
+    };
     let (_d, mut store) = store_with_budget(256);
     let layers = cpu_document(&mut store);
     let tiles = grid(4);
@@ -248,9 +265,9 @@ fn helpers_that_never_start_leave_the_caller_doing_everything() {
 /// returns long before the helper would have finished.
 #[test]
 fn a_stalled_helper_is_not_waited_for() {
-    if !pool_or_skip() {
+    let Some(_pool) = pool_or_skip() else {
         return;
-    }
+    };
     let (_d, mut store) = store_with_budget(256);
     let layers = cpu_document(&mut store);
     let tiles = grid(4);
@@ -291,9 +308,9 @@ fn a_stalled_helper_is_not_waited_for() {
 /// and the caller pages it in and composites it: the same bits.
 #[test]
 fn a_helper_hands_back_a_tile_it_cannot_read() {
-    if !pool_or_skip() {
+    let Some(_pool) = pool_or_skip() else {
         return;
-    }
+    };
     // A budget far below the document's tiles, so most are evicted.
     let (_d, mut store) = store_with_budget(4);
     let layers = cpu_document(&mut store);
@@ -301,7 +318,7 @@ fn a_helper_hands_back_a_tile_it_cannot_read() {
     let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
     poison(&mut store, &tiles);
     let _hooks = Hooks::set(TestHooks {
-        caller_yields: Some(std::time::Duration::from_secs(20)),
+        caller_yields: Some(YIELD_LIMIT),
         ..TestHooks::NONE
     });
     let _switch = Parallel::set(true);
@@ -317,9 +334,9 @@ fn a_helper_hands_back_a_tile_it_cannot_read() {
 /// however many tiles a pass has; the pass still installs every tile.
 #[test]
 fn helpers_stay_within_the_window() {
-    if !pool_or_skip() {
+    let Some(_pool) = pool_or_skip() else {
         return;
-    }
+    };
     let (_d, mut store) = store_with_budget(512);
     let mut layers = aurora_doc::LayerTree::new();
     let _ = layer(
@@ -333,7 +350,7 @@ fn helpers_stay_within_the_window() {
     let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
     poison(&mut store, &tiles);
     let _hooks = Hooks::set(TestHooks {
-        caller_yields: Some(std::time::Duration::from_secs(20)),
+        caller_yields: Some(YIELD_LIMIT),
         ..TestHooks::NONE
     });
     let _switch = Parallel::set(true);
@@ -345,6 +362,176 @@ fn helpers_stay_within_the_window() {
         "{diagnostics:?}"
     );
     assert_installed(&mut store, &tiles, &sequential, "window");
+}
+
+/// Resets the snapshot limit even if a test fails half way.
+struct SnapshotLimit;
+
+impl SnapshotLimit {
+    fn set(limit: usize) -> Self {
+        crate::frame_composite::set_snapshot_limit_for_tests(limit);
+        Self
+    }
+}
+
+impl Drop for SnapshotLimit {
+    fn drop(&mut self) {
+        crate::frame_composite::set_snapshot_limit_for_tests(MAX_SNAPSHOT_TILES);
+    }
+}
+
+/// Adds `count` encoded tiles to `layer`'s surface far below the view
+/// (rows 64 and on), so the store holds them (mostly paged out after a
+/// flush) but no view tile reads them.
+fn hold_far_tiles(store: &mut aurora_tile::TileStore, layers: &aurora_doc::LayerTree, count: u32) {
+    let Some(&root) = layers.roots().first() else {
+        unreachable!("a document with layers");
+    };
+    let Some(surface) = layers.surface_id(root) else {
+        unreachable!("a pixel layer");
+    };
+    let encoded =
+        aurora_tile::EncodedTile::of(ok(store.get(surface, aurora_tile::TileId { x: 0, y: 0 })));
+    for n in 0..count {
+        let id = aurora_tile::TileId {
+            x: n % 512,
+            y: 64 + n / 512,
+        };
+        store.insert_encoded(surface, id, encoded.clone());
+    }
+}
+
+/// A store holding more tiles than a pass may snapshot keeps the
+/// sequential loop (the snapshot walk is O(held tiles) on the caller);
+/// with the limit lifted the same store, its far tiles paged out, folds
+/// through the helpers to the same bits.
+#[test]
+fn a_store_too_large_to_snapshot_keeps_the_sequential_loop() {
+    let Some(_pool) = pool_or_skip() else {
+        return;
+    };
+    let (_d, mut store) = store_with_budget(64);
+    let layers = cpu_document(&mut store);
+    hold_far_tiles(&mut store, &layers, 4_200);
+    ok(store.flush());
+    assert!(store.held_tile_count_bound() > MAX_SNAPSHOT_TILES);
+    assert!(!crate::frame_composite::snapshot_is_bounded(&store));
+    let tiles = grid(4);
+    let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
+    poison(&mut store, &tiles);
+    let _switch = Parallel::set(true);
+    let _ = crate::frame_composite::take_pooled_tiles();
+    let mut cache = CompositeCache::default();
+    recomposite_tiles(&tiles, &layers, None, &mut store, &mut cache, None, None);
+    assert_eq!(crate::frame_composite::take_pooled_tiles(), 0, "sequential");
+    assert_installed(&mut store, &tiles, &sequential, "over the limit");
+
+    let _limit = SnapshotLimit::set(usize::MAX);
+    poison(&mut store, &tiles);
+    let (parallel, _) = recomposite(&layers, &mut store, &tiles, true);
+    assert_eq!(crate::frame_composite::take_pooled_tiles(), 16, "pooled");
+    for ((id, want), got) in tiles.iter().zip(&sequential).zip(&parallel) {
+        assert!(mismatches(got, want).is_empty(), "{id:?}");
+    }
+}
+
+/// The large-store numbers behind [`MAX_SNAPSHOT_TILES`] (60 FPS round
+/// 8): for stores holding 4,000 to 50,000 tiles (all but the view's
+/// paged out), the snapshot walk alone, and a 9- and a 16-tile pass
+/// sequentially, through the shipping decision (sequential above the
+/// limit) and with the helpers forced. Per-run means; release, with
+/// `--ignored --nocapture`.
+#[test]
+#[ignore = "timing only; run with --ignored --nocapture"]
+fn time_a_pass_over_a_large_store() {
+    let Some(_pool) = pool_or_skip() else {
+        return;
+    };
+    let runs = 20_u32;
+    for held in [4_000_u32, 10_000, 25_000, 50_000] {
+        let (_d, mut store) = store_with_budget(256);
+        let layers = cpu_document(&mut store);
+        hold_far_tiles(&mut store, &layers, held);
+        ok(store.flush());
+        let (walk, len) = crate::frame_composite::time_snapshot(&store);
+        println!(
+            "large store: {len} held tiles (bound {}): snapshot walk {:.3} ms",
+            store.held_tile_count_bound(),
+            walk.as_secs_f64() * 1e3
+        );
+        for side in [3_u32, 4] {
+            let tiles = grid(side);
+            let mut time = |parallel: bool, limit: usize| {
+                let _limit = SnapshotLimit::set(limit);
+                let _switch = Parallel::set(parallel);
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..runs {
+                    let mut cache = CompositeCache::default();
+                    let began = std::time::Instant::now();
+                    recomposite_tiles(&tiles, &layers, None, &mut store, &mut cache, None, None);
+                    total += began.elapsed();
+                }
+                total.as_secs_f64() * 1e3 / f64::from(runs)
+            };
+            let sequential = time(false, MAX_SNAPSHOT_TILES);
+            let shipping = time(true, MAX_SNAPSHOT_TILES);
+            let forced = time(true, usize::MAX);
+            println!(
+                "large store: {held} held, {} tiles: sequential {sequential:.3} ms, \
+                 shipping decision {shipping:.3} ms, helpers forced {forced:.3} ms",
+                side * side
+            );
+        }
+    }
+}
+
+/// A malformed document (a layer past the tree depth bound, a breach on
+/// every tile) warns once per pass through the pool, as the sequential
+/// loop does: every helper tile wants a report and goes back to the
+/// caller, whose single pass budget reports once. Same bits.
+#[test]
+fn a_malformed_tree_reports_once_per_pass_through_the_pool() {
+    let Some(_pool) = pool_or_skip() else {
+        return;
+    };
+    let (_d, mut store) = store_with_budget(256);
+    let mut layers = aurora_doc::LayerTree::new();
+    let _ = layer(
+        &mut layers,
+        &mut store,
+        None,
+        rect(0, 0, 512, 512),
+        &translucent,
+    );
+    let mut parent = None;
+    for level in 0..aurora_doc::MAX_LAYER_TREE_DEPTH {
+        parent = Some(ok(layers.add_group(format!("group-{level}"), parent)));
+    }
+    let _ =
+        ok(layers.insert_pixel_ignoring_the_depth_limit("too deep", rect(0, 0, 512, 512), parent));
+    let tiles = grid(2);
+    let reports = || crate::COMPOSITE_REPORTS.with(std::cell::Cell::get);
+    let before = reports();
+    let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
+    assert_eq!(
+        reports() - before,
+        1,
+        "the sequential loop reports once a pass"
+    );
+    poison(&mut store, &tiles);
+    let before = reports();
+    let (parallel, _) = recomposite(&layers, &mut store, &tiles, true);
+    let diagnostics = take_diagnostics();
+    assert_eq!(
+        reports() - before,
+        1,
+        "and so does the pool: {diagnostics:?}"
+    );
+    assert_eq!(diagnostics.helper_tiles, 0, "{diagnostics:?}");
+    assert!(diagnostics.handed_back > 0, "{diagnostics:?}");
+    for ((id, want), got) in tiles.iter().zip(&sequential).zip(&parallel) {
+        assert!(mismatches(got, want).is_empty(), "{id:?}");
+    }
 }
 
 /// A helper's budget never logs: a breach only records the wish, and the
@@ -369,9 +556,9 @@ fn a_helpers_budget_never_reports() {
 /// loop; current tiles are skipped; a tile named twice is composited once.
 #[test]
 fn a_dabs_tiles_stay_sequential_and_duplicates_composite_once() {
-    if !pool_or_skip() {
+    let Some(_pool) = pool_or_skip() else {
         return;
-    }
+    };
     assert_eq!(
         crate::frame_composite::MIN_PARALLEL_TILES,
         crate::background_composite::SYNC_TILE_LIMIT + 1
@@ -446,9 +633,9 @@ fn tile_composites() -> u64 {
 /// path on: no tile is composited on the CPU.
 #[test]
 fn a_gpu_document_keeps_the_gpu_arm_with_the_pool_on() {
-    if !pool_or_skip() {
+    let Some(_pool) = pool_or_skip() else {
         return;
-    }
+    };
     let Some(context) = crate::tests::real_gpu_context() else {
         return;
     };
@@ -477,9 +664,9 @@ fn a_gpu_document_keeps_the_gpu_arm_with_the_pool_on() {
 
 #[test]
 fn random_trees_composite_the_same_in_parallel() {
-    if !pool_or_skip() {
+    let Some(_pool) = pool_or_skip() else {
         return;
-    }
+    };
     let mut rng = Rng(0x5EED_0127_0007_0001);
     let mut compared = 0;
     let trees = 40;
@@ -526,9 +713,9 @@ const SPECIALS: [u16; 12] = [
 
 #[test]
 fn special_values_composite_the_same_in_parallel() {
-    if !pool_or_skip() {
+    let Some(_pool) = pool_or_skip() else {
         return;
-    }
+    };
     let mut compared = 0;
     for (index, mode) in aurora_doc::BlendMode::ALL
         .into_iter()
@@ -575,9 +762,9 @@ fn special_values_composite_the_same_in_parallel() {
 
 #[test]
 fn corpus_composites_the_same_in_parallel() {
-    if !pool_or_skip() {
+    let Some(_pool) = pool_or_skip() else {
         return;
-    }
+    };
     let files = corpus_files();
     if files.is_empty() {
         assert!(
@@ -645,9 +832,9 @@ fn corpus_composites_the_same_in_parallel() {
 #[test]
 #[ignore = "measures the Nyepi template; run with --ignored"]
 fn nyepi_whole_canvas_composites_the_same_in_parallel() {
-    if !pool_or_skip() {
+    let Some(_pool) = pool_or_skip() else {
         return;
-    }
+    };
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../images/flat-design-nyepi-template/6739968.psd");
     let Ok(bytes) = std::fs::read(&path) else {
@@ -728,9 +915,9 @@ fn assert_installed(
 /// handler. Every path installs the sequential loop's bits.
 #[test]
 fn the_redraw_decision_uses_the_pool_only_without_a_worker() {
-    if !pool_or_skip() {
+    let Some(_pool) = pool_or_skip() else {
         return;
-    }
+    };
     let (_d, mut store) = store_with_budget(256);
     let mut layers = aurora_doc::LayerTree::new();
     let _ = layer(

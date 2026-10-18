@@ -1609,6 +1609,19 @@ impl TileStore {
         self.resident.len()
     }
 
+    /// An upper bound on how many tiles this store holds (60 FPS round
+    /// 8): the resident, paged-out and pending counts added, so a tile in
+    /// two of those maps counts twice. Three length reads, no iteration:
+    /// what lets a caller refuse an O(held tiles) walk such as
+    /// [`Self::held_tile_versions`] before starting it.
+    #[must_use]
+    pub fn held_tile_count_bound(&self) -> usize {
+        self.resident
+            .len()
+            .saturating_add(self.paged_out.len())
+            .saturating_add(self.pending.len())
+    }
+
     /// The residency pool this store is a member of, if it was built with
     /// [`TileStore::new_shared`] (0.186.0: the background compositor's
     /// mirror joins the same pool, so the two stores' budgets are shares
@@ -5247,6 +5260,31 @@ mod insert_encoded_tests {
         if let Err(err) = store.flush() {
             unreachable!("{err}");
         }
+    }
+
+    /// 60 FPS round 8: the cheap bound is never below the real count,
+    /// whatever mix of resident, pending and paged-out tiles is held.
+    #[test]
+    fn the_held_tile_count_bound_covers_every_held_tile() {
+        let (_dir, mut store) = store(2);
+        let surface = SurfaceId::from_raw(3);
+        assert_eq!(store.held_tile_count_bound(), 0);
+        for x in 0..4 {
+            let _ = store.get_mut(surface, TileId { x, y: 0 });
+        }
+        for x in 0..5 {
+            store.insert_encoded(surface, TileId { x, y: 1 }, EncodedTile::of(&patterned(3)));
+        }
+        let check = |store: &TileStore| {
+            let held = store.held_tile_versions().len();
+            assert_eq!(held, 9);
+            assert!(store.held_tile_count_bound() >= held);
+        };
+        check(&store);
+        flush(&mut store);
+        check(&store);
+        let _ = store.get(surface, TileId { x: 1, y: 1 });
+        check(&store);
     }
 
     #[test]
