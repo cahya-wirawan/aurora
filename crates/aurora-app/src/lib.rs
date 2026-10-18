@@ -16231,12 +16231,14 @@ struct CompositeBudget {
     /// `aurora_tile::TileError` is neither `Clone` nor cheap to hold on
     /// to while the store it borrows from is still being mutated.
     first_store_error: Option<String>,
-    /// The pass's own "already reported" flag when several threads fold
-    /// one pass's tiles, each with its own budget (60 FPS round 7, the
-    /// frame pool): [`Self::should_report`] answers `true` once for the
-    /// whole pass, as the sequential loop's single budget does. `None`
-    /// keeps `reported` alone.
-    pass_reported: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// A frame-pool helper's budget (60 FPS round 8): [`Self::should_report`]
+    /// never answers `true`, so a helper logs nothing; it records the
+    /// wish in `wanted_report` instead, and the helper then leaves the
+    /// tile to the calling thread, whose single pass budget reports it
+    /// once per pass as the sequential loop does.
+    quiet: bool,
+    /// Whether a [`Self::quiet`] budget was asked to report.
+    wanted_report: bool,
 }
 
 impl CompositeBudget {
@@ -16260,22 +16262,26 @@ impl CompositeBudget {
             reported: false,
             store_errors: 0,
             first_store_error: None,
-            pass_reported: None,
+            quiet: false,
+            wanted_report: false,
         }
     }
 
-    /// [`Self::for_tile_of_pass`] whose report is once per *pass* across
-    /// every budget sharing `pass_reported` (60 FPS round 7, the frame
-    /// pool). The store-error tally stays per tile: the frame path never
-    /// reads it (the live canvas ignores it, see [`Self::note_store_error`]).
-    fn for_tile_of_shared_pass(
-        layers: &aurora_doc::LayerTree,
-        pass_reported: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self {
+    /// [`Self::for_tile_of_pass`] that never reports (60 FPS round 8, a
+    /// frame-pool helper's tile): a breach only sets
+    /// [`Self::wanted_report`], and the helper hands the tile back to the
+    /// calling thread, which composites it with the pass's own budget and
+    /// so reports once per pass, exactly as the sequential loop does.
+    fn quiet_for_tile(layers: &aurora_doc::LayerTree) -> Self {
         Self {
-            pass_reported: Some(std::sync::Arc::clone(pass_reported)),
+            quiet: true,
             ..Self::for_tile_of_pass(layers)
         }
+    }
+
+    /// Whether this [`Self::quiet_for_tile`] budget was asked to report.
+    fn wanted_report(&self) -> bool {
+        self.wanted_report
     }
 
     /// Recharges the node budget for the next tile of the same pass.
@@ -16303,10 +16309,15 @@ impl CompositeBudget {
     fn should_report(&mut self) -> bool {
         let first = !self.reported;
         self.reported = true;
-        match &self.pass_reported {
-            Some(pass) => first && !pass.swap(true, std::sync::atomic::Ordering::SeqCst),
-            None => first,
+        if self.quiet {
+            self.wanted_report = true;
+            return false;
         }
+        #[cfg(test)]
+        if first {
+            COMPOSITE_REPORTS.with(|n| n.set(n.get() + 1));
+        }
+        first
     }
 
     /// Records that one layer's tile could not be read out of the store
@@ -18955,7 +18966,8 @@ fn fold_children_isolating_adjustments(
         reported: true,
         store_errors: 0,
         first_store_error: None,
-        pass_reported: None,
+        quiet: false,
+        wanted_report: false,
     };
     let mut folded = 0_usize;
     // `children` is newest first: walk it from the end (the bottom).
@@ -19519,7 +19531,8 @@ fn opaque_cover_texels(
         reported: true,
         store_errors: 0,
         first_store_error: None,
-        pass_reported: None,
+        quiet: false,
+        wanted_report: false,
     };
     let texels = pixel_layer_texels(
         id,
@@ -20168,7 +20181,8 @@ fn pass_through_content(
         reported: true,
         store_errors: 0,
         first_store_error: None,
-        pass_reported: None,
+        quiet: false,
+        wanted_report: false,
     };
     let _ = fold_context_into(
         &mut own,
@@ -23142,6 +23156,14 @@ enum ProfileSlot {
 #[derive(Debug, Default, Clone, Copy)]
 struct CompositeProfile {
     slots: [(u64, u64); 11],
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: how many times a [`CompositeBudget`] on this thread
+    /// answered `true` to [`CompositeBudget::should_report`] (a warning
+    /// logged), 60 FPS round 8.
+    static COMPOSITE_REPORTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -26405,7 +26427,9 @@ fn recomposite_tiles(
 /// fewer than [`frame_composite::MIN_PARALLEL_TILES`] are stale (a dab:
 /// the redraw handler composites at most
 /// [`background_composite::SYNC_TILE_LIMIT`] tiles itself and those keep
-/// the sequential loop), the pool is unavailable or (tests) disabled.
+/// the sequential loop), the store holds more tiles than a pass may
+/// snapshot ([`frame_composite::MAX_SNAPSHOT_TILES`]), the pool is
+/// unavailable or (tests) disabled.
 fn recomposite_tiles_in_parallel(
     tiles: &[aurora_tile::TileId],
     layers: &aurora_doc::LayerTree,
@@ -26423,7 +26447,9 @@ fn recomposite_tiles_in_parallel(
         .copied()
         .filter(|&tile_id| !cache.is_current(tile_id) && seen.insert(tile_id))
         .collect();
-    if stale.len() < frame_composite::MIN_PARALLEL_TILES {
+    if stale.len() < frame_composite::MIN_PARALLEL_TILES
+        || !frame_composite::snapshot_is_bounded(store)
+    {
         return false;
     }
     let Some(pool) = frame_composite::frame_pool() else {
@@ -66741,6 +66767,7 @@ mod tests {
         // unless `AURORA_R7_SEQUENTIAL` asks for the old loop.
         let parallel = std::env::var_os("AURORA_R7_SEQUENTIAL").is_none();
         crate::frame_composite::set_parallel_enabled_for_tests(parallel);
+        let _ = crate::frame_composite::take_diagnostics();
         println!(
             "measure_pan_and_paint_frames: parallel frame recomposite {parallel} (threads {})",
             crate::frame_composite::frame_composite_threads()
@@ -66880,6 +66907,32 @@ mod tests {
                 .push(store_stat_deltas(&stats_before, store.stats()));
         }
         crate::frame_composite::set_parallel_enabled_for_tests(false);
+        // 60 FPS round 8: what the frame pool's caller-participates
+        // protocol did, per pass (all zero on a GPU or sequential run).
+        let pool = crate::frame_composite::take_diagnostics();
+        if pool.passes > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let per = |n: u64| n as f64 / pool.passes as f64;
+            println!(
+                "measure_pan_and_paint_frames: frame pool per pass: caller {:.2} tiles, \
+                 helpers {:.2}, duplicated {:.2}, handed back {:.2}; setup {:.3} ms, \
+                 waited {:.3} ms; first helper claim {:.3} ms after the pass began \
+                 (in {} of {} passes)",
+                per(pool.caller_tiles),
+                per(pool.helper_tiles),
+                per(pool.duplicates),
+                per(pool.handed_back),
+                per(pool.setup_ns) / 1e6,
+                per(pool.wait_ns) / 1e6,
+                if pool.helper_claimed_passes > 0 {
+                    pool.first_claim_ns as f64 / pool.helper_claimed_passes as f64 / 1e6
+                } else {
+                    0.0
+                },
+                pool.helper_claimed_passes,
+                pool.passes,
+            );
+        }
         stages
     }
 
