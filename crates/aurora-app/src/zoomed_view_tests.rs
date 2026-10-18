@@ -551,7 +551,13 @@ fn the_zoomed_out_atlas_draws_the_scaled_export_at_a_power_of_two_zoom() {
         frame.viewport_px,
         frame.level_zoom,
     );
-    let stats = atlas.sync(queue, &mut doc.store, level_surface(2), false, usize::MAX);
+    let stats = atlas.sync_only(
+        queue,
+        &mut doc.store,
+        level_surface(2),
+        usize::MAX,
+        &frame.visible,
+    );
     assert_eq!(stats.errors, 0);
     let mut canvas = aurora_gpu::CanvasPipeline::new(device);
     for (x, y) in [

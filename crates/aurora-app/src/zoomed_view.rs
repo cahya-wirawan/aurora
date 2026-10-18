@@ -174,7 +174,8 @@ pub(crate) struct ZoomedFrame {
     pub(crate) viewport_px: (u32, u32),
     /// The document rectangle in level texels.
     pub(crate) doc_clip: (f32, f32, f32, f32),
-    /// The level tiles the frame shows.
+    /// The level tiles the frame shows, and the ring its bilinear filter
+    /// can reach (the only tiles the zoomed-out atlas uploads).
     pub(crate) visible: Vec<TileId>,
 }
 
@@ -217,7 +218,10 @@ pub(crate) fn plan(
             return 0..0;
         }
         let first = (origin / span).floor() as u32;
-        let last = (end / span).ceil() as u32;
+        // One level texel further: the bilinear filter at the last
+        // fragment can reach it, so its tile must be uploaded (blank when
+        // it is past the document) and not hold another level's texels.
+        let last = ((end + scale) / span).ceil() as u32;
         first..last.max(first)
     };
     let xs = tiles(ox, vx, doc_size.0);

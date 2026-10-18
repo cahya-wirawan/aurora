@@ -149,12 +149,12 @@ impl Rig {
             level0,
             zoomed_view::PYRAMID_FRAME_BUDGET,
         );
-        let _ = self.atlas.sync(
+        let _ = self.atlas.sync_only(
             queue,
             &mut photo.store,
             zoomed_view::level_surface(frame.level),
-            false,
             usize::MAX,
+            &frame.visible,
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("r10-frame"),

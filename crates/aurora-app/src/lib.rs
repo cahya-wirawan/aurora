@@ -37620,12 +37620,12 @@ impl App {
         if advance.more {
             self.needs_redraw = true;
         }
-        let _ = atlas.sync(
+        let _ = atlas.sync_only(
             gpu.queue(),
             store,
             zoomed_view::level_surface(frame.level),
-            false,
             usize::MAX,
+            &frame.visible,
         );
         Some(frame)
     }

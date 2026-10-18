@@ -78,10 +78,7 @@ pub fn downsample_quad(children: [Option<&[f16]>; 4], valid: (u32, u32), out: &m
         let (cx, cy) = (quadrant % 2, quadrant / 2);
         let child = child.filter(|texels| texels.len() == SAMPLES);
         // Output rows `cy * HALF ..`, columns `cx * HALF ..`.
-        let out_rows = out
-            .chunks_exact_mut(ROW_SAMPLES)
-            .skip(cy * HALF)
-            .take(HALF);
+        let out_rows = out.chunks_exact_mut(ROW_SAMPLES).skip(cy * HALF).take(HALF);
         let Some(child) = child else {
             for row in out_rows {
                 if let Some(part) = row.get_mut(cx * HALF * CHANNELS..(cx + 1) * HALF * CHANNELS) {
@@ -99,8 +96,7 @@ pub fn downsample_quad(children: [Option<&[f16]>; 4], valid: (u32, u32), out: &m
             let y0 = cy * ROW + 2 * oy;
             let inside_top = y0 < valid.1;
             let inside_bottom = y0 + 1 < valid.1;
-            let Some(out_part) =
-                out_row.get_mut(cx * HALF * CHANNELS..(cx + 1) * HALF * CHANNELS)
+            let Some(out_part) = out_row.get_mut(cx * HALF * CHANNELS..(cx + 1) * HALF * CHANNELS)
             else {
                 continue;
             };

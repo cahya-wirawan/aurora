@@ -96,7 +96,12 @@ fn reference(image: &Image, level: u32, x: usize, y: usize) -> [f64; 4] {
         }
     }
     if sum[3] > 0.0 {
-        [sum[0] / sum[3], sum[1] / sum[3], sum[2] / sum[3], sum[3] / (n * n) as f64]
+        [
+            sum[0] / sum[3],
+            sum[1] / sum[3],
+            sum[2] / sum[3],
+            sum[3] / (n * n) as f64,
+        ]
     } else {
         [0.0; 4]
     }
@@ -265,7 +270,11 @@ fn each_quadrant_lands_in_its_own_quarter_of_the_output() {
     let solid = |v: f32| vec![f16::from_f32(v); SAMPLES];
     let (a, b, c, d) = (solid(0.25), solid(0.5), solid(0.75), solid(1.0));
     let mut out = vec![f16::ZERO; SAMPLES];
-    downsample_quad([Some(&a), Some(&b), Some(&c), Some(&d)], (512, 512), &mut out);
+    downsample_quad(
+        [Some(&a), Some(&b), Some(&c), Some(&d)],
+        (512, 512),
+        &mut out,
+    );
     let at = |x: usize, y: usize| out.get((y * T + x) * CHANNELS).map(|v| v.to_f32());
     assert_eq!(at(0, 0), Some(0.25));
     assert_eq!(at(T - 1, 0), Some(0.5));
