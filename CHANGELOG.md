@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.274.0] - 2026-10-18
+
+### Added
+
+- Record 60 FPS round 9: 24-60 MP photos measured, Curves/Levels tabulated, the pool's snapshot scoped, the dab's page faults ended
+
 ## [0.273.0] - 2026-10-18
 
 ### Added
