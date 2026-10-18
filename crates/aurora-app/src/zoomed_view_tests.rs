@@ -6,7 +6,9 @@
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    clippy::float_cmp
+    clippy::float_cmp,
+    clippy::cast_possible_wrap,
+    clippy::many_single_char_names
 )]
 
 use std::time::Duration;
@@ -210,7 +212,7 @@ fn the_crop_shield_and_the_selection_outline_follow_a_zoomed_out_centred_view() 
                 && py < piece.y + piece.height as i32
         })
     };
-    assert!(!covered((x0 + x1) / 2.0, (y0 + y1) / 2.0));
+    assert!(!covered(f32::midpoint(x0, x1), f32::midpoint(y0, y1)));
     assert!(!covered(x0 + 1.0, y0 + 1.0));
     assert!(covered(x0 - 2.0, y0 + 1.0));
     assert!(covered(x1 + 2.0, y1 - 1.0));
@@ -306,7 +308,7 @@ fn settle(doc: &mut Doc, cache: &mut crate::CompositeCache, level: u32) -> usize
             &mut doc.store,
             cache,
             Level0::Sync(None, None),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         );
         rounds += 1;
         if step.complete {

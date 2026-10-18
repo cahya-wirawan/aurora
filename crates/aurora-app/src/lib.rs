@@ -5816,6 +5816,8 @@ fn primary_modifier(primary_is_meta: bool) -> &'static str {
 /// (`primary_is_meta`) or `Ctrl`. A binding spelled `Primary+…` takes
 /// that modifier; `Ctrl+Tab`/`Ctrl+Shift+Tab` stay literal `Ctrl` on
 /// every platform (`Cmd+Tab` is macOS's application switcher).
+// One flat table of bindings; splitting it would only scatter it.
+#[allow(clippy::too_many_lines)]
 fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> {
     let bindings = [
         ("Tab", AppCommand::FocusNext),
@@ -37544,13 +37546,6 @@ impl App {
     /// Both halves were fixed together; see
     /// `composite_roots_into_tile`'s own doc comment and that shader's
     /// own comment.
-    // One linear per-frame flow (build widget paints, sync the canvas
-    // atlas, one shared render pass drawing both) -- splitting further
-    // would just relocate lines across more functions without reducing
-    // the real complexity a GPU frame has, the same call
-    // `render_test.rs::render_and_sample_pixel` already makes for an
-    // analogous reason.
-    #[allow(clippy::too_many_lines)]
     /// The zoomed-out half of a frame (0.275.0, `zoomed_view`): when the
     /// view's physical zoom is below the 1:1 atlas floor, sizes the
     /// zoomed-out atlas, advances the pyramid under the frame's budgets,
@@ -37630,6 +37625,13 @@ impl App {
         Some(frame)
     }
 
+    // One linear per-frame flow (build widget paints, sync the canvas
+    // atlas, one shared render pass drawing both) -- splitting further
+    // would just relocate lines across more functions without reducing
+    // the real complexity a GPU frame has, the same call
+    // `render_test.rs::render_and_sample_pixel` already makes for an
+    // analogous reason.
+    #[allow(clippy::too_many_lines)]
     fn redraw(&mut self) {
         // The caret owner this frame paints with (0.139.0 blink),
         // recorded before any early return below — see

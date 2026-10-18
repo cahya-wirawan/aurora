@@ -2820,7 +2820,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn coverage_one_is_the_canvas_atlas_exactly() {
         for viewport in [(1, 1), (255, 257), (1920, 1080), (1366, 768), (3024, 1964)] {
             assert_eq!(
@@ -2915,6 +2914,7 @@ mod tests {
     // the *same* expression applied to the same inputs; an exact
     // comparison is what pins them together.
     #[allow(clippy::float_cmp)]
+    #[test]
     fn min_zoom_for_viewport_is_exactly_the_floor_the_uniform_applies() {
         // The public promise (`min_zoom_for_viewport`) and the private
         // behaviour (`uniform_values`) must not be two formulas that

@@ -2,6 +2,8 @@
 //! image (not of tiles), so a mistake shared by the tile walk and the
 //! reference cannot hide.
 
+#![allow(clippy::many_single_char_names)]
+
 use super::downsample_quad;
 use aurora_tile::{CHANNELS, SAMPLES, TILE};
 use half::f16;
