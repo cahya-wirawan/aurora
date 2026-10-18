@@ -1069,3 +1069,68 @@ fn the_redraw_decision_uses_the_pool_only_without_a_worker() {
     );
     assert_installed(&mut store, &dab, &sequential, "dab");
 }
+
+/// The shipping bound (60 FPS round 9): a pass of a few scattered tiles
+/// scopes the rectangle between them, which can need far more lookups
+/// than [`MAX_SNAPSHOT_TILES`]; such a pass keeps the sequential loop,
+/// while a pass of many tiles is allowed its per-tile share.
+#[test]
+fn the_snapshot_bound_follows_the_pass() {
+    let (_d, mut store) = store_with_budget(64);
+    let layers = cpu_document(&mut store);
+    let view = crate::frame_composite::Scope::of(&layers, &grid(4), (0, 0));
+    assert!(view.is_bounded(16));
+    let far = [
+        aurora_tile::TileId { x: 0, y: 0 },
+        aurora_tile::TileId { x: 300, y: 300 },
+    ];
+    let scattered = crate::frame_composite::Scope::of(&layers, &far, (0, 0));
+    assert!(
+        scattered.lookups() > MAX_SNAPSHOT_TILES,
+        "{}",
+        scattered.lookups()
+    );
+    assert!(!scattered.is_bounded(far.len()));
+    let per_tile = crate::frame_composite::SNAPSHOT_KEYS_PER_TILE;
+    let enough = scattered.lookups().div_ceil(per_tile);
+    assert!(scattered.is_bounded(enough));
+    assert!(!scattered.is_bounded(enough - 1));
+}
+
+/// Each surface is scoped at its own origin: a layer far from the
+/// document's corner (here at (-3000, -2000), its tiles under the view
+/// are ids 11.. and 7..) is read by the helpers from the snapshot, with
+/// nothing handed back, to the sequential loop's bits.
+#[test]
+fn a_layer_far_from_the_corner_is_scoped_at_its_own_origin() {
+    let Some(_pool) = pool_or_skip() else {
+        return;
+    };
+    let (_d, mut store) = store_with_budget(1024);
+    let mut layers = aurora_doc::LayerTree::new();
+    let _ = layer(
+        &mut layers,
+        &mut store,
+        None,
+        rect(-3000, -2000, 4200, 3200),
+        &opaque,
+    );
+    let top = layer(
+        &mut layers,
+        &mut store,
+        None,
+        rect(-700, -900, 1800, 2000),
+        &translucent,
+    );
+    ok(layers.set_blend_mode(top, aurora_doc::BlendMode::Exclusion));
+    let tiles = grid(4);
+    let (sequential, _) = recomposite(&layers, &mut store, &tiles, false);
+    poison(&mut store, &tiles);
+    let (parallel, _) = recomposite(&layers, &mut store, &tiles, true);
+    let diagnostics = take_diagnostics();
+    assert!(diagnostics.helper_tiles > 0, "{diagnostics:?}");
+    assert_eq!(diagnostics.handed_back, 0, "{diagnostics:?}");
+    for ((id, want), got) in tiles.iter().zip(&sequential).zip(&parallel) {
+        assert!(mismatches(got, want).is_empty(), "{id:?}");
+    }
+}

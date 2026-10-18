@@ -1128,3 +1128,50 @@ fn merge_profile(delta: crate::CompositeProfile) {
         profile.set(current);
     });
 }
+
+#[cfg(test)]
+mod snapshot_source_tests {
+    use super::{Scope, Snapshot, SnapshotSource, TileRange};
+    use crate::TileSource as _;
+
+    /// A question about a tile outside the scope marks the tile missed
+    /// (the helper then hands it back); one inside it is answered.
+    #[test]
+    fn out_of_scope_questions_mark_the_tile_missed() {
+        let (_d, store) = crate::occlusion_cull_tests::store_with_budget(8);
+        let mut layers = aurora_doc::LayerTree::new();
+        let id = crate::occlusion_cull_tests::ok(layers.add_pixel_layer(
+            "p",
+            crate::occlusion_cull_tests::rect(0, 0, 256, 256),
+            None,
+        ));
+        let Some(surface) = layers.surface_id(id) else {
+            unreachable!("a pixel layer");
+        };
+        let mut scope = Scope::default();
+        scope.ranges.insert(
+            surface,
+            TileRange {
+                x0: 0,
+                x1: 2,
+                y0: 0,
+                y1: 2,
+            },
+        );
+        let snapshot = Snapshot::of(&store, scope);
+        let inside = aurora_tile::TileId { x: 1, y: 1 };
+        let outside = aurora_tile::TileId { x: 2, y: 0 };
+        let source = SnapshotSource {
+            snapshot: &snapshot,
+            missed: std::cell::Cell::new(false),
+            hits: Vec::new(),
+        };
+        assert!(!source.contains_tile(surface, inside));
+        assert_eq!(source.content_version(surface, inside), 0);
+        assert!(!source.missed.get(), "answered inside the scope");
+        assert!(source.contains_tile(surface, outside));
+        assert!(source.missed.replace(false));
+        assert_eq!(source.content_version(surface, outside), 0);
+        assert!(source.missed.get(), "a version outside the scope is a miss");
+    }
+}
