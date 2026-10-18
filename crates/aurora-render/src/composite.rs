@@ -2273,6 +2273,9 @@ pub fn un_premultiply_in_place(texels: &mut [f16]) {
     let mut wide = [0f32; CHUNK_SAMPLES];
     let mut original = [f16::ZERO; CHUNK_SAMPLES];
     for chunk in head.chunks_exact_mut(CHUNK_SAMPLES) {
+        if chunk_is_opaque_and_finite(chunk) {
+            continue;
+        }
         original.copy_from_slice(chunk);
         chunk.convert_to_f32_slice(&mut wide);
         for texel in wide.chunks_exact_mut(CHANNELS) {
@@ -2299,6 +2302,37 @@ pub fn un_premultiply_in_place(texels: &mut [f16]) {
         }
     }
     un_premultiply_per_sample(tail);
+}
+
+/// Whether every texel of `chunk` has an alpha of exactly `1.0` and
+/// finite colour channels (60 FPS round 8). On such a chunk
+/// [`un_premultiply_in_place`] is a bitwise identity, so it skips it:
+/// widening a finite `f16` is exact, dividing it by `1.0` is exact, it is
+/// already within `±F16_MAX` so the clamp leaves it (a `-0.0` included),
+/// and narrowing an exactly representable value is exact; the alpha is
+/// written back from its own bits anyway. An infinity (clamped to
+/// `F16_MAX`) or a NaN (whose payload a round trip may change) takes the
+/// arithmetic as before. Pinned against the per-sample loop over every
+/// `f16` pattern by
+/// `chunked_un_premultiply_is_bit_identical_to_the_per_sample_loop`.
+#[inline(always)]
+fn chunk_is_opaque_and_finite(chunk: &[f16]) -> bool {
+    const ONE: u16 = 0x3C00;
+    const EXPONENT: u16 = 0x7C00;
+    // Returns at the first texel that is not opaque, so a translucent
+    // chunk costs one comparison.
+    let mut finite = true;
+    for texel in chunk.chunks_exact(CHANNELS) {
+        if let [r, g, b, a] = texel {
+            if a.to_bits() != ONE {
+                return false;
+            }
+            finite &= (r.to_bits() & EXPONENT != EXPONENT)
+                & (g.to_bits() & EXPONENT != EXPONENT)
+                & (b.to_bits() & EXPONENT != EXPONENT);
+        }
+    }
+    finite
 }
 
 /// [`un_premultiply_in_place`]'s per-sample loop: what it was before
