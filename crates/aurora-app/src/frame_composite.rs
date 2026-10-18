@@ -631,7 +631,8 @@ pub(crate) fn composite_tiles(
             d.passes += 1;
             d.setup_ns = d.setup_ns.saturating_add(setup);
         });
-        if let Some(limit) = pass.hooks.caller_yields {
+        // Nothing to yield to without a helper (a pass of one tile).
+        if let Some(limit) = pass.hooks.caller_yields.filter(|_| helpers > 0) {
             let until = Instant::now() + limit;
             // Helpers stop at the window while nothing is installed.
             let claimable = count.min(HELPER_WINDOW_TILES);
