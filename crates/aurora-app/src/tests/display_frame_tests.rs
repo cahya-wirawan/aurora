@@ -206,10 +206,17 @@ impl Rig {
                     usize::MAX,
                 );
                 self.draw_atlas(gpu, residency);
-                let visible = display_view::visible_tiles(origin, zoom, self.viewport, photo.size);
-                let _ =
-                    self.view
-                        .adopt_from_atlas(device, queue, residency, &photo.store, &visible);
+                if gpu_path {
+                    let visible =
+                        display_view::visible_tiles(origin, zoom, self.viewport, photo.size);
+                    let _ = self.view.adopt_from_atlas(
+                        device,
+                        queue,
+                        residency,
+                        &photo.store,
+                        &visible,
+                    );
+                }
             }
             _ => self.draw(gpu, photo.size, origin, zoom),
         }

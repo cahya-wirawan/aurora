@@ -38109,9 +38109,14 @@ impl App {
                         // Task 142: the display texture takes over the
                         // tiles the atlas has just uploaded by a GPU copy,
                         // not a second upload, when it draws again.
-                        if let (Some(display), Some(canvas_size)) = (
+                        // GPU path only: on the CPU path the copies measured
+                        // slower than nothing at 100 %, and the texture is
+                        // built when the view holds still instead.
+                        if let (Some(display), Some(canvas_size), true) = (
                             self.display.as_mut(),
                             canvas_area_physical_size(&self.workspace, self.scale_factor),
+                            document_qualifies_for_gpu_compositing(&self.doc.layers)
+                                && self.compositor.is_some(),
                         ) {
                             let visible = display_view::visible_tiles(
                                 canvas_local_origin(

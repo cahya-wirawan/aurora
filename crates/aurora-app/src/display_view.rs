@@ -35,12 +35,12 @@
 //! texture only when every visible tile is uploaded at its current content
 //! ([`DisplayAdvance::ready`]); otherwise it draws the atlas, unchanged, and
 //! the texture adopts the tiles the atlas has just uploaded by a GPU copy
-//! ([`DisplayView::adopt_from_atlas`]). On the CPU compositing path (the
-//! worker or the frame pool) the atlas always draws at or above its floor
-//! and the texture does no visible-tile work there (its own dispatch and
-//! uploads measured 1.5-6 ms slower than the atlas alone), so the 1:1 frame
-//! is the old frame plus those GPU copies; the texture takes over below the
-//! floor.
+//! ([`DisplayView::adopt_from_atlas`], GPU compositing path only). On the
+//! CPU compositing path (the worker or the frame pool) the atlas always
+//! draws at or above its floor and the texture does no visible-tile work
+//! there (its own dispatch, uploads and even the GPU copies measured slower
+//! than the atlas alone, 1.5-6 ms under load); it is built when the view
+//! holds still ([`QUIET_FRAMES`]) and takes over below the floor.
 //! Below the floor it always draws the texture: a tile not uploaded yet is
 //! transparent there (the checkerboard), as a cold zoomed-out pyramid is.
 //!
@@ -430,9 +430,8 @@ impl DisplayView {
         // well would only upload them twice.
         let started = Instant::now();
         let surface = crate::composite_surface_id();
-        // There the texture follows the atlas by GPU copies
-        // (`adopt_from_atlas`) and its quiet-frame background build, and
-        // takes over below the floor.
+        // There the texture is built by its quiet-frame background build
+        // and takes over below the floor.
         let drawable = !atlas_draws
             && (!one_to_one || visible.iter().all(|&id| store.contains_tile(surface, id)));
         let budget = (!one_to_one).then_some(UPLOAD_BUDGET);
