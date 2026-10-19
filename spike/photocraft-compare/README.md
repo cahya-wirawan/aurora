@@ -109,6 +109,16 @@ rounded to 8). Then:
   the audit's reference) during its warm-up run. Each tool's output is put
   over white and compared like the audit, with score = mean of the R, G, B
   means.
+* **colour spaces**: Aurora converts a tagged file to its sRGB working space
+  and writes sRGB. PhotoCraft (as measured at 4d4de45) keeps the source
+  profile and embeds it in its PNG (`iCCP`, e.g. "Adobe RGB (1998)" for
+  Nyepi, "Generic RGB Profile" for `images/curve-02.jpg`). `pngread.py` reads
+  each output's ICC description. A tool that wrote sRGB, or no profile, is
+  compared with the working-space merged image. A tool that kept another
+  profile is compared with the merged image as stored, which Aurora writes
+  as `<ref>.stored.png` when the open converts colours. A tool-vs-tool row
+  whose outputs are in different colour spaces is marked "not comparable".
+  No colour conversion is done in Python.
 
 Above `--verify-max-pixels` (6 M) pixels, every k-th pixel is compared.
 The decode itself is always whole. Later runs are checked by SHA-256, and
