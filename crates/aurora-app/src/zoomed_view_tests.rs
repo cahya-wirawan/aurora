@@ -679,7 +679,7 @@ fn the_zoomed_out_atlas_draws_the_scaled_export_at_a_power_of_two_zoom() {
 // ---------------------------------------------------- review (ZV-1..ZV-4)
 
 /// Canvas areas up to 8K and past it, at wgpu's default 8192 limit.
-const BIG_CANVASES: [(u32, u32); 7] = [
+pub(super) const BIG_CANVASES: [(u32, u32); 7] = [
     (1920, 1080),
     (3968, 2160),
     (4000, 2250),
@@ -847,3 +847,6 @@ fn a_refused_worker_dispatch_is_composited_under_the_frame_budget() {
     assert!(step.more);
     assert!(!step.complete);
 }
+
+#[path = "zoomed_blend_tests.rs"]
+mod blend;

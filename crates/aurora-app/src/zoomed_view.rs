@@ -17,8 +17,8 @@
 //!
 //! At physical zoom `z` below the floor the level is `L = floor(log2(1 /
 //! z))` (at most [`MAX_LEVEL`]), shown at `z * 2^L` in `(0.5, 1]` with the
-//! atlas's bilinear minification, and (task 140) blended toward level `L
-//! + 1` by [`blend_weight`] (trilinear across two atlases, see
+//! atlas's bilinear minification, and (task 140) blended toward the next
+//! level by [`blend_weight`] (trilinear across two atlases, see
 //! [`ZoomedAtlases`]), so a zoom crossing a power of two does not pop and
 //! a zoom between two shows a mix of the sharper and the softer level, as
 //! a GPU's own trilinear filter would. At a power of two, at the deepest

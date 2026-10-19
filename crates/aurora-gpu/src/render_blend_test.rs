@@ -20,6 +20,8 @@
 //!   `L+1` alone) by the residual weight only, where the unblended picture
 //!   pops by the full aliasing of level `L`.
 
+#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+
 use super::{CanvasPipeline, TileResidency, paint, render_and_sample_blended};
 use crate::test_support::real_context;
 use aurora_tile::{SurfaceId, TILE, TileId, TileStore};
@@ -56,7 +58,7 @@ fn paint_stripes(store: &mut TileStore, surface: SurfaceId, id: TileId) {
     };
     for (i, sample) in tile.texels_mut().iter_mut().enumerate() {
         let column = (i / 4) as u32 % TILE;
-        let value = if i % 4 == 3 || column % 2 == 0 {
+        let value = if i % 4 == 3 || column.is_multiple_of(2) {
             1.0
         } else {
             0.0
@@ -226,7 +228,8 @@ fn reference(primary: [f32; 4], partner: [f32; 4], weight: f64, check: f64) -> [
         ]
     };
     let (p, q) = (premultiplied(primary), premultiplied(partner));
-    let mix = |i: usize| p[i] * (1.0 - weight) + q[i] * weight;
+    let at = |v: &[f64; 4], i: usize| v.get(i).copied().unwrap_or(0.0);
+    let mix = |i: usize| at(&p, i) * (1.0 - weight) + at(&q, i) * weight;
     let alpha = mix(3);
     let out = |i: usize| ((mix(i) + check * (1.0 - alpha)) * 255.0).round() as i32;
     [out(0), out(1), out(2)]

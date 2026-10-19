@@ -310,6 +310,7 @@ fn render_and_sample_pixels_in(
 /// [`render_and_sample_pixels_in`] through
 /// [`CanvasPipeline::bind_group_blended`] when a partner atlas is given
 /// (task 140), through [`CanvasPipeline::bind_group`] otherwise.
+#[allow(clippy::too_many_lines)]
 fn render_and_sample_blended(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
