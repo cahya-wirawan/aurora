@@ -510,6 +510,7 @@ name = "aurora-color"
 version = "0.276.0"
 dependencies = [
  "aurora-core",
+ "half",
  "lcms2",
  "thiserror 2.0.19",
  "tracing",

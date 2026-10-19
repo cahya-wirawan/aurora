@@ -45,6 +45,7 @@ pub mod import;
 pub mod jpeg;
 pub mod png;
 pub mod psd;
+mod quantize8;
 mod safe_save;
 pub mod tiff;
 

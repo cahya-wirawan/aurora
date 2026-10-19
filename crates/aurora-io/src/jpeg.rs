@@ -40,7 +40,7 @@
 //!   quality control (an export dialog with a slider) to drive
 //!   [`encode_with_quality`] with anything else yet.
 
-use aurora_color::{dither_quantize, promote_u8};
+use aurora_color::promote_u8;
 use half::f16;
 use jpeg_encoder::{ColorType, Encoder};
 use zune_jpeg::JpegDecoder;
@@ -124,7 +124,7 @@ pub fn encode(image: &Image) -> Result<Vec<u8>, IoError> {
 
 /// Encodes `image` as a JPEG at `quality` (1–100, `jpeg_encoder`'s own
 /// documented range — 100 is the highest image quality) — the export
-/// half of invariant §7.3.1b's 8-bit boundary, using [`dither_quantize`]
+/// half of invariant §7.3.1b's 8-bit boundary, using [`aurora_color::dither_quantize`]
 /// rather than plain rounding so a smooth gradient doesn't band on the
 /// way out. `image`'s own alpha channel is discarded (see this module's
 /// own doc comment — JPEG has none to encode it into).
@@ -141,14 +141,7 @@ pub fn encode_with_quality(image: &Image, quality: u8) -> Result<Vec<u8>, IoErro
         return Err(IoError::JpegDimensionsTooLarge { width, height });
     };
 
-    let mut rgba8 = Vec::with_capacity(image.samples().len());
-    for (index, &sample) in image.samples().iter().enumerate() {
-        #[allow(clippy::cast_possible_truncation)]
-        let pixel_index = (index / 4) as u32;
-        let x = pixel_index % width.max(1);
-        let y = pixel_index / width.max(1);
-        rgba8.push(dither_quantize(sample.to_f32(), x, y));
-    }
+    let rgba8 = crate::quantize8::dither_rgba8(image.samples(), width);
 
     let mut bytes = Vec::new();
     let mut encoder = Encoder::new(&mut bytes, quality);
