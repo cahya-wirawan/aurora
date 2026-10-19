@@ -624,7 +624,7 @@ pub fn run(options: &Options) -> Result<Report, Failure> {
             match write(&raw, Ok(image)) {
                 Ok(()) => report.reference_stored_written = true,
                 Err(failure) => {
-                    tracing::warn!(message = %failure.message, "no stored merged image")
+                    tracing::warn!(message = %failure.message, "no stored merged image");
                 }
             }
         }
