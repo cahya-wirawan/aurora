@@ -5287,7 +5287,9 @@ fn build_streamed(
     let embedded = notes.3.take();
     let plan = plan_colour(embedded.as_deref(), gray, &mut notes);
     let mut builder = Builder {
-        to_working: plan.convert_from,
+        to_working: plan
+            .convert_from
+            .map(|bytes| crate::ProfileConverter::new(bytes, crate::ConvertDirection::ToWorking)),
         adjustments_seen: 0,
         conversion_failed: 0,
         layers: &mut layers,
@@ -5442,8 +5444,9 @@ fn plan_colour(embedded: Option<&[u8]>, gray: bool, notes: &mut Notes) -> Colour
 /// from `'b` because a `&mut dyn` trait object's lifetime is invariant.
 struct Builder<'b, 'k, 's> {
     /// The embedded profile's conversion into the working space, when the
-    /// file's colours are not sRGB.
-    to_working: Option<Vec<u8>>,
+    /// file's colours are not sRGB; one converter for every layer, so its
+    /// transforms and their memos are built once per open.
+    to_working: Option<crate::ProfileConverter>,
     /// Adjustment layers added (the conversion note names them).
     adjustments_seen: u64,
     /// Layers whose colour conversion failed and were left as stored.
@@ -5472,14 +5475,10 @@ impl Builder<'_, '_, '_> {
     /// assume in-gamut colour; Photoshop clips out-of-gamut colour when it
     /// converts to sRGB too).
     fn bring_image_into_working(&mut self, image: &mut Image) {
-        let Some(profile) = &self.to_working else {
+        let Some(converter) = &self.to_working else {
             return;
         };
-        match crate::convert_profile_rgba(
-            image.samples_mut(),
-            profile,
-            crate::ConvertDirection::ToWorking,
-        ) {
+        match converter.convert(image.samples_mut()) {
             Ok(()) => crate::clamp_colour_unit(image.samples_mut()),
             Err(err) => {
                 tracing::warn!(
