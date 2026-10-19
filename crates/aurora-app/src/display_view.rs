@@ -364,40 +364,10 @@ impl DisplayView {
             .flat_map(|y| (0..tiles.0).map(move |x| TileId { x, y }))
             .collect();
         if visible.iter().all(|&id| cache.is_current(id)) {
-            let rest: Vec<TileId> = all
-                .iter()
-                .copied()
-                .filter(|&id| !cache.is_current(id))
-                .collect();
-            if !rest.is_empty() {
-                match &mut level0 {
-                    Level0::Worker(worker) => {
-                        result.more |= crate::dispatch_or_composite_tiles_bounded(
-                            &rest,
-                            layers,
-                            active_layer,
-                            store,
-                            cache,
-                            worker,
-                            Some(BACKGROUND_BUDGET),
-                        );
-                    }
-                    Level0::Sync(gpu, compositor) => {
-                        let (done, more) = zoomed_view::recomposite_within_budget(
-                            &rest,
-                            layers,
-                            active_layer,
-                            store,
-                            cache,
-                            *gpu,
-                            compositor.as_deref_mut(),
-                            BACKGROUND_BUDGET,
-                        );
-                        result.composited += done;
-                        result.more |= more;
-                    }
-                }
-            }
+            let (done, more) =
+                composite_rest(&all, layers, active_layer, store, cache, &mut level0);
+            result.composited += done;
+            result.more |= more;
         }
         // 3. Uploads: the visible tiles first (all of them at or above the
         // atlas floor), then the rest under the budget.
@@ -489,6 +459,51 @@ impl DisplayView {
     #[must_use]
     pub(crate) fn uploads(&self) -> u64 {
         self.texture.uploads()
+    }
+}
+
+/// Composites the tiles of `all` that are not current, in the background
+/// (one worker job, or [`BACKGROUND_BUDGET`] of synchronous recomposites);
+/// the tiles done synchronously and whether work was left for the UI thread.
+fn composite_rest(
+    all: &[TileId],
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    store: &mut aurora_tile::TileStore,
+    cache: &mut crate::CompositeCache,
+    level0: &mut Level0<'_>,
+) -> (usize, bool) {
+    let rest: Vec<TileId> = all
+        .iter()
+        .copied()
+        .filter(|&id| !cache.is_current(id))
+        .collect();
+    if rest.is_empty() {
+        return (0, false);
+    }
+    match level0 {
+        Level0::Worker(worker) => (
+            0,
+            crate::dispatch_or_composite_tiles_bounded(
+                &rest,
+                layers,
+                active_layer,
+                store,
+                cache,
+                worker,
+                Some(BACKGROUND_BUDGET),
+            ),
+        ),
+        Level0::Sync(gpu, compositor) => zoomed_view::recomposite_within_budget(
+            &rest,
+            layers,
+            active_layer,
+            store,
+            cache,
+            *gpu,
+            compositor.as_deref_mut(),
+            BACKGROUND_BUDGET,
+        ),
     }
 }
 
