@@ -116,6 +116,15 @@ impl GpuSurface<'_> {
         (self.config.width, self.config.height)
     }
 
+    /// Reconfigures the surface with `mode`. Only `Fifo`, which every
+    /// surface supports, and wgpu's `AutoVsync`/`AutoNoVsync`, which fall
+    /// back by support, are safe to pass; another mode a surface lacks
+    /// makes wgpu fail the configure.
+    pub fn set_present_mode(&mut self, device: &wgpu::Device, mode: wgpu::PresentMode) {
+        self.config.present_mode = mode;
+        self.surface.configure(device, &self.config);
+    }
+
     /// Reconfigures the surface for a new size.
     ///
     /// No-ops on a zero-sized request (a minimized window can report
