@@ -668,3 +668,77 @@ fn a_weight_below_one_step_is_not_drawn() {
     assert!(blend_weight(frame.level, frame.level_zoom, 0.94) < super::super::BLEND_EPSILON);
     assert_eq!(frame.blend, None);
 }
+
+#[test]
+fn zooming_in_across_a_boundary_hands_the_shown_level_over_at_full_weight() {
+    let Some(context) = crate::tests::real_gpu_context() else {
+        return;
+    };
+    let (device, queue) = (context.device(), context.queue());
+    let mut doc = document((2100, 1100));
+    let mut cache = crate::CompositeCache::default();
+    let mut atlases = ZoomedAtlases::new(device, queue, VIEW);
+    let mut canvas = aurora_gpu::CanvasPipeline::new(device);
+    // Level 2 alone, drawn complete as the primary only.
+    let quarter = settle_atlases(
+        device,
+        queue,
+        &mut atlases,
+        &mut doc,
+        &mut cache,
+        0.25,
+        VIEW,
+    );
+    assert_eq!((quarter.level, quarter.blend.clone()), (2, None));
+    // Just past the boundary into level 1: level 2 becomes the partner and
+    // is drawn at the full weight (about 0.986) on the very first frame.
+    let zoom_in = 0.25 * 1.01;
+    let (frame, _) = prepare_once(
+        device,
+        queue,
+        &mut atlases,
+        &mut doc,
+        &mut cache,
+        (zoom_in, (0.0, 0.0)),
+        VIEW,
+        false,
+        Duration::from_mins(1),
+    );
+    assert_eq!(frame.level, 1);
+    let weight = frame.blend.as_ref().map_or(0.0, |blend| blend.weight);
+    assert!(weight > 0.98, "{weight}");
+    assert_eq!(atlases.primary().blend_weight(), weight, "no fade back in");
+    assert_eq!(atlases.keys().1, Some((cache.id(), doc.size, 2)));
+    // The picture is level 2 at that zoom but for the residual 1 - w of
+    // level 1: within a few levels, where the reported pop (a fade from
+    // 1/6) would differ by most of the noise's amplitude.
+    let blended = render_frame(device, queue, &mut canvas, &atlases, &frame, VIEW);
+    let Some(partner) = atlases.partner() else {
+        unreachable!("the partner holds level 2");
+    };
+    let samples: Vec<(u32, u32)> = (0..VIEW.1)
+        .flat_map(|y| (0..VIEW.0).map(move |x| (x, y)))
+        .collect();
+    let bind_group = canvas.bind_group(device, partner);
+    let level2 =
+        crate::tests::render_bound_pixels(device, queue, &mut canvas, &bind_group, VIEW, &samples);
+    let jump = worst(&blended, &level2);
+    assert!(jump <= 5, "the crossing jumps by {jump} levels");
+
+    // And out again past the boundary: level 2 back as the primary, with
+    // at most the small weight toward level 3.
+    let (out, _) = prepare_once(
+        device,
+        queue,
+        &mut atlases,
+        &mut doc,
+        &mut cache,
+        (0.25 * 0.99, (0.0, 0.0)),
+        VIEW,
+        false,
+        Duration::from_mins(1),
+    );
+    assert_eq!(out.level, 2);
+    assert_eq!(atlases.keys().0, Some((cache.id(), doc.size, 2)));
+    assert!(atlases.primary().blend_weight() < 0.02);
+}

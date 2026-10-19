@@ -697,6 +697,16 @@ impl ZoomedAtlases {
         }
     }
 
+    /// The partner atlas, built (unkeyed) when there is none yet.
+    fn ensure_partner(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> &mut Atlas {
+        let size = self.size;
+        self.partner.get_or_insert_with(|| {
+            Atlas::new(aurora_gpu::TileResidency::with_coverage(
+                device, queue, size, COVERAGE,
+            ))
+        })
+    }
+
     /// Prepares one zoomed-out frame: hands the atlases their levels
     /// (swapping them when that saves an upload), advances the pyramid for
     /// the frame's level and uploads it, and, once that level is complete,
@@ -723,6 +733,12 @@ impl ZoomedAtlases {
         let key = |level: u32| (doc.cache_id, doc.canvas, level);
         let want_primary = key(frame.level);
         let want_partner = frame.blend.as_ref().map(|blend| key(blend.level));
+        if want_partner.is_some() {
+            // Before the swap: a zoom in past a power of two hands the
+            // level just shown over as the partner even on the first frame
+            // that blends.
+            self.ensure_partner(device, queue);
+        }
         if let Some(partner) = self.partner.as_mut() {
             let swap = (self.primary.key != Some(want_primary)
                 && partner.key == Some(want_primary))
@@ -754,16 +770,16 @@ impl ZoomedAtlases {
         let mut doc = doc;
         let mut result = advance_doc(frame.level, &frame.visible, &mut doc, level0.reborrow());
         if result.complete {
+            // Drawn complete as the frame's own level: on screen already,
+            // so when a zoom in hands it over as the partner it is drawn
+            // at its full weight at once, not faded in again (task 140
+            // re-review). Only a partner that was cold when keyed fades.
             self.primary.complete = true;
+            self.primary.shown = BLEND_FADE_FRAMES;
         }
         let mut weight = 0.0;
         if let (Some(blend), Some(want_partner)) = (frame.blend.as_ref(), want_partner) {
-            let size = self.size;
-            let atlas = self.partner.get_or_insert_with(|| {
-                Atlas::new(aurora_gpu::TileResidency::with_coverage(
-                    device, queue, size, COVERAGE,
-                ))
-            });
+            let atlas = self.ensure_partner(device, queue);
             atlas.key_to(want_partner, false);
             atlas.residency.set_origin(
                 queue,
