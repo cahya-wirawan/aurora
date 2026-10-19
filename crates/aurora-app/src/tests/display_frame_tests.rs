@@ -109,6 +109,18 @@ impl Rig {
         zoom: f32,
         origin: (f32, f32),
     ) -> Step {
+        self.frame_with(gpu, photo, zoom, origin, None)
+    }
+
+    /// [`Self::frame`], drawing `atlas` instead when the app would.
+    fn frame_with(
+        &mut self,
+        gpu: &aurora_gpu::GpuContext,
+        photo: &mut Photo,
+        zoom: f32,
+        origin: (f32, f32),
+        atlas: Option<&mut aurora_gpu::TileResidency>,
+    ) -> Step {
         let device = gpu.device();
         let queue = gpu.queue();
         let t0 = Instant::now();
@@ -146,7 +158,39 @@ impl Rig {
             level0,
             one_to_one,
         );
-        self.draw(gpu, photo.size, origin, zoom);
+        match atlas {
+            // As `redraw`: at or above the atlas floor a frame whose view
+            // is not uploaded yet draws the atlas.
+            Some(residency) if one_to_one && !advance.ready => {
+                residency.set_document_clip(Some((
+                    0.0,
+                    0.0,
+                    photo.size.0 as f32,
+                    photo.size.1 as f32,
+                )));
+                residency.set_origin(queue, origin, self.viewport, zoom);
+                let worker = if gpu_path { None } else { self.worker.as_mut() };
+                crate::recomposite_or_dispatch(
+                    residency,
+                    &photo.layers,
+                    Some(photo.active),
+                    &mut photo.store,
+                    &mut self.cache,
+                    Some(gpu),
+                    Some(&mut self.compositor),
+                    worker,
+                );
+                let _ = residency.sync(
+                    queue,
+                    &mut photo.store,
+                    crate::composite_surface_id(),
+                    false,
+                    usize::MAX,
+                );
+                self.draw_atlas(gpu, residency);
+            }
+            _ => self.draw(gpu, photo.size, origin, zoom),
+        }
         let _ = device.poll(wgpu::PollType::Wait {
             submission_index: None,
             timeout: None,
@@ -161,6 +205,37 @@ impl Rig {
             ms: ms(spent),
             advance,
         }
+    }
+
+    fn draw_atlas(&mut self, gpu: &aurora_gpu::GpuContext, residency: &aurora_gpu::TileResidency) {
+        let device = gpu.device();
+        let bind_group = self.canvas.bind_group(device, residency);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("r11-atlas"),
+        });
+        {
+            let pipeline = self.canvas.pipeline(device, FORMAT);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("r11-atlas"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        gpu.queue().submit(std::iter::once(encoder.finish()));
     }
 
     fn draw(
@@ -513,6 +588,27 @@ fn once_current_a_zoom_or_a_pan_uploads_and_composites_nothing() {
     }
 }
 
+/// At 100 % a frame whose visible tiles are not all uploaded yet is not
+/// ready (the app draws the atlas that frame): a fresh CPU-path document
+/// whose tiles the worker is still compositing.
+#[test]
+fn at_100_percent_a_view_not_yet_uploaded_is_not_ready() {
+    let Some(context) = real_gpu_context() else {
+        return;
+    };
+    let mut photo = build(Shape::PhotoMaskedCurves, SMALL);
+    let mut rig = Rig::new(&context, &photo, SMALL_VIEW, true, u32::MAX);
+    let first = rig.frame(&context, &mut photo, 1.0, (0.0, 0.0));
+    assert!(!first.advance.ready, "nothing composited yet");
+    assert_eq!(first.advance.uploaded, 0);
+    let (frames, _) = rig.settle(&context, &mut photo, 1.0, (0.0, 0.0), 400);
+    let last = rig.frame(&context, &mut photo, 1.0, (0.0, 0.0));
+    assert!(last.advance.ready, "ready once uploaded ({frames} frames)");
+    if let Some(mut worker) = rig.worker.take() {
+        worker.shutdown();
+    }
+}
+
 #[test]
 fn a_dab_reuploads_only_the_tiles_it_painted() {
     let Some(context) = real_gpu_context() else {
@@ -678,6 +774,7 @@ fn fit(size: (u32, u32)) -> (f32, (f32, f32)) {
 fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str, how: &str) {
     let worker = how == "worker";
     crate::frame_composite::set_parallel_enabled_for_tests(how != "sequential");
+    cold_paint(gpu, photo, label, path, how);
     let mut rig = Rig::new(gpu, photo, VIEWPORT, worker, u32::MAX);
     let (zoom, origin) = fit(photo.size);
     let started = Instant::now();
@@ -826,6 +923,56 @@ fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str,
         worker.shutdown();
     }
     crate::frame_composite::set_parallel_enabled_for_tests(false);
+}
+
+/// Round 9's frames exactly (a cold cache, 1:1, pan while painting, the
+/// newly seen tiles stale), as the app runs them with the display texture:
+/// a frame not ready draws the atlas (`redraw`'s fallback), and the
+/// display's own background build of the rest of the document runs
+/// alongside. Compare with `R9 frames`.
+fn cold_paint(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str, how: &str) {
+    let device = gpu.device();
+    let mut rig = Rig::new(gpu, photo, VIEWPORT, how == "worker", u32::MAX);
+    let mut residency = aurora_gpu::TileResidency::new(device, gpu.queue(), VIEWPORT);
+    let reference_origin = crate::composite_reference_origin(&photo.layers, Some(photo.active));
+    let mut frames = Vec::new();
+    let mut atlas_frames = 0;
+    for step in 0..40_u32 {
+        let (x, y) = (64 + step * 96, 32 + step * 48);
+        let t0 = Instant::now();
+        let outcome = aurora_brush::stamp_dab(
+            &mut photo.store,
+            photo.active_surface,
+            (x as f32 + 960.0, y as f32 + 540.0),
+            crate::BRUSH_RADIUS,
+            [0.95, 0.62, 0.25],
+            None,
+        );
+        crate::invalidate_painted_tiles(
+            &mut rig.cache,
+            &photo.layers,
+            photo.active,
+            outcome.painted(),
+            reference_origin,
+        );
+        let dab = ms(t0.elapsed());
+        let step = rig.frame_with(gpu, photo, 1.0, (x as f32, y as f32), Some(&mut residency));
+        if !step.advance.ready {
+            atlas_frames += 1;
+        }
+        // The dab is inside the frame, as round 9's (the worker's vsync
+        // pacing is not).
+        frames.push(dab + step.ms);
+    }
+    let (mean, p90, max, over) = stats(frames.get(1..).unwrap_or_default());
+    println!(
+        "R11 cold_paint11 doc={label} path={path} how={how} n=39 frame0={:.2} mean={mean:.2} \
+         p90={p90:.2} max={max:.2} over16={over} atlas_frames={atlas_frames}",
+        frames.first().copied().unwrap_or(0.0)
+    );
+    if let Some(mut worker) = rig.worker.take() {
+        worker.shutdown();
+    }
 }
 
 fn measure(size: (u32, u32), size_label: &str) {

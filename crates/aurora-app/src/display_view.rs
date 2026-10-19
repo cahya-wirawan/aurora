@@ -20,12 +20,14 @@
 //! **Each frame** ([`DisplayView::prepare`]): the visible tiles are made
 //! current first, exactly as the 1:1 atlas does at or above its floor (no
 //! budget) and as the zoomed-out view does below it (under
-//! [`zoomed_view::LEVEL0_FRAME_BUDGET`]); then, once they are, the rest of
-//! the document is composited in the background ([`BACKGROUND_BUDGET`] of
-//! synchronous recomposites, or one worker job). Changed visible tiles are
-//! uploaded (all of them at or above the atlas floor, so the frame is never
-//! staler than the atlas would be), the rest under [`UPLOAD_BUDGET`], and
-//! their mips rebuilt on the GPU.
+//! [`zoomed_view::LEVEL0_FRAME_BUDGET`]), and the changed ones uploaded
+//! (all of them at or above the atlas floor, so the frame is never staler
+//! than the atlas would be). Only on a frame that had none of that to do
+//! is the rest of the document composited in the background
+//! ([`BACKGROUND_BUDGET`] of synchronous recomposites, or one worker job)
+//! and uploaded under [`UPLOAD_BUDGET`], so painting or panning at 100 %
+//! costs what it costs on the atlas, and the build continues when the
+//! input pauses. Uploaded tiles get their mips rebuilt on the GPU.
 //!
 //! **What is drawn.** At or above the atlas floor the frame draws the
 //! texture only when every visible tile is uploaded at its current content
@@ -359,55 +361,67 @@ impl DisplayView {
                 }
             }
         }
-        // 2. The rest of the document, once the view is current.
+        // 2. The changed visible tiles uploaded (all of them at or above
+        // the atlas floor, so the frame is never staler than the atlas's).
+        let started = Instant::now();
+        let budget = (!one_to_one).then_some(UPLOAD_BUDGET);
+        let (uploaded, visible_left) = self.upload_tiles(queue, store, &visible, budget, started);
+        result.uploaded = uploaded;
+        result.more |= visible_left;
+        // 3. The rest of the document, in the background: only on a frame
+        // with nothing else to do (no visible tile stale, composited or
+        // uploaded), so a dab or a pan costs what it costs on the atlas.
         let all: Vec<TileId> = (0..tiles.1)
             .flat_map(|y| (0..tiles.0).map(move |x| TileId { x, y }))
             .collect();
-        if visible.iter().all(|&id| cache.is_current(id)) {
+        let idle = stale.is_empty() && uploaded == 0 && !visible_left;
+        if idle {
             let (done, more) =
                 composite_rest(&all, layers, active_layer, store, cache, &mut level0);
             result.composited += done;
             result.more |= more;
+            let (rest, rest_left) =
+                self.upload_tiles(queue, store, &all, Some(UPLOAD_BUDGET), started);
+            result.uploaded += rest;
+            result.more |= rest_left;
+        } else {
+            // Deferred to a later frame. A visible tile left to the worker
+            // wakes the loop when it lands; anything else asks for a frame.
+            let waiting_on_worker = matches!(level0, Level0::Worker(_))
+                && visible.iter().any(|&id| !cache.is_current(id));
+            let pending = all
+                .iter()
+                .any(|&id| !cache.is_current(id) || !self.uploaded_current(store, id));
+            result.more |= pending && !waiting_on_worker;
         }
-        // 3. Uploads: the visible tiles first (all of them at or above the
-        // atlas floor), then the rest under the budget.
-        let (uploaded, upload_left) = self.upload_changed(queue, store, &visible, &all, one_to_one);
-        result.uploaded = uploaded;
-        result.more |= upload_left;
         // 4. Their mips, on the GPU.
         let _ = self.texture.regenerate_mips(device, queue);
         result.ready = visible.iter().all(|&id| self.uploaded_current(store, id));
         result
     }
 
-    /// Uploads the changed tiles of `visible` (every one when `one_to_one`,
-    /// else under [`UPLOAD_BUDGET`]), then of `all` under the budget;
-    /// returns the count and whether the budget left some.
-    fn upload_changed(
+    /// Uploads the changed tiles of `tiles` in order, stopping once
+    /// `budget` (from `started`) is spent after at least one upload (`None`:
+    /// every one); the count and whether the budget left some.
+    fn upload_tiles(
         &mut self,
         queue: &wgpu::Queue,
         store: &mut aurora_tile::TileStore,
-        visible: &[TileId],
-        all: &[TileId],
-        one_to_one: bool,
+        tiles: &[TileId],
+        budget: Option<Duration>,
+        started: Instant,
     ) -> (u32, bool) {
-        let started = Instant::now();
         let mut uploaded = 0;
-        for &id in visible {
-            if !one_to_one && uploaded > 0 && started.elapsed() >= UPLOAD_BUDGET {
-                return (uploaded, true);
-            }
-            if self.upload_if_changed(queue, store, id) {
-                uploaded += 1;
-            }
-        }
-        for &id in all {
+        for &id in tiles {
             if self.uploaded_current(store, id)
                 || !store.contains_tile(crate::composite_surface_id(), id)
             {
                 continue;
             }
-            if uploaded > 0 && started.elapsed() >= UPLOAD_BUDGET {
+            if let Some(budget) = budget
+                && uploaded > 0
+                && started.elapsed() >= budget
+            {
                 return (uploaded, true);
             }
             if self.upload_if_changed(queue, store, id) {
