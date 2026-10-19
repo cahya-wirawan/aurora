@@ -157,6 +157,7 @@ impl Rig {
             &visible,
             level0,
             one_to_one,
+            (origin.0, origin.1, zoom),
         );
         match atlas {
             // As `redraw`: at or above the atlas floor a frame whose view

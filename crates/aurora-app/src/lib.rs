@@ -37809,6 +37809,7 @@ impl App {
             &visible,
             level0,
             one_to_one,
+            (origin.0, origin.1, zoom),
         );
         if advance.more {
             self.needs_redraw = true;

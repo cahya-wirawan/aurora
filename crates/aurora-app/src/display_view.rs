@@ -23,7 +23,9 @@
 //! [`zoomed_view::LEVEL0_FRAME_BUDGET`]), and the changed ones uploaded
 //! (all of them at or above the atlas floor, so the frame is never staler
 //! than the atlas would be). Only on a frame that had none of that to do
-//! is the rest of the document composited in the background
+//! (and only once the view has held still for [`QUIET_FRAMES`] frames and,
+//! on the CPU path, the worker is idle) is the rest of the document
+//! composited in the background
 //! ([`BACKGROUND_BUDGET`] of synchronous recomposites, or one worker job)
 //! and uploaded under [`UPLOAD_BUDGET`], so painting or panning at 100 %
 //! costs what it costs on the atlas, and the build continues when the
@@ -34,6 +36,14 @@
 //! ([`DisplayAdvance::ready`]); otherwise it draws the atlas, unchanged.
 //! Below the floor it always draws the texture: a tile not uploaded yet is
 //! transparent there (the checkerboard), as a cold zoomed-out pyramid is.
+//!
+//! **Lifetime.** One texture, for the active document only: a document
+//! switch, a crop (a new canvas size) or a new store builds a new one and
+//! re-uploads every tile. A window resize or a lost surface leaves it as it
+//! is (its size is the document's, not the window's). **Device loss is not
+//! handled**, as nothing in the app handles it: a lost device makes this
+//! texture as invalid as the atlas, the pipelines and every other GPU
+//! object, and a future recovery must drop `App::display` with them.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -51,6 +61,13 @@ pub(crate) const UPLOAD_BUDGET: Duration = Duration::from_millis(4);
 
 /// Synchronous recomposite time per frame for tiles outside the view.
 pub(crate) const BACKGROUND_BUDGET: Duration = Duration::from_millis(4);
+
+/// Frames the view must hold still, with nothing visible to composite or
+/// upload, before the rest of the document is built in the background
+/// (about 130 ms at 60 Hz): while the user pans, zooms or paints the frame
+/// does only what the atlas would, and the build never competes with the
+/// worker for the tiles coming into view.
+pub(crate) const QUIET_FRAMES: u32 = 8;
 
 /// The environment variable choosing the path: `0`/`off`/`false`/`no`
 /// never uses the display texture, `1`/`on`/`force` uses it for every
@@ -193,6 +210,11 @@ pub(crate) struct DisplayView {
     uploaded: HashMap<TileId, u64>,
     /// One canvas bind group per page, built on the first draw.
     groups: Vec<wgpu::BindGroup>,
+    /// The view (`origin.x`, `origin.y`, zoom) of the last frame.
+    last_view: Option<(f32, f32, f32)>,
+    /// Frames in a row with that view and no visible work: the background
+    /// build waits for [`QUIET_FRAMES`] of them.
+    quiet: u32,
 }
 
 impl DisplayView {
@@ -230,6 +252,8 @@ impl DisplayView {
             key,
             uploaded: HashMap::new(),
             groups: Vec::new(),
+            last_view: None,
+            quiet: 0,
         })
     }
 
@@ -292,6 +316,7 @@ impl DisplayView {
         visible: &[TileId],
         level0: Level0<'_>,
         one_to_one: bool,
+        view: (f32, f32, f32),
     ) -> DisplayAdvance {
         let FrameDocument {
             canvas,
@@ -362,20 +387,37 @@ impl DisplayView {
             }
         }
         // 2. The changed visible tiles uploaded (all of them at or above
-        // the atlas floor, so the frame is never staler than the atlas's).
+        // the atlas floor, so the frame is never staler than the atlas's),
+        // unless at or above the floor a visible tile has no content yet:
+        // then the atlas draws this frame, and uploading the others here as
+        // well would only upload them twice.
         let started = Instant::now();
+        let surface = crate::composite_surface_id();
+        let drawable = !one_to_one || visible.iter().all(|&id| store.contains_tile(surface, id));
         let budget = (!one_to_one).then_some(UPLOAD_BUDGET);
-        let (uploaded, visible_left) = self.upload_tiles(queue, store, &visible, budget, started);
+        let (uploaded, visible_left) = if drawable {
+            self.upload_tiles(queue, store, &visible, budget, started)
+        } else {
+            (0, false)
+        };
         result.uploaded = uploaded;
         result.more |= visible_left;
-        // 3. The rest of the document, in the background: only on a frame
-        // with nothing else to do (no visible tile stale, composited or
-        // uploaded), so a dab or a pan costs what it costs on the atlas.
+        // 3. The rest of the document, in the background: only after
+        // `QUIET_FRAMES` frames with the view still and nothing visible
+        // stale, composited or uploaded, and (CPU path) the worker idle, so
+        // a dab or a pan costs what it costs on the atlas.
         let all: Vec<TileId> = (0..tiles.1)
             .flat_map(|y| (0..tiles.0).map(move |x| TileId { x, y }))
             .collect();
-        let idle = stale.is_empty() && uploaded == 0 && !visible_left;
-        if idle {
+        let busy_frame = !stale.is_empty() || uploaded > 0 || visible_left || !drawable;
+        self.quiet = if busy_frame || self.last_view != Some(view) {
+            0
+        } else {
+            self.quiet.saturating_add(1)
+        };
+        self.last_view = Some(view);
+        let worker_busy = matches!(&level0, Level0::Worker(worker) if worker.is_busy());
+        if self.quiet >= QUIET_FRAMES && !worker_busy {
             let (done, more) =
                 composite_rest(&all, layers, active_layer, store, cache, &mut level0);
             result.composited += done;
@@ -385,14 +427,13 @@ impl DisplayView {
             result.uploaded += rest;
             result.more |= rest_left;
         } else {
-            // Deferred to a later frame. A visible tile left to the worker
-            // wakes the loop when it lands; anything else asks for a frame.
-            let waiting_on_worker = matches!(level0, Level0::Worker(_))
-                && visible.iter().any(|&id| !cache.is_current(id));
+            // Deferred to a later frame. A busy worker wakes the loop when
+            // its result lands; anything else asks for a frame (which is
+            // how the quiet frames are counted).
             let pending = all
                 .iter()
                 .any(|&id| !cache.is_current(id) || !self.uploaded_current(store, id));
-            result.more |= pending && !waiting_on_worker;
+            result.more |= pending && !worker_busy;
         }
         // 4. Their mips, on the GPU.
         let _ = self.texture.regenerate_mips(device, queue);

@@ -111,3 +111,27 @@ fn zoomed_out_the_visible_tiles_reach_one_texel_of_the_sampled_level_and_stay_in
         visible_tiles((0.0, 0.0), 1.0, (256, 256), (1000, 600))
     );
 }
+
+/// The documents either side of the discrete budget, one tile column
+/// apart: the one below is drawn through the display texture, the one
+/// above keeps the atlas and the pyramid.
+#[test]
+fn documents_just_below_and_just_above_the_budget_take_their_own_paths() {
+    let discrete = aurora_gpu::display_budget(wgpu::DeviceType::DiscreteGpu, None, false);
+    let height = 8000;
+    let tile = aurora_tile::TILE;
+    let mut width = tile;
+    while eligible((width + tile, height), 8192, discrete, DisplayMode::Auto) {
+        width += tile;
+    }
+    let below = (width, height);
+    let above = (width + 1, height);
+    assert!(eligible(below, 8192, discrete, DisplayMode::Auto));
+    assert!(!eligible(above, 8192, discrete, DisplayMode::Auto));
+    let bytes = |size| aurora_gpu::display_bytes(size, 8192, super::DISPLAY_MIP_LEVELS);
+    assert!(bytes(below).is_some_and(|b| b <= discrete.max_bytes));
+    assert!(bytes(above).is_some_and(|b| b > discrete.max_bytes));
+    // Forced, the one above is drawn too; off, neither.
+    assert!(eligible(above, 8192, discrete, DisplayMode::Force));
+    assert!(!eligible(below, 8192, discrete, DisplayMode::Off));
+}
