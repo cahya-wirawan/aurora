@@ -722,7 +722,10 @@ fn new_mirror(source: &mut TileStore) -> Option<TileStore> {
 /// threads (or a test's count) whose drop-shadow coverage goes through
 /// `shadows`. `None` if rayon cannot start it; the worker then folds
 /// sequentially on its own thread, as before 0.188.0.
-fn build_pool(threads: usize, shadows: &crate::SharedShadowCache) -> Option<rayon::ThreadPool> {
+pub(crate) fn build_pool(
+    threads: usize,
+    shadows: &crate::SharedShadowCache,
+) -> Option<rayon::ThreadPool> {
     let shadows = Arc::clone(shadows);
     match rayon::ThreadPoolBuilder::new()
         .num_threads(threads.max(1))
@@ -767,7 +770,7 @@ impl WorkerContext<'_> {
 /// Locks the mirror. A poisoned lock (a task panicked while holding it,
 /// which a release build's `panic = "abort"` never sees) is used as is:
 /// the store's own state is never left half-updated by a reader.
-fn lock<S>(store: &Mutex<S>) -> MutexGuard<'_, S> {
+pub(crate) fn lock<S>(store: &Mutex<S>) -> MutexGuard<'_, S> {
     match store.lock() {
         Ok(store) => store,
         Err(poisoned) => poisoned.into_inner(),

@@ -130,3 +130,10 @@ zip = { workspace = true }
 [[bin]]
 name = "aurora-app"
 path = "src/main.rs"
+
+# A timed headless open -> composite -> export run (`aurora_app::headless`),
+# for comparing Aurora with other editors from the outside
+# (`spike/photocraft-compare/`). No window, no display.
+[[bin]]
+name = "aurora-headless"
+path = "src/bin/aurora-headless.rs"
