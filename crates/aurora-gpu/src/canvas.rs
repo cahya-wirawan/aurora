@@ -149,7 +149,8 @@ impl CanvasPipeline {
     }
 
     /// A bind group drawing page `page` of `display` (task 142): its view,
-    /// sampler and uniform in the atlas's slots, and again in the partner
+    /// sampler (the atlas's filter when `atlas_filter`, see
+    /// [`crate::display_lod`]) and uniform in the atlas's slots, and again in the partner
     /// slots (`fs_display` never reads them). `None` for no such page.
     #[must_use]
     pub fn display_bind_group(
@@ -157,8 +158,9 @@ impl CanvasPipeline {
         device: &wgpu::Device,
         display: &crate::DisplayTexture,
         page: usize,
+        atlas_filter: bool,
     ) -> Option<wgpu::BindGroup> {
-        let (view, sampler, uniform) = display.page_bindings(page)?;
+        let (view, sampler, uniform) = display.page_bindings(page, atlas_filter)?;
         Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("canvas-display"),
             layout: &self.layout,

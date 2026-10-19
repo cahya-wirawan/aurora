@@ -247,6 +247,64 @@ pub fn lod_for_zoom(zoom: f32, levels: u32) -> f32 {
     if lod > 0.0 { lod.min(top) } else { 0.0 }
 }
 
+/// The level of detail the atlas-filter sampler is clamped to: under 0.5,
+/// so its nearest mip is always level 0, and above 0, so a minified sample
+/// stays a minification (`Linear`), as the atlas's.
+pub const LEVEL0_LOD_CLAMP: f32 = 0.49;
+
+/// What a frame at physical `zoom` samples, for a canvas whose 1:1 atlas
+/// floor is `atlas_floor` (task 142 review: the picture must not change
+/// filter where the display texture and the atlas meet): `(level of
+/// detail, atlas filter)`.
+///
+/// - At or above the floor: the true `-log2(zoom)` (0 at or above 100 %)
+///   with the atlas's own filter (`true`): level 0, bilinear when minified,
+///   nearest when magnified, exactly what the atlas samples, so a frame
+///   that falls back to the atlas there shows the same filter.
+/// - Below it: trilinear (`false`), the level ramped from 0 at the floor to
+///   1 at 50 % (the atlas's filter until the ramp reaches
+///   [`MIN_TRILINEAR_LOD`], since a level that small reads as a
+///   magnification in hardware) (`(lod - lod_floor) / (1 - lod_floor)`), the true level
+///   below 50 %, so crossing the floor does not jump and every
+///   power-of-two zoom at or below 50 % samples exactly one level. A floor
+///   at or below 50 % (a viewport under two tiles) has no ramp.
+///
+/// Clamped to `[0, levels - 1]`. Pure.
+#[must_use]
+pub fn display_lod(zoom: f32, atlas_floor: f32, levels: u32) -> (f32, bool) {
+    let zoom = guard_zoom(zoom);
+    let floor = if atlas_floor.is_finite() && atlas_floor > 0.0 {
+        atlas_floor.min(1.0)
+    } else {
+        1.0
+    };
+    let lod = -zoom.log2();
+    #[allow(clippy::cast_precision_loss)]
+    let top = levels.saturating_sub(1) as f32;
+    if zoom >= floor {
+        return (if lod > 0.0 { lod } else { 0.0 }, true);
+    }
+    let lod_floor = -floor.log2();
+    let ramped = if lod_floor < 1.0 && lod <= 1.0 {
+        (lod - lod_floor) / (1.0 - lod_floor)
+    } else {
+        lod
+    };
+    // Hardware holds the level of detail in fixed point: a level under
+    // about 1/256 above 0 reads as 0, a magnification (`Nearest`), measured
+    // on the RTX 3090. Until the ramp is clearly positive the atlas's filter
+    // keeps drawing (the true level, so a minification).
+    if ramped < MIN_TRILINEAR_LOD {
+        return (if lod > 0.0 { lod } else { 0.0 }, true);
+    }
+    (ramped.clamp(0.0, top), false)
+}
+
+/// The smallest ramped level of detail drawn trilinearly
+/// ([`display_lod`]): below it the atlas's filter draws. At it the picture
+/// steps by this share of level 1 (about 3 %).
+pub const MIN_TRILINEAR_LOD: f32 = 1.0 / 32.0;
+
 /// The first canvas pixel (of `extent`) whose centre lies at or past
 /// document position `boundary` for a view whose first pixel's left edge
 /// is document position `origin` at `zoom` (`(boundary - origin) * zoom -
@@ -442,6 +500,8 @@ pub struct DisplayTexture {
     mip_levels: u32,
     pages: Vec<Page>,
     sampler: wgpu::Sampler,
+    /// The atlas's own filter, for frames at or above its floor.
+    level0_sampler: wgpu::Sampler,
     mip_pipeline: wgpu::RenderPipeline,
     staging: Vec<u8>,
     bytes: u64,
@@ -528,12 +588,27 @@ impl DisplayTexture {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..wgpu::SamplerDescriptor::default()
         });
+        // The atlas's filter at or above its floor (task 142 review): level
+        // 0 only, `Linear` when minified, `Nearest` when magnified. The
+        // level of detail stays positive below 100 % (minification) but is
+        // clamped under 0.5, so the nearest mip is always level 0.
+        let level0_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("display-level0"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            lod_max_clamp: LEVEL0_LOD_CLAMP,
+            ..wgpu::SamplerDescriptor::default()
+        });
         Ok(Self {
             doc_size,
             doc_tiles: tiles,
             mip_levels,
             pages,
             sampler,
+            level0_sampler,
             mip_pipeline,
             staging: vec![0; TILE_BYTES],
             bytes,
@@ -597,10 +672,16 @@ impl DisplayTexture {
     pub fn page_bindings(
         &self,
         index: usize,
+        atlas_filter: bool,
     ) -> Option<(&wgpu::TextureView, &wgpu::Sampler, &wgpu::Buffer)> {
+        let sampler = if atlas_filter {
+            &self.level0_sampler
+        } else {
+            &self.sampler
+        };
         self.pages
             .get(index)
-            .map(|page| (&page.view, &self.sampler, &page.uniform))
+            .map(|page| (&page.view, sampler, &page.uniform))
     }
 
     /// Uploads composite tile `id`'s straight-alpha `texels` to level 0 of
@@ -687,7 +768,10 @@ impl DisplayTexture {
     /// origin in source)`) on the GPU, into every page holding them, and
     /// marks their mips for the next [`Self::regenerate_mips`]. A tile that
     /// is not interior is skipped (its outside texels must be masked, which
-    /// only [`Self::upload_tile`] does). Returns the tiles copied.
+    /// only [`Self::upload_tile`] does). Returns the tiles copied. The copies
+    /// are one submission of their own (not batched with the frame's
+    /// encoder): `aurora-app` calls this only on a GPU-path frame that fell
+    /// back to the atlas, which needs a visible tile with no composite yet.
     pub fn copy_tiles_from(
         &mut self,
         device: &wgpu::Device,
@@ -749,6 +833,37 @@ impl DisplayTexture {
     #[must_use]
     pub fn copies(&self) -> u64 {
         self.copies
+    }
+
+    /// Clears every level of every page to transparent on the GPU (one
+    /// clear pass each, no upload) and drops pending mip work: what a
+    /// texture whose source has been replaced wholesale needs.
+    pub fn clear(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("display-clear"),
+        });
+        for page in &mut self.pages {
+            page.dirty.clear();
+            for view in &page.level_views {
+                let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("display-clear"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+        }
+        queue.submit(std::iter::once(encoder.finish()));
     }
 
     /// Whether any uploaded tile still waits for its mips.
@@ -819,7 +934,11 @@ impl DisplayTexture {
     /// Writes every page's uniform for a view whose top-left canvas pixel
     /// is at document position `origin`, at physical `zoom`, in a canvas of
     /// `viewport` pixels, clipped to `doc_clip` (document pixels, `None`
-    /// for no clip), with the Channels panel's `gain`.
+    /// for no clip), with the Channels panel's `gain`, for a canvas whose
+    /// 1:1 atlas floor is `atlas_floor`. Returns whether the frame must draw
+    /// with the atlas's filter ([`display_lod`]; the bind group to use).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn set_view(
         &self,
         queue: &wgpu::Queue,
@@ -828,8 +947,9 @@ impl DisplayTexture {
         zoom: f32,
         doc_clip: Option<(f32, f32, f32, f32)>,
         gain: [f32; 3],
-    ) {
-        let lod = lod_for_zoom(zoom, self.mip_levels);
+        atlas_floor: f32,
+    ) -> bool {
+        let (lod, atlas_filter) = display_lod(zoom, atlas_floor, self.mip_levels);
         for page in &self.pages {
             #[allow(clippy::cast_precision_loss)]
             let page_origin = (
@@ -852,6 +972,7 @@ impl DisplayTexture {
             }
             queue.write_buffer(&page.uniform, 0, &bytes);
         }
+        atlas_filter
     }
 
     /// [`page_scissors`] for this texture's pages.

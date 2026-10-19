@@ -69,6 +69,10 @@ pub(crate) const UPLOAD_BUDGET: Duration = Duration::from_millis(4);
 /// Synchronous recomposite time per frame for tiles outside the view.
 pub(crate) const BACKGROUND_BUDGET: Duration = Duration::from_millis(4);
 
+/// Forgotten tiles cleared one by one in a frame before the whole texture
+/// is cleared instead ([`DisplayView::drop_forgotten`]).
+pub(crate) const FORGOTTEN_CLEAR_LIMIT: usize = 8;
+
 /// Frames the view must hold still, with nothing visible to composite or
 /// upload, before the rest of the document is built in the background
 /// (about 130 ms at 60 Hz): while the user pans, zooms or paints the frame
@@ -192,6 +196,9 @@ pub(crate) struct DisplayFrame {
     pub(crate) origin: (f32, f32),
     /// Physical zoom.
     pub(crate) zoom: f32,
+    /// The frame samples with the atlas's own filter (at or above the atlas
+    /// floor, [`aurora_gpu::display_lod`]).
+    pub(crate) atlas_filter: bool,
 }
 
 /// What one [`DisplayView::prepare`] did.
@@ -216,7 +223,11 @@ pub(crate) struct DisplayView {
     /// The content version each tile was uploaded at.
     uploaded: HashMap<TileId, u64>,
     /// One canvas bind group per page, built on the first draw.
-    groups: Vec<wgpu::BindGroup>,
+    /// The per-page canvas bind groups, `[trilinear, atlas filter]`, each
+    /// built on its first draw.
+    groups: [Vec<wgpu::BindGroup>; 2],
+    /// A transparent tile, for [`Self::clear_tile`] (built on first use).
+    zeros: Vec<half::f16>,
     /// The view (`origin.x`, `origin.y`, zoom) of the last frame.
     last_view: Option<(f32, f32, f32)>,
     /// Frames in a row with that view and no visible work: the background
@@ -258,7 +269,8 @@ impl DisplayView {
             texture,
             key,
             uploaded: HashMap::new(),
-            groups: Vec::new(),
+            groups: [Vec::new(), Vec::new()],
+            zeros: Vec::new(),
             last_view: None,
             quiet: 0,
         })
@@ -312,6 +324,50 @@ impl DisplayView {
         }
     }
 
+    /// Tiles uploaded once whose composite the store has since forgotten
+    /// (task 142 review: an open into the same store, or any other path
+    /// that forgets the composite surface) must never show their old
+    /// texels: up to [`FORGOTTEN_CLEAR_LIMIT`] are cleared to transparent
+    /// one by one, more clear the whole texture on the GPU (every texel
+    /// transparent, every record gone), so no frame draws one, whatever the
+    /// upload budget.
+    fn drop_forgotten(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        store: &aurora_tile::TileStore,
+    ) {
+        let surface = crate::composite_surface_id();
+        let forgotten: Vec<TileId> = self
+            .uploaded
+            .keys()
+            .copied()
+            .filter(|&id| !store.contains_tile(surface, id))
+            .collect();
+        if forgotten.is_empty() {
+            return;
+        }
+        if forgotten.len() > FORGOTTEN_CLEAR_LIMIT {
+            self.texture.clear(device, queue);
+            self.uploaded.clear();
+            return;
+        }
+        for id in forgotten {
+            let _ = self.clear_tile(queue, id);
+        }
+    }
+
+    /// Clears tile `id` to transparent and forgets its upload record (its
+    /// composite is gone from the store); whether it did.
+    fn clear_tile(&mut self, queue: &wgpu::Queue, id: TileId) -> bool {
+        if self.zeros.len() != aurora_tile::SAMPLES {
+            self.zeros = vec![half::f16::ZERO; aurora_tile::SAMPLES];
+        }
+        let cleared = self.texture.upload_tile(queue, id, &self.zeros).is_ok();
+        self.uploaded.remove(&id);
+        cleared
+    }
+
     /// One frame's work for showing `visible` (see the module doc).
     /// `one_to_one`: the frame is at or above the 1:1 atlas floor.
     #[allow(clippy::too_many_arguments)]
@@ -337,6 +393,7 @@ impl DisplayView {
         } = doc;
         let mut result = DisplayAdvance::default();
         let tiles = aurora_gpu::doc_tiles(canvas);
+        self.drop_forgotten(device, queue, store);
         let in_doc = |id: &TileId| id.x < tiles.0 && id.y < tiles.1;
         let visible: Vec<TileId> = visible.iter().copied().filter(in_doc).collect();
         let mut level0 = level0;
@@ -522,6 +579,7 @@ impl DisplayView {
     /// Writes the view's uniforms: `origin` the document position at the
     /// canvas's top-left pixel, `zoom` physical, `viewport` the canvas's
     /// physical size, the document clip and the channel gain.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn set_view(
         &self,
         queue: &wgpu::Queue,
@@ -530,23 +588,43 @@ impl DisplayView {
         zoom: f32,
         doc_clip: (f32, f32, f32, f32),
         gain: [f32; 3],
-    ) {
-        self.texture
-            .set_view(queue, origin, viewport, zoom, Some(doc_clip), gain);
+        atlas_floor: f32,
+    ) -> bool {
+        self.texture.set_view(
+            queue,
+            origin,
+            viewport,
+            zoom,
+            Some(doc_clip),
+            gain,
+            atlas_floor,
+        )
     }
 
-    /// The per-page bind groups, built once.
+    /// The per-page bind groups for the filter [`Self::set_view`] chose
+    /// (`atlas_filter`), each set built once.
     pub(crate) fn bind_groups(
         &mut self,
         canvas: &aurora_gpu::CanvasPipeline,
         device: &wgpu::Device,
+        atlas_filter: bool,
     ) -> &[wgpu::BindGroup] {
-        if self.groups.is_empty() {
-            self.groups = (0..self.texture.pages().len())
-                .filter_map(|page| canvas.display_bind_group(device, &self.texture, page))
-                .collect();
+        let index = usize::from(atlas_filter);
+        let pages = self.texture.pages().len();
+        let texture = &self.texture;
+        match self.groups.get_mut(index) {
+            Some(groups) => {
+                if groups.is_empty() {
+                    *groups = (0..pages)
+                        .filter_map(|page| {
+                            canvas.display_bind_group(device, texture, page, atlas_filter)
+                        })
+                        .collect();
+                }
+                groups
+            }
+            None => &[],
         }
-        &self.groups
     }
 
     /// The content version tile `id` was last uploaded at.

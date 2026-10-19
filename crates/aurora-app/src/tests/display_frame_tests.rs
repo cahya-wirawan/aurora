@@ -285,13 +285,16 @@ impl Rig {
     ) {
         let device = gpu.device();
         let queue = gpu.queue();
-        self.view.set_view(
+        let floor =
+            zoomed_view::atlas_floor(self.viewport, device.limits().max_texture_dimension_2d);
+        let atlas_filter = self.view.set_view(
             queue,
             origin,
             self.viewport,
             zoom,
             (0.0, 0.0, size.0 as f32, size.1 as f32),
             [1.0, 1.0, 1.0],
+            floor,
         );
         let scissors = display_view::surface_scissors(
             self.view.texture(),
@@ -304,7 +307,10 @@ impl Rig {
             label: Some("r11-frame"),
         });
         {
-            let groups = self.view.bind_groups(&self.canvas, device).to_vec();
+            let groups = self
+                .view
+                .bind_groups(&self.canvas, device, atlas_filter)
+                .to_vec();
             let pipeline = self.canvas.display_pipeline(device, FORMAT);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("r11-frame"),
@@ -374,9 +380,19 @@ fn read_texture(
     texture: &wgpu::Texture,
     size: (u32, u32),
 ) -> Vec<u8> {
+    read_texture_bytes(gpu, texture, size, 4)
+}
+
+/// Level 0 of `texture` (`size`, `bytes_per_texel` a texel) as bytes.
+fn read_texture_bytes(
+    gpu: &aurora_gpu::GpuContext,
+    texture: &wgpu::Texture,
+    size: (u32, u32),
+    bytes_per_texel: u32,
+) -> Vec<u8> {
     let device = gpu.device();
     let queue = gpu.queue();
-    let row = size.0 * 4;
+    let row = size.0 * bytes_per_texel;
     let padded = row.div_ceil(256) * 256;
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("r11-readback"),
@@ -846,6 +862,75 @@ fn a_pixel_undo_reuploads_only_the_tiles_the_stroke_touched() {
     assert_eq!(changed, want, "only the undone stroke's tiles");
     assert_eq!(step.advance.uploaded as usize, touched.len());
     assert!(rig.settled(&photo));
+}
+
+/// An open into the same store (what `replace_document_pixels_prepared`
+/// does: the composite surface is forgotten, the store, its serial, the
+/// cache and the canvas size stay) never leaves an old tile's texels in the
+/// texture: after the next frame below the floor every tile is either
+/// transparent or the new document's, on a document with few tiles
+/// (cleared one by one) and with many (the whole texture cleared).
+#[test]
+fn an_open_into_the_same_store_leaves_no_old_texels_below_the_floor() {
+    let Some(context) = real_gpu_context() else {
+        return;
+    };
+    for size in [(700, 500), SMALL] {
+        let mut photo = build(Shape::Photo, size);
+        let mut rig = Rig::new(&context, &photo, SMALL_VIEW, false, u32::MAX);
+        let _ = rig.settle(&context, &mut photo, 0.4, (0.0, 0.0), 400);
+        let Some(texture) = rig.view.texture().page_texture(0) else {
+            unreachable!("one page");
+        };
+        let page = (texture.width(), texture.height());
+        let old = read_texture_bytes(&context, texture, page, 8);
+        // The new document: the same layer, another picture.
+        let surface = crate::composite_surface_id();
+        let _ = photo.store.forget_surface(surface);
+        for id in photo.all_tiles() {
+            let Ok(tile) = photo.store.get_mut(photo.active_surface, id) else {
+                unreachable!("writable");
+            };
+            for texel in tile.texels_mut().chunks_exact_mut(4) {
+                texel.copy_from_slice(&[0.2, 0.4, 0.6, 1.0].map(half::f16::from_f32));
+            }
+        }
+        rig.cache.bump();
+        let _ = rig.frame(&context, &mut photo, 0.4, (0.0, 0.0));
+        let Some(texture) = rig.view.texture().page_texture(0) else {
+            unreachable!("one page");
+        };
+        let now = read_texture_bytes(&context, texture, page, 8);
+        let row = page.0 as usize * 8;
+        let tile_row = aurora_tile::TILE as usize * 8;
+        let mut survivors = Vec::new();
+        for id in photo.all_tiles() {
+            let rows = (0..aurora_tile::TILE as usize).map(|y| {
+                let start = (id.y as usize * aurora_tile::TILE as usize + y) * row
+                    + id.x as usize * tile_row;
+                start..start + tile_row
+            });
+            let mut same = true;
+            let mut nonzero_old = false;
+            for range in rows {
+                let (Some(a), Some(b)) = (old.get(range.clone()), now.get(range)) else {
+                    unreachable!("inside the page");
+                };
+                nonzero_old |= a.iter().any(|&x| x != 0);
+                same &= a == b;
+            }
+            if same && nonzero_old {
+                survivors.push(id);
+            }
+        }
+        assert!(
+            survivors.is_empty(),
+            "{size:?}: old tiles survived {survivors:?}"
+        );
+        // And the build continues to the new picture.
+        let _ = rig.settle(&context, &mut photo, 0.4, (0.0, 0.0), 400);
+        assert!(rig.settled(&photo), "{size:?}");
+    }
 }
 
 #[test]

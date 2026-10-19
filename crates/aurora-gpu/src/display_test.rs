@@ -8,8 +8,9 @@
 #![allow(clippy::float_cmp)]
 
 use super::{
-    DISCRETE_TEXEL_CAP, PageLayout, axis_segments, display_budget, display_bytes, doc_tiles,
-    lod_for_zoom, mask_outside, mip_rects, page_scissors, page_uniform, plan_pages, texture_bytes,
+    DISCRETE_TEXEL_CAP, PageLayout, axis_segments, display_budget, display_bytes, display_lod,
+    doc_tiles, lod_for_zoom, mask_outside, mip_rects, page_scissors, page_uniform, plan_pages,
+    texture_bytes,
 };
 use aurora_tile::{TILE, TileId};
 
@@ -328,4 +329,36 @@ fn texels_outside_the_document_are_zeroed() {
             assert_eq!(texel.iter().all(|&b| b == 0), !kept, "texel ({x}, {y})");
         }
     }
+}
+
+#[test]
+fn the_display_lod_takes_the_atlas_filter_above_its_floor_and_ramps_below_it() {
+    let floor = 0.9375;
+    // At or above the floor: the true level, the atlas's filter.
+    assert_eq!(display_lod(1.0, floor, 6), (0.0, true));
+    assert_eq!(display_lod(2.0, floor, 6), (0.0, true));
+    let (lod, atlas) = display_lod(0.95, floor, 6);
+    assert!(atlas && lod > 0.07 && lod < 0.08, "{lod}");
+    assert!(display_lod(floor, floor, 6).1);
+    // Below: trilinear, from 0 at the floor to 1 at 50 %, the true level
+    // below that.
+    // Just below the floor the ramp is near 0, which hardware reads as a
+    // magnification, so the atlas's filter keeps drawing until it reaches
+    // `MIN_TRILINEAR_LOD`.
+    let (lod, atlas) = display_lod(floor * 0.9999, floor, 6);
+    assert!(atlas && lod > 0.09, "{lod}");
+    let lf = -floor.log2();
+    let at_min = 2.0_f32.powf(-(lf + super::MIN_TRILINEAR_LOD * (1.0 - lf)));
+    let (lod, atlas) = display_lod(at_min * 0.999, floor, 6);
+    assert!(!atlas && lod >= super::MIN_TRILINEAR_LOD, "{lod}");
+    assert_eq!(display_lod(0.5, floor, 6), (1.0, false));
+    assert_eq!(display_lod(0.25, floor, 6), (2.0, false));
+    assert_eq!(display_lod(1.0 / 32.0, floor, 6), (5.0, false));
+    assert_eq!(display_lod(1.0 / 64.0, floor, 6), (5.0, false));
+    let (mid, _) = display_lod(0.7, floor, 6);
+    assert!((mid - (-(0.7_f32).log2() - lf) / (1.0 - lf)).abs() < 1e-6);
+    // A bad floor reads as 1.0; a floor at or below 50 % has no ramp.
+    assert!(!display_lod(0.75, f32::NAN, 6).1);
+    assert_eq!(display_lod(0.25, 0.4, 6), (2.0, false));
+    assert_eq!(display_lod(0.45, 0.5, 6).0, -(0.45_f32).log2());
 }

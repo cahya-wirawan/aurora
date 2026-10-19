@@ -37731,6 +37731,9 @@ impl App {
     /// view draws, exactly as before), when it cannot be built, or at or
     /// above the 1:1 atlas floor while a visible tile is not uploaded at its
     /// current content yet (the atlas draws that frame).
+    // One linear flow (eligibility, build, the frame's work, the view);
+    // its pieces live in `display_view` already.
+    #[allow(clippy::too_many_lines)]
     fn prepare_display_frame(&mut self, gpu: &GpuContext) -> Option<display_view::DisplayFrame> {
         let canvas_px = canvas_area_physical_size(&self.workspace, self.scale_factor)?;
         let limit = gpu.device().limits().max_texture_dimension_2d;
@@ -37819,18 +37822,23 @@ impl App {
         if one_to_one && !advance.ready {
             return None;
         }
-        display.set_view(
+        let atlas_filter = display.set_view(
             gpu.queue(),
             origin,
             canvas_px,
             zoom,
             document_clip_rect(self.doc.canvas_size, anchor),
             self.doc.channel_view.gain(),
+            zoomed_view::atlas_floor(canvas_px, limit),
         );
         // The zoomed-out view's atlases are not used while the display
         // texture draws.
         self.zoomed_atlases = None;
-        Some(display_view::DisplayFrame { origin, zoom })
+        Some(display_view::DisplayFrame {
+            origin,
+            zoom,
+            atlas_filter,
+        })
     }
 
     fn prepare_zoomed_frame(&mut self, gpu: &GpuContext) -> Option<zoomed_view::ZoomedFrame> {
@@ -38192,7 +38200,7 @@ impl App {
                             (x, y),
                             clip,
                         );
-                        let groups = display.bind_groups(canvas, gpu.device());
+                        let groups = display.bind_groups(canvas, gpu.device(), frame.atlas_filter);
                         let pipeline = canvas.display_pipeline(gpu.device(), surface.format());
                         pass.set_viewport(x, y, w, h, 0.0, 1.0);
                         pass.set_pipeline(pipeline);

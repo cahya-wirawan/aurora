@@ -179,14 +179,16 @@ fn present(c: vec4<f32>, pos: vec2<f32>) -> vec4<f32> {
 
 // Task 142: the display texture (`aurora_gpu::DisplayTexture`), one page
 // of the whole composited document with a full mip chain built on the
-// GPU. The level of detail is a uniform (`canvas.blend.y`,
-// `-log2(physical zoom)` clamped to the chain), not derived from screen
-// derivatives, so a zoom between two powers of two is a trilinear mix of
-// the two levels (no pop when the zoom crosses one) and a power-of-two
-// zoom samples exactly one level. At or above 100 % the level is `0.0`,
-// which is a magnification (`mag_filter`, `Nearest`, as the atlas), so
-// the picture there is the atlas's texel for texel. `textureSampleLevel`
-// needs no uniform control flow. Never samples the partner (binding 3).
+// GPU. The level of detail is a uniform (`canvas.blend.y`, chosen by
+// `aurora_gpu::display_lod`), not derived from screen derivatives. Below
+// the atlas floor it is trilinear (ramped from 0 at the floor, the true
+// `-log2(zoom)` at and below 50 %), so a zoom between two powers of two
+// mixes the two levels (no pop) and a power-of-two zoom samples one level.
+// At or above the floor the bind group carries the atlas's own sampler
+// (level 0 only, bilinear when minified) and at or above 100 % the level is
+// `0.0`, a magnification (`Nearest`, as the atlas), so the picture there is
+// the atlas's texel for texel. `textureSampleLevel` needs no uniform
+// control flow. Never samples the partner (binding 3).
 @fragment
 fn fs_display(in: VsOut) -> @location(0) vec4<f32> {
     if (in.t.x < canvas.doc_clip.x || in.t.y < canvas.doc_clip.y

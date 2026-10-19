@@ -61,6 +61,23 @@ fn fill(store: &mut TileStore, doc_size: (u32, u32), seed: u64) {
     }
 }
 
+/// Smooth content: straight colour ramps across the document, opaque.
+fn fill_smooth(store: &mut TileStore, doc_size: (u32, u32)) {
+    let tiles = crate::doc_tiles(doc_size);
+    for y in 0..tiles.1 {
+        for x in 0..tiles.0 {
+            let Ok(tile) = store.get_mut(surface(), TileId { x, y }) else {
+                unreachable!("a fresh store accepts tiles");
+            };
+            for (i, texel) in tile.texels_mut().chunks_exact_mut(CHANNELS).enumerate() {
+                let px = (x * TILE + i as u32 % TILE) as f32 / doc_size.0 as f32;
+                let py = (y * TILE + i as u32 / TILE) as f32 / doc_size.1 as f32;
+                texel.copy_from_slice(&[px, py, 1.0 - px, 1.0].map(f16::from_f32));
+            }
+        }
+    }
+}
+
 fn display_from(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -255,9 +272,26 @@ fn render_display(
     zoom: f32,
     clip: (f32, f32, f32, f32),
 ) -> Vec<u8> {
-    display.set_view(queue, origin, viewport, zoom, Some(clip), [1.0; 3]);
+    render_display_with_floor(
+        device, queue, canvas, display, viewport, origin, zoom, clip, 1.0,
+    )
+}
+
+/// [`render_display`] for a canvas whose atlas floor is `floor`.
+fn render_display_with_floor(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    canvas: &mut CanvasPipeline,
+    display: &DisplayTexture,
+    viewport: (u32, u32),
+    origin: (f32, f32),
+    zoom: f32,
+    clip: (f32, f32, f32, f32),
+    floor: f32,
+) -> Vec<u8> {
+    let atlas_filter = display.set_view(queue, origin, viewport, zoom, Some(clip), [1.0; 3], floor);
     let groups: Vec<wgpu::BindGroup> = (0..display.pages().len())
-        .filter_map(|page| canvas.display_bind_group(device, display, page))
+        .filter_map(|page| canvas.display_bind_group(device, display, page, atlas_filter))
         .collect();
     let scissors = display.page_scissors(origin, viewport, zoom);
     let pipeline = canvas.display_pipeline(device, FORMAT).clone();
@@ -863,4 +897,134 @@ fn an_upload_outside_the_document_or_of_the_wrong_size_is_refused() {
     assert_eq!(display.uploads(), 0);
     assert!(DisplayTexture::new(device, (0, 10), LEVELS).is_err());
     assert!(DisplayTexture::with_max_dimension(device, (2000, 10), LEVELS, 2 * TILE).is_err());
+}
+
+/// Between the atlas floor and 100 % the display samples with the atlas's
+/// own filter (level 0, bilinear), so a frame that falls back to the atlas
+/// there does not switch filters: the two pictures differ by at most one
+/// 8-bit step (bilinear weights quantised from two parameterisations of the
+/// same position), and just below the floor the trilinear picture starts
+/// from the same level-0 picture (its level ramps from 0 at the floor).
+#[test]
+#[allow(clippy::too_many_lines)]
+fn between_the_atlas_floor_and_100_percent_the_display_uses_the_atlas_filter() {
+    let Some(context) = real_context() else {
+        return;
+    };
+    let (device, queue) = (context.device(), context.queue());
+    let doc_size = (1700, 1150);
+    let (_dir, mut store) = real_tile_store(64);
+    fill(&mut store, doc_size, 0xF17E);
+    let display = display_from(device, queue, &mut store, doc_size, u32::MAX);
+    let mut canvas = CanvasPipeline::new(device);
+    let viewport = (300, 200);
+    let floor = TileResidency::min_zoom_for_viewport(viewport);
+    assert!(floor < 0.9, "{floor}");
+    let clip = clip_for(doc_size);
+    let total = (viewport.0 * viewport.1) as usize;
+    for &(origin, zoom) in &[
+        ((100.0, 50.0), 0.97_f32),
+        ((300.0, 260.0), 0.8),
+        ((10.0, 7.0), floor),
+        ((10.0, 7.0), f32::midpoint(floor, 1.0)),
+    ] {
+        let atlas = render_atlas(
+            device,
+            queue,
+            &mut canvas,
+            &mut store,
+            viewport,
+            origin,
+            zoom,
+            clip,
+        );
+        let shown = render_display_with_floor(
+            device,
+            queue,
+            &mut canvas,
+            &display,
+            viewport,
+            origin,
+            zoom,
+            clip,
+            floor,
+        );
+        let worst = atlas
+            .iter()
+            .zip(&shown)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        let differ = differing_pixels(&atlas, &shown);
+        // The trilinear sampler at the same position (what the display drew
+        // there before this rule) for scale: the filter, not the weights.
+        let trilinear = render_display_with_floor(
+            device,
+            queue,
+            &mut canvas,
+            &display,
+            viewport,
+            origin,
+            zoom,
+            clip,
+            0.0,
+        );
+        let tri_differ = differing_pixels(&atlas, &trilinear);
+        println!(
+            "{origin:?} x{zoom}: {differ} of {total} differ, worst {worst} (trilinear: \
+             {tri_differ} differ)"
+        );
+        // Noise content: neighbouring texels differ by up to the whole
+        // range, so the hardware's 8-bit bilinear weights, quantised from two
+        // parameterisations of one position, move a pixel by up to 2 steps.
+        assert!(worst <= 2, "{origin:?} x{zoom}: worst {worst}");
+        if zoom < 1.0 && zoom > floor {
+            assert!(
+                differ * 4 < tri_differ,
+                "{origin:?} x{zoom}: the atlas filter ({differ}) must be far closer than \
+                 trilinear ({tri_differ})"
+            );
+        }
+    }
+    // Where the ramp starts drawing trilinearly (`MIN_TRILINEAR_LOD`) the
+    // picture steps by about 3 % of level 1: on smooth content (a 0.2 %
+    // zoom step moves noise by a whole texel) that is under 2 steps.
+    let (_dir2, mut smooth_store) = real_tile_store(64);
+    fill_smooth(&mut smooth_store, doc_size);
+    let smooth = display_from(device, queue, &mut smooth_store, doc_size, u32::MAX);
+    let lf = -floor.log2();
+    let at_min = 2.0_f32.powf(-(lf + crate::MIN_TRILINEAR_LOD * (1.0 - lf)));
+    let origin = (10.0, 7.0);
+    let above = render_display_with_floor(
+        device,
+        queue,
+        &mut canvas,
+        &smooth,
+        viewport,
+        origin,
+        at_min * 1.001,
+        clip,
+        floor,
+    );
+    let below = render_display_with_floor(
+        device,
+        queue,
+        &mut canvas,
+        &smooth,
+        viewport,
+        origin,
+        at_min * 0.999,
+        clip,
+        floor,
+    );
+    let worst = above
+        .iter()
+        .zip(&below)
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        worst <= 2,
+        "the step into trilinear changes the picture by {worst}"
+    );
 }
