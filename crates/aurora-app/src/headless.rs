@@ -88,6 +88,10 @@ pub struct Report {
     pub psd_encode_ms: Option<f64>,
     pub psd_stage_ms: Option<f64>,
     pub open_notes: usize,
+    /// The source profile the open converted the pixels from to sRGB
+    /// (`ColourImport::source`); `None` when nothing was converted (sRGB,
+    /// untagged, a grey profile, which is not applied, or a `.aur`).
+    pub colour_converted_from: Option<String>,
     pub reference_written: bool,
     /// A second reference, the merged image in the file's own profile
     /// (`<reference>.stored.png`), written when that profile is not sRGB.
@@ -162,6 +166,9 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
     let input = input.ok_or_else(|| USAGE.to_owned())?;
     let output = output.ok_or_else(|| format!("--out is required\n{USAGE}"))?;
     if gpu {
+        if mode == CompositeMode::Pool {
+            return Err(format!("--gpu and --composite pool are exclusive\n{USAGE}"));
+        }
         mode = CompositeMode::Gpu;
     }
     let is_png = output
@@ -230,6 +237,38 @@ struct Opened {
     size: (u32, u32),
 }
 
+/// Decodes `options.input` by the app's own routes.
+fn decode_input(
+    options: &Options,
+    staging: &aurora_tile::StagingRoot,
+    report: &mut Report,
+) -> Result<DecodedFile, Failure> {
+    let path = options.input.as_path();
+    // The same routes `decode_chosen_file_with` takes; a PSD gets the
+    // requested encode-pool size instead of `composite_threads()`.
+    match crate::open_route(path) {
+        crate::OpenRoute::Psd => {
+            "psd".clone_into(&mut report.format);
+            PreparedPsd::stream_with_options(
+                path,
+                Some(staging),
+                options.threads,
+                crate::small_machine::overlap_allowed(),
+            )
+            .map(DecodedFile::Psd)
+        }
+        crate::OpenRoute::Aur => {
+            "aur".clone_into(&mut report.format);
+            crate::decode_chosen_file_with(path, Some(staging))
+        }
+        crate::OpenRoute::Image => {
+            "image".clone_into(&mut report.format);
+            crate::decode_chosen_file_with(path, Some(staging))
+        }
+    }
+    .map_err(|e| fail("open", format!("{e:?}")))
+}
+
 fn open_document(
     options: &Options,
     store: &mut aurora_tile::TileStore,
@@ -238,29 +277,7 @@ fn open_document(
     let path = options.input.as_path();
     let staging = store.staging_root();
     let started = Instant::now();
-    // The same routes `decode_chosen_file_with` takes; a PSD gets the
-    // requested encode-pool size instead of `composite_threads()`.
-    let decoded = match crate::open_route(path) {
-        crate::OpenRoute::Psd => {
-            "psd".clone_into(&mut report.format);
-            PreparedPsd::stream_with_options(
-                path,
-                Some(&staging),
-                options.threads,
-                crate::small_machine::overlap_allowed(),
-            )
-            .map(DecodedFile::Psd)
-        }
-        crate::OpenRoute::Aur => {
-            "aur".clone_into(&mut report.format);
-            crate::decode_chosen_file_with(path, Some(&staging))
-        }
-        crate::OpenRoute::Image => {
-            "image".clone_into(&mut report.format);
-            crate::decode_chosen_file_with(path, Some(&staging))
-        }
-    }
-    .map_err(|e| fail("open", format!("{e:?}")))?;
+    let decoded = decode_input(options, &staging, report)?;
     report.decode = started.elapsed();
     let started = Instant::now();
     let opened = match decoded {
@@ -273,12 +290,14 @@ fn open_document(
                 masks,
                 report: psd_report,
                 timings,
+                colour,
                 ..
             } = psd;
             report.layer_tiles = Some(timings.tiles);
             report.psd_encode_ms = Some(ms(timings.encode));
             report.psd_stage_ms = Some(ms(timings.stage));
             report.open_notes = psd_report.items.len();
+            report.colour_converted_from = colour.source.map(|s| s.description);
             drop(history);
             let (_freed, failed) = crate::replace_document_pixels_prepared(
                 store,
@@ -306,6 +325,8 @@ fn open_document(
                 .unwrap_or("Image");
             let size = image.size;
             report.open_notes = image.colour.report.warnings.len();
+            report.colour_converted_from =
+                image.colour.source.as_ref().map(|s| s.description.clone());
             let (layers, _history, layer_id) = crate::document_from_size(name, size);
             let (_freed, failed) = crate::replace_document_pixels_prepared(
                 store,
@@ -721,6 +742,11 @@ pub fn to_json(options: &Options, result: &Result<Report, Failure>) -> String {
             o.push_str(",\"gpu_adapter\":");
             match &r.gpu_adapter {
                 Some(a) => json_string(&mut o, a),
+                None => o.push_str("null"),
+            }
+            o.push_str(",\"colour_converted_from\":");
+            match &r.colour_converted_from {
+                Some(d) => json_string(&mut o, d),
                 None => o.push_str("null"),
             }
         }

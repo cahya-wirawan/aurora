@@ -338,8 +338,50 @@ def against_reference(img, refs):
     return c
 
 
-def verify(args, warm, au16, ref):
-    """warm: {tool: its warm-up PNG}; au16: Aurora's 16-bit PNG (or None)."""
+def aurora_conversion(res):
+    """What Aurora's open converted: (known, source description or None).
+
+    From the run's own `colour_converted_from`; for results written before
+    that field existed, a PSD's stored-profile reference (written only when
+    the open converted) stands in, and anything else is unknown."""
+    rows = [r for r in res.get("verify_runs", []) + res.get("warmup", []) if r.get("aurora", {}).get("ok")]
+    for r in rows:
+        if "colour_converted_from" in r["aurora"]:
+            return True, r["aurora"]["colour_converted_from"]
+    for r in rows:
+        if r["aurora"].get("reference_written"):
+            return True, ("(the file's profile)" if r["aurora"].get("reference_stored_written") else None)
+    return False, None
+
+
+def apply_colour_policy(v, conversion):
+    """Colour notes, and whether the A-vs-P pair is comparable.
+
+    PhotoCraft keeps a file's profile and embeds it. When Aurora converted
+    the file to sRGB the two outputs are in different spaces (not compared);
+    when Aurora did not convert (a grey profile, which it does not apply, or
+    a profile it ignored) both hold the file's own values and are compared."""
+    known, converted = conversion
+    v["notes"] = [n for n in v.get("notes", []) if not n.startswith("colour:")]
+    pc_head = v["headers"].get("photocraft") or {}
+    if pc_head.get("colour") != "embedded":
+        return
+    pair = v.get("pair") or {}
+    if known and not converted:
+        pair.pop("colour_spaces_differ", None)
+        v["notes"].append("colour: PhotoCraft tags '%s'; Aurora did not convert (profile not applied), "
+                          "so both hold the same unconverted values" % pc_head.get("icc"))
+    elif known:
+        v["notes"].append("colour: Aurora converted %s to sRGB in its timed open; PhotoCraft kept '%s'"
+                          % (converted if converted.startswith("(") else "'%s'" % converted, pc_head.get("icc")))
+    else:
+        v["notes"].append("colour: PhotoCraft tags '%s'; whether Aurora converted is not recorded"
+                          % pc_head.get("icc"))
+
+
+def verify(args, warm, au16, ref, conversion=(False, None)):
+    """warm: {tool: its warm-up PNG}; au16: Aurora's 16-bit PNG (or None);
+    conversion: `aurora_conversion` of this file."""
     v = {"headers": {t: png_header(p) for t, p in warm.items()}, "notes": []}
     images = {}
 
@@ -374,11 +416,7 @@ def verify(args, warm, au16, ref):
     if au and "photocraft" in images:
         v["pair"] = compare_images(au, images["photocraft"])
         v["pair"]["aurora_side"] = "16-bit" if "aurora16" in images else "8-bit dithered"
-    pc_head = v["headers"].get("photocraft") or {}
-    au_head = v["headers"].get("aurora-export") or {}
-    if pc_head.get("colour") == "embedded" and au_head.get("colour") == "srgb":
-        v["notes"].append("colour: Aurora converted to sRGB at open (in its timed open); PhotoCraft kept '%s'"
-                          % pc_head.get("icc"))
+    apply_colour_policy(v, conversion)
     if ref and os.path.exists(ref):
         refs = {}
         try:
@@ -439,7 +477,7 @@ def run_file(args, src, mode, tools, outdir, state):
                 os.remove(out)
     res["reference"] = bool(ref and os.path.exists(ref))
     if mode == "idle" and warm:
-        res["verify"] = verify(args, warm, au16, ref)
+        res["verify"] = verify(args, warm, au16, ref, aurora_conversion(res))
     # Every timed run (and this mode's warm-up) against the idle warm-up output.
     for tool in tools:
         idle = state["idle_hash"].get((src, tool))
@@ -568,6 +606,51 @@ def bucket(s):
     return "<1" if s < 1 else "<3" if s < 3 else "<10" if s < 10 else ">=10"
 
 
+def derived_counts(results):
+    """The aggregate counts quoted in FINDINGS.md, computed here so they are reproducible."""
+    idle = [r for r in results if r["mode"] == "idle" and r.get("verify")]
+    pairs = [r["verify"]["pair"] for r in idle if r["verify"].get("pair")]
+    if not pairs:
+        return []
+    dims = sum(1 for c in pairs if "dimensions_differ" in c)
+    differ = [c for c in pairs if c.get("colour_spaces_differ")]
+    same = [c for c in pairs if "mean" in c and not c.get("colour_spaces_differ")]
+    notes = [n for r in idle for n in r["verify"].get("notes", [])]
+    unconverted = sum(1 for n in notes if "did not convert" in n)
+    unknown = sum(1 for n in notes if "not recorded" in n)
+    L = ["### Derived counts (idle)", "",
+         "- files with both tools' output: %d; dimensions agree on %d, differ on %d"
+         % (len(pairs), len(pairs) - dims, dims),
+         "- pairs in different colour spaces (Aurora converted, PhotoCraft kept the profile), not compared: %d"
+         % len(differ),
+         "- pairs where PhotoCraft tags a profile Aurora did not apply (same values, compared): %d" % unconverted]
+    if unknown:
+        L.append("- pairs where PhotoCraft tags a profile and Aurora's conversion is not recorded: %d" % unknown)
+    L.append("- compared pairs with more than 1 %% of pixels more than 2 levels apart: %d of %d"
+             % (sum(1 for c in same if c["share_over_2"] > 0.01), len(same)))
+    a, p = {}, {}
+    for r in idle:
+        ref = r["verify"].get("reference") or {}
+        if "score" in (ref.get("aurora 16-bit") or {}):
+            a[r["file"]] = ref["aurora 16-bit"]
+        if "score" in (ref.get("photocraft") or {}):
+            p[r["file"]] = ref["photocraft"]
+    both = sorted(set(a) & set(p))
+    if both:
+        L.append("- vs Photoshop, both scored on %d files: PhotoCraft closer by more than 0.5 level on %d, "
+                 "Aurora (16-bit) on %d, within 0.5 on %d"
+                 % (len(both), sum(1 for f in both if p[f]["score"] < a[f]["score"] - 0.5),
+                    sum(1 for f in both if a[f]["score"] < p[f]["score"] - 0.5),
+                    sum(1 for f in both if abs(a[f]["score"] - p[f]["score"]) <= 0.5)))
+        for name, m in (("Aurora 16-bit", a), ("PhotoCraft", p)):
+            L.append("- %s: score 0.0000 at 4 decimals (mean error under 0.00005 level) on %d files; "
+                     "pixel-identical to the reference (max 0) on %d"
+                     % (name, sum(1 for f in both if m[f]["score"] == 0),
+                        sum(1 for f in both if max(m[f]["max"][:3]) == 0)))
+    L.append("")
+    return L
+
+
 def write_reports(args, meta, results):
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "results.json"), "w") as f:
@@ -693,6 +776,7 @@ def write_reports(args, meta, results):
                 L.append("| %s | %d | %.3f | %d | %d | %d | %d |" % (k, len(vals), statistics.median(vals),
                                                                 b["<1"], b["<3"], b["<10"], b[">=10"]))
         L.append("")
+    L += derived_counts(results)
     L += ["## Failures (every non-ok run, warm-up and verification runs included)", ""]
     any_fail = False
     for res in results:
@@ -748,6 +832,9 @@ def main():
         for k in ("threads", "runs", "timeout", "load"):
             if k in old:
                 setattr(args, k, old[k])
+        for res in data["results"]:
+            if res.get("verify"):
+                apply_colour_policy(res["verify"], aurora_conversion(res))
         write_reports(args, data["meta"], data["results"])
         print(os.path.join(args.out, "summary.md"))
         return

@@ -85,6 +85,18 @@ fn parse_args_reads_every_flag_and_refuses_the_rest() {
         parse_args(&args(&["in.psd", "--out", "o.png", "--gpu"])).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(gpu.mode, CompositeMode::Gpu);
     assert!(parse_args(&args(&["in.psd"])).is_err(), "--out is required");
+    assert!(
+        parse_args(&args(&[
+            "in.psd",
+            "--out",
+            "o.png",
+            "--gpu",
+            "--composite",
+            "pool"
+        ]))
+        .is_err(),
+        "--gpu overriding --composite pool would be silent"
+    );
     assert!(parse_args(&args(&["in.psd", "--out", "o.tif", "--depth", "16"])).is_err());
     assert!(parse_args(&args(&["in.psd", "--out", "o.png", "--threads", "0"])).is_err());
     assert!(parse_args(&args(&["in.psd", "--out", "o.png", "--fromat", "png"])).is_err());
@@ -120,6 +132,9 @@ fn a_png_round_trips_through_the_export_composite_and_the_scratch_is_removed() {
     assert!(json.contains("\"composite_mode\":\"export\""), "{json}");
     assert!(json.contains("\"threads\":2"), "{json}");
     assert!(json.contains("\"ms\":{\"decode\":"), "{json}");
+    // An sRGB-tagged PNG is not converted at open.
+    assert!(report.colour_converted_from.is_none());
+    assert!(json.contains("\"colour_converted_from\":null"), "{json}");
     assert!(json.ends_with('}'));
 }
 
