@@ -17,10 +17,14 @@ Each run is one process doing **open a file, flatten it, write a PNG**:
 
 | tool | invocation |
 |---|---|
-| `aurora-export` | `aurora-headless IN --out OUT.png --threads T`: the app's own open routes, then its Save As PNG export composite (`composite_document`, one thread), `encode_by_extension` and the verified write |
+| `aurora-export` | `RAYON_NUM_THREADS=T aurora-headless IN --out OUT.png --threads T`: the app's own open routes, then its Save As PNG export composite (`composite_document`, one thread), `encode_by_extension` and the verified write |
 | `aurora-pool` | the same, plus `--composite pool`: the same per-tile fold the background compositor runs, on a rayon pool of `T` threads (bit-identical to `aurora-export`, tested) |
 | `aurora-gpu` | optional (`--tools`), `--gpu`: the canvas's GPU tile path, folding on the CPU where that path refuses |
 | `photocraft` | `RAYON_NUM_THREADS=T photocraft-cli convert IN OUT.png`: its `files::open` then `files::save`, which flattens with `photocraft_compose::flatten_to_surface` (its CPU compositor) |
+
+`--threads T` sizes Aurora's PSD encode pool and its pool composite;
+`RAYON_NUM_THREADS=T` is set for both tools, so any other rayon use is also
+held to `T`. The app's export composite itself is single-threaded.
 
 Both tools are timed from outside with the same tool: `/usr/bin/time -v` on
 Linux, `/usr/bin/time -l` on macOS (peak RSS), plus this script's own wall
@@ -95,65 +99,91 @@ Requirements:
 
 ## Verification: speed is never reported for an unchecked picture
 
-For each file in the idle mode, every tool's first output is decoded by
-`pngread.py`, an independent stdlib PNG decoder (8/16-bit; 16-bit is
-rounded to 8). Then:
+The idle mode checks every file's pictures with `pngread.py`, an independent
+stdlib PNG decoder (8/16-bit; 16-bit samples are rounded to 8 bits, the same
+rounding the 16-bit reference gets).
 
-* **tool vs tool**: dimensions, plus the mean and max absolute difference per
-  channel in 8-bit levels. Colour is compared premultiplied, so the colour of
-  a transparent pixel does not count. We also give the share of pixels with
-  any channel more than 2 levels apart;
-* **tool vs Photoshop**: for a PSD whose merged image holds real data (the
-  audit's `audit_has_real_merged_data` check), Aurora writes the merged image
-  (`--reference-out`, which is `decode_psd_merged_image_in_working_space`,
-  the audit's reference) during its warm-up run. Each tool's output is put
-  over white and compared like the audit, with score = mean of the R, G, B
-  means.
-* **colour spaces**: Aurora converts a tagged file to its sRGB working space
-  and writes sRGB. PhotoCraft (as measured at 4d4de45) keeps the source
-  profile and embeds it in its PNG (`iCCP`, e.g. "Adobe RGB (1998)" for
-  Nyepi, "Generic RGB Profile" for `images/curve-02.jpg`). `pngread.py` reads
-  each output's ICC description. A tool that wrote sRGB, or no profile, is
-  compared with the working-space merged image. A tool that kept another
-  profile is compared with the merged image as stored, which Aurora writes
-  as `<ref>.stored.png` when the open converts colours. A tool-vs-tool row
-  whose outputs are in different colour spaces is marked "not comparable".
-  No colour conversion is done in Python.
+* **Aurora is checked from a 16-bit output.** Its timed runs write the 8-bit,
+  *dithered* PNG its Save As writes. That is the right thing to time, but
+  dithering adds about half a level of noise to every pixel, which would
+  count against Aurora in a comparison with an undithered picture. So one
+  extra, untimed verification run per file writes the same pipeline's output
+  as a 16-bit PNG (`--depth 16`). That run also writes the reference. The
+  **dither floor** (the timed 8-bit output against the 16-bit one) is
+  reported next to it. The 8-bit output's own score is in the table too.
+* **PhotoCraft is checked from its timed output** (its warm-up run).
+* **Tool vs tool:** dimensions, plus the mean and max absolute difference per
+  channel in 8-bit levels, with colour premultiplied, plus the share of
+  pixels with any channel more than 2 levels apart.
+* **Tool vs Photoshop:**
+  * The reference is the PSD's own merged image, for files whose merged
+    image holds real data (the audit's `audit_has_real_merged_data` check).
+  * It is decoded by Aurora (`--reference-out`, which is
+    `decode_psd_merged_image_in_working_space`, the audit's reference).
+  * Each output is compared over white, like the audit. Score = the mean of
+    the R, G, B mean errors.
+  * The reference exists only for files Aurora opens, so files Aurora
+    refuses (CMYK, Lab, 32-bit, ...) have no fidelity score for either tool.
+* **Colour spaces:**
+  * Aurora converts a tagged file to its sRGB working space and writes sRGB.
+  * PhotoCraft (as measured at 4d4de45) keeps the source profile and embeds
+    it (`iCCP`): "Adobe RGB (1998)" for Nyepi, "Generic RGB Profile" for
+    `images/curve-02.jpg`.
+  * `pngread.py` reads each output's ICC *description*, not the profile. An
+    output with no profile, or with a description containing "sRGB", is
+    treated as sRGB and scored against the working-space reference. An
+    untagged output that is not really sRGB would therefore be mis-scored.
+  * Other profiles are scored against the merged image as stored, which
+    Aurora writes as `<ref>.stored.png` when its open converts colours.
+  * Tool-vs-tool rows across colour spaces are marked "not comparable".
+  * No colour conversion is done in Python.
+* **Hashes:** every timed run's output, idle and loaded, is compared by
+  SHA-256 with the same tool's idle warm-up output, which is the picture
+  that was checked (for Aurora, via the dither floor). The timing tables'
+  "pixel check" column shows the score, the agreement and this hash check
+  for every row.
 
 Above `--verify-max-pixels` (6 M) pixels, every k-th pixel is compared.
-The decode itself is always whole. Later runs are checked by SHA-256, and
-the failures list says when a tool's output changes between runs.
+The decode itself is always whole.
 
 ## Fairness notes
 
-* **Same machine, both release builds.** Aurora is built with the workspace's
-  release profile (`panic = "abort"`, with debuginfo). PhotoCraft is built
-  with its own release profile. Same threads for both (`--threads`).
+`summary.md` repeats these at its top.
+
+* **Same machine, release builds.** Aurora is built with the workspace's
+  release profile (thin LTO, `panic = "abort"`, debuginfo). PhotoCraft is
+  built from source at the pinned commit with its own release profile. It
+  is not a release binary of theirs.
 * **Different feature coverage.** PhotoCraft's and Aurora's PSD support
-  differ: effects, adjustments, smart objects, fill layers, text, and how
-  each converts colour profiles. A file one tool renders more completely can
-  cost that tool more time. Read every time next to the pixel checks and
-  the reference score. Do not read the time alone.
-* **Different work per run.** Aurora's export writes through its verified
-  safe-save path: a temp file, `fsync`, a re-decode, a rename and a directory
-  `fsync`. PhotoCraft writes its file directly. Aurora always writes an 8-bit
-  dithered PNG. PhotoCraft's PNG keeps 8 or 16 bits by its own rules (its
-  README: "PNG keeps 8/16-bit samples"). `results.json` records each
-  output's bit depth (`verify.tools`). Aurora's
-  `aurora-export` composites on one thread because that is what the app's
-  export does today. `aurora-pool` shows the same fold on `T` threads.
-  Aurora's phase times show where its time goes.
+  differ: effects, adjustments, smart objects, fill layers, text, colour
+  modes and depths. A file one tool renders more completely can cost that
+  tool more time. Read every time next to the pixel check.
+* **Different work per run.**
+  * Aurora's export writes through its verified safe-save path: a temp
+    file, `fsync`, a re-decode, a rename and a directory `fsync`. PhotoCraft
+    writes its file directly.
+  * Aurora writes an 8-bit dithered PNG. On large documents that encode is
+    most of Aurora's time; see the phase table.
+  * PhotoCraft's encoder and bit depth are its own. The pixel table lists
+    each output's bit depth and size.
+  * Aurora converts colours at open; PhotoCraft does not. Files where this
+    happens carry a note.
+  * `aurora-export` composites on one thread because the app's export does.
 * **Peak RSS includes each tool's own caches.** For Aurora, that is the tile
   store's resident budget (a quarter of RAM, at most 8 GiB) and the effects
-  coverage cache. It is not a measure of the smallest memory either tool
-  could use.
+  coverage cache. `aurora-pool` also holds every composited tile until it
+  assembles the image (a buffer of the headless command, not of the app).
 * **Cold vs warm.** One warm-up run per tool and file comes first and is
-  reported separately in `results.json`/`runs.csv`. After it, the file is in
-  the OS page cache for every measured run. Aurora's warm-up also writes the
-  reference image, which makes it longer. The rounds rotate the tool order,
-  so neither tool always runs first.
-* **Load.** The loaded mode runs `--load` busy `yes` processes. That is
-  ordinary contention, not an adversarial setup. Both tools see the same load.
+  reported separately in `results.json`/`runs.csv`. The measured runs then
+  read from the OS page cache. The 16-bit verification run is untimed and
+  separate. The rounds rotate the tool order.
+* **Load.** The loaded mode runs `--load` busy `yes` processes. Each sits in
+  its own process group with a shell watchdog, so they die within a second
+  even if `compare.py` itself is killed with SIGKILL.
+* **One harness at a time.** `compare.py` takes a lock in the work
+  directory. Two concurrent runs would share outputs and load each other.
+  (Before the lock existed, an accidental second run deleted the other's
+  60 MP output once.)
 * **Never a single sample.** The tables give min-max over the measured runs.
   Treat a ratio of two single runs as noise.
 

@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """Run Aurora and PhotoCraft over the same files and compare (python3 stdlib only).
 
-Every run is "open the file, flatten it, write a PNG", timed from outside with
-the same ``/usr/bin/time`` measure for both tools (``-v`` on Linux, ``-l`` on
-macOS), plus each tool's own wall clock from this script. Runs are interleaved
-(the tool order rotates each round), one warm-up run per tool and file is
-reported separately, and nothing is dropped: a crash, a timeout or a refused
-file is a row with its reason.
+Every timed run is "open the file, flatten it, write a PNG", timed from outside
+with the same ``/usr/bin/time`` measure for both tools (``-v`` on Linux, ``-l``
+on macOS), plus this script's own wall clock. Runs are interleaved (the tool
+order rotates each round), one warm-up run per tool and file is reported
+separately, and nothing is dropped: a crash, a timeout or a refused file is a
+row with its reason.
 
-Outputs are verified: each tool's first measured PNG is decoded by
-``pngread.py`` (an independent decoder) and compared with the other tool's and,
-for a PSD with a real merged image, with Photoshop's merged image (written by
-Aurora's ``--reference-out``, i.e. the psd_fidelity_audit's reference, compared
-over white like the audit). Later runs' outputs are checked by SHA-256 only.
+Pictures are checked (idle mode) by ``pngread.py``, an independent decoder:
+
+* PhotoCraft's warm-up PNG, and Aurora's 16-bit PNG from one extra, untimed
+  verification run (``--depth 16``; the timed runs write the 8-bit dithered
+  PNG Aurora's Save As writes) are compared with each other and, for a PSD with
+  a real merged image, with Photoshop's merged image (Aurora's
+  ``--reference-out``, the psd_fidelity_audit's reference), over white;
+* Aurora's own dither floor (its timed 8-bit output against its 16-bit output)
+  is reported next to it;
+* every timed run's output (idle and loaded) is checked by SHA-256 against the
+  idle warm-up output of the same tool.
 
 See README.md for the commands and the fairness notes.
 """
@@ -21,6 +27,7 @@ import argparse
 import atexit
 import csv
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -29,17 +36,17 @@ import re
 import shutil
 import signal
 import statistics
+import struct
 import subprocess
 import sys
 import time
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import pngread  # noqa: E402
 
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
-FIXTURES = os.path.join(REPO, "corpora", "psd", "reference", "psd-tools-fixtures")
-IMAGES = os.path.join(REPO, "images")
 
 # The representative subset (relative to the repo root); missing files are
 # reported, not skipped silently.
@@ -60,14 +67,17 @@ REPRESENTATIVE = [
     "images/flat-design-nyepi-template/6739968.psd",
 ]
 
-LOAD_PROCS = []
+LOAD_GROUPS = []
 
 
 def kill_load():
-    while LOAD_PROCS:
-        p = LOAD_PROCS.pop()
+    while LOAD_GROUPS:
+        p = LOAD_GROUPS.pop()
         try:
-            p.kill()
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
             p.wait(timeout=5)
         except Exception:
             pass
@@ -86,12 +96,16 @@ if hasattr(signal, "SIGHUP"):
 
 
 def start_load(k):
+    """K busy `yes` processes, each in its own process group with a watchdog
+    that kills it within a second if this script dies (even by SIGKILL)."""
+    me = os.getpid()
+    script = ("yes >/dev/null & y=$!; "
+              "while kill -0 %d 2>/dev/null && kill -0 $y 2>/dev/null; do sleep 1; done; "
+              "kill $y 2>/dev/null" % me)
     for _ in range(k):
-        LOAD_PROCS.append(subprocess.Popen(["yes"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        LOAD_GROUPS.append(subprocess.Popen(["sh", "-c", script], stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL, start_new_session=True))
     time.sleep(1.0)
-
-
-# ---------------------------------------------------------------- machine
 
 
 def sh(cmd):
@@ -155,7 +169,12 @@ def parse_time(stderr):
     return rss, elapsed
 
 
-def tool_command(tool, args, src, out, ref):
+def tool_command(tool, args, src, out, ref=None, depth16=False):
+    env = {}
+    if args.threads:
+        # Both tools get the same rayon size; Aurora's --threads also sizes
+        # its PSD encode pool and its pool composite.
+        env["RAYON_NUM_THREADS"] = str(args.threads)
     if tool.startswith("aurora"):
         cmd = [args.aurora, src, "--out", out, "--scratch", args.scratch]
         if tool == "aurora-pool":
@@ -164,17 +183,16 @@ def tool_command(tool, args, src, out, ref):
             cmd += ["--gpu"]
         if args.threads:
             cmd += ["--threads", str(args.threads)]
+        if depth16:
+            cmd += ["--depth", "16"]
         if ref:
             cmd += ["--reference-out", ref]
-        return cmd, {}
-    env = {}
-    if args.threads:
-        env["RAYON_NUM_THREADS"] = str(args.threads)
+        return cmd, env
     return [args.photocraft, "convert", src, out], env
 
 
-def run_one(tool, args, src, out, ref=None):
-    cmd, extra_env = tool_command(tool, args, src, out, ref)
+def run_one(tool, args, src, out, ref=None, depth16=False):
+    cmd, extra_env = tool_command(tool, args, src, out, ref, depth16)
     env = dict(os.environ)
     env.update(extra_env)
     if os.path.exists(out):
@@ -218,43 +236,58 @@ def run_one(tool, args, src, out, ref=None):
         row.update(status="failed", error="exit 0 but no output file")
     else:
         row["status"] = "ok"
+        row["output_bytes"] = os.path.getsize(out)
         with open(out, "rb") as f:
             row["sha256"] = hashlib.sha256(f.read()).hexdigest()
     return row
 
 
-# ---------------------------------------------------------------- verification
-
-
 def has_real_merged_data(path):
-    """psd_audit_tests.rs `audit_has_real_merged_data`: resource 1057's byte."""
+    """psd_audit_tests.rs `audit_has_real_merged_data`: resource 1057's byte.
+
+    Reads the header and the whole image resource section (no size cap)."""
     try:
         with open(path, "rb") as f:
-            head = f.read(1 << 20)
-        be32 = lambda at: int.from_bytes(head[at:at + 4], "big") if at + 4 <= len(head) else None  # noqa: E731
-        mode_len = be32(26)
-        if mode_len is None:
-            return True
-        res_at = 30 + mode_len
-        res_len = be32(res_at)
-        if res_len is None:
-            return True
-        at = res_at + 4
-        end = min(at + res_len, len(head))
-        while at + 8 <= end and head[at:at + 4] == b"8BIM":
-            rid = int.from_bytes(head[at + 4:at + 6], "big")
-            name_len = head[at + 6]
+            head = f.read(30)
+            if len(head) < 30:
+                return True
+            mode_len = int.from_bytes(head[26:30], "big")
+            f.seek(26 + 4 + mode_len)
+            res_len = int.from_bytes(f.read(4), "big")
+            res = f.read(res_len)
+        at = 0
+        while at + 8 <= len(res) and res[at:at + 4] == b"8BIM":
+            rid = int.from_bytes(res[at + 4:at + 6], "big")
+            name_len = res[at + 6]
             data_at = at + 6 + ((1 + name_len + 1) & ~1)
-            length = be32(data_at)
-            if length is None:
+            if data_at + 4 > len(res):
                 break
+            length = int.from_bytes(res[data_at:data_at + 4], "big")
             body = data_at + 4
             if rid == 1057:
-                return body + 4 >= len(head) or head[body + 4] != 0
+                return body + 4 >= len(res) or res[body + 4] != 0
             at = body + length + (length & 1)
         return True
     except OSError:
         return True
+
+
+def png_header(path):
+    """Dimensions, bit depth, colour type and colour space of a PNG, without decoding it."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(1 << 20)
+        w, h, depth, colour = struct.unpack(">IIBB", data[16:26])
+        space, desc = "srgb", None
+        i = data.find(b"iCCP")
+        if i > 0 and data.find(b"sRGB", 0, i) < 0:
+            (n,) = struct.unpack(">I", data[i - 4:i])
+            desc = pngread.icc_description(data[i + 4:i + 4 + n])
+            if "srgb" not in desc.lower():
+                space = "embedded"
+        return {"width": w, "height": h, "bit_depth": depth, "colour_type": colour, "colour": space, "icc": desc}
+    except (OSError, struct.error, zlib.error):
+        return None
 
 
 def over_white(rgba):
@@ -276,58 +309,153 @@ def sample(rgba, step):
     return out
 
 
-def verify(args, outputs, ref):
-    """Decode each tool's PNG, compare tools pairwise and with the reference."""
-    decoded = {}
-    v = {"tools": {}}
-    for tool, path in outputs.items():
+def decode(path, args):
+    w, h, info, rgba = pngread.read_png_rgba8(path)
+    step = max(1, -(-w * h // args.verify_max_pixels))
+    return {"w": w, "h": h, "info": info, "rgba": sample(rgba, step), "step": step}
+
+
+def compare_images(a, b):
+    if (a["w"], a["h"]) != (b["w"], b["h"]):
+        return {"dimensions_differ": [[a["w"], a["h"]], [b["w"], b["h"]]]}
+    if a["step"] != b["step"]:
+        return {"error": "different sampling"}
+    c = pngread.compare_rgba8(a["rgba"], b["rgba"])
+    if a["info"]["colour"] != b["info"]["colour"]:
+        c["colour_spaces_differ"] = [a["info"]["colour"], b["info"]["colour"]]
+    return c
+
+
+def against_reference(img, refs):
+    """Score against the reference in the colour space the image is in."""
+    space = img["info"]["colour"]
+    ref = refs.get(space) or refs.get("srgb")
+    if (img["w"], img["h"]) != (ref["w"], ref["h"]):
+        return {"dimensions_differ": [[img["w"], img["h"]], [ref["w"], ref["h"]]]}
+    c = pngread.compare_rgba8(over_white(img["rgba"]), ref["rgba"])
+    c["score"] = round(sum(c["mean"][:3]) / 3, 4)
+    c["reference_space"] = space if space in refs else "srgb"
+    return c
+
+
+def verify(args, warm, au16, ref):
+    """warm: {tool: its warm-up PNG}; au16: Aurora's 16-bit PNG (or None)."""
+    v = {"headers": {t: png_header(p) for t, p in warm.items()}, "notes": []}
+    images = {}
+
+    def load(key, path):
         try:
-            w, h, info, rgba = pngread.read_png_rgba8(path)
-            step = max(1, -(-w * h // args.verify_max_pixels))
-            decoded[tool] = (w, h, sample(rgba, step), step)
-            v["tools"][tool] = {"width": w, "height": h, **info, "sample_step": step}
+            images[key] = decode(path, args)
         except Exception as e:  # noqa: BLE001
-            v["tools"][tool] = {"decode_error": str(e)}
-    names = sorted(decoded)
-    v["pairs"] = {}
-    for i, a in enumerate(names):
-        for b in names[i + 1:]:
-            (wa, ha, ra, sa), (wb, hb, rb, sb) = decoded[a], decoded[b]
-            key = "%s vs %s" % (a, b)
-            if (wa, ha) != (wb, hb):
-                v["pairs"][key] = {"dimensions_differ": [[wa, ha], [wb, hb]]}
-            else:
-                v["pairs"][key] = pngread.compare_rgba8(ra, rb)
-                ca, cb = v["tools"][a].get("colour"), v["tools"][b].get("colour")
-                if ca != cb:
-                    v["pairs"][key]["colour_spaces_differ"] = [ca, cb]
-    stored = ref[:-4] + ".stored.png" if ref else None
+            v.setdefault("decode_errors", {})[key] = str(e)
+
+    a8 = warm.get("aurora-export")
+    if au16:
+        v["headers"]["aurora (16-bit verify run)"] = png_header(au16)
+        load("aurora16", au16)
+    if a8:
+        load("aurora8", a8)
+    if "photocraft" in warm:
+        load("photocraft", warm["photocraft"])
+    # Other Aurora modes: bit-identical to aurora-export's PNG, or compared.
+    sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()  # noqa: E731
+    for t, p in warm.items():
+        if t.startswith("aurora") and t != "aurora-export" and a8:
+            same = sha(p) == sha(a8)
+            v.setdefault("same_bytes_as_aurora_export", {})[t] = same
+            if not same and "aurora16" in images:
+                try:
+                    v.setdefault("vs_aurora16", {})[t] = compare_images(decode(p, args), images["aurora16"])
+                except Exception as e:  # noqa: BLE001
+                    v.setdefault("decode_errors", {})[t] = str(e)
+    if "aurora16" in images and "aurora8" in images:
+        v["dither_floor"] = compare_images(images["aurora8"], images["aurora16"])
+    au = images.get("aurora16") or images.get("aurora8")
+    if au and "photocraft" in images:
+        v["pair"] = compare_images(au, images["photocraft"])
+        v["pair"]["aurora_side"] = "16-bit" if "aurora16" in images else "8-bit dithered"
+    pc_head = v["headers"].get("photocraft") or {}
+    au_head = v["headers"].get("aurora-export") or {}
+    if pc_head.get("colour") == "embedded" and au_head.get("colour") == "srgb":
+        v["notes"].append("colour: Aurora converted to sRGB at open (in its timed open); PhotoCraft kept '%s'"
+                          % pc_head.get("icc"))
     if ref and os.path.exists(ref):
+        refs = {}
         try:
-            refs = {"srgb": pngread.read_png_rgba8(ref)}
-            if stored and os.path.exists(stored):
-                refs["embedded"] = pngread.read_png_rgba8(stored)
-            w, h, _info, _rr = refs["srgb"]
-            v["reference"] = {"width": w, "height": h, "stored_profile_reference": "embedded" in refs}
-            for tool, (wt, ht, rt, st) in decoded.items():
-                # Compare in the space the tool wrote: sRGB against the
-                # working-space merged image, a kept source profile against
-                # the merged image as stored.
-                space = v["tools"][tool].get("colour", "srgb")
-                _w, _h, _i, rr = refs.get(space, refs["srgb"])
-                if (wt, ht) != (w, h):
-                    v["reference"][tool] = {"dimensions_differ": [[wt, ht], [w, h]]}
-                    continue
-                c = pngread.compare_rgba8(over_white(rt), sample(rr, st))
-                c["score"] = round(sum(c["mean"][:3]) / 3, 4)
-                c["reference_space"] = space if space in refs else "srgb"
-                v["reference"][tool] = c
+            refs["srgb"] = decode(ref, args)
+            stored = ref[:-4] + ".stored.png"
+            if os.path.exists(stored):
+                refs["embedded"] = decode(stored, args)
         except Exception as e:  # noqa: BLE001
-            v["reference"] = {"decode_error": str(e)}
+            v.setdefault("decode_errors", {})["reference"] = str(e)
+        if "srgb" in refs:
+            r = v["reference"] = {}
+            for key, label in (("aurora16", "aurora 16-bit"), ("aurora8", "aurora 8-bit dithered (timed)"),
+                               ("photocraft", "photocraft")):
+                if key in images:
+                    r[label] = against_reference(images[key], refs)
     return v
 
 
-# ---------------------------------------------------------------- driver
+def run_file(args, src, mode, tools, outdir, state):
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", display(src))
+    res = {"file": display(src), "path": src, "mode": mode, "runs": [], "warmup": [], "verify_runs": []}
+    if not os.path.exists(src):
+        res["missing"] = True
+        return res
+    res["bytes"] = os.path.getsize(src)
+    is_psd = src.lower().endswith((".psd", ".psb"))
+    synthetic = os.path.abspath(src).startswith(os.path.join(os.path.abspath(args.work), "synth") + os.sep)
+    warm = {}
+    for tool in tools:  # warm-up, reported separately
+        out = os.path.join(outdir, tool, name + ".warm.png")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        row = run_one(tool, args, src, out)
+        res["warmup"].append(row)
+        if row.get("status") == "ok":
+            warm[tool] = out
+            if mode == "idle":
+                state["idle_hash"][(src, tool)] = row["sha256"]
+    au16 = ref = None
+    au_tool = "aurora-export" if "aurora-export" in tools else next((t for t in tools if t.startswith("aurora")), None)
+    if mode == "idle" and au_tool:
+        # Untimed verification run: the same pipeline, written as 16 bits.
+        if is_psd and not synthetic and has_real_merged_data(src):
+            ref = os.path.join(outdir, "ref", name + ".png")
+            os.makedirs(os.path.dirname(ref), exist_ok=True)
+        au16 = os.path.join(outdir, au_tool, name + ".verify16.png")
+        row = run_one(au_tool, args, src, au16, ref=ref, depth16=True)
+        res["verify_runs"].append(row)
+        if row.get("status") != "ok":
+            au16 = None
+    for r in range(args.runs):
+        order = tools[r % len(tools):] + tools[:r % len(tools)]
+        for tool in order:
+            out = os.path.join(outdir, tool, "%s.run%d.png" % (name, r))
+            row = run_one(tool, args, src, out)
+            row["round"] = r
+            res["runs"].append(row)
+            if os.path.exists(out):
+                os.remove(out)
+    res["reference"] = bool(ref and os.path.exists(ref))
+    if mode == "idle" and warm:
+        res["verify"] = verify(args, warm, au16, ref)
+    # Every timed run (and this mode's warm-up) against the idle warm-up output.
+    for tool in tools:
+        idle = state["idle_hash"].get((src, tool))
+        rows = [x for x in res["warmup"] + res["runs"] if x["tool"] == tool and x.get("status") == "ok"]
+        if not rows:
+            res.setdefault("hash_check", {})[tool] = "no output"
+        elif idle is None:
+            res.setdefault("hash_check", {})[tool] = "no idle output"
+        else:
+            bad = sum(1 for x in rows if x["sha256"] != idle)
+            res.setdefault("hash_check", {})[tool] = "match" if bad == 0 else "%d differ" % bad
+    if not args.keep_outputs:
+        for p in list(warm.values()) + [au16]:
+            if p and os.path.exists(p):
+                os.remove(p)
+    return res
 
 
 def collect_inputs(args):
@@ -358,54 +486,6 @@ def display(path):
         if path.startswith(REPO) else os.path.basename(path)
 
 
-def run_file(args, src, mode, tools, outdir, ref_cache):
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", display(src))
-    res = {"file": display(src), "path": src, "mode": mode, "runs": [], "warmup": []}
-    if not os.path.exists(src):
-        res["missing"] = True
-        return res
-    res["bytes"] = os.path.getsize(src)
-    is_psd = src.lower().endswith((".psd", ".psb"))
-    ref = None
-    synthetic = os.path.abspath(src).startswith(os.path.join(os.path.abspath(args.work), "synth") + os.sep)
-    if is_psd and mode == "idle" and not synthetic and has_real_merged_data(src):
-        ref = os.path.join(outdir, "ref", name + ".png")
-        os.makedirs(os.path.dirname(ref), exist_ok=True)
-    keep = {}
-    for tool in tools:  # warm-up, reported separately
-        out = os.path.join(outdir, tool, name + ".warm.png")
-        os.makedirs(os.path.dirname(out), exist_ok=True)
-        row = run_one(tool, args, src, out, ref if tool.startswith("aurora") and ref else None)
-        res["warmup"].append(row)
-        if row.get("status") == "ok":
-            keep.setdefault(tool, out)
-            if tool.startswith("aurora") and ref:
-                ref_cache[src] = ref
-    for r in range(args.runs):
-        order = tools[r % len(tools):] + tools[:r % len(tools)]
-        for tool in order:
-            out = os.path.join(outdir, tool, "%s.run%d.png" % (name, r))
-            row = run_one(tool, args, src, out)
-            row["round"] = r
-            res["runs"].append(row)
-            if os.path.exists(out) and out != keep.get(tool):
-                os.remove(out)
-    ref = ref_cache.get(src)
-    if mode == "idle" and keep:
-        res["verify"] = verify(args, keep, ref if ref and os.path.exists(ref) else None)
-    res["reference"] = bool(ref and os.path.exists(ref))
-    # Same output every run?
-    for tool in tools:
-        hashes = {row.get("sha256") for row in res["warmup"] + res["runs"]
-                  if row["tool"] == tool and row.get("status") == "ok"}
-        res.setdefault("deterministic", {})[tool] = len(hashes) <= 1
-    if not args.keep_outputs:
-        for p in keep.values():
-            if os.path.exists(p):
-                os.remove(p)
-    return res
-
-
 def summarize_runs(rows, key):
     vals = [r[key] for r in rows if r.get("status") == "ok" and r.get(key) is not None]
     if not vals:
@@ -427,42 +507,103 @@ def fmt(x):
     return str(x)
 
 
+CAVEATS = """## Read these before the numbers
+
+* **Not the same work per run.** Aurora's timed run is its Save As PNG path: an 8-bit
+  *dithered* encode, then a safe write (a temp file, `fsync`, a re-decode of the file, a
+  rename and a directory `fsync`). PhotoCraft writes its PNG directly, with its own encoder and
+  bit depth (see the bit-depth and byte columns). Aurora's phases (open, composite, encode,
+  write) are in the phase table. At 60 MP the 8-bit dithered encode is most of Aurora's time.
+* **`aurora-export` composites on one thread**, as the app's export does today; `aurora-pool`
+  runs the same fold on `--threads` threads. `--threads` sizes Aurora's PSD encode pool and its
+  pool composite; both tools also get `RAYON_NUM_THREADS`.
+* **Colour conversion.** Aurora converts a tagged file to sRGB inside its timed open; PhotoCraft
+  keeps the source profile and embeds it. Files where this happens carry a note. On the Nyepi
+  template it is most of Aurora's open (about 10 s of 11.5 s, measured on a copy with the
+  profile resource renamed).
+* **Warm page cache.** One warm-up run per tool comes first (reported separately), so the
+  measured runs read the input from the OS page cache.
+* **Peak RSS** includes each tool's caches: Aurora's tile store keeps up to a quarter of RAM
+  (at most 8 GiB) resident, plus its effects coverage cache; `aurora-pool` also holds every
+  composited tile until it assembles the image.
+* **Pixel checks.** Aurora is checked from a 16-bit output of the same pipeline (one extra,
+  untimed run; `--depth 16`), because its timed 8-bit output is dithered; the dither floor
+  (timed 8-bit against 16-bit) is shown next to it, and the timed outputs are tied to the
+  checked pictures by SHA-256 (`hash`). PhotoCraft is checked from its timed output (its
+  warm-up run). The Photoshop reference is the PSD's own merged image, decoded **by Aurora**
+  (the psd_fidelity_audit's method), and exists only for files Aurora opens: files Aurora
+  refuses have no fidelity score for either tool. An output with no ICC profile, or one whose
+  ICC description names sRGB, is treated as sRGB (the harness reads the description, not the
+  profile); other profiles are scored against the merged image as stored.
+* **Never a single sample.** Cells give min-max over the measured runs (n is shown).
+"""
+
+
+def check_cell(res, idle_res, tools):
+    """A short pixel-check marker for a timing row."""
+    parts = []
+    v = (idle_res or {}).get("verify") or {}
+    ref = v.get("reference") or {}
+    a, p = ref.get("aurora 16-bit"), ref.get("photocraft")
+    if a or p:
+        parts.append("vs PS: A %s, P %s" % (("%.2f" % a["score"]) if a and "score" in a else "-",
+                                            ("%.2f" % p["score"]) if p and "score" in p else "-"))
+    pair = v.get("pair")
+    if pair and "mean" in pair:
+        if pair.get("colour_spaces_differ"):
+            parts.append("A~P: colour spaces differ")
+        else:
+            parts.append("A~P: mean %.2f max %d" % (max(pair["mean"][:3]), max(pair["max"])))
+    elif pair and "dimensions_differ" in pair:
+        parts.append("A~P: SIZE DIFFERS")
+    if not v:
+        parts.append("unverified")
+    hc = res.get("hash_check", {})
+    bad = [t for t in tools if hc.get(t) not in ("match",)]
+    parts.append("hash ok" if not bad else "hash: " + ", ".join("%s %s" % (t, hc.get(t)) for t in bad))
+    return "; ".join(parts)
+
+
+def bucket(s):
+    return "<1" if s < 1 else "<3" if s < 3 else "<10" if s < 10 else ">=10"
+
+
 def write_reports(args, meta, results):
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "results.json"), "w") as f:
         json.dump({"meta": meta, "results": results}, f, indent=1)
     with open(os.path.join(args.out, "runs.csv"), "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["file", "mode", "tool", "kind", "round", "status", "wall_s", "peak_rss_mib",
+        w.writerow(["file", "mode", "tool", "kind", "round", "status", "wall_s", "peak_rss_mib", "output_bytes",
                     "aurora_open_ms", "aurora_composite_ms", "aurora_encode_ms", "aurora_write_ms",
-                    "aurora_threads", "error"])
+                    "aurora_threads", "sha256", "error"])
         for res in results:
-            for kind in ("warmup", "runs"):
+            for kind in ("warmup", "verify_runs", "runs"):
                 for row in res.get(kind, []):
                     a = row.get("aurora", {}).get("ms", {})
                     w.writerow([res["file"], res["mode"], row["tool"], kind, row.get("round", ""),
                                 row.get("status"), row.get("wall_s"), row.get("peak_rss_mib"),
-                                a.get("open"), a.get("composite"), a.get("encode"), a.get("write"),
-                                row.get("aurora", {}).get("threads", ""), row.get("error", "")])
-    lines = ["# Aurora vs PhotoCraft: headless open -> flatten -> PNG", ""]
-    lines.append("Generated %s by `spike/photocraft-compare/compare.py`." % meta["date"])
-    lines.append("")
-    lines.append("## Machine and tools")
-    lines.append("")
-    for k, v in meta["machine"].items():
-        lines.append("- %s: %s" % (k, v))
-    for k in ("aurora", "photocraft"):
-        lines.append("- %s: %s" % (k, meta["tools"].get(k)))
-    lines.append("- threads: %s; runs per file and mode: %d (+1 warm-up per tool); timeout %d s; load: %d `yes`"
-                 % (args.threads or "each tool's default", args.runs, args.timeout, args.load))
-    lines.append("")
+                                row.get("output_bytes"), a.get("open"), a.get("composite"), a.get("encode"),
+                                a.get("write"), row.get("aurora", {}).get("threads", ""),
+                                row.get("sha256", ""), row.get("error", "")])
+    idle = {r["path"]: r for r in results if r["mode"] == "idle"}
     tools = meta["tool_list"]
+    L = ["# Aurora vs PhotoCraft: headless open -> flatten -> PNG", ""]
+    L.append("Generated %s by `spike/photocraft-compare/compare.py` (harness commit %s)."
+             % (meta["date"], meta.get("harness_commit", "?")))
+    L += ["", "## Machine and tools", ""]
+    for k, v in meta["machine"].items():
+        L.append("- %s: %s" % (k, v))
+    for k in ("aurora", "photocraft"):
+        L.append("- %s: %s" % (k, meta["tools"].get(k)))
+    L.append("- threads: %s; runs per file and mode: %d (+1 warm-up per tool); timeout %d s; load: %d `yes`"
+             % (args.threads or "each tool's default", args.runs, args.timeout, args.load))
+    L += ["", CAVEATS]
     for mode in meta["modes"]:
-        lines.append("## %s: wall time (s) and peak RSS (MiB), min-max over measured runs" % mode)
-        lines.append("")
-        head = "| file | size | px |" + "".join(" %s wall | %s RSS |" % (t, t) for t in tools)
-        lines.append(head)
-        lines.append("|" + "---|" * (3 + 2 * len(tools)))
+        L.append("## %s: wall time (s) and peak RSS (MiB), min-max over measured runs" % mode)
+        L.append("")
+        L.append("| file | size | px |" + "".join(" %s wall | %s RSS |" % (t, t) for t in tools) + " pixel check |")
+        L.append("|" + "---|" * (4 + 2 * len(tools)))
         for res in results:
             if res["mode"] != mode:
                 continue
@@ -481,81 +622,99 @@ def write_reports(args, meta, results):
                     wall += " **%d %s**" % (len(bad), bad[0].get("status"))
                 cells += " %s | %s |" % (wall, fmt_range(summarize_runs(rows, "peak_rss_mib")))
             size = "%.1f MB" % (res.get("bytes", 0) / 1e6) if "bytes" in res else "missing"
-            lines.append("| %s | %s | %s |%s" % (res["file"], size, px, cells))
-        lines.append("")
-        if mode == "idle":
-            lines.append("### idle: Aurora's own phases (ms, min-max over measured runs)")
-            lines.append("")
-            lines.append("| file | tool | open | composite | encode | write | layer tiles |")
-            lines.append("|---|---|---|---|---|---|---|")
-            for res in results:
-                if res["mode"] != mode:
+            L.append("| %s | %s | %s |%s %s |" % (res["file"], size, px, cells,
+                                                 check_cell(res, idle.get(res["path"]), tools)))
+        L.append("")
+        L.append("### %s: Aurora's own phases (ms, min-max over measured runs)" % mode)
+        L.append("")
+        L.append("| file | tool | open | composite | encode | write | layer tiles |")
+        L.append("|---|---|---|---|---|---|---|")
+        for res in results:
+            if res["mode"] != mode:
+                continue
+            for t in [t for t in tools if t.startswith("aurora")]:
+                rows = [r for r in res["runs"] if r["tool"] == t and r.get("aurora", {}).get("ok")]
+                if not rows:
                     continue
-                for t in [t for t in tools if t.startswith("aurora")]:
-                    rows = [r for r in res["runs"] if r["tool"] == t and r.get("aurora", {}).get("ok")]
-                    if not rows:
-                        continue
-                    ph = lambda k: fmt_range(summarize_runs([{**r, "v": r["aurora"]["ms"][k]} for r in rows], "v"))  # noqa: E731,E501
-                    lines.append("| %s | %s | %s | %s | %s | %s | %s |" % (
-                        res["file"], t, ph("open"), ph("composite"), ph("encode"), ph("write"),
-                        rows[0]["aurora"].get("layer_tiles")))
-            lines.append("")
-    lines.append("## Pixel checks (idle, first output of each tool)")
-    lines.append("")
-    lines.append("Mean/max |difference| per channel in 8-bit levels (colour premultiplied), share of pixels "
-                 "with any channel off by more than 2. Reference = the PSD's own merged image (Photoshop's), "
-                 "tool output over white, like Aurora's psd_fidelity_audit; score = mean of R, G, B means.")
-    lines.append("")
-    lines.append("| file | pair | dims | mean R,G,B,A | max R,G,B,A | share >2 |")
-    lines.append("|---|---|---|---|---|---|")
+                ph = lambda k: fmt_range(summarize_runs([{**r, "status": "ok", "v": r["aurora"]["ms"][k]} for r in rows], "v"))  # noqa: E731,E501
+                L.append("| %s | %s | %s | %s | %s | %s | %s |" % (
+                    res["file"], t, ph("open"), ph("composite"), ph("encode"), ph("write"),
+                    rows[0]["aurora"].get("layer_tiles")))
+        L.append("")
+    L += ["## Pixel checks (idle)", "",
+          "Levels are 8-bit, colour premultiplied; `share>2` = pixels with any channel more than 2 levels off. "
+          "A = Aurora's 16-bit verification output, P = PhotoCraft's output. Scores against Photoshop are "
+          "the mean of the R, G, B mean errors over white (the audit's score); [space] = which reference.", "",
+          "| file | Aurora timed PNG bits/bytes | PhotoCraft PNG bits/bytes | A vs P mean RGB / max / share>2 | Aurora dither floor (mean) | "
+          "A vs PS | A 8-bit timed vs PS | P vs PS | notes |",
+          "|---|---|---|---|---|---|---|---|---|"]
     for res in results:
         v = res.get("verify")
-        if not v:
+        if not v or res["mode"] != "idle":
             continue
-        for key, c in v.get("pairs", {}).items():
-            if "dimensions_differ" in c:
-                lines.append("| %s | %s | **differ %s** | | | |" % (res["file"], key, c["dimensions_differ"]))
-            else:
-                note = " (colour spaces differ: %s / %s, not comparable)" % tuple(c["colour_spaces_differ"]) \
-                    if c.get("colour_spaces_differ") else ""
-                lines.append("| %s | %s%s | same | %s | %s | %.4f |" % (res["file"], key, note, c["mean"], c["max"],
-                                                                     c["share_over_2"]))
-        ref = v.get("reference", {})
-        for t in tools:
-            c = ref.get(t)
-            if not c:
-                continue
-            if "dimensions_differ" in c:
-                lines.append("| %s | %s vs Photoshop | **differ %s** | | | |" % (res["file"], t, c["dimensions_differ"]))
-            else:
-                lines.append("| %s | %s vs Photoshop [%s] (score %.3f) | same | %s | %s | %.4f |" % (
-                    res["file"], t, c.get("reference_space", "srgb"), c["score"], c["mean"][:3], c["max"][:3],
-                    c["share_over_2"]))
-        for t, info in v.get("tools", {}).items():
-            if "decode_error" in info:
-                lines.append("| %s | %s output | **undecodable: %s** | | | |" % (res["file"], t, info["decode_error"]))
-    lines.append("")
-    lines.append("## Failures (every non-ok run, warm-up included)")
-    lines.append("")
+        h = v.get("headers", {})
+        bytes_of = lambda t: next((r.get("output_bytes") for r in res["warmup"] if r["tool"] == t and r.get("status") == "ok"), None)  # noqa: E731,E501
+        ab = "%s / %s" % ((h.get("aurora-export") or {}).get("bit_depth", "-"), bytes_of("aurora-export"))
+        pb = "%s / %s" % ((h.get("photocraft") or {}).get("bit_depth", "-"), bytes_of("photocraft"))
+        pair = v.get("pair") or {}
+        if "mean" in pair:
+            ps = "%s / %s / %.4f" % ([round(x, 3) for x in pair["mean"][:3]], max(pair["max"]), pair["share_over_2"])
+            if pair.get("colour_spaces_differ"):
+                ps += " (colour spaces differ: not comparable)"
+        elif "dimensions_differ" in pair:
+            ps = "**dimensions differ %s**" % pair["dimensions_differ"]
+        else:
+            ps = "-"
+        df = v.get("dither_floor") or {}
+        dfs = "%.3f" % max(df["mean"][:3]) if "mean" in df else "-"
+        ref = v.get("reference") or {}
+        sc = lambda k: ("%.3f [%s]" % (ref[k]["score"], ref[k]["reference_space"]) if k in ref and "score" in ref[k] else ("**size differs**" if k in ref else "-"))  # noqa: E731,E501
+        notes = list(v.get("notes", []))
+        for t, same in (v.get("same_bytes_as_aurora_export") or {}).items():
+            notes.append("%s %s aurora-export's PNG" % (t, "bit-identical to" if same else "DIFFERS from"))
+        for k, e in (v.get("decode_errors") or {}).items():
+            notes.append("%s undecodable: %s" % (k, e))
+        L.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            res["file"], ab, pb, ps, dfs, sc("aurora 16-bit"), sc("aurora 8-bit dithered (timed)"),
+            sc("photocraft"), "; ".join(notes)))
+    L.append("")
+    scores = {"aurora 16-bit": [], "aurora 8-bit dithered (timed)": [], "photocraft": []}
+    for res in results:
+        ref = (res.get("verify") or {}).get("reference") or {}
+        for k in scores:
+            if k in ref and "score" in ref[k]:
+                scores[k].append(ref[k]["score"])
+    if any(scores.values()):
+        L += ["### Scores against Photoshop, all files with a reference", "",
+              "| output | n | median | <1 | <3 | <10 | >=10 |", "|---|---|---|---|---|---|---|"]
+        for k, vals in scores.items():
+            if vals:
+                b = {x: sum(1 for s in vals if bucket(s) == x) for x in ("<1", "<3", "<10", ">=10")}
+                L.append("| %s | %d | %.3f | %d | %d | %d | %d |" % (k, len(vals), statistics.median(vals),
+                                                                b["<1"], b["<3"], b["<10"], b[">=10"]))
+        L.append("")
+    L += ["## Failures (every non-ok run, warm-up and verification runs included)", ""]
     any_fail = False
     for res in results:
         if res.get("missing"):
-            lines.append("- %s: input file missing" % res["file"])
+            L.append("- %s: input file missing" % res["file"])
             any_fail = True
-        for row in res.get("warmup", []) + res.get("runs", []):
-            if row.get("status") != "ok":
+        for kind in ("warmup", "verify_runs", "runs"):
+            for row in res.get(kind, []):
+                if row.get("status") != "ok":
+                    any_fail = True
+                    what = {"warmup": "warm-up", "verify_runs": "16-bit verify run"}.get(kind) or "round %d" % row["round"]
+                    L.append("- %s [%s, %s, %s]: %s: %s" % (res["file"], res["mode"], row["tool"], what,
+                                                          row.get("status"), (row.get("error") or "")[:300]))
+        for t, hc in res.get("hash_check", {}).items():
+            if hc not in ("match", "no output"):
                 any_fail = True
-                lines.append("- %s [%s, %s, %s]: %s: %s" % (
-                    res["file"], res["mode"], row["tool"], "warm-up" if "round" not in row else
-                    "round %d" % row["round"], row.get("status"), (row.get("error") or "")[:300]))
-        for t, same in res.get("deterministic", {}).items():
-            if not same:
-                lines.append("- %s [%s, %s]: output bytes differ between runs" % (res["file"], res["mode"], t))
+                L.append("- %s [%s, %s]: output hash vs idle: %s" % (res["file"], res["mode"], t, hc))
     if not any_fail:
-        lines.append("- none")
-    lines.append("")
+        L.append("- none")
+    L.append("")
     with open(os.path.join(args.out, "summary.md"), "w") as f:
-        f.write("\n".join(lines))
+        f.write("\n".join(L))
 
 
 def main():
@@ -573,50 +732,54 @@ def main():
     ap.add_argument("--load", type=int, default=8, help="number of `yes` processes in the loaded mode")
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--threads", type=int, default=os.cpu_count(),
-                    help="threads for both tools (Aurora --threads, PhotoCraft RAYON_NUM_THREADS); 0 = defaults")
+                    help="threads for both tools (RAYON_NUM_THREADS, and Aurora's --threads); 0 = defaults")
     ap.add_argument("--synthetic-sizes", default="24,60")
     ap.add_argument("--verify-max-pixels", type=int, default=6_000_000,
                     help="compare every k-th pixel above this many (the decode is always whole)")
     ap.add_argument("--keep-outputs", action="store_true")
     ap.add_argument("--aurora-version", default="")
     ap.add_argument("--photocraft-version", default="")
+    ap.add_argument("--harness-commit", default="")
     args = ap.parse_args()
     if args.rewrite:
         with open(args.rewrite) as f:
             data = json.load(f)
-        meta, results = data["meta"], data["results"]
-        for res in results:  # synthetic inputs never have a reference
-            if "/synth/synthetic-" in res.get("path", "") and res.get("verify"):
-                res["verify"].pop("reference", None)
-                res["reference"] = False
-        old = meta.get("args", {})
+        old = data["meta"].get("args", {})
         for k in ("threads", "runs", "timeout", "load"):
             if k in old:
                 setattr(args, k, old[k])
-        write_reports(args, meta, results)
+        write_reports(args, data["meta"], data["results"])
         print(os.path.join(args.out, "summary.md"))
         return
     if not (args.aurora and args.photocraft and args.work):
         ap.error("--aurora, --photocraft and --work are required")
+    os.makedirs(args.work, exist_ok=True)
+    # One harness at a time per work directory: two would share outputs and
+    # scratch, and would load each other's timings.
+    lock = open(os.path.join(args.work, ".compare.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("another compare.py is running in %s" % args.work)
     args.scratch = os.path.join(args.work, "aurora-scratch")
     os.makedirs(args.scratch, exist_ok=True)
     tools = [t for t in args.tools.split(",") if t]
     modes = [m for m in args.modes.split(",") if m]
     meta = {"date": datetime.datetime.now().isoformat(timespec="seconds"), "machine": machine(),
             "tools": {"aurora": args.aurora_version, "photocraft": args.photocraft_version},
-            "tool_list": tools, "modes": modes, "argv": sys.argv,
+            "harness_commit": args.harness_commit, "tool_list": tools, "modes": modes, "argv": sys.argv,
             "args": {"threads": args.threads, "runs": args.runs, "timeout": args.timeout, "load": args.load}}
     inputs = collect_inputs(args)
     outdir = os.path.join(args.work, "outputs")
     results = []
-    ref_cache = {}
+    state = {"idle_hash": {}}
     for mode in modes:
         if mode == "loaded":
             start_load(args.load)
         try:
             for i, src in enumerate(inputs):
                 print("[%s %d/%d] %s" % (mode, i + 1, len(inputs), display(src)), file=sys.stderr, flush=True)
-                results.append(run_file(args, src, mode, tools, outdir, ref_cache))
+                results.append(run_file(args, src, mode, tools, outdir, state))
                 write_reports(args, meta, results)
         finally:
             kill_load()

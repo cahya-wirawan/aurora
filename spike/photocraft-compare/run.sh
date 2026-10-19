@@ -59,4 +59,5 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT="${RESULTS_DIR:-$WORK/results-$STAMP}"
 python3 "$HERE/compare.py" --aurora "$AU_BIN" --photocraft "$PC_BIN" --work "$WORK" --out "$OUT" \
   --aurora-version "$AU_VER" --photocraft-version "$PC_VER" \
+  --harness-commit "$(git -C "$REPO" rev-parse --short HEAD)$(git -C "$REPO" diff --quiet HEAD -- spike/photocraft-compare || echo '-dirty')" \
   --synthetic-sizes "${SYNTHETIC_SIZES:-24,60}" "$@"
