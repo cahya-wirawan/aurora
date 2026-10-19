@@ -50,6 +50,7 @@ class DamageMonitor(threading.Thread):
     def __init__(self, disp_name, wid):
         super().__init__(daemon=True)
         self.d = xdisplay.Display(disp_name)
+        self.d.damage_query_version()   # DAMAGE refuses requests before QueryVersion
         self.win = self.d.create_resource_object('window', wid)
         self.dmg = self.win.damage_create(damage.DamageReportNonEmpty)
         self.d.flush()
@@ -93,9 +94,9 @@ class Input:
         self.d.flush()
 
     def chord(self, mods, key):
-        for m in mods: self.key(m, True)
-        self.key(key, True); self.key(key, False)
-        for m in reversed(mods): self.key(m, False)
+        for m in mods: self.key(m, True); time.sleep(0.03)
+        self.key(key, True); time.sleep(0.03); self.key(key, False); time.sleep(0.03)
+        for m in reversed(mods): self.key(m, False); time.sleep(0.03)
 
     def wheel(self, up):
         b = 4 if up else 5
@@ -114,6 +115,17 @@ def toplevels_of(d, pid):
         except Exception:
             pass
     return out
+
+
+def title_of(d, win):
+    try:
+        p = win.get_full_property(d.intern_atom('_NET_WM_NAME'), X.AnyPropertyType)
+        if p and p.value:
+            v = p.value
+            return v.decode('utf-8', 'replace') if isinstance(v, bytes) else str(v)
+        return str(win.get_wm_name() or '')
+    except Exception:
+        return ''
 
 
 def wait_window(disp_name, pid, timeout=60):
@@ -248,7 +260,7 @@ def stop_app(p):
             p.wait()
 
 
-def run_scenario(name, app, inp, mon, pid, args, cx, cy):
+def run_scenario(name, app, inp, mon, pid, args, cx, cy, title=lambda: ''):
     """One timed scenario. Returns its stats."""
     rate = args.rate
     dt = 1.0 / rate
@@ -262,6 +274,7 @@ def run_scenario(name, app, inp, mon, pid, args, cx, cy):
     if name == 'brush':
         inp.chord([], 'b')
     wait_quiet(mon, 1.0, 1.0, 30)
+    title_after_setup = title()
     inp.sent.clear()
     gpu = GpuSampler(); gpu.start()
     c0 = proc_cpu_ticks(pid)
@@ -281,7 +294,13 @@ def run_scenario(name, app, inp, mon, pid, args, cx, cy):
             a = 2 * math.pi * t / period
             inp.move(cx + R * math.cos(a), cy + R * math.sin(a))
             k += 1
+        t_end_inputs = now_ns()
+        # Untimed: half a turn more, so the screenshot shows the view moved by 2R.
+        for j in range(1, 21):
+            a = 2 * math.pi * (args.duration / period) + math.pi * j / 20
+            inp.move(cx + R * math.cos(a), cy + R * math.sin(a)); time.sleep(dt)
         inp.button(2 if name == 'pan' else 1, False)
+        inp.sent = [t for t in inp.sent if t <= t_end_inputs]
     else:
         # Wheel: alternating bursts of `zoom_burst` notches in, then out.
         if zoom_mod: inp.key(zoom_mod, True)
@@ -294,13 +313,14 @@ def run_scenario(name, app, inp, mon, pid, args, cx, cy):
             inp.wheel(up=(k // args.zoom_burst) % 2 == 0)
             k += 1
         if zoom_mod: inp.key(zoom_mod, False)
-    t_end = now_ns()
+    t_end = t_end_inputs if name in ('pan', 'brush') else now_ns()
     # Frames presented in response to the last inputs still count: wait for quiet.
     _, _ = wait_quiet(mon, 0.5, 0.0, 10, t0=t_end)
     t_tail = max(t_end, mon.last())
     c1 = proc_cpu_ticks(pid)
     gpu.finish()
     st = frame_stats(mon.stamps, t_start, t_tail, inp.sent)
+    st['title_after_setup'] = title_after_setup
     st['input_seconds'] = (t_end - t_start) / 1e9
     st['tail_seconds'] = (t_tail - t_end) / 1e9
     if c0 is not None and c1 is not None and st['seconds']:
@@ -330,9 +350,36 @@ def one_launch(app, file, args, outdir, tag):
         win.configure(x=0, y=0, width=WIN_W, height=WIN_H); d.sync()
         win.set_input_focus(X.RevertToParent, X.CurrentTime); d.sync()
         mon = DamageMonitor(args.display, win.id); mon.start()
-        ok, settled = wait_quiet(mon, args.quiet, args.min_open, args.open_timeout, t0=t_launch)
-        rec['open_settled'] = ok
-        rec['launch_to_last_frame_s'] = settled
+        # Ready = the window title names the file (both apps title the window after the
+        # open document; Aurora shows 'Opening …' while it decodes) and no frame for
+        # `quiet` s. A dialog can block an open before it lands (PhotoCraft's 'Embedded
+        # Profile Mismatch') or follow it (Aurora's 'Opened With Changes'); Return takes
+        # each dialog's default (PhotoCraft: keep the embedded profile), and is pressed
+        # only after the window has been quiet, never during a scenario.
+        inp0 = Input(args.display)
+        stem = Path(file).stem
+        returns = 0
+        ok = False
+        while (now_ns() - t_launch) / 1e9 < args.open_timeout:
+            quiet_ok, _ = wait_quiet(mon, args.quiet, 0.0, args.quiet + 0.5)
+            t = title_of(d, win)
+            if stem in t and 'Opening' not in t:
+                ok = True; break
+            if quiet_ok and returns < 3 and (now_ns() - t_launch) / 1e9 > args.min_open:
+                inp0.chord([], 'Return'); returns += 1
+        rec['open_titled'] = ok
+        rec['launch_to_title_s'] = (now_ns() - t_launch) / 1e9
+        inp0.chord([], 'Return'); returns += 1
+        ok2, _ = wait_quiet(mon, args.quiet, 1.0, args.settle_timeout)
+        rec['returns_pressed'] = returns
+        rec['after_return_settled'] = ok2
+        rec['launch_to_ready_s'] = (now_ns() - t_launch) / 1e9 - args.quiet
+        rec['title'] = title_of(d, win)
+        if args.screens:
+            screenshot(args.display, outdir / f'{tag}-ready.png')
+        if not ok:
+            rec['error'] = 'open did not finish (title never named the file)'
+            return rec
         g = win.get_geometry(); rec['window'] = [g.width, g.height]
         cx, cy = find_canvas_centre(app, win)
         inp = Input(args.display)
@@ -341,7 +388,7 @@ def one_launch(app, file, args, outdir, tag):
             if p.poll() is not None:
                 rec['error'] = f'exited {p.returncode} before {sc}'; break
             win.set_input_focus(X.RevertToParent, X.CurrentTime); d.sync()
-            rec['scenarios'][sc] = run_scenario(sc, app, inp, mon, p.pid, args, cx, cy)
+            rec['scenarios'][sc] = run_scenario(sc, app, inp, mon, p.pid, args, cx, cy, lambda: title_of(d, win))
             if args.screens:
                 screenshot(args.display, outdir / f'{tag}-{sc}.png')
         mon.stop = True
@@ -393,6 +440,8 @@ def main():
     ap.add_argument('--threads', type=int, default=0)
     ap.add_argument('--quiet', type=float, default=3.0); ap.add_argument('--min-open', type=float, default=4.0)
     ap.add_argument('--open-timeout', type=float, default=240.0)
+    ap.add_argument('--settle-timeout', type=float, default=30.0,
+                    help='after the open, wait at most this long for quiet (an app may keep repainting)')
     ap.add_argument('--screens', action='store_true')
     ap.add_argument('--scratch', default=None)
     args = ap.parse_args()

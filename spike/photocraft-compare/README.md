@@ -194,9 +194,110 @@ The decode itself is always whole.
 * **Never a single sample.** The tables give min-max over the measured runs.
   Treat a ratio of two single runs as noise.
 
-## Not compared (stage 2)
+## Stage 2: interactive frame rate (`stage2/`)
 
-UI frame rate, brush latency, and interactive pan/zoom are not compared
-here. Those need the windowed apps, measured from outside: the Metal HUD
-(`MTL_HUD_ENABLED=1`) on the Mac, and MangoHud on Linux. Filters,
-adjustments as operations, RAW, and saving PSD are not compared either.
+Stage 2 runs the two **live, windowed apps** and times their presented frames
+from outside, the same way for both. Results and the full caveat list are in
+`FINDINGS-stage2.md`.
+
+### Method (Linux)
+
+* **Display.** A private `Xvfb` server (`:99`, 2560 x 1440 x 24). Both apps
+  render with the NVIDIA Vulkan driver on the real GPU (wgpu picks the RTX 3090
+  on Xvfb; the log names the adapter) and present through the driver's X11 path
+  into the Xvfb window: a GPU-to-CPU copy of each 1280 x 800 frame and an X
+  image put. That copy is the same for both apps, but it makes every absolute
+  number a property of this present path, not of a real monitor.
+* **Same window.** Each app's toplevel is moved to (0, 0) and set to 1280 x 800
+  (Aurora's own default size, scale factor 1) and given the input focus. No
+  window manager runs.
+* **Same input.** XTEST, from the harness (`python-xlib`), at a fixed schedule:
+  * `pan`: Ctrl+1 (100 % in both), then a middle-button drag (both apps pan with
+    it) along a circle of radius 250 px, one turn a second, 240 pointer events a
+    second, for `--duration` s;
+  * `zoom`: Ctrl+0 (fit in both), then wheel notches, 120 a second, alternating
+    12 in and 12 out. Aurora zooms with the plain wheel; PhotoCraft with
+    Alt+wheel (its plain wheel scrolls, as in Photoshop), so the harness holds
+    Alt for PhotoCraft only. The zoom per notch differs between the apps;
+  * `brush`: Ctrl+1, `B` (the Brush in both), then a left-button drag along a
+    circle of radius 150 px, half a turn a second, 240 events a second. Each
+    app's default brush size, hardness and spacing.
+* **Same observer.** An X DAMAGE monitor on the app's window, in the harness
+  process, records the monotonic time of every presented frame
+  (`DamageReportNonEmpty`, subtracted on each event, so one event per
+  present). Neither app's own counter is used, no layer is injected into
+  either process.
+* **Same present mode.** `--present novsync` sets wgpu's `AutoNoVsync` in both
+  (Aurora: `AURORA_PRESENT_MODE`, an environment variable added for this
+  measurement; PhotoCraft: its own `PHOTOCRAFT_PRESENT_MODE`). Xvfb has no
+  vblank anyway.
+* **Same open.** Aurora opens the file through `AURORA_OPEN` (environment
+  variable added for this measurement; it calls the same `open_file` the
+  File > Open command uses); PhotoCraft takes the path as its argument. The
+  harness waits until the window title names the file and no frame has been
+  presented for 3 s, pressing Return when the window is quiet to take a
+  blocking dialog's default (Aurora: "Opened With Changes"; PhotoCraft:
+  "Embedded Profile Mismatch", whose default keeps the embedded profile, as in
+  stage 1). Every launch gets its own empty `HOME`, `TMPDIR` and XDG
+  directories, so no preference, recovery file or layout carries over.
+* **Metrics** per scenario: frames presented and frames per second over the
+  input period plus the tail until the window is quiet; the distribution of
+  frame-to-frame intervals (mean, p50, p95, p99, max, % above 16.7 ms); the
+  time from each injected event to the next presented frame (p50, p95; an
+  approximation of latency that includes X and the app's event handling);
+  process CPU time over the scenario (100 % = one core); whole-GPU utilisation
+  from `nvidia-smi` (other processes included).
+* **Runs.** `--runs` rounds, each launching every app once per file, the app
+  order alternating; idle and with `--load` (8) `yes` processes. Every launch
+  records the load average and the number of `cargo`/`rustc` processes before
+  and after. Screenshots after each phase (`--screens`) show whether the
+  picture actually moved, zoomed or was painted.
+
+### How to run
+
+```sh
+python3 -m venv venv && venv/bin/pip install python-xlib
+# Xvfb without root: apt-get download xvfb && dpkg -x xvfb_*.deb root/
+LD_LIBRARY_PATH=root/usr/lib/x86_64-linux-gnu root/usr/bin/Xvfb :99 -screen 0 2560x1440x24 -nolisten tcp &
+cargo build --release -p aurora-app --bin aurora-app
+(cd photocraft && cargo +1.97 build --release -p photocraft)    # pinned commit, as stage 1
+venv/bin/python spike/photocraft-compare/stage2/stage2.py --no-xvfb \
+  --aurora target/release/aurora-app --photocraft WORK/target/release/photocraft \
+  --files A.psd B.png ... --out WORK/s2 --runs 3 --modes idle,loaded \
+  --duration 6 --wheel-rate 120 --zoom-burst 12 --screens
+python3 spike/photocraft-compare/stage2/summarize.py WORK/s2/results.json > WORK/s2/summary.md
+```
+
+Without `--no-xvfb` the harness starts `--xvfb` itself on `--display`.
+
+### Stage 2 on the Mac (procedure, not yet run)
+
+The Mac reachable from the dev box has no GUI session, so this part is written,
+not run. It needs a logged-in session and a Terminal with Accessibility
+permission (for synthetic input) and `pip install pyobjc-framework-Quartz`.
+
+1. Build both apps in release on the Mac (as above; PhotoCraft at the pinned
+   commit with `cargo +1.97`).
+2. For each file and app, alternating the app order, idle and loaded (8 `yes`):
+   `stage2/mac_stage2.py --app aurora --bin target/release/aurora-app --file F --out OUT/<tag>`.
+   It launches the app with `MTL_HUD_ENABLED=1 MTL_HUD_LOG_ENABLED=1` and
+   the same present mode (`novsync`), records `log stream` of the Metal
+   subsystem, places the window at 1280 x 800, presses Return for each app's
+   post-open dialog, and injects the same pan, zoom and brush input through
+   CGEvent (Cmd+1 / Cmd+0 instead of Ctrl; Option+wheel for PhotoCraft).
+3. Check `ready.png`/`end.png`: the document must be open and the canvas must
+   have moved. There is no outside "ready" signal on the Mac yet: raise
+   `--open-wait` for Nyepi and the 60 MP files.
+4. `mac_stage2.py --out OUT/<tag> --parse` prints the same statistics from the
+   Metal HUD's per-frame log lines. **The HUD log's line format has not been
+   checked**: read `hud.log` first and adjust `FRAME_RE`. If the HUD does not
+   log per frame on that macOS version, the fair alternative is an outside
+   ScreenCaptureKit stream of the app's window (frame-change timestamps,
+   the Mac analogue of the X DAMAGE monitor); not written yet.
+5. Both apps present through `CAMetalLayer` with the same present mode; check
+   the HUD's reported refresh/present mode for each app before comparing.
+
+## Not compared
+
+Filters, adjustments as operations, RAW, and saving PSD are not compared.
+Stage 2's limits are listed in `FINDINGS-stage2.md`.
