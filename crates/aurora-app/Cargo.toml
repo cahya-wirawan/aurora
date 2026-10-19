@@ -8,6 +8,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+# Two binaries (the app and `aurora-headless`): `cargo run -p aurora-app`
+# still starts the app.
+default-run = "aurora-app"
 
 [lints]
 workspace = true
@@ -130,3 +133,10 @@ zip = { workspace = true }
 [[bin]]
 name = "aurora-app"
 path = "src/main.rs"
+
+# A timed headless open -> composite -> export run (`aurora_app::headless`),
+# for comparing Aurora with other editors from the outside
+# (`spike/photocraft-compare/`). No window, no display.
+[[bin]]
+name = "aurora-headless"
+path = "src/bin/aurora-headless.rs"

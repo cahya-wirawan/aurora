@@ -581,6 +581,8 @@ mod first_run;
 mod frame_composite;
 #[cfg(test)]
 mod frame_cost_tests;
+#[doc(hidden)]
+pub mod headless;
 mod lasso_tools;
 mod layer_thumbnails;
 mod menu_bar_app;
