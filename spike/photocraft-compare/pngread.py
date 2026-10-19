@@ -72,6 +72,30 @@ def _unfilter(raw, width, height, bpp, stride):
     return out
 
 
+def icc_description(iccp_body):
+    """The 'desc' text of an iCCP chunk's profile ('' when unreadable)."""
+    try:
+        name_end = iccp_body.index(b"\0")
+        prof = zlib.decompress(iccp_body[name_end + 2:])
+        (count,) = struct.unpack(">I", prof[128:132])
+        for i in range(min(count, 100)):
+            sig, off, size = struct.unpack(">4sII", prof[132 + 12 * i:144 + 12 * i])
+            if sig != b"desc":
+                continue
+            tag = prof[off:off + size]
+            if tag[:4] == b"desc":
+                (n,) = struct.unpack(">I", tag[8:12])
+                return tag[12:12 + n].split(b"\0")[0].decode("latin-1")
+            if tag[:4] == b"mluc":
+                (nrec,) = struct.unpack(">I", tag[8:12])
+                if nrec:
+                    ln, so = struct.unpack(">II", tag[20:28])
+                    return tag[so:so + ln].decode("utf-16-be", "replace")
+        return ""
+    except (ValueError, struct.error, zlib.error):
+        return ""
+
+
 def read_png_rgba8(path):
     """Return ``(width, height, info, rgba)``; ``rgba`` holds 4 bytes a pixel."""
     with open(path, "rb") as f:
@@ -83,6 +107,8 @@ def read_png_rgba8(path):
     idat = []
     palette = None
     trns = None
+    iccp = False
+    srgb = False
     while pos + 8 <= len(data):
         (length,) = struct.unpack(">I", data[pos:pos + 4])
         ctype = data[pos + 4:pos + 8]
@@ -96,6 +122,10 @@ def read_png_rgba8(path):
             palette = body
         elif ctype == b"tRNS":
             trns = body
+        elif ctype == b"iCCP":
+            iccp = icc_description(body)
+        elif ctype == b"sRGB":
+            srgb = True
         elif ctype == b"IEND":
             break
     if ihdr is None:
@@ -144,7 +174,10 @@ def read_png_rgba8(path):
             o = i * 4
             rgba[o:o + 3] = palette[idx * 3:idx * 3 + 3]
             rgba[o + 3] = trns[idx] if trns is not None and idx < len(trns) else 255
-    info = {"bit_depth": depth, "colour_type": colour}
+    # "srgb": tagged sRGB or untagged; "embedded": an ICC profile (which may
+    # still be an sRGB profile; this decoder does not read it).
+    space = "embedded" if iccp is not False and not srgb and "srgb" not in (iccp or "").lower() else "srgb"
+    info = {"bit_depth": depth, "colour_type": colour, "colour": space, "icc": iccp if iccp else None}
     return width, height, info, rgba
 
 

@@ -298,16 +298,29 @@ def verify(args, outputs, ref):
                 v["pairs"][key] = {"dimensions_differ": [[wa, ha], [wb, hb]]}
             else:
                 v["pairs"][key] = pngread.compare_rgba8(ra, rb)
+                ca, cb = v["tools"][a].get("colour"), v["tools"][b].get("colour")
+                if ca != cb:
+                    v["pairs"][key]["colour_spaces_differ"] = [ca, cb]
+    stored = ref[:-4] + ".stored.png" if ref else None
     if ref and os.path.exists(ref):
         try:
-            w, h, _info, rr = pngread.read_png_rgba8(ref)
-            v["reference"] = {"width": w, "height": h}
+            refs = {"srgb": pngread.read_png_rgba8(ref)}
+            if stored and os.path.exists(stored):
+                refs["embedded"] = pngread.read_png_rgba8(stored)
+            w, h, _info, _rr = refs["srgb"]
+            v["reference"] = {"width": w, "height": h, "stored_profile_reference": "embedded" in refs}
             for tool, (wt, ht, rt, st) in decoded.items():
+                # Compare in the space the tool wrote: sRGB against the
+                # working-space merged image, a kept source profile against
+                # the merged image as stored.
+                space = v["tools"][tool].get("colour", "srgb")
+                _w, _h, _i, rr = refs.get(space, refs["srgb"])
                 if (wt, ht) != (w, h):
                     v["reference"][tool] = {"dimensions_differ": [[wt, ht], [w, h]]}
                     continue
                 c = pngread.compare_rgba8(over_white(rt), sample(rr, st))
                 c["score"] = round(sum(c["mean"][:3]) / 3, 4)
+                c["reference_space"] = space if space in refs else "srgb"
                 v["reference"][tool] = c
         except Exception as e:  # noqa: BLE001
             v["reference"] = {"decode_error": str(e)}
@@ -503,8 +516,10 @@ def write_reports(args, meta, results):
             if "dimensions_differ" in c:
                 lines.append("| %s | %s | **differ %s** | | | |" % (res["file"], key, c["dimensions_differ"]))
             else:
-                lines.append("| %s | %s | same | %s | %s | %.4f |" % (res["file"], key, c["mean"], c["max"],
-                                                                   c["share_over_2"]))
+                note = " (colour spaces differ: %s / %s, not comparable)" % tuple(c["colour_spaces_differ"]) \
+                    if c.get("colour_spaces_differ") else ""
+                lines.append("| %s | %s%s | same | %s | %s | %.4f |" % (res["file"], key, note, c["mean"], c["max"],
+                                                                     c["share_over_2"]))
         ref = v.get("reference", {})
         for t in tools:
             c = ref.get(t)
@@ -513,8 +528,9 @@ def write_reports(args, meta, results):
             if "dimensions_differ" in c:
                 lines.append("| %s | %s vs Photoshop | **differ %s** | | | |" % (res["file"], t, c["dimensions_differ"]))
             else:
-                lines.append("| %s | %s vs Photoshop (score %.3f) | same | %s | %s | %.4f |" % (
-                    res["file"], t, c["score"], c["mean"][:3], c["max"][:3], c["share_over_2"]))
+                lines.append("| %s | %s vs Photoshop [%s] (score %.3f) | same | %s | %s | %.4f |" % (
+                    res["file"], t, c.get("reference_space", "srgb"), c["score"], c["mean"][:3], c["max"][:3],
+                    c["share_over_2"]))
         for t, info in v.get("tools", {}).items():
             if "decode_error" in info:
                 lines.append("| %s | %s output | **undecodable: %s** | | | |" % (res["file"], t, info["decode_error"]))

@@ -89,6 +89,9 @@ pub struct Report {
     pub psd_stage_ms: Option<f64>,
     pub open_notes: usize,
     pub reference_written: bool,
+    /// A second reference, the merged image in the file's own profile
+    /// (`<reference>.stored.png`), written when that profile is not sRGB.
+    pub reference_stored_written: bool,
     pub output_bytes: usize,
 }
 
@@ -592,22 +595,38 @@ pub fn run(options: &Options) -> Result<Report, Failure> {
 
     if let (Some(reference), "psd") = (&options.reference_out, report.format.as_str()) {
         // The audit's reference: the file's own merged image, in the
-        // working space (psd_audit_tests.rs). Outside the timed phases.
-        let merged = std::fs::read(&options.input)
-            .map_err(|e| fail("reference", e.to_string()))
-            .and_then(|b| {
-                aurora_io::decode_psd_merged_image_in_working_space(&b)
-                    .map_err(|e| fail("reference", format!("{e:?}")))
-            })
-            .and_then(|img| {
-                aurora_io::png::encode_16(&img).map_err(|e| fail("reference", format!("{e:?}")))
+        // working space (psd_audit_tests.rs), and beside it, when the
+        // file carries another profile, the merged image as stored (for
+        // a tool that keeps the source profile). Outside the timed phases.
+        let bytes = std::fs::read(&options.input).map_err(|e| fail("reference", e.to_string()))?;
+        let write = |path: &Path, image: Result<aurora_io::Image, aurora_io::IoError>| {
+            let png = image
+                .and_then(|img| aurora_io::png::encode_16(&img))
+                .map_err(|e| fail("reference", format!("{e:?}")))?;
+            std::fs::write(path, png).map_err(|e| fail("reference", e.to_string()))
+        };
+        let working = aurora_io::decode_psd_merged_image_in_working_space(&bytes);
+        // The merged image as stored differs from the working-space one
+        // exactly when the open converts the file's colours.
+        let stored = aurora_io::decode_psd_merged_image(&bytes)
+            .ok()
+            .filter(|stored| {
+                working
+                    .as_ref()
+                    .is_ok_and(|working| working.samples() != stored.samples())
             });
-        match merged {
-            Ok(png) => {
-                std::fs::write(reference, png).map_err(|e| fail("reference", e.to_string()))?;
-                report.reference_written = true;
-            }
+        match write(reference, working) {
+            Ok(()) => report.reference_written = true,
             Err(failure) => tracing::warn!(message = %failure.message, "no merged image"),
+        }
+        if let Some(image) = stored {
+            let raw = reference.with_extension("stored.png");
+            match write(&raw, Ok(image)) {
+                Ok(()) => report.reference_stored_written = true,
+                Err(failure) => {
+                    tracing::warn!(message = %failure.message, "no stored merged image")
+                }
+            }
         }
     }
     drop(scratch);
@@ -666,7 +685,7 @@ pub fn to_json(options: &Options, result: &Result<Report, Failure>) -> String {
                 ",\"width\":{},\"height\":{},\"layers\":{},\"doc_tiles\":{},\"layer_tiles\":{},\
 \"gpu_tiles\":{},\"cpu_tiles\":{},\"open_notes\":{},\"output_bytes\":{},\
 \"ms\":{{\"decode\":{},\"install\":{},\"open\":{},\"composite\":{},\"encode\":{},\"write\":{},\"total\":{}}},\
-\"psd_encode_ms\":{},\"psd_stage_ms\":{},\"reference_written\":{}",
+\"psd_encode_ms\":{},\"psd_stage_ms\":{},\"reference_written\":{},\"reference_stored_written\":{}",
                 r.width,
                 r.height,
                 r.layers,
@@ -686,6 +705,7 @@ pub fn to_json(options: &Options, result: &Result<Report, Failure>) -> String {
                 opt_num(r.psd_encode_ms),
                 opt_num(r.psd_stage_ms),
                 r.reference_written,
+                r.reference_stored_written,
             );
             o.push_str(",\"gpu_adapter\":");
             match &r.gpu_adapter {
