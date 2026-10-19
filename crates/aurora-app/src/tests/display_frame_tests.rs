@@ -150,24 +150,33 @@ impl Rig {
             Some(worker) if !gpu_path => Level0::Worker(worker),
             _ => Level0::Sync(Some(gpu), Some(&mut self.compositor)),
         };
-        let advance = self.view.prepare(
-            device,
-            queue,
-            zoomed_view::FrameDocument {
-                cache_id: self.cache.id(),
-                canvas: photo.size,
-                layers: &photo.layers,
-                active_layer: Some(photo.active),
-                store: &mut photo.store,
-                cache: &mut self.cache,
-            },
-            &visible,
-            level0,
-            one_to_one,
-            gpu_path,
-            (origin.0, origin.1, zoom),
-            &aurora_gpu::TileResidency::visible_tiles_at(origin, self.viewport, limit),
-        );
+        // `AURORA_R11_CONTROL`: the same frame with no display texture at
+        // all (every frame the atlas's), to tell the rig's own cost apart
+        // from the texture's.
+        let control = atlas.is_some() && std::env::var_os("AURORA_R11_CONTROL").is_some();
+        let advance = if control {
+            drop(level0);
+            DisplayAdvance::default()
+        } else {
+            self.view.prepare(
+                device,
+                queue,
+                zoomed_view::FrameDocument {
+                    cache_id: self.cache.id(),
+                    canvas: photo.size,
+                    layers: &photo.layers,
+                    active_layer: Some(photo.active),
+                    store: &mut photo.store,
+                    cache: &mut self.cache,
+                },
+                &visible,
+                level0,
+                one_to_one,
+                gpu_path,
+                (origin.0, origin.1, zoom),
+                &aurora_gpu::TileResidency::visible_tiles_at(origin, self.viewport, limit),
+            )
+        };
         let t_draw = Instant::now();
         if std::env::var_os("AURORA_R11_SPLIT").is_some() {
             let _ = device.poll(wgpu::PollType::Wait {
