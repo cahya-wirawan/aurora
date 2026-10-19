@@ -38104,6 +38104,33 @@ impl App {
                             false,
                             usize::MAX,
                         );
+                        // Task 142: the display texture takes over the
+                        // tiles the atlas has just uploaded by a GPU copy,
+                        // not a second upload, when it draws again.
+                        if let (Some(display), Some(canvas_size)) = (
+                            self.display.as_mut(),
+                            canvas_area_physical_size(&self.workspace, self.scale_factor),
+                        ) {
+                            let visible = display_view::visible_tiles(
+                                canvas_local_origin(
+                                    &self.doc.canvas_view,
+                                    active_layer_origin(&self.doc.layers, self.doc.active_layer),
+                                ),
+                                effective_residency_zoom(
+                                    self.doc.canvas_view.zoom(),
+                                    self.scale_factor,
+                                ),
+                                canvas_size,
+                                self.doc.canvas_size,
+                            );
+                            let _ = display.adopt_from_atlas(
+                                gpu.device(),
+                                gpu.queue(),
+                                residency,
+                                store,
+                                &visible,
+                            );
+                        }
                     }
                 }
 

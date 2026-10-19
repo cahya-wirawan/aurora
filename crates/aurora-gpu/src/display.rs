@@ -449,6 +449,8 @@ pub struct DisplayTexture {
     uploads: u64,
     /// Mip passes recorded since creation.
     mip_passes: u64,
+    /// Tiles copied from another texture since creation.
+    copies: u64,
 }
 
 const MIP_SHADER: &str = include_str!("shaders/display_mips.wgsl");
@@ -537,6 +539,7 @@ impl DisplayTexture {
             bytes,
             uploads: 0,
             mip_passes: 0,
+            copies: 0,
         })
     }
 
@@ -667,6 +670,85 @@ impl DisplayTexture {
         }
         self.uploads += 1;
         Ok(written)
+    }
+
+    /// Whether tile `id` lies wholly inside the document (no texel to mask),
+    /// so its level 0 can be copied from another texture as it is.
+    #[must_use]
+    pub fn tile_is_interior(&self, id: TileId) -> bool {
+        id.x < self.doc_tiles.0
+            && id.y < self.doc_tiles.1
+            && (id.x + 1).saturating_mul(TILE) <= self.doc_size.0
+            && (id.y + 1).saturating_mul(TILE) <= self.doc_size.1
+    }
+
+    /// Copies interior tiles' level 0 from `source` (an `Rgba16Float`
+    /// texture holding them premultiplied, as the atlas does: `(id, texel
+    /// origin in source)`) on the GPU, into every page holding them, and
+    /// marks their mips for the next [`Self::regenerate_mips`]. A tile that
+    /// is not interior is skipped (its outside texels must be masked, which
+    /// only [`Self::upload_tile`] does). Returns the tiles copied.
+    pub fn copy_tiles_from(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &wgpu::Texture,
+        tiles: &[(TileId, (u32, u32))],
+    ) -> u32 {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("display-adopt"),
+        });
+        let mut copied = 0;
+        for &(id, (sx, sy)) in tiles {
+            if !self.tile_is_interior(id)
+                || sx.saturating_add(TILE) > source.width()
+                || sy.saturating_add(TILE) > source.height()
+            {
+                continue;
+            }
+            for page in &mut self.pages {
+                if !page.layout.holds(id) {
+                    continue;
+                }
+                let local = (id.x - page.layout.first.0, id.y - page.layout.first.1);
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: source,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: sx, y: sy, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &page.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: local.0 * TILE,
+                            y: local.1 * TILE,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: TILE,
+                        height: TILE,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                page.dirty.push(local);
+            }
+            copied += 1;
+        }
+        if copied > 0 {
+            queue.submit(std::iter::once(encoder.finish()));
+            self.copies += u64::from(copied);
+        }
+        copied
+    }
+
+    /// Tiles adopted by [`Self::copy_tiles_from`] since creation.
+    #[must_use]
+    pub fn copies(&self) -> u64 {
+        self.copies
     }
 
     /// Whether any uploaded tile still waits for its mips.

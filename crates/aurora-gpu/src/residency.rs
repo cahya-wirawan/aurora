@@ -1424,6 +1424,17 @@ impl TileResidency {
         self.slots.clear();
     }
 
+    /// The texel origin, in [`Self::texture`], of the slot holding tile
+    /// `id`, when a slot holds it (task 142: the display texture adopts a
+    /// tile the atlas has just uploaded by a GPU copy instead of a second
+    /// upload). Only as current as the last [`Self::sync`] made it.
+    #[must_use]
+    pub fn slot_origin(&self, id: TileId) -> Option<(u32, u32)> {
+        let slot = (id.x % self.grid.0.max(1), id.y % self.grid.1.max(1));
+        (self.slots.get(&slot) == Some(&id) && self.mip_levels >= 1)
+            .then_some((slot.0 * TILE, slot.1 * TILE))
+    }
+
     /// How many slots currently hold a tile (0.172.0, for tests).
     #[must_use]
     pub fn resident_slots(&self) -> usize {

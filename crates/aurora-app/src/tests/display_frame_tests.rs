@@ -49,6 +49,13 @@ fn stats(values: &[f64]) -> (f64, f64, f64, usize) {
     (mean, p90, max, over)
 }
 
+thread_local! {
+    /// Milliseconds from the end of `prepare` to the GPU being idle, summed.
+    static DRAW_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    /// With `AURORA_R11_SPLIT`: the GPU wait for `prepare`'s own work.
+    static SPLIT_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
 struct Rig {
     view: DisplayView,
     canvas: aurora_gpu::CanvasPipeline,
@@ -159,6 +166,14 @@ impl Rig {
             one_to_one,
             (origin.0, origin.1, zoom),
         );
+        let t_draw = Instant::now();
+        if std::env::var_os("AURORA_R11_SPLIT").is_some() {
+            let _ = device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            SPLIT_MS.with(|d| d.set(d.get() + ms(t_draw.elapsed())));
+        }
         match atlas {
             // As `redraw`: at or above the atlas floor a frame whose view
             // is not uploaded yet draws the atlas.
@@ -189,6 +204,10 @@ impl Rig {
                     usize::MAX,
                 );
                 self.draw_atlas(gpu, residency);
+                let visible = display_view::visible_tiles(origin, zoom, self.viewport, photo.size);
+                let _ =
+                    self.view
+                        .adopt_from_atlas(device, queue, residency, &photo.store, &visible);
             }
             _ => self.draw(gpu, photo.size, origin, zoom),
         }
@@ -196,6 +215,7 @@ impl Rig {
             submission_index: None,
             timeout: None,
         });
+        DRAW_MS.with(|d| d.set(d.get() + ms(t_draw.elapsed())));
         let spent = t0.elapsed();
         if self.worker.is_some()
             && let Some(rest) = VSYNC.checked_sub(spent)
@@ -610,6 +630,66 @@ fn at_100_percent_a_view_not_yet_uploaded_is_not_ready() {
     }
 }
 
+/// A frame the atlas drew hands its freshly uploaded tiles to the display
+/// texture by a GPU copy: the next display frame uploads only the edge
+/// tiles (which need masking), and its picture is the atlas's.
+#[test]
+fn tiles_the_atlas_just_uploaded_are_adopted_by_a_gpu_copy() {
+    let Some(context) = real_gpu_context() else {
+        return;
+    };
+    let device = context.device();
+    let queue = context.queue();
+    // 1500 x 1000: the last tile column and row are partial.
+    let mut photo = build(Shape::Photo, SMALL);
+    let mut rig = Rig::new(&context, &photo, SMALL_VIEW, false, u32::MAX);
+    let mut residency = aurora_gpu::TileResidency::new(device, queue, SMALL_VIEW);
+    let origin = (1000.0, 600.0);
+    residency.set_origin(queue, origin, SMALL_VIEW, 1.0);
+    crate::recomposite_or_dispatch(
+        &residency,
+        &photo.layers,
+        Some(photo.active),
+        &mut photo.store,
+        &mut rig.cache,
+        Some(&context),
+        Some(&mut rig.compositor),
+        None,
+    );
+    let _ = residency.sync(
+        queue,
+        &mut photo.store,
+        crate::composite_surface_id(),
+        false,
+        usize::MAX,
+    );
+    let visible = display_view::visible_tiles(origin, 1.0, SMALL_VIEW, photo.size);
+    let interior = visible
+        .iter()
+        .filter(|&&id| rig.view.texture().tile_is_interior(id))
+        .count();
+    assert!(interior > 0 && interior < visible.len(), "{visible:?}");
+    let adopted = rig
+        .view
+        .adopt_from_atlas(device, queue, &residency, &photo.store, &visible);
+    assert_eq!(adopted as usize, interior);
+    assert_eq!(rig.view.uploads(), 0, "no CPU upload");
+    let step = rig.frame(&context, &mut photo, 1.0, origin);
+    assert!(step.advance.ready);
+    assert_eq!(
+        step.advance.uploaded as usize,
+        visible.len() - interior,
+        "only the edge tiles uploaded"
+    );
+    rig.draw(&context, photo.size, origin, 1.0);
+    let display = rig.read_back(&context);
+    let atlas = atlas_picture(&context, &mut photo, SMALL_VIEW, origin, 1.0);
+    assert!(
+        display == atlas,
+        "the adopted tiles show the atlas's picture"
+    );
+}
+
 #[test]
 fn a_dab_reuploads_only_the_tiles_it_painted() {
     let Some(context) = real_gpu_context() else {
@@ -664,6 +744,73 @@ fn a_dab_reuploads_only_the_tiles_it_painted() {
             Some(photo.store.content_version(surface, *id))
         );
     }
+    assert!(rig.settled(&photo));
+}
+
+/// A pixel undo re-uploads exactly the tiles the stroke touched, through
+/// the app's own undo path (`apply_pixel_step` and `after_undo_redo`).
+#[test]
+fn a_pixel_undo_reuploads_only_the_tiles_the_stroke_touched() {
+    let Some(context) = real_gpu_context() else {
+        return;
+    };
+    let mut photo = build(Shape::Photo, SMALL);
+    let mut rig = Rig::new(&context, &photo, SMALL_VIEW, false, u32::MAX);
+    let reference_origin = crate::composite_reference_origin(&photo.layers, Some(photo.active));
+    let mut history = aurora_brush::PixelHistory::new();
+    let mut snapshot = aurora_brush::StrokeSnapshot::new(photo.active_surface);
+    let outcome = aurora_brush::stamp_dab(
+        &mut photo.store,
+        photo.active_surface,
+        (300.0, 300.0),
+        crate::BRUSH_RADIUS,
+        [0.1, 0.9, 0.1],
+        Some(&mut snapshot),
+    );
+    let touched: Vec<TileId> = outcome.painted().to_vec();
+    assert!(!touched.is_empty());
+    let _ = history.push(snapshot);
+    crate::invalidate_painted_tiles(
+        &mut rig.cache,
+        &photo.layers,
+        photo.active,
+        outcome.painted(),
+        reference_origin,
+    );
+    let _ = rig.settle(&context, &mut photo, 0.4, (0.0, 0.0), 400);
+    let before: Vec<(TileId, Option<u64>)> = photo
+        .all_tiles()
+        .into_iter()
+        .map(|id| (id, rig.view.uploaded_version(id)))
+        .collect();
+    let Some(invalidation) = crate::apply_pixel_step(
+        &photo.layers,
+        &mut history,
+        &mut photo.store,
+        crate::UndoDirection::Undo,
+    ) else {
+        unreachable!("one stroke to undo");
+    };
+    let mut view = aurora_ui::CanvasView::default();
+    crate::after_undo_redo(
+        &mut view,
+        &photo.layers,
+        Some(photo.active),
+        &mut rig.cache,
+        None,
+        &invalidation,
+    );
+    let step = rig.frame(&context, &mut photo, 0.4, (0.0, 0.0));
+    let changed: Vec<TileId> = before
+        .iter()
+        .filter(|(id, version)| rig.view.uploaded_version(*id) != *version)
+        .map(|(id, _)| *id)
+        .collect();
+    // The layer is at the document origin, so its tiles are the composite's.
+    let mut want = touched.clone();
+    want.sort_by_key(|id| (id.y, id.x));
+    assert_eq!(changed, want, "only the undone stroke's tiles");
+    assert_eq!(step.advance.uploaded as usize, touched.len());
     assert!(rig.settled(&photo));
 }
 
@@ -776,6 +923,10 @@ fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str,
     let worker = how == "worker";
     crate::frame_composite::set_parallel_enabled_for_tests(how != "sequential");
     cold_paint(gpu, photo, label, path, how);
+    if std::env::var("AURORA_R11_ONLY").is_ok_and(|v| v == "cold_paint") {
+        crate::frame_composite::set_parallel_enabled_for_tests(false);
+        return;
+    }
     let mut rig = Rig::new(gpu, photo, VIEWPORT, worker, u32::MAX);
     let (zoom, origin) = fit(photo.size);
     let started = Instant::now();
@@ -938,6 +1089,8 @@ fn cold_paint(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path
     let reference_origin = crate::composite_reference_origin(&photo.layers, Some(photo.active));
     let mut frames = Vec::new();
     let mut atlas_frames = 0;
+    let mut prepares = Vec::new();
+    crate::display_view::PHASES.with(|p| p.set([0.0; 4]));
     for step in 0..40_u32 {
         let (x, y) = (64 + step * 96, 32 + step * 48);
         let t0 = Instant::now();
@@ -957,7 +1110,13 @@ fn cold_paint(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path
             reference_origin,
         );
         let dab = ms(t0.elapsed());
+        let before = crate::display_view::PHASES.with(std::cell::Cell::get);
+        let draw_before = DRAW_MS.with(std::cell::Cell::get);
         let step = rig.frame_with(gpu, photo, 1.0, (x as f32, y as f32), Some(&mut residency));
+        let after = crate::display_view::PHASES.with(std::cell::Cell::get);
+        let mut phases: Vec<f64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+        phases.push(DRAW_MS.with(std::cell::Cell::get) - draw_before);
+        prepares.push(phases);
         if !step.advance.ready {
             atlas_frames += 1;
         }
@@ -965,6 +1124,27 @@ fn cold_paint(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path
         // pacing is not).
         frames.push(dab + step.ms);
     }
+    let phase = |k: usize| {
+        let v: Vec<f64> = prepares
+            .iter()
+            .skip(1)
+            .map(|p| p.get(k).copied().unwrap_or(0.0))
+            .collect();
+        stats(&v).0
+    };
+    println!(
+        "R11 cold_paint11_phases doc={label} how={how} composite={:.2} upload={:.2} rest={:.2} \
+         mips={:.2} draw_and_wait={:.2}",
+        phase(0),
+        phase(1),
+        phase(2),
+        phase(3),
+        phase(4)
+    );
+    println!(
+        "R11 cold_paint11_split doc={label} how={how} prepare_gpu_wait_total={:.2}",
+        SPLIT_MS.with(std::cell::Cell::get)
+    );
     let (mean, p90, max, over) = stats(frames.get(1..).unwrap_or_default());
     println!(
         "R11 cold_paint11 doc={label} path={path} how={how} n=39 frame0={:.2} mean={mean:.2} \

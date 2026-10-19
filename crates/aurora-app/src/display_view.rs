@@ -178,6 +178,13 @@ pub(crate) fn visible_tiles(
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: milliseconds spent in [`DisplayView::prepare`]'s phases
+    /// (visible composite, visible upload, background, mips), summed.
+    pub(crate) static PHASES: std::cell::Cell<[f64; 4]> = const { std::cell::Cell::new([0.0; 4]) };
+}
+
 /// A frame drawn from the display texture: where its view is.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DisplayFrame {
@@ -331,6 +338,7 @@ impl DisplayView {
         let in_doc = |id: &TileId| id.x < tiles.0 && id.y < tiles.1;
         let visible: Vec<TileId> = visible.iter().copied().filter(in_doc).collect();
         let mut level0 = level0;
+        let phase_start = Instant::now();
         // 1. The visible tiles current, as the path drawing them would.
         let stale: Vec<TileId> = visible
             .iter()
@@ -386,6 +394,7 @@ impl DisplayView {
                 }
             }
         }
+        let t_composite = phase_start.elapsed();
         // 2. The changed visible tiles uploaded (all of them at or above
         // the atlas floor, so the frame is never staler than the atlas's),
         // unless at or above the floor a visible tile has no content yet:
@@ -402,6 +411,7 @@ impl DisplayView {
         };
         result.uploaded = uploaded;
         result.more |= visible_left;
+        let t_upload = phase_start.elapsed();
         // 3. The rest of the document, in the background: only after
         // `QUIET_FRAMES` frames with the view still and nothing visible
         // stale, composited or uploaded, and (CPU path) the worker idle, so
@@ -435,8 +445,33 @@ impl DisplayView {
                 .any(|&id| !cache.is_current(id) || !self.uploaded_current(store, id));
             result.more |= pending && !worker_busy;
         }
-        // 4. Their mips, on the GPU.
-        let _ = self.texture.regenerate_mips(device, queue);
+        let t_rest = phase_start.elapsed();
+        // 4. Their mips, on the GPU: when this frame samples them (below
+        // 100 %), or on a frame with nothing else to do. A frame at or above
+        // 100 % reads level 0 only, so while painting there the mip passes
+        // (and their render-target transitions of the whole texture) wait.
+        if view.2 < 1.0 || !busy_frame {
+            let _ = self.texture.regenerate_mips(device, queue);
+        } else if self.texture.mips_pending() {
+            result.more = true;
+        }
+        #[cfg(test)]
+        PHASES.with(|p| {
+            let mut v = p.get();
+            let done = phase_start.elapsed();
+            let marks = [
+                t_composite,
+                t_upload - t_composite,
+                t_rest - t_upload,
+                done - t_rest,
+            ];
+            for (sum, mark) in v.iter_mut().zip(marks) {
+                *sum += mark.as_secs_f64() * 1000.0;
+            }
+            p.set(v);
+        });
+        #[cfg(not(test))]
+        let _ = (t_composite, t_upload, t_rest);
         result.ready = visible.iter().all(|&id| self.uploaded_current(store, id));
         result
     }
@@ -470,6 +505,49 @@ impl DisplayView {
             }
         }
         (uploaded, false)
+    }
+
+    /// After the atlas drew a frame in this view's place (at or above its
+    /// floor, a visible tile not uploaded here yet): adopts the visible
+    /// tiles the atlas now holds at the store's current content by a GPU
+    /// copy, so the tiles the atlas has just uploaded are not uploaded a
+    /// second time from the CPU when this view takes over. Edge tiles (whose
+    /// outside texels this view masks) are left to the ordinary upload.
+    /// Returns the tiles adopted.
+    pub(crate) fn adopt_from_atlas(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        atlas: &aurora_gpu::TileResidency,
+        store: &aurora_tile::TileStore,
+        visible: &[TileId],
+    ) -> u32 {
+        let surface = crate::composite_surface_id();
+        let mut wanted = Vec::new();
+        let mut versions = Vec::new();
+        for &id in visible {
+            if !store.contains_tile(surface, id)
+                || store.is_dirty(surface, id)
+                || self.uploaded_current(store, id)
+                || !self.texture.tile_is_interior(id)
+            {
+                continue;
+            }
+            if let Some(origin) = atlas.slot_origin(id) {
+                wanted.push((id, origin));
+                versions.push((id, store.content_version(surface, id)));
+            }
+        }
+        if wanted.is_empty() {
+            return 0;
+        }
+        let copied = self
+            .texture
+            .copy_tiles_from(device, queue, atlas.texture(), &wanted);
+        self.uploaded.extend(versions);
+        // Their mips wait for the next `prepare` that needs them (this is a
+        // frame at or above 100 %).
+        copied
     }
 
     /// Writes the view's uniforms: `origin` the document position at the
