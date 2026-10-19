@@ -47,36 +47,10 @@ pub struct CanvasPipeline {
 impl CanvasPipeline {
     #[must_use]
     pub fn new(device: &wgpu::Device) -> Self {
+        let entries = layout_entries();
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some(LABEL),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
+            entries: &entries,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(LABEL),
@@ -157,28 +131,112 @@ impl CanvasPipeline {
     /// sampler, and pan/zoom uniform — cheap enough to rebuild every
     /// frame (three references, no data copy) rather than caching, the
     /// same "just build it" choice `TileCompositor::composite_over`
-    /// already makes for its own per-call bind group.
+    /// already makes for its own per-call bind group. The partner slots
+    /// (task 140) hold `residency` itself, so whatever its blend weight,
+    /// nothing but its own atlas is ever shown.
     #[must_use]
     pub fn bind_group(&self, device: &wgpu::Device, residency: &TileResidency) -> wgpu::BindGroup {
+        self.bind_group_blended(device, residency, residency)
+    }
+
+    /// [`Self::bind_group`] with `partner` bound as the second atlas (task
+    /// 140): the canvas shows `mix(primary, partner, w)` in premultiplied
+    /// space, `w` being `primary`'s
+    /// [`TileResidency::set_blend_weight`]. `partner` is sampled through
+    /// `primary`'s sampler, at the `uv` its own uniform maps the viewport
+    /// to; the document clip, checkerboard and channel gain are
+    /// `primary`'s. With `w == 0.0` the partner is never sampled.
+    #[must_use]
+    pub fn bind_group_blended(
+        &self,
+        device: &wgpu::Device,
+        primary: &TileResidency,
+        partner: &TileResidency,
+    ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(LABEL),
             layout: &self.layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(residency.view()),
+                    resource: wgpu::BindingResource::TextureView(primary.view()),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(residency.sampler()),
+                    resource: wgpu::BindingResource::Sampler(primary.sampler()),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: residency.uniform_buffer().as_entire_binding(),
+                    resource: primary.uniform_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(partner.view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: partner.uniform_buffer().as_entire_binding(),
                 },
             ],
         })
     }
+}
+
+/// The canvas bind group's layout: the atlas, its sampler and uniform, and
+/// (task 140) the partner atlas and its uniform. One definition, used by
+/// [`CanvasPipeline::new`] and the tests' own pipeline builder.
+#[must_use]
+pub(crate) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
+    [
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 2,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+        // Task 140: the partner atlas (the next pyramid level) and
+        // its own uniform, whose `uv` mapping places it.
+        wgpu::BindGroupLayoutEntry {
+            binding: 3,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 4,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+    ]
 }
 
 impl std::fmt::Debug for CanvasPipeline {
