@@ -291,3 +291,60 @@ A vsync-on measurement needs a real display: the gdm session's `:0` is not reach
 - A real monitor with vblank.
 - Brush latency proper (pen to photon); input->frame is an approximation.
 - Nyepi's Aurora pan stall: not confirmed with a log.
+
+## Display texture (0.280.0)
+
+Re-measured on 2026-10-19 with branch `142-gpu_display_texture` at `aba5a5c`, release build. The harness and method are unchanged (Xvfb, XTEST, X DAMAGE, `novsync`, 6 s per scenario, wheel 120 notches/s in bursts of 12). There were three interleaved rounds, each launching three variants per file, idle then with 8 `yes` processes:
+
+- Aurora `on`: the display texture is chosen by budget (the default).
+- Aurora `off`: the same binary with `AURORA_DISPLAY_TEXTURE=0` (the 0.279.0 atlas and pyramid paths).
+- PhotoCraft: a reference.
+
+That makes 54 launches. The quiet gate held before all 54 (`gate_met`: idle runs waited for 1-minute load under 1.0, and no cargo or rustc ran before any launch). The data is in `aurora-photocraft-work/s4/` (`<variant>-r<round>/results.json`, `run.log`, `agg.py`). Cells are min–max over the 3 rounds.
+
+**Wheel zoom** (fit, then 12 notches in and 12 out):
+
+| File | Mode | Aurora off | Aurora on | PhotoCraft |
+|---|---|---|---|---|
+| synthetic-60mp-flat | idle | 33–77 fps, p95 24.8–62.7 ms, 30–82 % over | 120 fps, p95 8.9 ms, 0.0–0.1 % over | 161–162 fps, p95 6.8 ms, 0.1–0.2 % |
+| synthetic-60mp-flat | loaded | 46–54 fps, p95 40–45 ms, 42–56 % | 103–108 fps, p95 14.3–15.1 ms, 0.9–1.9 % | 115–136 fps, p95 11.5–11.8 ms, 0.7–1.3 % |
+| synthetic-24mp-layers | idle | 112–113 fps, p95 20.1–20.7 ms, 8.8–9.1 % | 120–121 fps, p95 8.9–9.0 ms, 0.0 % | 161–163 fps, p95 6.7–7.0 ms, 0.1–0.2 % |
+| synthetic-24mp-layers | loaded | 69–76 fps, p95 28–33 ms, 23–30 % | 104–108 fps, p95 14.2–15.6 ms, 1.2–2.9 % | 128–141 fps, p95 11.0–12.5 ms, 0.2–2.1 % |
+| Nyepi (6739968.psd) | idle | 109–114 fps, p95 16.2–16.6 ms, 2.6–4.6 % | 120–121 fps, p95 10.1 ms, 0.1–0.3 % | 152–157 fps, p95 7.0–7.6 ms, 0.1 % |
+| Nyepi | loaded | 58–69 fps, p95 27–36 ms, 27–38 % | 77–88 fps, p95 17.1–20.0 ms, 5–16 % | 122–132 fps, p95 10.3–13.1 ms, 0.6–1.4 % |
+
+**Zoom input to frame, p95:**
+
+| File | Aurora off | Aurora on | PhotoCraft |
+|---|---|---|---|
+| 60 MP flat idle | 19–50 ms | 6.0–6.2 ms | 5.9 ms |
+| 60 MP flat loaded | 34–40 ms | 11.6–12.7 ms | 8.4–9.6 ms |
+| 24 MP layers idle | 15.2–15.6 ms | 5.8–5.9 ms | 5.9 ms |
+| 24 MP layers loaded | 23–28 ms | 11.2–12.7 ms | 8.0–10.7 ms |
+| Nyepi idle | 13–15 ms | 8.8–8.9 ms | 6.2 ms |
+| Nyepi loaded | 25–36 ms | 14.5–24.4 ms | 7.3–10.2 ms |
+
+**Pan at 100 %** (on against off; this path is meant to be unchanged):
+- 60 MP flat: idle 225–230 against 229–235 fps; loaded 131–145 against 141–145 fps.
+- 24 MP layers: idle 227–232 against 232–236 fps; loaded 142–147 against 142–147 fps.
+- Nyepi: idle 132–136 against 136 fps; loaded 81–86 against 79–86 fps.
+- p95 and % over overlap in every pan cell.
+
+**Brush at 100 %** (on against off): idle within noise or slightly better on; loaded mixed and overlapping. For example 60 MP flat loaded is 68–70 against 72–73 fps, and Nyepi loaded is 47–52 against 50–60 fps (53.8–62.3 against 37.8–55.2 % over). PhotoCraft is faster on every brush cell under load.
+
+**Reading:**
+- With the display texture, Aurora's wheel zoom no longer drops frames idle: 0.0–0.3 % over 16.7 ms against 2.6–82 % before, and input to frame matches PhotoCraft's (about 6 ms).
+- Under load it is 1–3 % over on the synthetic files (PhotoCraft 0.2–2.1 %). Nyepi is still 5–16 % over (PhotoCraft about 1 %).
+- Aurora's zoom fps reads 120 because it presents one frame per wheel notch (frames equal inputs, 720 of 720). PhotoCraft presents more frames than inputs, so fps is not comparable between the apps here; % over and p95 are.
+
+**Caveats:**
+- Xvfb has no vblank and every frame is copied back to the CPU; absolute numbers belong to this present path.
+- Every document here fits the display budget, so `on` uses the texture on all three files. The app logs show:
+  - 60 MP flat: 9486 × 6324, 2 pages, 666 MiB.
+  - 24 MP layers: 6000 × 4000, 1 page.
+  - Nyepi: a 1080 × 1920 canvas, 1 page, about 21 MiB.
+- None of these files is over budget. That case (above about 96 MP on an 8,192-limit device) keeps the old paths and was not measured here.
+- Nyepi composites on the CPU path. There Aurora draws the 1:1 atlas at and above its floor and the display texture only below it, so its pan and brush (at 100 %) are the old path by design. Its loaded zoom misses are not analysed.
+- Not comparable cases (NC) as before: PhotoCraft's Nyepi brush differs in what it composites (stage 2's earlier caveat). layer_effects and curve-02 were not re-run.
+- VRAM was not read from the driver; the sizes above are the texture's own accounting.
+- Linux, RTX 3090, i3-10100 only; the Mac and Windows were not run here.
