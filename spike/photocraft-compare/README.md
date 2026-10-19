@@ -198,7 +198,7 @@ The decode itself is always whole.
 
 Stage 2 runs the two **live, windowed apps** and times their presented frames
 from outside, the same way for both. Results and the full caveat list are in
-`stage2/FINDINGS-stage2.txt` (to be renamed `FINDINGS-stage2.md`).
+`FINDINGS-stage2.md`.
 
 ### Method (Linux)
 

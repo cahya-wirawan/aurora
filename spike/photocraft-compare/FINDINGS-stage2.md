@@ -50,7 +50,7 @@ This supersedes an earlier pass whose "idle" runs overlapped another build's `ca
 
 ## Results (main matrix, AutoNoVsync)
 
-How to read the tables:
+How to read the tables (rows marked NC are not comparable; see "Not comparable"):
 - ranges are min-max over the 3 runs, one value per run;
 - `over %` is the share of frame intervals above 16.7 ms;
 - `input->frame p50` is the median time from an injected event to the next presented frame. It includes X and the copy present, so it approximates latency;
@@ -85,7 +85,7 @@ How to read the tables:
 | curve-02.jpg | aurora | 3 | 122-123 | 8.2 | 8.0-8.1 | 20.0-20.1 | 22 | 24 | 8 | 4.8-4.9 | 81 | 26 |
 | curve-02.jpg | photocraft | 3 | 164-166 | 6.0-6.1 | 5.8-5.9 | 6.6 | 7-8 | 67-79 | 0 | 3.0 | 73-74 | 29 |
 | layer_effects.psd | aurora | 3 | 120-121 | 8.3 | 8.3 | 9.8 | 10 | 11-17 | 0 | 5.0-5.1 | 59 | 20 |
-| layer_effects.psd | photocraft | 3 | 158-196 | 5.1-6.3 | 4.9-6.0 | 5.7-7.1 | 6-8 | 71-81 | 0-1 | 2.5-3.1 | 74-90 | 27-33 |
+| layer_effects.psd (NC) | photocraft | 3 | 158-196 | 5.1-6.3 | 4.9-6.0 | 5.7-7.1 | 6-8 | 71-81 | 0-1 | 2.5-3.1 | 74-90 | 27-33 |
 | synthetic-24mp-flat.png | aurora | 3 | 96-98 | 10.2-10.4 | 6.2-6.4 | 27.0-27.1 | 28 | 30-35 | 19-21 | 6.0-6.3 | 98-99 | 25-26 |
 | synthetic-24mp-flat.png | photocraft | 3 | 164-206 | 4.8-6.1 | 4.7-5.9 | 5.4-6.8 | 6-7 | 66-76 | 0 | 2.6-3.0 | 74-90 | 29-36 |
 | synthetic-24mp-layers.psd | aurora | 3 | 111-112 | 8.9-9.0 | 6.8 | 20.1-20.4 | 22-23 | 23-25 | 9 | 5.2-5.4 | 97-98 | 28-30 |
@@ -100,11 +100,11 @@ How to read the tables:
 | file | app | n | fps | mean ms | p50 | p95 | p99 | max | over % | input->frame p50 | CPU % | GPU % mean |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 6739968.psd | aurora | 3 | 77 | 13.0 | 12.9-13.0 | 17.5-17.8 | 20-22 | 51-81 | 8-11 | 6.5 | 581-590 | 14 |
-| 6739968.psd | photocraft | 3 | 159-194 | 5.1-6.3 | 5.0-6.2 | 5.7-6.9 | 6-7 | 9-23 | 0 | 2.7-3.2 | 77-92 | 28-34 |
+| 6739968.psd (NC) | photocraft | 3 | 159-194 | 5.1-6.3 | 5.0-6.2 | 5.7-6.9 | 6-7 | 9-23 | 0 | 2.7-3.2 | 77-92 | 28-34 |
 | curve-02.jpg | aurora | 3 | 216-225 | 4.4-4.6 | 4.1-4.2 | 6.3-6.7 | 7-8 | 8-32 | 0 | 2.5-2.9 | 94-95 | 30-33 |
 | curve-02.jpg | photocraft | 3 | 156-157 | 6.4 | 6.2 | 7.4-7.5 | 8 | 8-9 | 0 | 3.2-3.3 | 77-78 | 35 |
 | layer_effects.psd | aurora | 3 | 96-98 | 10.1-10.4 | 10.5-10.6 | 16.2-16.3 | 18-20 | 136-208 | 3-4 | 5.0-5.1 | 100-101 | 17-18 |
-| layer_effects.psd | photocraft | 3 | 162-200 | 5.0-6.2 | 4.9-6.0 | 5.6-7.1 | 6-8 | 7-20 | 0 | 2.6-3.2 | 75-92 | 27-34 |
+| layer_effects.psd (NC) | photocraft | 3 | 162-200 | 5.0-6.2 | 4.9-6.0 | 5.6-7.1 | 6-8 | 7-20 | 0 | 2.6-3.2 | 75-92 | 27-34 |
 | synthetic-24mp-flat.png | aurora | 3 | 202-207 | 4.8-5.0 | 4.1-4.2 | 7.6-8.2 | 9-10 | 10-11 | 0 | 2.3-2.6 | 97-98 | 34-35 |
 | synthetic-24mp-flat.png | photocraft | 3 | 158-213 | 4.7-6.3 | 4.4-6.1 | 5.8-7.5 | 6-8 | 9-20 | 0 | 2.4-3.2 | 76-90 | 32-35 |
 | synthetic-24mp-layers.psd | aurora | 3 | 173-184 | 5.4-5.8 | 4.3-4.5 | 8.5-9.6 | 11 | 14-257 | 0 | 2.7-2.8 | 92-95 | 31-34 |
@@ -142,7 +142,7 @@ How to read the tables:
 | curve-02.jpg | aurora | 3 | 80-86 | 11.6-12.5 | 8.7-9.9 | 29.2-32.6 | 38-41 | 43-46 | 17-19 | 6.3-6.6 | 52-57 | 18-19 |
 | curve-02.jpg | photocraft | 3 | 128-143 | 7.0-7.8 | 6.4-6.8 | 9.9-12.2 | 15 | 64-74 | 0 | 3.3-4.0 | 53-67 | 22-25 |
 | layer_effects.psd | aurora | 3 | 99-102 | 9.8-10.1 | 9.5-10.2 | 15.6-16.0 | 18-19 | 19-27 | 2-4 | 5.0-5.3 | 43-44 | 17-18 |
-| layer_effects.psd | photocraft | 3 | 131-135 | 7.4-7.6 | 6.8-6.9 | 10.7-11.9 | 14-16 | 69-71 | 0-1 | 3.7-3.8 | 65-68 | 23 |
+| layer_effects.psd (NC) | photocraft | 3 | 131-135 | 7.4-7.6 | 6.8-6.9 | 10.7-11.9 | 14-16 | 69-71 | 0-1 | 3.7-3.8 | 65-68 | 23 |
 | synthetic-24mp-flat.png | aurora | 3 | 49-55 | 18.3-20.5 | 16.5-16.8 | 37.4-50.8 | 52-80 | 56-101 | 49-51 | 10.2-12.7 | 68-78 | 14-16 |
 | synthetic-24mp-flat.png | photocraft | 3 | 134-143 | 7.0-7.5 | 6.4-6.5 | 10.1-12.5 | 14-17 | 62-72 | 0-1 | 3.4-3.7 | 60-68 | 24-26 |
 | synthetic-24mp-layers.psd | aurora | 3 | 68-73 | 13.7-14.7 | 11.2-11.6 | 31.5-33.4 | 39-47 | 46-60 | 28-32 | 7.5-8.1 | 68-74 | 19-20 |
@@ -157,11 +157,11 @@ How to read the tables:
 | file | app | n | fps | mean ms | p50 | p95 | p99 | max | over % | input->frame p50 | CPU % | GPU % mean |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 6739968.psd | aurora | 3 | 51-58 | 17.2-19.8 | 14.5-19.4 | 30.7-35.7 | 43-49 | 49-87 | 40-59 | 8.6-9.9 | 251-254 | 9-11 |
-| 6739968.psd | photocraft | 3 | 126-131 | 7.6-7.9 | 6.8-7.2 | 11.8-12.5 | 15-19 | 19-25 | 0-2 | 3.7-3.9 | 63-68 | 21-23 |
+| 6739968.psd (NC) | photocraft | 3 | 126-131 | 7.6-7.9 | 6.8-7.2 | 11.8-12.5 | 15-19 | 19-25 | 0-2 | 3.7-3.9 | 63-68 | 21-23 |
 | curve-02.jpg | aurora | 3 | 81-87 | 11.5-12.3 | 11.1-12.1 | 17.3-18.6 | 21-22 | 32-72 | 8-12 | 5.8-6.3 | 39-43 | 22-23 |
 | curve-02.jpg | photocraft | 3 | 77-82 | 12.3-13.0 | 11.9-12.6 | 18.8-20.3 | 23-29 | 32-53 | 13-17 | 5.9-6.3 | 36-37 | 20-21 |
 | layer_effects.psd | aurora | 3 | 47-51 | 19.5-21.3 | 16.5-18.9 | 33.7-36.2 | 45-67 | 77-107 | 50-58 | 9.7-10.6 | 71-77 | 9-10 |
-| layer_effects.psd | photocraft | 3 | 131-139 | 7.2-7.6 | 6.8-7.0 | 10.4-12.1 | 14-15 | 22-25 | 0-1 | 3.5-3.9 | 65-71 | 22-24 |
+| layer_effects.psd (NC) | photocraft | 3 | 131-139 | 7.2-7.6 | 6.8-7.0 | 10.4-12.1 | 14-15 | 22-25 | 0-1 | 3.5-3.9 | 65-71 | 22-24 |
 | synthetic-24mp-flat.png | aurora | 3 | 72-75 | 13.4-13.8 | 13.2-13.6 | 21.3-22.5 | 25-26 | 28-39 | 19-21 | 6.7-6.9 | 41-42 | 20 |
 | synthetic-24mp-flat.png | photocraft | 3 | 106-127 | 7.9-9.5 | 7.4-8.2 | 12.7-15.5 | 16-19 | 19-37 | 1-4 | 4.0-4.7 | 54-71 | 27-32 |
 | synthetic-24mp-layers.psd | aurora | 3 | 67-68 | 14.6-14.9 | 14.2-14.6 | 22.2-23.3 | 28 | 32-45 | 25-33 | 7.2-7.3 | 41-42 | 19-20 |
@@ -204,13 +204,21 @@ How to read the tables:
   - The share of frames over budget rounds to 0 % for both apps on every file.
   - Single frames still exceed 16.7 ms in some runs: Aurora up to 28 ms on curve-02 and 20 ms on 60 MP, PhotoCraft up to 21 ms. The exception is Aurora's Nyepi stall (below).
   - On Nyepi Aurora is slower (132-135 against 163-199 fps). Its frames are still within budget apart from that one stall.
-- **Pan, loaded: about even.** The ranges overlap on every file except Nyepi: Aurora 78-86 fps with 9-15 % of frames over budget, PhotoCraft 136-138 fps with 0-1 %.
-- **Zoom: the clearest difference. PhotoCraft is smoother, in both modes and on every file.**
-  - Idle, Aurora (0.278.0, with smooth blending): 75-123 fps, p95 9.8-27 ms, 0-31 % of frames over budget. Worst on the 60 MP flat file: 75-80 fps, 28-31 % over.
-  - Idle, PhotoCraft: 157-206 fps, p95 5.4-7.1 ms, 0-1 % over.
-  - Loaded, Aurora: 46-102 fps with 2-64 % over (24 MP and 60 MP flat 49-55 and 46-53 fps, 49-64 % over). PhotoCraft: 128-144 fps, 0-1 % over.
+- **Pan, loaded: PhotoCraft is faster on three files; the other four overlap.**
+  - Nyepi: Aurora 78-86 fps with 9-15 % of frames over budget, PhotoCraft 136-138 fps with 0-1 %.
+  - synthetic 24 MP flat: Aurora 139-145 fps (mean 6.9-7.2 ms), PhotoCraft 150-158 fps (mean 6.3-6.7 ms).
+  - synthetic 24 MP layers: Aurora 136-146 fps, PhotoCraft 148-152 fps.
+  - The two 24 MP gaps are small, and both apps keep their frames over budget at about 1 % or less.
+  - curve-02, layer_effects and both 60 MP files overlap.
+- **Zoom: the clearest difference. PhotoCraft is smoother, in both modes and on every comparable file.**
+  - layer_effects.psd is excluded: PhotoCraft never zooms there, because a dialog stays up (see NC).
+  - Ranges below cover the other six files.
+  - Idle, Aurora (0.278.0, with smooth blending): 75-123 fps, p95 16.5-27 ms, 4-31 % of frames over budget. Worst on the 60 MP flat file: 75-80 fps, 28-31 % over. (Aurora's layer_effects row alone is 120-121 fps with 0 % over.)
+  - Idle, PhotoCraft: 157-206 fps, p95 5.4-7.0 ms, under 1 % over.
+  - Loaded, Aurora: 46-86 fps with 17-64 % over; the 24 MP and 60 MP flat files are 49-55 and 46-53 fps with 49-64 % over. (layer_effects alone: 99-102 fps, 2-4 % over.)
+  - Loaded, PhotoCraft: 128-144 fps, 0-1 % over.
   - Part of the gap is structural. Aurora draws one frame per notch (at most 120 fps here); PhotoCraft's glide adds frames that move by less than a notch.
-  - The input->frame time is the fairer comparison: Aurora 4.3-7.3 ms idle and 5.0-12.7 ms loaded, against PhotoCraft 2.5-3.1 and 3.3-4.0.
+  - The input->frame time is the fairer comparison (six files): Aurora 4.3-7.3 ms idle and 6.3-12.7 ms loaded, against PhotoCraft 2.5-3.1 and 3.3-4.0.
 - **Brush, idle:**
   - Aurora is faster on curve-02 (216-225 against 156-157 fps) and on 60 MP layers (191-195 against 170-172). The other files overlap.
   - On Nyepi and layer_effects Aurora paints at 77 and 96-98 fps, and on Nyepi it uses 5.8-5.9 cores (581-590 % CPU). PhotoCraft does not paint on those two files (see NC), so they cannot be compared.
@@ -218,25 +226,35 @@ How to read the tables:
   - On the synthetic files PhotoCraft is faster: 24 MP flat 106-127 against 72-75 fps; 24 MP layers 100-113 against 67-68; 60 MP flat 90-101 against 71-75; 60 MP layers 84-86 against 64-68.
   - Aurora's frames go over budget 18-35 % of the time there, PhotoCraft's 1-13 %.
   - curve-02 overlaps.
-- **Aurora's CPU use is higher in idle pan and brush** (about 91-99 % of one core against PhotoCraft's 73-93 %), while it also presents more frames.
+
+## Where the ranges overlap
+
+- **CPU use, idle pan and brush:** Aurora uses about 91-99 % of one core (Nyepi 111-113 % in pan and 581-590 % in brush); PhotoCraft uses 73-93 %.
+- On most files these ranges overlap, because PhotoCraft's run-to-run range is wide (for example idle pan on 24 MP flat: 91-92 % against 73-91 %).
+- Where Aurora's CPU is higher, it usually also presents more frames.
+- So no per-frame CPU conclusion is drawn.
 
 ## Vsync ON (Fifo) pass
 
-The Fifo pass gives the same numbers as AutoNoVsync, within run-to-run ranges (tables below). Both apps still reach 110-235 fps under Fifo. The reason is Xvfb, not the apps:
+The Fifo pass gives the same numbers as AutoNoVsync, within run-to-run ranges (tables above). Both apps still reach 110-235 fps under Fifo. The reason is Xvfb, not the apps:
 - Xvfb has no display and no vblank;
 - the NVIDIA X11 path on a non-NVIDIA X server presents by copying each frame, so Fifo is not paced to a refresh rate here.
 
 So this machine cannot put a 60 Hz cap on record, and the "vsync off" numbers above are uncapped. On a real 60 Hz monitor with Fifo:
 - both apps would be capped at 60 fps, and every interval shorter than 16.7 ms would read as 16.7 ms;
 - the only columns that would survive are the share of frames over budget, the p95/p99/max where they exceed 16.7 ms, and input->frame;
-- under that cap, pan and idle brush would look identical in both apps (60 fps), while Aurora's zoom (8-31 % idle and 2-64 % loaded over budget) and its loaded brush would still drop frames.
+- under that cap, pan and idle brush would look identical in both apps (60 fps), while Aurora's zoom (4-31 % idle and 17-64 % loaded over budget, on the six comparable files) and its loaded brush would still drop frames.
 
 A vsync-on measurement needs a real display: the gdm session's `:0` is not reachable from this account, or the Mac's Metal HUD.
 
 ## The long single frames (one line each)
 
-- **PhotoCraft, 60-85 ms in every zoom run:** in every run it falls 6.26-6.27 s after the first notch, i.e. 0.26 s after the last one. It is the last frame of the zoom glide, about 70 ms after the frame before it: the end of the animation, outside the input period, not a stall while zooming. It is usually the only over-budget interval in a PhotoCraft zoom run (over % 0-1).
-- **Aurora, 254-275 ms in every Nyepi pan run (123-207 ms loaded):** one frame per run, 0.43-0.44 s into the pan (interval 52-57), about when the circle has first carried the view about 450 px from its start and exposed document area that was not in the initial view. Likely the first build of the newly exposed tiles on the CPU compositing path (Nyepi's effects and groups keep it off the GPU). Not confirmed with a log.
+- **PhotoCraft, 60-85 ms in every zoom run:** in every run it falls 6.26-6.28 s after the first notch, i.e. 0.26 s after the last one. It is the last frame of the zoom glide, about 70 ms after the frame before it: the end of the animation, outside the input period, not a stall while zooming. It is usually the only over-budget interval in a PhotoCraft zoom run (over % 0-1).
+- **Aurora, one long frame in every Nyepi pan run: 254-275 ms idle, 123-207 ms loaded.**
+  - Idle, it falls 0.43-0.44 s into the pan (interval 52-57). That is about when the circle has first carried the view about 450 px from its start and exposed document area that was not in the initial view.
+  - Loaded, it falls later, 1.40-1.41 s in (interval 80-105). The 450 px reading is for idle only; why the frame comes later under load is not established.
+  - Likely cause in both modes: the first build of newly exposed tiles on the CPU compositing path (Nyepi's effects and groups keep it off the GPU).
+  - Inferred from the timing only; not confirmed with a log.
 - **Aurora, the brush maxima** (Nyepi 51-81 ms, layer_effects 136-208 ms, 24 MP layers 242-257 ms in 2 of 3 runs): these fall 6.09-6.29 s after the first event, i.e. at the button release. That is the stroke-end commit (the stroke's undo snapshot is packed on the UI thread at stroke end), outside the drag. Inferred from the timing only.
 
 ## Not comparable (NC), from the screenshots
