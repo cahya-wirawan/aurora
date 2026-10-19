@@ -27567,22 +27567,63 @@ fn composite_document(
         let tile_size = aurora_tile::TILE;
         let tiles_x = width.div_ceil(tile_size);
         let tiles_y = height.div_ceil(tile_size);
+        let tiles: Vec<aurora_tile::TileId> = (0..tiles_y)
+            .flat_map(|y| (0..tiles_x).map(move |x| aurora_tile::TileId { x, y }))
+            .collect();
+        let mut place = |tile_id: aurora_tile::TileId, composited: &[half::f16]| {
+            let origin_x = tile_id.x * tile_size;
+            let origin_y = tile_id.y * tile_size;
+            let w = (width - origin_x).min(tile_size);
+            let h = (height - origin_y).min(tile_size);
+            for ly in 0..h {
+                let dst_start = ((origin_y + ly) as usize * width as usize + origin_x as usize)
+                    * aurora_tile::CHANNELS;
+                let dst_end = dst_start + (w as usize) * aurora_tile::CHANNELS;
+                let src_start = (ly * tile_size) as usize * aurora_tile::CHANNELS;
+                let src_end = src_start + (w as usize) * aurora_tile::CHANNELS;
+                if let (Some(dst), Some(src)) = (
+                    samples.get_mut(dst_start..dst_end),
+                    composited.get(src_start..src_end),
+                ) {
+                    dst.copy_from_slice(src);
+                }
+            }
+        };
 
-        for ty in 0..tiles_y {
-            for tx in 0..tiles_x {
-                let tile_id = aurora_tile::TileId { x: tx, y: ty };
-                let doc_origin = (
-                    i64::from(tx) * i64::from(tile_size),
-                    i64::from(ty) * i64::from(tile_size),
+        // `(0, 0)` as the reference origin: an export always measures
+        // from the document's own origin, unlike the on-screen path,
+        // which measures from the viewport. The fold count is only of
+        // interest to `recomposite_visible_tiles`'s own diagnostic split;
+        // an export composites every tile either way.
+        //
+        // Many tiles go to the frame pool (0.277.0): the calling thread
+        // composites with this same pass budget and the pool's helpers
+        // help; every tile is what the loop below computes for it
+        // (`frame_composite`'s module documentation), and an unreadable
+        // tile is still read, and counted, by this thread.
+        let pooled = frame_composite::parallel_enabled()
+            && tiles.len() >= frame_composite::MIN_PARALLEL_TILES
+            && frame_composite::frame_pool().is_some_and(|pool| {
+                let scope = frame_composite::Scope::of(layers, &tiles, (0, 0));
+                if !scope.is_bounded(tiles.len()) {
+                    return false;
+                }
+                frame_composite::composite_tiles_with_budget(
+                    pool,
+                    scope,
+                    &tiles,
+                    layers,
+                    store,
+                    (0, 0),
+                    &mut budget,
+                    |_store, tile_id, composited, _folded| place(tile_id, &composited),
                 );
-
+                true
+            });
+        if !pooled {
+            for &tile_id in &tiles {
+                let doc_origin = composite_tile_doc_origin((0, 0), tile_id);
                 budget.next_tile(layers);
-                // `(0, 0)` as the reference origin: an export always
-                // measures from the document's own origin, unlike the
-                // on-screen path, which measures from the viewport.
-                // The fold count is only of interest to
-                // `recomposite_visible_tiles`'s own diagnostic split; an
-                // export composites every tile either way.
                 let (composited, _folded) = composite_roots_into_tile(
                     layers,
                     store,
@@ -27591,24 +27632,7 @@ fn composite_document(
                     (0, 0),
                     &mut budget,
                 );
-
-                let origin_x = tx * tile_size;
-                let origin_y = ty * tile_size;
-                let w = (width - origin_x).min(tile_size);
-                let h = (height - origin_y).min(tile_size);
-                for ly in 0..h {
-                    let dst_start = ((origin_y + ly) as usize * width as usize + origin_x as usize)
-                        * aurora_tile::CHANNELS;
-                    let dst_end = dst_start + (w as usize) * aurora_tile::CHANNELS;
-                    let src_start = (ly * tile_size) as usize * aurora_tile::CHANNELS;
-                    let src_end = src_start + (w as usize) * aurora_tile::CHANNELS;
-                    if let (Some(dst), Some(src)) = (
-                        samples.get_mut(dst_start..dst_end),
-                        composited.get(src_start..src_end),
-                    ) {
-                        dst.copy_from_slice(src);
-                    }
-                }
+                place(tile_id, &composited);
             }
         }
 
