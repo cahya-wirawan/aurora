@@ -185,13 +185,6 @@ pub(crate) fn visible_tiles(
         .collect()
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Test-only: milliseconds spent in [`DisplayView::prepare`]'s phases
-    /// (visible composite, visible upload, background, mips), summed.
-    pub(crate) static PHASES: std::cell::Cell<[f64; 4]> = const { std::cell::Cell::new([0.0; 4]) };
-}
-
 /// A frame drawn from the display texture: where its view is.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DisplayFrame {
@@ -347,7 +340,6 @@ impl DisplayView {
         let in_doc = |id: &TileId| id.x < tiles.0 && id.y < tiles.1;
         let visible: Vec<TileId> = visible.iter().copied().filter(in_doc).collect();
         let mut level0 = level0;
-        let phase_start = Instant::now();
         // 1. The visible tiles current, as the path drawing them would. At
         // or above the atlas floor that is the atlas's own tile list (its
         // grid, a tile wider than the view), so a frame that falls back to
@@ -374,55 +366,19 @@ impl DisplayView {
         // measured slower than the atlas alone), and composites for itself.
         let atlas_draws = one_to_one && !gpu_path;
         if !stale.is_empty() && !atlas_draws {
-            match (&mut level0, one_to_one) {
-                (Level0::Worker(worker), true) => crate::dispatch_or_composite_tiles(
-                    &composite_set,
-                    layers,
-                    active_layer,
-                    store,
-                    cache,
-                    worker,
-                ),
-                (Level0::Worker(worker), false) => {
-                    result.more |= crate::dispatch_or_composite_tiles_bounded(
-                        &visible,
-                        layers,
-                        active_layer,
-                        store,
-                        cache,
-                        worker,
-                        Some(zoomed_view::LEVEL0_FRAME_BUDGET),
-                    );
-                }
-                (Level0::Sync(gpu, compositor), true) => {
-                    crate::recomposite_tiles(
-                        &composite_set,
-                        layers,
-                        active_layer,
-                        store,
-                        cache,
-                        *gpu,
-                        compositor.as_deref_mut(),
-                    );
-                    result.composited += stale.len();
-                }
-                (Level0::Sync(gpu, compositor), false) => {
-                    let (done, more) = zoomed_view::recomposite_within_budget(
-                        &stale,
-                        layers,
-                        active_layer,
-                        store,
-                        cache,
-                        *gpu,
-                        compositor.as_deref_mut(),
-                        zoomed_view::LEVEL0_FRAME_BUDGET,
-                    );
-                    result.composited += done;
-                    result.more |= more;
-                }
-            }
+            let (done, more) = composite_visible(
+                &composite_set,
+                &stale,
+                layers,
+                active_layer,
+                store,
+                cache,
+                &mut level0,
+                one_to_one,
+            );
+            result.composited += done;
+            result.more |= more;
         }
-        let t_composite = phase_start.elapsed();
         // 2. The changed visible tiles uploaded (all of them at or above
         // the atlas floor, so the frame is never staler than the atlas's),
         // unless at or above the floor a visible tile has no content yet:
@@ -442,7 +398,6 @@ impl DisplayView {
         };
         result.uploaded = uploaded;
         result.more |= visible_left;
-        let t_upload = phase_start.elapsed();
         // 3. The rest of the document, in the background: only after
         // `QUIET_FRAMES` frames with the view still and nothing visible
         // stale, composited or uploaded, and (CPU path) the worker idle, so
@@ -477,7 +432,6 @@ impl DisplayView {
                 .any(|&id| !cache.is_current(id) || !self.uploaded_current(store, id));
             result.more |= pending && !worker_busy;
         }
-        let t_rest = phase_start.elapsed();
         // 4. Their mips, on the GPU: when this frame samples them (below
         // 100 %), or on a frame with nothing else to do. A frame at or above
         // 100 % reads level 0 only, so while painting there the mip passes
@@ -487,23 +441,6 @@ impl DisplayView {
         } else if self.texture.mips_pending() {
             result.more = true;
         }
-        #[cfg(test)]
-        PHASES.with(|p| {
-            let mut v = p.get();
-            let done = phase_start.elapsed();
-            let marks = [
-                t_composite,
-                t_upload - t_composite,
-                t_rest - t_upload,
-                done - t_rest,
-            ];
-            for (sum, mark) in v.iter_mut().zip(marks) {
-                *sum += mark.as_secs_f64() * 1000.0;
-            }
-            p.set(v);
-        });
-        #[cfg(not(test))]
-        let _ = (t_composite, t_upload, t_rest);
         result.ready = !atlas_draws && visible.iter().all(|&id| self.uploaded_current(store, id));
         result
     }
@@ -625,6 +562,69 @@ impl DisplayView {
     pub(crate) fn uploads(&self) -> u64 {
         self.texture.uploads()
     }
+}
+
+/// Step 1 of [`DisplayView::prepare`]: the visible tiles (`set`, of which
+/// `stale` are not current) made current, as the path drawing them would:
+/// unbudgeted at or above the atlas floor, under
+/// [`zoomed_view::LEVEL0_FRAME_BUDGET`] below it. The tiles done
+/// synchronously and whether work was left for the UI thread.
+#[allow(clippy::too_many_arguments)]
+fn composite_visible(
+    set: &[TileId],
+    stale: &[TileId],
+    layers: &aurora_doc::LayerTree,
+    active_layer: Option<aurora_doc::LayerId>,
+    store: &mut aurora_tile::TileStore,
+    cache: &mut crate::CompositeCache,
+    level0: &mut Level0<'_>,
+    one_to_one: bool,
+) -> (usize, bool) {
+    let mut composited = 0;
+    let mut left = false;
+    match (level0, one_to_one) {
+        (Level0::Worker(worker), true) => {
+            crate::dispatch_or_composite_tiles(set, layers, active_layer, store, cache, worker);
+        }
+        (Level0::Worker(worker), false) => {
+            left |= crate::dispatch_or_composite_tiles_bounded(
+                set,
+                layers,
+                active_layer,
+                store,
+                cache,
+                worker,
+                Some(zoomed_view::LEVEL0_FRAME_BUDGET),
+            );
+        }
+        (Level0::Sync(gpu, compositor), true) => {
+            crate::recomposite_tiles(
+                set,
+                layers,
+                active_layer,
+                store,
+                cache,
+                *gpu,
+                compositor.as_deref_mut(),
+            );
+            composited += stale.len();
+        }
+        (Level0::Sync(gpu, compositor), false) => {
+            let (done, more) = zoomed_view::recomposite_within_budget(
+                stale,
+                layers,
+                active_layer,
+                store,
+                cache,
+                *gpu,
+                compositor.as_deref_mut(),
+                zoomed_view::LEVEL0_FRAME_BUDGET,
+            );
+            composited += done;
+            left |= more;
+        }
+    }
+    (composited, left)
 }
 
 /// Composites the tiles of `all` that are not current, in the background

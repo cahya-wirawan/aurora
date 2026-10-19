@@ -155,7 +155,6 @@ impl Rig {
         // from the texture's.
         let control = atlas.is_some() && std::env::var_os("AURORA_R11_CONTROL").is_some();
         let advance = if control {
-            drop(level0);
             DisplayAdvance::default()
         } else {
             self.view.prepare(
@@ -1125,7 +1124,6 @@ fn cold_paint(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path
     let mut frames = Vec::new();
     let mut atlas_frames = 0;
     let mut prepares = Vec::new();
-    crate::display_view::PHASES.with(|p| p.set([0.0; 4]));
     for step in 0..40_u32 {
         let (x, y) = (64 + step * 96, 32 + step * 48);
         let t0 = Instant::now();
@@ -1145,13 +1143,9 @@ fn cold_paint(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path
             reference_origin,
         );
         let dab = ms(t0.elapsed());
-        let before = crate::display_view::PHASES.with(std::cell::Cell::get);
         let draw_before = DRAW_MS.with(std::cell::Cell::get);
         let step = rig.frame_with(gpu, photo, 1.0, (x as f32, y as f32), Some(&mut residency));
-        let after = crate::display_view::PHASES.with(std::cell::Cell::get);
-        let mut phases: Vec<f64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
-        phases.push(DRAW_MS.with(std::cell::Cell::get) - draw_before);
-        prepares.push(phases);
+        prepares.push(DRAW_MS.with(std::cell::Cell::get) - draw_before);
         if !step.advance.ready {
             atlas_frames += 1;
         }
@@ -1159,23 +1153,8 @@ fn cold_paint(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path
         // pacing is not).
         frames.push(dab + step.ms);
     }
-    let phase = |k: usize| {
-        let v: Vec<f64> = prepares
-            .iter()
-            .skip(1)
-            .map(|p| p.get(k).copied().unwrap_or(0.0))
-            .collect();
-        stats(&v).0
-    };
-    println!(
-        "R11 cold_paint11_phases doc={label} how={how} composite={:.2} upload={:.2} rest={:.2} \
-         mips={:.2} draw_and_wait={:.2}",
-        phase(0),
-        phase(1),
-        phase(2),
-        phase(3),
-        phase(4)
-    );
+    let draw = stats(prepares.get(1..).unwrap_or_default()).0;
+    println!("R11 cold_paint11_draw doc={label} how={how} draw_and_wait_mean={draw:.2}");
     println!(
         "R11 cold_paint11_split doc={label} how={how} prepare_gpu_wait_total={:.2}",
         SPLIT_MS.with(std::cell::Cell::get)
