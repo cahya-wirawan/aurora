@@ -338,6 +338,7 @@ fn at_and_above_100_percent_the_display_draws_the_atlas_picture_bit_for_bit() {
     let mut canvas = CanvasPipeline::new(device);
     let viewport = (300, 200);
     let clip = clip_for(doc_size);
+    let software = context.adapter_info().device_type == wgpu::DeviceType::Cpu;
     for &(origin, zoom) in &[
         ((0.0, 0.0), 1.0_f32),
         ((37.0, 11.0), 1.0),
@@ -358,6 +359,8 @@ fn at_and_above_100_percent_the_display_draws_the_atlas_picture_bit_for_bit() {
             zoom,
             clip,
         );
+        let ideal = ideal_nearest(&mut store, doc_size, viewport, origin, zoom);
+        let atlas_off = off_nearest(&atlas, &ideal);
         for (name, display) in [("one page", &one), ("paged", &paged)] {
             let shown = render_display(
                 device,
@@ -369,11 +372,32 @@ fn at_and_above_100_percent_the_display_draws_the_atlas_picture_bit_for_bit() {
                 zoom,
                 clip,
             );
+            // On every adapter the display draws each pixel centre's own
+            // texel (`fs_display` samples level 0 with `Nearest`).
             assert_eq!(
-                differing_pixels(&atlas, &shown),
+                off_nearest(&shown, &ideal),
                 0,
-                "{name}: {origin:?} at {zoom}x differs from the atlas"
+                "{name}: {origin:?} at {zoom}x is not the nearest texel"
             );
+            // On a real GPU the atlas draws the same texels, so the two are
+            // the same bytes. A software adapter (llvmpipe, WARP) derives a
+            // level of detail just above 0 for the atlas at exactly 1:1 and
+            // filters it bilinearly (measured on llvmpipe: at a fractional
+            // pan 17,854 pixels off the nearest texel, at a whole one 3
+            // pixels a step apart), while the display's level is an explicit
+            // 0 and stays exact; there the comparison only reports.
+            let differ = differing_pixels(&atlas, &shown);
+            if software {
+                println!(
+                    "{name}: {origin:?} at {zoom}x: {differ} pixels differ from the atlas \
+                     (atlas off the nearest texel: {atlas_off})"
+                );
+            } else {
+                assert_eq!(
+                    differ, 0,
+                    "{name}: {origin:?} at {zoom}x differs from the atlas"
+                );
+            }
         }
     }
 }
@@ -448,9 +472,17 @@ fn pages_draw_exactly_what_one_texture_draws_at_every_zoom() {
             seam.len()
         );
         assert!(worst <= 1, "{origin:?} at {zoom}x: paged off by {worst}");
+        // A broken seam would differ far more often at the page edges than
+        // elsewhere; quantised weights differ about as often everywhere
+        // (and how often depends on the adapter: WARP's filter differs on
+        // 5 % of seam pixels where the RTX 3090's differs on 1.5 %). So the
+        // seam rate is bounded by twice the whole picture's rate, plus 1 %.
+        let total = (viewport.0 * viewport.1) as usize;
+        let overall = differing_pixels(&a, &b);
         assert!(
-            at_seams * 20 <= seam.len().max(1),
-            "{origin:?} at {zoom}x: {at_seams} of {} seam pixels differ",
+            at_seams * total <= seam.len() * (2 * overall + total / 100),
+            "{origin:?} at {zoom}x: {at_seams} of {} seam pixels differ, against {overall} of \
+             {total} overall",
             seam.len()
         );
     }
@@ -1027,4 +1059,71 @@ fn between_the_atlas_floor_and_100_percent_the_display_uses_the_atlas_filter() {
         worst <= 2,
         "the step into trilinear changes the picture by {worst}"
     );
+}
+
+/// The picture an ideal nearest sampler gives at `zoom >= 1`: each pixel
+/// centre's texel, premultiplied, over the checkerboard, as 8-bit.
+fn ideal_nearest(
+    store: &mut TileStore,
+    doc_size: (u32, u32),
+    viewport: (u32, u32),
+    origin: (f32, f32),
+    zoom: f32,
+) -> Vec<u8> {
+    let mut out = vec![0_u8; (viewport.0 * viewport.1 * 4) as usize];
+    for y in 0..viewport.1 {
+        for x in 0..viewport.0 {
+            let dx = f64::from(origin.0) + (f64::from(x) + 0.5) / f64::from(zoom);
+            let dy = f64::from(origin.1) + (f64::from(y) + 0.5) / f64::from(zoom);
+            let base = ((y * viewport.0 + x) * 4) as usize;
+            if dx < 0.0 || dy < 0.0 || dx >= f64::from(doc_size.0) || dy >= f64::from(doc_size.1) {
+                continue;
+            }
+            let (tx, ty) = (dx.floor() as u32, dy.floor() as u32);
+            let Ok(tile) = store.get(
+                surface(),
+                TileId {
+                    x: tx / TILE,
+                    y: ty / TILE,
+                },
+            ) else {
+                unreachable!("filled");
+            };
+            let i = (((ty % TILE) * TILE + tx % TILE) * 4) as usize;
+            let t: Vec<f32> = (0..4)
+                .map(|c| tile.texels().get(i + c).map_or(0.0, |v| v.to_f32()))
+                .collect();
+            let a = t.get(3).copied().unwrap_or(0.0);
+            let check = if ((x / 8) + (y / 8)) % 2 == 0 {
+                0.24
+            } else {
+                0.18
+            };
+            for c in 0..3 {
+                let p = f16::from_f32(t.get(c).copied().unwrap_or(0.0) * a).to_f32();
+                let v = (p + check * (1.0 - a)) * 255.0;
+                if let Some(slot) = out.get_mut(base + c) {
+                    *slot = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            if let Some(slot) = out.get_mut(base + 3) {
+                *slot = 255;
+            }
+        }
+    }
+    out
+}
+
+/// Pixels of `img` more than one 8-bit step from `ideal` in a colour channel
+/// (one step: the GPU's own rounding of the over).
+fn off_nearest(img: &[u8], ideal: &[u8]) -> usize {
+    img.chunks_exact(4)
+        .zip(ideal.chunks_exact(4))
+        .filter(|(a, b)| {
+            a.iter()
+                .zip(b.iter())
+                .take(3)
+                .any(|(x, y)| x.abs_diff(*y) > 1)
+        })
+        .count()
 }
