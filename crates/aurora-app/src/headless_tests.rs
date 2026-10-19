@@ -216,3 +216,50 @@ fn a_missing_file_fails_in_the_open_phase_with_json() {
     assert!(json.contains("\"ok\":false,\"phase\":\"open\""), "{json}");
     assert!(!dir.path().join("o.png").exists());
 }
+
+/// A source tile that cannot be read back fails the pool composite (it
+/// never exports a picture with a hole), like the export composite.
+#[test]
+fn the_pool_composite_fails_on_an_unreadable_source_tile() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let budget = std::num::NonZeroUsize::new(1).unwrap_or_else(|| panic!("1 is non-zero"));
+    let mut store = aurora_tile::TileStore::new(dir.path().to_path_buf(), budget)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let (layers, _history, layer) = crate::document_from_size("t", (256, 256));
+    let surface = layers
+        .surface_id(layer)
+        .unwrap_or_else(|| panic!("a pixel layer"));
+    let tile = aurora_tile::TileId { x: 0, y: 0 };
+    let texels = store
+        .get_mut(surface, tile)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    texels.texels_mut().fill(half::f16::from_f32(1.0));
+    // Budget 1: touching another surface evicts the layer's tile to disk.
+    store
+        .get_mut(aurora_tile::SurfaceId::from_raw(0x7777), tile)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    store.flush().unwrap_or_else(|e| panic!("{e:?}"));
+    let mut damaged = 0;
+    for entry in std::fs::read_dir(dir.path())
+        .unwrap_or_else(|e| panic!("{e}"))
+        .flatten()
+    {
+        if entry.path().extension().is_some_and(|e| e == "tile") {
+            std::fs::write(entry.path(), b"not a tile").unwrap_or_else(|e| panic!("{e}"));
+            damaged += 1;
+        }
+    }
+    assert!(
+        damaged >= 1,
+        "the layer's tile was evicted to a scratch file"
+    );
+    let failure = composite_on_pool(&layers, store, (256, 256), 2)
+        .err()
+        .unwrap_or_else(|| panic!("composited a document with an unreadable tile"));
+    assert_eq!(failure.phase, "composite");
+    assert!(
+        failure.message.contains("could not be read"),
+        "{}",
+        failure.message
+    );
+}

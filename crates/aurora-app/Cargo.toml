@@ -8,6 +8,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+# Two binaries (the app and `aurora-headless`): `cargo run -p aurora-app`
+# still starts the app.
+default-run = "aurora-app"
 
 [lints]
 workspace = true

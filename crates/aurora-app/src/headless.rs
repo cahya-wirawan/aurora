@@ -400,7 +400,10 @@ fn composite_on_pool(
         .ok_or_else(|| fail("composite", "couldn't start the thread pool"))?;
     let mirror = Mutex::new(store);
     let serial = crate::background_composite::lock(&mirror).serial();
-    let results: Vec<(aurora_tile::TileId, Vec<half::f16>)> = pool.install(|| {
+    // Each tile has its own budget (as in the background compositor), so
+    // each tile's unreadable source tiles are counted and fail the run,
+    // exactly as `composite_document` refuses an incomplete export.
+    let results: Vec<(aurora_tile::TileId, Vec<half::f16>, usize)> = pool.install(|| {
         tiles
             .par_iter()
             .with_max_len(1)
@@ -417,16 +420,24 @@ fn composite_on_pool(
                     &mut budget,
                 );
                 source.finish();
-                (tile_id, texels)
+                let skipped = budget.store_error().map_or(0, |(skipped, _)| skipped);
+                (tile_id, texels, skipped)
             })
             .collect()
     });
+    let skipped: usize = results.iter().map(|(_, _, s)| s).sum();
+    if skipped > 0 {
+        return Err(fail(
+            "composite",
+            format!("{skipped} source tiles could not be read"),
+        ));
+    }
     let store = mirror
         .into_inner()
         .map_err(|_| fail("composite", "the tile store's lock was poisoned"))?;
     let mut samples =
         vec![half::f16::from_f32(0.0); width as usize * height as usize * aurora_tile::CHANNELS];
-    for (tile_id, texels) in results {
+    for (tile_id, texels, _) in results {
         place_tile(&mut samples, size, tile_id, &texels);
     }
     Ok((image_from(width, height, samples)?, store))
