@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.276.0] - 2026-10-19
+
+### Added
+
+- Record the PhotoCraft comparison: a headless harness measured on Linux and the Mac
+
 ## [0.275.0] - 2026-10-19
 
 ### Added
