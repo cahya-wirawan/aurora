@@ -1,10 +1,10 @@
 # Findings: Aurora vs PhotoCraft, headless open -> flatten -> PNG (Linux)
 
-Stage 1, measured on 2026-10-19 by `spike/photocraft-compare/` at harness commit `642470e`.
-
-Every number below comes from that commit's two runs, except the Nyepi colour-conversion attribution, which is marked where it appears:
-- the representative set: idle with 3 interleaved rounds, and loaded with 3 rounds under 8 `yes`;
-- the 272-file corpus pass: idle, 1 round.
+Stage 1, measured on 2026-10-19 by `spike/photocraft-compare/`. The numbers come from these runs:
+- the representative set at harness commit `642470e`: idle with 3 interleaved rounds, and loaded with 3 rounds under 8 `yes`. Its `summary.md` was regenerated at `8ae6ac3` (`compare.py --rewrite`) so its colour notes follow the corrected policy (Nyepi's from its stored-profile reference; `curve-02.jpg`'s reads "not recorded" there, and the colour-check run below records it); no timing or pixel number changed;
+- the 272-file corpus pass at harness commit `8ae6ac3` (`9df7bd0`'s code plus a README edit): idle, 1 round. Its timed pipeline is the same as at `642470e`; `aurora-headless` only gained the `colour_converted_from` field and the `--gpu`/`--composite pool` refusal;
+- a colour-check run of `curve-02.jpg` and the Nyepi template at `8ae6ac3` (idle, 3 rounds), which records what Aurora's open converted;
+- the Nyepi colour-conversion attribution, marked where it appears.
 
 Read README.md for the method and the fairness notes. `summary.md` in each results directory carries the full tables, the caveats and every failure.
 
@@ -21,7 +21,7 @@ Read README.md for the method and the fairness notes. `summary.md` in each resul
 ## What the timed run is, per tool
 
 The two tools do not do the same work per run. Read every time next to these differences:
-- **Aurora** runs its Save As PNG path: open (including the colour conversion to sRGB), the composite, an 8-bit dithered encode, and a safe write (temp file, `fsync`, a re-decode, a rename and a directory `fsync`).
+- **Aurora** runs its Save As PNG path: open (including the conversion to sRGB of a file tagged with a non-sRGB RGB profile; grey profiles are not applied), the composite, an 8-bit dithered encode, and a safe write (temp file, `fsync`, a re-decode, a rename and a directory `fsync`).
 - **PhotoCraft** opens the file, flattens it with its CPU compositor, and writes the PNG directly. It keeps the source colour profile instead of converting it, writes RGB (no alpha) for opaque documents, and writes 16 bits for a 16-bit source.
 
 ## Results: wall time in seconds / peak RSS in MiB, min-max over 3 measured runs
@@ -62,7 +62,7 @@ The two tools do not do the same work per run. Read every time next to these dif
 | synthetic 60 MP PSD | 17.0-19.1 | 17.4-18.0 | 8.94-9.74 |
 | synthetic 60 MP PNG | 15.2-16.2 | 15.5-16.6 | 2.75-3.41 |
 
-Peak RSS under load is within a few percent of idle; the full table is in `summary.md`.
+Peak RSS under load is within a few MiB of idle (for example `group.psd` 9 to 12 MiB, `1layer.psd` 8 to 9 MiB; within a few percent on the large files); the full table is in `summary.md`.
 
 ### Where Aurora's time goes (idle, its own phases, ms)
 
@@ -90,7 +90,7 @@ Peak RSS under load is within a few percent of idle; the full table is in `summa
 | Aurora, 8-bit dithered (timed) | 0.111 | 174 | 13 | 17 | 12 |
 | PhotoCraft | 0.000 | 206 | 2 | 5 | 3 |
 
-- **The medians mostly measure rounding.** 81 Aurora scores and 114 PhotoCraft scores are exactly 0.000. Compare the buckets and the per-file list, not the medians.
+- **The medians mostly measure rounding.** 81 Aurora (16-bit) scores and 114 PhotoCraft scores are 0.0000 at the 4 decimals `results.json` keeps (a mean error under 0.00005 level); 77 and 110 are pixel-identical to the reference (max 0). `summary.md` prints scores at 3 decimals, where 86 and 116 read 0.000. These counts are printed under "Derived counts" in the corpus `summary.md`. Compare the buckets and the per-file list, not the medians.
 - **Per file** (Aurora 16-bit vs PhotoCraft, threshold 0.5 level): PhotoCraft is closer on 45 files, Aurora on 4, and they are within 0.5 on 167.
 
 Largest gaps where Aurora is worse:
@@ -122,9 +122,13 @@ Largest gaps where PhotoCraft is worse:
 - Aurora's buckets match its own `psd_fidelity_audit`'s recorded 175/13/17/12 to within one borderline file. Spot checks: the audit gives 18.88 and 5.76, the harness 18.876 and 5.758.
 - PhotoCraft's layered renders are real composites: its PSD import reads the merged image only for flattened, multichannel or extra-channel files (`crates/io/src/psd_import.rs`, `merged_needed`); the synthetic PSDs, whose merged image is only the background, come out within 0.03 levels (max 1) of Aurora's.
 
-**Tool vs tool on the corpus.** Both tools produced output on 235 files: 23 are in different colour spaces and are marked not comparable; dimensions agree on all 235; 51 same-space files have more than 1 % of pixels more than 2 levels apart.
+**Tool vs tool on the corpus.** Both tools produced output on 235 files, and dimensions agree on all 235. PhotoCraft tags 23 of its outputs with a non-sRGB profile:
+- 5 are Adobe RGB files that Aurora converted to sRGB at open. They are in different colour spaces and are not compared.
+- 18 are grey files (the `*_grayscale` adjustment files, `gray0`/`gray1` (.psd/.psb), `gray-blend-modes`, the 8- and 16-bit `4x4_*_grayscale` and `stroke-color-descriptors-gray`). Aurora does not apply grey profiles, so both tools hold the same unconverted grey values, and these pairs are compared.
 
-**Colour spaces.** PhotoCraft keeps the source profile ("Adobe RGB (1998)" for Nyepi, "Generic RGB Profile" for `curve-02.jpg`); Aurora converts to sRGB. Each tool is scored against the reference in its own space. On Nyepi: Aurora 0.72 against the sRGB merged image, PhotoCraft 0.11 against the merged image as stored.
+Of the 230 compared pairs, 57 have more than 1 % of pixels more than 2 levels apart. Six of those are grey files: `brightnesscontrast_grayscale` (mean 8.2 levels), `brightnesscontrast_legacy_grayscale` (5.2), `4x4_16bit_grayscale` (16.9), `stroke-color-descriptors-gray` (4.7), `levels_grayscale` (0.37) and `posterize_grayscale` (0.62). An earlier version of this section counted 23 not-comparable pairs and 51; it wrongly treated the grey files as converted by Aurora. All these counts are printed under "Derived counts" in the corpus `summary.md`.
+
+**Colour spaces.** PhotoCraft keeps the source profile ("Adobe RGB (1998)" for Nyepi, "Generic RGB Profile" for `curve-02.jpg`). Aurora converts an RGB file with a non-sRGB profile to sRGB: the colour-check run's `colour_converted_from` is "Adobe RGB (1998)" for Nyepi and "Generic RGB Profile" for `curve-02.jpg`. It does not apply grey profiles. Each tool is scored against the reference in its own space. On Nyepi: Aurora 0.72 against the sRGB merged image, PhotoCraft 0.11 against the merged image as stored.
 
 ## Failures
 
@@ -139,7 +143,7 @@ These are also at the top of every `summary.md`:
 - Aurora's safe write (fsync, re-decode, rename, directory fsync) is extra work compared with PhotoCraft's plain write.
 - The encoders differ: Aurora's 8-bit dithered encode against PhotoCraft's encoder and bit depth. Aurora's PNGs are 3-9x larger on the synthetic files.
 - `aurora-export` composites on one thread; `aurora-pool` runs the same fold on 8.
-- Aurora's open includes colour conversion; PhotoCraft's does not.
+- Aurora's open converts non-sRGB RGB profiles to sRGB; PhotoCraft's does not. In the corpus these are 5 Adobe RGB files; in the representative set, Nyepi and `curve-02.jpg`. Aurora does not apply grey profiles.
 - The page cache is warm: one warm-up run per tool precedes the measured runs.
 - Peak RSS includes caches: Aurora's tile-store budget (a quarter of RAM, at most 8 GiB) and its effects cache; for `aurora-pool`, the headless command's buffer of composited tiles.
 - Outputs are classed as sRGB by their ICC description, not by reading the profile.
