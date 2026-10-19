@@ -198,7 +198,7 @@ The decode itself is always whole.
 
 Stage 2 runs the two **live, windowed apps** and times their presented frames
 from outside, the same way for both. Results and the full caveat list are in
-`FINDINGS-stage2.md`.
+`stage2/FINDINGS-stage2.txt` (to be renamed `FINDINGS-stage2.md`).
 
 ### Method (Linux)
 
@@ -247,6 +247,13 @@ from outside, the same way for both. Results and the full caveat list are in
   approximation of latency that includes X and the app's event handling);
   process CPU time over the scenario (100 % = one core); whole-GPU utilisation
   from `nvidia-smi` (other processes included).
+* **A quiet machine.** Before every launch the harness waits until no
+  `cargo`/`rustc`/`rustdoc`/`clippy-driver` process runs and, in idle mode,
+  until the 1-minute load average is below `--max-load` (1.0), and records
+  both (`machine_before`, `waited_s`, `gate_met`).
+* **Vsync.** `--present fifo` runs the same scenarios with vsync on. On Xvfb
+  it changes nothing (no vblank; the NVIDIA X11 path copies each frame), so a
+  60 Hz cap can only be measured on a real display.
 * **Runs.** `--runs` rounds, each launching every app once per file, the app
   order alternating; idle and with `--load` (8) `yes` processes. Every launch
   records the load average and the number of `cargo`/`rustc` processes before
