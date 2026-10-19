@@ -1136,8 +1136,7 @@ fn a_layer_far_from_the_corner_is_scoped_at_its_own_origin() {
 }
 
 /// The export composite (`composite_document`) of `layers`, through the
-/// frame pool or the sequential loop, with the caller letting the helpers
-/// claim first (0.277.0).
+/// export pool or the sequential loop (0.277.0).
 fn export(
     layers: &aurora_doc::LayerTree,
     store: &mut aurora_tile::TileStore,
@@ -1146,10 +1145,6 @@ fn export(
 ) -> Result<Vec<half::f16>, aurora_io::IoError> {
     clear_shadow_cache();
     let _switch = Parallel::set(parallel);
-    let _hooks = Hooks::set(TestHooks {
-        caller_yields: Some(YIELD_LIMIT),
-        ..TestHooks::NONE
-    });
     crate::composite_document(layers, store, size.0, size.1).map(|image| image.samples().to_vec())
 }
 
@@ -1163,9 +1158,9 @@ fn check_export(
     what: &str,
 ) -> (usize, u64) {
     let sequential = ok(export(layers, store, size, false));
-    let _ = take_diagnostics();
+    let before = crate::EXPORT_POOLED_TILES.load(std::sync::atomic::Ordering::Relaxed);
     let pooled = ok(export(layers, store, size, true));
-    let diagnostics = take_diagnostics();
+    let after = crate::EXPORT_POOLED_TILES.load(std::sync::atomic::Ordering::Relaxed);
     let bad = mismatches(&pooled, &sequential);
     assert!(
         bad.is_empty(),
@@ -1173,10 +1168,10 @@ fn check_export(
         bad.len(),
         bad.get(..bad.len().min(4))
     );
-    (sequential.len(), diagnostics.helper_tiles)
+    (sequential.len(), (after - before) as u64)
 }
 
-/// The export through the frame pool is the sequential export, bit for
+/// The export through the export pool is the sequential export, bit for
 /// bit, on random trees (groups, masks, clipping, adjustments, effects),
 /// some with a store budget that pages tiles in during the pass, at a
 /// size that is not whole tiles; and the helpers really did tiles.
@@ -1209,11 +1204,11 @@ fn the_pooled_export_is_the_sequential_export_on_random_trees() {
         compared += n;
         helped += h;
     }
-    assert!(helped > 0, "the helpers composited no tile");
+    assert!(helped > 0, "no tile went through the export pool");
     assert!(compared > 1_000_000, "{compared}");
 }
 
-/// The corpus's documents export the same through the frame pool.
+/// The corpus's documents export the same through the export pool.
 #[test]
 fn the_pooled_export_is_the_sequential_export_on_the_corpus() {
     let Some(_pool) = pool_or_skip() else {
@@ -1286,9 +1281,8 @@ fn tile_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-/// An unreadable source tile still refuses the export through the frame
-/// pool, counted as the sequential loop counts it: a helper never keeps a
-/// tile it could not read, so the caller reads it with the pass budget.
+/// An unreadable source tile still refuses the export through the export
+/// pool, with the sequential loop's count and first message.
 #[test]
 fn the_pooled_export_still_refuses_an_unreadable_tile() {
     let Some(_pool) = pool_or_skip() else {
@@ -1308,12 +1302,12 @@ fn the_pooled_export_still_refuses_an_unreadable_tile() {
         ));
     }
     let refusal = |result: Result<Vec<half::f16>, aurora_io::IoError>| match result {
-        Err(aurora_io::IoError::IncompleteComposite { skipped, .. }) => skipped,
+        Err(aurora_io::IoError::IncompleteComposite { skipped, first }) => (skipped, first),
         Ok(_) => unreachable!("an export with unreadable tiles must be refused"),
         Err(other) => unreachable!("expected IncompleteComposite, got {other:?}"),
     };
     let sequential = refusal(export(&layers, &mut store, (1024, 1024), false));
     let pooled = refusal(export(&layers, &mut store, (1024, 1024), true));
-    assert!(sequential > 0);
+    assert!(sequential.0 > 0);
     assert_eq!(pooled, sequential, "the same tiles are refused");
 }

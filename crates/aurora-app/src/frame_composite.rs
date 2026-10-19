@@ -840,37 +840,6 @@ pub(crate) fn composite_tiles(
     layers: &aurora_doc::LayerTree,
     store: &mut TileStore,
     reference_origin: (i64, i64),
-    install: impl FnMut(&mut TileStore, TileId, Vec<half::f16>, usize),
-) {
-    let mut budget = crate::CompositeBudget::for_pass(layers);
-    composite_tiles_with_budget(
-        frame,
-        scope,
-        tiles,
-        layers,
-        store,
-        reference_origin,
-        &mut budget,
-        install,
-    );
-}
-
-/// [`composite_tiles`] charging the caller's own composites to `budget`
-/// (a pass budget, `CompositeBudget::for_pass`), which the caller reads
-/// afterwards: the export (`composite_document`) refuses a composite whose
-/// budget saw an unreadable tile. A helper never reads a tile the
-/// snapshot cannot answer and never keeps a tile that would report, so
-/// every such read and report is the caller's, through `budget`, as in
-/// the sequential loop.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn composite_tiles_with_budget(
-    frame: &FramePool,
-    scope: Scope,
-    tiles: &[TileId],
-    layers: &aurora_doc::LayerTree,
-    store: &mut TileStore,
-    reference_origin: (i64, i64),
-    budget: &mut crate::CompositeBudget,
     mut install: impl FnMut(&mut TileStore, TileId, Vec<half::f16>, usize),
 ) {
     let count = tiles.len();
@@ -885,6 +854,7 @@ pub(crate) fn composite_tiles_with_budget(
         Ok(mut cache) => cache.begin_pass(),
         Err(poisoned) => poisoned.into_inner().begin_pass(),
     }
+    let mut budget = crate::CompositeBudget::for_pass(layers);
     let pass = Arc::new(Pass::new(tiles, layers, store, reference_origin, scope));
     // Closes the pass however this function ends, an unwind included, so
     // no helper is left claiming (or sleeping on the window) for a pass
@@ -932,7 +902,7 @@ pub(crate) fn composite_tiles_with_budget(
             break;
         };
         let began = Instant::now();
-        let (texels, folded) = own_composite(layers, store, tile_id, reference_origin, budget);
+        let (texels, folded) = own_composite(layers, store, tile_id, reference_origin, &mut budget);
         timing.add(began.elapsed());
         #[cfg(test)]
         note(|d| d.caller_tiles += 1);
@@ -957,7 +927,8 @@ pub(crate) fn composite_tiles_with_budget(
         let entry = if let Some(tile) = wait_for_helper(&pass, installed, timing.mean()) {
             Done::Helper(Box::new(tile))
         } else {
-            let (texels, folded) = own_composite(layers, store, tile_id, reference_origin, budget);
+            let (texels, folded) =
+                own_composite(layers, store, tile_id, reference_origin, &mut budget);
             Done::Own(texels, folded)
         };
         if let Some(slot) = done.get_mut(installed) {

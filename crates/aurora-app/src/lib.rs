@@ -16410,6 +16410,16 @@ impl CompositeBudget {
     /// tile was skipped during this pass because the store could not
     /// read it; `None` if every tile read cleanly. See
     /// [`Self::note_store_error`].
+    /// Adds another budget's [`Self::store_error`] to this one's (the
+    /// export pool's tiles, in tile order): the counts add up and the
+    /// first message stays the first.
+    fn absorb_store_errors(&mut self, skipped: usize, first: String) {
+        self.store_errors = self.store_errors.saturating_add(skipped);
+        if self.first_store_error.is_none() {
+            self.first_store_error = Some(first);
+        }
+    }
+
     fn store_error(&self) -> Option<(usize, &str)> {
         let first = self.first_store_error.as_deref()?;
         Some((self.store_errors, first))
@@ -27452,6 +27462,35 @@ fn read_layer_window_unprofiled(
     }
 }
 
+/// The export composite's thread pool (0.277.0): the machine's
+/// parallelism, at most eight threads, built on first use with a shared
+/// drop-shadow cache of [`small_machine::shadow_cache_bytes`]; `None` with
+/// one thread or if rayon cannot start it (the export then keeps the
+/// sequential loop).
+fn export_pool() -> Option<&'static (rayon::ThreadPool, SharedShadowCache)> {
+    static POOL: std::sync::OnceLock<Option<(rayon::ThreadPool, SharedShadowCache)>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(8);
+        if threads <= 1 {
+            return None;
+        }
+        let shadows = new_shared_shadow_cache(small_machine::shadow_cache_bytes());
+        background_composite::build_pool(threads, &shadows).map(|pool| (pool, shadows))
+    })
+    .as_ref()
+}
+
+/// One tile of a pooled export: its composite and its unreadable reads
+/// (count and first message), if any.
+type ExportTile = (Vec<half::f16>, Option<(usize, String)>);
+
+/// Test-only: tiles composited through [`export_pool`].
+#[cfg(test)]
+static EXPORT_POOLED_TILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Composites every visible pixel layer in `layers` across the whole
 /// `width`x`height` document rect into a flat `aurora_io::Image`, ready
 /// for `aurora_io::encode_by_extension` — the real multi-layer read
@@ -27549,6 +27588,7 @@ fn read_layer_window_unprofiled(
 /// through the same `aurora_io::Image::new` contract
 /// [`aurora_io::read_from_store`] already goes through, rather than
 /// asserted away.
+#[allow(clippy::too_many_lines)] // the export pool's branch (0.277.0)
 fn composite_document(
     layers: &aurora_doc::LayerTree,
     store: &mut aurora_tile::TileStore,
@@ -27596,28 +27636,55 @@ fn composite_document(
         // interest to `recomposite_visible_tiles`'s own diagnostic split;
         // an export composites every tile either way.
         //
-        // Many tiles go to the frame pool (0.277.0): the calling thread
-        // composites with this same pass budget and the pool's helpers
-        // help; every tile is what the loop below computes for it
-        // (`frame_composite`'s module documentation), and an unreadable
-        // tile is still read, and counted, by this thread.
+        // Many tiles fold on the export pool (0.277.0), with the
+        // background compositor's per-tile code: each task reads the store
+        // through a `SharedMirror` (a lock around it) and gives its tile a
+        // budget of its own; the tiles are placed and their unreadable
+        // reads counted in tile order, so the image and the refusal are
+        // the loop's below. This thread waits for the pool, as it waited
+        // for the loop.
         let pooled = frame_composite::parallel_enabled()
             && tiles.len() >= frame_composite::MIN_PARALLEL_TILES
-            && frame_composite::frame_pool().is_some_and(|pool| {
-                let scope = frame_composite::Scope::of(layers, &tiles, (0, 0));
-                if !scope.is_bounded(tiles.len()) {
-                    return false;
+            && export_pool().is_some_and(|(pool, shadows)| {
+                use rayon::prelude::*;
+                match shadows.lock() {
+                    Ok(mut cache) => cache.begin_pass(),
+                    Err(poisoned) => poisoned.into_inner().begin_pass(),
                 }
-                frame_composite::composite_tiles_with_budget(
-                    pool,
-                    scope,
-                    &tiles,
-                    layers,
-                    store,
-                    (0, 0),
-                    &mut budget,
-                    |_store, tile_id, composited, _folded| place(tile_id, &composited),
-                );
+                let serial = store.serial();
+                let mirror = std::sync::Mutex::new(&mut *store);
+                let results: Vec<ExportTile> = pool.install(|| {
+                    tiles
+                        .par_iter()
+                        .with_max_len(1)
+                        .map(|&tile_id| {
+                            let mut source =
+                                background_composite::SharedMirror::new(&mirror, serial);
+                            let mut tile_budget = CompositeBudget::for_tile_of_pass(layers);
+                            let (composited, _folded) = composite_roots_into_tile(
+                                layers,
+                                &mut source,
+                                tile_id,
+                                composite_tile_doc_origin((0, 0), tile_id),
+                                (0, 0),
+                                &mut tile_budget,
+                            );
+                            source.finish();
+                            let error = tile_budget
+                                .store_error()
+                                .map(|(skipped, first)| (skipped, first.to_owned()));
+                            (composited, error)
+                        })
+                        .collect()
+                });
+                for (&tile_id, (composited, error)) in tiles.iter().zip(results) {
+                    place(tile_id, &composited);
+                    if let Some((skipped, first)) = error {
+                        budget.absorb_store_errors(skipped, first);
+                    }
+                }
+                #[cfg(test)]
+                EXPORT_POOLED_TILES.fetch_add(tiles.len(), std::sync::atomic::Ordering::Relaxed);
                 true
             });
         if !pooled {
