@@ -268,6 +268,8 @@ def run_scenario(name, app, inp, mon, pid, args, cx, cy, title=lambda: ''):
     # Setup (untimed): the same zoom command in both apps.
     inp.move(cx, cy)
     if name in ('pan', 'brush'):
+        inp.chord(['Control_L'], '0')        # fit first: re-centres the view after an earlier pan
+        wait_quiet(mon, 0.5, 0.3, 10)
         inp.chord(['Control_L'], '1')        # 100 %
     else:
         inp.chord(['Control_L'], '0')        # fit on screen
