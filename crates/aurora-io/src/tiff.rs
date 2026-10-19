@@ -34,7 +34,7 @@
 //!   integer sample format remain a real, checked error, not silently
 //!   misinterpreted.
 //! - Encode is always 8-bit RGBA — matching invariant §7.3.1b's own
-//!   8-bit export boundary via [`dither_quantize`], the same as
+//!   8-bit export boundary via [`aurora_color::dither_quantize`], the same as
 //!   `png`/`jpeg` — uncompressed ([`encode`]) or LZW-compressed
 //!   ([`encode_compressed`], added 2026-08-06). Deflate/`PackBits` (the
 //!   `tiff` crate's other two compression options) remain unwritten —
@@ -54,7 +54,7 @@
 //!   trait via a blanket `&T` impl, confirmed by reading the source
 //!   rather than assumed.
 
-use aurora_color::{dither_quantize, promote_u8, promote_u16};
+use aurora_color::{promote_u8, promote_u16};
 use half::f16;
 use std::io::Cursor;
 use tiff::ColorType;
@@ -220,20 +220,11 @@ fn decode_current_parts(
 
 /// `image`'s own samples, dither-quantized to 8-bit RGBA — the shared
 /// pixel-preparation step [`encode`]/[`encode_compressed`] both need,
-/// using [`dither_quantize`] rather than plain rounding so a smooth
+/// using [`aurora_color::dither_quantize`] rather than plain rounding so a smooth
 /// gradient doesn't band on the way out (invariant §7.3.1b's own 8-bit
 /// export boundary).
 fn quantize_rgba8(image: &Image) -> Vec<u8> {
-    let width = image.width();
-    let mut rgba8 = Vec::with_capacity(image.samples().len());
-    for (index, &sample) in image.samples().iter().enumerate() {
-        #[allow(clippy::cast_possible_truncation)]
-        let pixel_index = (index / 4) as u32;
-        let x = pixel_index % width.max(1);
-        let y = pixel_index / width.max(1);
-        rgba8.push(dither_quantize(sample.to_f32(), x, y));
-    }
-    rgba8
+    crate::quantize8::dither_rgba8(image.samples(), image.width())
 }
 
 /// Encodes `image` as an uncompressed, 8-bit RGBA TIFF. Embeds

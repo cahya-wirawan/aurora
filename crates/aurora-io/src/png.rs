@@ -45,7 +45,7 @@
 //!   file written with the new `sRGB` chunk looks like on the way back
 //!   in.
 
-use aurora_color::{dither_quantize, promote_u8, promote_u16, quantize_u16};
+use aurora_color::{promote_u8, promote_u16, quantize_u16};
 use half::f16;
 
 use crate::error::IoError;
@@ -170,7 +170,7 @@ fn encoder_info(image: &Image, bit_depth: png::BitDepth) -> Result<png::Info<'st
 }
 
 /// Encodes `image` as an 8-bit PNG — the export half of invariant
-/// §7.3.1b's 8-bit boundary, using [`dither_quantize`] rather than
+/// §7.3.1b's 8-bit boundary, using [`aurora_color::dither_quantize`] rather than
 /// plain rounding so a smooth gradient doesn't band on the way out. See
 /// [`encode_16`] for the real 16-bit counterpart.
 ///
@@ -181,14 +181,7 @@ fn encoder_info(image: &Image, bit_depth: png::BitDepth) -> Result<png::Info<'st
 /// (e.g. an unwritable output buffer).
 pub fn encode(image: &Image) -> Result<Vec<u8>, IoError> {
     let width = image.width();
-    let mut rgba8 = Vec::with_capacity(image.samples().len());
-    for (index, &sample) in image.samples().iter().enumerate() {
-        #[allow(clippy::cast_possible_truncation)]
-        let pixel_index = (index / 4) as u32;
-        let x = pixel_index % width.max(1);
-        let y = pixel_index / width.max(1);
-        rgba8.push(dither_quantize(sample.to_f32(), x, y));
-    }
+    let rgba8 = crate::quantize8::dither_rgba8(image.samples(), width);
 
     let info = encoder_info(image, png::BitDepth::Eight)?;
     let mut bytes = Vec::new();

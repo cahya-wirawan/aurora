@@ -45,6 +45,7 @@ pub mod import;
 pub mod jpeg;
 pub mod png;
 pub mod psd;
+mod quantize8;
 mod safe_save;
 pub mod tiff;
 
@@ -60,9 +61,9 @@ pub use aur::{
 };
 pub use aur_colour::DocumentColour;
 pub use colour_import::{
-    ColourImport, ColourReport, ConvertDirection, SourceProfile, Tagging, bring_into_working,
-    clamp_colour_unit, convert_profile_rgba, convert_rgba, converted_on_open_line,
-    decode_to_working,
+    ColourImport, ColourReport, ConvertDirection, ProfileConverter, SourceProfile, Tagging,
+    bring_into_working, clamp_colour_unit, convert_profile_rgba, convert_rgba,
+    converted_on_open_line, decode_to_working,
 };
 pub use error::{IoError, psd_color_mode_name};
 pub use image::Image;

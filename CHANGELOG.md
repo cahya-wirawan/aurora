@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.277.0] - 2026-10-19
+
+### Added
+
+- Record the faster open and export: an exact colour-conversion memo, banded dithering and a pooled export composite
+
 ## [0.276.1] - 2026-10-19
 
 ### Added

@@ -17,3 +17,6 @@ aurora-core = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 lcms2 = { workspace = true }
+
+[dev-dependencies]
+half = { workspace = true }

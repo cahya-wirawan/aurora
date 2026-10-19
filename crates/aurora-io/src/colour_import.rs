@@ -13,9 +13,7 @@
 //! [`ColourReport`]. An untagged file is assumed sRGB, with an info line.
 //!
 //! **Not done:** grayscale ICC profiles on grayscale data (the profile is
-//! reported as not applied), CMYK/Lab data, rendering-intent choices, and
-//! converting in parallel (a large profiled image is converted on one
-//! thread).
+//! reported as not applied), CMYK/Lab data and rendering-intent choices.
 
 use std::path::Path;
 
@@ -200,48 +198,179 @@ fn injected_failure() -> aurora_color::ColorError {
     }
 }
 
-/// Converts `samples` (read only) through `transform` into a [`Staged`].
-/// `fail_chunk` makes that chunk fail (tests only; `None` in use).
+/// log2 of [`ColourCache`]'s slot count.
+const CACHE_BITS: u32 = 14;
+/// A slot no colour occupies (a key is 48 bits, so it never equals this).
+const EMPTY_KEY: u64 = u64::MAX;
+/// A slot's value is a miss index waiting for this chunk's `lcms2` call.
+const PENDING: u64 = 1 << 63;
+
+/// An exact memo of one transform's results: the three `f16` colour
+/// samples of a pixel, as bits, to the three `f16` samples converting them
+/// gives. `lcms2` evaluates a float transform pixel by pixel with nothing
+/// carried between pixels (no cache, no dithering), so the same input bits
+/// always give the same output bits, and the memo returns exactly what
+/// converting the pixel again would. A PSD layer is mostly a few colours
+/// (the Nyepi template's 114 M visible layer pixels hold about 110,000
+/// distinct colours per conversion part), and per-pixel `lcms2` float
+/// evaluation was where the open's time went.
+///
+/// Direct-mapped and never resized: a colour that collides with another
+/// replaces it.
+#[derive(Debug)]
+struct ColourCache {
+    /// `(key, value)`: the input bits (`r << 32 | g << 16 | b`) and either
+    /// the output bits packed the same way or [`PENDING`] plus a miss index.
+    slots: Vec<(u64, u64)>,
+}
+
+impl ColourCache {
+    fn new() -> Self {
+        Self {
+            slots: vec![(EMPTY_KEY, 0); 1 << CACHE_BITS],
+        }
+    }
+
+    /// Fibonacci hashing; the shift leaves `CACHE_BITS` bits, so the
+    /// result always fits a `usize` and indexes `slots`.
+    fn slot_of(key: u64) -> usize {
+        #[allow(clippy::cast_possible_truncation)]
+        let slot = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - CACHE_BITS)) as usize;
+        slot
+    }
+
+    /// Forgets every slot still waiting for a result (after a failed call).
+    fn forget_pending(&mut self) {
+        for slot in &mut self.slots {
+            if slot.1 & PENDING != 0 {
+                *slot = (EMPTY_KEY, 0);
+            }
+        }
+    }
+}
+
+fn pack_rgb(rgb: [u16; 3]) -> u64 {
+    (u64::from(rgb[0]) << 32) | (u64::from(rgb[1]) << 16) | u64::from(rgb[2])
+}
+
+fn unpack_rgb(packed: u64) -> [f16; 3] {
+    // Truncation intended: each field is 16 bits.
+    #[allow(clippy::cast_possible_truncation)]
+    let field = |shift: u32| f16::from_bits((packed >> shift) as u16);
+    [field(32), field(16), field(0)]
+}
+
+/// One thread's means of converting: a transform and its memo.
+#[derive(Debug)]
+struct Worker {
+    transform: Transform,
+    cache: ColourCache,
+}
+
+/// Converts `samples` (read only) through `transform` into a [`Staged`],
+/// memoising in `cache` (which must only ever have seen `transform`'s
+/// results, or one built identically). `fail_chunk` makes that chunk fail
+/// (tests only; `None` in use).
+///
+/// Each chunk's distinct colours that are not memoised go to `lcms2` in one
+/// call; every other kept pixel is copied from the memo. The result is bit
+/// for bit what converting every kept pixel would give
+/// (`the_memoised_conversion_equals_converting_every_pixel`).
 fn stage_rgba(
     samples: &[f16],
     transform: &Transform,
+    cache: &mut ColourCache,
     fail_chunk: Option<usize>,
 ) -> Result<Staged, aurora_color::ColorError> {
     let mut staged = Staged::default();
     if u32::try_from(samples.len() / 4).is_err() {
         return Err(injected_failure());
     }
-    let mut rgb: Vec<f32> = Vec::with_capacity(CHUNK_PIXELS * 3);
+    // The distinct missing colours of a chunk (`f32`, three per miss), the
+    // memo slot each claimed, and where each kept pixel's result goes.
+    let mut misses: Vec<f32> = Vec::with_capacity(CHUNK_PIXELS * 3);
+    let mut miss_slots: Vec<Option<usize>> = Vec::new();
+    let mut fixups: Vec<(usize, usize)> = Vec::new();
     let mut converted: Vec<f32> = Vec::new();
+    let mut converted_bits: Vec<u64> = Vec::new();
     for (index, chunk) in samples.chunks(CHUNK_PIXELS * 4).enumerate() {
-        if fail_chunk == Some(index) {
-            return Err(injected_failure());
-        }
-        rgb.clear();
+        misses.clear();
+        miss_slots.clear();
+        fixups.clear();
         let base = index * CHUNK_PIXELS;
-        let first_kept = staged.kept.len();
         for (i, px) in chunk.chunks_exact(4).enumerate() {
+            let [r, g, b, a] = [0, 1, 2, 3].map(|k| px.get(k).map_or(0, |v| v.to_bits()));
             // Alpha zero (either sign): the colour cannot be seen.
-            if px.get(3).is_some_and(|a| a.to_bits() << 1 == 0) {
+            if a << 1 == 0 {
                 continue;
             }
             // Cannot fail: checked against `u32` above.
             if let Ok(n) = u32::try_from(base + i) {
                 staged.kept.push(n);
             }
-            for c in px.iter().take(3) {
-                rgb.push(c.to_f32());
+            let key = pack_rgb([r, g, b]);
+            let slot_at = ColourCache::slot_of(key);
+            let slot = cache.slots.get(slot_at).copied();
+            match slot {
+                Some((held, value)) if held == key && value & PENDING == 0 => {
+                    staged.rgb.extend(unpack_rgb(value));
+                }
+                Some((held, value)) if held == key => {
+                    // A colour already missed in this chunk. The index is
+                    // below `CHUNK_PIXELS`, so it fits.
+                    #[allow(clippy::cast_possible_truncation)]
+                    fixups.push((staged.rgb.len(), (value & !PENDING) as usize));
+                    staged.rgb.extend([f16::ZERO; 3]);
+                }
+                _ => {
+                    let miss = miss_slots.len();
+                    // A slot another of this chunk's misses holds stays
+                    // with it; this colour is converted unmemoised.
+                    let claimable = slot.is_some_and(|(_, value)| value & PENDING == 0);
+                    match cache.slots.get_mut(slot_at) {
+                        Some(entry) if claimable => {
+                            *entry = (key, PENDING | miss as u64);
+                            miss_slots.push(Some(slot_at));
+                        }
+                        _ => miss_slots.push(None),
+                    }
+                    misses.extend([r, g, b].map(|c| f16::from_bits(c).to_f32()));
+                    fixups.push((staged.rgb.len(), miss));
+                    staged.rgb.extend([f16::ZERO; 3]);
+                }
             }
         }
-        if staged.kept.len() == first_kept {
+        // A test's injected failure stands where `lcms2` would refuse the
+        // chunk: after it has claimed its memo slots.
+        if fail_chunk == Some(index) {
+            cache.forget_pending();
+            return Err(injected_failure());
+        }
+        if misses.is_empty() {
             continue;
         }
         converted.clear();
-        converted.resize(rgb.len(), 0.0);
-        transform.transform(&rgb, &mut converted)?;
-        staged
-            .rgb
-            .extend(converted.iter().map(|v| f16::from_f32(*v)));
+        converted.resize(misses.len(), 0.0);
+        if let Err(err) = transform.transform(&misses, &mut converted) {
+            cache.forget_pending();
+            return Err(err);
+        }
+        converted_bits.clear();
+        converted_bits.extend(converted.chunks_exact(3).map(|c| {
+            pack_rgb([0, 1, 2].map(|k| c.get(k).map_or(0, |v| f16::from_f32(*v).to_bits())))
+        }));
+        for (slot_at, bits) in miss_slots.iter().zip(&converted_bits) {
+            if let Some(entry) = slot_at.and_then(|at| cache.slots.get_mut(at)) {
+                entry.1 = *bits;
+            }
+        }
+        for &(at, miss) in &fixups {
+            if let (Some(out), Some(bits)) =
+                (staged.rgb.get_mut(at..at + 3), converted_bits.get(miss))
+            {
+                out.copy_from_slice(&unpack_rgb(*bits));
+            }
+        }
     }
     Ok(staged)
 }
@@ -271,7 +400,7 @@ pub fn convert_rgba(
     samples: &mut [f16],
     transform: &Transform,
 ) -> Result<(), aurora_color::ColorError> {
-    let staged = stage_rgba(samples, transform, None)?;
+    let staged = stage_rgba(samples, transform, &mut ColourCache::new(), None)?;
     commit_staged(samples, &staged);
     Ok(())
 }
@@ -288,11 +417,125 @@ pub enum ConvertDirection {
 /// The fewest samples worth a thread of their own.
 const PARALLEL_MIN_SAMPLES: usize = 1 << 20;
 
+/// Converts many images through one RGB profile ([`convert_profile_rgba`]
+/// is one image through a fresh one): it keeps the `lcms2` transforms it
+/// builds (one per thread that has needed one, each with its memo of
+/// converted colours) for the next image, so a PSD open builds a handful of
+/// transforms instead of several per layer. Every transform is built from
+/// the same bytes the same way, so which one converts a pixel never changes
+/// its result.
+#[derive(Debug)]
+pub struct ProfileConverter {
+    profile_bytes: Vec<u8>,
+    direction: ConvertDirection,
+    /// Idle workers; a thread takes one (or builds one) and gives it back.
+    idle: std::sync::Mutex<Vec<Worker>>,
+}
+
+impl ProfileConverter {
+    /// A converter through the RGB profile `profile_bytes`; nothing is built
+    /// until the first conversion.
+    #[must_use]
+    pub fn new(profile_bytes: Vec<u8>, direction: ConvertDirection) -> Self {
+        Self {
+            profile_bytes,
+            direction,
+            idle: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take(&self) -> Result<Worker, aurora_color::ColorError> {
+        // A poisoned pool only means another thread panicked holding the
+        // lock; its workers are not trusted and a new one is built.
+        if let Some(worker) = self.idle.lock().ok().and_then(|mut idle| idle.pop()) {
+            return Ok(worker);
+        }
+        let profile = IccProfile::from_bytes(&self.profile_bytes)?;
+        let transform = match self.direction {
+            ConvertDirection::ToWorking => Transform::to_working(&profile),
+            ConvertDirection::FromWorking => Transform::from_working(&profile),
+        }?;
+        Ok(Worker {
+            transform,
+            cache: ColourCache::new(),
+        })
+    }
+
+    fn give(&self, worker: Worker) {
+        if let Ok(mut idle) = self.idle.lock() {
+            idle.push(worker);
+        }
+    }
+
+    /// Stages `piece` with an idle (or new) worker, giving it back after.
+    fn stage(
+        &self,
+        piece: &[f16],
+        fail_chunk: Option<usize>,
+    ) -> Result<Staged, aurora_color::ColorError> {
+        let mut worker = self.take()?;
+        let staged = stage_rgba(piece, &worker.transform, &mut worker.cache, fail_chunk);
+        self.give(worker);
+        staged
+    }
+
+    /// [`convert_profile_rgba`] through this converter.
+    ///
+    /// # Errors
+    ///
+    /// As [`convert_profile_rgba`]; `samples` is then unchanged.
+    pub fn convert(&self, samples: &mut [f16]) -> Result<(), aurora_color::ColorError> {
+        #[cfg(test)]
+        let fail_chunk = TEST_FAIL_CHUNK.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let fail_chunk = None;
+        self.convert_with(samples, fail_chunk)
+    }
+
+    /// [`Self::convert`] with a test-injected failure in chunk `fail_chunk`
+    /// of the first part.
+    pub(crate) fn convert_with(
+        &self,
+        samples: &mut [f16],
+        fail_chunk: Option<usize>,
+    ) -> Result<(), aurora_color::ColorError> {
+        let threads = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(8);
+        if threads <= 1 || samples.len() < PARALLEL_MIN_SAMPLES {
+            let staged = self.stage(samples, fail_chunk)?;
+            commit_staged(samples, &staged);
+            return Ok(());
+        }
+        // Whole pixels per part.
+        let part = ((samples.len() / threads).div_ceil(4) * 4).max(4);
+        let staged: Vec<Result<Staged, aurora_color::ColorError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = samples
+                .chunks(part)
+                .enumerate()
+                .map(|(n, piece)| {
+                    scope.spawn(move || self.stage(piece, if n == 0 { fail_chunk } else { None }))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err(injected_failure())))
+                .collect()
+        });
+        let staged: Vec<Staged> = staged.into_iter().collect::<Result<_, _>>()?;
+        for (piece, staged) in samples.chunks_mut(part).zip(&staged) {
+            commit_staged(piece, staged);
+        }
+        Ok(())
+    }
+}
+
 /// [`convert_rgba`] through the RGB profile `profile_bytes`, spread over the
-/// machine's cores for a big image (each thread builds its own `lcms2`
+/// machine's cores for a big image (each thread uses its own `lcms2`
 /// transform; they share nothing). Identical to the single-threaded result
 /// (every pixel is converted independently) and **all or nothing**: nothing
-/// is written unless every part converted.
+/// is written unless every part converted. Converting several images
+/// through one profile is cheaper with one [`ProfileConverter`].
 ///
 /// # Errors
 ///
@@ -303,11 +546,7 @@ pub fn convert_profile_rgba(
     profile_bytes: &[u8],
     direction: ConvertDirection,
 ) -> Result<(), aurora_color::ColorError> {
-    #[cfg(test)]
-    let fail_chunk = TEST_FAIL_CHUNK.with(std::cell::Cell::get);
-    #[cfg(not(test))]
-    let fail_chunk = None;
-    convert_profile_rgba_with(samples, profile_bytes, direction, fail_chunk)
+    ProfileConverter::new(profile_bytes.to_vec(), direction).convert(samples)
 }
 
 #[cfg(test)]
@@ -320,49 +559,53 @@ thread_local! {
 
 /// [`convert_profile_rgba`] with a test-injected failure in chunk
 /// `fail_chunk` of the first part.
+#[cfg(test)]
 pub(crate) fn convert_profile_rgba_with(
     samples: &mut [f16],
     profile_bytes: &[u8],
     direction: ConvertDirection,
     fail_chunk: Option<usize>,
 ) -> Result<(), aurora_color::ColorError> {
-    let build = || -> Result<Transform, aurora_color::ColorError> {
-        let profile = IccProfile::from_bytes(profile_bytes)?;
-        match direction {
-            ConvertDirection::ToWorking => Transform::to_working(&profile),
-            ConvertDirection::FromWorking => Transform::from_working(&profile),
+    ProfileConverter::new(profile_bytes.to_vec(), direction).convert_with(samples, fail_chunk)
+}
+
+/// The conversion as it was before the memo (0.276.0), kept as the
+/// reference the memoised one is tested against: every kept pixel goes
+/// through `lcms2`.
+#[cfg(test)]
+pub(crate) fn convert_rgba_unmemoised(
+    samples: &mut [f16],
+    transform: &Transform,
+) -> Result<(), aurora_color::ColorError> {
+    let mut staged = Staged::default();
+    let mut rgb: Vec<f32> = Vec::with_capacity(CHUNK_PIXELS * 3);
+    let mut converted: Vec<f32> = Vec::new();
+    for (index, chunk) in samples.chunks(CHUNK_PIXELS * 4).enumerate() {
+        rgb.clear();
+        let base = index * CHUNK_PIXELS;
+        let first_kept = staged.kept.len();
+        for (i, px) in chunk.chunks_exact(4).enumerate() {
+            if px.get(3).is_some_and(|a| a.to_bits() << 1 == 0) {
+                continue;
+            }
+            if let Ok(n) = u32::try_from(base + i) {
+                staged.kept.push(n);
+            }
+            for c in px.iter().take(3) {
+                rgb.push(c.to_f32());
+            }
         }
-    };
-    let threads = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(8);
-    if threads <= 1 || samples.len() < PARALLEL_MIN_SAMPLES {
-        let staged = stage_rgba(samples, &build()?, fail_chunk)?;
-        commit_staged(samples, &staged);
-        return Ok(());
+        if staged.kept.len() == first_kept {
+            continue;
+        }
+        converted.clear();
+        converted.resize(rgb.len(), 0.0);
+        transform.transform(&rgb, &mut converted)?;
+        staged
+            .rgb
+            .extend(converted.iter().map(|v| f16::from_f32(*v)));
     }
-    // Whole pixels per part.
-    let part = ((samples.len() / threads).div_ceil(4) * 4).max(4);
-    let staged: Vec<Result<Staged, aurora_color::ColorError>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = samples
-            .chunks(part)
-            .enumerate()
-            .map(|(n, piece)| {
-                scope.spawn(move || {
-                    let transform = build()?;
-                    stage_rgba(piece, &transform, if n == 0 { fail_chunk } else { None })
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Err(injected_failure())))
-            .collect()
-    });
-    let staged: Vec<Staged> = staged.into_iter().collect::<Result<_, _>>()?;
-    for (piece, staged) in samples.chunks_mut(part).zip(&staged) {
-        commit_staged(piece, staged);
-    }
+    commit_staged(samples, &staged);
     Ok(())
 }
 
@@ -374,11 +617,19 @@ pub(crate) fn convert_profile_rgba_with(
 pub fn clamp_colour_unit(samples: &mut [f16]) {
     for px in samples.chunks_exact_mut(4) {
         for c in px.iter_mut().take(3) {
-            let v = c.to_f32();
-            *c = f16::from_f32(if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) });
+            // `+0.0..=1.0` (bits `0x0000..=0x3C00`) is left as it is: the
+            // clamp returns it and `f16 -> f32 -> f16` is exact for it, so
+            // skipping the round trip changes no bit.
+            if c.to_bits() > ONE_BITS {
+                let v = c.to_f32();
+                *c = f16::from_f32(if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) });
+            }
         }
     }
 }
+
+/// `f16` 1.0's bits; every `f16` from `+0.0` to `1.0` has bits at most this.
+const ONE_BITS: u16 = 0x3C00;
 
 /// Decodes `bytes` by `path`'s extension into the working space
 /// ([`bring_into_working`]); the returned [`Image`] is tagged sRGB and its

@@ -61,9 +61,37 @@ pub fn quantize_u16(value: f32) -> u16 {
 /// Same clamping behaviour as [`quantize_u8`] for out-of-range input.
 #[must_use]
 pub fn dither_quantize(value: f32, x: u32, y: u32) -> u8 {
+    dither_quantize_with(value, bayer_threshold(x, y))
+}
+
+/// [`dither_quantize`] with the position's threshold already looked up
+/// (one entry of [`dither_thresholds`]): the same arithmetic, so
+/// `dither_quantize_with(v, dither_thresholds()[(y % 8 * 8 + x % 8) as usize])`
+/// is `dither_quantize(v, x, y)` bit for bit. For a caller quantising a
+/// whole image, which would otherwise rebuild the Bayer value per sample.
+#[must_use]
+pub fn dither_quantize_with(value: f32, threshold: f32) -> u8 {
     let scaled = value.clamp(0.0, 1.0) * 255.0;
-    let threshold = bayer_threshold(x, y);
     quantize_u8_unclamped(scaled + threshold)
+}
+
+/// The side of the ordered-dither matrix: [`dither_thresholds`] has
+/// `DITHER_SIZE * DITHER_SIZE` entries and a position's entry is
+/// `(y % DITHER_SIZE) * DITHER_SIZE + x % DITHER_SIZE`.
+pub const DITHER_SIZE: u32 = BAYER_SIZE;
+
+/// Every position's [`dither_quantize`] threshold, row by row
+/// (see [`DITHER_SIZE`]).
+#[must_use]
+pub fn dither_thresholds() -> [f32; (BAYER_SIZE * BAYER_SIZE) as usize] {
+    let mut table = [0.0; (BAYER_SIZE * BAYER_SIZE) as usize];
+    for (i, slot) in table.iter_mut().enumerate() {
+        // `i < 64`, so the casts are exact.
+        #[allow(clippy::cast_possible_truncation)]
+        let i = i as u32;
+        *slot = bayer_threshold(i % BAYER_SIZE, i / BAYER_SIZE);
+    }
+    table
 }
 
 #[allow(clippy::cast_sign_loss)]
@@ -178,6 +206,26 @@ mod tests {
     fn quantize_u16_clamps_out_of_range_input() {
         assert_eq!(quantize_u16(-1.0), 0);
         assert_eq!(quantize_u16(2.0), 65535);
+    }
+
+    #[test]
+    fn the_threshold_table_gives_dither_quantize_exactly() {
+        use super::{DITHER_SIZE, dither_quantize_with, dither_thresholds};
+        let table = dither_thresholds();
+        // Every f16 value (as the exporters read them) at every position
+        // of the matrix, plus a position past it.
+        for bits in 0..=u16::MAX {
+            let v = half::f16::from_bits(bits).to_f32();
+            for y in 0..=DITHER_SIZE {
+                for x in 0..=DITHER_SIZE {
+                    let t = table
+                        .get(((y % DITHER_SIZE) * DITHER_SIZE + x % DITHER_SIZE) as usize)
+                        .copied()
+                        .unwrap_or(f32::NAN);
+                    assert_eq!(dither_quantize_with(v, t), dither_quantize(v, x, y));
+                }
+            }
+        }
     }
 
     #[test]

@@ -481,3 +481,177 @@ fn a_failed_conversion_is_reported_truthfully_and_leaves_the_pixels_alone() {
             .any(|l| l.contains("treated as sRGB"))
     );
 }
+
+/// A deterministic pseudo-random sequence (tests only).
+fn lcg(seed: &mut u64) -> u64 {
+    *seed = seed
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    *seed >> 33
+}
+
+/// Images that exercise the memo: a small palette repeated (memo hits, and
+/// a colour missed twice in one chunk), every `f16` bit pattern in each
+/// colour channel (NaN, infinities, negatives, `-0.0`, subnormals, values
+/// over 1), and many distinct 8-bit colours (slot collisions, including a
+/// slot still waiting for its chunk's `lcms2` call). About a third of the
+/// pixels are fully transparent (`+0.0` or `-0.0` alpha), some translucent.
+fn memo_test_images() -> Vec<Vec<f16>> {
+    let mut seed = 0x5eed_u64;
+    let alpha = |seed: &mut u64| match lcg(seed) % 6 {
+        0 => f16::ZERO,
+        1 => f16::NEG_ZERO,
+        2 => f16::from_f32(0.5),
+        _ => f16::ONE,
+    };
+    let palette: Vec<[f16; 3]> = (0..300)
+        .map(|_| [0, 1, 2].map(|_| f16::from_f32((lcg(&mut seed) % 1024) as f32 / 1023.0)))
+        .collect();
+    let mut repeated = Vec::new();
+    for _ in 0..90_000 {
+        let i = (lcg(&mut seed) as usize) % palette.len();
+        let c = palette.get(i).copied().unwrap_or([f16::ZERO; 3]);
+        repeated.extend(c);
+        repeated.push(alpha(&mut seed));
+    }
+    let mut every_bit_pattern = Vec::new();
+    for channel in 0..3 {
+        for bits in 0..=u16::MAX {
+            let mut px = [0, 1, 2].map(|_| f16::from_f32((lcg(&mut seed) % 256) as f32 / 255.0));
+            if let Some(c) = px.get_mut(channel) {
+                *c = f16::from_bits(bits);
+            }
+            every_bit_pattern.extend(px);
+            every_bit_pattern.push(if bits % 5 == 0 { f16::ZERO } else { f16::ONE });
+        }
+    }
+    // Over the parallel threshold (2^20 samples), so the converter splits
+    // it across threads.
+    let mut distinct = Vec::new();
+    for _ in 0..300_000 {
+        distinct.extend([0, 1, 2].map(|_| f16::from_f32((lcg(&mut seed) % 256) as f32 / 255.0)));
+        distinct.push(alpha(&mut seed));
+    }
+    vec![repeated, every_bit_pattern, distinct]
+}
+
+fn eci_bytes() -> Vec<u8> {
+    include_bytes!("../../../corpora/icc/ECI-RGBv2.icc").to_vec()
+}
+
+fn unmemoised(samples: &[f16], profile: &[u8], direction: super::ConvertDirection) -> Vec<f16> {
+    let Ok(profile) = IccProfile::from_bytes(profile) else {
+        unreachable!()
+    };
+    let transform = match direction {
+        super::ConvertDirection::ToWorking => Transform::to_working(&profile),
+        super::ConvertDirection::FromWorking => Transform::from_working(&profile),
+    };
+    let Ok(transform) = transform else {
+        unreachable!()
+    };
+    let mut out = samples.to_vec();
+    assert!(super::convert_rgba_unmemoised(&mut out, &transform).is_ok());
+    out
+}
+
+/// The memo (0.277.0) changes no bit: every image, both directions, two
+/// profiles, single-threaded (`convert_rgba`, a small image through
+/// `ProfileConverter`) and parallel (`ProfileConverter` over the threshold),
+/// against converting every kept pixel through `lcms2` as before.
+#[test]
+fn the_memoised_conversion_equals_converting_every_pixel() {
+    use super::{ConvertDirection, ProfileConverter, convert_rgba};
+    for profile in [adobe_bytes(), eci_bytes()] {
+        for direction in [ConvertDirection::ToWorking, ConvertDirection::FromWorking] {
+            // One converter for every image, so its memo carries colours
+            // from one image to the next, as in a PSD open.
+            let converter = ProfileConverter::new(profile.clone(), direction);
+            for (n, image) in memo_test_images().iter().enumerate() {
+                let reference = unmemoised(image, &profile, direction);
+                assert_ne!(bits_of(&reference), bits_of(image), "image {n} converts");
+                let mut through_converter = image.clone();
+                assert!(converter.convert(&mut through_converter).is_ok());
+                assert_eq!(
+                    bits_of(&through_converter),
+                    bits_of(&reference),
+                    "{direction:?} image {n} through the converter"
+                );
+                // A small piece stays on one thread.
+                let piece = image.get(..40_000).unwrap_or(image);
+                let mut small = piece.to_vec();
+                assert!(converter.convert(&mut small).is_ok());
+                assert_eq!(
+                    bits_of(&small),
+                    bits_of(reference.get(..piece.len()).unwrap_or(&reference)),
+                    "{direction:?} image {n}, one thread"
+                );
+                let Ok(p) = IccProfile::from_bytes(&profile) else {
+                    unreachable!()
+                };
+                let t = match direction {
+                    ConvertDirection::ToWorking => Transform::to_working(&p),
+                    ConvertDirection::FromWorking => Transform::from_working(&p),
+                };
+                let Ok(t) = t else { unreachable!() };
+                let mut direct = image.clone();
+                assert!(convert_rgba(&mut direct, &t).is_ok());
+                assert_eq!(bits_of(&direct), bits_of(&reference), "convert_rgba {n}");
+            }
+        }
+    }
+}
+
+/// A failed chunk forgets the colours it had claimed in the memo (the
+/// failure is injected after the claims), so the converter's next image
+/// still converts exactly.
+#[test]
+fn a_failed_chunk_leaves_the_converters_memo_exact() {
+    use super::{ConvertDirection, ProfileConverter};
+    let bytes = adobe_bytes();
+    let converter = ProfileConverter::new(bytes.clone(), ConvertDirection::ToWorking);
+    let images = memo_test_images();
+    // Distinct colours, so the failing chunk (the second) has claimed memo
+    // slots for colours of its own when it fails.
+    let Some(image) = images.get(2) else {
+        unreachable!()
+    };
+    let piece = image.get(..160_000).unwrap_or(image);
+    let mut failing = piece.to_vec();
+    assert!(converter.convert_with(&mut failing, Some(1)).is_err());
+    assert_eq!(bits_of(&failing), bits_of(piece), "untouched");
+    let mut again = piece.to_vec();
+    assert!(converter.convert(&mut again).is_ok());
+    assert_eq!(
+        bits_of(&again),
+        bits_of(&unmemoised(piece, &bytes, ConvertDirection::ToWorking))
+    );
+}
+
+/// The clamp's fast path (0.277.0) gives what the clamp always gave, for
+/// every `f16` bit pattern in every colour channel; alpha is untouched.
+#[test]
+fn the_clamp_equals_its_old_formula_on_every_f16() {
+    let old = |v: f16| {
+        let v = v.to_f32();
+        f16::from_f32(if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) })
+    };
+    for channel in 0..4 {
+        let mut samples: Vec<f16> = Vec::new();
+        for bits in 0..=u16::MAX {
+            let mut px = [f16::from_f32(0.25); 4];
+            if let Some(c) = px.get_mut(channel) {
+                *c = f16::from_bits(bits);
+            }
+            samples.extend(px);
+        }
+        let mut clamped = samples.clone();
+        super::clamp_colour_unit(&mut clamped);
+        for (got, was) in clamped.chunks_exact(4).zip(samples.chunks_exact(4)) {
+            for (k, (g, w)) in got.iter().zip(was).enumerate() {
+                let want = if k == 3 { *w } else { old(*w) };
+                assert_eq!(g.to_bits(), want.to_bits(), "channel {k} of {w:?}");
+            }
+        }
+    }
+}

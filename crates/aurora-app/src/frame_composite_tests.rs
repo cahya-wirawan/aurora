@@ -1134,3 +1134,180 @@ fn a_layer_far_from_the_corner_is_scoped_at_its_own_origin() {
         assert!(mismatches(got, want).is_empty(), "{id:?}");
     }
 }
+
+/// The export composite (`composite_document`) of `layers`, through the
+/// export pool or the sequential loop (0.277.0).
+fn export(
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    size: (u32, u32),
+    parallel: bool,
+) -> Result<Vec<half::f16>, aurora_io::IoError> {
+    clear_shadow_cache();
+    let _switch = Parallel::set(parallel);
+    crate::composite_document(layers, store, size.0, size.1).map(|image| image.samples().to_vec())
+}
+
+/// Asserts the pooled export equals the sequential one bit for bit;
+/// returns the samples compared and the helpers' tiles.
+#[track_caller]
+fn check_export(
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    size: (u32, u32),
+    what: &str,
+) -> (usize, u64) {
+    let sequential = ok(export(layers, store, size, false));
+    let before = crate::EXPORT_POOLED_TILES.load(std::sync::atomic::Ordering::Relaxed);
+    let pooled = ok(export(layers, store, size, true));
+    let after = crate::EXPORT_POOLED_TILES.load(std::sync::atomic::Ordering::Relaxed);
+    let bad = mismatches(&pooled, &sequential);
+    assert!(
+        bad.is_empty(),
+        "{what}: {} samples differ, first {:?}",
+        bad.len(),
+        bad.get(..bad.len().min(4))
+    );
+    (sequential.len(), (after - before) as u64)
+}
+
+/// The export through the export pool is the sequential export, bit for
+/// bit, on random trees (groups, masks, clipping, adjustments, effects),
+/// some with a store budget that pages tiles in during the pass, at a
+/// size that is not whole tiles; and the helpers really did tiles.
+#[test]
+fn the_pooled_export_is_the_sequential_export_on_random_trees() {
+    let Some(_pool) = pool_or_skip() else {
+        return;
+    };
+    let mut rng = Rng(0x5EED_0138_0003_0001);
+    let (mut compared, mut helped) = (0, 0);
+    for tree in 0..24 {
+        let budget = if tree % 3 == 0 { 24 } else { 1024 };
+        let (_d, mut store) = store_with_budget(budget);
+        let mut layers = aurora_doc::LayerTree::new();
+        for _ in 0..=rng.below(4) {
+            random_node(&mut rng, &mut layers, &mut store, None, 1);
+        }
+        for id in pixel_layers(&layers) {
+            if rng.chance(30) {
+                ok(layers.set_effects(id, Some(reaching_effects(&mut rng))));
+            }
+            if rng.chance(20) {
+                let _ = layers.set_clipped(id, true);
+            }
+            if rng.chance(20) && layers.add_mask(id, rect(100, 80, 400, 300)).is_ok() {
+                ok(layers.set_mask_inverted(id, rng.chance(50)));
+            }
+        }
+        let (n, h) = check_export(&layers, &mut store, (1000, 900), &format!("tree {tree}"));
+        compared += n;
+        helped += h;
+    }
+    assert!(helped > 0, "no tile went through the export pool");
+    assert!(compared > 1_000_000, "{compared}");
+}
+
+/// The corpus's documents export the same through the export pool.
+#[test]
+fn the_pooled_export_is_the_sequential_export_on_the_corpus() {
+    let Some(_pool) = pool_or_skip() else {
+        return;
+    };
+    let files = corpus_files();
+    if files.is_empty() {
+        assert!(
+            std::env::var_os("AURORA_REQUIRE_CORPUS").is_none(),
+            "AURORA_REQUIRE_CORPUS is set and the PSD corpus is missing"
+        );
+        println!("SKIPPED: corpus absent");
+        return;
+    }
+    let mut opened = 0;
+    for path in &files {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let Ok(document) = crate::open_psd_document(&bytes) else {
+            continue;
+        };
+        let (w, h) = document.canvas_size;
+        let tile = aurora_tile::TILE;
+        if u64::from(w) * u64::from(h) > 4_000_000
+            || (w.div_ceil(tile) * h.div_ceil(tile))
+                < crate::frame_composite::MIN_PARALLEL_TILES as u32
+        {
+            continue;
+        }
+        let (_d, mut store) = store_with_budget(512);
+        let incoming: Vec<_> = document
+            .pixels
+            .iter()
+            .map(|p| (p.layer, &p.image, p.offset))
+            .collect();
+        let (_freed, failed) = crate::replace_document_pixels(
+            &mut store,
+            aurora_doc::LayerTree::new(),
+            aurora_doc::History::new(),
+            &document.layers,
+            &incoming,
+            &document.masks,
+        );
+        if failed > 0 {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let _ = check_export(&document.layers, &mut store, (w, h), &name);
+        opened += 1;
+    }
+    println!("corpus pooled export differential: {opened} files");
+    assert!(opened > 5, "{opened}");
+}
+
+/// Every tile file under `dir`, recursively.
+fn tile_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            tile_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "tile") {
+            out.push(path);
+        }
+    }
+}
+
+/// An unreadable source tile still refuses the export through the export
+/// pool, with the sequential loop's count and first message.
+#[test]
+fn the_pooled_export_still_refuses_an_unreadable_tile() {
+    let Some(_pool) = pool_or_skip() else {
+        return;
+    };
+    let (dir, mut store) = store_with_budget(4);
+    let layers = cpu_document(&mut store);
+    ok(store.flush());
+    let mut files = Vec::new();
+    tile_files(dir.path(), &mut files);
+    assert!(!files.is_empty(), "some tiles are on the scratch disk");
+    for file in &files {
+        let bytes = ok(std::fs::read(file));
+        ok(std::fs::write(
+            file,
+            bytes.get(..bytes.len() / 2).unwrap_or(&[]),
+        ));
+    }
+    let refusal = |result: Result<Vec<half::f16>, aurora_io::IoError>| match result {
+        Err(aurora_io::IoError::IncompleteComposite { skipped, first }) => (skipped, first),
+        Ok(_) => unreachable!("an export with unreadable tiles must be refused"),
+        Err(other) => unreachable!("expected IncompleteComposite, got {other:?}"),
+    };
+    let sequential = refusal(export(&layers, &mut store, (1024, 1024), false));
+    let pooled = refusal(export(&layers, &mut store, (1024, 1024), true));
+    assert!(sequential.0 > 0);
+    assert_eq!(pooled, sequential, "the same tiles are refused");
+}
