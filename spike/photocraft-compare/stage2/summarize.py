@@ -56,14 +56,16 @@ def main():
                       f"{rng(g('input_to_frame_p50_ms'), '{:.1f}')} | {rng(g('cpu_pct_of_one_core'), '{:.0f}')} | "
                       f"{rng(g('gpu_util_mean'), '{:.0f}')} |")
     print('\n## Open (launch to the window titled with the file, then quiet)\n')
-    print('| mode | file | app | n | launch -> titled s | launch -> ready s | settled | load avg before |')
-    print('|---|---|---|---|---|---|---|---|')
+    print('| mode | file | app | n | launch -> titled s | launch -> ready s | settled | load avg before | cargo/rustc before | machine gate met |')
+    print('|---|---|---|---|---|---|---|---|---|---|')
     for k in sorted(opens):
         rs = opens[k]
         print(f"| {k[0]} | {k[1]} | {k[2]} | {len(rs)} | {rng([r.get('launch_to_title_s') for r in rs], '{:.1f}')} | "
               f"{rng([r.get('launch_to_ready_s') for r in rs], '{:.1f}')} | "
               f"{sum(1 for r in rs if r.get('after_return_settled'))}/{len(rs)} | "
-              f"{rng([float(r['machine_before']['loadavg'][0]) for r in rs], '{:.1f}')} |")
+              f"{rng([float(r['machine_before']['loadavg'][0]) for r in rs], '{:.2f}')} | "
+              f"{rng([r['machine_before'].get('cargo_rustc') for r in rs], '{}')} | "
+              f"{sum(1 for r in rs if r['machine_before'].get('gate_met'))}/{len(rs)} |")
     print('\n## Zoom state after each scenario\'s setup (window title)\n')
     seen = set()
     for (mode, sc, name, app), sts in sorted(groups.items()):
@@ -72,6 +74,13 @@ def main():
         t = sorted({s.get('title_after_setup', '') for s in sts})
         if (sc, name) not in seen:
             seen.add((sc, name)); print(f'- {sc} {name} photocraft: {t}')
+    print('\n## Where the longest interval falls (s after the first input; index = interval number)\n')
+    print('| mode | scenario | file | app | max ms | at s | index | first frame after s |')
+    print('|---|---|---|---|---|---|---|---|')
+    for (mode, sc, name, app), sts in sorted(groups.items()):
+        cell = lambda f, fmt: ', '.join(fmt.format(s_.get(f)) if s_.get(f) is not None else '-' for s_ in sts)
+        print(f"| {mode} | {sc} | {name} | {app} | {cell('max_ms', '{:.0f}')} | {cell('max_at_s', '{:.2f}')} | "
+              f"{cell('max_index', '{}')} | {cell('first_frame_after_s', '{:.3f}')} |")
     print('\n## Errors\n')
     print('\n'.join(errors) if errors else 'none')
 

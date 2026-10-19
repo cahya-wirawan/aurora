@@ -200,6 +200,12 @@ def frame_stats(stamps, t_start, t_end, inputs):
         if j < len(fr) and fr[j] - t < 250e6: lat.append((fr[j] - t) / 1e6)
     lat.sort()
     r = {'frames': len(fr), 'seconds': dur, 'fps': len(fr) / dur if dur else None, 'inputs': len(inputs)}
+    if len(fr) > 1:
+        gaps = [((b - a) / 1e6, (a - t_start) / 1e9, k) for k, (a, b) in enumerate(zip(fr, fr[1:]))]
+        g = max(gaps)
+        r['max_at_s'] = g[1]; r['max_index'] = g[2]
+        r['first_interval_ms'] = gaps[0][0]
+        r['first_frame_after_s'] = (fr[0] - t_start) / 1e9
     if iv:
         r.update({'mean_ms': statistics.fmean(iv), 'p50_ms': pct(iv, .5), 'p95_ms': pct(iv, .95),
                   'p99_ms': pct(iv, .99), 'max_ms': iv[-1],
@@ -415,13 +421,32 @@ def stop_load(p):
         except ProcessLookupError: pass
 
 
-def machine_state():
-    s = {'loadavg': open('/proc/loadavg').read().split()[:3]}
+BUILD_RE = r'^(\S*/)?(cargo|rustc|cargo-[a-z-]+|rustdoc|clippy-driver)( |$)'
+
+
+def build_count():
+    """cargo/rustc-like processes on the machine (another build or test run)."""
     try:
-        s['cargo_rustc'] = subprocess.run(['pgrep', '-c', '-f', 'rustc|cargo'], capture_output=True, text=True).stdout.strip()
-    except OSError:
-        pass
-    return s
+        out = subprocess.run(['pgrep', '-f', BUILD_RE], capture_output=True, text=True).stdout.split()
+        return len([p for p in out if int(p) != os.getpid()])
+    except (OSError, ValueError):
+        return None
+
+
+def machine_state():
+    return {'loadavg': open('/proc/loadavg').read().split()[:3], 'cargo_rustc': build_count()}
+
+
+def wait_machine(max_load, timeout_s):
+    """Waits until no cargo/rustc runs and the 1-min load average is below max_load."""
+    t0 = time.monotonic()
+    while True:
+        st = machine_state()
+        ok = st['cargo_rustc'] == 0 and (max_load is None or float(st['loadavg'][0]) < max_load)
+        if ok or time.monotonic() - t0 > timeout_s:
+            st['waited_s'] = round(time.monotonic() - t0, 1); st['gate_met'] = ok
+            return st
+        time.sleep(5)
 
 
 def main():
@@ -445,6 +470,8 @@ def main():
     ap.add_argument('--settle-timeout', type=float, default=30.0,
                     help='after the open, wait at most this long for quiet (an app may keep repainting)')
     ap.add_argument('--screens', action='store_true')
+    ap.add_argument('--max-load', type=float, default=1.0, help='idle: wait for the 1-min load average below this')
+    ap.add_argument('--wait-timeout', type=float, default=900.0)
     ap.add_argument('--scratch', default=None)
     args = ap.parse_args()
     args.scenarios = [s for s in args.scenarios.split(',') if s]
@@ -468,7 +495,7 @@ def main():
                         order = apps if (r + fi) % 2 == 0 else list(reversed(apps))
                         for app in order:
                             tag = f'{mode}-r{r}-{Path(f).stem}-{app}'
-                            before = machine_state()
+                            before = wait_machine(args.max_load if mode == 'idle' else None, args.wait_timeout)
                             print(f'[{time.strftime("%H:%M:%S")}] {tag} load={before}', flush=True)
                             rec = one_launch(app, Path(f), args, out, tag)
                             rec.update({'mode': mode, 'round': r, 'machine_before': before, 'machine_after': machine_state()})
