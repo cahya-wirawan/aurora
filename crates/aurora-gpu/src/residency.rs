@@ -1424,6 +1424,36 @@ impl TileResidency {
         self.slots.clear();
     }
 
+    /// The tiles [`Self::visible_tiles`] would list for the canvas atlas
+    /// (coverage 1) of a `viewport_px` canvas on a device whose largest
+    /// texture side is `max_dimension`, after [`Self::set_origin`] at
+    /// `doc_origin`, without an atlas (task 142: the display texture
+    /// composites exactly the atlas's tiles at or above 100 %, so a frame
+    /// that falls back to the atlas finds every one of them in hand).
+    #[must_use]
+    pub fn visible_tiles_at(
+        doc_origin: (f32, f32),
+        viewport_px: (u32, u32),
+        max_dimension: u32,
+    ) -> Vec<TileId> {
+        let (x, y) = Self::clamp_doc_origin(doc_origin);
+        let tile_size = TILE as f32;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let origin = TileId {
+            x: (x / tile_size).floor() as u32,
+            y: (y / tile_size).floor() as u32,
+        };
+        let grid = Self::grid_for_coverage_within(viewport_px, 1, max_dimension);
+        (0..grid.1)
+            .flat_map(|gy| {
+                (0..grid.0).map(move |gx| TileId {
+                    x: origin.x + gx,
+                    y: origin.y + gy,
+                })
+            })
+            .collect()
+    }
+
     /// The texel origin, in [`Self::texture`], of the slot holding tile
     /// `id`, when a slot holds it (task 142: the display texture adopts a
     /// tile the atlas has just uploaded by a GPU copy instead of a second

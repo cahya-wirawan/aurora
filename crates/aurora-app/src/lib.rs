@@ -37810,6 +37810,7 @@ impl App {
             level0,
             one_to_one,
             (origin.0, origin.1, zoom),
+            &aurora_gpu::TileResidency::visible_tiles_at(origin, canvas_px, limit),
         );
         if advance.more {
             self.needs_redraw = true;

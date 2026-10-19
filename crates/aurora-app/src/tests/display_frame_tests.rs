@@ -165,6 +165,7 @@ impl Rig {
             level0,
             one_to_one,
             (origin.0, origin.1, zoom),
+            &aurora_gpu::TileResidency::visible_tiles_at(origin, self.viewport, limit),
         );
         let t_draw = Instant::now();
         if std::env::var_os("AURORA_R11_SPLIT").is_some() {
@@ -599,7 +600,10 @@ fn once_current_a_zoom_or_a_pan_uploads_and_composites_nothing() {
             let step = rig.frame(&context, &mut photo, zoom, origin);
             assert_eq!(step.advance.uploaded, 0, "{shape:?} {zoom} {origin:?}");
             assert_eq!(step.advance.composited, 0, "{shape:?} {zoom} {origin:?}");
-            assert!(step.advance.ready);
+            // On the worker path the atlas draws at or above its floor.
+            let limit = context.device().limits().max_texture_dimension_2d;
+            let atlas_draws = worker && zoom >= zoomed_view::atlas_floor(SMALL_VIEW, limit);
+            assert_eq!(step.advance.ready, !atlas_draws, "{shape:?} {zoom}");
             assert!(!step.advance.more);
         }
         assert_eq!(rig.view.uploads(), uploads, "{shape:?}: no tile uploaded");
@@ -624,7 +628,13 @@ fn at_100_percent_a_view_not_yet_uploaded_is_not_ready() {
     assert_eq!(first.advance.uploaded, 0);
     let (frames, _) = rig.settle(&context, &mut photo, 1.0, (0.0, 0.0), 400);
     let last = rig.frame(&context, &mut photo, 1.0, (0.0, 0.0));
-    assert!(last.advance.ready, "ready once uploaded ({frames} frames)");
+    assert!(
+        !last.advance.ready,
+        "on the worker path the atlas keeps drawing at 100 % ({frames} frames)"
+    );
+    assert!(rig.settled(&photo), "and the texture is built behind it");
+    let zoomed = rig.frame(&context, &mut photo, 0.5, (0.0, 0.0));
+    assert!(zoomed.advance.ready && zoomed.advance.uploaded == 0);
     if let Some(mut worker) = rig.worker.take() {
         worker.shutdown();
     }

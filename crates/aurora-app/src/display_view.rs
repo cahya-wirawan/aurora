@@ -33,7 +33,12 @@
 //!
 //! **What is drawn.** At or above the atlas floor the frame draws the
 //! texture only when every visible tile is uploaded at its current content
-//! ([`DisplayAdvance::ready`]); otherwise it draws the atlas, unchanged.
+//! ([`DisplayAdvance::ready`]); otherwise it draws the atlas, unchanged, and
+//! the texture adopts the tiles the atlas has just uploaded by a GPU copy
+//! ([`DisplayView::adopt_from_atlas`]). On the CPU path with the background
+//! worker the atlas always draws at or above its floor (the texture's own
+//! uploads there measured slower than the atlas's under load), so the 1:1
+//! frame is the old frame plus those copies.
 //! Below the floor it always draws the texture: a tile not uploaded yet is
 //! transparent there (the checkerboard), as a cold zoomed-out pyramid is.
 //!
@@ -324,6 +329,7 @@ impl DisplayView {
         level0: Level0<'_>,
         one_to_one: bool,
         view: (f32, f32, f32),
+        atlas_tiles: &[TileId],
     ) -> DisplayAdvance {
         let FrameDocument {
             canvas,
@@ -339,8 +345,23 @@ impl DisplayView {
         let visible: Vec<TileId> = visible.iter().copied().filter(in_doc).collect();
         let mut level0 = level0;
         let phase_start = Instant::now();
-        // 1. The visible tiles current, as the path drawing them would.
-        let stale: Vec<TileId> = visible
+        // 1. The visible tiles current, as the path drawing them would. At
+        // or above the atlas floor that is the atlas's own tile list (its
+        // grid, a tile wider than the view), so a frame that falls back to
+        // the atlas finds every tile it composites already dispatched.
+        let composite_set: Vec<TileId> = if one_to_one {
+            let mut set: Vec<TileId> = atlas_tiles.iter().copied().filter(in_doc).collect();
+            set.extend(
+                visible
+                    .iter()
+                    .copied()
+                    .filter(|id| !atlas_tiles.contains(id)),
+            );
+            set
+        } else {
+            visible.clone()
+        };
+        let stale: Vec<TileId> = composite_set
             .iter()
             .copied()
             .filter(|&id| !cache.is_current(id))
@@ -348,7 +369,7 @@ impl DisplayView {
         if !stale.is_empty() {
             match (&mut level0, one_to_one) {
                 (Level0::Worker(worker), true) => crate::dispatch_or_composite_tiles(
-                    &visible,
+                    &composite_set,
                     layers,
                     active_layer,
                     store,
@@ -368,7 +389,7 @@ impl DisplayView {
                 }
                 (Level0::Sync(gpu, compositor), true) => {
                     crate::recomposite_tiles(
-                        &stale,
+                        &composite_set,
                         layers,
                         active_layer,
                         store,
@@ -402,7 +423,14 @@ impl DisplayView {
         // well would only upload them twice.
         let started = Instant::now();
         let surface = crate::composite_surface_id();
-        let drawable = !one_to_one || visible.iter().all(|&id| store.contains_tile(surface, id));
+        // On the CPU path's background worker the atlas always draws at or
+        // above its floor (task 142 review: the texture's own uploads there
+        // measured 1-6 ms slower than the atlas under load); the texture
+        // follows it by GPU copies (`adopt_from_atlas`) and its own
+        // background build, and takes over below the floor.
+        let atlas_draws = one_to_one && matches!(level0, Level0::Worker(_));
+        let drawable = !atlas_draws
+            && (!one_to_one || visible.iter().all(|&id| store.contains_tile(surface, id)));
         let budget = (!one_to_one).then_some(UPLOAD_BUDGET);
         let (uploaded, visible_left) = if drawable {
             self.upload_tiles(queue, store, &visible, budget, started)
@@ -419,7 +447,8 @@ impl DisplayView {
         let all: Vec<TileId> = (0..tiles.1)
             .flat_map(|y| (0..tiles.0).map(move |x| TileId { x, y }))
             .collect();
-        let busy_frame = !stale.is_empty() || uploaded > 0 || visible_left || !drawable;
+        let busy_frame =
+            !stale.is_empty() || uploaded > 0 || visible_left || (!drawable && !atlas_draws);
         self.quiet = if busy_frame || self.last_view != Some(view) {
             0
         } else {
@@ -472,7 +501,7 @@ impl DisplayView {
         });
         #[cfg(not(test))]
         let _ = (t_composite, t_upload, t_rest);
-        result.ready = visible.iter().all(|&id| self.uploaded_current(store, id));
+        result.ready = !atlas_draws && visible.iter().all(|&id| self.uploaded_current(store, id));
         result
     }
 
