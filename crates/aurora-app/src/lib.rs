@@ -16406,10 +16406,6 @@ impl CompositeBudget {
         }
     }
 
-    /// `Some((how many skips, the first one's message))` if any layer
-    /// tile was skipped during this pass because the store could not
-    /// read it; `None` if every tile read cleanly. See
-    /// [`Self::note_store_error`].
     /// Adds another budget's [`Self::store_error`] to this one's (the
     /// export pool's tiles, in tile order): the counts add up and the
     /// first message stays the first.
@@ -16420,6 +16416,10 @@ impl CompositeBudget {
         }
     }
 
+    /// `Some((how many skips, the first one's message))` if any layer
+    /// tile was skipped during this pass because the store could not
+    /// read it; `None` if every tile read cleanly. See
+    /// [`Self::note_store_error`].
     fn store_error(&self) -> Option<(usize, &str)> {
         let first = self.first_store_error.as_deref()?;
         Some((self.store_errors, first))
@@ -27487,6 +27487,11 @@ fn export_pool() -> Option<&'static (rayon::ThreadPool, SharedShadowCache)> {
 /// (count and first message), if any.
 type ExportTile = (Vec<half::f16>, Option<(usize, String)>);
 
+/// Tiles per pool thread in one batch of a pooled export: enough to keep
+/// the threads busy across a batch boundary, few enough that the batch's
+/// composites (512 KiB a tile) stay small next to the image.
+const EXPORT_BATCH_TILES_PER_THREAD: usize = 4;
+
 /// Test-only: tiles composited through [`export_pool`].
 #[cfg(test)]
 static EXPORT_POOLED_TILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -27653,34 +27658,40 @@ fn composite_document(
                 }
                 let serial = store.serial();
                 let mirror = std::sync::Mutex::new(&mut *store);
-                let results: Vec<ExportTile> = pool.install(|| {
-                    tiles
-                        .par_iter()
-                        .with_max_len(1)
-                        .map(|&tile_id| {
-                            let mut source =
-                                background_composite::SharedMirror::new(&mirror, serial);
-                            let mut tile_budget = CompositeBudget::for_tile_of_pass(layers);
-                            let (composited, _folded) = composite_roots_into_tile(
-                                layers,
-                                &mut source,
-                                tile_id,
-                                composite_tile_doc_origin((0, 0), tile_id),
-                                (0, 0),
-                                &mut tile_budget,
-                            );
-                            source.finish();
-                            let error = tile_budget
-                                .store_error()
-                                .map(|(skipped, first)| (skipped, first.to_owned()));
-                            (composited, error)
-                        })
-                        .collect()
-                });
-                for (&tile_id, (composited, error)) in tiles.iter().zip(results) {
-                    place(tile_id, &composited);
-                    if let Some((skipped, first)) = error {
-                        budget.absorb_store_errors(skipped, first);
+                // In batches of a few tiles per thread, each placed before
+                // the next is composited, so the pass holds about that many
+                // tile composites beyond the image, as the loop holds one.
+                let batch = pool.current_num_threads().max(1) * EXPORT_BATCH_TILES_PER_THREAD;
+                for tiles in tiles.chunks(batch) {
+                    let results: Vec<ExportTile> = pool.install(|| {
+                        tiles
+                            .par_iter()
+                            .with_max_len(1)
+                            .map(|&tile_id| {
+                                let mut source =
+                                    background_composite::SharedMirror::new(&mirror, serial);
+                                let mut tile_budget = CompositeBudget::for_tile_of_pass(layers);
+                                let (composited, _folded) = composite_roots_into_tile(
+                                    layers,
+                                    &mut source,
+                                    tile_id,
+                                    composite_tile_doc_origin((0, 0), tile_id),
+                                    (0, 0),
+                                    &mut tile_budget,
+                                );
+                                source.finish();
+                                let error = tile_budget
+                                    .store_error()
+                                    .map(|(skipped, first)| (skipped, first.to_owned()));
+                                (composited, error)
+                            })
+                            .collect()
+                    });
+                    for (&tile_id, (composited, error)) in tiles.iter().zip(results) {
+                        place(tile_id, &composited);
+                        if let Some((skipped, first)) = error {
+                            budget.absorb_store_errors(skipped, first);
+                        }
                     }
                 }
                 #[cfg(test)]

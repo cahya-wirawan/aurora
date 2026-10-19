@@ -294,9 +294,6 @@ fn stage_rgba(
     let mut converted: Vec<f32> = Vec::new();
     let mut converted_bits: Vec<u64> = Vec::new();
     for (index, chunk) in samples.chunks(CHUNK_PIXELS * 4).enumerate() {
-        if fail_chunk == Some(index) {
-            return Err(injected_failure());
-        }
         misses.clear();
         miss_slots.clear();
         fixups.clear();
@@ -342,6 +339,12 @@ fn stage_rgba(
                     staged.rgb.extend([f16::ZERO; 3]);
                 }
             }
+        }
+        // A test's injected failure stands where `lcms2` would refuse the
+        // chunk: after it has claimed its memo slots.
+        if fail_chunk == Some(index) {
+            cache.forget_pending();
+            return Err(injected_failure());
         }
         if misses.is_empty() {
             continue;

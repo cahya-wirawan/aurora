@@ -525,8 +525,10 @@ fn memo_test_images() -> Vec<Vec<f16>> {
             every_bit_pattern.push(if bits % 5 == 0 { f16::ZERO } else { f16::ONE });
         }
     }
+    // Over the parallel threshold (2^20 samples), so the converter splits
+    // it across threads.
     let mut distinct = Vec::new();
-    for _ in 0..200_000 {
+    for _ in 0..300_000 {
         distinct.extend([0, 1, 2].map(|_| f16::from_f32((lcg(&mut seed) % 256) as f32 / 255.0)));
         distinct.push(alpha(&mut seed));
     }
@@ -600,18 +602,21 @@ fn the_memoised_conversion_equals_converting_every_pixel() {
     }
 }
 
-/// A failed chunk forgets the colours it had claimed in the memo, so the
-/// converter's next image still converts exactly.
+/// A failed chunk forgets the colours it had claimed in the memo (the
+/// failure is injected after the claims), so the converter's next image
+/// still converts exactly.
 #[test]
 fn a_failed_chunk_leaves_the_converters_memo_exact() {
     use super::{ConvertDirection, ProfileConverter};
     let bytes = adobe_bytes();
     let converter = ProfileConverter::new(bytes.clone(), ConvertDirection::ToWorking);
     let images = memo_test_images();
-    let Some(image) = images.first() else {
+    // Distinct colours, so the failing chunk (the second) has claimed memo
+    // slots for colours of its own when it fails.
+    let Some(image) = images.get(2) else {
         unreachable!()
     };
-    let piece = image.get(..80_000).unwrap_or(image);
+    let piece = image.get(..160_000).unwrap_or(image);
     let mut failing = piece.to_vec();
     assert!(converter.convert_with(&mut failing, Some(1)).is_err());
     assert_eq!(bits_of(&failing), bits_of(piece), "untouched");
