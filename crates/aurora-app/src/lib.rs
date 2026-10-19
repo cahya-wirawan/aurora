@@ -27483,15 +27483,6 @@ fn export_pool() -> Option<&'static (rayon::ThreadPool, SharedShadowCache)> {
     .as_ref()
 }
 
-/// One tile of a pooled export: its composite and its unreadable reads
-/// (count and first message), if any.
-type ExportTile = (Vec<half::f16>, Option<(usize, String)>);
-
-/// Tiles per pool thread in one batch of a pooled export: enough to keep
-/// the threads busy across a batch boundary, few enough that the batch's
-/// composites (512 KiB a tile) stay small next to the image.
-const EXPORT_BATCH_TILES_PER_THREAD: usize = 4;
-
 /// Test-only: tiles composited through [`export_pool`].
 #[cfg(test)]
 static EXPORT_POOLED_TILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -27615,25 +27606,26 @@ fn composite_document(
         let tiles: Vec<aurora_tile::TileId> = (0..tiles_y)
             .flat_map(|y| (0..tiles_x).map(move |x| aurora_tile::TileId { x, y }))
             .collect();
-        let mut place = |tile_id: aurora_tile::TileId, composited: &[half::f16]| {
-            let origin_x = tile_id.x * tile_size;
-            let origin_y = tile_id.y * tile_size;
-            let w = (width - origin_x).min(tile_size);
-            let h = (height - origin_y).min(tile_size);
-            for ly in 0..h {
-                let dst_start = ((origin_y + ly) as usize * width as usize + origin_x as usize)
-                    * aurora_tile::CHANNELS;
-                let dst_end = dst_start + (w as usize) * aurora_tile::CHANNELS;
-                let src_start = (ly * tile_size) as usize * aurora_tile::CHANNELS;
-                let src_end = src_start + (w as usize) * aurora_tile::CHANNELS;
-                if let (Some(dst), Some(src)) = (
-                    samples.get_mut(dst_start..dst_end),
-                    composited.get(src_start..src_end),
-                ) {
-                    dst.copy_from_slice(src);
+        let place =
+            |samples: &mut [half::f16], tile_id: aurora_tile::TileId, composited: &[half::f16]| {
+                let origin_x = tile_id.x * tile_size;
+                let origin_y = tile_id.y * tile_size;
+                let w = (width - origin_x).min(tile_size);
+                let h = (height - origin_y).min(tile_size);
+                for ly in 0..h {
+                    let dst_start = ((origin_y + ly) as usize * width as usize + origin_x as usize)
+                        * aurora_tile::CHANNELS;
+                    let dst_end = dst_start + (w as usize) * aurora_tile::CHANNELS;
+                    let src_start = (ly * tile_size) as usize * aurora_tile::CHANNELS;
+                    let src_end = src_start + (w as usize) * aurora_tile::CHANNELS;
+                    if let (Some(dst), Some(src)) = (
+                        samples.get_mut(dst_start..dst_end),
+                        composited.get(src_start..src_end),
+                    ) {
+                        dst.copy_from_slice(src);
+                    }
                 }
-            }
-        };
+            };
 
         // `(0, 0)` as the reference origin: an export always measures
         // from the document's own origin, unlike the on-screen path,
@@ -27643,11 +27635,15 @@ fn composite_document(
         //
         // Many tiles fold on the export pool (0.277.0), with the
         // background compositor's per-tile code: each task reads the store
-        // through a `SharedMirror` (a lock around it) and gives its tile a
-        // budget of its own; the tiles are placed and their unreadable
-        // reads counted in tile order, so the image and the refusal are
-        // the loop's below. This thread waits for the pool, as it waited
-        // for the loop.
+        // through a `SharedMirror` (a lock around it), gives its tile a
+        // budget of its own, copies the tile into the image (tiles cover
+        // disjoint pixels, so the order of the copies changes nothing) and
+        // gives its buffer back to its own thread's pool, so a pass holds
+        // about one tile per thread beyond the image, as the loop holds
+        // one, and no buffer is freed on another thread than the one that
+        // allocated it. The tiles' unreadable reads are then counted in
+        // tile order, so the image and the refusal are the loop's below.
+        // This thread waits for the pool, as it waited for the loop.
         let pooled = frame_composite::parallel_enabled()
             && tiles.len() >= frame_composite::MIN_PARALLEL_TILES
             && export_pool().is_some_and(|(pool, shadows)| {
@@ -27658,41 +27654,38 @@ fn composite_document(
                 }
                 let serial = store.serial();
                 let mirror = std::sync::Mutex::new(&mut *store);
-                // In batches of a few tiles per thread, each placed before
-                // the next is composited, so the pass holds about that many
-                // tile composites beyond the image, as the loop holds one.
-                let batch = pool.current_num_threads().max(1) * EXPORT_BATCH_TILES_PER_THREAD;
-                for tiles in tiles.chunks(batch) {
-                    let results: Vec<ExportTile> = pool.install(|| {
-                        tiles
-                            .par_iter()
-                            .with_max_len(1)
-                            .map(|&tile_id| {
-                                let mut source =
-                                    background_composite::SharedMirror::new(&mirror, serial);
-                                let mut tile_budget = CompositeBudget::for_tile_of_pass(layers);
-                                let (composited, _folded) = composite_roots_into_tile(
-                                    layers,
-                                    &mut source,
-                                    tile_id,
-                                    composite_tile_doc_origin((0, 0), tile_id),
-                                    (0, 0),
-                                    &mut tile_budget,
-                                );
-                                source.finish();
-                                let error = tile_budget
-                                    .store_error()
-                                    .map(|(skipped, first)| (skipped, first.to_owned()));
-                                (composited, error)
-                            })
-                            .collect()
-                    });
-                    for (&tile_id, (composited, error)) in tiles.iter().zip(results) {
-                        place(tile_id, &composited);
-                        if let Some((skipped, first)) = error {
-                            budget.absorb_store_errors(skipped, first);
-                        }
-                    }
+                let image = std::sync::Mutex::new(samples.as_mut_slice());
+                let errors: Vec<Option<(usize, String)>> = pool.install(|| {
+                    tiles
+                        .par_iter()
+                        .with_max_len(1)
+                        .map(|&tile_id| {
+                            let mut source =
+                                background_composite::SharedMirror::new(&mirror, serial);
+                            let mut tile_budget = CompositeBudget::for_tile_of_pass(layers);
+                            let (composited, _folded) = composite_roots_into_tile(
+                                layers,
+                                &mut source,
+                                tile_id,
+                                composite_tile_doc_origin((0, 0), tile_id),
+                                (0, 0),
+                                &mut tile_budget,
+                            );
+                            source.finish();
+                            place(
+                                &mut background_composite::lock(&image),
+                                tile_id,
+                                &composited,
+                            );
+                            tile_buffers::recycle(composited);
+                            tile_budget
+                                .store_error()
+                                .map(|(skipped, first)| (skipped, first.to_owned()))
+                        })
+                        .collect()
+                });
+                for (skipped, first) in errors.into_iter().flatten() {
+                    budget.absorb_store_errors(skipped, first);
                 }
                 #[cfg(test)]
                 EXPORT_POOLED_TILES.fetch_add(tiles.len(), std::sync::atomic::Ordering::Relaxed);
@@ -27710,7 +27703,7 @@ fn composite_document(
                     (0, 0),
                     &mut budget,
                 );
-                place(tile_id, &composited);
+                place(&mut samples, tile_id, &composited);
             }
         }
 
