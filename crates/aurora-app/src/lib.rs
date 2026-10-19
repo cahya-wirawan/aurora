@@ -31014,12 +31014,11 @@ struct App {
     /// sub-window rather than growing/shrinking with the canvas area; a
     /// real, separate follow-on fix, not new scope this field invents.
     residency: Option<aurora_gpu::TileResidency>,
-    /// The zoomed-out view's atlas (0.275.0, `zoomed_view`), built on the
-    /// first frame below the 1:1 atlas floor, with the viewport it was
-    /// sized for; `zoomed_key` is the (composite cache id, canvas size,
-    /// level) its slots were filled for, and any change forgets them.
-    zoomed_residency: Option<(aurora_gpu::TileResidency, (u32, u32))>,
-    zoomed_key: Option<(u64, (u32, u32), u32)>,
+    /// The zoomed-out view's atlases (0.275.0, `zoomed_view`; two since
+    /// task 140, the frame's level and the next one it blends toward),
+    /// built on the first frame below the 1:1 atlas floor for the canvas
+    /// area they were sized for.
+    zoomed_atlases: Option<zoomed_view::ZoomedAtlases>,
     /// The last frame drew the zoomed-out atlas: the next 1:1 frame must
     /// forget the canvas atlas's slots, because the zoomed-out atlas
     /// consumed the composite tiles' dirty flags at level 0.
@@ -31598,8 +31597,7 @@ impl App {
             layer_rows,
             scroll_follow: ScrollFollow::default(),
             residency: None,
-            zoomed_residency: None,
-            zoomed_key: None,
+            zoomed_atlases: None,
             zoomed_drawn: false,
             canvas_pipeline: None,
             compositor: None,
@@ -37720,70 +37718,55 @@ impl App {
         }
         let store = self.doc.tile_store.as_mut()?;
         let anchor = active_layer_origin(&self.doc.layers, self.doc.active_layer);
-        let frame = zoomed_view::plan(
+        let mut frame = zoomed_view::plan_blended(
             canvas_local_origin(&self.doc.canvas_view, anchor),
             zoom,
             canvas_px,
             self.doc.canvas_size,
             zoomed_view::zoomed_floor(canvas_px, limit),
+            zoomed_view::atlas_floor(canvas_px, limit),
         );
-        let fresh = !matches!(&self.zoomed_residency, Some((_, size)) if *size == canvas_px);
-        if fresh {
-            self.zoomed_residency = Some((
-                aurora_gpu::TileResidency::with_coverage(
-                    gpu.device(),
-                    gpu.queue(),
-                    canvas_px,
-                    zoomed_view::COVERAGE,
-                ),
+        if self
+            .zoomed_atlases
+            .as_ref()
+            .map(zoomed_view::ZoomedAtlases::size)
+            != Some(canvas_px)
+        {
+            self.zoomed_atlases = Some(zoomed_view::ZoomedAtlases::new(
+                gpu.device(),
+                gpu.queue(),
                 canvas_px,
             ));
         }
-        let (atlas, _) = self.zoomed_residency.as_mut()?;
-        let key = (
-            self.doc.composite_cache.id(),
-            self.doc.canvas_size,
-            frame.level,
-        );
-        if fresh || self.zoomed_key != Some(key) || !self.zoomed_drawn {
-            atlas.forget_slots();
-            self.zoomed_key = Some(key);
-        }
-        atlas.set_channel_gain(self.doc.channel_view.gain());
-        atlas.set_document_clip(Some(frame.doc_clip));
-        atlas.set_origin(
-            gpu.queue(),
-            frame.level_origin,
-            frame.viewport_px,
-            frame.level_zoom,
-        );
+        let atlases = self.zoomed_atlases.as_mut()?;
         let gpu_path =
             document_qualifies_for_gpu_compositing(&self.doc.layers) && self.compositor.is_some();
         let level0 = match self.composite_worker.as_mut() {
             Some(worker) if !gpu_path => zoomed_view::Level0::Worker(worker),
             _ => zoomed_view::Level0::Sync(Some(gpu), self.compositor.as_mut()),
         };
-        let advance = zoomed_view::advance(
-            frame.level,
-            &frame.visible,
-            self.doc.canvas_size,
-            &self.doc.layers,
-            self.doc.active_layer,
-            store,
-            &mut self.doc.composite_cache,
+        // Advances the pyramid and uploads the shown levels (`sync_only`
+        // inside).
+        let advance = atlases.prepare(
+            gpu.device(),
+            gpu.queue(),
+            &mut frame,
+            zoomed_view::FrameDocument {
+                cache_id: self.doc.composite_cache.id(),
+                canvas: self.doc.canvas_size,
+                layers: &self.doc.layers,
+                active_layer: self.doc.active_layer,
+                store,
+                cache: &mut self.doc.composite_cache,
+            },
+            !self.zoomed_drawn,
+            self.doc.channel_view.gain(),
             level0,
             zoomed_view::PYRAMID_FRAME_BUDGET,
         );
         if advance.more {
             self.needs_redraw = true;
         }
-        let _ = atlas.sync_only(
-            gpu.queue(),
-            store,
-            zoomed_view::level_surface(frame.level),
-            usize::MAX,
-            &frame.visible,
-        );
         // At once, not when the frame is drawn (task 136 review, ZV-2): the
         // upload consumed the composite tiles' dirty flags at level 0, so
         // even a frame whose surface texture never arrives must make the
@@ -38009,21 +37992,31 @@ impl App {
                     let viewport = canvas_area_physical_rect(&self.workspace, self.scale_factor);
                     let scissor =
                         viewport.and_then(|rect| clamp_canvas_to_surface(rect, surface.size()));
-                    let (atlas, viewport) = match zoomed_frame.as_ref() {
-                        Some(frame) => (
-                            self.zoomed_residency.as_ref().map(|(atlas, _)| atlas),
-                            viewport.map(|rect| zoomed_view_rect(rect, frame)),
-                        ),
-                        None => (self.residency.as_ref(), viewport),
+                    let viewport = match zoomed_frame.as_ref() {
+                        Some(frame) => viewport.map(|rect| zoomed_view_rect(rect, frame)),
+                        None => viewport,
                     };
+                    // Task 140: a zoomed-out frame binds both of its
+                    // atlases when it blends.
+                    let bind_group = self.canvas_pipeline.as_ref().and_then(|canvas| {
+                        match zoomed_frame.as_ref() {
+                            Some(frame) => self
+                                .zoomed_atlases
+                                .as_ref()
+                                .map(|atlases| atlases.bind_group(canvas, gpu.device(), frame)),
+                            None => self
+                                .residency
+                                .as_ref()
+                                .map(|residency| canvas.bind_group(gpu.device(), residency)),
+                        }
+                    });
                     if let (
-                        Some(residency),
+                        Some(bind_group),
                         Some(canvas_pipeline),
                         Some((x, y, w, h)),
                         Some(clip),
-                    ) = (atlas, self.canvas_pipeline.as_mut(), viewport, scissor)
+                    ) = (bind_group, self.canvas_pipeline.as_mut(), viewport, scissor)
                     {
-                        let bind_group = canvas_pipeline.bind_group(gpu.device(), residency);
                         let pipeline = canvas_pipeline.pipeline(gpu.device(), surface.format());
                         // The viewport keeps the canvas area's own rect, so
                         // the image is never squeezed; the scissor, clamped

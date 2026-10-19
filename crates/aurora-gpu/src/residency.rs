@@ -16,8 +16,9 @@ use crate::error::GpuError;
 
 /// The `Canvas` uniform `canvas.wgsl` expects: `uv_offset`/`uv_scale`
 /// (two `vec2<f32>`s), `doc_clip` (a `vec4<f32>`) and `channel_gain` (a
-/// `vec4<f32>`, 0.232.0), 48 bytes total.
-const UNIFORM_SIZE: u64 = 48;
+/// `vec4<f32>`, 0.232.0) and `blend` (a `vec4<f32>`, task 140: `x` is the
+/// weight of the partner level, the rest unused), 64 bytes total.
+const UNIFORM_SIZE: u64 = 64;
 
 /// `channel_gain` when every channel is shown: multiplying by `1.0` is
 /// exact, so the picture is bit-identical to one drawn without a gain.
@@ -994,6 +995,11 @@ pub struct TileResidency {
     /// hidden. A view setting only -- nothing stored is touched. See
     /// [`Self::set_channel_gain`].
     channel_gain: [f32; 3],
+    /// The weight `canvas.wgsl` gives the partner atlas bound beside this
+    /// one (task 140, the zoomed-out view's blend between two pyramid
+    /// levels): `0.0` draws this atlas alone, bit-identically to a canvas
+    /// with no partner. See [`Self::set_blend_weight`].
+    blend_weight: f32,
     /// How many viewports per axis the atlas covers at zoom 1 (1 for the
     /// canvas's own atlas; 2 for the zoomed-out view's, see
     /// [`Self::with_coverage`]).
@@ -1167,6 +1173,7 @@ impl TileResidency {
             sub_tile: (0.0, 0.0),
             doc_clip: None,
             channel_gain: FULL_GAIN,
+            blend_weight: 0.0,
             coverage,
             mip_levels,
         };
@@ -1327,6 +1334,26 @@ impl TileResidency {
     /// bit-identically to a canvas with no gain.
     pub fn set_channel_gain(&mut self, gain: [f32; 3]) {
         self.channel_gain = gain.map(|g| if g.is_nan() { 1.0 } else { g.clamp(0.0, 1.0) });
+    }
+
+    /// Sets how much of the partner atlas the canvas mixes into this one's
+    /// picture (task 140): the shader shows `mix(this, partner, weight)`,
+    /// premultiplied, before the checkerboard. `0.0` (the default, and any
+    /// NaN, zero or negative weight) skips the partner entirely, so the
+    /// picture is bit-identical to one drawn without it; a weight above
+    /// `1.0` is clamped. Takes effect on the next [`Self::set_origin`], as
+    /// [`Self::set_channel_gain`] does. Only a bind group from
+    /// [`crate::CanvasPipeline::bind_group_blended`] has a partner; with
+    /// [`crate::CanvasPipeline::bind_group`] the partner is this atlas
+    /// itself, so a stray weight could only mix the atlas with itself.
+    pub fn set_blend_weight(&mut self, weight: f32) {
+        self.blend_weight = if weight > 0.0 { weight.min(1.0) } else { 0.0 };
+    }
+
+    /// The weight [`Self::set_blend_weight`] last set.
+    #[must_use]
+    pub fn blend_weight(&self) -> f32 {
+        self.blend_weight
     }
 
     /// The gain [`Self::set_channel_gain`] last set.
@@ -1833,6 +1860,7 @@ impl TileResidency {
             .into_iter()
             .chain(clip)
             .chain([gain_r, gain_g, gain_b, 1.0])
+            .chain([self.blend_weight, 0.0, 0.0, 0.0])
         {
             bytes.extend_from_slice(&value.to_le_bytes());
         }

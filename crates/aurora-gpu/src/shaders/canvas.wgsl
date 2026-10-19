@@ -23,11 +23,22 @@ struct Canvas {
     // what is stored, composited, exported or measured. All ones is
     // bit-identical to no gain (x * 1.0 == x).
     channel_gain: vec4<f32>,
+    // Task 140: `x` is the weight of the partner atlas (binding 3), the
+    // next pyramid level of the zoomed-out view: the fragment shows
+    // `mix(this level, partner level, x)`, premultiplied, before the
+    // checkerboard. `0.0` (every atlas's default) never samples the
+    // partner, so the picture is bit-identical to one with no partner.
+    // `yzw` are unused.
+    blend: vec4<f32>,
 };
 
 @group(0) @binding(0) var canvas_tex: texture_2d<f32>;
 @group(0) @binding(1) var canvas_smp: sampler;
 @group(0) @binding(2) var<uniform> canvas: Canvas;
+// Task 140: the partner atlas and its own uniform (only its `uv` mapping
+// is read). The 1:1 canvas binds its own atlas here and a zero weight.
+@group(0) @binding(3) var partner_tex: texture_2d<f32>;
+@group(0) @binding(4) var<uniform> partner: Canvas;
 
 // 0.192.1: set by the pipeline when the render target is an sRGB-aware
 // format (`TextureFormat::is_srgb`). The atlas, the checkerboard and the
@@ -48,6 +59,8 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
     // Position across the viewport, 0..1 (top-left origin).
     @location(1) t: vec2<f32>,
+    // The partner atlas's uv for the same fragment (task 140).
+    @location(2) partner_uv: vec2<f32>,
 };
 
 // Fullscreen triangle; no vertex buffer.
@@ -59,6 +72,7 @@ fn vs_canvas(@builtin(vertex_index) i: u32) -> VsOut {
     out.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
     out.uv = vec2<f32>(x, y) * canvas.uv_scale + canvas.uv_offset;
     out.t = vec2<f32>(x, y);
+    out.partner_uv = vec2<f32>(x, y) * partner.uv_scale + partner.uv_offset;
     return out;
 }
 
@@ -70,7 +84,16 @@ fn fs_canvas(in: VsOut) -> @location(0) vec4<f32> {
         || in.t.x >= canvas.doc_clip.z || in.t.y >= canvas.doc_clip.w) {
         discard;
     }
-    let c = textureSample(canvas_tex, canvas_smp, in.uv);
+    var c = textureSample(canvas_tex, canvas_smp, in.uv);
+    // Task 140: the zoomed-out view's blend toward the next pyramid level
+    // (trilinear across two atlases). The weight is a uniform, so the
+    // branch is uniform control flow and a zero weight leaves `c` exactly
+    // as sampled. Both atlases are premultiplied, so the mix is the
+    // alpha-weighted one, like the hardware's bilinear average.
+    if (canvas.blend.x > 0.0) {
+        let p = textureSample(partner_tex, canvas_smp, in.partner_uv);
+        c = mix(c, p, canvas.blend.x);
+    }
     // Checkerboard behind transparent areas, as any image editor shows.
     let sq = floor(in.pos.xy / 8.0);
     let check = select(0.18, 0.24, (sq.x + sq.y) % 2.0 == 0.0);

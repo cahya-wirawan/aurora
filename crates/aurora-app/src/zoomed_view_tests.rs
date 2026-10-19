@@ -747,7 +747,7 @@ fn the_zoomed_out_frame_marks_itself_drawn_as_soon_as_it_uploads() {
     let body = source.get(start..).unwrap_or_default();
     let end = body.find("\n    fn redraw(").unwrap_or(body.len());
     let body = body.get(..end).unwrap_or_default();
-    let upload = body.find("sync_only(").unwrap_or(usize::MAX);
+    let upload = body.find(".prepare(").unwrap_or(usize::MAX);
     let marked = body.find("self.zoomed_drawn = true;").unwrap_or(0);
     assert!(upload < usize::MAX && marked > upload, "{upload} {marked}");
 }
