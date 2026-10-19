@@ -548,6 +548,7 @@ mod autosave_files;
 mod background_autosave;
 mod background_composite;
 mod background_open;
+mod bench_launch;
 mod channels_app;
 mod clipboard_app;
 mod clipboard_pixels;
@@ -38338,7 +38339,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
         };
         let size = window.inner_size();
-        let surface =
+        let mut surface =
             match gpu.create_surface(window.clone(), (size.width.max(1), size.height.max(1))) {
                 Ok(surface) => surface,
                 Err(err) => {
@@ -38346,6 +38347,8 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
             };
+        // Measurement only: unset, the surface keeps `AutoVsync`.
+        bench_launch::apply_present_mode_from_env(&mut surface, gpu.device());
 
         // 0.192.1: the swapchain format decides whether the canvas shader
         // must hand linear light (`SRGB_TARGET`); logged once so a report
@@ -38427,6 +38430,10 @@ impl ApplicationHandler<AppEvent> for App {
         self.surface = Some(surface);
         self.adapter = Some(adapter);
         self.push_accessibility();
+        // Measurement only: `AURORA_OPEN` opens through File > Open's route.
+        if let Some(path) = bench_launch::open_path_from_env() {
+            self.open_file(&path);
+        }
     }
 
     fn user_event(&mut self, _el: &ActiveEventLoop, event: AppEvent) {
