@@ -451,7 +451,7 @@ const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
 /// [`CHANNELS`] contributes nothing for its final incomplete texel, the
 /// same contract `premultiply_rgba` and the pre-0.96.0 spelling of
 /// [`extend_premultiplied_le_bytes`] both have.
-fn serialize_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
+pub(crate) fn serialize_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
     #[cfg(target_endian = "little")]
     if copy_if_premultiplied_already(texels, out) {
         return;
@@ -1422,6 +1422,47 @@ impl TileResidency {
     /// texture, the origin and the uniform; only the slot map goes.
     pub fn forget_slots(&mut self) {
         self.slots.clear();
+    }
+
+    /// The tiles [`Self::visible_tiles`] would list for the canvas atlas
+    /// (coverage 1) of a `viewport_px` canvas on a device whose largest
+    /// texture side is `max_dimension`, after [`Self::set_origin`] at
+    /// `doc_origin`, without an atlas (task 142: the display texture
+    /// composites exactly the atlas's tiles at or above 100 %, so a frame
+    /// that falls back to the atlas finds every one of them in hand).
+    #[must_use]
+    pub fn visible_tiles_at(
+        doc_origin: (f32, f32),
+        viewport_px: (u32, u32),
+        max_dimension: u32,
+    ) -> Vec<TileId> {
+        let (x, y) = Self::clamp_doc_origin(doc_origin);
+        let tile_size = TILE as f32;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let origin = TileId {
+            x: (x / tile_size).floor() as u32,
+            y: (y / tile_size).floor() as u32,
+        };
+        let grid = Self::grid_for_coverage_within(viewport_px, 1, max_dimension);
+        (0..grid.1)
+            .flat_map(|gy| {
+                (0..grid.0).map(move |gx| TileId {
+                    x: origin.x + gx,
+                    y: origin.y + gy,
+                })
+            })
+            .collect()
+    }
+
+    /// The texel origin, in [`Self::texture`], of the slot holding tile
+    /// `id`, when a slot holds it (task 142: the display texture adopts a
+    /// tile the atlas has just uploaded by a GPU copy instead of a second
+    /// upload). Only as current as the last [`Self::sync`] made it.
+    #[must_use]
+    pub fn slot_origin(&self, id: TileId) -> Option<(u32, u32)> {
+        let slot = (id.x % self.grid.0.max(1), id.y % self.grid.1.max(1));
+        (self.slots.get(&slot) == Some(&id) && self.mip_levels >= 1)
+            .then_some((slot.0 * TILE, slot.1 * TILE))
     }
 
     /// How many slots currently hold a tile (0.172.0, for tests).

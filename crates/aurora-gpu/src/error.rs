@@ -36,4 +36,11 @@ pub enum GpuError {
         expected: usize,
         actual: usize,
     },
+    /// A document that cannot be held as a [`crate::DisplayTexture`] on
+    /// this device (empty, or a texture limit under three tiles).
+    #[error("the document cannot be held as a display texture on this device")]
+    DisplayTooLarge,
+    /// A tile outside the display texture's document was uploaded.
+    #[error("tile is outside the display texture's document")]
+    DisplayTileOutside,
 }

@@ -566,6 +566,7 @@ mod crop_app;
 mod crop_ratio_tests;
 #[cfg(test)]
 mod crop_tests;
+mod display_view;
 mod document_close;
 mod document_overflow;
 mod document_overflow_app;
@@ -23990,6 +23991,8 @@ fn prewarm_gpu_pipelines(
 ) {
     if let Err(err) = aurora_render::capture_wgpu_errors(device, || {
         let _ = canvas_pipeline.pipeline(device, surface_format);
+        // Task 142: the display texture's pipeline, built here too.
+        let _ = canvas_pipeline.display_pipeline(device, surface_format);
     }) {
         // A failed build leaves an invalid pipeline cached; a fresh
         // `CanvasPipeline` builds it again on the first frame.
@@ -31024,6 +31027,14 @@ struct App {
     /// forget the canvas atlas's slots, because the zoomed-out atlas
     /// consumed the composite tiles' dirty flags at level 0.
     zoomed_drawn: bool,
+    /// Task 142: the active document's display texture (`display_view`),
+    /// when the document fits the device's display budget.
+    display: Option<display_view::DisplayView>,
+    /// The key a display texture failed to build for (out of memory, say),
+    /// so the frame does not retry it every turn.
+    display_refused: Option<display_view::DisplayKey>,
+    /// The device's display budget, read on the first frame.
+    display_budget: Option<aurora_gpu::DisplayBudget>,
     /// The render pipeline that draws `residency`'s own atlas to the
     /// screen (`aurora_gpu::CanvasPipeline`) — built alongside
     /// `residency`, `None` under the same conditions.
@@ -31600,6 +31611,9 @@ impl App {
             residency: None,
             zoomed_atlases: None,
             zoomed_drawn: false,
+            display: None,
+            display_refused: None,
+            display_budget: None,
             canvas_pipeline: None,
             compositor: None,
             path_pipeline: None,
@@ -37710,6 +37724,123 @@ impl App {
     /// zoomed-out atlas, advances the pyramid under the frame's budgets,
     /// uploads the shown level and returns the frame's geometry; `None`
     /// (nothing touched) at or above the floor.
+    /// Task 142: prepares a frame drawn from the display texture
+    /// (`display_view`): builds or re-keys it, makes the visible tiles
+    /// current, uploads what changed and rebuilds its mips. `None` when the
+    /// document is over the display budget (the atlas or the zoomed-out
+    /// view draws, exactly as before), when it cannot be built, or at or
+    /// above the 1:1 atlas floor while a visible tile is not uploaded at its
+    /// current content yet (the atlas draws that frame).
+    // One linear flow (eligibility, build, the frame's work, the view);
+    // its pieces live in `display_view` already.
+    #[allow(clippy::too_many_lines)]
+    fn prepare_display_frame(&mut self, gpu: &GpuContext) -> Option<display_view::DisplayFrame> {
+        let canvas_px = canvas_area_physical_size(&self.workspace, self.scale_factor)?;
+        let limit = gpu.device().limits().max_texture_dimension_2d;
+        let budget = *self.display_budget.get_or_insert_with(|| {
+            aurora_gpu::display_budget(
+                gpu.adapter_info().device_type,
+                aurora_tile::physical_ram_bytes(),
+                small_machine::is_small_machine(),
+            )
+        });
+        if self.canvas_pipeline.is_none()
+            || !display_view::eligible(self.doc.canvas_size, limit, budget, display_view::mode())
+        {
+            self.display = None;
+            return None;
+        }
+        let store = self.doc.tile_store.as_mut()?;
+        let key = (
+            self.doc.composite_cache.id(),
+            store.serial(),
+            self.doc.canvas_size,
+        );
+        if self.display_refused == Some(key) {
+            return None;
+        }
+        if self.display.as_ref().map(display_view::DisplayView::key) != Some(key) {
+            // The old texture goes first, so the two never coexist.
+            self.display = None;
+            match aurora_render::capture_wgpu_errors(gpu.device(), || {
+                display_view::DisplayView::new(gpu.device(), key)
+            }) {
+                Ok(Ok(view)) => {
+                    tracing::info!(
+                        doc = ?self.doc.canvas_size,
+                        pages = view.texture().pages().len(),
+                        mib = view.texture().bytes() as f64 / f64::from(1_u32 << 20),
+                        "display texture built"
+                    );
+                    self.display = Some(view);
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(%err, "no display texture for this document");
+                    self.display_refused = Some(key);
+                    return None;
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "building the display texture failed");
+                    self.display_refused = Some(key);
+                    return None;
+                }
+            }
+        }
+        let zoom = effective_residency_zoom(self.doc.canvas_view.zoom(), self.scale_factor);
+        let anchor = active_layer_origin(&self.doc.layers, self.doc.active_layer);
+        let origin = canvas_local_origin(&self.doc.canvas_view, anchor);
+        let one_to_one = zoom >= zoomed_view::atlas_floor(canvas_px, limit);
+        let visible = display_view::visible_tiles(origin, zoom, canvas_px, self.doc.canvas_size);
+        let gpu_path =
+            document_qualifies_for_gpu_compositing(&self.doc.layers) && self.compositor.is_some();
+        let level0 = match self.composite_worker.as_mut() {
+            Some(worker) if !gpu_path => zoomed_view::Level0::Worker(worker),
+            _ => zoomed_view::Level0::Sync(Some(gpu), self.compositor.as_mut()),
+        };
+        let display = self.display.as_mut()?;
+        let advance = display.prepare(
+            gpu.device(),
+            gpu.queue(),
+            zoomed_view::FrameDocument {
+                cache_id: self.doc.composite_cache.id(),
+                canvas: self.doc.canvas_size,
+                layers: &self.doc.layers,
+                active_layer: self.doc.active_layer,
+                store,
+                cache: &mut self.doc.composite_cache,
+            },
+            &visible,
+            level0,
+            one_to_one,
+            gpu_path,
+            (origin.0, origin.1, zoom),
+            &aurora_gpu::TileResidency::visible_tiles_at(origin, canvas_px, limit),
+        );
+        if advance.more {
+            self.needs_redraw = true;
+        }
+        if one_to_one && !advance.ready {
+            return None;
+        }
+        let atlas_filter = display.set_view(
+            gpu.queue(),
+            origin,
+            canvas_px,
+            zoom,
+            document_clip_rect(self.doc.canvas_size, anchor),
+            self.doc.channel_view.gain(),
+            zoomed_view::atlas_floor(canvas_px, limit),
+        );
+        // The zoomed-out view's atlases are not used while the display
+        // texture draws.
+        self.zoomed_atlases = None;
+        Some(display_view::DisplayFrame {
+            origin,
+            zoom,
+            atlas_filter,
+        })
+    }
+
     fn prepare_zoomed_frame(&mut self, gpu: &GpuContext) -> Option<zoomed_view::ZoomedFrame> {
         let canvas_px = canvas_area_physical_size(&self.workspace, self.scale_factor)?;
         let zoom = effective_residency_zoom(self.doc.canvas_view.zoom(), self.scale_factor);
@@ -37855,9 +37986,23 @@ impl App {
         // 0.275.0: the zoomed-out view's pyramid work and upload, before
         // the surface is borrowed (it needs `&mut self`); `None` at or
         // above the 1:1 atlas floor, where the frame is exactly as before.
-        let zoomed_frame = match self.gpu.take() {
+        // Task 142: the display texture first; when it draws, neither the
+        // zoomed-out view nor the 1:1 atlas does any work this frame.
+        let display_frame = match self.gpu.take() {
             Some(gpu) => {
                 let frame = if self.surface.is_some() {
+                    self.prepare_display_frame(&gpu)
+                } else {
+                    None
+                };
+                self.gpu = Some(gpu);
+                frame
+            }
+            None => None,
+        };
+        let zoomed_frame = match self.gpu.take() {
+            Some(gpu) => {
+                let frame = if self.surface.is_some() && display_frame.is_none() {
                     self.prepare_zoomed_frame(&gpu)
                 } else {
                     None
@@ -37920,7 +38065,11 @@ impl App {
 
                 // Sync before drawing, so this frame shows the latest
                 // painted pixels rather than lagging one frame behind.
-                if zoomed_frame.is_some() {
+                if display_frame.is_some() {
+                    // Drawn from the display texture: the atlas consumes
+                    // nothing and keeps its slots (the store's dirty flags
+                    // still mark whatever changed for it).
+                } else if zoomed_frame.is_some() {
                     self.zoomed_drawn = true;
                 } else if let Some(residency) = self.residency.as_mut() {
                     if std::mem::take(&mut self.zoomed_drawn) {
@@ -37965,6 +38114,38 @@ impl App {
                             false,
                             usize::MAX,
                         );
+                        // Task 142: the display texture takes over the
+                        // tiles the atlas has just uploaded by a GPU copy,
+                        // not a second upload, when it draws again.
+                        // GPU path only: on the CPU path the copies measured
+                        // slower than nothing at 100 %, and the texture is
+                        // built when the view holds still instead.
+                        if let (Some(display), Some(canvas_size), true) = (
+                            self.display.as_mut(),
+                            canvas_area_physical_size(&self.workspace, self.scale_factor),
+                            document_qualifies_for_gpu_compositing(&self.doc.layers)
+                                && self.compositor.is_some(),
+                        ) {
+                            let visible = display_view::visible_tiles(
+                                canvas_local_origin(
+                                    &self.doc.canvas_view,
+                                    active_layer_origin(&self.doc.layers, self.doc.active_layer),
+                                ),
+                                effective_residency_zoom(
+                                    self.doc.canvas_view.zoom(),
+                                    self.scale_factor,
+                                ),
+                                canvas_size,
+                                self.doc.canvas_size,
+                            );
+                            let _ = display.adopt_from_atlas(
+                                gpu.device(),
+                                gpu.queue(),
+                                residency,
+                                store,
+                                &visible,
+                            );
+                        }
                     }
                 }
 
@@ -37997,10 +38178,50 @@ impl App {
                         Some(frame) => viewport.map(|rect| zoomed_view_rect(rect, frame)),
                         None => viewport,
                     };
+                    // Task 142: the display texture, one draw per page in
+                    // its own scissor.
+                    if let (
+                        Some(frame),
+                        Some(canvas),
+                        Some(display),
+                        Some((x, y, w, h)),
+                        Some(clip),
+                    ) = (
+                        display_frame.as_ref(),
+                        self.canvas_pipeline.as_mut(),
+                        self.display.as_mut(),
+                        viewport,
+                        scissor,
+                    ) {
+                        let scissors = display_view::surface_scissors(
+                            display.texture(),
+                            frame.origin,
+                            frame.zoom,
+                            (x, y),
+                            clip,
+                        );
+                        let groups = display.bind_groups(canvas, gpu.device(), frame.atlas_filter);
+                        let pipeline = canvas.display_pipeline(gpu.device(), surface.format());
+                        pass.set_viewport(x, y, w, h, 0.0, 1.0);
+                        pass.set_pipeline(pipeline);
+                        for (page, sx, sy, sw, sh) in scissors {
+                            let Some(group) = groups.get(page) else {
+                                continue;
+                            };
+                            pass.set_scissor_rect(sx, sy, sw, sh);
+                            pass.set_bind_group(0, group, &[]);
+                            pass.draw(0..3, 0..1);
+                        }
+                        let (sw, sh) = surface.size();
+                        pass.set_scissor_rect(0, 0, sw, sh);
+                    }
                     // Task 140: a zoomed-out frame binds both of its
                     // atlases when it blends.
-                    let bind_group = self.canvas_pipeline.as_ref().and_then(|canvas| {
-                        match zoomed_frame.as_ref() {
+                    let bind_group = self
+                        .canvas_pipeline
+                        .as_ref()
+                        .filter(|_| display_frame.is_none())
+                        .and_then(|canvas| match zoomed_frame.as_ref() {
                             Some(frame) => self
                                 .zoomed_atlases
                                 .as_ref()
@@ -38009,8 +38230,7 @@ impl App {
                                 .residency
                                 .as_ref()
                                 .map(|residency| canvas.bind_group(gpu.device(), residency)),
-                        }
-                    });
+                        });
                     if let (
                         Some(bind_group),
                         Some(canvas_pipeline),
@@ -43723,6 +43943,7 @@ mod tests {
         (document, image)
     }
 
+    mod display_frame_tests;
     mod photo_frame_tests;
     mod psd_effects_write_tests;
     mod psd_five_adjust_tests;
