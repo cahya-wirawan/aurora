@@ -354,7 +354,8 @@ def run_file(args, src, mode, tools, outdir, ref_cache):
     res["bytes"] = os.path.getsize(src)
     is_psd = src.lower().endswith((".psd", ".psb"))
     ref = None
-    if is_psd and mode == "idle" and has_real_merged_data(src):
+    synthetic = os.path.abspath(src).startswith(os.path.join(os.path.abspath(args.work), "synth") + os.sep)
+    if is_psd and mode == "idle" and not synthetic and has_real_merged_data(src):
         ref = os.path.join(outdir, "ref", name + ".png")
         os.makedirs(os.path.dirname(ref), exist_ok=True)
     keep = {}
@@ -543,9 +544,10 @@ def write_reports(args, meta, results):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--aurora", required=True, help="aurora-headless binary")
-    ap.add_argument("--photocraft", required=True, help="photocraft-cli binary")
-    ap.add_argument("--work", required=True, help="work dir (synthetic inputs in WORK/synth)")
+    ap.add_argument("--rewrite", help="only regenerate summary.md/runs.csv from this results.json")
+    ap.add_argument("--aurora", help="aurora-headless binary")
+    ap.add_argument("--photocraft", help="photocraft-cli binary")
+    ap.add_argument("--work", help="work dir (synthetic inputs in WORK/synth)")
     ap.add_argument("--out", required=True, help="results directory")
     ap.add_argument("--set", default="representative", choices=["representative", "corpus", "all", "none"])
     ap.add_argument("--files", nargs="*", default=[], help="extra input files")
@@ -563,13 +565,31 @@ def main():
     ap.add_argument("--aurora-version", default="")
     ap.add_argument("--photocraft-version", default="")
     args = ap.parse_args()
+    if args.rewrite:
+        with open(args.rewrite) as f:
+            data = json.load(f)
+        meta, results = data["meta"], data["results"]
+        for res in results:  # synthetic inputs never have a reference
+            if "/synth/synthetic-" in res.get("path", "") and res.get("verify"):
+                res["verify"].pop("reference", None)
+                res["reference"] = False
+        old = meta.get("args", {})
+        for k in ("threads", "runs", "timeout", "load"):
+            if k in old:
+                setattr(args, k, old[k])
+        write_reports(args, meta, results)
+        print(os.path.join(args.out, "summary.md"))
+        return
+    if not (args.aurora and args.photocraft and args.work):
+        ap.error("--aurora, --photocraft and --work are required")
     args.scratch = os.path.join(args.work, "aurora-scratch")
     os.makedirs(args.scratch, exist_ok=True)
     tools = [t for t in args.tools.split(",") if t]
     modes = [m for m in args.modes.split(",") if m]
     meta = {"date": datetime.datetime.now().isoformat(timespec="seconds"), "machine": machine(),
             "tools": {"aurora": args.aurora_version, "photocraft": args.photocraft_version},
-            "tool_list": tools, "modes": modes, "argv": sys.argv}
+            "tool_list": tools, "modes": modes, "argv": sys.argv,
+            "args": {"threads": args.threads, "runs": args.runs, "timeout": args.timeout, "load": args.load}}
     inputs = collect_inputs(args)
     outdir = os.path.join(args.work, "outputs")
     results = []
