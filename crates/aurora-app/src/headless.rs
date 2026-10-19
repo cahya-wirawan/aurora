@@ -5,23 +5,23 @@
 //! another editor (`spike/photocraft-compare/`), so it runs the app's
 //! own code, not a reimplementation:
 //!
-//! * **open**: [`crate::decode_chosen_file_with`]'s routes (for a PSD/PSB
-//!   [`PreparedPsd::stream_with_options`], the streamed open with its
+//! * **open**: `crate::decode_chosen_file_with`'s routes (for a PSD/PSB
+//!   `PreparedPsd::stream_with_options`, the streamed open with its
 //!   staging area, given `--threads` as its encode-pool size), then the
-//!   install's store half, [`crate::replace_document_pixels_prepared`];
-//!   a `.aur` goes through [`crate::precheck_aur`] and
-//!   [`crate::read_prechecked_aur`] as in the app;
-//! * **composite**: `export` (the default) is [`crate::composite_document`],
+//!   install's store half, `crate::replace_document_pixels_prepared`;
+//!   a `.aur` goes through `crate::precheck_aur` and
+//!   `crate::read_prechecked_aur` as in the app;
+//! * **composite**: `export` (the default) is `crate::composite_document`,
 //!   exactly what Save As PNG/JPEG/TIFF composites with (one thread);
 //!   `pool` folds the same tiles on a rayon pool of `--threads` threads
 //!   with the background compositor's per-tile code (`SharedMirror` +
-//!   [`crate::composite_roots_into_tile`]); `--gpu` composites each tile
-//!   with the canvas's GPU path ([`crate::begin_gpu_composite_tile`]) and
+//!   `crate::composite_roots_into_tile`); `--gpu` composites each tile
+//!   with the canvas's GPU path (`crate::begin_gpu_composite_tile`) and
 //!   folds on the CPU where that path refuses, as the canvas does;
 //! * **export**: `colour_app::export_image` (no output profile, as after
 //!   an open), [`aurora_io::encode_by_extension`] (8-bit, dithered; or
 //!   `--depth 16` for a 16-bit PNG through `aurora_io::png::encode_16`),
-//!   then [`crate::export_save::write_export_verified`].
+//!   then `crate::export_save::write_export_verified`.
 //!
 //! One JSON object goes to stdout; logs go to stderr. Nothing here is
 //! reachable from the window: the app never calls [`main_from_args`].

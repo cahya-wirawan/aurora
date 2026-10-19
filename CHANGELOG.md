@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.276.1] - 2026-10-19
+
+### Added
+
+- Record the CI fix after the PhotoCraft merge
+
 ## [0.276.0] - 2026-10-19
 
 ### Added
