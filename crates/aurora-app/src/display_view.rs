@@ -35,10 +35,12 @@
 //! texture only when every visible tile is uploaded at its current content
 //! ([`DisplayAdvance::ready`]); otherwise it draws the atlas, unchanged, and
 //! the texture adopts the tiles the atlas has just uploaded by a GPU copy
-//! ([`DisplayView::adopt_from_atlas`]). On the CPU path with the background
-//! worker the atlas always draws at or above its floor (the texture's own
-//! uploads there measured slower than the atlas's under load), so the 1:1
-//! frame is the old frame plus those copies.
+//! ([`DisplayView::adopt_from_atlas`]). On the CPU compositing path (the
+//! worker or the frame pool) the atlas always draws at or above its floor
+//! and the texture does no visible-tile work there (its own dispatch and
+//! uploads measured 1.5-6 ms slower than the atlas alone), so the 1:1 frame
+//! is the old frame plus those GPU copies; the texture takes over below the
+//! floor.
 //! Below the floor it always draws the texture: a tile not uploaded yet is
 //! transparent there (the checkerboard), as a cold zoomed-out pyramid is.
 //!
@@ -328,6 +330,7 @@ impl DisplayView {
         visible: &[TileId],
         level0: Level0<'_>,
         one_to_one: bool,
+        gpu_path: bool,
         view: (f32, f32, f32),
         atlas_tiles: &[TileId],
     ) -> DisplayAdvance {
@@ -366,7 +369,11 @@ impl DisplayView {
             .copied()
             .filter(|&id| !cache.is_current(id))
             .collect();
-        if !stale.is_empty() {
+        // On the CPU path the atlas draws at or above its floor (task 142
+        // review: the texture's own composite dispatch and uploads there
+        // measured slower than the atlas alone), and composites for itself.
+        let atlas_draws = one_to_one && !gpu_path;
+        if !stale.is_empty() && !atlas_draws {
             match (&mut level0, one_to_one) {
                 (Level0::Worker(worker), true) => crate::dispatch_or_composite_tiles(
                     &composite_set,
@@ -423,12 +430,9 @@ impl DisplayView {
         // well would only upload them twice.
         let started = Instant::now();
         let surface = crate::composite_surface_id();
-        // On the CPU path's background worker the atlas always draws at or
-        // above its floor (task 142 review: the texture's own uploads there
-        // measured 1-6 ms slower than the atlas under load); the texture
-        // follows it by GPU copies (`adopt_from_atlas`) and its own
-        // background build, and takes over below the floor.
-        let atlas_draws = one_to_one && matches!(level0, Level0::Worker(_));
+        // There the texture follows the atlas by GPU copies
+        // (`adopt_from_atlas`) and its quiet-frame background build, and
+        // takes over below the floor.
         let drawable = !atlas_draws
             && (!one_to_one || visible.iter().all(|&id| store.contains_tile(surface, id)));
         let budget = (!one_to_one).then_some(UPLOAD_BUDGET);

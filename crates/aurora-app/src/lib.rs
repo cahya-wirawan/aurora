@@ -37809,6 +37809,7 @@ impl App {
             &visible,
             level0,
             one_to_one,
+            gpu_path,
             (origin.0, origin.1, zoom),
             &aurora_gpu::TileResidency::visible_tiles_at(origin, canvas_px, limit),
         );

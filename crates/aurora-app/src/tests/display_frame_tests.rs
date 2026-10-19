@@ -164,6 +164,7 @@ impl Rig {
             &visible,
             level0,
             one_to_one,
+            gpu_path,
             (origin.0, origin.1, zoom),
             &aurora_gpu::TileResidency::visible_tiles_at(origin, self.viewport, limit),
         );
@@ -613,20 +614,28 @@ fn once_current_a_zoom_or_a_pan_uploads_and_composites_nothing() {
     }
 }
 
-/// At 100 % a frame whose visible tiles are not all uploaded yet is not
-/// ready (the app draws the atlas that frame): a fresh CPU-path document
-/// whose tiles the worker is still compositing.
+/// At 100 % on the CPU path the atlas draws and the texture does no
+/// visible work (it is never ready there), yet it is built behind the atlas
+/// (GPU copies and the quiet-frame build) and draws at once below the
+/// floor; the CPU worker path, as the app runs it.
 #[test]
-fn at_100_percent_a_view_not_yet_uploaded_is_not_ready() {
+fn at_100_percent_on_the_cpu_path_the_atlas_draws_and_the_texture_is_built_behind_it() {
     let Some(context) = real_gpu_context() else {
         return;
     };
     let mut photo = build(Shape::PhotoMaskedCurves, SMALL);
     let mut rig = Rig::new(&context, &photo, SMALL_VIEW, true, u32::MAX);
-    let first = rig.frame(&context, &mut photo, 1.0, (0.0, 0.0));
-    assert!(!first.advance.ready, "nothing composited yet");
+    let mut residency =
+        aurora_gpu::TileResidency::new(context.device(), context.queue(), SMALL_VIEW);
+    let first = rig.frame_with(&context, &mut photo, 1.0, (0.0, 0.0), Some(&mut residency));
+    assert!(!first.advance.ready, "the atlas draws");
     assert_eq!(first.advance.uploaded, 0);
-    let (frames, _) = rig.settle(&context, &mut photo, 1.0, (0.0, 0.0), 400);
+    let mut frames = 0;
+    while !rig.settled(&photo) && frames < 400 {
+        let step = rig.frame_with(&context, &mut photo, 1.0, (0.0, 0.0), Some(&mut residency));
+        assert!(!step.advance.ready, "the atlas keeps drawing at 100 %");
+        frames += 1;
+    }
     let last = rig.frame(&context, &mut photo, 1.0, (0.0, 0.0));
     assert!(
         !last.advance.ready,
