@@ -679,7 +679,7 @@ fn the_zoomed_out_atlas_draws_the_scaled_export_at_a_power_of_two_zoom() {
 // ---------------------------------------------------- review (ZV-1..ZV-4)
 
 /// Canvas areas up to 8K and past it, at wgpu's default 8192 limit.
-const BIG_CANVASES: [(u32, u32); 7] = [
+pub(super) const BIG_CANVASES: [(u32, u32); 7] = [
     (1920, 1080),
     (3968, 2160),
     (4000, 2250),
@@ -747,7 +747,7 @@ fn the_zoomed_out_frame_marks_itself_drawn_as_soon_as_it_uploads() {
     let body = source.get(start..).unwrap_or_default();
     let end = body.find("\n    fn redraw(").unwrap_or(body.len());
     let body = body.get(..end).unwrap_or_default();
-    let upload = body.find("sync_only(").unwrap_or(usize::MAX);
+    let upload = body.find(".prepare(").unwrap_or(usize::MAX);
     let marked = body.find("self.zoomed_drawn = true;").unwrap_or(0);
     assert!(upload < usize::MAX && marked > upload, "{upload} {marked}");
 }
@@ -847,3 +847,6 @@ fn a_refused_worker_dispatch_is_composited_under_the_frame_budget() {
     assert!(step.more);
     assert!(!step.complete);
 }
+
+#[path = "zoomed_blend_tests.rs"]
+mod blend;

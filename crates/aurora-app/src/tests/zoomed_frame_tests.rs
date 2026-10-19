@@ -3,7 +3,9 @@
 //! The documents are round 9's (`photo_frame_tests::build`), seen in a
 //! 1920 x 1080 physical view through the zoomed-out atlas
 //! (`zoomed_view`), exactly as `App::prepare_zoomed_frame` drives it:
-//! `plan`, the atlas's slots forgotten on a level change, `advance`
+//! `plan_blended` and `ZoomedAtlases::prepare` (task 140: the level and
+//! the next one it blends toward, the slots forgotten on a key change,
+//! `advance`
 //! (GPU shapes: synchronous recomposites under the frame budget; CPU
 //! shapes: the background worker, drained and paced at 16.7 ms, or the
 //! synchronous pool), `sync` of the shown level, the render pass, submit
@@ -59,26 +61,32 @@ fn stats(values: &[f64]) -> (f64, f64, f64) {
 }
 
 struct Rig {
-    atlas: aurora_gpu::TileResidency,
+    atlases: zoomed_view::ZoomedAtlases,
     canvas: aurora_gpu::CanvasPipeline,
     compositor: aurora_render::TileCompositor,
     target: wgpu::TextureView,
     _texture: wgpu::Texture,
     cache: crate::CompositeCache,
     worker: Option<crate::background_composite::CompositeWorker>,
-    level: Option<u32>,
+    /// Frames that wanted the blend toward the next level and did not draw
+    /// it (task 140 review: a dab or a pan must not switch it off).
+    unblended: u32,
+}
+
+/// What one rig frame did.
+struct Step {
+    ms: f64,
+    advance: zoomed_view::Advance,
+    /// The frame wanted a blend (task 140) and drew it.
+    blend_wanted: bool,
+    blend_live: bool,
 }
 
 impl Rig {
     fn new(gpu: &aurora_gpu::GpuContext, worker: bool) -> Self {
         let device = gpu.device();
         let queue = gpu.queue();
-        let atlas = aurora_gpu::TileResidency::with_coverage(
-            device,
-            queue,
-            VIEWPORT,
-            zoomed_view::COVERAGE,
-        );
+        let atlases = zoomed_view::ZoomedAtlases::new(device, queue, VIEWPORT);
         let mut canvas = aurora_gpu::CanvasPipeline::new(device);
         let _ = canvas.pipeline(device, wgpu::TextureFormat::Rgba8Unorm);
         let mut compositor = aurora_render::TileCompositor::new(device);
@@ -87,7 +95,7 @@ impl Rig {
         let texture = frame_timing_target(device, VIEWPORT);
         let target = texture.create_view(&wgpu::TextureViewDescriptor::default());
         Self {
-            atlas,
+            atlases,
             canvas,
             compositor,
             target,
@@ -96,7 +104,7 @@ impl Rig {
             worker: worker.then(|| {
                 crate::background_composite::CompositeWorker::new(std::sync::Arc::new(|| {}))
             }),
-            level: None,
+            unblended: 0,
         }
     }
 
@@ -108,7 +116,7 @@ impl Rig {
         photo: &mut Photo,
         zoom: f32,
         origin: (f32, f32),
-    ) -> (f64, zoomed_view::Advance) {
+    ) -> Step {
         let device = gpu.device();
         let queue = gpu.queue();
         let t0 = Instant::now();
@@ -122,51 +130,46 @@ impl Rig {
             };
             let _ = worker.drain(Some(&mut target));
         }
-        let frame = zoomed_view::plan(
+        let limit = gpu.device().limits().max_texture_dimension_2d;
+        let mut frame = zoomed_view::plan_blended(
             origin,
             zoom,
             VIEWPORT,
             photo.size,
-            zoomed_view::zoomed_floor(VIEWPORT, gpu.device().limits().max_texture_dimension_2d),
+            zoomed_view::zoomed_floor(VIEWPORT, limit),
+            zoomed_view::atlas_floor(VIEWPORT, limit),
         );
-        if self.level != Some(frame.level) {
-            self.atlas.forget_slots();
-            self.level = Some(frame.level);
-        }
-        self.atlas.set_document_clip(Some(frame.doc_clip));
-        self.atlas.set_origin(
-            queue,
-            frame.level_origin,
-            frame.viewport_px,
-            frame.level_zoom,
-        );
+        let blend_wanted = frame.blend.is_some();
         let level0 = match self.worker.as_mut() {
             Some(worker) => Level0::Worker(worker),
             None => Level0::Sync(Some(gpu), Some(&mut self.compositor)),
         };
-        let advance = zoomed_view::advance(
-            frame.level,
-            &frame.visible,
-            photo.size,
-            &photo.layers,
-            Some(photo.active),
-            &mut photo.store,
-            &mut self.cache,
+        let advance = self.atlases.prepare(
+            device,
+            queue,
+            &mut frame,
+            zoomed_view::FrameDocument {
+                cache_id: self.cache.id(),
+                canvas: photo.size,
+                layers: &photo.layers,
+                active_layer: Some(photo.active),
+                store: &mut photo.store,
+                cache: &mut self.cache,
+            },
+            false,
+            [1.0, 1.0, 1.0],
             level0,
             zoomed_view::PYRAMID_FRAME_BUDGET,
         );
-        let _ = self.atlas.sync_only(
-            queue,
-            &mut photo.store,
-            zoomed_view::level_surface(frame.level),
-            usize::MAX,
-            &frame.visible,
-        );
+        let blend_live = frame.blend.is_some();
+        if blend_wanted && !blend_live {
+            self.unblended += 1;
+        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("r10-frame"),
         });
         {
-            let bind_group = self.canvas.bind_group(device, &self.atlas);
+            let bind_group = self.atlases.bind_group(&self.canvas, device, &frame);
             let pipeline = self
                 .canvas
                 .pipeline(device, wgpu::TextureFormat::Rgba8Unorm);
@@ -210,10 +213,18 @@ impl Rig {
         {
             std::thread::sleep(rest);
         }
-        (ms(spent), advance)
+        Step {
+            ms: ms(spent),
+            advance,
+            blend_wanted,
+            blend_live,
+        }
     }
 
-    /// Frames until the shown level is complete (at most `cap`).
+    /// Frames until the shown level is complete (at most `cap`): that
+    /// count, its milliseconds and the frame times; then, since task 140,
+    /// frames and milliseconds until the blend toward the next level is
+    /// live too (the same when the zoom does not blend).
     fn until_complete(
         &mut self,
         gpu: &aurora_gpu::GpuContext,
@@ -221,17 +232,26 @@ impl Rig {
         zoom: f32,
         origin: (f32, f32),
         cap: u32,
-    ) -> (u32, f64, Vec<f64>) {
+    ) -> (u32, f64, Vec<f64>, (u32, f64)) {
         let started = Instant::now();
         let mut times = Vec::new();
+        let mut complete = None;
         for n in 1..=cap {
-            let (t, advance) = self.frame(gpu, photo, zoom, origin);
-            times.push(t);
-            if advance.complete {
-                return (n, ms(started.elapsed()), times);
+            let step = self.frame(gpu, photo, zoom, origin);
+            if complete.is_none() {
+                times.push(step.ms);
+            }
+            if step.advance.complete && complete.is_none() {
+                complete = Some((n, ms(started.elapsed())));
+            }
+            if let Some((frames, total)) = complete
+                && step.blend_live == step.blend_wanted
+            {
+                return (frames, total, times, (n, ms(started.elapsed())));
             }
         }
-        (cap, ms(started.elapsed()), times)
+        let (frames, total) = complete.unwrap_or((cap, ms(started.elapsed())));
+        (frames, total, times, (cap, ms(started.elapsed())))
     }
 }
 
@@ -250,7 +270,8 @@ fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str,
     let (zoom, origin) = fit(photo.size);
     let level = zoomed_view::level_for_zoom(zoom);
 
-    let (frames, total, times) = rig.until_complete(gpu, photo, zoom, origin, 2_000);
+    let (frames, total, times, (blend_frames, blend_ms)) =
+        rig.until_complete(gpu, photo, zoom, origin, 2_000);
     let (mean, p90, max) = stats(&times);
     let pyramid = rig.cache.pyramid.current_len();
     // The level-0 composite the pyramid is built from stays in the store
@@ -259,14 +280,15 @@ fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str,
     println!(
         "R10 cold doc={label} path={path} how={how} zoom={zoom:.4} level={level} frames={frames} \
          ms={total:.0} ui_mean={mean:.2} ui_p90={p90:.2} ui_max={max:.2} pyramid_tiles={pyramid} \
-         pyramid_mib={:.1} level0_tiles={level0} level0_mib={:.1} held={}",
+         pyramid_mib={:.1} level0_tiles={level0} level0_mib={:.1} held={} \
+         blend_frames={blend_frames} blend_ms={blend_ms:.0}",
         pyramid as f64 * 0.5,
         level0 as f64 * 0.5,
         photo.store.held_tile_count_bound()
     );
 
     let times: Vec<f64> = (0..40)
-        .map(|_| rig.frame(gpu, photo, zoom, origin).0)
+        .map(|_| rig.frame(gpu, photo, zoom, origin).ms)
         .collect();
     let (mean, p90, max) = stats(times.get(1..).unwrap_or_default());
     println!(
@@ -275,6 +297,7 @@ fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str,
 
     // A dab at fit: frames and ms until the level is current again.
     let reference_origin = crate::composite_reference_origin(&photo.layers, Some(photo.active));
+    let dab_unblended = rig.unblended;
     let mut dab_ms = Vec::new();
     let mut dab_frames = Vec::new();
     for i in 0..10 {
@@ -298,7 +321,7 @@ fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str,
             outcome.painted(),
             reference_origin,
         );
-        let (frames, _, _) = rig.until_complete(gpu, photo, zoom, origin, 600);
+        let (frames, _, _, _) = rig.until_complete(gpu, photo, zoom, origin, 600);
         dab_ms.push(ms(started.elapsed()));
         dab_frames.push(f64::from(frames));
     }
@@ -306,7 +329,8 @@ fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str,
     let (fmean, _, fmax) = stats(&dab_frames);
     println!(
         "R10 dab doc={label} path={path} how={how} n=10 to_current_mean={mean:.2} p90={p90:.2} \
-         max={max:.2} frames_mean={fmean:.1} frames_max={fmax:.0}"
+         max={max:.2} frames_mean={fmean:.1} frames_max={fmax:.0} unblended_frames={}",
+        rig.unblended - dab_unblended
     );
 
     // Wheel: fit -> 1.0 physical floor of the 1:1 atlas and back, 1.1x a
@@ -324,24 +348,41 @@ fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str,
     steps.extend(back);
     let mut wheel = Vec::new();
     let mut incomplete = 0;
+    let mut unblended = 0;
+    let mut changes = Vec::new();
+    let mut last_level = zoomed_view::level_for_zoom(zoom);
     for z in &steps {
         let origin = (
             (centre_doc.0 - VIEWPORT.0 as f32 / 2.0 / z).max(0.0),
             (centre_doc.1 - VIEWPORT.1 as f32 / 2.0 / z).max(0.0),
         );
-        let (t, advance) = rig.frame(gpu, photo, *z, origin);
-        wheel.push(t);
-        if !advance.complete {
+        let step = rig.frame(gpu, photo, *z, origin);
+        wheel.push(step.ms);
+        if zoomed_view::level_for_zoom(*z) != last_level {
+            changes.push(step.ms);
+        }
+        last_level = zoomed_view::level_for_zoom(*z);
+        if !step.advance.complete {
             incomplete += 1;
+        }
+        if step.blend_wanted && !step.blend_live {
+            unblended += 1;
         }
     }
     let (mean, p90, max) = stats(&wheel);
+    let (change_mean, _, change_max) = stats(&changes);
+    println!(
+        "R10 levelchange doc={label} path={path} how={how} n={} mean={change_mean:.2} \
+         max={change_max:.2}",
+        changes.len()
+    );
     println!(
         "R10 wheel doc={label} path={path} how={how} n={} mean={mean:.2} p90={p90:.2} \
-         max={max:.2} incomplete_frames={incomplete}",
+         max={max:.2} incomplete_frames={incomplete} unblended_frames={unblended}",
         wheel.len()
     );
 
+    let pan_unblended = rig.unblended;
     // Pan at 0.3 (level 1), 40 frames of (96, 48) px.
     let mut pan = Vec::new();
     let mut incomplete = 0;
@@ -350,17 +391,18 @@ fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str,
             64.0 + step as f32 * 96.0 / 0.3,
             32.0 + step as f32 * 48.0 / 0.3,
         );
-        let (t, advance) = rig.frame(gpu, photo, 0.3, origin);
-        pan.push(t);
-        if !advance.complete {
+        let step = rig.frame(gpu, photo, 0.3, origin);
+        pan.push(step.ms);
+        if !step.advance.complete {
             incomplete += 1;
         }
     }
     let (mean, p90, max) = stats(pan.get(1..).unwrap_or_default());
     println!(
         "R10 pan doc={label} path={path} how={how} zoom=0.3 n=39 mean={mean:.2} p90={p90:.2} \
-         max={max:.2} incomplete_frames={incomplete} pyramid_tiles={}",
-        rig.cache.pyramid.current_len()
+         max={max:.2} incomplete_frames={incomplete} pyramid_tiles={} unblended_frames={}",
+        rig.cache.pyramid.current_len(),
+        rig.unblended - pan_unblended
     );
     if let Some(mut worker) = rig.worker.take() {
         worker.shutdown();

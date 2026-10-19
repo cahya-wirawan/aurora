@@ -296,7 +296,34 @@ fn render_and_sample_pixels_in(
     samples: &[(u32, u32)],
     format: wgpu::TextureFormat,
 ) -> Vec<[u8; 4]> {
-    let bind_group = canvas.bind_group(device, residency);
+    render_and_sample_blended(
+        device,
+        queue,
+        canvas,
+        (residency, None),
+        target_size,
+        samples,
+        format,
+    )
+}
+
+/// [`render_and_sample_pixels_in`] through
+/// [`CanvasPipeline::bind_group_blended`] when a partner atlas is given
+/// (task 140), through [`CanvasPipeline::bind_group`] otherwise.
+#[allow(clippy::too_many_lines)]
+fn render_and_sample_blended(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    canvas: &mut CanvasPipeline,
+    (residency, partner): (&TileResidency, Option<&TileResidency>),
+    target_size: (u32, u32),
+    samples: &[(u32, u32)],
+    format: wgpu::TextureFormat,
+) -> Vec<[u8; 4]> {
+    let bind_group = match partner {
+        Some(partner) => canvas.bind_group_blended(device, residency, partner),
+        None => canvas.bind_group(device, residency),
+    };
     let pipeline = canvas.pipeline(device, format);
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -2136,3 +2163,6 @@ fn the_canvas_shader_multiplies_by_the_channel_gain_last() {
     assert!(source.contains("channel_gain: vec4<f32>"));
     assert!(source.contains("* canvas.channel_gain.rgb"));
 }
+
+#[path = "render_blend_test.rs"]
+mod blend;

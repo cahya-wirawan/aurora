@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.278.0] - 2026-10-19
+
+### Added
+
+- Record the zoomed-out view's blend between pyramid levels
+
 ## [0.277.0] - 2026-10-19
 
 ### Added

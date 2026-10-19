@@ -17,7 +17,13 @@
 //!
 //! At physical zoom `z` below the floor the level is `L = floor(log2(1 /
 //! z))` (at most [`MAX_LEVEL`]), shown at `z * 2^L` in `(0.5, 1]` with the
-//! atlas's bilinear minification. There is no blend between two levels.
+//! atlas's bilinear minification, and (task 140) blended toward the next
+//! level by [`blend_weight`] (trilinear across two atlases, see
+//! [`ZoomedAtlases`]), so a zoom crossing a power of two does not pop and
+//! a zoom between two shows a mix of the sharper and the softer level, as
+//! a GPU's own trilinear filter would. At a power of two, at the deepest
+//! level and on the 1:1 path the weight is exactly zero and the picture
+//! is bit-identical to the unblended one.
 //!
 //! **Validity** lives in [`PyramidState`], inside the
 //! [`crate::CompositeCache`]: a level-`L` tile is current only when it was
@@ -215,6 +221,57 @@ pub(crate) struct ZoomedFrame {
     /// The level tiles the frame shows, and the ring its bilinear filter
     /// can reach (the only tiles the zoomed-out atlas uploads).
     pub(crate) visible: Vec<TileId>,
+    /// The blend toward the next level (task 140), `None` when the weight
+    /// is zero ([`plan`] never sets it; [`plan_blended`] does, and
+    /// [`ZoomedAtlases::prepare`] clears it while the next level is not
+    /// built yet).
+    pub(crate) blend: Option<Blend>,
+}
+
+/// The partner level a zoomed-out frame mixes in (task 140).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Blend {
+    /// `ZoomedFrame::level + 1`.
+    pub(crate) level: u32,
+    /// Its weight, in `(0, 1]` ([`blend_weight`]).
+    pub(crate) weight: f32,
+    /// The zoom its atlas renders it at (twice the frame's level zoom).
+    pub(crate) level_zoom: f32,
+    /// Its atlas's origin in its own level's texels.
+    pub(crate) level_origin: (f32, f32),
+    /// Its tiles the frame samples, with the bilinear ring.
+    pub(crate) visible: Vec<TileId>,
+}
+
+/// How much of level `level + 1` a frame showing `level` at `level_zoom`
+/// mixes in (task 140): the fractional part of the level of detail,
+/// `-log2(level_zoom)`, so the weight is `0` at a power of two (level zoom
+/// exactly `1`) and tends to `1` as the level zoom tends to `0.5`, where
+/// the next level takes over at its own level zoom `1`. Level 0 ramps from
+/// the 1:1 atlas's floor `one_floor` instead of from `1`, so the hand-over
+/// from the 1:1 atlas does not jump either. Zero at [`MAX_LEVEL`] (there is
+/// no deeper level), for a magnified level (a capped atlas, ZV-1), and for
+/// anything non-finite.
+#[must_use]
+pub(crate) fn blend_weight(level: u32, level_zoom: f32, one_floor: f32) -> f32 {
+    if level >= MAX_LEVEL || !(level_zoom.is_finite() && level_zoom > 0.0) {
+        return 0.0;
+    }
+    let lod = -level_zoom.log2();
+    let weight = if level == 0 {
+        let start = if one_floor.is_finite() && one_floor > 0.0 {
+            (-one_floor.log2()).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if start >= 1.0 {
+            return 0.0;
+        }
+        (lod - start) / (1.0 - start)
+    } else {
+        lod
+    };
+    if weight > 0.0 { weight.min(1.0) } else { 0.0 }
 }
 
 /// The frame for a view whose top-left canvas pixel is document point
@@ -239,7 +296,58 @@ pub(crate) fn plan(
     } else {
         1.0
     };
-    let level = level_for_zoom_within(zoom, floor);
+    plan_at(
+        view_origin,
+        zoom,
+        canvas_px,
+        doc_size,
+        level_for_zoom_within(zoom, floor),
+    )
+}
+
+/// [`plan`] with the blend toward the next level filled in (task 140):
+/// `one_floor` is the 1:1 atlas's floor ([`atlas_floor`]), where level 0's
+/// weight starts.
+#[must_use]
+pub(crate) fn plan_blended(
+    view_origin: (f32, f32),
+    zoom: f32,
+    canvas_px: (u32, u32),
+    doc_size: (u32, u32),
+    floor: f32,
+    one_floor: f32,
+) -> ZoomedFrame {
+    let mut frame = plan(view_origin, zoom, canvas_px, doc_size, floor);
+    let weight = blend_weight(frame.level, frame.level_zoom, one_floor);
+    // Below one 8-bit step the next level is neither built nor drawn.
+    if weight >= BLEND_EPSILON {
+        let zoom = frame.level_zoom / level_scale(frame.level);
+        let next = plan_at(view_origin, zoom, canvas_px, doc_size, frame.level + 1);
+        frame.blend = Some(Blend {
+            level: next.level,
+            weight,
+            level_zoom: next.level_zoom,
+            level_origin: next.level_origin,
+            visible: next.visible,
+        });
+    }
+    frame
+}
+
+/// [`plan`] at a given `level` (a valid `zoom`).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn plan_at(
+    view_origin: (f32, f32),
+    zoom: f32,
+    canvas_px: (u32, u32),
+    doc_size: (u32, u32),
+    level: u32,
+) -> ZoomedFrame {
+    let level = level.min(MAX_LEVEL);
     let scale = level_scale(level);
     let axis = |origin: f32, canvas: u32| {
         let origin = if origin.is_finite() { origin } else { 0.0 };
@@ -282,6 +390,7 @@ pub(crate) fn plan(
             doc_size.1 as f32 / scale,
         ),
         visible,
+        blend: None,
     }
 }
 
@@ -430,6 +539,304 @@ pub(crate) enum Level0<'a> {
         Option<&'a aurora_gpu::GpuContext>,
         Option<&'a mut aurora_render::TileCompositor>,
     ),
+}
+
+impl Level0<'_> {
+    /// The same way, borrowed again (a frame advances two levels).
+    pub(crate) fn reborrow(&mut self) -> Level0<'_> {
+        match self {
+            Level0::Worker(worker) => Level0::Worker(worker),
+            Level0::Sync(gpu, compositor) => Level0::Sync(*gpu, compositor.as_deref_mut()),
+        }
+    }
+}
+
+/// What an atlas's slots were filled for: (composite cache id, canvas
+/// size, level). Any change forgets them.
+pub(crate) type AtlasKey = (u64, (u32, u32), u32);
+
+/// The smallest blend weight drawn (task 140 review): below it the next
+/// level's contribution is under one 8-bit step, so the frame neither
+/// builds nor uploads it.
+pub(crate) const BLEND_EPSILON: f32 = 1.0 / 256.0;
+
+/// Frames over which a newly live blend fades in (task 140 review): the
+/// first frame a partner becomes complete for its key draws `1 / N` of
+/// the weight, the `N`th all of it, so a cold build's switch-on is a ramp
+/// of about 100 ms at 60 FPS rather than one step.
+pub(crate) const BLEND_FADE_FRAMES: u32 = 6;
+
+/// One zoomed-out atlas and what its slots hold.
+struct Atlas {
+    residency: aurora_gpu::TileResidency,
+    /// What its slots were filled for (`None`: nothing yet).
+    key: Option<AtlasKey>,
+    /// It has held a complete picture of `key` since the key was set: its
+    /// slots may be stale in places (a dab, a pan), but show what those
+    /// tiles last held, as the frame's own level does.
+    complete: bool,
+    /// Frames drawn as a live partner since `complete` was set, at most
+    /// [`BLEND_FADE_FRAMES`].
+    shown: u32,
+}
+
+impl Atlas {
+    fn new(residency: aurora_gpu::TileResidency) -> Self {
+        Self {
+            residency,
+            key: None,
+            complete: false,
+            shown: 0,
+        }
+    }
+
+    /// Hands the atlas `key`: a different key (or `forget`) forgets its
+    /// slots and its latch.
+    fn key_to(&mut self, key: AtlasKey, forget: bool) {
+        if forget || self.key != Some(key) {
+            self.reset(Some(key));
+        }
+    }
+
+    /// Forgets the slots and the latch, keyed to `key`.
+    fn reset(&mut self, key: Option<AtlasKey>) {
+        self.residency.forget_slots();
+        self.key = key;
+        self.complete = false;
+        self.shown = 0;
+    }
+}
+
+/// The zoomed-out view's two atlases (task 140): the frame's level and the
+/// next one, which the canvas shader mixes by [`Blend::weight`]. Both are
+/// double-coverage atlases, so they swap roles when the level changes: a
+/// zoom out past a power of two finds its new level already uploaded in
+/// the partner. The partner is built on the first frame that blends.
+///
+/// **Slot validity.** Each atlas consumes the dirty flags of the level it
+/// is keyed to, so at most one atlas is ever keyed to a level (a key is
+/// handed over by a swap, never copied), and `forget` (the 1:1 atlas drew
+/// last and consumed level 0's) forgets both.
+///
+/// **The latch** (task 140 review). Once the partner has held a complete
+/// next level for its key it keeps being drawn, whatever its tiles are
+/// doing: a dab or a pan leaves some of them not current for a frame or
+/// more, and they show what they last held (transparent when never built),
+/// exactly as the frame's own level does. Only a new key, `forget` or a
+/// cold partner turns the blend off, and a cold partner's first complete
+/// picture fades in over [`BLEND_FADE_FRAMES`].
+pub(crate) struct ZoomedAtlases {
+    size: (u32, u32),
+    primary: Atlas,
+    partner: Option<Atlas>,
+}
+
+/// One frame's document side for [`ZoomedAtlases::prepare`].
+pub(crate) struct FrameDocument<'a> {
+    /// The composite cache's id (part of every [`AtlasKey`]).
+    pub(crate) cache_id: u64,
+    pub(crate) canvas: (u32, u32),
+    pub(crate) layers: &'a aurora_doc::LayerTree,
+    pub(crate) active_layer: Option<aurora_doc::LayerId>,
+    pub(crate) store: &'a mut aurora_tile::TileStore,
+    pub(crate) cache: &'a mut crate::CompositeCache,
+}
+
+impl ZoomedAtlases {
+    /// The primary atlas for a canvas area of `canvas_px`; the partner is
+    /// built when first needed.
+    pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, canvas_px: (u32, u32)) -> Self {
+        Self {
+            size: canvas_px,
+            primary: Atlas::new(aurora_gpu::TileResidency::with_coverage(
+                device, queue, canvas_px, COVERAGE,
+            )),
+            partner: None,
+        }
+    }
+
+    /// The canvas area the atlases were sized for.
+    #[must_use]
+    pub(crate) fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// The atlas showing the frame's level.
+    #[must_use]
+    pub(crate) fn primary(&self) -> &aurora_gpu::TileResidency {
+        &self.primary.residency
+    }
+
+    /// The atlas holding the next level, once built.
+    #[must_use]
+    pub(crate) fn partner(&self) -> Option<&aurora_gpu::TileResidency> {
+        self.partner.as_ref().map(|atlas| &atlas.residency)
+    }
+
+    /// The keys the two atlases hold (primary, partner).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn keys(&self) -> (Option<AtlasKey>, Option<AtlasKey>) {
+        (
+            self.primary.key,
+            self.partner.as_ref().and_then(|atlas| atlas.key),
+        )
+    }
+
+    /// The bind group for `frame`: both atlases when it blends.
+    #[must_use]
+    pub(crate) fn bind_group(
+        &self,
+        canvas: &aurora_gpu::CanvasPipeline,
+        device: &wgpu::Device,
+        frame: &ZoomedFrame,
+    ) -> wgpu::BindGroup {
+        match (frame.blend.as_ref(), self.partner()) {
+            (Some(_), Some(partner)) => canvas.bind_group_blended(device, self.primary(), partner),
+            _ => canvas.bind_group(device, self.primary()),
+        }
+    }
+
+    /// The partner atlas, built (unkeyed) when there is none yet.
+    fn ensure_partner(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> &mut Atlas {
+        let size = self.size;
+        self.partner.get_or_insert_with(|| {
+            Atlas::new(aurora_gpu::TileResidency::with_coverage(
+                device, queue, size, COVERAGE,
+            ))
+        })
+    }
+
+    /// Prepares one zoomed-out frame: hands the atlases their levels
+    /// (swapping them when that saves an upload), advances the pyramid for
+    /// the frame's level and uploads it, and, once that level is complete,
+    /// advances the next level too; the next level's dirty tiles are
+    /// uploaded every blended frame. The blend is drawn while the partner
+    /// is latched complete for its key (see the type's doc), faded in over
+    /// [`BLEND_FADE_FRAMES`] the first time; before that `frame.blend` is
+    /// cleared and the frame shows its level alone, exactly as before task
+    /// 140 (the checkerboard of a cold build included). Returns the frame
+    /// level's [`Advance`], with `more` also set while the next level has
+    /// work left or the blend is still fading in.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: &mut ZoomedFrame,
+        doc: FrameDocument<'_>,
+        forget: bool,
+        gain: [f32; 3],
+        mut level0: Level0<'_>,
+        budget: Duration,
+    ) -> Advance {
+        let key = |level: u32| (doc.cache_id, doc.canvas, level);
+        let want_primary = key(frame.level);
+        let want_partner = frame.blend.as_ref().map(|blend| key(blend.level));
+        if want_partner.is_some() {
+            // Before the swap: a zoom in past a power of two hands the
+            // level just shown over as the partner even on the first frame
+            // that blends.
+            self.ensure_partner(device, queue);
+        }
+        if let Some(partner) = self.partner.as_mut() {
+            let swap = (self.primary.key != Some(want_primary)
+                && partner.key == Some(want_primary))
+                || (want_partner.is_some()
+                    && partner.key != want_partner
+                    && self.primary.key == want_partner);
+            if swap {
+                std::mem::swap(&mut self.primary, partner);
+            }
+            if forget {
+                partner.reset(None);
+            }
+        }
+        self.primary.key_to(want_primary, forget);
+        let advance_doc =
+            |level: u32, visible: &[TileId], doc: &mut FrameDocument<'_>, level0: Level0<'_>| {
+                advance(
+                    level,
+                    visible,
+                    doc.canvas,
+                    doc.layers,
+                    doc.active_layer,
+                    doc.store,
+                    doc.cache,
+                    level0,
+                    budget,
+                )
+            };
+        let mut doc = doc;
+        let mut result = advance_doc(frame.level, &frame.visible, &mut doc, level0.reborrow());
+        if result.complete {
+            // Drawn complete as the frame's own level: on screen already,
+            // so when a zoom in hands it over as the partner it is drawn
+            // at its full weight at once, not faded in again (task 140
+            // re-review). Only a partner that was cold when keyed fades.
+            self.primary.complete = true;
+            self.primary.shown = BLEND_FADE_FRAMES;
+        }
+        let mut weight = 0.0;
+        if let (Some(blend), Some(want_partner)) = (frame.blend.as_ref(), want_partner) {
+            let atlas = self.ensure_partner(device, queue);
+            atlas.key_to(want_partner, false);
+            atlas.residency.set_origin(
+                queue,
+                blend.level_origin,
+                frame.viewport_px,
+                blend.level_zoom,
+            );
+            if result.complete {
+                let next = advance_doc(blend.level, &blend.visible, &mut doc, level0.reborrow());
+                result.more |= next.more;
+                if next.complete {
+                    atlas.complete = true;
+                }
+            }
+            if atlas.complete {
+                let _ = atlas.residency.sync_only(
+                    queue,
+                    doc.store,
+                    level_surface(blend.level),
+                    usize::MAX,
+                    &blend.visible,
+                );
+                atlas.shown = (atlas.shown + 1).min(BLEND_FADE_FRAMES);
+                if atlas.shown < BLEND_FADE_FRAMES {
+                    result.more = true;
+                }
+                #[allow(clippy::cast_precision_loss)]
+                let fade = atlas.shown as f32 / BLEND_FADE_FRAMES as f32;
+                weight = if atlas.shown >= BLEND_FADE_FRAMES {
+                    blend.weight
+                } else {
+                    blend.weight * fade
+                };
+            }
+        }
+        if weight <= 0.0 {
+            frame.blend = None;
+        }
+        let atlas = &mut self.primary.residency;
+        atlas.set_channel_gain(gain);
+        atlas.set_document_clip(Some(frame.doc_clip));
+        atlas.set_blend_weight(weight);
+        atlas.set_origin(
+            queue,
+            frame.level_origin,
+            frame.viewport_px,
+            frame.level_zoom,
+        );
+        let _ = atlas.sync_only(
+            queue,
+            doc.store,
+            level_surface(frame.level),
+            usize::MAX,
+            &frame.visible,
+        );
+        result
+    }
 }
 
 /// The tiles at every level the visible `level` tiles need, top level
