@@ -28,7 +28,8 @@ struct Canvas {
     // `mix(this level, partner level, x)`, premultiplied, before the
     // checkerboard. `0.0` (every atlas's default) never samples the
     // partner, so the picture is bit-identical to one with no partner.
-    // `yzw` are unused.
+    // `y` is the level of detail `fs_display` samples at (task 142; the
+    // atlas writes `0.0` and `fs_canvas` never reads it). `zw` are unused.
     blend: vec4<f32>,
 };
 
@@ -94,8 +95,16 @@ fn fs_canvas(in: VsOut) -> @location(0) vec4<f32> {
         let p = textureSample(partner_tex, canvas_smp, in.partner_uv);
         c = mix(c, p, canvas.blend.x);
     }
+    return present(c, in.pos.xy);
+}
+
+// The picture behind the canvas and its final encode, shared by
+// `fs_canvas` (the atlas) and `fs_display` (task 142's display texture),
+// so the two draw a sampled texel identically. Its comments are the
+// canonical write-up of the premultiplied "over" below.
+fn present(c: vec4<f32>, pos: vec2<f32>) -> vec4<f32> {
     // Checkerboard behind transparent areas, as any image editor shows.
-    let sq = floor(in.pos.xy / 8.0);
+    let sq = floor(pos / 8.0);
     let check = select(0.18, 0.24, (sq.x + sq.y) % 2.0 == 0.0);
     let bg = vec3<f32>(check);
     // **The atlas holds PREMULTIPLIED alpha** (since 0.68.0), so this is
@@ -166,4 +175,24 @@ fn fs_canvas(in: VsOut) -> @location(0) vec4<f32> {
     // is zero in the picture and only there.
     let encoded = (c.rgb + bg * (1.0 - c.a)) * canvas.channel_gain.rgb;
     return vec4<f32>(select(encoded, srgb_to_linear(encoded), SRGB_TARGET), 1.0);
+}
+
+// Task 142: the display texture (`aurora_gpu::DisplayTexture`), one page
+// of the whole composited document with a full mip chain built on the
+// GPU. The level of detail is a uniform (`canvas.blend.y`,
+// `-log2(physical zoom)` clamped to the chain), not derived from screen
+// derivatives, so a zoom between two powers of two is a trilinear mix of
+// the two levels (no pop when the zoom crosses one) and a power-of-two
+// zoom samples exactly one level. At or above 100 % the level is `0.0`,
+// which is a magnification (`mag_filter`, `Nearest`, as the atlas), so
+// the picture there is the atlas's texel for texel. `textureSampleLevel`
+// needs no uniform control flow. Never samples the partner (binding 3).
+@fragment
+fn fs_display(in: VsOut) -> @location(0) vec4<f32> {
+    if (in.t.x < canvas.doc_clip.x || in.t.y < canvas.doc_clip.y
+        || in.t.x >= canvas.doc_clip.z || in.t.y >= canvas.doc_clip.w) {
+        discard;
+    }
+    let c = textureSampleLevel(canvas_tex, canvas_smp, in.uv, canvas.blend.y);
+    return present(c, in.pos.xy);
 }

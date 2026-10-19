@@ -23,6 +23,9 @@
 
 mod canvas;
 mod context;
+mod display;
+#[cfg(test)]
+mod display_gpu_test;
 mod error;
 mod pipeline;
 #[cfg(test)]
@@ -37,6 +40,11 @@ pub mod test_support;
 
 pub use canvas::{CHECKERBOARD_SHADES, CanvasPipeline};
 pub use context::GpuContext;
+pub use display::{
+    DISCRETE_TEXEL_CAP, DisplayBudget, DisplayTexture, MAX_DISPLAY_MIP_LEVELS, PageLayout,
+    SHARED_MEMORY_DIVISOR, display_budget, display_bytes, doc_tiles, lod_for_zoom, mip_levels_for,
+    mip_rects, page_scissors, page_uniform, plan_pages, texture_bytes,
+};
 pub use error::GpuError;
 pub use pipeline::{Blend, PipelineCache, PipelineKey};
 pub use residency::{SyncStats, TileResidency};

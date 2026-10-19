@@ -70,12 +70,21 @@ impl CanvasPipeline {
         device: &wgpu::Device,
         target_format: wgpu::TextureFormat,
     ) -> &wgpu::RenderPipeline {
+        self.pipeline_for(device, target_format, "fs_canvas")
+    }
+
+    fn pipeline_for(
+        &mut self,
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        fragment_entry: &'static str,
+    ) -> &wgpu::RenderPipeline {
         // `SRGB_TARGET` is derived from `target_format` below, so the
         // pipeline cache key needs no entry of its own for it.
         let key = PipelineKey {
             shader: LABEL,
             vertex_entry: "vs_canvas",
-            fragment_entry: "fs_canvas",
+            fragment_entry,
             target_format,
             blend: Blend::None,
         };
@@ -125,6 +134,57 @@ impl CanvasPipeline {
                 cache: None,
             })
         })
+    }
+
+    /// The display texture's pipeline for `target_format` (task 142): the
+    /// same shader module, layout and `SRGB_TARGET` rule as
+    /// [`Self::pipeline`], with `fs_display` (sampling at the uniform's level
+    /// of detail) as its fragment entry. Cached beside it.
+    pub fn display_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+    ) -> &wgpu::RenderPipeline {
+        self.pipeline_for(device, target_format, "fs_display")
+    }
+
+    /// A bind group drawing page `page` of `display` (task 142): its view,
+    /// sampler and uniform in the atlas's slots, and again in the partner
+    /// slots (`fs_display` never reads them). `None` for no such page.
+    #[must_use]
+    pub fn display_bind_group(
+        &self,
+        device: &wgpu::Device,
+        display: &crate::DisplayTexture,
+        page: usize,
+    ) -> Option<wgpu::BindGroup> {
+        let (view, sampler, uniform) = display.page_bindings(page)?;
+        Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("canvas-display"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        }))
     }
 
     /// Builds a fresh bind group sampling `residency`'s own atlas view,

@@ -451,7 +451,7 @@ const BLOCK_SAMPLES: usize = CHUNK_SAMPLES * BLOCK_CHUNKS;
 /// [`CHANNELS`] contributes nothing for its final incomplete texel, the
 /// same contract `premultiply_rgba` and the pre-0.96.0 spelling of
 /// [`extend_premultiplied_le_bytes`] both have.
-fn serialize_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
+pub(crate) fn serialize_premultiplied_le_bytes(texels: &[f16], out: &mut [u8]) {
     #[cfg(target_endian = "little")]
     if copy_if_premultiplied_already(texels, out) {
         return;
