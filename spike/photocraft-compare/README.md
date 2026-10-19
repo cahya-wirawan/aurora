@@ -125,7 +125,11 @@ rounding the 16-bit reference gets).
   * The reference exists only for files Aurora opens, so files Aurora
     refuses (CMYK, Lab, 32-bit, ...) have no fidelity score for either tool.
 * **Colour spaces:**
-  * Aurora converts a tagged file to its sRGB working space and writes sRGB.
+  * Aurora converts a file tagged with an RGB profile that is not sRGB to its
+    sRGB working space, and writes sRGB. It does **not** apply grey
+    profiles, or profiles it judges invalid: those files keep their stored
+    values. `aurora-headless` reports what it converted from
+    (`colour_converted_from`).
   * PhotoCraft (as measured at 4d4de45) keeps the source profile and embeds
     it (`iCCP`): "Adobe RGB (1998)" for Nyepi, "Generic RGB Profile" for
     `images/curve-02.jpg`.
@@ -135,7 +139,10 @@ rounding the 16-bit reference gets).
     untagged output that is not really sRGB would therefore be mis-scored.
   * Other profiles are scored against the merged image as stored, which
     Aurora writes as `<ref>.stored.png` when its open converts colours.
-  * Tool-vs-tool rows across colour spaces are marked "not comparable".
+  * A tool-vs-tool row is marked "not comparable" only when Aurora actually
+    converted the file. When Aurora did not convert, both tools hold the
+    file's own values, even though PhotoCraft tags them with the profile
+    (for example a grey file), so the row is compared.
   * No colour conversion is done in Python.
 * **Hashes:** every timed run's output, idle and loaded, is compared by
   SHA-256 with the same tool's idle warm-up output, which is the picture
@@ -166,8 +173,8 @@ The decode itself is always whole.
     most of Aurora's time; see the phase table.
   * PhotoCraft's encoder and bit depth are its own. The pixel table lists
     each output's bit depth and size.
-  * Aurora converts colours at open; PhotoCraft does not. Files where this
-    happens carry a note.
+  * Aurora converts RGB profiles at open; PhotoCraft does not. Files where this
+    happens carry a note; so do files whose profile Aurora did not apply.
   * `aurora-export` composites on one thread because the app's export does.
 * **Peak RSS includes each tool's own caches.** For Aurora, that is the tile
   store's resident budget (a quarter of RAM, at most 8 GiB) and the effects
