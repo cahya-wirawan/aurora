@@ -55,6 +55,18 @@ pub(crate) fn present_mode_from_env() -> Option<wgpu::PresentMode> {
     mode
 }
 
+/// Reconfigures `surface` with the present mode `AURORA_PRESENT_MODE`
+/// asks for; unset, empty or unknown, it leaves the surface untouched.
+pub(crate) fn apply_present_mode_from_env(
+    surface: &mut aurora_gpu::GpuSurface<'_>,
+    device: &wgpu::Device,
+) {
+    if let Some(mode) = present_mode_from_env() {
+        surface.set_present_mode(device, mode);
+        tracing::info!(?mode, "present mode set by {PRESENT_MODE_ENV}");
+    }
+}
+
 /// The path `value` names, or `None` when it is empty or only whitespace.
 pub(crate) fn parse_open_path(value: &std::ffi::OsStr) -> Option<PathBuf> {
     let text = value.to_string_lossy();

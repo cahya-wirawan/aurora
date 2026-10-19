@@ -38354,16 +38354,8 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
             };
-        // Measurement only (`bench_launch`): unset, the surface keeps
-        // `create_surface`'s `AutoVsync`.
-        if let Some(mode) = bench_launch::present_mode_from_env() {
-            surface.set_present_mode(gpu.device(), mode);
-            tracing::info!(
-                ?mode,
-                "present mode set by {}",
-                bench_launch::PRESENT_MODE_ENV
-            );
-        }
+        // Measurement only: unset, the surface keeps `AutoVsync`.
+        bench_launch::apply_present_mode_from_env(&mut surface, gpu.device());
 
         // 0.192.1: the swapchain format decides whether the canvas shader
         // must hand linear light (`SRGB_TARGET`); logged once so a report
@@ -38445,8 +38437,7 @@ impl ApplicationHandler<AppEvent> for App {
         self.surface = Some(surface);
         self.adapter = Some(adapter);
         self.push_accessibility();
-        // Measurement only (`bench_launch`): a file named by
-        // `AURORA_OPEN` opens through the File > Open route.
+        // Measurement only: `AURORA_OPEN` opens through File > Open's route.
         if let Some(path) = bench_launch::open_path_from_env() {
             self.open_file(&path);
         }
