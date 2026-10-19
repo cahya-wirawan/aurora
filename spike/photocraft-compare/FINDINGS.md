@@ -154,3 +154,35 @@ These are also at the top of every `summary.md`:
 - UI frame rate, brush latency and interactive pan/zoom. These would be measured from outside: Metal HUD (`MTL_HUD_ENABLED=1`) on the Mac, MangoHud on Linux.
 - Filters and adjustments as operations, RAW, and PSD save.
 - `aurora-gpu`: available through `--tools`, but not in these tables.
+
+## Mac (Apple M2 Pro), same harness at `f8f428a`
+
+Apple M2 Pro (10 cores), 32 GiB, macOS 26.6.2, python 3.9.6; Aurora 0.275.0 and PhotoCraft built in release at the same pinned commit; 10 threads; loaded = 10 `yes`; 3 measured runs per cell, one warm-up. Measured on the separate `aurora-diag` checkout. Full tables: the Mac's `summary.md` (representative set, idle and loaded) and the 272-file corpus pass.
+
+Wall time in seconds, min-max over 3 runs (peak RSS in the full summary):
+
+| file | idle export | idle pool | idle photocraft | loaded export | loaded pool | loaded photocraft |
+|---|---|---|---|---|---|---|
+| psd-tools/1layer.psd | 0.018-0.019 | 0.018-0.019 | 0.037-0.038 | 0.041-0.073 | 0.037-0.042 | 0.051-0.078 |
+| psd-tools/layer_effects.psd | 0.095-0.096 | 0.069-0.073 | 0.105-0.108 | 0.151-0.253 | 0.187-0.245 | 0.22-0.231 |
+| psd-tools/blend-modes/rgb-blend-modes.psd | 0.126-0.144 | 0.116-0.120 | 0.123-0.127 | 0.388-0.508 | 0.357-0.567 | 0.178-0.249 |
+| images/curve-02.jpg | 0.291-0.302 | 0.285-0.291 | 0.121-0.128 | 0.373-0.473 | 0.396-0.451 | 0.144-0.171 |
+| images/instagram-01.png | 0.230-0.234 | 0.222-0.226 | 0.121 | 0.274-0.354 | 0.318-0.344 | 0.147-0.158 |
+| Nyepi template | 7.63-7.74 | 6.22-6.46 | 1.79-1.82 | 12.9-13.5 | 12.1-12.3 | 3.35-4.26 |
+| synthetic 24 MP PSD | 1.60-1.61 | 1.49-1.52 | 0.674-0.682 | 2.25-2.31 | 2.47-2.58 | 1.28-1.41 |
+| synthetic 24 MP PNG | 1.39-1.43 | 1.32-1.34 | 0.268-0.273 | 1.90-1.99 | 1.87-1.96 | 0.310-0.362 |
+| synthetic 60 MP PSD | 3.78-3.85 | 3.48-3.53 | 1.45-1.52 | 5.37-5.53 | 6.18-6.32 | 2.68-2.80 |
+| synthetic 60 MP PNG | 3.13-3.14 | 2.93-2.95 | 0.558-0.597 | 4.32-4.71 | 4.67-4.89 | 0.705-0.917 |
+
+- The picture matches Linux: tiny files are a tie or Aurora is ahead; large and layered files, and flat PNGs, are 2-5x slower in Aurora (ranges above, not single-sample ratios). On this machine Aurora's 60 MP PSD is 3.8 s against 1.5 s, where Linux gave 9.4-9.6 s against 4.1-4.3 s.
+- Aurora's phases on Nyepi (idle): open 5.06-5.16 s, composite 2.38-2.48 s (pool 0.96-1.16 s), encode 58-60 ms.
+- Pixel checks and the corpus pass reproduce the Linux counts exactly: 235 pairs, dimensions agree on all, 5 converted, 18 grey compared, 57 of 230 over 1 %, 45 / 4 / 167 against Photoshop, 81 / 114 scores of 0.0000. Aurora refuses the same files (`pen-text.psb`: 32-bit).
+- Mac peak RSS is within a few percent of Linux for the large files.
+
+## Known gaps in this record
+
+- `summary.md`'s "conversion is not recorded: 1" line counts `4x4_32bit_grayscale.psd`, a file Aurora refuses, so it is not a pair.
+- The 3-decimal zero counts (86 / 116) are not printed in `summary.md`; the 4-decimal ones are.
+- On the PSD path, `colour_converted_from` is set when the conversion is planned; if every layer's conversion then failed it would still name the profile (not seen in the corpus).
+- Only the "no conversion" case of that field has a unit test; the converted case is shown by the colour check run.
+- `--composite export --gpu` becomes GPU mode silently (export is the default).
