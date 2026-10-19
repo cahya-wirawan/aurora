@@ -68,6 +68,9 @@ struct Rig {
     _texture: wgpu::Texture,
     cache: crate::CompositeCache,
     worker: Option<crate::background_composite::CompositeWorker>,
+    /// Frames that wanted the blend toward the next level and did not draw
+    /// it (task 140 review: a dab or a pan must not switch it off).
+    unblended: u32,
 }
 
 /// What one rig frame did.
@@ -101,6 +104,7 @@ impl Rig {
             worker: worker.then(|| {
                 crate::background_composite::CompositeWorker::new(std::sync::Arc::new(|| {}))
             }),
+            unblended: 0,
         }
     }
 
@@ -158,6 +162,9 @@ impl Rig {
             zoomed_view::PYRAMID_FRAME_BUDGET,
         );
         let blend_live = frame.blend.is_some();
+        if blend_wanted && !blend_live {
+            self.unblended += 1;
+        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("r10-frame"),
         });
@@ -290,6 +297,7 @@ fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str,
 
     // A dab at fit: frames and ms until the level is current again.
     let reference_origin = crate::composite_reference_origin(&photo.layers, Some(photo.active));
+    let dab_unblended = rig.unblended;
     let mut dab_ms = Vec::new();
     let mut dab_frames = Vec::new();
     for i in 0..10 {
@@ -321,7 +329,8 @@ fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str,
     let (fmean, _, fmax) = stats(&dab_frames);
     println!(
         "R10 dab doc={label} path={path} how={how} n=10 to_current_mean={mean:.2} p90={p90:.2} \
-         max={max:.2} frames_mean={fmean:.1} frames_max={fmax:.0}"
+         max={max:.2} frames_mean={fmean:.1} frames_max={fmax:.0} unblended_frames={}",
+        rig.unblended - dab_unblended
     );
 
     // Wheel: fit -> 1.0 physical floor of the 1:1 atlas and back, 1.1x a
@@ -373,6 +382,7 @@ fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str,
         wheel.len()
     );
 
+    let pan_unblended = rig.unblended;
     // Pan at 0.3 (level 1), 40 frames of (96, 48) px.
     let mut pan = Vec::new();
     let mut incomplete = 0;
@@ -390,8 +400,9 @@ fn run(gpu: &aurora_gpu::GpuContext, photo: &mut Photo, label: &str, path: &str,
     let (mean, p90, max) = stats(pan.get(1..).unwrap_or_default());
     println!(
         "R10 pan doc={label} path={path} how={how} zoom=0.3 n=39 mean={mean:.2} p90={p90:.2} \
-         max={max:.2} incomplete_frames={incomplete} pyramid_tiles={}",
-        rig.cache.pyramid.current_len()
+         max={max:.2} incomplete_frames={incomplete} pyramid_tiles={} unblended_frames={}",
+        rig.cache.pyramid.current_len(),
+        rig.unblended - pan_unblended
     );
     if let Some(mut worker) = rig.worker.take() {
         worker.shutdown();

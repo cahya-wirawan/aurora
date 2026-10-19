@@ -194,9 +194,33 @@ fn settle_atlases(
     zoom: f32,
     viewport: (u32, u32),
 ) -> super::super::ZoomedFrame {
-    for _ in 0..64 {
+    settle_at(
+        device,
+        queue,
+        atlases,
+        doc,
+        cache,
+        zoom,
+        (0.0, 0.0),
+        viewport,
+    )
+}
+
+/// [`settle_atlases`] with the view's corner at document point `origin`.
+#[allow(clippy::too_many_arguments)]
+fn settle_at(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    atlases: &mut ZoomedAtlases,
+    doc: &mut super::Doc,
+    cache: &mut crate::CompositeCache,
+    zoom: f32,
+    origin: (f32, f32),
+    viewport: (u32, u32),
+) -> super::super::ZoomedFrame {
+    for _ in 0..256 {
         let mut frame = plan_blended(
-            (0.0, 0.0),
+            origin,
             zoom,
             viewport,
             doc.size,
@@ -221,7 +245,11 @@ fn settle_atlases(
             Level0::Sync(None, None),
             Duration::from_mins(1),
         );
-        if advance.complete && frame.blend.is_some() == wanted {
+        let faded = frame
+            .blend
+            .as_ref()
+            .is_none_or(|blend| atlases.primary().blend_weight() == blend.weight);
+        if advance.complete && frame.blend.is_some() == wanted && faded {
             return frame;
         }
     }
@@ -322,4 +350,321 @@ fn the_atlases_blend_once_both_levels_are_built_and_swap_without_a_stale_slot() 
     }
     // The pyramid surfaces the two atlases read are distinct.
     assert_ne!(level_surface(1), level_surface(2));
+}
+
+/// One frame at `zoom` with the view's corner at `origin`, under `budget`.
+#[allow(clippy::too_many_arguments)]
+fn prepare_once(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    atlases: &mut ZoomedAtlases,
+    doc: &mut super::Doc,
+    cache: &mut crate::CompositeCache,
+    (zoom, origin): (f32, (f32, f32)),
+    viewport: (u32, u32),
+    forget: bool,
+    budget: Duration,
+) -> (super::super::ZoomedFrame, super::super::Advance) {
+    let mut frame = plan_blended(
+        origin,
+        zoom,
+        viewport,
+        doc.size,
+        zoomed_floor(viewport, u32::MAX),
+        atlas_floor(viewport, u32::MAX),
+    );
+    let advance = atlases.prepare(
+        device,
+        queue,
+        &mut frame,
+        FrameDocument {
+            cache_id: cache.id(),
+            canvas: doc.size,
+            layers: &doc.layers,
+            active_layer: Some(doc.top),
+            store: &mut doc.store,
+            cache,
+        },
+        forget,
+        [1.0, 1.0, 1.0],
+        Level0::Sync(None, None),
+        budget,
+    );
+    (frame, advance)
+}
+
+/// Every pixel of the frame as the canvas draws it.
+fn render_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    canvas: &mut aurora_gpu::CanvasPipeline,
+    atlases: &ZoomedAtlases,
+    frame: &super::super::ZoomedFrame,
+    viewport: (u32, u32),
+) -> Vec<[u8; 4]> {
+    let bind_group = atlases.bind_group(canvas, device, frame);
+    let samples: Vec<(u32, u32)> = (0..viewport.1)
+        .flat_map(|y| (0..viewport.0).map(move |x| (x, y)))
+        .collect();
+    crate::tests::render_bound_pixels(device, queue, canvas, &bind_group, viewport, &samples)
+}
+
+fn worst(a: &[[u8; 4]], b: &[[u8; 4]]) -> i32 {
+    a.iter()
+        .zip(b)
+        .flat_map(|(p, q)| {
+            p.iter()
+                .zip(q)
+                .map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs())
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// A brush dab on the top layer at document point `at`, invalidated as
+/// the app does.
+fn dab(doc: &mut super::Doc, cache: &mut crate::CompositeCache, at: (f32, f32)) {
+    let reference_origin = crate::composite_reference_origin(&doc.layers, Some(doc.top));
+    let outcome = aurora_brush::stamp_dab(
+        &mut doc.store,
+        doc.top_surface,
+        at,
+        20.0,
+        [0.1, 0.9, 0.2],
+        None,
+    );
+    crate::invalidate_painted_tiles(
+        cache,
+        &doc.layers,
+        doc.top,
+        outcome.painted(),
+        reference_origin,
+    );
+}
+
+const VIEW: (u32, u32) = (512, 256);
+
+#[test]
+fn a_dab_keeps_the_blend_and_the_picture_until_its_tiles_rebuild() {
+    let Some(context) = crate::tests::real_gpu_context() else {
+        return;
+    };
+    let (device, queue) = (context.device(), context.queue());
+    let mut doc = document((2100, 1100));
+    let mut cache = crate::CompositeCache::default();
+    let mut atlases = ZoomedAtlases::new(device, queue, VIEW);
+    let mut canvas = aurora_gpu::CanvasPipeline::new(device);
+    let settled = settle_atlases(device, queue, &mut atlases, &mut doc, &mut cache, 0.3, VIEW);
+    let weight = settled.blend.as_ref().map_or(0.0, |blend| blend.weight);
+    assert!(weight > 0.5, "{weight}");
+    let before = render_frame(device, queue, &mut canvas, &atlases, &settled, VIEW);
+    dab(&mut doc, &mut cache, (300.0, 300.0));
+    // A frame whose levels are not rebuilt yet (no pyramid budget, as a
+    // frame waiting on the worker): the blend stays, and so does the
+    // picture, every tile showing what it last held.
+    for _ in 0..3 {
+        let (frame, advance) = prepare_once(
+            device,
+            queue,
+            &mut atlases,
+            &mut doc,
+            &mut cache,
+            (0.3, (0.0, 0.0)),
+            VIEW,
+            false,
+            Duration::ZERO,
+        );
+        assert!(!advance.complete, "the dab's ancestors are not rebuilt");
+        assert_eq!(frame.blend.as_ref().map(|b| b.weight), Some(weight));
+        assert_eq!(atlases.primary().blend_weight(), weight);
+        let during = render_frame(device, queue, &mut canvas, &atlases, &frame, VIEW);
+        assert!(worst(&before, &during) <= 1, "the view changed while stale");
+    }
+    let after = settle_atlases(device, queue, &mut atlases, &mut doc, &mut cache, 0.3, VIEW);
+    assert_eq!(after.blend.as_ref().map(|b| b.weight), Some(weight));
+    let rebuilt = render_frame(device, queue, &mut canvas, &atlases, &after, VIEW);
+    assert!(worst(&before, &rebuilt) > 8, "the dab arrives once rebuilt");
+}
+
+#[test]
+fn a_pan_into_unbuilt_tiles_keeps_blending() {
+    let Some(context) = crate::tests::real_gpu_context() else {
+        return;
+    };
+    let (device, queue) = (context.device(), context.queue());
+    let mut doc = document((4200, 1100));
+    let mut cache = crate::CompositeCache::default();
+    let mut atlases = ZoomedAtlases::new(device, queue, VIEW);
+    let settled = settle_atlases(device, queue, &mut atlases, &mut doc, &mut cache, 0.3, VIEW);
+    let weight = settled.blend.as_ref().map_or(0.0, |blend| blend.weight);
+    assert!(weight > 0.5);
+    for step in 1..=4_u16 {
+        let origin = (f32::from(step) * 600.0, 0.0);
+        let (frame, advance) = prepare_once(
+            device,
+            queue,
+            &mut atlases,
+            &mut doc,
+            &mut cache,
+            (0.3, origin),
+            VIEW,
+            false,
+            Duration::ZERO,
+        );
+        assert!(!advance.complete, "step {step}: new tiles are unbuilt");
+        assert_eq!(
+            frame.blend.as_ref().map(|b| b.weight),
+            Some(weight),
+            "step {step}"
+        );
+    }
+    let done = settle_at(
+        device,
+        queue,
+        &mut atlases,
+        &mut doc,
+        &mut cache,
+        0.3,
+        (2400.0, 0.0),
+        VIEW,
+    );
+    assert_eq!(done.blend.as_ref().map(|b| b.weight), Some(weight));
+}
+
+#[test]
+fn forgetting_both_atlases_restarts_the_fade_and_redraws_the_same_picture() {
+    let Some(context) = crate::tests::real_gpu_context() else {
+        return;
+    };
+    let (device, queue) = (context.device(), context.queue());
+    let mut doc = document((2100, 1100));
+    let mut cache = crate::CompositeCache::default();
+    let mut atlases = ZoomedAtlases::new(device, queue, VIEW);
+    let mut canvas = aurora_gpu::CanvasPipeline::new(device);
+    let settled = settle_atlases(device, queue, &mut atlases, &mut doc, &mut cache, 0.3, VIEW);
+    let weight = settled.blend.as_ref().map_or(0.0, |blend| blend.weight);
+    let before = render_frame(device, queue, &mut canvas, &atlases, &settled, VIEW);
+    // ZV-2 with both atlases: the 1:1 atlas drew last.
+    let (frame, _) = prepare_once(
+        device,
+        queue,
+        &mut atlases,
+        &mut doc,
+        &mut cache,
+        (0.3, (0.0, 0.0)),
+        VIEW,
+        true,
+        Duration::ZERO,
+    );
+    // Both levels are still current, so the partner is complete again at
+    // once, but its latch restarted: the first frame fades in.
+    let first = frame.blend.as_ref().map_or(0.0, |blend| blend.weight);
+    assert_eq!(first, weight);
+    let shown = atlases.primary().blend_weight();
+    assert!(shown > 0.0 && shown < weight, "{shown} of {weight}");
+    let again = settle_atlases(device, queue, &mut atlases, &mut doc, &mut cache, 0.3, VIEW);
+    let after = render_frame(device, queue, &mut canvas, &atlases, &again, VIEW);
+    assert!(worst(&before, &after) <= 1);
+}
+
+#[test]
+fn a_new_composite_cache_rekeys_both_atlases() {
+    let Some(context) = crate::tests::real_gpu_context() else {
+        return;
+    };
+    let (device, queue) = (context.device(), context.queue());
+    let mut doc = document((2100, 1100));
+    let mut cache = crate::CompositeCache::default();
+    let mut atlases = ZoomedAtlases::new(device, queue, VIEW);
+    let mut canvas = aurora_gpu::CanvasPipeline::new(device);
+    let settled = settle_atlases(device, queue, &mut atlases, &mut doc, &mut cache, 0.3, VIEW);
+    let before = render_frame(device, queue, &mut canvas, &atlases, &settled, VIEW);
+    let old = cache.id();
+    assert_eq!(
+        atlases.keys(),
+        (Some((old, doc.size, 1)), Some((old, doc.size, 2)))
+    );
+    // A document switch: another cache, nothing current in it.
+    let mut fresh = crate::CompositeCache::default();
+    assert_ne!(fresh.id(), old);
+    let (frame, _) = prepare_once(
+        device,
+        queue,
+        &mut atlases,
+        &mut doc,
+        &mut fresh,
+        (0.3, (0.0, 0.0)),
+        VIEW,
+        false,
+        Duration::ZERO,
+    );
+    assert_eq!(frame.blend, None, "a cold partner under a new key");
+    assert_eq!(atlases.keys().0, Some((fresh.id(), doc.size, 1)));
+    let again = settle_atlases(device, queue, &mut atlases, &mut doc, &mut fresh, 0.3, VIEW);
+    assert_eq!(
+        atlases.keys(),
+        (
+            Some((fresh.id(), doc.size, 1)),
+            Some((fresh.id(), doc.size, 2))
+        )
+    );
+    let after = render_frame(device, queue, &mut canvas, &atlases, &again, VIEW);
+    assert!(worst(&before, &after) <= 1);
+}
+
+#[test]
+fn a_stale_partner_swapped_back_into_the_primary_uploads_what_changed_at_its_level() {
+    let Some(context) = crate::tests::real_gpu_context() else {
+        return;
+    };
+    let (device, queue) = (context.device(), context.queue());
+    let mut doc = document((2100, 1100));
+    let mut cache = crate::CompositeCache::default();
+    let mut atlases = ZoomedAtlases::new(device, queue, VIEW);
+    let mut canvas = aurora_gpu::CanvasPipeline::new(device);
+    let _ = settle_atlases(device, queue, &mut atlases, &mut doc, &mut cache, 0.3, VIEW);
+    // 0.5 shows level 1 alone: the partner keeps level 2, unsynced.
+    let half = settle_atlases(device, queue, &mut atlases, &mut doc, &mut cache, 0.5, VIEW);
+    assert_eq!((half.level, half.blend.clone()), (1, None));
+    let id = cache.id();
+    assert_eq!(atlases.keys().1, Some((id, doc.size, 2)));
+    // An edit at level 2 while nothing uploads it there.
+    dab(&mut doc, &mut cache, (300.0, 300.0));
+    let _ = settle_atlases(device, queue, &mut atlases, &mut doc, &mut cache, 0.5, VIEW);
+    // 0.25: level 2 comes back into the primary by a swap.
+    let quarter = settle_atlases(
+        device,
+        queue,
+        &mut atlases,
+        &mut doc,
+        &mut cache,
+        0.25,
+        VIEW,
+    );
+    assert_eq!((quarter.level, quarter.blend.clone()), (2, None));
+    assert_eq!(atlases.keys().0, Some((id, doc.size, 2)));
+    let pixels = render_frame(device, queue, &mut canvas, &atlases, &quarter, VIEW);
+    for (x, y) in [(75, 75), (70, 72), (80, 78), (3, 5), (300, 7), (511, 255)] {
+        let got = pixels
+            .get((y * VIEW.0 + x) as usize)
+            .copied()
+            .unwrap_or_default();
+        let want = box_filtered(&mut doc.store, doc.size, 2, x, y);
+        for (g, w) in got.iter().zip(want).take(3) {
+            assert!(
+                (f64::from(*g) - (w * 255.0).round()).abs() <= 1.0,
+                "({x}, {y}): {got:?} vs {want:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_weight_below_one_step_is_not_drawn() {
+    // Just below a power of two the next level would add under 1/256.
+    let zoom = 0.25 * 0.999;
+    let frame = frame_at(zoom, u32::MAX);
+    assert!(blend_weight(frame.level, frame.level_zoom, 0.94) > 0.0);
+    assert!(blend_weight(frame.level, frame.level_zoom, 0.94) < super::super::BLEND_EPSILON);
+    assert_eq!(frame.blend, None);
 }

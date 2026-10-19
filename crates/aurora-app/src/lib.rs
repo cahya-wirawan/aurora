@@ -49692,6 +49692,24 @@ mod tests {
         sample: (u32, u32),
     ) -> [u8; 4] {
         let bind_group = canvas.bind_group(device, residency);
+        render_bound_pixels(device, queue, canvas, &bind_group, viewport, &[sample])
+            .first()
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// [`render_and_sample_pixel`] for any canvas bind group (task 140:
+    /// the zoomed-out view's two atlases) and any set of `samples`.
+    /// `viewport.0` must be a multiple of 64 (unpadded readback rows).
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn render_bound_pixels(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        canvas: &mut aurora_gpu::CanvasPipeline,
+        bind_group: &wgpu::BindGroup,
+        viewport: (u32, u32),
+        samples: &[(u32, u32)],
+    ) -> Vec<[u8; 4]> {
         let pipeline = canvas.pipeline(device, wgpu::TextureFormat::Rgba8Unorm);
 
         let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -49731,7 +49749,7 @@ mod tests {
                 multiview_mask: None,
             });
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
 
@@ -49780,18 +49798,19 @@ mod tests {
         let Ok(data) = slice.get_mapped_range() else {
             unreachable!("the buffer was just confirmed mapped successfully above");
         };
-        let (sx, sy) = sample;
-        let offset = (sy as usize) * (bytes_per_row as usize) + (sx as usize) * 4;
-        let Some(pixel) = data.get(offset..offset + 4) else {
-            unreachable!("sample is well within the readback buffer's own bounds");
-        };
-        let result = match pixel {
-            &[r, g, b, a] => [r, g, b, a],
-            _ => unreachable!("sliced exactly 4 bytes"),
-        };
+        let pixels = samples
+            .iter()
+            .map(|&(sx, sy)| {
+                let offset = (sy as usize) * (bytes_per_row as usize) + (sx as usize) * 4;
+                match data.get(offset..offset + 4) {
+                    Some(&[r, g, b, a]) => [r, g, b, a],
+                    _ => unreachable!("sample is well within the readback buffer's own bounds"),
+                }
+            })
+            .collect();
         drop(data);
         readback_buffer.unmap();
-        result
+        pixels
     }
 
     #[test]
