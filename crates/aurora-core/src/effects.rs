@@ -805,6 +805,54 @@ fn count<T>(items: &[T], kind: &'static str) -> Result<(), EffectsError> {
 }
 
 impl LayerEffects {
+    /// Per gradient overlay, whether its ramp is smoothed
+    /// ([`crate::GradientFill::smooth_ramp`], task 147): the flags the
+    /// positional wire cannot carry.
+    #[must_use]
+    pub fn gradient_overlay_ramps(&self) -> Vec<bool> {
+        self.gradient_overlays
+            .iter()
+            .map(|o| o.gradient.smooth_ramp)
+            .collect()
+    }
+
+    /// Per stroke, whether its paint is a gradient with a smoothed ramp
+    /// (`false` for every other stroke).
+    #[must_use]
+    pub fn stroke_gradient_ramps(&self) -> Vec<bool> {
+        self.strokes
+            .iter()
+            .map(|s| matches!(&s.paint, Some(StrokePaint::Gradient { gradient, .. }) if gradient.smooth_ramp))
+            .collect()
+    }
+
+    /// Sets [`Self::gradient_overlay_ramps`]; `false` and nothing changed
+    /// when `flags` does not match the overlays one for one.
+    pub fn set_gradient_overlay_ramps(&mut self, flags: &[bool]) -> bool {
+        if flags.len() != self.gradient_overlays.len() {
+            return false;
+        }
+        for (overlay, flag) in self.gradient_overlays.iter_mut().zip(flags) {
+            overlay.gradient.smooth_ramp = *flag;
+        }
+        true
+    }
+
+    /// Sets [`Self::stroke_gradient_ramps`] on the strokes that paint a
+    /// gradient; `false` and nothing changed when `flags` does not match
+    /// the strokes one for one.
+    pub fn set_stroke_gradient_ramps(&mut self, flags: &[bool]) -> bool {
+        if flags.len() != self.strokes.len() {
+            return false;
+        }
+        for (stroke, flag) in self.strokes.iter_mut().zip(flags) {
+            if let Some(StrokePaint::Gradient { gradient, .. }) = &mut stroke.paint {
+                gradient.smooth_ramp = *flag;
+            }
+        }
+        true
+    }
+
     /// Checks every cap and range in the module docs.
     ///
     /// # Errors
@@ -1315,6 +1363,7 @@ mod tests {
             reverse: false,
             align: true,
             offset: (0.0, 0.0),
+            smooth_ramp: true,
         }
     }
 

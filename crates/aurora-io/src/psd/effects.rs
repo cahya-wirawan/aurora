@@ -50,6 +50,9 @@ pub(super) struct ReadEffects {
     /// with the layer, or a phase offset (no Photoshop picture to derive
     /// either from); counted in `other.pattern_overlays` (task 111).
     pub pattern_unplaced: u32,
+    /// Shown gradient overlays and strokes whose Smoothness is neither 0
+    /// nor 100 %, drawn at 100 % (task 147).
+    pub partial_smoothness: u32,
 }
 
 /// The pattern id, scale and placement test shared by pattern strokes
@@ -298,6 +301,7 @@ fn count_on(
 #[allow(clippy::too_many_lines)]
 pub(super) fn map_effects(d: &Descriptor, global_angle: f32) -> Result<ReadEffects, Unreadable> {
     let mut ctx = Ctx { clamped: false };
+    let mut partial_smoothness = 0u32;
     let mut fx = LayerEffects {
         enabled: flag(d, b"masterFXSwitch", true)?,
         scale: ctx.num(d, b"Scl ", 100.0, 1.0, 0.0, MAX_EFFECT_SCALE)?,
@@ -356,6 +360,8 @@ pub(super) fn map_effects(d: &Descriptor, global_angle: f32) -> Result<ReadEffec
             StrokeFill::Color => None,
             StrokeFill::Gradient => match super::fill::gradient(e) {
                 Ok(gradient) if gradient.align && gradient.validate().is_ok() => {
+                    partial_smoothness +=
+                        u32::from(super::fill::partial_smoothness(e) && gate(e)?.on());
                     Some(StrokePaint::Gradient {
                         gradient,
                         reference: None,
@@ -417,6 +423,7 @@ pub(super) fn map_effects(d: &Descriptor, global_angle: f32) -> Result<ReadEffec
         let opacity = ctx.opacity(e)?;
         match super::fill::gradient(e) {
             Ok(gradient) if gradient.align && gradient.validate().is_ok() => {
+                partial_smoothness += u32::from(super::fill::partial_smoothness(e) && g.on());
                 fx.gradient_overlays.push(GradientOverlay {
                     gate: g,
                     blend_mode: mode,
@@ -504,5 +511,6 @@ pub(super) fn map_effects(d: &Descriptor, global_angle: f32) -> Result<ReadEffec
         glow_contours,
         pattern_unreadable,
         pattern_unplaced,
+        partial_smoothness,
     })
 }

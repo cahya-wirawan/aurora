@@ -560,6 +560,9 @@ enum Note {
     StrokeSizeCapped,
     GlowNoiseNotApplied,
     GlowContourNotApplied,
+    /// Gradients whose Smoothness is neither 0 nor 100 %, drawn at 100 %
+    /// (task 147).
+    GradientSmoothnessPartial,
     GlowSizeCapped,
     DropShadowsNotShown,
     ColorOverlaysNotShown,
@@ -586,6 +589,9 @@ enum Note {
     /// Adjustment layers of a CMYK or 32-bit file, left out (task 146):
     /// nothing checked how Photoshop's adjustments read those modes.
     AdjustmentLeftOutInMode,
+    /// A Brightness/Contrast layer of a CMYK file is applied to the colours
+    /// already converted to sRGB, not to the inks (task 147).
+    AdjustmentOnConvertedCmyk,
     /// Layer effects of a CMYK or 32-bit file, left out (task 146).
     EffectsLeftOutInMode,
     /// A Grayscale file is held as RGB (grey on all three channels); a PSD
@@ -854,8 +860,8 @@ fn note_text(note: Note, n: u64) -> String {
         ),
         Note::ArtboardBackgroundNotDrawn(reason) => match reason {
             fill::ArtboardLeft::Unchecked => format!(
-                "{n} artboard{s} with a white or black background: the background {was} not \
-                 drawn (no Photoshop picture of one has been checked)."
+                "{n} artboard{s} with a black background: the background {was} not \
+                 drawn (no Photoshop picture of one has been checked; a white one is drawn)."
             ),
             fill::ArtboardLeft::Unreadable => {
                 format!("{n} artboard background{s} could not be read and {was} not drawn.")
@@ -982,6 +988,10 @@ fn note_text(note: Note, n: u64) -> String {
         }
         Note::GlowContourNotApplied => format!(
             "{n} outer glow{s} with a contour other than Linear {is} drawn with a Linear one."
+        ),
+        Note::GradientSmoothnessPartial => format!(
+            "{n} gradient{s} with a Smoothness between 0 and 100 % {is} drawn at 100 % \
+             (Aurora has no partial smoothness)."
         ),
         Note::GlowSizeCapped => format!(
             "{n} outer glow{s} {is} too large to draw at full size and {is} shown smaller \
@@ -1110,6 +1120,11 @@ fn note_text(note: Note, n: u64) -> String {
         Note::AdjustmentLeftOutInMode => format!(
             "{n} adjustment layer{s} {was} left out — Aurora has not checked how Photoshop's \
              adjustments work in CMYK or 32-bit files."
+        ),
+        Note::AdjustmentOnConvertedCmyk => format!(
+            "{n} Brightness/Contrast layer{s} of this CMYK file {was} applied to the colours \
+             converted to sRGB, not to the inks, and may differ from Photoshop's result \
+             (measured on its own renderings: legacy 3 levels, default 13 levels mean error)."
         ),
         Note::EffectsLeftOutInMode => format!(
             "The layer effects of {n} layer{s} {was} left out — their colours are in a space \
@@ -3873,6 +3888,10 @@ fn note_unsupported_kept(
                     }
                 }
                 notes.add_n(Note::GlowContourNotApplied, u64::from(read.glow_contours));
+                notes.add_n(
+                    Note::GradientSmoothnessPartial,
+                    u64::from(read.partial_smoothness),
+                );
                 // 0.190.0: solid-colour strokes are drawn too.
                 for stroke in fx.strokes.iter().filter(|e| fx.shows(e.gate) && e.drawn()) {
                     if stroke.geometry().capped {
@@ -4208,6 +4227,28 @@ fn other_adjustment_node(
     adjustment_node(src, record, header, params, notes, vector_budget)
 }
 
+/// Whether an adjustment layer of a CMYK file is applied to the converted
+/// sRGB picture (task 147). Only Brightness/Contrast: measured against
+/// Photoshop's own renderings of the `adjustments/*_cmyk.psd` fixtures
+/// (mean error against the left-out picture -> applied): legacy 22.3 -> 3.4,
+/// default 42.1 -> 12.7 (the default mode is approximate in RGB too, 8.75).
+/// Not applied: Invert (48.5 -> 49.8: Photoshop inverts the inks, so a light
+/// colour becomes near black), Threshold (68.8 -> 35.4: its lightness is not
+/// the sRGB luma), Posterize (11.5 -> 12.5, 19.4 -> 18.8), and Curves,
+/// Levels and Hue/Saturation, whose channel layouts are inks.
+fn cmyk_adjustment_applies(header: Header, record: &Record) -> bool {
+    header.cmyk()
+        && !header.float()
+        && !record.features.adjustment
+        && record.curves.is_none()
+        && record.levels.is_none()
+        && record.hue_saturation.is_none()
+        && matches!(
+            record.other_adjustment,
+            Some(read_adjust::Parsed::Brightness(..))
+        )
+}
+
 /// One non-divider record as a layer node, or `None` when it is left out
 /// (an adjustment layer, or a fill layer with no pixels).
 #[allow(clippy::too_many_lines)] // one branch per layer kind
@@ -4225,9 +4266,13 @@ fn layer_node(
             || record.levels.is_some()
             || record.hue_saturation.is_some()
             || record.other_adjustment.is_some())
+        && !cmyk_adjustment_applies(header, record)
     {
         notes.add(Note::AdjustmentLeftOutInMode);
         return None;
+    }
+    if header.cmyk() && cmyk_adjustment_applies(header, record) {
+        notes.add(Note::AdjustmentOnConvertedCmyk);
     }
     if let (Some(curves), false) = (&record.curves, record.features.adjustment) {
         let params = match curves {
@@ -4340,6 +4385,36 @@ fn layer_node(
     }))
 }
 
+/// The reference box of a drawn fill: a gradient's (the vector path's bounds;
+/// with no path, a raster user mask's rectangle, the layer's extent in
+/// task 147: `gradient-fill.psd`, a 100 x 150 canvas whose gradient layer has
+/// a 16 x 94 mask, whose Photoshop ramp spans the mask rectangle, mean error
+/// inside it 22 -> 4.5 levels against the canvas-sized ramp; else the
+/// canvas) or the canvas for a solid colour.
+fn fill_reference(
+    fill: &fill::Fill,
+    path_box: Option<Rect>,
+    record: &Record,
+    canvas: Rect,
+) -> Rect {
+    match fill {
+        fill::Fill::Gradient(g) => fill::reference_box(
+            g,
+            path_box.or_else(|| {
+                // Not the rendering of a vector mask (flags bit 3), which
+                // is a disabled or unreadable vector mask's `-2` channel.
+                record
+                    .mask
+                    .filter(|m| m.flags & 0x08 == 0)
+                    .map(|m| m.bounds)
+                    .filter(|b| b.width > 0 && b.height > 0)
+            }),
+            canvas,
+        ),
+        fill::Fill::Solid(_) => canvas,
+    }
+}
+
 /// A shape or fill layer that stores no pixels (task 108), drawn from its
 /// solid colour or gradient and its vector mask as an ordinary pixel layer.
 /// What cannot be drawn is left out and reported, as before.
@@ -4405,10 +4480,7 @@ fn drawn_fill_node(
         return left_out(notes, fill::LeftOut::TooLarge);
     }
     vector_budget.pixels -= charge;
-    let reference = match &fill {
-        fill::Fill::Gradient(g) => fill::reference_box(g, path_box, canvas),
-        fill::Fill::Solid(_) => canvas,
-    };
+    let reference = fill_reference(&fill, path_box, record, canvas);
     let Some(samples) = fill::render(&fill, region, reference, raster.as_ref(), density) else {
         return left_out(notes, fill::LeftOut::TooLarge);
     };
@@ -4418,6 +4490,13 @@ fn drawn_fill_node(
     notes.add(Note::FillDrawn);
     if matches!(fill, fill::Fill::Gradient(_)) {
         notes.add(Note::FillGradientApproximate);
+        if record
+            .fill
+            .as_ref()
+            .is_some_and(|(_, data)| fill::block_has_partial_smoothness(data))
+        {
+            notes.add(Note::GradientSmoothnessPartial);
+        }
     }
     let props = props_for(record, notes);
     let outcome = if raster.is_some() {

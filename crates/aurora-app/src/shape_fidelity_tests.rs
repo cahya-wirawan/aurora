@@ -61,7 +61,7 @@ fn error_by_hidden_layer_for_named_files() {
 /// follow the stored angle, a pattern fill and a pattern/gradient overlay.
 const SHAPE_FIDELITY: [(&str, f64, f64); 4] = [
     ("vector-mask2.psd", 5.0, 70.0),
-    ("colormodes/4x4_16bit_rgb.psd", 27.5, 135.0),
+    ("colormodes/4x4_16bit_rgb.psd", 28.0, 135.0),
     ("colormodes/4x4_16bit_grayscale.psd", 18.0, 45.0),
     ("artboard-bgcolor.psd", 0.05, 1.0),
 ];
@@ -73,7 +73,7 @@ fn drawn_fills_and_artboard_backgrounds_match_photoshops_merged_images() {
     for (file, mean_bound, max_bound) in SHAPE_FIDELITY {
         let path = root.join(file);
         let Ok(bytes) = std::fs::read(&path) else {
-            println!("SKIPPED: corpus file not present at {}", path.display());
+            crate::open_time_tests::corpus_file_absent(&path);
             continue;
         };
         let Ok(merged) = aurora_io::decode_psd_merged_image(&bytes) else {

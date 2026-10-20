@@ -412,14 +412,19 @@ fn gradient_positions_follow_the_geometry() {
     near(g.position(16.0, 3.0, b), 0.0);
     near(g.position(8.0, 3.0, b), 0.5);
     near(g.position(24.0, 3.0, b), 0.5);
-    // Radial: 0 at the centre, 1 at the corner.
+    // Radial (fitted to Photoshop's pixels, task 147): `EDGE_OFFSET` at the
+    // centre, 1 at the corner.
     let g = parsed_gradient(&black_to_white(b"Rdl ", 0.0, 100.0, false));
-    near(g.position(16.0, 16.0, b), 0.0);
+    near(g.position(16.0, 16.0, b), aurora_core::gradient_fill::EDGE_OFFSET as f32);
     near(g.position(32.0, 32.0, b), 1.0);
-    // Diamond: 1 at a corner of a square box, 0.5 at an edge midpoint.
+    // An edge midpoint: the fitted radius is `RADIAL_FACTOR` of the nominal.
+    near(g.position(32.0, 16.0, b), 0.806_570);
+    // Diamond (same radius as Radial times its factor): 1 at a corner of a
+    // square box, `EDGE_OFFSET + 16 / (DIAMOND_FACTOR 16 sqrt 2)` at an
+    // edge midpoint.
     let g = parsed_gradient(&black_to_white(b"Dmnd", 0.0, 100.0, false));
     near(g.position(32.0, 32.0, b), 1.0);
-    near(g.position(32.0, 16.0, b), 0.5);
+    near(g.position(32.0, 16.0, b), 0.838_594);
     // The box offset moves the centre (percent of the box).
     let mut moved = parsed_gradient(&black_to_white(b"Lnr ", 0.0, 100.0, false));
     moved.offset = (25.0, 0.0);
@@ -535,16 +540,21 @@ fn an_artboard_rectangle_past_the_canvas_is_clipped_to_it() {
 }
 
 #[test]
-fn transparent_white_and_black_artboard_backgrounds_draw_nothing() {
+fn transparent_and_black_artboard_backgrounds_draw_nothing_and_white_is_drawn() {
     let transparent = doc(&artboard_file(3, (0.0, 0.0, 6.0, 8.0)).write());
     assert_eq!(transparent.layers.len(), 1);
     assert!(!report_text(&transparent).contains("background"));
-    for kind in [1, 2] {
-        let document = doc(&artboard_file(kind, (0.0, 0.0, 6.0, 8.0)).write());
-        assert_eq!(document.layers.len(), 1, "type {kind}");
-        let text = report_text(&document);
-        assert!(text.contains("background") && text.contains("not drawn"), "{text}");
-    }
+    let black = doc(&artboard_file(2, (0.0, 0.0, 6.0, 8.0)).write());
+    assert_eq!(black.layers.len(), 1);
+    let text = report_text(&black);
+    assert!(text.contains("black background") && text.contains("not drawn"), "{text}");
+    // White (type 1) is drawn as white inside the rectangle: Photoshop's
+    // merged image of `advanced-blending.psd` blends its layers over it
+    // (task 147, mean error 58 -> see the audit).
+    let white = doc(&artboard_file(1, (0.0, 2.0, 4.0, 6.0)).write());
+    assert_eq!(white.layers.len(), 2, "the group and its background layer");
+    assert_eq!(fill_px(&white, 2, 0), Some(u8px(255, 255, 255, 255)));
+    assert!(fill_px(&white, 6, 0).is_none(), "right of the rectangle");
 }
 
 #[test]
@@ -641,4 +651,229 @@ fn a_drawn_fills_buffer_is_charged_unless_it_is_the_shapes_own_charged_raster() 
     assert_eq!(super::fill_pixel_charge(Some(&raster(false)), 0.5, region), 100);
     assert_eq!(super::fill_pixel_charge(Some(&raster(true)), 1.0, region), 100);
     assert_eq!(super::fill_pixel_charge(None, 1.0, region), 100);
+}
+
+/// Photoshop's own pixels (`gradient-styles.psd`, shapes of 32 x 32 px
+/// filled red to white, Smoothness 100 %, G channel = the ramp position
+/// through the smoothed transition, dithered by about 1-2 levels), sampled
+/// by hand, against the drawn fill's maths. Bounds are the fit's own mean
+/// error (Linear about 1, Radial about 1-2 levels) plus margin; the plain
+/// straight ramp and the old Diamond radius both fail them.
+#[test]
+fn drawn_gradients_follow_photoshops_pixels() {
+    let red_white = |style: &'static [u8; 4], angle: f64, reverse: bool| {
+        let block = gradient_block(
+            style,
+            angle,
+            100.0,
+            reverse,
+            vec![colour_stop(255.0, 0.0, 0.0, 0, 50), colour_stop(255.0, 255.0, 255.0, 4096, 50)],
+            vec![],
+        );
+        parsed_gradient(&block)
+    };
+    let level = |g: &fill::Gradient, b: aurora_core::Rect, x: f64, y: f64| {
+        f64::from(g.at(g.position(x, y, b)).0[1]) * 255.0
+    };
+    // Linear 30 degrees, box (0, 0, 32, 32): row y = 11, x = 2, 5, ..., 29.
+    let b = square(32);
+    let g = red_white(b"Lnr ", 30.0, false);
+    let photoshop = [48.0, 68.0, 88.0, 111.0, 133.0, 155.0, 176.0, 196.0, 215.0, 231.0];
+    for (i, want) in photoshop.iter().enumerate() {
+        let got = level(&g, b, 2.0 + 3.0 * i as f64, 11.0);
+        assert!((got - want).abs() < 6.0, "linear x {}: {got} vs {want}", 2 + 3 * i);
+    }
+    // Radial, box (32, 0, 32, 32), centre pixel (48, 16): the row to the
+    // right of the centre.
+    let b = aurora_core::Rect { x: 32, y: 0, width: 32, height: 32 };
+    let g = red_white(b"Rdl ", 30.0, false);
+    let row = [
+        0.0, 8.0, 17.0, 29.0, 42.0, 56.0, 71.0, 87.0, 104.0, 120.0, 137.0, 153.0, 170.0, 186.0,
+        201.0, 215.0, 228.0,
+    ];
+    for (k, want) in row.iter().enumerate().skip(1) {
+        let got = level(&g, b, 48.0 + k as f64, 16.0);
+        assert!((got - want).abs() < 8.0, "radial k {k}: {got} vs {want}");
+    }
+    // Diamond, 30 degrees (rotated square), box (128, 0, 32, 32): the
+    // anti-diagonal is not on the axes, so use the sums along the first
+    // axis instead -- Photoshop's pixel at the diamond's own corner
+    // distance is saturated white (255) and the centre is near 0.
+    let b = aurora_core::Rect { x: 128, y: 0, width: 32, height: 32 };
+    let g = red_white(b"Dmnd", 0.0, false);
+    assert!(level(&g, b, 144.0, 16.0) < 12.0, "diamond centre");
+    assert!(level(&g, b, 144.0 + 20.0, 16.0) > 250.0, "diamond edge 20 px out is white");
+}
+
+// The 4 x 4 gradient-only fixtures of psd-tools (`colormodes/4x4_*bit_*.psd`,
+// a 30 degree Reflected gradient on a 4 x 4 canvas) cannot be matched: their
+// merged image depends only on |x - y| (a 45 degree direction), while the
+// same Photoshop gradient with the same stored angle on the 34 x 34 shapes of
+// `gradient-styles.psd` really runs at 30 degrees (checked pixel by pixel,
+// task 147). They are kept as fixtures and score 17-28 levels; moving the
+// smoothing or the Radial/Diamond constants shifted them by 1-1.3 levels
+// either way, which is noise on an unexplained picture, not a signal.
+
+/// A two-stop black-to-white `GdFl` block with an explicit `Intr`
+/// (smoothness, 4096 = 100 %).
+fn gradient_block_with_smoothness(smoothness: Option<f64>) -> Vec<u8> {
+    gradient_block_with_alpha(smoothness, 100.0)
+}
+
+/// [`gradient_block_with_smoothness`] with the end opacity (percent).
+fn gradient_block_with_alpha(smoothness: Option<f64>, alpha_end: f64) -> Vec<u8> {
+    let mut grad = vec![
+        (&b"GrdF"[..], V::Enum(b"GrdF", b"CstS")),
+        (
+            b"Clrs",
+            V::List(vec![
+                colour_stop(0.0, 0.0, 0.0, 0, 50),
+                colour_stop(255.0, 255.0, 255.0, 4096, 50),
+            ]),
+        ),
+        (b"Trns", V::List(vec![alpha_stop(100.0, 0), alpha_stop(alpha_end, 4096)])),
+    ];
+    if let Some(s) = smoothness {
+        grad.push((b"Intr", V::Doub(s)));
+    }
+    fill_block(&[
+        (b"Angl", V::Unit(b"#Ang", 0.0)),
+        (b"Type", V::Enum(b"GrdT", b"Lnr ")),
+        (b"Grad", V::Obj(grad)),
+    ])
+}
+
+#[test]
+fn smoothness_zero_is_a_straight_ramp_and_anything_else_is_smoothed() {
+    // Photoshop's default (Smoothness 100 %, also when `Intr` is absent): a
+    // smoothstep per segment, 3 * 0.25^2 - 2 * 0.25^3 = 0.15625 at a quarter.
+    for smoothness in [None, Some(4096.0)] {
+        let g = parsed_gradient(&gradient_block_with_smoothness(smoothness));
+        assert!(g.smooth_ramp, "{smoothness:?}");
+        near_f32(g.at(0.25).0[0], 0.156_25);
+        near_f32(g.at(0.5).0[0], 0.5);
+    }
+    // Smoothness 0 %: straight.
+    let g = parsed_gradient(&gradient_block_with_smoothness(Some(0.0)));
+    assert!(!g.smooth_ramp);
+    near_f32(g.at(0.25).0[0], 0.25);
+}
+
+/// Opacity stops are smoothed like colour stops: a 100 % to 0 % ramp is
+/// `1 - smoothstep(t)`, so at a quarter `1 - 0.15625 = 0.84375` (derived
+/// from `3 * 0.25^2 - 2 * 0.25^3`, not read off the code), and straight
+/// (`0.75`) at Smoothness 0.
+#[test]
+fn opacity_stops_are_smoothed_like_colour_stops() {
+    let smooth = parsed_gradient(&gradient_block_with_alpha(None, 0.0));
+    near_f32(smooth.at(0.25).1, 0.843_75);
+    near_f32(smooth.at(0.5).1, 0.5);
+    let straight = parsed_gradient(&gradient_block_with_alpha(Some(0.0), 0.0));
+    near_f32(straight.at(0.25).1, 0.75);
+}
+
+fn near_f32(a: f32, want: f32) {
+    assert!((a - want).abs() < 1e-5, "{a} != {want}");
+}
+
+/// A CMYK file's gradient is blended in ink space through sub-stops that
+/// carry the smoothing themselves, and the ramp between them must stay
+/// straight (a second smoothing would flatten each tiny segment).
+#[test]
+fn a_cmyk_gradient_is_smoothed_once_through_its_ink_space_sub_stops() {
+    let ink = |c: f64| {
+        V::Obj(vec![
+            (b"Cyn ", V::Doub(c)),
+            (b"Mgnt", V::Doub(0.0)),
+            (b"Ylw ", V::Doub(0.0)),
+            (b"Blck", V::Doub(0.0)),
+        ])
+    };
+    let stop = |c: f64, at: i32| {
+        V::Obj(vec![(b"Clr ", ink(c)), (b"Lctn", V::Long(at)), (b"Mdpn", V::Long(50))])
+    };
+    let block = fill_block(&[
+        (b"Angl", V::Unit(b"#Ang", 0.0)),
+        (b"Type", V::Enum(b"GrdT", b"Lnr ")),
+        (
+            b"Grad",
+            V::Obj(vec![
+                (b"GrdF", V::Enum(b"GrdF", b"CstS")),
+                (b"Clrs", V::List(vec![stop(0.0, 0), stop(100.0, 4096)])),
+                (b"Trns", V::List(vec![alpha_stop(100.0, 0), alpha_stop(100.0, 4096)])),
+            ]),
+        ),
+    ]);
+    // No profile: the naive formula, red = 1 - cyan, so red = 1 - smoothstep(t).
+    let converter = crate::colour_cmyk::CmykConverter::new(None);
+    let Ok(Fill::Gradient(g)) = fill::parse_in(*b"GdFl", &block, Some(&converter)) else {
+        unreachable!("a CMYK gradient")
+    };
+    for t in [0.1_f32, 0.27, 0.5, 0.8] {
+        let want = 1.0 - f64::from(t) * f64::from(t) * (3.0 - 2.0 * f64::from(t));
+        let got = f64::from(g.at(t).0[0]);
+        assert!((got - want).abs() < 0.005, "t {t}: {got} vs {want}");
+    }
+}
+
+/// A gradient fill with a `-2` mask channel of 6 x 6 at (2, 2) on a 10 x 10
+/// canvas, black to white left to right; `mask_flags` is the mask's flags
+/// byte and `vector` an optional `vmsk` block.
+fn masked_gradient_file(mask_flags: u8, vector: Option<Vec<u8>>) -> TestPsd {
+    TestPsd::new(1, 10, 10, 8).with(|p| {
+        p.layers.push(TestLayer::empty("fill").with(|l| {
+            l.blocks.push((*b"GdFl", black_to_white(b"Lnr ", 0.0, 100.0, false)));
+            if let Some(v) = vector {
+                l.blocks.push((*b"vmsk", v));
+            }
+            l.mask = Some((2, 2, 8, 8, 0, mask_flags));
+            l.channels.push((-2, vec![255; 36]));
+        }));
+    })
+}
+
+/// The red a drawn gradient has at document `(3, 5)`: 0.216 when it spans
+/// the 10 px canvas (`t = 0.3`, smoothed), 0.074 when it spans the 6 px mask
+/// rectangle (`t = 1/6`).
+fn gradient_red_at_3_5(file: &TestPsd) -> f32 {
+    let document = doc(&file.write());
+    fill_px(&document, 3, 5).map_or(f32::NAN, |p| p[0])
+}
+
+/// Task 147: a raster user mask's rectangle is the layer's extent for a
+/// drawn gradient (Photoshop: `gradient-fill.psd`); the rendering of a
+/// disabled vector mask in the `-2` channel (flags bit 3) is not, and the
+/// gradient spans the canvas.
+#[test]
+fn a_drawn_gradient_spans_a_raster_masks_rectangle_but_not_a_disabled_vector_masks() {
+    let raster = gradient_red_at_3_5(&masked_gradient_file(0, None));
+    assert!((raster - 0.074).abs() < 0.01, "raster mask: {raster}");
+    // Flags bit 3: the mask channel is the vector mask's rendering; the
+    // vector mask itself is turned off (flags bit 2).
+    let disabled = gradient_red_at_3_5(&masked_gradient_file(
+        0x08,
+        Some(vmsk(4, &rect_path(0.25, 0.25, 0.75, 0.75, 1))),
+    ));
+    assert!((disabled - 0.216).abs() < 0.01, "disabled vector mask: {disabled}");
+}
+
+/// Task 147: a drawn gradient fill whose Smoothness is neither 0 nor 100 %
+/// says so in the open report; 0, 100 % and an absent `Intr` do not.
+#[test]
+fn a_drawn_fill_with_partial_smoothness_reports_it() {
+    for (intr, says) in [
+        (Some(2048.0), true),
+        (Some(4096.0), false),
+        (Some(0.0), false),
+        (None, false),
+    ] {
+        let file = empty_fill_file(10, 2, *b"GdFl", gradient_block_with_smoothness(intr), None);
+        let text = report_text(&doc(&file.write()));
+        assert_eq!(
+            text.contains("Smoothness between 0 and 100 % is drawn at 100 %")
+                || text.contains("Smoothness between 0 and 100 % are drawn at 100 %"),
+            says,
+            "{intr:?}: {text}"
+        );
+    }
 }

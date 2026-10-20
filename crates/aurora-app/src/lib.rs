@@ -93320,7 +93320,7 @@ mod tests {
             (
                 "effect-stroke-gradient.psd",
                 248.0,
-                [23.6092, 18.0220, 11.2299],
+                [23.6092, 18.0900, 11.3050],
             ),
             // 0.182.0: unchanged by drawing drop shadows.
             // 0.190.0: Outside and inside strokes drawn; before: 255 / 12.2021, 37.6904, 37.1924.
@@ -93332,12 +93332,13 @@ mod tests {
             // 0.182.0: unchanged by drawing drop shadows.
             ("effects/shape-fx.psd", 0.0, [0.0000, 0.0000, 0.0000]),
             // 0.182.0: unchanged by drawing drop shadows.
+            // Task 147: gradients are smoothed like Photoshop's (Smoothness 100 %): this file, effect-stroke-gradient and layer_comps measure 0.02-0.07 levels worse in single channels (bounds raised to the new measurements), shape-fx2 and layer_effects better.
             // 0.190.0: Solid strokes drawn (raster ones match Photoshop pixel for pixel); shape layers differ in their gradient fill, gradient and pattern strokes are not drawn, green is worse; before: 255 / 58.2448, 23.1956, 44.6420.
             // Task 118: the gradient and pattern strokes are drawn; on the pixels they change the summed error against Photoshop falls 377,360 -> 242,280 (red is 0.21 worse overall, green 0.56 and blue 0.03 better); the rest of the gap is the shape layers' own gradient fill and the gradient ramp length, as for gradient overlays; before: 255 / 37.9004, 24.9445, 27.3005.
             (
                 "effects/stroke-effects.psd",
                 255.0,
-                [38.1145, 24.3832, 27.2692],
+                [38.1145, 24.4500, 27.2900],
             ),
             // 0.182.0: unchanged by drawing drop shadows.
             // 0.203.0: its master-only Hue/Saturation layer imported; before: 240 / 133.1256, 58.7064, 39.0855.
@@ -93346,11 +93347,12 @@ mod tests {
             // 0.182.0, drop shadows drawn; before (0.181.0): max 162, mean 6.738, 12.118, 17.999.
             // 0.190.0: Strokes drawn; before: 162 / 4.4585, 9.8399, 15.7286.
             // Task 110: gradient overlays drawn (reference box = the record rectangle); mean over channels 9.63 -> 9.51: red 3.90 -> 3.64 and blue 15.63 -> 15.40 better, green 9.35 -> 9.48 worse (not explained).
-            ("layer_comps.psd", 162.0, [2.4443, 9.2351, 5.3467]),
+            ("layer_comps.psd", 162.0, [2.4480, 9.2640, 5.3780]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 182, mean 6.800, 12.246, 18.372.
             // 0.190.0: Strokes drawn; before: 182 / 4.2692, 9.7118, 15.7745.
             // Task 110: as layer_comps.psd (measured 3.5652 / 9.4646 / 15.5236).
-            ("layer_comps.psb", 127.0, [2.3718, 9.2261, 5.4342]),
+            // Task 147: max 127 -> 136. Located on the audit dumps: texels with error >= 120 went 8 -> 25 of 40,000 and the mean did not move (R 2.3718 -> 2.375); smoothing changed 1,337 texels (max change 14) in rows 72-183, columns 65-140, the gradient overlay's region, and the worst texel is (74, 67), mirrored at (74, 125): Aurora (136, 251, 136) against Photoshop (0, 252, 134), baseline (127, 247, 126), a one-pixel edge texel of the overlay's shape where the fitted ramp end differs. A smoothing artefact at a shape edge, not a regression of a place that matters.
+            ("layer_comps.psb", 136.0, [2.3760, 9.2600, 5.4620]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 245, mean 4.480, 7.851, 9.767.
             ("layer_params.psd", 252.0, [5.9676, 4.9552, 4.5911]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 245, mean 4.480, 7.851, 9.767.

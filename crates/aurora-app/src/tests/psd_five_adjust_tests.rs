@@ -31,7 +31,7 @@ fn measure(relative: &str) -> Option<(usize, Errors, Errors, Vec<String>)> {
         .join("../../corpora/psd/reference/psd-tools-fixtures")
         .join(relative);
     let Ok(bytes) = std::fs::read(&path) else {
-        println!("SKIPPED: corpus file not present at {}", path.display());
+        crate::open_time_tests::corpus_file_absent(&path);
         return None;
     };
     let merged = match aurora_io::decode_psd_merged_image(&bytes) {
@@ -112,7 +112,9 @@ const FILES: [Row; 14] = [
         // mean 23.99 / 25.33 / 24.69 -> 22.34 / 23.51 / 18.57, but the worst
         // texel is 10 levels further off in red and green (max 86 -> 96;
         // blue 78 -> 64). Not investigated.
-        [96.0, 96.0, 78.0],
+        // Task 147 (smoothed gradients): max 96 -> 97 in red and green, mean
+        // 22.33 / 23.50 / 18.29.
+        [97.0, 97.0, 78.0],
         [22.4, 23.6, 18.6],
     ),
     // Exposure -3.53 in a Pass Through group whose Fill is 40 %. Before
@@ -399,7 +401,7 @@ fn corpus_files_with_the_five_kinds_survive_a_psd_save_and_reopen() {
             .join("../../corpora/psd/reference/psd-tools-fixtures")
             .join(relative);
         let Ok(bytes) = std::fs::read(&path) else {
-            println!("SKIPPED: corpus file not present at {}", path.display());
+            crate::open_time_tests::corpus_file_absent(&path);
             continue;
         };
         ran += 1;

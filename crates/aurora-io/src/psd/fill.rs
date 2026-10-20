@@ -232,6 +232,7 @@ const INK_SUBDIVISIONS: usize = 16;
 fn expand_ink_stops(
     coloured: &[InkStop],
     conv: &crate::colour_cmyk::CmykConverter,
+    smooth: bool,
 ) -> Vec<Stop<[f32; 3]>> {
     let plain = |s: &InkStop| Stop {
         pos: s.pos,
@@ -264,6 +265,8 @@ fn expand_ink_stops(
         for j in 1..per {
             let u = j as f32 / per as f32;
             let f = u.powf(curve);
+            // Photoshop's smoothing (see `GradientFill::smooth_ramp`).
+            let f = if smooth { f * f * (3.0 - 2.0 * f) } else { f };
             let ink = [0, 1, 2, 3].map(|k| {
                 let (x, y) = (
                     ia.get(k).copied().unwrap_or(0.0),
@@ -279,6 +282,24 @@ fn expand_ink_stops(
         }
     }
     out
+}
+
+/// Whether the gradient in `d` has a Smoothness that is neither 0 nor 100 %
+/// (`Intr`, 4096 = 100 %): Aurora draws any value above 0 as 100 %
+/// (task 147).
+pub(super) fn partial_smoothness(d: &Descriptor) -> bool {
+    d.get(b"Grad")
+        .and_then(Value::descriptor)
+        .and_then(|g| g.get(b"Intr"))
+        .and_then(Value::number)
+        .is_some_and(|v| v.is_finite() && v > 0.0 && (v - 4096.0).abs() > 0.5)
+}
+
+/// [`partial_smoothness`] for a `GdFl` block (a drawn fill layer).
+pub(super) fn block_has_partial_smoothness(data: &[u8]) -> bool {
+    data.len() <= MAX_FILL_BLOCK_BYTES
+        && descriptor::parse_adjustment_block(data, &mut ItemBudget::new())
+            .is_ok_and(|d| partial_smoothness(&d))
 }
 
 pub(super) fn gradient(d: &Descriptor) -> Result<Gradient, LeftOut> {
@@ -300,8 +321,11 @@ pub(super) fn gradient_in(d: &Descriptor, cmyk: CmykColours<'_>) -> Result<Gradi
             .ok_or(LeftOut::Unreadable)?;
         Ok((colour_in(c, cmyk)?, cmyk.and_then(|_| ink_of(c))))
     })?;
+    // Smoothness 0 % (`Intr` 0) is a straight ramp; anything else is
+    // drawn as 100 % (partial values have no model yet).
+    let smooth = num(grad, b"Intr", 4096.0)? > 0.0;
     let colours = match cmyk {
-        Some(conv) => expand_ink_stops(&coloured, conv),
+        Some(conv) => expand_ink_stops(&coloured, conv, smooth),
         None => coloured
             .iter()
             .map(|s| Stop {
@@ -345,6 +369,8 @@ pub(super) fn gradient_in(d: &Descriptor, cmyk: CmykColours<'_>) -> Result<Gradi
         reverse: flag(d, b"Rvrs", false)?,
         align: flag(d, b"Algn", true)?,
         offset,
+        // The CMYK sub-stops carry the smoothing themselves.
+        smooth_ramp: smooth && cmyk.is_none(),
     })
 }
 
@@ -429,7 +455,8 @@ pub(super) struct ArtboardBackground {
 /// Why an artboard's background is not drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum ArtboardLeft {
-    /// White or black (types `1` and `2`): no corpus picture shows them.
+    /// Black (type `2`): no corpus picture shows it (white, type `1`, is
+    /// drawn since task 147: `advanced-blending.psd`).
     Unchecked,
     Unreadable,
     /// The rectangle is empty or lies entirely off the canvas.
@@ -462,18 +489,24 @@ pub(super) fn parse_artboard_in(
         .get(b"artboardBackgroundType")
         .and_then(Value::number)
         .ok_or(ArtboardLeft::Unreadable)?;
-    // A small stored integer: 3 is transparent, 4 a custom colour.
+    // A small stored integer: 1 is white (task 147), 3 transparent, 4 a
+    // custom colour; 2 (black) is not drawn.
     if (kind - 3.0).abs() < 0.5 {
         return Ok(None);
     }
-    if (kind - 4.0).abs() >= 0.5 {
+    let white = (kind - 1.0).abs() < 0.5;
+    if !white && (kind - 4.0).abs() >= 0.5 {
         return Err(ArtboardLeft::Unchecked);
     }
-    let c = d
-        .get(b"Clr ")
-        .and_then(Value::descriptor)
-        .ok_or(ArtboardLeft::Unreadable)?;
-    let colour = colour_in(c, cmyk).map_err(|_| ArtboardLeft::Unreadable)?;
+    let colour = if white {
+        [1.0; 3]
+    } else {
+        let c = d
+            .get(b"Clr ")
+            .and_then(Value::descriptor)
+            .ok_or(ArtboardLeft::Unreadable)?;
+        colour_in(c, cmyk).map_err(|_| ArtboardLeft::Unreadable)?
+    };
     let r = d
         .get(b"artboardRect")
         .and_then(Value::descriptor)

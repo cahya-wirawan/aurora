@@ -28,6 +28,9 @@ fn ramp_fill(angle: f64, from: [f32; 3], to: [f32; 3]) -> GradientFill {
         reverse: false,
         align: true,
         offset: (0.0, 0.0),
+        // These tests pin the geometry with straight ramps; the smoothed
+        // default is covered in `aurora-io`.
+        smooth_ramp: false,
     }
 }
 

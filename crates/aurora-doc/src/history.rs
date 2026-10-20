@@ -221,6 +221,76 @@ enum LayerOp {
         id: LayerId,
         value: Vec<Option<aurora_core::effects::StrokePaint>>,
     },
+    /// Sets which gradient ramps of a layer's effects are smoothed (task
+    /// 147, [`aurora_core::GradientFill::smooth_ramp`]): one flag per
+    /// gradient overlay and/or one per stroke (`None` leaves that list
+    /// alone). `smooth_ramp` is `#[serde(skip)]` like the rest of the
+    /// gradient data, so [`History::save_journal`] follows every op that
+    /// carries a smoothed gradient with one of these, and **only then**:
+    /// a journal without a smoothed gradient is byte-identical to the
+    /// ones older builds wrote, and a journal that lacks the op replays
+    /// straight ramps, exactly what those files always meant. Appended
+    /// after [`Self::SetStrokePaints`], so an Aurora older than this build
+    /// refuses a journal holding it (ADR 0009).
+    SetGradientRamps {
+        id: LayerId,
+        overlays: Option<Vec<bool>>,
+        strokes: Option<Vec<bool>>,
+    },
+}
+
+/// One layer's smoothed-ramp flags a journaled op carries (see
+/// [`LayerOp::SetGradientRamps`]): `(layer, overlays, strokes)`, only where
+/// some flag is set.
+type RampFlags = (LayerId, Option<Vec<bool>>, Option<Vec<bool>>);
+
+/// Every [`RampFlags`] a journaled op carries in gradients whose flags
+/// would be lost on the wire.
+fn carried_ramps(op: &LayerOp) -> Vec<RampFlags> {
+    fn of(id: LayerId, fx: &aurora_core::LayerEffects) -> Option<RampFlags> {
+        let (o, s) = (fx.gradient_overlay_ramps(), fx.stroke_gradient_ramps());
+        (o.iter().any(|f| *f) || s.iter().any(|f| *f)).then(|| {
+            (
+                id,
+                (!o.is_empty()).then_some(o),
+                s.iter().any(|f| *f).then_some(s),
+            )
+        })
+    }
+    match op {
+        LayerOp::Restore(subtree) => subtree
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| of(*id, entry.effects.as_ref()?))
+            .collect(),
+        LayerOp::SetEffects {
+            id,
+            value: Some(fx),
+        } => of(*id, fx).into_iter().collect(),
+        LayerOp::SetGradientOverlays { id, value } => {
+            let flags: Vec<bool> = value.iter().map(|o| o.gradient.smooth_ramp).collect();
+            if flags.iter().any(|f| *f) {
+                vec![(*id, Some(flags), None)]
+            } else {
+                Vec::new()
+            }
+        }
+        LayerOp::SetStrokePaints { id, value } => {
+            let flags: Vec<bool> = value
+                .iter()
+                .map(|p| {
+                    matches!(p, Some(aurora_core::effects::StrokePaint::Gradient { gradient, .. })
+                        if gradient.smooth_ramp)
+                })
+                .collect();
+            if flags.iter().any(|f| *f) {
+                vec![(*id, None, Some(flags))]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Every `(layer, gradient overlays)` pair a journaled op carries in an
@@ -573,6 +643,39 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
             tree.set_effects(id, Some(fx))?;
             Ok((LayerOp::SetStrokePaints { id, value: old }, None))
         }
+        LayerOp::SetGradientRamps {
+            id,
+            overlays,
+            strokes,
+        } => {
+            let invalid = || {
+                DocError::InvalidEffects(aurora_core::effects::EffectsError::OutOfRange {
+                    field: "gradient ramps do not match the effects",
+                })
+            };
+            let mut fx = tree.effects(id).cloned().ok_or_else(invalid)?;
+            let old_overlays = overlays.as_ref().map(|_| fx.gradient_overlay_ramps());
+            let old_strokes = strokes.as_ref().map(|_| fx.stroke_gradient_ramps());
+            if let Some(flags) = &overlays
+                && !fx.set_gradient_overlay_ramps(flags)
+            {
+                return Err(invalid());
+            }
+            if let Some(flags) = &strokes
+                && !fx.set_stroke_gradient_ramps(flags)
+            {
+                return Err(invalid());
+            }
+            tree.set_effects(id, Some(fx))?;
+            Ok((
+                LayerOp::SetGradientRamps {
+                    id,
+                    overlays: old_overlays,
+                    strokes: old_strokes,
+                },
+                None,
+            ))
+        }
         LayerOp::SetClipped { id, value } => {
             let old = tree.clipped(id);
             tree.set_clipped_flag(id, value)?;
@@ -765,6 +868,9 @@ fn describe(op: &LayerOp) -> String {
             },
             id.to_raw()
         ),
+        LayerOp::SetGradientRamps { id, .. } => {
+            format!("Changed gradient smoothing on layer #{}", id.to_raw())
+        }
         LayerOp::SetClipped { id, value } => {
             let verb = if *value {
                 "Clipped"
@@ -1086,6 +1192,15 @@ impl History {
                 wire.push(std::borrow::Cow::Owned(LayerOp::SetStrokePaints {
                     id,
                     value,
+                }));
+            }
+            // Smoothed gradient ramps (task 147) the same way, after the
+            // gradients they belong to.
+            for (id, overlays, strokes) in carried_ramps(op) {
+                wire.push(std::borrow::Cow::Owned(LayerOp::SetGradientRamps {
+                    id,
+                    overlays,
+                    strokes,
                 }));
             }
             // The clipping flag (0.201.0) the same way.
@@ -6074,6 +6189,7 @@ mod adjustment_tests {
                 reverse: false,
                 align: true,
                 offset: (0.0, 0.0),
+                smooth_ramp: true,
             },
             dither: false,
             reference: None,
@@ -6310,5 +6426,128 @@ mod adjustment_tests {
         assert!(
             matches!(inverse.0, LayerOp::SetStrokePaints { ref value, .. } if value == &vec![None, Some(paint.clone())])
         );
+    }
+    /// Task 147: `SetGradientRamps` is appended after `SetStrokePaints`, the
+    /// journal carries the smoothed-ramp flags the wire skips, and a journal
+    /// with only straight ramps is the one older builds wrote (no such op).
+    #[test]
+    #[allow(clippy::too_many_lines)] // one fixture, three checks
+    fn set_gradient_ramps_is_appended_and_the_journal_carries_the_flags() {
+        let id = crate::LayerId::from_raw(3);
+        let ordinal = |op: &LayerOp| {
+            postcard::to_allocvec(op)
+                .ok()
+                .and_then(|b| b.first().copied())
+        };
+        let paints = ordinal(&LayerOp::SetStrokePaints {
+            id,
+            value: Vec::new(),
+        });
+        let ramps = ordinal(&LayerOp::SetGradientRamps {
+            id,
+            overlays: None,
+            strokes: None,
+        });
+        assert!(
+            paints.is_some() && ramps == paints.map(|p| p + 1),
+            "{paints:?} {ramps:?}"
+        );
+
+        let gradient = |smooth: bool| aurora_core::GradientFill {
+            colours: vec![aurora_core::FillStop {
+                pos: 0.0,
+                mid: 0.5,
+                value: [0.0, 0.0, 0.0],
+            }],
+            alphas: Vec::new(),
+            style: aurora_core::GradientStyle::Linear,
+            angle: 0.0,
+            scale: 1.0,
+            reverse: false,
+            align: true,
+            offset: (0.0, 0.0),
+            smooth_ramp: smooth,
+        };
+        let effects = |smooth: bool| aurora_core::LayerEffects {
+            gradient_overlays: vec![aurora_core::effects::GradientOverlay {
+                gate: aurora_core::effects::EffectGate::default(),
+                blend_mode: aurora_core::effects::EffectBlendMode::Normal,
+                opacity: 1.0,
+                gradient: gradient(smooth),
+                dither: false,
+                reference: None,
+            }],
+            strokes: vec![aurora_core::effects::Stroke {
+                fill: aurora_core::effects::StrokeFill::Gradient,
+                paint: Some(aurora_core::effects::StrokePaint::Gradient {
+                    gradient: gradient(smooth),
+                    reference: None,
+                }),
+                ..aurora_core::effects::Stroke::default()
+            }],
+            ..aurora_core::LayerEffects::default()
+        };
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+        for smooth in [true, false] {
+            let mut tree = LayerTree::new();
+            let mut history = History::new();
+            let layer = history
+                .add_pixel_layer(&mut tree, "p", bounds, None)
+                .unwrap_or_else(|e| unreachable!("{e:?}"));
+            history
+                .set_effects(&mut tree, layer, Some(effects(smooth)))
+                .unwrap_or_else(|e| unreachable!("{e:?}"));
+            // Delete and undo: the layer comes back through a `Restore`.
+            history
+                .remove(&mut tree, layer)
+                .unwrap_or_else(|e| unreachable!("{e:?}"));
+            assert!(history.undo(&mut tree).is_ok());
+            let journal = history.save_journal().unwrap_or_default();
+            let wire: Vec<LayerOp> =
+                postcard::from_bytes(&journal).unwrap_or_else(|e| unreachable!("{e:?}"));
+            let carriers = wire
+                .iter()
+                .filter(|op| matches!(op, LayerOp::SetGradientRamps { .. }))
+                .count();
+            // Smooth: one after the `SetEffects` and one after the `Restore`
+            // entries' effects (a `Restore` of the layer). Straight: none.
+            assert_eq!(carriers > 0, smooth, "smooth {smooth}: {carriers}");
+            let loaded = History::load_journal(&journal).unwrap_or_else(|e| unreachable!("{e:?}"));
+            let replayed = loaded.replay().unwrap_or_else(|e| unreachable!("{e:?}"));
+            let got = replayed
+                .effects(layer)
+                .map(|f| (f.gradient_overlay_ramps(), f.stroke_gradient_ramps()));
+            assert_eq!(got, Some((vec![smooth], vec![smooth])), "smooth {smooth}");
+        }
+        // The op refuses flags that do not match the effects.
+        let mut direct = LayerTree::new();
+        let id2 = direct
+            .add_pixel_layer("d", bounds, None)
+            .unwrap_or_else(|e| unreachable!("{e:?}"));
+        direct
+            .set_effects(id2, Some(effects(false)))
+            .unwrap_or_else(|e| unreachable!("{e:?}"));
+        let op = |overlays, strokes| LayerOp::SetGradientRamps {
+            id: id2,
+            overlays,
+            strokes,
+        };
+        assert!(crate::history::apply(&mut direct, op(Some(vec![true, true]), None)).is_err());
+        assert!(crate::history::apply(&mut direct, op(None, Some(Vec::new()))).is_err());
+        let Ok((inverse, _)) =
+            crate::history::apply(&mut direct, op(Some(vec![true]), Some(vec![true])))
+        else {
+            unreachable!("matching flags apply")
+        };
+        assert!(matches!(
+            inverse,
+            LayerOp::SetGradientRamps { overlays: Some(ref o), strokes: Some(ref s), .. }
+                if o == &vec![false] && s == &vec![false]
+        ));
     }
 }
