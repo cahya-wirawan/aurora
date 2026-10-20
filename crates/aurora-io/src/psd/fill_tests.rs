@@ -713,3 +713,90 @@ fn drawn_gradients_follow_photoshops_pixels() {
 // task 147). They are kept as fixtures and score 17-28 levels; moving the
 // smoothing or the Radial/Diamond constants shifted them by 1-1.3 levels
 // either way, which is noise on an unexplained picture, not a signal.
+
+/// A two-stop black-to-white `GdFl` block with an explicit `Intr`
+/// (smoothness, 4096 = 100 %).
+fn gradient_block_with_smoothness(smoothness: Option<f64>) -> Vec<u8> {
+    let mut grad = vec![
+        (&b"GrdF"[..], V::Enum(b"GrdF", b"CstS")),
+        (
+            b"Clrs",
+            V::List(vec![
+                colour_stop(0.0, 0.0, 0.0, 0, 50),
+                colour_stop(255.0, 255.0, 255.0, 4096, 50),
+            ]),
+        ),
+        (b"Trns", V::List(vec![alpha_stop(100.0, 0), alpha_stop(100.0, 4096)])),
+    ];
+    if let Some(s) = smoothness {
+        grad.push((b"Intr", V::Doub(s)));
+    }
+    fill_block(&[
+        (b"Angl", V::Unit(b"#Ang", 0.0)),
+        (b"Type", V::Enum(b"GrdT", b"Lnr ")),
+        (b"Grad", V::Obj(grad)),
+    ])
+}
+
+#[test]
+fn smoothness_zero_is_a_straight_ramp_and_anything_else_is_smoothed() {
+    // Photoshop's default (Smoothness 100 %, also when `Intr` is absent): a
+    // smoothstep per segment, 3 * 0.25^2 - 2 * 0.25^3 = 0.15625 at a quarter.
+    for smoothness in [None, Some(4096.0)] {
+        let g = parsed_gradient(&gradient_block_with_smoothness(smoothness));
+        assert!(!g.linear_ramp, "{smoothness:?}");
+        near_f32(g.at(0.25).0[0], 0.156_25);
+        near_f32(g.at(0.5).0[0], 0.5);
+    }
+    // Smoothness 0 %: straight.
+    let g = parsed_gradient(&gradient_block_with_smoothness(Some(0.0)));
+    assert!(g.linear_ramp);
+    near_f32(g.at(0.25).0[0], 0.25);
+    // Opacity ramps follow the same rule.
+    let smooth = parsed_gradient(&gradient_block_with_smoothness(None));
+    near_f32(smooth.at(0.25).1, 1.0);
+}
+
+fn near_f32(a: f32, want: f32) {
+    assert!((a - want).abs() < 1e-5, "{a} != {want}");
+}
+
+/// A CMYK file's gradient is blended in ink space through sub-stops that
+/// carry the smoothing themselves, and the ramp between them must stay
+/// straight (a second smoothing would flatten each tiny segment).
+#[test]
+fn a_cmyk_gradient_is_smoothed_once_through_its_ink_space_sub_stops() {
+    let ink = |c: f64| {
+        V::Obj(vec![
+            (b"Cyn ", V::Doub(c)),
+            (b"Mgnt", V::Doub(0.0)),
+            (b"Ylw ", V::Doub(0.0)),
+            (b"Blck", V::Doub(0.0)),
+        ])
+    };
+    let stop = |c: f64, at: i32| {
+        V::Obj(vec![(b"Clr ", ink(c)), (b"Lctn", V::Long(at)), (b"Mdpn", V::Long(50))])
+    };
+    let block = fill_block(&[
+        (b"Angl", V::Unit(b"#Ang", 0.0)),
+        (b"Type", V::Enum(b"GrdT", b"Lnr ")),
+        (
+            b"Grad",
+            V::Obj(vec![
+                (b"GrdF", V::Enum(b"GrdF", b"CstS")),
+                (b"Clrs", V::List(vec![stop(0.0, 0), stop(100.0, 4096)])),
+                (b"Trns", V::List(vec![alpha_stop(100.0, 0), alpha_stop(100.0, 4096)])),
+            ]),
+        ),
+    ]);
+    // No profile: the naive formula, red = 1 - cyan, so red = 1 - smoothstep(t).
+    let converter = crate::colour_cmyk::CmykConverter::new(None);
+    let Ok(Fill::Gradient(g)) = fill::parse_in(*b"GdFl", &block, Some(&converter)) else {
+        unreachable!("a CMYK gradient")
+    };
+    for t in [0.1_f32, 0.27, 0.5, 0.8] {
+        let want = 1.0 - f64::from(t) * f64::from(t) * (3.0 - 2.0 * f64::from(t));
+        let got = f64::from(g.at(t).0[0]);
+        assert!((got - want).abs() < 0.005, "t {t}: {got} vs {want}");
+    }
+}
