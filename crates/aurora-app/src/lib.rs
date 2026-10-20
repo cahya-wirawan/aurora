@@ -45041,13 +45041,9 @@ mod tests {
                 aurora_io::IoError::UnsupportedPsdColorMode(9)
             ))
         ));
+        // 32-bit float opens since task 146 (and says it converted).
         let deep = include_bytes!("../../aurora-io/tests/fixtures/psd/32bit5x5.psd");
-        assert!(matches!(
-            open_psd_document(deep),
-            Err(OpenFailure::Decode(
-                aurora_io::IoError::UnsupportedPsdDepth(32)
-            ))
-        ));
+        assert!(open_psd_document(deep).is_ok());
         assert!(matches!(
             open_psd_document(b"PNG not really"),
             Err(OpenFailure::Decode(aurora_io::IoError::NotPsd))
