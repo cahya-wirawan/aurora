@@ -1086,17 +1086,15 @@ fn colormodes_file(name: &str) -> Option<Vec<u8>> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../corpora/psd/reference/psd-tools-fixtures/colormodes")
         .join(name);
-    match std::fs::read(path) {
-        Ok(bytes) => Some(bytes),
-        Err(_) => {
-            println!("SKIPPED: corpus file {name} not present");
-            assert!(
-                std::env::var_os("AURORA_REQUIRE_CORPUS").is_none(),
-                "AURORA_REQUIRE_CORPUS is set and {name} is missing"
-            );
-            None
-        }
+    if let Ok(bytes) = std::fs::read(path) {
+        return Some(bytes);
     }
+    println!("SKIPPED: corpus file {name} not present");
+    assert!(
+        std::env::var_os("AURORA_REQUIRE_CORPUS").is_none(),
+        "AURORA_REQUIRE_CORPUS is set and {name} is missing"
+    );
+    None
 }
 
 fn gradient_of(
@@ -1357,6 +1355,7 @@ fn a_cmyk_merged_image_with_alpha_is_unmatted_in_ink_space() {
     // Photoshop mattes against paper: stored v' = v*a + 255*(1-a), a = 128/255.
     // Ink C = 1 (v 0), M = 0 (v 255), Y = 0.5 (v 127), K = 0 (v 255).
     let a = 128.0_f32 / 255.0;
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let matte = |v: f32| (v * a + 255.0 * (1.0 - a)).round() as u8;
     let profile = synthetic_cmyk_bytes();
     let bytes = TestPsd::new(1, 1, 1, 8)

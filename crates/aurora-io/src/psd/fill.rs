@@ -214,6 +214,9 @@ fn ink_of(c: &Descriptor) -> Option<[f32; 4]> {
     Some([ink(b"Cyn ")?, ink(b"Mgnt")?, ink(b"Ylw ")?, ink(b"Blck")?])
 }
 
+/// A gradient stop's sRGB colour with, in a CMYK file, its ink coverages.
+type InkStop = Stop<([f32; 3], Option<[f32; 4]>)>;
+
 /// Sub-stops per segment of a CMYK gradient.
 const INK_SUBDIVISIONS: usize = 16;
 
@@ -227,20 +230,18 @@ const INK_SUBDIVISIONS: usize = 16;
 /// and the ramp blends only between those close stops. Fewer pieces when
 /// the stop budget is short; none when a stop is not a `CMYC` colour.
 fn expand_ink_stops(
-    coloured: &[Stop<([f32; 3], Option<[f32; 4]>)>],
+    coloured: &[InkStop],
     conv: &crate::colour_cmyk::CmykConverter,
 ) -> Vec<Stop<[f32; 3]>> {
-    let plain = |s: &Stop<([f32; 3], Option<[f32; 4]>)>| Stop {
+    let plain = |s: &InkStop| Stop {
         pos: s.pos,
         mid: s.mid,
         value: s.value.0,
     };
     let segments = coloured.len().saturating_sub(1);
-    let per = if segments == 0 {
-        1
-    } else {
-        INK_SUBDIVISIONS.min((MAX_STOPS - coloured.len()) / segments + 1)
-    };
+    let per = (MAX_STOPS.saturating_sub(coloured.len()))
+        .checked_div(segments)
+        .map_or(1, |spare| INK_SUBDIVISIONS.min(spare + 1));
     if per < 2 || coloured.iter().any(|s| s.value.1.is_none()) {
         return coloured.iter().map(plain).collect();
     }
