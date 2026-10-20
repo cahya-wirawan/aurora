@@ -265,7 +265,7 @@ fn expand_ink_stops(
         for j in 1..per {
             let u = j as f32 / per as f32;
             let f = u.powf(curve);
-            // Photoshop's smoothing (see `GradientFill::linear_ramp`).
+            // Photoshop's smoothing (see `GradientFill::smooth_ramp`).
             let f = if smooth { f * f * (3.0 - 2.0 * f) } else { f };
             let ink = [0, 1, 2, 3].map(|k| {
                 let (x, y) = (
@@ -282,6 +282,24 @@ fn expand_ink_stops(
         }
     }
     out
+}
+
+/// Whether the gradient in `d` has a Smoothness that is neither 0 nor 100 %
+/// (`Intr`, 4096 = 100 %): Aurora draws any value above 0 as 100 %
+/// (task 147).
+pub(super) fn partial_smoothness(d: &Descriptor) -> bool {
+    d.get(b"Grad")
+        .and_then(Value::descriptor)
+        .and_then(|g| g.get(b"Intr"))
+        .and_then(Value::number)
+        .is_some_and(|v| v.is_finite() && v > 0.0 && (v - 4096.0).abs() > 0.5)
+}
+
+/// [`partial_smoothness`] for a `GdFl` block (a drawn fill layer).
+pub(super) fn block_has_partial_smoothness(data: &[u8]) -> bool {
+    data.len() <= MAX_FILL_BLOCK_BYTES
+        && descriptor::parse_adjustment_block(data, &mut ItemBudget::new())
+            .is_ok_and(|d| partial_smoothness(&d))
 }
 
 pub(super) fn gradient(d: &Descriptor) -> Result<Gradient, LeftOut> {

@@ -560,6 +560,9 @@ enum Note {
     StrokeSizeCapped,
     GlowNoiseNotApplied,
     GlowContourNotApplied,
+    /// Gradients whose Smoothness is neither 0 nor 100 %, drawn at 100 %
+    /// (task 147).
+    GradientSmoothnessPartial,
     GlowSizeCapped,
     DropShadowsNotShown,
     ColorOverlaysNotShown,
@@ -985,6 +988,10 @@ fn note_text(note: Note, n: u64) -> String {
         }
         Note::GlowContourNotApplied => format!(
             "{n} outer glow{s} with a contour other than Linear {is} drawn with a Linear one."
+        ),
+        Note::GradientSmoothnessPartial => format!(
+            "{n} gradient{s} with a Smoothness between 0 and 100 % {is} drawn at 100 % \
+             (Aurora has no partial smoothness)."
         ),
         Note::GlowSizeCapped => format!(
             "{n} outer glow{s} {is} too large to draw at full size and {is} shown smaller \
@@ -3881,6 +3888,10 @@ fn note_unsupported_kept(
                     }
                 }
                 notes.add_n(Note::GlowContourNotApplied, u64::from(read.glow_contours));
+                notes.add_n(
+                    Note::GradientSmoothnessPartial,
+                    u64::from(read.partial_smoothness),
+                );
                 // 0.190.0: solid-colour strokes are drawn too.
                 for stroke in fx.strokes.iter().filter(|e| fx.shows(e.gate) && e.drawn()) {
                     if stroke.geometry().capped {
@@ -4479,6 +4490,13 @@ fn drawn_fill_node(
     notes.add(Note::FillDrawn);
     if matches!(fill, fill::Fill::Gradient(_)) {
         notes.add(Note::FillGradientApproximate);
+        if record
+            .fill
+            .as_ref()
+            .is_some_and(|(_, data)| fill::block_has_partial_smoothness(data))
+        {
+            notes.add(Note::GradientSmoothnessPartial);
+        }
     }
     let props = props_for(record, notes);
     let outcome = if raster.is_some() {

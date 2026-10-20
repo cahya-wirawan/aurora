@@ -447,6 +447,53 @@ struct LayerGradientOverlaysWireV2 {
 
 /// The entry's bytes for `layers`, or `None` when no layer has gradient
 /// overlays: version 1 unless some overlay has a smoothed ramp.
+/// Decodes a version-2 ramp-flag list (`Vec<(u64, Vec<bool>)>` in
+/// `postcard`) **bounded by what it must match**: `expected` is each pair's
+/// layer id and flag count, taken from the already decoded data. Every
+/// count is compared with it before a flag is read and nothing is allocated
+/// from a claimed length, so a hostile entry of empty pairs is refused
+/// without an allocation. The list must end the payload.
+fn read_ramp_flags(rest: &[u8], expected: &[(u64, usize)]) -> Result<Vec<Vec<bool>>, IoError> {
+    let bad = |what: &str| IoError::ManifestDeserialization(format!("ramp flags: {what}"));
+    let take = |bytes: &[u8]| -> Result<(u64, usize), IoError> {
+        let (value, rest) = postcard::take_from_bytes::<u64>(bytes)
+            .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+        Ok((value, bytes.len() - rest.len()))
+    };
+    let (count, used) = take(rest)?;
+    let mut rest = rest.get(used..).ok_or_else(|| bad("truncated"))?;
+    if usize::try_from(count).ok() != Some(expected.len()) {
+        return Err(bad("the pairs do not match the layers"));
+    }
+    let mut out = Vec::with_capacity(expected.len());
+    for (want_raw, want_len) in expected {
+        let (raw, used) = take(rest)?;
+        rest = rest.get(used..).ok_or_else(|| bad("truncated"))?;
+        let (len, used) = take(rest)?;
+        rest = rest.get(used..).ok_or_else(|| bad("truncated"))?;
+        if raw != *want_raw || usize::try_from(len).ok() != Some(*want_len) {
+            return Err(bad("the flags do not match the layer's gradients"));
+        }
+        let flags = rest.get(..*want_len).ok_or_else(|| bad("truncated"))?;
+        out.push(
+            flags
+                .iter()
+                .map(|b| match b {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    _ => Err(bad("a flag is not a boolean")),
+                })
+                .collect::<Result<Vec<bool>, IoError>>()?,
+        );
+        rest = rest.get(*want_len..).ok_or_else(|| bad("truncated"))?;
+    }
+    if rest.is_empty() {
+        Ok(out)
+    } else {
+        Err(bad("trailing bytes"))
+    }
+}
+
 fn layer_gradient_overlays_bytes(layers: &LayerTree) -> Result<Option<Vec<u8>>, IoError> {
     let overlays = layer_gradient_overlay_pairs(layers);
     if overlays.is_empty() {
@@ -525,19 +572,22 @@ fn read_layer_gradient_overlays<R: Read + Seek>(
             .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
         (wire.overlays, None)
     } else {
-        let wire: LayerGradientOverlaysWireV2 = postcard::from_bytes(&bytes)
+        // Version 2 is the version-1 fields (version 2) followed by the
+        // flag lists, decoded bounded by the overlays just read.
+        let (wire, rest) = postcard::take_from_bytes::<LayerGradientOverlaysWire>(&bytes)
             .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
-        if wire.ramps.len() != wire.overlays.len() {
-            return Err(bad("the ramp flags do not match the layers"));
-        }
-        (wire.overlays, Some(wire.ramps))
+        let expected: Vec<(u64, usize)> = wire
+            .overlays
+            .iter()
+            .map(|(raw, list)| (*raw, list.len()))
+            .collect();
+        let ramps = read_ramp_flags(rest, &expected)?;
+        (wire.overlays, Some(ramps))
     };
     for (index, (raw, mut overlays)) in overlays_by_layer.into_iter().enumerate() {
         if let Some(ramps) = &ramps {
             let flags = ramps
                 .get(index)
-                .filter(|(r, f)| *r == raw && f.len() == overlays.len())
-                .map(|(_, f)| f)
                 .ok_or_else(|| bad("the ramp flags do not match the overlays"))?;
             for (overlay, flag) in overlays.iter_mut().zip(flags) {
                 overlay.gradient.smooth_ramp = *flag;
@@ -1013,11 +1063,12 @@ fn read_layer_stroke_paints<R: Read + Seek>(
             let rest = de
                 .finalize()
                 .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
-            let ramps: Vec<(u64, Vec<bool>)> = postcard::from_bytes(rest)
-                .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
-            if ramps.len() != wire.paints.len() {
-                return Err(bad("the ramp flags do not match the layers"));
-            }
+            let expected: Vec<(u64, usize)> = wire
+                .paints
+                .iter()
+                .map(|(raw, list)| (*raw, list.len()))
+                .collect();
+            let ramps = read_ramp_flags(rest, &expected)?;
             Some(ramps)
         } else {
             None
@@ -1029,8 +1080,8 @@ fn read_layer_stroke_paints<R: Read + Seek>(
             Some(ramps) => Some(
                 ramps
                     .get(index)
-                    .filter(|(r, f)| *r == raw && f.len() == paints.len())
-                    .map(|(_, f)| f.clone())
+                    .filter(|f| f.len() == paints.len())
+                    .cloned()
                     .ok_or_else(|| bad("the ramp flags do not match the strokes"))?,
             ),
             None => None,
@@ -8685,6 +8736,44 @@ mod tests {
             let (_dir2, mut fresh) = real_tile_store();
             match read(Cursor::new(tampered), &mut fresh) {
                 Err(crate::error::IoError::ManifestDeserialization(_)) => {}
+                other => unreachable!("{entry}: expected a refusal, got {:?}", other.map(|_| ())),
+            }
+        }
+    }
+
+    /// A version-2 entry whose flag list claims millions of empty pairs
+    /// (two bytes each) is refused by its count before anything is built
+    /// from it: the list is checked against the layers' own gradients.
+    #[test]
+    fn a_hostile_ramp_flag_list_is_refused_without_a_huge_allocation() {
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, p, _) = ramp_document(&mut store, true);
+        let mut hostile_list = postcard::to_allocvec(&3_000_000_u64).unwrap_or_default();
+        hostile_list.extend(std::iter::repeat_n(0_u8, 6_000_000));
+        let mut overlay = gradient_overlay_fixture(33.0);
+        overlay.gradient.smooth_ramp = true;
+        let mut overlays = postcard::to_allocvec(&super::LayerGradientOverlaysWire {
+            version: super::LAYER_GRADIENT_OVERLAYS_VERSION_RAMPS,
+            overlays: vec![(p.to_raw(), vec![overlay])],
+        })
+        .unwrap_or_default();
+        overlays.extend_from_slice(&hostile_list);
+        let mut paints = postcard::to_allocvec(&super::LayerStrokePaintsWire {
+            version: super::LAYER_STROKE_PAINTS_VERSION_RAMPS,
+            paints: vec![(p.to_raw(), vec![None, Some(stroke_paint_gradient(71.0))])],
+        })
+        .unwrap_or_default();
+        paints.extend_from_slice(&hostile_list);
+        for (entry, payload) in [
+            (super::LAYER_GRADIENT_OVERLAYS_ENTRY, overlays),
+            (super::LAYER_STROKE_PAINTS_ENTRY, paints),
+        ] {
+            let tampered = with_named_entry(&bytes, entry, Some(&payload));
+            let (_dir2, mut fresh) = real_tile_store();
+            match read(Cursor::new(tampered), &mut fresh) {
+                Err(crate::error::IoError::ManifestDeserialization(message)) => {
+                    assert!(message.contains("ramp flags"), "{entry}: {message}");
+                }
                 other => unreachable!("{entry}: expected a refusal, got {:?}", other.map(|_| ())),
             }
         }

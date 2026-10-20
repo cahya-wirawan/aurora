@@ -856,3 +856,24 @@ fn a_drawn_gradient_spans_a_raster_masks_rectangle_but_not_a_disabled_vector_mas
     ));
     assert!((disabled - 0.216).abs() < 0.01, "disabled vector mask: {disabled}");
 }
+
+/// Task 147: a drawn gradient fill whose Smoothness is neither 0 nor 100 %
+/// says so in the open report; 0, 100 % and an absent `Intr` do not.
+#[test]
+fn a_drawn_fill_with_partial_smoothness_reports_it() {
+    for (intr, says) in [
+        (Some(2048.0), true),
+        (Some(4096.0), false),
+        (Some(0.0), false),
+        (None, false),
+    ] {
+        let file = empty_fill_file(10, 2, *b"GdFl", gradient_block_with_smoothness(intr), None);
+        let text = report_text(&doc(&file.write()));
+        assert_eq!(
+            text.contains("Smoothness between 0 and 100 % is drawn at 100 %")
+                || text.contains("Smoothness between 0 and 100 % are drawn at 100 %"),
+            says,
+            "{intr:?}: {text}"
+        );
+    }
+}

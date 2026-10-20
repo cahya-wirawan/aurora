@@ -1402,6 +1402,61 @@ fn gradient_fill<'a>(enab: bool, extra: Vec<(&'a [u8], V<'a>)>) -> V<'a> {
     V::Obj(items)
 }
 
+/// A two-stop `Grad` descriptor with an optional `Intr` (smoothness).
+fn grad_with_intr(intr: Option<f64>) -> V<'static> {
+    let stop = |r: f64, at: i32| {
+        V::Obj(vec![
+            (b"Clr ", rgb(r, 0.0, 0.0)),
+            (b"Type", V::Enum(b"Clry", b"UsrS")),
+            (b"Lctn", V::Long(at)),
+            (b"Mdpn", V::Long(50)),
+        ])
+    };
+    let mut items = vec![
+        (b"GrdF" as &[u8], V::Enum(b"GrdF", b"CstS")),
+        (b"Clrs", V::List(vec![stop(255.0, 0), stop(0.0, 4096)])),
+    ];
+    if let Some(v) = intr {
+        items.push((b"Intr", V::Doub(v)));
+    }
+    V::Obj(items)
+}
+
+/// Task 147: a shown gradient overlay or gradient stroke whose Smoothness is
+/// neither 0 nor 100 % is counted (drawn at 100 %); 0, 100 %, absent and a
+/// hidden one are not.
+#[test]
+fn partial_gradient_smoothness_is_counted_for_overlays_and_strokes() {
+    let count = |intr: Option<f64>, enab: bool| {
+        let overlay = gradient_fill(enab, vec![(b"Grad", grad_with_intr(intr))]);
+        mapped(&effects_block(&[(b"GrFl", overlay)])).partial_smoothness
+    };
+    assert_eq!(count(Some(2048.0), true), 1);
+    assert_eq!(count(Some(1.0), true), 1);
+    assert_eq!(count(Some(4096.0), true), 0);
+    assert_eq!(count(Some(0.0), true), 0);
+    assert_eq!(count(None, true), 0);
+    assert_eq!(
+        count(Some(2048.0), false),
+        0,
+        "a hidden overlay says nothing"
+    );
+    let stroke = |intr: Option<f64>| {
+        let frame = V::Obj(vec![
+            (b"enab", V::Bool(true)),
+            (b"present", V::Bool(true)),
+            (b"PntT", V::Enum(b"FrFl", b"GrFl")),
+            (b"Grad", grad_with_intr(intr)),
+            (b"Angl", V::Unit(b"#Ang", 0.0)),
+            (b"Type", V::Enum(b"GrdT", b"Lnr ")),
+            (b"Algn", V::Bool(true)),
+        ]);
+        mapped(&effects_block(&[(b"FrFX", frame)])).partial_smoothness
+    };
+    assert_eq!(stroke(Some(3000.0)), 1);
+    assert_eq!(stroke(Some(4096.0)), 0);
+}
+
 #[test]
 fn a_gradient_overlay_is_modelled_with_every_field() {
     let read = mapped(&effects_block(&[(b"GrFl", gradient_fill(true, vec![]))]));
