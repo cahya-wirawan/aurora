@@ -538,16 +538,21 @@ fn an_artboard_rectangle_past_the_canvas_is_clipped_to_it() {
 }
 
 #[test]
-fn transparent_white_and_black_artboard_backgrounds_draw_nothing() {
+fn transparent_and_black_artboard_backgrounds_draw_nothing_and_white_is_drawn() {
     let transparent = doc(&artboard_file(3, (0.0, 0.0, 6.0, 8.0)).write());
     assert_eq!(transparent.layers.len(), 1);
     assert!(!report_text(&transparent).contains("background"));
-    for kind in [1, 2] {
-        let document = doc(&artboard_file(kind, (0.0, 0.0, 6.0, 8.0)).write());
-        assert_eq!(document.layers.len(), 1, "type {kind}");
-        let text = report_text(&document);
-        assert!(text.contains("background") && text.contains("not drawn"), "{text}");
-    }
+    let black = doc(&artboard_file(2, (0.0, 0.0, 6.0, 8.0)).write());
+    assert_eq!(black.layers.len(), 1);
+    let text = report_text(&black);
+    assert!(text.contains("black background") && text.contains("not drawn"), "{text}");
+    // White (type 1) is drawn as white inside the rectangle: Photoshop's
+    // merged image of `advanced-blending.psd` blends its layers over it
+    // (task 147, mean error 58 -> see the audit).
+    let white = doc(&artboard_file(1, (0.0, 2.0, 4.0, 6.0)).write());
+    assert_eq!(white.layers.len(), 2, "the group and its background layer");
+    assert_eq!(fill_px(&white, 2, 0), Some(u8px(255, 255, 255, 255)));
+    assert!(fill_px(&white, 6, 0).is_none(), "right of the rectangle");
 }
 
 #[test]

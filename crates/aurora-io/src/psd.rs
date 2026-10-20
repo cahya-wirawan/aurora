@@ -857,8 +857,8 @@ fn note_text(note: Note, n: u64) -> String {
         ),
         Note::ArtboardBackgroundNotDrawn(reason) => match reason {
             fill::ArtboardLeft::Unchecked => format!(
-                "{n} artboard{s} with a white or black background: the background {was} not \
-                 drawn (no Photoshop picture of one has been checked)."
+                "{n} artboard{s} with a black background: the background {was} not \
+                 drawn (no Photoshop picture of one has been checked; a white one is drawn)."
             ),
             fill::ArtboardLeft::Unreadable => {
                 format!("{n} artboard background{s} could not be read and {was} not drawn.")

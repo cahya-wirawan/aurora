@@ -437,7 +437,8 @@ pub(super) struct ArtboardBackground {
 /// Why an artboard's background is not drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum ArtboardLeft {
-    /// White or black (types `1` and `2`): no corpus picture shows them.
+    /// Black (type `2`): no corpus picture shows it (white, type `1`, is
+    /// drawn since task 147: `advanced-blending.psd`).
     Unchecked,
     Unreadable,
     /// The rectangle is empty or lies entirely off the canvas.
@@ -470,18 +471,24 @@ pub(super) fn parse_artboard_in(
         .get(b"artboardBackgroundType")
         .and_then(Value::number)
         .ok_or(ArtboardLeft::Unreadable)?;
-    // A small stored integer: 3 is transparent, 4 a custom colour.
+    // A small stored integer: 1 is white (task 147), 3 transparent, 4 a
+    // custom colour; 2 (black) is not drawn.
     if (kind - 3.0).abs() < 0.5 {
         return Ok(None);
     }
-    if (kind - 4.0).abs() >= 0.5 {
+    let white = (kind - 1.0).abs() < 0.5;
+    if !white && (kind - 4.0).abs() >= 0.5 {
         return Err(ArtboardLeft::Unchecked);
     }
-    let c = d
-        .get(b"Clr ")
-        .and_then(Value::descriptor)
-        .ok_or(ArtboardLeft::Unreadable)?;
-    let colour = colour_in(c, cmyk).map_err(|_| ArtboardLeft::Unreadable)?;
+    let colour = if white {
+        [1.0; 3]
+    } else {
+        let c = d
+            .get(b"Clr ")
+            .and_then(Value::descriptor)
+            .ok_or(ArtboardLeft::Unreadable)?;
+        colour_in(c, cmyk).map_err(|_| ArtboardLeft::Unreadable)?
+    };
     let r = d
         .get(b"artboardRect")
         .and_then(Value::descriptor)
