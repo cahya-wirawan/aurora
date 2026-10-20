@@ -93351,6 +93351,7 @@ mod tests {
             // 0.182.0, drop shadows drawn; before (0.181.0): max 182, mean 6.800, 12.246, 18.372.
             // 0.190.0: Strokes drawn; before: 182 / 4.2692, 9.7118, 15.7745.
             // Task 110: as layer_comps.psd (measured 3.5652 / 9.4646 / 15.5236).
+            // Task 147: max 127 -> 136. Located on the audit dumps: texels with error >= 120 went 8 -> 25 of 40,000 and the mean did not move (R 2.3718 -> 2.375); smoothing changed 1,337 texels (max change 14) in rows 72-183, columns 65-140, the gradient overlay's region, and the worst texel is (74, 67), mirrored at (74, 125): Aurora (136, 251, 136) against Photoshop (0, 252, 134), baseline (127, 247, 126), a one-pixel edge texel of the overlay's shape where the fitted ramp end differs. A smoothing artefact at a shape edge, not a regression of a place that matters.
             ("layer_comps.psb", 136.0, [2.3760, 9.2600, 5.4620]),
             // 0.182.0, drop shadows drawn; before (0.181.0): max 245, mean 4.480, 7.851, 9.767.
             ("layer_params.psd", 252.0, [5.9676, 4.9552, 4.5911]),
