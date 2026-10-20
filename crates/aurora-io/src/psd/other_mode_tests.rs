@@ -149,6 +149,19 @@ fn a_lab_layer_converts_its_planes_and_keeps_alpha() {
 }
 
 #[test]
+fn a_lab_layer_without_a_lightness_channel_is_white_not_black() {
+    let layer = TestLayer::pixels("No L", 0, 0, 1, 1, 8, &[[0, 128, 128, 255]])
+        .with(|l| l.channels.retain(|(id, _)| *id != 0));
+    let file = TestPsd::new(1, 1, 1, 8)
+        .with(|p| {
+            p.color_mode = 9;
+            p.layers.push(layer);
+        })
+        .write();
+    assert_eq!(levels(first_layer(&open(&file))[0]), [255, 255, 255]);
+}
+
+#[test]
 fn lab_headers_are_gated() {
     // Fewer than three channels, 32-bit and 1-bit Lab do not exist.
     let thin = TestPsd::new(1, 1, 1, 8)

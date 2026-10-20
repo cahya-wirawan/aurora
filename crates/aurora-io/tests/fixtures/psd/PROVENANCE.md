@@ -8,7 +8,9 @@ MIT-licensed; its licence is reproduced in `LICENSE` beside this file and
 covers these fixtures (the repository's fixtures carry no separate
 licence). `4x4_8bit_lab.psd`, `4x4_8bit_grayscale.psd` and
 `4x4_16bit_grayscale.psd` (added 0.147.0) come from that suite's
-`colormodes/` subdirectory.
+`colormodes/` subdirectory, as do `4x4_8bit_rgb.psd`, `4x4_16bit_lab.psd`,
+`4x4_1bit_bitmap.psd`, `4x4_8bit_index_color.psd`,
+`4x4_16bit_multichannel.psd` and `4x4_8bit_duotone.psd` (added in task 148).
 
 They are committed (unlike the gitignored corpus under `corpora/`) because
 `aurora-io`'s unit tests (`src/psd/tests.rs`) read them with
@@ -29,3 +31,9 @@ values in those tests were read independently with psd-tools 1.17.4.
 | `group.psd` | `1aaf572b69f0b0fa7c04b7b3a14c97e310a0c7bbdc06e733c9dd0d0cdcf7df1c` |
 | `hidden-layer.psd` | `3aaadd20b5ff9d5e778239ee734c9c2bf57fc56bccc82c1b003c3719df46dba0` |
 | `layer-name-emoji.psd` | `2ed49149deeffbccb89aebbf8c5a19dee12a864b17641c7bc03a89e957f3eaa8` |
+| `4x4_8bit_rgb.psd` | `b656bd96b10350fc6911afaabbc2fa6a48cf5c1ae59c1a8e2f952539bd4f1930` |
+| `4x4_16bit_lab.psd` | `35f1727b45b73eb6191a726937f336c8ef6515992bd4913c80e67f46dbc5f12b` |
+| `4x4_1bit_bitmap.psd` | `56ec3967706373af835a319aa2ef6698351e07b8b495e5296ba4fe8848c2dd5f` |
+| `4x4_8bit_index_color.psd` | `1da88234b4c1d33ef2fed6a3a496f68e3c28c0bce420400917736e9b72f194cc` |
+| `4x4_16bit_multichannel.psd` | `36730fdab702fbbde8f8b96451d1099186a4443d02180119542ed50aab34c88d` |
+| `4x4_8bit_duotone.psd` | `4169c367a7e4698f55955901849c38b8bd284dd61f8ddcbef8bafa70e54bb19b` |
