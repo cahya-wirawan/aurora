@@ -245,17 +245,23 @@ pub enum IoError {
     /// (PSB).
     #[error("unsupported Photoshop file version {0}")]
     UnsupportedPsdVersion(u16),
-    /// The file uses a colour mode this reader does not decode — only
-    /// RGB, Grayscale and CMYK are read (0.144.0, Grayscale 0.147.0, CMYK task 146).
+    /// The file uses a colour mode this reader does not decode — Bitmap,
+    /// Grayscale, Indexed Color, RGB, CMYK, Multichannel, Duotone and Lab
+    /// are read (0.144.0, Grayscale 0.147.0, CMYK task 146, the rest task 148).
     #[error(
-        "the file uses the {name} colour mode (code {code}); only RGB, Grayscale and CMYK can be \
-         opened",
+        "the file uses the {name} colour mode (code {code}); only Bitmap, Grayscale, Indexed \
+         Color, RGB, CMYK, Multichannel, Duotone and Lab can be opened",
         name = psd_color_mode_name(*.0),
         code = .0
     )]
     UnsupportedPsdColorMode(u16),
-    /// The file's bit depth is not 8, 16 or 32 (floating point) bits per channel.
-    #[error("the file uses {0} bits per channel; only 8, 16 and 32 (floating point) can be opened")]
+    /// The file's bit depth is not one its colour mode exists in: 1 (Bitmap),
+    /// 8, 16 or 32 (floating point; Grayscale and RGB only) bits per channel.
+    #[error(
+        "the file uses {0} bits per channel, which its colour mode does not support here; \
+         Bitmap is 1, Indexed Color 8, Lab, CMYK, Duotone and Multichannel 8 or 16, Grayscale \
+         and RGB 8, 16 or 32 (floating point)"
+    )]
     UnsupportedPsdDepth(u16),
     /// A channel uses a compression method this reader does not know
     /// (PSD defines `0`..=`3`).

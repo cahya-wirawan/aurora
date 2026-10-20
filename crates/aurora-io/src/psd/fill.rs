@@ -142,6 +142,14 @@ fn colour_in(c: &Descriptor, cmyk: CmykColours<'_>) -> Result<[f32; 3], LeftOut>
             (Some(r), Some(g), Some(b)) => Ok([r, g, b]),
             _ => Err(LeftOut::Unreadable),
         }
+    } else if c.get(b"Lmnc").is_some() {
+        // A Lab colour (task 148): L* 0..100, a* and b* in their natural
+        // units, D50; clipped to sRGB.
+        let n = |key: &[u8]| c.get(key).and_then(Value::number).filter(|v| v.is_finite());
+        match (n(b"Lmnc"), n(b"A   "), n(b"B   ")) {
+            (Some(l), Some(a), Some(b)) => Ok(super::lab::lab_to_srgb(l, a, b)),
+            _ => Err(LeftOut::Unreadable),
+        }
     } else if c.get(b"Gry ").is_some() {
         // A Grayscale colour is the ink percentage: 100 is black (checked
         // on `4x4_16bit_grayscale.psd`: 90.6 shows as level 24).
