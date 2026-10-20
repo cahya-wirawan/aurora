@@ -43658,12 +43658,13 @@ mod tests {
         let message = open_failure_message(
             "photo.psd",
             "psd",
-            &OpenFailure::Decode(aurora_io::IoError::UnsupportedPsdColorMode(9)),
+            &OpenFailure::Decode(aurora_io::IoError::UnsupportedPsdColorMode(6)),
         );
         assert_eq!(
             message,
             "\"photo.psd\" uses a kind of Photoshop (PSD) that Aurora can't open yet. Details: \
-             the file uses the Lab colour mode (code 9); only RGB, Grayscale and CMYK can be opened. Your current \
+             the file uses the unknown colour mode (code 6); only Bitmap, Grayscale, Indexed \
+             Color, RGB, CMYK, Multichannel, Duotone and Lab can be opened. Your current \
              document has not changed."
         );
     }
@@ -43677,11 +43678,11 @@ mod tests {
             (
                 psd(aurora_io::IoError::UnsupportedPsdDepth(1)),
                 "uses a kind of Photoshop (PSD) that Aurora can't open yet. Details: the file \
-                 uses 1 bits per channel; only 8, 16 and 32 (floating point) can be opened.",
+                 uses 1 bits per channel, which its colour mode does not support here;",
             ),
             (
-                psd(aurora_io::IoError::UnsupportedPsdColorMode(8)),
-                "the Duotone colour mode",
+                psd(aurora_io::IoError::UnsupportedPsdColorMode(6)),
+                "the unknown colour mode (code 6)",
             ),
             (
                 psd(aurora_io::IoError::UnsupportedPsdCompression(9)),
@@ -45034,11 +45035,17 @@ mod tests {
 
     #[test]
     fn open_psd_document_refuses_unsupported_and_damaged_files_with_typed_errors() {
+        // Lab opens since task 148; an unassigned colour mode is refused.
         let lab = include_bytes!("../../aurora-io/tests/fixtures/psd/4x4_8bit_lab.psd");
+        assert!(open_psd_document(lab).is_ok());
+        let mut odd = lab.to_vec();
+        if let Some(mode) = odd.get_mut(25) {
+            *mode = 6;
+        }
         assert!(matches!(
-            open_psd_document(lab),
+            open_psd_document(&odd),
             Err(OpenFailure::Decode(
-                aurora_io::IoError::UnsupportedPsdColorMode(9)
+                aurora_io::IoError::UnsupportedPsdColorMode(6)
             ))
         ));
         // 32-bit float opens since task 146 (and says it converted).

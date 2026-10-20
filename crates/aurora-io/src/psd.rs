@@ -158,6 +158,8 @@ mod mode_tests;
 mod modes;
 mod pattern;
 #[cfg(test)]
+mod other_mode_tests;
+#[cfg(test)]
 mod pattern_tests;
 mod read_adjust;
 #[cfg(test)]
