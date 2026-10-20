@@ -1226,3 +1226,116 @@ fn extract_profile(bytes: &[u8]) -> Vec<u8> {
     }
     Vec::new()
 }
+
+fn profile_name(image: &crate::image::Image) -> String {
+    let bytes = image.color_space().to_bytes().unwrap_or_default();
+    aurora_color::profile_description(&bytes).unwrap_or_default()
+}
+
+#[test]
+fn the_decode_and_merged_image_contracts_say_what_a_32_bit_or_cmyk_image_is() {
+    // 32-bit: decode() and merged_image() hand back the stored linear
+    // values tagged with the file's linear profile; the open and
+    // merged_image_in_working_space convert to sRGB and tag it.
+    let linear = linear_srgb_bytes();
+    let file = float_file(&[[0.18, 0.18, 0.18, 1.0]], Some(&linear), 0);
+    let decoded = match decode(&file) {
+        Ok(f) => f,
+        Err(e) => unreachable!("{e:?}"),
+    };
+    let Some(super::PsdNode::Layer(layer)) = decoded.layers.first() else {
+        unreachable!("a layer")
+    };
+    let Some(image) = &layer.image else {
+        unreachable!("pixels")
+    };
+    assert!(
+        (image.samples()[0].to_f32() - 0.18).abs() < 1e-3,
+        "stored linear value"
+    );
+    assert_ne!(
+        profile_name(image),
+        profile_name(
+            &crate::image::Image::new(1, 1, IccProfile::srgb(), vec![f16::ZERO; 4])
+                .unwrap_or_else(|_| unreachable!())
+        )
+    );
+    let opened = open(&file);
+    let built = &opened.pixels[0].image;
+    assert!(
+        (built.samples()[0].to_f32() - 0.461).abs() < 3e-3,
+        "converted by the open"
+    );
+    assert!(
+        aurora_color::icc_bytes_match_ignoring_stamps(
+            &built.color_space().to_bytes().unwrap_or_default(),
+            &IccProfile::srgb().to_bytes().unwrap_or_default()
+        ),
+        "tagged sRGB after the open"
+    );
+    let stored = match merged_image(&float_flat()) {
+        Ok(i) => i,
+        Err(e) => unreachable!("{e:?}"),
+    };
+    let working = match merged_image_in_working_space(&float_flat()) {
+        Ok(i) => i,
+        Err(e) => unreachable!("{e:?}"),
+    };
+    assert!((stored.samples()[0].to_f32() - 0.18).abs() < 1e-3);
+    assert!((working.samples()[0].to_f32() - 0.461).abs() < 3e-3);
+    assert!(
+        !aurora_color::icc_bytes_match_ignoring_stamps(
+            &stored.color_space().to_bytes().unwrap_or_default(),
+            &IccProfile::srgb().to_bytes().unwrap_or_default()
+        ),
+        "the stored 32-bit image is not labelled sRGB"
+    );
+    assert!(
+        aurora_color::icc_bytes_match_ignoring_stamps(
+            &working.color_space().to_bytes().unwrap_or_default(),
+            &IccProfile::srgb().to_bytes().unwrap_or_default()
+        ),
+        "the working-space image is"
+    );
+    // The headless reference "stored.png" therefore carries the linear
+    // profile, not a mislabelled sRGB one.
+    let png = crate::png::encode_16(&stored).unwrap_or_default();
+    let reader = png::Decoder::new(std::io::Cursor::new(&png)).read_info();
+    let Ok(reader) = reader else {
+        unreachable!("a PNG")
+    };
+    let Some(embedded) = reader.info().icc_profile.as_ref() else {
+        unreachable!("an iCCP chunk")
+    };
+    assert!(
+        aurora_color::icc_bytes_match_ignoring_stamps(embedded, &linear),
+        "the PNG embeds the linear profile, not sRGB"
+    );
+    // CMYK: decode() already converted (the images equal the open's).
+    let cmyk = cmyk_file(&STORED_PIXELS, Some(&synthetic_cmyk_bytes()), 0);
+    let decoded = match decode(&cmyk) {
+        Ok(f) => f,
+        Err(e) => unreachable!("{e:?}"),
+    };
+    let Some(super::PsdNode::Layer(layer)) = decoded.layers.first() else {
+        unreachable!("a layer")
+    };
+    let Some(image) = &layer.image else {
+        unreachable!("pixels")
+    };
+    assert_eq!(image.samples(), open(&cmyk).pixels[0].image.samples());
+}
+
+/// A flat 1 x 1 32-bit file with linear value 0.18 and the linear profile.
+fn float_flat() -> Vec<u8> {
+    TestPsd::new(1, 1, 1, 32)
+        .with(|p| {
+            p.resources = resource_1039(&linear_srgb_bytes());
+            p.merged = Some(vec![
+                float_plane([0.18]),
+                float_plane([0.18]),
+                float_plane([0.18]),
+            ]);
+        })
+        .write()
+}

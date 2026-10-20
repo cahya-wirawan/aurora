@@ -72,6 +72,12 @@ impl Image {
         &self.color_space
     }
 
+    /// Re-labels the image's colour space without touching a sample: for
+    /// the moment a conversion has made the samples match another profile.
+    pub(crate) fn retag(&mut self, color_space: IccProfile) {
+        self.color_space = color_space;
+    }
+
     /// The samples, mutably: colour conversion at import rewrites them in
     /// place.
     pub(crate) fn samples_mut(&mut self) -> &mut [f16] {

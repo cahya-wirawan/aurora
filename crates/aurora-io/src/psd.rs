@@ -83,7 +83,14 @@
 //!   caller's sink — so a single layer must fit in memory (invariant
 //!   §7.3.1 is honoured per layer, not per tile). The [`PIXEL_BUDGET`]
 //!   still bounds the whole file.
-//! - An embedded ICC profile is ignored and the pixels are tagged sRGB.
+//! - An embedded ICC profile is ignored by [`decode`] for 8- and 16-bit RGB
+//!   and Grayscale: the pixels are tagged sRGB (the open, [`build_document`],
+//!   converts them). Two modes have no "as stored" RGB form and follow a
+//!   stated contract instead (task 146): a **CMYK** file's decoded images
+//!   are already converted to sRGB (through its CMYK profile, or the naive
+//!   formula), tagged sRGB; a **32-bit** file's decoded images hold its
+//!   stored linear values as `f16`, **tagged with the file's linear
+//!   profile**, and [`build_document`] converts them to sRGB.
 //! - User layer masks are applied (0.147.0: [`PsdMask`] →
 //!   [`PsdDocument::masks`], written by [`write_mask_pixels`]); user-mask
 //!   density is applied as `aurora_doc::LayerMask::density` (0.149.0,
@@ -308,7 +315,10 @@ pub struct PsdLayer {
     /// start before, the canvas). Zero-sized for a layer with no pixels.
     pub bounds: Rect,
     /// The layer's own pixels, straight (not premultiplied) alpha, `f16`
-    /// RGBA, tagged sRGB. `None` for a layer with an empty rectangle.
+    /// RGBA, tagged sRGB, except: a 32-bit file's are its stored linear
+    /// values tagged with its linear profile ([`Image::color_space`]), and a
+    /// CMYK file's are already converted to sRGB. `None` for a layer with an
+    /// empty rectangle.
     pub image: Option<Image>,
     /// The layer's user mask (channel `-2`), applied by
     /// [`build_document`] (0.147.0).
@@ -3541,6 +3551,9 @@ fn decode_mask_channel(
 /// serialised profile ([`IccProfile::from_bytes`]), not a fresh build.
 struct SharedProfile {
     icc: Option<Vec<u8>>,
+    /// The profile a 32-bit file's unconverted images are tagged with: its
+    /// linear one (task 146); `None` tags sRGB.
+    tag: Option<Vec<u8>>,
     /// The CMYK conversion of a CMYK file (task 146), built from its plan.
     cmyk: Option<crate::colour_cmyk::CmykConverter>,
     /// Set when a 32-bit layer held a colour channel above `1.0` (highlights
@@ -3552,6 +3565,7 @@ impl SharedProfile {
     fn new() -> Self {
         Self {
             icc: IccProfile::srgb().to_bytes().ok(),
+            tag: None,
             cmyk: None,
             bright: std::sync::atomic::AtomicBool::new(false),
         }
@@ -3562,6 +3576,12 @@ impl SharedProfile {
             cmyk,
             ..Self::new()
         }
+    }
+
+    /// Tags the images this produces with `tag` (a profile's bytes).
+    fn tagged(mut self, tag: Option<Vec<u8>>) -> Self {
+        self.tag = tag;
+        self
     }
 
     /// Remembers that a 32-bit image held values above white.
@@ -3581,8 +3601,9 @@ impl SharedProfile {
     }
 
     fn get(&self) -> IccProfile {
-        self.icc
+        self.tag
             .as_deref()
+            .or(self.icc.as_deref())
             .and_then(|bytes| IccProfile::from_bytes(bytes).ok())
             .unwrap_or_else(IccProfile::srgb)
     }
@@ -5082,8 +5103,51 @@ fn decode_with_vector_work(bytes: &[u8], vector_work: u64) -> Result<PsdFile, Io
     let profile = SharedProfile::with_cmyk(
         (file.color_mode == 4).then(|| cmyk_converter(file.notes.3.as_deref())),
     );
+    // A 32-bit file's images stay in its linear values, tagged with its
+    // linear profile (the conversion to sRGB is the build's).
+    let header = Header {
+        version: file.version,
+        channels: 0,
+        color_mode: file.color_mode,
+        width: file.width,
+        height: file.height,
+        depth: file.depth,
+    };
+    let tag = float_tag(file.notes.3.as_deref(), header);
+    let profile = profile.tagged(tag.clone());
     materialize(&mut file.layers, &mut src, &profile, 0)?;
+    if let Some(tag) = &tag {
+        retag_images(&mut file.layers, tag);
+    }
     Ok(file)
+}
+
+/// The profile a 32-bit file's unconverted images carry: the linear one the
+/// open converts them from ([`plan_colour`]'s `convert_from`). `None` for
+/// every other file (and for 32-bit data the file calls sRGB-encoded).
+fn float_tag(embedded: Option<&[u8]>, header: Header) -> Option<Vec<u8>> {
+    if !header.float() {
+        return None;
+    }
+    plan_colour(embedded, header, &mut Notes::default()).convert_from
+}
+
+/// Tags every image in `nodes` (drawn fill layers included) with `tag`.
+fn retag_images(nodes: &mut [PsdNode], tag: &[u8]) {
+    let mut stack: Vec<&mut PsdNode> = nodes.iter_mut().collect();
+    while let Some(node) = stack.pop() {
+        match node {
+            PsdNode::Layer(layer) => {
+                if let (Some(image), Ok(profile)) =
+                    (layer.image.as_mut(), IccProfile::from_bytes(tag))
+                {
+                    image.retag(profile);
+                }
+            }
+            PsdNode::Group { children, .. } => stack.extend(children.iter_mut()),
+            PsdNode::Adjustment(_) => {}
+        }
+    }
 }
 
 /// Decodes every pending layer image in `nodes`, in file order.
@@ -5414,6 +5478,17 @@ fn resolve_patterns(
 /// the corpus differentials compare Aurora's composite against it. The
 /// fourth channel is not read as transparency (the image is opaque).
 ///
+/// **What "stored" means per mode (task 146).** 8- and 16-bit RGB and
+/// Grayscale: the samples as stored, tagged sRGB whatever the file's
+/// profile (use [`merged_image_in_working_space`] for the converted
+/// image). 32-bit float: the stored linear values as `f16`, **tagged with
+/// the file's linear profile** (a synthetic linear sRGB when the file has
+/// none), so the image says what it is; the sRGB conversion is
+/// [`merged_image_in_working_space`]'s. CMYK has no stored RGB form: its
+/// image is already converted to sRGB (through the file's CMYK profile, or
+/// the naive formula without one), tagged sRGB, and equals the
+/// working-space image.
+///
 /// # Errors
 ///
 /// As [`decode`] for the header; [`IoError::PsdPixelBudget`] for a canvas
@@ -5435,8 +5510,8 @@ pub fn merged_image(bytes: &[u8]) -> Result<Image, IoError> {
     r.skip(resources, "image resources")?;
     let section = r.length(header.psb(), "layer and mask section length")?;
     r.skip(section, "layer and mask section")?;
-    let cmyk = if header.cmyk() {
-        // Back to the resources for the CMYK profile.
+    let embedded = if header.colours_unchecked() {
+        // Back to the resources for the CMYK or 32-bit profile.
         let mut again = Reader::new(bytes);
         let _ = read_header(&mut again)?;
         let color = again.length(false, "colour mode data length")?;
@@ -5445,11 +5520,18 @@ pub fn merged_image(bytes: &[u8]) -> Result<Image, IoError> {
         let data = again.take(resources, "image resources")?;
         let mut notes = Notes::default();
         let _angle = scan_resources(data, &mut notes);
-        Some(cmyk_converter(notes.3.as_deref()))
+        notes.3.take()
     } else {
         None
     };
-    decode_merged(&mut r, header, false, cmyk.as_ref())
+    let cmyk = header.cmyk().then(|| cmyk_converter(embedded.as_deref()));
+    let mut image = decode_merged(&mut r, header, false, cmyk.as_ref())?;
+    if let Some(tag) = float_tag(embedded.as_deref(), header)
+        && let Ok(profile) = IccProfile::from_bytes(&tag)
+    {
+        image.retag(profile);
+    }
+    Ok(image)
 }
 
 /// [`merged_image`], converted from the file's embedded RGB profile into
@@ -5489,6 +5571,7 @@ pub fn merged_image_in_working_space(bytes: &[u8]) -> Result<Image, IoError> {
         .is_ok()
     {
         crate::clamp_colour_unit(image.samples_mut());
+        image.retag(IccProfile::srgb());
     }
     Ok(image)
 }
@@ -5650,7 +5733,8 @@ fn build_streamed(
         header
             .cmyk()
             .then(|| crate::colour_cmyk::CmykConverter::new(plan.cmyk_profile.take())),
-    );
+    )
+    .tagged(header.float().then(|| plan.convert_from.clone()).flatten());
     let mut builder = Builder {
         to_working: plan
             .convert_from
@@ -6001,6 +6085,9 @@ impl Builder<'_, '_, '_> {
         let Some(converter) = &self.to_working else {
             return;
         };
+        // Whatever the outcome, the image leaves here as working space: a
+        // 32-bit image arrived tagged with its linear profile.
+        image.retag(IccProfile::srgb());
         match converter.convert(image.samples_mut()) {
             Ok(()) => crate::clamp_colour_unit(image.samples_mut()),
             Err(err) => {
