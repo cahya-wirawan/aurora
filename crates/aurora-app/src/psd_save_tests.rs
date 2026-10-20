@@ -1596,10 +1596,7 @@ fn a_cmyk_or_32_bit_open_carries_its_conversion_into_the_psd_save_report() {
     // built here. Each open reports that its colours were converted and the
     // original is not kept; the save carries those lines and asks.
     let float = include_bytes!("../../aurora-io/tests/fixtures/psd/32bit5x5.psd").to_vec();
-    for (bytes, needle) in [
-        (flat_cmyk_psd(), "CMYK"),
-        (float, "32-bit floating point"),
-    ] {
+    for (bytes, needle) in [(flat_cmyk_psd(), "CMYK"), (float, "32-bit floating point")] {
         let opened = ok(aurora_io::read_psd(&bytes));
         assert!(
             opened
@@ -1623,7 +1620,8 @@ fn a_cmyk_or_32_bit_open_carries_its_conversion_into_the_psd_save_report() {
                 .any(|l| l.contains(needle) && l.contains("not kept")),
             "{carried:?}"
         );
-        let PsdSaveStep::NeedsConfirmation(pending) = ok(doc.save_carrying(&target, carried.clone()))
+        let PsdSaveStep::NeedsConfirmation(pending) =
+            ok(doc.save_carrying(&target, carried.clone()))
         else {
             unreachable!("a converted open asks before a PSD save")
         };

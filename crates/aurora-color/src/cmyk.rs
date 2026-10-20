@@ -125,11 +125,7 @@ impl CmykTransform {
 #[must_use]
 pub fn naive_cmyk_to_rgb(ink: [f32; 4]) -> [f32; 3] {
     let k = 1.0 - ink[3];
-    [
-        (1.0 - ink[0]) * k,
-        (1.0 - ink[1]) * k,
-        (1.0 - ink[2]) * k,
-    ]
+    [(1.0 - ink[0]) * k, (1.0 - ink[1]) * k, (1.0 - ink[2]) * k]
 }
 
 impl IccProfile {

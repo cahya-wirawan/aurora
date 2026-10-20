@@ -137,10 +137,21 @@ fn a_cmyk_open_reports_the_conversion_and_keeps_no_rgb_profile() {
     let document = open(&cmyk_file(&STORED_PIXELS, Some(&profile), 0));
     // The CMYK profile is not an RGB source profile: it is not kept as one.
     assert!(document.colour.source.is_none());
-    assert_eq!(document.report.items.len(), 1, "{:?}", document.report.items);
+    assert_eq!(
+        document.report.items.len(),
+        1,
+        "{:?}",
+        document.report.items
+    );
     let line = &document.report.items[0];
-    assert!(line.contains("CMYK profile \"Aurora synthetic CMYK\""), "{line}");
-    assert!(line.contains("converted") && line.contains("clipped"), "{line}");
+    assert!(
+        line.contains("CMYK profile \"Aurora synthetic CMYK\""),
+        "{line}"
+    );
+    assert!(
+        line.contains("converted") && line.contains("clipped"),
+        "{line}"
+    );
     assert!(line.contains("not kept"), "{line}");
     assert!(
         document
@@ -167,7 +178,12 @@ fn a_cmyk_file_without_a_profile_uses_the_naive_formula_and_says_so() {
             "{stored:?}: {px:?} vs {want:?}"
         );
     }
-    assert_eq!(document.report.items.len(), 1, "{:?}", document.report.items);
+    assert_eq!(
+        document.report.items.len(),
+        1,
+        "{:?}",
+        document.report.items
+    );
     let line = &document.report.items[0];
     assert!(line.contains("no CMYK colour profile"), "{line}");
     assert!(line.contains("simple formula") && line.contains("will not match Photoshop"));
@@ -187,9 +203,17 @@ fn an_unusable_cmyk_profile_falls_back_to_the_formula_with_the_reason() {
             [want[0], want[1], want[2], 1.0],
             2e-3
         ));
-        assert_eq!(document.report.items.len(), 1, "{:?}", document.report.items);
+        assert_eq!(
+            document.report.items.len(),
+            1,
+            "{:?}",
+            document.report.items
+        );
         let line = &document.report.items[0];
-        assert!(line.contains("was not used") && line.contains(why), "{line}");
+        assert!(
+            line.contains("was not used") && line.contains(why),
+            "{line}"
+        );
         assert!(line.contains("simple formula"), "{line}");
     }
 }
@@ -218,8 +242,7 @@ fn sixteen_bit_cmyk_matches_the_eight_bit_values() {
             p.channels = 4;
             p.lr16 = true;
             p.resources = resource_1039(&profile);
-            p.layers
-                .push(TestLayer::cmyk("L", 0, 0, 4, 1, 16, &wide));
+            p.layers.push(TestLayer::cmyk("L", 0, 0, 4, 1, 16, &wide));
         })
         .write();
     let eight = first_pixels(&open(&cmyk_file(&STORED_PIXELS, Some(&profile), 0)), n);
@@ -247,7 +270,11 @@ fn a_transparent_cmyk_pixel_is_transparent_black_and_a_missing_channel_is_no_ink
         })
         .write();
     let document = open(&file);
-    assert!(near(first_pixels(&document, 1)[0], [1.0, 1.0, 1.0, 1.0], 2e-3));
+    assert!(near(
+        first_pixels(&document, 1)[0],
+        [1.0, 1.0, 1.0, 1.0],
+        2e-3
+    ));
     assert!(
         document
             .report
@@ -297,7 +324,10 @@ fn a_cmyk_flat_file_opens_from_its_merged_image() {
             Err(e) => unreachable!("{e:?}"),
         };
         assert_eq!(merged.samples(), working.samples());
-        assert_eq!(&merged.samples()[..4], &document.pixels[0].image.samples()[..4]);
+        assert_eq!(
+            &merged.samples()[..4],
+            &document.pixels[0].image.samples()[..4]
+        );
     }
 }
 
@@ -307,10 +337,10 @@ fn cmyk_adjustments_and_effects_are_left_out_and_counted() {
         .with(|p| {
             p.color_mode = 4;
             p.channels = 4;
-            p.layers
-                .push(TestLayer::cmyk("L", 0, 0, 1, 1, 8, &[[255, 255, 255, 255, 255]]).with(
-                    |l| l.blocks.push((*b"lfx2", vec![0; 16])),
-                ));
+            p.layers.push(
+                TestLayer::cmyk("L", 0, 0, 1, 1, 8, &[[255, 255, 255, 255, 255]])
+                    .with(|l| l.blocks.push((*b"lfx2", vec![0; 16]))),
+            );
             p.layers.push(TestLayer::empty("Invert").with(|l| {
                 l.blocks.push((*b"nvrt", Vec::new()));
             }));
@@ -322,7 +352,10 @@ fn cmyk_adjustments_and_effects_are_left_out_and_counted() {
     let document = open(&file);
     let text = document.report.items.join("\n");
     assert!(text.contains("1 adjustment layer was left out"), "{text}");
-    assert!(text.contains("layer effects of 1 layer was left out"), "{text}");
+    assert!(
+        text.contains("layer effects of 1 layer was left out"),
+        "{text}"
+    );
     // Only the pixel layer survives.
     assert_eq!(document.pixels.len(), 1);
 }
@@ -337,7 +370,10 @@ fn a_cmyk_header_needs_four_channels_and_thirty_two_bit_cmyk_does_not_exist() {
             p.channels = 4;
         })
         .write();
-    assert!(matches!(decode(&deep), Err(IoError::UnsupportedPsdDepth(32))));
+    assert!(matches!(
+        decode(&deep),
+        Err(IoError::UnsupportedPsdDepth(32))
+    ));
 }
 
 // ---------------------------------------------------------------------
@@ -410,12 +446,18 @@ fn a_32_bit_layer_is_read_as_linear_light_and_encoded_to_srgb() {
     assert!((got[3][0] - 0.461).abs() < 3e-3, "{:?}", got[3]);
     let line = document.report.items.join("\n");
     assert!(line.contains("32-bit floating point"), "{line}");
-    assert!(line.contains("linear light") && line.contains("not kept"), "{line}");
+    assert!(
+        line.contains("linear light") && line.contains("not kept"),
+        "{line}"
+    );
 }
 
 #[test]
 fn a_32_bit_file_without_a_profile_is_assumed_linear_srgb() {
-    let with = first_pixels(&open(&float_file(&FLOATS, Some(&linear_srgb_bytes()), 0)), 4);
+    let with = first_pixels(
+        &open(&float_file(&FLOATS, Some(&linear_srgb_bytes()), 0)),
+        4,
+    );
     let document = open(&float_file(&FLOATS, None, 0));
     let without = first_pixels(&document, 4);
     for (a, b) in with.iter().zip(&without) {
@@ -446,7 +488,16 @@ fn a_wide_gamut_linear_profile_converts_primaries_too() {
     let mut want = [0.0_f32; 3];
     assert!(t.transform(&[0.1, 0.6, 0.2], &mut want).is_ok());
     assert!(
-        near(got, [want[0].clamp(0.0, 1.0), want[1].clamp(0.0, 1.0), want[2].clamp(0.0, 1.0), 1.0], 4e-3),
+        near(
+            got,
+            [
+                want[0].clamp(0.0, 1.0),
+                want[1].clamp(0.0, 1.0),
+                want[2].clamp(0.0, 1.0),
+                1.0
+            ],
+            4e-3
+        ),
         "{got:?} vs {want:?}"
     );
     // It is not the sRGB-primaries answer.
@@ -542,14 +593,25 @@ fn a_32_bit_grayscale_file_is_linear_grey_encoded_to_srgb() {
             p.lr16 = true;
             p.color_mode = 1;
             p.channels = 1;
-            let mut layer = TestLayer::floats("L", 0, 0, 2, 1, &[[0.18, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]]);
+            let mut layer = TestLayer::floats(
+                "L",
+                0,
+                0,
+                2,
+                1,
+                &[[0.18, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]],
+            );
             layer.channels.retain(|(id, _)| *id == -1 || *id == 0);
             p.layers.push(layer);
         })
         .write();
     let document = open(&file);
     let got = first_pixels(&document, 2);
-    assert!(near(got[0], [0.461, 0.461, 0.461, 1.0], 3e-3), "{:?}", got[0]);
+    assert!(
+        near(got[0], [0.461, 0.461, 0.461, 1.0], 3e-3),
+        "{:?}",
+        got[0]
+    );
     assert!(near(got[1], [1.0, 1.0, 1.0, 1.0], 1e-3), "{:?}", got[1]);
     let text = document.report.items.join("\n");
     assert!(text.contains("linear grey") && text.contains("Grayscale file is held as RGB"));
@@ -572,7 +634,11 @@ fn a_32_bit_flat_file_opens_from_its_merged_image() {
             })
             .write();
         let got = first_pixels(&open(&file), 3);
-        assert!(near(got[1], [srgb_encode(0.5), srgb_encode(0.25), srgb_encode(0.01), 1.0], 3e-3));
+        assert!(near(
+            got[1],
+            [srgb_encode(0.5), srgb_encode(0.25), srgb_encode(0.01), 1.0],
+            3e-3
+        ));
         assert!(near(got[2], [1.0; 4], 1e-3));
         let working = match merged_image_in_working_space(&file) {
             Ok(i) => i,
@@ -590,7 +656,11 @@ fn an_srgb_encoded_profile_on_float_data_is_taken_at_its_word() {
     let got = first_pixels(&document, 4);
     assert!(near(got[1], [0.5, 0.25, 0.01, 1.0], 1e-3), "{:?}", got[1]);
     assert!(
-        document.report.items.join("\n").contains("used as encoded sRGB"),
+        document
+            .report
+            .items
+            .join("\n")
+            .contains("used as encoded sRGB"),
         "{:?}",
         document.report.items
     );
@@ -608,7 +678,12 @@ fn the_tracked_32_bit_fixture_matches_photoshops_own_16_bit_conversion() {
     assert_eq!(a.pixels.len(), b.pixels.len());
     let mut worst = 0.0_f32;
     for (x, y) in a.pixels.iter().zip(&b.pixels) {
-        for (u, v) in x.image.samples().chunks_exact(4).zip(y.image.samples().chunks_exact(4)) {
+        for (u, v) in x
+            .image
+            .samples()
+            .chunks_exact(4)
+            .zip(y.image.samples().chunks_exact(4))
+        {
             for c in 0..3 {
                 worst = worst.max((u[c].to_f32() - v[c].to_f32()).abs());
             }
@@ -619,11 +694,30 @@ fn the_tracked_32_bit_fixture_matches_photoshops_own_16_bit_conversion() {
     assert!(worst < 0.5 / 255.0, "{worst}");
 }
 
+/// A file of `mode`/`depth` whose one layer claims `side` x `side` pixels
+/// but stores one byte per channel.
+fn greedy_layer_file(mode: u16, depth: u16, channels: u16, side: i32) -> Vec<u8> {
+    TestPsd::new(1, 8, 8, depth)
+        .with(|p| {
+            p.color_mode = mode;
+            p.channels = channels;
+            p.lr16 = depth != 8;
+            let mut l = TestLayer::pixels("L", 0, 0, 1, 1, 8, &[[0, 0, 0, 255]]);
+            l.right = side;
+            l.bottom = side;
+            if mode == 4 {
+                l.channels.push((3, vec![0]));
+            }
+            p.layers.push(l);
+        })
+        .write()
+}
+
 #[test]
-fn hostile_cmyk_and_float_headers_cost_nothing() {
+fn hostile_cmyk_and_float_headers_are_refused_by_name_before_any_buffer() {
     for (mode, depth, channels) in [(4_u16, 8_u16, 4_u16), (4, 16, 5), (3, 32, 3), (1, 32, 1)] {
-        // A canvas the size of a document ceiling with almost no data: the
-        // merged image's size check refuses it before any buffer.
+        // A document-ceiling canvas with 16 bytes of data: the pixel
+        // budget refuses it from the header alone.
         let flat = TestPsd::new(1, 30_000, 30_000, depth)
             .with(|p| {
                 p.color_mode = mode;
@@ -631,33 +725,58 @@ fn hostile_cmyk_and_float_headers_cost_nothing() {
                 p.merged = Some(vec![vec![0; 16]; usize::from(channels)]);
             })
             .write();
-        let result = read(&flat);
-        assert!(result.is_err(), "mode {mode} depth {depth}");
-        // A layer that claims a huge rectangle with a few bytes of data.
-        let layer = TestPsd::new(1, 8, 8, depth)
-            .with(|p| {
-                p.color_mode = mode;
-                p.channels = channels;
-                p.lr16 = depth != 8;
-                let mut l = TestLayer::pixels("L", 0, 0, 1, 1, 8, &[[0, 0, 0, 255]]);
-                l.right = 20_000;
-                l.bottom = 20_000;
-                if mode == 4 {
-                    l.channels.push((3, vec![0]));
-                }
-                p.layers.push(l);
-            })
-            .write();
-        assert!(read(&layer).is_err(), "mode {mode} depth {depth}");
+        assert!(
+            matches!(read(&flat), Err(IoError::PsdPixelBudget { .. })),
+            "flat, mode {mode} depth {depth}"
+        );
+        // A layer whose rectangle alone is past the budget.
+        assert!(
+            matches!(
+                read(&greedy_layer_file(mode, depth, channels, 20_000)),
+                Err(IoError::PsdPixelBudget { .. })
+            ),
+            "20,000 px layer, mode {mode} depth {depth}"
+        );
+        // A layer inside the budget (100 Mpx, up to 1.6 GB of f16 RGBA)
+        // whose channels hold a few bytes: refused as too short before the
+        // buffer its rectangle implies exists.
+        assert!(
+            matches!(
+                read(&greedy_layer_file(mode, depth, channels, 10_000)),
+                Err(IoError::PsdMalformed { what }) if what.contains("too short")
+            ),
+            "10,000 px layer, mode {mode} depth {depth}"
+        );
     }
-    // A header with an absurd channel count is malformed, not allocated.
+    // An absurd channel count is malformed, not allocated.
     let many = TestPsd::new(1, 1, 1, 8)
         .with(|p| {
             p.color_mode = 4;
             p.channels = 4000;
         })
         .write();
-    assert!(read(&many).is_err());
+    assert!(matches!(read(&many), Err(IoError::PsdMalformed { .. })));
+    // A CMYK plane shorter than the layer reaches the converter only
+    // through a lying plan; the converter refuses it by name.
+    let converter = crate::colour_cmyk::CmykConverter::new(None);
+    let short = [0_u8; 3];
+    let planes = [
+        Some(&short[..]),
+        Some(&short[..]),
+        Some(&short[..]),
+        Some(&short[..]),
+    ];
+    assert!(matches!(
+        converter.convert_planes(planes, None, 1, 4),
+        Err(IoError::PsdMalformed { .. })
+    ));
+    // And a pixel count whose buffer cannot be sized is refused, not
+    // wrapped or allocated.
+    assert!(
+        converter
+            .convert_planes([None, None, None, None], None, 2, usize::MAX / 2)
+            .is_err()
+    );
 }
 
 #[test]

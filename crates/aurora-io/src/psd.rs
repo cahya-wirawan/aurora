@@ -3570,7 +3570,8 @@ impl SharedProfile {
                 .chunks_exact(4)
                 .any(|px| px.iter().take(3).any(|c| c.to_f32() > 1.0))
         {
-            self.bright.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.bright
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -5232,9 +5233,7 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
     // Smart objects (0.200.0): matched to their embedded files before the
     // tree is built, so the build knows which ones are kept.
     let resolved = smart::resolve(src, &mut info.records, &linked_windows, &mut effects_budget)?;
-    let cmyk_colours = header
-        .cmyk()
-        .then(|| cmyk_converter(notes.3.as_deref()));
+    let cmyk_colours = header.cmyk().then(|| cmyk_converter(notes.3.as_deref()));
     let layers = build_tree(
         src,
         &info.records,
@@ -5285,9 +5284,7 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         // The merged image is the rest of the file, read at once — about
         // one layer's worth, and only for a file with no layers at all.
         let rest = r.take_upto(src, usize::MAX, "merged image")?;
-        let cmyk = header
-            .cmyk()
-            .then(|| cmyk_converter(notes.3.as_deref()));
+        let cmyk = header.cmyk().then(|| cmyk_converter(notes.3.as_deref()));
         Some(decode_merged(
             &mut Reader::new(&rest),
             header,
@@ -5881,9 +5878,9 @@ fn plan_cmyk(embedded: Option<&[u8]>, plan: &mut ColourPlan) {
                            nothing of real inks, so the colours will not match Photoshop; the \
                            original CMYK values are not kept";
     match embedded.map(|bytes| (bytes, aurora_color::inspect_cmyk_source(bytes))) {
-        None => plan
-            .warnings
-            .push(format!("The file has no CMYK colour profile, so {FORMULA}.")),
+        None => plan.warnings.push(format!(
+            "The file has no CMYK colour profile, so {FORMULA}."
+        )),
         Some((_, Err(problem))) => plan.warnings.push(format!(
             "The file's colour profile was not used ({}), so {FORMULA}.",
             problem.describe_expecting("CMYK")
@@ -5915,7 +5912,8 @@ fn plan_float(embedded: Option<&[u8]>, gray: bool, plan: &mut ColourPlan) {
             None => {
                 plan.convert_from = linear();
                 plan.colour.report.info.push(
-                    "No colour profile: the 32-bit values are assumed to be linear sRGB.".to_owned(),
+                    "No colour profile: the 32-bit values are assumed to be linear sRGB."
+                        .to_owned(),
                 );
                 "linear light, sRGB assumed".to_owned()
             }

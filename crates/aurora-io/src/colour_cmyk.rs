@@ -102,7 +102,8 @@ impl CmykConverter {
             what: "a CMYK plane shorter than its layer",
         };
         let need = pixels.checked_mul(bps).ok_or_else(short)?;
-        if planes.iter().flatten().any(|p| p.len() < need) || alpha.is_some_and(|a| a.len() < need) {
+        if planes.iter().flatten().any(|p| p.len() < need) || alpha.is_some_and(|a| a.len() < need)
+        {
             return Err(short());
         }
         let len = pixels.checked_mul(4).ok_or_else(short)?;

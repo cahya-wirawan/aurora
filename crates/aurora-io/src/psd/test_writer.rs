@@ -119,7 +119,10 @@ impl TestLayer {
         depth: u16,
         cmyka: &[[u16; 5]],
     ) -> Self {
-        let rgba: Vec<[u16; 4]> = cmyka.iter().map(|[c, m, y, _, a]| [*c, *m, *y, *a]).collect();
+        let rgba: Vec<[u16; 4]> = cmyka
+            .iter()
+            .map(|[c, m, y, _, a]| [*c, *m, *y, *a])
+            .collect();
         let mut layer = Self::pixels(name, left, top, width, height, depth, &rgba);
         let plane = |c: usize| -> Vec<u8> {
             cmyka
