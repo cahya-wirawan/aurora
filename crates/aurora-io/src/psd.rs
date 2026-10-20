@@ -588,6 +588,9 @@ enum Note {
     BrokenGroups,
     ExtraChannels,
     ColorProfileIgnored,
+    /// A Lab, Indexed, Bitmap, Duotone or Multichannel file's flattened
+    /// image carries a transparency plane that is not read (task 148).
+    MergedTransparencyIgnored,
     ColorProfileTooLarge,
     /// Adjustment layers of a CMYK or 32-bit file, left out (task 146):
     /// nothing checked how Photoshop's adjustments read those modes.
@@ -1116,6 +1119,11 @@ fn note_text(note: Note, n: u64) -> String {
         ),
         Note::ExtraChannels => {
             format!("{n} saved channel{s} (alpha or spot colour) {was} not opened.")
+        }
+        Note::MergedTransparencyIgnored => {
+            "The flattened image's transparency channel was not read; \
+                                             it is shown opaque."
+                .to_owned()
         }
         Note::ColorProfileIgnored => "The file's embedded colour profile was ignored; its \
                                       colours are treated as sRGB."
@@ -5247,7 +5255,16 @@ fn decode_merged(
     }
     if header.lab() || header.indexed() || header.bitmap() {
         // The modes converted from their stored planes (task 148); their
-        // merged image carries no transparency plane here.
+        // merged image carries no transparency plane here (the open reports
+        // it). The pixel budget is checked here as well as by the callers,
+        // before any buffer is sized from the header.
+        let area = width as u64 * height as u64;
+        if area > PIXEL_BUDGET {
+            return Err(IoError::PsdPixelBudget {
+                total: area,
+                max: PIXEL_BUDGET,
+            });
+        }
         let mut sink = CmykPlanes {
             planes: [None, None, None, None, None],
         };
@@ -5505,6 +5522,13 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
     let resources = r.take(src, resources_len, "image resources")?;
     let global_angle = scan_resources(&resources, &mut notes);
     drop(resources);
+    // Lab, Indexed, Bitmap, Duotone and Multichannel files never use an
+    // embedded profile (task 148): say so when it is not plainly sRGB.
+    if !matches!(header.color_mode, 1 | 3 | 4)
+        && notes.3.as_deref().is_some_and(|p| !looks_like_srgb(p))
+    {
+        notes.add(Note::ColorProfileIgnored);
+    }
     let palette = palette_bytes
         .map(|bytes| modes::Palette::parse(&bytes, notes.4))
         .transpose()?;
@@ -5632,9 +5656,8 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
     let color_planes = u16::try_from(header.color_planes()).unwrap_or(3);
     // Only the colour modes whose merged image is un-matted here (RGB,
     // Grayscale, CMYK) read a transparency plane from it.
-    let merged_alpha = info.merged_alpha
-        && header.channels > color_planes
-        && matches!(header.color_mode, 1 | 3 | 4);
+    let tagged_alpha = info.merged_alpha && header.channels > color_planes;
+    let merged_alpha = tagged_alpha && matches!(header.color_mode, 1 | 3 | 4);
     let extra = u64::from(header.channels)
         .saturating_sub(u64::from(color_planes))
         .saturating_sub(u64::from(merged_alpha));
@@ -5655,6 +5678,9 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         }
         if !info.records.is_empty() {
             notes.add(Note::FlattenedFallback);
+        }
+        if tagged_alpha && !merged_alpha {
+            notes.add(Note::MergedTransparencyIgnored);
         }
         drop(info);
         // The merged image is the rest of the file, read at once — about

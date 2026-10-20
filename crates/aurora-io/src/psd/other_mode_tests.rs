@@ -608,3 +608,122 @@ fn every_corpus_file_of_the_five_modes_opens() {
         );
     }
 }
+
+// ------------------------------------------------- Hostile headers, notes
+
+/// A header-only file of `mode` and `depth` whose canvas is huge and whose
+/// merged data is a few bytes.
+fn huge_header(mode: u16, depth: u16, channels: u16, side: u32) -> Vec<u8> {
+    TestPsd::new(1, side, side, depth)
+        .with(|p| {
+            p.color_mode = mode;
+            p.channels = channels;
+            p.merged = Some(vec![vec![0; 4]; usize::from(channels)]);
+            if mode == 2 {
+                p.color_mode_data = vec![0; 768];
+            }
+        })
+        .write()
+}
+
+#[test]
+fn a_huge_canvas_with_tiny_data_is_refused_before_any_buffer() {
+    // 30,000 x 30,000 is 900 Mpx: past the pixel budget in every mode.
+    for (mode, depth, channels) in [(0_u16, 1_u16, 1_u16), (2, 8, 1), (9, 8, 3), (9, 16, 3)] {
+        let file = huge_header(mode, depth, channels, 30_000);
+        for result in [
+            decode(&file).map(|_| ()),
+            read(&file).map(|_| ()),
+            merged_image(&file).map(|_| ()),
+            merged_image_in_working_space(&file).map(|_| ()),
+        ] {
+            assert!(
+                matches!(result, Err(IoError::PsdPixelBudget { .. })),
+                "mode {mode} depth {depth}: {result:?}"
+            );
+        }
+    }
+    // Duotone and Multichannel share the RGB merged path and its budget.
+    for mode in [7_u16, 8] {
+        let file = huge_header(mode, 8, 1, 30_000);
+        assert!(matches!(
+            merged_image(&file),
+            Err(IoError::PsdPixelBudget { .. })
+        ));
+        assert!(matches!(decode(&file), Err(IoError::PsdPixelBudget { .. })));
+    }
+}
+
+#[test]
+fn a_canvas_inside_the_budget_with_tiny_data_fails_on_the_data_not_on_memory() {
+    // 16,384 x 16,384 is exactly the budget; its few data bytes cannot
+    // hold even the smallest RLE or raw planes, and the check comes
+    // before the output is allocated.
+    for (mode, depth, channels) in [(0_u16, 1_u16, 1_u16), (2, 8, 1), (9, 8, 3)] {
+        let file = huge_header(mode, depth, channels, 16_384);
+        let result = merged_image(&file).map(|_| ());
+        assert!(
+            matches!(result, Err(IoError::PsdTruncated { .. })),
+            "mode {mode}: {result:?}"
+        );
+        for compression in [1_u16, 2] {
+            let packed = TestPsd::new(1, 16_384, 16_384, depth)
+                .with(|p| {
+                    p.color_mode = mode;
+                    p.channels = channels;
+                    p.merged = Some(vec![vec![0; 4]; usize::from(channels)]);
+                    p.merged_compression = compression;
+                    if mode == 2 {
+                        p.color_mode_data = vec![0; 768];
+                    }
+                })
+                .write();
+            assert!(
+                read(&packed).is_err() && merged_image(&packed).is_err(),
+                "mode {mode} compression {compression}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_ignored_embedded_profile_is_reported_for_the_converted_modes() {
+    let with_profile = |profile: &[u8]| {
+        indexed_file(&[0, 1], None)
+            .with(|p| p.resources = resource(1039, profile))
+            .write()
+    };
+    let odd = report_text(&open(&with_profile(b"some other profile")));
+    assert!(odd.contains("embedded colour profile was ignored"), "{odd}");
+    let plain = report_text(&open(&with_profile(b"..sRGB IEC61966-2.1..")));
+    assert!(!plain.contains("embedded colour profile"), "{plain}");
+    let none = report_text(&open(&indexed_file(&[0, 1], None).write()));
+    assert!(!none.contains("embedded colour profile"), "{none}");
+    // A Lab file with one says so too.
+    let lab = lab_file(8, [&[10], &[128], &[128]])
+        .with(|p| p.resources = resource(1039, b"some other profile"))
+        .write();
+    assert!(report_text(&open(&lab)).contains("embedded colour profile was ignored"));
+}
+
+#[test]
+fn a_merged_transparency_plane_of_a_lab_file_is_reported_as_not_read() {
+    // Four channels and a `Mtrn` block: the fourth is the flattened
+    // image's transparency, which the layerless fallback does not read.
+    let file = TestPsd::new(1, 1, 1, 8)
+        .with(|p| {
+            p.color_mode = 9;
+            p.channels = 4;
+            p.merged = Some(vec![vec![200], vec![128], vec![128], vec![0]]);
+            p.globals.push((*b"Mtrn", vec![0, 0, 0, 1]));
+        })
+        .write();
+    let document = open(&file);
+    assert!(
+        report_text(&document).contains("transparency channel was not read"),
+        "{}",
+        report_text(&document)
+    );
+    // The colour is still the opaque conversion.
+    assert_eq!(first_layer(&document)[0][3], 1.0);
+}
