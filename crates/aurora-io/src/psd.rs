@@ -2987,11 +2987,20 @@ fn unpack_bits(src: &[u8], out: &mut Vec<u8>, row_bytes: usize) -> Result<(), Io
     Ok(())
 }
 
+/// How many output bytes per input byte [`inflate`] reserves up front.
+const INFLATE_HEAD_START: usize = 8;
+
 /// zlib-inflates `src` to exactly `expected` bytes. Reads at most one
 /// byte past `expected`, so an oversized stream is detected without being
 /// decompressed.
 fn inflate(src: &[u8], expected: usize) -> Result<Vec<u8>, IoError> {
-    let mut out = try_alloc(expected.saturating_add(1))?;
+    // The output grows as it is produced: only a small head start is
+    // reserved from the *input*, so a stream that claims a huge plane and
+    // delivers little never reserves the plane (task 146 review).
+    let head = expected
+        .min(src.len().saturating_mul(INFLATE_HEAD_START))
+        .saturating_add(1);
+    let mut out = try_alloc(head)?;
     let limit = u64::try_from(expected)
         .ok()
         .and_then(|e| e.checked_add(1))
@@ -3164,6 +3173,27 @@ fn opaque_buffer(width: usize, height: usize) -> Result<Vec<f16>, IoError> {
     Ok(samples)
 }
 
+/// The most memory (bytes) one CMYK layer or merged image may need at its
+/// peak (task 146): the five decoded planes (`bps` bytes a pixel each) held
+/// together with the `f16` RGBA output (8 bytes a pixel). A CMYK conversion
+/// needs all four ink planes at once, so unlike an RGB layer it cannot be
+/// decoded one plane at a time; a bigger layer is refused with
+/// [`IoError::PsdOutOfMemory`] before any plane is read. Within
+/// [`PIXEL_BUDGET`]'s 268 Mpx this admits up to about 240 Mpx 8-bit and 180
+/// Mpx 16-bit.
+const CMYK_PEAK_BYTES: u64 = 3 << 30;
+
+/// The peak memory of converting `pixels` CMYK pixels of `bps`-byte
+/// samples; `Err` when it is past [`CMYK_PEAK_BYTES`].
+fn check_cmyk_peak(pixels: u64, bps: usize) -> Result<(), IoError> {
+    let per_pixel = 8_u64.saturating_add(5 * bps as u64);
+    let bytes = pixels.saturating_mul(per_pixel);
+    if bytes > CMYK_PEAK_BYTES {
+        return Err(IoError::PsdOutOfMemory { bytes });
+    }
+    Ok(())
+}
+
 /// Where [`pixel_channels`] puts a record's transparency channel (`-1`):
 /// after the (up to four) colour channels. In the RGBA buffer it is slot 3.
 const ALPHA_SLOT: usize = 4;
@@ -3302,6 +3332,7 @@ fn decode_pending_cmyk(
     let Some(converter) = shared.cmyk.as_ref() else {
         return Err(malformed("a CMYK layer without a colour conversion"));
     };
+    check_cmyk_peak(width as u64 * height as u64, bps)?;
     let mut planes: [Option<Vec<u8>>; 5] = [None, None, None, None, None];
     for (slot, chan) in pending.slots.iter().enumerate() {
         if let (Some(chan), Some(entry)) = (chan, planes.get_mut(slot)) {
@@ -5017,10 +5048,14 @@ fn decode_merged(
         let Some(converter) = cmyk else {
             return Err(malformed("a CMYK merged image without a colour conversion"));
         };
+        check_cmyk_peak(width as u64 * height as u64, header.bytes_per_sample())?;
         let mut sink = CmykPlanes {
             planes: [None, None, None, None, None],
         };
         walk_merged_planes(r, header, planes, &mut sink)?;
+        if planes > color {
+            unmatte_cmyk(&mut sink.planes, header.bytes_per_sample());
+        }
         let [c, m, y, k, a] = &sink.planes;
         // The merged image's transparency plane is its fifth plane.
         let a = if planes > color { a.as_deref() } else { None };
@@ -5032,10 +5067,6 @@ fn decode_merged(
                 .checked_mul(height)
                 .ok_or_else(|| malformed("merged image size"))?,
         )?;
-        let mut samples = samples;
-        if planes > color {
-            remove_white_matte(&mut samples);
-        }
         return Image::new(header.width, header.height, IccProfile::srgb(), samples);
     }
     let mut sink = RgbaPlanes {
@@ -5054,6 +5085,55 @@ fn decode_merged(
         remove_white_matte(&mut samples);
     }
     Image::new(header.width, header.height, IccProfile::srgb(), samples)
+}
+
+/// Un-mattes a CMYK merged image in **ink space** (task 146). Photoshop
+/// mattes a transparent composite against white, which in CMYK is no ink at
+/// all (the stored maximum): a stored sample is `v' = v * a + max * (1 - a)`
+/// for coverage `a`, so `v = (v' - max * (1 - a)) / a`, clamped. Done on the
+/// stored colour planes before the profile conversion, where the matte is
+/// exactly a blend with paper; un-matting the converted RGB instead would
+/// blend through the profile's nonlinearity. A pixel with no coverage is
+/// left as it is (its colour is not shown).
+fn unmatte_cmyk(planes: &mut [Option<Vec<u8>>; 5], bps: usize) {
+    let (colour, alpha) = planes.split_at_mut(4);
+    let Some(Some(alpha)) = alpha.first() else {
+        return;
+    };
+    let max = if bps == 2 { 65_535.0_f32 } else { 255.0 };
+    let coverage = |i: usize| -> f32 {
+        if bps == 2 {
+            match alpha.get(i * 2..i * 2 + 2) {
+                Some([hi, lo]) => f32::from(u16::from_be_bytes([*hi, *lo])) / max,
+                _ => 0.0,
+            }
+        } else {
+            alpha.get(i).map_or(0.0, |v| f32::from(*v) / max)
+        }
+    };
+    for plane in colour.iter_mut().flatten() {
+        if bps == 2 {
+            for (i, pair) in plane.chunks_exact_mut(2).enumerate() {
+                let a = coverage(i);
+                if let (true, [hi, lo]) = (a > 0.0, pair) {
+                    let v = f32::from(u16::from_be_bytes([*hi, *lo]));
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let un = ((v - max * (1.0 - a)) / a).round().clamp(0.0, max) as u16;
+                    [*hi, *lo] = un.to_be_bytes();
+                }
+            }
+        } else {
+            for (i, byte) in plane.iter_mut().enumerate() {
+                let a = coverage(i);
+                if a > 0.0 {
+                    let v = f32::from(*byte);
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let un = ((v - max * (1.0 - a)) / a).round().clamp(0.0, max) as u8;
+                    *byte = un;
+                }
+            }
+        }
+    }
 }
 
 /// Un-mattes straight RGBA whose colour was composited over white:

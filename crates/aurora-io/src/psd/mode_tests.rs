@@ -1339,3 +1339,97 @@ fn float_flat() -> Vec<u8> {
         })
         .write()
 }
+
+#[test]
+fn a_cmyk_merged_image_with_alpha_is_unmatted_in_ink_space() {
+    // Photoshop mattes against paper: stored v' = v*a + 255*(1-a), a = 128/255.
+    // Ink C = 1 (v 0), M = 0 (v 255), Y = 0.5 (v 127), K = 0 (v 255).
+    let a = 128.0_f32 / 255.0;
+    let matte = |v: f32| (v * a + 255.0 * (1.0 - a)).round() as u8;
+    let profile = synthetic_cmyk_bytes();
+    let bytes = TestPsd::new(1, 1, 1, 8)
+        .with(|p| {
+            p.color_mode = 4;
+            p.channels = 5;
+            p.negative_count = true;
+            p.resources = resource_1039(&profile);
+            // The only record is left out, so the merged image is used.
+            p.layers.push(
+                TestLayer::cmyk("gone", 0, 0, 1, 1, 8, &[[0, 0, 0, 0, 255]])
+                    .with(|l| l.blocks.push((*b"hue ", vec![0; 4]))),
+            );
+            p.merged = Some(vec![
+                vec![matte(0.0)],
+                vec![matte(255.0)],
+                vec![matte(127.0)],
+                vec![matte(255.0)],
+                vec![128],
+            ]);
+        })
+        .write();
+    let document = open(&bytes);
+    let got = first_pixels(&document, 1)[0];
+    let want = reference_cmyk([1.0, 0.0, 1.0 - 127.0 / 255.0, 0.0]);
+    assert!(
+        near(got, [want[0], want[1], want[2], 128.0 / 255.0], 6e-3),
+        "{got:?} vs {want:?}"
+    );
+}
+
+#[test]
+fn a_cmyk_layer_past_the_peak_memory_cap_is_refused_before_any_plane_is_read() {
+    assert!(super::check_cmyk_peak(100_000_000, 1).is_ok());
+    assert!(super::check_cmyk_peak(160_000_000, 2).is_ok());
+    assert!(matches!(
+        super::check_cmyk_peak(180_000_000, 2),
+        Err(IoError::PsdOutOfMemory { bytes }) if bytes == 180_000_000 * 18
+    ));
+    // End to end: a 16-bit CMYK layer of 180 Mpx whose channels each hold
+    // enough bytes to pass the minimum-size check is refused by name and
+    // never decoded (its bytes are not even valid zlib).
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let junk: Vec<u8> = (0..400_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u8
+        })
+        .collect();
+    let file = TestPsd::new(1, 8, 8, 16)
+        .with(|p| {
+            p.color_mode = 4;
+            p.channels = 4;
+            p.lr16 = true;
+            let mut l = TestLayer::cmyk("L", 0, 0, 1, 1, 16, &[[0, 0, 0, 0, 0]]);
+            l.right = 18_000;
+            l.bottom = 10_000;
+            l.compression = 2;
+            for (_, plane) in &mut l.channels {
+                *plane = junk.clone();
+            }
+            p.layers.push(l);
+        })
+        .write();
+    assert!(
+        matches!(read(&file), Err(IoError::PsdOutOfMemory { bytes }) if bytes == 180_000_000 * 18),
+        "{:?}",
+        read(&file).err()
+    );
+}
+
+#[test]
+fn an_inflate_that_claims_a_huge_plane_reserves_only_what_it_produces() {
+    // 1 << 38 bytes would be refused by name as out of memory if it were
+    // reserved up front; the stream holds three bytes, so the answer is a
+    // plain size mismatch.
+    let tiny = super::test_writer::zlib(b"abc");
+    assert!(matches!(
+        super::inflate(&tiny, 1 << 38),
+        Err(IoError::PsdMalformed { .. })
+    ));
+    // And the exact size still works, with a head start larger than the input.
+    let big = vec![7_u8; 100_000];
+    let packed = super::test_writer::zlib(&big);
+    assert_eq!(super::inflate(&packed, big.len()).ok(), Some(big));
+}
