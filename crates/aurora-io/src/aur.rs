@@ -8145,6 +8145,7 @@ mod tests {
                 reverse: true,
                 align: true,
                 offset: (10.0, -5.0),
+                linear_ramp: false,
             },
             dither: true,
             reference: Some(aurora_core::effects::ReferenceBox {

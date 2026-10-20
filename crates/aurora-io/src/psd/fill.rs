@@ -232,6 +232,7 @@ const INK_SUBDIVISIONS: usize = 16;
 fn expand_ink_stops(
     coloured: &[InkStop],
     conv: &crate::colour_cmyk::CmykConverter,
+    smooth: bool,
 ) -> Vec<Stop<[f32; 3]>> {
     let plain = |s: &InkStop| Stop {
         pos: s.pos,
@@ -264,6 +265,8 @@ fn expand_ink_stops(
         for j in 1..per {
             let u = j as f32 / per as f32;
             let f = u.powf(curve);
+            // Photoshop's smoothing (see `GradientFill::linear_ramp`).
+            let f = if smooth { f * f * (3.0 - 2.0 * f) } else { f };
             let ink = [0, 1, 2, 3].map(|k| {
                 let (x, y) = (
                     ia.get(k).copied().unwrap_or(0.0),
@@ -300,8 +303,11 @@ pub(super) fn gradient_in(d: &Descriptor, cmyk: CmykColours<'_>) -> Result<Gradi
             .ok_or(LeftOut::Unreadable)?;
         Ok((colour_in(c, cmyk)?, cmyk.and_then(|_| ink_of(c))))
     })?;
+    // Smoothness 0 % (`Intr` 0) is a straight ramp; anything else is
+    // drawn as 100 % (partial values have no model yet).
+    let smooth = num(grad, b"Intr", 4096.0)? > 0.0;
     let colours = match cmyk {
-        Some(conv) => expand_ink_stops(&coloured, conv),
+        Some(conv) => expand_ink_stops(&coloured, conv, smooth),
         None => coloured
             .iter()
             .map(|s| Stop {
@@ -345,6 +351,8 @@ pub(super) fn gradient_in(d: &Descriptor, cmyk: CmykColours<'_>) -> Result<Gradi
         reverse: flag(d, b"Rvrs", false)?,
         align: flag(d, b"Algn", true)?,
         offset,
+        // The CMYK sub-stops carry the smoothing themselves.
+        linear_ramp: !smooth || cmyk.is_some(),
     })
 }
 

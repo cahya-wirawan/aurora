@@ -6074,6 +6074,7 @@ mod adjustment_tests {
                 reverse: false,
                 align: true,
                 offset: (0.0, 0.0),
+                linear_ramp: false,
             },
             dither: false,
             reference: None,

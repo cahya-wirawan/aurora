@@ -412,14 +412,17 @@ fn gradient_positions_follow_the_geometry() {
     near(g.position(16.0, 3.0, b), 0.0);
     near(g.position(8.0, 3.0, b), 0.5);
     near(g.position(24.0, 3.0, b), 0.5);
-    // Radial: 0 at the centre, 1 at the corner.
+    // Radial (fitted to Photoshop's pixels, task 147): `EDGE_OFFSET` at the
+    // centre, 1 at the corner.
     let g = parsed_gradient(&black_to_white(b"Rdl ", 0.0, 100.0, false));
-    near(g.position(16.0, 16.0, b), 0.0);
+    near(g.position(16.0, 16.0, b), aurora_core::gradient_fill::EDGE_OFFSET as f32);
     near(g.position(32.0, 32.0, b), 1.0);
-    // Diamond: 1 at a corner of a square box, 0.5 at an edge midpoint.
+    // Diamond (same radius as Radial times its factor): 1 at a corner of a
+    // square box, `EDGE_OFFSET + 16 / (DIAMOND_FACTOR 16 sqrt 2)` at an
+    // edge midpoint.
     let g = parsed_gradient(&black_to_white(b"Dmnd", 0.0, 100.0, false));
     near(g.position(32.0, 32.0, b), 1.0);
-    near(g.position(32.0, 16.0, b), 0.5);
+    near(g.position(32.0, 16.0, b), 0.839_86);
     // The box offset moves the centre (percent of the box).
     let mut moved = parsed_gradient(&black_to_white(b"Lnr ", 0.0, 100.0, false));
     moved.offset = (25.0, 0.0);
@@ -641,4 +644,56 @@ fn a_drawn_fills_buffer_is_charged_unless_it_is_the_shapes_own_charged_raster() 
     assert_eq!(super::fill_pixel_charge(Some(&raster(false)), 0.5, region), 100);
     assert_eq!(super::fill_pixel_charge(Some(&raster(true)), 1.0, region), 100);
     assert_eq!(super::fill_pixel_charge(None, 1.0, region), 100);
+}
+
+/// Photoshop's own pixels (`gradient-styles.psd`, shapes of 32 x 32 px
+/// filled red to white, Smoothness 100 %, G channel = the ramp position
+/// through the smoothed transition, dithered by about 1-2 levels), sampled
+/// by hand, against the drawn fill's maths. Bounds are the fit's own mean
+/// error (Linear about 1, Radial about 1-2 levels) plus margin; the plain
+/// straight ramp and the old Diamond radius both fail them.
+#[test]
+fn drawn_gradients_follow_photoshops_pixels() {
+    let red_white = |style: &'static [u8; 4], angle: f64, reverse: bool| {
+        let block = gradient_block(
+            style,
+            angle,
+            100.0,
+            reverse,
+            vec![colour_stop(255.0, 0.0, 0.0, 0, 50), colour_stop(255.0, 255.0, 255.0, 4096, 50)],
+            vec![],
+        );
+        parsed_gradient(&block)
+    };
+    let level = |g: &fill::Gradient, b: aurora_core::Rect, x: f64, y: f64| {
+        f64::from(g.at(g.position(x, y, b)).0[1]) * 255.0
+    };
+    // Linear 30 degrees, box (0, 0, 32, 32): row y = 11, x = 2, 5, ..., 29.
+    let b = square(32);
+    let g = red_white(b"Lnr ", 30.0, false);
+    let photoshop = [48.0, 68.0, 88.0, 111.0, 133.0, 155.0, 176.0, 196.0, 215.0, 231.0];
+    for (i, want) in photoshop.iter().enumerate() {
+        let got = level(&g, b, 2.0 + 3.0 * i as f64, 11.0);
+        assert!((got - want).abs() < 6.0, "linear x {}: {got} vs {want}", 2 + 3 * i);
+    }
+    // Radial, box (32, 0, 32, 32), centre pixel (48, 16): the row to the
+    // right of the centre.
+    let b = aurora_core::Rect { x: 32, y: 0, width: 32, height: 32 };
+    let g = red_white(b"Rdl ", 30.0, false);
+    let row = [
+        0.0, 8.0, 17.0, 29.0, 42.0, 56.0, 71.0, 87.0, 104.0, 120.0, 137.0, 153.0, 170.0, 186.0,
+        201.0, 215.0, 228.0,
+    ];
+    for (k, want) in row.iter().enumerate().skip(1) {
+        let got = level(&g, b, 48.0 + k as f64, 16.0);
+        assert!((got - want).abs() < 8.0, "radial k {k}: {got} vs {want}");
+    }
+    // Diamond, 30 degrees (rotated square), box (128, 0, 32, 32): the
+    // anti-diagonal is not on the axes, so use the sums along the first
+    // axis instead -- Photoshop's pixel at the diamond's own corner
+    // distance is saturated white (255) and the centre is near 0.
+    let b = aurora_core::Rect { x: 128, y: 0, width: 32, height: 32 };
+    let g = red_white(b"Dmnd", 0.0, false);
+    assert!(level(&g, b, 144.0, 16.0) < 12.0, "diamond centre");
+    assert!(level(&g, b, 144.0 + 20.0, 16.0) > 250.0, "diamond edge 20 px out is white");
 }

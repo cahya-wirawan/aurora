@@ -10,6 +10,16 @@
 
 use crate::Rect;
 
+/// Where a Radial or Diamond gradient starts: Photoshop's centre pixel is
+/// already 7 % into the ramp (fitted, task 147).
+pub const EDGE_OFFSET: f64 = 0.07;
+/// Fitted fraction of the nominal radius at which Photoshop's Radial style
+/// reaches the end colour (task 147; see [`GradientFill::frame`]).
+pub const RADIAL_FACTOR: f64 = 0.96;
+/// The same for the Diamond style, whose nominal radius is the Radial one
+/// (the earlier `scale (w + h) / 2` was about 1.5 times too large).
+pub const DIAMOND_FACTOR: f64 = 0.92;
+
 /// The most colour (and transparency) stops a gradient may hold.
 pub const MAX_GRADIENT_STOPS: usize = 256;
 
@@ -50,6 +60,14 @@ pub struct GradientFill {
     pub align: bool,
     /// Percent of the box width and height.
     pub offset: (f64, f64),
+    /// The ramp between stops is straight instead of Photoshop's smoothed
+    /// transition (Smoothness 100 %, the default: each segment's fraction
+    /// `u` becomes `3u^2 - 2u^3`, task 147). A `#[serde(skip)]` field so
+    /// the `.aur` wire is unchanged: a stored gradient reads back smoothed.
+    /// Set for Smoothness 0 and for a CMYK gradient's ink-space sub-stops
+    /// (which are never stored).
+    #[serde(skip)]
+    pub linear_ramp: bool,
 }
 
 /// A gradient fill refused by [`GradientFill::validate`].
@@ -60,7 +78,12 @@ pub struct GradientError {
 }
 
 #[allow(clippy::many_single_char_names)] // ramp maths, as in `aurora-io`'s old copy
-fn ramp<T: Copy>(stops: &[FillStop<T>], t: f32, lerp: impl Fn(T, T, f32) -> T) -> Option<T> {
+fn ramp<T: Copy>(
+    stops: &[FillStop<T>],
+    t: f32,
+    smooth: bool,
+    lerp: impl Fn(T, T, f32) -> T,
+) -> Option<T> {
     let first = stops.first()?;
     let last = stops.last()?;
     if t <= first.pos {
@@ -77,6 +100,12 @@ fn ramp<T: Copy>(stops: &[FillStop<T>], t: f32, lerp: impl Fn(T, T, f32) -> T) -
             let m = a.mid.clamp(0.001, 0.999);
             if (m - 0.5).abs() > 1e-6 {
                 u = u.powf(0.5_f32.ln() / m.ln());
+            }
+            if smooth {
+                // Measured on Photoshop's own gradient-styles.psd shapes:
+                // the mean error of a 2-stop Linear fell from 2.15 to 1.1
+                // levels (and a 32-stop one on the overlay corpus).
+                u = u * u * (3.0 - 2.0 * u);
             }
             return Some(lerp(a.value, b.value, u));
         }
@@ -160,8 +189,9 @@ impl GradientFill {
                 a[2] + (b[2] - a[2]) * u,
             ]
         };
-        let rgb = ramp(&self.colours, t, lerp3).unwrap_or([0.0; 3]);
-        let alpha = ramp(&self.alphas, t, |a, b, u| a + (b - a) * u).unwrap_or(1.0);
+        let smooth = !self.linear_ramp;
+        let rgb = ramp(&self.colours, t, smooth, lerp3).unwrap_or([0.0; 3]);
+        let alpha = ramp(&self.alphas, t, smooth, |a, b, u| a + (b - a) * u).unwrap_or(1.0);
         (rgb, alpha)
     }
 
@@ -171,10 +201,19 @@ impl GradientFill {
     /// `L = scale * (w |cos a| + h |sin a|)`:
     ///
     /// - Linear: `t = 0.5 + (p - c) . d / L`;
-    /// - Reflected: `t = |(p - c) . d| / (L / 2)`;
-    /// - Radial: `t = |p - c| / (scale * hypot(w, h) / 2)`;
-    /// - Diamond: `t = (|u| + |v|) / (scale * (w + h) / 2)`;
+    /// - Reflected: `t = |(p - c) . d| / (L / 2)` (unchanged: the fit to
+    ///   Photoshop's pixels is poor, 9 levels, and its 4 x 4 fixtures
+    ///   contradict any offset);
+    /// - Radial: `t = EDGE_OFFSET + |p - c| / (RADIAL_FACTOR scale hypot(w, h) / 2)`;
+    /// - Diamond: `t = EDGE_OFFSET + (|u| + |v|) / (DIAMOND_FACTOR scale hypot(w, h) / 2)`;
     /// - Angle: `t = ((deg(atan2(y, x)) + a) mod 360) / 360`.
+    ///
+    /// Radial and Diamond carry fitted constants (task 147): Photoshop's
+    /// own pixels for the 32 x 32 shapes of `gradient-styles.psd` (red to
+    /// white, Smoothness 100 %, angles 30, 60 and -60 degrees, scales 100
+    /// and 50 %) fit them within 2 (Radial) and 3 (Diamond) levels mean
+    /// error, where the earlier formulas were 20-23 levels off with the
+    /// smoothing. Fitted on one box size only.
     #[must_use]
     pub fn frame(&self, b: Rect) -> GradientFrame<'_> {
         let (w, h) = (f64::from(b.width), f64::from(b.height));
@@ -189,8 +228,8 @@ impl GradientFill {
             cos,
             sin,
             length: (self.scale * (w * cos.abs() + h * sin.abs())).max(1e-9),
-            radius: (self.scale * w.hypot(h) / 2.0).max(1e-9),
-            diamond: (self.scale * (w + h) / 2.0).max(1e-9),
+            radius: (RADIAL_FACTOR * self.scale * w.hypot(h) / 2.0).max(1e-9),
+            diamond: (DIAMOND_FACTOR * self.scale * w.hypot(h) / 2.0).max(1e-9),
         }
     }
 
@@ -227,8 +266,8 @@ impl GradientFrame<'_> {
         let t = match g.style {
             GradientStyle::Linear => 0.5 + along / self.length,
             GradientStyle::Reflected => along.abs() / (self.length / 2.0),
-            GradientStyle::Radial => dx.hypot(dy) / self.radius,
-            GradientStyle::Diamond => (along.abs() + across.abs()) / self.diamond,
+            GradientStyle::Radial => EDGE_OFFSET + dx.hypot(dy) / self.radius,
+            GradientStyle::Diamond => EDGE_OFFSET + (along.abs() + across.abs()) / self.diamond,
             GradientStyle::Angle => (dy.atan2(dx).to_degrees() + g.angle).rem_euclid(360.0) / 360.0,
         };
         #[allow(clippy::cast_possible_truncation)] // clamped to 0..=1
