@@ -558,7 +558,9 @@ fn predict(data: &mut [u8], row_bytes: usize, bps: usize) {
             let copy = row.to_vec();
             for i in 0..n {
                 for k in 0..4 {
-                    row[k * n + i] = copy[i * 4 + k];
+                    if let (Some(dst), Some(src)) = (row.get_mut(k * n + i), copy.get(i * 4 + k)) {
+                        *dst = *src;
+                    }
                 }
             }
             let mut previous: u8 = 0;

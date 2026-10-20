@@ -104,6 +104,7 @@ pub(super) enum Fill {
 pub(super) type CmykColours<'a> = Option<&'a crate::colour_cmyk::CmykConverter>;
 
 /// Parses a `SoCo` or `GdFl` block (`PtFl` is [`LeftOut::Pattern`]).
+#[cfg(test)]
 pub(super) fn parse(key: [u8; 4], data: &[u8]) -> Result<Fill, LeftOut> {
     parse_in(key, data, None)
 }
@@ -131,10 +132,6 @@ pub(super) fn parse_in(key: [u8; 4], data: &[u8], cmyk: CmykColours<'_>) -> Resu
 
 /// An `RGBC` (0..255), grey (`Grsc`, ink percent) or, in a CMYK file,
 /// `CMYC` (four ink percentages) colour descriptor.
-fn colour(c: &Descriptor) -> Result<[f32; 3], LeftOut> {
-    colour_in(c, None)
-}
-
 fn colour_in(c: &Descriptor, cmyk: CmykColours<'_>) -> Result<[f32; 3], LeftOut> {
     let channel = |key: &[u8]| -> Option<f32> {
         let v = c.get(key)?.number()?;
@@ -359,6 +356,7 @@ pub(super) enum ArtboardLeft {
 /// (type `3`, nothing to draw). Type `4` is a custom colour
 /// (`artboard-bgcolor.psd`: Photoshop's merged image shows exactly the
 /// `Clr ` colour inside `artboardRect`); the other types are not drawn.
+#[cfg(test)]
 pub(super) fn parse_artboard(data: &[u8]) -> Result<Option<ArtboardBackground>, ArtboardLeft> {
     parse_artboard_in(data, None)
 }

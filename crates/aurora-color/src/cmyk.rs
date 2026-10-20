@@ -152,6 +152,7 @@ fn s15(v: f64) -> [u8; 4] {
 }
 
 /// Encoded sRGB to CIE Lab (D50, Bradford-adapted), `f64`.
+#[allow(clippy::many_single_char_names)] // r, g, b, x, y, z, l: the colour maths' own names
 fn srgb_to_lab(rgb: [f64; 3]) -> [f64; 3] {
     let lin = |c: f64| {
         if c <= 0.040_45 {
@@ -279,6 +280,7 @@ fn synthetic_cmyk_bytes() -> Vec<u8> {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::float_cmp)] // fixed arrays built here; exact constants
 mod tests {
     use super::*;
 

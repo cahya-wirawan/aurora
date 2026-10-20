@@ -64,9 +64,7 @@ impl CmykConverter {
     }
 
     fn take(&self) -> Option<CmykTransform> {
-        if self.profile.is_none() {
-            return None;
-        }
+        self.profile.as_ref()?;
         if let Some(t) = self.idle.lock().ok().and_then(|mut idle| idle.pop()) {
             return Some(t);
         }

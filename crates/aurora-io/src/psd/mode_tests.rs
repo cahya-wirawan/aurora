@@ -2,6 +2,13 @@
 //! built in-test, the tracked 32-bit psd-tools fixture, hostile headers,
 //! and a sweep over the refused-until-now corpus files.
 
+// Tests index fixed-size arrays they built and compare exact constants.
+#![allow(
+    clippy::indexing_slicing,
+    clippy::float_cmp,
+    clippy::many_single_char_names
+)]
+
 use aurora_color::{CmykTransform, IccProfile, Transform};
 use half::f16;
 

@@ -3254,7 +3254,6 @@ fn decode_pending(
         return decode_pending_cmyk(pending, src, profile, width, height, bps);
     }
     if let Some(samples) = decode_four_channels(pending, src, width, height, bps)? {
-        let samples = samples;
         profile.note_if_bright(header, &samples);
         return Image::new(pending.width, pending.height, profile.get(), samples);
     }
@@ -3280,6 +3279,7 @@ fn decode_pending(
 /// are decoded one at a time and converted to the working space in one
 /// pass ([`colour_cmyk::CmykConverter::convert_planes`]); the layer's image
 /// is therefore already sRGB.
+#[allow(clippy::many_single_char_names)] // c, m, y, k, a: the planes' own names
 fn decode_pending_cmyk(
     pending: &PendingPixels,
     src: &mut dyn ByteSource,
@@ -3334,6 +3334,7 @@ fn channel_threads() -> usize {
 /// `f16` buffer in one pass through the promotion tables. `Ok(None)` when
 /// the layer is not that case (the caller takes the general path); the
 /// values and every check are the general path's.
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)] // one arm per sample width
 fn decode_four_channels(
     pending: &PendingPixels,
     src: &mut dyn ByteSource,
@@ -4157,6 +4158,7 @@ fn other_adjustment_node(
 
 /// One non-divider record as a layer node, or `None` when it is left out
 /// (an adjustment layer, or a fill layer with no pixels).
+#[allow(clippy::too_many_lines)] // one branch per layer kind
 fn layer_node(
     src: &mut dyn ByteSource,
     record: &Record,
@@ -4165,16 +4167,15 @@ fn layer_node(
     vector_budget: &mut vector::Budget,
     cmyk: fill::CmykColours<'_>,
 ) -> Option<PsdNode> {
-    if header.colours_unchecked() {
-        if record.features.adjustment
+    if header.colours_unchecked()
+        && (record.features.adjustment
             || record.curves.is_some()
             || record.levels.is_some()
             || record.hue_saturation.is_some()
-            || record.other_adjustment.is_some()
-        {
-            notes.add(Note::AdjustmentLeftOutInMode);
-            return None;
-        }
+            || record.other_adjustment.is_some())
+    {
+        notes.add(Note::AdjustmentLeftOutInMode);
+        return None;
     }
     if let (Some(curves), false) = (&record.curves, record.features.adjustment) {
         let params = match curves {
@@ -4975,6 +4976,7 @@ impl MergedPlanes for CmykPlanes {
 /// A CMYK file's planes are converted to sRGB through `cmyk` (task 146),
 /// so its image is in the working space; a 32-bit file's is its stored
 /// (linear) float values as `f16`, for the caller to convert.
+#[allow(clippy::many_single_char_names)] // c, m, y, k, a: the planes' own names
 fn decode_merged(
     r: &mut Reader<'_>,
     header: Header,
