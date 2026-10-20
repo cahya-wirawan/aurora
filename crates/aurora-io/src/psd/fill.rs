@@ -205,6 +205,81 @@ fn stops<T>(
     Ok(out)
 }
 
+/// A `CMYC` colour's four ink coverages (`0..=1`), if `c` is one.
+fn ink_of(c: &Descriptor) -> Option<[f32; 4]> {
+    let ink = |key: &[u8]| -> Option<f32> {
+        let v = c.get(key)?.number()?;
+        v.is_finite().then(|| (v / 100.0).clamp(0.0, 1.0) as f32)
+    };
+    Some([ink(b"Cyn ")?, ink(b"Mgnt")?, ink(b"Ylw ")?, ink(b"Blck")?])
+}
+
+/// Sub-stops per segment of a CMYK gradient.
+const INK_SUBDIVISIONS: usize = 16;
+
+/// A CMYK file's gradient stops as sRGB stops (task 146). Photoshop blends
+/// a CMYK gradient in ink space (measured on `4x4_16bit_cmyk.psd`: the
+/// half-way colour of a segment is the conversion of the *mean ink*, within
+/// 3 levels of Photoshop's merged image, where the mean of the converted
+/// colours is 23 levels off), but the ramp interpolates sRGB. So each
+/// segment is cut into [`INK_SUBDIVISIONS`] pieces whose stops are the
+/// converted ink-space colours (the midpoint applied as the ramp would),
+/// and the ramp blends only between those close stops. Fewer pieces when
+/// the stop budget is short; none when a stop is not a `CMYC` colour.
+fn expand_ink_stops(
+    coloured: &[Stop<([f32; 3], Option<[f32; 4]>)>],
+    conv: &crate::colour_cmyk::CmykConverter,
+) -> Vec<Stop<[f32; 3]>> {
+    let plain = |s: &Stop<([f32; 3], Option<[f32; 4]>)>| Stop {
+        pos: s.pos,
+        mid: s.mid,
+        value: s.value.0,
+    };
+    let segments = coloured.len().saturating_sub(1);
+    let per = if segments == 0 {
+        1
+    } else {
+        INK_SUBDIVISIONS.min((MAX_STOPS - coloured.len()) / segments + 1)
+    };
+    if per < 2 || coloured.iter().any(|s| s.value.1.is_none()) {
+        return coloured.iter().map(plain).collect();
+    }
+    let mut out = Vec::with_capacity(coloured.len() + segments * (per - 1));
+    for (i, a) in coloured.iter().enumerate() {
+        out.push(Stop {
+            mid: 0.5,
+            ..plain(a)
+        });
+        let Some(b) = coloured.get(i + 1) else { break };
+        let (Some(ia), Some(ib)) = (a.value.1, b.value.1) else {
+            break;
+        };
+        let m = a.mid.clamp(0.001, 0.999);
+        let curve = if (m - 0.5).abs() > 1e-6 {
+            0.5_f32.ln() / m.ln()
+        } else {
+            1.0
+        };
+        for j in 1..per {
+            let u = j as f32 / per as f32;
+            let f = u.powf(curve);
+            let ink = [0, 1, 2, 3].map(|k| {
+                let (x, y) = (
+                    ia.get(k).copied().unwrap_or(0.0),
+                    ib.get(k).copied().unwrap_or(0.0),
+                );
+                x + (y - x) * f
+            });
+            out.push(Stop {
+                pos: a.pos + (b.pos - a.pos) * u,
+                mid: 0.5,
+                value: conv.colour(ink),
+            });
+        }
+    }
+    out
+}
+
 pub(super) fn gradient(d: &Descriptor) -> Result<Gradient, LeftOut> {
     gradient_in(d, None)
 }
@@ -217,14 +292,24 @@ pub(super) fn gradient_in(d: &Descriptor, cmyk: CmykColours<'_>) -> Result<Gradi
     if grad.get(b"GrdF").and_then(Value::enum_value) != Some(b"CstS") {
         return Err(LeftOut::Noise);
     }
-    let colours = stops(grad.get(b"Clrs").ok_or(LeftOut::Unreadable)?, |s| {
-        colour_in(
-            s.get(b"Clr ")
-                .and_then(Value::descriptor)
-                .ok_or(LeftOut::Unreadable)?,
-            cmyk,
-        )
+    let coloured = stops(grad.get(b"Clrs").ok_or(LeftOut::Unreadable)?, |s| {
+        let c = s
+            .get(b"Clr ")
+            .and_then(Value::descriptor)
+            .ok_or(LeftOut::Unreadable)?;
+        Ok((colour_in(c, cmyk)?, cmyk.and_then(|_| ink_of(c))))
     })?;
+    let colours = match cmyk {
+        Some(conv) => expand_ink_stops(&coloured, conv),
+        None => coloured
+            .iter()
+            .map(|s| Stop {
+                pos: s.pos,
+                mid: s.mid,
+                value: s.value.0,
+            })
+            .collect(),
+    };
     if colours.is_empty() {
         return Err(LeftOut::Unreadable);
     }

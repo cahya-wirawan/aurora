@@ -441,7 +441,7 @@ fn descriptor_budget_is_shared_and_spent() {
 
 /// Every `key` effects block in a PSD's raw bytes, found by its `8BIM`
 /// signature (both are 4-byte-length keys).
-fn raw_blocks(file: &[u8], key: &[u8; 4]) -> Vec<Vec<u8>> {
+pub(super) fn raw_blocks(file: &[u8], key: &[u8; 4]) -> Vec<Vec<u8>> {
     let mut sig = b"8BIM".to_vec();
     sig.extend_from_slice(key);
     let mut out = Vec::new();

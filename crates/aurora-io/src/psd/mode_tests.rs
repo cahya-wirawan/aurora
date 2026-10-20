@@ -1069,3 +1069,160 @@ fn solid_fill_layers_without_pixels_are_drawn_in_cmyk_and_32_bit_files() {
     let got = first_pixels(&open(&float), 1)[0];
     assert!(near(got, [0.8404, 0.2347, 0.2347, 1.0], 2e-3), "{got:?}");
 }
+
+fn colormodes_file(name: &str) -> Option<Vec<u8>> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../corpora/psd/reference/psd-tools-fixtures/colormodes")
+        .join(name);
+    match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            println!("SKIPPED: corpus file {name} not present");
+            assert!(
+                std::env::var_os("AURORA_REQUIRE_CORPUS").is_none(),
+                "AURORA_REQUIRE_CORPUS is set and {name} is missing"
+            );
+            None
+        }
+    }
+}
+
+fn gradient_of(
+    file: &[u8],
+    cmyk: Option<&crate::colour_cmyk::CmykConverter>,
+) -> super::fill::Gradient {
+    let Some(block) = super::effects_tests::raw_blocks(file, b"GdFl")
+        .into_iter()
+        .next()
+    else {
+        unreachable!("a gradient fill block")
+    };
+    match super::fill::parse_in(*b"GdFl", &block, cmyk) {
+        Ok(super::fill::Fill::Gradient(g)) => g,
+        other => unreachable!("{other:?}"),
+    }
+}
+
+fn levels(c: [f32; 3]) -> [i32; 3] {
+    c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as i32)
+}
+
+fn within(a: [i32; 3], b: [i32; 3], tol: i32) -> bool {
+    a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol)
+}
+
+/// The merged image's 16 pixels as 8-bit RGB levels.
+fn merged_levels(file: &[u8]) -> Vec<[i32; 3]> {
+    let image = match merged_image_in_working_space(file) {
+        Ok(i) => i,
+        Err(e) => unreachable!("{e:?}"),
+    };
+    image
+        .samples()
+        .chunks_exact(4)
+        .map(|p| levels([p[0].to_f32(), p[1].to_f32(), p[2].to_f32()]))
+        .collect()
+}
+
+/// Why `4x4_16bit_cmyk`, `4x4_32bit_rgb` and `4x4_32bit_grayscale` (the
+/// gradient-only 4 x 4 files) score 21-27 levels against Photoshop's merged
+/// image, pinned with Photoshop's own numbers:
+///
+/// - **Colour space is right (and was a real second cause for CMYK).** A
+///   32-bit gradient blends in linear light: its half-way colour (the
+///   merged image's pixel one step off the diagonal) is Photoshop's
+///   (188, 0, 130), which is what the linear stops give. A CMYK gradient
+///   blends in *ink* space: the half-way colour is the conversion of the
+///   mean ink, within 4 levels of Photoshop's (149, 42, 89), where blending
+///   the converted colours is 20+ levels off. `gradient_in` now expands
+///   CMYK stops in ink space.
+/// - **Geometry is the rest, and is not a colour-mode problem.** Every pixel
+///   of Photoshop's merged image depends only on |x - y| (a 45-degree axis
+///   across the diagonal), though the descriptor says Reflected at 30
+///   degrees; Aurora applies the 30 degrees. The plain 16-bit RGB file
+///   `4x4_16bit_rgb.psd` has the same gradient and scored 26.46 before this
+///   task (the audit's baseline), so the gradient length/axis for a 4 x 4
+///   canvas is a pre-existing, documented imprecision (0.251.0/0.253.0:
+///   "gradient length is not matched to Photoshop"), not something CMYK or
+///   32-bit reading introduced.
+#[test]
+fn the_gradient_only_4x4_files_differ_in_geometry_not_in_colour() {
+    let (Some(cmyk), Some(rgb32), Some(gray32), Some(rgb16)) = (
+        colormodes_file("4x4_16bit_cmyk.psd"),
+        colormodes_file("4x4_32bit_rgb.psd"),
+        colormodes_file("4x4_32bit_grayscale.psd"),
+        colormodes_file("4x4_16bit_rgb.psd"),
+    ) else {
+        return;
+    };
+    // Photoshop's pixels depend on |x - y| only, in all four files.
+    for (name, file) in [
+        ("cmyk", &cmyk),
+        ("32 rgb", &rgb32),
+        ("32 grey", &gray32),
+        ("16 rgb", &rgb16),
+    ] {
+        let m = merged_levels(file);
+        for y in 0..4_usize {
+            for x in 0..4_usize {
+                let (a, b) = (m[y * 4 + x], m[x.abs_diff(y)]);
+                assert!(within(a, b, 1), "{name}: ({x},{y}) {a:?} vs {b:?}");
+            }
+        }
+    }
+    // The descriptor is Reflected at 30 degrees in all of them.
+    let g16 = gradient_of(&rgb16, None);
+    assert_eq!(g16.style, super::fill::Style::Reflected);
+    assert!((g16.angle - 30.0).abs() < 1e-9);
+    // 32-bit RGB: linear stops, blended in linear light, then encoded.
+    let g32 = gradient_of(&rgb32, None);
+    let (mid, _) = g32.at(0.25);
+    let encode = |v: f32| -> f32 {
+        if v <= 0.003_130_8 {
+            12.92 * v
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        }
+    };
+    let ps = merged_levels(&rgb32);
+    assert!(
+        within(levels(mid.map(encode)), ps[1], 2),
+        "{:?} vs {:?}",
+        levels(mid.map(encode)),
+        ps[1]
+    );
+    // CMYK: ink-space blending, through the file's own profile.
+    let profile = extract_profile(&cmyk);
+    let converter = crate::colour_cmyk::CmykConverter::new(Some(profile));
+    let gc = gradient_of(&cmyk, Some(&converter));
+    let (mid, _) = gc.at(0.25);
+    let ps = merged_levels(&cmyk);
+    assert!(
+        within(levels(mid), ps[1], 4),
+        "{:?} vs {:?}",
+        levels(mid),
+        ps[1]
+    );
+}
+
+/// Resource 1039 (the ICC profile) of a PSD's raw bytes.
+fn extract_profile(bytes: &[u8]) -> Vec<u8> {
+    let be32 = |at: usize| {
+        u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize
+    };
+    let mode = be32(26);
+    let mut at = 30 + mode + 4;
+    let end = at + be32(30 + mode);
+    while at + 12 <= end {
+        let id = u16::from_be_bytes([bytes[at + 4], bytes[at + 5]]);
+        let name = usize::from(bytes[at + 6]) + 1;
+        let name = name + name % 2;
+        let size = be32(at + 6 + name);
+        let body = at + 6 + name + 4;
+        if id == 1039 {
+            return bytes[body..body + size].to_vec();
+        }
+        at = body + size + size % 2;
+    }
+    Vec::new()
+}
