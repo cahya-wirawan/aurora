@@ -306,10 +306,14 @@ fn one_hundred_percent_centres_a_small_document_and_is_unchanged_for_a_large_one
             v.pan_by((-120.0, -80.0));
             apply_view_zoom(v, ViewZoom::ActualPixels, canvas, (4000, 3000), scale);
         }
+        // The app clamps the near edge after every zoom; the fitted view
+        // already holds the document over the area (task 144), which the
+        // unfitted one reaches only through that clamp.
+        without.clamp_pan_to_minimum((0.0, 0.0));
         assert_eq!(with.centred(), (false, false));
         assert_eq!(with.zoom().to_bits(), without.zoom().to_bits());
-        assert_eq!(with.pan().0.to_bits(), without.pan().0.to_bits());
-        assert_eq!(with.pan().1.to_bits(), without.pan().1.to_bits());
+        // Equal as numbers: a clamp may leave `-0.0` where the bound leaves `0.0`.
+        assert_eq!(with.pan(), without.pan());
     }
 }
 
@@ -383,8 +387,8 @@ fn the_frame_and_the_events_use_the_same_centred_view() {
         .next()
         .unwrap_or(source);
     assert!(
-        production.matches("self.sync_view_fit();").count() >= 5,
-        "a resize, a frame, a pointer move, a press and a wheel step each sync the fit"
+        production.matches("self.sync_view_fit();").count() >= 6,
+        "a resize, a frame, a pointer move, a press, a wheel step and a view command each sync the fit"
     );
     assert!(
         production.contains("zoomed_view::placement("),
@@ -403,4 +407,220 @@ fn the_frame_and_the_events_use_the_same_centred_view() {
         !production.contains("fn apply_zoomed_out_centring"),
         "the zoomed-out-only centring is gone: the view centres at every zoom"
     );
+}
+
+// ------------------------- a wheel zoom under a live drag, small document
+
+fn wheel(steps: f32) -> winit::event::MouseScrollDelta {
+    winit::event::MouseScrollDelta::LineDelta(0.0, steps)
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_wheel_zoom_mid_drag_on_a_small_document_leaves_the_fixed_references_alone() {
+    let canvas = (1000.0, 700.0);
+    let mut layers = aurora_doc::LayerTree::new();
+    let bounds = aurora_core::Rect {
+        x: 0,
+        y: 0,
+        width: 300,
+        height: 200,
+    };
+    let Ok(layer) = layers.add_pixel_layer("layer", bounds, None) else {
+        unreachable!("a layer fits");
+    };
+    for scale in [1.0_f32, 2.0] {
+        for steps in [2.0_f32, -3.0] {
+            let anchor = (200.0, 150.0);
+            let mut view = view_with(canvas, (300, 200), scale);
+            view.zoom_at((500.0, 350.0), 1.0);
+            let start_screen = (480.0, 330.0);
+
+            // Marquee.
+            let Some(mut drag) = begin_drag(
+                Tool::MarqueeSelect,
+                PointerButton::Primary,
+                start_screen,
+                &view,
+                None,
+            ) else {
+                unreachable!("a marquee press starts a drag");
+            };
+            let before = crate::drag_reference(&drag);
+            crate::apply_scroll_zoom(
+                &mut view,
+                Some(&mut drag),
+                anchor,
+                wheel(steps),
+                bounds_for(canvas),
+            );
+            assert_eq!(
+                crate::drag_reference(&drag),
+                before,
+                "marquee, scale {scale} steps {steps}"
+            );
+            assert_eq!(view.centred(), (true, true), "the document stayed small");
+            view.zoom_at((500.0, 350.0), 1.0);
+
+            // Move.
+            let Some(mut drag) = begin_drag(
+                Tool::Move,
+                PointerButton::Primary,
+                start_screen,
+                &view,
+                Some((layer, bounds)),
+            ) else {
+                unreachable!("a move press starts a drag");
+            };
+            let before = crate::drag_reference(&drag);
+            crate::apply_scroll_zoom(
+                &mut view,
+                Some(&mut drag),
+                anchor,
+                wheel(steps),
+                bounds_for(canvas),
+            );
+            assert_eq!(
+                crate::drag_reference(&drag),
+                before,
+                "move, scale {scale} steps {steps}"
+            );
+            view.zoom_at((500.0, 350.0), 1.0);
+
+            // Lasso: every vertex of the path stays.
+            let Some(mut drag) = begin_drag(
+                Tool::Lasso,
+                PointerButton::Primary,
+                start_screen,
+                &view,
+                None,
+            ) else {
+                unreachable!("a lasso press starts a drag");
+            };
+            let mut selection = aurora_doc::SelectionSet::new();
+            let _ = continue_drag(
+                &mut drag,
+                (500.0, 340.0),
+                &mut view,
+                &mut selection,
+                &ToolSettings::default(),
+                bounds_for(canvas),
+            );
+            let points_before = match &drag {
+                Drag::Lasso { points, .. } => points.clone(),
+                _ => unreachable!("a lasso drag"),
+            };
+            crate::apply_scroll_zoom(
+                &mut view,
+                Some(&mut drag),
+                anchor,
+                wheel(steps),
+                bounds_for(canvas),
+            );
+            match &drag {
+                Drag::Lasso { points, .. } => {
+                    assert_eq!(points, &points_before, "lasso, scale {scale}");
+                }
+                _ => unreachable!("a lasso drag"),
+            }
+            view.zoom_at((500.0, 350.0), 1.0);
+
+            // Gradient: the start stays, the end follows the pointer.
+            let Some(mut drag) = begin_drag(
+                Tool::Gradient,
+                PointerButton::Primary,
+                start_screen,
+                &view,
+                None,
+            ) else {
+                unreachable!("a gradient press starts a drag");
+            };
+            let _ = continue_drag(
+                &mut drag,
+                anchor,
+                &mut view,
+                &mut selection,
+                &ToolSettings::default(),
+                bounds_for(canvas),
+            );
+            let start_before = match &drag {
+                Drag::Gradient { start_doc, .. } => *start_doc,
+                _ => unreachable!("a gradient drag"),
+            };
+            crate::apply_scroll_zoom(
+                &mut view,
+                Some(&mut drag),
+                anchor,
+                wheel(steps),
+                bounds_for(canvas),
+            );
+            match &drag {
+                Drag::Gradient {
+                    start_doc,
+                    current_doc,
+                } => {
+                    assert_eq!(*start_doc, start_before, "gradient start, scale {scale}");
+                    let under = view.to_document(anchor);
+                    assert!(
+                        (current_doc.0 - under.0).abs() < 1e-3
+                            && (current_doc.1 - under.1).abs() < 1e-3,
+                        "the end stays under the pointer: {current_doc:?} vs {under:?}"
+                    );
+                }
+                _ => unreachable!("a gradient drag"),
+            }
+        }
+    }
+}
+
+fn bounds_for(canvas: (f32, f32)) -> PanBounds {
+    bounds(canvas)
+}
+
+#[test]
+fn a_wheel_zoom_mid_stroke_on_a_small_document_paints_no_stray_line() {
+    let canvas = (1000.0, 700.0);
+    for scale in [1.0_f32, 2.0] {
+        for steps in [2.0_f32, -3.0] {
+            let mut view = view_with(canvas, (300, 200), scale);
+            let pointer = (330.0, 260.0);
+            let Some(mut drag) =
+                begin_drag(Tool::Brush, PointerButton::Primary, pointer, &view, None)
+            else {
+                unreachable!("a brush press starts a drag");
+            };
+            let mut selection = aurora_doc::SelectionSet::new();
+            let settings = ToolSettings::default();
+            // Move the pointer a little, as a stroke does.
+            let _ = continue_drag(
+                &mut drag,
+                (332.0, 262.0),
+                &mut view,
+                &mut selection,
+                &settings,
+                bounds(canvas),
+            );
+            // The pointer rests while the wheel zooms about it.
+            crate::apply_scroll_zoom(
+                &mut view,
+                Some(&mut drag),
+                (332.0, 262.0),
+                wheel(steps),
+                bounds(canvas),
+            );
+            let dabs = continue_drag(
+                &mut drag,
+                (332.0, 262.0),
+                &mut view,
+                &mut selection,
+                &settings,
+                bounds(canvas),
+            );
+            assert!(
+                dabs.is_empty(),
+                "scale {scale} steps {steps}: {} stray dabs",
+                dabs.len()
+            );
+        }
+    }
 }

@@ -313,6 +313,43 @@ impl CanvasView {
     /// does so symmetrically, so its position is continuous across the
     /// zoom at which it fills the area.
     pub fn zoom_at(&mut self, screen_anchor: (f32, f32), new_zoom: f32) {
+        let was_centred = self.centred_pan_per_axis();
+        self.zoom_unbounded(screen_anchor, new_zoom);
+        // An axis the document overflows before and after the zoom keeps
+        // the document covering the area (task 144): a pan outside
+        // `[canvas - extent, 0]` (the document panned away from its edges)
+        // is brought back into it, so that by the time the document shrinks
+        // to the area's size the pan is exactly the centred one and the
+        // zoom out through the fit size is continuous. Hand panning is not
+        // limited by this.
+        if let Some(fit) = self.fit {
+            let (now_x, now_y) = self.centred_pan_per_axis();
+            #[allow(clippy::cast_precision_loss)]
+            let bound = |pan: f32, canvas: f32, doc: u32| {
+                let lowest = canvas - doc as f32 * self.zoom;
+                if lowest.is_finite() && lowest <= 0.0 {
+                    pan.clamp(lowest, 0.0)
+                } else {
+                    pan
+                }
+            };
+            if was_centred.0.is_none() && now_x.is_none() {
+                self.pan.0 = bound(self.pan.0, fit.canvas.0, fit.doc.0);
+            }
+            // `now_*` is redundant with `bound`'s own `lowest <= 0.0` test (an
+            // axis that is centred afterwards has `lowest >= 0`, and its
+            // stored pan is not read), kept so the two axes read alike.
+            if was_centred.1.is_none() && now_y.is_none() {
+                self.pan.1 = bound(self.pan.1, fit.canvas.1, fit.doc.1);
+            }
+        }
+    }
+
+    /// [`Self::zoom_at`] without the bound on an overflowing axis: only the
+    /// anchor rule (a centred axis zooms about the area's centre). The
+    /// position a caller holding fixed document points measures a zoom's
+    /// own effect by.
+    pub fn zoom_unbounded(&mut self, screen_anchor: (f32, f32), new_zoom: f32) {
         let new_zoom = new_zoom.clamp(self.min_zoom(), MAX_ZOOM);
         let (cx, cy) = self.centred_pan_per_axis();
         let (half_w, half_h) = self
@@ -336,6 +373,12 @@ impl CanvasView {
             anchor.0 - doc_anchor.0 * new_zoom,
             anchor.1 - doc_anchor.1 * new_zoom,
         );
+    }
+
+    /// The stored pan, which on a centred axis is never read (test pin).
+    #[cfg(test)]
+    pub(crate) const fn stored_pan(&self) -> (f32, f32) {
+        self.pan
     }
 
     /// Clamps `pan` (per axis, independently) so that

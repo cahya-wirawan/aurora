@@ -14614,11 +14614,26 @@ fn apply_scroll_zoom(
     let before = view.to_document(anchor);
     let steps = zoom_steps_for_scroll(delta);
     let factor = ZOOM_WHEEL_BASE.powf(steps);
-    view.zoom_at(anchor, view.zoom() * factor);
+    let target = view.zoom() * factor;
+    // Where the zoom alone leaves the anchor's document point: `before` on
+    // an axis the document overflows (the zoom holds the anchor), but not
+    // on a centred axis (task 144), where the zoom is about the area's
+    // centre. The fixed references are corrected only for what the clamps
+    // add to that, never for the zoom's own part.
+    let zoomed = {
+        let mut probe = *view;
+        probe.zoom_unbounded(anchor, target);
+        probe.to_document(anchor)
+    };
+    view.zoom_at(anchor, target);
     bounds.apply(view);
     let after = view.to_document(anchor);
     if let Some(drag) = drag {
-        shift_drag_reference(drag, (after.0 - before.0, after.1 - before.1));
+        shift_drag_references(
+            drag,
+            (after.0 - zoomed.0, after.1 - zoomed.1),
+            (after.0 - before.0, after.1 - before.1),
+        );
     }
 }
 
@@ -14669,33 +14684,46 @@ fn apply_scroll_zoom(
 /// event), and an eyedropper holds no reference point at all — it
 /// samples wherever the pointer currently is.
 fn shift_drag_reference(drag: &mut Drag, delta: (f32, f32)) {
+    shift_drag_references(drag, delta, delta);
+}
+
+/// [`shift_drag_reference`] with two deltas (task 144): `fixed` for the
+/// references that are fixed document points (a Marquee's, Move's or
+/// Gradient's start, a Lasso's path), `tied` for those that follow the
+/// pointer (a Brush's, Eraser's or Quick Select's last point, the
+/// Gradient's current one). They differ only when a zoom itself moves the
+/// document point under the pointer, which it does on a centred axis, where
+/// it zooms about the area's centre: the pointer-tied references must follow
+/// to the new point under the pointer (no stray line), the fixed ones must
+/// not move at all for the zoom.
+fn shift_drag_references(drag: &mut Drag, fixed: (f32, f32), tied: (f32, f32)) {
     match drag {
         Drag::Marquee { start_doc, .. } | Drag::Move { start_doc, .. } => {
-            start_doc.0 += delta.0;
-            start_doc.1 += delta.1;
+            start_doc.0 += fixed.0;
+            start_doc.1 += fixed.1;
         }
         Drag::Brush { last_doc, .. } | Drag::Eraser { last_doc, .. } => {
-            last_doc.0 += delta.0;
-            last_doc.1 += delta.1;
+            last_doc.0 += tied.0;
+            last_doc.1 += tied.1;
         }
         Drag::Gradient {
             start_doc,
             current_doc,
         } => {
-            start_doc.0 += delta.0;
-            start_doc.1 += delta.1;
-            current_doc.0 += delta.0;
-            current_doc.1 += delta.1;
+            start_doc.0 += fixed.0;
+            start_doc.1 += fixed.1;
+            current_doc.0 += tied.0;
+            current_doc.1 += tied.1;
         }
         Drag::Lasso { points, .. } => {
             for point in points {
-                point.0 += delta.0;
-                point.1 += delta.1;
+                point.0 += fixed.0;
+                point.1 += fixed.1;
             }
         }
         Drag::QuickSelect(quick) => {
-            quick.last_doc.0 += delta.0;
-            quick.last_doc.1 += delta.1;
+            quick.last_doc.0 += tied.0;
+            quick.last_doc.1 += tied.1;
         }
         Drag::Pan { .. } | Drag::Eyedropper => {}
     }
@@ -30800,6 +30828,8 @@ fn apply_view_fit(
     pointer: Option<(f32, f32)>,
     fit: Option<aurora_ui::ViewFit>,
 ) {
+    // A short-circuit only: `set_fit` with the fit already held changes
+    // nothing and the measured drag shift would be zero.
     if view.fit() == fit {
         return;
     }
@@ -36144,6 +36174,9 @@ impl App {
     /// swap button.
     /// Fit on Screen or 100% (0.275.0, `zoomed_view::apply_view_zoom`).
     fn apply_view_zoom(&mut self, command: zoomed_view::ViewZoom) {
+        // A menu or key command can arrive before any frame or pointer event
+        // since the area or the document changed (task 144).
+        self.sync_view_fit();
         let Some(canvas) = canvas_area_logical_size(&self.workspace) else {
             return;
         };

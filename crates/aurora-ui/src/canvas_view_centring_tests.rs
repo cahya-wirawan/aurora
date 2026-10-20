@@ -355,6 +355,10 @@ fn the_clamps_still_bound_an_axis_the_document_overflows() {
 struct Old {
     pan: (f32, f32),
     zoom: f32,
+    /// `Some((canvas, doc))` adds task 144's zoom bound on an overflowing
+    /// axis (the one change to a large document's maths); `None` is the
+    /// old view verbatim.
+    bound: Option<((f32, f32), (u32, u32))>,
 }
 
 impl Old {
@@ -370,6 +374,16 @@ impl Old {
         let d = self.doc_at(anchor);
         self.zoom = new_zoom;
         self.pan = (anchor.0 - d.0 * new_zoom, anchor.1 - d.1 * new_zoom);
+        if let Some((canvas, doc)) = self.bound {
+            let lowest = (
+                canvas.0 - doc.0 as f32 * new_zoom,
+                canvas.1 - doc.1 as f32 * new_zoom,
+            );
+            self.pan = (
+                self.pan.0.clamp(lowest.0, 0.0),
+                self.pan.1.clamp(lowest.1, 0.0),
+            );
+        }
     }
 
     fn clamp_min(&mut self, min_doc: (f32, f32)) {
@@ -396,7 +410,7 @@ impl Old {
 }
 
 #[test]
-fn a_document_larger_than_the_area_on_both_axes_is_bit_identical_to_the_old_maths() {
+fn a_document_larger_than_the_area_on_both_axes_is_the_old_maths_plus_the_zoom_bound() {
     let mut rng = Rng(0x0dd_ba11_cafe_f00d);
     let mut compared = 0_u32;
     for round in 0..300 {
@@ -411,6 +425,7 @@ fn a_document_larger_than_the_area_on_both_axes_is_bit_identical_to_the_old_math
         let mut old = Old {
             pan: (0.0, 0.0),
             zoom: 1.0,
+            bound: Some((canvas, doc)),
         };
         for _ in 0..40 {
             match rng.int(0, 3) {
@@ -459,6 +474,7 @@ fn a_view_with_no_fit_is_bit_identical_to_the_old_maths_at_every_zoom() {
     let mut old = Old {
         pan: (0.0, 0.0),
         zoom: 1.0,
+        bound: None,
     };
     for _ in 0..2000 {
         let anchor = (rng.range(0.0, 2000.0), rng.range(0.0, 1200.0));
@@ -475,4 +491,93 @@ fn a_view_with_no_fit_is_bit_identical_to_the_old_maths_at_every_zoom() {
         assert_eq!(new.pan().0.to_bits(), old.pan.0.to_bits());
         assert_eq!(new.pan().1.to_bits(), old.pan.1.to_bits());
     }
+}
+
+#[test]
+fn zooming_out_a_far_panned_document_through_its_fit_size_never_jumps() {
+    // A 10,000 px document in a 1,000 px area, panned to its far end, wheel
+    // zoomed out at the cursor on the area's left edge: the right edge stays
+    // on the area's right edge until the document is the area's size, where
+    // the (clamped) pan is exactly the centred one. No step is larger than
+    // the zoom step implies.
+    let canvas = (1000.0, 700.0);
+    let doc = (10_000_u32, 10_000_u32);
+    let mut view = view_with(canvas, doc, 1.0);
+    view.pan_by((canvas.0 - 10_000.0, canvas.1 - 10_000.0));
+    let mut zoom = 1.0_f32;
+    let mut previous = view.to_screen((0.0, 0.0));
+    let mut was_centred = false;
+    while zoom > 0.04 {
+        zoom *= 0.93;
+        view.zoom_at((0.0, 0.0), zoom);
+        let left = view.to_screen((0.0, 0.0));
+        let extent = (doc.0 as f32 * view.zoom(), doc.1 as f32 * view.zoom());
+        // The change in the edge's position is at most the change of the
+        // extent (7 % of it) plus the pixel of centring's rounding.
+        let allowed = (
+            extent.0 / 0.93 * 0.07 + 1.0 + 1e-2,
+            extent.1 / 0.93 * 0.07 + 1.0 + 1e-2,
+        );
+        assert!(
+            (left.0 - previous.0).abs() <= allowed.0 && (left.1 - previous.1).abs() <= allowed.1,
+            "zoom {}: the document jumped {previous:?} -> {left:?}",
+            view.zoom()
+        );
+        if view.centred() == (false, false) {
+            // Covering the area: both edges at or beyond the area's.
+            assert!(left.0 <= 1e-3 && left.0 + extent.0 >= canvas.0 - 1e-3);
+            assert!(left.1 <= 1e-3 && left.1 + extent.1 >= canvas.1 - 1e-3);
+        } else {
+            was_centred = true;
+        }
+        previous = left;
+    }
+    assert!(was_centred, "the sweep reached the centred sizes");
+    assert_eq!(view.centred(), (true, true));
+}
+
+#[test]
+fn the_bound_on_a_zoom_applies_to_the_zoom_only_and_not_to_a_hand_pan() {
+    let mut view = view_with((1000.0, 700.0), (10_000, 10_000), 1.0);
+    // A hand pan may go anywhere (the app's own clamps bound it).
+    view.pan_by((-20_000.0, -20_000.0));
+    assert_eq!(view.pan(), (-20_000.0, -20_000.0));
+    // A zoom brings the document back over the area.
+    view.zoom_at((10.0, 10.0), 1.1);
+    let pan = view.pan();
+    assert_eq!(pan, (1000.0 - 11_000.0, 700.0 - 11_000.0));
+    // The unbounded zoom is the anchor rule alone.
+    let mut free = view_with((1000.0, 700.0), (10_000, 10_000), 1.0);
+    free.pan_by((-20_000.0, -20_000.0));
+    free.zoom_unbounded((10.0, 10.0), 1.1);
+    assert!(free.pan().0 < pan.0 && free.pan().1 < pan.1);
+}
+
+#[test]
+fn the_pan_stored_for_a_centred_axis_is_never_touched() {
+    // The stored pan of a centred axis is not read by anything (`pan()`,
+    // `zoom_at` and `set_fit` all go through the centred value), so the
+    // gating of `pan_by` and of both clamps on it cannot be seen through
+    // `pan()`. This pins the stored value itself, which is what makes the
+    // gating unobservable rather than missing.
+    // A stored pan that is on the wrong side of every bound: x positive
+    // (the near bound would zero it), y far negative (the far bound would
+    // raise it), both left over from before the fit was given.
+    let mut view = CanvasView::new();
+    view.pan_by((50.0, -5000.0));
+    view.set_fit(Some(fit((1000.0, 700.0), (400, 300), 1.0)));
+    assert_eq!(view.centred(), (true, true));
+    let stored = view.stored_pan();
+    assert_eq!(stored, (50.0, -5000.0));
+    view.pan_by((120.0, -80.0));
+    assert_eq!(view.stored_pan(), stored, "pan_by");
+    view.clamp_pan_to_minimum((0.0, 0.0));
+    assert_eq!(view.stored_pan(), stored, "the near clamp");
+    view.clamp_pan_to_maximum((300.0, 300.0), (1000.0, 700.0));
+    assert_eq!(view.stored_pan(), stored, "the far clamp");
+    // And on an overflowing axis the stored pan is the one in force.
+    let mut wide = view_with((1000.0, 700.0), (3000, 300), 1.0);
+    wide.pan_by((-30.0, -40.0));
+    assert_eq!(wide.stored_pan().0, -30.0);
+    assert_eq!(wide.stored_pan().1, 0.0, "the centred y axis was left");
 }
