@@ -249,8 +249,7 @@ pub enum IoError {
     /// Grayscale, Indexed Color, RGB, CMYK, Multichannel, Duotone and Lab
     /// are read (0.144.0, Grayscale 0.147.0, CMYK task 146, the rest task 148).
     #[error(
-        "the file uses the {name} colour mode (code {code}); only Bitmap, Grayscale, Indexed \
-         Color, RGB, CMYK, Multichannel, Duotone and Lab can be opened",
+        "the file uses the {name} colour mode (code {code}), which cannot be opened",
         name = psd_color_mode_name(*.0),
         code = .0
     )]

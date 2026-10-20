@@ -43663,9 +43663,8 @@ mod tests {
         assert_eq!(
             message,
             "\"photo.psd\" uses a kind of Photoshop (PSD) that Aurora can't open yet. Details: \
-             the file uses the unknown colour mode (code 6); only Bitmap, Grayscale, Indexed \
-             Color, RGB, CMYK, Multichannel, Duotone and Lab can be opened. Your current \
-             document has not changed."
+             the file uses the unknown colour mode (code 6), which cannot be opened. Your \
+             current document has not changed."
         );
     }
 
