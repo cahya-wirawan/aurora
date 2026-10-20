@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.281.0] - 2026-10-20
+
+### Added
+
+- Record the centred small document
+
 ## [0.280.1] - 2026-10-20
 
 ### Added

@@ -502,6 +502,67 @@ fn atlas_picture(
     read_texture(gpu, &texture, viewport)
 }
 
+/// A canvas frame through the 1:1 atlas as `redraw` draws a view whose
+/// origin may be negative (task 144): the atlas sampled from the clamped
+/// origin into a viewport that starts where the document does.
+fn atlas_picture_placed(
+    gpu: &aurora_gpu::GpuContext,
+    photo: &mut Photo,
+    viewport: (u32, u32),
+    origin: (f32, f32),
+    zoom: f32,
+) -> Vec<u8> {
+    let device = gpu.device();
+    let queue = gpu.queue();
+    let placed = zoomed_view::placement(origin, zoom, viewport);
+    let mut residency = aurora_gpu::TileResidency::new(device, queue, viewport);
+    residency.set_document_clip(Some((0.0, 0.0, photo.size.0 as f32, photo.size.1 as f32)));
+    residency.set_origin(queue, placed.origin, placed.viewport_px, zoom);
+    let _ = residency.sync(
+        queue,
+        &mut photo.store,
+        crate::composite_surface_id(),
+        true,
+        usize::MAX,
+    );
+    let mut canvas = aurora_gpu::CanvasPipeline::new(device);
+    let bind_group = canvas.bind_group(device, &residency);
+    let texture = target_texture(device, viewport);
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("atlas-picture-placed"),
+    });
+    {
+        let pipeline = canvas.pipeline(device, FORMAT);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("atlas-picture-placed"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        let (x, y, w, h) = crate::shifted_view_rect(
+            (0.0, 0.0, viewport.0 as f32, viewport.1 as f32),
+            placed.shift_px,
+        );
+        pass.set_viewport(x, y, w, h, 0.0, 1.0);
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+    queue.submit(std::iter::once(encoder.finish()));
+    read_texture(gpu, &texture, viewport)
+}
+
 /// A zoomed-out frame through the pyramid (`zoomed_view`), unblended (a
 /// power-of-two zoom), built until complete.
 fn pyramid_picture(
@@ -991,6 +1052,75 @@ fn at_100_percent_the_picture_is_the_atlas_picture() {
                 .filter(|(a, b)| a != b)
                 .count();
             assert_eq!(differ, 0, "{max_dimension}: {zoom} at {origin:?}");
+        }
+    }
+}
+
+/// A document smaller than the area is centred (task 144) on every path:
+/// the display texture (negative origin) and the 1:1 atlas (shifted
+/// viewport) draw it at the same pixels, and nothing outside it. The atlas
+/// comparison is strict on a real GPU only: a software adapter filters the
+/// atlas at 1:1 slightly (0.280.1).
+#[test]
+fn a_small_document_is_drawn_centred_by_the_texture_and_by_the_atlas() {
+    let Some(context) = real_gpu_context() else {
+        return;
+    };
+    let software = context.adapter_info().device_type == wgpu::DeviceType::Cpu;
+    let size = (300_u32, 200_u32);
+    let mut photo = build(Shape::PhotoMaskedCurves, size);
+    let mut rig = Rig::new(&context, &photo, SMALL_VIEW, false, u32::MAX);
+    let _ = rig.settle(&context, &mut photo, 1.0, (0.0, 0.0), 400);
+    for zoom in [1.0_f32, 1.5] {
+        let extent = ((size.0 as f32 * zoom) as u32, (size.1 as f32 * zoom) as u32);
+        let shift = ((SMALL_VIEW.0 - extent.0) / 2, (SMALL_VIEW.1 - extent.1) / 2);
+        let origin = (-(shift.0 as f32) / zoom, -(shift.1 as f32) / zoom);
+        rig.draw(&context, size, origin, zoom);
+        let display = rig.read_back(&context);
+        let atlas = atlas_picture_placed(&context, &mut photo, SMALL_VIEW, origin, zoom);
+        for (name, picture) in [("display", &display), ("atlas", &atlas)] {
+            let mut outside = 0_u32;
+            let mut inside = 0_u32;
+            let mut inside_total = 0_u32;
+            for (i, texel) in picture.chunks_exact(4).enumerate() {
+                let (x, y) = (i as u32 % SMALL_VIEW.0, i as u32 / SMALL_VIEW.0);
+                let lit = texel.iter().take(3).any(|&c| c != 0);
+                let in_doc = x > shift.0
+                    && x + 1 < shift.0 + extent.0
+                    && y > shift.1
+                    && y + 1 < shift.1 + extent.1;
+                let out_doc = x + 1 < shift.0
+                    || y + 1 < shift.1
+                    || x > shift.0 + extent.0
+                    || y > shift.1 + extent.1;
+                if in_doc {
+                    inside_total += 1;
+                    inside += u32::from(lit);
+                }
+                if out_doc && lit {
+                    outside += 1;
+                }
+            }
+            assert_eq!(
+                outside, 0,
+                "{name} at {zoom}: pixels drawn outside the document"
+            );
+            assert!(
+                inside * 100 >= inside_total * 98,
+                "{name} at {zoom}: only {inside} of {inside_total} document pixels drawn"
+            );
+        }
+        let differ = display
+            .chunks_exact(4)
+            .zip(atlas.chunks_exact(4))
+            .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > 1))
+            .count();
+        println!("{zoom}: {differ} pixels differ between the texture and the atlas");
+        if !software {
+            assert_eq!(
+                differ, 0,
+                "{zoom}: the texture and the atlas place it alike"
+            );
         }
     }
 }

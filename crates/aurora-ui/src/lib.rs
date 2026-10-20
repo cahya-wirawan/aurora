@@ -81,7 +81,7 @@ pub use adjust_controls::{
     adjust_selective_absolute_checked, adjust_tab, adjust_tint_checked, insert_adjust_controls,
     sync_adjust_controls,
 };
-pub use canvas_view::CanvasView;
+pub use canvas_view::{CanvasView, ViewFit};
 pub use channels_panel::{
     CHANNELS_TOOLBAR_ICON_SIZE, CHANNELS_TOOLBAR_LABEL, ChannelRow, ChannelRowPart,
     ChannelVisibility, ChannelsAction, ChannelsPanel, ChannelsToolbar, CompositeChannel,

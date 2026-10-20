@@ -349,16 +349,8 @@ fn plan_at(
 ) -> ZoomedFrame {
     let level = level.min(MAX_LEVEL);
     let scale = level_scale(level);
-    let axis = |origin: f32, canvas: u32| {
-        let origin = if origin.is_finite() { origin } else { 0.0 };
-        let shift = ((-origin).max(0.0) * zoom)
-            .round()
-            .min(canvas.saturating_sub(1) as f32);
-        let shift = shift as u32;
-        (origin.max(0.0), shift, canvas.saturating_sub(shift).max(1))
-    };
-    let (ox, sx, vx) = axis(view_origin.0, canvas_px.0);
-    let (oy, sy, vy) = axis(view_origin.1, canvas_px.1);
+    let (ox, sx, vx) = axis_placement(view_origin.0, zoom, canvas_px.0);
+    let (oy, sy, vy) = axis_placement(view_origin.1, zoom, canvas_px.1);
     let span = TILE as f32 * scale;
     let tiles = |origin: f32, viewport: u32, doc: u32| -> std::ops::Range<u32> {
         let end = (origin + viewport as f32 / zoom).min(doc as f32);
@@ -395,8 +387,10 @@ fn plan_at(
 }
 
 /// The logical pan that centres a document of `doc` pixels on any axis
-/// where it is narrower than the `canvas` logical area at `zoom`, with the
-/// position on whole physical pixels; `pan` on the other axes.
+/// where it is not larger than the `canvas` logical area at `zoom`, with the
+/// position on whole physical pixels; `pan` on the other axes
+/// ([`aurora_ui::canvas_view::centred_axis_pan`], the rule the view itself
+/// applies since task 144).
 #[must_use]
 pub(crate) fn centred_pan(
     pan: (f32, f32),
@@ -405,21 +399,61 @@ pub(crate) fn centred_pan(
     doc: (u32, u32),
     scale_factor: f32,
 ) -> (f32, f32) {
-    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
-        scale_factor
-    } else {
-        1.0
-    };
-    #[allow(clippy::cast_precision_loss)]
-    let axis = |pan: f32, canvas: f32, doc: u32| {
-        let extent = doc as f32 * zoom;
-        if extent.is_finite() && canvas.is_finite() && extent <= canvas {
-            ((canvas - extent) / 2.0 * scale).round() / scale
-        } else {
-            pan
-        }
-    };
-    (axis(pan.0, canvas.0, doc.0), axis(pan.1, canvas.1, doc.1))
+    (
+        aurora_ui::canvas_view::centred_axis_pan(zoom, canvas.0, doc.0, scale_factor)
+            .unwrap_or(pan.0),
+        aurora_ui::canvas_view::centred_axis_pan(zoom, canvas.1, doc.1, scale_factor)
+            .unwrap_or(pan.1),
+    )
+}
+
+/// One axis of a view placed at document position `origin` (the document
+/// point at the canvas area's corner, possibly negative: a document smaller
+/// than the area is centred) at physical `zoom` in `canvas` physical pixels:
+/// the origin the atlas samples from (never negative), the physical pixels
+/// the picture starts in from the area's corner, and the viewport left
+/// (at least 1).
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+pub(crate) fn axis_placement(origin: f32, zoom: f32, canvas: u32) -> (f32, u32, u32) {
+    let origin = if origin.is_finite() { origin } else { 0.0 };
+    let shift = ((-origin).max(0.0) * zoom)
+        .round()
+        .min(canvas.saturating_sub(1) as f32);
+    let shift = shift as u32;
+    (origin.max(0.0), shift, canvas.saturating_sub(shift).max(1))
+}
+
+/// Where the 1:1 atlas draws a view (task 144): [`axis_placement`] on both
+/// axes. The atlas cannot sample left of / above the document, so a
+/// document centred in a larger area is drawn into the viewport that starts
+/// where the document does, from origin `(0, 0)`, exactly as the
+/// zoomed-out view does. `shift_px` is `(0, 0)` and `origin` the view's own
+/// whenever the origin is not negative.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Placement {
+    /// The origin to give the atlas (never negative).
+    pub(crate) origin: (f32, f32),
+    /// Physical pixels from the area's corner to the viewport's corner.
+    pub(crate) shift_px: (u32, u32),
+    /// The viewport's size: the area less the shift (at least 1).
+    pub(crate) viewport_px: (u32, u32),
+}
+
+/// The [`Placement`] of a view at `origin`, physical `zoom`, in `canvas_px`.
+#[must_use]
+pub(crate) fn placement(origin: (f32, f32), zoom: f32, canvas_px: (u32, u32)) -> Placement {
+    let (ox, sx, vx) = axis_placement(origin.0, zoom, canvas_px.0);
+    let (oy, sy, vy) = axis_placement(origin.1, zoom, canvas_px.1);
+    Placement {
+        origin: (ox, oy),
+        shift_px: (sx, sy),
+        viewport_px: (vx, vy),
+    }
 }
 
 /// The logical zoom that fits a document of `doc` pixels in a `canvas`
@@ -505,6 +539,19 @@ pub(crate) fn apply_view_zoom(
                 return;
             };
             view.zoom_at((0.0, 0.0), zoom);
+            // `canvas / doc * doc` can land an ulp above `canvas`, and the
+            // fitted axis would then count as larger than the area (and
+            // not centred): step the zoom down until it is not.
+            #[allow(clippy::cast_precision_loss)]
+            for _ in 0..4 {
+                let z = view.zoom();
+                if (doc.0 as f32 * z <= canvas.0 && doc.1 as f32 * z <= canvas.1)
+                    || z <= view.min_zoom()
+                {
+                    break;
+                }
+                view.zoom_at((0.0, 0.0), z.next_down());
+            }
             let pan = centred_pan(view.pan(), view.zoom(), canvas, doc, scale);
             let now = view.pan();
             view.pan_by((pan.0 - now.0, pan.1 - now.1));
