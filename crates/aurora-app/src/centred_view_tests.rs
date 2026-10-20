@@ -624,3 +624,118 @@ fn a_wheel_zoom_mid_stroke_on_a_small_document_paints_no_stray_line() {
         }
     }
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn raising_the_zoom_floor_mid_drag_on_a_small_document_leaves_the_fixed_references_alone() {
+    // A window shrink raises the floor (`set_min_zoom` zooms about the
+    // corner, or the area's centre on a centred axis): fixed references
+    // must not move for the zoom, a pointer-tied one follows the pointer.
+    let canvas = (1000.0, 700.0);
+    let mut layers = aurora_doc::LayerTree::new();
+    let bounds_rect = aurora_core::Rect {
+        x: 0,
+        y: 0,
+        width: 300,
+        height: 200,
+    };
+    let Ok(layer) = layers.add_pixel_layer("layer", bounds_rect, None) else {
+        unreachable!("a layer fits");
+    };
+    let pointer = (430.0, 300.0);
+    for scale in [1.0_f32, 2.0] {
+        let fresh = || {
+            let mut view = view_with(canvas, (300, 200), scale);
+            view.zoom_at((500.0, 350.0), 0.3);
+            assert_eq!(view.centred(), (true, true));
+            view
+        };
+        let raise = |view: &mut CanvasView, drag: &mut Drag| {
+            crate::apply_canvas_min_zoom(view, Some(drag), Some(pointer), 0.5, bounds(canvas));
+            assert_eq!(view.zoom(), 0.5, "the floor was raised");
+            assert_eq!(view.centred(), (true, true));
+        };
+        let mut selection = aurora_doc::SelectionSet::new();
+        let settings = ToolSettings::default();
+
+        let mut view = fresh();
+        let Some(mut drag) = begin_drag(
+            Tool::MarqueeSelect,
+            PointerButton::Primary,
+            pointer,
+            &view,
+            None,
+        ) else {
+            unreachable!("a marquee press starts a drag");
+        };
+        let before = crate::drag_reference(&drag);
+        raise(&mut view, &mut drag);
+        assert_eq!(
+            crate::drag_reference(&drag),
+            before,
+            "marquee, scale {scale}"
+        );
+
+        let mut view = fresh();
+        let Some(mut drag) = begin_drag(
+            Tool::Move,
+            PointerButton::Primary,
+            pointer,
+            &view,
+            Some((layer, bounds_rect)),
+        ) else {
+            unreachable!("a move press starts a drag");
+        };
+        let before = crate::drag_reference(&drag);
+        raise(&mut view, &mut drag);
+        assert_eq!(crate::drag_reference(&drag), before, "move, scale {scale}");
+
+        let mut view = fresh();
+        let Some(mut drag) = begin_drag(Tool::Lasso, PointerButton::Primary, pointer, &view, None)
+        else {
+            unreachable!("a lasso press starts a drag");
+        };
+        let _ = continue_drag(
+            &mut drag,
+            (440.0, 310.0),
+            &mut view,
+            &mut selection,
+            &settings,
+            bounds(canvas),
+        );
+        let before = crate::drag_reference(&drag);
+        raise(&mut view, &mut drag);
+        assert_eq!(crate::drag_reference(&drag), before, "lasso, scale {scale}");
+
+        let mut view = fresh();
+        let Some(mut drag) =
+            begin_drag(Tool::Gradient, PointerButton::Primary, pointer, &view, None)
+        else {
+            unreachable!("a gradient press starts a drag");
+        };
+        let before = crate::drag_reference(&drag);
+        raise(&mut view, &mut drag);
+        assert_eq!(
+            crate::drag_reference(&drag),
+            before,
+            "gradient start, scale {scale}"
+        );
+
+        // A pointer-tied reference follows the pointer: no stray dab.
+        let mut view = fresh();
+        let Some(mut drag) = begin_drag(Tool::Brush, PointerButton::Primary, pointer, &view, None)
+        else {
+            unreachable!("a brush press starts a drag");
+        };
+        raise(&mut view, &mut drag);
+        let dabs = continue_drag(
+            &mut drag,
+            pointer,
+            &mut view,
+            &mut selection,
+            &settings,
+            bounds(canvas),
+        );
+        assert!(dabs.is_empty(), "scale {scale}: {} stray dabs", dabs.len());
+    }
+}

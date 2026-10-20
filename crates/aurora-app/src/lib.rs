@@ -30661,11 +30661,24 @@ fn apply_canvas_min_zoom(
         pointer.or_else(|| drag_reference(drag).map(|reference| view.to_screen(reference)))
     });
     let before = anchor.map(|anchor| view.to_document(anchor));
+    // Where the raise alone leaves the anchor (task 144: a centred axis
+    // zooms about the area's centre, which moves the point under the anchor):
+    // fixed references are corrected for what the bound and the pan clamps
+    // add to that, pointer-tied ones for the whole move.
+    let zoomed = anchor.map(|anchor| {
+        let mut probe = *view;
+        probe.set_min_zoom_unbounded(min_zoom);
+        probe.to_document(anchor)
+    });
     view.set_min_zoom(min_zoom);
     bounds.apply(view);
-    if let (Some(drag), Some(anchor), Some(before)) = (drag, anchor, before) {
+    if let (Some(drag), Some(anchor), Some(before), Some(zoomed)) = (drag, anchor, before, zoomed) {
         let after = view.to_document(anchor);
-        shift_drag_reference(drag, (after.0 - before.0, after.1 - before.1));
+        shift_drag_references(
+            drag,
+            (after.0 - zoomed.0, after.1 - zoomed.1),
+            (after.0 - before.0, after.1 - before.1),
+        );
     }
 }
 

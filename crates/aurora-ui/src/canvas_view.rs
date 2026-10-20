@@ -267,6 +267,18 @@ impl CanvasView {
         }
     }
 
+    /// [`Self::set_min_zoom`] without the bound [`Self::zoom_at`] puts on an
+    /// overflowing axis: what a caller holding fixed document points
+    /// measures the raise's own effect by (task 144).
+    pub fn set_min_zoom_unbounded(&mut self, min_zoom: f32) {
+        let mut raised = *self;
+        raised.set_min_zoom(min_zoom);
+        self.min_zoom = raised.min_zoom;
+        if self.zoom < self.min_zoom {
+            self.zoom_unbounded((0.0, 0.0), self.min_zoom);
+        }
+    }
+
     /// Converts a document-space point to the canvas area's own logical
     /// screen space.
     #[must_use]
