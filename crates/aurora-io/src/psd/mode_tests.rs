@@ -456,6 +456,18 @@ fn a_32_bit_layer_is_read_as_linear_light_and_encoded_to_srgb() {
     // The 0.18 mid-grey of linear light is about 0.46 encoded.
     assert!((got[3][0] - 0.461).abs() < 3e-3, "{:?}", got[3]);
     let line = document.report.items.join("\n");
+    // One conversion, one line: the generic "converted from <profile>"
+    // line is not added beside the 32-bit one.
+    assert_eq!(
+        document
+            .report
+            .items
+            .iter()
+            .filter(|l| l.contains("converted from"))
+            .count(),
+        1,
+        "{line}"
+    );
     assert!(line.contains("32-bit floating point"), "{line}");
     assert!(
         line.contains("linear light") && line.contains("not kept"),
@@ -1432,4 +1444,32 @@ fn an_inflate_that_claims_a_huge_plane_reserves_only_what_it_produces() {
     let big = vec![7_u8; 100_000];
     let packed = super::test_writer::zlib(&big);
     assert_eq!(super::inflate(&packed, big.len()).ok(), Some(big));
+}
+
+/// The tracked real fixture's channels are all "ZIP with prediction"
+/// (psd-tools lists `ZIP_WITH_PREDICTION` for every `Background` channel of
+/// `32bit5x5.psd`), so this is the check of the float prediction against
+/// Photoshop's own bytes, independent of this crate's test encoder: the
+/// decoded linear values are psd-tools' (`PSDImage.numpy()`: pixel 0 is
+/// 0.8352661, 0.88623047, 0.9607544).
+#[test]
+fn photoshops_own_float_zip_with_prediction_decodes_to_psd_tools_values() {
+    let file = match decode(include_bytes!("../../tests/fixtures/psd/32bit5x5.psd")) {
+        Ok(f) => f,
+        Err(e) => unreachable!("{e:?}"),
+    };
+    let Some(super::PsdNode::Layer(layer)) = file.layers.first() else {
+        unreachable!("a layer")
+    };
+    let Some(image) = &layer.image else {
+        unreachable!("pixels")
+    };
+    let want = [0.835_266_1_f32, 0.886_230_47, 0.960_754_4];
+    for (got, want) in image.samples().iter().zip(want) {
+        assert!((got.to_f32() - want).abs() < 1e-3, "{got} vs {want}");
+    }
+    // Every pixel of the 5 x 5 picture is the same colour.
+    for px in image.samples().chunks_exact(4) {
+        assert!((px[0].to_f32() - want[0]).abs() < 1e-3);
+    }
 }
