@@ -886,3 +886,73 @@ fn every_cmyk_and_32_bit_corpus_file_opens() {
     // The task's corpus: 13 CMYK and 17 32-bit files.
     assert!(cmyk >= 13 && float >= 17, "CMYK {cmyk}, 32-bit {float}");
 }
+
+/// Photoshop's own RGB export (a PNG beside each `adjustments/*_cmyk.psd`)
+/// is the ground truth for the CMYK conversion: Aurora's converted merged
+/// image must land within a fraction of an 8-bit level of it. Measured when
+/// this was written (SWOP v2 profile, 8 files): mean 0.00-0.19 levels, max
+/// 1-3 levels.
+#[test]
+fn cmyk_merged_images_match_photoshops_own_srgb_export() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../corpora/psd/reference/psd-tools-fixtures/adjustments");
+    if !dir.is_dir() {
+        println!("SKIPPED: corpus not present at {}", dir.display());
+        assert!(
+            std::env::var_os("AURORA_REQUIRE_CORPUS").is_none(),
+            "AURORA_REQUIRE_CORPUS is set and the PSD corpus is missing"
+        );
+        return;
+    }
+    let mut checked = 0;
+    for name in [
+        "brightnesscontrast_cmyk",
+        "brightnesscontrast_legacy_cmyk",
+        "curves_cmyk",
+        "invert_cmyk",
+        "levels_cmyk",
+        "posterize_cmyk",
+        "threshold_cmyk",
+        "posterize_16bits_cmyk",
+    ] {
+        let psd = std::fs::read(dir.join(format!("{name}.psd")));
+        let png = std::fs::read(dir.join(format!("{name}.png")));
+        let (Ok(psd), Ok(png)) = (psd, png) else {
+            unreachable!("{name}: fixture missing")
+        };
+        let ours = match merged_image_in_working_space(&psd) {
+            Ok(i) => i,
+            Err(e) => unreachable!("{name}: {e:?}"),
+        };
+        let theirs = match crate::decode_by_extension(std::path::Path::new("x.png"), &png) {
+            Ok(i) => i,
+            Err(e) => unreachable!("{name}: {e:?}"),
+        };
+        assert_eq!(
+            (ours.width(), ours.height()),
+            (theirs.width(), theirs.height())
+        );
+        let (mut sum, mut worst, mut n) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for (a, b) in ours
+            .samples()
+            .chunks_exact(4)
+            .zip(theirs.samples().chunks_exact(4))
+        {
+            for c in 0..3 {
+                let d = (f64::from(a[c].to_f32()) * 255.0).round()
+                    - (f64::from(b[c].to_f32()) * 255.0).round();
+                sum += d.abs();
+                worst = worst.max(d.abs());
+                n += 1.0;
+            }
+        }
+        let mean = sum / n;
+        println!("{name}: mean {mean:.3} levels, max {worst}");
+        assert!(
+            mean < 0.5 && worst <= 4.0,
+            "{name}: mean {mean}, max {worst}"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 8);
+}

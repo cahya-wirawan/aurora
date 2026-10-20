@@ -43658,12 +43658,12 @@ mod tests {
         let message = open_failure_message(
             "photo.psd",
             "psd",
-            &OpenFailure::Decode(aurora_io::IoError::UnsupportedPsdColorMode(4)),
+            &OpenFailure::Decode(aurora_io::IoError::UnsupportedPsdColorMode(9)),
         );
         assert_eq!(
             message,
             "\"photo.psd\" uses a kind of Photoshop (PSD) that Aurora can't open yet. Details: \
-             the file uses the CMYK colour mode (code 4); only RGB and Grayscale can be opened. Your current \
+             the file uses the Lab colour mode (code 9); only RGB, Grayscale and CMYK can be opened. Your current \
              document has not changed."
         );
     }
@@ -43675,9 +43675,9 @@ mod tests {
         };
         let cases = [
             (
-                psd(aurora_io::IoError::UnsupportedPsdDepth(32)),
+                psd(aurora_io::IoError::UnsupportedPsdDepth(1)),
                 "uses a kind of Photoshop (PSD) that Aurora can't open yet. Details: the file \
-                 uses 32 bits per channel; only 8 and 16 can be opened.",
+                 uses 1 bits per channel; only 8, 16 and 32 (floating point) can be opened.",
             ),
             (
                 psd(aurora_io::IoError::UnsupportedPsdColorMode(8)),
