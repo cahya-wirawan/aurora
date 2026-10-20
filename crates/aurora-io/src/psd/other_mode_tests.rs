@@ -66,7 +66,13 @@ fn near(a: [i32; 3], b: [i32; 3], tol: i32) -> bool {
 }
 
 fn lab_file(depth: u16, planes: [&[u8]; 3]) -> TestPsd {
-    TestPsd::new(1, planes[0].len() as u32 / if depth == 16 { 2 } else { 1 }, 1, depth).with(|p| {
+    TestPsd::new(
+        1,
+        planes[0].len() as u32 / if depth == 16 { 2 } else { 1 },
+        1,
+        depth,
+    )
+    .with(|p| {
         p.color_mode = 9;
         p.channels = 3;
         p.merged = Some(planes.iter().map(|plane| plane.to_vec()).collect());
@@ -127,7 +133,11 @@ fn a_lab_layer_converts_its_planes_and_keeps_alpha() {
         3,
         1,
         8,
-        &[[255, 128, 128, 255], [128, 200, 100, 128], [90, 128, 128, 0]],
+        &[
+            [255, 128, 128, 255],
+            [128, 200, 100, 128],
+            [90, 128, 128, 0],
+        ],
     );
     let file = TestPsd::new(1, 3, 1, 8)
         .with(|p| {
@@ -287,7 +297,12 @@ fn indexed_samples_index_the_three_plane_table() {
     let got = merged_levels(&file);
     assert_eq!(
         got,
-        vec![[10, 20, 30], [200, 100, 50], [255, 255, 255], [200, 100, 50]]
+        vec![
+            [10, 20, 30],
+            [200, 100, 50],
+            [255, 255, 255],
+            [200, 100, 50]
+        ]
     );
     let document = open(&file);
     assert!(report_text(&document).contains("indexed colour table"));
@@ -441,10 +456,7 @@ fn the_real_bitmap_fixture_has_psd_tools_bits() {
         .collect();
     let b = 0;
     let w = 255;
-    assert_eq!(
-        got,
-        [b, b, w, w, b, b, b, b, w, b, b, b, w, w, b, b]
-    );
+    assert_eq!(got, [b, b, w, w, b, b, b, b, w, b, b, b, w, w, b, b]);
 }
 
 // ------------------------------------------------ Duotone, Multichannel
@@ -461,7 +473,11 @@ fn duotone_and_multichannel_show_their_first_channel_as_grey() {
             })
             .write();
         let got = merged_levels(&file);
-        assert_eq!(got, vec![[0, 0, 0], [64, 64, 64], [255, 255, 255]], "{mode}");
+        assert_eq!(
+            got,
+            vec![[0, 0, 0], [64, 64, 64], [255, 255, 255]],
+            "{mode}"
+        );
         let document = open(&file);
         let text = report_text(&document);
         assert!(
@@ -556,9 +572,10 @@ fn every_corpus_file_of_the_five_modes_opens() {
                 let p = entry.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if p.extension().is_some_and(|e| {
-                    e.eq_ignore_ascii_case("psd") || e.eq_ignore_ascii_case("psb")
-                }) {
+                } else if p
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("psd") || e.eq_ignore_ascii_case("psb"))
+                {
                     files.push(p);
                 }
             }
@@ -569,9 +586,7 @@ fn every_corpus_file_of_the_five_modes_opens() {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
-        let mode = bytes
-            .get(24..26)
-            .map(|m| u16::from_be_bytes([m[0], m[1]]));
+        let mode = bytes.get(24..26).map(|m| u16::from_be_bytes([m[0], m[1]]));
         if !matches!(mode, Some(0 | 2 | 7 | 8 | 9)) {
             continue;
         }

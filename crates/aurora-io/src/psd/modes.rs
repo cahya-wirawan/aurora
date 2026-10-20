@@ -128,7 +128,11 @@ pub(super) fn bitmap_to_rgba(
         return Err(short());
     }
     let mut out = opaque_buffer(width, height)?;
-    for (y, row) in plane.chunks_exact(row_bytes.max(1)).take(height).enumerate() {
+    for (y, row) in plane
+        .chunks_exact(row_bytes.max(1))
+        .take(height)
+        .enumerate()
+    {
         for x in 0..width {
             let bit = row
                 .get(x / 8)
@@ -214,6 +218,7 @@ pub(super) fn lab_to_rgba(
 }
 
 /// Converts the pixels `first ..` that `out` (4 samples a pixel) covers.
+#[allow(clippy::many_single_char_names)] // l, a, b, r, g: the channels' own names
 fn lab_range(
     out: &mut [f16],
     planes: [Option<&[u8]>; 3],
@@ -223,7 +228,7 @@ fn lab_range(
 ) {
     let [l_plane, a_plane, b_plane] = planes;
     // A pixel equal to the one before it reuses the result.
-    let mut previous: Option<([f64; 3], [f16; 3])> = None;
+    let mut previous: Option<([u64; 3], [f16; 3])> = None;
     for (n, px) in out.chunks_exact_mut(4).enumerate() {
         let i = first + n;
         let a = alpha.map_or(1.0, |plane| lab_alpha(plane, i, bps).clamp(0.0, 1.0));
@@ -235,12 +240,13 @@ fn lab_range(
             lab_value(1, a_plane, i, bps),
             lab_value(2, b_plane, i, bps),
         ];
+        let key = lab.map(f64::to_bits);
         let rgb = match previous {
-            Some((last, rgb)) if last == lab => rgb,
+            Some((last, rgb)) if last == key => rgb,
             _ => {
                 let [r, g, b] = super::lab::lab_to_srgb(lab[0], lab[1], lab[2]);
                 let rgb = [f16::from_f32(r), f16::from_f32(g), f16::from_f32(b)];
-                previous = Some((lab, rgb));
+                previous = Some((key, rgb));
                 rgb
             }
         };
