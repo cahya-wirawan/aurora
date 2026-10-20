@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.283.0] - 2026-10-20
+
+### Added
+
+- Record the PSD fidelity round
+
 ## [0.282.0] - 2026-10-20
 
 ### Added
