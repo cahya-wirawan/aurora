@@ -246,16 +246,16 @@ pub enum IoError {
     #[error("unsupported Photoshop file version {0}")]
     UnsupportedPsdVersion(u16),
     /// The file uses a colour mode this reader does not decode — only
-    /// RGB and Grayscale are read (0.144.0, Grayscale 0.147.0).
+    /// RGB, Grayscale and CMYK are read (0.144.0, Grayscale 0.147.0, CMYK task 146).
     #[error(
-        "the file uses the {name} colour mode (code {code}); only RGB and Grayscale can be \
+        "the file uses the {name} colour mode (code {code}); only RGB, Grayscale and CMYK can be \
          opened",
         name = psd_color_mode_name(*.0),
         code = .0
     )]
     UnsupportedPsdColorMode(u16),
-    /// The file's bit depth is not 8 or 16 bits per channel.
-    #[error("the file uses {0} bits per channel; only 8 and 16 can be opened")]
+    /// The file's bit depth is not 8, 16 or 32 (floating point) bits per channel.
+    #[error("the file uses {0} bits per channel; only 8, 16 and 32 (floating point) can be opened")]
     UnsupportedPsdDepth(u16),
     /// A channel uses a compression method this reader does not know
     /// (PSD defines `0`..=`3`).

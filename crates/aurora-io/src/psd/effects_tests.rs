@@ -185,7 +185,7 @@ pub(super) fn descriptor_bytes(items: &[(&[u8], V<'_>)]) -> Vec<u8> {
 }
 
 /// An `lfx2`-style block: object version 0, descriptor version 16.
-fn effects_block(items: &[(&[u8], V<'_>)]) -> Vec<u8> {
+pub(super) fn effects_block(items: &[(&[u8], V<'_>)]) -> Vec<u8> {
     let mut o = Vec::new();
     put_u32(&mut o, 0);
     put_u32(&mut o, 16);
@@ -208,7 +208,7 @@ pub(super) fn rgb<'a>(r: f64, g: f64, b: f64) -> V<'a> {
     ])
 }
 
-fn shadow<'a>(enab: bool, present: bool, distance: f64) -> V<'a> {
+pub(super) fn shadow<'a>(enab: bool, present: bool, distance: f64) -> V<'a> {
     V::Obj(vec![
         (b"enab", V::Bool(enab)),
         (b"present", V::Bool(present)),
@@ -441,7 +441,7 @@ fn descriptor_budget_is_shared_and_spent() {
 
 /// Every `key` effects block in a PSD's raw bytes, found by its `8BIM`
 /// signature (both are 4-byte-length keys).
-fn raw_blocks(file: &[u8], key: &[u8; 4]) -> Vec<Vec<u8>> {
+pub(super) fn raw_blocks(file: &[u8], key: &[u8; 4]) -> Vec<Vec<u8>> {
     let mut sig = b"8BIM".to_vec();
     sig.extend_from_slice(key);
     let mut out = Vec::new();

@@ -89,13 +89,20 @@ impl ProfileProblem {
     /// A plain-language fragment, for an open report ("`<this>`").
     #[must_use]
     pub fn describe(&self) -> String {
+        self.describe_expecting("RGB")
+    }
+
+    /// [`Self::describe`] for pixels of another colour space (`expected`
+    /// names it: "CMYK").
+    #[must_use]
+    pub fn describe_expecting(&self, expected: &str) -> String {
         match self {
             Self::TooLarge(len) => {
                 format!("it is {len} bytes, larger than the {MAX_PROFILE_BYTES} allowed")
             }
             Self::NotIcc(why) => format!("it is not a valid ICC profile ({why})"),
             Self::WrongSpace(space) => {
-                format!("it describes {} colour space, not RGB", space.name())
+                format!("it describes {} colour space, not {expected}", space.name())
             }
             Self::WrongClass(class) => format!(
                 "its class \"{}\" cannot describe image pixels",

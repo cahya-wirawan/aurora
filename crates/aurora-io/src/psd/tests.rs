@@ -707,15 +707,25 @@ fn a_layer_mask_is_decoded_and_no_longer_reported() {
 
 #[test]
 fn unsupported_modes_depths_and_compressions_are_typed_errors() {
-    let cmyk = TestPsd::new(1, 1, 1, 8).with(|p| p.color_mode = 4).write();
+    // CMYK and 32-bit float open since task 146; 32-bit CMYK does not exist
+    // in Photoshop and is refused by depth, and a CMYK header with fewer
+    // than four channels is malformed.
+    let cmyk32 = TestPsd::new(1, 1, 1, 32)
+        .with(|p| {
+            p.color_mode = 4;
+            p.channels = 4;
+        })
+        .write();
     assert!(matches!(
-        decode(&cmyk),
-        Err(IoError::UnsupportedPsdColorMode(4))
+        decode(&cmyk32),
+        Err(IoError::UnsupportedPsdDepth(32))
     ));
-    let deep = TestPsd::new(1, 1, 1, 32).write();
+    let thin = TestPsd::new(1, 1, 1, 8).with(|p| p.color_mode = 4).write();
+    assert!(matches!(decode(&thin), Err(IoError::PsdMalformed { .. })));
+    let deep = TestPsd::new(1, 1, 1, 64).write();
     assert!(matches!(
         decode(&deep),
-        Err(IoError::UnsupportedPsdDepth(32))
+        Err(IoError::UnsupportedPsdDepth(64))
     ));
     let bitmap = TestPsd::new(1, 1, 1, 1).write();
     assert!(matches!(
@@ -1156,10 +1166,8 @@ fn real_emoji_name_and_linear_dodge_at_half_opacity() {
 
 #[test]
 fn real_unsupported_fixtures_give_their_specific_errors() {
-    assert!(matches!(
-        decode(fixture!("32bit5x5.psd")),
-        Err(IoError::UnsupportedPsdDepth(32))
-    ));
+    // 32-bit float opens since task 146 (see `mode_tests`).
+    assert!(decode(fixture!("32bit5x5.psd")).is_ok());
     assert!(matches!(
         decode(fixture!("4x4_8bit_lab.psd")),
         Err(IoError::UnsupportedPsdColorMode(9))
@@ -2414,7 +2422,7 @@ fn grayscale_ignores_colour_channels_one_and_two_and_its_merged_image_is_grey() 
 
 #[test]
 fn bitmap_indexed_duotone_and_friends_stay_refused_by_name() {
-    for mode in [0_u16, 2, 4, 7, 8, 9] {
+    for mode in [0_u16, 2, 7, 8, 9] {
         let bytes = TestPsd::new(1, 1, 1, 8)
             .with(|p| p.color_mode = mode)
             .write();

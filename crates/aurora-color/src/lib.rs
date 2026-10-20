@@ -25,6 +25,7 @@
 //! This crate is M1.5's home; PLAN.md tracks what's done and what's
 //! still open there.
 
+mod cmyk;
 mod dither;
 mod error;
 mod linear;
@@ -32,6 +33,7 @@ mod profile;
 mod source;
 mod transform;
 
+pub use cmyk::{CmykSource, CmykTransform, inspect_cmyk_source, naive_cmyk_to_rgb};
 pub use dither::{
     DITHER_SIZE, dither_quantize, dither_quantize_with, dither_thresholds, promote_u8, promote_u16,
     quantize_u8, quantize_u16,
