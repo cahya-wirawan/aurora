@@ -697,3 +697,12 @@ fn drawn_gradients_follow_photoshops_pixels() {
     assert!(level(&g, b, 144.0, 16.0) < 12.0, "diamond centre");
     assert!(level(&g, b, 144.0 + 20.0, 16.0) > 250.0, "diamond edge 20 px out is white");
 }
+
+// The 4 x 4 gradient-only fixtures of psd-tools (`colormodes/4x4_*bit_*.psd`,
+// a 30 degree Reflected gradient on a 4 x 4 canvas) cannot be matched: their
+// merged image depends only on |x - y| (a 45 degree direction), while the
+// same Photoshop gradient with the same stored angle on the 34 x 34 shapes of
+// `gradient-styles.psd` really runs at 30 degrees (checked pixel by pixel,
+// task 147). They are kept as fixtures and score 17-28 levels; moving the
+// smoothing or the Radial/Diamond constants shifted them by 1-1.3 levels
+// either way, which is noise on an unexplained picture, not a signal.

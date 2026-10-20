@@ -4406,7 +4406,21 @@ fn drawn_fill_node(
     }
     vector_budget.pixels -= charge;
     let reference = match &fill {
-        fill::Fill::Gradient(g) => fill::reference_box(g, path_box, canvas),
+        // With no vector path, a raster user mask's rectangle is the
+        // layer's extent (task 147: `gradient-fill.psd`, a 100 x 150 canvas
+        // whose gradient layer has a 16 x 94 mask: Photoshop's ramp spans
+        // the mask rectangle, mean error inside it 22 -> 4.5 levels against
+        // the canvas-sized ramp).
+        fill::Fill::Gradient(g) => fill::reference_box(
+            g,
+            path_box.or_else(|| {
+                record
+                    .mask
+                    .map(|m| m.bounds)
+                    .filter(|b| b.width > 0 && b.height > 0)
+            }),
+            canvas,
+        ),
         fill::Fill::Solid(_) => canvas,
     };
     let Some(samples) = fill::render(&fill, region, reference, raster.as_ref(), density) else {
