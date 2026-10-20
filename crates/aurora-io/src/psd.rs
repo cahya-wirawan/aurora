@@ -576,9 +576,6 @@ enum Note {
     /// Adjustment layers of a CMYK or 32-bit file, left out (task 146):
     /// nothing checked how Photoshop's adjustments read those modes.
     AdjustmentLeftOutInMode,
-    /// Fill layers with no pixels and artboard background colours of a CMYK
-    /// or 32-bit file, left out (task 146).
-    FillLeftOutInMode,
     /// Layer effects of a CMYK or 32-bit file, left out (task 146).
     EffectsLeftOutInMode,
     /// A Grayscale file is held as RGB (grey on all three channels); a PSD
@@ -1103,10 +1100,6 @@ fn note_text(note: Note, n: u64) -> String {
         Note::AdjustmentLeftOutInMode => format!(
             "{n} adjustment layer{s} {was} left out — Aurora has not checked how Photoshop's \
              adjustments work in CMYK or 32-bit files."
-        ),
-        Note::FillLeftOutInMode => format!(
-            "{n} fill layer{s} with no stored pixels (or artboard background colour{s}) {was} \
-             left out — their colours are in a space Aurora does not read in CMYK or 32-bit files."
         ),
         Note::EffectsLeftOutInMode => format!(
             "The layer effects of {n} layer{s} {was} left out — their colours are in a space \
@@ -3947,6 +3940,7 @@ fn build_tree(
     header: Header,
     notes: &mut Notes,
     vector_budget: &mut vector::Budget,
+    cmyk: fill::CmykColours<'_>,
 ) -> Result<Vec<PsdNode>, IoError> {
     let mut stack: Vec<Vec<PsdNode>> = vec![Vec::new()];
     for record in records {
@@ -3970,12 +3964,7 @@ fn build_tree(
                 };
                 let mut children = children;
                 if let Some(block) = record.artboard.as_deref() {
-                    match fill::parse_artboard(block) {
-                        // A background colour in a CMYK or 32-bit file is in
-                        // a space this reader does not read (task 146).
-                        Ok(Some(_)) if header.colours_unchecked() => {
-                            notes.add(Note::FillLeftOutInMode);
-                        }
+                    match fill::parse_artboard_in(block, cmyk) {
                         Ok(Some(bg)) => match artboard_background(bg, header, vector_budget) {
                             Ok(node) => {
                                 children.insert(0, node);
@@ -4012,7 +4001,7 @@ fn build_tree(
                 }
             }
             _ => {
-                if let Some(node) = layer_node(src, record, header, notes, vector_budget)
+                if let Some(node) = layer_node(src, record, header, notes, vector_budget, cmyk)
                     && let Some(parent) = stack.last_mut()
                 {
                     parent.push(node);
@@ -4173,6 +4162,7 @@ fn layer_node(
     header: Header,
     notes: &mut Notes,
     vector_budget: &mut vector::Budget,
+    cmyk: fill::CmykColours<'_>,
 ) -> Option<PsdNode> {
     if header.colours_unchecked() {
         if record.features.adjustment
@@ -4182,10 +4172,6 @@ fn layer_node(
             || record.other_adjustment.is_some()
         {
             notes.add(Note::AdjustmentLeftOutInMode);
-            return None;
-        }
-        if record.features.fill && record.area() == 0 {
-            notes.add(Note::FillLeftOutInMode);
             return None;
         }
     }
@@ -4253,7 +4239,7 @@ fn layer_node(
         return None;
     }
     if record.features.fill && record.area() == 0 {
-        return drawn_fill_node(src, record, header, notes, vector_budget);
+        return drawn_fill_node(src, record, header, notes, vector_budget, cmyk);
     }
     // Located, not decoded (0.154.0): `decode` or `read_streaming`
     // decodes it later, one layer at a time.
@@ -4309,6 +4295,7 @@ fn drawn_fill_node(
     header: Header,
     notes: &mut Notes,
     vector_budget: &mut vector::Budget,
+    cmyk: fill::CmykColours<'_>,
 ) -> Option<PsdNode> {
     let left_out = |notes: &mut Notes, why: fill::LeftOut| {
         notes.add(Note::FillNotDrawn(why));
@@ -4318,7 +4305,7 @@ fn drawn_fill_node(
         notes.add(Note::FillSkipped);
         return None;
     };
-    let fill = match fill::parse(*key, data) {
+    let fill = match fill::parse_in(*key, data, cmyk) {
         Ok(fill) => fill,
         Err(why) => return left_out(notes, why),
     };
@@ -5245,7 +5232,17 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
     // Smart objects (0.200.0): matched to their embedded files before the
     // tree is built, so the build knows which ones are kept.
     let resolved = smart::resolve(src, &mut info.records, &linked_windows, &mut effects_budget)?;
-    let layers = build_tree(src, &info.records, header, &mut notes, &mut vector_budget)?;
+    let cmyk_colours = header
+        .cmyk()
+        .then(|| cmyk_converter(notes.3.as_deref()));
+    let layers = build_tree(
+        src,
+        &info.records,
+        header,
+        &mut notes,
+        &mut vector_budget,
+        cmyk_colours.as_ref(),
+    )?;
     // Only the files a layer that was actually built still names: a smart
     // object dropped on the way (no pixels) must not pool its file.
     let mut named = std::collections::BTreeSet::new();

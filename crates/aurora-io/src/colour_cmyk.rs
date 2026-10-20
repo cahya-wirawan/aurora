@@ -48,6 +48,21 @@ impl CmykConverter {
         }
     }
 
+    /// One colour: `ink` (cyan, magenta, yellow, black, each `0..=1`) as
+    /// encoded sRGB in `0..=1`. For a descriptor colour of a fill layer.
+    pub(crate) fn colour(&self, ink: [f32; 4]) -> [f32; 3] {
+        let mut rgb = [0.0_f32; 3];
+        let converted = self.take().is_some_and(|t| {
+            let ok = t.transform(&ink, &mut rgb).is_ok();
+            self.give(t);
+            ok
+        });
+        if !converted {
+            rgb = naive_cmyk_to_rgb(ink);
+        }
+        rgb.map(|v| if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) })
+    }
+
     fn take(&self) -> Option<CmykTransform> {
         if self.profile.is_none() {
             return None;

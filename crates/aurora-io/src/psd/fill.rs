@@ -99,8 +99,17 @@ pub(super) enum Fill {
     Gradient(Gradient),
 }
 
+/// How a CMYK file's `CMYC` colours become sRGB (task 146); `None` for an
+/// RGB or Grayscale file, where a `CMYC` colour is left out.
+pub(super) type CmykColours<'a> = Option<&'a crate::colour_cmyk::CmykConverter>;
+
 /// Parses a `SoCo` or `GdFl` block (`PtFl` is [`LeftOut::Pattern`]).
 pub(super) fn parse(key: [u8; 4], data: &[u8]) -> Result<Fill, LeftOut> {
+    parse_in(key, data, None)
+}
+
+/// [`parse`] for a file whose colours may be CMYK.
+pub(super) fn parse_in(key: [u8; 4], data: &[u8], cmyk: CmykColours<'_>) -> Result<Fill, LeftOut> {
     if &key == b"PtFl" {
         return Err(LeftOut::Pattern);
     }
@@ -113,15 +122,20 @@ pub(super) fn parse(key: [u8; 4], data: &[u8]) -> Result<Fill, LeftOut> {
     match &key {
         b"SoCo" => {
             let c = d.get(b"Clr ").and_then(Value::descriptor);
-            Ok(Fill::Solid(colour(c.ok_or(LeftOut::Unreadable)?)?))
+            Ok(Fill::Solid(colour_in(c.ok_or(LeftOut::Unreadable)?, cmyk)?))
         }
-        b"GdFl" => gradient(&d).map(Fill::Gradient),
+        b"GdFl" => gradient_in(&d, cmyk).map(Fill::Gradient),
         _ => Err(LeftOut::Unreadable),
     }
 }
 
-/// An `RGBC` (0..255) or grey (`Grsc`, ink percent) colour descriptor.
+/// An `RGBC` (0..255), grey (`Grsc`, ink percent) or, in a CMYK file,
+/// `CMYC` (four ink percentages) colour descriptor.
 fn colour(c: &Descriptor) -> Result<[f32; 3], LeftOut> {
+    colour_in(c, None)
+}
+
+fn colour_in(c: &Descriptor, cmyk: CmykColours<'_>) -> Result<[f32; 3], LeftOut> {
     let channel = |key: &[u8]| -> Option<f32> {
         let v = c.get(key)?.number()?;
         v.is_finite().then(|| (v / 255.0).clamp(0.0, 1.0) as f32)
@@ -140,6 +154,17 @@ fn colour(c: &Descriptor) -> Result<[f32; 3], LeftOut> {
             .filter(|v| v.is_finite());
         let g = (1.0 - ink.ok_or(LeftOut::Unreadable)? / 100.0).clamp(0.0, 1.0) as f32;
         Ok([g, g, g])
+    } else if c.get(b"Cyn ").is_some() {
+        // Ink percentages, not inverted (task 146).
+        let ink = |key: &[u8]| -> Option<f32> {
+            let v = c.get(key)?.number()?;
+            v.is_finite().then(|| (v / 100.0).clamp(0.0, 1.0) as f32)
+        };
+        match (ink(b"Cyn "), ink(b"Mgnt"), ink(b"Ylw "), ink(b"Blck"), cmyk) {
+            (Some(c), Some(m), Some(y), Some(k), Some(conv)) => Ok(conv.colour([c, m, y, k])),
+            (Some(_), Some(_), Some(_), Some(_), None) => Err(LeftOut::Colour),
+            _ => Err(LeftOut::Unreadable),
+        }
     } else {
         Err(LeftOut::Colour)
     }
@@ -184,6 +209,10 @@ fn stops<T>(
 }
 
 pub(super) fn gradient(d: &Descriptor) -> Result<Gradient, LeftOut> {
+    gradient_in(d, None)
+}
+
+pub(super) fn gradient_in(d: &Descriptor, cmyk: CmykColours<'_>) -> Result<Gradient, LeftOut> {
     let grad = d
         .get(b"Grad")
         .and_then(Value::descriptor)
@@ -192,10 +221,11 @@ pub(super) fn gradient(d: &Descriptor) -> Result<Gradient, LeftOut> {
         return Err(LeftOut::Noise);
     }
     let colours = stops(grad.get(b"Clrs").ok_or(LeftOut::Unreadable)?, |s| {
-        colour(
+        colour_in(
             s.get(b"Clr ")
                 .and_then(Value::descriptor)
                 .ok_or(LeftOut::Unreadable)?,
+            cmyk,
         )
     })?;
     if colours.is_empty() {
@@ -330,6 +360,14 @@ pub(super) enum ArtboardLeft {
 /// (`artboard-bgcolor.psd`: Photoshop's merged image shows exactly the
 /// `Clr ` colour inside `artboardRect`); the other types are not drawn.
 pub(super) fn parse_artboard(data: &[u8]) -> Result<Option<ArtboardBackground>, ArtboardLeft> {
+    parse_artboard_in(data, None)
+}
+
+/// [`parse_artboard`] for a file whose colours may be CMYK.
+pub(super) fn parse_artboard_in(
+    data: &[u8],
+    cmyk: CmykColours<'_>,
+) -> Result<Option<ArtboardBackground>, ArtboardLeft> {
     if data.len() > MAX_ARTBOARD_BLOCK_BYTES {
         return Err(ArtboardLeft::Unreadable);
     }
@@ -351,7 +389,7 @@ pub(super) fn parse_artboard(data: &[u8]) -> Result<Option<ArtboardBackground>, 
         .get(b"Clr ")
         .and_then(Value::descriptor)
         .ok_or(ArtboardLeft::Unreadable)?;
-    let colour = colour(c).map_err(|_| ArtboardLeft::Unreadable)?;
+    let colour = colour_in(c, cmyk).map_err(|_| ArtboardLeft::Unreadable)?;
     let r = d
         .get(b"artboardRect")
         .and_then(Value::descriptor)
