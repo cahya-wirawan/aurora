@@ -6431,6 +6431,7 @@ mod adjustment_tests {
     /// journal carries the smoothed-ramp flags the wire skips, and a journal
     /// with only straight ramps is the one older builds wrote (no such op).
     #[test]
+    #[allow(clippy::too_many_lines)] // one fixture, three checks
     fn set_gradient_ramps_is_appended_and_the_journal_carries_the_flags() {
         let id = crate::LayerId::from_raw(3);
         let ordinal = |op: &LayerOp| {
