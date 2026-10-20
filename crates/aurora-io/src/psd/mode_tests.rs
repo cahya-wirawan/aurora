@@ -12,6 +12,7 @@
 use aurora_color::{CmykTransform, IccProfile, Transform};
 use half::f16;
 
+use super::effects_tests::{V, descriptor_bytes};
 use super::test_writer::{TestLayer, TestPsd};
 use super::{PsdDocument, decode, merged_image, merged_image_in_working_space, read};
 use crate::error::IoError;
@@ -363,8 +364,11 @@ fn cmyk_adjustments_and_effects_are_left_out_and_counted() {
         text.contains("layer effects of 1 layer was left out"),
         "{text}"
     );
-    // Only the pixel layer survives.
+    // Only the pixel layer survives: no adjustment layer was imported with
+    // RGB semantics, and nothing else about the effects was reported.
     assert_eq!(document.pixels.len(), 1);
+    assert_eq!(document.layers.roots().len(), 1, "{text}");
+    assert_eq!(document.report.items.len(), 5, "{text}");
 }
 
 #[test]
@@ -955,4 +959,113 @@ fn cmyk_merged_images_match_photoshops_own_srgb_export() {
         checked += 1;
     }
     assert_eq!(checked, 8);
+}
+
+#[test]
+fn a_readable_drop_shadow_in_a_cmyk_or_32_bit_file_is_left_out_not_drawn() {
+    use super::effects_tests::{V, effects_block, shadow};
+    let block = effects_block(&[(b"dropShadowMulti", V::List(vec![shadow(true, true, 3.0)]))]);
+    let cmyk = TestPsd::new(1, 1, 1, 8)
+        .with(|p| {
+            p.color_mode = 4;
+            p.channels = 4;
+            p.layers.push(
+                TestLayer::cmyk("L", 0, 0, 1, 1, 8, &[[255, 255, 255, 255, 255]])
+                    .with(|l| l.blocks.push((*b"lfx2", block.clone()))),
+            );
+        })
+        .write();
+    let float = TestPsd::new(1, 1, 1, 32)
+        .with(|p| {
+            p.lr16 = true;
+            p.layers.push(
+                TestLayer::floats("L", 0, 0, 1, 1, &[[0.5, 0.5, 0.5, 1.0]])
+                    .with(|l| l.blocks.push((*b"lfx2", block.clone()))),
+            );
+        })
+        .write();
+    for (name, bytes) in [("CMYK", cmyk), ("32-bit", float)] {
+        let document = open(&bytes);
+        let Some(id) = document.layers.roots().first().copied() else {
+            unreachable!("a layer")
+        };
+        assert!(
+            document.layers.effects(id).is_none(),
+            "{name}: shadow drawn"
+        );
+        let text = document.report.items.join("\n");
+        assert!(
+            text.contains("layer effects of 1 layer was left out"),
+            "{name}: {text}"
+        );
+    }
+    // The same block on an 8-bit RGB layer is kept as data (the contrast).
+    let rgb = TestPsd::new(1, 1, 1, 8)
+        .with(|p| {
+            p.layers.push(
+                TestLayer::pixels("L", 0, 0, 1, 1, 8, &[[1, 2, 3, 255]])
+                    .with(|l| l.blocks.push((*b"lfx2", block.clone()))),
+            );
+        })
+        .write();
+    let document = open(&rgb);
+    let Some(id) = document.layers.roots().first().copied() else {
+        unreachable!("a layer")
+    };
+    assert!(document.layers.effects(id).is_some());
+}
+
+fn solid_fill_block(colour: V<'static>) -> Vec<u8> {
+    let mut out = 16_u32.to_be_bytes().to_vec();
+    out.extend_from_slice(&descriptor_bytes(&[(b"Clr ", colour)]));
+    out
+}
+
+#[test]
+fn solid_fill_layers_without_pixels_are_drawn_in_cmyk_and_32_bit_files() {
+    // CMYK: `CMYC` ink percentages go through the file's profile.
+    let profile = synthetic_cmyk_bytes();
+    let cmyc = V::Obj(vec![
+        (b"Cyn ", V::Doub(100.0)),
+        (b"Mgnt", V::Doub(25.0)),
+        (b"Ylw ", V::Doub(0.0)),
+        (b"Blck", V::Doub(10.0)),
+    ]);
+    let cmyk = TestPsd::new(1, 2, 2, 8)
+        .with(|p| {
+            p.color_mode = 4;
+            p.channels = 4;
+            p.resources = resource_1039(&profile);
+            p.layers.push(
+                TestLayer::empty("Fill")
+                    .with(|l| l.blocks.push((*b"SoCo", solid_fill_block(cmyc)))),
+            );
+        })
+        .write();
+    let got = first_pixels(&open(&cmyk), 1)[0];
+    let want = reference_cmyk([1.0, 0.25, 0.0, 0.1]);
+    assert!(
+        near(got, [want[0], want[1], want[2], 1.0], 3e-3),
+        "{got:?} vs {want:?}"
+    );
+    // 32-bit: the descriptor's 0..255 numbers are linear light x 255. The
+    // values are Photoshop's own (psd-tools `300dpi.psd`, "Shape 2"), whose
+    // merged image shows (0.8404, 0.2347, 0.2347) there.
+    let linear = V::Obj(vec![
+        (b"Rd  ", V::Doub(172.000_004_947_185_5)),
+        (b"Grn ", V::Doub(11.466_925_889_253_616)),
+        (b"Bl  ", V::Doub(11.466_925_889_253_616)),
+    ]);
+    let float = TestPsd::new(1, 2, 2, 32)
+        .with(|p| {
+            p.lr16 = true;
+            p.resources = resource_1039(&linear_srgb_bytes());
+            p.layers.push(
+                TestLayer::empty("Fill")
+                    .with(|l| l.blocks.push((*b"SoCo", solid_fill_block(linear)))),
+            );
+        })
+        .write();
+    let got = first_pixels(&open(&float), 1)[0];
+    assert!(near(got, [0.8404, 0.2347, 0.2347, 1.0], 2e-3), "{got:?}");
 }

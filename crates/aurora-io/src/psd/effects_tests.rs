@@ -185,7 +185,7 @@ pub(super) fn descriptor_bytes(items: &[(&[u8], V<'_>)]) -> Vec<u8> {
 }
 
 /// An `lfx2`-style block: object version 0, descriptor version 16.
-fn effects_block(items: &[(&[u8], V<'_>)]) -> Vec<u8> {
+pub(super) fn effects_block(items: &[(&[u8], V<'_>)]) -> Vec<u8> {
     let mut o = Vec::new();
     put_u32(&mut o, 0);
     put_u32(&mut o, 16);
@@ -208,7 +208,7 @@ pub(super) fn rgb<'a>(r: f64, g: f64, b: f64) -> V<'a> {
     ])
 }
 
-fn shadow<'a>(enab: bool, present: bool, distance: f64) -> V<'a> {
+pub(super) fn shadow<'a>(enab: bool, present: bool, distance: f64) -> V<'a> {
     V::Obj(vec![
         (b"enab", V::Bool(enab)),
         (b"present", V::Bool(present)),
