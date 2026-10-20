@@ -399,6 +399,53 @@ fn every_effect_kind_reads_back_equal() {
     assert!(!items.contains("couldn't"), "{items}");
 }
 
+/// Task 147: a straight ramp is written as Smoothness 0 (`Intr` 0) and a
+/// smoothed one as 100 % (4096), so both read back as they were and
+/// Photoshop shows the picture Aurora drew.
+#[test]
+fn a_straight_ramp_is_written_as_smoothness_zero_and_reads_back_straight() {
+    for smooth in [false, true] {
+        let mut fx = rich_effects();
+        for o in &mut fx.gradient_overlays {
+            o.gradient.smooth_ramp = smooth;
+        }
+        for stroke in &mut fx.strokes {
+            if let Some(aurora_core::effects::StrokePaint::Gradient { gradient, .. }) =
+                &mut stroke.paint
+            {
+                gradient.smooth_ramp = smooth;
+            }
+        }
+        assert_eq!(fx.gradient_overlay_ramps(), vec![smooth]);
+        assert!(fx.stroke_gradient_ramps().contains(&smooth));
+        let (mut doc, id) = doc_with(fx, &[pattern("pat-a")]);
+        let want = normalised(&doc.tree, id);
+        let (bytes, _) = write_on(&mut doc);
+        let (back, rid) = read_ids(&bytes);
+        assert_eq!(normalised(&back.layers, rid), want, "smooth {smooth}");
+        let got = back.layers.effects(rid);
+        assert_eq!(
+            got.map(aurora_core::LayerEffects::gradient_overlay_ramps),
+            Some(vec![smooth]),
+            "smooth {smooth}"
+        );
+        // The descriptor itself.
+        let d = parse(&lfx2_of(&bytes));
+        let intr = d
+            .get(b"GrFl")
+            .and_then(Value::descriptor)
+            .and_then(|g| g.get(b"Grad"))
+            .and_then(Value::descriptor)
+            .and_then(|g| g.get(b"Intr"))
+            .and_then(Value::number);
+        assert_eq!(
+            intr,
+            Some(if smooth { 4096.0 } else { 0.0 }),
+            "smooth {smooth}"
+        );
+    }
+}
+
 #[test]
 fn single_instances_use_single_keys_and_two_use_the_multi_list() {
     let (mut doc, _) = doc_with(rich_effects(), &[pattern("pat-a")]);
