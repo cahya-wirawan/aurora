@@ -1553,18 +1553,22 @@ fn a_gradient_with_a_raster_mask_spans_the_mask_rectangle() {
         return;
     };
     let document = open(&bytes);
-    let merged = merged_image_in_working_space(&bytes).expect("merged image");
+    let Ok(merged) = merged_image_in_working_space(&bytes) else {
+        unreachable!("the merged image")
+    };
     let level = |image: &crate::image::Image, x: u32, y: u32, c: usize| {
         let i = ((y * image.width() + x) * 4) as usize + c;
         (f64::from(image.samples()[i].to_f32()) * 255.0).round()
     };
     // The gradient layer is the topmost 100 x 150 pixel layer.
-    let layer = document
+    let Some(layer) = document
         .pixels
         .iter()
         .map(|p| &p.image)
         .rfind(|i| (i.width(), i.height()) == (100, 150))
-        .expect("the gradient layer");
+    else {
+        unreachable!("the gradient layer")
+    };
     for y in [12_u32, 30, 48, 66, 84, 96] {
         for c in 0..3 {
             let (got, want) = (level(layer, 51, y, c), level(&merged, 51, y, c));
