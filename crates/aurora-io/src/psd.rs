@@ -3277,7 +3277,7 @@ fn decode_pending(
 
 /// A CMYK layer (task 146): the four ink planes and the transparency plane
 /// are decoded one at a time and converted to the working space in one
-/// pass ([`colour_cmyk::CmykConverter::convert_planes`]); the layer's image
+/// pass (`CmykConverter::convert_planes`); the layer's image
 /// is therefore already sRGB.
 #[allow(clippy::many_single_char_names)] // c, m, y, k, a: the planes' own names
 fn decode_pending_cmyk(

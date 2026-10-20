@@ -109,7 +109,7 @@ pub(super) fn parse(key: [u8; 4], data: &[u8]) -> Result<Fill, LeftOut> {
     parse_in(key, data, None)
 }
 
-/// [`parse`] for a file whose colours may be CMYK.
+/// `parse` for a file whose colours may be CMYK.
 pub(super) fn parse_in(key: [u8; 4], data: &[u8], cmyk: CmykColours<'_>) -> Result<Fill, LeftOut> {
     if &key == b"PtFl" {
         return Err(LeftOut::Pattern);
@@ -361,7 +361,7 @@ pub(super) fn parse_artboard(data: &[u8]) -> Result<Option<ArtboardBackground>, 
     parse_artboard_in(data, None)
 }
 
-/// [`parse_artboard`] for a file whose colours may be CMYK.
+/// `parse_artboard` for a file whose colours may be CMYK.
 pub(super) fn parse_artboard_in(
     data: &[u8],
     cmyk: CmykColours<'_>,

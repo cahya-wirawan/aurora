@@ -5,7 +5,7 @@
 //! of cyan, magenta, yellow and black; a caller reading a Photoshop file
 //! must invert its stored channels first (Photoshop stores `255` for "no
 //! ink"). The transform is relative colorimetric with black point
-//! compensation, the same policy as [`Transform::to_working`] for RGB.
+//! compensation, the same policy as `Transform::to_working` for RGB.
 //!
 //! `lcms2` takes floating-point CMYK as a percentage (`0..=100`); that scale
 //! is hidden here (`transform` multiplies by 100), and a test pins it.
