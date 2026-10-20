@@ -27,16 +27,64 @@ pub const DEFAULT_ZOOM: f32 = 1.0;
 pub const MIN_ZOOM: f32 = 0.01;
 pub const MAX_ZOOM: f32 = 64.0;
 
+/// What a view needs to know to centre a document that is smaller than the
+/// canvas area (task 144): the area's logical size, the document's size in
+/// pixels and the window's scale factor (the centred position is rounded to
+/// a whole physical pixel, so the picture is not resampled).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewFit {
+    /// The canvas area's size in **logical** pixels.
+    pub canvas: (f32, f32),
+    /// The document's size in pixels.
+    pub doc: (u32, u32),
+    /// The window's scale factor (physical pixels per logical pixel);
+    /// anything not finite and positive reads as 1.
+    pub scale_factor: f32,
+}
+
+/// The pan that centres a document of `doc` pixels, at `zoom`, in a
+/// `canvas` of the same unit on one axis -- or `None` when the document is
+/// larger than the canvas on that axis (or either size is not finite), so
+/// it is not centred and the view's own pan applies. The position is
+/// rounded to a whole physical pixel (`scale_factor` physical pixels per
+/// unit). A document exactly as large as the canvas is centred (pan 0).
+#[must_use]
+pub fn centred_axis_pan(zoom: f32, canvas: f32, doc: u32, scale_factor: f32) -> Option<f32> {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let extent = doc as f32 * zoom;
+    (extent.is_finite() && canvas.is_finite() && extent <= canvas)
+        .then(|| ((canvas - extent) / 2.0 * scale).round() / scale)
+}
+
 /// Maps between document-pixel space and the canvas area's own logical
 /// screen space: `to_screen(doc) = doc * zoom + pan`.
 ///
 /// `pan` is the screen position (in the canvas area's own logical
 /// pixels, i.e. relative to its own top-left, not the window's) that
 /// document-space `(0, 0)` currently renders at.
+///
+/// **Centring (task 144).** Once the app hands the view a [`ViewFit`]
+/// ([`Self::set_fit`]), an axis on which the document at the current zoom
+/// is not larger than the canvas area is *centred*: its pan is the
+/// centring one whatever was stored, at every zoom, so the document does
+/// not jump when the zoom crosses 1.0 or any other value. Every reader
+/// ([`Self::pan`], [`Self::to_screen`], [`Self::to_document`]) sees the
+/// centred pan, so the pointer, the painted pixels, the overlays and the
+/// frame cannot disagree; a centred axis cannot be panned
+/// ([`Self::pan_by`], the pan clamps skip it) and a zoom keeps it centred
+/// ([`Self::zoom_at`]). An axis on which the document is larger behaves
+/// exactly as a view with no fit does.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CanvasView {
+    /// The stored pan; on a centred axis it is not what is read.
     pan: (f32, f32),
     zoom: f32,
+    fit: Option<ViewFit>,
     /// The lower bound [`Self::zoom_at`] clamps to, on top of
     /// [`MIN_ZOOM`] — see [`Self::set_min_zoom`]. [`MIN_ZOOM`] until a
     /// caller sets it, so a `CanvasView` built by anything that doesn't
@@ -52,6 +100,7 @@ impl CanvasView {
         Self {
             pan: (0.0, 0.0),
             zoom: DEFAULT_ZOOM,
+            fit: None,
             min_zoom: MIN_ZOOM,
         }
     }
@@ -61,9 +110,54 @@ impl CanvasView {
         self.zoom
     }
 
+    /// The pan in force: the stored one, except on a centred axis
+    /// ([`ViewFit`]), where it is the centring pan.
     #[must_use]
-    pub const fn pan(&self) -> (f32, f32) {
-        self.pan
+    pub fn pan(&self) -> (f32, f32) {
+        let (cx, cy) = self.centred_pan_per_axis();
+        (cx.unwrap_or(self.pan.0), cy.unwrap_or(self.pan.1))
+    }
+
+    /// The fit the view centres by, if the app gave it one.
+    #[must_use]
+    pub const fn fit(&self) -> Option<ViewFit> {
+        self.fit
+    }
+
+    /// Whether the document is centred on the x axis and on the y axis at
+    /// the current zoom (neither without a [`ViewFit`]).
+    #[must_use]
+    pub fn centred(&self) -> (bool, bool) {
+        let (cx, cy) = self.centred_pan_per_axis();
+        (cx.is_some(), cy.is_some())
+    }
+
+    /// The centring pan of each axis, `None` where the axis is not
+    /// centred.
+    fn centred_pan_per_axis(&self) -> (Option<f32>, Option<f32>) {
+        match self.fit {
+            Some(fit) => (
+                centred_axis_pan(self.zoom, fit.canvas.0, fit.doc.0, fit.scale_factor),
+                centred_axis_pan(self.zoom, fit.canvas.1, fit.doc.1, fit.scale_factor),
+            ),
+            None => (None, None),
+        }
+    }
+
+    /// Gives the view (or takes from it) the sizes it centres by. An axis
+    /// that is no longer centred keeps the pan it was shown at, so a
+    /// window that shrinks past the document does not move it; the pan
+    /// clamps then apply as usual.
+    pub fn set_fit(&mut self, fit: Option<ViewFit>) {
+        let shown = self.pan();
+        self.fit = fit;
+        let (cx, cy) = self.centred_pan_per_axis();
+        if cx.is_none() {
+            self.pan.0 = shown.0;
+        }
+        if cy.is_none() {
+            self.pan.1 = shown.1;
+        }
     }
 
     /// The current effective lower zoom bound — [`MIN_ZOOM`], or
@@ -177,41 +271,70 @@ impl CanvasView {
     /// screen space.
     #[must_use]
     pub fn to_screen(&self, doc: (f32, f32)) -> (f32, f32) {
-        (
-            doc.0 * self.zoom + self.pan.0,
-            doc.1 * self.zoom + self.pan.1,
-        )
+        let pan = self.pan();
+        (doc.0 * self.zoom + pan.0, doc.1 * self.zoom + pan.1)
     }
 
     /// Converts a point in the canvas area's own logical screen space to
     /// document space — the exact inverse of [`Self::to_screen`].
     #[must_use]
     pub fn to_document(&self, screen: (f32, f32)) -> (f32, f32) {
+        let pan = self.pan();
         (
-            (screen.0 - self.pan.0) / self.zoom,
-            (screen.1 - self.pan.1) / self.zoom,
+            (screen.0 - pan.0) / self.zoom,
+            (screen.1 - pan.1) / self.zoom,
         )
     }
 
     /// Pans by `delta` logical screen pixels (e.g. a drag delta) —
     /// dragging right/down moves the view right/down, the direction a
     /// real "hand tool" drag follows.
+    ///
+    /// A centred axis ([`ViewFit`]) does not move: a document smaller than
+    /// the canvas area has nothing to pan on that axis.
     pub fn pan_by(&mut self, delta: (f32, f32)) {
-        self.pan.0 += delta.0;
-        self.pan.1 += delta.1;
+        let (cx, cy) = self.centred_pan_per_axis();
+        if cx.is_none() {
+            self.pan.0 += delta.0;
+        }
+        if cy.is_none() {
+            self.pan.1 += delta.1;
+        }
     }
 
     /// Zooms to `new_zoom` (clamped to [`Self::min_zoom`]/[`MAX_ZOOM`]),
     /// keeping the document point currently under `screen_anchor` at the
     /// same screen position — "zoom toward the cursor," not toward the
     /// canvas area's own top-left corner.
+    ///
+    /// An axis that is centred before the zoom ([`ViewFit`]) zooms about
+    /// the canvas area's centre instead of `screen_anchor`: the document
+    /// stays centred while it is small, and when it outgrows the area it
+    /// does so symmetrically, so its position is continuous across the
+    /// zoom at which it fills the area.
     pub fn zoom_at(&mut self, screen_anchor: (f32, f32), new_zoom: f32) {
         let new_zoom = new_zoom.clamp(self.min_zoom(), MAX_ZOOM);
-        let doc_anchor = self.to_document(screen_anchor);
+        let (cx, cy) = self.centred_pan_per_axis();
+        let (half_w, half_h) = self
+            .fit
+            .map_or((0.0, 0.0), |fit| (fit.canvas.0 / 2.0, fit.canvas.1 / 2.0));
+        let anchor = (
+            if cx.is_some() {
+                half_w
+            } else {
+                screen_anchor.0
+            },
+            if cy.is_some() {
+                half_h
+            } else {
+                screen_anchor.1
+            },
+        );
+        let doc_anchor = self.to_document(anchor);
         self.zoom = new_zoom;
         self.pan = (
-            screen_anchor.0 - doc_anchor.0 * new_zoom,
-            screen_anchor.1 - doc_anchor.1 * new_zoom,
+            anchor.0 - doc_anchor.0 * new_zoom,
+            anchor.1 - doc_anchor.1 * new_zoom,
         );
     }
 
@@ -277,13 +400,20 @@ impl CanvasView {
     /// caller deriving `min_doc` some other way — parsed from a file, a
     /// division, an accumulated `f32` — owes it a finiteness check of
     /// its own before calling this.
+    ///
+    /// **A centred axis ([`ViewFit`]) is not clamped** (task 144): its
+    /// document starts right of / below the area's corner by design, and
+    /// every consumer places it there (the frame shifts its viewport; see
+    /// `aurora-app`'s `zoomed_view`), so the near bound has nothing to
+    /// protect on it.
     pub fn clamp_pan_to_minimum(&mut self, min_doc: (f32, f32)) {
+        let (cx, cy) = self.centred_pan_per_axis();
         let max_pan_x = -min_doc.0 * self.zoom;
-        if self.pan.0 > max_pan_x {
+        if cx.is_none() && self.pan.0 > max_pan_x {
             self.pan.0 = max_pan_x;
         }
         let max_pan_y = -min_doc.1 * self.zoom;
-        if self.pan.1 > max_pan_y {
+        if cy.is_none() && self.pan.1 > max_pan_y {
             self.pan.1 = max_pan_y;
         }
     }
@@ -352,13 +482,17 @@ impl CanvasView {
     /// that; it costs nothing on the real path, since `aurora-app`
     /// derives both arguments from an `i64` layer origin and a
     /// laid-out widget rectangle, all finite by construction.
+    ///
+    /// A centred axis ([`ViewFit`]) is skipped, as in
+    /// [`Self::clamp_pan_to_minimum`].
     pub fn clamp_pan_to_maximum(&mut self, max_doc: (f32, f32), canvas_size: (f32, f32)) {
+        let (cx, cy) = self.centred_pan_per_axis();
         let min_pan_x = canvas_size.0 - max_doc.0 * self.zoom;
-        if min_pan_x.is_finite() && self.pan.0 < min_pan_x {
+        if cx.is_none() && min_pan_x.is_finite() && self.pan.0 < min_pan_x {
             self.pan.0 = min_pan_x;
         }
         let min_pan_y = canvas_size.1 - max_doc.1 * self.zoom;
-        if min_pan_y.is_finite() && self.pan.1 < min_pan_y {
+        if cy.is_none() && min_pan_y.is_finite() && self.pan.1 < min_pan_y {
             self.pan.1 = min_pan_y;
         }
     }
@@ -934,3 +1068,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "canvas_view_centring_tests.rs"]
+mod centring_tests;

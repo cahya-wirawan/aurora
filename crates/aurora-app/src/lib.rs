@@ -549,6 +549,8 @@ mod background_autosave;
 mod background_composite;
 mod background_open;
 mod bench_launch;
+#[cfg(test)]
+mod centred_view_tests;
 mod channels_app;
 mod clipboard_app;
 mod clipboard_pixels;
@@ -30756,57 +30758,56 @@ fn load_document_view(
 /// to have). Named `canvas_local_origin` rather than the old
 /// `tile_origin_for_view`, since "tile origin" no longer describes what
 /// this returns.
-/// The render viewport the zoomed-out atlas draws into: the canvas area
-/// rectangle less the frame's shift (a centred document starts right of /
-/// below the area's corner), never past the area.
+/// The render viewport an atlas draws into when the picture starts
+/// `shift_px` physical pixels in from the canvas area's corner (a document
+/// smaller than the area is centred, task 144; 0.275.0 for the zoomed-out
+/// view): the canvas area rectangle less the shift, never past the area.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
-fn zoomed_view_rect(
+fn shifted_view_rect(
     (x, y, w, h): (f32, f32, f32, f32),
-    frame: &zoomed_view::ZoomedFrame,
+    shift_px: (u32, u32),
 ) -> (f32, f32, f32, f32) {
-    let sx = (frame.shift_px.0 as f32).min((w - 1.0).max(0.0));
-    let sy = (frame.shift_px.1 as f32).min((h - 1.0).max(0.0));
+    let sx = (shift_px.0 as f32).min((w - 1.0).max(0.0));
+    let sy = (shift_px.1 as f32).min((h - 1.0).max(0.0));
     (x + sx, y + sy, (w - sx).max(1.0), (h - sy).max(1.0))
 }
 
-/// While the view is zoomed out below the 1:1 atlas floor, centres the
-/// document on any axis where it is narrower than the canvas area (0.275.0),
-/// keeping a live drag's reference under the pointer as
-/// [`apply_canvas_min_zoom`] does. At or above the floor nothing changes
-/// (the document stays pinned to its corner as before).
-fn apply_zoomed_out_centring(
-    view: &mut aurora_ui::CanvasView,
-    drag: Option<&mut Drag>,
-    pointer: Option<(f32, f32)>,
-    atlas_floor: f32,
+/// What the view centres by (task 144): the canvas area's logical size, the
+/// document's size and the scale factor; `None` before the first layout (no
+/// size to centre in).
+#[must_use]
+fn view_fit(
     canvas_logical: Option<(f32, f32)>,
     doc_size: (u32, u32),
     scale_factor: f64,
+) -> Option<aurora_ui::ViewFit> {
+    canvas_logical.map(|canvas| aurora_ui::ViewFit {
+        canvas,
+        doc: doc_size,
+        scale_factor: guarded_scale_factor(scale_factor),
+    })
+}
+
+/// Gives `view` the sizes it centres a document smaller than the canvas
+/// area by (task 144), keeping a live drag's reference under the pointer as
+/// [`apply_canvas_min_zoom`] does when the document moves under it (the
+/// area resized, the document replaced). Changing nothing when the fit is
+/// the one the view already holds.
+fn apply_view_fit(
+    view: &mut aurora_ui::CanvasView,
+    drag: Option<&mut Drag>,
+    pointer: Option<(f32, f32)>,
+    fit: Option<aurora_ui::ViewFit>,
 ) {
-    let zoom = effective_residency_zoom(view.zoom(), scale_factor);
-    if zoom >= atlas_floor {
-        return;
-    }
-    let Some(canvas_logical) = canvas_logical else {
-        return;
-    };
-    let pan = zoomed_view::centred_pan(
-        view.pan(),
-        view.zoom(),
-        canvas_logical,
-        doc_size,
-        guarded_scale_factor(scale_factor),
-    );
-    let before_pan = view.pan();
-    if pan == before_pan {
+    if view.fit() == fit {
         return;
     }
     let anchor = drag.as_deref().and_then(|drag| {
         pointer.or_else(|| drag_reference(drag).map(|reference| view.to_screen(reference)))
     });
     let before = anchor.map(|anchor| view.to_document(anchor));
-    view.pan_by((pan.0 - before_pan.0, pan.1 - before_pan.1));
+    view.set_fit(fit);
     if let (Some(drag), Some(anchor), Some(before)) = (drag, anchor, before) {
         let after = view.to_document(anchor);
         shift_drag_reference(drag, (after.0 - before.0, after.1 - before.1));
@@ -34181,9 +34182,11 @@ impl App {
     /// ([`Self::sample_eyedropper`]) every event, so dragging with the
     /// Eyedropper tool held down updates the foreground colour live, the
     /// same as a real image editor's own eyedropper.
+    #[allow(clippy::too_many_lines)]
     fn handle_pointer_moved(&mut self, physical_position: (f64, f64)) {
         let position = logical_point(physical_position, self.scale_factor);
         self.pointer_position = Some(position);
+        self.sync_view_fit();
 
         // 0.257.0: while the command palette is open nothing underneath
         // follows the pointer (a drag begun before it opened resumes, or
@@ -34342,6 +34345,7 @@ impl App {
         let Some(position) = self.pointer_position else {
             return;
         };
+        self.sync_view_fit();
         // 0.262.0: a press hides the tooltip before it is routed, so a
         // tooltip over the press can never swallow it.
         self.dismiss_tooltip();
@@ -35687,6 +35691,7 @@ impl App {
     /// [`panel_scroll_delta`] for the units. A scroll that moved nothing
     /// (either end of the range) relayouts nothing.
     fn handle_mouse_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
+        self.sync_view_fit();
         let Some(position) = self.pointer_position else {
             return;
         };
@@ -37428,9 +37433,32 @@ impl App {
     /// this call — the same "never actually happens for
     /// `workspace.canvas_area` in practice, but handle it honestly"
     /// stance `resumed`'s own analogous call already takes.
+    /// Hands the canvas view the sizes it centres a small document by
+    /// (task 144, [`apply_view_fit`]). Cheap and idempotent, so it runs
+    /// wherever the area, the document or the scale factor can have
+    /// changed and wherever the view is read: a resize, every frame, and the
+    /// start of each pointer and wheel event, so a pointer event arriving
+    /// before the next frame maps through the centred view the frame shows.
+    fn sync_view_fit(&mut self) {
+        let pointer = self
+            .pointer_position
+            .and_then(|position| pointer_in_canvas(&self.workspace, position));
+        apply_view_fit(
+            &mut self.doc.canvas_view,
+            self.drag.as_mut(),
+            pointer,
+            view_fit(
+                canvas_area_logical_size(&self.workspace),
+                self.doc.canvas_size,
+                self.scale_factor,
+            ),
+        );
+    }
+
     fn apply_resize(&mut self, physical_size: (u32, u32)) {
         let (width, height) = logical_size(physical_size, self.scale_factor);
         self.layout(width, height);
+        self.sync_view_fit();
 
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
@@ -37915,6 +37943,9 @@ impl App {
     // analogous reason.
     #[allow(clippy::too_many_lines)]
     fn redraw(&mut self) {
+        // Before anything reads the view (task 144): a document smaller than
+        // the area is centred by the view itself.
+        self.sync_view_fit();
         // The caret owner this frame paints with (0.139.0 blink),
         // recorded before any early return below — see
         // `CaretState::drawn_owner`.
@@ -37951,15 +37982,6 @@ impl App {
                 pointer,
                 canvas_min_zoom_within(canvas_size, self.scale_factor, limit),
                 bounds,
-            );
-            apply_zoomed_out_centring(
-                &mut self.doc.canvas_view,
-                self.drag.as_mut(),
-                pointer,
-                zoomed_view::atlas_floor(canvas_size, limit),
-                canvas_area_logical_size(&self.workspace),
-                self.doc.canvas_size,
-                self.scale_factor,
             );
         }
         // 0.162.0: after the zoom floor above (which can move the zoom),
@@ -38063,6 +38085,11 @@ impl App {
                     text,
                 );
 
+                // Physical pixels the 1:1 atlas's picture starts in from the
+                // canvas area's corner (task 144: a document smaller than
+                // the area is centred and the atlas cannot sample left of
+                // or above it; the viewport starts where the document does).
+                let mut atlas_shift = (0_u32, 0_u32);
                 // Sync before drawing, so this frame shows the latest
                 // painted pixels rather than lagging one frame behind.
                 if display_frame.is_some() {
@@ -38083,18 +38110,20 @@ impl App {
                             self.doc.canvas_size,
                             active_layer_origin(&self.doc.layers, self.doc.active_layer),
                         )));
-                        residency.set_origin(
-                            gpu.queue(),
+                        let zoom = effective_residency_zoom(
+                            self.doc.canvas_view.zoom(),
+                            self.scale_factor,
+                        );
+                        let placed = zoomed_view::placement(
                             canvas_local_origin(
                                 &self.doc.canvas_view,
                                 active_layer_origin(&self.doc.layers, self.doc.active_layer),
                             ),
+                            zoom,
                             canvas_size,
-                            effective_residency_zoom(
-                                self.doc.canvas_view.zoom(),
-                                self.scale_factor,
-                            ),
                         );
+                        atlas_shift = placed.shift_px;
+                        residency.set_origin(gpu.queue(), placed.origin, placed.viewport_px, zoom);
                     }
                     if let Some(store) = self.doc.tile_store.as_mut() {
                         recomposite_or_dispatch(
@@ -38175,7 +38204,10 @@ impl App {
                     let scissor =
                         viewport.and_then(|rect| clamp_canvas_to_surface(rect, surface.size()));
                     let viewport = match zoomed_frame.as_ref() {
-                        Some(frame) => viewport.map(|rect| zoomed_view_rect(rect, frame)),
+                        Some(frame) => viewport.map(|rect| shifted_view_rect(rect, frame.shift_px)),
+                        None if display_frame.is_none() => {
+                            viewport.map(|rect| shifted_view_rect(rect, atlas_shift))
+                        }
                         None => viewport,
                     };
                     // Task 142: the display texture, one draw per page in
