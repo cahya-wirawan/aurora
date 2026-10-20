@@ -4374,6 +4374,33 @@ fn layer_node(
     }))
 }
 
+/// The reference box of a drawn fill: a gradient's (the vector path's bounds;
+/// with no path, a raster user mask's rectangle, the layer's extent in
+/// task 147: `gradient-fill.psd`, a 100 x 150 canvas whose gradient layer has
+/// a 16 x 94 mask, whose Photoshop ramp spans the mask rectangle, mean error
+/// inside it 22 -> 4.5 levels against the canvas-sized ramp; else the
+/// canvas) or the canvas for a solid colour.
+fn fill_reference(
+    fill: &fill::Fill,
+    path_box: Option<Rect>,
+    record: &Record,
+    canvas: Rect,
+) -> Rect {
+    match fill {
+        fill::Fill::Gradient(g) => fill::reference_box(
+            g,
+            path_box.or_else(|| {
+                record
+                    .mask
+                    .map(|m| m.bounds)
+                    .filter(|b| b.width > 0 && b.height > 0)
+            }),
+            canvas,
+        ),
+        fill::Fill::Solid(_) => canvas,
+    }
+}
+
 /// A shape or fill layer that stores no pixels (task 108), drawn from its
 /// solid colour or gradient and its vector mask as an ordinary pixel layer.
 /// What cannot be drawn is left out and reported, as before.
@@ -4439,24 +4466,7 @@ fn drawn_fill_node(
         return left_out(notes, fill::LeftOut::TooLarge);
     }
     vector_budget.pixels -= charge;
-    let reference = match &fill {
-        // With no vector path, a raster user mask's rectangle is the
-        // layer's extent (task 147: `gradient-fill.psd`, a 100 x 150 canvas
-        // whose gradient layer has a 16 x 94 mask: Photoshop's ramp spans
-        // the mask rectangle, mean error inside it 22 -> 4.5 levels against
-        // the canvas-sized ramp).
-        fill::Fill::Gradient(g) => fill::reference_box(
-            g,
-            path_box.or_else(|| {
-                record
-                    .mask
-                    .map(|m| m.bounds)
-                    .filter(|b| b.width > 0 && b.height > 0)
-            }),
-            canvas,
-        ),
-        fill::Fill::Solid(_) => canvas,
-    };
+    let reference = fill_reference(&fill, path_box, record, canvas);
     let Some(samples) = fill::render(&fill, region, reference, raster.as_ref(), density) else {
         return left_out(notes, fill::LeftOut::TooLarge);
     };

@@ -1532,3 +1532,46 @@ fn a_cmyk_brightness_contrast_layer_is_applied_on_the_converted_colours() {
         Some(aurora_doc::Adjustment::BrightnessContrast(_))
     ));
 }
+
+/// Task 147: `gradient-fill.psd` is a 32-bit gradient layer with a 16 x 94
+/// raster mask on a 100 x 150 canvas. Photoshop's ramp spans the mask
+/// rectangle: against its merged image, down the mask's middle column, the
+/// drawn gradient is within 20 levels at every sampled row (a canvas-sized
+/// ramp is 60 levels off at the bottom: 181 against 118 in red).
+#[test]
+fn a_gradient_with_a_raster_mask_spans_the_mask_rectangle() {
+    let Some(bytes) = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../corpora/psd/reference/psd-tools-fixtures/gradient-fill.psd"),
+    )
+    .ok() else {
+        println!("SKIPPED: corpus file gradient-fill.psd not present");
+        assert!(
+            std::env::var_os("AURORA_REQUIRE_CORPUS").is_none(),
+            "AURORA_REQUIRE_CORPUS is set and gradient-fill.psd is missing"
+        );
+        return;
+    };
+    let document = open(&bytes);
+    let merged = merged_image_in_working_space(&bytes).expect("merged image");
+    let level = |image: &crate::image::Image, x: u32, y: u32, c: usize| {
+        let i = ((y * image.width() + x) * 4) as usize + c;
+        (f64::from(image.samples()[i].to_f32()) * 255.0).round()
+    };
+    // The gradient layer is the topmost 100 x 150 pixel layer.
+    let layer = document
+        .pixels
+        .iter()
+        .map(|p| &p.image)
+        .rfind(|i| (i.width(), i.height()) == (100, 150))
+        .expect("the gradient layer");
+    for y in [12_u32, 30, 48, 66, 84, 96] {
+        for c in 0..3 {
+            let (got, want) = (level(layer, 51, y, c), level(&merged, 51, y, c));
+            assert!(
+                (got - want).abs() <= 20.0,
+                "y {y} channel {c}: {got} vs {want}"
+            );
+        }
+    }
+}

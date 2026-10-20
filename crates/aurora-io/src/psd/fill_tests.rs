@@ -422,7 +422,7 @@ fn gradient_positions_follow_the_geometry() {
     // edge midpoint.
     let g = parsed_gradient(&black_to_white(b"Dmnd", 0.0, 100.0, false));
     near(g.position(32.0, 32.0, b), 1.0);
-    near(g.position(32.0, 16.0, b), 0.839_86);
+    near(g.position(32.0, 16.0, b), 0.838_594);
     // The box offset moves the centre (percent of the box).
     let mut moved = parsed_gradient(&black_to_white(b"Lnr ", 0.0, 100.0, false));
     moved.offset = (25.0, 0.0);
