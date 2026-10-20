@@ -1571,3 +1571,63 @@ fn the_conversion_is_kept_in_the_import_losses_text() {
     assert!(!line.contains("clipped"));
     assert!(aurora_io::converted_on_open_line("X", true).contains("clipped"));
 }
+
+/// A flat 2 x 1 CMYK PSD with no colour profile (task 146): header, empty
+/// colour-mode, resource and layer sections, one raw merged image.
+fn flat_cmyk_psd() -> Vec<u8> {
+    let mut o = Vec::new();
+    o.extend_from_slice(b"8BPS");
+    o.extend_from_slice(&1_u16.to_be_bytes());
+    o.extend_from_slice(&[0; 6]);
+    o.extend_from_slice(&4_u16.to_be_bytes()); // channels
+    o.extend_from_slice(&1_u32.to_be_bytes()); // height
+    o.extend_from_slice(&2_u32.to_be_bytes()); // width
+    o.extend_from_slice(&8_u16.to_be_bytes());
+    o.extend_from_slice(&4_u16.to_be_bytes()); // CMYK
+    o.extend_from_slice(&[0; 12]); // colour mode, resources, layer section
+    o.extend_from_slice(&0_u16.to_be_bytes()); // raw
+    o.extend_from_slice(&[255, 0, 255, 0, 255, 0, 255, 0]); // C, M, Y, K planes
+    o
+}
+
+#[test]
+fn a_cmyk_or_32_bit_open_carries_its_conversion_into_the_psd_save_report() {
+    // The 32-bit file is psd-tools' own fixture (tracked); the CMYK one is
+    // built here. Each open reports that its colours were converted and the
+    // original is not kept; the save carries those lines and asks.
+    let float = include_bytes!("../../aurora-io/tests/fixtures/psd/32bit5x5.psd").to_vec();
+    for (bytes, needle) in [
+        (flat_cmyk_psd(), "CMYK"),
+        (float, "32-bit floating point"),
+    ] {
+        let opened = ok(aurora_io::read_psd(&bytes));
+        assert!(
+            opened
+                .report
+                .items
+                .iter()
+                .any(|l| l.contains(needle) && l.contains("not kept")),
+            "{needle}: {:?}",
+            opened.report.items
+        );
+        let mut doc = Doc::new();
+        let target = doc.path("converted.psd");
+        ok(std::fs::write(&target, &bytes));
+        let carried = crate::psd_save::carried_losses(
+            Some(opened.report.items.as_slice()),
+            &aurora_io::SkippedTiles::new(),
+        );
+        assert!(
+            carried
+                .iter()
+                .any(|l| l.contains(needle) && l.contains("not kept")),
+            "{carried:?}"
+        );
+        let PsdSaveStep::NeedsConfirmation(pending) = ok(doc.save_carrying(&target, carried.clone()))
+        else {
+            unreachable!("a converted open asks before a PSD save")
+        };
+        assert_eq!(pending.report.items, carried);
+        assert_eq!(ok(std::fs::read(&target)), bytes, "target untouched");
+    }
+}
