@@ -31,7 +31,7 @@ fn measure(relative: &str) -> Option<(usize, Errors, Errors, Vec<String>)> {
         .join("../../corpora/psd/reference/psd-tools-fixtures")
         .join(relative);
     let Ok(bytes) = std::fs::read(&path) else {
-        println!("SKIPPED: corpus file not present at {}", path.display());
+        crate::open_time_tests::corpus_file_absent(&path);
         return None;
     };
     let merged = match aurora_io::decode_psd_merged_image(&bytes) {
@@ -401,7 +401,7 @@ fn corpus_files_with_the_five_kinds_survive_a_psd_save_and_reopen() {
             .join("../../corpora/psd/reference/psd-tools-fixtures")
             .join(relative);
         let Ok(bytes) = std::fs::read(&path) else {
-            println!("SKIPPED: corpus file not present at {}", path.display());
+            crate::open_time_tests::corpus_file_absent(&path);
             continue;
         };
         ran += 1;

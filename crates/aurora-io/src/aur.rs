@@ -415,8 +415,18 @@ fn read_layer_effects<R: Read + Seek>(
 /// names a layer that [`LAYER_EFFECTS_ENTRY`] already gave effects.
 const LAYER_GRADIENT_OVERLAYS_ENTRY: &str = "layer-gradient-overlays";
 
-/// [`LAYER_GRADIENT_OVERLAYS_ENTRY`]'s own schema version.
+/// [`LAYER_GRADIENT_OVERLAYS_ENTRY`]'s base schema version.
 const LAYER_GRADIENT_OVERLAYS_VERSION: u32 = 1;
+
+/// Version 2 (task 147) adds [`LayerGradientOverlaysWireV2::ramps`], the
+/// per-overlay smoothed-ramp flags (`aurora_core::GradientFill::smooth_ramp`
+/// is `#[serde(skip)]`). It is written **only** when some overlay has the
+/// flag set, so every save without one stays byte-identical to version 1
+/// and an older Aurora still reads it; a version-1 entry decodes with
+/// straight ramps, which is what every such file always drew. An Aurora
+/// older than this build refuses a version-2 entry (its version check),
+/// the policy of the other entries (ADR 0009).
+const LAYER_GRADIENT_OVERLAYS_VERSION_RAMPS: u32 = 2;
 
 /// [`LAYER_GRADIENT_OVERLAYS_ENTRY`]'s payload: version first (frozen),
 /// then one `(raw layer id, overlays)` pair per layer with some.
@@ -424,6 +434,43 @@ const LAYER_GRADIENT_OVERLAYS_VERSION: u32 = 1;
 struct LayerGradientOverlaysWire {
     version: u32,
     overlays: Vec<(u64, Vec<aurora_core::effects::GradientOverlay>)>,
+}
+
+/// [`LAYER_GRADIENT_OVERLAYS_ENTRY`]'s version-2 payload: the version-1
+/// fields, then one flag list per `overlays` pair, one flag per overlay.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LayerGradientOverlaysWireV2 {
+    version: u32,
+    overlays: Vec<(u64, Vec<aurora_core::effects::GradientOverlay>)>,
+    ramps: Vec<(u64, Vec<bool>)>,
+}
+
+/// The entry's bytes for `layers`, or `None` when no layer has gradient
+/// overlays: version 1 unless some overlay has a smoothed ramp.
+fn layer_gradient_overlays_bytes(layers: &LayerTree) -> Result<Option<Vec<u8>>, IoError> {
+    let overlays = layer_gradient_overlay_pairs(layers);
+    if overlays.is_empty() {
+        return Ok(None);
+    }
+    let ramps: Vec<(u64, Vec<bool>)> = overlays
+        .iter()
+        .map(|(raw, list)| (*raw, list.iter().map(|o| o.gradient.smooth_ramp).collect()))
+        .collect();
+    let bytes = if ramps.iter().any(|(_, flags)| flags.iter().any(|f| *f)) {
+        postcard::to_allocvec(&LayerGradientOverlaysWireV2 {
+            version: LAYER_GRADIENT_OVERLAYS_VERSION_RAMPS,
+            overlays,
+            ramps,
+        })
+    } else {
+        postcard::to_allocvec(&LayerGradientOverlaysWire {
+            version: LAYER_GRADIENT_OVERLAYS_VERSION,
+            overlays,
+        })
+    };
+    bytes
+        .map(Some)
+        .map_err(|source| IoError::ManifestSerialization(source.to_string()))
 }
 
 fn layer_gradient_overlay_pairs(
@@ -456,21 +503,46 @@ fn read_layer_gradient_overlays<R: Read + Seek>(
     };
     let (prefix, _rest) = postcard::take_from_bytes::<MaskDensityPrefix>(&bytes)
         .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
-    if prefix.version != LAYER_GRADIENT_OVERLAYS_VERSION {
-        let cause = if prefix.version > LAYER_GRADIENT_OVERLAYS_VERSION {
+    if prefix.version != LAYER_GRADIENT_OVERLAYS_VERSION
+        && prefix.version != LAYER_GRADIENT_OVERLAYS_VERSION_RAMPS
+    {
+        let cause = if prefix.version > LAYER_GRADIENT_OVERLAYS_VERSION_RAMPS {
             "the file was saved by a newer Aurora"
         } else {
             "the entry is damaged or of an unknown kind"
         };
         return Err(IoError::ManifestDeserialization(format!(
             "unsupported layer-gradient-overlays version {} (this build understands version \
-             {LAYER_GRADIENT_OVERLAYS_VERSION}); {cause}",
+             {LAYER_GRADIENT_OVERLAYS_VERSION_RAMPS}); {cause}",
             prefix.version
         )));
     }
-    let wire: LayerGradientOverlaysWire = postcard::from_bytes(&bytes)
-        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
-    for (raw, overlays) in wire.overlays {
+    let bad = |what: &str| IoError::ManifestDeserialization(format!("gradient overlays: {what}"));
+    // Version 1: straight ramps (the flags default to off). Version 2: the
+    // flags, which must match the overlays one for one.
+    let (overlays_by_layer, ramps) = if prefix.version == LAYER_GRADIENT_OVERLAYS_VERSION {
+        let wire: LayerGradientOverlaysWire = postcard::from_bytes(&bytes)
+            .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+        (wire.overlays, None)
+    } else {
+        let wire: LayerGradientOverlaysWireV2 = postcard::from_bytes(&bytes)
+            .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+        if wire.ramps.len() != wire.overlays.len() {
+            return Err(bad("the ramp flags do not match the layers"));
+        }
+        (wire.overlays, Some(wire.ramps))
+    };
+    for (index, (raw, mut overlays)) in overlays_by_layer.into_iter().enumerate() {
+        if let Some(ramps) = &ramps {
+            let flags = ramps
+                .get(index)
+                .filter(|(r, f)| *r == raw && f.len() == overlays.len())
+                .map(|(_, f)| f)
+                .ok_or_else(|| bad("the ramp flags do not match the overlays"))?;
+            for (overlay, flag) in overlays.iter_mut().zip(flags) {
+                overlay.gradient.smooth_ramp = *flag;
+            }
+        }
         let id = aurora_doc::LayerId::from_raw(raw);
         let mut effects = layers.effects(id).cloned().ok_or_else(|| {
             IoError::ManifestDeserialization(
@@ -679,8 +751,17 @@ fn read_layer_patterns<R: Read + Seek>(
 /// refuses the open loudly.
 const LAYER_STROKE_PAINTS_ENTRY: &str = "layer-stroke-paints";
 
-/// [`LAYER_STROKE_PAINTS_ENTRY`]'s own schema version.
+/// [`LAYER_STROKE_PAINTS_ENTRY`]'s base schema version.
 const LAYER_STROKE_PAINTS_VERSION: u32 = 1;
+
+/// Version 2 (task 147): the version-1 payload followed by one flag list
+/// per pair (a `Vec<(u64, Vec<bool>)>`, one flag per stroke: whether its
+/// gradient paint has a smoothed ramp, `aurora_core::GradientFill::
+/// smooth_ramp` being `#[serde(skip)]`). Written **only** when some stroke
+/// paint has the flag, so every other save stays byte-identical to version
+/// 1; a version-1 entry decodes with straight ramps, what such files always
+/// drew. An older Aurora refuses version 2 (ADR 0009).
+const LAYER_STROKE_PAINTS_VERSION_RAMPS: u32 = 2;
 
 /// One layer's stroke paints, one per stroke in order.
 type StrokePaintList = Vec<Option<aurora_core::effects::StrokePaint>>;
@@ -827,6 +908,44 @@ impl<'de> serde::de::DeserializeSeed<'de> for PaintListSeed {
     }
 }
 
+/// The entry's bytes for `layers`, or `None` when no stroke has a paint:
+/// version 1 unless some gradient paint has a smoothed ramp.
+fn layer_stroke_paints_bytes(layers: &LayerTree) -> Result<Option<Vec<u8>>, IoError> {
+    let paints = layer_stroke_paint_pairs(layers);
+    if paints.is_empty() {
+        return Ok(None);
+    }
+    let ramps: Vec<(u64, Vec<bool>)> = paints
+        .iter()
+        .map(|(raw, list)| {
+            (
+                *raw,
+                list.iter()
+                    .map(|p| {
+                        matches!(p, Some(aurora_core::effects::StrokePaint::Gradient { gradient, .. })
+                            if gradient.smooth_ramp)
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    let smooth = ramps.iter().any(|(_, flags)| flags.iter().any(|f| *f));
+    let ser = |source: postcard::Error| IoError::ManifestSerialization(source.to_string());
+    let mut bytes = postcard::to_allocvec(&LayerStrokePaintsWire {
+        version: if smooth {
+            LAYER_STROKE_PAINTS_VERSION_RAMPS
+        } else {
+            LAYER_STROKE_PAINTS_VERSION
+        },
+        paints,
+    })
+    .map_err(ser)?;
+    if smooth {
+        bytes.extend_from_slice(&postcard::to_allocvec(&ramps).map_err(ser)?);
+    }
+    Ok(Some(bytes))
+}
+
 fn layer_stroke_paint_pairs(layers: &LayerTree) -> Vec<(u64, StrokePaintList)> {
     layer_ids(layers)
         .into_iter()
@@ -861,15 +980,17 @@ fn read_layer_stroke_paints<R: Read + Seek>(
     };
     let (prefix, _rest) = postcard::take_from_bytes::<MaskDensityPrefix>(&bytes)
         .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
-    if prefix.version != LAYER_STROKE_PAINTS_VERSION {
-        let cause = if prefix.version > LAYER_STROKE_PAINTS_VERSION {
+    if prefix.version != LAYER_STROKE_PAINTS_VERSION
+        && prefix.version != LAYER_STROKE_PAINTS_VERSION_RAMPS
+    {
+        let cause = if prefix.version > LAYER_STROKE_PAINTS_VERSION_RAMPS {
             "the file was saved by a newer Aurora"
         } else {
             "the entry is damaged or of an unknown kind"
         };
         return Err(IoError::ManifestDeserialization(format!(
             "unsupported layer-stroke-paints version {} (this build understands version \
-             {LAYER_STROKE_PAINTS_VERSION}); {cause}",
+             {LAYER_STROKE_PAINTS_VERSION_RAMPS}); {cause}",
             prefix.version
         )));
     }
@@ -878,17 +999,42 @@ fn read_layer_stroke_paints<R: Read + Seek>(
     // `Vec` would let a 16 MiB entry allocate gigabytes): at most one pair
     // per layer of the document, at most `MAX_EFFECT_INSTANCES` paints per
     // pair, each count checked before anything is allocated for it.
-    let wire = {
+    let bad = |what: &str| IoError::ManifestDeserialization(format!("stroke paints: {what}"));
+    let (wire, ramps) = {
         use serde::de::DeserializeSeed;
         let mut de = postcard::Deserializer::from_bytes(&bytes);
-        StrokePaintsSeed {
+        let wire = StrokePaintsSeed {
             max_layers: layers.len(),
         }
         .deserialize(&mut de)
-        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+        // Version 2 appends the ramp flags (one list per pair).
+        let ramps = if prefix.version == LAYER_STROKE_PAINTS_VERSION_RAMPS {
+            let rest = de
+                .finalize()
+                .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+            let ramps: Vec<(u64, Vec<bool>)> = postcard::from_bytes(rest)
+                .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+            if ramps.len() != wire.paints.len() {
+                return Err(bad("the ramp flags do not match the layers"));
+            }
+            Some(ramps)
+        } else {
+            None
+        };
+        (wire, ramps)
     };
-    let bad = |what: &str| IoError::ManifestDeserialization(format!("stroke paints: {what}"));
-    for (raw, paints) in wire.paints {
+    for (index, (raw, paints)) in wire.paints.into_iter().enumerate() {
+        let flags = match &ramps {
+            Some(ramps) => Some(
+                ramps
+                    .get(index)
+                    .filter(|(r, f)| *r == raw && f.len() == paints.len())
+                    .map(|(_, f)| f.clone())
+                    .ok_or_else(|| bad("the ramp flags do not match the strokes"))?,
+            ),
+            None => None,
+        };
         let id = aurora_doc::LayerId::from_raw(raw);
         let mut effects = layers
             .effects(id)
@@ -896,6 +1042,14 @@ fn read_layer_stroke_paints<R: Read + Seek>(
             .ok_or_else(|| bad("paints on a layer without effects"))?;
         if effects.strokes.len() != paints.len() {
             return Err(bad("the paints do not match the layer's strokes"));
+        }
+        let mut paints = paints;
+        if let Some(flags) = &flags {
+            for (paint, flag) in paints.iter_mut().zip(flags) {
+                if let Some(aurora_core::effects::StrokePaint::Gradient { gradient, .. }) = paint {
+                    gradient.smooth_ramp = *flag;
+                }
+            }
         }
         for (stroke, paint) in effects.strokes.iter_mut().zip(paints) {
             if let Some(aurora_core::effects::StrokePaint::Pattern { pattern, .. }) = &paint
@@ -2459,32 +2613,8 @@ impl DocumentEntries {
                     .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
             )
         };
-        let overlays = layer_gradient_overlay_pairs(layers);
-        let layer_gradient_overlays = if overlays.is_empty() {
-            None
-        } else {
-            let wire = LayerGradientOverlaysWire {
-                version: LAYER_GRADIENT_OVERLAYS_VERSION,
-                overlays,
-            };
-            Some(
-                postcard::to_allocvec(&wire)
-                    .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
-            )
-        };
-        let paints = layer_stroke_paint_pairs(layers);
-        let layer_stroke_paints = if paints.is_empty() {
-            None
-        } else {
-            let wire = LayerStrokePaintsWire {
-                version: LAYER_STROKE_PAINTS_VERSION,
-                paints,
-            };
-            Some(
-                postcard::to_allocvec(&wire)
-                    .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
-            )
-        };
+        let layer_gradient_overlays = layer_gradient_overlays_bytes(layers)?;
+        let layer_stroke_paints = layer_stroke_paints_bytes(layers)?;
         let clipped = layer_clipping_ids(layers);
         let layer_clipping = if clipped.is_empty() {
             None
@@ -8145,7 +8275,7 @@ mod tests {
                 reverse: true,
                 align: true,
                 offset: (10.0, -5.0),
-                linear_ramp: false,
+                smooth_ramp: true,
             },
             dither: true,
             reference: Some(aurora_core::effects::ReferenceBox {
@@ -8338,7 +8468,7 @@ mod tests {
         for (payload, needle) in [
             (
                 encode(&super::LayerGradientOverlaysWire {
-                    version: super::LAYER_GRADIENT_OVERLAYS_VERSION + 1,
+                    version: super::LAYER_GRADIENT_OVERLAYS_VERSION_RAMPS + 1,
                     overlays: Vec::new(),
                 }),
                 "saved by a newer Aurora",
@@ -8374,6 +8504,188 @@ mod tests {
                     assert!(message.contains(needle), "{message}");
                 }
                 other => unreachable!("expected a refusal, got {:?}", other.map(|_| ())),
+            }
+        }
+    }
+
+    // ---- task 147: the smoothed-ramp flag rides versioned entries ----
+
+    /// Layer "p": a gradient overlay and a gradient stroke paint whose
+    /// ramps are all `smooth`, saved through the real [`write`].
+    fn ramp_document(
+        store: &mut TileStore,
+        smooth: bool,
+    ) -> (Vec<u8>, aurora_doc::LayerId, History) {
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let p = match history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut overlay = gradient_overlay_fixture(33.0);
+        overlay.gradient.smooth_ramp = smooth;
+        let mut paint = stroke_paint_gradient(71.0);
+        if let aurora_core::effects::StrokePaint::Gradient { gradient, .. } = &mut paint {
+            gradient.smooth_ramp = smooth;
+        }
+        let mut fx = painted_strokes(Some(paint), None);
+        fx.strokes.truncate(2);
+        fx.gradient_overlays = vec![overlay];
+        if let Err(err) = history.set_effects(&mut layers, p, Some(fx)) {
+            unreachable!("{err:?}");
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        if let Err(err) = write(
+            &mut bytes,
+            &layers,
+            &history,
+            (100, 100),
+            None,
+            &SkippedTiles::new(),
+            store,
+        ) {
+            unreachable!("{err:?}");
+        }
+        (bytes.into_inner(), p, history)
+    }
+
+    fn ramps_of(tree: &LayerTree, id: aurora_doc::LayerId) -> Option<(Vec<bool>, Vec<bool>)> {
+        tree.effects(id)
+            .map(|f| (f.gradient_overlay_ramps(), f.stroke_gradient_ramps()))
+    }
+
+    /// Smooth stays smooth and straight stays straight through the `.aur`
+    /// entries and the replayed journal; a save with only straight ramps
+    /// writes the version-1 entries, a save with a smooth one version 2.
+    #[test]
+    fn smooth_and_straight_ramps_survive_aur_round_trip_and_journal_replay() {
+        for smooth in [true, false] {
+            let (_dir, mut store) = real_tile_store();
+            let (bytes, p, _) = ramp_document(&mut store, smooth);
+            for entry in [
+                super::LAYER_GRADIENT_OVERLAYS_ENTRY,
+                super::LAYER_STROKE_PAINTS_ENTRY,
+            ] {
+                let Some(payload) = entry_bytes(&bytes, entry) else {
+                    unreachable!("{entry} missing")
+                };
+                assert_eq!(
+                    payload.first(),
+                    Some(&if smooth { 2 } else { 1 }),
+                    "{entry}"
+                );
+            }
+            let (_dir2, mut fresh) = real_tile_store();
+            let document = match read(Cursor::new(bytes), &mut fresh) {
+                Ok(document) => document,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let want = Some((vec![smooth], vec![false, smooth]));
+            assert_eq!(ramps_of(&document.layers, p), want, "smooth {smooth}");
+            let replayed = match document.history.replay() {
+                Ok(tree) => tree,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(ramps_of(&replayed, p), want, "replay, smooth {smooth}");
+        }
+    }
+
+    /// An entry of version 1 (every file written before task 147, and every
+    /// save with only straight ramps) reads with straight ramps, so old
+    /// documents render exactly as they did.
+    #[test]
+    fn version_one_gradient_entries_read_straight() {
+        let (_dir, mut store) = real_tile_store();
+        let (smooth_bytes, p, _) = ramp_document(&mut store, true);
+        // The version-1 payloads of the same data: the flag is skipped on
+        // that wire.
+        let overlay = gradient_overlay_fixture(33.0);
+        let overlays = postcard::to_allocvec(&super::LayerGradientOverlaysWire {
+            version: super::LAYER_GRADIENT_OVERLAYS_VERSION,
+            overlays: vec![(p.to_raw(), vec![overlay])],
+        })
+        .unwrap_or_default();
+        let paints = postcard::to_allocvec(&super::LayerStrokePaintsWire {
+            version: super::LAYER_STROKE_PAINTS_VERSION,
+            paints: vec![(p.to_raw(), vec![None, Some(stroke_paint_gradient(71.0))])],
+        })
+        .unwrap_or_default();
+        let old = with_named_entry(
+            &with_named_entry(
+                &smooth_bytes,
+                super::LAYER_GRADIENT_OVERLAYS_ENTRY,
+                Some(&overlays),
+            ),
+            super::LAYER_STROKE_PAINTS_ENTRY,
+            Some(&paints),
+        );
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(old), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            ramps_of(&document.layers, p),
+            Some((vec![false], vec![false, false]))
+        );
+        // The overlay itself is otherwise the same.
+        let mut expected = gradient_overlay_fixture(33.0);
+        expected.gradient.smooth_ramp = false;
+        assert_eq!(
+            document
+                .layers
+                .effects(p)
+                .map(|f| f.gradient_overlays.clone()),
+            Some(vec![expected])
+        );
+    }
+
+    #[test]
+    fn version_two_ramp_flags_that_do_not_match_refuse_loudly() {
+        let (_dir, mut store) = real_tile_store();
+        let (bytes, p, _) = ramp_document(&mut store, true);
+        let overlay = {
+            let mut o = gradient_overlay_fixture(33.0);
+            o.gradient.smooth_ramp = true;
+            o
+        };
+        let bad_overlays = |ramps: Vec<(u64, Vec<bool>)>| {
+            postcard::to_allocvec(&super::LayerGradientOverlaysWireV2 {
+                version: super::LAYER_GRADIENT_OVERLAYS_VERSION_RAMPS,
+                overlays: vec![(p.to_raw(), vec![overlay.clone()])],
+                ramps,
+            })
+            .unwrap_or_default()
+        };
+        let mut paints = postcard::to_allocvec(&super::LayerStrokePaintsWire {
+            version: super::LAYER_STROKE_PAINTS_VERSION_RAMPS,
+            paints: vec![(p.to_raw(), vec![None, Some(stroke_paint_gradient(71.0))])],
+        })
+        .unwrap_or_default();
+        let ramps_bytes = |r: Vec<(u64, Vec<bool>)>| postcard::to_allocvec(&r).unwrap_or_default();
+        let (short, truncated) = (paints.clone(), {
+            paints.extend(ramps_bytes(vec![(p.to_raw(), vec![true])]));
+            paints
+        });
+        for (entry, payload) in [
+            (super::LAYER_GRADIENT_OVERLAYS_ENTRY, bad_overlays(vec![])),
+            (
+                super::LAYER_GRADIENT_OVERLAYS_ENTRY,
+                bad_overlays(vec![(p.to_raw(), vec![true, true])]),
+            ),
+            (
+                super::LAYER_GRADIENT_OVERLAYS_ENTRY,
+                bad_overlays(vec![(p.to_raw() + 1, vec![true])]),
+            ),
+            // Version 2 with the flag list missing, and with the wrong length.
+            (super::LAYER_STROKE_PAINTS_ENTRY, short),
+            (super::LAYER_STROKE_PAINTS_ENTRY, truncated),
+        ] {
+            let tampered = with_named_entry(&bytes, entry, Some(&payload));
+            let (_dir2, mut fresh) = real_tile_store();
+            match read(Cursor::new(tampered), &mut fresh) {
+                Err(crate::error::IoError::ManifestDeserialization(_)) => {}
+                other => unreachable!("{entry}: expected a refusal, got {:?}", other.map(|_| ())),
             }
         }
     }
@@ -8874,7 +9186,7 @@ mod tests {
         for (payload, needle) in [
             (
                 encode(&super::LayerStrokePaintsWire {
-                    version: super::LAYER_STROKE_PAINTS_VERSION + 1,
+                    version: super::LAYER_STROKE_PAINTS_VERSION_RAMPS + 1,
                     paints: Vec::new(),
                 }),
                 "saved by a newer Aurora",

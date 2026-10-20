@@ -352,7 +352,7 @@ pub(super) fn gradient_in(d: &Descriptor, cmyk: CmykColours<'_>) -> Result<Gradi
         align: flag(d, b"Algn", true)?,
         offset,
         // The CMYK sub-stops carry the smoothing themselves.
-        linear_ramp: !smooth || cmyk.is_some(),
+        smooth_ramp: smooth && cmyk.is_none(),
     })
 }
 

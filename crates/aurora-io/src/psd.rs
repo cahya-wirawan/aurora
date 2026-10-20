@@ -4390,8 +4390,11 @@ fn fill_reference(
         fill::Fill::Gradient(g) => fill::reference_box(
             g,
             path_box.or_else(|| {
+                // Not the rendering of a vector mask (flags bit 3), which
+                // is a disabled or unreadable vector mask's `-2` channel.
                 record
                     .mask
+                    .filter(|m| m.flags & 0x08 == 0)
                     .map(|m| m.bounds)
                     .filter(|b| b.width > 0 && b.height > 0)
             }),

@@ -717,6 +717,11 @@ fn drawn_gradients_follow_photoshops_pixels() {
 /// A two-stop black-to-white `GdFl` block with an explicit `Intr`
 /// (smoothness, 4096 = 100 %).
 fn gradient_block_with_smoothness(smoothness: Option<f64>) -> Vec<u8> {
+    gradient_block_with_alpha(smoothness, 100.0)
+}
+
+/// [`gradient_block_with_smoothness`] with the end opacity (percent).
+fn gradient_block_with_alpha(smoothness: Option<f64>, alpha_end: f64) -> Vec<u8> {
     let mut grad = vec![
         (&b"GrdF"[..], V::Enum(b"GrdF", b"CstS")),
         (
@@ -726,7 +731,7 @@ fn gradient_block_with_smoothness(smoothness: Option<f64>) -> Vec<u8> {
                 colour_stop(255.0, 255.0, 255.0, 4096, 50),
             ]),
         ),
-        (b"Trns", V::List(vec![alpha_stop(100.0, 0), alpha_stop(100.0, 4096)])),
+        (b"Trns", V::List(vec![alpha_stop(100.0, 0), alpha_stop(alpha_end, 4096)])),
     ];
     if let Some(s) = smoothness {
         grad.push((b"Intr", V::Doub(s)));
@@ -744,17 +749,27 @@ fn smoothness_zero_is_a_straight_ramp_and_anything_else_is_smoothed() {
     // smoothstep per segment, 3 * 0.25^2 - 2 * 0.25^3 = 0.15625 at a quarter.
     for smoothness in [None, Some(4096.0)] {
         let g = parsed_gradient(&gradient_block_with_smoothness(smoothness));
-        assert!(!g.linear_ramp, "{smoothness:?}");
+        assert!(g.smooth_ramp, "{smoothness:?}");
         near_f32(g.at(0.25).0[0], 0.156_25);
         near_f32(g.at(0.5).0[0], 0.5);
     }
     // Smoothness 0 %: straight.
     let g = parsed_gradient(&gradient_block_with_smoothness(Some(0.0)));
-    assert!(g.linear_ramp);
+    assert!(!g.smooth_ramp);
     near_f32(g.at(0.25).0[0], 0.25);
-    // Opacity ramps follow the same rule.
-    let smooth = parsed_gradient(&gradient_block_with_smoothness(None));
-    near_f32(smooth.at(0.25).1, 1.0);
+}
+
+/// Opacity stops are smoothed like colour stops: a 100 % to 0 % ramp is
+/// `1 - smoothstep(t)`, so at a quarter `1 - 0.15625 = 0.84375` (derived
+/// from `3 * 0.25^2 - 2 * 0.25^3`, not read off the code), and straight
+/// (`0.75`) at Smoothness 0.
+#[test]
+fn opacity_stops_are_smoothed_like_colour_stops() {
+    let smooth = parsed_gradient(&gradient_block_with_alpha(None, 0.0));
+    near_f32(smooth.at(0.25).1, 0.843_75);
+    near_f32(smooth.at(0.5).1, 0.5);
+    let straight = parsed_gradient(&gradient_block_with_alpha(Some(0.0), 0.0));
+    near_f32(straight.at(0.25).1, 0.75);
 }
 
 fn near_f32(a: f32, want: f32) {
@@ -799,4 +814,45 @@ fn a_cmyk_gradient_is_smoothed_once_through_its_ink_space_sub_stops() {
         let got = f64::from(g.at(t).0[0]);
         assert!((got - want).abs() < 0.005, "t {t}: {got} vs {want}");
     }
+}
+
+/// A gradient fill with a `-2` mask channel of 6 x 6 at (2, 2) on a 10 x 10
+/// canvas, black to white left to right; `mask_flags` is the mask's flags
+/// byte and `vector` an optional `vmsk` block.
+fn masked_gradient_file(mask_flags: u8, vector: Option<Vec<u8>>) -> TestPsd {
+    TestPsd::new(1, 10, 10, 8).with(|p| {
+        p.layers.push(TestLayer::empty("fill").with(|l| {
+            l.blocks.push((*b"GdFl", black_to_white(b"Lnr ", 0.0, 100.0, false)));
+            if let Some(v) = vector {
+                l.blocks.push((*b"vmsk", v));
+            }
+            l.mask = Some((2, 2, 8, 8, 0, mask_flags));
+            l.channels.push((-2, vec![255; 36]));
+        }));
+    })
+}
+
+/// The red a drawn gradient has at document `(3, 5)`: 0.216 when it spans
+/// the 10 px canvas (`t = 0.3`, smoothed), 0.074 when it spans the 6 px mask
+/// rectangle (`t = 1/6`).
+fn gradient_red_at_3_5(file: &TestPsd) -> f32 {
+    let document = doc(&file.write());
+    fill_px(&document, 3, 5).map_or(f32::NAN, |p| p[0])
+}
+
+/// Task 147: a raster user mask's rectangle is the layer's extent for a
+/// drawn gradient (Photoshop: `gradient-fill.psd`); the rendering of a
+/// disabled vector mask in the `-2` channel (flags bit 3) is not, and the
+/// gradient spans the canvas.
+#[test]
+fn a_drawn_gradient_spans_a_raster_masks_rectangle_but_not_a_disabled_vector_masks() {
+    let raster = gradient_red_at_3_5(&masked_gradient_file(0, None));
+    assert!((raster - 0.074).abs() < 0.01, "raster mask: {raster}");
+    // Flags bit 3: the mask channel is the vector mask's rendering; the
+    // vector mask itself is turned off (flags bit 2).
+    let disabled = gradient_red_at_3_5(&masked_gradient_file(
+        0x08,
+        Some(vmsk(4, &rect_path(0.25, 0.25, 0.75, 0.75, 1))),
+    ));
+    assert!((disabled - 0.216).abs() < 0.01, "disabled vector mask: {disabled}");
 }

@@ -636,7 +636,14 @@ fn gradient_descriptor(g: &GradientFill) -> (Value, bool) {
         vec![
             ("Nm  ", Value::Text("Custom".to_owned())),
             ("GrdF", enum_of("GrdF", b"CstS")),
-            ("Intr", Value::Double(4096.0)),
+            // Smoothness: 100 % for a smoothed ramp, 0 for a straight one
+            // (`GradientFill::smooth_ramp`, task 147): the exact inverse of
+            // the reader, so the picture Aurora drew is the one Photoshop
+            // shows.
+            (
+                "Intr",
+                Value::Double(if g.smooth_ramp { 4096.0 } else { 0.0 }),
+            ),
             ("Clrs", Value::List(colours)),
             ("Trns", Value::List(alphas)),
         ],

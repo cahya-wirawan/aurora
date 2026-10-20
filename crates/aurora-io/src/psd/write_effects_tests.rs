@@ -156,7 +156,7 @@ fn gradient() -> GradientFill {
         reverse: true,
         align: true,
         offset: (10.0, -5.0),
-        linear_ramp: false,
+        smooth_ramp: true,
     }
 }
 

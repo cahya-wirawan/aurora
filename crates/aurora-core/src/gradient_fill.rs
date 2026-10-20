@@ -60,14 +60,18 @@ pub struct GradientFill {
     pub align: bool,
     /// Percent of the box width and height.
     pub offset: (f64, f64),
-    /// The ramp between stops is straight instead of Photoshop's smoothed
-    /// transition (Smoothness 100 %, the default: each segment's fraction
-    /// `u` becomes `3u^2 - 2u^3`, task 147). A `#[serde(skip)]` field so
-    /// the `.aur` wire is unchanged: a stored gradient reads back smoothed.
-    /// Set for Smoothness 0 and for a CMYK gradient's ink-space sub-stops
-    /// (which are never stored).
+    /// The ramp between stops is Photoshop's smoothed transition
+    /// (Smoothness 100 %: each segment's fraction `u` becomes
+    /// `3u^2 - 2u^3`, task 147) instead of straight. `false` is the
+    /// straight ramp every gradient had before task 147, so a field that is
+    /// not stored reads back straight: it is `#[serde(skip)]` (the
+    /// `.aur` wire of the effects is positional) and travels in the
+    /// versioned `layer-gradient-overlays` / `layer-stroke-paints` entries
+    /// and the `SetGradientRamps` journal op. A PSD import sets it for
+    /// Smoothness above 0 (a CMYK gradient's ink-space sub-stops carry
+    /// their own smoothing and leave it off).
     #[serde(skip)]
-    pub linear_ramp: bool,
+    pub smooth_ramp: bool,
 }
 
 /// A gradient fill refused by [`GradientFill::validate`].
@@ -189,7 +193,7 @@ impl GradientFill {
                 a[2] + (b[2] - a[2]) * u,
             ]
         };
-        let smooth = !self.linear_ramp;
+        let smooth = self.smooth_ramp;
         let rgb = ramp(&self.colours, t, smooth, lerp3).unwrap_or([0.0; 3]);
         let alpha = ramp(&self.alphas, t, smooth, |a, b, u| a + (b - a) * u).unwrap_or(1.0);
         (rgb, alpha)

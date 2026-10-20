@@ -73,7 +73,7 @@ fn drawn_fills_and_artboard_backgrounds_match_photoshops_merged_images() {
     for (file, mean_bound, max_bound) in SHAPE_FIDELITY {
         let path = root.join(file);
         let Ok(bytes) = std::fs::read(&path) else {
-            println!("SKIPPED: corpus file not present at {}", path.display());
+            crate::open_time_tests::corpus_file_absent(&path);
             continue;
         };
         let Ok(merged) = aurora_io::decode_psd_merged_image(&bytes) else {
