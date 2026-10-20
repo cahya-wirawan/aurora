@@ -106,6 +106,69 @@ impl TestLayer {
         layer
     }
 
+    /// A CMYK layer (task 146) from `[c, m, y, k, alpha]` samples exactly as
+    /// stored (Photoshop stores ink inverted: the largest value is no
+    /// ink); only the low byte is used at 8-bit depth. Channel order in
+    /// the file: transparency, then cyan, magenta, yellow, black.
+    pub fn cmyk(
+        name: &str,
+        left: i32,
+        top: i32,
+        width: i32,
+        height: i32,
+        depth: u16,
+        cmyka: &[[u16; 5]],
+    ) -> Self {
+        let rgba: Vec<[u16; 4]> = cmyka.iter().map(|[c, m, y, _, a]| [*c, *m, *y, *a]).collect();
+        let mut layer = Self::pixels(name, left, top, width, height, depth, &rgba);
+        let plane = |c: usize| -> Vec<u8> {
+            cmyka
+                .iter()
+                .flat_map(|px| {
+                    let v = px.get(c).copied().unwrap_or(0);
+                    if depth == 16 {
+                        v.to_be_bytes().to_vec()
+                    } else {
+                        vec![v.to_be_bytes().get(1).copied().unwrap_or(0)]
+                    }
+                })
+                .collect()
+        };
+        layer.channels = vec![
+            (-1, plane(4)),
+            (0, plane(0)),
+            (1, plane(1)),
+            (2, plane(2)),
+            (3, plane(3)),
+        ];
+        layer
+    }
+
+    /// A 32-bit floating point RGB layer (task 146) from `[r, g, b, a]`
+    /// samples, written big-endian.
+    pub fn floats(
+        name: &str,
+        left: i32,
+        top: i32,
+        width: i32,
+        height: i32,
+        rgba: &[[f32; 4]],
+    ) -> Self {
+        let plane = |c: usize| -> Vec<u8> {
+            rgba.iter()
+                .flat_map(|px| px.get(c).copied().unwrap_or(0.0).to_be_bytes())
+                .collect()
+        };
+        Self {
+            channels: vec![(-1, plane(3)), (0, plane(0)), (1, plane(1)), (2, plane(2))],
+            ..Self::pixels(name, left, top, width, height, 8, &[])
+        }
+        .with(|l| {
+            l.bottom = top + height;
+            l.right = left + width;
+        })
+    }
+
     /// An empty-rectangle record with the four usual zero-size channels.
     pub fn empty(name: &str) -> Self {
         Self {
@@ -203,7 +266,11 @@ impl TestPsd {
     }
 
     fn bps(&self) -> usize {
-        if self.depth == 16 { 2 } else { 1 }
+        match self.depth {
+            32 => 4,
+            16 => 2,
+            _ => 1,
+        }
     }
 
     pub fn write(&self) -> Vec<u8> {
@@ -226,7 +293,7 @@ impl TestPsd {
             put_len(&mut section, 0, self.psb());
             put_u32(&mut section, 0); // global layer mask info
             section.extend_from_slice(b"8BIM");
-            section.extend_from_slice(b"Lr16");
+            section.extend_from_slice(if self.depth == 32 { b"Lr32" } else { b"Lr16" });
             put_len(&mut section, body.len(), self.psb());
             section.extend_from_slice(&body);
             while !section.len().is_multiple_of(4) {
@@ -479,6 +546,25 @@ pub(crate) fn zlib(data: &[u8]) -> Vec<u8> {
 /// The inverse of the reader's `undo_prediction`.
 fn predict(data: &mut [u8], row_bytes: usize, bps: usize) {
     if row_bytes == 0 {
+        return;
+    }
+    if bps == 4 {
+        // Float prediction: planar bytes per row, then delta-coded.
+        for row in data.chunks_mut(row_bytes) {
+            let n = row.len() / 4;
+            let copy = row.to_vec();
+            for i in 0..n {
+                for k in 0..4 {
+                    row[k * n + i] = copy[i * 4 + k];
+                }
+            }
+            let mut previous: u8 = 0;
+            for byte in row.iter_mut() {
+                let value = *byte;
+                *byte = value.wrapping_sub(previous);
+                previous = value;
+            }
+        }
         return;
     }
     for row in data.chunks_mut(row_bytes) {

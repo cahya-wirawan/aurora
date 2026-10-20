@@ -38,6 +38,7 @@ mod aur_selection;
 #[cfg(test)]
 mod aur_zip_compat_tests;
 mod channels;
+mod colour_cmyk;
 mod colour_import;
 mod error;
 mod image;

@@ -146,6 +146,8 @@ mod grey_profile;
 mod lab;
 #[cfg(test)]
 mod mixer_selective_tests;
+#[cfg(test)]
+mod mode_tests;
 mod pattern;
 #[cfg(test)]
 mod pattern_tests;
@@ -253,8 +255,11 @@ pub struct PsdFile {
     pub version: u16,
     pub width: u32,
     pub height: u32,
-    /// Bits per channel: `8` or `16`.
+    /// Bits per channel: `8`, `16` or `32` (floating point).
     pub depth: u16,
+    /// The file's colour mode: `1` Grayscale, `3` RGB or `4` CMYK. A CMYK
+    /// file's decoded pixels are already converted to sRGB (task 146).
+    pub color_mode: u16,
     /// The layer tree, **bottom-to-top** at every level (the file's own
     /// order).
     pub layers: Vec<PsdNode>,
@@ -568,6 +573,14 @@ enum Note {
     ExtraChannels,
     ColorProfileIgnored,
     ColorProfileTooLarge,
+    /// Adjustment layers of a CMYK or 32-bit file, left out (task 146):
+    /// nothing checked how Photoshop's adjustments read those modes.
+    AdjustmentLeftOutInMode,
+    /// Fill layers with no pixels and artboard background colours of a CMYK
+    /// or 32-bit file, left out (task 146).
+    FillLeftOutInMode,
+    /// Layer effects of a CMYK or 32-bit file, left out (task 146).
+    EffectsLeftOutInMode,
     /// A Grayscale file is held as RGB (grey on all three channels); a PSD
     /// save writes RGB (0.249.0).
     GrayscaleHeldAsRgb,
@@ -1087,6 +1100,18 @@ fn note_text(note: Note, n: u64) -> String {
         Note::ColorProfileTooLarge => "The file's embedded colour profile is larger than \
                                        allowed and was ignored; its colours are treated as sRGB."
             .to_owned(),
+        Note::AdjustmentLeftOutInMode => format!(
+            "{n} adjustment layer{s} {was} left out — Aurora has not checked how Photoshop's \
+             adjustments work in CMYK or 32-bit files."
+        ),
+        Note::FillLeftOutInMode => format!(
+            "{n} fill layer{s} with no stored pixels (or artboard background colour{s}) {was} \
+             left out — their colours are in a space Aurora does not read in CMYK or 32-bit files."
+        ),
+        Note::EffectsLeftOutInMode => format!(
+            "The layer effects of {n} layer{s} {was} left out — their colours are in a space \
+             Aurora does not read in CMYK or 32-bit files."
+        ),
         Note::GrayscaleHeldAsRgb => "This Grayscale file is held as RGB (the grey on all three \
                                      channels); saving it as a PSD writes an RGB file, not \
                                      Grayscale."
@@ -1409,11 +1434,12 @@ impl Window {
 struct Header {
     version: u16,
     channels: u16,
-    /// `1` (Grayscale) or `3` (RGB) — the only two [`read_header`] lets
-    /// through.
+    /// `1` (Grayscale), `3` (RGB) or `4` (CMYK, task 146) — the only three
+    /// [`read_header`] lets through.
     color_mode: u16,
     width: u32,
     height: u32,
+    /// `8`, `16`, or `32` (floating point, task 146; Grayscale and RGB only).
     depth: u16,
 }
 
@@ -1423,7 +1449,11 @@ impl Header {
     }
 
     fn bytes_per_sample(self) -> usize {
-        if self.depth == 16 { 2 } else { 1 }
+        match self.depth {
+            32 => 4,
+            16 => 2,
+            _ => 1,
+        }
     }
 
     /// Whether this is a Grayscale file (colour mode 1, 0.147.0).
@@ -1431,10 +1461,32 @@ impl Header {
         self.color_mode == 1
     }
 
+    /// Whether this is a CMYK file (colour mode 4, task 146).
+    fn cmyk(self) -> bool {
+        self.color_mode == 4
+    }
+
+    /// Whether samples are 32-bit floating point (task 146).
+    fn float(self) -> bool {
+        self.depth == 32
+    }
+
+    /// Whether the file's colour values (descriptor colours of fill layers
+    /// and effects, adjustment parameters) are in a space this reader has
+    /// not checked: CMYK inks, or 32-bit linear light. Those are left out
+    /// and reported rather than read as 8-bit sRGB.
+    fn colours_unchecked(self) -> bool {
+        self.cmyk() || self.float()
+    }
+
     /// How many colour channels a pixel has: `1` for Grayscale (channel
-    /// `0`, expanded to R = G = B on decode), `3` for RGB.
+    /// `0`, expanded to R = G = B on decode), `3` for RGB, `4` for CMYK.
     fn color_planes(self) -> usize {
-        if self.gray() { 1 } else { 3 }
+        match self.color_mode {
+            1 => 1,
+            4 => 4,
+            _ => 3,
+        }
     }
 }
 
@@ -1473,19 +1525,23 @@ fn read_header(r: &mut Reader<'_>) -> Result<Header, IoError> {
             max: u64::from(max),
         });
     }
-    // Grayscale (1) and RGB (3) only. Bitmap (0), Indexed (2), CMYK (4),
-    // Multichannel (7), Duotone (8) and Lab (9) are refused by name
-    // rather than guessed at: Indexed needs its palette, Duotone its ink
-    // curves, and showing either as grey or RGB would be a silent
+    // Grayscale (1), RGB (3) and CMYK (4, task 146) only. Bitmap (0),
+    // Indexed (2), Multichannel (7), Duotone (8) and Lab (9) are refused by
+    // name rather than guessed at: Indexed needs its palette, Duotone its
+    // ink curves, and showing either as grey or RGB would be a silent
     // mis-render.
-    if color_mode != 1 && color_mode != 3 {
+    if !matches!(color_mode, 1 | 3 | 4) {
         return Err(IoError::UnsupportedPsdColorMode(color_mode));
     }
-    if depth != 8 && depth != 16 {
+    // 8, 16, and 32-bit float (Photoshop has no 32-bit CMYK).
+    if !matches!(depth, 8 | 16 | 32) || (depth == 32 && color_mode == 4) {
         return Err(IoError::UnsupportedPsdDepth(depth));
     }
     if color_mode == 3 && channels < 3 {
         return Err(malformed("an RGB file with fewer than three channels"));
+    }
+    if color_mode == 4 && channels < 4 {
+        return Err(malformed("a CMYK file with fewer than four channels"));
     }
     Ok(Header {
         version,
@@ -2954,6 +3010,10 @@ fn undo_prediction(data: &mut [u8], row_bytes: usize, bps: usize) {
     if row_bytes == 0 {
         return;
     }
+    if bps == 4 {
+        undo_float_prediction(data, row_bytes);
+        return;
+    }
     for row in data.chunks_mut(row_bytes) {
         if bps == 2 {
             let mut previous: u16 = 0;
@@ -2972,6 +3032,44 @@ fn undo_prediction(data: &mut [u8], row_bytes: usize, bps: usize) {
             }
         }
     }
+}
+
+/// "ZIP with prediction" for 32-bit floating point samples (task 146). A
+/// row of `n` samples is stored as four byte planes, the most significant
+/// bytes of all `n` samples first, then the next byte of each, and so on;
+/// the whole row is then delta-coded bytewise (each byte is the difference
+/// from the one before it, wrapping). Undone here by summing the row and
+/// re-interleaving the planes into big-endian samples.
+fn undo_float_prediction(data: &mut [u8], row_bytes: usize) {
+    let mut planar: Vec<u8> = Vec::with_capacity(row_bytes);
+    for row in data.chunks_mut(row_bytes) {
+        let mut previous: u8 = 0;
+        for byte in row.iter_mut() {
+            *byte = byte.wrapping_add(previous);
+            previous = *byte;
+        }
+        let n = row.len() / 4;
+        planar.clear();
+        planar.extend_from_slice(row);
+        for i in 0..n {
+            for k in 0..4 {
+                if let (Some(dst), Some(src)) = (row.get_mut(i * 4 + k), planar.get(k * n + i)) {
+                    *dst = *src;
+                }
+            }
+        }
+    }
+}
+
+/// A 32-bit big-endian float sample as `f16`: NaN is `0`, and a value past
+/// `f16`'s range saturates there (65,504) rather than becoming infinite.
+fn promote_f32_sample(bytes: [u8; 4]) -> f16 {
+    let v = f32::from_be_bytes(bytes);
+    f16::from_f32(if v.is_nan() {
+        0.0
+    } else {
+        v.clamp(-65_504.0, 65_504.0)
+    })
 }
 
 /// Every 8-bit sample's `f16`, `f16::from_f32(promote_u8(v))` (0.189.0):
@@ -3001,7 +3099,13 @@ fn promote_u16_table() -> &'static [f16] {
 /// buffer, promoting each sample straight to float (through the lookup
 /// tables above, which hold exactly what the direct conversion returns).
 fn write_plane(samples: &mut [f16], plane: &[u8], channel: usize, bps: usize) {
-    if bps == 2 {
+    if bps == 4 {
+        for (px, quad) in samples.chunks_exact_mut(4).zip(plane.chunks_exact(4)) {
+            if let ([a, b, c, d], Some(slot)) = (quad, px.get_mut(channel)) {
+                *slot = promote_f32_sample([*a, *b, *c, *d]);
+            }
+        }
+    } else if bps == 2 {
         let table = promote_u16_table();
         for (px, pair) in samples.chunks_exact_mut(4).zip(plane.chunks_exact(2)) {
             if let ([hi, lo], Some(slot)) = (pair, px.get_mut(channel)) {
@@ -3057,14 +3161,19 @@ fn opaque_buffer(width: usize, height: usize) -> Result<Vec<f16>, IoError> {
     Ok(samples)
 }
 
-/// The colour (`0`, `1`, `2`) and transparency (`-1`) channels a record
-/// will actually decode, by RGBA slot: the *first* channel of each id. A
+/// Where [`pixel_channels`] puts a record's transparency channel (`-1`):
+/// after the (up to four) colour channels. In the RGBA buffer it is slot 3.
+const ALPHA_SLOT: usize = 4;
+
+/// The colour (`0`, `1`, `2`, and `3` for CMYK) and transparency (`-1`)
+/// channels a record will actually decode, by slot: the *first* channel of
+/// each id. A
 /// later channel with an id already seen is a duplicate — counted, and
 /// never decompressed (a 56-channel record of one id would otherwise
 /// cost 56 decodes) — and an id this reader does not know is counted as
 /// unknown. User masks (`-2`, `-3`) are `decode_mask`'s.
-fn pixel_channels(record: &Record, color_planes: usize, notes: &mut Notes) -> [Option<Chan>; 4] {
-    let mut slots: [Option<Chan>; 4] = [None; 4];
+fn pixel_channels(record: &Record, color_planes: usize, notes: &mut Notes) -> [Option<Chan>; 5] {
+    let mut slots: [Option<Chan>; 5] = [None; 5];
     let mut seen_ids: Vec<i16> = Vec::with_capacity(record.data.len());
     for (id, data) in &record.data {
         if seen_ids.contains(id) {
@@ -3075,10 +3184,10 @@ fn pixel_channels(record: &Record, color_planes: usize, notes: &mut Notes) -> [O
         let slot = match id {
             // A Grayscale file's only colour channel is `0`; a `1` or `2`
             // there is as unknown as a `7` is in RGB.
-            0..=2 if usize::from(id.cast_unsigned()) < color_planes => {
+            0..=3 if usize::from(id.cast_unsigned()) < color_planes => {
                 usize::from(id.cast_unsigned())
             }
-            -1 => 3,
+            -1 => ALPHA_SLOT,
             -2 | -3 => continue,
             _ => {
                 notes.add(Note::UnknownChannel);
@@ -3098,8 +3207,9 @@ struct PendingPixels {
     header: Header,
     width: u32,
     height: u32,
-    /// The channel decoded into each RGBA slot ([`pixel_channels`]).
-    slots: [Option<Chan>; 4],
+    /// The channel decoded into each slot ([`pixel_channels`]): colour
+    /// channels first, transparency in [`ALPHA_SLOT`].
+    slots: [Option<Chan>; 5],
 }
 
 /// What [`decode_pending`] will decode for `record`, or `None` for a
@@ -3147,11 +3257,12 @@ fn decode_pending(
     for chan in pending.slots.iter().flatten() {
         check_channel(src, *chan, row_bytes, height, header.psb())?;
     }
+    if header.cmyk() {
+        return decode_pending_cmyk(pending, src, profile, width, height, bps);
+    }
     if let Some(samples) = decode_four_channels(pending, src, width, height, bps)? {
-        let mut samples = samples;
-        if header.gray() {
-            replicate_gray(&mut samples);
-        }
+        let samples = samples;
+        profile.note_if_bright(header, &samples);
         return Image::new(pending.width, pending.height, profile.get(), samples);
     }
     let mut samples = opaque_buffer(width, height)?;
@@ -3160,13 +3271,51 @@ fn decode_pending(
             let data = src.read_at(chan.offset, chan.len, "channel image data")?;
             let plane = decode_channel(&data, width, height, bps, header.psb())?;
             drop(data);
-            write_plane(&mut samples, &plane, channel, bps);
+            // The transparency channel is slot 4 here and slot 3 in RGBA.
+            let rgba = if channel == ALPHA_SLOT { 3 } else { channel };
+            write_plane(&mut samples, &plane, rgba, bps);
         }
     }
     if header.gray() {
         replicate_gray(&mut samples);
     }
+    profile.note_if_bright(header, &samples);
     Image::new(pending.width, pending.height, profile.get(), samples)
+}
+
+/// A CMYK layer (task 146): the four ink planes and the transparency plane
+/// are decoded one at a time and converted to the working space in one
+/// pass ([`colour_cmyk::CmykConverter::convert_planes`]); the layer's image
+/// is therefore already sRGB.
+fn decode_pending_cmyk(
+    pending: &PendingPixels,
+    src: &mut dyn ByteSource,
+    shared: &SharedProfile,
+    width: usize,
+    height: usize,
+    bps: usize,
+) -> Result<Image, IoError> {
+    let header = pending.header;
+    let Some(converter) = shared.cmyk.as_ref() else {
+        return Err(malformed("a CMYK layer without a colour conversion"));
+    };
+    let mut planes: [Option<Vec<u8>>; 5] = [None, None, None, None, None];
+    for (slot, chan) in pending.slots.iter().enumerate() {
+        if let (Some(chan), Some(entry)) = (chan, planes.get_mut(slot)) {
+            let data = src.read_at(chan.offset, chan.len, "channel image data")?;
+            *entry = Some(decode_channel(&data, width, height, bps, header.psb())?);
+        }
+    }
+    let [c, m, y, k, a] = &planes;
+    let samples = converter.convert_planes(
+        [c.as_deref(), m.as_deref(), y.as_deref(), k.as_deref()],
+        a.as_deref(),
+        bps,
+        width
+            .checked_mul(height)
+            .ok_or_else(|| malformed("layer size"))?,
+    )?;
+    Image::new(pending.width, pending.height, shared.get(), samples)
 }
 
 /// The largest layer image (`f16` RGBA bytes) [`decode_four_channels`]
@@ -3199,7 +3348,7 @@ fn decode_four_channels(
     height: usize,
     bps: usize,
 ) -> Result<Option<Vec<f16>>, IoError> {
-    let [Some(c0), Some(c1), Some(c2), Some(c3)] = pending.slots else {
+    let [Some(c0), Some(c1), Some(c2), None, Some(c3)] = pending.slots else {
         return Ok(None);
     };
     let pixels = width
@@ -3253,7 +3402,22 @@ fn decode_four_channels(
         .ok_or_else(|| malformed("layer size"))?;
     let mut samples = try_alloc(len)?;
     samples.resize(len, f16::ZERO);
-    if bps == 2 {
+    if bps == 4 {
+        let at = |plane: &[u8], i: usize| -> f16 {
+            match plane.get(i * 4..i * 4 + 4) {
+                Some([a, b, c, d]) => promote_f32_sample([*a, *b, *c, *d]),
+                _ => f16::ZERO,
+            }
+        };
+        for (i, px) in samples.chunks_exact_mut(4).enumerate() {
+            if let [pr, pg, pb, pa] = px {
+                *pr = at(r, i);
+                *pg = at(g, i);
+                *pb = at(b, i);
+                *pa = at(a, i);
+            }
+        }
+    } else if bps == 2 {
         let table = promote_u16_table();
         let at = |plane: &[u8], i: usize| -> f16 {
             let value = match plane.get(i * 2..i * 2 + 2) {
@@ -3349,7 +3513,15 @@ fn decode_mask_channel(
         let plane = decode_channel(&data, width, height, bps, header.psb())?;
         drop(data);
         let mut values: Vec<f16> = try_alloc(width.saturating_mul(height))?;
-        if bps == 2 {
+        if bps == 4 {
+            // A 32-bit file's mask is floating point coverage.
+            values.extend(plane.chunks_exact(4).map(|quad| match quad {
+                [a, b, c, d] => {
+                    f16::from_f32(f32::from(promote_f32_sample([*a, *b, *c, *d])).clamp(0.0, 1.0))
+                }
+                _ => f16::ZERO,
+            }));
+        } else if bps == 2 {
             values.extend(plane.chunks_exact(2).map(|pair| match pair {
                 [hi, lo] => f16::from_f32(promote_u16(u16::from_be_bytes([*hi, *lo]))),
                 _ => f16::ZERO,
@@ -3375,13 +3547,42 @@ fn decode_mask_channel(
 /// serialised profile ([`IccProfile::from_bytes`]), not a fresh build.
 struct SharedProfile {
     icc: Option<Vec<u8>>,
+    /// The CMYK conversion of a CMYK file (task 146), built from its plan.
+    cmyk: Option<crate::colour_cmyk::CmykConverter>,
+    /// Set when a 32-bit layer held a colour channel above `1.0` (highlights
+    /// brighter than white), which the conversion to sRGB clips.
+    bright: std::sync::atomic::AtomicBool,
 }
 
 impl SharedProfile {
     fn new() -> Self {
         Self {
             icc: IccProfile::srgb().to_bytes().ok(),
+            cmyk: None,
+            bright: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn with_cmyk(cmyk: Option<crate::colour_cmyk::CmykConverter>) -> Self {
+        Self {
+            cmyk,
+            ..Self::new()
+        }
+    }
+
+    /// Remembers that a 32-bit image held values above white.
+    fn note_if_bright(&self, header: Header, samples: &[f16]) {
+        if header.float()
+            && samples
+                .chunks_exact(4)
+                .any(|px| px.iter().take(3).any(|c| c.to_f32() > 1.0))
+        {
+            self.bright.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn saw_bright(&self) -> bool {
+        self.bright.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn get(&self) -> IccProfile {
@@ -3770,6 +3971,11 @@ fn build_tree(
                 let mut children = children;
                 if let Some(block) = record.artboard.as_deref() {
                     match fill::parse_artboard(block) {
+                        // A background colour in a CMYK or 32-bit file is in
+                        // a space this reader does not read (task 146).
+                        Ok(Some(_)) if header.colours_unchecked() => {
+                            notes.add(Note::FillLeftOutInMode);
+                        }
                         Ok(Some(bg)) => match artboard_background(bg, header, vector_budget) {
                             Ok(node) => {
                                 children.insert(0, node);
@@ -3968,6 +4174,21 @@ fn layer_node(
     notes: &mut Notes,
     vector_budget: &mut vector::Budget,
 ) -> Option<PsdNode> {
+    if header.colours_unchecked() {
+        if record.features.adjustment
+            || record.curves.is_some()
+            || record.levels.is_some()
+            || record.hue_saturation.is_some()
+            || record.other_adjustment.is_some()
+        {
+            notes.add(Note::AdjustmentLeftOutInMode);
+            return None;
+        }
+        if record.features.fill && record.area() == 0 {
+            notes.add(Note::FillLeftOutInMode);
+            return None;
+        }
+    }
     if let (Some(curves), false) = (&record.curves, record.features.adjustment) {
         let params = match curves {
             Ok(block) => curves_params(block, header.gray()),
@@ -4607,17 +4828,30 @@ fn mask_or_report(
 // The merged image
 // ---------------------------------------------------------------------
 
-/// Decodes the merged (flattened) image: compression, then every channel
-/// planar. For RLE the row counts of *all* channels come first, then all
-/// the rows. The first three planes are RGB; with `alpha` the fourth is
-/// the composite's transparency, and the colour — which Photoshop stores
-/// matted against white — is un-matted (`c = (c' + a - 1) / a`,
-/// psd-tools' `_remove_white_background`). Every other plane is skipped.
+/// Where [`walk_merged_planes`] hands each decoded plane (task 146).
+trait MergedPlanes {
+    /// Called once, after the data present has been checked against the
+    /// planes needed and before the first plane: where buffers are made.
+    fn begin(&mut self) -> Result<(), IoError>;
+
+    /// Plane `channel`'s samples (`width * height * bps` bytes, big-endian,
+    /// prediction undone). The bytes are valid only for this call.
+    fn plane(&mut self, channel: usize, bytes: &[u8]) -> Result<(), IoError>;
+}
+
+/// Decodes the merged (flattened) image's first `planes` planes:
+/// compression, then every channel planar. For RLE the row counts of *all*
+/// channels come first, then all the rows. Every other plane is skipped.
 ///
 /// One plane is decoded at a time into one reused buffer (no
 /// all-planes intermediate), and nothing is allocated before the bytes
 /// present have been checked against the planes needed.
-fn decode_merged(r: &mut Reader<'_>, header: Header, alpha: bool) -> Result<Image, IoError> {
+fn walk_merged_planes(
+    r: &mut Reader<'_>,
+    header: Header,
+    planes: usize,
+    sink: &mut dyn MergedPlanes,
+) -> Result<(), IoError> {
     let width = header.width as usize;
     let height = header.height as usize;
     let bps = header.bytes_per_sample();
@@ -4625,27 +4859,18 @@ fn decode_merged(r: &mut Reader<'_>, header: Header, alpha: bool) -> Result<Imag
     let row_bytes = width.checked_mul(bps).ok_or_else(size)?;
     let plane_len = row_bytes.checked_mul(height).ok_or_else(size)?;
     let channels = usize::from(header.channels);
-    let color = header.color_planes();
-    let planes = if alpha && channels > color {
-        color + 1
-    } else {
-        color
-    };
-    // Plane `p`'s RGBA slot: the colour planes first, then alpha.
-    let slot = |p: usize| if p < color { p } else { 3 };
     let compression = r.u16("merged image compression")?;
-    let samples = match compression {
+    match compression {
         0 => {
             let needed = plane_len.checked_mul(planes).ok_or_else(size)?;
             if r.remaining() < needed {
                 return Err(truncated("merged image data"));
             }
-            let mut samples = opaque_buffer(width, height)?;
+            sink.begin()?;
             for channel in 0..planes {
                 let plane = r.take(plane_len, "merged image data")?;
-                write_plane(&mut samples, plane, slot(channel), bps);
+                sink.plane(channel, plane)?;
             }
-            samples
         }
         1 => {
             let rows = channels.checked_mul(height).ok_or_else(size)?;
@@ -4664,7 +4889,7 @@ fn decode_merged(r: &mut Reader<'_>, header: Header, alpha: bool) -> Result<Imag
             if r.remaining() < needed || needed < min_row.saturating_mul(used) {
                 return Err(truncated("merged image RLE rows"));
             }
-            let mut samples = opaque_buffer(width, height)?;
+            sink.begin()?;
             let mut plane = try_alloc(plane_len)?;
             let mut lengths = counts.lengths.into_iter();
             for channel in 0..planes {
@@ -4676,9 +4901,8 @@ fn decode_merged(r: &mut Reader<'_>, header: Header, alpha: bool) -> Result<Imag
                     let src = r.take(count, "merged image RLE row")?;
                     unpack_bits(src, &mut plane, row_bytes)?;
                 }
-                write_plane(&mut samples, &plane, slot(channel), bps);
+                sink.plane(channel, &plane)?;
             }
-            samples
         }
         2 | 3 => {
             let body = r.take(r.remaining(), "merged image data")?;
@@ -4686,7 +4910,7 @@ fn decode_merged(r: &mut Reader<'_>, header: Header, alpha: bool) -> Result<Imag
             if body.len() < needed / ZIP_MIN_RATIO_DIVISOR {
                 return Err(truncated("merged image data"));
             }
-            let mut samples = opaque_buffer(width, height)?;
+            sink.begin()?;
             let mut plane = try_alloc(plane_len)?;
             let plane_limit = u64::try_from(plane_len).map_err(|_| size())?;
             let mut decoder = flate2::read::ZlibDecoder::new(body);
@@ -4704,13 +4928,114 @@ fn decode_merged(r: &mut Reader<'_>, header: Header, alpha: bool) -> Result<Imag
                 if compression == 3 {
                     undo_prediction(&mut plane, row_bytes, bps);
                 }
-                write_plane(&mut samples, &plane, slot(channel), bps);
+                sink.plane(channel, &plane)?;
             }
-            samples
         }
         other => return Err(IoError::UnsupportedPsdCompression(other)),
+    }
+    Ok(())
+}
+
+/// [`MergedPlanes`] into an RGBA `f16` buffer (Grayscale and RGB).
+struct RgbaPlanes {
+    width: usize,
+    height: usize,
+    bps: usize,
+    color: usize,
+    samples: Vec<f16>,
+}
+
+impl MergedPlanes for RgbaPlanes {
+    fn begin(&mut self) -> Result<(), IoError> {
+        self.samples = opaque_buffer(self.width, self.height)?;
+        Ok(())
+    }
+
+    fn plane(&mut self, channel: usize, bytes: &[u8]) -> Result<(), IoError> {
+        // Plane `p`'s RGBA slot: the colour planes first, then alpha.
+        let slot = if channel < self.color { channel } else { 3 };
+        write_plane(&mut self.samples, bytes, slot, self.bps);
+        Ok(())
+    }
+}
+
+/// [`MergedPlanes`] keeping a CMYK file's planes as stored (task 146).
+struct CmykPlanes {
+    planes: [Option<Vec<u8>>; 5],
+}
+
+impl MergedPlanes for CmykPlanes {
+    fn begin(&mut self) -> Result<(), IoError> {
+        Ok(())
+    }
+
+    fn plane(&mut self, channel: usize, bytes: &[u8]) -> Result<(), IoError> {
+        let mut copy: Vec<u8> = try_alloc(bytes.len())?;
+        copy.extend_from_slice(bytes);
+        if let Some(slot) = self.planes.get_mut(channel) {
+            *slot = Some(copy);
+        }
+        Ok(())
+    }
+}
+
+/// Decodes the merged (flattened) image. The first colour planes are the
+/// colour; with `alpha` the next is the composite's transparency, and the
+/// colour — which Photoshop stores matted against white — is un-matted
+/// (`c = (c' + a - 1) / a`, psd-tools' `_remove_white_background`).
+///
+/// A CMYK file's planes are converted to sRGB through `cmyk` (task 146),
+/// so its image is in the working space; a 32-bit file's is its stored
+/// (linear) float values as `f16`, for the caller to convert.
+fn decode_merged(
+    r: &mut Reader<'_>,
+    header: Header,
+    alpha: bool,
+    cmyk: Option<&crate::colour_cmyk::CmykConverter>,
+) -> Result<Image, IoError> {
+    let width = header.width as usize;
+    let height = header.height as usize;
+    let channels = usize::from(header.channels);
+    let color = header.color_planes();
+    let planes = if alpha && channels > color {
+        color + 1
+    } else {
+        color
     };
-    let mut samples = samples;
+    if header.cmyk() {
+        let Some(converter) = cmyk else {
+            return Err(malformed("a CMYK merged image without a colour conversion"));
+        };
+        let mut sink = CmykPlanes {
+            planes: [None, None, None, None, None],
+        };
+        walk_merged_planes(r, header, planes, &mut sink)?;
+        let [c, m, y, k, a] = &sink.planes;
+        // The merged image's transparency plane is its fifth plane.
+        let a = if planes > color { a.as_deref() } else { None };
+        let samples = converter.convert_planes(
+            [c.as_deref(), m.as_deref(), y.as_deref(), k.as_deref()],
+            a,
+            header.bytes_per_sample(),
+            width
+                .checked_mul(height)
+                .ok_or_else(|| malformed("merged image size"))?,
+        )?;
+        let mut samples = samples;
+        if planes > color {
+            remove_white_matte(&mut samples);
+        }
+        return Image::new(header.width, header.height, IccProfile::srgb(), samples);
+    }
+    let mut sink = RgbaPlanes {
+        width,
+        height,
+        bps: header.bytes_per_sample(),
+        color,
+        samples: Vec::new(),
+    };
+    walk_merged_planes(r, header, planes, &mut sink)?;
+    let mut samples = sink.samples;
     if header.gray() {
         replicate_gray(&mut samples);
     }
@@ -4762,7 +5087,11 @@ pub fn decode(bytes: &[u8]) -> Result<PsdFile, IoError> {
 fn decode_with_vector_work(bytes: &[u8], vector_work: u64) -> Result<PsdFile, IoError> {
     let mut src = StreamSource::new(std::io::Cursor::new(bytes))?;
     let mut file = decode_source(&mut src, vector_work)?;
-    let profile = SharedProfile::new();
+    // A CMYK file's pixels are converted as they are decoded; the profile
+    // is judged here as it is for an open.
+    let profile = SharedProfile::with_cmyk(
+        (file.color_mode == 4).then(|| cmyk_converter(file.notes.3.as_deref())),
+    );
     materialize(&mut file.layers, &mut src, &profile, 0)?;
     Ok(file)
 }
@@ -4850,16 +5179,15 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
             match &key {
                 b"lnk2" | b"lnkD" | b"lnk3" | b"lnkE" => linked_windows.push((key, data)),
                 b"Patt" | b"Pat2" | b"Pat3" => pattern_windows.push(data),
-                b"Lr16" | b"Layr" if info.records.is_empty() => {
+                b"Lr16" | b"Layr" | b"Lr32" if info.records.is_empty() => {
                     let tagged_alpha = info.merged_alpha;
                     info = read_layer_info(src, &mut data, header)?;
                     info.merged_alpha |= tagged_alpha;
                 }
-                b"Lr32" => return Err(IoError::UnsupportedPsdDepth(32)),
                 // "Saving merged transparency": the merged image's
                 // fourth channel is its alpha (psd-tools'
                 // `has_transparency`).
-                b"Mtrn" | b"Mt16" => info.merged_alpha = true,
+                b"Mtrn" | b"Mt16" | b"Mt32" => info.merged_alpha = true,
                 _ => {}
             }
         }
@@ -4892,6 +5220,14 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         let mut blocks = std::mem::take(&mut record.effects_blocks);
         // Stable: two blocks of one kind keep their file order.
         blocks.sort_by_key(|(priority, _)| *priority);
+        if header.colours_unchecked() {
+            // Effect colours of a CMYK or 32-bit file are in a space this
+            // reader does not read (task 146).
+            if !blocks.is_empty() {
+                notes.add(Note::EffectsLeftOutInMode);
+            }
+            continue;
+        }
         for (_, block) in &blocks {
             let read = effects::read_effects(block, global_angle, &mut effects_budget);
             let done = read.is_ok();
@@ -4925,7 +5261,7 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
     if let Some(err) = src.take_failure() {
         return Err(err);
     }
-    let color_planes = if header.gray() { 1 } else { 3 };
+    let color_planes = u16::try_from(header.color_planes()).unwrap_or(3);
     let merged_alpha = info.merged_alpha && header.channels > color_planes;
     let extra = u64::from(header.channels)
         .saturating_sub(u64::from(color_planes))
@@ -4952,10 +5288,14 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         // The merged image is the rest of the file, read at once — about
         // one layer's worth, and only for a file with no layers at all.
         let rest = r.take_upto(src, usize::MAX, "merged image")?;
+        let cmyk = header
+            .cmyk()
+            .then(|| cmyk_converter(notes.3.as_deref()));
         Some(decode_merged(
             &mut Reader::new(&rest),
             header,
             merged_alpha,
+            cmyk.as_ref(),
         )?)
     } else {
         None
@@ -4966,6 +5306,7 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         width: header.width,
         height: header.height,
         depth: header.depth,
+        color_mode: header.color_mode,
         layers,
         composite,
         linked_files,
@@ -5098,7 +5439,21 @@ pub fn merged_image(bytes: &[u8]) -> Result<Image, IoError> {
     r.skip(resources, "image resources")?;
     let section = r.length(header.psb(), "layer and mask section length")?;
     r.skip(section, "layer and mask section")?;
-    decode_merged(&mut r, header, false)
+    let cmyk = if header.cmyk() {
+        // Back to the resources for the CMYK profile.
+        let mut again = Reader::new(bytes);
+        let _ = read_header(&mut again)?;
+        let color = again.length(false, "colour mode data length")?;
+        again.skip(color, "colour mode data")?;
+        let resources = again.length(false, "image resources length")?;
+        let data = again.take(resources, "image resources")?;
+        let mut notes = Notes::default();
+        let _angle = scan_resources(data, &mut notes);
+        Some(cmyk_converter(notes.3.as_deref()))
+    } else {
+        None
+    };
+    decode_merged(&mut r, header, false, cmyk.as_ref())
 }
 
 /// [`merged_image`], converted from the file's embedded RGB profile into
@@ -5128,7 +5483,7 @@ pub fn merged_image_in_working_space(bytes: &[u8]) -> Result<Image, IoError> {
     let mut notes = Notes::default();
     let _angle = scan_resources(data, &mut notes);
     let embedded = notes.3.take();
-    let plan = plan_colour(embedded.as_deref(), header.gray(), &mut notes);
+    let plan = plan_colour(embedded.as_deref(), header, &mut notes);
     if let Some(profile) = &plan.convert_from
         && crate::convert_profile_rgba(
             image.samples_mut(),
@@ -5256,15 +5611,25 @@ fn build_streamed(
     sink: &mut dyn PsdPixelSink,
 ) -> Result<PsdStreamedDocument, IoError> {
     let PsdFile {
+        version,
         width,
         height,
+        depth,
+        color_mode,
         layers: nodes,
         composite,
         linked_files,
         patterns,
         mut notes,
-        ..
     } = file;
+    let header = Header {
+        version,
+        channels: 0,
+        color_mode,
+        width,
+        height,
+        depth,
+    };
     let canvas = Rect {
         x: 0,
         y: 0,
@@ -5279,13 +5644,17 @@ fn build_streamed(
         layers.add_pattern(pattern)?;
     }
     let mut history = History::new();
-    let profile = SharedProfile::new();
     // Colour management (round 1): judge the embedded profile once, before
     // any pixel is decoded, so every layer image is converted on its way
-    // to the sink. A Grayscale file keeps its old handling.
-    let gray = notes.0.contains_key(&Note::GrayscaleHeldAsRgb);
+    // to the sink. A Grayscale file keeps its old handling (a 32-bit one
+    // does not, task 146).
     let embedded = notes.3.take();
-    let plan = plan_colour(embedded.as_deref(), gray, &mut notes);
+    let mut plan = plan_colour(embedded.as_deref(), header, &mut notes);
+    let profile = SharedProfile::with_cmyk(
+        header
+            .cmyk()
+            .then(|| crate::colour_cmyk::CmykConverter::new(plan.cmyk_profile.take())),
+    );
     let mut builder = Builder {
         to_working: plan
             .convert_from
@@ -5340,7 +5709,17 @@ fn build_streamed(
             },
         ));
     }
-    if let Some(source) = &colour.source {
+    if let Some(line) = plan.mode_line.take() {
+        extra_items.push(line);
+    }
+    if header.float() && profile.saw_bright() {
+        extra_items.push(
+            "Some 32-bit colour values were brighter than white; they were clipped to white \
+             when converted to sRGB."
+                .to_owned(),
+        );
+    }
+    if let Some(source) = colour.source.as_ref().filter(|_| !header.float()) {
         let line = crate::colour_import::converted_on_open_line(&source.description, true);
         extra_items.push(if builder.conversion_failed > 0 {
             // Not every layer converted: do not claim the whole file did.
@@ -5381,22 +5760,81 @@ fn build_streamed(
 
 /// What the embedded profile means for this open.
 struct ColourPlan {
-    /// The profile bytes to convert layers from, when they need converting.
+    /// The RGB profile bytes to convert layers from, when they need
+    /// converting (an RGB profile; for a 32-bit file, a linear one).
     convert_from: Option<Vec<u8>>,
+    /// A CMYK file's profile, when it has a usable one (task 146); `None`
+    /// means the naive formula.
+    cmyk_profile: Option<Vec<u8>>,
     colour: crate::ColourImport,
     /// Report lines for the "Opened With Changes" dialog.
     warnings: Vec<String>,
+    /// The line saying the file's colours were converted, for a CMYK or
+    /// 32-bit file (which have their own wording).
+    mode_line: Option<String>,
 }
 
-/// Judges resource 1039 (`embedded`) for an RGB file; a Grayscale file
-/// keeps its older note (the profile is not applied). No profile at all is
-/// an info line, not a warning.
-fn plan_colour(embedded: Option<&[u8]>, gray: bool, notes: &mut Notes) -> ColourPlan {
+/// The sRGB primaries with a linear (gamma 1.0) tone curve, as ICC bytes:
+/// what a 32-bit file without a usable profile is read as (Photoshop's
+/// 32-bit working space is linear).
+fn linear_srgb_profile_bytes() -> Option<Vec<u8>> {
+    static BYTES: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    BYTES
+        .get_or_init(|| {
+            IccProfile::synthetic_rgb(
+                [0.3127, 0.3290],
+                [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]],
+                1.0,
+            )
+            .ok()
+            .and_then(|p| p.to_bytes().ok())
+        })
+        .clone()
+}
+
+/// A CMYK file's converter: through its embedded profile when that is a
+/// usable CMYK profile, else the naive formula.
+fn cmyk_converter(embedded: Option<&[u8]>) -> crate::colour_cmyk::CmykConverter {
+    crate::colour_cmyk::CmykConverter::new(
+        embedded
+            .filter(|bytes| aurora_color::inspect_cmyk_source(bytes).is_ok())
+            .map(<[u8]>::to_vec),
+    )
+}
+
+/// Judges resource 1039 (`embedded`) for this file's mode and depth.
+///
+/// - **RGB, 8/16-bit:** the embedded RGB profile converts (0.264.0); no
+///   profile is an info line.
+/// - **Grayscale, 8/16-bit:** keeps its older note (the profile is not
+///   applied).
+/// - **CMYK (task 146):** converted through the embedded CMYK profile; a
+///   missing or unusable one falls back to the naive formula, said in a
+///   warning (the file opens, with colours that will not match Photoshop).
+/// - **32-bit (task 146):** the stored values are linear light. An embedded
+///   RGB profile (Photoshop writes "... (Linear RGB Profile)") converts
+///   them to sRGB; with none, or an unusable one, they are read as linear
+///   sRGB (the stated assumption). A Grayscale file's grey profile is not
+///   applied; its values are read as linear light. A profile that is
+///   sRGB-encoded rather than linear is taken at its word: the values are
+///   used as encoded sRGB.
+fn plan_colour(embedded: Option<&[u8]>, header: Header, notes: &mut Notes) -> ColourPlan {
     let mut plan = ColourPlan {
         convert_from: None,
+        cmyk_profile: None,
         colour: crate::ColourImport::default(),
         warnings: Vec::new(),
+        mode_line: None,
     };
+    if header.cmyk() {
+        plan_cmyk(embedded, &mut plan);
+        return plan;
+    }
+    if header.float() {
+        plan_float(embedded, header.gray(), &mut plan);
+        return plan;
+    }
+    let gray = header.gray();
     let Some(bytes) = embedded else {
         if !gray {
             plan.colour
@@ -5438,6 +5876,94 @@ fn plan_colour(embedded: Option<&[u8]>, gray: bool, notes: &mut Notes) -> Colour
         },
     }
     plan
+}
+
+/// [`plan_colour`] for a CMYK file.
+fn plan_cmyk(embedded: Option<&[u8]>, plan: &mut ColourPlan) {
+    const FORMULA: &str = "its inks are converted to sRGB with a simple formula that knows \
+                           nothing of real inks, so the colours will not match Photoshop; the \
+                           original CMYK values are not kept";
+    match embedded.map(|bytes| (bytes, aurora_color::inspect_cmyk_source(bytes))) {
+        None => plan
+            .warnings
+            .push(format!("The file has no CMYK colour profile, so {FORMULA}.")),
+        Some((_, Err(problem))) => plan.warnings.push(format!(
+            "The file's colour profile was not used ({}), so {FORMULA}.",
+            problem.describe_expecting("CMYK")
+        )),
+        Some((bytes, Ok(source))) => {
+            plan.colour.report.info.push(format!(
+                "Converted from the CMYK profile \"{}\" to sRGB.",
+                source.description
+            ));
+            plan.mode_line = Some(format!(
+                "The colours were converted from the CMYK profile \"{}\" to sRGB when the file \
+                 was opened (out-of-gamut colours are clipped); the original CMYK values and \
+                 profile are not kept.",
+                source.description
+            ));
+            plan.cmyk_profile = Some(bytes.to_vec());
+        }
+    }
+}
+
+/// [`plan_colour`] for a 32-bit floating point file.
+fn plan_float(embedded: Option<&[u8]>, gray: bool, plan: &mut ColourPlan) {
+    let linear = || linear_srgb_profile_bytes();
+    let what: String = if gray {
+        plan.convert_from = linear();
+        "linear grey".to_owned()
+    } else {
+        match embedded.map(|bytes| (bytes, aurora_color::inspect_rgb_source(bytes))) {
+            None => {
+                plan.convert_from = linear();
+                plan.colour.report.info.push(
+                    "No colour profile: the 32-bit values are assumed to be linear sRGB.".to_owned(),
+                );
+                "linear light, sRGB assumed".to_owned()
+            }
+            Some((_, Err(problem))) => {
+                plan.convert_from = linear();
+                plan.warnings.push(format!(
+                    "The file's embedded colour profile was not used ({}); its 32-bit values are \
+                     read as linear sRGB.",
+                    problem.describe()
+                ));
+                "linear light, sRGB assumed".to_owned()
+            }
+            Some((_, Ok(source))) if source.equivalent_to_srgb => {
+                // An sRGB-encoded profile on float data: taken at its word.
+                plan.warnings.push(
+                    "The file's profile is sRGB with its usual tone curve, not a linear one; its \
+                     32-bit values are used as encoded sRGB."
+                        .to_owned(),
+                );
+                "sRGB-encoded".to_owned()
+            }
+            Some((bytes, Ok(source))) => {
+                plan.colour.report.info.push(format!(
+                    "Converted from \"{}\" to sRGB.",
+                    source.description
+                ));
+                plan.colour.source = Some(crate::SourceProfile {
+                    bytes: bytes.to_vec(),
+                    description: source.description.clone(),
+                });
+                plan.convert_from = Some(bytes.to_vec());
+                format!("linear light, \"{}\"", source.description)
+            }
+        }
+    };
+    if plan.convert_from.is_none() && what != "sRGB-encoded" {
+        plan.warnings.push(
+            "The 32-bit colour conversion could not be set up; the values are used as they are."
+                .to_owned(),
+        );
+    }
+    plan.mode_line = Some(format!(
+        "The colours were converted from 32-bit floating point ({what}) to sRGB when the file \
+         was opened (out-of-gamut colours are clipped); the 32-bit original is not kept."
+    ));
 }
 
 /// `'k` and `'s` are the sink's and the source's own lifetimes, kept apart
