@@ -1168,10 +1168,8 @@ fn real_emoji_name_and_linear_dodge_at_half_opacity() {
 fn real_unsupported_fixtures_give_their_specific_errors() {
     // 32-bit float opens since task 146 (see `mode_tests`).
     assert!(decode(fixture!("32bit5x5.psd")).is_ok());
-    assert!(matches!(
-        decode(fixture!("4x4_8bit_lab.psd")),
-        Err(IoError::UnsupportedPsdColorMode(9))
-    ));
+    // Lab opens since task 148 (see `other_mode_tests`).
+    assert!(decode(fixture!("4x4_8bit_lab.psd")).is_ok());
     // Grayscale opens since 0.147.0 — see
     // `real_grayscale_fixture_matches_psd_tools`.
     assert!(decode(fixture!("4x4_8bit_grayscale.psd")).is_ok());
@@ -2421,8 +2419,9 @@ fn grayscale_ignores_colour_channels_one_and_two_and_its_merged_image_is_grey() 
 }
 
 #[test]
-fn bitmap_indexed_duotone_and_friends_stay_refused_by_name() {
-    for mode in [0_u16, 2, 7, 8, 9] {
+fn colour_modes_without_a_reader_stay_refused_by_name() {
+    // 5 and 6 are unassigned; the assigned modes open since task 148.
+    for mode in [5_u16, 6, 10, 255] {
         let bytes = TestPsd::new(1, 1, 1, 8)
             .with(|p| p.color_mode = mode)
             .write();

@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.284.0] - 2026-10-20
+
+### Added
+
+- Record Lab, Indexed, Bitmap, Duotone and Multichannel PSD reading
+
 ## [0.283.0] - 2026-10-20
 
 ### Added

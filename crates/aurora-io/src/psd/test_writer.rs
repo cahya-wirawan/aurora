@@ -231,6 +231,8 @@ pub(crate) struct TestPsd {
     pub lr16: bool,
     pub negative_count: bool,
     pub resources: Vec<u8>,
+    /// The colour mode data section (task 148): an Indexed Color table.
+    pub color_mode_data: Vec<u8>,
     /// The merged image's planes (one per header channel); white when
     /// `None`.
     pub merged: Option<Vec<Vec<u8>>>,
@@ -253,6 +255,7 @@ impl TestPsd {
             lr16: false,
             negative_count: false,
             resources: Vec::new(),
+            color_mode_data: Vec::new(),
             merged: None,
             merged_compression: 0,
             globals: Vec::new(),
@@ -266,6 +269,15 @@ impl TestPsd {
 
     fn psb(&self) -> bool {
         self.version == 2
+    }
+
+    /// The bytes of one stored merged-image row (1-bit rows are padded).
+    fn merged_row_bytes(&self) -> usize {
+        if self.depth == 1 {
+            (self.width as usize).div_ceil(8)
+        } else {
+            self.width as usize * self.bps()
+        }
     }
 
     fn bps(&self) -> usize {
@@ -286,7 +298,8 @@ impl TestPsd {
         o.extend_from_slice(&self.width.to_be_bytes());
         o.extend_from_slice(&self.depth.to_be_bytes());
         o.extend_from_slice(&self.color_mode.to_be_bytes());
-        o.extend_from_slice(&0u32.to_be_bytes());
+        put_u32(&mut o, self.color_mode_data.len());
+        o.extend_from_slice(&self.color_mode_data);
         put_u32(&mut o, self.resources.len());
         o.extend_from_slice(&self.resources);
 
@@ -388,7 +401,7 @@ impl TestPsd {
         let (w, h) = (self.width as usize, self.height as usize);
         let planes = self.merged.clone().unwrap_or_else(|| {
             (0..self.channels)
-                .map(|_| vec![0xFF; w * h * bps])
+                .map(|_| vec![0xFF; self.merged_row_bytes() * h])
                 .collect()
         });
         let mut o = Vec::new();
@@ -398,7 +411,7 @@ impl TestPsd {
                 let mut counts = Vec::new();
                 let mut data = Vec::new();
                 for plane in &planes {
-                    for row in plane.chunks(w * bps) {
+                    for row in plane.chunks(self.merged_row_bytes().max(1)) {
                         let packed = pack_bits(row);
                         put_count(&mut counts, packed.len(), self.psb());
                         data.extend_from_slice(&packed);

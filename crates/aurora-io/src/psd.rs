@@ -155,6 +155,9 @@ mod lab;
 mod mixer_selective_tests;
 #[cfg(test)]
 mod mode_tests;
+mod modes;
+#[cfg(test)]
+mod other_mode_tests;
 mod pattern;
 #[cfg(test)]
 mod pattern_tests;
@@ -585,6 +588,9 @@ enum Note {
     BrokenGroups,
     ExtraChannels,
     ColorProfileIgnored,
+    /// A Lab, Indexed, Bitmap, Duotone or Multichannel file's flattened
+    /// image carries a transparency plane that is not read (task 148).
+    MergedTransparencyIgnored,
     ColorProfileTooLarge,
     /// Adjustment layers of a CMYK or 32-bit file, left out (task 146):
     /// nothing checked how Photoshop's adjustments read those modes.
@@ -608,6 +614,9 @@ struct Notes(
     /// Resource 1039's bytes, when present and within
     /// `aurora_color::MAX_PROFILE_BYTES` (colour-managed open).
     Option<Vec<u8>>,
+    /// Resource 1047, the transparent index of an Indexed Color file
+    /// (task 148).
+    Option<u16>,
 );
 
 impl Notes {
@@ -1111,6 +1120,11 @@ fn note_text(note: Note, n: u64) -> String {
         Note::ExtraChannels => {
             format!("{n} saved channel{s} (alpha or spot colour) {was} not opened.")
         }
+        Note::MergedTransparencyIgnored => {
+            "The flattened image's transparency channel was not read; \
+                                             it is shown opaque."
+                .to_owned()
+        }
         Note::ColorProfileIgnored => "The file's embedded colour profile was ignored; its \
                                       colours are treated as sRGB."
             .to_owned(),
@@ -1119,7 +1133,8 @@ fn note_text(note: Note, n: u64) -> String {
             .to_owned(),
         Note::AdjustmentLeftOutInMode => format!(
             "{n} adjustment layer{s} {was} left out — Aurora has not checked how Photoshop's \
-             adjustments work in CMYK or 32-bit files."
+             adjustments work in CMYK, 32-bit, Lab, Indexed, Bitmap, Duotone or Multichannel \
+             files."
         ),
         Note::AdjustmentOnConvertedCmyk => format!(
             "{n} Brightness/Contrast layer{s} of this CMYK file {was} applied to the colours \
@@ -1128,7 +1143,8 @@ fn note_text(note: Note, n: u64) -> String {
         ),
         Note::EffectsLeftOutInMode => format!(
             "The layer effects of {n} layer{s} {was} left out — their colours are in a space \
-             Aurora does not read in CMYK or 32-bit files."
+             Aurora does not read in CMYK, 32-bit, Lab, Indexed, Bitmap, Duotone or \
+             Multichannel files."
         ),
         Note::GrayscaleHeldAsRgb => "This Grayscale file is held as RGB (the grey on all three \
                                      channels); saving it as a PSD writes an RGB file, not \
@@ -1452,12 +1468,14 @@ impl Window {
 struct Header {
     version: u16,
     channels: u16,
-    /// `1` (Grayscale), `3` (RGB) or `4` (CMYK, task 146) — the only three
-    /// [`read_header`] lets through.
+    /// `0` (Bitmap), `1` (Grayscale), `2` (Indexed Color), `3` (RGB), `4`
+    /// (CMYK, task 146), `7` (Multichannel), `8` (Duotone) or `9` (Lab) —
+    /// the modes [`read_header`] lets through (task 148).
     color_mode: u16,
     width: u32,
     height: u32,
-    /// `8`, `16`, or `32` (floating point, task 146; Grayscale and RGB only).
+    /// `1` (Bitmap only), `8`, `16`, or `32` (floating point, task 146;
+    /// Grayscale and RGB only); [`read_header`] checks the mode's depths.
     depth: u16,
 }
 
@@ -1484,9 +1502,40 @@ impl Header {
         self.color_mode == 4
     }
 
+    /// Whether this is a Lab file (colour mode 9, task 148).
+    fn lab(self) -> bool {
+        self.color_mode == 9
+    }
+
+    /// Whether this is an Indexed Color file (colour mode 2, task 148).
+    fn indexed(self) -> bool {
+        self.color_mode == 2
+    }
+
+    /// Whether this is a Bitmap file (colour mode 0, 1 bit, task 148).
+    fn bitmap(self) -> bool {
+        self.color_mode == 0
+    }
+
+    /// Whether the file's first channel is read as a grey plane and
+    /// expanded to R = G = B: Grayscale, and (task 148) Duotone and
+    /// Multichannel, whose inks and other channels are left out.
+    fn grey_plane(self) -> bool {
+        matches!(self.color_mode, 1 | 7 | 8)
+    }
+
     /// Whether samples are 32-bit floating point (task 146).
     fn float(self) -> bool {
         self.depth == 32
+    }
+
+    /// The bytes of one stored row of `width` samples of one channel.
+    fn row_bytes(self, width: usize) -> Option<usize> {
+        if self.depth == 1 {
+            Some(width.div_ceil(8))
+        } else {
+            width.checked_mul(self.bytes_per_sample())
+        }
     }
 
     /// Whether the file's colour values (descriptor colours of fill layers
@@ -1494,14 +1543,15 @@ impl Header {
     /// not checked: CMYK inks, or 32-bit linear light. Those are left out
     /// and reported rather than read as 8-bit sRGB.
     fn colours_unchecked(self) -> bool {
-        self.cmyk() || self.float()
+        self.cmyk() || self.float() || !matches!(self.color_mode, 1 | 3)
     }
 
-    /// How many colour channels a pixel has: `1` for Grayscale (channel
-    /// `0`, expanded to R = G = B on decode), `3` for RGB, `4` for CMYK.
+    /// How many colour channels a pixel has: `1` for Grayscale, Bitmap,
+    /// Indexed, Multichannel and Duotone (channel `0`, expanded on decode),
+    /// `3` for RGB and Lab, `4` for CMYK.
     fn color_planes(self) -> usize {
         match self.color_mode {
-            1 => 1,
+            0 | 1 | 2 | 7 | 8 => 1,
             4 => 4,
             _ => 3,
         }
@@ -1543,20 +1593,31 @@ fn read_header(r: &mut Reader<'_>) -> Result<Header, IoError> {
             max: u64::from(max),
         });
     }
-    // Grayscale (1), RGB (3) and CMYK (4, task 146) only. Bitmap (0),
-    // Indexed (2), Multichannel (7), Duotone (8) and Lab (9) are refused by
-    // name rather than guessed at: Indexed needs its palette, Duotone its
-    // ink curves, and showing either as grey or RGB would be a silent
-    // mis-render.
-    if !matches!(color_mode, 1 | 3 | 4) {
+    // Bitmap (0), Grayscale (1), Indexed (2), RGB (3), CMYK (4, task 146),
+    // Multichannel (7), Duotone (8) and Lab (9, task 148). Modes 5 and 6
+    // and anything else are refused by name.
+    if !matches!(color_mode, 0..=4 | 7..=9) {
         return Err(IoError::UnsupportedPsdColorMode(color_mode));
     }
-    // 8, 16, and 32-bit float (Photoshop has no 32-bit CMYK).
-    if !matches!(depth, 8 | 16 | 32) || (depth == 32 && color_mode == 4) {
+    // The depths each mode exists in: Bitmap is 1 bit only and Indexed 8;
+    // Grayscale and RGB take 8, 16 and 32-bit float; CMYK, Duotone,
+    // Multichannel and Lab take 8 and 16 (Photoshop has no 32-bit CMYK or
+    // Lab, and a 32-bit Multichannel or Duotone is not read).
+    let depth_ok = match color_mode {
+        0 => depth == 1,
+        2 => depth == 8,
+        1 | 3 => matches!(depth, 8 | 16 | 32),
+        _ => matches!(depth, 8 | 16),
+    };
+    if !depth_ok {
         return Err(IoError::UnsupportedPsdDepth(depth));
     }
-    if color_mode == 3 && channels < 3 {
-        return Err(malformed("an RGB file with fewer than three channels"));
+    if matches!(color_mode, 3 | 9) && channels < 3 {
+        return Err(malformed(if color_mode == 3 {
+            "an RGB file with fewer than three channels"
+        } else {
+            "a Lab file with fewer than three channels"
+        }));
     }
     if color_mode == 4 && channels < 4 {
         return Err(malformed("a CMYK file with fewer than four channels"));
@@ -1615,6 +1676,12 @@ fn scan_resources(data: &[u8], notes: &mut Notes) -> f32 {
         }
         if id == 1039 && notes.2 == grey_profile::GreyProfile::Absent {
             notes.2 = grey_profile::classify(body);
+        }
+        if id == 1047
+            && notes.4.is_none()
+            && let Some([hi, lo]) = body.get(..2)
+        {
+            notes.4 = Some(u16::from_be_bytes([*hi, *lo]));
         }
         if id == 1037
             && let Some(bytes) = body.get(..4)
@@ -3308,6 +3375,9 @@ fn decode_pending(
     if header.cmyk() {
         return decode_pending_cmyk(pending, src, profile, width, height, bps);
     }
+    if header.lab() {
+        return decode_pending_lab(pending, src, width, height, bps);
+    }
     if let Some(samples) = decode_four_channels(pending, src, width, height, bps)? {
         profile.note_if_bright(header, &samples);
         return Image::new(pending.width, pending.height, profile.get(), samples);
@@ -3323,11 +3393,41 @@ fn decode_pending(
             write_plane(&mut samples, &plane, rgba, bps);
         }
     }
-    if header.gray() {
+    if header.grey_plane() {
         replicate_gray(&mut samples);
     }
     profile.note_if_bright(header, &samples);
     Image::new(pending.width, pending.height, profile.get(), samples)
+}
+
+/// A Lab layer (task 148): the three planes and the transparency plane are
+/// decoded one at a time and converted to sRGB in one pass.
+fn decode_pending_lab(
+    pending: &PendingPixels,
+    src: &mut dyn ByteSource,
+    width: usize,
+    height: usize,
+    bps: usize,
+) -> Result<Image, IoError> {
+    let header = pending.header;
+    check_cmyk_peak(width as u64 * height as u64, bps)?;
+    let mut planes: [Option<Vec<u8>>; 5] = [None, None, None, None, None];
+    for (slot, chan) in pending.slots.iter().enumerate() {
+        if let (Some(chan), Some(entry)) = (chan, planes.get_mut(slot)) {
+            let data = src.read_at(chan.offset, chan.len, "channel image data")?;
+            *entry = Some(decode_channel(&data, width, height, bps, header.psb())?);
+        }
+    }
+    let [l, a, b, _, alpha] = &planes;
+    let samples = modes::lab_to_rgba(
+        [l.as_deref(), a.as_deref(), b.as_deref()],
+        alpha.as_deref(),
+        bps,
+        width
+            .checked_mul(height)
+            .ok_or_else(|| malformed("layer size"))?,
+    )?;
+    Image::new(pending.width, pending.height, IccProfile::srgb(), samples)
 }
 
 /// A CMYK layer (task 146): the four ink planes and the transparency plane
@@ -4976,10 +5076,14 @@ fn walk_merged_planes(
     let height = header.height as usize;
     let bps = header.bytes_per_sample();
     let size = || malformed("merged image size");
-    let row_bytes = width.checked_mul(bps).ok_or_else(size)?;
+    let row_bytes = header.row_bytes(width).ok_or_else(size)?;
     let plane_len = row_bytes.checked_mul(height).ok_or_else(size)?;
     let channels = usize::from(header.channels);
     let compression = r.u16("merged image compression")?;
+    if compression == 3 && header.depth == 1 {
+        // Prediction is defined on whole samples, not on bits.
+        return Err(IoError::UnsupportedPsdCompression(3));
+    }
     match compression {
         0 => {
             let needed = plane_len.checked_mul(planes).ok_or_else(size)?;
@@ -5113,6 +5217,7 @@ fn decode_merged(
     header: Header,
     alpha: bool,
     cmyk: Option<&crate::colour_cmyk::CmykConverter>,
+    palette: Option<&modes::Palette>,
 ) -> Result<Image, IoError> {
     let width = header.width as usize;
     let height = header.height as usize;
@@ -5148,6 +5253,43 @@ fn decode_merged(
         )?;
         return Image::new(header.width, header.height, IccProfile::srgb(), samples);
     }
+    if header.lab() || header.indexed() || header.bitmap() {
+        // The modes converted from their stored planes (task 148); their
+        // merged image carries no transparency plane here (the open reports
+        // it). The pixel budget is checked here as well as by the callers,
+        // before any buffer is sized from the header.
+        let area = width as u64 * height as u64;
+        if area > PIXEL_BUDGET {
+            return Err(IoError::PsdPixelBudget {
+                total: area,
+                max: PIXEL_BUDGET,
+            });
+        }
+        let mut sink = CmykPlanes {
+            planes: [None, None, None, None, None],
+        };
+        walk_merged_planes(r, header, color, &mut sink)?;
+        let [p0, p1, p2, ..] = &sink.planes;
+        let pixels = width
+            .checked_mul(height)
+            .ok_or_else(|| malformed("merged image size"))?;
+        let samples = if header.lab() {
+            check_cmyk_peak(pixels as u64, header.bytes_per_sample())?;
+            modes::lab_to_rgba(
+                [p0.as_deref(), p1.as_deref(), p2.as_deref()],
+                None,
+                header.bytes_per_sample(),
+                pixels,
+            )?
+        } else if header.indexed() {
+            let palette =
+                palette.ok_or_else(|| malformed("an Indexed Color file without a colour table"))?;
+            modes::indexed_to_rgba(p0.as_deref().unwrap_or_default(), pixels, palette)?
+        } else {
+            modes::bitmap_to_rgba(p0.as_deref().unwrap_or_default(), width, height)?
+        };
+        return Image::new(header.width, header.height, IccProfile::srgb(), samples);
+    }
     let mut sink = RgbaPlanes {
         width,
         height,
@@ -5157,7 +5299,7 @@ fn decode_merged(
     };
     walk_merged_planes(r, header, planes, &mut sink)?;
     let mut samples = sink.samples;
-    if header.gray() {
+    if header.grey_plane() {
         replicate_gray(&mut samples);
     }
     if planes > color {
@@ -5364,11 +5506,32 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
     }
 
     let color_data_len = r.length(src, false, "colour mode data length")?;
-    r.advance(color_data_len, "colour mode data")?;
+    // Only an Indexed Color file's table is read; it is exactly 768 bytes.
+    let palette_bytes = if header.indexed() {
+        if color_data_len != modes::PALETTE_BYTES {
+            return Err(malformed(
+                "an Indexed Color file whose colour table is not 768 bytes",
+            ));
+        }
+        Some(r.take(src, color_data_len, "colour table")?)
+    } else {
+        r.advance(color_data_len, "colour mode data")?;
+        None
+    };
     let resources_len = r.length(src, false, "image resources length")?;
     let resources = r.take(src, resources_len, "image resources")?;
     let global_angle = scan_resources(&resources, &mut notes);
     drop(resources);
+    // Lab, Indexed, Bitmap, Duotone and Multichannel files never use an
+    // embedded profile (task 148): say so when it is not plainly sRGB.
+    if !matches!(header.color_mode, 1 | 3 | 4)
+        && notes.3.as_deref().is_some_and(|p| !looks_like_srgb(p))
+    {
+        notes.add(Note::ColorProfileIgnored);
+    }
+    let palette = palette_bytes
+        .map(|bytes| modes::Palette::parse(&bytes, notes.4))
+        .transpose()?;
 
     let section_len = r.length(src, psb, "layer and mask section length")?;
     let mut section = r.sub(section_len, "layer and mask section")?;
@@ -5384,6 +5547,14 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         let info_len = section.length(src, psb, "layer info length")?;
         let mut body = section.sub(info_len, "layer info")?;
         info = read_layer_info(src, &mut body, header)?;
+        // Photoshop keeps no layers in a Bitmap or Indexed Color image.
+        if (header.bitmap() || header.indexed()) && !info.records.is_empty() {
+            return Err(malformed(if header.bitmap() {
+                "a Bitmap file with layers"
+            } else {
+                "an Indexed Color file with layers"
+            }));
+        }
         if section.remaining() >= 4 {
             let mask_len = section.length(src, false, "global layer mask length")?;
             section.advance(mask_len, "global layer mask")?;
@@ -5483,7 +5654,10 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         return Err(err);
     }
     let color_planes = u16::try_from(header.color_planes()).unwrap_or(3);
-    let merged_alpha = info.merged_alpha && header.channels > color_planes;
+    // Only the colour modes whose merged image is un-matted here (RGB,
+    // Grayscale, CMYK) read a transparency plane from it.
+    let tagged_alpha = info.merged_alpha && header.channels > color_planes;
+    let merged_alpha = tagged_alpha && matches!(header.color_mode, 1 | 3 | 4);
     let extra = u64::from(header.channels)
         .saturating_sub(u64::from(color_planes))
         .saturating_sub(u64::from(merged_alpha));
@@ -5505,6 +5679,9 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         if !info.records.is_empty() {
             notes.add(Note::FlattenedFallback);
         }
+        if tagged_alpha && !merged_alpha {
+            notes.add(Note::MergedTransparencyIgnored);
+        }
         drop(info);
         // The merged image is the rest of the file, read at once — about
         // one layer's worth, and only for a file with no layers at all.
@@ -5515,6 +5692,7 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
             header,
             merged_alpha,
             cmyk.as_ref(),
+            palette.as_ref(),
         )?)
     } else {
         None
@@ -5669,22 +5847,27 @@ pub fn merged_image(bytes: &[u8]) -> Result<Image, IoError> {
     r.skip(resources, "image resources")?;
     let section = r.length(header.psb(), "layer and mask section length")?;
     r.skip(section, "layer and mask section")?;
+    let mut palette = None;
     let embedded = if header.colours_unchecked() {
-        // Back to the resources for the CMYK or 32-bit profile.
+        // Back to the resources for the CMYK or 32-bit profile, and to the
+        // colour mode data for an Indexed Color table.
         let mut again = Reader::new(bytes);
         let _ = read_header(&mut again)?;
         let color = again.length(false, "colour mode data length")?;
-        again.skip(color, "colour mode data")?;
+        let table = again.take(color, "colour mode data")?;
         let resources = again.length(false, "image resources length")?;
         let data = again.take(resources, "image resources")?;
         let mut notes = Notes::default();
         let _angle = scan_resources(data, &mut notes);
+        if header.indexed() {
+            palette = Some(modes::Palette::parse(table, notes.4)?);
+        }
         notes.3.take()
     } else {
         None
     };
     let cmyk = header.cmyk().then(|| cmyk_converter(embedded.as_deref()));
-    let mut image = decode_merged(&mut r, header, false, cmyk.as_ref())?;
+    let mut image = decode_merged(&mut r, header, false, cmyk.as_ref(), palette.as_ref())?;
     if let Some(tag) = float_tag(embedded.as_deref(), header)
         && let Ok(profile) = IccProfile::from_bytes(&tag)
     {
@@ -6069,6 +6252,10 @@ fn plan_colour(embedded: Option<&[u8]>, header: Header, notes: &mut Notes) -> Co
         plan_cmyk(embedded, &mut plan);
         return plan;
     }
+    if !matches!(header.color_mode, 1 | 3) {
+        plan_other_mode(header, &mut plan);
+        return plan;
+    }
     if header.float() {
         plan_float(embedded, header.gray(), &mut plan);
         return plan;
@@ -6115,6 +6302,58 @@ fn plan_colour(embedded: Option<&[u8]>, header: Header, notes: &mut Notes) -> Co
         },
     }
     plan
+}
+
+/// [`plan_colour`] for Lab, Indexed Color, Bitmap, Duotone and Multichannel
+/// files (task 148): an embedded profile is not used, and the report says
+/// what was converted or left out.
+fn plan_other_mode(header: Header, plan: &mut ColourPlan) {
+    match header.color_mode {
+        9 => {
+            plan.colour
+                .report
+                .info
+                .push("Converted from Lab to sRGB.".to_owned());
+            plan.mode_line = Some(
+                "The colours were converted from Lab (D50) to sRGB when the file was opened \
+                 (out-of-gamut colours are clipped); the original Lab values are not kept."
+                    .to_owned(),
+            );
+        }
+        2 => {
+            plan.colour
+                .report
+                .info
+                .push("Indexed colours expanded to RGB.".to_owned());
+            plan.mode_line = Some(
+                "The file's indexed colour table was expanded to RGB when it was opened; the \
+                 table is not kept, and saving writes ordinary RGB."
+                    .to_owned(),
+            );
+        }
+        0 => {
+            plan.colour
+                .report
+                .info
+                .push("Bitmap pixels opened as black and white RGB.".to_owned());
+            plan.mode_line = Some(
+                "The file's 1-bit Bitmap was opened as black and white RGB pixels; it is no \
+                 longer a 1-bit image, and saving writes ordinary RGB."
+                    .to_owned(),
+            );
+        }
+        8 => plan.warnings.push(
+            "The file is Duotone: its ink colours and curves are not applied, so it is shown \
+             as greyscale and will differ from Photoshop's tinted rendering."
+                .to_owned(),
+        ),
+        _ => plan.warnings.push(
+            "The file is Multichannel: its first channel is shown as greyscale and the other \
+             channels are not shown, because Aurora does not know how Photoshop displays \
+             them."
+                .to_owned(),
+        ),
+    }
 }
 
 /// [`plan_colour`] for a CMYK file.
