@@ -417,6 +417,8 @@ fn gradient_positions_follow_the_geometry() {
     let g = parsed_gradient(&black_to_white(b"Rdl ", 0.0, 100.0, false));
     near(g.position(16.0, 16.0, b), aurora_core::gradient_fill::EDGE_OFFSET as f32);
     near(g.position(32.0, 32.0, b), 1.0);
+    // An edge midpoint: the fitted radius is `RADIAL_FACTOR` of the nominal.
+    near(g.position(32.0, 16.0, b), 0.806570);
     // Diamond (same radius as Radial times its factor): 1 at a corner of a
     // square box, `EDGE_OFFSET + 16 / (DIAMOND_FACTOR 16 sqrt 2)` at an
     // edge midpoint.
