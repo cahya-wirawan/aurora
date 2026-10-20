@@ -1472,3 +1472,63 @@ fn photoshops_own_float_zip_with_prediction_decodes_to_psd_tools_values() {
         assert!((px[0].to_f32() - want[0]).abs() < 1e-3);
     }
 }
+
+/// Brightness/Contrast is the one adjustment a CMYK file applies (task 147):
+/// to the colours already converted to sRGB, with a report line; the other
+/// kinds (Invert here) stay left out. 32-bit files apply none.
+#[test]
+fn a_cmyk_brightness_contrast_layer_is_applied_on_the_converted_colours() {
+    let build = |mode_depth: (u16, u16)| {
+        TestPsd::new(1, 2, 2, mode_depth.1)
+            .with(|p| {
+                p.color_mode = mode_depth.0;
+                p.channels = if mode_depth.0 == 4 { 4 } else { 3 };
+                if mode_depth.0 == 4 {
+                    p.layers.push(TestLayer::cmyk(
+                        "L",
+                        0,
+                        0,
+                        1,
+                        1,
+                        8,
+                        &[[255, 255, 255, 255, 255]],
+                    ));
+                }
+                p.layers.push(TestLayer::empty("BC").with(|l| {
+                    // Brightness 20, contrast 0, mean 127, default (not legacy) mode.
+                    let mut d = Vec::new();
+                    for v in [20_i16, 0, 127] {
+                        d.extend_from_slice(&v.to_be_bytes());
+                    }
+                    d.extend_from_slice(&[0, 0]);
+                    l.blocks.push((*b"brit", d));
+                }));
+                p.layers.push(TestLayer::empty("Invert").with(|l| {
+                    l.blocks.push((*b"nvrt", Vec::new()));
+                }));
+            })
+            .write()
+    };
+    let document = open(&build((4, 8)));
+    let text = document.report.items.join("\n");
+    assert!(
+        text.contains("1 Brightness/Contrast layer of this CMYK file was applied"),
+        "{text}"
+    );
+    assert!(text.contains("1 adjustment layer was left out"), "{text}");
+    let kinds: Vec<_> = document
+        .layers
+        .roots()
+        .iter()
+        .filter_map(|&id| document.layers.adjustment(id))
+        .collect();
+    assert_eq!(
+        kinds.len(),
+        1,
+        "only Brightness/Contrast is imported: {text}"
+    );
+    assert!(matches!(
+        kinds.first(),
+        Some(aurora_doc::Adjustment::BrightnessContrast(_))
+    ));
+}

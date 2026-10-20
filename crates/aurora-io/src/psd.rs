@@ -586,6 +586,9 @@ enum Note {
     /// Adjustment layers of a CMYK or 32-bit file, left out (task 146):
     /// nothing checked how Photoshop's adjustments read those modes.
     AdjustmentLeftOutInMode,
+    /// A Brightness/Contrast layer of a CMYK file is applied to the colours
+    /// already converted to sRGB, not to the inks (task 147).
+    AdjustmentOnConvertedCmyk,
     /// Layer effects of a CMYK or 32-bit file, left out (task 146).
     EffectsLeftOutInMode,
     /// A Grayscale file is held as RGB (grey on all three channels); a PSD
@@ -1110,6 +1113,11 @@ fn note_text(note: Note, n: u64) -> String {
         Note::AdjustmentLeftOutInMode => format!(
             "{n} adjustment layer{s} {was} left out — Aurora has not checked how Photoshop's \
              adjustments work in CMYK or 32-bit files."
+        ),
+        Note::AdjustmentOnConvertedCmyk => format!(
+            "{n} Brightness/Contrast layer{s} of this CMYK file {was} applied to the colours \
+             converted to sRGB, not to the inks, and may differ from Photoshop's result \
+             (measured on its own renderings: legacy 3 levels, default 13 levels mean error)."
         ),
         Note::EffectsLeftOutInMode => format!(
             "The layer effects of {n} layer{s} {was} left out — their colours are in a space \
@@ -4208,6 +4216,28 @@ fn other_adjustment_node(
     adjustment_node(src, record, header, params, notes, vector_budget)
 }
 
+/// Whether an adjustment layer of a CMYK file is applied to the converted
+/// sRGB picture (task 147). Only Brightness/Contrast: measured against
+/// Photoshop's own renderings of the `adjustments/*_cmyk.psd` fixtures
+/// (mean error against the left-out picture -> applied): legacy 22.3 -> 3.4,
+/// default 42.1 -> 12.7 (the default mode is approximate in RGB too, 8.75).
+/// Not applied: Invert (48.5 -> 49.8: Photoshop inverts the inks, so a light
+/// colour becomes near black), Threshold (68.8 -> 35.4: its lightness is not
+/// the sRGB luma), Posterize (11.5 -> 12.5, 19.4 -> 18.8), and Curves,
+/// Levels and Hue/Saturation, whose channel layouts are inks.
+fn cmyk_adjustment_applies(header: Header, record: &Record) -> bool {
+    header.cmyk()
+        && !header.float()
+        && !record.features.adjustment
+        && record.curves.is_none()
+        && record.levels.is_none()
+        && record.hue_saturation.is_none()
+        && matches!(
+            record.other_adjustment,
+            Some(read_adjust::Parsed::Brightness(..))
+        )
+}
+
 /// One non-divider record as a layer node, or `None` when it is left out
 /// (an adjustment layer, or a fill layer with no pixels).
 #[allow(clippy::too_many_lines)] // one branch per layer kind
@@ -4225,9 +4255,13 @@ fn layer_node(
             || record.levels.is_some()
             || record.hue_saturation.is_some()
             || record.other_adjustment.is_some())
+        && !cmyk_adjustment_applies(header, record)
     {
         notes.add(Note::AdjustmentLeftOutInMode);
         return None;
+    }
+    if header.cmyk() && cmyk_adjustment_applies(header, record) {
+        notes.add(Note::AdjustmentOnConvertedCmyk);
     }
     if let (Some(curves), false) = (&record.curves, record.features.adjustment) {
         let params = match curves {
