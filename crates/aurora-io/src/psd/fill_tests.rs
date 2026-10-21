@@ -203,7 +203,7 @@ fn a_vector_mask_density_lets_the_hidden_area_show_through_the_baked_fill() {
 }
 
 #[test]
-fn a_vector_mask_feather_on_a_baked_fill_is_reported() {
+fn a_vector_mask_feather_on_a_baked_fill_is_applied_and_not_reported() {
     let mut file = empty_fill_file(
         8,
         8,
@@ -217,8 +217,16 @@ fn a_vector_mask_feather_on_a_baked_fill_is_reported() {
         tail.extend_from_slice(&1.5_f64.to_be_bytes());
         layer.mask_tail = Some(tail);
     }
-    let text = report_text(&doc(&file.write()));
-    assert!(text.contains("feather"), "{text}");
+    let document = doc(&file.write());
+    // The rectangle covers pixels 2..6; a feather of 1.5 px spreads its
+    // edge outward (task 150), so a pixel just outside is partly covered
+    // and the edge pixel inside is no longer fully covered.
+    let outside = fill_px(&document, 1, 4).map_or(f32::NAN, |p| p[3]);
+    let edge = fill_px(&document, 2, 4).map_or(f32::NAN, |p| p[3]);
+    assert!(outside > f(0.0) && outside < f(0.5), "outside {outside}");
+    assert!(edge < f(1.0) && edge >= f(0.5), "edge {edge}");
+    let text = report_text(&document);
+    assert!(!text.contains("feather"), "applied, so not reported: {text}");
 }
 
 #[test]

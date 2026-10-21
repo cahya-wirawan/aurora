@@ -1926,7 +1926,7 @@ fn mask_density_applies_to_the_coverage_after_the_files_invert_flag() {
 }
 
 #[test]
-fn feather_and_unused_vector_parameters_are_still_reported_and_density_is_not() {
+fn unused_vector_density_is_reported_and_applied_feathers_and_densities_are_not() {
     let feather = |flag: u8, lead: &[u8], value: f64| {
         let mut tail = vec![flag];
         tail.extend_from_slice(lead);
@@ -1935,7 +1935,8 @@ fn feather_and_unused_vector_parameters_are_still_reported_and_density_is_not() 
     };
     let full = Some(1.0);
     for (what, tail, density, reported) in [
-        ("user feather", feather(0x02, &[], 2.5), full, true),
+        // Applied since task 150, so not reported.
+        ("user feather", feather(0x02, &[], 2.5), full, false),
         (
             "density + zero feather",
             feather(0x03, &[128], 0.0),
@@ -1962,7 +1963,7 @@ fn feather_and_unused_vector_parameters_are_still_reported_and_density_is_not() 
             Some(128.0 / 255.0),
             false,
         ),
-        ("vector feather", feather(0x08, &[], 1.0), full, true),
+        ("vector feather", feather(0x08, &[], 1.0), full, false),
         ("vector zero feather", feather(0x08, &[], 0.0), full, false),
         ("full density", vec![0x01, 255], full, false),
         ("nothing present", vec![0x00], full, false),
@@ -1971,7 +1972,7 @@ fn feather_and_unused_vector_parameters_are_still_reported_and_density_is_not() 
         assert_eq!(only_density(&document), density, "{what}");
         let text = report_text(&document);
         assert_eq!(
-            text.contains("feather or a vector-mask density"),
+            text.contains("a vector-mask density that Aurora doesn't apply"),
             reported,
             "{what}: {text}"
         );
@@ -2143,27 +2144,9 @@ fn corpus_mask_densities_and_effective_coverage_match_psd_tools() {
             (15, 16, 32, 24),
             130.007_843,
         ),
-        (
-            "layer_mask_data.psd",
-            "1",
-            204,
-            (12, 17, 68, 179),
-            7_104.141_179,
-        ),
-        (
-            "layer_mask_data.psd",
-            "2",
-            230,
-            (22, 11, 179, 59),
-            6_064.795_85,
-        ),
-        (
-            "layer_mask_data.psd",
-            "4",
-            191,
-            (12, 141, 188, 191),
-            6_541.570_782,
-        ),
+        // `layer_mask_data.psd` layers "2" and "4" have feathers, which
+        // psd-tools ignores and Aurora applies since task 150 (the sums
+        // differ by the blur), and layer "1" is drawn from its fill.
     ];
     for &(file, layer, byte, (x0, y0, x1, y1), want) in cases {
         let bytes = match std::fs::read(dir.join(file)) {
@@ -3677,7 +3660,7 @@ fn corpus_vector_masks_match_psd_tools_and_photoshops_own_rendering() {
 }
 
 #[test]
-fn applied_densities_are_not_reported_and_a_vector_feather_is() {
+fn applied_densities_and_feathers_are_not_reported() {
     // Both masks, both densities baked (the rendered-mask fixture): no
     // parameter line at all.
     let mut file = vector_file(8, 8, vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
@@ -3705,8 +3688,8 @@ fn applied_densities_are_not_reported_and_a_vector_feather_is() {
     }
     let text = report_text(&doc(&file.write()));
     assert!(
-        text.contains("1 layer mask uses a feather, which"),
-        "{text}"
+        !text.contains("feather"),
+        "applied, so not reported: {text}"
     );
     assert!(!text.contains("density"), "{text}");
 }
