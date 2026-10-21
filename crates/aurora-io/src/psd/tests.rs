@@ -5748,3 +5748,66 @@ fn a_ranged_hue_saturation_layer_opens_as_an_adjustment_and_is_not_reported() {
 }
 
 include!("fill_tests.rs");
+
+/// Task 150: both masks on a vector layer, each with its own feather. The
+/// vector mask (pixels 2..6 of 8) and a user mask (`-3`, rows 0..4 shown,
+/// hidden beyond) are combined as `user x vector`.
+#[test]
+fn a_vector_layers_user_and_vector_feathers_are_each_applied() {
+    let mut file = vector_file(8, 8, vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask = Some((0, 0, 8, 8, 0, 0x18));
+        let mut tail = vec![0x00, 0];
+        for v in [0_i32, 0, 4, 8] {
+            tail.extend_from_slice(&v.to_be_bytes());
+        }
+        tail.push(0x0A);
+        tail.extend_from_slice(&1.5_f64.to_be_bytes());
+        tail.extend_from_slice(&1.0_f64.to_be_bytes());
+        layer.mask_tail = Some(tail);
+        layer.channels.push((-2, vec![255; 64]));
+        layer.channels.push((-3, vec![255; 32]));
+    }
+    let document = doc(&file.write());
+    let id = root(&document.layers, 0);
+    let at = |x, y| effective_mask(&document, id, x, y).unwrap_or(f32::NAN);
+    // The user mask ends at row 4: its feather spreads into row 4, where the
+    // vector mask is fully shown, and softens row 3 (inside both).
+    assert!(
+        at(3, 4) > 0.05,
+        "user feather spreads past its edge: {}",
+        at(3, 4)
+    );
+    assert!(at(3, 3) < 1.0, "and softens inside it: {}", at(3, 3));
+    // The vector mask's feather spreads left of column 2, in rows both show.
+    assert!(
+        at(1, 2) > 0.05,
+        "vector feather spreads outward: {}",
+        at(1, 2)
+    );
+    let text = report_text(&document);
+    assert!(!text.contains("feather"), "{text}");
+}
+
+/// Task 150: a feathered, inverted vector mask keeps what lies outside its
+/// raster shown, right up to the raster's own edge.
+#[test]
+fn a_feathered_inverted_vector_mask_stays_shown_outside_its_raster() {
+    let mut file = vector_file(8, 8, vmsk(1, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask = Some((0, 0, 0, 0, 0, 0x10));
+        let mut tail = vec![0x08];
+        tail.extend_from_slice(&1.0_f64.to_be_bytes());
+        layer.mask_tail = Some(tail);
+    }
+    let document = doc(&file.write());
+    let id = root(&document.layers, 0);
+    let at = |x, y| effective_mask(&document, id, x, y).unwrap_or(f32::NAN);
+    assert!(at(0, 0) > 0.95, "shown outside: {}", at(0, 0));
+    assert!(at(7, 7) > 0.95, "shown outside: {}", at(7, 7));
+    assert!(
+        at(4, 4) < 0.1,
+        "hidden inside the inverted shape: {}",
+        at(4, 4)
+    );
+}
