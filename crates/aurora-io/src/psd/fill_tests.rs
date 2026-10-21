@@ -885,3 +885,84 @@ fn a_drawn_fill_with_partial_smoothness_reports_it() {
         );
     }
 }
+
+/// A shape layer that stores pixels for its own box (flags bit 4, a
+/// `SoCo` fill and a `vmsk` path), with an optional mask record and
+/// parameter block.
+fn stored_shape_file(mask_tail: Option<Vec<u8>>) -> TestPsd {
+    TestPsd::new(1, 8, 8, 8).with(|p| {
+        p.layers.push(
+            TestLayer::pixels("shape", 2, 2, 4, 4, 8, &[[255, 0, 0, 255]; 16]).with(|l| {
+                l.flags = 0x10;
+                l.blocks.push((*b"SoCo", solid_block(255.0, 0.0, 0.0)));
+                l.blocks
+                    .push((*b"vmsk", vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1))));
+                if let Some(tail) = mask_tail {
+                    l.mask = Some((0, 0, 0, 0, 0, 0x10));
+                    l.mask_tail = Some(tail);
+                }
+            }),
+        );
+    })
+}
+
+#[test]
+fn a_stored_shape_with_a_vector_density_below_full_spreads_its_fill_over_the_canvas() {
+    // Task 150, `layer_mask_data.psd` layer "1": the stored pixels cover
+    // the shape's box only, Photoshop shows the fill everywhere at
+    // `1 - density`.
+    let d = 128.0_f32 / 255.0;
+    let document = doc(&stored_shape_file(Some(vec![0x04, 128])).write());
+    let outside = fill_px(&document, 0, 0).map_or(f32::NAN, |p| p[3]);
+    let inside = fill_px(&document, 4, 4).map_or(f32::NAN, |p| p[3]);
+    assert_eq!(outside, f(1.0 - d), "the fill shows through outside");
+    assert_eq!(inside, f(1.0));
+    // Full density (or none) keeps the stored pixels: nothing outside them.
+    for tail in [Some(vec![0x04, 255]), None] {
+        let document = doc(&stored_shape_file(tail).write());
+        assert!(
+            fill_px(&document, 0, 0).is_none_or(|p| p[3] == 0.0),
+            "stored pixels only"
+        );
+        assert_eq!(fill_px(&document, 3, 3).map(|p| p[3]), Some(f(1.0)));
+    }
+}
+
+#[test]
+fn a_stored_shape_with_a_vector_feather_is_drawn_blurred_from_its_path() {
+    let mut tail = vec![0x08];
+    tail.extend_from_slice(&1.5_f64.to_be_bytes());
+    let document = doc(&stored_shape_file(Some(tail)).write());
+    // The 4 x 4 box (pixels 2..6) is blurred outward and inward.
+    let outside = fill_px(&document, 1, 3).map_or(f32::NAN, |p| p[3]);
+    let centre = fill_px(&document, 3, 3).map_or(f32::NAN, |p| p[3]);
+    assert!(outside > f(0.05), "spreads outward: {outside}");
+    assert!(centre < f(1.0), "and softens the inside: {centre}");
+}
+
+#[test]
+fn a_user_mask_feather_blurs_the_mask_beyond_its_rectangle() {
+    // A plane that is shown in a 2 x 2 rectangle, hidden beyond, with a
+    // user feather of 2.0 (flags bit 1 of the parameter block).
+    let mut tail = vec![0x02];
+    tail.extend_from_slice(&2.0_f64.to_be_bytes());
+    let file = TestPsd::new(1, 8, 8, 8).with(|p| {
+        p.layers.push(
+            TestLayer::pixels("m", 0, 0, 8, 8, 8, &[[10, 20, 30, 255]; 64]).with(|l| {
+                l.mask = Some((3, 3, 5, 5, 0, 0x10));
+                l.mask_tail = Some(tail.clone());
+                l.channels.push((-2, vec![255; 4]));
+            }),
+        );
+    });
+    let document = doc(&file.write());
+    let id = root(&document.layers, 0);
+    let centre = effective_mask(&document, id, 3, 3).unwrap_or(f32::NAN);
+    let beside = effective_mask(&document, id, 1, 3).unwrap_or(f32::NAN);
+    let far = effective_mask(&document, id, 7, 7).unwrap_or(f32::NAN);
+    assert!(centre > 0.0 && centre < 1.0, "softened: {centre}");
+    assert!(beside > 0.0 && beside < centre, "spread outward: {beside}");
+    assert!(far < beside);
+    let text = report_text(&document);
+    assert!(!text.contains("feather"), "applied, so not reported: {text}");
+}

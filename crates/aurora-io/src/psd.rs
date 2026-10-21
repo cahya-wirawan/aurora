@@ -5087,11 +5087,17 @@ fn mask_or_report(
         notes.add(Note::MaskUnreadable);
         None
     })?;
-    // A `-2` channel flagged as Photoshop's rendering is the vector mask's
-    // (with the user mask), so its feather is the vector one.
+    // A `-2` channel flagged as Photoshop's rendering holds the vector
+    // mask (with the user mask), so the vector feather applies when there
+    // is one. The flag is set on the user mask of `layer_mask_data.psb`
+    // layer "2" too, which has only a user feather (6.0), and Photoshop's
+    // merged image shows it blurred, so that feather is the fallback.
     let params = record.mask.map(|m| m.parameters).unwrap_or_default();
     let feather = if mask.flags & MASK_FROM_RENDER != 0 {
-        params.vector_feather
+        params
+            .vector_feather
+            .filter(|f| *f != 0.0)
+            .or(params.user_feather)
     } else {
         params.user_feather
     };
