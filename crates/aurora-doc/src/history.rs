@@ -6545,6 +6545,15 @@ mod adjustment_tests {
             unreachable!("{err:?}");
         }
         assert!(tree.blend_options(layer).is_default());
+        // And redo applies them again (the inverse of the undo step).
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.blend_options(layer), options);
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert!(tree.blend_options(layer).is_default());
         // A tree that never set the options journals the bytes older
         // builds wrote: no op, nothing added by a Restore of default entries.
         assert!(
