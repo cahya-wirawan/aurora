@@ -2423,6 +2423,32 @@ impl LayerTree {
         Ok(())
     }
 
+    /// The layer's advanced-blending options (task 149); the default for an
+    /// unknown layer.
+    #[must_use]
+    pub fn blend_options(&self, id: LayerId) -> crate::layer::LayerBlendOptions {
+        self.layers
+            .get(&id)
+            .map(|entry| entry.blend_options)
+            .unwrap_or_default()
+    }
+
+    /// Sets the layer's advanced-blending options (task 149). Data the
+    /// compositor reads; it never changes a stored pixel.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::UnknownLayer`] if `id` doesn't exist.
+    pub fn set_blend_options(
+        &mut self,
+        id: LayerId,
+        value: crate::layer::LayerBlendOptions,
+    ) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        entry.blend_options = value;
+        Ok(())
+    }
+
     /// The layer's preserved smart-object data (0.200.0), or `None` when
     /// it has none or `id` does not exist.
     #[must_use]

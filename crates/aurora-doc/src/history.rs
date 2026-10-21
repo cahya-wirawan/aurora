@@ -237,6 +237,18 @@ enum LayerOp {
         overlays: Option<Vec<bool>>,
         strokes: Option<Vec<bool>>,
     },
+    /// Sets a layer's advanced-blending options (task 149,
+    /// [`crate::LayerBlendOptions`]). `LayerEntry::blend_options` is
+    /// `#[serde(skip)]`, so [`History::save_journal`] follows every
+    /// journaled `Restore` that carries a non-default value with one of
+    /// these, and **only then**: a journal without non-default options is
+    /// byte-identical to the ones older builds wrote. Appended after
+    /// [`Self::SetGradientRamps`], so an Aurora older than this build
+    /// refuses a journal holding it (ADR 0009).
+    SetBlendOptions {
+        id: LayerId,
+        value: crate::layer::LayerBlendOptions,
+    },
 }
 
 /// One layer's smoothed-ramp flags a journaled op carries (see
@@ -387,6 +399,20 @@ fn restored_clipped(op: &LayerOp) -> Vec<LayerId> {
             .iter()
             .filter(|(_, entry)| entry.clipped)
             .map(|(id, _)| *id)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every layer a journaled `Restore` carries with non-default blend
+/// options (they would be lost on the wire).
+fn restored_blend_options(op: &LayerOp) -> Vec<(LayerId, crate::layer::LayerBlendOptions)> {
+    match op {
+        LayerOp::Restore(subtree) => subtree
+            .entries
+            .iter()
+            .filter(|(_, entry)| !entry.blend_options.is_default())
+            .map(|(id, entry)| (*id, entry.blend_options))
             .collect(),
         _ => Vec::new(),
     }
@@ -676,6 +702,13 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
                 None,
             ))
         }
+        LayerOp::SetBlendOptions { id, value } => {
+            let old = tree.blend_options(id);
+            tree.set_blend_options(id, value)?;
+            // `None`: the options change how a whole clip group or a
+            // layer's interior effects composite.
+            Ok((LayerOp::SetBlendOptions { id, value: old }, None))
+        }
         LayerOp::SetClipped { id, value } => {
             let old = tree.clipped(id);
             tree.set_clipped_flag(id, value)?;
@@ -870,6 +903,9 @@ fn describe(op: &LayerOp) -> String {
         ),
         LayerOp::SetGradientRamps { id, .. } => {
             format!("Changed gradient smoothing on layer #{}", id.to_raw())
+        }
+        LayerOp::SetBlendOptions { id, .. } => {
+            format!("Changed advanced blending on layer #{}", id.to_raw())
         }
         LayerOp::SetClipped { id, value } => {
             let verb = if *value {
@@ -1201,6 +1237,13 @@ impl History {
                     id,
                     overlays,
                     strokes,
+                }));
+            }
+            // The advanced-blending options (task 149) the same way.
+            for (id, value) in restored_blend_options(op) {
+                wire.push(std::borrow::Cow::Owned(LayerOp::SetBlendOptions {
+                    id,
+                    value,
                 }));
             }
             // The clipping flag (0.201.0) the same way.
@@ -1714,6 +1757,27 @@ impl History {
         tree.set_clipped(id, value)?;
         self.journal.push(LayerOp::SetClipped { id, value });
         self.push(LayerOp::SetClipped { id, value: old });
+        Ok(None)
+    }
+
+    /// Sets a layer's advanced-blending options (task 149), recorded for
+    /// undo. Returns `None` for the dirty rectangle: the options change how
+    /// the whole group or interior composites.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::UnknownLayer`] if `id` doesn't exist; nothing is
+    /// recorded then.
+    pub fn set_blend_options(
+        &mut self,
+        tree: &mut LayerTree,
+        id: LayerId,
+        value: crate::layer::LayerBlendOptions,
+    ) -> Result<Option<Rect>, DocError> {
+        let old = tree.blend_options(id);
+        tree.set_blend_options(id, value)?;
+        self.journal.push(LayerOp::SetBlendOptions { id, value });
+        self.push(LayerOp::SetBlendOptions { id, value: old });
         Ok(None)
     }
 

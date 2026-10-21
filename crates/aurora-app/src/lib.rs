@@ -18270,6 +18270,18 @@ fn fold_layer_with_effects(
     } else {
         raw_blend_mode
     };
+    // Task 149, "Blend Interior Effects as Group" (`infx`): the content and
+    // the interior effects (the overlays) composite as one group at full
+    // alpha, and Fill then fades that group; strokes, which are not
+    // interior effects, stay unfaded. Measured on `advanced-blending.psd`:
+    // Fill 28/255 with a 100 % Normal overlay (38, 47, 55) over white
+    // gives (231, 232, 233), i.e. `B + (overlay - B) * Fill`.
+    let group_fill = layers.blend_options(id).interior_as_group
+        && fill < 1.0
+        && (fx.color_overlays.iter().any(|o| fx.shows(o.gate))
+            || fx.shown_gradient_overlays() > 0
+            || fx.shown_pattern_overlays() > 0);
+    let content_fill = if group_fill { 1.0 } else { fill };
     for run in &runs {
         if let (Some(inside), Some(acc), Some(src), Some(shape)) = (
             interior.get_mut(run.clone()),
@@ -18284,7 +18296,7 @@ fn fold_layer_with_effects(
                     *alpha = one;
                 }
             }
-            fold_texels_in_mode(inside, src, fill, content_mode, doc_origin);
+            fold_texels_in_mode(inside, src, content_fill, content_mode, doc_origin);
         }
     }
     // Step 2: each shown overlay, bottom to top.
@@ -18384,6 +18396,18 @@ fn fold_layer_with_effects(
                         aurora_doc::BlendMode::from(overlay.blend_mode),
                         doc_origin,
                     );
+                }
+            }
+        }
+    }
+    if group_fill {
+        for run in &runs {
+            if let (Some(inside), Some(acc)) =
+                (interior.get_mut(run.clone()), accumulator.get(run.clone()))
+            {
+                for (x, &b) in inside.iter_mut().zip(acc) {
+                    let b = b.to_f32();
+                    *x = half::f16::from_f32((x.to_f32() - b).mul_add(fill, b));
                 }
             }
         }
@@ -20128,7 +20152,15 @@ fn fold_clip_group(
             budget,
         );
     }
-    let with_effects = cover.is_none() && layer_renders_effects(layers, base);
+    // Task 149, "Blend Clipped Layers as Group" off (`clbl` = 0): the base
+    // is folded alone (its own mode, opacity and Fill) and each clipped
+    // layer then adds its change over the result, limited to the base's
+    // shape and not taken through the base's Fill or mode. Measured on
+    // `advanced-blending.psd`: a black clipped overlay on a base with Fill
+    // 28/255 shows at full strength. The change is added the way a base
+    // with drawn effects does it (exact for a Normal clipped layer).
+    let separate = layers.blend_options(base).clipped_separately;
+    let with_effects = separate || (cover.is_none() && layer_renders_effects(layers, base));
     let mut changed = false;
     if with_effects {
         // The base as today (visibility, budget and effects inside).
@@ -20149,9 +20181,13 @@ fn fold_clip_group(
     } else if cover.is_none() && !admit_composite_node(base, layers, depth, budget) {
         return false;
     }
-    let Some(opacity) = content_opacity(layers, base) else {
+    let Some(mut opacity) = content_opacity(layers, base) else {
         return changed;
     };
+    if separate {
+        // Fill is the base's own; only its opacity reaches the clipped layers.
+        opacity = layers.opacity(base).unwrap_or(1.0);
+    }
     let texels = match cover {
         Some(cover) => Some(cover.to_vec()),
         None => pixel_layer_texels(
