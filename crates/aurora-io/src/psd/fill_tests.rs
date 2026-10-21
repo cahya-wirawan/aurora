@@ -966,3 +966,27 @@ fn a_user_mask_feather_blurs_the_mask_beyond_its_rectangle() {
     let text = report_text(&document);
     assert!(!text.contains("feather"), "applied, so not reported: {text}");
 }
+
+#[test]
+fn a_feathered_mask_shown_outside_its_rectangle_stays_shown_far_away() {
+    // A 2 x 2 hole (hidden) in a mask whose default colour is shown, with a
+    // user feather of 1.5: the hole softens and the far corner stays 1.
+    let mut tail = vec![0x02];
+    tail.extend_from_slice(&1.5_f64.to_be_bytes());
+    let file = TestPsd::new(1, 12, 12, 8).with(|p| {
+        p.layers.push(
+            TestLayer::pixels("m", 0, 0, 12, 12, 8, &[[10, 20, 30, 255]; 144]).with(|l| {
+                l.mask = Some((5, 5, 7, 7, 255, 0x10));
+                l.mask_tail = Some(tail.clone());
+                l.channels.push((-2, vec![0; 4]));
+            }),
+        );
+    });
+    let document = doc(&file.write());
+    let id = root(&document.layers, 0);
+    let at = |x, y| effective_mask(&document, id, x, y).unwrap_or(f32::NAN);
+    assert!(at(5, 5) > 0.0 && at(5, 5) < 0.9, "softened hole {}", at(5, 5));
+    assert!(at(4, 5) > 0.0 && at(4, 5) < 1.0, "spread outward {}", at(4, 5));
+    assert_eq!(at(0, 0), 1.0, "far away still shown");
+    assert_eq!(at(11, 11), 1.0);
+}

@@ -18170,6 +18170,7 @@ fn fold_layer_with_effects(
     reference_origin: (i64, i64),
     depth: usize,
     budget: &mut CompositeBudget,
+    clip_group: Option<Vec<half::f16>>,
 ) -> bool {
     if !admit_composite_node(id, layers, depth, budget) {
         return false;
@@ -18213,7 +18214,15 @@ fn fold_layer_with_effects(
     {
         return false;
     }
-    let shape = own.unwrap_or_else(aurora_render::transparent_tile);
+    // Task 150: with layers clipped to this one (`clbl` on), the content the
+    // overlays sit over is the whole clip group (the base's pixels with the
+    // clipped layers atop, straight alpha, limited to the base's shape), as
+    // Photoshop draws `clipping-mask2.psd`'s gradient overlay over the
+    // clipped shapes. Its alpha is the base's own.
+    let shape = match clip_group {
+        Some(group) => group,
+        None => own.unwrap_or_else(aurora_render::transparent_tile),
+    };
     let raw_blend_mode = layers
         .blend_mode(id)
         .unwrap_or(aurora_doc::BlendMode::Normal);
@@ -18872,6 +18881,7 @@ fn fold_layer_into(
                 reference_origin,
                 depth,
                 budget,
+                None,
             )
         });
     }
@@ -20174,6 +20184,22 @@ fn fold_clip_group(
     // 28/255 shows at full strength. The change is added the way a base
     // with drawn effects does it (exact for a Normal clipped layer).
     let separate = layers.blend_options(base).clipped_separately;
+    // Task 150: a base with drawn effects and its clipped layers blended as
+    // a group: the clip group is the base's content for its effects.
+    if !separate && cover.is_none() && layer_renders_effects(layers, base) {
+        return fold_effects_clip_group(
+            accumulator,
+            base,
+            clipped,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            depth,
+            budget,
+        );
+    }
     let with_effects = separate || (cover.is_none() && layer_renders_effects(layers, base));
     let mut changed = false;
     if with_effects {
@@ -20289,6 +20315,81 @@ fn fold_clip_group(
         fold_texels_in_mode(accumulator, &group, opacity, mode, doc_origin);
     });
     true
+}
+
+/// [`fold_clip_group`] for a pixel base that draws layer effects, its
+/// clipped layers blended with it as a group (`clbl` on; task 150): the
+/// clipped layers are laid atop the base's content limited to its shape
+/// ([`fold_clipped_atop`]), and that clip group is the content the base's
+/// effects are drawn over ([`fold_layer_with_effects`]'s `clip_group`), so
+/// an overlay covers the clipped layers too, with the base's mode, opacity
+/// and Fill applied to the whole. Measured on `clipping-mask2.psd`: the
+/// base's 50 % gradient overlay washes out the clipped blue and yellow
+/// shapes in Photoshop's merged image, where drawing the effects under the
+/// clipped layers left them untouched.
+#[allow(clippy::too_many_arguments)]
+fn fold_effects_clip_group(
+    accumulator: &mut [half::f16],
+    base: aurora_doc::LayerId,
+    clipped: &[aurora_doc::LayerId],
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    depth: usize,
+    budget: &mut CompositeBudget,
+) -> bool {
+    let texels = pixel_layer_texels(
+        base,
+        layers,
+        store,
+        tile_id,
+        doc_origin,
+        reference_origin,
+        budget,
+    );
+    let mut group = None;
+    if let Some(texels) = texels {
+        let mut atop = aurora_render::transparent_tile();
+        aurora_render::composite_layer_into(
+            &mut atop,
+            &texels,
+            1.0,
+            aurora_render::BlendMode::Normal,
+        );
+        let mut any = false;
+        for &id in clipped {
+            any |= fold_clipped_atop(
+                &mut atop,
+                id,
+                layers,
+                store,
+                tile_id,
+                doc_origin,
+                reference_origin,
+                depth,
+                budget,
+            );
+        }
+        if any {
+            // The group is premultiplied; the effects fold wants straight.
+            aurora_render::un_premultiply_in_place(&mut atop);
+            group = Some(atop);
+        }
+    }
+    fold_layer_with_effects(
+        accumulator,
+        base,
+        layers,
+        store,
+        tile_id,
+        doc_origin,
+        reference_origin,
+        depth,
+        budget,
+        group,
+    )
 }
 
 /// [`fold_clip_group`] for a **group** base (0.243.0): the group's own
