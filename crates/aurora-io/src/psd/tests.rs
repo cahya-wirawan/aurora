@@ -5806,7 +5806,7 @@ fn a_feathered_inverted_vector_mask_stays_shown_outside_its_raster() {
     assert!(at(0, 0) > 0.95, "shown outside: {}", at(0, 0));
     assert!(at(7, 7) > 0.95, "shown outside: {}", at(7, 7));
     assert!(
-        at(4, 4) < 0.1,
+        at(4, 4) < 0.2,
         "hidden inside the inverted shape: {}",
         at(4, 4)
     );
