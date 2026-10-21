@@ -9,7 +9,7 @@
 //! only that layer, Photoshop's merged image is matched by
 //! `density * gaussian(mask, sigma) + (1 - density)` with a mean error of
 //! 0.0038 (max 0.011) in coverage at sigma 6.0, 0.0025 at 6.2, against
-//! 0.0129 at 5.5 and 0.0162 at 7.0 (NumPy, an exact Gaussian truncated at
+//! 0.0129 at 5.5 and 0.0162 at 7.0 (`NumPy`, an exact Gaussian truncated at
 //! 4 sigma, the mask padded with its default colour). So sigma is the
 //! feather value; density is applied after the blur, as before.
 //!
@@ -33,24 +33,27 @@ pub(super) const MAX_TAP_WORK: u64 = 1_500_000_000;
 /// `f16` result, like a raster's).
 const CHARGE: u64 = 2;
 
-/// The kernel radius for `sigma`: 3.5 sigma, at least 1.
+/// The kernel radius for `sigma`: 3.5 sigma, at least 1. `sigma` is at most
+/// [`MAX_SIGMA`] here, so the radius is small and positive.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn radius(sigma: f64) -> usize {
     (sigma * 3.5).ceil().max(1.0) as usize
 }
 
-/// The normalised Gaussian taps `-r..=r`.
-fn kernel(sigma: f64, r: usize) -> Vec<f32> {
-    let mut taps: Vec<f64> = (0..=2 * r)
+/// The normalised Gaussian taps `-radius..=radius`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn kernel(sigma: f64, radius: usize) -> Vec<f32> {
+    let mut taps: Vec<f64> = (0..=2 * radius)
         .map(|i| {
-            let d = i as f64 - r as f64;
+            let d = i as f64 - radius as f64;
             (-0.5 * d * d / (sigma * sigma)).exp()
         })
         .collect();
     let sum: f64 = taps.iter().sum();
-    for t in &mut taps {
-        *t /= sum;
+    for tap in &mut taps {
+        *tap /= sum;
     }
-    taps.into_iter().map(|t| t as f32).collect()
+    taps.into_iter().map(|tap| tap as f32).collect()
 }
 
 /// Blurs the `bounds`-sized `plane` (row-major, `0..=1`), whose value
@@ -73,69 +76,75 @@ pub(super) fn blur_plane(
     if sigma > MAX_SIGMA {
         return None;
     }
-    let r = radius(sigma);
-    let (w, h) = (bounds.width as usize, bounds.height as usize);
-    if plane.len() != w.checked_mul(h)? {
+    let pad = radius(sigma);
+    let (width, height) = (bounds.width as usize, bounds.height as usize);
+    if plane.len() != width.checked_mul(height)? {
         return None;
     }
-    let gw = w.checked_add(r.checked_mul(2)?)?;
-    let gh = h.checked_add(r.checked_mul(2)?)?;
-    let area = u64::try_from(gw.checked_mul(gh)?).ok()?;
-    let taps = u64::try_from(2 * r + 1).ok()?;
+    let grown_width = width.checked_add(pad.checked_mul(2)?)?;
+    let grown_height = height.checked_add(pad.checked_mul(2)?)?;
+    let area = u64::try_from(grown_width.checked_mul(grown_height)?).ok()?;
+    let taps = u64::try_from(2 * pad + 1).ok()?;
     if area.checked_mul(CHARGE)? > *budget || area.checked_mul(taps)?.checked_mul(2)? > MAX_TAP_WORK
     {
         return None;
     }
-    let k = kernel(sigma, r);
+    let weights = kernel(sigma, pad);
     // Horizontal pass over the source rows only: a row of the padding is
     // the constant `outside`, whose blur is itself.
     let mut rows: Vec<f32> = Vec::new();
-    rows.try_reserve_exact(gw.checked_mul(h)?).ok()?;
-    for y in 0..h {
-        let row = plane.get(y * w..(y + 1) * w)?;
-        for gx in 0..gw {
-            // Source column of tap j: gx + j - 2r.
+    rows.try_reserve_exact(grown_width.checked_mul(height)?)
+        .ok()?;
+    for row in plane.chunks_exact(width) {
+        for gx in 0..grown_width {
+            // Source column of tap `j`: `gx + j - 2 * pad`.
             let mut acc = 0.0f32;
-            for (j, t) in k.iter().enumerate() {
-                let sx = (gx + j) as i64 - 2 * r as i64;
-                let v = if sx >= 0 && (sx as usize) < w {
-                    row.get(sx as usize).map_or(outside, |c| c.to_f32())
-                } else {
-                    outside
-                };
-                acc = t.mul_add(v, acc);
+            for (j, weight) in weights.iter().enumerate() {
+                let value = (gx + j)
+                    .checked_sub(2 * pad)
+                    .and_then(|sx| row.get(sx))
+                    .map_or(outside, |c| c.to_f32());
+                acc = weight.mul_add(value, acc);
             }
             rows.push(acc);
         }
     }
     let mut out: Vec<f16> = Vec::new();
-    out.try_reserve_exact(gw.checked_mul(gh)?).ok()?;
-    for gy in 0..gh {
-        for gx in 0..gw {
+    out.try_reserve_exact(grown_width.checked_mul(grown_height)?)
+        .ok()?;
+    for gy in 0..grown_height {
+        for gx in 0..grown_width {
             let mut acc = 0.0f32;
-            for (j, t) in k.iter().enumerate() {
-                let sy = (gy + j) as i64 - 2 * r as i64;
-                let v = if sy >= 0 && (sy as usize) < h {
-                    rows.get(sy as usize * gw + gx).copied().unwrap_or(outside)
-                } else {
-                    outside
-                };
-                acc = t.mul_add(v, acc);
+            for (j, weight) in weights.iter().enumerate() {
+                let value = (gy + j)
+                    .checked_sub(2 * pad)
+                    .filter(|sy| *sy < height)
+                    .and_then(|sy| rows.get(sy * grown_width + gx))
+                    .copied()
+                    .unwrap_or(outside);
+                acc = weight.mul_add(value, acc);
             }
             out.push(f16::from_f32(acc.clamp(0.0, 1.0)));
         }
     }
     *budget -= area.checked_mul(CHARGE)?;
+    let pad_px = i64::try_from(pad).ok()?;
     let grown = Rect {
-        x: bounds.x - r as i64,
-        y: bounds.y - r as i64,
-        width: u32::try_from(gw).ok()?,
-        height: u32::try_from(gh).ok()?,
+        x: bounds.x - pad_px,
+        y: bounds.y - pad_px,
+        width: u32::try_from(grown_width).ok()?,
+        height: u32::try_from(grown_height).ok()?,
     };
     Some((grown, out))
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::float_cmp
+)]
 mod tests {
     use super::*;
 

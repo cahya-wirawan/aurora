@@ -4548,6 +4548,7 @@ fn fill_reference(
 /// A shape or fill layer that stores no pixels (task 108), drawn from its
 /// solid colour or gradient and its vector mask as an ordinary pixel layer.
 /// What cannot be drawn is left out and reported, as before.
+#[allow(clippy::too_many_lines)]
 fn drawn_fill_node(
     src: &mut dyn ByteSource,
     record: &Record,
