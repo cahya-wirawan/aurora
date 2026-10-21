@@ -92218,12 +92218,13 @@ mod tests {
         /// base is pure black.
         #[test]
         fn clipped_layers_not_grouped_ignore_the_base_fill() {
-            let build = |separately: bool| {
+            let build = |separately: bool, base_alpha: f32, base_opacity: f32| {
                 let (_dir, mut store) = real_tile_store();
                 let mut layers = aurora_doc::LayerTree::new();
                 let _bottom = solid(&mut layers, &mut store, None, [0.0, 0.0, 1.0, 1.0]);
-                let base = solid(&mut layers, &mut store, None, [1.0, 0.0, 0.0, 1.0]);
+                let base = solid(&mut layers, &mut store, None, [1.0, 0.0, 0.0, base_alpha]);
                 ok(layers.set_fill_opacity(base, 0.25));
+                ok(layers.set_opacity(base, base_opacity));
                 let top = solid(&mut layers, &mut store, None, [0.0, 1.0, 0.0, 1.0]);
                 ok(layers.set_clipped(top, true));
                 ok(layers.set_blend_options(
@@ -92245,10 +92246,15 @@ mod tests {
                 texel(&acc, 0, 0)
             };
             // Grouped: green atop red, the group at Fill 0.25 over blue.
-            near(build(false), [0.0, 0.25, 0.75, 1.0]);
+            near(build(false, 1.0, 1.0), [0.0, 0.25, 0.75, 1.0]);
             // Separately: the base is lerp(blue, red, 0.25) and the green
             // layer covers it fully.
-            near(build(true), [0.0, 1.0, 0.0, 1.0]);
+            near(build(true, 1.0, 1.0), [0.0, 1.0, 0.0, 1.0]);
+            // The clipped layer shows with the base's alpha times its
+            // opacity: the base is lerp(blue, red, 0.125) (alpha or opacity
+            // 0.5 times Fill 0.25), the green layer then at weight 0.5.
+            near(build(true, 0.5, 1.0), [0.0625, 0.5, 0.4375, 1.0]);
+            near(build(true, 1.0, 0.5), [0.0625, 0.5, 0.4375, 1.0]);
         }
 
         /// Shape = content alpha × mask; layer opacity fades the overlay;
