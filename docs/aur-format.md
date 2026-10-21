@@ -173,7 +173,7 @@ Per-entry policy for an entry that is absent, malformed, oversized, or of an une
 | `history` | refuse (`MissingEntry`) | refuse | refuse | refuse (no version field) | no version field |
 | `mask-density` | ok (all masks density 1.0) | refuse | refuse | refuse (also: a pair naming a layer with no mask, or density outside 0..=1) | refuse (any value != 1, smaller or larger) |
 | `layer-effects` | ok | refuse | refuse | refuse (also: unknown layer, adjustment layer, `LayerEffects::validate` failure) | refuse (message distinguishes newer from damaged) |
-| `layer-clipping` | ok | refuse | refuse | refuse (also: unknown layer, a group, a layer with nothing beneath it) | refuse |
+| `layer-clipping` | ok | refuse | refuse | refuse (also: unknown layer, a layer or group with nothing beneath it) | refuse |
 | `layer-blend-options` | ok | refuse | refuse | refuse (also: unknown layer) | refuse (message distinguishes newer from damaged) |
 | `layer-patterns` | ok | refuse | refuse | refuse (also: a pattern over the size caps, a missing or wrong-sized pixel entry, an overlay on a layer without effects or naming a pattern the file lacks, `LayerEffects::validate` failure) | refuse (message distinguishes newer from damaged) |
 | `layer-stroke-paints` | ok | refuse | refuse | refuse (also: a layer without effects, a stroke-count mismatch, a paint of the wrong kind for its stroke, a pattern the file lacks, `LayerEffects::validate` failure) | refuse (message distinguishes newer from damaged) |
@@ -432,7 +432,7 @@ None. The format contains no thumbnail, preview image or composite. (`aurora-app
 
 ### 7.5 Clipping
 
-`LayerEntry::clipped` is not in the manifest. The `layer-clipping` entry (`aur.rs:417`) is `postcard` `{ version: u32 = 1, clipped: Vec<u64> }`: the raw ids of the layers clipped to the layer beneath them. It is written only for layers that **have** an unclipped base (`clip_base(id).is_some()`), so a flagged layer with nothing beneath it is not written. A reader applies each id with `LayerTree::set_clipped(id, true)`, which refuses (and thereby refuses the whole open): an unknown id, a group, a layer with no sibling beneath it. The *base* of a clipped layer is the nearest layer beneath it in its own sibling list that is not itself clipped (`LayerTree::clip_base`); the file stores only the flag. Introduced 0.201.0. The corresponding journal carrier is `SetClipped` (ordinal 18).
+`LayerEntry::clipped` is not in the manifest. The `layer-clipping` entry (`aur.rs:417`) is `postcard` `{ version: u32 = 1, clipped: Vec<u64> }`: the raw ids of the layers clipped to the layer beneath them. It is written only for layers that **have** an unclipped base (`clip_base(id).is_some()`), so a flagged layer with nothing beneath it is not written. A reader applies each id with `LayerTree::set_clipped(id, true)`, which refuses (and thereby refuses the whole open): an unknown id, a layer or group with no sibling beneath it (a group can be clipped since task 149). The *base* of a clipped layer is the nearest layer beneath it in its own sibling list that is not itself clipped (`LayerTree::clip_base`); the file stores only the flag. Introduced 0.201.0. The corresponding journal carrier is `SetClipped` (ordinal 18).
 
 ### 7.6 Layer effects
 

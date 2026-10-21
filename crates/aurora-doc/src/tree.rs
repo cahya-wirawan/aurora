@@ -2391,16 +2391,14 @@ impl LayerTree {
     /// # Errors
     ///
     /// [`DocError::UnknownLayer`] if `id` doesn't exist;
-    /// [`DocError::GroupCannotBeClipped`] for a group;
-    /// [`DocError::NoClipBase`] when clipping a layer with no layer beneath
-    /// it in its group (the bottom-most layer of a group has no base).
-    /// Nothing is changed when any happens.
+    /// [`DocError::NoClipBase`] when clipping a layer or group with nothing
+    /// beneath it in its own group (the bottom-most one has no base).
+    /// Nothing is changed when any happens. A **group** can be clipped
+    /// since task 149 (Photoshop's clipped group, `group-clipping.psd`):
+    /// its composite is limited to the base's shape like a layer's.
     pub fn set_clipped(&mut self, id: LayerId, value: bool) -> Result<(), DocError> {
         let entry = self.layers.get(&id).ok_or(DocError::UnknownLayer(id))?;
         if value {
-            if matches!(entry.kind, LayerKind::Group { .. }) {
-                return Err(DocError::GroupCannotBeClipped(id));
-            }
             let siblings = self.sibling_slice(entry.parent).unwrap_or(&[]);
             let has_below = siblings
                 .iter()

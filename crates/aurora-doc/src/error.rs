@@ -44,8 +44,9 @@ pub enum DocError {
     /// clip to.
     #[error("layer {0:?} has no layer beneath it in its group to be clipped to")]
     NoClipBase(LayerId),
-    /// [`crate::LayerTree::set_clipped`] was asked to clip a group (0.201.0):
-    /// only pixel and adjustment layers can be clipped.
+    /// [`crate::LayerTree::set_clipped`] was asked to clip a group (0.201.0).
+    /// No longer returned since task 149, which lets a group be clipped; the
+    /// variant stays so callers matching it keep compiling.
     #[error("layer {0:?} is a group and cannot be clipped")]
     GroupCannotBeClipped(LayerId),
     /// A group-only blend mode ([`crate::BlendMode::PassThrough`],

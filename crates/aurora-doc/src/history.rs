@@ -6183,14 +6183,12 @@ mod adjustment_tests {
         let loaded = History::load_journal(&history.save_journal().unwrap_or_default());
         let replayed = loaded.ok().and_then(|h| h.replay().ok());
         assert!(replayed.is_some_and(|t| t.clipped(top)));
-        // A released layer is no longer clipped; a group cannot be clipped.
+        // A released layer is no longer clipped; a group can be (task 149)
+        // when something lies beneath it.
         assert!(history.set_clipped(&mut tree, top, false).is_ok());
         assert_eq!(tree.clip_base(top), None);
         let group = history.add_group(&mut tree, "g", None).ok();
-        assert!(group.is_some_and(|g| matches!(
-            tree.set_clipped(g, true),
-            Err(DocError::GroupCannotBeClipped(_))
-        )));
+        assert!(group.is_some_and(|g| tree.set_clipped(g, true).is_ok() && tree.clipped(g)));
     }
 
     #[test]

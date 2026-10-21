@@ -2668,3 +2668,29 @@ fn the_reader_maps_infx_and_clbl_bytes_to_the_blend_options() {
         })
     );
 }
+
+/// Task 149: a clipped group is written with the clipping byte on its
+/// folder record and reads back clipped to the layer beneath it.
+#[test]
+fn a_clipped_group_round_trips_through_write_and_read_and_verifies() {
+    let mut doc = flat_doc();
+    let group = ok(doc.tree.add_group("G", None));
+    ok(doc
+        .tree
+        .add_pixel_layer("C", rect(0, 0, 16, 16), Some(group)));
+    ok(doc.tree.set_clipped(group, true));
+    let base = doc.tree.clip_base(group);
+    assert!(base.is_some());
+    let dir = ok(tempfile::tempdir());
+    let target = dir.path().join("clipped-group.psd");
+    let outcome = ok(save(&mut doc, &target, false));
+    assert!(outcome.report.is_empty(), "{:?}", outcome.report);
+    let back = read_back(&ok(std::fs::read(&target)));
+    let found = back
+        .layers
+        .roots()
+        .iter()
+        .copied()
+        .find(|id| back.layers.name(*id) == Some("G"));
+    assert!(found.is_some_and(|id| back.layers.clipped(id) && back.layers.clip_base(id).is_some()));
+}
