@@ -20135,7 +20135,7 @@ fn add_clip_change(
 /// Not modelled: the base's Fill applying to its own pixels only when the
 /// box is on, and a base with a non-`Normal` mode and drawn effects (see
 /// above).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn fold_clip_group(
     accumulator: &mut [half::f16],
     base: aurora_doc::LayerId,
