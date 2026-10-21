@@ -61,7 +61,7 @@ fn error_by_hidden_layer_for_named_files() {
 /// follow the stored angle, a pattern fill and a pattern/gradient overlay.
 /// Task 149 adds `advanced-blending.psd`: 58.26 before, 0.01 after (`infx`
 /// and `clbl`); its one-texel maximum is a rounded edge.
-const SHAPE_FIDELITY: [(&str, f64, f64); 9] = [
+const SHAPE_FIDELITY: [(&str, f64, f64); 10] = [
     ("vector-mask2.psd", 5.0, 70.0),
     ("colormodes/4x4_16bit_rgb.psd", 28.0, 135.0),
     ("colormodes/4x4_16bit_grayscale.psd", 18.0, 45.0),
@@ -77,7 +77,11 @@ const SHAPE_FIDELITY: [(&str, f64, f64); 9] = [
     // fill show across the whole canvas. The .psb keeps a larger error
     // (1.2) at one soft edge, not investigated.
     ("layer_mask_data.psd", 0.5, 15.0),
-    ("layer_mask_data.psb", 2.0, 135.0),
+    ("layer_mask_data.psb", 2.0, 100.0),
+    // 21.37 before a base's overlays were drawn over its clipped layers
+    // (task 150); the rest is not investigated (its Brightness/Contrast
+    // layer is the approximate default mode).
+    ("clipping-mask2.psd", 2.5, 90.0),
 ];
 
 #[test]

@@ -634,3 +634,55 @@ fn a_clipped_group_shows_only_where_its_base_has_alpha() {
         near(px(&acc, 8, 1), BLUE);
     }
 }
+
+/// Task 150 (`clipping-mask2.psd`): a base's colour overlay is drawn over its
+/// whole clip group, the clipped layers included, not under them. Base red
+/// on the left half over white, a blue layer clipped to it, and a 50 % black
+/// overlay on the base: the clipped blue shows at half strength.
+#[test]
+fn a_base_overlay_covers_the_clipped_layers_too() {
+    let build = |separately: bool| {
+        let (dir, mut store) = store();
+        let mut layers = aurora_doc::LayerTree::new();
+        solid(&mut layers, &mut store, WHITE);
+        let base = layer(&mut layers, &mut store, None, 10, half_red);
+        let blue = solid(&mut layers, &mut store, BLUE);
+        // `solid` adds at the root; it must sit above the base.
+        clip(&mut layers, blue);
+        let fx = aurora_core::LayerEffects {
+            color_overlays: vec![aurora_core::effects::ColorOverlay {
+                color: aurora_core::effects::EffectColor {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                },
+                opacity: 0.5,
+                ..aurora_core::effects::ColorOverlay::default()
+            }],
+            ..aurora_core::LayerEffects::default()
+        };
+        ok(layers.set_effects(base, Some(fx)));
+        if separately {
+            ok(layers.set_blend_options(
+                base,
+                aurora_doc::LayerBlendOptions {
+                    clipped_separately: true,
+                    ..aurora_doc::LayerBlendOptions::default()
+                },
+            ));
+        }
+        let acc = composite(&layers, &mut store);
+        drop(dir);
+        acc
+    };
+    let acc = build(false);
+    // Overlay (50 % black) over the clip group (blue on the base's shape).
+    near(px(&acc, 1, 1), [0.0, 0.0, 0.5, 1.0]);
+    near(px(&acc, 8, 1), WHITE);
+    // At the base's alpha 0.5: the same interior laid at half strength.
+    near(px(&acc, 2, 2), [0.5, 0.5, 0.75, 1.0]);
+    // Blended separately (`clbl` off) the clipped layer stays on top of the
+    // base's effects, at full strength (task 149).
+    let acc = build(true);
+    near(px(&acc, 1, 1), BLUE);
+}
