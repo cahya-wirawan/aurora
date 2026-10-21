@@ -890,10 +890,14 @@ fn a_drawn_fill_with_partial_smoothness_reports_it() {
 /// `SoCo` fill and a `vmsk` path), with an optional mask record and
 /// parameter block.
 fn stored_shape_file(mask_tail: Option<Vec<u8>>) -> TestPsd {
+    stored_shape_file_flagged(mask_tail, 0x10)
+}
+
+fn stored_shape_file_flagged(mask_tail: Option<Vec<u8>>, flags: u8) -> TestPsd {
     TestPsd::new(1, 8, 8, 8).with(|p| {
         p.layers.push(
             TestLayer::pixels("shape", 2, 2, 4, 4, 8, &[[255, 0, 0, 255]; 16]).with(|l| {
-                l.flags = 0x10;
+                l.flags = flags;
                 l.blocks.push((*b"SoCo", solid_block(255.0, 0.0, 0.0)));
                 l.blocks
                     .push((*b"vmsk", vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1))));
@@ -989,4 +993,33 @@ fn a_feathered_mask_shown_outside_its_rectangle_stays_shown_far_away() {
     assert!(at(4, 5) > 0.0 && at(4, 5) < 1.0, "spread outward {}", at(4, 5));
     assert_eq!(at(0, 0), 1.0, "far away still shown");
     assert_eq!(at(11, 11), 1.0);
+}
+
+#[test]
+fn only_a_flagged_shape_spreads_and_a_feather_that_is_too_large_is_reported() {
+    // Without the pixel-data-irrelevant flag the layer is an ordinary fill
+    // layer with pixels: the stored pixels stay (nothing spreads).
+    let document = doc(&stored_shape_file_flagged(Some(vec![0x04, 128]), 0).write());
+    assert!(
+        fill_px(&document, 0, 0).is_none_or(|p| p[3] == 0.0),
+        "an unflagged layer keeps its pixels"
+    );
+    // A feather over the cap leaves the mask hard-edged and says so.
+    let mut tail = vec![0x02];
+    tail.extend_from_slice(&((super::feather::MAX_SIGMA + 1.0).to_be_bytes()));
+    let file = TestPsd::new(1, 8, 8, 8).with(|p| {
+        p.layers.push(
+            TestLayer::pixels("m", 0, 0, 8, 8, 8, &[[10, 20, 30, 255]; 64]).with(|l| {
+                l.mask = Some((3, 3, 5, 5, 0, 0x10));
+                l.mask_tail = Some(tail.clone());
+                l.channels.push((-2, vec![255; 4]));
+            }),
+        );
+    });
+    let document = doc(&file.write());
+    let id = root(&document.layers, 0);
+    assert_eq!(effective_mask(&document, id, 1, 3), Some(0.0), "hard-edged");
+    assert_eq!(effective_mask(&document, id, 3, 3), Some(1.0));
+    let text = report_text(&document);
+    assert!(text.contains("a feather too large or too costly"), "{text}");
 }
