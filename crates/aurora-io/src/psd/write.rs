@@ -904,6 +904,9 @@ pub struct PsdExpectedLayer {
     /// The record's clipping byte (0.201.0): `1` when the layer is clipped
     /// to a base beneath it.
     pub clipped: bool,
+    /// The `infx` and `clbl` blocks (task 149), written only when not the
+    /// default.
+    pub blend_options: aurora_doc::LayerBlendOptions,
     /// The record's rectangle: top, left, bottom, right.
     pub rect: [i32; 4],
     /// A hash of every written `u16` sample (channel, position, value).
@@ -1389,6 +1392,7 @@ fn plan_props(
             visible: layers.visible(id).unwrap_or(true),
             lock: layers.lock(id).unwrap_or_default(),
             clipped: layers.clip_base(id).is_some(),
+            blend_options: layers.blend_options(id),
             rect,
             sample_hash: 0,
             decoded_hash: 0,
@@ -1419,6 +1423,7 @@ fn plan_group_end() -> LayerPlan {
             visible: true,
             lock: aurora_doc::LayerLock::none(),
             clipped: false,
+            blend_options: aurora_doc::LayerBlendOptions::default(),
             rect: [0; 4],
             sample_hash: 0,
             decoded_hash: 0,
@@ -1751,6 +1756,20 @@ fn record_extra(plan: &LayerPlan) -> Result<Vec<u8>, IoError> {
     extra.extend_from_slice(b"iOpa");
     extra.extend_from_slice(&4u32.to_be_bytes());
     extra.extend_from_slice(&[plan.expected.fill, 0, 0, 0]);
+    // Task 149: "Blend Clipped Layers as Group" off and "Blend Interior
+    // Effects as Group" on, written only when not Photoshop's default.
+    if plan.expected.blend_options.clipped_separately {
+        extra.extend_from_slice(b"8BIM");
+        extra.extend_from_slice(b"clbl");
+        extra.extend_from_slice(&4u32.to_be_bytes());
+        extra.extend_from_slice(&[0, 0, 0, 0]);
+    }
+    if plan.expected.blend_options.interior_as_group {
+        extra.extend_from_slice(b"8BIM");
+        extra.extend_from_slice(b"infx");
+        extra.extend_from_slice(&4u32.to_be_bytes());
+        extra.extend_from_slice(&[1, 0, 0, 0]);
+    }
     if let Some(effects) = &plan.expected.effects {
         extra.extend_from_slice(b"8BIM");
         extra.extend_from_slice(b"lfx2");
@@ -2653,6 +2672,7 @@ fn raw_record<R: std::io::Read + Seek>(
     let _pascal = raw.bytes(padded)?;
     let (mut name, mut fill, mut section) = (None, None, None);
     let mut protected = None;
+    let mut read_options = aurora_doc::LayerBlendOptions::default();
     let mut smart_blocks: Vec<aurora_doc::SmartObjectBlock> = Vec::new();
     let mut adjustment_blocks: Vec<([u8; 4], Vec<u8>)> = Vec::new();
     let (mut lfx2, mut fxrp) = (None, None);
@@ -2664,6 +2684,8 @@ fn raw_record<R: std::io::Read + Seek>(
         match &key {
             b"luni" => name = super::decode_luni(&data),
             b"iOpa" => fill = data.first().copied(),
+            b"clbl" => read_options.clipped_separately = data.first() == Some(&0),
+            b"infx" => read_options.interior_as_group = data.first().is_some_and(|v| *v != 0),
             b"lspf" => {
                 protected = data
                     .get(..4)
@@ -2715,6 +2737,17 @@ fn raw_record<R: std::io::Read + Seek>(
         Some(want.name.as_str()),
     )?;
     check(&format!("layer {i} fill"), fill, Some(want.fill))?;
+    check(
+        &format!("layer {i} advanced blending"),
+        (
+            read_options.interior_as_group,
+            read_options.clipped_separately,
+        ),
+        (
+            want.blend_options.interior_as_group,
+            want.blend_options.clipped_separately,
+        ),
+    )?;
     check(
         &format!("layer {i} protected setting"),
         protected,

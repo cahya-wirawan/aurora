@@ -64,7 +64,8 @@ mod tree;
 pub use error::DocError;
 pub use history::{History, MAX_DESCRIPTIONS, forget_document_surfaces};
 pub use layer::{
-    Adjustment, BlendMode, FULL_MASK_DENSITY, Layer, LayerId, LayerKind, LayerLock, LayerMask,
+    Adjustment, BlendMode, FULL_MASK_DENSITY, Layer, LayerBlendOptions, LayerId, LayerKind,
+    LayerLock, LayerMask,
 };
 pub use mask::{
     MASK_SURFACE_BIT, RESERVED_TOP_SURFACES, encode_mask_coverage_region, forget_mask_coverage,

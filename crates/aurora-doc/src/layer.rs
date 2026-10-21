@@ -641,6 +641,52 @@ impl From<aurora_core::effects::EffectBlendMode> for BlendMode {
     }
 }
 
+/// Photoshop's two "advanced blending" check boxes that change how a layer
+/// composites its parts (task 149). Both default to Photoshop's default,
+/// so `LayerBlendOptions::default()` is what every layer without the
+/// blocks means and what every older file holds.
+///
+/// * [`Self::interior_as_group`] is "Blend Interior Effects as Group"
+///   (PSD block `infx`, default off). On, Fill opacity fades the layer's
+///   *interior* effects (colour, gradient and pattern overlays) together
+///   with its content, as one group blended in the layer's mode; off, Fill
+///   fades the content only.
+/// * [`Self::clipped_separately`] is "Blend Clipped Layers as Group"
+///   turned **off** (PSD block `clbl` = 0, default on): the layers clipped
+///   to this base then composite in their own modes over the result and
+///   are not taken through the base's Fill or blend mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LayerBlendOptions {
+    pub interior_as_group: bool,
+    pub clipped_separately: bool,
+}
+
+impl LayerBlendOptions {
+    /// Whether this is the default (nothing to store, nothing to write).
+    #[must_use]
+    pub fn is_default(self) -> bool {
+        self == Self::default()
+    }
+}
+
+// Hand-written so the wire is two plain bools in declaration order, the
+// shape the journal op and the `.aur` entry freeze.
+impl serde::Serialize for LayerBlendOptions {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (self.interior_as_group, self.clipped_separately).serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LayerBlendOptions {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (interior_as_group, clipped_separately) = <(bool, bool)>::deserialize(deserializer)?;
+        Ok(Self {
+            interior_as_group,
+            clipped_separately,
+        })
+    }
+}
+
 /// One layer's bookkeeping: identity data plus its position in the tree.
 ///
 /// `Clone`: needed by [`crate::tree::RemovedSubtree`]'s own `Clone` impl,
@@ -679,6 +725,13 @@ pub(crate) struct LayerEntry {
     /// [`crate::History::save_journal`] emits after a journaled `Restore`.
     #[serde(skip)]
     pub(crate) clipped: bool,
+    /// The layer's advanced-blending check boxes (task 149).
+    /// `#[serde(skip)]` for the same reason as [`Self::clipped`]: it travels
+    /// as `.aur`'s optional `layer-blend-options` entry and as the
+    /// `LayerOp::SetBlendOptions` that [`crate::History::save_journal`]
+    /// emits after a journaled `Restore`.
+    #[serde(skip)]
+    pub(crate) blend_options: LayerBlendOptions,
 }
 
 impl LayerEntry {
@@ -696,6 +749,7 @@ impl LayerEntry {
             effects: None,
             smart_object: None,
             clipped: false,
+            blend_options: LayerBlendOptions::default(),
         }
     }
 }

@@ -1196,6 +1196,93 @@ fn read_layer_clipping<R: Read + Seek>(
     Ok(())
 }
 
+/// The optional entry carrying each layer's advanced-blending options
+/// (task 149, `aurora_doc::LayerBlendOptions`: "Blend Interior Effects as
+/// Group" on, "Blend Clipped Layers as Group" off), which
+/// `LayerEntry::blend_options` keeps `#[serde(skip)]` so the manifest's
+/// positional layout stays as it was.
+///
+/// Written only when some layer holds a non-default value, so every other
+/// save stays byte-identical; a file without it opens with the defaults,
+/// which is what every older file means. **Versioned, and a newer version
+/// refuses the file** loudly like [`LAYER_CLIPPING_ENTRY`]. An Aurora older
+/// than this entry ignores it, but refuses the file anyway whenever its
+/// journal holds a `SetBlendOptions` op (an unknown ordinal).
+const LAYER_BLEND_OPTIONS_ENTRY: &str = "layer-blend-options";
+
+/// [`LAYER_BLEND_OPTIONS_ENTRY`]'s own schema version.
+const LAYER_BLEND_OPTIONS_VERSION: u32 = 1;
+
+/// The largest [`LAYER_BLEND_OPTIONS_ENTRY`] read: an id (ten bytes at
+/// most) and two flags per layer.
+const MAX_LAYER_BLEND_OPTIONS_BYTES: u64 = 16 * 1024 * 1024;
+
+/// [`LAYER_BLEND_OPTIONS_ENTRY`]'s payload: version first (frozen), then
+/// `(raw layer id, options)` for every layer whose options are not the
+/// default.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LayerBlendOptionsWire {
+    version: u32,
+    options: Vec<(u64, aurora_doc::LayerBlendOptions)>,
+}
+
+/// Every layer with non-default blend options, in [`layer_ids`] order.
+fn layer_blend_options(layers: &LayerTree) -> Vec<(u64, aurora_doc::LayerBlendOptions)> {
+    layer_ids(layers)
+        .into_iter()
+        .filter_map(|id| {
+            let options = layers.blend_options(id);
+            (!options.is_default()).then_some((id.to_raw(), options))
+        })
+        .collect()
+}
+
+/// Reads [`LAYER_BLEND_OPTIONS_ENTRY`] if present and applies it to
+/// `layers`.
+///
+/// # Errors
+///
+/// [`IoError::ManifestDeserialization`] for an unknown version, bytes that
+/// do not decode, or an id naming a missing layer.
+fn read_layer_blend_options<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    layers: &mut LayerTree,
+) -> Result<(), IoError> {
+    let bytes = match zip.by_name(LAYER_BLEND_OPTIONS_ENTRY) {
+        Ok(file) => read_capped(
+            file,
+            LAYER_BLEND_OPTIONS_ENTRY,
+            MAX_LAYER_BLEND_OPTIONS_BYTES,
+        )?,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let (prefix, _rest) = postcard::take_from_bytes::<MaskDensityPrefix>(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    if prefix.version != LAYER_BLEND_OPTIONS_VERSION {
+        let cause = if prefix.version > LAYER_BLEND_OPTIONS_VERSION {
+            "the file was saved by a newer Aurora"
+        } else {
+            "the entry is damaged or of an unknown kind"
+        };
+        return Err(IoError::ManifestDeserialization(format!(
+            "unsupported layer-blend-options version {} (this build understands version \
+             {LAYER_BLEND_OPTIONS_VERSION}); {cause}",
+            prefix.version
+        )));
+    }
+    let wire: LayerBlendOptionsWire = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    for (raw, options) in wire.options {
+        layers
+            .set_blend_options(aurora_doc::LayerId::from_raw(raw), options)
+            .map_err(|err| {
+                IoError::ManifestDeserialization(format!("layer blend options: {err}"))
+            })?;
+    }
+    Ok(())
+}
+
 /// The optional entry carrying the document's preserved Photoshop smart
 /// objects (0.200.0): each smart-object layer's `aurora_doc::SmartObject`
 /// (`LayerEntry::smart_object` is `#[serde(skip)]`) and the list of
@@ -2604,6 +2691,9 @@ struct DocumentEntries {
     layer_stroke_paints: Option<Vec<u8>>,
     /// [`LAYER_CLIPPING_ENTRY`], when some layer is clipped (0.201.0).
     layer_clipping: Option<Vec<u8>>,
+    /// [`LAYER_BLEND_OPTIONS_ENTRY`], when some layer has non-default
+    /// advanced-blending options (task 149).
+    layer_blend_options: Option<Vec<u8>>,
     /// [`IMPORT_LOSSES_ENTRY`], when the document has any (0.177.0).
     import_losses: Option<Vec<u8>>,
     /// The selections to write as the `selection` entry (0.218.0); the
@@ -2679,6 +2769,19 @@ impl DocumentEntries {
                     .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
             )
         };
+        let blend_options = layer_blend_options(layers);
+        let layer_blend_options = if blend_options.is_empty() {
+            None
+        } else {
+            let wire = LayerBlendOptionsWire {
+                version: LAYER_BLEND_OPTIONS_VERSION,
+                options: blend_options,
+            };
+            Some(
+                postcard::to_allocvec(&wire)
+                    .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
+            )
+        };
         Ok(Self {
             manifest,
             history,
@@ -2688,6 +2791,7 @@ impl DocumentEntries {
             layer_patterns: pattern_entries(layers)?,
             layer_stroke_paints,
             layer_clipping,
+            layer_blend_options,
             import_losses: None,
             selection: None,
             colour: None,
@@ -2738,6 +2842,10 @@ impl DocumentEntries {
         }
         if let Some(bytes) = &self.layer_clipping {
             zip.start_file(LAYER_CLIPPING_ENTRY, deflated)?;
+            zip.write_all(bytes)?;
+        }
+        if let Some(bytes) = &self.layer_blend_options {
+            zip.start_file(LAYER_BLEND_OPTIONS_ENTRY, deflated)?;
             zip.write_all(bytes)?;
         }
         if let Some(smart) = &self.smart_objects {
@@ -3209,6 +3317,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     read_layer_patterns(&mut zip, &mut layers)?;
     read_layer_stroke_paints(&mut zip, &mut layers)?;
     read_layer_clipping(&mut zip, &mut layers)?;
+    read_layer_blend_options(&mut zip, &mut layers)?;
     read_smart_objects(&mut zip, &mut layers)?;
 
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
@@ -6521,6 +6630,87 @@ mod tests {
         let tampered = with_named_entry(&bytes, super::LAYER_CLIPPING_ENTRY, Some(&payload));
         let (_dir4, mut fresh) = real_tile_store();
         assert!(read(Cursor::new(tampered), &mut fresh).is_err());
+    }
+
+    /// Task 149: the advanced-blending options survive a save and reopen
+    /// (the optional `layer-blend-options` entry, the journal replay), an
+    /// untouched document writes no entry, and a newer entry version or an
+    /// unknown layer id refuses the file.
+    #[test]
+    fn round_trips_blend_options_and_refuses_a_newer_entry_version() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let mut add = |name: &str| match history.add_pixel_layer(&mut layers, name, bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let plain = add("plain");
+        let marked = add("marked");
+        let write_bytes = |layers: &LayerTree, history: &History, store: &mut TileStore| {
+            let mut bytes = Cursor::new(Vec::new());
+            if let Err(err) = write(
+                &mut bytes,
+                layers,
+                history,
+                (100, 100),
+                None,
+                &SkippedTiles::new(),
+                store,
+            ) {
+                unreachable!("{err:?}");
+            }
+            bytes.into_inner()
+        };
+        let untouched = write_bytes(&layers, &history, &mut store);
+        assert!(
+            effects_entry_names(&untouched)
+                .iter()
+                .all(|n| n != super::LAYER_BLEND_OPTIONS_ENTRY),
+            "default options write no entry"
+        );
+        let options = aurora_doc::LayerBlendOptions {
+            interior_as_group: true,
+            clipped_separately: true,
+        };
+        if let Err(err) = history.set_blend_options(&mut layers, marked, options) {
+            unreachable!("{err:?}");
+        }
+        let bytes = write_bytes(&layers, &history, &mut store);
+        assert!(
+            effects_entry_names(&bytes)
+                .iter()
+                .any(|n| n == super::LAYER_BLEND_OPTIONS_ENTRY)
+        );
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.clone()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(document.layers.blend_options(marked), options);
+        assert!(document.layers.blend_options(plain).is_default());
+        match document.history.replay() {
+            Ok(replayed) => assert_eq!(replayed.blend_options(marked), options),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        let tamper = |version: u32, id: u64| {
+            let payload = postcard::to_allocvec(&super::LayerBlendOptionsWire {
+                version,
+                options: vec![(id, options)],
+            })
+            .unwrap_or_default();
+            let tampered =
+                with_named_entry(&bytes, super::LAYER_BLEND_OPTIONS_ENTRY, Some(&payload));
+            let (_d, mut fresh) = real_tile_store();
+            read(Cursor::new(tampered), &mut fresh).is_ok()
+        };
+        assert!(tamper(super::LAYER_BLEND_OPTIONS_VERSION, marked.to_raw()));
+        assert!(!tamper(
+            super::LAYER_BLEND_OPTIONS_VERSION + 1,
+            marked.to_raw()
+        ));
+        assert!(!tamper(super::LAYER_BLEND_OPTIONS_VERSION, 9_999));
     }
 
     /// 0.158.0: a Curves layer whose curves have **moved endpoints** (a

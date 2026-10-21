@@ -59,11 +59,19 @@ fn error_by_hidden_layer_for_named_files() {
 /// (Photoshop's is about 16 % shorter than the conventional one on the one
 /// linear picture), the 4x4 reflected picture whose symmetry axis does not
 /// follow the stored angle, a pattern fill and a pattern/gradient overlay.
-const SHAPE_FIDELITY: [(&str, f64, f64); 4] = [
+/// Task 149 adds `advanced-blending.psd`: 58.26 before, 0.01 after (`infx`
+/// and `clbl`); its one-texel maximum is a rounded edge.
+const SHAPE_FIDELITY: [(&str, f64, f64); 7] = [
     ("vector-mask2.psd", 5.0, 70.0),
     ("colormodes/4x4_16bit_rgb.psd", 28.0, 135.0),
     ("colormodes/4x4_16bit_grayscale.psd", 18.0, 45.0),
     ("artboard-bgcolor.psd", 0.05, 1.0),
+    ("advanced-blending.psd", 0.05, 150.0),
+    // 20.60 before the stored pixels of a shape layer replaced its
+    // rasterised path (task 149).
+    ("effects/double-stroke-effects.psd", 0.05, 3.0),
+    // 18.50 before a clipped group was drawn clipped (task 149).
+    ("group-clipping/group-clipping.psd", 0.05, 3.0),
 ];
 
 #[test]

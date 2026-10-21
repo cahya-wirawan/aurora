@@ -231,6 +231,10 @@ const MASK_INVERT: u8 = 0x04;
 /// Photoshop's own rendering of that vector mask (combined with the real
 /// user mask, which is then channel `-3`), not a separate pixel mask.
 const MASK_FROM_RENDER: u8 = 0x08;
+
+/// The layer record's flags bit 4: the pixel data is irrelevant to the
+/// document's appearance, set on shape layers (task 149).
+const SHAPE_PIXELS_IRRELEVANT: u8 = 0x10;
 /// Mask flags bit 4: a mask-parameter block (density, feather) follows.
 const MASK_PARAMETERS: u8 = 0x10;
 
@@ -365,6 +369,9 @@ pub struct PsdProps {
     /// Clipped to the layer below (record byte `clipping` != 0), applied
     /// by `Builder::apply` through `History::set_clipped` (0.201.0).
     pub clipped: bool,
+    /// The `infx` ("Blend Interior Effects as Group") and `clbl` ("Blend
+    /// Clipped Layers as Group", read inverted) check boxes (task 149).
+    pub blend_options: aurora_doc::LayerBlendOptions,
     /// The layer's effects (0.180.0), stored on the layer as data and not
     /// rendered yet.
     pub effects: Option<Box<aurora_core::LayerEffects>>,
@@ -1855,6 +1862,10 @@ struct Record {
     name: String,
     section: Option<Section>,
     fill_opacity: Option<u8>,
+    /// The `infx` byte (task 149): "Blend Interior Effects as Group".
+    blend_interior: Option<u8>,
+    /// The `clbl` byte (task 149): "Blend Clipped Layers as Group".
+    blend_clipped: Option<u8>,
     features: Features,
     /// The first `vmsk`/`vsms` block's data (0.150.0), copied out of the
     /// record's extra data (0.154.0) so the record owns it.
@@ -2010,6 +2021,8 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let mut section = None;
     let mut nested_section = None;
     let mut fill_opacity = None;
+    let mut blend_interior = None;
+    let mut blend_clipped = None;
     let mut protected = None;
     let mut vector = None;
     let mut fill_block: Option<([u8; 4], Vec<u8>)> = None;
@@ -2036,6 +2049,8 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
             b"lsct" => section = read_section(data),
             b"lsdk" => nested_section = read_section(data),
             b"iOpa" => fill_opacity = data.first().copied(),
+            b"infx" => blend_interior = data.first().copied(),
+            b"clbl" => blend_clipped = data.first().copied(),
             b"lspf" => {
                 protected = data
                     .get(..4)
@@ -2125,6 +2140,8 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
         name,
         section: section.or(nested_section),
         fill_opacity,
+        blend_interior,
+        blend_clipped,
         features,
         vector,
         fill: fill_block,
@@ -3885,6 +3902,10 @@ fn props_for(record: &Record, notes: &mut Notes) -> PsdProps {
         visible: record.flags & 0x02 == 0,
         lock: lock_from_psd(record.flags, record.protected),
         clipped: record.clipping != 0,
+        blend_options: aurora_doc::LayerBlendOptions {
+            interior_as_group: record.blend_interior.is_some_and(|v| v != 0),
+            clipped_separately: record.blend_clipped == Some(0),
+        },
         effects: match &record.effects {
             Some(Ok(read)) if !read.effects.is_empty() && read.effects.validate().is_ok() => {
                 let mut fx = read.effects.clone();
@@ -4710,6 +4731,7 @@ fn artboard_background(
             visible: true,
             lock: aurora_doc::LayerLock::default(),
             clipped: false,
+            blend_options: aurora_doc::LayerBlendOptions::default(),
             effects: None,
         },
         bounds: region,
@@ -4747,6 +4769,17 @@ fn vector_for(
     budget: &mut vector::Budget,
 ) -> Result<Option<vector::Raster>, VectorSkip> {
     if record.features.fill {
+        return Ok(None);
+    }
+    // Task 149: a shape layer (the record's "pixel data irrelevant" flag,
+    // bit 4, which psd-tools also uses to call a record a shape) that
+    // stores pixels already holds Photoshop's own rendering of the shape,
+    // edge pixels included. Applying our rasterisation of the path on top
+    // only cut those edge pixels (`double-stroke-effects.psd`: the stored
+    // rectangle is 25 px wide, the rasterised path 24, and Photoshop's
+    // merged image shows 25), and every layer effect then sat one pixel
+    // inside.
+    if record.flags & SHAPE_PIXELS_IRRELEVANT != 0 && record.area() > 0 {
         return Ok(None);
     }
     let Some(data) = record.vector.as_deref() else {
@@ -6743,6 +6776,10 @@ impl Builder<'_, '_, '_> {
         }
         if props.lock.is_any() {
             self.history.set_lock(self.layers, id, props.lock)?;
+        }
+        if !props.blend_options.is_default() {
+            self.history
+                .set_blend_options(self.layers, id, props.blend_options)?;
         }
         if props.clipped {
             match self.history.set_clipped(self.layers, id, true) {

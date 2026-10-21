@@ -237,6 +237,18 @@ enum LayerOp {
         overlays: Option<Vec<bool>>,
         strokes: Option<Vec<bool>>,
     },
+    /// Sets a layer's advanced-blending options (task 149,
+    /// [`crate::LayerBlendOptions`]). `LayerEntry::blend_options` is
+    /// `#[serde(skip)]`, so [`History::save_journal`] follows every
+    /// journaled `Restore` that carries a non-default value with one of
+    /// these, and **only then**: a journal without non-default options is
+    /// byte-identical to the ones older builds wrote. Appended after
+    /// [`Self::SetGradientRamps`], so an Aurora older than this build
+    /// refuses a journal holding it (ADR 0009).
+    SetBlendOptions {
+        id: LayerId,
+        value: crate::layer::LayerBlendOptions,
+    },
 }
 
 /// One layer's smoothed-ramp flags a journaled op carries (see
@@ -387,6 +399,20 @@ fn restored_clipped(op: &LayerOp) -> Vec<LayerId> {
             .iter()
             .filter(|(_, entry)| entry.clipped)
             .map(|(id, _)| *id)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every layer a journaled `Restore` carries with non-default blend
+/// options (they would be lost on the wire).
+fn restored_blend_options(op: &LayerOp) -> Vec<(LayerId, crate::layer::LayerBlendOptions)> {
+    match op {
+        LayerOp::Restore(subtree) => subtree
+            .entries
+            .iter()
+            .filter(|(_, entry)| !entry.blend_options.is_default())
+            .map(|(id, entry)| (*id, entry.blend_options))
             .collect(),
         _ => Vec::new(),
     }
@@ -676,6 +702,13 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
                 None,
             ))
         }
+        LayerOp::SetBlendOptions { id, value } => {
+            let old = tree.blend_options(id);
+            tree.set_blend_options(id, value)?;
+            // `None`: the options change how a whole clip group or a
+            // layer's interior effects composite.
+            Ok((LayerOp::SetBlendOptions { id, value: old }, None))
+        }
         LayerOp::SetClipped { id, value } => {
             let old = tree.clipped(id);
             tree.set_clipped_flag(id, value)?;
@@ -870,6 +903,9 @@ fn describe(op: &LayerOp) -> String {
         ),
         LayerOp::SetGradientRamps { id, .. } => {
             format!("Changed gradient smoothing on layer #{}", id.to_raw())
+        }
+        LayerOp::SetBlendOptions { id, .. } => {
+            format!("Changed advanced blending on layer #{}", id.to_raw())
         }
         LayerOp::SetClipped { id, value } => {
             let verb = if *value {
@@ -1201,6 +1237,13 @@ impl History {
                     id,
                     overlays,
                     strokes,
+                }));
+            }
+            // The advanced-blending options (task 149) the same way.
+            for (id, value) in restored_blend_options(op) {
+                wire.push(std::borrow::Cow::Owned(LayerOp::SetBlendOptions {
+                    id,
+                    value,
                 }));
             }
             // The clipping flag (0.201.0) the same way.
@@ -1714,6 +1757,27 @@ impl History {
         tree.set_clipped(id, value)?;
         self.journal.push(LayerOp::SetClipped { id, value });
         self.push(LayerOp::SetClipped { id, value: old });
+        Ok(None)
+    }
+
+    /// Sets a layer's advanced-blending options (task 149), recorded for
+    /// undo. Returns `None` for the dirty rectangle: the options change how
+    /// the whole group or interior composites.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::UnknownLayer`] if `id` doesn't exist; nothing is
+    /// recorded then.
+    pub fn set_blend_options(
+        &mut self,
+        tree: &mut LayerTree,
+        id: LayerId,
+        value: crate::layer::LayerBlendOptions,
+    ) -> Result<Option<Rect>, DocError> {
+        let old = tree.blend_options(id);
+        tree.set_blend_options(id, value)?;
+        self.journal.push(LayerOp::SetBlendOptions { id, value });
+        self.push(LayerOp::SetBlendOptions { id, value: old });
         Ok(None)
     }
 
@@ -6119,14 +6183,12 @@ mod adjustment_tests {
         let loaded = History::load_journal(&history.save_journal().unwrap_or_default());
         let replayed = loaded.ok().and_then(|h| h.replay().ok());
         assert!(replayed.is_some_and(|t| t.clipped(top)));
-        // A released layer is no longer clipped; a group cannot be clipped.
+        // A released layer is no longer clipped; a group can be (task 149)
+        // when something lies beneath it.
         assert!(history.set_clipped(&mut tree, top, false).is_ok());
         assert_eq!(tree.clip_base(top), None);
         let group = history.add_group(&mut tree, "g", None).ok();
-        assert!(group.is_some_and(|g| matches!(
-            tree.set_clipped(g, true),
-            Err(DocError::GroupCannotBeClipped(_))
-        )));
+        assert!(group.is_some_and(|g| tree.set_clipped(g, true).is_ok() && tree.clipped(g)));
     }
 
     #[test]
@@ -6427,6 +6489,106 @@ mod adjustment_tests {
             matches!(inverse.0, LayerOp::SetStrokePaints { ref value, .. } if value == &vec![None, Some(paint.clone())])
         );
     }
+    /// Task 149: `SetBlendOptions` is appended after `SetGradientRamps`, a
+    /// journaled `Restore` carries a non-default value through the journal,
+    /// a default one adds nothing, and undo restores the old value.
+    #[test]
+    fn set_blend_options_is_appended_and_the_journal_carries_the_options() {
+        use crate::layer::LayerBlendOptions;
+        let id = crate::LayerId::from_raw(3);
+        let ordinal = |op: &LayerOp| {
+            postcard::to_allocvec(op)
+                .ok()
+                .and_then(|b| b.first().copied())
+        };
+        let ramps = ordinal(&LayerOp::SetGradientRamps {
+            id,
+            overlays: None,
+            strokes: None,
+        });
+        let options = LayerBlendOptions {
+            interior_as_group: true,
+            clipped_separately: true,
+        };
+        let op = ordinal(&LayerOp::SetBlendOptions { id, value: options });
+        assert!(
+            ramps.is_some() && op == ramps.map(|p| p + 1),
+            "{ramps:?} {op:?}"
+        );
+        // The wire is two bools, in declaration order.
+        assert_eq!(
+            postcard::to_allocvec(&options).unwrap_or_default(),
+            vec![1, 1]
+        );
+
+        let mut tree = crate::LayerTree::new();
+        let mut history = History::new();
+        let layer = match history.add_pixel_layer(&mut tree, "p", bounds(), None) {
+            Ok(layer) => layer,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let base_journal = history.save_journal().unwrap_or_default();
+        if let Err(err) = history.set_blend_options(&mut tree, layer, options) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.blend_options(layer), options);
+        let journal = history.save_journal().unwrap_or_default();
+        assert_ne!(journal, base_journal);
+        match History::load_journal(&journal).and_then(|h| h.replay()) {
+            Ok(replayed) => assert_eq!(replayed.blend_options(layer), options),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        // Undo puts the default back.
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert!(tree.blend_options(layer).is_default());
+        // And redo applies them again (the inverse of the undo step).
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.blend_options(layer), options);
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert!(tree.blend_options(layer).is_default());
+        // A tree that never set the options journals the bytes older
+        // builds wrote: no op, nothing added by a Restore of default entries.
+        assert!(
+            !format!(
+                "{:?}",
+                History::load_journal(&base_journal).map(|h| h.journal_descriptions())
+            )
+            .contains("advanced blending")
+        );
+    }
+
+    /// Task 149: removing a layer that holds non-default blend options and
+    /// undoing the removal (a journaled `Restore`) keeps them through the
+    /// wire, which skips the field.
+    #[test]
+    fn blend_options_survive_a_restore_through_the_journal() {
+        use crate::layer::LayerBlendOptions;
+        let options = LayerBlendOptions {
+            interior_as_group: true,
+            clipped_separately: false,
+        };
+        let mut tree = crate::LayerTree::new();
+        let mut history = History::new();
+        let layer = match history.add_pixel_layer(&mut tree, "p", bounds(), None) {
+            Ok(layer) => layer,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let _other = history.add_pixel_layer(&mut tree, "q", bounds(), None);
+        assert!(history.set_blend_options(&mut tree, layer, options).is_ok());
+        assert!(history.remove(&mut tree, layer).is_ok());
+        assert!(history.undo(&mut tree).is_ok());
+        assert_eq!(tree.blend_options(layer), options);
+        let loaded = History::load_journal(&history.save_journal().unwrap_or_default());
+        let replayed = loaded.ok().and_then(|h| h.replay().ok());
+        assert!(replayed.is_some_and(|t| t.blend_options(layer) == options));
+    }
+
     /// Task 147: `SetGradientRamps` is appended after `SetStrokePaints`, the
     /// journal carries the smoothed-ramp flags the wire skips, and a journal
     /// with only straight ramps is the one older builds wrote (no such op).

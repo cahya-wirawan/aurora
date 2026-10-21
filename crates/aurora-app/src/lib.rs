@@ -18150,7 +18150,15 @@ fn invalidate_painted_tiles(
 /// `Dissolve` layer that also carries a colour overlay is rare.
 ///
 /// Effects are computed here, at composite time, from the stored settings
-/// — never baked into the layer's pixels. `infx` is not modelled (E6).
+/// — never baked into the layer's pixels.
+///
+/// Task 149, "Blend Interior Effects as Group" (`infx`,
+/// [`aurora_doc::LayerBlendOptions::interior_as_group`]): with it on and a
+/// Fill below 100 %, step 1 takes the content at full alpha, steps 2-2a'
+/// fold the colour, gradient and pattern overlays onto it, and the whole
+/// interior is then faded toward the backdrop by Fill (`B + (X - B) * F`);
+/// the inside strokes (step 2b) stay unfaded. Corpus: `advanced-blending.psd`
+/// 58.3 -> 0.01 levels.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn fold_layer_with_effects(
     accumulator: &mut [half::f16],
@@ -18270,6 +18278,18 @@ fn fold_layer_with_effects(
     } else {
         raw_blend_mode
     };
+    // Task 149, "Blend Interior Effects as Group" (`infx`): the content and
+    // the interior effects (the overlays) composite as one group at full
+    // alpha, and Fill then fades that group; strokes, which are not
+    // interior effects, stay unfaded. Measured on `advanced-blending.psd`:
+    // Fill 28/255 with a 100 % Normal overlay (38, 47, 55) over white
+    // gives (231, 232, 233), i.e. `B + (overlay - B) * Fill`.
+    let group_fill = layers.blend_options(id).interior_as_group
+        && fill < 1.0
+        && (fx.color_overlays.iter().any(|o| fx.shows(o.gate))
+            || fx.shown_gradient_overlays() > 0
+            || fx.shown_pattern_overlays() > 0);
+    let content_fill = if group_fill { 1.0 } else { fill };
     for run in &runs {
         if let (Some(inside), Some(acc), Some(src), Some(shape)) = (
             interior.get_mut(run.clone()),
@@ -18284,7 +18304,7 @@ fn fold_layer_with_effects(
                     *alpha = one;
                 }
             }
-            fold_texels_in_mode(inside, src, fill, content_mode, doc_origin);
+            fold_texels_in_mode(inside, src, content_fill, content_mode, doc_origin);
         }
     }
     // Step 2: each shown overlay, bottom to top.
@@ -18384,6 +18404,18 @@ fn fold_layer_with_effects(
                         aurora_doc::BlendMode::from(overlay.blend_mode),
                         doc_origin,
                     );
+                }
+            }
+        }
+    }
+    if group_fill {
+        for run in &runs {
+            if let (Some(inside), Some(acc)) =
+                (interior.get_mut(run.clone()), accumulator.get(run.clone()))
+            {
+                for (x, &b) in inside.iter_mut().zip(acc) {
+                    let b = b.to_f32();
+                    *x = half::f16::from_f32((x.to_f32() - b).mul_add(fill, b));
                 }
             }
         }
@@ -20094,10 +20126,16 @@ fn add_clip_change(
 /// accumulator; that is exact for a `Normal` base and an approximation for
 /// other base modes.
 ///
-/// Not modelled: the "Blend Clipped Layers as Group" flag (`clbl`) turned
-/// off, the base's Fill applying to its own pixels only, and a base with a
-/// non-`Normal` mode and drawn effects (see above).
-#[allow(clippy::too_many_arguments)]
+/// Task 149: the "Blend Clipped Layers as Group" box turned off (`clbl` = 0,
+/// [`aurora_doc::LayerBlendOptions::clipped_separately`]) folds the base
+/// alone and then each clipped layer over the result, in its own mode,
+/// limited to the base's alpha times its opacity; the base's Fill and mode
+/// do not reach it.
+///
+/// Not modelled: the base's Fill applying to its own pixels only when the
+/// box is on, and a base with a non-`Normal` mode and drawn effects (see
+/// above).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn fold_clip_group(
     accumulator: &mut [half::f16],
     base: aurora_doc::LayerId,
@@ -20128,7 +20166,15 @@ fn fold_clip_group(
             budget,
         );
     }
-    let with_effects = cover.is_none() && layer_renders_effects(layers, base);
+    // Task 149, "Blend Clipped Layers as Group" off (`clbl` = 0): the base
+    // is folded alone (its own mode, opacity and Fill) and each clipped
+    // layer then adds its change over the result, limited to the base's
+    // shape and not taken through the base's Fill or mode. Measured on
+    // `advanced-blending.psd`: a black clipped overlay on a base with Fill
+    // 28/255 shows at full strength. The change is added the way a base
+    // with drawn effects does it (exact for a Normal clipped layer).
+    let separate = layers.blend_options(base).clipped_separately;
+    let with_effects = separate || (cover.is_none() && layer_renders_effects(layers, base));
     let mut changed = false;
     if with_effects {
         // The base as today (visibility, budget and effects inside).
@@ -20149,9 +20195,13 @@ fn fold_clip_group(
     } else if cover.is_none() && !admit_composite_node(base, layers, depth, budget) {
         return false;
     }
-    let Some(opacity) = content_opacity(layers, base) else {
+    let Some(mut opacity) = content_opacity(layers, base) else {
         return changed;
     };
+    if separate {
+        // Fill is the base's own; only its opacity reaches the clipped layers.
+        opacity = layers.opacity(base).unwrap_or(1.0);
+    }
     let texels = match cover {
         Some(cover) => Some(cover.to_vec()),
         None => pixel_layer_texels(
@@ -20168,6 +20218,44 @@ fn fold_clip_group(
     let Some(texels) = texels else {
         return changed;
     };
+    if separate {
+        // Each clipped layer folds over what the base already drew, in its
+        // own mode, and shows where the base has alpha (times the base's
+        // opacity): `result = B + (fold(B) - B) * base_alpha * opacity`,
+        // exact for any clipped mode, effects included. Not the base's Fill.
+        let weights: Vec<f32> = texels
+            .chunks_exact(aurora_tile::CHANNELS)
+            .map(|t| t.get(3).map_or(0.0, |a| a.to_f32()) * opacity)
+            .collect();
+        for &id in clipped {
+            let before = accumulator.to_vec();
+            if !fold_layer_into(
+                accumulator,
+                id,
+                layers,
+                store,
+                tile_id,
+                doc_origin,
+                reference_origin,
+                depth,
+                budget,
+            ) {
+                continue;
+            }
+            changed = true;
+            for ((out, old), &w) in accumulator
+                .chunks_exact_mut(aurora_tile::CHANNELS)
+                .zip(before.chunks_exact(aurora_tile::CHANNELS))
+                .zip(&weights)
+            {
+                for (x, b) in out.iter_mut().zip(old) {
+                    let b = b.to_f32();
+                    *x = half::f16::from_f32((x.to_f32() - b).mul_add(w.clamp(0.0, 1.0), b));
+                }
+            }
+        }
+        return changed;
+    }
     let mut group = aurora_render::transparent_tile();
     aurora_render::composite_layer_into(&mut group, &texels, 1.0, aurora_render::BlendMode::Normal);
     let before = with_effects.then(|| group.clone());
@@ -92080,6 +92168,93 @@ mod tests {
                 texel(&composite(&layers, &mut store), 0, 0),
                 [0.25, 0.5, 0.25, 1.0],
             );
+        }
+
+        /// Task 149, "Blend Interior Effects as Group" (`infx`): Fill 0.25
+        /// fades the group of content and Normal overlay together, so the
+        /// result is `B + (O - B) * Fill`; with the option off the overlay
+        /// is not faded. Photoshop's pixels, `advanced-blending.psd`:
+        /// Fill 28/255 and overlay (38, 47, 55) over white gave (231, 232, 233).
+        #[test]
+        fn interior_effects_as_group_fade_overlays_by_fill() {
+            let build = |as_group: bool, opacity: f32, fill: f32| {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers = aurora_doc::LayerTree::new();
+                let _bottom = solid(&mut layers, &mut store, None, [0.0, 0.0, 1.0, 1.0]);
+                let id = solid(&mut layers, &mut store, None, [1.0, 0.0, 0.0, 1.0]);
+                ok(layers.set_fill_opacity(id, fill));
+                set_overlays(
+                    &mut layers,
+                    id,
+                    vec![overlay(
+                        aurora_core::effects::EffectBlendMode::Normal,
+                        [0.0, 1.0, 0.0],
+                        opacity,
+                    )],
+                );
+                ok(layers.set_blend_options(
+                    id,
+                    aurora_doc::LayerBlendOptions {
+                        interior_as_group: as_group,
+                        ..aurora_doc::LayerBlendOptions::default()
+                    },
+                ));
+                texel(&composite(&layers, &mut store), 0, 0)
+            };
+            near(build(false, 1.0, 0.25), [0.0, 1.0, 0.0, 1.0]);
+            near(build(true, 1.0, 0.25), [0.0, 0.25, 0.75, 1.0]);
+            // A translucent overlay: the group is lerp(red, green, 0.5).
+            near(build(true, 0.5, 0.25), [0.125, 0.125, 0.75, 1.0]);
+            // Fill 1 is unchanged, Fill 0 hides the whole group.
+            near(build(true, 1.0, 1.0), build(false, 1.0, 1.0));
+            near(build(true, 1.0, 0.0), [0.0, 0.0, 1.0, 1.0]);
+        }
+
+        /// Task 149, "Blend Clipped Layers as Group" off (`clbl` = 0): the
+        /// base's Fill fades the base only, and the clipped layer shows at
+        /// full strength over it, limited to the base's shape. On (the
+        /// default) the group takes the base's Fill as before. Photoshop:
+        /// `advanced-blending.psd`'s black clipped overlay on a Fill-28/255
+        /// base is pure black.
+        #[test]
+        fn clipped_layers_not_grouped_ignore_the_base_fill() {
+            let build = |separately: bool, base_alpha: f32, base_opacity: f32| {
+                let (_dir, mut store) = real_tile_store();
+                let mut layers = aurora_doc::LayerTree::new();
+                let _bottom = solid(&mut layers, &mut store, None, [0.0, 0.0, 1.0, 1.0]);
+                let base = solid(&mut layers, &mut store, None, [1.0, 0.0, 0.0, base_alpha]);
+                ok(layers.set_fill_opacity(base, 0.25));
+                ok(layers.set_opacity(base, base_opacity));
+                let top = solid(&mut layers, &mut store, None, [0.0, 1.0, 0.0, 1.0]);
+                ok(layers.set_clipped(top, true));
+                ok(layers.set_blend_options(
+                    base,
+                    aurora_doc::LayerBlendOptions {
+                        clipped_separately: separately,
+                        ..aurora_doc::LayerBlendOptions::default()
+                    },
+                ));
+                let mut budget = CompositeBudget::for_pass(&layers);
+                let (acc, _) = composite_roots_into_tile(
+                    &layers,
+                    &mut store,
+                    TILE0,
+                    (0, 0),
+                    (0, 0),
+                    &mut budget,
+                );
+                texel(&acc, 0, 0)
+            };
+            // Grouped: green atop red, the group at Fill 0.25 over blue.
+            near(build(false, 1.0, 1.0), [0.0, 0.25, 0.75, 1.0]);
+            // Separately: the base is lerp(blue, red, 0.25) and the green
+            // layer covers it fully.
+            near(build(true, 1.0, 1.0), [0.0, 1.0, 0.0, 1.0]);
+            // The clipped layer shows with the base's alpha times its
+            // opacity: the base is lerp(blue, red, 0.125) (alpha or opacity
+            // 0.5 times Fill 0.25), the green layer then at weight 0.5.
+            near(build(true, 0.5, 1.0), [0.0625, 0.5, 0.4375, 1.0]);
+            near(build(true, 1.0, 0.5), [0.0625, 0.5, 0.4375, 1.0]);
         }
 
         /// Shape = content alpha × mask; layer opacity fades the overlay;

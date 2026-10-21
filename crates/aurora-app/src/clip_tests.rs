@@ -291,16 +291,16 @@ fn a_flagged_layer_with_a_group_base_or_nothing_beneath_composites_plain() {
     let (_dir, mut store) = store();
     let mut layers = aurora_doc::LayerTree::new();
     let bottom = solid(&mut layers, &mut store, RED);
-    // The model refuses to clip the bottom layer, and a group.
+    // The model refuses to clip the bottom layer.
     assert!(matches!(
         layers.set_clipped(bottom, true),
         Err(aurora_doc::DocError::NoClipBase(_))
     ));
     let group = ok(layers.add_group("g", None));
-    assert!(matches!(
-        layers.set_clipped(group, true),
-        Err(aurora_doc::DocError::GroupCannotBeClipped(_))
-    ));
+    // A group above a layer can be clipped since task 149 (and released).
+    ok(layers.set_clipped(group, true));
+    assert_eq!(layers.clip_base(group), Some(bottom));
+    ok(layers.set_clipped(group, false));
     // A pixel layer above an (empty) group base clips to it since 0.243.0:
     // the group has no content, so the clipped layer shows nothing.
     let top = solid(&mut layers, &mut store, BLUE);
@@ -603,4 +603,34 @@ fn the_clip_group_blends_with_the_bases_mode_over_the_backdrop() {
     let acc = composite(&layers, &mut store);
     // Group (blue) multiplied with the grey backdrop, not painted Normal.
     near(px(&acc, 3, 3), [0.0, 0.0, 0.5, 1.0]);
+}
+
+/// Task 149: a clipped **group** (Photoshop's `group-clipping.psd`) is cut
+/// to its base's shape, whatever its blend mode: here a Normal and a Pass
+/// Through group of full-size blue over a base that is red on the left half.
+#[test]
+fn a_clipped_group_shows_only_where_its_base_has_alpha() {
+    for pass_through in [false, true] {
+        let (_dir, mut store) = store();
+        let mut layers = aurora_doc::LayerTree::new();
+        solid(&mut layers, &mut store, WHITE);
+        layer(&mut layers, &mut store, None, 10, half_red);
+        let group = ok(layers.add_group("g", None));
+        if pass_through {
+            ok(layers.set_blend_mode(group, aurora_doc::BlendMode::PassThrough));
+        } else {
+            ok(layers.set_blend_mode(group, aurora_doc::BlendMode::Normal));
+        }
+        layer(&mut layers, &mut store, Some(group), 10, |_, _| BLUE);
+        clip(&mut layers, group);
+        let acc = composite(&layers, &mut store);
+        near(px(&acc, 1, 1), BLUE);
+        near(px(&acc, 8, 1), WHITE);
+        // Atop at the base's alpha 0.5, as for a clipped layer.
+        near(px(&acc, 2, 2), [0.5, 0.5, 1.0, 1.0]);
+        // Released, the group paints everywhere.
+        ok(layers.set_clipped(group, false));
+        let acc = composite(&layers, &mut store);
+        near(px(&acc, 8, 1), BLUE);
+    }
 }

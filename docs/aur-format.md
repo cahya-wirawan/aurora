@@ -46,7 +46,7 @@ There is **no single global file-format version number**. Versioning is layered:
 | Tile codec | byte 4 of every tile payload | `1` (`VERSION` in `codec.rs`) | `crates/aurora-tile/src/codec.rs` |
 | Enum ordinals | `postcard` variant indices inside the manifest and journal | see Appendix B | `layer.rs`, `history.rs` |
 
-Per-entry schema versions: `mask-density` 1 (`MASK_DENSITY_VERSION`), `layer-effects` 1 (`LAYER_EFFECTS_VERSION`), `layer-patterns` 1 (`LAYER_PATTERNS_VERSION`), `layer-stroke-paints` 1 (`LAYER_STROKE_PAINTS_VERSION`), `layer-clipping` 1 (`LAYER_CLIPPING_VERSION`), `smart-objects` 1 (`SMART_OBJECTS_VERSION`), `import-losses` 1 (`IMPORT_LOSSES_VERSION`), `skipped-tiles` 1 (`SKIPPED_TILES_VERSION`), `selection` 1 (`SELECTION_VERSION`, `aur_selection.rs`), `paths` 1 (`PATHS_VERSION`, `aur_paths.rs`).
+Per-entry schema versions: `mask-density` 1 (`MASK_DENSITY_VERSION`), `layer-effects` 1 (`LAYER_EFFECTS_VERSION`), `layer-patterns` 1 (`LAYER_PATTERNS_VERSION`), `layer-stroke-paints` 1 (`LAYER_STROKE_PAINTS_VERSION`), `layer-clipping` 1 (`LAYER_CLIPPING_VERSION`), `layer-blend-options` 1 (`LAYER_BLEND_OPTIONS_VERSION`), `smart-objects` 1 (`SMART_OBJECTS_VERSION`), `import-losses` 1 (`IMPORT_LOSSES_VERSION`), `skipped-tiles` 1 (`SKIPPED_TILES_VERSION`), `selection` 1 (`SELECTION_VERSION`, `aur_selection.rs`), `paths` 1 (`PATHS_VERSION`, `aur_paths.rs`).
 
 The format has **evolved without bumping the manifest version**: every change since the first release was made by (a) adding an optional top-level ZIP entry, or (b) appending an enum variant (section 10). `MANIFEST_VERSION` has never changed from 1, and a reader that meets any other value refuses the file (`aur.rs` `read`, "unsupported manifest version").
 
@@ -131,6 +131,7 @@ All entry names are exact, case-sensitive ASCII strings, with `/` as separator a
 | `layer-patterns` (+ `layer-pattern-pixels-<n>`) | no | Deflated | `postcard` `{version: u32, patterns: Vec<{id, name, width: u32, height: u32}>, overlays: Vec<(u64, Vec<PatternOverlay>)>}`; pixels: little-endian `u16` RGBA straight, exactly `width * height * 8` bytes per pattern, index = position in `patterns` (task 111) | the document has a pattern or a pattern overlay | meta 16 MiB; pixels 4 Mpx (32 MiB) each, 64 MiB and 256 patterns in all, sizes checked before any pixel is read | `LAYER_PATTERNS_ENTRY` |
 | `layer-stroke-paints` | no | Deflated | `postcard` `{version: u32, paints: Vec<(u64, Vec<Option<StrokePaint>>)>}`, one `Option` per stroke in order (task 118) | some stroke has a paint (a gradient or pattern stroke Aurora draws) | 16 MiB | `LAYER_STROKE_PAINTS_ENTRY` |
 | `layer-clipping` | no | Deflated | `postcard` `{version: u32, clipped: Vec<u64>}` (7.5) | some layer is clipped to a base | 16 MiB | `LAYER_CLIPPING_ENTRY` |
+| `layer-blend-options` | no | Deflated | `postcard` `{version: u32, options: Vec<(u64, (bool, bool))>}`, the pair being (interior effects as group, clipped layers blended separately) (8.4a) | some layer holds a non-default option | 16 MiB | `LAYER_BLEND_OPTIONS_ENTRY` |
 | `smart-objects` | no | Deflated | `postcard` `{version: u32, objects, files}` (8.5) | document has smart-object data or embedded files | 80 MiB | `SMART_OBJECTS_ENTRY` |
 | `smart-object-file-<n>` | only if named by `smart-objects` | **Stored** | one PSD linked-layer entry, framed (8.5) | one per record in `smart-objects.files`, `n` = 0-based index in that list | the record's `len` | `SMART_OBJECT_FILE_PREFIX` |
 | `import-losses` | no | Deflated | `postcard` `{version: u32, lines: Vec<String>}` (8.6) | the document was opened from another format with losses | 1,048,640 bytes | `IMPORT_LOSSES_ENTRY` |
@@ -145,7 +146,7 @@ Unknown entry names (including directory entries) are ignored by the reference r
 
 ### 3.3 Ordering requirements
 
-* The writer emits entries in this order: `mimetype`, `manifest`, `history`, `mask-density`, `layer-effects`, `layer-patterns` followed by its `layer-pattern-pixels-<n>` entries (task 111; the gradient-overlay entry of task 110 sits before it), `layer-stroke-paints` (task 118), `layer-clipping`, `smart-objects` followed by its `smart-object-file-<n>` entries in index order, `import-losses`, `selection`, `paths`, then all tile entries, then `skipped-tiles` (`DocumentEntries::write_to`, then the tile loop in `write_with_policy` and `write_snapshot`, then `skipped_tiles_entry`, all in `aur.rs`). The snapshot writer produces the same order.
+* The writer emits entries in this order: `mimetype`, `manifest`, `history`, `mask-density`, `layer-effects`, `layer-patterns` followed by its `layer-pattern-pixels-<n>` entries (task 111; the gradient-overlay entry of task 110 sits before it), `layer-stroke-paints` (task 118), `layer-clipping`, `layer-blend-options` (task 149), `smart-objects` followed by its `smart-object-file-<n>` entries in index order, `import-losses`, `selection`, `paths`, then all tile entries, then `skipped-tiles` (`DocumentEntries::write_to`, then the tile loop in `write_with_policy` and `write_snapshot`, then `skipped_tiles_entry`, all in `aur.rs`). The snapshot writer produces the same order.
 * `mimetype` SHOULD be first and Stored so that a magic-byte sniff works without parsing the central directory (ADR 0009; the app test at `crates/aurora-app/src/lib.rs:67594` asserts the entry exists and is Stored). No reader code depends on the position.
 * **A reader MUST NOT rely on entry order**; it looks every entry up by name through the central directory.
 * Tile entries are written in `persisted_surfaces` order (section 6.3): layers in depth-first pre-order of the tree (siblings in stored order), a pixel layer's content surface before its mask surface, within a surface row-major (rows outer, columns inner). This order is not significant to a reader.
@@ -159,7 +160,7 @@ Unknown entry names (including directory entries) are ignored by the reference r
 3. Colour space: `Srgb` -> none; `Icc(bytes)` -> parse with `IccProfile::from_bytes`; parse failure: refuse (`IoError::Color`).
 4. Canvas size: either dimension above `MAX_DOCUMENT_EXTENT` (300,000): refuse (`CanvasTooLarge`). Zero is not checked (G-6).
 5. `validate_persisted_rects`: every pixel-layer `bounds` and every mask `bounds`: origin within +/-300,000 (`LayerOriginOutOfRange`), extent <= 300,000 (`LayerBoundsTooLarge`), sum of tile-grid areas <= 2,747,168 (`TooManyTiles`). Refuse on violation.
-6. Apply optional side entries to the decoded tree, in this order: `mask-density`, `layer-effects`, `layer-clipping`, `smart-objects` (plus its files). For each, **absence is fine**; any other failure refuses (table below).
+6. Apply optional side entries to the decoded tree, in this order: `mask-density`, `layer-effects`, `layer-clipping`, `layer-blend-options`, `smart-objects` (plus its files). For each, **absence is fine**; any other failure refuses (table below).
 7. Read `history` (required) and decode with `History::load_journal`. Undecodable: refuse (`IoError::Doc`). The journal is **not replayed and not compared with the manifest** on open (G-1).
 8. `skipped-tiles`, `import-losses`, `selection`, `paths` (policies below).
 9. Scan the tile grid of every persisted surface (6.3), decoding each present tile entry into the caller's tile store. Missing entries are blank tiles (6.5).
@@ -172,7 +173,8 @@ Per-entry policy for an entry that is absent, malformed, oversized, or of an une
 | `history` | refuse (`MissingEntry`) | refuse | refuse | refuse (no version field) | no version field |
 | `mask-density` | ok (all masks density 1.0) | refuse | refuse | refuse (also: a pair naming a layer with no mask, or density outside 0..=1) | refuse (any value != 1, smaller or larger) |
 | `layer-effects` | ok | refuse | refuse | refuse (also: unknown layer, adjustment layer, `LayerEffects::validate` failure) | refuse (message distinguishes newer from damaged) |
-| `layer-clipping` | ok | refuse | refuse | refuse (also: unknown layer, a group, a layer with nothing beneath it) | refuse |
+| `layer-clipping` | ok | refuse | refuse | refuse (also: unknown layer, a layer or group with nothing beneath it) | refuse |
+| `layer-blend-options` | ok | refuse | refuse | refuse (also: unknown layer) | refuse (message distinguishes newer from damaged) |
 | `layer-patterns` | ok | refuse | refuse | refuse (also: a pattern over the size caps, a missing or wrong-sized pixel entry, an overlay on a layer without effects or naming a pattern the file lacks, `LayerEffects::validate` failure) | refuse (message distinguishes newer from damaged) |
 | `layer-stroke-paints` | ok | refuse | refuse | refuse (also: a layer without effects, a stroke-count mismatch, a paint of the wrong kind for its stroke, a pattern the file lacks, `LayerEffects::validate` failure) | refuse (message distinguishes newer from damaged) |
 | `smart-objects` | ok | refuse | refuse | refuse (also: object on missing or non-pixel layer, validation failure, missing/damaged/oversized embedded file, pool bounds) | refuse |
@@ -430,7 +432,7 @@ None. The format contains no thumbnail, preview image or composite. (`aurora-app
 
 ### 7.5 Clipping
 
-`LayerEntry::clipped` is not in the manifest. The `layer-clipping` entry (`aur.rs:417`) is `postcard` `{ version: u32 = 1, clipped: Vec<u64> }`: the raw ids of the layers clipped to the layer beneath them. It is written only for layers that **have** an unclipped base (`clip_base(id).is_some()`), so a flagged layer with nothing beneath it is not written. A reader applies each id with `LayerTree::set_clipped(id, true)`, which refuses (and thereby refuses the whole open): an unknown id, a group, a layer with no sibling beneath it. The *base* of a clipped layer is the nearest layer beneath it in its own sibling list that is not itself clipped (`LayerTree::clip_base`); the file stores only the flag. Introduced 0.201.0. The corresponding journal carrier is `SetClipped` (ordinal 18).
+`LayerEntry::clipped` is not in the manifest. The `layer-clipping` entry (`aur.rs:417`) is `postcard` `{ version: u32 = 1, clipped: Vec<u64> }`: the raw ids of the layers clipped to the layer beneath them. It is written only for layers that **have** an unclipped base (`clip_base(id).is_some()`), so a flagged layer with nothing beneath it is not written. A reader applies each id with `LayerTree::set_clipped(id, true)`, which refuses (and thereby refuses the whole open): an unknown id, a layer or group with no sibling beneath it (a group can be clipped since task 149). The *base* of a clipped layer is the nearest layer beneath it in its own sibling list that is not itself clipped (`LayerTree::clip_base`); the file stores only the flag. Introduced 0.201.0. The corresponding journal carrier is `SetClipped` (ordinal 18).
 
 ### 7.6 Layer effects
 
@@ -521,6 +523,10 @@ See 7.6. Cap 16 MiB (`MAX_LAYER_EFFECTS_BYTES`).
 ### 8.4 `layer-clipping`
 
 See 7.5. Cap 16 MiB (`MAX_LAYER_CLIPPING_BYTES`).
+
+### 8.4a `layer-blend-options`
+
+Task 149. `LayerEntry::blend_options` (`aurora_doc::LayerBlendOptions`, Photoshop's "Blend Interior Effects as Group" on and "Blend Clipped Layers as Group" off) is `#[serde(skip)]`, so it is not in the manifest. The entry is `postcard` `{ version: u32 = 1, options: Vec<(u64 layer id, (bool interior_as_group, bool clipped_separately))> }`, one pair per layer whose options are not both `false`, in pre-order. It is written only when some layer has a non-default value, so every other save is byte-identical to before; a file without it opens with the defaults. A reader applies each pair with `LayerTree::set_blend_options` and refuses the file for an unknown layer id or a version it does not know. Cap 16 MiB (`MAX_LAYER_BLEND_OPTIONS_BYTES`). The journal carrier is `LayerOp::SetBlendOptions { id, value }` (ordinal 24, appended after `SetGradientRamps`), emitted by `save_journal` only after a journaled `Restore` of a layer with non-default options; an older Aurora refuses a journal that holds it. The PSD blocks are `infx` (non-zero = on) and `clbl` (zero = blended separately).
 
 ### 8.5 `smart-objects` and `smart-object-file-<n>`
 
@@ -696,6 +702,7 @@ Aurora version numbers (SemVer, from 0.0.1; the first implementation predates th
 | `smart-objects`, `smart-object-file-<n>`, `SetSmartObject` op (17) | entries, op | 0.200.0 | ADR; commit `05deaae` |
 | `layer-clipping`, `SetClipped` op (18) | entry, op | 0.201.0 | ADR; commit `e5a6505` |
 | `Adjustment::Levels` (1) | variant | 0.202.0 | ADR |
+| `layer-blend-options`, `SetBlendOptions` op (24) | entry, op | task 149 | section 8.4a |
 | `Adjustment::HueSaturation` (2) | variant | 0.203.0 | ADR |
 | `Adjustment::HueSaturationRanges` (3) | variant | 0.204.0 | ADR |
 | `selection` | entry | 0.218.0 | ADR; commit `dd00fc4` |

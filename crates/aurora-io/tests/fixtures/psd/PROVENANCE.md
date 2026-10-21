@@ -37,3 +37,4 @@ values in those tests were read independently with psd-tools 1.17.4.
 | `4x4_8bit_index_color.psd` | `1da88234b4c1d33ef2fed6a3a496f68e3c28c0bce420400917736e9b72f194cc` |
 | `4x4_16bit_multichannel.psd` | `36730fdab702fbbde8f8b96451d1099186a4443d02180119542ed50aab34c88d` |
 | `4x4_8bit_duotone.psd` | `4169c367a7e4698f55955901849c38b8bd284dd61f8ddcbef8bafa70e54bb19b` |
+| `double-stroke-effects.psd` | `f7c0631ead3370a97aa445f610665796d14475528acc1184e276dd5d3f47ca3e` |
