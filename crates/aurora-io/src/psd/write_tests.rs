@@ -2580,3 +2580,91 @@ fn a_transparency_lock_sets_record_flag_bit_0_and_nothing_else() {
     let record = parse_record(&bytes, first_record(&bytes));
     assert_eq!(record.flags, 0x01);
 }
+
+// ---------------------------------------------------------------------
+// Advanced blending: `infx` and `clbl` (task 149)
+// ---------------------------------------------------------------------
+
+/// Both check boxes survive a save: written only when not Photoshop's
+/// default (`infx` on, `clbl` off), the file verifies (raw and reader
+/// passes) and reads back equal; a default layer writes neither block.
+#[test]
+fn infx_and_clbl_round_trip_through_write_and_read_and_verify() {
+    use aurora_doc::LayerBlendOptions;
+    for bits in 0..4u8 {
+        let options = LayerBlendOptions {
+            interior_as_group: bits & 1 != 0,
+            clipped_separately: bits & 2 != 0,
+        };
+        let mut doc = flat_doc();
+        let roots = doc.tree.roots().to_vec();
+        for id in roots.iter().copied() {
+            ok(doc.tree.set_blend_options(id, options));
+        }
+        let dir = ok(tempfile::tempdir());
+        let target = dir.path().join("blend-options.psd");
+        let outcome = ok(save(&mut doc, &target, false));
+        assert!(outcome.report.is_empty(), "{:?}", outcome.report);
+        let bytes = ok(std::fs::read(&target));
+        let back = read_back(&bytes);
+        for id in back.layers.roots() {
+            assert_eq!(back.layers.blend_options(*id), options, "{options:?}");
+        }
+        assert_eq!(
+            bytes.windows(4).any(|w| w == b"infx"),
+            options.interior_as_group
+        );
+        assert_eq!(
+            bytes.windows(4).any(|w| w == b"clbl"),
+            options.clipped_separately
+        );
+    }
+}
+
+/// The reader takes the blocks' first byte: `infx` non-zero is on, `clbl`
+/// zero is "separately", an absent block is the default, and a one-byte
+/// `clbl` of 1 is the default too.
+#[test]
+fn the_reader_maps_infx_and_clbl_bytes_to_the_blend_options() {
+    let layer = |name: &str, blocks: Vec<([u8; 4], Vec<u8>)>| {
+        TestLayer::pixels(name, 0, 0, 1, 1, 8, &[[0, 0, 0, 255]]).with(|l| l.blocks = blocks)
+    };
+    let bytes = TestPsd::new(1, 2, 2, 8)
+        .with(|p| {
+            p.layers.push(layer("plain", Vec::new()));
+            p.layers.push(layer(
+                "defaults",
+                vec![(*b"infx", vec![0, 0, 0, 0]), (*b"clbl", vec![1, 0, 0, 0])],
+            ));
+            p.layers.push(layer(
+                "both",
+                vec![(*b"infx", vec![1, 0, 0, 0]), (*b"clbl", vec![0, 0, 0, 0])],
+            ));
+        })
+        .write();
+    let document = ok(super::read(&bytes));
+    let tree = &document.layers;
+    let options = |name: &str| {
+        let id = tree
+            .roots()
+            .iter()
+            .copied()
+            .find(|id| tree.name(*id) == Some(name));
+        id.map(|id| tree.blend_options(id))
+    };
+    assert_eq!(
+        options("plain"),
+        Some(aurora_doc::LayerBlendOptions::default())
+    );
+    assert_eq!(
+        options("defaults"),
+        Some(aurora_doc::LayerBlendOptions::default())
+    );
+    assert_eq!(
+        options("both"),
+        Some(aurora_doc::LayerBlendOptions {
+            interior_as_group: true,
+            clipped_separately: true,
+        })
+    );
+}

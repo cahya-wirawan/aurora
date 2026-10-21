@@ -6632,6 +6632,87 @@ mod tests {
         assert!(read(Cursor::new(tampered), &mut fresh).is_err());
     }
 
+    /// Task 149: the advanced-blending options survive a save and reopen
+    /// (the optional `layer-blend-options` entry, the journal replay), an
+    /// untouched document writes no entry, and a newer entry version or an
+    /// unknown layer id refuses the file.
+    #[test]
+    fn round_trips_blend_options_and_refuses_a_newer_entry_version() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let mut add = |name: &str| match history.add_pixel_layer(&mut layers, name, bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let plain = add("plain");
+        let marked = add("marked");
+        let write_bytes = |layers: &LayerTree, history: &History, store: &mut TileStore| {
+            let mut bytes = Cursor::new(Vec::new());
+            if let Err(err) = write(
+                &mut bytes,
+                layers,
+                history,
+                (100, 100),
+                None,
+                &SkippedTiles::new(),
+                store,
+            ) {
+                unreachable!("{err:?}");
+            }
+            bytes.into_inner()
+        };
+        let untouched = write_bytes(&layers, &history, &mut store);
+        assert!(
+            effects_entry_names(&untouched)
+                .iter()
+                .all(|n| n != super::LAYER_BLEND_OPTIONS_ENTRY),
+            "default options write no entry"
+        );
+        let options = aurora_doc::LayerBlendOptions {
+            interior_as_group: true,
+            clipped_separately: true,
+        };
+        if let Err(err) = history.set_blend_options(&mut layers, marked, options) {
+            unreachable!("{err:?}");
+        }
+        let bytes = write_bytes(&layers, &history, &mut store);
+        assert!(
+            effects_entry_names(&bytes)
+                .iter()
+                .any(|n| n == super::LAYER_BLEND_OPTIONS_ENTRY)
+        );
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.clone()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(document.layers.blend_options(marked), options);
+        assert!(document.layers.blend_options(plain).is_default());
+        match document.history.replay() {
+            Ok(replayed) => assert_eq!(replayed.blend_options(marked), options),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        let tamper = |version: u32, id: u64| {
+            let payload = postcard::to_allocvec(&super::LayerBlendOptionsWire {
+                version,
+                options: vec![(id, options)],
+            })
+            .unwrap_or_default();
+            let tampered =
+                with_named_entry(&bytes, super::LAYER_BLEND_OPTIONS_ENTRY, Some(&payload));
+            let (_d, mut fresh) = real_tile_store();
+            read(Cursor::new(tampered), &mut fresh).is_ok()
+        };
+        assert!(tamper(super::LAYER_BLEND_OPTIONS_VERSION, marked.to_raw()));
+        assert!(!tamper(
+            super::LAYER_BLEND_OPTIONS_VERSION + 1,
+            marked.to_raw()
+        ));
+        assert!(!tamper(super::LAYER_BLEND_OPTIONS_VERSION, 9_999));
+    }
+
     /// 0.158.0: a Curves layer whose curves have **moved endpoints** (a
     /// PSD import's `curv`) survives a save and reopen — manifest and
     /// history — point for point. The points are stored as given, so a

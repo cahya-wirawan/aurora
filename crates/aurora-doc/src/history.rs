@@ -6491,6 +6491,97 @@ mod adjustment_tests {
             matches!(inverse.0, LayerOp::SetStrokePaints { ref value, .. } if value == &vec![None, Some(paint.clone())])
         );
     }
+    /// Task 149: `SetBlendOptions` is appended after `SetGradientRamps`, a
+    /// journaled `Restore` carries a non-default value through the journal,
+    /// a default one adds nothing, and undo restores the old value.
+    #[test]
+    fn set_blend_options_is_appended_and_the_journal_carries_the_options() {
+        use crate::layer::LayerBlendOptions;
+        let id = crate::LayerId::from_raw(3);
+        let ordinal = |op: &LayerOp| {
+            postcard::to_allocvec(op)
+                .ok()
+                .and_then(|b| b.first().copied())
+        };
+        let ramps = ordinal(&LayerOp::SetGradientRamps {
+            id,
+            overlays: None,
+            strokes: None,
+        });
+        let options = LayerBlendOptions {
+            interior_as_group: true,
+            clipped_separately: true,
+        };
+        let op = ordinal(&LayerOp::SetBlendOptions { id, value: options });
+        assert!(
+            ramps.is_some() && op == ramps.map(|p| p + 1),
+            "{ramps:?} {op:?}"
+        );
+        // The wire is two bools, in declaration order.
+        assert_eq!(
+            postcard::to_allocvec(&options).unwrap_or_default(),
+            vec![1, 1]
+        );
+
+        let mut tree = crate::LayerTree::new();
+        let mut history = History::new();
+        let layer = match history.add_pixel_layer(&mut tree, "p", bounds(), None) {
+            Ok(layer) => layer,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let base_journal = history.save_journal().unwrap_or_default();
+        if let Err(err) = history.set_blend_options(&mut tree, layer, options) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.blend_options(layer), options);
+        let journal = history.save_journal().unwrap_or_default();
+        assert_ne!(journal, base_journal);
+        match History::load_journal(&journal).and_then(|h| h.replay()) {
+            Ok(replayed) => assert_eq!(replayed.blend_options(layer), options),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        // Undo puts the default back.
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert!(tree.blend_options(layer).is_default());
+        // A tree that never set the options journals the bytes older
+        // builds wrote: no op, nothing added by a Restore of default entries.
+        assert!(
+            !format!(
+                "{:?}",
+                History::load_journal(&base_journal).map(|h| h.journal_descriptions())
+            )
+            .contains("advanced blending")
+        );
+    }
+
+    /// Task 149: removing a layer that holds non-default blend options and
+    /// undoing the removal (a journaled `Restore`) keeps them through the
+    /// wire, which skips the field.
+    #[test]
+    fn blend_options_survive_a_restore_through_the_journal() {
+        use crate::layer::LayerBlendOptions;
+        let options = LayerBlendOptions {
+            interior_as_group: true,
+            clipped_separately: false,
+        };
+        let mut tree = crate::LayerTree::new();
+        let mut history = History::new();
+        let layer = match history.add_pixel_layer(&mut tree, "p", bounds(), None) {
+            Ok(layer) => layer,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let _other = history.add_pixel_layer(&mut tree, "q", bounds(), None);
+        assert!(history.set_blend_options(&mut tree, layer, options).is_ok());
+        assert!(history.remove(&mut tree, layer).is_ok());
+        assert!(history.undo(&mut tree).is_ok());
+        assert_eq!(tree.blend_options(layer), options);
+        let loaded = History::load_journal(&history.save_journal().unwrap_or_default());
+        let replayed = loaded.ok().and_then(|h| h.replay().ok());
+        assert!(replayed.is_some_and(|t| t.blend_options(layer) == options));
+    }
+
     /// Task 147: `SetGradientRamps` is appended after `SetStrokePaints`, the
     /// journal carries the smoothed-ramp flags the wire skips, and a journal
     /// with only straight ramps is the one older builds wrote (no such op).
