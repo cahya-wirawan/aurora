@@ -61,12 +61,15 @@ fn error_by_hidden_layer_for_named_files() {
 /// follow the stored angle, a pattern fill and a pattern/gradient overlay.
 /// Task 149 adds `advanced-blending.psd`: 58.26 before, 0.01 after (`infx`
 /// and `clbl`); its one-texel maximum is a rounded edge.
-const SHAPE_FIDELITY: [(&str, f64, f64); 5] = [
+const SHAPE_FIDELITY: [(&str, f64, f64); 6] = [
     ("vector-mask2.psd", 5.0, 70.0),
     ("colormodes/4x4_16bit_rgb.psd", 28.0, 135.0),
     ("colormodes/4x4_16bit_grayscale.psd", 18.0, 45.0),
     ("artboard-bgcolor.psd", 0.05, 1.0),
     ("advanced-blending.psd", 0.05, 150.0),
+    // 20.60 before the stored pixels of a shape layer replaced its
+    // rasterised path (task 149).
+    ("effects/double-stroke-effects.psd", 0.05, 3.0),
 ];
 
 #[test]

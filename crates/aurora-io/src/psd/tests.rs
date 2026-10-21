@@ -2814,6 +2814,35 @@ fn a_bezier_ellipse_is_filled_as_a_curve_not_as_its_knot_polygon() {
     assert!(partial);
 }
 
+/// Task 149: a record flagged "pixel data irrelevant" (a shape layer) that
+/// stores pixels already holds Photoshop's rendering of the shape, so its
+/// vector mask is not rasterised and applied again; the same layer without
+/// the flag is an ordinary pixel layer and is masked.
+#[test]
+fn a_shape_layers_stored_pixels_are_not_cut_by_its_vector_mask() {
+    let block = vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1));
+    let masked = doc(&vector_file(8, 8, block.clone()).write());
+    assert!(masked.layers.mask(root(&masked.layers, 0)).is_some());
+    let mut shape = vector_file(8, 8, block);
+    for layer in &mut shape.layers {
+        layer.flags |= 0x10;
+    }
+    let shape = doc(&shape.write());
+    assert!(shape.layers.mask(root(&shape.layers, 0)).is_none());
+    // The real fixture: psd-tools' `double-stroke-effects.psd`, one shape
+    // layer whose stored rectangle is 25 px wide against a 24 px path.
+    let file = doc(include_bytes!(
+        "../../tests/fixtures/psd/double-stroke-effects.psd"
+    ));
+    let rectangle = file
+        .layers
+        .roots()
+        .iter()
+        .copied()
+        .find(|id| file.layers.name(*id) == Some("Rectangle 1"));
+    assert!(rectangle.is_some_and(|id| file.layers.mask(id).is_none()));
+}
+
 #[test]
 fn an_inverted_vector_mask_shows_outside_and_hides_inside() {
     let file = vector_file(8, 8, vmsk(1, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));

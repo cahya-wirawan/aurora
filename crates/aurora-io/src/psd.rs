@@ -231,6 +231,10 @@ const MASK_INVERT: u8 = 0x04;
 /// Photoshop's own rendering of that vector mask (combined with the real
 /// user mask, which is then channel `-3`), not a separate pixel mask.
 const MASK_FROM_RENDER: u8 = 0x08;
+
+/// The layer record's flags bit 4: the pixel data is irrelevant to the
+/// document's appearance, set on shape layers (task 149).
+const SHAPE_PIXELS_IRRELEVANT: u8 = 0x10;
 /// Mask flags bit 4: a mask-parameter block (density, feather) follows.
 const MASK_PARAMETERS: u8 = 0x10;
 
@@ -4765,6 +4769,17 @@ fn vector_for(
     budget: &mut vector::Budget,
 ) -> Result<Option<vector::Raster>, VectorSkip> {
     if record.features.fill {
+        return Ok(None);
+    }
+    // Task 149: a shape layer (the record's "pixel data irrelevant" flag,
+    // bit 4, which psd-tools also uses to call a record a shape) that
+    // stores pixels already holds Photoshop's own rendering of the shape,
+    // edge pixels included. Applying our rasterisation of the path on top
+    // only cut those edge pixels (`double-stroke-effects.psd`: the stored
+    // rectangle is 25 px wide, the rasterised path 24, and Photoshop's
+    // merged image shows 25), and every layer effect then sat one pixel
+    // inside.
+    if record.flags & SHAPE_PIXELS_IRRELEVANT != 0 && record.area() > 0 {
         return Ok(None);
     }
     let Some(data) = record.vector.as_deref() else {
