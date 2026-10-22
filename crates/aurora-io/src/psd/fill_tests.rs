@@ -203,7 +203,7 @@ fn a_vector_mask_density_lets_the_hidden_area_show_through_the_baked_fill() {
 }
 
 #[test]
-fn a_vector_mask_feather_on_a_baked_fill_is_reported() {
+fn a_vector_mask_feather_on_a_baked_fill_is_applied_and_not_reported() {
     let mut file = empty_fill_file(
         8,
         8,
@@ -217,8 +217,16 @@ fn a_vector_mask_feather_on_a_baked_fill_is_reported() {
         tail.extend_from_slice(&1.5_f64.to_be_bytes());
         layer.mask_tail = Some(tail);
     }
-    let text = report_text(&doc(&file.write()));
-    assert!(text.contains("feather"), "{text}");
+    let document = doc(&file.write());
+    // The rectangle covers pixels 2..6; a feather of 1.5 px spreads its
+    // edge outward (task 150), so a pixel just outside is partly covered
+    // and the edge pixel inside is no longer fully covered.
+    let outside = fill_px(&document, 1, 4).map_or(f32::NAN, |p| p[3]);
+    let edge = fill_px(&document, 2, 4).map_or(f32::NAN, |p| p[3]);
+    assert!(outside > f(0.0) && outside < f(0.5), "outside {outside}");
+    assert!(edge < f(1.0) && edge >= f(0.5), "edge {edge}");
+    let text = report_text(&document);
+    assert!(!text.contains("feather"), "applied, so not reported: {text}");
 }
 
 #[test]
@@ -876,4 +884,142 @@ fn a_drawn_fill_with_partial_smoothness_reports_it() {
             "{intr:?}: {text}"
         );
     }
+}
+
+/// A shape layer that stores pixels for its own box (flags bit 4, a
+/// `SoCo` fill and a `vmsk` path), with an optional mask record and
+/// parameter block.
+fn stored_shape_file(mask_tail: Option<Vec<u8>>) -> TestPsd {
+    stored_shape_file_flagged(mask_tail, 0x10)
+}
+
+fn stored_shape_file_flagged(mask_tail: Option<Vec<u8>>, flags: u8) -> TestPsd {
+    TestPsd::new(1, 8, 8, 8).with(|p| {
+        p.layers.push(
+            TestLayer::pixels("shape", 2, 2, 4, 4, 8, &[[255, 0, 0, 255]; 16]).with(|l| {
+                l.flags = flags;
+                l.blocks.push((*b"SoCo", solid_block(255.0, 0.0, 0.0)));
+                l.blocks
+                    .push((*b"vmsk", vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1))));
+                if let Some(tail) = mask_tail {
+                    l.mask = Some((0, 0, 0, 0, 0, 0x10));
+                    l.mask_tail = Some(tail);
+                }
+            }),
+        );
+    })
+}
+
+#[test]
+fn a_stored_shape_with_a_vector_density_below_full_spreads_its_fill_over_the_canvas() {
+    // Task 150, `layer_mask_data.psd` layer "1": the stored pixels cover
+    // the shape's box only, Photoshop shows the fill everywhere at
+    // `1 - density`.
+    let d = 128.0_f32 / 255.0;
+    let document = doc(&stored_shape_file(Some(vec![0x04, 128])).write());
+    let outside = fill_px(&document, 0, 0).map_or(f32::NAN, |p| p[3]);
+    let inside = fill_px(&document, 4, 4).map_or(f32::NAN, |p| p[3]);
+    assert_eq!(outside, f(1.0 - d), "the fill shows through outside");
+    assert_eq!(inside, f(1.0));
+    // Full density (or none) keeps the stored pixels: nothing outside them.
+    for tail in [Some(vec![0x04, 255]), None] {
+        let document = doc(&stored_shape_file(tail).write());
+        assert!(
+            fill_px(&document, 0, 0).is_none_or(|p| p[3] == 0.0),
+            "stored pixels only"
+        );
+        assert_eq!(fill_px(&document, 3, 3).map(|p| p[3]), Some(f(1.0)));
+    }
+}
+
+#[test]
+fn a_stored_shape_with_a_vector_feather_is_drawn_blurred_from_its_path() {
+    let mut tail = vec![0x08];
+    tail.extend_from_slice(&1.5_f64.to_be_bytes());
+    let document = doc(&stored_shape_file(Some(tail)).write());
+    // The 4 x 4 box (pixels 2..6) is blurred outward and inward.
+    let outside = fill_px(&document, 1, 3).map_or(f32::NAN, |p| p[3]);
+    let centre = fill_px(&document, 3, 3).map_or(f32::NAN, |p| p[3]);
+    assert!(outside > f(0.05), "spreads outward: {outside}");
+    assert!(centre < f(1.0), "and softens the inside: {centre}");
+}
+
+#[test]
+fn a_user_mask_feather_blurs_the_mask_beyond_its_rectangle() {
+    // A plane that is shown in a 2 x 2 rectangle, hidden beyond, with a
+    // user feather of 2.0 (flags bit 1 of the parameter block).
+    let mut tail = vec![0x02];
+    tail.extend_from_slice(&2.0_f64.to_be_bytes());
+    let file = TestPsd::new(1, 8, 8, 8).with(|p| {
+        p.layers.push(
+            TestLayer::pixels("m", 0, 0, 8, 8, 8, &[[10, 20, 30, 255]; 64]).with(|l| {
+                l.mask = Some((3, 3, 5, 5, 0, 0x10));
+                l.mask_tail = Some(tail.clone());
+                l.channels.push((-2, vec![255; 4]));
+            }),
+        );
+    });
+    let document = doc(&file.write());
+    let id = root(&document.layers, 0);
+    let centre = effective_mask(&document, id, 3, 3).unwrap_or(f32::NAN);
+    let beside = effective_mask(&document, id, 1, 3).unwrap_or(f32::NAN);
+    let far = effective_mask(&document, id, 7, 7).unwrap_or(f32::NAN);
+    assert!(centre > 0.0 && centre < 1.0, "softened: {centre}");
+    assert!(beside > 0.0 && beside < centre, "spread outward: {beside}");
+    assert!(far < beside);
+    let text = report_text(&document);
+    assert!(!text.contains("feather"), "applied, so not reported: {text}");
+}
+
+#[test]
+fn a_feathered_mask_shown_outside_its_rectangle_stays_shown_far_away() {
+    // A 2 x 2 hole (hidden) in a mask whose default colour is shown, with a
+    // user feather of 1.5: the hole softens and the far corner stays 1.
+    let mut tail = vec![0x02];
+    tail.extend_from_slice(&1.5_f64.to_be_bytes());
+    let file = TestPsd::new(1, 12, 12, 8).with(|p| {
+        p.layers.push(
+            TestLayer::pixels("m", 0, 0, 12, 12, 8, &[[10, 20, 30, 255]; 144]).with(|l| {
+                l.mask = Some((5, 5, 7, 7, 255, 0x10));
+                l.mask_tail = Some(tail.clone());
+                l.channels.push((-2, vec![0; 4]));
+            }),
+        );
+    });
+    let document = doc(&file.write());
+    let id = root(&document.layers, 0);
+    let at = |x, y| effective_mask(&document, id, x, y).unwrap_or(f32::NAN);
+    assert!(at(5, 5) > 0.0 && at(5, 5) < 0.9, "softened hole {}", at(5, 5));
+    assert!(at(4, 5) > 0.0 && at(4, 5) < 1.0, "spread outward {}", at(4, 5));
+    assert_eq!(at(0, 0), 1.0, "far away still shown");
+    assert_eq!(at(11, 11), 1.0);
+}
+
+#[test]
+fn only_a_flagged_shape_spreads_and_a_feather_that_is_too_large_is_reported() {
+    // Without the pixel-data-irrelevant flag the layer is an ordinary fill
+    // layer with pixels: the stored pixels stay (nothing spreads).
+    let document = doc(&stored_shape_file_flagged(Some(vec![0x04, 128]), 0).write());
+    assert!(
+        fill_px(&document, 0, 0).is_none_or(|p| p[3] == 0.0),
+        "an unflagged layer keeps its pixels"
+    );
+    // A feather over the cap leaves the mask hard-edged and says so.
+    let mut tail = vec![0x02];
+    tail.extend_from_slice(&((super::feather::MAX_SIGMA + 1.0).to_be_bytes()));
+    let file = TestPsd::new(1, 8, 8, 8).with(|p| {
+        p.layers.push(
+            TestLayer::pixels("m", 0, 0, 8, 8, 8, &[[10, 20, 30, 255]; 64]).with(|l| {
+                l.mask = Some((3, 3, 5, 5, 0, 0x10));
+                l.mask_tail = Some(tail.clone());
+                l.channels.push((-2, vec![255; 4]));
+            }),
+        );
+    });
+    let document = doc(&file.write());
+    let id = root(&document.layers, 0);
+    assert_eq!(effective_mask(&document, id, 1, 3), Some(0.0), "hard-edged");
+    assert_eq!(effective_mask(&document, id, 3, 3), Some(1.0));
+    let text = report_text(&document);
+    assert!(text.contains("a feather too large or too costly"), "{text}");
 }

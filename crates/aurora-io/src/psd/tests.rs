@@ -1926,7 +1926,7 @@ fn mask_density_applies_to_the_coverage_after_the_files_invert_flag() {
 }
 
 #[test]
-fn feather_and_unused_vector_parameters_are_still_reported_and_density_is_not() {
+fn unused_vector_density_is_reported_and_applied_feathers_and_densities_are_not() {
     let feather = |flag: u8, lead: &[u8], value: f64| {
         let mut tail = vec![flag];
         tail.extend_from_slice(lead);
@@ -1935,7 +1935,8 @@ fn feather_and_unused_vector_parameters_are_still_reported_and_density_is_not() 
     };
     let full = Some(1.0);
     for (what, tail, density, reported) in [
-        ("user feather", feather(0x02, &[], 2.5), full, true),
+        // Applied since task 150, so not reported.
+        ("user feather", feather(0x02, &[], 2.5), full, false),
         (
             "density + zero feather",
             feather(0x03, &[128], 0.0),
@@ -1962,7 +1963,7 @@ fn feather_and_unused_vector_parameters_are_still_reported_and_density_is_not() 
             Some(128.0 / 255.0),
             false,
         ),
-        ("vector feather", feather(0x08, &[], 1.0), full, true),
+        ("vector feather", feather(0x08, &[], 1.0), full, false),
         ("vector zero feather", feather(0x08, &[], 0.0), full, false),
         ("full density", vec![0x01, 255], full, false),
         ("nothing present", vec![0x00], full, false),
@@ -1971,7 +1972,7 @@ fn feather_and_unused_vector_parameters_are_still_reported_and_density_is_not() 
         assert_eq!(only_density(&document), density, "{what}");
         let text = report_text(&document);
         assert_eq!(
-            text.contains("feather or a vector-mask density"),
+            text.contains("a vector-mask density that Aurora doesn't apply"),
             reported,
             "{what}: {text}"
         );
@@ -2143,27 +2144,9 @@ fn corpus_mask_densities_and_effective_coverage_match_psd_tools() {
             (15, 16, 32, 24),
             130.007_843,
         ),
-        (
-            "layer_mask_data.psd",
-            "1",
-            204,
-            (12, 17, 68, 179),
-            7_104.141_179,
-        ),
-        (
-            "layer_mask_data.psd",
-            "2",
-            230,
-            (22, 11, 179, 59),
-            6_064.795_85,
-        ),
-        (
-            "layer_mask_data.psd",
-            "4",
-            191,
-            (12, 141, 188, 191),
-            6_541.570_782,
-        ),
+        // `layer_mask_data.psd` layers "2" and "4" have feathers, which
+        // psd-tools ignores and Aurora applies since task 150 (the sums
+        // differ by the blur), and layer "1" is drawn from its fill.
     ];
     for &(file, layer, byte, (x0, y0, x1, y1), want) in cases {
         let bytes = match std::fs::read(dir.join(file)) {
@@ -3677,7 +3660,7 @@ fn corpus_vector_masks_match_psd_tools_and_photoshops_own_rendering() {
 }
 
 #[test]
-fn applied_densities_are_not_reported_and_a_vector_feather_is() {
+fn applied_densities_and_feathers_are_not_reported() {
     // Both masks, both densities baked (the rendered-mask fixture): no
     // parameter line at all.
     let mut file = vector_file(8, 8, vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
@@ -3705,8 +3688,8 @@ fn applied_densities_are_not_reported_and_a_vector_feather_is() {
     }
     let text = report_text(&doc(&file.write()));
     assert!(
-        text.contains("1 layer mask uses a feather, which"),
-        "{text}"
+        !text.contains("feather"),
+        "applied, so not reported: {text}"
     );
     assert!(!text.contains("density"), "{text}");
 }
@@ -5765,3 +5748,66 @@ fn a_ranged_hue_saturation_layer_opens_as_an_adjustment_and_is_not_reported() {
 }
 
 include!("fill_tests.rs");
+
+/// Task 150: both masks on a vector layer, each with its own feather. The
+/// vector mask (pixels 2..6 of 8) and a user mask (`-3`, rows 0..4 shown,
+/// hidden beyond) are combined as `user x vector`.
+#[test]
+fn a_vector_layers_user_and_vector_feathers_are_each_applied() {
+    let mut file = vector_file(8, 8, vmsk(0, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask = Some((0, 0, 8, 8, 0, 0x18));
+        let mut tail = vec![0x00, 0];
+        for v in [0_i32, 0, 4, 8] {
+            tail.extend_from_slice(&v.to_be_bytes());
+        }
+        tail.push(0x0A);
+        tail.extend_from_slice(&1.5_f64.to_be_bytes());
+        tail.extend_from_slice(&1.0_f64.to_be_bytes());
+        layer.mask_tail = Some(tail);
+        layer.channels.push((-2, vec![255; 64]));
+        layer.channels.push((-3, vec![255; 32]));
+    }
+    let document = doc(&file.write());
+    let id = root(&document.layers, 0);
+    let at = |x, y| effective_mask(&document, id, x, y).unwrap_or(f32::NAN);
+    // The user mask ends at row 4: its feather spreads into row 4, where the
+    // vector mask is fully shown, and softens row 3 (inside both).
+    assert!(
+        at(3, 4) > 0.05,
+        "user feather spreads past its edge: {}",
+        at(3, 4)
+    );
+    assert!(at(3, 3) < 1.0, "and softens inside it: {}", at(3, 3));
+    // The vector mask's feather spreads left of column 2, in rows both show.
+    assert!(
+        at(1, 2) > 0.05,
+        "vector feather spreads outward: {}",
+        at(1, 2)
+    );
+    let text = report_text(&document);
+    assert!(!text.contains("feather"), "{text}");
+}
+
+/// Task 150: a feathered, inverted vector mask keeps what lies outside its
+/// raster shown, right up to the raster's own edge.
+#[test]
+fn a_feathered_inverted_vector_mask_stays_shown_outside_its_raster() {
+    let mut file = vector_file(8, 8, vmsk(1, &rect_path(0.25, 0.25, 0.75, 0.75, 1)));
+    if let Some(layer) = file.layers.first_mut() {
+        layer.mask = Some((0, 0, 0, 0, 0, 0x10));
+        let mut tail = vec![0x08];
+        tail.extend_from_slice(&1.0_f64.to_be_bytes());
+        layer.mask_tail = Some(tail);
+    }
+    let document = doc(&file.write());
+    let id = root(&document.layers, 0);
+    let at = |x, y| effective_mask(&document, id, x, y).unwrap_or(f32::NAN);
+    assert!(at(0, 0) > 0.95, "shown outside: {}", at(0, 0));
+    assert!(at(7, 7) > 0.95, "shown outside: {}", at(7, 7));
+    assert!(
+        at(4, 4) < 0.2,
+        "hidden inside the inverted shape: {}",
+        at(4, 4)
+    );
+}

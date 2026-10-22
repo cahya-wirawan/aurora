@@ -142,6 +142,7 @@ mod descriptor;
 mod effects;
 #[cfg(test)]
 mod effects_tests;
+mod feather;
 mod fill;
 #[cfg(test)]
 mod gradient_lookup_tests;
@@ -931,13 +932,13 @@ fn note_text(note: Note, n: u64) -> String {
              can't be edited."
         ),
         Note::MaskParametersNotApplied => format!(
-            "{n} layer mask{s} use{} a feather or a vector-mask density, which Aurora doesn't \
-             apply yet; {} applied with hard edges.",
+            "{n} layer mask{s} use{} a vector-mask density that Aurora doesn't apply yet; {} \
+             applied without it.",
             if one { "s" } else { "" },
             if one { "it is" } else { "they are" },
         ),
         Note::FeatherNotApplied => format!(
-            "{n} layer mask{s} use{} a feather, which Aurora doesn't apply yet; {} applied \
+            "{n} layer mask{s} use{} a feather too large or too costly to apply; {} applied \
              with hard edges.",
             if one { "s" } else { "" },
             if one { "it is" } else { "they are" },
@@ -1812,13 +1813,11 @@ impl MaskParameters {
     }
 
     /// Whether the block asks for anything Aurora does not apply: a
-    /// non-zero user or vector feather, or a vector-mask density that
-    /// [`Self::applied_density`] did not already use (a user density is
-    /// there too) and that is below full.
+    /// vector-mask density that [`Self::applied_density`] did not already
+    /// use (a user density is there too) and that is below full. Feathers
+    /// are applied since task 150 ([`feather`]).
     fn has_unapplied(self) -> bool {
-        feathered(self.user_feather)
-            || feathered(self.vector_feather)
-            || (self.user_density.is_some() && self.vector_density.is_some_and(|d| d != u8::MAX))
+        self.user_density.is_some() && self.vector_density.is_some_and(|d| d != u8::MAX)
     }
 }
 
@@ -4078,14 +4077,6 @@ fn note_unsupported_kept(
     // (`masks_for`), so only a feather of a part actually used is left —
     // also when there is no `-2` channel at all.
     if let Some(mask) = record.mask
-        && outcome.vector_applied
-    {
-        let p = mask.parameters;
-        if feathered(p.vector_feather) || (outcome.pixel_used && feathered(p.user_feather)) {
-            notes.add(Note::FeatherNotApplied);
-        }
-    }
-    if let Some(mask) = record.mask
         && record.has_channel(-2)
     {
         if !outcome.vector_applied && mask.parameters.has_unapplied() {
@@ -4458,7 +4449,7 @@ fn layer_node(
         notes.add(Note::AdjustmentSkipped);
         return None;
     }
-    if record.features.fill && record.area() == 0 {
+    if record.features.fill && (record.area() == 0 || shape_mask_spreads(record)) {
         return drawn_fill_node(src, record, header, notes, vector_budget, cmyk);
     }
     // Located, not decoded (0.154.0): `decode` or `read_streaming`
@@ -4506,6 +4497,24 @@ fn layer_node(
     }))
 }
 
+/// A shape layer whose stored pixels cannot be used because its vector
+/// mask reaches beyond them (task 150): a vector-mask density below 100 %
+/// lets the fill show through everywhere outside the shape, and a feather
+/// blurs the shape's edge outward. Photoshop's stored pixels cover only
+/// the shape's own box, but its merged image shows the fill across the
+/// whole canvas (`layer_mask_data.psd`: a blue shape with vector density
+/// 204 tints the entire canvas by 20 %), so such a layer is drawn from its
+/// fill and path, like a layer that stores no pixels.
+fn shape_mask_spreads(record: &Record) -> bool {
+    record.flags & SHAPE_PIXELS_IRRELEVANT != 0
+        && record.features.vector_mask
+        && record.vector.is_some()
+        && record.mask.is_some_and(|m| {
+            m.parameters.vector_density.is_some_and(|d| d != u8::MAX)
+                || feathered(m.parameters.vector_feather)
+        })
+}
+
 /// The reference box of a drawn fill: a gradient's (the vector path's bounds;
 /// with no path, a raster user mask's rectangle, the layer's extent in
 /// task 147: `gradient-fill.psd`, a 100 x 150 canvas whose gradient layer has
@@ -4539,6 +4548,7 @@ fn fill_reference(
 /// A shape or fill layer that stores no pixels (task 108), drawn from its
 /// solid colour or gradient and its vector mask as an ordinary pixel layer.
 /// What cannot be drawn is left out and reported, as before.
+#[allow(clippy::too_many_lines)]
 fn drawn_fill_node(
     src: &mut dyn ByteSource,
     record: &Record,
@@ -4574,7 +4584,10 @@ fn drawn_fill_node(
             Ok(path) if !path.disable => {
                 raster = match vector::rasterize(&path, header.width, header.height, vector_budget)
                 {
-                    Ok(r) => Some(r),
+                    Ok(r) => {
+                        let feather = record.mask.and_then(|m| m.parameters.vector_feather);
+                        Some(feather_raster(r, feather, vector_budget, notes))
+                    }
                     Err(_) => return left_out(notes, fill::LeftOut::TooLarge),
                 };
                 path_box = vector::path_extent(&path, header.width, header.height);
@@ -4631,8 +4644,8 @@ fn drawn_fill_node(
                 notes.add(Note::MaskUnreadable);
                 None
             });
+        let mask = mask.map(|m| feather_psd_mask(m, params.user_feather, vector_budget, notes));
         MaskOutcome {
-            pixel_used: mask.is_some(),
             mask,
             vector_applied: true,
         }
@@ -4812,8 +4825,6 @@ struct MaskOutcome {
     mask: Option<PsdMask>,
     /// The vector mask was converted and is part of `mask`.
     vector_applied: bool,
-    /// A pixel (user) mask is part of `mask`.
-    pixel_used: bool,
 }
 
 /// The record's one Aurora mask (0.150.0). Without an applicable vector
@@ -4858,19 +4869,20 @@ fn masks_for(
             VectorSkip::Unreadable => Note::VectorMaskUnreadable,
             VectorSkip::TooLarge => Note::VectorMaskTooLarge,
         });
-        let mask = mask_or_report(src, record, header, notes);
+        let mask = mask_or_report(src, record, header, notes, budget);
         MaskOutcome {
-            pixel_used: mask.is_some(),
             mask,
             vector_applied: false,
         }
     };
     let raster = match vector_for(record, header, budget) {
-        Ok(Some(raster)) => raster,
+        Ok(Some(raster)) => {
+            let vector_feather = record.mask.and_then(|m| m.parameters.vector_feather);
+            feather_raster(raster, vector_feather, budget, notes)
+        }
         Ok(None) => {
-            let mask = mask_or_report(src, record, header, notes);
+            let mask = mask_or_report(src, record, header, notes, budget);
             return MaskOutcome {
-                pixel_used: mask.is_some(),
                 mask,
                 vector_applied: false,
             };
@@ -4888,7 +4900,9 @@ fn masks_for(
         }
         Err(PixelPart::TooLarge) => return fallback(src, notes, budget, VectorSkip::TooLarge),
     };
-    let pixel = pixel.filter(|m| m.flags & MASK_DISABLED == 0 && !is_identity(m));
+    let pixel = pixel
+        .filter(|m| m.flags & MASK_DISABLED == 0 && !is_identity(m))
+        .map(|m| feather_psd_mask(m, params.user_feather, budget, notes));
     let vector = PsdMask {
         bounds: raster.bounds,
         default_color: if raster.outside { u8::MAX } else { 0 },
@@ -4901,7 +4915,6 @@ fn masks_for(
         return MaskOutcome {
             mask: Some(vector),
             vector_applied: true,
-            pixel_used: false,
         };
     };
     if let Some(mask) = combine_masks(&pixel, &vector, region, &mut budget.pixels) {
@@ -4909,7 +4922,6 @@ fn masks_for(
         MaskOutcome {
             mask: Some(mask),
             vector_applied: true,
-            pixel_used: true,
         }
     } else {
         fallback(src, notes, budget, VectorSkip::TooLarge)
@@ -5070,11 +5082,90 @@ fn mask_or_report(
     record: &Record,
     header: Header,
     notes: &mut Notes,
+    budget: &mut vector::Budget,
 ) -> Option<PsdMask> {
-    decode_mask(src, record, header).unwrap_or_else(|_| {
+    let mask = decode_mask(src, record, header).unwrap_or_else(|_| {
         notes.add(Note::MaskUnreadable);
         None
-    })
+    })?;
+    // A `-2` channel flagged as Photoshop's rendering holds the vector
+    // mask (with the user mask), so the vector feather applies when there
+    // is one. The flag is set on the user mask of `layer_mask_data.psb`
+    // layer "2" too, which has only a user feather (6.0), and Photoshop's
+    // merged image shows it blurred, so that feather is the fallback.
+    let params = record.mask.map(|m| m.parameters).unwrap_or_default();
+    let feather = if mask.flags & MASK_FROM_RENDER != 0 {
+        params
+            .vector_feather
+            .filter(|f| *f != 0.0)
+            .or(params.user_feather)
+    } else {
+        params.user_feather
+    };
+    Some(feather_psd_mask(mask, feather, budget, notes))
+}
+
+/// A mask feathered (task 150): its coverage blurred by a Gaussian whose
+/// standard deviation is `feather` pixels (see [`feather`]), the bounds
+/// grown to hold the blur. A feather that is absent or zero changes
+/// nothing; one the bounds decline leaves the mask hard-edged and is
+/// reported.
+fn feather_psd_mask(
+    mut mask: PsdMask,
+    feather: Option<f64>,
+    budget: &mut vector::Budget,
+    notes: &mut Notes,
+) -> PsdMask {
+    let Some(sigma) = feather.filter(|f| *f != 0.0) else {
+        return mask;
+    };
+    let Some(plane) = mask.coverage.as_deref() else {
+        // No samples: a constant, which a blur leaves alone.
+        return mask;
+    };
+    let outside = if mask.default_color != 0 { 1.0 } else { 0.0 };
+    match feather::blur_plane(plane, mask.bounds, outside, sigma, &mut budget.pixels) {
+        Some((bounds, coverage)) => {
+            mask.bounds = bounds;
+            mask.coverage = Some(coverage);
+        }
+        None => notes.add(Note::FeatherNotApplied),
+    }
+    mask
+}
+
+/// [`feather_psd_mask`] for a rasterised vector mask. The extra budget
+/// the grown plane cost is added to its `charged`, so a caller that ends
+/// up not using the raster refunds it.
+fn feather_raster(
+    mut raster: vector::Raster,
+    feather: Option<f64>,
+    budget: &mut vector::Budget,
+    notes: &mut Notes,
+) -> vector::Raster {
+    let Some(sigma) = feather.filter(|f| *f != 0.0) else {
+        return raster;
+    };
+    if raster.coverage.is_empty() {
+        return raster;
+    }
+    let outside = if raster.outside { 1.0 } else { 0.0 };
+    let before = budget.pixels;
+    match feather::blur_plane(
+        &raster.coverage,
+        raster.bounds,
+        outside,
+        sigma,
+        &mut budget.pixels,
+    ) {
+        Some((bounds, coverage)) => {
+            raster.charged = raster.charged.saturating_add(before - budget.pixels);
+            raster.bounds = bounds;
+            raster.coverage = coverage;
+        }
+        None => notes.add(Note::FeatherNotApplied),
+    }
+    raster
 }
 
 // ---------------------------------------------------------------------
