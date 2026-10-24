@@ -9,6 +9,7 @@
 //! A diagnostic, like `bench_launch`'s hooks: it changes no behaviour.
 
 use std::cell::RefCell;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -130,15 +131,15 @@ pub(crate) fn end(label: &'static str) {
     );
     for (name, ms) in &open.marks {
         if *ms >= 0.5 {
-            line.push_str(&format!(" {name}={ms:.2}"));
+            let _ = write!(line, " {name}={ms:.2}");
         }
     }
     for (name, value) in &open.notes {
-        line.push_str(&format!(" #{name}={value}"));
+        let _ = write!(line, " #{name}={value}");
     }
     let rest = now.duration_since(open.last).as_secs_f64() * 1e3;
     if rest >= 0.5 {
-        line.push_str(&format!(" rest={rest:.2}"));
+        let _ = write!(line, " rest={rest:.2}");
     }
     line.push('\n');
     if let Ok(mut file) = sink.file.lock() {

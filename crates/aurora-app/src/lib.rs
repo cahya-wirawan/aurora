@@ -26479,6 +26479,23 @@ fn dispatch_or_composite_tiles(
     );
 }
 
+/// Whether the CPU path composites `uncovered` (stale tiles nothing in
+/// flight will deliver) on the UI thread this frame rather than leaving
+/// them to the background worker (task 152). Only a few tiles
+/// ([`background_composite::SYNC_TILE_LIMIT`], a dab's own), and only when
+/// every one of them already shows a composite (`shown`): an edit there
+/// must show at once. A tile coming into view for the first time (a pan
+/// or a zoom exposing it) shows nothing yet either way, so it waits for
+/// the worker like a larger exposure does: on the Nyepi template two such
+/// tiles cost the first pan frame 244 ms on the UI thread. Pure.
+fn composites_synchronously(
+    uncovered: &[aurora_tile::TileId],
+    shown: impl Fn(aurora_tile::TileId) -> bool,
+) -> bool {
+    uncovered.len() <= background_composite::SYNC_TILE_LIMIT
+        && uncovered.iter().all(|&tile| shown(tile))
+}
+
 /// [`dispatch_or_composite_tiles`] with the synchronous fallback for a
 /// refused dispatch bounded by `budget` (task 136 review, ZV-3: on the
 /// zoomed-out path the needed set can be the whole document, which the
@@ -26520,7 +26537,7 @@ fn dispatch_or_composite_tiles_bounded(
     if uncovered.is_empty() {
         return false;
     }
-    if uncovered.len() <= background_composite::SYNC_TILE_LIMIT {
+    if composites_synchronously(&uncovered, |tile| target.cache.has_shown(tile)) {
         recomposite_tiles(
             &uncovered,
             layers,
@@ -27138,6 +27155,14 @@ impl CompositeCache {
     fn mark_current(&mut self, id: aurora_tile::TileId) {
         self.current.insert(id);
         self.displayed.insert(id, self.stamp);
+    }
+
+    /// Whether tile `id` shows any composite at all, current or older
+    /// (task 152): a tile never composited since the cache was made shows
+    /// nothing. A bump keeps what tiles show, so it keeps this too.
+    #[must_use]
+    fn has_shown(&self, id: aurora_tile::TileId) -> bool {
+        self.displayed.contains_key(&id)
     }
 
     /// Whether tile `id` shows content older than `stamp` (or nothing).
@@ -99574,6 +99599,7 @@ mod menu_scroll_app_tests;
 
 /// The event loop's two hooks, wrapped by `frame_trace` (task 152).
 impl App {
+    #[allow(clippy::too_many_lines)]
     fn window_event_untraced(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         if let (Some(adapter), Some(window)) = (self.adapter.as_mut(), self.window.as_ref()) {
             adapter.process_event(window, &event);
@@ -99691,6 +99717,7 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn user_event_untraced(&mut self, _el: &ActiveEventLoop, event: AppEvent) {
         let event = match event {
             AppEvent::Accessibility(event) => event,
@@ -99722,6 +99749,7 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn about_to_wait_untraced(&mut self, el: &ActiveEventLoop) {
         // 0.213.0: a selection step undone or redone by a path that does
         // not own the selection (defensive; the known ones apply it).
