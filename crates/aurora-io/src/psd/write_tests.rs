@@ -823,6 +823,43 @@ fn big_endian_fields_are_big_endian() {
     );
 }
 
+/// Task 151: a shape layer whose effects follow a kept outline is saved with
+/// its pixels and effects only, and the report says the outline is not
+/// written; a layer without an outline adds no line.
+#[test]
+fn an_unwritten_effect_outline_is_itemised() {
+    let mut tree = LayerTree::new();
+    let shape = ok(tree.add_pixel_layer("Shape", rect(0, 0, 4, 4), None));
+    let plain = ok(tree.add_pixel_layer("Plain", rect(0, 0, 4, 4), None));
+    let opts = PsdSaveOptions::default();
+    let fx = || aurora_core::LayerEffects {
+        strokes: vec![aurora_core::effects::Stroke::default()],
+        ..aurora_core::LayerEffects::default()
+    };
+    ok(tree.set_effects(shape, Some(fx())));
+    ok(tree.set_effects(plain, Some(fx())));
+    let outline = ok(aurora_doc::EffectShape::new(
+        rect(0, 0, 2, 2),
+        vec![255; 4],
+        1,
+    ));
+    let without = ok(psd_save_preflight(&tree, (4, 4), opts));
+    assert!(!without.items.iter().any(|i| i.contains("vector outline")));
+    ok(tree.set_effect_shape(shape, Some(std::sync::Arc::new(outline))));
+    let with = ok(psd_save_preflight(&tree, (4, 4), opts));
+    let line: Vec<&String> = with
+        .items
+        .iter()
+        .filter(|i| i.contains("vector outline"))
+        .collect();
+    assert_eq!(line.len(), 1, "{:?}", with.items);
+    assert!(
+        line.iter()
+            .all(|l| l.contains("1 shape layer") && l.contains("Shape") && !l.contains("Plain")),
+        "{line:?}"
+    );
+}
+
 #[test]
 fn dissolve_is_itemised() {
     let line = "Dissolve layers will look different in apps other than Photoshop.";
