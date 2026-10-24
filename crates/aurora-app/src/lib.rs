@@ -17286,7 +17286,7 @@ fn effect_tile_coverage(
     SHADOW_COMPUTES.with(|n| n.set(n.get() + 1));
     let errors_before = budget.store_errors;
     let coverage = std::sync::Arc::new(profiled(ProfileSlot::ShadowMiss, || {
-        compute_shadow_tile_coverage(id, layers, store, tile, own, geometry, budget)
+        compute_shadow_tile_coverage(kind, id, layers, store, tile, own, geometry, budget)
     })?);
     // Review RC-1: a source or mask tile that failed to page in was
     // skipped (or failed open), so this coverage is degraded; the versions
@@ -17605,6 +17605,7 @@ fn coverage_cache_key(
 
 /// [`shadow_tile_coverage`]'s computation, uncached.
 fn compute_shadow_tile_coverage(
+    kind: CoverageKind,
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
     store: &mut dyn TileSource,
@@ -17615,7 +17616,22 @@ fn compute_shadow_tile_coverage(
 ) -> Option<Vec<f32>> {
     let apron = i64::from(geometry.apron);
     let side_usize = usize::try_from(i64::from(aurora_tile::TILE) + 2 * apron).ok()?;
-    let alpha = read_shape_window(id, layers, store, tile, own, geometry.offset, apron, budget)?;
+    // Task 151: only strokes follow a shape layer's outline. Using it for
+    // drop shadows and outer glows changed no corpus file (measured on the
+    // whole audit corpus), and Photoshop's own rule for them is not known,
+    // so they keep reading the pixels' alpha.
+    let outline = !matches!(kind, CoverageKind::DropShadow | CoverageKind::OuterGlow);
+    let alpha = read_shape_window(
+        id,
+        layers,
+        store,
+        tile,
+        own,
+        geometry.offset,
+        apron,
+        budget,
+        outline,
+    )?;
     let coverage = aurora_filters::shadow_coverage(
         &alpha,
         side_usize,
@@ -17643,6 +17659,7 @@ fn read_shape_window(
     offset: (i64, i64),
     apron: i64,
     budget: &mut CompositeBudget,
+    outline: bool,
 ) -> Option<Vec<f32>> {
     let t = i64::from(aurora_tile::TILE);
     let side = t + 2 * apron;
@@ -17653,7 +17670,7 @@ fn read_shape_window(
     );
     // Task 151: a shape layer's strokes, glows and shadows follow its
     // outline while its pixels are the ones the outline was recorded with.
-    if let Some(shape) = effect_shape_app::valid_effect_shape(id, layers, store) {
+    if outline && let Some(shape) = effect_shape_app::valid_effect_shape(id, layers, store) {
         let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
         return effect_shape_app::shape_window(&shape, origin, window, side_usize);
     }
@@ -17788,7 +17805,8 @@ fn stroke_tile_planes(
     STROKE_COMPUTES.with(|n| n.set(n.get() + 1));
     let errors_before = budget.store_errors;
     let apron = i64::from(geometry.apron);
-    let Some(alpha) = read_shape_window(id, layers, store, tile, own, (0, 0), apron, budget) else {
+    let Some(alpha) = read_shape_window(id, layers, store, tile, own, (0, 0), apron, budget, true)
+    else {
         return planes;
     };
     let Ok(side) = usize::try_from(i64::from(aurora_tile::TILE) + 2 * apron) else {

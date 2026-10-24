@@ -1947,8 +1947,8 @@ fn a_gradient_stroke_box_is_made_relative_to_the_layers_bounds_on_open() {
 // ---------------------------------------------------------------------
 
 mod outline {
-    use crate::psd::{PsdEffectShape, outline_covers_pixels};
     use crate::Image;
+    use crate::psd::{PsdEffectShape, outline_covers_pixels, refine_outline_edge};
     use aurora_color::IccProfile;
     use aurora_core::Rect;
 
@@ -2022,5 +2022,43 @@ mod outline {
             rect(10, 20, 4, 4),
             &outline()
         ));
+    }
+
+    /// An edge texel takes the pixels' own anti-aliasing relative to the
+    /// local fill, so an opaque shape's edge is its pixels' and a
+    /// translucent fill still reads as a full outline.
+    #[test]
+    fn an_edge_texel_takes_the_pixels_antialiasing_relative_to_the_fill() {
+        // 4 x 4 at document (0, 0); the outline's area is the whole image:
+        // interior (1, 1) and (2, 1) fully covered, (3, 1) an edge texel.
+        let mut coverage = vec![0u8; 16];
+        coverage[5] = 255;
+        coverage[6] = 255;
+        coverage[7] = 200;
+        // Opaque fill: the edge texel's alpha 0.5 replaces the path's 200/255.
+        let opaque = image_with(&[((1, 1), 1.0), ((2, 1), 1.0), ((3, 1), 0.5)]);
+        let mut shape = PsdEffectShape {
+            area: rect(0, 0, 4, 4),
+            coverage: coverage.clone(),
+        };
+        refine_outline_edge(&opaque, rect(0, 0, 4, 4), &mut shape);
+        assert_eq!(shape.coverage[7], 128);
+        assert_eq!(shape.coverage[5], 255);
+        // A translucent fill (0.3): the same relative edge, 0.15 / 0.3.
+        let translucent = image_with(&[((1, 1), 0.3), ((2, 1), 0.3), ((3, 1), 0.15)]);
+        let mut shape = PsdEffectShape {
+            area: rect(0, 0, 4, 4),
+            coverage: coverage.clone(),
+        };
+        refine_outline_edge(&translucent, rect(0, 0, 4, 4), &mut shape);
+        assert_eq!(shape.coverage[7], 128);
+        // No visible fill beside the edge texel: the path's coverage stays.
+        let faint = image_with(&[((1, 1), 0.02), ((2, 1), 0.02), ((3, 1), 0.01)]);
+        let mut shape = PsdEffectShape {
+            area: rect(0, 0, 4, 4),
+            coverage,
+        };
+        refine_outline_edge(&faint, rect(0, 0, 4, 4), &mut shape);
+        assert_eq!(shape.coverage[7], 200);
     }
 }
