@@ -1589,3 +1589,72 @@ worker_on_a_small_machine! {
     several_threads_equal_sync_on_a_small_machine => a_job_folded_on_several_threads_equals_the_sync_composite,
     pools_shadow_cache_keeps_documents_apart_on_a_small_machine => the_pools_shadow_cache_never_mixes_two_documents_up,
 }
+
+// Task 152: a tile coming into view for the first time is never
+// composited on the UI thread; a few tiles an edit made stale still are.
+
+#[test]
+fn composites_synchronously_only_a_few_tiles_that_already_show_a_composite() {
+    let ids: Vec<aurora_tile::TileId> = (0..=SYNC_TILE_LIMIT)
+        .map(|x| aurora_tile::TileId {
+            x: u32::try_from(x).unwrap_or(0),
+            y: 0,
+        })
+        .collect();
+    let few = ids.get(..SYNC_TILE_LIMIT).unwrap_or(&[]);
+    assert_eq!(few.len(), SYNC_TILE_LIMIT);
+    assert!(composites_synchronously(&[], |_| false));
+    assert!(composites_synchronously(few, |_| true));
+    assert!(!composites_synchronously(&ids, |_| true), "over the limit");
+    assert!(!composites_synchronously(few, |_| false), "never shown");
+    // One new tile among shown ones is enough to leave them to the worker.
+    let last = few.last().copied();
+    assert!(!composites_synchronously(few, |tile| Some(tile) != last));
+}
+
+#[test]
+fn a_tile_has_shown_a_composite_once_it_was_installed_and_a_bump_keeps_it() {
+    let mut cache = CompositeCache::default();
+    let a = aurora_tile::TileId { x: 0, y: 0 };
+    let b = aurora_tile::TileId { x: 1, y: 0 };
+    assert!(!cache.has_shown(a));
+    cache.mark_current(a);
+    cache.mark_provisional(b, 0);
+    assert!(cache.has_shown(a) && cache.has_shown(b));
+    cache.bump();
+    cache.invalidate(a);
+    assert!(cache.has_shown(a) && cache.has_shown(b));
+    assert!(!cache.has_shown(aurora_tile::TileId { x: 2, y: 0 }));
+}
+
+#[test]
+fn a_tile_never_composited_goes_to_the_worker_and_an_edited_one_is_composited_at_once() {
+    let (_d, mut store) = store_with_budget(256);
+    let (layers, size) = fixture(&mut store);
+    let tiles = grid(size);
+    let Some(&first) = tiles.first() else {
+        unreachable!("the fixture has tiles");
+    };
+    let one = [first];
+    let gate = Arc::new(Gate::default());
+    let mut worker = CompositeWorker::with_threads(Gate::waker(&gate), 1);
+    let mut cache = CompositeCache::default();
+    // First exposure: the UI thread composites nothing, the worker has it.
+    dispatch_or_composite_tiles(&one, &layers, None, &mut store, &mut cache, &mut worker);
+    assert!(!cache.is_current(first), "composited on the UI thread");
+    assert!(worker.is_busy(), "not dispatched");
+    gate.open();
+    let _ = worker.wait_until_idle(Some(&mut target(&layers, &mut store, &mut cache)), WAIT);
+    settle(&mut worker, &layers, &mut store, &mut cache, &one);
+    assert!(cache.is_current(first));
+    assert_same(
+        &read_composite(&mut store, &one),
+        &sync_composite(&layers, &mut store, &one),
+        "the worker's first composite",
+    );
+    // An edit there: composited before the call returns, as a dab's tiles are.
+    cache.invalidate(first);
+    dispatch_or_composite_tiles(&one, &layers, None, &mut store, &mut cache, &mut worker);
+    assert!(cache.is_current(first), "an edited tile left to the worker");
+    assert!(!worker.is_busy());
+}
