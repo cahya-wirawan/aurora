@@ -58,8 +58,7 @@ fn versions_hash(
                 continue;
             }
             let v = store.content_version(surface, tile);
-            h = (h ^ (u64::from(tx) << 32 | u64::from(ty)))
-                .wrapping_mul(0x0100_0000_01B3);
+            h = (h ^ (u64::from(tx) << 32 | u64::from(ty))).wrapping_mul(0x0100_0000_01B3);
             h = (h ^ v).wrapping_mul(0x0100_0000_01B3);
         }
     }

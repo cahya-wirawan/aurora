@@ -4519,6 +4519,40 @@ fn layer_node(
     }))
 }
 
+/// Whether a decoded shape layer's visible pixels all lie under the
+/// outline `shape` (task 151): no pixel of alpha `>= 0.25` where the
+/// outline's coverage is zero. Photoshop draws a vector stroke into the
+/// stored pixels of a shape layer (`double-stroke-effects.psd`: 25 px
+/// stored against a 24 px path), and an outline smaller than its pixels is
+/// not the shape its effects should follow.
+fn outline_covers_pixels(image: &Image, layer_bounds: Rect, shape: &PsdEffectShape) -> bool {
+    let width = image.width() as usize;
+    for (iy, row) in image.samples().chunks(width.max(1) * 4).enumerate() {
+        for (ix, texel) in row.chunks_exact(4).enumerate() {
+            let alpha = texel.get(3).map_or(0.0, |a| a.to_f32());
+            if alpha < 0.25 {
+                continue;
+            }
+            let x = layer_bounds.x + ix as i64 - shape.area.x;
+            let y = layer_bounds.y + iy as i64 - shape.area.y;
+            let covered = match (u32::try_from(x), u32::try_from(y)) {
+                (Ok(x), Ok(y)) if x < shape.area.width && y < shape.area.height => {
+                    let index = u64::from(y) * u64::from(shape.area.width) + u64::from(x);
+                    usize::try_from(index)
+                        .ok()
+                        .and_then(|i| shape.coverage.get(i))
+                        .is_some_and(|c| *c != 0)
+                }
+                _ => false,
+            };
+            if !covered {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// The most pixels a layer's own surface may cover for it to keep an effect
 /// shape (task 151): the compositor checks the shape's fingerprint against
 /// the layer's tiles, so a layer with a huge surface is left on pixel alpha.
@@ -4542,7 +4576,6 @@ fn effect_shape_for(
 ) -> Option<PsdEffectShape> {
     if record.flags & SHAPE_PIXELS_IRRELEVANT == 0
         || record.area() == 0
-        || record.features.fill
         || !record.features.vector_mask
         || shape_mask_spreads(record)
         || u64::from(layer_region.width) * u64::from(layer_region.height)
@@ -6788,7 +6821,18 @@ impl Builder<'_, '_, '_> {
                     if let Some(image) = image.as_mut() {
                         self.bring_image_into_working(image);
                     }
-                    if let (Some(image), Some(shape)) = (&image, layer.effect_shape) {
+                    // A path that does not cover the pixels is not the shape
+                    // they were drawn from (a vector stroke adds a pixel
+                    // `double-stroke-effects.psd`): the layer keeps its alpha.
+                    let shape = match (&image, layer.effect_shape) {
+                        (Some(image), Some(shape))
+                            if outline_covers_pixels(image, layer.bounds, &shape) =>
+                        {
+                            Some(shape)
+                        }
+                        _ => None,
+                    };
+                    if let (Some(image), Some(shape)) = (&image, shape) {
                         // The fingerprint of the pixels as they sit in the
                         // layer's surface, so the compositor can tell that
                         // they are still the ones the outline went with

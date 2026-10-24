@@ -540,7 +540,6 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::window::{Window, WindowId};
 
 mod adjust_app;
-mod effect_shape_app;
 mod adjust_tables;
 #[cfg(test)]
 mod anchor_tests;
@@ -577,6 +576,7 @@ mod document_session;
 mod document_tabs;
 #[cfg(test)]
 mod document_tabs_tests;
+mod effect_shape_app;
 mod export_save;
 mod fill_tools;
 mod filter_stamp;
@@ -17588,8 +17588,8 @@ fn coverage_cache_key(
             m.density.to_bits(),
         )
     });
-    let shape = effect_shape_app::valid_effect_shape(id, layers, store)
-        .map_or(0, |s| s.content_hash());
+    let shape =
+        effect_shape_app::valid_effect_shape(id, layers, store).map_or(0, |s| s.content_hash());
     Some(ShadowCacheKey {
         kind: kind as u8,
         shape,
@@ -93784,6 +93784,163 @@ mod tests {
             ] {
                 near(texel(&acc, x, y), want);
             }
+        }
+
+        // ---- task 151: effect shapes ----
+
+        /// Overwrites the painted square with premultiplied white at alpha
+        /// `a` (a translucent fill, like a gradient that fades out).
+        fn fade(
+            store: &mut aurora_tile::TileStore,
+            layers: &aurora_doc::LayerTree,
+            id: aurora_doc::LayerId,
+            rect: (usize, usize, usize, usize),
+            a: f32,
+        ) {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("pixel layer");
+            };
+            let Ok(tile) = store.get_mut(surface, aurora_tile::TileId { x: 0, y: 0 }) else {
+                unreachable!("writable");
+            };
+            for y in rect.1..rect.1 + rect.3 {
+                for x in rect.0..rect.0 + rect.2 {
+                    let i = (y * aurora_tile::TILE as usize + x) * 4;
+                    for v in tile.texels_mut().iter_mut().skip(i).take(4) {
+                        *v = half::f16::from_f32(a);
+                    }
+                }
+            }
+        }
+
+        /// A 40 x 40 square at (100, 100) of white at alpha 0.25 with a 3 px
+        /// outside red stroke and an effect shape covering exactly the
+        /// square, recorded beside the current pixels.
+        fn translucent_shape() -> (
+            tempfile::TempDir,
+            aurora_tile::TileStore,
+            aurora_doc::LayerTree,
+            aurora_doc::LayerId,
+        ) {
+            let (dir, mut store, mut layers, id) = {
+                let (d, s, l, i) = stroked_square(StrokePosition::Outside, 3.0);
+                (d, s, l, i)
+            };
+            fade(&mut store, &layers, id, (100, 100, 40, 40), 0.25);
+            let fingerprint = fingerprint_of(&mut store, &layers, id);
+            let shape = ok(aurora_doc::EffectShape::new(
+                aurora_core::Rect {
+                    x: 100,
+                    y: 100,
+                    width: 40,
+                    height: 40,
+                },
+                vec![255; 40 * 40],
+                fingerprint,
+            ));
+            ok(layers.set_effect_shape(id, Some(std::sync::Arc::new(shape))));
+            (dir, store, layers, id)
+        }
+
+        fn fingerprint_of(
+            store: &mut aurora_tile::TileStore,
+            layers: &aurora_doc::LayerTree,
+            id: aurora_doc::LayerId,
+        ) -> u64 {
+            let (Some(surface), Some(bounds)) = (layers.surface_id(id), layers.bounds(id)) else {
+                unreachable!("pixel layer");
+            };
+            ok(aurora_doc::smart_object::surface_fingerprint(
+                store, surface, bounds,
+            ))
+        }
+
+        /// The translucent square the outline strokes: a complete frame
+        /// outside it and nothing red inside, where the pixel alpha alone
+        /// would let the stroke show through the translucent fill.
+        #[test]
+        fn a_translucent_shape_gets_a_square_frame_from_its_outline() {
+            let (_d, mut store, layers, _) = translucent_shape();
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            // Stored straight, composited premultiplied: 0.25 x 0.25.
+            near(texel(&acc, 120, 120), [0.0625, 0.0625, 0.0625, 0.25]);
+            near(texel(&acc, 101, 101), [0.0625, 0.0625, 0.0625, 0.25]);
+            for (x, y) in [(99, 120), (97, 120), (120, 97), (142, 120), (120, 142)] {
+                near(texel(&acc, x, y), RED);
+            }
+            near(texel(&acc, 96, 120), CLEAR);
+        }
+
+        /// Without a shape the same layer strokes from its alpha, and the
+        /// result differs inside the square: the control that proves the
+        /// shape is what changed the picture.
+        #[test]
+        fn without_an_effect_shape_the_stroke_follows_the_pixel_alpha() {
+            let (_d, mut store, mut layers, id) = translucent_shape();
+            ok(layers.set_effect_shape(id, None));
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            let inside = texel(&acc, 101, 101);
+            assert!(
+                inside[0] > inside[1] + 0.05,
+                "red shows through: {inside:?}"
+            );
+        }
+
+        /// Editing the layer's pixels ends the shape's use (Photoshop
+        /// rasterises a shape layer when it is painted on); restoring the
+        /// pixels (an undo) brings it back.
+        #[test]
+        fn painting_on_the_layer_drops_the_shape_and_undoing_restores_it() {
+            let (_d, mut store, layers, id) = translucent_shape();
+            let with_shape = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("pixel layer");
+            };
+            let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+            let index = (110 * aurora_tile::TILE as usize + 110) * 4;
+            let original = {
+                let Ok(tile) = store.get_mut(surface, tile_id) else {
+                    unreachable!("writable");
+                };
+                let Some(v) = tile.texels_mut().get_mut(index + 3) else {
+                    unreachable!("in range");
+                };
+                let old = *v;
+                *v = half::f16::from_f32(0.5);
+                old
+            };
+            let painted_on = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            let inside = texel(&painted_on, 101, 101);
+            assert!(
+                inside[0] > inside[1] + 0.05,
+                "falls back to alpha: {inside:?}"
+            );
+            {
+                let Ok(tile) = store.get_mut(surface, tile_id) else {
+                    unreachable!("writable");
+                };
+                if let Some(v) = tile.texels_mut().get_mut(index + 3) {
+                    *v = original;
+                }
+            }
+            let restored = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            assert_eq!(with_shape, restored);
+        }
+
+        /// The fingerprint comparison runs once while the layer's tile
+        /// versions stay the same, and again after an edit.
+        #[test]
+        fn the_validity_check_is_remembered_until_a_tile_changes() {
+            let (_d, mut store, layers, id) = translucent_shape();
+            let runs = || crate::effect_shape_app::FINGERPRINT_RUNS.with(std::cell::Cell::get);
+            let before = runs();
+            for _ in 0..3 {
+                let _ = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            }
+            assert_eq!(runs() - before, 1);
+            fade(&mut store, &layers, id, (100, 100, 1, 1), 0.3);
+            let _ = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            assert_eq!(runs() - before, 2);
         }
 
         #[test]
