@@ -191,6 +191,12 @@ pub struct LayerTree {
     /// `.aur`'s `smart-objects` entry carries it. Cheap to clone (`Arc`s).
     #[serde(skip)]
     linked_files: std::collections::BTreeMap<String, crate::smart_object::LinkedFile>,
+    /// The document's `Txt2` text-engine block (task 155), kept verbatim
+    /// for a PSD save that writes text layers back. Not part of the
+    /// positional manifest (`#[serde(skip)]`): `.aur`'s `text-layers` entry
+    /// carries it. Cheap to clone (`Arc`).
+    #[serde(skip)]
+    text_engine: Option<std::sync::Arc<Vec<u8>>>,
     /// The document's pool of patterns (task 111), keyed by pattern ID.
     /// `#[serde(skip)]`: the `.aur` entry `layer-patterns` carries it.
     /// Cheap to clone (`Arc`ed pixels).
@@ -309,6 +315,7 @@ impl TryFrom<LayerTreeRepr> for LayerTree {
             layers,
             roots,
             linked_files: std::collections::BTreeMap::new(),
+            text_engine: None,
             patterns: std::collections::BTreeMap::new(),
         })
     }
@@ -827,6 +834,7 @@ impl LayerTree {
             layers: HashMap::new(),
             roots: Vec::new(),
             linked_files: std::collections::BTreeMap::new(),
+            text_engine: None,
             patterns: std::collections::BTreeMap::new(),
         }
     }
@@ -2527,6 +2535,84 @@ impl LayerTree {
         Ok(())
     }
 
+    /// The layer's preserved text data (task 155), or `None` when it has
+    /// none or `id` does not exist.
+    #[must_use]
+    pub fn text_layer(&self, id: LayerId) -> Option<&crate::text_layer::TextLayer> {
+        self.layers.get(&id)?.text_layer.as_deref()
+    }
+
+    /// Replaces the layer's preserved text data (task 155); `None` removes
+    /// it. Data only: nothing is rendered from it.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::UnknownLayer`] if `id` doesn't exist;
+    /// [`DocError::NotAPixelLayer`] if it is not a pixel layer;
+    /// [`DocError::InvalidTextLayer`] if `value` fails
+    /// [`crate::TextLayer::validate`] or the document's text blocks would
+    /// together pass [`crate::MAX_TEXT_TOTAL_BYTES`]. Nothing is changed
+    /// when any happens.
+    pub fn set_text_layer(
+        &mut self,
+        id: LayerId,
+        value: Option<crate::text_layer::TextLayer>,
+    ) -> Result<(), DocError> {
+        let entry = self.layers.get(&id).ok_or(DocError::UnknownLayer(id))?;
+        if !matches!(entry.kind, LayerKind::Pixel { .. }) {
+            return Err(DocError::NotAPixelLayer(id));
+        }
+        if let Some(value) = &value {
+            value.validate().map_err(DocError::InvalidTextLayer)?;
+            let others: usize = self
+                .layers
+                .iter()
+                .filter(|(other, _)| **other != id)
+                .filter_map(|(_, e)| e.text_layer.as_ref())
+                .map(|t| t.data.len())
+                .fold(0usize, usize::saturating_add);
+            if others.saturating_add(value.data.len()) > crate::text_layer::MAX_TEXT_TOTAL_BYTES {
+                return Err(DocError::InvalidTextLayer(
+                    crate::TextLayerError::TotalTooLarge,
+                ));
+            }
+        }
+        if let Some(entry) = self.layers.get_mut(&id) {
+            entry.text_layer = value.map(Box::new);
+        }
+        Ok(())
+    }
+
+    /// The document's `Txt2` text-engine block (task 155), if kept.
+    #[must_use]
+    pub fn text_engine_data(&self) -> Option<&std::sync::Arc<Vec<u8>>> {
+        self.text_engine.as_ref()
+    }
+
+    /// Replaces the document's text-engine block; `None` removes it.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::InvalidTextLayer`] if the block is empty or over
+    /// [`crate::MAX_TEXT_ENGINE_BYTES`]. Nothing is changed then.
+    pub fn set_text_engine_data(
+        &mut self,
+        value: Option<std::sync::Arc<Vec<u8>>>,
+    ) -> Result<(), DocError> {
+        if let Some(block) = &value {
+            if block.is_empty() {
+                return Err(DocError::InvalidTextLayer(crate::TextLayerError::Empty));
+            }
+            if block.len() > crate::text_layer::MAX_TEXT_ENGINE_BYTES {
+                return Err(DocError::InvalidTextLayer(
+                    crate::TextLayerError::BlockTooLarge,
+                ));
+            }
+        }
+        self.text_engine = value;
+        Ok(())
+    }
+
     /// The document's embedded smart-object files, by unique ID (0.200.0).
     #[must_use]
     pub fn linked_files(
@@ -3060,6 +3146,7 @@ mod tests {
                 layers,
                 roots: vec![colliding],
                 linked_files: std::collections::BTreeMap::new(),
+                text_engine: None,
                 patterns: std::collections::BTreeMap::new(),
             };
             assert!(forced.contains(colliding), "the guard, not `contains`");
@@ -3082,6 +3169,7 @@ mod tests {
             layers,
             roots: vec![below],
             linked_files: std::collections::BTreeMap::new(),
+            text_engine: None,
             patterns: std::collections::BTreeMap::new(),
         };
         assert_eq!(

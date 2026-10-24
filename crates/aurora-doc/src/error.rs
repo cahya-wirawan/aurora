@@ -36,6 +36,9 @@ pub enum DocError {
     /// Smart-object data failed its bounds (0.200.0).
     #[error("invalid smart object data: {0}")]
     InvalidSmartObject(crate::smart_object::SmartObjectError),
+    /// Preserved text data failed its bounds (task 155).
+    #[error("invalid text layer data: {0}")]
+    InvalidTextLayer(crate::text_layer::TextLayerError),
     /// An effect shape failed its bounds (task 151).
     #[error("invalid effect shape: {0}")]
     InvalidEffectShape(crate::effect_shape::EffectShapeError),

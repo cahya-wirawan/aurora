@@ -93,6 +93,30 @@
 //! Checked with Aurora's own parsers and with psd-tools
 //! (`scripts/verify_psd_write.py`); never opened in Photoshop.
 //!
+//! # Text layers (task 155)
+//!
+//! A pixel layer that still carries `aurora_doc::TextLayer` data (a
+//! Photoshop text layer kept at open, see `aurora_doc::text_layer`) is
+//! written back as one: its `TySh` (or legacy `tySh`) block verbatim in the
+//! record's extra data, and, once some text layer is written, the
+//! document's `Txt2` block after the pattern block (its exact length, then
+//! padding to four bytes as Photoshop frames global blocks). The layer's
+//! pixels are written exactly as for any layer: they are the text's
+//! rendering and Aurora never lays text out.
+//!
+//! The same policy as a smart object: the data is kept only while the
+//! layer's bounds equal the recorded ones and the fingerprint of its tiles
+//! matches; otherwise the layer is written as ordinary pixels and the
+//! report names it and the reason. Opacity, fill, blend mode, visibility,
+//! locks, masks and effects do not matter. A block whose length is not a
+//! multiple of four gets up to three zero bytes appended inside its length
+//! (Photoshop's own are multiples of four). The record rectangle is the
+//! tile-occupied extent of the pixels like any other layer's, not the
+//! original rectangle; the text's own box lives in the `TySh` block.
+//! Checked with Aurora's own parsers and with psd-tools; **never opened in
+//! Photoshop**, so it is not known that Photoshop shows the layer as
+//! editable text.
+//!
 //! # Masks (0.178.0)
 //!
 //! A layer's or group's `aurora_doc::LayerMask` is written as a PSD
@@ -289,12 +313,25 @@ enum SmartDrop {
     FileMissing,
 }
 
+/// Why a text layer's data was not written back (task 155).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextDrop {
+    /// The layer's pixels differ from the text's rendering.
+    Pixels,
+    /// The layer was moved; its transform would be wrong.
+    Moved,
+    /// The layer holds no stored pixels, so nothing shows the text.
+    NoPixels,
+}
+
 /// The counts behind a [`PsdWriteReport`]: structural ones known before
 /// writing, measured ones while writing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Losses {
     /// Smart-object layers saved as ordinary layers, by name (0.200.0).
     smart_dropped: Vec<(String, SmartDrop)>,
+    /// Text layers saved as ordinary layers, by name (task 155).
+    text_dropped: Vec<(String, TextDrop)>,
     long_names: usize,
     rounded_opacity: usize,
     rounded_density: usize,
@@ -436,6 +473,43 @@ impl Losses {
             }
             items.push(format!(
                 "Not saved (unverified in Photoshop): {kind} on {}.",
+                name_list(&names)
+            ));
+        }
+        items
+    }
+
+    /// One line per reason a text layer's data was not written back.
+    fn text_items(&self) -> Vec<String> {
+        let mut items = Vec::new();
+        for (drop, reason) in [
+            (
+                TextDrop::Pixels,
+                "their pixels were painted or erased after the file was opened, so they no \
+                 longer match the text",
+            ),
+            (
+                TextDrop::Moved,
+                "they were moved, and Aurora does not update a text layer's position",
+            ),
+            (
+                TextDrop::NoPixels,
+                "they hold no stored pixels, so nothing shows the text",
+            ),
+        ] {
+            let names: Vec<&str> = self
+                .text_dropped
+                .iter()
+                .filter(|(_, d)| *d == drop)
+                .map(|(n, _)| n.as_str())
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            items.push(format!(
+                "{} will be saved as ordinary pixel layers because {reason}; Photoshop will not \
+                 be able to edit their text. Affected: {}.",
+                plural(names.len() as u64, "text layer", "text layers"),
                 name_list(&names)
             ));
         }
@@ -686,6 +760,7 @@ impl Losses {
             ));
         }
         items.extend(self.smart_object_items());
+        items.extend(self.text_items());
         if !self.outline_dropped.is_empty() {
             let names: Vec<&str> = self.outline_dropped.iter().map(String::as_str).collect();
             items.push(format!(
@@ -846,6 +921,15 @@ pub struct PsdExpectedSmart {
     pub blocks: Vec<aurora_doc::SmartObjectBlock>,
 }
 
+/// A text layer's block as [`verify_psd_file`] expects to read it back
+/// (task 155): its key and its data as written (zero-padded to a multiple
+/// of four bytes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PsdExpectedText {
+    pub key: [u8; 4],
+    pub data: Vec<u8>,
+}
+
 /// One embedded file as [`verify_psd_file`] expects to read it back
 /// (0.200.0): the list it sits in, its unique ID and the length and hash
 /// of its whole framed entry.
@@ -871,6 +955,17 @@ impl ByteHash {
         for &b in bytes {
             self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3);
         }
+    }
+}
+
+/// One-shot [`ByteHash`] of a byte slice (task 155).
+struct ByteHashOf;
+
+impl ByteHashOf {
+    fn of(bytes: &[u8]) -> u64 {
+        let mut hash = ByteHash::new();
+        hash.update(bytes);
+        hash.0
     }
 }
 
@@ -911,6 +1006,9 @@ pub struct PsdExpectedLayer {
     /// The record's smart-object data, when it is written back as one
     /// (0.200.0).
     pub smart: Option<PsdExpectedSmart>,
+    /// The record's text block, when it is written back as a text layer
+    /// (task 155).
+    pub text: Option<PsdExpectedText>,
     pub kind: PsdRecordKind,
     /// The name as written (after any shortening).
     pub name: String,
@@ -955,6 +1053,9 @@ pub struct PsdExpectation {
     /// The length and hash of the `Patt` block written before the linked
     /// lists, if any (task 120).
     pub patterns: Option<(u64, u64)>,
+    /// The length and hash of the `Txt2` block written after the pattern
+    /// block, if any (task 155).
+    pub text_engine: Option<(u64, u64)>,
 }
 
 /// [`write_psd`]'s result.
@@ -1403,6 +1504,7 @@ fn plan_props(
                 }),
             adjustment: None,
             smart: None,
+            text: None,
             kind,
             name: written,
             blend: layers.blend_mode(id).unwrap_or_default(),
@@ -1434,6 +1536,7 @@ fn plan_group_end() -> LayerPlan {
             effects: None,
             adjustment: None,
             smart: None,
+            text: None,
             kind: PsdRecordKind::GroupEnd,
             name: PSD_GROUP_END_NAME.to_owned(),
             blend: BlendMode::Normal,
@@ -1555,6 +1658,46 @@ fn smart_for(
     }))
 }
 
+/// Whether `id`'s text data is still true and so written back (task 155),
+/// and the block as it is written; otherwise why not, recorded in `losses`.
+/// See the module documentation for the policy.
+fn text_for(
+    layers: &LayerTree,
+    store: &mut TileStore,
+    id: LayerId,
+    (surface, bounds, extent): (SurfaceId, &Rect, (u32, u32, u32, u32)),
+    losses: &mut Losses,
+) -> Result<Option<PsdExpectedText>, IoError> {
+    let Some(text) = layers.text_layer(id) else {
+        return Ok(None);
+    };
+    let mut drop_for = |why: TextDrop| {
+        losses
+            .text_dropped
+            .push((layers.name(id).unwrap_or_default().to_owned(), why));
+        Ok(None)
+    };
+    if text.bounds != *bounds {
+        return drop_for(TextDrop::Moved);
+    }
+    if extent.2 == 0 || extent.3 == 0 {
+        return drop_for(TextDrop::NoPixels);
+    }
+    if aurora_doc::smart_object::surface_fingerprint(store, surface, *bounds)?
+        != text.pixel_fingerprint
+    {
+        return drop_for(TextDrop::Pixels);
+    }
+    let mut data = text.data.clone();
+    while !data.len().is_multiple_of(4) {
+        data.push(0);
+    }
+    Ok(Some(PsdExpectedText {
+        key: text.key,
+        data,
+    }))
+}
+
 /// An adjustment layer's record: no pixels, its block, the usual
 /// properties and mask.
 fn plan_adjustment(
@@ -1637,6 +1780,7 @@ fn plan_layer(
     plan.surface = Some(surface);
     plan.extent = extent;
     plan.expected.smart = smart_for(layers, store, id, (surface, bounds, extent), losses)?;
+    plan.expected.text = text_for(layers, store, id, (surface, bounds, extent), losses)?;
     Ok(plan)
 }
 
@@ -1804,6 +1948,9 @@ fn record_extra(plan: &LayerPlan) -> Result<Vec<u8>, IoError> {
             extra.extend_from_slice(point);
         }
     }
+    if let Some(text) = &plan.expected.text {
+        push_text_block(&mut extra, text)?;
+    }
     if let Some(smart) = &plan.expected.smart {
         for block in &smart.blocks {
             extra.extend_from_slice(b"8BIM");
@@ -1814,6 +1961,16 @@ fn record_extra(plan: &LayerPlan) -> Result<Vec<u8>, IoError> {
         }
     }
     Ok(extra)
+}
+
+/// A text layer's block in a record's extra data (task 155).
+fn push_text_block(extra: &mut Vec<u8>, text: &PsdExpectedText) -> Result<(), IoError> {
+    extra.extend_from_slice(b"8BIM");
+    extra.extend_from_slice(&text.key);
+    let len = u32::try_from(text.data.len()).map_err(|_| too_large("text layer"))?;
+    extra.extend_from_slice(&len.to_be_bytes());
+    extra.extend_from_slice(&text.data);
+    Ok(())
 }
 
 /// A record's flags byte: bit 0 transparency protected, bit 1 hidden.
@@ -2234,10 +2391,18 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
         Some(super::write_effects::pattern_block(&pool).map_err(|_| too_large("pattern block"))?)
     };
     let linked = linked_to_write(layers, &plans);
+    // The text-engine block goes with the first written text layer (task
+    // 155): only when some layer is written back as text.
+    let text_engine = if plans.iter().any(|p| p.expected.text.is_some()) {
+        layers.text_engine_data()
+    } else {
+        None
+    };
     let linked_bytes: u64 = linked
         .iter()
         .map(|f| f.entry.len() as u64 + 12)
-        .fold(0u64, u64::saturating_add);
+        .fold(0u64, u64::saturating_add)
+        .saturating_add(text_engine.map_or(0, |e| e.len() as u64 + 16));
     if minimum_file_size(&plans, canvas, linked_bytes) > max_bytes {
         return Err(too_large(
             "a .psd file must be smaller than 2 GiB; use .psb instead",
@@ -2301,6 +2466,22 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
         }
         None => None,
     };
+    let text_engine_expected = match text_engine {
+        Some(block) => {
+            let len = u32::try_from(block.len()).map_err(|_| too_large("text engine data"))?;
+            w.write_all(b"8BIM")?;
+            w.write_all(b"Txt2")?;
+            w.write_all(&len.to_be_bytes())?;
+            w.write_all(block)?;
+            // Global blocks are aligned to four bytes after their data.
+            w.write_all(&vec![0u8; (4 - block.len() % 4) % 4])?;
+            check_size(w, limit)?;
+            let mut hash = ByteHash::new();
+            hash.update(block);
+            Some((block.len() as u64, hash.0))
+        }
+        None => None,
+    };
     let linked_expected = write_linked_blocks(w, &linked, limit)?;
     let section_end = pos(w)?;
     patch(
@@ -2322,6 +2503,7 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
             linked: linked_expected,
             global_angle: angle,
             patterns: patterns_expected,
+            text_engine: text_engine_expected,
         },
     })
 }
@@ -2725,6 +2907,7 @@ fn raw_record<R: std::io::Read + Seek>(
     let mut protected = None;
     let mut read_options = aurora_doc::LayerBlendOptions::default();
     let mut smart_blocks: Vec<aurora_doc::SmartObjectBlock> = Vec::new();
+    let mut text_blocks: Vec<PsdExpectedText> = Vec::new();
     let mut adjustment_blocks: Vec<([u8; 4], Vec<u8>)> = Vec::new();
     let (mut lfx2, mut fxrp) = (None, None);
     while raw.pos()? < extra_end {
@@ -2750,9 +2933,17 @@ fn raw_record<R: std::io::Read + Seek>(
             k if aurora_doc::smart_object::SMART_OBJECT_BLOCK_KEYS.contains(k) => {
                 smart_blocks.push(aurora_doc::SmartObjectBlock { key, data });
             }
+            k if aurora_doc::TEXT_BLOCK_KEYS.contains(k) => {
+                text_blocks.push(PsdExpectedText { key, data });
+            }
             _ => {}
         }
     }
+    check(
+        &format!("layer {i} text blocks"),
+        text_blocks,
+        want.text.iter().cloned().collect::<Vec<_>>(),
+    )?;
     check(
         &format!("layer {i} adjustment blocks"),
         adjustment_blocks,
@@ -2864,6 +3055,7 @@ fn verify_raw<R: std::io::Read + Seek>(inner: R, expected: &PsdExpectation) -> R
         section_start + section,
         &expected.linked,
         expected.patterns,
+        expected.text_engine,
     )?;
     raw.inner.seek(SeekFrom::Start(section_start + section))?;
     raw_merged(&mut raw, expected)
@@ -2877,10 +3069,12 @@ fn raw_linked<R: std::io::Read + Seek>(
     section_end: u64,
     want: &[PsdExpectedLinked],
     want_patterns: Option<(u64, u64)>,
+    want_text_engine: Option<(u64, u64)>,
 ) -> Result<(), IoError> {
     const CHUNK: u64 = 1 << 20;
     let mut got = Vec::new();
     let mut got_patterns = None;
+    let mut got_text_engine = None;
     while raw.pos()? + 12 <= section_end {
         check("global block signature", raw.array::<4>()?, *b"8BIM")?;
         let key = raw.array::<4>()?;
@@ -2899,6 +3093,18 @@ fn raw_linked<R: std::io::Read + Seek>(
                 left -= n;
             }
             got_patterns = Some((len, hash.0));
+            continue;
+        }
+        if key == *b"Txt2" {
+            // The text-engine block (task 155): hashed, then its padding.
+            if raw.pos()? + len > section_end {
+                return Err(mismatch("the text engine block runs past its section"));
+            }
+            let mut hash = ByteHash::new();
+            let bytes = raw.bytes(usize::try_from(len).map_err(|_| mismatch("a length"))?)?;
+            hash.update(&bytes);
+            raw.skip((4 - len % 4) % 4)?;
+            got_text_engine = Some((len, hash.0));
             continue;
         }
         if !aurora_doc::smart_object::LINKED_LIST_KEYS.contains(&key) {
@@ -2943,6 +3149,7 @@ fn raw_linked<R: std::io::Read + Seek>(
         }
     }
     check("pattern block", got_patterns, want_patterns)?;
+    check("text engine block", got_text_engine, want_text_engine)?;
     check("linked-layer entries", got, want.to_vec())
 }
 
@@ -3162,6 +3369,11 @@ fn reader_pass(path: &Path, expected: &PsdExpectation) -> Result<(), IoError> {
                 .as_ref()
                 .map(|s| (s.unique_id.as_str(), s.blocks.as_slice())),
         )?;
+        check(
+            &format!("layer {i} text layer"),
+            l.text_layer(id).map(|t| (t.key, t.data.as_slice())),
+            want.text.as_ref().map(|t| (t.key, t.data.as_slice())),
+        )?;
         reader_mask(i, l.mask(id), want.mask.as_ref(), id, &sink.masks)?;
         check(
             &format!("layer {i} adjustment"),
@@ -3198,6 +3410,13 @@ fn reader_pass(path: &Path, expected: &PsdExpectation) -> Result<(), IoError> {
     if decoded.next().is_some() {
         return Err(mismatch("more layers with pixels than were written"));
     }
+    check(
+        "text engine data",
+        doc.layers
+            .text_engine_data()
+            .map(|e| (e.len() as u64, ByteHashOf::of(e))),
+        expected.text_engine,
+    )?;
     check(
         "embedded smart object files",
         doc.layers.linked_files().len(),

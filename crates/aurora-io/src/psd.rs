@@ -108,7 +108,13 @@
 //!   every other adjustment kind, a Grayscale file's Hue/Saturation and
 //!   the kinds no Grayscale fixture checks (0.249.0), and fill
 //!   layers with no pixels are left out; text,
-//!   smart-object and shape layers open as their stored pixels. Every
+//!   smart-object and shape layers open as their stored pixels. A text
+//!   layer's `TySh` block and the document's `Txt2` block are kept
+//!   verbatim when the file is 8 or 16-bit RGB (task 155, [`PsdLayer::text`],
+//!   [`PsdFile::text_engine`], the `text` module) and written back by a
+//!   save while the layer's pixels and position are unchanged; the open
+//!   still reports the layer as opened as pixels, with the kept/not kept
+//!   distinction and the fonts it references. Every
 //!   one of those that a file actually uses is named in the report —
 //!   except a smart object whose data is **kept** (0.200.0): its
 //!   `SoLd`/`PlLd`/`SoLE`/`fxrp` blocks and the embedded file its unique
@@ -172,6 +178,9 @@ mod smart_tests;
 mod test_writer;
 #[cfg(test)]
 mod tests;
+mod text;
+#[cfg(test)]
+mod text_tests;
 mod vector;
 pub mod write;
 mod write_adjust;
@@ -185,6 +194,7 @@ mod write_pixels;
 mod write_tests;
 
 pub use smart::PsdSmartObject;
+pub use text::PsdTextLayer;
 pub use write::{
     PSD_GROUP_END_NAME, PSD_MAX_NAME_UNITS, PSD_MAX_RECORDS, PsdCompositeSource, PsdExpectation,
     PsdExpectedAdjustment, PsdExpectedLayer, PsdExpectedMask, PsdFormat, PsdRecordKind,
@@ -286,6 +296,9 @@ pub struct PsdFile {
     /// The embedded smart-object files some layer's
     /// [`PsdLayer::smart`] names (0.200.0), in first-use order.
     pub linked_files: Vec<aurora_doc::LinkedFile>,
+    /// The document's `Txt2` text-engine block (task 155), read only when
+    /// some layer's [`PsdLayer::text`] is kept.
+    pub text_engine: Option<std::sync::Arc<Vec<u8>>>,
     /// The patterns some layer's pattern overlay names (task 111).
     pub patterns: Vec<aurora_core::pattern::Pattern>,
     notes: Notes,
@@ -336,6 +349,10 @@ pub struct PsdLayer {
     /// interpreted: [`build_document`] attaches it to the tree with the
     /// pixels' fingerprint, so a PSD save can write it back.
     pub smart: Option<PsdSmartObject>,
+    /// The layer's text data (task 155), kept verbatim and not
+    /// interpreted: [`build_document`] attaches it to the tree with the
+    /// pixels' fingerprint, so a PSD save can write it back.
+    pub text: Option<PsdTextLayer>,
     /// The coverage of the layer's vector outline (task 151), for a shape
     /// layer that stores pixels and draws layer effects:
     /// [`build_document`] attaches it with the pixels' fingerprint, so the
@@ -560,6 +577,12 @@ enum Note {
     /// be read (`false`): the fill covers the whole canvas.
     FillVectorMaskNotApplied(bool),
     TextRasterised,
+    /// A text layer opened as pixels whose text data is kept for a PSD
+    /// save (task 155).
+    TextKept,
+    /// Kept text layers in a file whose embedded profile is not sRGB: the
+    /// colours inside the kept data are in that profile (task 155).
+    TextKeptProfile,
     SmartObjectRasterised,
     ShapeRasterised,
     FillRasterised,
@@ -642,6 +665,8 @@ struct Notes(
     /// Resource 1047, the transparent index of an Indexed Color file
     /// (task 148).
     Option<u16>,
+    /// The font names kept text layers reference (task 155).
+    std::collections::BTreeSet<String>,
 );
 
 impl Notes {
@@ -669,6 +694,15 @@ impl Notes {
         }
     }
 
+    /// Remembers the fonts a kept text layer references for the report.
+    fn add_fonts(&mut self, names: Vec<String>) {
+        for name in names {
+            if self.5.len() < text::MAX_FONTS_REPORTED * 4 {
+                self.5.insert(name);
+            }
+        }
+    }
+
     fn report(&self) -> PsdImportReport {
         PsdImportReport {
             items: self
@@ -676,6 +710,27 @@ impl Notes {
                 .iter()
                 .map(|(note, n)| {
                     let mut text = note_text(*note, *n);
+                    if matches!(note, Note::TextKept) && !self.5.is_empty() {
+                        let shown: Vec<&str> = self
+                            .5
+                            .iter()
+                            .take(text::MAX_FONTS_REPORTED)
+                            .map(String::as_str)
+                            .collect();
+                        let more = self.5.len().saturating_sub(shown.len());
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut text,
+                            format_args!(
+                                " Fonts they use: {}{}.",
+                                shown.join(", "),
+                                if more > 0 {
+                                    format!(" and {more} more")
+                                } else {
+                                    String::new()
+                                }
+                            ),
+                        );
+                    }
                     if matches!(
                         note,
                         Note::ColorLookup(read_adjust::ColorLookupReason::Table)
@@ -935,9 +990,27 @@ fn note_text(note: Note, n: u64) -> String {
                 fill::LeftOut::TooLarge => "drawing it would exceed the work or memory bound",
             },
         ),
-        Note::TextRasterised => {
-            format!("{n} text layer{s} opened as pixels; the text can't be edited.")
-        }
+        Note::TextRasterised => format!(
+            "{n} text layer{s} opened as pixels; the text can't be edited, and its text data \
+             isn't kept (the file isn't 8 or 16-bit RGB, the layer has no pixels, or the data is \
+             damaged or too large), so a saved .psd has {} as pixels.",
+            if one { "it" } else { "them" },
+        ),
+        Note::TextKept => format!(
+            "{n} text layer{s} opened as pixels; the text can't be edited in Aurora. Its text \
+             data is kept and written back when you save as .psd, so Photoshop should show \
+             {} as editable text again, unless {} painted on or moved first (Aurora hasn't \
+             checked this in Photoshop).",
+            if one { "it" } else { "them" },
+            if one { "it is" } else { "they are" },
+        ),
+        Note::TextKeptProfile => format!(
+            "{n} kept text layer{s} {} colours in the file's original colour profile, but a \
+             saved .psd carries sRGB pixels, so Photoshop may show {} text in slightly \
+             different colours if it is edited there.",
+            if one { "has" } else { "have" },
+            if one { "its" } else { "their" },
+        ),
         Note::SmartObjectRasterised => {
             format!("{n} smart object{s} opened as pixels; the original contents aren't kept.")
         }
@@ -1914,6 +1987,13 @@ struct Record {
     smart_filters: bool,
     /// The smart object [`smart::resolve`] matched to an embedded file.
     smart: Option<PsdSmartObject>,
+    /// The layer's `TySh`/`tySh` block when it is one of the kept shape
+    /// and within the per-block bound (task 155), before the file-wide
+    /// bound is applied.
+    text_candidate: Option<PsdTextLayer>,
+    /// [`Self::text_candidate`] once [`text::resolve`] has applied the
+    /// file-wide bound.
+    text: Option<PsdTextLayer>,
 }
 
 impl Record {
@@ -1984,7 +2064,11 @@ fn rect_from_edges(top: i32, left: i32, bottom: i32, right: i32) -> Result<Rect,
 }
 
 #[allow(clippy::too_many_lines)] // one arm per tagged block, nothing else
-fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
+fn read_record(
+    r: &mut Reader<'_>,
+    header: Header,
+    text_budget: &mut usize,
+) -> Result<Record, IoError> {
     let top = r.i32("layer rectangle")?;
     let left = r.i32("layer rectangle")?;
     let bottom = r.i32("layer rectangle")?;
@@ -2051,6 +2135,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
     let mut effects_blocks: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut smart_blocks: Vec<aurora_doc::SmartObjectBlock> = Vec::new();
     let mut smart_filters = false;
+    let mut text_candidate: Option<PsdTextLayer> = None;
     let mut features = Features {
         blend_if: blend_if_in_use(ranges),
         ..Features::default()
@@ -2073,7 +2158,12 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
                     .and_then(|b| <[u8; 4]>::try_from(b).ok())
                     .map(u32::from_be_bytes);
             }
-            b"TySh" | b"tySh" => features.text = true,
+            b"TySh" | b"tySh" => {
+                features.text = true;
+                if text_candidate.is_none() {
+                    text_candidate = text::candidate(key, data, text_budget);
+                }
+            }
             b"SoLd" | b"PlLd" | b"SoLE" => {
                 features.smart = true;
                 smart_blocks.push(aurora_doc::SmartObjectBlock {
@@ -2171,6 +2261,8 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
         smart_blocks,
         smart_filters,
         smart: None,
+        text_candidate,
+        text: None,
     })
 }
 
@@ -2756,10 +2848,13 @@ fn read_layer_info(
     let merged_alpha = count < 0;
     let count = count.unsigned_abs();
     let mut records = Vec::new();
+    // What the records may still copy of their text blocks, in all (task
+    // 155): the bound is applied as each block is met, not afterwards.
+    let mut text_budget = aurora_doc::MAX_TEXT_TOTAL_BYTES;
     for _ in 0..count {
         let bytes = read_record_bytes(src, r, header)?;
         let mut rr = Reader::new(&bytes);
-        let record = read_record(&mut rr, header)?;
+        let record = read_record(&mut rr, header, &mut text_budget)?;
         if rr.remaining() != 0 {
             return Err(malformed("layer record"));
         }
@@ -4267,6 +4362,19 @@ fn collect_smart_ids(nodes: &[PsdNode], out: &mut std::collections::BTreeSet<Str
     }
 }
 
+/// Whether any layer in `nodes` keeps text data (task 155). Iterative.
+fn collect_has_text(nodes: &[PsdNode]) -> bool {
+    let mut stack: Vec<&PsdNode> = nodes.iter().collect();
+    while let Some(node) = stack.pop() {
+        match node {
+            PsdNode::Layer(layer) if layer.text.is_some() => return true,
+            PsdNode::Group { children, .. } => stack.extend(children.iter()),
+            PsdNode::Layer(_) | PsdNode::Adjustment(_) => {}
+        }
+    }
+    false
+}
+
 /// A `hue2` record as an adjustment node, or `None` (with a report line)
 /// when its block is unreadable or is in a Grayscale file
 /// ([`hue_saturation_adjustment`]).
@@ -4477,8 +4585,24 @@ fn layer_node(
     // matched one with an empty rectangle or no readable channels is
     // reported like any other, and its file never enters the pool.
     let smart = record.smart.clone().filter(|_| pending.is_some());
+    // Text data is kept (task 155) only for an 8 or 16-bit RGB file, where
+    // Photoshop's text colours are RGB too (a 32-bit file's pixels were
+    // converted from linear light, its text colours were not), on a layer
+    // that has pixels to be the rendering, and not alongside a kept smart
+    // object.
+    let text = record.text.clone().filter(|_| {
+        pending.is_some() && smart.is_none() && header.color_mode == 3 && !header.float()
+    });
     if record.features.text {
-        notes.add(Note::TextRasterised);
+        if let Some(kept) = &text {
+            notes.add(Note::TextKept);
+            if notes.3.as_deref().is_some_and(|p| !looks_like_srgb(p)) {
+                notes.add(Note::TextKeptProfile);
+            }
+            notes.add_fonts(text::font_names(&kept.data));
+        } else {
+            notes.add(Note::TextRasterised);
+        }
     } else if record.features.smart {
         // A kept smart object is not a loss; the layer's pixels are its
         // rendering and are saved as before.
@@ -4515,6 +4639,7 @@ fn layer_node(
         image: None,
         mask,
         smart,
+        text,
         effect_shape,
         pending,
     }))
@@ -4821,6 +4946,7 @@ fn drawn_fill_node(
         image: Some(image),
         mask: outcome.mask,
         smart: None,
+        text: None,
         effect_shape: None,
         pending: None,
     }))
@@ -4855,6 +4981,7 @@ fn empty_fill_node(
         image: None,
         mask: outcome.mask,
         smart: None,
+        text: None,
         effect_shape: None,
         pending: None,
     })
@@ -4908,6 +5035,7 @@ fn artboard_background(
         image: Some(image),
         mask: None,
         smart: None,
+        text: None,
         effect_shape: None,
         pending: None,
     }))
@@ -5825,6 +5953,8 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
     let mut linked_windows: Vec<([u8; 4], Window)> = Vec::new();
     // The document-level pattern blocks (task 111), located only.
     let mut pattern_windows: Vec<Window> = Vec::new();
+    // The document-level text-engine block (task 155), located only.
+    let mut text_engine_window: Option<Window> = None;
     if section.remaining() > 0 {
         let info_len = section.length(src, psb, "layer info length")?;
         let mut body = section.sub(info_len, "layer info")?;
@@ -5845,6 +5975,7 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
             match &key {
                 b"lnk2" | b"lnkD" | b"lnk3" | b"lnkE" => linked_windows.push((key, data)),
                 b"Patt" | b"Pat2" | b"Pat3" => pattern_windows.push(data),
+                b"Txt2" if text_engine_window.is_none() => text_engine_window = Some(data),
                 b"Lr16" | b"Layr" | b"Lr32" if info.records.is_empty() => {
                     let tagged_alpha = info.merged_alpha;
                     info = read_layer_info(src, &mut data, header)?;
@@ -5911,6 +6042,7 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
     // Smart objects (0.200.0): matched to their embedded files before the
     // tree is built, so the build knows which ones are kept.
     let resolved = smart::resolve(src, &mut info.records, &linked_windows, &mut effects_budget)?;
+    text::resolve(&mut info.records);
     let cmyk_colours = header.cmyk().then(|| cmyk_converter(notes.3.as_deref()));
     let layers = build_tree(
         src,
@@ -5924,6 +6056,11 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
     // object dropped on the way (no pixels) must not pool its file.
     let mut named = std::collections::BTreeSet::new();
     collect_smart_ids(&layers, &mut named);
+    let text_engine = if collect_has_text(&layers) {
+        text::read_engine(src, text_engine_window)?
+    } else {
+        None
+    };
     let linked_files: Vec<aurora_doc::LinkedFile> = resolved
         .into_iter()
         .filter(|f| named.contains(&f.unique_id))
@@ -5989,6 +6126,7 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         layers,
         composite,
         linked_files,
+        text_engine,
         patterns,
         notes,
     })
@@ -6322,6 +6460,7 @@ fn build_streamed(
         layers: nodes,
         composite,
         linked_files,
+        text_engine,
         patterns,
         mut notes,
     } = file;
@@ -6343,6 +6482,7 @@ fn build_streamed(
     for file in linked_files {
         layers.add_linked_file(file)?;
     }
+    layers.set_text_engine_data(text_engine)?;
     for pattern in patterns {
         layers.add_pattern(pattern)?;
     }
@@ -6905,6 +7045,26 @@ impl Builder<'_, '_, '_> {
                                 pixel_fingerprint,
                             }),
                         )?;
+                    }
+                    if let (Some(image), Some(text)) = (&image, layer.text) {
+                        // The fingerprint of the pixels as they will sit in
+                        // the layer's surface, so a later save can tell
+                        // whether they are still the text's rendering
+                        // (task 155).
+                        let pixel_fingerprint =
+                            crate::import::placed_image_fingerprint(image, offset.0, offset.1)?;
+                        // A document-wide bound the file-level one should
+                        // have met already; a refusal only drops the data.
+                        let _ = self.history.set_text_layer(
+                            self.layers,
+                            id,
+                            Some(aurora_doc::TextLayer {
+                                key: text.key,
+                                data: text.data,
+                                bounds,
+                                pixel_fingerprint,
+                            }),
+                        );
                     }
                     if let Some(image) = image {
                         self.sink.layer(PsdPixels {

@@ -262,6 +262,21 @@ enum LayerOp {
         id: LayerId,
         value: Option<crate::PackedEffectShape>,
     },
+    /// Replace a pixel layer's preserved Photoshop text data (task 155);
+    /// `None` removes it. `LayerEntry::text_layer` is `#[serde(skip)]`, so
+    /// [`History::save_journal`] follows every journaled `Restore` that
+    /// carries one with one of these, and **only then**: a journal without
+    /// text data is byte-identical to the ones older builds wrote. The
+    /// payload is positional `postcard` too: a change to
+    /// [`crate::TextLayer`]'s shape needs a new variant, never an edit of
+    /// this one. Appended after [`Self::SetEffectShape`] (ordinal 26), so
+    /// an Aurora older than this build refuses a journal holding it
+    /// (ADR 0009). The document's `Txt2` block is not in the journal: it
+    /// is carried by `.aur`'s `text-layers` entry.
+    SetTextLayer {
+        id: LayerId,
+        value: Option<Box<crate::text_layer::TextLayer>>,
+    },
 }
 
 /// One layer's smoothed-ramp flags a journaled op carries (see
@@ -396,6 +411,19 @@ fn restored_smart_objects(op: &LayerOp) -> Vec<(LayerId, Box<crate::smart_object
             .entries
             .iter()
             .filter_map(|(id, entry)| entry.smart_object.clone().map(|so| (*id, so)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every `(layer, text data)` pair a journaled `Restore` carries in a
+/// subtree entry whose text data would be lost on the wire.
+fn restored_text_layers(op: &LayerOp) -> Vec<(LayerId, Box<crate::text_layer::TextLayer>)> {
+    match op {
+        LayerOp::Restore(subtree) => subtree
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| entry.text_layer.clone().map(|t| (*id, t)))
             .collect(),
         _ => Vec::new(),
     }
@@ -748,6 +776,14 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
             // shadows reach.
             Ok((LayerOp::SetEffectShape { id, value: old }, None))
         }
+        LayerOp::SetTextLayer { id, value } => {
+            let old = tree.text_layer(id).cloned().map(Box::new);
+            tree.set_text_layer(id, value.map(|t| *t))?;
+            // `None`: region unknown, as for `SetSmartObject`; no pixel
+            // changes and the PSD open that creates these clears the undo
+            // stack.
+            Ok((LayerOp::SetTextLayer { id, value: old }, None))
+        }
         LayerOp::SetClipped { id, value } => {
             let old = tree.clipped(id);
             tree.set_clipped_flag(id, value)?;
@@ -949,6 +985,10 @@ fn describe(op: &LayerOp) -> String {
         LayerOp::SetEffectShape { id, value } => match value {
             Some(_) => format!("Kept the effect shape of layer #{}", id.to_raw()),
             None => format!("Removed the effect shape of layer #{}", id.to_raw()),
+        },
+        LayerOp::SetTextLayer { id, value } => match value {
+            Some(_) => format!("Kept the text data of layer #{}", id.to_raw()),
+            None => format!("Removed the text data of layer #{}", id.to_raw()),
         },
         LayerOp::SetClipped { id, value } => {
             let verb = if *value {
@@ -1294,6 +1334,13 @@ impl History {
                 wire.push(std::borrow::Cow::Owned(LayerOp::SetEffectShape {
                     id,
                     value: Some(crate::PackedEffectShape::of(&value)),
+                }));
+            }
+            // The text data (task 155) the same way.
+            for (id, value) in restored_text_layers(op) {
+                wire.push(std::borrow::Cow::Owned(LayerOp::SetTextLayer {
+                    id,
+                    value: Some(value),
                 }));
             }
             // The clipping flag (0.201.0) the same way.
@@ -2137,6 +2184,31 @@ impl History {
             value: value.map(Box::new),
         });
         self.push(LayerOp::SetSmartObject { id, value: old });
+        Ok(None)
+    }
+
+    /// Same as [`LayerTree::set_text_layer`], recorded for undo as one
+    /// `LayerOp::SetTextLayer` step (task 155). Returns `None` (region
+    /// unknown) like [`Self::set_smart_object`]; the PSD open that creates
+    /// these ops clears the undo stack afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LayerTree::set_text_layer`]. Nothing is recorded when it
+    /// fails.
+    pub fn set_text_layer(
+        &mut self,
+        tree: &mut LayerTree,
+        id: LayerId,
+        value: Option<crate::text_layer::TextLayer>,
+    ) -> Result<Option<Rect>, DocError> {
+        let old = tree.text_layer(id).cloned().map(Box::new);
+        tree.set_text_layer(id, value.clone())?;
+        self.journal.push(LayerOp::SetTextLayer {
+            id,
+            value: value.map(Box::new),
+        });
+        self.push(LayerOp::SetTextLayer { id, value: old });
         Ok(None)
     }
 
@@ -6208,6 +6280,107 @@ mod adjustment_tests {
         let id = crate::LayerId::from_raw(1);
         let bytes = postcard::to_allocvec(&LayerOp::SetSmartObject { id, value: None });
         assert_eq!(bytes.ok().and_then(|b| b.first().copied()), Some(17));
+    }
+
+    fn text_layer(seed: u8) -> crate::TextLayer {
+        crate::TextLayer {
+            key: *b"TySh",
+            data: vec![seed; 12],
+            bounds: bounds(),
+            pixel_fingerprint: u64::from(seed),
+        }
+    }
+
+    #[test]
+    fn set_text_layer_undo_redo_replay_and_validation() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let layer = match history.add_pixel_layer(&mut tree, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match history.add_group(&mut tree, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(tree.text_layer(layer).is_none());
+        if let Err(err) = history.set_text_layer(&mut tree, layer, Some(text_layer(1))) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.text_layer(layer), Some(&text_layer(1)));
+        assert_eq!(
+            replayed_through_postcard(&history).text_layer(layer),
+            Some(&text_layer(1)),
+            "journal replay"
+        );
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert!(tree.text_layer(layer).is_none());
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.text_layer(layer), Some(&text_layer(1)));
+        let steps = history.journal_len();
+        assert!(matches!(
+            history.set_text_layer(&mut tree, group, Some(text_layer(2))),
+            Err(DocError::NotAPixelLayer(_))
+        ));
+        let mut bad = text_layer(3);
+        bad.key = *b"SoLd";
+        assert!(matches!(
+            history.set_text_layer(&mut tree, layer, Some(bad)),
+            Err(DocError::InvalidTextLayer(_))
+        ));
+        assert_eq!(tree.text_layer(layer), Some(&text_layer(1)));
+        assert_eq!(history.journal_len(), steps, "refusals record nothing");
+    }
+
+    #[test]
+    fn restored_subtree_keeps_text_layers_through_journal() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let group = match history.add_group(&mut tree, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match history.add_pixel_layer(&mut tree, "c", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_text_layer(&mut tree, child, Some(text_layer(9))) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.remove(&mut tree, group) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(replayed_through_postcard(&history).text_layer(child), None);
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.text_layer(child), Some(&text_layer(9)), "in memory");
+        assert_eq!(
+            replayed_through_postcard(&history).text_layer(child),
+            Some(&text_layer(9)),
+            "through the wire"
+        );
+    }
+
+    /// Task 155: `SetTextLayer` is appended after `SetEffectShape` (25), and
+    /// a journal without text data is byte-identical to before.
+    #[test]
+    fn set_text_layer_is_appended_after_set_effect_shape() {
+        let id = crate::LayerId::from_raw(1);
+        let first = |op: &LayerOp| {
+            postcard::to_allocvec(op)
+                .ok()
+                .and_then(|b| b.first().copied())
+        };
+        assert_eq!(
+            first(&LayerOp::SetEffectShape { id, value: None }),
+            Some(25)
+        );
+        assert_eq!(first(&LayerOp::SetTextLayer { id, value: None }), Some(26));
     }
 
     #[test]

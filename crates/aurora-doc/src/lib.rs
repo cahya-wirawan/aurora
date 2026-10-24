@@ -59,6 +59,7 @@ mod selection_refine_tests;
 #[cfg(test)]
 mod selection_tests;
 pub mod smart_object;
+mod text_layer;
 mod text_safety;
 mod tree;
 
@@ -106,5 +107,9 @@ pub use selection_refine::{
     feather, smooth,
 };
 pub use smart_object::{LinkedFile, SmartObject, SmartObjectBlock, SmartObjectError};
+pub use text_layer::{
+    MAX_TEXT_BLOCK_BYTES, MAX_TEXT_ENGINE_BYTES, MAX_TEXT_TOTAL_BYTES, TEXT_BLOCK_KEYS, TextLayer,
+    TextLayerError,
+};
 pub use text_safety::sanitize_display_name;
 pub use tree::{LayerTree, MAX_LAYER_TREE_DEPTH};

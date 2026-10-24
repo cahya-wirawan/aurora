@@ -742,6 +742,13 @@ pub(crate) struct LayerEntry {
     /// one plane.
     #[serde(skip)]
     pub(crate) effect_shape: Option<std::sync::Arc<crate::effect_shape::EffectShape>>,
+    /// The layer's preserved Photoshop text data (task 155), on a pixel
+    /// layer only. `#[serde(skip)]` for the same reason as
+    /// [`Self::smart_object`]: it travels as `.aur`'s optional
+    /// `text-layers` entry and as the `LayerOp::SetTextLayer` that
+    /// [`crate::History::save_journal`] emits after a journaled `Restore`.
+    #[serde(skip)]
+    pub(crate) text_layer: Option<Box<crate::text_layer::TextLayer>>,
 }
 
 impl LayerEntry {
@@ -761,6 +768,7 @@ impl LayerEntry {
             clipped: false,
             blend_options: LayerBlendOptions::default(),
             effect_shape: None,
+            text_layer: None,
         }
     }
 }
