@@ -2786,3 +2786,35 @@ fn a_failing_merged_row_is_written_up_to_and_reported() {
         "rows before the failing one were not written: {written:?}"
     );
 }
+
+/// Task 154: the two verify passes run side by side, but when both fail
+/// the raw pass's error is the one returned, as when it ran first.
+#[test]
+fn verify_reports_the_raw_pass_first_when_both_passes_fail() {
+    let mut doc = Doc::new((8, 8));
+    let px = image(8, 8, |x, y| [level(x), level(y), 0.5, 1.0]);
+    doc.layer("A", rect(0, 0, 8, 8), Some((&px, 0, 0)));
+    let (bytes, outcome) = ok(doc.write());
+    let dir = ok(tempfile::tempdir());
+    let path = dir.path().join("v.psd");
+    ok(std::fs::write(&path, &bytes));
+    let with = |sample: bool, decoded: bool| {
+        let mut bad = outcome.expected.clone();
+        if let Some(l) = bad.layers.first_mut() {
+            if sample {
+                l.sample_hash ^= 1;
+            }
+            if decoded {
+                l.decoded_hash ^= 1;
+            }
+        }
+        match verify_psd_file(&path, &bad) {
+            Err(err) => err.to_string(),
+            Ok(()) => unreachable!("a wrong hash verified"),
+        }
+    };
+    let raw_only = with(true, false);
+    let reader_only = with(false, true);
+    assert_ne!(raw_only, reader_only, "the passes fail differently");
+    assert_eq!(with(true, true), raw_only);
+}
