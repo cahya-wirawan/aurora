@@ -320,6 +320,8 @@ enum TextDrop {
     Pixels,
     /// The layer was moved; its transform would be wrong.
     Moved,
+    /// The layer holds no stored pixels, so nothing shows the text.
+    NoPixels,
 }
 
 /// The counts behind a [`PsdWriteReport`]: structural ones known before
@@ -489,6 +491,10 @@ impl Losses {
             (
                 TextDrop::Moved,
                 "they were moved, and Aurora does not update a text layer's position",
+            ),
+            (
+                TextDrop::NoPixels,
+                "they hold no stored pixels, so nothing shows the text",
             ),
         ] {
             let names: Vec<&str> = self
@@ -1674,11 +1680,12 @@ fn text_for(
     if text.bounds != *bounds {
         return drop_for(TextDrop::Moved);
     }
-    let unchanged = extent.2 > 0
-        && extent.3 > 0
-        && aurora_doc::smart_object::surface_fingerprint(store, surface, *bounds)?
-            == text.pixel_fingerprint;
-    if !unchanged {
+    if extent.2 == 0 || extent.3 == 0 {
+        return drop_for(TextDrop::NoPixels);
+    }
+    if aurora_doc::smart_object::surface_fingerprint(store, surface, *bounds)?
+        != text.pixel_fingerprint
+    {
         return drop_for(TextDrop::Pixels);
     }
     let mut data = text.data.clone();

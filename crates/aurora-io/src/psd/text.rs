@@ -10,15 +10,13 @@
 //!
 //! **Bounded against hostile input.** A layer's block is limited to
 //! [`MAX_TEXT_BLOCK_BYTES`], all layers' blocks together to
-//! [`MAX_TEXT_TOTAL_BYTES`], and the `Txt2` block to
+//! [`aurora_doc::MAX_TEXT_TOTAL_BYTES`], and the `Txt2` block to
 //! [`MAX_TEXT_ENGINE_BYTES`]; a block over its bound is not kept (the layer
 //! opens as pixels and the open reports it). The font scan is linear in the
 //! block and keeps at most [`MAX_FONTS_PER_LAYER`] names of
 //! [`MAX_FONT_NAME_CHARS`] characters.
 
-use aurora_doc::{
-    MAX_TEXT_BLOCK_BYTES, MAX_TEXT_ENGINE_BYTES, MAX_TEXT_TOTAL_BYTES, TEXT_BLOCK_KEYS,
-};
+use aurora_doc::{MAX_TEXT_BLOCK_BYTES, MAX_TEXT_ENGINE_BYTES, TEXT_BLOCK_KEYS};
 
 use super::{ByteSource, IoError, Record, Window};
 
@@ -41,36 +39,39 @@ pub struct PsdTextLayer {
 
 /// A block's data if it is one of the kept kinds, long enough to hold the
 /// fixed head Photoshop writes (version, transform, text version,
-/// descriptor version) and within the per-block bound.
-pub(super) fn candidate(key: [u8; 4], data: &[u8]) -> Option<PsdTextLayer> {
+/// descriptor version), within the per-block bound **and within what is
+/// left of the file-wide bound** (`budget`, which starts at
+/// [`aurora_doc::MAX_TEXT_TOTAL_BYTES`] and is charged for every block copied). The
+/// copy is only made after those checks, so a hostile file with thousands
+/// of records never holds more than the bound, whatever its size.
+pub(super) fn candidate(key: [u8; 4], data: &[u8], budget: &mut usize) -> Option<PsdTextLayer> {
     // `TySh`: version (2), transform (48), text version (2), descriptor
     // version (4). The legacy `tySh` has the same version and transform.
     const HEAD: usize = 2 + 48 + 2 + 4;
     let ok = TEXT_BLOCK_KEYS.contains(&key)
         && data.len() >= HEAD
         && data.len() <= MAX_TEXT_BLOCK_BYTES
+        && data.len() <= *budget
         && data.starts_with(&[0, 1]);
-    ok.then(|| PsdTextLayer {
+    if !ok {
+        return None;
+    }
+    *budget -= data.len();
+    Some(PsdTextLayer {
         key,
         data: data.to_vec(),
     })
 }
 
-/// Applies the file-wide bound to the candidates, in record order: the
-/// blocks that fit [`MAX_TEXT_TOTAL_BYTES`] together become
-/// [`Record::text`]; later ones stay unkept.
+/// Promotes the candidates to [`Record::text`], except those on a group's
+/// records. The file-wide bound was applied while the records were read
+/// ([`candidate`]), so nothing larger than it was ever copied.
 pub(super) fn resolve(records: &mut [Record]) {
-    let mut total = 0usize;
     for record in records.iter_mut() {
         let Some(candidate) = record.text_candidate.take() else {
             continue;
         };
-        if record.section.is_some() {
-            continue;
-        }
-        let size = candidate.data.len();
-        if total.saturating_add(size) <= MAX_TEXT_TOTAL_BYTES {
-            total += size;
+        if record.section.is_none() {
             record.text = Some(candidate);
         }
     }
@@ -241,6 +242,7 @@ fn decode_name(bytes: &[u8]) -> String {
 #[allow(clippy::indexing_slicing)] // fixed-size fixtures
 mod tests {
     use super::*;
+    use aurora_doc::MAX_TEXT_TOTAL_BYTES;
 
     fn utf16(name: &str) -> Vec<u8> {
         let mut out = vec![0xFE, 0xFF];
@@ -328,17 +330,53 @@ mod tests {
     #[test]
     fn candidates_need_a_kept_key_a_head_and_the_bound() {
         let good = block_with(&engine_with(&["A"]));
-        assert!(candidate(*b"TySh", &good).is_some());
-        assert!(candidate(*b"tySh", &good).is_some());
-        assert!(candidate(*b"SoLd", &good).is_none());
-        assert!(candidate(*b"TySh", &good[..50]).is_none(), "no head");
+        let fresh = || MAX_TEXT_TOTAL_BYTES;
+        assert!(candidate(*b"TySh", &good, &mut fresh()).is_some());
+        assert!(candidate(*b"tySh", &good, &mut fresh()).is_some());
+        assert!(candidate(*b"SoLd", &good, &mut fresh()).is_none());
+        assert!(
+            candidate(*b"TySh", &good[..50], &mut fresh()).is_none(),
+            "no head"
+        );
         let mut wrong_version = good.clone();
         wrong_version[1] = 2;
-        assert!(candidate(*b"TySh", &wrong_version).is_none());
+        assert!(candidate(*b"TySh", &wrong_version, &mut fresh()).is_none());
         let mut big = vec![0, 1];
         big.resize(MAX_TEXT_BLOCK_BYTES, 0);
-        assert!(candidate(*b"TySh", &big).is_some(), "the bound itself");
+        assert!(
+            candidate(*b"TySh", &big, &mut fresh()).is_some(),
+            "the bound itself"
+        );
         big.push(0);
-        assert!(candidate(*b"TySh", &big).is_none(), "one over");
+        assert!(
+            candidate(*b"TySh", &big, &mut fresh()).is_none(),
+            "one over"
+        );
+    }
+
+    #[test]
+    fn the_budget_is_charged_and_nothing_past_it_is_copied() {
+        let mut block = block_with(&engine_with(&["A"]));
+        block.resize(MAX_TEXT_BLOCK_BYTES, 0);
+        let mut budget = MAX_TEXT_TOTAL_BYTES;
+        let mut copied = 0usize;
+        let mut kept = 0usize;
+        for _ in 0..1000 {
+            if let Some(c) = candidate(*b"TySh", &block, &mut budget) {
+                copied += c.data.len();
+                kept += 1;
+            }
+        }
+        assert_eq!(kept, MAX_TEXT_TOTAL_BYTES / MAX_TEXT_BLOCK_BYTES);
+        assert_eq!(copied, MAX_TEXT_TOTAL_BYTES, "exactly the bound, no more");
+        assert_eq!(budget, 0);
+        // A block that does not fit leaves the budget alone; a smaller one
+        // after it still fits.
+        let small = block_with(&engine_with(&[]));
+        let mut budget = small.len() + 7;
+        assert!(candidate(*b"TySh", &block, &mut budget).is_none());
+        assert_eq!(budget, small.len() + 7);
+        assert!(candidate(*b"TySh", &small, &mut budget).is_some());
+        assert_eq!(budget, 7);
     }
 }

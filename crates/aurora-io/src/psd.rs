@@ -110,7 +110,7 @@
 //!   layers with no pixels are left out; text,
 //!   smart-object and shape layers open as their stored pixels. A text
 //!   layer's `TySh` block and the document's `Txt2` block are kept
-//!   verbatim when the file is RGB (task 155, [`PsdLayer::text`],
+//!   verbatim when the file is 8 or 16-bit RGB (task 155, [`PsdLayer::text`],
 //!   [`PsdFile::text_engine`], the `text` module) and written back by a
 //!   save while the layer's pixels and position are unchanged; the open
 //!   still reports the layer as opened as pixels, with the kept/not kept
@@ -992,8 +992,8 @@ fn note_text(note: Note, n: u64) -> String {
         ),
         Note::TextRasterised => format!(
             "{n} text layer{s} opened as pixels; the text can't be edited, and its text data \
-             isn't kept (the file isn't RGB, the layer has no pixels, or the data is damaged or \
-             too large), so a saved .psd has {} as pixels.",
+             isn't kept (the file isn't 8 or 16-bit RGB, the layer has no pixels, or the data is \
+             damaged or too large), so a saved .psd has {} as pixels.",
             if one { "it" } else { "them" },
         ),
         Note::TextKept => format!(
@@ -2064,7 +2064,11 @@ fn rect_from_edges(top: i32, left: i32, bottom: i32, right: i32) -> Result<Rect,
 }
 
 #[allow(clippy::too_many_lines)] // one arm per tagged block, nothing else
-fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
+fn read_record(
+    r: &mut Reader<'_>,
+    header: Header,
+    text_budget: &mut usize,
+) -> Result<Record, IoError> {
     let top = r.i32("layer rectangle")?;
     let left = r.i32("layer rectangle")?;
     let bottom = r.i32("layer rectangle")?;
@@ -2157,7 +2161,7 @@ fn read_record(r: &mut Reader<'_>, header: Header) -> Result<Record, IoError> {
             b"TySh" | b"tySh" => {
                 features.text = true;
                 if text_candidate.is_none() {
-                    text_candidate = text::candidate(key, data);
+                    text_candidate = text::candidate(key, data, text_budget);
                 }
             }
             b"SoLd" | b"PlLd" | b"SoLE" => {
@@ -2844,10 +2848,13 @@ fn read_layer_info(
     let merged_alpha = count < 0;
     let count = count.unsigned_abs();
     let mut records = Vec::new();
+    // What the records may still copy of their text blocks, in all (task
+    // 155): the bound is applied as each block is met, not afterwards.
+    let mut text_budget = aurora_doc::MAX_TEXT_TOTAL_BYTES;
     for _ in 0..count {
         let bytes = read_record_bytes(src, r, header)?;
         let mut rr = Reader::new(&bytes);
-        let record = read_record(&mut rr, header)?;
+        let record = read_record(&mut rr, header, &mut text_budget)?;
         if rr.remaining() != 0 {
             return Err(malformed("layer record"));
         }
@@ -4578,13 +4585,14 @@ fn layer_node(
     // matched one with an empty rectangle or no readable channels is
     // reported like any other, and its file never enters the pool.
     let smart = record.smart.clone().filter(|_| pending.is_some());
-    // Text data is kept (task 155) only for an RGB file, where Photoshop's
-    // text colours are RGB too, on a layer that has pixels to be the
-    // rendering, and not alongside a kept smart object.
-    let text = record
-        .text
-        .clone()
-        .filter(|_| pending.is_some() && smart.is_none() && header.color_mode == 3);
+    // Text data is kept (task 155) only for an 8 or 16-bit RGB file, where
+    // Photoshop's text colours are RGB too (a 32-bit file's pixels were
+    // converted from linear light, its text colours were not), on a layer
+    // that has pixels to be the rendering, and not alongside a kept smart
+    // object.
+    let text = record.text.clone().filter(|_| {
+        pending.is_some() && smart.is_none() && header.color_mode == 3 && !header.float()
+    });
     if record.features.text {
         if let Some(kept) = &text {
             notes.add(Note::TextKept);

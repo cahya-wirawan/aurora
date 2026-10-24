@@ -284,6 +284,68 @@ fn the_total_bound_keeps_the_first_layers_and_drops_the_rest() {
 }
 
 #[test]
+fn many_large_blocks_never_make_the_reader_copy_more_than_the_bound() {
+    // 40 records of 1 MiB each (40 MiB of file): the reader must stop
+    // copying once the file-wide bound is spent, at the point each record
+    // is read, not afterwards.
+    let per = MAX_TEXT_BLOCK_BYTES;
+    let mut psd = TestPsd::new(1, 8, 8, 8);
+    psd.layers = (0..40)
+        .map(|i| {
+            let mut block = tysh(&["A"], i as u8);
+            block.resize(per, 0);
+            TestLayer::pixels(&format!("T{i}"), 0, 0, 4, 4, 8, &rgba(4, 4, i as u16)).with(|l| {
+                l.blocks = vec![(*b"TySh", block.clone())];
+            })
+        })
+        .collect();
+    let bytes = psd.write();
+    let (_, records) = super::tests::records_of(&bytes);
+    assert_eq!(records.len(), 40);
+    let copied: usize = records
+        .iter()
+        .filter_map(|r| r.text_candidate.as_ref())
+        .map(|c| c.data.len())
+        .sum();
+    assert_eq!(
+        copied,
+        aurora_doc::MAX_TEXT_TOTAL_BYTES,
+        "exactly the bound"
+    );
+    let with: Vec<bool> = records.iter().map(|r| r.text_candidate.is_some()).collect();
+    assert_eq!(
+        with.iter().filter(|b| **b).count(),
+        aurora_doc::MAX_TEXT_TOTAL_BYTES / per
+    );
+    assert!(with[..8].iter().all(|b| *b), "the first ones");
+    assert!(with[8..].iter().all(|b| !*b), "none after the bound");
+}
+
+#[test]
+fn a_32_bit_file_does_not_keep_text() {
+    // Its pixels were converted from linear light; the text colours were
+    // not, so the kept data would not match.
+    let psd = TestPsd::new(1, 8, 8, 32).with(|p| {
+        p.layers = vec![
+            TestLayer::floats("T", 0, 0, 4, 4, &[[0.5, 0.25, 0.75, 1.0]; 16]).with(|l| {
+                l.blocks = vec![(*b"TySh", tysh(&["A"], 3))];
+            }),
+        ];
+        p.globals = vec![(*b"Txt2", txt2())];
+    });
+    let opened = Opened::new(&psd.write());
+    assert!(text_names(&opened.document.layers).is_empty());
+    assert!(opened.document.layers.text_engine_data().is_none());
+    let items = &opened.document.report.items;
+    assert!(
+        items
+            .iter()
+            .any(|i| i.contains("text layer") && i.contains("isn't kept")),
+        "{items:?}"
+    );
+}
+
+#[test]
 fn an_oversized_or_missing_engine_block_keeps_the_layers_without_it() {
     let huge = vec![b'x'; aurora_doc::MAX_TEXT_ENGINE_BYTES + 1];
     for globals in [vec![(*b"Txt2", huge)], Vec::new()] {
@@ -473,7 +535,13 @@ fn a_layer_with_no_pixels_never_keeps_text_even_with_a_matching_fingerprint() {
         }),
     ));
     let (outcome, tree, _) = dropped(&mut opened);
-    assert!(report_text(&outcome).contains("Blank"), "{outcome:?}");
+    let text = report_text(&outcome);
+    assert!(text.contains("Blank"), "{outcome:?}");
+    assert!(
+        text.contains("hold no stored pixels"),
+        "an accurate reason: {text}"
+    );
+    assert!(!text.contains("painted or erased"), "{text}");
     assert_eq!(text_names(&tree).len(), 2);
 }
 
@@ -810,7 +878,6 @@ fn photoshops_own_text_files_round_trip() {
     let base = "corpora/psd/reference/psd-tools-fixtures";
     for (file, layers) in [
         ("text.psd", 1),
-        ("pen-text.psd", 2),
         ("layers/type-layer.psd", 1),
         ("layers-minimal/type-layer.psd", 1),
     ] {
@@ -818,6 +885,28 @@ fn photoshops_own_text_files_round_trip() {
             assert_eq!(count, layers, "{file}");
         }
     }
+}
+
+#[test]
+fn photoshops_32_bit_text_file_is_not_kept() {
+    // `pen-text.psd` is a 32-bit file: its pixels were converted from linear
+    // light, so its text data is not kept.
+    let Some(bytes) = corpus("corpora/psd/reference/psd-tools-fixtures/pen-text.psd") else {
+        return;
+    };
+    let opened = Opened::new(&bytes);
+    assert!(text_names(&opened.document.layers).is_empty());
+    assert!(opened.document.layers.text_engine_data().is_none());
+    assert!(
+        opened
+            .document
+            .report
+            .items
+            .iter()
+            .any(|i| i.starts_with("2 text layers opened as pixels") && i.contains("isn't kept")),
+        "{:?}",
+        opened.document.report.items
+    );
 }
 
 #[test]
@@ -868,7 +957,10 @@ fn write_text_fixtures_for_psd_tools() {
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../corpora/psd/reference/psd-tools-fixtures");
     let mut index = Vec::new();
-    for (file, tag) in [("text.psd", "text"), ("pen-text.psd", "pen-text")] {
+    for (file, tag) in [
+        ("text.psd", "text"),
+        ("layers/type-layer.psd", "type-layer"),
+    ] {
         let source = base.join(file);
         let mut opened = Opened::new(&ok(std::fs::read(&source)));
         let (bytes, _) = opened.write();

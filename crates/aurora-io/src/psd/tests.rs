@@ -2563,7 +2563,7 @@ fn source(bytes: &[u8]) -> super::StreamSource<std::io::Cursor<&[u8]>> {
     ok(super::StreamSource::new(std::io::Cursor::new(bytes)))
 }
 
-fn records_of(bytes: &[u8]) -> (super::Header, Vec<super::Record>) {
+pub(super) fn records_of(bytes: &[u8]) -> (super::Header, Vec<super::Record>) {
     let mut src = ok(super::StreamSource::new(std::io::Cursor::new(bytes)));
     let mut r = super::Reader::new(bytes);
     let header = ok(super::read_header(&mut r));
