@@ -18467,12 +18467,12 @@ fn fold_layer_with_effects(
     // over the laid-down layer instead (below), at the outline's coverage:
     // inside the interior they would be scaled by the pixels' alpha, which
     // a translucent fill makes partial.
-    let outline = effect_shape_app::valid_effect_shape(id, layers, store).is_some();
+    let outline = effect_shape_app::valid_effect_shape(id, layers, store);
     for shown in &strokes {
         let Some(plane) = &shown.planes.inside else {
             continue;
         };
-        if outline {
+        if outline.is_some() {
             continue;
         }
         for run in &runs {
@@ -18522,11 +18522,19 @@ fn fold_layer_with_effects(
     return_tile_scratch(interior);
     return_tile_scratch(source);
     // Step 3a (task 151): the inside strokes of a layer with an effect
-    // shape, over the laid-down layer, at the layer's opacity.
-    if outline {
-        for shown in &strokes {
-            if let Some(plane) = &shown.planes.inside {
-                fold_stroke_plane(accumulator, plane, 0, shown, scale, doc_origin);
+    // shape, over the laid-down layer, at the layer's opacity and clipped
+    // by the outline's coverage (an inside plane is 1 everywhere outside
+    // the shape, where the distance to the exterior is zero).
+    if let Some(shape) = &outline {
+        let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
+        let side = aurora_tile::TILE as usize;
+        let cover = effect_shape_app::shape_window(shape, origin, doc_origin, side);
+        if let Some(cover) = cover {
+            for shown in &strokes {
+                if let Some(plane) = &shown.planes.inside {
+                    let clipped: Vec<f32> = plane.iter().zip(&cover).map(|(p, c)| p * c).collect();
+                    fold_stroke_plane(accumulator, &clipped, 0, shown, scale, doc_origin);
+                }
             }
         }
     }
@@ -93839,10 +93847,18 @@ mod tests {
             aurora_doc::LayerTree,
             aurora_doc::LayerId,
         ) {
-            let (dir, mut store, mut layers, id) = {
-                let (d, s, l, i) = stroked_square(StrokePosition::Outside, 3.0);
-                (d, s, l, i)
-            };
+            translucent_shape_with(StrokePosition::Outside)
+        }
+
+        fn translucent_shape_with(
+            position: StrokePosition,
+        ) -> (
+            tempfile::TempDir,
+            aurora_tile::TileStore,
+            aurora_doc::LayerTree,
+            aurora_doc::LayerId,
+        ) {
+            let (dir, mut store, mut layers, id) = stroked_square(position, 3.0);
             fade(&mut store, &layers, id, (100, 100, 40, 40), 0.25);
             let fingerprint = fingerprint_of(&mut store, &layers, id);
             let shape = ok(aurora_doc::EffectShape::new(
@@ -93886,6 +93902,28 @@ mod tests {
                 near(texel(&acc, x, y), RED);
             }
             near(texel(&acc, 96, 120), CLEAR);
+        }
+
+        /// An inside stroke of a translucent shape is a solid frame at the
+        /// outline's edge (not faded by the fill's alpha), nothing outside
+        /// the outline, and the interior is left as it was.
+        #[test]
+        fn an_inside_stroke_of_a_translucent_shape_is_a_solid_frame() {
+            let (_d, mut store, layers, _) = translucent_shape_with(StrokePosition::Inside);
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            for (x, y) in [(100, 120), (102, 120), (137, 120), (139, 120), (120, 100)] {
+                near(texel(&acc, x, y), RED);
+            }
+            near(texel(&acc, 120, 120), [0.0625, 0.0625, 0.0625, 0.25]);
+            near(texel(&acc, 103, 120), [0.0625, 0.0625, 0.0625, 0.25]);
+            near(texel(&acc, 99, 120), CLEAR);
+            near(texel(&acc, 140, 120), CLEAR);
+            // Without the shape the frame is faded by the alpha.
+            let (_d2, mut store2, mut layers2, id2) =
+                translucent_shape_with(StrokePosition::Inside);
+            ok(layers2.set_effect_shape(id2, None));
+            let plain = composite_tile_at(&layers2, &mut store2, 0, 0, (0, 0));
+            assert!(texel(&plain, 101, 120)[3] < 0.5);
         }
 
         /// Without a shape the same layer strokes from its alpha, and the
