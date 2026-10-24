@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.287.0] - 2026-10-24
+
+### Added
+
+- Record layer-effect strokes following a shape layer's outline
+
 ## [0.286.0] - 2026-10-22
 
 ### Added
