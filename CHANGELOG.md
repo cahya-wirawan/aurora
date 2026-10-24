@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.289.0] - 2026-10-24
+
+### Added
+
+- Record the faster Save As .psd and the PNG write explanation
+
 ## [0.288.0] - 2026-10-24
 
 ### Added
