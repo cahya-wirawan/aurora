@@ -17588,8 +17588,13 @@ fn coverage_cache_key(
             m.density.to_bits(),
         )
     });
-    let shape =
-        effect_shape_app::valid_effect_shape(id, layers, store).map_or(0, |s| s.content_hash());
+    // Only strokes read the outline (drop shadows and glows read the
+    // pixels' alpha), so only their keys carry it and pay for the check.
+    let shape = if matches!(kind, CoverageKind::DropShadow | CoverageKind::OuterGlow) {
+        0
+    } else {
+        effect_shape_app::valid_effect_shape(id, layers, store).map_or(0, |s| s.content_hash())
+    };
     Some(ShadowCacheKey {
         kind: kind as u8,
         shape,
@@ -94072,6 +94077,28 @@ mod tests {
                 },
             ));
             assert!(crate::effect_shape_app::valid_effect_shape(id, &layers, &mut store).is_none());
+        }
+
+        /// The inside stroke of a translucent fill with an outline is
+        /// painted exactly once, at the outline's coverage: a stroke of 50 %
+        /// opacity over the 0.25-alpha fill is the 50 % red over the layer
+        /// result, not stacked twice (the fold in the interior at the pixels'
+        /// alpha plus a second one over the laid-down layer).
+        #[test]
+        fn an_inside_stroke_is_folded_once_at_the_outlines_coverage() {
+            let (_d, mut store, mut layers, id) = translucent_shape_with(StrokePosition::Inside);
+            let mut half = stroke(StrokePosition::Inside, 3.0, [1.0, 0.0, 0.0]);
+            half.opacity = 0.5;
+            set_strokes(&mut layers, id, vec![half]);
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            // Layer result there: white 0.0625 premultiplied at alpha 0.25;
+            // one 50 % red fold over it: red 0.5 + 0.0625 * 0.5, green and
+            // blue 0.0625 * 0.5, alpha 0.5 + 0.25 * 0.5.
+            for (x, y) in [(100, 120), (101, 120), (102, 120), (120, 100), (120, 102)] {
+                near(texel(&acc, x, y), [0.53125, 0.03125, 0.03125, 0.625]);
+            }
+            near(texel(&acc, 120, 120), [0.0625, 0.0625, 0.0625, 0.25]);
+            near(texel(&acc, 99, 120), CLEAR);
         }
 
         /// Without a shape the same layer strokes from its alpha, and the
