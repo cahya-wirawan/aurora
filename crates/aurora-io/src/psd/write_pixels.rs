@@ -203,6 +203,18 @@ fn run_parts<'a, I: Sync, T: Send>(
     per: usize,
     work: &(dyn Fn(usize, &'a [I]) -> T + Sync),
 ) -> Vec<T> {
+    run_parts_with(items, threads, per, work, &std::thread::Builder::new)
+}
+
+/// [`run_parts`] with the thread builder injected, so a test can make
+/// every spawn fail and reach the run-it-here fallback.
+pub(crate) fn run_parts_with<'a, I: Sync, T: Send>(
+    items: &'a [I],
+    threads: usize,
+    per: usize,
+    work: &(dyn Fn(usize, &'a [I]) -> T + Sync),
+    builder: &dyn Fn() -> std::thread::Builder,
+) -> Vec<T> {
     let per = per.max(1);
     if threads <= 1 || items.len() <= per {
         return items
@@ -216,7 +228,7 @@ fn run_parts<'a, I: Sync, T: Send>(
             .chunks(per)
             .enumerate()
             .map(|(n, part)| {
-                std::thread::Builder::new()
+                builder()
                     .spawn_scoped(scope, move || work(n * per, part))
                     .map_err(|_| work(n * per, part))
             })

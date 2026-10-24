@@ -159,3 +159,26 @@ fn merged_rows_pack_identically_on_every_thread_count() {
         }
     }
 }
+
+/// A thread the system will not start (here: a 64 TiB stack) runs its
+/// part on the caller, with the same first index, in order.
+#[test]
+fn parts_whose_thread_cannot_start_run_here_in_order() {
+    let items: Vec<u32> = (0..23).collect();
+    let work = |first: usize, part: &[u32]| (first, part.iter().sum::<u32>());
+    let want: Vec<(usize, u32)> = items
+        .chunks(5)
+        .enumerate()
+        .map(|(n, part)| work(n * 5, part))
+        .collect();
+    let failing = || std::thread::Builder::new().stack_size(1 << 46);
+    assert!(
+        std::thread::scope(|s| failing().spawn_scoped(s, || ()).is_err()),
+        "the test needs a spawn that fails"
+    );
+    assert_eq!(run_parts_with(&items, 4, 5, &work, &failing), want);
+    assert_eq!(
+        run_parts_with(&items, 4, 5, &work, &std::thread::Builder::new),
+        want
+    );
+}
