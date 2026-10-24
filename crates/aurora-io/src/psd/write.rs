@@ -3056,6 +3056,18 @@ pub(crate) fn verify_psd_file_with_budget(
     expected: &PsdExpectation,
     budget: u64,
 ) -> Result<(), IoError> {
+    verify_psd_file_with(path, expected, budget, &super::write_pixels::thread_builder)
+}
+
+/// [`verify_psd_file_with_budget`] with the reader thread's builder
+/// injected (task 154), so a test reaches the one-after-the-other path a
+/// system that will not start a thread takes.
+pub(crate) fn verify_psd_file_with(
+    path: &Path,
+    expected: &PsdExpectation,
+    budget: u64,
+    builder: &super::write_pixels::BuilderSource,
+) -> Result<(), IoError> {
     // The reader refuses a file whose layers add up to more than its
     // `PIXEL_BUDGET` (2^28 px), and it holds each decoded layer whole: so
     // past that budget only the streaming check runs.
@@ -3080,7 +3092,7 @@ pub(crate) fn verify_psd_file_with_budget(
     // error still comes first, as when it ran before the reader. A thread
     // the system will not start means the passes run one after the other.
     std::thread::scope(|scope| {
-        match std::thread::Builder::new().spawn_scoped(scope, || reader_pass(path, expected)) {
+        match builder().and_then(|b| b.spawn_scoped(scope, || reader_pass(path, expected))) {
             Ok(reader) => {
                 let raw = raw_pass();
                 let read = reader

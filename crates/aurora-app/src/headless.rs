@@ -27,7 +27,9 @@
 //!   own Save As PSD (preflight, merged-image composite, `write_psd` into
 //!   a temp file, `sync_all`, `verify_psd_file`, rename and directory
 //!   sync), then, if the save report is not empty, the same `persist`
-//!   Save Anyway runs; each phase is timed (`psd_save_ms`).
+//!   Save Anyway runs; each phase is timed (`psd_save_ms`). Unlike the
+//!   app, it passes no import losses (what the open itself dropped) into
+//!   the save report, so `report_items` counts only the write's own lines.
 //!
 //! One JSON object goes to stdout; logs go to stderr. Nothing here is
 //! reachable from the window: the app never calls [`main_from_args`].
@@ -111,7 +113,8 @@ pub struct Report {
 
 const USAGE: &str = "usage: aurora-headless <input> --out <file.png|.tif|.jpg|.psd> \
 [--scratch DIR] [--threads N] [--composite export|pool] [--gpu|--cpu] \
-[--depth 8|16] [--reference-out ref.png]";
+[--depth 8|16] [--reference-out ref.png]\n\
+(--out X.psd runs Save As PSD; unlike the app it passes no import losses into the save report)";
 
 /// Parses `args` (without the program name).
 ///

@@ -2818,3 +2818,49 @@ fn verify_reports_the_raw_pass_first_when_both_passes_fail() {
     assert_ne!(raw_only, reader_only, "the passes fail differently");
     assert_eq!(with(true, true), raw_only);
 }
+
+/// Task 154: when the reader pass's thread cannot start, the two passes
+/// run one after the other: a good file verifies, either pass alone still
+/// fails it (so nothing would be renamed into place), and when both fail
+/// the raw pass's error wins, exactly as on two threads.
+#[test]
+fn verify_without_a_second_thread_runs_both_passes_in_order() {
+    let mut doc = Doc::new((8, 8));
+    let px = image(8, 8, |x, y| [level(x), level(y), 0.5, 1.0]);
+    doc.layer("A", rect(0, 0, 8, 8), Some((&px, 0, 0)));
+    let (bytes, outcome) = ok(doc.write());
+    let dir = ok(tempfile::tempdir());
+    let path = dir.path().join("v.psd");
+    ok(std::fs::write(&path, &bytes));
+    let no_threads = super::write_pixels::tests::no_threads;
+    let threads = super::write_pixels::thread_builder;
+    let budget = super::PIXEL_BUDGET;
+    ok(super::write::verify_psd_file_with(
+        &path,
+        &outcome.expected,
+        budget,
+        &no_threads,
+    ));
+    for (sample, decoded) in [(true, false), (false, true), (true, true)] {
+        let mut bad = outcome.expected.clone();
+        if let Some(l) = bad.layers.first_mut() {
+            if sample {
+                l.sample_hash ^= 1;
+            }
+            if decoded {
+                l.decoded_hash ^= 1;
+            }
+        }
+        let message = |builder: &super::write_pixels::BuilderSource| {
+            match super::write::verify_psd_file_with(&path, &bad, budget, builder) {
+                Err(err) => err.to_string(),
+                Ok(()) => unreachable!("a wrong hash verified ({sample}, {decoded})"),
+            }
+        };
+        assert_eq!(
+            message(&no_threads),
+            message(&threads),
+            "({sample}, {decoded})"
+        );
+    }
+}

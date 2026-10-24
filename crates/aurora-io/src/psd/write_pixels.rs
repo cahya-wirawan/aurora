@@ -203,7 +203,18 @@ fn run_parts<'a, I: Sync, T: Send>(
     per: usize,
     work: &(dyn Fn(usize, &'a [I]) -> T + Sync),
 ) -> Vec<T> {
-    run_parts_with(items, threads, per, work, &std::thread::Builder::new)
+    run_parts_with(items, threads, per, work, &thread_builder)
+}
+
+/// Where a scoped thread's [`std::thread::Builder`] comes from: the
+/// writer and the verify use [`thread_builder`]; a test injects one that
+/// fails, as a system that will not start a thread does.
+pub(crate) type BuilderSource = dyn Fn() -> std::io::Result<std::thread::Builder> + Sync;
+
+/// The real builder source: a default [`std::thread::Builder`].
+#[allow(clippy::unnecessary_wraps)] // the signature a failing source shares
+pub(crate) fn thread_builder() -> std::io::Result<std::thread::Builder> {
+    Ok(std::thread::Builder::new())
 }
 
 /// [`run_parts`] with the thread builder injected, so a test can make
@@ -213,7 +224,7 @@ pub(crate) fn run_parts_with<'a, I: Sync, T: Send>(
     threads: usize,
     per: usize,
     work: &(dyn Fn(usize, &'a [I]) -> T + Sync),
-    builder: &dyn Fn() -> std::thread::Builder,
+    builder: &BuilderSource,
 ) -> Vec<T> {
     let per = per.max(1);
     if threads <= 1 || items.len() <= per {
@@ -229,7 +240,7 @@ pub(crate) fn run_parts_with<'a, I: Sync, T: Send>(
             .enumerate()
             .map(|(n, part)| {
                 builder()
-                    .spawn_scoped(scope, move || work(n * per, part))
+                    .and_then(|b| b.spawn_scoped(scope, move || work(n * per, part)))
                     .map_err(|_| work(n * per, part))
             })
             .collect();
@@ -320,4 +331,4 @@ pub(crate) fn pack_merged_rows_on(
 
 #[cfg(test)]
 #[path = "write_pixels_tests.rs"]
-mod tests;
+pub(crate) mod tests;

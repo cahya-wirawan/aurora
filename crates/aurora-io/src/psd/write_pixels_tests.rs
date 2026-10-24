@@ -160,8 +160,14 @@ fn merged_rows_pack_identically_on_every_thread_count() {
     }
 }
 
-/// A thread the system will not start (here: a 64 TiB stack) runs its
-/// part on the caller, with the same first index, in order.
+/// A builder source that fails, as a system that will not start a
+/// thread does.
+pub(crate) fn no_threads() -> std::io::Result<std::thread::Builder> {
+    Err(std::io::Error::other("no threads (injected)"))
+}
+
+/// A part whose thread cannot start runs on the caller, with the same
+/// first index, in order.
 #[test]
 fn parts_whose_thread_cannot_start_run_here_in_order() {
     let items: Vec<u32> = (0..23).collect();
@@ -171,14 +177,31 @@ fn parts_whose_thread_cannot_start_run_here_in_order() {
         .enumerate()
         .map(|(n, part)| work(n * 5, part))
         .collect();
-    let failing = || std::thread::Builder::new().stack_size(1 << 46);
-    assert!(
-        std::thread::scope(|s| failing().spawn_scoped(s, || ()).is_err()),
-        "the test needs a spawn that fails"
+    assert_eq!(run_parts_with(&items, 4, 5, &work, &no_threads), want);
+    assert_eq!(run_parts_with(&items, 4, 5, &work, &thread_builder), want);
+    // Whole bands too: the fallback packs the same rows.
+    let band: Vec<u16> = (0u32..40 * 9).map(|i| (i * 977 % 65_536) as u16).collect();
+    let threaded = pack_channel_band_on(&band, 40, 9, 1, 3, 4);
+    let rows: Vec<&[u16]> = band.chunks(40).collect();
+    let here = run_parts_with(
+        &rows,
+        4,
+        3,
+        &|first, part: &[&[u16]]| {
+            let flat: Vec<u16> = part.iter().flat_map(|r| r.iter().copied()).collect();
+            pack_channel_band_on(&flat, 40, part.len(), 1, 3 + first as u32, 1)
+        },
+        &no_threads,
     );
-    assert_eq!(run_parts_with(&items, 4, 5, &work, &failing), want);
+    let mut joined = Vec::new();
+    let (mut s, mut d) = (0u64, 0u64);
+    for p in here {
+        joined.extend(p.rows);
+        s = s.wrapping_add(p.sample_sum);
+        d = d.wrapping_add(p.decoded_sum);
+    }
     assert_eq!(
-        run_parts_with(&items, 4, 5, &work, &std::thread::Builder::new),
-        want
+        (joined, s, d),
+        (threaded.rows, threaded.sample_sum, threaded.decoded_sum)
     );
 }
