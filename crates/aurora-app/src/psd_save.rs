@@ -23,7 +23,9 @@
 //! in memory (a banded composite is round R5), and the write runs on the
 //! UI thread (a background write is later work).
 
+use std::cell::Cell;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use aurora_widgets::widgets::DialogAction;
 
@@ -261,33 +263,88 @@ pub(crate) fn begin_psd_save(
     source: PsdSaveSource<'_>,
     path: &Path,
 ) -> Result<PsdSaveStep, PsdSaveFailure> {
+    begin_psd_save_timed(source, path, &mut PsdSaveTimings::default())
+}
+
+/// Wall times of one [`begin_psd_save_timed`] call, per phase (task 154,
+/// the headless Save As `.psd` measurement). A phase the call never
+/// reached stays zero.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PsdSaveTimings {
+    /// `psd_save_preflight`.
+    pub(crate) preflight: Duration,
+    /// The merged image's composite (`composite_document`).
+    pub(crate) composite: Duration,
+    /// `write_psd` into the temp file: tile reads, PackBits and the writes.
+    pub(crate) write: Duration,
+    /// The temp file's `sync_all`.
+    pub(crate) sync: Duration,
+    /// `verify_psd_file`: the reopen by Aurora's own parsers.
+    pub(crate) verify: Duration,
+    /// The rename and the directory sync, when the report is empty (else
+    /// the caller persists, after Save Anyway).
+    pub(crate) persist: Duration,
+}
+
+/// [`begin_psd_save`], recording each phase's wall time into `timings`.
+/// The same steps in the same order; only clocks are read in between.
+pub(crate) fn begin_psd_save_timed(
+    source: PsdSaveSource<'_>,
+    path: &Path,
+    timings: &mut PsdSaveTimings,
+) -> Result<PsdSaveStep, PsdSaveFailure> {
     if is_psb_save_path(path) {
         return Err(PsdSaveFailure::Refused(PSB_NOT_YET.to_owned()));
     }
     let opts = aurora_io::PsdSaveOptions::default();
-    if let Err(refusal) = aurora_io::psd_save_preflight(source.layers, source.canvas, opts) {
+    let started = Instant::now();
+    let preflight = aurora_io::psd_save_preflight(source.layers, source.canvas, opts);
+    timings.preflight = started.elapsed();
+    if let Err(refusal) = preflight {
         return Err(PsdSaveFailure::Refused(refusal.to_string()));
     }
     let (width, height) = source.canvas;
+    let started = Instant::now();
     let image = crate::composite_document(source.layers, source.store, width, height)
         .map_err(PsdSaveFailure::Composite)?;
+    timings.composite = started.elapsed();
     let layers = source.layers;
     let store = source.store;
-    let written = aurora_io::write_verified_temp(
+    let write_time = Cell::new(Duration::ZERO);
+    let sync_time = Cell::new(Duration::ZERO);
+    let verify_time = Cell::new(Duration::ZERO);
+    let written = aurora_io::write_verified_temp_with(
         path,
         |file| {
+            let started = Instant::now();
             let mut composite = &image;
-            aurora_io::write_psd(
+            let outcome = aurora_io::write_psd(
                 &mut *file,
                 layers,
                 source.canvas,
                 &mut composite,
                 store,
                 opts,
-            )
+            );
+            write_time.set(started.elapsed());
+            outcome
         },
-        |temp, outcome| aurora_io::verify_psd_file(temp, &outcome.expected),
+        |file| {
+            let started = Instant::now();
+            let synced = file.sync_all();
+            sync_time.set(started.elapsed());
+            synced
+        },
+        |temp, outcome| {
+            let started = Instant::now();
+            let verified = aurora_io::verify_psd_file(temp, &outcome.expected);
+            verify_time.set(started.elapsed());
+            verified
+        },
     );
+    timings.write = write_time.get();
+    timings.sync = sync_time.get();
+    timings.verify = verify_time.get();
     let (mut outcome, temp) = match written {
         Ok(written) => written,
         Err(aurora_io::IoError::PsdSaveRefused(refusal)) => {
@@ -298,7 +355,10 @@ pub(crate) fn begin_psd_save(
     // The fixed-order "carried from open" block goes last (category C).
     outcome.report.items.extend(source.carried);
     if outcome.report.is_empty() {
-        let advisory = temp.persist().map_err(PsdSaveFailure::Write)?;
+        let started = Instant::now();
+        let advisory = temp.persist();
+        timings.persist = started.elapsed();
+        let advisory = advisory.map_err(PsdSaveFailure::Write)?;
         return Ok(if advisory.is_some() {
             PsdSaveStep::SavedNotConfirmed
         } else {
