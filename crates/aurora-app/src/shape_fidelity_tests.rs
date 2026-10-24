@@ -150,6 +150,22 @@ fn stroke_effects_shape_layers_keep_their_outline() {
             without.push(name);
         }
     }
+    // The outline is positioned relative to the layer's bounds origin
+    // (`Effect OutsetFrame` starts left of the canvas, at x = -1; its
+    // outline is clipped to the canvas, so its left edge is at document 0).
+    let outset = crate::layer_ids_in_order(&document.layers)
+        .into_iter()
+        .find(|id| document.layers.name(*id) == Some("Effect OutsetFrame"));
+    let Some(outset) = outset else {
+        unreachable!("Effect OutsetFrame is in the file");
+    };
+    let (Some(bounds), Some(shape)) = (
+        document.layers.bounds(outset),
+        document.layers.effect_shape(outset),
+    ) else {
+        unreachable!("Effect OutsetFrame has bounds and an outline");
+    };
+    assert_eq!(bounds.x + shape.area().x, 0, "{bounds:?} {:?}", shape.area());
     println!("EFFECT-SHAPES with {with:?} without {without:?}");
     // Every raster twin has no outline; the 'Shape *' layers do.
     assert!(without.iter().any(|n| n.starts_with("Raster")), "{without:?}");
