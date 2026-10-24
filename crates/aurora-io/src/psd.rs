@@ -4553,65 +4553,6 @@ fn outline_covers_pixels(image: &Image, layer_bounds: Rect, shape: &PsdEffectSha
     true
 }
 
-/// Replaces the outline's partial coverage on its edge texels with
-/// Photoshop's own anti-aliasing where the pixels show it (task 151): an
-/// edge texel's coverage becomes its stored alpha divided by the largest
-/// alpha among the fully covered texels around it (the local fill alpha), so
-/// an opaque shape's edge is exactly its pixels' (Aurora's rasterised path
-/// differs from Photoshop's by a few levels along a curve), while a
-/// translucent fill still gives the outline's full interior. Where no fully
-/// covered neighbour shows a fill (alpha at most 0.05) the path's own
-/// coverage stays.
-fn refine_outline_edge(image: &Image, layer_bounds: Rect, shape: &mut PsdEffectShape) {
-    let (w, h) = (shape.area.width as usize, shape.area.height as usize);
-    let alpha_at = |x: i64, y: i64| -> f32 {
-        let (ix, iy) = (x - layer_bounds.x, y - layer_bounds.y);
-        match (u32::try_from(ix), u32::try_from(iy)) {
-            (Ok(ix), Ok(iy)) if ix < image.width() && iy < image.height() => {
-                let index = (iy as usize * image.width() as usize + ix as usize) * 4 + 3;
-                image.samples().get(index).map_or(0.0, |a| a.to_f32())
-            }
-            _ => 0.0,
-        }
-    };
-    let original = shape.coverage.clone();
-    let at = |cx: i64, cy: i64| -> u8 {
-        match (usize::try_from(cx), usize::try_from(cy)) {
-            (Ok(cx), Ok(cy)) if cx < w && cy < h => original.get(cy * w + cx).copied().unwrap_or(0),
-            _ => 0,
-        }
-    };
-    for cy in 0..h {
-        for cx in 0..w {
-            let Some(c) = original.get(cy * w + cx).copied() else {
-                continue;
-            };
-            if c == 0 || c == u8::MAX {
-                continue;
-            }
-            let (cx, cy) = (cx as i64, cy as i64);
-            let mut fill = 0.0f32;
-            for dy in -1..=1 {
-                for dx in -1..=1 {
-                    if at(cx + dx, cy + dy) == u8::MAX {
-                        fill = fill.max(alpha_at(shape.area.x + cx + dx, shape.area.y + cy + dy));
-                    }
-                }
-            }
-            if fill <= 0.05 {
-                continue;
-            }
-            let a = alpha_at(shape.area.x + cx, shape.area.y + cy);
-            let refined = (a / fill).clamp(0.0, 1.0);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let byte = (refined * 255.0).round() as u8;
-            if let Some(slot) = shape.coverage.get_mut(cy as usize * w + cx as usize) {
-                *slot = byte;
-            }
-        }
-    }
-}
-
 /// The most pixels a layer's own surface may cover for it to keep an effect
 /// shape (task 151): the compositor checks the shape's fingerprint against
 /// the layer's tiles, so a layer with a huge surface is left on pixel alpha.
@@ -6884,10 +6825,9 @@ impl Builder<'_, '_, '_> {
                     // they were drawn from (a vector stroke adds a pixel
                     // `double-stroke-effects.psd`): the layer keeps its alpha.
                     let shape = match (&image, layer.effect_shape) {
-                        (Some(image), Some(mut shape))
+                        (Some(image), Some(shape))
                             if outline_covers_pixels(image, layer.bounds, &shape) =>
                         {
-                            refine_outline_edge(image, layer.bounds, &mut shape);
                             Some(shape)
                         }
                         _ => None,

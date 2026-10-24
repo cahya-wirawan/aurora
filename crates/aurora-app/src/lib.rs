@@ -93944,6 +93944,103 @@ mod tests {
             assert!(texel(&plain, 101, 120)[3] < 0.5);
         }
 
+        /// A Move keeps the shape valid (tiles are layer-local) and the
+        /// outline travels with the layer: the frame is drawn around the
+        /// moved square, nothing is left at the old place.
+        #[test]
+        fn moving_a_shape_layer_moves_its_stroke_frame_with_it() {
+            let (_d, mut store, mut layers, id) = translucent_shape();
+            ok(layers.set_bounds(
+                id,
+                aurora_core::Rect {
+                    x: 20,
+                    y: 10,
+                    width: 4096,
+                    height: 4096,
+                },
+            ));
+            assert!(crate::effect_shape_app::valid_effect_shape(id, &layers, &mut store).is_some());
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            // The square is now (120, 110) to (160, 150).
+            near(texel(&acc, 140, 130), [0.0625, 0.0625, 0.0625, 0.25]);
+            for (x, y) in [(119, 130), (117, 130), (140, 107), (162, 130), (140, 152)] {
+                near(texel(&acc, x, y), RED);
+            }
+            near(texel(&acc, 116, 130), CLEAR);
+            near(texel(&acc, 110, 120), CLEAR);
+            near(texel(&acc, 99, 120), CLEAR);
+        }
+
+        /// An edit to a layer with an effect shape repaints the whole
+        /// layer's effects (the edit can end the shape's use), not only the
+        /// edit's reach.
+        #[test]
+        fn editing_a_shape_layer_repaints_the_whole_layer() {
+            let (_d, _store, mut layers, id) = translucent_shape();
+            let dab = [aurora_core::Rect {
+                x: 110,
+                y: 110,
+                width: 1,
+                height: 1,
+            }];
+            let covers_layer = |layers: &aurora_doc::LayerTree| {
+                effect_reach_rects(layers, id, &dab)
+                    .iter()
+                    .any(|r| r.x <= 0 && r.y <= 0 && r.width >= 4096 && r.height >= 4096)
+            };
+            assert!(covers_layer(&layers));
+            ok(layers.set_effect_shape(id, None));
+            assert!(!covers_layer(&layers));
+        }
+
+        /// A different outline with the same pixels is a different picture:
+        /// the coverage cache is keyed on the outline too.
+        #[test]
+        fn a_different_outline_is_not_served_from_the_cache() {
+            let (_d, mut store, mut layers, id) = translucent_shape();
+            let first = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            near(texel(&first, 121, 110), [0.0625, 0.0625, 0.0625, 0.25]);
+            let fingerprint = fingerprint_of(&mut store, &layers, id);
+            let mut plane = vec![0u8; 40 * 40];
+            for y in 0..20 {
+                for x in 0..20 {
+                    if let Some(v) = plane.get_mut(y * 40 + x) {
+                        *v = 255;
+                    }
+                }
+            }
+            let smaller = ok(aurora_doc::EffectShape::new(
+                aurora_core::Rect {
+                    x: 100,
+                    y: 100,
+                    width: 40,
+                    height: 40,
+                },
+                plane,
+                fingerprint,
+            ));
+            ok(layers.set_effect_shape(id, Some(std::sync::Arc::new(smaller))));
+            let second = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            near(texel(&second, 121, 110), RED);
+        }
+
+        /// A layer with an enabled mask does not use its outline.
+        #[test]
+        fn a_masked_layer_ignores_its_outline() {
+            let (_d, mut store, mut layers, id) = translucent_shape();
+            assert!(crate::effect_shape_app::valid_effect_shape(id, &layers, &mut store).is_some());
+            ok(layers.add_mask(
+                id,
+                aurora_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 4096,
+                    height: 4096,
+                },
+            ));
+            assert!(crate::effect_shape_app::valid_effect_shape(id, &layers, &mut store).is_none());
+        }
+
         /// Without a shape the same layer strokes from its alpha, and the
         /// result differs inside the square: the control that proves the
         /// shape is what changed the picture.
