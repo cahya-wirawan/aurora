@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.287.1] - 2026-10-24
+
+### Fixed
+
+- Update clipboard-win to 5.4.3: 5.4.1 was yanked and cargo deny failed
+
 ## [0.287.0] - 2026-10-24
 
 ### Added
