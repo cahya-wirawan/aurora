@@ -586,6 +586,7 @@ mod first_run;
 mod frame_composite;
 #[cfg(test)]
 mod frame_cost_tests;
+mod frame_trace;
 #[doc(hidden)]
 pub mod headless;
 mod lasso_tools;
@@ -26510,6 +26511,12 @@ fn dispatch_or_composite_tiles_bounded(
         .copied()
         .filter(|&tile| !worker.covers(&target, tile))
         .collect();
+    #[allow(clippy::cast_precision_loss)]
+    {
+        frame_trace::note("stale", stale.len() as f64);
+        frame_trace::note("uncovered", uncovered.len() as f64);
+        frame_trace::note("busy", f64::from(u8::from(worker.is_busy())));
+    }
     if uncovered.is_empty() {
         return false;
     }
@@ -26531,6 +26538,7 @@ fn dispatch_or_composite_tiles_bounded(
         return false;
     }
     if !worker.dispatch(&mut target, stale) {
+        frame_trace::note("dispatch_refused", 1.0);
         let Some(budget) = budget else {
             recomposite_tiles(
                 &uncovered,
@@ -34498,6 +34506,7 @@ impl App {
         let position = logical_point(physical_position, self.scale_factor);
         self.pointer_position = Some(position);
         self.sync_view_fit();
+        frame_trace::mark("view_fit");
 
         // 0.257.0: while the command palette is open nothing underneath
         // follows the pointer (a drag begun before it opened resumes, or
@@ -37516,6 +37525,7 @@ impl App {
         let invalidation = apply_curves_outcome(&mut self.curves_edit(), outcome, captured);
         apply_layer_control_invalidation(&mut self.doc.composite_cache, &invalidation);
         self.sync_curves_controls_now();
+        frame_trace::mark("sync_controls");
         self.needs_redraw = true;
     }
 
@@ -38319,6 +38329,7 @@ impl App {
         self.sync_quick_mask_tint_now();
         // 0.227.0: the Crop tool's shield beneath the outline.
         self.sync_crop_shield_now();
+        frame_trace::mark("overlays");
         // 0.275.0: the zoomed-out view's pyramid work and upload, before
         // the surface is borrowed (it needs `&mut self`); `None` at or
         // above the 1:1 atlas floor, where the frame is exactly as before.
@@ -38336,6 +38347,7 @@ impl App {
             }
             None => None,
         };
+        frame_trace::mark("display_prepare");
         let zoomed_frame = match self.gpu.take() {
             Some(gpu) => {
                 let frame = if self.surface.is_some() && display_frame.is_none() {
@@ -38348,6 +38360,7 @@ impl App {
             }
             None => None,
         };
+        frame_trace::mark("zoomed_prepare");
         let (Some(gpu), Some(surface)) = (self.gpu.as_ref(), self.surface.as_mut()) else {
             return;
         };
@@ -38368,6 +38381,7 @@ impl App {
                 // The keyboard focus ring, resolved once for the whole
                 // frame (`FocusPaint::resolve`): `None` when focus is not
                 // visible or nothing focused paints one.
+                frame_trace::mark("acquire");
                 let focus_paint = FocusPaint::resolve(&self.workspace.tree, &self.focus);
                 if let Some(engine) = self.text_engine.as_mut() {
                     engine.begin_frame();
@@ -38403,6 +38417,7 @@ impl App {
                 // canvas area's corner (task 144: a document smaller than
                 // the area is centred and the atlas cannot sample left of
                 // or above it; the viewport starts where the document does).
+                frame_trace::mark("widget_paints");
                 let mut atlas_shift = (0_u32, 0_u32);
                 // Sync before drawing, so this frame shows the latest
                 // painted pixels rather than lagging one frame behind.
@@ -38450,6 +38465,7 @@ impl App {
                             self.compositor.as_mut(),
                             self.composite_worker.as_mut(),
                         );
+                        frame_trace::mark("recomposite");
                         let _ = residency.sync(
                             gpu.queue(),
                             store,
@@ -38457,6 +38473,7 @@ impl App {
                             false,
                             usize::MAX,
                         );
+                        frame_trace::mark("atlas_sync");
                         // Task 142: the display texture takes over the
                         // tiles the atlas has just uploaded by a GPU copy,
                         // not a second upload, when it draws again.
@@ -38630,8 +38647,11 @@ impl App {
                         );
                     }
                 }
+                frame_trace::mark("encode");
                 gpu.queue().submit(std::iter::once(encoder.finish()));
+                frame_trace::mark("submit");
                 gpu.queue().present(texture);
+                frame_trace::mark("present");
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {}
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -39002,152 +39022,22 @@ impl ApplicationHandler<AppEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, event: AppEvent) {
-        let event = match event {
-            AppEvent::Accessibility(event) => event,
-            wake @ (AppEvent::OpenFinished
-            | AppEvent::CompositeReady
-            | AppEvent::ThumbnailReady) => {
-                // Installed by `about_to_wait`, which runs after this on
-                // the same iteration: the wake's whole job is to end the
-                // loop's `Wait` so that it does.
-                if app_event_requests_redraw(&wake) {
-                    self.needs_redraw = true;
-                }
-                return;
-            }
-        };
-        match event.window_event {
-            accesskit_winit::WindowEvent::InitialTreeRequested => {
-                // `Adapter::with_event_loop_proxy` can't synchronously
-                // return an initial tree (see its own doc comment); this
-                // is the deferred push it expects in response.
-                self.push_accessibility();
-            }
-            accesskit_winit::WindowEvent::ActionRequested(request) => {
-                self.handle_accessibility_action(&request);
-            }
-            accesskit_winit::WindowEvent::AccessibilityDeactivated => {
-                tracing::debug!("accessibility deactivated");
-            }
-        }
+    fn user_event(&mut self, el: &ActiveEventLoop, event: AppEvent) {
+        frame_trace::begin("user_event");
+        self.user_event_untraced(el, event);
+        frame_trace::end("user_event");
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        if let (Some(adapter), Some(window)) = (self.adapter.as_mut(), self.window.as_ref()) {
-            adapter.process_event(window, &event);
-        }
-
-        // Every real event other than `RedrawRequested` itself might
-        // change what the next frame should show (a moved cursor, a
-        // resize, a keystroke, ...) — coarse (any event, not just ones
-        // that actually touched pixels) but correct and cheap, and
-        // exactly what keeps `about_to_wait` from ever needing to guess.
-        // `RedrawRequested` is excluded so handling one doesn't
-        // immediately ask for another — see `needs_redraw`'s own doc
-        // comment for why that distinction is the whole fix.
-        if !matches!(event, WindowEvent::RedrawRequested) {
-            self.needs_redraw = true;
-        }
-
-        match event {
-            WindowEvent::CloseRequested if !self.request_quit() => {
-                // 0.174.0: the quit review is asking about an unsaved
-                // document; it exits through `about_to_wait` once done.
-            }
-            WindowEvent::CloseRequested => {
-                // A clean shutdown -- see `App::finish_shutdown` for
-                // what it undoes and why it is one method. `exiting`
-                // would run it anyway once `el.exit()` takes effect;
-                // it is called here too so the marker, the autosave,
-                // the scratch tiles and the dock layout are all settled
-                // before the loop starts unwinding, and running it
-                // twice is a no-op.
-                self.finish_shutdown();
-                el.exit();
-            }
-            WindowEvent::Resized(size) => self.apply_resize((size.width, size.height)),
-            WindowEvent::RedrawRequested => self.redraw(),
-            // No caret, and no blink wake-ups, while another window has
-            // keyboard focus (`caret_step`); the redraw every real event
-            // gets repaints the caret's disappearance or return.
-            WindowEvent::Focused(focused) => {
-                self.caret.window_focused = focused;
-                // 0.166.0: a release lost with the focus must not leave a
-                // panel drag live.
-                if !focused {
-                    self.cancel_panel_drag();
-                    self.clear_tooltip();
-                }
-            }
-            WindowEvent::ModifiersChanged(modifiers) => {
-                self.modifiers = translate_modifiers(modifiers.state());
-            }
-            WindowEvent::KeyboardInput { event, .. } => self.handle_key_event(&event),
-            WindowEvent::Ime(ime) => self.handle_ime(&ime),
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                // e.g. the window moved to a monitor with a different
-                // DPI scale -- the physical size winit reports for the
-                // *same* window may not have changed at all, but the
-                // logical size `apply_resize` computes from it has, so
-                // this always re-applies even when `inner_size` itself
-                // is unchanged.
-                self.scale_factor = scale_factor;
-                if let Some(window) = self.window.as_ref() {
-                    let size = window.inner_size();
-                    self.apply_resize((size.width, size.height));
-                }
-                // 0.163.0: the status bar's zoom is physical (logical zoom
-                // times this factor), so moving between a Retina and a
-                // non-Retina monitor changes its text with no zoom change.
-                self.sync_status_bar_now();
-            }
-            WindowEvent::DroppedFile(path) => self.handle_dropped_file(&path),
-            // No drop-target visual affordance exists yet (nothing
-            // renders a pixel in this crate regardless of drag state),
-            // so a hover just gets a debug-level trace -- there's
-            // nothing else to react to it with yet.
-            WindowEvent::HoveredFile(path) => {
-                tracing::debug!(path = %path.display(), "file hovered over the window");
-            }
-            WindowEvent::HoveredFileCancelled => {
-                tracing::debug!("file drag cancelled");
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.handle_pointer_moved((position.x, position.y));
-            }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button,
-                ..
-            } => self.handle_pointer_pressed(button),
-            WindowEvent::MouseInput {
-                state: ElementState::Released,
-                button,
-                ..
-            } => self.handle_pointer_released(button),
-            WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
-            WindowEvent::CursorLeft { .. } => {
-                self.pointer_position = None;
-                // 0.166.0: leaving the window cancels a panel drag.
-                self.cancel_panel_drag();
-                // Dragging off the window edge ends the drag, and used
-                // to end it by simply dropping it -- losing a live
-                // stroke's whole undo entry along with it. Commit it the
-                // same way a release would (`commit_ending_drag`).
-                // A Polygonal Lasso (clicked vertices, no button held) stays.
-                let interrupted = lasso_tools::take_on_cursor_left(&mut self.drag);
-                self.commit_drag(interrupted);
-                // A gallery drag ends too: its release may never arrive.
-                // The value keeps whatever the last move set.
-                self.gallery_click.release_capture();
-                self.settle_layer_controls_drag();
-                self.update_gallery_hover(None);
-                self.update_toolbar_hover(None);
-                self.update_menu_bar_hover(None);
-            }
-            _ => {}
-        }
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Task 152: `AURORA_FRAME_TRACE` logs slow phases (a no-op unset).
+        let label = if matches!(event, WindowEvent::RedrawRequested) {
+            "redraw"
+        } else {
+            "event"
+        };
+        frame_trace::begin(label);
+        self.window_event_untraced(el, id, event);
+        frame_trace::end(label);
     }
 
     // Sets the control flow on **every** iteration, on every platform
@@ -39158,181 +39048,9 @@ impl ApplicationHandler<AppEvent> for App {
     // `WaitUntil` in the past behind, which is a busy loop.
     #[allow(clippy::too_many_lines)]
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        // 0.213.0: a selection step undone or redone by a path that does
-        // not own the selection (defensive; the known ones apply it).
-        self.apply_pending_selection();
-        // 0.221.0: a Clone Stamp source belongs to the layer it was set on.
-        self.doc.clone_stamp.observe_layer(self.doc.active_layer);
-        // 0.186.0: install whatever the background compositor finished.
-        if self.drain_background_composite() {
-            self.needs_redraw = true;
-        }
-        // 0.174.0: the quit review ended with nothing left unsaved.
-        if self.exit_requested {
-            self.exit_requested = false;
-            self.finish_shutdown();
-            el.exit();
-            return;
-        }
-        // 0.177.0 review L-2: a Save With Changes that found the modal
-        // slot taken asks the first iteration no dialog is open.
-        if psd_save::take_deferred_dialog(
-            &mut self.psd_dialog_deferred,
-            self.pending_psd_save.is_some(),
-            self.dialog.is_some(),
-        ) {
-            self.psd_dialog_deferred = !self.open_psd_save_dialog();
-        }
-        // 0.175.0 (F-3): a window close that waited for a dialog starts
-        // the quit review the first iteration no dialog is open.
-        if document_close::take_pending_quit(
-            &mut self.quit_pending,
-            self.dialog.is_some(),
-            self.quit_review.is_some(),
-        ) {
-            let _ = self.request_quit();
-        }
-        // 0.174.0: unsaved marks follow every change, relabelled only
-        // when one differs.
-        if document_close::refresh_dirty_marks(
-            &mut self.workspace,
-            &mut self.focus,
-            &mut self.shelf,
-            &self.doc,
-        ) {
-            let window_size = self.window.as_ref().map(|window| window.inner_size());
-            if let Some(size) = window_size {
-                self.apply_resize((size.width, size.height));
-            }
-            self.push_accessibility();
-            self.needs_redraw = true;
-        }
-        // muda's own events arrive on a plain channel, not through this
-        // crate's `accesskit_winit::Event` user-event type (the two
-        // don't share one enum -- restructuring the accessibility
-        // integration around a combined event type is a bigger, separate
-        // change) -- polled here since `about_to_wait` already runs on
-        // every loop iteration. Real `winit` `WindowEvent`s never arrive
-        // for a native menu action, so `needs_redraw` alone can't catch
-        // one -- set explicitly here instead, for the same reason
-        // `window_event` sets it for every other real input.
-        #[cfg(target_os = "macos")]
-        {
-            // A real, found-not-assumed bug: a menu action (e.g. "Toggle
-            // Layers Panel") changes a panel's own layout *style*
-            // (`aurora_ui::set_panel_collapsed`/`close_panel`), but
-            // nothing re-runs `WidgetTree::compute_layout` afterward on
-            // this path — unlike `App::handle_key_event`, which already
-            // does this unconditionally after every key event for
-            // exactly this reason (see that method's own doc comment).
-            // Without it, the new style never reaches `WidgetTree::
-            // bounds`, so the menu action visibly does nothing at all
-            // until some *other* event (a real window resize) happens
-            // to force a relayout.
-            let mut menu_event_handled = false;
-            while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
-                self.handle_menu_event(&event);
-                self.needs_redraw = true;
-                menu_event_handled = true;
-            }
-            if menu_event_handled && let Some(window) = self.window.as_ref() {
-                let size = window.inner_size();
-                self.apply_resize((size.width, size.height));
-            }
-        }
-
-        // A background open whose decode finished (0.151.0) is installed
-        // here, on the UI thread, before everything below mirrors the
-        // document -- so the controls follow the new one this iteration.
-        self.poll_background_open();
-
-        // The gallery tooltip's timer: tick first, then read the next
-        // deadline, so a deadline that just passed is consumed.
-        let now = std::time::Instant::now();
-        let (changed, gallery_deadline) =
-            gallery_timer_step(&mut self.workspace, &mut self.gallery, now);
-        if changed {
-            self.relayout_after_gallery();
-        }
-        // Once per iteration, whatever ran above (a macOS menu command, an
-        // accessibility action): IME follows focus (review M1), and the
-        // Layers-panel controls follow the document -- after the menu
-        // drain, so a menu command's own change is mirrored this
-        // iteration, not the next (critic C5).
-        self.sync_ime();
-        self.follow_document_tabs_now();
-        self.sync_layer_controls_now();
-        self.sync_tool_controls_now();
-        self.sync_channels_now();
-        self.sync_paths_now();
-        self.sync_curves_controls_now();
-        self.sync_status_bar_now();
-        let thumbnail_deadline = self.update_layer_thumbnails(now);
-        let tooltip_deadline = self.tooltip_step(now);
-        // The caret blink (0.139.0): after everything above that can move
-        // focus or edit a field, so the signature it observes is this
-        // iteration's. A flip the last frame did not draw asks for one
-        // frame; the next flip joins the tooltip's deadline, so an idle
-        // loop with a focused field wakes exactly once per half-period.
-        let caret = self.caret_step(now);
-        let deadline = fold_caret_step(caret, gallery_deadline, &mut self.needs_redraw);
-        let deadline = match (deadline, thumbnail_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        // 0.212.0: the selection's ants, only while one is shown, the
-        // window is focused and motion is allowed (`ants_step`).
-        let ants = self.ants_step(now);
-        if ants.redraw {
-            self.needs_redraw = true;
-        }
-        let deadline = earliest_deadline(deadline, ants.next_tick);
-        let deadline = earliest_deadline(deadline, tooltip_deadline);
-        // `ControlFlow::Wait` would otherwise block indefinitely, and
-        // muda's channel has no event-loop wakeup of its own to
-        // interrupt that wait -- so macOS also re-polls on a short timer,
-        // the cost of catching a menu click promptly without the
-        // unconditional per-frame `request_redraw` this whole mechanism
-        // used to rely on (and which pegged a full CPU core doing it,
-        // since it never let the loop go idle at all -- see
-        // `needs_redraw`'s own doc comment). Non-macOS has no channel to
-        // poll and blocks in plain `Wait` unless a tooltip or a caret
-        // flip is pending.
-        #[cfg(target_os = "macos")]
-        let poll = Some(MUDA_POLL_INTERVAL);
-        #[cfg(not(target_os = "macos"))]
-        let poll = None;
-        // 0.185.0: a store opened or closed since the last turn moved
-        // every share of the residency pool; a parked document admits
-        // nothing, so it is brought inside its share here, at most
-        // `EVICTION_BURST` tiles per store per turn (review RB-1), and
-        // the loop does not sleep while any store is still over. A
-        // comparison per store when nothing changed.
-        //
-        // 0.187.0: every change of the active document already moves the
-        // pool's active share (`document_session::hand_tile_pool_over`);
-        // re-claiming it here, a lock and a store, is the backstop that
-        // keeps it on the active document whatever path changed it.
-        let _ = self.doc.claim_active_tile_share();
-        let (evicted, over) = self
-            .shelf
-            .enforce_tile_budgets(&mut self.doc, aurora_tile::EVICTION_BURST);
-        if evicted > 0 {
-            tracing::debug!(
-                evicted,
-                over,
-                "shrinking open documents to their tile budget shares"
-            );
-        }
-        let poll = tile_budget_poll(over, poll);
-        el.set_control_flow(next_control_flow(now, deadline, poll));
-
-        if self.needs_redraw
-            && let Some(window) = self.window.as_ref()
-        {
-            window.request_redraw();
-            self.needs_redraw = false;
-        }
+        frame_trace::begin("about_to_wait");
+        self.about_to_wait_untraced(el);
+        frame_trace::end("about_to_wait");
     }
 
     /// The catch-all for every way out of the loop, including the ones
@@ -99853,3 +99571,336 @@ mod palette_scroll_app_tests;
 
 #[cfg(test)]
 mod menu_scroll_app_tests;
+
+/// The event loop's two hooks, wrapped by `frame_trace` (task 152).
+impl App {
+    fn window_event_untraced(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let (Some(adapter), Some(window)) = (self.adapter.as_mut(), self.window.as_ref()) {
+            adapter.process_event(window, &event);
+        }
+
+        // Every real event other than `RedrawRequested` itself might
+        // change what the next frame should show (a moved cursor, a
+        // resize, a keystroke, ...) — coarse (any event, not just ones
+        // that actually touched pixels) but correct and cheap, and
+        // exactly what keeps `about_to_wait` from ever needing to guess.
+        // `RedrawRequested` is excluded so handling one doesn't
+        // immediately ask for another — see `needs_redraw`'s own doc
+        // comment for why that distinction is the whole fix.
+        if !matches!(event, WindowEvent::RedrawRequested) {
+            self.needs_redraw = true;
+        }
+
+        match event {
+            WindowEvent::CloseRequested if !self.request_quit() => {
+                // 0.174.0: the quit review is asking about an unsaved
+                // document; it exits through `about_to_wait` once done.
+            }
+            WindowEvent::CloseRequested => {
+                // A clean shutdown -- see `App::finish_shutdown` for
+                // what it undoes and why it is one method. `exiting`
+                // would run it anyway once `el.exit()` takes effect;
+                // it is called here too so the marker, the autosave,
+                // the scratch tiles and the dock layout are all settled
+                // before the loop starts unwinding, and running it
+                // twice is a no-op.
+                self.finish_shutdown();
+                el.exit();
+            }
+            WindowEvent::Resized(size) => self.apply_resize((size.width, size.height)),
+            WindowEvent::RedrawRequested => self.redraw(),
+            // No caret, and no blink wake-ups, while another window has
+            // keyboard focus (`caret_step`); the redraw every real event
+            // gets repaints the caret's disappearance or return.
+            WindowEvent::Focused(focused) => {
+                self.caret.window_focused = focused;
+                // 0.166.0: a release lost with the focus must not leave a
+                // panel drag live.
+                if !focused {
+                    self.cancel_panel_drag();
+                    self.clear_tooltip();
+                }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = translate_modifiers(modifiers.state());
+            }
+            WindowEvent::KeyboardInput { event, .. } => self.handle_key_event(&event),
+            WindowEvent::Ime(ime) => self.handle_ime(&ime),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // e.g. the window moved to a monitor with a different
+                // DPI scale -- the physical size winit reports for the
+                // *same* window may not have changed at all, but the
+                // logical size `apply_resize` computes from it has, so
+                // this always re-applies even when `inner_size` itself
+                // is unchanged.
+                self.scale_factor = scale_factor;
+                if let Some(window) = self.window.as_ref() {
+                    let size = window.inner_size();
+                    self.apply_resize((size.width, size.height));
+                }
+                // 0.163.0: the status bar's zoom is physical (logical zoom
+                // times this factor), so moving between a Retina and a
+                // non-Retina monitor changes its text with no zoom change.
+                self.sync_status_bar_now();
+            }
+            WindowEvent::DroppedFile(path) => self.handle_dropped_file(&path),
+            // No drop-target visual affordance exists yet (nothing
+            // renders a pixel in this crate regardless of drag state),
+            // so a hover just gets a debug-level trace -- there's
+            // nothing else to react to it with yet.
+            WindowEvent::HoveredFile(path) => {
+                tracing::debug!(path = %path.display(), "file hovered over the window");
+            }
+            WindowEvent::HoveredFileCancelled => {
+                tracing::debug!("file drag cancelled");
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.handle_pointer_moved((position.x, position.y));
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } => self.handle_pointer_pressed(button),
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button,
+                ..
+            } => self.handle_pointer_released(button),
+            WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
+            WindowEvent::CursorLeft { .. } => {
+                self.pointer_position = None;
+                // 0.166.0: leaving the window cancels a panel drag.
+                self.cancel_panel_drag();
+                // Dragging off the window edge ends the drag, and used
+                // to end it by simply dropping it -- losing a live
+                // stroke's whole undo entry along with it. Commit it the
+                // same way a release would (`commit_ending_drag`).
+                // A Polygonal Lasso (clicked vertices, no button held) stays.
+                let interrupted = lasso_tools::take_on_cursor_left(&mut self.drag);
+                self.commit_drag(interrupted);
+                // A gallery drag ends too: its release may never arrive.
+                // The value keeps whatever the last move set.
+                self.gallery_click.release_capture();
+                self.settle_layer_controls_drag();
+                self.update_gallery_hover(None);
+                self.update_toolbar_hover(None);
+                self.update_menu_bar_hover(None);
+            }
+            _ => {}
+        }
+    }
+
+    fn user_event_untraced(&mut self, _el: &ActiveEventLoop, event: AppEvent) {
+        let event = match event {
+            AppEvent::Accessibility(event) => event,
+            wake @ (AppEvent::OpenFinished
+            | AppEvent::CompositeReady
+            | AppEvent::ThumbnailReady) => {
+                // Installed by `about_to_wait`, which runs after this on
+                // the same iteration: the wake's whole job is to end the
+                // loop's `Wait` so that it does.
+                if app_event_requests_redraw(&wake) {
+                    self.needs_redraw = true;
+                }
+                return;
+            }
+        };
+        match event.window_event {
+            accesskit_winit::WindowEvent::InitialTreeRequested => {
+                // `Adapter::with_event_loop_proxy` can't synchronously
+                // return an initial tree (see its own doc comment); this
+                // is the deferred push it expects in response.
+                self.push_accessibility();
+            }
+            accesskit_winit::WindowEvent::ActionRequested(request) => {
+                self.handle_accessibility_action(&request);
+            }
+            accesskit_winit::WindowEvent::AccessibilityDeactivated => {
+                tracing::debug!("accessibility deactivated");
+            }
+        }
+    }
+
+    fn about_to_wait_untraced(&mut self, el: &ActiveEventLoop) {
+        // 0.213.0: a selection step undone or redone by a path that does
+        // not own the selection (defensive; the known ones apply it).
+        self.apply_pending_selection();
+        // 0.221.0: a Clone Stamp source belongs to the layer it was set on.
+        self.doc.clone_stamp.observe_layer(self.doc.active_layer);
+        // 0.186.0: install whatever the background compositor finished.
+        if self.drain_background_composite() {
+            self.needs_redraw = true;
+        }
+        frame_trace::mark("drain_background");
+        // 0.174.0: the quit review ended with nothing left unsaved.
+        if self.exit_requested {
+            self.exit_requested = false;
+            self.finish_shutdown();
+            el.exit();
+            return;
+        }
+        // 0.177.0 review L-2: a Save With Changes that found the modal
+        // slot taken asks the first iteration no dialog is open.
+        if psd_save::take_deferred_dialog(
+            &mut self.psd_dialog_deferred,
+            self.pending_psd_save.is_some(),
+            self.dialog.is_some(),
+        ) {
+            self.psd_dialog_deferred = !self.open_psd_save_dialog();
+        }
+        // 0.175.0 (F-3): a window close that waited for a dialog starts
+        // the quit review the first iteration no dialog is open.
+        if document_close::take_pending_quit(
+            &mut self.quit_pending,
+            self.dialog.is_some(),
+            self.quit_review.is_some(),
+        ) {
+            let _ = self.request_quit();
+        }
+        // 0.174.0: unsaved marks follow every change, relabelled only
+        // when one differs.
+        if document_close::refresh_dirty_marks(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.shelf,
+            &self.doc,
+        ) {
+            let window_size = self.window.as_ref().map(|window| window.inner_size());
+            if let Some(size) = window_size {
+                self.apply_resize((size.width, size.height));
+            }
+            self.push_accessibility();
+            self.needs_redraw = true;
+        }
+        // muda's own events arrive on a plain channel, not through this
+        // crate's `accesskit_winit::Event` user-event type (the two
+        // don't share one enum -- restructuring the accessibility
+        // integration around a combined event type is a bigger, separate
+        // change) -- polled here since `about_to_wait` already runs on
+        // every loop iteration. Real `winit` `WindowEvent`s never arrive
+        // for a native menu action, so `needs_redraw` alone can't catch
+        // one -- set explicitly here instead, for the same reason
+        // `window_event` sets it for every other real input.
+        #[cfg(target_os = "macos")]
+        {
+            // A real, found-not-assumed bug: a menu action (e.g. "Toggle
+            // Layers Panel") changes a panel's own layout *style*
+            // (`aurora_ui::set_panel_collapsed`/`close_panel`), but
+            // nothing re-runs `WidgetTree::compute_layout` afterward on
+            // this path — unlike `App::handle_key_event`, which already
+            // does this unconditionally after every key event for
+            // exactly this reason (see that method's own doc comment).
+            // Without it, the new style never reaches `WidgetTree::
+            // bounds`, so the menu action visibly does nothing at all
+            // until some *other* event (a real window resize) happens
+            // to force a relayout.
+            let mut menu_event_handled = false;
+            while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
+                self.handle_menu_event(&event);
+                self.needs_redraw = true;
+                menu_event_handled = true;
+            }
+            if menu_event_handled && let Some(window) = self.window.as_ref() {
+                let size = window.inner_size();
+                self.apply_resize((size.width, size.height));
+            }
+        }
+
+        // A background open whose decode finished (0.151.0) is installed
+        // here, on the UI thread, before everything below mirrors the
+        // document -- so the controls follow the new one this iteration.
+        self.poll_background_open();
+        frame_trace::mark("poll_open");
+
+        // The gallery tooltip's timer: tick first, then read the next
+        // deadline, so a deadline that just passed is consumed.
+        let now = std::time::Instant::now();
+        let (changed, gallery_deadline) =
+            gallery_timer_step(&mut self.workspace, &mut self.gallery, now);
+        if changed {
+            self.relayout_after_gallery();
+        }
+        // Once per iteration, whatever ran above (a macOS menu command, an
+        // accessibility action): IME follows focus (review M1), and the
+        // Layers-panel controls follow the document -- after the menu
+        // drain, so a menu command's own change is mirrored this
+        // iteration, not the next (critic C5).
+        self.sync_ime();
+        self.follow_document_tabs_now();
+        self.sync_layer_controls_now();
+        frame_trace::mark("sync_layers");
+        self.sync_tool_controls_now();
+        self.sync_channels_now();
+        self.sync_paths_now();
+        self.sync_curves_controls_now();
+        self.sync_status_bar_now();
+        let thumbnail_deadline = self.update_layer_thumbnails(now);
+        frame_trace::mark("thumbnails");
+        let tooltip_deadline = self.tooltip_step(now);
+        // The caret blink (0.139.0): after everything above that can move
+        // focus or edit a field, so the signature it observes is this
+        // iteration's. A flip the last frame did not draw asks for one
+        // frame; the next flip joins the tooltip's deadline, so an idle
+        // loop with a focused field wakes exactly once per half-period.
+        let caret = self.caret_step(now);
+        let deadline = fold_caret_step(caret, gallery_deadline, &mut self.needs_redraw);
+        let deadline = match (deadline, thumbnail_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        // 0.212.0: the selection's ants, only while one is shown, the
+        // window is focused and motion is allowed (`ants_step`).
+        let ants = self.ants_step(now);
+        if ants.redraw {
+            self.needs_redraw = true;
+        }
+        let deadline = earliest_deadline(deadline, ants.next_tick);
+        let deadline = earliest_deadline(deadline, tooltip_deadline);
+        // `ControlFlow::Wait` would otherwise block indefinitely, and
+        // muda's channel has no event-loop wakeup of its own to
+        // interrupt that wait -- so macOS also re-polls on a short timer,
+        // the cost of catching a menu click promptly without the
+        // unconditional per-frame `request_redraw` this whole mechanism
+        // used to rely on (and which pegged a full CPU core doing it,
+        // since it never let the loop go idle at all -- see
+        // `needs_redraw`'s own doc comment). Non-macOS has no channel to
+        // poll and blocks in plain `Wait` unless a tooltip or a caret
+        // flip is pending.
+        #[cfg(target_os = "macos")]
+        let poll = Some(MUDA_POLL_INTERVAL);
+        #[cfg(not(target_os = "macos"))]
+        let poll = None;
+        // 0.185.0: a store opened or closed since the last turn moved
+        // every share of the residency pool; a parked document admits
+        // nothing, so it is brought inside its share here, at most
+        // `EVICTION_BURST` tiles per store per turn (review RB-1), and
+        // the loop does not sleep while any store is still over. A
+        // comparison per store when nothing changed.
+        //
+        // 0.187.0: every change of the active document already moves the
+        // pool's active share (`document_session::hand_tile_pool_over`);
+        // re-claiming it here, a lock and a store, is the backstop that
+        // keeps it on the active document whatever path changed it.
+        let _ = self.doc.claim_active_tile_share();
+        let (evicted, over) = self
+            .shelf
+            .enforce_tile_budgets(&mut self.doc, aurora_tile::EVICTION_BURST);
+        if evicted > 0 {
+            tracing::debug!(
+                evicted,
+                over,
+                "shrinking open documents to their tile budget shares"
+            );
+        }
+        let poll = tile_budget_poll(over, poll);
+        el.set_control_flow(next_control_flow(now, deadline, poll));
+
+        if self.needs_redraw
+            && let Some(window) = self.window.as_ref()
+        {
+            window.request_redraw();
+            self.needs_redraw = false;
+        }
+    }
+}
