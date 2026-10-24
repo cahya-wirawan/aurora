@@ -61,7 +61,7 @@ fn error_by_hidden_layer_for_named_files() {
 /// follow the stored angle, a pattern fill and a pattern/gradient overlay.
 /// Task 149 adds `advanced-blending.psd`: 58.26 before, 0.01 after (`infx`
 /// and `clbl`); its one-texel maximum is a rounded edge.
-const SHAPE_FIDELITY: [(&str, f64, f64); 10] = [
+const SHAPE_FIDELITY: [(&str, f64, f64); 11] = [
     ("vector-mask2.psd", 5.0, 70.0),
     ("colormodes/4x4_16bit_rgb.psd", 28.0, 135.0),
     ("colormodes/4x4_16bit_grayscale.psd", 18.0, 45.0),
@@ -70,6 +70,11 @@ const SHAPE_FIDELITY: [(&str, f64, f64); 10] = [
     // 20.60 before the stored pixels of a shape layer replaced its
     // rasterised path (task 149).
     ("effects/double-stroke-effects.psd", 0.05, 3.0),
+    // 28.84 before the strokes of a shape layer followed its vector outline
+    // instead of its pixels' alpha (task 151); 4.5 after. The rest is the
+    // 'Raster *' twins and the gradient and pattern strokes, not
+    // investigated.
+    ("effects/stroke-effects.psd", 5.0, 255.0),
     // 18.50 before a clipped group was drawn clipped (task 149).
     ("group-clipping/group-clipping.psd", 0.05, 3.0),
     // 18.88 and 19.13 before task 150: the masks' feathers (Gaussian,
@@ -110,5 +115,62 @@ fn drawn_fills_and_artboard_backgrounds_match_photoshops_merged_images() {
         println!("SHAPE-FIDELITY {file}: mean {mean:.3} max {max:.0}");
         assert!(mean <= mean_bound, "{file}: mean {mean} over {mean_bound}");
         assert!(max <= max_bound, "{file}: max {max} over {max_bound}");
+    }
+}
+
+/// Task 151: the shape layers of `stroke-effects.psd` keep their outline
+/// (their strokes follow it) and the raster twins and plain layers do not.
+#[test]
+fn stroke_effects_shape_layers_keep_their_outline() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../corpora/psd/reference/psd-tools-fixtures/effects/stroke-effects.psd");
+    let Ok(bytes) = std::fs::read(&path) else {
+        crate::open_time_tests::corpus_file_absent(&path);
+        return;
+    };
+    let (_scratch, mut store) = real_tile_store();
+    let (document, _image) = open_and_composite_psd(
+        &bytes,
+        &mut store,
+        (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
+    );
+    let mut with = Vec::new();
+    let mut without = Vec::new();
+    for id in crate::layer_ids_in_order(&document.layers) {
+        if !matches!(
+            document.layers.kind(id),
+            Some(aurora_doc::LayerKind::Pixel { .. })
+        ) {
+            continue;
+        }
+        let name = document.layers.name(id).unwrap_or("?").to_string();
+        if document.layers.effect_shape(id).is_some() {
+            with.push(name);
+        } else {
+            without.push(name);
+        }
+    }
+    // The outline is positioned relative to the layer's bounds origin
+    // (`Effect OutsetFrame` starts left of the canvas, at x = -1; its
+    // outline is clipped to the canvas, so its left edge is at document 0).
+    let outset = crate::layer_ids_in_order(&document.layers)
+        .into_iter()
+        .find(|id| document.layers.name(*id) == Some("Effect OutsetFrame"));
+    let Some(outset) = outset else {
+        unreachable!("Effect OutsetFrame is in the file");
+    };
+    let (Some(bounds), Some(shape)) = (
+        document.layers.bounds(outset),
+        document.layers.effect_shape(outset),
+    ) else {
+        unreachable!("Effect OutsetFrame has bounds and an outline");
+    };
+    assert_eq!(bounds.x + shape.area().x, 0, "{bounds:?} {:?}", shape.area());
+    println!("EFFECT-SHAPES with {with:?} without {without:?}");
+    // Every raster twin has no outline; the 'Shape *' layers do.
+    assert!(without.iter().any(|n| n.starts_with("Raster")), "{without:?}");
+    assert!(with.iter().all(|n| !n.starts_with("Raster")), "{with:?}");
+    for name in ["Shape Rectangle", "Shape Ellipse", "Shape OutsetFrame"] {
+        assert!(with.iter().any(|n| n == name), "{name} in {with:?}");
     }
 }

@@ -249,6 +249,19 @@ enum LayerOp {
         id: LayerId,
         value: crate::layer::LayerBlendOptions,
     },
+    /// Sets or clears a layer's effect shape (task 151,
+    /// [`crate::EffectShape`]). `LayerEntry::effect_shape` is
+    /// `#[serde(skip)]`, so [`History::save_journal`] follows every
+    /// journaled `Restore` that carries one with one of these, and **only
+    /// then**: a journal without an effect shape is byte-identical to the
+    /// ones older builds wrote. The plane travels lz4-compressed and is
+    /// decoded with its size checked first. Appended after
+    /// [`Self::SetBlendOptions`], so an Aurora older than this build
+    /// refuses a journal holding it (ADR 0009).
+    SetEffectShape {
+        id: LayerId,
+        value: Option<crate::PackedEffectShape>,
+    },
 }
 
 /// One layer's smoothed-ramp flags a journaled op carries (see
@@ -399,6 +412,19 @@ fn restored_clipped(op: &LayerOp) -> Vec<LayerId> {
             .iter()
             .filter(|(_, entry)| entry.clipped)
             .map(|(id, _)| *id)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every layer a journaled `Restore` carries with an effect shape (it would
+/// be lost on the wire).
+fn restored_effect_shapes(op: &LayerOp) -> Vec<(LayerId, std::sync::Arc<crate::EffectShape>)> {
+    match op {
+        LayerOp::Restore(subtree) => subtree
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| entry.effect_shape.clone().map(|s| (*id, s)))
             .collect(),
         _ => Vec::new(),
     }
@@ -709,6 +735,19 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
             // layer's interior effects composite.
             Ok((LayerOp::SetBlendOptions { id, value: old }, None))
         }
+        LayerOp::SetEffectShape { id, value } => {
+            let old = tree
+                .effect_shape(id)
+                .map(|s| crate::PackedEffectShape::of(s));
+            let shape = value
+                .map(|packed| packed.unpack().map(std::sync::Arc::new))
+                .transpose()
+                .map_err(DocError::InvalidEffectShape)?;
+            tree.set_effect_shape(id, shape)?;
+            // `None`: the shape changes where a layer's strokes, glows and
+            // shadows reach.
+            Ok((LayerOp::SetEffectShape { id, value: old }, None))
+        }
         LayerOp::SetClipped { id, value } => {
             let old = tree.clipped(id);
             tree.set_clipped_flag(id, value)?;
@@ -907,6 +946,10 @@ fn describe(op: &LayerOp) -> String {
         LayerOp::SetBlendOptions { id, .. } => {
             format!("Changed advanced blending on layer #{}", id.to_raw())
         }
+        LayerOp::SetEffectShape { id, value } => match value {
+            Some(_) => format!("Kept the effect shape of layer #{}", id.to_raw()),
+            None => format!("Removed the effect shape of layer #{}", id.to_raw()),
+        },
         LayerOp::SetClipped { id, value } => {
             let verb = if *value {
                 "Clipped"
@@ -1244,6 +1287,13 @@ impl History {
                 wire.push(std::borrow::Cow::Owned(LayerOp::SetBlendOptions {
                     id,
                     value,
+                }));
+            }
+            // The effect shape (task 151) the same way.
+            for (id, value) in restored_effect_shapes(op) {
+                wire.push(std::borrow::Cow::Owned(LayerOp::SetEffectShape {
+                    id,
+                    value: Some(crate::PackedEffectShape::of(&value)),
                 }));
             }
             // The clipping flag (0.201.0) the same way.
@@ -2034,6 +2084,33 @@ impl History {
             value: value.map(Box::new),
         });
         self.push(LayerOp::SetEffects { id, value: old });
+        Ok(None)
+    }
+
+    /// Same as [`LayerTree::set_effect_shape`], recorded for undo as one
+    /// `LayerOp::SetEffectShape` step (task 151). Returns `None` (region
+    /// unknown) like [`Self::set_smart_object`]; the PSD open that creates
+    /// these ops clears the undo stack afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LayerTree::set_effect_shape`]. Nothing is recorded when it
+    /// fails.
+    pub fn set_effect_shape(
+        &mut self,
+        tree: &mut LayerTree,
+        id: LayerId,
+        value: Option<std::sync::Arc<crate::EffectShape>>,
+    ) -> Result<Option<Rect>, DocError> {
+        let old = tree
+            .effect_shape(id)
+            .map(|s| crate::PackedEffectShape::of(s));
+        tree.set_effect_shape(id, value.clone())?;
+        self.journal.push(LayerOp::SetEffectShape {
+            id,
+            value: value.map(|s| crate::PackedEffectShape::of(&s)),
+        });
+        self.push(LayerOp::SetEffectShape { id, value: old });
         Ok(None)
     }
 
@@ -6587,6 +6664,178 @@ mod adjustment_tests {
         let loaded = History::load_journal(&history.save_journal().unwrap_or_default());
         let replayed = loaded.ok().and_then(|h| h.replay().ok());
         assert!(replayed.is_some_and(|t| t.blend_options(layer) == options));
+    }
+
+    fn effect_shape_fixture(seed: u8) -> std::sync::Arc<crate::EffectShape> {
+        let plane = (0..16u8).map(|i| i.wrapping_mul(seed)).collect();
+        match crate::EffectShape::new(
+            aurora_core::Rect {
+                x: 1,
+                y: 2,
+                width: 4,
+                height: 4,
+            },
+            plane,
+            u64::from(seed),
+        ) {
+            Ok(shape) => std::sync::Arc::new(shape),
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// Task 151: `SetEffectShape` is appended after `SetBlendOptions`, the
+    /// shape survives the journal and undo/redo, only a pixel layer takes
+    /// one, and a journal that never held one is the one older builds wrote.
+    #[test]
+    fn set_effect_shape_is_appended_undoable_and_journaled() {
+        let id = crate::LayerId::from_raw(3);
+        let ordinal = |op: &LayerOp| {
+            postcard::to_allocvec(op)
+                .ok()
+                .and_then(|b| b.first().copied())
+        };
+        let options = ordinal(&LayerOp::SetBlendOptions {
+            id,
+            value: crate::layer::LayerBlendOptions::default(),
+        });
+        let op = ordinal(&LayerOp::SetEffectShape { id, value: None });
+        assert!(
+            options.is_some() && op == options.map(|p| p + 1),
+            "{options:?} {op:?}"
+        );
+
+        let mut tree = crate::LayerTree::new();
+        let mut history = History::new();
+        let layer = match history.add_pixel_layer(&mut tree, "p", bounds(), None) {
+            Ok(layer) => layer,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match history.add_group(&mut tree, "g", None) {
+            Ok(group) => group,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let base_journal = history.save_journal().unwrap_or_default();
+        assert!(
+            history
+                .set_effect_shape(&mut tree, layer, Some(effect_shape_fixture(5)))
+                .is_ok()
+        );
+        assert!(matches!(
+            history.set_effect_shape(&mut tree, group, Some(effect_shape_fixture(5))),
+            Err(DocError::NotAPixelLayer(_))
+        ));
+        assert_eq!(
+            tree.effect_shape(layer).map(|s| s.as_ref().clone()),
+            Some((*effect_shape_fixture(5)).clone())
+        );
+        assert_ne!(history.save_journal().unwrap_or_default(), base_journal);
+        assert_eq!(
+            replayed_through_postcard(&history)
+                .effect_shape(layer)
+                .map(|s| s.as_ref().clone()),
+            Some((*effect_shape_fixture(5)).clone())
+        );
+        // Replacing, undoing and redoing.
+        assert!(
+            history
+                .set_effect_shape(&mut tree, layer, Some(effect_shape_fixture(7)))
+                .is_ok()
+        );
+        assert!(history.undo(&mut tree).is_ok());
+        assert_eq!(
+            tree.effect_shape(layer).map(|s| s.pixel_fingerprint()),
+            Some(5)
+        );
+        assert!(history.undo(&mut tree).is_ok());
+        assert!(tree.effect_shape(layer).is_none());
+        assert!(history.redo(&mut tree).is_ok());
+        assert_eq!(
+            tree.effect_shape(layer).map(|s| s.pixel_fingerprint()),
+            Some(5)
+        );
+        // Clearing it.
+        assert!(history.set_effect_shape(&mut tree, layer, None).is_ok());
+        assert!(tree.effect_shape(layer).is_none());
+        assert!(
+            replayed_through_postcard(&history)
+                .effect_shape(layer)
+                .is_none()
+        );
+        // A journal that never held a shape has no such op.
+        assert!(
+            !format!(
+                "{:?}",
+                History::load_journal(&base_journal).map(|h| h.journal_descriptions())
+            )
+            .contains("effect shape")
+        );
+    }
+
+    /// Task 151: removing a layer with an effect shape and undoing the
+    /// removal (a journaled `Restore`) keeps the shape through the wire,
+    /// which skips the field.
+    #[test]
+    fn effect_shapes_survive_a_restore_through_the_journal() {
+        let mut tree = crate::LayerTree::new();
+        let mut history = History::new();
+        let layer = match history.add_pixel_layer(&mut tree, "p", bounds(), None) {
+            Ok(layer) => layer,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let _other = history.add_pixel_layer(&mut tree, "q", bounds(), None);
+        assert!(
+            history
+                .set_effect_shape(&mut tree, layer, Some(effect_shape_fixture(9)))
+                .is_ok()
+        );
+        assert!(history.remove(&mut tree, layer).is_ok());
+        assert!(history.undo(&mut tree).is_ok());
+        assert!(tree.effect_shape(layer).is_some());
+        assert_eq!(
+            replayed_through_postcard(&history)
+                .effect_shape(layer)
+                .map(|s| s.pixel_fingerprint()),
+            Some(9)
+        );
+    }
+
+    /// Task 151: the document's shapes together are bounded.
+    #[test]
+    fn effect_shapes_are_bounded_in_total() {
+        let mut tree = crate::LayerTree::new();
+        let mut history = History::new();
+        let mut ids = Vec::new();
+        for n in 0..9 {
+            match history.add_pixel_layer(&mut tree, format!("p{n}"), bounds(), None) {
+                Ok(layer) => ids.push(layer),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        }
+        let side = 2048u32;
+        let big = || {
+            crate::EffectShape::new(
+                aurora_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: side,
+                    height: side,
+                },
+                vec![0; (side as usize) * (side as usize)],
+                1,
+            )
+            .map(std::sync::Arc::new)
+        };
+        let mut accepted = 0;
+        for id in ids {
+            let Ok(shape) = big() else {
+                unreachable!("valid")
+            };
+            if tree.set_effect_shape(id, Some(shape)).is_ok() {
+                accepted += 1;
+            }
+        }
+        // 4 Mpx each against a 32 Mpx cap: eight fit, the ninth is refused.
+        assert_eq!(accepted, 8);
     }
 
     /// Task 147: `SetGradientRamps` is appended after `SetStrokePaints`, the

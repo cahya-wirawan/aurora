@@ -576,6 +576,7 @@ mod document_session;
 mod document_tabs;
 #[cfg(test)]
 mod document_tabs_tests;
+mod effect_shape_app;
 mod export_save;
 mod fill_tools;
 mod filter_stamp;
@@ -17285,7 +17286,7 @@ fn effect_tile_coverage(
     SHADOW_COMPUTES.with(|n| n.set(n.get() + 1));
     let errors_before = budget.store_errors;
     let coverage = std::sync::Arc::new(profiled(ProfileSlot::ShadowMiss, || {
-        compute_shadow_tile_coverage(id, layers, store, tile, own, geometry, budget)
+        compute_shadow_tile_coverage(kind, id, layers, store, tile, own, geometry, budget)
     })?);
     // Review RC-1: a source or mask tile that failed to page in was
     // skipped (or failed open), so this coverage is degraded; the versions
@@ -17329,6 +17330,9 @@ struct ShadowCacheKey {
     doc_origin: (i64, i64),
     geometry: (i64, i64, u32, u32),
     mask: Option<(i64, i64, u32, u32, bool, u32)>,
+    /// [`aurora_doc::EffectShape::content_hash`] when the coverage is read
+    /// from the layer's valid effect shape (task 151), else `0`.
+    shape: u64,
     versions: Vec<(bool, u32, u32, bool, u64)>,
 }
 
@@ -17537,7 +17541,7 @@ enum CoverageKind {
 fn coverage_cache_key(
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &dyn TileSource,
+    store: &mut dyn TileSource,
     tile: CompositeTileAt,
     kind: CoverageKind,
     offset: (i64, i64),
@@ -17584,8 +17588,16 @@ fn coverage_cache_key(
             m.density.to_bits(),
         )
     });
+    // Only strokes read the outline (drop shadows and glows read the
+    // pixels' alpha), so only their keys carry it and pay for the check.
+    let shape = if matches!(kind, CoverageKind::DropShadow | CoverageKind::OuterGlow) {
+        0
+    } else {
+        effect_shape_app::valid_effect_shape(id, layers, store).map_or(0, |s| s.content_hash())
+    };
     Some(ShadowCacheKey {
         kind: kind as u8,
+        shape,
         store: store.serial(),
         surface,
         layer_origin,
@@ -17597,7 +17609,9 @@ fn coverage_cache_key(
 }
 
 /// [`shadow_tile_coverage`]'s computation, uncached.
+#[allow(clippy::too_many_arguments)]
 fn compute_shadow_tile_coverage(
+    kind: CoverageKind,
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
     store: &mut dyn TileSource,
@@ -17608,7 +17622,22 @@ fn compute_shadow_tile_coverage(
 ) -> Option<Vec<f32>> {
     let apron = i64::from(geometry.apron);
     let side_usize = usize::try_from(i64::from(aurora_tile::TILE) + 2 * apron).ok()?;
-    let alpha = read_shape_window(id, layers, store, tile, own, geometry.offset, apron, budget)?;
+    // Task 151: only strokes follow a shape layer's outline. Using it for
+    // drop shadows and outer glows changed no corpus file (measured on the
+    // whole audit corpus), and Photoshop's own rule for them is not known,
+    // so they keep reading the pixels' alpha.
+    let outline = !matches!(kind, CoverageKind::DropShadow | CoverageKind::OuterGlow);
+    let alpha = read_shape_window(
+        id,
+        layers,
+        store,
+        tile,
+        own,
+        geometry.offset,
+        apron,
+        budget,
+        outline,
+    )?;
     let coverage = aurora_filters::shadow_coverage(
         &alpha,
         side_usize,
@@ -17636,6 +17665,7 @@ fn read_shape_window(
     offset: (i64, i64),
     apron: i64,
     budget: &mut CompositeBudget,
+    outline: bool,
 ) -> Option<Vec<f32>> {
     let t = i64::from(aurora_tile::TILE);
     let side = t + 2 * apron;
@@ -17644,6 +17674,12 @@ fn read_shape_window(
         tile.doc_origin.0 - offset.0 - apron,
         tile.doc_origin.1 - offset.1 - apron,
     );
+    // Task 151: a shape layer's strokes, glows and shadows follow its
+    // outline while its pixels are the ones the outline was recorded with.
+    if outline && let Some(shape) = effect_shape_app::valid_effect_shape(id, layers, store) {
+        let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
+        return effect_shape_app::shape_window(&shape, origin, window, side_usize);
+    }
     let same_origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y)) == tile.reference_origin;
     let cell_lo = (
         (window.0 - tile.reference_origin.0).div_euclid(t),
@@ -17775,7 +17811,8 @@ fn stroke_tile_planes(
     STROKE_COMPUTES.with(|n| n.set(n.get() + 1));
     let errors_before = budget.store_errors;
     let apron = i64::from(geometry.apron);
-    let Some(alpha) = read_shape_window(id, layers, store, tile, own, (0, 0), apron, budget) else {
+    let Some(alpha) = read_shape_window(id, layers, store, tile, own, (0, 0), apron, budget, true)
+    else {
         return planes;
     };
     let Ok(side) = usize::try_from(i64::from(aurora_tile::TILE) + 2 * apron) else {
@@ -18036,6 +18073,23 @@ fn effect_reach_rects(
 ) -> Vec<aurora_core::Rect> {
     let mut out = rects.to_vec();
     let reaches = move_invalidation::effect_reaches(layers, layer);
+    // Task 151: an edit to a layer with an effect shape can end the shape's
+    // use (its pixels no longer match), which changes the layer's effects
+    // everywhere, not only around the edit: the whole layer and its reach
+    // are repainted.
+    if layers.effect_shape(layer).is_some()
+        && let Some(bounds) = layers.bounds(layer)
+    {
+        let grow = reaches.iter().map(|(_, apron)| *apron).max().unwrap_or(0);
+        let a = i64::from(grow);
+        let extra = u32::try_from(2 * a).unwrap_or(u32::MAX);
+        out.push(aurora_core::Rect {
+            x: bounds.x - a,
+            y: bounds.y - a,
+            width: bounds.width.saturating_add(extra),
+            height: bounds.height.saturating_add(extra),
+        });
+    }
     for (offset, apron) in reaches {
         let a = i64::from(apron);
         for r in rects {
@@ -18433,10 +18487,18 @@ fn fold_layer_with_effects(
     // overlays (Photoshop's order: the stroke is the topmost interior
     // effect), at the stroke's opacity in its own mode. Fill does not fade
     // it; the shape (step 3) clips it.
+    // Task 151: with a valid effect shape the inside strokes are folded
+    // over the laid-down layer instead (below), at the outline's coverage:
+    // inside the interior they would be scaled by the pixels' alpha, which
+    // a translucent fill makes partial.
+    let outline = effect_shape_app::valid_effect_shape(id, layers, store);
     for shown in &strokes {
         let Some(plane) = &shown.planes.inside else {
             continue;
         };
+        if outline.is_some() {
+            continue;
+        }
         for run in &runs {
             let first = run.start / aurora_tile::CHANNELS;
             if let (Some(inside), Some(cover)) = (
@@ -18483,6 +18545,23 @@ fn fold_layer_with_effects(
     }
     return_tile_scratch(interior);
     return_tile_scratch(source);
+    // Step 3a (task 151): the inside strokes of a layer with an effect
+    // shape, over the laid-down layer, at the layer's opacity and clipped
+    // by the outline's coverage (an inside plane is 1 everywhere outside
+    // the shape, where the distance to the exterior is zero).
+    if let Some(shape) = &outline {
+        let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
+        let side = aurora_tile::TILE as usize;
+        let cover = effect_shape_app::shape_window(shape, origin, doc_origin, side);
+        if let Some(cover) = cover {
+            for shown in &strokes {
+                if let Some(plane) = &shown.planes.inside {
+                    let clipped: Vec<f32> = plane.iter().zip(&cover).map(|(p, c)| p * c).collect();
+                    fold_stroke_plane(accumulator, &clipped, 0, shown, scale, doc_origin);
+                }
+            }
+        }
+    }
     // Step 4 (0.190.0): each shown stroke's outside plane over the laid-down
     // layer, in list order, at the stroke's opacity × the layer's opacity
     // (as a shadow's, beneath this). Fill does not fade it; the plane is
@@ -93082,6 +93161,7 @@ mod tests {
                 doc_origin: (i64::try_from(i).unwrap_or(0) * 256, 0),
                 geometry: (0, 0, 0, 0),
                 mask: None,
+                shape: 0,
                 versions: Vec::new(),
             };
             // RC-2: a pass that needs more than the cap, twice in order.
@@ -93753,6 +93833,350 @@ mod tests {
             ] {
                 near(texel(&acc, x, y), want);
             }
+        }
+
+        // ---- task 151: effect shapes ----
+
+        /// Overwrites the painted square with premultiplied white at alpha
+        /// `a` (a translucent fill, like a gradient that fades out).
+        fn fade(
+            store: &mut aurora_tile::TileStore,
+            layers: &aurora_doc::LayerTree,
+            id: aurora_doc::LayerId,
+            rect: (usize, usize, usize, usize),
+            a: f32,
+        ) {
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("pixel layer");
+            };
+            let Ok(tile) = store.get_mut(surface, aurora_tile::TileId { x: 0, y: 0 }) else {
+                unreachable!("writable");
+            };
+            for y in rect.1..rect.1 + rect.3 {
+                for x in rect.0..rect.0 + rect.2 {
+                    let i = (y * aurora_tile::TILE as usize + x) * 4;
+                    for v in tile.texels_mut().iter_mut().skip(i).take(4) {
+                        *v = half::f16::from_f32(a);
+                    }
+                }
+            }
+        }
+
+        /// A 40 x 40 square at (100, 100) of white at alpha 0.25 with a 3 px
+        /// outside red stroke and an effect shape covering exactly the
+        /// square, recorded beside the current pixels.
+        fn translucent_shape() -> (
+            tempfile::TempDir,
+            aurora_tile::TileStore,
+            aurora_doc::LayerTree,
+            aurora_doc::LayerId,
+        ) {
+            translucent_shape_with(StrokePosition::Outside)
+        }
+
+        fn translucent_shape_with(
+            position: StrokePosition,
+        ) -> (
+            tempfile::TempDir,
+            aurora_tile::TileStore,
+            aurora_doc::LayerTree,
+            aurora_doc::LayerId,
+        ) {
+            let (dir, mut store, mut layers, id) = stroked_square(position, 3.0);
+            fade(&mut store, &layers, id, (100, 100, 40, 40), 0.25);
+            let fingerprint = fingerprint_of(&mut store, &layers, id);
+            let shape = ok(aurora_doc::EffectShape::new(
+                aurora_core::Rect {
+                    x: 100,
+                    y: 100,
+                    width: 40,
+                    height: 40,
+                },
+                vec![255; 40 * 40],
+                fingerprint,
+            ));
+            ok(layers.set_effect_shape(id, Some(std::sync::Arc::new(shape))));
+            (dir, store, layers, id)
+        }
+
+        fn fingerprint_of(
+            store: &mut aurora_tile::TileStore,
+            layers: &aurora_doc::LayerTree,
+            id: aurora_doc::LayerId,
+        ) -> u64 {
+            let (Some(surface), Some(bounds)) = (layers.surface_id(id), layers.bounds(id)) else {
+                unreachable!("pixel layer");
+            };
+            ok(aurora_doc::smart_object::surface_fingerprint(
+                store, surface, bounds,
+            ))
+        }
+
+        /// The translucent square the outline strokes: a complete frame
+        /// outside it and nothing red inside, where the pixel alpha alone
+        /// would let the stroke show through the translucent fill.
+        #[test]
+        fn a_translucent_shape_gets_a_square_frame_from_its_outline() {
+            let (_d, mut store, layers, _) = translucent_shape();
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            // Stored straight, composited premultiplied: 0.25 x 0.25.
+            near(texel(&acc, 120, 120), [0.0625, 0.0625, 0.0625, 0.25]);
+            near(texel(&acc, 101, 101), [0.0625, 0.0625, 0.0625, 0.25]);
+            for (x, y) in [(99, 120), (97, 120), (120, 97), (142, 120), (120, 142)] {
+                near(texel(&acc, x, y), RED);
+            }
+            near(texel(&acc, 96, 120), CLEAR);
+        }
+
+        /// An inside stroke of a translucent shape is a solid frame at the
+        /// outline's edge (not faded by the fill's alpha), nothing outside
+        /// the outline, and the interior is left as it was.
+        #[test]
+        fn an_inside_stroke_of_a_translucent_shape_is_a_solid_frame() {
+            let (_d, mut store, layers, _) = translucent_shape_with(StrokePosition::Inside);
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            for (x, y) in [(100, 120), (102, 120), (137, 120), (139, 120), (120, 100)] {
+                near(texel(&acc, x, y), RED);
+            }
+            near(texel(&acc, 120, 120), [0.0625, 0.0625, 0.0625, 0.25]);
+            near(texel(&acc, 103, 120), [0.0625, 0.0625, 0.0625, 0.25]);
+            near(texel(&acc, 99, 120), CLEAR);
+            near(texel(&acc, 140, 120), CLEAR);
+            // Without the shape the frame is faded by the alpha.
+            let (_d2, mut store2, mut layers2, id2) =
+                translucent_shape_with(StrokePosition::Inside);
+            ok(layers2.set_effect_shape(id2, None));
+            let plain = composite_tile_at(&layers2, &mut store2, 0, 0, (0, 0));
+            assert!(texel(&plain, 101, 120)[3] < 0.5);
+        }
+
+        /// A Move keeps the shape valid (tiles are layer-local) and the
+        /// outline travels with the layer: the frame is drawn around the
+        /// moved square, nothing is left at the old place.
+        #[test]
+        fn moving_a_shape_layer_moves_its_stroke_frame_with_it() {
+            let (_d, mut store, mut layers, id) = translucent_shape();
+            ok(layers.set_bounds(
+                id,
+                aurora_core::Rect {
+                    x: 20,
+                    y: 10,
+                    width: 4096,
+                    height: 4096,
+                },
+            ));
+            assert!(crate::effect_shape_app::valid_effect_shape(id, &layers, &mut store).is_some());
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            // The square is now (120, 110) to (160, 150).
+            near(texel(&acc, 140, 130), [0.0625, 0.0625, 0.0625, 0.25]);
+            for (x, y) in [(119, 130), (117, 130), (140, 107), (162, 130), (140, 152)] {
+                near(texel(&acc, x, y), RED);
+            }
+            near(texel(&acc, 116, 130), CLEAR);
+            near(texel(&acc, 110, 120), CLEAR);
+            near(texel(&acc, 99, 120), CLEAR);
+        }
+
+        /// An edit to a layer with an effect shape repaints the whole
+        /// layer's effects (the edit can end the shape's use), not only the
+        /// edit's reach.
+        #[test]
+        fn editing_a_shape_layer_repaints_the_whole_layer() {
+            let (_d, _store, mut layers, id) = translucent_shape();
+            let dab = [aurora_core::Rect {
+                x: 110,
+                y: 110,
+                width: 1,
+                height: 1,
+            }];
+            let covers_layer = |layers: &aurora_doc::LayerTree| {
+                effect_reach_rects(layers, id, &dab)
+                    .iter()
+                    .any(|r| r.x <= 0 && r.y <= 0 && r.width >= 4096 && r.height >= 4096)
+            };
+            assert!(covers_layer(&layers));
+            ok(layers.set_effect_shape(id, None));
+            assert!(!covers_layer(&layers));
+        }
+
+        /// A different outline with the same pixels is a different picture:
+        /// the coverage cache is keyed on the outline too.
+        #[test]
+        fn a_different_outline_is_not_served_from_the_cache() {
+            let (_d, mut store, mut layers, id) = translucent_shape();
+            let first = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            near(texel(&first, 121, 110), [0.0625, 0.0625, 0.0625, 0.25]);
+            let fingerprint = fingerprint_of(&mut store, &layers, id);
+            let mut plane = vec![0u8; 40 * 40];
+            for y in 0..20 {
+                for x in 0..20 {
+                    if let Some(v) = plane.get_mut(y * 40 + x) {
+                        *v = 255;
+                    }
+                }
+            }
+            let smaller = ok(aurora_doc::EffectShape::new(
+                aurora_core::Rect {
+                    x: 100,
+                    y: 100,
+                    width: 40,
+                    height: 40,
+                },
+                plane,
+                fingerprint,
+            ));
+            ok(layers.set_effect_shape(id, Some(std::sync::Arc::new(smaller))));
+            let second = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            near(texel(&second, 121, 110), RED);
+        }
+
+        /// Drop shadows and outer glows keep reading the pixels' alpha: the
+        /// same layer with and without an outline casts the same shadow.
+        #[test]
+        fn shadows_and_glows_keep_reading_the_pixel_alpha() {
+            for glow in [false, true] {
+                let fx = || {
+                    if glow {
+                        aurora_core::LayerEffects {
+                            outer_glows: vec![aurora_core::effects::OuterGlow {
+                                size: 6.0,
+                                ..aurora_core::effects::OuterGlow::default()
+                            }],
+                            ..aurora_core::LayerEffects::default()
+                        }
+                    } else {
+                        aurora_core::LayerEffects {
+                            drop_shadows: vec![aurora_core::effects::DropShadow {
+                                distance: 8.0,
+                                ..aurora_core::effects::DropShadow::default()
+                            }],
+                            ..aurora_core::LayerEffects::default()
+                        }
+                    }
+                };
+                // Two stores, so the coverage cache cannot serve one from
+                // the other (shadow keys do not carry the outline).
+                let (_d, mut store, mut layers, id) = translucent_shape();
+                ok(layers.set_effects(id, Some(fx())));
+                let with = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+                let (_d2, mut store2, mut layers2, id2) = translucent_shape();
+                ok(layers2.set_effects(id2, Some(fx())));
+                ok(layers2.set_effect_shape(id2, None));
+                let without = composite_tile_at(&layers2, &mut store2, 0, 0, (0, 0));
+                assert_eq!(with, without, "glow: {glow}");
+                assert!(texel(&with, 100, 100)[3] > 0.0);
+            }
+        }
+
+        /// A layer with an enabled mask does not use its outline.
+        #[test]
+        fn a_masked_layer_ignores_its_outline() {
+            let (_d, mut store, mut layers, id) = translucent_shape();
+            assert!(crate::effect_shape_app::valid_effect_shape(id, &layers, &mut store).is_some());
+            ok(layers.add_mask(
+                id,
+                aurora_core::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 4096,
+                    height: 4096,
+                },
+            ));
+            assert!(crate::effect_shape_app::valid_effect_shape(id, &layers, &mut store).is_none());
+        }
+
+        /// The inside stroke of a translucent fill with an outline is
+        /// painted exactly once, at the outline's coverage: a stroke of 50 %
+        /// opacity over the 0.25-alpha fill is the 50 % red over the layer
+        /// result, not stacked twice (the fold in the interior at the pixels'
+        /// alpha plus a second one over the laid-down layer).
+        #[test]
+        fn an_inside_stroke_is_folded_once_at_the_outlines_coverage() {
+            let (_d, mut store, mut layers, id) = translucent_shape_with(StrokePosition::Inside);
+            let mut half = stroke(StrokePosition::Inside, 3.0, [1.0, 0.0, 0.0]);
+            half.opacity = 0.5;
+            set_strokes(&mut layers, id, vec![half]);
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            // Layer result there: white 0.0625 premultiplied at alpha 0.25;
+            // one 50 % red fold over it: red 0.5 + 0.0625 * 0.5, green and
+            // blue 0.0625 * 0.5, alpha 0.5 + 0.25 * 0.5.
+            for (x, y) in [(100, 120), (101, 120), (102, 120), (120, 100), (120, 102)] {
+                near(texel(&acc, x, y), [0.53125, 0.03125, 0.03125, 0.625]);
+            }
+            near(texel(&acc, 120, 120), [0.0625, 0.0625, 0.0625, 0.25]);
+            near(texel(&acc, 99, 120), CLEAR);
+        }
+
+        /// Without a shape the same layer strokes from its alpha, and the
+        /// result differs inside the square: the control that proves the
+        /// shape is what changed the picture.
+        #[test]
+        fn without_an_effect_shape_the_stroke_follows_the_pixel_alpha() {
+            let (_d, mut store, mut layers, id) = translucent_shape();
+            ok(layers.set_effect_shape(id, None));
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            let inside = texel(&acc, 101, 101);
+            assert!(
+                inside[0] > inside[1] + 0.05,
+                "red shows through: {inside:?}"
+            );
+        }
+
+        /// Editing the layer's pixels ends the shape's use (Photoshop
+        /// rasterises a shape layer when it is painted on); restoring the
+        /// pixels (an undo) brings it back.
+        #[test]
+        fn painting_on_the_layer_drops_the_shape_and_undoing_restores_it() {
+            let (_d, mut store, layers, id) = translucent_shape();
+            let with_shape = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            let Some(surface) = layers.surface_id(id) else {
+                unreachable!("pixel layer");
+            };
+            let tile_id = aurora_tile::TileId { x: 0, y: 0 };
+            let index = (110 * aurora_tile::TILE as usize + 110) * 4;
+            let original = {
+                let Ok(tile) = store.get_mut(surface, tile_id) else {
+                    unreachable!("writable");
+                };
+                let Some(v) = tile.texels_mut().get_mut(index + 3) else {
+                    unreachable!("in range");
+                };
+                let old = *v;
+                *v = half::f16::from_f32(0.5);
+                old
+            };
+            let painted_on = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            let inside = texel(&painted_on, 101, 101);
+            assert!(
+                inside[0] > inside[1] + 0.05,
+                "falls back to alpha: {inside:?}"
+            );
+            {
+                let Ok(tile) = store.get_mut(surface, tile_id) else {
+                    unreachable!("writable");
+                };
+                if let Some(v) = tile.texels_mut().get_mut(index + 3) {
+                    *v = original;
+                }
+            }
+            let restored = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            assert_eq!(with_shape, restored);
+        }
+
+        /// The fingerprint comparison runs once while the layer's tile
+        /// versions stay the same, and again after an edit.
+        #[test]
+        fn the_validity_check_is_remembered_until_a_tile_changes() {
+            let (_d, mut store, layers, id) = translucent_shape();
+            let runs = || crate::effect_shape_app::FINGERPRINT_RUNS.with(std::cell::Cell::get);
+            let before = runs();
+            for _ in 0..3 {
+                let _ = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            }
+            assert_eq!(runs() - before, 1);
+            fade(&mut store, &layers, id, (100, 100, 1, 1), 0.3);
+            let _ = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            assert_eq!(runs() - before, 2);
         }
 
         #[test]

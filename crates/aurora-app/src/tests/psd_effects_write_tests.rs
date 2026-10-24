@@ -91,8 +91,19 @@ fn strip_unverified(doc: &mut aurora_io::PsdDocument) {
 }
 
 /// Files allowed to change by a bounded amount in the save round trip, each
-/// with its reason. Empty: none are.
-const COMPOSITE_ALLOWLIST: [(&str, f64); 0] = [];
+/// with its reason.
+///
+/// `stroke-effects.psd` (task 151): its shape layers have translucent fills
+/// and Aurora draws their strokes from the vector outline it kept at open,
+/// which a PSD file cannot carry (the save report says so), so the reopened
+/// file strokes from the pixels' alpha and differs.
+///
+/// Measured: max 255 (a stroke frame is wholly absent at its edge) and
+/// per-channel means 28.55 / 11.84 / 17.79; the bound is the max plus a
+/// margin on each mean, so the check still fails if the round trip got worse
+/// (before the outline, the same file round-tripped bit for bit).
+const COMPOSITE_ALLOWLIST: [(&str, f64, [f64; 3]); 1] =
+    [("stroke-effects.psd", 255.0, [29.0, 12.5, 18.5])];
 
 #[test]
 #[allow(clippy::too_many_lines)]
@@ -190,13 +201,17 @@ fn corpus_files_with_effects_survive_a_psd_save_and_reopen() {
         // is not the saved record rectangle, which the default no longer
         // writes. The allowlist of files allowed to differ is empty; add a
         // file here only with a written reason.
-        let bound = COMPOSITE_ALLOWLIST
+        let (bound, mean_bound) = COMPOSITE_ALLOWLIST
             .iter()
-            .find(|(n, _)| *n == name)
-            .map_or(0.0, |(_, b)| *b);
+            .find(|(n, _, _)| *n == name)
+            .map_or((0.0, [0.0; 3]), |(_, b, m)| (*b, *m));
         assert!(
             max.iter().all(|&m| m <= bound),
             "{name}: composite changed by the save: max {max:?}"
+        );
+        assert!(
+            mean.iter().zip(mean_bound).all(|(m, b)| *m <= b),
+            "{name}: composite changed by the save: mean {mean:?} over {mean_bound:?}"
         );
         assert_eq!(before.len(), after.len(), "{name}: layers with effects");
         let mut differing = Vec::new();

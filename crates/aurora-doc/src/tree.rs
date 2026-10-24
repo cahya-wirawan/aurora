@@ -2447,6 +2447,53 @@ impl LayerTree {
         Ok(())
     }
 
+    /// The layer's effect shape (task 151), or `None` when it has none or
+    /// `id` does not exist.
+    #[must_use]
+    pub fn effect_shape(&self, id: LayerId) -> Option<&std::sync::Arc<crate::EffectShape>> {
+        self.layers.get(&id)?.effect_shape.as_ref()
+    }
+
+    /// Replaces the layer's effect shape (task 151); `None` removes it.
+    /// Data the compositor reads for strokes, glows and shadows; it never
+    /// changes a stored pixel.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::UnknownLayer`] if `id` doesn't exist;
+    /// [`DocError::NotAPixelLayer`] if it is not a pixel layer;
+    /// [`DocError::InvalidEffectShape`] if the document's shapes would
+    /// together cover more than [`crate::MAX_EFFECT_SHAPE_TOTAL_PIXELS`].
+    /// Nothing is changed when any happens.
+    pub fn set_effect_shape(
+        &mut self,
+        id: LayerId,
+        value: Option<std::sync::Arc<crate::EffectShape>>,
+    ) -> Result<(), DocError> {
+        let entry = self.layers.get(&id).ok_or(DocError::UnknownLayer(id))?;
+        if !matches!(entry.kind, LayerKind::Pixel { .. }) {
+            return Err(DocError::NotAPixelLayer(id));
+        }
+        if let Some(value) = &value {
+            let others: u64 = self
+                .layers
+                .iter()
+                .filter(|(other, _)| **other != id)
+                .filter_map(|(_, e)| e.effect_shape.as_ref())
+                .map(|s| s.pixels())
+                .sum();
+            if others.saturating_add(value.pixels()) > crate::MAX_EFFECT_SHAPE_TOTAL_PIXELS {
+                return Err(DocError::InvalidEffectShape(
+                    crate::EffectShapeError::BadSize,
+                ));
+            }
+        }
+        if let Some(entry) = self.layers.get_mut(&id) {
+            entry.effect_shape = value;
+        }
+        Ok(())
+    }
+
     /// The layer's preserved smart-object data (0.200.0), or `None` when
     /// it has none or `id` does not exist.
     #[must_use]

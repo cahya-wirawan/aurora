@@ -335,10 +335,26 @@ pub struct PsdLayer {
     /// interpreted: [`build_document`] attaches it to the tree with the
     /// pixels' fingerprint, so a PSD save can write it back.
     pub smart: Option<PsdSmartObject>,
+    /// The coverage of the layer's vector outline (task 151), for a shape
+    /// layer that stores pixels and draws layer effects:
+    /// [`build_document`] attaches it with the pixels' fingerprint, so the
+    /// strokes, glows and shadows follow the outline and not the alpha of a
+    /// translucent fill.
+    pub effect_shape: Option<PsdEffectShape>,
     /// Where the layer's channels are in the file, while its pixels are
     /// not decoded yet (0.154.0): [`decode`] decodes every one before it
     /// returns, [`read_streaming`] one at a time as each is handed on.
     pending: Option<PendingPixels>,
+}
+
+/// A shape layer's outline coverage (task 151), see
+/// [`PsdLayer::effect_shape`].
+#[derive(Debug)]
+pub struct PsdEffectShape {
+    /// Where `coverage` lies, in **document** coordinates.
+    pub area: Rect,
+    /// Row-major over `area`, `0..=255`.
+    pub coverage: Vec<u8>,
 }
 
 /// One imported adjustment layer: Curves (`curv`, 0.158.0), Levels
@@ -4487,14 +4503,152 @@ fn layer_node(
     let outcome = masks_for(src, record, header, region, notes, vector_budget);
     note_unsupported(record, &outcome, notes, true);
     let mask = outcome.mask;
+    let effect_shape = if pending.is_some() && props.effects.is_some() {
+        effect_shape_for(record, header, region, vector_budget)
+    } else {
+        None
+    };
     Some(PsdNode::Layer(PsdLayer {
         props,
         bounds: record.bounds,
         image: None,
         mask,
         smart,
+        effect_shape,
         pending,
     }))
+}
+
+/// Whether a decoded shape layer's visible pixels all lie under the
+/// outline `shape` (task 151): no pixel of alpha `>= 0.25` where the
+/// outline's coverage is zero. Photoshop draws a vector stroke into the
+/// stored pixels of a shape layer (`double-stroke-effects.psd`: 25 px
+/// stored against a 24 px path), and an outline smaller than its pixels is
+/// not the shape its effects should follow.
+fn outline_covers_pixels(image: &Image, layer_bounds: Rect, shape: &PsdEffectShape) -> bool {
+    let width = image.width() as usize;
+    for (iy, row) in image.samples().chunks(width.max(1) * 4).enumerate() {
+        for (ix, texel) in row.chunks_exact(4).enumerate() {
+            let alpha = texel.get(3).map_or(0.0, |a| a.to_f32());
+            if alpha < 0.25 {
+                continue;
+            }
+            let x = layer_bounds.x + i64::try_from(ix).unwrap_or(i64::MAX) - shape.area.x;
+            let y = layer_bounds.y + i64::try_from(iy).unwrap_or(i64::MAX) - shape.area.y;
+            let covered = match (u32::try_from(x), u32::try_from(y)) {
+                (Ok(x), Ok(y)) if x < shape.area.width && y < shape.area.height => {
+                    let index = u64::from(y) * u64::from(shape.area.width) + u64::from(x);
+                    usize::try_from(index)
+                        .ok()
+                        .and_then(|i| shape.coverage.get(i))
+                        .is_some_and(|c| *c != 0)
+                }
+                _ => false,
+            };
+            if !covered {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Whether the outline says something the pixels' alpha does not (task 151):
+/// some texel the outline covers fully has alpha below 0.95, as with a fill
+/// that fades or is absent. For an opaque shape the stored alpha is already
+/// Photoshop's own rendering of the outline, anti-aliasing included, and is
+/// the better shape (measured on `layer_comps.psd`: the rasterised path's
+/// edge is a few levels worse), so such a layer keeps no outline and its
+/// effects are exactly what they were.
+fn outline_adds_information(image: &Image, layer_bounds: Rect, shape: &PsdEffectShape) -> bool {
+    let width = image.width() as usize;
+    let stored = |x: i64, y: i64| -> f32 {
+        let (ix, iy) = (x - layer_bounds.x, y - layer_bounds.y);
+        match (u32::try_from(ix), u32::try_from(iy)) {
+            (Ok(ix), Ok(iy)) if ix < image.width() && iy < image.height() => image
+                .samples()
+                .get((iy as usize * width + ix as usize) * 4 + 3)
+                .map_or(0.0, |a| a.to_f32()),
+            _ => 0.0,
+        }
+    };
+    let w = shape.area.width as usize;
+    shape.coverage.iter().enumerate().any(|(i, c)| {
+        *c == u8::MAX
+            && stored(
+                shape.area.x + i64::try_from(i % w.max(1)).unwrap_or(i64::MAX),
+                shape.area.y + i64::try_from(i / w.max(1)).unwrap_or(i64::MAX),
+            ) < 0.95
+    })
+}
+
+/// The most pixels a layer's own surface may cover for it to keep an effect
+/// shape (task 151): the compositor checks the shape's fingerprint against
+/// the layer's tiles, so a layer with a huge surface is left on pixel alpha.
+const EFFECT_SHAPE_MAX_LAYER_PIXELS: u64 = 256 * 256 * 256;
+
+/// A shape layer's outline coverage (task 151): for a record that the
+/// stored-pixels rule of task 149 keeps as pixels (the "pixel data
+/// irrelevant" flag, an area, a vector mask) and that draws layer effects,
+/// the rasterised path as 8-bit coverage in document coordinates. `None`
+/// for any other record, a disabled, unreadable, inverted or oversized
+/// path, a layer whose mask spreads (those are drawn from fill and path,
+/// [`shape_mask_spreads`]), or when the file's vector budget is spent.
+/// Strokes, glows and shadows of such a layer follow this outline instead
+/// of the pixels' alpha, which a translucent fill makes partial
+/// (`stroke-effects.psd`).
+fn effect_shape_for(
+    record: &Record,
+    header: Header,
+    layer_region: Rect,
+    budget: &mut vector::Budget,
+) -> Option<PsdEffectShape> {
+    if record.flags & SHAPE_PIXELS_IRRELEVANT == 0
+        || record.area() == 0
+        || !record.features.vector_mask
+        || shape_mask_spreads(record)
+        || u64::from(layer_region.width) * u64::from(layer_region.height)
+            > EFFECT_SHAPE_MAX_LAYER_PIXELS
+    {
+        return None;
+    }
+    let data = record.vector.as_deref()?;
+    let records = (data.len() / 26) as u64 + 1;
+    if records > budget.work {
+        return None;
+    }
+    budget.work -= records;
+    let path = vector::parse(data).ok()?;
+    if path.disable {
+        return None;
+    }
+    let raster = vector::rasterize(&path, header.width, header.height, budget).ok()?;
+    // The shape is held as 8-bit coverage, smaller than the raster the
+    // budget was charged for.
+    budget.pixels = budget.pixels.saturating_add(raster.charged);
+    let pixels = u64::from(raster.bounds.width) * u64::from(raster.bounds.height);
+    if raster.outside
+        || raster.coverage.is_empty()
+        || pixels == 0
+        || pixels > aurora_doc::MAX_EFFECT_SHAPE_PIXELS
+        || u64::try_from(raster.coverage.len()) != Ok(pixels)
+    {
+        return None;
+    }
+    let coverage = raster
+        .coverage
+        .iter()
+        .map(|c| {
+            // `0.0..=1.0` to `0..=255`, rounded; the clamp makes the cast exact.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let byte = (c.to_f32().clamp(0.0, 1.0) * 255.0).round() as u8;
+            byte
+        })
+        .collect();
+    Some(PsdEffectShape {
+        area: raster.bounds,
+        coverage,
+    })
 }
 
 /// A shape layer whose stored pixels cannot be used because its vector
@@ -4666,6 +4820,7 @@ fn drawn_fill_node(
         image: Some(image),
         mask: outcome.mask,
         smart: None,
+        effect_shape: None,
         pending: None,
     }))
 }
@@ -4699,6 +4854,7 @@ fn empty_fill_node(
         image: None,
         mask: outcome.mask,
         smart: None,
+        effect_shape: None,
         pending: None,
     })
 }
@@ -4751,6 +4907,7 @@ fn artboard_background(
         image: Some(image),
         mask: None,
         smart: None,
+        effect_shape: None,
         pending: None,
     }))
 }
@@ -6692,6 +6849,43 @@ impl Builder<'_, '_, '_> {
                     };
                     if let Some(image) = image.as_mut() {
                         self.bring_image_into_working(image);
+                    }
+                    // A path that does not cover the pixels is not the shape
+                    // they were drawn from (a vector stroke adds a pixel
+                    // `double-stroke-effects.psd`): the layer keeps its alpha.
+                    let shape = match (&image, layer.effect_shape) {
+                        (Some(image), Some(shape))
+                            if outline_covers_pixels(image, layer.bounds, &shape)
+                                && outline_adds_information(image, layer.bounds, &shape) =>
+                        {
+                            Some(shape)
+                        }
+                        _ => None,
+                    };
+                    if let (Some(image), Some(shape)) = (&image, shape) {
+                        // The fingerprint of the pixels as they sit in the
+                        // layer's surface, so the compositor can tell that
+                        // they are still the ones the outline went with
+                        // (task 151). A shape the document refuses (its
+                        // total bound) is dropped: the layer's effects fall
+                        // back to its pixels.
+                        let fingerprint =
+                            crate::import::placed_image_fingerprint(image, offset.0, offset.1)?;
+                        let relative = Rect {
+                            x: shape.area.x - bounds.x,
+                            y: shape.area.y - bounds.y,
+                            width: shape.area.width,
+                            height: shape.area.height,
+                        };
+                        if let Ok(shape) =
+                            aurora_doc::EffectShape::new(relative, shape.coverage, fingerprint)
+                        {
+                            let _ = self.history.set_effect_shape(
+                                self.layers,
+                                id,
+                                Some(std::sync::Arc::new(shape)),
+                            );
+                        }
                     }
                     if let (Some(image), Some(smart)) = (&image, layer.smart) {
                         // The fingerprint of the pixels as they will sit in

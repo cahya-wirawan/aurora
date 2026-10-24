@@ -732,6 +732,16 @@ pub(crate) struct LayerEntry {
     /// emits after a journaled `Restore`.
     #[serde(skip)]
     pub(crate) blend_options: LayerBlendOptions,
+    /// The coverage of the vector shape the layer's strokes, glows and
+    /// shadows are drawn from (task 151, [`crate::EffectShape`]), on a pixel
+    /// layer only. `#[serde(skip)]` for the same reason as
+    /// [`Self::clipped`]: it travels as `.aur`'s optional
+    /// `layer-effect-shapes` entry and as the `LayerOp::SetEffectShape`
+    /// that [`crate::History::save_journal`] emits after a journaled
+    /// `Restore`. An `Arc` so a journal op, an undo step and the tree share
+    /// one plane.
+    #[serde(skip)]
+    pub(crate) effect_shape: Option<std::sync::Arc<crate::effect_shape::EffectShape>>,
 }
 
 impl LayerEntry {
@@ -750,6 +760,7 @@ impl LayerEntry {
             smart_object: None,
             clipped: false,
             blend_options: LayerBlendOptions::default(),
+            effect_shape: None,
         }
     }
 }

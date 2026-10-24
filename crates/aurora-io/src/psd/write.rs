@@ -305,6 +305,11 @@ struct Losses {
     /// Layers (by name) holding effects of kinds that are not saved by
     /// default, with the kinds.
     fx_unverified: Vec<(String, Vec<&'static str>)>,
+    /// Layers (by name) whose effects follow a vector outline Aurora kept
+    /// (task 151, `aurora_doc::EffectShape`): the file holds the pixels and
+    /// the effects but not the outline, so on reopening the effects follow
+    /// the pixels' alpha.
+    outline_dropped: Vec<String>,
     /// Adjustment layers with values rounded to the file's resolution
     /// (0.205.0): Curves, Levels, Hue/Saturation; and since 0.241.0 Vibrance,
     /// Exposure, Photo Filter, Black & White, Color Balance (slots 3..=7).
@@ -677,6 +682,16 @@ impl Losses {
             ));
         }
         items.extend(self.smart_object_items());
+        if !self.outline_dropped.is_empty() {
+            let names: Vec<&str> = self.outline_dropped.iter().map(String::as_str).collect();
+            items.push(format!(
+                "The vector outline of {} is not saved: its effects are saved, but a file \
+                 reopened here draws strokes, glows and shadows from the pixels' alpha, which \
+                 can differ where the fill is translucent. Affected: {}.",
+                plural(names.len() as u64, "shape layer", "shape layers"),
+                name_list(&names)
+            ));
+        }
         if self.dissolve > 0 {
             items.push(
                 "Dissolve layers will look different in apps other than Photoshop.".to_owned(),
@@ -1063,6 +1078,11 @@ fn census_of(
         }
         if layers.blend_mode(id) == Some(BlendMode::Dissolve) {
             losses.dissolve += 1;
+        }
+        if layers.effects(id).is_some() && layers.effect_shape(id).is_some() {
+            losses
+                .outline_dropped
+                .push(layers.name(id).unwrap_or_default().to_owned());
         }
         if let Some(fx) = layers.effects(id) {
             let (_, lost) = super::write_effects::encode(fx, layers.bounds(id), ctx);
