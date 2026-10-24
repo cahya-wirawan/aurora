@@ -94035,28 +94035,34 @@ mod tests {
         #[test]
         fn shadows_and_glows_keep_reading_the_pixel_alpha() {
             for glow in [false, true] {
-                let (_d, mut store, mut layers, id) = translucent_shape();
-                let fx = if glow {
-                    aurora_core::LayerEffects {
-                        outer_glows: vec![aurora_core::effects::OuterGlow {
-                            size: 6.0,
-                            ..aurora_core::effects::OuterGlow::default()
-                        }],
-                        ..aurora_core::LayerEffects::default()
-                    }
-                } else {
-                    aurora_core::LayerEffects {
-                        drop_shadows: vec![aurora_core::effects::DropShadow {
-                            distance: 8.0,
-                            ..aurora_core::effects::DropShadow::default()
-                        }],
-                        ..aurora_core::LayerEffects::default()
+                let fx = || {
+                    if glow {
+                        aurora_core::LayerEffects {
+                            outer_glows: vec![aurora_core::effects::OuterGlow {
+                                size: 6.0,
+                                ..aurora_core::effects::OuterGlow::default()
+                            }],
+                            ..aurora_core::LayerEffects::default()
+                        }
+                    } else {
+                        aurora_core::LayerEffects {
+                            drop_shadows: vec![aurora_core::effects::DropShadow {
+                                distance: 8.0,
+                                ..aurora_core::effects::DropShadow::default()
+                            }],
+                            ..aurora_core::LayerEffects::default()
+                        }
                     }
                 };
-                ok(layers.set_effects(id, Some(fx)));
+                // Two stores, so the coverage cache cannot serve one from
+                // the other (shadow keys do not carry the outline).
+                let (_d, mut store, mut layers, id) = translucent_shape();
+                ok(layers.set_effects(id, Some(fx())));
                 let with = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
-                ok(layers.set_effect_shape(id, None));
-                let without = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+                let (_d2, mut store2, mut layers2, id2) = translucent_shape();
+                ok(layers2.set_effects(id2, Some(fx())));
+                ok(layers2.set_effect_shape(id2, None));
+                let without = composite_tile_at(&layers2, &mut store2, 0, 0, (0, 0));
                 assert_eq!(with, without, "glow: {glow}");
                 assert!(texel(&with, 100, 100)[3] > 0.0);
             }
