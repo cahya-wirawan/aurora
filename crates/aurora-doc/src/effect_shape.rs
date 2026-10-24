@@ -46,7 +46,7 @@ pub const MAX_EFFECT_SHAPE_PIXELS: u64 = 4 * 1024 * 1024;
 /// (32 MiB of planes).
 pub const MAX_EFFECT_SHAPE_TOTAL_PIXELS: u64 = 32 * 1024 * 1024;
 
-/// A layer's effect shape, see the [module documentation](self).
+/// A layer's effect shape, see the module documentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectShape {
     /// Where the plane lies, in the layer's own coordinates: `x`/`y` are

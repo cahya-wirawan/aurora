@@ -1948,7 +1948,7 @@ fn a_gradient_stroke_box_is_made_relative_to_the_layers_bounds_on_open() {
 
 mod outline {
     use crate::Image;
-    use crate::psd::{PsdEffectShape, outline_covers_pixels};
+    use crate::psd::{PsdEffectShape, outline_adds_information, outline_covers_pixels};
     use aurora_color::IccProfile;
     use aurora_core::Rect;
 
@@ -2022,5 +2022,41 @@ mod outline {
             rect(10, 20, 4, 4),
             &outline()
         ));
+    }
+
+    /// An opaque shape keeps no outline (its alpha is Photoshop's own); a
+    /// fill that fades, or a hole where the outline is full, keeps it.
+    #[test]
+    fn only_a_translucent_fill_keeps_an_outline() {
+        let outline = PsdEffectShape {
+            area: rect(0, 0, 2, 2),
+            coverage: vec![255, 255, 255, 255],
+        };
+        let all = |a: f32| image_with(&[((0, 0), a), ((1, 0), a), ((0, 1), a), ((1, 1), a)]);
+        assert!(!outline_adds_information(
+            &all(1.0),
+            rect(0, 0, 4, 4),
+            &outline
+        ));
+        assert!(!outline_adds_information(
+            &all(0.96),
+            rect(0, 0, 4, 4),
+            &outline
+        ));
+        assert!(outline_adds_information(
+            &all(0.9),
+            rect(0, 0, 4, 4),
+            &outline
+        ));
+        // One faded texel is enough.
+        let one = image_with(&[((0, 0), 1.0), ((1, 0), 1.0), ((0, 1), 1.0), ((1, 1), 0.2)]);
+        assert!(outline_adds_information(&one, rect(0, 0, 4, 4), &outline));
+        // Partial coverage on the edge is not counted.
+        let edge = PsdEffectShape {
+            area: rect(0, 0, 2, 2),
+            coverage: vec![255, 255, 255, 100],
+        };
+        let image = image_with(&[((0, 0), 1.0), ((1, 0), 1.0), ((0, 1), 1.0), ((1, 1), 0.3)]);
+        assert!(!outline_adds_information(&image, rect(0, 0, 4, 4), &edge));
     }
 }

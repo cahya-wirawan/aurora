@@ -91,8 +91,13 @@ fn strip_unverified(doc: &mut aurora_io::PsdDocument) {
 }
 
 /// Files allowed to change by a bounded amount in the save round trip, each
-/// with its reason. Empty: none are.
-const COMPOSITE_ALLOWLIST: [(&str, f64); 0] = [];
+/// with its reason.
+///
+/// `stroke-effects.psd` (task 151): its shape layers have translucent fills
+/// and Aurora draws their strokes from the vector outline it kept at open,
+/// which a PSD file cannot carry (the save report says so), so the reopened
+/// file strokes from the pixels' alpha and differs.
+const COMPOSITE_ALLOWLIST: [(&str, f64); 1] = [("stroke-effects.psd", 255.0)];
 
 #[test]
 #[allow(clippy::too_many_lines)]

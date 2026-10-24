@@ -4553,6 +4553,35 @@ fn outline_covers_pixels(image: &Image, layer_bounds: Rect, shape: &PsdEffectSha
     true
 }
 
+/// Whether the outline says something the pixels' alpha does not (task 151):
+/// some texel the outline covers fully has alpha below 0.95, as with a fill
+/// that fades or is absent. For an opaque shape the stored alpha is already
+/// Photoshop's own rendering of the outline, anti-aliasing included, and is
+/// the better shape (measured on `layer_comps.psd`: the rasterised path's
+/// edge is a few levels worse), so such a layer keeps no outline and its
+/// effects are exactly what they were.
+fn outline_adds_information(image: &Image, layer_bounds: Rect, shape: &PsdEffectShape) -> bool {
+    let width = image.width() as usize;
+    let stored = |x: i64, y: i64| -> f32 {
+        let (ix, iy) = (x - layer_bounds.x, y - layer_bounds.y);
+        match (u32::try_from(ix), u32::try_from(iy)) {
+            (Ok(ix), Ok(iy)) if ix < image.width() && iy < image.height() => image
+                .samples()
+                .get((iy as usize * width + ix as usize) * 4 + 3)
+                .map_or(0.0, |a| a.to_f32()),
+            _ => 0.0,
+        }
+    };
+    let w = shape.area.width as usize;
+    shape.coverage.iter().enumerate().any(|(i, c)| {
+        *c == u8::MAX
+            && stored(
+                shape.area.x + i64::try_from(i % w.max(1)).unwrap_or(i64::MAX),
+                shape.area.y + i64::try_from(i / w.max(1)).unwrap_or(i64::MAX),
+            ) < 0.95
+    })
+}
+
 /// The most pixels a layer's own surface may cover for it to keep an effect
 /// shape (task 151): the compositor checks the shape's fingerprint against
 /// the layer's tiles, so a layer with a huge surface is left on pixel alpha.
@@ -6826,7 +6855,8 @@ impl Builder<'_, '_, '_> {
                     // `double-stroke-effects.psd`): the layer keeps its alpha.
                     let shape = match (&image, layer.effect_shape) {
                         (Some(image), Some(shape))
-                            if outline_covers_pixels(image, layer.bounds, &shape) =>
+                            if outline_covers_pixels(image, layer.bounds, &shape)
+                                && outline_adds_information(image, layer.bounds, &shape) =>
                         {
                             Some(shape)
                         }
