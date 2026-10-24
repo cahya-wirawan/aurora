@@ -18463,10 +18463,18 @@ fn fold_layer_with_effects(
     // overlays (Photoshop's order: the stroke is the topmost interior
     // effect), at the stroke's opacity in its own mode. Fill does not fade
     // it; the shape (step 3) clips it.
+    // Task 151: with a valid effect shape the inside strokes are folded
+    // over the laid-down layer instead (below), at the outline's coverage:
+    // inside the interior they would be scaled by the pixels' alpha, which
+    // a translucent fill makes partial.
+    let outline = effect_shape_app::valid_effect_shape(id, layers, store).is_some();
     for shown in &strokes {
         let Some(plane) = &shown.planes.inside else {
             continue;
         };
+        if outline {
+            continue;
+        }
         for run in &runs {
             let first = run.start / aurora_tile::CHANNELS;
             if let (Some(inside), Some(cover)) = (
@@ -18513,6 +18521,15 @@ fn fold_layer_with_effects(
     }
     return_tile_scratch(interior);
     return_tile_scratch(source);
+    // Step 3a (task 151): the inside strokes of a layer with an effect
+    // shape, over the laid-down layer, at the layer's opacity.
+    if outline {
+        for shown in &strokes {
+            if let Some(plane) = &shown.planes.inside {
+                fold_stroke_plane(accumulator, plane, 0, shown, scale, doc_origin);
+            }
+        }
+    }
     // Step 4 (0.190.0): each shown stroke's outside plane over the laid-down
     // layer, in list order, at the stroke's opacity × the layer's opacity
     // (as a shadow's, beneath this). Fill does not fade it; the plane is
