@@ -125,7 +125,7 @@ pub(crate) fn valid_effect_shape(
 /// The shape's coverage `0..=1` over the `side` x `side` window whose
 /// top-left is document point `window`, for a layer whose bounds origin is
 /// `layer_origin`; `None` when the window holds none.
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_possible_wrap)] // a window row or column is at most a few thousand
 pub(crate) fn shape_window(
     shape: &EffectShape,
     layer_origin: (i64, i64),

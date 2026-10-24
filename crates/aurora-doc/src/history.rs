@@ -6806,7 +6806,7 @@ mod adjustment_tests {
         let mut history = History::new();
         let mut ids = Vec::new();
         for n in 0..9 {
-            match history.add_pixel_layer(&mut tree, &format!("p{n}"), bounds(), None) {
+            match history.add_pixel_layer(&mut tree, format!("p{n}"), bounds(), None) {
                 Ok(layer) => ids.push(layer),
                 Err(err) => unreachable!("{err:?}"),
             }

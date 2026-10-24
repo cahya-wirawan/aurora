@@ -4533,8 +4533,8 @@ fn outline_covers_pixels(image: &Image, layer_bounds: Rect, shape: &PsdEffectSha
             if alpha < 0.25 {
                 continue;
             }
-            let x = layer_bounds.x + ix as i64 - shape.area.x;
-            let y = layer_bounds.y + iy as i64 - shape.area.y;
+            let x = layer_bounds.x + i64::try_from(ix).unwrap_or(i64::MAX) - shape.area.x;
+            let y = layer_bounds.y + i64::try_from(iy).unwrap_or(i64::MAX) - shape.area.y;
             let covered = match (u32::try_from(x), u32::try_from(y)) {
                 (Ok(x), Ok(y)) if x < shape.area.width && y < shape.area.height => {
                     let index = u64::from(y) * u64::from(shape.area.width) + u64::from(x);

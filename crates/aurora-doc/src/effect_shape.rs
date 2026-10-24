@@ -158,8 +158,8 @@ fn hash_plane(area: Rect, coverage: &[u8]) -> u64 {
     let mut mix = |v: u64| {
         h = (h ^ v).wrapping_mul(PRIME);
     };
-    mix(area.x as u64);
-    mix(area.y as u64);
+    mix(area.x.cast_unsigned());
+    mix(area.y.cast_unsigned());
     mix(u64::from(area.width));
     mix(u64::from(area.height));
     for chunk in coverage.chunks(8) {

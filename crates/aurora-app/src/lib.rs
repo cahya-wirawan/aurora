@@ -17604,6 +17604,7 @@ fn coverage_cache_key(
 }
 
 /// [`shadow_tile_coverage`]'s computation, uncached.
+#[allow(clippy::too_many_arguments)]
 fn compute_shadow_tile_coverage(
     kind: CoverageKind,
     id: aurora_doc::LayerId,

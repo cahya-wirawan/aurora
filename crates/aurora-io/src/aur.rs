@@ -6901,13 +6901,18 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         assert_eq!(
-            document.layers.effect_shape(shaped).map(|s| s.as_ref()),
+            document
+                .layers
+                .effect_shape(shaped)
+                .map(std::convert::AsRef::as_ref),
             Some(shape.as_ref())
         );
         assert!(document.layers.effect_shape(plain).is_none());
         match document.history.replay() {
             Ok(replayed) => assert_eq!(
-                replayed.effect_shape(shaped).map(|s| s.as_ref()),
+                replayed
+                    .effect_shape(shaped)
+                    .map(std::convert::AsRef::as_ref),
                 Some(shape.as_ref())
             ),
             Err(err) => unreachable!("{err:?}"),
