@@ -103,21 +103,7 @@ pub(crate) fn decode_parts(bytes: &[u8]) -> Result<crate::colour_import::ImagePa
         other => return Err(IoError::UnexpectedColorType(other)),
     };
 
-    let promoted: Vec<f16> = match info.bit_depth {
-        png::BitDepth::Sixteen => pixels
-            .chunks_exact(2)
-            .map(|pair| {
-                let Ok(raw) = <[u8; 2]>::try_from(pair) else {
-                    unreachable!("chunks_exact(2) always yields length-2 slices");
-                };
-                f16::from_f32(promote_u16(u16::from_be_bytes(raw)))
-            })
-            .collect(),
-        _ => pixels
-            .iter()
-            .map(|&sample| f16::from_f32(promote_u8(sample)))
-            .collect(),
-    };
+    let promoted = promote_samples(pixels, info.bit_depth);
 
     let samples = if channels == 4 {
         promoted
@@ -131,6 +117,46 @@ pub(crate) fn decode_parts(bytes: &[u8]) -> Result<crate::colour_import::ImagePa
         samples,
         tag,
     })
+}
+
+/// Promotes decoded big-endian 16-bit or 8-bit samples to `f16` (task
+/// 154): through the PSD reader's lookup tables, which hold exactly
+/// `f16::from_f32(promote_u16(v))` / `f16::from_f32(promote_u8(v))` for
+/// every input (so the samples are bit-identical to converting each one),
+/// instead of a division and a software half conversion per sample (about
+/// half of decoding a 60 MP PNG). A lookup that misses (it cannot: the
+/// tables cover the whole input range) falls back to the direct form.
+fn promote_samples(pixels: &[u8], bit_depth: png::BitDepth) -> Vec<f16> {
+    match bit_depth {
+        png::BitDepth::Sixteen => {
+            let table = crate::psd::promote_u16_table();
+            pixels
+                .chunks_exact(2)
+                .map(|pair| {
+                    let Ok(raw) = <[u8; 2]>::try_from(pair) else {
+                        unreachable!("chunks_exact(2) always yields length-2 slices");
+                    };
+                    let value = u16::from_be_bytes(raw);
+                    table
+                        .get(usize::from(value))
+                        .copied()
+                        .unwrap_or_else(|| f16::from_f32(promote_u16(value)))
+                })
+                .collect()
+        }
+        _ => {
+            let table = crate::psd::promote_u8_table();
+            pixels
+                .iter()
+                .map(|&sample| {
+                    table
+                        .get(usize::from(sample))
+                        .copied()
+                        .unwrap_or_else(|| f16::from_f32(promote_u8(sample)))
+                })
+                .collect()
+        }
+    }
 }
 
 /// Builds the `png::Info` [`encode`]/[`encode_16`] both encode against:
@@ -782,5 +808,57 @@ mod tests {
             "a PNG written with the lighter sRGB chunk must decode back to exactly sRGB, \
              with zero decode-side special-casing required"
         );
+    }
+
+    /// Task 154: the table promotion gives exactly the per-sample
+    /// conversion for every 8-bit value, in every RGBA channel.
+    #[test]
+    fn decode_promotes_every_8_bit_value_exactly() {
+        // 256 pixels, pixel v = (v, 255 - v, v ^ 0x5a, v): each channel
+        // walks all 256 values.
+        let data: Vec<u8> = (0..=u8::MAX)
+            .flat_map(|v| [v, u8::MAX - v, v ^ 0x5a, v])
+            .collect();
+        let bytes = make_png(16, 16, png::ColorType::Rgba, png::BitDepth::Eight, &data);
+        let image = match decode(&bytes) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let want: Vec<u16> = data
+            .iter()
+            .map(|&v| f16::from_f32(promote_u8(v)).to_bits())
+            .collect();
+        let got: Vec<u16> = image.samples().iter().map(|s| s.to_bits()).collect();
+        assert_eq!(got, want);
+    }
+
+    /// Task 154: the same for every 16-bit value (big-endian in the file).
+    #[test]
+    fn decode_promotes_every_16_bit_value_exactly() {
+        // 65,536 samples = 128 x 128 RGBA pixels; sample i holds value
+        // (i * 40,503) mod 65,536 (odd, so every value appears once).
+        let values: Vec<u16> = (0..=u16::MAX).map(|i| i.wrapping_mul(40_503)).collect();
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_be_bytes()).collect();
+        let bytes = make_png(
+            128,
+            128,
+            png::ColorType::Rgba,
+            png::BitDepth::Sixteen,
+            &data,
+        );
+        let image = match decode(&bytes) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let want: Vec<u16> = values
+            .iter()
+            .map(|&v| f16::from_f32(aurora_color::promote_u16(v)).to_bits())
+            .collect();
+        let got: Vec<u16> = image.samples().iter().map(|s| s.to_bits()).collect();
+        assert_eq!(got, want);
+        let mut seen = values.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 65_536);
     }
 }

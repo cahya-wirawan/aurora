@@ -281,3 +281,41 @@ fn the_pool_composite_fails_on_an_unreadable_source_tile() {
         failure.message
     );
 }
+
+/// Task 154: an output ending in `.psd` runs the app's Save As PSD, times
+/// each phase and leaves a PSD the reader opens at the document's size.
+#[test]
+fn a_psd_output_runs_the_timed_save_as_psd() {
+    let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let input = write_test_png(dir.path());
+    let output = dir.path().join("out.PSD");
+    let scratch = dir.path().join("scratch");
+    let o = options(&input, &output, &scratch, CompositeMode::Export);
+    let result = run(&o);
+    let report = result.as_ref().unwrap_or_else(|f| panic!("{f:?}"));
+    let timings = report
+        .psd_save
+        .unwrap_or_else(|| panic!("no PSD timings: {report:?}"));
+    assert!(timings.write > Duration::ZERO && timings.verify > Duration::ZERO);
+    assert_eq!(report.composite, timings.composite);
+    assert_eq!(report.encode, Duration::ZERO);
+    let bytes = std::fs::read(&output).unwrap_or_else(|e| panic!("{e}"));
+    assert!(bytes.starts_with(b"8BPS"), "not a PSD");
+    assert_eq!(report.output_bytes, bytes.len());
+    let merged = aurora_io::decode_psd_merged_image(&bytes).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!((merged.width(), merged.height()), (300, 200));
+    // No temp file is left beside the target.
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap_or_else(|e| panic!("{e}"))
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.to_string_lossy().ends_with(".tmp")),
+        "{names:?}"
+    );
+    let json = to_json(&o, &result);
+    assert!(json.contains("\"psd_save_ms\":{\"preflight\":"), "{json}");
+    assert!(json.contains("\"report_items\":"), "{json}");
+    // A PNG run reports no PSD phases.
+    assert!(!is_psd_output(Path::new("a.png")) && is_psd_output(Path::new("a.psd")));
+}
