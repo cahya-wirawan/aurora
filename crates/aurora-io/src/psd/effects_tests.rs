@@ -1941,3 +1941,86 @@ fn a_gradient_stroke_box_is_made_relative_to_the_layers_bounds_on_open() {
         (0, 0, 4, 4)
     );
 }
+
+// ---------------------------------------------------------------------
+// Task 151: the outline of a shape layer
+// ---------------------------------------------------------------------
+
+mod outline {
+    use crate::psd::{PsdEffectShape, outline_covers_pixels};
+    use crate::Image;
+    use aurora_color::IccProfile;
+    use aurora_core::Rect;
+
+    fn rect(x: i64, y: i64, width: u32, height: u32) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// A 4 x 4 image at document (10, 20) with alpha `a` at the listed
+    /// `(x, y)` pixels and 0 elsewhere.
+    fn image_with(alpha: &[((u32, u32), f32)]) -> Image {
+        let mut samples = Vec::new();
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let a = alpha
+                    .iter()
+                    .find(|(p, _)| *p == (x, y))
+                    .map_or(0.0, |(_, a)| *a);
+                samples.extend([1.0, 1.0, 1.0, a].map(half::f16::from_f32));
+            }
+        }
+        match Image::new(4, 4, IccProfile::srgb(), samples) {
+            Ok(image) => image,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    /// The outline covers document (11..13, 21..23).
+    fn outline() -> PsdEffectShape {
+        PsdEffectShape {
+            area: rect(11, 21, 2, 2),
+            coverage: vec![255, 255, 0, 128],
+        }
+    }
+
+    #[test]
+    fn pixels_under_the_outline_are_covered() {
+        let image = image_with(&[((1, 1), 1.0), ((2, 1), 0.9), ((2, 2), 0.7)]);
+        // (2, 2) -> document (12, 22) has coverage 128: covered; a faint
+        // alpha at the zero-coverage texel is below the threshold.
+        assert!(outline_covers_pixels(
+            &image,
+            rect(10, 20, 4, 4),
+            &outline()
+        ));
+        let faint = image_with(&[((1, 2), 0.2)]);
+        assert!(outline_covers_pixels(
+            &faint,
+            rect(10, 20, 4, 4),
+            &outline()
+        ));
+    }
+
+    #[test]
+    fn a_visible_pixel_outside_the_outline_refuses_it() {
+        // (1, 2) is document (11, 22): coverage 0 inside the area.
+        let image = image_with(&[((1, 1), 1.0), ((1, 2), 0.5)]);
+        assert!(!outline_covers_pixels(
+            &image,
+            rect(10, 20, 4, 4),
+            &outline()
+        ));
+        // A pixel outside the outline's area altogether.
+        let outside = image_with(&[((0, 0), 1.0)]);
+        assert!(!outline_covers_pixels(
+            &outside,
+            rect(10, 20, 4, 4),
+            &outline()
+        ));
+    }
+}
