@@ -27,6 +27,7 @@
 
 #[cfg(test)]
 mod crop_tests;
+mod effect_shape;
 mod error;
 mod history;
 mod layer;
@@ -61,6 +62,9 @@ pub mod smart_object;
 mod text_safety;
 mod tree;
 
+pub use effect_shape::{
+    EffectShape, EffectShapeError, MAX_EFFECT_SHAPE_PIXELS, MAX_EFFECT_SHAPE_TOTAL_PIXELS,
+};
 pub use error::DocError;
 pub use history::{History, MAX_DESCRIPTIONS, forget_document_surfaces};
 pub use layer::{

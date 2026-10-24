@@ -36,6 +36,9 @@ pub enum DocError {
     /// Smart-object data failed its bounds (0.200.0).
     #[error("invalid smart object data: {0}")]
     InvalidSmartObject(crate::smart_object::SmartObjectError),
+    /// An effect shape failed its bounds (task 151).
+    #[error("invalid effect shape: {0}")]
+    InvalidEffectShape(crate::effect_shape::EffectShapeError),
     /// A pattern failed its bounds, or the pool is full (task 111).
     #[error("invalid pattern: {0}")]
     InvalidPattern(aurora_core::pattern::PatternError),
