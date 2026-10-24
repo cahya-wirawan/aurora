@@ -540,6 +540,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::window::{Window, WindowId};
 
 mod adjust_app;
+mod effect_shape_app;
 mod adjust_tables;
 #[cfg(test)]
 mod anchor_tests;
@@ -17329,6 +17330,9 @@ struct ShadowCacheKey {
     doc_origin: (i64, i64),
     geometry: (i64, i64, u32, u32),
     mask: Option<(i64, i64, u32, u32, bool, u32)>,
+    /// [`aurora_doc::EffectShape::content_hash`] when the coverage is read
+    /// from the layer's valid effect shape (task 151), else `0`.
+    shape: u64,
     versions: Vec<(bool, u32, u32, bool, u64)>,
 }
 
@@ -17537,7 +17541,7 @@ enum CoverageKind {
 fn coverage_cache_key(
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
-    store: &dyn TileSource,
+    store: &mut dyn TileSource,
     tile: CompositeTileAt,
     kind: CoverageKind,
     offset: (i64, i64),
@@ -17584,8 +17588,11 @@ fn coverage_cache_key(
             m.density.to_bits(),
         )
     });
+    let shape = effect_shape_app::valid_effect_shape(id, layers, store)
+        .map_or(0, |s| s.content_hash());
     Some(ShadowCacheKey {
         kind: kind as u8,
+        shape,
         store: store.serial(),
         surface,
         layer_origin,
@@ -17644,6 +17651,12 @@ fn read_shape_window(
         tile.doc_origin.0 - offset.0 - apron,
         tile.doc_origin.1 - offset.1 - apron,
     );
+    // Task 151: a shape layer's strokes, glows and shadows follow its
+    // outline while its pixels are the ones the outline was recorded with.
+    if let Some(shape) = effect_shape_app::valid_effect_shape(id, layers, store) {
+        let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
+        return effect_shape_app::shape_window(&shape, origin, window, side_usize);
+    }
     let same_origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y)) == tile.reference_origin;
     let cell_lo = (
         (window.0 - tile.reference_origin.0).div_euclid(t),
@@ -18036,6 +18049,23 @@ fn effect_reach_rects(
 ) -> Vec<aurora_core::Rect> {
     let mut out = rects.to_vec();
     let reaches = move_invalidation::effect_reaches(layers, layer);
+    // Task 151: an edit to a layer with an effect shape can end the shape's
+    // use (its pixels no longer match), which changes the layer's effects
+    // everywhere, not only around the edit: the whole layer and its reach
+    // are repainted.
+    if layers.effect_shape(layer).is_some()
+        && let Some(bounds) = layers.bounds(layer)
+    {
+        let grow = reaches.iter().map(|(_, apron)| *apron).max().unwrap_or(0);
+        let a = i64::from(grow);
+        let extra = u32::try_from(2 * a).unwrap_or(u32::MAX);
+        out.push(aurora_core::Rect {
+            x: bounds.x - a,
+            y: bounds.y - a,
+            width: bounds.width.saturating_add(extra),
+            height: bounds.height.saturating_add(extra),
+        });
+    }
     for (offset, apron) in reaches {
         let a = i64::from(apron);
         for r in rects {
@@ -93082,6 +93112,7 @@ mod tests {
                 doc_origin: (i64::try_from(i).unwrap_or(0) * 256, 0),
                 geometry: (0, 0, 0, 0),
                 mask: None,
+                shape: 0,
                 versions: Vec::new(),
             };
             // RC-2: a pass that needs more than the cap, twice in order.

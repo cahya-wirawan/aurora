@@ -57,6 +57,9 @@ pub struct EffectShape {
     coverage: Vec<u8>,
     /// The layer's pixel fingerprint when this shape was recorded.
     pixel_fingerprint: u64,
+    /// A hash of the area and the plane, taken once at construction: what a
+    /// cache of anything derived from the plane keys on.
+    content_hash: u64,
 }
 
 /// Why an [`EffectShape`] was refused.
@@ -90,11 +93,19 @@ impl EffectShape {
         if u64::try_from(coverage.len()) != Ok(pixels) {
             return Err(EffectShapeError::LengthMismatch);
         }
+        let content_hash = hash_plane(area, &coverage);
         Ok(Self {
             area,
             coverage,
             pixel_fingerprint,
+            content_hash,
         })
+    }
+
+    /// A hash of the plane and its area (never `0`), for cache keys.
+    #[must_use]
+    pub fn content_hash(&self) -> u64 {
+        self.content_hash
     }
 
     /// The plane's rectangle relative to the layer's bounds origin.
@@ -138,6 +149,27 @@ impl EffectShape {
             .copied()
             .unwrap_or(0)
     }
+}
+
+/// FNV-1a over the area and the plane, forced non-zero.
+fn hash_plane(area: Rect, coverage: &[u8]) -> u64 {
+    const PRIME: u64 = 0x0100_0000_01B3;
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut mix = |v: u64| {
+        h = (h ^ v).wrapping_mul(PRIME);
+    };
+    mix(area.x as u64);
+    mix(area.y as u64);
+    mix(u64::from(area.width));
+    mix(u64::from(area.height));
+    for chunk in coverage.chunks(8) {
+        let mut word = 0u64;
+        for (i, b) in chunk.iter().enumerate() {
+            word |= u64::from(*b) << (8 * i);
+        }
+        mix(word);
+    }
+    h | 1
 }
 
 /// An [`EffectShape`] as it travels (journal op, `.aur` entry): the plane
