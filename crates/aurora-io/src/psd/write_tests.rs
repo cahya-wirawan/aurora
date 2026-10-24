@@ -2731,3 +2731,136 @@ fn a_clipped_group_round_trips_through_write_and_read_and_verifies() {
         .find(|id| back.layers.name(*id) == Some("G"));
     assert!(found.is_some_and(|id| back.layers.clipped(id) && back.layers.clip_base(id).is_some()));
 }
+
+/// Task 154: the merged image is read in chunks of rows. A row that fails
+/// still lets the rows before it be written (and size-checked) first, as
+/// the row-at-a-time loop did, and its error comes back.
+#[test]
+fn a_failing_merged_row_is_written_up_to_and_reported() {
+    struct FailsAt<'a> {
+        image: &'a Image,
+        row: u32,
+    }
+    impl super::write::PsdCompositeSource for FailsAt<'_> {
+        fn size(&self) -> (u32, u32) {
+            (self.image.width(), self.image.height())
+        }
+        fn read_row(&mut self, y: u32, out: &mut [f16]) -> Result<(), IoError> {
+            if y == self.row {
+                return Err(IoError::PsdCompositeRow { y });
+            }
+            let mut image = self.image;
+            super::write::PsdCompositeSource::read_row(&mut image, y, out)
+        }
+    }
+    let mut doc = Doc::new((64, 200));
+    let px = image(64, 200, |x, y| {
+        [level(x * 3 + y), level(y * 7 + x), level(x ^ y), 1.0]
+    });
+    doc.layer("A", rect(0, 0, 64, 200), Some((&px, 0, 0)));
+    let mut written = Vec::new();
+    for row in [140, 150] {
+        let mut out = Cursor::new(Vec::new());
+        let mut source = FailsAt {
+            image: &doc.composite,
+            row,
+        };
+        let result = write_psd(
+            &mut out,
+            &doc.tree,
+            doc.canvas,
+            &mut source,
+            &mut doc.store,
+            PsdSaveOptions::default(),
+        );
+        assert!(
+            matches!(result, Err(IoError::PsdCompositeRow { y }) if y == row),
+            "{result:?}"
+        );
+        written.push(out.get_ref().len());
+    }
+    // Both rows sit in the third chunk of 64; the later failure wrote the
+    // ten rows between them.
+    assert!(
+        written.get(1) > written.first(),
+        "rows before the failing one were not written: {written:?}"
+    );
+}
+
+/// Task 154: the two verify passes run side by side, but when both fail
+/// the raw pass's error is the one returned, as when it ran first.
+#[test]
+fn verify_reports_the_raw_pass_first_when_both_passes_fail() {
+    let mut doc = Doc::new((8, 8));
+    let px = image(8, 8, |x, y| [level(x), level(y), 0.5, 1.0]);
+    doc.layer("A", rect(0, 0, 8, 8), Some((&px, 0, 0)));
+    let (bytes, outcome) = ok(doc.write());
+    let dir = ok(tempfile::tempdir());
+    let path = dir.path().join("v.psd");
+    ok(std::fs::write(&path, &bytes));
+    let with = |sample: bool, decoded: bool| {
+        let mut bad = outcome.expected.clone();
+        if let Some(l) = bad.layers.first_mut() {
+            if sample {
+                l.sample_hash ^= 1;
+            }
+            if decoded {
+                l.decoded_hash ^= 1;
+            }
+        }
+        match verify_psd_file(&path, &bad) {
+            Err(err) => err.to_string(),
+            Ok(()) => unreachable!("a wrong hash verified"),
+        }
+    };
+    let raw_only = with(true, false);
+    let reader_only = with(false, true);
+    assert_ne!(raw_only, reader_only, "the passes fail differently");
+    assert_eq!(with(true, true), raw_only);
+}
+
+/// Task 154: when the reader pass's thread cannot start, the two passes
+/// run one after the other: a good file verifies, either pass alone still
+/// fails it (so nothing would be renamed into place), and when both fail
+/// the raw pass's error wins, exactly as on two threads.
+#[test]
+fn verify_without_a_second_thread_runs_both_passes_in_order() {
+    let mut doc = Doc::new((8, 8));
+    let px = image(8, 8, |x, y| [level(x), level(y), 0.5, 1.0]);
+    doc.layer("A", rect(0, 0, 8, 8), Some((&px, 0, 0)));
+    let (bytes, outcome) = ok(doc.write());
+    let dir = ok(tempfile::tempdir());
+    let path = dir.path().join("v.psd");
+    ok(std::fs::write(&path, &bytes));
+    let no_threads = super::write_pixels::tests::no_threads;
+    let threads = super::write_pixels::thread_builder;
+    let budget = super::PIXEL_BUDGET;
+    ok(super::write::verify_psd_file_with(
+        &path,
+        &outcome.expected,
+        budget,
+        &no_threads,
+    ));
+    for (sample, decoded) in [(true, false), (false, true), (true, true)] {
+        let mut bad = outcome.expected.clone();
+        if let Some(l) = bad.layers.first_mut() {
+            if sample {
+                l.sample_hash ^= 1;
+            }
+            if decoded {
+                l.decoded_hash ^= 1;
+            }
+        }
+        let message = |builder: &super::write_pixels::BuilderSource| {
+            match super::write::verify_psd_file_with(&path, &bad, budget, builder) {
+                Err(err) => err.to_string(),
+                Ok(()) => unreachable!("a wrong hash verified ({sample}, {decoded})"),
+            }
+        };
+        assert_eq!(
+            message(&no_threads),
+            message(&threads),
+            "({sample}, {decoded})"
+        );
+    }
+}

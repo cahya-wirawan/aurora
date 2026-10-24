@@ -21,7 +21,15 @@
 //! * **export**: `colour_app::export_image` (no output profile, as after
 //!   an open), [`aurora_io::encode_by_extension`] (8-bit, dithered; or
 //!   `--depth 16` for a 16-bit PNG through `aurora_io::png::encode_16`),
-//!   then `crate::export_save::write_export_verified`.
+//!   then `crate::export_save::write_export_verified`;
+//! * **Save As `.psd`** (an output ending in `.psd`, task 154): instead
+//!   of the export, `crate::psd_save::begin_psd_save_timed`, the app's
+//!   own Save As PSD (preflight, merged-image composite, `write_psd` into
+//!   a temp file, `sync_all`, `verify_psd_file`, rename and directory
+//!   sync), then, if the save report is not empty, the same `persist`
+//!   Save Anyway runs; each phase is timed (`psd_save_ms`). Unlike the
+//!   app, it passes no import losses (what the open itself dropped) into
+//!   the save report, so `report_items` counts only the write's own lines.
 //!
 //! One JSON object goes to stdout; logs go to stderr. Nothing here is
 //! reachable from the window: the app never calls [`main_from_args`].
@@ -97,11 +105,16 @@ pub struct Report {
     /// (`<reference>.stored.png`), written when that profile is not sRGB.
     pub reference_stored_written: bool,
     pub output_bytes: usize,
+    /// The Save As `.psd` phases, when the output is a `.psd`.
+    pub(crate) psd_save: Option<crate::psd_save::PsdSaveTimings>,
+    /// Lines in that save's report (what "Save With Changes?" would list).
+    pub psd_save_report_items: usize,
 }
 
-const USAGE: &str = "usage: aurora-headless <input> --out <file.png|.tif|.jpg> \
+const USAGE: &str = "usage: aurora-headless <input> --out <file.png|.tif|.jpg|.psd> \
 [--scratch DIR] [--threads N] [--composite export|pool] [--gpu|--cpu] \
-[--depth 8|16] [--reference-out ref.png]";
+[--depth 8|16] [--reference-out ref.png]\n\
+(--out X.psd runs Save As PSD; unlike the app it passes no import losses into the save report)";
 
 /// Parses `args` (without the program name).
 ///
@@ -560,6 +573,51 @@ fn ms(d: Duration) -> f64 {
     (d.as_secs_f64() * 1_000_000.0).round() / 1000.0
 }
 
+/// Whether `output` names a `.psd` (any case): the Save As PSD run.
+fn is_psd_output(output: &Path) -> bool {
+    output
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("psd"))
+}
+
+/// The app's Save As `.psd` of the opened document, timed per phase; a
+/// non-empty report is persisted as Save Anyway would.
+fn save_as_psd(
+    options: &Options,
+    opened: &Opened,
+    store: &mut aurora_tile::TileStore,
+    report: &mut Report,
+) -> Result<(), Failure> {
+    let mut timings = crate::psd_save::PsdSaveTimings::default();
+    let source = crate::psd_save::PsdSaveSource {
+        layers: &opened.layers,
+        canvas: opened.size,
+        store,
+        doc_id: crate::document_session::DocumentId::next(),
+        revision: crate::UndoRevision::default(),
+        carried: Vec::new(),
+    };
+    let step = crate::psd_save::begin_psd_save_timed(source, &options.output, &mut timings)
+        .map_err(|e| fail("psd save", format!("{e:?}")))?;
+    if let crate::psd_save::PsdSaveStep::NeedsConfirmation(pending) = step {
+        report.psd_save_report_items = pending.report.items.len();
+        let started = Instant::now();
+        let persisted = pending.temp.persist();
+        timings.persist = started.elapsed();
+        persisted.map_err(|e| fail("psd persist", format!("{e:?}")))?;
+    }
+    report.composite = timings.composite;
+    report.write =
+        timings.preflight + timings.write + timings.sync + timings.verify + timings.persist;
+    report.output_bytes = std::fs::metadata(&options.output)
+        .ok()
+        .and_then(|m| usize::try_from(m.len()).ok())
+        .unwrap_or(0);
+    report.psd_save = Some(timings);
+    Ok(())
+}
+
 /// Opens, composites and exports `options.input`.
 ///
 /// # Errors
@@ -578,6 +636,12 @@ pub fn run(options: &Options) -> Result<Report, Failure> {
     report.height = height;
     report.layers = opened.layers.len();
     report.doc_tiles = document_tiles(width, height).len();
+    if is_psd_output(&options.output) {
+        save_as_psd(options, &opened, &mut store, &mut report)?;
+        drop(store);
+        report.total = total.elapsed();
+        return Ok(report);
+    }
 
     let started = Instant::now();
     let image = match options.mode {
@@ -739,6 +803,24 @@ pub fn to_json(options: &Options, result: &Result<Report, Failure>) -> String {
                 r.reference_written,
                 r.reference_stored_written,
             );
+            o.push_str(",\"psd_save_ms\":");
+            match &r.psd_save {
+                Some(t) => {
+                    let _ = write!(
+                        o,
+                        "{{\"preflight\":{},\"composite\":{},\"write\":{},\"sync\":{},\
+\"verify\":{},\"persist\":{},\"report_items\":{}}}",
+                        ms(t.preflight),
+                        ms(t.composite),
+                        ms(t.write),
+                        ms(t.sync),
+                        ms(t.verify),
+                        ms(t.persist),
+                        r.psd_save_report_items,
+                    );
+                }
+                None => o.push_str("null"),
+            }
             o.push_str(",\"gpu_adapter\":");
             match &r.gpu_adapter {
                 Some(a) => json_string(&mut o, a),

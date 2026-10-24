@@ -180,6 +180,7 @@ mod write_adjust_tests;
 mod write_effects;
 #[cfg(test)]
 mod write_effects_tests;
+mod write_pixels;
 #[cfg(test)]
 mod write_tests;
 
@@ -3202,7 +3203,7 @@ fn promote_f32_sample(bytes: [u8; 4]) -> f16 {
 /// the per-sample division and software half conversion were the biggest
 /// single cost of opening a layered PSD (1.0 s of 2.7 s on the Nyepi
 /// template), and there are only 256 inputs.
-fn promote_u8_table() -> &'static [f16] {
+pub(crate) fn promote_u8_table() -> &'static [f16] {
     static TABLE: std::sync::OnceLock<Vec<f16>> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         (0..=u8::MAX)
@@ -3212,7 +3213,7 @@ fn promote_u8_table() -> &'static [f16] {
 }
 
 /// The 16-bit counterpart: 65,536 entries (128 KiB), built on first use.
-fn promote_u16_table() -> &'static [f16] {
+pub(crate) fn promote_u16_table() -> &'static [f16] {
     static TABLE: std::sync::OnceLock<Vec<f16>> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         (0..=u16::MAX)
