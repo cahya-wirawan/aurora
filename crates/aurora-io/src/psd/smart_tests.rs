@@ -33,14 +33,14 @@ const ID_A: &str = "20031581-1068-5645-bb2e-5dc035354e3b";
 const ID_B: &str = "b711f658-fef8-b041-b0ad-cb28b01a33ac";
 const UNUSED: &str = "00000000-0000-0000-0000-000000000000";
 
-fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
+pub(super) fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     match r {
         Ok(v) => v,
         Err(err) => unreachable!("{err:?}"),
     }
 }
 
-fn store() -> (tempfile::TempDir, TileStore) {
+pub(super) fn store() -> (tempfile::TempDir, TileStore) {
     let dir = ok(tempfile::tempdir());
     let Some(budget) = NonZeroUsize::new(64) else {
         unreachable!("64 is non-zero");
@@ -53,7 +53,7 @@ fn store() -> (tempfile::TempDir, TileStore) {
 // Fixture bytes
 // ---------------------------------------------------------------------
 
-fn unicode(text: &str) -> Vec<u8> {
+pub(super) fn unicode(text: &str) -> Vec<u8> {
     let units: Vec<u16> = text.encode_utf16().collect();
     let mut out = (units.len() as u32).to_be_bytes().to_vec();
     for unit in units {
@@ -125,7 +125,7 @@ fn payload(seed: u8, len: usize) -> Vec<u8> {
         .collect()
 }
 
-fn rgba(width: i32, height: i32, seed: u16) -> Vec<[u16; 4]> {
+pub(super) fn rgba(width: i32, height: i32, seed: u16) -> Vec<[u16; 4]> {
     (0..width * height)
         .map(|i| {
             let i = i as u16;
@@ -149,7 +149,7 @@ fn smart_layer(name: &str, id: &str, left: i32, top: i32, seed: u16) -> TestLaye
     })
 }
 
-fn plain_layer(name: &str) -> TestLayer {
+pub(super) fn plain_layer(name: &str) -> TestLayer {
     TestLayer::pixels(name, 0, 0, 8, 8, 8, &rgba(8, 8, 3))
 }
 
@@ -188,14 +188,14 @@ fn linked_list(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 // ---------------------------------------------------------------------
 
 /// A PSD opened into a real store, as the app installs it.
-struct Opened {
-    _dir: tempfile::TempDir,
-    store: TileStore,
-    document: PsdDocument,
+pub(super) struct Opened {
+    pub(super) _dir: tempfile::TempDir,
+    pub(super) store: TileStore,
+    pub(super) document: PsdDocument,
 }
 
 impl Opened {
-    fn new(bytes: &[u8]) -> Self {
+    pub(super) fn new(bytes: &[u8]) -> Self {
         let mut document = ok(read(bytes));
         let (dir, mut store) = store();
         for pixels in std::mem::take(&mut document.pixels) {
@@ -217,7 +217,7 @@ impl Opened {
         }
     }
 
-    fn layer(&self, name: &str) -> LayerId {
+    pub(super) fn layer(&self, name: &str) -> LayerId {
         let mut found = None;
         for id in all_layers(&self.document.layers) {
             if self.document.layers.name(id) == Some(name) {
@@ -230,14 +230,14 @@ impl Opened {
         }
     }
 
-    fn surface(&self, name: &str) -> aurora_tile::SurfaceId {
+    pub(super) fn surface(&self, name: &str) -> aurora_tile::SurfaceId {
         match self.document.layers.surface_id(self.layer(name)) {
             Some(s) => s,
             None => unreachable!("no surface"),
         }
     }
 
-    fn write(&mut self) -> (Vec<u8>, PsdWriteOutcome) {
+    pub(super) fn write(&mut self) -> (Vec<u8>, PsdWriteOutcome) {
         let (w, h) = self.document.canvas_size;
         let composite = ok(Image::new(
             w,
@@ -259,7 +259,7 @@ impl Opened {
     }
 }
 
-fn bounds_of(tree: &LayerTree, id: LayerId) -> Rect {
+pub(super) fn bounds_of(tree: &LayerTree, id: LayerId) -> Rect {
     match tree.bounds(id) {
         Some(b) => b,
         None => unreachable!("a pixel layer"),
@@ -267,7 +267,7 @@ fn bounds_of(tree: &LayerTree, id: LayerId) -> Rect {
 }
 
 /// Every layer id, top first, hidden ones and groups' children included.
-fn all_layers(tree: &LayerTree) -> Vec<LayerId> {
+pub(super) fn all_layers(tree: &LayerTree) -> Vec<LayerId> {
     let mut out = Vec::new();
     let mut stack: Vec<LayerId> = tree.roots().iter().rev().copied().collect();
     while let Some(id) = stack.pop() {
@@ -736,7 +736,7 @@ fn a_long_list_of_dropped_layers_is_summarised() {
 // .aur
 // ---------------------------------------------------------------------
 
-fn aur_bytes(opened: &mut Opened, history: &History) -> Vec<u8> {
+pub(super) fn aur_bytes(opened: &mut Opened, history: &History) -> Vec<u8> {
     let mut out = Cursor::new(Vec::new());
     ok(crate::aur::write(
         &mut out,
@@ -796,7 +796,7 @@ fn a_document_without_smart_objects_writes_no_smart_entries() {
     );
 }
 
-fn rewrite_entry(bytes: &[u8], name: &str, replacement: Option<&[u8]>) -> Vec<u8> {
+pub(super) fn rewrite_entry(bytes: &[u8], name: &str, replacement: Option<&[u8]>) -> Vec<u8> {
     use std::io::{Read, Write};
     let mut src = ok(zip::ZipArchive::new(Cursor::new(bytes)));
     let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));

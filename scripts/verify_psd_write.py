@@ -644,6 +644,60 @@ def check_smart(folder):
     print(f"OK: the template's {len(after)} smart objects survived open -> save byte for byte")
 
 
+def type_layers(psd):
+    """Every text layer of `psd` as (name, text, TySh bytes), in tree order."""
+    from psd_tools.constants import Tag
+    out = []
+    for layer in psd.descendants():
+        if layer.kind == "type":
+            block = layer.tagged_blocks.get_data(Tag.TYPE_TOOL_OBJECT_SETTING)
+            out.append((layer.name, layer.text, bytes(block.tobytes())))
+    return out
+
+
+def text_engine(psd):
+    """The document-level `Txt2` block's bytes, or None."""
+    from psd_tools.constants import Tag
+    blocks = psd._record.layer_and_mask_information.tagged_blocks
+    block = blocks.get_data(Tag.TEXT_ENGINE_DATA) if blocks else None
+    return None if block is None else bytes(block.tobytes())
+
+
+def check_text(folder):
+    """Task 155: preserved text layers read back as text layers.
+
+    For each real file in `text.json`, the round-tripped file must hold the
+    same text layers (names, text, byte-identical `TySh` blocks) and the same
+    `Txt2` block as the original, read by psd-tools. `text-dropped.psd` has
+    one layer painted on: it must no longer be a text layer, and the other
+    must be.
+    """
+    spec_path = folder / "text.json"
+    if not spec_path.exists():
+        print("no text.json: the text layer pass was skipped")
+        return
+    for entry in json.loads(spec_path.read_text(encoding="utf-8"))["files"]:
+        tag = entry["tag"]
+        original = PSDImage.open(entry["original"])
+        again = PSDImage.open(folder / f"{tag}-roundtrip.psd")
+        before, after = type_layers(original), type_layers(again)
+        check(f"{tag} text layer count", len(after), len(before))
+        check(f"{tag} has text layers", len(after) > 0, True)
+        for (name, text, block), (name2, text2, block2) in zip(before, after):
+            check(f"{tag} {name} name", name2, name)
+            check(f"{tag} {name} text", text2, text)
+            check(f"{tag} {name} TySh block", block2 == block, True)
+        check(f"{tag} Txt2 block", text_engine(again), text_engine(original))
+        check(f"{tag} layer names", [l.name for l in again.descendants()],
+              [l.name for l in original.descendants()])
+        print(f"OK: psd-tools read {len(after)} text layers of {tag} with identical TySh and Txt2 blocks")
+    dropped = PSDImage.open(folder / "text-dropped.psd")
+    kinds = {l.name: l.kind for l in dropped.descendants()}
+    check("painted text layer is pixels", kinds.get("Title"), "pixel")
+    check("untouched text layer is text", kinds.get("Body"), "type")
+    print("OK: an edited text layer is written as pixels, the other stays text")
+
+
 EFFECT_KINDS = {
     b"DrSh": "drop shadow", b"dropShadowMulti": "drop shadow",
     b"SoFi": "colour overlay", b"solidFillMulti": "colour overlay",
@@ -758,6 +812,7 @@ if __name__ == "__main__":
     check_locks(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_clips(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_smart(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
+    check_text(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_adjustments(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_adjustments5(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_adjustments4(Path(sys.argv[1] if len(sys.argv) > 1 else "."))

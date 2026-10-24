@@ -1562,6 +1562,103 @@ fn read_smart_objects<R: Read + Seek>(
     Ok(())
 }
 
+/// The optional entry carrying the document's preserved Photoshop text
+/// layers (task 155): each text layer's `aurora_doc::TextLayer`
+/// (`LayerEntry::text_layer` is `#[serde(skip)]`) and the document's `Txt2`
+/// text-engine block (`aurora_doc::LayerTree::text_engine_data`).
+///
+/// Written only when the document has text data, so every other save stays
+/// byte-identical; a file without it opens with none, which is what every
+/// older file means. **Versioned, and a newer version refuses the file**
+/// loudly, like [`SMART_OBJECTS_ENTRY`]. An Aurora older than this entry
+/// ignores it, but refuses the file anyway whenever its journal holds a
+/// `SetTextLayer` op (an unknown ordinal), which every document whose text
+/// layers came from an open does.
+const TEXT_LAYERS_ENTRY: &str = "text-layers";
+
+/// [`TEXT_LAYERS_ENTRY`]'s own schema version.
+const TEXT_LAYERS_VERSION: u32 = 1;
+
+/// The largest [`TEXT_LAYERS_ENTRY`] read: the blocks are bounded by
+/// `MAX_TEXT_TOTAL_BYTES` and the engine block by `MAX_TEXT_ENGINE_BYTES`,
+/// plus the layer list.
+const MAX_TEXT_LAYERS_BYTES: u64 = 16 * 1024 * 1024;
+
+/// [`TEXT_LAYERS_ENTRY`]'s payload: version first (frozen), the
+/// `(raw layer id, text layer)` pairs, then the `Txt2` block if kept.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TextLayersWire {
+    version: u32,
+    layers: Vec<(u64, aurora_doc::TextLayer)>,
+    engine: Option<Vec<u8>>,
+}
+
+/// The `text-layers` entry's bytes for `layers`, or `None` when it has no
+/// text data.
+fn text_layers_entry(layers: &LayerTree) -> Result<Option<Vec<u8>>, IoError> {
+    let text: Vec<(u64, aurora_doc::TextLayer)> = layer_ids(layers)
+        .into_iter()
+        .filter_map(|id| Some((id.to_raw(), layers.text_layer(id)?.clone())))
+        .collect();
+    let engine = layers.text_engine_data().map(|e| e.to_vec());
+    if text.is_empty() && engine.is_none() {
+        return Ok(None);
+    }
+    let wire = TextLayersWire {
+        version: TEXT_LAYERS_VERSION,
+        layers: text,
+        engine,
+    };
+    postcard::to_allocvec(&wire)
+        .map(Some)
+        .map_err(|source| IoError::ManifestSerialization(source.to_string()))
+}
+
+/// Reads [`TEXT_LAYERS_ENTRY`] if present and applies it to `layers`.
+///
+/// # Errors
+///
+/// [`IoError::ManifestDeserialization`] for an unknown version, bytes that
+/// do not decode, text data on a missing or non-pixel layer, a block over
+/// its bounds or an engine block over its bound;
+/// [`IoError::EntryTooLarge`] for an entry over its cap.
+fn read_text_layers<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    layers: &mut LayerTree,
+) -> Result<(), IoError> {
+    let bytes = match zip.by_name(TEXT_LAYERS_ENTRY) {
+        Ok(file) => read_capped(file, TEXT_LAYERS_ENTRY, MAX_TEXT_LAYERS_BYTES)?,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let (prefix, _rest) = postcard::take_from_bytes::<MaskDensityPrefix>(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    if prefix.version != TEXT_LAYERS_VERSION {
+        let cause = if prefix.version > TEXT_LAYERS_VERSION {
+            "the file was saved by a newer Aurora"
+        } else {
+            "the entry is damaged or of an unknown kind"
+        };
+        return Err(IoError::ManifestDeserialization(format!(
+            "unsupported text-layers version {} (this build understands version \
+             {TEXT_LAYERS_VERSION}); {cause}",
+            prefix.version
+        )));
+    }
+    let wire: TextLayersWire = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    let bad = |what: String| IoError::ManifestDeserialization(format!("text layers: {what}"));
+    for (raw, layer) in wire.layers {
+        layers
+            .set_text_layer(aurora_doc::LayerId::from_raw(raw), Some(layer))
+            .map_err(|err| bad(err.to_string()))?;
+    }
+    layers
+        .set_text_engine_data(wire.engine.map(std::sync::Arc::new))
+        .map_err(|err| bad(err.to_string()))?;
+    Ok(())
+}
+
 /// The entry holding what the document's own open changed or left out
 /// (0.177.0 review B-1): the lines of a PSD's "Opened With Changes"
 /// report, so a later Photoshop save of the document lists them even
@@ -2805,6 +2902,8 @@ struct DocumentEntries {
     /// [`SMART_OBJECTS_ENTRY`] and the embedded files, when the document
     /// has any (0.200.0).
     smart_objects: Option<SmartEntries>,
+    /// [`TEXT_LAYERS_ENTRY`], when the document has text data (task 155).
+    text_layers: Option<Vec<u8>>,
 }
 
 impl DocumentEntries {
@@ -2910,6 +3009,7 @@ impl DocumentEntries {
             selection: None,
             colour: None,
             smart_objects: smart_entries(layers)?,
+            text_layers: text_layers_entry(layers)?,
         })
     }
 
@@ -2973,6 +3073,10 @@ impl DocumentEntries {
                 zip.start_file(format!("{SMART_OBJECT_FILE_PREFIX}{index}"), stored)?;
                 zip.write_all(file)?;
             }
+        }
+        if let Some(bytes) = &self.text_layers {
+            zip.start_file(TEXT_LAYERS_ENTRY, deflated)?;
+            zip.write_all(bytes)?;
         }
         if let Some(bytes) = &self.import_losses {
             zip.start_file(IMPORT_LOSSES_ENTRY, deflated)?;
@@ -3438,6 +3542,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     read_layer_blend_options(&mut zip, &mut layers)?;
     read_layer_effect_shapes(&mut zip, &mut layers)?;
     read_smart_objects(&mut zip, &mut layers)?;
+    read_text_layers(&mut zip, &mut layers)?;
 
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
     let history = History::load_journal(&history_bytes)?;
