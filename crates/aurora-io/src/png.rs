@@ -127,35 +127,32 @@ pub(crate) fn decode_parts(bytes: &[u8]) -> Result<crate::colour_import::ImagePa
 /// half of decoding a 60 MP PNG). A lookup that misses (it cannot: the
 /// tables cover the whole input range) falls back to the direct form.
 fn promote_samples(pixels: &[u8], bit_depth: png::BitDepth) -> Vec<f16> {
-    match bit_depth {
-        png::BitDepth::Sixteen => {
-            let table = crate::psd::promote_u16_table();
-            pixels
-                .chunks_exact(2)
-                .map(|pair| {
-                    let Ok(raw) = <[u8; 2]>::try_from(pair) else {
-                        unreachable!("chunks_exact(2) always yields length-2 slices");
-                    };
-                    let value = u16::from_be_bytes(raw);
-                    table
-                        .get(usize::from(value))
-                        .copied()
-                        .unwrap_or_else(|| f16::from_f32(promote_u16(value)))
-                })
-                .collect()
-        }
-        _ => {
-            let table = crate::psd::promote_u8_table();
-            pixels
-                .iter()
-                .map(|&sample| {
-                    table
-                        .get(usize::from(sample))
-                        .copied()
-                        .unwrap_or_else(|| f16::from_f32(promote_u8(sample)))
-                })
-                .collect()
-        }
+    if bit_depth == png::BitDepth::Sixteen {
+        let table = crate::psd::promote_u16_table();
+        pixels
+            .chunks_exact(2)
+            .map(|pair| {
+                let Ok(raw) = <[u8; 2]>::try_from(pair) else {
+                    unreachable!("chunks_exact(2) always yields length-2 slices");
+                };
+                let value = u16::from_be_bytes(raw);
+                table
+                    .get(usize::from(value))
+                    .copied()
+                    .unwrap_or_else(|| f16::from_f32(promote_u16(value)))
+            })
+            .collect()
+    } else {
+        let table = crate::psd::promote_u8_table();
+        pixels
+            .iter()
+            .map(|&sample| {
+                table
+                    .get(usize::from(sample))
+                    .copied()
+                    .unwrap_or_else(|| f16::from_f32(promote_u8(sample)))
+            })
+            .collect()
     }
 }
 

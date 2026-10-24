@@ -180,6 +180,7 @@ mod write_adjust_tests;
 mod write_effects;
 #[cfg(test)]
 mod write_effects_tests;
+mod write_pixels;
 #[cfg(test)]
 mod write_tests;
 

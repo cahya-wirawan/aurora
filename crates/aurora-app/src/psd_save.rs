@@ -275,7 +275,7 @@ pub(crate) struct PsdSaveTimings {
     pub(crate) preflight: Duration,
     /// The merged image's composite (`composite_document`).
     pub(crate) composite: Duration,
-    /// `write_psd` into the temp file: tile reads, PackBits and the writes.
+    /// `write_psd` into the temp file: tile reads, `PackBits` and the writes.
     pub(crate) write: Duration,
     /// The temp file's `sync_all`.
     pub(crate) sync: Duration,

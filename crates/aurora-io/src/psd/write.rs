@@ -142,12 +142,16 @@
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
-use aurora_color::{promote_u16, quantize_u16};
+use aurora_color::quantize_u16;
 use aurora_core::Rect;
 use aurora_doc::{BlendMode, LayerId, LayerKind, LayerTree};
 use aurora_tile::{SurfaceId, TILE, TileId, TileStore};
 use half::f16;
 
+use super::write_pixels::{
+    MERGED_CHUNK_ROWS, SampleCounts, pack_channel_band, pack_merged_rows, quantize_counted,
+    quantize_f16,
+};
 use super::{
     MASK_DISABLED, MASK_PARAMETERS, MAX_GROUP_DEPTH, PSD_MAX_EXTENT, PsdPixelSink, PsdPixels,
     unpack_bits,
@@ -1225,20 +1229,15 @@ fn mix(mut z: u64) -> u64 {
 
 /// One sample's contribution to an order-independent hash: summed
 /// (wrapping), so channels can be hashed in any order.
-fn sample_hash(slot: u8, x: u32, y: u32, value: u64) -> u64 {
+pub(crate) fn sample_hash(slot: u8, x: u32, y: u32, value: u64) -> u64 {
     mix(mix((u64::from(slot) << 58) ^ (u64::from(y) << 29) ^ u64::from(x)) ^ value)
 }
 
-/// `f16` to the file's `u16`, counting what is clipped or `NaN`.
-fn quantize(value: f32, losses: &mut Losses) -> u16 {
-    if value.is_nan() {
-        losses.nan += 1;
-        0
-    } else {
-        if !(0.0..=1.0).contains(&value) {
-            losses.clipped += 1;
-        }
-        quantize_u16(value)
+impl Losses {
+    /// Adds what the pixel writer clipped or zeroed (task 154).
+    fn absorb(&mut self, counts: SampleCounts) {
+        self.clipped += counts.clipped;
+        self.nan += counts.nan;
     }
 }
 
@@ -2023,7 +2022,6 @@ fn write_channel<W: Write + Seek>(
     let mut counts: Vec<u8> = Vec::with_capacity(table_len);
     let row_samples = ew as usize;
     let mut band: Vec<u16> = Vec::new();
-    let mut row_bytes: Vec<u8> = Vec::with_capacity(row_samples.saturating_mul(2));
     let mut y = ey;
     while y < ey + eh {
         let ty = y / TILE;
@@ -2031,6 +2029,7 @@ fn write_channel<W: Write + Seek>(
         let rows = (band_end - y) as usize;
         band.clear();
         band.resize(row_samples.saturating_mul(rows), absent);
+        let mut clipped = SampleCounts::default();
         for tx in (ex / TILE)..(ex + ew).div_ceil(TILE) {
             let id = TileId { x: tx, y: ty };
             let Some(surface) = source.surface() else {
@@ -2043,33 +2042,25 @@ fn write_channel<W: Write + Seek>(
             let texels = tile.texels();
             let x0 = (tx * TILE).max(ex);
             let x1 = tx.saturating_add(1).saturating_mul(TILE).min(ex + ew);
+            let span = (x1 - x0) as usize;
             for r in 0..rows {
                 let ly = (y - ty * TILE) as usize + r;
-                for x in x0..x1 {
-                    let lx = (x - tx * TILE) as usize;
-                    let texel = (ly * TILE as usize + lx) * 4;
-                    let q = quantize(source.value(texels, texel), losses);
-                    if let Some(dst) = band.get_mut(r * row_samples + (x - ex) as usize) {
-                        *dst = q;
-                    }
-                }
+                let first = (ly * TILE as usize + (x0 - tx * TILE) as usize) * 4;
+                let at = r * row_samples + (x0 - ex) as usize;
+                let Some(dst) = band.get_mut(at..at + span) else {
+                    continue;
+                };
+                fill_span(dst, source, texels, first, &mut clipped);
             }
         }
-        for (r, row) in band.chunks(row_samples.max(1)).take(rows).enumerate() {
-            row_bytes.clear();
-            let ry = y - ey + r as u32;
-            for (x, &q) in row.iter().enumerate() {
-                row_bytes.extend_from_slice(&q.to_be_bytes());
-                let x = x as u32;
-                sample_sum = sample_sum.wrapping_add(sample_hash(slot, x, ry, u64::from(q)));
-                let decoded = f16::from_f32(promote_u16(q)).to_bits();
-                decoded_sum =
-                    decoded_sum.wrapping_add(sample_hash(slot, x, ry, u64::from(decoded)));
-            }
-            let packed = pack_bits(&row_bytes);
-            let count = u16::try_from(packed.len()).map_err(|_| too_large("RLE row"))?;
+        losses.absorb(clipped);
+        let packed = pack_channel_band(&band, row_samples, rows, slot, y - ey);
+        sample_sum = sample_sum.wrapping_add(packed.sample_sum);
+        decoded_sum = decoded_sum.wrapping_add(packed.decoded_sum);
+        for row in &packed.rows {
+            let count = u16::try_from(row.len()).map_err(|_| too_large("RLE row"))?;
             counts.extend_from_slice(&count.to_be_bytes());
-            w.write_all(&packed)?;
+            w.write_all(row)?;
         }
         y = band_end;
         check_size(w, limit)?;
@@ -2077,6 +2068,35 @@ fn write_channel<W: Write + Seek>(
     let end = pos(w)?;
     patch(w, table_at, &counts, end)?;
     Ok((sample_sum, decoded_sum))
+}
+
+/// Quantises one tile row's span of a channel into `dst`: texel `first`
+/// (its first sample) is `dst[0]`'s. A colour slot goes through the exact
+/// `f16` table, a mask through its coverage (task 154).
+fn fill_span(
+    dst: &mut [u16],
+    source: PlaneSource,
+    texels: &[f16],
+    first: usize,
+    counts: &mut SampleCounts,
+) {
+    match source {
+        PlaneSource::Color { slot, .. } => {
+            let src = texels.get(first..).unwrap_or(&[]);
+            for (i, d) in dst.iter_mut().enumerate() {
+                let v = src
+                    .get(i * 4 + usize::from(slot))
+                    .copied()
+                    .unwrap_or(f16::ZERO);
+                *d = quantize_f16(v, counts);
+            }
+        }
+        PlaneSource::Mask { .. } => {
+            for (i, d) in dst.iter_mut().enumerate() {
+                *d = quantize_counted(source.value(texels, first + i * 4), counts);
+            }
+        }
+    }
 }
 
 /// Stops the write once the file passes `limit` (an absolute position):
@@ -2413,30 +2433,41 @@ fn write_merged<W: Write + Seek>(
         .ok_or_else(|| too_large("merged row table"))?;
     w.write_all(&vec![0u8; table_len])?;
     let mut counts: Vec<u8> = Vec::with_capacity(table_len);
-    let mut row = vec![f16::ZERO; (width as usize).saturating_mul(4)];
-    let mut bytes = Vec::with_capacity((width as usize).saturating_mul(2));
+    let row_len = (width as usize).saturating_mul(4);
+    let chunk_rows = MERGED_CHUNK_ROWS.min(height.max(1) as usize);
+    let mut chunk = vec![f16::ZERO; row_len.saturating_mul(chunk_rows)];
     let mut hash = 0u64;
     for plane in 0..4u8 {
-        for y in 0..height {
-            composite.read_row(y, &mut row)?;
-            bytes.clear();
-            for (x, px) in row.chunks_exact(4).enumerate() {
-                let sample = |c: usize| px.get(c).map_or(0.0, |v| v.to_f32());
-                let alpha = sample(3);
-                let value = if plane == 3 {
-                    alpha
-                } else {
-                    sample(usize::from(plane)) * alpha + 1.0 - alpha
-                };
-                let q = quantize(value, losses);
-                hash = hash.wrapping_add(sample_hash(plane, x as u32, y, u64::from(q)));
-                bytes.extend_from_slice(&q.to_be_bytes());
+        let mut y = 0u32;
+        while y < height {
+            let rows = chunk_rows.min((height - y) as usize);
+            // Read the chunk's rows in order; a failed read still writes
+            // the rows before it (and their size checks) first, as the
+            // row-at-a-time loop did.
+            let mut read = 0usize;
+            let mut failed = None;
+            for (r, out) in chunk.chunks_mut(row_len.max(1)).take(rows).enumerate() {
+                if let Err(err) = composite.read_row(y + r as u32, out) {
+                    failed = Some(err);
+                    break;
+                }
+                read += 1;
             }
-            let packed = pack_bits(&bytes);
-            let count = u16::try_from(packed.len()).map_err(|_| too_large("RLE row"))?;
-            counts.extend_from_slice(&count.to_be_bytes());
-            w.write_all(&packed)?;
-            check_size(w, limit)?;
+            let samples = chunk.get(..read.saturating_mul(row_len)).unwrap_or(&[]);
+            let (packed, chunk_hash, clipped) =
+                pack_merged_rows(samples, width as usize, read, plane, y);
+            hash = hash.wrapping_add(chunk_hash);
+            losses.absorb(clipped);
+            for row in &packed {
+                let count = u16::try_from(row.len()).map_err(|_| too_large("RLE row"))?;
+                counts.extend_from_slice(&count.to_be_bytes());
+                w.write_all(row)?;
+                check_size(w, limit)?;
+            }
+            if let Some(err) = failed {
+                return Err(err);
+            }
+            y += rows as u32;
         }
     }
     let end = pos(w)?;
@@ -3020,18 +3051,14 @@ pub fn verify_psd_file(path: &Path, expected: &PsdExpectation) -> Result<(), IoE
 
 /// [`verify_psd_file`] with the reader pass's pixel budget as a
 /// parameter (0.177.0, N-3), so a test reaches the skip branch.
-#[allow(clippy::too_many_lines)] // one linear list of checks, one per field
 pub(crate) fn verify_psd_file_with_budget(
     path: &Path,
     expected: &PsdExpectation,
     budget: u64,
 ) -> Result<(), IoError> {
-    let file = std::fs::File::open(path)?;
-    verify_raw(std::io::BufReader::new(file), expected)?;
-
     // The reader refuses a file whose layers add up to more than its
     // `PIXEL_BUDGET` (2^28 px), and it holds each decoded layer whole: so
-    // past that budget only the streaming check above runs.
+    // past that budget only the streaming check runs.
     let total: u64 = expected
         .layers
         .iter()
@@ -3041,9 +3068,36 @@ pub(crate) fn verify_psd_file_with_budget(
             w.saturating_mul(h).saturating_add(mw.saturating_mul(mh))
         })
         .fold(0u64, u64::saturating_add);
+    let raw_pass = || -> Result<(), IoError> {
+        let file = std::fs::File::open(path)?;
+        verify_raw(std::io::BufReader::new(file), expected)
+    };
     if total > budget {
-        return Ok(());
+        return raw_pass();
     }
+    // The two passes read the file independently, so the reader pass runs
+    // on a second thread beside the raw one (task 154); the raw pass's
+    // error still comes first, as when it ran before the reader. A thread
+    // the system will not start means the passes run one after the other.
+    std::thread::scope(|scope| {
+        match std::thread::Builder::new().spawn_scoped(scope, || reader_pass(path, expected)) {
+            Ok(reader) => {
+                let raw = raw_pass();
+                let read = reader
+                    .join()
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e));
+                raw.and(read)
+            }
+            Err(_) => raw_pass().and_then(|()| reader_pass(path, expected)),
+        }
+    })
+}
+
+/// [`verify_psd_file`]'s second pass: Aurora's own reader
+/// (`read_streaming`) reopens the file and every record, mask and pixel
+/// hash is checked against `expected`.
+#[allow(clippy::too_many_lines)] // one linear list of checks, one per field
+fn reader_pass(path: &Path, expected: &PsdExpectation) -> Result<(), IoError> {
     let file = std::fs::File::open(path)?;
     let mut sink = CheckingSink::default();
     let doc = super::read_streaming(std::io::BufReader::new(file), &mut sink)?;
