@@ -2731,3 +2731,58 @@ fn a_clipped_group_round_trips_through_write_and_read_and_verifies() {
         .find(|id| back.layers.name(*id) == Some("G"));
     assert!(found.is_some_and(|id| back.layers.clipped(id) && back.layers.clip_base(id).is_some()));
 }
+
+/// Task 154: the merged image is read in chunks of rows. A row that fails
+/// still lets the rows before it be written (and size-checked) first, as
+/// the row-at-a-time loop did, and its error comes back.
+#[test]
+fn a_failing_merged_row_is_written_up_to_and_reported() {
+    struct FailsAt<'a> {
+        image: &'a Image,
+        row: u32,
+    }
+    impl super::write::PsdCompositeSource for FailsAt<'_> {
+        fn size(&self) -> (u32, u32) {
+            (self.image.width(), self.image.height())
+        }
+        fn read_row(&mut self, y: u32, out: &mut [f16]) -> Result<(), IoError> {
+            if y == self.row {
+                return Err(IoError::PsdCompositeRow { y });
+            }
+            let mut image = self.image;
+            super::write::PsdCompositeSource::read_row(&mut image, y, out)
+        }
+    }
+    let mut doc = Doc::new((64, 200));
+    let px = image(64, 200, |x, y| {
+        [level(x * 3 + y), level(y * 7 + x), level(x ^ y), 1.0]
+    });
+    doc.layer("A", rect(0, 0, 64, 200), Some((&px, 0, 0)));
+    let mut written = Vec::new();
+    for row in [140, 150] {
+        let mut out = Cursor::new(Vec::new());
+        let mut source = FailsAt {
+            image: &doc.composite,
+            row,
+        };
+        let result = write_psd(
+            &mut out,
+            &doc.tree,
+            doc.canvas,
+            &mut source,
+            &mut doc.store,
+            PsdSaveOptions::default(),
+        );
+        assert!(
+            matches!(result, Err(IoError::PsdCompositeRow { y }) if y == row),
+            "{result:?}"
+        );
+        written.push(out.get_ref().len());
+    }
+    // Both rows sit in the third chunk of 64; the later failure wrote the
+    // ten rows between them.
+    assert!(
+        written.get(1) > written.first(),
+        "rows before the failing one were not written: {written:?}"
+    );
+}
