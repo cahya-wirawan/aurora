@@ -28,12 +28,12 @@
 //! bounds, so it travels with the layer.
 //!
 //! Persistence: `LayerEntry::effect_shape` is `#[serde(skip)]`; the shape
-//! travels as `.aur`'s optional `layer-effect-shapes` entry and as the
-//! appended `LayerOp::SetEffectShape` that [`crate::History::save_journal`]
-//! emits after a journaled `Restore` of a subtree that carries one. The wire
-//! is positional `postcard` of `(x, y, width, height, fingerprint,
-//! lz4-compressed plane)`, decoded with the area checked against
-//! [`MAX_EFFECT_SHAPE_PIXELS`] before anything is allocated.
+//! travels as [`PackedEffectShape`] (positional `postcard`, the plane
+//! lz4-compressed and expanded only when applied, with its area checked
+//! against [`MAX_EFFECT_SHAPE_PIXELS`] first) in `.aur`'s optional
+//! `layer-effect-shapes` entry and in the appended `LayerOp::SetEffectShape`
+//! that [`crate::History::save_journal`] emits after a journaled `Restore`
+//! of a subtree that carries one.
 
 use aurora_core::Rect;
 
@@ -140,48 +140,63 @@ impl EffectShape {
     }
 }
 
-/// The wire form: `(x, y, width, height, fingerprint, lz4 plane)`.
-type Wire<'a> = (i64, i64, u32, u32, u64, std::borrow::Cow<'a, [u8]>);
-
-impl serde::Serialize for EffectShape {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let packed = lz4_flex::block::compress(&self.coverage);
-        let wire: Wire<'_> = (
-            self.area.x,
-            self.area.y,
-            self.area.width,
-            self.area.height,
-            self.pixel_fingerprint,
-            std::borrow::Cow::Owned(packed),
-        );
-        wire.serialize(serializer)
-    }
+/// An [`EffectShape`] as it travels (journal op, `.aur` entry): the plane
+/// lz4-compressed, **not yet expanded**. Deserialising one allocates no more
+/// than its input; [`Self::unpack`] checks the declared size against
+/// [`MAX_EFFECT_SHAPE_PIXELS`] before it expands anything, and its caller
+/// expands one shape at a time against the document's total bound, so a
+/// hostile file cannot make a long list of small payloads each decompress to
+/// a full plane at once.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PackedEffectShape {
+    x: i64,
+    y: i64,
+    width: u32,
+    height: u32,
+    pixel_fingerprint: u64,
+    packed: Vec<u8>,
 }
 
-impl<'de> serde::Deserialize<'de> for EffectShape {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        let (x, y, width, height, fingerprint, packed) = <Wire<'static>>::deserialize(deserializer)?;
-        // The size is checked before the plane is allocated: `decompress`
-        // allocates exactly the length it is told.
-        let pixels = u64::from(width) * u64::from(height);
-        if pixels == 0 || pixels > MAX_EFFECT_SHAPE_PIXELS {
-            return Err(D::Error::custom(EffectShapeError::BadSize));
+impl PackedEffectShape {
+    /// The packed form of `shape`.
+    #[must_use]
+    pub fn of(shape: &EffectShape) -> Self {
+        Self {
+            x: shape.area.x,
+            y: shape.area.y,
+            width: shape.area.width,
+            height: shape.area.height,
+            pixel_fingerprint: shape.pixel_fingerprint,
+            packed: lz4_flex::block::compress(&shape.coverage),
         }
-        let size = usize::try_from(pixels).map_err(|_| D::Error::custom("size"))?;
-        let coverage = lz4_flex::block::decompress(&packed, size)
-            .map_err(|err| D::Error::custom(format!("effect shape plane: {err}")))?;
-        Self::new(
+    }
+
+    /// The shape, expanded.
+    ///
+    /// # Errors
+    ///
+    /// [`EffectShapeError::BadSize`] for an empty or oversized declared
+    /// area (checked before anything is allocated);
+    /// [`EffectShapeError::LengthMismatch`] when the payload does not
+    /// expand to exactly `width * height` bytes.
+    pub fn unpack(&self) -> Result<EffectShape, EffectShapeError> {
+        let pixels = u64::from(self.width) * u64::from(self.height);
+        if pixels == 0 || pixels > MAX_EFFECT_SHAPE_PIXELS {
+            return Err(EffectShapeError::BadSize);
+        }
+        let size = usize::try_from(pixels).map_err(|_| EffectShapeError::BadSize)?;
+        let coverage = lz4_flex::block::decompress(&self.packed, size)
+            .map_err(|_| EffectShapeError::LengthMismatch)?;
+        EffectShape::new(
             Rect {
-                x,
-                y,
-                width,
-                height,
+                x: self.x,
+                y: self.y,
+                width: self.width,
+                height: self.height,
             },
             coverage,
-            fingerprint,
+            self.pixel_fingerprint,
         )
-        .map_err(D::Error::custom)
     }
 }
 
@@ -241,21 +256,39 @@ mod tests {
     #[test]
     fn the_wire_round_trips() {
         let shape = square();
-        let bytes = postcard::to_allocvec(&shape).unwrap_or_default();
+        let bytes = postcard::to_allocvec(&PackedEffectShape::of(&shape)).unwrap_or_default();
         assert!(!bytes.is_empty());
-        let back: Result<EffectShape, _> = postcard::from_bytes(&bytes);
-        assert_eq!(back.ok(), Some(shape));
+        let back: Result<PackedEffectShape, _> = postcard::from_bytes(&bytes);
+        assert_eq!(back.ok().and_then(|p| p.unpack().ok()), Some(shape));
     }
 
     #[test]
     fn a_hostile_size_is_refused_without_allocating_the_plane() {
         // A declared 4 billion pixel plane with a two-byte payload.
-        let wire: Wire<'_> = (0, 0, u32::MAX, u32::MAX, 0, std::borrow::Cow::Borrowed(&[0, 0]));
-        let bytes = postcard::to_allocvec(&wire).unwrap_or_default();
-        assert!(postcard::from_bytes::<EffectShape>(&bytes).is_err());
-        // A plausible size whose compressed payload decodes to fewer bytes.
-        let wire: Wire<'_> = (0, 0, 8, 8, 0, std::borrow::Cow::Borrowed(&[0x10, 7]));
-        let bytes = postcard::to_allocvec(&wire).unwrap_or_default();
-        assert!(postcard::from_bytes::<EffectShape>(&bytes).is_err());
+        let hostile = PackedEffectShape {
+            x: 0,
+            y: 0,
+            width: u32::MAX,
+            height: u32::MAX,
+            pixel_fingerprint: 0,
+            packed: vec![0, 0],
+        };
+        assert_eq!(hostile.unpack(), Err(EffectShapeError::BadSize));
+        // A plausible size whose payload decodes to fewer bytes.
+        let short = PackedEffectShape {
+            width: 8,
+            height: 8,
+            packed: vec![0x10, 7],
+            ..hostile.clone()
+        };
+        assert_eq!(short.unpack(), Err(EffectShapeError::LengthMismatch));
+        // A payload that would expand past the declared size is refused too.
+        let over = PackedEffectShape {
+            width: 2,
+            height: 2,
+            packed: lz4_flex::block::compress(&[1u8; 64]),
+            ..hostile
+        };
+        assert_eq!(over.unpack(), Err(EffectShapeError::LengthMismatch));
     }
 }

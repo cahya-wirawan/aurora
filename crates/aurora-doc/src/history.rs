@@ -260,7 +260,7 @@ enum LayerOp {
     /// refuses a journal holding it (ADR 0009).
     SetEffectShape {
         id: LayerId,
-        value: Option<Box<crate::EffectShape>>,
+        value: Option<crate::PackedEffectShape>,
     },
 }
 
@@ -736,8 +736,14 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
             Ok((LayerOp::SetBlendOptions { id, value: old }, None))
         }
         LayerOp::SetEffectShape { id, value } => {
-            let old = tree.effect_shape(id).map(|s| Box::new((**s).clone()));
-            tree.set_effect_shape(id, value.map(|s| std::sync::Arc::new(*s)))?;
+            let old = tree
+                .effect_shape(id)
+                .map(|s| crate::PackedEffectShape::of(s));
+            let shape = value
+                .map(|packed| packed.unpack().map(std::sync::Arc::new))
+                .transpose()
+                .map_err(DocError::InvalidEffectShape)?;
+            tree.set_effect_shape(id, shape)?;
             // `None`: the shape changes where a layer's strokes, glows and
             // shadows reach.
             Ok((LayerOp::SetEffectShape { id, value: old }, None))
@@ -1287,7 +1293,7 @@ impl History {
             for (id, value) in restored_effect_shapes(op) {
                 wire.push(std::borrow::Cow::Owned(LayerOp::SetEffectShape {
                     id,
-                    value: Some(Box::new((*value).clone())),
+                    value: Some(crate::PackedEffectShape::of(&value)),
                 }));
             }
             // The clipping flag (0.201.0) the same way.
@@ -2096,11 +2102,13 @@ impl History {
         id: LayerId,
         value: Option<std::sync::Arc<crate::EffectShape>>,
     ) -> Result<Option<Rect>, DocError> {
-        let old = tree.effect_shape(id).map(|s| Box::new((**s).clone()));
+        let old = tree
+            .effect_shape(id)
+            .map(|s| crate::PackedEffectShape::of(s));
         tree.set_effect_shape(id, value.clone())?;
         self.journal.push(LayerOp::SetEffectShape {
             id,
-            value: value.map(|s| Box::new((*s).clone())),
+            value: value.map(|s| crate::PackedEffectShape::of(&s)),
         });
         self.push(LayerOp::SetEffectShape { id, value: old });
         Ok(None)
@@ -6748,7 +6756,11 @@ mod adjustment_tests {
         // Clearing it.
         assert!(history.set_effect_shape(&mut tree, layer, None).is_ok());
         assert!(tree.effect_shape(layer).is_none());
-        assert!(replayed_through_postcard(&history).effect_shape(layer).is_none());
+        assert!(
+            replayed_through_postcard(&history)
+                .effect_shape(layer)
+                .is_none()
+        );
         // A journal that never held a shape has no such op.
         assert!(
             !format!(

@@ -64,6 +64,7 @@ mod tree;
 
 pub use effect_shape::{
     EffectShape, EffectShapeError, MAX_EFFECT_SHAPE_PIXELS, MAX_EFFECT_SHAPE_TOTAL_PIXELS,
+    PackedEffectShape,
 };
 pub use error::DocError;
 pub use history::{History, MAX_DESCRIPTIONS, forget_document_surfaces};

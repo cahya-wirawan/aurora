@@ -1283,6 +1283,103 @@ fn read_layer_blend_options<R: Read + Seek>(
     Ok(())
 }
 
+/// The optional entry carrying each pixel layer's effect shape (task 151,
+/// `aurora_doc::EffectShape`: the coverage of the vector outline a PSD
+/// shape layer's strokes, glows and shadows are drawn from), which
+/// `LayerEntry::effect_shape` keeps `#[serde(skip)]`.
+///
+/// Written only when some layer holds one, so every other save stays
+/// byte-identical; a file without it opens with none, which is what every
+/// older file means. **Versioned, and a newer version refuses the file**
+/// loudly like [`LAYER_CLIPPING_ENTRY`]. An Aurora older than this entry
+/// ignores it, but refuses the file anyway whenever its journal holds a
+/// `SetEffectShape` op (an unknown ordinal).
+///
+/// Each shape is its own length-prefixed `PackedEffectShape` byte string
+/// and is expanded one at a time, against the document's total bound, so a
+/// hostile entry cannot decompress a long list of small payloads at once;
+/// the entry itself is read under [`MAX_LAYER_EFFECT_SHAPES_BYTES`].
+const LAYER_EFFECT_SHAPES_ENTRY: &str = "layer-effect-shapes";
+
+/// [`LAYER_EFFECT_SHAPES_ENTRY`]'s own schema version.
+const LAYER_EFFECT_SHAPES_VERSION: u32 = 1;
+
+/// The largest [`LAYER_EFFECT_SHAPES_ENTRY`] read.
+const MAX_LAYER_EFFECT_SHAPES_BYTES: u64 = 16 * 1024 * 1024;
+
+/// [`LAYER_EFFECT_SHAPES_ENTRY`]'s payload: version first (frozen), then
+/// `(raw layer id, postcard of aurora_doc::PackedEffectShape)`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LayerEffectShapesWire {
+    version: u32,
+    shapes: Vec<(u64, Vec<u8>)>,
+}
+
+/// Every layer's effect shape, packed, in [`layer_ids`] order.
+fn layer_effect_shapes(layers: &LayerTree) -> Result<Vec<(u64, Vec<u8>)>, IoError> {
+    let mut out = Vec::new();
+    for id in layer_ids(layers) {
+        if let Some(shape) = layers.effect_shape(id) {
+            let bytes = postcard::to_allocvec(&aurora_doc::PackedEffectShape::of(shape))
+                .map_err(|source| IoError::ManifestSerialization(source.to_string()))?;
+            out.push((id.to_raw(), bytes));
+        }
+    }
+    Ok(out)
+}
+
+/// Reads [`LAYER_EFFECT_SHAPES_ENTRY`] if present and applies it to
+/// `layers`.
+///
+/// # Errors
+///
+/// [`IoError::ManifestDeserialization`] for an unknown version, bytes that
+/// do not decode, a shape over its bounds or an id naming a missing or
+/// non-pixel layer.
+fn read_layer_effect_shapes<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    layers: &mut LayerTree,
+) -> Result<(), IoError> {
+    let bytes = match zip.by_name(LAYER_EFFECT_SHAPES_ENTRY) {
+        Ok(file) => read_capped(
+            file,
+            LAYER_EFFECT_SHAPES_ENTRY,
+            MAX_LAYER_EFFECT_SHAPES_BYTES,
+        )?,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let (prefix, _rest) = postcard::take_from_bytes::<MaskDensityPrefix>(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    if prefix.version != LAYER_EFFECT_SHAPES_VERSION {
+        let cause = if prefix.version > LAYER_EFFECT_SHAPES_VERSION {
+            "the file was saved by a newer Aurora"
+        } else {
+            "the entry is damaged or of an unknown kind"
+        };
+        return Err(IoError::ManifestDeserialization(format!(
+            "unsupported layer-effect-shapes version {} (this build understands version \
+             {LAYER_EFFECT_SHAPES_VERSION}); {cause}",
+            prefix.version
+        )));
+    }
+    let wire: LayerEffectShapesWire = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    for (raw, packed) in wire.shapes {
+        let shape = postcard::from_bytes::<aurora_doc::PackedEffectShape>(&packed)
+            .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?
+            .unpack()
+            .map_err(|err| IoError::ManifestDeserialization(format!("effect shape: {err}")))?;
+        layers
+            .set_effect_shape(
+                aurora_doc::LayerId::from_raw(raw),
+                Some(std::sync::Arc::new(shape)),
+            )
+            .map_err(|err| IoError::ManifestDeserialization(format!("effect shape: {err}")))?;
+    }
+    Ok(())
+}
+
 /// The optional entry carrying the document's preserved Photoshop smart
 /// objects (0.200.0): each smart-object layer's `aurora_doc::SmartObject`
 /// (`LayerEntry::smart_object` is `#[serde(skip)]`) and the list of
@@ -2694,6 +2791,9 @@ struct DocumentEntries {
     /// [`LAYER_BLEND_OPTIONS_ENTRY`], when some layer has non-default
     /// advanced-blending options (task 149).
     layer_blend_options: Option<Vec<u8>>,
+    /// [`LAYER_EFFECT_SHAPES_ENTRY`], when some layer has an effect shape
+    /// (task 151).
+    layer_effect_shapes: Option<Vec<u8>>,
     /// [`IMPORT_LOSSES_ENTRY`], when the document has any (0.177.0).
     import_losses: Option<Vec<u8>>,
     /// The selections to write as the `selection` entry (0.218.0); the
@@ -2782,6 +2882,19 @@ impl DocumentEntries {
                     .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
             )
         };
+        let effect_shapes = layer_effect_shapes(layers)?;
+        let layer_effect_shapes = if effect_shapes.is_empty() {
+            None
+        } else {
+            let wire = LayerEffectShapesWire {
+                version: LAYER_EFFECT_SHAPES_VERSION,
+                shapes: effect_shapes,
+            };
+            Some(
+                postcard::to_allocvec(&wire)
+                    .map_err(|source| IoError::ManifestSerialization(source.to_string()))?,
+            )
+        };
         Ok(Self {
             manifest,
             history,
@@ -2792,6 +2905,7 @@ impl DocumentEntries {
             layer_stroke_paints,
             layer_clipping,
             layer_blend_options,
+            layer_effect_shapes,
             import_losses: None,
             selection: None,
             colour: None,
@@ -2846,6 +2960,10 @@ impl DocumentEntries {
         }
         if let Some(bytes) = &self.layer_blend_options {
             zip.start_file(LAYER_BLEND_OPTIONS_ENTRY, deflated)?;
+            zip.write_all(bytes)?;
+        }
+        if let Some(bytes) = &self.layer_effect_shapes {
+            zip.start_file(LAYER_EFFECT_SHAPES_ENTRY, deflated)?;
             zip.write_all(bytes)?;
         }
         if let Some(smart) = &self.smart_objects {
@@ -3318,6 +3436,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     read_layer_stroke_paints(&mut zip, &mut layers)?;
     read_layer_clipping(&mut zip, &mut layers)?;
     read_layer_blend_options(&mut zip, &mut layers)?;
+    read_layer_effect_shapes(&mut zip, &mut layers)?;
     read_smart_objects(&mut zip, &mut layers)?;
 
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
@@ -6711,6 +6830,119 @@ mod tests {
             marked.to_raw()
         ));
         assert!(!tamper(super::LAYER_BLEND_OPTIONS_VERSION, 9_999));
+    }
+
+    /// Task 151: an effect shape survives a save and reopen (the optional
+    /// `layer-effect-shapes` entry and the journal replay), an untouched
+    /// document writes no entry, and a newer entry version, an unknown
+    /// layer id, a hostile size and a truncated plane each refuse the file
+    /// without expanding a huge plane.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one fixture, several tampered reads
+    fn round_trips_an_effect_shape_and_refuses_hostile_entries() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let mut add = |name: &str| match history.add_pixel_layer(&mut layers, name, bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let plain = add("plain");
+        let shaped = add("shaped");
+        let write_bytes = |layers: &LayerTree, history: &History, store: &mut TileStore| {
+            let mut bytes = Cursor::new(Vec::new());
+            if let Err(err) = write(
+                &mut bytes,
+                layers,
+                history,
+                (100, 100),
+                None,
+                &SkippedTiles::new(),
+                store,
+            ) {
+                unreachable!("{err:?}");
+            }
+            bytes.into_inner()
+        };
+        let untouched = write_bytes(&layers, &history, &mut store);
+        assert!(
+            effects_entry_names(&untouched)
+                .iter()
+                .all(|n| n != super::LAYER_EFFECT_SHAPES_ENTRY),
+            "no shape writes no entry"
+        );
+        let plane: Vec<u8> = (0..24u8).map(|i| i * 10).collect();
+        let shape = match aurora_doc::EffectShape::new(
+            aurora_core::Rect {
+                x: -2,
+                y: 3,
+                width: 6,
+                height: 4,
+            },
+            plane,
+            0xDEAD_BEEF,
+        ) {
+            Ok(shape) => std::sync::Arc::new(shape),
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_effect_shape(&mut layers, shaped, Some(shape.clone())) {
+            unreachable!("{err:?}");
+        }
+        let bytes = write_bytes(&layers, &history, &mut store);
+        assert!(
+            effects_entry_names(&bytes)
+                .iter()
+                .any(|n| n == super::LAYER_EFFECT_SHAPES_ENTRY)
+        );
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.clone()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(
+            document.layers.effect_shape(shaped).map(|s| s.as_ref()),
+            Some(shape.as_ref())
+        );
+        assert!(document.layers.effect_shape(plain).is_none());
+        match document.history.replay() {
+            Ok(replayed) => assert_eq!(
+                replayed.effect_shape(shaped).map(|s| s.as_ref()),
+                Some(shape.as_ref())
+            ),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        let packed = aurora_doc::PackedEffectShape::of(&shape);
+        let packed_bytes = postcard::to_allocvec(&packed).unwrap_or_default();
+        let tamper = |version: u32, id: u64, payload: Vec<u8>| {
+            let payload = postcard::to_allocvec(&super::LayerEffectShapesWire {
+                version,
+                shapes: vec![(id, payload)],
+            })
+            .unwrap_or_default();
+            let tampered =
+                with_named_entry(&bytes, super::LAYER_EFFECT_SHAPES_ENTRY, Some(&payload));
+            let (_d, mut fresh) = real_tile_store();
+            read(Cursor::new(tampered), &mut fresh).is_ok()
+        };
+        let v = super::LAYER_EFFECT_SHAPES_VERSION;
+        assert!(tamper(v, shaped.to_raw(), packed_bytes.clone()));
+        assert!(!tamper(v + 1, shaped.to_raw(), packed_bytes.clone()));
+        assert!(!tamper(v, 9_999, packed_bytes.clone()));
+        // Truncated bytes, and a payload whose plane is short.
+        assert!(!tamper(
+            v,
+            shaped.to_raw(),
+            packed_bytes
+                .get(..packed_bytes.len() / 2)
+                .unwrap_or_default()
+                .to_vec()
+        ));
+        // A hostile declared size: the same payload with a 2^32 x 2^32 box.
+        let hostile =
+            postcard::to_allocvec(&(0i64, 0i64, u32::MAX, u32::MAX, 0u64, vec![0u8, 0u8]))
+                .unwrap_or_default();
+        assert!(!tamper(v, shaped.to_raw(), hostile));
     }
 
     /// 0.158.0: a Curves layer whose curves have **moved endpoints** (a
