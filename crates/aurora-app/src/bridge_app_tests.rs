@@ -1,0 +1,714 @@
+//! Headless tests of the bridge's app side: options, the modal policy, the
+//! command gate, the marshalling queue and the confined file staging. The
+//! handlers that need a live `App` (window, GPU) are covered by the
+//! Xvfb smoke script (`scripts/mcp_bridge_smoke.sh`), not here.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use aurora_automation::Roots;
+use aurora_automation::bridge::client::{BridgeClient, ClientError};
+use aurora_automation::bridge::protocol::CallError;
+use aurora_automation::bridge::server::{BridgeServer, Dispatcher, ServerConfig};
+use aurora_automation::bridge::token;
+use serde_json::{Value, json};
+
+use crate::bridge_app::{AppDispatcher, BridgeOptions, Job, QUEUE_CAPACITY, policy};
+use crate::bridge_doc::{command_gate, commit_export, stage_open_file};
+
+fn env_none(_: &str) -> Option<String> {
+    None
+}
+
+fn args(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| (*s).to_owned()).collect()
+}
+
+// ---- off by default ----
+
+#[test]
+fn the_bridge_is_off_unless_asked_for() {
+    let o = BridgeOptions::from_args(&[], &env_none).unwrap();
+    assert!(!o.enabled);
+    assert!(o.read_roots.is_empty() && o.write_roots.is_empty());
+    // Roots or limits alone never enable it.
+    let o = BridgeOptions::from_args(
+        &args(&["--mcp-bridge-root", "/tmp", "--mcp-bridge-max-mpx", "5"]),
+        &env_none,
+    )
+    .unwrap();
+    assert!(!o.enabled);
+    assert_eq!(o.max_pixels, 5_000_000);
+    // Unknown arguments (a platform launcher's) are ignored.
+    assert!(
+        !BridgeOptions::from_args(&args(&["-psn_0_1", "file.png"]), &env_none)
+            .unwrap()
+            .enabled
+    );
+    // Falsy environment values stay off.
+    for v in ["", "0", "false", "off", "no", "2"] {
+        let env = move |n: &str| (n == "AURORA_MCP_BRIDGE").then(|| v.to_owned());
+        assert!(
+            !BridgeOptions::from_args(&[], &env).unwrap().enabled,
+            "{v:?}"
+        );
+    }
+}
+
+#[test]
+fn the_flag_and_the_environment_enable_it() {
+    assert!(
+        BridgeOptions::from_args(&args(&["--mcp-bridge"]), &env_none)
+            .unwrap()
+            .enabled
+    );
+    for v in ["1", "true", "ON", " yes "] {
+        let env = move |n: &str| (n == "AURORA_MCP_BRIDGE").then(|| v.to_owned());
+        assert!(
+            BridgeOptions::from_args(&[], &env).unwrap().enabled,
+            "{v:?}"
+        );
+    }
+    let env = |n: &str| match n {
+        "AURORA_MCP_BRIDGE_ROOTS" => Some("/a:/b".to_owned()),
+        "AURORA_MCP_BRIDGE_WRITE_ROOTS" => Some("/w".to_owned()),
+        _ => None,
+    };
+    let o = BridgeOptions::from_args(
+        &args(&[
+            "--mcp-bridge",
+            "--mcp-bridge-root",
+            "/c",
+            "--mcp-bridge-read-root",
+            "/d",
+            "--mcp-bridge-write-root",
+            "/e",
+        ]),
+        &env,
+    )
+    .unwrap();
+    assert_eq!(
+        o.read_roots,
+        [
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/c"),
+            PathBuf::from("/d")
+        ]
+    );
+    assert_eq!(o.write_roots, [PathBuf::from("/w"), PathBuf::from("/e")]);
+}
+
+#[test]
+fn the_bare_root_flag_never_grants_writing() {
+    let o = BridgeOptions::from_args(
+        &args(&["--mcp-bridge", "--mcp-bridge-root", "/c"]),
+        &env_none,
+    )
+    .unwrap();
+    assert_eq!(o.read_roots, [PathBuf::from("/c")]);
+    assert!(
+        o.write_roots.is_empty(),
+        "writing needs --mcp-bridge-write-root"
+    );
+}
+
+#[test]
+fn bad_option_values_are_errors() {
+    assert!(BridgeOptions::from_args(&args(&["--mcp-bridge-root"]), &env_none).is_err());
+    assert!(BridgeOptions::from_args(&args(&["--mcp-bridge-write-root"]), &env_none).is_err());
+    assert!(BridgeOptions::from_args(&args(&["--mcp-bridge-read-root"]), &env_none).is_err());
+    assert!(BridgeOptions::from_args(&args(&["--mcp-bridge-max-mpx", "0"]), &env_none).is_err());
+    assert!(BridgeOptions::from_args(&args(&["--mcp-bridge-max-mpx", "x"]), &env_none).is_err());
+}
+
+// ---- policy ----
+
+#[test]
+fn a_modal_dialog_blocks_everything_but_reads_and_the_dialog_tool() {
+    let modal = Some("Save changes?");
+    for method in [
+        "command.run",
+        "doc.open",
+        "doc.save",
+        "ui.pointer",
+        "ui.key",
+    ] {
+        let e = policy(method, None, modal, false).unwrap_err();
+        assert_eq!(e.kind, "modal_dialog", "{method}");
+        assert!(e.message.contains("ui_dialog"));
+    }
+    assert_eq!(
+        policy("ui.menu", Some("activate"), modal, false)
+            .unwrap_err()
+            .kind,
+        "modal_dialog"
+    );
+    for method in [
+        "bridge.status",
+        "command.context",
+        "doc.inspect",
+        "doc.preview",
+        "doc.psd_check",
+        "ui.inspect",
+        "ui.screenshot",
+        "ui.dialog",
+    ] {
+        assert!(policy(method, None, modal, false).is_ok(), "{method}");
+    }
+    assert!(policy("ui.menu", Some("list"), modal, false).is_ok());
+    // No dialog: everything is allowed.
+    for method in ["command.run", "doc.open", "ui.pointer", "ui.key"] {
+        assert!(policy(method, None, None, false).is_ok());
+    }
+}
+
+#[test]
+fn an_open_palette_refuses_commands_and_files_but_not_keys() {
+    for method in ["command.run", "doc.open", "doc.save"] {
+        assert_eq!(
+            policy(method, None, None, true).unwrap_err().kind,
+            "palette_open"
+        );
+    }
+    assert_eq!(
+        policy("ui.menu", Some("activate"), None, true)
+            .unwrap_err()
+            .kind,
+        "palette_open"
+    );
+    assert!(
+        policy("ui.key", None, None, true).is_ok(),
+        "the palette is driven by keys"
+    );
+    assert!(policy("ui.pointer", None, None, true).is_ok());
+}
+
+// ---- command gate ----
+
+#[test]
+fn quitting_and_file_commands_are_never_run() {
+    for id in [
+        "app.quit",
+        "automation.disconnect",
+        "file.open",
+        "file.save",
+    ] {
+        assert_eq!(command_gate(id).unwrap_err().kind, "refused", "{id}");
+    }
+    // A command with a file-path parameter is refused too.
+    let registry = aurora_commands::Registry::builtin();
+    let with_path: Vec<String> = registry
+        .list()
+        .commands
+        .iter()
+        .filter(|c| {
+            registry.get(&c.id).is_some_and(|spec| {
+                spec.params
+                    .iter()
+                    .any(|p| matches!(p.kind, aurora_commands::ParamKind::Path { .. }))
+            })
+        })
+        .map(|c| c.id.clone())
+        .collect();
+    assert!(!with_path.is_empty(), "the registry has path commands");
+    for id in with_path {
+        assert!(command_gate(&id).is_err(), "{id}");
+    }
+    for id in ["edit.undo", "select.expand", "layer.new", "tool.brush"] {
+        assert!(command_gate(id).is_ok(), "{id}");
+    }
+}
+
+// ---- marshalling ----
+
+fn dispatcher(
+    capacity: usize,
+    wait: Duration,
+) -> (Arc<AppDispatcher>, mpsc::Receiver<Job>, Arc<Mutex<u32>>) {
+    let (tx, rx) = mpsc::sync_channel(capacity);
+    let wakes = Arc::new(Mutex::new(0_u32));
+    let w = Arc::clone(&wakes);
+    let d = AppDispatcher::new(tx, Box::new(move || *w.lock().unwrap() += 1), wait);
+    (Arc::new(d), rx, wakes)
+}
+
+fn request(method: &str) -> aurora_automation::bridge::protocol::Request {
+    serde_json::from_value(json!({"id": 1, "method": method, "params": {}})).unwrap()
+}
+
+#[test]
+fn the_queue_is_bounded_at_sixteen() {
+    assert_eq!(QUEUE_CAPACITY, 16);
+    let (d, rx, wakes) = dispatcher(2, Duration::from_millis(700));
+    let mut waiting = Vec::new();
+    for _ in 0..2 {
+        let d = Arc::clone(&d);
+        waiting.push(std::thread::spawn(move || {
+            d.dispatch(request("ui.inspect"))
+        }));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let full = d.dispatch(request("ui.inspect")).unwrap_err();
+    assert_eq!(full.kind, "rate_limited");
+    assert!(*wakes.lock().unwrap() >= 2, "the UI thread was woken");
+    // The two queued ones are served by whoever drains the queue.
+    while let Ok(job) = rx.try_recv() {
+        job.finish(Ok(json!({"served": true})));
+    }
+    for w in waiting {
+        assert_eq!(w.join().unwrap().unwrap()["served"], true);
+    }
+}
+
+#[test]
+fn a_request_the_ui_never_reached_says_it_was_not_run() {
+    let (d, rx, _) = dispatcher(4, Duration::from_millis(150));
+    let e = d.dispatch(request("command.run")).unwrap_err();
+    assert_eq!(e.kind, "timeout");
+    assert!(e.message.contains("not run"), "{}", e.message);
+    let job = rx.try_recv().unwrap();
+    assert!(!job.live(), "an abandoned job is skipped by the UI");
+}
+
+#[test]
+fn a_request_the_ui_started_may_still_apply() {
+    let (d, rx, _) = dispatcher(4, Duration::from_millis(300));
+    let worker = std::thread::spawn(move || {
+        let job = rx.recv().unwrap();
+        job.start();
+        std::thread::sleep(Duration::from_millis(600));
+        job
+    });
+    let e = d.dispatch(request("command.run")).unwrap_err();
+    assert!(e.message.contains("may still apply"), "{}", e.message);
+    drop(worker.join().unwrap());
+}
+
+#[test]
+fn through_a_real_socket_a_modal_dialog_refuses_a_command() {
+    let (d, rx, _) = dispatcher(QUEUE_CAPACITY, Duration::from_secs(5));
+    let tok = token::generate().unwrap();
+    let server = BridgeServer::start(ServerConfig::default(), tok.clone(), d).unwrap();
+    // A fake UI thread that applies the real policy with a dialog open.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let s = Arc::clone(&stop);
+    let ui = std::thread::spawn(move || {
+        while !s.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Ok(job) = rx.recv_timeout(Duration::from_millis(50)) {
+                job.start();
+                let action = job.param("action").and_then(Value::as_str);
+                let answer = policy(&job.request.method, action, Some("Save changes?"), false)
+                    .map(|()| json!({"ran": job.request.method}));
+                job.finish(answer);
+            }
+        }
+    });
+    let mut client =
+        BridgeClient::connect_to(server.local_addr(), &tok, Duration::from_secs(3)).unwrap();
+    let e = client
+        .call(
+            "command.run",
+            json!({"id": "edit.undo"}),
+            Duration::from_secs(3),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&e, ClientError::App(c) if c.kind == "modal_dialog"),
+        "{e:?}"
+    );
+    let ok = client
+        .call(
+            "ui.dialog",
+            json!({"action": "get"}),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+    assert_eq!(ok["ran"], "ui.dialog");
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    ui.join().unwrap();
+}
+
+// ---- confined files ----
+
+fn png_header(w: u32, h: u32) -> Vec<u8> {
+    let mut b = b"\x89PNG\r\n\x1a\n".to_vec();
+    b.extend_from_slice(&13_u32.to_be_bytes());
+    b.extend_from_slice(b"IHDR");
+    b.extend_from_slice(&w.to_be_bytes());
+    b.extend_from_slice(&h.to_be_bytes());
+    b.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    b
+}
+
+fn roots_in(dir: &std::path::Path) -> Roots {
+    Roots::open(&[dir.to_path_buf()], &[dir.to_path_buf()]).unwrap()
+}
+
+#[test]
+fn opening_is_confined_to_the_roots_and_copies_to_private_scratch() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.png"), png_header(10, 10)).unwrap();
+    std::fs::write(outside.path().join("secret.png"), png_header(10, 10)).unwrap();
+    let roots = roots_in(root.path());
+    let out = outside.path().join("secret.png").display().to_string();
+    for bad in [out.as_str(), "../secret.png", "/etc/passwd", "missing.png"] {
+        let e = stage_open_file(&roots, &scratch.path().join("o1"), bad, 100_000_000).unwrap_err();
+        assert_eq!(e.kind, "refused", "{bad}: {e}");
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.png"),
+            root.path().join("link.png"),
+        )
+        .unwrap();
+        let e = stage_open_file(&roots, &scratch.path().join("o2"), "link.png", 100_000_000)
+            .unwrap_err();
+        assert_eq!(e.kind, "refused", "an escaping symlink: {e}");
+    }
+    assert!(
+        !scratch.path().join("o1").exists(),
+        "nothing staged for a refusal"
+    );
+    let staged = stage_open_file(&roots, &scratch.path().join("o3"), "a.png", 100_000_000).unwrap();
+    assert_ne!(
+        staged,
+        root.path().join("a.png"),
+        "the decoder gets the copy"
+    );
+    assert_eq!(std::fs::read(&staged).unwrap(), png_header(10, 10));
+    assert_eq!(staged.file_name().unwrap(), "a.png");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(staged.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+}
+
+#[test]
+fn a_huge_declared_picture_is_refused_before_anything_is_copied() {
+    let root = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("bomb.png"), png_header(30_000, 30_000)).unwrap();
+    let e = stage_open_file(
+        &roots_in(root.path()),
+        &scratch.path().join("o"),
+        "bomb.png",
+        50_000_000,
+    )
+    .unwrap_err();
+    assert_eq!(e.kind, "refused");
+    assert!(e.message.contains("--mcp-bridge-max-mpx"), "{}", e.message);
+    assert!(!scratch.path().join("o").exists());
+}
+
+#[test]
+fn with_no_roots_there_is_no_file_access() {
+    let scratch = tempfile::tempdir().unwrap();
+    let none = Roots::open(&[], &[]).unwrap();
+    assert!(stage_open_file(&none, &scratch.path().join("o"), "/etc/passwd", 1).is_err());
+    let out = scratch.path().join("out.png");
+    std::fs::write(&out, b"x").unwrap();
+    assert!(commit_export(&none, &out, "/tmp/x.png").is_err());
+}
+
+#[test]
+fn saving_creates_a_new_file_and_never_replaces_one() {
+    let root = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let out = work.path().join("out.png");
+    std::fs::write(&out, b"NEW-BYTES").unwrap();
+    std::fs::write(root.path().join("keep.png"), b"PRECIOUS").unwrap();
+    let roots = roots_in(root.path());
+    let e = commit_export(&roots, &out, "keep.png").unwrap_err();
+    assert_eq!(e.kind, "refused");
+    assert_eq!(
+        std::fs::read(root.path().join("keep.png")).unwrap(),
+        b"PRECIOUS"
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("nowhere.png", root.path().join("dangling.png")).unwrap();
+        assert!(commit_export(&roots, &out, "dangling.png").is_err());
+        assert!(
+            !root.path().join("nowhere.png").exists(),
+            "a dangling link is not followed"
+        );
+    }
+    assert!(commit_export(&roots, &out, "../escape.png").is_err());
+    assert!(
+        commit_export(
+            &roots,
+            &out,
+            &work.path().join("abs.png").display().to_string()
+        )
+        .is_err()
+    );
+    assert_eq!(commit_export(&roots, &out, "fresh.png").unwrap(), 9);
+    assert_eq!(
+        std::fs::read(root.path().join("fresh.png")).unwrap(),
+        b"NEW-BYTES"
+    );
+}
+
+#[test]
+fn error_kinds_survive_the_trip() {
+    let c = CallError::new("modal_dialog", "x");
+    assert_eq!(c.kind, "modal_dialog");
+}
+
+// ---- dialogs: what a controller may answer ----
+
+use crate::DialogPurpose;
+use crate::bridge_ui::dialog_choice_allowed;
+
+/// Every purpose with every action id its dialog has, and whether a
+/// controller may choose it. The `match` is exhaustive on purpose: a new
+/// dialog purpose does not compile until it is classified here (and in
+/// ADR 0015's table).
+fn table(purpose: &DialogPurpose) -> Vec<(&'static str, bool)> {
+    use crate::{document_close as dc, first_run as fr, psd_save as ps, workspace_presets as wp};
+    match purpose {
+        DialogPurpose::CrashRecovery => vec![(crate::CRASH_RECOVERY_CONTINUE, true)],
+        DialogPurpose::OpenedWithChanges => vec![(crate::PSD_REPORT_DISMISS, true)],
+        DialogPurpose::OpenFailed => vec![(crate::OPEN_FAILED_DISMISS, true)],
+        DialogPurpose::SaveFailed => vec![(crate::SAVE_FAILED_DISMISS, true)],
+        DialogPurpose::ExportRefused => vec![(crate::EXPORT_REFUSED_DISMISS, true)],
+        DialogPurpose::SkippedTiles => vec![(crate::SKIPPED_TILES_DISMISS, true)],
+        DialogPurpose::MoveRefused => vec![(crate::MOVE_REFUSED_DISMISS, true)],
+        DialogPurpose::ReplaceWorkspace(_) => vec![
+            (wp::WORKSPACE_REPLACE, false),
+            (wp::WORKSPACE_REPLACE_CANCEL, true),
+        ],
+        DialogPurpose::CloseDocument(_) | DialogPurpose::QuitReview(_) => vec![
+            (dc::CLOSE_SAVE, false),
+            (dc::CLOSE_DONT_SAVE, false),
+            (dc::CLOSE_CANCEL, true),
+        ],
+        DialogPurpose::ExportedNotSaved => vec![(dc::EXPORTED_NOT_SAVED_DISMISS, true)],
+        DialogPurpose::PsdSaveWithChanges => {
+            vec![(ps::PSD_SAVE_ANYWAY, false), (ps::PSD_SAVE_CANCEL, true)]
+        }
+        DialogPurpose::PsdCheck => vec![(ps::PSD_CHECK_OK, true)],
+        DialogPurpose::Welcome => vec![(fr::WELCOME_START, true), (fr::WELCOME_PALETTE, true)],
+    }
+}
+
+fn every_purpose() -> Vec<DialogPurpose> {
+    use crate::document_session::DocumentId;
+    vec![
+        DialogPurpose::CrashRecovery,
+        DialogPurpose::OpenedWithChanges,
+        DialogPurpose::OpenFailed,
+        DialogPurpose::SaveFailed,
+        DialogPurpose::ExportRefused,
+        DialogPurpose::SkippedTiles,
+        DialogPurpose::MoveRefused,
+        DialogPurpose::ReplaceWorkspace("Mine".to_owned()),
+        DialogPurpose::CloseDocument(DocumentId::next()),
+        DialogPurpose::QuitReview(DocumentId::next()),
+        DialogPurpose::ExportedNotSaved,
+        DialogPurpose::PsdSaveWithChanges,
+        DialogPurpose::PsdCheck,
+        DialogPurpose::Welcome,
+    ]
+}
+
+#[test]
+fn a_controller_may_acknowledge_and_cancel_but_never_discard_or_quit() {
+    for purpose in every_purpose() {
+        for (action, allowed) in table(&purpose) {
+            assert_eq!(
+                dialog_choice_allowed(&purpose, action).is_ok(),
+                allowed,
+                "{purpose:?} / {action}"
+            );
+        }
+        // An id the dialog does not have is never allowed.
+        assert!(
+            dialog_choice_allowed(&purpose, "nonsense.id").is_err(),
+            "{purpose:?}"
+        );
+    }
+}
+
+#[test]
+fn the_unsaved_changes_answers_are_refused_with_a_reason() {
+    let id = crate::document_session::DocumentId::next();
+    for purpose in [
+        DialogPurpose::CloseDocument(id),
+        DialogPurpose::QuitReview(id),
+    ] {
+        for action in [
+            crate::document_close::CLOSE_DONT_SAVE,
+            crate::document_close::CLOSE_SAVE,
+        ] {
+            let message = dialog_choice_allowed(&purpose, action).unwrap_err();
+            assert!(message.contains("unsaved"), "{message}");
+        }
+        assert!(dialog_choice_allowed(&purpose, crate::document_close::CLOSE_CANCEL).is_ok());
+    }
+}
+
+#[test]
+fn choosing_goes_through_one_validation_that_knows_the_gate() {
+    use crate::bridge_ui::validate_choice;
+    let id = crate::document_session::DocumentId::next();
+    let purpose = DialogPurpose::CloseDocument(id);
+    assert_eq!(
+        validate_choice(&purpose, true, crate::document_close::CLOSE_DONT_SAVE)
+            .unwrap_err()
+            .kind,
+        "refused"
+    );
+    assert!(validate_choice(&purpose, true, crate::document_close::CLOSE_CANCEL).is_ok());
+    assert_eq!(
+        validate_choice(&purpose, false, crate::document_close::CLOSE_CANCEL)
+            .unwrap_err()
+            .kind,
+        "bad_request"
+    );
+}
+
+// ---- a controller can never quit (the central gate) ----
+
+use crate::bridge_app::{Gated, SyntheticScope, gate, synthetic_input};
+
+#[test]
+fn the_gate_refuses_quit_disconnect_and_native_dialogs_only_inside_a_job() {
+    for action in [
+        Gated::Quit,
+        Gated::DisconnectAutomation,
+        Gated::NativeDialog,
+    ] {
+        assert!(
+            gate(action).is_ok(),
+            "a person's input is never gated: {action:?}"
+        );
+    }
+    {
+        let _job = SyntheticScope::enter();
+        assert!(synthetic_input());
+        for action in [
+            Gated::Quit,
+            Gated::DisconnectAutomation,
+            Gated::NativeDialog,
+        ] {
+            assert!(gate(action).is_err(), "{action:?}");
+        }
+        {
+            let _nested = SyntheticScope::enter();
+        }
+        assert!(
+            gate(Gated::Quit).is_err(),
+            "leaving a nested scope keeps the outer one"
+        );
+    }
+    assert!(!synthetic_input());
+    assert!(
+        gate(Gated::Quit).is_ok(),
+        "a real quit works again once the job ends"
+    );
+}
+
+#[test]
+fn the_gate_is_per_thread_so_a_real_event_on_another_thread_is_never_blocked() {
+    let _job = SyntheticScope::enter();
+    let other = std::thread::spawn(|| gate(Gated::Quit).is_ok())
+        .join()
+        .unwrap();
+    assert!(other);
+}
+
+/// The source between `start` and `len` bytes after it.
+fn region(source: &'static str, start: &str, len: usize) -> &'static str {
+    let at = source.find(start).expect("the pinned source text exists");
+    &source[at..(at + len).min(source.len())]
+}
+
+#[test]
+fn every_exit_and_blocking_route_calls_the_central_gate() {
+    const LIB: &str = include_str!("lib.rs");
+    // Every way to quit funnels through `request_quit`: the window close
+    // request, the menu bar and native menu "Quit Aurora", ActivatedCommand::Quit.
+    assert!(
+        region(LIB, "    fn request_quit(&mut self) -> bool {", 700)
+            .contains("bridge_app::gate(bridge_app::Gated::Quit)"),
+        "request_quit must call the gate first"
+    );
+    assert!(
+        region(LIB, "Some(ActivatedCommand::Quit) => {", 120).contains("request_quit()"),
+        "the Quit command must go through request_quit"
+    );
+    assert!(
+        region(
+            LIB,
+            "Some(ActivatedCommand::DisconnectAutomation) => {",
+            200
+        )
+        .contains("bridge_app::Gated::DisconnectAutomation")
+    );
+    let dialog = region(LIB, "impl FileDialogAccess for SystemFileDialog {", 700);
+    assert_eq!(
+        dialog.matches("bridge_app::Gated::NativeDialog").count(),
+        2,
+        "both native dialogs"
+    );
+    assert!(
+        region(
+            LIB,
+            "    fn run_dialog_result(&mut self, result: &DialogResult) {",
+            400
+        )
+        .contains("bridge_app::synthetic_input()"),
+        "dialog answers are re-checked for synthetic input"
+    );
+    // The only places that end the event loop are reached through request_quit
+    // (`exit_requested`) or the real window close event.
+    let exits: Vec<&str> = LIB
+        .match_indices("self.exit_requested = true")
+        .map(|(i, _)| &LIB[i.saturating_sub(300)..i])
+        .collect();
+    assert_eq!(exits.len(), 1, "one place sets exit_requested");
+    assert!(exits[0].contains("QuitEffect::CleanupAndExit"));
+}
+
+#[test]
+fn bridge_dispatch_runs_inside_the_synthetic_scope() {
+    const APP: &str = include_str!("bridge_app.rs");
+    assert!(
+        region(APP, "fn bridge_dispatch(&mut self, job: Job)", 400)
+            .contains("SyntheticScope::enter()")
+    );
+}
+
+#[test]
+fn quit_and_disconnect_are_not_in_the_palette() {
+    let ids: Vec<String> = crate::command_registry::palette_entries()
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    assert!(
+        !ids.iter().any(|id| id == "app.quit"),
+        "Quit is a menu item only"
+    );
+    // Disconnect is in the palette (the person's lever) and refused for a controller by the gate.
+    assert!(ids.iter().any(|id| id == "automation.disconnect"));
+}

@@ -15,13 +15,13 @@
 //! (stderr).
 
 mod budgets;
-pub mod header;
-pub mod roots;
-pub mod scratch;
+pub use aurora_automation::{header, roots, scratch};
+pub mod bridge_session;
 pub mod server;
 pub mod session;
 mod transport;
 
+pub use bridge_session::{BridgeSession, DiscoverySource};
 pub use budgets::{
     Limits, MAX_PATH_BYTES, MAX_PREVIEW_PNG_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
 };

@@ -38,7 +38,8 @@ async fn tools_list_names_every_tool_with_all_four_hints_and_strict_schemas() {
         .collect();
     names.sort();
     assert_eq!(names, ALL_TOOLS);
-    assert_eq!(aurora_mcp::tool_names().len(), ALL_TOOLS.len());
+    // `tool_names` lists the six bridge-only window tools too.
+    assert_eq!(aurora_mcp::tool_names().len(), ALL_TOOLS.len() + 6);
     for tool in tools {
         let a = &tool["annotations"];
         for hint in [

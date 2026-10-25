@@ -100,7 +100,14 @@ pub struct StatusInfo {
     /// The Crop tool's rectangle while it has one (0.226.0): its readout
     /// ([`crop_text`]) is appended to the document label.
     pub crop: Option<aurora_core::Rect>,
+    /// An automation controller is connected (task 160): the document label
+    /// always ends with [`AUTOMATION_TEXT`], whatever else it shows, so the
+    /// indication cannot be hidden behind a notice.
+    pub automation: bool,
 }
+
+/// The status bar's automation indicator (task 160).
+pub const AUTOMATION_TEXT: &str = "Automation connected";
 
 /// The status bar's Quick Mask indicator (0.217.0).
 pub const QUICK_MASK_TEXT: &str = "Quick Mask";
@@ -346,11 +353,24 @@ pub fn sync_status_bar(
     let document = widgets::set_label_text(
         tree,
         bar.document,
-        &info
-            .notice
-            .map_or_else(|| document_label_text(info), str::to_owned),
+        &with_automation(
+            info.notice
+                .map_or_else(|| document_label_text(info), str::to_owned),
+            info,
+        ),
     )?;
     Ok(zoom || document)
+}
+
+/// `text` followed by the automation indicator while a controller is
+/// connected — after a notice too, so the indication is never hidden.
+#[must_use]
+pub fn with_automation(text: String, info: &StatusInfo) -> String {
+    if info.automation {
+        format!("{text} · {AUTOMATION_TEXT}")
+    } else {
+        text
+    }
 }
 
 /// The text `bar` currently shows, `(zoom, document)` — `None` if either
@@ -440,6 +460,7 @@ mod tests {
             document_size: (4000, 3000),
             sample: SampleFormat::F16,
             notice: None,
+            automation: false,
             selection: None,
             quick_mask: false,
             crop: None,
@@ -518,6 +539,7 @@ mod tests {
             document_size: (10, 10),
             sample: aurora_tile::SAMPLE_FORMAT,
             notice: None,
+            automation: false,
             selection: None,
             quick_mask: false,
             crop: None,
@@ -564,6 +586,7 @@ mod tests {
             document_size: (640, 480),
             sample: SampleFormat::F16,
             notice: None,
+            automation: false,
             selection: None,
             quick_mask: false,
             crop: None,
@@ -647,6 +670,7 @@ mod tests {
             document_size: (100, 80),
             sample: aurora_tile::SAMPLE_FORMAT,
             notice: None,
+            automation: false,
             selection: None,
             quick_mask: false,
             crop: Some(rect),
@@ -655,5 +679,32 @@ mod tests {
         assert!(text.ends_with(" · Crop: 7, 3, 40 × 30 px"), "{text}");
         let none = StatusInfo { crop: None, ..info };
         assert!(!super::document_label_text(&none).contains("Crop"));
+    }
+
+    #[test]
+    fn the_automation_indicator_is_never_hidden_behind_a_notice() {
+        let info = StatusInfo {
+            zoom: 1.0,
+            scale_factor: 1.0,
+            document_size: (10, 10),
+            sample: SampleFormat::F16,
+            notice: Some("A layer is locked."),
+            selection: None,
+            quick_mask: false,
+            crop: None,
+            automation: true,
+        };
+        let shown = super::with_automation(
+            info.notice
+                .map_or_else(|| super::document_label_text(&info), str::to_owned),
+            &info,
+        );
+        assert!(shown.starts_with("A layer is locked."), "{shown}");
+        assert!(shown.ends_with(super::AUTOMATION_TEXT), "{shown}");
+        let off = StatusInfo {
+            automation: false,
+            ..info
+        };
+        assert_eq!(super::with_automation("x".to_owned(), &off), "x");
     }
 }

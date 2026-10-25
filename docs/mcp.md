@@ -4,7 +4,7 @@
 over standard input and output, so a model or a script can open a document,
 inspect it, run editor commands, look at it, check a PSD save and write files,
 **without a window or a GPU**. It is headless only: driving the running desktop
-app (screenshots, pointer, menus) is task 160. The design and the reasons for
+app (screenshots, pointer, menus) is [bridge mode](#bridge-mode-driving-the-running-app-task-160). The design and the reasons for
 its dependencies are in [ADR 0014](adr/0014-mcp-server.md); the command
 descriptions come from the [command registry](command-registry.md).
 
@@ -240,10 +240,151 @@ decoding; a decode in progress finishes.
 * Saved selections of the document are written to a PSD as alpha channels and
   listed in the report; the active selection and paths are not.
 
-## What task 160 adds
+## Bridge mode: driving the running app (task 160)
 
-Bridge mode: the same tools drive the running desktop app over a loopback
-socket (256-bit token in an owner-only file), plus `ui_inspect`,
-`ui_screenshot`, pointer and menu/dialog control, so a session can look at the
-real window (including on the Mac), and the commands that need a window become
-runnable there.
+The same tools can drive the **running desktop app** instead of a headless
+document, so a session can look at the real window (on the Mac too) and
+operate it. Design and threat model: [ADR 0015](adr/0015-mcp-bridge.md).
+
+**It is off unless you turn it on.** Without the flag nothing listens and no
+file is written.
+
+### Enable it
+
+```sh
+aurora-app --mcp-bridge --mcp-bridge-read-root ~/Pictures/work --mcp-bridge-write-root ~/Pictures/work/out    # or AURORA_MCP_BRIDGE=1
+```
+
+| Option | Meaning |
+|---|---|
+| `--mcp-bridge` | Turn the bridge on (also `AURORA_MCP_BRIDGE=1`). |
+| `--mcp-bridge-read-root DIR` | A directory the file tools may read from (repeatable; also `AURORA_MCP_BRIDGE_ROOTS`, a path list). `--mcp-bridge-root DIR` is the same thing: **read-only**. None = `doc_open` is refused. |
+| `--mcp-bridge-write-root DIR` | A directory `doc_save` may create NEW files in (repeatable; also `AURORA_MCP_BRIDGE_WRITE_ROOTS`). Writing is never granted by a read root. None = `doc_save` is refused. |
+| `--mcp-bridge-max-mpx N` | Largest canvas the bridge opens, previews or exports, in Mpx (default 50). Preview and export run on the UI thread. |
+
+The app listens on `127.0.0.1` only, makes a 256-bit token and writes a
+discovery file (mode `0600`, in a `0700` per-user directory):
+
+| Platform | Default directory |
+|---|---|
+| Linux | `$XDG_RUNTIME_DIR/aurora`, else `<temp>/aurora-bridge-<uid>` |
+| macOS | `$TMPDIR/aurora-bridge-<uid>` (`$TMPDIR` is per-user) |
+| Windows | `%LOCALAPPDATA%\Aurora\bridge` |
+
+`AURORA_BRIDGE_DIR` overrides it (for both the app and the proxy).
+
+### Connect
+
+```json
+{
+  "mcpServers": {
+    "aurora-live": {
+      "command": "/path/to/aurora-cli",
+      "args": ["mcp", "--bridge", "--read-root", "/Users/me/Pictures/work", "--write-root", "/Users/me/Pictures/work"]
+    }
+  }
+}
+```
+
+`--discovery FILE` names a specific discovery file; the default is the newest
+live app in the directory above. Give the proxy roots that lie **inside**
+the app's read and write roots respectively: the app enforces its own roots again, and a path outside
+them is refused there. A relative path means the first root of its kind in the
+proxy; the app is always sent an absolute path.
+
+On a Mac and a Linux machine the config is the same apart from paths; start
+`aurora-app` on the machine whose window you want to see, and run the proxy
+as the same user.
+
+### Tools in bridge mode
+
+`command_list`, `command_run`, `command_batch`, `doc_open`, `doc_inspect`,
+`render_preview`, `psd_check`, `doc_save` keep their names, argument
+validation (`-32602` before anything is sent), hints and replies, but act on
+the **live** document and run through the same `activate_command` /
+`run_activated` the palette and menus use. Almost every registry command is
+runnable (`command_list` says `headless: true` for ones this server will send;
+read it as "runnable here"). Never run: `app.quit`, `automation.disconnect`,
+`file.open` / `file.save` (use `doc_open` / `doc_save`) and any command with a
+file-path parameter.
+
+| Tool | Does | readOnly |
+|---|---|---|
+| `ui_inspect` | Widget tree: id, role, name, value, state, bounds in logical window pixels; focus, tool, open dialog / palette / menu. At most 1500 widgets. `include_hidden`. | yes |
+| `ui_screenshot` | PNG of Aurora's own rendered frame (`max_side` 16 to 4096, default 1600), with the physical size and scale factor. Waits for the next drawn frame; an occluded or hidden window times out. | yes |
+| `ui_pointer` | `move`, `click`, `double_click`, `drag` (`to_x`, `to_y`, `steps`), `scroll` (`dx`, `dy` lines), at `x`,`y` (logical window pixels) or the centre of a widget `id`; `button`, `ctrl`/`shift`/`alt`/`meta`. | no |
+| `ui_key` | A key (`Enter`, `Escape`, `z`, `F5`...) with modifiers and/or typed `text` (at most 256 characters), through the real key handler. | no |
+| `ui_menu` | `list` the menus (command ids, labels, hints, enabled) or `activate` an enabled item by command id. | no |
+| `ui_dialog` | `get` the open dialog (title, message, actions with ids) or `choose` an action. The only way to answer a dialog. | no |
+
+`doc_open` replaces nothing destructively: the app opens the file in a new
+document tab. `doc_save` is the usual never-overwrite save; it is an export
+and does not mark the live document as saved.
+
+### Safety rules
+
+* **A person is told.** While a controller is connected the window title ends
+  with "[automation connected]" and the status bar ends with "Automation
+  connected". The palette command **Disconnect Automation** closes it and
+  turns the bridge off until Aurora is restarted.
+* **A controller can never quit Aurora.** Whatever a tool does while a
+  request is running is synthetic input, and quitting is refused at its one
+  central place (`request_quit`) for it: the File > Quit Aurora menu item
+  (clicked with `ui_pointer` or driven with `ui_key`), the Quit command, any
+  key chord and a window-close request all end with a calm status-bar notice
+  and nothing else. The same gate refuses switching the bridge off
+  (`automation.disconnect` is the person's lever) and any native file dialog
+  (it would block the UI thread until a person answered; use `doc_open` /
+  `doc_save`). A real user's own quit, close or Disconnect works normally
+  while a controller is connected: only a request's own input is gated.
+* **A controller can never discard work.** `ui_dialog` may
+  acknowledge a report and **cancel** a question, but it may not choose
+  Save, Don't Save, Quit, Replace or Save Anyway in the unsaved-changes,
+  quit, workspace-replace and lossy-PSD dialogs; those need a person
+  (the table is in ADR 0015). `file.close` and a window-close shortcut can
+  *open* the close dialog; the reply says so and the controller can only
+  cancel it. A click or key that opens a dialog stops the rest of that call.
+* **A modal dialog blocks everything** but reads (`doc_inspect`,
+  `ui_inspect`, `ui_screenshot`, `render_preview`, `psd_check`,
+  `command_list`) and `ui_dialog`. That includes the unsaved-changes
+  questions: they are answered only with `ui_dialog`, visibly. With the
+  command palette open, commands and file tools are refused (drive the
+  palette with `ui_key`). The tools can start a close, but quitting is not a
+  tool and the close dialogs are the normal review.
+* One controller at a time; one request at a time per connection; 16 requests
+  can wait for the UI thread; burst 32 / 20 per second per connection; a
+  request line is at most 1 MiB; a controller silent for 5 minutes is dropped
+  (the proxy reconnects). Read-only calls are retried once on a fresh
+  connection; anything that changes state is never resent after a transport
+  failure (the error says it may have completed).
+* Five failed handshakes lock new connections out for 1 s, doubling to 60 s.
+  Only a well-formed handshake with a wrong token counts; HTTP requests (a
+  web page), binary junk, a TLS hello and any other first line are refused
+  or dropped and never count.
+* Every tool call is logged at `info` (method only, no pixel data).
+
+### What is not protected
+
+Any process running as the same user can read the discovery file and use the
+bridge: that is the design (ADR 0015). The commands that touch the document
+are exactly those a person at the window could run. Windows file permissions
+are not verified by code; Windows and macOS are untested. The app does not
+compare a stale discovery file's port with a live process beyond its lock, so
+an unrelated process that reuses a dead app's port would only ever receive a
+token that no longer works.
+
+### Limits and gaps
+
+* Preview, `doc_save` and `psd_check` composite on the **UI thread** (the
+  window pauses for as long as the same action does for a person); the UI
+  thread never waits on the socket.
+* Cancellation (`notifications/cancelled`) is not forwarded to the app; a
+  request the app has started runs to the end, and a call that gets no reply
+  in 60 s says it may still apply.
+* `ui_pointer` coordinates are logical window pixels; a screenshot's pixels are
+  physical (`scale_factor` is returned).
+* A screenshot needs a surface that can be read back (not every GPU/driver);
+  `bridge.status` / the error say when it cannot.
+* No progress notifications; `doc_save` is not interruptible.
+* Not run in CI: the live-window handlers are exercised by
+  `scripts/mcp_bridge_smoke.sh` (needs Xvfb or a display).

@@ -188,8 +188,21 @@ fn kind_name(kind: &LayerKind) -> &'static str {
     }
 }
 
+/// The parts of a document `inspect` describes: the headless session's
+/// own and, over the bridge (task 160), the live app's.
+pub(crate) struct InspectView<'a> {
+    pub name: &'a str,
+    pub format: &'a str,
+    pub layers: &'a aurora_doc::LayerTree,
+    pub active: Option<LayerId>,
+    pub canvas: (u32, u32),
+    pub undo_order: &'a mut UndoOrder,
+    pub selection: &'a aurora_doc::SelectionSet,
+    pub notes: &'a [String],
+}
+
 fn node_json(
-    doc: &Doc,
+    doc: &InspectView<'_>,
     id: LayerId,
     depth: usize,
     count: &mut usize,
@@ -261,6 +274,44 @@ fn report_json(name: &str, report: &aurora_io::PsdWriteReport) -> Value {
         "message": crate::psd_report::check_message(name, report),
         "verified_in_photoshop": false,
     })
+}
+
+/// The document as JSON (layer tree, history, selection, canvas size).
+#[allow(clippy::needless_pass_by_value)] // a bundle of borrows
+pub(crate) fn inspect_json(view: InspectView<'_>) -> Value {
+    view.undo_order.sync_labels();
+    let mut count = 0;
+    let mut truncated = false;
+    let tree: Vec<Value> = view
+        .layers
+        .roots()
+        .iter()
+        .filter_map(|&id| node_json(&view, id, 0, &mut count, &mut truncated))
+        .collect();
+    let mut redo: Vec<&String> = view.undo_order.redo_labels.iter().collect();
+    redo.reverse();
+    json!({"document": {
+        "name": view.name,
+        "format": view.format,
+        "canvas": {"width": view.canvas.0, "height": view.canvas.1},
+        "layer_count": view.layers.len(),
+        "layers": tree,
+        "layers_truncated": truncated,
+        "active_layer": view.active.map(LayerId::to_raw),
+        "history": {
+            "origin": view.undo_order.origin,
+            "steps": view.undo_order.undo_labels,
+            "undone": redo,
+            "can_undo": !view.undo_order.undo.is_empty(),
+            "can_redo": !view.undo_order.redo.is_empty(),
+        },
+        "selection": {
+            "active": view.selection.active().as_ref().map(selection_json),
+            "saved": view.selection.saved_sorted().iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        },
+        "paths": view.selection.paths().len(),
+        "notes": view.notes,
+    }})
 }
 
 impl HeadlessSession {
@@ -456,7 +507,7 @@ impl HeadlessSession {
 
     /// A `.aur` is a zip, so the server cannot read its header; its manifest
     /// states the canvas size, read here before any tile is decoded.
-    fn check_aur_header(staged: &Path, max_pixels: u64) -> Result<(), Failure> {
+    pub(crate) fn check_aur_header(staged: &Path, max_pixels: u64) -> Result<(), Failure> {
         use std::io::Read as _;
         let Ok(mut file) = std::fs::File::open(staged) else {
             return Ok(());
@@ -488,39 +539,16 @@ impl HeadlessSession {
         let Some(doc) = self.doc.as_mut() else {
             return Ok(json!({"document": null}));
         };
-        doc.undo_order.sync_labels();
-        let mut count = 0;
-        let mut truncated = false;
-        let tree: Vec<Value> = doc
-            .layers
-            .roots()
-            .iter()
-            .filter_map(|&id| node_json(doc, id, 0, &mut count, &mut truncated))
-            .collect();
-        let mut redo: Vec<&String> = doc.undo_order.redo_labels.iter().collect();
-        redo.reverse();
-        Ok(json!({"document": {
-            "name": doc.name,
-            "format": doc.format,
-            "canvas": {"width": doc.canvas.0, "height": doc.canvas.1},
-            "layer_count": doc.layers.len(),
-            "layers": tree,
-            "layers_truncated": truncated,
-            "active_layer": doc.active.map(LayerId::to_raw),
-            "history": {
-                "origin": doc.undo_order.origin,
-                "steps": doc.undo_order.undo_labels,
-                "undone": redo,
-                "can_undo": !doc.undo_order.undo.is_empty(),
-                "can_redo": !doc.undo_order.redo.is_empty(),
-            },
-            "selection": {
-                "active": doc.selection.active().as_ref().map(selection_json),
-                "saved": doc.selection.saved_sorted().iter().map(|(n, _)| *n).collect::<Vec<_>>(),
-            },
-            "paths": doc.selection.paths().len(),
-            "notes": doc.notes,
-        }}))
+        Ok(inspect_json(InspectView {
+            name: &doc.name,
+            format: doc.format,
+            layers: &doc.layers,
+            active: doc.active,
+            canvas: doc.canvas,
+            undo_order: &mut doc.undo_order,
+            selection: &doc.selection,
+            notes: &doc.notes,
+        }))
     }
 
     /// The facts the registry's enabled checks need.
@@ -733,51 +761,6 @@ impl HeadlessSession {
         Ok(json!({"changed": applied}))
     }
 
-    /// Composites the whole document on the CPU, one tile at a time, polling
-    /// `cancelled` and reporting a fraction.
-    fn composite(
-        doc: &mut Doc,
-        max_pixels: u64,
-        cancelled: &dyn Fn() -> bool,
-        progress: &mut dyn FnMut(f64),
-    ) -> Result<aurora_io::Image, Failure> {
-        let (width, height) = doc.canvas;
-        if u64::from(width) * u64::from(height) > max_pixels {
-            return Err(Failure::Refused(format!(
-                "the document is {width} x {height} px; this server composites at most \
-                 {max_pixels} pixels"
-            )));
-        }
-        let mut samples = vec![
-            half::f16::from_f32(0.0);
-            width as usize * height as usize * aurora_tile::CHANNELS
-        ];
-        let tiles = crate::headless::document_tiles(width, height);
-        let total = tiles.len().max(1);
-        let mut budget = crate::CompositeBudget::for_pass(&doc.layers);
-        for (index, tile_id) in tiles.into_iter().enumerate() {
-            if cancelled() {
-                return Err(Failure::Cancelled);
-            }
-            budget.next_tile(&doc.layers);
-            let (texels, _) = crate::composite_roots_into_tile(
-                &doc.layers,
-                &mut doc.store,
-                tile_id,
-                crate::composite_tile_doc_origin((0, 0), tile_id),
-                (0, 0),
-                &mut budget,
-            );
-            crate::headless::place_tile(&mut samples, (width, height), tile_id, &texels);
-            progress((index + 1) as f64 / total as f64);
-        }
-        if let Some((skipped, _)) = budget.store_error() {
-            return Err(failed(format!("{skipped} source tiles could not be read")));
-        }
-        aurora_io::Image::new(width, height, aurora_color::IccProfile::srgb(), samples)
-            .map_err(failed)
-    }
-
     /// A flattened preview no larger than `max_side`.
     ///
     /// # Errors
@@ -797,33 +780,15 @@ impl HeadlessSession {
         {
             return Ok(cache.image.clone());
         }
-        let image = Self::composite(doc, max_pixels, cancelled, &mut |_| {})?;
-        let (w, h) = (image.width(), image.height());
-        let scale = f64::from(max_side) / f64::from(w.max(h).max(1));
-        let (tw, th) = if scale >= 1.0 {
-            (w, h)
-        } else {
-            (
-                ((f64::from(w) * scale).round() as u32).max(1),
-                ((f64::from(h) * scale).round() as u32).max(1),
-            )
-        };
-        let small = if (tw, th) == (w, h) {
-            image
-        } else {
-            box_downscale(&image, tw, th).map_err(failed)?
-        };
-        let small = match crate::colour_app::export_image(small, None) {
-            Ok(image) | Err(image) => image,
-        };
-        let png = aurora_io::png::encode(&small).map_err(failed)?;
-        let preview = PreviewImage {
-            png,
-            width: tw,
-            height: th,
-            document_width: w,
-            document_height: h,
-        };
+        let image = composite_document_cpu(
+            &doc.layers,
+            &mut doc.store,
+            doc.canvas,
+            max_pixels,
+            cancelled,
+            &mut |_| {},
+        )?;
+        let preview = preview_from_image(image, max_side)?;
         self.preview_cache = Some(PreviewCache {
             document: doc.id,
             revision: doc.undo_order.revision,
@@ -875,7 +840,6 @@ impl HeadlessSession {
         Ok(result)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn export_inner(
         &mut self,
         kind: ExportKind,
@@ -887,95 +851,27 @@ impl HeadlessSession {
         let max_pixels = self.limits.max_pixels;
         let max_bytes = self.limits.max_export_bytes;
         let doc = self.doc_mut()?;
-        match kind {
-            ExportKind::Png | ExportKind::Jpeg | ExportKind::Tiff => {
-                let image =
-                    Self::composite(doc, max_pixels, cancelled, &mut |f| progress(f * 0.8))?;
-                let image = match crate::colour_app::export_image(image, None) {
-                    Ok(image) | Err(image) => image,
-                };
-                let bytes = aurora_io::encode_by_extension(out, &image).map_err(failed)?;
-                if bytes.len() as u64 > max_bytes {
-                    return Err(Failure::Refused(format!(
-                        "the encoded image is {} MiB; the limit is {} MiB",
-                        bytes.len() >> 20,
-                        max_bytes >> 20
-                    )));
-                }
-                if cancelled() {
-                    return Err(Failure::Cancelled);
-                }
-                progress(0.9);
-                crate::export_save::write_export_verified(
-                    out,
-                    &bytes,
-                    image.width(),
-                    image.height(),
-                )
-                .map_err(failed)?;
-                progress(1.0);
-                Ok(ExportResult::Written(json!({"lossless": false})))
-            }
-            ExportKind::Aur => {
-                progress(0.1);
-                let source = crate::aur_save::AurSaveSource {
-                    layers: &doc.layers,
-                    history: &doc.history,
-                    canvas_size: doc.canvas,
-                    skipped_tiles: &doc.skipped,
-                    import_losses: (!doc.import_losses.is_empty())
-                        .then_some(doc.import_losses.as_slice()),
-                    selection: &doc.selection,
-                    colour: &doc.colour,
-                };
-                crate::aur_save::save_aur_document(out, &source, &mut doc.store).map_err(failed)?;
-                progress(1.0);
-                Ok(ExportResult::Written(json!({"lossless": true})))
-            }
-            ExportKind::Psd => {
-                if cancelled() {
-                    return Err(Failure::Cancelled);
-                }
-                progress(0.05);
-                let mut carried =
-                    crate::psd_save::carried_losses(Some(&doc.import_losses), &doc.skipped);
-                carried.extend(crate::psd_save::paths_loss_entry(&doc.selection));
-                carried.extend(crate::psd_save::colour_loss_entries(&doc.colour));
-                let name = doc.name.clone();
-                let source = crate::psd_save::PsdSaveSource {
-                    saved: doc.selection.saved_sorted(),
-                    layers: &doc.layers,
-                    canvas: doc.canvas,
-                    store: &mut doc.store,
-                    doc_id: doc.id,
-                    revision: crate::UndoRevision::default(),
-                    carried,
-                };
-                let step = crate::psd_save::begin_psd_save(source, out).map_err(|e| match e {
-                    crate::psd_save::PsdSaveFailure::Refused(reason) => Failure::Refused(reason),
-                    other => failed(format!("{other:?}")),
-                })?;
-                progress(0.95);
-                match step {
-                    crate::psd_save::PsdSaveStep::Saved
-                    | crate::psd_save::PsdSaveStep::SavedNotConfirmed => {
-                        progress(1.0);
-                        Ok(ExportResult::Written(json!({"lossless": true})))
-                    }
-                    crate::psd_save::PsdSaveStep::NeedsConfirmation(pending) => {
-                        let report = report_json(&name, &pending.report);
-                        if accept_losses {
-                            pending.temp.persist().map_err(failed)?;
-                            progress(1.0);
-                            Ok(ExportResult::Written(report))
-                        } else {
-                            // Dropping the pending save deletes its temp file.
-                            Ok(ExportResult::NeedsConfirmation(report))
-                        }
-                    }
-                }
-            }
-        }
+        let losses: &[String] = &doc.import_losses;
+        export_document(
+            ExportParts {
+                name: &doc.name,
+                layers: &doc.layers,
+                history: &doc.history,
+                canvas: doc.canvas,
+                skipped: &doc.skipped,
+                import_losses: (!losses.is_empty()).then_some(losses),
+                selection: &doc.selection,
+                colour: &doc.colour,
+                id: doc.id,
+                store: &mut doc.store,
+            },
+            kind,
+            accept_losses,
+            out,
+            (max_pixels, max_bytes),
+            cancelled,
+            progress,
+        )
     }
 
     /// The grouped report a PSD save would give, writing no file.
@@ -984,28 +880,22 @@ impl HeadlessSession {
     /// No document, a refusal (a canvas over 30,000 px, ...) or a failure.
     pub fn psd_check(&mut self, cancelled: &dyn Fn() -> bool) -> Result<Value, Failure> {
         let doc = self.doc_mut()?;
-        if cancelled() {
-            return Err(Failure::Cancelled);
-        }
-        let mut carried = crate::psd_save::carried_losses(Some(&doc.import_losses), &doc.skipped);
-        carried.extend(crate::psd_save::paths_loss_entry(&doc.selection));
-        carried.extend(crate::psd_save::colour_loss_entries(&doc.colour));
-        let name = doc.name.clone();
-        let source = crate::psd_save::PsdSaveSource {
-            saved: doc.selection.saved_sorted(),
-            layers: &doc.layers,
-            canvas: doc.canvas,
-            store: &mut doc.store,
-            doc_id: doc.id,
-            revision: crate::UndoRevision::default(),
-            carried,
-        };
-        match crate::psd_save::check_psd_compatibility(source) {
-            Ok(report) => Ok(report_json(&name, &report)),
-            Err(failure) => Err(Failure::Refused(
-                crate::psd_save::psd_check_failure_message(&failure),
-            )),
-        }
+        let losses: &[String] = &doc.import_losses;
+        psd_check_document(
+            ExportParts {
+                name: &doc.name,
+                layers: &doc.layers,
+                history: &doc.history,
+                canvas: doc.canvas,
+                skipped: &doc.skipped,
+                import_losses: (!losses.is_empty()).then_some(losses),
+                selection: &doc.selection,
+                colour: &doc.colour,
+                id: doc.id,
+                store: &mut doc.store,
+            },
+            cancelled,
+        )
     }
 
     /// Whether a document is open (for tests).
@@ -1013,6 +903,238 @@ impl HeadlessSession {
     pub fn canvas_size(&self) -> Option<(u32, u32)> {
         self.doc().ok().map(|d| d.canvas)
     }
+}
+
+/// Composites the whole document on the CPU, one tile at a time, polling
+/// `cancelled` and reporting a fraction.
+pub(crate) fn composite_document_cpu(
+    layers: &aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+    canvas: (u32, u32),
+    max_pixels: u64,
+    cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(f64),
+) -> Result<aurora_io::Image, Failure> {
+    let (width, height) = canvas;
+    if u64::from(width) * u64::from(height) > max_pixels {
+        return Err(Failure::Refused(format!(
+            "the document is {width} x {height} px; this server composites at most \
+             {max_pixels} pixels"
+        )));
+    }
+    let mut samples =
+        vec![half::f16::from_f32(0.0); width as usize * height as usize * aurora_tile::CHANNELS];
+    let tiles = crate::headless::document_tiles(width, height);
+    let total = tiles.len().max(1);
+    let mut budget = crate::CompositeBudget::for_pass(layers);
+    for (index, tile_id) in tiles.into_iter().enumerate() {
+        if cancelled() {
+            return Err(Failure::Cancelled);
+        }
+        budget.next_tile(layers);
+        let (texels, _) = crate::composite_roots_into_tile(
+            layers,
+            store,
+            tile_id,
+            crate::composite_tile_doc_origin((0, 0), tile_id),
+            (0, 0),
+            &mut budget,
+        );
+        crate::headless::place_tile(&mut samples, (width, height), tile_id, &texels);
+        progress((index + 1) as f64 / total as f64);
+    }
+    if let Some((skipped, _)) = budget.store_error() {
+        return Err(failed(format!("{skipped} source tiles could not be read")));
+    }
+    aurora_io::Image::new(width, height, aurora_color::IccProfile::srgb(), samples).map_err(failed)
+}
+
+/// The parts of a document an export and a PSD check read: the headless
+/// session's own and, over the bridge (task 160), the live app's.
+pub(crate) struct ExportParts<'a> {
+    pub name: &'a str,
+    pub layers: &'a aurora_doc::LayerTree,
+    pub history: &'a aurora_doc::History,
+    pub canvas: (u32, u32),
+    pub skipped: &'a aurora_io::SkippedTiles,
+    pub import_losses: Option<&'a [String]>,
+    pub selection: &'a aurora_doc::SelectionSet,
+    pub colour: &'a aurora_io::DocumentColour,
+    pub id: crate::document_session::DocumentId,
+    pub store: &'a mut aurora_tile::TileStore,
+}
+
+fn carried_for(parts: &ExportParts<'_>) -> Vec<aurora_io::ReportEntry> {
+    let mut carried = crate::psd_save::carried_losses(parts.import_losses, parts.skipped);
+    carried.extend(crate::psd_save::paths_loss_entry(parts.selection));
+    carried.extend(crate::psd_save::colour_loss_entries(parts.colour));
+    carried
+}
+
+/// The grouped report a PSD save would give, writing no file.
+///
+/// # Errors
+/// A refusal (a canvas over 30,000 px, ...) or a cancel.
+#[allow(clippy::needless_pass_by_value)] // a bundle of borrows
+pub(crate) fn psd_check_document(
+    parts: ExportParts<'_>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Value, Failure> {
+    if cancelled() {
+        return Err(Failure::Cancelled);
+    }
+    let carried = carried_for(&parts);
+    let source = crate::psd_save::PsdSaveSource {
+        saved: parts.selection.saved_sorted(),
+        layers: parts.layers,
+        canvas: parts.canvas,
+        store: parts.store,
+        doc_id: parts.id,
+        revision: crate::UndoRevision::default(),
+        carried,
+    };
+    match crate::psd_save::check_psd_compatibility(source) {
+        Ok(report) => Ok(report_json(parts.name, &report)),
+        Err(failure) => Err(Failure::Refused(
+            crate::psd_save::psd_check_failure_message(&failure),
+        )),
+    }
+}
+
+/// Writes the document to `out`, a fresh private path.
+///
+/// # Errors
+/// A refusal, a failure or a cancel.
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+pub(crate) fn export_document(
+    parts: ExportParts<'_>,
+    kind: ExportKind,
+    accept_losses: bool,
+    out: &Path,
+    (max_pixels, max_bytes): (u64, u64),
+    cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(f64),
+) -> Result<ExportResult, Failure> {
+    match kind {
+        ExportKind::Png | ExportKind::Jpeg | ExportKind::Tiff => {
+            let image = composite_document_cpu(
+                parts.layers,
+                parts.store,
+                parts.canvas,
+                max_pixels,
+                cancelled,
+                &mut |f| progress(f * 0.8),
+            )?;
+            let image = match crate::colour_app::export_image(image, None) {
+                Ok(image) | Err(image) => image,
+            };
+            let bytes = aurora_io::encode_by_extension(out, &image).map_err(failed)?;
+            if bytes.len() as u64 > max_bytes {
+                return Err(Failure::Refused(format!(
+                    "the encoded image is {} MiB; the limit is {} MiB",
+                    bytes.len() >> 20,
+                    max_bytes >> 20
+                )));
+            }
+            if cancelled() {
+                return Err(Failure::Cancelled);
+            }
+            progress(0.9);
+            crate::export_save::write_export_verified(out, &bytes, image.width(), image.height())
+                .map_err(failed)?;
+            progress(1.0);
+            Ok(ExportResult::Written(json!({"lossless": false})))
+        }
+        ExportKind::Aur => {
+            progress(0.1);
+            let source = crate::aur_save::AurSaveSource {
+                layers: parts.layers,
+                history: parts.history,
+                canvas_size: parts.canvas,
+                skipped_tiles: parts.skipped,
+                import_losses: parts.import_losses,
+                selection: parts.selection,
+                colour: parts.colour,
+            };
+            crate::aur_save::save_aur_document(out, &source, parts.store).map_err(failed)?;
+            progress(1.0);
+            Ok(ExportResult::Written(json!({"lossless": true})))
+        }
+        ExportKind::Psd => {
+            if cancelled() {
+                return Err(Failure::Cancelled);
+            }
+            progress(0.05);
+            let carried = carried_for(&parts);
+            let name = parts.name.to_owned();
+            let source = crate::psd_save::PsdSaveSource {
+                saved: parts.selection.saved_sorted(),
+                layers: parts.layers,
+                canvas: parts.canvas,
+                store: parts.store,
+                doc_id: parts.id,
+                revision: crate::UndoRevision::default(),
+                carried,
+            };
+            let step = crate::psd_save::begin_psd_save(source, out).map_err(|e| match e {
+                crate::psd_save::PsdSaveFailure::Refused(reason) => Failure::Refused(reason),
+                other => failed(format!("{other:?}")),
+            })?;
+            progress(0.95);
+            match step {
+                crate::psd_save::PsdSaveStep::Saved
+                | crate::psd_save::PsdSaveStep::SavedNotConfirmed => {
+                    progress(1.0);
+                    Ok(ExportResult::Written(json!({"lossless": true})))
+                }
+                crate::psd_save::PsdSaveStep::NeedsConfirmation(pending) => {
+                    let report = report_json(&name, &pending.report);
+                    if accept_losses {
+                        pending.temp.persist().map_err(failed)?;
+                        progress(1.0);
+                        Ok(ExportResult::Written(report))
+                    } else {
+                        // Dropping the pending save deletes its temp file.
+                        Ok(ExportResult::NeedsConfirmation(report))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Scales a composited image to `max_side` and encodes it as a PNG.
+#[allow(clippy::cast_sign_loss)] // a positive scale of positive sides
+pub(crate) fn preview_from_image(
+    image: aurora_io::Image,
+    max_side: u32,
+) -> Result<PreviewImage, Failure> {
+    let (w, h) = (image.width(), image.height());
+    let scale = f64::from(max_side) / f64::from(w.max(h).max(1));
+    let (tw, th) = if scale >= 1.0 {
+        (w, h)
+    } else {
+        (
+            ((f64::from(w) * scale).round() as u32).max(1),
+            ((f64::from(h) * scale).round() as u32).max(1),
+        )
+    };
+    let small = if (tw, th) == (w, h) {
+        image
+    } else {
+        box_downscale(&image, tw, th).map_err(failed)?
+    };
+    let small = match crate::colour_app::export_image(small, None) {
+        Ok(image) | Err(image) => image,
+    };
+    let png = aurora_io::png::encode(&small).map_err(failed)?;
+    Ok(PreviewImage {
+        png,
+        width: tw,
+        height: th,
+        document_width: w,
+        document_height: h,
+    })
 }
 
 /// An alpha-weighted box average to `tw` x `th`.
