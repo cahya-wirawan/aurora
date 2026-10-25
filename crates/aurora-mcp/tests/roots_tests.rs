@@ -17,8 +17,14 @@ fn roots(read: &std::path::Path, write: &std::path::Path) -> Roots {
 fn nothing_is_granted_by_default() {
     let roots = Roots::none();
     assert_eq!(roots.open_read("a", 10).unwrap_err(), PathError::NoReadRoot);
-    assert_eq!(roots.check_write("a.png").unwrap_err(), PathError::NoWriteRoot);
-    assert_eq!(roots.create_write("a.png").unwrap_err(), PathError::NoWriteRoot);
+    assert_eq!(
+        roots.check_write("a.png").unwrap_err(),
+        PathError::NoWriteRoot
+    );
+    assert_eq!(
+        roots.create_write("a.png").unwrap_err(),
+        PathError::NoWriteRoot
+    );
     assert!(!roots.can_read() && !roots.can_write());
 }
 
@@ -27,8 +33,16 @@ fn parent_components_are_refused_before_the_file_system() {
     let d = tempfile::tempdir().unwrap();
     let roots = roots(d.path(), d.path());
     for p in ["..", "../x", "a/../b", "a/..", "./../x"] {
-        assert_eq!(roots.open_read(p, 10).unwrap_err(), PathError::ParentComponent, "{p}");
-        assert_eq!(roots.check_write(p).unwrap_err(), PathError::ParentComponent, "{p}");
+        assert_eq!(
+            roots.open_read(p, 10).unwrap_err(),
+            PathError::ParentComponent,
+            "{p}"
+        );
+        assert_eq!(
+            roots.check_write(p).unwrap_err(),
+            PathError::ParentComponent,
+            "{p}"
+        );
     }
 }
 
@@ -40,7 +54,10 @@ fn an_absolute_path_must_lie_inside_the_root() {
     std::fs::write(other.path().join("f"), b"no").unwrap();
     let roots = roots(d.path(), d.path());
     let inside = d.path().canonicalize().unwrap().join("f");
-    assert_eq!(roots.open_read(inside.to_str().unwrap(), 10).unwrap().len, 2);
+    assert_eq!(
+        roots.open_read(inside.to_str().unwrap(), 10).unwrap().len,
+        2
+    );
     let outside = other.path().join("f");
     assert!(matches!(
         roots.open_read(outside.to_str().unwrap(), 10).unwrap_err(),
@@ -48,7 +65,10 @@ fn an_absolute_path_must_lie_inside_the_root() {
     ));
     // a sibling whose name merely starts with the root's name
     let sibling = format!("{}x/f", d.path().display());
-    assert!(matches!(roots.open_read(&sibling, 10).unwrap_err(), PathError::Outside(_)));
+    assert!(matches!(
+        roots.open_read(&sibling, 10).unwrap_err(),
+        PathError::Outside(_)
+    ));
 }
 
 #[test]
@@ -56,8 +76,14 @@ fn text_checks() {
     let d = tempfile::tempdir().unwrap();
     let roots = roots(d.path(), d.path());
     assert_eq!(roots.open_read("", 10).unwrap_err(), PathError::Empty);
-    assert_eq!(roots.open_read("a\u{0}", 10).unwrap_err(), PathError::ControlCharacter);
-    assert_eq!(roots.open_read(&"a".repeat(5000), 10).unwrap_err(), PathError::TooLong);
+    assert_eq!(
+        roots.open_read("a\u{0}", 10).unwrap_err(),
+        PathError::ControlCharacter
+    );
+    assert_eq!(
+        roots.open_read(&"a".repeat(5000), 10).unwrap_err(),
+        PathError::TooLong
+    );
     assert_eq!(roots.open_read(".", 10).unwrap_err(), PathError::NoFileName);
 }
 
@@ -72,10 +98,22 @@ fn symlinks_may_not_lead_out_of_a_root() {
     symlink(out.path(), d.path().join("dir_link")).unwrap();
     symlink("../../..", d.path().join("up")).unwrap();
     let roots = roots(d.path(), d.path());
-    assert_eq!(roots.open_read("file_link", 100).unwrap_err(), PathError::Escapes);
-    assert_eq!(roots.open_read("dir_link/s", 100).unwrap_err(), PathError::Escapes);
-    assert_eq!(roots.open_read("up/etc/passwd", 100).unwrap_err(), PathError::Escapes);
-    assert_eq!(roots.create_write("dir_link/new").unwrap_err(), PathError::Escapes);
+    assert_eq!(
+        roots.open_read("file_link", 100).unwrap_err(),
+        PathError::Escapes
+    );
+    assert_eq!(
+        roots.open_read("dir_link/s", 100).unwrap_err(),
+        PathError::Escapes
+    );
+    assert_eq!(
+        roots.open_read("up/etc/passwd", 100).unwrap_err(),
+        PathError::Escapes
+    );
+    assert_eq!(
+        roots.create_write("dir_link/new").unwrap_err(),
+        PathError::Escapes
+    );
     assert!(!out.path().join("new").exists());
 }
 
@@ -85,10 +123,19 @@ fn create_write_is_exclusive_and_cleans_up_when_dropped() {
     let roots = roots(d.path(), d.path());
     let mut target = roots.create_write("new.bin").unwrap();
     assert!(target.file().is_some());
-    assert!(matches!(roots.create_write("new.bin").unwrap_err(), PathError::Exists(_)));
-    assert!(matches!(roots.check_write("new.bin").unwrap_err(), PathError::Exists(_)));
+    assert!(matches!(
+        roots.create_write("new.bin").unwrap_err(),
+        PathError::Exists(_)
+    ));
+    assert!(matches!(
+        roots.check_write("new.bin").unwrap_err(),
+        PathError::Exists(_)
+    ));
     drop(target);
-    assert!(!d.path().join("new.bin").exists(), "an uncommitted file is removed");
+    assert!(
+        !d.path().join("new.bin").exists(),
+        "an uncommitted file is removed"
+    );
     let target = roots.create_write("kept.bin").unwrap();
     target.commit();
     assert!(d.path().join("kept.bin").exists());
@@ -105,7 +152,13 @@ fn only_regular_files_within_the_limit_open() {
         roots.open_read("sub/f", 4).unwrap_err(),
         PathError::TooLarge { size: 5, max: 4 }
     ));
-    assert!(matches!(roots.open_read("sub/none", 10).unwrap_err(), PathError::NotFound(_)));
+    assert!(matches!(
+        roots.open_read("sub/none", 10).unwrap_err(),
+        PathError::NotFound(_)
+    ));
     assert_eq!(roots.open_read("sub/f", 5).unwrap().name, "f");
-    assert!(matches!(roots.create_write("nodir/x").unwrap_err(), PathError::NoFolder(_)));
+    assert!(matches!(
+        roots.create_write("nodir/x").unwrap_err(),
+        PathError::NoFolder(_)
+    ));
 }

@@ -55,8 +55,7 @@ pub(crate) async fn bounded_line<R: AsyncRead + Unpin>(
 }
 
 fn into_text(bytes: Vec<u8>) -> std::io::Result<String> {
-    String::from_utf8(bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// A JSON-RPC parse error reply (`-32700`, `id: null`).

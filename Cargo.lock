@@ -512,6 +512,8 @@ dependencies = [
  "aurora-text",
  "aurora-tile",
  "aurora-vector",
+ "base64",
+ "png 0.17.16",
  "serde_json",
  "tempfile",
  "tokio",

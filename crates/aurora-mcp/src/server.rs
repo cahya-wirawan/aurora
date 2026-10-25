@@ -372,10 +372,9 @@ impl AuroraMcp {
                     .create_new(true)
                     .open(&staged.0)
                     .map_err(|e| SessionError::Failed(format!("scratch file: {e}")))?;
-                let completed = copy_bounded(&mut read.file, &mut out, max, |_| {
-                    !cancel.is_cancelled()
-                })
-                .map_err(|e| SessionError::Failed(format!("reading {}: {e}", read.name)))?;
+                let completed =
+                    copy_bounded(&mut read.file, &mut out, max, |_| !cancel.is_cancelled())
+                        .map_err(|e| SessionError::Failed(format!("reading {}: {e}", read.name)))?;
                 if !completed {
                     return Err(SessionError::Cancelled);
                 }
@@ -925,7 +924,10 @@ impl ServerHandler for AuroraMcp {
         // An argument the tool does not declare is an error before anything
         // runs, whatever the schema's own deserialiser would do with it.
         if let Some(tool) = self.tool_router.get(&request.name) {
-            let properties = tool.input_schema.get("properties").and_then(Value::as_object);
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object);
             if let Some(args) = &request.arguments
                 && let Some(key) = args
                     .keys()
@@ -992,7 +994,9 @@ impl ServerHandler for AuroraMcp {
 /// Parses `arguments` as `tool` will, so a mistake is a `-32602` before
 /// anything runs.
 fn check_arguments(tool: &str, arguments: Option<Map<String, Value>>) -> Result<(), String> {
-    fn parse<T: serde::de::DeserializeOwned>(arguments: Option<Map<String, Value>>) -> Result<(), String> {
+    fn parse<T: serde::de::DeserializeOwned>(
+        arguments: Option<Map<String, Value>>,
+    ) -> Result<(), String> {
         serde_json::from_value::<T>(Value::Object(arguments.unwrap_or_default()))
             .map(|_| ())
             .map_err(|e| e.to_string())

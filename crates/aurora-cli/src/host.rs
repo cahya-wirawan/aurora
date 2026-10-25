@@ -7,9 +7,7 @@ use std::path::Path;
 
 use aurora_app::mcp_session::{ExportKind, ExportResult, Failure, HeadlessSession};
 use aurora_commands::{CommandContext, Validated};
-use aurora_mcp::{
-    Cancel, ExportFormat, ExportOutcome, Preview, Session, SessionError,
-};
+use aurora_mcp::{Cancel, ExportFormat, ExportOutcome, Preview, Session, SessionError};
 use serde_json::Value;
 
 /// The host `aurora-cli mcp` serves.
@@ -92,7 +90,13 @@ impl Session for AppHost {
         };
         match self
             .0
-            .export(kind, accept_losses, out, &|| cancel.is_cancelled(), progress)
+            .export(
+                kind,
+                accept_losses,
+                out,
+                &|| cancel.is_cancelled(),
+                progress,
+            )
             .map_err(error)?
         {
             ExportResult::Written(report) => Ok(ExportOutcome::Written { report }),

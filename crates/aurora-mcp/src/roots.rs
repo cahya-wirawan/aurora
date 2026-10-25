@@ -231,9 +231,8 @@ impl Roots {
             paths
                 .iter()
                 .map(|p| {
-                    Root::open(p).map_err(|e| {
-                        io::Error::new(e.kind(), format!("root {}: {e}", p.display()))
-                    })
+                    Root::open(p)
+                        .map_err(|e| io::Error::new(e.kind(), format!("root {}: {e}", p.display())))
                 })
                 .collect()
         };
@@ -324,11 +323,7 @@ impl Roots {
         })
     }
 
-    fn parent_and_name(
-        root: &Root,
-        rel: &Path,
-        user: &str,
-    ) -> Result<(Dir, OsString), PathError> {
+    fn parent_and_name(root: &Root, rel: &Path, user: &str) -> Result<(Dir, OsString), PathError> {
         let name = rel.file_name().ok_or(PathError::NoFileName)?.to_owned();
         let folder = rel.parent().unwrap_or_else(|| Path::new(""));
         let parent = if folder.as_os_str().is_empty() {

@@ -592,9 +592,9 @@ mod frame_cost_tests;
 mod frame_trace;
 #[doc(hidden)]
 pub mod headless;
-pub mod mcp_session;
 mod lasso_tools;
 mod layer_thumbnails;
+pub mod mcp_session;
 mod menu_bar_app;
 mod menu_bar_state;
 mod menu_model;

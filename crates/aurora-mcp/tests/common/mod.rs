@@ -56,7 +56,11 @@ impl Mock {
 impl Session for Mock {
     fn open(&mut self, staged: &Path, name: &str, _: &Cancel) -> Result<Value, SessionError> {
         let bytes = std::fs::read(staged).map_err(|e| SessionError::Failed(e.to_string()))?;
-        self.seen.opened.lock().unwrap().push((name.to_owned(), bytes));
+        self.seen
+            .opened
+            .lock()
+            .unwrap()
+            .push((name.to_owned(), bytes));
         self.document = true;
         Ok(json!({"name": name, "width": 4, "height": 4}))
     }
@@ -74,7 +78,13 @@ impl Session for Mock {
         CommandContext::default()
     }
     fn headless_commands(&self) -> &'static [&'static str] {
-        &["layer.new", "edit.undo", "select.expand", "select.all", "file.check_psd"]
+        &[
+            "layer.new",
+            "edit.undo",
+            "select.expand",
+            "select.all",
+            "file.check_psd",
+        ]
     }
     fn run_command(&mut self, call: &Validated) -> Result<Value, SessionError> {
         self.seen.commands.lock().unwrap().push(call.id.clone());
@@ -205,18 +215,20 @@ impl Client {
     pub async fn send_request(&mut self, method: &str, params: Value) -> i64 {
         let id = self.next_id;
         self.next_id += 1;
-        let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
+        let line =
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
         self.send_raw(&line).await;
         id
     }
 
     pub async fn reply(&mut self, id: i64) -> Value {
         loop {
-            let line = tokio::time::timeout(std::time::Duration::from_secs(30), self.lines.next_line())
-                .await
-                .expect("the server did not reply in time")
-                .unwrap()
-                .expect("the server closed the stream");
+            let line =
+                tokio::time::timeout(std::time::Duration::from_secs(30), self.lines.next_line())
+                    .await
+                    .expect("the server did not reply in time")
+                    .unwrap()
+                    .expect("the server closed the stream");
             let value: Value = serde_json::from_str(&line).expect("every output line is JSON");
             assert_eq!(value["jsonrpc"], "2.0", "{value}");
             if value.get("id") == Some(&json!(id)) {
@@ -252,9 +264,15 @@ impl Client {
     /// A tool call that must be a tool error; the message.
     pub async fn tool_error(&mut self, tool: &str, arguments: Value) -> String {
         let reply = self.call(tool, arguments).await;
-        assert!(reply.get("error").is_none(), "expected a tool error: {reply}");
+        assert!(
+            reply.get("error").is_none(),
+            "expected a tool error: {reply}"
+        );
         assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
-        reply["result"]["content"][0]["text"].as_str().unwrap().to_owned()
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     /// A call that must be a JSON-RPC error; the code.

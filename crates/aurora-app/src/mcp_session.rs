@@ -351,7 +351,12 @@ impl HeadlessSession {
                 skipped = document.skipped_tiles;
                 selection = document.selection;
                 colour = document.colour;
-                ("aur", document.layers, document.history, document.canvas_size)
+                (
+                    "aur",
+                    document.layers,
+                    document.history,
+                    document.canvas_size,
+                )
             }
         };
         let active = crate::topmost_pixel_layer(&layers);
@@ -470,10 +475,19 @@ impl HeadlessSession {
                 let bounds = crate::new_layer_bounds(&doc.layers, doc.canvas);
                 let new = doc
                     .history
-                    .add_pixel_layer_at(&mut doc.layers, name, bounds, placement.parent, placement.index)
+                    .add_pixel_layer_at(
+                        &mut doc.layers,
+                        name,
+                        bounds,
+                        placement.parent,
+                        placement.index,
+                    )
                     .map_err(|e| Failure::Refused(format!("New Layer was refused: {e:?}")))?;
-                doc.undo_order
-                    .record(UndoKind::Structural, &mut doc.history, &mut doc.pixel_history);
+                doc.undo_order.record(
+                    UndoKind::Structural,
+                    &mut doc.history,
+                    &mut doc.pixel_history,
+                );
                 doc.active = Some(new);
                 Ok(json!({"changed": true, "layer": new.to_raw(), "label": "New Layer"}))
             }
@@ -490,8 +504,11 @@ impl HeadlessSession {
                         aurora_doc::BlendMode::PassThrough,
                     )
                     .map_err(|e| Failure::Refused(format!("New Group was refused: {e:?}")))?;
-                doc.undo_order
-                    .record(UndoKind::Structural, &mut doc.history, &mut doc.pixel_history);
+                doc.undo_order.record(
+                    UndoKind::Structural,
+                    &mut doc.history,
+                    &mut doc.pixel_history,
+                );
                 doc.active = Some(new);
                 Ok(json!({"changed": true, "layer": new.to_raw(), "label": "New Group"}))
             }
@@ -516,8 +533,11 @@ impl HeadlessSession {
                 doc.history
                     .remove(&mut doc.layers, target)
                     .map_err(|e| Failure::Refused(format!("Delete Layer was refused: {e:?}")))?;
-                doc.undo_order
-                    .record(UndoKind::Structural, &mut doc.history, &mut doc.pixel_history);
+                doc.undo_order.record(
+                    UndoKind::Structural,
+                    &mut doc.history,
+                    &mut doc.pixel_history,
+                );
                 doc.active = position.and_then(|p| crate::layer_at_or_near(&doc.layers, p));
                 Ok(json!({"changed": true, "label": "Delete Layer"}))
             }
@@ -554,7 +574,9 @@ impl HeadlessSession {
 
     fn refine(doc: &mut Doc, call: &Validated) -> Result<Value, Failure> {
         let Some(current) = doc.selection.active() else {
-            return Err(Failure::Refused("there is no selection to modify".to_owned()));
+            return Err(Failure::Refused(
+                "there is no selection to modify".to_owned(),
+            ));
         };
         let (label, result) = match call.id.as_str() {
             "select.feather" => {
@@ -573,7 +595,8 @@ impl HeadlessSession {
                 }
             }
         };
-        let refined = result.map_err(|e| Failure::Refused(format!("{label} was refused: {e:?}")))?;
+        let refined =
+            result.map_err(|e| Failure::Refused(format!("{label} was refused: {e:?}")))?;
         match &refined {
             Some(selection) => doc.selection.select(selection.clone()),
             None => doc.selection.deselect(),
@@ -813,9 +836,9 @@ impl HeadlessSession {
         };
         match crate::psd_save::check_psd_compatibility(source) {
             Ok(report) => Ok(report_json(&name, &report)),
-            Err(failure) => Err(Failure::Refused(crate::psd_save::psd_check_failure_message(
-                &failure,
-            ))),
+            Err(failure) => Err(Failure::Refused(
+                crate::psd_save::psd_check_failure_message(&failure),
+            )),
         }
     }
 
@@ -860,7 +883,11 @@ fn box_downscale(
             }
             let o = (ty * tw_us + tx) * channels;
             if let Some(dst) = out.get_mut(o..o + 4) {
-                let (cr, cg, cb) = if a > 0.0 { (r / a, g / a, b / a) } else { (0.0, 0.0, 0.0) };
+                let (cr, cg, cb) = if a > 0.0 {
+                    (r / a, g / a, b / a)
+                } else {
+                    (0.0, 0.0, 0.0)
+                };
                 let ca = if n > 0.0 { a / n } else { 0.0 };
                 for (slot, v) in dst.iter_mut().zip([cr, cg, cb, ca]) {
                     *slot = half::f16::from_f32(v);
