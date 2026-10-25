@@ -451,6 +451,67 @@ pub(crate) fn policy(
     Ok(())
 }
 
+thread_local! {
+    /// How many bridge jobs are executing on this (the UI) thread right now.
+    /// Everything a job does is **synthetic input**: it goes through the
+    /// same handlers a real event reaches, so the few actions that must stay
+    /// a person's (quitting, switching the bridge off, blocking native file
+    /// dialogs) are refused at their one central place by [`gate`], whichever
+    /// route (menu bar, palette, key chord, command) reached them. A real
+    /// user's input is never inside a job, so it is unaffected even while a
+    /// controller is connected.
+    static SYNTHETIC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks the current thread as running a controller's job for its lifetime.
+pub(crate) struct SyntheticScope;
+
+impl SyntheticScope {
+    pub(crate) fn enter() -> Self {
+        SYNTHETIC_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+        Self
+    }
+}
+
+impl Drop for SyntheticScope {
+    fn drop(&mut self) {
+        SYNTHETIC_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Whether the code running now was driven by a controller's job.
+pub(crate) fn synthetic_input() -> bool {
+    SYNTHETIC_DEPTH.with(|d| d.get() > 0)
+}
+
+/// What a controller's synthetic input may never do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gated {
+    /// Quit Aurora (the menu bar item, a quit request, any exit path).
+    Quit,
+    /// Switch the bridge off (the person's lever).
+    DisconnectAutomation,
+    /// A native file dialog: it blocks the UI thread until a person answers.
+    NativeDialog,
+}
+
+/// The central gate: `Err` with the calm notice text while a controller's job
+/// is running. Quitting, disconnecting and native dialogs call it first.
+pub(crate) fn gate(action: Gated) -> Result<(), &'static str> {
+    if !synthetic_input() {
+        return Ok(());
+    }
+    Err(match action {
+        Gated::Quit => "A controller can't quit Aurora. Quitting is for the person at the window.",
+        Gated::DisconnectAutomation => {
+            "A controller can't switch the bridge off. Use Disconnect Automation in the palette."
+        }
+        Gated::NativeDialog => {
+            "A controller can't open a file dialog. Use doc_open and doc_save with the bridge's roots."
+        }
+    })
+}
+
 /// Ids never run over the bridge: quitting is not a tool.
 pub(crate) const BLOCKED_COMMANDS: &[&str] = &["app.quit", COMMAND_DISCONNECT];
 
@@ -556,6 +617,10 @@ impl App {
     /// Runs one request; `Some` is the finished answer, `None` means the
     /// job was stored to finish on a later turn.
     fn bridge_dispatch(&mut self, job: Job) -> Option<(Job, Result<Value, CallError>)> {
+        // Everything below is a controller's synthetic input: the central
+        // gate ([`gate`]) refuses quit, disconnect and native dialogs until
+        // this scope ends.
+        let _synthetic = SyntheticScope::enter();
         let method = job.request.method.clone();
         let action = job
             .param("action")

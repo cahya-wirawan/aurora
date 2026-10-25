@@ -586,3 +586,129 @@ fn choosing_goes_through_one_validation_that_knows_the_gate() {
         "bad_request"
     );
 }
+
+// ---- a controller can never quit (the central gate) ----
+
+use crate::bridge_app::{Gated, SyntheticScope, gate, synthetic_input};
+
+#[test]
+fn the_gate_refuses_quit_disconnect_and_native_dialogs_only_inside_a_job() {
+    for action in [
+        Gated::Quit,
+        Gated::DisconnectAutomation,
+        Gated::NativeDialog,
+    ] {
+        assert!(
+            gate(action).is_ok(),
+            "a person's input is never gated: {action:?}"
+        );
+    }
+    {
+        let _job = SyntheticScope::enter();
+        assert!(synthetic_input());
+        for action in [
+            Gated::Quit,
+            Gated::DisconnectAutomation,
+            Gated::NativeDialog,
+        ] {
+            assert!(gate(action).is_err(), "{action:?}");
+        }
+        {
+            let _nested = SyntheticScope::enter();
+        }
+        assert!(
+            gate(Gated::Quit).is_err(),
+            "leaving a nested scope keeps the outer one"
+        );
+    }
+    assert!(!synthetic_input());
+    assert!(
+        gate(Gated::Quit).is_ok(),
+        "a real quit works again once the job ends"
+    );
+}
+
+#[test]
+fn the_gate_is_per_thread_so_a_real_event_on_another_thread_is_never_blocked() {
+    let _job = SyntheticScope::enter();
+    let other = std::thread::spawn(|| gate(Gated::Quit).is_ok())
+        .join()
+        .unwrap();
+    assert!(other);
+}
+
+/// The source between `start` and `len` bytes after it.
+fn region(source: &'static str, start: &str, len: usize) -> &'static str {
+    let at = source.find(start).expect("the pinned source text exists");
+    &source[at..(at + len).min(source.len())]
+}
+
+#[test]
+fn every_exit_and_blocking_route_calls_the_central_gate() {
+    const LIB: &str = include_str!("lib.rs");
+    // Every way to quit funnels through `request_quit`: the window close
+    // request, the menu bar and native menu "Quit Aurora", ActivatedCommand::Quit.
+    assert!(
+        region(LIB, "    fn request_quit(&mut self) -> bool {", 700)
+            .contains("bridge_app::gate(bridge_app::Gated::Quit)"),
+        "request_quit must call the gate first"
+    );
+    assert!(
+        region(LIB, "Some(ActivatedCommand::Quit) => {", 120).contains("request_quit()"),
+        "the Quit command must go through request_quit"
+    );
+    assert!(
+        region(
+            LIB,
+            "Some(ActivatedCommand::DisconnectAutomation) => {",
+            200
+        )
+        .contains("bridge_app::Gated::DisconnectAutomation")
+    );
+    let dialog = region(LIB, "impl FileDialogAccess for SystemFileDialog {", 700);
+    assert_eq!(
+        dialog.matches("bridge_app::Gated::NativeDialog").count(),
+        2,
+        "both native dialogs"
+    );
+    assert!(
+        region(
+            LIB,
+            "    fn run_dialog_result(&mut self, result: &DialogResult) {",
+            400
+        )
+        .contains("bridge_app::synthetic_input()"),
+        "dialog answers are re-checked for synthetic input"
+    );
+    // The only places that end the event loop are reached through request_quit
+    // (`exit_requested`) or the real window close event.
+    let exits: Vec<&str> = LIB
+        .match_indices("self.exit_requested = true")
+        .map(|(i, _)| &LIB[i.saturating_sub(300)..i])
+        .collect();
+    assert_eq!(exits.len(), 1, "one place sets exit_requested");
+    assert!(exits[0].contains("QuitEffect::CleanupAndExit"));
+}
+
+#[test]
+fn bridge_dispatch_runs_inside_the_synthetic_scope() {
+    const APP: &str = include_str!("bridge_app.rs");
+    assert!(
+        region(APP, "fn bridge_dispatch(&mut self, job: Job)", 400)
+            .contains("SyntheticScope::enter()")
+    );
+}
+
+#[test]
+fn quit_and_disconnect_are_not_in_the_palette() {
+    let ids: Vec<String> = crate::command_registry::palette_entries()
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    assert!(
+        !ids.iter().any(|id| id == "app.quit"),
+        "Quit is a menu item only"
+    );
+    // Disconnect is in the palette (the person's lever) and refused for a controller by the gate.
+    assert!(ids.iter().any(|id| id == "automation.disconnect"));
+}

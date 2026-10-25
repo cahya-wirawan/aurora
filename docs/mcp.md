@@ -327,7 +327,17 @@ and does not mark the live document as saved.
   with "[automation connected]" and the status bar ends with "Automation
   connected". The palette command **Disconnect Automation** closes it and
   turns the bridge off until Aurora is restarted.
-* **A controller can never discard work or quit.** `ui_dialog` may
+* **A controller can never quit Aurora.** Whatever a tool does while a
+  request is running is synthetic input, and quitting is refused at its one
+  central place (`request_quit`) for it: the File > Quit Aurora menu item
+  (clicked with `ui_pointer` or driven with `ui_key`), the Quit command, any
+  key chord and a window-close request all end with a calm status-bar notice
+  and nothing else. The same gate refuses switching the bridge off
+  (`automation.disconnect` is the person's lever) and any native file dialog
+  (it would block the UI thread until a person answered; use `doc_open` /
+  `doc_save`). A real user's own quit, close or Disconnect works normally
+  while a controller is connected: only a request's own input is gated.
+* **A controller can never discard work.** `ui_dialog` may
   acknowledge a report and **cancel** a question, but it may not choose
   Save, Don't Save, Quit, Replace or Save Anyway in the unsaved-changes,
   quit, workspace-replace and lossy-PSD dialogs; those need a person

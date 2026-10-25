@@ -80,7 +80,20 @@ threat model matters more than the feature.
    dialogs are refused (they would block the UI thread); `doc_open` copies the
    confined file to private scratch and header-checks the copy; `doc_save`
    writes a new file with `create_new` and never overwrites.
-6. **A controller never answers a discard or quit question.** `ui.dialog`
+6. **A controller never quits, and never answers a discard or quit
+   question.** Every bridge job runs inside a `SyntheticScope` (a
+   thread-local on the UI thread, so a real event on any other path is never
+   inside one). One central gate (`bridge_app::gate`) refuses, while a job
+   runs, **Quit** (checked first thing in `request_quit`, the single funnel
+   for the File > Quit Aurora menu item, the Quit command, a key chord and
+   the window-close request), **Disconnect Automation** (the person's lever)
+   and **native file dialogs** (`SystemFileDialog` returns nothing: a native
+   dialog blocks the UI thread until a person answers). Each refusal shows a
+   status-bar notice and does nothing else. A real user's quit, close or
+   Disconnect while a controller is merely connected works as usual.
+   `run_dialog_result` re-checks a dialog answer for synthetic input as
+   defence in depth. `ui.dialog` `choose` goes through
+   `dialog_choice_allowed`. `ui.dialog`
    `choose` goes through `dialog_choice_allowed`: a controller may acknowledge
    a report and cancel a question, nothing else. Audit of every
    `DialogPurpose` (a test asserts each row and the `match` over the enum is

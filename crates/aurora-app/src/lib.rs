@@ -6132,10 +6132,14 @@ struct SystemFileDialog;
 
 impl FileDialogAccess for SystemFileDialog {
     fn pick_file(&mut self) -> Option<PathBuf> {
+        // Task 160: a controller's input never opens a dialog that blocks
+        // this thread until a person answers it.
+        bridge_app::gate(bridge_app::Gated::NativeDialog).ok()?;
         rfd::FileDialog::new().pick_file()
     }
 
     fn save_file(&mut self) -> Option<PathBuf> {
+        bridge_app::gate(bridge_app::Gated::NativeDialog).ok()?;
         let mut dialog = rfd::FileDialog::new();
         for (name, extensions) in psd_save::save_file_filters() {
             dialog = dialog.add_filter(name, extensions);
@@ -29955,6 +29959,9 @@ enum LockRefusal {
     HealNotEnoughSurroundings,
     /// A Spot Healing stroke over the size bound (0.237.0).
     HealTooLarge,
+    /// Something a controller's input may not do (task 160): quit, switch
+    /// the bridge off, open a native file dialog.
+    Automation(&'static str),
     /// An undo or redo could not read the step's saved data back (0.210.0:
     /// a pixel-history spill file a temp-file cleaner removed, or a corrupt
     /// one). Not a lock; the step stays in the History panel.
@@ -30033,7 +30040,9 @@ impl LockRefusal {
             LockRefusal::QuickMaskNothing => {
                 "Quick Mask selected nothing, so there is no selection."
             }
-            LockRefusal::Path(text) | LockRefusal::Colour(text) => text,
+            LockRefusal::Path(text) | LockRefusal::Colour(text) | LockRefusal::Automation(text) => {
+                text
+            }
             LockRefusal::SavedSelectionNeedsSelection => {
                 "Make a selection first. Save Selection keeps the selection you have."
             }
@@ -30159,7 +30168,10 @@ fn lock_refusal_applies(
     press_refusal(tool, lock) == Some(refusal)
         || delete_refusal(lock) == Some(refusal)
         || refusal == LockRefusal::HistoryUnavailable
-        || matches!(refusal, LockRefusal::Path(_) | LockRefusal::Colour(_))
+        || matches!(
+            refusal,
+            LockRefusal::Path(_) | LockRefusal::Colour(_) | LockRefusal::Automation(_)
+        )
         || matches!(
             refusal,
             LockRefusal::SavedSelectionNeedsSelection
@@ -32250,6 +32262,7 @@ impl App {
     /// Runs what a command activation (a shortcut, a palette entry, the
     /// native menu, or — 0.225.0 — the in-window menu bar) resolved to: the
     /// one dispatch every surface shares.
+    #[allow(clippy::too_many_lines)]
     fn run_activated(&mut self, picked: Option<ActivatedCommand>) {
         match picked {
             Some(ActivatedCommand::OpenFile(path)) => self.open_file(&path),
@@ -32319,7 +32332,15 @@ impl App {
                 self.run_layer_command(LayerCommand::SetClip(on));
             }
             Some(ActivatedCommand::SwapColours) => self.swap_colours(),
-            Some(ActivatedCommand::DisconnectAutomation) => self.disconnect_automation(),
+            Some(ActivatedCommand::DisconnectAutomation) => {
+                match bridge_app::gate(bridge_app::Gated::DisconnectAutomation) {
+                    Ok(()) => self.disconnect_automation(),
+                    Err(notice) => {
+                        self.lock_notice =
+                            Some((LockRefusal::Automation(notice), self.doc.active_layer));
+                    }
+                }
+            }
             Some(ActivatedCommand::ViewZoom(command)) => self.apply_view_zoom(command),
             Some(ActivatedCommand::ResetColours) => self.reset_colours(),
             Some(ActivatedCommand::Selection(command)) => self.run_selection_command(command),
@@ -33010,6 +33031,13 @@ impl App {
     /// unsaved); otherwise the quit review starts, or — another dialog
     /// being open, or a review already running — the request is refused.
     fn request_quit(&mut self) -> bool {
+        // Task 160: a controller can never quit (any route: the menu bar,
+        // a key chord, a command); a person's own request is unaffected.
+        if let Err(notice) = bridge_app::gate(bridge_app::Gated::Quit) {
+            self.lock_notice = Some((LockRefusal::Automation(notice), self.doc.active_layer));
+            self.needs_redraw = true;
+            return false;
+        }
         if self.quit_review.is_some() {
             return false;
         }
@@ -36878,6 +36906,21 @@ impl App {
     /// dispatched by its purpose ([`dialog_effect`]). The dialog is already
     /// closed and focus restored.
     fn run_dialog_result(&mut self, result: &DialogResult) {
+        // Task 160, defence in depth: whatever route a controller's input
+        // took to a dialog button, it cannot answer a question that discards
+        // changes, quits, replaces a workspace or saves a lossy file.
+        if bridge_app::synthetic_input()
+            && let Err(message) = bridge_ui::dialog_choice_allowed(&result.purpose, &result.action)
+        {
+            tracing::warn!(%message, "a controller's dialog answer was refused");
+            self.lock_notice = Some((
+                LockRefusal::Automation(
+                    "A controller can only cancel this question; a person answers it.",
+                ),
+                self.doc.active_layer,
+            ));
+            return;
+        }
         match dialog_effect(result) {
             DialogEffect::Acknowledged => {}
             DialogEffect::Workspace(command) => self.run_workspace_command(command),
