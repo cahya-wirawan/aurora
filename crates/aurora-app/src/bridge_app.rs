@@ -12,7 +12,7 @@
 //!   put on a bounded queue ([`QUEUE_CAPACITY`]) and `about_to_wait` runs
 //!   at most [`JOBS_PER_TURN`] of them per loop turn. A screenshot or an
 //!   open finishes on a later turn.
-//! * **Policy** ([`App::bridge_call`]): while a modal dialog (or the quit
+//! * **Policy** (`App::bridge_dispatch`): while a modal dialog (or the quit
 //!   review) is open, only reads and `ui.dialog` run; with the command
 //!   palette open, commands and file tools are refused; `app.quit`, the
 //!   native-dialog commands and any command with a file parameter are never

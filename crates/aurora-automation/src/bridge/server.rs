@@ -15,7 +15,7 @@
 //!   one is active. At most [`MAX_UNAUTHENTICATED`] handshakes are in
 //!   progress at once.
 //! * **Bounded input.** A request line is at most
-//!   [`protocol::MAX_REQUEST_BYTES`]; a longer one closes the connection
+//!   [`super::protocol::MAX_REQUEST_BYTES`]; a longer one closes the connection
 //!   and is never acted on. Requests are rate-limited.
 //! * Each connection is served by its own thread, one request at a time;
 //!   the [`Dispatcher`] decides where a request runs (the app marshals it to
