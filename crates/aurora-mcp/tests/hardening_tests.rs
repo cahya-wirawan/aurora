@@ -586,6 +586,51 @@ fn a_dead_servers_scratch_is_swept_and_nothing_else_is() {
     assert_eq!(name.len(), PREFIX.len() + aurora_mcp::scratch::RANDOM_LEN);
 }
 
+#[test]
+fn a_starting_servers_directory_is_never_swept_at_any_instant_of_its_creation() {
+    use aurora_mcp::scratch::{Scratch, sweep_stale};
+    let parent = tempfile::tempdir().unwrap();
+    let seen = std::cell::Cell::new(0);
+    let server = Scratch::create_with(Some(parent.path()), &|dir| {
+        // a second server starting at exactly this instant
+        assert_eq!(
+            sweep_stale(parent.path()),
+            0,
+            "swept a starting server's directory"
+        );
+        assert!(dir.exists());
+        seen.set(seen.get() + 1);
+    })
+    .unwrap();
+    assert_eq!(seen.get(), 4, "every step was probed");
+    assert!(server.path().exists());
+}
+
+#[test]
+fn a_sweep_holds_the_directorys_lock_while_it_removes_it() {
+    use aurora_mcp::scratch::{LOCK_FILE, MARKER_FILE, PREFIX, sweep_dir};
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join(format!("{PREFIX}AbCd1234"));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join(MARKER_FILE), b"x").unwrap();
+    std::fs::write(dir.join(LOCK_FILE), b"").unwrap();
+    let probed = std::cell::Cell::new(false);
+    assert!(sweep_dir(&dir, &|| {
+        // an owner trying to lock the directory right now must fail
+        let other = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(LOCK_FILE))
+            .unwrap();
+        assert!(
+            other.try_lock().is_err(),
+            "the sweep did not hold the lock during removal"
+        );
+        probed.set(true);
+    }));
+    assert!(probed.get() && !dir.exists());
+}
+
 // ----- protocol edge cases --------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]

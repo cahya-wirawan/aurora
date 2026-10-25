@@ -38,6 +38,19 @@ impl Scratch {
     /// # Errors
     /// The directory or its lock file could not be created.
     pub fn create(parent: Option<&Path>) -> io::Result<Self> {
+        Self::create_with(parent, &|_| {})
+    }
+
+    /// [`Scratch::create`] with `window` called after each step, so a test can
+    /// run a sweep at every moment a second server could start in. Order
+    /// matters and is the point: the lock file is created and **locked
+    /// first**, and the marker (which makes a directory sweepable) is written
+    /// only once the lock is held, so there is no instant at which a
+    /// directory is both marked and unlocked.
+    ///
+    /// # Errors
+    /// As [`Scratch::create`].
+    pub fn create_with(parent: Option<&Path>, window: &dyn Fn(&Path)) -> io::Result<Self> {
         let parent: PathBuf = parent.map_or_else(std::env::temp_dir, Path::to_path_buf);
         let _ = sweep_stale(&parent);
         let mut builder = tempfile::Builder::new();
@@ -48,17 +61,21 @@ impl Scratch {
             builder.permissions(std::fs::Permissions::from_mode(0o700));
         }
         let dir = builder.tempdir_in(&parent)?;
-        std::fs::write(
-            dir.path().join(MARKER_FILE),
-            b"created by aurora-cli mcp; safe to delete when no server is running\n",
-        )?;
+        window(dir.path());
         let lock = File::options()
             .read(true)
             .write(true)
             .create_new(true)
             .open(dir.path().join(LOCK_FILE))?;
+        window(dir.path());
         lock.try_lock()
             .map_err(|e| io::Error::other(format!("couldn't lock the scratch directory: {e}")))?;
+        window(dir.path());
+        std::fs::write(
+            dir.path().join(MARKER_FILE),
+            b"created by aurora-cli mcp; safe to delete when no server is running\n",
+        )?;
+        window(dir.path());
         Ok(Self { dir, _lock: lock })
     }
 
@@ -109,20 +126,37 @@ pub fn sweep_stale(parent: &Path) -> usize {
         if !meta.is_dir() {
             continue;
         }
-        let is_file =
-            |name: &str| std::fs::symlink_metadata(path.join(name)).is_ok_and(|m| m.is_file());
-        if !is_file(MARKER_FILE) || !is_file(LOCK_FILE) {
-            continue;
-        }
-        let takeable = File::options()
-            .read(true)
-            .write(true)
-            .open(path.join(LOCK_FILE))
-            .is_ok_and(|lock| lock.try_lock().is_ok());
-        if takeable && std::fs::remove_dir_all(&path).is_ok() {
+        if sweep_dir(&path, &|| {}) {
             removed += 1;
         }
     }
+    removed
+}
+
+/// Removes one candidate directory if every condition of [`sweep_stale`]
+/// holds. The lock is taken **before** the removal and kept until after it,
+/// so a directory is never deleted from under an owner that locks it in the
+/// meantime. `before_remove` runs while the lock is held (a test seam).
+#[must_use]
+pub fn sweep_dir(path: &Path, before_remove: &dyn Fn()) -> bool {
+    let is_file =
+        |name: &str| std::fs::symlink_metadata(path.join(name)).is_ok_and(|m| m.is_file());
+    if !is_file(MARKER_FILE) || !is_file(LOCK_FILE) {
+        return false;
+    }
+    let Ok(lock) = File::options()
+        .read(true)
+        .write(true)
+        .open(path.join(LOCK_FILE))
+    else {
+        return false;
+    };
+    if lock.try_lock().is_err() {
+        return false;
+    }
+    before_remove();
+    let removed = std::fs::remove_dir_all(path).is_ok();
+    drop(lock);
     removed
 }
 
