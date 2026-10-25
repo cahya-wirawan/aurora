@@ -3,7 +3,7 @@
 //! `rmcp` reads lines of any length and treats a line that is not JSON as a
 //! fatal transport error. This front end makes both properties ours:
 //!
-//! * a request line longer than [`MAX_REQUEST_BYTES`] ends the session
+//! * a request line longer than `MAX_REQUEST_BYTES` (1 MiB) ends the session
 //!   (it is never forwarded, not even its valid prefix);
 //! * a line that is not JSON is answered with a JSON-RPC `-32700` error
 //!   (`id: null`) and the next line is handled normally;

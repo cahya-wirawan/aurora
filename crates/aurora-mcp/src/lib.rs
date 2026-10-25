@@ -4,7 +4,7 @@
 //! This crate is the protocol side only: the tools and resources
 //! ([`server`]), the file-access rules ([`roots`]: no authority without a
 //! granted root, paths confined with `cap-std`, never overwriting), the
-//! hardened line transport ([`transport`]) and the [`Session`] trait a
+//! hardened line transport (the private `transport` module) and the [`Session`] trait a
 //! document host implements. It depends on the command registry and on no
 //! document code; `aurora-cli` plugs `aurora-app`'s headless session into
 //! it. `tokio` is used here for the stream and the blocking-task hand-off
