@@ -87,7 +87,7 @@ fn the_palette_is_the_registry_in_order() {
         .map(|entry| (entry.id.as_str(), entry.title.as_str()))
         .collect();
     assert_eq!(actual, expected);
-    assert_eq!(palette.len(), 147);
+    assert_eq!(palette.len(), 148);
     let unique: BTreeSet<&str> = palette.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(unique.len(), palette.len(), "palette ids are unique");
 }

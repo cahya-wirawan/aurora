@@ -549,6 +549,9 @@ mod background_autosave;
 mod background_composite;
 mod background_open;
 mod bench_launch;
+mod bridge_app;
+mod bridge_doc;
+mod bridge_ui;
 #[cfg(test)]
 mod centred_view_tests;
 mod channels_app;
@@ -595,6 +598,7 @@ pub mod headless;
 mod lasso_tools;
 mod layer_thumbnails;
 pub mod mcp_session;
+pub use bridge_app::{AUTOMATION_CONNECTED, BridgeOptions};
 mod menu_bar_app;
 mod menu_bar_state;
 mod menu_model;
@@ -1142,6 +1146,9 @@ enum AppEvent {
     /// The layer thumbnail worker (0.197.0) finished pictures;
     /// `about_to_wait` installs them.
     ThumbnailReady,
+    /// The automation bridge (task 160) has a request or a connection
+    /// change for the UI thread; `about_to_wait` runs them.
+    Bridge,
 }
 
 impl From<accesskit_winit::Event> for AppEvent {
@@ -8929,6 +8936,7 @@ fn status_info(
         selection: None,
         quick_mask: false,
         crop: None,
+        automation: bridge_app::AUTOMATION_CONNECTED.load(std::sync::atomic::Ordering::SeqCst),
     }
 }
 
@@ -26007,7 +26015,10 @@ fn install_provisional_tile(
 fn app_event_requests_redraw(event: &AppEvent) -> bool {
     matches!(
         event,
-        AppEvent::OpenFinished | AppEvent::CompositeReady | AppEvent::ThumbnailReady
+        AppEvent::OpenFinished
+            | AppEvent::CompositeReady
+            | AppEvent::ThumbnailReady
+            | AppEvent::Bridge
     )
 }
 
@@ -31199,6 +31210,8 @@ struct App {
     pending_open: document_tabs::PendingOpenStores,
     /// The quit review in progress (0.174.0), if any.
     quit_review: Option<document_close::QuitReview>,
+    /// The automation bridge (task 160); `None` unless enabled.
+    bridge: Option<bridge_app::Bridge>,
     /// A written PSD waiting for the Save With Changes dialog (0.177.0).
     pending_psd_save: Option<psd_save::PendingPsdSave>,
     /// Its dialog could not open (another held the slot): shown once no
@@ -31827,6 +31840,7 @@ impl App {
             shelf: recovered_shelf(extra_sessions),
             pending_open: document_tabs::PendingOpenStores::default(),
             quit_review: None,
+            bridge: None,
             pending_psd_save: None,
             psd_dialog_deferred: false,
             exit_requested: false,
@@ -33167,14 +33181,22 @@ impl App {
     /// one finishes, before its install, so the state is cleared on
     /// every outcome — success, failure, or a caught panic.
     fn show_open_state(&mut self) {
-        if let Some(window) = self.window.as_ref() {
-            window.set_title(&window_title(
-                self.open_worker.pending_path(),
-                &self.doc.name,
-            ));
-        }
+        self.apply_window_title();
         self.push_accessibility();
         self.needs_redraw = true;
+    }
+
+    /// Sets the window title: the document, "Aurora", and — while an
+    /// automation controller is connected (task 160) — an indication that
+    /// cannot be turned off from the bridge.
+    pub(crate) fn apply_window_title(&self) {
+        if let Some(window) = self.window.as_ref() {
+            let mut title = window_title(self.open_worker.pending_path(), &self.doc.name);
+            if self.bridge.as_ref().is_some_and(|b| b.shown_connected) {
+                title.push_str(bridge_app::TITLE_SUFFIX);
+            }
+            window.set_title(&title);
+        }
     }
 
     /// Installs a background open whose result has arrived, if any
@@ -36249,6 +36271,10 @@ impl App {
     /// silently pass `None` for the store and the scratch directory and
     /// still pass the whole gate. See [`ShutdownState`].
     fn finish_shutdown(&mut self) {
+        // Task 160: the controller is dropped and the discovery file removed
+        // first, so no request lands on a closing app.
+        self.bridge = None;
+        bridge_app::AUTOMATION_CONNECTED.store(false, std::sync::atomic::Ordering::SeqCst);
         // 60 FPS round 6: the blend pipelines' background build must not
         // reach process exit still running (see
         // `TileCompositor::stop_background_pipelines`).
@@ -38671,8 +38697,34 @@ impl App {
                     }
                 }
                 frame_trace::mark("encode");
+                // Task 160: a pending screenshot copies this very frame.
+                let capture = if self
+                    .bridge
+                    .as_ref()
+                    .is_some_and(bridge_app::Bridge::wants_capture)
+                {
+                    aurora_gpu::capture::record_capture(
+                        gpu.device(),
+                        &mut encoder,
+                        &texture.texture,
+                        surface.size(),
+                        surface.format(),
+                    )
+                } else {
+                    None
+                };
                 gpu.queue().submit(std::iter::once(encoder.finish()));
                 frame_trace::mark("submit");
+                if let Some(capture) = capture
+                    && let Some((width, height, rgba)) = capture.finish(gpu.device())
+                    && let Some(bridge) = self.bridge.as_mut()
+                {
+                    bridge.captured = Some(bridge_app::CapturedFrame {
+                        width,
+                        height,
+                        rgba,
+                    });
+                }
                 gpu.queue().present(texture);
                 frame_trace::mark("present");
             }
@@ -38958,6 +39010,16 @@ impl ApplicationHandler<AppEvent> for App {
             };
         // Measurement only: unset, the surface keeps `AutoVsync`.
         bench_launch::apply_present_mode_from_env(&mut surface, gpu.device());
+        // Task 160: screenshots read the app's own frame back; only a bridge
+        // asks the swapchain for that.
+        if self.bridge.is_some() {
+            let supported =
+                aurora_gpu::capture::can_capture(surface.format()) && surface.enable_capture(&gpu);
+            if let Some(bridge) = self.bridge.as_mut() {
+                bridge.capture_supported = supported;
+            }
+            tracing::info!(supported, "bridge screenshots");
+        }
 
         // 0.192.1: the swapchain format decides whether the canvas shader
         // must hand linear light (`SRGB_TARGET`); logged once so a report
@@ -39226,6 +39288,11 @@ pub fn run() -> anyhow::Result<()> {
     );
     // The crashed runs' locks were held through recovery and adoption.
     drop(found);
+    // Task 160: off unless asked for (`--mcp-bridge`, `AURORA_MCP_BRIDGE=1`).
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let bridge_options = BridgeOptions::from_args(&args, &|name| std::env::var(name).ok())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    app.enable_bridge(&bridge_options);
     event_loop
         .run_app(&mut app)
         .map_err(|err| anyhow::anyhow!("event loop run failed: {err}"))?;
@@ -99723,7 +99790,8 @@ impl App {
             AppEvent::Accessibility(event) => event,
             wake @ (AppEvent::OpenFinished
             | AppEvent::CompositeReady
-            | AppEvent::ThumbnailReady) => {
+            | AppEvent::ThumbnailReady
+            | AppEvent::Bridge) => {
                 // Installed by `about_to_wait`, which runs after this on
                 // the same iteration: the wake's whole job is to end the
                 // loop's `Wait` so that it does.
@@ -99839,6 +99907,8 @@ impl App {
         // here, on the UI thread, before everything below mirrors the
         // document -- so the controls follow the new one this iteration.
         self.poll_background_open();
+        // Task 160: requests from the automation bridge (a no-op when off).
+        self.drain_bridge();
         frame_trace::mark("poll_open");
 
         // The gallery tooltip's timer: tick first, then read the next

@@ -145,6 +145,7 @@ view.float_channels	Float Channels Panel	Palette
 view.dock_channels	Dock Channels Panel	Palette
 view.float_paths	Float Paths Panel	Palette
 view.dock_paths	Dock Paths Panel	Palette
+automation.disconnect	Disconnect Automation	Palette
 app.quit	Quit Aurora	MenuOnly
 workspace.reset_active	Reset Workspace	Dynamic
 workspace.save_as	Save Workspace As…	Dynamic

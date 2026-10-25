@@ -18,6 +18,11 @@ workspace = true
 [dependencies]
 aurora-core = { workspace = true }
 aurora-commands = { workspace = true }
+# The bridge (task 160): std-only listener, path roots, scratch. No async runtime.
+aurora-automation = { workspace = true }
+# Screenshots and previews over the bridge are PNGs in JSON.
+png = { workspace = true }
+base64 = { workspace = true }
 aurora-tile = { workspace = true }
 aurora-graph = { workspace = true }
 aurora-gpu = { workspace = true }

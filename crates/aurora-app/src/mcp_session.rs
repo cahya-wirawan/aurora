@@ -277,7 +277,7 @@ fn report_json(name: &str, report: &aurora_io::PsdWriteReport) -> Value {
 }
 
 /// The document as JSON (layer tree, history, selection, canvas size).
-pub(crate) fn inspect_json(mut view: InspectView<'_>) -> Value {
+pub(crate) fn inspect_json(view: InspectView<'_>) -> Value {
     view.undo_order.sync_labels();
     let mut count = 0;
     let mut truncated = false;
@@ -506,7 +506,7 @@ impl HeadlessSession {
 
     /// A `.aur` is a zip, so the server cannot read its header; its manifest
     /// states the canvas size, read here before any tile is decoded.
-    fn check_aur_header(staged: &Path, max_pixels: u64) -> Result<(), Failure> {
+    pub(crate) fn check_aur_header(staged: &Path, max_pixels: u64) -> Result<(), Failure> {
         use std::io::Read as _;
         let Ok(mut file) = std::fs::File::open(staged) else {
             return Ok(());
@@ -908,9 +908,9 @@ impl HeadlessSession {
 /// `cancelled` and reporting a fraction.
 pub(crate) fn composite_document_cpu(
     layers: &aurora_doc::LayerTree,
-store: &mut aurora_tile::TileStore,
-canvas: (u32, u32),
-max_pixels: u64,
+    store: &mut aurora_tile::TileStore,
+    canvas: (u32, u32),
+    max_pixels: u64,
     cancelled: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(f64),
 ) -> Result<aurora_io::Image, Failure> {
@@ -921,10 +921,8 @@ max_pixels: u64,
              {max_pixels} pixels"
         )));
     }
-    let mut samples = vec![
-        half::f16::from_f32(0.0);
-        width as usize * height as usize * aurora_tile::CHANNELS
-    ];
+    let mut samples =
+        vec![half::f16::from_f32(0.0); width as usize * height as usize * aurora_tile::CHANNELS];
     let tiles = crate::headless::document_tiles(width, height);
     let total = tiles.len().max(1);
     let mut budget = crate::CompositeBudget::for_pass(layers);
@@ -947,10 +945,8 @@ max_pixels: u64,
     if let Some((skipped, _)) = budget.store_error() {
         return Err(failed(format!("{skipped} source tiles could not be read")));
     }
-    aurora_io::Image::new(width, height, aurora_color::IccProfile::srgb(), samples)
-        .map_err(failed)
+    aurora_io::Image::new(width, height, aurora_color::IccProfile::srgb(), samples).map_err(failed)
 }
-
 
 /// The parts of a document an export and a PSD check read: the headless
 /// session's own and, over the bridge (task 160), the live app's.
@@ -1111,32 +1107,32 @@ pub(crate) fn preview_from_image(
     image: aurora_io::Image,
     max_side: u32,
 ) -> Result<PreviewImage, Failure> {
-        let (w, h) = (image.width(), image.height());
-        let scale = f64::from(max_side) / f64::from(w.max(h).max(1));
-        let (tw, th) = if scale >= 1.0 {
-            (w, h)
-        } else {
-            (
-                ((f64::from(w) * scale).round() as u32).max(1),
-                ((f64::from(h) * scale).round() as u32).max(1),
-            )
-        };
-        let small = if (tw, th) == (w, h) {
-            image
-        } else {
-            box_downscale(&image, tw, th).map_err(failed)?
-        };
-        let small = match crate::colour_app::export_image(small, None) {
-            Ok(image) | Err(image) => image,
-        };
-        let png = aurora_io::png::encode(&small).map_err(failed)?;
-        Ok(PreviewImage {
-            png,
-            width: tw,
-            height: th,
-            document_width: w,
-            document_height: h,
-        })
+    let (w, h) = (image.width(), image.height());
+    let scale = f64::from(max_side) / f64::from(w.max(h).max(1));
+    let (tw, th) = if scale >= 1.0 {
+        (w, h)
+    } else {
+        (
+            ((f64::from(w) * scale).round() as u32).max(1),
+            ((f64::from(h) * scale).round() as u32).max(1),
+        )
+    };
+    let small = if (tw, th) == (w, h) {
+        image
+    } else {
+        box_downscale(&image, tw, th).map_err(failed)?
+    };
+    let small = match crate::colour_app::export_image(small, None) {
+        Ok(image) | Err(image) => image,
+    };
+    let png = aurora_io::png::encode(&small).map_err(failed)?;
+    Ok(PreviewImage {
+        png,
+        width: tw,
+        height: th,
+        document_width: w,
+        document_height: h,
+    })
 }
 
 /// An alpha-weighted box average to `tw` x `th`.
