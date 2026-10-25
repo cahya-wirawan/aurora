@@ -445,6 +445,20 @@ fn family_members_validate_their_target_and_take_no_arguments() {
         builtin().validate_args("document.switch.abc", &Args::new()),
         Err(ArgError::BadTarget { .. })
     ));
+    for bad in [
+        "document.switch.+5",
+        "document.switch.-1",
+        "document.switch.1_0",
+        "document.switch. 7",
+    ] {
+        assert!(
+            matches!(
+                builtin().validate_args(bad, &Args::new()),
+                Err(ArgError::BadTarget { .. })
+            ),
+            "{bad}"
+        );
+    }
     let v = builtin().validate_args("select.load:sky", &Args::new());
     assert_eq!(v.map(|v| v.target), Ok(Some("sky".into())));
     assert!(matches!(

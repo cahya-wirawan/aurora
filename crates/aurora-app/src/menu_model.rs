@@ -191,7 +191,12 @@ fn rows_to_entries(rows: Vec<Row>) -> Vec<Entry> {
 /// The registry's title for `command` (the id itself for one the registry
 /// does not know, which a test forbids).
 fn registry_title(command: &str) -> &str {
-    crate::command_registry::menu_label(command).unwrap_or(command)
+    let title = crate::command_registry::menu_label(command);
+    debug_assert!(
+        title.is_some(),
+        "menu command {command} is not in the registry"
+    );
+    title.unwrap_or(command)
 }
 
 fn item(command: &str, label: &str) -> Entry {

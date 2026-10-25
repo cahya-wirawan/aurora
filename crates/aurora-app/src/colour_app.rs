@@ -26,9 +26,9 @@ use crate::LockRefusal;
 
 pub(crate) const COMMAND_SET_OUTPUT: &str = "colour.output_profile.set";
 pub(crate) const COMMAND_CLEAR_OUTPUT: &str = "colour.output_profile.clear";
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 pub(crate) const TITLE_SET_OUTPUT: &str = "Set Output Profile\u{2026}";
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 pub(crate) const TITLE_CLEAR_OUTPUT: &str = "Clear Output Profile (sRGB)";
 
 pub(crate) const NOTICE_SET: &str =

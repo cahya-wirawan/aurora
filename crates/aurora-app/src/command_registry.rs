@@ -77,7 +77,7 @@ pub(crate) fn enabled(id: &str, context: &MenuContext) -> bool {
 
 // The typed bridge is exercised by the tests and waits for its first
 // caller (the automation front ends of tasks 159 and 160).
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 /// Why a typed call could not become an [`ActivatedCommand`].
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TypedError {
@@ -105,13 +105,13 @@ impl From<ArgError> for TypedError {
 /// [`TypedError::Invalid`] when the registry refuses the arguments,
 /// [`TypedError::Refused`] when the application's own name rule does, and
 /// [`TypedError::NoTypedForm`] for a command that is run by id.
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn activated_from_args(id: &str, args: &Args) -> Result<ActivatedCommand, TypedError> {
     let validated = registry().validate_args(id, args)?;
     typed_form(&validated).unwrap_or(Err(TypedError::NoTypedForm))
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn typed_form(call: &Validated) -> Option<Result<ActivatedCommand, TypedError>> {
     let path = || call.text("path").map(std::path::PathBuf::from);
     let made = match call.id.as_str() {

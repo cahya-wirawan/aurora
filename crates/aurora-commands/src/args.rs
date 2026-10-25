@@ -393,7 +393,7 @@ pub fn validate_family(family: &FamilySpec, id: &str, args: &Args) -> Result<Val
             })?;
         }
         TargetKind::Id => {
-            if target.parse::<u64>().is_err() {
+            if !target.bytes().all(|b| b.is_ascii_digit()) || target.parse::<u64>().is_err() {
                 return Err(ArgError::BadTarget {
                     command: id.to_owned(),
                     prefix: family.prefix.to_owned(),

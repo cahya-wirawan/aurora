@@ -10,7 +10,7 @@
 //! name" per workspace).
 //!
 //! This crate is **pure metadata and validation**: it knows no document, no
-//! window and no file system, and depends on nothing but `serde`. Running a
+//! window and no file system, and depends on nothing but `serde` and `thiserror`. Running a
 //! command stays in `aurora-app`; the registry says what may be asked of
 //! it ([`Registry::validate_args`]), whether it can run now
 //! ([`Registry::check_enabled`]) and how to describe it

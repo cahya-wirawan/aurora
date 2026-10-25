@@ -29,7 +29,7 @@ use crate::{FocusManager, LockRefusal, WidgetId, command_palette_style};
 /// The palette command that opens the name prompt.
 pub(crate) const COMMAND_SAVE: &str = "select.save";
 /// Its palette title.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 pub(crate) const SAVE_TITLE: &str = "Save Selection\u{2026}";
 /// The History row of a load.
 pub(crate) const LOAD_STEP_LABEL: &str = "Load Selection";
