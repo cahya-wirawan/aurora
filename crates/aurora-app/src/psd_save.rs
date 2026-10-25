@@ -46,6 +46,7 @@ pub(crate) const PSD_SAVE_CANCEL: &str = "psd.save.cancel";
 /// The command id, palette/menu label and dialogs of "Check PSD
 /// Compatibility" (task 157).
 pub(crate) const COMMAND_CHECK: &str = "file.check_psd";
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) const CHECK_TITLE: &str = "Check PSD Compatibility\u{2026}";
 pub(crate) const PSD_CHECK_TITLE: &str = "Photoshop Compatibility";
 pub(crate) const PSD_CHECK_FAILED_TITLE: &str = "Can't Check Photoshop Compatibility";

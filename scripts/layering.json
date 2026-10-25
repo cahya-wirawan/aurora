@@ -1,5 +1,6 @@
 {
   "aurora-core": [],
+  "aurora-commands": [],
   "aurora-testkit": [],
   "aurora-tile": [
     "aurora-core"
@@ -92,6 +93,7 @@
   ],
   "aurora-app": [
     "aurora-core",
+    "aurora-commands",
     "aurora-tile",
     "aurora-graph",
     "aurora-gpu",
@@ -111,6 +113,7 @@
   ],
   "aurora-cli": [
     "aurora-core",
+    "aurora-commands",
     "aurora-tile",
     "aurora-graph",
     "aurora-gpu",

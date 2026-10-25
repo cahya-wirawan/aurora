@@ -500,11 +500,13 @@ pub(crate) fn rendered_canvas_zoom_within(canvas_px: (u32, u32), zoom: f32, limi
 /// Palette and menu id of View > Fit on Screen (`Primary+0`).
 pub(crate) const COMMAND_FIT_ON_SCREEN: &str = "view.fit-on-screen";
 /// Its title.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) const FIT_ON_SCREEN_TITLE: &str = "Fit on Screen";
 /// Palette and menu id of View > 100% (`Primary+1`): one image pixel per
 /// physical pixel, Photoshop's physical 100 % (0.163.0's status bar zoom).
 pub(crate) const COMMAND_ACTUAL_PIXELS: &str = "view.actual-pixels";
 /// Its title.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) const ACTUAL_PIXELS_TITLE: &str = "100%";
 
 /// A view zoom command.

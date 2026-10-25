@@ -47,6 +47,7 @@ use crate::{Key, LockRefusal, UndoOrder};
 pub(crate) const COMMAND_CROP_TO_SELECTION: &str = "select.crop_to_selection";
 
 /// The palette / menu title of "Crop to Selection".
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) const COMMAND_TITLE: &str = "Crop to Selection";
 
 /// The History row of a crop.
@@ -554,12 +555,14 @@ pub(crate) const fn ratio_command_id(choice: aurora_ui::CropRatio) -> &'static s
 }
 
 /// The palette title of `Crop Ratio: <choice>`.
+#[cfg(test)]
 pub(crate) fn ratio_command_title(choice: aurora_ui::CropRatio) -> String {
     format!("Crop Ratio: {}", choice.label())
 }
 
 /// The palette id and title of "Crop: Swap Orientation".
 pub(crate) const COMMAND_SWAP_ORIENTATION: &str = "crop.swap_orientation";
+#[cfg(test)]
 pub(crate) const SWAP_ORIENTATION_TITLE: &str = "Crop: Swap Orientation";
 
 /// Which side the pointer fixes.

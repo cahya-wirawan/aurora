@@ -56,6 +56,7 @@ pub(crate) const STEP_LABEL: &str = "Quick Mask";
 pub(crate) const COMMAND_ID: &str = "select.quick_mask";
 
 /// The palette and menu title.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) const COMMAND_TITLE: &str = "Toggle Quick Mask Mode";
 
 /// What a Select command meets while the mode is on.

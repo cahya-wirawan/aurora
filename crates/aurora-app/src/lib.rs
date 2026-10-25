@@ -562,6 +562,9 @@ mod clone_stamp_tests;
 mod colour_app;
 mod colour_range_app;
 mod colour_state;
+mod command_registry;
+#[cfg(test)]
+mod command_registry_tests;
 mod crop;
 mod crop_app;
 #[cfg(test)]
@@ -6302,6 +6305,7 @@ const COMMAND_CLOSE_PATHS: &str = "view.close_paths";
 /// entries nor the native menu's items are rebuilt when state changes.
 const COMMAND_TOGGLE_PANELS: &str = "window.toggle_panels";
 /// [`COMMAND_TOGGLE_PANELS`]' label in the palette and the Window menu.
+#[cfg(any(test, target_os = "macos"))]
 const COMMAND_TOGGLE_PANELS_LABEL: &str = "Collapse or Expand Panels";
 /// The keyboard path for drag-to-redock (0.166.0; invariant 9 — not
 /// mouse-only): per panel, "Up" (out of its group into the gap above it,
@@ -6548,158 +6552,8 @@ const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
 /// yet, so every save shows a picker. `COMMAND_LAYER_NEW`/
 /// `COMMAND_LAYER_DELETE` (0.143.0) resolve to [`ActivatedCommand::NewLayer`]/
 /// [`ActivatedCommand::DeleteLayer`], run by [`perform_layer_command`].
-#[allow(clippy::too_many_lines)]
 fn palette_commands() -> Vec<CommandEntry> {
-    let mut commands = vec![
-        CommandEntry::new(COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
-        CommandEntry::new(COMMAND_FOCUS_PROPERTIES, "Focus Properties Panel"),
-        CommandEntry::new(COMMAND_FOCUS_HISTORY, "Focus History Panel"),
-        CommandEntry::new(COMMAND_FOCUS_CHANNELS, "Focus Channels Panel"),
-        CommandEntry::new(COMMAND_FOCUS_PATHS, "Focus Paths Panel"),
-        CommandEntry::new(COMMAND_TOGGLE_LAYERS, "Toggle Layers Panel"),
-        CommandEntry::new(COMMAND_TOGGLE_PROPERTIES, "Toggle Properties Panel"),
-        CommandEntry::new(COMMAND_TOGGLE_HISTORY, "Toggle History Panel"),
-        CommandEntry::new(COMMAND_TOGGLE_CHANNELS, "Toggle Channels Panel"),
-        CommandEntry::new(COMMAND_TOGGLE_PATHS, "Toggle Paths Panel"),
-        CommandEntry::new(COMMAND_CLOSE_LAYERS, "Close Layers Panel"),
-        CommandEntry::new(COMMAND_CLOSE_PROPERTIES, "Close Properties Panel"),
-        CommandEntry::new(COMMAND_CLOSE_HISTORY, "Close History Panel"),
-        CommandEntry::new(COMMAND_CLOSE_CHANNELS, "Close Channels Panel"),
-        CommandEntry::new(COMMAND_CLOSE_PATHS, "Close Paths Panel"),
-        CommandEntry::new(COMMAND_TOGGLE_PANELS, COMMAND_TOGGLE_PANELS_LABEL),
-        CommandEntry::new(COMMAND_RESET_PANELS, "Reset Panel Layout"),
-        CommandEntry::new(document_tabs::COMMAND_FILE_NEW, "New Document"),
-        CommandEntry::new(document_close::COMMAND_FILE_CLOSE, "Close Document"),
-        CommandEntry::new(COMMAND_FILE_OPEN, "Open File…"),
-        CommandEntry::new(document_tabs::COMMAND_DOCUMENT_NEXT, "Next Document"),
-        CommandEntry::new(
-            document_tabs::COMMAND_DOCUMENT_PREVIOUS,
-            "Previous Document",
-        ),
-        CommandEntry::new(COMMAND_FILE_SAVE, "Save As…"),
-        CommandEntry::new(psd_save::COMMAND_CHECK, psd_save::CHECK_TITLE),
-        CommandEntry::new(COMMAND_UNDO, "Undo"),
-        CommandEntry::new(COMMAND_REDO, "Redo"),
-        CommandEntry::new(COMMAND_TOGGLE_WIDGET_GALLERY, "Toggle Widget Gallery"),
-        CommandEntry::new(COMMAND_LAYER_NEW, "New Layer"),
-        CommandEntry::new(COMMAND_LAYER_DELETE, "Delete Layer"),
-        CommandEntry::new(COMMAND_LAYER_NEW_CURVES, "New Curves Layer"),
-        CommandEntry::new(COMMAND_LAYER_NEW_LEVELS, "New Levels Layer"),
-        CommandEntry::new(COMMAND_LAYER_NEW_HUE_SATURATION, "New Hue/Saturation Layer"),
-        CommandEntry::new(COMMAND_LAYER_NEW_VIBRANCE, "New Vibrance Layer"),
-        CommandEntry::new(COMMAND_LAYER_NEW_EXPOSURE, "New Exposure Layer"),
-        CommandEntry::new(COMMAND_LAYER_NEW_PHOTO_FILTER, "New Photo Filter Layer"),
-        CommandEntry::new(COMMAND_LAYER_NEW_BLACK_WHITE, "New Black & White Layer"),
-        CommandEntry::new(COMMAND_LAYER_NEW_COLOR_BALANCE, "New Color Balance Layer"),
-        CommandEntry::new(COMMAND_LAYER_NEW_INVERT, "New Invert Layer"),
-        CommandEntry::new(COMMAND_LAYER_NEW_THRESHOLD, "New Threshold Layer"),
-        CommandEntry::new(COMMAND_LAYER_NEW_POSTERIZE, "New Posterize Layer"),
-        CommandEntry::new(
-            COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST,
-            "New Brightness/Contrast Layer",
-        ),
-        CommandEntry::new(COMMAND_LAYER_NEW_CHANNEL_MIXER, "New Channel Mixer Layer"),
-        CommandEntry::new(
-            COMMAND_LAYER_NEW_SELECTIVE_COLOR,
-            "New Selective Color Layer",
-        ),
-        CommandEntry::new(COMMAND_LAYER_NEW_GRADIENT_MAP, "New Gradient Map Layer"),
-        CommandEntry::new(COMMAND_LAYER_NEW_GROUP, "New Group"),
-        CommandEntry::new(COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
-        CommandEntry::new(COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),
-        CommandEntry::new(
-            COMMAND_COLOURS_SWAP,
-            "Swap Foreground and Background Colours",
-        ),
-        CommandEntry::new(
-            zoomed_view::COMMAND_FIT_ON_SCREEN,
-            zoomed_view::FIT_ON_SCREEN_TITLE,
-        ),
-        CommandEntry::new(
-            zoomed_view::COMMAND_ACTUAL_PIXELS,
-            zoomed_view::ACTUAL_PIXELS_TITLE,
-        ),
-        CommandEntry::new(
-            COMMAND_COLOURS_RESET,
-            "Default Foreground and Background Colours",
-        ),
-        CommandEntry::new(COMMAND_SELECT_ALL, "Select All"),
-        CommandEntry::new(COMMAND_SELECT_DESELECT, "Deselect"),
-        CommandEntry::new(COMMAND_SELECT_INVERSE, "Inverse Selection"),
-        CommandEntry::new(quick_mask::COMMAND_ID, quick_mask::COMMAND_TITLE),
-        CommandEntry::new(crop::COMMAND_CROP_TO_SELECTION, crop::COMMAND_TITLE),
-        CommandEntry::new(crop::COMMAND_SWAP_ORIENTATION, crop::SWAP_ORIENTATION_TITLE),
-        CommandEntry::new(selection_store::COMMAND_SAVE, selection_store::SAVE_TITLE),
-    ];
-    commands.extend(
-        clipboard_app::COMMANDS
-            .iter()
-            .map(|(id, title, _)| CommandEntry::new(*id, *title)),
-    );
-    commands.extend(
-        paths_app::COMMANDS
-            .iter()
-            .map(|(id, title)| CommandEntry::new(*id, *title)),
-    );
-    // Colour management: the document's output profile.
-    commands.push(CommandEntry::new(
-        colour_app::COMMAND_SET_OUTPUT,
-        colour_app::TITLE_SET_OUTPUT,
-    ));
-    commands.push(CommandEntry::new(
-        colour_app::COMMAND_CLEAR_OUTPUT,
-        colour_app::TITLE_CLEAR_OUTPUT,
-    ));
-    // 0.238.0: Select > Colour Range.
-    commands.push(CommandEntry::new(
-        colour_range_app::COMMAND_ID,
-        colour_range_app::COMMAND_TITLE,
-    ));
-    // 0.216.0: Select > Modify.
-    commands.extend(
-        selection_refine::RefineKind::ALL
-            .iter()
-            .map(|kind| CommandEntry::new(kind.command_id(), kind.menu_label())),
-    );
-    // 0.239.0: the Photo Filter preset colours.
-    commands.extend((0..aurora_core::PHOTO_FILTER_PRESETS.len()).map(|i| {
-        CommandEntry::new(
-            adjust_app::preset_command_id(i),
-            adjust_app::preset_command_title(i),
-        )
-    }));
-    // 0.236.0: the Crop tool's aspect ratios.
-    commands.extend(aurora_ui::CropRatio::ALL.iter().map(|choice| {
-        CommandEntry::new(
-            crop::ratio_command_id(*choice),
-            crop::ratio_command_title(*choice),
-        )
-    }));
-    // 0.215.0: the selection tools' mode button.
-    commands.extend(aurora_doc::SelectionMode::ALL.iter().map(|mode| {
-        CommandEntry::new(
-            selection_mode_command_id(*mode),
-            selection_modes::palette_label(*mode),
-        )
-    }));
-    // 0.209.0: "Select ... Tool" for every tool (the palette had none).
-    commands.extend(aurora_ui::Tool::ALL.iter().map(|tool| {
-        CommandEntry::new(
-            tool_command_id(*tool),
-            format!("Select {} Tool", tool.label()),
-        )
-    }));
-    commands.extend(
-        PANEL_MOVE_COMMANDS
-            .iter()
-            .map(|(id, _, _, label)| CommandEntry::new(*id, *label)),
-    );
-    commands.extend(
-        PANEL_FLOAT_COMMANDS
-            .iter()
-            .map(|(id, _, _, label)| CommandEntry::new(*id, *label)),
-    );
-    commands
+    command_registry::palette_entries()
 }
 
 /// Resolves an activated command-palette entry's own `id` (one of the
