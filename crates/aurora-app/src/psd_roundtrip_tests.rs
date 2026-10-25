@@ -209,7 +209,14 @@ fn roundtrip_header(
             )
     };
     let commit = run("git", &["rev-parse", "--short", "HEAD"]);
-    let dirty = run("git", &["status", "--porcelain", "--untracked-files=no"]);
+    let dirty = run("git", &[
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            "--",
+            ".",
+            ":!docs/psd-roundtrip-report.md",
+        ]);
     let os = std::fs::read_to_string("/etc/os-release")
         .ok()
         .and_then(|s| {
@@ -227,8 +234,8 @@ fn roundtrip_header(
          - Machine: {os}, {cores} threads\n\
          - Size cap: files over {max_mb} MiB are skipped. {measured} files measured, {skipped} \
          skipped, {failed} failed.\n\
-         - Corpus: the files under `corpora/psd` in the repository, plus a local corpus of {local} \
-         files that is not in the repository; those are listed as `local file #N` and their \
+         - Corpus: the files under `corpora/psd` in the repository, plus {local} local \
+         file(s) that are not in the repository; they are listed as `local file #N` and their \
          paths are not recorded.\n\n\
          ## What this is, and what it is not\n\n\
          For each corpus PSD Aurora opens it, builds the Save As `.psd` report \
