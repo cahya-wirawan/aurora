@@ -3908,6 +3908,9 @@ enum DialogPurpose {
     /// "Save With Changes?" (0.177.0): a written PSD whose report is not
     /// empty waits in `App::pending_psd_save` for Save Anyway or Cancel.
     PsdSaveWithChanges,
+    /// "Photoshop Compatibility" (task 157): the report of Check PSD
+    /// Compatibility, or why it could not run. One "OK".
+    PsdCheck,
     /// "Welcome to Aurora" (0.257.0), the first-run welcome.
     Welcome,
 }
@@ -3983,6 +3986,7 @@ fn dialog_effect(result: &DialogResult) -> DialogEffect {
         DialogPurpose::ExportedNotSaved if action == document_close::EXPORTED_NOT_SAVED_DISMISS => {
             DialogEffect::Acknowledged
         }
+        DialogPurpose::PsdCheck if action == psd_save::PSD_CHECK_OK => DialogEffect::Acknowledged,
         DialogPurpose::Welcome => {
             first_run::welcome_choice(action).map_or(DialogEffect::Unknown, DialogEffect::Welcome)
         }
@@ -4275,6 +4279,15 @@ const OPENABLE_FORMATS: &str =
 /// The formats this build saves — [`save_failure_message`]'s own
 /// counterpart to [`OPENABLE_FORMATS`]. The same set today.
 const SAVEABLE_FORMATS: &str = "PNG, JPEG, TIFF, Photoshop (.psd) or Aurora document (.aur)";
+
+/// The report entries a PSD save (or its check) carries from the document
+/// itself: its open's own lines, missing tiles, paths and colour notes.
+fn psd_carried_entries(doc: &DocumentSession) -> Vec<aurora_io::ReportEntry> {
+    let mut carried = psd_save::carried_losses(doc.import_losses.as_deref(), &doc.skipped_tiles);
+    carried.extend(psd_save::paths_loss_entry(&doc.selection));
+    carried.extend(psd_save::colour_loss_entries(&doc.colour));
+    carried
+}
 
 /// `path`'s own file name for a dialog message, made safe to show.
 ///
@@ -6135,6 +6148,9 @@ impl FileDialogAccess for SystemFileDialog {
 enum ActivatedCommand {
     OpenFile(PathBuf),
     SaveFile(PathBuf),
+    /// Check PSD Compatibility (task 157): the Save As `.psd` report with
+    /// nothing written.
+    CheckPsd,
     Undo,
     Redo,
     /// Open or close the Widget Gallery panel (0.130.0) — returned rather
@@ -6561,6 +6577,7 @@ fn palette_commands() -> Vec<CommandEntry> {
             "Previous Document",
         ),
         CommandEntry::new(COMMAND_FILE_SAVE, "Save As…"),
+        CommandEntry::new(psd_save::COMMAND_CHECK, psd_save::CHECK_TITLE),
         CommandEntry::new(COMMAND_UNDO, "Undo"),
         CommandEntry::new(COMMAND_REDO, "Redo"),
         CommandEntry::new(COMMAND_TOGGLE_WIDGET_GALLERY, "Toggle Widget Gallery"),
@@ -6849,6 +6866,9 @@ fn activate_command(
     }
     if id == COMMAND_FILE_SAVE {
         return file_dialog.save_file().map(ActivatedCommand::SaveFile);
+    }
+    if id == psd_save::COMMAND_CHECK {
+        return Some(ActivatedCommand::CheckPsd);
     }
     if id == COMMAND_UNDO {
         return Some(ActivatedCommand::Undo);
@@ -10893,6 +10913,7 @@ fn build_menu() -> muda::Menu {
         &[
             &muda::MenuItem::with_id(COMMAND_FILE_OPEN, "Open File…", true, None),
             &muda::MenuItem::with_id(COMMAND_FILE_SAVE, "Save As…", true, None),
+            &muda::MenuItem::with_id(psd_save::COMMAND_CHECK, psd_save::CHECK_TITLE, true, None),
             // 0.174.0: routed like the palette's Close Document.
             &muda::MenuItem::with_id(document_close::COMMAND_FILE_CLOSE, "Close", true, None),
         ],
@@ -32352,6 +32373,7 @@ impl App {
             Some(ActivatedCommand::SaveFile(path)) => {
                 let _saved = self.save_file(&path);
             }
+            Some(ActivatedCommand::CheckPsd) => self.check_psd_compatibility(),
             Some(ActivatedCommand::Undo) => self.run_undo_redo(AppCommand::Undo),
             Some(ActivatedCommand::Redo) => self.run_undo_redo(AppCommand::Redo),
             Some(ActivatedCommand::ToggleWidgetGallery) => self.toggle_widget_gallery(),
@@ -34275,6 +34297,7 @@ impl App {
     /// `.psd` path and name); anything else leaves the document's saved
     /// state and path alone. Returns what happened.
     fn save_psd_file(&mut self, path: &Path) -> PsdSaveOutcome {
+        let carried = psd_carried_entries(&self.doc);
         let Some(store) = self.doc.tile_store.as_mut() else {
             self.report_save_failure(path, &SaveFailure::NoTileStorage);
             return PsdSaveOutcome::Failed;
@@ -34288,15 +34311,7 @@ impl App {
             store,
             doc_id: self.doc.id,
             revision: self.doc.undo_order.content_revision,
-            carried: {
-                let mut carried = psd_save::carried_losses(
-                    self.doc.import_losses.as_deref(),
-                    &self.doc.skipped_tiles,
-                );
-                carried.extend(psd_save::paths_loss_line(&self.doc.selection));
-                carried.extend(psd_save::colour_loss_lines(&self.doc.colour));
-                carried
-            },
+            carried,
         };
         match psd_save::begin_psd_save(source, path) {
             Ok(
@@ -34322,6 +34337,71 @@ impl App {
                 self.report_psd_save_failure(path, &failure);
                 PsdSaveOutcome::Failed
             }
+        }
+    }
+
+    /// Check PSD Compatibility (task 157): the report a Save As `.psd`
+    /// would show for the active document, in a single-OK dialog. Writes
+    /// no file and changes nothing ([`psd_save::check_psd_compatibility`]).
+    fn check_psd_compatibility(&mut self) {
+        let name = aurora_doc::sanitize_display_name(&self.doc.name).into_owned();
+        let carried = psd_carried_entries(&self.doc);
+        let Some(store) = self.doc.tile_store.as_mut() else {
+            self.open_psd_check_dialog(
+                psd_save::PSD_CHECK_FAILED_TITLE,
+                "This document has no tile storage to check. No file was written.",
+            );
+            return;
+        };
+        let source = psd_save::PsdSaveSource {
+            saved: self.doc.selection.saved_sorted(),
+            layers: &self.doc.layers,
+            canvas: self.doc.canvas_size,
+            store,
+            doc_id: self.doc.id,
+            revision: self.doc.undo_order.content_revision,
+            carried,
+        };
+        let (title, message) = match psd_save::check_psd_compatibility(source) {
+            Ok(report) => {
+                tracing::info!(
+                    report = %psd_report::SaveReport::new(&report).full_text(),
+                    "checked Photoshop compatibility"
+                );
+                (
+                    psd_save::PSD_CHECK_TITLE,
+                    psd_report::check_message(&name, &report),
+                )
+            }
+            Err(failure) => {
+                tracing::warn!(?failure, "the Photoshop compatibility check failed");
+                (
+                    psd_save::PSD_CHECK_FAILED_TITLE,
+                    psd_save::psd_check_failure_message(&failure),
+                )
+            }
+        };
+        self.open_psd_check_dialog(title, &message);
+    }
+
+    fn open_psd_check_dialog(&mut self, title: &str, message: &str) {
+        let opened = open_dialog(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.dialog,
+            &self.scales,
+            title,
+            message,
+            psd_save::psd_check_dialog_actions(),
+            DialogPurpose::PsdCheck,
+        );
+        if opened {
+            self.relayout_and_announce();
+        } else {
+            tracing::info!(
+                message,
+                "the Photoshop compatibility check could not be shown"
+            );
         }
     }
 

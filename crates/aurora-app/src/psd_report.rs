@@ -99,6 +99,7 @@ impl SaveReport {
     }
 
     /// Lines in `category`.
+    #[cfg(test)]
     pub(crate) fn count(&self, category: ReportCategory) -> usize {
         self.groups
             .iter()
@@ -129,7 +130,14 @@ impl SaveReport {
                 let n = g.entries.len();
                 match g.category {
                     ReportCategory::NeedsAttention => {
-                        format!("{n} {}", if n == 1 { "needs attention" } else { "need attention" })
+                        format!(
+                            "{n} {}",
+                            if n == 1 {
+                                "needs attention"
+                            } else {
+                                "need attention"
+                            }
+                        )
                     }
                     ReportCategory::NotSaved => format!("{n} not saved"),
                     ReportCategory::Changed => {
@@ -192,7 +200,9 @@ impl SaveReport {
                         .affected
                         .iter()
                         .take(MAX_FULL_NAMES)
-                        .map(|n| format!("\u{201c}{}\u{201d}", aurora_doc::sanitize_display_name(n)))
+                        .map(|n| {
+                            format!("\u{201c}{}\u{201d}", aurora_doc::sanitize_display_name(n))
+                        })
                         .collect();
                     text.push_str("\n    All: ");
                     text.push_str(&names.join(", "));

@@ -138,7 +138,7 @@ fn stop<T>(pos: f32, value: T) -> FillStop<T> {
     }
 }
 
-fn gradient() -> GradientFill {
+pub(super) fn gradient() -> GradientFill {
     GradientFill {
         colours: vec![
             stop(0.0, [1.0, 0.0, 0.0]),
@@ -189,7 +189,7 @@ fn pattern_overlay(id: &str, origin: (f64, f64)) -> PatternOverlay {
     }
 }
 
-fn gradient_overlay(g: GradientFill) -> GradientOverlay {
+pub(super) fn gradient_overlay(g: GradientFill) -> GradientOverlay {
     GradientOverlay {
         gate: EffectGate::default(),
         blend_mode: EffectBlendMode::Normal,

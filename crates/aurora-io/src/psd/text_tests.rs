@@ -396,6 +396,16 @@ fn unchanged_text_layers_round_trip_through_a_save() {
         "lossless: {:?}",
         outcome.report.items
     );
+    // Task 157: the kept text layers are listed as information only.
+    let kept: Vec<_> = outcome
+        .report
+        .entries
+        .iter()
+        .filter(|e| e.category == crate::ReportCategory::Kept)
+        .collect();
+    assert_eq!(kept.len(), 1, "{:?}", outcome.report.entries);
+    assert_eq!(kept[0].affected, ["Body", "Title"]);
+    assert_eq!(outcome.report.entries.len(), 1);
     assert_eq!(
         outcome.expected.text_engine.map(|(len, _)| len),
         Some(txt2().len() as u64)
@@ -442,6 +452,18 @@ fn painting_a_text_layer_drops_its_text_and_says_so() {
     assert!(text.contains("painted or erased"), "{text}");
     assert!(text.contains("\u{201c}Title\u{201d}"), "{text}");
     assert!(!text.contains("Body"), "only the edited layer: {text}");
+    // Task 157: not saved, naming the layer; the other layer is Kept.
+    let entries = &outcome.report.entries;
+    assert!(
+        entries
+            .iter()
+            .any(|e| { e.category == crate::ReportCategory::NotSaved && e.affected == ["Title"] })
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| { e.category == crate::ReportCategory::Kept && e.affected == ["Body"] })
+    );
     assert_eq!(text_names(&tree), vec!["Body"]);
     // The engine block still goes with the layer that kept its text.
     assert!(tree.text_engine_data().is_some());

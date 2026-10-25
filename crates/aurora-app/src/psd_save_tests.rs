@@ -16,6 +16,11 @@ use crate::psd_save::{
 };
 use crate::{DialogEffect, DialogPurpose, DialogResult, FileDialogAccess, UndoRevision};
 
+/// The sentences of `entries`.
+fn texts(entries: &[aurora_io::ReportEntry]) -> Vec<String> {
+    entries.iter().map(|e| e.text.clone()).collect()
+}
+
 fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     match r {
         Ok(v) => v,
@@ -84,7 +89,7 @@ impl Doc {
     fn save_carrying(
         &mut self,
         path: &Path,
-        carried: Vec<String>,
+        carried: Vec<aurora_io::ReportEntry>,
     ) -> Result<PsdSaveStep, PsdSaveFailure> {
         self.save_selections(path, carried, Vec::new())
     }
@@ -92,7 +97,7 @@ impl Doc {
     fn save_selections(
         &mut self,
         path: &Path,
-        carried: Vec<String>,
+        carried: Vec<aurora_io::ReportEntry>,
         saved: Vec<(&str, &aurora_doc::Selection)>,
     ) -> Result<PsdSaveStep, PsdSaveFailure> {
         begin_psd_save(
@@ -278,18 +283,19 @@ fn run_dialog_action_maps_psd_save_actions() {
 }
 
 #[test]
-fn save_psd_message_lists_items_in_fixed_order() {
-    let report = aurora_io::PsdWriteReport {
-        items: vec!["First.".to_owned(), "Second.".to_owned()],
-    };
+fn save_psd_message_groups_items_by_category_with_counts() {
+    let report = aurora_io::PsdWriteReport::from_entries(vec![
+        aurora_io::ReportEntry::new(aurora_io::ReportCategory::Changed, "Second."),
+        aurora_io::ReportEntry::new(aurora_io::ReportCategory::NotSaved, "First."),
+    ]);
     let message = psd_save_message("art.psd", &report);
     assert_eq!(
         message,
-        "Saving \u{201c}art.psd\u{201d} as a Photoshop file changes it:\n\u{2022} First.\n\
-         \u{2022} Second.\nSave Anyway writes the file with these changes; your document is not \
-         changed. Nothing has been written yet."
+        "Saving \u{201c}art.psd\u{201d} as a Photoshop file changes it (1 not saved, 1 \
+         change):\nNot saved:\n\u{2022} First.\nChanged:\n\u{2022} Second.\nSave Anyway writes \
+         the file with these changes; your document is not changed. Nothing has been written yet."
     );
-    // And a real report's items arrive in the writer's own fixed order.
+    // And a real report's groups arrive in the fixed group order.
     let mut doc = Doc::new();
     doc.make_lossy();
     let top = doc.tree.roots().first().copied();
@@ -302,10 +308,12 @@ fn save_psd_message_lists_items_in_fixed_order() {
     let message = psd_save_message("a.psd", &pending.report);
     let opacity = message.find("rounded to Photoshop's 255 steps");
     let dissolve = message.find("Dissolve layers");
+    // Needs attention (Dissolve) comes before Changed (the rounding).
     assert!(
-        opacity.is_some() && dissolve.is_some() && opacity < dissolve,
+        opacity.is_some() && dissolve.is_some() && dissolve < opacity,
         "{message}"
     );
+    assert!(message.contains("(1 needs attention, 1 change)"), "{message}");
 }
 
 /// A dirty session holding `doc`'s layers.
@@ -457,9 +465,11 @@ fn a_psd_opened_with_changes_always_asks_before_a_psd_save() {
     let losses = Some(opened.report.items.clone());
     let skipped = aurora_io::SkippedTiles::new();
     let carried = crate::psd_save::carried_losses(losses.as_deref(), &skipped);
-    assert_eq!(
-        carried.first().map(String::as_str),
-        Some(crate::psd_save::CARRIED_HEADING)
+    assert!(
+        !carried.is_empty()
+            && carried
+                .iter()
+                .all(|e| e.category == aurora_io::ReportCategory::FromOpen)
     );
     // Saving over the very file it came from: a flat, otherwise lossless
     // document, so only the carried block is in the report.
@@ -469,7 +479,7 @@ fn a_psd_opened_with_changes_always_asks_before_a_psd_save() {
     else {
         unreachable!("needs confirmation")
     };
-    assert_eq!(pending.report.items, carried);
+    assert_eq!(pending.report.items, texts(&carried));
     assert_eq!(ok(std::fs::read(&target)), bytes, "target untouched");
     drop(pending);
     assert_eq!(doc.listing(), ["source.psd"], "temp removed");
@@ -504,8 +514,11 @@ fn new_and_other_documents_carry_no_losses_of_their_own() {
     let none = aurora_io::SkippedTiles::new();
     assert!(crate::psd_save::carried_losses(fresh.import_losses.as_deref(), &none).is_empty());
     assert_eq!(
-        crate::psd_save::carried_losses(opened.import_losses.as_deref(), &none).len(),
-        2
+        texts(&crate::psd_save::carried_losses(
+            opened.import_losses.as_deref(),
+            &none
+        )),
+        ["Clipping masks are shown unclipped."]
     );
 }
 
@@ -874,15 +887,17 @@ fn lossy_open(doc: &mut Doc) -> (Vec<u8>, Vec<String>) {
 /// `bytes`): it asks, carries the block, and leaves the target alone.
 fn assert_asks(doc: &mut Doc, target: &Path, bytes: &[u8], losses: Option<&[String]>) {
     let carried = crate::psd_save::carried_losses(losses, &aurora_io::SkippedTiles::new());
-    assert_eq!(
-        carried.first().map(String::as_str),
-        Some(crate::psd_save::CARRIED_HEADING)
+    assert!(
+        !carried.is_empty()
+            && carried
+                .iter()
+                .all(|e| e.category == aurora_io::ReportCategory::FromOpen)
     );
     let PsdSaveStep::NeedsConfirmation(pending) = ok(doc.save_carrying(target, carried.clone()))
     else {
         unreachable!("needs confirmation")
     };
-    assert_eq!(pending.report.items, carried);
+    assert_eq!(pending.report.items, texts(&carried));
     assert_eq!(ok(std::fs::read(target)), bytes, "target untouched");
 }
 
@@ -1517,7 +1532,7 @@ fn a_grayscale_open_carries_the_colour_mode_change_into_the_save_report() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("Grayscale") && l.contains("writes an RGB file")),
+            .any(|l| l.text.contains("Grayscale") && l.text.contains("writes an RGB file")),
         "{lines:?}"
     );
 }
@@ -1561,11 +1576,16 @@ fn a_document_converted_from_another_profile_makes_the_psd_save_ask() {
     assert!(line.contains("not kept"), "{line}");
     assert!(line.contains("clipped"), "{line}");
     let target = doc.path("converted.psd");
-    let PsdSaveStep::NeedsConfirmation(pending) = ok(doc.save_carrying(&target, lines.clone()))
+    let PsdSaveStep::NeedsConfirmation(pending) =
+        ok(doc.save_carrying(&target, crate::psd_save::colour_loss_entries(&colour)))
     else {
         unreachable!("a converted document must ask before a Photoshop save")
     };
     assert_eq!(pending.report.items, lines);
+    assert_eq!(
+        pending.report.entries.first().map(|e| e.category),
+        Some(aurora_io::ReportCategory::NeedsAttention)
+    );
     // Nothing without a source profile; an output profile is itemised too.
     assert!(crate::psd_save::colour_loss_lines(&aurora_io::DocumentColour::default()).is_empty());
     let both = crate::psd_save::colour_loss_lines(&aurora_io::DocumentColour {
@@ -1629,7 +1649,7 @@ fn a_cmyk_or_32_bit_open_carries_its_conversion_into_the_psd_save_report() {
         assert!(
             carried
                 .iter()
-                .any(|l| l.contains(needle) && l.contains("not kept")),
+                .any(|l| l.text.contains(needle) && l.text.contains("not kept")),
             "{carried:?}"
         );
         let PsdSaveStep::NeedsConfirmation(pending) =
@@ -1637,7 +1657,7 @@ fn a_cmyk_or_32_bit_open_carries_its_conversion_into_the_psd_save_report() {
         else {
             unreachable!("a converted open asks before a PSD save")
         };
-        assert_eq!(pending.report.items, carried);
+        assert_eq!(pending.report.items, texts(&carried));
         assert_eq!(ok(std::fs::read(&target)), bytes, "target untouched");
     }
 }
