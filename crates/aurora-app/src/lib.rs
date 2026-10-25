@@ -99659,6 +99659,9 @@ mod frame_composite_tests;
 mod menu_bar_tests;
 
 #[cfg(test)]
+mod bridge_app_tests;
+
+#[cfg(test)]
 mod palette_scroll_app_tests;
 
 #[cfg(test)]

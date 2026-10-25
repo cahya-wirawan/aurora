@@ -140,7 +140,7 @@ impl Job {
         !self.abandoned.load(Ordering::SeqCst)
     }
 
-    fn start(&self) {
+    pub(crate) fn start(&self) {
         self.started.store(true, Ordering::SeqCst);
     }
 
@@ -170,16 +170,24 @@ pub(crate) struct CapturedFrame {
     pub(crate) rgba: Vec<u8>,
 }
 
-struct AppDispatcher {
+pub(crate) struct AppDispatcher {
     tx: mpsc::SyncSender<Job>,
-    proxy: Mutex<EventLoopProxy<AppEvent>>,
+    /// Wakes the UI thread's event loop.
+    wake: Box<dyn Fn() + Send + Sync>,
     wait: Duration,
 }
 
 impl AppDispatcher {
+    pub(crate) fn new(
+        tx: mpsc::SyncSender<Job>,
+        wake: Box<dyn Fn() + Send + Sync>,
+        wait: Duration,
+    ) -> Self {
+        Self { tx, wake, wait }
+    }
+
     fn wake(&self) {
-        let proxy = self.proxy.lock().unwrap_or_else(PoisonError::into_inner);
-        let _ = proxy.send_event(AppEvent::Bridge);
+        (self.wake)();
     }
 }
 
@@ -275,11 +283,15 @@ impl Bridge {
         })?;
         let token_text = token::generate()?;
         let (tx, rx) = mpsc::sync_channel(QUEUE_CAPACITY);
-        let dispatcher = Arc::new(AppDispatcher {
+        let proxy = Mutex::new(proxy);
+        let dispatcher = Arc::new(AppDispatcher::new(
             tx,
-            proxy: Mutex::new(proxy),
-            wait: CALL_TIMEOUT,
-        });
+            Box::new(move || {
+                let proxy = proxy.lock().unwrap_or_else(PoisonError::into_inner);
+                let _ = proxy.send_event(AppEvent::Bridge);
+            }),
+            CALL_TIMEOUT,
+        ));
         let config = ServerConfig {
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             ..ServerConfig::default()
@@ -357,7 +369,7 @@ impl Bridge {
         AUTOMATION_CONNECTED.store(false, Ordering::SeqCst);
     }
 
-    fn take_jobs(&self, max: usize) -> Vec<Job> {
+    pub(crate) fn take_jobs(&self, max: usize) -> Vec<Job> {
         let mut jobs = Vec::new();
         while jobs.len() < max {
             match self.rx.try_recv() {

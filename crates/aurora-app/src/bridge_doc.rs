@@ -73,6 +73,36 @@ impl crate::FileDialogAccess for NoDialogs {
     }
 }
 
+/// Commands the bridge never runs: quitting and the bridge's own control
+/// (blocked by id), the file commands (`doc_open` / `doc_save` reach files
+/// through the roots) and anything with a file-path parameter.
+pub(crate) fn command_gate(id: &str) -> Result<(), CallError> {
+    if BLOCKED_COMMANDS.contains(&id) {
+        return Err(CallError::new(
+            "refused",
+            format!("`{id}` is not available over the bridge"),
+        ));
+    }
+    if id == crate::COMMAND_FILE_OPEN || id == crate::COMMAND_FILE_SAVE {
+        return Err(CallError::new(
+            "refused",
+            "use doc_open and doc_save: files are only reached through the bridge's roots",
+        ));
+    }
+    if let Some(spec) = command_registry::registry().get(id)
+        && spec
+            .params
+            .iter()
+            .any(|p| matches!(p.kind, ParamKind::Path { .. }))
+    {
+        return Err(CallError::new(
+            "refused",
+            format!("`{id}` takes a file path; the bridge does not pass paths to commands"),
+        ));
+    }
+    Ok(())
+}
+
 impl App {
     pub(crate) fn bridge_command_context(&self) -> Value {
         let facts = command_registry::facts(&self.menu_context());
@@ -101,29 +131,7 @@ impl App {
         let validated = registry
             .validate_args(&id, &args)
             .map_err(|e| bad(e.to_string()))?;
-        if BLOCKED_COMMANDS.contains(&id.as_str()) {
-            return Err(CallError::new(
-                "refused",
-                format!("`{id}` is not available over the bridge"),
-            ));
-        }
-        if id == crate::COMMAND_FILE_OPEN || id == crate::COMMAND_FILE_SAVE {
-            return Err(CallError::new(
-                "refused",
-                "use doc_open and doc_save: files are only reached through the bridge's roots",
-            ));
-        }
-        if let Some(spec) = registry.get(&id)
-            && spec
-                .params
-                .iter()
-                .any(|p| matches!(p.kind, ParamKind::Path { .. }))
-        {
-            return Err(CallError::new(
-                "refused",
-                format!("`{id}` takes a file path; the bridge does not pass paths to commands"),
-            ));
-        }
+        command_gate(&id)?;
         let context = command_registry::facts(&self.menu_context());
         if let Err(reason) = registry.check_enabled(&id, &context) {
             return Err(CallError::new(
@@ -316,32 +324,8 @@ impl App {
                 .bridge
                 .as_ref()
                 .ok_or_else(|| CallError::new("unavailable", "the bridge is off"))?;
-            let mut source = std::fs::File::open(&out)
-                .map_err(|e| CallError::new("failed", format!("reading the export: {e}")))?;
-            let total = source.metadata().map_or(0, |m| m.len());
-            if total > MAX_EXPORT_BYTES {
-                return Err(CallError::new(
-                    "refused",
-                    "the export is larger than the limit",
-                ));
-            }
-            let mut target = bridge
-                .roots
-                .create_write(&path)
-                .map_err(|e| CallError::new("refused", e.to_string()))?;
-            let file = target
-                .file()
-                .ok_or_else(|| CallError::new("failed", "the target is not open"))?;
-            aurora_automation::roots::copy_bounded(&mut source, file, MAX_EXPORT_BYTES, |_| true)
-                .map_err(|e| CallError::new("failed", format!("writing {path}: {e}")))?;
-            file.flush()
-                .and_then(|()| file.sync_all())
-                .map_err(|e| CallError::new("failed", format!("writing {path}: {e}")))?;
-            let display = target.display().to_owned();
-            target.commit();
-            Ok(
-                json!({"saved": true, "path": display, "format": extension, "bytes": total, "report": report}),
-            )
+            let total = commit_export(&bridge.roots, &out, &path)?;
+            Ok(json!({"saved": true, "path": path, "format": extension, "bytes": total, "report": report}))
         })();
         let _ = std::fs::remove_dir_all(&directory);
         answer
@@ -382,58 +366,99 @@ impl App {
         if let Some(old) = bridge.staged.take() {
             let _ = std::fs::remove_dir_all(old);
         }
-        let mut read = bridge
-            .roots
-            .open_read(&path, MAX_OPEN_BYTES)
-            .map_err(|e| CallError::new("refused", e.to_string()))?;
-        let max_pixels = bridge.max_pixels;
-        check_header(&mut read.file, max_pixels)?;
-        std::io::Seek::seek(&mut read.file, std::io::SeekFrom::Start(0))
-            .map_err(|e| CallError::new("failed", e.to_string()))?;
         let n = bridge.next_counter();
         let dir = bridge.scratch.path().join(format!("open-{n}"));
-        std::fs::create_dir(&dir).map_err(|e| CallError::new("failed", format!("scratch: {e}")))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        }
         bridge.staged = Some(dir.clone());
-        // The copy keeps the file's own name (the tab and title show it) but
-        // never anything from the caller's path.
-        let name: String = read
-            .name
-            .chars()
-            .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
-            .take(120)
-            .collect();
-        let staged = dir.join(if name.is_empty() {
-            "document".to_owned()
-        } else {
-            name
-        });
-        let mut out = std::fs::OpenOptions::new();
-        out.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            out.mode(0o600);
-        }
-        let mut out = out
-            .open(&staged)
-            .map_err(|e| CallError::new("failed", format!("scratch file: {e}")))?;
-        aurora_automation::roots::copy_bounded(&mut read.file, &mut out, MAX_OPEN_BYTES, |_| true)
-            .map_err(|e| CallError::new("failed", format!("reading {}: {e}", read.name)))?;
-        out.flush()
-            .map_err(|e| CallError::new("failed", e.to_string()))?;
-        drop(out);
-        // Again on the copy, which is what gets decoded.
-        let mut copy =
-            std::fs::File::open(&staged).map_err(|e| CallError::new("failed", e.to_string()))?;
-        check_header(&mut copy, max_pixels)?;
-        mcp_session::HeadlessSession::check_aur_header(&staged, max_pixels).map_err(failure)?;
-        Ok(staged)
+        stage_open_file(&bridge.roots, &dir, &path, bridge.max_pixels)
     }
+}
+
+/// Confines `path` to the read roots, checks its header, and copies it into
+/// the new private directory `dir` (keeping its file name), checking the
+/// header again on the copy, which is what gets decoded.
+pub(crate) fn stage_open_file(
+    roots: &aurora_automation::Roots,
+    dir: &std::path::Path,
+    path: &str,
+    max_pixels: u64,
+) -> Result<std::path::PathBuf, CallError> {
+    let mut read = roots
+        .open_read(path, MAX_OPEN_BYTES)
+        .map_err(|e| CallError::new("refused", e.to_string()))?;
+    check_header(&mut read.file, max_pixels)?;
+    std::io::Seek::seek(&mut read.file, std::io::SeekFrom::Start(0))
+        .map_err(|e| CallError::new("failed", e.to_string()))?;
+    std::fs::create_dir(dir).map_err(|e| CallError::new("failed", format!("scratch: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    // The copy keeps the file's own name (the tab and title show it) but
+    // never anything from the caller's path.
+    let name: String = read
+        .name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .take(120)
+        .collect();
+    let staged = dir.join(if name.is_empty() {
+        "document".to_owned()
+    } else {
+        name
+    });
+    let mut out = std::fs::OpenOptions::new();
+    out.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        out.mode(0o600);
+    }
+    let mut out = out
+        .open(&staged)
+        .map_err(|e| CallError::new("failed", format!("scratch file: {e}")))?;
+    aurora_automation::roots::copy_bounded(&mut read.file, &mut out, MAX_OPEN_BYTES, |_| true)
+        .map_err(|e| CallError::new("failed", format!("reading {}: {e}", read.name)))?;
+    out.flush()
+        .map_err(|e| CallError::new("failed", e.to_string()))?;
+    drop(out);
+    let mut copy =
+        std::fs::File::open(&staged).map_err(|e| CallError::new("failed", e.to_string()))?;
+    check_header(&mut copy, max_pixels)?;
+    mcp_session::HeadlessSession::check_aur_header(&staged, max_pixels).map_err(failure)?;
+    Ok(staged)
+}
+
+/// Copies the finished export `out` into a NEW file `path` inside a write
+/// root (`create_new`; an existing target is never touched; a failure
+/// removes the file this call created).
+pub(crate) fn commit_export(
+    roots: &aurora_automation::Roots,
+    out: &std::path::Path,
+    path: &str,
+) -> Result<u64, CallError> {
+    let mut source = std::fs::File::open(out)
+        .map_err(|e| CallError::new("failed", format!("reading the export: {e}")))?;
+    let total = source.metadata().map_or(0, |m| m.len());
+    if total > MAX_EXPORT_BYTES {
+        return Err(CallError::new(
+            "refused",
+            "the export is larger than the limit",
+        ));
+    }
+    let mut target = roots
+        .create_write(path)
+        .map_err(|e| CallError::new("refused", e.to_string()))?;
+    let file = target
+        .file()
+        .ok_or_else(|| CallError::new("failed", "the target is not open"))?;
+    aurora_automation::roots::copy_bounded(&mut source, file, MAX_EXPORT_BYTES, |_| true)
+        .map_err(|e| CallError::new("failed", format!("writing {path}: {e}")))?;
+    file.flush()
+        .and_then(|()| file.sync_all())
+        .map_err(|e| CallError::new("failed", format!("writing {path}: {e}")))?;
+    target.commit();
+    Ok(total)
 }
 
 fn check_header(

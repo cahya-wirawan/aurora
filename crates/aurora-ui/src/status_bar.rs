@@ -680,4 +680,24 @@ mod tests {
         let none = StatusInfo { crop: None, ..info };
         assert!(!super::document_label_text(&none).contains("Crop"));
     }
+
+    #[test]
+    fn the_automation_indicator_is_never_hidden_behind_a_notice() {
+        let info = StatusInfo {
+            zoom: 1.0,
+            scale_factor: 1.0,
+            document_size: (10, 10),
+            sample: SampleFormat::F16,
+            notice: Some("A layer is locked."),
+            selection: None,
+            quick_mask: false,
+            crop: None,
+            automation: true,
+        };
+        let shown = with_automation(info.notice.map_or_else(|| document_label_text(&info), str::to_owned), &info);
+        assert!(shown.starts_with("A layer is locked."), "{shown}");
+        assert!(shown.ends_with(AUTOMATION_TEXT), "{shown}");
+        let off = StatusInfo { automation: false, ..info };
+        assert_eq!(with_automation("x".to_owned(), &off), "x");
+    }
 }
