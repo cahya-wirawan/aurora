@@ -30,6 +30,18 @@ fn groups_come_in_the_documented_order_whatever_the_arrival_order() {
     assert_eq!(forward, backward);
     let order: Vec<ReportCategory> = forward.groups.iter().map(|g| g.category).collect();
     assert_eq!(order, ReportCategory::ALL);
+    // The documented order, spelled out: what needs a decision comes first.
+    assert_eq!(
+        order,
+        [
+            ReportCategory::NeedsAttention,
+            ReportCategory::NotSaved,
+            ReportCategory::Changed,
+            ReportCategory::FromOpen,
+            ReportCategory::Kept,
+        ]
+    );
+    assert!(ReportCategory::NeedsAttention < ReportCategory::Kept);
 }
 
 #[test]
