@@ -694,17 +694,17 @@ mod tests {
             crop: None,
             automation: true,
         };
-        let shown = with_automation(
+        let shown = super::with_automation(
             info.notice
-                .map_or_else(|| document_label_text(&info), str::to_owned),
+                .map_or_else(|| super::document_label_text(&info), str::to_owned),
             &info,
         );
         assert!(shown.starts_with("A layer is locked."), "{shown}");
-        assert!(shown.ends_with(AUTOMATION_TEXT), "{shown}");
+        assert!(shown.ends_with(super::AUTOMATION_TEXT), "{shown}");
         let off = StatusInfo {
             automation: false,
             ..info
         };
-        assert_eq!(with_automation("x".to_owned(), &off), "x");
+        assert_eq!(super::with_automation("x".to_owned(), &off), "x");
     }
 }
