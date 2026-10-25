@@ -49,7 +49,7 @@ pub(crate) const QUEUE_CAPACITY: usize = 16;
 /// Requests the UI thread runs in one loop turn.
 pub(crate) const JOBS_PER_TURN: usize = 4;
 /// How long a connection thread waits for the UI thread.
-pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_mins(1);
 /// A pending screenshot or open that has not finished after this is failed.
 pub(crate) const ASYNC_TIMEOUT: Duration = Duration::from_secs(50);
 
@@ -88,13 +88,15 @@ impl BridgeOptions {
         args: &[String],
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
-        let mut options = Self::default();
-        options.enabled = env("AURORA_MCP_BRIDGE").is_some_and(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
-        });
+        let mut options = Self {
+            enabled: env("AURORA_MCP_BRIDGE").is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            }),
+            ..Self::default()
+        };
         if let Some(list) = env("AURORA_MCP_BRIDGE_ROOTS").filter(|v| !v.is_empty()) {
             options.roots.extend(std::env::split_paths(&list));
         }
@@ -215,24 +217,22 @@ impl Dispatcher for AppDispatcher {
             }
         }
         self.wake();
-        match answer.recv_timeout(self.wait) {
-            Ok(result) => result,
-            Err(_) => {
-                abandoned.store(true, Ordering::SeqCst);
-                if started.load(Ordering::SeqCst) {
-                    Err(CallError::new(
-                        "timeout",
-                        "no reply in time: the app started the request and it may still apply; \
-                         check the window before retrying",
-                    ))
-                } else {
-                    Err(CallError::new(
-                        "timeout",
-                        "timeout: not run (the app did not get to the request; it is safe to \
-                         send again)",
-                    ))
-                }
-            }
+        if let Ok(result) = answer.recv_timeout(self.wait) {
+            return result;
+        }
+        abandoned.store(true, Ordering::SeqCst);
+        if started.load(Ordering::SeqCst) {
+            Err(CallError::new(
+                "timeout",
+                "no reply in time: the app started the request and it may still apply; \
+                 check the window before retrying",
+            ))
+        } else {
+            Err(CallError::new(
+                "timeout",
+                "timeout: not run (the app did not get to the request; it is safe to \
+                 send again)",
+            ))
         }
     }
 

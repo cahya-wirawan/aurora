@@ -38964,6 +38964,7 @@ const MIN_WINDOW_WIDTH: f64 = 640.0;
 const MIN_WINDOW_HEIGHT: f64 = 480.0;
 
 impl ApplicationHandler<AppEvent> for App {
+    #[allow(clippy::too_many_lines)]
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() {
             return;

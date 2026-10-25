@@ -277,6 +277,7 @@ fn report_json(name: &str, report: &aurora_io::PsdWriteReport) -> Value {
 }
 
 /// The document as JSON (layer tree, history, selection, canvas size).
+#[allow(clippy::needless_pass_by_value)] // a bundle of borrows
 pub(crate) fn inspect_json(view: InspectView<'_>) -> Value {
     view.undo_order.sync_labels();
     let mut count = 0;
@@ -974,6 +975,7 @@ fn carried_for(parts: &ExportParts<'_>) -> Vec<aurora_io::ReportEntry> {
 ///
 /// # Errors
 /// A refusal (a canvas over 30,000 px, ...) or a cancel.
+#[allow(clippy::needless_pass_by_value)] // a bundle of borrows
 pub(crate) fn psd_check_document(
     parts: ExportParts<'_>,
     cancelled: &dyn Fn() -> bool,
@@ -1003,7 +1005,7 @@ pub(crate) fn psd_check_document(
 ///
 /// # Errors
 /// A refusal, a failure or a cancel.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 pub(crate) fn export_document(
     parts: ExportParts<'_>,
     kind: ExportKind,

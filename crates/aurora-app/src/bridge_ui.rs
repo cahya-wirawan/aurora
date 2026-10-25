@@ -168,6 +168,7 @@ fn number(job: &Job, name: &str) -> Result<Option<f64>, CallError> {
 
 impl App {
     /// Describes the widget tree: roles, names, states and logical bounds.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn bridge_ui_inspect(&mut self, job: &Job) -> Result<Value, CallError> {
         let include_hidden = job
             .param("include_hidden")
@@ -392,8 +393,8 @@ impl App {
                 .ok_or_else(|| bad(format!("no widget {id}")))?;
             #[allow(clippy::cast_precision_loss)]
             return Ok((
-                rect.x as f64 + rect.width as f64 / 2.0,
-                rect.y as f64 + rect.height as f64 / 2.0,
+                rect.x as f64 + f64::from(rect.width) / 2.0,
+                rect.y as f64 + f64::from(rect.height) / 2.0,
             ));
         }
         match (number(job, x)?, number(job, y)?) {
@@ -603,6 +604,7 @@ impl crate::FileDialogAccess for RefuseDialogs {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
 
     #[test]

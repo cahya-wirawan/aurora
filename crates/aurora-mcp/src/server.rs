@@ -165,8 +165,8 @@ pub struct UiScreenshotParams {
 pub struct UiPointerParams {
     /// `move`, `click`, `double_click`, `drag` or `scroll`.
     pub action: String,
-    /// Logical window pixels (the same units as ui_inspect bounds). Or give
-    /// `id`, a widget id from ui_inspect: its centre is used.
+    /// Logical window pixels (the same units as `ui_inspect` bounds). Or give
+    /// `id`, a widget id from `ui_inspect`: its centre is used.
     #[serde(default)]
     pub x: Option<f64>,
     #[serde(default)]
