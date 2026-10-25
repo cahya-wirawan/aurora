@@ -505,41 +505,85 @@ async fn staged_copies_are_owner_only() {
     assert_eq!(seen.staged_modes.lock().unwrap().as_slice(), [0o600]);
 }
 
+/// A directory shaped like one of the server's, with or without its marker
+/// and lock file.
+fn fake_scratch(
+    parent: &std::path::Path,
+    suffix: &str,
+    marker: bool,
+    lock: bool,
+) -> std::path::PathBuf {
+    use aurora_mcp::scratch::{LOCK_FILE, MARKER_FILE, PREFIX};
+    let dir = parent.join(format!("{PREFIX}{suffix}"));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("open-1.psd"), vec![0_u8; 1024]).unwrap();
+    if marker {
+        std::fs::write(dir.join(MARKER_FILE), b"x").unwrap();
+    }
+    if lock {
+        std::fs::write(dir.join(LOCK_FILE), b"").unwrap();
+    }
+    dir
+}
+
 #[test]
-fn a_dead_servers_scratch_is_swept_and_a_live_ones_is_not() {
+fn a_dead_servers_scratch_is_swept_and_nothing_else_is() {
     use aurora_mcp::scratch::{PREFIX, Scratch, sweep_stale};
     let parent = tempfile::tempdir().unwrap();
-    // a crashed server's leftovers: a directory with an unlocked lock file
-    let dead = parent.path().join(format!("{PREFIX}dead"));
-    std::fs::create_dir(&dead).unwrap();
-    std::fs::write(dead.join(".lock"), b"").unwrap();
-    std::fs::write(dead.join("open-1.psd"), vec![0_u8; 1024]).unwrap();
-    // someone else's directory and a file with the prefix
-    let other = parent.path().join("photos");
-    std::fs::create_dir(&other).unwrap();
-    std::fs::write(parent.path().join(format!("{PREFIX}file")), b"x").unwrap();
-    // a directory with no lock file yet (a server still starting)
-    let young = parent.path().join(format!("{PREFIX}young"));
-    std::fs::create_dir(&young).unwrap();
-    // a symlink with the prefix pointing at a directory that must survive
+    let dead = fake_scratch(parent.path(), "AbCd1234", true, true);
+    // a person's own directory that happens to start with the prefix
+    let notes = parent.path().join(format!("{PREFIX}notes"));
+    std::fs::create_dir(&notes).unwrap();
+    std::fs::write(notes.join("todo.txt"), b"mine").unwrap();
+    // right name shape but no marker (not made by this server), even with a lock file
+    let markerless = fake_scratch(parent.path(), "Zz990011", false, true);
+    let markerless_nolock = fake_scratch(parent.path(), "Yy880022", false, false);
+    // marked, but its lock file is gone: maybe a live server's, left alone
+    let no_lock = fake_scratch(parent.path(), "Xx770033", true, false);
+    // right shape, wrong length
+    let long = fake_scratch(parent.path(), "toolongsuffix1", true, true);
+    // a plain file and a symlink wearing the name
+    std::fs::write(parent.path().join(format!("{PREFIX}file1234")), b"x").unwrap();
     let precious = tempfile::tempdir().unwrap();
     std::fs::write(precious.path().join("keep"), b"x").unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(precious.path(), parent.path().join(format!("{PREFIX}link")))
-        .unwrap();
+    std::fs::write(precious.path().join(".aurora-mcp-scratch"), b"x").unwrap();
+    std::fs::write(precious.path().join(".lock"), b"").unwrap();
+    std::os::unix::fs::symlink(
+        precious.path(),
+        parent.path().join(format!("{PREFIX}Link1234")),
+    )
+    .unwrap();
     // a live server
     let live = Scratch::create(Some(parent.path())).unwrap();
-    assert!(!dead.exists(), "the dead server's directory was swept");
+    assert!(
+        !dead.exists(),
+        "the marked dead server's directory was swept"
+    );
+    for survivor in [&notes, &markerless, &markerless_nolock, &no_lock, &long] {
+        assert!(survivor.exists(), "{} must survive", survivor.display());
+    }
+    assert_eq!(std::fs::read(notes.join("todo.txt")).unwrap(), b"mine");
+    assert!(
+        precious.path().join("keep").exists(),
+        "a symlink is never followed"
+    );
     assert!(live.path().exists());
-    assert!(other.exists() && young.exists());
-    assert!(precious.path().join("keep").exists());
-    // a second start sweeps again and still leaves the live one
+    // a live server survives even when a tmp cleaner removed its lock file
+    std::fs::remove_file(live.path().join(".lock")).unwrap();
     let second = Scratch::create(Some(parent.path())).unwrap();
     assert!(live.path().exists() && second.path().exists());
     assert_eq!(sweep_stale(parent.path()), 0);
     let gone = live.path().to_path_buf();
     drop(live);
     assert!(!gone.exists(), "a clean exit removes the directory");
+    // the real names have the exact shape the sweep requires
+    let name = second
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(name.len(), PREFIX.len() + aurora_mcp::scratch::RANDOM_LEN);
 }
 
 // ----- protocol edge cases --------------------------------------------------

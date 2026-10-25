@@ -477,56 +477,15 @@ impl AuroraMcp {
         let inner = Arc::clone(&self.inner);
         let counter = self.next_counter();
         Self::spawn(ctx, Cancel::new(), move |cancel| {
-            let limits = inner.limits;
-            let mut read = inner
-                .roots
-                .open_read(&path, limits.max_open_bytes)
-                .map_err(|e| SessionError::Refused(e.to_string()))?;
-            // The header says how big the picture is before a byte is
-            // decoded or copied.
-            match header::dimensions(&mut read.file) {
-                Err(message) => return Err(SessionError::Refused(message)),
-                Ok(Some(d)) if d.width == 0 || d.height == 0 => {
-                    return Err(SessionError::Refused(format!(
-                        "the {} header declares an empty picture",
-                        d.format
-                    )));
-                }
-                Ok(Some(d)) if d.pixels() > limits.max_open_pixels => {
-                    return Err(SessionError::Refused(format!(
-                        "the {} header declares {} x {} px ({} Mpx); at most {} Mpx may be \
-                         opened (raise it with --max-open-mpx)",
-                        d.format,
-                        d.width,
-                        d.height,
-                        d.pixels() / 1_000_000,
-                        limits.max_open_pixels / 1_000_000
-                    )));
-                }
-                Ok(_) => {}
-            }
-            read.file
-                .seek(std::io::SeekFrom::Start(0))
-                .map_err(|e| SessionError::Failed(format!("reading {}: {e}", read.name)))?;
-            let extension = safe_extension(&read.name);
-            let staged = ScratchFile(
-                inner
-                    .scratch
-                    .path()
-                    .join(format!("open-{counter}.{extension}")),
-            );
-            let mut out = private_file(&staged.0)
-                .map_err(|e| SessionError::Failed(format!("scratch file: {e}")))?;
-            let completed = copy_bounded(&mut read.file, &mut out, limits.max_open_bytes, |_| {
-                !cancel.is_cancelled()
-            })
-            .map_err(|e| SessionError::Failed(format!("reading {}: {e}", read.name)))?;
-            if !completed {
-                return Err(SessionError::Cancelled);
-            }
-            out.flush()
-                .map_err(|e| SessionError::Failed(format!("scratch file: {e}")))?;
-            Ok((staged, read.name))
+            stage_file(
+                &inner.roots,
+                &inner.limits,
+                inner.scratch.path(),
+                counter,
+                &path,
+                cancel,
+                &|| {},
+            )
         })
         .await
     }
@@ -833,6 +792,73 @@ impl AuroraMcp {
 
     async fn inspect_value(&self) -> Result<Value, Fail> {
         Ok(self.blocking(None, |s, _| s.inspect()).await?)
+    }
+}
+
+/// Copies the confined file at `path` into `scratch` and returns the copy.
+/// The header is checked on the original (before a byte is copied) **and
+/// again on the copy**, which is what the host opens: a file modified in
+/// place between the first check and the copy cannot slip a bigger picture
+/// past the cap. `between` runs after the first check (a test seam).
+fn stage_file(
+    roots: &Roots,
+    limits: &Limits,
+    scratch: &Path,
+    counter: u64,
+    path: &str,
+    cancel: &Cancel,
+    between: &dyn Fn(),
+) -> Result<(ScratchFile, String), SessionError> {
+    let mut read = roots
+        .open_read(path, limits.max_open_bytes)
+        .map_err(|e| SessionError::Refused(e.to_string()))?;
+    check_header(&mut read.file, limits)?;
+    between();
+    read.file
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| SessionError::Failed(format!("reading {}: {e}", read.name)))?;
+    let extension = safe_extension(&read.name);
+    let staged = ScratchFile(scratch.join(format!("open-{counter}.{extension}")));
+    let mut out =
+        private_file(&staged.0).map_err(|e| SessionError::Failed(format!("scratch file: {e}")))?;
+    let completed = copy_bounded(&mut read.file, &mut out, limits.max_open_bytes, |_| {
+        !cancel.is_cancelled()
+    })
+    .map_err(|e| SessionError::Failed(format!("reading {}: {e}", read.name)))?;
+    if !completed {
+        return Err(SessionError::Cancelled);
+    }
+    out.flush()
+        .map_err(|e| SessionError::Failed(format!("scratch file: {e}")))?;
+    drop(out);
+    let mut copy = std::fs::File::open(&staged.0)
+        .map_err(|e| SessionError::Failed(format!("scratch file: {e}")))?;
+    check_header(&mut copy, limits)?;
+    Ok((staged, read.name))
+}
+
+/// Refuses a file whose header declares an empty picture, a damaged header or
+/// more pixels than the limit.
+fn check_header(
+    file: &mut (impl std::io::Read + std::io::Seek),
+    limits: &Limits,
+) -> Result<(), SessionError> {
+    match header::dimensions(file) {
+        Err(message) => Err(SessionError::Refused(message)),
+        Ok(Some(d)) if d.width == 0 || d.height == 0 => Err(SessionError::Refused(format!(
+            "the {} header declares an empty picture",
+            d.format
+        ))),
+        Ok(Some(d)) if d.pixels() > limits.max_open_pixels => Err(SessionError::Refused(format!(
+            "the {} header declares {} x {} px ({} Mpx); at most {} Mpx may be opened (raise it \
+             with --max-open-mpx)",
+            d.format,
+            d.width,
+            d.height,
+            d.pixels() / 1_000_000,
+            limits.max_open_pixels / 1_000_000
+        ))),
+        Ok(_) => Ok(()),
     }
 }
 
@@ -1289,4 +1315,66 @@ pub fn tool_names() -> Vec<String> {
         .into_iter()
         .map(|t| t.name.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut b = b"\x89PNG\r\n\x1a\n".to_vec();
+        b.extend_from_slice(&13_u32.to_be_bytes());
+        b.extend_from_slice(b"IHDR");
+        b.extend_from_slice(&w.to_be_bytes());
+        b.extend_from_slice(&h.to_be_bytes());
+        b.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        b
+    }
+
+    #[test]
+    fn a_file_enlarged_between_the_check_and_the_copy_is_caught_on_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.png");
+        std::fs::write(&file, png(10, 10)).unwrap();
+        let roots = Roots::open(&[dir.path().to_path_buf()], &[]).unwrap();
+        let limits = Limits::default();
+        // The original passes its check; the file is then rewritten in
+        // place (same inode) with a header claiming 30000 x 30000.
+        let swap = || {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+            std::io::Write::write_all(&mut f, &png(30_000, 30_000)).unwrap();
+        };
+        let result = stage_file(
+            &roots,
+            &limits,
+            scratch.path(),
+            1,
+            "a.png",
+            &Cancel::new(),
+            &swap,
+        );
+        let error = result.err().expect("refused").to_string();
+        assert!(error.contains("--max-open-mpx"), "{error}");
+        assert_eq!(
+            std::fs::read_dir(scratch.path()).unwrap().count(),
+            0,
+            "the copy is removed"
+        );
+        // and without the swap the same file stages fine
+        std::fs::write(&file, png(10, 10)).unwrap();
+        let (staged, name) = stage_file(
+            &roots,
+            &limits,
+            scratch.path(),
+            2,
+            "a.png",
+            &Cancel::new(),
+            &|| {},
+        )
+        .unwrap();
+        assert_eq!(name, "a.png");
+        assert!(staged.0.exists());
+    }
 }
