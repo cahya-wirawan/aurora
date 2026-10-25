@@ -144,6 +144,21 @@ fn authentication_goes_through_the_constant_time_verify() {
 }
 
 #[test]
+fn a_wrong_token_is_compared_in_full_even_when_the_first_character_differs() {
+    let (server, token, _) = start(fast());
+    // Differs from the real token at the very first character.
+    let mut wrong = token.clone().into_bytes();
+    wrong[0] = if wrong[0] == b'0' { b'1' } else { b'0' };
+    let wrong = String::from_utf8(wrong).unwrap();
+    let before = token::examined_total();
+    let _ = BridgeClient::connect_to(server.local_addr(), &wrong, Duration::from_secs(3));
+    assert!(
+        token::examined_total() - before >= 64,
+        "the whole token must be examined, not up to the first difference"
+    );
+}
+
+#[test]
 fn a_wrong_token_is_refused_and_nothing_is_dispatched() {
     let (server, _, echo) = start(fast());
     let wrong = "0".repeat(64);

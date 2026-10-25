@@ -21,11 +21,11 @@ pub mod server;
 pub mod session;
 mod transport;
 
+pub use bridge_session::{BridgeSession, DiscoverySource};
 pub use budgets::{
     Limits, MAX_PATH_BYTES, MAX_PREVIEW_PNG_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
 };
 pub use roots::{PathError, Roots};
-pub use bridge_session::{BridgeSession, DiscoverySource};
 pub use server::{AuroraMcp, tool_names};
 pub use session::{Cancel, ExportFormat, ExportOutcome, Preview, Session, SessionError};
 

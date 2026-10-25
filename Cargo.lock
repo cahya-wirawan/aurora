@@ -514,6 +514,7 @@ version = "0.294.1"
 dependencies = [
  "aurora-ai",
  "aurora-app",
+ "aurora-automation",
  "aurora-brush",
  "aurora-color",
  "aurora-commands",

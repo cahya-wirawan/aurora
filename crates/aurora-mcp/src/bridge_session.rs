@@ -42,9 +42,9 @@ impl DiscoverySource {
     /// # Errors
     /// No default directory exists on this platform.
     pub fn default_dir() -> Result<Self, String> {
-        discovery::default_dir()
-            .map(Self::Dir)
-            .ok_or_else(|| "no default discovery directory on this platform; pass --discovery".to_owned())
+        discovery::default_dir().map(Self::Dir).ok_or_else(|| {
+            "no default discovery directory on this platform; pass --discovery".to_owned()
+        })
     }
 
     fn resolve(&self) -> Result<Discovery, DiscoveryError> {
@@ -88,13 +88,19 @@ impl BridgeSession {
             .source
             .resolve()
             .map_err(|e| SessionError::Failed(e.to_string()))?;
-        let client = BridgeClient::connect(&info).map_err(|e| SessionError::Failed(e.to_string()))?;
+        let client =
+            BridgeClient::connect(&info).map_err(|e| SessionError::Failed(e.to_string()))?;
         self.client = Some(client);
         Ok(())
     }
 
     /// One call. `read_only` calls get one retry on a fresh connection.
-    fn call(&mut self, method: &str, params: &Value, read_only: bool) -> Result<Value, SessionError> {
+    fn call(
+        &mut self,
+        method: &str,
+        params: &Value,
+        read_only: bool,
+    ) -> Result<Value, SessionError> {
         let attempts = if read_only { 2 } else { 1 };
         let mut last = SessionError::Failed("no connection".to_owned());
         for _ in 0..attempts {
@@ -165,7 +171,12 @@ impl Session for BridgeSession {
         ))
     }
 
-    fn open_path(&mut self, absolute: &str, _max_pixels: u64, _cancel: &Cancel) -> Result<Value, SessionError> {
+    fn open_path(
+        &mut self,
+        absolute: &str,
+        _max_pixels: u64,
+        _cancel: &Cancel,
+    ) -> Result<Value, SessionError> {
         self.call("doc.open", &json!({"path": absolute}), false)
     }
 
@@ -221,7 +232,12 @@ impl Session for BridgeSession {
     fn preview(&mut self, max_side: u32, _cancel: &Cancel) -> Result<Preview, SessionError> {
         let value = self.call("doc.preview", &json!({"max_side": max_side}), true)?;
         let png = base64::engine::general_purpose::STANDARD
-            .decode(value.get("png_base64").and_then(Value::as_str).unwrap_or_default())
+            .decode(
+                value
+                    .get("png_base64")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
             .map_err(|e| SessionError::Failed(format!("the app's preview is not valid: {e}")))?;
         let n = |name: &str| {
             value
@@ -256,10 +272,17 @@ impl Session for BridgeSession {
         self.call("doc.psd_check", &json!({}), true)
     }
 
-    fn ui_call(&mut self, method: &str, params: Value, _cancel: &Cancel) -> Result<Value, SessionError> {
+    fn ui_call(
+        &mut self,
+        method: &str,
+        params: Value,
+        _cancel: &Cancel,
+    ) -> Result<Value, SessionError> {
         let read_only = matches!(method, "ui.inspect" | "ui.screenshot")
-            || (method == "ui.dialog" && params.get("action").and_then(Value::as_str) != Some("choose"))
-            || (method == "ui.menu" && params.get("action").and_then(Value::as_str) != Some("activate"));
+            || (method == "ui.dialog"
+                && params.get("action").and_then(Value::as_str) != Some("choose"))
+            || (method == "ui.menu"
+                && params.get("action").and_then(Value::as_str) != Some("activate"));
         self.call(method, &params, read_only)
     }
 }

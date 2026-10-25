@@ -35,28 +35,54 @@ fn the_bridge_is_off_unless_asked_for() {
     assert!(!o.enabled);
     assert!(o.roots.is_empty());
     // Roots or limits alone never enable it.
-    let o = BridgeOptions::from_args(&args(&["--mcp-bridge-root", "/tmp", "--mcp-bridge-max-mpx", "5"]), &env_none).unwrap();
+    let o = BridgeOptions::from_args(
+        &args(&["--mcp-bridge-root", "/tmp", "--mcp-bridge-max-mpx", "5"]),
+        &env_none,
+    )
+    .unwrap();
     assert!(!o.enabled);
     assert_eq!(o.max_pixels, 5_000_000);
     // Unknown arguments (a platform launcher's) are ignored.
-    assert!(!BridgeOptions::from_args(&args(&["-psn_0_1", "file.png"]), &env_none).unwrap().enabled);
+    assert!(
+        !BridgeOptions::from_args(&args(&["-psn_0_1", "file.png"]), &env_none)
+            .unwrap()
+            .enabled
+    );
     // Falsy environment values stay off.
     for v in ["", "0", "false", "off", "no", "2"] {
         let env = move |n: &str| (n == "AURORA_MCP_BRIDGE").then(|| v.to_owned());
-        assert!(!BridgeOptions::from_args(&[], &env).unwrap().enabled, "{v:?}");
+        assert!(
+            !BridgeOptions::from_args(&[], &env).unwrap().enabled,
+            "{v:?}"
+        );
     }
 }
 
 #[test]
 fn the_flag_and_the_environment_enable_it() {
-    assert!(BridgeOptions::from_args(&args(&["--mcp-bridge"]), &env_none).unwrap().enabled);
+    assert!(
+        BridgeOptions::from_args(&args(&["--mcp-bridge"]), &env_none)
+            .unwrap()
+            .enabled
+    );
     for v in ["1", "true", "ON", " yes "] {
         let env = move |n: &str| (n == "AURORA_MCP_BRIDGE").then(|| v.to_owned());
-        assert!(BridgeOptions::from_args(&[], &env).unwrap().enabled, "{v:?}");
+        assert!(
+            BridgeOptions::from_args(&[], &env).unwrap().enabled,
+            "{v:?}"
+        );
     }
     let env = |n: &str| (n == "AURORA_MCP_BRIDGE_ROOTS").then(|| "/a:/b".to_owned());
-    let o = BridgeOptions::from_args(&args(&["--mcp-bridge", "--mcp-bridge-root", "/c"]), &env).unwrap();
-    assert_eq!(o.roots, [PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")]);
+    let o = BridgeOptions::from_args(&args(&["--mcp-bridge", "--mcp-bridge-root", "/c"]), &env)
+        .unwrap();
+    assert_eq!(
+        o.roots,
+        [
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/c")
+        ]
+    );
 }
 
 #[test]
@@ -71,13 +97,33 @@ fn bad_option_values_are_errors() {
 #[test]
 fn a_modal_dialog_blocks_everything_but_reads_and_the_dialog_tool() {
     let modal = Some("Save changes?");
-    for method in ["command.run", "doc.open", "doc.save", "ui.pointer", "ui.key"] {
+    for method in [
+        "command.run",
+        "doc.open",
+        "doc.save",
+        "ui.pointer",
+        "ui.key",
+    ] {
         let e = policy(method, None, modal, false).unwrap_err();
         assert_eq!(e.kind, "modal_dialog", "{method}");
         assert!(e.message.contains("ui_dialog"));
     }
-    assert_eq!(policy("ui.menu", Some("activate"), modal, false).unwrap_err().kind, "modal_dialog");
-    for method in ["bridge.status", "command.context", "doc.inspect", "doc.preview", "doc.psd_check", "ui.inspect", "ui.screenshot", "ui.dialog"] {
+    assert_eq!(
+        policy("ui.menu", Some("activate"), modal, false)
+            .unwrap_err()
+            .kind,
+        "modal_dialog"
+    );
+    for method in [
+        "bridge.status",
+        "command.context",
+        "doc.inspect",
+        "doc.preview",
+        "doc.psd_check",
+        "ui.inspect",
+        "ui.screenshot",
+        "ui.dialog",
+    ] {
         assert!(policy(method, None, modal, false).is_ok(), "{method}");
     }
     assert!(policy("ui.menu", Some("list"), modal, false).is_ok());
@@ -90,10 +136,21 @@ fn a_modal_dialog_blocks_everything_but_reads_and_the_dialog_tool() {
 #[test]
 fn an_open_palette_refuses_commands_and_files_but_not_keys() {
     for method in ["command.run", "doc.open", "doc.save"] {
-        assert_eq!(policy(method, None, None, true).unwrap_err().kind, "palette_open");
+        assert_eq!(
+            policy(method, None, None, true).unwrap_err().kind,
+            "palette_open"
+        );
     }
-    assert_eq!(policy("ui.menu", Some("activate"), None, true).unwrap_err().kind, "palette_open");
-    assert!(policy("ui.key", None, None, true).is_ok(), "the palette is driven by keys");
+    assert_eq!(
+        policy("ui.menu", Some("activate"), None, true)
+            .unwrap_err()
+            .kind,
+        "palette_open"
+    );
+    assert!(
+        policy("ui.key", None, None, true).is_ok(),
+        "the palette is driven by keys"
+    );
     assert!(policy("ui.pointer", None, None, true).is_ok());
 }
 
@@ -101,7 +158,12 @@ fn an_open_palette_refuses_commands_and_files_but_not_keys() {
 
 #[test]
 fn quitting_and_file_commands_are_never_run() {
-    for id in ["app.quit", "automation.disconnect", "file.open", "file.save"] {
+    for id in [
+        "app.quit",
+        "automation.disconnect",
+        "file.open",
+        "file.save",
+    ] {
         assert_eq!(command_gate(id).unwrap_err().kind, "refused", "{id}");
     }
     // A command with a file-path parameter is refused too.
@@ -130,7 +192,10 @@ fn quitting_and_file_commands_are_never_run() {
 
 // ---- marshalling ----
 
-fn dispatcher(capacity: usize, wait: Duration) -> (Arc<AppDispatcher>, mpsc::Receiver<Job>, Arc<Mutex<u32>>) {
+fn dispatcher(
+    capacity: usize,
+    wait: Duration,
+) -> (Arc<AppDispatcher>, mpsc::Receiver<Job>, Arc<Mutex<u32>>) {
     let (tx, rx) = mpsc::sync_channel(capacity);
     let wakes = Arc::new(Mutex::new(0_u32));
     let w = Arc::clone(&wakes);
@@ -149,7 +214,9 @@ fn the_queue_is_bounded_at_sixteen() {
     let mut waiting = Vec::new();
     for _ in 0..2 {
         let d = Arc::clone(&d);
-        waiting.push(std::thread::spawn(move || d.dispatch(request("ui.inspect"))));
+        waiting.push(std::thread::spawn(move || {
+            d.dispatch(request("ui.inspect"))
+        }));
     }
     std::thread::sleep(Duration::from_millis(200));
     let full = d.dispatch(request("ui.inspect")).unwrap_err();
@@ -207,10 +274,26 @@ fn through_a_real_socket_a_modal_dialog_refuses_a_command() {
             }
         }
     });
-    let mut client = BridgeClient::connect_to(server.local_addr(), &tok, Duration::from_secs(3)).unwrap();
-    let e = client.call("command.run", json!({"id": "edit.undo"}), Duration::from_secs(3)).unwrap_err();
-    assert!(matches!(&e, ClientError::App(c) if c.kind == "modal_dialog"), "{e:?}");
-    let ok = client.call("ui.dialog", json!({"action": "get"}), Duration::from_secs(3)).unwrap();
+    let mut client =
+        BridgeClient::connect_to(server.local_addr(), &tok, Duration::from_secs(3)).unwrap();
+    let e = client
+        .call(
+            "command.run",
+            json!({"id": "edit.undo"}),
+            Duration::from_secs(3),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&e, ClientError::App(c) if c.kind == "modal_dialog"),
+        "{e:?}"
+    );
+    let ok = client
+        .call(
+            "ui.dialog",
+            json!({"action": "get"}),
+            Duration::from_secs(3),
+        )
+        .unwrap();
     assert_eq!(ok["ran"], "ui.dialog");
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     ui.join().unwrap();
@@ -247,20 +330,42 @@ fn opening_is_confined_to_the_roots_and_copies_to_private_scratch() {
     }
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(outside.path().join("secret.png"), root.path().join("link.png")).unwrap();
-        let e = stage_open_file(&roots, &scratch.path().join("o2"), "link.png", 100_000_000).unwrap_err();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.png"),
+            root.path().join("link.png"),
+        )
+        .unwrap();
+        let e = stage_open_file(&roots, &scratch.path().join("o2"), "link.png", 100_000_000)
+            .unwrap_err();
         assert_eq!(e.kind, "refused", "an escaping symlink: {e}");
     }
-    assert!(!scratch.path().join("o1").exists(), "nothing staged for a refusal");
+    assert!(
+        !scratch.path().join("o1").exists(),
+        "nothing staged for a refusal"
+    );
     let staged = stage_open_file(&roots, &scratch.path().join("o3"), "a.png", 100_000_000).unwrap();
-    assert_ne!(staged, root.path().join("a.png"), "the decoder gets the copy");
+    assert_ne!(
+        staged,
+        root.path().join("a.png"),
+        "the decoder gets the copy"
+    );
     assert_eq!(std::fs::read(&staged).unwrap(), png_header(10, 10));
     assert_eq!(staged.file_name().unwrap(), "a.png");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(std::fs::metadata(staged.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(staged.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 }
 
@@ -269,7 +374,13 @@ fn a_huge_declared_picture_is_refused_before_anything_is_copied() {
     let root = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("bomb.png"), png_header(30_000, 30_000)).unwrap();
-    let e = stage_open_file(&roots_in(root.path()), &scratch.path().join("o"), "bomb.png", 50_000_000).unwrap_err();
+    let e = stage_open_file(
+        &roots_in(root.path()),
+        &scratch.path().join("o"),
+        "bomb.png",
+        50_000_000,
+    )
+    .unwrap_err();
     assert_eq!(e.kind, "refused");
     assert!(e.message.contains("--mcp-bridge-max-mpx"), "{}", e.message);
     assert!(!scratch.path().join("o").exists());
@@ -295,17 +406,33 @@ fn saving_creates_a_new_file_and_never_replaces_one() {
     let roots = roots_in(root.path());
     let e = commit_export(&roots, &out, "keep.png").unwrap_err();
     assert_eq!(e.kind, "refused");
-    assert_eq!(std::fs::read(root.path().join("keep.png")).unwrap(), b"PRECIOUS");
+    assert_eq!(
+        std::fs::read(root.path().join("keep.png")).unwrap(),
+        b"PRECIOUS"
+    );
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink("nowhere.png", root.path().join("dangling.png")).unwrap();
         assert!(commit_export(&roots, &out, "dangling.png").is_err());
-        assert!(!root.path().join("nowhere.png").exists(), "a dangling link is not followed");
+        assert!(
+            !root.path().join("nowhere.png").exists(),
+            "a dangling link is not followed"
+        );
     }
     assert!(commit_export(&roots, &out, "../escape.png").is_err());
-    assert!(commit_export(&roots, &out, &work.path().join("abs.png").display().to_string()).is_err());
+    assert!(
+        commit_export(
+            &roots,
+            &out,
+            &work.path().join("abs.png").display().to_string()
+        )
+        .is_err()
+    );
     assert_eq!(commit_export(&roots, &out, "fresh.png").unwrap(), 9);
-    assert_eq!(std::fs::read(root.path().join("fresh.png")).unwrap(), b"NEW-BYTES");
+    assert_eq!(
+        std::fs::read(root.path().join("fresh.png")).unwrap(),
+        b"NEW-BYTES"
+    );
 }
 
 #[test]

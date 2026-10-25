@@ -695,7 +695,12 @@ mod bridge {
     #[test]
     fn the_binary_proxies_a_tool_call_to_the_app_and_never_without_one() {
         let token = token::generate().unwrap();
-        let server = BridgeServer::start(ServerConfig::default(), token.clone(), std::sync::Arc::new(Fake)).unwrap();
+        let server = BridgeServer::start(
+            ServerConfig::default(),
+            token.clone(),
+            std::sync::Arc::new(Fake),
+        )
+        .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let published = discovery::publish(
             &dir.path().join("b"),
@@ -707,12 +712,35 @@ mod bridge {
         let initialized = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"doc_inspect","arguments":{}}}"#;
         let input = format!("{init}\n{initialized}\n{call}\n");
-        let (lines, _err, _code) = bridge_binary(&["mcp", "--bridge", "--discovery", &file], &input);
-        let reply: Value = lines.iter().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["id"] == 2).unwrap();
-        assert!(reply["result"]["content"][0]["text"].as_str().unwrap().contains("from-the-fake-app"), "{reply}");
+        let (lines, _err, _code) =
+            bridge_binary(&["mcp", "--bridge", "--discovery", &file], &input);
+        let reply: Value = lines
+            .iter()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["id"] == 2)
+            .unwrap();
+        assert!(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("from-the-fake-app"),
+            "{reply}"
+        );
         // A discovery file that does not exist: a clear tool error, no crash.
-        let (lines, _err, _code) = bridge_binary(&["mcp", "--bridge", "--discovery", "/nonexistent/aurora-bridge-1.json"], &input);
-        let reply: Value = lines.iter().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["id"] == 2).unwrap();
+        let (lines, _err, _code) = bridge_binary(
+            &[
+                "mcp",
+                "--bridge",
+                "--discovery",
+                "/nonexistent/aurora-bridge-1.json",
+            ],
+            &input,
+        );
+        let reply: Value = lines
+            .iter()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["id"] == 2)
+            .unwrap();
         assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
         // --discovery without --bridge is a usage error.
         let (_l, err, code) = bridge_binary(&["mcp", "--discovery", &file], "");

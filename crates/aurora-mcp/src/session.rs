@@ -173,7 +173,9 @@ pub trait Session: Send + 'static {
         _max_pixels: u64,
         _cancel: &Cancel,
     ) -> Result<Value, SessionError> {
-        Err(SessionError::NotAvailable("not a bridge session".to_owned()))
+        Err(SessionError::NotAvailable(
+            "not a bridge session".to_owned(),
+        ))
     }
 
     /// Writes the live document to the NEW file `absolute` (inside the
@@ -187,7 +189,9 @@ pub trait Session: Send + 'static {
         _accept_losses: bool,
         _cancel: &Cancel,
     ) -> Result<Value, SessionError> {
-        Err(SessionError::NotAvailable("not a bridge session".to_owned()))
+        Err(SessionError::NotAvailable(
+            "not a bridge session".to_owned(),
+        ))
     }
 
     /// A window-level call (`ui.inspect`, `ui.screenshot`, `ui.pointer`,

@@ -78,12 +78,7 @@ fn run_mcp(args: &[String]) -> ExitCode {
     } else {
         Box::new(AppHost::with_limits(&config.limits))
     };
-    match runtime.block_on(aurora_mcp::serve_io(
-        host,
-        config,
-        tokio::io::stdin(),
-        out,
-    )) {
+    match runtime.block_on(aurora_mcp::serve_io(host, config, tokio::io::stdin(), out)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("aurora-cli mcp: {error}");

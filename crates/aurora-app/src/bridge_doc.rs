@@ -325,7 +325,9 @@ impl App {
                 .as_ref()
                 .ok_or_else(|| CallError::new("unavailable", "the bridge is off"))?;
             let total = commit_export(&bridge.roots, &out, &path)?;
-            Ok(json!({"saved": true, "path": path, "format": extension, "bytes": total, "report": report}))
+            Ok(
+                json!({"saved": true, "path": path, "format": extension, "bytes": total, "report": report}),
+            )
         })();
         let _ = std::fs::remove_dir_all(&directory);
         answer

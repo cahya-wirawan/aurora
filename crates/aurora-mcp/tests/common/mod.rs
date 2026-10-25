@@ -251,12 +251,7 @@ pub async fn start_session(
         limits,
         scratch_parent: None,
     };
-    let server = tokio::spawn(aurora_mcp::serve_io(
-        session,
-        config,
-        server_in,
-        server_out,
-    ));
+    let server = tokio::spawn(aurora_mcp::serve_io(session, config, server_in, server_out));
     let mut client = Client {
         to_server: client_to_server,
         lines: BufReader::new(from_server).lines(),

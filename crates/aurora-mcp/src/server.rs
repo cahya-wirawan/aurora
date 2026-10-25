@@ -888,8 +888,10 @@ impl AuroraMcp {
         params: Value,
     ) -> Result<Value, SessionError> {
         tracing::info!(method, "window tool");
-        self.blocking(Some(ctx), move |session, cancel| session.ui_call(method, params, cancel))
-            .await
+        self.blocking(Some(ctx), move |session, cancel| {
+            session.ui_call(method, params, cancel)
+        })
+        .await
     }
 
     fn is_headless(&self, id: &str) -> bool {
@@ -1404,7 +1406,12 @@ impl AuroraMcp {
         Parameters(p): Parameters<UiInspectParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.ui(&ctx, "ui.inspect", json!({"include_hidden": p.include_hidden})).await
+        self.ui(
+            &ctx,
+            "ui.inspect",
+            json!({"include_hidden": p.include_hidden}),
+        )
+        .await
     }
 
     #[tool(
@@ -1431,9 +1438,15 @@ impl AuroraMcp {
             Ok(value) => value,
             Err(error) => return Ok(fail_result(error.to_string())),
         };
-        let png = value.get("png_base64").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let png = value
+            .get("png_base64")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         if png.len() > MAX_PREVIEW_PNG_BYTES * 2 {
-            return Ok(fail_result("the screenshot is too large; ask for a smaller max_side"));
+            return Ok(fail_result(
+                "the screenshot is too large; ask for a smaller max_side",
+            ));
         }
         let mut note = value;
         if let Some(object) = note.as_object_mut() {
@@ -1471,7 +1484,10 @@ impl AuroraMcp {
             ));
         }
         if p.id.is_none() && (p.x.is_none() || p.y.is_none()) {
-            return Err(McpError::invalid_params("give `x` and `y` or a widget `id`", None));
+            return Err(McpError::invalid_params(
+                "give `x` and `y` or a widget `id`",
+                None,
+            ));
         }
         let params = json!({
             "action": p.action, "x": p.x, "y": p.y, "id": p.id, "to_x": p.to_x, "to_y": p.to_y,
@@ -1532,10 +1548,18 @@ impl AuroraMcp {
                 return Err(McpError::invalid_params("`activate` needs `command`", None));
             }
             Some(_) => {
-                return Err(McpError::invalid_params("`action` must be list or activate", None));
+                return Err(McpError::invalid_params(
+                    "`action` must be list or activate",
+                    None,
+                ));
             }
         }
-        self.ui(&ctx, "ui.menu", json!({"action": p.action, "command": p.command})).await
+        self.ui(
+            &ctx,
+            "ui.menu",
+            json!({"action": p.action, "command": p.command}),
+        )
+        .await
     }
 
     #[tool(
@@ -1560,9 +1584,15 @@ impl AuroraMcp {
             None | Some("get") => {}
             Some("choose") if p.id.is_some() => {}
             Some("choose") => return Err(McpError::invalid_params("`choose` needs `id`", None)),
-            Some(_) => return Err(McpError::invalid_params("`action` must be get or choose", None)),
+            Some(_) => {
+                return Err(McpError::invalid_params(
+                    "`action` must be get or choose",
+                    None,
+                ));
+            }
         }
-        self.ui(&ctx, "ui.dialog", json!({"action": p.action, "id": p.id})).await
+        self.ui(&ctx, "ui.dialog", json!({"action": p.action, "id": p.id}))
+            .await
     }
 }
 

@@ -64,6 +64,7 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 static VERIFICATIONS: AtomicU64 = AtomicU64::new(0);
+static EXAMINED: AtomicU64 = AtomicU64::new(0);
 
 /// Checks a presented token against the real one. The one place a token is
 /// compared; counts its calls so a test can prove the listener goes through
@@ -71,7 +72,16 @@ static VERIFICATIONS: AtomicU64 = AtomicU64::new(0);
 #[must_use]
 pub fn verify(presented: &str, expected: &str) -> bool {
     VERIFICATIONS.fetch_add(1, Ordering::Relaxed);
-    ct_eq(presented.as_bytes(), expected.as_bytes())
+    let (equal, examined) = ct_eq_probe(presented.as_bytes(), expected.as_bytes());
+    EXAMINED.fetch_add(examined as u64, Ordering::Relaxed);
+    equal
+}
+
+/// Total byte positions [`verify`] has examined in this process (tests: a
+/// comparison that stopped at the first difference would examine fewer).
+#[must_use]
+pub fn examined_total() -> u64 {
+    EXAMINED.load(Ordering::Relaxed)
 }
 
 /// How many times [`verify`] has run in this process (tests).
