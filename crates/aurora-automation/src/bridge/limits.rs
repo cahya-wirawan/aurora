@@ -10,7 +10,7 @@ pub const FREE_FAILURES: u32 = 5;
 pub const LOCKOUT_BASE: Duration = Duration::from_secs(1);
 /// The longest lockout (small on purpose: a lockout is also a denial of
 /// service against the real controller).
-pub const LOCKOUT_MAX: Duration = Duration::from_secs(60);
+pub const LOCKOUT_MAX: Duration = Duration::from_mins(1);
 
 /// Failed-handshake bookkeeping.
 #[derive(Debug, Clone)]
@@ -141,7 +141,7 @@ mod tests {
         );
         assert!(!bucket.allow(t0 + Duration::from_millis(600)));
         // never above the burst after a long wait
-        let later = t0 + Duration::from_secs(60);
+        let later = t0 + Duration::from_mins(1);
         assert!(bucket.allow(later) && bucket.allow(later) && bucket.allow(later));
         assert!(!bucket.allow(later));
     }

@@ -459,6 +459,7 @@ pub struct SweepReport {
 
 /// Removes the discovery files of apps that are gone, and nothing else (see
 /// the module docs for every condition).
+#[must_use]
 pub fn sweep_stale(dir: &Path) -> SweepReport {
     let mut report = SweepReport::default();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -478,10 +479,11 @@ pub fn sweep_stale(dir: &Path) -> SweepReport {
             // An orphan lock file: its json is gone (a crash between the
             // steps, or a half-finished sweep).
             let json = dir.join(json_name(pid));
-            if std::fs::symlink_metadata(&json).is_err() && orphan_lock_removable(&entry.path()) {
-                if std::fs::remove_file(entry.path()).is_ok() {
-                    report.removed += 1;
-                }
+            if std::fs::symlink_metadata(&json).is_err()
+                && orphan_lock_removable(&entry.path())
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                report.removed += 1;
             }
         }
     }

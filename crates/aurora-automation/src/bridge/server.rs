@@ -87,7 +87,7 @@ impl Default for ServerConfig {
         Self {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             auth_timeout: Duration::from_secs(3),
-            idle_timeout: Duration::from_secs(300),
+            idle_timeout: Duration::from_mins(5),
             free_failures: FREE_FAILURES,
             lockout_base: LOCKOUT_BASE,
             lockout_max: LOCKOUT_MAX,
@@ -251,7 +251,7 @@ fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>) {
         let spawned = std::thread::Builder::new()
             .name("aurora-bridge-conn".to_owned())
             .spawn(move || {
-                serve_connection(stream, &conn_shared);
+                serve_connection(&stream, &conn_shared);
             });
         if spawned.is_err() {
             shared.unauthenticated.fetch_sub(1, Ordering::SeqCst);
@@ -307,7 +307,7 @@ impl Drop for Slot<'_> {
     }
 }
 
-fn serve_connection(stream: TcpStream, shared: &Arc<Shared>) {
+fn serve_connection(stream: &TcpStream, shared: &Arc<Shared>) {
     let counted = Unauthenticated(&shared.unauthenticated);
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
@@ -337,12 +337,9 @@ fn serve_connection(stream: TcpStream, shared: &Arc<Shared>) {
         let _ = stream.shutdown(Shutdown::Both);
         return;
     }
-    let hello: Hello = match serde_json::from_slice(&line) {
-        Ok(hello) => hello,
-        Err(_) => {
-            fail_auth(shared, &mut writer, "bad handshake");
-            return;
-        }
+    let Ok(hello) = serde_json::from_slice::<Hello>(&line) else {
+        fail_auth(shared, &mut writer, "bad handshake");
+        return;
     };
     if hello.hello != HELLO || !token::verify(&hello.token, &shared.token) {
         fail_auth(shared, &mut writer, "authentication failed");
