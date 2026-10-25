@@ -19,6 +19,13 @@
 //! carried into the report ([`carried_losses`], 0.177.0 review H-1), so
 //! re-saving an opened PSD over itself never drops that content silently.
 //!
+//! Saved selections (task 156) are written as PSD alpha channels
+//! (`aurora_io::write_psd_with_selections`). The write's report then always
+//! carries a "written as alpha channels" line (the channels are not checked
+//! in Photoshop), so a save of a document with saved selections is never
+//! lossless and always asks "Save With Changes?" first, as saves with
+//! effects or text layers do.
+//!
 //! The merged image is the whole-canvas `composite_document` image, held
 //! in memory (a banded composite is round R5), and the write runs on the
 //! UI thread (a background write is later work).

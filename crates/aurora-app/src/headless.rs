@@ -30,6 +30,8 @@
 //!   Save Anyway runs; each phase is timed (`psd_save_ms`). Unlike the
 //!   app, it passes no import losses (what the open itself dropped) into
 //!   the save report, so `report_items` counts only the write's own lines.
+//!   It also passes no saved selections (task 156), so a PSD with alpha
+//!   channels converted here loses them; the app's Save As writes them.
 //!
 //! One JSON object goes to stdout; logs go to stderr. Nothing here is
 //! reachable from the window: the app never calls [`main_from_args`].
