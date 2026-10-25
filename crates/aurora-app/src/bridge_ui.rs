@@ -13,7 +13,10 @@ use serde_json::{Value, json};
 
 use crate::bridge_app::{BLOCKED_COMMANDS, CapturedFrame, Job, Pending};
 use crate::bridge_doc::bad;
-use crate::{App, Key, Modifiers, NamedKey, activate_command, menu_model, run_dialog_action};
+use crate::{
+    App, DialogEffect, DialogPurpose, DialogResult, Key, Modifiers, NamedKey, activate_command,
+    dialog_effect, menu_model, run_dialog_action,
+};
 
 const MAX_INSPECT_NODES: usize = 1500;
 const MAX_TEXT_CHARS: usize = 200;
@@ -70,6 +73,74 @@ pub(crate) fn parse_key(name: &str) -> Option<Key> {
         }
     };
     Some(Key::Named(named))
+}
+
+/// Whether a controller may choose `action` in a dialog opened for
+/// `purpose` (ADR 0015's table). The rule: a controller can acknowledge a
+/// report, and can CANCEL a question, but never answer one that discards
+/// work, quits, replaces a saved preset or writes a lossy file. Those
+/// answers stay a human's.
+///
+/// # Errors
+/// A sentence saying what the controller may do instead.
+pub(crate) fn dialog_choice_allowed(purpose: &DialogPurpose, action: &str) -> Result<(), String> {
+    use crate::document_close::CloseChoice;
+    let refuse = |what: &str| {
+        Err(format!(
+            "a controller may not choose `{action}` here ({what}); it can only cancel, and a person \
+             answers the rest"
+        ))
+    };
+    match dialog_effect(&DialogResult {
+        purpose: purpose.clone(),
+        action: action.to_owned(),
+    }) {
+        // OK / Continue / Dismiss: an acknowledgement changes nothing.
+        DialogEffect::Acknowledged => Ok(()),
+        // The first-run welcome only closes or opens the palette.
+        DialogEffect::Welcome(_) => Ok(()),
+        DialogEffect::Close(_, CloseChoice::Cancel)
+        | DialogEffect::Quit(_, CloseChoice::Cancel) => Ok(()),
+        DialogEffect::PsdSave(crate::psd_save::PsdSaveChoice::Cancel) => Ok(()),
+        DialogEffect::Close(..) | DialogEffect::Quit(..) => {
+            refuse("it saves or discards the document's unsaved changes")
+        }
+        DialogEffect::PsdSave(_) => refuse("it writes a file that loses or changes content"),
+        DialogEffect::Workspace(command) => {
+            if matches!(
+                command,
+                crate::workspace_presets::WorkspaceCommand::ReturnToNamePrompt(_)
+            ) {
+                Ok(())
+            } else {
+                refuse("it replaces a saved workspace")
+            }
+        }
+        DialogEffect::Unknown => refuse("it is not one of this dialog's actions"),
+    }
+}
+
+/// The checks `ui.dialog choose` makes before anything is chosen: the
+/// dialog has the action, and a controller may answer it.
+pub(crate) fn validate_choice(
+    purpose: &DialogPurpose,
+    known: bool,
+    id: &str,
+) -> Result<(), CallError> {
+    if !known {
+        return Err(bad(format!("the dialog has no action `{id}`")));
+    }
+    dialog_choice_allowed(purpose, id).map_err(|message| CallError::new("refused", message))
+}
+
+/// The actions of the open dialog a controller may choose.
+fn controller_choices(dialog: &crate::OpenDialog) -> Vec<String> {
+    dialog
+        .actions
+        .iter()
+        .map(|(id, _)| id.clone())
+        .filter(|id| dialog_choice_allowed(&dialog.purpose, id).is_ok())
+        .collect()
 }
 
 /// Box-averages RGBA8 to fit `max_side` (never enlarging).
@@ -320,6 +391,12 @@ impl App {
                 self.handle_pointer_moved(physical(start));
                 let times = if action == "click" { 1 } else { 2 };
                 for _ in 0..times {
+                    // A click that opened a dialog (a tab's close button)
+                    // must not be followed by a second press that lands on
+                    // the dialog.
+                    if self.bridge_modal().is_some() {
+                        break;
+                    }
                     self.handle_pointer_pressed(button);
                     self.handle_pointer_released(button);
                 }
@@ -336,6 +413,9 @@ impl App {
                     self.handle_pointer_moved(physical(start));
                     self.handle_pointer_pressed(button);
                     for i in 1..=steps {
+                        if self.bridge_modal().is_some() {
+                            break;
+                        }
                         #[allow(clippy::cast_precision_loss)]
                         let t = i as f64 / steps as f64;
                         let p = (
@@ -376,7 +456,7 @@ impl App {
                 })
             });
         Ok(
-            json!({"ok": true, "hit": hit, "tool": format!("{:?}", self.tool), "modal": self.bridge_modal()}),
+            json!({"ok": true, "hit": hit, "tool": format!("{:?}", self.tool), "modal": self.bridge_modal(), "dialog_note": self.bridge_modal_note()}),
         )
     }
 
@@ -439,6 +519,10 @@ impl App {
         self.modifiers = Modifiers::default();
         if let Some(text) = text {
             for ch in text.chars() {
+                // Typing never continues into a dialog the key opened.
+                if self.bridge_modal().is_some() {
+                    break;
+                }
                 let mut buffer = [0_u8; 4];
                 let s: &str = ch.encode_utf8(&mut buffer);
                 self.handle_key_pressed(Some(Key::Character(ch.to_ascii_lowercase())), Some(s));
@@ -447,7 +531,7 @@ impl App {
         self.modifiers = saved;
         self.needs_redraw = true;
         Ok(
-            json!({"ok": true, "modal": self.bridge_modal(), "palette_open": self.command_palette.is_some()}),
+            json!({"ok": true, "modal": self.bridge_modal(), "palette_open": self.command_palette.is_some(), "dialog_note": self.bridge_modal_note()}),
         )
     }
 
@@ -520,7 +604,9 @@ impl App {
                 self.push_accessibility();
                 self.relayout_after_gallery();
                 self.needs_redraw = true;
-                Ok(json!({"ok": true, "command": id, "modal": self.bridge_modal()}))
+                Ok(
+                    json!({"ok": true, "command": id, "modal": self.bridge_modal(), "dialog_note": self.bridge_modal_note()}),
+                )
             }
             Some(other) => Err(bad(format!("unknown menu action `{other}`"))),
         }
@@ -552,6 +638,8 @@ impl App {
                         "message": text(dialog.message).and_then(|n| n.value().or_else(|| n.label())).map(clip),
                         "purpose": format!("{:?}", dialog.purpose),
                         "actions": actions,
+                        "controller_may_choose": controller_choices(dialog),
+                        "note": "A controller can acknowledge reports and cancel questions; it cannot answer one that discards unsaved changes, quits, replaces a workspace or saves a lossy file. A person answers those.",
                     })
                 }
             }
@@ -567,8 +655,8 @@ impl App {
                 if self.dialog.is_none() {
                     return Err(CallError::new("failed", "no dialog is open"));
                 }
-                if !self.dialog.as_ref().is_some_and(|d| d.action_id_known(&id)) {
-                    return Err(bad(format!("the dialog has no action `{id}`")));
+                if let Some(dialog) = self.dialog.as_ref() {
+                    validate_choice(&dialog.purpose, dialog.action_id_known(&id), &id)?;
                 }
                 let before = describe(self);
                 let result = run_dialog_action(

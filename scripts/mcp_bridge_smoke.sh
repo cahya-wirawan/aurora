@@ -35,7 +35,7 @@ fi
 mkdir -p "$WORK/files" "$WORK/bridge"
 export AURORA_BRIDGE_DIR="$WORK/bridge"
 export HOME="$WORK/home"; mkdir -p "$HOME"
-"$APP" --mcp-bridge --mcp-bridge-root "$WORK/files" >"$WORK/app.log" 2>&1 &
+"$APP" --mcp-bridge --mcp-bridge-read-root "$WORK/files" --mcp-bridge-write-root "$WORK/files" >"$WORK/app.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 60); do
   FILE="$(ls "$WORK"/bridge/aurora-bridge-*.json 2>/dev/null | head -1)"

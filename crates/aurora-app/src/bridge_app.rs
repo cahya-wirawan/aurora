@@ -3,7 +3,8 @@
 //! UI thread and run through the same handlers real input reaches.
 //!
 //! * **Enabling.** `aurora-app --mcp-bridge` (or `AURORA_MCP_BRIDGE=1`);
-//!   `--mcp-bridge-root DIR` (repeatable; `AURORA_MCP_BRIDGE_ROOTS`, a
+//!   `--mcp-bridge-read-root DIR` / `--mcp-bridge-write-root DIR` (repeatable;
+//!   `--mcp-bridge-root` is the read-only shorthand; `AURORA_MCP_BRIDGE_ROOTS`, a
 //!   path list) names the only directories the bridge's file tools may
 //!   read or write, none = no file tools. Nothing listens and no file is
 //!   written otherwise ([`BridgeOptions::from_args`]).
@@ -60,7 +61,12 @@ pub static AUTOMATION_CONNECTED: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeOptions {
     pub enabled: bool,
-    pub roots: Vec<PathBuf>,
+    /// Directories the file tools may READ from (`--mcp-bridge-root` is a
+    /// shorthand for `--mcp-bridge-read-root`).
+    pub read_roots: Vec<PathBuf>,
+    /// Directories the file tools may create NEW files in; writing needs
+    /// `--mcp-bridge-write-root` explicitly.
+    pub write_roots: Vec<PathBuf>,
     /// Largest canvas the bridge composites for a preview or an export, in
     /// pixels (the work runs on the UI thread).
     pub max_pixels: u64,
@@ -70,7 +76,8 @@ impl Default for BridgeOptions {
     fn default() -> Self {
         Self {
             enabled: false,
-            roots: Vec::new(),
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
             max_pixels: 50_000_000,
         }
     }
@@ -98,17 +105,26 @@ impl BridgeOptions {
             ..Self::default()
         };
         if let Some(list) = env("AURORA_MCP_BRIDGE_ROOTS").filter(|v| !v.is_empty()) {
-            options.roots.extend(std::env::split_paths(&list));
+            options.read_roots.extend(std::env::split_paths(&list));
+        }
+        if let Some(list) = env("AURORA_MCP_BRIDGE_WRITE_ROOTS").filter(|v| !v.is_empty()) {
+            options.write_roots.extend(std::env::split_paths(&list));
         }
         let mut it = args.iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "--mcp-bridge" => options.enabled = true,
-                "--mcp-bridge-root" => {
+                flag @ ("--mcp-bridge-root" | "--mcp-bridge-read-root") => {
                     let value = it
                         .next()
-                        .ok_or_else(|| "--mcp-bridge-root needs a directory".to_owned())?;
-                    options.roots.push(PathBuf::from(value));
+                        .ok_or_else(|| format!("{flag} needs a directory"))?;
+                    options.read_roots.push(PathBuf::from(value));
+                }
+                "--mcp-bridge-write-root" => {
+                    let value = it
+                        .next()
+                        .ok_or_else(|| "--mcp-bridge-write-root needs a directory".to_owned())?;
+                    options.write_roots.push(PathBuf::from(value));
                 }
                 "--mcp-bridge-max-mpx" => {
                     let value = it
@@ -254,7 +270,8 @@ pub(crate) struct Bridge {
     rx: mpsc::Receiver<Job>,
     pub(crate) shown_connected: bool,
     pub(crate) roots: Roots,
-    pub(crate) root_paths: Vec<PathBuf>,
+    pub(crate) read_root_paths: Vec<PathBuf>,
+    pub(crate) write_root_paths: Vec<PathBuf>,
     pub(crate) scratch: Scratch,
     pub(crate) max_pixels: u64,
     pub(crate) pending: Vec<Pending>,
@@ -275,7 +292,7 @@ impl Bridge {
         options: &BridgeOptions,
         proxy: EventLoopProxy<AppEvent>,
     ) -> Result<Self, String> {
-        let roots = Roots::open(&options.roots, &options.roots)
+        let roots = Roots::open(&options.read_roots, &options.write_roots)
             .map_err(|e| format!("a bridge root can't be opened: {e}"))?;
         let scratch = Scratch::create(None).map_err(|e| format!("bridge scratch: {e}"))?;
         let dir = discovery::default_dir().ok_or_else(|| {
@@ -312,7 +329,8 @@ impl Bridge {
         tracing::info!(
             port = record.port,
             file = %published.path().display(),
-            roots = options.roots.len(),
+            read_roots = options.read_roots.len(),
+            write_roots = options.write_roots.len(),
             "automation bridge enabled (loopback only)"
         );
         let discovery_path = Some(published.path().to_path_buf());
@@ -322,7 +340,8 @@ impl Bridge {
             rx,
             shown_connected: false,
             roots,
-            root_paths: options.roots.clone(),
+            read_root_paths: options.read_roots.clone(),
+            write_root_paths: options.write_roots.clone(),
             scratch,
             max_pixels: options.max_pixels,
             pending: Vec::new(),
@@ -524,6 +543,16 @@ impl App {
         self.quit_review.as_ref().map(|_| "quit review".to_owned())
     }
 
+    /// What a controller is told when its call left a dialog open.
+    pub(crate) fn bridge_modal_note(&self) -> Option<String> {
+        self.bridge_modal().map(|modal| {
+            format!(
+                "a dialog is open ({modal}); a controller can only acknowledge it or cancel \
+                 (ui_dialog); a person answers questions that discard changes or quit"
+            )
+        })
+    }
+
     /// Runs one request; `Some` is the finished answer, `None` means the
     /// job was stored to finish on a later turn.
     fn bridge_dispatch(&mut self, job: Job) -> Option<(Job, Result<Value, CallError>)> {
@@ -573,7 +602,8 @@ impl App {
             "app_version": env!("CARGO_PKG_VERSION"),
             "pid": std::process::id(),
             "window": {"physical_width": width, "physical_height": height, "scale_factor": self.scale_factor},
-            "roots": self.bridge.as_ref().map(|b| b.root_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()),
+            "read_roots": self.bridge.as_ref().map(|b| b.read_root_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()),
+            "write_roots": self.bridge.as_ref().map(|b| b.write_root_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()),
             "modal": self.bridge_modal(),
             "palette_open": self.command_palette.is_some(),
             "screenshots": self.bridge.as_ref().is_some_and(|b| b.capture_supported),

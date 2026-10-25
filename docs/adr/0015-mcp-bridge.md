@@ -30,15 +30,20 @@ threat model matters more than the feature.
 ## Decision
 
 1. **Off unless enabled.** `aurora-app --mcp-bridge` (or `AURORA_MCP_BRIDGE=1`).
-   Without it nothing listens and no file is written (tested). File access
-   needs `--mcp-bridge-root DIR` (repeatable); none means no file tools.
+   Without it nothing listens and no file is written (the option parsing is
+   tested; the live path was not run). File access needs
+   `--mcp-bridge-read-root DIR` (`--mcp-bridge-root` is the same) and, for
+   saving, a separate `--mcp-bridge-write-root DIR` (repeatable); a read root
+   never grants writing, and none means no file tools.
 2. **Transport.** Newline-delimited JSON over TCP on `127.0.0.1`, an
    ephemeral port. No HTTP, no TLS (loopback; the token authenticates).
    First line from the client: exactly `{"hello":"aurora-bridge","version":1,"token":"<64 hex>"}`
    (unknown fields refused, at most 512 bytes, within 3 s *in total*, not per
    read). Token from the OS RNG (`getrandom`), compared in constant time.
    After five failed handshakes new connections are refused for a growing
-   time (1 s doubling to 60 s). **One** controller; a second authenticated
+   time (1 s doubling to 60 s); **only a well-formed handshake carrying a
+   wrong token counts** (binary junk, a TLS hello, invalid UTF-8, JSON of
+   another shape and HTTP are refused or dropped and never counted). **One** controller; a second authenticated
    connection is refused; at most four handshakes in progress. Requests are
    at most 1 MiB, rate-limited (burst 32, 20/s) and served one at a time per
    connection; a controller silent for 5 minutes is dropped (the proxy
@@ -71,13 +76,38 @@ threat model matters more than the feature.
    dialogs are refused (they would block the UI thread); `doc_open` copies the
    confined file to private scratch and header-checks the copy; `doc_save`
    writes a new file with `create_new` and never overwrites.
-6. **Visible and revocable.** While a controller is connected the window title
+6. **A controller never answers a discard or quit question.** `ui.dialog`
+   `choose` goes through `dialog_choice_allowed`: a controller may acknowledge
+   a report and cancel a question, nothing else. Audit of every
+   `DialogPurpose` (a test asserts each row and the `match` over the enum is
+   exhaustive, so a new purpose does not compile until classified):
+
+   | Dialog | Actions | Controller may choose |
+   |---|---|---|
+   | CrashRecovery | Continue | Continue |
+   | OpenedWithChanges | OK | OK |
+   | OpenFailed / SaveFailed / ExportRefused / SkippedTiles / MoveRefused | Dismiss | Dismiss |
+   | ExportedNotSaved | Dismiss | Dismiss |
+   | PsdCheck | OK | OK |
+   | Welcome | Get Started, Open Command Palette | both (they only close it or open the palette) |
+   | **CloseDocument** | Save, Don't Save, Cancel | **Cancel only** |
+   | **QuitReview** | Save, Don't Save, Cancel | **Cancel only** |
+   | **PsdSaveWithChanges** | Save Anyway, Cancel | **Cancel only** (Save Anyway writes a lossy file) |
+   | **ReplaceWorkspace** | Replace, Cancel | **Cancel only** (Replace overwrites a saved preset) |
+
+   `file.close` and Ctrl+W are not blocked (the normal review is the point);
+   the dialog they open can only be cancelled by the controller, and the tool
+   reply says so (`dialog_note`). A click, drag or typed text that opens a
+   dialog stops the rest of that call, so a second click cannot land on it.
+   Save is refused too: Aurora's Save is Save As and would raise a native
+   dialog, which the bridge never does.
+7. **Visible and revocable.** While a controller is connected the window title
    ends with "[automation connected]" and the status bar ends with
    "Automation connected" (also after a notice). The palette command
    **Disconnect Automation** (`automation.disconnect`) closes the controller
    and turns the bridge off for good (the token stops working, the discovery
    file is removed); quitting does the same.
-7. **Screenshots** read Aurora's own swapchain frame back (the surface is
+8. **Screenshots** read Aurora's own swapchain frame back (the surface is
    configured with `COPY_SRC` only when the bridge is on). They are not an OS
    screen capture, so no other window can appear in one.
 
@@ -127,5 +157,15 @@ unless the user asks.
   machine is protected by the permission checks, not by the token alone.
 * Windows ACLs on the discovery directory are not verified by code (the
   per-user profile directory is relied on); Windows and macOS are untested.
-* The live-window handlers (`ui_*`, screenshots, the UI-thread marshalling)
-  are covered by a manual smoke script, not by automated tests.
+* The token is generated once per app run and is **not rotated per
+  controller**: a controller that has read the discovery file can reconnect
+  until the app exits or the user runs Disconnect Automation. Anything that
+  could read the file once can read it again.
+* **Windows ACLs on the discovery directory are not verified by code**; the
+  per-user profile directory's own ACL is relied on. Windows and macOS are
+  untested.
+* The live-window handlers (`ui_*`, screenshots, the UI-thread marshalling,
+  the dialog gate's wiring in `ui.dialog`, the "stop after a dialog opens"
+  guards) have **not been run at all** (no display server was available when
+  this was written) and are covered by a manual smoke script, not by
+  automated tests. The pure parts are tested.

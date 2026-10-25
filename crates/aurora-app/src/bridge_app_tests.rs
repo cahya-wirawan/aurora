@@ -33,7 +33,7 @@ fn args(list: &[&str]) -> Vec<String> {
 fn the_bridge_is_off_unless_asked_for() {
     let o = BridgeOptions::from_args(&[], &env_none).unwrap();
     assert!(!o.enabled);
-    assert!(o.roots.is_empty());
+    assert!(o.read_roots.is_empty() && o.write_roots.is_empty());
     // Roots or limits alone never enable it.
     let o = BridgeOptions::from_args(
         &args(&["--mcp-bridge-root", "/tmp", "--mcp-bridge-max-mpx", "5"]),
@@ -72,22 +72,55 @@ fn the_flag_and_the_environment_enable_it() {
             "{v:?}"
         );
     }
-    let env = |n: &str| (n == "AURORA_MCP_BRIDGE_ROOTS").then(|| "/a:/b".to_owned());
-    let o = BridgeOptions::from_args(&args(&["--mcp-bridge", "--mcp-bridge-root", "/c"]), &env)
-        .unwrap();
+    let env = |n: &str| match n {
+        "AURORA_MCP_BRIDGE_ROOTS" => Some("/a:/b".to_owned()),
+        "AURORA_MCP_BRIDGE_WRITE_ROOTS" => Some("/w".to_owned()),
+        _ => None,
+    };
+    let o = BridgeOptions::from_args(
+        &args(&[
+            "--mcp-bridge",
+            "--mcp-bridge-root",
+            "/c",
+            "--mcp-bridge-read-root",
+            "/d",
+            "--mcp-bridge-write-root",
+            "/e",
+        ]),
+        &env,
+    )
+    .unwrap();
     assert_eq!(
-        o.roots,
+        o.read_roots,
         [
             PathBuf::from("/a"),
             PathBuf::from("/b"),
-            PathBuf::from("/c")
+            PathBuf::from("/c"),
+            PathBuf::from("/d")
         ]
+    );
+    assert_eq!(o.write_roots, [PathBuf::from("/w"), PathBuf::from("/e")]);
+}
+
+#[test]
+fn the_bare_root_flag_never_grants_writing() {
+    let o = BridgeOptions::from_args(
+        &args(&["--mcp-bridge", "--mcp-bridge-root", "/c"]),
+        &env_none,
+    )
+    .unwrap();
+    assert_eq!(o.read_roots, [PathBuf::from("/c")]);
+    assert!(
+        o.write_roots.is_empty(),
+        "writing needs --mcp-bridge-write-root"
     );
 }
 
 #[test]
 fn bad_option_values_are_errors() {
     assert!(BridgeOptions::from_args(&args(&["--mcp-bridge-root"]), &env_none).is_err());
+    assert!(BridgeOptions::from_args(&args(&["--mcp-bridge-write-root"]), &env_none).is_err());
+    assert!(BridgeOptions::from_args(&args(&["--mcp-bridge-read-root"]), &env_none).is_err());
     assert!(BridgeOptions::from_args(&args(&["--mcp-bridge-max-mpx", "0"]), &env_none).is_err());
     assert!(BridgeOptions::from_args(&args(&["--mcp-bridge-max-mpx", "x"]), &env_none).is_err());
 }
@@ -439,4 +472,117 @@ fn saving_creates_a_new_file_and_never_replaces_one() {
 fn error_kinds_survive_the_trip() {
     let c = CallError::new("modal_dialog", "x");
     assert_eq!(c.kind, "modal_dialog");
+}
+
+// ---- dialogs: what a controller may answer ----
+
+use crate::DialogPurpose;
+use crate::bridge_ui::dialog_choice_allowed;
+
+/// Every purpose with every action id its dialog has, and whether a
+/// controller may choose it. The `match` is exhaustive on purpose: a new
+/// dialog purpose does not compile until it is classified here (and in
+/// ADR 0015's table).
+fn table(purpose: &DialogPurpose) -> Vec<(&'static str, bool)> {
+    use crate::{document_close as dc, first_run as fr, psd_save as ps, workspace_presets as wp};
+    match purpose {
+        DialogPurpose::CrashRecovery => vec![(crate::CRASH_RECOVERY_CONTINUE, true)],
+        DialogPurpose::OpenedWithChanges => vec![(crate::PSD_REPORT_DISMISS, true)],
+        DialogPurpose::OpenFailed => vec![(crate::OPEN_FAILED_DISMISS, true)],
+        DialogPurpose::SaveFailed => vec![(crate::SAVE_FAILED_DISMISS, true)],
+        DialogPurpose::ExportRefused => vec![(crate::EXPORT_REFUSED_DISMISS, true)],
+        DialogPurpose::SkippedTiles => vec![(crate::SKIPPED_TILES_DISMISS, true)],
+        DialogPurpose::MoveRefused => vec![(crate::MOVE_REFUSED_DISMISS, true)],
+        DialogPurpose::ReplaceWorkspace(_) => vec![
+            (wp::WORKSPACE_REPLACE, false),
+            (wp::WORKSPACE_REPLACE_CANCEL, true),
+        ],
+        DialogPurpose::CloseDocument(_) | DialogPurpose::QuitReview(_) => vec![
+            (dc::CLOSE_SAVE, false),
+            (dc::CLOSE_DONT_SAVE, false),
+            (dc::CLOSE_CANCEL, true),
+        ],
+        DialogPurpose::ExportedNotSaved => vec![(dc::EXPORTED_NOT_SAVED_DISMISS, true)],
+        DialogPurpose::PsdSaveWithChanges => {
+            vec![(ps::PSD_SAVE_ANYWAY, false), (ps::PSD_SAVE_CANCEL, true)]
+        }
+        DialogPurpose::PsdCheck => vec![(ps::PSD_CHECK_OK, true)],
+        DialogPurpose::Welcome => vec![(fr::WELCOME_START, true), (fr::WELCOME_PALETTE, true)],
+    }
+}
+
+fn every_purpose() -> Vec<DialogPurpose> {
+    use crate::document_session::DocumentId;
+    vec![
+        DialogPurpose::CrashRecovery,
+        DialogPurpose::OpenedWithChanges,
+        DialogPurpose::OpenFailed,
+        DialogPurpose::SaveFailed,
+        DialogPurpose::ExportRefused,
+        DialogPurpose::SkippedTiles,
+        DialogPurpose::MoveRefused,
+        DialogPurpose::ReplaceWorkspace("Mine".to_owned()),
+        DialogPurpose::CloseDocument(DocumentId::next()),
+        DialogPurpose::QuitReview(DocumentId::next()),
+        DialogPurpose::ExportedNotSaved,
+        DialogPurpose::PsdSaveWithChanges,
+        DialogPurpose::PsdCheck,
+        DialogPurpose::Welcome,
+    ]
+}
+
+#[test]
+fn a_controller_may_acknowledge_and_cancel_but_never_discard_or_quit() {
+    for purpose in every_purpose() {
+        for (action, allowed) in table(&purpose) {
+            assert_eq!(
+                dialog_choice_allowed(&purpose, action).is_ok(),
+                allowed,
+                "{purpose:?} / {action}"
+            );
+        }
+        // An id the dialog does not have is never allowed.
+        assert!(
+            dialog_choice_allowed(&purpose, "nonsense.id").is_err(),
+            "{purpose:?}"
+        );
+    }
+}
+
+#[test]
+fn the_unsaved_changes_answers_are_refused_with_a_reason() {
+    let id = crate::document_session::DocumentId::next();
+    for purpose in [
+        DialogPurpose::CloseDocument(id),
+        DialogPurpose::QuitReview(id),
+    ] {
+        for action in [
+            crate::document_close::CLOSE_DONT_SAVE,
+            crate::document_close::CLOSE_SAVE,
+        ] {
+            let message = dialog_choice_allowed(&purpose, action).unwrap_err();
+            assert!(message.contains("unsaved"), "{message}");
+        }
+        assert!(dialog_choice_allowed(&purpose, crate::document_close::CLOSE_CANCEL).is_ok());
+    }
+}
+
+#[test]
+fn choosing_goes_through_one_validation_that_knows_the_gate() {
+    use crate::bridge_ui::validate_choice;
+    let id = crate::document_session::DocumentId::next();
+    let purpose = DialogPurpose::CloseDocument(id);
+    assert_eq!(
+        validate_choice(&purpose, true, crate::document_close::CLOSE_DONT_SAVE)
+            .unwrap_err()
+            .kind,
+        "refused"
+    );
+    assert!(validate_choice(&purpose, true, crate::document_close::CLOSE_CANCEL).is_ok());
+    assert_eq!(
+        validate_choice(&purpose, false, crate::document_close::CLOSE_CANCEL)
+            .unwrap_err()
+            .kind,
+        "bad_request"
+    );
 }

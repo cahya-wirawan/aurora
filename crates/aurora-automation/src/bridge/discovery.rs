@@ -275,6 +275,52 @@ impl Drop for Published {
     }
 }
 
+/// Whether `file` is still the file `path` names (Unix: same device and
+/// inode; elsewhere assumed). A sweeper that unlinked the lock file between
+/// its creation and its locking leaves the publisher holding a lock on a file
+/// that no longer has a name; this detects that.
+fn same_file(file: &File, path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        match (file.metadata(), std::fs::symlink_metadata(path)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, path);
+        true
+    }
+}
+
+/// Creates (or opens) this process's lock file and locks it, retrying when
+/// a sweeper held or removed it in the meantime. The returned file is
+/// locked **and** is the file the path names, so a fresh lock file is never
+/// left unlinked under its publisher.
+fn take_lock(lock_path: &Path) -> io::Result<File> {
+    for _ in 0..50 {
+        let mut options = private_options();
+        options.create(true).truncate(false);
+        let lock = options.open(lock_path)?;
+        make_owner_only(&lock)?;
+        match lock.try_lock() {
+            Ok(()) if same_file(&lock, lock_path) => return Ok(lock),
+            // Unlinked by a sweeper before we locked it: start again.
+            Ok(()) | Err(std::fs::TryLockError::WouldBlock) => {
+                drop(lock);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "another bridge with this process id is running",
+    ))
+}
+
 fn private_options() -> OpenOptions {
     let mut options = OpenOptions::new();
     options.write(true);
@@ -320,17 +366,7 @@ pub fn publish(dir: &Path, record: &Discovery) -> io::Result<Published> {
     }
     let lock_path = dir.join(lock_name(record.pid));
     let json = dir.join(json_name(record.pid));
-    let mut lock_options = private_options();
-    lock_options.create(true).truncate(false);
-    let lock = lock_options.open(&lock_path)?;
-    make_owner_only(&lock)?;
-    lock.try_lock().map_err(|e| match e {
-        std::fs::TryLockError::WouldBlock => io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "another bridge with this process id is running",
-        ),
-        std::fs::TryLockError::Error(e) => e,
-    })?;
+    let lock = take_lock(&lock_path)?;
     let mut file_options = private_options();
     file_options.create_new(true);
     let mut file = file_options.open(&json)?;
@@ -479,10 +515,7 @@ pub fn sweep_stale(dir: &Path) -> SweepReport {
             // An orphan lock file: its json is gone (a crash between the
             // steps, or a half-finished sweep).
             let json = dir.join(json_name(pid));
-            if std::fs::symlink_metadata(&json).is_err()
-                && orphan_lock_removable(&entry.path())
-                && std::fs::remove_file(entry.path()).is_ok()
-            {
+            if std::fs::symlink_metadata(&json).is_err() && remove_orphan_lock(&entry.path()) {
                 report.removed += 1;
             }
         }
@@ -490,7 +523,11 @@ pub fn sweep_stale(dir: &Path) -> SweepReport {
     report
 }
 
-fn orphan_lock_removable(path: &Path) -> bool {
+/// Removes an orphan lock file (its discovery file is gone), but only while
+/// holding the lock itself, so a lock file a publisher has just created and
+/// is about to lock is never unlinked from under it (the publisher checks
+/// that its locked file is still the named one and retries).
+fn remove_orphan_lock(path: &Path) -> bool {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return false;
     };
@@ -501,7 +538,44 @@ fn orphan_lock_removable(path: &Path) -> bool {
             return false;
         }
     }
-    meta.file_type().is_file() && meta.len() == 0 && lock_state(path) == LockState::Free
+    if !meta.file_type().is_file() || meta.len() != 0 {
+        return false;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed());
+    }
+    let Ok(file) = options.open(path) else {
+        return false;
+    };
+    if file.try_lock().is_err() || !same_file(&file, path) {
+        return false;
+    }
+    // Unlinked while the lock is held; a publisher that opens the old
+    // inode after this finds it unnamed and starts again.
+    std::fs::remove_file(path).is_ok()
+}
+
+/// Opens an existing lock file and takes the lock: `Some` only when the file
+/// is a regular file that nobody holds (its owner is gone). Holding it keeps
+/// a new publisher from locking the file while it is being removed.
+fn lock_exclusive(path: &Path) -> Option<File> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed());
+    }
+    let file = options.open(path).ok()?;
+    (file.try_lock().is_ok() && same_file(&file, path)).then_some(file)
 }
 
 fn sweep_one(dir: &Path, path: &Path, pid: u32) -> bool {
@@ -513,9 +587,10 @@ fn sweep_one(dir: &Path, path: &Path, pid: u32) -> bool {
         return false;
     }
     let lock_path = dir.join(lock_name(pid));
-    if lock_state(&lock_path) != LockState::Free {
+    // Dead owner: the lock can be taken. It is held while both files go.
+    let Some(_held) = lock_exclusive(&lock_path) else {
         return false;
-    }
+    };
     let removed = std::fs::remove_file(path).is_ok();
     if removed {
         let _ = std::fs::remove_file(&lock_path);

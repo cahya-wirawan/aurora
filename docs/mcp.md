@@ -252,13 +252,14 @@ file is written.
 ### Enable it
 
 ```sh
-aurora-app --mcp-bridge --mcp-bridge-root ~/Pictures/work    # or AURORA_MCP_BRIDGE=1
+aurora-app --mcp-bridge --mcp-bridge-read-root ~/Pictures/work --mcp-bridge-write-root ~/Pictures/work/out    # or AURORA_MCP_BRIDGE=1
 ```
 
 | Option | Meaning |
 |---|---|
 | `--mcp-bridge` | Turn the bridge on (also `AURORA_MCP_BRIDGE=1`). |
-| `--mcp-bridge-root DIR` | A directory the file tools may read **and** write (repeatable; also `AURORA_MCP_BRIDGE_ROOTS`, a path list). None = no file tools. |
+| `--mcp-bridge-read-root DIR` | A directory the file tools may read from (repeatable; also `AURORA_MCP_BRIDGE_ROOTS`, a path list). `--mcp-bridge-root DIR` is the same thing: **read-only**. None = `doc_open` is refused. |
+| `--mcp-bridge-write-root DIR` | A directory `doc_save` may create NEW files in (repeatable; also `AURORA_MCP_BRIDGE_WRITE_ROOTS`). Writing is never granted by a read root. None = `doc_save` is refused. |
 | `--mcp-bridge-max-mpx N` | Largest canvas the bridge opens, previews or exports, in Mpx (default 50). Preview and export run on the UI thread. |
 
 The app listens on `127.0.0.1` only, makes a 256-bit token and writes a
@@ -287,7 +288,7 @@ discovery file (mode `0600`, in a `0700` per-user directory):
 
 `--discovery FILE` names a specific discovery file; the default is the newest
 live app in the directory above. Give the proxy roots that lie **inside**
-`--mcp-bridge-root`: the app enforces its own roots again, and a path outside
+the app's read and write roots respectively: the app enforces its own roots again, and a path outside
 them is refused there. A relative path means the first root of its kind in the
 proxy; the app is always sent an absolute path.
 
@@ -326,6 +327,13 @@ and does not mark the live document as saved.
   with "[automation connected]" and the status bar ends with "Automation
   connected". The palette command **Disconnect Automation** closes it and
   turns the bridge off until Aurora is restarted.
+* **A controller can never discard work or quit.** `ui_dialog` may
+  acknowledge a report and **cancel** a question, but it may not choose
+  Save, Don't Save, Quit, Replace or Save Anyway in the unsaved-changes,
+  quit, workspace-replace and lossy-PSD dialogs; those need a person
+  (the table is in ADR 0015). `file.close` and a window-close shortcut can
+  *open* the close dialog; the reply says so and the controller can only
+  cancel it. A click or key that opens a dialog stops the rest of that call.
 * **A modal dialog blocks everything** but reads (`doc_inspect`,
   `ui_inspect`, `ui_screenshot`, `render_preview`, `psd_check`,
   `command_list`) and `ui_dialog`. That includes the unsaved-changes
@@ -340,7 +348,9 @@ and does not mark the live document as saved.
   connection; anything that changes state is never resent after a transport
   failure (the error says it may have completed).
 * Five failed handshakes lock new connections out for 1 s, doubling to 60 s.
-  HTTP requests (a web page) are dropped without an answer and do not count.
+  Only a well-formed handshake with a wrong token counts; HTTP requests (a
+  web page), binary junk, a TLS hello and any other first line are refused
+  or dropped and never count.
 * Every tool call is logged at `info` (method only, no pixel data).
 
 ### What is not protected

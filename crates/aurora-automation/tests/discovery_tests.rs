@@ -154,3 +154,52 @@ fn a_file_naming_another_pid_is_not_swept() {
     assert_eq!(sweep_stale(&dir).removed, 0);
     assert!(json.exists());
 }
+
+#[test]
+fn a_sweeper_never_unlinks_a_lock_file_a_publisher_is_taking() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("b");
+    ensure_private_dir(&dir).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let sweepers: Vec<_> = (0..3)
+        .map(|_| {
+            let (dir, stop) = (dir.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let _ = sweep_stale(&dir);
+                }
+            })
+        })
+        .collect();
+    for round in 0..300 {
+        let published =
+            publish(&dir, &Discovery::new(4242, token::generate().unwrap(), "t")).unwrap();
+        // The lock we hold must still be the file the name points at, so
+        // a proxy sees this app as alive.
+        let (path, _) = find_running(&dir).unwrap_or_else(|e| panic!("round {round}: {e}"));
+        assert_eq!(path, published.path());
+        drop(published);
+    }
+    stop.store(true, Ordering::SeqCst);
+    for s in sweepers {
+        s.join().unwrap();
+    }
+}
+
+#[test]
+fn an_orphan_lock_file_is_removed_only_when_nobody_holds_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("b");
+    ensure_private_dir(&dir).unwrap();
+    let lock = dir.join("aurora-bridge-999004.lock");
+    std::fs::write(&lock, b"").unwrap();
+    let held = std::fs::OpenOptions::new().read(true).open(&lock).unwrap();
+    held.try_lock().unwrap();
+    assert_eq!(sweep_stale(&dir).removed, 0, "a held lock is not an orphan");
+    assert!(lock.exists());
+    drop(held);
+    assert_eq!(sweep_stale(&dir).removed, 1);
+    assert!(!lock.exists());
+}

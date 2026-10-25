@@ -435,3 +435,53 @@ fn the_client_never_dials_a_non_loopback_address() {
         BridgeClient::connect_to(addr, &"a".repeat(64), Duration::from_millis(100)).unwrap_err();
     assert!(err.to_string().contains("loopback"));
 }
+
+#[test]
+fn junk_that_is_not_a_handshake_never_locks_the_real_controller_out() {
+    let (server, token, _) = start(ServerConfig {
+        free_failures: 1,
+        ..fast()
+    });
+    let junk: Vec<Vec<u8>> = vec![
+        // A TLS ClientHello's first bytes.
+        vec![
+            0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0xfc, 0x03, 0x03, b'\n',
+        ],
+        // Invalid UTF-8.
+        vec![0xff, 0xfe, 0xfd, 0x80, b'\n'],
+        b"{\"hello\":\"aurora-bridge\",\"version\":1}\n".to_vec(),
+        b"{\"hello\":\"other\",\"version\":1,\"token\":\"x\"}\n".to_vec(),
+        b"[1,2,3]\n".to_vec(),
+        b"null\n".to_vec(),
+        vec![b'a'; 3000],
+    ];
+    for _ in 0..4 {
+        for bytes in &junk {
+            let mut s = raw(&server);
+            let _ = s.write_all(bytes);
+            let _ = s.write_all(b"\n");
+            let mut sink = Vec::new();
+            let _ = s.read_to_end(&mut sink);
+        }
+    }
+    // Twenty-eight junk connections, two free failures would have locked it.
+    BridgeClient::connect_to(server.local_addr(), &token, Duration::from_secs(3)).unwrap();
+}
+
+#[test]
+fn only_a_well_formed_hello_with_a_wrong_token_counts() {
+    let (server, token, _) = start(ServerConfig {
+        free_failures: 1,
+        ..fast()
+    });
+    let wrong = "2".repeat(64);
+    for _ in 0..3 {
+        let _ = BridgeClient::connect_to(server.local_addr(), &wrong, Duration::from_secs(3));
+    }
+    let err =
+        BridgeClient::connect_to(server.local_addr(), &token, Duration::from_secs(3)).unwrap_err();
+    assert!(
+        err.to_string().contains("too many failed attempts"),
+        "{err}"
+    );
+}

@@ -324,10 +324,11 @@ fn serve_connection(stream: &TcpStream, shared: &Arc<Shared>) {
     let line = match frame::read_line_by(&mut reader, MAX_HELLO_BYTES, deadline) {
         Ok(Line::Data(line)) => line,
         Ok(Line::TooLong) => {
-            fail_auth(shared, &mut writer, "the handshake is too long");
+            // Not a handshake at all: refused, not counted.
+            reject(&mut writer, "the handshake is too long");
             return;
         }
-        // Closed without a line, or too slow: nothing to answer, but a
+        // Closed without a line, or too slow: nothing to answer, and a
         // connection that sends nothing is not an authentication attempt
         // worth counting (a port scanner, a liveness probe).
         Ok(Line::Eof) | Err(_) => return,
@@ -337,11 +338,19 @@ fn serve_connection(stream: &TcpStream, shared: &Arc<Shared>) {
         let _ = stream.shutdown(Shutdown::Both);
         return;
     }
+    // Only a WELL-FORMED hello with a wrong token counts as a failed
+    // attempt. Binary junk, a TLS ClientHello, invalid UTF-8, JSON of
+    // another shape: refused, never counted, so something that cannot even
+    // speak the protocol cannot lock the real controller out.
     let Ok(hello) = serde_json::from_slice::<Hello>(&line) else {
-        fail_auth(shared, &mut writer, "bad handshake");
+        reject(&mut writer, "bad handshake");
         return;
     };
-    if hello.hello != HELLO || !token::verify(&hello.token, &shared.token) {
+    if hello.hello != HELLO {
+        reject(&mut writer, "bad handshake");
+        return;
+    }
+    if !token::verify(&hello.token, &shared.token) {
         fail_auth(shared, &mut writer, "authentication failed");
         return;
     }
@@ -406,6 +415,13 @@ fn reply_hello_error(writer: &mut TcpStream, message: &str) {
     let _ = writer.shutdown(Shutdown::Both);
 }
 
+/// Refuses a connection that did not present a well-formed handshake.
+fn reject(writer: &mut TcpStream, message: &str) {
+    tracing::debug!("bridge: a connection did not send a handshake");
+    reply_hello_error(writer, message);
+}
+
+/// A well-formed handshake with the wrong token: counted toward the lockout.
 fn fail_auth(shared: &Shared, writer: &mut TcpStream, message: &str) {
     lock(&shared.lockout).failed(Instant::now());
     tracing::warn!("bridge: a connection failed the handshake");

@@ -162,7 +162,9 @@ impl App {
         self.push_accessibility();
         self.relayout_after_gallery();
         self.needs_redraw = true;
-        Ok(json!({"id": id, "ok": true, "dialog": self.bridge_modal()}))
+        Ok(
+            json!({"id": id, "ok": true, "dialog": self.bridge_modal(), "dialog_note": self.bridge_modal_note()}),
+        )
     }
 
     pub(crate) fn bridge_doc_inspect(&mut self) -> Value {
