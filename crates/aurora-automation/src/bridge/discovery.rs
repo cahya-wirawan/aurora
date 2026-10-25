@@ -252,15 +252,27 @@ impl Published {
         &self.json
     }
 
-    /// Removes the files now (disabling the bridge).
+    /// Removes the files now (disabling the bridge). The discovery file and
+    /// then the lock file are removed **while the lock is still held** (Unix),
+    /// so a sweeper that opened the lock file earlier cannot lock it, find
+    /// it still named and then delete a newer app's discovery file by name.
     pub fn remove(&mut self) {
         if let Err(e) = std::fs::remove_file(&self.json)
             && e.kind() != io::ErrorKind::NotFound
         {
             tracing::warn!(error = %e, "couldn't remove the bridge discovery file");
         }
-        // Release the lock before removing its file (Windows).
+        #[cfg(unix)]
+        if let Some(lock) = self.lock.as_ref()
+            && same_file(lock, &self.lock_path)
+            && let Err(e) = std::fs::remove_file(&self.lock_path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %e, "couldn't remove the bridge lock file");
+        }
+        // Release the lock (before removing its file, on Windows).
         self.lock = None;
+        #[cfg(not(unix))]
         if let Err(e) = std::fs::remove_file(&self.lock_path)
             && e.kind() != io::ErrorKind::NotFound
         {
@@ -300,11 +312,18 @@ fn same_file(file: &File, path: &Path) -> bool {
 /// locked **and** is the file the path names, so a fresh lock file is never
 /// left unlinked under its publisher.
 fn take_lock(lock_path: &Path) -> io::Result<File> {
+    take_lock_with(lock_path, &|| {})
+}
+
+/// [`take_lock`] with `window` called between creating the file and locking
+/// it: the instant a sweeper could unlink it (a test seam).
+fn take_lock_with(lock_path: &Path, window: &dyn Fn()) -> io::Result<File> {
     for _ in 0..50 {
         let mut options = private_options();
         options.create(true).truncate(false);
         let lock = options.open(lock_path)?;
         make_owner_only(&lock)?;
+        window();
         match lock.try_lock() {
             Ok(()) if same_file(&lock, lock_path) => return Ok(lock),
             // Unlinked by a sweeper before we locked it: start again.
@@ -637,5 +656,34 @@ pub fn find_running(dir: &Path) -> Result<(PathBuf, Discovery), DiscoveryError> 
             || DiscoveryError::NotFound(dir.display().to_string()),
             DiscoveryError::Unusable,
         )),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn a_lock_file_swept_between_creation_and_locking_is_taken_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("b");
+        ensure_private_dir(&dir).unwrap();
+        let lock_path = dir.join(lock_name(999_777));
+        let swept = Cell::new(0);
+        // On the first pass a sweep runs in the window: the new, empty,
+        // unlocked lock file looks like an orphan, and (this being the
+        // race) is unlinked.
+        let lock = take_lock_with(&lock_path, &|| {
+            if swept.get() == 0 {
+                swept.set(1);
+                assert_eq!(sweep_stale(&dir).removed, 1, "the window is real");
+            }
+        })
+        .unwrap();
+        // The lock we hold is the file the name points at, and is held.
+        assert!(same_file(&lock, &lock_path));
+        assert_eq!(lock_state(&lock_path), LockState::Held);
     }
 }

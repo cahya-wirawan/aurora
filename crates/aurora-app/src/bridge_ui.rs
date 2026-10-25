@@ -96,12 +96,14 @@ pub(crate) fn dialog_choice_allowed(purpose: &DialogPurpose, action: &str) -> Re
         action: action.to_owned(),
     }) {
         // OK / Continue / Dismiss: an acknowledgement changes nothing.
-        DialogEffect::Acknowledged => Ok(()),
-        // The first-run welcome only closes or opens the palette.
-        DialogEffect::Welcome(_) => Ok(()),
-        DialogEffect::Close(_, CloseChoice::Cancel)
-        | DialogEffect::Quit(_, CloseChoice::Cancel) => Ok(()),
-        DialogEffect::PsdSave(crate::psd_save::PsdSaveChoice::Cancel) => Ok(()),
+        // Acknowledgements change nothing; the first-run welcome only closes
+        // or opens the palette; Cancel on a close, quit or lossy-save
+        // question leaves everything as it is.
+        DialogEffect::Acknowledged
+        | DialogEffect::Welcome(_)
+        | DialogEffect::Close(_, CloseChoice::Cancel)
+        | DialogEffect::Quit(_, CloseChoice::Cancel)
+        | DialogEffect::PsdSave(crate::psd_save::PsdSaveChoice::Cancel) => Ok(()),
         DialogEffect::Close(..) | DialogEffect::Quit(..) => {
             refuse("it saves or discards the document's unsaved changes")
         }

@@ -178,7 +178,8 @@ fn a_sweeper_never_unlinks_a_lock_file_a_publisher_is_taking() {
             publish(&dir, &Discovery::new(4242, token::generate().unwrap(), "t")).unwrap();
         // The lock we hold must still be the file the name points at, so
         // a proxy sees this app as alive.
-        let (path, _) = find_running(&dir).unwrap_or_else(|e| panic!("round {round}: {e}"));
+        let (path, _) = find_running(&dir).expect("the published app is found");
+        let _ = round;
         assert_eq!(path, published.path());
         drop(published);
     }

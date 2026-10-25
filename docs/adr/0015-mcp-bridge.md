@@ -57,7 +57,11 @@ threat model matters more than the feature.
    never a symbolic link. Removed on a clean exit. A crash leaves them; the
    next app or proxy sweeps **only** files of exactly that name shape that
    parse as ours, name the same pid, are owned by the user, are regular files
-   and whose lock can be taken (the scratch directory's rule, ADR 0014).
+   and whose lock can be taken (the scratch directory's rule, ADR 0014). The
+   lock protocol: a discovery file is created and removed only while its
+   lock is held, and a lock file is unlinked only by whoever holds the lock
+   on the named file, so a sweeper can never delete a newer app's files; a
+   publisher re-checks that its locked file is still the named one.
    `AURORA_BRIDGE_DIR` overrides the directory (the same checks apply).
 4. **The same tools.** `aurora-cli mcp --bridge [--discovery FILE]` serves
    the ADR 0014 tools through a `BridgeSession`: every operation is forwarded
