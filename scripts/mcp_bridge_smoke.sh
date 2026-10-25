@@ -79,12 +79,54 @@ img = shot["result"]["content"][0]
 check("screenshot is a PNG", img.get("type") == "image" and base64.b64decode(img["data"]).startswith(b"\x89PNG"), shot)
 insp = json.loads(tool("ui_inspect")["result"]["content"][0]["text"])
 check("ui_inspect lists widgets", len(insp["nodes"]) > 10, insp.get("window"))
+def jtext(r):
+    return json.loads(r["result"]["content"][0]["text"])
+# A crash-recovery dialog from an earlier killed run may be open: it is
+# modal, so everything but ui_dialog is refused until a person (here the
+# script, through ui_dialog) answers it.
+dlg = jtext(tool("ui_dialog", {"action": "get"}))
+if dlg.get("open"):
+    acts = [a["id"] for a in dlg.get("actions", []) if a.get("controller_may_choose", True)]
+    print("dialog open:", dlg.get("title"), acts)
+    ans = tool("ui_dialog", {"action": "choose", "id": acts[0]}) if acts else None
+    check("a harmless dialog can be answered", ans is not None and ans["result"].get("isError") is not True, ans)
 ctx = tool("command_run", {"id": "layer.new"})
 check("command_run layer.new", ctx["result"].get("isError") is not True, ctx)
 doc = json.loads(tool("doc_inspect")["result"]["content"][0]["text"])
 check("doc_inspect sees the live document", doc["document"]["layer_count"] >= 2, doc)
 quit_ = tool("command_run", {"id": "app.quit"})
 check("app.quit is refused", quit_["result"].get("isError") is True)
+# The route the review found: click File, then "Quit Aurora" in the in-window
+# menu bar. With a clean document that used to exit the app.
+def find(nodes, name, role=None):
+    for nd in nodes:
+        if nd.get("label") == name and (role is None or nd.get("role") == role):
+            return nd
+nodes = jtext(tool("ui_inspect"))["nodes"]
+file_btn = find(nodes, "File", "Button")
+check("menu bar has a File button", file_btn is not None)
+if file_btn is None:
+    print("buttons:", sorted({nd.get("label") for nd in nodes if nd.get("role") == "Button"} - {None})[:40])
+if file_btn:
+    tool("ui_pointer", {"action": "click", "id": file_btn["id"]})
+    nodes = jtext(tool("ui_inspect"))["nodes"]
+    quit_item = find(nodes, "Quit Aurora")
+    if quit_item is None:
+        print("labels with Quit/Open/New:", sorted({str(nd.get("label")) for nd in nodes if any(k in str(nd.get("label")) for k in ("Quit", "Open", "New", "Save"))}))
+        after = tool("ui_screenshot", {"max_side": 800})["result"]["content"][0]
+        open("/tmp/mcp_bridge_smoke_menu.png", "wb").write(base64.b64decode(after["data"]))
+    check("File menu lists Quit Aurora", quit_item is not None)
+    if quit_item:
+        tool("ui_pointer", {"action": "click", "id": quit_item["id"]})
+    alive = tool("ui_screenshot", {"max_side": 800})
+    try:
+        open("/tmp/mcp_bridge_smoke_after_quit.png", "wb").write(base64.b64decode(alive["result"]["content"][0]["data"]))
+    except Exception:
+        pass
+    check("the app is still alive after clicking Quit Aurora",
+          alive.get("result", {}).get("isError") is not True and p.poll() is None, alive)
+    status = jtext(tool("ui_inspect")).get("status", "")
+    print("status after the quit click:", status)
 open("/tmp/mcp_bridge_smoke.png", "wb").write(base64.b64decode(img["data"]))
 print("screenshot written to /tmp/mcp_bridge_smoke.png")
 p.stdin.close(); p.wait(timeout=10)
