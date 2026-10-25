@@ -1,5 +1,6 @@
 //! Tests for saved selections as PSD alpha channels (task 156).
 #![allow(clippy::many_single_char_names)]
+#![allow(clippy::indexing_slicing)] // fixed-size fixtures
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -596,11 +597,9 @@ fn saved_selections_round_trip_bit_for_bit_and_pass_both_verify_passes() {
         assert_eq!(u16::from_be_bytes([bytes[12], bytes[13]]), 8);
         let back = open(&bytes);
         for (name, sel) in &back.saved_selections {
-            let original = saved
-                .iter()
-                .find(|s| s.0 == name)
-                .map(|s| s.1)
-                .unwrap_or_else(|| unreachable!("{name}"));
+            let Some(&(_, original)) = saved.iter().find(|s| s.0 == name) else {
+                unreachable!("{name}")
+            };
             assert_eq!(
                 coverage(sel, w, h),
                 coverage(original, w, h),
@@ -827,7 +826,11 @@ fn a_document_without_saved_selections_writes_the_bytes_main_wrote() {
     ] {
         let mut doc = doc_with_a_layer(canvas);
         let (bytes, _) = ok(doc.write());
-        assert_eq!((bytes.len(), stable_hash(&bytes)), (len, hash), "{canvas:?}");
+        assert_eq!(
+            (bytes.len(), stable_hash(&bytes)),
+            (len, hash),
+            "{canvas:?}"
+        );
         let (again, _) = write_with(&mut doc, &[]);
         assert_eq!(stable_hash(&again), hash);
     }
@@ -838,7 +841,10 @@ fn extra_channels_without_any_alpha_resource_stay_unopened_as_before() {
     let doc = open(&flat(6, 4, 8, 0, vec![ramp()], Vec::new()));
     assert!(doc.saved_selections.is_empty());
     assert!(
-        doc.report.items.iter().any(|i| i.contains("1 saved channel")),
+        doc.report
+            .items
+            .iter()
+            .any(|i| i.contains("1 saved channel")),
         "{:?}",
         doc.report.items
     );

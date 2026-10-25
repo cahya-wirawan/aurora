@@ -1680,12 +1680,12 @@ fn saved_selections_are_written_as_alpha_channels_and_reported() {
         .collect();
     assert_eq!(names, ["Disc", "Sky"]);
     for (name, sel) in &back.saved_selections {
-        let want = set.saved(name).map(Selection::clone);
+        let want = set.saved(name).cloned();
         let want = want.unwrap_or_else(|| unreachable!("{name}"));
         for y in 0..8 {
             for x in 0..8 {
                 // An ellipse edge is k/16; the file holds the nearest 8-bit value.
-                let byte = |s: &Selection| (s.coverage_at(x, y) * 255.0).round();
+                let byte = |s: &Selection| (s.coverage_at(x, y) * 255.0).round().to_bits();
                 assert_eq!(byte(sel), byte(&want), "{name} {x},{y}");
             }
         }

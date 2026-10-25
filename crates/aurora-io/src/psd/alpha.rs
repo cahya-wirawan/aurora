@@ -361,7 +361,7 @@ impl ResourceBodies {
             let trimmed = units
                 .iter()
                 .rposition(|&u| u != 0)
-                .map_or(&units[..0], |last| units.get(..=last).unwrap_or(&[]));
+                .map_or(&[][..], |last| units.get(..=last).unwrap_or(&[]));
             out.push(String::from_utf16_lossy(trimmed));
             rest = tail.get(bytes.len()..).unwrap_or_default();
         }
@@ -568,7 +568,7 @@ fn walk_planes(
     mut window: Window,
     header: Header,
     wanted: &[usize],
-    on_row: &mut dyn FnMut(usize, &[u8]) -> Result<(), IoError>,
+    on_row: &mut RowSink<'_>,
 ) -> Result<(), IoError> {
     let size = || malformed("merged image size");
     let width = header.width as usize;
@@ -681,6 +681,12 @@ fn walk_planes(
     Ok(())
 }
 
+/// Where [`walk_planes`] hands each row: the wanted plane's index and the row.
+type RowSink<'a> = dyn FnMut(usize, &[u8]) -> Result<(), IoError> + 'a;
+
+/// A plane to read: its number, kind byte and listed name.
+type Wanted = (usize, u8, Option<String>);
+
 /// Reads the file's alpha planes as saved selections. `color_planes` is the
 /// number of colour planes and `first_plane` the first plane that may be an
 /// alpha channel (after the merged transparency plane, when there is one).
@@ -742,7 +748,7 @@ pub(crate) fn read_channels_with(
     let unicode = resources.unicode_names();
     let display = resources.display_entries();
     // (plane, kind, listed name), spot channels set aside.
-    let mut wanted: Vec<(usize, u8, Option<String>)> = Vec::new();
+    let mut wanted: Vec<Wanted> = Vec::new();
     for plane in first_plane..total {
         let index = plane - color_planes;
         let kind = display.get(index).map_or(KIND_PLAIN, |&(_, kind)| kind);

@@ -2482,6 +2482,7 @@ fn write_header<W: Write>(
 
 /// [`write_psd`] with the file-size limit as a parameter, so a test can
 /// reach it without writing 2 GiB.
+#[cfg(test)]
 pub(crate) fn write_psd_limited<W: Write + Seek>(
     writer: W,
     layers: &LayerTree,
