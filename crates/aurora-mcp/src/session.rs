@@ -117,12 +117,33 @@ pub enum ExportOutcome {
 /// One document host. Implemented over the application's own document
 /// code; every method runs on a blocking thread, one at a time.
 pub trait Session: Send + 'static {
+    /// Tells the host where it may keep private scratch files (its tile
+    /// store): a directory inside the server's own locked scratch
+    /// directory, so it is swept with it after a crash. Called once,
+    /// before any other method.
+    fn set_scratch_dir(&mut self, _dir: &Path) {}
+
     /// Replaces the session's document with the file at `staged`, a private
-    /// copy of what the caller named; `name` is the original file name.
+    /// copy of what the caller named; `name` is the original file name. The
+    /// server has already checked PNG, JPEG, TIFF, PSD and PSB headers
+    /// against `max_pixels`; the host must do the same for the formats the
+    /// server cannot read (`.aur`) before decoding.
     ///
     /// # Errors
     /// The file could not be opened.
-    fn open(&mut self, staged: &Path, name: &str, cancel: &Cancel) -> Result<Value, SessionError>;
+    fn open(
+        &mut self,
+        staged: &Path,
+        name: &str,
+        max_pixels: u64,
+        cancel: &Cancel,
+    ) -> Result<Value, SessionError>;
+
+    /// A worst-case size in bytes of an export in `format`, to refuse early
+    /// when the scratch disk clearly cannot hold it; `None` when unknown.
+    fn export_estimate(&mut self, _format: ExportFormat) -> Option<u64> {
+        None
+    }
 
     /// The document as JSON (layer tree, history, selection, canvas size);
     /// `{"document": null}` when none is open.

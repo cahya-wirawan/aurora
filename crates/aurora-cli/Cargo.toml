@@ -45,6 +45,9 @@ path = "src/lib.rs"
 name = "aurora-cli"
 path = "src/main.rs"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 png = { workspace = true }

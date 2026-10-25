@@ -3913,6 +3913,37 @@ fn roll_back_committed_tiles(
 /// [`IoError::MissingEntry`] if it isn't present at all — [`read`]'s own
 /// shared "the manifest/history entries are not optional" step. Capped
 /// at [`MAX_METADATA_ENTRY_BYTES`] ([`read_capped`]).
+/// The canvas size an `.aur` file's manifest declares, read without
+/// decoding the layer tree or any tile: the cheap check a host makes
+/// before it commits memory to opening an untrusted file (the MCP server's
+/// pixel cap). The manifest entry is read under the same size cap as
+/// [`read`].
+///
+/// # Errors
+/// [`IoError::Zip`]/[`IoError::Io`] for a damaged container,
+/// [`IoError::MissingEntry`] when there is no manifest and
+/// [`IoError::ManifestDeserialization`] when its header does not decode.
+pub fn peek_canvas_size<R: Read + Seek>(reader: R) -> Result<(u32, u32), IoError> {
+    /// The first three manifest fields, in [`ManifestRead`]'s order.
+    #[derive(serde::Deserialize)]
+    struct Head {
+        version: u32,
+        canvas_width: u32,
+        canvas_height: u32,
+    }
+    let mut zip = ZipArchive::new(reader)?;
+    let bytes = read_entry(&mut zip, MANIFEST_ENTRY)?;
+    let head: Head = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    if head.version != MANIFEST_VERSION {
+        return Err(IoError::ManifestDeserialization(format!(
+            "unsupported manifest version {}",
+            head.version
+        )));
+    }
+    Ok((head.canvas_width, head.canvas_height))
+}
+
 fn read_entry<R: Read + Seek>(
     zip: &mut ZipArchive<R>,
     name: &'static str,

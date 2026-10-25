@@ -8,9 +8,9 @@
 //! understood but cannot run (disabled, needs a window, a file problem) is
 //! a tool result with `isError: true`.
 
-use std::io::Write as _;
+use std::io::{Seek as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -32,8 +32,13 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::budgets::{Limits, MAX_PREVIEW_PNG_BYTES, MAX_RESPONSE_BYTES};
+use crate::header;
 use crate::roots::{PathError, Roots, copy_bounded};
+use crate::scratch::{Scratch, free_bytes};
 use crate::session::{Cancel, ExportFormat, ExportOutcome, Session, SessionError};
+
+/// Longest accepted progress token: it is echoed in every progress notification.
+const MAX_PROGRESS_TOKEN_BYTES: usize = 256;
 
 const DOCUMENT: &str = "aurora://document";
 const COMMANDS: &str = "aurora://commands";
@@ -223,10 +228,17 @@ fn validate_step(step: &RunParams) -> Result<Validated, String> {
 // ---------------------------------------------------------------------------
 
 struct Inner {
+    /// The document host. **Never locked on an async worker**: only inside
+    /// `spawn_blocking` closures (`AuroraMcp::spawn`), so a long export or
+    /// preview holding it cannot stop the runtime from serving ping,
+    /// cancellation or other requests.
     session: Mutex<Box<dyn Session>>,
+    /// The host's static command list, read once at start so no request has
+    /// to take the lock to answer "can this run headless?".
+    headless: &'static [&'static str],
     roots: Roots,
     limits: Limits,
-    scratch: tempfile::TempDir,
+    scratch: Scratch,
     counter: AtomicU64,
 }
 
@@ -258,6 +270,53 @@ impl Drop for ScratchFile {
     }
 }
 
+/// A scratch directory (one export's) that is removed when dropped.
+struct ScratchDir(PathBuf);
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "couldn't remove a scratch directory");
+        }
+    }
+}
+
+/// Stops a watcher task when dropped.
+struct Watch(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Creates a private (`0700` on Unix) directory.
+fn private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+/// Creates a new private file (`0600` on Unix), never opening an existing one.
+fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 /// An extension that is safe to put in a scratch file name.
 fn safe_extension(name: &str) -> String {
     Path::new(name)
@@ -274,23 +333,57 @@ fn safe_extension(name: &str) -> String {
         .unwrap_or_else(|| "bin".to_owned())
 }
 
+/// The total size of the files directly in `dir`.
+fn dir_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .filter(std::fs::Metadata::is_file)
+            .map(|m| m.len())
+            .sum()
+    })
+}
+
+/// One step's entry in a batch reply.
+fn step_entry(index: usize, id: &str, outcome: Result<Value, Fail>) -> (Value, bool) {
+    match outcome {
+        Ok(result) => (json!({"step": index, "id": id, "ok": true, "result": result}), true),
+        Err(Fail::Tool(message)) => (
+            json!({"step": index, "id": id, "ok": false, "error": message}),
+            false,
+        ),
+    }
+}
+
+/// Check-and-run of one host command, **in one lock hold**: the enabled
+/// check and the run see the same document.
+fn run_host_command(session: &mut dyn Session, call: &Validated) -> Result<Value, Fail> {
+    if !session.has_document() {
+        return Err(SessionError::NoDocument.into());
+    }
+    if let Err(reason) = Registry::builtin().check_enabled(&call.id, &session.command_context()) {
+        return Err(Fail::Tool(format!("`{}` is not enabled: {reason}", call.id)));
+    }
+    Ok(session.run_command(call)?)
+}
+
 impl AuroraMcp {
     /// Builds a server over `session` with the granted `roots`.
     ///
     /// # Errors
     /// The private scratch directory could not be created.
     pub fn new(
-        session: Box<dyn Session>,
+        mut session: Box<dyn Session>,
         roots: Roots,
         limits: Limits,
         scratch_parent: Option<&Path>,
     ) -> std::io::Result<Self> {
-        let mut builder = tempfile::Builder::new();
-        builder.prefix("aurora-mcp-");
-        let scratch = match scratch_parent {
-            Some(parent) => builder.tempdir_in(parent)?,
-            None => builder.tempdir()?,
-        };
+        let scratch = Scratch::create(scratch_parent)?;
+        let host_dir = scratch.path().join("host");
+        private_dir(&host_dir)?;
+        session.set_scratch_dir(&host_dir);
+        let headless = session.headless_commands();
         let mut tool_router = Self::tool_router();
         for route in tool_router.map.values_mut() {
             let mut schema = (*route.attr.input_schema).clone();
@@ -300,6 +393,7 @@ impl AuroraMcp {
         Ok(Self {
             inner: Arc::new(Inner {
                 session: Mutex::new(session),
+                headless,
                 roots,
                 limits,
                 scratch,
@@ -309,86 +403,144 @@ impl AuroraMcp {
         })
     }
 
-    fn scratch_path(&self, extension: &str) -> PathBuf {
-        let n = self.inner.counter.fetch_add(1, Ordering::Relaxed);
-        self.inner.scratch.path().join(format!("{n}.{extension}"))
+    /// The server's private scratch directory (for tests and diagnostics).
+    #[must_use]
+    pub fn scratch_dir(&self) -> &Path {
+        self.inner.scratch.path()
     }
 
-    /// Runs `f` on the session on a blocking thread. `ctx`'s cancellation
-    /// becomes the [`Cancel`] flag `f` polls.
-    async fn blocking<T: Send + 'static>(
-        &self,
+    fn next_counter(&self) -> u64 {
+        self.inner.counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Runs `job` on a blocking thread. `ctx`'s cancellation is forwarded to
+    /// `cancel`, which `job` polls.
+    async fn spawn<T: Send + 'static>(
         ctx: Option<&RequestContext<RoleServer>>,
-        f: impl FnOnce(&mut dyn Session, &Cancel) -> Result<T, SessionError> + Send + 'static,
+        cancel: Cancel,
+        job: impl FnOnce(&Cancel) -> Result<T, SessionError> + Send + 'static,
     ) -> Result<T, SessionError> {
-        let cancel = Cancel::new();
-        let watcher = ctx.map(|ctx| {
+        let watch = Watch(ctx.map(|ctx| {
             let token = ctx.ct.clone();
             let flag = cancel.clone();
             tokio::spawn(async move {
                 token.cancelled().await;
                 flag.cancel();
             })
-        });
+        }));
+        let joined = tokio::task::spawn_blocking(move || job(&cancel)).await;
+        drop(watch);
+        joined.unwrap_or_else(|e| Err(SessionError::Failed(format!("the operation failed: {e}"))))
+    }
+
+    /// Runs `f` on the session, on a blocking thread, under its lock.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        ctx: Option<&RequestContext<RoleServer>>,
+        f: impl FnOnce(&mut dyn Session, &Cancel) -> Result<T, SessionError> + Send + 'static,
+    ) -> Result<T, SessionError> {
+        self.blocking_with(ctx, Cancel::new(), f).await
+    }
+
+    async fn blocking_with<T: Send + 'static>(
+        &self,
+        ctx: Option<&RequestContext<RoleServer>>,
+        cancel: Cancel,
+        f: impl FnOnce(&mut dyn Session, &Cancel) -> Result<T, SessionError> + Send + 'static,
+    ) -> Result<T, SessionError> {
         let inner = Arc::clone(&self.inner);
-        let flag = cancel.clone();
-        let joined = tokio::task::spawn_blocking(move || {
+        Self::spawn(ctx, cancel, move |cancel| {
             // A panic poisons the lock; the session is used again rather
             // than failing every later call (a release build aborts on a
             // panic anyway, so this is only reachable in dev builds).
             let mut guard = inner.session.lock().unwrap_or_else(PoisonError::into_inner);
-            f(guard.as_mut(), &flag)
+            f(guard.as_mut(), cancel)
         })
-        .await;
-        if let Some(watcher) = watcher {
-            watcher.abort();
-        }
-        joined.unwrap_or_else(|e| Err(SessionError::Failed(format!("the operation failed: {e}"))))
+        .await
     }
 
     // ----- shared implementations -----
+
+    /// Reads the confined file once into the scratch directory, after the
+    /// header size check. Runs without the session lock.
+    async fn stage(
+        &self,
+        path: String,
+        ctx: Option<&RequestContext<RoleServer>>,
+    ) -> Result<(ScratchFile, String), SessionError> {
+        let inner = Arc::clone(&self.inner);
+        let counter = self.next_counter();
+        Self::spawn(ctx, Cancel::new(), move |cancel| {
+            let limits = inner.limits;
+            let mut read = inner
+                .roots
+                .open_read(&path, limits.max_open_bytes)
+                .map_err(|e| SessionError::Refused(e.to_string()))?;
+            // The header says how big the picture is before a byte is
+            // decoded or copied.
+            match header::dimensions(&mut read.file) {
+                Err(message) => return Err(SessionError::Refused(message)),
+                Ok(Some(d)) if d.width == 0 || d.height == 0 => {
+                    return Err(SessionError::Refused(format!(
+                        "the {} header declares an empty picture",
+                        d.format
+                    )));
+                }
+                Ok(Some(d)) if d.pixels() > limits.max_open_pixels => {
+                    return Err(SessionError::Refused(format!(
+                        "the {} header declares {} x {} px ({} Mpx); at most {} Mpx may be \
+                         opened (raise it with --max-open-mpx)",
+                        d.format,
+                        d.width,
+                        d.height,
+                        d.pixels() / 1_000_000,
+                        limits.max_open_pixels / 1_000_000
+                    )));
+                }
+                Ok(_) => {}
+            }
+            read.file
+                .seek(std::io::SeekFrom::Start(0))
+                .map_err(|e| SessionError::Failed(format!("reading {}: {e}", read.name)))?;
+            let extension = safe_extension(&read.name);
+            let staged = ScratchFile(
+                inner
+                    .scratch
+                    .path()
+                    .join(format!("open-{counter}.{extension}")),
+            );
+            let mut out = private_file(&staged.0)
+                .map_err(|e| SessionError::Failed(format!("scratch file: {e}")))?;
+            let completed = copy_bounded(&mut read.file, &mut out, limits.max_open_bytes, |_| {
+                !cancel.is_cancelled()
+            })
+            .map_err(|e| SessionError::Failed(format!("reading {}: {e}", read.name)))?;
+            if !completed {
+                return Err(SessionError::Cancelled);
+            }
+            out.flush()
+                .map_err(|e| SessionError::Failed(format!("scratch file: {e}")))?;
+            Ok((staged, read.name))
+        })
+        .await
+    }
 
     async fn open_impl(
         &self,
         path: String,
         ctx: Option<&RequestContext<RoleServer>>,
     ) -> Result<Value, Fail> {
-        let this = self.clone();
-        let staged_dir = self.inner.scratch.path().to_path_buf();
-        let counter = self.inner.counter.fetch_add(1, Ordering::Relaxed);
-        let max = self.inner.limits.max_open_bytes;
-        // Stage: read the confined file once into the private scratch
-        // directory, then open that copy. The host never receives, and
-        // never re-resolves, a path of the caller's.
-        let result = self
+        let (staged, name) = self.stage(path, ctx).await?;
+        let max_pixels = self.inner.limits.max_open_pixels;
+        // The host reads the private copy, never the caller's path.
+        Ok(self
             .blocking(ctx, move |session, cancel| {
-                let mut read = this
-                    .inner
-                    .roots
-                    .open_read(&path, max)
-                    .map_err(|e| SessionError::Refused(e.to_string()))?;
-                let extension = safe_extension(&read.name);
-                let staged = ScratchFile(staged_dir.join(format!("open-{counter}.{extension}")));
-                let mut out = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&staged.0)
-                    .map_err(|e| SessionError::Failed(format!("scratch file: {e}")))?;
-                let completed =
-                    copy_bounded(&mut read.file, &mut out, max, |_| !cancel.is_cancelled())
-                        .map_err(|e| SessionError::Failed(format!("reading {}: {e}", read.name)))?;
-                if !completed {
-                    return Err(SessionError::Cancelled);
-                }
-                out.flush()
-                    .map_err(|e| SessionError::Failed(format!("scratch file: {e}")))?;
-                drop(out);
-                session.open(&staged.0, &read.name, cancel)
+                session.open(&staged.0, &name, max_pixels, cancel)
             })
-            .await?;
-        Ok(result)
+            .await?)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn save_impl(
         &self,
         params: SaveParams,
@@ -404,17 +556,78 @@ impl AuroraMcp {
                 params.path
             )));
         };
-        // Refuse a bad or existing target before the expensive export.
-        self.inner.roots.check_write(&params.path)?;
+        let path = params.path;
+        // Refuse a bad or existing target before queueing behind the
+        // session; the closure below checks again under its lock.
+        {
+            let inner = Arc::clone(&self.inner);
+            let path = path.clone();
+            Self::spawn(ctx, Cancel::new(), move |_| {
+                inner
+                    .roots
+                    .check_write(&path)
+                    .map_err(|e| SessionError::Refused(e.to_string()))
+            })
+            .await?;
+        }
+        let limits = self.inner.limits;
+        // One private directory per export; the size monitor watches it.
+        let dir = ScratchDir(self.inner.scratch.path().join(format!("export-{}", self.next_counter())));
+        private_dir(&dir.0).map_err(|e| Fail::Tool(format!("scratch directory: {e}")))?;
+        let out = dir.0.join(format!("out.{}", format.extension()));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
         let this = self.clone();
-        let scratch = ScratchFile(self.scratch_path(format.extension()));
         let accept = params.accept_losses.unwrap_or(false);
-        let path = params.path;
-        let max_bytes = self.inner.limits.max_export_bytes;
-        let job = self.blocking(ctx, move |session, cancel| {
-            let outcome = session.export(format, accept, &scratch.0, cancel, &mut |f| {
-                let _ = tx.send((f.clamp(0.0, 1.0)) * 0.9);
+        let cancel = Cancel::new();
+        // Bound the file *while it is written*: a monitor cancels the
+        // export as soon as its directory outgrows the limit.
+        let over = Arc::new(AtomicBool::new(false));
+        let _monitor = Watch(Some({
+            let (dir, cancel, over) = (dir.0.clone(), cancel.clone(), Arc::clone(&over));
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    let size = tokio::task::spawn_blocking({
+                        let dir = dir.clone();
+                        move || dir_bytes(&dir)
+                    })
+                    .await
+                    .unwrap_or(0);
+                    if size > limits.max_export_bytes {
+                        over.store(true, Ordering::SeqCst);
+                        cancel.cancel();
+                        break;
+                    }
+                }
+            })
+        }));
+        let job = self.blocking_with(ctx, cancel, move |session, cancel| {
+            // Re-checked under the session lock: a concurrent save to the
+            // same name that finished while this one queued must not make
+            // this one run a whole export for nothing.
+            this.inner
+                .roots
+                .check_write(&path)
+                .map_err(|e| SessionError::Refused(e.to_string()))?;
+            if !session.has_document() {
+                return Err(SessionError::NoDocument);
+            }
+            if let (Some(estimate), Some(free)) = (
+                session.export_estimate(format),
+                free_bytes(this.inner.scratch.path()),
+            ) {
+                let need = estimate.min(limits.max_export_bytes);
+                if free < need {
+                    return Err(SessionError::Refused(format!(
+                        "the scratch disk has {} MiB free; this export may need {} MiB (use \
+                         --scratch-dir to put it elsewhere)",
+                        free >> 20,
+                        need >> 20
+                    )));
+                }
+            }
+            let outcome = session.export(format, accept, &out, cancel, &mut |f| {
+                let _ = tx.send(f.clamp(0.0, 1.0) * 0.9);
             })?;
             let report = match outcome {
                 ExportOutcome::NeedsConfirmation { report } => {
@@ -430,9 +643,13 @@ impl AuroraMcp {
             if cancel.is_cancelled() {
                 return Err(SessionError::Cancelled);
             }
-            let mut source = std::fs::File::open(&scratch.0)
+            let mut source = std::fs::File::open(&out)
                 .map_err(|e| SessionError::Failed(format!("reading the export: {e}")))?;
-            let total = source.metadata().map_or(0, |m| m.len()).max(1);
+            let total = source.metadata().map_or(0, |m| m.len());
+            if total > limits.max_export_bytes {
+                return Err(SessionError::Refused(export_too_large(limits)));
+            }
+            let total = total.max(1);
             // Atomic `create_new`: from here on the name is ours, and a
             // failure or a cancel removes it (WriteTarget's drop).
             let mut target = this
@@ -443,7 +660,7 @@ impl AuroraMcp {
             let file = target
                 .file()
                 .ok_or_else(|| SessionError::Failed("the target is not open".to_owned()))?;
-            let completed = copy_bounded(&mut source, file, max_bytes, |done| {
+            let completed = copy_bounded(&mut source, file, limits.max_export_bytes, |done| {
                 let _ = tx.send(0.9 + 0.1 * (done as f64 / total as f64));
                 !cancel.is_cancelled()
             })
@@ -453,14 +670,13 @@ impl AuroraMcp {
             }
             file.sync_all()
                 .map_err(|e| SessionError::Failed(format!("writing {path}: {e}")))?;
-            let bytes = total;
             let display = target.display().to_owned();
             target.commit();
             Ok(json!({
                 "saved": true,
                 "path": display,
                 "format": format.extension(),
-                "bytes": bytes,
+                "bytes": total,
                 "report": report,
             }))
         });
@@ -492,22 +708,18 @@ impl AuroraMcp {
                 result = &mut job => break result,
             }
         };
+        if over.load(Ordering::SeqCst) && matches!(result, Err(SessionError::Cancelled)) {
+            return Err(Fail::Tool(export_too_large(limits)));
+        }
         Ok(result?)
     }
 
     fn is_headless(&self, id: &str) -> bool {
-        if SERVER_COMMANDS.contains(&id) {
-            return true;
-        }
-        self.inner
-            .session
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .headless_commands()
-            .contains(&id)
+        SERVER_COMMANDS.contains(&id) || self.inner.headless.contains(&id)
     }
 
-    /// Runs one validated command call.
+    /// Runs one validated command. A host command's enabled check and its
+    /// run happen in one lock hold ([`run_host_command`]).
     async fn execute(
         &self,
         call: Validated,
@@ -519,15 +731,6 @@ impl AuroraMcp {
                 "`{id}` is not available in the headless server: it needs a window or has no \
                  headless form yet (command_list marks each command's `headless`)"
             )));
-        }
-        let (has_document, context) = self
-            .blocking(None, |s, _| Ok((s.has_document(), s.command_context())))
-            .await?;
-        if !has_document && id != "file.open" {
-            return Err(Fail::Tool(SessionError::NoDocument.to_string()));
-        }
-        if let Err(reason) = Registry::builtin().check_enabled(&id, &context) {
-            return Err(Fail::Tool(format!("`{id}` is not enabled: {reason}")));
         }
         match id.as_str() {
             "file.open" => {
@@ -545,9 +748,13 @@ impl AuroraMcp {
                 )
                 .await
             }
-            _ => Ok(self
-                .blocking(ctx, move |session, _| session.run_command(&call))
-                .await?),
+            _ => match self
+                .blocking(ctx, move |session, _| Ok(run_host_command(session, &call)))
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => Err(error.into()),
+            },
         }
     }
 
@@ -616,6 +823,14 @@ impl AuroraMcp {
     async fn inspect_value(&self) -> Result<Value, Fail> {
         Ok(self.blocking(None, |s, _| s.inspect()).await?)
     }
+}
+
+fn export_too_large(limits: Limits) -> String {
+    format!(
+        "the export is larger than the limit of {} MiB (raise it with --max-export-mb); nothing \
+         was written",
+        limits.max_export_bytes >> 20
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -703,44 +918,74 @@ impl AuroraMcp {
             );
         }
         let stop = p.stop_on_error.unwrap_or(true);
+        let total = calls.len();
+        let all_host = calls.iter().all(|c| !SERVER_COMMANDS.contains(&c.id.as_str()));
         let mut results: Vec<Value> = Vec::new();
         let mut failed = 0_usize;
         let mut budget = 0_usize;
-        for (index, call) in calls.into_iter().enumerate() {
-            if ctx.ct.is_cancelled() {
-                break;
+        if all_host && calls.iter().all(|c| self.is_headless(&c.id)) {
+            // Every step is a host command: run the whole batch in ONE lock
+            // hold, so no other request can interleave between its steps.
+            let outcome = self
+                .blocking(Some(&ctx), move |session, cancel| {
+                    let mut results: Vec<Value> = Vec::new();
+                    let mut failed = 0_usize;
+                    let mut budget = 0_usize;
+                    for (index, call) in calls.into_iter().enumerate() {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        let id = call.id.clone();
+                        let (entry, ok) = step_entry(index, &id, run_host_command(session, &call));
+                        failed += usize::from(!ok);
+                        budget = budget.saturating_add(entry.to_string().len());
+                        if budget > MAX_RESPONSE_BYTES / 2 {
+                            results.push(json!({"step": index, "ok": false, "error": "the batch reply budget is spent; this step may have completed"}));
+                            failed += 1;
+                            break;
+                        }
+                        results.push(entry);
+                        if !ok && stop {
+                            break;
+                        }
+                    }
+                    Ok((results, failed))
+                })
+                .await;
+            match outcome {
+                Ok((r, f)) => (results, failed) = (r, f),
+                Err(error) => return Ok(fail_result(error.to_string())),
             }
-            let id = call.id.clone();
-            let outcome = self.execute(call, Some(&ctx)).await;
-            let entry = match outcome {
-                Ok(result) => json!({"step": index, "id": id, "ok": true, "result": result}),
-                Err(Fail::Tool(message)) => {
-                    failed += 1;
-                    json!({"step": index, "id": id, "ok": false, "error": message})
+        } else {
+            // A step that touches files (file.open, file.save) takes the
+            // lock in its own pieces, so other requests may interleave
+            // BETWEEN steps of such a batch (each step is still atomic).
+            for (index, call) in calls.into_iter().enumerate() {
+                if ctx.ct.is_cancelled() {
+                    break;
                 }
-            };
-            let failed_step = entry.get("ok") == Some(&json!(false));
-            budget = budget.saturating_add(entry.to_string().len());
-            if budget > MAX_RESPONSE_BYTES / 2 {
-                results.push(json!({
-                    "step": index,
-                    "ok": false,
-                    "error": "the batch reply budget is spent; this step may have completed",
-                }));
-                failed += 1;
-                break;
-            }
-            results.push(entry);
-            if failed_step && stop {
-                break;
+                let id = call.id.clone();
+                let (entry, ok) = step_entry(index, &id, self.execute(call, Some(&ctx)).await);
+                failed += usize::from(!ok);
+                budget = budget.saturating_add(entry.to_string().len());
+                if budget > MAX_RESPONSE_BYTES / 2 {
+                    results.push(json!({"step": index, "ok": false, "error": "the batch reply budget is spent; this step may have completed"}));
+                    failed += 1;
+                    break;
+                }
+                results.push(entry);
+                if !ok && stop {
+                    break;
+                }
             }
         }
         let completed = results.len() - failed;
         Ok(ok_json(&json!({
             "completed": completed,
             "failed": failed,
-            "not_run": p.steps.len() - results.len(),
+            "not_run": total - results.len(),
             "atomic": false,
+            "interleaved_by_other_requests": !all_host,
             "results": results,
         })))
     }
@@ -940,6 +1185,14 @@ impl ServerHandler for AuroraMcp {
                     None,
                 ));
             }
+        }
+        if let Some(token) = context.meta.get_progress_token()
+            && serde_json::to_string(&token).map_or(true, |t| t.len() > MAX_PROGRESS_TOKEN_BYTES)
+        {
+            return Err(McpError::invalid_params(
+                format!("the progress token is longer than {MAX_PROGRESS_TOKEN_BYTES} bytes"),
+                None,
+            ));
         }
         // Wrong types and missing arguments are also protocol errors, not
         // tool errors: parse them here, the way the tool will, first.

@@ -149,6 +149,31 @@ pub struct WriteTarget {
     file: Option<std::fs::File>,
     display: String,
     committed: bool,
+    /// (device, inode) of the file this value created, where the platform
+    /// has them: the drop removes the name only while it still is that file.
+    identity: Option<(u64, u64)>,
+}
+
+#[cfg(unix)]
+fn identity_of(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(unix)]
+fn cap_identity_of(meta: &cap_std::fs::Metadata) -> Option<(u64, u64)> {
+    use cap_std::fs::MetadataExt as _;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn cap_identity_of(_: &cap_std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+#[cfg(not(unix))]
+fn identity_of(_: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 impl WriteTarget {
@@ -175,7 +200,16 @@ impl Drop for WriteTarget {
             // Close first (Windows), then remove only the name this value
             // created with `create_new`.
             self.file = None;
-            if let Err(error) = self.parent.remove_file(&self.name) {
+            // Where the platform gives file identity, only remove the name
+            // if it still is the file this value created; a file someone
+            // else put there since is never deleted. (Elsewhere the name is
+            // removed unconditionally: a documented gap.)
+            let still_ours = match (self.identity, self.parent.symlink_metadata(&self.name)) {
+                (Some(ours), Ok(now)) => cap_identity_of(&now) == Some(ours),
+                (None, Ok(_)) => true,
+                (_, Err(_)) => false,
+            };
+            if still_ours && let Err(error) = self.parent.remove_file(&self.name) {
                 tracing::warn!(%error, file = %self.display, "couldn't remove a partial file");
             }
         }
@@ -305,7 +339,20 @@ impl Roots {
                 max: max_bytes,
             });
         }
-        let file = root.dir.open(&rel).map_err(|e| map_io(&e, "read"))?;
+        // Opened non-blocking: if the name was swapped for a FIFO since the
+        // metadata call, the open returns at once and the handle check
+        // below refuses it instead of waiting for a writer forever.
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
+        }
+        let file = root
+            .dir
+            .open_with(&rel, &options)
+            .map_err(|e| map_io(&e, "read"))?;
         let opened = file.metadata().map_err(|e| map_io(&e, "read"))?;
         if !opened.is_file() {
             return Err(PathError::NotAFile);
@@ -378,10 +425,13 @@ impl Roots {
                 map_io(&e, "write")
             }
         })?;
+        let file = file.into_std();
+        let identity = file.metadata().ok().and_then(|m| identity_of(&m));
         Ok(WriteTarget {
             parent,
             name,
-            file: Some(file.into_std()),
+            identity,
+            file: Some(file),
             display: user.to_owned(),
             committed: false,
         })
