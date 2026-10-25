@@ -837,3 +837,57 @@ fn extra_channels_without_any_alpha_resource_stay_unopened_as_before() {
         doc.report.items
     );
 }
+
+/// Writes `alpha.psd` and `alpha.json` for `scripts/verify_psd_write.py`
+/// (`check_alpha`): a 16 x 12 document with a rectangle, an ellipse, an
+/// inverted rectangle and a fractional mask saved as alpha channels. The
+/// JSON holds each channel's name and its 8-bit coverage, row-major.
+///
+/// ```text
+/// AURORA_PSD_FIXTURE_DIR=/tmp/psdw cargo test -p aurora-io --lib \
+///     alpha_fixtures_for_psd_tools -- --ignored
+/// ```
+#[test]
+#[ignore = "writes fixtures for scripts/verify_psd_write.py"]
+fn alpha_fixtures_for_psd_tools() {
+    let Ok(out) = std::env::var("AURORA_PSD_FIXTURE_DIR") else {
+        unreachable!("set AURORA_PSD_FIXTURE_DIR");
+    };
+    let (w, h) = (16u32, 12u32);
+    let rect = rect_sel(2, 1, 9, 6);
+    let ellipse = Selection::ellipse(Rect {
+        x: 0,
+        y: 0,
+        width: w,
+        height: h,
+    });
+    let mut inverted = rect_sel(4, 3, 5, 4);
+    inverted.inverted = true;
+    let mask = mask_sel(3, 2, 10, 8, |x, y| ((x * 25 + y * 7) % 256) as u8);
+    let saved = [
+        ("Box", &rect),
+        ("Disc", &ellipse),
+        ("Everything but", &inverted),
+        ("Gradient", &mask),
+    ];
+    let mut doc = doc_with_a_layer((w, h));
+    let (bytes, outcome) = write_with(&mut doc, &saved);
+    ok(verify(&bytes, &outcome));
+    let dir = std::path::Path::new(&out);
+    ok(std::fs::write(dir.join("alpha.psd"), &bytes));
+    let channels: Vec<String> = saved
+        .iter()
+        .map(|(name, sel)| {
+            let cov: Vec<String> = coverage(sel, w, h).iter().map(u8::to_string).collect();
+            format!("{{\"name\": {name:?}, \"coverage\": [{}]}}", cov.join(","))
+        })
+        .collect();
+    let json = format!(
+        "{{\"width\": {w}, \"height\": {h}, \"channels\": [{}]}}",
+        channels.join(",")
+    );
+    ok(std::fs::write(dir.join("alpha.json"), json));
+    // The same selections read back from a real Photoshop-style file list.
+    let back = open(&bytes);
+    assert_eq!(back.saved_selections.len(), 4);
+}

@@ -698,6 +698,50 @@ def check_text(folder):
     print("OK: an edited text layer is written as pixels, the other stays text")
 
 
+def check_alpha(folder):
+    """Task 156: saved selections written as alpha channels.
+
+    `alpha.psd` holds four saved selections. psd-tools must see the header
+    channel count (RGB + merged transparency + 4), the names in resources
+    1006 (Pascal) and 1045 (Unicode), the Transparency entry first, the
+    1053 identifiers, the 1077 display information (masked areas, red) and
+    every alpha plane's 16-bit samples equal to coverage * 257.
+    """
+    spec_path = folder / "alpha.json"
+    if not spec_path.exists():
+        print("no alpha.json: the alpha channel pass was skipped")
+        return
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    psd = PSDImage.open(folder / "alpha.psd")
+    want = spec["channels"]
+    header = psd._record.header
+    check("alpha header channels", header.channels, 4 + len(want))
+    check("alpha depth", header.depth, 16)
+    res = psd.image_resources
+    pascal = res.get_data(Resource.ALPHA_NAMES_PASCAL)
+    unicode_names = res.get_data(Resource.ALPHA_NAMES_UNICODE)
+    names = ["Transparency"] + [c["name"] for c in want]
+    check("alpha Pascal names", [str(n) for n in pascal], names)
+    check("alpha Unicode names", [str(n).rstrip("\x00") for n in unicode_names], names)
+    ids = res.get_data(Resource.ALPHA_IDENTIFIERS)
+    check("alpha identifiers", list(ids), [0] + list(range(1, len(want) + 1)))
+    display = res.get_data(Resource.DISPLAY_INFO)
+    check("alpha display entries", len(display.alpha_channels), len(want) + 1)
+    for entry in display.alpha_channels[1:]:
+        check("alpha display opacity", entry.opacity, 50)
+        check("alpha display kind (masked areas)", int(entry.mode), 1)
+    data = psd._record.image_data.get_data(header, split=True)
+    check("merged planes", len(data), 4 + len(want))
+    w, h = spec["width"], spec["height"]
+    for k, channel in enumerate(want):
+        plane = np.frombuffer(data[4 + k], dtype=">u2").astype(np.int64)
+        expected = np.asarray(channel["coverage"], dtype=np.int64) * 257
+        check(f"alpha {channel['name']} size", plane.size, w * h)
+        if not np.array_equal(plane, expected):
+            fail(f"alpha {channel['name']}: samples differ from coverage * 257")
+    print(f"OK: psd-tools read {len(want)} alpha channels with the right names, ids, display info and samples")
+
+
 EFFECT_KINDS = {
     b"DrSh": "drop shadow", b"dropShadowMulti": "drop shadow",
     b"SoFi": "colour overlay", b"solidFillMulti": "colour overlay",
@@ -813,6 +857,7 @@ if __name__ == "__main__":
     check_clips(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_smart(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_text(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
+    check_alpha(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_adjustments(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_adjustments5(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
     check_adjustments4(Path(sys.argv[1] if len(sys.argv) > 1 else "."))
