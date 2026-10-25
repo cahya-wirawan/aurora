@@ -668,3 +668,54 @@ fn a_stray_println_does_not_reach_the_protocol() {
         "the stray line went to stderr: {stderr}"
     );
 }
+
+// ---- bridge mode through the real binary ----
+
+mod bridge {
+    use super::*;
+    use aurora_automation::bridge::discovery::{self, Discovery};
+    use aurora_automation::bridge::protocol::{CallError, Request};
+    use aurora_automation::bridge::server::{BridgeServer, Dispatcher, ServerConfig};
+    use aurora_automation::bridge::token;
+
+    struct Fake;
+    impl Dispatcher for Fake {
+        fn dispatch(&self, request: Request) -> Result<Value, CallError> {
+            match request.method.as_str() {
+                "doc.inspect" => Ok(json!({"document": {"name": "from-the-fake-app"}})),
+                _ => Err(CallError::new("refused", "no")),
+            }
+        }
+    }
+
+    fn bridge_binary(args: &[&str], input: &str) -> (Vec<String>, String, Option<i32>) {
+        run_binary(args, input)
+    }
+
+    #[test]
+    fn the_binary_proxies_a_tool_call_to_the_app_and_never_without_one() {
+        let token = token::generate().unwrap();
+        let server = BridgeServer::start(ServerConfig::default(), token.clone(), std::sync::Arc::new(Fake)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let published = discovery::publish(
+            &dir.path().join("b"),
+            &Discovery::new(server.local_addr().port(), token, "t"),
+        )
+        .unwrap();
+        let file = published.path().display().to_string();
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+        let initialized = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"doc_inspect","arguments":{}}}"#;
+        let input = format!("{init}\n{initialized}\n{call}\n");
+        let (lines, _err, _code) = bridge_binary(&["mcp", "--bridge", "--discovery", &file], &input);
+        let reply: Value = lines.iter().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["id"] == 2).unwrap();
+        assert!(reply["result"]["content"][0]["text"].as_str().unwrap().contains("from-the-fake-app"), "{reply}");
+        // A discovery file that does not exist: a clear tool error, no crash.
+        let (lines, _err, _code) = bridge_binary(&["mcp", "--bridge", "--discovery", "/nonexistent/aurora-bridge-1.json"], &input);
+        let reply: Value = lines.iter().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["id"] == 2).unwrap();
+        assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
+        // --discovery without --bridge is a usage error.
+        let (_l, err, code) = bridge_binary(&["mcp", "--discovery", &file], "");
+        assert_eq!(code, Some(2), "{err}");
+    }
+}
