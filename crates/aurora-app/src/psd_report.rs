@@ -21,6 +21,8 @@
 //! The wording is plain text in one dialog message: no section styling, as
 //! no token exists for it.
 
+use std::fmt::Write as _;
+
 use aurora_io::{PsdWriteReport, ReportCategory, ReportEntry};
 
 /// Lines a group shows in a dialog before "and N more".
@@ -168,7 +170,7 @@ impl SaveReport {
             }
             let more = group.entries.len() - shown;
             if more > 0 {
-                text.push_str(&format!("\n  \u{2026} and {more} more"));
+                let _ = write!(text, "\n  \u{2026} and {more} more");
             }
         }
         text
@@ -207,10 +209,7 @@ impl SaveReport {
                     text.push_str("\n    All: ");
                     text.push_str(&names.join(", "));
                     if entry.affected.len() > MAX_FULL_NAMES {
-                        text.push_str(&format!(
-                            " and {} more",
-                            entry.affected.len() - MAX_FULL_NAMES
-                        ));
+                        let _ = write!(text, " and {} more", entry.affected.len() - MAX_FULL_NAMES);
                     }
                 }
             }
@@ -224,7 +223,7 @@ pub(crate) fn save_message(file_name: &str, report: &PsdWriteReport) -> String {
     let grouped = SaveReport::new(report);
     let mut message = format!("Saving \u{201c}{file_name}\u{201d} as a Photoshop file changes it");
     if let Some(summary) = grouped.summary() {
-        message.push_str(&format!(" ({summary})"));
+        let _ = write!(message, " ({summary})");
     }
     message.push_str(":\n");
     message.push_str(&grouped.dialog_body());
@@ -241,7 +240,7 @@ pub(crate) fn check_message(name: &str, report: &PsdWriteReport) -> String {
     let mut message = format!("Saving \u{201c}{name}\u{201d} as a Photoshop file");
     if grouped.asks() {
         if let Some(summary) = grouped.summary() {
-            message.push_str(&format!(" would change it ({summary})"));
+            let _ = write!(message, " would change it ({summary})");
         }
         message.push_str(":\n");
     } else if grouped.total() == 0 {

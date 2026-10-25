@@ -1,6 +1,8 @@
 //! Tests for the grouped PSD save report (task 157): grouping, order,
 //! dedupe, caps, counts, the ask rule and the two messages.
 
+#![allow(clippy::indexing_slicing)] // fixtures with known group counts
+
 use aurora_io::{PsdWriteReport, ReportCategory, ReportEntry};
 
 use crate::psd_report::{
@@ -130,7 +132,7 @@ fn a_long_group_is_capped_with_and_n_more_but_the_full_text_has_everything() {
         "{body}"
     );
     assert!(
-        !body.contains(&format!("line {:02}", MAX_ITEMS_PER_GROUP)),
+        !body.contains(&format!("line {MAX_ITEMS_PER_GROUP:02}")),
         "{body}"
     );
     assert!(body.contains("\u{2026} and 3 more"), "{body}");

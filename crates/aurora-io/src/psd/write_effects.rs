@@ -378,6 +378,7 @@ impl EffectLosses {
     }
 
     /// The report lines (without the "not checked in Photoshop" one).
+    #[allow(clippy::too_many_lines)] // one linear list of report lines
     pub(super) fn items(&self) -> Vec<ReportEntry> {
         let many = |n: usize, one: &str, rest: &str| -> String {
             if n == 1 {

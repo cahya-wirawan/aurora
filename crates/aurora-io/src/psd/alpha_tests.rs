@@ -687,6 +687,7 @@ fn a_file_without_saved_selections_is_unchanged() {
 
 #[test]
 fn the_report_itemises_exceptions() {
+    use crate::ReportCategory::{Changed, NeedsAttention, NotSaved};
     let mut doc = doc_with_a_layer((10, 10));
     let past = rect_sel(-2, -2, 5, 5);
     let outside = rect_sel(60, 60, 2, 2);
@@ -707,7 +708,6 @@ fn the_report_itemises_exceptions() {
     );
     assert!(all.contains("hasn't checked them in Photoshop"), "{all}");
     // Task 157: categories and the selection names.
-    use crate::ReportCategory::{Changed, NeedsAttention, NotSaved};
     let cat = |needle: &str| {
         outcome
             .report

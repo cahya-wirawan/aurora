@@ -1880,7 +1880,10 @@ fn missing_tiles_are_a_change() {
     );
     let entries = crate::psd_save::carried_losses(None, &skipped);
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].category, aurora_io::ReportCategory::Changed);
+    assert_eq!(
+        entries.first().map(|e| e.category),
+        Some(aurora_io::ReportCategory::Changed)
+    );
 }
 
 #[test]

@@ -61,6 +61,23 @@ fn roundtrip_diff(a: &aurora_io::Image, b: &aurora_io::Image) -> Option<(f64, f6
     Some((sum / n, max))
 }
 
+fn make_source<'a>(
+    document: &'a aurora_io::PsdDocument,
+    saved: &[(&'a str, &'a aurora_doc::Selection)],
+    carried: &[aurora_io::ReportEntry],
+    store: &'a mut aurora_tile::TileStore,
+) -> crate::psd_save::PsdSaveSource<'a> {
+    crate::psd_save::PsdSaveSource {
+        saved: saved.to_vec(),
+        layers: &document.layers,
+        canvas: document.canvas_size,
+        store,
+        doc_id: crate::document_session::DocumentId::next(),
+        revision: crate::UndoRevision(0),
+        carried: carried.to_vec(),
+    }
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn roundtrip_one_file(path: &std::path::Path, name: &str) -> Result<RoundTripRow, String> {
     let started = std::time::Instant::now();
@@ -85,22 +102,6 @@ fn roundtrip_one_file(path: &std::path::Path, name: &str) -> Result<RoundTripRow
         .iter()
         .map(|(n, s)| (n.as_str(), s))
         .collect();
-    fn make_source<'a>(
-        document: &'a aurora_io::PsdDocument,
-        saved: &[(&'a str, &'a aurora_doc::Selection)],
-        carried: &[aurora_io::ReportEntry],
-        store: &'a mut aurora_tile::TileStore,
-    ) -> crate::psd_save::PsdSaveSource<'a> {
-        crate::psd_save::PsdSaveSource {
-            saved: saved.to_vec(),
-            layers: &document.layers,
-            canvas: document.canvas_size,
-            store,
-            doc_id: crate::document_session::DocumentId::next(),
-            revision: crate::UndoRevision(0),
-            carried: carried.to_vec(),
-        }
-    }
     let report = crate::psd_save::check_psd_compatibility(make_source(&document, &saved, &carried, &mut store))
         .map_err(|f| format!("could not be saved: {}", crate::psd_save::psd_check_failure_message(&f)))?;
     let grouped = crate::psd_report::SaveReport::new(&report);
@@ -196,8 +197,10 @@ fn roundtrip_header(max_mb: u64, measured: usize, skipped: usize, failed: usize)
             .output()
             .ok()
             .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-            .unwrap_or_else(|| "unknown".to_owned())
+            .map_or_else(
+                || "unknown".to_owned(),
+                |o| String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+            )
     };
     let commit = run("git", &["rev-parse", "--short", "HEAD"]);
     let dirty = run("git", &["status", "--porcelain", "--untracked-files=no"]);
