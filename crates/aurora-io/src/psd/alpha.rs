@@ -669,6 +669,44 @@ pub(crate) fn read_channels(
     first_plane: usize,
     resources: &ResourceBodies,
 ) -> Result<Outcome, IoError> {
+    read_channels_with(
+        src,
+        merged,
+        header,
+        color_planes,
+        first_plane,
+        resources,
+        Caps::DEFAULT,
+    )
+}
+
+/// The limits a read keeps selections within.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Caps {
+    pub selections: usize,
+    pub bytes: u64,
+    pub pixels: u64,
+}
+
+impl Caps {
+    pub(crate) const DEFAULT: Self = Self {
+        selections: MAX_SAVED_SELECTIONS,
+        bytes: MAX_SAVED_SELECTION_BYTES,
+        pixels: MAX_SELECTION_MASK_PIXELS,
+    };
+}
+
+/// [`read_channels`] with the caps as a parameter, so a test reaches them
+/// without a gigabyte file.
+pub(crate) fn read_channels_with(
+    src: &mut dyn ByteSource,
+    merged: Window,
+    header: Header,
+    color_planes: usize,
+    first_plane: usize,
+    resources: &ResourceBodies,
+    caps: Caps,
+) -> Result<Outcome, IoError> {
     let mut outcome = Outcome::default();
     let total = usize::from(header.channels);
     if first_plane >= total {
@@ -690,7 +728,7 @@ pub(crate) fn read_channels(
     }
     let (width, height) = (header.width, header.height);
     let area = u64::from(width) * u64::from(height);
-    if area > MAX_SELECTION_MASK_PIXELS {
+    if area > caps.pixels {
         outcome.over_caps += wanted.len() as u64;
         return Ok(outcome);
     }
@@ -725,12 +763,11 @@ pub(crate) fn read_channels(
         match selection_of(&plane, width, height)? {
             None => outcome.empty += 1,
             Some(selection) => {
-                bytes = bytes.saturating_add(selection.mask_bytes());
-                if outcome.selections.len() >= MAX_SAVED_SELECTIONS
-                    || bytes > MAX_SAVED_SELECTION_BYTES
-                {
+                let next = bytes.saturating_add(selection.mask_bytes());
+                if outcome.selections.len() >= caps.selections || next > caps.bytes {
                     outcome.over_caps += 1;
                 } else {
+                    bytes = next;
                     let ordinal = outcome.selections.len() + outcome.empty as usize + 1;
                     let name = selection_name(name.clone(), ordinal, &outcome.selections);
                     outcome.selections.push((name, selection));

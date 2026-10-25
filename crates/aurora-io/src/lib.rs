@@ -73,9 +73,9 @@ pub use import::{
     encode_image_tiles_at, image_tile_ids, read_from_store, write_into_store, write_into_store_at,
 };
 pub use psd::{
-    PsdCompositeSource, PsdExpectation, PsdExpectedAdjustment, PsdExpectedLayer, PsdExpectedMask,
-    PsdFormat, PsdRecordKind, PsdSaveOptions, PsdSaveRefusal, PsdWriteOutcome, PsdWriteReport,
-    psd_save_preflight, verify_psd_file, write_psd,
+    PsdCompositeSource, PsdExpectation, PsdExpectedAdjustment, PsdExpectedAlpha, PsdExpectedLayer,
+    PsdExpectedMask, PsdFormat, PsdRecordKind, PsdSaveOptions, PsdSaveRefusal, PsdWriteOutcome,
+    PsdWriteReport, psd_save_preflight, verify_psd_file, write_psd, write_psd_with_selections,
 };
 pub use psd::{
     PsdDocument, PsdImportReport, PsdMaskPixels, PsdPixelSink, PsdPixels, PsdStreamedDocument,

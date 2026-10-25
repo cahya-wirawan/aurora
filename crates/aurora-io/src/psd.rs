@@ -200,9 +200,9 @@ pub use smart::PsdSmartObject;
 pub use text::PsdTextLayer;
 pub use write::{
     PSD_GROUP_END_NAME, PSD_MAX_NAME_UNITS, PSD_MAX_RECORDS, PsdCompositeSource, PsdExpectation,
-    PsdExpectedAdjustment, PsdExpectedLayer, PsdExpectedMask, PsdFormat, PsdRecordKind,
-    PsdSaveOptions, PsdSaveRefusal, PsdWriteOutcome, PsdWriteReport, psd_blend_key,
-    psd_save_preflight, verify_psd_file, write_psd,
+    PsdExpectedAdjustment, PsdExpectedAlpha, PsdExpectedLayer, PsdExpectedMask, PsdFormat,
+    PsdRecordKind, PsdSaveOptions, PsdSaveRefusal, PsdWriteOutcome, PsdWriteReport,
+    psd_blend_key, psd_save_preflight, verify_psd_file, write_psd, write_psd_with_selections,
 };
 
 /// The largest canvas side a version-1 PSD file may declare.
