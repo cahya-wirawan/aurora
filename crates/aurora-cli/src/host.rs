@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use aurora_app::mcp_session::{ExportKind, ExportResult, Failure, HeadlessSession};
+use aurora_app::mcp_session::{ExportKind, ExportResult, Failure, HeadlessSession, SessionLimits};
 use aurora_commands::{CommandContext, Validated};
 use aurora_mcp::{Cancel, ExportFormat, ExportOutcome, Preview, Session, SessionError};
 use serde_json::Value;
@@ -18,6 +18,26 @@ impl AppHost {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A host under the server's limits, so the session's composite and
+    /// export bounds match what the server checks.
+    #[must_use]
+    pub fn with_limits(limits: &aurora_mcp::Limits) -> Self {
+        Self(HeadlessSession::with_limits(SessionLimits {
+            max_pixels: limits.max_open_pixels,
+            max_export_bytes: limits.max_export_bytes,
+        }))
+    }
+}
+
+fn kind_of(format: ExportFormat) -> ExportKind {
+    match format {
+        ExportFormat::Png => ExportKind::Png,
+        ExportFormat::Jpeg => ExportKind::Jpeg,
+        ExportFormat::Tiff => ExportKind::Tiff,
+        ExportFormat::Psd => ExportKind::Psd,
+        ExportFormat::Aur => ExportKind::Aur,
     }
 }
 
@@ -32,11 +52,25 @@ fn error(failure: Failure) -> SessionError {
 }
 
 impl Session for AppHost {
-    fn open(&mut self, staged: &Path, name: &str, cancel: &Cancel) -> Result<Value, SessionError> {
+    fn set_scratch_dir(&mut self, dir: &Path) {
+        self.0.set_scratch_dir(dir);
+    }
+
+    fn open(
+        &mut self,
+        staged: &Path,
+        name: &str,
+        max_pixels: u64,
+        cancel: &Cancel,
+    ) -> Result<Value, SessionError> {
         if cancel.is_cancelled() {
             return Err(SessionError::Cancelled);
         }
-        self.0.open(staged, name).map_err(error)
+        self.0.open(staged, name, max_pixels).map_err(error)
+    }
+
+    fn export_estimate(&mut self, format: ExportFormat) -> Option<u64> {
+        self.0.export_estimate(kind_of(format))
     }
 
     fn inspect(&mut self) -> Result<Value, SessionError> {
@@ -81,13 +115,7 @@ impl Session for AppHost {
         cancel: &Cancel,
         progress: &mut dyn FnMut(f64),
     ) -> Result<ExportOutcome, SessionError> {
-        let kind = match format {
-            ExportFormat::Png => ExportKind::Png,
-            ExportFormat::Jpeg => ExportKind::Jpeg,
-            ExportFormat::Tiff => ExportKind::Tiff,
-            ExportFormat::Psd => ExportKind::Psd,
-            ExportFormat::Aur => ExportKind::Aur,
-        };
+        let kind = kind_of(format);
         match self
             .0
             .export(

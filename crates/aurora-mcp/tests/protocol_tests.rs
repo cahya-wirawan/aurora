@@ -318,7 +318,7 @@ async fn command_batch_is_validated_up_front_not_atomic_and_stops_or_continues()
         -32602
     );
     // default: stop at the first failing step; earlier steps stay applied
-    let steps = json!({"steps": [{"id": "layer.new"}, {"id": "select.all"}, {"id": "layer.new"}]});
+    let steps = json!({"steps": [{"id": "layer.new"}, {"id": "select.expand", "args": {"amount": 2}}, {"id": "layer.new"}]});
     let result = client.ok("command_batch", steps.clone()).await;
     assert_eq!(result["atomic"], json!(false));
     assert_eq!(result["completed"], json!(1));
@@ -326,7 +326,7 @@ async fn command_batch_is_validated_up_front_not_atomic_and_stops_or_continues()
     assert_eq!(result["not_run"], json!(1));
     assert_eq!(
         seen.commands.lock().unwrap().as_slice(),
-        ["layer.new", "select.all"]
+        ["layer.new", "select.expand"]
     );
     // stop_on_error false: runs on
     seen.commands.lock().unwrap().clear();

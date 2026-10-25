@@ -51,9 +51,24 @@ pub const HEADLESS_COMMANDS: &[&str] = &[
 const MAX_INSPECT_LAYERS: usize = 2000;
 /// The deepest group nesting `inspect` follows.
 const MAX_INSPECT_DEPTH: usize = 64;
-/// The most pixels a preview or an export composites (a guard against a
-/// request that would allocate gigabytes).
-const MAX_COMPOSITE_PIXELS: u64 = 200_000_000;
+/// Limits a session runs under; the server sets them from its options.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionLimits {
+    /// The most pixels a document may have to be opened, previewed or
+    /// exported (a guard against a request that would allocate gigabytes).
+    pub max_pixels: u64,
+    /// The largest export, in bytes.
+    pub max_export_bytes: u64,
+}
+
+impl Default for SessionLimits {
+    fn default() -> Self {
+        Self {
+            max_pixels: 100_000_000,
+            max_export_bytes: 1 << 30,
+        }
+    }
+}
 
 /// Why a session operation did not complete.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +136,20 @@ struct Doc {
 #[derive(Default)]
 pub struct HeadlessSession {
     doc: Option<Doc>,
+    limits: SessionLimits,
+    /// Where the document's tile store lives (the server's scratch
+    /// directory); the system temporary directory when unset.
+    scratch_dir: Option<std::path::PathBuf>,
+    /// The last preview and what it was made from, so asking again for the
+    /// same size of an unchanged document costs nothing.
+    preview_cache: Option<PreviewCache>,
+}
+
+struct PreviewCache {
+    document: crate::document_session::DocumentId,
+    revision: crate::UndoRevision,
+    max_side: u32,
+    image: PreviewImage,
 }
 
 impl std::fmt::Debug for HeadlessSession {
@@ -237,6 +266,21 @@ impl HeadlessSession {
         Self::default()
     }
 
+    /// A session under `limits`.
+    #[must_use]
+    pub fn with_limits(limits: SessionLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
+    /// Keeps the document's tile store inside `dir` (a private directory
+    /// the caller owns and sweeps).
+    pub fn set_scratch_dir(&mut self, dir: &Path) {
+        self.scratch_dir = Some(dir.to_path_buf());
+    }
+
     #[must_use]
     pub fn has_document(&self) -> bool {
         self.doc.is_some()
@@ -261,11 +305,22 @@ impl HeadlessSession {
     /// # Errors
     /// The file cannot be decoded or installed.
     #[allow(clippy::too_many_lines)]
-    pub fn open(&mut self, staged: &Path, name: &str) -> Result<Value, Failure> {
-        let scratch = tempfile::Builder::new()
-            .prefix("aurora-mcp-doc-")
-            .tempdir()
-            .map_err(|e| failed(format!("scratch directory: {e}")))?;
+    pub fn open(&mut self, staged: &Path, name: &str, max_pixels: u64) -> Result<Value, Failure> {
+        self.limits.max_pixels = max_pixels;
+        self.preview_cache = None;
+        Self::check_aur_header(staged, max_pixels)?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("doc-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let scratch = match &self.scratch_dir {
+            Some(dir) => builder.tempdir_in(dir),
+            None => builder.tempdir(),
+        }
+        .map_err(|e| failed(format!("scratch directory: {e}")))?;
         let mut store =
             aurora_tile::TileStore::new_shared(scratch.path().to_path_buf(), crate::tile_pool())
                 .map_err(|e| failed(format!("tile store: {e:?}")))?;
@@ -276,7 +331,13 @@ impl HeadlessSession {
             .unwrap_or("Image")
             .to_owned();
         let decoded = crate::decode_chosen_file_with(staged, Some(&staging))
-            .map_err(|e| Failure::Refused(format!("couldn't open {name}: {e:?}")))?;
+            .map_err(|e| {
+                let extension = Path::new(name)
+                    .extension()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or("");
+                Failure::Refused(crate::open_failure_message(name, extension, &e))
+            })?;
         let mut notes: Vec<String> = Vec::new();
         let mut import_losses: Vec<String> = Vec::new();
         let mut skipped = aurora_io::SkippedTiles::default();
@@ -341,7 +402,9 @@ impl HeadlessSession {
             }
             DecodedFile::Aur(bytes) => {
                 let document = crate::read_prechecked_aur(&bytes, &mut store)
-                    .map_err(|e| Failure::Refused(format!("couldn't open {name}: {e:?}")))?;
+                    .map_err(|e| {
+                        Failure::Refused(crate::open_failure_message(name, "aur", &e))
+                    })?;
                 if let Some(losses) = document.import_losses {
                     notes.extend(losses.iter().cloned());
                     import_losses = losses;
@@ -389,6 +452,31 @@ impl HeadlessSession {
         });
         self.doc = Some(doc);
         Ok(info)
+    }
+
+    /// A `.aur` is a zip, so the server cannot read its header; its manifest
+    /// states the canvas size, read here before any tile is decoded.
+    fn check_aur_header(staged: &Path, max_pixels: u64) -> Result<(), Failure> {
+        use std::io::Read as _;
+        let Ok(mut file) = std::fs::File::open(staged) else {
+            return Ok(());
+        };
+        let mut magic = [0_u8; 4];
+        if file.read_exact(&mut magic).is_err() || &magic != b"PK\x03\x04" {
+            return Ok(());
+        }
+        let (width, height) = aurora_io::peek_aur_canvas_size(file)
+            .map_err(|e| Failure::Refused(format!("this is not a readable Aurora document ({e})")))?;
+        let pixels = u64::from(width) * u64::from(height);
+        if width == 0 || height == 0 || pixels > max_pixels {
+            return Err(Failure::Refused(format!(
+                "the .aur manifest declares {width} x {height} px ({} Mpx); at most {} Mpx may \
+                 be opened (raise it with --max-open-mpx)",
+                pixels / 1_000_000,
+                max_pixels / 1_000_000
+            )));
+        }
+        Ok(())
     }
 
     /// The document as JSON.
@@ -463,6 +551,16 @@ impl HeadlessSession {
     #[allow(clippy::too_many_lines)]
     pub fn run_command(&mut self, call: &Validated) -> Result<Value, Failure> {
         let id = call.id.as_str();
+        // The caller checked too, but under its own view of the document:
+        // a command re-checks its own preconditions where it runs.
+        if self.doc.is_none() {
+            return Err(Failure::NoDocument);
+        }
+        if let Err(reason) = aurora_commands::Registry::builtin()
+            .check_enabled(id, &self.command_context())
+        {
+            return Err(Failure::Refused(format!("`{id}` is not enabled: {reason}")));
+        }
         match id {
             "file.check_psd" => return self.psd_check(&|| false),
             "edit.undo" => return self.undo_redo(UndoDirection::Undo),
@@ -638,14 +736,15 @@ impl HeadlessSession {
     /// `cancelled` and reporting a fraction.
     fn composite(
         doc: &mut Doc,
+        max_pixels: u64,
         cancelled: &dyn Fn() -> bool,
         progress: &mut dyn FnMut(f64),
     ) -> Result<aurora_io::Image, Failure> {
         let (width, height) = doc.canvas;
-        if u64::from(width) * u64::from(height) > MAX_COMPOSITE_PIXELS {
+        if u64::from(width) * u64::from(height) > max_pixels {
             return Err(Failure::Refused(format!(
                 "the document is {width} x {height} px; this server composites at most \
-                 {MAX_COMPOSITE_PIXELS} pixels"
+                 {max_pixels} pixels"
             )));
         }
         let mut samples = vec![
@@ -688,8 +787,16 @@ impl HeadlessSession {
         max_side: u32,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<PreviewImage, Failure> {
-        let doc = self.doc_mut()?;
-        let image = Self::composite(doc, cancelled, &mut |_| {})?;
+        let max_pixels = self.limits.max_pixels;
+        let doc = self.doc.as_mut().ok_or(Failure::NoDocument)?;
+        if let Some(cache) = &self.preview_cache
+            && cache.document == doc.id
+            && cache.revision == doc.undo_order.revision
+            && cache.max_side == max_side
+        {
+            return Ok(cache.image.clone());
+        }
+        let image = Self::composite(doc, max_pixels, cancelled, &mut |_| {})?;
         let (w, h) = (image.width(), image.height());
         let scale = f64::from(max_side) / f64::from(w.max(h).max(1));
         let (tw, th) = if scale >= 1.0 {
@@ -709,20 +816,40 @@ impl HeadlessSession {
             Ok(image) | Err(image) => image,
         };
         let png = aurora_io::png::encode(&small).map_err(failed)?;
-        Ok(PreviewImage {
+        let preview = PreviewImage {
             png,
             width: tw,
             height: th,
             document_width: w,
             document_height: h,
-        })
+        };
+        self.preview_cache = Some(PreviewCache {
+            document: doc.id,
+            revision: doc.undo_order.revision,
+            max_side,
+            image: preview.clone(),
+        });
+        Ok(preview)
+    }
+
+    /// A worst-case size in bytes of an export of the open document, for a
+    /// free-space check: the samples at 16 bits a channel, once for a flat
+    /// image and once per layer plus the merged image for PSD and `.aur`.
+    #[must_use]
+    pub fn export_estimate(&self, kind: ExportKind) -> Option<u64> {
+        let doc = self.doc.as_ref()?;
+        let pixels = u64::from(doc.canvas.0) * u64::from(doc.canvas.1);
+        let copies = match kind {
+            ExportKind::Png | ExportKind::Jpeg | ExportKind::Tiff => 1,
+            ExportKind::Psd | ExportKind::Aur => doc.layers.len() as u64 + 1,
+        };
+        Some(pixels.saturating_mul(8).saturating_mul(copies))
     }
 
     /// Writes the document to `out`, a fresh private path.
     ///
     /// # Errors
     /// No document, a refusal, a failure or a cancel.
-    #[allow(clippy::too_many_lines)]
     pub fn export(
         &mut self,
         kind: ExportKind,
@@ -731,14 +858,48 @@ impl HeadlessSession {
         cancelled: &dyn Fn() -> bool,
         progress: &mut dyn FnMut(f64),
     ) -> Result<ExportResult, Failure> {
+        let max_bytes = self.limits.max_export_bytes;
+        let result = self.export_inner(kind, accept_losses, out, cancelled, progress)?;
+        // The server also watches the export's directory while it is
+        // written; this is the host's own bound on what it produced.
+        if matches!(result, ExportResult::Written(_))
+            && std::fs::metadata(out).is_ok_and(|m| m.len() > max_bytes)
+        {
+            let _ = std::fs::remove_file(out);
+            return Err(Failure::Refused(format!(
+                "the export is larger than the limit of {} MiB",
+                max_bytes >> 20
+            )));
+        }
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn export_inner(
+        &mut self,
+        kind: ExportKind,
+        accept_losses: bool,
+        out: &Path,
+        cancelled: &dyn Fn() -> bool,
+        progress: &mut dyn FnMut(f64),
+    ) -> Result<ExportResult, Failure> {
+        let max_pixels = self.limits.max_pixels;
+        let max_bytes = self.limits.max_export_bytes;
         let doc = self.doc_mut()?;
         match kind {
             ExportKind::Png | ExportKind::Jpeg | ExportKind::Tiff => {
-                let image = Self::composite(doc, cancelled, &mut |f| progress(f * 0.8))?;
+                let image = Self::composite(doc, max_pixels, cancelled, &mut |f| progress(f * 0.8))?;
                 let image = match crate::colour_app::export_image(image, None) {
                     Ok(image) | Err(image) => image,
                 };
                 let bytes = aurora_io::encode_by_extension(out, &image).map_err(failed)?;
+                if bytes.len() as u64 > max_bytes {
+                    return Err(Failure::Refused(format!(
+                        "the encoded image is {} MiB; the limit is {} MiB",
+                        bytes.len() >> 20,
+                        max_bytes >> 20
+                    )));
+                }
                 if cancelled() {
                     return Err(Failure::Cancelled);
                 }

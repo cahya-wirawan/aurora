@@ -25,6 +25,11 @@ pub struct Seen {
     pub opened: Mutex<Vec<(String, Vec<u8>)>>,
     pub commands: Mutex<Vec<String>>,
     pub exports: AtomicUsize,
+    pub scratch: Mutex<Option<std::path::PathBuf>>,
+    pub staged_modes: Mutex<Vec<u32>>,
+    /// Bytes the slow-writing export managed to write.
+    pub written_chunks: AtomicUsize,
+    pub order: Mutex<Vec<String>>,
 }
 
 pub struct Mock {
@@ -35,6 +40,13 @@ pub struct Mock {
     /// The next PSD export reports losses.
     pub lossy_psd: bool,
     pub export_bytes: Vec<u8>,
+    /// The preview blocks (polling cancel) until cancelled.
+    pub hang_on_preview: bool,
+    /// The export writes many chunks slowly (to test the size bound).
+    pub slow_big_export: bool,
+    /// What `export_estimate` says.
+    pub estimate: Option<u64>,
+    pub can_undo: bool,
 }
 
 impl Mock {
@@ -47,6 +59,10 @@ impl Mock {
                 hang_on_export: false,
                 lossy_psd: false,
                 export_bytes: b"EXPORTED-BYTES".to_vec(),
+                hang_on_preview: false,
+                slow_big_export: false,
+                estimate: None,
+                can_undo: false,
             },
             seen,
         )
@@ -54,7 +70,16 @@ impl Mock {
 }
 
 impl Session for Mock {
-    fn open(&mut self, staged: &Path, name: &str, _: &Cancel) -> Result<Value, SessionError> {
+    fn set_scratch_dir(&mut self, dir: &Path) {
+        *self.seen.scratch.lock().unwrap() = Some(dir.to_path_buf());
+    }
+    fn open(&mut self, staged: &Path, name: &str, _: u64, _: &Cancel) -> Result<Value, SessionError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(staged).unwrap().permissions().mode() & 0o777;
+            self.seen.staged_modes.lock().unwrap().push(mode);
+        }
         let bytes = std::fs::read(staged).map_err(|e| SessionError::Failed(e.to_string()))?;
         self.seen
             .opened
@@ -75,7 +100,13 @@ impl Session for Mock {
         self.document
     }
     fn command_context(&mut self) -> CommandContext {
-        CommandContext::default()
+        self.seen.order.lock().unwrap().push("check".into());
+        // A window for another request to slip in, if the lock were released.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        CommandContext { can_undo: self.can_undo, ..CommandContext::default() }
+    }
+    fn export_estimate(&mut self, _: ExportFormat) -> Option<u64> {
+        self.estimate
     }
     fn headless_commands(&self) -> &'static [&'static str] {
         &[
@@ -88,15 +119,26 @@ impl Session for Mock {
     }
     fn run_command(&mut self, call: &Validated) -> Result<Value, SessionError> {
         self.seen.commands.lock().unwrap().push(call.id.clone());
-        if call.id == "layer.new" {
+        self.seen.order.lock().unwrap().push(format!("run:{}", call.id));
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        if call.id == "layer.new" || call.id == "select.all" {
             Ok(json!({"changed": true}))
         } else {
             Err(SessionError::Refused(format!("mock refuses {}", call.id)))
         }
     }
-    fn preview(&mut self, max_side: u32, _: &Cancel) -> Result<Preview, SessionError> {
+    fn preview(&mut self, max_side: u32, cancel: &Cancel) -> Result<Preview, SessionError> {
         if !self.document {
             return Err(SessionError::NoDocument);
+        }
+        if self.hang_on_preview {
+            for _ in 0..2000 {
+                if cancel.is_cancelled() {
+                    return Err(SessionError::Cancelled);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            return Err(SessionError::Failed("never cancelled".into()));
         }
         Ok(Preview {
             png: b"\x89PNG-mock".to_vec(),
@@ -128,6 +170,20 @@ impl Session for Mock {
             }
             return Err(SessionError::Failed("never cancelled".into()));
         }
+        if self.slow_big_export {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(out).unwrap();
+            for _ in 0..200 {
+                if cancel.is_cancelled() {
+                    return Err(SessionError::Cancelled);
+                }
+                file.write_all(&[7_u8; 64 * 1024]).unwrap();
+                file.flush().unwrap();
+                self.seen.written_chunks.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            return Ok(ExportOutcome::Written { report: json!({}) });
+        }
         if format == ExportFormat::Psd && self.lossy_psd && !accept {
             return Ok(ExportOutcome::NeedsConfirmation {
                 report: json!({"asks": true}),
@@ -149,6 +205,7 @@ pub struct Client {
     lines: tokio::io::Lines<BufReader<tokio::io::DuplexStream>>,
     next_id: i64,
     pub notifications: Vec<Value>,
+    replies: std::collections::HashMap<i64, Value>,
     pub server: tokio::task::JoinHandle<Result<(), aurora_mcp::ServeError>>,
 }
 
@@ -182,6 +239,7 @@ pub async fn start_with(mock: Mock, read: &[&Path], write: &[&Path], limits: Lim
         lines: BufReader::new(from_server).lines(),
         next_id: 1,
         notifications: Vec::new(),
+        replies: std::collections::HashMap::new(),
         server,
     };
     let init = client
@@ -199,6 +257,10 @@ impl Client {
     pub async fn send_raw(&mut self, line: &str) {
         self.to_server.write_all(line.as_bytes()).await.unwrap();
         self.to_server.write_all(b"\n").await.unwrap();
+    }
+
+    pub async fn send_bytes(&mut self, bytes: &[u8]) {
+        self.to_server.write_all(bytes).await.unwrap();
     }
 
     pub async fn notify(&mut self, method: &str, params: Value) {
@@ -222,6 +284,9 @@ impl Client {
     }
 
     pub async fn reply(&mut self, id: i64) -> Value {
+        if let Some(value) = self.replies.remove(&id) {
+            return value;
+        }
         loop {
             let line =
                 tokio::time::timeout(std::time::Duration::from_secs(30), self.lines.next_line())
@@ -234,7 +299,11 @@ impl Client {
             if value.get("id") == Some(&json!(id)) {
                 return value;
             }
-            self.notifications.push(value);
+            if let Some(other) = value.get("id").and_then(Value::as_i64) {
+                self.replies.insert(other, value);
+            } else {
+                self.notifications.push(value);
+            }
         }
     }
 

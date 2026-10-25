@@ -4,3 +4,4 @@
 
 pub mod host;
 pub mod mcp_args;
+pub mod stdio_guard;

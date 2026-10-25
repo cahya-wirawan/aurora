@@ -50,7 +50,26 @@ fn run_mcp(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(aurora_mcp::serve_stdio(Box::new(AppHost::new()), config)) {
+    let out = match aurora_cli::stdio_guard::protect_stdout() {
+        Ok(out) => out,
+        Err(error) => {
+            eprintln!("aurora-cli mcp: couldn't set up the protocol stream: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Test hook for the stdout-hygiene test: print to "stdout" the way a
+    // stray `println!` in a dependency would. After the guard it goes to
+    // stderr, never into the protocol.
+    if std::env::var_os("AURORA_MCP_SELFTEST_STRAY_STDOUT").is_some() {
+        println!("stray output that must not reach the protocol");
+    }
+    let host = AppHost::with_limits(&config.limits);
+    match runtime.block_on(aurora_mcp::serve_io(
+        Box::new(host),
+        config,
+        tokio::io::stdin(),
+        out,
+    )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("aurora-cli mcp: {error}");

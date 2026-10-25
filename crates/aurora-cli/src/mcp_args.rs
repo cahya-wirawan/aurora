@@ -6,7 +6,7 @@ use aurora_mcp::Limits;
 
 /// The usage text.
 pub const USAGE: &str = "usage: aurora-cli mcp [--read-root DIR]... [--write-root DIR]... \
-[--max-open-mb N] [--scratch-dir DIR]\n\
+[--max-open-mb N] [--max-open-mpx N] [--max-export-mb N] [--scratch-dir DIR]\n\
 Serves the Model Context Protocol over stdin/stdout. Without --read-root or --write-root the \
 server has no file access at all. Logs go to stderr.";
 
@@ -16,6 +16,8 @@ pub struct McpOptions {
     pub read_roots: Vec<PathBuf>,
     pub write_roots: Vec<PathBuf>,
     pub max_open_mb: Option<u64>,
+    pub max_open_mpx: Option<u64>,
+    pub max_export_mb: Option<u64>,
     pub scratch_dir: Option<PathBuf>,
 }
 
@@ -27,8 +29,21 @@ impl McpOptions {
         if let Some(mb) = self.max_open_mb {
             limits.max_open_bytes = mb.saturating_mul(1 << 20);
         }
+        if let Some(mpx) = self.max_open_mpx {
+            limits.max_open_pixels = mpx.saturating_mul(1_000_000);
+        }
+        if let Some(mb) = self.max_export_mb {
+            limits.max_export_bytes = mb.saturating_mul(1 << 20);
+        }
         limits
     }
+}
+
+fn number(flag: &str, text: String) -> Result<u64, String> {
+    text.parse::<u64>()
+        .ok()
+        .filter(|n| (1..=1_000_000).contains(n))
+        .ok_or_else(|| format!("{flag} needs a whole number 1..1000000\n{USAGE}"))
 }
 
 /// Parses the arguments after `mcp`.
@@ -59,6 +74,8 @@ pub fn parse(args: &[String]) -> Result<McpOptions, String> {
                         })?,
                 );
             }
+            "--max-open-mpx" => options.max_open_mpx = Some(number(&arg, value()?)?),
+            "--max-export-mb" => options.max_export_mb = Some(number(&arg, value()?)?),
             "-h" | "--help" => return Err(USAGE.to_owned()),
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
