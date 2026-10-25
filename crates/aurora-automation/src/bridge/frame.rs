@@ -92,7 +92,15 @@ pub fn read_line_by(
         let remaining = deadline
             .saturating_duration_since(now)
             .max(Duration::from_millis(1));
-        socket.set_read_timeout(Some(remaining))
+        match socket.set_read_timeout(Some(remaining)) {
+            Ok(()) => Ok(()),
+            // macOS answers EINVAL to setsockopt once the peer has closed the
+            // connection (Linux does not). Whatever the peer sent first is
+            // still buffered, and a read on such a socket returns it or ends
+            // at once, so the deadline cannot be overrun: carry on and read.
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
+            Err(e) => Err(e),
+        }
     })
 }
 
