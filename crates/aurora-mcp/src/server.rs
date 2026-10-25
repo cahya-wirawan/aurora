@@ -40,6 +40,14 @@ use crate::session::{Cancel, ExportFormat, ExportOutcome, Session, SessionError}
 /// Longest accepted progress token: it is echoed in every progress notification.
 const MAX_PROGRESS_TOKEN_BYTES: usize = 256;
 
+const BRIDGE_INSTRUCTIONS: &str = "Aurora image editor, driving the RUNNING desktop app. The \
+document tools (command_list, command_run, command_batch, doc_open, doc_inspect, render_preview, \
+psd_check, doc_save) act on the live document; ui_inspect, ui_screenshot, ui_pointer, ui_key, \
+ui_menu and ui_dialog look at and operate the window. A person is watching: the window title \
+says a controller is connected. A modal dialog blocks everything but reads and ui_dialog. File \
+paths are relative to the roots granted at launch; doc_save never overwrites. Quitting is not a \
+tool.";
+
 const DOCUMENT: &str = "aurora://document";
 const COMMANDS: &str = "aurora://commands";
 
@@ -49,6 +57,16 @@ doc_inspect, edit with command_run or command_batch, look with render_preview, c
 with psd_check and write with doc_save (it never overwrites an existing file). File paths are \
 relative to the roots granted at launch (--read-root, --write-root); without a root there is no \
 file access. Read aurora://document and aurora://commands for live JSON.";
+
+/// The window tools: offered only when the host is a bridge to the app.
+const UI_TOOLS: &[&str] = &[
+    "ui_inspect",
+    "ui_screenshot",
+    "ui_pointer",
+    "ui_key",
+    "ui_menu",
+    "ui_dialog",
+];
 
 /// Commands the server itself runs (they touch files, which only the server
 /// may do, through its roots).
@@ -124,6 +142,105 @@ pub struct SaveParams {
     /// default such a save is refused and the report is returned instead.
     #[serde(default)]
     pub accept_losses: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UiInspectParams {
+    /// Also list widgets that are hidden (collapsed panels, closed popups).
+    #[serde(default)]
+    pub include_hidden: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UiScreenshotParams {
+    /// Longest side of the returned PNG in pixels (default 1600, 16 to 4096).
+    #[serde(default)]
+    pub max_side: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UiPointerParams {
+    /// `move`, `click`, `double_click`, `drag` or `scroll`.
+    pub action: String,
+    /// Logical window pixels (the same units as ui_inspect bounds). Or give
+    /// `id`, a widget id from ui_inspect: its centre is used.
+    #[serde(default)]
+    pub x: Option<f64>,
+    #[serde(default)]
+    pub y: Option<f64>,
+    #[serde(default)]
+    pub id: Option<u64>,
+    /// Drag end point.
+    #[serde(default)]
+    pub to_x: Option<f64>,
+    #[serde(default)]
+    pub to_y: Option<f64>,
+    /// `left` (default), `right` or `middle`.
+    #[serde(default)]
+    pub button: Option<String>,
+    /// Intermediate moves of a drag (default 8, at most 64).
+    #[serde(default)]
+    pub steps: Option<u32>,
+    /// Scroll in wheel lines (at most 50 either way).
+    #[serde(default)]
+    pub dx: Option<f64>,
+    #[serde(default)]
+    pub dy: Option<f64>,
+    #[serde(default)]
+    pub ctrl: Option<bool>,
+    #[serde(default)]
+    pub shift: Option<bool>,
+    #[serde(default)]
+    pub alt: Option<bool>,
+    /// Cmd on macOS, the Windows key elsewhere.
+    #[serde(default)]
+    pub meta: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UiKeyParams {
+    /// A key: `Enter`, `Escape`, `Tab`, `Backspace`, `Delete`, `Space`,
+    /// `ArrowUp`..., `Home`, `End`, `PageUp`, `PageDown`, `F1`..`F12` or one
+    /// character, pressed with the modifiers.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Text typed after the key, character by character (at most 256).
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub ctrl: Option<bool>,
+    #[serde(default)]
+    pub shift: Option<bool>,
+    #[serde(default)]
+    pub alt: Option<bool>,
+    #[serde(default)]
+    pub meta: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UiMenuParams {
+    /// `list` (default) or `activate`.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// For `activate`: the command id of an enabled menu item.
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UiDialogParams {
+    /// `get` (default) reports the open dialog; `choose` picks an action.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// For `choose`: one of the action ids `get` listed.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +353,8 @@ struct Inner {
     /// The host's static command list, read once at start so no request has
     /// to take the lock to answer "can this run headless?".
     headless: &'static [&'static str],
+    /// The host drives the running app (task 160).
+    bridge: bool,
     roots: Roots,
     limits: Limits,
     scratch: Scratch,
@@ -390,7 +509,13 @@ impl AuroraMcp {
         private_dir(&host_dir)?;
         session.set_scratch_dir(&host_dir);
         let headless = session.headless_commands();
+        let bridge = session.is_bridge();
         let mut tool_router = Self::tool_router();
+        if !bridge {
+            for name in UI_TOOLS {
+                tool_router.map.remove(*name);
+            }
+        }
         for route in tool_router.map.values_mut() {
             let mut schema = (*route.attr.input_schema).clone();
             schema.insert("additionalProperties".into(), json!(false));
@@ -400,6 +525,7 @@ impl AuroraMcp {
             inner: Arc::new(Inner {
                 session: Mutex::new(session),
                 headless,
+                bridge,
                 roots,
                 limits,
                 scratch,
@@ -495,12 +621,70 @@ impl AuroraMcp {
         path: String,
         ctx: Option<&RequestContext<RoleServer>>,
     ) -> Result<Value, Fail> {
+        if self.inner.bridge {
+            return self.bridge_open(path, ctx).await;
+        }
         let (staged, name) = self.stage(path, ctx).await?;
         let max_pixels = self.inner.limits.max_open_pixels;
         // The host reads the private copy, never the caller's path.
         Ok(self
             .blocking(ctx, move |session, cancel| {
                 session.open(&staged.0, &name, max_pixels, cancel)
+            })
+            .await?)
+    }
+
+    /// Bridge mode: the path is resolved inside the read root here (the
+    /// early gate), and the app confines and opens it itself.
+    async fn bridge_open(
+        &self,
+        path: String,
+        ctx: Option<&RequestContext<RoleServer>>,
+    ) -> Result<Value, Fail> {
+        let inner = Arc::clone(&self.inner);
+        let absolute = Self::spawn(ctx, Cancel::new(), move |_| {
+            inner
+                .roots
+                .open_read(&path, inner.limits.max_open_bytes)
+                .map_err(|e| SessionError::Refused(e.to_string()))?;
+            inner
+                .roots
+                .absolute_read(&path)
+                .map_err(|e| SessionError::Refused(e.to_string()))
+        })
+        .await?;
+        let max_pixels = self.inner.limits.max_open_pixels;
+        Ok(self
+            .blocking(ctx, move |session, cancel| {
+                session.open_path(&absolute, max_pixels, cancel)
+            })
+            .await?)
+    }
+
+    /// Bridge mode: the target is checked against the write root here; the
+    /// app writes it (a NEW file) inside its own roots.
+    async fn bridge_save(
+        &self,
+        params: SaveParams,
+        ctx: Option<&RequestContext<RoleServer>>,
+    ) -> Result<Value, Fail> {
+        let inner = Arc::clone(&self.inner);
+        let path = params.path;
+        let absolute = Self::spawn(ctx, Cancel::new(), move |_| {
+            inner
+                .roots
+                .check_write(&path)
+                .map_err(|e| SessionError::Refused(e.to_string()))?;
+            inner
+                .roots
+                .absolute_write(&path)
+                .map_err(|e| SessionError::Refused(e.to_string()))
+        })
+        .await?;
+        let accept = params.accept_losses.unwrap_or(false);
+        Ok(self
+            .blocking(ctx, move |session, cancel| {
+                session.save_path(&absolute, accept, cancel)
             })
             .await?)
     }
@@ -521,6 +705,9 @@ impl AuroraMcp {
                 params.path
             )));
         };
+        if self.inner.bridge {
+            return self.bridge_save(params, ctx).await;
+        }
         let path = params.path;
         // Refuse a bad or existing target before queueing behind the
         // session; the closure below checks again under its lock.
@@ -684,6 +871,27 @@ impl AuroraMcp {
         Ok(result?)
     }
 
+    /// A window call on the host, as a tool result.
+    async fn ui(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        method: &'static str,
+        params: Value,
+    ) -> Result<CallToolResult, McpError> {
+        to_result(self.ui_value(ctx, method, params).await.map_err(Fail::from))
+    }
+
+    async fn ui_value(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        method: &'static str,
+        params: Value,
+    ) -> Result<Value, SessionError> {
+        tracing::info!(method, "window tool");
+        self.blocking(Some(ctx), move |session, cancel| session.ui_call(method, params, cancel))
+            .await
+    }
+
     fn is_headless(&self, id: &str) -> bool {
         SERVER_COMMANDS.contains(&id) || self.inner.headless.contains(&id)
     }
@@ -697,10 +905,14 @@ impl AuroraMcp {
     ) -> Result<Value, Fail> {
         let id = call.id.clone();
         if !self.is_headless(&id) {
-            return Err(Fail::Tool(format!(
-                "`{id}` is not available in the headless server: it needs a window or has no \
-                 headless form yet (command_list marks each command's `headless`)"
-            )));
+            let what = if self.inner.bridge {
+                "is not available over the bridge (quitting and the app's own control commands \
+                 are never tools)"
+            } else {
+                "is not available in the headless server: it needs a window or has no headless \
+                 form yet (command_list marks each command's `headless`)"
+            };
+            return Err(Fail::Tool(format!("`{id}` {what}")));
         }
         match id.as_str() {
             "file.open" => {
@@ -1172,6 +1384,186 @@ impl AuroraMcp {
             .map_err(Fail::from);
         to_result(outcome)
     }
+
+    // ----- window tools (bridge mode only; removed from the router otherwise) -----
+
+    #[tool(
+        description = "The running app's widget tree: every widget's id, role, name, value, state \
+        and bounds (logical window pixels), the focused widget, the tool, the open dialog or \
+        palette. Bounded to 1500 widgets. Read-only. Bridge mode only.",
+        annotations(
+            title = "Inspect the window",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn ui_inspect(
+        &self,
+        Parameters(p): Parameters<UiInspectParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ui(&ctx, "ui.inspect", json!({"include_hidden": p.include_hidden})).await
+    }
+
+    #[tool(
+        description = "A PNG of the app's own rendered window (Aurora's frame, read back from its \
+        swapchain; never an operating-system screen capture, so no other window can appear). \
+        Waits for the next drawn frame. Read-only. Bridge mode only.",
+        annotations(
+            title = "Screenshot the window",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn ui_screenshot(
+        &self,
+        Parameters(p): Parameters<UiScreenshotParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let value = match self
+            .ui_value(&ctx, "ui.screenshot", json!({"max_side": p.max_side}))
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => return Ok(fail_result(error.to_string())),
+        };
+        let png = value.get("png_base64").and_then(Value::as_str).unwrap_or_default().to_owned();
+        if png.len() > MAX_PREVIEW_PNG_BYTES * 2 {
+            return Ok(fail_result("the screenshot is too large; ask for a smaller max_side"));
+        }
+        let mut note = value;
+        if let Some(object) = note.as_object_mut() {
+            object.remove("png_base64");
+        }
+        Ok(CallToolResult::success(vec![
+            Content::image(png, "image/png"),
+            Content::text(note.to_string()),
+        ]))
+    }
+
+    #[tool(
+        description = "Pointer input at logical window coordinates (or a widget id), injected into \
+        the same handlers real input reaches: move, click, double_click, drag (from x,y to \
+        to_x,to_y) or scroll (dx, dy lines), with optional modifiers. A dialog or the palette \
+        takes the press as it would a real one; while a dialog is open this is refused (use \
+        ui_dialog). May edit the document. Bridge mode only.",
+        annotations(
+            title = "Pointer input",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn ui_pointer(
+        &self,
+        Parameters(p): Parameters<UiPointerParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if !["move", "click", "double_click", "drag", "scroll"].contains(&p.action.as_str()) {
+            return Err(McpError::invalid_params(
+                "`action` must be move, click, double_click, drag or scroll",
+                None,
+            ));
+        }
+        if p.id.is_none() && (p.x.is_none() || p.y.is_none()) {
+            return Err(McpError::invalid_params("give `x` and `y` or a widget `id`", None));
+        }
+        let params = json!({
+            "action": p.action, "x": p.x, "y": p.y, "id": p.id, "to_x": p.to_x, "to_y": p.to_y,
+            "button": p.button, "steps": p.steps, "dx": p.dx, "dy": p.dy,
+            "ctrl": p.ctrl, "shift": p.shift, "alt": p.alt, "meta": p.meta,
+        });
+        self.ui(&ctx, "ui.pointer", params).await
+    }
+
+    #[tool(
+        description = "A key chord and/or typed text, injected into the same key handler real \
+        keys reach (so a focused text field, the palette and shortcuts behave as for a person). \
+        Refused while a dialog is open (use ui_dialog). May edit the document. Bridge mode only.",
+        annotations(
+            title = "Keyboard input",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn ui_key(
+        &self,
+        Parameters(p): Parameters<UiKeyParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if p.key.is_none() && p.text.is_none() {
+            return Err(McpError::invalid_params("give `key` and/or `text`", None));
+        }
+        let params = json!({
+            "key": p.key, "text": p.text,
+            "ctrl": p.ctrl, "shift": p.shift, "alt": p.alt, "meta": p.meta,
+        });
+        self.ui(&ctx, "ui.key", params).await
+    }
+
+    #[tool(
+        description = "List the menus (items with command ids, labels, shortcut hints and whether \
+        each is enabled), or activate an enabled item by its command id. Quit and file commands \
+        are never run this way (use doc_open / doc_save). Bridge mode only.",
+        annotations(
+            title = "Menus",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn ui_menu(
+        &self,
+        Parameters(p): Parameters<UiMenuParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        match p.action.as_deref() {
+            None | Some("list") => {}
+            Some("activate") if p.command.is_some() => {}
+            Some("activate") => {
+                return Err(McpError::invalid_params("`activate` needs `command`", None));
+            }
+            Some(_) => {
+                return Err(McpError::invalid_params("`action` must be list or activate", None));
+            }
+        }
+        self.ui(&ctx, "ui.menu", json!({"action": p.action, "command": p.command})).await
+    }
+
+    #[tool(
+        description = "Report the open modal dialog (title, message, actions with ids) or choose \
+        one of its actions by id. This is the only way to answer a dialog, including an \
+        unsaved-changes question; the answer takes the same path as a click on that button. \
+        Bridge mode only.",
+        annotations(
+            title = "Dialogs",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn ui_dialog(
+        &self,
+        Parameters(p): Parameters<UiDialogParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        match p.action.as_deref() {
+            None | Some("get") => {}
+            Some("choose") if p.id.is_some() => {}
+            Some("choose") => return Err(McpError::invalid_params("`choose` needs `id`", None)),
+            Some(_) => return Err(McpError::invalid_params("`action` must be get or choose", None)),
+        }
+        self.ui(&ctx, "ui.dialog", json!({"action": p.action, "id": p.id})).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1187,7 +1579,11 @@ impl ServerHandler for AuroraMcp {
                 .build(),
         )
         .with_server_info(Implementation::new("aurora", env!("CARGO_PKG_VERSION")))
-        .with_instructions(INSTRUCTIONS)
+        .with_instructions(if self.inner.bridge {
+            BRIDGE_INSTRUCTIONS
+        } else {
+            INSTRUCTIONS
+        })
     }
 
     async fn list_tools(
@@ -1303,6 +1699,12 @@ fn check_arguments(tool: &str, arguments: Option<Map<String, Value>>) -> Result<
         "doc_inspect" | "psd_check" => parse::<NoParams>(arguments),
         "render_preview" => parse::<PreviewParams>(arguments),
         "doc_save" => parse::<SaveParams>(arguments),
+        "ui_inspect" => parse::<UiInspectParams>(arguments),
+        "ui_screenshot" => parse::<UiScreenshotParams>(arguments),
+        "ui_pointer" => parse::<UiPointerParams>(arguments),
+        "ui_key" => parse::<UiKeyParams>(arguments),
+        "ui_menu" => parse::<UiMenuParams>(arguments),
+        "ui_dialog" => parse::<UiDialogParams>(arguments),
         _ => Ok(()),
     }
 }

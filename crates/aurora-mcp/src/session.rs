@@ -152,6 +152,62 @@ pub trait Session: Send + 'static {
     /// The document could not be described.
     fn inspect(&mut self) -> Result<Value, SessionError>;
 
+    /// Whether this host drives the running desktop app over the bridge
+    /// (task 160). Such a host reads and writes files itself, through the
+    /// roots it was told, so the server hands it path text
+    /// ([`Session::open_path`], [`Session::save_path`]) rather than staged
+    /// copies, and the `ui_*` tools are offered.
+    fn is_bridge(&self) -> bool {
+        false
+    }
+
+    /// Opens `absolute`, a path the server already resolved inside its read
+    /// root, in the running app (bridge hosts only). The app confines it
+    /// again against its own roots.
+    ///
+    /// # Errors
+    /// Refused by the app, or not a bridge host.
+    fn open_path(
+        &mut self,
+        _absolute: &str,
+        _max_pixels: u64,
+        _cancel: &Cancel,
+    ) -> Result<Value, SessionError> {
+        Err(SessionError::NotAvailable("not a bridge session".to_owned()))
+    }
+
+    /// Writes the live document to the NEW file `absolute` (inside the
+    /// server's write root; the app confines it again and never overwrites).
+    ///
+    /// # Errors
+    /// Refused by the app, or not a bridge host.
+    fn save_path(
+        &mut self,
+        _absolute: &str,
+        _accept_losses: bool,
+        _cancel: &Cancel,
+    ) -> Result<Value, SessionError> {
+        Err(SessionError::NotAvailable("not a bridge session".to_owned()))
+    }
+
+    /// A window-level call (`ui.inspect`, `ui.screenshot`, `ui.pointer`,
+    /// `ui.key`, `ui.menu`, `ui.dialog`) on the running app.
+    ///
+    /// # Errors
+    /// Refused or failed in the app, or not a bridge host.
+    fn ui_call(
+        &mut self,
+        _method: &str,
+        _params: Value,
+        _cancel: &Cancel,
+    ) -> Result<Value, SessionError> {
+        Err(SessionError::NotAvailable(
+            "the window tools need the bridge: start Aurora with --mcp-bridge and run \
+             `aurora-cli mcp --bridge`"
+                .to_owned(),
+        ))
+    }
+
     /// Whether a document is open.
     fn has_document(&self) -> bool;
 

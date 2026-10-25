@@ -63,9 +63,23 @@ fn run_mcp(args: &[String]) -> ExitCode {
     if std::env::var_os("AURORA_MCP_SELFTEST_STRAY_STDOUT").is_some() {
         println!("stray output that must not reach the protocol");
     }
-    let host = AppHost::with_limits(&config.limits);
+    let host: Box<dyn aurora_mcp::Session> = if options.bridge {
+        let source = match &options.discovery {
+            Some(file) => aurora_mcp::DiscoverySource::File(file.clone()),
+            None => match aurora_mcp::DiscoverySource::default_dir() {
+                Ok(source) => source,
+                Err(message) => {
+                    eprintln!("aurora-cli mcp: {message}");
+                    return ExitCode::from(2);
+                }
+            },
+        };
+        Box::new(aurora_mcp::BridgeSession::new(source))
+    } else {
+        Box::new(AppHost::with_limits(&config.limits))
+    };
     match runtime.block_on(aurora_mcp::serve_io(
-        Box::new(host),
+        host,
         config,
         tokio::io::stdin(),
         out,

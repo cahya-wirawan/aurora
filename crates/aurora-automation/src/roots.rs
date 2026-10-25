@@ -372,6 +372,33 @@ impl Roots {
         })
     }
 
+    /// The absolute path `user` names inside a read root (after the same
+    /// text checks and the same root choice as [`Roots::open_read`]), for a
+    /// caller that hands the path on to another process, which must confine
+    /// it again. A relative path is taken from the first read root.
+    ///
+    /// # Errors
+    /// The path is refused or no read root is granted.
+    pub fn absolute_read(&self, user: &str) -> Result<String, PathError> {
+        if self.read.is_empty() {
+            return Err(PathError::NoReadRoot);
+        }
+        let (root, rel) = Self::pick(&self.read, user, "read")?;
+        Ok(root.named.join(rel).display().to_string())
+    }
+
+    /// [`Roots::absolute_read`] for a write root.
+    ///
+    /// # Errors
+    /// The path is refused or no write root is granted.
+    pub fn absolute_write(&self, user: &str) -> Result<String, PathError> {
+        if self.write.is_empty() {
+            return Err(PathError::NoWriteRoot);
+        }
+        let (root, rel) = Self::pick(&self.write, user, "write")?;
+        Ok(root.named.join(rel).display().to_string())
+    }
+
     fn parent_and_name(root: &Root, rel: &Path, user: &str) -> Result<(Dir, OsString), PathError> {
         let name = rel.file_name().ok_or(PathError::NoFileName)?.to_owned();
         let folder = rel.parent().unwrap_or_else(|| Path::new(""));
