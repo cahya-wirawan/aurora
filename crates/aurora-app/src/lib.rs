@@ -34402,6 +34402,8 @@ impl App {
                 message,
                 "the Photoshop compatibility check could not be shown"
             );
+            // A calm status-bar notice, so the user sees something.
+            self.colour_notice(psd_save::PSD_CHECK_BUSY_NOTICE);
         }
     }
 

@@ -186,7 +186,13 @@ fn roundtrip_civil(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-fn roundtrip_header(max_mb: u64, measured: usize, skipped: usize, failed: usize) -> String {
+fn roundtrip_header(
+    max_mb: u64,
+    measured: usize,
+    skipped: usize,
+    failed: usize,
+    local: usize,
+) -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -204,17 +210,6 @@ fn roundtrip_header(max_mb: u64, measured: usize, skipped: usize, failed: usize)
     };
     let commit = run("git", &["rev-parse", "--short", "HEAD"]);
     let dirty = run("git", &["status", "--porcelain", "--untracked-files=no"]);
-    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map_or_else(|_| "unknown".to_owned(), |s| s.trim().to_owned());
-    let cpu = std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("model name"))
-                .and_then(|l| l.split(':').nth(1))
-                .map(|v| v.trim().to_owned())
-        })
-        .unwrap_or_else(|| "unknown".to_owned());
     let os = std::fs::read_to_string("/etc/os-release")
         .ok()
         .and_then(|s| {
@@ -229,9 +224,12 @@ fn roundtrip_header(max_mb: u64, measured: usize, skipped: usize, failed: usize)
          edit by hand.*\n\n\
          - Date: {y:04}-{m:02}-{d:02} (UTC)\n\
          - Git commit: {commit}{}\n\
-         - Machine: {host}, {cpu}, {cores} threads, {os}\n\
+         - Machine: {os}, {cores} threads\n\
          - Size cap: files over {max_mb} MiB are skipped. {measured} files measured, {skipped} \
-         skipped, {failed} failed.\n\n\
+         skipped, {failed} failed.\n\
+         - Corpus: the files under `corpora/psd` in the repository, plus a local corpus of {local} \
+         files that is not in the repository; those are listed as `local file #N` and their \
+         paths are not recorded.\n\n\
          ## What this is, and what it is not\n\n\
          For each corpus PSD Aurora opens it, builds the Save As `.psd` report \
          (`psd_report`), saves a `.psd` through its own safe-save path, reopens that \
@@ -329,13 +327,22 @@ fn psd_roundtrip_report() {
     let max_mb = env_u64("AURORA_AUDIT_MAX_MB", 64);
     let secs = env_u64("AURORA_AUDIT_SECS", 300);
     let (mut rows, mut skipped, mut failed) = (Vec::new(), Vec::new(), Vec::new());
+    let mut local = 0;
     for path in &files {
-        let name = path
+        let relative = path
             .strip_prefix(&root)
             .unwrap_or(path)
             .to_string_lossy()
             .replace("corpora/psd/reference/psd-tools-fixtures/", "psd-tools/")
             .replace('\\', "/");
+        // Anything outside the repository's own corpus is a local file: its
+        // path is not recorded, so the committed report carries none.
+        let name = if relative.starts_with("corpora/") || relative.starts_with("psd-tools/") {
+            relative
+        } else {
+            local += 1;
+            format!("local file #{local}")
+        };
         match std::fs::metadata(path) {
             Ok(meta) if meta.len() > max_mb << 20 => {
                 let why = format!("{} MiB is over the {max_mb} MiB size cap", meta.len() >> 20);
@@ -365,7 +372,7 @@ fn psd_roundtrip_report() {
         }
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    let header = roundtrip_header(max_mb, rows.len(), skipped.len(), failed.len());
+    let header = roundtrip_header(max_mb, rows.len(), skipped.len(), failed.len(), local);
     let markdown = roundtrip_markdown(&header, &rows, &skipped, &failed);
     let out = std::env::var("AURORA_ROUNDTRIP_OUT")
         .map_or_else(|_| root.join("docs/psd-roundtrip-report.md"), Into::into);

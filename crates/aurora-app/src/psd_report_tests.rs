@@ -118,30 +118,36 @@ fn the_ask_rule_only_kept_lines_do_not_ask() {
 }
 
 #[test]
-fn a_long_group_is_capped_with_and_n_more_but_the_full_text_has_everything() {
+fn only_changed_from_open_and_kept_are_capped_and_the_rest_is_in_the_full_text() {
     let n = MAX_ITEMS_PER_GROUP + 3;
-    let entries: Vec<ReportEntry> = (0..n)
-        .map(|i| entry(ReportCategory::Changed, &format!("line {i:02}")))
-        .collect();
-    let r = SaveReport::new(&report(entries));
-    assert!(r.is_truncated());
-    let body = r.dialog_body();
-    assert!(body.contains("line 00"), "{body}");
-    assert!(
-        body.contains(&format!("line {:02}", MAX_ITEMS_PER_GROUP - 1)),
-        "{body}"
-    );
-    assert!(
-        !body.contains(&format!("line {MAX_ITEMS_PER_GROUP:02}")),
-        "{body}"
-    );
-    assert!(body.contains("\u{2026} and 3 more"), "{body}");
-    assert!(body.contains("full list is in Aurora's log"), "{body}");
-    let full = r.full_text();
-    for i in 0..n {
-        assert!(full.contains(&format!("line {i:02}")), "{full}");
+    for category in [
+        ReportCategory::Changed,
+        ReportCategory::FromOpen,
+        ReportCategory::Kept,
+    ] {
+        let entries: Vec<ReportEntry> = (0..n)
+            .map(|i| entry(category, &format!("line {i:02}")))
+            .collect();
+        let r = SaveReport::new(&report(entries));
+        assert!(r.is_truncated(), "{category:?}");
+        let body = r.dialog_body();
+        assert!(body.contains("line 00"), "{body}");
+        assert!(
+            body.contains(&format!("line {:02}", MAX_ITEMS_PER_GROUP - 1)),
+            "{body}"
+        );
+        assert!(
+            !body.contains(&format!("line {MAX_ITEMS_PER_GROUP:02}")),
+            "{body}"
+        );
+        assert!(body.contains("\u{2026} and 3 more"), "{body}");
+        assert!(body.contains("full list is in Aurora's log"), "{body}");
+        let full = r.full_text();
+        for i in 0..n {
+            assert!(full.contains(&format!("line {i:02}")), "{full}");
+        }
+        assert!(!full.contains("and 3 more"), "{full}");
     }
-    assert!(!full.contains("and 3 more"), "{full}");
     // At exactly the cap nothing is cut.
     let exact = SaveReport::new(&report(
         (0..MAX_ITEMS_PER_GROUP)
@@ -150,6 +156,33 @@ fn a_long_group_is_capped_with_and_n_more_but_the_full_text_has_everything() {
     ));
     assert!(!exact.is_truncated());
     assert!(!exact.dialog_body().contains("more"));
+}
+
+/// The trust rule: a line that says something is lost or unchecked is never
+/// hidden behind "and N more", however long the group.
+#[test]
+fn needs_attention_and_not_saved_lines_are_never_cut() {
+    let n = MAX_ITEMS_PER_GROUP * 3;
+    for category in [ReportCategory::NeedsAttention, ReportCategory::NotSaved] {
+        // Sorts last, past position 5 and past the Changed cap.
+        let mut entries: Vec<ReportEntry> = (0..n)
+            .map(|i| entry(category, &format!("line {i:02}")))
+            .collect();
+        entries.push(entry(category, "zzz the important one"));
+        let r = SaveReport::new(&report(entries));
+        assert!(!r.is_truncated(), "{category:?}");
+        let body = r.dialog_body();
+        assert!(body.contains("zzz the important one"), "{body}");
+        assert!(body.contains(&format!("line {:02}", n - 1)), "{body}");
+        assert!(!body.contains("more"), "{body}");
+        assert!(!body.contains("Aurora's log"), "{body}");
+        // And through the real message.
+        let message = save_message(
+            "a.psd",
+            &report(vec![entry(category, "zzz the important one")]),
+        );
+        assert!(message.contains("zzz the important one"));
+    }
 }
 
 #[test]

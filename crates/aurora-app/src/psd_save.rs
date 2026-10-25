@@ -50,6 +50,10 @@ pub(crate) const CHECK_TITLE: &str = "Check PSD Compatibility\u{2026}";
 pub(crate) const PSD_CHECK_TITLE: &str = "Photoshop Compatibility";
 pub(crate) const PSD_CHECK_FAILED_TITLE: &str = "Can't Check Photoshop Compatibility";
 pub(crate) const PSD_CHECK_OK: &str = "psd.check.ok";
+/// The calm status-bar notice when the check's result cannot be shown because
+/// another dialog is open (the result is also logged).
+pub(crate) const PSD_CHECK_BUSY_NOTICE: &str = "The Photoshop compatibility check couldn't be shown because a dialog is open. Close it and \
+     check again.";
 
 /// The check dialog's single "OK" (default and cancel).
 pub(crate) fn psd_check_dialog_actions() -> Vec<DialogAction> {
