@@ -94534,6 +94534,7 @@ mod tests {
         include!("outer_glow_tests.rs");
         include!("clip_corpus_tests.rs");
         include!("psd_audit_tests.rs");
+        include!("psd_roundtrip_tests.rs");
         include!("four_adjust_fidelity_tests.rs");
         include!("two_adjust_fidelity_tests.rs");
         include!("gradient_fidelity_tests.rs");
