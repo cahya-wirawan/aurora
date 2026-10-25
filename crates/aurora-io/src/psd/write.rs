@@ -1112,7 +1112,7 @@ pub struct PsdExpectedLayer {
 pub struct PsdExpectedAlpha {
     /// What the four alpha resources say about it.
     pub channel: super::alpha::ResourceChannel,
-    /// The sum of [`sample_hash`] over every written 16-bit sample of its
+    /// The sum of `sample_hash` over every written 16-bit sample of its
     /// plane (plane number `4 + its index`).
     pub hash: u64,
     /// Whether any sample is non-zero: an all-zero channel holds no
@@ -2427,7 +2427,7 @@ pub fn write_psd_with_selections<W: Write + Seek>(
     )
 }
 
-/// The limits [`write_psd_limited`] applies — parameters so tests reach
+/// The limits `write_psd_limited` applies — parameters so tests reach
 /// them without gigabyte files.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WriteLimits {
@@ -2495,7 +2495,7 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
     write_psd_limited_with(writer, layers, canvas, composite, store, opts, limits, &[])
 }
 
-/// [`write_psd_limited`] with the saved selections to write as alpha
+/// `write_psd_limited` with the saved selections to write as alpha
 /// channels (task 156).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn write_psd_limited_with<W: Write + Seek>(
