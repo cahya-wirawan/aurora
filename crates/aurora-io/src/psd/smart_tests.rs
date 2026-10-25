@@ -774,6 +774,7 @@ fn smart_objects_survive_an_aur_round_trip_and_a_later_psd_save() {
             masks: Vec::new(),
             report: super::PsdImportReport::default(),
             colour: crate::ColourImport::default(),
+            saved_selections: Vec::new(),
         },
     };
     let (_, outcome) = reopened.write();

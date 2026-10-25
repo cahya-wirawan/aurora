@@ -337,6 +337,22 @@ impl Selection {
         }
     }
 
+    /// The coverage of document row `y`, texels `x0 .. x0 + out.len()`, as
+    /// bytes (task 156, writing a saved selection as a PSD alpha channel):
+    /// `out[i]` is exactly what [`Self::coverage_at`] gives at `(x0 + i, y)`
+    /// scaled to `0..=255` with the inversion applied -- `255`/`0` for a
+    /// rectangle, `round(k/16 * 255)` along an ellipse's edge, a mask's own
+    /// byte -- so a mask round-trips bit for bit. A rectangle or ellipse is cut to its bounds.
+    pub fn coverage_row_bytes(&self, y: i64, x0: i64, out: &mut [u8]) {
+        let flip = |byte: u8| if self.inverted { u8::MAX - byte } else { byte };
+        let in_rows = y >= self.bounds.y && y < self.bounds.bottom();
+        for (i, slot) in out.iter_mut().enumerate() {
+            let x = i64::try_from(i).map_or(i64::MAX, |i| x0.saturating_add(i));
+            let inside = in_rows && x >= self.bounds.x && x < self.bounds.right();
+            *slot = flip(if inside { self.shape_byte_at(x, y) } else { 0 });
+        }
+    }
+
     /// A rectangle outside which [`Self::coverage_at`] is `0`: the bounds
     /// of a plain selection, `None` for an inverted one (everything
     /// outside the shape is covered, so no useful bound exists).

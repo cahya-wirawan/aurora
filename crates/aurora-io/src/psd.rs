@@ -142,6 +142,9 @@ use half::f16;
 use crate::error::IoError;
 use crate::image::Image;
 
+mod alpha;
+#[cfg(test)]
+mod alpha_tests;
 #[cfg(test)]
 mod colour_tests;
 mod descriptor;
@@ -301,6 +304,9 @@ pub struct PsdFile {
     pub text_engine: Option<std::sync::Arc<Vec<u8>>>,
     /// The patterns some layer's pattern overlay names (task 111).
     pub patterns: Vec<aurora_core::pattern::Pattern>,
+    /// The file's alpha channels read as saved selections (task 156), in
+    /// file order.
+    pub saved_selections: Vec<(String, aurora_doc::Selection)>,
     notes: Notes,
 }
 
@@ -474,6 +480,10 @@ pub struct PsdDocument {
     /// What the open did about colour (profile kept as metadata, calm
     /// info lines). Warnings are in [`Self::report`].
     pub colour: crate::ColourImport,
+    /// The file's alpha channels as saved selections (task 156), in file
+    /// order, each name valid and unique. Applied by the caller with
+    /// `SelectionSet::from_parts`.
+    pub saved_selections: Vec<(String, aurora_doc::Selection)>,
 }
 
 /// One pixel layer's decoded image, placed in its layer's surface.
@@ -635,6 +645,16 @@ enum Note {
     DuplicateChannel,
     BrokenGroups,
     ExtraChannels,
+    /// Alpha channels opened as saved selections (task 156).
+    AlphaRead,
+    /// Spot colour channels, left out.
+    AlphaSpot,
+    /// Alpha channels with nothing selected, left out.
+    AlphaEmpty,
+    /// Alpha channels past Aurora's selection caps, left out.
+    AlphaOverCaps,
+    /// Alpha channels of a merged image that could not be read.
+    AlphaUnreadable,
     ColorProfileIgnored,
     /// A Lab, Indexed, Bitmap, Duotone or Multichannel file's flattened
     /// image carries a transparency plane that is not read (task 148).
@@ -667,6 +687,8 @@ struct Notes(
     Option<u16>,
     /// The font names kept text layers reference (task 155).
     std::collections::BTreeSet<String>,
+    /// The alpha channel resources (task 156).
+    alpha::ResourceBodies,
 );
 
 impl Notes {
@@ -1214,6 +1236,28 @@ fn note_text(note: Note, n: u64) -> String {
         Note::BrokenGroups => format!(
             "The file's group structure is inconsistent ({n} unmatched group marker{s}), so \
              some layers may appear outside the group they belong to."
+        ),
+        Note::AlphaRead => format!(
+            "{n} alpha channel{s} opened as saved selection{s} (Select > Load Selection). \
+             A saved .psd writes {} back as alpha channels (Aurora hasn't checked this in \
+             Photoshop).",
+            if one { "it" } else { "them" },
+        ),
+        Note::AlphaSpot => {
+            format!("{n} spot colour channel{s} {was} not opened.")
+        }
+        Note::AlphaEmpty => format!(
+            "{n} alpha channel{s} with nothing selected {was} not opened as saved selections."
+        ),
+        Note::AlphaOverCaps => format!(
+            "{n} alpha channel{s} {was} not opened: Aurora keeps at most {} saved selections, \
+             {} MiB of masks, and masks up to {} megapixels.",
+            aurora_doc::MAX_SAVED_SELECTIONS,
+            aurora_doc::MAX_SAVED_SELECTION_BYTES / (1024 * 1024),
+            aurora_doc::MAX_SELECTION_MASK_PIXELS / (1024 * 1024),
+        ),
+        Note::AlphaUnreadable => format!(
+            "{n} alpha channel{s} {was} not opened: the file's flattened image is damaged."
         ),
         Note::ExtraChannels => {
             format!("{n} saved channel{s} (alpha or spot colour) {was} not opened.")
@@ -1781,6 +1825,7 @@ fn scan_resources(data: &[u8], notes: &mut Notes) -> f32 {
         {
             notes.4 = Some(u16::from_be_bytes([*hi, *lo]));
         }
+        notes.6.offer(id, body);
         if id == 1037
             && let Some(bytes) = body.get(..4)
         {
@@ -6080,7 +6125,36 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
     let extra = u64::from(header.channels)
         .saturating_sub(u64::from(color_planes))
         .saturating_sub(u64::from(merged_alpha));
-    notes.add_n(Note::ExtraChannels, extra);
+    // Alpha channels (task 156): the planes after the colour planes (and the
+    // merged transparency plane) become saved selections. Only the modes whose
+    // colour planes are known and whose samples are whole bytes are read.
+    let mut saved_selections = Vec::new();
+    let mut accounted = 0_u64;
+    let alpha_modes = matches!(header.color_mode, 1 | 3 | 4 | 9) && header.depth != 1;
+    if alpha_modes && extra > 0 {
+        // A file that names its first extra plane `Transparency` without
+        // tagging it (a layerless 32-bit file, say) has the merged
+        // transparency there, not an alpha channel.
+        let transparency = tagged_alpha || notes.6.first_name_is_transparency();
+        let colour = usize::from(color_planes);
+        let first = colour + usize::from(transparency);
+        let outcome = alpha::read_channels(src, r, header, colour, first, &notes.6)?;
+        if let Some(err) = src.take_failure() {
+            return Err(err);
+        }
+        accounted = (outcome.selections.len() as u64)
+            .saturating_add(outcome.spot)
+            .saturating_add(outcome.empty)
+            .saturating_add(outcome.over_caps)
+            .saturating_add(outcome.unreadable);
+        notes.add_n(Note::AlphaRead, outcome.selections.len() as u64);
+        notes.add_n(Note::AlphaSpot, outcome.spot);
+        notes.add_n(Note::AlphaEmpty, outcome.empty);
+        notes.add_n(Note::AlphaOverCaps, outcome.over_caps);
+        notes.add_n(Note::AlphaUnreadable, outcome.unreadable);
+        saved_selections = outcome.selections;
+    }
+    notes.add_n(Note::ExtraChannels, extra.saturating_sub(accounted));
 
     // Only a file whose tree is entirely empty falls back to the merged
     // image. One with groups but no pixel layers opens as just that — its
@@ -6128,6 +6202,7 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
         linked_files,
         text_engine,
         patterns,
+        saved_selections,
         notes,
     })
 }
@@ -6408,6 +6483,8 @@ pub struct PsdStreamedDocument {
     pub report: PsdImportReport,
     /// See [`PsdDocument::colour`].
     pub colour: crate::ColourImport,
+    /// See [`PsdDocument::saved_selections`].
+    pub saved_selections: Vec<(String, aurora_doc::Selection)>,
 }
 
 /// The sink [`build_document`] and [`read`] collect into.
@@ -6427,6 +6504,7 @@ impl Collect {
             masks: self.masks,
             report: document.report,
             colour: document.colour,
+            saved_selections: document.saved_selections,
         }
     }
 }
@@ -6462,6 +6540,7 @@ fn build_streamed(
         linked_files,
         text_engine,
         patterns,
+        saved_selections,
         mut notes,
     } = file;
     let header = Header {
@@ -6599,6 +6678,7 @@ fn build_streamed(
         canvas_size: (width, height),
         report,
         colour,
+        saved_selections,
     })
 }
 
