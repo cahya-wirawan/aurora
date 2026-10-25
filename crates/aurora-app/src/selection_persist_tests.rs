@@ -420,25 +420,6 @@ fn the_name_prompt_validates_and_the_palette_lists_loads_and_deletes() {
     );
 }
 
-#[test]
-fn the_psd_report_names_only_saved_selections_never_a_transient_active_one() {
-    let mut set = SelectionSet::new();
-    assert_eq!(crate::psd_save::selection_loss_line(&set), None);
-    set.select(Selection::new(rect(0, 0, 3, 3)));
-    assert_eq!(
-        crate::psd_save::selection_loss_line(&set),
-        None,
-        "an active selection alone does not make a PSD save lossy"
-    );
-    ok(set.save_active("x"));
-    let line = crate::psd_save::selection_loss_line(&set).unwrap_or_default();
-    assert!(line.contains("Saved selections"), "{line}");
-    set.deselect();
-    assert!(crate::psd_save::selection_loss_line(&set).is_some());
-    ok(set.delete_saved("x"));
-    assert_eq!(crate::psd_save::selection_loss_line(&set), None);
-}
-
 // -- Autosave and recovery -------------------------------------------------
 
 fn new_store() -> (tempfile::TempDir, aurora_tile::TileStore) {

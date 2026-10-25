@@ -153,18 +153,12 @@ pub(crate) fn carried_losses(
     lines
 }
 
-/// The one report line for a document that has **saved named selections**
-/// (0.218.1): they are the user's data and a Photoshop file cannot carry
-/// them yet (PSD alpha channels wait for the Channels panel), so the save
-/// would leave them out. `None` when there are none. The *active*
-/// selection alone adds nothing: it is transient state, and listing it
-/// would make every PSD save of a document with a marquee "lossy" and ask
-/// first. (It is still not written to the PSD: a documented gap.)
-pub(crate) fn selection_loss_line(selection: &aurora_doc::SelectionSet) -> Option<String> {
-    (selection.saved_count() > 0)
-        .then(|| "Saved selections are not saved in a Photoshop file.".to_owned())
-}
-
+/// Saved selections are written as PSD alpha channels (task 156) by
+/// `aurora_io::write_psd_with_selections`, which itemises what it writes and
+/// what it cannot in its own report; the *active* selection alone adds
+/// nothing: it is transient state, and listing it would make every PSD save
+/// of a document with a marquee "lossy" and ask first. (It is still not
+/// written to the PSD: a documented gap.)
 /// The report line for paths (0.233.0): a PSD does not carry them.
 pub(crate) fn paths_loss_line(selection: &aurora_doc::SelectionSet) -> Option<String> {
     (!selection.paths().is_empty()).then(|| "Paths are not saved in a Photoshop file.".to_owned())
@@ -246,6 +240,9 @@ pub(crate) enum PsdSaveFailure {
 /// The document a PSD save writes.
 #[derive(Debug)]
 pub(crate) struct PsdSaveSource<'a> {
+    /// The saved selections, written as alpha channels (task 156), sorted
+    /// by name ([`aurora_doc::SelectionSet::saved_sorted`]).
+    pub(crate) saved: Vec<(&'a str, &'a aurora_doc::Selection)>,
     pub(crate) layers: &'a aurora_doc::LayerTree,
     pub(crate) canvas: (u32, u32),
     pub(crate) store: &'a mut aurora_tile::TileStore,
@@ -318,13 +315,14 @@ pub(crate) fn begin_psd_save_timed(
         |file| {
             let started = Instant::now();
             let mut composite = &image;
-            let outcome = aurora_io::write_psd(
+            let outcome = aurora_io::write_psd_with_selections(
                 &mut *file,
                 layers,
                 source.canvas,
                 &mut composite,
                 store,
                 opts,
+                &source.saved,
             );
             write_time.set(started.elapsed());
             outcome

@@ -153,6 +153,8 @@ pub(crate) struct PreparedPsd {
     pub(crate) report: aurora_io::PsdImportReport,
     /// What the open did about colour.
     pub(crate) colour: aurora_io::ColourImport,
+    /// The file's alpha channels as saved selections (task 156).
+    pub(crate) selections: Vec<(String, aurora_doc::Selection)>,
     /// Where the open's time went (0.189.0).
     pub(crate) timings: Box<OpenTimings>,
 }
@@ -191,6 +193,7 @@ impl PreparedPsd {
             masks,
             report,
             colour,
+            saved_selections,
         } = document;
         let pixels = pixels
             .into_iter()
@@ -211,6 +214,7 @@ impl PreparedPsd {
             masks: prepare_masks(&masks),
             report,
             colour,
+            selections: saved_selections,
             timings: Box::default(),
         }
     }
@@ -337,6 +341,7 @@ impl PreparedPsd {
             masks,
             report: document.report,
             colour: document.colour,
+            selections: document.saved_selections,
             timings: Box::new(timings),
         })
     }

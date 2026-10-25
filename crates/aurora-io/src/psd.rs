@@ -201,8 +201,8 @@ pub use text::PsdTextLayer;
 pub use write::{
     PSD_GROUP_END_NAME, PSD_MAX_NAME_UNITS, PSD_MAX_RECORDS, PsdCompositeSource, PsdExpectation,
     PsdExpectedAdjustment, PsdExpectedAlpha, PsdExpectedLayer, PsdExpectedMask, PsdFormat,
-    PsdRecordKind, PsdSaveOptions, PsdSaveRefusal, PsdWriteOutcome, PsdWriteReport,
-    psd_blend_key, psd_save_preflight, verify_psd_file, write_psd, write_psd_with_selections,
+    PsdRecordKind, PsdSaveOptions, PsdSaveRefusal, PsdWriteOutcome, PsdWriteReport, psd_blend_key,
+    psd_save_preflight, verify_psd_file, write_psd, write_psd_with_selections,
 };
 
 /// The largest canvas side a version-1 PSD file may declare.
@@ -1256,9 +1256,9 @@ fn note_text(note: Note, n: u64) -> String {
             aurora_doc::MAX_SAVED_SELECTION_BYTES / (1024 * 1024),
             aurora_doc::MAX_SELECTION_MASK_PIXELS / (1024 * 1024),
         ),
-        Note::AlphaUnreadable => format!(
-            "{n} alpha channel{s} {was} not opened: the file's flattened image is damaged."
-        ),
+        Note::AlphaUnreadable => {
+            format!("{n} alpha channel{s} {was} not opened: the file's flattened image is damaged.")
+        }
         Note::ExtraChannels => {
             format!("{n} saved channel{s} (alpha or spot colour) {was} not opened.")
         }
@@ -6131,7 +6131,10 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
     let mut saved_selections = Vec::new();
     let mut accounted = 0_u64;
     let alpha_modes = matches!(header.color_mode, 1 | 3 | 4 | 9) && header.depth != 1;
-    if alpha_modes && extra > 0 {
+    // Only a file that names or describes its extra channels (Photoshop
+    // always does) has them read as alpha channels; without that they stay
+    // "saved channels not opened", as before task 156.
+    if alpha_modes && extra > 0 && notes.6.any() {
         // A file that names its first extra plane `Transparency` without
         // tagging it (a layerless 32-bit file, say) has the merged
         // transparency there, not an alpha channel.

@@ -148,10 +148,7 @@ fn extends_past(selection: &Selection, canvas: (u32, u32)) -> bool {
         return false;
     }
     let b = &selection.bounds;
-    b.x < 0
-        || b.y < 0
-        || b.right() > i64::from(canvas.0)
-        || b.bottom() > i64::from(canvas.1)
+    b.x < 0 || b.y < 0 || b.right() > i64::from(canvas.0) || b.bottom() > i64::from(canvas.1)
 }
 
 /// The Pascal bytes of a name: ASCII kept, anything else `?` (the Unicode
@@ -160,7 +157,13 @@ fn extends_past(selection: &Selection, canvas: (u32, u32)) -> bool {
 pub(crate) fn pascal_bytes(name: &str) -> (Vec<u8>, bool) {
     let mut bytes: Vec<u8> = name
         .chars()
-        .map(|c| if c.is_ascii() && !c.is_ascii_control() { c as u8 } else { b'?' })
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() {
+                c as u8
+            } else {
+                b'?'
+            }
+        })
         .collect();
     let cut = bytes.len() > PASCAL_MAX;
     bytes.truncate(PASCAL_MAX);
@@ -312,6 +315,11 @@ impl ResourceBodies {
         }
     }
 
+    /// Whether the file carried any of the alpha channel resources.
+    pub(crate) fn any(&self) -> bool {
+        self.pascal.is_some() || self.unicode.is_some() || self.display.is_some()
+    }
+
     fn pascal_names(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let mut rest: &[u8] = self.pascal.as_deref().unwrap_or_default();
@@ -343,7 +351,12 @@ impl ResourceBodies {
             };
             let units: Vec<u16> = bytes
                 .chunks_exact(2)
-                .map(|p| u16::from_be_bytes([p.first().copied().unwrap_or(0), p.get(1).copied().unwrap_or(0)]))
+                .map(|p| {
+                    u16::from_be_bytes([
+                        p.first().copied().unwrap_or(0),
+                        p.get(1).copied().unwrap_or(0),
+                    ])
+                })
                 .collect();
             let trimmed = units
                 .iter()
@@ -363,7 +376,10 @@ impl ResourceBodies {
             .chunks_exact(13)
             .take(MAX_ENTRIES)
             .map(|e| {
-                let opacity = u16::from_be_bytes([e.get(10).copied().unwrap_or(0), e.get(11).copied().unwrap_or(0)]);
+                let opacity = u16::from_be_bytes([
+                    e.get(10).copied().unwrap_or(0),
+                    e.get(11).copied().unwrap_or(0),
+                ]);
                 (opacity, e.get(12).copied().unwrap_or(KIND_PLAIN))
             })
             .collect()
@@ -457,7 +473,11 @@ fn coverage_row(row: &[u8], bps: usize, out: &mut Vec<u8>) {
             ]);
             // Clamped to 0..=255 before the cast; NaN reads as 0.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let byte = if v.is_nan() { 0 } else { (v.clamp(0.0, 1.0) * 255.0).round() as u8 };
+            let byte = if v.is_nan() {
+                0
+            } else {
+                (v.clamp(0.0, 1.0) * 255.0).round() as u8
+            };
             byte
         })),
         _ => out.extend_from_slice(row),
@@ -494,7 +514,11 @@ fn selection_of(plane: &[u8], width: u32, height: u32) -> Result<Option<Selectio
     let box_w = right - left + 1;
     let mut data: Vec<u8> = try_alloc(box_w * (bottom - top + 1))?;
     let mut solid = true;
-    for row in plane.chunks_exact(w.max(1)).skip(top).take(bottom - top + 1) {
+    for row in plane
+        .chunks_exact(w.max(1))
+        .skip(top)
+        .take(bottom - top + 1)
+    {
         let part = row.get(left..=right).unwrap_or_default();
         solid &= part.iter().all(|&b| b == u8::MAX);
         data.extend_from_slice(part);
@@ -561,9 +585,7 @@ fn walk_planes(
     let compression = u16::from_be_bytes(window.take_array(src, "merged image compression")?);
     match compression {
         0 => {
-            let needed = plane_len
-                .checked_mul(last + 1)
-                .ok_or_else(size)?;
+            let needed = plane_len.checked_mul(last + 1).ok_or_else(size)?;
             if !window.fits(needed) {
                 return Err(truncated("merged image data"));
             }
@@ -592,7 +614,11 @@ fn walk_planes(
             if !window.fits(table_all) {
                 return Err(truncated("merged image RLE row lengths"));
             }
-            let table = src.read_at(window.pos, used_rows * entry, "merged image RLE row lengths")?;
+            let table = src.read_at(
+                window.pos,
+                used_rows * entry,
+                "merged image RLE row lengths",
+            )?;
             let lengths: Vec<usize> = table
                 .chunks_exact(entry)
                 .map(|c| match c {

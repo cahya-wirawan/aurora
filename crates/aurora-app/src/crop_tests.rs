@@ -952,6 +952,7 @@ fn a_psd_saved_after_a_crop_has_the_cropped_size_in_its_header() {
     let path = dir.path().join("cropped.psd");
     let step = begin_psd_save(
         PsdSaveSource {
+            saved: Vec::new(),
             layers: &doc.layers,
             canvas: doc.canvas,
             store: &mut doc.store,

@@ -591,6 +591,7 @@ fn save_as_psd(
 ) -> Result<(), Failure> {
     let mut timings = crate::psd_save::PsdSaveTimings::default();
     let source = crate::psd_save::PsdSaveSource {
+        saved: Vec::new(),
         layers: &opened.layers,
         canvas: opened.size,
         store,

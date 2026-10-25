@@ -2854,12 +2854,8 @@ fn write_merged<W: Write + Seek>(
             for (x, &byte) in row8.iter().enumerate() {
                 let value = u16::from(byte) * 257;
                 row16.extend_from_slice(&value.to_be_bytes());
-                plane_hash = plane_hash.wrapping_add(sample_hash(
-                    plane,
-                    x as u32,
-                    y,
-                    u64::from(value),
-                ));
+                plane_hash =
+                    plane_hash.wrapping_add(sample_hash(plane, x as u32, y, u64::from(value)));
                 nonzero |= byte != 0;
             }
             let packed = pack_bits(&row16);
@@ -3681,17 +3677,18 @@ fn reader_pass(path: &Path, expected: &PsdExpectation) -> Result<(), IoError> {
 /// back as (task 156): the names, in order, for the channels that select
 /// anything, and each one's coverage over the canvas, hashed like the
 /// written plane.
-fn check_alpha(
-    expected: &PsdExpectation,
-    doc: &super::PsdStreamedDocument,
-) -> Result<(), IoError> {
+fn check_alpha(expected: &PsdExpectation, doc: &super::PsdStreamedDocument) -> Result<(), IoError> {
     let want: Vec<(usize, &PsdExpectedAlpha)> = expected
         .alpha
         .iter()
         .enumerate()
         .filter(|(_, a)| a.nonzero)
         .collect();
-    let got_names: Vec<&str> = doc.saved_selections.iter().map(|(n, _)| n.as_str()).collect();
+    let got_names: Vec<&str> = doc
+        .saved_selections
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
     let want_names: Vec<&str> = want.iter().map(|(_, a)| a.channel.name.as_str()).collect();
     check("saved selections read back (names)", got_names, want_names)?;
     let width = expected.width as usize;

@@ -86,8 +86,18 @@ impl Doc {
         path: &Path,
         carried: Vec<String>,
     ) -> Result<PsdSaveStep, PsdSaveFailure> {
+        self.save_selections(path, carried, Vec::new())
+    }
+
+    fn save_selections(
+        &mut self,
+        path: &Path,
+        carried: Vec<String>,
+        saved: Vec<(&str, &aurora_doc::Selection)>,
+    ) -> Result<PsdSaveStep, PsdSaveFailure> {
         begin_psd_save(
             PsdSaveSource {
+                saved,
                 layers: &self.tree,
                 canvas: (8, 8),
                 store: &mut self.store,
@@ -557,6 +567,7 @@ fn preflight_refusal_shows_couldnt_save_with_reason() {
     let big = doc.path("big.psd");
     let result = begin_psd_save(
         PsdSaveSource {
+            saved: Vec::new(),
             layers: &doc.tree,
             canvas: (30_001, 8),
             store: &mut doc.store,
@@ -1333,6 +1344,7 @@ mod crop_and_smart_objects {
         fn save(&self, doc: &mut Doc, path: &Path) -> PsdSaveStep {
             ok(begin_psd_save(
                 PsdSaveSource {
+                    saved: Vec::new(),
                     layers: &doc.tree,
                     canvas: self.canvas,
                     store: &mut doc.store,
@@ -1628,4 +1640,71 @@ fn a_cmyk_or_32_bit_open_carries_its_conversion_into_the_psd_save_report() {
         assert_eq!(pending.report.items, carried);
         assert_eq!(ok(std::fs::read(&target)), bytes, "target untouched");
     }
+}
+
+#[test]
+fn saved_selections_are_written_as_alpha_channels_and_reported() {
+    use aurora_doc::{Selection, SelectionSet};
+    let mut doc = Doc::new();
+    let mut set = SelectionSet::new();
+    set.select(Selection::new(rect(1, 1, 4, 3)));
+    // An active selection alone adds nothing: the save stays lossless.
+    let path = doc.path("plain.psd");
+    let step = ok(doc.save_selections(&path, Vec::new(), set.saved_sorted()));
+    assert!(matches!(step, PsdSaveStep::Saved));
+    ok(set.save_active("Sky"));
+    set.select(Selection::ellipse(rect(0, 0, 8, 8)));
+    ok(set.save_active("Disc"));
+    let path = doc.path("sel.psd");
+    ok(std::fs::write(&path, b"the user's file"));
+    let step = ok(doc.save_selections(&path, Vec::new(), set.saved_sorted()));
+    let PsdSaveStep::NeedsConfirmation(pending) = step else {
+        unreachable!("the alpha channels are reported")
+    };
+    let report = pending.report.items.join("\n");
+    assert!(report.contains("written as alpha channels"), "{report}");
+    assert!(
+        report.contains("Disc") && report.contains("Sky"),
+        "{report}"
+    );
+    assert!(
+        !report.contains("Saved selections are not saved"),
+        "{report}"
+    );
+    ok(finish_psd_save(pending, doc.id, doc.revision));
+    let back = ok(aurora_io::read_psd(&ok(std::fs::read(&path))));
+    let names: Vec<&str> = back
+        .saved_selections
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert_eq!(names, ["Disc", "Sky"]);
+    for (name, sel) in &back.saved_selections {
+        let want = set.saved(name).map(Selection::clone);
+        let want = want.unwrap_or_else(|| unreachable!("{name}"));
+        for y in 0..8 {
+            for x in 0..8 {
+                // An ellipse edge is k/16; the file holds the nearest 8-bit value.
+                let byte = |s: &Selection| (s.coverage_at(x, y) * 255.0).round();
+                assert_eq!(byte(sel), byte(&want), "{name} {x},{y}");
+            }
+        }
+    }
+    // The open path (the background decode) hands them on for the install.
+    let prepared = ok(crate::PreparedPsd::stream(&path, None));
+    let names: Vec<&str> = prepared
+        .selections
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert_eq!(names, ["Disc", "Sky"]);
+    assert!(
+        prepared
+            .report
+            .items
+            .iter()
+            .any(|i| i.contains("alpha channels opened as saved selections")),
+        "{:?}",
+        prepared.report.items
+    );
 }

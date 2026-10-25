@@ -33433,6 +33433,47 @@ impl App {
         true
     }
 
+    /// A PSD's alpha channels, read as saved selections (task 156), become
+    /// the freshly opened document's saved selections, and the autosave the
+    /// install made (which could not hold them yet) is requested again so a
+    /// crash right after the open keeps them. A set the caps refuse (the
+    /// reader keeps within them) is dropped with a log line.
+    fn install_opened_selections(
+        &mut self,
+        selections: Vec<(String, aurora_doc::Selection)>,
+        canvas_size: (u32, u32),
+    ) {
+        if selections.is_empty() {
+            return;
+        }
+        match aurora_doc::SelectionSet::from_parts(None, selections) {
+            Ok(set) => self.doc.selection = set,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "the file's alpha channels were refused as saved selections"
+                );
+                return;
+            }
+        }
+        if let Some(store) = self.doc.tile_store.as_mut() {
+            let own_autosave = self.autosave.session_path(self.doc.id.get());
+            request_autosave_with_colour(
+                &mut self.autosave_worker,
+                &own_autosave,
+                self.doc.id.get(),
+                &self.doc.layers,
+                &self.doc.history,
+                canvas_size,
+                &mut self.doc.skipped_tiles,
+                store,
+                self.doc.import_losses.as_deref(),
+                Some(&self.doc.selection),
+                Some(&self.doc.colour),
+            );
+        }
+    }
+
     /// Opens a Photoshop file (0.144.0): reads and decodes it whole
     /// ([`PreparedPsd::stream`], `aurora_io::read_psd_streaming`) into a real,
     /// multi-layer document with its groups, names, opacity, fill
@@ -33464,6 +33505,7 @@ impl App {
             masks,
             report,
             colour,
+            selections,
             timings,
         } = document;
         self.doc.colour = aurora_io::DocumentColour {
@@ -33486,6 +33528,7 @@ impl App {
             return false;
         };
         report.items.extend(unwritten_layers_item(unwritten));
+        self.install_opened_selections(selections, canvas_size);
         self.announce_colour_open(&colour);
         // Review H-1: kept for a later Photoshop save of this document.
         self.doc.import_losses = (!report.items.is_empty()).then(|| report.items.clone());
@@ -34236,6 +34279,7 @@ impl App {
         // A newer save replaces any pending one (its temp file goes).
         self.pending_psd_save = None;
         let source = psd_save::PsdSaveSource {
+            saved: self.doc.selection.saved_sorted(),
             layers: &self.doc.layers,
             canvas: self.doc.canvas_size,
             store,
@@ -34246,7 +34290,6 @@ impl App {
                     self.doc.import_losses.as_deref(),
                     &self.doc.skipped_tiles,
                 );
-                carried.extend(psd_save::selection_loss_line(&self.doc.selection));
                 carried.extend(psd_save::paths_loss_line(&self.doc.selection));
                 carried.extend(psd_save::colour_loss_lines(&self.doc.colour));
                 carried
@@ -85349,6 +85392,7 @@ mod tests {
             masks: prepared_masks,
             report: _,
             colour: _,
+            selections: _,
             timings: _,
         } = document;
         let started = std::time::Instant::now();
