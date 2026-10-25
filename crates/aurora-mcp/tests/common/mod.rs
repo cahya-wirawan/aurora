@@ -232,6 +232,15 @@ pub async fn start(mock: Mock, read: &[&Path], write: &[&Path]) -> Client {
 }
 
 pub async fn start_with(mock: Mock, read: &[&Path], write: &[&Path], limits: Limits) -> Client {
+    start_session(Box::new(mock), read, write, limits).await
+}
+
+pub async fn start_session(
+    session: Box<dyn Session>,
+    read: &[&Path],
+    write: &[&Path],
+    limits: Limits,
+) -> Client {
     let read: Vec<_> = read.iter().map(|p| p.to_path_buf()).collect();
     let write: Vec<_> = write.iter().map(|p| p.to_path_buf()).collect();
     let roots = Roots::open(&read, &write).unwrap();
@@ -243,7 +252,7 @@ pub async fn start_with(mock: Mock, read: &[&Path], write: &[&Path], limits: Lim
         scratch_parent: None,
     };
     let server = tokio::spawn(aurora_mcp::serve_io(
-        Box::new(mock),
+        session,
         config,
         server_in,
         server_out,
