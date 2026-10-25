@@ -401,6 +401,12 @@ fn the_caps_leave_channels_out_and_say_so() {
         ..Caps::DEFAULT
     });
     assert_eq!((by_bytes.selections.len(), by_bytes.over_caps), (2, 1));
+    // Exactly the cap is kept (two masks of 8 bytes in 16).
+    let exact = outcome(Caps {
+        bytes: 16,
+        ..Caps::DEFAULT
+    });
+    assert_eq!((exact.selections.len(), exact.over_caps), (2, 1));
     let pixels = outcome(Caps {
         pixels: 23,
         ..Caps::DEFAULT
