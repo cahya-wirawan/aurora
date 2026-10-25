@@ -3,7 +3,7 @@
 //! caller may reasonably want different are in [`Limits`].
 
 /// Longest accepted path, in bytes.
-pub const MAX_PATH_BYTES: usize = 4096;
+pub use aurora_automation::MAX_PATH_BYTES;
 /// Longest accepted request line (JSON-RPC message), in bytes.
 pub const MAX_REQUEST_BYTES: usize = 1 << 20;
 /// Longest accepted tool reply text, in bytes.

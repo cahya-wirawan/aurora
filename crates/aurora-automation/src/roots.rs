@@ -28,7 +28,7 @@ use std::path::{Component, Path, PathBuf};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 
-use crate::budgets::MAX_PATH_BYTES;
+use crate::MAX_PATH_BYTES;
 
 /// Why a path was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

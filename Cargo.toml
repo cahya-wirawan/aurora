@@ -27,6 +27,7 @@ authors = ["Cahya Wirawan"]
 aurora-core = { path = "crates/aurora-core" }
 aurora-commands = { path = "crates/aurora-commands" }
 aurora-mcp = { path = "crates/aurora-mcp" }
+aurora-automation = { path = "crates/aurora-automation" }
 aurora-tile = { path = "crates/aurora-tile" }
 aurora-graph = { path = "crates/aurora-graph" }
 aurora-gpu = { path = "crates/aurora-gpu" }
@@ -136,7 +137,10 @@ base64 = "0.22"
 # Safe wrappers over a few syscalls the MCP server needs without `unsafe`
 # (aurora-mcp: O_NONBLOCK, statvfs; aurora-cli: dup/dup2 of stdout). Already in
 # the lock file through cap-std; Unix targets only.
-rustix = { version = "1", default-features = false, features = ["std", "fs", "stdio"] }
+rustix = { version = "1", default-features = false, features = ["std", "fs", "stdio", "process"] }
+# Task 160: the bridge's 256-bit token comes from the operating system's random
+# number generator. Already in the lock file (tempfile and others use it).
+getrandom = "0.3"
 pollster = "1"
 # Default features minus `wayland-csd-adwaita`, plus `wayland-csd-adwaita-crossfont`:
 # the stock feature renders Wayland's fallback window-decoration title text via

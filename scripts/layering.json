@@ -109,7 +109,8 @@
     "aurora-plugin",
     "aurora-theme",
     "aurora-widgets",
-    "aurora-ui"
+    "aurora-ui",
+    "aurora-automation"
   ],
   "aurora-cli": [
     "aurora-core",
@@ -128,9 +129,12 @@
     "aurora-ai",
     "aurora-plugin",
     "aurora-mcp",
-    "aurora-app"
+    "aurora-app",
+    "aurora-automation"
   ],
   "aurora-mcp": [
-    "aurora-commands"
-  ]
+    "aurora-commands",
+    "aurora-automation"
+  ],
+  "aurora-automation": []
 }

@@ -7,7 +7,7 @@
 //! Recognised by content (magic bytes), not by extension, so a file named
 //! `.png` that is really a PSB is checked as a PSB. A `.aur` (a zip) is
 //! checked by the host, which can read its manifest
-//! ([`crate::Session::open`]). A file with no known magic is left to the
+//! (the host's `open`). A file with no known magic is left to the
 //! decoders, which refuse it cheaply.
 
 use std::io::{Read, Seek, SeekFrom};

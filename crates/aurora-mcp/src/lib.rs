@@ -15,9 +15,7 @@
 //! (stderr).
 
 mod budgets;
-pub mod header;
-pub mod roots;
-pub mod scratch;
+pub use aurora_automation::{header, roots, scratch};
 pub mod server;
 pub mod session;
 mod transport;

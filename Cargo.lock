@@ -479,6 +479,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aurora-automation"
+version = "0.294.1"
+dependencies = [
+ "cap-std",
+ "getrandom 0.3.4",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
 name = "aurora-brush"
 version = "0.294.1"
 dependencies = [
@@ -634,6 +648,7 @@ dependencies = [
 name = "aurora-mcp"
 version = "0.294.1"
 dependencies = [
+ "aurora-automation",
  "aurora-commands",
  "base64",
  "cap-std",
