@@ -869,7 +869,7 @@ fn dissolve_is_itemised() {
     let opts = PsdSaveOptions::default();
     assert_eq!(
         psd_save_preflight(&tree, (4, 4), opts),
-        Ok(super::write::PsdWriteReport::default())
+        Ok(super::write_report::PsdWriteReport::default())
     );
     ok(tree.set_blend_mode(a, BlendMode::Dissolve));
     ok(tree.set_blend_mode(b, BlendMode::Dissolve));

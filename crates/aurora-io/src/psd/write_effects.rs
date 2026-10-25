@@ -53,6 +53,7 @@ use aurora_core::gradient_fill::{GradientFill, GradientStyle};
 use aurora_core::pattern::Pattern;
 
 use super::descriptor::{Descriptor, MAX_DEPTH, Value};
+use super::write_report::{ReportCategory, ReportEntry};
 
 /// The most bytes one layer's `lfx2` block may take.
 const MAX_BLOCK_BYTES: usize = 4 << 20;
@@ -377,7 +378,7 @@ impl EffectLosses {
     }
 
     /// The report lines (without the "not checked in Photoshop" one).
-    pub(super) fn items(&self) -> Vec<String> {
+    pub(super) fn items(&self) -> Vec<ReportEntry> {
         let many = |n: usize, one: &str, rest: &str| -> String {
             if n == 1 {
                 format!("1 {one}{rest}")
@@ -392,75 +393,105 @@ impl EffectLosses {
                 format!("{n} {one}s{rest}")
             }
         };
-        let mut items = Vec::new();
+        let mut items: Vec<ReportEntry> = Vec::new();
         if self.contours > 0 {
-            items.push(many(
-                self.contours,
-                "effect",
-                " had a custom contour (saved with the Linear contour).",
+            items.push(ReportEntry::new(
+                ReportCategory::Changed,
+                many(
+                    self.contours,
+                    "effect",
+                    " had a custom contour (saved with the Linear contour).",
+                ),
             ));
         }
         if self.extra_glows > 0 {
-            items.push(many(
-                self.extra_glows,
-                "extra outer glow",
-                " isn't saved (the file holds one per layer).",
+            items.push(ReportEntry::new(
+                ReportCategory::NotSaved,
+                many(
+                    self.extra_glows,
+                    "extra outer glow",
+                    " isn't saved (the file holds one per layer).",
+                ),
             ));
         }
         if self.extra_patterns > 0 {
-            items.push(many(
-                self.extra_patterns,
-                "extra pattern overlay",
-                " isn't saved (the file holds one per layer).",
+            items.push(ReportEntry::new(
+                ReportCategory::NotSaved,
+                many(
+                    self.extra_patterns,
+                    "extra pattern overlay",
+                    " isn't saved (the file holds one per layer).",
+                ),
             ));
         }
         if self.detached_angles > 0 {
-            items.push(many(
+            items.push(ReportEntry::new(
+                ReportCategory::Changed,
+                many(
                 self.detached_angles,
                 "drop shadow",
                 " follows global light at an angle other than the file's; written with its own angle instead.",
+                ),
             ));
         }
         if self.strokes_left_out > 0 {
-            items.push(many(
-                self.strokes_left_out,
-                "gradient or pattern stroke",
-                " that Aurora couldn't draw isn't saved.",
+            items.push(ReportEntry::new(
+                ReportCategory::NotSaved,
+                many(
+                    self.strokes_left_out,
+                    "gradient or pattern stroke",
+                    " that Aurora couldn't draw isn't saved.",
+                ),
             ));
         }
         if self.patterns_missing > 0 {
-            items.push(many(
+            items.push(ReportEntry::new(
+                ReportCategory::NotSaved,
+                many(
                 self.patterns_missing,
                 "pattern effect",
                 " names a pattern the document doesn't hold, or one that can't be saved, and isn't saved.",
+                ),
             ));
         }
         if self.mixed_origins > 0 {
-            items.push(many(
+            items.push(ReportEntry::new(
+                ReportCategory::Changed,
+                many(
                 self.mixed_origins,
                 "layer",
                 " has pattern effects placed differently; the file holds one placement per layer, so they share the first.",
+                ),
             ));
         }
         if self.glows_normalised > 0 {
-            items.push(many(
+            items.push(ReportEntry::new(
+                ReportCategory::Changed,
+                many(
                 self.glows_normalised,
                 "outer glow",
                 " is saved with Photoshop's fixed Range 50 %, Jitter 0 % and anti-aliasing off (Aurora doesn't keep them).",
+                ),
             ));
         }
         if self.paints_normalised > 0 {
-            items.push(many(
+            items.push(ReportEntry::new(
+                ReportCategory::Changed,
+                many(
                 self.paints_normalised,
                 "gradient or pattern effect",
                 " is saved aligned with its layer, with no pattern phase and no stroke dither (Aurora doesn't model other settings).",
+                ),
             ));
         }
         if self.gradients_rounded > 0 {
-            items.push(many(
+            items.push(ReportEntry::new(
+                ReportCategory::Changed,
+                many(
                 self.gradients_rounded,
                 "gradient",
                 " has stop positions or midpoints finer than the file; they are rounded to 1/4096 and 1 %.",
+                ),
             ));
         }
         items

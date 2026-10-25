@@ -193,6 +193,9 @@ mod write_effects;
 #[cfg(test)]
 mod write_effects_tests;
 mod write_pixels;
+mod write_report;
+#[cfg(test)]
+mod write_report_tests;
 #[cfg(test)]
 mod write_tests;
 
@@ -201,9 +204,10 @@ pub use text::PsdTextLayer;
 pub use write::{
     PSD_GROUP_END_NAME, PSD_MAX_NAME_UNITS, PSD_MAX_RECORDS, PsdCompositeSource, PsdExpectation,
     PsdExpectedAdjustment, PsdExpectedAlpha, PsdExpectedLayer, PsdExpectedMask, PsdFormat,
-    PsdRecordKind, PsdSaveOptions, PsdSaveRefusal, PsdWriteOutcome, PsdWriteReport, psd_blend_key,
+    PsdRecordKind, PsdSaveOptions, PsdSaveRefusal, PsdWriteOutcome, psd_blend_key,
     psd_save_preflight, verify_psd_file, write_psd, write_psd_with_selections,
 };
+pub use write_report::{PsdWriteReport, ReportCategory, ReportEntry};
 
 /// The largest canvas side a version-1 PSD file may declare.
 pub const PSD_MAX_EXTENT: u32 = 30_000;

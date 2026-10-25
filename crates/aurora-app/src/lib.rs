@@ -603,6 +603,9 @@ mod paths_app;
 mod paths_undo_tests;
 mod pen;
 mod prepared_pixels;
+mod psd_report;
+#[cfg(test)]
+mod psd_report_tests;
 mod psd_save;
 #[cfg(test)]
 mod psd_save_tests;
