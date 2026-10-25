@@ -55,9 +55,25 @@ fn jpeg_header(w: u16, h: u16) -> Vec<u8> {
 }
 
 fn tiff_header(big_endian: bool, w: u32, h: u32) -> Vec<u8> {
-    let u16b = |v: u16| if big_endian { v.to_be_bytes() } else { v.to_le_bytes() };
-    let u32b = |v: u32| if big_endian { v.to_be_bytes() } else { v.to_le_bytes() };
-    let mut b = if big_endian { b"MM\0*".to_vec() } else { b"II*\0".to_vec() };
+    let u16b = |v: u16| {
+        if big_endian {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        }
+    };
+    let u32b = |v: u32| {
+        if big_endian {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        }
+    };
+    let mut b = if big_endian {
+        b"MM\0*".to_vec()
+    } else {
+        b"II*\0".to_vec()
+    };
     b.extend_from_slice(&u32b(8));
     b.extend_from_slice(&u16b(2));
     for (tag, value) in [(256_u16, w), (257, h)] {
@@ -72,7 +88,11 @@ fn tiff_header(big_endian: bool, w: u32, h: u32) -> Vec<u8> {
 
 #[test]
 fn header_parsing_reads_each_format() {
-    let dims = |bytes: Vec<u8>| header::dimensions(&mut std::io::Cursor::new(bytes)).unwrap().unwrap();
+    let dims = |bytes: Vec<u8>| {
+        header::dimensions(&mut std::io::Cursor::new(bytes))
+            .unwrap()
+            .unwrap()
+    };
     let d = dims(png_header(30_000, 20_000));
     assert_eq!((d.width, d.height, d.format), (30_000, 20_000, "PNG"));
     let d = dims(psd_header(2, 300_000, 300_000));
@@ -85,15 +105,30 @@ fn header_parsing_reads_each_format() {
         assert_eq!((d.width, d.height, d.format), (100_000, 90_000, "TIFF"));
     }
     // unknown content is left to the decoders; cut headers are refused
-    assert!(header::dimensions(&mut std::io::Cursor::new(b"hello".to_vec())).unwrap().is_none());
-    for cut in [b"\x89PNG\r\n\x1a\n\0\0".to_vec(), b"8BPS\0\x02".to_vec(), vec![0xFF, 0xD8, 0xFF], b"II*\0\x08".to_vec()] {
+    assert!(
+        header::dimensions(&mut std::io::Cursor::new(b"hello".to_vec()))
+            .unwrap()
+            .is_none()
+    );
+    for cut in [
+        b"\x89PNG\r\n\x1a\n\0\0".to_vec(),
+        b"8BPS\0\x02".to_vec(),
+        vec![0xFF, 0xD8, 0xFF],
+        b"II*\0\x08".to_vec(),
+    ] {
         assert!(header::dimensions(&mut std::io::Cursor::new(cut)).is_err());
     }
 }
 
 fn peak_rss_kib() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    status.lines().find(|l| l.starts_with("VmHWM:"))?.split_whitespace().nth(1)?.parse().ok()
+    status
+        .lines()
+        .find(|l| l.starts_with("VmHWM:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -126,57 +161,128 @@ async fn hostile_headers_are_refused_fast_before_the_host_is_reached() {
         }
     }
     assert!(started.elapsed() < Duration::from_secs(5), "refused fast");
-    assert!(seen.opened.lock().unwrap().is_empty(), "the host was never reached");
+    assert!(
+        seen.opened.lock().unwrap().is_empty(),
+        "the host was never reached"
+    );
     if let (Some(a), Some(b)) = (before, peak_rss_kib()) {
-        assert!(b.saturating_sub(a) < 200 * 1024, "no allocation from a header number: {a} -> {b} KiB");
+        assert!(
+            b.saturating_sub(a) < 200 * 1024,
+            "no allocation from a header number: {a} -> {b} KiB"
+        );
     }
     // nothing was even staged
-    let staged: Vec<_> = std::fs::read_dir(seen.scratch.lock().unwrap().clone().unwrap().parent().unwrap())
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("open-"))
-        .collect();
+    let staged: Vec<_> = std::fs::read_dir(
+        seen.scratch
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap()
+            .parent()
+            .unwrap(),
+    )
+    .unwrap()
+    .flatten()
+    .filter(|e| e.file_name().to_string_lossy().starts_with("open-"))
+    .collect();
     assert!(staged.is_empty());
     // a modest picture, and the cap as an option
     std::fs::write(r.path().join("ok.png"), png_header(1000, 1000)).unwrap();
     client.ok("doc_open", json!({"path": "ok.png"})).await;
     drop(client);
     let (mock, _) = Mock::new();
-    let mut tight = start_with(mock, &[r.path()], &[], Limits { max_open_pixels: 500_000, ..Limits::default() }).await;
-    assert!(tight.tool_error("doc_open", json!({"path": "ok.png"})).await.contains("at most 0 Mpx"));
+    let mut tight = start_with(
+        mock,
+        &[r.path()],
+        &[],
+        Limits {
+            max_open_pixels: 500_000,
+            ..Limits::default()
+        },
+    )
+    .await;
+    assert!(
+        tight
+            .tool_error("doc_open", json!({"path": "ok.png"}))
+            .await
+            .contains("at most 0 Mpx")
+    );
 }
 
 // ----- responsiveness and the session lock --------------------------------
 
+/// With ONE runtime thread, anything that blocks it (a session lock taken on
+/// an async worker, blocking work outside `spawn_blocking`) freezes the
+/// server AND this client, so the ping below is never answered.
+#[tokio::test(flavor = "current_thread")]
+async fn a_single_runtime_thread_still_serves_ping_and_cancel_during_a_long_preview() {
+    long_preview_stays_responsive().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ping_and_cancel_are_served_while_a_long_preview_holds_the_session() {
+    long_preview_stays_responsive().await;
+}
+
+async fn long_preview_stays_responsive() {
     let (r, _w) = dirs();
     std::fs::write(r.path().join("a.png"), png_header(10, 10)).unwrap();
     let (mut mock, _seen) = Mock::new();
     mock.hang_on_preview = true;
     let mut client = start(mock, &[r.path()], &[]).await;
     client.ok("doc_open", json!({"path": "a.png"})).await;
-    let preview = client.send_request("tools/call", json!({"name": "render_preview", "arguments": {}})).await;
+    let whole = Instant::now();
+    let preview = client
+        .send_request(
+            "tools/call",
+            json!({"name": "render_preview", "arguments": {}}),
+        )
+        .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     // two more calls queue behind the preview; with two runtime workers
     // they must not occupy them
     let mut queued = Vec::new();
     for _ in 0..4 {
-        queued.push(client.send_request("tools/call", json!({"name": "command_run", "arguments": {"id": "layer.new"}})).await);
+        queued.push(
+            client
+                .send_request(
+                    "tools/call",
+                    json!({"name": "command_run", "arguments": {"id": "layer.new"}}),
+                )
+                .await,
+        );
         tokio::time::sleep(Duration::from_millis(60)).await;
     }
     let started = Instant::now();
     let pong = client.request("ping", json!({})).await;
     assert!(pong.get("error").is_none(), "{pong}");
-    assert!(started.elapsed() < Duration::from_secs(1), "ping took {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "ping took {:?}",
+        started.elapsed()
+    );
     // cancel the preview: it must stop, which lets the queued calls run
-    client.notify("notifications/cancelled", json!({"requestId": preview})).await;
+    client
+        .notify("notifications/cancelled", json!({"requestId": preview}))
+        .await;
     let started = Instant::now();
     for id in queued {
         let reply = client.reply(id).await;
         assert_eq!(reply["result"]["isError"], json!(false), "{reply}");
     }
-    assert!(started.elapsed() < Duration::from_secs(5), "the cancel took effect: {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the cancel took effect: {:?}",
+        started.elapsed()
+    );
+    // The mock preview would run for 10 s if nothing cancelled it, and a
+    // blocked runtime thread freezes the client's own sleeps too: the whole
+    // exchange must be short.
+    assert!(
+        whole.elapsed() < Duration::from_secs(4),
+        "the runtime stalled: {:?}",
+        whole.elapsed()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -187,14 +293,27 @@ async fn a_commands_enabled_check_and_run_share_one_lock_hold() {
     let mut client = start(mock, &[r.path()], &[]).await;
     client.ok("doc_open", json!({"path": "a.png"})).await;
     seen.order.lock().unwrap().clear();
-    let a = client.send_request("tools/call", json!({"name": "command_run", "arguments": {"id": "layer.new"}})).await;
-    let b = client.send_request("tools/call", json!({"name": "command_run", "arguments": {"id": "select.all"}})).await;
+    let a = client
+        .send_request(
+            "tools/call",
+            json!({"name": "command_run", "arguments": {"id": "layer.new"}}),
+        )
+        .await;
+    let b = client
+        .send_request(
+            "tools/call",
+            json!({"name": "command_run", "arguments": {"id": "select.all"}}),
+        )
+        .await;
     client.reply(a).await;
     client.reply(b).await;
     let order = seen.order.lock().unwrap().clone();
     assert_eq!(order.len(), 4, "{order:?}");
     assert_eq!(order[0], "check", "{order:?}");
-    assert!(order[1].starts_with("run:"), "a check is followed by its own run: {order:?}");
+    assert!(
+        order[1].starts_with("run:"),
+        "a check is followed by its own run: {order:?}"
+    );
     assert_eq!(order[2], "check", "{order:?}");
     assert!(order[3].starts_with("run:"), "{order:?}");
 }
@@ -214,17 +333,38 @@ async fn a_batch_of_host_commands_is_not_interleaved_by_other_requests() {
         )
         .await;
     tokio::time::sleep(Duration::from_millis(20)).await;
-    let single = client.send_request("tools/call", json!({"name": "command_run", "arguments": {"id": "select.all"}})).await;
+    let single = client
+        .send_request(
+            "tools/call",
+            json!({"name": "command_run", "arguments": {"id": "select.all"}}),
+        )
+        .await;
     let reply = client.reply(batch).await;
     client.reply(single).await;
-    let result: Value = serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let result: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(result["interleaved_by_other_requests"], json!(false));
-    let runs: Vec<String> = seen.order.lock().unwrap().iter().filter(|e| e.starts_with("run:")).cloned().collect();
+    let runs: Vec<String> = seen
+        .order
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.starts_with("run:"))
+        .cloned()
+        .collect();
     assert_eq!(runs.len(), 4);
     let at = runs.iter().position(|e| e == "run:select.all").unwrap();
-    assert!(at == 0 || at == 3, "the single command ran between batch steps: {runs:?}");
+    assert!(
+        at == 0 || at == 3,
+        "the single command ran between batch steps: {runs:?}"
+    );
     // a batch that touches files says it may be interleaved
-    let mixed = client.ok("command_batch", json!({"steps": [{"id": "layer.new"}, {"id": "file.open", "args": {"path": "a.png"}}]})).await;
+    let mixed = client
+        .ok(
+            "command_batch",
+            json!({"steps": [{"id": "layer.new"}, {"id": "file.open", "args": {"path": "a.png"}}]}),
+        )
+        .await;
     assert_eq!(mixed["interleaved_by_other_requests"], json!(true));
 }
 
@@ -239,9 +379,16 @@ async fn two_saves_to_one_target_export_once() {
     let a = client.send_request("tools/call", args.clone()).await;
     let b = client.send_request("tools/call", args).await;
     let (ra, rb) = (client.reply(a).await, client.reply(b).await);
-    let errors = [&ra, &rb].iter().filter(|r| r["result"]["isError"] == json!(true)).count();
+    let errors = [&ra, &rb]
+        .iter()
+        .filter(|r| r["result"]["isError"] == json!(true))
+        .count();
     assert_eq!(errors, 1, "{ra} {rb}");
-    assert_eq!(seen.exports.load(Ordering::SeqCst), 1, "the loser did not run a whole export");
+    assert_eq!(
+        seen.exports.load(Ordering::SeqCst),
+        1,
+        "the loser did not run a whole export"
+    );
 }
 
 // ----- export size, disk space, scratch -----------------------------------
@@ -252,12 +399,26 @@ async fn an_export_is_stopped_while_it_is_written_when_it_outgrows_the_limit() {
     std::fs::write(r.path().join("a.png"), png_header(10, 10)).unwrap();
     let (mut mock, seen) = Mock::new();
     mock.slow_big_export = true;
-    let mut client = start_with(mock, &[r.path()], &[w.path()], Limits { max_export_bytes: 256 * 1024, ..Limits::default() }).await;
+    let mut client = start_with(
+        mock,
+        &[r.path()],
+        &[w.path()],
+        Limits {
+            max_export_bytes: 256 * 1024,
+            ..Limits::default()
+        },
+    )
+    .await;
     client.ok("doc_open", json!({"path": "a.png"})).await;
-    let message = client.tool_error("doc_save", json!({"path": "big.png"})).await;
+    let message = client
+        .tool_error("doc_save", json!({"path": "big.png"}))
+        .await;
     assert!(message.contains("larger than the limit"), "{message}");
     let chunks = seen.written_chunks.load(Ordering::SeqCst);
-    assert!(chunks < 100, "the writer was stopped early, not after all 200 chunks (wrote {chunks})");
+    assert!(
+        chunks < 100,
+        "the writer was stopped early, not after all 200 chunks (wrote {chunks})"
+    );
     assert!(!w.path().join("big.png").exists());
     let scratch = seen.scratch.lock().unwrap().clone().unwrap();
     let left: Vec<_> = std::fs::read_dir(scratch.parent().unwrap())
@@ -275,12 +436,21 @@ async fn an_export_that_cannot_fit_on_the_scratch_disk_is_refused_before_it_star
     std::fs::write(r.path().join("a.png"), png_header(10, 10)).unwrap();
     let (mut mock, seen) = Mock::new();
     mock.estimate = Some(1 << 60);
-    let limits = Limits { max_export_bytes: 1 << 60, ..Limits::default() };
+    let limits = Limits {
+        max_export_bytes: 1 << 60,
+        ..Limits::default()
+    };
     let mut client = start_with(mock, &[r.path()], &[w.path()], limits).await;
     client.ok("doc_open", json!({"path": "a.png"})).await;
-    let message = client.tool_error("doc_save", json!({"path": "x.png"})).await;
+    let message = client
+        .tool_error("doc_save", json!({"path": "x.png"}))
+        .await;
     assert!(message.contains("scratch disk"), "{message}");
-    assert_eq!(seen.exports.load(Ordering::SeqCst), 0, "refused before the export ran");
+    assert_eq!(
+        seen.exports.load(Ordering::SeqCst),
+        0,
+        "refused before the export ran"
+    );
 }
 
 #[cfg(unix)]
@@ -294,8 +464,17 @@ async fn scratch_is_private_whatever_the_umask() {
     let roots = Roots::open(&[r.path().to_path_buf()], &[]).unwrap();
     let (c2s, server_in) = tokio::io::duplex(1 << 16);
     let (server_out, _from) = tokio::io::duplex(1 << 16);
-    let config = aurora_mcp::Config { roots, limits: Limits::default(), scratch_parent: Some(parent.path().to_path_buf()) };
-    let _server = tokio::spawn(aurora_mcp::serve_io(Box::new(mock), config, server_in, server_out));
+    let config = aurora_mcp::Config {
+        roots,
+        limits: Limits::default(),
+        scratch_parent: Some(parent.path().to_path_buf()),
+    };
+    let _server = tokio::spawn(aurora_mcp::serve_io(
+        Box::new(mock),
+        config,
+        server_in,
+        server_out,
+    ));
     let _keep = c2s;
     // wait for startup to hand the host its directory
     let t = Instant::now();
@@ -307,7 +486,11 @@ async fn scratch_is_private_whatever_the_umask() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
     let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode(host.parent().unwrap()), 0o700, "the server's scratch directory");
+    assert_eq!(
+        mode(host.parent().unwrap()),
+        0o700,
+        "the server's scratch directory"
+    );
     assert_eq!(mode(&host), 0o700, "the host's directory");
 }
 
@@ -342,7 +525,8 @@ fn a_dead_servers_scratch_is_swept_and_a_live_ones_is_not() {
     let precious = tempfile::tempdir().unwrap();
     std::fs::write(precious.path().join("keep"), b"x").unwrap();
     #[cfg(unix)]
-    std::os::unix::fs::symlink(precious.path(), parent.path().join(format!("{PREFIX}link"))).unwrap();
+    std::os::unix::fs::symlink(precious.path(), parent.path().join(format!("{PREFIX}link")))
+        .unwrap();
     // a live server
     let live = Scratch::create(Some(parent.path())).unwrap();
     assert!(!dead.exists(), "the dead server's directory was swept");
@@ -376,7 +560,12 @@ async fn a_non_utf8_line_is_32700_and_the_session_continues() {
 async fn invalid_requests_get_32600_with_an_id_field() {
     let (mock, _) = Mock::new();
     let mut client = start(mock, &[], &[]).await;
-    for line in ["[]", "42", "\"x\"", "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}]"] {
+    for line in [
+        "[]",
+        "42",
+        "\"x\"",
+        "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}]",
+    ] {
         client.send_raw(line).await;
         let reply = client.next_message().await;
         assert_eq!(reply["error"]["code"], json!(-32600), "{line}: {reply}");
@@ -385,8 +574,17 @@ async fn invalid_requests_get_32600_with_an_id_field() {
     }
     client.send_raw("{\"jsonrpc\":\"2.0\",\"id\":77}").await;
     let reply = client.next_message().await;
-    assert_eq!((reply["error"]["code"].as_i64(), reply["id"].as_i64()), (Some(-32600), Some(77)));
-    assert!(client.request("ping", json!({})).await.get("error").is_none());
+    assert_eq!(
+        (reply["error"]["code"].as_i64(), reply["id"].as_i64()),
+        (Some(-32600), Some(77))
+    );
+    assert!(
+        client
+            .request("ping", json!({}))
+            .await
+            .get("error")
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -397,17 +595,35 @@ async fn a_request_id_already_in_flight_is_rejected_not_lost() {
     mock.hang_on_preview = true;
     let mut client = start(mock, &[r.path()], &[]).await;
     client.ok("doc_open", json!({"path": "a.png"})).await;
-    let call = |id: i64| json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "render_preview", "arguments": {}}}).to_string();
+    let call = |id: i64| {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "render_preview", "arguments": {}}}).to_string()
+    };
     client.send_raw(&call(900)).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     client.send_raw(&call(900)).await;
     let reply = client.next_message().await;
-    assert_eq!((reply["error"]["code"].as_i64(), reply["id"].as_i64()), (Some(-32600), Some(900)), "{reply}");
-    assert!(reply["error"]["message"].as_str().unwrap().contains("in flight"));
+    assert_eq!(
+        (reply["error"]["code"].as_i64(), reply["id"].as_i64()),
+        (Some(-32600), Some(900)),
+        "{reply}"
+    );
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("in flight")
+    );
     // the original is still running and can be cancelled; its id is then free
-    client.notify("notifications/cancelled", json!({"requestId": 900})).await;
+    client
+        .notify("notifications/cancelled", json!({"requestId": 900}))
+        .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let id = client.send_request("tools/call", json!({"name": "doc_inspect", "arguments": {}})).await;
+    let id = client
+        .send_request(
+            "tools/call",
+            json!({"name": "doc_inspect", "arguments": {}}),
+        )
+        .await;
     assert!(client.reply(id).await.get("error").is_none());
 }
 
@@ -417,11 +633,17 @@ async fn an_oversized_progress_token_is_refused() {
     let mut client = start(mock, &[], &[]).await;
     let long = "t".repeat(300);
     let reply = client
-        .request("tools/call", json!({"name": "doc_inspect", "arguments": {}, "_meta": {"progressToken": long}}))
+        .request(
+            "tools/call",
+            json!({"name": "doc_inspect", "arguments": {}, "_meta": {"progressToken": long}}),
+        )
         .await;
     assert_eq!(reply["error"]["code"], json!(-32602), "{reply}");
     let ok = client
-        .request("tools/call", json!({"name": "doc_inspect", "arguments": {}, "_meta": {"progressToken": "fine"}}))
+        .request(
+            "tools/call",
+            json!({"name": "doc_inspect", "arguments": {}, "_meta": {"progressToken": "fine"}}),
+        )
         .await;
     assert!(ok.get("error").is_none(), "{ok}");
 }
@@ -433,10 +655,19 @@ async fn an_oversized_progress_token_is_refused() {
 fn a_fifo_is_refused_without_blocking() {
     let d = tempfile::tempdir().unwrap();
     let fifo = d.path().join("pipe.png");
-    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
     let roots = Roots::open(&[d.path().to_path_buf()], &[]).unwrap();
     let started = Instant::now();
-    assert_eq!(roots.open_read("pipe.png", 100).unwrap_err(), PathError::NotAFile);
+    assert_eq!(
+        roots.open_read("pipe.png", 100).unwrap_err(),
+        PathError::NotAFile
+    );
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
@@ -450,7 +681,10 @@ fn a_dropped_write_target_removes_only_the_file_it_created() {
     std::fs::remove_file(d.path().join("mine.bin")).unwrap();
     std::fs::write(d.path().join("mine.bin"), b"SOMEONE ELSES").unwrap();
     drop(target);
-    assert_eq!(std::fs::read(d.path().join("mine.bin")).unwrap(), b"SOMEONE ELSES");
+    assert_eq!(
+        std::fs::read(d.path().join("mine.bin")).unwrap(),
+        b"SOMEONE ELSES"
+    );
     // and the ordinary case still cleans up
     let target = roots.create_write("plain.bin").unwrap();
     drop(target);

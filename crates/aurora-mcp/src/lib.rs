@@ -16,8 +16,8 @@
 
 mod budgets;
 pub mod header;
-pub mod scratch;
 pub mod roots;
+pub mod scratch;
 pub mod server;
 pub mod session;
 mod transport;

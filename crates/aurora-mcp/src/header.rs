@@ -62,7 +62,7 @@ fn read_exact_at<R: Read + Seek>(r: &mut R, at: u64, len: usize) -> std::io::Res
     Ok(buf)
 }
 
-/// Reads the dimensions a PNG, JPEG, TIFF, BigTIFF, PSD or PSB header
+/// Reads the dimensions a PNG, JPEG, TIFF, `BigTIFF`, PSD or PSB header
 /// declares. `Ok(None)`: no recognised magic. `Err`: recognised but the
 /// header is cut or inconsistent (refuse it).
 ///

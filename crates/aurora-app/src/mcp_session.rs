@@ -156,6 +156,9 @@ impl std::fmt::Debug for HeadlessSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HeadlessSession")
             .field("open", &self.doc.is_some())
+            .field("limits", &self.limits)
+            .field("scratch_dir", &self.scratch_dir)
+            .field("preview_cached", &self.preview_cache.is_some())
             .finish()
     }
 }
@@ -330,14 +333,13 @@ impl HeadlessSession {
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("Image")
             .to_owned();
-        let decoded = crate::decode_chosen_file_with(staged, Some(&staging))
-            .map_err(|e| {
-                let extension = Path::new(name)
-                    .extension()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .unwrap_or("");
-                Failure::Refused(crate::open_failure_message(name, extension, &e))
-            })?;
+        let decoded = crate::decode_chosen_file_with(staged, Some(&staging)).map_err(|e| {
+            let extension = Path::new(name)
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("");
+            Failure::Refused(crate::open_failure_message(name, extension, &e))
+        })?;
         let mut notes: Vec<String> = Vec::new();
         let mut import_losses: Vec<String> = Vec::new();
         let mut skipped = aurora_io::SkippedTiles::default();
@@ -402,9 +404,7 @@ impl HeadlessSession {
             }
             DecodedFile::Aur(bytes) => {
                 let document = crate::read_prechecked_aur(&bytes, &mut store)
-                    .map_err(|e| {
-                        Failure::Refused(crate::open_failure_message(name, "aur", &e))
-                    })?;
+                    .map_err(|e| Failure::Refused(crate::open_failure_message(name, "aur", &e)))?;
                 if let Some(losses) = document.import_losses {
                     notes.extend(losses.iter().cloned());
                     import_losses = losses;
@@ -465,8 +465,9 @@ impl HeadlessSession {
         if file.read_exact(&mut magic).is_err() || &magic != b"PK\x03\x04" {
             return Ok(());
         }
-        let (width, height) = aurora_io::peek_aur_canvas_size(file)
-            .map_err(|e| Failure::Refused(format!("this is not a readable Aurora document ({e})")))?;
+        let (width, height) = aurora_io::peek_aur_canvas_size(file).map_err(|e| {
+            Failure::Refused(format!("this is not a readable Aurora document ({e})"))
+        })?;
         let pixels = u64::from(width) * u64::from(height);
         if width == 0 || height == 0 || pixels > max_pixels {
             return Err(Failure::Refused(format!(
@@ -556,8 +557,8 @@ impl HeadlessSession {
         if self.doc.is_none() {
             return Err(Failure::NoDocument);
         }
-        if let Err(reason) = aurora_commands::Registry::builtin()
-            .check_enabled(id, &self.command_context())
+        if let Err(reason) =
+            aurora_commands::Registry::builtin().check_enabled(id, &self.command_context())
         {
             return Err(Failure::Refused(format!("`{id}` is not enabled: {reason}")));
         }
@@ -888,7 +889,8 @@ impl HeadlessSession {
         let doc = self.doc_mut()?;
         match kind {
             ExportKind::Png | ExportKind::Jpeg | ExportKind::Tiff => {
-                let image = Self::composite(doc, max_pixels, cancelled, &mut |f| progress(f * 0.8))?;
+                let image =
+                    Self::composite(doc, max_pixels, cancelled, &mut |f| progress(f * 0.8))?;
                 let image = match crate::colour_app::export_image(image, None) {
                     Ok(image) | Err(image) => image,
                 };

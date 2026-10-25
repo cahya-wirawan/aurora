@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 pub const PREFIX: &str = "aurora-mcp-";
 const LOCK_FILE: &str = ".lock";
 /// A directory without a lock file this young is a server still starting.
-const GRACE: Duration = Duration::from_secs(60);
+const GRACE: Duration = Duration::from_mins(1);
 
 /// A locked, private scratch directory.
 #[derive(Debug)]
@@ -35,7 +35,7 @@ impl Scratch {
     /// The directory or its lock file could not be created.
     pub fn create(parent: Option<&Path>) -> io::Result<Self> {
         let parent: PathBuf = parent.map_or_else(std::env::temp_dir, Path::to_path_buf);
-        sweep_stale(&parent);
+        let _ = sweep_stale(&parent);
         let mut builder = tempfile::Builder::new();
         builder.prefix(PREFIX);
         #[cfg(unix)]
@@ -62,6 +62,7 @@ impl Scratch {
 
 /// Removes scratch directories in `parent` whose owner is gone. Returns how
 /// many it removed. Never touches a directory whose lock is held.
+#[must_use]
 pub fn sweep_stale(parent: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return 0;
@@ -80,7 +81,11 @@ pub fn sweep_stale(parent: &Path) -> usize {
         if !meta.is_dir() {
             continue;
         }
-        let stale = match File::options().read(true).write(true).open(path.join(LOCK_FILE)) {
+        let stale = match File::options()
+            .read(true)
+            .write(true)
+            .open(path.join(LOCK_FILE))
+        {
             Ok(lock) => lock.try_lock().is_ok(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => meta
                 .modified()

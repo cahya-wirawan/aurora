@@ -39,7 +39,7 @@ impl McpOptions {
     }
 }
 
-fn number(flag: &str, text: String) -> Result<u64, String> {
+fn number(flag: &str, text: &str) -> Result<u64, String> {
     text.parse::<u64>()
         .ok()
         .filter(|n| (1..=1_000_000).contains(n))
@@ -74,8 +74,8 @@ pub fn parse(args: &[String]) -> Result<McpOptions, String> {
                         })?,
                 );
             }
-            "--max-open-mpx" => options.max_open_mpx = Some(number(&arg, value()?)?),
-            "--max-export-mb" => options.max_export_mb = Some(number(&arg, value()?)?),
+            "--max-open-mpx" => options.max_open_mpx = Some(number(arg, &value()?)?),
+            "--max-export-mb" => options.max_export_mb = Some(number(arg, &value()?)?),
             "-h" | "--help" => return Err(USAGE.to_owned()),
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }

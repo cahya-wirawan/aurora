@@ -493,15 +493,29 @@ async fn size_bombs_are_refused_quickly_with_bounded_memory() {
     for (name, _) in &files {
         let message = c.err("doc_open", json!({"path": name})).await;
         assert!(!message.is_empty(), "{name}");
-        assert!(!message.contains("FormatError {"), "{name}: plain words, not Debug text: {message}");
+        assert!(
+            !message.contains("FormatError {"),
+            "{name}: plain words, not Debug text: {message}"
+        );
     }
-    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
     let high_water = std::fs::read_to_string("/proc/self/status")
         .ok()
-        .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:")).map(str::to_owned));
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM:"))
+                .map(str::to_owned)
+        });
     if let Some(line) = high_water {
         let kib: u64 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
-        assert!(kib < 4 * 1024 * 1024, "the test process stayed under 4 GiB: {line}");
+        assert!(
+            kib < 4 * 1024 * 1024,
+            "the test process stayed under 4 GiB: {line}"
+        );
     }
     // the session still works afterwards
     write_png(&dir.path().join("a.png"), 8, 8);
@@ -525,7 +539,10 @@ async fn a_hostile_png_header_is_refused_before_the_real_open_path() {
     assert!(message.contains("--max-open-mpx"), "{message}");
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
     // the document was never replaced
-    assert_eq!(c.ok("doc_inspect", json!({})).await["document"], json!(null));
+    assert_eq!(
+        c.ok("doc_inspect", json!({})).await["document"],
+        json!(null)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -535,12 +552,29 @@ async fn an_aur_manifest_declaring_too_many_pixels_is_refused_by_the_host() {
     let roots = Roots::open(&[dir.path().to_path_buf()], &[]).unwrap();
     let (to_server, server_in) = tokio::io::duplex(1 << 20);
     let (server_out, from_server) = tokio::io::duplex(1 << 22);
-    let limits = Limits { max_open_pixels: 4, ..Limits::default() };
-    let config = Config { roots, limits, scratch_parent: None };
-    tokio::spawn(aurora_mcp::serve_io(Box::new(AppHost::with_limits(&limits)), config, server_in, server_out));
-    let mut c = Client { to_server, lines: BufReader::new(from_server).lines(), next_id: 1 };
+    let limits = Limits {
+        max_open_pixels: 4,
+        ..Limits::default()
+    };
+    let config = Config {
+        roots,
+        limits,
+        scratch_parent: None,
+    };
+    tokio::spawn(aurora_mcp::serve_io(
+        Box::new(AppHost::with_limits(&limits)),
+        config,
+        server_in,
+        server_out,
+    ));
+    let mut c = Client {
+        to_server,
+        lines: BufReader::new(from_server).lines(),
+        next_id: 1,
+    };
     c.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}})).await;
-    c.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
+    c.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        .await;
     let message = c.err("doc_open", json!({"path": "rich.aur"})).await;
     assert!(message.contains("manifest declares"), "{message}");
 }
@@ -553,15 +587,41 @@ async fn the_scratch_dir_option_holds_the_document_store_and_staging() {
     let roots = Roots::open(&[dir.path().to_path_buf()], &[]).unwrap();
     let (to_server, server_in) = tokio::io::duplex(1 << 20);
     let (server_out, from_server) = tokio::io::duplex(1 << 22);
-    let config = Config { roots, limits: Limits::default(), scratch_parent: Some(scratch.path().to_path_buf()) };
-    tokio::spawn(aurora_mcp::serve_io(Box::new(AppHost::new()), config, server_in, server_out));
-    let mut c = Client { to_server, lines: BufReader::new(from_server).lines(), next_id: 1 };
+    let config = Config {
+        roots,
+        limits: Limits::default(),
+        scratch_parent: Some(scratch.path().to_path_buf()),
+    };
+    tokio::spawn(aurora_mcp::serve_io(
+        Box::new(AppHost::new()),
+        config,
+        server_in,
+        server_out,
+    ));
+    let mut c = Client {
+        to_server,
+        lines: BufReader::new(from_server).lines(),
+        next_id: 1,
+    };
     c.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}})).await;
-    c.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
+    c.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        .await;
     c.ok("doc_open", json!({"path": "a.png"})).await;
-    let server_dir = std::fs::read_dir(scratch.path()).unwrap().flatten().next().expect("a scratch dir").path();
-    let host_docs: Vec<_> = std::fs::read_dir(server_dir.join("host")).unwrap().flatten().collect();
-    assert_eq!(host_docs.len(), 1, "the document's tile store lives under --scratch-dir");
+    let server_dir = std::fs::read_dir(scratch.path())
+        .unwrap()
+        .flatten()
+        .next()
+        .expect("a scratch dir")
+        .path();
+    let host_docs: Vec<_> = std::fs::read_dir(server_dir.join("host"))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(
+        host_docs.len(),
+        1,
+        "the document's tile store lives under --scratch-dir"
+    );
 }
 
 #[test]
@@ -583,16 +643,28 @@ fn a_stray_println_does_not_reach_the_protocol() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
     let output = child.wait_with_output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(!stdout.contains("stray output"), "the protocol stream was polluted: {stdout}");
+    assert!(
+        !stdout.contains("stray output"),
+        "the protocol stream was polluted: {stdout}"
+    );
     for line in stdout.lines() {
-        let value: Value = serde_json::from_str(line).unwrap_or_else(|_| panic!("not JSON: {line}"));
+        let value: Value =
+            serde_json::from_str(line).unwrap_or_else(|_| panic!("not JSON: {line}"));
         assert_eq!(value["jsonrpc"], json!("2.0"));
     }
     assert!(stdout.lines().count() >= 2);
     #[cfg(unix)]
-    assert!(stderr.contains("stray output"), "the stray line went to stderr: {stderr}");
+    assert!(
+        stderr.contains("stray output"),
+        "the stray line went to stderr: {stderr}"
+    );
 }

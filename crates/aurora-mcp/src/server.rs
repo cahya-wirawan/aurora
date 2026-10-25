@@ -348,7 +348,10 @@ fn dir_bytes(dir: &Path) -> u64 {
 /// One step's entry in a batch reply.
 fn step_entry(index: usize, id: &str, outcome: Result<Value, Fail>) -> (Value, bool) {
     match outcome {
-        Ok(result) => (json!({"step": index, "id": id, "ok": true, "result": result}), true),
+        Ok(result) => (
+            json!({"step": index, "id": id, "ok": true, "result": result}),
+            true,
+        ),
         Err(Fail::Tool(message)) => (
             json!({"step": index, "id": id, "ok": false, "error": message}),
             false,
@@ -363,7 +366,10 @@ fn run_host_command(session: &mut dyn Session, call: &Validated) -> Result<Value
         return Err(SessionError::NoDocument.into());
     }
     if let Err(reason) = Registry::builtin().check_enabled(&call.id, &session.command_context()) {
-        return Err(Fail::Tool(format!("`{}` is not enabled: {reason}", call.id)));
+        return Err(Fail::Tool(format!(
+            "`{}` is not enabled: {reason}",
+            call.id
+        )));
     }
     Ok(session.run_command(call)?)
 }
@@ -572,7 +578,12 @@ impl AuroraMcp {
         }
         let limits = self.inner.limits;
         // One private directory per export; the size monitor watches it.
-        let dir = ScratchDir(self.inner.scratch.path().join(format!("export-{}", self.next_counter())));
+        let dir = ScratchDir(
+            self.inner
+                .scratch
+                .path()
+                .join(format!("export-{}", self.next_counter())),
+        );
         private_dir(&dir.0).map_err(|e| Fail::Tool(format!("scratch directory: {e}")))?;
         let out = dir.0.join(format!("out.{}", format.extension()));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
@@ -919,7 +930,9 @@ impl AuroraMcp {
         }
         let stop = p.stop_on_error.unwrap_or(true);
         let total = calls.len();
-        let all_host = calls.iter().all(|c| !SERVER_COMMANDS.contains(&c.id.as_str()));
+        let all_host = calls
+            .iter()
+            .all(|c| !SERVER_COMMANDS.contains(&c.id.as_str()));
         let mut results: Vec<Value> = Vec::new();
         let mut failed = 0_usize;
         let mut budget = 0_usize;

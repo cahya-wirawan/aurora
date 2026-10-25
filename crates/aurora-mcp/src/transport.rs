@@ -175,7 +175,11 @@ impl Pumps {
                 let line = match read {
                     Line::Text(line) => line,
                     Line::NotUtf8 => {
-                        if errors.send(parse_error("the line is not valid UTF-8")).await.is_err() {
+                        if errors
+                            .send(parse_error("the line is not valid UTF-8"))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                         continue;

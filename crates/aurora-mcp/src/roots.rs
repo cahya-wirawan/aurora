@@ -155,12 +155,14 @@ pub struct WriteTarget {
 }
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // the non-Unix twin has no identity
 fn identity_of(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
     Some((meta.dev(), meta.ino()))
 }
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // the non-Unix twin has no identity
 fn cap_identity_of(meta: &cap_std::fs::Metadata) -> Option<(u64, u64)> {
     use cap_std::fs::MetadataExt as _;
     Some((meta.dev(), meta.ino()))

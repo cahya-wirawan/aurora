@@ -3909,10 +3909,6 @@ fn roll_back_committed_tiles(
     );
 }
 
-/// Reads one required entry's whole contents, or
-/// [`IoError::MissingEntry`] if it isn't present at all — [`read`]'s own
-/// shared "the manifest/history entries are not optional" step. Capped
-/// at [`MAX_METADATA_ENTRY_BYTES`] ([`read_capped`]).
 /// The canvas size an `.aur` file's manifest declares, read without
 /// decoding the layer tree or any tile: the cheap check a host makes
 /// before it commits memory to opening an untrusted file (the MCP server's
@@ -3944,6 +3940,10 @@ pub fn peek_canvas_size<R: Read + Seek>(reader: R) -> Result<(u32, u32), IoError
     Ok((head.canvas_width, head.canvas_height))
 }
 
+/// Reads one required entry's whole contents, or
+/// [`IoError::MissingEntry`] if it isn't present at all — [`read`]'s own
+/// shared "the manifest/history entries are not optional" step. Capped
+/// at [`MAX_METADATA_ENTRY_BYTES`] ([`read_capped`]).
 fn read_entry<R: Read + Seek>(
     zip: &mut ZipArchive<R>,
     name: &'static str,

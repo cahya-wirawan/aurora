@@ -2,6 +2,7 @@
 
 #![allow(
     dead_code,
+    clippy::struct_excessive_bools,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
@@ -73,7 +74,13 @@ impl Session for Mock {
     fn set_scratch_dir(&mut self, dir: &Path) {
         *self.seen.scratch.lock().unwrap() = Some(dir.to_path_buf());
     }
-    fn open(&mut self, staged: &Path, name: &str, _: u64, _: &Cancel) -> Result<Value, SessionError> {
+    fn open(
+        &mut self,
+        staged: &Path,
+        name: &str,
+        _: u64,
+        _: &Cancel,
+    ) -> Result<Value, SessionError> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -103,7 +110,10 @@ impl Session for Mock {
         self.seen.order.lock().unwrap().push("check".into());
         // A window for another request to slip in, if the lock were released.
         std::thread::sleep(std::time::Duration::from_millis(40));
-        CommandContext { can_undo: self.can_undo, ..CommandContext::default() }
+        CommandContext {
+            can_undo: self.can_undo,
+            ..CommandContext::default()
+        }
     }
     fn export_estimate(&mut self, _: ExportFormat) -> Option<u64> {
         self.estimate
@@ -119,7 +129,11 @@ impl Session for Mock {
     }
     fn run_command(&mut self, call: &Validated) -> Result<Value, SessionError> {
         self.seen.commands.lock().unwrap().push(call.id.clone());
-        self.seen.order.lock().unwrap().push(format!("run:{}", call.id));
+        self.seen
+            .order
+            .lock()
+            .unwrap()
+            .push(format!("run:{}", call.id));
         std::thread::sleep(std::time::Duration::from_millis(40));
         if call.id == "layer.new" || call.id == "select.all" {
             Ok(json!({"changed": true}))
@@ -177,7 +191,7 @@ impl Session for Mock {
                 if cancel.is_cancelled() {
                     return Err(SessionError::Cancelled);
                 }
-                file.write_all(&[7_u8; 64 * 1024]).unwrap();
+                file.write_all(&vec![7_u8; 64 * 1024]).unwrap();
                 file.flush().unwrap();
                 self.seen.written_chunks.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(15));
