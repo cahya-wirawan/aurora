@@ -155,7 +155,9 @@ decoding; a decode in progress finishes.
   a prior check. Control characters and paths over 4096 bytes are refused.
 * **Headers are read before pixels.** The size a PNG, JPEG, TIFF, BigTIFF,
   PSD, PSB or `.aur` header declares is checked against `--max-open-mpx`
-  before the file is copied or decoded (by content, not by extension: a PSB
+  before the file is copied or decoded, and checked again on the private copy
+  that the decoder will open, so a file modified in place between the check and
+  the copy cannot slip past the cap (by content, not by extension: a PSB
   called `.png` is checked as a PSB). A hostile 3.5 MB PNG that says 30000 x
   30000 is refused in milliseconds without allocating; a file with a cut or
   inconsistent header is refused. The `.aur` manifest is read by the app's
@@ -172,10 +174,17 @@ decoding; a decode in progress finishes.
   the open itself is non-blocking, so a name swapped for a FIFO between the
   check and the open cannot hang the server).
 * **Scratch is private and tidy.** The scratch directory is `0700`, its files
-  `0600`, whatever the umask. It is locked for the life of the process and
-  removed on exit; a `kill -9` leaves it, and the next server started in the
-  same parent directory removes such leftovers (a directory is removed only
-  if its lock can be taken, so a running server's is never touched).
+  `0600`, whatever the umask. Its name is `aurora-mcp-` plus exactly eight
+  random characters, it holds a marker file (`.aurora-mcp-scratch`) and a lock
+  file held for the life of the process, and it is removed on exit. A
+  `kill -9` leaves it; the next server started in the same parent directory
+  removes such leftovers, but **only** a real directory (a symbolic link is
+  never followed) with exactly that name shape, with the marker file, whose
+  lock file exists and can be taken. Anything else is left alone: a person's
+  own `aurora-mcp-notes/`, a directory without the marker, a marked directory
+  whose lock file is missing (it may be a live server whose lock a temp cleaner
+  removed). There is no age-based cleanup, so such a directory is never
+  reclaimed automatically.
 * **Writes create, never replace.** See `doc_save`. A failed save removes
   only the file it created: if the name was meanwhile replaced by a different
   file (device and inode compared, Unix), that file is left alone.
@@ -208,6 +217,13 @@ decoding; a decode in progress finishes.
 * One document per session; `doc_open` replaces it.
 * Requests sent without waiting for replies may run out of order (see
   Concurrency). Wait for each reply (every real client does).
+* Memory: a preview or a PNG/JPEG/TIFF export composites the whole document
+  into one f16 RGBA buffer, **8 bytes a pixel** (800 MB at 100 Mpx), plus
+  conversion and encode copies on top (the 8-bit dithered image, the encoded
+  bytes, and the verification re-decode of an export), so budget several times
+  that for an export at the cap; a PSD or `.aur` export streams from the tile
+  store instead. Opening costs about 12 bytes a pixel (measured). Lower
+  `--max-open-mpx` on a small machine.
 * The preview composites the whole document on the CPU (one thread) and
   downsamples it: a 24 Mpx document takes seconds. The last preview is cached
   by document revision and size, so asking again for the same size of an

@@ -268,6 +268,13 @@ pub async fn start_with(mock: Mock, read: &[&Path], write: &[&Path], limits: Lim
 }
 
 impl Client {
+    /// Like `send_raw`, but a write the server cut short (it ended the
+    /// session on an oversized line) is not an error.
+    pub async fn send_raw_lossy(&mut self, line: &str) {
+        let _ = self.to_server.write_all(line.as_bytes()).await;
+        let _ = self.to_server.write_all(b"\n").await;
+    }
+
     pub async fn send_raw(&mut self, line: &str) {
         self.to_server.write_all(line.as_bytes()).await.unwrap();
         self.to_server.write_all(b"\n").await.unwrap();

@@ -676,7 +676,7 @@ async fn an_oversized_request_ends_the_session_and_never_runs() {
     let mut client = start(mock, &[r.path()], &[]).await;
     let big = "a".repeat(aurora_mcp::MAX_REQUEST_BYTES + 10);
     client
-        .send_raw(&format!(
+        .send_raw_lossy(&format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{{\"name\":\"doc_open\",\"arguments\":{{\"path\":\"{big}\"}}}}}}"
         ))
         .await;
