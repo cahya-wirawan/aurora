@@ -438,6 +438,7 @@ dependencies = [
  "aurora-ai",
  "aurora-brush",
  "aurora-color",
+ "aurora-commands",
  "aurora-core",
  "aurora-doc",
  "aurora-filters",
@@ -514,6 +515,15 @@ dependencies = [
  "lcms2",
  "thiserror 2.0.19",
  "tracing",
+]
+
+[[package]]
+name = "aurora-commands"
+version = "0.292.0"
+dependencies = [
+ "postcard",
+ "serde",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

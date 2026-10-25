@@ -38,6 +38,7 @@ use crate::{FocusManager, LockRefusal, WidgetId, command_palette_style};
 pub(crate) const COMMAND_ID: &str = "select.colour_range";
 
 /// The palette and menu title ("…": it asks for a number).
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) const COMMAND_TITLE: &str = "Select Colour Range\u{2026}";
 
 /// The History row of the step (New mode).

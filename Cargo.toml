@@ -25,6 +25,7 @@ authors = ["Cahya Wirawan"]
 # Internal crates. Layering is enforced by scripts/check_layering.py — adding a
 # dependency here does not make it legal, see docs/adr and PRD §7.2.
 aurora-core = { path = "crates/aurora-core" }
+aurora-commands = { path = "crates/aurora-commands" }
 aurora-tile = { path = "crates/aurora-tile" }
 aurora-graph = { path = "crates/aurora-graph" }
 aurora-gpu = { path = "crates/aurora-gpu" }

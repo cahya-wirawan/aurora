@@ -17,6 +17,7 @@ workspace = true
 
 [dependencies]
 aurora-core = { workspace = true }
+aurora-commands = { workspace = true }
 aurora-tile = { workspace = true }
 aurora-graph = { workspace = true }
 aurora-gpu = { workspace = true }

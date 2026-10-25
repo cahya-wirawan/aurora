@@ -246,6 +246,7 @@ pub(crate) fn step_label(mode: SelectionMode, tool_label: &'static str) -> &'sta
 }
 
 /// The palette's row for choosing a mode.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) const fn palette_label(mode: SelectionMode) -> &'static str {
     match mode {
         SelectionMode::Replace => "Selection Mode: New",

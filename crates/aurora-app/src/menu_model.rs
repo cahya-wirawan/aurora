@@ -74,7 +74,8 @@ pub(crate) struct MenuContext {
 /// A static row: a separator or a command with its label.
 enum Row {
     Sep,
-    Cmd(&'static str, &'static str),
+    /// A registry command; its label is the registry title.
+    Cmd(&'static str),
 }
 
 use Row::{Cmd, Sep};
@@ -95,140 +96,83 @@ fn modify_rows() -> Vec<(&'static str, String)> {
 fn static_rows(title: &str) -> Vec<Row> {
     match title {
         "File" => vec![
-            Cmd(crate::document_tabs::COMMAND_FILE_NEW, "New Document"),
-            Cmd(crate::COMMAND_FILE_OPEN, "Open File\u{2026}"),
-            Cmd(crate::COMMAND_FILE_SAVE, "Save As\u{2026}"),
-            Cmd(crate::psd_save::COMMAND_CHECK, crate::psd_save::CHECK_TITLE),
+            Cmd(crate::document_tabs::COMMAND_FILE_NEW),
+            Cmd(crate::COMMAND_FILE_OPEN),
+            Cmd(crate::COMMAND_FILE_SAVE),
+            Cmd(crate::psd_save::COMMAND_CHECK),
             Sep,
-            Cmd(crate::document_close::COMMAND_FILE_CLOSE, "Close Document"),
+            Cmd(crate::document_close::COMMAND_FILE_CLOSE),
             Sep,
-            Cmd(crate::COMMAND_APP_QUIT, "Quit Aurora"),
+            Cmd(crate::COMMAND_APP_QUIT),
         ],
         "Edit" => vec![
-            Cmd(crate::COMMAND_UNDO, "Undo"),
-            Cmd(crate::COMMAND_REDO, "Redo"),
+            Cmd(crate::COMMAND_UNDO),
+            Cmd(crate::COMMAND_REDO),
             Sep,
-            Cmd(crate::clipboard_app::COMMAND_COPY, "Copy"),
-            Cmd(crate::clipboard_app::COMMAND_CUT, "Cut"),
-            Cmd(crate::clipboard_app::COMMAND_COPY_MERGED, "Copy Merged"),
-            Cmd(crate::clipboard_app::COMMAND_PASTE, "Paste"),
-            Cmd(
-                crate::clipboard_app::COMMAND_PASTE_IN_PLACE,
-                "Paste in Place",
-            ),
-            Cmd(
-                crate::clipboard_app::COMMAND_LAYER_VIA_COPY,
-                crate::clipboard_app::LAYER_VIA_COPY_LABEL,
-            ),
-            Cmd(
-                crate::clipboard_app::COMMAND_LAYER_VIA_CUT,
-                crate::clipboard_app::LAYER_VIA_CUT_LABEL,
-            ),
+            Cmd(crate::clipboard_app::COMMAND_COPY),
+            Cmd(crate::clipboard_app::COMMAND_CUT),
+            Cmd(crate::clipboard_app::COMMAND_COPY_MERGED),
+            Cmd(crate::clipboard_app::COMMAND_PASTE),
+            Cmd(crate::clipboard_app::COMMAND_PASTE_IN_PLACE),
+            Cmd(crate::clipboard_app::COMMAND_LAYER_VIA_COPY),
+            Cmd(crate::clipboard_app::COMMAND_LAYER_VIA_CUT),
             Sep,
-            Cmd(
-                crate::COMMAND_COLOURS_SWAP,
-                "Swap Foreground and Background Colours",
-            ),
-            Cmd(
-                crate::COMMAND_COLOURS_RESET,
-                "Default Foreground and Background Colours",
-            ),
+            Cmd(crate::COMMAND_COLOURS_SWAP),
+            Cmd(crate::COMMAND_COLOURS_RESET),
             Sep,
-            Cmd(
-                crate::colour_app::COMMAND_SET_OUTPUT,
-                crate::colour_app::TITLE_SET_OUTPUT,
-            ),
-            Cmd(
-                crate::colour_app::COMMAND_CLEAR_OUTPUT,
-                crate::colour_app::TITLE_CLEAR_OUTPUT,
-            ),
+            Cmd(crate::colour_app::COMMAND_SET_OUTPUT),
+            Cmd(crate::colour_app::COMMAND_CLEAR_OUTPUT),
         ],
         "Layer" => vec![
-            Cmd(crate::COMMAND_LAYER_NEW, "New Layer"),
-            Cmd(crate::COMMAND_LAYER_NEW_GROUP, "New Group"),
-            Cmd(crate::COMMAND_LAYER_DELETE, "Delete Layer"),
+            Cmd(crate::COMMAND_LAYER_NEW),
+            Cmd(crate::COMMAND_LAYER_NEW_GROUP),
+            Cmd(crate::COMMAND_LAYER_DELETE),
             Sep,
-            Cmd(crate::COMMAND_LAYER_NEW_CURVES, "New Curves Layer"),
-            Cmd(crate::COMMAND_LAYER_NEW_LEVELS, "New Levels Layer"),
-            Cmd(
-                crate::COMMAND_LAYER_NEW_HUE_SATURATION,
-                "New Hue/Saturation Layer",
-            ),
-            Cmd(crate::COMMAND_LAYER_NEW_VIBRANCE, "New Vibrance Layer"),
-            Cmd(crate::COMMAND_LAYER_NEW_EXPOSURE, "New Exposure Layer"),
-            Cmd(
-                crate::COMMAND_LAYER_NEW_PHOTO_FILTER,
-                "New Photo Filter Layer",
-            ),
-            Cmd(
-                crate::COMMAND_LAYER_NEW_BLACK_WHITE,
-                "New Black & White Layer",
-            ),
-            Cmd(
-                crate::COMMAND_LAYER_NEW_COLOR_BALANCE,
-                "New Color Balance Layer",
-            ),
-            Cmd(crate::COMMAND_LAYER_NEW_INVERT, "New Invert Layer"),
-            Cmd(crate::COMMAND_LAYER_NEW_THRESHOLD, "New Threshold Layer"),
-            Cmd(crate::COMMAND_LAYER_NEW_POSTERIZE, "New Posterize Layer"),
-            Cmd(
-                crate::COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST,
-                "New Brightness/Contrast Layer",
-            ),
-            Cmd(
-                crate::COMMAND_LAYER_NEW_CHANNEL_MIXER,
-                "New Channel Mixer Layer",
-            ),
-            Cmd(
-                crate::COMMAND_LAYER_NEW_SELECTIVE_COLOR,
-                "New Selective Color Layer",
-            ),
-            Cmd(
-                crate::COMMAND_LAYER_NEW_GRADIENT_MAP,
-                "New Gradient Map Layer",
-            ),
+            Cmd(crate::COMMAND_LAYER_NEW_CURVES),
+            Cmd(crate::COMMAND_LAYER_NEW_LEVELS),
+            Cmd(crate::COMMAND_LAYER_NEW_HUE_SATURATION),
+            Cmd(crate::COMMAND_LAYER_NEW_VIBRANCE),
+            Cmd(crate::COMMAND_LAYER_NEW_EXPOSURE),
+            Cmd(crate::COMMAND_LAYER_NEW_PHOTO_FILTER),
+            Cmd(crate::COMMAND_LAYER_NEW_BLACK_WHITE),
+            Cmd(crate::COMMAND_LAYER_NEW_COLOR_BALANCE),
+            Cmd(crate::COMMAND_LAYER_NEW_INVERT),
+            Cmd(crate::COMMAND_LAYER_NEW_THRESHOLD),
+            Cmd(crate::COMMAND_LAYER_NEW_POSTERIZE),
+            Cmd(crate::COMMAND_LAYER_NEW_BRIGHTNESS_CONTRAST),
+            Cmd(crate::COMMAND_LAYER_NEW_CHANNEL_MIXER),
+            Cmd(crate::COMMAND_LAYER_NEW_SELECTIVE_COLOR),
+            Cmd(crate::COMMAND_LAYER_NEW_GRADIENT_MAP),
             Sep,
-            Cmd(crate::COMMAND_LAYER_CLIP_CREATE, "Create Clipping Mask"),
-            Cmd(crate::COMMAND_LAYER_CLIP_RELEASE, "Release Clipping Mask"),
+            Cmd(crate::COMMAND_LAYER_CLIP_CREATE),
+            Cmd(crate::COMMAND_LAYER_CLIP_RELEASE),
         ],
         "View" => vec![
-            Cmd(
-                crate::zoomed_view::COMMAND_FIT_ON_SCREEN,
-                crate::zoomed_view::FIT_ON_SCREEN_TITLE,
-            ),
-            Cmd(
-                crate::zoomed_view::COMMAND_ACTUAL_PIXELS,
-                crate::zoomed_view::ACTUAL_PIXELS_TITLE,
-            ),
+            Cmd(crate::zoomed_view::COMMAND_FIT_ON_SCREEN),
+            Cmd(crate::zoomed_view::COMMAND_ACTUAL_PIXELS),
             Sep,
-            Cmd(crate::COMMAND_FOCUS_LAYERS, "Focus Layers Panel"),
-            Cmd(crate::COMMAND_FOCUS_PROPERTIES, "Focus Properties Panel"),
-            Cmd(crate::COMMAND_FOCUS_HISTORY, "Focus History Panel"),
-            Cmd(crate::COMMAND_FOCUS_CHANNELS, "Focus Channels Panel"),
-            Cmd(crate::COMMAND_FOCUS_PATHS, "Focus Paths Panel"),
+            Cmd(crate::COMMAND_FOCUS_LAYERS),
+            Cmd(crate::COMMAND_FOCUS_PROPERTIES),
+            Cmd(crate::COMMAND_FOCUS_HISTORY),
+            Cmd(crate::COMMAND_FOCUS_CHANNELS),
+            Cmd(crate::COMMAND_FOCUS_PATHS),
             Sep,
-            Cmd(crate::COMMAND_TOGGLE_LAYERS, "Toggle Layers Panel"),
-            Cmd(crate::COMMAND_TOGGLE_PROPERTIES, "Toggle Properties Panel"),
-            Cmd(crate::COMMAND_TOGGLE_HISTORY, "Toggle History Panel"),
-            Cmd(crate::COMMAND_TOGGLE_CHANNELS, "Toggle Channels Panel"),
-            Cmd(crate::COMMAND_TOGGLE_PATHS, "Toggle Paths Panel"),
+            Cmd(crate::COMMAND_TOGGLE_LAYERS),
+            Cmd(crate::COMMAND_TOGGLE_PROPERTIES),
+            Cmd(crate::COMMAND_TOGGLE_HISTORY),
+            Cmd(crate::COMMAND_TOGGLE_CHANNELS),
+            Cmd(crate::COMMAND_TOGGLE_PATHS),
             Sep,
-            Cmd(crate::COMMAND_CLOSE_LAYERS, "Close Layers Panel"),
-            Cmd(crate::COMMAND_CLOSE_PROPERTIES, "Close Properties Panel"),
-            Cmd(crate::COMMAND_CLOSE_HISTORY, "Close History Panel"),
-            Cmd(crate::COMMAND_CLOSE_CHANNELS, "Close Channels Panel"),
-            Cmd(crate::COMMAND_CLOSE_PATHS, "Close Paths Panel"),
+            Cmd(crate::COMMAND_CLOSE_LAYERS),
+            Cmd(crate::COMMAND_CLOSE_PROPERTIES),
+            Cmd(crate::COMMAND_CLOSE_HISTORY),
+            Cmd(crate::COMMAND_CLOSE_CHANNELS),
+            Cmd(crate::COMMAND_CLOSE_PATHS),
             Sep,
-            Cmd(
-                crate::COMMAND_TOGGLE_PANELS,
-                crate::COMMAND_TOGGLE_PANELS_LABEL,
-            ),
-            Cmd(crate::COMMAND_RESET_PANELS, "Reset Panel Layout"),
+            Cmd(crate::COMMAND_TOGGLE_PANELS),
+            Cmd(crate::COMMAND_RESET_PANELS),
             Sep,
-            Cmd(
-                crate::COMMAND_TOGGLE_WIDGET_GALLERY,
-                "Toggle Widget Gallery",
-            ),
+            Cmd(crate::COMMAND_TOGGLE_WIDGET_GALLERY),
         ],
         _ => Vec::new(),
     }
@@ -239,9 +183,15 @@ fn rows_to_entries(rows: Vec<Row>) -> Vec<Entry> {
     rows.into_iter()
         .map(|row| match row {
             Sep => Entry::Separator,
-            Cmd(command, label) => item(command, label),
+            Cmd(command) => item(command, registry_title(command)),
         })
         .collect()
+}
+
+/// The registry's title for `command` (the id itself for one the registry
+/// does not know, which a test forbids).
+fn registry_title(command: &str) -> &str {
+    crate::command_registry::menu_label(command).unwrap_or(command)
 }
 
 fn item(command: &str, label: &str) -> Entry {
@@ -262,11 +212,16 @@ fn push_dynamic(entries: &mut Vec<Entry>, dynamic: &[CommandEntry]) {
     entries.extend(dynamic.iter().map(|e| item(&e.id, &e.title)));
 }
 
+/// A registry command as a menu item, labelled with its registry title.
+fn registry_item(command: &str) -> Entry {
+    item(command, registry_title(command))
+}
+
 fn select_entries(context: &MenuContext) -> Vec<Entry> {
     let mut entries = vec![
-        item(crate::COMMAND_SELECT_ALL, "Select All"),
-        item(crate::COMMAND_SELECT_DESELECT, "Deselect"),
-        item(crate::COMMAND_SELECT_INVERSE, "Inverse Selection"),
+        registry_item(crate::COMMAND_SELECT_ALL),
+        registry_item(crate::COMMAND_SELECT_DESELECT),
+        registry_item(crate::COMMAND_SELECT_INVERSE),
         Entry::Separator,
     ];
     entries.extend(
@@ -275,40 +230,27 @@ fn select_entries(context: &MenuContext) -> Vec<Entry> {
             .map(|(id, label)| item(id, &label)),
     );
     entries.push(Entry::Separator);
-    entries.push(item(
-        crate::colour_range_app::COMMAND_ID,
-        crate::colour_range_app::COMMAND_TITLE,
-    ));
-    entries.push(item(
-        crate::quick_mask::COMMAND_ID,
-        crate::quick_mask::COMMAND_TITLE,
-    ));
-    entries.push(item(
-        crate::crop::COMMAND_CROP_TO_SELECTION,
-        crate::crop::COMMAND_TITLE,
-    ));
+    entries.push(registry_item(crate::colour_range_app::COMMAND_ID));
+    entries.push(registry_item(crate::quick_mask::COMMAND_ID));
+    entries.push(registry_item(crate::crop::COMMAND_CROP_TO_SELECTION));
     entries.push(Entry::Separator);
     entries.extend(
         crate::paths_app::COMMANDS
             .iter()
-            .map(|(id, title)| item(id, title)),
+            .map(|(id, _)| registry_item(id)),
     );
     entries.push(Entry::Separator);
-    entries.push(item(
-        crate::selection_store::COMMAND_SAVE,
-        crate::selection_store::SAVE_TITLE,
-    ));
+    entries.push(registry_item(crate::selection_store::COMMAND_SAVE));
     // Load and Delete per saved name, as the palette lists them.
     for entry in &context.saved_selections {
         entries.push(item(&entry.id, &entry.title));
     }
     entries.push(Entry::Separator);
-    entries.extend(aurora_doc::SelectionMode::ALL.iter().map(|mode| {
-        item(
-            crate::selection_mode_command_id(*mode),
-            crate::selection_modes::palette_label(*mode),
-        )
-    }));
+    entries.extend(
+        aurora_doc::SelectionMode::ALL
+            .iter()
+            .map(|mode| registry_item(crate::selection_mode_command_id(*mode))),
+    );
     entries
 }
 
@@ -319,20 +261,16 @@ fn window_entries(context: &MenuContext) -> Vec<Entry> {
         .map(|e| item(&e.id, &e.title))
         .collect();
     entries.push(Entry::Separator);
-    entries.push(item(
-        crate::document_tabs::COMMAND_DOCUMENT_NEXT,
-        "Next Document",
-    ));
-    entries.push(item(
+    entries.push(registry_item(crate::document_tabs::COMMAND_DOCUMENT_NEXT));
+    entries.push(registry_item(
         crate::document_tabs::COMMAND_DOCUMENT_PREVIOUS,
-        "Previous Document",
     ));
     push_dynamic(&mut entries, &context.documents);
     entries.push(Entry::Separator);
     entries.extend(
         crate::PANEL_FLOAT_COMMANDS
             .iter()
-            .map(|(id, _, _, label)| item(id, label)),
+            .map(|(id, _, _, _)| registry_item(id)),
     );
     entries
 }
@@ -365,34 +303,11 @@ pub(crate) fn hint_command(id: &str) -> Option<AppCommand> {
 }
 
 /// Whether command `id` can run now (an item that cannot is shown
-/// disabled).
+/// disabled): the registry's requirements for the id, evaluated on the
+/// menu's facts ([`crate::command_registry::enabled`]); an id it does not
+/// know is enabled.
 pub(crate) fn enabled(id: &str, context: &MenuContext) -> bool {
-    match id {
-        crate::COMMAND_UNDO => context.can_undo,
-        crate::COMMAND_REDO => context.can_redo,
-        crate::COMMAND_LAYER_DELETE => context.delete_allowed,
-        crate::COMMAND_LAYER_CLIP_CREATE => !context.clipped && !context.clip_refused,
-        crate::COMMAND_LAYER_CLIP_RELEASE => context.clipped,
-        crate::COMMAND_SELECT_ALL
-        | crate::COMMAND_SELECT_DESELECT
-        | crate::COMMAND_SELECT_INVERSE
-        | crate::crop::COMMAND_CROP_TO_SELECTION
-        | crate::colour_range_app::COMMAND_ID
-        | crate::paths_app::COMMAND_MAKE_SELECTION
-        | crate::path_paint::COMMAND_FILL
-        | crate::path_paint::COMMAND_STROKE
-        | crate::path_paint::COMMAND_MAKE_FROM_SELECTION => !context.quick_mask,
-        _ if crate::clipboard_app::command_for(id).is_some() => !context.quick_mask,
-        _ if crate::selection_refine::RefineKind::for_command(id).is_some() => !context.quick_mask,
-        _ if matches!(
-            crate::selection_store::command_for(id),
-            Some(crate::selection_store::SavedSelectionCommand::Load(_))
-        ) =>
-        {
-            !context.quick_mask
-        }
-        _ => true,
-    }
+    crate::command_registry::enabled(id, context)
 }
 
 /// Builds the menus, in bar order, with hints from `shortcuts` and

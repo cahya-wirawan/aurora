@@ -492,6 +492,7 @@ pub(crate) fn preset_command_id(index: usize) -> String {
 }
 
 /// The palette title of preset `index`.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn preset_command_title(index: usize) -> String {
     let name = aurora_core::PHOTO_FILTER_PRESETS
         .get(index)
