@@ -563,6 +563,7 @@ fn reopened_from_aur(bytes: &[u8]) -> Opened {
             masks: Vec::new(),
             report: super::PsdImportReport::default(),
             colour: crate::ColourImport::default(),
+            saved_selections: Vec::new(),
         },
     }
 }

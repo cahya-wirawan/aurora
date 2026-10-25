@@ -377,6 +377,79 @@ struct Losses {
     /// The written layers add up to more than the reader's
     /// `PIXEL_BUDGET`, so Aurora cannot reopen the file (0.177.0, N-1).
     unreopenable: bool,
+    /// Saved selections and the alpha channels they became (task 156).
+    alpha: AlphaItems,
+}
+
+/// What the report says about saved selections (task 156).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AlphaItems {
+    written: Vec<String>,
+    renamed: Vec<(String, String)>,
+    outside: Vec<String>,
+    over_caps: Vec<String>,
+    clipped: Vec<String>,
+    canvas_too_large: usize,
+}
+
+impl AlphaItems {
+    fn items(&self) -> Vec<String> {
+        let mut items = Vec::new();
+        if self.canvas_too_large > 0 {
+            items.push(format!(
+                "{} not saved: the canvas is larger than {} megapixels, the most Aurora reads \
+                 back as a selection.",
+                plural(
+                    self.canvas_too_large as u64,
+                    "saved selection is",
+                    "saved selections are"
+                ),
+                aurora_doc::MAX_SELECTION_MASK_PIXELS / (1024 * 1024),
+            ));
+        }
+        for (names, what) in [
+            (
+                &self.outside,
+                "Saved selections not saved, wholly outside the canvas",
+            ),
+            (
+                &self.over_caps,
+                "Saved selections not saved, because Aurora could not read them back within its \
+                 limits of 64 saved selections and 128 MiB of masks",
+            ),
+            (
+                &self.clipped,
+                "Saved selections that extend past the canvas; only the part inside is saved",
+            ),
+        ] {
+            if !names.is_empty() {
+                let list: Vec<&str> = names.iter().map(String::as_str).collect();
+                items.push(format!("{what}: {}.", name_list(&list)));
+            }
+        }
+        if !self.renamed.is_empty() {
+            let list: Vec<String> = self
+                .renamed
+                .iter()
+                .map(|(was, now)| format!("\u{201c}{was}\u{201d} as \u{201c}{now}\u{201d}"))
+                .collect();
+            items.push(format!(
+                "Photoshop reserves the channel name Transparency; saved: {}.",
+                list.join(", ")
+            ));
+        }
+        if !self.written.is_empty() {
+            let list: Vec<&str> = self.written.iter().map(String::as_str).collect();
+            items.push(format!(
+                "Saved selections written as alpha channels (white is selected; a rectangle or \
+                 ellipse becomes a pixel mask): {}. The saved file is re-read and checked with Aurora's \
+                 reader; psd-tools reads files written this way in testing; Aurora hasn't \
+                 checked them in Photoshop.",
+                name_list(&list)
+            ));
+        }
+        items
+    }
 }
 
 impl Losses {
@@ -761,6 +834,7 @@ impl Losses {
         }
         items.extend(self.smart_object_items());
         items.extend(self.text_items());
+        items.extend(self.alpha.items());
         if !self.outline_dropped.is_empty() {
             let names: Vec<&str> = self.outline_dropped.iter().map(String::as_str).collect();
             items.push(format!(
@@ -1034,6 +1108,19 @@ pub struct PsdExpectedLayer {
     pub mask: Option<PsdExpectedMask>,
 }
 
+/// One alpha channel written for a saved selection (task 156).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PsdExpectedAlpha {
+    /// What the four alpha resources say about it.
+    pub channel: super::alpha::ResourceChannel,
+    /// The sum of `sample_hash` over every written 16-bit sample of its
+    /// plane (plane number `4 + its index`).
+    pub hash: u64,
+    /// Whether any sample is non-zero: an all-zero channel holds no
+    /// selection, so the reader does not return one for it.
+    pub nonzero: bool,
+}
+
 /// Everything [`verify_psd_file`] checks a written file against.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PsdExpectation {
@@ -1056,6 +1143,9 @@ pub struct PsdExpectation {
     /// The length and hash of the `Txt2` block written after the pattern
     /// block, if any (task 155).
     pub text_engine: Option<(u64, u64)>,
+    /// The alpha channels written for saved selections (task 156), in plane
+    /// order after the merged image's four planes.
+    pub alpha: Vec<PsdExpectedAlpha>,
 }
 
 /// [`write_psd`]'s result.
@@ -1352,29 +1442,35 @@ impl Losses {
 /// comparing two writes) must see the bytes the write used.
 #[cfg(test)]
 pub(crate) fn icc_resource() -> Result<Vec<u8>, IoError> {
-    resources_for(None)
+    resources_for(None, &[])
 }
 
-/// The image resources: the global light angle (1037, task 120) when
-/// layer effects follow one, then the ICC profile.
-pub(crate) fn resources_for(global_angle: Option<i32>) -> Result<Vec<u8>, IoError> {
+/// The image resources: the alpha channel resources (1006, 1045, 1053,
+/// 1077; task 156) when `alpha` lists planes (the `Transparency` plane
+/// first), the global light angle (1037, task 120) when layer effects follow
+/// one, then the ICC profile; ascending by id.
+pub(crate) fn resources_for(
+    global_angle: Option<i32>,
+    alpha: &[super::alpha::ResourceChannel],
+) -> Result<Vec<u8>, IoError> {
     let profile = aurora_color::IccProfile::srgb_bytes()?;
-    let size = u32::try_from(profile.len()).map_err(|_| too_large("ICC profile"))?;
-    let mut out = Vec::with_capacity(profile.len() + 13 + 16);
+    let mut blocks: Vec<(u16, Vec<u8>)> = super::alpha::resource_blocks(alpha);
     if let Some(angle) = global_angle {
-        out.extend_from_slice(b"8BIM");
-        out.extend_from_slice(&1037u16.to_be_bytes());
-        out.extend_from_slice(&[0, 0]); // empty Pascal name, padded to even
-        out.extend_from_slice(&4u32.to_be_bytes());
-        out.extend_from_slice(&angle.to_be_bytes());
+        blocks.push((1037, angle.to_be_bytes().to_vec()));
     }
-    out.extend_from_slice(b"8BIM");
-    out.extend_from_slice(&1039u16.to_be_bytes());
-    out.extend_from_slice(&[0, 0]); // empty Pascal name, padded to even
-    out.extend_from_slice(&size.to_be_bytes());
-    out.extend_from_slice(&profile);
-    if !profile.len().is_multiple_of(2) {
-        out.push(0);
+    blocks.push((1039, profile));
+    blocks.sort_by_key(|(id, _)| *id);
+    let mut out = Vec::new();
+    for (id, body) in blocks {
+        let size = u32::try_from(body.len()).map_err(|_| too_large("image resource"))?;
+        out.extend_from_slice(b"8BIM");
+        out.extend_from_slice(&id.to_be_bytes());
+        out.extend_from_slice(&[0, 0]); // empty Pascal name, padded to even
+        out.extend_from_slice(&size.to_be_bytes());
+        out.extend_from_slice(&body);
+        if !body.len().is_multiple_of(2) {
+            out.push(0);
+        }
     }
     Ok(out)
 }
@@ -1383,7 +1479,12 @@ pub(crate) fn resources_for(global_angle: Option<i32>) -> Result<Vec<u8>, IoErro
 /// channel row and merged row as `PackBits`' best case, one two-byte
 /// packet per 128 bytes, plus its row count and compression field. Known
 /// before a byte is written, from the planned extents.
-fn minimum_file_size(plans: &[LayerPlan], (width, height): (u32, u32), linked: u64) -> u64 {
+fn minimum_file_size(
+    plans: &[LayerPlan],
+    (width, height): (u32, u32),
+    linked: u64,
+    alpha: usize,
+) -> u64 {
     let rows = |w: u32, h: u32, channels: u64| -> u64 {
         let row_min = 2 * (u64::from(w) * 2).div_ceil(128);
         channels.saturating_mul(2 + u64::from(h).saturating_mul(2 + row_min))
@@ -1397,7 +1498,8 @@ fn minimum_file_size(plans: &[LayerPlan], (width, height): (u32, u32), linked: u
         .fold(0u64, u64::saturating_add);
     // The merged image has one compression field for all four planes.
     let merged_row_min = 2 * (u64::from(width) * 2).div_ceil(128);
-    let merged = 2 + 4 * u64::from(height).saturating_mul(2 + merged_row_min);
+    let planes = 4 + alpha as u64;
+    let merged = 2 + planes * u64::from(height).saturating_mul(2 + merged_row_min);
     layers.saturating_add(merged).saturating_add(linked)
 }
 
@@ -2291,7 +2393,30 @@ pub fn write_psd<W: Write + Seek>(
     store: &mut TileStore,
     opts: PsdSaveOptions,
 ) -> Result<PsdWriteOutcome, IoError> {
-    write_psd_limited(
+    write_psd_with_selections(writer, layers, canvas, composite, store, opts, &[])
+}
+
+/// [`write_psd`] that also writes the document's saved selections as alpha
+/// channels (task 156): `saved` is `(name, selection)` per saved selection
+/// ([`aurora_doc::SelectionSet::saved_sorted`] gives them in a stable order).
+/// Each becomes a plane of the merged image after its four planes, named by
+/// image resources 1006 and 1045, with identifiers (1053) and display
+/// information (1077); see `alpha` for the rules, caps and what is itemised
+/// in the report. With no selections the bytes are exactly [`write_psd`]'s.
+///
+/// # Errors
+///
+/// As [`write_psd`].
+pub fn write_psd_with_selections<W: Write + Seek>(
+    writer: W,
+    layers: &LayerTree,
+    canvas: (u32, u32),
+    composite: &mut dyn PsdCompositeSource,
+    store: &mut TileStore,
+    opts: PsdSaveOptions,
+    saved: &[(&str, &aurora_doc::Selection)],
+) -> Result<PsdWriteOutcome, IoError> {
+    write_psd_limited_with(
         writer,
         layers,
         canvas,
@@ -2299,10 +2424,11 @@ pub fn write_psd<W: Write + Seek>(
         store,
         opts,
         WriteLimits::default(),
+        saved,
     )
 }
 
-/// The limits [`write_psd_limited`] applies — parameters so tests reach
+/// The limits `write_psd_limited` applies — parameters so tests reach
 /// them without gigabyte files.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WriteLimits {
@@ -2332,18 +2458,22 @@ fn write_header<W: Write>(
     w: &mut W,
     (width, height): (u32, u32),
     global_angle: Option<i32>,
+    alpha: &[super::alpha::ResourceChannel],
 ) -> Result<(), IoError> {
-    // Header: 4 channels (RGB + merged transparency), 16-bit, RGB.
+    // Header: 4 channels (RGB + merged transparency) and one per alpha
+    // channel (task 156), 16-bit, RGB. `alpha` lists the Transparency plane
+    // too, so it is one longer than the alpha channels.
+    let channels = 4 + u16::try_from(alpha.len().saturating_sub(1)).unwrap_or(0);
     w.write_all(b"8BPS")?;
     w.write_all(&1u16.to_be_bytes())?;
     w.write_all(&[0; 6])?;
-    w.write_all(&4u16.to_be_bytes())?;
+    w.write_all(&channels.to_be_bytes())?;
     w.write_all(&height.to_be_bytes())?;
     w.write_all(&width.to_be_bytes())?;
     w.write_all(&16u16.to_be_bytes())?;
     w.write_all(&3u16.to_be_bytes())?;
     w.write_all(&0u32.to_be_bytes())?; // colour mode data
-    let resources = resources_for(global_angle)?;
+    let resources = resources_for(global_angle, alpha)?;
     let resources_len = u32::try_from(resources.len()).map_err(|_| too_large("resources"))?;
     w.write_all(&resources_len.to_be_bytes())?;
     w.write_all(&resources)?;
@@ -2353,8 +2483,23 @@ fn write_header<W: Write>(
 
 /// [`write_psd`] with the file-size limit as a parameter, so a test can
 /// reach it without writing 2 GiB.
-#[allow(clippy::too_many_lines)]
+#[cfg(test)]
 pub(crate) fn write_psd_limited<W: Write + Seek>(
+    writer: W,
+    layers: &LayerTree,
+    canvas: (u32, u32),
+    composite: &mut dyn PsdCompositeSource,
+    store: &mut TileStore,
+    opts: PsdSaveOptions,
+    limits: WriteLimits,
+) -> Result<PsdWriteOutcome, IoError> {
+    write_psd_limited_with(writer, layers, canvas, composite, store, opts, limits, &[])
+}
+
+/// `write_psd_limited` with the saved selections to write as alpha
+/// channels (task 156).
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) fn write_psd_limited_with<W: Write + Seek>(
     mut writer: W,
     layers: &LayerTree,
     canvas: (u32, u32),
@@ -2362,6 +2507,7 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
     store: &mut TileStore,
     opts: PsdSaveOptions,
     limits: WriteLimits,
+    saved: &[(&str, &aurora_doc::Selection)],
 ) -> Result<PsdWriteOutcome, IoError> {
     let max_bytes = limits.max_bytes;
     let mut losses =
@@ -2372,6 +2518,29 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
             composite: composite.size(),
         }));
     }
+    let mut saved_sorted: Vec<(&str, &aurora_doc::Selection)> = saved.to_vec();
+    saved_sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let alpha_plan = super::alpha::plan(&saved_sorted, canvas);
+    losses.alpha = AlphaItems {
+        written: alpha_plan.channels.iter().map(|c| c.name.clone()).collect(),
+        renamed: alpha_plan.renamed.clone(),
+        outside: alpha_plan.outside.clone(),
+        over_caps: alpha_plan.over_caps.clone(),
+        clipped: alpha_plan.clipped.clone(),
+        canvas_too_large: alpha_plan.canvas_too_large,
+    };
+    let alpha_resources: Vec<super::alpha::ResourceChannel> = if alpha_plan.channels.is_empty() {
+        Vec::new()
+    } else {
+        std::iter::once(super::alpha::ResourceChannel::transparency())
+            .chain(
+                alpha_plan
+                    .channels
+                    .iter()
+                    .map(|c| super::alpha::ResourceChannel::alpha(&c.name, c.id)),
+            )
+            .collect()
+    };
     let (angle, _) = effects_angle(layers);
     let effect_pool = effect_patterns(layers, limits.unverified_effects);
     let ctx = effects_ctx(&effect_pool, angle, limits.unverified_effects);
@@ -2403,7 +2572,7 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
         .map(|f| f.entry.len() as u64 + 12)
         .fold(0u64, u64::saturating_add)
         .saturating_add(text_engine.map_or(0, |e| e.len() as u64 + 16));
-    if minimum_file_size(&plans, canvas, linked_bytes) > max_bytes {
+    if minimum_file_size(&plans, canvas, linked_bytes, alpha_plan.channels.len()) > max_bytes {
         return Err(too_large(
             "a .psd file must be smaller than 2 GiB; use .psb instead",
         ));
@@ -2424,7 +2593,7 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
     let (width, height) = canvas;
     let limit = pos(w)?.saturating_add(max_bytes);
 
-    write_header(w, canvas, angle)?;
+    write_header(w, canvas, angle, &alpha_resources)?;
 
     let section_at = pos(w)?;
     w.write_all(&0u32.to_be_bytes())?; // section length, filled in below
@@ -2491,7 +2660,14 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
         section_end,
     )?;
 
-    let merged_hash = write_merged(w, composite, canvas, &mut losses, limit)?;
+    let (merged_hash, alpha_written) = write_merged(
+        w,
+        composite,
+        canvas,
+        &mut losses,
+        limit,
+        &alpha_plan.channels,
+    )?;
     w.flush()?;
     Ok(PsdWriteOutcome {
         report: losses.report(),
@@ -2504,6 +2680,16 @@ pub(crate) fn write_psd_limited<W: Write + Seek>(
             global_angle: angle,
             patterns: patterns_expected,
             text_engine: text_engine_expected,
+            alpha: alpha_resources
+                .into_iter()
+                .skip(1)
+                .zip(alpha_written)
+                .map(|(channel, (hash, nonzero))| PsdExpectedAlpha {
+                    channel,
+                    hash,
+                    nonzero,
+                })
+                .collect(),
         },
     })
 }
@@ -2607,11 +2793,12 @@ fn write_merged<W: Write + Seek>(
     (width, height): (u32, u32),
     losses: &mut Losses,
     limit: u64,
-) -> Result<u64, IoError> {
+    alpha: &[super::alpha::WrittenChannel<'_>],
+) -> Result<(u64, Vec<(u64, bool)>), IoError> {
     w.write_all(&1u16.to_be_bytes())?;
     let table_at = pos(w)?;
     let table_len = (height as usize)
-        .checked_mul(8)
+        .checked_mul(2 * (4 + alpha.len()))
         .ok_or_else(|| too_large("merged row table"))?;
     w.write_all(&vec![0u8; table_len])?;
     let mut counts: Vec<u8> = Vec::with_capacity(table_len);
@@ -2652,9 +2839,38 @@ fn write_merged<W: Write + Seek>(
             y += rows as u32;
         }
     }
+    // The alpha channels (task 156): one plane per saved selection, rasterised
+    // a row at a time. White is selected; a 16-bit sample is `byte * 257`, so
+    // an 8-bit coverage reads back exactly.
+    let mut alpha_hashes = Vec::with_capacity(alpha.len());
+    let mut row8 = vec![0u8; width as usize];
+    let mut row16: Vec<u8> = Vec::with_capacity(width as usize * 2);
+    for (k, channel) in alpha.iter().enumerate() {
+        let plane = u8::try_from(4 + k).unwrap_or(u8::MAX);
+        let (mut plane_hash, mut nonzero) = (0u64, false);
+        for y in 0..height {
+            channel
+                .selection
+                .coverage_row_bytes(i64::from(y), 0, &mut row8);
+            row16.clear();
+            for (x, &byte) in row8.iter().enumerate() {
+                let value = u16::from(byte) * 257;
+                row16.extend_from_slice(&value.to_be_bytes());
+                plane_hash =
+                    plane_hash.wrapping_add(sample_hash(plane, x as u32, y, u64::from(value)));
+                nonzero |= byte != 0;
+            }
+            let packed = pack_bits(&row16);
+            let count = u16::try_from(packed.len()).map_err(|_| too_large("RLE row"))?;
+            counts.extend_from_slice(&count.to_be_bytes());
+            w.write_all(&packed)?;
+            check_size(w, limit)?;
+        }
+        alpha_hashes.push((plane_hash, nonzero));
+    }
     let end = pos(w)?;
     patch(w, table_at, &counts, end)?;
-    Ok(hash)
+    Ok((hash, alpha_hashes))
 }
 
 /// `PackBits`: a run of two or more equal bytes *starting a packet* as a
@@ -2803,7 +3019,7 @@ fn raw_header<R: std::io::Read + Seek>(
     check("signature", raw.array::<4>()?, *b"8BPS")?;
     check("version", raw.u16()?, 1)?;
     raw.skip(6)?;
-    check("channels", raw.u16()?, 4)?;
+    check("channels", raw.u16()?, 4 + expected.alpha.len() as u16)?;
     check("height", raw.u32()?, expected.height)?;
     check("width", raw.u32()?, expected.width)?;
     check("depth", raw.u16()?, 16)?;
@@ -2811,11 +3027,20 @@ fn raw_header<R: std::io::Read + Seek>(
     let color = raw.u32()?;
     raw.skip(u64::from(color))?;
     let resources = raw.u32()?;
-    let want = resources_for(expected.global_angle)?;
+    let listed: Vec<super::alpha::ResourceChannel> = if expected.alpha.is_empty() {
+        Vec::new()
+    } else {
+        std::iter::once(super::alpha::ResourceChannel::transparency())
+            .chain(expected.alpha.iter().map(|a| a.channel.clone()))
+            .collect()
+    };
+    let want = resources_for(expected.global_angle, &listed)?;
     check("image resources length", resources as usize, want.len())?;
     let got = raw.bytes(want.len())?;
     if got != want {
-        return Err(mismatch("the sRGB ICC profile resource (1039)"));
+        return Err(mismatch(
+            "the image resources (alpha channel names, ids and display information, or the sRGB ICC profile)",
+        ));
     }
     Ok(())
 }
@@ -3159,13 +3384,15 @@ fn raw_merged<R: std::io::Read + Seek>(
     expected: &PsdExpectation,
 ) -> Result<(), IoError> {
     check("merged compression", raw.u16()?, 1)?;
-    let rows = (expected.height as usize).saturating_mul(4);
+    let planes = 4 + expected.alpha.len();
+    let rows = (expected.height as usize).saturating_mul(planes);
     let mut counts = Vec::with_capacity(rows);
     for _ in 0..rows {
         counts.push(usize::from(raw.u16()?));
     }
     let row_bytes = (expected.width as usize).saturating_mul(2);
     let mut hash = 0u64;
+    let mut alpha_hashes = vec![0u64; expected.alpha.len()];
     let mut row = Vec::with_capacity(row_bytes);
     for (i, count) in counts.into_iter().enumerate() {
         let plane = (i / expected.height.max(1) as usize) as u8;
@@ -3176,11 +3403,18 @@ fn raw_merged<R: std::io::Read + Seek>(
         for (x, pair) in row.chunks_exact(2).enumerate() {
             if let [hi, lo] = pair {
                 let v = u16::from_be_bytes([*hi, *lo]);
-                hash = hash.wrapping_add(sample_hash(plane, x as u32, y, u64::from(v)));
+                let h = sample_hash(plane, x as u32, y, u64::from(v));
+                match alpha_hashes.get_mut(usize::from(plane).wrapping_sub(4)) {
+                    Some(slot) => *slot = slot.wrapping_add(h),
+                    None => hash = hash.wrapping_add(h),
+                }
             }
         }
     }
     check("merged image pixels", hash, expected.merged_hash)?;
+    for (k, (got, want)) in alpha_hashes.iter().zip(&expected.alpha).enumerate() {
+        check(&format!("alpha channel {k} pixels"), *got, want.hash)?;
+    }
     Ok(())
 }
 
@@ -3410,6 +3644,7 @@ fn reader_pass(path: &Path, expected: &PsdExpectation) -> Result<(), IoError> {
     if decoded.next().is_some() {
         return Err(mismatch("more layers with pixels than were written"));
     }
+    check_alpha(expected, &doc)?;
     check(
         "text engine data",
         doc.layers
@@ -3435,6 +3670,45 @@ fn reader_pass(path: &Path, expected: &PsdExpectation) -> Result<(), IoError> {
             &format!("embedded file {}", want.unique_id),
             (file.list, file.entry.len() as u64, hash.0),
             (want.list, want.len, want.hash),
+        )?;
+    }
+    Ok(())
+}
+
+/// The reader pass's check of the saved selections the alpha channels read
+/// back as (task 156): the names, in order, for the channels that select
+/// anything, and each one's coverage over the canvas, hashed like the
+/// written plane.
+fn check_alpha(expected: &PsdExpectation, doc: &super::PsdStreamedDocument) -> Result<(), IoError> {
+    let want: Vec<(usize, &PsdExpectedAlpha)> = expected
+        .alpha
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.nonzero)
+        .collect();
+    let got_names: Vec<&str> = doc
+        .saved_selections
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
+    let want_names: Vec<&str> = want.iter().map(|(_, a)| a.channel.name.as_str()).collect();
+    check("saved selections read back (names)", got_names, want_names)?;
+    let width = expected.width as usize;
+    let mut row = vec![0u8; width];
+    for ((k, a), (_, selection)) in want.iter().zip(&doc.saved_selections) {
+        let plane = u8::try_from(4 + k).unwrap_or(u8::MAX);
+        let mut hash = 0u64;
+        for y in 0..expected.height {
+            selection.coverage_row_bytes(i64::from(y), 0, &mut row);
+            for (x, &byte) in row.iter().enumerate() {
+                let v = u64::from(u16::from(byte) * 257);
+                hash = hash.wrapping_add(sample_hash(plane, x as u32, y, v));
+            }
+        }
+        check(
+            &format!("saved selection {:?} coverage", a.channel.name),
+            hash,
+            a.hash,
         )?;
     }
     Ok(())
