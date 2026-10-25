@@ -21,7 +21,7 @@
 //!   the [`Dispatcher`] decides where a request runs (the app marshals it to
 //!   its UI thread and waits with a timeout; the UI thread never waits).
 
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -263,6 +263,39 @@ fn refuse(mut stream: TcpStream, message: &str) {
     let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
     let reply = serde_json::json!({"ok": false, "error": message}).to_string();
     let _ = frame::write_line(&mut stream, &reply);
+    close_after_reply(&stream, Duration::from_millis(30));
+}
+
+/// Ends a connection after a reply without losing the reply.
+///
+/// Closing a socket that still holds unread data from the peer makes Windows
+/// send a reset, and the reset discards what the peer had not read yet: the
+/// client saw "connection aborted" (os error 10053) instead of the refusal.
+/// So the write side is closed first (the reply is delivered, then a FIN) and
+/// whatever the peer already sent is read and thrown away, for at most
+/// `patience` and 64 KiB, before the socket is dropped.
+fn close_after_reply(stream: &TcpStream, patience: Duration) {
+    let _ = stream.shutdown(Shutdown::Write);
+    let deadline = Instant::now() + patience;
+    let mut seen = 0_usize;
+    let mut buf = [0_u8; 4096];
+    let mut reader = stream;
+    while seen < 64 * 1024 {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let left = deadline
+            .saturating_duration_since(now)
+            .max(Duration::from_millis(1));
+        if stream.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => seen += n,
+        }
+    }
     let _ = stream.shutdown(Shutdown::Both);
 }
 
@@ -331,7 +364,12 @@ fn serve_connection(stream: &TcpStream, shared: &Arc<Shared>) {
         // Closed without a line, or too slow: nothing to answer, and a
         // connection that sends nothing is not an authentication attempt
         // worth counting (a port scanner, a liveness probe).
-        Ok(Line::Eof) | Err(_) => return,
+        Ok(Line::Eof) | Err(_) => {
+            // Close the socket explicitly: a silent client must not be left
+            // waiting for the handles to be released.
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
     };
     if looks_like_http(&line) {
         tracing::debug!("bridge: dropped an HTTP request on the control socket");
@@ -412,7 +450,7 @@ fn reply_hello_error(writer: &mut TcpStream, message: &str) {
     if let Ok(text) = serde_json::to_string(&reply) {
         let _ = frame::write_line(writer, &text);
     }
-    let _ = writer.shutdown(Shutdown::Both);
+    close_after_reply(writer, Duration::from_millis(100));
 }
 
 /// Refuses a connection that did not present a well-formed handshake.
