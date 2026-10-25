@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.295.2] - 2026-10-25
+
+### Fixed
+
+- Bridge: tolerate EINVAL from setsockopt after the peer closed (macOS); Windows test warning
+
 ## [0.295.1] - 2026-10-25
 
 ### Fixed
