@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.294.0] - 2026-10-25
+
+### Added
+
+- Record the headless MCP server
+
 ## [0.293.0] - 2026-10-25
 
 ### Added
