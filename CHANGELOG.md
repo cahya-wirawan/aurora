@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.291.0] - 2026-10-25
+
+### Added
+
+- Record saved selections as PSD alpha channels
+
 ## [0.290.0] - 2026-10-24
 
 ### Added
