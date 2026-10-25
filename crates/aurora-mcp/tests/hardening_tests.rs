@@ -160,9 +160,11 @@ async fn ping_and_cancel_are_served_while_a_long_preview_holds_the_session() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     // two more calls queue behind the preview; with two runtime workers
     // they must not occupy them
-    let first = client.send_request("tools/call", json!({"name": "command_run", "arguments": {"id": "layer.new"}})).await;
-    let second = client.send_request("tools/call", json!({"name": "command_run", "arguments": {"id": "layer.new"}})).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut queued = Vec::new();
+    for _ in 0..4 {
+        queued.push(client.send_request("tools/call", json!({"name": "command_run", "arguments": {"id": "layer.new"}})).await);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
     let started = Instant::now();
     let pong = client.request("ping", json!({})).await;
     assert!(pong.get("error").is_none(), "{pong}");
@@ -170,7 +172,7 @@ async fn ping_and_cancel_are_served_while_a_long_preview_holds_the_session() {
     // cancel the preview: it must stop, which lets the queued calls run
     client.notify("notifications/cancelled", json!({"requestId": preview})).await;
     let started = Instant::now();
-    for id in [first, second] {
+    for id in queued {
         let reply = client.reply(id).await;
         assert_eq!(reply["result"]["isError"], json!(false), "{reply}");
     }

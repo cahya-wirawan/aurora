@@ -58,7 +58,14 @@ Constraints that make it hard:
    window, event loop or GPU context is created. It speaks plain Rust and
    `serde_json`, not MCP types, so the app does not depend on `rmcp` or
    `tokio`.
-4. **`aurora-cli mcp`** is the binary. It depends on `aurora-mcp` and on
+4. **`aurora-cli mcp`** is the binary. **`aurora-cli` now links the whole
+   `aurora-app` crate** (winit, wgpu, accesskit, the widget toolkit and every
+   document crate), although `mcp` never creates a window or a GPU context.
+   That is deliberate and the price of the design: the code that opens a
+   file, composites it and writes PSD/`.aur` is private to `aurora-app`, and
+   moving it down into a library crate is a refactor of that crate's `lib.rs`
+   as large as the feature. Until then a headless binary that does real
+   document work has to depend on the crate that holds it. It depends on `aurora-mcp` and on
    `aurora-app` (a `scripts/layering.json` edit: `aurora-cli` gains
    `aurora-mcp` and `aurora-app`) and adapts one to the other with a
    newtype (`AppHost`), because the trait and the session type are both
@@ -87,10 +94,23 @@ Constraints that make it hard:
    * Arguments are strict: unknown tool argument, wrong type, unknown command
      id, unknown command argument, out-of-range value are JSON-RPC `-32602`
      before anything runs; a whole batch is validated before its first step.
+   * The session lock is never taken on an async worker (only on
+     `spawn_blocking` threads), a command's enabled check and run share one
+     lock hold, and a batch of host commands holds it across its steps.
+   * stdout is the protocol: on Unix it is moved to a private duplicate of
+     fd 1 and fd 1 is redirected to stderr (`rustix`'s safe `dup`/`dup2`,
+     already in the lock file through `cap-std`, no `unsafe`).
+   * Scratch lives in one `0700` directory locked for the process's life and
+     swept after a crash; the document's tile store is inside it.
    * stdout carries only JSON-RPC lines; a non-JSON line gets `-32700` and
      the next line is still served; logs go to stderr.
    * Honest hints on every tool (all four annotations), documented in
      `docs/mcp.md`; hints are not permissions.
+
+A fourth dependency was added during review: `rustix` (features `std`,
+`fs`, `stdio`; Unix only), for `O_NONBLOCK`, `statvfs` and the stdout
+redirect without `unsafe`. It was already in `Cargo.lock` (a `cap-std`
+dependency) and `cargo deny` passes.
 
 ## Alternatives considered
 
@@ -138,6 +158,11 @@ tests ran on: `cap-std` is cross-platform, but Windows drive-prefixed
 absolute paths and macOS were not exercised. The headless command set is
 small (14 of about 150 registry commands); the rest report "not available
 headless".
+
+**Not verified:** a red-team reproduced several faults against the first
+version, which this revision fixes with tests; the red team's own live
+path-escape battery and the PSD/`.aur`/zip bomb batteries were not run by
+anyone but the builder's tests (docs/mcp.md lists what is covered).
 
 **Follow-on work:** task 160 (bridge mode to the running app, `ui_*`
 tools); more headless commands as their effects get document-level
