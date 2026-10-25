@@ -415,3 +415,184 @@ fn bad_command_lines_print_usage_to_stderr_only() {
         assert_eq!(code, Some(2), "{args:?}");
     }
 }
+
+// ----- bombs -----------------------------------------------------------------
+
+/// A stored-method zip with one entry called `manifest`: `declared` is the
+/// size its headers claim, `data` the bytes it really holds.
+fn zip_with_manifest(declared: u32, data: &[u8]) -> Vec<u8> {
+    let name = b"manifest";
+    let mut out = Vec::new();
+    let mut local = b"PK\x03\x04".to_vec();
+    local.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    local.extend_from_slice(&declared.to_le_bytes());
+    local.extend_from_slice(&declared.to_le_bytes());
+    local.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    local.extend_from_slice(&[0, 0]);
+    local.extend_from_slice(name);
+    out.extend_from_slice(&local);
+    out.extend_from_slice(data);
+    let central_at = out.len() as u32;
+    let mut central = b"PK\x01\x02".to_vec();
+    central.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    central.extend_from_slice(&declared.to_le_bytes());
+    central.extend_from_slice(&declared.to_le_bytes());
+    central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    central.extend_from_slice(&[0; 12]);
+    central.extend_from_slice(&0_u32.to_le_bytes());
+    central.extend_from_slice(name);
+    out.extend_from_slice(&central);
+    out.extend_from_slice(b"PK\x05\x06");
+    out.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&central_at.to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
+    out
+}
+
+fn psd_with_layers(layer_count: i16, canvas: u32) -> Vec<u8> {
+    let mut b = b"8BPS".to_vec();
+    b.extend_from_slice(&1_u16.to_be_bytes());
+    b.extend_from_slice(&[0; 6]);
+    b.extend_from_slice(&3_u16.to_be_bytes());
+    b.extend_from_slice(&canvas.to_be_bytes());
+    b.extend_from_slice(&canvas.to_be_bytes());
+    b.extend_from_slice(&8_u16.to_be_bytes());
+    b.extend_from_slice(&3_u16.to_be_bytes());
+    b.extend_from_slice(&0_u32.to_be_bytes()); // colour mode data
+    b.extend_from_slice(&0_u32.to_be_bytes()); // image resources
+    // layer and mask information: claims a huge layer count, holds nothing
+    b.extend_from_slice(&64_u32.to_be_bytes());
+    b.extend_from_slice(&32_u32.to_be_bytes());
+    b.extend_from_slice(&layer_count.to_be_bytes());
+    b.extend_from_slice(&[0; 40]);
+    b
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn size_bombs_are_refused_quickly_with_bounded_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let files: Vec<(&str, Vec<u8>)> = vec![
+        ("bomb.aur", zip_with_manifest(u32::MAX, b"tiny")),
+        ("lying.aur", zip_with_manifest(4, b"abcdefghijklmnop")),
+        ("layers.psd", psd_with_layers(32_767, 16)),
+        ("neg.psd", psd_with_layers(-32_768, 16)),
+        ("psb.psb", {
+            let mut b = psd_with_layers(1, 16);
+            b[4..6].copy_from_slice(&2_u16.to_be_bytes());
+            b[14..18].copy_from_slice(&300_000_u32.to_be_bytes());
+            b[18..22].copy_from_slice(&300_000_u32.to_be_bytes());
+            b
+        }),
+    ];
+    for (name, bytes) in &files {
+        std::fs::write(dir.path().join(name), bytes).unwrap();
+    }
+    let mut c = start(dir.path(), dir.path()).await;
+    let started = std::time::Instant::now();
+    for (name, _) in &files {
+        let message = c.err("doc_open", json!({"path": name})).await;
+        assert!(!message.is_empty(), "{name}");
+        assert!(!message.contains("FormatError {"), "{name}: plain words, not Debug text: {message}");
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    let high_water = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:")).map(str::to_owned));
+    if let Some(line) = high_water {
+        let kib: u64 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+        assert!(kib < 4 * 1024 * 1024, "the test process stayed under 4 GiB: {line}");
+    }
+    // the session still works afterwards
+    write_png(&dir.path().join("a.png"), 8, 8);
+    c.ok("doc_open", json!({"path": "a.png"})).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hostile_png_header_is_refused_before_the_real_open_path() {
+    let dir = tempfile::tempdir().unwrap();
+    // a real 30000 x 30000 PNG header over a few real bytes
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend_from_slice(&13_u32.to_be_bytes());
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&30_000_u32.to_be_bytes());
+    png.extend_from_slice(&30_000_u32.to_be_bytes());
+    png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    std::fs::write(dir.path().join("huge.png"), &png).unwrap();
+    let mut c = start(dir.path(), dir.path()).await;
+    let started = std::time::Instant::now();
+    let message = c.err("doc_open", json!({"path": "huge.png"})).await;
+    assert!(message.contains("--max-open-mpx"), "{message}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    // the document was never replaced
+    assert_eq!(c.ok("doc_inspect", json!({})).await["document"], json!(null));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aur_manifest_declaring_too_many_pixels_is_refused_by_the_host() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(aur_fixture(), dir.path().join("rich.aur")).unwrap();
+    let roots = Roots::open(&[dir.path().to_path_buf()], &[]).unwrap();
+    let (to_server, server_in) = tokio::io::duplex(1 << 20);
+    let (server_out, from_server) = tokio::io::duplex(1 << 22);
+    let limits = Limits { max_open_pixels: 4, ..Limits::default() };
+    let config = Config { roots, limits, scratch_parent: None };
+    tokio::spawn(aurora_mcp::serve_io(Box::new(AppHost::with_limits(&limits)), config, server_in, server_out));
+    let mut c = Client { to_server, lines: BufReader::new(from_server).lines(), next_id: 1 };
+    c.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}})).await;
+    c.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
+    let message = c.err("doc_open", json!({"path": "rich.aur"})).await;
+    assert!(message.contains("manifest declares"), "{message}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_scratch_dir_option_holds_the_document_store_and_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    write_png(&dir.path().join("a.png"), 16, 16);
+    let roots = Roots::open(&[dir.path().to_path_buf()], &[]).unwrap();
+    let (to_server, server_in) = tokio::io::duplex(1 << 20);
+    let (server_out, from_server) = tokio::io::duplex(1 << 22);
+    let config = Config { roots, limits: Limits::default(), scratch_parent: Some(scratch.path().to_path_buf()) };
+    tokio::spawn(aurora_mcp::serve_io(Box::new(AppHost::new()), config, server_in, server_out));
+    let mut c = Client { to_server, lines: BufReader::new(from_server).lines(), next_id: 1 };
+    c.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}})).await;
+    c.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
+    c.ok("doc_open", json!({"path": "a.png"})).await;
+    let server_dir = std::fs::read_dir(scratch.path()).unwrap().flatten().next().expect("a scratch dir").path();
+    let host_docs: Vec<_> = std::fs::read_dir(server_dir.join("host")).unwrap().flatten().collect();
+    assert_eq!(host_docs.len(), 1, "the document's tile store lives under --scratch-dir");
+}
+
+#[test]
+fn a_stray_println_does_not_reach_the_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    write_png(&dir.path().join("a.png"), 8, 8);
+    let input = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    ]
+    .join("\n")
+        + "\n";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aurora-cli"))
+        .args(["mcp", "--read-root", dir.path().to_str().unwrap()])
+        .env("AURORA_MCP_SELFTEST_STRAY_STDOUT", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stdout.contains("stray output"), "the protocol stream was polluted: {stdout}");
+    for line in stdout.lines() {
+        let value: Value = serde_json::from_str(line).unwrap_or_else(|_| panic!("not JSON: {line}"));
+        assert_eq!(value["jsonrpc"], json!("2.0"));
+    }
+    assert!(stdout.lines().count() >= 2);
+    #[cfg(unix)]
+    assert!(stderr.contains("stray output"), "the stray line went to stderr: {stderr}");
+}
