@@ -937,6 +937,10 @@ impl ServerHandler for AuroraMcp {
                 ));
             }
         }
+        // Wrong types and missing arguments are also protocol errors, not
+        // tool errors: parse them here, the way the tool will, first.
+        check_arguments(&request.name, request.arguments.clone())
+            .map_err(|m| McpError::invalid_params(format!("{}: {m}", request.name), None))?;
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
     }
@@ -982,6 +986,26 @@ impl ServerHandler for AuroraMcp {
         }))
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(result.into())
+    }
+}
+
+/// Parses `arguments` as `tool` will, so a mistake is a `-32602` before
+/// anything runs.
+fn check_arguments(tool: &str, arguments: Option<Map<String, Value>>) -> Result<(), String> {
+    fn parse<T: serde::de::DeserializeOwned>(arguments: Option<Map<String, Value>>) -> Result<(), String> {
+        serde_json::from_value::<T>(Value::Object(arguments.unwrap_or_default()))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    match tool {
+        "command_list" => parse::<ListParams>(arguments),
+        "command_run" => parse::<RunParams>(arguments),
+        "command_batch" => parse::<BatchParams>(arguments),
+        "doc_open" => parse::<OpenParams>(arguments),
+        "doc_inspect" | "psd_check" => parse::<NoParams>(arguments),
+        "render_preview" => parse::<PreviewParams>(arguments),
+        "doc_save" => parse::<SaveParams>(arguments),
+        _ => Ok(()),
     }
 }
 
