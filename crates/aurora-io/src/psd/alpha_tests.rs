@@ -903,3 +903,111 @@ fn alpha_fixtures_for_psd_tools() {
     let back = open(&bytes);
     assert_eq!(back.saved_selections.len(), 4);
 }
+
+// ---------------------------------------------------------------------
+// Review fixes
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_small_zip_merged_image_claiming_huge_planes_is_refused_before_inflating() {
+    use std::io::Write;
+    // 1 MiB of zeros deflates to about a kilobyte; the header claims
+    // 64 Mpx planes, so the planes could never fit in the payload.
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    ok(enc.write_all(&vec![0u8; 1 << 20]));
+    let payload = ok(enc.finish());
+    let mut file = vec![0u8; 8];
+    file.extend_from_slice(&2u16.to_be_bytes());
+    file.extend_from_slice(&payload);
+    let mut src = ok(super::StreamSource::new(Cursor::new(file.clone())));
+    let window = super::Window {
+        pos: 8,
+        end: file.len() as u64,
+    };
+    let header = super::Header {
+        version: 1,
+        channels: 8,
+        color_mode: 3,
+        width: 8000,
+        height: 8000,
+        depth: 8,
+    };
+    let mut bodies = alpha::ResourceBodies::default();
+    bodies.offer(1006, &[1, b'a', 1, b'b', 1, b'c', 1, b'd', 1, b'e']);
+    let started = std::time::Instant::now();
+    let outcome = ok(read_channels_with(
+        &mut src,
+        window,
+        header,
+        3,
+        3,
+        &bodies,
+        Caps::DEFAULT,
+    ));
+    assert!(started.elapsed().as_secs() < 2);
+    assert!(outcome.selections.is_empty());
+    assert_eq!(outcome.unreadable, 5);
+    // Only the two-byte compression field was read: nothing was inflated.
+    assert_eq!(src.total_read, 2);
+}
+
+#[test]
+fn kind_zero_channels_are_reported_as_inverted_back() {
+    let doc = one_alpha(
+        8,
+        0,
+        ramp().iter().map(|b| 255 - b).collect(),
+        KIND_INVERTED,
+    );
+    assert!(
+        doc.report.items.iter().any(|i| i.contains(
+            "1 alpha channel was stored as inverted (Photoshop's \"selected areas\" option) and was inverted back"
+        ) && i.contains("check it")),
+        "{:?}",
+        doc.report.items
+    );
+    let plain = one_alpha(8, 0, ramp(), KIND_PLAIN);
+    assert!(!plain.report.items.iter().any(|i| i.contains("inverted")));
+}
+
+/// A layered file (negative layer count: the merged transparency plane
+/// comes first) with one alpha channel of kind `kind`, whose resource lists
+/// are `listed`.
+fn layered_with_lists(listed: &[ResourceChannel]) -> PsdDocument {
+    use super::test_writer::TestLayer;
+    let white = vec![0xFF; 24];
+    let plane = ramp().iter().map(|b| 255 - b).collect::<Vec<u8>>();
+    open(
+        &TestPsd::new(1, 6, 4, 8)
+            .with(|f| {
+                f.channels = 5;
+                f.negative_count = true;
+                f.layers = vec![TestLayer::pixels("a", 0, 0, 1, 1, 8, &[[0, 0, 0, 255]])];
+                f.merged = Some(vec![
+                    white.clone(),
+                    white.clone(),
+                    white.clone(),
+                    white,
+                    plane,
+                ]);
+                f.resources = resources(listed);
+            })
+            .write(),
+    )
+}
+
+#[test]
+fn resource_lists_with_or_without_a_transparency_entry_map_to_the_right_plane() {
+    // Photoshop's way: Transparency first, then the alpha (inverted, kind 0).
+    let with = layered_with_lists(&[
+        ResourceChannel::transparency(),
+        channel("Mine", KIND_INVERTED),
+    ]);
+    // A writer that lists only the alpha channels.
+    let without = layered_with_lists(&[channel("Mine", KIND_INVERTED)]);
+    for doc in [&with, &without] {
+        assert_eq!(names(doc), ["Mine"], "{:?}", doc.report.items);
+        // kind 0 was applied to the alpha, not shifted onto Transparency.
+        assert_eq!(coverage(&doc.saved_selections[0].1, 6, 4), ramp());
+    }
+}

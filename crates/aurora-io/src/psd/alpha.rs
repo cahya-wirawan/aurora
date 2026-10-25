@@ -320,6 +320,14 @@ impl ResourceBodies {
         self.pascal.is_some() || self.unicode.is_some() || self.display.is_some()
     }
 
+    /// How many planes the resource lists describe (the longest list).
+    pub(crate) fn listed(&self) -> usize {
+        self.pascal_names()
+            .len()
+            .max(self.unicode_names().len())
+            .max(self.display_entries().len())
+    }
+
     fn pascal_names(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let mut rest: &[u8] = self.pascal.as_deref().unwrap_or_default();
@@ -423,6 +431,8 @@ pub(crate) struct Outcome {
     pub over_caps: u64,
     /// Channels in a merged image that could not be read.
     pub unreadable: u64,
+    /// Kept channels stored with kind 0 and inverted back.
+    pub inverted: u64,
 }
 
 /// A name that is valid, unique and at most 64 characters: the file's own
@@ -610,7 +620,10 @@ fn walk_planes(
                 .checked_mul(height)
                 .and_then(|n| n.checked_mul(entry))
                 .ok_or_else(size)?;
-            let used_rows = (last + 1).checked_mul(height).ok_or_else(size)?;
+            let used_rows = (last + 1)
+                .checked_mul(height)
+                .ok_or_else(size)?
+                .min(channels * height);
             if !window.fits(table_all) {
                 return Err(truncated("merged image RLE row lengths"));
             }
@@ -652,6 +665,15 @@ fn walk_planes(
             }
         }
         2 | 3 => {
+            // The merged image's own guard: a payload that could not hold
+            // the planes needed even at deflate's best ratio is refused
+            // before anything is inflated (a few bytes may not claim many
+            // 64 Mpx planes).
+            let needed = plane_len.checked_mul(last + 1).ok_or_else(size)?;
+            let payload = usize::try_from(window.remaining()).unwrap_or(usize::MAX);
+            if payload < needed / super::ZIP_MIN_RATIO_DIVISOR {
+                return Err(truncated("merged image data"));
+            }
             let reader = SourceRead {
                 src,
                 pos: window.pos,
@@ -749,8 +771,19 @@ pub(crate) fn read_channels_with(
     let display = resources.display_entries();
     // (plane, kind, listed name), spot channels set aside.
     let mut wanted: Vec<Wanted> = Vec::new();
+    // Photoshop's lists name the Transparency plane too, but a writer may
+    // list only the alpha channels: when a transparency plane is present and
+    // the lists hold exactly as many entries as there are alpha planes, the
+    // first entry is the first alpha; otherwise the lists start at the
+    // first plane after the colour planes.
+    let alphas = total - first_plane;
+    let base = if first_plane > color_planes && resources.listed() == alphas {
+        first_plane
+    } else {
+        color_planes
+    };
     for plane in first_plane..total {
-        let index = plane - color_planes;
+        let index = plane - base;
         let kind = display.get(index).map_or(KIND_PLAIN, |&(_, kind)| kind);
         if kind == KIND_SPOT {
             outcome.spot += 1;
@@ -800,6 +833,7 @@ pub(crate) fn read_channels_with(
                     outcome.over_caps += 1;
                 } else {
                     bytes = next;
+                    outcome.inverted += u64::from(*kind == KIND_INVERTED);
                     let ordinal = outcome.selections.len() + outcome.empty as usize + 1;
                     let name = selection_name(name.clone(), ordinal, &outcome.selections);
                     outcome.selections.push((name, selection));

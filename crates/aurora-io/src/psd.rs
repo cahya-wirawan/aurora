@@ -647,6 +647,8 @@ enum Note {
     ExtraChannels,
     /// Alpha channels opened as saved selections (task 156).
     AlphaRead,
+    /// Alpha channels stored as inverted (kind 0) and inverted back.
+    AlphaInverted,
     /// Spot colour channels, left out.
     AlphaSpot,
     /// Alpha channels with nothing selected, left out.
@@ -1241,6 +1243,11 @@ fn note_text(note: Note, n: u64) -> String {
             "{n} alpha channel{s} opened as saved selection{s} (Select > Load Selection). \
              A saved .psd writes {} back as alpha channels (Aurora hasn't checked this in \
              Photoshop).",
+            if one { "it" } else { "them" },
+        ),
+        Note::AlphaInverted => format!(
+            "{n} alpha channel{s} {was} stored as inverted (Photoshop's \"selected areas\" \
+             option) and {was} inverted back to read as saved selection{s}; check {}.",
             if one { "it" } else { "them" },
         ),
         Note::AlphaSpot => {
@@ -6151,6 +6158,7 @@ fn decode_source(src: &mut dyn ByteSource, vector_work: u64) -> Result<PsdFile, 
             .saturating_add(outcome.over_caps)
             .saturating_add(outcome.unreadable);
         notes.add_n(Note::AlphaRead, outcome.selections.len() as u64);
+        notes.add_n(Note::AlphaInverted, outcome.inverted);
         notes.add_n(Note::AlphaSpot, outcome.spot);
         notes.add_n(Note::AlphaEmpty, outcome.empty);
         notes.add_n(Note::AlphaOverCaps, outcome.over_caps);

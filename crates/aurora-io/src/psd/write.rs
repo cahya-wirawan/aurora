@@ -442,8 +442,9 @@ impl AlphaItems {
             let list: Vec<&str> = self.written.iter().map(String::as_str).collect();
             items.push(format!(
                 "Saved selections written as alpha channels (white is selected; a rectangle or \
-                 ellipse becomes a pixel mask): {}. The channels are checked with Aurora's \
-                 reader and psd-tools, but Aurora hasn't checked them in Photoshop.",
+                 ellipse becomes a pixel mask): {}. The saved file is re-read and checked with Aurora's \
+                 reader; psd-tools reads files written this way in testing; Aurora hasn't \
+                 checked them in Photoshop.",
                 name_list(&list)
             ));
         }
