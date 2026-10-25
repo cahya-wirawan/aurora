@@ -634,6 +634,17 @@ fn saved_selections_round_trip_bit_for_bit_and_pass_both_verify_passes() {
             "{:?}",
             outcome.report.items
         );
+        // Task 157: unchecked in Photoshop, so it needs attention (asks).
+        let line = outcome
+            .report
+            .entries
+            .iter()
+            .find(|e| e.text.contains("written as alpha channels"));
+        assert_eq!(
+            line.map(|e| e.category),
+            Some(crate::ReportCategory::NeedsAttention)
+        );
+        assert!(line.is_some_and(|e| !e.affected.is_empty()));
     }
 }
 
@@ -676,6 +687,7 @@ fn a_file_without_saved_selections_is_unchanged() {
 
 #[test]
 fn the_report_itemises_exceptions() {
+    use crate::ReportCategory::{Changed, NeedsAttention, NotSaved};
     let mut doc = doc_with_a_layer((10, 10));
     let past = rect_sel(-2, -2, 5, 5);
     let outside = rect_sel(60, 60, 2, 2);
@@ -695,6 +707,31 @@ fn the_report_itemises_exceptions() {
         "{all}"
     );
     assert!(all.contains("hasn't checked them in Photoshop"), "{all}");
+    // Task 157: categories and the selection names.
+    let cat = |needle: &str| {
+        outcome
+            .report
+            .entries
+            .iter()
+            .find(|e| e.text.contains(needle))
+            .map(|e| (e.category, e.affected.clone()))
+    };
+    assert_eq!(
+        cat("wholly outside the canvas"),
+        Some((NotSaved, vec!["Outside".to_owned()]))
+    );
+    assert_eq!(
+        cat("extend past the canvas"),
+        Some((Changed, vec!["Past".to_owned()]))
+    );
+    assert_eq!(
+        cat("reserves the channel name Transparency").map(|c| c.0),
+        Some(Changed)
+    );
+    assert_eq!(
+        cat("written as alpha channels").map(|c| c.0),
+        Some(NeedsAttention)
+    );
     // The reserved name round-trips under its new one.
     let (bytes, _) = write_with(&mut doc, &[("Transparency", &t)]);
     assert_eq!(names(&open(&bytes)), ["Transparency 2"]);

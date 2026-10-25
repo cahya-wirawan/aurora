@@ -176,6 +176,7 @@ use super::write_pixels::{
     MERGED_CHUNK_ROWS, SampleCounts, pack_channel_band, pack_merged_rows, quantize_counted,
     quantize_f16,
 };
+use super::write_report::{PsdWriteReport, ReportCategory, ReportEntry};
 use super::{
     MASK_DISABLED, MASK_PARAMETERS, MAX_GROUP_DEPTH, PSD_MAX_EXTENT, PsdPixelSink, PsdPixels,
     unpack_bits,
@@ -287,21 +288,6 @@ impl std::fmt::Display for PsdSaveRefusal {
     }
 }
 
-/// What a PSD save changes, one human-readable line per kind of change,
-/// in a fixed order (categories A then B of the PSD write plan). Empty
-/// for a lossless save.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PsdWriteReport {
-    pub items: Vec<String>,
-}
-
-impl PsdWriteReport {
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-}
-
 /// Why a smart object's data was not written back (0.200.0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SmartDrop {
@@ -332,6 +318,10 @@ struct Losses {
     smart_dropped: Vec<(String, SmartDrop)>,
     /// Text layers saved as ordinary layers, by name (task 155).
     text_dropped: Vec<(String, TextDrop)>,
+    /// Smart-object layers whose data is written back (task 157): kept.
+    smart_kept: Vec<String>,
+    /// Text layers whose data is written back (task 157): kept.
+    text_kept: Vec<String>,
     long_names: usize,
     rounded_opacity: usize,
     rounded_density: usize,
@@ -393,38 +383,47 @@ struct AlphaItems {
 }
 
 impl AlphaItems {
-    fn items(&self) -> Vec<String> {
+    fn entries(&self) -> Vec<ReportEntry> {
         let mut items = Vec::new();
         if self.canvas_too_large > 0 {
-            items.push(format!(
-                "{} not saved: the canvas is larger than {} megapixels, the most Aurora reads \
-                 back as a selection.",
-                plural(
-                    self.canvas_too_large as u64,
-                    "saved selection is",
-                    "saved selections are"
+            items.push(ReportEntry::new(
+                ReportCategory::NotSaved,
+                format!(
+                    "{} not saved: the canvas is larger than {} megapixels, the most Aurora \
+                     reads back as a selection.",
+                    plural(
+                        self.canvas_too_large as u64,
+                        "saved selection is",
+                        "saved selections are"
+                    ),
+                    aurora_doc::MAX_SELECTION_MASK_PIXELS / (1024 * 1024),
                 ),
-                aurora_doc::MAX_SELECTION_MASK_PIXELS / (1024 * 1024),
             ));
         }
-        for (names, what) in [
+        for (names, what, category) in [
             (
                 &self.outside,
                 "Saved selections not saved, wholly outside the canvas",
+                ReportCategory::NotSaved,
             ),
             (
                 &self.over_caps,
                 "Saved selections not saved, because Aurora could not read them back within its \
                  limits of 64 saved selections and 128 MiB of masks",
+                ReportCategory::NotSaved,
             ),
             (
                 &self.clipped,
                 "Saved selections that extend past the canvas; only the part inside is saved",
+                ReportCategory::Changed,
             ),
         ] {
             if !names.is_empty() {
                 let list: Vec<&str> = names.iter().map(String::as_str).collect();
-                items.push(format!("{what}: {}.", name_list(&list)));
+                items.push(
+                    ReportEntry::new(category, format!("{what}: {}.", name_list(&list)))
+                        .with_affected(&list),
+                );
             }
         }
         if !self.renamed.is_empty() {
@@ -433,20 +432,33 @@ impl AlphaItems {
                 .iter()
                 .map(|(was, now)| format!("\u{201c}{was}\u{201d} as \u{201c}{now}\u{201d}"))
                 .collect();
-            items.push(format!(
-                "Photoshop reserves the channel name Transparency; saved: {}.",
-                list.join(", ")
-            ));
+            let was: Vec<&str> = self.renamed.iter().map(|(was, _)| was.as_str()).collect();
+            items.push(
+                ReportEntry::new(
+                    ReportCategory::Changed,
+                    format!(
+                        "Photoshop reserves the channel name Transparency; saved: {}.",
+                        list.join(", ")
+                    ),
+                )
+                .with_affected(&was),
+            );
         }
         if !self.written.is_empty() {
             let list: Vec<&str> = self.written.iter().map(String::as_str).collect();
-            items.push(format!(
-                "Saved selections written as alpha channels (white is selected; a rectangle or \
-                 ellipse becomes a pixel mask): {}. The saved file is re-read and checked with Aurora's \
-                 reader; psd-tools reads files written this way in testing; Aurora hasn't \
-                 checked them in Photoshop.",
-                name_list(&list)
-            ));
+            items.push(
+                ReportEntry::new(
+                    ReportCategory::NeedsAttention,
+                    format!(
+                        "Saved selections written as alpha channels (white is selected; a \
+                         rectangle or ellipse becomes a pixel mask): {}. The saved file is \
+                         re-read and checked with Aurora's reader; psd-tools reads files written \
+                         this way in testing; Aurora hasn't checked them in Photoshop.",
+                        name_list(&list)
+                    ),
+                )
+                .with_affected(&list),
+            );
         }
         items
     }
@@ -527,7 +539,7 @@ impl Losses {
     /// One line per reason a smart object's data was not written back.
     /// One line per effect kind that is not saved by default, naming the
     /// layers.
-    fn unverified_items(&self) -> Vec<String> {
+    fn unverified_items(&self) -> Vec<ReportEntry> {
         let mut items = Vec::new();
         for kind in [
             "gradient overlay",
@@ -544,16 +556,22 @@ impl Losses {
             if names.is_empty() {
                 continue;
             }
-            items.push(format!(
-                "Not saved (unverified in Photoshop): {kind} on {}.",
-                name_list(&names)
-            ));
+            items.push(
+                ReportEntry::new(
+                    ReportCategory::NotSaved,
+                    format!(
+                        "Not saved (unverified in Photoshop): {kind} on {}.",
+                        name_list(&names)
+                    ),
+                )
+                .with_affected(&names),
+            );
         }
         items
     }
 
     /// One line per reason a text layer's data was not written back.
-    fn text_items(&self) -> Vec<String> {
+    fn text_items(&self) -> Vec<ReportEntry> {
         let mut items = Vec::new();
         for (drop, reason) in [
             (
@@ -579,17 +597,23 @@ impl Losses {
             if names.is_empty() {
                 continue;
             }
-            items.push(format!(
-                "{} will be saved as ordinary pixel layers because {reason}; Photoshop will not \
-                 be able to edit their text. Affected: {}.",
-                plural(names.len() as u64, "text layer", "text layers"),
-                name_list(&names)
-            ));
+            items.push(
+                ReportEntry::new(
+                    ReportCategory::NotSaved,
+                    format!(
+                        "{} will be saved as ordinary pixel layers because {reason}; Photoshop \
+                         will not be able to edit their text. Affected: {}.",
+                        plural(names.len() as u64, "text layer", "text layers"),
+                        name_list(&names)
+                    ),
+                )
+                .with_affected(&names),
+            );
         }
         items
     }
 
-    fn smart_object_items(&self) -> Vec<String> {
+    fn smart_object_items(&self) -> Vec<ReportEntry> {
         let mut items = Vec::new();
         for (drop, reason) in [
             (
@@ -615,48 +639,66 @@ impl Losses {
             if names.is_empty() {
                 continue;
             }
-            items.push(format!(
-                "{} will be saved as ordinary pixel layers because {reason}; Photoshop will not \
-                 be able to open their original contents. Affected: {}.",
-                plural(
-                    names.len() as u64,
-                    "smart object layer",
-                    "smart object layers"
-                ),
-                name_list(&names)
-            ));
+            items.push(
+                ReportEntry::new(
+                    ReportCategory::NotSaved,
+                    format!(
+                        "{} will be saved as ordinary pixel layers because {reason}; Photoshop \
+                         will not be able to open their original contents. Affected: {}.",
+                        plural(
+                            names.len() as u64,
+                            "smart object layer",
+                            "smart object layers"
+                        ),
+                        name_list(&names)
+                    ),
+                )
+                .with_affected(&names),
+            );
         }
         items
     }
 
     #[allow(clippy::too_many_lines)] // one linear list of report lines
     fn report(self) -> PsdWriteReport {
-        let mut items = Vec::new();
+        let mut items: Vec<ReportEntry> = Vec::new();
         if self.long_names > 0 {
-            items.push(format!(
-                "{} longer than {PSD_MAX_NAME_UNITS} characters will be shortened.",
-                plural(self.long_names as u64, "layer name is", "layer names are")
-            ));
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                format!(
+                    "{} longer than {PSD_MAX_NAME_UNITS} characters will be shortened.",
+                    plural(self.long_names as u64, "layer name is", "layer names are")
+                ),
+            );
         }
         if self.rounded_opacity > 0 {
-            items.push(format!(
-                "{} will be rounded to Photoshop's 255 steps.",
-                plural(
-                    self.rounded_opacity as u64,
-                    "layer opacity or fill value",
-                    "layer opacity or fill values"
-                )
-            ));
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                format!(
+                    "{} will be rounded to Photoshop's 255 steps.",
+                    plural(
+                        self.rounded_opacity as u64,
+                        "layer opacity or fill value",
+                        "layer opacity or fill values"
+                    )
+                ),
+            );
         }
         if self.rounded_density > 0 {
-            items.push(format!(
-                "{} will be rounded to Photoshop's 255 steps.",
-                plural(
-                    self.rounded_density as u64,
-                    "layer mask density",
-                    "layer mask densities"
-                )
-            ));
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                format!(
+                    "{} will be rounded to Photoshop's 255 steps.",
+                    plural(
+                        self.rounded_density as u64,
+                        "layer mask density",
+                        "layer mask densities"
+                    )
+                ),
+            );
         }
         let [
             curves,
@@ -672,32 +714,48 @@ impl Losses {
             gradient_map,
         ] = self.adjustment_rounded;
         if curves > 0 {
-            items.push(format!(
-                "{} point positions will be rounded to Photoshop's 255 levels.",
-                plural(curves as u64, "Curves layer's", "Curves layers'")
-            ));
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                format!(
+                    "{} point positions will be rounded to Photoshop's 255 levels.",
+                    plural(curves as u64, "Curves layer's", "Curves layers'")
+                ),
+            );
         }
         if self.curve_merged > 0 {
-            items.push(format!(
-                "{} points less than one level apart will be merged.",
-                plural(self.curve_merged as u64, "Curves layer's", "Curves layers'")
-            ));
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                format!(
+                    "{} points less than one level apart will be merged.",
+                    plural(self.curve_merged as u64, "Curves layer's", "Curves layers'")
+                ),
+            );
         }
         if levels > 0 {
-            items.push(format!(
-                "{} values will be rounded to Photoshop's 255 levels and a gamma to hundredths.",
-                plural(levels as u64, "Levels layer's", "Levels layers'")
-            ));
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                format!(
+                    "{} values will be rounded to Photoshop's 255 levels and a gamma to hundredths.",
+                    plural(levels as u64, "Levels layer's", "Levels layers'")
+                ),
+            );
         }
         if hue > 0 {
-            items.push(format!(
-                "{} fractional values will be rounded to whole numbers.",
-                plural(
-                    hue as u64,
-                    "Hue/Saturation layer's",
-                    "Hue/Saturation layers'"
-                )
-            ));
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                format!(
+                    "{} fractional values will be rounded to whole numbers.",
+                    plural(
+                        hue as u64,
+                        "Hue/Saturation layer's",
+                        "Hue/Saturation layers'"
+                    )
+                ),
+            );
         }
         for (n, one, many, what) in [
             (
@@ -745,133 +803,236 @@ impl Losses {
             ),
         ] {
             if n > 0 {
-                items.push(format!("{} {what}", plural(n as u64, one, many)));
+                add(
+                    &mut items,
+                    ReportCategory::Changed,
+                    format!("{} {what}", plural(n as u64, one, many)),
+                );
             }
         }
         if self.mixer_unchecked > 0 {
-            items.push(format!(
-                "{} written in the layout Aurora inferred (output rows, the constant as the \
+            add(
+                &mut items,
+                ReportCategory::NeedsAttention,
+                format!(
+                    "{} written in the layout Aurora inferred (output rows, the constant as the \
                  fifth value) and not checked in Photoshop; Photoshop may render {} \
                  differently.",
-                plural(
-                    self.mixer_unchecked as u64,
-                    "Channel Mixer layer is",
-                    "Channel Mixer layers are"
+                    plural(
+                        self.mixer_unchecked as u64,
+                        "Channel Mixer layer is",
+                        "Channel Mixer layers are"
+                    ),
+                    if self.mixer_unchecked == 1 {
+                        "it"
+                    } else {
+                        "them"
+                    }
                 ),
-                if self.mixer_unchecked == 1 {
-                    "it"
-                } else {
-                    "them"
-                }
-            ));
+            );
         }
         if self.exposure_trc > 0 {
-            items.push(format!(
-                "{} the grey profile of the Grayscale file it came from, which an RGB file \
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                format!(
+                    "{} the grey profile of the Grayscale file it came from, which an RGB file \
                  cannot carry; {} will be saved as a plain Exposure with the same sliders, and \
                  Photoshop will render {} in sRGB light, differently (about 11 levels on \
                  average in the one file this was measured on).",
-                plural(
-                    self.exposure_trc as u64,
-                    "Exposure layer uses",
-                    "Exposure layers use"
+                    plural(
+                        self.exposure_trc as u64,
+                        "Exposure layer uses",
+                        "Exposure layers use"
+                    ),
+                    if self.exposure_trc == 1 { "it" } else { "they" },
+                    if self.exposure_trc == 1 { "it" } else { "them" },
                 ),
-                if self.exposure_trc == 1 { "it" } else { "they" },
-                if self.exposure_trc == 1 { "it" } else { "them" },
-            ));
+            );
         }
         if self.black_white_written > 0 {
-            items.push(format!(
-                "{} tint colour will be stored as a colour made from its hue and saturation, \
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                format!(
+                    "{} tint colour will be stored as a colour made from its hue and saturation, \
                  and its preset name will be cleared.",
-                plural(
-                    self.black_white_written as u64,
-                    "Black & White layer's",
-                    "Black & White layers'"
-                )
-            ));
+                    plural(
+                        self.black_white_written as u64,
+                        "Black & White layer's",
+                        "Black & White layers'"
+                    )
+                ),
+            );
         }
         if self.hue_ranges_reset > 0 {
-            items.push(format!(
-                "{} custom colour-range edges on ranges that adjust nothing will be saved as \
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                format!(
+                    "{} custom colour-range edges on ranges that adjust nothing will be saved as \
                  Photoshop's standard edges.",
-                plural(
-                    self.hue_ranges_reset as u64,
-                    "Hue/Saturation layer's",
-                    "Hue/Saturation layers'"
-                )
-            ));
+                    plural(
+                        self.hue_ranges_reset as u64,
+                        "Hue/Saturation layer's",
+                        "Hue/Saturation layers'"
+                    )
+                ),
+            );
         }
         if self.hue_colorize_ranges > 0 {
-            items.push(format!(
-                "{} colour-range adjustments are saved in the file, but Aurora ignores them \
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                format!(
+                    "{} colour-range adjustments are saved in the file, but Aurora ignores them \
                  while Colorize is on and will not keep them when it reopens the file.",
-                plural(
-                    self.hue_colorize_ranges as u64,
-                    "Hue/Saturation layer's",
-                    "Hue/Saturation layers'"
-                )
-            ));
+                    plural(
+                        self.hue_colorize_ranges as u64,
+                        "Hue/Saturation layer's",
+                        "Hue/Saturation layers'"
+                    )
+                ),
+            );
         }
         items.extend(self.fx.items());
         if self.fx_angle_rounded {
-            items.push("The global light angle is saved as a whole number of degrees.".to_owned());
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                "The global light angle is saved as a whole number of degrees.".to_owned(),
+            );
         }
         if self.fx_gradient_box > 0 {
-            items.push(format!(
-                "{} gradient effects were laid over a box other than the area the layer is \
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                format!(
+                    "{} gradient effects were laid over a box other than the area the layer is \
                  saved with; Photoshop will align them to the saved area.",
-                plural(self.fx_gradient_box as u64, "layer's", "layers'")
-            ));
+                    plural(self.fx_gradient_box as u64, "layer's", "layers'")
+                ),
+            );
         }
         items.extend(self.unverified_items());
         if self.fx.layers > 0 {
-            items.push(format!(
-                "{} effects are saved in the file, but Aurora hasn't checked them in Photoshop: \
+            add(
+                &mut items,
+                ReportCategory::NeedsAttention,
+                format!(
+                    "{} effects are saved in the file, but Aurora hasn't checked them in Photoshop: \
                  neither the layout nor how Photoshop draws them is verified.",
-                plural(self.fx.layers as u64, "layer's", "layers'")
-            ));
+                    plural(self.fx.layers as u64, "layer's", "layers'")
+                ),
+            );
         }
         items.extend(self.smart_object_items());
         items.extend(self.text_items());
-        items.extend(self.alpha.items());
+        items.extend(self.alpha.entries());
         if !self.outline_dropped.is_empty() {
             let names: Vec<&str> = self.outline_dropped.iter().map(String::as_str).collect();
-            items.push(format!(
-                "The vector outline of {} is not saved: its effects are saved, but a file \
+            add_named(
+                &mut items,
+                ReportCategory::NotSaved,
+                &self.outline_dropped,
+                format!(
+                    "The vector outline of {} is not saved: its effects are saved, but a file \
                  reopened here draws strokes, glows and shadows from the pixels' alpha, which \
                  can differ where the fill is translucent. Affected: {}.",
-                plural(names.len() as u64, "shape layer", "shape layers"),
-                name_list(&names)
-            ));
+                    plural(names.len() as u64, "shape layer", "shape layers"),
+                    name_list(&names)
+                ),
+            );
         }
         if self.dissolve > 0 {
-            items.push(
+            add(
+                &mut items,
+                ReportCategory::NeedsAttention,
                 "Dissolve layers will look different in apps other than Photoshop.".to_owned(),
             );
         }
         if self.unreopenable {
-            items.push(format!(
-                "Aurora can't reopen this file yet: its layers add up to more than {} pixels. \
+            add(
+                &mut items,
+                ReportCategory::NeedsAttention,
+                format!(
+                    "Aurora can't reopen this file yet: its layers add up to more than {} pixels. \
                  Photoshop can open it.",
-                group_thousands(super::PIXEL_BUDGET)
-            ));
+                    group_thousands(super::PIXEL_BUDGET)
+                ),
+            );
         }
         if self.clipped > 0 {
-            items.push(format!(
-                "{} outside the 0–1 range will be clipped.",
-                plural(self.clipped, "colour value", "colour values")
-            ));
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                format!(
+                    "{} outside the 0–1 range will be clipped.",
+                    plural(self.clipped, "colour value", "colour values")
+                ),
+            );
         }
         if self.nan > 0 {
-            items.push(format!(
-                "{} that {} not a number will be written as 0.",
-                plural(self.nan, "colour value", "colour values"),
-                if self.nan == 1 { "is" } else { "are" }
-            ));
+            add(
+                &mut items,
+                ReportCategory::Changed,
+                format!(
+                    "{} that {} not a number will be written as 0.",
+                    plural(self.nan, "colour value", "colour values"),
+                    if self.nan == 1 { "is" } else { "are" }
+                ),
+            );
         }
-        PsdWriteReport { items }
+        // Information only (task 157): what is written back as it was read.
+        if !self.smart_kept.is_empty() {
+            let names: Vec<&str> = self.smart_kept.iter().map(String::as_str).collect();
+            add_named(
+                &mut items,
+                ReportCategory::Kept,
+                &self.smart_kept,
+                format!(
+                    "{} saved with their original contents unchanged, so Photoshop can open \
+                     them as smart objects (Aurora hasn't checked this in Photoshop). Layers: {}.",
+                    plural(
+                        names.len() as u64,
+                        "smart object layer is",
+                        "smart object layers are"
+                    ),
+                    name_list(&names)
+                ),
+            );
+        }
+        if !self.text_kept.is_empty() {
+            let names: Vec<&str> = self.text_kept.iter().map(String::as_str).collect();
+            add_named(
+                &mut items,
+                ReportCategory::Kept,
+                &self.text_kept,
+                format!(
+                    "{} saved with their original text data unchanged, so Photoshop can edit \
+                     their text (Aurora hasn't checked this in Photoshop). Layers: {}.",
+                    plural(names.len() as u64, "text layer is", "text layers are"),
+                    name_list(&names)
+                ),
+            );
+        }
+        PsdWriteReport::from_entries(items)
     }
+}
+
+/// Appends an entry.
+fn add(items: &mut Vec<ReportEntry>, category: ReportCategory, text: String) {
+    items.push(ReportEntry::new(category, text));
+}
+
+/// Appends an entry that names layers.
+fn add_named(
+    items: &mut Vec<ReportEntry>,
+    category: ReportCategory,
+    names: &[String],
+    text: String,
+) {
+    items.push(ReportEntry::new(category, text).with_affected(names));
 }
 
 /// `268435456` as `268,435,456`.
@@ -1754,6 +1915,9 @@ fn smart_for(
             aurora_doc::SmartObjectBlock { key: b.key, data }
         })
         .collect();
+    losses
+        .smart_kept
+        .push(layers.name(id).unwrap_or_default().to_owned());
     Ok(Some(PsdExpectedSmart {
         unique_id: smart.unique_id.clone(),
         blocks,
@@ -1794,6 +1958,9 @@ fn text_for(
     while !data.len().is_multiple_of(4) {
         data.push(0);
     }
+    losses
+        .text_kept
+        .push(layers.name(id).unwrap_or_default().to_owned());
     Ok(Some(PsdExpectedText {
         key: text.key,
         data,

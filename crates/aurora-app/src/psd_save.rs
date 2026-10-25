@@ -2,7 +2,8 @@
 //! `App::save_psd_file` is built from, so the whole flow is testable
 //! without a window.
 //!
-//! A *lossless* PSD save (an empty report, nothing carried from the open)
+//! A *lossless* PSD save (a report with no line that asks: only
+//! [`aurora_io::ReportCategory::Kept`] ones, see [`crate::psd_report`])
 //! is a real save: the document becomes clean and takes the `.psd` path
 //! and name, and a close or quit Save to it goes ahead (design-owner
 //! decision, 2026-10-10, bringing R4's "clean if lossless" forward). A
@@ -41,6 +42,27 @@ use crate::document_session::DocumentId;
 pub(crate) const PSD_SAVE_WITH_CHANGES_TITLE: &str = "Save With Changes?";
 pub(crate) const PSD_SAVE_ANYWAY: &str = "psd.save.anyway";
 pub(crate) const PSD_SAVE_CANCEL: &str = "psd.save.cancel";
+
+/// The command id, palette/menu label and dialogs of "Check PSD
+/// Compatibility" (task 157).
+pub(crate) const COMMAND_CHECK: &str = "file.check_psd";
+pub(crate) const CHECK_TITLE: &str = "Check PSD Compatibility\u{2026}";
+pub(crate) const PSD_CHECK_TITLE: &str = "Photoshop Compatibility";
+pub(crate) const PSD_CHECK_FAILED_TITLE: &str = "Can't Check Photoshop Compatibility";
+pub(crate) const PSD_CHECK_OK: &str = "psd.check.ok";
+/// The calm status-bar notice when the check's result cannot be shown because
+/// another dialog is open (the result is also logged).
+pub(crate) const PSD_CHECK_BUSY_NOTICE: &str = "The Photoshop compatibility check couldn't be shown because a dialog is open. Close it and \
+     check again.";
+
+/// The check dialog's single "OK" (default and cancel).
+pub(crate) fn psd_check_dialog_actions() -> Vec<DialogAction> {
+    vec![
+        DialogAction::new(PSD_CHECK_OK, "OK")
+            .as_default()
+            .as_cancel(),
+    ]
+}
 
 /// Why a `.psb` name is refused until round R5.
 pub(crate) const PSB_NOT_YET: &str = "PSB isn't supported yet. Choose a name ending in .psd, \
@@ -118,46 +140,34 @@ pub(crate) fn psd_save_choice(action: &str) -> Option<PsdSaveChoice> {
     }
 }
 
-/// The dialog's message: the report's items, one per line, in the
-/// report's own fixed order, then what Save Anyway does and does not do.
+/// The dialog's message: the report grouped by category with counts
+/// ([`crate::psd_report`]), then what Save Anyway does and does not do.
 pub(crate) fn psd_save_message(file_name: &str, report: &aurora_io::PsdWriteReport) -> String {
-    let mut message = format!("Saving \u{201c}{file_name}\u{201d} as a Photoshop file changes it:");
-    for item in &report.items {
-        message.push_str("\n\u{2022} ");
-        message.push_str(item);
-    }
-    message.push_str(
-        "\nSave Anyway writes the file with these changes; your document is not changed. \
-         Nothing has been written yet.",
-    );
-    message
+    crate::psd_report::save_message(file_name, report)
 }
 
-/// The heading of the report's "carried from open" block (H-1).
-pub(crate) const CARRIED_HEADING: &str =
-    "This file was opened with changes; saving writes it as Aurora shows it:";
-
-/// The report lines carried from the document's own open (0.177.0 review
-/// H-1): its "Opened With Changes" lines under [`CARRIED_HEADING`], and a
-/// line for tiles a `.aur` open found missing. Empty for a faithful open.
+/// The report entries carried from the document's own open (0.177.0 review
+/// H-1; task 157: one [`aurora_io::ReportCategory::FromOpen`] entry per
+/// "Opened With Changes" line), and one for tiles a `.aur` open found
+/// missing. Empty for a faithful open.
 pub(crate) fn carried_losses(
     import_losses: Option<&[String]>,
     skipped_tiles: &aurora_io::SkippedTiles,
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    let opened: &[String] = import_losses.unwrap_or_default();
-    if !opened.is_empty() {
-        lines.push(CARRIED_HEADING.to_owned());
-        lines.extend(opened.iter().map(|line| format!("\u{2013} {line}")));
-    }
+) -> Vec<aurora_io::ReportEntry> {
+    use aurora_io::{ReportCategory, ReportEntry};
+    let mut entries: Vec<ReportEntry> = import_losses
+        .unwrap_or_default()
+        .iter()
+        .map(|line| ReportEntry::new(ReportCategory::FromOpen, line.clone()))
+        .collect();
     if !skipped_tiles.is_empty() {
-        lines.push(
+        entries.push(ReportEntry::new(
+            ReportCategory::Changed,
             "Some of this document's tiles were missing when it was opened; they are saved as \
-             transparent."
-                .to_owned(),
-        );
+             transparent.",
+        ));
     }
-    lines
+    entries
 }
 
 /// Saved selections are written as PSD alpha channels (task 156) by
@@ -169,6 +179,24 @@ pub(crate) fn carried_losses(
 /// The report line for paths (0.233.0): a PSD does not carry them.
 pub(crate) fn paths_loss_line(selection: &aurora_doc::SelectionSet) -> Option<String> {
     (!selection.paths().is_empty()).then(|| "Paths are not saved in a Photoshop file.".to_owned())
+}
+
+/// [`paths_loss_line`] as a Not saved entry.
+pub(crate) fn paths_loss_entry(
+    selection: &aurora_doc::SelectionSet,
+) -> Option<aurora_io::ReportEntry> {
+    paths_loss_line(selection)
+        .map(|line| aurora_io::ReportEntry::new(aurora_io::ReportCategory::NotSaved, line))
+}
+
+/// [`colour_loss_lines`] as Needs attention entries: the profile is not kept.
+pub(crate) fn colour_loss_entries(
+    colour: &aurora_io::DocumentColour,
+) -> Vec<aurora_io::ReportEntry> {
+    colour_loss_lines(colour)
+        .into_iter()
+        .map(|line| aurora_io::ReportEntry::new(aurora_io::ReportCategory::NeedsAttention, line))
+        .collect()
 }
 
 /// The report lines for a document with colour metadata: a PSD is written in
@@ -256,7 +284,7 @@ pub(crate) struct PsdSaveSource<'a> {
     pub(crate) doc_id: DocumentId,
     pub(crate) revision: crate::UndoRevision,
     /// [`carried_losses`] for this document, appended to the report.
-    pub(crate) carried: Vec<String>,
+    pub(crate) carried: Vec<aurora_io::ReportEntry>,
 }
 
 /// Runs the preflight, composites the document, writes and verifies the
@@ -357,8 +385,9 @@ pub(crate) fn begin_psd_save_timed(
         }
         Err(err) => return Err(PsdSaveFailure::Write(err)),
     };
-    // The fixed-order "carried from open" block goes last (category C).
-    outcome.report.items.extend(source.carried);
+    // The lines carried from the open, and the colour and path notes, are
+    // entries of their own categories (task 157).
+    outcome.report.extend_entries(source.carried);
     if outcome.report.is_empty() {
         let started = Instant::now();
         let advisory = temp.persist();
@@ -370,12 +399,112 @@ pub(crate) fn begin_psd_save_timed(
             PsdSaveStep::Saved
         });
     }
+    tracing::info!(
+        report = %crate::psd_report::SaveReport::new(&outcome.report).full_text(),
+        "the Photoshop save asks first"
+    );
     Ok(PsdSaveStep::NeedsConfirmation(PendingPsdSave {
         temp,
         doc_id: source.doc_id,
         revision: source.revision,
         report: outcome.report,
     }))
+}
+
+/// A writer that keeps nothing: it counts its position and length so the
+/// PSD writer, which seeks back to patch lengths, runs unchanged.
+#[derive(Debug, Default)]
+struct CountingSink {
+    pos: u64,
+    len: u64,
+}
+
+impl std::io::Write for CountingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.pos = self.pos.saturating_add(buf.len() as u64);
+        self.len = self.len.max(self.pos);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Seek for CountingSink {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        let target = match to {
+            std::io::SeekFrom::Start(n) => Some(n),
+            std::io::SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+            std::io::SeekFrom::End(d) => self.len.checked_add_signed(d),
+        };
+        let Some(target) = target else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek before the start",
+            ));
+        };
+        self.pos = target;
+        Ok(target)
+    }
+}
+
+/// "Check PSD Compatibility" (task 157): the report a Save As `.psd` would
+/// show, without writing a file. It runs the preflight, composites the
+/// document and runs the real writer into a sink that keeps nothing, so
+/// the measured lines (clipped colours, kept and dropped smart objects and
+/// text, alpha channels) are the ones a save would give. Nothing is
+/// created on disk and the document is untouched. The cost is a save's
+/// without its disk writes and verification (the composite and the tile
+/// reads), on the calling thread.
+pub(crate) fn check_psd_compatibility(
+    source: PsdSaveSource<'_>,
+) -> Result<aurora_io::PsdWriteReport, PsdSaveFailure> {
+    let opts = aurora_io::PsdSaveOptions::default();
+    aurora_io::psd_save_preflight(source.layers, source.canvas, opts)
+        .map_err(|refusal| PsdSaveFailure::Refused(refusal.to_string()))?;
+    let (width, height) = source.canvas;
+    let image = crate::composite_document(source.layers, source.store, width, height)
+        .map_err(PsdSaveFailure::Composite)?;
+    let mut composite = &image;
+    let mut sink = CountingSink::default();
+    let outcome = aurora_io::write_psd_with_selections(
+        &mut sink,
+        source.layers,
+        source.canvas,
+        &mut composite,
+        source.store,
+        opts,
+        &source.saved,
+    )
+    .map_err(|err| match err {
+        aurora_io::IoError::PsdSaveRefused(refusal) => PsdSaveFailure::Refused(refusal.to_string()),
+        other => PsdSaveFailure::Write(other),
+    })?;
+    let mut report = outcome.report;
+    report.extend_entries(source.carried);
+    Ok(report)
+}
+
+/// The text of the "can't check" dialog for a failed [`check_psd_compatibility`].
+pub(crate) fn psd_check_failure_message(failure: &PsdSaveFailure) -> String {
+    match failure {
+        PsdSaveFailure::Refused(reason) => format!(
+            "Aurora can't save this document as a Photoshop file: {reason}. No file was written."
+        ),
+        PsdSaveFailure::Composite(err) => format!(
+            "Aurora couldn't combine the document's layers to check it. Details: {}. No file \
+             was written.",
+            crate::display_error_detail(err)
+        ),
+        PsdSaveFailure::Write(err) => format!(
+            "Aurora couldn't finish checking the document. Details: {}. No file was written.",
+            crate::display_error_detail(err)
+        ),
+        PsdSaveFailure::DocumentChanged => {
+            "The document changed while it was being checked. No file was written.".to_owned()
+        }
+    }
 }
 
 /// Save Anyway: swaps the pending file in — only if `doc_id` and

@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.292.0] - 2026-10-25
+
+### Added
+
+- Record the grouped PSD save report, the compatibility check and the round-trip report
+
 ## [0.291.0] - 2026-10-25
 
 ### Added
