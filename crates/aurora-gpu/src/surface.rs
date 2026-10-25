@@ -116,6 +116,21 @@ impl GpuSurface<'_> {
         (self.config.width, self.config.height)
     }
 
+    /// Lets frames be read back (`COPY_SRC` on the swapchain texture), for
+    /// the automation bridge's screenshots. Returns whether the surface
+    /// supports it; an unsupported surface is left as it was. Not done by
+    /// default: a copy-capable swapchain can cost presentation speed on
+    /// some platforms.
+    pub fn enable_capture(&mut self, gpu: &GpuContext) -> bool {
+        let caps = self.surface.get_capabilities(gpu.adapter());
+        if !caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+            return false;
+        }
+        self.config.usage |= wgpu::TextureUsages::COPY_SRC;
+        self.surface.configure(gpu.device(), &self.config);
+        true
+    }
+
     /// Reconfigures the surface with `mode`. Only `Fifo`, which every
     /// surface supports, and wgpu's `AutoVsync`/`AutoNoVsync`, which fall
     /// back by support, are safe to pass; another mode a surface lacks

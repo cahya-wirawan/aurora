@@ -1194,6 +1194,15 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
         Window,
         Ui,
     ),
+    CommandSpec::new(
+        "automation.disconnect",
+        "Disconnect Automation",
+        "Disconnects the automation controller (an MCP session driving this window) and turns \
+         the bridge off until Aurora is restarted: its token stops working and its discovery \
+         file is removed. Does nothing when the bridge is not enabled.",
+        Window,
+        Ui,
+    ),
     // -- Not in the static palette --
     CommandSpec::new(
         "app.quit",

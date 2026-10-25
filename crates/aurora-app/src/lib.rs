@@ -6214,6 +6214,9 @@ enum ActivatedCommand {
     /// Swap the foreground and background colours (0.208.0): `X`, the
     /// palette and the Tools panel's swap button.
     SwapColours,
+    /// Disconnect the automation controller and turn the bridge off
+    /// (task 160): the palette command `automation.disconnect`.
+    DisconnectAutomation,
     /// Fit on Screen or 100% (0.275.0): `Primary+0`/`Primary+1`, the
     /// palette and the View menus.
     ViewZoom(zoomed_view::ViewZoom),
@@ -6813,6 +6816,9 @@ fn activate_command(
     }
     if id == COMMAND_COLOURS_SWAP {
         return Some(ActivatedCommand::SwapColours);
+    }
+    if id == bridge_app::COMMAND_DISCONNECT {
+        return Some(ActivatedCommand::DisconnectAutomation);
     }
     if id == zoomed_view::COMMAND_FIT_ON_SCREEN {
         return Some(ActivatedCommand::ViewZoom(zoomed_view::ViewZoom::Fit));
@@ -32043,6 +32049,14 @@ impl App {
         // press hiding it. Not a modifier-only press and not a shortcut
         // chord: see `key_shows_focus_ring`.
         let key = translate_key(&event.logical_key);
+        self.handle_key_pressed(key, event.text.as_deref());
+    }
+
+    /// A key press already translated: the body of [`Self::handle_key_event`],
+    /// which the automation bridge (`ui_key`, task 160) calls with a synthetic
+    /// key so it reaches exactly the handlers a real key does.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn handle_key_pressed(&mut self, key: Option<Key>, text: Option<&str>) {
         if key_shows_focus_ring(key.as_ref(), self.modifiers) {
             self.focus
                 .note_input(&mut self.workspace.tree, FocusOrigin::Keyboard);
@@ -32097,7 +32111,7 @@ impl App {
             self.command_palette.is_some(),
             self.modifiers,
             key,
-            event.text.as_deref(),
+            text,
             &mut self.clipboard,
         );
         if let Some((owner, KeyOutcome::Handled(outcome))) = routed {
@@ -32177,7 +32191,7 @@ impl App {
             &self.shortcuts,
             self.modifiers,
             key,
-            event.text.as_deref(),
+            text,
             &mut self.clipboard,
             &mut self.file_dialog,
         );
@@ -32291,6 +32305,7 @@ impl App {
                 self.run_layer_command(LayerCommand::SetClip(on));
             }
             Some(ActivatedCommand::SwapColours) => self.swap_colours(),
+            Some(ActivatedCommand::DisconnectAutomation) => self.disconnect_automation(),
             Some(ActivatedCommand::ViewZoom(command)) => self.apply_view_zoom(command),
             Some(ActivatedCommand::ResetColours) => self.reset_colours(),
             Some(ActivatedCommand::Selection(command)) => self.run_selection_command(command),

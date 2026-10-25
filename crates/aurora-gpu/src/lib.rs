@@ -22,6 +22,7 @@
 //! `aurora-app`'s own canvas rendering (PLAN.md M1.8) to use.
 
 mod canvas;
+pub mod capture;
 mod context;
 mod display;
 #[cfg(test)]
