@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.295.3] - 2026-10-25
+
+### Fixed
+
+- Fix the Windows bridge root-list test: use the platform path separator
+
 ## [0.295.2] - 2026-10-25
 
 ### Fixed
