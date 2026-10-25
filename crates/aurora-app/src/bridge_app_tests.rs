@@ -72,8 +72,13 @@ fn the_flag_and_the_environment_enable_it() {
             "{v:?}"
         );
     }
+    // The list separator is the platform's (`:` on Unix, `;` on Windows).
+    let read_list = std::env::join_paths(["/a", "/b"])
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let env = |n: &str| match n {
-        "AURORA_MCP_BRIDGE_ROOTS" => Some("/a:/b".to_owned()),
+        "AURORA_MCP_BRIDGE_ROOTS" => Some(read_list.clone()),
         "AURORA_MCP_BRIDGE_WRITE_ROOTS" => Some("/w".to_owned()),
         _ => None,
     };
