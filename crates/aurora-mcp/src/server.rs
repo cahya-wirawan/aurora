@@ -415,6 +415,7 @@ impl Drop for Watch {
 
 /// Creates a private (`0700` on Unix) directory.
 fn private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {

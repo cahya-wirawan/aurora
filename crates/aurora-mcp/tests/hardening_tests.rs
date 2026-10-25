@@ -14,6 +14,7 @@ mod common;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+#[cfg_attr(not(unix), allow(unused_imports))]
 use aurora_mcp::{Limits, PathError, Roots, header};
 use common::{Mock, dirs, start, start_with};
 use serde_json::{Value, json};
@@ -507,6 +508,7 @@ async fn staged_copies_are_owner_only() {
 
 /// A directory shaped like one of the server's, with or without its marker
 /// and lock file.
+#[cfg(unix)]
 fn fake_scratch(
     parent: &std::path::Path,
     suffix: &str,
@@ -526,6 +528,7 @@ fn fake_scratch(
     dir
 }
 
+#[cfg(unix)] // the sweep and its symlink case are Unix-only
 #[test]
 fn a_dead_servers_scratch_is_swept_and_nothing_else_is() {
     use aurora_mcp::scratch::{PREFIX, Scratch, sweep_stale};

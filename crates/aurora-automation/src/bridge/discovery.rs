@@ -124,9 +124,9 @@ pub fn default_dir() -> Option<PathBuf> {
     }
     #[cfg(windows)]
     {
-        return std::env::var_os("LOCALAPPDATA")
+        std::env::var_os("LOCALAPPDATA")
             .filter(|v| !v.is_empty())
-            .map(|base| PathBuf::from(base).join("Aurora").join("bridge"));
+            .map(|base| PathBuf::from(base).join("Aurora").join("bridge"))
     }
     #[cfg(not(windows))]
     {
@@ -164,6 +164,7 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -353,6 +354,7 @@ fn private_options() -> OpenOptions {
     options
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn make_owner_only(file: &File) -> io::Result<()> {
     #[cfg(unix)]
     {
