@@ -260,6 +260,7 @@ impl HeadlessSession {
     ///
     /// # Errors
     /// The file cannot be decoded or installed.
+    #[allow(clippy::too_many_lines)]
     pub fn open(&mut self, staged: &Path, name: &str) -> Result<Value, Failure> {
         let scratch = tempfile::Builder::new()
             .prefix("aurora-mcp-doc-")
@@ -320,7 +321,7 @@ impl HeadlessSession {
                 let size = image.size;
                 notes.extend(image.colour.report.warnings.iter().cloned());
                 notes.extend(image.colour.report.info.iter().cloned());
-                colour.source = image.colour.source.clone();
+                colour.source.clone_from(&image.colour.source);
                 let (layers, history, layer_id) = crate::document_from_size(stem.clone(), size);
                 let (_freed, bad) = crate::replace_document_pixels_prepared(
                     &mut store,
@@ -459,6 +460,7 @@ impl HeadlessSession {
     ///
     /// # Errors
     /// [`Failure::NotAvailable`] for a command that needs a window.
+    #[allow(clippy::too_many_lines)]
     pub fn run_command(&mut self, call: &Validated) -> Result<Value, Failure> {
         let id = call.id.as_str();
         match id {
@@ -680,6 +682,7 @@ impl HeadlessSession {
     ///
     /// # Errors
     /// No document, too large to composite, cancelled, or a failure.
+    #[allow(clippy::cast_sign_loss)] // a positive scale of positive sides
     pub fn preview(
         &mut self,
         max_side: u32,
@@ -855,41 +858,41 @@ fn box_downscale(
     tw: u32,
     th: u32,
 ) -> Result<aurora_io::Image, aurora_io::IoError> {
-    let (w, h) = (image.width() as usize, image.height() as usize);
+    let (width, height) = (image.width() as usize, image.height() as usize);
     let (tw_us, th_us) = (tw as usize, th as usize);
     let src = image.samples();
     let channels = aurora_tile::CHANNELS;
     let mut out = vec![half::f16::from_f32(0.0); tw_us * th_us * channels];
     for ty in 0..th_us {
-        let y0 = ty * h / th_us;
-        let y1 = ((ty + 1) * h / th_us).max(y0 + 1).min(h);
+        let y0 = ty * height / th_us;
+        let y1 = ((ty + 1) * height / th_us).max(y0 + 1).min(height);
         for tx in 0..tw_us {
-            let x0 = tx * w / tw_us;
-            let x1 = ((tx + 1) * w / tw_us).max(x0 + 1).min(w);
-            let (mut r, mut g, mut b, mut a) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
-            let mut n = 0.0_f32;
+            let x0 = tx * width / tw_us;
+            let x1 = ((tx + 1) * width / tw_us).max(x0 + 1).min(width);
+            let mut sum = [0.0_f32; 4];
+            let mut count = 0.0_f32;
             for y in y0..y1 {
                 for x in x0..x1 {
-                    let i = (y * w + x) * channels;
+                    let i = (y * width + x) * channels;
                     if let Some(px) = src.get(i..i + 4) {
                         let alpha = px.get(3).map_or(0.0, |v| v.to_f32());
-                        r += px.first().map_or(0.0, |v| v.to_f32()) * alpha;
-                        g += px.get(1).map_or(0.0, |v| v.to_f32()) * alpha;
-                        b += px.get(2).map_or(0.0, |v| v.to_f32()) * alpha;
-                        a += alpha;
-                        n += 1.0;
+                        for (slot, value) in sum.iter_mut().zip(px.iter().take(3)) {
+                            *slot += value.to_f32() * alpha;
+                        }
+                        sum[3] += alpha;
+                        count += 1.0;
                     }
                 }
             }
             let o = (ty * tw_us + tx) * channels;
             if let Some(dst) = out.get_mut(o..o + 4) {
-                let (cr, cg, cb) = if a > 0.0 {
-                    (r / a, g / a, b / a)
-                } else {
-                    (0.0, 0.0, 0.0)
-                };
-                let ca = if n > 0.0 { a / n } else { 0.0 };
-                for (slot, v) in dst.iter_mut().zip([cr, cg, cb, ca]) {
+                let alpha_sum = sum.get(3).copied().unwrap_or(0.0);
+                let mean = |c: f32| if alpha_sum > 0.0 { c / alpha_sum } else { 0.0 };
+                let mean_alpha = if count > 0.0 { alpha_sum / count } else { 0.0 };
+                for (slot, v) in
+                    dst.iter_mut()
+                        .zip([mean(sum[0]), mean(sum[1]), mean(sum[2]), mean_alpha])
+                {
                     *slot = half::f16::from_f32(v);
                 }
             }

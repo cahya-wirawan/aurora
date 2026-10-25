@@ -172,6 +172,8 @@ fn ok_json(value: &Value) -> CallToolResult {
     }
 }
 
+// The tool functions return `Result<_, McpError>`; this keeps their bodies uniform.
+#[allow(clippy::unnecessary_wraps)]
 fn to_result(outcome: Result<Value, Fail>) -> Result<CallToolResult, McpError> {
     match outcome {
         Ok(value) => Ok(ok_json(&value)),

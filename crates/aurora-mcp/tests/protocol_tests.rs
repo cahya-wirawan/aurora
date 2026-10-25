@@ -212,7 +212,7 @@ async fn bad_arguments_are_32602_before_anything_runs() {
         client
             .rpc_error(
                 "command_run",
-                json!({"id": "select.expand", "args": {"amount": 100000}})
+                json!({"id": "select.expand", "args": {"amount": 100_000}})
             )
             .await,
         -32602

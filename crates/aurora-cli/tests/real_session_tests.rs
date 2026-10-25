@@ -3,6 +3,7 @@
 //! process over a duplex stream, plus the binary itself for stdout hygiene.
 
 #![allow(
+    clippy::too_many_lines,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
@@ -71,7 +72,7 @@ impl Client {
             .await;
         loop {
             let line =
-                tokio::time::timeout(std::time::Duration::from_secs(120), self.lines.next_line())
+                tokio::time::timeout(std::time::Duration::from_mins(2), self.lines.next_line())
                     .await
                     .expect("reply in time")
                     .unwrap()
