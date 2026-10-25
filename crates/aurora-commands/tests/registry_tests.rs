@@ -71,7 +71,9 @@ fn the_ids_titles_and_presence_are_pinned_by_the_golden_file() {
     if std::env::var_os("AURORA_UPDATE_GOLDEN").is_some() {
         std::fs::write(path, &actual).unwrap_or(());
     }
-    let golden = include_str!("command_ids.tsv");
+    // A Windows checkout may convert the file to CRLF; the golden is the
+    // same text either way.
+    let golden = include_str!("command_ids.tsv").replace("\r\n", "\n");
     assert_eq!(
         actual, golden,
         "the registry changed; see docs/command-registry.md"
