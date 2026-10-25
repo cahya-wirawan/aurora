@@ -26,6 +26,7 @@ authors = ["Cahya Wirawan"]
 # dependency here does not make it legal, see docs/adr and PRD §7.2.
 aurora-core = { path = "crates/aurora-core" }
 aurora-commands = { path = "crates/aurora-commands" }
+aurora-mcp = { path = "crates/aurora-mcp" }
 aurora-tile = { path = "crates/aurora-tile" }
 aurora-graph = { path = "crates/aurora-graph" }
 aurora-gpu = { path = "crates/aurora-gpu" }
@@ -119,6 +120,18 @@ rayon = "1"
 # lighter than the full `image` crate, which this doesn't need.
 png = "0.17"
 wgpu = "30"
+# ADR 0014 (task 159): the MCP server. `rmcp` is the protocol SDK (stdio
+# transport, tool and resource plumbing), `tokio` is its runtime and is used
+# for the MCP's own I/O only -- never the render loop (ADR 0014), `cap-std`
+# confines every path the server reads or writes to a granted root, and
+# `schemars`/`serde_json`/`base64` are the tool schemas, JSON replies and
+# image content. Only `aurora-mcp` and `aurora-cli` reach them.
+rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "io-util", "time"] }
+cap-std = "4"
+schemars = "1"
+serde_json = "1"
+base64 = "0.22"
 pollster = "1"
 # Default features minus `wayland-csd-adwaita`, plus `wayland-csd-adwaita-crossfont`:
 # the stock feature renders Wayland's fallback window-decoration title text via
