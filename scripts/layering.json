@@ -126,6 +126,11 @@
     "aurora-text",
     "aurora-io",
     "aurora-ai",
-    "aurora-plugin"
+    "aurora-plugin",
+    "aurora-mcp",
+    "aurora-app"
+  ],
+  "aurora-mcp": [
+    "aurora-commands"
   ]
 }

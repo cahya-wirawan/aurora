@@ -51,6 +51,7 @@ mod safe_save;
 pub mod tiff;
 
 pub use aur::IMPORT_LOSSES_FALLBACK;
+pub use aur::peek_canvas_size as peek_aur_canvas_size;
 pub use aur::{
     AurDocument, AurSnapshot, SkippedTile, SkippedTileRecord, SkippedTiles, read as read_aur,
     snapshot_best_effort as snapshot_aur_best_effort, write as write_aur,

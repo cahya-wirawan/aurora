@@ -376,7 +376,7 @@ fn open_document(
 }
 
 /// Every document tile, row by row.
-fn document_tiles(width: u32, height: u32) -> Vec<aurora_tile::TileId> {
+pub(crate) fn document_tiles(width: u32, height: u32) -> Vec<aurora_tile::TileId> {
     let tile = aurora_tile::TILE;
     let mut tiles = Vec::new();
     for y in 0..height.div_ceil(tile) {
@@ -388,7 +388,7 @@ fn document_tiles(width: u32, height: u32) -> Vec<aurora_tile::TileId> {
 }
 
 /// Copies one composited tile into the flat image buffer.
-fn place_tile(
+pub(crate) fn place_tile(
     samples: &mut [half::f16],
     (width, height): (u32, u32),
     tile_id: aurora_tile::TileId,

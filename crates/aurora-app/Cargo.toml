@@ -84,6 +84,9 @@ directories = { workspace = true }
 # The *shipped binary* genuinely does gain that subtree, though -- it is
 # linked into `aurora-app` now rather than only into its test harness.
 tempfile = { workspace = true }
+# The headless MCP session (`mcp_session`) answers in JSON; serde_json is
+# already in the graph (no tokio, no rmcp: ADR 0014 keeps those out of the app).
+serde_json = { workspace = true }
 
 # macOS only -- see the workspace `Cargo.toml`'s own comment on `muda`
 # for why Windows/Linux aren't included here. `objc2-app-kit` is already

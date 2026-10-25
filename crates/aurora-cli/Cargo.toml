@@ -27,9 +27,28 @@ aurora-text = { workspace = true }
 aurora-io = { workspace = true }
 aurora-ai = { workspace = true }
 aurora-plugin = { workspace = true }
+aurora-commands = { workspace = true }
+aurora-mcp = { workspace = true }
+# The headless document session (`aurora_app::mcp_session`); no window or GPU is
+# created unless a command asks (ADR 0014 records why the CLI depends on the app).
+aurora-app = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[lib]
+name = "aurora_cli"
+path = "src/lib.rs"
 
 [[bin]]
 name = "aurora-cli"
 path = "src/main.rs"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+png = { workspace = true }
+base64 = { workspace = true }

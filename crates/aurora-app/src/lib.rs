@@ -594,6 +594,7 @@ mod frame_trace;
 pub mod headless;
 mod lasso_tools;
 mod layer_thumbnails;
+pub mod mcp_session;
 mod menu_bar_app;
 mod menu_bar_state;
 mod menu_model;
