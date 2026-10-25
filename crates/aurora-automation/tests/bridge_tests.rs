@@ -235,8 +235,9 @@ fn a_slow_client_is_cut_off_at_the_deadline_even_if_it_drips_bytes() {
             break;
         }
     }
-    s.set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
+    // The server may already have closed the socket; macOS then answers
+    // EINVAL to setsockopt, Linux does not. Either way the read below ends.
+    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
     let mut rest = Vec::new();
     let _ = s.read_to_end(&mut rest);
     assert!(
