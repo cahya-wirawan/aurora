@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.295.4] - 2026-10-26
+
+### Fixed
+
+- Bridge server: close refused connections gracefully (Windows reset lost the reply), no-fail-fast CI tests
+
 ## [0.295.3] - 2026-10-25
 
 ### Fixed
