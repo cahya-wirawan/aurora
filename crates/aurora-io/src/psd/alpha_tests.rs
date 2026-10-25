@@ -798,3 +798,42 @@ fn a_corpus_alpha_channel_survives_open_save_reopen() {
     let second = open(&out);
     assert_eq!(first.saved_selections, second.saved_selections);
 }
+
+/// FNV-1a of a file without its image-resources section (the sRGB profile
+/// in it carries lcms2's time stamp).
+fn stable_hash(bytes: &[u8]) -> u64 {
+    let rl = be32(bytes, 30) as usize;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes[..34].iter().chain(&bytes[34 + rl..]) {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+#[test]
+fn a_document_without_saved_selections_writes_the_bytes_main_wrote() {
+    // The hashes were taken from the code as of 0.290.0, before alpha
+    // channels existed (`git worktree` of c943536).
+    for (canvas, len, hash) in [
+        ((9u32, 7u32), 1644, 0x8a14_7809_3a33_3803_u64),
+        ((16, 12), 3201, 0xfd30_0ff4_c536_43b2),
+    ] {
+        let mut doc = doc_with_a_layer(canvas);
+        let (bytes, _) = ok(doc.write());
+        assert_eq!((bytes.len(), stable_hash(&bytes)), (len, hash), "{canvas:?}");
+        let (again, _) = write_with(&mut doc, &[]);
+        assert_eq!(stable_hash(&again), hash);
+    }
+}
+
+#[test]
+fn extra_channels_without_any_alpha_resource_stay_unopened_as_before() {
+    let doc = open(&flat(6, 4, 8, 0, vec![ramp()], Vec::new()));
+    assert!(doc.saved_selections.is_empty());
+    assert!(
+        doc.report.items.iter().any(|i| i.contains("1 saved channel")),
+        "{:?}",
+        doc.report.items
+    );
+}
