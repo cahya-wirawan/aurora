@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.294.1] - 2026-10-25
+
+### Fixed
+
+- Make the command-id golden file line-ending proof for the Windows job
+
 ## [0.294.0] - 2026-10-25
 
 ### Added
