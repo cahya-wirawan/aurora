@@ -4105,6 +4105,53 @@ fn open_dialog(
     actions: Vec<DialogAction>,
     purpose: DialogPurpose,
 ) -> bool {
+    open_dialog_with(
+        workspace, focus, dialog, scales, title, message, None, actions, purpose,
+    )
+}
+
+/// [`open_dialog`] for a long message (task 161): `lines` (already wrapped,
+/// see [`App::dialog_lines`]) are drawn as rows in a scroll container with
+/// a scrollbar, capped to the window, while `message` stays the one
+/// announced text. Everything else, the already-open guard included, is
+/// [`open_dialog`]'s.
+#[allow(clippy::too_many_arguments)]
+fn open_dialog_lines(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    dialog: &mut Option<OpenDialog>,
+    scales: &Scales,
+    title: &str,
+    message: &str,
+    lines: &[String],
+    actions: Vec<DialogAction>,
+    purpose: DialogPurpose,
+) -> bool {
+    open_dialog_with(
+        workspace,
+        focus,
+        dialog,
+        scales,
+        title,
+        message,
+        Some(lines),
+        actions,
+        purpose,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_dialog_with(
+    workspace: &mut aurora_ui::Workspace,
+    focus: &mut FocusManager,
+    dialog: &mut Option<OpenDialog>,
+    scales: &Scales,
+    title: &str,
+    message: &str,
+    lines: Option<&[String]>,
+    actions: Vec<DialogAction>,
+    purpose: DialogPurpose,
+) -> bool {
     if dialog.is_some() {
         tracing::warn!(
             suppressed = title,
@@ -4113,14 +4160,26 @@ fn open_dialog(
         );
         return false;
     }
-    let handle = match insert_dialog(
-        &mut workspace.tree,
-        workspace.root,
-        scales,
-        title,
-        message,
-        actions,
-    ) {
+    let inserted = match lines {
+        Some(lines) => aurora_widgets::widgets::insert_dialog_scrolling(
+            &mut workspace.tree,
+            workspace.root,
+            scales,
+            title,
+            message,
+            lines,
+            actions,
+        ),
+        None => insert_dialog(
+            &mut workspace.tree,
+            workspace.root,
+            scales,
+            title,
+            message,
+            actions,
+        ),
+    };
+    let handle = match inserted {
         Ok(handle) => handle,
         Err(err) => {
             tracing::warn!(?err, title, "failed to open a dialog");
@@ -4748,6 +4807,10 @@ fn handle_dialog_key(
     chord: KeyChord,
 ) -> Option<DialogResult> {
     let handle = dialog.as_ref()?;
+    // Task 161: a long message scrolls from the keyboard too.
+    if dialog_scroll_key(&mut workspace.tree, Some(handle), &chord) {
+        return None;
+    }
     // 0.169.0: the widget layer decides what the key chooses
     // (`DialogHandle::key`): Enter/Space on the focused button, Enter for
     // the default, Escape for the cancel (nothing without one), Tab and
@@ -12617,6 +12680,82 @@ fn is_palette_scrollbar(
         at = tree.parent(current);
     }
     false
+}
+
+/// Whether `id` is the open dialog's own scrollbar (task 161): a linked
+/// scrollbar inside the dialog. A modal dialog swallows every other press
+/// ([`handle_dialog_pointer`]); this one is the exception, because the bar
+/// is how a pointer scrolls a long message (the wheel already does).
+fn is_dialog_scrollbar(
+    tree: &WidgetTree<WidgetKind>,
+    dialog: Option<&OpenDialog>,
+    id: WidgetId,
+) -> bool {
+    let Some(dialog) = dialog else {
+        return false;
+    };
+    aurora_widgets::widgets::scrollbar_target(tree, id).is_some() && tree.is_within(dialog.root, id)
+}
+
+/// The scroll container a wheel event at `position` moves while a scrolling
+/// dialog is open (task 161): the message body, when the pointer is
+/// anywhere over the dialog. `None` otherwise (a plain dialog, or the
+/// pointer outside it), so the modal swallow rule stands.
+fn dialog_wheel_target(
+    tree: &WidgetTree<WidgetKind>,
+    dialog: Option<&OpenDialog>,
+    position: (f32, f32),
+) -> Option<WidgetId> {
+    let dialog = dialog?;
+    let body = dialog.body?;
+    let hit = tree.hit_test(position)?;
+    tree.is_within(dialog.root, hit).then_some(body)
+}
+
+/// A key that scrolls an open scrolling dialog's message (task 161):
+/// the arrows by a row, `PageUp`/`PageDown` by a page, `Home`/`End` to the
+/// ends. `None` for any other chord, or when the dialog does not scroll.
+/// Buttons keep `Tab`, `Enter`, `Space` and `Escape` as before.
+fn dialog_scroll_key(
+    tree: &mut WidgetTree<WidgetKind>,
+    dialog: Option<&OpenDialog>,
+    chord: &KeyChord,
+) -> bool {
+    let Some(body) = dialog.and_then(|d| d.body) else {
+        return false;
+    };
+    let mods = chord.modifiers;
+    if mods.control || mods.alt || mods.meta || mods.shift {
+        return false;
+    }
+    // One row is the height of the message's first line.
+    #[allow(clippy::cast_precision_loss)]
+    let Some(row) = tree
+        .children(body)
+        .and_then(|rows| rows.first().copied())
+        .and_then(|first| tree.bounds(first))
+        .map(|bounds| bounds.height as f32)
+    else {
+        return false;
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let page = tree
+        .bounds(body)
+        .map_or(row, |bounds| (bounds.height as f32 - row).max(row));
+    let range = tree.scroll_range(body).unwrap_or(0.0);
+    let current = tree.scroll_y(body).unwrap_or(0.0);
+    let target = match chord.key {
+        Key::Named(NamedKey::ArrowDown) => current + row,
+        Key::Named(NamedKey::ArrowUp) => current - row,
+        Key::Named(NamedKey::PageDown) => current + page,
+        Key::Named(NamedKey::PageUp) => current - page,
+        Key::Named(NamedKey::Home) => 0.0,
+        Key::Named(NamedKey::End) => range,
+        _ => return false,
+    };
+    // The key is the dialog's whether or not anything moved.
+    let _ = tree.set_scroll_y(body, target);
+    true
 }
 
 /// Routes one key press while the command palette is open — captures
@@ -32097,6 +32236,15 @@ impl App {
         if self.cancel_panel_drag() && key == Key::Named(NamedKey::Escape) {
             return;
         }
+        // Task 161: a long dialog message scrolls from the keyboard.
+        if dialog_scroll_key(
+            &mut self.workspace.tree,
+            self.dialog.as_ref(),
+            &KeyChord::new(self.modifiers, key),
+        ) {
+            self.relayout_after_gallery();
+            return;
+        }
         if colour_state::escape_closes_popover(
             key,
             self.colour.popover.is_some(),
@@ -34304,14 +34452,45 @@ impl App {
         self.open_psd_check_dialog(title, &message);
     }
 
+    /// `message` wrapped to the width a scrolling dialog's text has in the
+    /// current window (task 161). With no text engine, or before the first
+    /// layout, nothing is wrapped (lines may then be clipped at the end).
+    fn dialog_lines(&mut self, message: &str) -> Vec<String> {
+        #[allow(clippy::cast_precision_loss)]
+        let window_width = self
+            .workspace
+            .tree
+            .bounds(self.workspace.root)
+            .map_or(0.0, |bounds| bounds.width as f32);
+        let max_width = if window_width > 0.0 {
+            aurora_widgets::widgets::dialog_text_width(window_width, &self.scales)
+        } else {
+            0.0
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let scale_factor = self.scale_factor as f32;
+        match self.text_engine.as_mut() {
+            Some(engine) => aurora_widgets::widgets::wrap_dialog_lines(
+                engine,
+                &self.scales,
+                scale_factor,
+                message,
+                max_width,
+            ),
+            None => message.split('\n').map(str::to_owned).collect(),
+        }
+    }
+
     fn open_psd_check_dialog(&mut self, title: &str, message: &str) {
-        let opened = open_dialog(
+        let lines = self.dialog_lines(message);
+        let opened = open_dialog_lines(
             &mut self.workspace,
             &mut self.focus,
             &mut self.dialog,
             &self.scales,
             title,
             message,
+            &lines,
             psd_save::psd_check_dialog_actions(),
             DialogPurpose::PsdCheck,
         );
@@ -34335,13 +34514,15 @@ impl App {
         };
         let message =
             psd_save::psd_save_message(&display_file_name(pending.temp.target()), &pending.report);
-        let opened = open_dialog(
+        let lines = self.dialog_lines(&message);
+        let opened = open_dialog_lines(
             &mut self.workspace,
             &mut self.focus,
             &mut self.dialog,
             &self.scales,
             psd_save::PSD_SAVE_WITH_CHANGES_TITLE,
             &message,
+            &lines,
             psd_save::psd_save_dialog_actions(),
             DialogPurpose::PsdSaveWithChanges,
         );
@@ -34760,6 +34941,15 @@ impl App {
         ) {
             DialogPointer::NotOpen => {}
             DialogPointer::Swallowed => {
+                // Task 161: the dialog's own scrollbar takes its press (and
+                // the drag it captures); every other press stays swallowed.
+                if button == PointerButton::Primary
+                    && self.workspace.tree.hit_test(position).is_some_and(|hit| {
+                        is_dialog_scrollbar(&self.workspace.tree, self.dialog.as_ref(), hit)
+                    })
+                {
+                    self.route_gallery(PointerPhase::Down, position);
+                }
                 self.push_accessibility();
                 return;
             }
@@ -36089,6 +36279,22 @@ impl App {
             return;
         };
         self.dismiss_tooltip();
+        // Task 161: over an open scrolling dialog the wheel scrolls its
+        // message (it neither zooms the canvas nor scrolls a panel).
+        if let Some(body) =
+            dialog_wheel_target(&self.workspace.tree, self.dialog.as_ref(), position)
+        {
+            if scroll_panel(
+                &mut self.workspace.tree,
+                body,
+                delta,
+                self.scale_factor,
+                &self.scales,
+            ) {
+                self.relayout_after_gallery();
+            }
+            return;
+        }
         // 0.257.0: over the open command palette the wheel scrolls its
         // results (a modal dialog still swallows it).
         if self.dialog.is_none()
@@ -36383,6 +36589,22 @@ impl App {
         }
     }
 
+    /// Whether this pointer phase belongs to the open dialog's scrollbar
+    /// (task 161): a press on it, or a move or release of a drag it
+    /// captured.
+    fn dialog_scrollbar_gesture(&self, phase: PointerPhase, position: (f32, f32)) -> bool {
+        let tree = &self.workspace.tree;
+        match phase {
+            PointerPhase::Down => tree
+                .hit_test(position)
+                .is_some_and(|hit| is_dialog_scrollbar(tree, self.dialog.as_ref(), hit)),
+            _ => self
+                .gallery_click
+                .captured()
+                .is_some_and(|id| is_dialog_scrollbar(tree, self.dialog.as_ref(), id)),
+        }
+    }
+
     /// Routes one primary-button event to the Widget Gallery or (0.135.0)
     /// the Layers-panel controls ([`route_widget_pointer`]), applying a
     /// control's document edit ([`Self::apply_layer_control`]) and
@@ -36402,6 +36624,7 @@ impl App {
             self.light_dismiss_menu_bar(position);
         }
         let palette_scrollbar = self.palette_scrollbar_gesture(phase, position);
+        let dialog_scrollbar = self.dialog_scrollbar_gesture(phase, position);
         let controls = self.layer_controls.controls;
         let tool_controls = self.tool_controls;
         #[allow(clippy::cast_possible_truncation)]
@@ -36424,7 +36647,8 @@ impl App {
             tool_controls.as_ref(),
             &mut self.gallery_click,
             &self.scales,
-            self.dialog.is_some() || (self.command_palette.is_some() && !palette_scrollbar),
+            (self.dialog.is_some() && !dialog_scrollbar)
+                || (self.command_palette.is_some() && !palette_scrollbar),
             phase,
             position,
             self.modifiers,
