@@ -28,6 +28,30 @@ say so. A relative path is taken from the *first* root of its kind; an absolute
 path must lie inside one of them. stdout carries only protocol lines; logs go to
 stderr (`RUST_LOG=info` for more).
 
+## Claude Code quick start
+
+Claude Code takes the same server with `claude mcp add` (everything after `--`
+is the command line; the roots are examples, use your own):
+
+```sh
+# Headless: open, inspect, preview and check files; no window.
+claude mcp add aurora -- /path/to/aurora-cli mcp \
+  --read-root ~/Pictures --write-root ~/Pictures/out
+
+# Live: drive the running editor. Start the app first, with the bridge on.
+aurora-app --mcp-bridge --mcp-bridge-read-root ~/Pictures --mcp-bridge-write-root ~/Pictures/out
+claude mcp add aurora-live -- /path/to/aurora-cli mcp --bridge \
+  --read-root ~/Pictures --write-root ~/Pictures/out
+```
+
+Then ask in plain words, for example "open `a.psd`, check whether a PSD save
+would lose anything and list it", or, with the live app, "take a screenshot and
+tell me which layer is selected". Without a root there is no file access at
+all, and a controller can never quit the app or answer a discard dialog (see
+[Bridge mode](#bridge-mode-driving-the-running-app-task-160)). The `claude mcp
+add` lines are the command-line form of the JSON below; no real MCP client has
+been tried against Aurora yet, so report anything that does not connect.
+
 A client configuration (Claude Desktop style):
 
 ```json
