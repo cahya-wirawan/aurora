@@ -620,7 +620,7 @@ pub fn insert_dialog(
 /// here).
 ///
 /// **Capped to the window.** The dialog may take at most 90 % of its
-/// parent's height ([`SCROLLING_MAX_HEIGHT_FRACTION`], a proportion, so a
+/// parent's height (`SCROLLING_MAX_HEIGHT_FRACTION`, a proportion, so a
 /// resized window needs no recompute); the message viewport shrinks to fit
 /// (never below one row) and scrolls, while the title and every button
 /// keep their height, so the buttons stay on screen and clickable. The
@@ -652,7 +652,7 @@ pub fn insert_dialog_scrolling(
 
 /// The width in logical px a scrolling dialog's text lines have when the
 /// window (really: the dialog's parent) is `window_width` wide: the dialog
-/// is [`WIDTH_FRACTION`] of it (never under its `spacing.xxxl` floor), less
+/// is `WIDTH_FRACTION` of it (never under its `spacing.xxxl` floor), less
 /// its padding, the always-reserved scrollbar and a row's own text inset.
 /// What [`insert_dialog_scrolling`]'s caller should wrap its lines to.
 #[must_use]
