@@ -512,9 +512,8 @@ mod dialog {
     #[test]
     fn only_the_dialogs_scrollbar_is_let_through_a_press_and_a_button_click_still_chooses() {
         let mut rig = rig(300, true);
-        let bar = match open(&rig).scrollbar {
-            Some(bar) => bar,
-            None => unreachable!("a bar"),
+        let Some(bar) = open(&rig).scrollbar else {
+            unreachable!("a bar");
         };
         assert!(is_dialog_scrollbar(tree(&rig), rig.dialog.as_ref(), bar));
         let (_, cancel) = open(&rig).actions[1].clone();

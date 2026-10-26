@@ -36256,6 +36256,29 @@ impl App {
         self.update_gallery_hover(self.pointer_position);
     }
 
+    /// The wheel over an open scrolling dialog scrolls its message; `true`
+    /// when the event was the dialog's (whether or not anything moved).
+    fn scroll_dialog_wheel(
+        &mut self,
+        position: (f32, f32),
+        delta: winit::event::MouseScrollDelta,
+    ) -> bool {
+        let Some(body) = dialog_wheel_target(&self.workspace.tree, self.dialog.as_ref(), position)
+        else {
+            return false;
+        };
+        if scroll_panel(
+            &mut self.workspace.tree,
+            body,
+            delta,
+            self.scale_factor,
+            &self.scales,
+        ) {
+            self.relayout_after_gallery();
+        }
+        true
+    }
+
     /// A real `WindowEvent::MouseWheel`: zooms around the pointer's last
     /// known position ([`apply_scroll_zoom`]) if it's over the canvas
     /// area — a no-op otherwise (e.g. scrolling while the pointer is
@@ -36281,18 +36304,7 @@ impl App {
         self.dismiss_tooltip();
         // Task 161: over an open scrolling dialog the wheel scrolls its
         // message (it neither zooms the canvas nor scrolls a panel).
-        if let Some(body) =
-            dialog_wheel_target(&self.workspace.tree, self.dialog.as_ref(), position)
-        {
-            if scroll_panel(
-                &mut self.workspace.tree,
-                body,
-                delta,
-                self.scale_factor,
-                &self.scales,
-            ) {
-                self.relayout_after_gallery();
-            }
+        if self.scroll_dialog_wheel(position, delta) {
             return;
         }
         // 0.257.0: over the open command palette the wheel scrolls its
