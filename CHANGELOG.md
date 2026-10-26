@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.295.5] - 2026-10-26
+
+### Fixed
+
+- Bridge: one shared socket handle, stat export files by path, stdout test Unix-only
+
 ## [0.295.4] - 2026-10-26
 
 ### Fixed

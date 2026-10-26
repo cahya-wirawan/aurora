@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::discovery::Discovery;
-use super::frame::{self, Line};
+use super::frame::{self, Conn, Line};
 use super::protocol::{
     CallError, Hello, HelloReply, Id, MAX_HELLO_BYTES, MAX_REPLY_BYTES, Reply, Request,
 };
@@ -32,8 +32,8 @@ pub enum ClientError {
 /// An authenticated connection.
 #[derive(Debug)]
 pub struct BridgeClient {
-    stream: TcpStream,
-    reader: BufReader<TcpStream>,
+    stream: Conn,
+    reader: BufReader<Conn>,
     next_id: u64,
     pub app_version: String,
 }
@@ -68,13 +68,9 @@ impl BridgeClient {
             .map_err(|e| ClientError::Connect(e.to_string()))?;
         let _ = stream.set_nodelay(true);
         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-        let reader_stream = stream
-            .try_clone()
-            .map_err(|e| ClientError::Connect(e.to_string()))?;
-        let mut writer = stream
-            .try_clone()
-            .map_err(|e| ClientError::Connect(e.to_string()))?;
-        let mut reader = BufReader::new(reader_stream);
+        let stream = Conn::new(stream);
+        let mut writer = stream.clone();
+        let mut reader = BufReader::new(stream.clone());
         let hello = serde_json::to_string(&Hello::new(token))
             .map_err(|e| ClientError::Connect(e.to_string()))?;
         frame::write_line(&mut writer, &hello).map_err(|e| ClientError::Connect(e.to_string()))?;

@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::frame::{self, Line};
+use super::frame::{self, Conn, Line};
 use super::limits::{FREE_FAILURES, LOCKOUT_BASE, LOCKOUT_MAX, Lockout, RateLimiter};
 use super::protocol::{
     CallError, HELLO, Hello, HelloReply, MAX_HELLO_BYTES, MAX_REQUEST_BYTES, PROTOCOL_VERSION,
@@ -106,7 +106,7 @@ struct Shared {
     lockout: Mutex<Lockout>,
     unauthenticated: AtomicUsize,
     /// The active controller's stream (a clone, to close it from outside).
-    controller: Mutex<Option<TcpStream>>,
+    controller: Mutex<Option<Conn>>,
     stop: AtomicBool,
 }
 
@@ -196,7 +196,7 @@ impl BridgeServer {
     /// Closes the connected controller's socket (its thread then ends).
     pub fn disconnect_controller(&self) {
         if let Some(stream) = lock(&self.shared.controller).as_ref() {
-            let _ = stream.shutdown(Shutdown::Both);
+            let _ = stream.socket().shutdown(Shutdown::Both);
         }
     }
 
@@ -251,7 +251,7 @@ fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>) {
         let spawned = std::thread::Builder::new()
             .name("aurora-bridge-conn".to_owned())
             .spawn(move || {
-                serve_connection(&stream, &conn_shared);
+                serve_connection(&Conn::new(stream), &conn_shared);
             });
         if spawned.is_err() {
             shared.unauthenticated.fetch_sub(1, Ordering::SeqCst);
@@ -340,17 +340,13 @@ impl Drop for Slot<'_> {
     }
 }
 
-fn serve_connection(stream: &TcpStream, shared: &Arc<Shared>) {
+fn serve_connection(conn: &Conn, shared: &Arc<Shared>) {
     let counted = Unauthenticated(&shared.unauthenticated);
+    let stream = conn.socket();
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-    let Ok(mut writer) = stream.try_clone() else {
-        return;
-    };
-    let Ok(reader_stream) = stream.try_clone() else {
-        return;
-    };
-    let mut reader = BufReader::new(reader_stream);
+    let mut writer = conn.clone();
+    let mut reader = BufReader::new(conn.clone());
 
     // ---- handshake: exactly one bounded line, within the deadline ----
     let deadline = Instant::now() + shared.config.auth_timeout;
@@ -411,10 +407,7 @@ fn serve_connection(stream: &TcpStream, shared: &Arc<Shared>) {
             reply_hello_error(&mut writer, "another controller is already connected");
             return;
         }
-        match stream.try_clone() {
-            Ok(clone) => *slot = Some(clone),
-            Err(_) => return,
-        }
+        *slot = Some(conn.clone());
     }
     drop(counted);
     lock(&shared.lockout).succeeded();
@@ -439,7 +432,7 @@ fn serve_connection(stream: &TcpStream, shared: &Arc<Shared>) {
     let _ = stream.shutdown(Shutdown::Both);
 }
 
-fn reply_hello_error(writer: &mut TcpStream, message: &str) {
+fn reply_hello_error(writer: &mut Conn, message: &str) {
     let reply = HelloReply {
         ok: false,
         protocol: None,
@@ -450,23 +443,23 @@ fn reply_hello_error(writer: &mut TcpStream, message: &str) {
     if let Ok(text) = serde_json::to_string(&reply) {
         let _ = frame::write_line(writer, &text);
     }
-    close_after_reply(writer, Duration::from_millis(100));
+    close_after_reply(writer.socket(), Duration::from_millis(100));
 }
 
 /// Refuses a connection that did not present a well-formed handshake.
-fn reject(writer: &mut TcpStream, message: &str) {
+fn reject(writer: &mut Conn, message: &str) {
     tracing::debug!("bridge: a connection did not send a handshake");
     reply_hello_error(writer, message);
 }
 
 /// A well-formed handshake with the wrong token: counted toward the lockout.
-fn fail_auth(shared: &Shared, writer: &mut TcpStream, message: &str) {
+fn fail_auth(shared: &Shared, writer: &mut Conn, message: &str) {
     lock(&shared.lockout).failed(Instant::now());
     tracing::warn!("bridge: a connection failed the handshake");
     reply_hello_error(writer, message);
 }
 
-fn request_loop(reader: &mut BufReader<TcpStream>, writer: &mut TcpStream, shared: &Arc<Shared>) {
+fn request_loop(reader: &mut BufReader<Conn>, writer: &mut Conn, shared: &Arc<Shared>) {
     let mut limiter = RateLimiter::new(shared.config.rate_burst, shared.config.rate_per_second);
     let mut bad_streak = 0_u32;
     loop {
@@ -536,7 +529,7 @@ fn request_loop(reader: &mut BufReader<TcpStream>, writer: &mut TcpStream, share
     }
 }
 
-fn send(writer: &mut TcpStream, reply: &Reply) -> io::Result<()> {
+fn send(writer: &mut Conn, reply: &Reply) -> io::Result<()> {
     let mut text = serde_json::to_string(reply).map_err(|e| io::Error::other(e.to_string()))?;
     if text.len() > super::protocol::MAX_REPLY_BYTES {
         let replacement = Reply::failure(

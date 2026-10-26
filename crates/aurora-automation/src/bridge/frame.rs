@@ -6,9 +6,50 @@
 //! that drips one byte every few seconds cannot hold a connection open),
 //! and a line that is not terminated is never returned.
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// One socket handle shared by the reader, the writer and whoever closes it.
+///
+/// The bridge never duplicates the socket (`TcpStream::try_clone`): on
+/// Windows a timeout or a shutdown set through one duplicate did not reach
+/// the handle being read, so the handshake deadline was never enforced and a
+/// disconnect did not end the connection. Every operation goes through this
+/// one handle instead.
+#[derive(Clone, Debug)]
+pub struct Conn(Arc<TcpStream>);
+
+impl Conn {
+    /// Wraps an accepted or connected socket.
+    #[must_use]
+    pub fn new(stream: TcpStream) -> Self {
+        Self(Arc::new(stream))
+    }
+
+    /// The socket, for options and `shutdown`.
+    #[must_use]
+    pub fn socket(&self) -> &TcpStream {
+        &self.0
+    }
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        (&*self.0).read(buf)
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self.0).flush()
+    }
+}
 
 /// What reading a line gave.
 #[derive(Debug, PartialEq, Eq)]
@@ -28,19 +69,19 @@ pub enum Line {
 /// Any read error, including the timeout kinds when the reader is a socket
 /// with a read timeout.
 pub fn read_line(reader: &mut impl BufRead, max: usize) -> io::Result<Line> {
-    read_line_until(reader, max, &mut |_| Ok(()))
+    read_line_until(reader, max, &mut |_, _| Ok(()))
 }
 
 /// [`read_line`] that calls `before_read` with the bytes read so far ahead
 /// of every blocking read; it may return an error (a deadline) to stop.
-fn read_line_until(
-    reader: &mut impl BufRead,
+fn read_line_until<R: BufRead>(
+    reader: &mut R,
     max: usize,
-    before_read: &mut dyn FnMut(usize) -> io::Result<()>,
+    before_read: &mut dyn FnMut(&R, usize) -> io::Result<()>,
 ) -> io::Result<Line> {
     let mut line: Vec<u8> = Vec::new();
     loop {
-        before_read(line.len())?;
+        before_read(&*reader, line.len())?;
         let buffer = match reader.fill_buf() {
             Ok(buffer) => buffer,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -77,14 +118,13 @@ fn read_line_until(
 /// # Errors
 /// `TimedOut` at the deadline, or any read error.
 pub fn read_line_by(
-    reader: &mut BufReader<TcpStream>,
+    reader: &mut BufReader<Conn>,
     max: usize,
     deadline: Instant,
 ) -> io::Result<Line> {
     // The deadline is checked before every blocking read and bounds that
-    // read through the socket's own timeout.
-    let socket = reader.get_ref().try_clone()?;
-    read_line_until(reader, max, &mut |_| {
+    // read through the socket's own timeout, set on the very handle read.
+    read_line_until(reader, max, &mut |reader, _| {
         let now = Instant::now();
         if now >= deadline {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "line deadline"));
@@ -92,7 +132,7 @@ pub fn read_line_by(
         let remaining = deadline
             .saturating_duration_since(now)
             .max(Duration::from_millis(1));
-        match socket.set_read_timeout(Some(remaining)) {
+        match reader.get_ref().socket().set_read_timeout(Some(remaining)) {
             Ok(()) => Ok(()),
             // macOS answers EINVAL to setsockopt once the peer has closed the
             // connection (Linux does not). Whatever the peer sent first is
