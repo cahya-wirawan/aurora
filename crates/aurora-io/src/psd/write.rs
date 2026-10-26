@@ -176,7 +176,7 @@ use super::write_pixels::{
     MERGED_CHUNK_ROWS, SampleCounts, pack_channel_band, pack_merged_rows, quantize_counted,
     quantize_f16,
 };
-use super::write_report::{PsdWriteReport, ReportCategory, ReportEntry};
+use super::write_report::{PsdWriteReport, REPORT_NAMES_SHOWN, ReportCategory, ReportEntry};
 use super::{
     MASK_DISABLED, MASK_PARAMETERS, MAX_GROUP_DEPTH, PSD_MAX_EXTENT, PsdPixelSink, PsdPixels,
     unpack_bits,
@@ -520,7 +520,7 @@ fn plural(n: u64, one: &str, many: &str) -> String {
 
 /// "A, B, C and 2 more" for a report line.
 fn name_list(names: &[&str]) -> String {
-    const SHOWN: usize = 5;
+    const SHOWN: usize = REPORT_NAMES_SHOWN;
     let shown: Vec<String> = names
         .iter()
         .take(SHOWN)

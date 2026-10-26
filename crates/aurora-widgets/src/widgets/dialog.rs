@@ -1438,4 +1438,153 @@ mod tests {
         assert_eq!(handle.choice_for(handle.message), None);
         assert_eq!(handle.choice_for(handle.root), None);
     }
+
+    // -- task 161: the scrolling dialog --
+
+    fn scrolling(
+        line_count: usize,
+        window: (f32, f32),
+    ) -> (crate::WidgetTree<crate::widgets::WidgetKind>, super::DialogHandle) {
+        let (mut tree, root) = new_tree(Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::length(window.0),
+                height: taffy::style_helpers::length(window.1),
+            },
+            ..Default::default()
+        });
+        let lines: Vec<String> = (0..line_count).map(|i| format!("line {i}")).collect();
+        let handle = match super::insert_dialog_scrolling(
+            &mut tree,
+            root,
+            &test_scales(),
+            "Save With Changes?",
+            lines.join("\n"),
+            &lines,
+            vec![
+                DialogAction::new("save", "Save Anyway"),
+                DialogAction::new("cancel", "Cancel").as_default().as_cancel(),
+            ],
+        ) {
+            Ok(handle) => handle,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        crate::compute_text_layout(&mut tree, window.0, window.1, None);
+        (tree, handle)
+    }
+
+    fn parts(handle: &super::DialogHandle) -> (WidgetId, WidgetId) {
+        match (handle.body, handle.scrollbar) {
+            (Some(body), Some(bar)) => (body, bar),
+            _ => unreachable!("a scrolling dialog has a body and a bar"),
+        }
+    }
+
+    #[test]
+    fn a_long_message_scrolls_inside_a_dialog_capped_to_the_window() {
+        let window = (800.0, 300.0);
+        let (tree, handle) = scrolling(200, window);
+        let (body, bar) = parts(&handle);
+        let Some(dialog) = tree.bounds(handle.root) else {
+            unreachable!("laid out");
+        };
+        assert!(
+            f32::from(u16::try_from(dialog.height).unwrap_or(u16::MAX)) <= window.1 * 0.9 + 1.0,
+            "capped at 90 % of the window: {dialog:?}"
+        );
+        assert!(dialog.y >= 0 && dialog.y + i64::from(dialog.height) <= 300);
+        assert!(tree.scroll_range(body).is_some_and(|r| r > 0.0), "scrolls");
+        assert_ne!(
+            tree.style(bar).map(|s| s.display),
+            Some(taffy::Display::None),
+            "the bar is shown when the lines overflow"
+        );
+        // Every button is on screen and reachable.
+        for (_, button) in &handle.actions {
+            let Some(b) = tree.bounds(*button) else {
+                unreachable!("laid out");
+            };
+            assert!(b.height > 0 && b.y >= 0 && b.y + i64::from(b.height) <= 300, "{b:?}");
+            #[allow(clippy::cast_precision_loss)]
+            let centre = (b.x as f32 + b.width as f32 / 2.0, b.y as f32 + b.height as f32 / 2.0);
+            assert_eq!(tree.hit_test(centre), Some(*button));
+        }
+    }
+
+    #[test]
+    fn scrolling_reaches_the_last_line_and_a_short_message_does_not_scroll() {
+        let (mut tree, handle) = scrolling(200, (800.0, 300.0));
+        let (body, _) = parts(&handle);
+        let range = tree.scroll_range(body).unwrap_or(0.0);
+        assert!(matches!(tree.set_scroll_y(body, range), Ok(true)));
+        let Some(rows) = tree.children(body) else {
+            unreachable!("rows");
+        };
+        let Some(last) = rows.last().copied() else {
+            unreachable!("rows");
+        };
+        let (Some(row), Some(view)) = (tree.bounds(last), tree.bounds(body)) else {
+            unreachable!("laid out");
+        };
+        assert!(
+            row.y + i64::from(row.height) <= view.y + i64::from(view.height),
+            "the last line is in view at the end: {row:?} in {view:?}"
+        );
+        let (short, short_handle) = scrolling(3, (800.0, 600.0));
+        let (short_body, short_bar) = parts(&short_handle);
+        assert_eq!(short.scroll_range(short_body), Some(0.0));
+        assert_eq!(
+            short.style(short_bar).map(|s| s.display),
+            Some(taffy::Display::None),
+            "no bar when everything fits"
+        );
+    }
+
+    #[test]
+    fn the_scrolling_dialog_announces_the_whole_message_once_and_keeps_its_choices() {
+        let (tree, handle) = scrolling(5, (800.0, 600.0));
+        let Some(message) = tree.accessibility(handle.message) else {
+            unreachable!("inserted");
+        };
+        assert_eq!(message.label(), Some("line 0\nline 1\nline 2\nline 3\nline 4"));
+        let (body, _) = parts(&handle);
+        for row in tree.children(body).unwrap_or_default() {
+            assert!(
+                tree.accessibility(*row).is_some_and(accesskit::Node::is_hidden),
+                "drawn lines are not announced a second time"
+            );
+        }
+        let Some(root) = tree.accessibility(handle.root) else {
+            unreachable!("inserted");
+        };
+        assert_eq!(root.label(), Some("Save With Changes?"));
+        assert!(root.is_modal());
+        // Default and cancel are unchanged: Enter and Escape.
+        let cancel = handle.cancel_action;
+        assert_eq!(handle.initial_focus(), cancel);
+        let escape = chord(named(crate::shortcut::NamedKey::Escape), false);
+        assert_eq!(
+            handle.key(&escape, None),
+            super::DialogKeyOutcome::Chosen(super::DialogChoice {
+                dialog: handle.root,
+                action: "cancel".into()
+            })
+        );
+        let enter = chord(named(crate::shortcut::NamedKey::Enter), false);
+        assert!(matches!(
+            handle.key(&enter, None),
+            super::DialogKeyOutcome::Chosen(c) if c.action == "cancel"
+        ));
+    }
+
+    #[test]
+    fn a_plain_dialog_has_no_scroll_parts_and_the_text_width_follows_the_window() {
+        let (_, handle) = choice_dialog();
+        assert_eq!((handle.body, handle.scrollbar), (None, None));
+        let scales = test_scales();
+        let narrow = super::dialog_text_width(600.0, &scales);
+        let wide = super::dialog_text_width(1200.0, &scales);
+        assert!(narrow > 0.0 && wide > narrow);
+        assert!(wide < 1200.0 * 0.5, "less than the dialog itself");
+    }
+
 }
