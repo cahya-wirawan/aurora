@@ -1797,4 +1797,24 @@ mod tests {
                 .is_some_and(|l| l.contains("full list is in Aurora's log"))
         );
     }
+
+    #[test]
+    fn in_a_short_window_the_buttons_and_title_keep_their_height_and_the_message_gives_way() {
+        let scales = test_scales();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = row_height(&scales) as u32;
+        let (tree, handle) = scrolling(200, (800.0, 140.0));
+        for (_, button) in &handle.actions {
+            let Some(b) = tree.bounds(*button) else {
+                unreachable!("laid out");
+            };
+            assert!(b.height >= row, "a button is squeezed to {b:?}");
+        }
+        let Some(title) = tree.bounds(handle.title) else {
+            unreachable!("laid out");
+        };
+        assert_eq!(title.height, row, "the title keeps its row");
+        let (body, _) = parts(&handle);
+        assert!(tree.scroll_range(body).is_some_and(|r| r > 0.0));
+    }
 }

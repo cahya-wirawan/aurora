@@ -524,6 +524,23 @@ mod dialog {
             cancel
         ));
         assert!(!is_dialog_scrollbar(tree(&rig), None, bar));
+        // A linked scrollbar elsewhere in the window (a panel's) is not the
+        // dialog's: the modal still swallows presses on it.
+        let mut others = 0;
+        let mut stack = vec![tree(&rig).root()];
+        while let Some(id) = stack.pop() {
+            stack.extend(tree(&rig).children(id).unwrap_or_default().iter().copied());
+            if aurora_widgets::widgets::scrollbar_target(tree(&rig), id).is_some()
+                && !tree(&rig).is_within(open(&rig).root, id)
+            {
+                others += 1;
+                assert!(!is_dialog_scrollbar(tree(&rig), rig.dialog.as_ref(), id));
+            }
+        }
+        assert!(
+            others > 0,
+            "the workspace has panel scrollbars to test against"
+        );
         // A press on a button is the choice; one on the bar is swallowed
         // here (the App then routes it to the bar).
         let Some(b) = tree(&rig).bounds(bar) else {
