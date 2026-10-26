@@ -76,8 +76,8 @@ pub use import::{
 pub use psd::{
     PsdCompositeSource, PsdExpectation, PsdExpectedAdjustment, PsdExpectedAlpha, PsdExpectedLayer,
     PsdExpectedMask, PsdFormat, PsdRecordKind, PsdSaveOptions, PsdSaveRefusal, PsdWriteOutcome,
-    PsdWriteReport, REPORT_NAMES_SHOWN, ReportCategory, ReportEntry, psd_save_preflight, verify_psd_file, write_psd,
-    write_psd_with_selections,
+    PsdWriteReport, REPORT_NAMES_SHOWN, ReportCategory, ReportEntry, psd_save_preflight,
+    verify_psd_file, write_psd, write_psd_with_selections,
 };
 pub use psd::{
     PsdDocument, PsdImportReport, PsdMaskPixels, PsdPixelSink, PsdPixels, PsdStreamedDocument,

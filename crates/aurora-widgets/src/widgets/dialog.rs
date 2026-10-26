@@ -595,7 +595,15 @@ pub fn insert_dialog(
     message: impl Into<String>,
     actions: Vec<DialogAction>,
 ) -> Result<DialogHandle, WidgetError> {
-    build_dialog(tree, parent, scales, title.into(), message.into(), None, actions)
+    build_dialog(
+        tree,
+        parent,
+        scales,
+        title.into(),
+        message.into(),
+        None,
+        actions,
+    )
 }
 
 /// [`insert_dialog`] for a message of many lines (task 161): `message` is
@@ -655,6 +663,108 @@ pub fn dialog_text_width(window_width: f32, scales: &Scales) -> f32 {
         + scrollbar_thickness(scales)
         + 2.0 * spacing(scales.spacing.sm);
     (dialog - inset).max(0.0)
+}
+
+/// The most lines [`wrap_dialog_lines`] returns; the last one then says how
+/// many were cut. A bound on what a hostile report can make a dialog build.
+pub const MAX_DIALOG_LINES: usize = 10_000;
+
+/// Wraps `text` (lines separated by `\n`) to `max_width` logical px for
+/// [`insert_dialog_scrolling`], breaking at spaces and, for a word wider
+/// than the line, between characters. A wrapped line continues indented by
+/// two spaces beyond the original's own indent (a bullet's text lines up
+/// roughly under its first word). Text that already fits is returned
+/// unchanged, line for line; a non-positive or non-finite `max_width` wraps
+/// nothing. At most [`MAX_DIALOG_LINES`] lines come back.
+///
+/// The width is measured with the engine and scale the dialog's text is
+/// drawn with, once, when the dialog opens: a window narrowed afterwards
+/// clips the ends of lines (there is still no re-wrap on resize).
+pub fn wrap_dialog_lines(
+    engine: &mut aurora_text::TextEngine,
+    scales: &Scales,
+    scale_factor: f32,
+    text: &str,
+    max_width: f32,
+) -> Vec<String> {
+    let style = crate::text::label_style(scales);
+    let mut out: Vec<String> = Vec::new();
+    let mut width_of = |candidate: &str| -> f32 {
+        engine
+            .shape(
+                &crate::text::sanitize_label(candidate),
+                &style,
+                scale_factor,
+            )
+            .width
+    };
+    let wrap = max_width.is_finite() && max_width > 0.0;
+    let mut total = 0_usize;
+    'lines: for line in text.split('\n') {
+        if !wrap || width_of(line) <= max_width {
+            total += 1;
+            if total > MAX_DIALOG_LINES {
+                break 'lines;
+            }
+            out.push(line.to_owned());
+            continue;
+        }
+        let indent: String = line.chars().take_while(|c| *c == ' ').collect();
+        let body = line.trim_start_matches(' ');
+        let continuation = format!("{indent}  ");
+        let mut current = indent.clone();
+        let mut has_word = false;
+        let mut pieces: Vec<String> = Vec::new();
+        for word in body.split(' ').filter(|w| !w.is_empty()) {
+            let candidate = if has_word {
+                format!("{current} {word}")
+            } else {
+                format!("{current}{word}")
+            };
+            if width_of(&candidate) <= max_width {
+                current = candidate;
+                has_word = true;
+                continue;
+            }
+            if has_word {
+                pieces.push(std::mem::replace(&mut current, continuation.clone()));
+            }
+            // A word wider than a whole line: cut it between characters.
+            let mut rest = word;
+            loop {
+                let mut take = 0;
+                for (at, ch) in rest.char_indices() {
+                    let end = at + ch.len_utf8();
+                    let probe = format!("{current}{}", rest.get(..end).unwrap_or(rest));
+                    if width_of(&probe) > max_width && take > 0 {
+                        break;
+                    }
+                    take = end;
+                }
+                let (head, tail) =
+                    rest.split_at(take.max(rest.chars().next().map_or(0, char::len_utf8)));
+                current.push_str(head);
+                if tail.is_empty() {
+                    has_word = true;
+                    break;
+                }
+                pieces.push(std::mem::replace(&mut current, continuation.clone()));
+                rest = tail;
+            }
+        }
+        pieces.push(current);
+        for piece in pieces {
+            total += 1;
+            if total > MAX_DIALOG_LINES {
+                break 'lines;
+            }
+            out.push(piece);
+        }
+    }
+    if total > MAX_DIALOG_LINES {
+        out.push("\u{2026} more lines; the full list is in Aurora's log.".to_owned());
+    }
+    out
 }
 
 /// A scrolling dialog's message viewport: a clipping `Row` that holds the
@@ -1444,7 +1554,10 @@ mod tests {
     fn scrolling(
         line_count: usize,
         window: (f32, f32),
-    ) -> (crate::WidgetTree<crate::widgets::WidgetKind>, super::DialogHandle) {
+    ) -> (
+        crate::WidgetTree<crate::widgets::WidgetKind>,
+        super::DialogHandle,
+    ) {
         let (mut tree, root) = new_tree(Style {
             size: taffy::Size {
                 width: taffy::style_helpers::length(window.0),
@@ -1462,7 +1575,9 @@ mod tests {
             &lines,
             vec![
                 DialogAction::new("save", "Save Anyway"),
-                DialogAction::new("cancel", "Cancel").as_default().as_cancel(),
+                DialogAction::new("cancel", "Cancel")
+                    .as_default()
+                    .as_cancel(),
             ],
         ) {
             Ok(handle) => handle,
@@ -1503,9 +1618,15 @@ mod tests {
             let Some(b) = tree.bounds(*button) else {
                 unreachable!("laid out");
             };
-            assert!(b.height > 0 && b.y >= 0 && b.y + i64::from(b.height) <= 300, "{b:?}");
+            assert!(
+                b.height > 0 && b.y >= 0 && b.y + i64::from(b.height) <= 300,
+                "{b:?}"
+            );
             #[allow(clippy::cast_precision_loss)]
-            let centre = (b.x as f32 + b.width as f32 / 2.0, b.y as f32 + b.height as f32 / 2.0);
+            let centre = (
+                b.x as f32 + b.width as f32 / 2.0,
+                b.y as f32 + b.height as f32 / 2.0,
+            );
             assert_eq!(tree.hit_test(centre), Some(*button));
         }
     }
@@ -1545,11 +1666,15 @@ mod tests {
         let Some(message) = tree.accessibility(handle.message) else {
             unreachable!("inserted");
         };
-        assert_eq!(message.label(), Some("line 0\nline 1\nline 2\nline 3\nline 4"));
+        assert_eq!(
+            message.label(),
+            Some("line 0\nline 1\nline 2\nline 3\nline 4")
+        );
         let (body, _) = parts(&handle);
         for row in tree.children(body).unwrap_or_default() {
             assert!(
-                tree.accessibility(*row).is_some_and(accesskit::Node::is_hidden),
+                tree.accessibility(*row)
+                    .is_some_and(accesskit::Node::is_hidden),
                 "drawn lines are not announced a second time"
             );
         }
@@ -1587,4 +1712,89 @@ mod tests {
         assert!(wide < 1200.0 * 0.5, "less than the dialog itself");
     }
 
+    // -- task 161: wrapping --
+
+    fn engine() -> aurora_text::TextEngine {
+        match aurora_text::TextEngine::new() {
+            Ok(engine) => engine,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn width(engine: &mut aurora_text::TextEngine, text: &str) -> f32 {
+        engine
+            .shape(text, &crate::text::label_style(&test_scales()), 1.0)
+            .width
+    }
+
+    #[test]
+    fn text_that_fits_is_returned_line_for_line_and_long_text_wraps_losslessly() {
+        let scales = test_scales();
+        let mut engine = engine();
+        let short = "Changed:\n\u{2022} one\n\u{2022} two";
+        assert_eq!(
+            super::wrap_dialog_lines(&mut engine, &scales, 1.0, short, 400.0),
+            ["Changed:", "\u{2022} one", "\u{2022} two"]
+        );
+        let long = format!(
+            "\u{2022} {}",
+            (0..60)
+                .map(|i| format!("word{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let lines = super::wrap_dialog_lines(&mut engine, &scales, 1.0, &long, 200.0);
+        assert!(lines.len() > 3, "{lines:?}");
+        for line in &lines {
+            assert!(width(&mut engine, line) <= 200.0, "{line:?}");
+        }
+        let words: Vec<&str> = lines
+            .iter()
+            .flat_map(|l| l.split(' '))
+            .filter(|w| !w.is_empty() && *w != "\u{2022}")
+            .collect();
+        let expected: Vec<String> = (0..60).map(|i| format!("word{i}")).collect();
+        assert_eq!(
+            words,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(
+            lines.iter().skip(1).all(|l| l.starts_with("  ")),
+            "continuations are indented"
+        );
+    }
+
+    #[test]
+    fn a_word_wider_than_the_line_is_cut_between_characters_without_losing_any() {
+        let scales = test_scales();
+        let mut engine = engine();
+        let word = "W".repeat(80);
+        let lines = super::wrap_dialog_lines(&mut engine, &scales, 1.0, &word, 120.0);
+        assert!(lines.len() > 1);
+        let joined: String = lines.iter().map(|l| l.trim_start()).collect();
+        assert_eq!(joined, word);
+        for line in &lines {
+            assert!(width(&mut engine, line) <= 120.0, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_degenerate_width_wraps_nothing_and_the_line_count_is_bounded() {
+        let scales = test_scales();
+        let mut engine = engine();
+        for bad in [0.0_f32, -4.0, f32::NAN] {
+            assert_eq!(
+                super::wrap_dialog_lines(&mut engine, &scales, 1.0, "a b c d", bad),
+                ["a b c d"]
+            );
+        }
+        let many = vec!["x"; super::MAX_DIALOG_LINES + 50].join("\n");
+        let lines = super::wrap_dialog_lines(&mut engine, &scales, 1.0, &many, 400.0);
+        assert_eq!(lines.len(), super::MAX_DIALOG_LINES + 1);
+        assert!(
+            lines
+                .last()
+                .is_some_and(|l| l.contains("full list is in Aurora's log"))
+        );
+    }
 }
