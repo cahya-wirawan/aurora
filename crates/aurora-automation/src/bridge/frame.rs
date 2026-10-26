@@ -9,6 +9,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// One socket handle shared by the reader, the writer and whoever closes it.
@@ -19,35 +20,58 @@ use std::time::{Duration, Instant};
 /// disconnect did not end the connection. Every operation goes through this
 /// one handle instead.
 #[derive(Clone, Debug)]
-pub struct Conn(Arc<TcpStream>);
+pub struct Conn(Arc<ConnInner>);
+
+#[derive(Debug)]
+struct ConnInner {
+    stream: TcpStream,
+    closed: AtomicBool,
+}
 
 impl Conn {
     /// Wraps an accepted or connected socket.
     #[must_use]
     pub fn new(stream: TcpStream) -> Self {
-        Self(Arc::new(stream))
+        Self(Arc::new(ConnInner {
+            stream,
+            closed: AtomicBool::new(false),
+        }))
     }
 
     /// The socket, for options and `shutdown`.
     #[must_use]
     pub fn socket(&self) -> &TcpStream {
-        &self.0
+        &self.0.stream
+    }
+
+    /// Closes the connection and remembers it. Windows can still hand a
+    /// reader data that arrives after `shutdown`, so a reader must also ask
+    /// [`Conn::is_closed`] before acting on what it read.
+    pub fn close(&self) {
+        self.0.closed.store(true, Ordering::SeqCst);
+        let _ = self.0.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Whether [`Conn::close`] was called on any clone.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.0.closed.load(Ordering::SeqCst)
     }
 }
 
 impl Read for Conn {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        (&*self.0).read(buf)
+        (&self.0.stream).read(buf)
     }
 }
 
 impl Write for Conn {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (&*self.0).write(buf)
+        (&self.0.stream).write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        (&*self.0).flush()
+        (&self.0.stream).flush()
     }
 }
 
