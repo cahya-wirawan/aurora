@@ -624,6 +624,9 @@ async fn the_scratch_dir_option_holds_the_document_store_and_staging() {
     );
 }
 
+// Unix only: stdout is moved off fd 1 only on Unix (ADR 0014), so on Windows a
+// stray print still reaches the protocol stream.
+#[cfg(unix)]
 #[test]
 fn a_stray_println_does_not_reach_the_protocol() {
     let dir = tempfile::tempdir().unwrap();

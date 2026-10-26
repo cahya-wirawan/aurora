@@ -458,7 +458,9 @@ fn dir_bytes(dir: &Path) -> u64 {
     std::fs::read_dir(dir).map_or(0, |entries| {
         entries
             .flatten()
-            .filter_map(|e| e.metadata().ok())
+            // Not `DirEntry::metadata`: on Windows that is the directory
+            // listing's copy, which lags behind a file still being written.
+            .filter_map(|e| std::fs::symlink_metadata(e.path()).ok())
             .filter(std::fs::Metadata::is_file)
             .map(|m| m.len())
             .sum()
