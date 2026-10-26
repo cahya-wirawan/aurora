@@ -763,6 +763,12 @@ fn container_text(
     match tree.payload(parent)? {
         WidgetKind::Dialog => {
             let node = tree.accessibility(id)?;
+            // A scrolling dialog's message node (task 161) is a viewport
+            // holding its lines as rows, which draw themselves: it draws
+            // nothing, or the whole text would also appear on one line.
+            if tree.children(id).is_some_and(|kids| !kids.is_empty()) {
+                return None;
+            }
             (node.role() == accesskit::Role::Label)
                 .then(|| node.label().map(str::to_owned))
                 .flatten()
