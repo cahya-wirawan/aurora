@@ -196,7 +196,7 @@ impl BridgeServer {
     /// Closes the connected controller's socket (its thread then ends).
     pub fn disconnect_controller(&self) {
         if let Some(stream) = lock(&self.shared.controller).as_ref() {
-            let _ = stream.socket().shutdown(Shutdown::Both);
+            stream.close();
         }
     }
 
@@ -485,6 +485,9 @@ fn request_loop(reader: &mut BufReader<Conn>, writer: &mut Conn, shared: &Arc<Sh
             }
             Ok(Line::Eof) | Err(_) => return,
         };
+        if reader.get_ref().is_closed() {
+            return;
+        }
         let request: Request = match serde_json::from_slice(&line) {
             Ok(request) => request,
             Err(error) => {

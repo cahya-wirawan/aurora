@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.295.6] - 2026-10-26
+
+### Fixed
+
+- Bridge: a closed connection delivers no more requests on Windows
+
 ## [0.295.5] - 2026-10-26
 
 ### Fixed
