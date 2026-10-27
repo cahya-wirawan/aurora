@@ -14,6 +14,7 @@ use crate::document_session::DocumentId;
 use crate::psd_save::{PsdSaveFailure, PsdSaveSource};
 
 const PATIENCE: Duration = Duration::from_secs(20);
+const LONG_PATIENCE: Duration = Duration::from_secs(600);
 
 fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     match r {
@@ -147,7 +148,11 @@ fn run_on_worker(worker: &mut PsdCheckWorker, job: CheckJob) -> FinishedCheck {
     let _ = ok(worker.start(job, move || {
         let _ = tx.send(());
     }));
-    wait(&rx);
+    // A large document's check takes tens of seconds in a dev build.
+    assert!(
+        rx.recv_timeout(LONG_PATIENCE).is_ok(),
+        "the check never woke"
+    );
     match worker.take_finished() {
         Some(finished) => finished,
         None => unreachable!("no result after the wake"),
