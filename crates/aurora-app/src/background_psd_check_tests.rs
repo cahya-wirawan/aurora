@@ -14,7 +14,7 @@ use crate::document_session::DocumentId;
 use crate::psd_save::{PsdSaveFailure, PsdSaveSource};
 
 const PATIENCE: Duration = Duration::from_secs(20);
-const LONG_PATIENCE: Duration = Duration::from_secs(600);
+const LONG_PATIENCE: Duration = Duration::from_mins(10);
 
 fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     match r {
@@ -277,6 +277,7 @@ fn a_refused_document_shows_the_calm_failure_dialog_and_writes_nothing() {
 }
 
 #[test]
+#[allow(clippy::panic)] // the point of the test
 fn a_panicking_check_is_a_failed_check_not_a_lost_one() {
     let mut worker = PsdCheckWorker::default();
     let (tx, rx) = mpsc::channel();
@@ -355,7 +356,7 @@ fn a_second_check_while_one_runs_is_refused_and_does_not_start_a_job() {
         worker
             .start_with(
                 meta(DocumentId::next(), 1),
-                |_| Ok(Default::default()),
+                |_| Ok(aurora_io::PsdWriteReport::default()),
                 || {}
             )
             .is_ok()
@@ -513,7 +514,10 @@ fn a_finished_check_is_shown_for_its_own_document_and_flags_an_edit() {
     wait(&woken);
     assert_eq!(background_check_step(&mut host), CheckStep::Finished);
     assert_eq!(host.shown.len(), 1);
-    assert!(host.shown[0].1, "edited");
+    assert!(
+        host.shown.first().is_some_and(|(_, edited)| *edited),
+        "edited"
+    );
     assert_eq!(host.states, 1, "the indicator is refreshed to cleared");
     assert!(!host.worker.is_checking());
 }
