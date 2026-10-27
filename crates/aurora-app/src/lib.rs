@@ -34489,15 +34489,12 @@ impl App {
             Ok(job) => job,
             Err(why) => {
                 tracing::warn!(%why, "the Photoshop compatibility check could not be prepared");
-                self.open_psd_check_dialog(
-                    psd_save::PSD_CHECK_FAILED_TITLE,
-                    &background_psd_check::dialog_text(
-                        "",
-                        &Err(background_psd_check::CheckFailure::Snapshot(why)),
-                        false,
-                    )
-                    .1,
+                let (title, message) = background_psd_check::dialog_text(
+                    "",
+                    &Err(background_psd_check::CheckFailure::Snapshot(why)),
+                    false,
                 );
+                self.open_psd_check_dialog(title, &message);
                 return;
             }
         };
@@ -34521,10 +34518,12 @@ impl App {
             }
             Err(background_psd_check::StartFailure::Spawn(err)) => {
                 tracing::warn!(%err, "couldn't start the Photoshop compatibility check");
-                self.open_psd_check_dialog(
-                    psd_save::PSD_CHECK_FAILED_TITLE,
-                    "Aurora couldn't start the Photoshop compatibility check. No file was written.",
+                let (title, message) = background_psd_check::dialog_text(
+                    "",
+                    &Err(background_psd_check::CheckFailure::CouldNotStart),
+                    false,
                 );
+                self.open_psd_check_dialog(title, &message);
             }
         }
     }
@@ -34541,9 +34540,8 @@ impl App {
     /// `about_to_wait`'s step for a background Check PSD Compatibility
     /// (task 162), through [`background_psd_check::background_check_step`].
     fn poll_psd_check(&mut self) {
-        if background_psd_check::background_check_step(self)
-            != background_psd_check::CheckStep::Idle
-        {
+        let step = background_psd_check::background_check_step(self);
+        if background_psd_check::step_needs_redraw(step) {
             self.needs_redraw = true;
         }
     }

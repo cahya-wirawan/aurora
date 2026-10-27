@@ -22,7 +22,10 @@
 //! snapshot nothing the worker reads can change, so a later edit never
 //! tears the report: it is the report of the document as it was when the
 //! check started, and the dialog says so when the document was edited
-//! meanwhile ([`EDITED_NOTE`]).
+//! meanwhile ([`EDITED_NOTE`]). "Edited" is the document's content
+//! revision, which a change of the output profile does not move (it is
+//! metadata, `colour_unsaved`): a profile set after the snapshot is not
+//! noted, and the report carries the colour lines as they were at start.
 //!
 //! The rules this module owns, each pinned by a test:
 //!
@@ -90,6 +93,8 @@ pub(crate) enum CheckFailure {
     Snapshot(String),
     /// The check panicked; the payload's message.
     Panicked(String),
+    /// The thread could not be started.
+    CouldNotStart,
     /// Dropped on request; never shown.
     Cancelled,
 }
@@ -293,6 +298,8 @@ pub(crate) struct PsdCheckWorker {
     pending: Option<PendingCheck>,
     /// Cancelled checks whose threads have not finished yet.
     abandoned: Vec<JoinHandle<()>>,
+    /// The running check's result once it has arrived, until taken.
+    ready: Option<FinishedCheck>,
     sender: mpsc::Sender<FinishedCheck>,
     receiver: mpsc::Receiver<FinishedCheck>,
 }
@@ -304,6 +311,7 @@ impl Default for PsdCheckWorker {
             last_generation: 0,
             pending: None,
             abandoned: Vec::new(),
+            ready: None,
             sender,
             receiver,
         }
@@ -427,30 +435,46 @@ impl PsdCheckWorker {
         };
         pending.cancel.store(true, Ordering::SeqCst);
         self.abandoned.push(pending.handle);
+        self.ready = None;
         true
     }
 
-    /// Drains the channel and returns the running check's result, clearing
-    /// the pending state. A result whose check was cancelled is dropped.
-    pub(crate) fn take_finished(&mut self) -> Option<FinishedCheck> {
-        let mut current = None;
+    /// Moves what has arrived on the channel aside: the running check's
+    /// result is kept in `ready`, any other (a cancelled check's) dropped.
+    fn collect(&mut self) {
         while let Ok(finished) = self.receiver.try_recv() {
             let is_pending = self
                 .pending
                 .as_ref()
                 .is_some_and(|pending| pending.generation == finished.generation);
             if is_pending {
-                if let Some(pending) = self.pending.take() {
-                    // Finished except for its `wake` call: reaped later.
-                    self.abandoned.push(pending.handle);
-                }
-                current = Some(finished);
+                self.ready = Some(finished);
             } else {
                 tracing::info!(
                     generation = finished.generation,
                     "dropped a cancelled Photoshop compatibility check's result"
                 );
             }
+        }
+    }
+
+    /// Whether the running check's result has arrived and waits to be
+    /// taken (what a dialog defers). Takes nothing.
+    pub(crate) fn has_result(&mut self) -> bool {
+        self.collect();
+        self.ready.is_some()
+    }
+
+    /// Returns the running check's result if it has arrived, clearing the
+    /// pending state. A result whose check was cancelled is dropped.
+    pub(crate) fn take_finished(&mut self) -> Option<FinishedCheck> {
+        self.collect();
+        let current = self.ready.take();
+        if current.is_some()
+            && let Some(pending) = self.pending.take()
+        {
+            // Finished except for its `wake` call: reaped later.
+            self.abandoned.push(pending.handle);
         }
         self.reap();
         current
@@ -472,6 +496,7 @@ impl PsdCheckWorker {
     /// finishes within `bound` and detaches the rest. Never blocks for
     /// much longer than `bound`.
     pub(crate) fn shutdown(&mut self, bound: Duration) -> ShutdownReport {
+        self.ready = None;
         let mut handles = std::mem::take(&mut self.abandoned);
         if let Some(pending) = self.pending.take() {
             pending.cancel.store(true, Ordering::SeqCst);
@@ -546,6 +571,10 @@ fn failure_message(failure: &CheckFailure) -> String {
         CheckFailure::Snapshot(why) => {
             format!("Aurora couldn't read the document to check it: {why}. No file was written.")
         }
+        CheckFailure::CouldNotStart => {
+            "Aurora couldn't start the Photoshop compatibility check. No file was written."
+                .to_owned()
+        }
         CheckFailure::Panicked(message) => format!(
             "The Photoshop compatibility check stopped unexpectedly. Details: {}. No file was \
              written.",
@@ -591,6 +620,14 @@ pub(crate) enum CheckStep {
     Finished,
 }
 
+/// Whether `step` changed what is on screen, so the loop asks for a frame.
+/// A check still running (or finished and waiting under a dialog) asks
+/// for none: the indicator was drawn when the check started.
+#[must_use]
+pub(crate) fn step_needs_redraw(step: CheckStep) -> bool {
+    matches!(step, CheckStep::Cancelled | CheckStep::Finished)
+}
+
 /// The side of the app [`background_check_step`] drives: `App` in
 /// production, a recording stand-in in tests.
 pub(crate) trait CheckHost {
@@ -622,7 +659,9 @@ pub(crate) fn background_check_step(host: &mut impl CheckHost) -> CheckStep {
         return CheckStep::Cancelled;
     }
     if host.modal_open() {
-        return if host.check_worker().is_checking() {
+        // Deferred only when there is something to show; a check still
+        // running under a dialog is Idle, so the loop is not kept awake.
+        return if host.check_worker().has_result() {
             CheckStep::Deferred
         } else {
             CheckStep::Idle

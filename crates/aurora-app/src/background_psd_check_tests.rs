@@ -560,6 +560,100 @@ fn a_finished_check_waits_while_a_dialog_is_open() {
 }
 
 #[test]
+fn a_check_under_a_dialog_asks_for_no_redraw_until_it_is_shown() {
+    let doc = DocumentId::next();
+    let mut host = Host::new(doc);
+    host.modal = true;
+    let (release, woken, _) = gated_start(&mut host.worker, meta(doc, 1));
+    // Still running under the dialog: Idle, so the loop is not kept awake.
+    for _ in 0..3 {
+        let step = background_check_step(&mut host);
+        assert_eq!(step, CheckStep::Idle);
+        assert!(!step_needs_redraw(step));
+    }
+    // Finished but waiting for the dialog: nothing to draw yet either.
+    let _ = release.send(());
+    wait(&woken);
+    for _ in 0..3 {
+        let step = background_check_step(&mut host);
+        assert_eq!(step, CheckStep::Deferred);
+        assert!(!step_needs_redraw(step));
+    }
+    // The dialog closes: shown, and only now a frame.
+    host.modal = false;
+    let step = background_check_step(&mut host);
+    assert_eq!(step, CheckStep::Finished);
+    assert!(step_needs_redraw(step));
+    assert!(step_needs_redraw(CheckStep::Cancelled));
+    assert!(!step_needs_redraw(CheckStep::Idle));
+}
+
+#[test]
+fn the_app_redraws_only_for_the_steps_that_change_the_screen() {
+    let lib = include_str!("lib.rs");
+    let start = lib.find("fn poll_psd_check(&mut self)").unwrap_or(0);
+    let body = &lib[start..start + 400.min(lib.len() - start)];
+    assert!(body.contains("step_needs_redraw(step)"), "{body}");
+}
+
+#[test]
+fn the_snapshot_and_start_failures_have_their_own_calm_dialogs() {
+    let (title, message) = dialog_text(
+        "",
+        &Err(CheckFailure::Snapshot(
+            "a tile could not be read".to_owned(),
+        )),
+        false,
+    );
+    assert_eq!(title, crate::psd_save::PSD_CHECK_FAILED_TITLE);
+    assert_eq!(
+        message,
+        "Aurora couldn't read the document to check it: a tile could not be read. No file was written."
+    );
+    let (title, message) = dialog_text("", &Err(CheckFailure::CouldNotStart), true);
+    assert_eq!(title, crate::psd_save::PSD_CHECK_FAILED_TITLE);
+    assert_eq!(
+        message,
+        "Aurora couldn't start the Photoshop compatibility check. No file was written."
+    );
+}
+
+#[test]
+fn the_result_is_on_the_channel_before_the_wake_runs() {
+    let mut worker = PsdCheckWorker::default();
+    let (tx, rx) = mpsc::channel();
+    let _ = ok(worker.start_with(
+        meta(DocumentId::next(), 1),
+        |_| Ok(aurora_io::PsdWriteReport::default()),
+        move || {
+            let _ = tx.send(());
+            // A slow wake: a result sent only after it would be missed.
+            std::thread::sleep(Duration::from_millis(300));
+        },
+    ));
+    wait(&rx);
+    assert!(worker.take_finished().is_some(), "result before wake");
+}
+
+#[test]
+fn a_cancelled_job_reports_cancelled_even_when_the_writer_fails_first() {
+    let mut doc = Doc::new(8, 8, 16);
+    // Flag already set: the fill stops at the first tile.
+    let job = doc.job(Vec::new());
+    let cancel = AtomicBool::new(true);
+    assert!(matches!(job.run(&cancel), Err(CheckFailure::Cancelled)));
+    // No tiles to fill, flag set: the sink fails the writer, and that
+    // failure is still reported as a cancel, not as a broken write.
+    let mut job = doc.job(Vec::new());
+    job.tiles.clear();
+    let cancel = AtomicBool::new(true);
+    assert!(matches!(job.run(&cancel), Err(CheckFailure::Cancelled)));
+    // Not set: the same job runs to a report.
+    let job = doc.job(Vec::new());
+    assert!(job.run(&AtomicBool::new(false)).is_ok());
+}
+
+#[test]
 fn shutdown_with_a_check_in_flight_cancels_and_joins_without_hanging() {
     let mut worker = PsdCheckWorker::default();
     let (release, woken, seen_cancel) = gated_start(&mut worker, meta(DocumentId::next(), 1));
