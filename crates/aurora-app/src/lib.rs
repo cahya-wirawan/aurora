@@ -548,6 +548,7 @@ mod autosave_files;
 mod background_autosave;
 mod background_composite;
 mod background_open;
+mod background_psd_check;
 mod bench_launch;
 mod bridge_app;
 mod bridge_doc;
@@ -1149,6 +1150,9 @@ enum AppEvent {
     /// The automation bridge (task 160) has a request or a connection
     /// change for the UI thread; `about_to_wait` runs them.
     Bridge,
+    /// A Check PSD Compatibility run (task 162) has finished;
+    /// `about_to_wait` shows its report.
+    PsdCheckFinished,
 }
 
 impl From<accesskit_winit::Event> for AppEvent {
@@ -26162,6 +26166,7 @@ fn app_event_requests_redraw(event: &AppEvent) -> bool {
             | AppEvent::CompositeReady
             | AppEvent::ThumbnailReady
             | AppEvent::Bridge
+            | AppEvent::PsdCheckFinished
     )
 }
 
@@ -31244,6 +31249,8 @@ struct App {
     /// The open still decoding on a background thread, if any, and the
     /// channel its result comes back on (0.151.0).
     open_worker: OpenWorker,
+    /// The Check PSD Compatibility run in flight, if any (task 162).
+    psd_check_worker: background_psd_check::PsdCheckWorker,
     /// The background compositor (0.186.0); `None` only if a test double
     /// builds an `App` without one.
     composite_worker: Option<background_composite::CompositeWorker>,
@@ -31707,6 +31714,32 @@ impl OpenInstaller for App {
     }
 }
 
+impl background_psd_check::CheckHost for App {
+    fn check_worker(&mut self) -> &mut background_psd_check::PsdCheckWorker {
+        &mut self.psd_check_worker
+    }
+
+    fn active_document(&self) -> (document_session::DocumentId, UndoRevision) {
+        (self.doc.id, self.doc.undo_order.content_revision)
+    }
+
+    fn modal_open(&self) -> bool {
+        self.dialog.is_some()
+    }
+
+    fn show_check_state(&mut self) {
+        Self::show_check_state(self);
+    }
+
+    fn check_cancelled(&mut self) {
+        self.colour_notice(background_psd_check::CANCELLED_NOTICE);
+    }
+
+    fn show_check_result(&mut self, finished: background_psd_check::FinishedCheck, edited: bool) {
+        self.show_psd_check_result(finished, edited);
+    }
+}
+
 impl App {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -31938,6 +31971,7 @@ impl App {
             adapter: None,
             proxy,
             open_worker: OpenWorker::default(),
+            psd_check_worker: background_psd_check::PsdCheckWorker::default(),
             thumbnails: layer_thumbnails::LayerThumbnails::new(std::sync::Arc::new(move || {
                 let _ = thumbnail_proxy.send_event(AppEvent::ThumbnailReady);
             })),
@@ -32090,8 +32124,13 @@ impl App {
         let tree = &self.workspace.tree;
         let focused = self.focus.focused().unwrap_or(self.workspace.root);
         let opening = self.open_worker.pending_path();
+        let checking = self.psd_check_worker.is_checking();
         adapter.update_if_active(|| {
-            with_opening_status(tree.accessibility_update(focused), tree.root(), opening)
+            background_psd_check::with_check_status(
+                with_opening_status(tree.accessibility_update(focused), tree.root(), opening),
+                tree.root(),
+                checking,
+            )
         });
     }
 
@@ -33367,7 +33406,11 @@ impl App {
     /// cannot be turned off from the bridge.
     pub(crate) fn apply_window_title(&self) {
         if let Some(window) = self.window.as_ref() {
-            let mut title = window_title(self.open_worker.pending_path(), &self.doc.name);
+            let mut title = background_psd_check::window_title_with_check(
+                self.open_worker.pending_path(),
+                self.psd_check_worker.is_checking(),
+                &self.doc.name,
+            );
             if self.bridge.as_ref().is_some_and(|b| b.shown_connected) {
                 title.push_str(bridge_app::TITLE_SUFFIX);
             }
@@ -34411,7 +34454,18 @@ impl App {
     /// Check PSD Compatibility (task 157): the report a Save As `.psd`
     /// would show for the active document, in a single-OK dialog. Writes
     /// no file and changes nothing ([`psd_save::check_psd_compatibility`]).
+    ///
+    /// **Since task 162 this only starts the check** (invariant §7.3.4):
+    /// the UI thread takes a snapshot of the document
+    /// ([`background_psd_check::CheckJob::snapshot`]) and a worker thread
+    /// composites and runs the writer; the window title and an
+    /// accessibility status node say "Checking PSD compatibility…" until
+    /// [`Self::poll_psd_check`] shows the report. One check at a time.
     fn check_psd_compatibility(&mut self) {
+        if self.psd_check_worker.is_busy() {
+            self.colour_notice(background_psd_check::BUSY_NOTICE);
+            return;
+        }
         let name = aurora_doc::sanitize_display_name(&self.doc.name).into_owned();
         let carried = psd_carried_entries(&self.doc);
         let Some(store) = self.doc.tile_store.as_mut() else {
@@ -34421,34 +34475,109 @@ impl App {
             );
             return;
         };
-        let source = psd_save::PsdSaveSource {
-            saved: self.doc.selection.saved_sorted(),
-            layers: &self.doc.layers,
-            canvas: self.doc.canvas_size,
-            store,
+        let started = std::time::Instant::now();
+        let inputs = background_psd_check::CheckInputs {
+            name,
             doc_id: self.doc.id,
             revision: self.doc.undo_order.content_revision,
+            layers: &self.doc.layers,
+            canvas: self.doc.canvas_size,
+            saved: self.doc.selection.saved_sorted(),
             carried,
         };
-        let (title, message) = match psd_save::check_psd_compatibility(source) {
-            Ok(report) => {
-                tracing::info!(
-                    report = %psd_report::SaveReport::new(&report).full_text(),
-                    "checked Photoshop compatibility"
-                );
-                (
-                    psd_save::PSD_CHECK_TITLE,
-                    psd_report::check_message(&name, &report),
-                )
-            }
-            Err(failure) => {
-                tracing::warn!(?failure, "the Photoshop compatibility check failed");
-                (
+        let job = match background_psd_check::CheckJob::snapshot(inputs, store) {
+            Ok(job) => job,
+            Err(why) => {
+                tracing::warn!(%why, "the Photoshop compatibility check could not be prepared");
+                self.open_psd_check_dialog(
                     psd_save::PSD_CHECK_FAILED_TITLE,
-                    psd_save::psd_check_failure_message(&failure),
-                )
+                    &background_psd_check::dialog_text(
+                        "",
+                        &Err(background_psd_check::CheckFailure::Snapshot(why)),
+                        false,
+                    )
+                    .1,
+                );
+                return;
             }
         };
+        let snapshot_time = started.elapsed();
+        let proxy = self.proxy.clone();
+        let wake = move || {
+            // `Err` only once the loop has exited (quitting).
+            let _ = proxy.send_event(AppEvent::PsdCheckFinished);
+        };
+        match self.psd_check_worker.start(job, wake) {
+            Ok(generation) => {
+                tracing::info!(
+                    generation,
+                    snapshot_ms = snapshot_time.as_secs_f64() * 1e3,
+                    "checking Photoshop compatibility in the background"
+                );
+                self.show_check_state();
+            }
+            Err(background_psd_check::StartFailure::Busy) => {
+                self.colour_notice(background_psd_check::BUSY_NOTICE);
+            }
+            Err(background_psd_check::StartFailure::Spawn(err)) => {
+                tracing::warn!(%err, "couldn't start the Photoshop compatibility check");
+                self.open_psd_check_dialog(
+                    psd_save::PSD_CHECK_FAILED_TITLE,
+                    "Aurora couldn't start the Photoshop compatibility check. No file was written.",
+                );
+            }
+        }
+    }
+
+    /// Mirrors the check worker's pending state into the window title and
+    /// the accessibility tree and asks for a frame (the Opening pattern,
+    /// [`Self::show_open_state`]).
+    fn show_check_state(&mut self) {
+        self.apply_window_title();
+        self.push_accessibility();
+        self.needs_redraw = true;
+    }
+
+    /// `about_to_wait`'s step for a background Check PSD Compatibility
+    /// (task 162), through [`background_psd_check::background_check_step`].
+    fn poll_psd_check(&mut self) {
+        if background_psd_check::background_check_step(self)
+            != background_psd_check::CheckStep::Idle
+        {
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Shows a finished check: the same dialog the synchronous check gave
+    /// ([`background_psd_check::dialog_text`]).
+    fn show_psd_check_result(
+        &mut self,
+        finished: background_psd_check::FinishedCheck,
+        edited: bool,
+    ) {
+        let background_psd_check::FinishedCheck {
+            generation,
+            meta,
+            result,
+            elapsed,
+        } = finished;
+        match &result {
+            Ok(report) => tracing::info!(
+                generation,
+                check_ms = elapsed.as_secs_f64() * 1e3,
+                edited,
+                report = %psd_report::SaveReport::new(report).full_text(),
+                "checked Photoshop compatibility"
+            ),
+            Err(failure) => {
+                tracing::warn!(
+                    generation,
+                    ?failure,
+                    "the Photoshop compatibility check failed"
+                );
+            }
+        }
+        let (title, message) = background_psd_check::dialog_text(&meta.name, &result, edited);
         self.open_psd_check_dialog(title, &message);
     }
 
@@ -36578,6 +36707,18 @@ impl App {
         // `run_shutdown_cleanup` stops the autosave worker before it
         // deletes anything (0.152.0; review R6 moved that step there so
         // the ordering is tested).
+        // Task 162: a compatibility check still running is cancelled and
+        // joined within a bound, like a decode; its mirror store lives in
+        // the scratch directory the cleanup below removes.
+        let check = self
+            .psd_check_worker
+            .shutdown(background_psd_check::SHUTDOWN_JOIN_BOUND);
+        if check.detached > 0 {
+            tracing::info!(
+                detached = check.detached,
+                "quit with a Photoshop compatibility check running; its thread was detached"
+            );
+        }
         run_shutdown_cleanup(self);
     }
 
@@ -100074,7 +100215,8 @@ impl App {
             wake @ (AppEvent::OpenFinished
             | AppEvent::CompositeReady
             | AppEvent::ThumbnailReady
-            | AppEvent::Bridge) => {
+            | AppEvent::Bridge
+            | AppEvent::PsdCheckFinished) => {
                 // Installed by `about_to_wait`, which runs after this on
                 // the same iteration: the wake's whole job is to end the
                 // loop's `Wait` so that it does.
@@ -100209,6 +100351,9 @@ impl App {
         // iteration, not the next (critic C5).
         self.sync_ime();
         self.follow_document_tabs_now();
+        // Task 162: after the tab switch, so a check whose document just
+        // went away is dropped this iteration.
+        self.poll_psd_check();
         self.sync_layer_controls_now();
         frame_trace::mark("sync_layers");
         self.sync_tool_controls_now();

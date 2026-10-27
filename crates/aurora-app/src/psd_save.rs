@@ -413,15 +413,25 @@ pub(crate) fn begin_psd_save_timed(
 }
 
 /// A writer that keeps nothing: it counts its position and length so the
-/// PSD writer, which seeks back to patch lengths, runs unchanged.
+/// PSD writer, which seeks back to patch lengths, runs unchanged. With a
+/// `cancel` flag (task 162) a write after the flag is set fails, which
+/// stops a check nobody wants any more at the writer's next write.
 #[derive(Debug, Default)]
-struct CountingSink {
+struct CountingSink<'a> {
     pos: u64,
     len: u64,
+    cancel: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
-impl std::io::Write for CountingSink {
+impl std::io::Write for CountingSink<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self
+            .cancel
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            // Not `Interrupted`: `write_all` retries that forever.
+            return Err(std::io::Error::other("the check was cancelled"));
+        }
         self.pos = self.pos.saturating_add(buf.len() as u64);
         self.len = self.len.max(self.pos);
         Ok(buf.len())
@@ -432,7 +442,7 @@ impl std::io::Write for CountingSink {
     }
 }
 
-impl std::io::Seek for CountingSink {
+impl std::io::Seek for CountingSink<'_> {
     fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
         let target = match to {
             std::io::SeekFrom::Start(n) => Some(n),
@@ -457,9 +467,21 @@ impl std::io::Seek for CountingSink {
 /// text, alpha channels) are the ones a save would give. Nothing is
 /// created on disk and the document is untouched. The cost is a save's
 /// without its disk writes and verification (the composite and the tile
-/// reads), on the calling thread.
+/// reads), on the calling thread. The app runs the same check off the UI
+/// thread over a snapshot (`background_psd_check`, task 162); this form
+/// is what that must equal, and what the automation bridge calls.
 pub(crate) fn check_psd_compatibility(
     source: PsdSaveSource<'_>,
+) -> Result<aurora_io::PsdWriteReport, PsdSaveFailure> {
+    check_psd_compatibility_cancellable(source, None)
+}
+
+/// [`check_psd_compatibility`] that stops, with an error, at the writer's
+/// next write once `cancel` is set. The result of a cancelled check is
+/// meaningless; the caller drops it.
+pub(crate) fn check_psd_compatibility_cancellable(
+    source: PsdSaveSource<'_>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<aurora_io::PsdWriteReport, PsdSaveFailure> {
     let opts = aurora_io::PsdSaveOptions::default();
     aurora_io::psd_save_preflight(source.layers, source.canvas, opts)
@@ -468,7 +490,10 @@ pub(crate) fn check_psd_compatibility(
     let image = crate::composite_document(source.layers, source.store, width, height)
         .map_err(PsdSaveFailure::Composite)?;
     let mut composite = &image;
-    let mut sink = CountingSink::default();
+    let mut sink = CountingSink {
+        cancel,
+        ..CountingSink::default()
+    };
     let outcome = aurora_io::write_psd_with_selections(
         &mut sink,
         source.layers,
