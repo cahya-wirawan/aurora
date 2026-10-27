@@ -90,7 +90,7 @@ fn roundtrip_one_file(path: &std::path::Path, name: &str) -> Result<RoundTripRow
         (aurora_doc::LayerTree::new(), aurora_doc::History::new()),
     );
     let mut carried = crate::psd_save::carried_losses(
-        Some(&document.report.items).filter(|items| !items.is_empty()).map(Vec::as_slice),
+        Some(document.report.losses()).filter(|items| !items.is_empty()).as_deref(),
         &aurora_io::SkippedTiles::new(),
     );
     carried.extend(crate::psd_save::colour_loss_entries(&aurora_io::DocumentColour {

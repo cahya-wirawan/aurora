@@ -43,6 +43,7 @@ mod colour_import;
 mod error;
 mod image;
 pub mod import;
+mod import_loss;
 pub mod jpeg;
 pub mod png;
 pub mod psd;
@@ -73,6 +74,7 @@ pub use import::{
     EncodedTiles, ImageView, decode_by_extension, encode_by_extension, encode_image_tile,
     encode_image_tiles_at, image_tile_ids, read_from_store, write_into_store, write_into_store_at,
 };
+pub use import_loss::{ImportLoss, ImportLossKind};
 pub use psd::{
     PsdCompositeSource, PsdExpectation, PsdExpectedAdjustment, PsdExpectedAlpha, PsdExpectedLayer,
     PsdExpectedMask, PsdFormat, PsdRecordKind, PsdSaveOptions, PsdSaveRefusal, PsdWriteOutcome,

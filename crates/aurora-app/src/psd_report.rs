@@ -30,7 +30,9 @@
 //! Compatibility and in a dialog that is shown anyway, and they never make a
 //! save ask. A PSD whose only report lines are the open's own kept-text or
 //! alpha-channel notes still asks, because those notes are carried into the
-//! save as From open lines ([`ReportCategory::FromOpen`]), which always ask.
+//! save as lines of the open's own kind (task 163: Changed, Not saved, or
+//! From open for a line nobody could place; [`ReportCategory::FromOpen`]
+//! stays the group for those), and none of them is Kept, so all of them ask.
 //!
 //! The wording is plain text in one dialog message. The section headings are
 //! not bold: the only bundled face is Inter Regular and the text engine has

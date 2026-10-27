@@ -27,7 +27,7 @@ pub(crate) struct AurSaveSource<'a> {
     pub(crate) history: &'a aurora_doc::History,
     pub(crate) canvas_size: (u32, u32),
     pub(crate) skipped_tiles: &'a aurora_io::SkippedTiles,
-    pub(crate) import_losses: Option<&'a [String]>,
+    pub(crate) import_losses: Option<&'a [aurora_io::ImportLoss]>,
     pub(crate) selection: &'a aurora_doc::SelectionSet,
     pub(crate) colour: &'a aurora_io::DocumentColour,
 }

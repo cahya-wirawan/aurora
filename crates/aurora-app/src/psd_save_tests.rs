@@ -465,14 +465,19 @@ fn a_psd_opened_with_changes_always_asks_before_a_psd_save() {
     let opened = ok(aurora_io::read_psd(&bytes));
     assert!(!opened.report.is_empty(), "the open reports a change");
     // `App::open_psd_file` keeps the open's lines on the session.
-    let losses = Some(opened.report.items.clone());
+    let losses = Some(opened.report.losses());
     let skipped = aurora_io::SkippedTiles::new();
     let carried = crate::psd_save::carried_losses(losses.as_deref(), &skipped);
-    assert!(
-        !carried.is_empty()
-            && carried
-                .iter()
-                .all(|e| e.category == aurora_io::ReportCategory::FromOpen)
+    // Each carried line lands in the group its open-time kind names.
+    assert!(!carried.is_empty());
+    assert_eq!(
+        carried.iter().map(|e| e.category).collect::<Vec<_>>(),
+        opened
+            .report
+            .losses()
+            .iter()
+            .map(|l| l.kind.category())
+            .collect::<Vec<_>>()
     );
     // Saving over the very file it came from: a flat, otherwise lossless
     // document, so only the carried block is in the report.
@@ -495,7 +500,7 @@ fn a_psd_opened_cleanly_saves_without_a_dialog() {
     assert!(matches!(ok(doc.save(&path)), PsdSaveStep::Saved));
     let opened = ok(aurora_io::read_psd(&ok(std::fs::read(&path))));
     assert!(opened.report.is_empty());
-    let losses = (!opened.report.items.is_empty()).then(|| opened.report.items.clone());
+    let losses = (!opened.report.items.is_empty()).then(|| opened.report.losses());
     let carried =
         crate::psd_save::carried_losses(losses.as_deref(), &aurora_io::SkippedTiles::new());
     assert!(carried.is_empty());
@@ -513,7 +518,10 @@ fn new_and_other_documents_carry_no_losses_of_their_own() {
     // Each session carries only its own: the save reads the active
     // session's field, so switching documents switches what is carried.
     let mut opened = dirty_session(Doc::new());
-    opened.import_losses = Some(vec!["Clipping masks are shown unclipped.".to_owned()]);
+    opened.import_losses = Some(vec![aurora_io::ImportLoss::new(
+        aurora_io::ImportLossKind::NotSaved,
+        "Clipping masks are shown unclipped.",
+    )]);
     let none = aurora_io::SkippedTiles::new();
     assert!(crate::psd_save::carried_losses(fresh.import_losses.as_deref(), &none).is_empty());
     assert_eq!(
@@ -879,22 +887,30 @@ fn psd_save_through_a_symlink_replaces_the_real_file() {
 }
 
 /// A PSD that opens with changes, and the lines its open reports.
-fn lossy_open(doc: &mut Doc) -> (Vec<u8>, Vec<String>) {
+fn lossy_open(doc: &mut Doc) -> (Vec<u8>, Vec<aurora_io::ImportLoss>) {
     let bytes = psd_opening_with_changes(doc);
     let opened = ok(aurora_io::read_psd(&bytes));
     assert!(!opened.report.is_empty());
-    (bytes, opened.report.items)
+    (bytes, opened.report.losses())
 }
 
 /// After a PSD save of `doc` carrying `losses` over `target` (holding
 /// `bytes`): it asks, carries the block, and leaves the target alone.
-fn assert_asks(doc: &mut Doc, target: &Path, bytes: &[u8], losses: Option<&[String]>) {
+fn assert_asks(
+    doc: &mut Doc,
+    target: &Path,
+    bytes: &[u8],
+    losses: Option<&[aurora_io::ImportLoss]>,
+) {
     let carried = crate::psd_save::carried_losses(losses, &aurora_io::SkippedTiles::new());
-    assert!(
-        !carried.is_empty()
-            && carried
-                .iter()
-                .all(|e| e.category == aurora_io::ReportCategory::FromOpen)
+    assert!(!carried.is_empty());
+    assert_eq!(
+        carried.iter().map(|e| e.category).collect::<Vec<_>>(),
+        losses
+            .unwrap_or_default()
+            .iter()
+            .map(|l| l.kind.category())
+            .collect::<Vec<_>>()
     );
     let PsdSaveStep::NeedsConfirmation(pending) = ok(doc.save_carrying(target, carried.clone()))
     else {
@@ -1531,7 +1547,7 @@ fn a_grayscale_open_carries_the_colour_mode_change_into_the_save_report() {
     };
     let opened = ok(aurora_io::psd::read(&bytes));
     let none = aurora_io::SkippedTiles::new();
-    let lines = crate::psd_save::carried_losses(Some(&opened.report.items), &none);
+    let lines = crate::psd_save::carried_losses(Some(&opened.report.losses()), &none);
     assert!(
         lines
             .iter()
@@ -1646,7 +1662,7 @@ fn a_cmyk_or_32_bit_open_carries_its_conversion_into_the_psd_save_report() {
         let target = doc.path("converted.psd");
         ok(std::fs::write(&target, &bytes));
         let carried = crate::psd_save::carried_losses(
-            Some(opened.report.items.as_slice()),
+            Some(opened.report.losses().as_slice()),
             &aurora_io::SkippedTiles::new(),
         );
         assert!(
@@ -1860,7 +1876,7 @@ fn the_carried_colour_and_path_lines_have_their_categories() {
     let path_entry = crate::psd_save::paths_loss_entry(&set);
     assert_eq!(path_entry.map(|e| e.category), Some(NotSaved));
     let open = crate::psd_save::carried_losses(
-        Some(&["Something was left out.".to_owned()]),
+        Some(&[aurora_io::ImportLoss::from_open("Something was left out.")]),
         &aurora_io::SkippedTiles::new(),
     );
     assert_eq!(open.len(), 1);
@@ -1986,4 +2002,129 @@ fn a_check_that_cannot_open_its_dialog_leaves_a_calm_notice() {
     let body = &lib[start..start + 900.min(lib.len() - start)];
     assert!(body.contains("self.colour_notice(psd_save::PSD_CHECK_BUSY_NOTICE)"));
     assert!(crate::psd_save::PSD_CHECK_BUSY_NOTICE.contains("dialog is open"));
+}
+
+// ---- task 163: carried open notes are grouped by their kind ----
+
+#[test]
+fn a_carried_open_line_lands_in_the_group_its_kind_names() {
+    use aurora_io::{ImportLoss, ImportLossKind, ReportCategory};
+    let losses = [
+        ImportLoss::new(ImportLossKind::NotSaved, "Gone."),
+        ImportLoss::new(ImportLossKind::Changed, "Altered."),
+        ImportLoss::from_open("Unplaced."),
+    ];
+    let carried = crate::psd_save::carried_losses(Some(&losses), &aurora_io::SkippedTiles::new());
+    assert_eq!(
+        carried
+            .iter()
+            .map(|e| (e.category, e.text.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (ReportCategory::NotSaved, "Gone."),
+            (ReportCategory::Changed, "Altered."),
+            (ReportCategory::FromOpen, "Unplaced."),
+        ]
+    );
+    // Through the report the dialog shows: three groups, in display order,
+    // each with its one line.
+    let report = aurora_io::PsdWriteReport::from_entries(carried);
+    let grouped = crate::psd_report::SaveReport::new(&report);
+    assert_eq!(grouped.count(ReportCategory::NotSaved), 1);
+    assert_eq!(grouped.count(ReportCategory::Changed), 1);
+    assert_eq!(grouped.count(ReportCategory::FromOpen), 1);
+    assert!(grouped.asks());
+    let body = grouped.dialog_body();
+    let at = |needle: &str| body.find(needle).unwrap_or(usize::MAX);
+    assert!(
+        at("Not saved:") < at("Changed:")
+            && at("Changed:") < at(crate::psd_report::FROM_OPEN_HEADING)
+    );
+    assert!(
+        at("Gone.") < at("Changed:") && at("Altered.") < at(crate::psd_report::FROM_OPEN_HEADING)
+    );
+}
+
+/// Differential against the 0.297.0 behaviour (every carried line a From
+/// open entry): the same lines, in the same order, none lost, none twice;
+/// only the group differs, and the save still asks.
+#[test]
+fn splitting_the_carried_lines_loses_and_duplicates_none() {
+    let mut doc = Doc::new();
+    let (_bytes, losses) = lossy_open(&mut doc);
+    let none = aurora_io::SkippedTiles::new();
+    let split = crate::psd_save::carried_losses(Some(&losses), &none);
+    // What the old code produced: every line as From open.
+    let before: Vec<aurora_io::ReportEntry> = losses
+        .iter()
+        .map(|l| aurora_io::ReportEntry::new(aurora_io::ReportCategory::FromOpen, l.text.clone()))
+        .collect();
+    assert_eq!(texts(&split), texts(&before), "same lines, same order");
+    let (new_report, old_report) = (
+        aurora_io::PsdWriteReport::from_entries(split),
+        aurora_io::PsdWriteReport::from_entries(before),
+    );
+    assert_eq!(new_report.items, old_report.items, "the asking lines");
+    let (new_group, old_group) = (
+        crate::psd_report::SaveReport::new(&new_report),
+        crate::psd_report::SaveReport::new(&old_report),
+    );
+    assert_eq!(new_group.total(), old_group.total());
+    assert_eq!(new_group.asks(), old_group.asks());
+    let mut new_lines: Vec<String> = new_group
+        .groups
+        .iter()
+        .flat_map(|g| g.entries.iter().map(|e| e.text.clone()))
+        .collect();
+    let mut old_lines: Vec<String> = old_group
+        .groups
+        .iter()
+        .flat_map(|g| g.entries.iter().map(|e| e.text.clone()))
+        .collect();
+    new_lines.sort();
+    old_lines.sort();
+    assert_eq!(new_lines, old_lines);
+    // The clipped layer of this fixture is a layer property Aurora does
+    // not keep: it must now be under Not saved, not From open.
+    assert_eq!(new_group.count(aurora_io::ReportCategory::FromOpen), 0);
+    assert_eq!(new_group.count(aurora_io::ReportCategory::NotSaved), 1);
+}
+
+/// The kinds survive a `.aur` save, a crash-recovery autosave and a reopen
+/// (the existing round-trip tests compare the whole value, kinds included;
+/// this one pins that the fixture is not all From open, which would let a
+/// dropped kind pass them).
+#[test]
+fn the_lossy_fixture_has_a_kind_that_is_not_from_open() {
+    let mut doc = Doc::new();
+    let (_bytes, losses) = lossy_open(&mut doc);
+    assert!(
+        losses
+            .iter()
+            .any(|l| l.kind == aurora_io::ImportLossKind::NotSaved),
+        "{losses:?}"
+    );
+}
+
+#[test]
+fn a_flat_files_open_lines_carry_their_kinds() {
+    use aurora_io::ImportLossKind::{Changed, FromOpen, NotSaved};
+    let mut colour = aurora_io::ColourImport {
+        source: Some(adobe_source()),
+        ..aurora_io::ColourImport::default()
+    };
+    colour
+        .report
+        .warnings
+        .push("The profile was odd.".to_owned());
+    let report = crate::flat_open_report(&colour, 2);
+    let losses = report.losses();
+    assert_eq!(
+        losses.iter().map(|l| l.kind).collect::<Vec<_>>(),
+        [Changed, FromOpen, NotSaved]
+    );
+    assert!(losses.first().is_some_and(|l| l.text.contains("Adobe RGB")));
+    assert!(losses.last().is_some_and(|l| l.text.contains("2 layers")));
+    // Nothing to say: no lines at all.
+    assert!(crate::flat_open_report(&aurora_io::ColourImport::default(), 0).is_empty());
 }

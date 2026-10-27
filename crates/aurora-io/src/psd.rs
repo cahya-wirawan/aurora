@@ -141,6 +141,7 @@ use half::f16;
 
 use crate::error::IoError;
 use crate::image::Image;
+use crate::import_loss::{ImportLoss, ImportLossKind};
 
 mod alpha;
 #[cfg(test)]
@@ -160,6 +161,8 @@ mod grayscale_adjust_tests;
 #[cfg(test)]
 mod grey_exposure_tests;
 mod grey_profile;
+#[cfg(test)]
+mod import_kind_tests;
 mod lab;
 #[cfg(test)]
 mod mixer_selective_tests;
@@ -514,12 +517,43 @@ pub struct PsdPixels {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PsdImportReport {
     pub items: Vec<String>,
+    /// The [`ImportLossKind`] of `items[i]` (task 163). Built only through
+    /// [`Self::push`] / [`Self::extend`]; an `items` line with no entry here
+    /// (a caller that pushed straight onto `items`) reads as
+    /// [`ImportLossKind::FromOpen`] in [`Self::losses`], never as missing.
+    pub kinds: Vec<ImportLossKind>,
 }
 
 impl PsdImportReport {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    /// Appends one line with its kind.
+    pub fn push(&mut self, kind: ImportLossKind, text: impl Into<String>) {
+        self.items.push(text.into());
+        self.kinds.push(kind);
+    }
+
+    /// Appends classified lines.
+    pub fn extend(&mut self, more: impl IntoIterator<Item = ImportLoss>) {
+        for loss in more {
+            self.push(loss.kind, loss.text);
+        }
+    }
+
+    /// Every line with its kind, in report order: what the document keeps as
+    /// its `import_losses` and what a later save carries into its report.
+    #[must_use]
+    pub fn losses(&self) -> Vec<ImportLoss> {
+        self.items
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                ImportLoss::new(self.kinds.get(i).copied().unwrap_or_default(), text.clone())
+            })
+            .collect()
     }
 }
 
@@ -732,52 +766,180 @@ impl Notes {
     }
 
     fn report(&self) -> PsdImportReport {
-        PsdImportReport {
-            items: self
-                .0
-                .iter()
-                .map(|(note, n)| {
-                    let mut text = note_text(*note, *n);
-                    if matches!(note, Note::TextKept) && !self.5.is_empty() {
-                        let shown: Vec<&str> = self
-                            .5
-                            .iter()
-                            .take(text::MAX_FONTS_REPORTED)
-                            .map(String::as_str)
-                            .collect();
-                        let more = self.5.len().saturating_sub(shown.len());
-                        let _ = std::fmt::Write::write_fmt(
-                            &mut text,
-                            format_args!(
-                                " Fonts they use: {}{}.",
-                                shown.join(", "),
-                                if more > 0 {
-                                    format!(" and {more} more")
-                                } else {
-                                    String::new()
-                                }
-                            ),
-                        );
-                    }
-                    if matches!(
-                        note,
-                        Note::ColorLookup(read_adjust::ColorLookupReason::Table)
-                    ) && !self.1.is_empty()
-                    {
-                        let names: Vec<String> = self
-                            .1
-                            .iter()
-                            .map(|n| format!("\u{201c}{n}\u{201d}"))
-                            .collect();
-                        let _ = std::fmt::Write::write_fmt(
-                            &mut text,
-                            format_args!(" Named: {}.", names.join(", ")),
-                        );
-                    }
-                    text
-                })
-                .collect(),
+        let mut report = PsdImportReport::default();
+        for (note, n) in &self.0 {
+            let mut text = note_text(*note, *n);
+            if matches!(note, Note::TextKept) && !self.5.is_empty() {
+                let shown: Vec<&str> = self
+                    .5
+                    .iter()
+                    .take(text::MAX_FONTS_REPORTED)
+                    .map(String::as_str)
+                    .collect();
+                let more = self.5.len().saturating_sub(shown.len());
+                let _ = std::fmt::Write::write_fmt(
+                    &mut text,
+                    format_args!(
+                        " Fonts they use: {}{}.",
+                        shown.join(", "),
+                        if more > 0 {
+                            format!(" and {more} more")
+                        } else {
+                            String::new()
+                        }
+                    ),
+                );
+            }
+            if matches!(
+                note,
+                Note::ColorLookup(read_adjust::ColorLookupReason::Table)
+            ) && !self.1.is_empty()
+            {
+                let names: Vec<String> = self
+                    .1
+                    .iter()
+                    .map(|n| format!("\u{201c}{n}\u{201d}"))
+                    .collect();
+                let _ = std::fmt::Write::write_fmt(
+                    &mut text,
+                    format_args!(" Named: {}.", names.join(", ")),
+                );
+            }
+            report.push(note_kind(*note), text);
         }
+        report
+    }
+}
+
+/// Which save-report group a counted note belongs to (task 163): the same
+/// vocabulary the PSD writer's own report uses
+/// ([`crate::psd::ReportCategory`]).
+///
+/// - [`ImportLossKind::NotSaved`]: something the file had is not in the
+///   document, so not in a saved file: a layer, mask, effect, clipping or
+///   setting left out, ignored or "not kept"; and the original of anything
+///   opened as pixels (text, smart object, shape or fill with its source not
+///   kept, vector masks converted to pixel masks), exactly as the writer
+///   itself lists "saved as ordinary pixel layers" under Not saved.
+/// - [`ImportLossKind::Changed`]: the content is in the document in another
+///   form or limited to a range: kept text data, alpha channels held as
+///   saved selections, a Grayscale file held as RGB, values clamped to
+///   Photoshop's ranges, an unknown blend mode shown (and saved) as Normal,
+///   a mask drawn without its feather or density, an artboard colour drawn
+///   as a layer.
+/// - [`ImportLossKind::FromOpen`]: everything else, **including every line
+///   nobody could place with confidence**: display approximations and
+///   unverified drawing (the data is kept or the difference is only on
+///   screen), effects "not shown" but kept with the layer, damaged-file
+///   repairs, and notes whose text mixes both. Such a line keeps today's
+///   "already different when this file was opened" group.
+///
+/// An exhaustive `match` on purpose: a new [`Note`] must be placed here.
+#[allow(clippy::too_many_lines)] // one arm per note, nothing else
+const fn note_kind(note: Note) -> ImportLossKind {
+    use ImportLossKind::{Changed, FromOpen, NotSaved};
+    match note {
+        // Not saved: layers, masks, clipping, blend options, effects and
+        // channels left out or ignored; and the original of anything opened as
+        // pixels (the writer lists the same as "saved as ordinary pixel
+        // layers", Not saved).
+        Note::AdjustmentSkipped
+        | Note::CurvesUnreadable
+        | Note::CurvesTooManyPoints
+        | Note::CurvesGrayscale
+        | Note::LevelsUnreadable
+        | Note::LevelsGrayscale
+        | Note::HueSaturationUnreadable
+        | Note::HueSaturationGrayscale
+        | Note::Unreadable(_)
+        | Note::Grayscale(_)
+        | Note::BrightnessContrastOption
+        | Note::Unverified(_)
+        | Note::GradientLeftOut(_)
+        | Note::ColorLookup(_)
+        | Note::PhotoFilterColour
+        | Note::GreyExposureProfile(_)
+        | Note::FillSkipped
+        | Note::FillNotDrawn(_)
+        | Note::ArtboardBackgroundNotDrawn(_)
+        | Note::AdjustmentLeftOutInMode
+        | Note::EffectsLeftOutInMode
+        | Note::FlattenedFallback
+        | Note::TextRasterised
+        | Note::SmartObjectRasterised
+        | Note::ShapeRasterised
+        | Note::FillRasterised
+        | Note::FillDrawn
+        | Note::VectorMaskRasterised
+        | Note::VectorMaskFromRendering
+        | Note::MaskUnreadable
+        | Note::VectorMaskUnreadable
+        | Note::VectorMaskTooLarge
+        | Note::VectorMaskDisabledDropped
+        | Note::FillVectorMaskNotApplied(_)
+        | Note::RenderedMaskUsed
+        | Note::ClippingDropped
+        | Note::AdjustmentClipNotApplied
+        | Note::BlendIfNotApplied
+        | Note::KnockoutNotApplied
+        | Note::OtherEffectsNotShown
+        | Note::AdjustmentEffectsDropped
+        | Note::EffectsUnreadable
+        | Note::UnknownChannel
+        | Note::DuplicateChannel
+        | Note::ExtraChannels
+        | Note::AlphaSpot
+        | Note::AlphaEmpty
+        | Note::AlphaOverCaps
+        | Note::AlphaUnreadable => NotSaved,
+        // Changed: kept, in another form or limited to a range.
+        Note::TextKept
+        | Note::AlphaRead
+        | Note::AlphaInverted
+        | Note::GrayscaleHeldAsRgb
+        | Note::EffectsClamped
+        | Note::UnknownBlendMode
+        | Note::ArtboardBackgroundDrawn
+        | Note::MaskParametersNotApplied
+        | Note::FeatherNotApplied
+        | Note::GreyExposureDrawn => Changed,
+        // From open: display approximations and unverified drawing (the data is
+        // kept or the difference is on screen only), effects "not shown" that
+        // the text says are kept, damaged-file repairs, colour-profile and
+        // placement notes, and any note whose text mixes kept and dropped
+        // settings: not placed.
+        Note::BrightnessContrastApproximate
+        | Note::Unvalidated(_)
+        | Note::GradientSmoothness
+        | Note::GradientSmoothnessPartial
+        | Note::GradientUnvalidated
+        | Note::FillGradientApproximate
+        | Note::AdjustmentOnConvertedCmyk
+        | Note::AdjustmentUnderGroupFill
+        | Note::TextKeptProfile
+        | Note::EffectScaleNotApplied
+        | Note::ShadowNoiseNotApplied
+        | Note::ShadowContourNotApplied
+        | Note::GlowNoiseNotApplied
+        | Note::GlowContourNotApplied
+        | Note::ShadowSizeCapped
+        | Note::StrokeSizeCapped
+        | Note::GlowSizeCapped
+        | Note::DropShadowsNotShown
+        | Note::ColorOverlaysNotShown
+        | Note::StrokesNotShown
+        | Note::OuterGlowsNotShown
+        | Note::EffectsNotShown
+        | Note::PatternOverlaysUnreadable
+        | Note::PatternOverlaysUnplaced
+        | Note::MaskRelativePosition
+        | Note::RealMaskNotUsed
+        | Note::MissingColorChannel
+        | Note::LayerWithoutChannels
+        | Note::BrokenGroups
+        | Note::MergedTransparencyIgnored
+        | Note::ColorProfileIgnored
+        | Note::ColorProfileTooLarge => FromOpen,
     }
 }
 
@@ -6629,9 +6791,9 @@ fn build_streamed(
         builder.add_nodes(nodes, None, 0)?;
     }
     let mut colour = plan.colour;
-    let mut extra_items: Vec<String> = plan.warnings;
+    let mut extra_items: Vec<ImportLoss> = plan.warnings;
     if builder.conversion_failed > 0 {
-        extra_items.push(format!(
+        extra_items.push(ImportLoss::from_open(format!(
             "{} layer{} could not be converted from the file's colour profile and {} shown as \
              stored (treated as sRGB).",
             builder.conversion_failed,
@@ -6645,34 +6807,36 @@ fn build_streamed(
             } else {
                 "are"
             },
-        ));
+        )));
     }
     if let Some(line) = plan.mode_line.take() {
         extra_items.push(line);
     }
     if header.float() && profile.saw_bright() {
-        extra_items.push(
+        extra_items.push(ImportLoss::new(
+            ImportLossKind::Changed,
             "Some 32-bit colour values were brighter than white; they were clipped to white \
-             when converted to sRGB."
-                .to_owned(),
-        );
+             when converted to sRGB.",
+        ));
     }
     if let Some(source) = colour.source.as_ref().filter(|_| !header.float()) {
         let line = crate::colour_import::converted_on_open_line(&source.description, true);
-        extra_items.push(if builder.conversion_failed > 0 {
-            // Not every layer converted: do not claim the whole file did.
-            line.replacen("The colours were", "The other layers' colours were", 1)
-        } else {
-            line
-        });
+        extra_items.push(ImportLoss::new(
+            ImportLossKind::Changed,
+            if builder.conversion_failed > 0 {
+                // Not every layer converted: do not claim the whole file did.
+                line.replacen("The colours were", "The other layers' colours were", 1)
+            } else {
+                line
+            },
+        ));
     }
     if colour.source.is_some() && builder.adjustments_seen > 0 {
-        extra_items.push(
+        extra_items.push(ImportLoss::from_open(
             "The colours were converted to sRGB when the file was opened, but its adjustment \
              layers (and any layer effects) compute in sRGB, not in the file's own profile, so \
-             they can differ from Photoshop."
-                .to_owned(),
-        );
+             they can differ from Photoshop.",
+        ));
     }
     notes.add_n(Note::ClippingDropped, builder.clip_refused);
     notes.add_n(
@@ -6685,7 +6849,7 @@ fn build_streamed(
     // `decode_source` checks for that before it returns.
     history.clear_undo();
     let mut report = notes.report();
-    report.items.extend(extra_items);
+    report.extend(extra_items);
     colour.report.warnings.clear();
     Ok(PsdStreamedDocument {
         layers,
@@ -6707,10 +6871,10 @@ struct ColourPlan {
     cmyk_profile: Option<Vec<u8>>,
     colour: crate::ColourImport,
     /// Report lines for the "Opened With Changes" dialog.
-    warnings: Vec<String>,
+    warnings: Vec<ImportLoss>,
     /// The line saying the file's colours were converted, for a CMYK or
     /// 32-bit file (which have their own wording).
-    mode_line: Option<String>,
+    mode_line: Option<ImportLoss>,
 }
 
 /// The sRGB primaries with a linear (gamma 1.0) tone curve, as ICC bytes:
@@ -6794,10 +6958,10 @@ fn plan_colour(embedded: Option<&[u8]>, header: Header, notes: &mut Notes) -> Co
         return plan;
     }
     match aurora_color::inspect_rgb_source(bytes) {
-        Err(problem) => plan.warnings.push(format!(
+        Err(problem) => plan.warnings.push(ImportLoss::from_open(format!(
             "The file's embedded colour profile was not used ({}); its colours are treated as sRGB.",
             problem.describe()
-        )),
+        ))),
         Ok(source) if source.equivalent_to_srgb => {}
         Ok(source) => match aurora_color::Transform::to_working(&source.profile) {
             Ok(_checked) => {
@@ -6811,11 +6975,10 @@ fn plan_colour(embedded: Option<&[u8]>, header: Header, notes: &mut Notes) -> Co
                 });
                 plan.convert_from = Some(bytes.to_vec());
             }
-            Err(_) => plan.warnings.push(
+            Err(_) => plan.warnings.push(ImportLoss::from_open(
                 "The file's embedded colour profile could not be used for a conversion; its \
-                 colours are treated as sRGB."
-                    .to_owned(),
-            ),
+                 colours are treated as sRGB.",
+            )),
         },
     }
     plan
@@ -6831,45 +6994,46 @@ fn plan_other_mode(header: Header, plan: &mut ColourPlan) {
                 .report
                 .info
                 .push("Converted from Lab to sRGB.".to_owned());
-            plan.mode_line = Some(
+            plan.mode_line = Some(ImportLoss::new(
+                ImportLossKind::Changed,
                 "The colours were converted from Lab (D50) to sRGB when the file was opened \
-                 (out-of-gamut colours are clipped); the original Lab values are not kept."
-                    .to_owned(),
-            );
+                 (out-of-gamut colours are clipped); the original Lab values are not kept.",
+            ));
         }
         2 => {
             plan.colour
                 .report
                 .info
                 .push("Indexed colours expanded to RGB.".to_owned());
-            plan.mode_line = Some(
+            plan.mode_line = Some(ImportLoss::new(
+                ImportLossKind::Changed,
                 "The file's indexed colour table was expanded to RGB when it was opened; the \
-                 table is not kept, and saving writes ordinary RGB."
-                    .to_owned(),
-            );
+                 table is not kept, and saving writes ordinary RGB.",
+            ));
         }
         0 => {
             plan.colour
                 .report
                 .info
                 .push("Bitmap pixels opened as black and white RGB.".to_owned());
-            plan.mode_line = Some(
+            plan.mode_line = Some(ImportLoss::new(
+                ImportLossKind::Changed,
                 "The file's 1-bit Bitmap was opened as black and white RGB pixels; it is no \
-                 longer a 1-bit image, and saving writes ordinary RGB."
-                    .to_owned(),
-            );
+                 longer a 1-bit image, and saving writes ordinary RGB.",
+            ));
         }
-        8 => plan.warnings.push(
+        // Ink colours / the other channels are not in the document.
+        8 => plan.warnings.push(ImportLoss::new(
+            ImportLossKind::NotSaved,
             "The file is Duotone: its ink colours and curves are not applied, so it is shown \
-             as greyscale and will differ from Photoshop's tinted rendering."
-                .to_owned(),
-        ),
-        _ => plan.warnings.push(
+             as greyscale and will differ from Photoshop's tinted rendering.",
+        )),
+        _ => plan.warnings.push(ImportLoss::new(
+            ImportLossKind::NotSaved,
             "The file is Multichannel: its first channel is shown as greyscale and the other \
              channels are not shown, because Aurora does not know how Photoshop displays \
-             them."
-                .to_owned(),
-        ),
+             them.",
+        )),
     }
 }
 
@@ -6879,23 +7043,30 @@ fn plan_cmyk(embedded: Option<&[u8]>, plan: &mut ColourPlan) {
                            nothing of real inks, so the colours will not match Photoshop; the \
                            original CMYK values are not kept";
     match embedded.map(|bytes| (bytes, aurora_color::inspect_cmyk_source(bytes))) {
-        None => plan.warnings.push(format!(
-            "The file has no CMYK colour profile, so {FORMULA}."
+        None => plan.warnings.push(ImportLoss::new(
+            ImportLossKind::Changed,
+            format!("The file has no CMYK colour profile, so {FORMULA}."),
         )),
-        Some((_, Err(problem))) => plan.warnings.push(format!(
-            "The file's colour profile was not used ({}), so {FORMULA}.",
-            problem.describe_expecting("CMYK")
+        Some((_, Err(problem))) => plan.warnings.push(ImportLoss::new(
+            ImportLossKind::Changed,
+            format!(
+                "The file's colour profile was not used ({}), so {FORMULA}.",
+                problem.describe_expecting("CMYK")
+            ),
         )),
         Some((bytes, Ok(source))) => {
             plan.colour.report.info.push(format!(
                 "Converted from the CMYK profile \"{}\" to sRGB.",
                 source.description
             ));
-            plan.mode_line = Some(format!(
-                "The colours were converted from the CMYK profile \"{}\" to sRGB when the file \
-                 was opened (out-of-gamut colours are clipped); the original CMYK values and \
-                 profile are not kept.",
-                source.description
+            plan.mode_line = Some(ImportLoss::new(
+                ImportLossKind::Changed,
+                format!(
+                    "The colours were converted from the CMYK profile \"{}\" to sRGB when the \
+                     file was opened (out-of-gamut colours are clipped); the original CMYK \
+                     values and profile are not kept.",
+                    source.description
+                ),
             ));
             plan.cmyk_profile = Some(bytes.to_vec());
         }
@@ -6920,20 +7091,19 @@ fn plan_float(embedded: Option<&[u8]>, gray: bool, plan: &mut ColourPlan) {
             }
             Some((_, Err(problem))) => {
                 plan.convert_from = linear();
-                plan.warnings.push(format!(
+                plan.warnings.push(ImportLoss::from_open(format!(
                     "The file's embedded colour profile was not used ({}); its 32-bit values are \
                      read as linear sRGB.",
                     problem.describe()
-                ));
+                )));
                 "linear light, sRGB assumed".to_owned()
             }
             Some((_, Ok(source))) if source.equivalent_to_srgb => {
                 // An sRGB-encoded profile on float data: taken at its word.
-                plan.warnings.push(
+                plan.warnings.push(ImportLoss::from_open(
                     "The file's profile is sRGB with its usual tone curve, not a linear one; its \
-                     32-bit values are used as encoded sRGB."
-                        .to_owned(),
-                );
+                     32-bit values are used as encoded sRGB.",
+                ));
                 "sRGB-encoded".to_owned()
             }
             Some((bytes, Ok(source))) => {
@@ -6951,14 +7121,17 @@ fn plan_float(embedded: Option<&[u8]>, gray: bool, plan: &mut ColourPlan) {
         }
     };
     if plan.convert_from.is_none() && what != "sRGB-encoded" {
-        plan.warnings.push(
-            "The 32-bit colour conversion could not be set up; the values are used as they are."
-                .to_owned(),
-        );
+        plan.warnings.push(ImportLoss::from_open(
+            "The 32-bit colour conversion could not be set up; the values are used as they are.",
+        ));
     }
-    plan.mode_line = Some(format!(
-        "The colours were converted from 32-bit floating point ({what}) to sRGB when the file \
-         was opened (out-of-gamut colours are clipped); the 32-bit original is not kept."
+    plan.mode_line = Some(ImportLoss::new(
+        ImportLossKind::Changed,
+        format!(
+            "The colours were converted from 32-bit floating point ({what}) to sRGB when the \
+             file was opened (out-of-gamut colours are clipped); the 32-bit original is not \
+             kept."
+        ),
     ));
 }
 

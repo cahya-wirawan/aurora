@@ -230,8 +230,8 @@ fn build_rich() -> Vec<u8> {
     );
     let _ = curves;
     let losses = vec![
-        "Opened with changes: line one.".to_owned(),
-        "Second line, with a non-ASCII byte: \u{e9}.".to_owned(),
+        crate::ImportLoss::from_open("Opened with changes: line one."),
+        crate::ImportLoss::from_open("Second line, with a non-ASCII byte: \u{e9}."),
     ];
     let set = rich_selection();
     let mut out = Cursor::new(Vec::new());
@@ -578,7 +578,15 @@ fn old_rich_fixture_opens_with_every_optional_entry() {
         ),
         [0.25, 0.25, 0.25, 0.5],
     );
-    assert_eq!(doc.import_losses.as_ref().map(Vec::len), Some(2));
+    // The committed fixture holds the 0.177.0 (version 1) entry: its two
+    // lines read as From open (task 163).
+    assert_eq!(
+        doc.import_losses,
+        Some(vec![
+            crate::ImportLoss::from_open("Opened with changes: line one."),
+            crate::ImportLoss::from_open("Second line, with a non-ASCII byte: \u{e9}."),
+        ])
+    );
     assert!(doc.selection.active().is_some());
     assert_eq!(doc.selection.saved_count(), 2);
     assert_eq!(doc.selection.paths().saved().len(), 2);
@@ -679,6 +687,19 @@ fn a_fresh_write_has_the_old_entry_table() {
         for (o, n) in old.iter().zip(&new) {
             assert_eq!(o.name, n.name, "{name} order");
             assert_eq!(o.method, n.method, "{name}/{}", o.name);
+            if o.name == "import-losses" {
+                // Deliberately different since task 163: the fixtures hold the
+                // version-1 entry (bare lines), a fresh write the version-2
+                // one (a kind per line). The old entry's lines are the new
+                // entry's texts, in order.
+                assert_eq!(o.data.first(), Some(&1), "{name}: the fixture is version 1");
+                assert_eq!(
+                    n.data.first(),
+                    Some(&2),
+                    "{name}: a fresh write is version 2"
+                );
+                continue;
+            }
             assert_eq!(o.crc32, n.crc32, "{name}/{}", o.name);
             assert_eq!(o.size, n.size, "{name}/{}", o.name);
             assert_eq!(o.data, n.data, "{name}/{} bytes", o.name);
@@ -875,8 +896,12 @@ fn a_fresh_write_has_the_old_envelope_field_for_field() {
             assert_eq!(a.flags, b.flags, "{label} flags");
             assert_eq!(a.method, b.method, "{label} method");
             assert_eq!((a.time, a.date), (b.time, b.date), "{label} timestamp");
-            assert_eq!(a.crc, b.crc, "{label} crc");
-            assert_eq!(a.usize, b.usize, "{label} size");
+            // `import-losses` is version 1 in the fixtures and version 2 in a
+            // fresh write (task 163); the entry table test checks both.
+            if a.name != b"import-losses" {
+                assert_eq!(a.crc, b.crc, "{label} crc");
+                assert_eq!(a.usize, b.usize, "{label} size");
+            }
             assert_eq!((a.disk, a.internal), (b.disk, b.internal), "{label}");
             assert_eq!(a.extra, b.extra, "{label} extra fields");
             assert_eq!(a.comment_len, b.comment_len, "{label}");
