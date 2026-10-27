@@ -11,7 +11,7 @@
 //!
 //! **The snapshot.** The writer and the composite read the document
 //! through a `&mut TileStore`, so the worker gets a store of its own, the
-//! way the background compositor's mirror does ([`new_mirror`]): a clone
+//! way the background compositor's mirror does (`background_composite::new_mirror`): a clone
 //! of the `LayerTree`, the saved selections and the carried report lines,
 //! plus one [`aurora_tile::TileShare`] per source tile. A resident tile is
 //! the live store's own `Arc` of texels (a reference count, no copy: the
