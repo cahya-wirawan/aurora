@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.297.0] - 2026-10-27
+
+### Changed
+
+- Records for task 162: PSD compatibility check off the UI thread
+
 ## [0.296.0] - 2026-10-27
 
 ### Changed

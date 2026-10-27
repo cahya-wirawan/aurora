@@ -691,7 +691,7 @@ fn result_is_installable(job: &ActiveJob, target: &CompositeTarget<'_>, tile: Ti
 /// source store's own, in tests), with the source's residency budget:
 /// resident tiles are shared, so that budget costs nothing extra for
 /// them.
-fn new_mirror(source: &mut TileStore) -> Option<TileStore> {
+pub(crate) fn new_mirror(source: &mut TileStore) -> Option<TileStore> {
     let dir = crate::composite_mirror_scratch_dir(source)?;
     // MEM-1: a pooled source's mirror joins the same pool, so the two
     // budgets are shares of one total rather than two whole budgets.
