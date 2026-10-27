@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.298.0] - 2026-10-27
+
+### Changed
+
+- Records for task 163: carried open notes split into Changed / Not saved / From open
+
 ## [0.297.0] - 2026-10-27
 
 ### Changed

@@ -320,7 +320,7 @@ pub(crate) struct DocumentSession {
     /// memory only. `None` for a faithful open, a New document, a `.aur`
     /// open and a recovered document. A Photoshop save lists them, so a
     /// file re-saved over itself never loses that content silently.
-    pub(crate) import_losses: Option<Vec<String>>,
+    pub(crate) import_losses: Option<Vec<aurora_io::ImportLoss>>,
     /// The document's colour metadata: the profile its file came in (its
     /// pixels were converted into the sRGB working space on open) and the
     /// output profile export converts to. Saved in the `.aur` `colour`

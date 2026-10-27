@@ -168,7 +168,14 @@ impl App {
     }
 
     pub(crate) fn bridge_doc_inspect(&mut self) -> Value {
-        let notes: Vec<String> = self.doc.import_losses.clone().unwrap_or_default();
+        let notes: Vec<String> = self
+            .doc
+            .import_losses
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|loss| loss.text.clone())
+            .collect();
         mcp_session::inspect_json(InspectView {
             name: &self.doc.name,
             format: "live",

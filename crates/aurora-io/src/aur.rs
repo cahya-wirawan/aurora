@@ -248,6 +248,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::error::IoError;
+use crate::import_loss::{ImportLoss, ImportLossKind};
 
 /// [`MIME_ENTRY`]'s own contents — a real, chosen media type for the
 /// format, not borrowed from anything else (`.aur` isn't registered
@@ -1668,8 +1669,16 @@ fn read_text_layers<R: Read + Seek>(
 /// it decodes as before, and an older Aurora ignores it.
 const IMPORT_LOSSES_ENTRY: &str = "import-losses";
 
-/// [`IMPORT_LOSSES_ENTRY`]'s own schema version.
-const IMPORT_LOSSES_VERSION: u32 = 1;
+/// [`IMPORT_LOSSES_ENTRY`]'s own schema version. Version 1 (0.177.0) held
+/// bare lines; version 2 (task 163) gives each line a
+/// [`crate::ImportLossKind`]. A version-1 entry still decodes (every line
+/// [`crate::ImportLossKind::FromOpen`]); an entry of any other version reads
+/// as the generic [`IMPORT_LOSSES_FALLBACK`] line, as an unknown version of
+/// this entry always has (it never refuses the open).
+const IMPORT_LOSSES_VERSION: u32 = 2;
+
+/// The version that held bare lines, still read.
+const IMPORT_LOSSES_VERSION_V1: u32 = 1;
 
 /// The most lines, and characters per line, [`IMPORT_LOSSES_ENTRY`]
 /// keeps when read: the strings are untrusted file data.
@@ -1680,21 +1689,43 @@ const MAX_IMPORT_LOSS_CHARS: usize = 1024;
 /// one generic line, never none — so a later Photoshop save still asks.
 pub const IMPORT_LOSSES_FALLBACK: &str = "This document was opened with changes from another file.";
 
-/// [`IMPORT_LOSSES_ENTRY`]'s payload: version first (frozen), then the
-/// lines.
+/// [`IMPORT_LOSSES_ENTRY`]'s version-1 payload: version first (frozen), then
+/// the lines.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct ImportLossesWire {
+struct ImportLossesWireV1 {
     version: u32,
     lines: Vec<String>,
 }
 
-fn encode_import_losses(lines: Option<&[String]>) -> Result<Option<Vec<u8>>, IoError> {
+/// One version-2 line: the kind's wire value
+/// ([`crate::ImportLossKind::to_wire`]; an unknown value reads as
+/// `FromOpen`) and the text.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ImportLossWire {
+    kind: u8,
+    text: String,
+}
+
+/// [`IMPORT_LOSSES_ENTRY`]'s version-2 payload.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ImportLossesWire {
+    version: u32,
+    lines: Vec<ImportLossWire>,
+}
+
+fn encode_import_losses(lines: Option<&[ImportLoss]>) -> Result<Option<Vec<u8>>, IoError> {
     let Some(lines) = lines.filter(|lines| !lines.is_empty()) else {
         return Ok(None);
     };
     let wire = ImportLossesWire {
         version: IMPORT_LOSSES_VERSION,
-        lines: lines.to_vec(),
+        lines: lines
+            .iter()
+            .map(|line| ImportLossWire {
+                kind: line.kind.to_wire(),
+                text: line.text.clone(),
+            })
+            .collect(),
     };
     postcard::to_allocvec(&wire)
         .map(Some)
@@ -1711,17 +1742,39 @@ fn sanitize_import_loss(line: &str) -> String {
         .collect()
 }
 
+/// The lines of an entry's payload in either version, before sanitising;
+/// `None` for garbage or a version this build does not read.
+fn decode_import_loss_lines(bytes: &[u8]) -> Option<Vec<ImportLoss>> {
+    let (version, _) = postcard::take_from_bytes::<u32>(bytes).ok()?;
+    match version {
+        IMPORT_LOSSES_VERSION_V1 => {
+            let wire = postcard::from_bytes::<ImportLossesWireV1>(bytes).ok()?;
+            Some(wire.lines.into_iter().map(ImportLoss::from_open).collect())
+        }
+        IMPORT_LOSSES_VERSION => {
+            let wire = postcard::from_bytes::<ImportLossesWire>(bytes).ok()?;
+            Some(
+                wire.lines
+                    .into_iter()
+                    .map(|line| ImportLoss::new(ImportLossKind::from_wire(line.kind), line.text))
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
 /// Reads [`IMPORT_LOSSES_ENTRY`]: `None` when the file has none; the
 /// sanitised, capped lines when it decodes; [`IMPORT_LOSSES_FALLBACK`]
 /// alone on any problem (an oversized, damaged, empty or unknown-version
 /// entry) — erring on the side of asking. Never fails the open.
-fn read_import_losses<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Option<Vec<String>> {
-    let fallback = || Some(vec![IMPORT_LOSSES_FALLBACK.to_owned()]);
+fn read_import_losses<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Option<Vec<ImportLoss>> {
+    let fallback = || Some(vec![ImportLoss::from_open(IMPORT_LOSSES_FALLBACK)]);
     let bytes = match zip.by_name(IMPORT_LOSSES_ENTRY) {
         Ok(file) => match read_capped(
             file,
             IMPORT_LOSSES_ENTRY,
-            (MAX_IMPORT_LOSS_LINES * MAX_IMPORT_LOSS_CHARS * 4 + 64) as u64,
+            (MAX_IMPORT_LOSS_LINES * (MAX_IMPORT_LOSS_CHARS * 4 + 2) + 64) as u64,
         ) {
             Ok(bytes) => bytes,
             Err(_) => return fallback(),
@@ -1729,24 +1782,22 @@ fn read_import_losses<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Option<Vec<Str
         Err(zip::result::ZipError::FileNotFound) => return None,
         Err(_) => return fallback(),
     };
-    let Ok(wire) = postcard::from_bytes::<ImportLossesWire>(&bytes) else {
+    let Some(decoded) = decode_import_loss_lines(&bytes) else {
         return fallback();
     };
-    if wire.version != IMPORT_LOSSES_VERSION {
-        return fallback();
-    }
-    let mut lines: Vec<String> = wire
-        .lines
-        .iter()
-        .map(|line| sanitize_import_loss(line))
-        .filter(|line| !line.trim().is_empty())
+    let mut lines: Vec<ImportLoss> = decoded
+        .into_iter()
+        .map(|line| ImportLoss::new(line.kind, sanitize_import_loss(&line.text)))
+        .filter(|line| !line.text.trim().is_empty())
         .collect();
     if lines.is_empty() {
         return fallback();
     }
     if lines.len() > MAX_IMPORT_LOSS_LINES {
         lines.truncate(MAX_IMPORT_LOSS_LINES - 1);
-        lines.push("…and more changes than can be listed.".to_owned());
+        lines.push(ImportLoss::from_open(
+            "…and more changes than can be listed.",
+        ));
     }
     Some(lines)
 }
@@ -2553,7 +2604,7 @@ pub fn write_with_import_losses<W: Write + Seek>(
     canvas_size: (u32, u32),
     profile: Option<&aurora_color::IccProfile>,
     known_missing: &SkippedTiles,
-    import_losses: Option<&[String]>,
+    import_losses: Option<&[ImportLoss]>,
     selection: Option<&aurora_doc::SelectionSet>,
     store: &mut TileStore,
 ) -> Result<(), IoError> {
@@ -2589,7 +2640,7 @@ pub fn write_best_effort_with_import_losses<W: Write + Seek>(
     canvas_size: (u32, u32),
     profile: Option<&aurora_color::IccProfile>,
     known_missing: &SkippedTiles,
-    import_losses: Option<&[String]>,
+    import_losses: Option<&[ImportLoss]>,
     selection: Option<&aurora_doc::SelectionSet>,
     store: &mut TileStore,
 ) -> Result<Vec<SkippedTile>, IoError> {
@@ -2624,7 +2675,7 @@ pub fn write_with_import_losses_and_colour<W: Write + Seek>(
     canvas_size: (u32, u32),
     profile: Option<&aurora_color::IccProfile>,
     known_missing: &SkippedTiles,
-    import_losses: Option<&[String]>,
+    import_losses: Option<&[ImportLoss]>,
     selection: Option<&aurora_doc::SelectionSet>,
     colour: Option<&crate::aur_colour::DocumentColour>,
     store: &mut TileStore,
@@ -2661,7 +2712,7 @@ pub fn write_best_effort_with_import_losses_and_colour<W: Write + Seek>(
     canvas_size: (u32, u32),
     profile: Option<&aurora_color::IccProfile>,
     known_missing: &SkippedTiles,
-    import_losses: Option<&[String]>,
+    import_losses: Option<&[ImportLoss]>,
     selection: Option<&aurora_doc::SelectionSet>,
     colour: Option<&crate::aur_colour::DocumentColour>,
     store: &mut TileStore,
@@ -2709,7 +2760,7 @@ struct WritePolicy<'a> {
     known_missing: &'a SkippedTiles,
     unreadable: UnreadableTile,
     /// What the document's open changed (0.177.0 review B-1).
-    import_losses: Option<&'a [String]>,
+    import_losses: Option<&'a [ImportLoss]>,
     /// The selections to persist (0.218.0).
     selection: Option<&'a aurora_doc::SelectionSet>,
     /// The document's source/output colour profiles.
@@ -3153,7 +3204,7 @@ impl AurSnapshot {
     /// # Errors
     ///
     /// [`IoError::ManifestSerialization`] if the lines cannot be encoded.
-    pub fn set_import_losses(&mut self, lines: Option<&[String]>) -> Result<(), IoError> {
+    pub fn set_import_losses(&mut self, lines: Option<&[ImportLoss]>) -> Result<(), IoError> {
         self.entries.import_losses = encode_import_losses(lines)?;
         Ok(())
     }
@@ -3420,7 +3471,7 @@ pub struct AurDocument {
     /// (the optional `import-losses` entry, 0.177.0 review B-1): `None`
     /// for a file without one, sanitised lines when it reads, a single
     /// generic line ([`IMPORT_LOSSES_FALLBACK`]) when it is damaged.
-    pub import_losses: Option<Vec<String>>,
+    pub import_losses: Option<Vec<ImportLoss>>,
     /// The persisted selections (the optional `selection` entry, 0.218.0):
     /// empty for a file without one or with one that was dropped.
     pub selection: aurora_doc::SelectionSet,
@@ -10005,7 +10056,7 @@ mod tests {
     }
 }
 
-/// The `import-losses` entry (0.177.0 review B-1).
+/// The `import-losses` entry (0.177.0 review B-1; version 2, task 163).
 #[cfg(test)]
 mod import_losses_tests {
     use std::io::Cursor;
@@ -10014,8 +10065,10 @@ mod import_losses_tests {
     use aurora_tile::TileStore;
 
     use super::{
-        IMPORT_LOSSES_ENTRY, IMPORT_LOSSES_FALLBACK, IMPORT_LOSSES_VERSION, ImportLossesWire,
-        MAX_IMPORT_LOSS_CHARS, MAX_IMPORT_LOSS_LINES, SkippedTiles, read, write_with_import_losses,
+        IMPORT_LOSSES_ENTRY, IMPORT_LOSSES_FALLBACK, IMPORT_LOSSES_VERSION,
+        IMPORT_LOSSES_VERSION_V1, ImportLoss, ImportLossKind, ImportLossWire, ImportLossesWire,
+        ImportLossesWireV1, MAX_IMPORT_LOSS_CHARS, MAX_IMPORT_LOSS_LINES, SkippedTiles, read,
+        write_with_import_losses,
     };
 
     fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
@@ -10034,7 +10087,7 @@ mod import_losses_tests {
         (dir, store)
     }
 
-    fn container(lines: Option<&[String]>) -> Vec<u8> {
+    fn container(lines: Option<&[ImportLoss]>) -> Vec<u8> {
         let (_dir, mut store) = store();
         let mut tree = LayerTree::new();
         ok(tree.add_pixel_layer(
@@ -10062,7 +10115,7 @@ mod import_losses_tests {
         out.into_inner()
     }
 
-    fn read_losses(bytes: &[u8]) -> Option<Vec<String>> {
+    fn read_losses(bytes: &[u8]) -> Option<Vec<ImportLoss>> {
         let (_dir, mut store) = store();
         ok(read(Cursor::new(bytes), &mut store)).import_losses
     }
@@ -10095,14 +10148,53 @@ mod import_losses_tests {
         ok(out.finish()).into_inner()
     }
 
+    /// The entry's raw payload in `bytes`.
+    fn entry_bytes(bytes: &[u8]) -> Vec<u8> {
+        let mut archive = ok(zip::ZipArchive::new(Cursor::new(bytes)));
+        let mut file = ok(archive.by_name(IMPORT_LOSSES_ENTRY));
+        let mut out = Vec::new();
+        ok(std::io::Read::read_to_end(&mut file, &mut out));
+        out
+    }
+
+    fn v2(version: u32, lines: Vec<(u8, &str)>) -> Vec<u8> {
+        ok(postcard::to_allocvec(&ImportLossesWire {
+            version,
+            lines: lines
+                .into_iter()
+                .map(|(kind, text)| ImportLossWire {
+                    kind,
+                    text: text.to_owned(),
+                })
+                .collect(),
+        }))
+    }
+
+    fn v1(lines: Vec<&str>) -> Vec<u8> {
+        ok(postcard::to_allocvec(&ImportLossesWireV1 {
+            version: IMPORT_LOSSES_VERSION_V1,
+            lines: lines.into_iter().map(str::to_owned).collect(),
+        }))
+    }
+
+    #[allow(clippy::unnecessary_wraps)] // compared with `read_losses`' Option
+    fn fallback() -> Option<Vec<ImportLoss>> {
+        Some(vec![ImportLoss::from_open(IMPORT_LOSSES_FALLBACK)])
+    }
+
     #[test]
     fn import_losses_round_trip_and_an_ordinary_save_writes_no_entry() {
         let lines = vec![
-            "Clipping masks are shown unclipped.".to_owned(),
-            "Layer effects are not shown.".to_owned(),
+            ImportLoss::new(
+                ImportLossKind::NotSaved,
+                "Clipping masks are shown unclipped.",
+            ),
+            ImportLoss::new(ImportLossKind::Changed, "Layer effects are not shown."),
+            ImportLoss::from_open("Something nobody placed."),
         ];
         let bytes = container(Some(&lines));
         assert!(entry_names(&bytes).iter().any(|n| n == IMPORT_LOSSES_ENTRY));
+        // Kinds survive the round trip, line for line, in order.
         assert_eq!(read_losses(&bytes), Some(lines));
         // An old file, or a document with nothing to carry: no entry, None.
         let plain = container(None);
@@ -10112,46 +10204,111 @@ mod import_losses_tests {
     }
 
     #[test]
+    fn the_entry_is_written_as_version_two_with_the_wire_values_frozen() {
+        assert_eq!(IMPORT_LOSSES_VERSION, 2);
+        let lines = vec![
+            ImportLoss::from_open("a"),
+            ImportLoss::new(ImportLossKind::Changed, "b"),
+            ImportLoss::new(ImportLossKind::NotSaved, "c"),
+        ];
+        let payload = entry_bytes(&container(Some(&lines)));
+        // postcard: version 2, three lines, each `kind, len, text`.
+        assert_eq!(
+            payload,
+            [2, 3, 0, 1, b'a', 1, 1, b'b', 2, 1, b'c'],
+            "the version-2 wire layout is frozen"
+        );
+    }
+
+    #[test]
+    fn a_version_one_entry_still_reads_with_every_line_from_open() {
+        let base = container(None);
+        let bytes = with_entry(&base, &v1(vec!["old one", "old two"]));
+        assert_eq!(
+            read_losses(&bytes),
+            Some(vec![
+                ImportLoss::from_open("old one"),
+                ImportLoss::from_open("old two"),
+            ])
+        );
+        // The very bytes 0.177.0 wrote for one line.
+        let literal = with_entry(&base, &[1, 1, 3, b'a', b'b', b'c']);
+        assert_eq!(
+            read_losses(&literal),
+            Some(vec![ImportLoss::from_open("abc")])
+        );
+    }
+
+    #[test]
+    fn an_unknown_kind_value_reads_as_from_open_and_unknown_versions_fall_back() {
+        let base = container(None);
+        let odd = with_entry(
+            &base,
+            &v2(IMPORT_LOSSES_VERSION, vec![(200, "x"), (2, "y")]),
+        );
+        assert_eq!(
+            read_losses(&odd),
+            Some(vec![
+                ImportLoss::from_open("x"),
+                ImportLoss::new(ImportLossKind::NotSaved, "y"),
+            ])
+        );
+        // A newer version (and version zero) is not read: the generic line.
+        for version in [0, IMPORT_LOSSES_VERSION + 1, 99] {
+            assert_eq!(
+                read_losses(&with_entry(&base, &v2(version, vec![(2, "x")]))),
+                fallback(),
+                "version {version}"
+            );
+        }
+    }
+
+    #[test]
     fn a_damaged_or_hostile_import_losses_entry_errs_safe() {
         let base = container(None);
-        let fallback = Some(vec![IMPORT_LOSSES_FALLBACK.to_owned()]);
-        let encode = |version: u32, lines: Vec<String>| -> Vec<u8> {
-            ok(postcard::to_allocvec(&ImportLossesWire { version, lines }))
-        };
-        // Garbage, an unknown version, and nothing but blank lines.
-        assert_eq!(read_losses(&with_entry(&base, b"\xff\xff\xff")), fallback);
+        // Garbage, a truncated payload, and nothing but blank lines.
+        assert_eq!(read_losses(&with_entry(&base, b"\xff\xff\xff")), fallback());
+        assert_eq!(read_losses(&with_entry(&base, &[2, 5, 2])), fallback());
+        assert_eq!(read_losses(&with_entry(&base, &[1, 5])), fallback());
+        assert_eq!(read_losses(&with_entry(&base, &[])), fallback());
         assert_eq!(
             read_losses(&with_entry(
                 &base,
-                &encode(IMPORT_LOSSES_VERSION + 1, vec!["x".into()])
+                &v2(IMPORT_LOSSES_VERSION, vec![(2, " ")])
             )),
-            fallback
+            fallback()
         );
-        assert_eq!(
-            read_losses(&with_entry(
-                &base,
-                &encode(IMPORT_LOSSES_VERSION, vec![" ".into()])
-            )),
-            fallback
-        );
+        assert_eq!(read_losses(&with_entry(&base, &v1(vec![" "]))), fallback());
         // Control and text-direction characters are dropped, long lines cut,
         // too many lines capped with a closing line.
         let hostile = format!("evil\u{202e}gnp.\u{0007}{}", "x".repeat(5000));
-        let many: Vec<String> = std::iter::once(hostile)
+        let texts: Vec<String> = std::iter::once(hostile)
             .chain((0..1000).map(|i| format!("line {i}")))
             .collect();
-        let Some(read_back) = read_losses(&with_entry(&base, &encode(IMPORT_LOSSES_VERSION, many)))
-        else {
+        let many = v2(
+            IMPORT_LOSSES_VERSION,
+            texts.iter().map(|t| (2, t.as_str())).collect(),
+        );
+        let Some(read_back) = read_losses(&with_entry(&base, &many)) else {
             unreachable!("read")
         };
         assert_eq!(read_back.len(), MAX_IMPORT_LOSS_LINES);
-        let first = read_back.first().cloned().unwrap_or_default();
-        assert!(first.starts_with("evilgnp."), "{first:?}");
-        assert!(!first.contains('\u{202e}') && !first.contains('\u{0007}'));
-        assert!(first.chars().count() <= MAX_IMPORT_LOSS_CHARS);
-        assert!(read_back.last().is_some_and(|l| l.contains("and more")));
+        let first = read_back
+            .first()
+            .cloned()
+            .unwrap_or_else(|| ImportLoss::from_open(String::new()));
+        assert!(first.text.starts_with("evilgnp."), "{:?}", first.text);
+        assert_eq!(first.kind, ImportLossKind::NotSaved, "the kind survives");
+        assert!(!first.text.contains('\u{202e}') && !first.text.contains('\u{0007}'));
+        assert!(first.text.chars().count() <= MAX_IMPORT_LOSS_CHARS);
+        let last = read_back
+            .last()
+            .cloned()
+            .unwrap_or_else(|| ImportLoss::from_open(String::new()));
+        assert!(last.text.contains("and more"));
+        assert_eq!(last.kind, ImportLossKind::FromOpen);
         // An entry far past its size cap is not read at all.
-        let huge = vec![0u8; MAX_IMPORT_LOSS_LINES * MAX_IMPORT_LOSS_CHARS * 4 + 1024];
-        assert_eq!(read_losses(&with_entry(&base, &huge)), fallback);
+        let huge = vec![0u8; MAX_IMPORT_LOSS_LINES * MAX_IMPORT_LOSS_CHARS * 4 + 4096];
+        assert_eq!(read_losses(&with_entry(&base, &huge)), fallback());
     }
 }

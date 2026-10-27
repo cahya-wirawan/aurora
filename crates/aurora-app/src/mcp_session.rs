@@ -122,7 +122,7 @@ struct Doc {
     selection: aurora_doc::SelectionSet,
     canvas: (u32, u32),
     active: Option<LayerId>,
-    import_losses: Vec<String>,
+    import_losses: Vec<aurora_io::ImportLoss>,
     notes: Vec<String>,
     colour: aurora_io::DocumentColour,
     skipped: aurora_io::SkippedTiles,
@@ -392,7 +392,7 @@ impl HeadlessSession {
             Failure::Refused(crate::open_failure_message(name, extension, &e))
         })?;
         let mut notes: Vec<String> = Vec::new();
-        let mut import_losses: Vec<String> = Vec::new();
+        let mut import_losses: Vec<aurora_io::ImportLoss> = Vec::new();
         let mut skipped = aurora_io::SkippedTiles::default();
         let mut selection = aurora_doc::SelectionSet::new();
         let mut colour = aurora_io::DocumentColour::default();
@@ -427,7 +427,7 @@ impl HeadlessSession {
                     }
                 }
                 notes.extend(report.items.iter().cloned());
-                import_losses = report.items;
+                import_losses = report.losses();
                 colour.source = imported.source;
                 ("psd", layers, history, canvas_size)
             }
@@ -457,7 +457,7 @@ impl HeadlessSession {
                 let document = crate::read_prechecked_aur(&bytes, &mut store)
                     .map_err(|e| Failure::Refused(crate::open_failure_message(name, "aur", &e)))?;
                 if let Some(losses) = document.import_losses {
-                    notes.extend(losses.iter().cloned());
+                    notes.extend(losses.iter().map(|loss| loss.text.clone()));
                     import_losses = losses;
                 }
                 if let Some(reason) = document.selection_dropped {
@@ -851,7 +851,7 @@ impl HeadlessSession {
         let max_pixels = self.limits.max_pixels;
         let max_bytes = self.limits.max_export_bytes;
         let doc = self.doc_mut()?;
-        let losses: &[String] = &doc.import_losses;
+        let losses: &[aurora_io::ImportLoss] = &doc.import_losses;
         export_document(
             ExportParts {
                 name: &doc.name,
@@ -880,7 +880,7 @@ impl HeadlessSession {
     /// No document, a refusal (a canvas over 30,000 px, ...) or a failure.
     pub fn psd_check(&mut self, cancelled: &dyn Fn() -> bool) -> Result<Value, Failure> {
         let doc = self.doc_mut()?;
-        let losses: &[String] = &doc.import_losses;
+        let losses: &[aurora_io::ImportLoss] = &doc.import_losses;
         psd_check_document(
             ExportParts {
                 name: &doc.name,
@@ -957,7 +957,7 @@ pub(crate) struct ExportParts<'a> {
     pub history: &'a aurora_doc::History,
     pub canvas: (u32, u32),
     pub skipped: &'a aurora_io::SkippedTiles,
-    pub import_losses: Option<&'a [String]>,
+    pub import_losses: Option<&'a [aurora_io::ImportLoss]>,
     pub selection: &'a aurora_doc::SelectionSet,
     pub colour: &'a aurora_io::DocumentColour,
     pub id: crate::document_session::DocumentId,

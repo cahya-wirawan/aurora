@@ -148,18 +148,20 @@ pub(crate) fn psd_save_message(file_name: &str, report: &aurora_io::PsdWriteRepo
 }
 
 /// The report entries carried from the document's own open (0.177.0 review
-/// H-1; task 157: one [`aurora_io::ReportCategory::FromOpen`] entry per
-/// "Opened With Changes" line), and one for tiles a `.aur` open found
+/// H-1; task 157: one entry per "Opened With Changes" line, in the group its
+/// [`aurora_io::ImportLossKind`] names since task 163: Changed, Not saved, or
+/// [`aurora_io::ReportCategory::FromOpen`] for a line nobody could place), and
+/// one for tiles a `.aur` open found
 /// missing. Empty for a faithful open.
 pub(crate) fn carried_losses(
-    import_losses: Option<&[String]>,
+    import_losses: Option<&[aurora_io::ImportLoss]>,
     skipped_tiles: &aurora_io::SkippedTiles,
 ) -> Vec<aurora_io::ReportEntry> {
     use aurora_io::{ReportCategory, ReportEntry};
     let mut entries: Vec<ReportEntry> = import_losses
         .unwrap_or_default()
         .iter()
-        .map(|line| ReportEntry::new(ReportCategory::FromOpen, line.clone()))
+        .map(|line| ReportEntry::new(line.kind.category(), line.text.clone()))
         .collect();
     if !skipped_tiles.is_empty() {
         entries.push(ReportEntry::new(

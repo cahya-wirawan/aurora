@@ -1012,6 +1012,30 @@ fn unwritten_layers_item(unwritten: usize) -> Option<String> {
     })
 }
 
+/// The lines a PNG/JPEG/TIFF open keeps for a later Photoshop save (task
+/// 163: each with its kind): the colour conversion (Changed: the colours are
+/// kept, converted), the file's colour warnings (From open), and layers that
+/// could not be loaded (Not saved: they are shown, and saved, empty).
+fn flat_open_report(
+    colour: &aurora_io::ColourImport,
+    unwritten: usize,
+) -> aurora_io::PsdImportReport {
+    let mut report = aurora_io::PsdImportReport::default();
+    if let Some(source) = &colour.source {
+        report.push(
+            aurora_io::ImportLossKind::Changed,
+            aurora_io::converted_on_open_line(&source.description, true),
+        );
+    }
+    for warning in &colour.report.warnings {
+        report.push(aurora_io::ImportLossKind::FromOpen, warning.clone());
+    }
+    if let Some(item) = unwritten_layers_item(unwritten) {
+        report.push(aurora_io::ImportLossKind::NotSaved, item);
+    }
+    report
+}
+
 /// The status-bar line for what an open did about colour: the conversion,
 /// or the sRGB assumption; `None` when the file was sRGB-tagged (or an
 /// sRGB-equivalent profile) and nothing happened.
@@ -2037,7 +2061,7 @@ fn write_autosave(
     canvas_size: (u32, u32),
     skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
-    import_losses: Option<&[String]>,
+    import_losses: Option<&[aurora_io::ImportLoss]>,
     selection: Option<&aurora_doc::SelectionSet>,
 ) {
     write_autosave_with_colour(
@@ -2061,7 +2085,7 @@ fn write_autosave_with_colour(
     canvas_size: (u32, u32),
     skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
-    import_losses: Option<&[String]>,
+    import_losses: Option<&[aurora_io::ImportLoss]>,
     selection: Option<&aurora_doc::SelectionSet>,
     colour: Option<&aurora_io::DocumentColour>,
 ) {
@@ -2189,7 +2213,7 @@ fn request_autosave(
     canvas_size: (u32, u32),
     skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
-    import_losses: Option<&[String]>,
+    import_losses: Option<&[aurora_io::ImportLoss]>,
     selection: Option<&aurora_doc::SelectionSet>,
 ) -> Option<background_autosave::Generation> {
     request_autosave_with_colour(
@@ -2217,7 +2241,7 @@ fn request_autosave_with_colour(
     canvas_size: (u32, u32),
     skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
-    import_losses: Option<&[String]>,
+    import_losses: Option<&[aurora_io::ImportLoss]>,
     selection: Option<&aurora_doc::SelectionSet>,
     colour: Option<&aurora_io::DocumentColour>,
 ) -> Option<background_autosave::Generation> {
@@ -2257,7 +2281,7 @@ fn request_autosave_within(
     canvas_size: (u32, u32),
     skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
-    import_losses: Option<&[String]>,
+    import_losses: Option<&[aurora_io::ImportLoss]>,
     selection: Option<&aurora_doc::SelectionSet>,
 ) -> Option<background_autosave::Generation> {
     request_autosave_within_with_colour(
@@ -2287,7 +2311,7 @@ fn request_autosave_within_with_colour(
     canvas_size: (u32, u32),
     skipped: &mut aurora_io::SkippedTiles,
     store: &mut aurora_tile::TileStore,
-    import_losses: Option<&[String]>,
+    import_losses: Option<&[aurora_io::ImportLoss]>,
     selection: Option<&aurora_doc::SelectionSet>,
     colour: Option<&aurora_io::DocumentColour>,
 ) -> Option<background_autosave::Generation> {
@@ -2382,7 +2406,7 @@ fn snapshot_autosave(
     skipped: &mut aurora_io::SkippedTiles,
     max_texel_bytes: usize,
     store: &mut aurora_tile::TileStore,
-    import_losses: Option<&[String]>,
+    import_losses: Option<&[aurora_io::ImportLoss]>,
     selection: Option<&aurora_doc::SelectionSet>,
 ) -> SnapshotOutcome {
     snapshot_autosave_with_colour(
@@ -2408,7 +2432,7 @@ fn snapshot_autosave_with_colour(
     skipped: &mut aurora_io::SkippedTiles,
     max_texel_bytes: usize,
     store: &mut aurora_tile::TileStore,
-    import_losses: Option<&[String]>,
+    import_losses: Option<&[aurora_io::ImportLoss]>,
     selection: Option<&aurora_doc::SelectionSet>,
     colour: Option<&aurora_io::DocumentColour>,
 ) -> SnapshotOutcome {
@@ -2851,7 +2875,7 @@ struct RecoveredDocument {
     /// What its own open changed (0.177.0 review B-1), carried into
     /// [`DocumentSession::import_losses`] so a recovered document's
     /// Photoshop save still lists it.
-    import_losses: Option<Vec<String>>,
+    import_losses: Option<Vec<aurora_io::ImportLoss>>,
     /// The selections the autosave carried (0.218.0).
     selection: aurora_doc::SelectionSet,
     /// Why its selection entry was dropped, if it was (0.218.1).
@@ -2876,7 +2900,7 @@ struct StartupDocument {
     /// record instead of erasing it.
     skipped_tiles: aurora_io::SkippedTiles,
     /// A recovered document's carried open report (0.177.0 review B-1).
-    import_losses: Option<Vec<String>>,
+    import_losses: Option<Vec<aurora_io::ImportLoss>>,
     /// A recovered document's selections (0.218.0); empty otherwise.
     selection: aurora_doc::SelectionSet,
     /// Why a recovered document's selection entry was dropped (0.218.1),
@@ -33551,15 +33575,9 @@ impl App {
         // The conversion is a change the user should be able to see again
         // (kept in the import losses, so it survives a `.aur` save and is
         // carried into a Photoshop save's report), not only a status line.
-        let mut items: Vec<String> = Vec::new();
-        if let Some(source) = &colour.source {
-            items.push(aurora_io::converted_on_open_line(&source.description, true));
-        }
-        items.extend(colour.report.warnings.clone());
-        items.extend(unwritten_layers_item(unwritten));
-        if !items.is_empty() {
-            self.doc.import_losses = Some(items.clone());
-            let report = aurora_io::PsdImportReport { items };
+        let report = flat_open_report(&colour, unwritten);
+        if !report.is_empty() {
+            self.doc.import_losses = Some(report.losses());
             if let Some(message) = psd_report_message(&display_file_name(path), &report)
                 && !self.open_psd_report_dialog(&message)
             {
@@ -33657,17 +33675,20 @@ impl App {
         );
         let mut report = report;
         // Review B-1: set before the install, whose autosave carries it.
-        self.doc.import_losses = (!report.items.is_empty()).then(|| report.items.clone());
+        self.doc.import_losses = (!report.items.is_empty()).then(|| report.losses());
         let Some(unwritten) =
             self.install_opened_document(layers, history, pixels, masks, canvas_size)
         else {
             return false;
         };
-        report.items.extend(unwritten_layers_item(unwritten));
+        if let Some(item) = unwritten_layers_item(unwritten) {
+            // Layers shown empty: their pixels are not in a saved file.
+            report.push(aurora_io::ImportLossKind::NotSaved, item);
+        }
         self.install_opened_selections(selections, canvas_size);
         self.announce_colour_open(&colour);
         // Review H-1: kept for a later Photoshop save of this document.
-        self.doc.import_losses = (!report.items.is_empty()).then(|| report.items.clone());
+        self.doc.import_losses = (!report.items.is_empty()).then(|| report.losses());
         if let Some(message) = psd_report_message(&display_file_name(path), &report) {
             tracing::info!(path = %path.display(), items = report.items.len(), "opened a PSD with changes");
             if !self.open_psd_report_dialog(&message) {
@@ -45565,12 +45586,15 @@ mod tests {
             psd_report_message("a.psd", &aurora_io::PsdImportReport::default()),
             None
         );
-        let report = aurora_io::PsdImportReport {
-            items: vec![
-                "1 clipped layer is shown unclipped.".to_owned(),
-                format!("2 layer masks are{}not applied yet.", '\u{202E}'),
-            ],
-        };
+        let mut report = aurora_io::PsdImportReport::default();
+        report.push(
+            aurora_io::ImportLossKind::NotSaved,
+            "1 clipped layer is shown unclipped.",
+        );
+        report.push(
+            aurora_io::ImportLossKind::FromOpen,
+            format!("2 layer masks are{}not applied yet.", '\u{202E}'),
+        );
         let Some(message) = psd_report_message("a.psd", &report) else {
             unreachable!("a non-empty report must produce a message");
         };
