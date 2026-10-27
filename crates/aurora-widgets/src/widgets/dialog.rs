@@ -118,12 +118,13 @@ use accesskit::{Node, Role};
 use aurora_theme::Scales;
 use taffy::style_helpers::{TaffyAuto as _, TaffyZero as _, auto, length, percent};
 use taffy::{
-    AlignItems, Dimension, FlexDirection, LengthPercentageAuto, Position, Rect as LayoutRect, Size,
-    Style,
+    AlignItems, Dimension, FlexDirection, LengthPercentageAuto, Overflow, Position,
+    Rect as LayoutRect, Size, Style,
 };
 
 use super::button::insert_button;
-use super::{WidgetKind, row_height, spacing};
+use super::popup_list::{insert_parts, scrollbar_thickness};
+use super::{ListRowState, WidgetKind, row_height, spacing};
 use crate::error::WidgetError;
 use crate::shortcut::{Key, KeyChord, NamedKey};
 use crate::tree::{WidgetId, WidgetTree};
@@ -142,6 +143,13 @@ const MESSAGE_WIDTH_FRACTION: f32 = 1.0;
 /// The share of the dialog's own content width its title spans — all
 /// of it, for the same reason as [`MESSAGE_WIDTH_FRACTION`].
 const TITLE_WIDTH_FRACTION: f32 = 1.0;
+
+/// The most of its parent's height a scrolling dialog may take
+/// ([`insert_dialog_scrolling`]). A proportion, like [`WIDTH_FRACTION`]: it
+/// needs no token and follows a resized window with no recompute, which a
+/// pixel cap measured at open time would not. The message viewport gives
+/// way first, the title and the buttons never shrink.
+const SCROLLING_MAX_HEIGHT_FRACTION: f32 = 0.9;
 
 /// A dialog root's own layout: a centred overlay, **out of its parent's
 /// flow entirely**.
@@ -444,6 +452,12 @@ pub struct DialogHandle {
     /// The cancel action's button, if one was marked
     /// ([`DialogAction::as_cancel`]).
     pub cancel_action: Option<WidgetId>,
+    /// The scroll container holding the message's lines, for a dialog built
+    /// by [`insert_dialog_scrolling`] (task 161); `None` for a plain one.
+    pub body: Option<WidgetId>,
+    /// The scrollbar linked to [`Self::body`] (hidden while every line
+    /// fits); `None` for a plain dialog.
+    pub scrollbar: Option<WidgetId>,
 }
 
 impl DialogHandle {
@@ -581,10 +595,232 @@ pub fn insert_dialog(
     message: impl Into<String>,
     actions: Vec<DialogAction>,
 ) -> Result<DialogHandle, WidgetError> {
+    build_dialog(
+        tree,
+        parent,
+        scales,
+        title.into(),
+        message.into(),
+        None,
+        actions,
+    )
+}
+
+/// [`insert_dialog`] for a message of many lines (task 161): `message` is
+/// the whole text, as a screen reader should hear it (it stays the message
+/// node's single accessibility label, exactly as in a plain dialog), and
+/// `lines` is what is drawn, one row each, in a scroll container with a
+/// linked scrollbar.
+///
+/// Why a separate call: a plain dialog draws its message as ONE line (a
+/// newline is drawn as a space and the rest is clipped: there is no
+/// wrapping), which is right for the short sentences every other dialog
+/// holds and useless for a list. The caller wraps `lines` itself to the
+/// width [`dialog_text_width`] gives (the text engine is not available
+/// here).
+///
+/// **Capped to the window.** The dialog may take at most 90 % of its
+/// parent's height (`SCROLLING_MAX_HEIGHT_FRACTION`, a proportion, so a
+/// resized window needs no recompute); the message viewport shrinks to fit
+/// (never below one row) and scrolls, while the title and every button
+/// keep their height, so the buttons stay on screen and clickable. The
+/// scrollbar is hidden while all the lines fit. Titles, buttons, default
+/// and cancel actions, and the announcement are as in [`insert_dialog`].
+///
+/// # Errors
+///
+/// As [`insert_dialog`].
+pub fn insert_dialog_scrolling(
+    tree: &mut WidgetTree<WidgetKind>,
+    parent: WidgetId,
+    scales: &Scales,
+    title: impl Into<String>,
+    message: impl Into<String>,
+    lines: &[String],
+    actions: Vec<DialogAction>,
+) -> Result<DialogHandle, WidgetError> {
+    build_dialog(
+        tree,
+        parent,
+        scales,
+        title.into(),
+        message.into(),
+        Some(lines),
+        actions,
+    )
+}
+
+/// The width in logical px a scrolling dialog's text lines have when the
+/// window (really: the dialog's parent) is `window_width` wide: the dialog
+/// is `WIDTH_FRACTION` of it (never under its `spacing.xxxl` floor), less
+/// its padding, the always-reserved scrollbar and a row's own text inset.
+/// What [`insert_dialog_scrolling`]'s caller should wrap its lines to.
+#[must_use]
+pub fn dialog_text_width(window_width: f32, scales: &Scales) -> f32 {
+    let floor = spacing(scales.spacing.xxxl);
+    let dialog = (window_width * WIDTH_FRACTION).max(floor);
+    let inset = 2.0 * spacing(scales.spacing.md)
+        + scrollbar_thickness(scales)
+        + 2.0 * spacing(scales.spacing.sm);
+    (dialog - inset).max(0.0)
+}
+
+/// The most lines [`wrap_dialog_lines`] returns; the last one then says how
+/// many were cut. A bound on what a hostile report can make a dialog build.
+pub const MAX_DIALOG_LINES: usize = 10_000;
+
+/// Wraps `text` (lines separated by `\n`) to `max_width` logical px for
+/// [`insert_dialog_scrolling`], breaking at spaces and, for a word wider
+/// than the line, between characters. A wrapped line continues indented by
+/// two spaces beyond the original's own indent (a bullet's text lines up
+/// roughly under its first word). Text that already fits is returned
+/// unchanged, line for line; a non-positive or non-finite `max_width` wraps
+/// nothing. At most [`MAX_DIALOG_LINES`] lines come back.
+///
+/// The width is measured with the engine and scale the dialog's text is
+/// drawn with, once, when the dialog opens: a window narrowed afterwards
+/// clips the ends of lines (there is still no re-wrap on resize).
+pub fn wrap_dialog_lines(
+    engine: &mut aurora_text::TextEngine,
+    scales: &Scales,
+    scale_factor: f32,
+    text: &str,
+    max_width: f32,
+) -> Vec<String> {
+    let style = crate::text::label_style(scales);
+    let mut out: Vec<String> = Vec::new();
+    let mut width_of = |candidate: &str| -> f32 {
+        engine
+            .shape(
+                &crate::text::sanitize_label(candidate),
+                &style,
+                scale_factor,
+            )
+            .width
+    };
+    let wrap = max_width.is_finite() && max_width > 0.0;
+    let mut total = 0_usize;
+    'lines: for line in text.split('\n') {
+        if !wrap || width_of(line) <= max_width {
+            total += 1;
+            if total > MAX_DIALOG_LINES {
+                break 'lines;
+            }
+            out.push(line.to_owned());
+            continue;
+        }
+        let indent: String = line.chars().take_while(|c| *c == ' ').collect();
+        let body = line.trim_start_matches(' ');
+        let continuation = format!("{indent}  ");
+        let mut current = indent.clone();
+        let mut has_word = false;
+        let mut pieces: Vec<String> = Vec::new();
+        for word in body.split(' ').filter(|w| !w.is_empty()) {
+            let candidate = if has_word {
+                format!("{current} {word}")
+            } else {
+                format!("{current}{word}")
+            };
+            if width_of(&candidate) <= max_width {
+                current = candidate;
+                has_word = true;
+                continue;
+            }
+            if has_word {
+                pieces.push(std::mem::replace(&mut current, continuation.clone()));
+            }
+            // A word wider than a whole line: cut it between characters.
+            let mut rest = word;
+            loop {
+                let mut take = 0;
+                for (at, ch) in rest.char_indices() {
+                    let end = at + ch.len_utf8();
+                    let probe = format!("{current}{}", rest.get(..end).unwrap_or(rest));
+                    if width_of(&probe) > max_width && take > 0 {
+                        break;
+                    }
+                    take = end;
+                }
+                let (head, tail) =
+                    rest.split_at(take.max(rest.chars().next().map_or(0, char::len_utf8)));
+                current.push_str(head);
+                if tail.is_empty() {
+                    has_word = true;
+                    break;
+                }
+                pieces.push(std::mem::replace(&mut current, continuation.clone()));
+                rest = tail;
+            }
+        }
+        pieces.push(current);
+        for piece in pieces {
+            total += 1;
+            if total > MAX_DIALOG_LINES {
+                break 'lines;
+            }
+            out.push(piece);
+        }
+    }
+    if total > MAX_DIALOG_LINES {
+        out.push("\u{2026} more lines; the full list is in Aurora's log.".to_owned());
+    }
+    out
+}
+
+/// A scrolling dialog's message viewport: a clipping `Row` that holds the
+/// scroll container and its bar, and gives way when the dialog hits its
+/// height cap.
+fn viewport_style(scales: &Scales) -> Style {
+    Style {
+        flex_direction: FlexDirection::Row,
+        flex_shrink: 1.0,
+        overflow: taffy::Point {
+            x: Overflow::Hidden,
+            y: Overflow::Hidden,
+        },
+        ..message_style(scales)
+    }
+}
+
+/// One drawn line of a scrolling dialog: full width, exactly one row, never
+/// shrunk.
+fn line_style(scales: &Scales) -> Style {
+    Style {
+        size: Size {
+            width: percent(MESSAGE_WIDTH_FRACTION),
+            height: length(row_height(scales)),
+        },
+        flex_shrink: 0.0,
+        ..Default::default()
+    }
+}
+
+/// Makes `id` keep its size when the dialog is squeezed.
+fn never_shrink(tree: &mut WidgetTree<WidgetKind>, id: WidgetId) -> Result<(), WidgetError> {
+    let Some(mut style) = tree.style(id).cloned() else {
+        return Err(WidgetError::UnknownWidget(id));
+    };
+    style.flex_shrink = 0.0;
+    tree.set_style(id, style)
+}
+
+fn build_dialog(
+    tree: &mut WidgetTree<WidgetKind>,
+    parent: WidgetId,
+    scales: &Scales,
+    title: String,
+    message: String,
+    lines: Option<&[String]>,
+    actions: Vec<DialogAction>,
+) -> Result<DialogHandle, WidgetError> {
     let mut root_node = Node::new(Role::AlertDialog);
-    root_node.set_label(title.into());
+    root_node.set_label(title);
     root_node.set_modal();
-    let root = tree.insert(parent, root_style(scales), root_node, WidgetKind::Dialog)?;
+    let mut root_layout = root_style(scales);
+    if lines.is_some() {
+        root_layout.max_size.height = percent(SCROLLING_MAX_HEIGHT_FRACTION);
+    }
+    let root = tree.insert(parent, root_layout, root_node, WidgetKind::Dialog)?;
 
     // The title's own layout slot (0.141.0), first so it sits above
     // the message. Presentational: the root's own label already *is*
@@ -600,19 +836,47 @@ pub fn insert_dialog(
     )?;
 
     let mut message_node = Node::new(Role::Label);
-    message_node.set_label(message.into());
-    let message_id = tree.insert(
-        root,
-        message_style(scales),
-        message_node,
-        WidgetKind::Container,
-    )?;
+    message_node.set_label(message);
+    let message_layout = if lines.is_some() {
+        viewport_style(scales)
+    } else {
+        message_style(scales)
+    };
+    let message_id = tree.insert(root, message_layout, message_node, WidgetKind::Container)?;
+
+    let mut parts = None;
+    if let Some(lines) = lines {
+        never_shrink(tree, title_id)?;
+        let (body, scrollbar) = insert_parts(tree, message_id, scrollbar_thickness(scales))?;
+        for line in lines {
+            // A drawn line is presentational: the message node above holds
+            // the one announced copy of the text. `draws_label` is the
+            // existing opt-in that makes a plain list row draw its own
+            // accessible label.
+            let mut node = Node::new(Role::GenericContainer);
+            node.set_label(line.as_str());
+            node.set_hidden();
+            tree.insert(
+                body,
+                line_style(scales),
+                node,
+                WidgetKind::ListRow(ListRowState {
+                    draws_label: true,
+                    ..ListRowState::default()
+                }),
+            )?;
+        }
+        parts = Some((body, scrollbar));
+    }
 
     let mut action_ids = Vec::with_capacity(actions.len());
     let mut default_action = None;
     let mut cancel_action = None;
     for action in actions {
         let button = insert_button(tree, root, scales, action.label)?;
+        if lines.is_some() {
+            never_shrink(tree, button)?;
+        }
         if action.is_default && default_action.is_none() {
             default_action = Some(button);
         }
@@ -629,6 +893,8 @@ pub fn insert_dialog(
         actions: action_ids,
         default_action,
         cancel_action,
+        body: parts.map(|(body, _)| body),
+        scrollbar: parts.map(|(_, scrollbar)| scrollbar),
     })
 }
 
@@ -1281,5 +1547,274 @@ mod tests {
         assert_eq!(by_key, expected);
         assert_eq!(handle.choice_for(handle.message), None);
         assert_eq!(handle.choice_for(handle.root), None);
+    }
+
+    // -- task 161: the scrolling dialog --
+
+    fn scrolling(
+        line_count: usize,
+        window: (f32, f32),
+    ) -> (
+        crate::WidgetTree<crate::widgets::WidgetKind>,
+        super::DialogHandle,
+    ) {
+        let (mut tree, root) = new_tree(Style {
+            size: taffy::Size {
+                width: taffy::style_helpers::length(window.0),
+                height: taffy::style_helpers::length(window.1),
+            },
+            ..Default::default()
+        });
+        let lines: Vec<String> = (0..line_count).map(|i| format!("line {i}")).collect();
+        let handle = match super::insert_dialog_scrolling(
+            &mut tree,
+            root,
+            &test_scales(),
+            "Save With Changes?",
+            lines.join("\n"),
+            &lines,
+            vec![
+                DialogAction::new("save", "Save Anyway"),
+                DialogAction::new("cancel", "Cancel")
+                    .as_default()
+                    .as_cancel(),
+            ],
+        ) {
+            Ok(handle) => handle,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        crate::compute_text_layout(&mut tree, window.0, window.1, None);
+        (tree, handle)
+    }
+
+    fn parts(handle: &super::DialogHandle) -> (WidgetId, WidgetId) {
+        match (handle.body, handle.scrollbar) {
+            (Some(body), Some(bar)) => (body, bar),
+            _ => unreachable!("a scrolling dialog has a body and a bar"),
+        }
+    }
+
+    #[test]
+    fn a_long_message_scrolls_inside_a_dialog_capped_to_the_window() {
+        let window = (800.0, 300.0);
+        let (tree, handle) = scrolling(200, window);
+        let (body, bar) = parts(&handle);
+        let Some(dialog) = tree.bounds(handle.root) else {
+            unreachable!("laid out");
+        };
+        assert!(
+            f32::from(u16::try_from(dialog.height).unwrap_or(u16::MAX)) <= window.1 * 0.9 + 1.0,
+            "capped at 90 % of the window: {dialog:?}"
+        );
+        assert!(dialog.y >= 0 && dialog.y + i64::from(dialog.height) <= 300);
+        assert!(tree.scroll_range(body).is_some_and(|r| r > 0.0), "scrolls");
+        assert_ne!(
+            tree.style(bar).map(|s| s.display),
+            Some(taffy::Display::None),
+            "the bar is shown when the lines overflow"
+        );
+        // Every button is on screen and reachable.
+        for (_, button) in &handle.actions {
+            let Some(b) = tree.bounds(*button) else {
+                unreachable!("laid out");
+            };
+            assert!(
+                b.height > 0 && b.y >= 0 && b.y + i64::from(b.height) <= 300,
+                "{b:?}"
+            );
+            #[allow(clippy::cast_precision_loss)]
+            let centre = (
+                b.x as f32 + b.width as f32 / 2.0,
+                b.y as f32 + b.height as f32 / 2.0,
+            );
+            assert_eq!(tree.hit_test(centre), Some(*button));
+        }
+    }
+
+    #[test]
+    fn scrolling_reaches_the_last_line_and_a_short_message_does_not_scroll() {
+        let (mut tree, handle) = scrolling(200, (800.0, 300.0));
+        let (body, _) = parts(&handle);
+        let range = tree.scroll_range(body).unwrap_or(0.0);
+        assert!(matches!(tree.set_scroll_y(body, range), Ok(true)));
+        let Some(rows) = tree.children(body) else {
+            unreachable!("rows");
+        };
+        let Some(last) = rows.last().copied() else {
+            unreachable!("rows");
+        };
+        let (Some(row), Some(view)) = (tree.bounds(last), tree.bounds(body)) else {
+            unreachable!("laid out");
+        };
+        assert!(
+            row.y + i64::from(row.height) <= view.y + i64::from(view.height),
+            "the last line is in view at the end: {row:?} in {view:?}"
+        );
+        let (short, short_handle) = scrolling(3, (800.0, 600.0));
+        let (short_body, short_bar) = parts(&short_handle);
+        assert_eq!(short.scroll_range(short_body), Some(0.0));
+        assert_eq!(
+            short.style(short_bar).map(|s| s.display),
+            Some(taffy::Display::None),
+            "no bar when everything fits"
+        );
+    }
+
+    #[test]
+    fn the_scrolling_dialog_announces_the_whole_message_once_and_keeps_its_choices() {
+        let (tree, handle) = scrolling(5, (800.0, 600.0));
+        let Some(message) = tree.accessibility(handle.message) else {
+            unreachable!("inserted");
+        };
+        assert_eq!(
+            message.label(),
+            Some("line 0\nline 1\nline 2\nline 3\nline 4")
+        );
+        let (body, _) = parts(&handle);
+        for row in tree.children(body).unwrap_or_default() {
+            assert!(
+                tree.accessibility(*row)
+                    .is_some_and(accesskit::Node::is_hidden),
+                "drawn lines are not announced a second time"
+            );
+        }
+        let Some(root) = tree.accessibility(handle.root) else {
+            unreachable!("inserted");
+        };
+        assert_eq!(root.label(), Some("Save With Changes?"));
+        assert!(root.is_modal());
+        // Default and cancel are unchanged: Enter and Escape.
+        let cancel = handle.cancel_action;
+        assert_eq!(handle.initial_focus(), cancel);
+        let escape = chord(named(crate::shortcut::NamedKey::Escape), false);
+        assert_eq!(
+            handle.key(&escape, None),
+            super::DialogKeyOutcome::Chosen(super::DialogChoice {
+                dialog: handle.root,
+                action: "cancel".into()
+            })
+        );
+        let enter = chord(named(crate::shortcut::NamedKey::Enter), false);
+        assert!(matches!(
+            handle.key(&enter, None),
+            super::DialogKeyOutcome::Chosen(c) if c.action == "cancel"
+        ));
+    }
+
+    #[test]
+    fn a_plain_dialog_has_no_scroll_parts_and_the_text_width_follows_the_window() {
+        let (_, handle) = choice_dialog();
+        assert_eq!((handle.body, handle.scrollbar), (None, None));
+        let scales = test_scales();
+        let narrow = super::dialog_text_width(600.0, &scales);
+        let wide = super::dialog_text_width(1200.0, &scales);
+        assert!(narrow > 0.0 && wide > narrow);
+        assert!(wide < 1200.0 * 0.5, "less than the dialog itself");
+    }
+
+    // -- task 161: wrapping --
+
+    fn engine() -> aurora_text::TextEngine {
+        match aurora_text::TextEngine::new() {
+            Ok(engine) => engine,
+            Err(err) => unreachable!("{err:?}"),
+        }
+    }
+
+    fn width(engine: &mut aurora_text::TextEngine, text: &str) -> f32 {
+        engine
+            .shape(text, &crate::text::label_style(&test_scales()), 1.0)
+            .width
+    }
+
+    #[test]
+    fn text_that_fits_is_returned_line_for_line_and_long_text_wraps_losslessly() {
+        let scales = test_scales();
+        let mut engine = engine();
+        let short = "Changed:\n\u{2022} one\n\u{2022} two";
+        assert_eq!(
+            super::wrap_dialog_lines(&mut engine, &scales, 1.0, short, 400.0),
+            ["Changed:", "\u{2022} one", "\u{2022} two"]
+        );
+        let long = format!(
+            "\u{2022} {}",
+            (0..60)
+                .map(|i| format!("word{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let lines = super::wrap_dialog_lines(&mut engine, &scales, 1.0, &long, 200.0);
+        assert!(lines.len() > 3, "{lines:?}");
+        for line in &lines {
+            assert!(width(&mut engine, line) <= 200.0, "{line:?}");
+        }
+        let words: Vec<&str> = lines
+            .iter()
+            .flat_map(|l| l.split(' '))
+            .filter(|w| !w.is_empty() && *w != "\u{2022}")
+            .collect();
+        let expected: Vec<String> = (0..60).map(|i| format!("word{i}")).collect();
+        assert_eq!(
+            words,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(
+            lines.iter().skip(1).all(|l| l.starts_with("  ")),
+            "continuations are indented"
+        );
+    }
+
+    #[test]
+    fn a_word_wider_than_the_line_is_cut_between_characters_without_losing_any() {
+        let scales = test_scales();
+        let mut engine = engine();
+        let word = "W".repeat(80);
+        let lines = super::wrap_dialog_lines(&mut engine, &scales, 1.0, &word, 120.0);
+        assert!(lines.len() > 1);
+        let joined: String = lines.iter().map(|l| l.trim_start()).collect();
+        assert_eq!(joined, word);
+        for line in &lines {
+            assert!(width(&mut engine, line) <= 120.0, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_degenerate_width_wraps_nothing_and_the_line_count_is_bounded() {
+        let scales = test_scales();
+        let mut engine = engine();
+        for bad in [0.0_f32, -4.0, f32::NAN] {
+            assert_eq!(
+                super::wrap_dialog_lines(&mut engine, &scales, 1.0, "a b c d", bad),
+                ["a b c d"]
+            );
+        }
+        let many = vec!["x"; super::MAX_DIALOG_LINES + 50].join("\n");
+        let lines = super::wrap_dialog_lines(&mut engine, &scales, 1.0, &many, 400.0);
+        assert_eq!(lines.len(), super::MAX_DIALOG_LINES + 1);
+        assert!(
+            lines
+                .last()
+                .is_some_and(|l| l.contains("full list is in Aurora's log"))
+        );
+    }
+
+    #[test]
+    fn in_a_short_window_the_buttons_and_title_keep_their_height_and_the_message_gives_way() {
+        let scales = test_scales();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let row = row_height(&scales) as u32;
+        let (tree, handle) = scrolling(200, (800.0, 140.0));
+        for (_, button) in &handle.actions {
+            let Some(b) = tree.bounds(*button) else {
+                unreachable!("laid out");
+            };
+            assert!(b.height >= row, "a button is squeezed to {b:?}");
+        }
+        let Some(title) = tree.bounds(handle.title) else {
+            unreachable!("laid out");
+        };
+        assert_eq!(title.height, row, "the title keeps its row");
+        let (body, _) = parts(&handle);
+        assert!(tree.scroll_range(body).is_some_and(|r| r > 0.0));
     }
 }

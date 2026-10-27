@@ -6,6 +6,10 @@
 //! app can group, count and cap them. The sentences themselves are
 //! unchanged, and so is what is written: this module only describes it.
 
+/// How many layer names a report sentence lists before "and N more"; a
+/// dialog shows every name of a longer list on its own line (task 161).
+pub const REPORT_NAMES_SHOWN: usize = 5;
+
 /// What kind of thing a [`ReportEntry`] says about the saved file.
 ///
 /// Declared in the order a reader should meet them: what needs a decision

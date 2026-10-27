@@ -4,16 +4,16 @@
 //! [`SaveReport`] is a pure view of a [`aurora_io::PsdWriteReport`]'s
 //! classified entries: duplicates removed, grouped by
 //! [`ReportCategory`], sorted deterministically (group order, then the
-//! sentence case-insensitively), counted, and — for the dialog — cut at
-//! [`MAX_ITEMS_PER_GROUP`] lines with "and N more" in the Changed, From open
-//! and Kept groups only: **Needs attention and Not saved lines are never
-//! cut** ([`cap_for`]), so nothing that is lost or unchecked hides behind
-//! "and N more". The dialog's message is one plain label that does not
-//! scroll; a very long Needs attention or Not saved list therefore grows
-//! the dialog (each sentence already shows at most five names, the rest are
-//! in [`SaveReport::full_text`]) and may not fit a small window. Nothing
-//! here changes what is written. [`SaveReport::full_text`] always has every
-//! line and every affected name, for the log.
+//! sentence case-insensitively) and counted. **The dialog shows every line
+//! of every group** (task 161; before it, Changed, From open and Kept were
+//! cut at 12 lines with "and N more"): the message is drawn as rows in a
+//! scroll container capped to the window (`aurora_widgets::widgets::
+//! insert_dialog_scrolling`), so a long list scrolls instead of growing the
+//! dialog. Needs attention and Not saved come first. A line that names more
+//! layers than its sentence lists is followed by an "All:" line with every
+//! name (at most [`MAX_FULL_NAMES`], then "and N more"). Nothing here
+//! changes what is written. [`SaveReport::full_text`] is the log's text and
+//! is unchanged.
 //!
 //! **The ask rule.** A save asks "Save With Changes?" first when any entry's
 //! category [asks](ReportCategory::asks): Needs attention, Not saved,
@@ -32,29 +32,16 @@
 //! alpha-channel notes still asks, because those notes are carried into the
 //! save as From open lines ([`ReportCategory::FromOpen`]), which always ask.
 //!
-//! The wording is plain text in one dialog message: no section styling, as
-//! no token exists for it.
+//! The wording is plain text in one dialog message. The section headings are
+//! not bold: the only bundled face is Inter Regular and the text engine has
+//! no weight selection (task 161, decision B skipped).
 
 use std::fmt::Write as _;
 
 use aurora_io::{PsdWriteReport, ReportCategory, ReportEntry};
 
-/// Lines a Changed, From open or Kept group shows in a dialog before "and
-/// N more". Needs attention and Not saved are never cut: a line there may
-/// be the one that matters (see [`cap_for`]).
-pub(crate) const MAX_ITEMS_PER_GROUP: usize = 12;
-
-/// The dialog's line cap for `category`: `None` (every line) for the two
-/// categories that say something is lost or unchecked.
-pub(crate) const fn cap_for(category: ReportCategory) -> Option<usize> {
-    match category {
-        ReportCategory::NeedsAttention | ReportCategory::NotSaved => None,
-        _ => Some(MAX_ITEMS_PER_GROUP),
-    }
-}
-
 /// The names listed after a line in the full text, at most.
-const MAX_FULL_NAMES: usize = 2000;
+pub(crate) const MAX_FULL_NAMES: usize = 2000;
 
 /// The heading of the "carried from open" group (it was a sentence of the
 /// flat report before task 157).
@@ -140,13 +127,6 @@ impl SaveReport {
         self.groups.iter().any(|g| g.category.asks())
     }
 
-    /// Whether the dialog cuts any group short.
-    pub(crate) fn is_truncated(&self) -> bool {
-        self.groups
-            .iter()
-            .any(|g| cap_for(g.category).is_some_and(|cap| g.entries.len() > cap))
-    }
-
     /// "3 changes, 2 not saved": a count for each group that has lines
     /// (Kept ones too, last), or `None` for an empty report.
     pub(crate) fn summary(&self) -> Option<String> {
@@ -178,9 +158,10 @@ impl SaveReport {
         (!parts.is_empty()).then(|| parts.join(", "))
     }
 
-    /// The groups as sections of bullet lines; when `capped`, a group with a
-    /// cap ([`cap_for`]) is cut there with "and N more".
-    fn sections(&self, capped: bool) -> String {
+    /// The dialog's body: every group as a heading and bullet lines, every
+    /// line included. A line that names more layers than its sentence lists
+    /// ([`aurora_io::REPORT_NAMES_SHOWN`]) is followed by an "All:" line.
+    pub(crate) fn dialog_body(&self) -> String {
         let mut text = String::new();
         for group in &self.groups {
             if !text.is_empty() {
@@ -188,28 +169,15 @@ impl SaveReport {
             }
             text.push_str(heading(group.category));
             text.push(':');
-            let shown = cap_for(group.category)
-                .filter(|_| capped)
-                .map_or(group.entries.len(), |cap| cap.min(group.entries.len()));
-            for entry in group.entries.iter().take(shown) {
+            for entry in &group.entries {
                 text.push_str("\n\u{2022} ");
                 text.push_str(&entry.text);
-            }
-            let more = group.entries.len() - shown;
-            if more > 0 {
-                let _ = write!(text, "\n  \u{2026} and {more} more");
+                if entry.affected.len() > aurora_io::REPORT_NAMES_SHOWN {
+                    push_all_names(&mut text, &entry.affected);
+                }
             }
         }
         text
-    }
-
-    /// The dialog's body: the sections, capped.
-    pub(crate) fn dialog_body(&self) -> String {
-        let mut body = self.sections(true);
-        if self.is_truncated() {
-            body.push_str("\n(The full list is in Aurora's log.)");
-        }
-        body
     }
 
     /// Every line and every affected name, for the log and for tests.
@@ -225,23 +193,26 @@ impl SaveReport {
                 text.push_str("\n\u{2022} ");
                 text.push_str(&entry.text);
                 if entry.affected.len() > 1 {
-                    let names: Vec<String> = entry
-                        .affected
-                        .iter()
-                        .take(MAX_FULL_NAMES)
-                        .map(|n| {
-                            format!("\u{201c}{}\u{201d}", aurora_doc::sanitize_display_name(n))
-                        })
-                        .collect();
-                    text.push_str("\n    All: ");
-                    text.push_str(&names.join(", "));
-                    if entry.affected.len() > MAX_FULL_NAMES {
-                        let _ = write!(text, " and {} more", entry.affected.len() - MAX_FULL_NAMES);
-                    }
+                    push_all_names(&mut text, &entry.affected);
                 }
             }
         }
         text
+    }
+}
+
+/// Appends the "All:" line naming every affected layer (at most
+/// [`MAX_FULL_NAMES`], then "and N more").
+fn push_all_names(text: &mut String, affected: &[String]) {
+    let names: Vec<String> = affected
+        .iter()
+        .take(MAX_FULL_NAMES)
+        .map(|n| format!("\u{201c}{}\u{201d}", aurora_doc::sanitize_display_name(n)))
+        .collect();
+    text.push_str("\n    All: ");
+    text.push_str(&names.join(", "));
+    if affected.len() > MAX_FULL_NAMES {
+        let _ = write!(text, " and {} more", affected.len() - MAX_FULL_NAMES);
     }
 }
 

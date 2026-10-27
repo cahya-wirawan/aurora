@@ -763,6 +763,12 @@ fn container_text(
     match tree.payload(parent)? {
         WidgetKind::Dialog => {
             let node = tree.accessibility(id)?;
+            // A scrolling dialog's message node (task 161) is a viewport
+            // holding its lines as rows, which draw themselves: it draws
+            // nothing, or the whole text would also appear on one line.
+            if tree.children(id).is_some_and(|kids| !kids.is_empty()) {
+                return None;
+            }
             (node.role() == accesskit::Role::Label)
                 .then(|| node.label().map(str::to_owned))
                 .flatten()
@@ -3055,6 +3061,39 @@ mod field_tests {
         assert_eq!(run.color, rgba(theme.text.primary, 1.0));
         assert!(run.field.is_none());
         assert!(texts_of(&tree, handle.root, None).is_empty());
+    }
+
+    /// Task 161: a scrolling dialog's message node draws nothing (its
+    /// lines do), each line draws its own text in `text.primary`, and the
+    /// plain dialog above is unchanged.
+    #[test]
+    fn a_scrolling_dialog_draws_each_line_once_and_not_the_whole_message() {
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let scales = test_scales();
+        let theme = dark_theme();
+        let lines = vec!["first line".to_owned(), "second line".to_owned()];
+        let handle = ok(crate::widgets::insert_dialog_scrolling(
+            &mut tree,
+            root,
+            &scales,
+            "Title",
+            "first line\nsecond line",
+            &lines,
+            vec![DialogAction::new("ok", "OK")],
+        ));
+        assert!(texts_of(&tree, handle.message, None).is_empty());
+        let Some(body) = handle.body else {
+            unreachable!("a body");
+        };
+        let rows = tree.children(body).unwrap_or_default().to_vec();
+        assert_eq!(rows.len(), 2);
+        for (row, expected) in rows.iter().zip(&lines) {
+            let [run] = &texts_of(&tree, *row, None)[..] else {
+                unreachable!("the line draws");
+            };
+            assert_eq!(&run.text, expected);
+            assert_eq!(run.color, rgba(theme.text.primary, 1.0));
+        }
     }
 
     /// 0.141.0: the title slot draws the root's own label -- the title

@@ -207,7 +207,7 @@ pub use write::{
     PsdRecordKind, PsdSaveOptions, PsdSaveRefusal, PsdWriteOutcome, psd_blend_key,
     psd_save_preflight, verify_psd_file, write_psd, write_psd_with_selections,
 };
-pub use write_report::{PsdWriteReport, ReportCategory, ReportEntry};
+pub use write_report::{PsdWriteReport, REPORT_NAMES_SHOWN, ReportCategory, ReportEntry};
 
 /// The largest canvas side a version-1 PSD file may declare.
 pub const PSD_MAX_EXTENT: u32 = 30_000;

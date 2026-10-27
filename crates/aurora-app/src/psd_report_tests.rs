@@ -5,9 +5,7 @@
 
 use aurora_io::{PsdWriteReport, ReportCategory, ReportEntry};
 
-use crate::psd_report::{
-    FROM_OPEN_HEADING, MAX_ITEMS_PER_GROUP, SaveReport, check_message, save_message,
-};
+use crate::psd_report::{FROM_OPEN_HEADING, SaveReport, check_message, save_message};
 
 fn entry(category: ReportCategory, text: &str) -> ReportEntry {
     ReportEntry::new(category, text)
@@ -117,72 +115,117 @@ fn the_ask_rule_only_kept_lines_do_not_ask() {
     assert!(!SaveReport::default().asks());
 }
 
+/// Task 161: the 12-line cap and "and N more" are gone; every line of every
+/// group is in the dialog body (the dialog scrolls instead).
 #[test]
-fn only_changed_from_open_and_kept_are_capped_and_the_rest_is_in_the_full_text() {
-    let n = MAX_ITEMS_PER_GROUP + 3;
-    for category in [
-        ReportCategory::Changed,
-        ReportCategory::FromOpen,
-        ReportCategory::Kept,
-    ] {
-        let entries: Vec<ReportEntry> = (0..n)
-            .map(|i| entry(category, &format!("line {i:02}")))
-            .collect();
-        let r = SaveReport::new(&report(entries));
-        assert!(r.is_truncated(), "{category:?}");
-        let body = r.dialog_body();
-        assert!(body.contains("line 00"), "{body}");
-        assert!(
-            body.contains(&format!("line {:02}", MAX_ITEMS_PER_GROUP - 1)),
-            "{body}"
-        );
-        assert!(
-            !body.contains(&format!("line {MAX_ITEMS_PER_GROUP:02}")),
-            "{body}"
-        );
-        assert!(body.contains("\u{2026} and 3 more"), "{body}");
-        assert!(body.contains("full list is in Aurora's log"), "{body}");
-        let full = r.full_text();
+fn every_line_of_every_group_is_in_the_dialog_body() {
+    let n = 40;
+    let mut entries = Vec::new();
+    for category in ReportCategory::ALL {
         for i in 0..n {
-            assert!(full.contains(&format!("line {i:02}")), "{full}");
+            entries.push(entry(category, &format!("{category:?} line {i:02}")));
         }
-        assert!(!full.contains("and 3 more"), "{full}");
     }
-    // At exactly the cap nothing is cut.
-    let exact = SaveReport::new(&report(
-        (0..MAX_ITEMS_PER_GROUP)
-            .map(|i| entry(ReportCategory::Changed, &format!("l{i}")))
-            .collect(),
-    ));
-    assert!(!exact.is_truncated());
-    assert!(!exact.dialog_body().contains("more"));
+    let r = SaveReport::new(&report(entries));
+    let body = r.dialog_body();
+    for category in ReportCategory::ALL {
+        for i in 0..n {
+            assert!(
+                body.contains(&format!("{category:?} line {i:02}")),
+                "{category:?} {i}"
+            );
+        }
+    }
+    assert!(!body.contains("more"), "{body}");
+    assert!(!body.contains("Aurora's log"), "{body}");
+    assert_eq!(
+        body.matches('\u{2022}').count(),
+        n * ReportCategory::ALL.len()
+    );
+    // Needs attention and Not saved still come first.
+    let na = body.find("Needs your attention").unwrap_or(usize::MAX);
+    let ns = body.find("Not saved:").unwrap_or(usize::MAX);
+    let ch = body.find("Changed:").unwrap_or(usize::MAX);
+    assert!(na < ns && ns < ch, "{body}");
+    // And through the real messages.
+    let rep = report(vec![entry(
+        ReportCategory::Changed,
+        "zzz last changed line",
+    )]);
+    assert!(save_message("a.psd", &rep).contains("zzz last changed line"));
+    assert!(check_message("a", &rep).contains("zzz last changed line"));
 }
 
-/// The trust rule: a line that says something is lost or unchecked is never
-/// hidden behind "and N more", however long the group.
+/// The dialog lists a line's every affected layer when the sentence shows
+/// only the first five, up to the 2,000-name limit.
 #[test]
-fn needs_attention_and_not_saved_lines_are_never_cut() {
-    let n = MAX_ITEMS_PER_GROUP * 3;
-    for category in [ReportCategory::NeedsAttention, ReportCategory::NotSaved] {
-        // Sorts last, past position 5 and past the Changed cap.
-        let mut entries: Vec<ReportEntry> = (0..n)
-            .map(|i| entry(category, &format!("line {i:02}")))
-            .collect();
-        entries.push(entry(category, "zzz the important one"));
-        let r = SaveReport::new(&report(entries));
-        assert!(!r.is_truncated(), "{category:?}");
-        let body = r.dialog_body();
-        assert!(body.contains("zzz the important one"), "{body}");
-        assert!(body.contains(&format!("line {:02}", n - 1)), "{body}");
-        assert!(!body.contains("more"), "{body}");
-        assert!(!body.contains("Aurora's log"), "{body}");
-        // And through the real message.
-        let message = save_message(
-            "a.psd",
-            &report(vec![entry(category, "zzz the important one")]),
-        );
-        assert!(message.contains("zzz the important one"));
-    }
+fn a_report_naming_two_thousand_layers_lists_them_all_in_the_dialog() {
+    let names: Vec<String> = (0..2000).map(|i| format!("Layer {i:04}")).collect();
+    let r = SaveReport::new(&report(vec![
+        entry(ReportCategory::Changed, "Two thousand layers.").with_affected(&names),
+    ]));
+    let body = r.dialog_body();
+    assert!(body.contains("\u{201c}Layer 0000\u{201d}"), "first");
+    assert!(body.contains("\u{201c}Layer 1999\u{201d}"), "last");
+    assert!(
+        !body.contains("and 0 more") && !body.contains(" more"),
+        "none cut"
+    );
+    // Past the limit the log's own rule applies.
+    let more: Vec<String> = (0..2003).map(|i| format!("L{i:04}")).collect();
+    let r = SaveReport::new(&report(vec![
+        entry(ReportCategory::Changed, "Many.").with_affected(&more),
+    ]));
+    let body = r.dialog_body();
+    assert!(
+        body.contains("L1999") && !body.contains("L2000"),
+        "cut at the limit"
+    );
+    assert!(
+        body.ends_with("and 3 more"),
+        "{}",
+        &body[body.len().saturating_sub(40)..]
+    );
+    assert_eq!(
+        r.full_text().matches("All:").count(),
+        1,
+        "the log is as before"
+    );
+}
+
+#[test]
+fn the_all_line_appears_only_when_the_sentence_does_not_list_every_name() {
+    let five: Vec<String> = (0..aurora_io::REPORT_NAMES_SHOWN)
+        .map(|i| format!("N{i}"))
+        .collect();
+    let mut six = five.clone();
+    six.push("N5".to_owned());
+    let at_limit = SaveReport::new(&report(vec![
+        entry(ReportCategory::NotSaved, "Five.").with_affected(&five),
+    ]));
+    assert!(!at_limit.dialog_body().contains("All:"));
+    let over = SaveReport::new(&report(vec![
+        entry(ReportCategory::NotSaved, "Six.").with_affected(&six),
+    ]));
+    assert!(over.dialog_body().contains("All:"));
+    // The log keeps listing from two names, as before.
+    assert!(at_limit.full_text().contains("All:"));
+}
+
+/// The asking rule is unchanged by the full list: any non-Kept line asks.
+#[test]
+fn the_ask_rule_is_unchanged_with_many_lines() {
+    let many_kept = SaveReport::new(&report(
+        (0..100)
+            .map(|i| entry(ReportCategory::Kept, &format!("k{i}")))
+            .collect(),
+    ));
+    assert!(!many_kept.asks());
+    let mut entries: Vec<ReportEntry> = (0..100)
+        .map(|i| entry(ReportCategory::Kept, &format!("k{i}")))
+        .collect();
+    entries.push(entry(ReportCategory::FromOpen, "carried"));
+    assert!(SaveReport::new(&report(entries)).asks());
 }
 
 #[test]
@@ -254,4 +297,279 @@ fn the_check_message_says_nothing_was_written_and_never_claims_photoshop() {
     assert!(kept_only.contains("kept"), "{kept_only}");
     let lossy = check_message("doc", &report(vec![entry(ReportCategory::Changed, "c")]));
     assert!(lossy.contains("would change it (1 change):"), "{lossy}");
+}
+
+// -- task 161: the real dialog in the real workspace --
+
+mod dialog {
+    use aurora_widgets::shortcut::{Key, KeyChord, Modifiers, NamedKey};
+    use aurora_widgets::widgets::WidgetKind;
+    use aurora_widgets::{FocusManager, WidgetId, WidgetTree};
+
+    use crate::{
+        DialogPointer, OpenDialog, PointerButton, handle_dialog_key, handle_dialog_pointer,
+        is_dialog_scrollbar, open_dialog, open_dialog_lines, psd_save,
+    };
+
+    use super::*;
+
+    const WINDOW: (f32, f32) = (1000.0, 500.0);
+
+    struct Rig {
+        workspace: aurora_ui::Workspace,
+        focus: FocusManager,
+        dialog: Option<OpenDialog>,
+    }
+
+    fn rig(line_count: usize, scrolling: bool) -> Rig {
+        let scales = crate::test_workspace_scales();
+        let mut workspace = aurora_ui::build_workspace(&scales);
+        let mut focus = FocusManager::default();
+        let mut dialog = None;
+        aurora_widgets::compute_text_layout(&mut workspace.tree, WINDOW.0, WINDOW.1, None);
+        let entries: Vec<ReportEntry> = (0..line_count)
+            .map(|i| entry(ReportCategory::Changed, &format!("Changed line {i:03}.")))
+            .collect();
+        let message = save_message("big.psd", &report(entries));
+        let lines: Vec<String> = message.split('\n').map(str::to_owned).collect();
+        let opened = if scrolling {
+            open_dialog_lines(
+                &mut workspace,
+                &mut focus,
+                &mut dialog,
+                &scales,
+                psd_save::PSD_SAVE_WITH_CHANGES_TITLE,
+                &message,
+                &lines,
+                psd_save::psd_save_dialog_actions(),
+                crate::DialogPurpose::PsdSaveWithChanges,
+            )
+        } else {
+            open_dialog(
+                &mut workspace,
+                &mut focus,
+                &mut dialog,
+                &scales,
+                psd_save::PSD_SAVE_WITH_CHANGES_TITLE,
+                &message,
+                psd_save::psd_save_dialog_actions(),
+                crate::DialogPurpose::PsdSaveWithChanges,
+            )
+        };
+        assert!(opened);
+        aurora_widgets::compute_text_layout(&mut workspace.tree, WINDOW.0, WINDOW.1, None);
+        Rig {
+            workspace,
+            focus,
+            dialog,
+        }
+    }
+
+    fn tree(rig: &Rig) -> &WidgetTree<WidgetKind> {
+        &rig.workspace.tree
+    }
+
+    fn open(rig: &Rig) -> &OpenDialog {
+        match rig.dialog.as_ref() {
+            Some(dialog) => dialog,
+            None => unreachable!("open"),
+        }
+    }
+
+    fn body(rig: &Rig) -> WidgetId {
+        match open(rig).body {
+            Some(body) => body,
+            None => unreachable!("a scrolling dialog"),
+        }
+    }
+
+    fn key(key: NamedKey) -> KeyChord {
+        KeyChord::new(Modifiers::none(), Key::Named(key))
+    }
+
+    #[test]
+    fn a_three_hundred_line_report_scrolls_inside_the_window_with_its_buttons_reachable() {
+        let rig = rig(300, true);
+        let body = body(&rig);
+        let t = tree(&rig);
+        assert!(t.scroll_range(body).is_some_and(|r| r > 1000.0), "scrolls");
+        let rows = t.children(body).map_or(0, <[WidgetId]>::len);
+        assert!(rows >= 300, "every line is a row: {rows}");
+        let Some(dialog) = t.bounds(open(&rig).root) else {
+            unreachable!("laid out");
+        };
+        assert!(
+            dialog.y >= 0 && dialog.y + i64::from(dialog.height) <= 500,
+            "inside the window: {dialog:?}"
+        );
+        for (id, button) in &open(&rig).actions {
+            let Some(b) = t.bounds(*button) else {
+                unreachable!("laid out");
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let centre = (
+                b.x as f32 + b.width as f32 / 2.0,
+                b.y as f32 + b.height as f32 / 2.0,
+            );
+            assert_eq!(t.hit_test(centre), Some(*button), "{id} is reachable");
+        }
+    }
+
+    #[test]
+    fn the_plain_dialog_for_the_same_report_does_not_scroll() {
+        let rig = rig(300, false);
+        assert_eq!(
+            open(&rig).body,
+            None,
+            "the old path stays for other dialogs"
+        );
+    }
+
+    #[test]
+    fn page_keys_scroll_and_home_and_end_reach_the_ends() {
+        let mut rig = rig(300, true);
+        let body = body(&rig);
+        let at = |rig: &Rig| tree(rig).scroll_y(body).unwrap_or(-1.0);
+        assert!(at(&rig).abs() < f32::EPSILON);
+        let Rig {
+            workspace,
+            focus,
+            dialog,
+        } = &mut rig;
+        assert!(handle_dialog_key(workspace, focus, dialog, key(NamedKey::PageDown)).is_none());
+        let page = at(&rig);
+        assert!(page > 0.0, "PageDown moved the message");
+        let Rig {
+            workspace,
+            focus,
+            dialog,
+        } = &mut rig;
+        handle_dialog_key(workspace, focus, dialog, key(NamedKey::ArrowDown));
+        assert!(at(&rig) > page, "ArrowDown moved it further");
+        let Rig {
+            workspace,
+            focus,
+            dialog,
+        } = &mut rig;
+        handle_dialog_key(workspace, focus, dialog, key(NamedKey::End));
+        let range = tree(&rig).scroll_range(body).unwrap_or(0.0);
+        assert!((at(&rig) - range).abs() < 1.0, "End is the last line");
+        let Rig {
+            workspace,
+            focus,
+            dialog,
+        } = &mut rig;
+        handle_dialog_key(workspace, focus, dialog, key(NamedKey::Home));
+        assert!(at(&rig).abs() < f32::EPSILON, "Home is the top");
+        assert!(rig.dialog.is_some(), "scrolling never closes the dialog");
+    }
+
+    #[test]
+    fn enter_and_escape_still_choose_cancel_and_enter_never_saves() {
+        for named in [NamedKey::Enter, NamedKey::Escape] {
+            let mut rig = rig(300, true);
+            let Rig {
+                workspace,
+                focus,
+                dialog,
+            } = &mut rig;
+            let result = handle_dialog_key(workspace, focus, dialog, key(named));
+            let Some(result) = result else {
+                unreachable!("a choice");
+            };
+            assert_eq!(result.action, psd_save::PSD_SAVE_CANCEL, "{named:?}");
+            assert!(rig.dialog.is_none());
+        }
+    }
+
+    #[test]
+    fn the_dialog_wheel_target_is_the_body_only_over_a_scrolling_dialog() {
+        let scrolling = rig(300, true);
+        let Some(dialog) = tree(&scrolling).bounds(open(&scrolling).root) else {
+            unreachable!("laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let inside = (
+            dialog.x as f32 + 40.0,
+            dialog.y as f32 + dialog.height as f32 / 2.0,
+        );
+        assert_eq!(
+            crate::dialog_wheel_target(tree(&scrolling), scrolling.dialog.as_ref(), inside),
+            Some(body(&scrolling))
+        );
+        assert_eq!(
+            crate::dialog_wheel_target(tree(&scrolling), scrolling.dialog.as_ref(), (1.0, 1.0)),
+            None,
+            "outside the dialog the modal still swallows the wheel"
+        );
+        let plain = rig(300, false);
+        assert_eq!(
+            crate::dialog_wheel_target(tree(&plain), plain.dialog.as_ref(), inside),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_dialogs_scrollbar_is_let_through_a_press_and_a_button_click_still_chooses() {
+        let mut rig = rig(300, true);
+        let Some(bar) = open(&rig).scrollbar else {
+            unreachable!("a bar");
+        };
+        assert!(is_dialog_scrollbar(tree(&rig), rig.dialog.as_ref(), bar));
+        let (_, cancel) = open(&rig).actions[1].clone();
+        assert!(!is_dialog_scrollbar(
+            tree(&rig),
+            rig.dialog.as_ref(),
+            cancel
+        ));
+        assert!(!is_dialog_scrollbar(tree(&rig), None, bar));
+        // A linked scrollbar elsewhere in the window (a panel's) is not the
+        // dialog's: the modal still swallows presses on it.
+        let mut others = 0;
+        let mut stack = vec![tree(&rig).root()];
+        while let Some(id) = stack.pop() {
+            stack.extend(tree(&rig).children(id).unwrap_or_default().iter().copied());
+            if aurora_widgets::widgets::scrollbar_target(tree(&rig), id).is_some()
+                && !tree(&rig).is_within(open(&rig).root, id)
+            {
+                others += 1;
+                assert!(!is_dialog_scrollbar(tree(&rig), rig.dialog.as_ref(), id));
+            }
+        }
+        assert!(
+            others > 0,
+            "the workspace has panel scrollbars to test against"
+        );
+        // A press on a button is the choice; one on the bar is swallowed
+        // here (the App then routes it to the bar).
+        let Some(b) = tree(&rig).bounds(bar) else {
+            unreachable!("laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let on_bar = (b.x as f32 + 2.0, b.y as f32 + 2.0);
+        let Rig {
+            workspace,
+            focus,
+            dialog,
+        } = &mut rig;
+        assert!(matches!(
+            handle_dialog_pointer(workspace, focus, dialog, PointerButton::Primary, on_bar),
+            DialogPointer::Swallowed
+        ));
+        assert!(rig.dialog.is_some());
+        let Some(cb) = tree(&rig).bounds(cancel) else {
+            unreachable!("laid out");
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let on_cancel = (cb.x as f32 + 4.0, cb.y as f32 + 4.0);
+        let Rig {
+            workspace,
+            focus,
+            dialog,
+        } = &mut rig;
+        assert!(matches!(
+            handle_dialog_pointer(workspace, focus, dialog, PointerButton::Primary, on_cancel),
+            DialogPointer::Chosen(_)
+        ));
+    }
 }

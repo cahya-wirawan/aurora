@@ -206,7 +206,10 @@ pub use curve_editor::{
     set_curve_editor_histogram, set_curve_editor_points, set_curve_point_output,
 };
 pub(crate) use curve_editor::{MARKER_RING_WIDTH, plot_rect};
-pub use dialog::{DialogAction, DialogChoice, DialogHandle, DialogKeyOutcome, insert_dialog};
+pub use dialog::{
+    DialogAction, DialogChoice, DialogHandle, DialogKeyOutcome, MAX_DIALOG_LINES,
+    dialog_text_width, insert_dialog, insert_dialog_scrolling, wrap_dialog_lines,
+};
 pub use drop_indicator::{
     DropIndicatorKind, DropIndicatorState, drop_indicator_state, hide_drop_indicator,
     insert_drop_indicator, show_drop_indicator,

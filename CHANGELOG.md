@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.296.0] - 2026-10-27
+
+### Changed
+
+- PSD report dialog: every line, scrolling (task 161)
+
 ## [0.295.6] - 2026-10-26
 
 ### Fixed
