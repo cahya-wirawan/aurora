@@ -412,3 +412,45 @@ token that no longer works.
 * No progress notifications; `doc_save` is not interruptible.
 * Not run in CI: the live-window handlers are exercised by
   `scripts/mcp_bridge_smoke.sh` (needs Xvfb or a display).
+
+### Reviews run so far (2026-10-28)
+
+**A local attack battery against the bridge** (an agent wrote and ran it
+against its own instance of the app under Xvfb, binaries at 0.298.1, scripts
+kept outside the repository). Every stated promise held: off unless enabled,
+loopback only, token required, bounded lines, one controller, no quit and no
+discard answers (by command, menu, key, palette, pointer and the real File >
+Quit click), and file access confined to the roots (`..`, absolute paths,
+symlinks and symlink swaps, fifos, overwrites, header-shaped decompression
+bombs, wrong extensions, an oversize file). A legitimate client connected and
+answered after every attack. What it did **not** cover: Windows, macOS, a real
+MCP client, valid images near the caps decoded on the UI thread, JPEG/TIFF
+files whose header and decoder disagree, parallel clients on the rate limiter,
+other local users, pointer drags, the idle timeout.
+
+Weaknesses it found, none breaking a promise, none fixed yet:
+
+* **Handshake lockout.** Any local process that can reach the loopback port can
+  keep the real controller locked out without the token: a steady stream of
+  well-formed wrong-token hellos holds the lockout at 60 s, and four silent
+  connections hold the unauthenticated-handshake slots for 3 s each.
+* **`--discovery FILE` has no liveness check.** If the file is stale and a
+  different local process now owns its port, `aurora-cli` sends that process
+  the stale token. `--discovery-dir` discovery does check the lock.
+* **The token lives as long as the app** (no rotation) and its file stays on
+  disk after a SIGTERM until the next start sweeps it (owner-only).
+* **A controller can run clipboard commands** (`edit.copy`,
+  `edit.copy_merged`, `edit.paste`): authority beyond the file roots.
+* **The 50 Mpx cap is checked on the canvas header only.** A small canvas with
+  huge layer rectangles is bounded by the PSD reader's 268 Mpx layer cap.
+* **App state lives under `TMPDIR`**, not `HOME`: a test instance with only
+  `HOME` changed adopts stale autosave files in the shared temp directory.
+
+**A smoke run on macOS (Apple M2 Pro, Metal, 0.298.1, a real display session
+started through `open -a Terminal`).** The UI tools list, `ui_inspect`, a
+dialog answer, `command_run layer.new`, `doc_inspect` and the `app.quit`
+refusal passed. `ui_screenshot` answered "no frame was drawn" because the
+Mac's console was locked (`IOConsoleLocked`): a locked screen is the same as an
+occluded window, and the error says so. The in-window menu bar check does not
+apply on macOS (it uses its native menu), so the smoke script skips it there.
+The screenshot on Metal is still unverified: unlock the screen and rerun.
