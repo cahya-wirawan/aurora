@@ -9032,6 +9032,7 @@ fn status_info(
         quick_mask: false,
         crop: None,
         automation: bridge_app::AUTOMATION_CONNECTED.load(std::sync::atomic::Ordering::SeqCst),
+        task: None,
     }
 }
 
@@ -9052,6 +9053,7 @@ fn sync_status_bar(
         None,
         false,
         None,
+        None,
     )
 }
 
@@ -9067,9 +9069,11 @@ fn sync_status_bar_notice(
     selection: Option<aurora_doc::Selection>,
     quick_mask: bool,
     crop: Option<aurora_core::Rect>,
+    task: Option<&'static str>,
 ) -> bool {
     let bar = workspace.status_bar;
     let mut info = status_info(view, canvas_size, scale_factor);
+    info.task = task;
     info.notice = notice;
     info.selection = selection;
     info.quick_mask = quick_mask;
@@ -31275,6 +31279,9 @@ struct App {
     open_worker: OpenWorker,
     /// The Check PSD Compatibility run in flight, if any (task 162).
     psd_check_worker: background_psd_check::PsdCheckWorker,
+    /// A Check PSD Compatibility failure dialog waiting for the modal slot
+    /// (task 164), shown by [`Self::poll_psd_check`] once no dialog is open.
+    deferred_check_dialog: background_psd_check::DeferredDialog,
     /// The background compositor (0.186.0); `None` only if a test double
     /// builds an `App` without one.
     composite_worker: Option<background_composite::CompositeWorker>,
@@ -31996,6 +32003,7 @@ impl App {
             proxy,
             open_worker: OpenWorker::default(),
             psd_check_worker: background_psd_check::PsdCheckWorker::default(),
+            deferred_check_dialog: background_psd_check::DeferredDialog::default(),
             thumbnails: layer_thumbnails::LayerThumbnails::new(std::sync::Arc::new(move || {
                 let _ = thumbnail_proxy.send_event(AppEvent::ThumbnailReady);
             })),
@@ -34554,6 +34562,10 @@ impl App {
     /// [`Self::show_open_state`]).
     fn show_check_state(&mut self) {
         self.apply_window_title();
+        // Task 164: the status bar's "Checking PSD compatibility…" follows
+        // the worker now (it pushes the accessibility tree itself when its
+        // text changed; the push below carries the polite status node).
+        self.sync_status_bar_now();
         self.push_accessibility();
         self.needs_redraw = true;
     }
@@ -34563,6 +34575,15 @@ impl App {
     fn poll_psd_check(&mut self) {
         let step = background_psd_check::background_check_step(self);
         if background_psd_check::step_needs_redraw(step) {
+            self.needs_redraw = true;
+        }
+        // Task 164: a failure dialog that found the modal slot taken waits
+        // for it, as a finished check's result does.
+        if let Some((title, message)) = self
+            .deferred_check_dialog
+            .take_if_free(self.dialog.is_some())
+        {
+            self.open_psd_check_dialog(title, &message);
             self.needs_redraw = true;
         }
     }
@@ -34629,7 +34650,18 @@ impl App {
         }
     }
 
-    fn open_psd_check_dialog(&mut self, title: &str, message: &str) {
+    fn open_psd_check_dialog(&mut self, title: &'static str, message: &str) {
+        if self.dialog.is_some() {
+            // Task 164: queue it, like a finished check's result under a
+            // dialog ([`Self::poll_psd_check`] shows it once the slot is
+            // free), instead of dropping it for a notice.
+            tracing::info!(
+                message,
+                "the Photoshop compatibility dialog waits for the open dialog to close"
+            );
+            self.deferred_check_dialog.queue(title, message.to_owned());
+            return;
+        }
         let lines = self.dialog_lines(message);
         let opened = open_dialog_lines(
             &mut self.workspace,
@@ -38061,6 +38093,7 @@ impl App {
             self.doc.selection.active(),
             self.quick_mask.is_some(),
             crop::status_rect(self.tool, &self.crop),
+            background_psd_check::check_status_text(self.psd_check_worker.is_checking()),
         ) {
             self.push_accessibility();
             self.needs_redraw = true;
@@ -38808,6 +38841,7 @@ impl App {
             self.doc.selection.active(),
             self.quick_mask.is_some(),
             crop::status_rect(self.tool, &self.crop),
+            background_psd_check::check_status_text(self.psd_check_worker.is_checking()),
         ) {
             self.push_accessibility();
         }

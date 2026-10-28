@@ -104,6 +104,12 @@ pub struct StatusInfo {
     /// always ends with [`AUTOMATION_TEXT`], whatever else it shows, so the
     /// indication cannot be hidden behind a notice.
     pub automation: bool,
+    /// A background task the app is running (task 164; the Check PSD
+    /// Compatibility worker): while `Some`, the document label starts with
+    /// this text ([`with_task`]), notice or not, so a sighted user sees that
+    /// something is running. Plain text in a non-live label: the one
+    /// announcement stays the app's own polite status node.
+    pub task: Option<&'static str>,
 }
 
 /// The status bar's automation indicator (task 160).
@@ -354,12 +360,26 @@ pub fn sync_status_bar(
         tree,
         bar.document,
         &with_automation(
-            info.notice
-                .map_or_else(|| document_label_text(info), str::to_owned),
+            with_task(
+                info.notice
+                    .map_or_else(|| document_label_text(info), str::to_owned),
+                info,
+            ),
             info,
         ),
     )?;
     Ok(zoom || document)
+}
+
+/// The running background task's text (task 164) followed by ` · ` and
+/// `text`, so it leads the label and an ellipsis on a narrow bar cuts the
+/// document readout, not the task. Unchanged while no task runs.
+#[must_use]
+pub fn with_task(text: String, info: &StatusInfo) -> String {
+    match info.task {
+        Some(task) => format!("{task} · {text}"),
+        None => text,
+    }
 }
 
 /// `text` followed by the automation indicator while a controller is
@@ -461,6 +481,7 @@ mod tests {
             sample: SampleFormat::F16,
             notice: None,
             automation: false,
+            task: None,
             selection: None,
             quick_mask: false,
             crop: None,
@@ -540,6 +561,7 @@ mod tests {
             sample: aurora_tile::SAMPLE_FORMAT,
             notice: None,
             automation: false,
+            task: None,
             selection: None,
             quick_mask: false,
             crop: None,
@@ -587,6 +609,7 @@ mod tests {
             sample: SampleFormat::F16,
             notice: None,
             automation: false,
+            task: None,
             selection: None,
             quick_mask: false,
             crop: None,
@@ -671,6 +694,7 @@ mod tests {
             sample: aurora_tile::SAMPLE_FORMAT,
             notice: None,
             automation: false,
+            task: None,
             selection: None,
             quick_mask: false,
             crop: Some(rect),
@@ -693,6 +717,7 @@ mod tests {
             quick_mask: false,
             crop: None,
             automation: true,
+            task: None,
         };
         let shown = super::with_automation(
             info.notice
@@ -703,8 +728,100 @@ mod tests {
         assert!(shown.ends_with(super::AUTOMATION_TEXT), "{shown}");
         let off = StatusInfo {
             automation: false,
+            task: None,
             ..info
         };
         assert_eq!(super::with_automation("x".to_owned(), &off), "x");
+    }
+
+    fn task_info(task: Option<&'static str>, notice: Option<&'static str>) -> StatusInfo {
+        StatusInfo {
+            zoom: 1.0,
+            scale_factor: 1.0,
+            document_size: (10, 10),
+            sample: SampleFormat::F16,
+            notice,
+            selection: None,
+            quick_mask: false,
+            crop: None,
+            automation: false,
+            task,
+        }
+    }
+
+    /// Task 164: the running task leads the label, notice or not, and a
+    /// bar with no task reads exactly as before.
+    #[test]
+    fn a_running_task_leads_the_document_label() {
+        let info = task_info(Some("Checking PSD compatibility…"), None);
+        let shown = super::with_task("Document: 10 × 10 px · 16-bit float".to_owned(), &info);
+        assert_eq!(
+            shown,
+            "Checking PSD compatibility… · Document: 10 × 10 px · 16-bit float"
+        );
+        assert_eq!(
+            super::with_task("x".to_owned(), &task_info(None, None)),
+            "x",
+            "no task, no change"
+        );
+    }
+
+    /// Task 164: the status bar widget shows the task text while it runs
+    /// (also under a notice and beside the automation indicator) and drops
+    /// it when the task ends, and the bar stays a non-live region, so the
+    /// text is never announced a second time.
+    #[test]
+    fn the_status_bar_shows_and_clears_the_task_text_without_a_live_region() {
+        let scales = test_scales();
+        let (mut tree, root) = aurora_widgets::widgets::new_tree(taffy::Style::default());
+        let idle = task_info(None, None);
+        let bar = match insert_status_bar(&mut tree, root, &scales, &idle) {
+            Ok(bar) => bar,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let document = |tree: &aurora_widgets::WidgetTree<aurora_widgets::widgets::WidgetKind>| {
+            status_bar_text(tree, bar).map(|(_, document)| document)
+        };
+        let base = document(&tree);
+        let running = task_info(Some("Checking PSD compatibility…"), None);
+        assert!(matches!(
+            sync_status_bar(&mut tree, bar, &running),
+            Ok(true)
+        ));
+        let text = document(&tree).unwrap_or_default();
+        assert!(text.starts_with("Checking PSD compatibility… · "), "{text}");
+        assert!(text.contains("Document: 10 × 10 px"), "{text}");
+        let Some(node) = tree.accessibility(bar.document) else {
+            unreachable!("inserted");
+        };
+        assert_eq!(node.label(), Some(text.as_str()), "the AT text follows");
+        for id in [bar.root, bar.document, bar.zoom] {
+            let live = tree.accessibility(id).and_then(accesskit::Node::live);
+            assert_ne!(live, Some(Live::Polite), "one announcement only");
+            assert_ne!(live, Some(Live::Assertive), "one announcement only");
+        }
+        assert!(matches!(
+            sync_status_bar(&mut tree, bar, &running),
+            Ok(false)
+        ));
+        // Under a notice and beside the automation indicator.
+        let noisy = StatusInfo {
+            automation: true,
+            ..task_info(
+                Some("Checking PSD compatibility…"),
+                Some("A layer is locked."),
+            )
+        };
+        assert!(matches!(sync_status_bar(&mut tree, bar, &noisy), Ok(true)));
+        let text = document(&tree).unwrap_or_default();
+        assert!(
+            text.starts_with("Checking PSD compatibility… · A layer is locked."),
+            "{text}"
+        );
+        assert!(text.ends_with(super::AUTOMATION_TEXT), "{text}");
+        // Ended: gone again.
+        assert!(matches!(sync_status_bar(&mut tree, bar, &idle), Ok(true)));
+        assert_eq!(document(&tree), base);
+        assert!(!document(&tree).unwrap_or_default().contains("Checking"));
     }
 }

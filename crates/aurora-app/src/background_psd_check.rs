@@ -413,11 +413,14 @@ impl PsdCheckWorker {
         self.pending.is_some() || !self.abandoned.is_empty()
     }
 
-    /// Whether a check is running and its result is wanted: what the
-    /// "Checking …" indicator shows.
+    /// Whether a check is actually running and its result is wanted: what
+    /// the "Checking …" indicator shows. False once the result has arrived
+    /// and is only waiting for a dialog to close (task 164; the result is
+    /// seen by [`Self::has_result`]). Not what [`Self::is_busy`] means: a
+    /// waiting result still counts as pending there.
     #[must_use]
     pub(crate) fn is_checking(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() && self.ready.is_none()
     }
 
     /// The running check's document and revision.
@@ -534,6 +537,46 @@ pub(crate) fn window_title_with_check(
         return format!("{CHECKING_TEXT} \u{2014} Aurora");
     }
     crate::window_title(opening, document)
+}
+
+/// The status bar's task text for the check worker's state (task 164):
+/// [`CHECKING_TEXT`] while a check is running and its result wanted
+/// ([`PsdCheckWorker::is_checking`]), nothing otherwise (finished,
+/// cancelled, failed to start). Plain text in the non-live status bar; the
+/// one live announcement stays [`with_check_status`]'s node.
+#[must_use]
+pub(crate) fn check_status_text(checking: bool) -> Option<&'static str> {
+    checking.then_some(CHECKING_TEXT)
+}
+
+/// A failure dialog that could not open because another dialog held the
+/// modal slot (task 164): kept until the slot is free, like a finished
+/// check's result is. One slot; a newer failure replaces an older one.
+#[derive(Debug, Default)]
+pub(crate) struct DeferredDialog {
+    slot: Option<(&'static str, String)>,
+}
+
+impl DeferredDialog {
+    /// Keeps `title` and `message` to show once no dialog is open.
+    pub(crate) fn queue(&mut self, title: &'static str, message: String) {
+        self.slot = Some((title, message));
+    }
+
+    /// The queued dialog if one waits and no modal is open; takes it.
+    pub(crate) fn take_if_free(&mut self, modal_open: bool) -> Option<(&'static str, String)> {
+        if modal_open {
+            return None;
+        }
+        self.slot.take()
+    }
+
+    /// Whether a dialog waits.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn is_queued(&self) -> bool {
+        self.slot.is_some()
+    }
 }
 
 /// The accessibility node id of the "Checking …" status. Not a widget:
@@ -661,7 +704,15 @@ pub(crate) fn background_check_step(host: &mut impl CheckHost) -> CheckStep {
     if host.modal_open() {
         // Deferred only when there is something to show; a check still
         // running under a dialog is Idle, so the loop is not kept awake.
-        return if host.check_worker().has_result() {
+        let was_checking = host.check_worker().is_checking();
+        let arrived = host.check_worker().has_result();
+        if was_checking && !host.check_worker().is_checking() {
+            // Task 164: the result arrived but waits under the dialog, so
+            // the indicator stops saying a check is running. Once, on the
+            // transition (a later turn finds `was_checking` false).
+            host.show_check_state();
+        }
+        return if arrived {
             CheckStep::Deferred
         } else {
             CheckStep::Idle
