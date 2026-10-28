@@ -129,7 +129,8 @@ fn every_note_has_the_kind_the_table_names() {
 /// variant lines as the table has distinct variant names.
 #[test]
 fn the_table_covers_every_note_variant() {
-    let source = include_str!("../psd.rs");
+    // A Windows checkout may hold CRLF line endings.
+    let source = include_str!("../psd.rs").replace("\r\n", "\n");
     let start = source.find("enum Note {").unwrap_or(0);
     let body = source.get(start..).unwrap_or_default();
     let end = body.find("\n}\n").unwrap_or(body.len());

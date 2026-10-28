@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.298.1] - 2026-10-28
+
+### Fixed
+
+- PSD note kind test tolerates CRLF line endings
+
 ## [0.298.0] - 2026-10-27
 
 ### Changed
