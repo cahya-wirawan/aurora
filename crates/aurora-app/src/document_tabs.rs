@@ -279,6 +279,10 @@ pub(crate) fn bind_active_document(cx: &mut SwitchContext<'_>) {
         cx.doc.selection.active(),
         false,
         None,
+        // A running Check PSD Compatibility belonged to the outgoing
+        // document and is cancelled by the next loop turn's poll
+        // (`background_check_step`), which re-syncs the bar.
+        None,
     );
 }
 

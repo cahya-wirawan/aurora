@@ -536,6 +536,45 @@ pub(crate) fn window_title_with_check(
     crate::window_title(opening, document)
 }
 
+/// The status bar's task text for the check worker's state (task 164):
+/// [`CHECKING_TEXT`] while a check is running and its result wanted
+/// ([`PsdCheckWorker::is_checking`]), nothing otherwise (finished,
+/// cancelled, failed to start). Plain text in the non-live status bar; the
+/// one live announcement stays [`with_check_status`]'s node.
+#[must_use]
+pub(crate) fn check_status_text(checking: bool) -> Option<&'static str> {
+    checking.then_some(CHECKING_TEXT)
+}
+
+/// A failure dialog that could not open because another dialog held the
+/// modal slot (task 164): kept until the slot is free, like a finished
+/// check's result is. One slot; a newer failure replaces an older one.
+#[derive(Debug, Default)]
+pub(crate) struct DeferredDialog {
+    slot: Option<(&'static str, String)>,
+}
+
+impl DeferredDialog {
+    /// Keeps `title` and `message` to show once no dialog is open.
+    pub(crate) fn queue(&mut self, title: &'static str, message: String) {
+        self.slot = Some((title, message));
+    }
+
+    /// The queued dialog if one waits and no modal is open; takes it.
+    pub(crate) fn take_if_free(&mut self, modal_open: bool) -> Option<(&'static str, String)> {
+        if modal_open {
+            return None;
+        }
+        self.slot.take()
+    }
+
+    /// Whether a dialog waits.
+    #[must_use]
+    pub(crate) fn is_queued(&self) -> bool {
+        self.slot.is_some()
+    }
+}
+
 /// The accessibility node id of the "Checking …" status. Not a widget:
 /// widget ids count up from zero, and `u64::MAX` is the "Opening …" node.
 pub(crate) const CHECK_STATUS_NODE: accesskit::NodeId = accesskit::NodeId(u64::MAX - 1);

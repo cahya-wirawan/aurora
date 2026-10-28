@@ -891,3 +891,185 @@ fn nyepi_check_snapshot_cost() {
         }
     }
 }
+
+// ---- task 164: the status-bar indicator and the queued failure dialog ----
+
+#[test]
+fn the_status_text_is_the_checking_text_exactly_while_a_check_runs() {
+    assert_eq!(
+        check_status_text(true),
+        Some("Checking PSD compatibility\u{2026}")
+    );
+    assert_eq!(check_status_text(false), None);
+    assert_eq!(check_status_text(true), Some(CHECKING_TEXT));
+}
+
+/// The text follows the worker's real state: running shows it, a cancel
+/// and a taken result clear it.
+#[test]
+fn the_status_text_follows_the_worker_through_start_cancel_and_finish() {
+    let mut worker = PsdCheckWorker::default();
+    assert_eq!(check_status_text(worker.is_checking()), None, "idle");
+    let (release, woken, _) = gated_start(&mut worker, meta(DocumentId::next(), 1));
+    assert_eq!(
+        check_status_text(worker.is_checking()),
+        Some(CHECKING_TEXT),
+        "running"
+    );
+    assert!(worker.cancel());
+    assert_eq!(check_status_text(worker.is_checking()), None, "cancelled");
+    let _ = release.send(());
+    wait(&woken);
+
+    let (release, woken, _) = gated_start(&mut worker, meta(DocumentId::next(), 1));
+    assert_eq!(check_status_text(worker.is_checking()), Some(CHECKING_TEXT));
+    let _ = release.send(());
+    wait(&woken);
+    let deadline = std::time::Instant::now() + PATIENCE;
+    let mut taken = false;
+    while std::time::Instant::now() < deadline {
+        if worker.take_finished().is_some() {
+            taken = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(taken, "the result arrives");
+    assert_eq!(check_status_text(worker.is_checking()), None, "finished");
+}
+
+/// The real status bar of the startup workspace shows the text through the
+/// app's own sync while a check runs, keeps it under a notice, and drops it
+/// when the check ends; the bar itself stays out of the live regions.
+#[test]
+fn the_workspace_status_bar_shows_and_clears_the_checking_text() {
+    let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+    workspace.tree.compute_layout(1000.0, 800.0);
+    let view = aurora_ui::CanvasView::new();
+    let sync =
+        |workspace: &mut aurora_ui::Workspace, notice: Option<&'static str>, checking: bool| {
+            crate::sync_status_bar_notice(
+                workspace,
+                &view,
+                (4000, 3000),
+                1.0,
+                notice,
+                None,
+                false,
+                None,
+                check_status_text(checking),
+            )
+        };
+    let document = |workspace: &aurora_ui::Workspace| {
+        aurora_ui::status_bar_text(&workspace.tree, workspace.status_bar)
+            .map(|(_, document)| document)
+            .unwrap_or_default()
+    };
+    assert!(sync(&mut workspace, None, false));
+    let idle = document(&workspace);
+    assert!(!idle.contains("Checking"), "{idle}");
+
+    assert!(
+        sync(&mut workspace, None, true),
+        "starting changes the text"
+    );
+    let running = document(&workspace);
+    assert_eq!(running, format!("{CHECKING_TEXT} \u{b7} {idle}"));
+    assert!(
+        !sync(&mut workspace, None, true),
+        "unchanged touches nothing"
+    );
+    for id in [workspace.status_bar.root, workspace.status_bar.document] {
+        let live = workspace
+            .tree
+            .accessibility(id)
+            .and_then(accesskit::Node::live);
+        assert!(
+            !matches!(
+                live,
+                Some(accesskit::Live::Polite | accesskit::Live::Assertive)
+            ),
+            "the status bar adds no second announcement"
+        );
+    }
+
+    assert!(sync(&mut workspace, Some("A layer is locked."), true));
+    let noisy = document(&workspace);
+    assert!(
+        noisy.starts_with(&format!("{CHECKING_TEXT} \u{b7} A layer is locked.")),
+        "{noisy}"
+    );
+
+    assert!(sync(&mut workspace, None, false), "ending changes the text");
+    assert_eq!(document(&workspace), idle, "cleared");
+}
+
+/// One announcement: the polite status node exists exactly while checking
+/// and the status bar adds none.
+#[test]
+fn only_the_check_status_node_is_a_live_announcement() {
+    let mut workspace = aurora_ui::build_workspace(&crate::test_workspace_scales());
+    workspace.tree.compute_layout(1000.0, 800.0);
+    let focused = workspace.root;
+    let live_count = |checking: bool| {
+        let update = with_check_status(
+            workspace.tree.accessibility_update(focused),
+            workspace.tree.root(),
+            checking,
+        );
+        update
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.live() == Some(accesskit::Live::Polite))
+            .count()
+    };
+    assert_eq!(live_count(true), live_count(false) + 1);
+}
+
+#[test]
+fn a_deferred_failure_dialog_waits_for_the_modal_slot_and_shows_once() {
+    let mut deferred = DeferredDialog::default();
+    assert!(!deferred.is_queued());
+    assert_eq!(deferred.take_if_free(false), None, "nothing queued");
+    deferred.queue(crate::psd_save::PSD_CHECK_FAILED_TITLE, "first".to_owned());
+    assert!(deferred.is_queued());
+    assert_eq!(deferred.take_if_free(true), None, "a dialog is still open");
+    assert!(deferred.is_queued(), "kept while the slot is taken");
+    // A newer failure replaces the older one.
+    deferred.queue(crate::psd_save::PSD_CHECK_FAILED_TITLE, "second".to_owned());
+    assert_eq!(
+        deferred.take_if_free(false),
+        Some((crate::psd_save::PSD_CHECK_FAILED_TITLE, "second".to_owned()))
+    );
+    assert!(!deferred.is_queued());
+    assert_eq!(deferred.take_if_free(false), None, "shown once");
+}
+
+#[test]
+fn the_app_wires_the_status_text_and_the_queued_failure_dialog() {
+    let lib = include_str!("lib.rs");
+    assert_eq!(
+        lib.matches("background_psd_check::check_status_text(self.psd_check_worker.is_checking())")
+            .count(),
+        2,
+        "the per-turn and the per-frame status sync both pass the task text"
+    );
+    let start = lib
+        .find("fn show_check_state(&mut self) {\n        self.apply_window_title();")
+        .unwrap_or(0);
+    let body = &lib[start..start + 500.min(lib.len() - start)];
+    assert!(body.contains("self.sync_status_bar_now()"), "{body}");
+
+    let start = lib.find("fn open_psd_check_dialog(").unwrap_or(0);
+    let body = &lib[start..start + 700.min(lib.len() - start)];
+    assert!(body.contains("if self.dialog.is_some()"), "{body}");
+    assert!(body.contains("self.deferred_check_dialog.queue("), "{body}");
+
+    let start = lib.find("fn poll_psd_check(&mut self)").unwrap_or(0);
+    let body = &lib[start..start + 900.min(lib.len() - start)];
+    assert!(
+        body.contains(".take_if_free(self.dialog.is_some())"),
+        "{body}"
+    );
+    assert!(body.contains("self.open_psd_check_dialog(title, &message)"));
+}

@@ -500,6 +500,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         sample: aurora_tile::SAMPLE_FORMAT,
         notice: None,
         automation: false,
+        task: None,
     };
     let status_bar = match insert_status_bar(&mut tree, canvas_column, scales, &initial) {
         Ok(bar) => bar,
