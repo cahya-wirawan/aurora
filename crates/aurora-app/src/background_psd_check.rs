@@ -569,6 +569,7 @@ impl DeferredDialog {
     }
 
     /// Whether a dialog waits.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn is_queued(&self) -> bool {
         self.slot.is_some()
