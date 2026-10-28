@@ -5,7 +5,8 @@
 #
 #   scripts/mcp_bridge_smoke.sh [path-to-aurora-app path-to-aurora-cli]
 #
-# Needs Xvfb (or a real DISPLAY: set SMOKE_USE_DISPLAY=1). Kills only the
+# Needs Xvfb (or a real DISPLAY: set SMOKE_USE_DISPLAY=1; on a Mac the screen
+# must be unlocked, or ui_screenshot reports no frame was drawn). Kills only the
 # processes it started. Exit 0 = every check passed.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -76,7 +77,7 @@ tools = {t["name"] for t in rpc("tools/list")["result"]["tools"]}
 check("ui tools are listed", {"ui_screenshot", "ui_inspect", "ui_pointer", "ui_key", "ui_menu", "ui_dialog"} <= tools)
 shot = tool("ui_screenshot", {"max_side": 800})
 img = shot["result"]["content"][0]
-check("screenshot is a PNG", img.get("type") == "image" and base64.b64decode(img["data"]).startswith(b"\x89PNG"), shot)
+check("screenshot is a PNG", img.get("type") == "image" and base64.b64decode(img.get("data", "")).startswith(b"\x89PNG"), shot)
 insp = json.loads(tool("ui_inspect")["result"]["content"][0]["text"])
 check("ui_inspect lists widgets", len(insp["nodes"]) > 10, insp.get("window"))
 def jtext(r):
@@ -103,9 +104,12 @@ def find(nodes, name, role=None):
         if nd.get("label") == name and (role is None or nd.get("role") == role):
             return nd
 nodes = jtext(tool("ui_inspect"))["nodes"]
+import platform
+# macOS uses its native menu bar; the in-window one is off there.
 file_btn = find(nodes, "File", "Button")
-check("menu bar has a File button", file_btn is not None)
-if file_btn is None:
+if platform.system() != "Darwin":
+    check("menu bar has a File button", file_btn is not None)
+if file_btn is None and platform.system() != "Darwin":
     print("buttons:", sorted({nd.get("label") for nd in nodes if nd.get("role") == "Button"} - {None})[:40])
 if file_btn:
     tool("ui_pointer", {"action": "click", "id": file_btn["id"]})
@@ -127,8 +131,9 @@ if file_btn:
           alive.get("result", {}).get("isError") is not True and p.poll() is None, alive)
     status = jtext(tool("ui_inspect")).get("status", "")
     print("status after the quit click:", status)
-open("/tmp/mcp_bridge_smoke.png", "wb").write(base64.b64decode(img["data"]))
-print("screenshot written to /tmp/mcp_bridge_smoke.png")
+if img.get("data"):
+    open("/tmp/mcp_bridge_smoke.png", "wb").write(base64.b64decode(img["data"]))
+    print("screenshot written to /tmp/mcp_bridge_smoke.png")
 p.stdin.close(); p.wait(timeout=10)
 sys.exit(0 if ok else 1)
 PY
