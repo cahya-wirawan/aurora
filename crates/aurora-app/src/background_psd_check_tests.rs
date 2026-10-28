@@ -553,10 +553,60 @@ fn a_finished_check_waits_while_a_dialog_is_open() {
     wait(&woken);
     assert_eq!(background_check_step(&mut host), CheckStep::Deferred);
     assert!(host.shown.is_empty());
-    assert!(host.worker.is_checking(), "still indicated until shown");
+    assert!(
+        !host.worker.is_checking(),
+        "the indicator stops once the result has arrived (task 164)"
+    );
+    assert!(host.worker.is_busy(), "but a second check is still refused");
     host.modal = false;
     assert_eq!(background_check_step(&mut host), CheckStep::Finished);
     assert_eq!(host.shown.len(), 1);
+}
+
+/// Task 164: a result waiting under a dialog clears the indicator exactly
+/// once, on the transition, and is then shown once when the dialog closes.
+#[test]
+fn the_indicator_clears_when_the_result_waits_under_a_dialog_and_the_result_shows_once() {
+    let doc = DocumentId::next();
+    let mut host = Host::new(doc);
+    let (release, woken, _) = gated_start(&mut host.worker, meta(doc, 1));
+    assert_eq!(background_check_step(&mut host), CheckStep::Idle);
+    assert!(host.worker.is_checking());
+    host.modal = true;
+    let _ = release.send(());
+    wait(&woken);
+    let before = host.states;
+    assert_eq!(background_check_step(&mut host), CheckStep::Deferred);
+    assert!(!host.worker.is_checking(), "cleared");
+    assert_eq!(host.states, before + 1, "refreshed on the transition");
+    for _ in 0..3 {
+        assert_eq!(background_check_step(&mut host), CheckStep::Deferred);
+    }
+    assert_eq!(host.states, before + 1, "not refreshed again every turn");
+    assert!(host.shown.is_empty());
+    host.modal = false;
+    assert_eq!(background_check_step(&mut host), CheckStep::Finished);
+    assert_eq!(host.shown.len(), 1, "shown once");
+    assert_eq!(background_check_step(&mut host), CheckStep::Idle);
+    assert_eq!(host.shown.len(), 1);
+}
+
+/// Task 164: a worker still running under a dialog keeps the indicator and
+/// refreshes nothing.
+#[test]
+fn the_indicator_stays_while_the_worker_still_runs_under_a_dialog() {
+    let doc = DocumentId::next();
+    let mut host = Host::new(doc);
+    host.modal = true;
+    let (release, woken, _) = gated_start(&mut host.worker, meta(doc, 1));
+    let before = host.states;
+    for _ in 0..3 {
+        assert_eq!(background_check_step(&mut host), CheckStep::Idle);
+        assert!(host.worker.is_checking(), "still running");
+    }
+    assert_eq!(host.states, before, "no refresh while nothing changed");
+    let _ = release.send(());
+    wait(&woken);
 }
 
 #[test]
@@ -1054,22 +1104,31 @@ fn the_app_wires_the_status_text_and_the_queued_failure_dialog() {
         2,
         "the per-turn and the per-frame status sync both pass the task text"
     );
-    let start = lib
-        .find("fn show_check_state(&mut self) {\n        self.apply_window_title();")
-        .unwrap_or(0);
-    let body = &lib[start..start + 500.min(lib.len() - start)];
+    let body = fn_body(
+        &lib,
+        "fn show_check_state(&mut self) {\n        self.apply_window_title();",
+    );
     assert!(body.contains("self.sync_status_bar_now()"), "{body}");
 
-    let start = lib.find("fn open_psd_check_dialog(").unwrap_or(0);
-    let body = &lib[start..start + 700.min(lib.len() - start)];
+    let body = fn_body(&lib, "fn open_psd_check_dialog(");
     assert!(body.contains("if self.dialog.is_some()"), "{body}");
     assert!(body.contains("self.deferred_check_dialog.queue("), "{body}");
 
-    let start = lib.find("fn poll_psd_check(&mut self)").unwrap_or(0);
-    let body = &lib[start..start + 900.min(lib.len() - start)];
+    let body = fn_body(&lib, "fn poll_psd_check(&mut self)");
     assert!(
         body.contains(".take_if_free(self.dialog.is_some())"),
         "{body}"
     );
     assert!(body.contains("self.open_psd_check_dialog(title, &message)"));
+}
+
+/// The source of the `App` method starting at `marker`, up to the next
+/// method (`\n    fn `), CRLF-proof when the caller normalised `lib`.
+fn fn_body<'a>(lib: &'a str, marker: &str) -> &'a str {
+    let start = lib.find(marker).unwrap_or(0);
+    let rest = &lib[start..];
+    let end = rest[marker.len().min(rest.len())..]
+        .find("\n    fn ")
+        .map_or(rest.len(), |at| at + marker.len());
+    &rest[..end]
 }

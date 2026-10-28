@@ -413,11 +413,14 @@ impl PsdCheckWorker {
         self.pending.is_some() || !self.abandoned.is_empty()
     }
 
-    /// Whether a check is running and its result is wanted: what the
-    /// "Checking …" indicator shows.
+    /// Whether a check is actually running and its result is wanted: what
+    /// the "Checking …" indicator shows. False once the result has arrived
+    /// and is only waiting for a dialog to close (task 164; the result is
+    /// seen by [`Self::has_result`]). Not what [`Self::is_busy`] means: a
+    /// waiting result still counts as pending there.
     #[must_use]
     pub(crate) fn is_checking(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() && self.ready.is_none()
     }
 
     /// The running check's document and revision.
@@ -701,7 +704,15 @@ pub(crate) fn background_check_step(host: &mut impl CheckHost) -> CheckStep {
     if host.modal_open() {
         // Deferred only when there is something to show; a check still
         // running under a dialog is Idle, so the loop is not kept awake.
-        return if host.check_worker().has_result() {
+        let was_checking = host.check_worker().is_checking();
+        let arrived = host.check_worker().has_result();
+        if was_checking && !host.check_worker().is_checking() {
+            // Task 164: the result arrived but waits under the dialog, so
+            // the indicator stops saying a check is running. Once, on the
+            // transition (a later turn finds `was_checking` false).
+            host.show_check_state();
+        }
+        return if arrived {
             CheckStep::Deferred
         } else {
             CheckStep::Idle

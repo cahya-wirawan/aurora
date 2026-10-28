@@ -1997,9 +1997,14 @@ fn the_check_never_touches_the_pending_save_or_the_target() {
 fn a_check_that_cannot_open_its_dialog_leaves_a_calm_notice() {
     // `App::open_psd_check_dialog` needs a window; pin its fallback by source
     // and the notice's text by value.
-    let lib = include_str!("lib.rs");
+    let lib = include_str!("lib.rs").replace("\r\n", "\n");
     let start = lib.find("fn open_psd_check_dialog").unwrap_or_default();
-    let body = &lib[start..start + 900.min(lib.len() - start)];
+    let rest = &lib[start..];
+    // Up to the next method, not a fixed byte count.
+    let end = rest["fn open_psd_check_dialog".len()..]
+        .find("\n    fn ")
+        .map_or(rest.len(), |at| at + "fn open_psd_check_dialog".len());
+    let body = &rest[..end];
     assert!(body.contains("self.colour_notice(psd_save::PSD_CHECK_BUSY_NOTICE)"));
     assert!(crate::psd_save::PSD_CHECK_BUSY_NOTICE.contains("dialog is open"));
 }
