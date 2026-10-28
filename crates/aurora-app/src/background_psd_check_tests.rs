@@ -1047,7 +1047,7 @@ fn a_deferred_failure_dialog_waits_for_the_modal_slot_and_shows_once() {
 
 #[test]
 fn the_app_wires_the_status_text_and_the_queued_failure_dialog() {
-    let lib = include_str!("lib.rs");
+    let lib = include_str!("lib.rs").replace("\r\n", "\n");
     assert_eq!(
         lib.matches("background_psd_check::check_status_text(self.psd_check_worker.is_checking())")
             .count(),
