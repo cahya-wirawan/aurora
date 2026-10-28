@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.299.0] - 2026-10-28
+
+### Changed
+
+- Records for task 164: the status-bar indicator for the PSD check
+
 ## [0.298.1] - 2026-10-28
 
 ### Fixed
