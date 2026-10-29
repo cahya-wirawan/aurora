@@ -1,5 +1,5 @@
 //! The bridge listener against real sockets: handshake, authentication,
-//! lockout, limits, single controller, loopback-only.
+//! no lockout, limits, single controller, loopback-only.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -49,8 +49,7 @@ fn fast() -> ServerConfig {
     ServerConfig {
         auth_timeout: Duration::from_millis(400),
         idle_timeout: Duration::from_secs(5),
-        lockout_base: Duration::from_millis(300),
-        lockout_max: Duration::from_millis(600),
+        fail_delay: Duration::from_millis(30),
         ..ServerConfig::default()
     }
 }
@@ -182,10 +181,7 @@ fn a_request_without_a_handshake_is_refused_and_never_dispatched() {
 
 #[test]
 fn garbage_and_wrong_shapes_are_refused() {
-    let (server, token, echo) = start(ServerConfig {
-        free_failures: 100,
-        ..fast()
-    });
+    let (server, token, echo) = start(ServerConfig { ..fast() });
     for bad in [
         "garbage\n".to_owned(),
         "[]\n".to_owned(),
@@ -272,10 +268,7 @@ fn an_oversized_handshake_line_is_refused() {
 
 #[test]
 fn an_http_request_is_dropped_without_an_answer_and_does_not_count_as_a_failure() {
-    let (server, token, _) = start(ServerConfig {
-        free_failures: 1,
-        ..fast()
-    });
+    let (server, token, _) = start(ServerConfig { ..fast() });
     for _ in 0..6 {
         let mut s = raw(&server);
         s.write_all(b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n")
@@ -289,27 +282,6 @@ fn an_http_request_is_dropped_without_an_answer_and_does_not_count_as_a_failure(
         );
     }
     // Six probes did not lock the real controller out.
-    BridgeClient::connect_to(server.local_addr(), &token, Duration::from_secs(3)).unwrap();
-}
-
-#[test]
-fn repeated_failures_lock_connections_out_for_a_while() {
-    let (server, token, _) = start(ServerConfig {
-        free_failures: 2,
-        ..fast()
-    });
-    let wrong = "1".repeat(64);
-    for _ in 0..3 {
-        let _ = BridgeClient::connect_to(server.local_addr(), &wrong, Duration::from_secs(3));
-    }
-    // Locked out: even the right token is refused now.
-    let err =
-        BridgeClient::connect_to(server.local_addr(), &token, Duration::from_secs(3)).unwrap_err();
-    assert!(
-        err.to_string().contains("too many failed attempts"),
-        "{err}"
-    );
-    std::thread::sleep(Duration::from_millis(1100));
     BridgeClient::connect_to(server.local_addr(), &token, Duration::from_secs(3)).unwrap();
 }
 
@@ -439,10 +411,7 @@ fn the_client_never_dials_a_non_loopback_address() {
 
 #[test]
 fn junk_that_is_not_a_handshake_never_locks_the_real_controller_out() {
-    let (server, token, _) = start(ServerConfig {
-        free_failures: 1,
-        ..fast()
-    });
+    let (server, token, _) = start(ServerConfig { ..fast() });
     let junk: Vec<Vec<u8>> = vec![
         // A TLS ClientHello's first bytes.
         vec![
@@ -469,20 +438,146 @@ fn junk_that_is_not_a_handshake_never_locks_the_real_controller_out() {
     BridgeClient::connect_to(server.local_addr(), &token, Duration::from_secs(3)).unwrap();
 }
 
+// ---- task 165: no lockout, no slot starvation ----
+
 #[test]
-fn only_a_well_formed_hello_with_a_wrong_token_counts() {
+fn the_production_defaults_are_short_and_roomy() {
+    let config = ServerConfig::default();
+    assert!(config.auth_timeout <= Duration::from_secs(2));
+    assert!(config.max_unauthenticated >= 8);
+    assert!(config.fail_delay > Duration::ZERO);
+}
+
+#[test]
+fn repeated_wrong_tokens_never_lock_the_right_one_out() {
+    let (server, token, _) = start(fast());
+    let wrong = "1".repeat(64);
+    for round in 0..40 {
+        let err = BridgeClient::connect_to(server.local_addr(), &wrong, Duration::from_secs(3))
+            .err()
+            .expect("a wrong token is refused");
+        assert!(err.to_string().contains("authentication failed"), "{err}");
+        if round % 8 == 7 {
+            // Right in the middle of the stream of failures.
+            let mut client =
+                BridgeClient::connect_to(server.local_addr(), &token, Duration::from_secs(3))
+                    .unwrap();
+            client
+                .call("echo", json!({}), Duration::from_secs(3))
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_concurrent_wrong_token_flood_does_not_keep_the_controller_out() {
+    // Four flooders, each with one connection open at a time, against the
+    // production number of slots: the controller's connection always fits.
+    let (server, token, _) = start(fast());
+    let addr = server.local_addr();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flooders: Vec<_> = (0..4)
+        .map(|n| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let wrong = format!("{n}").repeat(64);
+                let wrong = &wrong[..64];
+                while !stop.load(Ordering::SeqCst) {
+                    let _ = BridgeClient::connect_to(addr, wrong, Duration::from_secs(1));
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(150));
+    let mut connected = 0;
+    for _ in 0..10 {
+        // A correct token on a fresh connection is never refused for having
+        // been preceded by failures.
+        if let Ok(mut client) = BridgeClient::connect_to(addr, &token, Duration::from_secs(3)) {
+            client
+                .call("echo", json!({}), Duration::from_secs(3))
+                .unwrap();
+            connected += 1;
+        }
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    stop.store(true, Ordering::SeqCst);
+    for flooder in flooders {
+        flooder.join().unwrap();
+    }
+    assert!(
+        connected == 10,
+        "the right token got in {connected} of 10 times during a flood"
+    );
+}
+
+#[test]
+fn silent_connections_cannot_hold_the_handshake_slots() {
     let (server, token, _) = start(ServerConfig {
-        free_failures: 1,
+        max_unauthenticated: 3,
+        auth_timeout: Duration::from_secs(30),
         ..fast()
     });
-    let wrong = "2".repeat(64);
-    for _ in 0..3 {
-        let _ = BridgeClient::connect_to(server.local_addr(), &wrong, Duration::from_secs(3));
-    }
-    let err =
-        BridgeClient::connect_to(server.local_addr(), &token, Duration::from_secs(3)).unwrap_err();
+    // Far more silent connections than slots, each held open.
+    let mut silent: Vec<TcpStream> = (0..12).map(|_| raw(&server)).collect();
+    let started = Instant::now();
+    let mut client =
+        BridgeClient::connect_to(server.local_addr(), &token, Duration::from_secs(3)).unwrap();
+    client
+        .call("echo", json!({}), Duration::from_secs(3))
+        .unwrap();
     assert!(
-        err.to_string().contains("too many failed attempts"),
-        "{err}"
+        started.elapsed() < Duration::from_secs(2),
+        "the controller waited behind silent connections"
+    );
+    // The oldest silent connections were dropped to make room: closed
+    // without an answer, long before the 30 s deadline.
+    let oldest = silent.first_mut().unwrap();
+    oldest
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = [0_u8; 8];
+    let n = oldest.read(&mut buf).unwrap_or(0);
+    assert_eq!(n, 0, "closed with nothing sent");
+}
+
+#[test]
+fn a_connection_that_has_failed_is_dropped_before_one_still_waiting() {
+    let (server, token, _) = start(ServerConfig {
+        max_unauthenticated: 2,
+        fail_delay: Duration::from_secs(5),
+        ..fast()
+    });
+    let wrong = "3".repeat(64);
+    let mut failing: Vec<TcpStream> = Vec::new();
+    for _ in 0..2 {
+        let mut s = raw(&server);
+        s.write_all(hello(&wrong).as_bytes()).unwrap();
+        failing.push(s);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    BridgeClient::connect_to(server.local_addr(), &token, Duration::from_secs(3)).unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the right token waited for the failing connections' delay"
+    );
+}
+
+#[test]
+fn a_wrong_token_is_answered_only_after_the_fixed_delay() {
+    let (server, _, _) = start(ServerConfig {
+        fail_delay: Duration::from_millis(300),
+        ..fast()
+    });
+    let mut s = raw(&server);
+    let started = Instant::now();
+    s.write_all(hello(&"4".repeat(64)).as_bytes()).unwrap();
+    let line = read_all_line(&mut s);
+    assert!(line.contains("authentication failed"), "{line}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "answered after {:?}",
+        started.elapsed()
     );
 }

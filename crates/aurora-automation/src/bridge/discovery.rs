@@ -41,6 +41,9 @@ pub const FILE_PREFIX: &str = "aurora-bridge-";
 /// Environment variable overriding the default directory (tests, and a user
 /// who wants the files elsewhere; the directory is still verified).
 pub const DIR_ENV: &str = "AURORA_BRIDGE_DIR";
+/// The suffix of the temporary file a token rotation writes before renaming
+/// it over the discovery file.
+const TEMP_SUFFIX: &str = ".tmp";
 /// Discovery files are tiny; anything larger is not one.
 pub const MAX_DISCOVERY_BYTES: u64 = 4096;
 
@@ -282,6 +285,51 @@ impl Published {
     }
 }
 
+impl Published {
+    /// Replaces the discovery file's contents with `record` (same pid, port
+    /// and name; a new token), atomically: the new text is written to a
+    /// private temporary file beside it and renamed over it, so a reader
+    /// sees the old file or the new one, never half of either. The lock is
+    /// untouched.
+    ///
+    /// # Errors
+    /// The record is invalid or names another process, or a write failed;
+    /// the old file is then still in place.
+    pub fn rewrite(&mut self, record: &Discovery) -> io::Result<()> {
+        record
+            .validate()
+            .map_err(|m| io::Error::new(io::ErrorKind::InvalidInput, m))?;
+        if self.json.file_name().and_then(|n| n.to_str()) != Some(json_name(record.pid).as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the record names another process than this discovery file",
+            ));
+        }
+        let temp = self
+            .json
+            .with_file_name(format!("{}{TEMP_SUFFIX}", json_name(record.pid)));
+        // A leftover from an earlier failed rewrite is ours: replace it.
+        let _ = std::fs::remove_file(&temp);
+        let mut options = private_options();
+        options.create_new(true);
+        let mut file = options.open(&temp)?;
+        let written = (|| {
+            make_owner_only(&file)?;
+            let text =
+                serde_json::to_string(record).map_err(|e| io::Error::other(e.to_string()))?;
+            file.write_all(text.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temp, &self.json)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        written
+    }
+}
+
 impl Drop for Published {
     fn drop(&mut self) {
         self.remove();
@@ -407,6 +455,31 @@ pub fn publish(dir: &Path, record: &Discovery) -> io::Result<Published> {
     Ok(published)
 }
 
+/// Gives the running bridge a fresh token: writes the new discovery file
+/// first, and only when that succeeded makes the server accept the new
+/// token (so a failed write leaves the old file and the old token, which
+/// still agree). The connected controller is untouched; a connection that
+/// presents the old token is refused from now on.
+///
+/// `record` is updated to the new token on success.
+///
+/// # Errors
+/// A token could not be generated or the file could not be rewritten
+/// (nothing changed).
+pub fn rotate_token(
+    server: &super::server::BridgeServer,
+    published: &mut Published,
+    record: &mut Discovery,
+) -> io::Result<()> {
+    let fresh = token::generate().map_err(io::Error::other)?;
+    let mut next = record.clone();
+    next.token = fresh;
+    published.rewrite(&next)?;
+    server.set_token(&next.token)?;
+    *record = next;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Reading and sweeping
 // ---------------------------------------------------------------------------
@@ -507,6 +580,33 @@ pub fn read_file(path: &Path) -> Result<Discovery, DiscoveryError> {
     Ok(record)
 }
 
+/// [`read_file`] plus the liveness check [`find_running`] applies: the lock
+/// file beside it, named for the record's pid, must be **held** (a live app).
+/// A discovery file whose app is gone (a crash, a SIGTERM) can name a port a
+/// different local process now owns; this keeps the token from being sent
+/// there.
+///
+/// # Errors
+/// [`DiscoveryError::Unusable`] when the file is unusable or stale.
+pub fn read_live(path: &Path) -> Result<Discovery, DiscoveryError> {
+    let record = read_file(path)?;
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if lock_state(&dir.join(lock_name(record.pid))) != LockState::Held {
+        return Err(DiscoveryError::Unusable(format!(
+            "{} is stale: no running Aurora (pid {}) holds its lock, so the token in it is not \
+             sent to whatever may be listening on port {} now. Start the app with --mcp-bridge \
+             again, or leave out --discovery to find the running app",
+            path.display(),
+            record.pid,
+            record.port
+        )));
+    }
+    Ok(record)
+}
+
 /// What a sweep did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepReport {
@@ -532,6 +632,17 @@ pub fn sweep_stale(dir: &Path) -> SweepReport {
             } else {
                 report.skipped += 1;
             }
+        } else if let Some(pid) = name
+            .strip_suffix(TEMP_SUFFIX)
+            .and_then(|stem| pid_of(stem, ".json"))
+        {
+            // A token rotation that died between writing and renaming: its
+            // owner must be gone (the lock can be taken, or there is none).
+            if lock_state(&dir.join(lock_name(pid))) != LockState::Held
+                && remove_stale_temp(&entry.path())
+            {
+                report.removed += 1;
+            }
         } else if let Some(pid) = pid_of(name, ".lock") {
             // An orphan lock file: its json is gone (a crash between the
             // steps, or a half-finished sweep).
@@ -542,6 +653,23 @@ pub fn sweep_stale(dir: &Path) -> SweepReport {
         }
     }
     report
+}
+
+/// Removes a leftover rotation temp file: a regular, small file of ours.
+fn remove_stale_temp(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.uid() != my_uid() {
+            return false;
+        }
+    }
+    meta.file_type().is_file()
+        && meta.len() <= MAX_DISCOVERY_BYTES
+        && std::fs::remove_file(path).is_ok()
 }
 
 /// Removes an orphan lock file (its discovery file is gone), but only while

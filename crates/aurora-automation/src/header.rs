@@ -2,7 +2,9 @@
 //! byte is decoded or even copied: a 3.5 MB PNG whose header says
 //! 30000 x 30000 decodes to ten gigabytes. Only the fixed-size header of
 //! each format is read, with a bounded number of reads; nothing is
-//! allocated from a number in the file.
+//! allocated from a number in the file. A PSD or PSB also declares a
+//! rectangle for each layer (and layer mask): [`psd_layers`] reads those
+//! records, so a small canvas cannot hide huge layers.
 //!
 //! Recognised by content (magic bytes), not by extension, so a file named
 //! `.png` that is really a PSB is checked as a PSB. A `.aur` (a zip) is
@@ -192,3 +194,254 @@ fn tiff<R: Read + Seek>(r: &mut R, magic: &[u8]) -> Result<Dimensions, ()> {
         format: "TIFF",
     })
 }
+
+// ---------------------------------------------------------------------------
+// PSD / PSB layer rectangles
+// ---------------------------------------------------------------------------
+
+/// The most layer records [`psd_layers`] walks (a PSD stores the count in an
+/// `i16`, so this is also the format's own ceiling).
+const MAX_LAYER_RECORDS: u32 = 32_767;
+/// A layer record has at most this many channels (the format allows 56).
+const MAX_CHANNELS: u64 = 64;
+/// How many global tagged blocks are examined looking for the `Lr16`,
+/// `Lr32` or `Layr` block that holds a 16/32-bit file's layers.
+const MAX_GLOBAL_BLOCKS: u32 = 4096;
+/// Tagged-block keys whose length is 8 bytes in a PSB (the list the PSD reader
+/// uses: psd-tools' `_BIG_KEYS`).
+const PSB_WIDE_KEYS: [&[u8; 4]; 21] = [
+    b"LMsk", b"Lr16", b"Lr32", b"Layr", b"Mt16", b"Mt32", b"Mtrn", b"Alph", b"FMsk", b"lnk2",
+    b"lnk3", b"lnkE", b"FXid", b"FEid", b"FELS", b"PxSD", b"pths", b"extd", b"extn", b"cinf",
+    b"artd",
+];
+
+/// What a PSD's layer records declare.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayerExtent {
+    /// Layer records seen.
+    pub layers: u32,
+    /// The largest single layer rectangle or layer mask rectangle, in pixels.
+    pub largest: u64,
+    /// The sum of all layer rectangles, in pixels.
+    pub total: u64,
+}
+
+/// A bounds-checked cursor over a file; nothing is allocated from a number
+/// in the file and a read past the end is an error.
+struct Cursor<'a, R: Read + Seek> {
+    file: &'a mut R,
+    at: u64,
+    len: u64,
+}
+
+impl<R: Read + Seek> Cursor<'_, R> {
+    fn bytes<const N: usize>(&mut self) -> Result<[u8; N], ()> {
+        let end = self.at.checked_add(N as u64).ok_or(())?;
+        if end > self.len {
+            return Err(());
+        }
+        self.file.seek(SeekFrom::Start(self.at)).map_err(|_| ())?;
+        let mut buf = [0_u8; N];
+        self.file.read_exact(&mut buf).map_err(|_| ())?;
+        self.at = end;
+        Ok(buf)
+    }
+
+    fn u16(&mut self) -> Result<u64, ()> {
+        Ok(u64::from(u16::from_be_bytes(self.bytes::<2>()?)))
+    }
+
+    fn u32(&mut self) -> Result<u64, ()> {
+        Ok(u64::from(u32::from_be_bytes(self.bytes::<4>()?)))
+    }
+
+    fn i32(&mut self) -> Result<i64, ()> {
+        Ok(i64::from(i32::from_be_bytes(self.bytes::<4>()?)))
+    }
+
+    fn u64(&mut self) -> Result<u64, ()> {
+        Ok(u64::from_be_bytes(self.bytes::<8>()?))
+    }
+
+    /// A 4-byte length, or an 8-byte one in a PSB.
+    fn length(&mut self, wide: bool) -> Result<u64, ()> {
+        if wide { self.u64() } else { self.u32() }
+    }
+
+    fn skip(&mut self, n: u64) -> Result<(), ()> {
+        let end = self.at.checked_add(n).ok_or(())?;
+        if end > self.len {
+            return Err(());
+        }
+        self.at = end;
+        Ok(())
+    }
+}
+
+fn rect_pixels(top: i64, left: i64, bottom: i64, right: i64) -> u64 {
+    let height = bottom.saturating_sub(top).max(0).unsigned_abs();
+    let width = right.saturating_sub(left).max(0).unsigned_abs();
+    width.saturating_mul(height)
+}
+
+/// Reads the layer records of a PSD or PSB (`psb`: version 2) and returns the
+/// extent they declare, without decoding a pixel: only the fixed fields of
+/// each record are read, with seeks over everything else. The records are
+/// found in the layer-info section or, for a 16- or 32-bit file, in the
+/// `Lr16`/`Lr32`/`Layr` block after it.
+///
+/// # Errors
+/// A message when the structure is cut short or inconsistent: such a file
+/// is refused rather than guessed at (the real reader refuses it too).
+pub fn psd_layers<R: Read + Seek>(r: &mut R, psb: bool) -> Result<LayerExtent, String> {
+    let cut = || "the PSD layer records are damaged or cut short".to_owned();
+    let len = r.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+    let mut c = Cursor {
+        file: r,
+        at: 26,
+        len,
+    };
+    // Colour mode data, image resources, then the layer and mask section.
+    let colour = c.u32().map_err(|()| cut())?;
+    c.skip(colour).map_err(|()| cut())?;
+    let resources = c.u32().map_err(|()| cut())?;
+    c.skip(resources).map_err(|()| cut())?;
+    let section = c.length(psb).map_err(|()| cut())?;
+    let section_end = c.at.checked_add(section).ok_or_else(cut)?;
+    if section == 0 {
+        return Ok(LayerExtent::default());
+    }
+    if section_end > len {
+        return Err(cut());
+    }
+    let info = c.length(psb).map_err(|()| cut())?;
+    let info_end = c.at.checked_add(info).ok_or_else(cut)?;
+    if info_end > section_end {
+        return Err(cut());
+    }
+    if info > 0 {
+        return layer_info(&mut c, psb, info_end).map_err(|()| cut());
+    }
+    // The layers live in a global `Lr16` / `Lr32` / `Layr` block.
+    let mask = c.u32().map_err(|()| cut())?;
+    c.skip(mask).map_err(|()| cut())?;
+    for _ in 0..MAX_GLOBAL_BLOCKS {
+        if section_end.saturating_sub(c.at) < 12 {
+            break;
+        }
+        let signature = c.bytes::<4>().map_err(|()| cut())?;
+        if &signature != b"8BIM" && &signature != b"8B64" {
+            break;
+        }
+        let key = c.bytes::<4>().map_err(|()| cut())?;
+        let wide = psb && PSB_WIDE_KEYS.iter().any(|k| **k == key);
+        let block = c.length(wide).map_err(|()| cut())?;
+        let block_end = c.at.checked_add(block).ok_or_else(cut)?;
+        if block_end > section_end {
+            return Err(cut());
+        }
+        if &key == b"Lr16" || &key == b"Lr32" || &key == b"Layr" {
+            return layer_info(&mut c, psb, block_end).map_err(|()| cut());
+        }
+        c.at = block_end;
+        // Global blocks are padded to a multiple of four.
+        let pad = (4 - block % 4) % 4;
+        if section_end.saturating_sub(c.at) >= pad {
+            c.at += pad;
+        }
+    }
+    Ok(LayerExtent::default())
+}
+
+/// The layer count and records, ending at `end`.
+fn layer_info<R: Read + Seek>(
+    c: &mut Cursor<'_, R>,
+    psb: bool,
+    end: u64,
+) -> Result<LayerExtent, ()> {
+    // Negative: the first alpha channel is the merged result's transparency.
+    let count = u32::from(i16::from_be_bytes(c.bytes::<2>()?).unsigned_abs());
+    if count > MAX_LAYER_RECORDS {
+        return Err(());
+    }
+    let mut out = LayerExtent::default();
+    for _ in 0..count {
+        let top = c.i32()?;
+        let left = c.i32()?;
+        let bottom = c.i32()?;
+        let right = c.i32()?;
+        let pixels = rect_pixels(top, left, bottom, right);
+        out.layers += 1;
+        out.largest = out.largest.max(pixels);
+        out.total = out.total.saturating_add(pixels);
+        let channels = c.u16()?;
+        if channels > MAX_CHANNELS {
+            return Err(());
+        }
+        c.skip(channels * if psb { 10 } else { 6 })?;
+        // blend signature, key, opacity, clipping, flags, filler
+        c.skip(12)?;
+        let extra = c.u32()?;
+        let extra_end = c.at.checked_add(extra).ok_or(())?;
+        if extra_end > end {
+            return Err(());
+        }
+        // The extra data opens with the layer mask: a length, then (when it
+        // holds a rectangle) top, left, bottom, right.
+        if extra >= 4 {
+            let mask = c.u32()?;
+            if mask >= 16 && extra >= 20 {
+                let top = c.i32()?;
+                let left = c.i32()?;
+                let bottom = c.i32()?;
+                let right = c.i32()?;
+                out.largest = out.largest.max(rect_pixels(top, left, bottom, right));
+            }
+        }
+        c.at = extra_end;
+    }
+    Ok(out)
+}
+
+/// Checks a PSD or PSB's layer rectangles against `max_pixels` (the cap the
+/// canvas header is held to). `format` is [`Dimensions::format`]; other
+/// formats pass. `Err` is the refusal text.
+///
+/// A single layer (or mask) rectangle over the cap is refused: that layer
+/// would be decoded into memory whole. The sum of all layer rectangles is
+/// refused past [`LAYER_TOTAL_FACTOR`] times the cap, which bounds the
+/// total work of one open.
+///
+/// # Errors
+/// The refusal message.
+pub fn check_psd_layers<R: Read + Seek>(
+    r: &mut R,
+    format: &str,
+    max_pixels: u64,
+) -> Result<(), String> {
+    if format != "PSD" && format != "PSB" {
+        return Ok(());
+    }
+    let extent = psd_layers(r, format == "PSB")?;
+    if extent.largest > max_pixels {
+        return Err(format!(
+            "a {format} layer declares a {} Mpx rectangle; at most {} Mpx may be opened, \
+             layers included",
+            extent.largest / 1_000_000,
+            max_pixels / 1_000_000
+        ));
+    }
+    if extent.total > max_pixels.saturating_mul(LAYER_TOTAL_FACTOR) {
+        return Err(format!(
+            "the {format} layers declare {} Mpx in all ({} layers); at most {} Mpx (\
+             {LAYER_TOTAL_FACTOR} times the open limit) may be opened",
+            extent.total / 1_000_000,
+            extent.layers,
+            max_pixels.saturating_mul(LAYER_TOTAL_FACTOR) / 1_000_000
+        ));
+    }
+    Ok(())
+}
+
+/// How many times the open limit the layer rectangles may add up to.
+pub const LAYER_TOTAL_FACTOR: u64 = 16;
