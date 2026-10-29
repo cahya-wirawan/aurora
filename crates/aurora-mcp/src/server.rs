@@ -911,8 +911,14 @@ impl AuroraMcp {
         let id = call.id.clone();
         if !self.is_headless(&id) {
             let what = if self.inner.bridge {
-                "is not available over the bridge (quitting and the app's own control commands \
-                 are never tools)"
+                match aurora_commands::controller_refusal(&id) {
+                    Some(reason) => {
+                        return Err(Fail::Tool(format!(
+                            "`{id}` is not available over the bridge: {reason}"
+                        )));
+                    }
+                    None => "is not available over the bridge",
+                }
             } else {
                 "is not available in the headless server: it needs a window or has no headless \
                  form yet (command_list marks each command's `headless`)"
@@ -1075,7 +1081,11 @@ fn check_header(
             d.pixels() / 1_000_000,
             limits.max_open_pixels / 1_000_000
         ))),
-        Ok(_) => Ok(()),
+        // A PSD/PSB also declares a rectangle per layer: a small canvas
+        // cannot hide huge layers.
+        Ok(Some(d)) => header::check_psd_layers(file, d.format, limits.max_open_pixels)
+            .map_err(SessionError::Refused),
+        Ok(None) => Ok(()),
     }
 }
 
