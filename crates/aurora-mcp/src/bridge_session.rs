@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use aurora_automation::bridge::client::{BridgeClient, ClientError};
 use aurora_automation::bridge::discovery::{self, Discovery, DiscoveryError};
-use aurora_commands::{ArgValue, CommandContext, Registry, Validated};
+use aurora_commands::{ArgValue, CommandContext, Registry, Validated, controller_refusal};
 use base64::Engine as _;
 use serde_json::{Map, Value, json};
 
@@ -24,8 +24,9 @@ use crate::session::{Cancel, ExportFormat, ExportOutcome, Preview, Session, Sess
 /// Longer than the app's own 60 s wait, so its message is the one we see.
 const CALL_TIMEOUT: Duration = Duration::from_secs(65);
 
-/// Commands never offered over the bridge (the app refuses them too).
-const BLOCKED: &[&str] = &["app.quit", "automation.disconnect"];
+/// How long to wait before reading the discovery file again after a token
+/// was refused (the app rotates it when a controller leaves).
+const AUTH_RETRY_WAIT: Duration = Duration::from_millis(150);
 
 /// Where the app's discovery record comes from.
 #[derive(Debug, Clone)]
@@ -49,7 +50,7 @@ impl DiscoverySource {
 
     fn resolve(&self) -> Result<Discovery, DiscoveryError> {
         match self {
-            Self::File(path) => discovery::read_file(path),
+            Self::File(path) => discovery::read_live(path),
             Self::Dir(dir) => discovery::find_running(dir).map(|(_, record)| record),
         }
     }
@@ -71,7 +72,7 @@ impl BridgeSession {
             .commands
             .iter()
             .map(|c| &*Box::leak(c.id.clone().into_boxed_str()))
-            .filter(|id| !BLOCKED.contains(id))
+            .filter(|id| controller_refusal(id).is_none())
             .collect();
         Self {
             source,
@@ -88,8 +89,21 @@ impl BridgeSession {
             .source
             .resolve()
             .map_err(|e| SessionError::Failed(e.to_string()))?;
-        let client =
-            BridgeClient::connect(&info).map_err(|e| SessionError::Failed(e.to_string()))?;
+        let client = match BridgeClient::connect(&info) {
+            Ok(client) => client,
+            // The app gives the bridge a new token whenever a controller
+            // leaves; a file read just before that is one token behind.
+            // Read it again, once.
+            Err(error) if error.to_string().contains("authentication failed") => {
+                std::thread::sleep(AUTH_RETRY_WAIT);
+                let fresh = self
+                    .source
+                    .resolve()
+                    .map_err(|e| SessionError::Failed(e.to_string()))?;
+                BridgeClient::connect(&fresh).map_err(|e| SessionError::Failed(e.to_string()))?
+            }
+            Err(error) => return Err(SessionError::Failed(error.to_string())),
+        };
         self.client = Some(client);
         Ok(())
     }

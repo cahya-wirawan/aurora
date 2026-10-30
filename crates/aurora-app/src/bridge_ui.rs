@@ -11,7 +11,7 @@ use aurora_automation::bridge::protocol::CallError;
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-use crate::bridge_app::{BLOCKED_COMMANDS, CapturedFrame, Job, Pending};
+use crate::bridge_app::{CapturedFrame, Job, Pending};
 use crate::bridge_doc::bad;
 use crate::{
     App, DialogEffect, DialogPurpose, DialogResult, Key, Modifiers, NamedKey, activate_command,
@@ -585,10 +585,13 @@ impl App {
                         format!("`{id}` is disabled in the menu"),
                     ));
                 }
-                if BLOCKED_COMMANDS.contains(&id.as_str())
-                    || id == crate::COMMAND_FILE_OPEN
-                    || id == crate::COMMAND_FILE_SAVE
-                {
+                if let Some(reason) = aurora_commands::controller_refusal(&id) {
+                    return Err(CallError::new(
+                        "refused",
+                        format!("`{id}` is not available over the bridge: {reason}"),
+                    ));
+                }
+                if id == crate::COMMAND_FILE_OPEN || id == crate::COMMAND_FILE_SAVE {
                     return Err(CallError::new(
                         "refused",
                         format!(

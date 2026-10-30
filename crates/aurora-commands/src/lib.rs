@@ -20,6 +20,7 @@
 //! says how to add a command.
 
 mod args;
+mod controller;
 mod describe;
 mod registry;
 mod spec;
@@ -28,6 +29,7 @@ mod table;
 pub use args::{
     ArgError, ArgValue, Args, Validated, default_value, validate_command, validate_family,
 };
+pub use controller::{CONTROLLER_REFUSED, controller_refusal};
 pub use describe::{
     ChoiceInfo, CommandInfo, DefaultInfo, FamilyInfo, KindInfo, Listing, ParamInfo,
     RequirementInfo, TargetInfo,

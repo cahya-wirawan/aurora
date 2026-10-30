@@ -45,6 +45,53 @@ fn psd_header(version: u16, w: u32, h: u32) -> Vec<u8> {
     b
 }
 
+/// A PSD of a tiny canvas whose one layer record declares `lw` x `lh`.
+fn psd_with_layer(lw: i32, lh: i32) -> Vec<u8> {
+    let mut b = psd_header(1, 64, 64);
+    b.truncate(26);
+    b.extend_from_slice(&0_u32.to_be_bytes()); // colour mode data
+    b.extend_from_slice(&0_u32.to_be_bytes()); // image resources
+    let mut record = Vec::new();
+    for v in [0_i32, 0, lh, lw] {
+        record.extend_from_slice(&v.to_be_bytes());
+    }
+    record.extend_from_slice(&1_u16.to_be_bytes());
+    record.extend_from_slice(&0_i16.to_be_bytes());
+    record.extend_from_slice(&4_u32.to_be_bytes());
+    record.extend_from_slice(b"8BIMnorm");
+    record.extend_from_slice(&[255, 0, 0, 0]);
+    let extra = [0_u8; 12]; // no mask, no ranges, empty name
+    record.extend_from_slice(&(extra.len() as u32).to_be_bytes());
+    record.extend_from_slice(&extra);
+    let mut info = 1_i16.to_be_bytes().to_vec();
+    info.extend_from_slice(&record);
+    let mut section = (info.len() as u32).to_be_bytes().to_vec();
+    section.extend_from_slice(&info);
+    section.extend_from_slice(&0_u32.to_be_bytes());
+    b.extend_from_slice(&(section.len() as u32).to_be_bytes());
+    b.extend_from_slice(&section);
+    b
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_small_canvas_with_a_huge_layer_rectangle_is_refused_before_the_host_is_reached() {
+    let (r, _w) = dirs();
+    std::fs::write(r.path().join("layer.psd"), psd_with_layer(60_000, 60_000)).unwrap();
+    std::fs::write(r.path().join("fine.psd"), psd_with_layer(60, 60)).unwrap();
+    let (mock, seen) = Mock::new();
+    let mut client = start(mock, &[r.path()], &[]).await;
+    let message = client
+        .tool_error("doc_open", json!({"path": "layer.psd"}))
+        .await;
+    assert!(
+        message.contains("layer declares") && message.contains("3600 Mpx"),
+        "{message}"
+    );
+    assert!(seen.opened.lock().unwrap().is_empty());
+    client.ok("doc_open", json!({"path": "fine.psd"})).await;
+    assert_eq!(seen.opened.lock().unwrap().len(), 1);
+}
+
 fn jpeg_header(w: u16, h: u16) -> Vec<u8> {
     let mut b = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
     b.extend_from_slice(&[0; 14]);

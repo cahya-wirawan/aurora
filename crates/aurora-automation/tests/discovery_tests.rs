@@ -5,10 +5,18 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use aurora_automation::bridge::client::BridgeClient;
 use aurora_automation::bridge::discovery::{
-    Discovery, ensure_private_dir, find_running, publish, read_file, sweep_stale,
+    Discovery, ensure_private_dir, find_running, publish, read_file, read_live, rotate_token,
+    sweep_stale,
 };
+use aurora_automation::bridge::protocol::{CallError, Request};
+use aurora_automation::bridge::server::{BridgeServer, Dispatcher, ServerConfig};
 use aurora_automation::bridge::token;
+use serde_json::{Value, json};
 
 fn record(pid: u32) -> Discovery {
     let mut d = Discovery::new(4242, token::generate().unwrap(), "0.0.0");
@@ -203,4 +211,159 @@ fn an_orphan_lock_file_is_removed_only_when_nobody_holds_it() {
     drop(held);
     assert_eq!(sweep_stale(&dir).removed, 1);
     assert!(!lock.exists());
+}
+
+// ---- task 165: liveness of an explicitly named file ----
+
+#[test]
+fn a_named_discovery_file_must_belong_to_a_live_app() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("b");
+    let live = publish(&dir, &record(std::process::id())).unwrap();
+    assert_eq!(
+        read_live(live.path()).unwrap().pid,
+        std::process::id(),
+        "a held lock is a live app"
+    );
+    let path = live.path().to_path_buf();
+    drop(live);
+    // The app is gone (its lock is released). Put its file back, as a crash
+    // or a SIGTERM leaves it.
+    crashed(&dir, std::process::id());
+    let stale = read_live(&path).unwrap_err().to_string();
+    assert!(
+        stale.contains("stale") && stale.contains("not sent"),
+        "{stale}"
+    );
+    // read_file alone would have trusted it: that is the old behaviour.
+    assert!(read_file(&path).is_ok());
+}
+
+#[test]
+fn a_discovery_file_with_no_lock_beside_it_is_stale() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("b");
+    crashed(&dir, 999_010);
+    std::fs::remove_file(dir.join("aurora-bridge-999010.lock")).unwrap();
+    // Renamed to something the sweep would never touch.
+    let json = dir.join("mine.json");
+    std::fs::rename(dir.join("aurora-bridge-999010.json"), &json).unwrap();
+    assert!(read_live(&json).unwrap_err().to_string().contains("stale"));
+}
+
+// ---- task 165: token rotation ----
+
+struct Quiet;
+
+impl Dispatcher for Quiet {
+    fn dispatch(&self, request: Request) -> Result<Value, CallError> {
+        Ok(json!({"echo": request.method}))
+    }
+}
+
+fn server_for(token: &str) -> BridgeServer {
+    BridgeServer::start(
+        ServerConfig {
+            fail_delay: Duration::from_millis(20),
+            ..ServerConfig::default()
+        },
+        token.to_owned(),
+        Arc::new(Quiet),
+    )
+    .unwrap()
+}
+
+fn connect(server: &BridgeServer, token: &str) -> Result<BridgeClient, String> {
+    BridgeClient::connect_to(server.local_addr(), token, Duration::from_secs(3))
+        .map_err(|e| e.to_string())
+}
+
+#[test]
+fn rotating_the_token_replaces_the_file_and_refuses_the_old_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("b");
+    let first = token::generate().unwrap();
+    let server = server_for(&first);
+    let mut record = Discovery::new(server.local_addr().port(), first.clone(), "t");
+    let mut published = publish(&dir, &record).unwrap();
+
+    // A controller works, leaves; the token is rotated.
+    let mut client = connect(&server, &first).unwrap();
+    client.call("x", json!({}), Duration::from_secs(3)).unwrap();
+    drop(client);
+    rotate_token(&server, &mut published, &mut record).unwrap();
+
+    assert_ne!(record.token, first);
+    let on_disk = read_live(published.path()).unwrap();
+    assert_eq!(on_disk, record, "the file holds the new token");
+    assert_eq!(mode(published.path()), 0o600);
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(!names.iter().any(|n| n.contains(".tmp")), "{names:?}");
+
+    // The old token no longer opens the door; the new one does.
+    let refused = connect(&server, &first).expect_err("old token refused");
+    assert!(refused.contains("authentication failed"), "{refused}");
+    let mut again = connect(&server, &on_disk.token).unwrap();
+    again.call("x", json!({}), Duration::from_secs(3)).unwrap();
+}
+
+#[test]
+fn a_rotation_leaves_a_connected_controller_connected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("b");
+    let first = token::generate().unwrap();
+    let server = server_for(&first);
+    let mut record = Discovery::new(server.local_addr().port(), first.clone(), "t");
+    let mut published = publish(&dir, &record).unwrap();
+    let mut client = connect(&server, &first).unwrap();
+    rotate_token(&server, &mut published, &mut record).unwrap();
+    client
+        .call("x", json!({}), Duration::from_secs(3))
+        .expect("the session that was authenticated keeps working");
+}
+
+#[test]
+fn a_failed_rewrite_keeps_the_old_file_and_the_old_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("b");
+    let first = token::generate().unwrap();
+    let server = server_for(&first);
+    let mut record = Discovery::new(server.local_addr().port(), first.clone(), "t");
+    let mut published = publish(&dir, &record).unwrap();
+    let before = std::fs::read_to_string(published.path()).unwrap();
+    // A record for another process is refused by the rewrite.
+    let mut stranger = record.clone();
+    stranger.pid = record.pid.wrapping_add(1);
+    stranger.token = token::generate().unwrap();
+    assert!(published.rewrite(&stranger).is_err());
+    assert_eq!(std::fs::read_to_string(published.path()).unwrap(), before);
+    connect(&server, &first).expect("the old token still works");
+    // A malformed token is refused by the server and by the rewrite.
+    assert!(server.set_token("not a token").is_err());
+    record.token = "zz".into();
+    assert!(published.rewrite(&record).is_err());
+}
+
+#[test]
+fn the_sweep_removes_a_dead_rotations_temp_file_and_spares_a_live_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("b");
+    // (publish sweeps too, so the dead app's files are made after it.)
+    let live = publish(&dir, &record(std::process::id())).unwrap();
+    crashed(&dir, 999_020);
+    let dead = dir.join("aurora-bridge-999020.json.tmp");
+    std::fs::write(&dead, b"{}").unwrap();
+    let alive = dir.join(format!("aurora-bridge-{}.json.tmp", std::process::id()));
+    std::fs::write(&alive, b"{}").unwrap();
+    let report = sweep_stale(&dir);
+    assert_eq!(report.removed, 2, "the crashed app's json and its temp");
+    assert!(!dead.exists());
+    assert!(
+        alive.exists(),
+        "a held lock means a rotation may be running"
+    );
+    drop(live);
 }

@@ -9,11 +9,21 @@
 //!   closes it; an HTTP request (what a web page can send) is dropped
 //!   without an answer and without counting as a failed attempt. The token
 //!   is compared in constant time ([`token::verify`]).
-//! * **After repeated failures** new connections are refused for a growing
-//!   time ([`Lockout`]).
+//! * **No lockout.** A failed handshake costs only its own connection: it
+//!   gets one attempt, is answered after a short fixed delay
+//!   ([`ServerConfig::fail_delay`]) and is closed. Nothing a stream of wrong
+//!   tokens does can refuse the connection that carries the right one (a
+//!   lockout would be a denial of service against the real controller). The
+//!   256-bit token, not a throttle, is what makes guessing pointless.
 //! * **One controller.** A second authenticated connection is refused while
-//!   one is active. At most [`MAX_UNAUTHENTICATED`] handshakes are in
-//!   progress at once.
+//!   one is active. At most [`ServerConfig::max_unauthenticated`] handshakes
+//!   are in progress at once; when a new connection arrives and they are all
+//!   taken, the connection that has already failed, else the oldest one that
+//!   has not sent a byte, is dropped to make room. A connection that has begun
+//!   its handshake is spared (the newcomer is let in over the limit) until the
+//!   list has doubled, so a flood cannot cut a real handshake short; silent
+//!   connections cannot hold the slots, and the handshake must complete within
+//!   [`ServerConfig::auth_timeout`].
 //! * **Bounded input.** A request line is at most
 //!   [`super::protocol::MAX_REQUEST_BYTES`]; a longer one closes the connection
 //!   and is never acted on. Requests are rate-limited.
@@ -21,9 +31,10 @@
 //!   the [`Dispatcher`] decides where a request runs (the app marshals it to
 //!   its UI thread and waits with a timeout; the UI thread never waits).
 
+use std::collections::VecDeque;
 use std::io::{self, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -31,15 +42,15 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::frame::{self, Conn, Line};
-use super::limits::{FREE_FAILURES, LOCKOUT_BASE, LOCKOUT_MAX, Lockout, RateLimiter};
+use super::limits::RateLimiter;
 use super::protocol::{
     CallError, HELLO, Hello, HelloReply, MAX_HELLO_BYTES, MAX_REQUEST_BYTES, PROTOCOL_VERSION,
     Reply, Request,
 };
 use super::token;
 
-/// Most handshakes in progress at once; further connections are refused.
-pub const MAX_UNAUTHENTICATED: usize = 4;
+/// Default for [`ServerConfig::max_unauthenticated`].
+pub const MAX_UNAUTHENTICATED: usize = 8;
 /// Consecutive malformed requests after which a controller is dropped.
 const MAX_BAD_STREAK: u32 = 8;
 
@@ -66,13 +77,13 @@ pub struct ServerConfig {
     pub bind: SocketAddr,
     /// The whole handshake line must arrive within this.
     pub auth_timeout: Duration,
+    /// Handshakes in progress at once (more than this evicts the oldest).
+    pub max_unauthenticated: usize,
+    /// How long a failed handshake is held before its refusal is sent.
+    pub fail_delay: Duration,
     /// A controller that sends nothing for this long is dropped (the proxy
     /// reconnects on its next call).
     pub idle_timeout: Duration,
-    /// Failed handshakes allowed before the lockout starts.
-    pub free_failures: u32,
-    pub lockout_base: Duration,
-    pub lockout_max: Duration,
     /// Request rate: a burst and a sustained rate.
     pub rate_burst: u32,
     pub rate_per_second: f64,
@@ -86,11 +97,10 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            auth_timeout: Duration::from_secs(3),
+            auth_timeout: Duration::from_secs(2),
+            max_unauthenticated: MAX_UNAUTHENTICATED,
+            fail_delay: Duration::from_millis(250),
             idle_timeout: Duration::from_mins(5),
-            free_failures: FREE_FAILURES,
-            lockout_base: LOCKOUT_BASE,
-            lockout_max: LOCKOUT_MAX,
             rate_burst: 32,
             rate_per_second: 20.0,
             max_request_bytes: MAX_REQUEST_BYTES,
@@ -99,12 +109,23 @@ impl Default for ServerConfig {
     }
 }
 
+/// A connection that has not authenticated yet.
+struct Waiting {
+    id: u64,
+    conn: Conn,
+    /// Set once the connection has presented a wrong token: it is doomed, so
+    /// it is the first to be dropped when room is needed.
+    failed: Arc<AtomicBool>,
+}
+
 struct Shared {
-    token: String,
+    /// The current token (replaced by [`BridgeServer::set_token`]).
+    token: Mutex<String>,
     config: ServerConfig,
     dispatcher: Arc<dyn Dispatcher>,
-    lockout: Mutex<Lockout>,
-    unauthenticated: AtomicUsize,
+    /// Connections still to authenticate, oldest first.
+    waiting: Mutex<VecDeque<Waiting>>,
+    next_waiting: AtomicU64,
     /// The active controller's stream (a clone, to close it from outside).
     controller: Mutex<Option<Conn>>,
     stop: AtomicBool,
@@ -158,15 +179,11 @@ impl BridgeServer {
         let listener = TcpListener::bind(config.bind)?;
         let addr = listener.local_addr()?;
         let shared = Arc::new(Shared {
-            lockout: Mutex::new(Lockout::new(
-                config.free_failures,
-                config.lockout_base,
-                config.lockout_max,
-            )),
-            token: token_text,
+            token: Mutex::new(token_text),
             config,
             dispatcher,
-            unauthenticated: AtomicUsize::new(0),
+            waiting: Mutex::new(VecDeque::new()),
+            next_waiting: AtomicU64::new(1),
             controller: Mutex::new(None),
             stop: AtomicBool::new(false),
         });
@@ -185,6 +202,22 @@ impl BridgeServer {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Replaces the token: connections that present the old one are refused
+    /// from now on. The controller already connected stays connected.
+    ///
+    /// # Errors
+    /// The new token is malformed (nothing changes).
+    pub fn set_token(&self, token_text: &str) -> io::Result<()> {
+        if !token::well_formed(token_text) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the bridge token must be 64 hexadecimal characters",
+            ));
+        }
+        token_text.clone_into(&mut lock(&self.shared.token));
+        Ok(())
     }
 
     /// Whether a controller is connected.
@@ -230,40 +263,51 @@ fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>) {
             tracing::warn!("bridge: dropped a connection from a non-loopback address");
             continue;
         }
-        // Refuse inline (no thread) when the lockout is on or too many
-        // handshakes are in progress.
-        if let Some(left) = lock(&shared.lockout).remaining(Instant::now()) {
-            refuse(
-                stream,
-                &format!(
-                    "too many failed attempts; try again in {} s",
-                    left.as_secs() + 1
-                ),
-            );
-            continue;
-        }
-        if shared.unauthenticated.fetch_add(1, Ordering::SeqCst) >= MAX_UNAUTHENTICATED {
-            shared.unauthenticated.fetch_sub(1, Ordering::SeqCst);
-            refuse(stream, "too many connections are authenticating; try again");
-            continue;
+        let conn = Conn::new(stream);
+        let failed = Arc::new(AtomicBool::new(false));
+        let id = shared.next_waiting.fetch_add(1, Ordering::Relaxed);
+        {
+            // Make room, in this order: a connection that has already
+            // failed; the oldest one that has not sent a byte yet; and only
+            // once the list has doubled, the oldest of all. A connection that
+            // has begun its handshake is never dropped for a newcomer while
+            // there is room to let the newcomer in as well, so a flood
+            // cannot cut a legitimate handshake short.
+            let mut waiting = lock(&shared.waiting);
+            let capacity = shared.config.max_unauthenticated.max(1);
+            while waiting.len() >= capacity {
+                let victim = waiting
+                    .iter()
+                    .position(|w| w.failed.load(Ordering::SeqCst))
+                    .or_else(|| waiting.iter().position(|w| !w.conn.has_received()))
+                    .or_else(|| (waiting.len() >= capacity * 2).then_some(0));
+                let Some(victim) = victim else { break };
+                if let Some(evicted) = waiting.remove(victim) {
+                    tracing::debug!("bridge: dropped a connection waiting to authenticate");
+                    evicted.conn.close();
+                }
+            }
+            waiting.push_back(Waiting {
+                id,
+                conn: conn.clone(),
+                failed: Arc::clone(&failed),
+            });
         }
         let conn_shared = Arc::clone(shared);
         let spawned = std::thread::Builder::new()
             .name("aurora-bridge-conn".to_owned())
             .spawn(move || {
-                serve_connection(&Conn::new(stream), &conn_shared);
+                serve_connection(&conn, &conn_shared, id, &failed);
             });
         if spawned.is_err() {
-            shared.unauthenticated.fetch_sub(1, Ordering::SeqCst);
+            forget(shared, id);
         }
     }
 }
 
-fn refuse(mut stream: TcpStream, message: &str) {
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
-    let reply = serde_json::json!({"ok": false, "error": message}).to_string();
-    let _ = frame::write_line(&mut stream, &reply);
-    close_after_reply(&stream, Duration::from_millis(30));
+/// Takes a connection off the waiting list (it authenticated or ended).
+fn forget(shared: &Shared, id: u64) {
+    lock(&shared.waiting).retain(|w| w.id != id);
 }
 
 /// Ends a connection after a reply without losing the reply.
@@ -319,12 +363,15 @@ fn looks_like_http(line: &[u8]) -> bool {
             .any(|w| w == b" HTTP/1." || w == b" HTTP/2.")
 }
 
-/// Releases the handshake count on every exit path.
-struct Unauthenticated<'a>(&'a AtomicUsize);
+/// Takes the connection off the waiting list on every exit path.
+struct Unauthenticated<'a> {
+    shared: &'a Shared,
+    id: u64,
+}
 
 impl Drop for Unauthenticated<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        forget(self.shared, self.id);
     }
 }
 
@@ -340,8 +387,8 @@ impl Drop for Slot<'_> {
     }
 }
 
-fn serve_connection(conn: &Conn, shared: &Arc<Shared>) {
-    let counted = Unauthenticated(&shared.unauthenticated);
+fn serve_connection(conn: &Conn, shared: &Arc<Shared>, id: u64, failed: &AtomicBool) {
+    let counted = Unauthenticated { shared, id };
     let stream = conn.socket();
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
@@ -384,7 +431,9 @@ fn serve_connection(conn: &Conn, shared: &Arc<Shared>) {
         reject(&mut writer, "bad handshake");
         return;
     }
-    if !token::verify(&hello.token, &shared.token) {
+    let expected = lock(&shared.token).clone();
+    if !token::verify(&hello.token, &expected) {
+        failed.store(true, Ordering::SeqCst);
         fail_auth(shared, &mut writer, "authentication failed");
         return;
     }
@@ -410,7 +459,6 @@ fn serve_connection(conn: &Conn, shared: &Arc<Shared>) {
         *slot = Some(conn.clone());
     }
     drop(counted);
-    lock(&shared.lockout).succeeded();
     let _slot = Slot { shared };
     let ok = HelloReply {
         ok: true,
@@ -452,10 +500,19 @@ fn reject(writer: &mut Conn, message: &str) {
     reply_hello_error(writer, message);
 }
 
-/// A well-formed handshake with the wrong token: counted toward the lockout.
+/// A well-formed handshake with the wrong token: the refusal is sent after
+/// a short fixed delay (cut short if the connection is dropped meanwhile)
+/// and the connection is closed. Nothing is remembered: the next connection
+/// starts clean, so failures can never keep the right token out.
 fn fail_auth(shared: &Shared, writer: &mut Conn, message: &str) {
-    lock(&shared.lockout).failed(Instant::now());
     tracing::warn!("bridge: a connection failed the handshake");
+    let until = Instant::now() + shared.config.fail_delay;
+    while Instant::now() < until && !writer.is_closed() && !shared.stop.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if writer.is_closed() {
+        return;
+    }
     reply_hello_error(writer, message);
 }
 

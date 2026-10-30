@@ -415,3 +415,159 @@ async fn without_an_app_the_error_says_how_to_start_one() {
     let e = c.tool_error("doc_inspect", json!({})).await;
     assert!(e.contains("--mcp-bridge"), "{e}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_clipboard_commands_are_refused_by_name_with_a_reason() {
+    let (read, write) = dirs();
+    let r = rig();
+    let mut c = bridge_client(&r, &[read.path()], &[write.path()]).await;
+    for id in [
+        "edit.copy",
+        "edit.cut",
+        "edit.copy_merged",
+        "edit.paste",
+        "edit.paste_in_place",
+    ] {
+        let error = c.tool_error("command_run", json!({"id": id})).await;
+        assert!(
+            error.contains("not available over the bridge") && error.contains("clipboard"),
+            "{id}: {error}"
+        );
+    }
+    // The layer commands that stay inside the app are still commands.
+    let list = c.ok("command_list", json!({})).await;
+    let ids: Vec<&str> = list["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"edit.layer_via_copy"));
+    assert!(
+        r.app
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.0 != "command.run"),
+        "nothing reached the app"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_discovery_file_is_not_sent_the_token() {
+    let (read, write) = dirs();
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("b");
+    discovery::ensure_private_dir(&private).unwrap();
+    // What a killed app leaves: its file and an unheld lock.
+    let mut record = Discovery::new(9, token::generate().unwrap(), "test");
+    record.pid = 999_333;
+    let file = private.join("aurora-bridge-999333.json");
+    std::fs::write(&file, serde_json::to_string(&record).unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    std::fs::write(private.join("aurora-bridge-999333.lock"), b"").unwrap();
+    // A listener that would happily receive a token.
+    let spy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    record.port = spy.local_addr().unwrap().port();
+    std::fs::write(&file, serde_json::to_string(&record).unwrap()).unwrap();
+    spy.set_nonblocking(true).unwrap();
+    let mut c = start_session(
+        Box::new(BridgeSession::new(DiscoverySource::File(file))),
+        &[read.path()],
+        &[write.path()],
+        Limits::default(),
+    )
+    .await;
+    let e = c.tool_error("doc_inspect", json!({})).await;
+    assert!(e.contains("stale"), "{e}");
+    assert!(
+        spy.accept().is_err(),
+        "nothing connected to the port a stale file names"
+    );
+}
+
+/// A rig that keeps its `Published` so the token can be rotated.
+struct RotatingRig {
+    server: BridgeServer,
+    published: discovery::Published,
+    record: Discovery,
+    dir: tempfile::TempDir,
+}
+
+fn rotating_rig() -> RotatingRig {
+    let app = Arc::new(FakeApp::default());
+    let token = token::generate().unwrap();
+    let server = BridgeServer::start(
+        ServerConfig {
+            fail_delay: std::time::Duration::from_millis(20),
+            ..ServerConfig::default()
+        },
+        token.clone(),
+        app,
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let record = Discovery::new(server.local_addr().port(), token, "test");
+    let published = discovery::publish(&dir.path().join("b"), &record).unwrap();
+    RotatingRig {
+        server,
+        published,
+        record,
+        dir,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn after_a_rotation_the_proxy_reconnects_with_the_new_token() {
+    let (read, write) = dirs();
+    let mut r = rotating_rig();
+    let mut c = start_session(
+        Box::new(BridgeSession::new(DiscoverySource::File(
+            r.published.path().to_path_buf(),
+        ))),
+        &[read.path()],
+        &[write.path()],
+        Limits::default(),
+    )
+    .await;
+    c.ok("doc_inspect", json!({})).await;
+    // The controller leaves (the idle timeout, a dropped pipe): the app
+    // rotates; the proxy's next call finds a new file and a new token.
+    r.server.disconnect_controller();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    discovery::rotate_token(&r.server, &mut r.published, &mut r.record).unwrap();
+    let after = c.ok("doc_inspect", json!({})).await;
+    assert_eq!(after["document"]["name"], "live");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_read_just_before_a_rotation_is_read_again_once() {
+    let (read, write) = dirs();
+    let mut r = rotating_rig();
+    let path = r.published.path().to_path_buf();
+    // The server already has the new token; the file catches up 80 ms later.
+    let fresh = token::generate().unwrap();
+    r.server.set_token(&fresh).unwrap();
+    let mut next = r.record.clone();
+    next.token = fresh;
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        r.published.rewrite(&next).unwrap();
+        (r.server, r.published, r.dir)
+    });
+    let mut c = start_session(
+        Box::new(BridgeSession::new(DiscoverySource::File(path))),
+        &[read.path()],
+        &[write.path()],
+        Limits::default(),
+    )
+    .await;
+    let reply = c.ok("doc_inspect", json!({})).await;
+    assert_eq!(reply["document"]["name"], "live");
+    let _keep = writer.join().unwrap();
+}
