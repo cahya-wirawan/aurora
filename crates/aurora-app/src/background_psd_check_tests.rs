@@ -970,6 +970,13 @@ fn the_status_text_follows_the_worker_through_start_cancel_and_finish() {
     assert_eq!(check_status_text(worker.is_checking()), None, "cancelled");
     let _ = release.send(());
     wait(&woken);
+    // The cancelled job's thread sends its wake just before it returns, so
+    // it can still be winding down (the worker is busy until it is reaped;
+    // seen on the Windows CI job as `Busy` from the next start).
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while worker.is_busy() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     let (release, woken, _) = gated_start(&mut worker, meta(DocumentId::next(), 1));
     assert_eq!(check_status_text(worker.is_checking()), Some(CHECKING_TEXT));
