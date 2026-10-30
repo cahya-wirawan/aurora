@@ -430,6 +430,18 @@ fn layer_info<R: Read + Seek>(
                 let bottom = c.i32()?;
                 let right = c.i32()?;
                 out.largest = out.largest.max(rect_pixels(top, left, bottom, right));
+                // With 36 bytes or more the reader also takes the "real"
+                // user mask (channel -3): default colour and flags of the
+                // first mask, the real flags and colour, then its own
+                // rectangle. A cut real block is just not counted.
+                if mask >= 36 && extra >= 40 {
+                    c.skip(4)?;
+                    let top = c.i32()?;
+                    let left = c.i32()?;
+                    let bottom = c.i32()?;
+                    let right = c.i32()?;
+                    out.largest = out.largest.max(rect_pixels(top, left, bottom, right));
+                }
             }
         }
         c.at = extra_end;

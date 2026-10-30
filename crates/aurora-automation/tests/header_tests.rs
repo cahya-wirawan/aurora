@@ -16,10 +16,16 @@ use aurora_automation::header::{self, LAYER_TOTAL_FACTOR};
 struct Layer {
     rect: [i32; 4],
     mask: Option<[i32; 4]>,
+    /// The "real" user mask rectangle (the mask data is then 36 bytes).
+    real: Option<[i32; 4]>,
 }
 
 fn layer(rect: [i32; 4]) -> Layer {
-    Layer { rect, mask: None }
+    Layer {
+        rect,
+        mask: None,
+        real: None,
+    }
 }
 
 fn big(width: i32, height: i32) -> Layer {
@@ -55,15 +61,26 @@ fn layer_records(layers: &[Layer], psb: bool) -> Vec<u8> {
         out.extend_from_slice(b"8BIMnorm");
         out.extend_from_slice(&[255, 0, 0, 0]);
         let mut extra = Vec::new();
-        match l.mask {
-            Some(m) => {
+        match (l.mask, l.real) {
+            (Some(m), Some(real)) => {
+                be32(&mut extra, 36);
+                for v in m {
+                    extra.extend_from_slice(&v.to_be_bytes());
+                }
+                // default colour, flags, real flags, real default colour
+                extra.extend_from_slice(&[0, 0, 0, 0]);
+                for v in real {
+                    extra.extend_from_slice(&v.to_be_bytes());
+                }
+            }
+            (Some(m), None) => {
                 be32(&mut extra, 20);
                 for v in m {
                     extra.extend_from_slice(&v.to_be_bytes());
                 }
                 extra.extend_from_slice(&[0, 0, 0, 0]);
             }
-            None => be32(&mut extra, 0),
+            (None, _) => be32(&mut extra, 0),
         }
         be32(&mut extra, 0); // blending ranges
         extra.extend_from_slice(&[1, b'a', 0, 0]); // Pascal name, padded
@@ -387,4 +404,33 @@ fn an_unreadable_global_block_region_without_layers_is_refused() {
         assert!(n > 0);
         assert_eq!(scan(&short, psb).unwrap().layers, 0);
     }
+}
+
+#[test]
+fn the_real_user_mask_rectangle_counts_too() {
+    for psb in [false, true] {
+        let format = if psb { "PSB" } else { "PSD" };
+        // A small first rectangle, a huge second one (the "real" mask).
+        let mut hidden = layer([0, 0, 10, 10]);
+        hidden.mask = Some([0, 0, 10, 10]);
+        hidden.real = Some([0, 0, 40_000, 40_000]);
+        let bytes = file(psb, 10, 10, &[hidden], false);
+        assert_eq!(scan(&bytes, psb).unwrap().largest, 1_600_000_000);
+        assert!(check(&bytes, format).is_err(), "psb {psb}");
+        // Both small: fine.
+        let mut fine = layer([0, 0, 10, 10]);
+        fine.mask = Some([0, 0, 10, 10]);
+        fine.real = Some([0, 0, 10, 10]);
+        check(&file(psb, 10, 10, &[fine], false), format).unwrap();
+    }
+}
+
+#[test]
+fn a_cut_real_mask_block_is_not_counted() {
+    // Mask data of 20 bytes (no real block) followed by bytes that look
+    // like a huge rectangle: the reader reads no real mask, so neither do we.
+    let mut l = layer([0, 0, 10, 10]);
+    l.mask = Some([0, 0, 10, 10]);
+    let bytes = file(false, 10, 10, &[l], false);
+    assert_eq!(scan(&bytes, false).unwrap().largest, 100);
 }
