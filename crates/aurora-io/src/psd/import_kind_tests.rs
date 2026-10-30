@@ -59,8 +59,8 @@ fn table() -> Vec<(Note, ImportLossKind)> {
         (Note::ShapeRasterised, NotSaved),
         (Note::FillRasterised, NotSaved),
         (Note::MaskUnreadable, NotSaved),
-        (Note::MaskParametersNotApplied, Changed),
-        (Note::FeatherNotApplied, Changed),
+        (Note::MaskParametersNotApplied, NotSaved),
+        (Note::FeatherNotApplied, NotSaved),
         (Note::RealMaskNotUsed, FromOpen),
         (Note::RenderedMaskUsed, NotSaved),
         (Note::MaskRelativePosition, FromOpen),
@@ -94,7 +94,7 @@ fn table() -> Vec<(Note, ImportLossKind)> {
         (Note::EffectsClamped, Changed),
         (Note::BlendIfNotApplied, NotSaved),
         (Note::KnockoutNotApplied, NotSaved),
-        (Note::UnknownBlendMode, Changed),
+        (Note::UnknownBlendMode, NotSaved),
         (Note::UnknownChannel, NotSaved),
         (Note::MissingColorChannel, FromOpen),
         (Note::LayerWithoutChannels, FromOpen),
@@ -165,8 +165,8 @@ fn the_notes_per_kind_are_counted() {
             .count()
     };
     assert_eq!(table().len(), 94);
-    assert_eq!(count(NotSaved), 52);
-    assert_eq!(count(Changed), 10);
+    assert_eq!(count(NotSaved), 55);
+    assert_eq!(count(Changed), 7);
     assert_eq!(count(FromOpen), 32);
 }
 
