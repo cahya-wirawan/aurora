@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.300.0] - 2026-10-30
+
+### Changed
+
+- Records for task 165: MCP bridge hardening
+
 ## [0.299.0] - 2026-10-28
 
 ### Changed
