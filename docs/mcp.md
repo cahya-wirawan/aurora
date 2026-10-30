@@ -408,11 +408,13 @@ and does not mark the live document as saved.
   after a fixed 250 ms and the connection is closed; nothing is remembered,
   so no stream of wrong tokens can keep the right one out. At most 8
   handshakes are in progress; when a new connection arrives and they are
-  taken, one that has already failed, else the oldest one still waiting, is
-  dropped (never the newcomer), and the handshake line must arrive within
-  2 s. Silent connections therefore cannot hold the slots. HTTP requests (a
-  web page), binary junk, a TLS hello and any other first line are dropped or
-  refused as before. What stops guessing is the 256-bit token, not a
+  taken, one that has already failed, else the oldest one that has not sent a
+  single byte, is dropped. A connection that has begun its handshake is
+  spared and the newcomer is let in over the limit, until the list has doubled
+  (16), when the oldest goes; so a flood cannot cut a real handshake short and
+  silent connections cannot hold the slots. The handshake line must arrive
+  within 2 s. HTTP requests (a web page), binary junk, a TLS hello and any
+  other first line are dropped or refused as before. What stops guessing is the 256-bit token, not a
   throttle: a throttle shared by all local processes is exactly a lever for
   locking the real controller out.
 * **The token is replaced whenever a controller's session ends** (the
@@ -433,8 +435,10 @@ and does not mark the live document as saved.
   `edit.layer_via_copy` and `edit.layer_via_cut` stay inside the app and are allowed.
 * The size cap covers a PSD/PSB's **layer rectangles** as well as its canvas:
   before anything is copied or decoded the layer records are read from the
-  file structure (the layer-info section, or the `Lr16`/`Lr32`/`Layr` block of
-  a 16/32-bit file). A layer or layer-mask rectangle over the open limit
+  file structure, choosing the source exactly as the PSD reader does (the
+  layer-info section; then each `Lr16`/`Lr32`/`Layr` block in turn while no
+  layer has been found, so a count of zero hides nothing). A global block
+  region that stops on an unknown signature and holds no layers is refused. A layer or layer-mask rectangle over the open limit
   (default 50 Mpx), or layer rectangles that add up to more than 16 times the
   limit, are refused with the size in the message. A PSD whose layer section
   cannot be read is refused. This applies to the bridge and to the headless
@@ -502,12 +506,12 @@ each (2026-10-29):
   every time), twelve silent connections against three slots, failed
   connections evicted before waiting ones, and the fixed answer delay.
   *Not done:* no throttle on how fast wrong tokens can be tried, on purpose
-  (see "No lockout" in the bridge limits above). A connection that has not yet sent its hello can still
-  be dropped if the slots are all taken by newer connections within the
-  milliseconds before it sends: the real client sends at once, and a test with
-  four flooding threads against eight slots never lost it, but a determined
-  local process opening dozens of silent connections at once can still win
-  that race now and then; it cannot hold anyone out.
+  (see "No lockout" in the bridge limits above). A connection that has sent nothing yet can be dropped if
+  newer silent connections arrive in the milliseconds before its first byte;
+  the real client sends at once. A connection that has begun its handshake is
+  spared until 16 are waiting; a flood of well-formed-looking drips could
+  still delay (for at most the 2 s deadline each) but not refuse the right
+  token, since the list is capped at twice the limit.
 * **`--discovery FILE` had no liveness check. Fixed.** `read_live` applies the
   directory search's lock check; a stale file is refused with a clear message
   and nothing is sent. Tested against a spy listener on the port a stale file
@@ -515,7 +519,9 @@ each (2026-10-29):
 * **Token lifetime. Half done.** The token is now replaced whenever a
   controller's session ends (file written first, then the listener switched; a
   failed write keeps both; tested with a real server, client and proxy
-  session, including a token read just before the switch). Removing the file
+  session, including a token read just before the switch). The old token is
+  refused at once, with no grace period: the proxy's single re-read covers the
+  race, and a grace window would keep a spent token valid. Removing the file
   on SIGTERM/SIGINT was **not done**, for the reason given under "What is not
   protected". The app's `rotate` call on the UI thread (a small file write) is
   covered by a source pin, not run against a live window.

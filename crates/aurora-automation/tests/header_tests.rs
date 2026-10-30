@@ -108,6 +108,30 @@ fn file(psb: bool, w: u32, h: u32, layers: &[Layer], lr16: bool) -> Vec<u8> {
     out
 }
 
+/// A file with an explicit layer-info body (`info`, may be empty) and global
+/// blocks `(signature, key, body)` after a zero-length global mask info.
+fn file_with_blocks(psb: bool, info: &[u8], blocks: &[(&[u8; 4], &[u8; 4], Vec<u8>)]) -> Vec<u8> {
+    let mut out = file(psb, 10, 10, &[], false);
+    out.truncate(26 + 8);
+    let mut section = Vec::new();
+    len(&mut section, psb, info.len());
+    section.extend_from_slice(info);
+    be32(&mut section, 0);
+    for (sig, key, body) in blocks {
+        section.extend_from_slice(*sig);
+        section.extend_from_slice(*key);
+        let wide = psb && matches!(*key, b"Lr16" | b"Lr32" | b"Layr");
+        len(&mut section, wide, body.len());
+        section.extend_from_slice(body);
+        while section.len() % 4 != 0 {
+            section.push(0);
+        }
+    }
+    len(&mut out, psb, section.len());
+    out.extend_from_slice(&section);
+    out
+}
+
 fn scan(bytes: &[u8], psb: bool) -> Result<header::LayerExtent, String> {
     header::psd_layers(&mut Cursor::new(bytes), psb)
 }
@@ -278,5 +302,89 @@ fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         {
             out.push(path);
         }
+    }
+}
+
+// ---- the scan mirrors the reader's choice of layer source ----
+
+#[test]
+fn a_zero_count_layer_info_does_not_hide_layers_in_an_lr16_block() {
+    for psb in [false, true] {
+        let empty = layer_records(&[], psb);
+        let huge = layer_records(&[big(60_000, 60_000)], psb);
+        let bytes = file_with_blocks(psb, &empty, &[(b"8BIM", b"Lr16", huge)]);
+        let format = if psb { "PSB" } else { "PSD" };
+        assert!(check(&bytes, format).is_err(), "psb {psb}");
+        assert_eq!(scan(&bytes, psb).unwrap().layers, 1);
+    }
+}
+
+#[test]
+fn a_zero_count_lr16_does_not_hide_a_later_one() {
+    for psb in [false, true] {
+        let empty = layer_records(&[], psb);
+        let huge = layer_records(&[big(60_000, 60_000)], psb);
+        let bytes = file_with_blocks(
+            psb,
+            &[],
+            &[(b"8BIM", b"Lr16", empty), (b"8BIM", b"Lr16", huge)],
+        );
+        let format = if psb { "PSB" } else { "PSD" };
+        assert!(check(&bytes, format).is_err(), "psb {psb}");
+    }
+}
+
+#[test]
+fn once_layers_are_found_later_blocks_are_ignored_like_the_reader_does() {
+    for psb in [false, true] {
+        let small = layer_records(&[big(10, 10)], psb);
+        let huge = layer_records(&[big(60_000, 60_000)], psb);
+        let bytes = file_with_blocks(
+            psb,
+            &[],
+            &[
+                (b"8BIM", b"Lr16", small.clone()),
+                (b"8BIM", b"Lr16", huge.clone()),
+            ],
+        );
+        assert_eq!(scan(&bytes, psb).unwrap().largest, 100, "psb {psb}");
+        // Layers in the info section also win over any Lr16.
+        let bytes = file_with_blocks(psb, &small, &[(b"8BIM", b"Lr16", huge)]);
+        assert_eq!(scan(&bytes, psb).unwrap().largest, 100, "psb {psb}");
+    }
+}
+
+#[test]
+fn an_unreadable_global_block_region_without_layers_is_refused() {
+    for psb in [false, true] {
+        let huge = layer_records(&[big(60_000, 60_000)], psb);
+        // A block whose signature is neither 8BIM nor 8B64, ahead of an Lr16.
+        let bytes = file_with_blocks(psb, &[], &[(b"XXXX", b"Lr16", huge.clone())]);
+        assert!(scan(&bytes, psb).is_err(), "psb {psb}");
+        // 8B64 is accepted like 8BIM.
+        let bytes = file_with_blocks(psb, &[], &[(b"8B64", b"Lr16", huge)]);
+        assert_eq!(scan(&bytes, psb).unwrap().layers, 1);
+        // Fewer than 12 trailing bytes are not a block (the reader stops too).
+        let mut short = file_with_blocks(psb, &[], &[]);
+        short.extend_from_slice(b"\0\0\0\0");
+        let n = short.len();
+        let section_len_at = 26 + 8;
+        if psb {
+            let v = u64::from_be_bytes(
+                short[section_len_at..section_len_at + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            short[section_len_at..section_len_at + 8].copy_from_slice(&(v + 4).to_be_bytes());
+        } else {
+            let v = u32::from_be_bytes(
+                short[section_len_at..section_len_at + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            short[section_len_at..section_len_at + 4].copy_from_slice(&(v + 4).to_be_bytes());
+        }
+        assert!(n > 0);
+        assert_eq!(scan(&short, psb).unwrap().layers, 0);
     }
 }

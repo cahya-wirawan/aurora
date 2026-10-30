@@ -43,7 +43,7 @@ threat model matters more than the feature.
    There is **no lockout** (addendum, task 165): a failed handshake costs only
    its own connection (answered after 250 ms, then closed), and a full set of
    eight handshake slots drops the connection that already failed, else the
-   oldest waiting one, so neither wrong tokens nor silent connections can keep
+   oldest one that has sent nothing (one that has begun is spared up to 16), so neither wrong tokens nor silent connections can keep
    the real controller out. **One** controller; a second authenticated
    connection is refused. Requests are
    at most 1 MiB, rate-limited (burst 32, 20/s) and served one at a time per

@@ -26,6 +26,7 @@ pub struct Conn(Arc<ConnInner>);
 struct ConnInner {
     stream: TcpStream,
     closed: AtomicBool,
+    received: AtomicBool,
 }
 
 impl Conn {
@@ -35,6 +36,7 @@ impl Conn {
         Self(Arc::new(ConnInner {
             stream,
             closed: AtomicBool::new(false),
+            received: AtomicBool::new(false),
         }))
     }
 
@@ -52,6 +54,12 @@ impl Conn {
         let _ = self.0.stream.shutdown(std::net::Shutdown::Both);
     }
 
+    /// Whether any byte has ever been read from the peer.
+    #[must_use]
+    pub fn has_received(&self) -> bool {
+        self.0.received.load(Ordering::SeqCst)
+    }
+
     /// Whether [`Conn::close`] was called on any clone.
     #[must_use]
     pub fn is_closed(&self) -> bool {
@@ -61,7 +69,11 @@ impl Conn {
 
 impl Read for Conn {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        (&self.0.stream).read(buf)
+        let n = (&self.0.stream).read(buf)?;
+        if n > 0 {
+            self.0.received.store(true, Ordering::SeqCst);
+        }
+        Ok(n)
     }
 }
 

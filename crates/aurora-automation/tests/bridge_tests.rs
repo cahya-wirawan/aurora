@@ -580,3 +580,62 @@ fn a_wrong_token_is_answered_only_after_the_fixed_delay() {
         started.elapsed()
     );
 }
+
+#[test]
+fn a_flood_of_silent_connections_cannot_cut_a_handshake_in_flight() {
+    let (server, token, _) = start(ServerConfig {
+        max_unauthenticated: 2,
+        auth_timeout: Duration::from_secs(10),
+        ..fast()
+    });
+    let line = hello(&token);
+    let (first, rest) = line.as_bytes().split_at(20);
+    let mut real = raw(&server);
+    real.write_all(first).unwrap();
+    // Let the server read those bytes: the handshake is now in flight.
+    std::thread::sleep(Duration::from_millis(200));
+    // Many newer connections that never say anything.
+    let flood: Vec<TcpStream> = (0..9).map(|_| raw(&server)).collect();
+    std::thread::sleep(Duration::from_millis(100));
+    real.write_all(rest).unwrap();
+    let reply = read_all_line(&mut real);
+    assert!(
+        reply.contains("\"ok\":true"),
+        "the handshake was cut: {reply:?}"
+    );
+    drop(flood);
+}
+
+#[test]
+fn a_connection_that_began_its_handshake_is_dropped_only_once_the_list_has_doubled() {
+    let (server, _, _) = start(ServerConfig {
+        max_unauthenticated: 1,
+        auth_timeout: Duration::from_secs(10),
+        ..fast()
+    });
+    let mut first = raw(&server);
+    first.write_all(b"{\"hello\"").unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    // Over the soft limit but under double: the first is spared.
+    let mut second = raw(&server);
+    second.write_all(b"{\"hello\"").unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    // A third reaches double: the oldest of those that began goes.
+    let _third = raw(&server);
+    first
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = [0_u8; 4];
+    assert_eq!(first.read(&mut buf).unwrap(), 0, "closed at last");
+    second
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let still_open = second.read(&mut buf).unwrap_err().kind();
+    assert!(
+        matches!(
+            still_open,
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "the second was spared: {still_open:?}"
+    );
+}

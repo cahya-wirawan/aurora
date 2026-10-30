@@ -319,19 +319,41 @@ pub fn psd_layers<R: Read + Seek>(r: &mut R, psb: bool) -> Result<LayerExtent, S
     if info_end > section_end {
         return Err(cut());
     }
-    if info > 0 {
-        return layer_info(&mut c, psb, info_end).map_err(|()| cut());
-    }
-    // The layers live in a global `Lr16` / `Lr32` / `Layr` block.
-    let mask = c.u32().map_err(|()| cut())?;
-    c.skip(mask).map_err(|()| cut())?;
-    for _ in 0..MAX_GLOBAL_BLOCKS {
-        if section_end.saturating_sub(c.at) < 12 {
-            break;
+    // This mirrors the PSD reader (`aurora-io`'s `decode`): the layer-info
+    // section first; then, in order, every `Lr16` / `Lr32` / `Layr` block
+    // while no layers have been found yet (a section or block that holds a
+    // count of zero does not count). All global blocks are located before
+    // any is used, as the reader does.
+    let mut found = if info > 0 {
+        layer_info(&mut c, psb, info_end).map_err(|()| cut())?
+    } else {
+        LayerExtent::default()
+    };
+    c.at = info_end;
+    if section_end.saturating_sub(c.at) >= 4 {
+        let mask = c.u32().map_err(|()| cut())?;
+        if section_end.saturating_sub(c.at) < mask {
+            return Err(cut());
         }
+        c.skip(mask).map_err(|()| cut())?;
+    }
+    let mut blocks: Vec<(u64, u64)> = Vec::new();
+    let mut walked = 0_u32;
+    let mut stopped_on_junk = false;
+    while section_end.saturating_sub(c.at) >= 12 {
         let signature = c.bytes::<4>().map_err(|()| cut())?;
         if &signature != b"8BIM" && &signature != b"8B64" {
+            // The reader stops here and ignores the rest. Layers could only
+            // be hiding there if none were found before, so that case is
+            // refused below rather than scanned as empty.
+            stopped_on_junk = true;
             break;
+        }
+        walked += 1;
+        if walked > MAX_GLOBAL_BLOCKS {
+            // More blocks than we are willing to walk: refuse rather than
+            // guess what the reader would find past them.
+            return Err(cut());
         }
         let key = c.bytes::<4>().map_err(|()| cut())?;
         let wide = psb && PSB_WIDE_KEYS.iter().any(|k| **k == key);
@@ -341,7 +363,7 @@ pub fn psd_layers<R: Read + Seek>(r: &mut R, psb: bool) -> Result<LayerExtent, S
             return Err(cut());
         }
         if &key == b"Lr16" || &key == b"Lr32" || &key == b"Layr" {
-            return layer_info(&mut c, psb, block_end).map_err(|()| cut());
+            blocks.push((c.at, block_end));
         }
         c.at = block_end;
         // Global blocks are padded to a multiple of four.
@@ -350,7 +372,19 @@ pub fn psd_layers<R: Read + Seek>(r: &mut R, psb: bool) -> Result<LayerExtent, S
             c.at += pad;
         }
     }
-    Ok(LayerExtent::default())
+    for (start, block_end) in blocks {
+        if found.layers > 0 {
+            break;
+        }
+        if start < block_end {
+            c.at = start;
+            found = layer_info(&mut c, psb, block_end).map_err(|()| cut())?;
+        }
+    }
+    if found.layers == 0 && stopped_on_junk {
+        return Err("the PSD global block region is not readable".to_owned());
+    }
+    Ok(found)
 }
 
 /// The layer count and records, ending at `end`.

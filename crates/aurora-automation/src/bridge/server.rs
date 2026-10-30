@@ -18,9 +18,11 @@
 //! * **One controller.** A second authenticated connection is refused while
 //!   one is active. At most [`ServerConfig::max_unauthenticated`] handshakes
 //!   are in progress at once; when a new connection arrives and they are all
-//!   taken, the connection that has already failed, else the oldest one still
-//!   waiting for its handshake, is dropped to make room. Silent connections
-//!   therefore cannot hold the slots, and the handshake must arrive within
+//!   taken, the connection that has already failed, else the oldest one that
+//!   has not sent a byte, is dropped to make room. A connection that has begun
+//!   its handshake is spared (the newcomer is let in over the limit) until the
+//!   list has doubled, so a flood cannot cut a real handshake short; silent
+//!   connections cannot hold the slots, and the handshake must complete within
 //!   [`ServerConfig::auth_timeout`].
 //! * **Bounded input.** A request line is at most
 //!   [`super::protocol::MAX_REQUEST_BYTES`]; a longer one closes the connection
@@ -265,15 +267,21 @@ fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>) {
         let failed = Arc::new(AtomicBool::new(false));
         let id = shared.next_waiting.fetch_add(1, Ordering::Relaxed);
         {
-            // Make room by dropping a connection that has already failed,
-            // else the oldest one still waiting; never refuse the new one.
+            // Make room, in this order: a connection that has already
+            // failed; the oldest one that has not sent a byte yet; and only
+            // once the list has doubled, the oldest of all. A connection that
+            // has begun its handshake is never dropped for a newcomer while
+            // there is room to let the newcomer in as well, so a flood
+            // cannot cut a legitimate handshake short.
             let mut waiting = lock(&shared.waiting);
             let capacity = shared.config.max_unauthenticated.max(1);
             while waiting.len() >= capacity {
                 let victim = waiting
                     .iter()
                     .position(|w| w.failed.load(Ordering::SeqCst))
-                    .unwrap_or(0);
+                    .or_else(|| waiting.iter().position(|w| !w.conn.has_received()))
+                    .or_else(|| (waiting.len() >= capacity * 2).then_some(0));
+                let Some(victim) = victim else { break };
                 if let Some(evicted) = waiting.remove(victim) {
                     tracing::debug!("bridge: dropped a connection waiting to authenticate");
                     evicted.conn.close();
