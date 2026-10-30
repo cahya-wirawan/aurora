@@ -301,10 +301,10 @@ fn rotating_the_token_replaces_the_file_and_refuses_the_old_token() {
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
-    assert!(!names.iter().any(|n| n.ends_with(".tmp")), "{names:?}");
+    assert!(!names.iter().any(|n| n.contains(".tmp")), "{names:?}");
 
     // The old token no longer opens the door; the new one does.
-    let refused = connect(&server, &first).err().expect("old token refused");
+    let refused = connect(&server, &first).expect_err("old token refused");
     assert!(refused.contains("authentication failed"), "{refused}");
     let mut again = connect(&server, &on_disk.token).unwrap();
     again.call("x", json!({}), Duration::from_secs(3)).unwrap();

@@ -297,6 +297,25 @@ discovery file (mode `0600`, in a `0700` per-user directory):
 
 `AURORA_BRIDGE_DIR` overrides it (for both the app and the proxy).
 
+**Where the app keeps its other state, and isolating a test instance.** The
+discovery directory is only part of it. The app's crash-recovery autosave
+files, its session marker and its tile scratch directory live under the
+operating system's temporary directory (`TMPDIR` on Unix, `TEMP` on Windows),
+**not** under `HOME`. A second instance started with only `HOME` changed
+therefore shares them: it can adopt the first one's stale autosave files as a
+crash to recover. To run a throwaway instance, give it its own `TMPDIR` (and,
+on Linux, its own `AURORA_BRIDGE_DIR` or `XDG_RUNTIME_DIR` so the proxy finds
+the right app):
+
+```sh
+TMPDIR=$(mktemp -d) AURORA_BRIDGE_DIR=$(mktemp -d) aurora-app --mcp-bridge ...
+```
+
+The bridge's startup line on stderr prints the state directory it is using.
+This is a design choice, not an oversight (ADR 0011: crash-recovery data is
+ephemeral and belongs in the temporary directory); it is documented rather than
+moved.
+
 ### Connect
 
 ```json
@@ -311,7 +330,11 @@ discovery file (mode `0600`, in a `0700` per-user directory):
 ```
 
 `--discovery FILE` names a specific discovery file; the default is the newest
-live app in the directory above. Give the proxy roots that lie **inside**
+live app in the directory above. A named file gets the same liveness check as
+the directory search: the lock file beside it (`aurora-bridge-<pid>.lock`, for
+the pid inside the file) must be held by a running app, or the proxy refuses
+with "stale" and sends nothing, so a dead app's token is never offered to
+whatever process owns its old port now. Give the proxy roots that lie **inside**
 the app's read and write roots respectively: the app enforces its own roots again, and a path outside
 them is refused there. A relative path means the first root of its kind in the
 proxy; the app is always sent an absolute path.
@@ -381,10 +404,41 @@ and does not mark the live document as saved.
   (the proxy reconnects). Read-only calls are retried once on a fresh
   connection; anything that changes state is never resent after a transport
   failure (the error says it may have completed).
-* Five failed handshakes lock new connections out for 1 s, doubling to 60 s.
-  Only a well-formed handshake with a wrong token counts; HTTP requests (a
-  web page), binary junk, a TLS hello and any other first line are refused
-  or dropped and never count.
+* **No lockout.** A connection gets one handshake: a wrong token is answered
+  after a fixed 250 ms and the connection is closed; nothing is remembered,
+  so no stream of wrong tokens can keep the right one out. At most 8
+  handshakes are in progress; when a new connection arrives and they are
+  taken, one that has already failed, else the oldest one still waiting, is
+  dropped (never the newcomer), and the handshake line must arrive within
+  2 s. Silent connections therefore cannot hold the slots. HTTP requests (a
+  web page), binary junk, a TLS hello and any other first line are dropped or
+  refused as before. What stops guessing is the 256-bit token, not a
+  throttle: a throttle shared by all local processes is exactly a lever for
+  locking the real controller out.
+* **The token is replaced whenever a controller's session ends** (the
+  controller leaves, is dropped after 5 idle minutes, or the connection
+  fails). The app writes the new discovery file first (a private temporary
+  file renamed over the old one, mode `0600`) and only then makes the
+  listener accept the new token. The connected controller is never affected;
+  the proxy reads the file at every (re)connect and reads it once more if a
+  token was just refused. A copy of an old token (a log, a crash dump) is
+  useless after the session it belonged to.
+* A controller can never use the **operating system clipboard**:
+  `edit.copy`, `edit.cut`, `edit.copy_merged`, `edit.paste` and
+  `edit.paste_in_place` are refused by name, with the reason, by the proxy
+  (they are not offered) and by the app (`aurora_commands::CONTROLLER_REFUSED`),
+  and the app's clipboard layer itself reads and writes nothing while a
+  controller's input is being handled, so a key chord, a menu click or a
+  paste into the palette's text field does not reach it either.
+  `edit.layer_via_copy` and `edit.layer_via_cut` stay inside the app and are allowed.
+* The size cap covers a PSD/PSB's **layer rectangles** as well as its canvas:
+  before anything is copied or decoded the layer records are read from the
+  file structure (the layer-info section, or the `Lr16`/`Lr32`/`Layr` block of
+  a 16/32-bit file). A layer or layer-mask rectangle over the open limit
+  (default 50 Mpx), or layer rectangles that add up to more than 16 times the
+  limit, are refused with the size in the message. A PSD whose layer section
+  cannot be read is refused. This applies to the bridge and to the headless
+  server's `doc_open`; the app's own File > Open is unchanged.
 * Every tool call is logged at `info` (method only, no pixel data).
 
 ### What is not protected
@@ -392,10 +446,19 @@ and does not mark the live document as saved.
 Any process running as the same user can read the discovery file and use the
 bridge: that is the design (ADR 0015). The commands that touch the document
 are exactly those a person at the window could run. Windows file permissions
-are not verified by code; Windows and macOS are untested. The app does not
-compare a stale discovery file's port with a live process beyond its lock, so
-an unrelated process that reuses a dead app's port would only ever receive a
-token that no longer works.
+are not verified by code; Windows and macOS are untested. The proxy checks the
+lock beside any discovery file before it sends the token (see above), so an
+unrelated process that reuses a dead app's port is never offered it.
+
+**After a kill, the discovery file stays on disk.** Aurora removes its
+discovery and lock files on a normal exit and when the person runs Disconnect
+Automation. On SIGTERM, SIGINT, SIGKILL or a crash they stay (owner-only,
+`0600`) until the next app start sweeps them. Cleaning up on SIGTERM/SIGINT was
+**not done**: the standard library has no signal API, handling a signal needs
+`unsafe` (which `aurora-app` forbids) or a new dependency (`signal-hook` or
+similar, which is a decision for the dependency list, not for this task). The
+damage is limited: the app is gone, so the port is closed, the proxy refuses the
+stale file (its lock is free), and the next app start uses a new token.
 
 ### Limits and gaps
 
@@ -428,23 +491,51 @@ MCP client, valid images near the caps decoded on the UI thread, JPEG/TIFF
 files whose header and decoder disagree, parallel clients on the rate limiter,
 other local users, pointer drags, the idle timeout.
 
-Weaknesses it found, none breaking a promise, none fixed yet:
+Weaknesses it found, none breaking a promise, and what task 165 did about
+each (2026-10-29):
 
-* **Handshake lockout.** Any local process that can reach the loopback port can
-  keep the real controller locked out without the token: a steady stream of
-  well-formed wrong-token hellos holds the lockout at 60 s, and four silent
-  connections hold the unauthenticated-handshake slots for 3 s each.
-* **`--discovery FILE` has no liveness check.** If the file is stale and a
-  different local process now owns its port, `aurora-cli` sends that process
-  the stale token. `--discovery-dir` discovery does check the lock.
-* **The token lives as long as the app** (no rotation) and its file stays on
-  disk after a SIGTERM until the next start sweeps it (owner-only).
-* **A controller can run clipboard commands** (`edit.copy`,
-  `edit.copy_merged`, `edit.paste`): authority beyond the file roots.
-* **The 50 Mpx cap is checked on the canvas header only.** A small canvas with
-  huge layer rectangles is bounded by the PSD reader's 268 Mpx layer cap.
-* **App state lives under `TMPDIR`**, not `HOME`: a test instance with only
-  `HOME` changed adopts stale autosave files in the shared temp directory.
+* **Handshake lockout. Fixed.** The global lockout is gone. A failed handshake
+  costs only its own connection; a full set of handshake slots drops the
+  connection that already failed, else the oldest waiting one, instead of
+  refusing the new one; the handshake deadline is 2 s. Tested with a
+  sequential and a concurrent wrong-token flood (the right token connects
+  every time), twelve silent connections against three slots, failed
+  connections evicted before waiting ones, and the fixed answer delay.
+  *Not done:* no throttle on how fast wrong tokens can be tried, on purpose
+  (see "No lockout" in the bridge limits above). A connection that has not yet sent its hello can still
+  be dropped if the slots are all taken by newer connections within the
+  milliseconds before it sends: the real client sends at once, and a test with
+  four flooding threads against eight slots never lost it, but a determined
+  local process opening dozens of silent connections at once can still win
+  that race now and then; it cannot hold anyone out.
+* **`--discovery FILE` had no liveness check. Fixed.** `read_live` applies the
+  directory search's lock check; a stale file is refused with a clear message
+  and nothing is sent. Tested against a spy listener on the port a stale file
+  names (never contacted), and for a file with no lock beside it.
+* **Token lifetime. Half done.** The token is now replaced whenever a
+  controller's session ends (file written first, then the listener switched; a
+  failed write keeps both; tested with a real server, client and proxy
+  session, including a token read just before the switch). Removing the file
+  on SIGTERM/SIGINT was **not done**, for the reason given under "What is not
+  protected". The app's `rotate` call on the UI thread (a small file write) is
+  covered by a source pin, not run against a live window.
+* **Clipboard commands. Fixed.** Refused by name with a reason in the proxy and
+  the app, and the app's clipboard layer is closed to a controller's input.
+  Tested at the shared table, the app's command gate, the proxy over a real
+  bridge, and a source pin on the four clipboard methods. The clipboard gate
+  was not exercised against a live window.
+* **The 50 Mpx cap was checked on the canvas header only. Fixed** for PSD/PSB
+  in the bridge's app-side open and the headless `doc_open`. Tested with
+  synthetic PSDs and PSBs (both layer layouts, mask rectangles, extreme and
+  upside-down rectangles, cut and lying records) and by scanning all 273
+  PSD/PSB files of the local corpora (none has a layer over 50 Mpx, none fails
+  to scan). *Not done:* the sum bound (16 times the limit) is an engineering
+  default; a file whose layers a legitimate Photoshop session stacks beyond
+  it must be opened with a higher `--mcp-bridge-max-mpx`; the cap on
+  `.aur`, PNG, JPEG and TIFF is unchanged.
+* **App state lives under `TMPDIR`. Documented, not moved**, by decision: see
+  "Where the app keeps its other state" above. The startup line now names the
+  directory.
 
 **A smoke run on macOS (Apple M2 Pro, Metal, 0.298.1, a real display session
 started through `open -a Terminal`).** The UI tools list, `ui_inspect`, a

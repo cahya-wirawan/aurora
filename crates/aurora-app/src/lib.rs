@@ -6160,6 +6160,9 @@ impl SystemClipboard {
 
 impl ClipboardAccess for SystemClipboard {
     fn get_text(&mut self) -> Option<String> {
+        // Task 165: a controller's input (a key chord, a menu click, a paste
+        // into the palette's text field) never reaches the OS clipboard.
+        bridge_app::gate(bridge_app::Gated::Clipboard).ok()?;
         match self.clipboard()?.get_text() {
             Ok(text) => Some(text),
             Err(err) => {
@@ -6170,6 +6173,9 @@ impl ClipboardAccess for SystemClipboard {
     }
 
     fn set_text(&mut self, text: String) {
+        if bridge_app::gate(bridge_app::Gated::Clipboard).is_err() {
+            return;
+        }
         if let Some(clipboard) = self.clipboard()
             && let Err(err) = clipboard.set_text(text)
         {
@@ -6178,6 +6184,7 @@ impl ClipboardAccess for SystemClipboard {
     }
 
     fn get_image(&mut self) -> Option<clipboard_pixels::ClipImage> {
+        bridge_app::gate(bridge_app::Gated::Clipboard).ok()?;
         match self.clipboard()?.get_image() {
             Ok(image) => Some(clipboard_pixels::ClipImage {
                 width: u32::try_from(image.width).ok()?,
@@ -6192,6 +6199,9 @@ impl ClipboardAccess for SystemClipboard {
     }
 
     fn set_image(&mut self, image: &clipboard_pixels::ClipImage) {
+        if bridge_app::gate(bridge_app::Gated::Clipboard).is_err() {
+            return;
+        }
         let (Ok(width), Ok(height)) = (usize::try_from(image.width), usize::try_from(image.height))
         else {
             return;

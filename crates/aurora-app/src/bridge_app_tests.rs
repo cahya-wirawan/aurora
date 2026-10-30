@@ -228,6 +228,37 @@ fn quitting_and_file_commands_are_never_run() {
     }
 }
 
+#[test]
+fn every_command_in_the_controller_refusal_table_is_refused_with_its_reason() {
+    assert!(
+        aurora_commands::CONTROLLER_REFUSED
+            .iter()
+            .any(|(id, _)| *id == crate::bridge_app::COMMAND_DISCONNECT),
+        "the app's own disconnect id is in the shared table"
+    );
+    for id in [
+        "edit.copy",
+        "edit.cut",
+        "edit.copy_merged",
+        "edit.paste",
+        "edit.paste_in_place",
+    ] {
+        let error = command_gate(id).unwrap_err();
+        assert_eq!(error.kind, "refused", "{id}");
+        assert!(
+            error.message.contains("clipboard"),
+            "{id}: {}",
+            error.message
+        );
+    }
+    for (id, reason) in aurora_commands::CONTROLLER_REFUSED {
+        let error = command_gate(id).unwrap_err();
+        assert!(error.message.contains(reason), "{id}: {}", error.message);
+    }
+    // The commands that stay inside the app are not refused.
+    assert!(command_gate("edit.layer_via_copy").is_ok());
+}
+
 // ---- marshalling ----
 
 fn dispatcher(
@@ -424,6 +455,76 @@ fn a_huge_declared_picture_is_refused_before_anything_is_copied() {
     assert!(!scratch.path().join("o").exists());
 }
 
+/// A PSD of a 64 x 64 canvas whose one layer record declares `lw` x `lh`.
+fn psd_with_layer(lw: i32, lh: i32) -> Vec<u8> {
+    let mut b = b"8BPS".to_vec();
+    b.extend_from_slice(&1_u16.to_be_bytes());
+    b.extend_from_slice(&[0; 6]);
+    b.extend_from_slice(&3_u16.to_be_bytes());
+    b.extend_from_slice(&64_u32.to_be_bytes());
+    b.extend_from_slice(&64_u32.to_be_bytes());
+    b.extend_from_slice(&8_u16.to_be_bytes());
+    b.extend_from_slice(&3_u16.to_be_bytes());
+    b.extend_from_slice(&0_u32.to_be_bytes());
+    b.extend_from_slice(&0_u32.to_be_bytes());
+    let mut record = Vec::new();
+    for v in [0_i32, 0, lh, lw] {
+        record.extend_from_slice(&v.to_be_bytes());
+    }
+    record.extend_from_slice(&1_u16.to_be_bytes());
+    record.extend_from_slice(&0_i16.to_be_bytes());
+    record.extend_from_slice(&4_u32.to_be_bytes());
+    record.extend_from_slice(b"8BIMnorm");
+    record.extend_from_slice(&[255, 0, 0, 0]);
+    record.extend_from_slice(&12_u32.to_be_bytes());
+    record.extend_from_slice(&[0; 12]);
+    let mut info = 1_i16.to_be_bytes().to_vec();
+    info.extend_from_slice(&record);
+    let mut section = u32::try_from(info.len()).unwrap().to_be_bytes().to_vec();
+    section.extend_from_slice(&info);
+    section.extend_from_slice(&0_u32.to_be_bytes());
+    b.extend_from_slice(&u32::try_from(section.len()).unwrap().to_be_bytes());
+    b.extend_from_slice(&section);
+    b
+}
+
+#[test]
+fn a_small_canvas_with_a_huge_layer_rectangle_is_refused_before_anything_is_copied() {
+    let root = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("big.psd"), psd_with_layer(60_000, 60_000)).unwrap();
+    std::fs::write(root.path().join("ok.psd"), psd_with_layer(60, 60)).unwrap();
+    let e = stage_open_file(
+        &roots_in(root.path()),
+        &scratch.path().join("o"),
+        "big.psd",
+        50_000_000,
+    )
+    .unwrap_err();
+    assert_eq!(e.kind, "refused");
+    assert!(e.message.contains("layer declares"), "{}", e.message);
+    assert!(!scratch.path().join("o").exists());
+    stage_open_file(
+        &roots_in(root.path()),
+        &scratch.path().join("o2"),
+        "ok.psd",
+        50_000_000,
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_controllers_session_ending_rotates_the_token() {
+    const APP: &str = include_str!("bridge_app.rs");
+    let at = APP.find("bridge.shown_connected = connected;").unwrap();
+    let region = &APP[at..(at + 300).min(APP.len())];
+    assert!(region.contains("bridge.rotate_token()"), "{region}");
+    assert!(
+        APP.contains("discovery::rotate_token(server, published, &mut self.record)"),
+        "rotation goes through the file-first helper"
+    );
+}
+
 #[test]
 fn with_no_roots_there_is_no_file_access() {
     let scratch = tempfile::tempdir().unwrap();
@@ -602,6 +703,7 @@ fn the_gate_refuses_quit_disconnect_and_native_dialogs_only_inside_a_job() {
         Gated::Quit,
         Gated::DisconnectAutomation,
         Gated::NativeDialog,
+        Gated::Clipboard,
     ] {
         assert!(
             gate(action).is_ok(),
@@ -615,6 +717,7 @@ fn the_gate_refuses_quit_disconnect_and_native_dialogs_only_inside_a_job() {
             Gated::Quit,
             Gated::DisconnectAutomation,
             Gated::NativeDialog,
+            Gated::Clipboard,
         ] {
             assert!(gate(action).is_err(), "{action:?}");
         }
@@ -669,6 +772,13 @@ fn every_exit_and_blocking_route_calls_the_central_gate() {
             200
         )
         .contains("bridge_app::Gated::DisconnectAutomation")
+    );
+    // Task 165: every method of the real clipboard goes through the gate.
+    let clipboard = region(LIB, "impl ClipboardAccess for SystemClipboard {", 2600);
+    assert_eq!(
+        clipboard.matches("bridge_app::Gated::Clipboard").count(),
+        4,
+        "get_text, set_text, get_image and set_image"
     );
     let dialog = region(LIB, "impl FileDialogAccess for SystemFileDialog {", 700);
     assert_eq!(

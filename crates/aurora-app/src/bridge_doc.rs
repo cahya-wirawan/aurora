@@ -10,7 +10,7 @@ use aurora_commands::{ArgValue, Args, ParamKind};
 use base64::Engine as _;
 use serde_json::{Map, Value, json};
 
-use crate::bridge_app::{BLOCKED_COMMANDS, Job, Pending};
+use crate::bridge_app::{Job, Pending};
 use crate::command_registry::{self, TypedError};
 use crate::mcp_session::{
     self, ExportKind, ExportParts, ExportResult, Failure, InspectView, composite_document_cpu,
@@ -73,14 +73,15 @@ impl crate::FileDialogAccess for NoDialogs {
     }
 }
 
-/// Commands the bridge never runs: quitting and the bridge's own control
-/// (blocked by id), the file commands (`doc_open` / `doc_save` reach files
+/// Commands the bridge never runs: quitting, the bridge's own control and
+/// the clipboard commands (`aurora_commands::CONTROLLER_REFUSED`, with the
+/// reason each is refused), the file commands (`doc_open` / `doc_save` reach files
 /// through the roots) and anything with a file-path parameter.
 pub(crate) fn command_gate(id: &str) -> Result<(), CallError> {
-    if BLOCKED_COMMANDS.contains(&id) {
+    if let Some(reason) = aurora_commands::controller_refusal(id) {
         return Err(CallError::new(
             "refused",
-            format!("`{id}` is not available over the bridge"),
+            format!("`{id}` is not available over the bridge: {reason}"),
         ));
     }
     if id == crate::COMMAND_FILE_OPEN || id == crate::COMMAND_FILE_SAVE {
@@ -492,6 +493,10 @@ fn check_header(
                 max_pixels / 1_000_000
             ),
         )),
-        Ok(_) => Ok(()),
+        // A PSD/PSB also declares a rectangle per layer: a small canvas
+        // cannot hide huge layers (task 165).
+        Ok(Some(d)) => header::check_psd_layers(file, d.format, max_pixels)
+            .map_err(|message| CallError::new("refused", message)),
+        Ok(None) => Ok(()),
     }
 }

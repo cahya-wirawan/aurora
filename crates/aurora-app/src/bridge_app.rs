@@ -281,6 +281,8 @@ pub(crate) struct Bridge {
     pub(crate) counter: u64,
     pub(crate) staged: Option<PathBuf>,
     pub(crate) discovery_path: Option<PathBuf>,
+    /// What the discovery file says now (its token changes on rotation).
+    record: Discovery,
 }
 
 impl Bridge {
@@ -350,7 +352,22 @@ impl Bridge {
             counter: 1,
             staged: None,
             discovery_path,
+            record,
         })
+    }
+
+    /// Gives the bridge a fresh token (a controller has left): the discovery
+    /// file is rewritten first, then the listener accepts only the new
+    /// token. A failure keeps the old file and token and is logged.
+    pub(crate) fn rotate_token(&mut self) {
+        let (Some(server), Some(published)) = (self.server.as_ref(), self.published.as_mut())
+        else {
+            return;
+        };
+        match discovery::rotate_token(server, published, &mut self.record) {
+            Ok(()) => tracing::info!("the bridge token was replaced after the controller left"),
+            Err(error) => tracing::warn!(%error, "the bridge token could not be replaced"),
+        }
     }
 
     /// A screenshot is waiting for the next frame.
@@ -493,6 +510,9 @@ pub(crate) enum Gated {
     DisconnectAutomation,
     /// A native file dialog: it blocks the UI thread until a person answers.
     NativeDialog,
+    /// Read or write the operating system clipboard, which is shared with
+    /// the person's other applications.
+    Clipboard,
 }
 
 /// The central gate: `Err` with the calm notice text while a controller's job
@@ -509,11 +529,11 @@ pub(crate) fn gate(action: Gated) -> Result<(), &'static str> {
         Gated::NativeDialog => {
             "A controller can't open a file dialog. Use doc_open and doc_save with the bridge's roots."
         }
+        Gated::Clipboard => {
+            "A controller can't use the system clipboard. It is shared with the person's other applications."
+        }
     })
 }
-
-/// Ids never run over the bridge: quitting is not a tool.
-pub(crate) const BLOCKED_COMMANDS: &[&str] = &["app.quit", COMMAND_DISCONNECT];
 
 impl App {
     /// Starts the bridge when the options ask for it. A failure is logged
@@ -525,12 +545,15 @@ impl App {
         match Bridge::start(options, self.proxy.clone()) {
             Ok(bridge) => {
                 eprintln!(
-                    "aurora: automation bridge enabled; discovery file {}",
+                    "aurora: automation bridge enabled; discovery file {}; state (autosave, \
+                     recovery marker, tile scratch) under {} (set TMPDIR to isolate a test \
+                     instance)",
                     bridge
                         .discovery_path
                         .as_deref()
                         .map(|p| p.display().to_string())
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    std::env::temp_dir().display()
                 );
                 self.bridge = Some(bridge);
             }
@@ -584,6 +607,10 @@ impl App {
         }
         if let Some(bridge) = self.bridge.as_mut() {
             bridge.shown_connected = connected;
+            // A controller's session has ended: its token is spent.
+            if !connected {
+                bridge.rotate_token();
+            }
         }
         self.apply_window_title();
         self.sync_status_bar_now();

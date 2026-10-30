@@ -23,7 +23,7 @@ threat model matters more than the feature.
 |---|---|---|
 | **A process running as the same user** | Can already read the app's memory, its files and the discovery file. | Not defended against, by design: the token is a capability for "whoever can run as this user". The docs say so. |
 | **Another user on the same machine** | Can connect to any loopback port; cannot read the user's files. | A 256-bit token is required as the first line; the discovery file is `0600` in a `0700` per-user directory that must be owned by the user; the proxy refuses a discovery file that is not ours or is readable by others. |
-| **A web page in the user's browser** (including DNS rebinding) | Can open a TCP connection to `127.0.0.1:<port>` and send **HTTP**. Cannot read files, cannot send arbitrary bytes. | The socket is **not HTTP**: the first line must be exactly the handshake JSON with the token. Anything HTTP-shaped is dropped without an answer and without counting against the lockout. `Origin`/`Host` are therefore irrelevant: nothing parses them, and a page cannot guess a 256-bit token. |
+| **A web page in the user's browser** (including DNS rebinding) | Can open a TCP connection to `127.0.0.1:<port>` and send **HTTP**. Cannot read files, cannot send arbitrary bytes. | The socket is **not HTTP**: the first line must be exactly the handshake JSON with the token. Anything HTTP-shaped is dropped without an answer. `Origin`/`Host` are therefore irrelevant: nothing parses them, and a page cannot guess a 256-bit token. |
 | **A prompt-injected model** driving the tools | The realistic attacker for the *tools*. | Roots and `..` rules (ADR 0014) enforced in the proxy **and again in the app**; the registry validates arguments in both; quitting is not a tool; a modal dialog (an unsaved-changes question included) blocks everything except reads and the dialog tool; a visible, un-hideable indication; the user can disconnect. |
 | **A network peer** | Must not reach the app. | The listener binds `127.0.0.1` only, refuses any other configured address, drops non-loopback peers. |
 
@@ -40,11 +40,12 @@ threat model matters more than the feature.
    First line from the client: exactly `{"hello":"aurora-bridge","version":1,"token":"<64 hex>"}`
    (unknown fields refused, at most 512 bytes, within 3 s *in total*, not per
    read). Token from the OS RNG (`getrandom`), compared in constant time.
-   After five failed handshakes new connections are refused for a growing
-   time (1 s doubling to 60 s); **only a well-formed handshake carrying a
-   wrong token counts** (binary junk, a TLS hello, invalid UTF-8, JSON of
-   another shape and HTTP are refused or dropped and never counted). **One** controller; a second authenticated
-   connection is refused; at most four handshakes in progress. Requests are
+   There is **no lockout** (addendum, task 165): a failed handshake costs only
+   its own connection (answered after 250 ms, then closed), and a full set of
+   eight handshake slots drops the connection that already failed, else the
+   oldest waiting one, so neither wrong tokens nor silent connections can keep
+   the real controller out. **One** controller; a second authenticated
+   connection is refused. Requests are
    at most 1 MiB, rate-limited (burst 32, 20/s) and served one at a time per
    connection; a controller silent for 5 minutes is dropped (the proxy
    reconnects).
@@ -168,16 +169,17 @@ unless the user asks.
   `--mcp-bridge-max-mpx`, default 50 Mpx): the window can pause for as long as
   the same action takes for a person. The UI thread never *waits* on the
   socket.
-* A failed-handshake lockout is also a denial of service against the real
-  controller (capped at 60 s).
+* (Task 165) There is no failed-handshake lockout: it was a denial of service
+  against the real controller. Guessing is stopped by the 256-bit token alone.
 * Any process running as the same user can use the bridge. A multi-user
   machine is protected by the permission checks, not by the token alone.
 * Windows ACLs on the discovery directory are not verified by code (the
   per-user profile directory is relied on); Windows and macOS are untested.
-* The token is generated once per app run and is **not rotated per
-  controller**: a controller that has read the discovery file can reconnect
-  until the app exits or the user runs Disconnect Automation. Anything that
-  could read the file once can read it again.
+* The token is replaced whenever a controller's session ends (task 165), so a
+  stale copy is useless; anything that can read the discovery file while the app
+  runs can still read the current token. The file is not removed on SIGTERM
+  (no safe signal handling without a new dependency); the proxy refuses a
+  discovery file whose lock is not held.
 * **Windows ACLs on the discovery directory are not verified by code**; the
   per-user profile directory's own ACL is relied on. Windows and macOS are
   untested.

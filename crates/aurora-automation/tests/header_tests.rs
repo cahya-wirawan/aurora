@@ -1,5 +1,11 @@
 //! PSD / PSB layer rectangles read from the header structure alone.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 
 use std::io::Cursor;
 

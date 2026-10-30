@@ -214,7 +214,7 @@ impl BridgeServer {
                 "the bridge token must be 64 hexadecimal characters",
             ));
         }
-        *lock(&self.shared.token) = token_text.to_owned();
+        token_text.clone_into(&mut lock(&self.shared.token));
         Ok(())
     }
 

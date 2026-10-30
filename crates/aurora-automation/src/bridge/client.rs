@@ -44,7 +44,7 @@ impl BridgeClient {
     ///
     /// # Errors
     /// [`ClientError::Connect`] with the reason (including the app's
-    /// refusal: wrong token, another controller, lockout).
+    /// refusal: wrong token, another controller).
     pub fn connect(info: &Discovery) -> Result<Self, ClientError> {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), info.port);
         Self::connect_to(addr, &info.token, Duration::from_secs(5))

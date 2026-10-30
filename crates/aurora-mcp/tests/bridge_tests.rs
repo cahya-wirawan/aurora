@@ -496,7 +496,7 @@ struct RotatingRig {
     server: BridgeServer,
     published: discovery::Published,
     record: Discovery,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 fn rotating_rig() -> RotatingRig {
@@ -518,7 +518,7 @@ fn rotating_rig() -> RotatingRig {
         server,
         published,
         record,
-        _dir: dir,
+        dir,
     }
 }
 
@@ -558,7 +558,7 @@ async fn a_token_read_just_before_a_rotation_is_read_again_once() {
     let writer = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(80));
         r.published.rewrite(&next).unwrap();
-        (r.server, r.published, r._dir)
+        (r.server, r.published, r.dir)
     });
     let mut c = start_session(
         Box::new(BridgeSession::new(DiscoverySource::File(path))),

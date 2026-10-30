@@ -454,8 +454,7 @@ fn repeated_wrong_tokens_never_lock_the_right_one_out() {
     let wrong = "1".repeat(64);
     for round in 0..40 {
         let err = BridgeClient::connect_to(server.local_addr(), &wrong, Duration::from_secs(3))
-            .err()
-            .expect("a wrong token is refused");
+            .expect_err("a wrong token is refused");
         assert!(err.to_string().contains("authentication failed"), "{err}");
         if round % 8 == 7 {
             // Right in the middle of the stream of failures.
