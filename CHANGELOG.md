@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.300.1] - 2026-10-30
+
+### Fixed
+
+- Wait for a cancelled check's thread before the next start in a status-text test
+
 ## [0.300.0] - 2026-10-30
 
 ### Changed
