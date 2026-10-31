@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.301.0] - 2026-10-31
+
+### Changed
+
+- Records for task 166: notes moved to Not saved
+
 ## [0.300.1] - 2026-10-30
 
 ### Fixed

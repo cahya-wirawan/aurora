@@ -817,16 +817,16 @@ impl Notes {
 ///
 /// - [`ImportLossKind::NotSaved`]: something the file had is not in the
 ///   document, so not in a saved file: a layer, mask, effect, clipping or
-///   setting left out, ignored or "not kept"; and the original of anything
-///   opened as pixels (text, smart object, shape or fill with its source not
-///   kept, vector masks converted to pixel masks), exactly as the writer
-///   itself lists "saved as ordinary pixel layers" under Not saved.
+///   setting left out, ignored or "not kept" (a mask drawn without its
+///   feather or density, an unknown blend mode shown as Normal); and the
+///   original of anything opened as pixels (text, smart object, shape or fill
+///   with its source not kept, vector masks converted to pixel masks), exactly
+///   as the writer itself lists "saved as ordinary pixel layers" under Not
+///   saved.
 /// - [`ImportLossKind::Changed`]: the content is in the document in another
 ///   form or limited to a range: kept text data, alpha channels held as
 ///   saved selections, a Grayscale file held as RGB, values clamped to
-///   Photoshop's ranges, an unknown blend mode shown (and saved) as Normal,
-///   a mask drawn without its feather or density, an artboard colour drawn
-///   as a layer.
+///   Photoshop's ranges, an artboard colour drawn as a layer.
 /// - [`ImportLossKind::FromOpen`]: everything else, **including every line
 ///   nobody could place with confidence**: display approximations and
 ///   unverified drawing (the data is kept or the difference is only on
@@ -891,17 +891,17 @@ const fn note_kind(note: Note) -> ImportLossKind {
         | Note::AlphaSpot
         | Note::AlphaEmpty
         | Note::AlphaOverCaps
-        | Note::AlphaUnreadable => NotSaved,
+        | Note::AlphaUnreadable
+        | Note::UnknownBlendMode
+        | Note::MaskParametersNotApplied
+        | Note::FeatherNotApplied => NotSaved,
         // Changed: kept, in another form or limited to a range.
         Note::TextKept
         | Note::AlphaRead
         | Note::AlphaInverted
         | Note::GrayscaleHeldAsRgb
         | Note::EffectsClamped
-        | Note::UnknownBlendMode
         | Note::ArtboardBackgroundDrawn
-        | Note::MaskParametersNotApplied
-        | Note::FeatherNotApplied
         | Note::GreyExposureDrawn => Changed,
         // From open: display approximations and unverified drawing (the data is
         // kept or the difference is on screen only), effects "not shown" that
