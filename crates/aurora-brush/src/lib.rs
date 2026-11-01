@@ -50,6 +50,10 @@
 mod amount;
 #[cfg(test)]
 mod amount_tests;
+// EXPERIMENTAL (task 168 spike): not exported, not wired into any tool.
+mod bristle;
+#[cfg(test)]
+mod bristle_tests;
 mod clone;
 #[cfg(test)]
 mod clone_tests;
