@@ -74,10 +74,12 @@ pub(crate) fn touch_sample(location: (f64, f64), force: Option<Force>) -> PenSam
     )
 }
 
-/// Which source owns the gesture: one mouse button at most, or one touch.
+/// Which source owns the gesture: the mouse (any buttons held) or one touch.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct PointerGate {
-    mouse_down: bool,
+    /// Mouse buttons pressed and not yet released (saturating; reset when
+    /// the window loses focus, since a release outside it may never arrive).
+    mouse_down: u8,
     touch: Option<u64>,
 }
 
@@ -93,7 +95,7 @@ impl PointerGate {
         if self.touch.is_some() {
             return false;
         }
-        self.mouse_down = true;
+        self.mouse_down = self.mouse_down.saturating_add(1);
         true
     }
 
@@ -104,7 +106,13 @@ impl PointerGate {
 
     /// A mouse release that was allowed.
     pub(crate) fn mouse_released(&mut self) {
-        self.mouse_down = false;
+        self.mouse_down = self.mouse_down.saturating_sub(1);
+    }
+
+    /// The window lost focus: a mouse release may never arrive, so stop
+    /// counting held buttons (otherwise a touch could never start again).
+    pub(crate) fn focus_lost(&mut self) {
+        self.mouse_down = 0;
     }
 
     /// Classifies one touch event.
@@ -117,7 +125,7 @@ impl PointerGate {
     ) -> TouchAction {
         let sample = touch_sample(location, force);
         match (phase, self.touch) {
-            (TouchPhase::Started, None) if !self.mouse_down => {
+            (TouchPhase::Started, None) if self.mouse_down == 0 => {
                 self.touch = Some(id);
                 TouchAction::Press(sample)
             }
@@ -252,5 +260,33 @@ mod tests {
         gate.touch(TouchPhase::Ended, 1, (0.0, 0.0), None);
         assert!(gate.mouse_allowed());
         assert!(gate.mouse_pressed());
+    }
+
+    #[test]
+    fn two_mouse_buttons_must_both_release_before_a_touch() {
+        let mut gate = PointerGate::default();
+        assert!(gate.mouse_pressed());
+        assert!(gate.mouse_pressed());
+        gate.mouse_released();
+        assert_eq!(
+            gate.touch(TouchPhase::Started, 1, (0.0, 0.0), None),
+            TouchAction::Ignore
+        );
+        gate.mouse_released();
+        assert!(matches!(
+            gate.touch(TouchPhase::Started, 1, (0.0, 0.0), None),
+            TouchAction::Press(_)
+        ));
+    }
+
+    #[test]
+    fn losing_focus_forgets_a_held_mouse_button() {
+        let mut gate = PointerGate::default();
+        assert!(gate.mouse_pressed());
+        gate.focus_lost();
+        assert!(matches!(
+            gate.touch(TouchPhase::Started, 1, (0.0, 0.0), None),
+            TouchAction::Press(_)
+        ));
     }
 }

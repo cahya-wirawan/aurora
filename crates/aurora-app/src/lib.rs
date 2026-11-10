@@ -100263,6 +100263,9 @@ impl App {
                 if !focused {
                     self.cancel_panel_drag();
                     self.clear_tooltip();
+                    // Task 169: a mouse release lost with the focus must not
+                    // keep touch input locked out.
+                    self.pointer_gate.focus_lost();
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
