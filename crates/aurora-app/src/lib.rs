@@ -599,6 +599,7 @@ pub mod headless;
 mod lasso_tools;
 mod layer_thumbnails;
 pub mod mcp_session;
+mod pen_input;
 pub use bridge_app::{AUTOMATION_CONNECTED, BridgeOptions};
 mod menu_bar_app;
 mod menu_bar_state;
@@ -31521,6 +31522,11 @@ struct App {
     /// space (already DPI-adjusted — see [`logical_point`]) — `None`
     /// before the first `CursorMoved`, or after `CursorLeft`.
     pointer_position: Option<(f32, f32)>,
+    /// Which pointer source (mouse or one touch) owns the gesture (task 169).
+    pointer_gate: pen_input::PointerGate,
+    /// The latest pointer sample (pressure, tilt, rotation), set before each
+    /// press/move reaches the stroke path. Nothing consumes pressure yet.
+    pen_sample: aurora_core::PenSample,
     /// The Widget Gallery panel while open (0.130.0) — `None` means it is
     /// not in the tree at all. See [`toggle_gallery`].
     gallery: Option<aurora_ui::GalleryPanel>,
@@ -32094,6 +32100,8 @@ impl App {
             widget_paint_cache: widget_paint_cache::WidgetPaintCache::default(),
             text_engine: None,
             pointer_position: None,
+            pointer_gate: pen_input::PointerGate::default(),
+            pen_sample: aurora_core::PenSample::default(),
             gallery: None,
             gallery_click: ClickTracker::default(),
             channel_click: None,
@@ -34925,6 +34933,55 @@ impl App {
         saved
     }
 
+    /// `WindowEvent::CursorLeft`, and a cancelled touch: ends the pointer's
+    /// gestures as an interruption (a live stroke keeps its undo step).
+    fn handle_cursor_left(&mut self) {
+        self.pointer_position = None;
+        // 0.166.0: leaving the window cancels a panel drag.
+        self.cancel_panel_drag();
+        // Dragging off the window edge ends the drag, and used
+        // to end it by simply dropping it -- losing a live
+        // stroke's whole undo entry along with it. Commit it the
+        // same way a release would (`commit_ending_drag`).
+        // A Polygonal Lasso (clicked vertices, no button held) stays.
+        let interrupted = lasso_tools::take_on_cursor_left(&mut self.drag);
+        self.commit_drag(interrupted);
+        // A gallery drag ends too: its release may never arrive.
+        // The value keeps whatever the last move set.
+        self.gallery_click.release_capture();
+        self.settle_layer_controls_drag();
+        self.update_gallery_hover(None);
+        self.update_toolbar_hover(None);
+        self.update_menu_bar_hover(None);
+    }
+
+    /// A real `WindowEvent::Touch` (task 169): one touch at a time drives the
+    /// same press/move/release handlers as the mouse, carrying its sample.
+    fn handle_touch(&mut self, touch: winit::event::Touch) {
+        let at = (touch.location.x, touch.location.y);
+        match self
+            .pointer_gate
+            .touch(touch.phase, touch.id, at, touch.force)
+        {
+            pen_input::TouchAction::Press(sample) => {
+                self.pen_sample = sample;
+                self.handle_pointer_moved(at);
+                self.handle_pointer_pressed(winit::event::MouseButton::Left);
+            }
+            pen_input::TouchAction::Move(sample) => {
+                self.pen_sample = sample;
+                self.handle_pointer_moved(at);
+            }
+            pen_input::TouchAction::Release(sample) => {
+                self.pen_sample = sample;
+                self.handle_pointer_moved(at);
+                self.handle_pointer_released(winit::event::MouseButton::Left);
+            }
+            pen_input::TouchAction::Cancel => self.handle_cursor_left(),
+            pen_input::TouchAction::Ignore => {}
+        }
+    }
+
     /// A real `WindowEvent::CursorMoved`: updates the tracked pointer
     /// position and, if a rail resize is in progress
     /// ([`RailResize`]), applies the new width
@@ -35621,6 +35678,10 @@ impl App {
     /// collapse still left a long drag across one emitting ~100
     /// identical lines.
     fn paint_dab(&mut self, doc_point: (f32, f32)) {
+        // Task 169: the sample (pressure, tilt) is carried to the stamp site;
+        // nothing maps it to size or opacity yet, so strokes are unchanged.
+        let pressure = self.pen_sample.pressure;
+        debug_assert!((0.0..=1.0).contains(&pressure));
         // The Clone Stamp (0.221.0) is the Brush's drag with a cloned dab.
         if let Some(offset) = clone_stamp::drag_offset(self.drag.as_ref()) {
             self.clone_dab(doc_point, offset);
@@ -100238,38 +100299,33 @@ impl App {
                 tracing::debug!("file drag cancelled");
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.handle_pointer_moved((position.x, position.y));
+                if self.pointer_gate.mouse_allowed() {
+                    self.pen_sample = aurora_core::PenSample::mouse((position.x, position.y));
+                    self.handle_pointer_moved((position.x, position.y));
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button,
                 ..
-            } => self.handle_pointer_pressed(button),
+            } => {
+                if self.pointer_gate.mouse_pressed() {
+                    self.handle_pointer_pressed(button);
+                }
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Released,
                 button,
                 ..
-            } => self.handle_pointer_released(button),
-            WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
-            WindowEvent::CursorLeft { .. } => {
-                self.pointer_position = None;
-                // 0.166.0: leaving the window cancels a panel drag.
-                self.cancel_panel_drag();
-                // Dragging off the window edge ends the drag, and used
-                // to end it by simply dropping it -- losing a live
-                // stroke's whole undo entry along with it. Commit it the
-                // same way a release would (`commit_ending_drag`).
-                // A Polygonal Lasso (clicked vertices, no button held) stays.
-                let interrupted = lasso_tools::take_on_cursor_left(&mut self.drag);
-                self.commit_drag(interrupted);
-                // A gallery drag ends too: its release may never arrive.
-                // The value keeps whatever the last move set.
-                self.gallery_click.release_capture();
-                self.settle_layer_controls_drag();
-                self.update_gallery_hover(None);
-                self.update_toolbar_hover(None);
-                self.update_menu_bar_hover(None);
+            } => {
+                if self.pointer_gate.mouse_allowed() {
+                    self.pointer_gate.mouse_released();
+                    self.handle_pointer_released(button);
+                }
             }
+            WindowEvent::Touch(touch) => self.handle_touch(touch),
+            WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
+            WindowEvent::CursorLeft { .. } => self.handle_cursor_left(),
             _ => {}
         }
     }
