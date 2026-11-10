@@ -109,10 +109,14 @@ impl PointerGate {
         self.mouse_down = self.mouse_down.saturating_sub(1);
     }
 
-    /// The window lost focus: a mouse release may never arrive, so stop
-    /// counting held buttons (otherwise a touch could never start again).
-    pub(crate) fn focus_lost(&mut self) {
+    /// The window lost focus: a mouse release or a touch's `Ended` may never
+    /// arrive, so forget held buttons and the active touch (otherwise one
+    /// source could lock the other out for the rest of the session).
+    /// Returns whether a touch was active, so the caller can interrupt its
+    /// gesture the way a cancelled touch does.
+    pub(crate) fn focus_lost(&mut self) -> bool {
         self.mouse_down = 0;
+        self.touch.take().is_some()
     }
 
     /// Classifies one touch event.
@@ -288,5 +292,33 @@ mod tests {
             gate.touch(TouchPhase::Started, 1, (0.0, 0.0), None),
             TouchAction::Press(_)
         ));
+    }
+
+    #[test]
+    fn losing_focus_mid_touch_frees_the_mouse_and_new_touches() {
+        let mut gate = PointerGate::default();
+        assert!(matches!(
+            gate.touch(TouchPhase::Started, 7, (0.0, 0.0), None),
+            TouchAction::Press(_)
+        ));
+        assert!(!gate.mouse_allowed());
+        // The touch's Ended is lost with the focus.
+        assert!(gate.focus_lost());
+        assert!(gate.mouse_allowed());
+        assert!(gate.mouse_pressed());
+        gate.mouse_released();
+        // A new touch, even with another id, can start.
+        assert!(matches!(
+            gate.touch(TouchPhase::Started, 8, (0.0, 0.0), None),
+            TouchAction::Press(_)
+        ));
+        // A late Ended for the lost touch is ignored.
+        assert_eq!(
+            gate.touch(TouchPhase::Ended, 7, (0.0, 0.0), None),
+            TouchAction::Ignore
+        );
+        // Focus loss with nothing active reports no touch.
+        let mut idle = PointerGate::default();
+        assert!(!idle.focus_lost());
     }
 }

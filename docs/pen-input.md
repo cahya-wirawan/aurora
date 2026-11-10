@@ -18,6 +18,13 @@ so a consumer that ignores pressure behaves as before.
 * Exactly one source owns a gesture: one touch id at a time (other fingers
   are ignored); a touch cannot start while a mouse button is down, and mouse
   events are ignored while a touch is active.
+* Losing window focus forgets held mouse buttons and the active touch, so a
+  lost release or `Ended` cannot lock either source out; a touch gesture live
+  at that moment is interrupted like a cancelled one. A late `Ended` for it
+  is ignored.
+* A touch release clears the hover highlights and any tooltip (a lifted
+  finger or pen has no hover position). A touch does update hover while it
+  moves, as the mouse does.
 * `App::pen_sample` holds the latest sample and is read at `paint_dab`.
   **Nothing maps pressure or tilt to size, opacity or flow yet**; that is a
   design decision for the design owner.

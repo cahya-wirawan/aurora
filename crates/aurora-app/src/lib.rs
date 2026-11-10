@@ -34976,6 +34976,13 @@ impl App {
                 self.pen_sample = sample;
                 self.handle_pointer_moved(at);
                 self.handle_pointer_released(winit::event::MouseButton::Left);
+                // A lifted finger or pen has no hover position: clear the
+                // hover highlights and any tooltip it started.
+                self.pointer_position = None;
+                self.clear_tooltip();
+                self.update_gallery_hover(None);
+                self.update_toolbar_hover(None);
+                self.update_menu_bar_hover(None);
             }
             pen_input::TouchAction::Cancel => self.handle_cursor_left(),
             pen_input::TouchAction::Ignore => {}
@@ -100263,9 +100270,13 @@ impl App {
                 if !focused {
                     self.cancel_panel_drag();
                     self.clear_tooltip();
-                    // Task 169: a mouse release lost with the focus must not
-                    // keep touch input locked out.
-                    self.pointer_gate.focus_lost();
+                    // Task 169: a mouse release or a touch's end lost with
+                    // the focus must not lock either source out; a live
+                    // touch gesture is interrupted like a cancelled touch
+                    // (a stroke keeps its undo step).
+                    if self.pointer_gate.focus_lost() {
+                        self.handle_cursor_left();
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
