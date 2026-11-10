@@ -122,15 +122,17 @@ mod tests {
     #[test]
     fn the_pointer_moving_and_leaving_report_to_the_tooltips() {
         // At the end of `update_toolbar_hover`, which the pointer move and
-        // `CursorLeft` both call.
+        // `CursorLeft` both call; a touch release (task 169) clears the
+        // hover too.
         assert_eq!(count("self.update_tooltip_hover(position);"), 1);
         assert_eq!(count("self.update_toolbar_hover(Some(position));"), 1);
-        assert_eq!(count("self.update_toolbar_hover(None);"), 1);
+        assert_eq!(count("self.update_toolbar_hover(None);"), 2);
     }
 
     #[test]
     fn losing_window_focus_clears_it_and_the_loop_steps_it_once() {
-        assert_eq!(count("self.clear_tooltip();"), 1);
+        // Losing window focus, and a touch release (task 169).
+        assert_eq!(count("self.clear_tooltip();"), 2);
         assert_eq!(count("let tooltip_deadline = self.tooltip_step(now);"), 1);
         assert_eq!(
             count("let deadline = earliest_deadline(deadline, tooltip_deadline);"),

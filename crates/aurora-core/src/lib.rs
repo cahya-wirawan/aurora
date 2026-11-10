@@ -24,6 +24,7 @@ pub mod hue_saturation;
 pub mod id;
 pub mod levels;
 pub mod pattern;
+pub mod pen;
 pub mod photo_filter;
 pub mod posterize;
 pub mod selective_color;
@@ -69,6 +70,7 @@ pub use hue_ranges::{
 pub use hue_saturation::{HueSaturationError, HueSaturationParams};
 pub use id::{Id, IdGenerator};
 pub use levels::{GAMMA_MAX, GAMMA_MIN, LevelsChannel, LevelsError, LevelsParams, MIN_INPUT_SPAN};
+pub use pen::{PenSample, PointerSource};
 pub use photo_filter::{
     DEFAULT_DENSITY, PHOTO_FILTER_PRESETS, PhotoFilterError, PhotoFilterParams,
 };

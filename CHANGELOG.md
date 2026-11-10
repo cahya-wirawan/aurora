@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.302.0] - 2026-11-11
+
+### Changed
+
+- Records for task 169: pen-input contract, touch paints, rmcp 3.9.0
+
 ## [0.301.0] - 2026-10-31
 
 ### Changed
