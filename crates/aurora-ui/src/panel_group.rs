@@ -49,7 +49,8 @@ use taffy::{Dimension, Display, FlexDirection, Size, Style};
 
 use crate::panel::{
     PanelHandle, PanelSizing, grouped_header_style, insert_panel, panel_is_closed,
-    panel_is_collapsed, root_style, set_display, set_panel_collapsed, shown_children_floor,
+    panel_is_collapsed, root_style, set_display, set_panel_collapsed, set_title_tab_shown,
+    shown_children_floor,
 };
 
 /// One inserted panel tab group's own widget ids.
@@ -113,6 +114,8 @@ pub fn insert_panel_group(
         selected,
     )?;
     widgets::set_tab_bar_surface(tree, bar, Some(widgets::StripSurface::Header))?;
+    // Task 173: the selected tab is the panel's own colour, so it joins the body.
+    widgets::set_tab_bar_selected_surface(tree, bar, Some(widgets::StripSurface::Panel))?;
     // The tab row never shrinks and counts one row toward the group's
     // floor (`shown_children_floor` reads declared minimums only).
     let mut bar_style = tree
@@ -126,6 +129,7 @@ pub fn insert_panel_group(
     for title in titles {
         let panel = insert_panel(tree, root, *title, scales)?;
         tree.set_style(panel.header, grouped_header_style())?;
+        set_title_tab_shown(tree, panel, false)?;
         members.push(panel);
     }
     let group = PanelGroup { root, bar, members };
@@ -188,6 +192,8 @@ pub(crate) fn build_panel_group(
         selected,
     )?;
     widgets::set_tab_bar_surface(tree, bar, Some(widgets::StripSurface::Header))?;
+    // Task 173: the selected tab is the panel's own colour, so it joins the body.
+    widgets::set_tab_bar_selected_surface(tree, bar, Some(widgets::StripSurface::Panel))?;
     let mut bar_style = tree
         .style(bar)
         .cloned()

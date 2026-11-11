@@ -16,6 +16,10 @@ pub enum StripSurface {
     Chrome,
     /// `surface.header`: a panel's title strip and a panel group's tab row.
     Header,
+    /// `surface.panel`: a panel's own colour, used by the title tab of a
+    /// lone panel and by the selected tab of a panel group (task 173), so
+    /// the tab joins the body below it.
+    Panel,
 }
 
 /// Inserts a [`WidgetKind::Strip`] under `parent` with the given layout

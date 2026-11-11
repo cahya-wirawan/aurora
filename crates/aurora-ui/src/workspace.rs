@@ -430,9 +430,26 @@ impl Workspace {
 /// that function), and it propagated identically. `min_size.height` is
 /// pinned alongside it for symmetry only; height is the rail's cross axis
 /// and is already `Stretch`ed by `root`, so it is inert today.
-fn rail_style(width: f32) -> Style {
+/// The dark gutter between the docked regions (task 173), in logical px:
+/// `spacing.xxs` (4). The gutter is the window's own `surface.app` showing
+/// through between shown regions; no colour is painted for it.
+#[must_use]
+pub fn gutter(scales: &Scales) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let gutter = scales.spacing.xxs as f32;
+    gutter
+}
+
+fn rail_style(width: f32, scales: &Scales) -> Style {
     Style {
         flex_direction: FlexDirection::Column,
+        // Task 173: a `surface.app` gutter between the rail's shown slots
+        // (taffy's gap skips `Display::None` children, so a closed panel
+        // or a hidden group adds none).
+        gap: taffy::Size {
+            width: taffy::style_helpers::zero(),
+            height: taffy::style_helpers::length(gutter(scales)),
+        },
         size: taffy::Size {
             width: taffy::style_helpers::length(width),
             height: taffy::style_helpers::auto(),
@@ -529,7 +546,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
 
     let rail = match tree.insert(
         root,
-        rail_style(RAIL_WIDTH_DEFAULT),
+        rail_style(RAIL_WIDTH_DEFAULT, scales),
         Node::new(Role::GenericContainer),
         WidgetKind::Container,
     ) {
@@ -951,6 +968,14 @@ fn insert_canvas_column(
                 width: Dimension::ZERO,
                 height: Dimension::ZERO,
             },
+            // Task 173: a gutter on each side, towards the tools column
+            // and towards the rail (or its collapsed strip).
+            margin: taffy::Rect {
+                left: taffy::style_helpers::length(gutter(scales)),
+                right: taffy::style_helpers::length(gutter(scales)),
+                top: taffy::style_helpers::zero(),
+                bottom: taffy::style_helpers::zero(),
+            },
             ..Default::default()
         },
     ) {
@@ -1089,11 +1114,13 @@ pub fn set_rail_width(
     let clamped = width.clamp(RAIL_MIN_WIDTH, RAIL_MAX_WIDTH);
     // 0.165.0: a width change keeps the rail collapsed or expanded as it
     // was — `display` is the collapse, `size.width` the remembered width.
-    let mut style = rail_style(clamped);
-    style.display = tree
+    // Task 173: only the width changes; the rail keeps its gap between
+    // slots and its display.
+    let mut style = tree
         .style(rail_id)
         .ok_or(WidgetError::UnknownWidget(rail_id))?
-        .display;
+        .clone();
+    style.size.width = taffy::style_helpers::length(clamped);
     tree.set_style(rail_id, style)?;
 
     let node = tree
@@ -1404,6 +1431,9 @@ pub(crate) fn test_group(workspace: &Workspace) -> PanelGroup {
 
 #[cfg(test)]
 mod tests {
+    /// The dark gutter between shown regions (task 173): `spacing.xxs`.
+    const GUTTER: u32 = 4;
+
     use super::{RAIL_MAX_WIDTH, RAIL_MIN_WIDTH, build_workspace, rail_width, set_rail_width};
     use aurora_widgets::FocusManager;
 
@@ -1471,7 +1501,7 @@ mod tests {
             assert_eq!(tools.width, tools_w, "{case}: {tools:?}");
             assert_eq!((tools.x, tools.y), (0, 0), "{case}");
             assert_eq!(bar.height, row + 2 * xs, "{case}: {bar:?}");
-            assert_eq!(column.x, i64::from(tools.width), "{case}");
+            assert_eq!(column.x, i64::from(tools.width + GUTTER), "{case}");
             assert_eq!((bar.x, bar.y), (column.x, 0), "{case}");
             // The bar's own padding is a floor on its width: in a window
             // too narrow for even that (the last case), it overhangs its
@@ -1494,9 +1524,9 @@ mod tests {
                 "{case}: the canvas sits under the bar, right of the tools"
             );
             assert_eq!(
-                column.x + i64::from(column.width),
+                column.x + i64::from(column.width + GUTTER),
                 rail_bounds.x,
-                "{case}: the canvas column ends where the rail begins"
+                "{case}: the canvas column and the rail's gutter end where the rail begins"
             );
             for (name, a, b) in [
                 ("tools/column", tools, column),
@@ -1585,11 +1615,18 @@ mod tests {
         assert_eq!(strip(ws.options_bar), chrome, "options bar");
         assert_eq!(strip(ws.status_bar.root), chrome, "status bar");
         assert_eq!(strip(ws.panel_strip.root), chrome, "collapsed rail strip");
-        assert_eq!(bar_surface(ws.document_tabs), chrome, "document tab strip");
+        // Task 173: the document strip is header-coloured, its selected tab
+        // panel-coloured; the menu bar is a flat chrome strip.
+        assert_eq!(bar_surface(ws.document_tabs), header, "document tab strip");
         assert!(
-            matches!(ws.tree.payload(ws.menu_bar.root), Some(WidgetKind::Panel)),
-            "the menu bar is a Panel (surface.panel)"
+            matches!(
+                ws.tree.payload(ws.document_tabs),
+                Some(WidgetKind::TabBar(state))
+                    if state.selected_surface() == Some(StripSurface::Panel)
+            ),
+            "the selected document tab is panel-coloured"
         );
+        assert_eq!(strip(ws.menu_bar.root), chrome, "menu bar");
         for p in ws.all_slots().flat_map(super::RailSlot::panels) {
             assert_eq!(strip(p.header), header, "every panel's title strip");
         }
@@ -1665,7 +1702,8 @@ mod tests {
         let tools = tools_width(&ws);
         let bar = options_bar_height(&ws);
         assert!(tools > 0 && bar > 0, "tools {tools}, bar {bar}");
-        assert_eq!(canvas_bounds.width, 750 - tools);
+        // Task 173: a gutter each side of the canvas column.
+        assert_eq!(canvas_bounds.width, 750 - tools - 2 * GUTTER);
         assert_eq!(rail_bounds.width, 250);
         // 0.162.0: the status bar takes one row off the column's bottom.
         let status = bounds_of(&ws, ws.status_bar.root).height;
@@ -1677,7 +1715,7 @@ mod tests {
         assert_eq!(rail_bounds.height, 800);
         assert_eq!(
             (canvas_bounds.x, canvas_bounds.y),
-            (i64::from(tools), i64::from(bar + tabs))
+            (i64::from(tools + GUTTER), i64::from(bar + tabs))
         );
 
         let Some(layers_bounds) = ws.tree.bounds(ws.layers.root) else {
@@ -1712,8 +1750,8 @@ mod tests {
         assert_eq!(bar_bounds.height, row, "the tab row is one row");
         assert_eq!(
             group_bounds.y,
-            layers_bounds.bottom(),
-            "the group docks under Layers"
+            layers_bounds.bottom() + i64::from(GUTTER),
+            "the group docks under Layers, a gutter below it"
         );
         assert_eq!(bar_bounds.y, group_bounds.y, "its tab row first");
         assert_eq!(
@@ -1747,13 +1785,13 @@ mod tests {
         };
         assert_eq!(
             group_bounds.height,
-            800 - 2 * row - crate::layer_toolbar::toolbar_px(&test_scales()),
-            "the group fills the rest"
+            800 - 2 * row - crate::layer_toolbar::toolbar_px(&test_scales()) - GUTTER,
+            "the group fills the rest, less the gutter below Layers"
         );
         assert_eq!(
             history_bounds.height,
-            800 - 3 * row - crate::layer_toolbar::toolbar_px(&test_scales()),
-            "History under its tab row"
+            800 - 3 * row - crate::layer_toolbar::toolbar_px(&test_scales()) - GUTTER,
+            "History under its tab row, less the gutter below Layers"
         );
         assert_eq!(
             properties_bounds.height, 0,
@@ -1811,7 +1849,7 @@ mod tests {
         assert_eq!(rail_bounds.width, 300);
         assert_eq!(
             canvas_bounds.width,
-            700 - tools_width(&ws),
+            700 - tools_width(&ws) - 2 * GUTTER,
             "the canvas must give back exactly what the rail gained"
         );
     }
@@ -1981,7 +2019,9 @@ mod tests {
             #[allow(clippy::cast_precision_loss)]
             let tools =
                 (2 * (scales.spacing.lg + 2 * scales.spacing.xxs) + 2 * scales.spacing.xxs) as f32;
-            ws.tree.compute_layout(tools + 1.0, 200.0);
+            // Task 173: the canvas column keeps a gutter each side.
+            ws.tree
+                .compute_layout(tools + 2.0 * GUTTER as f32 + 1.0, 200.0);
 
             let Some(rail) = ws.tree.bounds(ws.rail) else {
                 unreachable!("just laid out");
@@ -2541,8 +2581,12 @@ mod tests {
     #[test]
     fn history_keeps_ten_rows_and_the_curves_editor_its_strip_in_short_windows() {
         let history = |h: f32| group_heights_at(h, false, true).1;
-        assert_eq!(history(900.0), 331);
-        assert_eq!(history(800.0), 231, "already above the floor: unchanged");
+        assert_eq!(history(900.0), 327, "was 331 before task 173's gutter");
+        assert_eq!(
+            history(800.0),
+            227,
+            "already above the floor: 231 before task 173's gutter"
+        );
         assert_eq!(history(768.0), 210, "was 199 before the floor");
         assert_eq!(history(700.0), 210, "was 131 before the floor");
         let floor = 210;
@@ -2563,7 +2607,11 @@ mod tests {
         super::show_history_tab(&mut ws);
         ws.tree.compute_layout(1280.0, 768.0);
         let layers = ws.tree.bounds(ws.layers.root).map_or(0, |b| b.height);
-        assert_eq!(layers, 548 - 11);
+        assert_eq!(
+            layers,
+            548 - 11 - GUTTER,
+            "4 px of the list go to the gutter, task 173"
+        );
     }
 
     /// AC-4: a rail barely taller than every panel's floor (title, one
@@ -2583,8 +2631,10 @@ mod tests {
             Err(err) => unreachable!("{err:?}"),
         };
         fill_panels(&mut ws, &scales, (true, false, true), 20);
-        ws.tree.compute_layout(1274.0, 312.0);
-        assert_stacked_inside_the_rail(&ws, "1274 x 312");
+        // Task 173: the 4 px gutter between Layers and the tab group moved
+        // the floor from 312 to 316.
+        ws.tree.compute_layout(1274.0, 316.0);
+        assert_stacked_inside_the_rail(&ws, "1274 x 316");
         // 0.164.0: History is the other tab of Properties' slot; it is
         // checked with its own tab shown, below.
         let mut history_shown = build_workspace(&scales);
@@ -2592,8 +2642,9 @@ mod tests {
         super::show_history_tab(&mut history_shown);
         // History's body floor is ten rows since 0.199.0 (210 px): 313 px
         // is the shortest rail holding it under a strip-less Layers panel.
-        history_shown.tree.compute_layout(1274.0, 313.0);
-        assert_stacked_inside_the_rail(&history_shown, "1274 x 313, History shown");
+        // (317 px since task 173's gutter.)
+        history_shown.tree.compute_layout(1274.0, 317.0);
+        assert_stacked_inside_the_rail(&history_shown, "1274 x 317, History shown");
         let (Some(rows), Some(panel)) = (
             history_shown.tree.bounds(history_shown.history.viewport),
             history_shown.tree.bounds(history_shown.history.root),
@@ -2704,9 +2755,9 @@ mod tests {
             let right = window.0 as i64;
             assert_eq!(strip.x + i64::from(strip.width), right, "{case}");
             assert_eq!(
-                column.x + i64::from(column.width),
+                column.x + i64::from(column.width + GUTTER),
                 strip.x,
-                "{case}: the canvas column ends where the strip begins"
+                "{case}: the canvas column and its gutter end where the strip begins"
             );
             assert_eq!(bounds_of(&ws, ws.rail).width, 0, "{case}: rail hidden");
             assert_eq!(bounds_of(&ws, ws.divider).width, 0, "{case}");
@@ -2777,7 +2828,7 @@ mod tests {
         let strip_width = strip.width as f32;
         assert!(strip_width < RAIL_MIN_WIDTH, "a narrow strip: {strip:?}");
         let column = bounds_of(&ws, ws.canvas_column);
-        assert_eq!(column.right(), strip.x);
+        assert_eq!(column.right() + i64::from(GUTTER), strip.x);
     }
 
     /// 0.165.0 AC-5: the rail's width is remembered across collapse and
