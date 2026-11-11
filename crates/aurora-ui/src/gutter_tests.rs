@@ -197,11 +197,12 @@ fn a_selected_panel_group_tab_paints_the_panel_colour_and_an_unselected_one_does
     };
     let dark = theme("Dark");
     let sel = paints(&ws, selected, &dark);
-    assert_eq!(sel.first(), Some(&colour(dark.surface.panel)), "fill first");
+    // Task 174: in Dark the panel-coloured fill alone marks the tab, so it
+    // joins the body below with no accent underline.
     assert_eq!(
-        sel.last(),
-        Some(&colour(dark.accent.primary)),
-        "underline kept"
+        sel,
+        vec![colour(dark.surface.panel)],
+        "fill only, no underline"
     );
     assert!(paints(&ws, other, &dark).is_empty(), "unselected: nothing");
     // The row itself stays the header colour.
@@ -209,7 +210,8 @@ fn a_selected_panel_group_tab_paints_the_panel_colour_and_an_unselected_one_does
         paints(&ws, crate::workspace::test_group(&ws).bar, &dark).first(),
         Some(&colour(dark.surface.header))
     );
-    // Where header equals panel the fill is invisible against the row.
+    // Where header equals panel the fill is invisible against the row, so
+    // the accent underline stays as the only mark of the selected tab.
     for name in [
         "Light",
         "High Contrast Dark",
@@ -218,6 +220,11 @@ fn a_selected_panel_group_tab_paints_the_panel_colour_and_an_unselected_one_does
     ] {
         let theme = theme(name);
         assert_eq!(theme.surface.header, theme.surface.panel, "{name}");
+        assert_eq!(
+            paints(&ws, selected, &theme).last(),
+            Some(&colour(theme.accent.primary)),
+            "{name}: underline kept"
+        );
     }
 }
 
@@ -258,7 +265,7 @@ fn a_lone_panels_title_sits_on_a_panel_coloured_tab_in_a_header_coloured_strip()
 }
 
 #[test]
-fn the_document_strip_is_header_coloured_with_a_chrome_coloured_selected_tab() {
+fn the_document_strip_is_header_coloured_with_a_panel_coloured_selected_tab() {
     let ws = laid_out(1000.0, 800.0);
     let Ok(bar) = aurora_widgets::widgets::tab_bar_state(&ws.tree, ws.document_tabs) else {
         unreachable!("the strip is a tab bar");
@@ -269,20 +276,26 @@ fn the_document_strip_is_header_coloured_with_a_chrome_coloured_selected_tab() {
     let dark = theme("Dark");
     let strip = paints(&ws, ws.document_tabs, &dark);
     assert_eq!(strip.first(), Some(&colour(dark.surface.header)));
-    let tab_paints = paints(&ws, tab, &dark);
-    assert_eq!(tab_paints.first(), Some(&colour(dark.surface.chrome)));
+    // Task 174: in Dark the panel-coloured fill alone marks the tab.
     assert_eq!(
-        tab_paints.last(),
-        Some(&colour(dark.accent.primary)),
-        "underline"
+        paints(&ws, tab, &dark),
+        vec![colour(dark.surface.panel)],
+        "fill only, no underline"
     );
-    // Light: chrome (e2e2e5) is a visibly different step from the strip's
-    // header (f5f5f6); in the other themes the two are equal.
-    let light = theme("Light");
-    assert_ne!(light.surface.chrome, light.surface.header);
-    for name in ["High Contrast Dark", "High Contrast Light"] {
+    // Where the strip's header equals the panel the fill is invisible, so
+    // the accent underline is still the selected tab's mark.
+    for name in [
+        "Light",
+        "High Contrast Dark",
+        "High Contrast Light",
+        "Color-Critical",
+    ] {
         let theme = theme(name);
-        assert_eq!(theme.surface.chrome, theme.surface.header, "{name}");
+        assert_eq!(
+            paints(&ws, tab, &theme).last(),
+            Some(&colour(theme.accent.primary)),
+            "{name}: underline kept"
+        );
     }
 }
 
