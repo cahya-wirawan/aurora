@@ -31280,6 +31280,10 @@ struct App {
     /// the layer it was about (0.198.0). Cleared by
     /// [`App::sync_status_bar_now`] once it no longer applies.
     lock_notice: Option<(LockRefusal, Option<aurora_doc::LayerId>)>,
+    /// Windows pen tilt/rotation reader (task 171). Declared before
+    /// `window` and also dropped explicitly first in shutdown: it must be
+    /// removed before the window is destroyed.
+    pen_tracker: Option<aurora_pen_win::PenTracker>,
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
     surface: Option<GpuSurface<'static>>,
@@ -32012,6 +32016,7 @@ impl App {
         let composite_proxy = proxy.clone();
         let thumbnail_proxy = proxy.clone();
         let mut app = Self {
+            pen_tracker: None,
             window: None,
             gpu: None,
             surface: None,
@@ -34955,14 +34960,59 @@ impl App {
         self.update_menu_bar_hover(None);
     }
 
+    /// Installs the Windows pen reader on the shown window; elsewhere (and
+    /// on failure) tilt stays unavailable.
+    fn install_pen_tracker(&mut self, window: &Window) {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if !cfg!(windows) {
+            return;
+        }
+        let hwnd = if let Ok(RawWindowHandle::Win32(handle)) =
+            window.window_handle().map(|h| h.as_raw())
+        {
+            handle.hwnd.get()
+        } else {
+            tracing::warn!("no Win32 window handle; pen tilt unavailable");
+            return;
+        };
+        match aurora_pen_win::PenTracker::install(hwnd) {
+            Ok(tracker) => self.pen_tracker = Some(tracker),
+            Err(err) => tracing::warn!("pen tilt unavailable: {err}"),
+        }
+    }
+
     /// A real `WindowEvent::Touch` (task 169): one touch at a time drives the
     /// same press/move/release handlers as the mouse, carrying its sample.
     fn handle_touch(&mut self, touch: winit::event::Touch) {
         let at = (touch.location.x, touch.location.y);
-        match self
+        // Task 171: on Windows the pen reader knows which contacts are pens.
+        let pen = self
+            .pen_tracker
+            .as_ref()
+            .and_then(|tracker| tracker.pen_info(touch.id));
+        let action = self
             .pointer_gate
-            .touch(touch.phase, touch.id, at, touch.force)
+            .touch(touch.phase, touch.id, at, touch.force);
+        if matches!(
+            touch.phase,
+            winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
+        ) && let Some(tracker) = self.pen_tracker.as_ref()
         {
+            tracker.forget(touch.id);
+        }
+        let action = match action {
+            pen_input::TouchAction::Press(s) => {
+                pen_input::TouchAction::Press(pen_input::enrich(s, pen))
+            }
+            pen_input::TouchAction::Move(s) => {
+                pen_input::TouchAction::Move(pen_input::enrich(s, pen))
+            }
+            pen_input::TouchAction::Release(s) => {
+                pen_input::TouchAction::Release(pen_input::enrich(s, pen))
+            }
+            other => other,
+        };
+        match action {
             pen_input::TouchAction::Press(sample) => {
                 self.pen_sample = sample;
                 self.handle_pointer_moved(at);
@@ -36775,6 +36825,8 @@ impl App {
     /// silently pass `None` for the store and the scratch directory and
     /// still pass the whole gate. See [`ShutdownState`].
     fn finish_shutdown(&mut self) {
+        // Task 171: the window subclass goes before the window does.
+        self.pen_tracker = None;
         // Task 160: the controller is dropped and the discovery file removed
         // first, so no request lands on a closing app.
         self.bridge = None;
@@ -39648,6 +39700,7 @@ impl ApplicationHandler<AppEvent> for App {
         self.text_pipeline = Some(TextPipeline::new(gpu.device()));
         self.glyph_atlas = Some(GlyphAtlas::new(gpu.device()));
 
+        self.install_pen_tracker(&window);
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.surface = Some(surface);

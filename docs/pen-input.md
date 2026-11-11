@@ -41,13 +41,22 @@ A pen delivered as touch cannot be told from a finger, so the source is
 ## Platforms through winit 0.30.13
 
 * Windows: pen and touch arrive as `Touch` with `force` (documented by
-  winit for Windows 8+). Not verified here, no tablet.
+  winit for Windows 8+). winit keeps only the pressure of a pen. Since task
+  171 the `aurora-pen-win` crate subclasses the window and reads
+  `GetPointerPenInfo` for `WM_POINTER*` messages (read-only, every message
+  forwarded), so a pen contact (matched by the `Touch` id, which is the pointer
+  id) reports source `Pen`, `tilt_x`/`tilt_y` (degrees) and `rotation`; a
+  field the device does not report is neutral. The barrel/inverted/eraser
+  flags are read but not used yet. Pressure stays winit's value. Fingers stay
+  `Touch`. **Unverified:** no tablet and no Windows machine were available;
+  history-coalesced samples share the latest pen info; an event buffered by
+  winit while its handler is busy may see a newer sample's info.
 * macOS, X11, Wayland: winit 0.30 documents no pen data (macOS `Touch` is
   unsupported). A tablet there is a mouse. Not verified, no tablet.
 
 ## Next backends
 
-* octotablet for Windows Ink and Wayland tablet protocol (tilt, rotation,
-  eraser end, hover).
+* Wayland tablet protocol and Windows hover/eraser end (tilt and rotation on
+  Windows are done, above).
 * macOS `NSEvent` tablet fields (pressure, tilt, rotation) via platform glue.
 * winit 0.31 when stable and when `accesskit_winit` supports it.

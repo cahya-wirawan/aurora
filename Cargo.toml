@@ -29,6 +29,7 @@ aurora-commands = { path = "crates/aurora-commands" }
 aurora-mcp = { path = "crates/aurora-mcp" }
 aurora-automation = { path = "crates/aurora-automation" }
 aurora-tile = { path = "crates/aurora-tile" }
+aurora-pen-win = { path = "crates/aurora-pen-win" }
 aurora-graph = { path = "crates/aurora-graph" }
 aurora-gpu = { path = "crates/aurora-gpu" }
 aurora-render = { path = "crates/aurora-render" }

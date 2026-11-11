@@ -452,6 +452,7 @@ dependencies = [
  "aurora-gpu",
  "aurora-graph",
  "aurora-io",
+ "aurora-pen-win",
  "aurora-plugin",
  "aurora-render",
  "aurora-text",
@@ -666,6 +667,14 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "aurora-pen-win"
+version = "0.303.0"
+dependencies = [
+ "thiserror 2.0.19",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
