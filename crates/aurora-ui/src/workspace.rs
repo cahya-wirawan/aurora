@@ -1564,10 +1564,11 @@ mod tests {
     }
 
     /// Task 172: the chrome strips paint `surface.chrome` and the panel title
-    /// strips and tab rows paint `surface.header`, so the window background
-    /// (`surface.app`) shows only below the rail and around the document.
+    /// strips and tab rows paint `surface.header`. In Dark those differ from
+    /// `surface.app`, so the window background shows only below the rail and
+    /// around the document; the other themes set chrome = app, header = panel.
     #[test]
-    fn chrome_strips_use_the_panel_surface_and_panel_titles_the_header_surface() {
+    fn chrome_strips_use_the_chrome_surface_and_panel_titles_the_header_surface() {
         use aurora_widgets::widgets::{StripSurface, WidgetKind};
         let ws = build_workspace(&test_scales());
         let strip = |id| match ws.tree.payload(id) {
