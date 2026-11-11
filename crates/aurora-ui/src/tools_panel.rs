@@ -262,7 +262,13 @@ pub fn insert_tools_panel(
     let mut node = Node::new(Role::Toolbar);
     node.set_label(TOOLS_PANEL_LABEL);
     node.set_orientation(Orientation::Vertical);
-    let root = tree.insert(parent, strip_style(scales), node, WidgetKind::Container)?;
+    let root = widgets::insert_strip(
+        tree,
+        parent,
+        strip_style(scales),
+        node,
+        widgets::StripSurface::Chrome,
+    )?;
     let built = build(tree, root, scales, selected);
     if built.is_err() {
         let _ = tree.remove(root);

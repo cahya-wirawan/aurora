@@ -510,6 +510,7 @@ fn allowed_owner(kind: &WidgetKind) -> bool {
         | WidgetKind::TreeItem(_)
         | WidgetKind::Panel
         | WidgetKind::RaisedPanel
+        | WidgetKind::Strip(_)
         | WidgetKind::Dialog
         | WidgetKind::Dropdown(_)
         | WidgetKind::DropdownList
@@ -1421,6 +1422,7 @@ mod tests {
             WidgetKind::Thumbnail(_) => 27,
             WidgetKind::SelectionOutline(_) => 28,
             WidgetKind::GradientBar(_) => 29,
+            WidgetKind::Strip(_) => 30,
         }
     }
 
@@ -1510,6 +1512,12 @@ mod tests {
             Style::default(),
             accesskit::Node::new(Role::Pane),
             WidgetKind::RaisedPanel,
+        ));
+        ok(tree.insert(
+            root,
+            Style::default(),
+            accesskit::Node::new(Role::Pane),
+            WidgetKind::Strip(crate::widgets::StripSurface::Chrome),
         ));
         ok(insert_dialog(
             &mut tree,

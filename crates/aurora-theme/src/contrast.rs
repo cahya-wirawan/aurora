@@ -43,6 +43,56 @@ struct GatedPair {
 }
 
 const GATED_PAIRS: &[GatedPair] = &[
+    // surface.header (task 172): panel title strips and tab rows.
+    GatedPair {
+        label: "text.primary on surface.header",
+        floor: 4.5,
+        foreground: |t| t.text.primary,
+        background: |t| t.surface.header,
+    },
+    GatedPair {
+        label: "text.secondary on surface.header",
+        floor: 4.5,
+        foreground: |t| t.text.secondary,
+        background: |t| t.surface.header,
+    },
+    GatedPair {
+        label: "icon.default on surface.header",
+        floor: 3.0,
+        foreground: |t| t.icon.default,
+        background: |t| t.surface.header,
+    },
+    GatedPair {
+        label: "icon.secondary on surface.header",
+        floor: 3.0,
+        foreground: |t| t.icon.secondary,
+        background: |t| t.surface.header,
+    },
+    // surface.chrome (task 172): the window chrome strips.
+    GatedPair {
+        label: "text.primary on surface.chrome",
+        floor: 4.5,
+        foreground: |t| t.text.primary,
+        background: |t| t.surface.chrome,
+    },
+    GatedPair {
+        label: "text.secondary on surface.chrome",
+        floor: 4.5,
+        foreground: |t| t.text.secondary,
+        background: |t| t.surface.chrome,
+    },
+    GatedPair {
+        label: "icon.default on surface.chrome",
+        floor: 3.0,
+        foreground: |t| t.icon.default,
+        background: |t| t.surface.chrome,
+    },
+    GatedPair {
+        label: "icon.secondary on surface.chrome",
+        floor: 3.0,
+        foreground: |t| t.icon.secondary,
+        background: |t| t.surface.chrome,
+    },
     GatedPair {
         label: "text.primary on surface.canvas",
         floor: 4.5,
@@ -338,8 +388,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            30,
-            "expected all 30 gated pairs to be checked"
+            38,
+            "expected all 38 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -350,6 +400,77 @@ mod tests {
                 result.floor
             );
         }
+    }
+
+    /// Task 172: outside Dark the new `surface.chrome` and `surface.header`
+    /// tokens reproduce what was drawn before they existed: the chrome strips
+    /// showed `surface.app` and the title strips and tab rows the panel.
+    #[test]
+    fn outside_dark_chrome_is_app_and_header_is_panel() {
+        let palette = match Palette::from_toml_str(PALETTE_TOML) {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut set = ThemeSet::new();
+        for toml in [
+            DARK_TOML,
+            LIGHT_TOML,
+            HIGH_CONTRAST_DARK_TOML,
+            HIGH_CONTRAST_LIGHT_TOML,
+            COLOR_CRITICAL_TOML,
+        ] {
+            if let Err(err) = set.register(toml) {
+                unreachable!("{err:?}");
+            }
+        }
+        for name in [
+            "Light",
+            "High Contrast Dark",
+            "High Contrast Light",
+            "Color-Critical",
+        ] {
+            let theme = match set.resolve(name, &palette) {
+                Ok(t) => t,
+                Err(err) => unreachable!("{name}: {err:?}"),
+            };
+            assert_eq!(theme.surface.chrome, theme.surface.app, "{name}: chrome");
+            assert_eq!(theme.surface.header, theme.surface.panel, "{name}: header");
+        }
+    }
+
+    /// Task 172: in the Dark theme the window background (`surface.app`,
+    /// the clear colour and the gutters) and the panel surface must be told
+    /// apart at a glance; they measured 1.2:1 and read as one colour. The
+    /// header strip sits between them and is distinguishable from both.
+    #[test]
+    fn dark_surfaces_app_header_and_panel_are_visibly_distinct() {
+        let palette = match Palette::from_toml_str(PALETTE_TOML) {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut set = ThemeSet::new();
+        if let Err(err) = set.register(DARK_TOML) {
+            unreachable!("{err:?}");
+        }
+        let theme = match set.resolve("Dark", &palette) {
+            Ok(t) => t,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let s = theme.surface;
+        let app_panel = contrast_ratio(s.app, s.panel);
+        assert!(
+            app_panel >= 1.6,
+            "surface.app vs surface.panel is {app_panel:.2}:1, under the 1.6:1 floor"
+        );
+        let app_header = contrast_ratio(s.app, s.header);
+        let header_panel = contrast_ratio(s.header, s.panel);
+        assert!(app_header >= 1.2, "app vs header {app_header:.2}:1");
+        assert!(header_panel >= 1.2, "header vs panel {header_panel:.2}:1");
+        let sunken_panel = contrast_ratio(s.sunken, s.panel);
+        assert!(
+            sunken_panel >= 1.2,
+            "sunken vs panel {sunken_panel:.2}:1: a field must read as recessed"
+        );
     }
 
     /// 0.219.0: the ants pair is a gated pair with a 3:1 floor, and as
@@ -401,8 +522,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            30,
-            "expected all 30 gated pairs to be checked"
+            38,
+            "expected all 38 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -437,8 +558,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            30,
-            "expected all 30 gated pairs to be checked"
+            38,
+            "expected all 38 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -473,8 +594,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            30,
-            "expected all 30 gated pairs to be checked"
+            38,
+            "expected all 38 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -509,8 +630,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            30,
-            "expected all 30 gated pairs to be checked"
+            38,
+            "expected all 38 gated pairs to be checked"
         );
         for result in &results {
             assert!(

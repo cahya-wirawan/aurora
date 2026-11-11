@@ -9,29 +9,31 @@ is_default = true
 
 [surface]
 canvas  = "neutral.0"
-app     = "neutral.50"
-panel   = "neutral.150"
-raised  = "neutral.200"
-overlay = "neutral.300"
-sunken  = "neutral.0"
+app     = "graphite.app"      # 282828 -- gutters, window frame, pasteboard
+chrome  = "graphite.panel"    # 535353 -- the window's chrome strips
+header  = "graphite.header"   # 424242 -- panel title strips and tab rows
+panel   = "graphite.panel"    # 535353 -- panel bodies (the chrome strips use surface.chrome, the same grey here)
+raised  = "graphite.raised"   # 585858; lighter than 5e5e5e would drop border.focus below 3:1
+overlay = "graphite.overlay"  # 626262
+sunken  = "graphite.sunken"   # 3a3a3a -- recessed against panel
 
 [text]
 primary   = "neutral.900"
-secondary = "neutral.700"
-disabled  = "neutral.500"
+secondary = "graphite.text_secondary"
+disabled  = "graphite.disabled"
 on_accent = "neutral.0"
 
 [icon]
 default   = "neutral.800"
-secondary = "neutral.600"
-disabled  = "neutral.500"
+secondary = "graphite.icon_secondary"
+disabled  = "graphite.disabled"
 on_accent = "neutral.0"
 
 [border]
-default = "neutral.300"
-strong  = "neutral.500"
+default = "graphite.border_default"
+strong  = "graphite.border_strong"
 focus   = "accent.blue.500"
-control = "neutral.500"          # reuses border.strong's own reference -- if control_opacity
+control = "graphite.border_strong"          # reuses border.strong's own reference -- if control_opacity
                                   #   were ever raised above 0, this degrades to something sane
                                   #   rather than an arbitrary colour; see vocabulary.md
 control_opacity = 0.0

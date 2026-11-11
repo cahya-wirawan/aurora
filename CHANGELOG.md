@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.305.0] - 2026-11-11
+
+### Changed
+
+- Records for task 172: Dark theme in Photoshop-style greys
+
 ## [0.304.0] - 2026-11-11
 
 ### Changed

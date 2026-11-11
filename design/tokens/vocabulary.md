@@ -25,6 +25,8 @@ Background fills, back to front.
 | `surface.panel` | Default panel background (Layers, Properties, Tool Options, ...). |
 | `surface.raised` | Elevation 1: dropdowns, popovers, context menus. |
 | `surface.overlay` | Elevation 2: modals, dialogs. |
+| `surface.chrome` | The fill of the window's chrome strips: tools column, options bar, status bar, document tab strip (task 172). Equals `surface.app` in every theme but Dark. |
+| `surface.header` | Panel title strips and tab rows: a step darker than `surface.panel` in Dark, equal to it elsewhere (task 172). |
 | `surface.sunken` | Inset wells: text field bodies, color swatches, input backgrounds. |
 
 ## Text

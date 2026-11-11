@@ -4,23 +4,25 @@
  */
 :root {
   --surface-canvas: #141414;
-  --surface-app: #1a1a1b;
-  --surface-panel: #28282c;
-  --surface-raised: #313136;
-  --surface-overlay: #404048;
-  --surface-sunken: #141414;
+  --surface-app: #282828;
+  --surface-chrome: #535353;
+  --surface-header: #424242;
+  --surface-panel: #535353;
+  --surface-raised: #585858;
+  --surface-overlay: #626262;
+  --surface-sunken: #3a3a3a;
   --text-primary: #f5f5f6;
-  --text-secondary: #c1c1c7;
-  --text-disabled: #7a7a83;
+  --text-secondary: #dcdcdc;
+  --text-disabled: #8c8c8c;
   --text-on-accent: #141414;
   --icon-default: #e2e2e5;
-  --icon-secondary: #9d9da5;
-  --icon-disabled: #7a7a83;
+  --icon-secondary: #bcbcbc;
+  --icon-disabled: #8c8c8c;
   --icon-on-accent: #141414;
-  --border-default: #404048;
-  --border-strong: #7a7a83;
+  --border-default: #6e6e6e;
+  --border-strong: #a8a8a8;
   --border-focus: #78acff;
-  --border-control: #7a7a83;
+  --border-control: #a8a8a8;
   --border-control-opacity: 0.0;
   --accent-primary: #78acff;
   --accent-primary-hover: #a4c8ff;

@@ -196,7 +196,7 @@ use aurora_theme::Scales;
 use taffy::style_helpers::{auto, length, percent, zero};
 use taffy::{AlignItems, FlexDirection, Rect as LayoutRect, Size, Style};
 
-use super::{WidgetKind, row_height, spacing};
+use super::{StripSurface, WidgetKind, row_height, spacing};
 use crate::error::WidgetError;
 use crate::shortcut::NamedKey;
 use crate::tree::{WidgetId, WidgetTree};
@@ -305,6 +305,8 @@ pub struct TabBarState {
     /// A floor and a ceiling for every tab's width (0.260.0,
     /// [`set_tab_width_limits`]); `None` is the equal-share default.
     width_limits: Option<(f32, f32)>,
+    /// A fill under the bar (task 172, [`set_tab_bar_surface`]); `None` paints none.
+    surface: Option<StripSurface>,
 }
 
 impl TabBarState {
@@ -321,7 +323,14 @@ impl TabBarState {
             metrics,
             window: None,
             width_limits: None,
+            surface: None,
         }
+    }
+
+    /// The surface the bar fills with, if any ([`set_tab_bar_surface`]).
+    #[must_use]
+    pub fn surface(&self) -> Option<StripSurface> {
+        self.surface
     }
 
     /// The shown tabs as a half-open index range, or `None` when every
@@ -1086,6 +1095,28 @@ pub fn set_tab_bar_closable(
     }
     with_tab_bar_mut(tree, bar, |state| {
         state.closable = closable;
+        Ok(())
+    })?;
+    Ok(true)
+}
+
+/// Gives the bar a fill of its own (task 172): `surface.chrome` for the
+/// document tab strip, `surface.header` for a panel group's tab row.
+/// Returns whether anything changed.
+///
+/// # Errors
+///
+/// [`WidgetError::WrongWidgetKind`] if `bar` is not a tab bar.
+pub fn set_tab_bar_surface(
+    tree: &mut WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    surface: Option<StripSurface>,
+) -> Result<bool, WidgetError> {
+    if state(tree, bar)?.surface == surface {
+        return Ok(false);
+    }
+    with_tab_bar_mut(tree, bar, |state| {
+        state.surface = surface;
         Ok(())
     })?;
     Ok(true)

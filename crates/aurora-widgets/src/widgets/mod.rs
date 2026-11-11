@@ -163,6 +163,7 @@ mod popup_list;
 mod scrollbar;
 mod selection_outline;
 mod slider;
+mod strip;
 mod tab_bar;
 mod text_field;
 mod thumbnail;
@@ -254,11 +255,13 @@ pub use slider::{
     SliderState, insert_slider, set_slider_disabled, set_slider_label, set_slider_range,
     set_slider_value,
 };
+pub use strip::{StripSurface, insert_strip};
 pub use tab_bar::{
     TAB_CLOSE_GLYPH, TabBarKey, TabBarOutcome, TabBarState, TabState, handle_tab_bar_key,
     insert_tab_bar, select_tab, set_tab_accessible_names, set_tab_bar_closable,
-    set_tab_bar_disabled, set_tab_descriptions, set_tab_labels, set_tab_width_limits,
-    set_tab_window, tab_bar_state, tab_close_button, tab_close_index, tab_close_width,
+    set_tab_bar_disabled, set_tab_bar_surface, set_tab_descriptions, set_tab_labels,
+    set_tab_width_limits, set_tab_window, tab_bar_state, tab_close_button, tab_close_index,
+    tab_close_width,
 };
 pub use text_field::{
     ChordEffect, Composition, TEXT_FIELD_MAX_BYTES, TextFieldChord, TextFieldKey, TextFieldState,
@@ -345,6 +348,13 @@ pub enum WidgetKind {
     ///
     /// [`Panel`]: WidgetKind::Panel
     RaisedPanel,
+    /// A flat, square-cornered strip of chrome (task 172): the Dark theme's
+    /// mid-grey chrome (tools column, options bar, status bar) and darker
+    /// header rows (panel titles) are different surfaces, and a container
+    /// paints nothing. Fills its whole box with the [`StripSurface`] token,
+    /// no border, no radius; otherwise a container (no state beyond the
+    /// surface, no focus stop).
+    Strip(StripSurface),
     /// A modal dialog's own root — `widgets::dialog`'s `insert_dialog` is
     /// the only constructor. No state, for the same reason [`Panel`] has
     /// none: its paint is a pure function of its own bounds and the

@@ -55,6 +55,14 @@ pub fn check_surface_neutrality(theme: &Theme) -> Vec<NeutralityResult> {
             color: theme.surface.app,
         },
         NeutralityResult {
+            label: "surface.chrome",
+            color: theme.surface.chrome,
+        },
+        NeutralityResult {
+            label: "surface.header",
+            color: theme.surface.header,
+        },
+        NeutralityResult {
             label: "surface.panel",
             color: theme.surface.panel,
         },
@@ -181,8 +189,8 @@ mod tests {
         let results = check_surface_neutrality(&theme);
         assert_eq!(
             results.len(),
-            16,
-            "expected all 16 checked tokens (6 surface + 4 text + 4 icon + 2 border)"
+            18,
+            "expected all 18 checked tokens (8 surface + 4 text + 4 icon + 2 border)"
         );
         for result in &results {
             assert!(

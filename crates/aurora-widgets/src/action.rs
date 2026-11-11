@@ -384,6 +384,7 @@ pub(crate) fn payload_disabled(kind: &WidgetKind) -> bool {
         | WidgetKind::CommandPalette(_)
         | WidgetKind::Panel
         | WidgetKind::RaisedPanel
+        | WidgetKind::Strip(_)
         | WidgetKind::Dialog
         | WidgetKind::DropdownList
         | WidgetKind::Tooltip
@@ -908,6 +909,12 @@ mod tests {
             Style::default(),
             Node::new(Role::Pane),
             WidgetKind::RaisedPanel,
+        ));
+        ok(tree.insert(
+            root,
+            Style::default(),
+            Node::new(Role::Pane),
+            WidgetKind::Strip(crate::widgets::StripSurface::Chrome),
         ));
         let tooltip = ok(tree.insert(
             button,
@@ -1855,9 +1862,10 @@ mod tests {
             WidgetKind::Thumbnail(_) => 27,
             WidgetKind::SelectionOutline(_) => 28,
             WidgetKind::GradientBar(_) => 29,
+            WidgetKind::Strip(_) => 30,
         }
     }
-    const KIND_COUNT: usize = 29;
+    const KIND_COUNT: usize = 30;
 
     /// The data a well-formed request for `action` on `id` would carry.
     fn well_formed(f: &Fixture, id: WidgetId, action: Action) -> Option<ActionData> {
