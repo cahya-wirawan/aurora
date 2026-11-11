@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.307.0] - 2026-11-11
+
+### Changed
+
+- Records for task 174: no underline under filled selected tabs
+
 ## [0.306.0] - 2026-11-11
 
 ### Changed
