@@ -144,11 +144,12 @@ pub fn insert_panel(
         root_node,
         WidgetKind::Panel,
     )?;
-    let header = tree.insert(
+    let header = widgets::insert_strip(
+        tree,
         root,
         header_style(scales),
         Node::new(Role::GenericContainer),
-        WidgetKind::Container,
+        widgets::StripSurface::Header,
     )?;
     let viewport =
         widgets::insert_container(tree, root, viewport_style(PanelSizing::Fill, scales))?;

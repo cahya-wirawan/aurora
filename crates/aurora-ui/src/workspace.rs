@@ -965,11 +965,12 @@ fn insert_canvas_column(
     let mut options_node = Node::new(Role::Toolbar);
     options_node.set_label(OPTIONS_BAR_LABEL);
     options_node.set_orientation(accesskit::Orientation::Horizontal);
-    let options_bar = match tree.insert(
+    let options_bar = match widgets::insert_strip(
+        tree,
         canvas_column,
         options_bar_style(scales),
         options_node,
-        WidgetKind::Container,
+        widgets::StripSurface::Panel,
     ) {
         Ok(id) => id,
         Err(err) => unreachable!("canvas_column was just inserted: {err:?}"),
@@ -1560,6 +1561,43 @@ mod tests {
         };
         assert_eq!(accessibility.role(), accesskit::Role::Window);
         assert_eq!(accessibility.label(), Some("Aurora"));
+    }
+
+    /// Task 172: the chrome strips paint `surface.panel` and the panel title
+    /// strips and tab rows paint `surface.header`, so the window background
+    /// (`surface.app`) shows only below the rail and around the document.
+    #[test]
+    fn chrome_strips_use_the_panel_surface_and_panel_titles_the_header_surface() {
+        use aurora_widgets::widgets::{StripSurface, WidgetKind};
+        let ws = build_workspace(&test_scales());
+        let strip = |id| match ws.tree.payload(id) {
+            Some(WidgetKind::Strip(surface)) => Some(*surface),
+            _ => None,
+        };
+        let bar_surface = |id| match ws.tree.payload(id) {
+            Some(WidgetKind::TabBar(state)) => state.surface(),
+            _ => None,
+        };
+        let panel = Some(StripSurface::Panel);
+        let header = Some(StripSurface::Header);
+        assert_eq!(strip(ws.tools.root), panel, "tools column");
+        assert_eq!(strip(ws.options_bar), panel, "options bar");
+        assert_eq!(strip(ws.status_bar.root), panel, "status bar");
+        assert_eq!(strip(ws.panel_strip.root), panel, "collapsed rail strip");
+        assert_eq!(bar_surface(ws.document_tabs), panel, "document tab strip");
+        assert!(
+            matches!(ws.tree.payload(ws.menu_bar.root), Some(WidgetKind::Panel)),
+            "the menu bar is a Panel (surface.panel)"
+        );
+        for p in ws.all_slots().flat_map(super::RailSlot::panels) {
+            assert_eq!(strip(p.header), header, "every panel's title strip");
+        }
+        let mut groups = 0;
+        for group in ws.groups() {
+            groups += 1;
+            assert_eq!(bar_surface(group.bar), header, "a panel group's tab row");
+        }
+        assert!(groups > 0, "the default workspace has a tab group");
     }
 
     #[test]

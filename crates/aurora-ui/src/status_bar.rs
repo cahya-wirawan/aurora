@@ -318,11 +318,12 @@ pub fn insert_status_bar(
     scales: &Scales,
     info: &StatusInfo,
 ) -> Result<StatusBar, WidgetError> {
-    let root = tree.insert(
+    let root = widgets::insert_strip(
+        tree,
         parent,
         status_bar_style(scales),
         status_bar_node(),
-        WidgetKind::Container,
+        widgets::StripSurface::Panel,
     )?;
     let built = (|| {
         let zoom =

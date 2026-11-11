@@ -40223,8 +40223,8 @@ mod tests {
                 && (0.0..1.0).contains(&color.b),
             "expected in-range linear channel values, got {color:?}"
         );
-        // `surface.app` resolves to `neutral.50` = `#1a1a1b` -- already
-        // dark in sRGB (~0.10), and srgb_to_linear always maps any
+        // `surface.app` resolves to `graphite.app` = `#282828` (task 172;
+        // `#1a1a1b` before) -- still dark in sRGB (~0.16), and srgb_to_linear always maps any
         // value in (0, 1) to something smaller (the sRGB curve
         // perceptually brightens midtones on encode, so decode does the
         // reverse) -- so the linear result must land well under 0.5,

@@ -133,8 +133,8 @@ use crate::tree::{PaintClip, WidgetId, WidgetTree};
 use crate::widgets::{
     ButtonState, CheckboxState, ColorPickerPartRole, ColorPickerPartState, ColorSwatchState,
     CurveEditorState, DropdownState, Hsv, IconState, IconTone, ListRowState, MARKER_RING_WIDTH,
-    ScrollbarState, SliderState, TabBarState, TabState, TextFieldState, TreeItemState, WidgetKind,
-    checkbox_box_rect, plot_rect, row_height,
+    ScrollbarState, SliderState, StripSurface, TabBarState, TabState, TextFieldState,
+    TreeItemState, WidgetKind, checkbox_box_rect, plot_rect, row_height,
 };
 
 /// One shape's own paint: tessellated fill geometry plus the straight,
@@ -567,6 +567,7 @@ fn kind_disabled(kind: &WidgetKind) -> bool {
         | WidgetKind::ListRow(_)
         | WidgetKind::Panel
         | WidgetKind::RaisedPanel
+        | WidgetKind::Strip(_)
         | WidgetKind::Dialog
         | WidgetKind::DropdownList
         | WidgetKind::Tooltip
@@ -1194,6 +1195,7 @@ pub fn paint_widget(
         WidgetKind::TreeItem(state) => paint_tree_item(state, bounds, theme, scales, scale_factor),
         WidgetKind::Panel => paint_panel(bounds, theme, scales, scale_factor),
         WidgetKind::RaisedPanel => paint_raised_panel(bounds, theme, scales, scale_factor),
+        WidgetKind::Strip(surface) => paint_strip(*surface, bounds, theme, scale_factor),
         WidgetKind::Dialog => paint_dialog(bounds, theme, scales, scale_factor),
         WidgetKind::Dropdown(state) => paint_dropdown(state, bounds, theme, scales, scale_factor),
         WidgetKind::DropdownList => paint_dropdown_list(bounds, theme, scales, scale_factor),
@@ -2618,6 +2620,36 @@ fn band(
     fill(&path, tolerance).map(Some).map_err(WidgetError::Paint)
 }
 
+/// The fill colour of a [`StripSurface`].
+fn strip_colour(surface: StripSurface, theme: &Theme) -> aurora_theme::Color {
+    match surface {
+        StripSurface::Panel => theme.surface.panel,
+        StripSurface::Header => theme.surface.header,
+    }
+}
+
+/// A flat strip's paint (task 172): its whole box, square-cornered, in
+/// `surface.panel` or `surface.header`; nothing for an empty box.
+fn paint_strip(
+    surface: StripSurface,
+    bounds: Rect,
+    theme: &Theme,
+    scale_factor: f32,
+) -> Result<Vec<Paint>, WidgetError> {
+    let Some(mesh) = band(
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.width as f32,
+        bounds.height as f32,
+        scale_factor,
+    )?
+    else {
+        return Ok(vec![]);
+    };
+    let [r, g, b] = strip_colour(surface, theme).to_srgb_f32();
+    Ok(vec![(mesh, [r, g, b, 1.0])])
+}
+
 /// A tab bar's own paint: one **filled** 1 px `border.default` rule
 /// along its bottom edge, the full width of the bar — the mockup's
 /// `.tabs { border-bottom: 1px solid var(--border-default) }`. A fill
@@ -2642,6 +2674,12 @@ fn paint_tab_bar(
     const BORDER_WIDTH: f32 = 1.0;
 
     let (width, height) = (bounds.width as f32, bounds.height as f32);
+    let mut paints = Vec::new();
+    // A bar may carry a surface of its own (task 172): the fill goes first,
+    // under the rule and the tabs.
+    if let Some(surface) = state.surface() {
+        paints.extend(paint_strip(surface, bounds, theme, scale_factor)?);
+    }
     let rule_height = BORDER_WIDTH.min(height);
     let Some(mesh) = band(
         bounds.x as f32,
@@ -2651,7 +2689,7 @@ fn paint_tab_bar(
         scale_factor,
     )?
     else {
-        return Ok(vec![]);
+        return Ok(paints);
     };
     let alpha = if state.is_disabled() {
         theme.state.disabled_opacity
@@ -2659,7 +2697,8 @@ fn paint_tab_bar(
         1.0
     };
     let [r, g, b] = theme.border.default.to_srgb_f32();
-    Ok(vec![(mesh, [r, g, b, alpha])])
+    paints.push((mesh, [r, g, b, alpha]));
+    Ok(paints)
 }
 
 /// One tab's own paint. The conditional [`control_outline`] (High
@@ -3205,7 +3244,7 @@ fn paint_tree_item(
 /// **The border is a real, necessary follow-on, not decoration**: a
 /// plain fill alone was found — on real hardware, not assumed — to be
 /// nearly invisible against the window's own background
-/// (`surface.app`, `#1a1a1b`, next to `surface.panel`'s own original
+/// (`surface.app`, `#1a1a1b` then, now `#282828`, next to `surface.panel`'s own original
 /// `#212124` — a ~7-in-255 per-channel difference), the deliberately
 /// "quiet" neutral ramp `design/tokens/palette.toml`'s own comment
 /// names ("must stay quiet enough that they never compete with a
@@ -3228,7 +3267,14 @@ fn paint_tree_item(
 /// `neutral.150`, `.150` -> `.200`, `.200` -> `.300`) rather than
 /// reuse `surface.raised`'s old value outright, which would have
 /// collapsed panels and popovers to the same colour. `surface.panel`
-/// is `#28282c` now, not `#212124`.
+/// was `#28282c`, not `#212124`.
+///
+/// **Task 172 superseded those values**: the Dark theme now takes its
+/// surfaces from the `[graphite]` palette table (design owner, "match the
+/// reference grey"): `surface.app` `#282828`, `surface.header` `#424242`,
+/// `surface.panel` `#535353`, `surface.raised` `#585858`,
+/// `surface.overlay` `#626262`, `surface.sunken` `#3a3a3a`, so the window
+/// background and a panel differ by more than 1.6:1.
 ///
 /// No `disabled` state — a panel has no such concept — and no distinct
 /// paint for collapsed vs. expanded: a real collapsed panel's own root
@@ -3527,6 +3573,7 @@ fn paint_drop_indicator(
 mod tests {
     use super::{Paint, paint_widget};
     use crate::tree::{WidgetId, WidgetTree};
+    use crate::widgets::StripSurface;
     use crate::widgets::{
         CommandEntry, DialogAction, DialogHandle, DropdownState, ListRowState, ScrollbarRange,
         ScrollbarState, WidgetKind, command_palette_state, dropdown_state, insert_button,
@@ -5945,6 +5992,116 @@ mod tests {
             [r, g, b, 1.0],
             "a panel's own border must use border.default at full opacity"
         );
+    }
+
+    /// Task 172: a flat strip fills its whole box, square-cornered and
+    /// borderless, with the token its surface names.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_strip_paints_its_surface_token_and_nothing_else() {
+        let scales = scales();
+        let theme = dark_theme();
+        for (surface, token) in [
+            (StripSurface::Panel, theme.surface.panel),
+            (StripSurface::Header, theme.surface.header),
+        ] {
+            let (mut tree, root) = new_tree(taffy::Style::default());
+            let strip = match tree.insert(
+                root,
+                taffy::Style::default(),
+                accesskit::Node::new(accesskit::Role::Toolbar),
+                WidgetKind::Strip(surface),
+            ) {
+                Ok(id) => id,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            if let Err(err) = tree.set_bounds(
+                strip,
+                Rect {
+                    x: 3,
+                    y: 5,
+                    width: 200,
+                    height: 24,
+                },
+            ) {
+                unreachable!("{err:?}");
+            }
+            let paints = match paint_widget(&tree, strip, &theme, &scales, 1.0) {
+                Ok(paints) => paints,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(paints.len(), 1, "{surface:?}: one fill, no border");
+            let Some((mesh, colour)) = paints.first() else {
+                unreachable!("one paint");
+            };
+            let [r, g, b] = token.to_srgb_f32();
+            assert_eq!(*colour, [r, g, b, 1.0], "{surface:?}");
+            // Corner pixels are covered: a square-cornered rectangle.
+            let xs: Vec<f32> = mesh.vertices.iter().map(|v| v.x).collect();
+            let ys: Vec<f32> = mesh.vertices.iter().map(|v| v.y).collect();
+            let min = |v: &[f32]| v.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = |v: &[f32]| v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!((min(&xs), max(&xs)), (3.0, 203.0), "{surface:?} width");
+            assert_eq!((min(&ys), max(&ys)), (5.0, 29.0), "{surface:?} height");
+        }
+    }
+
+    /// Task 172: a tab bar with a surface paints that fill first, then
+    /// its rule; without one it paints the rule alone (as before).
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn a_tab_bar_with_a_surface_fills_under_its_rule() {
+        let scales = scales();
+        let theme = dark_theme();
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let bar = match crate::widgets::insert_tab_bar(
+            &mut tree,
+            root,
+            &scales,
+            "Tabs",
+            vec!["One".into(), "Two".into()],
+            0,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = tree.set_bounds(
+            bar,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 240,
+                height: 28,
+            },
+        ) {
+            unreachable!("{err:?}");
+        }
+        let plain = match paint_widget(&tree, bar, &theme, &scales, 1.0) {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(plain.len(), 1, "no surface: the rule alone");
+        for (surface, token) in [
+            (StripSurface::Panel, theme.surface.panel),
+            (StripSurface::Header, theme.surface.header),
+        ] {
+            if let Err(err) = crate::widgets::set_tab_bar_surface(&mut tree, bar, Some(surface)) {
+                unreachable!("{err:?}");
+            }
+            let paints = match paint_widget(&tree, bar, &theme, &scales, 1.0) {
+                Ok(p) => p,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            assert_eq!(paints.len(), 2, "{surface:?}: fill then rule");
+            let colours: Vec<[f32; 4]> = paints.iter().map(|(_, c)| *c).collect();
+            let [r, g, b] = token.to_srgb_f32();
+            let [br, bg, bb] = theme.border.default.to_srgb_f32();
+            assert_eq!(
+                colours,
+                vec![[r, g, b, 1.0], [br, bg, bb, 1.0]],
+                "{surface:?}: the fill first, the rule on top"
+            );
+        }
     }
 
     /// The window a dialog test lays out against. Any definite size

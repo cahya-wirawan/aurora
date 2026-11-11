@@ -112,6 +112,7 @@ pub fn insert_panel_group(
         titles.iter().map(|title| (*title).to_owned()).collect(),
         selected,
     )?;
+    widgets::set_tab_bar_surface(tree, bar, Some(widgets::StripSurface::Header))?;
     // The tab row never shrinks and counts one row toward the group's
     // floor (`shown_children_floor` reads declared minimums only).
     let mut bar_style = tree
@@ -186,6 +187,7 @@ pub(crate) fn build_panel_group(
         titles.iter().map(|title| (*title).to_owned()).collect(),
         selected,
     )?;
+    widgets::set_tab_bar_surface(tree, bar, Some(widgets::StripSurface::Header))?;
     let mut bar_style = tree
         .style(bar)
         .cloned()

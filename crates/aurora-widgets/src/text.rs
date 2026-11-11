@@ -662,7 +662,7 @@ pub fn text_runs(
         // heading weight or size exists in the type tokens -- the title's
         // typography and colour are the design owner's call, flagged
         // rather than invented.
-        WidgetKind::Container if let Some(title) = panel_title(tree, id) => {
+        WidgetKind::Container | WidgetKind::Strip(_) if let Some(title) = panel_title(tree, id) => {
             vec![ellipsized(run(
                 title,
                 rgba(theme.text.secondary, 1.0),

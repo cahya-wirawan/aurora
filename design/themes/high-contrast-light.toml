@@ -19,6 +19,7 @@ is_default = false
 [surface]
 canvas  = "hc.white"
 app     = "hc.white"
+header  = "hc.white"
 panel   = "hc.white"
 raised  = "hc.white"
 overlay = "hc.white"

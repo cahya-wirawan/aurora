@@ -19,6 +19,11 @@ HERE = Path(__file__).parent
 
 # (label, foreground token path, background token path, required ratio, note)
 PAIRS = [
+    # surface.header (task 172): panel title strips and tab rows.
+    ("text.primary on surface.header", "text.primary", "surface.header", 4.5, "body text"),
+    ("text.secondary on surface.header", "text.secondary", "surface.header", 4.5, "body text"),
+    ("icon.default on surface.header", "icon.default", "surface.header", 3.0, "UI graphic (icon)"),
+    ("icon.secondary on surface.header", "icon.secondary", "surface.header", 3.0, "UI graphic (icon)"),
     ("text.primary on surface.canvas", "text.primary", "surface.canvas", 4.5, "body text"),
     ("text.primary on surface.app", "text.primary", "surface.app", 4.5, "body text"),
     ("text.primary on surface.panel", "text.primary", "surface.panel", 4.5, "body text"),
