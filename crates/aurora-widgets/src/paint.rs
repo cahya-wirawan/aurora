@@ -6078,6 +6078,87 @@ mod tests {
 
     /// Task 172: a tab bar with a surface paints that fill first, then
     /// its rule; without one it paints the rule alone (as before).
+    /// Task 174: a selected tab drops its accent underline only when its
+    /// fill and its bar's row resolve to different colours; with the same
+    /// colour, or no row surface, the underline is still its mark.
+    #[test]
+    fn a_filled_selected_tab_drops_its_underline_only_where_the_fill_differs_from_the_row() {
+        let scales = scales();
+        let (mut tree, root) = new_tree(taffy::Style::default());
+        let bar = match crate::widgets::insert_tab_bar(
+            &mut tree,
+            root,
+            &scales,
+            "Tabs",
+            vec!["One".into(), "Two".into()],
+            0,
+        ) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let tab = match crate::widgets::tab_bar_state(&tree, bar)
+            .map(crate::widgets::TabBarState::selected_tab)
+        {
+            Ok(Some(tab)) => tab,
+            other => unreachable!("{other:?}"),
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 28,
+        };
+        if let Err(err) = tree.set_bounds(tab, rect) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) =
+            crate::widgets::set_tab_bar_selected_surface(&mut tree, bar, Some(StripSurface::Panel))
+        {
+            unreachable!("{err:?}");
+        }
+        let colours = |tree: &WidgetTree<WidgetKind>, theme: &Theme| -> Vec<[f32; 4]> {
+            match paint_widget(tree, tab, theme, &scales, 1.0) {
+                Ok(p) => p.iter().map(|(_, c)| *c).collect(),
+                Err(err) => unreachable!("{err:?}"),
+            }
+        };
+        let rgba = |c: aurora_theme::Color| {
+            let [r, g, b] = c.to_srgb_f32();
+            [r, g, b, 1.0]
+        };
+        // No row surface: the underline is kept.
+        let dark = dark_theme();
+        assert_eq!(
+            colours(&tree, &dark).last(),
+            Some(&rgba(dark.accent.primary)),
+            "no row surface"
+        );
+        if let Err(err) =
+            crate::widgets::set_tab_bar_surface(&mut tree, bar, Some(StripSurface::Header))
+        {
+            unreachable!("{err:?}");
+        }
+        // Dark: panel differs from header, so the fill alone marks the tab.
+        assert_ne!(dark.surface.panel, dark.surface.header);
+        assert_eq!(
+            colours(&tree, &dark),
+            vec![rgba(dark.surface.panel)],
+            "Dark"
+        );
+        // Light and Color-Critical: panel equals header, the underline stays.
+        for (name, theme) in [
+            ("Light", light_theme()),
+            ("Color-Critical", color_critical_theme()),
+        ] {
+            assert_eq!(theme.surface.panel, theme.surface.header, "{name}");
+            assert_eq!(
+                colours(&tree, &theme).last(),
+                Some(&rgba(theme.accent.primary)),
+                "{name}: underline kept"
+            );
+        }
+    }
+
     #[test]
     #[allow(clippy::float_cmp)]
     fn a_tab_bar_with_a_surface_fills_under_its_rule() {
