@@ -1,0 +1,42 @@
+[package]
+name = "aurora-pen-win"
+description = "Windows pen tilt, rotation and pen-ness: a read-only WM_POINTER subclass beside winit."
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Not `workspace = true`: like `aurora-tile`, this crate overrides only
+# `unsafe_code`. The Windows module calls `SetWindowSubclass`,
+# `GetPointerPenInfo` and friends (raw Win32 FFI). Every other lint below is
+# copied verbatim from `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "allow"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+module_name_repetitions = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+similar_names = "allow"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_WindowsAndMessaging",
+] }

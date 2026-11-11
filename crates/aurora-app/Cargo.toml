@@ -17,6 +17,7 @@ workspace = true
 
 [dependencies]
 aurora-core = { workspace = true }
+aurora-pen-win = { workspace = true }
 aurora-commands = { workspace = true }
 # The bridge (task 160): std-only listener, path roots, scratch. No async runtime.
 aurora-automation = { workspace = true }

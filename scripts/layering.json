@@ -2,6 +2,7 @@
   "aurora-core": [],
   "aurora-commands": [],
   "aurora-testkit": [],
+  "aurora-pen-win": [],
   "aurora-tile": [
     "aurora-core"
   ],
@@ -93,6 +94,7 @@
   ],
   "aurora-app": [
     "aurora-core",
+    "aurora-pen-win",
     "aurora-commands",
     "aurora-tile",
     "aurora-graph",

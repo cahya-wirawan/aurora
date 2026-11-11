@@ -74,6 +74,23 @@ pub(crate) fn touch_sample(location: (f64, f64), force: Option<Force>) -> PenSam
     )
 }
 
+/// A touch sample made richer by the Windows pen reader: when `pen` is known
+/// the contact is a pen (source `Pen`) and tilt and rotation come from it.
+/// Position and pressure stay winit's (the same hardware value). With `None`
+/// the sample is returned unchanged.
+pub(crate) fn enrich(sample: PenSample, pen: Option<aurora_pen_win::RawPen>) -> PenSample {
+    match pen {
+        Some(raw) => PenSample::new(
+            (sample.x, sample.y),
+            sample.pressure,
+            (raw.tilt_x, raw.tilt_y),
+            raw.rotation,
+            PointerSource::Pen,
+        ),
+        None => sample,
+    }
+}
+
 /// Which source owns the gesture: the mouse (any buttons held) or one touch.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct PointerGate {
@@ -186,6 +203,24 @@ mod tests {
         assert_eq!(touch_sample((0.0, 0.0), None).tilt_x, 0.0);
         let nan = touch_sample((0.0, 0.0), cal(1.0, 1.0, Some(f64::NAN)));
         assert_eq!(nan.tilt_x, 0.0);
+    }
+
+    #[test]
+    fn enrich_makes_a_pen_and_keeps_position_and_pressure() {
+        let base = touch_sample((3.0, 4.0), Some(Force::Normalized(0.5)));
+        assert_eq!(enrich(base, None), base);
+        let raw = aurora_pen_win::RawPen::from_raw(0xF, 0, 1024, 270, -20, 35);
+        let s = enrich(base, Some(raw));
+        assert_eq!(s.source, PointerSource::Pen);
+        assert_eq!((s.x, s.y, s.pressure), (3.0, 4.0, 0.5));
+        assert_eq!((s.tilt_x, s.tilt_y, s.rotation), (-20.0, 35.0, 270.0));
+        // A pen with no tilt bits is still a pen, upright.
+        let flat = aurora_pen_win::RawPen::from_raw(0x1, 0, 100, 0, 50, 50);
+        let s = enrich(base, Some(flat));
+        assert_eq!(
+            (s.source, s.tilt_x, s.tilt_y),
+            (PointerSource::Pen, 0.0, 0.0)
+        );
     }
 
     #[test]
