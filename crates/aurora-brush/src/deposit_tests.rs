@@ -356,6 +356,22 @@ fn differential(seed: u64, budget: usize, strokes: usize, batches: usize, mode: 
     }
 }
 
+/// The `Mode::Parallel` differentials fall back to the serial path when the
+/// pool is missing, so they would pass without covering the parallel code;
+/// this test makes that visible instead of silent.
+#[test]
+fn the_parallel_differentials_really_run_on_the_pool() {
+    let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    if cores < 2 {
+        println!("SKIPPED: one core, the Parallel differentials ran serially");
+        return;
+    }
+    assert!(
+        crate::deposit::deposit_pool().is_some(),
+        "{cores} cores but no deposit pool: the Parallel differentials ran serially"
+    );
+}
+
 #[test]
 fn batch_deposit_equals_per_dab_stamping_bit_for_bit_with_a_stroke_snapshot() {
     for mode in [Mode::Serial, Mode::Parallel, Mode::Auto] {

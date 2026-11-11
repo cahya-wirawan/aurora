@@ -273,7 +273,7 @@ pub fn deposit_soft_dabs_with(
 
 /// The deposit's own pool, built on first use; `None` when it cannot be
 /// built (the deposit then runs serially) or the machine has one core.
-fn deposit_pool() -> Option<&'static rayon::ThreadPool> {
+pub(crate) fn deposit_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
@@ -527,6 +527,14 @@ fn deposit_parallel(
             out.tiles.fail(id, malformed_tile(surface, id, 0));
             continue;
         };
+        if original.len() != aurora_tile::SAMPLES {
+            // The band copies below assume a whole tile; refuse a malformed
+            // one as the per-dab path does instead of panicking.
+            plan.mark_failed(range, failed_dab);
+            out.tiles
+                .fail(id, malformed_tile(surface, id, original.len()));
+            continue;
+        }
         let held = if track {
             snapshot.as_deref_mut().and_then(|s| s.cover_mut().take(id))
         } else {
