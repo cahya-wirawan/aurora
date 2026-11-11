@@ -50,7 +50,15 @@ A pen delivered as touch cannot be told from a finger, so the source is
   flags are read but not used yet. Pressure stays winit's value. Fingers stay
   `Touch`. **Unverified:** no tablet and no Windows machine were available;
   history-coalesced samples share the latest pen info; an event buffered by
-  winit while its handler is busy may see a newer sample's info.
+  winit while its handler is busy may see a newer sample's info; the map is
+  keyed by the low 16 bits of the pointer id (as winit queries it), so for ids
+  above 65535 a lookup misses or collides; in a multi-pointer frame only the `wParam`
+  pointer is read; a hovering pen's `WM_POINTERUPDATE` reaches the app as a
+  `Touch` move with no active touch, which the gate ignores, but it is tagged
+  `Pen` if looked up; Windows' `tiltY` sign is assumed, not checked, to match
+  `PenSample`'s (positive toward the user); the tracker is installed once per
+  window (a second install on the same window would replace the first's
+  data and its drop would remove the new subclass).
 * macOS, X11, Wayland: winit 0.30 documents no pen data (macOS `Touch` is
   unsupported). A tablet there is a mouse. Not verified, no tablet.
 
