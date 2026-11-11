@@ -17,6 +17,7 @@ aurora-core = { workspace = true }
 aurora-tile = { workspace = true }
 aurora-gpu = { workspace = true }
 half = { workspace = true }
+rayon = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

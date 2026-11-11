@@ -103,6 +103,13 @@ impl StrokeCover {
         self.tiles = HashMap::new();
     }
 
+    /// Every tile's coverage, in no particular order (tests: the batch
+    /// deposit's differential, task 170).
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&TileId, &CoverTile)> {
+        self.tiles.iter()
+    }
+
     /// Tiles with coverage (a test and bound check).
     pub(crate) fn tile_count(&self) -> usize {
         self.tiles.len()

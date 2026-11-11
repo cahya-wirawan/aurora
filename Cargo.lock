@@ -503,6 +503,7 @@ dependencies = [
  "aurora-gpu",
  "aurora-tile",
  "half",
+ "rayon",
  "tempfile",
  "thiserror 2.0.19",
  "tracing",

@@ -64,6 +64,10 @@ mod coverage;
 #[cfg(test)]
 mod coverage_tests;
 mod dab;
+// EXPERIMENTAL (task 170): the bristle brush's batch deposit; not exported.
+mod deposit;
+#[cfg(test)]
+mod deposit_tests;
 #[cfg(test)]
 mod erase_amount_tests;
 mod fill;

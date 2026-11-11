@@ -28,7 +28,8 @@
 //! * Between two samples a bristle deposits soft dabs along its own path
 //!   (spacing [`BRISTLE_STEP_RADII`] of its radius, floored at 1 px, at most
 //!   [`MAX_DABS_PER_BRISTLE_SAMPLE`] per sample), each through the existing
-//!   [`crate::stamp_dab_amount`] with the bristle's colour and
+//!   [`crate::stamp_dab_amount`] (since task 170 through the batch
+//!   [`crate::deposit::deposit_soft_dabs`], the same bits) with the bristle's colour and
 //!   `PaintAmount { opacity: 1, flow: flow * pressure * load }`. The load
 //!   depletes with distance travelled (`1 / (load_length_radii * radius)` per
 //!   pixel), so a stroke dries out.
@@ -48,6 +49,7 @@
 
 use aurora_tile::{SurfaceId, TileStore};
 
+use crate::deposit::{Mode, SoftDab, deposit_soft_dabs_with};
 use crate::{PaintAmount, StrokeSnapshot, stamp_dab_amount};
 
 /// Fewest bristles a brush is built with.
@@ -400,10 +402,50 @@ impl BristleBrush {
         true
     }
 
-    /// Stamps the pending dabs onto `surface` of `store` through the
-    /// existing soft-Brush path, capturing undo and stroke coverage in
-    /// `snapshot`.
+    /// Stamps the pending dabs onto `surface` of `store` with the batch
+    /// deposit ([`crate::deposit::deposit_soft_dabs`], task 170): the same
+    /// tile bits, stroke coverage and undo capture as
+    /// [`Self::deposit_per_dab`], tile by tile.
     pub fn deposit(
+        &mut self,
+        store: &mut TileStore,
+        surface: SurfaceId,
+        snapshot: Option<&mut StrokeSnapshot>,
+    ) -> DepositStats {
+        self.deposit_with(store, surface, snapshot, Mode::Auto)
+    }
+
+    /// [`Self::deposit`] with the batch deposit's scheduling chosen (the
+    /// measurement compares [`Mode::Serial`] and [`Mode::Auto`]).
+    pub fn deposit_with(
+        &mut self,
+        store: &mut TileStore,
+        surface: SurfaceId,
+        snapshot: Option<&mut StrokeSnapshot>,
+        mode: Mode,
+    ) -> DepositStats {
+        let dabs: Vec<SoftDab> = self
+            .pending
+            .drain(..)
+            .map(|dab| SoftDab {
+                center: dab.center,
+                radius: dab.radius,
+                colour: dab.colour,
+                amount: PaintAmount::new(1.0, dab.flow),
+            })
+            .collect();
+        let outcome = deposit_soft_dabs_with(store, surface, &dabs, snapshot, mode);
+        DepositStats {
+            dabs: dabs.len(),
+            failed: outcome.failed_dabs,
+        }
+    }
+
+    /// The task 168 spike's deposit: every pending dab through the existing
+    /// soft-Brush path ([`crate::stamp_dab_amount`]) one at a time, capturing
+    /// undo and stroke coverage in `snapshot`. Kept as the reference the
+    /// batch deposit is compared and measured against.
+    pub fn deposit_per_dab(
         &mut self,
         store: &mut TileStore,
         surface: SurfaceId,

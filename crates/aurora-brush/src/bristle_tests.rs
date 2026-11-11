@@ -22,6 +22,7 @@ use crate::bristle::{
     BristleBrush, BristleConfig, DepositStats, MAX_BRISTLES, MAX_DABS_PER_BRISTLE_SAMPLE,
     MIN_BRISTLES, PenSample,
 };
+use crate::deposit::Mode;
 use crate::{
     DEFAULT_SPACING, PaintAmount, PixelHistory, StrokeSnapshot, advance_segment, dab_step,
     stamp_dab_amount,
@@ -480,6 +481,77 @@ fn hostile_pen_samples_are_refused_or_clamped_without_panic() {
     }
 }
 
+#[test]
+fn the_batch_deposit_paints_the_same_stroke_as_the_per_dab_deposit() {
+    // Task 170: a whole bristle stroke (lag, splay, tilt, depletion, several
+    // tile boundaries) through both deposits gives the same tiles bit for
+    // bit, the same captured undo state, and the same result after undo.
+    let samples = synthetic(Shape::ZigZag, 240.0, 240, 0.2, 3000.0);
+    for (count, radius) in [(64_usize, 40.0_f32), (512, 150.0), (1024, 12.0)] {
+        let config = BristleConfig {
+            load_length_radii: 30.0,
+            ..BristleConfig::new(count, radius)
+        };
+        let (_da, mut a) = store_with_budget(4096);
+        let (_db, mut b) = store_with_budget(4096);
+        let mut ba = BristleBrush::new(config);
+        let mut bb = BristleBrush::new(config);
+        let mut sa = StrokeSnapshot::new(surface());
+        let mut sb = StrokeSnapshot::new(surface());
+        for s in &samples {
+            assert!(ba.advance(*s) && bb.advance(*s));
+            let x = ba.deposit_per_dab(&mut a, surface(), Some(&mut sa));
+            let y = bb.deposit(&mut b, surface(), Some(&mut sb));
+            assert_eq!(x, y);
+        }
+        let mut held: Vec<TileId> = a
+            .held_tile_versions()
+            .into_iter()
+            .map(|((_, id), _)| id)
+            .collect();
+        let mut held_b: Vec<TileId> = b
+            .held_tile_versions()
+            .into_iter()
+            .map(|((_, id), _)| id)
+            .collect();
+        held.sort_by_key(|t| (t.y, t.x));
+        held_b.sort_by_key(|t| (t.y, t.x));
+        assert_eq!(held, held_b, "N={count}: the same tiles");
+        assert!(
+            held.len() > 2,
+            "N={count}: the stroke crosses tile boundaries ({})",
+            held.len()
+        );
+        let same = |a: &mut TileStore, b: &mut TileStore| {
+            held.iter().all(|&id| {
+                let x: Vec<u16> = match a.get(surface(), id) {
+                    Ok(t) => t.texels().iter().map(|v| v.to_bits()).collect(),
+                    Err(_) => Vec::new(),
+                };
+                let y: Vec<u16> = match b.get(surface(), id) {
+                    Ok(t) => t.texels().iter().map(|v| v.to_bits()).collect(),
+                    Err(_) => Vec::new(),
+                };
+                x == y
+            })
+        };
+        assert!(same(&mut a, &mut b), "N={count}: the same pixels");
+        let mut ca: Vec<TileId> = sa.captured().collect();
+        let mut cb: Vec<TileId> = sb.captured().collect();
+        ca.sort_by_key(|t| (t.y, t.x));
+        cb.sort_by_key(|t| (t.y, t.x));
+        assert_eq!(ca, cb, "N={count}: the same captured tiles");
+        let (mut ha, mut hb) = (PixelHistory::new(), PixelHistory::new());
+        assert!(ha.push(sa) && hb.push(sb));
+        assert!(matches!(ha.undo(&mut a), Ok(true)));
+        assert!(matches!(hb.undo(&mut b), Ok(true)));
+        assert!(
+            same(&mut a, &mut b),
+            "N={count}: the same pixels after undo"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The measurement.
 
@@ -544,7 +616,19 @@ fn strokes_for(shape: Shape, rate: f32) -> Vec<Vec<PenSample>> {
     strokes_at(shape, rate, speed)
 }
 
-fn measure_bristle(config: BristleConfig, strokes: &[Vec<PenSample>]) -> Timing {
+/// Which deposit a measurement runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path {
+    /// The task 168 spike's: `stamp_dab_amount` once per dab.
+    PerDab,
+    /// Task 170's batch deposit, one tile after another.
+    Serial,
+    /// Task 170's batch deposit as the brush runs it (`Mode::Auto`: tiles
+    /// on the deposit pool when the batch is big enough).
+    Batch,
+}
+
+fn measure_bristle(config: BristleConfig, strokes: &[Vec<PenSample>], path: Path) -> Timing {
     let (_dir, mut store) = store_with_budget(512);
     let mut t = Timing {
         total_us: Vec::new(),
@@ -565,10 +649,14 @@ fn measure_bristle(config: BristleConfig, strokes: &[Vec<PenSample>]) -> Timing 
             let t0 = Instant::now();
             let ok = brush.advance(*s);
             let t1 = Instant::now();
-            let stats = if ok {
-                brush.deposit(&mut store, surface(), Some(&mut snap))
-            } else {
+            let stats = if !ok {
                 DepositStats::default()
+            } else if path == Path::Batch {
+                brush.deposit(&mut store, surface(), Some(&mut snap))
+            } else if path == Path::Serial {
+                brush.deposit_with(&mut store, surface(), Some(&mut snap), Mode::Serial)
+            } else {
+                brush.deposit_per_dab(&mut store, surface(), Some(&mut snap))
             };
             let t2 = Instant::now();
             let adv = (t1 - t0).as_secs_f64() * 1.0e6;
@@ -714,7 +802,7 @@ fn bristle_measure() {
                     "bristle N={count} r={radius} (rb {:.2})",
                     probe.bristle_radius()
                 ),
-                &measure_bristle(measure_config(count, radius), &circle240),
+                &measure_bristle(measure_config(count, radius), &circle240, Path::PerDab),
             );
         }
     }
@@ -731,7 +819,7 @@ fn bristle_measure() {
             for &count in counts {
                 report(
                     &format!("{name} bristle N={count} r=48"),
-                    &measure_bristle(measure_config(count, 48.0), &strokes),
+                    &measure_bristle(measure_config(count, 48.0), &strokes, Path::PerDab),
                 );
             }
         }
@@ -749,7 +837,7 @@ fn bristle_measure() {
         for count in [128_usize, 512, 1024] {
             report(
                 &format!("  bristle N={count} r=48"),
-                &measure_bristle(measure_config(count, 48.0), &strokes),
+                &measure_bristle(measure_config(count, 48.0), &strokes, Path::PerDab),
             );
         }
     }
@@ -770,8 +858,70 @@ fn bristle_measure() {
             for count in [128_usize, 512] {
                 report(
                     &format!("{name} bristle N={count} r={radius}"),
-                    &measure_bristle(measure_config(count, radius), &strokes),
+                    &measure_bristle(measure_config(count, radius), &strokes, Path::PerDab),
                 );
+            }
+        }
+    }
+    println!("loadavg after: {}", load_average().trim());
+}
+
+/// Task 170: the per-dab deposit against the batch deposit, configuration by
+/// configuration (each pair run back to back on fresh stores, the per-dab
+/// one first). `cargo test --release -p aurora-brush bristle_deposit_measure
+/// -- --ignored --nocapture`; `AURORA_BRISTLE_QUICK` runs only r = 150.
+#[test]
+#[ignore = "measurement: run in release with --ignored --nocapture"]
+fn bristle_deposit_measure() {
+    println!(
+        "profile: {}",
+        if cfg!(debug_assertions) {
+            "dev (opt-level 1)"
+        } else {
+            "release"
+        }
+    );
+    println!("loadavg before: {}", load_average().trim());
+    let quick = std::env::var("AURORA_BRISTLE_QUICK").is_ok();
+    let circle240 = strokes_for(Shape::Circle, 240.0);
+    println!(
+        "--- circle @ 240 Hz, 800 px/s ({:.1} px/sample) ---",
+        mean_step_px(&circle240[0])
+    );
+    let radii: &[f32] = if quick {
+        &[150.0]
+    } else {
+        &[12.0, 48.0, 150.0]
+    };
+    for &radius in radii {
+        for count in [32_usize, 128, 512, 1024] {
+            let config = measure_config(count, radius);
+            for path in [Path::PerDab, Path::Serial, Path::Batch] {
+                report(
+                    &format!("{path:?} N={count} r={radius}"),
+                    &measure_bristle(config, &circle240, path),
+                );
+            }
+        }
+    }
+    if !quick {
+        for radius in [48.0_f32, 150.0] {
+            println!("--- pen speed sweep, circle @ 240 Hz, r={radius} ---");
+            for speed in [200.0_f32, 800.0, 1600.0, 3200.0, 6400.0] {
+                let strokes = strokes_at(Shape::Circle, 240.0, speed);
+                println!(
+                    "speed {speed} px/s = {:.1} px/sample",
+                    mean_step_px(&strokes[0])
+                );
+                for count in [512_usize, 1024] {
+                    let config = measure_config(count, radius);
+                    for path in [Path::PerDab, Path::Serial, Path::Batch] {
+                        report(
+                            &format!("  {path:?} N={count} r={radius}"),
+                            &measure_bristle(config, &strokes, path),
+                        );
+                    }
+                }
             }
         }
     }
