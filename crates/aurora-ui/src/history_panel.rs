@@ -931,9 +931,11 @@ mod tests {
             // 0.161.0: History is the rail's `Fill` panel, so it takes
             // exactly what the two (empty, content-sized) panels above it
             // leave, however many entries it holds.
+            // Task 173: and the 4 px `surface.app` gutter between the
+            // Layers panel and the tab group.
             assert_eq!(
                 history_bounds.height,
-                900 - layers_bounds.height - properties_bounds.height,
+                900 - layers_bounds.height - properties_bounds.height - 4,
                 "History takes the rest of the rail at {count} entries"
             );
             assert!(

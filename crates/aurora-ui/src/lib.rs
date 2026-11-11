@@ -148,6 +148,8 @@ pub use paths_panel::{
     sync_paths_panel, sync_paths_toolbar,
 };
 #[cfg(test)]
+mod gutter_tests;
+#[cfg(test)]
 mod layer_filter_tests;
 #[cfg(test)]
 mod layers_panel_render;

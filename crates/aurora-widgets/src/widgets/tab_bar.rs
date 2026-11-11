@@ -307,6 +307,8 @@ pub struct TabBarState {
     width_limits: Option<(f32, f32)>,
     /// A fill under the bar (task 172, [`set_tab_bar_surface`]); `None` paints none.
     surface: Option<StripSurface>,
+    /// The fill of the selected tab (task 173, [`set_tab_bar_selected_surface`]).
+    selected_surface: Option<StripSurface>,
 }
 
 impl TabBarState {
@@ -324,7 +326,14 @@ impl TabBarState {
             window: None,
             width_limits: None,
             surface: None,
+            selected_surface: None,
         }
+    }
+
+    /// The fill of the selected tab, if any ([`set_tab_bar_selected_surface`]).
+    #[must_use]
+    pub fn selected_surface(&self) -> Option<StripSurface> {
+        self.selected_surface
     }
 
     /// The surface the bar fills with, if any ([`set_tab_bar_surface`]).
@@ -1117,6 +1126,29 @@ pub fn set_tab_bar_surface(
     }
     with_tab_bar_mut(tree, bar, |state| {
         state.surface = surface;
+        Ok(())
+    })?;
+    Ok(true)
+}
+
+/// Gives the bar's selected tab a fill of its own (task 173): a panel
+/// group's tab is filled with the panel colour so it joins the body below
+/// it, the document strip's with the chrome colour. Returns whether
+/// anything changed.
+///
+/// # Errors
+///
+/// [`WidgetError::WrongWidgetKind`] if `bar` is not a tab bar.
+pub fn set_tab_bar_selected_surface(
+    tree: &mut WidgetTree<WidgetKind>,
+    bar: WidgetId,
+    surface: Option<StripSurface>,
+) -> Result<bool, WidgetError> {
+    if state(tree, bar)?.selected_surface == surface {
+        return Ok(false);
+    }
+    with_tab_bar_mut(tree, bar, |state| {
+        state.selected_surface = surface;
         Ok(())
     })?;
     Ok(true)

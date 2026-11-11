@@ -1200,7 +1200,19 @@ pub fn paint_widget(
         WidgetKind::Dropdown(state) => paint_dropdown(state, bounds, theme, scales, scale_factor),
         WidgetKind::DropdownList => paint_dropdown_list(bounds, theme, scales, scale_factor),
         WidgetKind::TabBar(state) => paint_tab_bar(state, bounds, theme, scale_factor),
-        WidgetKind::Tab(state) => paint_tab(state, bounds, theme, scales, scale_factor),
+        WidgetKind::Tab(state) => {
+            // A selected tab may carry a fill of its own (task 173), set on
+            // its bar: the panel group's tab joins the body below it.
+            let fill = if state.is_selected() {
+                tree.parent(id).and_then(|bar| match tree.payload(bar) {
+                    Some(WidgetKind::TabBar(bar)) => bar.selected_surface(),
+                    _ => None,
+                })
+            } else {
+                None
+            };
+            paint_tab(state, fill, bounds, theme, scales, scale_factor)
+        }
         WidgetKind::Tooltip => paint_tooltip(bounds, theme, scales, scale_factor),
         WidgetKind::Menu(_) => paint_menu(bounds, theme, scales, scale_factor),
         WidgetKind::MenuSeparator => paint_menu_separator(bounds, theme, scale_factor),
@@ -2625,6 +2637,7 @@ fn strip_colour(surface: StripSurface, theme: &Theme) -> aurora_theme::Color {
     match surface {
         StripSurface::Chrome => theme.surface.chrome,
         StripSurface::Header => theme.surface.header,
+        StripSurface::Panel => theme.surface.panel,
     }
 }
 
@@ -2719,6 +2732,7 @@ fn paint_tab_bar(
 /// by [`paint_widget_ops_focused`].
 fn paint_tab(
     state: &TabState,
+    fill: Option<StripSurface>,
     bounds: Rect,
     theme: &Theme,
     scales: &Scales,
@@ -2741,9 +2755,11 @@ fn paint_tab(
         1.0
     };
     let path = rounded_rect(left, top, width, height, scales.radius.sm as f32);
-    let mut paints: Vec<Paint> = control_outline(&path, theme, alpha, scale_factor)?
-        .into_iter()
-        .collect();
+    let mut paints: Vec<Paint> = Vec::new();
+    if let Some(surface) = fill {
+        paints.extend(paint_strip(surface, bounds, theme, scale_factor)?);
+    }
+    paints.extend(control_outline(&path, theme, alpha, scale_factor)?);
     if state.is_selected() {
         let underline = underline_width.min(height);
         if let Some(mesh) = band(

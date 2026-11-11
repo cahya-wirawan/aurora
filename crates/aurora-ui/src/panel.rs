@@ -133,8 +133,9 @@ pub fn insert_panel(
     title: impl Into<String>,
     scales: &Scales,
 ) -> Result<PanelHandle, WidgetError> {
+    let title_text: String = title.into();
     let mut root_node = Node::new(Role::Region);
-    root_node.set_label(title.into());
+    root_node.set_label(title_text.clone());
     root_node.add_action(Action::Focus);
     root_node.add_action(Action::Collapse);
     root_node.set_expanded(true);
@@ -151,6 +152,7 @@ pub fn insert_panel(
         Node::new(Role::GenericContainer),
         widgets::StripSurface::Header,
     )?;
+    insert_title_tab(tree, header, &title_text, scales)?;
     let viewport =
         widgets::insert_container(tree, root, viewport_style(PanelSizing::Fill, scales))?;
     let body = widgets::insert_container(tree, viewport, body_style(false))?;
@@ -184,6 +186,72 @@ pub fn insert_panel(
     };
     refresh_panel_floor(tree, panel)?;
     Ok(panel)
+}
+
+/// A lone panel's title tab (task 173): a `surface.panel` strip, padded by
+/// `spacing.sm` on each side, flush left in the title slot and as wide as its
+/// text, holding the title as a measured label. Both nodes are hidden from
+/// assistive technology: the panel `Region`'s label is the one announcement
+/// of the title. The tab is `Display::None` while the panel is grouped (the
+/// group's tab names it).
+fn insert_title_tab(
+    tree: &mut WidgetTree<WidgetKind>,
+    header: WidgetId,
+    title: &str,
+    scales: &Scales,
+) -> Result<(), WidgetError> {
+    #[allow(clippy::cast_precision_loss)]
+    let sm = scales.spacing.sm as f32;
+    let mut tab_node = Node::new(Role::GenericContainer);
+    tab_node.set_hidden();
+    let tab = widgets::insert_strip(
+        tree,
+        header,
+        Style {
+            flex_direction: taffy::FlexDirection::Row,
+            flex_shrink: 1.0,
+            min_size: Size {
+                width: Dimension::ZERO,
+                height: Dimension::ZERO,
+            },
+            padding: taffy::Rect {
+                left: length(sm),
+                right: length(sm),
+                top: taffy::style_helpers::zero(),
+                bottom: taffy::style_helpers::zero(),
+            },
+            ..Default::default()
+        },
+        tab_node,
+        widgets::StripSurface::Panel,
+    )?;
+    let label = widgets::insert_label(tree, tab, scales, title)?;
+    widgets::set_label_reserve(tree, label, &[title])?;
+    let mut style = tree
+        .style(label)
+        .cloned()
+        .ok_or(WidgetError::UnknownWidget(label))?;
+    style.flex_shrink = 1.0;
+    style.min_size.width = Dimension::ZERO;
+    tree.set_style(label, style)?;
+    let mut node = tree
+        .accessibility(label)
+        .ok_or(WidgetError::UnknownWidget(label))?
+        .clone();
+    node.set_hidden();
+    tree.set_accessibility(label, node)
+}
+
+/// Shows or hides `panel`'s title tab (task 173); hidden while grouped.
+pub(crate) fn set_title_tab_shown(
+    tree: &mut WidgetTree<WidgetKind>,
+    panel: PanelHandle,
+    shown: bool,
+) -> Result<(), WidgetError> {
+    if let Some(&tab) = tree.children(panel.header).and_then(<[WidgetId]>::first) {
+        set_display(tree, tab, if shown { Display::Flex } else { Display::None })?;
+    }
+    Ok(())
 }
 
 /// A panel's height floor while expanded (0.161.0, see [`root_style`]):
@@ -964,6 +1032,18 @@ pub fn set_panel_collapsed(
             },
         )?;
     }
+    // Reopening a closed lone panel shows its root again (task 173: a
+    // closed panel's root is `Display::None`, so the rail's gap skips it);
+    // a grouped panel's visibility is the group's (`sync_panel_group`).
+    let reopening = tree
+        .style(panel.header)
+        .is_some_and(|style| style.display == Display::None);
+    if reopening
+        && let Some(parent) = tree.parent(panel.root)
+        && !crate::panel_group::is_group_root(tree, parent)
+    {
+        set_display(tree, panel.root, Display::Flex)?;
+    }
     set_display(tree, panel.header, Display::Flex)?;
     // The root last (0.161.0 review J6): its floor counts only the
     // children shown, so it is computed once their `display` is final.
@@ -1033,6 +1113,8 @@ pub fn close_panel(
     // `set_panel_collapsed` call — the panel-toggle command's reopen
     // path — shows it again.
     set_display(tree, panel.header, Display::None)?;
+    // And its root, so the rail's gap (task 173) skips it too.
+    set_display(tree, panel.root, Display::None)?;
     clear_panel_body(tree, panel.body)?;
     tree.set_accessibility(panel.body, Node::new(Role::GenericContainer))
 }
@@ -1111,9 +1193,19 @@ pub(crate) fn set_panel_grouped(
         header_style(scales)
     };
     tree.set_style(panel.header, Style { display, ..header })?;
+    // The title tab shows only on a lone panel (task 173).
+    set_title_tab_shown(tree, panel, !grouped)?;
     let collapsed = panel_is_collapsed(tree, panel)?;
     if !grouped {
-        set_display(tree, panel.root, Display::Flex)?;
+        set_display(
+            tree,
+            panel.root,
+            if display == Display::None && collapsed {
+                Display::None
+            } else {
+                Display::Flex
+            },
+        )?;
         let node = tree
             .accessibility(panel.root)
             .ok_or(WidgetError::UnknownWidget(panel.root))?;
@@ -1699,6 +1791,7 @@ mod tests {
     /// slot's box, and nothing on the root, body or the Layers controls
     /// strip.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn each_docked_panels_title_slot_draws_its_name_and_nothing_else_does() {
         const PALETTE_TOML: &str = include_str!("../../../design/tokens/palette.toml");
         const DARK_THEME_TOML: &str = include_str!("../../../design/themes/dark.toml");
@@ -1719,7 +1812,21 @@ mod tests {
             Ok(controls) => controls,
             Err(err) => unreachable!("{err:?}"),
         };
-        ws.tree.compute_layout(1600.0, 900.0);
+        // Task 173: the title is a measured label inside the title tab, so
+        // the layout is the app's text-aware one.
+        let Ok(mut engine) = aurora_text::TextEngine::new() else {
+            unreachable!("the bundled font loads")
+        };
+        aurora_widgets::compute_text_layout(
+            &mut ws.tree,
+            1600.0,
+            900.0,
+            Some(aurora_widgets::TextMeasure {
+                engine: &mut engine,
+                scales: &scales,
+                scale_factor: 1.0,
+            }),
+        );
         let runs = |id| {
             let Some(bounds) = ws.tree.bounds(id) else {
                 unreachable!("laid out");
@@ -1755,12 +1862,27 @@ mod tests {
         }
         {
             let (panel, title) = (ws.layers, "Layers");
-            let header_runs = runs(panel.header);
-            let [run] = &header_runs[..] else {
-                unreachable!("{title}: one title run, got {header_runs:?}");
+            assert!(
+                runs(panel.header).is_empty(),
+                "{title}: the title slot itself draws nothing, its tab's label does"
+            );
+            let tab = ws
+                .tree
+                .children(panel.header)
+                .and_then(|c| c.first().copied());
+            let label = tab
+                .and_then(|tab| ws.tree.children(tab))
+                .and_then(|c| c.first().copied());
+            let (Some(tab), Some(label)) = (tab, label) else {
+                unreachable!("{title}: the slot holds a title tab holding a label");
+            };
+            let label_runs = runs(label);
+            let [run] = &label_runs[..] else {
+                unreachable!("{title}: one title run, got {label_runs:?}");
             };
             assert_eq!(run.text, title);
-            let Some(header) = ws.tree.bounds(panel.header) else {
+            let (Some(header), Some(tab_box)) = (ws.tree.bounds(panel.header), ws.tree.bounds(tab))
+            else {
                 unreachable!("laid out");
             };
             #[allow(clippy::cast_precision_loss)]
@@ -1775,6 +1897,18 @@ mod tests {
                 "{title}: inside the slot horizontally: {run:?} vs {header:?}"
             );
             assert!((run.rect.1 - y).abs() < f32::EPSILON && (run.rect.3 - h).abs() < f32::EPSILON);
+            // The tab is flush left, one `spacing.sm` of padding each side
+            // of the text, and as tall as the slot.
+            #[allow(clippy::cast_precision_loss)]
+            let sm = scales.spacing.sm as f32;
+            assert_eq!(tab_box.x, header.x, "{title}: the tab is flush left");
+            assert_eq!(tab_box.height, header.height);
+            assert!(
+                (tab_box.width as f32 - (run.rect.2 + 2.0 * sm)).abs() < 1.0,
+                "{title}: tab width {} is text {} plus 2 x {sm}",
+                tab_box.width,
+                run.rect.2
+            );
             assert!(
                 runs(panel.root).is_empty(),
                 "{title}: the root draws nothing"

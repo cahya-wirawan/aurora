@@ -75410,6 +75410,9 @@ mod tests {
         // own comment); at a 2x scale factor, physical is double that --
         // the origin included, which is what keeps Retina mapping right.
         // Since 0.162.0 the status bar takes one row (`sh`) off its bottom.
+        // Since task 173 a 4 px gutter (`spacing.xxs`) sits each side of the
+        // canvas column: the origin is after the tools' gutter, the width
+        // loses both.
         let (ox, oy) = canvas_origin(&workspace);
         let sh = status_bar_height(&workspace);
         assert_eq!(
@@ -75417,7 +75420,7 @@ mod tests {
             Some((
                 2.0 * ox,
                 2.0 * oy,
-                2.0 * (750.0 - ox),
+                2.0 * (750.0 - ox - 4.0),
                 2.0 * (800.0 - oy - sh)
             ))
         );
@@ -75443,7 +75446,7 @@ mod tests {
         let (ox, oy) = canvas_origin(&workspace);
         let sh = status_bar_height(&workspace);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let expected = ((750.0 - ox) as u32, (800.0 - oy - sh) as u32);
+        let expected = ((750.0 - ox - 4.0) as u32, (800.0 - oy - sh) as u32);
         assert_eq!(canvas_area_physical_size(&workspace, 1.0), Some(expected));
     }
 
@@ -96147,8 +96150,8 @@ mod panel_scroll_tests {
             let rail = bounds(ws, ws.rail);
             assert_eq!(
                 group.y,
-                layers.bottom(),
-                "{what}: the group docks under Layers"
+                layers.bottom() + 4,
+                "{what}: the group docks under Layers, a 4 px gutter below it (task 173)"
             );
             assert_eq!(bar.y, group.y, "{what}: the tab row is the group's top");
             let Some(index) = shown(ws) else {
@@ -98859,7 +98862,11 @@ mod panel_scroll_tests {
                 toggle(&mut ws, &mut focus);
                 let canvas = bounds(&ws, ws.canvas_area);
                 let strip = bounds(&ws, ws.panel_strip.root);
-                assert_eq!(canvas.right(), strip.x, "the canvas reaches the strip");
+                assert_eq!(
+                    canvas.right() + 4,
+                    strip.x,
+                    "the canvas reaches the strip, a 4 px gutter short (task 173)"
+                );
                 #[allow(clippy::cast_precision_loss)]
                 let (ox, oy, right) = (canvas.x as f32, canvas.y as f32, canvas.right() as f32);
                 assert!(ox > 0.0 && oy > 0.0);

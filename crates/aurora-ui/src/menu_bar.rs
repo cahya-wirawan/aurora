@@ -5,8 +5,8 @@
 //! The bar is the first child of the canvas column, above the options bar,
 //! so it spans the canvas column and not the tools panel or the rail (a
 //! full-window row would need the root re-parented; a named gap). It is a
-//! `WidgetKind::Panel` (`surface.panel` with the panel's `border.default`
-//! outline) whose accessibility role is overridden to `MenuBar`, and is
+//! flat `WidgetKind::Strip` (`surface.chrome`, no border or radius, like the
+//! options bar since task 173) whose accessibility role is `MenuBar`, and is
 //! built **hidden**: [`set_menu_bar_shown`] shows it, so every layout that
 //! does not ask for it is exactly as before.
 //!
@@ -18,8 +18,8 @@
 //! button by [`open_menu_under`]. What the items *are* and what they do is
 //! `aurora-app`'s: this module only builds, shows, relabels and measures.
 //!
-//! Colours and sizes are existing tokens only: `surface.panel`,
-//! `border.default`, `text.primary`, `state.hover_overlay`,
+//! Colours and sizes are existing tokens only: `surface.chrome`,
+//! `text.primary`, `state.hover_overlay`,
 //! `state.active_overlay`, `spacing.*` and the control row height.
 
 use accesskit::{Node, Orientation, Role};
@@ -84,7 +84,13 @@ pub(crate) fn insert_menu_bar(
     let mut node = Node::new(Role::MenuBar);
     node.set_label(MENU_BAR_LABEL);
     node.set_orientation(Orientation::Horizontal);
-    let root = tree.insert(parent, bar_style(scales), node, WidgetKind::Panel)?;
+    let root = widgets::insert_strip(
+        tree,
+        parent,
+        bar_style(scales),
+        node,
+        widgets::StripSurface::Chrome,
+    )?;
     let mut buttons = [root; 6];
     for (slot, title) in buttons.iter_mut().zip(MENU_BAR_TITLES) {
         match widgets::insert_flat_button(tree, root, scales, title) {

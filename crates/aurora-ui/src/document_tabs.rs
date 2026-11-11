@@ -76,7 +76,10 @@ pub fn insert_document_tabs(
         vec![INITIAL_DOCUMENT_TAB.to_owned()],
         0,
     )?;
-    widgets::set_tab_bar_surface(tree, bar, Some(widgets::StripSurface::Chrome))?;
+    // Task 173: the strip is the header grey and the selected document
+    // tab the chrome colour, as in Photoshop's arrangement.
+    widgets::set_tab_bar_surface(tree, bar, Some(widgets::StripSurface::Header))?;
+    widgets::set_tab_bar_selected_surface(tree, bar, Some(widgets::StripSurface::Chrome))?;
     let mut style = tree
         .style(bar)
         .cloned()

@@ -35,8 +35,8 @@
 //! result rows, a tooltip's text (its accessibility label, the one copy
 //! `Tooltip::set_text` keeps current), and a dialog's message (one
 //! line). Since 0.140.0 a measured `Checkbox`'s label, since 0.141.0 a
-//! dialog's title, and since 0.142.0 a docked panel's title (its root's
-//! label, drawn in the root's first child — [`panel_title`]). A text
+//! dialog's title, and since 0.142.0 a docked panel's title (since task 173 a
+//! measured `Label` inside the panel's title tab). A text
 //! field's placeholder (0.199.0) is drawn in `text.secondary` while it is empty.
 //!
 //! **Overflow (0.142.0).** There is no wrapping. A run is clipped to its
@@ -653,23 +653,8 @@ pub fn text_runs(
                 HAlign::Start,
             ))]
         }
-        // A docked panel's title (0.142.0): the panel's first child (its
-        // unlabelled title slot) draws the panel `Region`'s own label --
-        // the one copy of the title -- one line, flush left, inset by
-        // `spacing.sm` like a tree row's label, ellipsized. `text.secondary`
-        // (gated at 4.5:1 on `surface.panel`), Regular, body size: the
-        // title is a heading over the rows, not one of them, but no
-        // heading weight or size exists in the type tokens -- the title's
-        // typography and colour are the design owner's call, flagged
-        // rather than invented.
-        WidgetKind::Container | WidgetKind::Strip(_) if let Some(title) = panel_title(tree, id) => {
-            vec![ellipsized(run(
-                title,
-                rgba(theme.text.secondary, 1.0),
-                inset_x(full, pad),
-                HAlign::Start,
-            ))]
-        }
+        // A docked panel's title is a measured `Label` inside the panel's
+        // title tab (task 173), drawn like any label.
         // A dialog's title (0.141.0): its presentational first child
         // draws the dialog's own label -- the one copy of the title --
         // on one line, flush left, clipped, in `text.primary`, exactly
@@ -720,30 +705,6 @@ fn dialog_title(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<&str> {
     let parent = tree.parent(id)?;
     let is_slot = matches!(tree.payload(parent)?, WidgetKind::Dialog)
         && tree.accessibility(id)?.role() == accesskit::Role::GenericContainer;
-    is_slot
-        .then(|| tree.accessibility(parent)?.label())
-        .flatten()
-}
-
-/// The title a docked panel's title slot draws: its parent `Panel`'s own
-/// accessibility label, when `id` is that panel's unlabelled
-/// `Role::GenericContainer` **first** child (`aurora_ui`'s `insert_panel`
-/// builds exactly that). The first-child test is load-bearing, unlike the
-/// dialog's: a panel's body and its controls strips are unlabelled
-/// generic containers too. `None` for any other widget.
-fn panel_title(tree: &WidgetTree<WidgetKind>, id: WidgetId) -> Option<&str> {
-    let parent = tree.parent(id)?;
-    let node = tree.accessibility(id)?;
-    // Only under a `Region` (0.164.0): a panel in a tab group is a
-    // `TabPanel` whose tab names it, and its title slot is zero height.
-    // A floating panel (0.167.0) is a `RaisedPanel` with the same slot.
-    let is_slot = matches!(
-        tree.payload(parent)?,
-        WidgetKind::Panel | WidgetKind::RaisedPanel
-    ) && tree.accessibility(parent)?.role() == accesskit::Role::Region
-        && node.role() == accesskit::Role::GenericContainer
-        && node.label().is_none()
-        && tree.children(parent)?.first() == Some(&id);
     is_slot
         .then(|| tree.accessibility(parent)?.label())
         .flatten()
@@ -2240,94 +2201,6 @@ mod tests {
         assert_eq!(overflow(label), Some(super::TextOverflow::Ellipsis));
         assert_eq!(overflow(row), Some(super::TextOverflow::Ellipsis));
         assert_eq!(overflow(field), Some(super::TextOverflow::Clip));
-    }
-
-    /// A panel `Region` laid out like `aurora_ui`'s `insert_panel`: the
-    /// root, an unlabelled generic first child (the title slot), a body
-    /// and a controls strip (both unlabelled generic containers too).
-    fn panel_tree(title: &str) -> (WidgetTree<WidgetKind>, [WidgetId; 4]) {
-        let (mut tree, root) = new_tree(taffy::Style::default());
-        let mut node = accesskit::Node::new(accesskit::Role::Region);
-        node.set_label(title);
-        let panel = ok(tree.insert(root, taffy::Style::default(), node, WidgetKind::Panel));
-        let generic = |tree: &mut WidgetTree<WidgetKind>| {
-            ok(tree.insert(
-                panel,
-                taffy::Style::default(),
-                accesskit::Node::new(accesskit::Role::GenericContainer),
-                WidgetKind::Container,
-            ))
-        };
-        let header = generic(&mut tree);
-        let body = generic(&mut tree);
-        let strip = generic(&mut tree);
-        (tree, [panel, header, body, strip])
-    }
-
-    /// 0.142.0: a panel's first child draws the panel's label, inset like
-    /// a tree row's, in `text.secondary`, ellipsized; its root, body and
-    /// controls strip draw nothing.
-    #[test]
-    fn a_panels_title_slot_draws_the_panel_label_and_nothing_else_does() {
-        let (tree, [panel, header, body, strip]) = panel_tree("Layers");
-        let scales = test_scales();
-        let theme = dark_theme();
-        let bounds = Rect {
-            x: 1350,
-            y: 0,
-            width: 250,
-            height: 21,
-        };
-        let runs = |id| text_runs(&tree, id, bounds, bounds, None, &theme, &scales);
-        let title_runs = runs(header);
-        let [title] = &title_runs[..] else {
-            unreachable!("exactly one title run: {title_runs:?}");
-        };
-        assert_eq!(title.text, "Layers");
-        assert_eq!(title.color, rgba(theme.text.secondary, 1.0));
-        assert_eq!(title.align, HAlign::Start);
-        assert_eq!(title.overflow, super::TextOverflow::Ellipsis);
-        assert!(title.field.is_none());
-        let pad = super::token_px(scales.spacing.sm);
-        assert_eq!(title.rect, (1350.0 + pad, 0.0, 250.0 - 2.0 * pad, 21.0));
-        assert!(runs(panel).is_empty(), "the root draws nothing itself");
-        assert!(runs(body).is_empty(), "the body is not a title slot");
-        assert!(runs(strip).is_empty(), "nor is a controls strip");
-    }
-
-    /// The slot must be unlabelled and the panel's: a labelled first child
-    /// or a generic first child of a non-panel draws no title, and an
-    /// empty title draws nothing.
-    #[test]
-    fn only_a_panels_unlabelled_first_child_is_its_title_slot() {
-        let scales = test_scales();
-        let theme = dark_theme();
-        let bounds = Rect {
-            x: 0,
-            y: 0,
-            width: 200,
-            height: 21,
-        };
-        let (mut tree, [_, header, _, _]) = panel_tree("Layers");
-        let mut labelled = accesskit::Node::new(accesskit::Role::GenericContainer);
-        labelled.set_label("Something");
-        ok(tree.set_accessibility(header, labelled));
-        assert!(text_runs(&tree, header, bounds, bounds, None, &theme, &scales).is_empty());
-
-        let (tree, [_, header, _, _]) = panel_tree("");
-        assert!(text_runs(&tree, header, bounds, bounds, None, &theme, &scales).is_empty());
-
-        let (mut tree, root) = new_tree(taffy::Style::default());
-        let mut node = accesskit::Node::new(accesskit::Role::Region);
-        node.set_label("Not a panel");
-        let region = ok(tree.insert(root, taffy::Style::default(), node, WidgetKind::Container));
-        let first = ok(tree.insert(
-            region,
-            taffy::Style::default(),
-            accesskit::Node::new(accesskit::Role::GenericContainer),
-            WidgetKind::Container,
-        ));
-        assert!(text_runs(&tree, first, bounds, bounds, None, &theme, &scales).is_empty());
     }
 
     #[test]
