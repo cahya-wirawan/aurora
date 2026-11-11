@@ -970,7 +970,7 @@ fn insert_canvas_column(
         canvas_column,
         options_bar_style(scales),
         options_node,
-        widgets::StripSurface::Panel,
+        widgets::StripSurface::Chrome,
     ) {
         Ok(id) => id,
         Err(err) => unreachable!("canvas_column was just inserted: {err:?}"),
@@ -1563,7 +1563,7 @@ mod tests {
         assert_eq!(accessibility.label(), Some("Aurora"));
     }
 
-    /// Task 172: the chrome strips paint `surface.panel` and the panel title
+    /// Task 172: the chrome strips paint `surface.chrome` and the panel title
     /// strips and tab rows paint `surface.header`, so the window background
     /// (`surface.app`) shows only below the rail and around the document.
     #[test]
@@ -1578,13 +1578,13 @@ mod tests {
             Some(WidgetKind::TabBar(state)) => state.surface(),
             _ => None,
         };
-        let panel = Some(StripSurface::Panel);
+        let chrome = Some(StripSurface::Chrome);
         let header = Some(StripSurface::Header);
-        assert_eq!(strip(ws.tools.root), panel, "tools column");
-        assert_eq!(strip(ws.options_bar), panel, "options bar");
-        assert_eq!(strip(ws.status_bar.root), panel, "status bar");
-        assert_eq!(strip(ws.panel_strip.root), panel, "collapsed rail strip");
-        assert_eq!(bar_surface(ws.document_tabs), panel, "document tab strip");
+        assert_eq!(strip(ws.tools.root), chrome, "tools column");
+        assert_eq!(strip(ws.options_bar), chrome, "options bar");
+        assert_eq!(strip(ws.status_bar.root), chrome, "status bar");
+        assert_eq!(strip(ws.panel_strip.root), chrome, "collapsed rail strip");
+        assert_eq!(bar_surface(ws.document_tabs), chrome, "document tab strip");
         assert!(
             matches!(ws.tree.payload(ws.menu_bar.root), Some(WidgetKind::Panel)),
             "the menu bar is a Panel (surface.panel)"

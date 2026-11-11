@@ -323,7 +323,7 @@ pub fn insert_status_bar(
         parent,
         status_bar_style(scales),
         status_bar_node(),
-        widgets::StripSurface::Panel,
+        widgets::StripSurface::Chrome,
     )?;
     let built = (|| {
         let zoom =

@@ -10,7 +10,8 @@ is_default = false
 [surface]
 canvas  = "neutral.900" # f5f5f6 -- near-white, mirrors Dark's canvas being the darkest neutral extreme
 app     = "neutral.800" # e2e2e5 -- one visible step down from canvas, real chrome/canvas separation
-header  = "neutral.800" # e2e2e5 -- same as app: Light keeps its existing look (task 172: header token added for Dark)
+chrome  = "neutral.800" # e2e2e5 -- same as app: the chrome strips showed surface.app before surface.chrome existed
+header  = "neutral.900" # f5f5f6 -- same as panel: title strips and tab rows showed the panel root before
 panel   = "neutral.900" # f5f5f6 -- panels are the "card" that sits brighter than app chrome; elevation
 raised  = "neutral.900" # f5f5f6 -- same as panel; elevation differentiated by scales.toml's shadow token,
 overlay = "neutral.900" # f5f5f6 --   not a neutral-step shift (unlike Dark: scales.toml's own elevation

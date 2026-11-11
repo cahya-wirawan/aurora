@@ -1100,7 +1100,7 @@ pub fn set_tab_bar_closable(
     Ok(true)
 }
 
-/// Gives the bar a fill of its own (task 172): `surface.panel` for the
+/// Gives the bar a fill of its own (task 172): `surface.chrome` for the
 /// document tab strip, `surface.header` for a panel group's tab row.
 /// Returns whether anything changed.
 ///

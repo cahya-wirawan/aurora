@@ -1517,7 +1517,7 @@ mod tests {
             root,
             Style::default(),
             accesskit::Node::new(Role::Pane),
-            WidgetKind::Strip(crate::widgets::StripSurface::Panel),
+            WidgetKind::Strip(crate::widgets::StripSurface::Chrome),
         ));
         ok(insert_dialog(
             &mut tree,

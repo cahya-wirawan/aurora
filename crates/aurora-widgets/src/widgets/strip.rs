@@ -11,9 +11,9 @@ use crate::tree::{WidgetId, WidgetTree};
 /// Which surface token a [`WidgetKind::Strip`] (or a tab bar) fills with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StripSurface {
-    /// `surface.panel`: chrome strips (tools column, options bar, status
-    /// bar, document tab strip).
-    Panel,
+    /// `surface.chrome`: the window's chrome strips (tools column, options
+    /// bar, status bar, document tab strip).
+    Chrome,
     /// `surface.header`: a panel's title strip and a panel group's tab row.
     Header,
 }

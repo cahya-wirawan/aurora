@@ -2623,7 +2623,7 @@ fn band(
 /// The fill colour of a [`StripSurface`].
 fn strip_colour(surface: StripSurface, theme: &Theme) -> aurora_theme::Color {
     match surface {
-        StripSurface::Panel => theme.surface.panel,
+        StripSurface::Chrome => theme.surface.chrome,
         StripSurface::Header => theme.surface.header,
     }
 }
@@ -6002,7 +6002,7 @@ mod tests {
         let scales = scales();
         let theme = dark_theme();
         for (surface, token) in [
-            (StripSurface::Panel, theme.surface.panel),
+            (StripSurface::Chrome, theme.surface.chrome),
             (StripSurface::Header, theme.surface.header),
         ] {
             let (mut tree, root) = new_tree(taffy::Style::default());
@@ -6082,7 +6082,7 @@ mod tests {
         };
         assert_eq!(plain.len(), 1, "no surface: the rule alone");
         for (surface, token) in [
-            (StripSurface::Panel, theme.surface.panel),
+            (StripSurface::Chrome, theme.surface.chrome),
             (StripSurface::Header, theme.surface.header),
         ] {
             if let Err(err) = crate::widgets::set_tab_bar_surface(&mut tree, bar, Some(surface)) {

@@ -110,7 +110,7 @@ pub(crate) fn insert_panel_strip(
     node.set_hidden();
     let mut style = crate::tools_panel::tools_style(scales);
     style.display = Display::None;
-    let root = widgets::insert_strip(tree, parent, style, node, widgets::StripSurface::Panel)?;
+    let root = widgets::insert_strip(tree, parent, style, node, widgets::StripSurface::Chrome)?;
     let mut buttons = panels.map(|(panel, _)| (panel, root));
     for (slot, (panel, full)) in buttons.iter_mut().zip(panels) {
         let short = panel_short_label(full).unwrap_or(full);

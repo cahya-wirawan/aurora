@@ -914,7 +914,7 @@ mod tests {
             root,
             Style::default(),
             Node::new(Role::Pane),
-            WidgetKind::Strip(crate::widgets::StripSurface::Panel),
+            WidgetKind::Strip(crate::widgets::StripSurface::Chrome),
         ));
         let tooltip = ok(tree.insert(
             button,

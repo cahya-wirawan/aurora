@@ -68,6 +68,31 @@ const GATED_PAIRS: &[GatedPair] = &[
         foreground: |t| t.icon.secondary,
         background: |t| t.surface.header,
     },
+    // surface.chrome (task 172): the window chrome strips.
+    GatedPair {
+        label: "text.primary on surface.chrome",
+        floor: 4.5,
+        foreground: |t| t.text.primary,
+        background: |t| t.surface.chrome,
+    },
+    GatedPair {
+        label: "text.secondary on surface.chrome",
+        floor: 4.5,
+        foreground: |t| t.text.secondary,
+        background: |t| t.surface.chrome,
+    },
+    GatedPair {
+        label: "icon.default on surface.chrome",
+        floor: 3.0,
+        foreground: |t| t.icon.default,
+        background: |t| t.surface.chrome,
+    },
+    GatedPair {
+        label: "icon.secondary on surface.chrome",
+        floor: 3.0,
+        foreground: |t| t.icon.secondary,
+        background: |t| t.surface.chrome,
+    },
     GatedPair {
         label: "text.primary on surface.canvas",
         floor: 4.5,
@@ -363,8 +388,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            34,
-            "expected all 34 gated pairs to be checked"
+            38,
+            "expected all 38 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -374,6 +399,42 @@ mod tests {
                 result.ratio,
                 result.floor
             );
+        }
+    }
+
+    /// Task 172: outside Dark the new `surface.chrome` and `surface.header`
+    /// tokens reproduce what was drawn before they existed: the chrome strips
+    /// showed `surface.app` and the title strips and tab rows the panel.
+    #[test]
+    fn outside_dark_chrome_is_app_and_header_is_panel() {
+        let palette = match Palette::from_toml_str(PALETTE_TOML) {
+            Ok(p) => p,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let mut set = ThemeSet::new();
+        for toml in [
+            DARK_TOML,
+            LIGHT_TOML,
+            HIGH_CONTRAST_DARK_TOML,
+            HIGH_CONTRAST_LIGHT_TOML,
+            COLOR_CRITICAL_TOML,
+        ] {
+            if let Err(err) = set.register(toml) {
+                unreachable!("{err:?}");
+            }
+        }
+        for name in [
+            "Light",
+            "High Contrast Dark",
+            "High Contrast Light",
+            "Color-Critical",
+        ] {
+            let theme = match set.resolve(name, &palette) {
+                Ok(t) => t,
+                Err(err) => unreachable!("{name}: {err:?}"),
+            };
+            assert_eq!(theme.surface.chrome, theme.surface.app, "{name}: chrome");
+            assert_eq!(theme.surface.header, theme.surface.panel, "{name}: header");
         }
     }
 
@@ -461,8 +522,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            34,
-            "expected all 34 gated pairs to be checked"
+            38,
+            "expected all 38 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -497,8 +558,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            34,
-            "expected all 34 gated pairs to be checked"
+            38,
+            "expected all 38 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -533,8 +594,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            34,
-            "expected all 34 gated pairs to be checked"
+            38,
+            "expected all 38 gated pairs to be checked"
         );
         for result in &results {
             assert!(
@@ -569,8 +630,8 @@ mod tests {
         let results = check_gated_pairs(&theme);
         assert_eq!(
             results.len(),
-            34,
-            "expected all 34 gated pairs to be checked"
+            38,
+            "expected all 38 gated pairs to be checked"
         );
         for result in &results {
             assert!(

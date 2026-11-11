@@ -14,6 +14,7 @@ is_default = false
 [surface]
 canvas  = "hc.black"
 app     = "hc.black"
+chrome  = "hc.black"
 header  = "hc.black"
 panel   = "hc.black"
 raised  = "hc.black"

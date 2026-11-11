@@ -24,6 +24,9 @@ pub struct SurfaceTokens {
     pub app: Color,
     /// Panel title strips and tab rows (added with the Dark greys, task 172).
     pub header: Color,
+    /// The fill of the window's chrome strips (tools column, options bar,
+    /// status bar, document tab strip); task 172.
+    pub chrome: Color,
     pub panel: Color,
     pub raised: Color,
     pub overlay: Color,
@@ -226,6 +229,7 @@ impl ThemeSet {
                 canvas: resolve_color(&merged, "surface.canvas", palette)?,
                 app: resolve_color(&merged, "surface.app", palette)?,
                 header: resolve_color(&merged, "surface.header", palette)?,
+                chrome: resolve_color(&merged, "surface.chrome", palette)?,
                 panel: resolve_color(&merged, "surface.panel", palette)?,
                 raised: resolve_color(&merged, "surface.raised", palette)?,
                 overlay: resolve_color(&merged, "surface.overlay", palette)?,

@@ -267,7 +267,7 @@ pub fn insert_tools_panel(
         parent,
         strip_style(scales),
         node,
-        widgets::StripSurface::Panel,
+        widgets::StripSurface::Chrome,
     )?;
     let built = build(tree, root, scales, selected);
     if built.is_err() {

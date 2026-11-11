@@ -18,7 +18,8 @@ is_default = false
 [surface]
 canvas  = "cc.canvas"
 app     = "cc.app"
-header  = "cc.header"
+chrome  = "cc.app"
+header  = "cc.panel"
 panel   = "cc.panel"
 raised  = "cc.raised"
 overlay = "cc.overlay"
