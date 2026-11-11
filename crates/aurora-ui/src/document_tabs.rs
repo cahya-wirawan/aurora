@@ -77,9 +77,11 @@ pub fn insert_document_tabs(
         0,
     )?;
     // Task 173: the strip is the header grey and the selected document
-    // tab the chrome colour, as in Photoshop's arrangement.
+    // tab the panel colour, like a selected panel tab (Photoshop's
+    // arrangement; in Light it keeps the selected tab from going darker
+    // than its strip).
     widgets::set_tab_bar_surface(tree, bar, Some(widgets::StripSurface::Header))?;
-    widgets::set_tab_bar_selected_surface(tree, bar, Some(widgets::StripSurface::Chrome))?;
+    widgets::set_tab_bar_selected_surface(tree, bar, Some(widgets::StripSurface::Panel))?;
     let mut style = tree
         .style(bar)
         .cloned()

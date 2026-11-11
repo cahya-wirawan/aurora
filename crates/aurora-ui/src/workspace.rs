@@ -1616,14 +1616,15 @@ mod tests {
         assert_eq!(strip(ws.status_bar.root), chrome, "status bar");
         assert_eq!(strip(ws.panel_strip.root), chrome, "collapsed rail strip");
         // Task 173: the document strip is header-coloured, its selected tab
-        // chrome-coloured; the menu bar is a flat chrome strip.
+        // panel-coloured; the menu bar is a flat chrome strip.
         assert_eq!(bar_surface(ws.document_tabs), header, "document tab strip");
         assert!(
             matches!(
                 ws.tree.payload(ws.document_tabs),
-                Some(WidgetKind::TabBar(state)) if state.selected_surface() == chrome
+                Some(WidgetKind::TabBar(state))
+                    if state.selected_surface() == Some(StripSurface::Panel)
             ),
-            "the selected document tab is chrome-coloured"
+            "the selected document tab is panel-coloured"
         );
         assert_eq!(strip(ws.menu_bar.root), chrome, "menu bar");
         for p in ws.all_slots().flat_map(super::RailSlot::panels) {
