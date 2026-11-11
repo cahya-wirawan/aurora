@@ -50,6 +50,10 @@
 mod amount;
 #[cfg(test)]
 mod amount_tests;
+// EXPERIMENTAL (task 168 spike): not exported, not wired into any tool.
+mod bristle;
+#[cfg(test)]
+mod bristle_tests;
 mod clone;
 #[cfg(test)]
 mod clone_tests;
@@ -60,6 +64,10 @@ mod coverage;
 #[cfg(test)]
 mod coverage_tests;
 mod dab;
+// EXPERIMENTAL (task 170): the bristle brush's batch deposit; not exported.
+mod deposit;
+#[cfg(test)]
+mod deposit_tests;
 #[cfg(test)]
 mod erase_amount_tests;
 mod fill;

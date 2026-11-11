@@ -300,7 +300,7 @@ dependencies = [
  "futures-lite",
  "parking",
  "polling",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "slab",
  "windows-sys 0.61.2",
 ]
@@ -331,7 +331,7 @@ dependencies = [
  "cfg-if",
  "event-listener",
  "futures-lite",
- "rustix 1.1.4",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -357,7 +357,7 @@ dependencies = [
  "cfg-if",
  "futures-core",
  "futures-io",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "signal-hook-registry",
  "slab",
  "windows-sys 0.61.2",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-ai"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-core",
  "aurora-tile",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-app"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -483,11 +483,11 @@ dependencies = [
 
 [[package]]
 name = "aurora-automation"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "cap-std",
  "getrandom 0.3.4",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "tempfile",
@@ -497,12 +497,13 @@ dependencies = [
 
 [[package]]
 name = "aurora-brush"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-core",
  "aurora-gpu",
  "aurora-tile",
  "half",
+ "rayon",
  "tempfile",
  "thiserror 2.0.19",
  "tracing",
@@ -510,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-cli"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-ai",
  "aurora-app",
@@ -532,7 +533,7 @@ dependencies = [
  "aurora-vector",
  "base64",
  "png 0.17.16",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde_json",
  "tempfile",
  "tokio",
@@ -542,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-color"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-core",
  "half",
@@ -553,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-commands"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "postcard",
  "serde",
@@ -562,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-core"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "postcard",
  "serde",
@@ -572,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-doc"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-core",
  "aurora-graph",
@@ -588,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-filters"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-color",
  "aurora-core",
@@ -601,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-gpu"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-core",
  "aurora-tile",
@@ -618,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-graph"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-core",
  "aurora-tile",
@@ -628,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-io"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-color",
  "aurora-core",
@@ -650,14 +651,14 @@ dependencies = [
 
 [[package]]
 name = "aurora-mcp"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-automation",
  "aurora-commands",
  "base64",
  "cap-std",
  "rmcp",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "schemars",
  "serde",
  "serde_json",
@@ -669,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-plugin"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-core",
  "aurora-graph",
@@ -680,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-render"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-core",
  "aurora-gpu",
@@ -697,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-testkit"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "png 0.17.16",
  "tempfile",
@@ -707,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-text"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-core",
  "aurora-vector",
@@ -721,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-theme"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-color",
  "aurora-core",
@@ -733,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-tile"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-core",
  "bytemuck",
@@ -752,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-ui"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "accesskit",
  "aurora-ai",
@@ -780,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-vector"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "aurora-core",
  "lyon",
@@ -790,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "aurora-widgets"
-version = "0.302.0"
+version = "0.303.0"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -975,7 +976,7 @@ dependencies = [
  "io-lifetimes 3.0.1",
  "ipnet",
  "maybe-owned",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "rustix-linux-procfs",
  "windows-sys 0.61.2",
  "winx",
@@ -990,7 +991,7 @@ dependencies = [
  "cap-primitives",
  "io-extras",
  "io-lifetimes 3.0.1",
- "rustix 1.1.4",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -1571,7 +1572,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1732,7 +1733,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
 dependencies = [
  "io-lifetimes 2.0.4",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "windows-sys 0.59.0",
 ]
 
@@ -1853,7 +1854,7 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8"
 dependencies = [
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "windows-link",
 ]
 
@@ -2104,7 +2105,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3153,7 +3154,7 @@ dependencies = [
  "concurrent-queue",
  "hermit-abi",
  "pin-project-lite",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "windows-sys 0.61.2",
 ]
 
@@ -3522,15 +3523,15 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.1",
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3540,7 +3541,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fc84bf7e9aa16c4f2c758f27412dc9841341e16aa682d9c7ac308fe3ee12056"
 dependencies = [
  "once_cell",
- "rustix 1.1.4",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -3919,8 +3920,8 @@ dependencies = [
  "fastrand",
  "getrandom 0.3.4",
  "once_cell",
- "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "rustix 1.1.6",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4361,7 +4362,7 @@ checksum = "016ccf01d1c58b6f8999612813e17c9b2390f7d70671428869913310f83f54b8"
 dependencies = [
  "cc",
  "downcast-rs",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "scoped-tls",
  "smallvec",
  "wayland-sys",
@@ -4374,7 +4375,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3c36a0f861ad76d0901f2800b46321410d9f73f2ea88aac0650d86c32688073"
 dependencies = [
  "bitflags 2.13.1",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "wayland-backend",
  "wayland-scanner",
 ]
@@ -4396,7 +4397,7 @@ version = "0.31.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a52d18780be9b1314328a3de5f930b73d2200112e3849ca6cb11822793fb34d"
 dependencies = [
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "wayland-client",
  "xcursor",
 ]
@@ -4683,7 +4684,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5007,7 +5008,7 @@ dependencies = [
  "libc",
  "libloading",
  "once_cell",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "x11rb-protocol",
 ]
 
@@ -5088,7 +5089,7 @@ dependencies = [
  "hex",
  "libc",
  "ordered-stream",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde",
  "serde_repr",
  "tracing",
