@@ -199,6 +199,8 @@ Missing and the options:
 
 ## 7. Recommended next step
 
+(Step 2 was done in task 170; see section 9.)
+
 1. Decide the pen path first; it gates everything. A one-day spike per platform that logs raw pressure/tilt/twist from the native API (start with Windows `GetPointerPenInfo` and macOS `NSEvent`) next to winit. Without tilt/twist the bristle model degrades to pressure-only; without pressure on macOS and Wayland it is a mouse brush there.
 2. Before touching the GPU, write a purpose-built CPU bristle deposit (tile-binned, f32 working tile, no per-dab hash lookups, optionally rayon across tiles) and re-measure; the measured 37-48 ns/texel leaves room and the CPU path keeps `TileStore` authoritative with no readback problem. Target: N = 512 at r = 150 under 4 ms at 800 px/s.
 3. Only then, if pick-up/mixing (wet paint) is wanted, scope a GPU scratch layer (section 5), which is a new-infrastructure project (no compute plumbing, no readback today).
@@ -211,3 +213,149 @@ unverified claims marked above; GPU section is analysis only; timings are one ma
 idle: other sessions ran), release and dev only; the stroke picture was seen only once and is not a quality
 claim; the model has no canvas pick-up; no live-app or composite/upload/present cost was measured; the
 speed-sweep and 120 Hz figures come from synthetic strokes, not human pen data.
+
+## 9. Task 170: a purpose-built batch deposit (measured)
+
+Branch `170-bristle_deposit`. Code: `crates/aurora-brush/src/deposit.rs` (`deposit_soft_dabs`,
+`deposit_soft_dabs_with`, `Mode`), tests in `deposit_tests.rs`, the measurement `bristle_deposit_measure` in
+`bristle_tests.rs`. `BristleBrush::deposit` now uses the batch deposit; the spike's per-dab deposit is kept as
+`BristleBrush::deposit_per_dab` as the reference. Still experimental: no tool, no UI, no tokens, no saving.
+`stamp_dab_amount` and every app brush are unchanged (no line of `stamp.rs` changed).
+
+**What it does.** One pen sample's dabs are binned by the tiles their bounding boxes reach (a sort of
+`(tile, dab index)` pairs, so each tile's dabs stay in input order). Per tile: one `TileStore::get_mut`, one
+take of the stroke coverage tile, one snapshot capture at most; per dab only a `raw_content` lookup. Each dab
+walks only the rows and columns its disc (grown by 2 texels) can reach instead of its whole box, and a texel's
+four channels go through one `f16 -> f32` and one `f32 -> f16` conversion call (`half`'s slice conversions:
+F16C on this machine) instead of eight scalar calls. A batch whose dab boxes hold at least 32 K texels
+(`PARALLEL_MIN_TEXELS`, an untuned engineering default) runs on a lazily built 4-thread rayon pool
+(`aurora-deposit-*`), split into bands of 64 rows (4 per tile); each band copies its rows of the tile out
+of the store's shared buffer (`peek_shared`), applies its tile's dabs in order, and the changed bands are
+copied back on the calling thread, which also captures the snapshot from the untouched original.
+
+**Not done, and why.** An `f32` working tile (the findings' suggestion) is deliberately not used: the
+per-dab path decides capture, the painted list, the dirty rectangle and (without a snapshot) the next dab's
+start by comparing the rounded `f16` against the stored bits after every dab, so keeping `f32` between dabs
+would change those decisions. `hypot` and `powf(1.5)` per texel (about 3.4 + 7.2 ns here, measured in a
+micro-benchmark) are kept because a cheaper falloff would change bits; they are now most of the per-texel
+cost.
+
+**Exactness.** The batch must leave the same tile bits as `stamp_dab_amount(.., None, false, false, amount)`
+per dab in order. The argument (in the module doc): every value a texel's update reads is per texel (stored
+texel, stroke coverage) or per tile (stroke-start content), each texel sees its dabs in the original order,
+the start content is the snapshot's raw copy or the untouched tile (equal by construction), the arithmetic is
+a copy of `stamp_dab_impl`'s soft unlocked uncovered branch, and the skipped texels have falloff 0. Proved by
+tests, all passing: `batch_deposit_equals_per_dab_stamping_bit_for_bit_with_a_stroke_snapshot` (16 seeds x 3
+modes, 2 strokes x 4 random batches: clustered, scattered, tile edges and corners, negative and >2^22
+centres, texel-aligned centres, degenerate and NaN radii, dabs reaching no texel, out-of-range colours,
+random opacity/flow, seeded tiles with NaN/inf/negative texels; compares painted tiles, which tiles exist,
+every texel bit, every dirty rectangle, the captured tiles and their raw copies, every stroke-coverage value,
+then undo and redo of both strokes), `..._when_tiles_page_to_disk` (budget 3: tiles evict and page back in;
+dirty rectangles compared for presence only because an evicted dirty tile reports the whole tile and the LRU
+order differs), `..._with_no_snapshot`, `heavily_overlapping_dabs_keep_their_order` (400 dabs on the same
+texels; the reversed order is shown to give different bits, so the test can see order),
+`the_four_channel_conversions_match_one_at_a_time` (every `f16` bit pattern, every rounding midpoint and one
+ulp either side, specials, 200,000 random `f32`), `an_empty_batch_and_dabs_that_reach_nothing_change_nothing`,
+`a_snapshot_for_another_surface_is_ignored_like_the_per_dab_path`, and a whole bristle stroke through both
+deposits (`the_batch_deposit_paints_the_same_stroke_as_the_per_dab_deposit`). Six hand mutations were run
+and each failed the differential tests (reversed dab order in a tile, a too-tight row limit, a dirty rectangle
+from the last dab only, the start content ignoring the raw copy in the serial and in the parallel path,
+capturing the painted copy instead of the original); a zero margin on the row limit survived, as expected
+(the margin is a safety allowance, not needed on this machine's arithmetic).
+
+**Refused, not differing.** `SoftDab` has no field for selection coverage, the transparency lock or the hard
+Pencil dab, so the batch only takes the plain soft case. Known differences that are not pixels: the tile
+content-version *numbers* (the per-dab path bumps a tile once per dab, the batch once, or twice when the
+parallel path writes it back), LRU recency (so which tiles a small budget evicts), and a failed page-in skips
+the tile for every dab of the batch where the per-dab path would retry it for each dab.
+
+### Results (release, same method and machine as section 2), microseconds per pen sample
+
+Machine: i3-10100 (4 cores / 8 threads, 1 MiB L2, 6 MiB L3), Linux. 1-minute load average 1.68 before the
+run and 2.63 after (other login sessions, plus the deposit's own 4 threads while it ran); nothing was built
+during the run. The three paths of each row ran back to back on fresh stores, per-dab first, n = 2,400 samples
+each. PerDab = the task 168 path (`stamp_dab_amount` per dab), Serial = the batch deposit on the calling
+thread, Batch = the batch deposit as the brush runs it (`Mode::Auto`: on the pool above 32 K texels). The
+PerDab column re-measures the task 168 numbers of section 3: within about 4 % for N >= 128, while the
+N = 32 rows at r = 12 and r = 48 are 23 % and 11 % lower than then (not investigated). Mean / median / p99:
+
+Circle at 240 Hz, 800 px/s (3.3 px/sample):
+
+| brush | r | PerDab | Serial | Batch | dabs/sample |
+|---|---|---|---|---|---|
+| N=32 | 12 | 137 / 132 / 215 | 116 / 109 / 197 | 124 / 121 / 202 | 77 |
+| N=128 | 12 | 286 / 281 / 443 | 225 / 223 / 320 | 227 / 223 / 354 | 424 |
+| N=512 | 12 | 535 / 534 / 668 | 455 / 451 / 581 | 482 / 472 / 688 | 1,694 |
+| N=1024 | 12 | 1,025 / 1,020 / 1,433 | 842 / 842 / 1,057 | 931 / 922 / 1,370 | 3,388 |
+| N=32 | 48 | 418 / 406 / 695 | 296 / 286 / 539 | 294 / 284 / 508 | 19 |
+| N=128 | 48 | 918 / 911 / 1,271 | 688 / 673 / 1,029 | 666 / 664 / 959 | 154 |
+| N=512 | 48 | 2,091 / 2,068 / 2,752 | 1,727 / 1,701 / 2,316 | 1,436 / 1,467 / 2,067 | 1,227 |
+| N=1024 | 48 | 3,115 / 3,095 / 5,084 | 2,680 / 2,703 / 3,764 | 2,186 / 2,197 / 3,271 | 3,219 |
+| N=32 | 150 | 1,256 / 1,184 / 2,801 | 872 / 808 / 2,279 | 696 / 688 / 1,482 | 6 |
+| N=128 | 150 | 2,548 / 2,489 / 4,161 | 1,773 / 1,723 / 2,956 | 1,030 / 969 / 2,228 | 49 |
+| **N=512** | **150** | **5,241 / 5,248 / 7,345** | 3,824 / 3,760 / 5,657 | **1,775 / 1,696 / 3,088** | 394 |
+| N=1024 | 150 | 7,476 / 7,530 / 10,556 | 5,642 / 5,681 / 7,869 | 2,578 / 2,530 / 3,769 | 1,113 |
+
+Pen speed sweep, circle at 240 Hz, mean / p99:
+
+| speed (px/sample) | case | PerDab | Serial | Batch |
+|---|---|---|---|---|
+| 200 px/s (0.8) | N=512 r=48 | 584 / 909 | 473 / 724 | 442 / 603 |
+| | N=1024 r=48 | 821 / 1,058 | 731 / 1,077 | 685 / 1,037 |
+| | N=512 r=150 | 1,884 / 3,039 | 1,318 / 2,238 | 829 / 1,494 |
+| | N=1024 r=150 | 2,672 / 4,858 | 2,019 / 3,800 | 1,062 / 1,588 |
+| 800 px/s (3.3) | N=512 r=48 | 2,092 / 2,784 | 1,691 / 2,202 | 1,431 / 2,167 |
+| | N=1024 r=48 | 3,117 / 4,529 | 2,700 / 3,775 | 2,166 / 3,075 |
+| | N=512 r=150 | 5,240 / 7,795 | 3,790 / 5,474 | 1,814 / 2,854 |
+| | N=1024 r=150 | 7,468 / 10,635 | 5,713 / 7,581 | 2,559 / 3,645 |
+| 1,600 px/s (6.7) | N=512 r=48 | 4,257 / 5,810 | 3,509 / 4,895 | 2,662 / 3,979 |
+| | N=1024 r=48 | 6,328 / 9,253 | 5,485 / 7,369 | 4,127 / 6,201 |
+| | N=512 r=150 | 11,134 / 17,101 | 8,077 / 11,089 | 3,488 / 6,125 |
+| | N=1024 r=150 | 15,637 / 23,037 | 12,226 / 17,236 | 4,977 / 7,230 |
+| 3,200 px/s (13.3) | N=512 r=48 | 8,381 / 10,844 | 6,920 / 8,989 | 5,055 / 7,701 |
+| | N=1024 r=48 | 12,477 / 17,891 | 10,838 / 14,195 | 7,884 / 12,094 |
+| | N=512 r=150 | 21,216 / 28,720 | 15,809 / 21,489 | 6,333 / 9,389 |
+| | N=1024 r=150 | 30,200 / 40,609 | 23,594 / 30,730 | 9,342 / 13,078 |
+| 6,400 px/s (26.7) | N=512 r=48 | 16,015 / 22,226 | 13,497 / 18,311 | 9,596 / 14,822 |
+| | N=1024 r=48 | 23,485 / 34,871 | 20,914 / 29,713 | 15,015 / 23,606 |
+| | N=512 r=150 | 39,761 / 57,145 | 30,440 / 42,926 | 11,764 / 17,699 |
+| | N=1024 r=150 | 54,770 / 78,581 | 44,163 / 62,519 | 17,079 / 26,990 |
+
+Undo capture is unchanged by construction (the same tiles, e.g. 12.9 per 300-sample stroke for N=512 r=150
+in all three paths).
+
+**Target: met.** N = 512 at r = 150, 800 px/s: mean 1.78 ms (median 1.70, p99 3.09) against 4 ms, from
+5.24 ms (p99 7.34): 2.95x on the mean. The serial kernel alone gives 1.37x (3.82 ms mean, p99 5.66: misses
+4 ms at p99); the rest is the 4-thread pool, so the target is met only with the threads. In the quick runs
+before the full one the same case measured 1.85 ms mean / 3.44 p99 (Batch) and 3.77-3.82 / 5.62-5.68
+(Serial).
+
+Reading the numbers:
+- The gain grows with the dab radius: small dabs (r = 12, bristle radius about 0.75-2.8 px) gain 1.1-1.2x
+  serially and nothing more from the pool; the big-dab cases (r = 150) gain 2.5-3.3x. At r = 12 `Batch` is
+  2-10 % slower than `Serial` although most of its batches stay under the threshold and run the identical
+  serial code; I did not establish why (idle pool threads spinning after a parallel batch, or run-order
+  noise, are guesses). The threshold is untuned.
+- Cost still scales with pen travel. With the batch, N = 512 r = 150 stays under the 4.17 ms 240 Hz
+  throughput bound up to about 1,600 px/s (3.5 ms mean, p99 6.1) and under the 10 ms latency bound up to
+  about 3,200 px/s (6.3 / 9.4); N = 1024 r = 150 up to about 1,600 px/s (5.0 / 7.2) for latency. r = 48
+  with tiny bristle dabs gains least: N = 1024 at 3,200 px/s is 7.9 / 12.1 ms.
+- Per dab texel the serial kernel is now roughly 40 ns on the r = 150 cases, from about 53 (**estimated**
+  from dabs per sample and the disc area of the mean bristle radius, not counted); `hypot` plus `powf` are
+  about 11 ns of it (micro-benchmark).
+
+**Known weaknesses and unverified points.**
+- One machine, Linux, release only, not idle (load 1.7-2.6); the pool's gain depends on free cores, and in
+  the app the deposit would share the CPU with the frame-composite pool (4 threads), the background
+  compositor and the UI thread: not measured. A second process-wide pool (4 threads, idle when unused) is new
+  permanent state if this is ever wired in.
+- Each parallel batch allocates a 512 KiB work tile per reached tile (zeroed by the allocator) and a 256 KiB
+  coverage tile per newly reached tile; allocation cost is inside the numbers above but not studied.
+- Exactness is proved on x86_64 with F16C only. The four-channel conversions and the per-texel libm calls are
+  the same functions on both paths on any one platform, and the tests compare against the per-dab path on
+  whatever machine runs them, but no Mac (aarch64 `fp16` conversions) or Windows run has happened.
+- The dirty rectangle is compared exactly only while nothing is evicted; with eviction only its presence.
+- Still only the tile-write cost of a pen sample: recomposite, upload, present and invalidation are not
+  included, no live window, no real tablet, no human looked at a stroke made by the new path (its pixels are
+  identical to the old path's by the tests).
+
