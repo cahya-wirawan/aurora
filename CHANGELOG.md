@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.303.0] - 2026-11-11
+
+### Changed
+
+- Records for task 170: tile-binned bristle deposit, rustix 1.1.6
+
 ## [0.302.0] - 2026-11-11
 
 ### Changed
