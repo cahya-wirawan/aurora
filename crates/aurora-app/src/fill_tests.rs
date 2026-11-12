@@ -1830,7 +1830,9 @@ fn in_a_narrow_bar_the_sliders_give_up_width_before_any_readout() {
     // Between the two, the Brush's sliders are wider than the floor but
     // not yet full, with its readouts exactly where they were at 700.
     let (narrow, _) = options_items(&mut bar, Tool::Brush, 700.0);
-    let (mid, _) = options_items(&mut bar, Tool::Brush, 1100.0);
+    // 1,500 px since 0.308.0: the two pen pressure checkboxes lengthen the
+    // Brush's controls, so its sliders stay at their floor up to about 1,300.
+    let (mid, _) = options_items(&mut bar, Tool::Brush, 1500.0);
     let sliders: Vec<i64> = mid
         .iter()
         .filter(|i| i.leaf == Leaf::Slider)

@@ -5318,5 +5318,7 @@ fn the_quick_mask_eraser_ignores_the_erasers_opacity_and_flow() {
 
 #[path = "colour_range_app_tests.rs"]
 mod colour_range_app_tests;
+#[path = "pen_pressure_tests.rs"]
+mod pen_pressure_tests;
 #[path = "quick_select_app_tests.rs"]
 mod quick_select_app_tests;

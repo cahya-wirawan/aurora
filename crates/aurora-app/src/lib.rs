@@ -600,6 +600,7 @@ mod lasso_tools;
 mod layer_thumbnails;
 pub mod mcp_session;
 mod pen_input;
+mod pen_pressure;
 pub use bridge_app::{AUTOMATION_CONNECTED, BridgeOptions};
 mod menu_bar_app;
 mod menu_bar_state;
@@ -9104,6 +9105,7 @@ fn sync_status_bar_notice(
 /// widget did, the controls are re-mirrored from `settings`, so the pair
 /// of type buttons stays a radio group. No history step. Returns whether
 /// a setting changed.
+#[allow(clippy::too_many_lines)]
 fn apply_fill_control_outcome(
     workspace: &mut aurora_ui::Workspace,
     controls: &aurora_ui::ToolControls,
@@ -9173,6 +9175,19 @@ fn apply_fill_control_outcome(
             let on = *state == accesskit::Toggled::True;
             let changed = settings.contiguous != on;
             settings.contiguous = on;
+            changed
+        }
+        // Pen pressure for size / opacity (0.308.0).
+        ActionOutcome::Toggled { id, state } if *id == fill.pressure_size => {
+            let on = *state == accesskit::Toggled::True;
+            let changed = settings.pressure_size != on;
+            settings.pressure_size = on;
+            changed
+        }
+        ActionOutcome::Toggled { id, state } if *id == fill.pressure_opacity => {
+            let on = *state == accesskit::Toggled::True;
+            let changed = settings.pressure_opacity != on;
+            settings.pressure_opacity = on;
             changed
         }
         ActionOutcome::ValueChanged { id, value } if *id == fill.opacity => {
@@ -14308,6 +14323,7 @@ fn begin_drag(
 /// 300,000 px ceiling, where that same `set_origin` saturates instead.
 /// Applying both here keeps render and paint reading the same,
 /// already-bounded `view`.
+#[cfg(test)]
 #[must_use]
 fn continue_drag(
     drag: &mut Drag,
@@ -14316,6 +14332,34 @@ fn continue_drag(
     selection: &mut aurora_doc::SelectionSet,
     tool_settings: &ToolSettings,
     bounds: PanBounds,
+) -> Vec<(f32, f32)> {
+    continue_drag_pressured(
+        drag,
+        canvas_point,
+        view,
+        selection,
+        tool_settings,
+        bounds,
+        (1.0, 1.0),
+    )
+}
+
+/// [`continue_drag`] for a pen whose pressure went from `pressures.0` (the
+/// previous event) to `pressures.1` (this one) (0.308.0): the Brush and
+/// Eraser space their dabs by the pressured radius at the mean pressure
+/// ([`pen_pressure::segment_step`]); every other drag ignores it. At
+/// `(1.0, 1.0)`, or with "Pressure for Size" off, the step is exactly
+/// [`continue_drag`]'s earlier one.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+fn continue_drag_pressured(
+    drag: &mut Drag,
+    canvas_point: (f32, f32),
+    view: &mut aurora_ui::CanvasView,
+    selection: &mut aurora_doc::SelectionSet,
+    tool_settings: &ToolSettings,
+    bounds: PanBounds,
+    pressures: (f32, f32),
 ) -> Vec<(f32, f32)> {
     match drag {
         Drag::Pan { last_screen } => {
@@ -14377,9 +14421,11 @@ fn continue_drag(
             last_doc, carry, ..
         } => {
             let current_doc = view.to_document(canvas_point);
-            let step = aurora_brush::dab_step(
+            let step = pen_pressure::segment_step(
                 tool_settings.dab_radius(DabTool::Brush),
-                aurora_brush::DEFAULT_SPACING,
+                tool_settings.pressure_size,
+                pressures.0,
+                pressures.1,
             );
             let (dabs, new_carry) =
                 aurora_brush::advance_segment(*last_doc, current_doc, *carry, step);
@@ -14391,9 +14437,11 @@ fn continue_drag(
             last_doc, carry, ..
         } => {
             let current_doc = view.to_document(canvas_point);
-            let step = aurora_brush::dab_step(
+            let step = pen_pressure::segment_step(
                 tool_settings.dab_radius(DabTool::Eraser),
-                aurora_brush::DEFAULT_SPACING,
+                tool_settings.pressure_size,
+                pressures.0,
+                pressures.1,
             );
             let (dabs, new_carry) =
                 aurora_brush::advance_segment(*last_doc, current_doc, *carry, step);
@@ -29842,6 +29890,12 @@ struct ToolSettings {
     crop_ratio: aurora_ui::CropRatio,
     /// The Crop tool's Portrait toggle (0.236.0; swaps the ratio's sides).
     crop_portrait: bool,
+    /// Pen pressure scales the Brush, Pencil and Eraser dab size (0.308.0;
+    /// default on; one pair shared by the three tools, because pressure
+    /// sensitivity belongs to the pen, not the tool; not persisted).
+    pressure_size: bool,
+    /// Pen pressure scales their Opacity ceiling (0.308.0; default off).
+    pressure_opacity: bool,
 }
 
 /// The default Opacity and Flow of the paint tools, percent (0.228.0).
@@ -29883,6 +29937,8 @@ impl Default for ToolSettings {
             eraser_flow: DEFAULT_PAINT_PERCENT,
             crop_ratio: aurora_ui::CropRatio::Free,
             crop_portrait: false,
+            pressure_size: true,
+            pressure_opacity: false,
         }
     }
 }
@@ -29909,6 +29965,8 @@ impl ToolSettings {
             clone_flow: self.clone_flow,
             eraser_opacity: self.eraser_opacity,
             eraser_flow: self.eraser_flow,
+            pressure_size: self.pressure_size,
+            pressure_opacity: self.pressure_opacity,
         }
     }
 
@@ -30585,7 +30643,51 @@ fn stamp_tool_dab_covered(
     drag: &mut Option<Drag>,
     coverage: Option<&dyn aurora_brush::Coverage>,
 ) -> aurora_brush::DabOutcome {
-    let radius = settings.dab_radius(tool);
+    stamp_tool_dab_pressured(
+        tool,
+        preserve_alpha,
+        store,
+        surface,
+        local,
+        settings,
+        colour,
+        drag,
+        coverage,
+        1.0,
+    )
+}
+
+/// [`stamp_tool_dab_covered`] for a dab laid with pen `pressure` (0.308.0):
+/// with the settings' "Pressure for Size" the radius is
+/// [`pen_pressure::pressured_radius`], with "Pressure for Opacity" the
+/// Opacity ceiling is [`pen_pressure::pressured_amount`]. At pressure 1.0,
+/// and with both options off, it is exactly [`stamp_tool_dab_covered`]'s
+/// earlier body (differential-tested).
+#[allow(clippy::too_many_arguments)]
+fn stamp_tool_dab_pressured(
+    tool: DabTool,
+    preserve_alpha: bool,
+    store: &mut aurora_tile::TileStore,
+    surface: aurora_tile::SurfaceId,
+    local: (f32, f32),
+    settings: &ToolSettings,
+    colour: [f32; 3],
+    drag: &mut Option<Drag>,
+    coverage: Option<&dyn aurora_brush::Coverage>,
+    pressure: f32,
+) -> aurora_brush::DabOutcome {
+    let size_pressure = if settings.pressure_size {
+        pressure
+    } else {
+        1.0
+    };
+    let opacity_pressure = if settings.pressure_opacity {
+        pressure
+    } else {
+        1.0
+    };
+    let radius = pen_pressure::pressured_radius(settings.dab_radius(tool), size_pressure);
+    let amount = pen_pressure::pressured_amount(settings.paint_amount(tool), opacity_pressure);
     match tool {
         // The Brush and the Pencil stamp with their Opacity and Flow
         // (0.228.0); at 100 % each is exactly the earlier entry point.
@@ -30599,7 +30701,7 @@ fn stamp_tool_dab_covered(
             coverage,
             preserve_alpha,
             tool == DabTool::Pencil,
-            settings.paint_amount(tool),
+            amount,
         ),
         // The Eraser erases with its Opacity and Flow (0.229.0); at 100 %
         // each is exactly `erase_dab_covered`.
@@ -30610,7 +30712,7 @@ fn stamp_tool_dab_covered(
             radius,
             eraser_stroke_mut(drag),
             coverage,
-            settings.paint_amount(tool),
+            amount,
         ),
     }
 }
@@ -31531,6 +31633,9 @@ struct App {
     /// The latest pointer sample (pressure, tilt, rotation), set before each
     /// press/move reaches the stroke path. Nothing consumes pressure yet.
     pen_sample: aurora_core::PenSample,
+    /// The previous pointer event's pressure during a Brush/Pencil/Eraser
+    /// stroke (0.308.0): the start of the next segment's interpolation.
+    stroke_pressure: f32,
     /// The Widget Gallery panel while open (0.130.0) — `None` means it is
     /// not in the tree at all. See [`toggle_gallery`].
     gallery: Option<aurora_ui::GalleryPanel>,
@@ -32107,6 +32212,7 @@ impl App {
             pointer_position: None,
             pointer_gate: pen_input::PointerGate::default(),
             pen_sample: aurora_core::PenSample::default(),
+            stroke_pressure: 1.0,
             gallery: None,
             gallery_click: ClickTracker::default(),
             channel_click: None,
@@ -35128,7 +35234,13 @@ impl App {
         if let Some(drag) = self.drag.as_mut() {
             let erasing = matches!(drag, Drag::Eraser { .. });
             let quick = matches!(drag, Drag::QuickSelect(_));
-            let dabs = continue_drag(
+            let segment_start = match drag {
+                Drag::Brush { last_doc, .. } | Drag::Eraser { last_doc, .. } => Some(*last_doc),
+                _ => None,
+            };
+            let pressure_from = self.stroke_pressure;
+            let pressure_to = pen_pressure::clean(self.pen_sample.pressure);
+            let dabs = continue_drag_pressured(
                 drag,
                 canvas_point,
                 &mut self.doc.canvas_view,
@@ -35139,14 +35251,37 @@ impl App {
                     self.doc.active_layer,
                     canvas_area_logical_size(&self.workspace),
                 ),
+                (pressure_from, pressure_to),
             );
+            let segment_end = match self.drag.as_ref() {
+                Some(Drag::Brush { last_doc, .. } | Drag::Eraser { last_doc, .. }) => {
+                    Some(*last_doc)
+                }
+                _ => None,
+            };
+            if segment_start.is_some() {
+                self.stroke_pressure = pressure_to;
+            }
             for doc_point in dabs {
                 if quick {
                     self.quick_select_stamp(doc_point);
-                } else if erasing {
-                    self.erase_dab(doc_point);
+                    continue;
+                }
+                // Pressure at this dab: linear along the segment (0.308.0).
+                let pressure = match (segment_start, segment_end) {
+                    (Some(from), Some(to)) => pen_pressure::pressure_along(
+                        from,
+                        to,
+                        pressure_from,
+                        pressure_to,
+                        doc_point,
+                    ),
+                    _ => 1.0,
+                };
+                if erasing {
+                    self.erase_dab(doc_point, pressure);
                 } else {
-                    self.paint_dab(doc_point);
+                    self.paint_dab(doc_point, pressure);
                 }
             }
             if quick {
@@ -35677,11 +35812,13 @@ impl App {
         match self.drag.as_ref() {
             Some(Drag::Brush { last_doc, .. }) => {
                 let last_doc = *last_doc;
-                self.paint_dab(last_doc);
+                self.stroke_pressure = pen_pressure::clean(self.pen_sample.pressure);
+                self.paint_dab(last_doc, self.stroke_pressure);
             }
             Some(Drag::Eraser { last_doc, .. }) => {
                 let last_doc = *last_doc;
-                self.erase_dab(last_doc);
+                self.stroke_pressure = pen_pressure::clean(self.pen_sample.pressure);
+                self.erase_dab(last_doc, self.stroke_pressure);
             }
             Some(Drag::Eyedropper) => {
                 let doc_point = self.doc.canvas_view.to_document(canvas_point);
@@ -35734,10 +35871,10 @@ impl App {
     /// for the rest of the drag, and 0.55.0's own one-line-per-dab
     /// collapse still left a long drag across one emitting ~100
     /// identical lines.
-    fn paint_dab(&mut self, doc_point: (f32, f32)) {
-        // Task 169: the sample (pressure, tilt) is carried to the stamp site;
-        // nothing maps it to size or opacity yet, so strokes are unchanged.
-        let pressure = self.pen_sample.pressure;
+    fn paint_dab(&mut self, doc_point: (f32, f32), pressure: f32) {
+        // 0.308.0: `pressure` (0..=1, already interpolated along the
+        // segment) reaches the Brush and Pencil stamp; the Quick Mask and
+        // every other dab tool below ignore it.
         debug_assert!((0.0..=1.0).contains(&pressure));
         // The Clone Stamp (0.221.0) is the Brush's drag with a cloned dab.
         if let Some(offset) = clone_stamp::drag_offset(self.drag.as_ref()) {
@@ -35810,7 +35947,7 @@ impl App {
         // free function over `&mut Option<Drag>` and not a `&mut self`
         // helper method: that would borrow all of `self` and conflict
         // with `self.doc.tile_store` above.
-        let outcome = selection_paint::dab_through_selection(
+        let outcome = selection_paint::dab_through_selection_pressured(
             dab_tool,
             preserve_alpha,
             store,
@@ -35821,6 +35958,7 @@ impl App {
             &self.tool_settings,
             colour_state::dab_colour(dab_tool, &self.colour.state),
             &mut self.drag,
+            pressure,
         );
         let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
         invalidate_painted_tiles(
@@ -36129,7 +36267,7 @@ impl App {
     /// reporting, per-stroke warning dedupe, and in-dab undo-snapshot
     /// capture (against `Drag::Eraser`'s own `stroke` field instead,
     /// via [`eraser_stroke_mut`]).
-    fn erase_dab(&mut self, doc_point: (f32, f32)) {
+    fn erase_dab(&mut self, doc_point: (f32, f32), pressure: f32) {
         // Quick Mask (0.217.0): the Eraser pulls toward the background.
         if let Some(mode) = self.quick_mask.as_mut() {
             let _ = quick_mask::paint_dab(
@@ -36165,7 +36303,7 @@ impl App {
         };
         // Same distinct-field borrows `Self::paint_dab` relies on; the
         // colour is unused by an erase.
-        let outcome = selection_paint::dab_through_selection(
+        let outcome = selection_paint::dab_through_selection_pressured(
             DabTool::Eraser,
             false,
             store,
@@ -36176,6 +36314,7 @@ impl App {
             &self.tool_settings,
             colour_state::dab_colour(DabTool::Eraser, &self.colour.state),
             &mut self.drag,
+            pressure,
         );
         let reference_origin = composite_reference_origin(&self.doc.layers, Some(layer_id));
         invalidate_painted_tiles(

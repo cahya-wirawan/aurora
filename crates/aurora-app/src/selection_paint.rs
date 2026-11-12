@@ -55,6 +55,7 @@ pub(crate) fn as_coverage(layer: Option<&LayerSelection>) -> Option<&dyn Coverag
 /// selection): the one call `App::paint_dab` and `App::erase_dab` stamp
 /// with, so a test can drive exactly what the app does. The active drag's
 /// own stroke snapshot captures the tiles the dab really changes.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dab_through_selection(
     tool: DabTool,
@@ -68,9 +69,40 @@ pub(crate) fn dab_through_selection(
     colour: [f32; 3],
     drag: &mut Option<Drag>,
 ) -> aurora_brush::DabOutcome {
+    dab_through_selection_pressured(
+        tool,
+        preserve_alpha,
+        store,
+        surface,
+        bounds,
+        doc_point,
+        selection,
+        settings,
+        colour,
+        drag,
+        1.0,
+    )
+}
+
+/// [`dab_through_selection`] for a dab laid with pen `pressure` (0.308.0);
+/// at 1.0 it is exactly the earlier function.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dab_through_selection_pressured(
+    tool: DabTool,
+    preserve_alpha: bool,
+    store: &mut aurora_tile::TileStore,
+    surface: aurora_tile::SurfaceId,
+    bounds: Rect,
+    doc_point: (f32, f32),
+    selection: Option<Selection>,
+    settings: &ToolSettings,
+    colour: [f32; 3],
+    drag: &mut Option<Drag>,
+    pressure: f32,
+) -> aurora_brush::DabOutcome {
     let local = crate::layer_local_point(bounds, doc_point);
     let cover = layer_selection(selection, bounds);
-    crate::stamp_tool_dab_covered(
+    crate::stamp_tool_dab_pressured(
         tool,
         preserve_alpha,
         store,
@@ -80,6 +112,7 @@ pub(crate) fn dab_through_selection(
         colour,
         drag,
         as_coverage(cover.as_ref()),
+        pressure,
     )
 }
 

@@ -882,11 +882,23 @@ fn stamp_dab_impl(
                                         let s = at_start(c);
                                         f16::from_f32(s + (painted - s) * o)
                                     };
+                                    let limited_alpha = limited(3, a);
+                                    // A varying ceiling (pen pressure, 0.308.0):
+                                    // a dab whose limited alpha is below what is
+                                    // there leaves the texel alone, so a light
+                                    // dab never lightens a heavier one. With a
+                                    // constant ceiling this never fires (the
+                                    // limited alpha of one stroke start is the
+                                    // same or higher than any earlier write), so
+                                    // that output is unchanged.
+                                    if limited_alpha.to_f32() < dst_a.to_f32() {
+                                        continue;
+                                    }
                                     [
                                         limited(0, red * a),
                                         limited(1, green * a),
                                         limited(2, blue * a),
-                                        limited(3, a),
+                                        limited_alpha,
                                     ]
                                 } else {
                                     // A hard dab replaces (`a` is 1).
