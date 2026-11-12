@@ -511,6 +511,7 @@ pub fn build_workspace(scales: &Scales) -> Workspace {
         selection: None,
         quick_mask: false,
         crop: None,
+        crop_angle: None,
         zoom: crate::canvas_view::DEFAULT_ZOOM,
         scale_factor: 1.0,
         document_size: (0, 0),

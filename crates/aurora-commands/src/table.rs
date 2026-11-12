@@ -81,6 +81,14 @@ const COLOUR_RANGE_PARAMS: &[ParamSpec] = &[ParamSpec::optional(
     ParamKind::Int { min: 0, max: 200 },
     ParamDefault::Int(40),
 )];
+const STRAIGHTEN_PARAMS: &[ParamSpec] = &[ParamSpec::required(
+    "degrees",
+    "The straighten angle in degrees, -45 to 45 (fractions allowed); 0 clears the angle.",
+    ParamKind::Number {
+        min: -45.0,
+        max: 45.0,
+    },
+)];
 const SELECTION_NAME_PARAMS: &[ParamSpec] = &[ParamSpec::required(
     "name",
     "The name to save the selection under; an existing name is replaced.",
@@ -685,6 +693,17 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
         Tool,
         Ui,
     ),
+    CommandSpec::new(
+        "crop.straighten_by_angle",
+        "Crop: Straighten by Angle\u{2026}",
+        "Sets the Crop tool's straighten angle: the rectangle becomes the largest one that fits \
+         the canvas turned by that angle, and committing it rotates and crops every layer, mask \
+         and selection in one undo step. Use the Crop tool.",
+        Tool,
+        Write,
+    )
+    .requires(NOT_IN_QUICK_MASK)
+    .params(STRAIGHTEN_PARAMS),
     CommandSpec::new(
         "select.save",
         "Save Selection\u{2026}",

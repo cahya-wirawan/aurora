@@ -87,7 +87,7 @@ fn the_palette_is_the_registry_in_order() {
         .map(|entry| (entry.id.as_str(), entry.title.as_str()))
         .collect();
     assert_eq!(actual, expected);
-    assert_eq!(palette.len(), 156);
+    assert_eq!(palette.len(), 157);
     let unique: BTreeSet<&str> = palette.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(unique.len(), palette.len(), "palette ids are unique");
 }
@@ -353,6 +353,7 @@ fn reference_enabled(id: &str, c: &MenuContext) -> bool {
         | crate::COMMAND_SELECT_INVERSE
         | crop::COMMAND_CROP_TO_SELECTION
         | colour_range_app::COMMAND_ID
+        | crate::straighten::COMMAND_ID
         | paths_app::COMMAND_MAKE_SELECTION
         | path_paint::COMMAND_FILL
         | path_paint::COMMAND_STROKE

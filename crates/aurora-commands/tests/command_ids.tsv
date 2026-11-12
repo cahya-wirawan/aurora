@@ -63,6 +63,7 @@ select.inverse	Inverse Selection	Palette
 select.quick_mask	Toggle Quick Mask Mode	Palette
 select.crop_to_selection	Crop to Selection	Palette
 crop.swap_orientation	Crop: Swap Orientation	Palette
+crop.straighten_by_angle	Crop: Straighten by Angle…	Palette
 select.save	Save Selection…	Palette
 edit.copy	Copy	Palette
 edit.cut	Cut	Palette

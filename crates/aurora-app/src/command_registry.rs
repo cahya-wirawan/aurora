@@ -13,8 +13,8 @@
 //!   call** to the same [`ActivatedCommand`] the palette and the menus
 //!   produce, for the commands whose interactive form is a dialog or a
 //!   prompt and whose automation form is a parameter: Open, Save As, Set
-//!   Output Profile, Select > Modify, Colour Range, Save Selection and Save
-//!   Workspace As.
+//!   Output Profile, Select > Modify, Colour Range, Straighten by Angle, Save
+//!   Selection and Save Workspace As.
 //!
 //! **Running stays here.** [`crate::activate_command`] still resolves an id
 //! to an [`ActivatedCommand`] (or does a panel command inline) and
@@ -167,6 +167,7 @@ fn typed_form(call: &Validated) -> Option<Result<ActivatedCommand, TypedError>> 
             let fuzziness = u16::try_from(call.int("fuzziness")?).ok()?;
             ActivatedCommand::ColourRangeApply(fuzziness)
         }
+        crate::straighten::COMMAND_ID => ActivatedCommand::StraightenApply(call.number("degrees")?),
         crate::selection_store::COMMAND_SAVE => {
             let name = call.text("name")?;
             return Some(

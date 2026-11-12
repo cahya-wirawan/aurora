@@ -14,7 +14,7 @@ use crate::{App, Key, guarded_scale_factor};
 
 impl App {
     /// The crop handle's side in physical pixels (`spacing.xs` logical).
-    fn crop_handle_px(&self) -> u32 {
+    pub(crate) fn crop_handle_px(&self) -> u32 {
         let side =
             f64::from(self.scales.spacing.xs) * f64::from(guarded_scale_factor(self.scale_factor));
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -51,6 +51,13 @@ impl App {
     pub(crate) fn crop_press(&mut self, canvas_point: (f32, f32)) {
         self.sync_crop_ratio_now();
         let doc_point = self.doc.canvas_view.to_document(canvas_point);
+        // With the Straighten box on, a drag draws the angle line instead.
+        if self.straighten_line_armed() {
+            self.crop
+                .begin_line(doc_point, self.doc.id, self.doc.canvas_size);
+            self.crop_changed_visibly();
+            return;
+        }
         let radius = self.crop_hit_radius();
         match self.crop.press(
             doc_point,
@@ -79,12 +86,16 @@ impl App {
     /// The primary button was released: a crop drag ends, the rectangle stays.
     pub(crate) fn crop_pointer_released(&mut self) {
         if self.crop.dragging() {
+            let line = self.crop.line();
             self.crop.release();
+            if let Some(line) = line {
+                self.straighten_line_released(line);
+            }
             self.crop_changed_visibly();
         }
     }
 
-    fn crop_changed_visibly(&mut self) {
+    pub(crate) fn crop_changed_visibly(&mut self) {
         self.needs_redraw = true;
         self.sync_status_bar_now();
     }
@@ -130,7 +141,10 @@ impl App {
                 .and_then(|position| crate::pointer_in_canvas(&self.workspace, position))
         };
         let pointer = over_canvas.map(|point| self.doc.canvas_view.to_document(point));
-        let rect = self.crop.rect();
+        // The Straighten line is drawn with a crosshair, wherever it is.
+        let rect = self.crop.rect().filter(|_| !self.straighten_line_armed());
+        // With an angle the rectangle lives in the straightened frame.
+        let pointer = pointer.map(|p| self.crop.frame_point(p, self.doc.canvas_size));
         crop::cursor_for(self.tool, rect.as_ref(), pointer, self.crop_hit_radius())
     }
 
@@ -168,6 +182,13 @@ impl App {
         // A live layer drag ends (and is recorded) before the crop.
         let ending = self.drag.take();
         self.commit_drag(ending);
+        // With an angle the rectangle is in the straightened frame: the
+        // commit resamples every surface (task 180). Angle 0 never gets here
+        // (`set_angle(None)` clears it): it is the plain crop below.
+        if let Some(angle) = self.crop.angle() {
+            self.straighten_commit(angle, rect);
+            return;
+        }
         match crop::crop_document(
             &mut self.doc.layers,
             &mut self.doc.history,
@@ -187,7 +208,7 @@ impl App {
         }
     }
 
-    fn crop_refused(&mut self, why: CropRefusal) {
+    pub(crate) fn crop_refused(&mut self, why: CropRefusal) {
         self.crop.cancel();
         self.lock_notice = Some((why.notice(), self.doc.active_layer));
         self.sync_status_bar_now();
@@ -203,7 +224,12 @@ impl App {
         }
         match crop::selection_crop_rect(self.doc.selection.active().as_ref(), self.doc.canvas_size)
         {
-            Ok(rect) => self.crop_commit_rect(rect),
+            Ok(rect) => {
+                // The selection's bounds are in the document, not in a
+                // straightened frame.
+                self.crop.cancel();
+                self.crop_commit_rect(rect);
+            }
             Err(why) => self.crop_refused(why),
         }
     }
@@ -227,7 +253,7 @@ impl App {
     /// The document's size or origin changed (a crop, its undo or redo): the
     /// rectangle goes, every composite tile and atlas slot is stale, and the
     /// view starts again at the new canvas (the same reset an Open does).
-    fn after_canvas_changed(&mut self) {
+    pub(crate) fn after_canvas_changed(&mut self) {
         self.crop.cancel();
         self.doc.composite_cache.bump();
         if let Some(residency) = self.residency.as_mut() {
@@ -249,6 +275,9 @@ impl App {
     /// Crop tool has one, else the active selection.
     pub(crate) fn outline_selection(&self) -> Option<aurora_doc::Selection> {
         match (self.tool, self.crop.rect()) {
+            // A straightened rectangle is drawn rotated, by
+            // `straighten_overlay_runs_now`.
+            (aurora_ui::Tool::Crop, Some(_)) if self.crop.angle().is_some() => None,
             (aurora_ui::Tool::Crop, Some(rect)) => Some(aurora_doc::Selection::new(rect)),
             _ => self.doc.selection.active(),
         }
@@ -258,7 +287,7 @@ impl App {
     pub(crate) fn crop_handle_runs_now(&self) -> Vec<aurora_widgets::widgets::OutlineRun> {
         let (aurora_ui::Tool::Crop, Some(rect), Some(size)) = (
             self.tool,
-            self.crop.rect(),
+            self.crop.rect().filter(|_| self.crop.angle().is_none()),
             crate::canvas_area_logical_size(&self.workspace),
         ) else {
             return Vec::new();
@@ -277,7 +306,7 @@ impl App {
     pub(crate) fn crop_guide_runs_now(&self) -> Vec<aurora_widgets::widgets::OutlineRun> {
         guides_for_frame(
             self.tool,
-            self.crop.rect(),
+            self.crop.rect().filter(|_| self.crop.angle().is_none()),
             crate::canvas_area_logical_size(&self.workspace),
             &self.doc.canvas_view,
             guarded_scale_factor(self.scale_factor),
@@ -289,7 +318,7 @@ impl App {
     pub(crate) fn crop_shield_rects_now(&self) -> Vec<aurora_widgets::widgets::ShieldRect> {
         shield_for_frame(
             self.tool,
-            self.crop.rect(),
+            self.crop.rect().filter(|_| self.crop.angle().is_none()),
             crate::canvas_area_logical_size(&self.workspace),
             &self.doc.canvas_view,
             guarded_scale_factor(self.scale_factor),

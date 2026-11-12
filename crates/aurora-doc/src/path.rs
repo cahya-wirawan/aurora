@@ -519,6 +519,46 @@ impl PathSet {
         Ok(())
     }
 
+    /// Maps every anchor through the affine map `(x, y) -> (a*x + c*y + e,
+    /// b*x + d*y + f)` with `matrix = [a, b, c, d, e, f]` (Straighten): points
+    /// move by the whole map, handle offsets by its linear part only. Done in
+    /// `f64` and stored as `f32`. All or nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::InvalidPath`] when the matrix is not finite or a mapped
+    /// coordinate leaves the range.
+    #[allow(clippy::many_single_char_names)] // the six entries of an affine matrix
+    pub fn transform(&mut self, matrix: [f64; 6]) -> Result<(), DocError> {
+        if !matrix.iter().all(|v| v.is_finite()) {
+            return Err(DocError::InvalidPath("a coordinate is not usable"));
+        }
+        let [a, b, c, d, e, f] = matrix;
+        let point = |(x, y): (f32, f32)| -> (f32, f32) {
+            let (x, y) = (f64::from(x), f64::from(y));
+            #[allow(clippy::cast_possible_truncation)]
+            ((a * x + c * y + e) as f32, (b * x + d * y + f) as f32)
+        };
+        let offset = |(x, y): (f32, f32)| -> (f32, f32) {
+            let (x, y) = (f64::from(x), f64::from(y));
+            #[allow(clippy::cast_possible_truncation)]
+            ((a * x + c * y) as f32, (b * x + d * y) as f32)
+        };
+        let mut next = self.clone();
+        for path in next.paths.iter_mut().chain(next.work.iter_mut()) {
+            for sub in &mut path.subpaths {
+                for anchor in &mut sub.anchors {
+                    anchor.point = point(anchor.point);
+                    anchor.handle_in = offset(anchor.handle_in);
+                    anchor.handle_out = offset(anchor.handle_out);
+                }
+            }
+        }
+        next.check()?;
+        *self = next;
+        Ok(())
+    }
+
     /// Moves every anchor by `(dx, dy)` (the Crop). All or nothing.
     ///
     /// # Errors

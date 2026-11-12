@@ -125,6 +125,11 @@ pub(crate) enum CropRefusal {
     OutOfRange,
     /// "Crop to Selection" with no selection.
     NeedsSelection,
+    /// A straighten would resample more than the caps allow (task 180).
+    TooLarge,
+    /// A straighten could not finish (a tile store failure); nothing changed
+    /// (task 180).
+    Failed,
 }
 
 impl CropRefusal {
@@ -136,6 +141,8 @@ impl CropRefusal {
             Self::QuickMask => LockRefusal::QuickMaskLeaveFirst,
             Self::OutOfRange => LockRefusal::CropOutOfRange,
             Self::NeedsSelection => LockRefusal::CropNeedsSelection,
+            Self::TooLarge => LockRefusal::StraightenTooLarge,
+            Self::Failed => LockRefusal::StraightenFailed,
         }
     }
 }
@@ -146,6 +153,14 @@ pub(crate) fn status_rect(tool: aurora_ui::Tool, state: &CropState) -> Option<Re
     (tool == aurora_ui::Tool::Crop)
         .then(|| state.rect())
         .flatten()
+}
+
+/// What the status bar reports of the Crop tool (task 180): the rectangle
+/// and, when one is set, the Straighten angle in degrees.
+pub(crate) fn status_crop(tool: aurora_ui::Tool, state: &CropState) -> Option<(Rect, Option<f32>)> {
+    #[allow(clippy::cast_possible_truncation)]
+    let angle = state.angle().map(|a| a as f32);
+    status_rect(tool, state).map(|rect| (rect, angle))
 }
 
 /// The canvas as a rectangle at the origin.
@@ -832,6 +847,9 @@ enum Gesture {
     Move { grab: (f32, f32), origin: Rect },
     /// Resizing by `handle` from `origin`.
     Resize { handle: CropHandle, origin: Rect },
+    /// Drawing the Straighten line from `from` to `to` (source points;
+    /// task 180).
+    Line { from: (f32, f32), to: (f32, f32) },
 }
 
 /// What a press did.
@@ -855,6 +873,10 @@ pub(crate) struct CropState {
     /// The aspect ratio the rectangle is held to (0.236.0); `None` is free.
     /// Survives [`Self::cancel`]: it is a setting, not a gesture.
     ratio: Option<Ratio>,
+    /// The Straighten angle in degrees (task 180), `None` for a plain crop.
+    /// While it is set, `rect` is in the straightened frame's coordinates
+    /// ([`crate::straighten::Frame`]) and the pointer is mapped into it.
+    angle: Option<f64>,
 }
 
 impl CropState {
@@ -896,7 +918,103 @@ impl CropState {
         if let (Some(ratio), Some(rect)) = (ratio, self.rect) {
             self.rect = Some(refit(rect, ratio, canvas));
         }
+        // A straightened rectangle must stay inside the valid area.
+        if let (Some(frame), Some(rect)) = (self.frame(canvas), self.rect)
+            && !frame.rect_is_valid(&rect)
+        {
+            self.rect = frame.largest_rect(ratio);
+        }
         true
+    }
+
+    /// The Straighten angle in degrees, if one is set.
+    pub(crate) fn angle(&self) -> Option<f64> {
+        self.angle
+    }
+
+    /// The straightened frame of `canvas` when an angle is set.
+    pub(crate) fn frame(&self, canvas: (u32, u32)) -> Option<crate::straighten::Frame> {
+        crate::straighten::Frame::new(canvas, self.angle?)
+    }
+
+    /// The Straighten line being drawn: its two source points.
+    pub(crate) fn line(&self) -> Option<((f32, f32), (f32, f32))> {
+        match self.gesture {
+            Some(Gesture::Line { from, to }) => Some((from, to)),
+            _ => None,
+        }
+    }
+
+    /// Sets the Straighten angle (`Some`, degrees; the caller has run it
+    /// through [`crate::straighten::checked_angle`]) or clears it. With an
+    /// angle the rectangle becomes the largest valid one for the aspect
+    /// ratio in force ([`crate::straighten::Frame::largest_rect`]); clearing
+    /// keeps the rectangle cut to the canvas. Ends any live drag. Returns
+    /// whether the state changed (a canvas too small for any rectangle
+    /// refuses the angle).
+    pub(crate) fn set_angle(
+        &mut self,
+        angle: Option<f64>,
+        id: crate::document_session::DocumentId,
+        canvas: (u32, u32),
+    ) -> bool {
+        self.gesture = None;
+        self.last_press = None;
+        if let Some(degrees) = angle {
+            let Some(frame) = crate::straighten::Frame::new(canvas, degrees) else {
+                return false;
+            };
+            let Some(rect) = frame.largest_rect(self.ratio) else {
+                return false;
+            };
+            self.angle = Some(degrees);
+            self.rect = Some(rect);
+            self.owner = Some((id, canvas));
+            true
+        } else {
+            let changed = self.angle.take().is_some();
+            if changed {
+                self.rect = self.rect.and_then(|rect| {
+                    let canvas = canvas_rect(canvas);
+                    let (l, t) = (rect.x.max(canvas.x), rect.y.max(canvas.y));
+                    let (r, b) = (
+                        rect.right().min(canvas.right()),
+                        rect.bottom().min(canvas.bottom()),
+                    );
+                    from_edges(l, t, r, b)
+                });
+            }
+            changed
+        }
+    }
+
+    /// Starts drawing the Straighten line at source point `p` (the
+    /// rectangle, if any, stays).
+    pub(crate) fn begin_line(
+        &mut self,
+        p: (f32, f32),
+        id: crate::document_session::DocumentId,
+        canvas: (u32, u32),
+    ) {
+        self.owner = Some((id, canvas));
+        self.last_press = None;
+        self.gesture = Some(Gesture::Line { from: p, to: p });
+    }
+
+    /// The pointer's source point `p` as a point of the rectangle's frame
+    /// (unchanged without an angle).
+    pub(crate) fn frame_point(&self, p: (f32, f32), canvas: (u32, u32)) -> (f32, f32) {
+        self.to_frame(p, canvas)
+    }
+
+    fn to_frame(&self, p: (f32, f32), canvas: (u32, u32)) -> (f32, f32) {
+        let Some(frame) = self.frame(canvas) else {
+            return p;
+        };
+        let (x, y) = frame.from_source((f64::from(p.0), f64::from(p.1)));
+        #[allow(clippy::cast_possible_truncation)]
+        let mapped = (x as f32, y as f32);
+        mapped
     }
 
     /// Whether the state belongs to another document or canvas size than
@@ -921,6 +1039,7 @@ impl CropState {
         id: crate::document_session::DocumentId,
         canvas: (u32, u32),
     ) -> Press {
+        let p = self.to_frame(p, canvas);
         let double = self.last_press.is_some_and(|(then, at)| {
             now.saturating_duration_since(then) <= DOUBLE_CLICK
                 && (p.0 - at.0).abs().max((p.1 - at.1).abs()) <= DOUBLE_CLICK_SLOP
@@ -958,23 +1077,69 @@ impl CropState {
 
     /// The pointer moved to `p` during a drag.
     pub(crate) fn drag(&mut self, p: (f32, f32), canvas: (u32, u32)) {
+        if let Some(Gesture::Line { from, .. }) = self.gesture {
+            self.gesture = Some(Gesture::Line { from, to: p });
+            return;
+        }
+        let frame = self.frame(canvas);
+        let p = self.to_frame(p, canvas);
         match self.gesture {
             Some(Gesture::Create { anchor }) => {
-                self.rect = match self.ratio {
-                    Some(ratio) => rect_from_points_ratio(anchor, p, canvas, ratio),
-                    None => rect_from_points(anchor, p, canvas),
+                let make = |to: (f32, f32)| match self.ratio {
+                    Some(ratio) => rect_from_points_ratio(anchor, to, canvas, ratio),
+                    None => rect_from_points(anchor, to, canvas),
+                };
+                self.rect = match frame {
+                    None => make(p),
+                    Some(frame) => {
+                        // Pull the pointer back towards the anchor until the
+                        // rectangle fits the valid area.
+                        let fits = |r: &Option<Rect>| r.is_some_and(|r| frame.rect_is_valid(&r));
+                        let full = make(p);
+                        if fits(&full) {
+                            full
+                        } else {
+                            let at = |t: f32| {
+                                (
+                                    anchor.0 + (p.0 - anchor.0) * t,
+                                    anchor.1 + (p.1 - anchor.1) * t,
+                                )
+                            };
+                            let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+                            let mut best = None;
+                            for _ in 0..30 {
+                                let t = f32::midpoint(lo, hi);
+                                let candidate = make(at(t));
+                                if fits(&candidate) {
+                                    best = candidate;
+                                    lo = t;
+                                } else {
+                                    hi = t;
+                                }
+                            }
+                            best
+                        }
+                    }
                 };
             }
             Some(Gesture::Move { grab, origin }) => {
-                self.rect = Some(moved(origin, p.0 - grab.0, p.1 - grab.1, canvas));
-            }
-            Some(Gesture::Resize { handle, origin }) => {
-                self.rect = Some(match self.ratio {
-                    Some(ratio) => resized_ratio(origin, handle, p, canvas, ratio),
-                    None => resized(origin, handle, p, canvas),
+                let candidate = moved(origin, p.0 - grab.0, p.1 - grab.1, canvas);
+                self.rect = Some(match frame {
+                    Some(frame) => frame.clamp_move(origin, candidate),
+                    None => candidate,
                 });
             }
-            None => {}
+            Some(Gesture::Resize { handle, origin }) => {
+                let candidate = match self.ratio {
+                    Some(ratio) => resized_ratio(origin, handle, p, canvas, ratio),
+                    None => resized(origin, handle, p, canvas),
+                };
+                self.rect = Some(match frame {
+                    Some(frame) => frame.clamp_resize(origin, candidate, self.ratio),
+                    None => candidate,
+                });
+            }
+            Some(Gesture::Line { .. }) | None => {}
         }
     }
 
@@ -983,7 +1148,12 @@ impl CropState {
     pub(crate) fn nudge(&mut self, nudge: Nudge, canvas: (u32, u32)) -> bool {
         match (self.rect, self.gesture) {
             (Some(rect), None) => {
-                self.rect = Some(nudged_ratio(rect, nudge, canvas, self.ratio));
+                let candidate = nudged_ratio(rect, nudge, canvas, self.ratio);
+                self.rect = Some(match self.frame(canvas) {
+                    Some(frame) if nudge.resize => frame.clamp_resize(rect, candidate, self.ratio),
+                    Some(frame) => frame.clamp_move(rect, candidate),
+                    None => candidate,
+                });
                 true
             }
             _ => false,

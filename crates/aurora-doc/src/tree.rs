@@ -826,6 +826,9 @@ pub(crate) fn validate_origin(bounds: Rect) -> Result<(), DocError> {
     })
 }
 
+/// A list of layer ids with a rectangle each ([`LayerTree::all_bounds`]).
+pub type LayerBounds = Vec<(LayerId, Rect)>;
+
 impl LayerTree {
     #[must_use]
     pub fn new() -> Self {
@@ -2148,6 +2151,72 @@ impl LayerTree {
             }
             if let Some(mask) = &mut entry.mask {
                 mask.bounds = shifted(mask.bounds)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every pixel layer's bounds and every mask's bounds, each list in
+    /// ascending raw id order (Straighten, which retargets them all at once).
+    #[must_use]
+    pub fn all_bounds(&self) -> (LayerBounds, LayerBounds) {
+        let mut pixel = Vec::new();
+        let mut masks = Vec::new();
+        for (id, entry) in &self.layers {
+            if let LayerKind::Pixel { bounds } = &entry.kind {
+                pixel.push((*id, *bounds));
+            }
+            if let Some(mask) = &entry.mask {
+                masks.push((*id, mask.bounds));
+            }
+        }
+        pixel.sort_by_key(|(id, _)| id.to_raw());
+        masks.sort_by_key(|(id, _)| id.to_raw());
+        (pixel, masks)
+    }
+
+    /// Sets the bounds of the listed pixel layers and of the listed layers'
+    /// masks in one go (Straighten's document half, and its inverse). All or
+    /// nothing: every id must exist (a pixel layer for the first list, a
+    /// layer with a mask for the second) and every origin be in range.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::UnknownLayer`], [`DocError::NotAPixelLayer`] or
+    /// [`DocError::LayerOriginOutOfRange`]; the tree is unchanged then.
+    pub fn set_all_bounds(
+        &mut self,
+        pixel: &[(LayerId, Rect)],
+        masks: &[(LayerId, Rect)],
+    ) -> Result<(), DocError> {
+        for (id, rect) in pixel {
+            match self.layers.get(id).map(|entry| &entry.kind) {
+                None => return Err(DocError::UnknownLayer(*id)),
+                Some(LayerKind::Pixel { .. }) => validate_origin(*rect)?,
+                Some(_) => return Err(DocError::NotAPixelLayer(*id)),
+            }
+        }
+        for (id, rect) in masks {
+            let entry = self.layers.get(id).ok_or(DocError::UnknownLayer(*id))?;
+            if entry.mask.is_none() {
+                return Err(DocError::UnknownLayer(*id));
+            }
+            validate_origin(*rect)?;
+        }
+        for (id, rect) in pixel {
+            if let Some(LayerKind::Pixel { bounds }) =
+                self.layers.get_mut(id).map(|entry| &mut entry.kind)
+            {
+                *bounds = *rect;
+            }
+        }
+        for (id, rect) in masks {
+            if let Some(mask) = self
+                .layers
+                .get_mut(id)
+                .and_then(|entry| entry.mask.as_mut())
+            {
+                mask.bounds = *rect;
             }
         }
         Ok(())
