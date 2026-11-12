@@ -32,14 +32,16 @@ use taffy::{FlexDirection, Style};
 pub const MENU_BAR_LABEL: &str = "Menu bar";
 
 /// The menus' titles, left to right. `aurora-app`'s menu model lists the
-/// same six (a test pins them together).
-pub const MENU_BAR_TITLES: [&str; 6] = ["File", "Edit", "Layer", "Select", "View", "Window"];
+/// same seven (a test pins them together).
+pub const MENU_BAR_TITLES: [&str; 7] = [
+    "File", "Edit", "Layer", "Select", "Filter", "View", "Window",
+];
 
 /// The bar: its root row and one button per title.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MenuBar {
     pub root: WidgetId,
-    pub buttons: [WidgetId; 6],
+    pub buttons: [WidgetId; 7],
 }
 
 impl MenuBar {
@@ -91,7 +93,7 @@ pub(crate) fn insert_menu_bar(
         node,
         widgets::StripSurface::Chrome,
     )?;
-    let mut buttons = [root; 6];
+    let mut buttons = [root; 7];
     for (slot, title) in buttons.iter_mut().zip(MENU_BAR_TITLES) {
         match widgets::insert_flat_button(tree, root, scales, title) {
             Ok(id) => *slot = id,
@@ -272,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_is_a_menubar_of_six_named_buttons_in_order() {
+    fn the_bar_is_a_menubar_of_seven_named_buttons_in_order() {
         let ws = laid_out(true);
         let Some(node) = ws.tree.accessibility(ws.menu_bar.root) else {
             unreachable!("built");

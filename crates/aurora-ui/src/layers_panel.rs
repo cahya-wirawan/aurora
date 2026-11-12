@@ -1037,6 +1037,14 @@ pub fn layer_row_description(layers: &LayerTree, id: LayerId) -> String {
     if layers.clip_base(id).is_some() {
         suffix.push_str(", clipped");
     }
+    // Task 176: a pixel layer with editable filters says so (no icon).
+    if let Some(filters) = layers.filters(id) {
+        suffix.push_str(if filters.any_visible() {
+            ", filtered"
+        } else {
+            ", filters hidden"
+        });
+    }
     let suffix = suffix.as_str();
     match layers.kind(id) {
         // A group names its blend mode too (0.195.0), unless it is Pass

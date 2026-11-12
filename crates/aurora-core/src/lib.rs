@@ -16,6 +16,7 @@ pub mod effects;
 pub mod error;
 pub mod exposure;
 pub mod exposure_trc;
+pub mod filters;
 pub mod geometry;
 pub mod gradient_fill;
 pub mod gradient_map;
@@ -54,6 +55,10 @@ pub use error::CoreError;
 pub use exposure::{EXPOSURE_MAX, ExposureError, ExposureParams, OFFSET_MAX};
 pub use exposure_trc::{
     ExposureTrcParams, GREY_TRC_MAX_ENTRIES, GREY_TRC_MIN_ENTRIES, GreyTrc, GreyTrcError,
+};
+pub use filters::{
+    FilterKind, FiltersError, GaussianSpec, LayerFilter, LayerFilters, MAX_FILTER_REACH,
+    MAX_GAUSSIAN_RADIUS, MAX_LAYER_FILTERS, MIN_GAUSSIAN_RADIUS,
 };
 pub use geometry::{MAX_DOCUMENT_EXTENT, MAX_DOCUMENT_ORIGIN, Rect, Size};
 pub use gradient_fill::{

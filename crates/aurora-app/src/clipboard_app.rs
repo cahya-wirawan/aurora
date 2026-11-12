@@ -301,6 +301,20 @@ impl UndoOrder {
     }
 }
 
+/// The calm notice after a Copy, Cut, Layer via Copy or Layer via Cut of a
+/// layer with shown filters (task 176): the clip holds the layer's stored,
+/// unfiltered pixels and the new layer (if any) has no filters. Copy Merged
+/// copies what is shown, filters included, and needs no notice.
+pub(crate) const FILTERS_NOT_COPIED_NOTICE: &str = "Copied the layer's own pixels. Its filters were not copied; use Copy Merged to copy what is shown.";
+
+/// Whether copying `layer`'s pixels leaves out shown filters.
+pub(crate) fn copy_leaves_filters_behind(
+    layers: &aurora_doc::LayerTree,
+    layer: Option<aurora_doc::LayerId>,
+) -> bool {
+    layer.is_some_and(|id| crate::layer_filter_app::has_visible_filters(layers, id))
+}
+
 impl App {
     fn clip_notice(&mut self, text: &'static str) {
         self.lock_notice = Some((LockRefusal::Path(text), self.doc.active_layer));
@@ -323,13 +337,20 @@ impl App {
                 match clip {
                     Ok(clip) => {
                         let label = PASTE_LABEL;
-                        self.place_clip(clip, command == ClipCommand::PasteInPlace, label, None);
+                        let _ = self.place_clip(
+                            clip,
+                            command == ClipCommand::PasteInPlace,
+                            label,
+                            None,
+                        );
                     }
                     Err(text) => self.clip_notice(text),
                 }
             }
             ClipCommand::LayerViaCopy => {
                 let selection = self.doc.selection.active();
+                let left_behind =
+                    copy_leaves_filters_behind(&self.doc.layers, self.doc.active_layer);
                 let Some(store) = self.doc.tile_store.as_mut() else {
                     return;
                 };
@@ -340,7 +361,10 @@ impl App {
                     selection.as_ref(),
                 ) {
                     Ok(clip) => {
-                        self.place_clip(clip, true, LAYER_VIA_COPY_LABEL, None);
+                        let placed = self.place_clip(clip, true, LAYER_VIA_COPY_LABEL, None);
+                        if placed && left_behind {
+                            self.clip_notice(FILTERS_NOT_COPIED_NOTICE);
+                        }
                     }
                     Err(text) => self.clip_notice(text),
                 }
@@ -365,8 +389,15 @@ impl App {
                 selection.as_ref(),
             )
         };
+        let left_behind =
+            !merged && copy_leaves_filters_behind(&self.doc.layers, self.doc.active_layer);
         match result {
-            Ok(clip) => publish(&mut self.pixel_clip, clip, &mut self.clipboard),
+            Ok(clip) => {
+                publish(&mut self.pixel_clip, clip, &mut self.clipboard);
+                if left_behind {
+                    self.clip_notice(FILTERS_NOT_COPIED_NOTICE);
+                }
+            }
             Err(text) => self.clip_notice(text),
         }
     }
@@ -389,6 +420,7 @@ impl App {
         let Some(store) = self.doc.tile_store.as_mut() else {
             return;
         };
+        let left_behind = copy_leaves_filters_behind(&self.doc.layers, layer);
         let outcome = cut_active(store, &self.doc.layers, layer, selection.as_ref());
         let via_layer = command == ClipCommand::LayerViaCut;
         match outcome {
@@ -400,13 +432,17 @@ impl App {
                 self.clip_notice(text);
             }
             Ok((clip, filled)) => {
+                let mut done = true;
                 if via_layer {
-                    self.place_clip(clip, true, LAYER_VIA_CUT_LABEL, Some(filled));
+                    done = self.place_clip(clip, true, LAYER_VIA_CUT_LABEL, Some(filled));
                 } else {
                     publish(&mut self.pixel_clip, clip, &mut self.clipboard);
                     if let Some(layer) = layer {
                         self.finish_fill(layer, Ok(filled), CUT_LABEL);
                     }
+                }
+                if done && left_behind {
+                    self.clip_notice(FILTERS_NOT_COPIED_NOTICE);
                 }
             }
         }
@@ -420,11 +456,11 @@ impl App {
         in_place: bool,
         label: &'static str,
         cut: Option<Filled>,
-    ) {
+    ) -> bool {
         let visible = crate::canvas_area_logical_size(&self.workspace)
             .and_then(|size| visible_rect(&self.doc.canvas_view, size));
         let Some(store) = self.doc.tile_store.as_mut() else {
-            return;
+            return false;
         };
         let result = place_clip_core(
             &mut LayerCommandContext {
@@ -459,6 +495,8 @@ impl App {
         self.needs_redraw = true;
         if let Err(text) = result {
             self.clip_notice(text);
+            return false;
         }
+        true
     }
 }

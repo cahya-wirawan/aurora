@@ -12,6 +12,7 @@
 //! adjustment is still to come.
 
 pub mod black_white;
+pub mod blur;
 pub mod brightness_contrast;
 pub mod channel_mixer;
 pub mod color_balance;
@@ -30,6 +31,7 @@ pub mod threshold;
 pub mod vibrance;
 
 pub use black_white::{BLACK_WHITE_PACKED_LEN, BlackWhiteOp};
+pub use blur::{crop_window, gaussian_blur_window};
 pub use brightness_contrast::{BRIGHTNESS_CONTRAST_PACKED_LEN, BrightnessContrastOp};
 pub use channel_mixer::{CHANNEL_MIXER_PACKED_LEN, ChannelMixerOp};
 pub use color_balance::{COLOR_BALANCE_PACKED_LEN, ColorBalanceOp, SHIFT_AT_100, range_weights};

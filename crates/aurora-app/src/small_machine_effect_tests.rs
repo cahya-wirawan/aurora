@@ -97,6 +97,7 @@ fn a_cache_smaller_than_one_tile_keeps_one_entry_and_evicts_the_rest() {
         mask: None,
         shape: 0,
         versions: Vec::new(),
+        filters: Vec::new(),
     };
     let mut cache = ShadowCache::with_cap_bytes(0);
     for pass in 0..3 {

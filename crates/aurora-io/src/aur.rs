@@ -1660,6 +1660,92 @@ fn read_text_layers<R: Read + Seek>(
     Ok(())
 }
 
+/// The optional entry carrying layers' editable filters (task 176):
+/// each filtered pixel layer's `aurora_core::LayerFilters`
+/// (`LayerEntry::filters` is `#[serde(skip)]`).
+///
+/// Written only when some layer has filters, so every other save stays
+/// byte-identical; a file without it opens with none, which is what every
+/// older file means. **Versioned, and a newer version refuses the file**
+/// loudly, like [`TEXT_LAYERS_ENTRY`]. An Aurora older than this entry
+/// ignores it, but refuses the file anyway whenever its journal holds a
+/// `SetFilters` op (an unknown ordinal), which every document whose
+/// filters were added in the session does.
+const LAYER_FILTERS_ENTRY: &str = "layer-filters";
+
+/// [`LAYER_FILTERS_ENTRY`]'s own schema version.
+const LAYER_FILTERS_VERSION: u32 = 1;
+
+/// The largest [`LAYER_FILTERS_ENTRY`] read: a few dozen bytes per layer.
+const MAX_LAYER_FILTERS_BYTES: u64 = 4 * 1024 * 1024;
+
+/// [`LAYER_FILTERS_ENTRY`]'s payload: version first (frozen), then the
+/// `(raw layer id, filters)` pairs.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LayerFiltersWire {
+    version: u32,
+    layers: Vec<(u64, aurora_core::LayerFilters)>,
+}
+
+/// The `layer-filters` entry's bytes for `layers`, or `None` when no layer
+/// has filters.
+fn layer_filters_entry(layers: &LayerTree) -> Result<Option<Vec<u8>>, IoError> {
+    let pairs: Vec<(u64, aurora_core::LayerFilters)> = layer_ids(layers)
+        .into_iter()
+        .filter_map(|id| Some((id.to_raw(), layers.filters(id)?.clone())))
+        .collect();
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    let wire = LayerFiltersWire {
+        version: LAYER_FILTERS_VERSION,
+        layers: pairs,
+    };
+    postcard::to_allocvec(&wire)
+        .map(Some)
+        .map_err(|source| IoError::ManifestSerialization(source.to_string()))
+}
+
+/// Reads [`LAYER_FILTERS_ENTRY`] if present and applies it to `layers`.
+///
+/// # Errors
+///
+/// [`IoError::ManifestDeserialization`] for an unknown version, bytes that
+/// do not decode, filters on a missing or non-pixel layer or filters that
+/// fail validation; [`IoError::EntryTooLarge`] for an entry over its cap.
+fn read_layer_filters<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
+    layers: &mut LayerTree,
+) -> Result<(), IoError> {
+    let bytes = match zip.by_name(LAYER_FILTERS_ENTRY) {
+        Ok(file) => read_capped(file, LAYER_FILTERS_ENTRY, MAX_LAYER_FILTERS_BYTES)?,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let (prefix, _rest) = postcard::take_from_bytes::<MaskDensityPrefix>(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    if prefix.version != LAYER_FILTERS_VERSION {
+        let cause = if prefix.version > LAYER_FILTERS_VERSION {
+            "the file was saved by a newer Aurora"
+        } else {
+            "the entry is damaged or of an unknown kind"
+        };
+        return Err(IoError::ManifestDeserialization(format!(
+            "unsupported layer-filters version {} (this build understands version \
+             {LAYER_FILTERS_VERSION}); {cause}",
+            prefix.version
+        )));
+    }
+    let wire: LayerFiltersWire = postcard::from_bytes(&bytes)
+        .map_err(|source| IoError::ManifestDeserialization(source.to_string()))?;
+    for (raw, filters) in wire.layers {
+        layers
+            .set_filters(aurora_doc::LayerId::from_raw(raw), Some(filters))
+            .map_err(|err| IoError::ManifestDeserialization(format!("layer filters: {err}")))?;
+    }
+    Ok(())
+}
+
 /// The entry holding what the document's own open changed or left out
 /// (0.177.0 review B-1): the lines of a PSD's "Opened With Changes"
 /// report, so a later Photoshop save of the document lists them even
@@ -2955,6 +3041,8 @@ struct DocumentEntries {
     smart_objects: Option<SmartEntries>,
     /// [`TEXT_LAYERS_ENTRY`], when the document has text data (task 155).
     text_layers: Option<Vec<u8>>,
+    /// [`LAYER_FILTERS_ENTRY`], when some layer has filters (task 176).
+    layer_filters: Option<Vec<u8>>,
 }
 
 impl DocumentEntries {
@@ -3061,6 +3149,7 @@ impl DocumentEntries {
             colour: None,
             smart_objects: smart_entries(layers)?,
             text_layers: text_layers_entry(layers)?,
+            layer_filters: layer_filters_entry(layers)?,
         })
     }
 
@@ -3127,6 +3216,10 @@ impl DocumentEntries {
         }
         if let Some(bytes) = &self.text_layers {
             zip.start_file(TEXT_LAYERS_ENTRY, deflated)?;
+            zip.write_all(bytes)?;
+        }
+        if let Some(bytes) = &self.layer_filters {
+            zip.start_file(LAYER_FILTERS_ENTRY, deflated)?;
             zip.write_all(bytes)?;
         }
         if let Some(bytes) = &self.import_losses {
@@ -3594,6 +3687,7 @@ pub fn read<R: Read + Seek>(reader: R, store: &mut TileStore) -> Result<AurDocum
     read_layer_effect_shapes(&mut zip, &mut layers)?;
     read_smart_objects(&mut zip, &mut layers)?;
     read_text_layers(&mut zip, &mut layers)?;
+    read_layer_filters(&mut zip, &mut layers)?;
 
     let history_bytes = read_entry(&mut zip, HISTORY_ENTRY)?;
     let history = History::load_journal(&history_bytes)?;
@@ -6935,6 +7029,108 @@ mod tests {
         .unwrap_or_default();
         let tampered = with_named_entry(&bytes, super::LAYER_CLIPPING_ENTRY, Some(&payload));
         let (_dir4, mut fresh) = real_tile_store();
+        assert!(read(Cursor::new(tampered), &mut fresh).is_err());
+    }
+
+    /// Task 176: layer filters survive a save and reopen (the optional
+    /// `layer-filters` entry and the journal replay), an unfiltered
+    /// document writes no entry, and a newer version, a non-pixel layer,
+    /// an unknown layer or invalid settings refuse the file.
+    #[test]
+    fn round_trips_layer_filters_and_refuses_bad_entries() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let add = |name: &str, layers: &mut LayerTree, history: &mut History| match history
+            .add_pixel_layer(layers, name, bounds(), None)
+        {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let plain = add("plain", &mut layers, &mut history);
+        let blurred = add("blurred", &mut layers, &mut history);
+        let group = match history.add_group(&mut layers, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let write_bytes = |layers: &LayerTree, history: &History, store: &mut TileStore| {
+            let mut bytes = Cursor::new(Vec::new());
+            if let Err(err) = write(
+                &mut bytes,
+                layers,
+                history,
+                (100, 100),
+                None,
+                &SkippedTiles::new(),
+                store,
+            ) {
+                unreachable!("{err:?}");
+            }
+            bytes.into_inner()
+        };
+        let untouched = write_bytes(&layers, &history, &mut store);
+        assert!(
+            effects_entry_names(&untouched)
+                .iter()
+                .all(|n| n != super::LAYER_FILTERS_ENTRY),
+            "an unfiltered document writes no entry"
+        );
+        let filters = aurora_core::LayerFilters {
+            filters: vec![
+                aurora_core::LayerFilter::new(aurora_core::FilterKind::GaussianBlur {
+                    radius: 6.5,
+                }),
+                aurora_core::LayerFilter {
+                    kind: aurora_core::FilterKind::GaussianBlur { radius: 1.0 },
+                    visible: false,
+                },
+            ],
+        };
+        if let Err(err) = history.set_filters(&mut layers, blurred, Some(filters.clone())) {
+            unreachable!("{err:?}");
+        }
+        let bytes = write_bytes(&layers, &history, &mut store);
+        assert!(
+            effects_entry_names(&bytes)
+                .iter()
+                .any(|n| n == super::LAYER_FILTERS_ENTRY)
+        );
+        let (_dir2, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.clone()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(document.layers.filters(blurred), Some(&filters));
+        assert!(document.layers.filters(plain).is_none());
+        match document.history.replay() {
+            Ok(replayed) => assert_eq!(replayed.filters(blurred), Some(&filters)),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        let tamper = |version: u32, id: u64, value: aurora_core::LayerFilters| {
+            let payload = postcard::to_allocvec(&super::LayerFiltersWire {
+                version,
+                layers: vec![(id, value)],
+            })
+            .unwrap_or_default();
+            let tampered = with_named_entry(&bytes, super::LAYER_FILTERS_ENTRY, Some(&payload));
+            let (_d, mut fresh) = real_tile_store();
+            read(Cursor::new(tampered), &mut fresh).is_err()
+        };
+        let v = super::LAYER_FILTERS_VERSION;
+        assert!(!tamper(v, blurred.to_raw(), filters.clone()), "control");
+        assert!(tamper(v + 1, blurred.to_raw(), filters.clone()), "newer");
+        assert!(tamper(0, blurred.to_raw(), filters.clone()), "older");
+        assert!(tamper(v, group.to_raw(), filters.clone()), "group");
+        assert!(tamper(v, 987_654, filters.clone()), "unknown layer");
+        let bad = aurora_core::LayerFilters {
+            filters: vec![aurora_core::LayerFilter::new(
+                aurora_core::FilterKind::GaussianBlur { radius: 1.0e9 },
+            )],
+        };
+        assert!(tamper(v, blurred.to_raw(), bad), "invalid radius");
+        // Damaged bytes refuse too.
+        let tampered = with_named_entry(&bytes, super::LAYER_FILTERS_ENTRY, Some(&[1, 0xff]));
+        let (_d, mut fresh) = real_tile_store();
         assert!(read(Cursor::new(tampered), &mut fresh).is_err());
     }
 

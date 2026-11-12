@@ -277,6 +277,18 @@ enum LayerOp {
         id: LayerId,
         value: Option<Box<crate::text_layer::TextLayer>>,
     },
+    /// Replaces a pixel layer's editable filters (task 176,
+    /// [`aurora_core::LayerFilters`]); `None` removes them.
+    /// `LayerEntry::filters` is `#[serde(skip)]`, so
+    /// [`History::save_journal`] follows every journaled `Restore` that
+    /// carries filters with one of these, and **only then**: a journal
+    /// without filters is byte-identical to the ones older builds wrote.
+    /// Appended after [`Self::SetTextLayer`] (ordinal 27), so an Aurora
+    /// older than this build refuses a journal holding it (ADR 0009).
+    SetFilters {
+        id: LayerId,
+        value: Option<aurora_core::LayerFilters>,
+    },
 }
 
 /// One layer's smoothed-ramp flags a journaled op carries (see
@@ -424,6 +436,19 @@ fn restored_text_layers(op: &LayerOp) -> Vec<(LayerId, Box<crate::text_layer::Te
             .entries
             .iter()
             .filter_map(|(id, entry)| entry.text_layer.clone().map(|t| (*id, t)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every `(layer, filters)` pair a journaled `Restore` carries in a
+/// subtree entry whose filters would be lost on the wire.
+fn restored_filters(op: &LayerOp) -> Vec<(LayerId, aurora_core::LayerFilters)> {
+    match op {
+        LayerOp::Restore(subtree) => subtree
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| entry.filters.as_deref().map(|f| (*id, f.clone())))
             .collect(),
         _ => Vec::new(),
     }
@@ -784,6 +809,13 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
             // stack.
             Ok((LayerOp::SetTextLayer { id, value: old }, None))
         }
+        LayerOp::SetFilters { id, value } => {
+            let old = tree.filters(id).cloned();
+            tree.set_filters(id, value)?;
+            // `None`: region unknown. The filter spreads pixels beyond the
+            // layer's own tiles, so the whole layer's reach is repainted.
+            Ok((LayerOp::SetFilters { id, value: old }, None))
+        }
         LayerOp::SetClipped { id, value } => {
             let old = tree.clipped(id);
             tree.set_clipped_flag(id, value)?;
@@ -989,6 +1021,15 @@ fn describe(op: &LayerOp) -> String {
         LayerOp::SetTextLayer { id, value } => match value {
             Some(_) => format!("Kept the text data of layer #{}", id.to_raw()),
             None => format!("Removed the text data of layer #{}", id.to_raw()),
+        },
+        LayerOp::SetFilters { id, value } => match value {
+            Some(f) => format!(
+                "Set {} filter{} on layer #{}",
+                f.filters.len(),
+                if f.filters.len() == 1 { "" } else { "s" },
+                id.to_raw()
+            ),
+            None => format!("Removed the filters of layer #{}", id.to_raw()),
         },
         LayerOp::SetClipped { id, value } => {
             let verb = if *value {
@@ -1339,6 +1380,13 @@ impl History {
             // The text data (task 155) the same way.
             for (id, value) in restored_text_layers(op) {
                 wire.push(std::borrow::Cow::Owned(LayerOp::SetTextLayer {
+                    id,
+                    value: Some(value),
+                }));
+            }
+            // The editable filters (task 176) the same way.
+            for (id, value) in restored_filters(op) {
+                wire.push(std::borrow::Cow::Owned(LayerOp::SetFilters {
                     id,
                     value: Some(value),
                 }));
@@ -2209,6 +2257,30 @@ impl History {
             value: value.map(Box::new),
         });
         self.push(LayerOp::SetTextLayer { id, value: old });
+        Ok(None)
+    }
+
+    /// Same as [`LayerTree::set_filters`], recorded for undo as one
+    /// `LayerOp::SetFilters` step (task 176). Returns `None` (region
+    /// unknown): a filter reaches beyond the layer's own tiles, so the
+    /// caller repaints the layer and its reach.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LayerTree::set_filters`]. Nothing is recorded when it
+    /// fails.
+    pub fn set_filters(
+        &mut self,
+        tree: &mut LayerTree,
+        id: LayerId,
+        value: Option<aurora_core::LayerFilters>,
+    ) -> Result<Option<Rect>, DocError> {
+        let old = tree.filters(id).cloned();
+        tree.set_filters(id, value)?;
+        // What the tree now holds (an empty list is stored as none).
+        let value = tree.filters(id).cloned();
+        self.journal.push(LayerOp::SetFilters { id, value });
+        self.push(LayerOp::SetFilters { id, value: old });
         Ok(None)
     }
 
@@ -6381,6 +6453,141 @@ mod adjustment_tests {
             Some(25)
         );
         assert_eq!(first(&LayerOp::SetTextLayer { id, value: None }), Some(26));
+    }
+
+    fn blur_filters(radius: f32) -> aurora_core::LayerFilters {
+        aurora_core::LayerFilters {
+            filters: vec![aurora_core::LayerFilter::new(
+                aurora_core::FilterKind::GaussianBlur { radius },
+            )],
+        }
+    }
+
+    /// Task 176: `SetFilters` is appended after `SetTextLayer` (26).
+    #[test]
+    fn set_filters_is_appended_after_set_text_layer() {
+        let id = crate::LayerId::from_raw(1);
+        let first = |op: &LayerOp| {
+            postcard::to_allocvec(op)
+                .ok()
+                .and_then(|b| b.first().copied())
+        };
+        assert_eq!(first(&LayerOp::SetTextLayer { id, value: None }), Some(26));
+        assert_eq!(first(&LayerOp::SetFilters { id, value: None }), Some(27));
+    }
+
+    #[test]
+    fn set_filters_undo_redo_replay_validation_and_pixel_only() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let layer = match history.add_pixel_layer(&mut tree, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let group = match history.add_group(&mut tree, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert!(tree.filters(layer).is_none());
+        if let Err(err) = history.set_filters(&mut tree, layer, Some(blur_filters(4.0))) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.filters(layer), Some(&blur_filters(4.0)));
+        assert_eq!(
+            replayed_through_postcard(&history).filters(layer),
+            Some(&blur_filters(4.0)),
+            "journal replay"
+        );
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert!(tree.filters(layer).is_none());
+        if let Err(err) = history.redo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.filters(layer), Some(&blur_filters(4.0)));
+        let steps = history.journal_len();
+        assert!(matches!(
+            history.set_filters(&mut tree, group, Some(blur_filters(2.0))),
+            Err(DocError::NotAPixelLayer(_))
+        ));
+        assert!(matches!(
+            history.set_filters(&mut tree, layer, Some(blur_filters(f32::NAN))),
+            Err(DocError::InvalidFilters(_))
+        ));
+        assert!(matches!(
+            history.set_filters(&mut tree, layer, Some(blur_filters(500.0))),
+            Err(DocError::InvalidFilters(_))
+        ));
+        assert_eq!(tree.filters(layer), Some(&blur_filters(4.0)));
+        assert_eq!(history.journal_len(), steps, "refusals record nothing");
+        // An empty list is no filters.
+        if let Err(err) =
+            history.set_filters(&mut tree, layer, Some(aurora_core::LayerFilters::default()))
+        {
+            unreachable!("{err:?}");
+        }
+        assert!(tree.filters(layer).is_none());
+    }
+
+    #[test]
+    fn restored_subtree_keeps_filters_through_journal() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let group = match history.add_group(&mut tree, "g", None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let child = match history.add_pixel_layer(&mut tree, "c", bounds(), Some(group)) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = history.set_filters(&mut tree, child, Some(blur_filters(7.0))) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.remove(&mut tree, group) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(tree.filters(child), Some(&blur_filters(7.0)), "in memory");
+        assert_eq!(
+            replayed_through_postcard(&history).filters(child),
+            Some(&blur_filters(7.0)),
+            "through the wire"
+        );
+    }
+
+    #[test]
+    fn a_journal_without_filters_emits_no_filter_op() {
+        let mut tree = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut tree, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let replayed = replayed_through_postcard(&history);
+        assert!(replayed.filters(id).is_none());
+        // A removed-and-restored layer without filters adds no SetFilters.
+        if let Err(err) = history.remove(&mut tree, id) {
+            unreachable!("{err:?}");
+        }
+        if let Err(err) = history.undo(&mut tree) {
+            unreachable!("{err:?}");
+        }
+        let wire: Vec<LayerOp> = history
+            .save_journal()
+            .ok()
+            .and_then(|b| postcard::from_bytes(&b).ok())
+            .unwrap_or_default();
+        assert!(!wire.is_empty());
+        assert!(
+            !wire
+                .iter()
+                .any(|op| matches!(op, LayerOp::SetFilters { .. })),
+            "no filters, no op"
+        );
     }
 
     #[test]

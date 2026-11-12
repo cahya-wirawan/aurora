@@ -1473,3 +1473,80 @@ fn a_stale_clip_from_a_larger_document_is_centred_not_kept_off_the_canvas() {
         "centred on the canvas"
     );
 }
+
+// ---- task 176: layer filters and the clipboard ----
+
+fn blur_filters(radius: f32, visible: bool) -> aurora_core::LayerFilters {
+    aurora_core::LayerFilters {
+        filters: vec![aurora_core::LayerFilter {
+            kind: aurora_core::FilterKind::GaussianBlur { radius },
+            visible,
+        }],
+    }
+}
+
+#[test]
+fn copy_takes_the_stored_pixels_and_merged_copy_takes_the_filtered_ones() {
+    let mut rig = Rig::doc();
+    rig.fill(100, 100, 110, 110, RED);
+    let plain = ok(rig.copy(None)).rect();
+    assert_eq!(plain, rect(100, 100, 10, 10));
+    ok(rig
+        .layers
+        .set_filters(rig.layer, Some(blur_filters(4.0, true))));
+    // Copy and Layer via Copy: still the stored pixels, filters left behind.
+    assert_eq!(ok(rig.copy(None)).rect(), plain);
+    // Copy Merged: what is shown, the blur's spill included.
+    let merged = ok(pixels::extract_merged(
+        &rig.layers,
+        &mut rig.store,
+        CANVAS,
+        None,
+    ));
+    let r = merged.rect();
+    assert!(r.width > 10 && r.height > 10, "{r:?}");
+    assert!(r.x < 100 && r.y < 100);
+}
+
+#[test]
+fn only_shown_filters_make_a_copy_say_they_were_left_behind() {
+    let mut rig = Rig::doc();
+    assert!(!clipboard_app::copy_leaves_filters_behind(
+        &rig.layers,
+        rig.active
+    ));
+    ok(rig
+        .layers
+        .set_filters(rig.layer, Some(blur_filters(4.0, false))));
+    assert!(!clipboard_app::copy_leaves_filters_behind(
+        &rig.layers,
+        rig.active
+    ));
+    ok(rig
+        .layers
+        .set_filters(rig.layer, Some(blur_filters(4.0, true))));
+    assert!(clipboard_app::copy_leaves_filters_behind(
+        &rig.layers,
+        rig.active
+    ));
+    assert!(!clipboard_app::copy_leaves_filters_behind(
+        &rig.layers,
+        None
+    ));
+}
+
+/// Copy, Cut and Layer via Copy/Cut each raise the notice (the App
+/// wrappers need a window, so this pins their source).
+#[test]
+fn every_layer_copy_path_raises_the_filters_notice() {
+    let source = include_str!("clipboard_app.rs").replace("\r\n", "\n");
+    assert_eq!(
+        source
+            .matches("self.clip_notice(FILTERS_NOT_COPIED_NOTICE)")
+            .count(),
+        3,
+        "copy_command, LayerViaCopy and cut_command"
+    );
+    assert!(source.contains("!merged && copy_leaves_filters_behind"));
+    assert!(clipboard_app::FILTERS_NOT_COPIED_NOTICE.contains("filters were not copied"));
+}

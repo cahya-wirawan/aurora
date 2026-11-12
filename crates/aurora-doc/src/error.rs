@@ -39,6 +39,9 @@ pub enum DocError {
     /// Preserved text data failed its bounds (task 155).
     #[error("invalid text layer data: {0}")]
     InvalidTextLayer(crate::text_layer::TextLayerError),
+    /// A layer's filters failed validation (task 176).
+    #[error("invalid layer filters: {0}")]
+    InvalidFilters(aurora_core::FiltersError),
     /// An effect shape failed its bounds (task 151).
     #[error("invalid effect shape: {0}")]
     InvalidEffectShape(crate::effect_shape::EffectShapeError),

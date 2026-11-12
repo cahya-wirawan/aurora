@@ -597,6 +597,9 @@ mod frame_trace;
 #[doc(hidden)]
 pub mod headless;
 mod lasso_tools;
+mod layer_filter_app;
+mod layer_filter_cmd;
+mod layer_filter_psd;
 mod layer_thumbnails;
 pub mod mcp_session;
 mod pen_input;
@@ -6367,6 +6370,12 @@ enum ActivatedCommand {
     /// Select > Colour Range (0.238.0): apply it with the Fuzziness the
     /// prompt accepted.
     ColourRangeApply(u16),
+    /// Gaussian Blur… and Edit Last Layer Filter… (task 176): open the
+    /// radius prompt.
+    FilterPrompt(layer_filter_cmd::PromptKind),
+    /// A layer filter change (task 176): add, edit, hide/show or remove,
+    /// run as [`LayerCommand::Filter`].
+    FilterApply(layer_filter_cmd::FilterEdit),
     /// Save, Load or Delete a saved selection (0.218.0).
     SavedSelection(selection_store::SavedSelectionCommand),
     /// A Paths command (0.233.0).
@@ -6947,6 +6956,12 @@ fn activate_command(
     }
     if let Some(kind) = selection_refine::RefineKind::for_command(id) {
         return Some(ActivatedCommand::RefinePrompt(kind));
+    }
+    if let Some(kind) = layer_filter_cmd::prompt_for_command(id) {
+        return Some(ActivatedCommand::FilterPrompt(kind));
+    }
+    if let Some(edit) = layer_filter_cmd::plain_edit_for_command(id) {
+        return Some(ActivatedCommand::FilterApply(edit));
     }
     if id == colour_app::COMMAND_SET_OUTPUT {
         return file_dialog
@@ -11121,6 +11136,47 @@ fn build_menu() -> muda::Menu {
         Err(err) => unreachable!("freshly built items cannot fail to append: {err:?}"),
     };
 
+    // Task 176: the macOS Filter menu, the editable layer filters.
+    let filter_menu = match muda::Submenu::with_items(
+        "Filter",
+        true,
+        &[
+            &muda::MenuItem::with_id(
+                layer_filter_cmd::COMMAND_GAUSSIAN_BLUR,
+                "Gaussian Blur\u{2026}",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                layer_filter_cmd::COMMAND_EDIT_LAST,
+                "Edit Last Layer Filter\u{2026}",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                layer_filter_cmd::COMMAND_TOGGLE,
+                "Hide or Show Layer Filters",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                layer_filter_cmd::COMMAND_REMOVE_LAST,
+                "Remove Last Layer Filter",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
+                layer_filter_cmd::COMMAND_REMOVE_ALL,
+                "Remove All Layer Filters",
+                true,
+                None,
+            ),
+        ],
+    ) {
+        Ok(submenu) => submenu,
+        Err(err) => unreachable!("freshly built items cannot fail to append: {err:?}"),
+    };
+
     let view_menu = match muda::Submenu::with_items(
         "View",
         true,
@@ -11203,6 +11259,7 @@ fn build_menu() -> muda::Menu {
         &file_menu,
         &edit_menu,
         &layer_menu,
+        &filter_menu,
         &view_menu,
         &window_menu,
     ]) {
@@ -12879,6 +12936,15 @@ fn handle_palette_key(
                 Some(Err(())) => return None,
                 None => {}
             }
+            // Task 176: the layer filter radius prompts.
+            match layer_filter_cmd::prompt_enter(&mut workspace.tree, root) {
+                Some(Ok(edit)) => {
+                    close_command_palette(workspace, focus, palette);
+                    return Some(ActivatedCommand::FilterApply(edit));
+                }
+                Some(Err(())) => return None,
+                None => {}
+            }
             // 0.238.0: the Colour Range Fuzziness prompt.
             match colour_range_app::prompt_enter(&mut workspace.tree, root) {
                 Some(Ok(fuzziness)) => {
@@ -12936,6 +13002,7 @@ fn handle_palette_key(
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
                 selection_store::follow_prompt_query(&mut workspace.tree, root);
                 colour_range_app::follow_prompt_query(&mut workspace.tree, root);
+                layer_filter_cmd::follow_prompt_query(&mut workspace.tree, root);
                 paths_app::follow_prompt_query(&mut workspace.tree, root);
             }
         }
@@ -12967,6 +13034,7 @@ fn handle_palette_key(
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
                 selection_store::follow_prompt_query(&mut workspace.tree, root);
                 colour_range_app::follow_prompt_query(&mut workspace.tree, root);
+                layer_filter_cmd::follow_prompt_query(&mut workspace.tree, root);
                 paths_app::follow_prompt_query(&mut workspace.tree, root);
             }
         }
@@ -12994,6 +13062,7 @@ fn handle_palette_key(
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
                 selection_store::follow_prompt_query(&mut workspace.tree, root);
                 colour_range_app::follow_prompt_query(&mut workspace.tree, root);
+                layer_filter_cmd::follow_prompt_query(&mut workspace.tree, root);
                 paths_app::follow_prompt_query(&mut workspace.tree, root);
             }
         }
@@ -17158,8 +17227,65 @@ fn pixel_layer_texels(
     })
 }
 
-/// [`pixel_layer_texels`]' body, under [`profiled`] (0.183.0).
+/// [`pixel_layer_texels`]' body, under [`profiled`] (0.183.0): the layer's
+/// stored pixels ([`raw_layer_texels`]), through its editable filters when
+/// it has visible ones (task 176, [`layer_filter_app`]), then its mask.
 fn pixel_layer_texels_unprofiled(
+    id: aurora_doc::LayerId,
+    layers: &aurora_doc::LayerTree,
+    store: &mut dyn TileSource,
+    tile_id: aurora_tile::TileId,
+    doc_origin: (i64, i64),
+    reference_origin: (i64, i64),
+    budget: &mut CompositeBudget,
+) -> Option<Vec<half::f16>> {
+    // Filters run before the mask, blend, opacity, Fill and effects: the
+    // filtered pixels are the layer's content from here on.
+    let texels = if layer_filter_app::has_visible_filters(layers, id) {
+        layer_filter_app::filtered_layer_texels(
+            id,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            budget,
+        )?
+    } else {
+        raw_layer_texels(
+            id,
+            layers,
+            store,
+            tile_id,
+            doc_origin,
+            reference_origin,
+            budget,
+        )?
+    };
+    // Masking runs first, ahead of `Dissolve` below: it
+    // restricts which pixels are even in play, and by how much,
+    // before any blend mode acts on what's left. See
+    // `resolve_tile`'s own doc comment for the full ordering
+    // rationale and `apply_mask`'s own doc comment for how
+    // `mask.bounds` and real per-pixel coverage combine.
+    Some(match layers.mask(id) {
+        Some(mask) if mask.enabled => apply_mask(
+            &texels,
+            mask,
+            layers.mask_surface_id(id),
+            store,
+            doc_origin,
+            budget,
+        ),
+        _ => texels,
+    })
+}
+
+/// A pixel layer's stored texels on composite tile `tile_id`, straight
+/// RGBA, with no mask and no filter (task 176, split out of
+/// [`pixel_layer_texels_unprofiled`]). `None` when nothing was ever stored
+/// under the tile or the read failed (charged to `budget`).
+fn raw_layer_texels(
     id: aurora_doc::LayerId,
     layers: &aurora_doc::LayerTree,
     store: &mut dyn TileSource,
@@ -17271,23 +17397,7 @@ fn pixel_layer_texels_unprofiled(
         }
         window.into_texels()
     };
-    // Masking runs first, ahead of `Dissolve` below: it
-    // restricts which pixels are even in play, and by how much,
-    // before any blend mode acts on what's left. See
-    // `resolve_tile`'s own doc comment for the full ordering
-    // rationale and `apply_mask`'s own doc comment for how
-    // `mask.bounds` and real per-pixel coverage combine.
-    Some(match layers.mask(id) {
-        Some(mask) if mask.enabled => apply_mask(
-            &texels,
-            mask,
-            layers.mask_surface_id(id),
-            store,
-            doc_origin,
-            budget,
-        ),
-        _ => texels,
-    })
+    Some(texels)
 }
 
 /// A layer's opacity times its Fill (0.181.0): the factor its own content
@@ -17479,6 +17589,9 @@ struct ShadowCacheKey {
     /// from the layer's valid effect shape (task 151), else `0`.
     shape: u64,
     versions: Vec<(bool, u32, u32, bool, u64)>,
+    /// The layer's visible filters (task 176): effects are drawn from the
+    /// filtered pixels. Empty without any.
+    filters: Vec<(u8, u32)>,
 }
 
 /// The shadow coverage cache (0.182.0 review): least recently used
@@ -17703,12 +17816,16 @@ fn coverage_cache_key(
     );
     let layer_origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
     let mut versions = Vec::new();
+    // Task 176: under a visible filter the effect's source pixels are the
+    // filtered ones, which depend on the stored tiles `filter_reach` further
+    // out; the filters' settings are part of the key.
+    let filter_reach = i64::from(layer_filter_app::filter_reach(layers, id));
     surface_window_versions(
         store,
         surface,
         layer_origin,
-        window,
-        side,
+        (window.0 - filter_reach, window.1 - filter_reach),
+        side + 2 * filter_reach,
         false,
         &mut versions,
     );
@@ -17750,6 +17867,7 @@ fn coverage_cache_key(
         geometry: (offset.0, offset.1, params.0, params.1),
         mask,
         versions,
+        filters: layer_filter_app::filter_signature(layers, id),
     })
 }
 
@@ -17821,7 +17939,12 @@ fn read_shape_window(
     );
     // Task 151: a shape layer's strokes, glows and shadows follow its
     // outline while its pixels are the ones the outline was recorded with.
-    if outline && let Some(shape) = effect_shape_app::valid_effect_shape(id, layers, store) {
+    // Task 176: not under a visible filter, which changes the pixels the
+    // outline was recorded with.
+    if outline
+        && !layer_filter_app::has_visible_filters(layers, id)
+        && let Some(shape) = effect_shape_app::valid_effect_shape(id, layers, store)
+    {
         let origin = layers.bounds(id).map_or((0, 0), |b| (b.x, b.y));
         return effect_shape_app::shape_window(&shape, origin, window, side_usize);
     }
@@ -21902,8 +22025,11 @@ fn document_qualifies_for_gpu_compositing(layers: &aurora_doc::LayerTree) -> boo
         // effects.
         // 0.201.0: a visible clipped layer refuses the GPU, which has no
         // clipping pass (`fold_clip_group`).
+        // Task 176: a visible layer with a visible editable filter refuses
+        // the GPU too; the filter is computed on the CPU only.
         layers.visible(id) != Some(true)
             || (!layer_renders_effects(layers, id)
+                && !layer_filter_app::has_visible_filters(layers, id)
                 && clip_base_of(layers, id).is_none()
                 && (adjustment_layer_qualifies_for_gpu(layers, id)
                     || pixel_layer_mode_qualifies_for_gpu(layers, id)))
@@ -28391,7 +28517,7 @@ fn mark_active_layer_row(
 
 /// One add-or-delete activation, from the command palette, the macOS
 /// `Layer` menu or (`New` only) `Ctrl+Shift+N`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum LayerCommand {
     /// A new, empty pixel layer directly above the active node, which it
     /// replaces as active. See [`new_layer_placement`].
@@ -28419,6 +28545,9 @@ enum LayerCommand {
     /// layer (0.201.0): one journaled `History::set_clipped` step labelled
     /// "Clip Layer"/"Release Clipping Mask"; the layer stays active.
     SetClip(bool),
+    /// A change to the active pixel layer's editable filters (task 176): one
+    /// journaled `History::set_filters` step.
+    Filter(layer_filter_cmd::FilterEdit),
     /// Paste, Layer via Copy and Layer via Cut (0.235.0): a new pixel layer
     /// with `bounds`, placed as [`Self::New`] places one, recorded under
     /// `label`. The caller writes the pixels afterwards.
@@ -28886,6 +29015,7 @@ fn delete_layer(cx: &mut LayerCommandContext<'_>) -> Option<AppliedLayerCommand>
 /// refused delete, which records nothing). The caller relays out, pushes
 /// accessibility and redraws either way, since step 1 or 2 may have
 /// committed something.
+#[allow(clippy::too_many_lines)]
 fn perform_layer_command(cx: &mut LayerCommandContext<'_>, command: LayerCommand) -> bool {
     let canvas_area = canvas_area_logical_size(cx.workspace);
     let _ = end_layer_control_gestures(
@@ -28946,6 +29076,15 @@ fn perform_layer_command(cx: &mut LayerCommandContext<'_>, command: LayerCommand
             label: None,
         }),
         LayerCommand::SetClip(on) => set_clip(cx, on),
+        LayerCommand::Filter(edit) => {
+            let layer = *cx.active_layer;
+            layer_filter_cmd::apply(cx.layers, cx.history, layer, edit).map(|label| {
+                AppliedLayerCommand {
+                    next_active: layer,
+                    label: Some(label),
+                }
+            })
+        }
         LayerCommand::Paste { bounds, label } => paste_layer(cx, bounds, label),
     };
     let Some(AppliedLayerCommand { next_active, label }) = next_active else {
@@ -29064,6 +29203,9 @@ struct LayerSetSnapshot {
     /// Layers clipped to a base (0.201.0): an undone Create Clipping Mask
     /// changes row indentation without changing the layer set.
     clipped: HashSet<aurora_doc::LayerId>,
+    /// Which layers have filters and whether any is shown (task 176): an
+    /// undone Gaussian Blur changes a row's description, not the set.
+    filtered: Vec<(aurora_doc::LayerId, bool)>,
 }
 
 impl LayerSetSnapshot {
@@ -29072,8 +29214,17 @@ impl LayerSetSnapshot {
             ids: layer_ids_in_order(layers).into_iter().collect(),
             active_position: active.and_then(|id| layer_position(layers, id)),
             clipped: clipped_set(layers),
+            filtered: filtered_state(layers),
         }
     }
+}
+
+/// Every layer with filters, with whether any is shown, in panel order.
+fn filtered_state(layers: &aurora_doc::LayerTree) -> Vec<(aurora_doc::LayerId, bool)> {
+    layer_ids_in_order(layers)
+        .into_iter()
+        .filter_map(|id| Some((id, layers.filters(id)?.any_visible())))
+        .collect()
 }
 
 /// Every layer with a clip base, for [`LayerSetSnapshot`].
@@ -29114,6 +29265,7 @@ fn sync_layer_rows_after_undo_redo(
     if after.len() == before.ids.len()
         && after.iter().all(|id| before.ids.contains(id))
         && clipped_set(layers) == before.clipped
+        && filtered_state(layers) == before.filtered
     {
         return false;
     }
@@ -29868,6 +30020,9 @@ struct ToolSettings {
     /// The last Fuzziness Select > Colour Range was run with (0.238.0;
     /// default 40, 0..=200, not persisted).
     colour_range_fuzziness: u16,
+    /// The Gaussian Blur… prompt's starting radius (task 176): the last
+    /// one used this session, not persisted.
+    gaussian_blur_radius: f32,
     /// The Smudge's strength, 1..=100 percent (0.222.0; default 50).
     smudge_strength: u8,
     /// The Blur's strength, 1..=100 percent (0.223.0; default 50).
@@ -29937,6 +30092,7 @@ impl Default for ToolSettings {
             selection_mode: aurora_doc::SelectionMode::Replace,
             refine_amounts: selection_refine::RefineAmounts::default(),
             colour_range_fuzziness: colour_range_app::DEFAULT_FUZZINESS,
+            gaussian_blur_radius: layer_filter_cmd::DEFAULT_RADIUS,
             smudge_strength: DEFAULT_SMUDGE_STRENGTH,
             blur_strength: DEFAULT_SMUDGE_STRENGTH,
             sharpen_strength: DEFAULT_SMUDGE_STRENGTH,
@@ -30146,6 +30302,14 @@ enum LockRefusal {
     ColourRangeNeedsPixelLayer,
     /// Colour Range found no pixel near the foreground colour (0.238.0).
     ColourRangeNothing,
+    /// A layer filter command with no pixel layer to filter (task 176).
+    FilterNeedsPixelLayer,
+    /// Edit, Hide/Show or Remove a layer filter on a layer that has none
+    /// (task 176).
+    FilterNothing,
+    /// The layer's filters together would reach farther than one tile
+    /// (task 176).
+    FilterTooLarge,
     /// Select > Modify with nothing selected (0.216.0).
     RefineNeedsSelection,
     /// A Select > Modify result is over the mask cap or the work budget
@@ -30264,6 +30428,13 @@ impl LockRefusal {
             }
             LockRefusal::SelectionTooLarge => {
                 "That selection is too large to build in one step (over 64 megapixels). Use a smaller region; for the Magic Wand, raise the tolerance less or turn Contiguous on."
+            }
+            LockRefusal::FilterNeedsPixelLayer => {
+                "Select a pixel layer to filter. A group, an adjustment layer or no layer can't have layer filters."
+            }
+            LockRefusal::FilterNothing => "This layer has no filters to change.",
+            LockRefusal::FilterTooLarge => {
+                "These filters would reach too far. A layer's shown filters together can blur at most about 85 pixels; lower a radius, or hide or remove a filter."
             }
             LockRefusal::RefineNeedsSelection => {
                 "Make a selection first. Select > Modify changes the selection you have."
@@ -30482,6 +30653,9 @@ fn lock_refusal_applies(
             refusal,
             LockRefusal::RefineNeedsSelection
                 | LockRefusal::RefineTooLarge
+                | LockRefusal::FilterNeedsPixelLayer
+                | LockRefusal::FilterNothing
+                | LockRefusal::FilterTooLarge
                 | LockRefusal::AdjustNeedsPhotoFilter
         )
         || matches!(
@@ -32720,6 +32894,13 @@ impl App {
             Some(ActivatedCommand::Clipboard(command)) => self.run_clipboard_command(command),
             Some(ActivatedCommand::RefinePrompt(kind)) => self.open_refine_prompt(kind),
             Some(ActivatedCommand::RefineApply(kind, amount)) => self.run_refine(kind, amount),
+            Some(ActivatedCommand::FilterPrompt(kind)) => self.open_filter_prompt(kind),
+            Some(ActivatedCommand::FilterApply(edit)) => {
+                if let layer_filter_cmd::FilterEdit::AddGaussianBlur(radius) = edit {
+                    self.tool_settings.gaussian_blur_radius = radius;
+                }
+                self.run_layer_command(LayerCommand::Filter(edit));
+            }
             Some(ActivatedCommand::ColourRangePrompt) => self.open_colour_range_prompt(),
             Some(ActivatedCommand::ColourRangeApply(fuzziness)) => {
                 self.run_colour_range(fuzziness);
@@ -33046,6 +33227,17 @@ impl App {
             && let Some(why) = delete_refusal(self.doc.layers.lock(layer).unwrap_or_default())
         {
             self.lock_notice = Some((why, Some(layer)));
+        }
+        if let LayerCommand::Filter(edit) = command {
+            match layer_filter_cmd::plan(&self.doc.layers, self.doc.active_layer, edit) {
+                Ok(Some(_)) => {}
+                Ok(None) => return false,
+                Err(why) => {
+                    self.lock_notice = Some((why, self.doc.active_layer));
+                    self.sync_status_bar_now();
+                    return false;
+                }
+            }
         }
         if command == LayerCommand::SetClip(true)
             && let Some(layer) = self.doc.active_layer
@@ -38002,6 +38194,56 @@ impl App {
     fn note_selection_too_large(&mut self) {
         self.lock_notice = Some((LockRefusal::SelectionTooLarge, self.doc.active_layer));
         self.sync_status_bar_now();
+    }
+
+    /// Gaussian Blur… and Edit Last Layer Filter… (task 176): opens the
+    /// radius prompt, or says why there is nothing to filter.
+    fn open_filter_prompt(&mut self, kind: layer_filter_cmd::PromptKind) {
+        let probe = layer_filter_cmd::FilterEdit::AddGaussianBlur(layer_filter_cmd::DEFAULT_RADIUS);
+        let start = match kind {
+            layer_filter_cmd::PromptKind::Add => {
+                if let Err(why) =
+                    layer_filter_cmd::plan(&self.doc.layers, self.doc.active_layer, probe)
+                {
+                    self.lock_notice = Some((why, self.doc.active_layer));
+                    self.sync_status_bar_now();
+                    return;
+                }
+                self.tool_settings.gaussian_blur_radius
+            }
+            layer_filter_cmd::PromptKind::EditLast => {
+                let last = self
+                    .doc
+                    .active_layer
+                    .and_then(|id| layer_filter_cmd::last_radius(&self.doc.layers, id));
+                let Some(last) = last else {
+                    let why = if self.doc.active_layer.is_some_and(|id| {
+                        matches!(
+                            self.doc.layers.kind(id),
+                            Some(aurora_doc::LayerKind::Pixel { .. })
+                        )
+                    }) {
+                        LockRefusal::FilterNothing
+                    } else {
+                        LockRefusal::FilterNeedsPixelLayer
+                    };
+                    self.lock_notice = Some((why, self.doc.active_layer));
+                    self.sync_status_bar_now();
+                    return;
+                };
+                last
+            }
+        };
+        if layer_filter_cmd::open_prompt(
+            &mut self.workspace,
+            &mut self.focus,
+            &mut self.command_palette,
+            kind,
+            start,
+        ) {
+            self.push_accessibility();
+            self.needs_redraw = true;
+        }
     }
 
     /// Select > Modify (0.216.0): opens the number prompt of `kind`, or
@@ -48359,8 +48601,10 @@ mod tests {
         // Balance Layer", and (0.244.0) "New Invert Layer", "New Threshold
         // Layer", "New Posterize Layer" and "New Brightness/Contrast Layer",
         // and (0.245.0) "New Channel Mixer Layer" and "New Selective Color
-        // Layer", and (0.248.0) "New Gradient Map Layer".
-        assert_eq!(state.results().len(), 28);
+        // Layer", and (0.248.0) "New Gradient Map Layer", and (task 176)
+        // "Edit Last Layer Filter", "Hide or Show Layer Filters", "Remove
+        // Last Layer Filter" and "Remove All Layer Filters".
+        assert_eq!(state.results().len(), 32);
         assert_eq!(
             state.selected().map(|entry| entry.id.as_str()),
             Some(COMMAND_FOCUS_LAYERS)
@@ -93741,6 +93985,7 @@ mod tests {
                 mask: None,
                 shape: 0,
                 versions: Vec::new(),
+                filters: Vec::new(),
             };
             // RC-2: a pass that needs more than the cap, twice in order.
             for pass in 0..2 {
@@ -95240,6 +95485,7 @@ mod tests {
         }
 
         include!("outer_glow_tests.rs");
+        include!("layer_filter_tests.rs");
         include!("clip_corpus_tests.rs");
         include!("psd_audit_tests.rs");
         include!("psd_roundtrip_tests.rs");

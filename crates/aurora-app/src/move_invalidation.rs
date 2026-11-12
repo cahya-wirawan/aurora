@@ -82,37 +82,47 @@ const MAX_WINDOW_TILES: i64 = 64;
 /// `(offset, apron)` of every effect of `layer` that is drawn and reaches
 /// beyond its source pixel: a drop shadow's own, a stroke's apron with no
 /// offset (0.190.0), a Softer outer glow's apron (0.191.0). Empty for a
-/// layer that draws no effect ([`crate::layer_renders_effects`]).
+/// layer that draws no effect ([`crate::layer_renders_effects`]) and has no
+/// visible filter. A visible editable filter (task 176) adds `((0, 0),
+/// reach)` and widens every effect's apron by its reach.
 pub(crate) fn effect_reaches(
     layers: &aurora_doc::LayerTree,
     layer: aurora_doc::LayerId,
 ) -> Vec<((i64, i64), u32)> {
+    // Task 176: a visible filter spreads the layer's pixels by its reach,
+    // and every drawn effect is computed from the filtered pixels, so it
+    // reaches that much further still.
+    let filter = crate::layer_filter_app::filter_reach(layers, layer);
+    let mut reaches: Vec<((i64, i64), u32)> = Vec::new();
+    if filter > 0 {
+        reaches.push(((0, 0), filter));
+    }
     let Some(fx) = layers.effects(layer) else {
-        return Vec::new();
+        return reaches;
     };
     if !crate::layer_renders_effects(layers, layer) {
-        return Vec::new();
+        return reaches;
     }
-    let mut reaches: Vec<((i64, i64), u32)> = fx
-        .drop_shadows
-        .iter()
-        .filter(|s| fx.shows(s.gate))
-        .map(|shadow| {
-            let g = shadow.geometry();
-            (g.offset, g.apron)
-        })
-        .collect();
+    reaches.extend(
+        fx.drop_shadows
+            .iter()
+            .filter(|s| fx.shows(s.gate))
+            .map(|shadow| {
+                let g = shadow.geometry();
+                (g.offset, g.apron.saturating_add(filter))
+            }),
+    );
     reaches.extend(
         fx.strokes
             .iter()
             .filter(|s| fx.shows(s.gate) && crate::stroke_paintable(s, layers))
-            .map(|stroke| ((0, 0), stroke.geometry().apron)),
+            .map(|stroke| ((0, 0), stroke.geometry().apron.saturating_add(filter))),
     );
     reaches.extend(
         fx.outer_glows
             .iter()
             .filter(|g| fx.shows(g.gate) && !g.precise)
-            .map(|glow| ((0, 0), glow.geometry().apron)),
+            .map(|glow| ((0, 0), glow.geometry().apron.saturating_add(filter))),
     );
     reaches
 }
