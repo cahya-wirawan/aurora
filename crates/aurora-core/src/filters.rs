@@ -29,7 +29,8 @@ pub const MAX_GAUSSIAN_RADIUS: f32 = 85.0;
 /// The smallest Gaussian blur radius, in pixels (Photoshop's is 0.1).
 pub const MIN_GAUSSIAN_RADIUS: f32 = 0.1;
 
-/// The most pixels all of one layer's visible filters may reach together.
+/// The most pixels all of one layer's shown filters may reach together
+/// (hidden filters are not counted; showing one is checked again).
 /// One tile's side: the window drawn for a tile is then at most 3 x 3
 /// tiles, however the filters are chained.
 pub const MAX_FILTER_REACH: u32 = 256;
@@ -52,7 +53,7 @@ pub enum FiltersError {
     )]
     RadiusOutOfRange,
     #[error(
-        "the layer's filters together reach {reach} pixels; at most {MAX_FILTER_REACH} are allowed"
+        "the layer's shown filters together reach {reach} pixels; at most {MAX_FILTER_REACH} are allowed"
     )]
     ReachTooLarge { reach: u32 },
 }
@@ -136,7 +137,7 @@ pub struct LayerFilters {
 }
 
 impl LayerFilters {
-    /// Checks the count, every setting and the total reach of the visible
+    /// Checks the count, every setting and the total reach of the shown
     /// filters.
     ///
     /// # Errors
@@ -151,13 +152,10 @@ impl LayerFilters {
         for filter in &self.filters {
             filter.kind.validate()?;
         }
-        // Hidden filters count too, so showing one can never break the
-        // bound.
-        let reach = self
-            .filters
-            .iter()
-            .map(|f| f.kind.reach())
-            .fold(0u32, u32::saturating_add);
+        // Only the shown filters are drawn, and every draw, cache key and
+        // invalidation reads the shown reach, so only it is bounded.
+        // Showing a hidden filter is validated again at that moment.
+        let reach = self.visible_reach();
         if reach > MAX_FILTER_REACH {
             return Err(FiltersError::ReachTooLarge { reach });
         }
@@ -362,28 +360,38 @@ mod tests {
     }
 
     #[test]
-    fn reach_counts_visible_only_but_validation_counts_all() {
+    fn only_the_shown_filters_count_toward_the_reach_cap() {
         let mut f = LayerFilters {
             filters: vec![
                 LayerFilter::new(FilterKind::GaussianBlur { radius: 50.0 }),
                 LayerFilter::new(FilterKind::GaussianBlur { radius: 50.0 }),
             ],
         };
-        assert!(f.validate().is_err());
-        let one = LayerFilters {
-            filters: vec![LayerFilter::new(FilterKind::GaussianBlur { radius: 50.0 })],
-        };
-        assert!(one.validate().is_ok());
+        assert!(f.validate().is_err(), "both shown reach too far");
         if let Some(f1) = f.filters.get_mut(1) {
             f1.visible = false;
         }
+        // One shown, one hidden: allowed, and the hidden one is not drawn.
+        assert!(f.validate().is_ok());
+        let one = LayerFilters {
+            filters: vec![LayerFilter::new(FilterKind::GaussianBlur { radius: 50.0 })],
+        };
         assert_eq!(f.visible_reach(), one.visible_reach());
         assert!(f.any_visible());
-        if let Some(f0) = f.filters.get_mut(0) {
-            f0.visible = false;
+        // Showing the hidden one again is refused by the same check.
+        if let Some(f1) = f.filters.get_mut(1) {
+            f1.visible = true;
+        }
+        assert!(matches!(
+            f.validate(),
+            Err(FiltersError::ReachTooLarge { .. })
+        ));
+        for filter in &mut f.filters {
+            filter.visible = false;
         }
         assert!(!f.any_visible());
         assert_eq!(f.visible_reach(), 0);
+        assert!(f.validate().is_ok());
     }
 
     #[test]

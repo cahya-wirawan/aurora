@@ -1658,3 +1658,56 @@ fn a_tile_never_composited_goes_to_the_worker_and_an_edited_one_is_composited_at
     assert!(cache.is_current(first), "an edited tile left to the worker");
     assert!(!worker.is_busy());
 }
+
+/// Task 176: a dab on a heavily blurred layer reaches more than
+/// `SYNC_TILE_LIMIT` composite tiles, so its recomposite goes to the
+/// background worker on the CPU path, while the same dab without a filter
+/// stays within the synchronous limit.
+#[test]
+fn a_dab_on_a_heavily_blurred_layer_is_recomposited_by_the_worker() {
+    let (_d, mut store) = store_with_budget(256);
+    let (mut layers, size) = nyepi_shaped(&mut store);
+    let painted = layer(
+        &mut layers,
+        &mut store,
+        None,
+        rect(0, 0, 700, 600),
+        &|x, y| {
+            if (x - 100).abs() < 20 && (y - 100).abs() < 20 {
+                opaque(y, x)
+            } else {
+                [0.0; 4]
+            }
+        },
+    );
+    let tiles = grid(size);
+    let own = aurora_tile::TileId { x: 0, y: 0 };
+    let mut worker = CompositeWorker::new(noop_waker());
+    let mut cache = CompositeCache::default();
+    settle(&mut worker, &layers, &mut store, &mut cache, &tiles);
+    for filtered in [false, true] {
+        if filtered {
+            ok(layers.set_filters(
+                painted,
+                Some(aurora_core::LayerFilters {
+                    filters: vec![aurora_core::LayerFilter::new(
+                        aurora_core::FilterKind::GaussianBlur { radius: 85.0 },
+                    )],
+                }),
+            ));
+            // The filter edit itself is structural: everything is stale.
+            cache.bump();
+            settle(&mut worker, &layers, &mut store, &mut cache, &tiles);
+        }
+        invalidate_painted_tiles(&mut cache, &layers, painted, &[own], (0, 0));
+        let stale = tiles.iter().filter(|&&t| !cache.is_current(t)).count();
+        if filtered {
+            assert!(stale > SYNC_TILE_LIMIT, "{stale} stale tiles");
+        } else {
+            assert!(stale <= SYNC_TILE_LIMIT, "{stale} stale tiles");
+        }
+        dispatch_or_composite_tiles(&tiles, &layers, None, &mut store, &mut cache, &mut worker);
+        assert_eq!(worker.is_busy(), filtered, "filtered {filtered}");
+        settle(&mut worker, &layers, &mut store, &mut cache, &tiles);
+    }
+}

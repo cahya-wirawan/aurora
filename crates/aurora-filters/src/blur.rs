@@ -418,7 +418,7 @@ mod tests {
     #[test]
     #[ignore = "timing only"]
     fn time_a_tile_blur() {
-        for sigma in [2.0_f32, 4.0, 5.0, 10.0, 40.0, 85.0] {
+        for sigma in [2.0_f32, 4.0, 5.0, 10.0, 20.0, 40.0, 85.0] {
             let Some(spec) = GaussianSpec::new(sigma) else {
                 unreachable!("spec");
             };

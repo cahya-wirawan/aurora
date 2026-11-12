@@ -28,6 +28,13 @@ fn ok<T, E: std::fmt::Debug>(r: Result<T, E>) -> T {
     }
 }
 
+fn ok_opt<T>(v: Option<T>) -> T {
+    match v {
+        Some(v) => v,
+        None => unreachable!("expected Some"),
+    }
+}
+
 fn rect(x: i64, y: i64, width: u32, height: u32) -> Rect {
     Rect {
         x,
@@ -2211,4 +2218,71 @@ fn a_filtered_layer_is_saved_as_its_filtered_pixels_and_the_save_asks() {
     assert!(before.get(3).is_some_and(|v| v.to_f32() > 0.99));
     let corner = alpha_of(top_pixels.image.samples(), 0, 0, w);
     assert!(corner < 0.9, "corner alpha {corner}");
+}
+
+fn filtered_top(radius: f32) -> (Doc, aurora_doc::LayerId) {
+    let mut doc = Doc::new();
+    let top = doc.tree.roots().first().copied();
+    let Some(top) = top else { unreachable!() };
+    ok(doc.tree.set_filters(top, Some(blur_filters(radius))));
+    (doc, top)
+}
+
+#[test]
+fn the_blur_spill_left_and_above_the_origin_is_saved_and_nothing_is_reported_cut() {
+    let (mut doc, _top) = filtered_top(2.0);
+    let path = doc.path("spill.psd");
+    let PsdSaveStep::NeedsConfirmation(pending) = ok(doc.save(&path)) else {
+        unreachable!("filters make the save ask")
+    };
+    assert!(
+        !pending
+            .report
+            .entries
+            .iter()
+            .any(|e| e.text.contains("spreads past")),
+        "{:?}",
+        pending.report.entries
+    );
+    let _ = ok(finish_psd_save(pending, doc.id, doc.revision));
+    let back = ok(aurora_io::read_psd(&ok(std::fs::read(&path))));
+    let Some(top_back) = back.layers.roots().first().copied() else {
+        unreachable!("layer")
+    };
+    let bounds = ok_opt(back.layers.bounds(top_back));
+    assert!(bounds.x < 0 && bounds.y < 0, "{bounds:?}");
+    let Some(pixels) = back.pixels.last() else {
+        unreachable!("pixels")
+    };
+    let w = pixels.image.width() as usize;
+    // Doc (-1, 4): one pixel left of the layer, inside the blur's reach.
+    let lx = usize::try_from(-1 - bounds.x).unwrap_or(0);
+    let ly = usize::try_from(4 - bounds.y).unwrap_or(0);
+    let alpha = pixels
+        .image
+        .samples()
+        .get((ly * w + lx) * 4 + 3)
+        .map_or(0.0, |v| v.to_f32());
+    assert!(alpha > 0.01, "spill alpha {alpha}");
+}
+
+#[test]
+fn spill_that_cannot_be_saved_is_reported_for_that_layer_only() {
+    let (mut doc, top) = filtered_top(2.0);
+    // At the far edge of the document range the rectangle cannot grow.
+    ok(doc
+        .tree
+        .set_bounds(top, rect(-aurora_core::MAX_DOCUMENT_ORIGIN, 0, 8, 8)));
+    let report = ok(crate::psd_save::check_psd_compatibility(source_of(
+        &mut doc,
+        Vec::new(),
+    )));
+    let line = report
+        .entries
+        .iter()
+        .find(|e| e.text.contains("spreads past"));
+    assert_eq!(
+        line.map(|e| (e.category, e.affected.clone())),
+        Some((aurora_io::ReportCategory::NotSaved, vec!["Top".to_owned()]))
+    );
 }

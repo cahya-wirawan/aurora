@@ -30434,7 +30434,7 @@ impl LockRefusal {
             }
             LockRefusal::FilterNothing => "This layer has no filters to change.",
             LockRefusal::FilterTooLarge => {
-                "These filters would reach too far. A layer's filters together can blur at most about 85 pixels; lower a radius or remove a filter."
+                "These filters would reach too far. A layer's shown filters together can blur at most about 85 pixels; lower a radius, or hide or remove a filter."
             }
             LockRefusal::RefineNeedsSelection => {
                 "Make a selection first. Select > Modify changes the selection you have."

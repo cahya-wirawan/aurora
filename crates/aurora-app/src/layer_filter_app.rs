@@ -28,6 +28,15 @@
 //! not in it, so those edits hit. The cache holds at most
 //! [`crate::small_machine::shadow_cache_bytes`] worth of tiles (half-float
 //! RGBA, 512 KiB each), least recently used out first.
+//!
+//! **Limits to know.** The filter is exact for any chain within its reach
+//! cap, but the layer effects drawn from the filtered pixels are bounded
+//! separately: a shadow, stroke or glow reads its source through a window
+//! of at most `MAX_SHADOW_APRON` pixels (25 composite cells), and that
+//! window now has to cover the effect's own apron *plus* the filter's
+//! reach. Where the sum goes past the bound the effect's source window is
+//! clipped, so a far edge of a very large shadow or glow of a heavily
+//! blurred layer can be cut short. Nothing is reported for it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
