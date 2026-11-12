@@ -11160,6 +11160,12 @@ fn build_menu() -> muda::Menu {
                 None,
             ),
             &muda::MenuItem::with_id(
+                layer_filter_cmd::COMMAND_DUST_SCRATCHES,
+                "Dust & Scratches\u{2026}",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
                 layer_filter_cmd::COMMAND_EDIT_LAST,
                 "Edit Last Layer Filter\u{2026}",
                 true,
@@ -30041,6 +30047,9 @@ struct ToolSettings {
     /// The Reduce Noise… prompt's starting values (task 178): the last
     /// ones used this session, not persisted.
     noise_settings: layer_filter_cmd::NoiseSettings,
+    /// The Dust & Scratches… prompt's starting values (task 179), not
+    /// persisted.
+    dust_settings: layer_filter_cmd::DustSettings,
     /// The Smudge's strength, 1..=100 percent (0.222.0; default 50).
     smudge_strength: u8,
     /// The Blur's strength, 1..=100 percent (0.223.0; default 50).
@@ -30113,6 +30122,7 @@ impl Default for ToolSettings {
             gaussian_blur_radius: layer_filter_cmd::DEFAULT_RADIUS,
             unsharp_settings: layer_filter_cmd::DEFAULT_UNSHARP,
             noise_settings: layer_filter_cmd::DEFAULT_NOISE,
+            dust_settings: layer_filter_cmd::DEFAULT_DUST,
             smudge_strength: DEFAULT_SMUDGE_STRENGTH,
             blur_strength: DEFAULT_SMUDGE_STRENGTH,
             sharpen_strength: DEFAULT_SMUDGE_STRENGTH,
@@ -32927,6 +32937,10 @@ impl App {
                     layer_filter_cmd::FilterEdit::AddReduceNoise(settings)
                     | layer_filter_cmd::FilterEdit::EditLastNoise(settings) => {
                         self.tool_settings.noise_settings = settings;
+                    }
+                    layer_filter_cmd::FilterEdit::AddDustScratches(settings)
+                    | layer_filter_cmd::FilterEdit::EditLastDust(settings) => {
+                        self.tool_settings.dust_settings = settings;
                     }
                     _ => {}
                 }
@@ -38233,7 +38247,10 @@ impl App {
         use layer_filter_cmd::PromptKind;
         let probe = layer_filter_cmd::FilterEdit::AddGaussianBlur(layer_filter_cmd::DEFAULT_RADIUS);
         let (kind, start) = match kind {
-            PromptKind::Add | PromptKind::AddUnsharp | PromptKind::AddNoise => {
+            PromptKind::Add
+            | PromptKind::AddUnsharp
+            | PromptKind::AddNoise
+            | PromptKind::AddDust => {
                 if let Err(why) =
                     layer_filter_cmd::plan(&self.doc.layers, self.doc.active_layer, probe)
                 {
@@ -38246,13 +38263,18 @@ impl App {
                         selection_refine::amount_text(self.tool_settings.gaussian_blur_radius)
                     }
                     PromptKind::AddNoise => self.tool_settings.noise_settings.text(),
+                    PromptKind::AddDust => self.tool_settings.dust_settings.text(),
                     _ => self.tool_settings.unsharp_settings.text(),
                 };
                 (kind, start)
             }
-            PromptKind::EditLast | PromptKind::EditLastUnsharp | PromptKind::EditLastNoise => {
+            PromptKind::EditLast
+            | PromptKind::EditLastUnsharp
+            | PromptKind::EditLastNoise
+            | PromptKind::EditLastDust => {
                 let layer = self.doc.active_layer;
                 let noise = layer.and_then(|id| layer_filter_cmd::last_noise(&self.doc.layers, id));
+                let dust = layer.and_then(|id| layer_filter_cmd::last_dust(&self.doc.layers, id));
                 let unsharp =
                     layer.and_then(|id| layer_filter_cmd::last_unsharp(&self.doc.layers, id));
                 let last = layer.and_then(|id| layer_filter_cmd::last_radius(&self.doc.layers, id));
@@ -38260,6 +38282,10 @@ impl App {
                     _ if noise.is_some() => (
                         PromptKind::EditLastNoise,
                         noise.map_or_else(String::new, layer_filter_cmd::NoiseSettings::text),
+                    ),
+                    _ if dust.is_some() => (
+                        PromptKind::EditLastDust,
+                        dust.map_or_else(String::new, layer_filter_cmd::DustSettings::text),
                     ),
                     (Some(settings), _) => (PromptKind::EditLastUnsharp, settings.text()),
                     (None, Some(radius)) => {

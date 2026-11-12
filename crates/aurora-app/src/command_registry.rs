@@ -149,6 +149,13 @@ fn typed_form(call: &Validated) -> Option<Result<ActivatedCommand, TypedError>> 
                 },
             ))
         }
+        crate::layer_filter_cmd::COMMAND_DUST_SCRATCHES => {
+            let radius = u32::try_from(call.int("radius")?).ok()?;
+            let threshold = u8::try_from(call.int("threshold")?).ok()?;
+            ActivatedCommand::FilterApply(crate::layer_filter_cmd::FilterEdit::AddDustScratches(
+                crate::layer_filter_cmd::DustSettings { radius, threshold },
+            ))
+        }
         crate::layer_filter_cmd::COMMAND_EDIT_LAST => {
             #[allow(clippy::cast_possible_truncation)] // validated to 0.1..=85
             let radius = call.number("radius")? as f32;

@@ -57,11 +57,12 @@ pub use exposure_trc::{
     ExposureTrcParams, GREY_TRC_MAX_ENTRIES, GREY_TRC_MIN_ENTRIES, GreyTrc, GreyTrcError,
 };
 pub use filters::{
-    FilterKind, FiltersError, GaussianSpec, LayerFilter, LayerFilters, MAX_FILTER_REACH,
-    MAX_GAUSSIAN_RADIUS, MAX_LAYER_FILTERS, MAX_NOISE_PERCENT, MAX_NOISE_STRENGTH,
-    MAX_UNSHARP_AMOUNT, MIN_GAUSSIAN_RADIUS, MIN_UNSHARP_AMOUNT, REDUCE_NOISE_MAX_CHROMA_SIGMA,
-    REDUCE_NOISE_MAX_RADIUS, REDUCE_NOISE_SHARPEN_SIGMA, reduce_noise_chroma_spec,
-    reduce_noise_radius, reduce_noise_sharpen_spec,
+    FilterKind, FiltersError, GaussianSpec, LayerFilter, LayerFilters, MAX_DUST_RADIUS,
+    MAX_FILTER_REACH, MAX_GAUSSIAN_RADIUS, MAX_LAYER_FILTERS, MAX_NOISE_PERCENT,
+    MAX_NOISE_STRENGTH, MAX_UNSHARP_AMOUNT, MIN_DUST_RADIUS, MIN_GAUSSIAN_RADIUS,
+    MIN_UNSHARP_AMOUNT, REDUCE_NOISE_MAX_CHROMA_SIGMA, REDUCE_NOISE_MAX_RADIUS,
+    REDUCE_NOISE_SHARPEN_SIGMA, reduce_noise_chroma_spec, reduce_noise_radius,
+    reduce_noise_sharpen_spec,
 };
 pub use geometry::{MAX_DOCUMENT_EXTENT, MAX_DOCUMENT_ORIGIN, Rect, Size};
 pub use gradient_fill::{

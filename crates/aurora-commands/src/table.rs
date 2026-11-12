@@ -160,6 +160,18 @@ const REDUCE_NOISE_PARAMS: &[ParamSpec] = &[
         },
     ),
 ];
+const DUST_SCRATCHES_PARAMS: &[ParamSpec] = &[
+    ParamSpec::required(
+        "radius",
+        "The median's radius in whole pixels, 1 to 10.",
+        ParamKind::Int { min: 1, max: 10 },
+    ),
+    ParamSpec::required(
+        "threshold",
+        "The difference from the median, in 8-bit levels (0 to 255), a value must exceed to be replaced; 0 replaces every difference.",
+        ParamKind::Int { min: 0, max: 255 },
+    ),
+];
 const EDIT_FILTER_PARAMS: &[ParamSpec] = &[ParamSpec::required(
     "radius",
     "The new blur radius in pixels, 0.1 to 85 (fractions allowed).",
@@ -551,11 +563,24 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
     )
     .params(REDUCE_NOISE_PARAMS),
     CommandSpec::new(
+        "layer.filter.dust_scratches",
+        "Dust & Scratches\u{2026}",
+        "Adds an editable Dust & Scratches to the active pixel layer: a median filter over a disc \
+         of the given radius that replaces a colour channel only where it differs from the \
+         median by more than the threshold, which removes specks and thin scratches while \
+         keeping large edges; alpha is never changed. It is computed when the layer is drawn, \
+         not baked into its pixels (one undo step).",
+        Layer,
+        Write,
+    )
+    .params(DUST_SCRATCHES_PARAMS),
+    CommandSpec::new(
         "layer.filter.edit_last",
         "Edit Last Layer Filter\u{2026}",
         "Changes the radius of the active layer's last (topmost) filter, a Gaussian Blur or an \
-         Unsharp Mask; a Reduce Noise has no radius and is edited through the Reduce Noise prompt \
-         (one undo step).",
+         Unsharp Mask; a Reduce Noise has no radius and is edited through the Reduce Noise prompt; a Dust & \
+         Scratches takes a whole number of pixels from 1 to 10 (its threshold is edited through \
+         its prompt) (one undo step).",
         Layer,
         Write,
     )

@@ -53,6 +53,15 @@ pub const REDUCE_NOISE_SHARPEN_SIGMA: f32 = 1.0;
 /// The largest half-width, in pixels, of Reduce Noise's bilateral window.
 pub const REDUCE_NOISE_MAX_RADIUS: u32 = 5;
 
+/// The largest Dust & Scratches radius, in pixels (Photoshop's is 100; a
+/// median over a disc costs about `pi r^2` samples a pixel: one 256 px tile
+/// measures 11 ms at radius 1, 110 at 5 and 340 at 10 (dev profile), so Aurora
+/// stops where one tile still draws in a fraction of a second).
+pub const MAX_DUST_RADIUS: u32 = 10;
+
+/// The smallest Dust & Scratches radius, in pixels (Photoshop's is 1).
+pub const MIN_DUST_RADIUS: u32 = 1;
+
 /// The most pixels all of one layer's shown filters may reach together
 /// (hidden filters are not counted; showing one is checked again).
 /// One tile's side: the window drawn for a tile is then at most 3 x 3
@@ -86,6 +95,10 @@ pub enum FiltersError {
         "Reduce Noise Preserve Details, Reduce Color Noise and Sharpen Details are not numbers from 0 to {MAX_NOISE_PERCENT} percent"
     )]
     NoisePercentOutOfRange,
+    #[error(
+        "Dust & Scratches radius is not a whole number from {MIN_DUST_RADIUS} to {MAX_DUST_RADIUS} pixels"
+    )]
+    DustRadiusOutOfRange,
     #[error(
         "the layer's shown filters together reach {reach} pixels; at most {MAX_FILTER_REACH} are allowed"
     )]
@@ -124,6 +137,12 @@ pub enum FilterKind {
         color_noise: f32,
         sharpen_details: f32,
     },
+    /// Dust & Scratches (task 179), appended after Reduce Noise: a median
+    /// filter over the disc of `radius` pixels (1..=10) that replaces a
+    /// channel only where it differs from the median by more than
+    /// `threshold` 8-bit levels (0..=255; 0 replaces every difference).
+    /// See `aurora_filters::dust_scratches`.
+    DustAndScratches { radius: u32, threshold: u8 },
 }
 
 /// The half-width of Reduce Noise's bilateral window for `strength`:
@@ -171,6 +190,7 @@ impl FilterKind {
             Self::GaussianBlur { .. } => "Gaussian Blur",
             Self::UnsharpMask { .. } => "Unsharp Mask",
             Self::ReduceNoise { .. } => "Reduce Noise",
+            Self::DustAndScratches { .. } => "Dust & Scratches",
         }
     }
 
@@ -223,6 +243,13 @@ impl FilterKind {
                     Err(FiltersError::NoisePercentOutOfRange)
                 }
             }
+            Self::DustAndScratches { radius, .. } => {
+                if (MIN_DUST_RADIUS..=MAX_DUST_RADIUS).contains(radius) {
+                    Ok(())
+                } else {
+                    Err(FiltersError::DustRadiusOutOfRange)
+                }
+            }
         }
     }
 
@@ -249,6 +276,15 @@ impl FilterKind {
                 .saturating_add(
                     reduce_noise_sharpen_spec(*sharpen_details).map_or(0, |s| s.reach()),
                 ),
+            // The disc of `radius` pixels fits in the square of that
+            // half-width.
+            Self::DustAndScratches { radius, .. } => {
+                if (MIN_DUST_RADIUS..=MAX_DUST_RADIUS).contains(radius) {
+                    *radius
+                } else {
+                    0
+                }
+            }
         }
     }
 }
@@ -720,6 +756,78 @@ mod tests {
             postcard::from_bytes::<LayerFilter>(&bytes).ok(),
             Some(reduce)
         );
+    }
+
+    #[test]
+    fn dust_and_scratches_validates_names_and_reaches_its_radius() {
+        let dust = |radius| FilterKind::DustAndScratches {
+            radius,
+            threshold: 0,
+        };
+        assert_eq!(dust(1).validate(), Ok(()));
+        assert_eq!(dust(MAX_DUST_RADIUS).validate(), Ok(()));
+        for bad in [0, MAX_DUST_RADIUS + 1, u32::MAX] {
+            assert_eq!(
+                dust(bad).validate(),
+                Err(FiltersError::DustRadiusOutOfRange)
+            );
+            assert_eq!(dust(bad).reach(), 0);
+        }
+        assert_eq!(dust(1).name(), "Dust & Scratches");
+        assert_eq!(dust(7).reach(), 7);
+        // It shares the cap with the other kinds.
+        let list = LayerFilters {
+            filters: vec![
+                LayerFilter::new(dust(MAX_DUST_RADIUS)),
+                LayerFilter::new(FilterKind::GaussianBlur { radius: 85.0 }),
+                LayerFilter::new(FilterKind::GaussianBlur { radius: 85.0 }),
+            ],
+        };
+        assert!(matches!(
+            list.validate(),
+            Err(FiltersError::ReachTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn wire_format_dust_and_scratches_is_variant_three_and_0_311_readers_refuse_it() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        enum Old {
+            GaussianBlur {
+                radius: f32,
+            },
+            UnsharpMask {
+                amount: f32,
+                radius: f32,
+                threshold: u8,
+            },
+            ReduceNoise {
+                strength: f32,
+                preserve_details: f32,
+                color_noise: f32,
+                sharpen_details: f32,
+            },
+        }
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct OldFilter {
+            kind: Old,
+            visible: bool,
+        }
+        let reduce = LayerFilter::new(noise(4.0, 60.0, 30.0, 20.0));
+        let bytes = postcard::to_allocvec(&reduce).unwrap_or_default();
+        assert!(postcard::from_bytes::<OldFilter>(&bytes).is_ok(), "control");
+        let dust = LayerFilter::new(FilterKind::DustAndScratches {
+            radius: 3,
+            threshold: 12,
+        });
+        let bytes = postcard::to_allocvec(&dust).unwrap_or_default();
+        assert_eq!(
+            bytes,
+            vec![3, 3, 12, 1],
+            "variant 3, radius, threshold, visible"
+        );
+        assert!(postcard::from_bytes::<OldFilter>(&bytes).is_err());
+        assert_eq!(postcard::from_bytes::<LayerFilter>(&bytes).ok(), Some(dust));
     }
 
     #[test]

@@ -418,6 +418,9 @@ fn chain_reference(kinds: &[aurora_core::FilterKind]) -> Vec<f32> {
                 color_noise,
                 sharpen_details,
             ),
+            aurora_core::FilterKind::DustAndScratches { radius, threshold } => {
+                aurora_filters::dust_scratches_window(&mut window, side_u, radius, threshold);
+            }
         }
     }
     aurora_filters::crop_window(&window, side_u, 512)
@@ -425,7 +428,7 @@ fn chain_reference(kinds: &[aurora_core::FilterKind]) -> Vec<f32> {
 
 #[test]
 fn unsharp_tiles_are_bit_identical_to_a_one_shot_reference_across_the_boundary() {
-    let chains: [Vec<aurora_core::FilterKind>; 5] = [
+    let chains: [Vec<aurora_core::FilterKind>; 7] = [
         vec![unsharp(200.0, 2.0, 0)],
         vec![unsharp(150.0, 9.0, 2)],
         vec![
@@ -437,6 +440,8 @@ fn unsharp_tiles_are_bit_identical_to_a_one_shot_reference_across_the_boundary()
             reduce_noise(4.0, 80.0, 40.0, 0.0),
             aurora_core::FilterKind::GaussianBlur { radius: 2.0 },
         ],
+        vec![dust(10, 0)],
+        vec![dust(4, 3), aurora_core::FilterKind::GaussianBlur { radius: 1.0 }],
     ];
     for kinds in chains {
         let (_dir, mut store) = real_tile_store();
@@ -651,6 +656,61 @@ fn a_dab_recomposites_the_neighbours_within_the_reduce_noise_reach() {
     let near_tile = aurora_tile::TileId { x: 1, y: 0 };
     let far_tile = aurora_tile::TileId { x: 3, y: 0 };
     ok(layers.set_filters(id, Some(filters_of(&[reduce_noise(10.0, 0.0, 100.0, 100.0)]))));
+    let mut cache = CompositeCache::default();
+    for t in [own, near_tile, far_tile] {
+        cache.mark_current(t);
+    }
+    invalidate_painted_tiles(&mut cache, &layers, id, &[own], (0, 0));
+    assert!(!cache.is_current(own));
+    assert!(!cache.is_current(near_tile));
+    assert!(cache.is_current(far_tile));
+}
+
+// ---- task 179: Dust & Scratches ----
+
+fn dust(radius: u32, threshold: u8) -> aurora_core::FilterKind {
+    aurora_core::FilterKind::DustAndScratches { radius, threshold }
+}
+
+#[test]
+fn dust_and_scratches_settings_are_part_of_the_cache_key_and_refuse_the_gpu_path() {
+    let (_dir, mut store) = real_tile_store();
+    let mut layers = aurora_doc::LayerTree::new();
+    let id = two_tone_layer(&mut layers, &mut store);
+    let computes = || crate::layer_filter_app::FILTER_COMPUTES.with(std::cell::Cell::get);
+    let tile = |layers: &aurora_doc::LayerTree, store: &mut aurora_tile::TileStore| {
+        composite_tile_at(layers, store, 0, 0, (0, 0))
+    };
+    let before = computes();
+    ok(layers.set_filters(id, Some(filters_of(&[dust(2, 5)]))));
+    let _ = tile(&layers, &mut store);
+    let _ = tile(&layers, &mut store);
+    assert_eq!(computes() - before, 1, "second draw hits");
+    for (n, kind) in [dust(3, 5), dust(3, 6)].into_iter().enumerate() {
+        ok(layers.set_filters(id, Some(filters_of(&[kind]))));
+        let _ = tile(&layers, &mut store);
+        assert_eq!(computes() - before, 2 + n, "{kind:?} misses");
+    }
+    assert!(!document_qualifies_for_gpu_compositing(&layers));
+    let mut hidden = filters_of(&[dust(2, 5)]);
+    if let Some(f) = hidden.filters.get_mut(0) {
+        f.visible = false;
+    }
+    ok(layers.set_filters(id, Some(hidden)));
+    assert!(document_qualifies_for_gpu_compositing(&layers));
+}
+
+#[test]
+fn a_dab_recomposites_the_neighbours_within_the_dust_and_scratches_reach() {
+    let (_dir, mut store) = real_tile_store();
+    let mut layers = aurora_doc::LayerTree::new();
+    // A dab at x = 250 of tile 0; a radius of 10 reaches x = 260 (tile 1)
+    // but not tile 3.
+    let id = painted(&mut layers, &mut store, (0, 0), (250, 100, 1, 1));
+    let own = aurora_tile::TileId { x: 0, y: 0 };
+    let near_tile = aurora_tile::TileId { x: 1, y: 0 };
+    let far_tile = aurora_tile::TileId { x: 3, y: 0 };
+    ok(layers.set_filters(id, Some(filters_of(&[dust(10, 0)]))));
     let mut cache = CompositeCache::default();
     for t in [own, near_tile, far_tile] {
         cache.mark_current(t);

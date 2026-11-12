@@ -2289,6 +2289,39 @@ fn a_reduce_noise_layer_is_named_in_the_save_report_like_a_blur() {
     assert!(doc.tree.filters(top).is_some(), "the document is untouched");
 }
 
+#[test]
+fn a_dust_and_scratches_layer_is_named_in_the_save_report_like_a_blur() {
+    let mut doc = Doc::new();
+    let Some(top) = doc.tree.roots().first().copied() else {
+        unreachable!()
+    };
+    ok(doc.tree.set_filters(
+        top,
+        Some(aurora_core::LayerFilters {
+            filters: vec![aurora_core::LayerFilter::new(
+                aurora_core::FilterKind::DustAndScratches {
+                    radius: 3,
+                    threshold: 8,
+                },
+            )],
+        }),
+    ));
+    let report = ok(crate::psd_save::check_psd_compatibility(source_of(
+        &mut doc,
+        Vec::new(),
+    )));
+    let line = report
+        .entries
+        .iter()
+        .find(|e| e.text.contains("Layer filters are not saved"));
+    assert_eq!(
+        line.map(|e| (e.category, e.affected.clone())),
+        Some((aurora_io::ReportCategory::NotSaved, vec!["Top".to_owned()]))
+    );
+    assert!(!report.is_empty(), "the save asks");
+    assert!(doc.tree.filters(top).is_some(), "the document is untouched");
+}
+
 fn filtered_top(radius: f32) -> (Doc, aurora_doc::LayerId) {
     let mut doc = Doc::new();
     let top = doc.tree.roots().first().copied();
