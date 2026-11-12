@@ -40,7 +40,8 @@
 //! same blur and reaches as far, but spreads nothing into transparent
 //! pixels, so it has no spill. A Reduce Noise (task 178) reaches the sum of its
 //! three stages' reaches (at most 20 px) and spills nothing either. Nothing is
-//! reported for it.
+//! reported for it. A Dust & Scratches (task 179) reaches its radius (at most
+//! 10 px) and spills nothing either.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -115,6 +116,9 @@ pub(crate) fn filter_signature(
                             sharpen_details.to_bits(),
                         ],
                     ),
+                    aurora_core::FilterKind::DustAndScratches { radius, threshold } => {
+                        (3, [radius, u32::from(threshold), 0, 0])
+                    }
                 })
                 .collect()
         })
@@ -340,6 +344,9 @@ fn compute(
                 color_noise,
                 sharpen_details,
             ),
+            aurora_core::FilterKind::DustAndScratches { radius, threshold } => {
+                aurora_filters::dust_scratches_window(&mut window, side, radius, threshold);
+            }
         }
     }
     let centre = aurora_filters::crop_window(&window, side, T);

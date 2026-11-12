@@ -17,6 +17,7 @@ pub mod brightness_contrast;
 pub mod channel_mixer;
 pub mod color_balance;
 pub mod curves;
+pub mod dust_scratches;
 pub mod exposure;
 pub mod gradient_map;
 pub mod hue_saturation;
@@ -38,6 +39,7 @@ pub use brightness_contrast::{BRIGHTNESS_CONTRAST_PACKED_LEN, BrightnessContrast
 pub use channel_mixer::{CHANNEL_MIXER_PACKED_LEN, ChannelMixerOp};
 pub use color_balance::{COLOR_BALANCE_PACKED_LEN, ColorBalanceOp, SHIFT_AT_100, range_weights};
 pub use curves::{CURVES_LUT_INTERVALS, CURVES_PACKED_HEADER, CURVES_PACKED_LEN, CurvesLut};
+pub use dust_scratches::dust_scratches_window;
 pub use exposure::{EXPOSURE_PACKED_LEN, ExposureOp, ExposureTrcOp};
 pub use gradient_map::{GRADIENT_MAP_PACKED_LEN, GradientMapOp};
 pub use hue_saturation::{HUE_SATURATION_PACKED_LEN, HueSaturationOp, range_weight};

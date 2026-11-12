@@ -38,6 +38,16 @@
 //! "no filters to change" notice; the prompt (palette, Filter menu) is the
 //! way to edit one.
 //!
+//! **Dust & Scratches… (task 179)** is the fourth: a one-line prompt with
+//! two whole numbers, "Radius Threshold" typed as `1 0` (pixels 1..=10,
+//! levels 0..=255; spaces or commas; `px` after the radius allowed),
+//! starting as the values last used this session
+//! (`ToolSettings::dust_settings`, not persisted; Photoshop's 1 / 0 the
+//! first time). The typed (registry) Edit Last Layer Filter, which has only
+//! a `radius`, sets a Dust & Scratches' radius when the value is a whole
+//! number from 1 to 10 (and is refused with the "no filters to change"
+//! notice otherwise); its threshold needs the Dust & Scratches prompt.
+//!
 //! **What does not.** No Properties-panel editor (slider per filter, eye,
 //! delete button) yet: editing is by command, and only the last filter can
 //! be edited. No live preview while the radius is typed. Nothing is
@@ -53,6 +63,7 @@ use crate::{FocusManager, LockRefusal, WidgetId, command_palette_style};
 pub(crate) const COMMAND_GAUSSIAN_BLUR: &str = "layer.filter.gaussian_blur";
 pub(crate) const COMMAND_UNSHARP_MASK: &str = "layer.filter.unsharp_mask";
 pub(crate) const COMMAND_REDUCE_NOISE: &str = "layer.filter.reduce_noise";
+pub(crate) const COMMAND_DUST_SCRATCHES: &str = "layer.filter.dust_scratches";
 pub(crate) const COMMAND_EDIT_LAST: &str = "layer.filter.edit_last";
 pub(crate) const COMMAND_TOGGLE: &str = "layer.filter.toggle";
 pub(crate) const COMMAND_REMOVE_LAST: &str = "layer.filter.remove_last";
@@ -142,6 +153,35 @@ impl NoiseSettings {
     }
 }
 
+/// Photoshop's Dust & Scratches defaults (radius 1, threshold 0).
+pub(crate) const DEFAULT_DUST: DustSettings = DustSettings {
+    radius: 1,
+    threshold: 0,
+};
+
+/// The two numbers of a Dust & Scratches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DustSettings {
+    /// Whole pixels, 1..=10.
+    pub(crate) radius: u32,
+    /// 8-bit levels, 0..=255.
+    pub(crate) threshold: u8,
+}
+
+impl DustSettings {
+    fn kind(self) -> aurora_core::FilterKind {
+        aurora_core::FilterKind::DustAndScratches {
+            radius: self.radius,
+            threshold: self.threshold,
+        }
+    }
+
+    /// The prompt's text for these values.
+    pub(crate) fn text(self) -> String {
+        format!("{} {}", self.radius, self.threshold)
+    }
+}
+
 /// Which prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptKind {
@@ -157,6 +197,10 @@ pub(crate) enum PromptKind {
     AddNoise,
     /// Edit Last Layer Filter… when the last filter is a Reduce Noise.
     EditLastNoise,
+    /// Dust & Scratches…: add a filter.
+    AddDust,
+    /// Edit Last Layer Filter… when the last filter is a Dust & Scratches.
+    EditLastDust,
 }
 
 impl PromptKind {
@@ -170,6 +214,9 @@ impl PromptKind {
             Self::AddNoise | Self::EditLastNoise => {
                 "Reduce Noise: Strength 0 to 10, Preserve Details, Reduce Color Noise and Sharpen Details in Percent"
             }
+            Self::AddDust | Self::EditLastDust => {
+                "Dust & Scratches: Radius in Pixels, Threshold in Levels"
+            }
         }
     }
 
@@ -181,6 +228,8 @@ impl PromptKind {
             Self::EditLastUnsharp => "layer.filter.edit_last_unsharp.apply",
             Self::AddNoise => "layer.filter.reduce_noise.apply",
             Self::EditLastNoise => "layer.filter.edit_last_noise.apply",
+            Self::AddDust => "layer.filter.dust_scratches.apply",
+            Self::EditLastDust => "layer.filter.edit_last_dust.apply",
         }
     }
 
@@ -192,6 +241,8 @@ impl PromptKind {
             Self::EditLastUnsharp,
             Self::AddNoise,
             Self::EditLastNoise,
+            Self::AddDust,
+            Self::EditLastDust,
         ]
         .into_iter()
         .find(|kind| kind.row_id() == id)
@@ -223,17 +274,29 @@ impl PromptKind {
                 ),
                 Err(_) => format!("Edit Reduce Noise: {amount}"),
             },
+            Self::AddDust => match parse_dust(amount) {
+                Ok(v) => format!("Dust & Scratches, {}", dust_summary(v)),
+                Err(_) => format!("Dust & Scratches: {amount}"),
+            },
+            Self::EditLastDust => match parse_dust(amount) {
+                Ok(v) => format!(
+                    "Change the last layer filter to Dust & Scratches, {}",
+                    dust_summary(v)
+                ),
+                Err(_) => format!("Edit Dust & Scratches: {amount}"),
+            },
         }
     }
 
     fn bare_title(self) -> &'static str {
         match self {
             Self::Add => "Gaussian Blur",
-            Self::EditLast | Self::EditLastUnsharp | Self::EditLastNoise => {
+            Self::EditLast | Self::EditLastUnsharp | Self::EditLastNoise | Self::EditLastDust => {
                 "Edit Last Layer Filter"
             }
             Self::AddUnsharp => "Unsharp Mask",
             Self::AddNoise => "Reduce Noise",
+            Self::AddDust => "Dust & Scratches",
         }
     }
 }
@@ -255,6 +318,11 @@ pub(crate) enum FilterEdit {
     /// Replace the settings of the last filter, which must be a Reduce
     /// Noise.
     EditLastNoise(NoiseSettings),
+    /// Append a Dust & Scratches.
+    AddDustScratches(DustSettings),
+    /// Replace the settings of the last filter, which must be a Dust &
+    /// Scratches.
+    EditLastDust(DustSettings),
     /// Hide every filter, or show them all when none is shown.
     ToggleVisible,
     RemoveLast,
@@ -277,6 +345,7 @@ pub(crate) fn prompt_for_command(id: &str) -> Option<PromptKind> {
         COMMAND_GAUSSIAN_BLUR => Some(PromptKind::Add),
         COMMAND_UNSHARP_MASK => Some(PromptKind::AddUnsharp),
         COMMAND_REDUCE_NOISE => Some(PromptKind::AddNoise),
+        COMMAND_DUST_SCRATCHES => Some(PromptKind::AddDust),
         COMMAND_EDIT_LAST => Some(PromptKind::EditLast),
         _ => None,
     }
@@ -288,6 +357,7 @@ pub(crate) fn prompt_for_command(id: &str) -> Option<PromptKind> {
 /// # Errors
 ///
 /// The calm notice for why it cannot run.
+#[allow(clippy::too_many_lines)] // one arm per edit
 pub(crate) fn plan(
     layers: &aurora_doc::LayerTree,
     layer: Option<aurora_doc::LayerId>,
@@ -319,6 +389,21 @@ pub(crate) fn plan(
                 aurora_core::FilterKind::ReduceNoise { .. } => {
                     return Err(LockRefusal::FilterNothing);
                 }
+                // A Dust & Scratches radius is a whole number of pixels
+                // from 1 to the maximum: the radius form sets it when the
+                // value is such a number and is refused otherwise. Its
+                // threshold needs the Dust & Scratches prompt.
+                aurora_core::FilterKind::DustAndScratches { radius: old, .. } => {
+                    let max = f32::from(u16::try_from(aurora_core::MAX_DUST_RADIUS).unwrap_or(0));
+                    if radius.fract() != 0.0 || !(1.0..=max).contains(&radius) {
+                        return Err(LockRefusal::FilterNothing);
+                    }
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    // whole, 1..=max
+                    {
+                        *old = radius as u32;
+                    }
+                }
             }
             "Edit Layer Filter"
         }
@@ -347,6 +432,19 @@ pub(crate) fn plan(
             }
             last.kind = settings.kind();
             "Edit Reduce Noise"
+        }
+        FilterEdit::AddDustScratches(settings) => {
+            next.filters
+                .push(aurora_core::LayerFilter::new(settings.kind()));
+            "Dust & Scratches"
+        }
+        FilterEdit::EditLastDust(settings) => {
+            let last = next.filters.last_mut().ok_or(LockRefusal::FilterNothing)?;
+            if !matches!(last.kind, aurora_core::FilterKind::DustAndScratches { .. }) {
+                return Err(LockRefusal::FilterNothing);
+            }
+            last.kind = settings.kind();
+            "Edit Dust & Scratches"
         }
         FilterEdit::ToggleVisible => {
             if next.filters.is_empty() {
@@ -411,7 +509,24 @@ pub(crate) fn last_radius(
     match layers.filters(layer)?.filters.last()?.kind {
         aurora_core::FilterKind::GaussianBlur { radius }
         | aurora_core::FilterKind::UnsharpMask { radius, .. } => Some(radius),
-        aurora_core::FilterKind::ReduceNoise { .. } => None,
+        aurora_core::FilterKind::ReduceNoise { .. }
+        | aurora_core::FilterKind::DustAndScratches { .. } => None,
+    }
+}
+
+/// The last filter's settings on `layer` when it is a Dust & Scratches:
+/// the Edit prompt's starting values.
+pub(crate) fn last_dust(
+    layers: &aurora_doc::LayerTree,
+    layer: aurora_doc::LayerId,
+) -> Option<DustSettings> {
+    match layers.filters(layer)?.filters.last()?.kind {
+        aurora_core::FilterKind::DustAndScratches { radius, threshold } => {
+            Some(DustSettings { radius, threshold })
+        }
+        aurora_core::FilterKind::GaussianBlur { .. }
+        | aurora_core::FilterKind::UnsharpMask { .. }
+        | aurora_core::FilterKind::ReduceNoise { .. } => None,
     }
 }
 
@@ -434,7 +549,8 @@ pub(crate) fn last_noise(
             sharpen_details,
         }),
         aurora_core::FilterKind::GaussianBlur { .. }
-        | aurora_core::FilterKind::UnsharpMask { .. } => None,
+        | aurora_core::FilterKind::UnsharpMask { .. }
+        | aurora_core::FilterKind::DustAndScratches { .. } => None,
     }
 }
 
@@ -455,7 +571,8 @@ pub(crate) fn last_unsharp(
             threshold,
         }),
         aurora_core::FilterKind::GaussianBlur { .. }
-        | aurora_core::FilterKind::ReduceNoise { .. } => None,
+        | aurora_core::FilterKind::ReduceNoise { .. }
+        | aurora_core::FilterKind::DustAndScratches { .. } => None,
     }
 }
 
@@ -559,6 +676,48 @@ pub(crate) fn parse_unsharp(text: &str) -> Result<UnsharpSettings, String> {
         radius,
         threshold,
     })
+}
+
+/// "radius 1 px, threshold 0 levels" for the prompt's row.
+fn dust_summary(v: DustSettings) -> String {
+    format!("radius {} px, threshold {} levels", v.radius, v.threshold)
+}
+
+/// The two numbers typed into the Dust & Scratches prompt (radius in whole
+/// pixels, threshold in whole levels; spaces or commas between; `px` after
+/// the radius allowed), or the reason they are refused.
+///
+/// # Errors
+///
+/// A short sentence for the prompt's row.
+pub(crate) fn parse_dust(text: &str) -> Result<DustSettings, String> {
+    let tokens: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|t| !t.is_empty())
+        .collect();
+    let [radius, threshold] = tokens.as_slice() else {
+        return Err("Enter radius and threshold, for example 1 0.".to_owned());
+    };
+    let whole = |token: &str, suffix: &str, what: &str| -> Result<u32, String> {
+        let digits = token.strip_suffix(suffix).unwrap_or(token);
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!("The {what} is a whole number, for example 1."));
+        }
+        digits
+            .parse::<u32>()
+            .map_err(|_| format!("The {what} is too large."))
+    };
+    let radius = whole(radius, "px", "radius")?;
+    if !(aurora_core::MIN_DUST_RADIUS..=aurora_core::MAX_DUST_RADIUS).contains(&radius) {
+        return Err(format!(
+            "The radius is from {} to {} px.",
+            aurora_core::MIN_DUST_RADIUS,
+            aurora_core::MAX_DUST_RADIUS
+        ));
+    }
+    let threshold = u8::try_from(whole(threshold, "", "threshold")?)
+        .map_err(|_| "The threshold is a whole number from 0 to 255 levels.".to_owned())?;
+    Ok(DustSettings { radius, threshold })
 }
 
 /// "strength 6, preserve details 60 %, ..." for the prompt's row.
@@ -712,6 +871,16 @@ pub(crate) fn prompt_enter(
 ) -> Option<Result<FilterEdit, ()>> {
     let kind = prompt_kind(tree, root)?;
     let query = command_palette_state(tree, root).ok()?.query().to_owned();
+    if matches!(kind, PromptKind::AddDust | PromptKind::EditLastDust) {
+        return Some(match parse_dust(&query) {
+            Ok(v) => Ok(if kind == PromptKind::AddDust {
+                FilterEdit::AddDustScratches(v)
+            } else {
+                FilterEdit::EditLastDust(v)
+            }),
+            Err(message) => show_refusal(tree, root, kind, message),
+        });
+    }
     if matches!(kind, PromptKind::AddNoise | PromptKind::EditLastNoise) {
         return Some(match parse_noise(&query) {
             Ok(v) => Ok(if kind == PromptKind::AddNoise {
@@ -740,7 +909,9 @@ pub(crate) fn prompt_enter(
             | PromptKind::AddUnsharp
             | PromptKind::EditLastUnsharp
             | PromptKind::AddNoise
-            | PromptKind::EditLastNoise => FilterEdit::EditLastRadius(radius),
+            | PromptKind::EditLastNoise
+            | PromptKind::AddDust
+            | PromptKind::EditLastDust => FilterEdit::EditLastRadius(radius),
         })),
         Err(message) => Some(show_refusal(tree, root, kind, message)),
     }
@@ -1206,6 +1377,138 @@ mod tests {
             row(PromptKind::EditLastNoise, "1 2 3 4")
                 .starts_with("Change the last layer filter to Reduce Noise,")
         );
+    }
+
+    fn dust_of(radius: u32, threshold: u8) -> DustSettings {
+        DustSettings { radius, threshold }
+    }
+
+    #[test]
+    fn parse_dust_reads_two_whole_numbers_and_explains_refusals() {
+        assert_eq!(parse_dust("1 0"), Ok(dust_of(1, 0)));
+        assert_eq!(parse_dust(" 10px, 255 "), Ok(dust_of(10, 255)));
+        for bad in [
+            "",
+            "1",
+            "1 2 3",
+            "0 0",
+            "11 0",
+            "1 256",
+            "1.5 0",
+            "1 2.5",
+            "-1 0",
+            "a b",
+            "1 -2",
+            "99999999999 0",
+        ] {
+            assert!(parse_dust(bad).is_err(), "{bad:?}");
+        }
+        let v = dust_of(7, 33);
+        assert_eq!(parse_dust(&v.text()), Ok(v));
+    }
+
+    #[test]
+    fn dust_add_edit_and_undo_are_single_labelled_steps() {
+        let (mut tree, mut history, pixel, group) = doc();
+        let mut run =
+            |tree: &mut aurora_doc::LayerTree, edit| apply(tree, &mut history, Some(pixel), edit);
+        assert_eq!(
+            run(&mut tree, FilterEdit::AddGaussianBlur(3.0)),
+            Some("Gaussian Blur")
+        );
+        // Editing a blur as a dust filter is refused.
+        assert_eq!(
+            plan(&tree, Some(pixel), FilterEdit::EditLastDust(dust_of(2, 0))),
+            Err(LockRefusal::FilterNothing)
+        );
+        assert!(last_dust(&tree, pixel).is_none());
+        assert_eq!(
+            run(&mut tree, FilterEdit::AddDustScratches(dust_of(1, 0))),
+            Some("Dust & Scratches")
+        );
+        assert_eq!(last_dust(&tree, pixel), Some(dust_of(1, 0)));
+        assert_eq!(last_radius(&tree, pixel), None);
+        assert!(last_noise(&tree, pixel).is_none());
+        assert!(last_unsharp(&tree, pixel).is_none());
+        // The typed radius form sets a whole radius and keeps the threshold.
+        assert_eq!(
+            run(&mut tree, FilterEdit::EditLastRadius(4.0)),
+            Some("Edit Layer Filter")
+        );
+        assert_eq!(last_dust(&tree, pixel), Some(dust_of(4, 0)));
+        for bad in [2.5, 0.0, 11.0, 85.0] {
+            assert_eq!(
+                plan(&tree, Some(pixel), FilterEdit::EditLastRadius(bad)),
+                Err(LockRefusal::FilterNothing),
+                "{bad}"
+            );
+        }
+        // Noise and unsharp edits are refused on it.
+        assert_eq!(
+            plan(
+                &tree,
+                Some(pixel),
+                FilterEdit::EditLastNoise(noise(1.0, 1.0, 1.0, 1.0))
+            ),
+            Err(LockRefusal::FilterNothing)
+        );
+        assert_eq!(
+            run(&mut tree, FilterEdit::EditLastDust(dust_of(6, 20))),
+            Some("Edit Dust & Scratches")
+        );
+        assert_eq!(last_dust(&tree, pixel), Some(dust_of(6, 20)));
+        assert_eq!(
+            run(&mut tree, FilterEdit::EditLastDust(dust_of(6, 20))),
+            None
+        );
+        // Shared reach cap: blur 3 px (9) + dust 6 is fine, + blur 85 is not.
+        assert_eq!(
+            plan(&tree, Some(pixel), FilterEdit::AddGaussianBlur(85.0)),
+            Err(LockRefusal::FilterTooLarge)
+        );
+        assert_eq!(
+            plan(
+                &tree,
+                Some(group),
+                FilterEdit::AddDustScratches(dust_of(1, 0))
+            ),
+            Err(LockRefusal::FilterNeedsPixelLayer)
+        );
+        let _ = history.undo(&mut tree);
+        assert_eq!(last_dust(&tree, pixel), Some(dust_of(4, 0)));
+        let _ = history.undo(&mut tree);
+        assert_eq!(last_dust(&tree, pixel), Some(dust_of(1, 0)));
+        let _ = history.undo(&mut tree);
+        assert!(last_dust(&tree, pixel).is_none());
+    }
+
+    #[test]
+    fn dust_prompt_rows_and_command_ids() {
+        assert_eq!(
+            prompt_for_command(COMMAND_DUST_SCRATCHES),
+            Some(PromptKind::AddDust)
+        );
+        assert_eq!(plain_edit_for_command(COMMAND_DUST_SCRATCHES), None);
+        for kind in [PromptKind::AddDust, PromptKind::EditLastDust] {
+            assert_eq!(PromptKind::for_row(kind.row_id()), Some(kind));
+        }
+        let row = |k, q: &str| {
+            prompt_entries(k, q)
+                .first()
+                .map(|e| e.title.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(row(PromptKind::AddDust, ""), "Dust & Scratches");
+        assert_eq!(
+            row(PromptKind::AddDust, "2 8"),
+            "Dust & Scratches, radius 2 px, threshold 8 levels"
+        );
+        assert_eq!(row(PromptKind::AddDust, "2"), "Dust & Scratches: 2");
+        assert!(
+            row(PromptKind::EditLastDust, "1 2")
+                .starts_with("Change the last layer filter to Dust & Scratches,")
+        );
+        assert_eq!(DEFAULT_DUST, dust_of(1, 0));
     }
 
     #[test]
