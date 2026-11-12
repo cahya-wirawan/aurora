@@ -308,6 +308,7 @@ Reader semantics: `read` only decodes the journal. **It does not replay it and d
 | 17 | `SetSmartObject` | `id: u64, value: Option<SmartObject>` | 0.200.0 |
 | 18 | `SetClipped` | `id: u64, value: bool` | 0.201.0 |
 | 19 | `Translate` | `dx: i64, dy: i64` | 0.226.0 |
+| 28 | `SetAllBounds` | `pixel: Vec<(u64, Rect)>, masks: Vec<(u64, Rect)>` | 0.313.0 |
 
 Ordinals 17 and 18 are stated by ADR 0009 and match the declaration order. "Original" means present in the first implementation (`ade24bc`, 2026-08-06) or at least before the earliest dated addendum; the exact version for ordinals 0 to 13 was not determined, and the ADR does not date `SetBounds` (G-10).
 
@@ -733,6 +734,7 @@ Aurora version numbers (SemVer, from 0.0.1; the first implementation predates th
 | `Adjustment::HueSaturationRanges` (3) | variant | 0.204.0 | ADR |
 | `selection` | entry | 0.218.0 | ADR; commit `dd00fc4` |
 | `Translate` op (19) | op | 0.226.0 | ADR; commit `0afd450` |
+| `SetAllBounds` op (28) | op | 0.313.0 | ADR 0009 addendum |
 | `paths` | entry | 0.233.0 | ADR; commit `98f71b0` |
 | `Adjustment::{Vibrance, Exposure, PhotoFilter}` (4, 5, 6) | variants | 0.239.0 | ADR |
 | `Adjustment::{BlackWhite, ColorBalance}` (7, 8) | variants | 0.240.0 | ADR |

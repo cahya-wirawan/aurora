@@ -712,8 +712,12 @@ pub(crate) fn straighten_document(
                 tracing::error!(?err, "failed to roll back a straighten");
             }
         }
-        pixel_history.clear_redo();
-        undo_order.discard_redo(history, pixel_history);
+        // Only a push clears the redo stacks; a failure before the first
+        // push leaves the user's redo history as it was.
+        if pushed > 0 {
+            pixel_history.clear_redo();
+            undo_order.discard_redo(history, pixel_history);
+        }
         return Err(CropRefusal::Failed);
     }
     let step = StraightenStep {
