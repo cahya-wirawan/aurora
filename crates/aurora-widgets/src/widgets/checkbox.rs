@@ -21,11 +21,20 @@ pub struct CheckboxState {
     /// checkbox over a partial selection).
     pub checked: Toggled,
     pub disabled: bool,
+    /// The name assistive technology announces, when it should differ from
+    /// the drawn `label` (a short drawn label in a tight bar); `None` means
+    /// the label.
+    pub accessible_name: Option<String>,
 }
 
 fn node(state: &CheckboxState) -> Node {
     let mut node = Node::new(Role::CheckBox);
-    node.set_label(state.label.clone());
+    node.set_label(
+        state
+            .accessible_name
+            .clone()
+            .unwrap_or_else(|| state.label.clone()),
+    );
     node.set_toggled(state.checked);
     if state.disabled {
         node.set_disabled();
@@ -108,6 +117,7 @@ pub fn insert_checkbox(
         label: label.into(),
         checked: Toggled::False,
         disabled: false,
+        accessible_name: None,
     };
     tree.insert(
         parent,
@@ -180,6 +190,24 @@ pub fn set_checkbox_checked(
     tree.mark_dirty(id)
 }
 
+/// Sets the name assistive technology announces for `id` (a checkbox),
+/// apart from its drawn label.
+///
+/// # Errors
+///
+/// Returns [`WidgetError::UnknownWidget`] if `id` doesn't exist, or
+/// [`WidgetError::WrongWidgetKind`] if it exists but isn't a checkbox.
+pub fn set_checkbox_accessible_name(
+    tree: &mut WidgetTree<WidgetKind>,
+    id: WidgetId,
+    name: &str,
+) -> Result<(), WidgetError> {
+    with_checkbox_mut(tree, id, |state| {
+        state.accessible_name = Some(name.to_owned());
+        Ok(())
+    })
+}
+
 /// Sets whether `id` (a checkbox) is disabled.
 ///
 /// # Errors
@@ -244,6 +272,33 @@ mod tests {
         };
         assert_eq!(accessibility.toggled(), Some(Toggled::False));
         assert!(accessibility.supports_action(Action::Click));
+    }
+
+    #[test]
+    fn an_accessible_name_replaces_the_drawn_label_for_assistive_technology() {
+        let (mut tree, root) = new_tree(Style::default());
+        let scales = test_scales();
+        let id = match insert_checkbox(&mut tree, root, &scales, "Short") {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        if let Err(err) = super::set_checkbox_accessible_name(&mut tree, id, "A longer name") {
+            unreachable!("{err:?}");
+        }
+        let label = |tree: &crate::WidgetTree<WidgetKind>| {
+            tree.accessibility(id)
+                .and_then(|n| n.label().map(str::to_owned))
+        };
+        assert_eq!(label(&tree).as_deref(), Some("A longer name"));
+        // It survives a state change, and the drawn label is untouched.
+        if let Err(err) = set_checkbox_checked(&mut tree, id, Toggled::True) {
+            unreachable!("{err:?}");
+        }
+        assert_eq!(label(&tree).as_deref(), Some("A longer name"));
+        match tree.payload(id) {
+            Some(WidgetKind::Checkbox(state)) => assert_eq!(state.label, "Short"),
+            other => unreachable!("{other:?}"),
+        }
     }
 
     #[test]

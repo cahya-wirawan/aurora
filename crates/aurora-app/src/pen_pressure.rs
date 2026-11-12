@@ -64,6 +64,43 @@ pub(crate) fn pressured_amount(amount: PaintAmount, pressure: f32) -> PaintAmoun
     PaintAmount::new(amount.opacity() * p, amount.flow())
 }
 
+/// The previous pointer event's pressure during a stroke: the start of the
+/// next segment's interpolation. A press resets it to the press sample, so
+/// a new stroke never starts from the last stroke's final pressure.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct StrokePressure(f32);
+
+impl Default for StrokePressure {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+impl StrokePressure {
+    /// A press with pen `sample` pressure: the stroke's first pressure.
+    pub(crate) fn press(&mut self, sample: f32) -> f32 {
+        self.0 = clean(sample);
+        self.0
+    }
+
+    /// A move event with `sample` pressure: `(previous, this)`.
+    pub(crate) fn advance(&mut self, sample: f32) -> (f32, f32) {
+        let from = self.0;
+        self.0 = clean(sample);
+        (from, self.0)
+    }
+}
+
+/// Whether a `Drag::Brush` is the plain layer Brush or Pencil (none of the
+/// clone, smudge, filter, tone or heal modes), the only ones whose dab
+/// spacing follows pressure. (Quick Mask is not part of the drag; `App`
+/// hands it full pressure.) `modes` is `[clone, smudge, filter, tone, heal]`:
+/// whether each is set.
+#[must_use]
+pub(crate) fn brush_drag_takes_pressure(modes: [bool; 5]) -> bool {
+    !modes.contains(&true)
+}
+
 /// The pressure at `point`, a dab on the segment `from -> to`, given the
 /// pressure `p_from` at `from` and `p_to` at `to`: linear in the dab's
 /// distance from `from` over the segment's length. A zero-length segment

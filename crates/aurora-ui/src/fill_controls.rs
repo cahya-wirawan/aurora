@@ -141,6 +141,11 @@ pub struct FillView {
     pub pressure_opacity: bool,
 }
 
+/// The drawn label of the "Pressure for Size" checkbox.
+pub const PRESSURE_SIZE_LABEL: &str = "Pen Size";
+/// The drawn label of the "Pressure for Opacity" checkbox.
+pub const PRESSURE_OPACITY_LABEL: &str = "Pen Opacity";
+
 /// Whether `tool` shows the pen pressure checkboxes: the Brush, Pencil and
 /// Eraser (the Clone Stamp and the other dab tools ignore pressure).
 #[must_use]
@@ -281,7 +286,10 @@ fn insert_paint_group(
         STRENGTH_MIN,
         STRENGTH_MAX,
     )?;
-    let pressure_size = widgets::insert_checkbox(tree, paint, scales, "Pressure for Size")?;
+    // Short drawn labels keep the Brush's row inside the bar at a 1,280 px
+    // window; assistive technology still hears the full names.
+    let pressure_size = widgets::insert_checkbox(tree, paint, scales, PRESSURE_SIZE_LABEL)?;
+    widgets::set_checkbox_accessible_name(tree, pressure_size, "Pressure for Size")?;
     widgets::set_checkbox_checked(tree, pressure_size, Toggled::True)?;
     let pressure_opacity = widgets::insert_checkbox(tree, paint, scales, "Pressure for Opacity")?;
     for (id, item) in [

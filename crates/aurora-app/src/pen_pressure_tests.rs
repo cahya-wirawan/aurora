@@ -439,3 +439,105 @@ fn the_other_dab_tools_do_not_take_pressure() {
     }
     assert_eq!(region(&mut a), region(&mut b));
 }
+
+/// The dabs one long segment lays for a drag of `tool` at `pressures`.
+fn segment_dabs(tool: Tool, clone: bool, pressures: (f32, f32)) -> Vec<(f32, f32)> {
+    let mut r = rig();
+    r.settings.brush_radius = 40.0;
+    let mut drag = begin_drag(
+        tool,
+        PointerButton::Primary,
+        (20.0, 100.0),
+        &r.view,
+        crate::active_pixel_layer(&r.layers, Some(r.layer)),
+    );
+    if clone && let Some(Drag::Brush { clone, .. }) = drag.as_mut() {
+        *clone = Some((5, 5));
+    }
+    let bounds = pan_bounds(&r.layers, Some(r.layer), Some((1000.0, 800.0)));
+    let Some(d) = drag.as_mut() else {
+        unreachable!("the tool starts a drag");
+    };
+    continue_drag_pressured(
+        d,
+        (320.0, 100.0),
+        &mut r.view,
+        &mut r.selection,
+        &r.settings,
+        bounds,
+        pressures,
+    )
+}
+
+#[test]
+fn only_the_plain_brush_pencil_and_eraser_space_dabs_by_pressure() {
+    // Plain tools: low pressure packs the dabs closer.
+    for tool in [Tool::Brush, Tool::Pencil, Tool::Eraser] {
+        let full = segment_dabs(tool, false, (1.0, 1.0));
+        let light = segment_dabs(tool, false, (0.2, 0.2));
+        assert!(
+            light.len() > full.len() * 2,
+            "{tool:?}: {} vs {}",
+            light.len(),
+            full.len()
+        );
+    }
+    // Every other drag that shares the Brush's: pressure changes nothing.
+    for (tool, clone) in [
+        (Tool::CloneStamp, true),
+        (Tool::Smudge, false),
+        (Tool::Blur, false),
+        (Tool::Sharpen, false),
+        (Tool::Dodge, false),
+        (Tool::Burn, false),
+        (Tool::Sponge, false),
+        (Tool::SpotHealing, false),
+    ] {
+        let full = segment_dabs(tool, clone, (1.0, 1.0));
+        let light = segment_dabs(tool, clone, (0.2, 0.2));
+        assert!(!full.is_empty(), "{tool:?} lays dabs");
+        assert_eq!(full, light, "{tool:?}");
+    }
+}
+
+#[test]
+fn the_brush_drag_helper_rejects_every_other_mode() {
+    assert!(pen_pressure::brush_drag_takes_pressure([false; 5]));
+    for i in 0..5 {
+        let mut flags = [false; 5];
+        flags[i] = true;
+        assert!(!pen_pressure::brush_drag_takes_pressure(flags), "{i}");
+    }
+}
+
+#[test]
+fn a_press_resets_the_stroke_pressure_to_the_press_sample() {
+    let mut p = pen_pressure::StrokePressure::default();
+    assert_eq!(p.press(0.9), 0.9);
+    assert_eq!(p.advance(0.5), (0.9, 0.5));
+    assert_eq!(p.advance(0.2), (0.5, 0.2));
+    // The next stroke starts from its own press, not from 0.2.
+    assert_eq!(p.press(0.8), 0.8);
+    assert_eq!(p.advance(0.7), (0.8, 0.7));
+    // A non-finite or out-of-range sample is cleaned.
+    assert_eq!(p.press(f32::NAN), 1.0);
+    assert_eq!(p.advance(3.0), (1.0, 1.0));
+    // The App presses through it at both stroke starts.
+    let source = include_str!("lib.rs");
+    assert_eq!(
+        source
+            .matches("self.stroke_pressure.press(self.pen_sample.pressure)")
+            .count(),
+        2,
+        "the Brush and the Eraser press"
+    );
+}
+
+#[test]
+fn quick_mask_strokes_get_full_pressure_in_the_move_glue() {
+    // `App::handle_pointer_moved` needs a window; pin the one rule.
+    let source = include_str!("lib.rs");
+    assert!(source.contains(
+        "let (pressure_from, pressure_to) = if self.quick_mask.is_none() {\n                (event_from, event_to)\n            } else {\n                (1.0, 1.0)\n            };"
+    ));
+}

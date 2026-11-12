@@ -14418,12 +14418,29 @@ fn continue_drag_pressured(
             quick_select::advance(quick, current_doc, tool_settings.dab_radius(DabTool::Brush))
         }
         Drag::Brush {
-            last_doc, carry, ..
+            last_doc,
+            carry,
+            clone,
+            smudge,
+            filter,
+            tone,
+            heal,
+            ..
         } => {
             let current_doc = view.to_document(canvas_point);
+            // Only the plain layer Brush and Pencil space by pressure; the
+            // Clone Stamp, Smudge, Blur, Sharpen, Dodge/Burn/Sponge and Spot
+            // Healing share this drag and keep the unpressured step.
+            let pressured = pen_pressure::brush_drag_takes_pressure([
+                clone.is_some(),
+                smudge.is_some(),
+                filter.is_some(),
+                tone.is_some(),
+                heal.is_some(),
+            ]);
             let step = pen_pressure::segment_step(
                 tool_settings.dab_radius(DabTool::Brush),
-                tool_settings.pressure_size,
+                tool_settings.pressure_size && pressured,
                 pressures.0,
                 pressures.1,
             );
@@ -31635,7 +31652,7 @@ struct App {
     pen_sample: aurora_core::PenSample,
     /// The previous pointer event's pressure during a Brush/Pencil/Eraser
     /// stroke (0.308.0): the start of the next segment's interpolation.
-    stroke_pressure: f32,
+    stroke_pressure: pen_pressure::StrokePressure,
     /// The Widget Gallery panel while open (0.130.0) — `None` means it is
     /// not in the tree at all. See [`toggle_gallery`].
     gallery: Option<aurora_ui::GalleryPanel>,
@@ -32212,7 +32229,7 @@ impl App {
             pointer_position: None,
             pointer_gate: pen_input::PointerGate::default(),
             pen_sample: aurora_core::PenSample::default(),
-            stroke_pressure: 1.0,
+            stroke_pressure: pen_pressure::StrokePressure::default(),
             gallery: None,
             gallery_click: ClickTracker::default(),
             channel_click: None,
@@ -35238,8 +35255,13 @@ impl App {
                 Drag::Brush { last_doc, .. } | Drag::Eraser { last_doc, .. } => Some(*last_doc),
                 _ => None,
             };
-            let pressure_from = self.stroke_pressure;
-            let pressure_to = pen_pressure::clean(self.pen_sample.pressure);
+            // Quick Mask strokes edit the mask grid and ignore pressure.
+            let (event_from, event_to) = self.stroke_pressure.advance(self.pen_sample.pressure);
+            let (pressure_from, pressure_to) = if self.quick_mask.is_none() {
+                (event_from, event_to)
+            } else {
+                (1.0, 1.0)
+            };
             let dabs = continue_drag_pressured(
                 drag,
                 canvas_point,
@@ -35259,9 +35281,6 @@ impl App {
                 }
                 _ => None,
             };
-            if segment_start.is_some() {
-                self.stroke_pressure = pressure_to;
-            }
             for doc_point in dabs {
                 if quick {
                     self.quick_select_stamp(doc_point);
@@ -35812,13 +35831,13 @@ impl App {
         match self.drag.as_ref() {
             Some(Drag::Brush { last_doc, .. }) => {
                 let last_doc = *last_doc;
-                self.stroke_pressure = pen_pressure::clean(self.pen_sample.pressure);
-                self.paint_dab(last_doc, self.stroke_pressure);
+                let pressure = self.stroke_pressure.press(self.pen_sample.pressure);
+                self.paint_dab(last_doc, pressure);
             }
             Some(Drag::Eraser { last_doc, .. }) => {
                 let last_doc = *last_doc;
-                self.stroke_pressure = pen_pressure::clean(self.pen_sample.pressure);
-                self.erase_dab(last_doc, self.stroke_pressure);
+                let pressure = self.stroke_pressure.press(self.pen_sample.pressure);
+                self.erase_dab(last_doc, pressure);
             }
             Some(Drag::Eyedropper) => {
                 let doc_point = self.doc.canvas_view.to_document(canvas_point);

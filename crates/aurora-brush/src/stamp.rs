@@ -884,14 +884,18 @@ fn stamp_dab_impl(
                                     };
                                     let limited_alpha = limited(3, a);
                                     // A varying ceiling (pen pressure, 0.308.0):
-                                    // a dab whose limited alpha is below what is
-                                    // there leaves the texel alone, so a light
-                                    // dab never lightens a heavier one. With a
-                                    // constant ceiling this never fires (the
-                                    // limited alpha of one stroke start is the
-                                    // same or higher than any earlier write), so
-                                    // that output is unchanged.
-                                    if limited_alpha.to_f32() < dst_a.to_f32() {
+                                    // once the stroke has a captured start for
+                                    // this tile, a dab whose limited alpha is
+                                    // below the alpha already there leaves the
+                                    // texel alone, so a light dab never lightens
+                                    // a heavier one. With a constant ceiling that
+                                    // never fires (limited alpha of one start
+                                    // is at least any earlier write's), and
+                                    // with no stroke start (`start` is `None`:
+                                    // no snapshot, or the tile's first dab) the
+                                    // rule is not consulted at all, so those
+                                    // writes are the unchanged ones bit for bit.
+                                    if start.is_some() && limited_alpha.to_f32() < dst_a.to_f32() {
                                         continue;
                                     }
                                     [
