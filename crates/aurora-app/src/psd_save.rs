@@ -343,8 +343,17 @@ pub(crate) fn begin_psd_save_timed(
     let image = crate::composite_document(source.layers, source.store, width, height)
         .map_err(PsdSaveFailure::Composite)?;
     timings.composite = started.elapsed();
-    let layers = source.layers;
-    let store = source.store;
+    // Task 176: editable layer filters are saved as their filtered pixels,
+    // from a copy of the document; the report says so.
+    let mut baked = crate::layer_filter_psd::bake_filters(source.layers, source.store)
+        .map_err(PsdSaveFailure::Composite)?;
+    let filter_entry = baked
+        .as_ref()
+        .map(crate::layer_filter_psd::BakedFilters::report_entry);
+    let (layers, store) = match baked.as_mut() {
+        Some(b) => (&b.layers, &mut b.store),
+        None => (source.layers, source.store),
+    };
     let write_time = Cell::new(Duration::ZERO);
     let sync_time = Cell::new(Duration::ZERO);
     let verify_time = Cell::new(Duration::ZERO);
@@ -391,6 +400,7 @@ pub(crate) fn begin_psd_save_timed(
     // The lines carried from the open, and the colour and path notes, are
     // entries of their own categories (task 157).
     outcome.report.extend_entries(source.carried);
+    outcome.report.extend_entries(filter_entry);
     if outcome.report.is_empty() {
         let started = Instant::now();
         let advisory = temp.persist();
@@ -496,12 +506,22 @@ pub(crate) fn check_psd_compatibility_cancellable(
         cancel,
         ..CountingSink::default()
     };
+    // Task 176: filters are saved as their filtered pixels.
+    let mut baked = crate::layer_filter_psd::bake_filters(source.layers, source.store)
+        .map_err(PsdSaveFailure::Composite)?;
+    let filter_entry = baked
+        .as_ref()
+        .map(crate::layer_filter_psd::BakedFilters::report_entry);
+    let (layers, store) = match baked.as_mut() {
+        Some(b) => (&b.layers, &mut b.store),
+        None => (source.layers, source.store),
+    };
     let outcome = aurora_io::write_psd_with_selections(
         &mut sink,
-        source.layers,
+        layers,
         source.canvas,
         &mut composite,
-        source.store,
+        store,
         opts,
         &source.saved,
     )
@@ -511,6 +531,7 @@ pub(crate) fn check_psd_compatibility_cancellable(
     })?;
     let mut report = outcome.report;
     report.extend_entries(source.carried);
+    report.extend_entries(filter_entry);
     Ok(report)
 }
 

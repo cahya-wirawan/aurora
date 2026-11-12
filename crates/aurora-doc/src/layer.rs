@@ -749,6 +749,13 @@ pub(crate) struct LayerEntry {
     /// [`crate::History::save_journal`] emits after a journaled `Restore`.
     #[serde(skip)]
     pub(crate) text_layer: Option<Box<crate::text_layer::TextLayer>>,
+    /// The layer's editable filters (task 176), on a pixel layer only.
+    /// `#[serde(skip)]` for the same reason as [`Self::effects`]: it travels
+    /// as `.aur`'s optional `layer-filters` entry and as the
+    /// `LayerOp::SetFilters` that [`crate::History::save_journal`] emits
+    /// after a journaled `Restore`.
+    #[serde(skip)]
+    pub(crate) filters: Option<Box<aurora_core::LayerFilters>>,
 }
 
 impl LayerEntry {
@@ -769,6 +776,7 @@ impl LayerEntry {
             blend_options: LayerBlendOptions::default(),
             effect_shape: None,
             text_layer: None,
+            filters: None,
         }
     }
 }

@@ -95,6 +95,22 @@ const WORKSPACE_NAME_PARAMS: &[ParamSpec] = &[ParamSpec::required(
         max_chars: NAME_MAX_CHARS,
     },
 )];
+const GAUSSIAN_BLUR_PARAMS: &[ParamSpec] = &[ParamSpec::required(
+    "radius",
+    "The blur radius in pixels (the Gaussian's standard deviation), 0.1 to 85 (fractions allowed).",
+    ParamKind::Number {
+        min: 0.1,
+        max: 85.0,
+    },
+)];
+const EDIT_FILTER_PARAMS: &[ParamSpec] = &[ParamSpec::required(
+    "radius",
+    "The new blur radius in pixels, 0.1 to 85 (fractions allowed).",
+    ParamKind::Number {
+        min: 0.1,
+        max: 85.0,
+    },
+)];
 const OPEN_PARAMS: &[ParamSpec] = &[PATH_TO_OPEN];
 const SAVE_PARAMS: &[ParamSpec] = &[PATH_TO_SAVE];
 
@@ -445,6 +461,47 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
         Write,
     )
     .requires(&[Clipped]),
+    // -- Editable layer filters (task 176) --
+    CommandSpec::new(
+        "layer.filter.gaussian_blur",
+        "Gaussian Blur\u{2026}",
+        "Adds an editable Gaussian Blur to the active pixel layer. It is computed when the layer \
+         is drawn, not baked into its pixels, and can be edited, hidden or removed later \
+         (one undo step).",
+        Layer,
+        Write,
+    )
+    .params(GAUSSIAN_BLUR_PARAMS),
+    CommandSpec::new(
+        "layer.filter.edit_last",
+        "Edit Last Layer Filter\u{2026}",
+        "Changes the radius of the active layer's last (topmost) filter (one undo step).",
+        Layer,
+        Write,
+    )
+    .params(EDIT_FILTER_PARAMS),
+    CommandSpec::new(
+        "layer.filter.toggle",
+        "Hide or Show Layer Filters",
+        "Hides the active layer's filters, or shows them when all are hidden. Their settings are \
+         kept (one undo step).",
+        Layer,
+        Write,
+    ),
+    CommandSpec::new(
+        "layer.filter.remove_last",
+        "Remove Last Layer Filter",
+        "Removes the active layer's last (topmost) filter (one undo step).",
+        Layer,
+        Write,
+    ),
+    CommandSpec::new(
+        "layer.filter.remove_all",
+        "Remove All Layer Filters",
+        "Removes every filter from the active layer (one undo step).",
+        Layer,
+        Write,
+    ),
     // -- Colours and the view --
     CommandSpec::new(
         "colour.swap",

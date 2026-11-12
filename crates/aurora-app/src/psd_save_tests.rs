@@ -173,7 +173,7 @@ fn psd_save_with_items_opens_dialog_and_target_untouched_until_save_anyway() {
         2,
         "the verified temp file waits beside it"
     );
-    ok(finish_psd_save(pending, doc.id, doc.revision));
+    let _ = ok(finish_psd_save(pending, doc.id, doc.revision));
     let back = ok(aurora_io::read_psd(&ok(std::fs::read(&path))));
     assert_eq!(names_bottom_up(&back.layers), ["Background", "Top"]);
     assert_eq!(doc.listing(), ["copy.psd"]);
@@ -366,7 +366,7 @@ fn lossy_psd_save_anyway_keeps_dirty() {
     let PsdSaveStep::NeedsConfirmation(pending) = ok(doc.save(&path)) else {
         unreachable!("needs confirmation")
     };
-    ok(finish_psd_save(pending, doc.id, doc.revision));
+    let _ = ok(finish_psd_save(pending, doc.id, doc.revision));
     assert!(path.exists(), "Save Anyway wrote it");
     let mut session = dirty_session(doc);
     // `App::answer_psd_save`: a save with changes is recorded as lossy.
@@ -727,7 +727,7 @@ fn the_five_new_adjustment_layers_save_and_reopen() {
                     .iter()
                     .any(|i| i.contains("preset name"))
             );
-            ok(finish_psd_save(pending, doc.id, doc.revision));
+            let _ = ok(finish_psd_save(pending, doc.id, doc.revision));
             step = PsdSaveStep::Saved;
         }
         assert!(matches!(step, PsdSaveStep::Saved), "{kind}: {step:?}");
@@ -776,7 +776,7 @@ fn the_five_new_adjustment_layers_save_and_reopen() {
         "{:?}",
         pending.report.items
     );
-    ok(finish_psd_save(pending, doc.id, doc.revision));
+    let _ = ok(finish_psd_save(pending, doc.id, doc.revision));
     let reopened = ok(aurora_io::read_psd(&ok(std::fs::read(&target))));
     let id = find(&reopened.layers, "Vibrant");
     let Some(aurora_doc::Adjustment::Vibrance(v)) = reopened.layers.adjustment(id) else {
@@ -1287,7 +1287,7 @@ fn a_brush_dab_on_a_smart_object_layer_drops_it_with_an_itemised_report() {
     let text = pending.report.items.join("\n");
     assert!(text.contains("painted or erased"), "{text}");
     assert!(text.contains("\u{201c}Top\u{201d}"), "{text}");
-    ok(finish_psd_save(pending, doc.id, doc.revision));
+    let _ = ok(finish_psd_save(pending, doc.id, doc.revision));
     let back = ok(aurora_io::read_psd(&ok(std::fs::read(&path))));
     assert!(back.layers.linked_files().is_empty());
     assert!(
@@ -1432,7 +1432,7 @@ mod crop_and_smart_objects {
             let text = pending.report.items.join("\n");
             assert!(text.contains("they were moved"), "{text}");
             assert!(text.contains("\u{201c}Top\u{201d}"), "{text}");
-            ok(finish_psd_save(pending, doc.id, doc.revision));
+            let _ = ok(finish_psd_save(pending, doc.id, doc.revision));
             assert_eq!(smart_layers(&path), 0, "written as ordinary pixels ({r:?})");
         }
     }
@@ -1526,7 +1526,7 @@ fn adjustment_layers_save_losslessly_and_rounded_ones_ask_first() {
     );
     let message = psd_save_message("rounded.psd", &pending.report);
     assert!(message.contains("rounded to whole numbers"), "{message}");
-    ok(finish_psd_save(pending, doc.id, doc.revision));
+    let _ = ok(finish_psd_save(pending, doc.id, doc.revision));
     assert!(target.exists());
 }
 
@@ -1710,7 +1710,7 @@ fn saved_selections_are_written_as_alpha_channels_and_reported() {
         !report.contains("Saved selections are not saved"),
         "{report}"
     );
-    ok(finish_psd_save(pending, doc.id, doc.revision));
+    let _ = ok(finish_psd_save(pending, doc.id, doc.revision));
     let back = ok(aurora_io::read_psd(&ok(std::fs::read(&path))));
     let names: Vec<&str> = back
         .saved_selections
@@ -2132,4 +2132,83 @@ fn a_flat_files_open_lines_carry_their_kinds() {
     assert!(losses.last().is_some_and(|l| l.text.contains("2 layers")));
     // Nothing to say: no lines at all.
     assert!(crate::flat_open_report(&aurora_io::ColourImport::default(), 0).is_empty());
+}
+
+// ---- task 176: layer filters are saved as their filtered pixels ----
+
+fn blur_filters(radius: f32) -> aurora_core::LayerFilters {
+    aurora_core::LayerFilters {
+        filters: vec![aurora_core::LayerFilter::new(
+            aurora_core::FilterKind::GaussianBlur { radius },
+        )],
+    }
+}
+
+#[test]
+fn a_filtered_layer_is_saved_as_its_filtered_pixels_and_the_save_asks() {
+    let mut doc = Doc::new();
+    let top = doc.tree.roots().first().copied();
+    let Some(top) = top else { unreachable!() };
+    ok(doc.tree.set_filters(top, Some(blur_filters(2.0))));
+    let before: Vec<f16> = {
+        let Some(surface) = doc.tree.surface_id(top) else {
+            unreachable!()
+        };
+        ok(doc.store.get(surface, aurora_tile::TileId { x: 0, y: 0 }))
+            .texels()
+            .to_vec()
+    };
+    let report = ok(crate::psd_save::check_psd_compatibility(source_of(
+        &mut doc,
+        Vec::new(),
+    )));
+    let line = report
+        .entries
+        .iter()
+        .find(|e| e.text.contains("Layer filters are not saved"));
+    assert_eq!(
+        line.map(|e| (e.category, e.affected.clone())),
+        Some((aurora_io::ReportCategory::NotSaved, vec!["Top".to_owned()]))
+    );
+    assert!(!report.is_empty(), "the save asks");
+    // The document itself is untouched by the bake.
+    let after: Vec<f16> = {
+        let Some(surface) = doc.tree.surface_id(top) else {
+            unreachable!()
+        };
+        ok(doc.store.get(surface, aurora_tile::TileId { x: 0, y: 0 }))
+            .texels()
+            .to_vec()
+    };
+    assert_eq!(before, after);
+    assert!(doc.tree.filters(top).is_some());
+    // Write it and read the layer back: it is blurred (not the stored
+    // pixels), and the opaque 8 x 8 layer lost alpha at its edge.
+    let path = doc.path("filtered.psd");
+    let PsdSaveStep::NeedsConfirmation(pending) = ok(doc.save(&path)) else {
+        unreachable!("filters make the save ask")
+    };
+    assert!(
+        pending
+            .report
+            .entries
+            .iter()
+            .any(|e| e.text.contains("Layer filters"))
+    );
+    let _ = ok(finish_psd_save(pending, doc.id, doc.revision));
+    let back = ok(aurora_io::read_psd(&ok(std::fs::read(&path))));
+    let Some(top_pixels) = back.pixels.last() else {
+        unreachable!("pixels")
+    };
+    let alpha_of = |samples: &[f16], x: usize, y: usize, w: usize| {
+        samples
+            .get((y * w + x) * 4 + 3)
+            .map_or(f32::NAN, |v| v.to_f32())
+    };
+    let w = top_pixels.image.width() as usize;
+    // The stored layer is opaque everywhere (alpha 1 at the corner); the
+    // saved, blurred one fades towards its edge against the surround.
+    assert!(before.get(3).is_some_and(|v| v.to_f32() > 0.99));
+    let corner = alpha_of(top_pixels.image.samples(), 0, 0, w);
+    assert!(corner < 0.9, "corner alpha {corner}");
 }

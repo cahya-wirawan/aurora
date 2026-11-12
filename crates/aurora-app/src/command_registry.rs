@@ -118,6 +118,20 @@ fn typed_form(call: &Validated) -> Option<Result<ActivatedCommand, TypedError>> 
         crate::COMMAND_FILE_OPEN => ActivatedCommand::OpenFile(path()?),
         crate::COMMAND_FILE_SAVE => ActivatedCommand::SaveFile(path()?),
         crate::colour_app::COMMAND_SET_OUTPUT => ActivatedCommand::SetOutputProfile(path()?),
+        crate::layer_filter_cmd::COMMAND_GAUSSIAN_BLUR => {
+            #[allow(clippy::cast_possible_truncation)] // validated to 0.1..=85
+            let radius = call.number("radius")? as f32;
+            ActivatedCommand::FilterApply(crate::layer_filter_cmd::FilterEdit::AddGaussianBlur(
+                radius,
+            ))
+        }
+        crate::layer_filter_cmd::COMMAND_EDIT_LAST => {
+            #[allow(clippy::cast_possible_truncation)] // validated to 0.1..=85
+            let radius = call.number("radius")? as f32;
+            ActivatedCommand::FilterApply(crate::layer_filter_cmd::FilterEdit::EditLastRadius(
+                radius,
+            ))
+        }
         crate::colour_range_app::COMMAND_ID => {
             let fuzziness = u16::try_from(call.int("fuzziness")?).ok()?;
             ActivatedCommand::ColourRangeApply(fuzziness)

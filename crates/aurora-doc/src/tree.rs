@@ -2535,6 +2535,40 @@ impl LayerTree {
         Ok(())
     }
 
+    /// The layer's editable filters (task 176), or `None` when it has none
+    /// or `id` does not exist.
+    #[must_use]
+    pub fn filters(&self, id: LayerId) -> Option<&aurora_core::LayerFilters> {
+        self.layers.get(&id)?.filters.as_deref()
+    }
+
+    /// Replaces the layer's filters (task 176); `None` (or an empty list)
+    /// removes them. Filters are data (invariant §7.3.2): no pixel is
+    /// touched.
+    ///
+    /// # Errors
+    ///
+    /// [`DocError::UnknownLayer`] if `id` doesn't exist;
+    /// [`DocError::NotAPixelLayer`] if it is not a pixel layer;
+    /// [`DocError::InvalidFilters`] if the list fails
+    /// [`aurora_core::LayerFilters::validate`]. Nothing is changed when any
+    /// happens.
+    pub fn set_filters(
+        &mut self,
+        id: LayerId,
+        value: Option<aurora_core::LayerFilters>,
+    ) -> Result<(), DocError> {
+        let entry = self.layers.get_mut(&id).ok_or(DocError::UnknownLayer(id))?;
+        if !matches!(entry.kind, LayerKind::Pixel { .. }) {
+            return Err(DocError::NotAPixelLayer(id));
+        }
+        if let Some(value) = &value {
+            value.validate().map_err(DocError::InvalidFilters)?;
+        }
+        entry.filters = value.filter(|f| !f.filters.is_empty()).map(Box::new);
+        Ok(())
+    }
+
     /// The layer's preserved text data (task 155), or `None` when it has
     /// none or `id` does not exist.
     #[must_use]

@@ -78,13 +78,15 @@ fn all_commands(menus: &[Menu]) -> Vec<String> {
 // -- the model --
 
 #[test]
-fn the_model_has_the_bars_six_menus_in_order() {
+fn the_model_has_the_bars_seven_menus_in_order() {
     let menus = menus_for(&context());
     let titles: Vec<&str> = menus.iter().map(|m| m.title).collect();
     assert_eq!(titles, aurora_ui::MENU_BAR_TITLES);
     assert_eq!(
         titles,
-        ["File", "Edit", "Layer", "Select", "View", "Window"]
+        [
+            "File", "Edit", "Layer", "Select", "Filter", "View", "Window"
+        ]
     );
 }
 
@@ -467,8 +469,8 @@ fn only_quit_runs_under_a_dialog() {
 
 #[test]
 fn wrap_step_wraps_both_ways() {
-    assert_eq!(wrap_step(5, 6, true), 0);
-    assert_eq!(wrap_step(0, 6, false), 5);
+    assert_eq!(wrap_step(6, 7, true), 0);
+    assert_eq!(wrap_step(0, 7, false), 6);
     assert_eq!(wrap_step(2, 6, true), 3);
     assert_eq!(wrap_step(2, 6, false), 1);
     assert_eq!(wrap_step(3, 0, true), 0);
@@ -654,7 +656,10 @@ fn clicking_a_title_routes_to_the_bar_and_toggles_its_menu() {
     assert_eq!(rig.click_action(title), BarAction::Toggle(0));
     assert!(rig.open(0, &context()));
     assert_eq!(rig.popup_count(), 1);
-    assert_eq!(rig.expanded(), [true, false, false, false, false, false]);
+    assert_eq!(
+        rig.expanded(),
+        [true, false, false, false, false, false, false]
+    );
     let open = rig.state.open.clone();
     assert_eq!(open.as_ref().map(|o| o.index), Some(0));
     // The popup holds the focus (a screen reader follows the highlight).
@@ -663,7 +668,7 @@ fn clicking_a_title_routes_to_the_bar_and_toggles_its_menu() {
     assert_eq!(rig.click_action(title), BarAction::Toggle(0));
     assert!(rig.state.close(&mut rig.ws, &mut rig.focus, true));
     assert_eq!(rig.popup_count(), 0);
-    assert_eq!(rig.expanded(), [false; 6]);
+    assert_eq!(rig.expanded(), [false; 7]);
     assert_eq!(
         rig.focus.focused(),
         Some(title),
@@ -678,7 +683,10 @@ fn opening_a_second_menu_replaces_the_first_so_one_popup_exists() {
     let first = rig.state.open.clone().map(|o| o.menu);
     assert!(rig.open(3, &context()));
     assert_eq!(rig.popup_count(), 1);
-    assert_eq!(rig.expanded(), [false, false, false, true, false, false]);
+    assert_eq!(
+        rig.expanded(),
+        [false, false, false, true, false, false, false]
+    );
     let second = rig.state.open.clone().map(|o| o.menu);
     assert_ne!(first, second);
     assert!(first.is_some_and(|menu| !rig.ws.tree.contains(menu)));
@@ -698,7 +706,7 @@ fn activating_an_enabled_row_runs_its_command_and_closes_the_menu() {
     );
     assert_eq!(rig.popup_count(), 0);
     assert!(rig.state.open.is_none());
-    assert_eq!(rig.expanded(), [false; 6]);
+    assert_eq!(rig.expanded(), [false; 7]);
     assert_eq!(rig.focus.focused(), Some(rig.ws.menu_bar.buttons[2]));
 }
 
@@ -728,7 +736,7 @@ fn escape_closes_the_popup_and_returns_focus_to_the_title() {
     assert_eq!(action, BarAction::None);
     assert!(rig.state.open.is_none());
     assert_eq!(rig.popup_count(), 0);
-    assert_eq!(rig.expanded(), [false; 6]);
+    assert_eq!(rig.expanded(), [false; 7]);
     assert_eq!(rig.focus.focused(), Some(rig.ws.menu_bar.buttons[4]));
 }
 
@@ -746,9 +754,9 @@ fn down_and_enter_walk_the_popup_through_the_toolkits_keys() {
 fn left_and_right_move_between_open_menus_and_wrap() {
     let mut rig = Rig::new();
     assert!(rig.open(0, &context()));
-    assert_eq!(rig.key(NamedKey::ArrowLeft).0, Some(KeyAction::Open(5)));
+    assert_eq!(rig.key(NamedKey::ArrowLeft).0, Some(KeyAction::Open(6)));
     assert_eq!(rig.key(NamedKey::ArrowRight).0, Some(KeyAction::Open(1)));
-    assert!(rig.open(5, &context()));
+    assert!(rig.open(6, &context()));
     assert_eq!(rig.key(NamedKey::ArrowRight).0, Some(KeyAction::Open(0)));
     // Other keys are the toolkit's, not the bar's.
     assert_eq!(rig.key(NamedKey::Home).0, None);
@@ -764,7 +772,7 @@ fn keys_on_a_focused_title_open_it_or_move_along_the_bar() {
     assert_eq!(rig.focus.focused(), Some(titles[2]));
     assert!(rig.focus.focus(&mut rig.ws.tree, titles[0]).is_ok());
     assert_eq!(rig.key(NamedKey::ArrowLeft).0, Some(KeyAction::Handled));
-    assert_eq!(rig.focus.focused(), Some(titles[5]), "wraps");
+    assert_eq!(rig.focus.focused(), Some(titles[6]), "wraps");
     // Focus elsewhere: the bar passes every key.
     let canvas_button = rig.ws.tools.buttons[0].1;
     assert!(rig.focus.focus(&mut rig.ws.tree, canvas_button).is_ok());
@@ -855,7 +863,7 @@ fn no_menu_opens_under_a_modal_and_a_modal_closes_an_open_one() {
     );
     assert!(rig.state.close_for_modal(&mut rig.ws, &mut rig.focus, true));
     assert_eq!(rig.popup_count(), 0);
-    assert_eq!(rig.expanded(), [false; 6]);
+    assert_eq!(rig.expanded(), [false; 7]);
 }
 
 #[test]
@@ -877,7 +885,7 @@ fn a_popup_removed_behind_the_states_back_is_forgotten() {
     assert!(rig.ws.tree.remove(menu).is_ok());
     rig.state.forget_stale(&mut rig.ws);
     assert!(rig.state.open.is_none());
-    assert_eq!(rig.expanded(), [false; 6]);
+    assert_eq!(rig.expanded(), [false; 7]);
 }
 
 #[test]
