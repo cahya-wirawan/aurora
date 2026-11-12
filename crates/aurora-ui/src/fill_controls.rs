@@ -291,7 +291,8 @@ fn insert_paint_group(
     let pressure_size = widgets::insert_checkbox(tree, paint, scales, PRESSURE_SIZE_LABEL)?;
     widgets::set_checkbox_accessible_name(tree, pressure_size, "Pressure for Size")?;
     widgets::set_checkbox_checked(tree, pressure_size, Toggled::True)?;
-    let pressure_opacity = widgets::insert_checkbox(tree, paint, scales, "Pressure for Opacity")?;
+    let pressure_opacity = widgets::insert_checkbox(tree, paint, scales, PRESSURE_OPACITY_LABEL)?;
+    widgets::set_checkbox_accessible_name(tree, pressure_opacity, "Pressure for Opacity")?;
     for (id, item) in [
         (paint_opacity_readout, OptionsItem::Readout),
         (paint_opacity, OptionsItem::Slider),

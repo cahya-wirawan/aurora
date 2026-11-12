@@ -84,7 +84,7 @@ pub(crate) fn dab_through_selection(
     )
 }
 
-/// [`dab_through_selection`] for a dab laid with pen `pressure` (0.308.0);
+/// `dab_through_selection` (test-only) for a dab laid with pen `pressure` (0.308.0);
 /// at 1.0 it is exactly the earlier function.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dab_through_selection_pressured(

@@ -13484,7 +13484,7 @@ struct RailResize {
 /// `pointer_x` — pure arithmetic, [`App::handle_pointer_moved`]'s own
 /// delta computation extracted so it's testable without a real window
 /// or `App` (the same "pure function `App` just calls" shape
-/// [`continue_drag`] already uses). The rail sits to the *right* of the
+/// [`continue_drag_pressured`] already uses). The rail sits to the *right* of the
 /// divider (`design/mockups/workspace.html`'s own canvas-then-rail
 /// ordering), so moving the pointer right shrinks it by exactly that
 /// rightward travel, and moving left grows it by exactly that leftward
@@ -13506,7 +13506,7 @@ fn resized_rail_width(resize: RailResize, pointer_x: f32) -> f32 {
 /// already travelled past the last placed dab
 /// (`aurora_brush::advance_segment`'s own carry parameter) — so spacing
 /// stays correct across many small move events, not just within one
-/// event's own segment (see [`continue_drag`]'s own doc comment for why
+/// event's own segment (see [`continue_drag_pressured`]'s own doc comment for why
 /// this matters). `Eraser` is otherwise identical to `Brush` — same
 /// dab-spacing math, different pixel operation once a dab lands (see
 /// [`App::erase_dab`]) — so it gets its own variant rather than reusing
@@ -13517,7 +13517,7 @@ fn resized_rail_width(resize: RailResize, pointer_x: f32) -> f32 {
 /// `start_doc`/`start_bounds` (the drag's own fixed starting point and
 /// that layer's own bounds at that moment), and `current_bounds` — the
 /// live result of shifting `start_bounds` by however far the pointer
-/// has travelled since `start_doc` ([`continue_drag`] updates this
+/// has travelled since `start_doc` ([`continue_drag_pressured`] updates this
 /// field in place, mirroring `Pan`'s own `last_screen`); the caller
 /// (`App::handle_pointer_moved`) reads it back out afterward and
 /// applies it to the document (`App::apply_move`) — the same
@@ -14344,12 +14344,12 @@ fn continue_drag(
     )
 }
 
-/// [`continue_drag`] for a pen whose pressure went from `pressures.0` (the
+/// `continue_drag` (test-only) for a pen whose pressure went from `pressures.0` (the
 /// previous event) to `pressures.1` (this one) (0.308.0): the Brush and
 /// Eraser space their dabs by the pressured radius at the mean pressure
 /// ([`pen_pressure::segment_step`]); every other drag ignores it. At
 /// `(1.0, 1.0)`, or with "Pressure for Size" off, the step is exactly
-/// [`continue_drag`]'s earlier one.
+/// `continue_drag` (test-only)'s earlier one.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 fn continue_drag_pressured(
@@ -15236,7 +15236,7 @@ impl PanBounds {
 /// ([`active_layer_origin`], the value [`canvas_local_origin`]
 /// subtracts) on the near edge and that origin plus the document
 /// ceiling on the far one, and every gesture that moves the *pan*
-/// already applies it ([`continue_drag`], [`apply_scroll_zoom`],
+/// already applies it ([`continue_drag_pressured`], [`apply_scroll_zoom`],
 /// [`handle_zoom_tool_click`]). This is the
 /// counterpart for the other way the same invariant breaks: the active
 /// layer's own origin changing moves the boundary out from under a pan
@@ -30090,7 +30090,7 @@ impl ToolSettings {
 
 /// The two tools that lay dabs (review M4a/M4b): the one key
 /// [`ToolSettings::dab_radius`] reads a live radius by, so every dab
-/// site — [`continue_drag`]'s spacing and [`stamp_tool_dab`]'s stamp —
+/// site — [`continue_drag_pressured`]'s spacing and [`stamp_tool_dab`]'s stamp —
 /// asks the same question the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DabTool {
@@ -30517,7 +30517,7 @@ fn adopt_history_failure(
 impl ToolSettings {
     /// The live radius `tool`'s dabs are laid with — **the only place a
     /// dab site reads a radius** (review M4a/M4b, 0.136.0). Both
-    /// [`continue_drag`]'s dab spacing and [`stamp_tool_dab`]'s stamp go
+    /// [`continue_drag_pressured`]'s dab spacing and [`stamp_tool_dab`]'s stamp go
     /// through it, so neither can silently fall back to
     /// [`BRUSH_RADIUS`]/[`ERASER_RADIUS`] on its own.
     fn dab_radius(&self, tool: DabTool) -> f32 {
@@ -35170,7 +35170,7 @@ impl App {
     /// tool-dependent, the same reason [`Self::handle_pointer_pressed`]
     /// checks [`pointer_on_rail_divider`] before its own canvas gate.
     /// Otherwise, if a canvas drag is in progress, advances it
-    /// ([`continue_drag`]), painting or erasing any dab positions it
+    /// ([`continue_drag_pressured`]), painting or erasing any dab positions it
     /// returns ([`Self::paint_dab`]/[`Self::erase_dab`], chosen by which
     /// `Drag` variant is active) — empty for every drag but
     /// `Brush`/`Eraser`. For `Drag::Move`, applies its own live,
