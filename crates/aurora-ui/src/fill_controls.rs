@@ -88,10 +88,16 @@ pub struct FillControls {
     pub paint_flow_readout: WidgetId,
     /// The paint Flow slider, 1 to 100.
     pub paint_flow: WidgetId,
+    /// The "Pressure for Size" checkbox (Brush, Pencil, Eraser).
+    pub pressure_size: WidgetId,
+    /// The "Pressure for Opacity" checkbox (Brush, Pencil, Eraser).
+    pub pressure_opacity: WidgetId,
 }
 
 /// The fill settings the controls mirror.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Independent on/off options of different tools, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct FillView {
     /// Radial (`true`) or Linear (`false`).
     pub radial: bool,
@@ -129,6 +135,22 @@ pub struct FillView {
     pub eraser_opacity: u8,
     /// Eraser flow, 1 to 100 (0.229.0).
     pub eraser_flow: u8,
+    /// Pen pressure scales the dab size (Brush, Pencil, Eraser).
+    pub pressure_size: bool,
+    /// Pen pressure scales the dab opacity (Brush, Pencil, Eraser).
+    pub pressure_opacity: bool,
+}
+
+/// The drawn label of the "Pressure for Size" checkbox.
+pub const PRESSURE_SIZE_LABEL: &str = "Pen Size";
+/// The drawn label of the "Pressure for Opacity" checkbox.
+pub const PRESSURE_OPACITY_LABEL: &str = "Pen Opacity";
+
+/// Whether `tool` shows the pen pressure checkboxes: the Brush, Pencil and
+/// Eraser (the Clone Stamp and the other dab tools ignore pressure).
+#[must_use]
+pub const fn has_pen_pressure(tool: Tool) -> bool {
+    matches!(tool, Tool::Brush | Tool::Pencil | Tool::Eraser)
 }
 
 /// "Opacity 100 %".
@@ -236,12 +258,12 @@ fn reserve_readout_widths(
 
 /// The Brush, Pencil, Clone Stamp and (0.229.0) Eraser group (0.228.0): Opacity, and Flow for
 /// the two that have one. Returns the group and its
-/// `[opacity readout, opacity, flow readout, flow]`.
+/// `[opacity readout, opacity, flow readout, flow, pressure size, pressure opacity]`.
 fn insert_paint_group(
     tree: &mut WidgetTree<WidgetKind>,
     options: WidgetId,
     scales: &Scales,
-) -> Result<(WidgetId, [WidgetId; 4]), WidgetError> {
+) -> Result<(WidgetId, [WidgetId; 6]), WidgetError> {
     let paint = widgets::insert_container(tree, options, group_style(scales, 2))?;
     let paint_opacity_readout =
         widgets::insert_label(tree, paint, scales, opacity_readout_text(100))?;
@@ -264,11 +286,20 @@ fn insert_paint_group(
         STRENGTH_MIN,
         STRENGTH_MAX,
     )?;
+    // Short drawn labels keep the Brush's row inside the bar at a 1,280 px
+    // window; assistive technology still hears the full names.
+    let pressure_size = widgets::insert_checkbox(tree, paint, scales, PRESSURE_SIZE_LABEL)?;
+    widgets::set_checkbox_accessible_name(tree, pressure_size, "Pressure for Size")?;
+    widgets::set_checkbox_checked(tree, pressure_size, Toggled::True)?;
+    let pressure_opacity = widgets::insert_checkbox(tree, paint, scales, PRESSURE_OPACITY_LABEL)?;
+    widgets::set_checkbox_accessible_name(tree, pressure_opacity, "Pressure for Opacity")?;
     for (id, item) in [
         (paint_opacity_readout, OptionsItem::Readout),
         (paint_opacity, OptionsItem::Slider),
         (paint_flow_readout, OptionsItem::Readout),
         (paint_flow, OptionsItem::Slider),
+        (pressure_size, OptionsItem::Check),
+        (pressure_opacity, OptionsItem::Check),
     ] {
         set_options_item(tree, scales, id, item, true)?;
     }
@@ -280,6 +311,8 @@ fn insert_paint_group(
             paint_opacity,
             paint_flow_readout,
             paint_flow,
+            pressure_size,
+            pressure_opacity,
         ],
     ))
 }
@@ -356,6 +389,8 @@ pub fn insert_fill_controls(
             paint_opacity,
             paint_flow_readout,
             paint_flow,
+            pressure_size,
+            pressure_opacity,
         ],
     ) = insert_paint_group(tree, options, scales)?;
 
@@ -399,6 +434,8 @@ pub fn insert_fill_controls(
         paint_opacity,
         paint_flow_readout,
         paint_flow,
+        pressure_size,
+        pressure_opacity,
     })
 }
 
@@ -554,6 +591,15 @@ pub fn sync_fill_controls(
         changed |= set_item_shown(tree, id, flow_shown)?;
         changed |= set_node_hidden(tree, id, !flow_shown)?;
     }
+    // The pen pressure checkboxes: the Clone Stamp shares the group but
+    // ignores pressure.
+    changed |= sync_checkbox(tree, fill.pressure_size, view.pressure_size)?;
+    changed |= sync_checkbox(tree, fill.pressure_opacity, view.pressure_opacity)?;
+    let pressure_shown = has_pen_pressure(tool);
+    for id in [fill.pressure_size, fill.pressure_opacity] {
+        changed |= set_item_shown(tree, id, pressure_shown)?;
+        changed |= set_node_hidden(tree, id, !pressure_shown)?;
+    }
     Ok(changed)
 }
 
@@ -619,6 +665,8 @@ mod tests {
         clone_flow: 100,
         eraser_opacity: 100,
         eraser_flow: 100,
+        pressure_size: true,
+        pressure_opacity: false,
     };
 
     fn built() -> (crate::Workspace, ToolControls) {
@@ -757,6 +805,8 @@ mod tests {
             clone_flow: 100,
             eraser_opacity: 100,
             eraser_flow: 100,
+            pressure_size: true,
+            pressure_opacity: false,
         };
         assert!(sync(&mut ws, &controls, Tool::Gradient, view, None));
         assert!(!sync(&mut ws, &controls, Tool::Gradient, view, None));
@@ -959,6 +1009,8 @@ mod tests {
             clone_flow: 90,
             eraser_opacity: 35,
             eraser_flow: 65,
+            pressure_size: true,
+            pressure_opacity: false,
             ..VIEW
         }
     }
@@ -1017,6 +1069,71 @@ mod tests {
         assert_eq!(shown_fill_group(&ws.tree, &controls), Some(Tool::Brush));
         sync(&mut ws, &controls, Tool::Move, paint_view(), None);
         assert_eq!(shown_fill_group(&ws.tree, &controls), None);
+    }
+
+    #[test]
+    fn the_pressure_checkboxes_show_for_brush_pencil_and_eraser_only() {
+        let (mut ws, controls) = built();
+        let fill = controls.fill;
+        for tool in Tool::ALL {
+            sync(&mut ws, &controls, tool, paint_view(), None);
+            ws.tree.compute_layout(1600.0, 900.0);
+            let wants = matches!(tool, Tool::Brush | Tool::Pencil | Tool::Eraser);
+            assert_eq!(super::has_pen_pressure(tool), wants, "{tool:?}");
+            for id in [fill.pressure_size, fill.pressure_opacity] {
+                assert_eq!(shown(&ws.tree, id), wants, "{tool:?} {id:?}");
+                assert_eq!(hidden_to_at(&ws.tree, id), !wants, "{tool:?} {id:?}");
+                if wants {
+                    assert!(tool_controls_contains(&ws.tree, &controls, id));
+                    let Some(b) = ws.tree.bounds(id) else {
+                        unreachable!("laid out");
+                    };
+                    assert!(b.width > 0 && b.height > 0, "{tool:?} {id:?} {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_pressure_checkboxes_are_named_and_mirror_the_settings() {
+        let (mut ws, controls) = built();
+        let fill = controls.fill;
+        for (id, name) in [
+            (fill.pressure_size, "Pressure for Size"),
+            (fill.pressure_opacity, "Pressure for Opacity"),
+        ] {
+            let label = ws
+                .tree
+                .accessibility(id)
+                .and_then(|n| n.label().map(str::to_owned));
+            assert_eq!(label.as_deref(), Some(name));
+        }
+        let state = |ws: &crate::Workspace, id| {
+            ws.tree.accessibility(id).and_then(accesskit::Node::toggled)
+        };
+        sync(&mut ws, &controls, Tool::Brush, paint_view(), None);
+        assert_eq!(
+            state(&ws, fill.pressure_size),
+            Some(accesskit::Toggled::True)
+        );
+        assert_eq!(
+            state(&ws, fill.pressure_opacity),
+            Some(accesskit::Toggled::False)
+        );
+        let flipped = FillView {
+            pressure_size: false,
+            pressure_opacity: true,
+            ..paint_view()
+        };
+        sync(&mut ws, &controls, Tool::Eraser, flipped, None);
+        assert_eq!(
+            state(&ws, fill.pressure_size),
+            Some(accesskit::Toggled::False)
+        );
+        assert_eq!(
+            state(&ws, fill.pressure_opacity),
+            Some(accesskit::Toggled::True)
+        );
     }
 
     #[test]

@@ -1830,7 +1830,10 @@ fn in_a_narrow_bar_the_sliders_give_up_width_before_any_readout() {
     // Between the two, the Brush's sliders are wider than the floor but
     // not yet full, with its readouts exactly where they were at 700.
     let (narrow, _) = options_items(&mut bar, Tool::Brush, 700.0);
-    let (mid, _) = options_items(&mut bar, Tool::Brush, 1100.0);
+    // 1,440 px since 0.308.0 (was 1,100): the two pen pressure checkboxes
+    // lengthen the Brush's controls, so its sliders sit at their floor up to
+    // about 1,270 px and are between floor and full only above that.
+    let (mid, _) = options_items(&mut bar, Tool::Brush, 1440.0);
     let sliders: Vec<i64> = mid
         .iter()
         .filter(|i| i.leaf == Leaf::Slider)
@@ -2240,5 +2243,31 @@ mod path_paint_flows {
             ),
             Err(FillRefused::Notice(LockRefusal::FillNeedsPixelLayer))
         ));
+    }
+}
+
+/// The default workspace at a 1,280 and a 1,440 px window (rail open, the
+/// default rail width, scale 1, measured text): every control of the
+/// Brush, Pencil and Eraser bars, the pen pressure checkboxes included,
+/// lies wholly inside the options bar. Measured 1,280: bar x 76..1026, the
+/// Brush's last item ends at 1014; 1,440: bar 76..1186, last item 1174.
+#[test]
+fn the_paint_tools_bars_fit_wholly_inside_the_bar_at_1280_and_1440() {
+    let mut bar = Bar::new();
+    for width in [1280.0, 1440.0] {
+        for tool in [Tool::Brush, Tool::Pencil, Tool::Eraser] {
+            let (items, (left, right)) = options_items(&mut bar, tool, width);
+            let checks = items.iter().filter(|i| i.leaf == Leaf::Check).count();
+            assert_eq!(checks, 2, "{tool:?}: both pressure checkboxes are laid out");
+            for item in &items {
+                assert!(
+                    item.x >= left && item.right <= right,
+                    "{tool:?} at {width}: a {:?} spans {}..{} outside the bar {left}..{right}",
+                    item.leaf,
+                    item.x,
+                    item.right
+                );
+            }
+        }
     }
 }

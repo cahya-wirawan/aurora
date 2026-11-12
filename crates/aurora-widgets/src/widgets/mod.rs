@@ -178,7 +178,8 @@ pub use button::{
     set_button_hovered, set_button_pressed, set_button_toggled,
 };
 pub use checkbox::{
-    CheckboxState, insert_checkbox, set_checkbox_checked, set_checkbox_disabled, toggle_checkbox,
+    CheckboxState, insert_checkbox, set_checkbox_accessible_name, set_checkbox_checked,
+    set_checkbox_disabled, toggle_checkbox,
 };
 pub(crate) use checkbox::{checkbox_box_rect, checkbox_metrics};
 pub use color_picker::{

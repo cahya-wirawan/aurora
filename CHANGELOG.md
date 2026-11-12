@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.308.0] - 2026-11-12
+
+### Changed
+
+- Pen pressure controls Brush, Pencil and Eraser size and opacity
+
 ## [0.307.0] - 2026-11-11
 
 ### Changed

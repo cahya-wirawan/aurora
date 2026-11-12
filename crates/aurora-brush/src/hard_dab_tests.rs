@@ -647,3 +647,90 @@ fn the_grid_dab_clips_to_the_grid_and_reports_no_change_when_already_set() {
     let _ = stamp_toward(&mut soft, 64, 64, (30.5, 30.5), 10.0, 0);
     assert!(soft.iter().any(|&v| v != 0 && v != 255));
 }
+
+/// 0.308.0: the Pencil's pressure rule (skip a texel whose limited alpha is
+/// below the one there) must not touch a dab with no stroke snapshot: each
+/// dab is its own stroke and writes `s + (colour - s) * o` per channel, as
+/// before. Checked against that rule written out, over overlapping dabs
+/// with an opacity ceiling.
+#[test]
+fn a_pencil_dab_without_a_snapshot_writes_the_unchanged_limited_texel() {
+    use crate::amount_tests::{bits, h, store, surface, texel};
+    use crate::{PaintAmount, stamp_dab_amount};
+    let (_dir, mut s) = store();
+    let colour = [0.9_f32, 0.3, 0.1];
+    let o = 0.6_f32;
+    let amount = PaintAmount::new(o, 1.0);
+    let mut model: std::collections::HashMap<(u32, u32), crate::amount_tests::Tx> =
+        std::collections::HashMap::new();
+    // Lay a backdrop through a full-opacity Pencil dab, then reset the model.
+    let _ = stamp_dab_amount(
+        &mut s,
+        surface(),
+        (32.0, 32.0),
+        14.0,
+        [0.2, 0.2, 0.2],
+        None,
+        None,
+        false,
+        true,
+        PaintAmount::FULL,
+    );
+    for y in 18..46 {
+        for x in 18..46 {
+            model.insert((x, y), texel(&mut s, x, y));
+        }
+    }
+    let dabs = [
+        (30.0_f32, 30.0_f32, 5.0_f32),
+        (33.0, 31.0, 4.0),
+        (31.0, 34.0, 6.0),
+        (30.0, 30.0, 2.0),
+    ];
+    for (cx, cy, r) in dabs {
+        let _ = stamp_dab_amount(
+            &mut s,
+            surface(),
+            (cx, cy),
+            r,
+            colour,
+            None,
+            None,
+            false,
+            true,
+            amount,
+        );
+        let (sx, sy) = crate::hard_dab_snap((cx, cy));
+        for y in 18..46_u32 {
+            for x in 18..46_u32 {
+                let (px_, py_) = (x as f32 + 0.5, y as f32 + 0.5);
+                let d = ((px_ - sx).powi(2) + (py_ - sy).powi(2)).sqrt();
+                if d >= r {
+                    continue;
+                }
+                let Some(old) = model.get(&(x, y)).copied() else {
+                    continue;
+                };
+                let lim = |c: usize, painted: f32| {
+                    let st = old[c].to_f32();
+                    h(st + (painted - st) * o)
+                };
+                model.insert(
+                    (x, y),
+                    [
+                        lim(0, colour[0]),
+                        lim(1, colour[1]),
+                        lim(2, colour[2]),
+                        lim(3, 1.0),
+                    ],
+                );
+            }
+        }
+    }
+    for y in 18..46 {
+        for x in 18..46 {
+            let want = model.get(&(x, y)).copied().map(bits);
+            assert_eq!(want, Some(bits(texel(&mut s, x, y))), "({x}, {y})");
+        }
+    }
+}
