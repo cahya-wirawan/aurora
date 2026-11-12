@@ -604,6 +604,11 @@ mod layer_thumbnails;
 pub mod mcp_session;
 mod pen_input;
 mod pen_pressure;
+mod straighten;
+mod straighten_app;
+mod straighten_doc;
+#[cfg(test)]
+mod straighten_tests;
 pub use bridge_app::{AUTOMATION_CONNECTED, BridgeOptions};
 mod menu_bar_app;
 mod menu_bar_state;
@@ -6358,6 +6363,11 @@ enum ActivatedCommand {
     SetCropRatio(aurora_ui::CropRatio),
     /// Swap the Crop tool's orientation (0.236.0): palette only.
     SwapCropOrientation,
+    /// Open the Straighten angle prompt (task 180): palette only.
+    StraightenPrompt,
+    /// Set the Crop tool's Straighten angle, in degrees (task 180); `0`
+    /// clears it.
+    StraightenApply(f64),
     /// A clipboard command (0.235.0).
     Clipboard(clipboard_app::ClipCommand),
     /// Select > Modify (0.216.0): open the number prompt of a command.
@@ -6979,6 +6989,9 @@ fn activate_command(
     }
     if id == crop::COMMAND_CROP_TO_SELECTION {
         return Some(ActivatedCommand::CropToSelection);
+    }
+    if id == straighten::COMMAND_ID {
+        return Some(ActivatedCommand::StraightenPrompt);
     }
     if id == crop::COMMAND_SWAP_ORIENTATION {
         return Some(ActivatedCommand::SwapCropOrientation);
@@ -9008,6 +9021,7 @@ fn sync_tool_controls(
         tool,
         settings.crop_ratio,
         settings.crop_portrait,
+        settings.crop_straighten,
     ) {
         Ok(changed) => changed,
         Err(err) => {
@@ -9058,6 +9072,7 @@ fn status_info(
         selection: None,
         quick_mask: false,
         crop: None,
+        crop_angle: None,
         automation: bridge_app::AUTOMATION_CONNECTED.load(std::sync::atomic::Ordering::SeqCst),
         task: None,
     }
@@ -9095,7 +9110,7 @@ fn sync_status_bar_notice(
     notice: Option<&'static str>,
     selection: Option<aurora_doc::Selection>,
     quick_mask: bool,
-    crop: Option<aurora_core::Rect>,
+    crop: Option<(aurora_core::Rect, Option<f32>)>,
     task: Option<&'static str>,
 ) -> bool {
     let bar = workspace.status_bar;
@@ -9104,7 +9119,8 @@ fn sync_status_bar_notice(
     info.notice = notice;
     info.selection = selection;
     info.quick_mask = quick_mask;
-    info.crop = crop;
+    info.crop = crop.map(|(rect, _)| rect);
+    info.crop_angle = crop.and_then(|(_, angle)| angle);
     match aurora_ui::sync_status_bar(&mut workspace.tree, bar, &info) {
         Ok(changed) => changed,
         Err(err) => {
@@ -9152,6 +9168,12 @@ fn apply_fill_control_outcome(
             let chosen = aurora_ui::CropRatio::at(*index).unwrap_or(settings.crop_ratio);
             let changed = settings.crop_ratio != chosen;
             settings.crop_ratio = chosen;
+            changed
+        }
+        ActionOutcome::Toggled { id, state } if *id == controls.crop.straighten => {
+            let on = *state == accesskit::Toggled::True;
+            let changed = settings.crop_straighten != on;
+            settings.crop_straighten = on;
             changed
         }
         ActionOutcome::Toggled { id, state } if *id == controls.crop.portrait => {
@@ -11429,6 +11451,10 @@ enum UndoKind {
     /// ([`crop::CropStep`]); its document half is one `Translate` step in
     /// `aurora_doc::History`. It is a content change (dirty).
     Crop,
+    /// A straighten (task 180): every surface resampled onto the rotated
+    /// crop. Its data lives in [`UndoOrder`]
+    /// ([`straighten_doc::StraightenStep`]) and in both history stores.
+    Straighten,
     /// An edit of the document's paths (0.233.0): its before and after live
     /// in [`UndoOrder`] ([`pen::PathStep`]). Unlike a selection step it
     /// is a content change (dirty): paths are authored work saved with the
@@ -11500,6 +11526,14 @@ struct UndoOrder {
     /// the same order (the newest on top).
     crop_undo: Vec<crop::CropStep>,
     crop_redo: Vec<crop::CropStep>,
+    /// The straightens behind the `Straighten` tags (task 180), the newest
+    /// on top.
+    straighten_undo: Vec<straighten_doc::StraightenStep>,
+    straighten_redo: Vec<straighten_doc::StraightenStep>,
+    /// The selections, paths and canvas size an undo or redo of a
+    /// straighten has just put in force, for the owner of the live document
+    /// to take ([`straighten_doc::apply_pending_straighten`]).
+    pending_straighten: Option<straighten_doc::PendingStraighten>,
     /// What an undo or redo of crops has just put in force, for the owner
     /// of the live document to take ([`crop::apply_pending_crop`]); shifts
     /// of several steps in one History jump add up.
@@ -11588,6 +11622,7 @@ fn default_step_label(kind: UndoKind) -> &'static str {
         UndoKind::Pixel => "Pixel Edit",
         UndoKind::Selection => "Selection Change",
         UndoKind::Crop => crop::CROP_LABEL,
+        UndoKind::Straighten => straighten::STRAIGHTEN_LABEL,
         UndoKind::Path => "Path Change",
         UndoKind::LayerViaCut => clipboard_app::LAYER_VIA_CUT_LABEL,
     }
@@ -11617,6 +11652,9 @@ impl Default for UndoOrder {
             pending_selection: None,
             crop_undo: Vec::new(),
             crop_redo: Vec::new(),
+            straighten_undo: Vec::new(),
+            straighten_redo: Vec::new(),
+            pending_straighten: None,
             pending_crop: None,
             path_undo: Vec::new(),
             path_redo: Vec::new(),
@@ -11898,6 +11936,15 @@ impl UndoOrder {
                 self.step_forward();
             }
         }
+        // A straighten stepped earlier in the same jump holds a whole state
+        // in the coordinates before this crop's shift: the crop folds into it.
+        if let Some(pending) = self.pending_straighten.as_mut() {
+            if pending.set.translate(dx, dy).is_err() {
+                pending.set = aurora_doc::SelectionSet::new();
+            }
+            pending.canvas = canvas;
+            return true;
+        }
         if let Some(Some(target)) = self.pending_selection.take() {
             self.pending_selection = Some(target.translated(dx, dy).ok());
         }
@@ -11926,6 +11973,103 @@ impl UndoOrder {
     /// once.
     fn take_pending_crop(&mut self) -> Option<crop::PendingCrop> {
         self.pending_crop.take()
+    }
+
+    /// Records a committed straighten as a step labelled "Straighten" (task
+    /// 180), after its `SetAllBounds` step is in `history` and its pixel
+    /// entries are in `pixel_history`.
+    fn record_straighten(
+        &mut self,
+        step: straighten_doc::StraightenStep,
+        history: &mut aurora_doc::History,
+        pixel_history: &mut aurora_brush::PixelHistory,
+    ) {
+        self.record_labelled(
+            UndoKind::Straighten,
+            straighten::STRAIGHTEN_LABEL.to_owned(),
+            history,
+            pixel_history,
+        );
+        // After `record_labelled`, which clears the redo side.
+        self.straighten_undo.push(step);
+    }
+
+    /// Drops every redo step, here and in both backing stores (a straighten
+    /// that failed after it had already cleared the pixel history's redo).
+    fn discard_redo(
+        &mut self,
+        history: &mut aurora_doc::History,
+        pixel_history: &mut aurora_brush::PixelHistory,
+    ) {
+        self.redo.clear();
+        self.redo_labels.clear();
+        self.selection_redo.clear();
+        self.crop_redo.clear();
+        self.straighten_redo.clear();
+        self.path_redo.clear();
+        history.clear_redo();
+        pixel_history.clear_redo();
+    }
+
+    /// How many pixel-history entries the top straighten of the `direction`
+    /// side owns; `None` when the top tag is not a straighten or its data is
+    /// missing.
+    fn straighten_pixel_steps(&self, direction: UndoDirection) -> Option<usize> {
+        match direction {
+            UndoDirection::Undo => {
+                (self.undo.last() == Some(&UndoKind::Straighten)).then_some(())?;
+                self.straighten_undo.last().map(|s| s.pixel_steps)
+            }
+            UndoDirection::Redo => {
+                (self.redo.last() == Some(&UndoKind::Straighten)).then_some(())?;
+                self.straighten_redo.last().map(|s| s.pixel_steps)
+            }
+        }
+    }
+
+    /// Moves the top straighten across (the bookkeeping half of an undo or
+    /// redo whose document half has just succeeded) and leaves its
+    /// selections, paths and canvas size in
+    /// [`Self::take_pending_straighten`]. They replace the whole state, so
+    /// whatever newer steps of the same jump left pending is superseded.
+    fn apply_straighten_step(&mut self, direction: UndoDirection) -> bool {
+        let pending = match direction {
+            UndoDirection::Undo => {
+                let Some(step) = self.straighten_undo.pop() else {
+                    return false;
+                };
+                let pending = straighten_doc::PendingStraighten {
+                    set: step.before.clone(),
+                    canvas: step.canvas_before,
+                };
+                self.straighten_redo.push(step);
+                self.step_back();
+                pending
+            }
+            UndoDirection::Redo => {
+                let Some(step) = self.straighten_redo.pop() else {
+                    return false;
+                };
+                let pending = straighten_doc::PendingStraighten {
+                    set: step.after.clone(),
+                    canvas: step.canvas_after,
+                };
+                self.straighten_undo.push(step);
+                self.step_forward();
+                pending
+            }
+        };
+        self.pending_crop = None;
+        self.pending_selection = None;
+        self.pending_paths = None;
+        self.pending_straighten = Some(pending);
+        true
+    }
+
+    /// What the last undo, redo or History jump of a straighten put in
+    /// force, once.
+    fn take_pending_straighten(&mut self) -> Option<straighten_doc::PendingStraighten> {
+        self.pending_straighten.take()
     }
 
     /// The selection the last undo or redo of a selection step put in
@@ -11983,6 +12127,7 @@ impl UndoOrder {
             UndoKind::Pixel
             | UndoKind::Selection
             | UndoKind::Crop
+            | UndoKind::Straighten
             | UndoKind::Path
             | UndoKind::LayerViaCut => default_step_label(kind).to_owned(),
         };
@@ -12014,6 +12159,7 @@ impl UndoOrder {
         self.redo_labels.clear();
         self.selection_redo.clear();
         self.crop_redo.clear();
+        self.straighten_redo.clear();
         self.path_redo.clear();
         history.clear_redo();
         pixel_history.clear_redo();
@@ -12393,6 +12539,23 @@ fn step_undo_order(
             Some(UndoKind::Path) => undo_order
                 .apply_path_step(UndoDirection::Undo)
                 .then_some(CompositeInvalidation::None),
+            Some(UndoKind::Straighten) => {
+                if let Some(store) = store
+                    && straighten_doc::step_straighten(
+                        layers,
+                        history,
+                        pixel_history,
+                        store,
+                        undo_order,
+                        UndoDirection::Undo,
+                    )
+                {
+                    Some(CompositeInvalidation::Everything)
+                } else {
+                    tracing::warn!("a straighten could not be undone");
+                    None
+                }
+            }
             Some(UndoKind::Crop) => {
                 if history.can_undo() && undo_order.crop_step_ready(UndoDirection::Undo) {
                     match history.undo(layers) {
@@ -12478,6 +12641,23 @@ fn step_undo_order(
             Some(UndoKind::Path) => undo_order
                 .apply_path_step(UndoDirection::Redo)
                 .then_some(CompositeInvalidation::None),
+            Some(UndoKind::Straighten) => {
+                if let Some(store) = store
+                    && straighten_doc::step_straighten(
+                        layers,
+                        history,
+                        pixel_history,
+                        store,
+                        undo_order,
+                        UndoDirection::Redo,
+                    )
+                {
+                    Some(CompositeInvalidation::Everything)
+                } else {
+                    tracing::warn!("a straighten could not be redone");
+                    None
+                }
+            }
             Some(UndoKind::Crop) => {
                 if history.can_redo() && undo_order.crop_step_ready(UndoDirection::Redo) {
                     match history.redo(layers) {
@@ -12972,6 +13152,15 @@ fn handle_palette_key(
                 Some(Err(())) => return None,
                 None => {}
             }
+            // Task 180: the Straighten angle prompt.
+            match straighten_app::prompt_enter(&mut workspace.tree, root) {
+                Some(Ok(degrees)) => {
+                    close_command_palette(workspace, focus, palette);
+                    return Some(ActivatedCommand::StraightenApply(degrees));
+                }
+                Some(Err(())) => return None,
+                None => {}
+            }
             // 0.218.0: the Save Selection name prompt.
             match selection_store::prompt_enter(&mut workspace.tree, root) {
                 Some(Ok(name)) => {
@@ -13020,6 +13209,7 @@ fn handle_palette_key(
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
                 selection_store::follow_prompt_query(&mut workspace.tree, root);
                 colour_range_app::follow_prompt_query(&mut workspace.tree, root);
+                straighten_app::follow_prompt_query(&mut workspace.tree, root);
                 layer_filter_cmd::follow_prompt_query(&mut workspace.tree, root);
                 paths_app::follow_prompt_query(&mut workspace.tree, root);
             }
@@ -13052,6 +13242,7 @@ fn handle_palette_key(
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
                 selection_store::follow_prompt_query(&mut workspace.tree, root);
                 colour_range_app::follow_prompt_query(&mut workspace.tree, root);
+                straighten_app::follow_prompt_query(&mut workspace.tree, root);
                 layer_filter_cmd::follow_prompt_query(&mut workspace.tree, root);
                 paths_app::follow_prompt_query(&mut workspace.tree, root);
             }
@@ -13080,6 +13271,7 @@ fn handle_palette_key(
                 workspace_presets::follow_name_prompt_query(&mut workspace.tree, root);
                 selection_store::follow_prompt_query(&mut workspace.tree, root);
                 colour_range_app::follow_prompt_query(&mut workspace.tree, root);
+                straighten_app::follow_prompt_query(&mut workspace.tree, root);
                 layer_filter_cmd::follow_prompt_query(&mut workspace.tree, root);
                 paths_app::follow_prompt_query(&mut workspace.tree, root);
             }
@@ -30089,6 +30281,9 @@ struct ToolSettings {
     crop_ratio: aurora_ui::CropRatio,
     /// The Crop tool's Portrait toggle (0.236.0; swaps the ratio's sides).
     crop_portrait: bool,
+    /// The Crop tool's Straighten box (task 180): while on, a canvas drag
+    /// draws the angle line; turns itself off when the line is drawn.
+    crop_straighten: bool,
     /// Pen pressure scales the Brush, Pencil and Eraser dab size (0.308.0;
     /// default on; one pair shared by the three tools, because pressure
     /// sensitivity belongs to the pen, not the tool; not persisted).
@@ -30140,6 +30335,7 @@ impl Default for ToolSettings {
             eraser_flow: DEFAULT_PAINT_PERCENT,
             crop_ratio: aurora_ui::CropRatio::Free,
             crop_portrait: false,
+            crop_straighten: false,
             pressure_size: true,
             pressure_opacity: false,
         }
@@ -30358,6 +30554,12 @@ enum LockRefusal {
     /// A crop would move a layer or mask out of the document's range
     /// (0.226.0).
     CropOutOfRange,
+    /// A straighten would resample more than the size caps allow (task 180).
+    StraightenTooLarge,
+    /// A straighten could not finish; nothing changed (task 180).
+    StraightenFailed,
+    /// "Crop: Straighten by Angle" with another tool active (task 180).
+    StraightenNeedsCropTool,
     /// Quick Mask (0.217.0): the document is over the 64 Mpx mask cap, so
     /// the mode is not entered.
     QuickMaskTooLarge,
@@ -30486,6 +30688,15 @@ impl LockRefusal {
             }
             LockRefusal::CropOutOfRange => {
                 "This crop would move a layer further from the document origin than Aurora allows. Crop closer to the top-left, or move the layer first."
+            }
+            LockRefusal::StraightenTooLarge => {
+                "This document is too large to straighten (over 64 megapixels, or over a billion pixels across all layers and masks). Crop it smaller first."
+            }
+            LockRefusal::StraightenFailed => {
+                "The straighten could not be completed, so nothing was changed."
+            }
+            LockRefusal::StraightenNeedsCropTool => {
+                "Choose the Crop tool first. Straighten by Angle sets the angle of the Crop tool's rectangle."
             }
             LockRefusal::QuickMaskTooLarge => {
                 "This document is too large for Quick Mask (over 64 megapixels)."
@@ -30694,6 +30905,9 @@ fn lock_refusal_applies(
                 | LockRefusal::CropNoChange
                 | LockRefusal::CropDegenerate
                 | LockRefusal::CropOutOfRange
+                | LockRefusal::StraightenTooLarge
+                | LockRefusal::StraightenFailed
+                | LockRefusal::StraightenNeedsCropTool
         )
         || (refusal == LockRefusal::QuickMaskToolUnavailable
             && quick_mask::tool_refusal(tool).is_some())
@@ -32921,6 +33135,10 @@ impl App {
             Some(ActivatedCommand::CropToSelection) => self.crop_to_selection(),
             Some(ActivatedCommand::SetCropRatio(choice)) => self.set_crop_ratio(choice),
             Some(ActivatedCommand::SwapCropOrientation) => self.swap_crop_orientation(),
+            Some(ActivatedCommand::StraightenPrompt) => self.open_straighten_prompt(),
+            Some(ActivatedCommand::StraightenApply(degrees)) => {
+                self.run_straighten_angle(degrees);
+            }
             Some(ActivatedCommand::Clipboard(command)) => self.run_clipboard_command(command),
             Some(ActivatedCommand::RefinePrompt(kind)) => self.open_refine_prompt(kind),
             Some(ActivatedCommand::RefineApply(kind, amount)) => self.run_refine(kind, amount),
@@ -38697,7 +38915,7 @@ impl App {
             notice,
             self.doc.selection.active(),
             self.quick_mask.is_some(),
-            crop::status_rect(self.tool, &self.crop),
+            crop::status_crop(self.tool, &self.crop),
             background_psd_check::check_status_text(self.psd_check_worker.is_checking()),
         ) {
             self.push_accessibility();
@@ -38993,6 +39211,9 @@ impl App {
         // A crop's shift first: a selection step undone in the same jump
         // holds coordinates of its own era and replaces the shifted one.
         self.apply_pending_crop_now();
+        // A straighten replaces the whole state; selection and path steps
+        // stepped after it in the same jump replace what it holds.
+        self.apply_pending_straighten_now();
         if selection_view::apply_pending_selection(
             &mut self.doc.undo_order,
             &mut self.doc.selection,
@@ -39148,6 +39369,8 @@ impl App {
         // (0.226.0) sit on top of its outline, the handles over the guides.
         runs.extend(self.crop_guide_runs_now());
         runs.extend(self.crop_handle_runs_now());
+        // The rotated Straighten frame and the line being drawn (task 180).
+        runs.extend(self.straighten_overlay_runs_now());
         // The Pen's path (0.233.0): never beside the Crop's handles.
         runs.extend(self.pen_overlay_runs_now());
         if let Err(err) = aurora_ui::sync_selection_outline(
@@ -39445,7 +39668,7 @@ impl App {
             self.lock_notice.map(|(why, _)| why.message()),
             self.doc.selection.active(),
             self.quick_mask.is_some(),
-            crop::status_rect(self.tool, &self.crop),
+            crop::status_crop(self.tool, &self.crop),
             background_psd_check::check_status_text(self.psd_check_worker.is_checking()),
         ) {
             self.push_accessibility();

@@ -162,8 +162,8 @@ pub use colour_controls::{
     sync_colour_controls,
 };
 pub use crop_controls::{
-    CROP_GROUP_LABEL, CROP_PORTRAIT_LABEL, CROP_RATIO_LABEL, CropControls, CropRatio,
-    has_crop_controls, insert_crop_controls, sync_crop_controls,
+    CROP_GROUP_LABEL, CROP_PORTRAIT_LABEL, CROP_RATIO_LABEL, CROP_STRAIGHTEN_LABEL, CropControls,
+    CropRatio, has_crop_controls, insert_crop_controls, sync_crop_controls,
 };
 pub use crop_overlay::{
     CROP_GUIDE_MIN_GAP, CROP_HANDLE_COUNT, crop_guide_runs, crop_handle_runs, crop_shield_rects,
@@ -215,9 +215,9 @@ pub use selection_outline::{
     DASH_LENGTH, MARCH_PERIOD, selection_outline_runs, sync_selection_outline,
 };
 pub use status_bar::{
-    QUICK_MASK_TEXT, STATUS_BAR_LABEL, StatusBar, StatusInfo, crop_text, document_label_text,
-    document_text, insert_status_bar, physical_zoom, sample_format_text, selection_text,
-    status_bar_text, sync_status_bar, zoom_text,
+    QUICK_MASK_TEXT, STATUS_BAR_LABEL, StatusBar, StatusInfo, crop_angle_text, crop_text,
+    document_label_text, document_text, insert_status_bar, physical_zoom, sample_format_text,
+    selection_text, status_bar_text, sync_status_bar, zoom_text,
 };
 pub use tone_controls::{
     SPONGE_MODE_LABEL, TONE_RANGE_LABEL, ToneControls, has_tone_range, insert_tone_controls,

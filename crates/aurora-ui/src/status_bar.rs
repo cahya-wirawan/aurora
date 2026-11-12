@@ -100,6 +100,9 @@ pub struct StatusInfo {
     /// The Crop tool's rectangle while it has one (0.226.0): its readout
     /// ([`crop_text`]) is appended to the document label.
     pub crop: Option<aurora_core::Rect>,
+    /// The Crop tool's Straighten angle in degrees (task 180), if it has
+    /// one: appended to the crop readout ([`crop_angle_text`]).
+    pub crop_angle: Option<f32>,
     /// An automation controller is connected (task 160): the document label
     /// always ends with [`AUTOMATION_TEXT`], whatever else it shows, so the
     /// indication cannot be hidden behind a notice.
@@ -210,6 +213,14 @@ pub fn crop_text(rect: &aurora_core::Rect) -> String {
     )
 }
 
+/// The Straighten angle's readout (task 180): `Angle 1.2°`, one decimal.
+#[must_use]
+pub fn crop_angle_text(degrees: f32) -> String {
+    // `+ 0.0` keeps a rounded negative zero from printing as `-0.0`.
+    let rounded = (degrees * 10.0).round() / 10.0 + 0.0;
+    format!("Angle {rounded:.1}°")
+}
+
 /// The document label's full text: the document readout, then the
 /// selection readout after ` · ` while one is active.
 #[must_use]
@@ -220,7 +231,10 @@ pub fn document_label_text(info: &StatusInfo) -> String {
         None => document,
     };
     let text = match info.crop.as_ref() {
-        Some(rect) => format!("{text} · {}", crop_text(rect)),
+        Some(rect) => match info.crop_angle {
+            Some(angle) => format!("{text} · {} · {}", crop_text(rect), crop_angle_text(angle)),
+            None => format!("{text} · {}", crop_text(rect)),
+        },
         None => text,
     };
     if info.quick_mask {
@@ -486,6 +500,7 @@ mod tests {
             selection: None,
             quick_mask: false,
             crop: None,
+            crop_angle: None,
         };
         let bar = match insert_status_bar(&mut tree, root, &scales, &info) {
             Ok(bar) => bar,
@@ -566,10 +581,12 @@ mod tests {
             selection: None,
             quick_mask: false,
             crop: None,
+            crop_angle: None,
         };
         let on = StatusInfo {
             quick_mask: true,
             crop: None,
+            crop_angle: None,
             ..off.clone()
         };
         assert_eq!(QUICK_MASK_TEXT, "Quick Mask");
@@ -614,6 +631,7 @@ mod tests {
             selection: None,
             quick_mask: false,
             crop: None,
+            crop_angle: None,
         };
         let base = "Document: 640 × 480 px · 16-bit float";
         assert_eq!(document_label_text(&info), base);
@@ -621,6 +639,7 @@ mod tests {
             selection: Some(selection),
             quick_mask: false,
             crop: None,
+            crop_angle: None,
             ..info
         };
         let plain = Selection::new(rect(10, 20, 300, 200));
@@ -699,11 +718,46 @@ mod tests {
             selection: None,
             quick_mask: false,
             crop: Some(rect),
+            crop_angle: None,
         };
         let text = super::document_label_text(&info);
         assert!(text.ends_with(" · Crop: 7, 3, 40 × 30 px"), "{text}");
         let none = StatusInfo { crop: None, ..info };
         assert!(!super::document_label_text(&none).contains("Crop"));
+    }
+
+    #[test]
+    fn the_straighten_angle_is_appended_to_the_crop_readout_with_one_decimal() {
+        let rect = aurora_core::Rect {
+            x: 7,
+            y: 3,
+            width: 40,
+            height: 30,
+        };
+        assert_eq!(super::crop_angle_text(1.24), "Angle 1.2°");
+        assert_eq!(super::crop_angle_text(-12.0), "Angle -12.0°");
+        assert_eq!(super::crop_angle_text(-0.01), "Angle 0.0°");
+        let info = StatusInfo {
+            zoom: 1.0,
+            scale_factor: 1.0,
+            document_size: (100, 80),
+            sample: aurora_tile::SAMPLE_FORMAT,
+            notice: None,
+            automation: false,
+            task: None,
+            selection: None,
+            quick_mask: false,
+            crop: Some(rect),
+            crop_angle: Some(-2.5),
+        };
+        let text = super::document_label_text(&info);
+        assert!(
+            text.ends_with(" · Crop: 7, 3, 40 × 30 px · Angle -2.5°"),
+            "{text}"
+        );
+        // No rectangle, no angle readout.
+        let none = StatusInfo { crop: None, ..info };
+        assert!(!super::document_label_text(&none).contains("Angle"));
     }
 
     #[test]
@@ -717,6 +771,7 @@ mod tests {
             selection: None,
             quick_mask: false,
             crop: None,
+            crop_angle: None,
             automation: true,
             task: None,
         };
@@ -745,6 +800,7 @@ mod tests {
             selection: None,
             quick_mask: false,
             crop: None,
+            crop_angle: None,
             automation: false,
             task,
         }

@@ -34,6 +34,9 @@ pub const CROP_RATIO_LABEL: &str = "Crop ratio";
 /// The checkbox's label and accessible name.
 pub const CROP_PORTRAIT_LABEL: &str = "Portrait";
 
+/// The Straighten checkbox's label and accessible name (task 180).
+pub const CROP_STRAIGHTEN_LABEL: &str = "Straighten";
+
 /// The group's accessible name.
 pub const CROP_GROUP_LABEL: &str = "Crop options";
 
@@ -127,6 +130,9 @@ pub struct CropControls {
     pub ratio: WidgetId,
     /// The "Portrait" checkbox.
     pub portrait: WidgetId,
+    /// The "Straighten" checkbox (task 180): while on, a drag on the canvas
+    /// draws the line that sets the crop angle.
+    pub straighten: WidgetId,
 }
 
 /// Whether `tool` shows the group.
@@ -190,16 +196,19 @@ pub fn insert_crop_controls(
     tree.set_style(ratio, style)?;
     let portrait = widgets::insert_checkbox(tree, group, scales, CROP_PORTRAIT_LABEL)?;
     set_options_item(tree, scales, portrait, OptionsItem::Check, true)?;
+    let straighten = widgets::insert_checkbox(tree, group, scales, CROP_STRAIGHTEN_LABEL)?;
+    set_options_item(tree, scales, straighten, OptionsItem::Check, true)?;
     set_node_hidden(tree, group, true)?;
     Ok(CropControls {
         group,
         ratio,
         portrait,
+        straighten,
     })
 }
 
 /// Shows the group for the Crop tool (hidden for any other, with an open
-/// list closed), and mirrors `ratio` and `portrait`. Never inserts or
+/// list closed), and mirrors `ratio`, `portrait` and `straighten`. Never inserts or
 /// removes a widget, so held ids stay valid. Returns whether anything
 /// changed.
 ///
@@ -213,6 +222,7 @@ pub fn sync_crop_controls(
     tool: Tool,
     ratio: CropRatio,
     portrait: bool,
+    straighten: bool,
 ) -> Result<bool, WidgetError> {
     let crop = &controls.crop;
     let shown = has_crop_controls(tool);
@@ -244,13 +254,28 @@ pub fn sync_crop_controls(
         Some(_) => return Err(WidgetError::WrongWidgetKind(crop.portrait)),
         None => return Err(WidgetError::UnknownWidget(crop.portrait)),
     }
+    let want = if straighten {
+        Toggled::True
+    } else {
+        Toggled::False
+    };
+    match tree.payload(crop.straighten) {
+        Some(WidgetKind::Checkbox(state)) if state.checked == want => {}
+        Some(WidgetKind::Checkbox(_)) => {
+            widgets::set_checkbox_checked(tree, crop.straighten, want)?;
+            changed = true;
+        }
+        Some(_) => return Err(WidgetError::WrongWidgetKind(crop.straighten)),
+        None => return Err(WidgetError::UnknownWidget(crop.straighten)),
+    }
     Ok(changed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CROP_PORTRAIT_LABEL, CROP_RATIO_LABEL, CropRatio, has_crop_controls, sync_crop_controls,
+        CROP_PORTRAIT_LABEL, CROP_RATIO_LABEL, CROP_STRAIGHTEN_LABEL, CropRatio, has_crop_controls,
+        sync_crop_controls,
     };
     use crate::tool::Tool;
     use crate::tool_controls::{ToolControls, insert_tool_controls, tool_controls_contains};
@@ -282,7 +307,18 @@ mod tests {
         ratio: CropRatio,
         portrait: bool,
     ) -> bool {
-        let changed = match sync_crop_controls(&mut ws.tree, c, tool, ratio, portrait) {
+        sync_straighten(ws, c, tool, ratio, portrait, false)
+    }
+
+    fn sync_straighten(
+        ws: &mut crate::Workspace,
+        c: &ToolControls,
+        tool: Tool,
+        ratio: CropRatio,
+        portrait: bool,
+        straighten: bool,
+    ) -> bool {
+        let changed = match sync_crop_controls(&mut ws.tree, c, tool, ratio, portrait, straighten) {
             Ok(changed) => changed,
             Err(err) => unreachable!("{err:?}"),
         };
@@ -359,7 +395,7 @@ mod tests {
             )
         };
         assert!(checked(&ws));
-        for id in [c.crop.ratio, c.crop.portrait] {
+        for id in [c.crop.ratio, c.crop.portrait, c.crop.straighten] {
             assert!(tool_controls_contains(&ws.tree, &c, id));
             let rect = ws.tree.bounds(id);
             assert!(
@@ -391,16 +427,60 @@ mod tests {
         let (mut ws, c) = built();
         sync(&mut ws, &c, Tool::Crop, CropRatio::Free, false);
         let widths = |ws: &crate::Workspace| {
-            [c.crop.ratio, c.crop.portrait]
+            [c.crop.ratio, c.crop.portrait, c.crop.straighten]
                 .map(|id| ws.tree.bounds(id).map_or(0, |bounds| bounds.width))
         };
         let wide = widths(&ws);
         assert_eq!(wide[0], floor, "the dropdown is the slider floor wide");
         assert!(wide[1] > 0);
+        assert!(wide[2] > 0);
         for window in [1000.0_f32, 700.0] {
             ws.tree.compute_layout(window, 900.0);
             assert_eq!(widths(&ws), wide, "{window}: nothing shrinks");
         }
+    }
+
+    #[test]
+    fn the_straighten_checkbox_is_named_mirrored_and_re_mirrored() {
+        let (mut ws, c) = built();
+        sync_straighten(&mut ws, &c, Tool::Crop, CropRatio::Free, false, true);
+        assert_eq!(CROP_STRAIGHTEN_LABEL, "Straighten");
+        assert_eq!(
+            ws.tree
+                .accessibility(c.crop.straighten)
+                .and_then(|n| n.label()),
+            Some(CROP_STRAIGHTEN_LABEL)
+        );
+        let checked = |ws: &crate::Workspace| {
+            matches!(
+                ws.tree.payload(c.crop.straighten),
+                Some(WidgetKind::Checkbox(s)) if s.checked == accesskit::Toggled::True
+            )
+        };
+        assert!(checked(&ws));
+        // The portrait box is its own setting.
+        assert!(matches!(
+            ws.tree.payload(c.crop.portrait),
+            Some(WidgetKind::Checkbox(s)) if s.checked == accesskit::Toggled::False
+        ));
+        assert!(!sync_straighten(
+            &mut ws,
+            &c,
+            Tool::Crop,
+            CropRatio::Free,
+            false,
+            true
+        ));
+        // The app turns the setting off; the box follows.
+        assert!(sync_straighten(
+            &mut ws,
+            &c,
+            Tool::Crop,
+            CropRatio::Free,
+            false,
+            false
+        ));
+        assert!(!checked(&ws));
     }
 
     #[test]

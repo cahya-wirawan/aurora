@@ -308,6 +308,7 @@ Reader semantics: `read` only decodes the journal. **It does not replay it and d
 | 17 | `SetSmartObject` | `id: u64, value: Option<SmartObject>` | 0.200.0 |
 | 18 | `SetClipped` | `id: u64, value: bool` | 0.201.0 |
 | 19 | `Translate` | `dx: i64, dy: i64` | 0.226.0 |
+| 28 | `SetAllBounds` | `pixel: Vec<(u64, Rect)>, masks: Vec<(u64, Rect)>` | 0.313.0 |
 
 Ordinals 17 and 18 are stated by ADR 0009 and match the declaration order. "Original" means present in the first implementation (`ade24bc`, 2026-08-06) or at least before the earliest dated addendum; the exact version for ordinals 0 to 13 was not determined, and the ADR does not date `SetBounds` (G-10).
 
@@ -315,6 +316,7 @@ Semantics of ops that the wire alone does not convey:
 
 * Adding a layer is journaled as `Restore` with a one-entry `RemovedSubtree` (`History::add_pixel_layer`, `add_group`), not as a dedicated op. `index` is the sibling position the layer landed at (0 = top).
 * `Translate { dx, dy }` shifts every pixel layer's `bounds` and every layer's and group's mask `bounds` by `(dx, dy)`; tile contents are layer- and mask-local and are not touched. It is the Crop operation: a crop to `(x, y, w, h)` records `Translate { -x, -y }` and sets the canvas size (which lives in the manifest, not the journal). The inverse is the negated op (`tree.translate_all`, `history.rs:449`). A shift that would leave a layer origin outside +/-300,000 is refused.
+* `SetAllBounds { pixel, masks }` (ordinal 28, task 180) sets the bounds of the listed pixel layers and of the listed layers' masks in one step; it is the document half of the Crop tool's Straighten, whose resampled tiles are stored like any pixel edit and whose new canvas size is in the manifest. The inverse is the same op with the old rectangles. An Aurora older than this build refuses a journal holding it.
 * `SetEffects`, `SetSmartObject`, `SetClipped` and `SetMaskDensity` also act as **carriers**: `LayerEntry::effects`, `::smart_object`, `::clipped` and `LayerMask::density` are not on the wire inside `Restore`/`RestoreMask`, so `save_journal` writes an extra op immediately after each journaled `Restore`/`RestoreMask` whose entries hold such a value (`reduced_mask_densities`, `restored_effects`, `restored_clipped`, `restored_smart_objects`, `history.rs:193-254`). The in-memory journal is unchanged; the extra ops exist only on the wire. A reader replaying a journal MUST apply them in sequence.
 
 ### 5.3 Compatibility consequence
@@ -732,6 +734,7 @@ Aurora version numbers (SemVer, from 0.0.1; the first implementation predates th
 | `Adjustment::HueSaturationRanges` (3) | variant | 0.204.0 | ADR |
 | `selection` | entry | 0.218.0 | ADR; commit `dd00fc4` |
 | `Translate` op (19) | op | 0.226.0 | ADR; commit `0afd450` |
+| `SetAllBounds` op (28) | op | 0.313.0 | ADR 0009 addendum |
 | `paths` | entry | 0.233.0 | ADR; commit `98f71b0` |
 | `Adjustment::{Vibrance, Exposure, PhotoFilter}` (4, 5, 6) | variants | 0.239.0 | ADR |
 | `Adjustment::{BlackWhite, ColorBalance}` (7, 8) | variants | 0.240.0 | ADR |

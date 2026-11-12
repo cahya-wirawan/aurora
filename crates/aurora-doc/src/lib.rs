@@ -31,6 +31,8 @@ mod effect_shape;
 mod error;
 mod history;
 mod layer;
+#[cfg(test)]
+mod straighten_tests;
 // Public, unlike this crate's other modules, because its own module doc
 // comment *is* the mask-storage convention -- the one place the writer
 // and reader halves are written down together. The three items below

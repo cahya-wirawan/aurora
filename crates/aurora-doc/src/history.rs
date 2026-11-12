@@ -289,6 +289,17 @@ enum LayerOp {
         id: LayerId,
         value: Option<aurora_core::LayerFilters>,
     },
+    /// Sets the bounds of the listed pixel layers and the bounds of the
+    /// listed layers' masks (task 180, the Crop tool's Straighten, which
+    /// resamples every surface onto a new canvas). Appended after
+    /// [`Self::SetFilters`] (ordinal 28), so an Aurora older than this build
+    /// refuses a journal holding it (ADR 0009). The tile contents are not in
+    /// the journal (as for every pixel edit); the canvas size is in the
+    /// manifest.
+    SetAllBounds {
+        pixel: Vec<(LayerId, Rect)>,
+        masks: Vec<(LayerId, Rect)>,
+    },
 }
 
 /// One layer's smoothed-ramp flags a journaled op carries (see
@@ -834,6 +845,33 @@ fn apply(tree: &mut LayerTree, op: LayerOp) -> Result<(LayerOp, Option<Rect>), D
             // user action reaches it.
             Ok((LayerOp::SetSmartObject { id, value: old }, None))
         }
+        LayerOp::SetAllBounds { pixel, masks } => {
+            let old_pixel = pixel
+                .iter()
+                .map(|(id, _)| {
+                    tree.bounds(*id)
+                        .map(|b| (*id, b))
+                        .ok_or(DocError::UnknownLayer(*id))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let old_masks = masks
+                .iter()
+                .map(|(id, _)| {
+                    tree.mask(*id)
+                        .map(|m| (*id, m.bounds))
+                        .ok_or(DocError::UnknownLayer(*id))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            tree.set_all_bounds(&pixel, &masks)?;
+            // `None`: every surface was resampled, the whole composite is stale.
+            Ok((
+                LayerOp::SetAllBounds {
+                    pixel: old_pixel,
+                    masks: old_masks,
+                },
+                None,
+            ))
+        }
         LayerOp::Translate { dx, dy } => {
             tree.translate_all(dx, dy)?;
             // `None`: every layer moved, so the whole composite is stale.
@@ -1046,6 +1084,11 @@ fn describe(op: &LayerOp) -> String {
         LayerOp::Translate { dx, dy } => {
             format!("Shifted every layer and mask by ({dx}, {dy}) (crop)")
         }
+        LayerOp::SetAllBounds { pixel, masks } => format!(
+            "Repositioned {} layers and {} masks (straighten)",
+            pixel.len(),
+            masks.len()
+        ),
         LayerOp::SetBounds { id, value } => {
             format!(
                 "Repositioned layer #{} to ({}, {})",
@@ -1758,6 +1801,37 @@ impl History {
         tree.translate_all(dx, dy)?;
         self.journal.push(LayerOp::Translate { dx, dy });
         self.push(LayerOp::Translate { dx: -dx, dy: -dy });
+        Ok(())
+    }
+
+    /// Sets every pixel layer's and every mask's bounds to the given lists
+    /// as ONE undo step (task 180, Straighten). Layers and masks not listed
+    /// keep theirs. All or nothing; nothing is recorded on an error.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`LayerTree::set_all_bounds`].
+    pub fn set_all_bounds(
+        &mut self,
+        tree: &mut LayerTree,
+        pixel: Vec<(LayerId, Rect)>,
+        masks: Vec<(LayerId, Rect)>,
+    ) -> Result<(), DocError> {
+        let (all_pixel, all_masks) = tree.all_bounds();
+        let old_pixel: Vec<_> = all_pixel
+            .into_iter()
+            .filter(|(id, _)| pixel.iter().any(|(p, _)| p == id))
+            .collect();
+        let old_masks: Vec<_> = all_masks
+            .into_iter()
+            .filter(|(id, _)| masks.iter().any(|(m, _)| m == id))
+            .collect();
+        tree.set_all_bounds(&pixel, &masks)?;
+        self.journal.push(LayerOp::SetAllBounds { pixel, masks });
+        self.push(LayerOp::SetAllBounds {
+            pixel: old_pixel,
+            masks: old_masks,
+        });
         Ok(())
     }
 
@@ -6646,6 +6720,24 @@ mod adjustment_tests {
         assert_eq!(tree.clip_base(top), None);
         let group = history.add_group(&mut tree, "g", None).ok();
         assert!(group.is_some_and(|g| tree.set_clipped(g, true).is_ok() && tree.clipped(g)));
+    }
+
+    #[test]
+    fn set_all_bounds_is_appended_after_set_filters() {
+        let ordinal = |op: &LayerOp| {
+            postcard::to_allocvec(op)
+                .ok()
+                .and_then(|b| b.first().copied())
+        };
+        let id = crate::LayerId::from_raw(1);
+        assert_eq!(ordinal(&LayerOp::SetFilters { id, value: None }), Some(27));
+        assert_eq!(
+            ordinal(&LayerOp::SetAllBounds {
+                pixel: Vec::new(),
+                masks: Vec::new()
+            }),
+            Some(28)
+        );
     }
 
     #[test]
