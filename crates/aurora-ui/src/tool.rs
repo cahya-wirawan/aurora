@@ -122,6 +122,11 @@ pub enum Tool {
     /// and the release heals it, real via `aurora_brush::spot_heal_covered`
     /// in `aurora-app`.
     SpotHealing,
+    /// Heals painted pixels from a sampled source (0.314.0): the Clone
+    /// Stamp's `Alt`-click source and aligned offset, the Spot Healing's
+    /// collect-then-heal release, real via `aurora_brush::healing_brush_covered`
+    /// in `aurora-app`.
+    HealingBrush,
     /// Selects by painting over the active pixel layer (0.238.0): each
     /// stamp grows a region of similar colour round the brush, real in
     /// `aurora-app`'s `quick_select` over `aurora_brush::quick_select_stamp`.
@@ -132,7 +137,7 @@ impl Tool {
     /// Every tool this enum has today, in the fixed order they're
     /// offered to the user (matches PLAN.md's own bullets: Move, Marquee
     /// Select, Zoom, Pan, Eyedropper, then Brush, Eraser, and the 0.209.0 fills Gradient and Paint Bucket).
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::Move,
         Self::MarqueeSelect,
         Self::EllipticalMarquee,
@@ -150,6 +155,7 @@ impl Tool {
         Self::CloneStamp,
         Self::Smudge,
         Self::SpotHealing,
+        Self::HealingBrush,
         Self::Blur,
         Self::Sharpen,
         Self::Dodge,
@@ -204,6 +210,7 @@ impl Tool {
             Self::Crop => "Crop",
             Self::Pen => "Pen",
             Self::SpotHealing => "Spot Healing",
+            Self::HealingBrush => "Healing Brush",
             Self::QuickSelect => "Quick Select",
         }
     }
@@ -230,7 +237,7 @@ impl Tool {
             Self::Dodge | Self::Burn => 'O',
             Self::Sponge | Self::Pen => 'P',
             Self::Crop => 'C',
-            Self::SpotHealing => 'J',
+            Self::SpotHealing | Self::HealingBrush => 'J',
         }
     }
 
@@ -244,7 +251,8 @@ impl Tool {
     /// Aurora gives each its own chord; `O` the Dodge and `Shift+O` the Burn,
     /// and `Shift+P` the Sponge, 0.224.0: Photoshop shares O among the three,
     /// and `Shift+P` is the free chord Aurora gives the Sponge; `W` the Magic
-    /// Wand and `Shift+W` the Quick Select, 0.238.0).
+    /// Wand and `Shift+W` the Quick Select, 0.238.0; `J` the Spot Healing and
+    /// `Shift+J` the Healing Brush, 0.314.0).
     #[must_use]
     pub const fn shortcut_needs_shift(self) -> bool {
         matches!(
@@ -258,6 +266,7 @@ impl Tool {
                 | Self::Burn
                 | Self::Sponge
                 | Self::QuickSelect
+                | Self::HealingBrush
         )
     }
 
@@ -308,11 +317,11 @@ mod tests {
 
     #[test]
     fn all_lists_every_variant_once() {
-        assert_eq!(Tool::ALL.len(), 25);
+        assert_eq!(Tool::ALL.len(), 26);
         let mut seen = Tool::ALL.to_vec();
         seen.sort_by_key(|tool| tool.label());
         seen.dedup();
-        assert_eq!(seen.len(), 25, "ALL must not repeat a variant");
+        assert_eq!(seen.len(), 26, "ALL must not repeat a variant");
     }
 
     #[test]
@@ -330,7 +339,7 @@ mod tests {
         let mut letters = keys;
         letters.sort_unstable();
         letters.dedup();
-        assert_eq!(letters.len(), Tool::ALL.len() - 9);
+        assert_eq!(letters.len(), Tool::ALL.len() - 10);
         assert_eq!(Tool::Crop.shortcut_text(), "C");
         assert_eq!(Tool::Lasso.shortcut_text(), "L");
         assert_eq!(Tool::PolygonalLasso.shortcut_text(), "Shift+L");
@@ -344,6 +353,7 @@ mod tests {
         assert_eq!(Tool::CloneStamp.shortcut_text(), "S");
         assert_eq!(Tool::Smudge.shortcut_text(), "R");
         assert_eq!(Tool::SpotHealing.shortcut_text(), "J");
+        assert_eq!(Tool::HealingBrush.shortcut_text(), "Shift+J");
         assert_eq!(Tool::QuickSelect.shortcut_text(), "Shift+W");
         assert_eq!(Tool::Blur.shortcut_text(), "Shift+R");
         assert_eq!(Tool::Sharpen.shortcut_text(), "Shift+S");

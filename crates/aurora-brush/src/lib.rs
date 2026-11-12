@@ -76,6 +76,8 @@ mod filter_brush;
 mod filter_brush_tests;
 #[cfg(test)]
 mod hard_dab_tests;
+#[cfg(test)]
+mod healing_brush_tests;
 mod mask_dab;
 mod quick_select;
 #[cfg(test)]
@@ -123,7 +125,7 @@ pub use quick_select::{
 pub use smudge::{MAX_SMUDGE_PATCH_TEXELS, SmudgeCarry, smudge_dab_covered};
 pub use spot_heal::{
     HEAL_FEATHER, HealMask, HealRefusal, MAX_HEAL_ITERATIONS, MAX_HEAL_SIDE, MAX_HEAL_TEXELS,
-    MIN_RING_TEXELS, spot_heal_covered,
+    MIN_RING_TEXELS, healing_brush_covered, spot_heal_covered,
 };
 pub use stamp::{
     DabOutcome, erase_dab, erase_dab_amount, erase_dab_covered, stamp_dab, stamp_dab_amount,

@@ -1143,6 +1143,13 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
         Ui,
     ),
     CommandSpec::new(
+        "tool.healing_brush",
+        "Select Healing Brush Tool",
+        "Makes the Healing Brush the active tool (Alt-click sets the source).",
+        Tool,
+        Ui,
+    ),
+    CommandSpec::new(
         "tool.blur",
         "Select Blur Tool",
         "Makes the Blur brush the active tool.",

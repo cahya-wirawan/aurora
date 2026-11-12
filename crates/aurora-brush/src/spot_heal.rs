@@ -90,6 +90,9 @@ pub enum HealRefusal {
     TooLarge,
     /// Too few surrounding texels, or part of the area has none within reach.
     NotEnoughSurroundings,
+    /// The Healing Brush's source area lies mostly outside the layer (or on
+    /// texels with no alpha).
+    SourceOutside,
 }
 
 /// The area a Spot Healing stroke has painted so far: hard-edged discs in
@@ -304,6 +307,53 @@ impl Window {
     }
 }
 
+/// The window `rect = (x0, y0, w, h)` shifted by `offset`: texel `(i, j)`
+/// holds the layer at `(x0 + i + ox, y0 + j + oy)`, transparent where the
+/// layer has nothing (or the coordinate is negative).
+fn gather_shifted(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    rect: (i64, i64, usize, usize),
+    offset: (i64, i64),
+) -> Result<Window, (TileId, TileError)> {
+    let (x0, y0, w, h) = rect;
+    let mut out = Window {
+        w,
+        h,
+        texels: vec![0.0_f32; w * h * CHANNELS],
+    };
+    // The reachable layer coordinates: tile ids are `u32`.
+    let top = i64::from(u32::MAX / TILE) * i64::from(TILE) - 1;
+    #[allow(clippy::cast_possible_wrap)]
+    let (sx0, sy0) = (x0.saturating_add(offset.0), y0.saturating_add(offset.1));
+    #[allow(clippy::cast_possible_wrap)]
+    let (sx1, sy1) = (
+        sx0.saturating_add(w as i64 - 1),
+        sy0.saturating_add(h as i64 - 1),
+    );
+    let (cx0, cy0) = (sx0.max(0), sy0.max(0));
+    let (cx1, cy1) = (sx1.min(top), sy1.min(top));
+    if cx0 > cx1 || cy0 > cy1 {
+        return Ok(out);
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let (cw, ch) = ((cx1 - cx0 + 1) as usize, (cy1 - cy0 + 1) as usize);
+    let part = gather_rect(store, surface, cx0, cy0, cw, ch)?;
+    #[allow(clippy::cast_sign_loss)]
+    let (ix, iy) = ((cx0 - sx0) as usize, (cy0 - sy0) as usize);
+    for row in 0..ch {
+        let from = row * cw * CHANNELS;
+        let to = ((iy + row) * w + ix) * CHANNELS;
+        if let (Some(src), Some(dst)) = (
+            part.texels.get(from..from + cw * CHANNELS),
+            out.texels.get_mut(to..to + cw * CHANNELS),
+        ) {
+            dst.copy_from_slice(src);
+        }
+    }
+    Ok(out)
+}
+
 /// Reads the layer rectangle `(x0, y0, w, h)` (layer-local, non-negative)
 /// as premultiplied `f32`; `Err` is the tile that could not be read.
 fn gather_rect(
@@ -485,15 +535,36 @@ fn every_nth<T: Copy>(items: &[T], cap: usize) -> Vec<T> {
 ///
 /// `domain` marks the texels to solve (`w * h` flags); `margin` is the ring
 /// width.
+pub(crate) fn heal_window(
+    win: &Window,
+    domain: &[bool],
+    margin: usize,
+) -> Result<Vec<(usize, [f32; 4])>, HealRefusal> {
+    heal_window_with(win, domain, margin, SourceMode::Search)
+}
+
+/// Where the fill's texture `s` comes from.
+#[derive(Clone, Copy)]
+pub(crate) enum SourceMode<'a> {
+    /// The Spot Healing's best offset, searched in the same window.
+    Search,
+    /// The Healing Brush's fixed offset: a window of the same size and
+    /// layout holding the texels at `p + offset` (transparent where the
+    /// layer has none), read before anything is written.
+    Fixed(&'a Window),
+}
+
+/// [`heal_window`] with the source chosen by `mode`.
 #[allow(
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss
 )]
-pub(crate) fn heal_window(
+pub(crate) fn heal_window_with(
     win: &Window,
     domain: &[bool],
     margin: usize,
+    mode: SourceMode<'_>,
 ) -> Result<Vec<(usize, [f32; 4])>, HealRefusal> {
     let (w, h) = (win.w, win.h);
     if domain.len() != w * h {
@@ -584,23 +655,62 @@ pub(crate) fn heal_window(
         return Err(HealRefusal::NotEnoughSurroundings);
     }
 
-    // The source offset.
-    let search = Search {
-        win,
-        domain,
-        ring_samples: every_nth(&ring, MAX_SAMPLES)
-            .into_iter()
-            .map(|i| (i, win.straight(i)))
-            .collect(),
-        domain_samples: every_nth(&unknown, MAX_SAMPLES),
+    // The source: a searched offset (Spot Healing) or the fixed window
+    // (Healing Brush).
+    let searched = match mode {
+        SourceMode::Search => Some(Search {
+            win,
+            domain,
+            ring_samples: every_nth(&ring, MAX_SAMPLES)
+                .into_iter()
+                .map(|i| (i, win.straight(i)))
+                .collect(),
+            domain_samples: every_nth(&unknown, MAX_SAMPLES),
+        }),
+        SourceMode::Fixed(_) => None,
     };
-    let offset = find_source(&search, &unknown, &boundary_nb, side);
+    let offset = searched
+        .as_ref()
+        .and_then(|search| find_source(search, &unknown, &boundary_nb, side));
+    // A fixed source needs at least half of the solved texels to have
+    // something to copy; the rest (and any boundary texel without a
+    // source) read the ring's mean colour instead.
+    let mut ring_mean = [0.0_f32; 4];
+    if let SourceMode::Fixed(src) = mode {
+        if src.w != w || src.h != h {
+            return Err(HealRefusal::SourceOutside);
+        }
+        let usable = unknown.iter().filter(|&&i| src.valid(i)).count();
+        if usable * 2 < unknown.len() {
+            return Err(HealRefusal::SourceOutside);
+        }
+        for &i in &ring {
+            let t = win.straight(i);
+            for (m, v) in ring_mean.iter_mut().zip(&t) {
+                *m += v;
+            }
+        }
+        let n = ring.len() as f32;
+        ring_mean = ring_mean.map(|m| m / n);
+    }
 
     // The harmonic part.
     let shifted = |i: usize| -> [f32; 4] {
-        offset.map_or([0.0; 4], |o| {
-            search.source(i, o).map_or([0.0; 4], |j| win.straight(j))
-        })
+        match mode {
+            SourceMode::Fixed(src) => {
+                if src.valid(i) {
+                    src.straight(i)
+                } else {
+                    ring_mean
+                }
+            }
+            SourceMode::Search => offset.map_or([0.0; 4], |o| {
+                searched
+                    .as_ref()
+                    .and_then(|search| search.source(i, o))
+                    .map_or([0.0; 4], |j| win.straight(j))
+            }),
+        }
     };
     let mut bsum = vec![[0.0_f32; 4]; unknown.len()];
     let mut inv_n = vec![0.0_f32; unknown.len()];
@@ -775,6 +885,73 @@ pub fn spot_heal_covered(
     snapshot: Option<&mut StrokeSnapshot>,
     coverage: Option<&dyn Coverage>,
 ) -> Result<DabOutcome, HealRefusal> {
+    heal_covered(
+        store,
+        surface,
+        mask,
+        radius,
+        None,
+        preserve_alpha,
+        snapshot,
+        coverage,
+    )
+}
+
+/// The Healing Brush (0.314.0): [`spot_heal_covered`] with the texture taken
+/// from the layer at `p + offset` (whole texels, document axes) instead of
+/// a searched offset. The source is read from `store` before anything is
+/// written, so it is the layer as it was before the heal, and may overlap
+/// the healed area. Source texels the layer does not hold read as
+/// transparent; a heal whose source has no alpha under half of its solved
+/// texels is refused with [`HealRefusal::SourceOutside`]. Everything else
+/// (mask, ring, harmonic correction, soft edge, locks, selection, snapshot)
+/// is the Spot Healing's. A choice, not compared with Photoshop.
+///
+/// # Errors
+///
+/// [`HealRefusal`], as for [`spot_heal_covered`], plus `SourceOutside`;
+/// nothing is written.
+#[allow(clippy::too_many_arguments)]
+pub fn healing_brush_covered(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    mask: &HealMask,
+    radius: f32,
+    offset: (i64, i64),
+    preserve_alpha: bool,
+    snapshot: Option<&mut StrokeSnapshot>,
+    coverage: Option<&dyn Coverage>,
+) -> Result<DabOutcome, HealRefusal> {
+    heal_covered(
+        store,
+        surface,
+        mask,
+        radius,
+        Some(offset),
+        preserve_alpha,
+        snapshot,
+        coverage,
+    )
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+fn heal_covered(
+    store: &mut TileStore,
+    surface: SurfaceId,
+    mask: &HealMask,
+    radius: f32,
+    fixed: Option<(i64, i64)>,
+    preserve_alpha: bool,
+    snapshot: Option<&mut StrokeSnapshot>,
+    coverage: Option<&dyn Coverage>,
+) -> Result<DabOutcome, HealRefusal> {
     if mask.overflowed() {
         return Err(HealRefusal::TooLarge);
     }
@@ -793,7 +970,13 @@ pub fn spot_heal_covered(
     let (dx0, dy0, dx1, dy1) = ((tx0 - f).max(0), (ty0 - f).max(0), tx1 + f, ty1 + f);
     let side = (dx1 - dx0 + 1).max(dy1 - dy0 + 1) as usize;
     let margin = margin_for(radius);
-    let reach = margin + search_radius(side) + 1;
+    let reach = margin
+        + if fixed.is_some() {
+            0
+        } else {
+            search_radius(side)
+        }
+        + 1;
     let (wx0, wy0) = ((dx0 - reach).max(0), (dy0 - reach).max(0));
     let (wx1, wy1) = (dx1 + reach, dy1 + reach);
     let (ww, wh) = ((wx1 - wx0 + 1) as usize, (wy1 - wy0 + 1) as usize);
@@ -817,7 +1000,18 @@ pub fn spot_heal_covered(
         }
     }
     let domain = dilate(&inmask, ww, wh, f as usize);
-    let healed = heal_window(&win, &domain, margin as usize)?;
+    let healed = if let Some((ox, oy)) = fixed {
+        let src = match gather_shifted(store, surface, (wx0, wy0, ww, wh), (ox, oy)) {
+            Ok(src) => src,
+            Err((id, err)) => {
+                outcome.fail(id, err);
+                return Ok(outcome);
+            }
+        };
+        heal_window_with(&win, &domain, margin as usize, SourceMode::Fixed(&src))?
+    } else {
+        heal_window(&win, &domain, margin as usize)?
+    };
 
     // 5 x 5 box mean of the mask through an integral image.
     let mut integral = vec![0_u32; (ww + 1) * (wh + 1)];

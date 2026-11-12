@@ -121,6 +121,7 @@ tool.eraser	Select Eraser Tool	Palette
 tool.clone_stamp	Select Clone Stamp Tool	Palette
 tool.smudge	Select Smudge Tool	Palette
 tool.spot_healing	Select Spot Healing Tool	Palette
+tool.healing_brush	Select Healing Brush Tool	Palette
 tool.blur	Select Blur Tool	Palette
 tool.sharpen	Select Sharpen Tool	Palette
 tool.dodge	Select Dodge Tool	Palette
