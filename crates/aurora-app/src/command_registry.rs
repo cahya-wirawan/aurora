@@ -137,6 +137,18 @@ fn typed_form(call: &Validated) -> Option<Result<ActivatedCommand, TypedError>> 
                 },
             ))
         }
+        crate::layer_filter_cmd::COMMAND_REDUCE_NOISE => {
+            #[allow(clippy::cast_possible_truncation)] // validated to their ranges
+            let number = |name: &str| call.number(name).map(|v| v as f32);
+            ActivatedCommand::FilterApply(crate::layer_filter_cmd::FilterEdit::AddReduceNoise(
+                crate::layer_filter_cmd::NoiseSettings {
+                    strength: number("strength")?,
+                    preserve_details: number("preserve_details")?,
+                    color_noise: number("color_noise")?,
+                    sharpen_details: number("sharpen_details")?,
+                },
+            ))
+        }
         crate::layer_filter_cmd::COMMAND_EDIT_LAST => {
             #[allow(clippy::cast_possible_truncation)] // validated to 0.1..=85
             let radius = call.number("radius")? as f32;

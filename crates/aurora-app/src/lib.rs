@@ -11154,6 +11154,12 @@ fn build_menu() -> muda::Menu {
                 None,
             ),
             &muda::MenuItem::with_id(
+                layer_filter_cmd::COMMAND_REDUCE_NOISE,
+                "Reduce Noise\u{2026}",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
                 layer_filter_cmd::COMMAND_EDIT_LAST,
                 "Edit Last Layer Filter\u{2026}",
                 true,
@@ -17597,7 +17603,7 @@ struct ShadowCacheKey {
     versions: Vec<(bool, u32, u32, bool, u64)>,
     /// The layer's visible filters (task 176): effects are drawn from the
     /// filtered pixels. Empty without any.
-    filters: Vec<(u8, [u32; 3])>,
+    filters: Vec<(u8, [u32; 4])>,
 }
 
 /// The shadow coverage cache (0.182.0 review): least recently used
@@ -30032,6 +30038,9 @@ struct ToolSettings {
     /// The Unsharp Mask… prompt's starting values (task 177): the last
     /// ones used this session, not persisted.
     unsharp_settings: layer_filter_cmd::UnsharpSettings,
+    /// The Reduce Noise… prompt's starting values (task 178): the last
+    /// ones used this session, not persisted.
+    noise_settings: layer_filter_cmd::NoiseSettings,
     /// The Smudge's strength, 1..=100 percent (0.222.0; default 50).
     smudge_strength: u8,
     /// The Blur's strength, 1..=100 percent (0.223.0; default 50).
@@ -30103,6 +30112,7 @@ impl Default for ToolSettings {
             colour_range_fuzziness: colour_range_app::DEFAULT_FUZZINESS,
             gaussian_blur_radius: layer_filter_cmd::DEFAULT_RADIUS,
             unsharp_settings: layer_filter_cmd::DEFAULT_UNSHARP,
+            noise_settings: layer_filter_cmd::DEFAULT_NOISE,
             smudge_strength: DEFAULT_SMUDGE_STRENGTH,
             blur_strength: DEFAULT_SMUDGE_STRENGTH,
             sharpen_strength: DEFAULT_SMUDGE_STRENGTH,
@@ -32913,6 +32923,10 @@ impl App {
                     layer_filter_cmd::FilterEdit::AddUnsharpMask(settings)
                     | layer_filter_cmd::FilterEdit::EditLastUnsharp(settings) => {
                         self.tool_settings.unsharp_settings = settings;
+                    }
+                    layer_filter_cmd::FilterEdit::AddReduceNoise(settings)
+                    | layer_filter_cmd::FilterEdit::EditLastNoise(settings) => {
+                        self.tool_settings.noise_settings = settings;
                     }
                     _ => {}
                 }
@@ -38219,7 +38233,7 @@ impl App {
         use layer_filter_cmd::PromptKind;
         let probe = layer_filter_cmd::FilterEdit::AddGaussianBlur(layer_filter_cmd::DEFAULT_RADIUS);
         let (kind, start) = match kind {
-            PromptKind::Add | PromptKind::AddUnsharp => {
+            PromptKind::Add | PromptKind::AddUnsharp | PromptKind::AddNoise => {
                 if let Err(why) =
                     layer_filter_cmd::plan(&self.doc.layers, self.doc.active_layer, probe)
                 {
@@ -38227,19 +38241,26 @@ impl App {
                     self.sync_status_bar_now();
                     return;
                 }
-                let start = if kind == PromptKind::Add {
-                    selection_refine::amount_text(self.tool_settings.gaussian_blur_radius)
-                } else {
-                    self.tool_settings.unsharp_settings.text()
+                let start = match kind {
+                    PromptKind::Add => {
+                        selection_refine::amount_text(self.tool_settings.gaussian_blur_radius)
+                    }
+                    PromptKind::AddNoise => self.tool_settings.noise_settings.text(),
+                    _ => self.tool_settings.unsharp_settings.text(),
                 };
                 (kind, start)
             }
-            PromptKind::EditLast | PromptKind::EditLastUnsharp => {
+            PromptKind::EditLast | PromptKind::EditLastUnsharp | PromptKind::EditLastNoise => {
                 let layer = self.doc.active_layer;
+                let noise = layer.and_then(|id| layer_filter_cmd::last_noise(&self.doc.layers, id));
                 let unsharp =
                     layer.and_then(|id| layer_filter_cmd::last_unsharp(&self.doc.layers, id));
                 let last = layer.and_then(|id| layer_filter_cmd::last_radius(&self.doc.layers, id));
                 match (unsharp, last) {
+                    _ if noise.is_some() => (
+                        PromptKind::EditLastNoise,
+                        noise.map_or_else(String::new, layer_filter_cmd::NoiseSettings::text),
+                    ),
                     (Some(settings), _) => (PromptKind::EditLastUnsharp, settings.text()),
                     (None, Some(radius)) => {
                         (PromptKind::EditLast, selection_refine::amount_text(radius))

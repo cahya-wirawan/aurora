@@ -126,6 +126,40 @@ const UNSHARP_MASK_PARAMS: &[ParamSpec] = &[
         ParamKind::Int { min: 0, max: 255 },
     ),
 ];
+const REDUCE_NOISE_PARAMS: &[ParamSpec] = &[
+    ParamSpec::required(
+        "strength",
+        "How strongly luminance noise is smoothed, 0 to 10 (0 smooths nothing).",
+        ParamKind::Number {
+            min: 0.0,
+            max: 10.0,
+        },
+    ),
+    ParamSpec::required(
+        "preserve_details",
+        "How much edge contrast survives the smoothing, in percent, 0 to 100.",
+        ParamKind::Number {
+            min: 0.0,
+            max: 100.0,
+        },
+    ),
+    ParamSpec::required(
+        "color_noise",
+        "How strongly colour-only noise is blurred away, in percent, 0 to 100 (0 does nothing).",
+        ParamKind::Number {
+            min: 0.0,
+            max: 100.0,
+        },
+    ),
+    ParamSpec::required(
+        "sharpen_details",
+        "How much the result is sharpened afterwards, in percent, 0 to 100 (0 does nothing).",
+        ParamKind::Number {
+            min: 0.0,
+            max: 100.0,
+        },
+    ),
+];
 const EDIT_FILTER_PARAMS: &[ParamSpec] = &[ParamSpec::required(
     "radius",
     "The new blur radius in pixels, 0.1 to 85 (fractions allowed).",
@@ -506,10 +540,22 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
     )
     .params(UNSHARP_MASK_PARAMS),
     CommandSpec::new(
+        "layer.filter.reduce_noise",
+        "Reduce Noise\u{2026}",
+        "Adds an editable Reduce Noise to the active pixel layer: edge-preserving smoothing of \
+         grain, a blur of colour-only noise and an optional sharpening of the result; alpha is \
+         never changed. It is computed when the layer is drawn, not baked into its pixels (one \
+         undo step).",
+        Layer,
+        Write,
+    )
+    .params(REDUCE_NOISE_PARAMS),
+    CommandSpec::new(
         "layer.filter.edit_last",
         "Edit Last Layer Filter\u{2026}",
         "Changes the radius of the active layer's last (topmost) filter, a Gaussian Blur or an \
-         Unsharp Mask (one undo step).",
+         Unsharp Mask; a Reduce Noise has no radius and is edited through the Reduce Noise prompt \
+         (one undo step).",
         Layer,
         Write,
     )

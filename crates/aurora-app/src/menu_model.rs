@@ -150,6 +150,7 @@ fn static_rows(title: &str) -> Vec<Row> {
         "Filter" => vec![
             Cmd(crate::layer_filter_cmd::COMMAND_GAUSSIAN_BLUR),
             Cmd(crate::layer_filter_cmd::COMMAND_UNSHARP_MASK),
+            Cmd(crate::layer_filter_cmd::COMMAND_REDUCE_NOISE),
             Cmd(crate::layer_filter_cmd::COMMAND_EDIT_LAST),
             Sep,
             Cmd(crate::layer_filter_cmd::COMMAND_TOGGLE),
@@ -466,6 +467,7 @@ pub(crate) const NATIVE_MENU_COMMANDS: &[&str] = &[
     crate::COMMAND_LAYER_CLIP_RELEASE,
     crate::layer_filter_cmd::COMMAND_GAUSSIAN_BLUR,
     crate::layer_filter_cmd::COMMAND_UNSHARP_MASK,
+    crate::layer_filter_cmd::COMMAND_REDUCE_NOISE,
     crate::layer_filter_cmd::COMMAND_EDIT_LAST,
     crate::layer_filter_cmd::COMMAND_TOGGLE,
     crate::layer_filter_cmd::COMMAND_REMOVE_LAST,
