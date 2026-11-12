@@ -90,7 +90,7 @@ pub const TOOL_COLUMNS: usize = 2;
 /// The groups of the strip, top to bottom, each one row of at most
 /// [`TOOL_COLUMNS`] buttons, a rule between consecutive groups. Together
 /// they hold every tool of [`Tool::ALL`], in that order.
-pub const TOOL_GROUPS: [&[Tool]; 14] = [
+pub const TOOL_GROUPS: [&[Tool]; 15] = [
     &[Tool::Move],
     &[Tool::MarqueeSelect, Tool::EllipticalMarquee],
     &[Tool::Lasso, Tool::PolygonalLasso],
@@ -100,7 +100,8 @@ pub const TOOL_GROUPS: [&[Tool]; 14] = [
     &[Tool::Eyedropper],
     &[Tool::Brush, Tool::Pencil],
     &[Tool::Eraser, Tool::CloneStamp],
-    &[Tool::Smudge, Tool::SpotHealing],
+    &[Tool::Smudge],
+    &[Tool::SpotHealing, Tool::HealingBrush],
     &[Tool::Blur, Tool::Sharpen],
     &[Tool::Dodge, Tool::Burn],
     &[Tool::Sponge, Tool::Pen],
@@ -136,6 +137,7 @@ pub const fn tool_icon(tool: Tool) -> IconKind {
         Tool::Crop => IconKind::Crop,
         Tool::Pen => IconKind::Pen,
         Tool::SpotHealing => IconKind::SpotHealing,
+        Tool::HealingBrush => IconKind::HealingBrush,
         Tool::Gradient => IconKind::Gradient,
         Tool::PaintBucket => IconKind::PaintBucket,
     }
@@ -412,7 +414,7 @@ mod tests {
 
     /// The icon each tool must wear, written out independently of
     /// [`tool_icon`] so a mapped-to-the-wrong-tool slip fails.
-    const EXPECTED_ICONS: [(Tool, IconKind); 25] = [
+    const EXPECTED_ICONS: [(Tool, IconKind); 26] = [
         (Tool::Move, IconKind::Move),
         (Tool::MarqueeSelect, IconKind::Marquee),
         (Tool::EllipticalMarquee, IconKind::EllipseMarquee),
@@ -429,6 +431,7 @@ mod tests {
         (Tool::CloneStamp, IconKind::CloneStamp),
         (Tool::Smudge, IconKind::Smudge),
         (Tool::SpotHealing, IconKind::SpotHealing),
+        (Tool::HealingBrush, IconKind::HealingBrush),
         (Tool::Blur, IconKind::Blur),
         (Tool::Sharpen, IconKind::Sharpen),
         (Tool::Dodge, IconKind::Dodge),
@@ -529,6 +532,10 @@ mod tests {
         assert_eq!(
             tool_description(Tool::SpotHealing),
             "Spot Healing tool, shortcut J"
+        );
+        assert_eq!(
+            tool_description(Tool::HealingBrush),
+            "Healing Brush tool, shortcut Shift+J"
         );
         assert_eq!(tool_description(Tool::Blur), "Blur tool, shortcut Shift+R");
         assert_eq!(
@@ -786,11 +793,14 @@ mod tests {
             // left column, above the fill row.
             assert!(at(Tool::Smudge).y > at(Tool::Eraser).y);
             assert_eq!(at(Tool::Smudge).x, at(Tool::Eraser).x);
-            // 0.237.0: the Spot Healing shares the Smudge's row, right of it.
-            assert_eq!(at(Tool::SpotHealing).y, at(Tool::Smudge).y);
-            assert_eq!(at(Tool::Smudge).x + 32, at(Tool::SpotHealing).x);
+            // 0.314.0: the Smudge has a row of its own; the Spot Healing and
+            // the Healing Brush share the next one (the strip stays two
+            // buttons wide).
+            assert!(at(Tool::SpotHealing).y > at(Tool::Smudge).y);
+            assert_eq!(at(Tool::HealingBrush).y, at(Tool::SpotHealing).y);
+            assert_eq!(at(Tool::SpotHealing).x + 32, at(Tool::HealingBrush).x);
             // 0.223.0: the Blur and Sharpen share a row under it.
-            assert!(at(Tool::Blur).y > at(Tool::Smudge).y);
+            assert!(at(Tool::Blur).y > at(Tool::HealingBrush).y);
             assert_eq!(at(Tool::Sharpen).y, at(Tool::Blur).y);
             assert_eq!(at(Tool::Blur).x + 32, at(Tool::Sharpen).x);
             // 0.224.0: the Dodge and Burn share a row under that, the
@@ -813,7 +823,7 @@ mod tests {
             let bucket = at(Tool::PaintBucket);
             assert_eq!(
                 bucket.bottom() - strip.y,
-                4 + 14 * 32 + 13 * 8,
+                4 + 15 * 32 + 14 * 8,
                 "scale {scale_factor}"
             );
             assert!(

@@ -149,6 +149,8 @@ pub enum IconKind {
     Pen,
     /// A diagonal sticking plaster: the Spot Healing tool (0.237.0).
     SpotHealing,
+    /// A brush with a small plus at its tip: the Healing Brush tool (0.314.0).
+    HealingBrush,
     /// A brush tip with corner marks: the Quick Select tool (0.238.0).
     QuickSelect,
     /// Three overlapping rings, the red, green and blue channels: the
@@ -165,7 +167,7 @@ pub enum IconKind {
 
 impl IconKind {
     /// Every icon, in the order the gallery shows them.
-    pub const ALL: [IconKind; 49] = [
+    pub const ALL: [IconKind; 50] = [
         IconKind::Eye,
         IconKind::EyeOff,
         IconKind::FolderClosed,
@@ -210,6 +212,7 @@ impl IconKind {
         IconKind::Crop,
         IconKind::Pen,
         IconKind::SpotHealing,
+        IconKind::HealingBrush,
         IconKind::QuickSelect,
         IconKind::Channels,
         IconKind::FillPath,
@@ -266,6 +269,7 @@ impl IconKind {
             IconKind::Crop => "Crop",
             IconKind::Pen => "Pen",
             IconKind::SpotHealing => "Spot Healing",
+            IconKind::HealingBrush => "Healing Brush",
             IconKind::QuickSelect => "Quick Select",
             IconKind::Channels => "Channels",
             IconKind::FillPath => "Fill Path",
@@ -886,6 +890,19 @@ pub fn icon_parts(kind: IconKind) -> Vec<IconPart> {
                 .l(6.2, 8.0)
                 .closed(),
         ],
+        IconKind::HealingBrush => vec![
+            // A brush on a diagonal handle, with a small plus (the healing
+            // mark) at its lower left.
+            stroke_part().m(14.0, 2.0).l(8.0, 8.0),
+            stroke_part()
+                .m(8.0, 8.0)
+                .l(10.0, 10.0)
+                .l(7.5, 12.5)
+                .l(5.5, 10.5)
+                .closed(),
+            stroke_part().m(3.5, 13.5).l(3.5, 9.5),
+            stroke_part().m(1.5, 11.5).l(5.5, 11.5),
+        ],
         IconKind::QuickSelect => vec![
             // A brush tip on a short handle, with the corner marks of a
             // selection round its lower right.
@@ -1082,8 +1099,8 @@ mod tests {
 
     #[test]
     fn the_set_has_every_named_icon_once_with_a_distinct_name_and_drawing() {
-        // 49 since 0.257.0: Channels, Fill Path, Stroke Path and Make Path.
-        assert_eq!(IconKind::ALL.len(), 49);
+        // 49 since 0.257.0 (Channels, Fill Path, Stroke Path, Make Path); 50 since 0.314.0 (Healing Brush).
+        assert_eq!(IconKind::ALL.len(), 50);
         for kind in [IconKind::SwapArrows, IconKind::DefaultColours] {
             assert!(IconKind::ALL.contains(&kind));
             assert!(!icon_parts(kind).is_empty(), "{kind:?}");

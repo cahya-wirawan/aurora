@@ -122,8 +122,32 @@ pub(crate) fn press(
     locked: Option<LockRefusal>,
     doc_point: (f32, f32),
 ) -> Press {
+    press_with(
+        state,
+        alt,
+        layer,
+        locked,
+        doc_point,
+        (
+            LockRefusal::CloneNeedsPixelLayer,
+            LockRefusal::CloneNeedsSource,
+        ),
+    )
+}
+
+/// [`press`] with the two notices of the tool using the state: `refusals` is
+/// (no pixel layer, no source). The Healing Brush (0.314.0) shares the
+/// Clone Stamp's source and aligned-offset machinery through this.
+pub(crate) fn press_with(
+    state: &mut CloneStamp,
+    alt: bool,
+    layer: Option<LayerId>,
+    locked: Option<LockRefusal>,
+    doc_point: (f32, f32),
+    refusals: (LockRefusal, LockRefusal),
+) -> Press {
     let Some(layer) = layer else {
-        return Press::Refused(LockRefusal::CloneNeedsPixelLayer);
+        return Press::Refused(refusals.0);
     };
     if alt {
         state.set_source(layer, doc_point);
@@ -134,7 +158,7 @@ pub(crate) fn press(
     }
     match state.begin_stroke(layer, doc_point) {
         Some(offset) => Press::Stroke(offset),
-        None => Press::Refused(LockRefusal::CloneNeedsSource),
+        None => Press::Refused(refusals.1),
     }
 }
 

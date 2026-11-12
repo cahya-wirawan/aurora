@@ -341,6 +341,9 @@ pub(crate) struct DocumentSession {
     /// active one (`commit_live_gestures`), when the active layer changes
     /// and by a new `Alt`+click.
     pub(crate) clone_stamp: crate::clone_stamp::CloneStamp,
+    /// The Healing Brush's (0.314.0) own source and aligned offset, the
+    /// same machinery as the Clone Stamp's, kept apart from it.
+    pub(crate) healing_source: crate::clone_stamp::CloneStamp,
     /// Which colour channels the canvas displays (0.232.0, the Channels
     /// panel's eyes): a per-document *view* setting, not document state
     /// (no undo, never dirty, not saved), applied only to the displayed
@@ -608,6 +611,7 @@ impl DocumentSession {
             colour_unsaved: false,
             layer_filter: aurora_ui::LayerFilter::default(),
             clone_stamp: crate::clone_stamp::CloneStamp::default(),
+            healing_source: crate::clone_stamp::CloneStamp::default(),
             channel_view: aurora_ui::ChannelVisibility::default(),
             park_autosave: None,
             canvas_view,

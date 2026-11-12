@@ -1,4 +1,4 @@
-//! The Spot Healing tool (0.237.0): Photoshop's Spot Healing Brush, simplified
+//! The Spot Healing tool (0.237.0) and the Healing Brush (0.314.0): Photoshop's Spot Healing Brush, simplified
 //! (see `aurora-brush`'s `spot_heal.rs` for the model).
 //!
 //! A drag is the Brush's drag (the same radius, spacing and stroke snapshot)
@@ -27,11 +27,17 @@ use crate::{Drag, LockRefusal, PaintPermission, ToolSettings};
 /// The History row label of a healed stroke.
 pub(crate) const SPOT_HEALING_LABEL: &str = "Spot Healing";
 
+/// The History row label of a Healing Brush stroke (0.314.0).
+pub(crate) const HEALING_BRUSH_LABEL: &str = "Healing Brush";
+
 /// The area a Spot Healing drag has painted and the radius that painted it.
 #[derive(Debug, Default)]
 pub(crate) struct HealStroke {
     mask: aurora_brush::HealMask,
     radius: f32,
+    /// The Healing Brush's (0.314.0) aligned source offset, fixed at the
+    /// press; `None` is a Spot Healing stroke.
+    offset: Option<(i64, i64)>,
 }
 
 impl HealStroke {
@@ -39,6 +45,49 @@ impl HealStroke {
     #[cfg(test)]
     pub(crate) fn mask(&self) -> &aurora_brush::HealMask {
         &self.mask
+    }
+}
+
+/// The History row label of the stroke a `heal` drag field describes.
+#[must_use]
+pub(crate) fn label(heal: Option<&HealStroke>) -> &'static str {
+    if heal.is_some_and(|h| h.offset.is_some()) {
+        HEALING_BRUSH_LABEL
+    } else {
+        SPOT_HEALING_LABEL
+    }
+}
+
+/// The one decision a Healing Brush primary press makes (0.314.0): the
+/// Clone Stamp's ([`crate::clone_stamp::press`]) over the Healing Brush's
+/// own source state, with its own notices. `Alt`+click sets the source.
+pub(crate) fn healing_press(
+    state: &mut crate::clone_stamp::CloneStamp,
+    alt: bool,
+    layer: Option<aurora_doc::LayerId>,
+    locked: Option<LockRefusal>,
+    doc_point: (f32, f32),
+) -> crate::clone_stamp::Press {
+    crate::clone_stamp::press_with(
+        state,
+        alt,
+        layer,
+        locked,
+        doc_point,
+        (
+            LockRefusal::SpotHealNeedsPixelLayer,
+            LockRefusal::HealNeedsSource,
+        ),
+    )
+}
+
+/// Stores the press's offset in a freshly begun Healing Brush drag.
+pub(crate) fn set_drag_offset(drag: &mut Option<Drag>, offset: (i64, i64)) {
+    if let Some(Drag::Brush {
+        heal: Some(stroke), ..
+    }) = drag
+    {
+        stroke.offset = Some(offset);
     }
 }
 
@@ -107,6 +156,8 @@ pub(crate) fn finish(drag: &mut Option<Drag>, doc: &mut DocumentSession) -> Opti
         return None;
     };
     let painted = std::mem::take(&mut **stroke);
+    // The emptied stroke keeps what kind it is (its History label).
+    stroke.offset = painted.offset;
     if painted.mask.is_empty() && !painted.mask.overflowed() {
         return None;
     }
@@ -130,16 +181,29 @@ pub(crate) fn finish(drag: &mut Option<Drag>, doc: &mut DocumentSession) -> Opti
     let selection = doc.selection.active();
     let store = doc.tile_store.as_mut()?;
     let cover = crate::selection_paint::layer_selection(selection, bounds);
-    let healed = aurora_brush::spot_heal_covered(
-        store,
-        surface,
-        &painted.mask,
-        painted.radius,
-        preserve_alpha,
-        snapshot.as_mut(),
-        crate::selection_paint::as_coverage(cover.as_ref()),
-    );
+    let healed = match painted.offset {
+        Some(offset) => aurora_brush::healing_brush_covered(
+            store,
+            surface,
+            &painted.mask,
+            painted.radius,
+            offset,
+            preserve_alpha,
+            snapshot.as_mut(),
+            crate::selection_paint::as_coverage(cover.as_ref()),
+        ),
+        None => aurora_brush::spot_heal_covered(
+            store,
+            surface,
+            &painted.mask,
+            painted.radius,
+            preserve_alpha,
+            snapshot.as_mut(),
+            crate::selection_paint::as_coverage(cover.as_ref()),
+        ),
+    };
     match healed {
+        Err(aurora_brush::HealRefusal::SourceOutside) => Some(LockRefusal::HealSourceOutside),
         Err(aurora_brush::HealRefusal::TooLarge) => Some(LockRefusal::HealTooLarge),
         Err(aurora_brush::HealRefusal::NotEnoughSurroundings) => {
             Some(LockRefusal::HealNotEnoughSurroundings)

@@ -213,6 +213,8 @@ fn x_and_d_are_bound_and_collide_with_no_tool_letter() {
                 Tool::Burn => Tool::Dodge,
                 // 0.238.0: bare W is the Magic Wand; Shift+W the Quick Select.
                 Tool::QuickSelect => Tool::MagicWand,
+                // 0.314.0: bare J is the Spot Healing; Shift+J the Healing Brush.
+                Tool::HealingBrush => Tool::SpotHealing,
                 Tool::Sponge => {
                     assert_eq!(
                         shortcut_command(key),

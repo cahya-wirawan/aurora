@@ -29,11 +29,11 @@ use crate::{
     MIN_RING_TEXELS, PixelHistory, StrokeSnapshot, spot_heal_covered,
 };
 
-fn surface() -> SurfaceId {
+pub(crate) fn surface() -> SurfaceId {
     SurfaceId::from_raw(0)
 }
 
-fn store() -> (tempfile::TempDir, TileStore) {
+pub(crate) fn store() -> (tempfile::TempDir, TileStore) {
     let dir = match tempfile::tempdir() {
         Ok(dir) => dir,
         Err(err) => unreachable!("tempdir: {err}"),
@@ -47,7 +47,7 @@ fn store() -> (tempfile::TempDir, TileStore) {
     }
 }
 
-fn put(store: &mut TileStore, x: u32, y: u32, v: [f32; 4]) {
+pub(crate) fn put(store: &mut TileStore, x: u32, y: u32, v: [f32; 4]) {
     let Ok(tile) = store.get_mut(
         surface(),
         TileId {
@@ -66,11 +66,11 @@ fn put(store: &mut TileStore, x: u32, y: u32, v: [f32; 4]) {
 }
 
 /// An opaque premultiplied texel from straight colour and alpha.
-fn texel(r: f32, g: f32, b: f32, a: f32) -> [f32; 4] {
+pub(crate) fn texel(r: f32, g: f32, b: f32, a: f32) -> [f32; 4] {
     [r * a, g * a, b * a, a]
 }
 
-fn get(store: &mut TileStore, x: u32, y: u32) -> [f16; CHANNELS] {
+pub(crate) fn get(store: &mut TileStore, x: u32, y: u32) -> [f16; CHANNELS] {
     let id = TileId {
         x: x / TILE,
         y: y / TILE,
@@ -89,16 +89,16 @@ fn get(store: &mut TileStore, x: u32, y: u32) -> [f16; CHANNELS] {
     out
 }
 
-fn getf(store: &mut TileStore, x: u32, y: u32) -> [f32; 4] {
+pub(crate) fn getf(store: &mut TileStore, x: u32, y: u32) -> [f32; 4] {
     get(store, x, y).map(f16::to_f32)
 }
 
-fn bits(t: [f16; CHANNELS]) -> [u16; 4] {
+pub(crate) fn bits(t: [f16; CHANNELS]) -> [u16; 4] {
     t.map(f16::to_bits)
 }
 
 /// Paints `w x h` texels from the origin with `f(x, y)` (premultiplied).
-fn paint(s: &mut TileStore, w: u32, h: u32, f: impl Fn(u32, u32) -> [f32; 4]) {
+pub(crate) fn paint(s: &mut TileStore, w: u32, h: u32, f: impl Fn(u32, u32) -> [f32; 4]) {
     for y in 0..h {
         for x in 0..w {
             put(s, x, y, f(x, y));
@@ -106,7 +106,7 @@ fn paint(s: &mut TileStore, w: u32, h: u32, f: impl Fn(u32, u32) -> [f32; 4]) {
     }
 }
 
-fn dump(s: &mut TileStore, w: u32, h: u32) -> Vec<[u16; 4]> {
+pub(crate) fn dump(s: &mut TileStore, w: u32, h: u32) -> Vec<[u16; 4]> {
     let mut out = Vec::new();
     for y in 0..h {
         for x in 0..w {
@@ -116,13 +116,13 @@ fn dump(s: &mut TileStore, w: u32, h: u32) -> Vec<[u16; 4]> {
     out
 }
 
-fn disc(cx: f32, cy: f32, r: f32) -> HealMask {
+pub(crate) fn disc(cx: f32, cy: f32, r: f32) -> HealMask {
     let mut mask = HealMask::new();
     mask.add_dab((cx, cy), r);
     mask
 }
 
-fn heal(
+pub(crate) fn heal(
     s: &mut TileStore,
     mask: &HealMask,
     preserve: bool,
@@ -132,7 +132,7 @@ fn heal(
     spot_heal_covered(s, surface(), mask, 8.0, preserve, snap, cov)
 }
 
-struct Constant(f32);
+pub(crate) struct Constant(pub f32);
 
 impl Coverage for Constant {
     fn bounds(&self) -> Option<Rect> {
@@ -143,7 +143,7 @@ impl Coverage for Constant {
     }
 }
 
-struct RightOf(i64);
+pub(crate) struct RightOf(pub i64);
 
 impl Coverage for RightOf {
     fn bounds(&self) -> Option<Rect> {
@@ -154,7 +154,7 @@ impl Coverage for RightOf {
     }
 }
 
-fn close(a: [f32; 4], b: [f32; 4], tol: f32) -> bool {
+pub(crate) fn close(a: [f32; 4], b: [f32; 4], tol: f32) -> bool {
     a.iter().zip(&b).all(|(x, y)| (x - y).abs() <= tol)
 }
 

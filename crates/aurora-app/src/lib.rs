@@ -610,6 +610,8 @@ mod straighten_doc;
 #[cfg(test)]
 mod straighten_tests;
 pub use bridge_app::{AUTOMATION_CONNECTED, BridgeOptions};
+#[cfg(test)]
+mod healing_brush_stamp_tests;
 mod menu_bar_app;
 mod menu_bar_state;
 mod menu_model;
@@ -6027,6 +6029,14 @@ fn default_shortcuts_for(primary_is_meta: bool) -> ShortcutRegistry<AppCommand> 
         // 0.237.0: Photoshop's Spot Healing Brush key (bare, like the other
         // tool letters; Primary+J is Layer via Copy, a different chord).
         ("j", AppCommand::SelectTool(aurora_ui::Tool::SpotHealing)),
+        // 0.314.0: the Healing Brush. Photoshop shares J among the healing
+        // tools; Aurora keeps bare J for the Spot Healing and gives the
+        // Healing Brush Shift+J (Layer via Cut is Primary+Shift+J, a
+        // different chord).
+        (
+            "Shift+J",
+            AppCommand::SelectTool(aurora_ui::Tool::HealingBrush),
+        ),
         // 0.224.0: the Dodge, Burn and Sponge. Photoshop shares O among the
         // three; Aurora keeps bare O for the Dodge, Shift+O for the Burn and
         // gives the Sponge Shift+P (bare P stays free for a future Pen).
@@ -6650,6 +6660,7 @@ const fn tool_command_id(tool: aurora_ui::Tool) -> &'static str {
         aurora_ui::Tool::Crop => "tool.crop",
         aurora_ui::Tool::Pen => "tool.pen",
         aurora_ui::Tool::SpotHealing => "tool.spot_healing",
+        aurora_ui::Tool::HealingBrush => "tool.healing_brush",
         aurora_ui::Tool::QuickSelect => "tool.quick_select",
     }
 }
@@ -13890,7 +13901,9 @@ enum Drag {
         tone: Option<tone_stamp::ToneKind>,
         /// The Spot Healing (0.237.0): `Some(stroke)` is the area painted so
         /// far ([`spot_heal_stamp`]); nothing is written while the drag
-        /// runs, the release heals it as one step "Spot Healing".
+        /// runs, the release heals it as one step "Spot Healing". The
+        /// Healing Brush (0.314.0) is the same field with the stroke's
+        /// source offset set: its step reads "Healing Brush".
         heal: Option<Box<spot_heal_stamp::HealStroke>>,
         last_doc: (f32, f32),
         carry: f32,
@@ -14187,7 +14200,7 @@ fn commit_ending_drag(
             if clone.is_some() {
                 CLONE_STAMP_STROKE_LABEL
             } else if heal.is_some() {
-                spot_heal_stamp::SPOT_HEALING_LABEL
+                spot_heal_stamp::label(heal.as_deref())
             } else if smudge.is_some() {
                 SMUDGE_STROKE_LABEL
             } else if let Some(kind) = filter {
@@ -14497,6 +14510,7 @@ fn begin_drag(
             | aurora_ui::Tool::CloneStamp
             | aurora_ui::Tool::Smudge
             | aurora_ui::Tool::SpotHealing
+            | aurora_ui::Tool::HealingBrush
             | aurora_ui::Tool::Blur
             | aurora_ui::Tool::Sharpen
             | aurora_ui::Tool::Dodge
@@ -14514,7 +14528,11 @@ fn begin_drag(
                 smudge: (tool == aurora_ui::Tool::Smudge).then(Box::default),
                 filter: filter_stamp::kind_of(tool),
                 tone: tone_stamp::kind_of(tool),
-                heal: (tool == aurora_ui::Tool::SpotHealing).then(Box::default),
+                heal: matches!(
+                    tool,
+                    aurora_ui::Tool::SpotHealing | aurora_ui::Tool::HealingBrush
+                )
+                .then(Box::default),
                 last_doc: view.to_document(canvas_point),
                 carry: 0.0,
                 stroke: active_pixel_layer
@@ -30613,6 +30631,11 @@ enum LockRefusal {
     HealNotEnoughSurroundings,
     /// A Spot Healing stroke over the size bound (0.237.0).
     HealTooLarge,
+    /// A Healing Brush press with no source set (0.314.0).
+    HealNeedsSource,
+    /// A Healing Brush stroke whose source lies mostly outside the layer
+    /// (0.314.0).
+    HealSourceOutside,
     /// Something a controller's input may not do (task 160): quit, switch
     /// the bridge off, open a native file dialog.
     Automation(&'static str),
@@ -30740,6 +30763,10 @@ impl LockRefusal {
                 "Not enough surrounding texture to heal here."
             }
             LockRefusal::HealTooLarge => "That area is too large to heal.",
+            LockRefusal::HealNeedsSource => "Alt-click to set a healing source.",
+            LockRefusal::HealSourceOutside => {
+                "The healing source is mostly outside the layer. Alt-click a source on the layer."
+            }
             LockRefusal::BlurNeedsPixelLayer => {
                 "Select a pixel layer to blur. A group, an adjustment layer or no layer can't be blurred."
             }
@@ -30808,6 +30835,7 @@ fn press_refusal(tool: aurora_ui::Tool, lock: aurora_doc::LayerLock) -> Option<L
         | aurora_ui::Tool::CloneStamp
         | aurora_ui::Tool::Smudge
         | aurora_ui::Tool::SpotHealing
+        | aurora_ui::Tool::HealingBrush
         | aurora_ui::Tool::Blur
         | aurora_ui::Tool::Sharpen
         | aurora_ui::Tool::Dodge
@@ -30868,6 +30896,14 @@ fn lock_refusal_applies(
                 | LockRefusal::HealNotEnoughSurroundings
                 | LockRefusal::HealTooLarge
         ) && tool == aurora_ui::Tool::SpotHealing)
+        || (matches!(
+            refusal,
+            LockRefusal::SpotHealNeedsPixelLayer
+                | LockRefusal::HealNotEnoughSurroundings
+                | LockRefusal::HealTooLarge
+                | LockRefusal::HealNeedsSource
+                | LockRefusal::HealSourceOutside
+        ) && tool == aurora_ui::Tool::HealingBrush)
         || (refusal == LockRefusal::BlurNeedsPixelLayer && tool == aurora_ui::Tool::Blur)
         || (refusal == LockRefusal::SharpenNeedsPixelLayer && tool == aurora_ui::Tool::Sharpen)
         || (refusal == LockRefusal::DodgeNeedsPixelLayer && tool == aurora_ui::Tool::Dodge)
@@ -30954,6 +30990,7 @@ impl ToolSettings {
             | aurora_ui::Tool::CloneStamp
             | aurora_ui::Tool::Smudge
             | aurora_ui::Tool::SpotHealing
+            | aurora_ui::Tool::HealingBrush
             | aurora_ui::Tool::QuickSelect
             | aurora_ui::Tool::Blur
             | aurora_ui::Tool::Sharpen
@@ -30997,6 +31034,7 @@ impl ToolSettings {
             | aurora_ui::Tool::CloneStamp
             | aurora_ui::Tool::Smudge
             | aurora_ui::Tool::SpotHealing
+            | aurora_ui::Tool::HealingBrush
             | aurora_ui::Tool::QuickSelect
             | aurora_ui::Tool::Blur
             | aurora_ui::Tool::Sharpen
@@ -36114,6 +36152,35 @@ impl App {
                 clone_stamp::Press::Stroke(offset) => clone_offset = Some(offset),
             }
         }
+        // The Healing Brush (0.314.0): the Clone Stamp's Alt+click source
+        // and aligned offset (kept in its own state), a pixel layer the
+        // lock allows.
+        let mut healing_offset = None;
+        if self.tool == aurora_ui::Tool::HealingBrush && button == PointerButton::Primary {
+            let doc_point = self.doc.canvas_view.to_document(canvas_point);
+            let layer =
+                active_pixel_layer(&self.doc.layers, self.doc.active_layer).map(|(id, _)| id);
+            match spot_heal_stamp::healing_press(
+                &mut self.doc.healing_source,
+                self.modifiers.alt,
+                layer,
+                self.doc.active_layer.and_then(|id| {
+                    press_refusal(self.tool, self.doc.layers.lock(id).unwrap_or_default())
+                }),
+                doc_point,
+            ) {
+                clone_stamp::Press::SourceSet => {
+                    self.needs_redraw = true;
+                    return;
+                }
+                clone_stamp::Press::Refused(why) => {
+                    self.lock_notice = Some((why, self.doc.active_layer));
+                    self.sync_status_bar_now();
+                    return;
+                }
+                clone_stamp::Press::Stroke(offset) => healing_offset = Some(offset),
+            }
+        }
         // The Smudge (0.222.0): a press needs a pixel layer the lock allows.
         if self.tool == aurora_ui::Tool::Smudge
             && button == PointerButton::Primary
@@ -36211,6 +36278,9 @@ impl App {
         );
         if let Some(offset) = clone_offset {
             clone_stamp::set_drag_offset(&mut self.drag, offset);
+        }
+        if let Some(offset) = healing_offset {
+            spot_heal_stamp::set_drag_offset(&mut self.drag, offset);
         }
         if matches!(self.drag, Some(Drag::Lasso { .. })) {
             // Like the Marquee, a press deselects at once; the path then
@@ -75834,6 +75904,7 @@ mod tests {
                         | Tool::CloneStamp
                         | Tool::Smudge
                         | Tool::SpotHealing
+                        | Tool::HealingBrush
                         | Tool::QuickSelect
                         | Tool::Blur
                         | Tool::Sharpen
@@ -101147,6 +101218,7 @@ impl App {
         self.apply_pending_selection();
         // 0.221.0: a Clone Stamp source belongs to the layer it was set on.
         self.doc.clone_stamp.observe_layer(self.doc.active_layer);
+        self.doc.healing_source.observe_layer(self.doc.active_layer);
         // 0.186.0: install whatever the background compositor finished.
         if self.drain_background_composite() {
             self.needs_redraw = true;
