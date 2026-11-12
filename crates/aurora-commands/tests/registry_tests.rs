@@ -45,8 +45,8 @@ fn ids_are_unique_and_the_table_has_the_expected_size() {
     ids.sort_unstable();
     ids.dedup();
     assert_eq!(ids.len(), total, "duplicate ids");
-    assert_eq!(total, 156);
-    assert_eq!(builtin().palette().count(), 153);
+    assert_eq!(total, 157);
+    assert_eq!(builtin().palette().count(), 154);
 }
 
 /// The id list is pinned: an id, its title and whether the palette lists it

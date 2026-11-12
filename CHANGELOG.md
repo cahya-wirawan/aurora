@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.310.0] - 2026-11-12
+
+### Changed
+
+- Unsharp Mask as the second editable layer filter
+
 ## [0.309.0] - 2026-11-12
 
 ### Changed

@@ -36,7 +36,9 @@
 //! window now has to cover the effect's own apron *plus* the filter's
 //! reach. Where the sum goes past the bound the effect's source window is
 //! clipped, so a far edge of a very large shadow or glow of a heavily
-//! blurred layer can be cut short. Nothing is reported for it.
+//! blurred layer can be cut short. An Unsharp Mask (task 177) reads the
+//! same blur and reaches as far, but spreads nothing into transparent
+//! pixels, so it has no spill. Nothing is reported for it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -72,12 +74,12 @@ pub(crate) fn filter_reach(layers: &aurora_doc::LayerTree, id: aurora_doc::Layer
 }
 
 /// The visible filters' settings as a cache key part: kind tag and the
-/// setting's bits. Empty without visible filters.
+/// settings' bits (unused slots zero). Empty without visible filters.
 #[must_use]
 pub(crate) fn filter_signature(
     layers: &aurora_doc::LayerTree,
     id: aurora_doc::LayerId,
-) -> Vec<(u8, u32)> {
+) -> Vec<(u8, [u32; 3])> {
     if !has_visible_filters(layers, id) {
         return Vec::new();
     }
@@ -86,7 +88,17 @@ pub(crate) fn filter_signature(
         .map(|f| {
             f.visible()
                 .map(|filter| match filter.kind {
-                    aurora_core::FilterKind::GaussianBlur { radius } => (0, radius.to_bits()),
+                    aurora_core::FilterKind::GaussianBlur { radius } => {
+                        (0, [radius.to_bits(), 0, 0])
+                    }
+                    aurora_core::FilterKind::UnsharpMask {
+                        amount,
+                        radius,
+                        threshold,
+                    } => (
+                        1,
+                        [amount.to_bits(), radius.to_bits(), u32::from(threshold)],
+                    ),
                 })
                 .collect()
         })
@@ -100,7 +112,7 @@ struct FilterCacheKey {
     layer_origin: (i64, i64),
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
-    filters: Vec<(u8, u32)>,
+    filters: Vec<(u8, [u32; 3])>,
     versions: Vec<(bool, u32, u32, bool, u64)>,
 }
 
@@ -290,6 +302,14 @@ fn compute(
             aurora_core::FilterKind::GaussianBlur { radius } => {
                 let spec = aurora_core::GaussianSpec::new(radius)?;
                 aurora_filters::gaussian_blur_window(&mut window, side, &spec);
+            }
+            aurora_core::FilterKind::UnsharpMask {
+                amount,
+                radius,
+                threshold,
+            } => {
+                let spec = aurora_core::GaussianSpec::new(radius)?;
+                aurora_filters::unsharp_mask_window(&mut window, side, amount, threshold, &spec);
             }
         }
     }

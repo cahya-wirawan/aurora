@@ -11148,6 +11148,12 @@ fn build_menu() -> muda::Menu {
                 None,
             ),
             &muda::MenuItem::with_id(
+                layer_filter_cmd::COMMAND_UNSHARP_MASK,
+                "Unsharp Mask\u{2026}",
+                true,
+                None,
+            ),
+            &muda::MenuItem::with_id(
                 layer_filter_cmd::COMMAND_EDIT_LAST,
                 "Edit Last Layer Filter\u{2026}",
                 true,
@@ -17591,7 +17597,7 @@ struct ShadowCacheKey {
     versions: Vec<(bool, u32, u32, bool, u64)>,
     /// The layer's visible filters (task 176): effects are drawn from the
     /// filtered pixels. Empty without any.
-    filters: Vec<(u8, u32)>,
+    filters: Vec<(u8, [u32; 3])>,
 }
 
 /// The shadow coverage cache (0.182.0 review): least recently used
@@ -30023,6 +30029,9 @@ struct ToolSettings {
     /// The Gaussian Blur… prompt's starting radius (task 176): the last
     /// one used this session, not persisted.
     gaussian_blur_radius: f32,
+    /// The Unsharp Mask… prompt's starting values (task 177): the last
+    /// ones used this session, not persisted.
+    unsharp_settings: layer_filter_cmd::UnsharpSettings,
     /// The Smudge's strength, 1..=100 percent (0.222.0; default 50).
     smudge_strength: u8,
     /// The Blur's strength, 1..=100 percent (0.223.0; default 50).
@@ -30093,6 +30102,7 @@ impl Default for ToolSettings {
             refine_amounts: selection_refine::RefineAmounts::default(),
             colour_range_fuzziness: colour_range_app::DEFAULT_FUZZINESS,
             gaussian_blur_radius: layer_filter_cmd::DEFAULT_RADIUS,
+            unsharp_settings: layer_filter_cmd::DEFAULT_UNSHARP,
             smudge_strength: DEFAULT_SMUDGE_STRENGTH,
             blur_strength: DEFAULT_SMUDGE_STRENGTH,
             sharpen_strength: DEFAULT_SMUDGE_STRENGTH,
@@ -30434,7 +30444,7 @@ impl LockRefusal {
             }
             LockRefusal::FilterNothing => "This layer has no filters to change.",
             LockRefusal::FilterTooLarge => {
-                "These filters would reach too far. A layer's shown filters together can blur at most about 85 pixels; lower a radius, or hide or remove a filter."
+                "These filters would reach too far. A layer's shown filters together can reach at most about 85 pixels; lower a radius, or hide or remove a filter."
             }
             LockRefusal::RefineNeedsSelection => {
                 "Make a selection first. Select > Modify changes the selection you have."
@@ -32896,8 +32906,15 @@ impl App {
             Some(ActivatedCommand::RefineApply(kind, amount)) => self.run_refine(kind, amount),
             Some(ActivatedCommand::FilterPrompt(kind)) => self.open_filter_prompt(kind),
             Some(ActivatedCommand::FilterApply(edit)) => {
-                if let layer_filter_cmd::FilterEdit::AddGaussianBlur(radius) = edit {
-                    self.tool_settings.gaussian_blur_radius = radius;
+                match edit {
+                    layer_filter_cmd::FilterEdit::AddGaussianBlur(radius) => {
+                        self.tool_settings.gaussian_blur_radius = radius;
+                    }
+                    layer_filter_cmd::FilterEdit::AddUnsharpMask(settings)
+                    | layer_filter_cmd::FilterEdit::EditLastUnsharp(settings) => {
+                        self.tool_settings.unsharp_settings = settings;
+                    }
+                    _ => {}
                 }
                 self.run_layer_command(LayerCommand::Filter(edit));
             }
@@ -38199,9 +38216,10 @@ impl App {
     /// Gaussian Blur… and Edit Last Layer Filter… (task 176): opens the
     /// radius prompt, or says why there is nothing to filter.
     fn open_filter_prompt(&mut self, kind: layer_filter_cmd::PromptKind) {
+        use layer_filter_cmd::PromptKind;
         let probe = layer_filter_cmd::FilterEdit::AddGaussianBlur(layer_filter_cmd::DEFAULT_RADIUS);
-        let start = match kind {
-            layer_filter_cmd::PromptKind::Add => {
+        let (kind, start) = match kind {
+            PromptKind::Add | PromptKind::AddUnsharp => {
                 if let Err(why) =
                     layer_filter_cmd::plan(&self.doc.layers, self.doc.active_layer, probe)
                 {
@@ -38209,29 +38227,39 @@ impl App {
                     self.sync_status_bar_now();
                     return;
                 }
-                self.tool_settings.gaussian_blur_radius
-            }
-            layer_filter_cmd::PromptKind::EditLast => {
-                let last = self
-                    .doc
-                    .active_layer
-                    .and_then(|id| layer_filter_cmd::last_radius(&self.doc.layers, id));
-                let Some(last) = last else {
-                    let why = if self.doc.active_layer.is_some_and(|id| {
-                        matches!(
-                            self.doc.layers.kind(id),
-                            Some(aurora_doc::LayerKind::Pixel { .. })
-                        )
-                    }) {
-                        LockRefusal::FilterNothing
-                    } else {
-                        LockRefusal::FilterNeedsPixelLayer
-                    };
-                    self.lock_notice = Some((why, self.doc.active_layer));
-                    self.sync_status_bar_now();
-                    return;
+                let start = if kind == PromptKind::Add {
+                    selection_refine::amount_text(self.tool_settings.gaussian_blur_radius)
+                } else {
+                    self.tool_settings.unsharp_settings.text()
                 };
-                last
+                (kind, start)
+            }
+            PromptKind::EditLast | PromptKind::EditLastUnsharp => {
+                let layer = self.doc.active_layer;
+                let unsharp =
+                    layer.and_then(|id| layer_filter_cmd::last_unsharp(&self.doc.layers, id));
+                let last = layer.and_then(|id| layer_filter_cmd::last_radius(&self.doc.layers, id));
+                match (unsharp, last) {
+                    (Some(settings), _) => (PromptKind::EditLastUnsharp, settings.text()),
+                    (None, Some(radius)) => {
+                        (PromptKind::EditLast, selection_refine::amount_text(radius))
+                    }
+                    (None, None) => {
+                        let why = if layer.is_some_and(|id| {
+                            matches!(
+                                self.doc.layers.kind(id),
+                                Some(aurora_doc::LayerKind::Pixel { .. })
+                            )
+                        }) {
+                            LockRefusal::FilterNothing
+                        } else {
+                            LockRefusal::FilterNeedsPixelLayer
+                        };
+                        self.lock_notice = Some((why, layer));
+                        self.sync_status_bar_now();
+                        return;
+                    }
+                }
             }
         };
         if layer_filter_cmd::open_prompt(
@@ -38239,7 +38267,7 @@ impl App {
             &mut self.focus,
             &mut self.command_palette,
             kind,
-            start,
+            &start,
         ) {
             self.push_accessibility();
             self.needs_redraw = true;

@@ -29,6 +29,12 @@ pub const MAX_GAUSSIAN_RADIUS: f32 = 85.0;
 /// The smallest Gaussian blur radius, in pixels (Photoshop's is 0.1).
 pub const MIN_GAUSSIAN_RADIUS: f32 = 0.1;
 
+/// The smallest Unsharp Mask amount, in percent (Photoshop's is 1).
+pub const MIN_UNSHARP_AMOUNT: f32 = 1.0;
+
+/// The largest Unsharp Mask amount, in percent (Photoshop's is 500).
+pub const MAX_UNSHARP_AMOUNT: f32 = 500.0;
+
 /// The most pixels all of one layer's shown filters may reach together
 /// (hidden filters are not counted; showing one is checked again).
 /// One tile's side: the window drawn for a tile is then at most 3 x 3
@@ -49,7 +55,11 @@ pub enum FiltersError {
     #[error("{count} filters on one layer; at most {MAX_LAYER_FILTERS} are allowed")]
     TooMany { count: usize },
     #[error(
-        "Gaussian blur radius is not a number from {MIN_GAUSSIAN_RADIUS} to {MAX_GAUSSIAN_RADIUS} pixels"
+        "Unsharp Mask amount is not a number from {MIN_UNSHARP_AMOUNT} to {MAX_UNSHARP_AMOUNT} percent"
+    )]
+    AmountOutOfRange,
+    #[error(
+        "filter radius is not a number from {MIN_GAUSSIAN_RADIUS} to {MAX_GAUSSIAN_RADIUS} pixels"
     )]
     RadiusOutOfRange,
     #[error(
@@ -65,6 +75,17 @@ pub enum FilterKind {
     /// A Gaussian blur whose `radius` (pixels) is the Gaussian's standard
     /// deviation.
     GaussianBlur { radius: f32 },
+    /// An Unsharp Mask (task 177), appended after the blur. `amount` is
+    /// the percentage of the difference between a pixel's colour and its
+    /// Gaussian-blurred colour that is added back (1..=500), `radius` the
+    /// blur's standard deviation in pixels (the blur's own range) and
+    /// `threshold` the smallest per-channel difference, in 8-bit levels
+    /// (0..=255), that is sharpened; a smaller difference is left alone.
+    UnsharpMask {
+        amount: f32,
+        radius: f32,
+        threshold: u8,
+    },
 }
 
 impl FilterKind {
@@ -73,6 +94,7 @@ impl FilterKind {
     pub fn name(&self) -> &'static str {
         match self {
             Self::GaussianBlur { .. } => "Gaussian Blur",
+            Self::UnsharpMask { .. } => "Unsharp Mask",
         }
     }
 
@@ -81,11 +103,25 @@ impl FilterKind {
     /// # Errors
     ///
     /// [`FiltersError::RadiusOutOfRange`] for a non-finite or out-of-range
-    /// radius.
+    /// radius, [`FiltersError::AmountOutOfRange`] for an Unsharp Mask
+    /// amount.
     pub fn validate(&self) -> Result<(), FiltersError> {
         match self {
             Self::GaussianBlur { radius } => {
                 if radius.is_finite()
+                    && (MIN_GAUSSIAN_RADIUS..=MAX_GAUSSIAN_RADIUS).contains(radius)
+                {
+                    Ok(())
+                } else {
+                    Err(FiltersError::RadiusOutOfRange)
+                }
+            }
+            Self::UnsharpMask { amount, radius, .. } => {
+                if !(amount.is_finite()
+                    && (MIN_UNSHARP_AMOUNT..=MAX_UNSHARP_AMOUNT).contains(amount))
+                {
+                    Err(FiltersError::AmountOutOfRange)
+                } else if radius.is_finite()
                     && (MIN_GAUSSIAN_RADIUS..=MAX_GAUSSIAN_RADIUS).contains(radius)
                 {
                     Ok(())
@@ -102,7 +138,10 @@ impl FilterKind {
     #[must_use]
     pub fn reach(&self) -> u32 {
         match self {
-            Self::GaussianBlur { radius } => GaussianSpec::new(*radius).map_or(0, |s| s.reach()),
+            // The unsharp mask reads exactly the blur it subtracts.
+            Self::GaussianBlur { radius } | Self::UnsharpMask { radius, .. } => {
+                GaussianSpec::new(*radius).map_or(0, |s| s.reach())
+            }
         }
     }
 }
@@ -392,6 +431,87 @@ mod tests {
         assert!(!f.any_visible());
         assert_eq!(f.visible_reach(), 0);
         assert!(f.validate().is_ok());
+    }
+
+    #[test]
+    fn unsharp_mask_validates_reaches_like_the_blur_and_is_appended() {
+        let unsharp = |amount, radius| FilterKind::UnsharpMask {
+            amount,
+            radius,
+            threshold: 3,
+        };
+        assert_eq!(unsharp(150.0, 2.0).validate(), Ok(()));
+        assert_eq!(unsharp(1.0, 0.1).validate(), Ok(()));
+        assert_eq!(unsharp(500.0, 85.0).validate(), Ok(()));
+        for amount in [0.9, 500.1, f32::NAN, f32::INFINITY, -5.0] {
+            assert_eq!(
+                unsharp(amount, 2.0).validate(),
+                Err(FiltersError::AmountOutOfRange),
+                "{amount}"
+            );
+        }
+        for radius in [0.09, 85.1, f32::NAN] {
+            assert_eq!(
+                unsharp(150.0, radius).validate(),
+                Err(FiltersError::RadiusOutOfRange),
+                "{radius}"
+            );
+        }
+        assert_eq!(
+            unsharp(100.0, 7.0).reach(),
+            FilterKind::GaussianBlur { radius: 7.0 }.reach()
+        );
+        assert_eq!(unsharp(100.0, 7.0).name(), "Unsharp Mask");
+        // It counts toward the shared reach cap like a blur.
+        let list = LayerFilters {
+            filters: vec![
+                LayerFilter::new(unsharp(100.0, 85.0)),
+                LayerFilter::new(FilterKind::GaussianBlur { radius: 85.0 }),
+            ],
+        };
+        assert!(matches!(
+            list.validate(),
+            Err(FiltersError::ReachTooLarge { .. })
+        ));
+    }
+
+    /// The wire format: the blur keeps variant 0 and its bytes; the Unsharp
+    /// Mask is variant 1. A build that knows only the blur (mirrored here)
+    /// refuses the new variant instead of misreading it.
+    #[test]
+    fn wire_format_blur_bytes_unchanged_and_old_readers_refuse_unsharp() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        enum Old {
+            GaussianBlur { radius: f32 },
+        }
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct OldFilter {
+            kind: Old,
+            visible: bool,
+        }
+        let blur = LayerFilter::new(FilterKind::GaussianBlur { radius: 2.5 });
+        let bytes = postcard::to_allocvec(&blur).unwrap_or_default();
+        // variant 0, f32 2.5 little-endian, visible = true.
+        assert_eq!(bytes, [0, 0, 0, 0x20, 0x40, 1]);
+        assert_eq!(
+            postcard::from_bytes::<OldFilter>(&bytes).ok(),
+            Some(OldFilter {
+                kind: Old::GaussianBlur { radius: 2.5 },
+                visible: true
+            })
+        );
+        let unsharp = LayerFilter::new(FilterKind::UnsharpMask {
+            amount: 150.0,
+            radius: 2.0,
+            threshold: 4,
+        });
+        let bytes = postcard::to_allocvec(&unsharp).unwrap_or_default();
+        assert_eq!(bytes.first(), Some(&1), "variant 1");
+        assert!(postcard::from_bytes::<OldFilter>(&bytes).is_err());
+        assert_eq!(
+            postcard::from_bytes::<LayerFilter>(&bytes).ok(),
+            Some(unsharp)
+        );
     }
 
     #[test]
