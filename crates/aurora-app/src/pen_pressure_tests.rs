@@ -397,7 +397,7 @@ fn the_other_dab_tools_do_not_take_pressure() {
     // `App::paint_dab` hands the pressure only to the stamp helper below the
     // early returns; each of these tools' dab methods has no pressure
     // parameter, and the Quick Mask dab is called without it.
-    let source = include_str!("lib.rs");
+    let source = include_str!("lib.rs").replace("\r\n", "\n");
     for line in [
         "fn clone_dab(&mut self, doc_point: (f32, f32), offset: (i64, i64)) {",
         "fn smudge_dab(&mut self, doc_point: (f32, f32)) {",
@@ -523,7 +523,7 @@ fn a_press_resets_the_stroke_pressure_to_the_press_sample() {
     assert_eq!(p.press(f32::NAN), 1.0);
     assert_eq!(p.advance(3.0), (1.0, 1.0));
     // The App presses through it at both stroke starts.
-    let source = include_str!("lib.rs");
+    let source = include_str!("lib.rs").replace("\r\n", "\n");
     assert_eq!(
         source
             .matches("self.stroke_pressure.press(self.pen_sample.pressure)")
@@ -536,7 +536,7 @@ fn a_press_resets_the_stroke_pressure_to_the_press_sample() {
 #[test]
 fn quick_mask_strokes_get_full_pressure_in_the_move_glue() {
     // `App::handle_pointer_moved` needs a window; pin the one rule.
-    let source = include_str!("lib.rs");
+    let source = include_str!("lib.rs").replace("\r\n", "\n");
     assert!(source.contains(
         "let (pressure_from, pressure_to) = if self.quick_mask.is_none() {\n                (event_from, event_to)\n            } else {\n                (1.0, 1.0)\n            };"
     ));
