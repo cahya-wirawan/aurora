@@ -14,6 +14,17 @@
 //! Smart Filters stack too); the filters' total reach is capped at one tile
 //! ([`aurora_core::MAX_FILTER_REACH`]).
 //!
+//! **Unsharp Mask… (task 177)** is the second kind. Its prompt is the same
+//! one-line palette prompt with three numbers: "Amount Radius Threshold"
+//! typed as `150 1.5 4` (percent, pixels, levels; spaces or commas; a `%`
+//! or `px` suffix is allowed), starting as the values last used this
+//! session (`ToolSettings::unsharp_settings`, not persisted; Photoshop's
+//! defaults 50 / 1 / 0 the first time). One line was chosen over three
+//! prompts in a row because the palette prompt has no "next" state, a
+//! single line keeps Enter and Escape meaning one thing, and a screen
+//! reader hears all three names in the prompt's label. Edit Last Layer
+//! Filter… opens the prompt that fits the last filter's kind.
+//!
 //! **What does not.** No Properties-panel editor (slider per filter, eye,
 //! delete button) yet: editing is by command, and only the last filter can
 //! be edited. No live preview while the radius is typed. Nothing is
@@ -27,6 +38,7 @@ use aurora_widgets::widgets::{
 use crate::{FocusManager, LockRefusal, WidgetId, command_palette_style};
 
 pub(crate) const COMMAND_GAUSSIAN_BLUR: &str = "layer.filter.gaussian_blur";
+pub(crate) const COMMAND_UNSHARP_MASK: &str = "layer.filter.unsharp_mask";
 pub(crate) const COMMAND_EDIT_LAST: &str = "layer.filter.edit_last";
 pub(crate) const COMMAND_TOGGLE: &str = "layer.filter.toggle";
 pub(crate) const COMMAND_REMOVE_LAST: &str = "layer.filter.remove_last";
@@ -35,6 +47,44 @@ pub(crate) const COMMAND_REMOVE_ALL: &str = "layer.filter.remove_all";
 /// The radius the prompt starts with the first time.
 pub(crate) const DEFAULT_RADIUS: f32 = 5.0;
 
+/// The Photoshop defaults the Unsharp Mask prompt starts with.
+pub(crate) const DEFAULT_UNSHARP: UnsharpSettings = UnsharpSettings {
+    amount: 50.0,
+    radius: 1.0,
+    threshold: 0,
+};
+
+/// The three numbers of an Unsharp Mask.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct UnsharpSettings {
+    /// Percent, 1..=500.
+    pub(crate) amount: f32,
+    /// Pixels (the blur's standard deviation).
+    pub(crate) radius: f32,
+    /// 8-bit levels, 0..=255.
+    pub(crate) threshold: u8,
+}
+
+impl UnsharpSettings {
+    fn kind(self) -> aurora_core::FilterKind {
+        aurora_core::FilterKind::UnsharpMask {
+            amount: self.amount,
+            radius: self.radius,
+            threshold: self.threshold,
+        }
+    }
+
+    /// The prompt's text for these values.
+    pub(crate) fn text(self) -> String {
+        format!(
+            "{} {} {}",
+            amount_text(self.amount),
+            amount_text(self.radius),
+            self.threshold
+        )
+    }
+}
+
 /// Which prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptKind {
@@ -42,6 +92,10 @@ pub(crate) enum PromptKind {
     Add,
     /// Edit Last Layer Filter…: change the last filter's radius.
     EditLast,
+    /// Unsharp Mask…: add a filter.
+    AddUnsharp,
+    /// Edit Last Layer Filter… when the last filter is an Unsharp Mask.
+    EditLastUnsharp,
 }
 
 impl PromptKind {
@@ -49,6 +103,9 @@ impl PromptKind {
         match self {
             Self::Add => "Gaussian Blur Radius in Pixels",
             Self::EditLast => "Layer Filter Radius in Pixels",
+            Self::AddUnsharp | Self::EditLastUnsharp => {
+                "Unsharp Mask: Amount in Percent, Radius in Pixels, Threshold in Levels"
+            }
         }
     }
 
@@ -56,26 +113,45 @@ impl PromptKind {
         match self {
             Self::Add => "layer.filter.gaussian_blur.apply",
             Self::EditLast => "layer.filter.edit_last.apply",
+            Self::AddUnsharp => "layer.filter.unsharp_mask.apply",
+            Self::EditLastUnsharp => "layer.filter.edit_last_unsharp.apply",
         }
     }
 
     fn for_row(id: &str) -> Option<Self> {
-        [Self::Add, Self::EditLast]
-            .into_iter()
-            .find(|kind| kind.row_id() == id)
+        [
+            Self::Add,
+            Self::EditLast,
+            Self::AddUnsharp,
+            Self::EditLastUnsharp,
+        ]
+        .into_iter()
+        .find(|kind| kind.row_id() == id)
     }
 
     fn row_title(self, amount: &str) -> String {
         match self {
             Self::Add => format!("Gaussian Blur, radius {amount} px"),
             Self::EditLast => format!("Change the last layer filter to radius {amount} px"),
+            Self::AddUnsharp => match parse_unsharp(amount) {
+                Ok(v) => format!("Unsharp Mask, {}", unsharp_summary(v)),
+                Err(_) => format!("Unsharp Mask: {amount}"),
+            },
+            Self::EditLastUnsharp => match parse_unsharp(amount) {
+                Ok(v) => format!(
+                    "Change the last layer filter to Unsharp Mask, {}",
+                    unsharp_summary(v)
+                ),
+                Err(_) => format!("Edit Unsharp Mask: {amount}"),
+            },
         }
     }
 
     fn bare_title(self) -> &'static str {
         match self {
             Self::Add => "Gaussian Blur",
-            Self::EditLast => "Edit Last Layer Filter",
+            Self::EditLast | Self::EditLastUnsharp => "Edit Last Layer Filter",
+            Self::AddUnsharp => "Unsharp Mask",
         }
     }
 }
@@ -85,8 +161,13 @@ impl PromptKind {
 pub(crate) enum FilterEdit {
     /// Append a Gaussian Blur of this radius.
     AddGaussianBlur(f32),
-    /// Set the last filter's radius.
+    /// Set the last filter's radius (either kind).
     EditLastRadius(f32),
+    /// Append an Unsharp Mask.
+    AddUnsharpMask(UnsharpSettings),
+    /// Replace the settings of the last filter, which must be an Unsharp
+    /// Mask.
+    EditLastUnsharp(UnsharpSettings),
     /// Hide every filter, or show them all when none is shown.
     ToggleVisible,
     RemoveLast,
@@ -107,6 +188,7 @@ pub(crate) fn plain_edit_for_command(id: &str) -> Option<FilterEdit> {
 pub(crate) fn prompt_for_command(id: &str) -> Option<PromptKind> {
     match id {
         COMMAND_GAUSSIAN_BLUR => Some(PromptKind::Add),
+        COMMAND_UNSHARP_MASK => Some(PromptKind::AddUnsharp),
         COMMAND_EDIT_LAST => Some(PromptKind::EditLast),
         _ => None,
     }
@@ -142,9 +224,23 @@ pub(crate) fn plan(
         FilterEdit::EditLastRadius(radius) => {
             let last = next.filters.last_mut().ok_or(LockRefusal::FilterNothing)?;
             match &mut last.kind {
-                aurora_core::FilterKind::GaussianBlur { radius: old } => *old = radius,
+                aurora_core::FilterKind::GaussianBlur { radius: old }
+                | aurora_core::FilterKind::UnsharpMask { radius: old, .. } => *old = radius,
             }
             "Edit Layer Filter"
+        }
+        FilterEdit::AddUnsharpMask(settings) => {
+            next.filters
+                .push(aurora_core::LayerFilter::new(settings.kind()));
+            "Unsharp Mask"
+        }
+        FilterEdit::EditLastUnsharp(settings) => {
+            let last = next.filters.last_mut().ok_or(LockRefusal::FilterNothing)?;
+            if !matches!(last.kind, aurora_core::FilterKind::UnsharpMask { .. }) {
+                return Err(LockRefusal::FilterNothing);
+            }
+            last.kind = settings.kind();
+            "Edit Unsharp Mask"
         }
         FilterEdit::ToggleVisible => {
             if next.filters.is_empty() {
@@ -207,7 +303,28 @@ pub(crate) fn last_radius(
     layer: aurora_doc::LayerId,
 ) -> Option<f32> {
     match layers.filters(layer)?.filters.last()?.kind {
-        aurora_core::FilterKind::GaussianBlur { radius } => Some(radius),
+        aurora_core::FilterKind::GaussianBlur { radius }
+        | aurora_core::FilterKind::UnsharpMask { radius, .. } => Some(radius),
+    }
+}
+
+/// The last filter's settings on `layer` when it is an Unsharp Mask: the
+/// Edit prompt's starting values.
+pub(crate) fn last_unsharp(
+    layers: &aurora_doc::LayerTree,
+    layer: aurora_doc::LayerId,
+) -> Option<UnsharpSettings> {
+    match layers.filters(layer)?.filters.last()?.kind {
+        aurora_core::FilterKind::UnsharpMask {
+            amount,
+            radius,
+            threshold,
+        } => Some(UnsharpSettings {
+            amount,
+            radius,
+            threshold,
+        }),
+        aurora_core::FilterKind::GaussianBlur { .. } => None,
     }
 }
 
@@ -248,6 +365,71 @@ pub(crate) fn parse_radius(text: &str) -> Result<f32, String> {
     Ok(value)
 }
 
+/// "50 %, radius 1 px, threshold 0" for the prompt's row.
+fn unsharp_summary(v: UnsharpSettings) -> String {
+    format!(
+        "amount {} %, radius {} px, threshold {} levels",
+        amount_text(v.amount),
+        amount_text(v.radius),
+        v.threshold
+    )
+}
+
+/// The three numbers typed into the Unsharp Mask prompt (amount, radius,
+/// threshold; spaces or commas between; `%` after the amount and `px`
+/// after the radius allowed), or the reason they are refused.
+///
+/// # Errors
+///
+/// A short sentence for the prompt's row.
+pub(crate) fn parse_unsharp(text: &str) -> Result<UnsharpSettings, String> {
+    let tokens: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|t| !t.is_empty())
+        .collect();
+    let [amount, radius, threshold] = tokens.as_slice() else {
+        return Err("Enter amount, radius and threshold, for example 100 1.5 0.".to_owned());
+    };
+    let number = |token: &str, suffix: &str, what: &str| -> Result<f32, String> {
+        let digits = token.strip_suffix(suffix).unwrap_or(token);
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return Err(format!("The {what} must use digits only, for example 5."));
+        }
+        digits
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| format!("The {what} is not a number."))
+    };
+    let amount = number(amount, "%", "amount")?;
+    if !(aurora_core::MIN_UNSHARP_AMOUNT..=aurora_core::MAX_UNSHARP_AMOUNT).contains(&amount) {
+        return Err(format!(
+            "The amount is from {} to {} percent.",
+            amount_text(aurora_core::MIN_UNSHARP_AMOUNT),
+            amount_text(aurora_core::MAX_UNSHARP_AMOUNT)
+        ));
+    }
+    let radius = number(radius, "px", "radius")?;
+    if !(aurora_core::MIN_GAUSSIAN_RADIUS..=aurora_core::MAX_GAUSSIAN_RADIUS).contains(&radius) {
+        return Err(format!(
+            "The radius is from {} to {} px.",
+            amount_text(aurora_core::MIN_GAUSSIAN_RADIUS),
+            amount_text(aurora_core::MAX_GAUSSIAN_RADIUS)
+        ));
+    }
+    let threshold = number(threshold, "", "threshold")?;
+    if threshold.fract() != 0.0 || !(0.0..=255.0).contains(&threshold) {
+        return Err("The threshold is a whole number from 0 to 255 levels.".to_owned());
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // 0..=255, whole
+    let threshold = threshold as u8;
+    Ok(UnsharpSettings {
+        amount,
+        radius,
+        threshold,
+    })
+}
+
 fn prompt_entries(kind: PromptKind, query: &str) -> Vec<CommandEntry> {
     let amount = query.trim();
     let title = if amount.is_empty() {
@@ -265,12 +447,12 @@ pub(crate) fn open_prompt(
     focus: &mut FocusManager,
     palette: &mut Option<WidgetId>,
     kind: PromptKind,
-    start: f32,
+    start: &str,
 ) -> bool {
     if palette.is_some() {
         return false;
     }
-    let query = amount_text(start);
+    let query = start.to_owned();
     let root = match insert_command_prompt(
         &mut workspace.tree,
         workspace.root,
@@ -340,22 +522,43 @@ pub(crate) fn prompt_enter(
 ) -> Option<Result<FilterEdit, ()>> {
     let kind = prompt_kind(tree, root)?;
     let query = command_palette_state(tree, root).ok()?.query().to_owned();
+    if matches!(kind, PromptKind::AddUnsharp | PromptKind::EditLastUnsharp) {
+        return Some(match parse_unsharp(&query) {
+            Ok(v) => Ok(if kind == PromptKind::AddUnsharp {
+                FilterEdit::AddUnsharpMask(v)
+            } else {
+                FilterEdit::EditLastUnsharp(v)
+            }),
+            Err(message) => show_refusal(tree, root, kind, message),
+        });
+    }
     match parse_radius(&query) {
         Ok(radius) => Some(Ok(match kind {
             PromptKind::Add => FilterEdit::AddGaussianBlur(radius),
-            PromptKind::EditLast => FilterEdit::EditLastRadius(radius),
+            // The Unsharp Mask kinds returned above.
+            PromptKind::EditLast | PromptKind::AddUnsharp | PromptKind::EditLastUnsharp => {
+                FilterEdit::EditLastRadius(radius)
+            }
         })),
-        Err(message) => {
-            let row = vec![CommandEntry::new(kind.row_id(), message.clone())];
-            if let Err(err) = set_command_palette_commands(tree, root, row) {
-                tracing::warn!(?err, "failed to show a refused radius");
-            }
-            if let Err(err) = set_command_palette_message(tree, root, Some(message)) {
-                tracing::warn!(?err, "failed to describe a refused radius");
-            }
-            Some(Err(()))
-        }
+        Err(message) => Some(show_refusal(tree, root, kind, message)),
     }
+}
+
+/// Shows why the typed text was refused; the prompt stays open.
+fn show_refusal(
+    tree: &mut aurora_widgets::WidgetTree<crate::WidgetKind>,
+    root: WidgetId,
+    kind: PromptKind,
+    message: String,
+) -> Result<FilterEdit, ()> {
+    let row = vec![CommandEntry::new(kind.row_id(), message.clone())];
+    if let Err(err) = set_command_palette_commands(tree, root, row) {
+        tracing::warn!(?err, "failed to show a refused value");
+    }
+    if let Err(err) = set_command_palette_message(tree, root, Some(message)) {
+        tracing::warn!(?err, "failed to describe a refused value");
+    }
+    Err(())
 }
 
 #[cfg(test)]
@@ -488,6 +691,162 @@ mod tests {
             Err(LockRefusal::FilterTooLarge)
         );
         assert_eq!(history.journal_len(), steps + 1);
+    }
+
+    fn settings(amount: f32, radius: f32, threshold: u8) -> UnsharpSettings {
+        UnsharpSettings {
+            amount,
+            radius,
+            threshold,
+        }
+    }
+
+    #[test]
+    fn parse_unsharp_reads_three_numbers_and_explains_refusals() {
+        assert_eq!(parse_unsharp("150 1.5 4"), Ok(settings(150.0, 1.5, 4)));
+        assert_eq!(parse_unsharp("  50,1,0 "), Ok(settings(50.0, 1.0, 0)));
+        assert_eq!(
+            parse_unsharp("200% 2.5px 255"),
+            Ok(settings(200.0, 2.5, 255))
+        );
+        assert_eq!(parse_unsharp("1 0.1 0"), Ok(settings(1.0, 0.1, 0)));
+        assert_eq!(parse_unsharp("500 85 255"), Ok(settings(500.0, 85.0, 255)));
+        for bad in [
+            "",
+            "50",
+            "50 1",
+            "50 1 0 0",
+            "0 1 0",
+            "0.5 1 0",
+            "501 1 0",
+            "50 0 0",
+            "50 0.05 0",
+            "50 86 0",
+            "50 1 256",
+            "50 1 1.5",
+            "50 1 -1",
+            "-50 1 0",
+            "a 1 0",
+            "50 1e1 0",
+            "5 0 0 ",
+            "50 . 0",
+        ] {
+            assert!(parse_unsharp(bad).is_err(), "{bad:?}");
+        }
+        // The settings round-trip through the prompt's text.
+        let v = settings(137.5, 2.25, 9);
+        assert_eq!(parse_unsharp(&v.text()), Ok(v));
+        assert_eq!(DEFAULT_UNSHARP.text(), "50 1 0");
+    }
+
+    #[test]
+    fn unsharp_add_edit_and_undo_are_single_labelled_steps() {
+        let (mut tree, mut history, pixel, group) = doc();
+        let mut run =
+            |tree: &mut aurora_doc::LayerTree, edit| apply(tree, &mut history, Some(pixel), edit);
+        // Editing the unsharp settings of a blur is refused.
+        assert_eq!(
+            run(&mut tree, FilterEdit::AddGaussianBlur(3.0)),
+            Some("Gaussian Blur")
+        );
+        assert_eq!(
+            plan(
+                &tree,
+                Some(pixel),
+                FilterEdit::EditLastUnsharp(settings(100.0, 1.0, 0))
+            ),
+            Err(LockRefusal::FilterNothing)
+        );
+        assert!(last_unsharp(&tree, pixel).is_none());
+        assert_eq!(
+            run(
+                &mut tree,
+                FilterEdit::AddUnsharpMask(settings(150.0, 2.0, 4))
+            ),
+            Some("Unsharp Mask")
+        );
+        assert_eq!(last_unsharp(&tree, pixel), Some(settings(150.0, 2.0, 4)));
+        assert_eq!(last_radius(&tree, pixel), Some(2.0));
+        assert_eq!(
+            run(
+                &mut tree,
+                FilterEdit::EditLastUnsharp(settings(80.0, 1.0, 0))
+            ),
+            Some("Edit Unsharp Mask")
+        );
+        assert_eq!(last_unsharp(&tree, pixel), Some(settings(80.0, 1.0, 0)));
+        // Same settings again: nothing to do.
+        assert_eq!(
+            run(
+                &mut tree,
+                FilterEdit::EditLastUnsharp(settings(80.0, 1.0, 0))
+            ),
+            None
+        );
+        // The typed-form radius edit changes only the radius.
+        assert_eq!(
+            run(&mut tree, FilterEdit::EditLastRadius(6.0)),
+            Some("Edit Layer Filter")
+        );
+        assert_eq!(last_unsharp(&tree, pixel), Some(settings(80.0, 6.0, 0)));
+        // The blur plus the unsharp mask share the reach cap.
+        assert_eq!(
+            plan(
+                &tree,
+                Some(pixel),
+                FilterEdit::AddUnsharpMask(settings(100.0, 85.0, 0))
+            ),
+            Err(LockRefusal::FilterTooLarge)
+        );
+        assert_eq!(
+            plan(
+                &tree,
+                Some(group),
+                FilterEdit::AddUnsharpMask(settings(100.0, 1.0, 0))
+            ),
+            Err(LockRefusal::FilterNeedsPixelLayer)
+        );
+        // Undo walks back one step at a time.
+        let _ = history.undo(&mut tree);
+        assert_eq!(last_unsharp(&tree, pixel), Some(settings(80.0, 1.0, 0)));
+        let _ = history.undo(&mut tree);
+        assert_eq!(last_unsharp(&tree, pixel), Some(settings(150.0, 2.0, 4)));
+        let _ = history.undo(&mut tree);
+        assert!(last_unsharp(&tree, pixel).is_none());
+    }
+
+    #[test]
+    fn unsharp_prompt_rows_and_command_ids() {
+        assert_eq!(
+            prompt_for_command(COMMAND_UNSHARP_MASK),
+            Some(PromptKind::AddUnsharp)
+        );
+        assert_eq!(plain_edit_for_command(COMMAND_UNSHARP_MASK), None);
+        for kind in [
+            PromptKind::Add,
+            PromptKind::EditLast,
+            PromptKind::AddUnsharp,
+            PromptKind::EditLastUnsharp,
+        ] {
+            assert_eq!(PromptKind::for_row(kind.row_id()), Some(kind));
+        }
+        assert_eq!(
+            prompt_entries(PromptKind::AddUnsharp, "")
+                .first()
+                .map(|e| e.title.clone()),
+            Some("Unsharp Mask".to_owned())
+        );
+        let row = |q: &str| {
+            prompt_entries(PromptKind::AddUnsharp, q)
+                .first()
+                .map(|e| e.title.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            row("150 2 4"),
+            "Unsharp Mask, amount 150 %, radius 2 px, threshold 4 levels"
+        );
+        assert_eq!(row("150 2"), "Unsharp Mask: 150 2");
     }
 
     #[test]

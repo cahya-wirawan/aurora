@@ -7134,6 +7134,161 @@ mod tests {
         assert!(read(Cursor::new(tampered), &mut fresh).is_err());
     }
 
+    /// Task 177: an Unsharp Mask round-trips through the `layer-filters`
+    /// entry and the journal, a blur-only document's entry bytes are the
+    /// same as before the new kind existed (version 1, variant 0), a
+    /// build that knows only the blur refuses the entry instead of
+    /// misreading it, and invalid Unsharp Mask settings refuse the file.
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::items_after_statements)]
+    fn round_trips_unsharp_mask_and_keeps_blur_only_bytes() {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = LayerTree::new();
+        let mut history = History::new();
+        let id = match history.add_pixel_layer(&mut layers, "p", bounds(), None) {
+            Ok(id) => id,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        let write_bytes = |layers: &LayerTree, history: &History, store: &mut TileStore| {
+            let mut bytes = Cursor::new(Vec::new());
+            if let Err(err) = write(
+                &mut bytes,
+                layers,
+                history,
+                (100, 100),
+                None,
+                &SkippedTiles::new(),
+                store,
+            ) {
+                unreachable!("{err:?}");
+            }
+            bytes.into_inner()
+        };
+        let entry = |bytes: &[u8]| -> Vec<u8> {
+            let mut zip = match zip::ZipArchive::new(Cursor::new(bytes.to_vec())) {
+                Ok(zip) => zip,
+                Err(err) => unreachable!("{err:?}"),
+            };
+            let mut out = Vec::new();
+            match zip.by_name(super::LAYER_FILTERS_ENTRY) {
+                Ok(mut file) => {
+                    let _ = std::io::Read::read_to_end(&mut file, &mut out);
+                }
+                Err(err) => unreachable!("{err:?}"),
+            }
+            out
+        };
+        // Blur only: exactly the task-176 bytes.
+        let blur = aurora_core::LayerFilters {
+            filters: vec![aurora_core::LayerFilter::new(
+                aurora_core::FilterKind::GaussianBlur { radius: 2.5 },
+            )],
+        };
+        if let Err(err) = history.set_filters(&mut layers, id, Some(blur.clone())) {
+            unreachable!("{err:?}");
+        }
+        let blur_bytes = write_bytes(&layers, &history, &mut store);
+        // version 1, one (id, filters) pair, one filter: variant 0, 2.5, visible.
+        let tail = [1_u8, 0, 0, 0, 0x20, 0x40, 1];
+        let payload = entry(&blur_bytes);
+        assert_eq!(payload.first(), Some(&1), "version 1");
+        assert!(payload.ends_with(&tail), "{payload:?}");
+        // Unsharp: round trip through the entry and the journal.
+        let filters = aurora_core::LayerFilters {
+            filters: vec![
+                aurora_core::LayerFilter::new(aurora_core::FilterKind::GaussianBlur {
+                    radius: 2.5,
+                }),
+                aurora_core::LayerFilter {
+                    kind: aurora_core::FilterKind::UnsharpMask {
+                        amount: 175.0,
+                        radius: 1.5,
+                        threshold: 7,
+                    },
+                    visible: false,
+                },
+            ],
+        };
+        if let Err(err) = history.set_filters(&mut layers, id, Some(filters.clone())) {
+            unreachable!("{err:?}");
+        }
+        let bytes = write_bytes(&layers, &history, &mut store);
+        let (_d, mut fresh) = real_tile_store();
+        let document = match read(Cursor::new(bytes.clone()), &mut fresh) {
+            Ok(document) => document,
+            Err(err) => unreachable!("{err:?}"),
+        };
+        assert_eq!(document.layers.filters(id), Some(&filters));
+        match document.history.replay() {
+            Ok(replayed) => assert_eq!(replayed.filters(id), Some(&filters)),
+            Err(err) => unreachable!("{err:?}"),
+        }
+        // An older build (blur variant only) cannot decode the entry.
+        #[derive(serde::Deserialize)]
+        enum OldKind {
+            #[allow(dead_code)]
+            GaussianBlur { radius: f32 },
+        }
+        #[derive(serde::Deserialize)]
+        struct OldFilter {
+            #[allow(dead_code)]
+            kind: OldKind,
+            #[allow(dead_code)]
+            visible: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldFilters {
+            #[allow(dead_code)]
+            filters: Vec<OldFilter>,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldWire {
+            #[allow(dead_code)]
+            version: u32,
+            #[allow(dead_code)]
+            layers: Vec<(u64, OldFilters)>,
+        }
+        assert!(postcard::from_bytes::<OldWire>(&payload).is_ok(), "control");
+        assert!(postcard::from_bytes::<OldWire>(&entry(&bytes)).is_err());
+        // Invalid settings refuse the file.
+        for kind in [
+            aurora_core::FilterKind::UnsharpMask {
+                amount: 0.0,
+                radius: 1.0,
+                threshold: 0,
+            },
+            aurora_core::FilterKind::UnsharpMask {
+                amount: 501.0,
+                radius: 1.0,
+                threshold: 0,
+            },
+            aurora_core::FilterKind::UnsharpMask {
+                amount: 100.0,
+                radius: 86.0,
+                threshold: 0,
+            },
+            aurora_core::FilterKind::UnsharpMask {
+                amount: f32::NAN,
+                radius: 1.0,
+                threshold: 0,
+            },
+        ] {
+            let payload = postcard::to_allocvec(&super::LayerFiltersWire {
+                version: super::LAYER_FILTERS_VERSION,
+                layers: vec![(
+                    id.to_raw(),
+                    aurora_core::LayerFilters {
+                        filters: vec![aurora_core::LayerFilter::new(kind)],
+                    },
+                )],
+            })
+            .unwrap_or_default();
+            let tampered = with_named_entry(&bytes, super::LAYER_FILTERS_ENTRY, Some(&payload));
+            let (_d, mut fresh) = real_tile_store();
+            assert!(read(Cursor::new(tampered), &mut fresh).is_err(), "{kind:?}");
+        }
+    }
+
     /// Task 149: the advanced-blending options survive a save and reopen
     /// (the optional `layer-blend-options` entry, the journal replay), an
     /// untouched document writes no entry, and a newer entry version or an

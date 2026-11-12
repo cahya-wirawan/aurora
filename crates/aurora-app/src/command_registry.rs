@@ -125,6 +125,18 @@ fn typed_form(call: &Validated) -> Option<Result<ActivatedCommand, TypedError>> 
                 radius,
             ))
         }
+        crate::layer_filter_cmd::COMMAND_UNSHARP_MASK => {
+            #[allow(clippy::cast_possible_truncation)] // validated to their ranges
+            let (amount, radius) = (call.number("amount")? as f32, call.number("radius")? as f32);
+            let threshold = u8::try_from(call.int("threshold")?).ok()?;
+            ActivatedCommand::FilterApply(crate::layer_filter_cmd::FilterEdit::AddUnsharpMask(
+                crate::layer_filter_cmd::UnsharpSettings {
+                    amount,
+                    radius,
+                    threshold,
+                },
+            ))
+        }
         crate::layer_filter_cmd::COMMAND_EDIT_LAST => {
             #[allow(clippy::cast_possible_truncation)] // validated to 0.1..=85
             let radius = call.number("radius")? as f32;

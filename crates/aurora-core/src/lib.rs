@@ -58,7 +58,8 @@ pub use exposure_trc::{
 };
 pub use filters::{
     FilterKind, FiltersError, GaussianSpec, LayerFilter, LayerFilters, MAX_FILTER_REACH,
-    MAX_GAUSSIAN_RADIUS, MAX_LAYER_FILTERS, MIN_GAUSSIAN_RADIUS,
+    MAX_GAUSSIAN_RADIUS, MAX_LAYER_FILTERS, MAX_UNSHARP_AMOUNT, MIN_GAUSSIAN_RADIUS,
+    MIN_UNSHARP_AMOUNT,
 };
 pub use geometry::{MAX_DOCUMENT_EXTENT, MAX_DOCUMENT_ORIGIN, Rect, Size};
 pub use gradient_fill::{

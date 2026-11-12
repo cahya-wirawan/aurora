@@ -103,6 +103,29 @@ const GAUSSIAN_BLUR_PARAMS: &[ParamSpec] = &[ParamSpec::required(
         max: 85.0,
     },
 )];
+const UNSHARP_MASK_PARAMS: &[ParamSpec] = &[
+    ParamSpec::required(
+        "amount",
+        "How much of the sharpening difference is added back, in percent, 1 to 500.",
+        ParamKind::Number {
+            min: 1.0,
+            max: 500.0,
+        },
+    ),
+    ParamSpec::required(
+        "radius",
+        "The blur radius in pixels (the Gaussian's standard deviation), 0.1 to 85 (fractions allowed).",
+        ParamKind::Number {
+            min: 0.1,
+            max: 85.0,
+        },
+    ),
+    ParamSpec::required(
+        "threshold",
+        "The smallest per-channel difference, in 8-bit levels (0 to 255), that is sharpened.",
+        ParamKind::Int { min: 0, max: 255 },
+    ),
+];
 const EDIT_FILTER_PARAMS: &[ParamSpec] = &[ParamSpec::required(
     "radius",
     "The new blur radius in pixels, 0.1 to 85 (fractions allowed).",
@@ -473,9 +496,20 @@ pub(crate) static COMMANDS: &[CommandSpec] = &[
     )
     .params(GAUSSIAN_BLUR_PARAMS),
     CommandSpec::new(
+        "layer.filter.unsharp_mask",
+        "Unsharp Mask\u{2026}",
+        "Adds an editable Unsharp Mask to the active pixel layer: the colour is sharpened where it \
+         differs from its Gaussian-blurred self by at least the threshold; alpha is never changed. \
+         It is computed when the layer is drawn, not baked into its pixels (one undo step).",
+        Layer,
+        Write,
+    )
+    .params(UNSHARP_MASK_PARAMS),
+    CommandSpec::new(
         "layer.filter.edit_last",
         "Edit Last Layer Filter\u{2026}",
-        "Changes the radius of the active layer's last (topmost) filter (one undo step).",
+        "Changes the radius of the active layer's last (topmost) filter, a Gaussian Blur or an \
+         Unsharp Mask (one undo step).",
         Layer,
         Write,
     )

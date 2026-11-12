@@ -305,3 +305,254 @@ fn a_translucent_coloured_layer_blurs_in_premultiplied_space() {
         }
     }
 }
+
+// ---- task 177: Unsharp Mask ----
+
+fn unsharp(amount: f32, radius: f32, threshold: u8) -> aurora_core::FilterKind {
+    aurora_core::FilterKind::UnsharpMask {
+        amount,
+        radius,
+        threshold,
+    }
+}
+
+fn filters_of(kinds: &[aurora_core::FilterKind]) -> aurora_core::LayerFilters {
+    aurora_core::LayerFilters {
+        filters: kinds
+            .iter()
+            .map(|k| aurora_core::LayerFilter::new(*k))
+            .collect(),
+    }
+}
+
+/// Paints `rgba` into `rect` of the pixel layer `id` (tile by tile).
+fn paint_rect(
+    store: &mut aurora_tile::TileStore,
+    layers: &aurora_doc::LayerTree,
+    id: aurora_doc::LayerId,
+    rect: (i64, i64, i64, i64),
+    rgba: [f32; 4],
+) {
+    let Some(surface) = layers.surface_id(id) else {
+        unreachable!("pixel layer");
+    };
+    let t = i64::from(aurora_tile::TILE);
+    for y in rect.1..rect.1 + rect.3 {
+        for x in rect.0..rect.0 + rect.2 {
+            let tile_id = aurora_tile::TileId {
+                x: u32::try_from(x / t).unwrap_or(0),
+                y: u32::try_from(y / t).unwrap_or(0),
+            };
+            let Ok(tile) = store.get_mut(surface, tile_id) else {
+                unreachable!("writable");
+            };
+            let i = usize::try_from(((y % t) * t + x % t) * 4).unwrap_or(0);
+            for (k, v) in tile.texels_mut().iter_mut().skip(i).take(4).enumerate() {
+                *v = half::f16::from_f32(rgba.get(k).copied().unwrap_or(0.0));
+            }
+            tile.mark_dirty(aurora_core::Rect {
+                x: 0,
+                y: 0,
+                width: aurora_tile::TILE,
+                height: aurora_tile::TILE,
+            });
+        }
+    }
+}
+
+/// A layer with a dark block left of x = 256 and a bright one right of it
+/// (an opaque edge straddling the tile boundary, plus a vertical seam at
+/// y = 256 for the corner).
+fn two_tone_layer(
+    layers: &mut aurora_doc::LayerTree,
+    store: &mut aurora_tile::TileStore,
+) -> aurora_doc::LayerId {
+    let id = painted_rgba(layers, store, (200, 200, 56, 112), [0.4, 0.4, 0.4, 1.0]);
+    paint_rect(store, layers, id, (256, 200, 56, 112), [0.6, 0.6, 0.6, 1.0]);
+    id
+}
+
+/// The one-shot reference of a filter chain over `two_tone_layer`: the
+/// document `0..512` squared, premultiplied, each filter run in a window
+/// the chain's total reach larger on every side, cropped.
+fn chain_reference(kinds: &[aurora_core::FilterKind]) -> Vec<f32> {
+    let reach: i64 = kinds.iter().map(|k| i64::from(k.reach())).sum();
+    let side = 512 + 2 * reach;
+    let side_u = usize::try_from(side).unwrap_or(0);
+    let mut window = vec![0.0_f32; side_u * side_u * 4];
+    for y in 200..312_i64 {
+        for x in 200..312_i64 {
+            let v = if x < 256 { 0.4_f32 } else { 0.6 };
+            // The stored f16, as the layer holds it.
+            let v = half::f16::from_f32(v).to_f32();
+            let i = usize::try_from(((y + reach) * side + x + reach) * 4).unwrap_or(0);
+            for (k, slot) in window.iter_mut().skip(i).take(4).enumerate() {
+                *slot = if k == 3 { 1.0 } else { v };
+            }
+        }
+    }
+    for kind in kinds {
+        match *kind {
+            aurora_core::FilterKind::GaussianBlur { radius } => {
+                let spec = aurora_core::GaussianSpec::new(radius).unwrap_or_else(|| unreachable!());
+                aurora_filters::gaussian_blur_window(&mut window, side_u, &spec);
+            }
+            aurora_core::FilterKind::UnsharpMask {
+                amount,
+                radius,
+                threshold,
+            } => {
+                let spec = aurora_core::GaussianSpec::new(radius).unwrap_or_else(|| unreachable!());
+                aurora_filters::unsharp_mask_window(&mut window, side_u, amount, threshold, &spec);
+            }
+        }
+    }
+    aurora_filters::crop_window(&window, side_u, 512)
+}
+
+#[test]
+fn unsharp_tiles_are_bit_identical_to_a_one_shot_reference_across_the_boundary() {
+    let chains: [Vec<aurora_core::FilterKind>; 3] = [
+        vec![unsharp(200.0, 2.0, 0)],
+        vec![unsharp(150.0, 9.0, 2)],
+        vec![
+            aurora_core::FilterKind::GaussianBlur { radius: 1.5 },
+            unsharp(300.0, 3.0, 0),
+        ],
+    ];
+    for kinds in chains {
+        let (_dir, mut store) = real_tile_store();
+        let mut layers = aurora_doc::LayerTree::new();
+        let id = two_tone_layer(&mut layers, &mut store);
+        ok(layers.set_filters(id, Some(filters_of(&kinds))));
+        let reference = chain_reference(&kinds);
+        for (tx, ty) in [(0_u32, 0_u32), (1, 0), (0, 1), (1, 1)] {
+            let mut budget = CompositeBudget::for_pass(&layers);
+            let got = crate::layer_filter_app::filtered_layer_texels(
+                id,
+                &layers,
+                &mut store,
+                aurora_tile::TileId { x: tx, y: ty },
+                (i64::from(tx) * 256, i64::from(ty) * 256),
+                (0, 0),
+                &mut budget,
+            );
+            let mut tile = Vec::new();
+            for y in 0..256_usize {
+                for x in 0..256_usize {
+                    tile.extend(ref_at(
+                        &reference,
+                        tx as usize * 256 + x,
+                        ty as usize * 256 + y,
+                    ));
+                }
+            }
+            let want = crate::layer_filter_app::to_straight_half(&tile);
+            assert_eq!(
+                got.as_ref().map(|v| v.iter().map(|h| h.to_bits()).collect::<Vec<_>>()),
+                want.as_ref().map(|v| v.iter().map(|h| h.to_bits()).collect::<Vec<_>>()),
+                "{kinds:?} tile ({tx}, {ty})"
+            );
+        }
+        // And the composite shows the overshoot on both sides of x = 256
+        // (for a lone unsharp mask; after a blur the edge is already soft).
+        if kinds.len() == 1 {
+            let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+            let dark = texel(&acc, 255, 250)[0];
+            let acc1 = composite_tile_at(&layers, &mut store, 1, 0, (0, 0));
+            let bright = texel(&acc1, 0, 250)[0];
+            assert!(dark < 0.4 - 0.005 && bright > 0.6 + 0.005, "{kinds:?}: {dark} {bright}");
+        }
+    }
+}
+
+#[test]
+fn unsharp_does_not_spill_onto_untouched_tiles_and_keeps_alpha() {
+    let (_dir, mut store) = real_tile_store();
+    let mut layers = aurora_doc::LayerTree::new();
+    let id = two_tone_layer(&mut layers, &mut store);
+    let plain_alpha = alpha_at(&composite_tile_at(&layers, &mut store, 0, 0, (0, 0)), 100, 100);
+    ok(layers.set_filters(id, Some(filters_of(&[unsharp(500.0, 20.0, 0)]))));
+    let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
+    // Outside the block (alpha 0) stays transparent, inside stays opaque.
+    assert!(alpha_at(&acc, 100, 100).abs() < TOL, "{plain_alpha}");
+    assert!((alpha_at(&acc, 230, 250) - 1.0).abs() < TOL);
+    let mut budget = CompositeBudget::for_pass(&layers);
+    let none = crate::layer_filter_app::filtered_layer_texels(
+        id,
+        &layers,
+        &mut store,
+        aurora_tile::TileId { x: 3, y: 3 },
+        (768, 768),
+        (0, 0),
+        &mut budget,
+    );
+    assert!(none.is_none());
+}
+
+#[test]
+fn unsharp_settings_are_part_of_the_cache_key() {
+    let (_dir, mut store) = real_tile_store();
+    let mut layers = aurora_doc::LayerTree::new();
+    let id = two_tone_layer(&mut layers, &mut store);
+    let computes = || crate::layer_filter_app::FILTER_COMPUTES.with(std::cell::Cell::get);
+    let tile = |layers: &aurora_doc::LayerTree, store: &mut aurora_tile::TileStore| {
+        composite_tile_at(layers, store, 0, 0, (0, 0))
+    };
+    let before = computes();
+    ok(layers.set_filters(id, Some(filters_of(&[unsharp(100.0, 2.0, 0)]))));
+    let a = tile(&layers, &mut store);
+    let _ = tile(&layers, &mut store);
+    assert_eq!(computes() - before, 1, "second draw hits");
+    for (n, kind) in [
+        unsharp(101.0, 2.0, 0),
+        unsharp(100.0, 2.5, 0),
+        unsharp(100.0, 2.0, 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        ok(layers.set_filters(id, Some(filters_of(&[kind]))));
+        let _ = tile(&layers, &mut store);
+        assert_eq!(computes() - before, 2 + n, "{kind:?} misses");
+    }
+    // A blur of the same radius is not an unsharp mask.
+    ok(layers.set_filters(id, Some(filters_of(&[unsharp(100.0, 2.0, 0)]))));
+    let again = tile(&layers, &mut store);
+    assert_eq!(a, again);
+    set_blur(&mut layers, id, 2.0);
+    assert_ne!(a, tile(&layers, &mut store));
+}
+
+#[test]
+fn a_visible_unsharp_refuses_the_gpu_path_and_a_hidden_one_does_not() {
+    let (_dir, mut store) = real_tile_store();
+    let mut layers = aurora_doc::LayerTree::new();
+    let id = two_tone_layer(&mut layers, &mut store);
+    assert!(document_qualifies_for_gpu_compositing(&layers));
+    ok(layers.set_filters(id, Some(filters_of(&[unsharp(100.0, 2.0, 0)]))));
+    assert!(!document_qualifies_for_gpu_compositing(&layers));
+    let mut hidden = filters_of(&[unsharp(100.0, 2.0, 0)]);
+    if let Some(f) = hidden.filters.get_mut(0) {
+        f.visible = false;
+    }
+    ok(layers.set_filters(id, Some(hidden)));
+    assert!(document_qualifies_for_gpu_compositing(&layers));
+}
+
+#[test]
+fn a_dab_recomposites_the_neighbours_within_the_unsharp_reach() {
+    let (_dir, mut store) = real_tile_store();
+    let mut layers = aurora_doc::LayerTree::new();
+    let id = painted(&mut layers, &mut store, (0, 0), (250, 100, 1, 1));
+    let own = aurora_tile::TileId { x: 0, y: 0 };
+    let near_tile = aurora_tile::TileId { x: 1, y: 0 };
+    ok(layers.set_filters(id, Some(filters_of(&[unsharp(100.0, 10.0, 0)]))));
+    let mut cache = CompositeCache::default();
+    for t in [own, near_tile] {
+        cache.mark_current(t);
+    }
+    invalidate_painted_tiles(&mut cache, &layers, id, &[own], (0, 0));
+    assert!(!cache.is_current(own));
+    assert!(!cache.is_current(near_tile));
+}

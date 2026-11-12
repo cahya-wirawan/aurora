@@ -28,6 +28,7 @@ pub mod selective_color;
 pub mod shadow;
 pub mod stroke;
 pub mod threshold;
+pub mod unsharp;
 pub mod vibrance;
 
 pub use black_white::{BLACK_WHITE_PACKED_LEN, BlackWhiteOp};
@@ -47,6 +48,7 @@ pub use selective_color::{SELECTIVE_COLOR_PACKED_LEN, SelectiveColorOp};
 pub use shadow::shadow_coverage;
 pub use stroke::{StrokeSide, stroke_coverage, stroke_reach};
 pub use threshold::{THRESHOLD_PACKED_LEN, ThresholdOp};
+pub use unsharp::unsharp_mask_window;
 pub use vibrance::{VIBRANCE_PACKED_LEN, VibranceOp};
 
 /// The crate's own name, kept from the skeleton so CI's crate-name check
