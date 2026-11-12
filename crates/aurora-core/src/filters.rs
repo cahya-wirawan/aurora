@@ -35,6 +35,24 @@ pub const MIN_UNSHARP_AMOUNT: f32 = 1.0;
 /// The largest Unsharp Mask amount, in percent (Photoshop's is 500).
 pub const MAX_UNSHARP_AMOUNT: f32 = 500.0;
 
+/// The largest Reduce Noise strength (Photoshop's is 10).
+pub const MAX_NOISE_STRENGTH: f32 = 10.0;
+
+/// The largest Reduce Noise percentage (Preserve Details, Reduce Color
+/// Noise, Sharpen Details; Photoshop's are 0..=100 %).
+pub const MAX_NOISE_PERCENT: f32 = 100.0;
+
+/// The standard deviation, in pixels, of the chroma blur at Reduce Color
+/// Noise 100 % (Aurora's own choice; exact-kernel range, reach 12 px).
+pub const REDUCE_NOISE_MAX_CHROMA_SIGMA: f32 = 4.0;
+
+/// The standard deviation, in pixels, of the blur Sharpen Details
+/// sharpens against (Aurora's own choice; reach 3 px).
+pub const REDUCE_NOISE_SHARPEN_SIGMA: f32 = 1.0;
+
+/// The largest half-width, in pixels, of Reduce Noise's bilateral window.
+pub const REDUCE_NOISE_MAX_RADIUS: u32 = 5;
+
 /// The most pixels all of one layer's shown filters may reach together
 /// (hidden filters are not counted; showing one is checked again).
 /// One tile's side: the window drawn for a tile is then at most 3 x 3
@@ -62,6 +80,12 @@ pub enum FiltersError {
         "filter radius is not a number from {MIN_GAUSSIAN_RADIUS} to {MAX_GAUSSIAN_RADIUS} pixels"
     )]
     RadiusOutOfRange,
+    #[error("Reduce Noise strength is not a number from 0 to {MAX_NOISE_STRENGTH}")]
+    NoiseStrengthOutOfRange,
+    #[error(
+        "Reduce Noise Preserve Details, Reduce Color Noise and Sharpen Details are not numbers from 0 to {MAX_NOISE_PERCENT} percent"
+    )]
+    NoisePercentOutOfRange,
     #[error(
         "the layer's shown filters together reach {reach} pixels; at most {MAX_FILTER_REACH} are allowed"
     )]
@@ -86,6 +110,57 @@ pub enum FilterKind {
         radius: f32,
         threshold: u8,
     },
+    /// Reduce Noise (task 178), appended after the Unsharp Mask. All four
+    /// are Photoshop's controls with Aurora's own maths (see
+    /// `aurora_filters::reduce_noise`): `strength` 0..=10 (the luminance
+    /// smoothing; 0 = none), `preserve_details` 0..=100 % (how much edge
+    /// contrast survives the smoothing), `color_noise` 0..=100 % (blur of
+    /// the colour-only part of the picture; 0 = none) and `sharpen_details`
+    /// 0..=100 % (a final unsharp boost; 0 = none). All four at 0 is the
+    /// identity.
+    ReduceNoise {
+        strength: f32,
+        preserve_details: f32,
+        color_noise: f32,
+        sharpen_details: f32,
+    },
+}
+
+/// The half-width of Reduce Noise's bilateral window for `strength`:
+/// `0` for none (strength 0 or not a number), else `ceil(strength / 2)`,
+/// 1..=5.
+#[must_use]
+pub fn reduce_noise_radius(strength: f32) -> u32 {
+    if !(strength.is_finite() && strength > 0.0) {
+        return 0;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // 1..=5 after the clamp
+    let r = (strength.min(MAX_NOISE_STRENGTH) / 2.0).ceil() as u32;
+    r.clamp(1, REDUCE_NOISE_MAX_RADIUS)
+}
+
+/// The chroma blur's spec for `color_noise` percent, or `None` for none
+/// (0 % or not a number). Sigma is `color_noise / 100 * 4` px, at least
+/// the blur's 0.1 px minimum.
+#[must_use]
+pub fn reduce_noise_chroma_spec(color_noise: f32) -> Option<GaussianSpec> {
+    if !(color_noise.is_finite() && color_noise > 0.0) {
+        return None;
+    }
+    let sigma = (color_noise.min(MAX_NOISE_PERCENT) / MAX_NOISE_PERCENT
+        * REDUCE_NOISE_MAX_CHROMA_SIGMA)
+        .max(MIN_GAUSSIAN_RADIUS);
+    GaussianSpec::new(sigma)
+}
+
+/// The sharpen stage's blur spec, or `None` when `sharpen_details` is 0
+/// (or not a number).
+#[must_use]
+pub fn reduce_noise_sharpen_spec(sharpen_details: f32) -> Option<GaussianSpec> {
+    if !(sharpen_details.is_finite() && sharpen_details > 0.0) {
+        return None;
+    }
+    GaussianSpec::new(REDUCE_NOISE_SHARPEN_SIGMA)
 }
 
 impl FilterKind {
@@ -95,6 +170,7 @@ impl FilterKind {
         match self {
             Self::GaussianBlur { .. } => "Gaussian Blur",
             Self::UnsharpMask { .. } => "Unsharp Mask",
+            Self::ReduceNoise { .. } => "Reduce Noise",
         }
     }
 
@@ -129,6 +205,24 @@ impl FilterKind {
                     Err(FiltersError::RadiusOutOfRange)
                 }
             }
+            Self::ReduceNoise {
+                strength,
+                preserve_details,
+                color_noise,
+                sharpen_details,
+            } => {
+                if !(strength.is_finite() && (0.0..=MAX_NOISE_STRENGTH).contains(strength)) {
+                    return Err(FiltersError::NoiseStrengthOutOfRange);
+                }
+                if [preserve_details, color_noise, sharpen_details]
+                    .iter()
+                    .all(|v| v.is_finite() && (0.0..=MAX_NOISE_PERCENT).contains(*v))
+                {
+                    Ok(())
+                } else {
+                    Err(FiltersError::NoisePercentOutOfRange)
+                }
+            }
         }
     }
 
@@ -142,6 +236,19 @@ impl FilterKind {
             Self::GaussianBlur { radius } | Self::UnsharpMask { radius, .. } => {
                 GaussianSpec::new(*radius).map_or(0, |s| s.reach())
             }
+            // The three stages run one after the other, each reading the
+            // one before: their reaches add. A stage that is off (its
+            // setting 0) reads nothing.
+            Self::ReduceNoise {
+                strength,
+                color_noise,
+                sharpen_details,
+                ..
+            } => reduce_noise_radius(*strength)
+                .saturating_add(reduce_noise_chroma_spec(*color_noise).map_or(0, |s| s.reach()))
+                .saturating_add(
+                    reduce_noise_sharpen_spec(*sharpen_details).map_or(0, |s| s.reach()),
+                ),
         }
     }
 }
@@ -511,6 +618,107 @@ mod tests {
         assert_eq!(
             postcard::from_bytes::<LayerFilter>(&bytes).ok(),
             Some(unsharp)
+        );
+    }
+
+    fn noise(strength: f32, preserve: f32, colour: f32, sharpen: f32) -> FilterKind {
+        FilterKind::ReduceNoise {
+            strength,
+            preserve_details: preserve,
+            color_noise: colour,
+            sharpen_details: sharpen,
+        }
+    }
+
+    #[test]
+    fn reduce_noise_validates_names_and_reaches_by_stage() {
+        assert_eq!(noise(0.0, 0.0, 0.0, 0.0).validate(), Ok(()));
+        assert_eq!(noise(10.0, 100.0, 100.0, 100.0).validate(), Ok(()));
+        for bad in [-0.1, 10.1, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                noise(bad, 50.0, 50.0, 50.0).validate(),
+                Err(FiltersError::NoiseStrengthOutOfRange),
+                "{bad}"
+            );
+        }
+        for bad in [-1.0, 100.5, f32::NAN, f32::NEG_INFINITY] {
+            for slot in 0..3 {
+                let mut v = [50.0_f32; 3];
+                if let Some(v) = v.get_mut(slot) {
+                    *v = bad;
+                }
+                assert_eq!(
+                    noise(
+                        5.0,
+                        v.first().copied().unwrap_or(0.0),
+                        v.get(1).copied().unwrap_or(0.0),
+                        v.get(2).copied().unwrap_or(0.0)
+                    )
+                    .validate(),
+                    Err(FiltersError::NoisePercentOutOfRange),
+                    "{bad} slot {slot}"
+                );
+            }
+        }
+        assert_eq!(noise(1.0, 0.0, 0.0, 0.0).name(), "Reduce Noise");
+        // Stage reaches: off stages read nothing, the rest add.
+        assert_eq!(noise(0.0, 80.0, 0.0, 0.0).reach(), 0);
+        assert_eq!(reduce_noise_radius(0.01), 1);
+        assert_eq!(reduce_noise_radius(2.0), 1);
+        assert_eq!(reduce_noise_radius(2.1), 2);
+        assert_eq!(reduce_noise_radius(10.0), 5);
+        assert_eq!(noise(10.0, 0.0, 0.0, 0.0).reach(), 5);
+        assert_eq!(noise(0.0, 0.0, 100.0, 0.0).reach(), 12);
+        assert_eq!(noise(0.0, 0.0, 0.0, 1.0).reach(), 3);
+        assert_eq!(noise(10.0, 0.0, 100.0, 100.0).reach(), 5 + 12 + 3);
+        // It shares the cap with the other kinds.
+        let list = LayerFilters {
+            filters: vec![
+                LayerFilter::new(noise(10.0, 0.0, 100.0, 100.0)),
+                LayerFilter::new(FilterKind::GaussianBlur { radius: 85.0 }),
+            ],
+        };
+        assert!(matches!(
+            list.validate(),
+            Err(FiltersError::ReachTooLarge { .. })
+        ));
+    }
+
+    /// Task 178: variant 2; a build that knows only the first two kinds
+    /// (the 0.310.0 shape, mirrored here) refuses it.
+    #[test]
+    fn wire_format_reduce_noise_is_variant_two_and_0_310_readers_refuse_it() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        enum Old {
+            GaussianBlur {
+                radius: f32,
+            },
+            UnsharpMask {
+                amount: f32,
+                radius: f32,
+                threshold: u8,
+            },
+        }
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct OldFilter {
+            kind: Old,
+            visible: bool,
+        }
+        let unsharp = LayerFilter::new(FilterKind::UnsharpMask {
+            amount: 150.0,
+            radius: 2.0,
+            threshold: 4,
+        });
+        let bytes = postcard::to_allocvec(&unsharp).unwrap_or_default();
+        assert!(postcard::from_bytes::<OldFilter>(&bytes).is_ok(), "control");
+        let reduce = LayerFilter::new(noise(4.0, 60.0, 30.0, 20.0));
+        let bytes = postcard::to_allocvec(&reduce).unwrap_or_default();
+        assert_eq!(bytes.first(), Some(&2), "variant 2");
+        assert_eq!(bytes.len(), 1 + 16 + 1);
+        assert!(postcard::from_bytes::<OldFilter>(&bytes).is_err());
+        assert_eq!(
+            postcard::from_bytes::<LayerFilter>(&bytes).ok(),
+            Some(reduce)
         );
     }
 

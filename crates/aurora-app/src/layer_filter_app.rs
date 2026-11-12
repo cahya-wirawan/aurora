@@ -38,7 +38,9 @@
 //! clipped, so a far edge of a very large shadow or glow of a heavily
 //! blurred layer can be cut short. An Unsharp Mask (task 177) reads the
 //! same blur and reaches as far, but spreads nothing into transparent
-//! pixels, so it has no spill. Nothing is reported for it.
+//! pixels, so it has no spill. A Reduce Noise (task 178) reaches the sum of its
+//! three stages' reaches (at most 20 px) and spills nothing either. Nothing is
+//! reported for it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -79,7 +81,7 @@ pub(crate) fn filter_reach(layers: &aurora_doc::LayerTree, id: aurora_doc::Layer
 pub(crate) fn filter_signature(
     layers: &aurora_doc::LayerTree,
     id: aurora_doc::LayerId,
-) -> Vec<(u8, [u32; 3])> {
+) -> Vec<(u8, [u32; 4])> {
     if !has_visible_filters(layers, id) {
         return Vec::new();
     }
@@ -89,7 +91,7 @@ pub(crate) fn filter_signature(
             f.visible()
                 .map(|filter| match filter.kind {
                     aurora_core::FilterKind::GaussianBlur { radius } => {
-                        (0, [radius.to_bits(), 0, 0])
+                        (0, [radius.to_bits(), 0, 0, 0])
                     }
                     aurora_core::FilterKind::UnsharpMask {
                         amount,
@@ -97,7 +99,21 @@ pub(crate) fn filter_signature(
                         threshold,
                     } => (
                         1,
-                        [amount.to_bits(), radius.to_bits(), u32::from(threshold)],
+                        [amount.to_bits(), radius.to_bits(), u32::from(threshold), 0],
+                    ),
+                    aurora_core::FilterKind::ReduceNoise {
+                        strength,
+                        preserve_details,
+                        color_noise,
+                        sharpen_details,
+                    } => (
+                        2,
+                        [
+                            strength.to_bits(),
+                            preserve_details.to_bits(),
+                            color_noise.to_bits(),
+                            sharpen_details.to_bits(),
+                        ],
                     ),
                 })
                 .collect()
@@ -112,7 +128,7 @@ struct FilterCacheKey {
     layer_origin: (i64, i64),
     doc_origin: (i64, i64),
     reference_origin: (i64, i64),
-    filters: Vec<(u8, [u32; 3])>,
+    filters: Vec<(u8, [u32; 4])>,
     versions: Vec<(bool, u32, u32, bool, u64)>,
 }
 
@@ -311,6 +327,19 @@ fn compute(
                 let spec = aurora_core::GaussianSpec::new(radius)?;
                 aurora_filters::unsharp_mask_window(&mut window, side, amount, threshold, &spec);
             }
+            aurora_core::FilterKind::ReduceNoise {
+                strength,
+                preserve_details,
+                color_noise,
+                sharpen_details,
+            } => aurora_filters::reduce_noise_window(
+                &mut window,
+                side,
+                strength,
+                preserve_details,
+                color_noise,
+                sharpen_details,
+            ),
         }
     }
     let centre = aurora_filters::crop_window(&window, side, T);

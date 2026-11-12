@@ -405,6 +405,19 @@ fn chain_reference(kinds: &[aurora_core::FilterKind]) -> Vec<f32> {
                 let spec = aurora_core::GaussianSpec::new(radius).unwrap_or_else(|| unreachable!());
                 aurora_filters::unsharp_mask_window(&mut window, side_u, amount, threshold, &spec);
             }
+            aurora_core::FilterKind::ReduceNoise {
+                strength,
+                preserve_details,
+                color_noise,
+                sharpen_details,
+            } => aurora_filters::reduce_noise_window(
+                &mut window,
+                side_u,
+                strength,
+                preserve_details,
+                color_noise,
+                sharpen_details,
+            ),
         }
     }
     aurora_filters::crop_window(&window, side_u, 512)
@@ -412,12 +425,17 @@ fn chain_reference(kinds: &[aurora_core::FilterKind]) -> Vec<f32> {
 
 #[test]
 fn unsharp_tiles_are_bit_identical_to_a_one_shot_reference_across_the_boundary() {
-    let chains: [Vec<aurora_core::FilterKind>; 3] = [
+    let chains: [Vec<aurora_core::FilterKind>; 5] = [
         vec![unsharp(200.0, 2.0, 0)],
         vec![unsharp(150.0, 9.0, 2)],
         vec![
             aurora_core::FilterKind::GaussianBlur { radius: 1.5 },
             unsharp(300.0, 3.0, 0),
+        ],
+        vec![reduce_noise(10.0, 30.0, 100.0, 100.0)],
+        vec![
+            reduce_noise(4.0, 80.0, 40.0, 0.0),
+            aurora_core::FilterKind::GaussianBlur { radius: 2.0 },
         ],
     ];
     for kinds in chains {
@@ -456,7 +474,7 @@ fn unsharp_tiles_are_bit_identical_to_a_one_shot_reference_across_the_boundary()
         }
         // And the composite shows the overshoot on both sides of x = 256
         // (for a lone unsharp mask; after a blur the edge is already soft).
-        if kinds.len() == 1 {
+        if matches!(kinds.as_slice(), [aurora_core::FilterKind::UnsharpMask { .. }]) {
             let acc = composite_tile_at(&layers, &mut store, 0, 0, (0, 0));
             let dark = texel(&acc, 255, 250)[0];
             let acc1 = composite_tile_at(&layers, &mut store, 1, 0, (0, 0));
@@ -555,4 +573,90 @@ fn a_dab_recomposites_the_neighbours_within_the_unsharp_reach() {
     invalidate_painted_tiles(&mut cache, &layers, id, &[own], (0, 0));
     assert!(!cache.is_current(own));
     assert!(!cache.is_current(near_tile));
+}
+
+// ---- task 178: Reduce Noise ----
+
+fn reduce_noise(
+    strength: f32,
+    preserve_details: f32,
+    color_noise: f32,
+    sharpen_details: f32,
+) -> aurora_core::FilterKind {
+    aurora_core::FilterKind::ReduceNoise {
+        strength,
+        preserve_details,
+        color_noise,
+        sharpen_details,
+    }
+}
+
+#[test]
+fn reduce_noise_all_zero_draws_the_unfiltered_pixels() {
+    let (_dir, mut store) = real_tile_store();
+    let mut layers = aurora_doc::LayerTree::new();
+    let id = two_tone_layer(&mut layers, &mut store);
+    let plain: Vec<_> = [(0, 0), (1, 0)]
+        .map(|(x, y)| composite_tile_at(&layers, &mut store, x, y, (0, 0)))
+        .into();
+    ok(layers.set_filters(id, Some(filters_of(&[reduce_noise(0.0, 80.0, 0.0, 0.0)]))));
+    let filtered: Vec<_> = [(0, 0), (1, 0)]
+        .map(|(x, y)| composite_tile_at(&layers, &mut store, x, y, (0, 0)))
+        .into();
+    assert_eq!(plain, filtered);
+}
+
+#[test]
+fn reduce_noise_settings_are_part_of_the_cache_key_and_refuse_the_gpu_path() {
+    let (_dir, mut store) = real_tile_store();
+    let mut layers = aurora_doc::LayerTree::new();
+    let id = two_tone_layer(&mut layers, &mut store);
+    let computes = || crate::layer_filter_app::FILTER_COMPUTES.with(std::cell::Cell::get);
+    let tile = |layers: &aurora_doc::LayerTree, store: &mut aurora_tile::TileStore| {
+        composite_tile_at(layers, store, 0, 0, (0, 0))
+    };
+    let before = computes();
+    ok(layers.set_filters(id, Some(filters_of(&[reduce_noise(5.0, 50.0, 50.0, 50.0)]))));
+    let _ = tile(&layers, &mut store);
+    let _ = tile(&layers, &mut store);
+    assert_eq!(computes() - before, 1, "second draw hits");
+    for (n, kind) in [
+        reduce_noise(5.5, 50.0, 50.0, 50.0),
+        reduce_noise(5.5, 51.0, 50.0, 50.0),
+        reduce_noise(5.5, 51.0, 49.0, 50.0),
+        reduce_noise(5.5, 51.0, 49.0, 10.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        ok(layers.set_filters(id, Some(filters_of(&[kind]))));
+        let _ = tile(&layers, &mut store);
+        assert_eq!(computes() - before, 2 + n, "{kind:?} misses");
+    }
+    assert!(!document_qualifies_for_gpu_compositing(&layers));
+    let mut hidden = filters_of(&[reduce_noise(5.0, 50.0, 50.0, 50.0)]);
+    if let Some(f) = hidden.filters.get_mut(0) {
+        f.visible = false;
+    }
+    ok(layers.set_filters(id, Some(hidden)));
+    assert!(document_qualifies_for_gpu_compositing(&layers));
+}
+
+#[test]
+fn a_dab_recomposites_the_neighbours_within_the_reduce_noise_reach() {
+    let (_dir, mut store) = real_tile_store();
+    let mut layers = aurora_doc::LayerTree::new();
+    let id = painted(&mut layers, &mut store, (0, 0), (250, 100, 1, 1));
+    let own = aurora_tile::TileId { x: 0, y: 0 };
+    let near_tile = aurora_tile::TileId { x: 1, y: 0 };
+    let far_tile = aurora_tile::TileId { x: 3, y: 0 };
+    ok(layers.set_filters(id, Some(filters_of(&[reduce_noise(10.0, 0.0, 100.0, 100.0)]))));
+    let mut cache = CompositeCache::default();
+    for t in [own, near_tile, far_tile] {
+        cache.mark_current(t);
+    }
+    invalidate_painted_tiles(&mut cache, &layers, id, &[own], (0, 0));
+    assert!(!cache.is_current(own));
+    assert!(!cache.is_current(near_tile));
+    assert!(cache.is_current(far_tile));
 }

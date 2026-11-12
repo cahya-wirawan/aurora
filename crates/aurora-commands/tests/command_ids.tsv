@@ -47,6 +47,7 @@ layer.clip_create	Create Clipping Mask	Palette
 layer.clip_release	Release Clipping Mask	Palette
 layer.filter.gaussian_blur	Gaussian Blur…	Palette
 layer.filter.unsharp_mask	Unsharp Mask…	Palette
+layer.filter.reduce_noise	Reduce Noise…	Palette
 layer.filter.edit_last	Edit Last Layer Filter…	Palette
 layer.filter.toggle	Hide or Show Layer Filters	Palette
 layer.filter.remove_last	Remove Last Layer Filter	Palette

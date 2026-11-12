@@ -25,6 +25,19 @@
 //! reader hears all three names in the prompt's label. Edit Last Layer
 //! Filter… opens the prompt that fits the last filter's kind.
 //!
+//! **Reduce Noise… (task 178)** is the third. Its prompt is the same kind
+//! of one-line prompt with four numbers: "Strength, Preserve Details,
+//! Reduce Color Noise, Sharpen Details" typed as `6 60 45 25` (0..=10, then
+//! three percentages 0..=100; spaces or commas; a `%` after a percentage
+//! is allowed), starting as the values last used this session
+//! (`ToolSettings::noise_settings`, not persisted; Photoshop's defaults
+//! 6 / 60 / 45 / 25 the first time). Edit Last Layer Filter… opens it
+//! with the filter's values when the last filter is a Reduce Noise. The
+//! typed (registry) form of Edit Last Layer Filter only has a `radius`, so
+//! it cannot change a Reduce Noise, which has none: it is refused with the
+//! "no filters to change" notice; the prompt (palette, Filter menu) is the
+//! way to edit one.
+//!
 //! **What does not.** No Properties-panel editor (slider per filter, eye,
 //! delete button) yet: editing is by command, and only the last filter can
 //! be edited. No live preview while the radius is typed. Nothing is
@@ -39,6 +52,7 @@ use crate::{FocusManager, LockRefusal, WidgetId, command_palette_style};
 
 pub(crate) const COMMAND_GAUSSIAN_BLUR: &str = "layer.filter.gaussian_blur";
 pub(crate) const COMMAND_UNSHARP_MASK: &str = "layer.filter.unsharp_mask";
+pub(crate) const COMMAND_REDUCE_NOISE: &str = "layer.filter.reduce_noise";
 pub(crate) const COMMAND_EDIT_LAST: &str = "layer.filter.edit_last";
 pub(crate) const COMMAND_TOGGLE: &str = "layer.filter.toggle";
 pub(crate) const COMMAND_REMOVE_LAST: &str = "layer.filter.remove_last";
@@ -85,6 +99,49 @@ impl UnsharpSettings {
     }
 }
 
+/// Photoshop's Reduce Noise defaults.
+pub(crate) const DEFAULT_NOISE: NoiseSettings = NoiseSettings {
+    strength: 6.0,
+    preserve_details: 60.0,
+    color_noise: 45.0,
+    sharpen_details: 25.0,
+};
+
+/// The four numbers of a Reduce Noise.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NoiseSettings {
+    /// 0..=10.
+    pub(crate) strength: f32,
+    /// Percent, 0..=100.
+    pub(crate) preserve_details: f32,
+    /// Percent, 0..=100.
+    pub(crate) color_noise: f32,
+    /// Percent, 0..=100.
+    pub(crate) sharpen_details: f32,
+}
+
+impl NoiseSettings {
+    fn kind(self) -> aurora_core::FilterKind {
+        aurora_core::FilterKind::ReduceNoise {
+            strength: self.strength,
+            preserve_details: self.preserve_details,
+            color_noise: self.color_noise,
+            sharpen_details: self.sharpen_details,
+        }
+    }
+
+    /// The prompt's text for these values.
+    pub(crate) fn text(self) -> String {
+        format!(
+            "{} {} {} {}",
+            amount_text(self.strength),
+            amount_text(self.preserve_details),
+            amount_text(self.color_noise),
+            amount_text(self.sharpen_details)
+        )
+    }
+}
+
 /// Which prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptKind {
@@ -96,6 +153,10 @@ pub(crate) enum PromptKind {
     AddUnsharp,
     /// Edit Last Layer Filter… when the last filter is an Unsharp Mask.
     EditLastUnsharp,
+    /// Reduce Noise…: add a filter.
+    AddNoise,
+    /// Edit Last Layer Filter… when the last filter is a Reduce Noise.
+    EditLastNoise,
 }
 
 impl PromptKind {
@@ -106,6 +167,9 @@ impl PromptKind {
             Self::AddUnsharp | Self::EditLastUnsharp => {
                 "Unsharp Mask: Amount in Percent, Radius in Pixels, Threshold in Levels"
             }
+            Self::AddNoise | Self::EditLastNoise => {
+                "Reduce Noise: Strength 0 to 10, Preserve Details, Reduce Color Noise and Sharpen Details in Percent"
+            }
         }
     }
 
@@ -115,6 +179,8 @@ impl PromptKind {
             Self::EditLast => "layer.filter.edit_last.apply",
             Self::AddUnsharp => "layer.filter.unsharp_mask.apply",
             Self::EditLastUnsharp => "layer.filter.edit_last_unsharp.apply",
+            Self::AddNoise => "layer.filter.reduce_noise.apply",
+            Self::EditLastNoise => "layer.filter.edit_last_noise.apply",
         }
     }
 
@@ -124,6 +190,8 @@ impl PromptKind {
             Self::EditLast,
             Self::AddUnsharp,
             Self::EditLastUnsharp,
+            Self::AddNoise,
+            Self::EditLastNoise,
         ]
         .into_iter()
         .find(|kind| kind.row_id() == id)
@@ -144,14 +212,28 @@ impl PromptKind {
                 ),
                 Err(_) => format!("Edit Unsharp Mask: {amount}"),
             },
+            Self::AddNoise => match parse_noise(amount) {
+                Ok(v) => format!("Reduce Noise, {}", noise_summary(v)),
+                Err(_) => format!("Reduce Noise: {amount}"),
+            },
+            Self::EditLastNoise => match parse_noise(amount) {
+                Ok(v) => format!(
+                    "Change the last layer filter to Reduce Noise, {}",
+                    noise_summary(v)
+                ),
+                Err(_) => format!("Edit Reduce Noise: {amount}"),
+            },
         }
     }
 
     fn bare_title(self) -> &'static str {
         match self {
             Self::Add => "Gaussian Blur",
-            Self::EditLast | Self::EditLastUnsharp => "Edit Last Layer Filter",
+            Self::EditLast | Self::EditLastUnsharp | Self::EditLastNoise => {
+                "Edit Last Layer Filter"
+            }
             Self::AddUnsharp => "Unsharp Mask",
+            Self::AddNoise => "Reduce Noise",
         }
     }
 }
@@ -168,6 +250,11 @@ pub(crate) enum FilterEdit {
     /// Replace the settings of the last filter, which must be an Unsharp
     /// Mask.
     EditLastUnsharp(UnsharpSettings),
+    /// Append a Reduce Noise.
+    AddReduceNoise(NoiseSettings),
+    /// Replace the settings of the last filter, which must be a Reduce
+    /// Noise.
+    EditLastNoise(NoiseSettings),
     /// Hide every filter, or show them all when none is shown.
     ToggleVisible,
     RemoveLast,
@@ -189,6 +276,7 @@ pub(crate) fn prompt_for_command(id: &str) -> Option<PromptKind> {
     match id {
         COMMAND_GAUSSIAN_BLUR => Some(PromptKind::Add),
         COMMAND_UNSHARP_MASK => Some(PromptKind::AddUnsharp),
+        COMMAND_REDUCE_NOISE => Some(PromptKind::AddNoise),
         COMMAND_EDIT_LAST => Some(PromptKind::EditLast),
         _ => None,
     }
@@ -226,6 +314,11 @@ pub(crate) fn plan(
             match &mut last.kind {
                 aurora_core::FilterKind::GaussianBlur { radius: old }
                 | aurora_core::FilterKind::UnsharpMask { radius: old, .. } => *old = radius,
+                // A Reduce Noise has no radius; the radius form cannot
+                // change it.
+                aurora_core::FilterKind::ReduceNoise { .. } => {
+                    return Err(LockRefusal::FilterNothing);
+                }
             }
             "Edit Layer Filter"
         }
@@ -241,6 +334,19 @@ pub(crate) fn plan(
             }
             last.kind = settings.kind();
             "Edit Unsharp Mask"
+        }
+        FilterEdit::AddReduceNoise(settings) => {
+            next.filters
+                .push(aurora_core::LayerFilter::new(settings.kind()));
+            "Reduce Noise"
+        }
+        FilterEdit::EditLastNoise(settings) => {
+            let last = next.filters.last_mut().ok_or(LockRefusal::FilterNothing)?;
+            if !matches!(last.kind, aurora_core::FilterKind::ReduceNoise { .. }) {
+                return Err(LockRefusal::FilterNothing);
+            }
+            last.kind = settings.kind();
+            "Edit Reduce Noise"
         }
         FilterEdit::ToggleVisible => {
             if next.filters.is_empty() {
@@ -305,6 +411,30 @@ pub(crate) fn last_radius(
     match layers.filters(layer)?.filters.last()?.kind {
         aurora_core::FilterKind::GaussianBlur { radius }
         | aurora_core::FilterKind::UnsharpMask { radius, .. } => Some(radius),
+        aurora_core::FilterKind::ReduceNoise { .. } => None,
+    }
+}
+
+/// The last filter's settings on `layer` when it is a Reduce Noise: the
+/// Edit prompt's starting values.
+pub(crate) fn last_noise(
+    layers: &aurora_doc::LayerTree,
+    layer: aurora_doc::LayerId,
+) -> Option<NoiseSettings> {
+    match layers.filters(layer)?.filters.last()?.kind {
+        aurora_core::FilterKind::ReduceNoise {
+            strength,
+            preserve_details,
+            color_noise,
+            sharpen_details,
+        } => Some(NoiseSettings {
+            strength,
+            preserve_details,
+            color_noise,
+            sharpen_details,
+        }),
+        aurora_core::FilterKind::GaussianBlur { .. }
+        | aurora_core::FilterKind::UnsharpMask { .. } => None,
     }
 }
 
@@ -324,7 +454,8 @@ pub(crate) fn last_unsharp(
             radius,
             threshold,
         }),
-        aurora_core::FilterKind::GaussianBlur { .. } => None,
+        aurora_core::FilterKind::GaussianBlur { .. }
+        | aurora_core::FilterKind::ReduceNoise { .. } => None,
     }
 }
 
@@ -430,6 +561,65 @@ pub(crate) fn parse_unsharp(text: &str) -> Result<UnsharpSettings, String> {
     })
 }
 
+/// "strength 6, preserve details 60 %, ..." for the prompt's row.
+fn noise_summary(v: NoiseSettings) -> String {
+    format!(
+        "strength {}, preserve details {} %, colour noise {} %, sharpen details {} %",
+        amount_text(v.strength),
+        amount_text(v.preserve_details),
+        amount_text(v.color_noise),
+        amount_text(v.sharpen_details)
+    )
+}
+
+/// The four numbers typed into the Reduce Noise prompt (strength,
+/// preserve details, reduce colour noise, sharpen details; spaces or
+/// commas between; `%` after a percentage allowed), or the reason they
+/// are refused.
+///
+/// # Errors
+///
+/// A short sentence for the prompt's row.
+pub(crate) fn parse_noise(text: &str) -> Result<NoiseSettings, String> {
+    let tokens: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|t| !t.is_empty())
+        .collect();
+    let [strength, preserve, colour, sharpen] = tokens.as_slice() else {
+        return Err(
+            "Enter strength, preserve details, colour noise and sharpen details, for example 6 60 45 25."
+                .to_owned(),
+        );
+    };
+    let number = |token: &str, suffix: &str, what: &str, max: f32| -> Result<f32, String> {
+        let digits = token.strip_suffix(suffix).unwrap_or(token);
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return Err(format!("The {what} must use digits only, for example 5."));
+        }
+        let value = digits
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| format!("The {what} is not a number."))?;
+        if (0.0..=max).contains(&value) {
+            Ok(value)
+        } else {
+            Err(format!(
+                "The {what} is from 0 to {}{}.",
+                amount_text(max),
+                if suffix == "%" { " percent" } else { "" }
+            ))
+        }
+    };
+    let max_percent = aurora_core::MAX_NOISE_PERCENT;
+    Ok(NoiseSettings {
+        strength: number(strength, "", "strength", aurora_core::MAX_NOISE_STRENGTH)?,
+        preserve_details: number(preserve, "%", "preserve details", max_percent)?,
+        color_noise: number(colour, "%", "colour noise", max_percent)?,
+        sharpen_details: number(sharpen, "%", "sharpen details", max_percent)?,
+    })
+}
+
 fn prompt_entries(kind: PromptKind, query: &str) -> Vec<CommandEntry> {
     let amount = query.trim();
     let title = if amount.is_empty() {
@@ -522,6 +712,16 @@ pub(crate) fn prompt_enter(
 ) -> Option<Result<FilterEdit, ()>> {
     let kind = prompt_kind(tree, root)?;
     let query = command_palette_state(tree, root).ok()?.query().to_owned();
+    if matches!(kind, PromptKind::AddNoise | PromptKind::EditLastNoise) {
+        return Some(match parse_noise(&query) {
+            Ok(v) => Ok(if kind == PromptKind::AddNoise {
+                FilterEdit::AddReduceNoise(v)
+            } else {
+                FilterEdit::EditLastNoise(v)
+            }),
+            Err(message) => show_refusal(tree, root, kind, message),
+        });
+    }
     if matches!(kind, PromptKind::AddUnsharp | PromptKind::EditLastUnsharp) {
         return Some(match parse_unsharp(&query) {
             Ok(v) => Ok(if kind == PromptKind::AddUnsharp {
@@ -536,9 +736,11 @@ pub(crate) fn prompt_enter(
         Ok(radius) => Some(Ok(match kind {
             PromptKind::Add => FilterEdit::AddGaussianBlur(radius),
             // The Unsharp Mask kinds returned above.
-            PromptKind::EditLast | PromptKind::AddUnsharp | PromptKind::EditLastUnsharp => {
-                FilterEdit::EditLastRadius(radius)
-            }
+            PromptKind::EditLast
+            | PromptKind::AddUnsharp
+            | PromptKind::EditLastUnsharp
+            | PromptKind::AddNoise
+            | PromptKind::EditLastNoise => FilterEdit::EditLastRadius(radius),
         })),
         Err(message) => Some(show_refusal(tree, root, kind, message)),
     }
@@ -847,6 +1049,163 @@ mod tests {
             "Unsharp Mask, amount 150 %, radius 2 px, threshold 4 levels"
         );
         assert_eq!(row("150 2"), "Unsharp Mask: 150 2");
+    }
+
+    fn noise(strength: f32, preserve: f32, colour: f32, sharpen: f32) -> NoiseSettings {
+        NoiseSettings {
+            strength,
+            preserve_details: preserve,
+            color_noise: colour,
+            sharpen_details: sharpen,
+        }
+    }
+
+    #[test]
+    fn parse_noise_reads_four_numbers_and_explains_refusals() {
+        assert_eq!(parse_noise("6 60 45 25"), Ok(noise(6.0, 60.0, 45.0, 25.0)));
+        assert_eq!(parse_noise(" 0,0,0,0 "), Ok(noise(0.0, 0.0, 0.0, 0.0)));
+        assert_eq!(
+            parse_noise("10 100% 100% 100%"),
+            Ok(noise(10.0, 100.0, 100.0, 100.0))
+        );
+        assert_eq!(
+            parse_noise("2.5 50 12.5 0"),
+            Ok(noise(2.5, 50.0, 12.5, 0.0))
+        );
+        for bad in [
+            "",
+            "6 60 45",
+            "6 60 45 25 1",
+            "10.5 60 45 25",
+            "-1 60 45 25",
+            "6 101 45 25",
+            "6 60 100.5 25",
+            "6 60 45 101",
+            "a 60 45 25",
+            "6 6e1 45 25",
+            "6 . 45 25",
+            "6 60 -5 25",
+            "6% 60 45 25",
+        ] {
+            assert!(parse_noise(bad).is_err(), "{bad:?}");
+        }
+        let v = noise(7.5, 33.5, 12.0, 1.0);
+        assert_eq!(parse_noise(&v.text()), Ok(v));
+        assert_eq!(DEFAULT_NOISE.text(), "6 60 45 25");
+    }
+
+    #[test]
+    fn noise_add_edit_and_undo_are_single_labelled_steps() {
+        let (mut tree, mut history, pixel, group) = doc();
+        let mut run =
+            |tree: &mut aurora_doc::LayerTree, edit| apply(tree, &mut history, Some(pixel), edit);
+        assert_eq!(
+            run(&mut tree, FilterEdit::AddGaussianBlur(3.0)),
+            Some("Gaussian Blur")
+        );
+        // Editing a blur as a noise filter is refused.
+        assert_eq!(
+            plan(
+                &tree,
+                Some(pixel),
+                FilterEdit::EditLastNoise(noise(1.0, 1.0, 1.0, 1.0))
+            ),
+            Err(LockRefusal::FilterNothing)
+        );
+        assert!(last_noise(&tree, pixel).is_none());
+        assert_eq!(
+            run(
+                &mut tree,
+                FilterEdit::AddReduceNoise(noise(6.0, 60.0, 45.0, 25.0))
+            ),
+            Some("Reduce Noise")
+        );
+        assert_eq!(last_noise(&tree, pixel), Some(noise(6.0, 60.0, 45.0, 25.0)));
+        // It has no radius, and no unsharp settings.
+        assert_eq!(last_radius(&tree, pixel), None);
+        assert!(last_unsharp(&tree, pixel).is_none());
+        // The typed radius form cannot change it (disclosed refusal).
+        assert_eq!(
+            plan(&tree, Some(pixel), FilterEdit::EditLastRadius(6.0)),
+            Err(LockRefusal::FilterNothing)
+        );
+        // And an unsharp edit is refused on it.
+        assert_eq!(
+            plan(
+                &tree,
+                Some(pixel),
+                FilterEdit::EditLastUnsharp(settings(100.0, 1.0, 0))
+            ),
+            Err(LockRefusal::FilterNothing)
+        );
+        assert_eq!(
+            run(
+                &mut tree,
+                FilterEdit::EditLastNoise(noise(2.0, 90.0, 0.0, 0.0))
+            ),
+            Some("Edit Reduce Noise")
+        );
+        assert_eq!(last_noise(&tree, pixel), Some(noise(2.0, 90.0, 0.0, 0.0)));
+        assert_eq!(
+            run(
+                &mut tree,
+                FilterEdit::EditLastNoise(noise(2.0, 90.0, 0.0, 0.0))
+            ),
+            None
+        );
+        // Shared reach cap: the blur 3 px (9) + this noise at the maximum
+        // (20) is fine; a second blur of 85 would not be.
+        assert_eq!(
+            plan(&tree, Some(pixel), FilterEdit::AddGaussianBlur(85.0)),
+            Err(LockRefusal::FilterTooLarge)
+        );
+        assert_eq!(
+            plan(
+                &tree,
+                Some(group),
+                FilterEdit::AddReduceNoise(noise(1.0, 1.0, 1.0, 1.0))
+            ),
+            Err(LockRefusal::FilterNeedsPixelLayer)
+        );
+        let _ = history.undo(&mut tree);
+        assert_eq!(last_noise(&tree, pixel), Some(noise(6.0, 60.0, 45.0, 25.0)));
+        let _ = history.undo(&mut tree);
+        assert!(last_noise(&tree, pixel).is_none());
+    }
+
+    #[test]
+    fn noise_prompt_rows_and_command_ids() {
+        assert_eq!(
+            prompt_for_command(COMMAND_REDUCE_NOISE),
+            Some(PromptKind::AddNoise)
+        );
+        assert_eq!(plain_edit_for_command(COMMAND_REDUCE_NOISE), None);
+        for kind in [
+            PromptKind::Add,
+            PromptKind::EditLast,
+            PromptKind::AddUnsharp,
+            PromptKind::EditLastUnsharp,
+            PromptKind::AddNoise,
+            PromptKind::EditLastNoise,
+        ] {
+            assert_eq!(PromptKind::for_row(kind.row_id()), Some(kind));
+        }
+        let row = |k, q: &str| {
+            prompt_entries(k, q)
+                .first()
+                .map(|e| e.title.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(row(PromptKind::AddNoise, ""), "Reduce Noise");
+        assert_eq!(
+            row(PromptKind::AddNoise, "6 60 45 25"),
+            "Reduce Noise, strength 6, preserve details 60 %, colour noise 45 %, sharpen details 25 %"
+        );
+        assert_eq!(row(PromptKind::AddNoise, "6 60"), "Reduce Noise: 6 60");
+        assert!(
+            row(PromptKind::EditLastNoise, "1 2 3 4")
+                .starts_with("Change the last layer filter to Reduce Noise,")
+        );
     }
 
     #[test]
