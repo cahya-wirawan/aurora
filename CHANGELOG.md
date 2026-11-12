@@ -20,6 +20,12 @@ commit, not of the merge.
 Work on a branch that has not been merged to `main` is not listed here until
 it is merged.
 
+## [0.312.0] - 2026-11-12
+
+### Changed
+
+- Dust & Scratches as the fourth editable layer filter
+
 ## [0.311.0] - 2026-11-12
 
 ### Changed
